@@ -1,12 +1,23 @@
-//! Services tab: SCM-backed list with status filter, search and control
-//! actions (start/stop/restart).
+//! Services tab: SCM-backed list (Name/PID/Beschreibung/Status/Gruppe) with
+//! German status labels, row selection and the Starten/Beenden/Neu starten/
+//! Dienste öffnen command bar.
 
 use eframe::egui;
 use std::time::{Duration, Instant};
 use tm_core::model::ServiceStatus;
 
 use crate::app::TaskManApp;
+use crate::icons::Icon;
 use crate::theme;
+use crate::widgets::tablekit::{TmColumn, TmTable};
+
+const COLS: [TmColumn; 5] = [
+    TmColumn::text("name", "Name", 0.0),
+    TmColumn::text("pid", "PID", 90.0),
+    TmColumn::text("desc", "Beschreibung", 460.0),
+    TmColumn::text("status", "Status", 130.0),
+    TmColumn::text("group", "Gruppe", 150.0),
+];
 
 pub struct Cache {
     pub items: Vec<tm_core::model::ServiceInfo>,
@@ -27,58 +38,64 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
         if stale {
             match app.actions.list_services() {
                 Ok(items) => {
-                    *guard = Some(Cache {
-                        items,
-                        fetched: Instant::now(),
-                    });
+                    *guard = Some(Cache { items, fetched: Instant::now() });
                 }
                 Err(e) => {
                     app.shared.toast(format!("Dienste nicht verfügbar: {e}"));
-                    // Avoid toast spam: pretend we just fetched.
-                    *guard = Some(Cache {
-                        items: vec![],
-                        fetched: Instant::now(),
-                    });
+                    *guard = Some(Cache { items: vec![], fetched: Instant::now() });
                 }
             }
         }
     }
 
-    ui.horizontal(|ui| {
-        ui.add(
-            egui::TextEdit::singleline(&mut app.services_search)
-                .hint_text("Suchen…")
-                .desired_width(220.0),
-        );
-        if ui
-            .selectable_label(app.services_running_filter, "Wird ausgeführt")
-            .clicked()
-        {
-            app.services_running_filter = !app.services_running_filter;
-        }
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            ui.label(
-                egui::RichText::new(if app.actions.is_elevated() {
-                    "Administrator"
-                } else {
-                    ""
-                })
-                .size(11.5)
-                .color(pal.text_dim),
-            );
+    let selected_status = app
+        .services_selected_name
+        .as_ref()
+        .and_then(|name| {
+            app.shared
+                .services_cache
+                .lock()
+                .as_ref()
+                .and_then(|c| c.items.iter().find(|s| &s.name == name))
+                .map(|s| s.status)
         });
-    });
-    ui.separator();
+
+    crate::app_ui::tab_header(
+        app,
+        ui,
+        &pal,
+        |app, ui| {
+            let running = selected_status == Some(ServiceStatus::Running);
+            let stopped = selected_status == Some(ServiceStatus::Stopped);
+            if crate::app_ui::cmd_button(ui, &pal, Icon::Play, "Starten", stopped) {
+                control(app, tm_platform::actions::ServiceAction::Start);
+            }
+            if crate::app_ui::cmd_button(ui, &pal, Icon::StopSquare, "Beenden", running) {
+                control(app, tm_platform::actions::ServiceAction::Stop);
+            }
+            if crate::app_ui::cmd_button(ui, &pal, Icon::Restart, "Neu starten", running) {
+                control(app, tm_platform::actions::ServiceAction::Restart);
+            }
+            crate::app_ui::vsep(ui, &pal);
+            if crate::app_ui::cmd_button(ui, &pal, Icon::OpenExternal, "Dienste öffnen", true) {
+                let _ = app.actions.run_new_task("services.msc", false);
+            }
+        },
+        |_app, ui| {
+            if ui.button("Jetzt aktualisieren (F5)").clicked() {
+                ui.close();
+            }
+        },
+    );
 
     let guard = app.shared.services_cache.clone();
     let cache = guard.lock();
     let Some(ref c) = *cache else { return };
 
-    let q = app.services_search.to_lowercase();
-    let rows: Vec<&tm_core::model::ServiceInfo> = c
+    let q = app.search.trim().to_lowercase();
+    let mut rows: Vec<&tm_core::model::ServiceInfo> = c
         .items
         .iter()
-        .filter(|s| !app.services_running_filter || s.status == ServiceStatus::Running)
         .filter(|s| {
             q.is_empty()
                 || s.name.to_lowercase().contains(&q)
@@ -86,117 +103,86 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
                 || s.description.to_lowercase().contains(&q)
         })
         .collect();
+    rows.sort_by_key(|a| a.name.to_lowercase());
 
-    egui::ScrollArea::both()
+    let table = TmTable::new(COLS.to_vec(), 340.0);
+    let avail = ui.available_width();
+    table.header(ui, &pal, avail, None, None);
+
+    egui::ScrollArea::vertical()
         .id_salt("svc-table")
+        .auto_shrink(false)
         .show(ui, |ui| {
-            egui::Grid::new("svc-header")
-                .num_columns(5)
-                .spacing([10.0, 4.0])
-                .show(ui, |ui| {
-                    for h in ["Name", "PID", "Beschreibung", "Status", "Gruppe"] {
-                        ui.label(egui::RichText::new(h).size(11.5).color(pal.text_dim));
-                    }
-                    ui.end_row();
-                });
-            ui.separator();
+            for s in rows {
+                let selected = app.services_selected_name.as_deref() == Some(s.name.as_str());
+                let (rect, resp) = table.row(ui, &pal, avail, selected);
 
-            egui::Grid::new("svc-rows")
-                .num_columns(5)
-                .spacing([10.0, 1.0])
-                .show(ui, |ui| {
-                    for s in rows {
-                        ui.monospace(&s.name);
-                        ui.label(s.pid.map(|p| p.to_string()).unwrap_or_default());
-                        ui.add_sized(
-                            [380.0, 20.0],
-                            egui::Label::new(truncate(&s.display_name, 60)).truncate(),
-                        );
-                        status_badge(ui, &pal, s.status);
-                        ui.weak(&s.group);
-                        ui.end_row();
+                // Gear glyph per row.
+                let icon_rect = egui::Rect::from_center_size(
+                    egui::Pos2::new(rect.left() + 38.0, rect.center().y),
+                    egui::vec2(16.0, 16.0),
+                );
+                crate::icons::draw_at(ui, icon_rect, Icon::Properties, pal.text_dim);
+                let name_rect = table.col_rect(0, avail, rect);
+                ui.painter().text(
+                    egui::Pos2::new(name_rect.left() + 56.0, rect.center().y),
+                    egui::Align2::LEFT_CENTER,
+                    &s.name,
+                    egui::FontId::proportional(12.5),
+                    pal.text,
+                );
+                table.text_cell(ui, avail, rect, 1, &s.pid.map(|p| p.to_string()).unwrap_or_default(), &pal, false);
+                table.text_cell(ui, avail, rect, 2, &s.display_name, &pal, false);
+                table.text_cell(ui, avail, rect, 3, status_label(s.status), &pal, false);
+                table.text_cell(ui, avail, rect, 4, &s.group, &pal, false);
+
+                if resp.clicked() {
+                    app.services_selected_name = Some(s.name.clone());
+                }
+                resp.context_menu(|ui| {
+                    ui.set_min_width(160.0);
+                    if ui.button("Starten").clicked() {
+                        app.services_selected_name = Some(s.name.clone());
+                        control(app, tm_platform::actions::ServiceAction::Start);
+                        ui.close();
                     }
-                    // context menus per row need ids; simpler: buttons on hover are heavy.
+                    if ui.button("Beenden").clicked() {
+                        app.services_selected_name = Some(s.name.clone());
+                        control(app, tm_platform::actions::ServiceAction::Stop);
+                        ui.close();
+                    }
+                    if ui.button("Neu starten").clicked() {
+                        app.services_selected_name = Some(s.name.clone());
+                        control(app, tm_platform::actions::ServiceAction::Restart);
+                        ui.close();
+                    }
                 });
-            ui.add_space(20.0);
+            }
+            ui.add_space(12.0);
         });
+}
 
-    // Control actions via a simple selected-service pattern:
-    // clicking a row stores its name; buttons act on it.
+fn status_label(st: ServiceStatus) -> &'static str {
+    match st {
+        ServiceStatus::Running => "Wird ausgeführt",
+        ServiceStatus::Stopped => "Beendet",
+        ServiceStatus::StartPending => "Startet",
+        ServiceStatus::StopPending => "Wird beendet",
+        ServiceStatus::ContinuePending => "Wird fortgesetzt",
+        ServiceStatus::PausePending => "Wird angehalten",
+        ServiceStatus::Paused => "Angehalten",
+        ServiceStatus::Unknown => "",
+    }
+}
+
+fn control(app: &mut TaskManApp, action: tm_platform::actions::ServiceAction) {
     if let Some(name) = app.services_selected_name.clone() {
-        egui::Area::new(egui::Id::new("svc-actions"))
-            .anchor(egui::Align2::RIGHT_BOTTOM, [-14.0, -40.0])
-            .show(&ctx_of(ui), |ui| {
-                egui::Frame::window(ui.style()).show(ui, |ui| {
-                    ui.horizontal(|ui| {
-                        ui.label(egui::RichText::new(&name).strong());
-                        if ui.button("Starten").clicked() {
-                            report(
-                                app,
-                                name.clone(),
-                                app.actions.control_service(
-                                    &name,
-                                    tm_platform::actions::ServiceAction::Start,
-                                ),
-                            );
-                        }
-                        if ui.button("Beenden").clicked() {
-                            report(
-                                app,
-                                name.clone(),
-                                app.actions.control_service(
-                                    &name,
-                                    tm_platform::actions::ServiceAction::Stop,
-                                ),
-                            );
-                        }
-                        if ui.button("Neu starten").clicked() {
-                            report(
-                                app,
-                                name.clone(),
-                                app.actions.control_service(
-                                    &name,
-                                    tm_platform::actions::ServiceAction::Restart,
-                                ),
-                            );
-                        }
-                        if ui.small_button("✕").clicked() {
-                            app.services_selected_name = None;
-                        }
-                    });
-                });
-            });
-    }
-}
-
-fn truncate(s: &str, n: usize) -> String {
-    if s.chars().count() <= n {
-        s.to_string()
-    } else {
-        format!("{}…", s.chars().take(n).collect::<String>())
-    }
-}
-
-fn status_badge(ui: &mut egui::Ui, pal: &theme::Palette, st: ServiceStatus) {
-    let color = match st {
-        ServiceStatus::Running => pal.ok_green,
-        ServiceStatus::Stopped => pal.text_dim,
-        _ => pal.accent,
-    };
-    ui.horizontal(|ui| {
-        let (rect, _) = ui.allocate_exact_size(egui::vec2(8.0, 8.0), egui::Sense::hover());
-        ui.painter().circle_filled(rect.center(), 3.0, color);
-        ui.label(st.label());
-    });
-}
-
-fn ctx_of(ui: &egui::Ui) -> egui::Context {
-    ui.ctx().clone()
-}
-
-fn report(app: &mut TaskManApp, name: String, result: Result<(), tm_core::TmError>) {
-    match result {
-        Ok(()) => app.shared.toast(format!("'{name}' ausgeführt")),
-        Err(e) => app.shared.toast(format!("Fehler: {e}")),
+        let result = app.actions.control_service(&name, action);
+        // Invalidate the cache so the status refreshes immediately.
+        *app.shared.services_cache.lock() = None;
+        match result {
+            Ok(()) => app.shared.toast(format!("'{name}' ausgeführt")),
+            Err(e) => app.shared.toast(format!("Fehler: {e}")),
+        }
     }
 }

@@ -116,6 +116,18 @@ pub trait PlatformActions: Send + Sync {
         Err(tm_core::TmError::Unsupported("elevation"))
     }
 
+    /// Firmware POST time of the last boot in ms ("Letzte BIOS-Zeit");
+    /// None when the platform cannot provide it.
+    fn last_bios_time_ms(&self) -> Option<u64> {
+        None
+    }
+
+    /// Shell icon for an executable path as straight-alpha RGBA (w, h, bytes).
+    /// None when unavailable (non-Windows, system processes without file).
+    fn process_icon_rgba(&self, _exe_path: &str) -> Option<(u32, u32, Vec<u8>)> {
+        None
+    }
+
     /// Human-readable name of the platform backend.
     fn backend_name(&self) -> &'static str {
         "unknown"

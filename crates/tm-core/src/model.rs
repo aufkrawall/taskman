@@ -315,6 +315,8 @@ pub struct ProcessEntry {
     pub exe_path: Option<PathBuf>,
     pub command_line: Option<String>,
     pub has_window: bool,
+    /// Topmost process of an app subtree (Task Manager's "Apps" root rows).
+    pub app_root: bool,
     /// Runs elevated (admin/root) when determinable.
     pub elevated: Option<bool>,
     /// 32-bit process on a 64-bit OS (Windows WOW64).
@@ -369,6 +371,7 @@ impl ProcessEntry {
             exe_path: None,
             command_line: None,
             has_window: false,
+            app_root: false,
             elevated: None,
             wow64: None,
             service_name: None,

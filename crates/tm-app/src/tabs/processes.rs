@@ -1,21 +1,64 @@
-//! Processes tab: grouped Apps/Background/System table with heat-mapped
-//! resource columns, search filter and End-Task actions.
+//! Processes tab: Apps/Hintergrundprozesse groups, expandable parent→child
+//! trees with aggregated values, blue heat-mapped resource columns and the
+//! aggregate header — mirroring Win11 Task Manager.
 
 use eframe::egui;
+use std::collections::{HashMap, HashSet};
 use tm_core::format;
-use tm_core::model::{ProcCategory, ProcStatus, ProcessEntry};
+use tm_core::model::{ProcStatus, ProcessEntry, Snapshot};
 
 use crate::app::TaskManApp;
+use crate::icons::Icon;
 use crate::theme;
-use crate::widgets::tablekit::{self, ProcColumn};
+use crate::widgets::tablekit::{Aggregates, TmColumn, TmTable};
+
+const COLS: [TmColumn; 6] = [
+    TmColumn::text("name", "Name", 0.0),
+    TmColumn::text("status", "Status", 190.0),
+    TmColumn::num("cpu", "CPU", 110.0),
+    TmColumn::num("mem", "Arbeitsspeicher", 110.0),
+    TmColumn::num("disk", "Datenträger", 110.0),
+    TmColumn::num("net", "Netzwerk", 110.0),
+];
 
 #[derive(Default)]
 pub struct State {
-    pub sort_col: Option<ProcColumn>,
+    pub sort_col: usize,
     pub ascending: bool,
-    pub search: String,
-    /// Collapsed group set.
-    pub collapsed: [bool; 3],
+    /// Expanded parent pids.
+    pub expanded: HashSet<u32>,
+    /// Expanded user rows (Benutzer tab reuses the same table kit).
+    pub expanded_users: HashSet<u32>,
+    /// Collapsed group headers [Apps, Hintergrundprozesse].
+    pub group_collapsed: [bool; 2],
+    cache: Option<Cache>,
+}
+
+impl State {
+    /// TM default: sorted by name ascending.
+    pub fn new() -> Self {
+        Self {
+            ascending: true,
+            ..Default::default()
+        }
+    }
+}
+
+struct Cache {
+    key: (u64, String, usize, bool),
+    rows: Vec<Row>,
+}
+
+pub struct Row {
+    pub pid: u32,
+    pub depth: usize,
+    pub name: String,
+    pub icon_path: Option<String>,
+    pub children: bool,
+    pub group: usize,
+    /// cpu, mem bytes, disk bps, net bps (aggregated over the subtree).
+    pub values: [f64; 4],
+    pub suspended: bool,
 }
 
 pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
@@ -25,410 +68,491 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
         return;
     };
 
-    // Toolbar.
-    toolbar(app, ui);
+    let caps = app.actions.capabilities();
 
-    // Column maxima for heat normalization (over all visible rows).
-    let maxima = column_maxima(&snap.processes);
-
-    let mut state = std::mem::take(&mut app.processes_state);
-    egui::ScrollArea::both().show(ui, |ui| {
-        // Table header.
-        egui::Grid::new("proc-header")
-            .num_columns(ProcColumn::ALL.len())
-            .spacing([8.0, 4.0])
-            .show(ui, |ui| {
-                for col in ProcColumn::ALL {
-                    let label = col.header();
-                    let resp = ui
-                        .allocate_ui(egui::vec2(col.width() - 12.0, 20.0), |ui| {
-                            ui.horizontal(|ui| {
-                                if col.is_heat() || matches!(col, ProcColumn::Name) {
-                                    ui.label(
-                                        egui::RichText::new(label)
-                                            .strong()
-                                            .color(pal.text_dim)
-                                            .size(11.5),
-                                    );
-                                } else {
-                                    ui.label(
-                                        egui::RichText::new(label).color(pal.text_dim).size(11.5),
-                                    );
-                                }
-                            });
-                        })
-                        .response;
-                    if resp.clicked() {
-                        if state.sort_col == Some(*col) {
-                            state.ascending = !state.ascending;
-                        } else {
-                            state.sort_col = Some(*col);
-                            state.ascending = false; // TM defaults to descending for numeric columns
-                        }
-                    }
-                    if state.sort_col == Some(*col) {
-                        tablekit::sort_arrow(ui, state.ascending, true);
-                    }
-                    let _ = resp;
-                }
-                ui.end_row();
-            });
-
-        ui.separator();
-
-        // Groups in fixed order with collapsible headers.
-        let groups = [
-            (ProcCategory::App, "Apps"),
-            (ProcCategory::Background, "Hintergrund"),
-            (ProcCategory::System, "System"),
-        ];
-        for (gi, (cat, label)) in groups.iter().enumerate() {
-            let procs = filtered_group(&snap.processes, *cat, &state.search);
-            if procs.is_empty() && !state.search.is_empty() {
-                continue;
-            }
-            let total_cpu: f32 = procs.iter().map(|p| p.cpu_pct).sum();
-            let collapsed = state.collapsed[gi];
-
-            // Group header row.
-            egui::Grid::new(format!("grp-{gi}"))
-                .num_columns(ProcColumn::ALL.len())
-                .spacing([8.0, 4.0])
-                .show(ui, |ui| {
-                    let icon = if collapsed {
-                        crate::icons::Icon::ChevronRight
-                    } else {
-                        crate::icons::Icon::ChevronDown
-                    };
-                    let (btn_rect, btn_resp) =
-                        ui.allocate_exact_size(egui::vec2(18.0, 18.0), egui::Sense::click());
-                    crate::icons::draw_at(ui, btn_rect, icon, pal.text);
-                    if btn_resp.clicked() {
-                        state.collapsed[gi] = !collapsed;
-                    }
-                    ui.label(
-                        egui::RichText::new(format!(
-                            "{label} ({})",
-                            snap.processes.iter().filter(|p| p.category == *cat).count()
-                        ))
-                        .size(13.5),
-                    );
-                    ui.weak(format!("{total_cpu:.1} %"));
-                    ui.end_row();
-                });
-
-            if collapsed {
-                continue;
-            }
-
-            // Sorted process rows.
-            let mut sorted = procs;
-            sort_procs(
-                &mut sorted,
-                state.sort_col.unwrap_or(ProcColumn::Cpu),
-                state.ascending,
-            );
-            for p in sorted {
-                proc_row(app, ui, &pal, p, &maxima, &state.search);
-            }
-            ui.add_space(4.0);
-        }
-    });
-    app.processes_state = state;
-}
-
-fn toolbar(app: &mut TaskManApp, ui: &mut egui::Ui) {
-    let pal = theme::palette(ui);
-    ui.horizontal(|ui| {
-        ui.add(
-            egui::TextEdit::singleline(&mut app.processes_state.search)
-                .hint_text("Suchen…")
-                .desired_width(220.0),
-        );
-
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if ui.button("Task beenden").clicked() {
-                if let Some(pid) = app.selected_pid {
-                    match app.actions.kill_process(pid, false) {
-                        Ok(()) => app.shared.toast(format!("Prozess {pid} beendet")),
-                        Err(e) => app.shared.toast(format!("Fehler: {e}")),
-                    }
-                    app.selected_pid = None;
-                } else {
-                    app.shared.toast("Kein Prozess ausgewählt");
-                }
-            }
-            if ui.button("Alle reduzieren").clicked() {
-                app.processes_state.collapsed = [true, true, true];
-            }
-            if ui.button("Alle erweitern").clicked() {
-                app.processes_state.collapsed = [false, false, false];
-            }
-        });
-        let _ = pal;
-    });
-    ui.add_space(2.0);
-}
-
-struct Maxima {
-    cpu: f32,
-    mem: u64,
-    disk: f64,
-    net: f64,
-    gpu: f32,
-}
-
-fn column_maxima(procs: &[tm_core::model::ProcessEntry]) -> Maxima {
-    Maxima {
-        cpu: procs.iter().map(|p| p.cpu_pct).fold(0.0f32, f32::max),
-        mem: procs.iter().map(|p| p.mem_bytes).max().unwrap_or(0),
-        disk: procs
-            .iter()
-            .map(|p| p.disk_read_bps + p.disk_write_bps)
-            .fold(0.0f64, f64::max),
-        net: procs
-            .iter()
-            .map(|p| p.net_recv_bps.unwrap_or(0.0) + p.net_sent_bps.unwrap_or(0.0))
-            .fold(0.0f64, f64::max),
-        gpu: procs
-            .iter()
-            .filter_map(|p| p.gpu_util_pct)
-            .fold(0.0f32, f32::max),
-    }
-}
-
-fn filtered_group<'a>(
-    procs: &'a [ProcessEntry],
-    cat: ProcCategory,
-    search: &str,
-) -> Vec<&'a ProcessEntry> {
-    let q = search.to_lowercase();
-    procs
-        .iter()
-        .filter(|p| p.category == cat && (q.is_empty() || p.name.to_lowercase().contains(&q)))
-        .collect()
-}
-
-fn sort_procs(v: &mut [&ProcessEntry], col: ProcColumn, asc: bool) {
-    let cmp = |a: &ProcessEntry, b: &ProcessEntry| -> std::cmp::Ordering {
-        match col {
-            ProcColumn::Name => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
-            ProcColumn::Status => format!("{:?}", a.status).cmp(&format!("{:?}", b.status)),
-            ProcColumn::User => a
-                .user
-                .clone()
-                .unwrap_or_default()
-                .cmp(&b.user.clone().unwrap_or_default()),
-            ProcColumn::Cpu => a
-                .cpu_pct
-                .partial_cmp(&b.cpu_pct)
-                .unwrap_or(std::cmp::Ordering::Equal),
-            ProcColumn::Memory => a.mem_bytes.cmp(&b.mem_bytes),
-            ProcColumn::Disk => (a.disk_read_bps + a.disk_write_bps)
-                .partial_cmp(&(b.disk_read_bps + b.disk_write_bps))
-                .unwrap_or(std::cmp::Ordering::Equal),
-            ProcColumn::Network => {
-                let an = a.net_recv_bps.unwrap_or(0.0) + a.net_sent_bps.unwrap_or(0.0);
-                let bn = b.net_recv_bps.unwrap_or(0.0) + b.net_sent_bps.unwrap_or(0.0);
-                an.partial_cmp(&bn).unwrap_or(std::cmp::Ordering::Equal)
-            }
-            ProcColumn::Gpu => a
-                .gpu_util_pct
-                .partial_cmp(&b.gpu_util_pct)
-                .unwrap_or(std::cmp::Ordering::Equal),
-        }
-    };
-    v.sort_by(|a, b| {
-        let o = cmp(a, b);
-        if asc { o } else { o.reverse() }
-    });
-}
-
-fn proc_row(
-    app: &mut TaskManApp,
-    ui: &mut egui::Ui,
-    pal: &theme::Palette,
-    p: &ProcessEntry,
-    m: &Maxima,
-    search: &str,
-) {
-    let selected = app.selected_pid == Some(p.pid);
-    let row_h = 24.0;
-
-    let response = ui
-        .allocate_ui(egui::vec2(ui.available_width(), row_h), |ui| {
-            ui.horizontal(|ui| {
-                // Name cell with selection highlight spanning full width is complex;
-                // highlight via small accent dot instead.
-                if selected {
-                    let rect = ui.available_rect_before_wrap();
-                    ui.painter().rect_filled(
-                        egui::Rect::from_min_size(rect.left_top(), egui::vec2(rect.width(), row_h)),
-                        3.0,
-                        pal.accent.gamma_multiply(0.18),
-                    );
-                }
-
-                // Icon-ish dot colored by category.
-                let (rect, _) =
-                    ui.allocate_exact_size(egui::vec2(14.0, row_h), egui::Sense::hover());
-                let color = match p.category {
-                    ProcCategory::App => pal.accent,
-                    ProcCategory::Background => pal.text_dim.gamma_multiply(0.7),
-                    ProcCategory::System => pal.ok_green.gamma_multiply(0.9),
-                };
-                ui.painter().circle_filled(rect.center(), 3.0, color);
-
-                // Name (indented under its group).
-                ui.label(
-                    egui::RichText::new(highlight_name(p, search))
-                        .size(12.5)
-                        .color(pal.text),
-                );
-
-                // Status.
-                let status_label = match p.status {
-                    ProcStatus::Suspended => "Angehalten",
-                    ProcStatus::NotResponding => "Reagiert nicht",
-                    ProcStatus::Running => "",
-                };
-                ui.monospace(status_label);
-
-                // User.
-                ui.weak(p.user.clone().unwrap_or_default());
-
-                // Numeric cells.
-                tablekit::heat_cell_r(
-                    ui,
-                    pal,
-                    heat_t(p.cpu_pct, m.cpu),
-                    format::format_pct(p.cpu_pct),
-                );
-                tablekit::heat_cell_r(
-                    ui,
-                    pal,
-                    bytes_t(p.mem_bytes, m.mem),
-                    format::format_bytes(p.mem_bytes),
-                );
-                let d_total = p.disk_read_bps + p.disk_write_bps;
-                tablekit::heat_cell_r(
-                    ui,
-                    pal,
-                    rate_t(d_total, m.disk),
-                    format::format_rate_short(d_total),
-                );
-                let n_total = p.net_recv_bps.unwrap_or(0.0) + p.net_sent_bps.unwrap_or(0.0);
-                let net_text = if p.net_recv_bps.is_none() && p.net_sent_bps.is_none() {
-                    "".to_string()
-                } else {
-                    format::format_rate_short(n_total)
-                };
-                tablekit::heat_cell_r(ui, pal, rate_t(n_total, m.net), net_text);
-                let gpu_text = p.gpu_util_pct.map(format::format_pct).unwrap_or_default();
-                tablekit::heat_cell_r(
-                    ui,
-                    pal,
-                    p.gpu_util_pct.map_or(0.0, |g| heat_t(g, m.gpu)),
-                    gpu_text,
-                );
-            });
-        })
-        .response;
-
-    // Row interaction.
-    let row_id = response.id.with(p.pid);
-    let response = response.interact(egui::Sense::click());
-    if response.clicked() {
-        app.selected_pid = Some(p.pid);
-    }
-    response.context_menu(|ui| {
-        ui.set_min_width(180.0);
-        if ui.button("Task beenden").clicked() {
-            match app.actions.kill_process(p.pid, false) {
-                Ok(()) => app.shared.toast(format!("{} beendet", p.shown_name())),
-                Err(e) => app.shared.toast(format!("Fehler: {e}")),
-            }
-            ui.close();
-        }
-        #[cfg(target_os = "windows")]
-        if ui.button("Struktur beenden").clicked() {
-            match app.actions.kill_process(p.pid, true) {
-                Ok(()) => app
-                    .shared
-                    .toast(format!("Struktur von {} beendet", p.shown_name())),
-                Err(e) => app.shared.toast(format!("Fehler: {e}")),
-            }
-            ui.close();
-        }
-        ui.separator();
-        let suspended = p.status == ProcStatus::Suspended;
-        if ui
-            .button(if suspended { "Fortsetzen" } else { "Anhalten" })
-            .clicked()
-        {
-            match app.actions.suspend_process(p.pid, !suspended) {
-                Ok(()) => app.shared.toast(if suspended {
-                    "Fortgesetzt"
-                } else {
-                    "Angehalten"
-                }),
-                Err(e) => app.shared.toast(format!("Fehler: {e}")),
-            }
-            ui.close();
-        }
-        #[cfg(target_os = "windows")]
-        {
-            let eco_on = app.efficiency_pids.contains(&p.pid);
-            if ui
-                .button(if eco_on {
-                    "Effizienzmodus deaktivieren"
-                } else {
-                    "Effizienzmodus"
-                })
-                .clicked()
+    crate::app_ui::tab_header(
+        app,
+        ui,
+        &pal,
+        |app, ui| {
+            if crate::app_ui::cmd_button(
+                ui,
+                &pal,
+                Icon::Leaf,
+                "Effizienzmodus",
+                caps.efficiency_mode && app.selected_pid.is_some(),
+            ) && let Some(pid) = app.selected_pid
             {
-                match app.actions.set_efficiency_mode(p.pid, !eco_on) {
+                let on = !app.efficiency_pids.contains(&pid);
+                match app.actions.set_efficiency_mode(pid, on) {
                     Ok(()) => {
-                        if eco_on {
-                            app.efficiency_pids.remove(&p.pid);
+                        if on {
+                            app.efficiency_pids.insert(pid);
                         } else {
-                            app.efficiency_pids.insert(p.pid);
+                            app.efficiency_pids.remove(&pid);
                         }
-                        app.shared.toast("Effizienzmodus geändert");
                     }
                     Err(e) => app.shared.toast(format!("Fehler: {e}")),
                 }
+            }
+            if crate::app_ui::cmd_button(ui, &pal, Icon::Close, "Task beenden", app.selected_pid.is_some())
+            {
+                app.end_selected();
+            }
+        },
+        |app, ui| {
+            if ui.button("Alle erweitern").clicked() {
+                if let Some(snap) = app.latest_snapshot() {
+                    for p in &snap.processes {
+                        app.processes_state.expanded.insert(p.pid);
+                    }
+                }
                 ui.close();
             }
+            if ui.button("Alle reduzieren").clicked() {
+                app.processes_state.expanded.clear();
+                ui.close();
+            }
+        },
+    );
+
+    let table = TmTable::new(COLS.to_vec(), 340.0);
+
+    // Rebuild the row model only when the snapshot/search/sort changes.
+    let key = (
+        snap.timestamp_ms,
+        app.search.clone(),
+        app.processes_state.sort_col,
+        app.processes_state.ascending,
+    );
+    let mut cache = app.processes_state.cache.take();
+    let cache_stale = cache.as_ref().is_none_or(|c| c.key != key);
+    if cache_stale {
+        cache = Some(Cache {
+            key: key.clone(),
+            rows: build_rows(&snap, &key.1, key.2, key.3, &app.processes_state.expanded),
+        });
+    }
+    let rows = &cache.as_ref().expect("cache").rows;
+
+    let agg = Aggregates::from_snapshot(&snap);
+    let aggs = agg.strings();
+
+    let avail = ui.available_width();
+    if let Some(col) = table.header(
+        ui,
+        &pal,
+        avail,
+        Some((app.processes_state.sort_col, app.processes_state.ascending)),
+        Some(&aggs),
+    ) {
+        if app.processes_state.sort_col == col {
+            app.processes_state.ascending = !app.processes_state.ascending;
+        } else {
+            app.processes_state.sort_col = col;
+            // Numeric columns default descending, name ascending.
+            app.processes_state.ascending = !COLS[col].numeric;
         }
-        ui.separator();
-        if ui.button("Im Detail anzeigen").clicked() {
-            app.details_filter = p.name.clone();
-            app.tab = crate::app::Tab::Details;
-            ui.close();
+    }
+
+    egui::ScrollArea::vertical()
+        .id_salt("proc-table")
+        .auto_shrink(false)
+        .show(ui, |ui| {
+
+            let searching = !app.search.trim().is_empty();
+            let maxima = column_maxima(rows);
+
+            if searching {
+                for row in rows.iter().filter(|r| r.group < 2) {
+                    row_ui(app, ui, &pal, &table, avail, row, &maxima);
+                }
+            } else {
+                for gi in 0..2usize {
+                    let label = if gi == 0 { "Apps" } else { "Hintergrundprozesse" };
+                    let total = if gi == 0 {
+                        rows.iter().filter(|r| r.group == 0 && r.depth == 0).count()
+                    } else {
+                        rows.iter().filter(|r| r.group == 1).count()
+                    };
+                    group_header(app, ui, &pal, label, total);
+                    if app.processes_state.group_collapsed[gi] {
+                        continue;
+                    }
+                    for row in rows.iter().filter(|r| r.group == gi) {
+                        row_ui(app, ui, &pal, &table, avail, row, &maxima);
+                    }
+                    ui.add_space(6.0);
+                }
+            }
+            ui.add_space(12.0);
+        });
+    app.processes_state.cache = cache;
+}
+
+/// Collapsible group header ("Apps (5)").
+fn group_header(
+    app: &mut TaskManApp,
+    ui: &mut egui::Ui,
+    pal: &theme::Palette,
+    label: &str,
+    count: usize,
+) {
+    let gi = if label == "Apps" { 0 } else { 1 };
+    let (rect, resp) = ui.allocate_exact_size(
+        egui::vec2(ui.available_width(), 38.0),
+        egui::Sense::click(),
+    );
+    if resp.hovered() {
+        ui.painter().rect_filled(rect, 4.0, egui::Color32::from_white_alpha(8));
+    }
+    ui.painter().text(
+        egui::Pos2::new(rect.left() + 18.0, rect.center().y),
+        egui::Align2::LEFT_CENTER,
+        format!("{label} ({count})"),
+        egui::FontId::proportional(15.0),
+        pal.text,
+    );
+    if resp.clicked() {
+        app.processes_state.group_collapsed[gi] = !app.processes_state.group_collapsed[gi];
+    }
+}
+
+fn row_ui(
+    app: &mut TaskManApp,
+    ui: &mut egui::Ui,
+    pal: &theme::Palette,
+    table: &TmTable,
+    avail: f32,
+    row: &Row,
+    maxima: &[f64; 4],
+) {
+    let selected = app.selected_pid == Some(row.pid);
+    let (rect, resp) = table.row(ui, pal, avail, selected);
+
+    // Chevron + icon + name.
+    let toggled = row.children && table.chevron(ui, rect, app.processes_state.expanded.contains(&row.pid), true, pal);
+    if toggled {
+        if app.processes_state.expanded.contains(&row.pid) {
+            app.processes_state.expanded.remove(&row.pid);
+        } else {
+            app.processes_state.expanded.insert(row.pid);
         }
-        let _ = row_id;
+    }
+
+    let tex = row
+        .icon_path
+        .as_ref()
+        .and_then(|p| app.shared.icons.get(ui.ctx(), app.actions.as_ref(), p, 6));
+    table.icon_cell(ui, rect.translate(egui::vec2(row.depth as f32 * 22.0, 0.0)), tex.as_ref(), pal.accent);
+    let name_rect = table.col_rect(0, avail, rect);
+    ui.painter().text(
+        egui::Pos2::new(name_rect.left() + 58.0 + row.depth as f32 * 22.0, rect.center().y),
+        egui::Align2::LEFT_CENTER,
+        &row.name,
+        egui::FontId::proportional(12.5),
+        pal.text,
+    );
+
+    // Status text + efficiency leaf.
+    if row.suspended {
+        table.text_cell(ui, avail, rect, 1, "Angehalten", pal, false);
+    }
+    if app.efficiency_pids.contains(&row.pid) {
+        let status_rect = table.col_rect(1, avail, rect);
+        crate::icons::draw_at(
+            ui,
+            egui::Rect::from_center_size(
+                egui::Pos2::new(status_rect.right() - 16.0, rect.center().y),
+                egui::vec2(16.0, 16.0),
+            ),
+            Icon::Leaf,
+            pal.ok_green,
+        );
+    }
+
+    // Heat cells.
+    let texts = [
+        format::format_pct_de(row.values[0].min(100.0) as f32),
+        format::format_mb_de(row.values[1] as u64),
+        format::format_rate_de(row.values[2]),
+        format::format_mbit_de(row.values[3]),
+    ];
+    let intensity = [
+        (row.values[0].min(100.0) / 100.0) as f32,
+        (row.values[1] / maxima[1].max(1.0)) as f32,
+        (row.values[2] / maxima[2].max(1.0)) as f32,
+        (row.values[3] / maxima[3].max(1.0)) as f32,
+    ];
+    let active = row.values.iter().any(|&v| v > 0.0);
+    let cells: Vec<(f32, String)> =
+        intensity.iter().zip(texts.iter()).map(|(t, s)| (*t, s.clone())).collect();
+    table.heat_cells(ui, pal, avail, rect, 2, &cells, active);
+
+    if resp.clicked() {
+        app.selected_pid = Some(row.pid);
+    }
+    resp.context_menu(|ui| context_menu(app, ui, row));
+}
+
+fn context_menu(app: &mut TaskManApp, ui: &mut egui::Ui, row: &Row) {
+    ui.set_min_width(200.0);
+    if ui.button("Task beenden").clicked() {
+        match app.actions.kill_process(row.pid, false) {
+            Ok(()) => app.shared.toast(format!("{} beendet", row.name)),
+            Err(e) => app.shared.toast(format!("Fehler: {e}")),
+        }
+        ui.close();
+    }
+    #[cfg(target_os = "windows")]
+    if ui.button("Struktur beenden").clicked() {
+        match app.actions.kill_process(row.pid, true) {
+            Ok(()) => app.shared.toast(format!("Struktur von {} beendet", row.name)),
+            Err(e) => app.shared.toast(format!("Fehler: {e}")),
+        }
+        ui.close();
+    }
+    ui.separator();
+    if ui.button("Effizienzmodus").clicked() {
+        let on = !app.efficiency_pids.contains(&row.pid);
+        match app.actions.set_efficiency_mode(row.pid, on) {
+            Ok(()) => {
+                if on {
+                    app.efficiency_pids.insert(row.pid);
+                } else {
+                    app.efficiency_pids.remove(&row.pid);
+                }
+            }
+            Err(e) => app.shared.toast(format!("Fehler: {e}")),
+        }
+        ui.close();
+    }
+    if ui.button("Im Detail anzeigen").clicked() {
+        app.details_state.filter = row.name.clone();
+        app.tab = crate::app::Tab::Details;
+        ui.close();
+    }
+    let _ = row.suspended;
+}
+
+// ---------------------------------------------------------------- row model
+
+fn column_maxima(rows: &[Row]) -> [f64; 4] {
+    let mut m = [1.0f64; 4];
+    for r in rows {
+        for (m_i, v) in m.iter_mut().zip(r.values) {
+            *m_i = (*m_i).max(v);
+        }
+    }
+    m
+}
+
+/// Build the visible row list: apps tree + background tree, sorted.
+fn build_rows(
+    snap: &Snapshot,
+    search: &str,
+    sort_col: usize,
+    ascending: bool,
+    expanded: &HashSet<u32>,
+) -> Vec<Row> {
+    let q = search.trim().to_lowercase();
+    let all: Vec<&ProcessEntry> = snap.processes.iter().collect();
+    // Subtree aggregates computed once per process (used for sorting + rows).
+    let all_children = children_map(&all);
+    let mut subtree: HashMap<u32, [f64; 4]> = HashMap::with_capacity(all.len());
+    for p in &all {
+        subtree.insert(p.pid, subtree_values(p, &all_children));
+    }
+
+    // The sampler marks whole app-subtrees as `App`; the topmost process of
+    // each subtree is the root (TM's "Steam (2)" style grouping).
+    let app_pids: HashSet<u32> = snap
+        .processes
+        .iter()
+        .filter(|p| p.category == tm_core::model::ProcCategory::App)
+        .map(|p| p.pid)
+        .collect();
+
+    let mut rows = Vec::new();
+
+    // ---- Apps group (tree by ppid, aggregated parent values).
+    let app_list: Vec<&ProcessEntry> = snap
+        .processes
+        .iter()
+        .filter(|p| app_pids.contains(&p.pid))
+        .collect();
+    let app_children = children_map(&app_list);
+    let roots: Vec<&ProcessEntry> = app_list
+        .iter()
+        .copied()
+        .filter(|p| p.app_root || p.ppid.is_none_or(|pp| !app_pids.contains(&pp)))
+        .collect();
+    emit_tree(
+        &mut rows,
+        &roots,
+        &app_children,
+        &subtree,
+        0,
+        sort_col,
+        ascending,
+        expanded,
+    );
+
+    // ---- Background group (remaining processes, also tree-shaped).
+    let bg_list: Vec<&ProcessEntry> = snap
+        .processes
+        .iter()
+        .filter(|p| !app_pids.contains(&p.pid))
+        .collect();
+    let bg_children = children_map(&bg_list);
+    let bg_roots: Vec<&ProcessEntry> = bg_list
+        .iter()
+        .copied()
+        .filter(|p| p.ppid.is_none_or(|pp| !bg_children.contains_key(&pp)))
+        .collect();
+    emit_tree(
+        &mut rows,
+        &bg_roots,
+        &bg_children,
+        &subtree,
+        1,
+        sort_col,
+        ascending,
+        expanded,
+    );
+
+    if !q.is_empty() {
+        // Search: flat list of direct name matches only.
+        rows.retain(|r| r.name.to_lowercase().contains(&q));
+    }
+    rows
+}
+
+fn children_map<'a>(list: &[&'a ProcessEntry]) -> HashMap<u32, Vec<&'a ProcessEntry>> {
+    let pids: HashSet<u32> = list.iter().map(|p| p.pid).collect();
+    let mut m: HashMap<u32, Vec<&ProcessEntry>> = HashMap::new();
+    for p in list {
+        if let Some(ppid) = p.ppid
+            && ppid != p.pid
+            && pids.contains(&ppid)
+        {
+            m.entry(ppid).or_default().push(p);
+        }
+    }
+    m
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_tree<'a>(
+    out: &mut Vec<Row>,
+    roots: &[&'a ProcessEntry],
+    children: &HashMap<u32, Vec<&'a ProcessEntry>>,
+    subtree: &HashMap<u32, [f64; 4]>,
+    group: usize,
+    sort_col: usize,
+    ascending: bool,
+    expanded: &HashSet<u32>,
+) {
+    let mut roots: Vec<&ProcessEntry> = roots.to_vec();
+    sort_entries(&mut roots, sort_col, ascending, subtree);
+    for root in roots {
+        let n_children = children.get(&root.pid).map_or(0, |v| v.len());
+        let name = if n_children > 0 {
+            format!("{} ({})", root.shown_name(), n_children + 1)
+        } else {
+            root.shown_name().to_string()
+        };
+        out.push(make_row(
+            root,
+            subtree.get(&root.pid).unwrap_or(&[0.0; 4]),
+            group,
+            0,
+            n_children > 0,
+            name,
+        ));
+        if n_children > 0 && !expanded.contains(&root.pid) {
+            continue;
+        }
+        if let Some(kids) = children.get(&root.pid) {
+            let mut kids: Vec<&ProcessEntry> = kids.to_vec();
+            sort_entries(&mut kids, sort_col, ascending, subtree);
+            for k in kids {
+                let kn = children.get(&k.pid).map_or(0, |v| v.len());
+                let kname = if kn > 0 {
+                    format!("{} ({})", k.shown_name(), kn + 1)
+                } else {
+                    k.shown_name().to_string()
+                };
+                out.push(make_row(
+                    k,
+                    subtree.get(&k.pid).unwrap_or(&[0.0; 4]),
+                    group,
+                    1,
+                    kn > 0,
+                    kname,
+                ));
+            }
+        }
+    }
+}
+
+fn make_row(
+    p: &ProcessEntry,
+    values: &[f64; 4],
+    group: usize,
+    depth: usize,
+    children: bool,
+    name: String,
+) -> Row {
+    Row {
+        pid: p.pid,
+        depth,
+        name,
+        icon_path: p.exe_path.as_ref().map(|p| p.to_string_lossy().into_owned()),
+        children,
+        group,
+        values: *values,
+        suspended: p.status == ProcStatus::Suspended,
+    }
+}
+
+/// Aggregate cpu/mem/disk/net over a process and all its descendants.
+fn subtree_values(
+    p: &ProcessEntry,
+    children: &HashMap<u32, Vec<&ProcessEntry>>,
+) -> [f64; 4] {
+    let mut v = [
+        p.cpu_pct as f64,
+        p.mem_bytes as f64,
+        p.disk_read_bps + p.disk_write_bps,
+        p.net_recv_bps.unwrap_or(0.0) + p.net_sent_bps.unwrap_or(0.0),
+    ];
+    if let Some(kids) = children.get(&p.pid) {
+        for k in kids {
+            let kv = subtree_values(k, children);
+            for i in 0..4 {
+                v[i] += kv[i];
+            }
+        }
+    }
+    v
+}
+
+fn sort_entries(
+    v: &mut [&ProcessEntry],
+    col: usize,
+    asc: bool,
+    subtree: &HashMap<u32, [f64; 4]>,
+) {
+    let sv = |p: &ProcessEntry, i: usize| subtree.get(&p.pid).map_or(0.0, |s| s[i]);
+    v.sort_by(|a, b| {
+        let o = match col {
+            2 => sv(a, 0).partial_cmp(&sv(b, 0)).unwrap_or(std::cmp::Ordering::Equal),
+            3 => sv(a, 1).partial_cmp(&sv(b, 1)).unwrap_or(std::cmp::Ordering::Equal),
+            4 => sv(a, 2).partial_cmp(&sv(b, 2)).unwrap_or(std::cmp::Ordering::Equal),
+            5 => sv(a, 3).partial_cmp(&sv(b, 3)).unwrap_or(std::cmp::Ordering::Equal),
+            _ => a.shown_name().to_lowercase().cmp(&b.shown_name().to_lowercase()),
+        };
+        if asc { o } else { o.reverse() }
     });
-}
-
-fn highlight_name(p: &ProcessEntry, _search: &str) -> String {
-    p.shown_name().to_string()
-}
-
-fn heat_t(v: f32, max: f32) -> f32 {
-    if max > 0.001 { (v / max).sqrt() } else { 0.0 }
-}
-fn bytes_t(v: u64, max: u64) -> f32 {
-    if max > 0 {
-        (v as f32 / max as f32).sqrt()
-    } else {
-        0.0
-    }
-}
-fn rate_t(v: f64, max: f64) -> f32 {
-    if max > 0.001 {
-        ((v / max) as f32).sqrt()
-    } else {
-        0.0
-    }
 }

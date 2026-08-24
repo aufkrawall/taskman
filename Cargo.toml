@@ -29,9 +29,13 @@ windows = { version = "0.62", features = [
 ] }
 
 [profile.release]
-lto = "thin"
+lto = "fat"
 codegen-units = 1
-strip = "debuginfo"
+strip = "symbols"
+opt-level = 3
+panic = "abort"
+
+[profile.release.package."*"]
 opt-level = 3
 
 [profile.dev.package."*"]

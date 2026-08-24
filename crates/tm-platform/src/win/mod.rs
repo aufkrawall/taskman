@@ -2,6 +2,8 @@
 
 mod cpu_info;
 mod gpu;
+pub mod icons;
+mod version;
 mod perfcounters;
 mod process_ops;
 mod sampler;
@@ -15,6 +17,36 @@ use crate::actions::*;
 use tm_core::engine::SystemCollector;
 use tm_core::error::Result;
 use tm_core::model::*;
+
+/// Firmware POST duration of the last boot in ms — the same value the Task
+/// Manager shows as "Letzte BIOS-Zeit". Registry: FwPOSTTime under Session
+/// Manager\Power (0/missing = unknown).
+pub fn last_bios_time_ms() -> Option<u64> {
+    use windows::Win32::System::Registry::{RegGetValueW, HKEY_LOCAL_MACHINE, RRF_RT_REG_DWORD};
+    let sub: Vec<u16> = "SYSTEM\x5cCurrentControlSet\x5cControl\x5cSession Manager\x5cPower"
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    let value: Vec<u16> = "FwPOSTTime".encode_utf16().chain(std::iter::once(0)).collect();
+    let mut data: u32 = 0;
+    let mut size = std::mem::size_of::<u32>() as u32;
+    let rc = unsafe {
+        RegGetValueW(
+            HKEY_LOCAL_MACHINE,
+            windows::core::PCWSTR(sub.as_ptr()),
+            windows::core::PCWSTR(value.as_ptr()),
+            RRF_RT_REG_DWORD,
+            None,
+            Some(&mut data as *mut u32 as _),
+            Some(&mut size),
+        )
+    };
+    if rc.is_err() || data == 0 {
+        None
+    } else {
+        Some(data as u64)
+    }
+}
 
 /// Collector combining sysinfo sampling with Win32/PDH extras.
 pub struct WinCollector {
@@ -109,10 +141,20 @@ impl PlatformActions for WinActions {
         process_ops::relaunch_elevated()
     }
 
+    fn last_bios_time_ms(&self) -> Option<u64> {
+        last_bios_time_ms()
+    }
+
+    fn process_icon_rgba(&self, exe_path: &str) -> Option<(u32, u32, Vec<u8>)> {
+        icons::extract_icon_rgba(exe_path).map(|ic| (ic.width, ic.height, ic.rgba))
+    }
+
     fn backend_name(&self) -> &'static str {
         "win32"
     }
 }
+
+
 
 pub fn create() -> (WinCollector, WinActions) {
     (

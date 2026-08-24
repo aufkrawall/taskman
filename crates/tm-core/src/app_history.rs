@@ -73,6 +73,14 @@ impl AppHistoryDb {
         self.since_epoch_s
     }
 
+    /// Wipe all accumulated usage ("Auslastungsverlauf löschen").
+    pub fn clear(&mut self) {
+        self.entries.clear();
+        self.prev.clear();
+        self.since_epoch_s = unix_now();
+        self.save();
+    }
+
     pub fn entries(&self) -> &BTreeMap<String, AppUsage> {
         &self.entries
     }

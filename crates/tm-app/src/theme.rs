@@ -1,5 +1,5 @@
-//! Theme: Win11-Task-Manager-inspired palette for dark and light mode,
-//! heatmap gradient helpers and accent colors.
+//! Theme: Windows-11-Task-Manager palette for dark and light mode plus the
+//! blue heat-map gradient used by the table value cells.
 
 use eframe::egui::{self, Color32, CornerRadius, Visuals};
 
@@ -16,9 +16,10 @@ pub struct Palette {
     pub accent_text: Color32,
     pub stroke: Color32,
     pub chart_grid: Color32,
-    /// Heat gradient stops (low → high utilization).
+    /// Base navy behind every active row's numeric cells.
+    pub heat_base: Color32,
+    /// Heat gradient stops (low → high utilization), blue like Win11 TM.
     pub heat_low: Color32,
-    pub heat_mid: Color32,
     pub heat_high: Color32,
     pub ok_green: Color32,
 }
@@ -26,18 +27,18 @@ pub struct Palette {
 pub const DARK: Palette = Palette {
     window_bg: Color32::from_rgb(0x20, 0x20, 0x20),
     panel_bg: Color32::from_rgb(0x27, 0x27, 0x27),
-    card_bg: Color32::from_rgb(0x2d, 0x2d, 0x2d),
-    card_bg_hover: Color32::from_rgb(0x35, 0x35, 0x35),
-    sidebar_bg: Color32::from_rgb(0x1c, 0x1c, 0x1c),
-    text: Color32::from_rgb(0xf0, 0xf0, 0xf0),
-    text_dim: Color32::from_rgb(0x9a, 0x9a, 0x9a),
+    card_bg: Color32::from_rgb(0x2b, 0x2b, 0x2b),
+    card_bg_hover: Color32::from_rgb(0x38, 0x38, 0x38),
+    sidebar_bg: Color32::from_rgb(0x1b, 0x1b, 0x1b),
+    text: Color32::from_rgb(0xff, 0xff, 0xff),
+    text_dim: Color32::from_rgb(0x9d, 0x9d, 0x9d),
     accent: Color32::from_rgb(0x4c, 0xc2, 0xff),
     accent_text: Color32::from_rgb(0x00, 0x1b, 0x2e),
-    stroke: Color32::from_rgb(0x3a, 0x3a, 0x3a),
-    chart_grid: Color32::from_rgb(0x3c, 0x3c, 0x3c),
-    heat_low: Color32::from_rgba_premultiplied(60, 120, 70, 90),
-    heat_mid: Color32::from_rgba_premultiplied(140, 130, 40, 100),
-    heat_high: Color32::from_rgba_premultiplied(160, 55, 45, 120),
+    stroke: Color32::from_rgb(0x38, 0x38, 0x38),
+    chart_grid: Color32::from_rgb(0x37, 0x37, 0x37),
+    heat_base: Color32::from_rgb(0x1a, 0x2a, 0x4a),
+    heat_low: Color32::from_rgb(0x1c, 0x30, 0x58),
+    heat_high: Color32::from_rgb(0x3f, 0x76, 0xd0),
     ok_green: Color32::from_rgb(0x6c, 0xcb, 0x6f),
 };
 
@@ -53,9 +54,9 @@ pub const LIGHT: Palette = Palette {
     accent_text: Color32::WHITE,
     stroke: Color32::from_rgb(0xdd, 0xdd, 0xdd),
     chart_grid: Color32::from_rgb(0xe2, 0xe2, 0xe2),
-    heat_low: Color32::from_rgba_premultiplied(190, 230, 195, 110),
-    heat_mid: Color32::from_rgba_premultiplied(245, 220, 150, 130),
-    heat_high: Color32::from_rgba_premultiplied(240, 170, 155, 150),
+    heat_base: Color32::from_rgb(0xea, 0xf1, 0xfb),
+    heat_low: Color32::from_rgb(0xd8, 0xe8, 0xfa),
+    heat_high: Color32::from_rgb(0x9f, 0xc8, 0xf0),
     ok_green: Color32::from_rgb(0x0f, 0x7b, 0x0f),
 };
 
@@ -123,23 +124,20 @@ pub fn light_visuals() -> Visuals {
     v
 }
 
-/// Map normalized intensity [0..=1] to the heat gradient.
-pub fn heat_color(pal: &Palette, t: f32) -> Color32 {
+/// Map normalized intensity [0..=1] to the blue heat gradient
+/// (Win11 Task Manager style value-cell background).
+pub fn heat_blue(pal: &Palette, t: f32) -> Color32 {
     let t = t.clamp(0.0, 1.0);
+    let f = t * t; // ease-in: small values stay near the base navy
     let lerp = |a: Color32, b: Color32, f: f32| -> Color32 {
-        let f = f.clamp(0.0, 1.0);
         Color32::from_rgba_premultiplied(
             (a.r() as f32 + (b.r() as f32 - a.r() as f32) * f) as u8,
             (a.g() as f32 + (b.g() as f32 - a.g() as f32) * f) as u8,
             (a.b() as f32 + (b.b() as f32 - a.b() as f32) * f) as u8,
-            (a.a() as f32 + (b.a() as f32 - a.a() as f32) * f) as u8,
+            255,
         )
     };
-    if t < 0.5 {
-        lerp(pal.heat_low, pal.heat_mid, t * 2.0)
-    } else {
-        lerp(pal.heat_mid, pal.heat_high, (t - 0.5) * 2.0)
-    }
+    lerp(pal.heat_low, pal.heat_high, f)
 }
 
 /// Palette for a context (outside of any Ui).

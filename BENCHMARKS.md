@@ -62,3 +62,17 @@ Each bench dir is standalone: `cd bench/<dir> && cargo build --release`, then
 ```
 powershell -NoProfile -ExecutionPolicy Bypass -File bench/bench-window-ms.ps1 <abs path to exe>
 ```
+
+## Final app measurements (v2, full Task-Manager UI)
+
+Same machine, `cargo build --release` (fat LTO, strip=symbols, panic=abort).
+Startup = spawn → `MainWindowHandle` (40 ms polling), single run.
+
+| Build                        | Binary    | Startup-to-window |
+|------------------------------|-----------|-------------------|
+| default (wgpu + glow)        | 11.9 MB   | ~0.5–0.7 s        |
+| `--no-default-features --features glow` | 7.2 MB | ~0.5–0.6 s  |
+
+The glow-only build is the size-optimized option (`cargo build --release
+--no-default-features --features glow`); both stay well under the 1 s budget
+while sampling ~240 processes at 1 Hz in the background.

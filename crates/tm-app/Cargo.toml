@@ -9,14 +9,17 @@ license.workspace = true
 name = "taskman"
 path = "src/main.rs"
 
+[features]
+default = ["wgpu", "glow"]
+wgpu = ["eframe/wgpu"]
+glow = ["eframe/glow"]
+
 [dependencies]
 tm-core = { workspace = true }
 tm-platform = { workspace = true }
 eframe = { version = "=0.36.1", default-features = false, features = [
   "accesskit",
   "default_fonts",
-  "glow",
-  "wgpu",
   "wayland",
   "x11",
 ] }

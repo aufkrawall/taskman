@@ -1,6 +1,6 @@
 //! sysinfo-driven sampler producing full `Snapshot`s on Windows.
 
-use crate::win::{cpu_info, gpu, perfcounters, process_ops, threads_map, windows_enum};
+use crate::win::{cpu_info, gpu, perfcounters, process_ops, threads_map, version, windows_enum};
 use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -9,6 +9,10 @@ use sysinfo::{
     System, UpdateKind, Users,
 };
 use tm_core::classify;
+
+fn tm_category_app() -> tm_core::model::ProcCategory {
+    tm_core::model::ProcCategory::App
+}
 use tm_core::engine::SystemCollector;
 use tm_core::error::Result;
 use tm_core::model::*;
@@ -171,14 +175,27 @@ impl Sampler {
                 system_session: session_id.is_some_and(|s| s == 0),
             });
 
-            let user = p
+            let mut user = p
                 .user_id()
                 .and_then(|uid| self.user_names.get(uid).cloned());
+            // System processes have no owning user; TM shows "SYSTEM".
+            if user.is_none() && session_id.is_some_and(|sid| sid == 0) {
+                user = Some("SYSTEM".to_string());
+            }
 
             let du = p.disk_usage();
 
             let mut entry = ProcessEntry::new(pid_u, name.clone());
-            entry.display = name.clone();
+            // Friendly name (FileDescription) like TM: "Windows-Explorer".
+            if let Some(exe) = p.exe().map(|e| e.to_string_lossy().into_owned()) {
+                let ver = version::query(&exe);
+                if !ver[0].is_empty() {
+                    entry.display = ver[0].clone();
+                }
+                if !ver[1].is_empty() {
+                    entry.company = Some(ver[1].clone());
+                }
+            }
             entry.ppid = p.parent().map(|x| x.as_u32());
             entry.category = category;
             entry.status = map_status(p.status());
@@ -200,6 +217,89 @@ impl Sampler {
             entry.wow64 = process_ops::is_wow64(pid_u);
             entry.threads = thread_counts.get(&pid_u).copied();
             processes.push(entry);
+        }
+
+        // ---- App grouping (TM semantics) --------------------------------
+        // Every process with a visible window is an app root; windowless
+        // ancestors below system boundaries fold in ("Steam (2)" absorbs
+        // steamwebhelper's window; Terminal absorbs its shell children).
+        // The ancestor walk stops at windowed processes and at system
+        // processes (svchost/services/...), matching Task Manager.
+        {
+            let idx_by_pid: HashMap<u32, usize> =
+                processes.iter().enumerate().map(|(i, p)| (p.pid, i)).collect();
+            let mut children: HashMap<usize, Vec<usize>> = HashMap::new();
+            for (i, p) in processes.iter().enumerate() {
+                if let Some(ppid) = p.ppid
+                    && ppid != p.pid
+                    && let Some(&pi) = idx_by_pid.get(&ppid)
+                {
+                    children.entry(pi).or_default().push(i);
+                }
+            }
+            let is_boundary = |name: &str| -> bool {
+                const SYSTEM: [&str; 12] = [
+                    "svchost.exe",
+                    "services.exe",
+                    "csrss.exe",
+                    "smss.exe",
+                    "wininit.exe",
+                    "winlogon.exe",
+                    "lsass.exe",
+                    "lsaiso.exe",
+                    "dwm.exe",
+                    "fontdrvhost.exe",
+                    "system",
+                    "registry",
+                ];
+                SYSTEM.iter().any(|s| name.eq_ignore_ascii_case(s))
+            };
+            // App roots: windowed processes walked up to the topmost
+            // non-windowed, non-system ancestor.
+            let mut roots: Vec<usize> = Vec::new();
+            for (i, p) in processes.iter().enumerate() {
+                if !p.has_window {
+                    continue;
+                }
+                let mut cur = i;
+                loop {
+                    let next = processes[cur]
+                        .ppid
+                        .and_then(|pp| idx_by_pid.get(&pp).copied());
+                    match next {
+                        Some(pi)
+                            if pi != cur
+                                && !processes[pi].has_window
+                                && !is_boundary(&processes[pi].name) =>
+                        {
+                            cur = pi;
+                        }
+                        _ => break,
+                    }
+                }
+                if !roots.contains(&cur) {
+                    roots.push(cur);
+                }
+            }
+            // Propagate App from roots down through descendants. Windowed
+            // children are roots themselves and are not descended into.
+            let root_set: std::collections::HashSet<usize> = roots.iter().copied().collect();
+            for &r in &root_set {
+                processes[r].app_root = true;
+            }
+            let mut stack: Vec<usize> = roots;
+            let mut seen: Vec<usize> = stack.clone();
+            while let Some(i) = stack.pop() {
+                processes[i].category = tm_category_app();
+                if let Some(kids) = children.get(&i) {
+                    for &k in kids {
+                        if !root_set.contains(&k) && !seen.contains(&k) {
+                            seen.push(k);
+                            stack.push(k);
+                        }
+                    }
+                }
+            }
         }
 
         // ---- GPU ---------------------------------------------------------------
@@ -243,11 +343,15 @@ impl Sampler {
                 }
                 _ => MediaKind::Unknown,
             };
-            let id = disk_id_for_mount(&mount);
             let perf = disk_perf.iter().find(|x| x.matches_mount(&mount));
+            let id = match perf {
+                Some(x) => physical_disk_id(&x.instance, &mount),
+                None => disk_id_for_mount(&mount),
+            };
             disks.push(DiskInfo {
                 id,
                 mount: mount.clone(),
+                // keep id assignment below
                 label: String::new(),
                 media,
                 total_bytes: d.total_space(),
@@ -375,6 +479,13 @@ fn map_status(s: sysinfo::ProcessStatus) -> ProcStatus {
 
 fn disk_id_for_mount(mount: &str) -> String {
     mount.trim_end_matches(['\\', '/']).to_uppercase()
+}
+
+/// TM-style disk id "0 (C:)" from the PDH instance "0 C:".
+fn physical_disk_id(instance: &str, mount: &str) -> String {
+    let num = instance.split_whitespace().next().unwrap_or("0");
+    let letter = mount.trim_end_matches([char::from_u32(92).unwrap(), '/']).to_uppercase();
+    format!("{num} ({letter})")
 }
 
 fn classify_adapter(internal: &str) -> String {

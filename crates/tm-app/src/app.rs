@@ -1,5 +1,5 @@
-//! Root application state & layout: navigation rail, tab routing, status bar,
-//! settings dialog, run-new-task dialog, toast notifications.
+//! Root application state & layout: navigation rail, top search, per-tab
+//! command bars, dialogs, toasts.
 
 use crate::app_ui::apply_theme;
 use eframe::egui;
@@ -22,6 +22,7 @@ pub struct HistoryPoint {
     pub mem_used_bytes: u64,
     pub mem_total_bytes: u64,
     pub commit_used_bytes: u64,
+    #[allow(dead_code)] // kept for future committed-limit charts
     pub commit_limit_bytes: u64,
     pub disks: Vec<(String, f32, f64, f64)>, // mount, active%, read bps, write bps
     pub nets: Vec<(String, f64, f64)>,       // name, recv bps, sent bps
@@ -55,7 +56,7 @@ impl Tab {
             Tab::Processes => "Prozesse",
             Tab::Performance => "Leistung",
             Tab::AppHistory => "App-Verlauf",
-            Tab::Startup => "Autostart",
+            Tab::Startup => "Autostart von Apps",
             Tab::Users => "Benutzer",
             Tab::Details => "Details",
             Tab::Services => "Dienste",
@@ -85,6 +86,8 @@ pub struct SharedState {
     pub services_cache: Arc<PlMutex<Option<crate::tabs::services::Cache>>>,
     pub startup_cache: CachedVec<tm_core::model::StartupItem>,
     pub sessions_cache: CachedVec<tm_core::model::UserSession>,
+    /// Shell icon textures keyed by executable path.
+    pub icons: crate::icon_cache::IconCache,
     /// Toast queue (message, born instant).
     pub toasts: Arc<PlMutex<Vec<(String, std::time::Instant)>>>,
 }
@@ -112,19 +115,21 @@ pub struct TaskManApp {
     pub run_elevated: bool,
     pub ticks_seen: u64,
     pub affinity_dialog: Option<(u32, u64)>, // pid, current mask
+    pub startup_props: Option<tm_core::model::StartupItem>,
+    pub selected_startup_idx: Option<usize>,
     pub last_save: std::time::Instant,
+
+    /// Global top search ("Nach Namen, Herausgeber oder PID suchen").
+    pub search: String,
 
     // Tab states.
     pub processes_state: crate::tabs::processes::State,
-    pub perf_selected: usize, // index into resource list of Performance tab
-    pub details_sort_col: usize,
-    pub details_ascending: bool,
-    pub details_filter: String,
+    pub perf_selected: usize,
+    pub details_state: crate::tabs::details::State,
     pub selected_pid: Option<u32>,
+    pub selected_user: Option<u32>,
     pub efficiency_pids: std::collections::HashSet<u32>,
     // Services tab.
-    pub services_search: String,
-    pub services_running_filter: bool,
     pub services_selected_name: Option<String>,
 }
 
@@ -174,6 +179,7 @@ impl TaskManApp {
                 services_cache: Arc::new(PlMutex::new(None)),
                 startup_cache: Arc::new(PlMutex::new(None)),
                 sessions_cache: Arc::new(PlMutex::new(None)),
+                icons: Default::default(),
                 toasts: Arc::new(PlMutex::new(Vec::new())),
             },
             history: VecDeque::with_capacity(HISTORY_CAP),
@@ -185,16 +191,16 @@ impl TaskManApp {
             run_elevated: false,
             ticks_seen: 0,
             affinity_dialog: None,
+            startup_props: None,
+            selected_startup_idx: None,
             last_save: std::time::Instant::now(),
-            processes_state: Default::default(),
+            search: String::new(),
+            processes_state: crate::tabs::processes::State::new(),
             perf_selected: 0,
-            details_sort_col: 0,
-            details_ascending: false,
-            details_filter: String::new(),
+            details_state: Default::default(),
             selected_pid: None,
+            selected_user: None,
             efficiency_pids: std::collections::HashSet::new(),
-            services_search: String::new(),
-            services_running_filter: false,
             services_selected_name: None,
         }
     }
@@ -258,7 +264,7 @@ impl TaskManApp {
         self.tab = match name.to_ascii_lowercase().as_str() {
             "processes" | "prozesse" => Tab::Processes,
             "performance" | "leistung" => Tab::Performance,
-            "history" | "appverlauf" => Tab::AppHistory,
+            "apphistory" | "history" | "appverlauf" => Tab::AppHistory,
             "startup" | "autostart" => Tab::Startup,
             "users" | "benutzer" => Tab::Users,
             "details" => Tab::Details,
@@ -295,16 +301,12 @@ impl eframe::App for TaskManApp {
         let pal = crate::theme::palette_ctx(&ctx);
 
         // ------------------------------------------------ top-level panels
-        self.sidebar(ui, &pal);
-        self.status_bar(ui, &pal);
+        crate::app_ui::top_search_panel(self, ui, &pal);
+        crate::app_ui::sidebar(self, ui, &pal);
 
         // ------------------------------------------------ main content
         egui::CentralPanel::default()
-            .frame(
-                egui::Frame::NONE
-                    .fill(pal.window_bg)
-                    .inner_margin(egui::Margin::same(10)),
-            )
+            .frame(egui::Frame::NONE.fill(pal.window_bg))
             .show(ui, |ui| match self.tab {
                 Tab::Processes => crate::tabs::processes::show(self, ui),
                 Tab::Performance => crate::tabs::performance::show(self, ui),
@@ -317,15 +319,18 @@ impl eframe::App for TaskManApp {
 
         // ------------------------------------------------ dialogs & toasts
         if self.show_settings {
-            self.settings_dialog(&ctx, &pal);
+            crate::app_ui::settings_dialog(self, &ctx, &pal);
         }
         if self.run_dialog_open {
-            self.run_task_dialog(&ctx, &pal);
+            crate::app_ui::run_task_dialog(self, &ctx, &pal);
         }
         if let Some((pid, mask)) = self.affinity_dialog {
             crate::tabs::details::affinity_dialog(self, &ctx, pid, mask, &pal);
         }
-        self.draw_toasts(&ctx);
+        if self.startup_props.is_some() {
+            crate::tabs::startup::properties_dialog(self, &ctx, &pal);
+        }
+        crate::app_ui::draw_toasts(self, &ctx);
 
         // Global shortcuts.
         if ctx.input(|i| i.key_pressed(egui::Key::F5)) {
@@ -347,5 +352,15 @@ impl eframe::App for TaskManApp {
 impl TaskManApp {
     pub fn latest_snapshot(&self) -> Option<Arc<Snapshot>> {
         self.engine.latest()
+    }
+
+    /// End the selected process (toolbar "Task beenden").
+    pub fn end_selected(&mut self) {
+        if let Some(pid) = self.selected_pid.take() {
+            match self.actions.kill_process(pid, false) {
+                Ok(()) => self.shared.toast(format!("Prozess {pid} beendet")),
+                Err(e) => self.shared.toast(format!("Fehler: {e}")),
+            }
+        }
     }
 }
