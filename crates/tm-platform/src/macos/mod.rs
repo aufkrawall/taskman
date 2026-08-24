@@ -42,7 +42,7 @@ impl SystemCollector for MacCollector {
                 .with_cpu(sysinfo::CpuRefreshKind::nothing().with_cpu_usage().with_frequency())
                 .with_memory(MemoryRefreshKind::nothing().with_ram().with_swap()),
         );
-        self.sys.refresh_processes(
+        self.sys.refresh_processes_specifics(
             ProcessesToUpdate::All,
             true,
             ProcessRefreshKind::nothing()
@@ -53,7 +53,7 @@ impl SystemCollector for MacCollector {
                 .with_exe(UpdateKind::OnlyIfNotSet),
         );
         self.disks.refresh(true);
-        self.networks.refresh_list();
+        self.networks.refresh(true);
 
         let cpus = self.sys.cpus();
         let logical = cpus.len().max(1);
@@ -63,12 +63,12 @@ impl SystemCollector for MacCollector {
 
         let n_procs = self.sys.processes().len();
         let mut name_by_pid = HashMap::with_capacity(n_procs);
-        for (pid, p) in &self.sys.processes() {
+        for (pid, p) in self.sys.processes() {
             name_by_pid.insert(pid.as_u32(), p.name().to_string_lossy().into_owned());
         }
 
         let mut processes = Vec::with_capacity(n_procs);
-        for (pid, p) in &self.sys.processes() {
+        for (pid, p) in self.sys.processes() {
             let pid_u = pid.as_u32();
             let name = p.name().to_string_lossy().into_owned();
 
@@ -85,7 +85,7 @@ impl SystemCollector for MacCollector {
                         anc.push(n.clone());
                         cur = self
                             .sys
-                            .process(sysinfo::Pid::from(ppid))
+                            .process(sysinfo::Pid::from_u32(ppid))
                             .and_then(|pp| pp.parent())
                             .map(|x| x.as_u32());
                     }
@@ -212,8 +212,8 @@ impl SystemCollector for MacCollector {
                 os_name: System::name().unwrap_or_else(|| "macOS".into()),
                 os_version: System::os_version().unwrap_or_default(),
                 kernel_version: System::kernel_version().unwrap_or_default(),
-                uptime_s: self.sys.uptime(),
-                boot_epoch_s: self.sys.boot_time() as i64,
+                uptime_s: System::uptime(),
+                boot_epoch_s: System::boot_time() as i64,
                 process_count: n_procs,
                 thread_count: threads_total(&self.sys),
                 handle_count: 0,

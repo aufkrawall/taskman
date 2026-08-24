@@ -6,9 +6,16 @@ use tm_core::error::{Result, TmError};
 use tm_core::model::{StartupImpact, StartupItem};
 
 fn autostart_dirs() -> Vec<PathBuf> {
-    let mut dirs = vec![dirs::config_dir().unwrap_or_default().join("autostart")];
-    dirs.push(PathBuf::from("/etc/xdg/autostart"));
-    dirs
+    let mut out = Vec::new();
+    let config_home = std::env::var("XDG_CONFIG_HOME")
+        .ok()
+        .map(PathBuf::from)
+        .or_else(|| std::env::var("HOME").ok().map(|h| PathBuf::from(h).join(".config")));
+    if let Some(c) = config_home {
+        out.push(c.join("autostart"));
+    }
+    out.push(PathBuf::from("/etc/xdg/autostart"));
+    out
 }
 
 pub fn list_autostart() -> Vec<StartupItem> {
