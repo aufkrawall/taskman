@@ -111,6 +111,8 @@ pub enum MediaKind {
     Unknown,
     SsdNvme,
     SsdSata,
+    /// Generic SSD when the bus type is not distinguishable.
+    Ssd,
     Hdd,
     Usb,
     Network,
@@ -123,6 +125,7 @@ impl MediaKind {
             MediaKind::Unknown => "",
             MediaKind::SsdNvme => "SSD (NVMe)",
             MediaKind::SsdSata => "SSD (SATA)",
+            MediaKind::Ssd => "SSD",
             MediaKind::Hdd => "HDD",
             MediaKind::Usb => "USB",
             MediaKind::Network => "Network drive",
