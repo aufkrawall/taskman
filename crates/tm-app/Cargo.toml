@@ -1,5 +1,6 @@
 [package]
 name = "tm-app"
+description = "Cross-platform task manager GUI (Wayland/X11/Win32/Metal)"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -9,3 +10,20 @@ name = "taskman"
 path = "src/main.rs"
 
 [dependencies]
+tm-core = { workspace = true }
+tm-platform = { workspace = true }
+eframe = { version = "=0.36.1", default-features = false, features = [
+  "accesskit",
+  "default_fonts",
+  "glow",
+  "wgpu",
+  "wayland",
+  "x11",
+] }
+egui_extras = { version = "=0.36.1", features = ["serde"] }
+tracing = { workspace = true }
+serde_json = { workspace = true }
+parking_lot = { workspace = true }
+
+[package.metadata.notes]
+renderer = "wgpu primary, glow fallback; wayland+x11 enabled for native Linux"
