@@ -1,0 +1,39 @@
+[workspace]
+resolver = "2"
+members = ["crates/tm-core", "crates/tm-platform", "crates/tm-app"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT"
+
+[workspace.dependencies]
+tm-core = { path = "crates/tm-core" }
+tm-platform = { path = "crates/tm-platform" }
+
+anyhow = "1"
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+dirs = "6"
+parking_lot = "0.12"
+crossbeam-channel = "0.5"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "local-time"] }
+tracing-appender = "0.2"
+sysinfo = "0.39"
+windows = { version = "0.62", features = [
+  "Win32_Foundation",
+  "Win32_System_SystemInformation",
+] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "debuginfo"
+opt-level = 3
+
+[profile.dev.package."*"]
+# Optimize heavy third-party deps even in dev so wgpu/sysinfo stay usable while debugging.
+opt-level = 2
