@@ -1,0 +1,12 @@
+[package]
+name = "bench_egui_both"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+eframe = { version = "0.36", features = ["glow", "wgpu"] }
+
+[profile.release]
+lto = "thin"
+strip = true
+codegen-units = 1

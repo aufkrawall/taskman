@@ -1,0 +1,12 @@
+[package]
+name = "bench_egui_glow"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+eframe = { version = "0.36", default-features = false, features = ["glow", "default_fonts"] }
+
+[profile.release]
+lto = "thin"
+strip = true
+codegen-units = 1
