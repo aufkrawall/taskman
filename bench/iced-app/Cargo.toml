@@ -1,0 +1,12 @@
+[package]
+name = "bench_iced"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+iced = { version = "0.14", features = ["wgpu"] }
+
+[profile.release]
+lto = "thin"
+strip = true
+codegen-units = 1

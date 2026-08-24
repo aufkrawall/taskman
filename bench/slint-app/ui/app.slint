@@ -1,0 +1,18 @@
+import { Button } from "std-widgets.slint";
+export component MainWindow inherits Window {
+    title: "BenchSlint";
+    width: 640px;
+    height: 480px;
+    background: #202020;
+
+    VerticalLayout {
+        padding: 8px;
+        spacing: 4px;
+        Text { text: "Hello from Slint"; font-size: 24px; color: white; }
+        Button { text: "Button"; }
+        for i in 10: HorizontalLayout {
+            Text { text: "Row " + i; color: white; }
+            Text { text: i * 7 + "%"; color: white; }
+        }
+    }
+}

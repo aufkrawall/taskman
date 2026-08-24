@@ -1,0 +1,17 @@
+    Blocking waiting for file lock on package cache
+    Blocking waiting for file lock on package cache
+    Blocking waiting for file lock on package cache
+   Compiling bench_iced v0.1.0 (C:\Users\REDACTED\Programme\build\tmproject\bench\iced-app)
+warning: field `start` is never read
+ --> src\main.rs:7:5
+  |
+6 | struct State {
+  |        ----- field in this struct
+7 |     start: Instant,
+  |     ^^^^^
+  |
+  = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `bench_iced` (bin "bench_iced") generated 1 warning
+    Finished `release` profile [optimized] target(s) in 39.71s
+EXIT=0
