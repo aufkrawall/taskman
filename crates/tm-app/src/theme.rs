@@ -61,11 +61,7 @@ pub const LIGHT: Palette = Palette {
 
 /// Active palette derived from egui's dark-mode flag.
 pub fn palette(ui: &egui::Ui) -> Palette {
-    if ui.visuals().dark_mode {
-        DARK
-    } else {
-        LIGHT
-    }
+    if ui.visuals().dark_mode { DARK } else { LIGHT }
 }
 
 pub fn apply_startup(ctx: &egui::Context) {

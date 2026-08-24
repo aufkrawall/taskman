@@ -8,12 +8,12 @@ use crate::actions::*;
 use std::collections::HashMap;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use sysinfo::{
-    Disks, MemoryRefreshKind, Networks, ProcessRefreshKind, ProcessesToUpdate, RefreshKind,
-    System, UpdateKind,
+    Disks, MemoryRefreshKind, Networks, ProcessRefreshKind, ProcessesToUpdate, RefreshKind, System,
+    UpdateKind,
 };
-use tm_core::{classify, engine::SystemCollector};
 use tm_core::error::Result;
 use tm_core::model::*;
+use tm_core::{classify, engine::SystemCollector};
 
 pub struct MacCollector {
     sys: System,
@@ -39,7 +39,11 @@ impl SystemCollector for MacCollector {
 
         self.sys.refresh_specifics(
             RefreshKind::nothing()
-                .with_cpu(sysinfo::CpuRefreshKind::nothing().with_cpu_usage().with_frequency())
+                .with_cpu(
+                    sysinfo::CpuRefreshKind::nothing()
+                        .with_cpu_usage()
+                        .with_frequency(),
+                )
                 .with_memory(MemoryRefreshKind::nothing().with_ram().with_swap()),
         );
         self.sys.refresh_processes_specifics(
@@ -128,18 +132,24 @@ impl SystemCollector for MacCollector {
         for (name, data) in &self.networks {
             let recv_total = data.total_received();
             let sent_total = data.total_transmitted();
-            let (recv_bps, sent_bps) =
-                match (self.prev_net_totals.get(name.as_str()).copied(), self.first_tick_done) {
-                    (Some((pr, ps)), true) => (
-                        recv_total.saturating_sub(pr) as f64 / interval_s,
-                        sent_total.saturating_sub(ps) as f64 / interval_s,
-                    ),
-                    _ => (0.0, 0.0),
-                };
+            let (recv_bps, sent_bps) = match (
+                self.prev_net_totals.get(name.as_str()).copied(),
+                self.first_tick_done,
+            ) {
+                (Some((pr, ps)), true) => (
+                    recv_total.saturating_sub(pr) as f64 / interval_s,
+                    sent_total.saturating_sub(ps) as f64 / interval_s,
+                ),
+                _ => (0.0, 0.0),
+            };
             nets.push(NetworkInfo {
                 name: name.to_string(),
                 desc: String::new(),
-                kind: if name.starts_with("en") { "Ethernet".to_string() } else { String::new() },
+                kind: if name.starts_with("en") {
+                    "Ethernet".to_string()
+                } else {
+                    String::new()
+                },
                 oper_up: recv_total > 0 || sent_total > 0,
                 recv_bps,
                 sent_bps,
@@ -158,11 +168,20 @@ impl SystemCollector for MacCollector {
             timestamp_ms: now_ms(),
             sample_duration_ms: started.elapsed().as_millis() as u64,
             cpu: CpuInfo {
-                brand: cpus.first().map(|c| c.brand().to_string()).unwrap_or_default(),
-                vendor: cpus.first().map(|c| c.vendor_id().to_string()).unwrap_or_default(),
+                brand: cpus
+                    .first()
+                    .map(|c| c.brand().to_string())
+                    .unwrap_or_default(),
+                vendor: cpus
+                    .first()
+                    .map(|c| c.vendor_id().to_string())
+                    .unwrap_or_default(),
                 architecture: std::env::consts::ARCH.into(),
                 utilization_pct: utilization.clamp(0.0, 100.0),
-                per_core_pct: cpus.iter().map(|c| c.cpu_usage().clamp(0.0, 100.0)).collect(),
+                per_core_pct: cpus
+                    .iter()
+                    .map(|c| c.cpu_usage().clamp(0.0, 100.0))
+                    .collect(),
                 freq_mhz: freq,
                 freq_base_mhz: 0.0,
                 logical_count: logical,
@@ -236,7 +255,11 @@ fn now_ms() -> u64 {
 }
 
 fn threads_total(sys: &System) -> usize {
-    sys.processes().values().filter_map(|p| p.tasks()).map(|t| t.len()).sum()
+    sys.processes()
+        .values()
+        .filter_map(|p| p.tasks())
+        .map(|t| t.len())
+        .sum()
 }
 
 pub struct MacActions;
@@ -273,7 +296,14 @@ impl PlatformActions for MacActions {
         send_signal(pid, libc::SIGTERM)
     }
     fn suspend_process(&self, pid: u32, suspend: bool) -> Result<()> {
-        send_signal(pid, if suspend { libc::SIGSTOP } else { libc::SIGCONT })
+        send_signal(
+            pid,
+            if suspend {
+                libc::SIGSTOP
+            } else {
+                libc::SIGCONT
+            },
+        )
     }
     fn set_priority(&self, pid: u32, priority: PriorityClass) -> Result<()> {
         let nice: i32 = match priority {
@@ -287,7 +317,10 @@ impl PlatformActions for MacActions {
         if rc == 0 {
             Ok(())
         } else {
-            Err(tm_core::TmError::platform("setpriority", "permission denied"))
+            Err(tm_core::TmError::platform(
+                "setpriority",
+                "permission denied",
+            ))
         }
     }
 
@@ -314,7 +347,10 @@ fn send_signal(pid: u32, sig: i32) -> Result<()> {
     if rc == 0 {
         Ok(())
     } else {
-        Err(tm_core::TmError::platform("kill", format!("signal {sig} failed")))
+        Err(tm_core::TmError::platform(
+            "kill",
+            format!("signal {sig} failed"),
+        ))
     }
 }
 

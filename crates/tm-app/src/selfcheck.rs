@@ -60,11 +60,9 @@ pub fn run(mock: bool) -> i32 {
     let _ = join.join();
 
     // Basic sanity gates.
-    if !mock {
-        if snap.processes.len() < 5 || snap.cpu.logical_count == 0 {
-            eprintln!("selfcheck: implausible snapshot; failing");
-            return 1;
-        }
+    if !mock && (snap.processes.len() < 5 || snap.cpu.logical_count == 0) {
+        eprintln!("selfcheck: implausible snapshot; failing");
+        return 1;
     }
     0
 }

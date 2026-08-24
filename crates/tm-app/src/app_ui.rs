@@ -53,7 +53,8 @@ impl TaskManApp {
                         );
                         ui.painter().rect_filled(r, 2.0, pal.accent);
                     } else if response.hovered() {
-                        ui.painter().rect_filled(rect, 5.0, pal.card_bg_hover.gamma_multiply(0.8));
+                        ui.painter()
+                            .rect_filled(rect, 5.0, pal.card_bg_hover.gamma_multiply(0.8));
                     }
                     let icon_rect = egui::Rect::from_center_size(
                         rect.left_center() + egui::vec2(22.0, 0.0),
@@ -154,7 +155,10 @@ impl TaskManApp {
                         tm_core::settings::UpdateSpeed::Paused,
                     ] {
                         if ui
-                            .selectable_label(self.shared.settings.update_speed == speed, speed.label())
+                            .selectable_label(
+                                self.shared.settings.update_speed == speed,
+                                speed.label(),
+                            )
                             .clicked()
                         {
                             self.shared.settings.update_speed = speed;
@@ -173,13 +177,11 @@ impl TaskManApp {
                 let mut on_top = self.shared.settings.always_on_top;
                 if ui.checkbox(&mut on_top, "Immer im Vordergrund").changed() {
                     self.shared.settings.always_on_top = on_top;
-                    ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(
-                        if on_top {
-                            egui::WindowLevel::AlwaysOnTop
-                        } else {
-                            egui::WindowLevel::Normal
-                        },
-                    ));
+                    ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(if on_top {
+                        egui::WindowLevel::AlwaysOnTop
+                    } else {
+                        egui::WindowLevel::Normal
+                    }));
                 }
 
                 ui.add_space(10.0);
@@ -187,7 +189,10 @@ impl TaskManApp {
                 ui.horizontal(|ui| {
                     for secs in [30u32, 60, 120] {
                         if ui
-                            .selectable_label(self.shared.settings.graph_seconds == secs, format!("{secs} s"))
+                            .selectable_label(
+                                self.shared.settings.graph_seconds == secs,
+                                format!("{secs} s"),
+                            )
                             .clicked()
                         {
                             self.shared.settings.graph_seconds = secs;
@@ -218,7 +223,7 @@ impl TaskManApp {
         }
     }
 
-    pub fn run_task_dialog(&mut self, ctx: &egui::Context, pal: &theme::Palette) {
+    pub fn run_task_dialog(&mut self, ctx: &egui::Context, _pal: &theme::Palette) {
         let mut open = true;
         egui::Window::new("Neuen Task ausführen")
             .open(&mut open)
@@ -245,9 +250,9 @@ impl TaskManApp {
                     if ui.button("Abbrechen").clicked() {
                         self.run_dialog_open = false;
                     }
-                    let enter =
-                        resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                    if (ui.button("OK").clicked() || enter) && !self.run_dialog_text.trim().is_empty()
+                    let enter = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                    if (ui.button("OK").clicked() || enter)
+                        && !self.run_dialog_text.trim().is_empty()
                     {
                         let cmdline = self.run_dialog_text.trim().to_string();
                         match self.actions.run_new_task(&cmdline, self.run_elevated) {
@@ -295,7 +300,12 @@ impl TaskManApp {
     }
 }
 
-fn nav_button(ui: &mut egui::Ui, pal: &theme::Palette, icon: crate::icons::Icon, label: &str) -> bool {
+fn nav_button(
+    ui: &mut egui::Ui,
+    pal: &theme::Palette,
+    icon: crate::icons::Icon,
+    label: &str,
+) -> bool {
     let (rect, response) =
         ui.allocate_exact_size(egui::vec2(ui.available_width(), 32.0), egui::Sense::click());
     if response.hovered() {

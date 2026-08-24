@@ -41,12 +41,11 @@ const SYSTEM_UNIX: &[&str] = &[
 ];
 
 fn normalize(name: &str) -> String {
-    name.trim_start_matches('/')
-        .to_ascii_lowercase()
+    name.trim_start_matches('/').to_ascii_lowercase()
 }
 
 fn is_system_name(name_lower: &str) -> bool {
-    SYSTEM_CRITICAL.iter().any(|n| name_lower == *n)
+    SYSTEM_CRITICAL.contains(&name_lower)
         || SYSTEM_UNIX
             .iter()
             .any(|n| name_lower.starts_with(n) || name_lower == *n)

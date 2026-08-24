@@ -86,7 +86,7 @@ impl AppHistoryDb {
             if p.category != ProcCategory::App {
                 continue;
             }
-            let cpu_time = p.cpu_time_s.unwrap_or_else(|| {
+            let cpu_time = p.cpu_time_s.unwrap_or({
                 // Fallback: estimate from rate * elapsed when the platform
                 // cannot report accumulated CPU time.
                 0.0
@@ -115,8 +115,7 @@ impl AppHistoryDb {
             } else {
                 (p.cpu_pct as f64 / 100.0) * interval_s.max(0.0)
             };
-            let d_net = if d_net > 0 || (p.net_recv_bps.is_none() && p.net_sent_bps.is_none())
-            {
+            let d_net = if d_net > 0 || (p.net_recv_bps.is_none() && p.net_sent_bps.is_none()) {
                 d_net
             } else {
                 ((p.net_recv_bps.unwrap_or(0.0) + p.net_sent_bps.unwrap_or(0.0))
@@ -170,15 +169,14 @@ impl AppHistoryDb {
 fn unix_now() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
+        .map_or(0, |d| d.as_secs() as i64)
 }
 
 fn entry_key(p: &crate::model::ProcessEntry) -> String {
-    if let Some(path) = &p.exe_path {
-        if let Some(name) = path.file_name() {
-            return name.to_string_lossy().to_ascii_lowercase();
-        }
+    if let Some(path) = &p.exe_path
+        && let Some(name) = path.file_name()
+    {
+        return name.to_string_lossy().to_ascii_lowercase();
     }
     p.name.to_ascii_lowercase()
 }
@@ -206,7 +204,10 @@ mod tests {
         let mut db = AppHistoryDb::in_memory();
         db.observe(&snap_with(1, "app.exe", ProcCategory::App, 10.0, 1000), 1.0);
         db.observe(&snap_with(1, "app.exe", ProcCategory::App, 12.5, 1500), 1.0);
-        db.observe(&snap_with(2, "svc.exe", ProcCategory::System, 50.0, 999_999), 1.0);
+        db.observe(
+            &snap_with(2, "svc.exe", ProcCategory::System, 50.0, 999_999),
+            1.0,
+        );
 
         let e = db.entries().get("app.exe").unwrap();
         assert!((e.cpu_seconds - 2.5).abs() < 1e-6);
@@ -218,7 +219,10 @@ mod tests {
     fn first_sighting_contributes_no_accumulated_jump() {
         let mut db = AppHistoryDb::in_memory();
         // Process already lived 500 s before we started watching.
-        db.observe(&snap_with(3, "app.exe", ProcCategory::App, 500.0, 1 << 20), 1.0);
+        db.observe(
+            &snap_with(3, "app.exe", ProcCategory::App, 500.0, 1 << 20),
+            1.0,
+        );
         let e = db.entries().get("app.exe").unwrap();
         assert_eq!(e.cpu_seconds, 0.0);
         assert_eq!(e.network_bytes, 0);
@@ -227,7 +231,10 @@ mod tests {
     #[test]
     fn pid_reuse_does_not_create_negative_deltas() {
         let mut db = AppHistoryDb::in_memory();
-        db.observe(&snap_with(7, "a.exe", ProcCategory::App, 100.0, 10_000), 1.0);
+        db.observe(
+            &snap_with(7, "a.exe", ProcCategory::App, 100.0, 10_000),
+            1.0,
+        );
         // New process with recycled pid starts from low counters again.
         db.observe(&snap_with(7, "b.exe", ProcCategory::App, 1.0, 200), 1.0);
         let a = db.entries().get("a.exe").unwrap();

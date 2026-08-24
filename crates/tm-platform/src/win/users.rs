@@ -3,8 +3,8 @@
 use tm_core::error::{Result, TmError};
 use tm_core::model::{UserSession, UserSessionState};
 use windows::Win32::System::RemoteDesktop::{
-    WTSDisconnectSession, WTSEnumerateSessionsW, WTSFreeMemory, WTSLogoffSession,
-    WTSQuerySessionInformationW, WTS_SESSION_INFOW, WTS_INFO_CLASS, WTSUserName, WTSDomainName,
+    WTS_INFO_CLASS, WTS_SESSION_INFOW, WTSDisconnectSession, WTSDomainName, WTSEnumerateSessionsW,
+    WTSFreeMemory, WTSLogoffSession, WTSQuerySessionInformationW, WTSUserName,
 };
 
 pub fn list_sessions() -> Result<Vec<UserSession>> {
@@ -21,7 +21,11 @@ pub fn list_sessions() -> Result<Vec<UserSession>> {
             let domain = query_string(s.SessionId, WTSDomainName);
             out.push(UserSession {
                 id: s.SessionId,
-                user: if user.is_empty() { format!("(session {})", s.SessionId) } else { user },
+                user: if user.is_empty() {
+                    format!("(session {})", s.SessionId)
+                } else {
+                    user
+                },
                 domain: (!domain.is_empty()).then_some(domain),
                 state: map_state(s.State.0),
                 logon_epoch_s: None,
@@ -37,19 +41,19 @@ pub fn list_sessions() -> Result<Vec<UserSession>> {
 
 unsafe fn query_string(session_id: u32, class: WTS_INFO_CLASS) -> String {
     unsafe {
-    let mut buf = windows::core::PWSTR::null();
-    let mut len: u32 = 0;
-    if WTSQuerySessionInformationW(None, session_id, class, &mut buf, &mut len).is_ok() {
-        let s = if buf.0.is_null() {
-            String::new()
+        let mut buf = windows::core::PWSTR::null();
+        let mut len: u32 = 0;
+        if WTSQuerySessionInformationW(None, session_id, class, &mut buf, &mut len).is_ok() {
+            let s = if buf.0.is_null() {
+                String::new()
+            } else {
+                buf.to_string().unwrap_or_default()
+            };
+            WTSFreeMemory(buf.0.cast());
+            s
         } else {
-            buf.to_string().unwrap_or_default()
-        };
-        WTSFreeMemory(buf.0.cast());
-        s
-    } else {
-        String::new()
-    }
+            String::new()
+        }
     }
 }
 

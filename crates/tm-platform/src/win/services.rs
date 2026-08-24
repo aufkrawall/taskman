@@ -2,8 +2,8 @@
 
 use tm_core::error::{Result, TmError};
 use tm_core::model::*;
-use windows::core::PCWSTR;
 use windows::Win32::System::Services as scm;
+use windows::core::PCWSTR;
 
 pub fn list_services() -> Result<Vec<ServiceInfo>> {
     let started = std::time::Instant::now();
@@ -78,8 +78,12 @@ pub fn list_services() -> Result<Vec<ServiceInfo>> {
 
 fn open_mgr() -> Result<scm::SC_HANDLE> {
     unsafe {
-        scm::OpenSCManagerW(PCWSTR::null(), PCWSTR::null(), scm::SC_MANAGER_ENUMERATE_SERVICE)
-            .map_err(|e| TmError::platform("OpenSCManagerW", e.to_string()))
+        scm::OpenSCManagerW(
+            PCWSTR::null(),
+            PCWSTR::null(),
+            scm::SC_MANAGER_ENUMERATE_SERVICE,
+        )
+        .map_err(|e| TmError::platform("OpenSCManagerW", e.to_string()))
     }
 }
 
@@ -91,9 +95,11 @@ fn enrich(services: &[ServiceInfo]) -> Result<Vec<ServiceInfo>> {
         for s in services {
             let mut info = s.clone();
             let name_w: Vec<u16> = s.name.encode_utf16().chain([0]).collect();
-            if let Ok(h) =
-                scm::OpenServiceW(mgr, PCWSTR::from_raw(name_w.as_ptr()), scm::SERVICE_QUERY_CONFIG)
-            {
+            if let Ok(h) = scm::OpenServiceW(
+                mgr,
+                PCWSTR::from_raw(name_w.as_ptr()),
+                scm::SERVICE_QUERY_CONFIG,
+            ) {
                 let mut needed: u32 = 0;
                 let _ = scm::QueryServiceConfigW(h, None, 0, &mut needed);
                 if needed > 0 {
@@ -225,7 +231,8 @@ pub fn control_service(name: &str, action: crate::actions::ServiceAction) -> Res
                     wait_state(svc, &[scm::SERVICE_STOPPED.0], 15)?;
                 }
                 Restart => {
-                    let _ = scm::ControlService(svc, scm::SERVICE_CONTROL_STOP, std::ptr::null_mut());
+                    let _ =
+                        scm::ControlService(svc, scm::SERVICE_CONTROL_STOP, std::ptr::null_mut());
                     wait_state(svc, &[scm::SERVICE_STOPPED.0], 15)?;
                     scm::StartServiceW(svc, None).map_err(wrap("StartServiceW(restart)"))?;
                     wait_state(svc, &[scm::SERVICE_RUNNING.0], 10)?;
@@ -245,31 +252,32 @@ fn wrap(ctx: &'static str) -> impl Fn(windows::core::Error) -> TmError {
 }
 
 /// Poll service state until it reaches one of `wanted` or timeout.
-unsafe fn wait_state(
-    svc: scm::SC_HANDLE,
-    wanted: &[u32],
-    timeout_s: u64,
-) -> Result<()> {
+unsafe fn wait_state(svc: scm::SC_HANDLE, wanted: &[u32], timeout_s: u64) -> Result<()> {
     use std::time::{Duration, Instant};
 
     unsafe {
-    let deadline = Instant::now() + Duration::from_secs(timeout_s);
-    loop {
-        let mut buf = [0u8; std::mem::size_of::<scm::SERVICE_STATUS_PROCESS>()];
-        let mut needed: u32 = 0;
-        if scm::QueryServiceStatusEx(svc, scm::SC_STATUS_PROCESS_INFO, Some(&mut buf), &mut needed)
+        let deadline = Instant::now() + Duration::from_secs(timeout_s);
+        loop {
+            let mut buf = [0u8; std::mem::size_of::<scm::SERVICE_STATUS_PROCESS>()];
+            let mut needed: u32 = 0;
+            if scm::QueryServiceStatusEx(
+                svc,
+                scm::SC_STATUS_PROCESS_INFO,
+                Some(&mut buf),
+                &mut needed,
+            )
             .is_ok()
-        {
-            let status = &*(buf.as_ptr() as *const scm::SERVICE_STATUS_PROCESS);
-            if wanted.contains(&(status.dwCurrentState.0)) {
-                return Ok(());
+            {
+                let status = &*(buf.as_ptr() as *const scm::SERVICE_STATUS_PROCESS);
+                if wanted.contains(&(status.dwCurrentState.0)) {
+                    return Ok(());
+                }
+            }
+            std::thread::sleep(Duration::from_millis(200));
+            if Instant::now() > deadline {
+                return Err(TmError::platform("service wait", "timeout"));
             }
         }
-        std::thread::sleep(Duration::from_millis(200));
-        if Instant::now() > deadline {
-            return Err(TmError::platform("service wait", "timeout"));
-        }
-    }
     }
 }
 

@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 use windows::Win32::System::Diagnostics::ToolHelp::{
-    CreateToolhelp32Snapshot, Thread32First, Thread32Next, TH32CS_SNAPTHREAD, THREADENTRY32,
+    CreateToolhelp32Snapshot, TH32CS_SNAPTHREAD, THREADENTRY32, Thread32First, Thread32Next,
 };
 
 pub fn thread_counts() -> HashMap<u32, u32> {

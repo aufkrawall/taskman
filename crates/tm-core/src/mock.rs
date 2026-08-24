@@ -13,8 +13,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 pub fn snapshot(seed: u32) -> Snapshot {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0);
+        .map_or(0, |d| d.as_millis() as u64);
     let s = seed as f32;
 
     let mut p1 = ProcessEntry::new(1000 + seed % 7, "mockapp.exe");
@@ -97,11 +96,17 @@ pub fn snapshot(seed: u32) -> Snapshot {
             util_pct: (s * 5.0) % 100.0,
             mem_used_bytes: 2 * 1024 * 1024 * 1024,
             mem_total_bytes: 8 * 1024 * 1024 * 1024,
-            dedicated_used_bytes: 1 * 1024 * 1024 * 1024,
+            dedicated_used_bytes: 1024 * 1024 * 1024,
             temperature_c: Some(42.0),
             engines: vec![
-                GpuEngine { name: "3D".into(), util_pct: (s * 5.0) % 100.0 },
-                GpuEngine { name: "Copy".into(), util_pct: 0.0 },
+                GpuEngine {
+                    name: "3D".into(),
+                    util_pct: (s * 5.0) % 100.0,
+                },
+                GpuEngine {
+                    name: "Copy".into(),
+                    util_pct: 0.0,
+                },
             ],
         }],
         processes: vec![p1, p2, p3],

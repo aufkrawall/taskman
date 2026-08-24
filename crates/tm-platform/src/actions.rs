@@ -5,9 +5,7 @@
 //! controls based on `capabilities()`.
 
 use tm_core::error::Result;
-use tm_core::model::{
-    ServiceInfo, StartupItem, UserSession, PriorityClass, ProcStatus,
-};
+use tm_core::model::{PriorityClass, ProcStatus, ServiceInfo, StartupItem, UserSession};
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Capabilities {

@@ -3,12 +3,11 @@
 
 use tm_core::error::{Result, TmError};
 use tm_core::model::PriorityClass;
-use windows::core::PCWSTR;
 use windows::Win32::Foundation::{CloseHandle, HANDLE};
 use windows::Win32::System::Threading as th;
 use windows::Win32::UI::Shell::ShellExecuteExW;
 use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
-
+use windows::core::PCWSTR;
 
 fn open_process(pid: u32, access: th::PROCESS_ACCESS_RIGHTS) -> Result<HANDLE> {
     unsafe {
@@ -98,7 +97,8 @@ pub fn kill_single(pid: u32) -> Result<()> {
     unsafe {
         let h = open_process(pid, th::PROCESS_TERMINATE)?;
         // Exit code 1 mirrors Task Manager behavior.
-        let r = th::TerminateProcess(h, 1).map_err(|e| TmError::platform("TerminateProcess", e.to_string()));
+        let r = th::TerminateProcess(h, 1)
+            .map_err(|e| TmError::platform("TerminateProcess", e.to_string()));
         let _ = CloseHandle(h);
         r
     }
@@ -112,11 +112,11 @@ pub fn kill_process(pid: u32, tree: bool) -> Result<()> {
     // Kill descendants depth-first (deepest last in BFS order → reverse).
     let mut err: Option<TmError> = None;
     for c in children.iter().rev() {
-        if *c != std::process::id() {
-            if let Err(e) = kill_single(*c) {
-                tracing::debug!(child = c, error = %e, "tree-kill child failed");
-                err.get_or_insert(e);
-            }
+        if *c != std::process::id()
+            && let Err(e) = kill_single(*c)
+        {
+            tracing::debug!(child = c, error = %e, "tree-kill child failed");
+            err.get_or_insert(e);
         }
     }
     match kill_single(pid) {
@@ -128,8 +128,8 @@ pub fn kill_process(pid: u32, tree: bool) -> Result<()> {
 /// BFS all descendant pids of `pid` via a full process snapshot.
 fn collect_children(root: u32) -> Vec<u32> {
     use windows::Win32::System::Diagnostics::ToolHelp::{
-        CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, TH32CS_SNAPPROCESS,
-        PROCESSENTRY32W,
+        CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW,
+        TH32CS_SNAPPROCESS,
     };
 
     let mut parent_map: std::collections::HashMap<u32, Vec<u32>> = Default::default();
@@ -181,25 +181,29 @@ fn ntdll_fn(name: &str) -> Option<NtSuspendFn> {
         let base = *NTDLL.get_or_init(|| {
             let wide: Vec<u16> = "ntdll.dll\0".encode_utf16().collect();
             windows::Win32::System::LibraryLoader::GetModuleHandleW(PCWSTR::from_raw(wide.as_ptr()))
-                .map(|m| m.0 as usize)
-                .unwrap_or(0)
+                .map_or(0, |m| m.0 as usize)
         });
         if base == 0 {
             return None;
         }
         let cname = std::ffi::CString::new(name).ok()?;
-        let proc_addr =
-            windows::Win32::System::LibraryLoader::GetProcAddress(
-                windows::Win32::Foundation::HMODULE(base as *mut _),
-                windows::core::PCSTR(cname.as_ptr() as *const u8),
-            )?;
-        Some(std::mem::transmute::<usize, NtSuspendFn>(proc_addr as usize))
+        let proc_addr = windows::Win32::System::LibraryLoader::GetProcAddress(
+            windows::Win32::Foundation::HMODULE(base as *mut _),
+            windows::core::PCSTR(cname.as_ptr() as *const u8),
+        )?;
+        Some(std::mem::transmute::<usize, NtSuspendFn>(
+            proc_addr as usize,
+        ))
     }
 }
 
 pub fn suspend_process(pid: u32, suspend: bool) -> Result<()> {
-    let f = ntdll_fn(if suspend { "NtSuspendProcess" } else { "NtResumeProcess" })
-        .ok_or_else(|| TmError::Unsupported("ntdll suspend/resume"))?;
+    let f = ntdll_fn(if suspend {
+        "NtSuspendProcess"
+    } else {
+        "NtResumeProcess"
+    })
+    .ok_or(TmError::Unsupported("ntdll suspend/resume"))?;
     unsafe {
         let h = open_process(pid, th::PROCESS_SUSPEND_RESUME)?;
         let rc = f(h);
@@ -207,7 +211,10 @@ pub fn suspend_process(pid: u32, suspend: bool) -> Result<()> {
         if rc == 0 {
             Ok(())
         } else {
-            Err(TmError::platform("suspend/resume", format!("NTSTATUS {rc:#x}")))
+            Err(TmError::platform(
+                "suspend/resume",
+                format!("NTSTATUS {rc:#x}"),
+            ))
         }
     }
 }
@@ -239,10 +246,7 @@ pub fn get_affinity(pid: u32) -> Result<u64> {
 
 pub fn system_affinity() -> Result<u64> {
     let pid = std::process::id();
-    get_affinity(pid).map(|mask| {
-        // Our own process mask may be restricted; fall back to kernel mask via any process.
-        mask
-    })
+    get_affinity(pid)
 }
 
 pub fn set_affinity(pid: u32, mask: u64) -> Result<()> {
@@ -259,8 +263,8 @@ pub fn set_affinity(pid: u32, mask: u64) -> Result<()> {
 
 pub fn set_efficiency_mode(pid: u32, on: bool) -> Result<()> {
     use windows::Win32::System::Threading::{
-        SetProcessInformation, PROCESS_POWER_THROTTLING_EXECUTION_SPEED,
-        PROCESS_POWER_THROTTLING_STATE, ProcessPowerThrottling,
+        PROCESS_POWER_THROTTLING_EXECUTION_SPEED, PROCESS_POWER_THROTTLING_STATE,
+        ProcessPowerThrottling, SetProcessInformation,
     };
     unsafe {
         let h = open_process(pid, th::PROCESS_SET_INFORMATION)?;
@@ -268,7 +272,11 @@ pub fn set_efficiency_mode(pid: u32, on: bool) -> Result<()> {
         let state = PROCESS_POWER_THROTTLING_STATE {
             Version: 1,
             ControlMask: PROCESS_POWER_THROTTLING_EXECUTION_SPEED,
-            StateMask: if on { 0u32 } else { PROCESS_POWER_THROTTLING_EXECUTION_SPEED },
+            StateMask: if on {
+                0u32
+            } else {
+                PROCESS_POWER_THROTTLING_EXECUTION_SPEED
+            },
         };
         let r = SetProcessInformation(
             h,
@@ -287,12 +295,15 @@ pub fn set_efficiency_mode(pid: u32, on: bool) -> Result<()> {
 pub fn is_elevated() -> bool {
     use windows::Win32::Foundation::HANDLE;
     use windows::Win32::Security::{
-        GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY,
+        GetTokenInformation, TOKEN_ELEVATION, TOKEN_QUERY, TokenElevation,
     };
     use windows::Win32::System::Threading::OpenProcessToken;
     unsafe {
-        let Ok(process) = th::OpenProcess(th::PROCESS_QUERY_LIMITED_INFORMATION, false, std::process::id())
-        else {
+        let Ok(process) = th::OpenProcess(
+            th::PROCESS_QUERY_LIMITED_INFORMATION,
+            false,
+            std::process::id(),
+        ) else {
             return false;
         };
         let mut token = HANDLE::default();
@@ -324,17 +335,18 @@ pub fn run_new_task(command_line: &str, elevate: bool) -> Result<()> {
 }
 
 pub fn relaunch_elevated() -> Result<()> {
-    let exe = std::env::current_exe()
-        .map_err(|e| TmError::platform("current_exe", e.to_string()))?;
+    let exe =
+        std::env::current_exe().map_err(|e| TmError::platform("current_exe", e.to_string()))?;
     shell_execute(&exe.to_string_lossy(), None, true, false)
 }
 
 fn shell_execute(file: &str, params: Option<&str>, elevate: bool, wait: bool) -> Result<()> {
-    use windows::Win32::UI::Shell::{SEE_MASK_FLAG_NO_UI, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW};
+    use windows::Win32::UI::Shell::{
+        SEE_MASK_FLAG_NO_UI, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW,
+    };
 
     let file_w: Vec<u16> = file.encode_utf16().chain([0]).collect();
-    let params_w: Option<Vec<u16>> =
-        params.map(|p| p.encode_utf16().chain([0]).collect());
+    let params_w: Option<Vec<u16>> = params.map(|p| p.encode_utf16().chain([0]).collect());
     let verb_w: Option<Vec<u16>> = elevate.then(|| "runas\0".encode_utf16().collect());
 
     let mut info = SHELLEXECUTEINFOW {
@@ -342,13 +354,11 @@ fn shell_execute(file: &str, params: Option<&str>, elevate: bool, wait: bool) ->
         fMask: SEE_MASK_NOCLOSEPROCESS | SEE_MASK_FLAG_NO_UI,
         lpVerb: verb_w
             .as_ref()
-            .map(|v| PCWSTR::from_raw(v.as_ptr()))
-            .unwrap_or(PCWSTR::null()),
+            .map_or(PCWSTR::null(), |v| PCWSTR::from_raw(v.as_ptr())),
         lpFile: PCWSTR::from_raw(file_w.as_ptr()),
         lpParameters: params_w
             .as_ref()
-            .map(|p| PCWSTR::from_raw(p.as_ptr()))
-            .unwrap_or(PCWSTR::null()),
+            .map_or(PCWSTR::null(), |p| PCWSTR::from_raw(p.as_ptr())),
         nShow: SW_SHOWNORMAL.0,
         ..Default::default()
     };
@@ -369,12 +379,12 @@ fn shell_execute(file: &str, params: Option<&str>, elevate: bool, wait: bool) ->
 /// Split "prog args..." respecting quotes into (file, params).
 fn split_command(cmd: &str) -> (String, Option<String>) {
     let cmd = cmd.trim();
-    if cmd.starts_with('"') {
-        if let Some(end) = cmd[1..].find('"') {
-            let file = cmd[1..1 + end].to_string();
-            let rest = cmd[2 + end..].trim();
-            return (file, (!rest.is_empty()).then(|| rest.to_string()));
-        }
+    if cmd.starts_with('"')
+        && let Some(end) = cmd[1..].find('"')
+    {
+        let file = cmd[1..1 + end].to_string();
+        let rest = cmd[2 + end..].trim();
+        return (file, (!rest.is_empty()).then(|| rest.to_string()));
     }
     match cmd.split_once(' ') {
         Some((f, p)) => (f.to_string(), Some(p.trim().to_string())),

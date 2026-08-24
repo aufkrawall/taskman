@@ -18,7 +18,6 @@ pub struct State {
     pub collapsed: [bool; 3],
 }
 
-
 pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
     let pal = theme::palette(ui);
     let Some(snap) = app.latest_snapshot() else {
@@ -53,9 +52,7 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
                                     );
                                 } else {
                                     ui.label(
-                                        egui::RichText::new(label)
-                                            .color(pal.text_dim)
-                                            .size(11.5),
+                                        egui::RichText::new(label).color(pal.text_dim).size(11.5),
                                     );
                                 }
                             });
@@ -116,7 +113,7 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
                         ))
                         .size(13.5),
                     );
-                    ui.weak(format!("{:.1} %", total_cpu));
+                    ui.weak(format!("{total_cpu:.1} %"));
                     ui.end_row();
                 });
 
@@ -126,7 +123,11 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
 
             // Sorted process rows.
             let mut sorted = procs;
-            sort_procs(&mut sorted, state.sort_col.unwrap_or(ProcColumn::Cpu), state.ascending);
+            sort_procs(
+                &mut sorted,
+                state.sort_col.unwrap_or(ProcColumn::Cpu),
+                state.ascending,
+            );
             for p in sorted {
                 proc_row(app, ui, &pal, p, &maxima, &state.search);
             }
@@ -213,8 +214,15 @@ fn sort_procs(v: &mut [&ProcessEntry], col: ProcColumn, asc: bool) {
         match col {
             ProcColumn::Name => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
             ProcColumn::Status => format!("{:?}", a.status).cmp(&format!("{:?}", b.status)),
-            ProcColumn::User => a.user.clone().unwrap_or_default().cmp(&b.user.clone().unwrap_or_default()),
-            ProcColumn::Cpu => a.cpu_pct.partial_cmp(&b.cpu_pct).unwrap_or(std::cmp::Ordering::Equal),
+            ProcColumn::User => a
+                .user
+                .clone()
+                .unwrap_or_default()
+                .cmp(&b.user.clone().unwrap_or_default()),
+            ProcColumn::Cpu => a
+                .cpu_pct
+                .partial_cmp(&b.cpu_pct)
+                .unwrap_or(std::cmp::Ordering::Equal),
             ProcColumn::Memory => a.mem_bytes.cmp(&b.mem_bytes),
             ProcColumn::Disk => (a.disk_read_bps + a.disk_write_bps)
                 .partial_cmp(&(b.disk_read_bps + b.disk_write_bps))
@@ -247,63 +255,85 @@ fn proc_row(
     let selected = app.selected_pid == Some(p.pid);
     let row_h = 24.0;
 
-    let response = ui.allocate_ui(egui::vec2(ui.available_width(), row_h), |ui| {
-        ui.horizontal(|ui| {
-            // Name cell with selection highlight spanning full width is complex;
-            // highlight via small accent dot instead.
-            if selected {
-                let rect = ui.available_rect_before_wrap();
-                ui.painter().rect_filled(
-                    egui::Rect::from_min_size(rect.left_top(), egui::vec2(rect.width(), row_h)),
-                    3.0,
-                    pal.accent.gamma_multiply(0.18),
+    let response = ui
+        .allocate_ui(egui::vec2(ui.available_width(), row_h), |ui| {
+            ui.horizontal(|ui| {
+                // Name cell with selection highlight spanning full width is complex;
+                // highlight via small accent dot instead.
+                if selected {
+                    let rect = ui.available_rect_before_wrap();
+                    ui.painter().rect_filled(
+                        egui::Rect::from_min_size(rect.left_top(), egui::vec2(rect.width(), row_h)),
+                        3.0,
+                        pal.accent.gamma_multiply(0.18),
+                    );
+                }
+
+                // Icon-ish dot colored by category.
+                let (rect, _) =
+                    ui.allocate_exact_size(egui::vec2(14.0, row_h), egui::Sense::hover());
+                let color = match p.category {
+                    ProcCategory::App => pal.accent,
+                    ProcCategory::Background => pal.text_dim.gamma_multiply(0.7),
+                    ProcCategory::System => pal.ok_green.gamma_multiply(0.9),
+                };
+                ui.painter().circle_filled(rect.center(), 3.0, color);
+
+                // Name (indented under its group).
+                ui.label(
+                    egui::RichText::new(highlight_name(p, search))
+                        .size(12.5)
+                        .color(pal.text),
                 );
-            }
 
-            // Icon-ish dot colored by category.
-            let (rect, _) = ui.allocate_exact_size(egui::vec2(14.0, row_h), egui::Sense::hover());
-            let color = match p.category {
-                ProcCategory::App => pal.accent,
-                ProcCategory::Background => pal.text_dim.gamma_multiply(0.7),
-                ProcCategory::System => pal.ok_green.gamma_multiply(0.9),
-            };
-            ui.painter().circle_filled(rect.center(), 3.0, color);
+                // Status.
+                let status_label = match p.status {
+                    ProcStatus::Suspended => "Angehalten",
+                    ProcStatus::NotResponding => "Reagiert nicht",
+                    ProcStatus::Running => "",
+                };
+                ui.monospace(status_label);
 
-            // Name (indented under its group).
-            ui.label(
-                egui::RichText::new(highlight_name(p, search)).size(12.5).color(pal.text),
-            );
+                // User.
+                ui.weak(p.user.clone().unwrap_or_default());
 
-            // Status.
-            let status_label = match p.status {
-                ProcStatus::Suspended => "Angehalten",
-                ProcStatus::NotResponding => "Reagiert nicht",
-                ProcStatus::Running => "",
-            };
-            ui.monospace(status_label);
-
-            // User.
-            ui.weak(p.user.clone().unwrap_or_default());
-
-            // Numeric cells.
-            tablekit::heat_cell_r(ui, pal, heat_t(p.cpu_pct, m.cpu), format::format_pct(p.cpu_pct));
-            tablekit::heat_cell_r(ui, pal, bytes_t(p.mem_bytes, m.mem), format::format_bytes(p.mem_bytes));
-            let d_total = p.disk_read_bps + p.disk_write_bps;
-            tablekit::heat_cell_r(ui, pal, rate_t(d_total, m.disk), format::format_rate_short(d_total));
-            let n_total = p.net_recv_bps.unwrap_or(0.0) + p.net_sent_bps.unwrap_or(0.0);
-            let net_text = if p.net_recv_bps.is_none() && p.net_sent_bps.is_none() {
-                "".to_string()
-            } else {
-                format::format_rate_short(n_total)
-            };
-            tablekit::heat_cell_r(ui, pal, rate_t(n_total, m.net), net_text);
-            let gpu_text = p
-                .gpu_util_pct
-                .map(|g| format::format_pct(g))
-                .unwrap_or_default();
-            tablekit::heat_cell_r(ui, pal, p.gpu_util_pct.map(|g| heat_t(g, m.gpu)).unwrap_or(0.0), gpu_text);
-        });
-    }).response;
+                // Numeric cells.
+                tablekit::heat_cell_r(
+                    ui,
+                    pal,
+                    heat_t(p.cpu_pct, m.cpu),
+                    format::format_pct(p.cpu_pct),
+                );
+                tablekit::heat_cell_r(
+                    ui,
+                    pal,
+                    bytes_t(p.mem_bytes, m.mem),
+                    format::format_bytes(p.mem_bytes),
+                );
+                let d_total = p.disk_read_bps + p.disk_write_bps;
+                tablekit::heat_cell_r(
+                    ui,
+                    pal,
+                    rate_t(d_total, m.disk),
+                    format::format_rate_short(d_total),
+                );
+                let n_total = p.net_recv_bps.unwrap_or(0.0) + p.net_sent_bps.unwrap_or(0.0);
+                let net_text = if p.net_recv_bps.is_none() && p.net_sent_bps.is_none() {
+                    "".to_string()
+                } else {
+                    format::format_rate_short(n_total)
+                };
+                tablekit::heat_cell_r(ui, pal, rate_t(n_total, m.net), net_text);
+                let gpu_text = p.gpu_util_pct.map(format::format_pct).unwrap_or_default();
+                tablekit::heat_cell_r(
+                    ui,
+                    pal,
+                    p.gpu_util_pct.map_or(0.0, |g| heat_t(g, m.gpu)),
+                    gpu_text,
+                );
+            });
+        })
+        .response;
 
     // Row interaction.
     let row_id = response.id.with(p.pid);
@@ -323,16 +353,25 @@ fn proc_row(
         #[cfg(target_os = "windows")]
         if ui.button("Struktur beenden").clicked() {
             match app.actions.kill_process(p.pid, true) {
-                Ok(()) => app.shared.toast(format!("Struktur von {} beendet", p.shown_name())),
+                Ok(()) => app
+                    .shared
+                    .toast(format!("Struktur von {} beendet", p.shown_name())),
                 Err(e) => app.shared.toast(format!("Fehler: {e}")),
             }
             ui.close();
         }
         ui.separator();
         let suspended = p.status == ProcStatus::Suspended;
-        if ui.button(if suspended { "Fortsetzen" } else { "Anhalten" }).clicked() {
+        if ui
+            .button(if suspended { "Fortsetzen" } else { "Anhalten" })
+            .clicked()
+        {
             match app.actions.suspend_process(p.pid, !suspended) {
-                Ok(()) => app.shared.toast(if suspended { "Fortgesetzt" } else { "Angehalten" }),
+                Ok(()) => app.shared.toast(if suspended {
+                    "Fortgesetzt"
+                } else {
+                    "Angehalten"
+                }),
                 Err(e) => app.shared.toast(format!("Fehler: {e}")),
             }
             ui.close();
@@ -340,10 +379,21 @@ fn proc_row(
         #[cfg(target_os = "windows")]
         {
             let eco_on = app.efficiency_pids.contains(&p.pid);
-            if ui.button(if eco_on { "Effizienzmodus deaktivieren" } else { "Effizienzmodus" }).clicked() {
+            if ui
+                .button(if eco_on {
+                    "Effizienzmodus deaktivieren"
+                } else {
+                    "Effizienzmodus"
+                })
+                .clicked()
+            {
                 match app.actions.set_efficiency_mode(p.pid, !eco_on) {
                     Ok(()) => {
-                        if eco_on { app.efficiency_pids.remove(&p.pid); } else { app.efficiency_pids.insert(p.pid); }
+                        if eco_on {
+                            app.efficiency_pids.remove(&p.pid);
+                        } else {
+                            app.efficiency_pids.insert(p.pid);
+                        }
                         app.shared.toast("Effizienzmodus geändert");
                     }
                     Err(e) => app.shared.toast(format!("Fehler: {e}")),
@@ -361,20 +411,24 @@ fn proc_row(
     });
 }
 
-fn highlight_name(p: &ProcessEntry, search: &str) -> String {
-    if search.is_empty() {
-        p.shown_name().to_string()
-    } else {
-        p.shown_name().to_string()
-    }
+fn highlight_name(p: &ProcessEntry, _search: &str) -> String {
+    p.shown_name().to_string()
 }
 
 fn heat_t(v: f32, max: f32) -> f32 {
     if max > 0.001 { (v / max).sqrt() } else { 0.0 }
 }
 fn bytes_t(v: u64, max: u64) -> f32 {
-    if max > 0 { ((v as f32 / max as f32)).sqrt() } else { 0.0 }
+    if max > 0 {
+        (v as f32 / max as f32).sqrt()
+    } else {
+        0.0
+    }
 }
 fn rate_t(v: f64, max: f64) -> f32 {
-    if max > 0.001 { ((v / max) as f32).sqrt() } else { 0.0 }
+    if max > 0.001 {
+        ((v / max) as f32).sqrt()
+    } else {
+        0.0
+    }
 }

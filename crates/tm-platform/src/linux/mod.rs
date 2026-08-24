@@ -8,8 +8,8 @@ use crate::actions::*;
 use std::collections::{HashMap, HashSet};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use sysinfo::{
-    Disks, MemoryRefreshKind, Networks, ProcessRefreshKind, ProcessesToUpdate, RefreshKind,
-    System, UpdateKind,
+    Disks, MemoryRefreshKind, Networks, ProcessRefreshKind, ProcessesToUpdate, RefreshKind, System,
+    UpdateKind,
 };
 use tm_core::classify;
 use tm_core::engine::SystemCollector;
@@ -41,7 +41,11 @@ impl SystemCollector for LinuxCollector {
 
         self.sys.refresh_specifics(
             RefreshKind::nothing()
-                .with_cpu(sysinfo::CpuRefreshKind::nothing().with_cpu_usage().with_frequency())
+                .with_cpu(
+                    sysinfo::CpuRefreshKind::nothing()
+                        .with_cpu_usage()
+                        .with_frequency(),
+                )
                 .with_memory(MemoryRefreshKind::nothing().with_ram().with_swap()),
         );
         self.sys.refresh_processes_specifics(
@@ -126,7 +130,9 @@ impl SystemCollector for LinuxCollector {
             entry.disk_write_total = du.total_written_bytes;
             entry.has_window = has_window;
             entry.exe_path = p.exe().map(|e| e.to_path_buf());
-            entry.user = p.user_id().and_then(|uid| username_for_uid(&self.users, uid));
+            entry.user = p
+                .user_id()
+                .and_then(|uid| username_for_uid(&self.users, uid));
             entry.status = match p.status() {
                 sysinfo::ProcessStatus::Stop => ProcStatus::Suspended,
                 _ => ProcStatus::Running,
@@ -145,7 +151,11 @@ impl SystemCollector for LinuxCollector {
                 _ => MediaKind::Unknown,
             };
             // Match the parent device for partitions ("sda2" -> "sda").
-            let ds = diskstats.iter().find(|s| dev == s.device || dev.starts_with(&format!("{}/", s.device)) == false && dev.trim_end_matches(char::is_numeric) == s.device);
+            let ds = diskstats.iter().find(|s| {
+                dev == s.device
+                    || dev.starts_with(&format!("{}/", s.device)) == false
+                        && dev.trim_end_matches(char::is_numeric) == s.device
+            });
             disks.push(DiskInfo {
                 id: dev.clone(),
                 mount,
@@ -166,14 +176,16 @@ impl SystemCollector for LinuxCollector {
         for (name, data) in &self.networks {
             let recv_total = data.total_received();
             let sent_total = data.total_transmitted();
-            let (recv_bps, sent_bps) =
-                match (self.prev_net_totals.get(name.as_str()).copied(), self.first_tick_done) {
-                    (Some((pr, ps)), true) => (
-                        recv_total.saturating_sub(pr) as f64 / interval_s,
-                        sent_total.saturating_sub(ps) as f64 / interval_s,
-                    ),
-                    _ => (0.0, 0.0),
-                };
+            let (recv_bps, sent_bps) = match (
+                self.prev_net_totals.get(name.as_str()).copied(),
+                self.first_tick_done,
+            ) {
+                (Some((pr, ps)), true) => (
+                    recv_total.saturating_sub(pr) as f64 / interval_s,
+                    sent_total.saturating_sub(ps) as f64 / interval_s,
+                ),
+                _ => (0.0, 0.0),
+            };
             nets.push(NetworkInfo {
                 name: name.to_string(),
                 desc: String::new(),
@@ -202,11 +214,20 @@ impl SystemCollector for LinuxCollector {
             timestamp_ms: now_ms(),
             sample_duration_ms: started.elapsed().as_millis() as u64,
             cpu: CpuInfo {
-                brand: cpus.first().map(|c| c.brand().to_string()).unwrap_or_default(),
-                vendor: cpus.first().map(|c| c.vendor_id().to_string()).unwrap_or_default(),
+                brand: cpus
+                    .first()
+                    .map(|c| c.brand().to_string())
+                    .unwrap_or_default(),
+                vendor: cpus
+                    .first()
+                    .map(|c| c.vendor_id().to_string())
+                    .unwrap_or_default(),
                 architecture: std::env::consts::ARCH.into(),
                 utilization_pct: utilization.clamp(0.0, 100.0),
-                per_core_pct: cpus.iter().map(|c| c.cpu_usage().clamp(0.0, 100.0)).collect(),
+                per_core_pct: cpus
+                    .iter()
+                    .map(|c| c.cpu_usage().clamp(0.0, 100.0))
+                    .collect(),
                 freq_mhz: freq,
                 freq_base_mhz: base_freq_from_cpufreq(),
                 logical_count: logical,
@@ -281,7 +302,12 @@ fn physical_cores() -> usize {
         let mut ids = Vec::new();
         for line in text.lines() {
             if let Some(rest) = line.strip_prefix("core id") {
-                if let Some(v) = rest.trim_start_matches(['\t', ' ', ':']).trim().parse::<u32>().ok() {
+                if let Some(v) = rest
+                    .trim_start_matches(['\t', ' ', ':'])
+                    .trim()
+                    .parse::<u32>()
+                    .ok()
+                {
                     ids.push(v);
                 }
             }
@@ -311,7 +337,8 @@ fn parse_cache_size(text: &str) -> u64 {
 }
 
 fn base_freq_from_cpufreq() -> f32 {
-    if let Ok(khz) = std::fs::read_to_string("/sys/devices/system/cpu/cpu0/cpufreq/base_frequency") {
+    if let Ok(khz) = std::fs::read_to_string("/sys/devices/system/cpu/cpu0/cpufreq/base_frequency")
+    {
         if let Ok(k) = khz.trim().parse::<f32>() {
             return k / 1000.0;
         }
@@ -333,7 +360,11 @@ fn now_ms() -> u64 {
 }
 
 fn threads_total(sys: &System) -> usize {
-    sys.processes().values().filter_map(|p| p.tasks()).map(|t| t.len()).sum()
+    sys.processes()
+        .values()
+        .filter_map(|p| p.tasks())
+        .map(|t| t.len())
+        .sum()
 }
 
 /// GPU list from DRM sysfs (amdgpu/i915 expose busy %).
@@ -371,7 +402,10 @@ fn drm_gpus() -> Vec<GpuInfo> {
                 mem_total_bytes: vram_total,
                 dedicated_used_bytes: vram_used,
                 temperature_c: None,
-                engines: vec![GpuEngine { name: "3D".into(), util_pct: busy }],
+                engines: vec![GpuEngine {
+                    name: "3D".into(),
+                    util_pct: busy,
+                }],
             });
         }
     }
@@ -417,7 +451,14 @@ impl PlatformActions for LinuxActions {
         send_signal(pid, libc::SIGTERM)
     }
     fn suspend_process(&self, pid: u32, suspend: bool) -> Result<()> {
-        send_signal(pid, if suspend { libc::SIGSTOP } else { libc::SIGCONT })
+        send_signal(
+            pid,
+            if suspend {
+                libc::SIGSTOP
+            } else {
+                libc::SIGCONT
+            },
+        )
     }
     fn set_priority(&self, pid: u32, priority: PriorityClass) -> Result<()> {
         let nice: i32 = match priority {
@@ -431,13 +472,18 @@ impl PlatformActions for LinuxActions {
         if rc == 0 {
             Ok(())
         } else {
-            Err(tm_core::TmError::platform("setpriority", "permission denied"))
+            Err(tm_core::TmError::platform(
+                "setpriority",
+                "permission denied",
+            ))
         }
     }
     fn get_affinity_mask(&self, pid: u32) -> Result<u64> {
         unsafe {
             let mut set: libc::cpu_set_t = std::mem::zeroed();
-            if libc::sched_getaffinity(pid as i32, std::mem::size_of::<libc::cpu_set_t>(), &mut set) != 0 {
+            if libc::sched_getaffinity(pid as i32, std::mem::size_of::<libc::cpu_set_t>(), &mut set)
+                != 0
+            {
                 return Err(tm_core::TmError::platform("sched_getaffinity", "failed"));
             }
             let mut mask = 0u64;
@@ -461,7 +507,9 @@ impl PlatformActions for LinuxActions {
                     libc::CPU_SET(cpu, &mut set);
                 }
             }
-            if libc::sched_setaffinity(pid as i32, std::mem::size_of::<libc::cpu_set_t>(), &set) != 0 {
+            if libc::sched_setaffinity(pid as i32, std::mem::size_of::<libc::cpu_set_t>(), &set)
+                != 0
+            {
                 return Err(tm_core::TmError::platform("sched_setaffinity", "failed"));
             }
             Ok(())
@@ -495,7 +543,10 @@ fn send_signal(pid: u32, sig: i32) -> Result<()> {
     if rc == 0 {
         Ok(())
     } else {
-        Err(tm_core::TmError::platform("kill", format!("signal {sig} failed")))
+        Err(tm_core::TmError::platform(
+            "kill",
+            format!("signal {sig} failed"),
+        ))
     }
 }
 
