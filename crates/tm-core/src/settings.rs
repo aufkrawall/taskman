@@ -57,6 +57,8 @@ pub struct Settings {
     pub window_size: [f32; 2],
     /// Show per-process network column even when the platform can't measure it.
     pub show_net_column_anyway: bool,
+    /// Navigation rail collapsed to icons only (hamburger toggle).
+    pub sidebar_collapsed: bool,
 }
 
 impl Default for Settings {
@@ -70,6 +72,7 @@ impl Default for Settings {
             remember_window: true,
             window_size: [1100.0, 720.0],
             show_net_column_anyway: true,
+            sidebar_collapsed: false,
         }
     }
 }

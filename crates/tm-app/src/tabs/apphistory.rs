@@ -1,98 +1,107 @@
-//! App history tab: cumulative CPU time / network per application since we
-//! started tracking (persisted across runs).
+//! App history tab: "App-Verlauf" — caption with since-date, clear-history
+//! link, and the CPU-Zeit/Netzwerk/Benachrichtigungen heat table.
 
 use eframe::egui;
+use tm_core::format;
 
 use crate::app::TaskManApp;
 use crate::theme;
+use crate::widgets::tablekit::{TmColumn, TmTable};
+
+const COLS: [TmColumn; 4] = [
+    TmColumn::text("name", "Name", 0.0),
+    TmColumn::num("cpu", "CPU-Zeit", 150.0),
+    TmColumn::num("net", "Netzwerk", 140.0),
+    TmColumn::num("notif", "Benachrichtigungen", 170.0),
+];
 
 pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
     let pal = theme::palette(ui);
 
-    let since_epoch = app.app_history_db.since_epoch_s();
-    let since_text = chrono_fmt_local(since_epoch);
-
-    ui.heading("App-Verlauf");
-    ui.label(
-        egui::RichText::new(format!(
-            "Ressourcennutzung seit {since_text} — CPU-Zeit und Netzwerk werden von Task Manager selbst gemessen."
-        ))
-        .size(12.0)
-        .color(pal.text_dim),
+    crate::app_ui::tab_header(
+        app,
+        ui,
+        &pal,
+        |_app, _ui| {},
+        |_app, ui| {
+            if ui.button("Jetzt aktualisieren (F5)").clicked() {
+                ui.close();
+            }
+        },
     );
-    ui.add_space(4.0);
-    ui.separator();
 
-    let entries: Vec<(String, f64, u64)> = app
+    // Caption + clear link, like TM.
+    let since = format::format_date_de(app.app_history_db.since_epoch_s());
+    ui.horizontal(|ui| {
+        ui.add_space(16.0);
+        ui.vertical(|ui| {
+            ui.label(
+                egui::RichText::new(format!(
+                    "Ressourcenauslastung seit {since} für aktuelle Benutzer- und Systemkonten."
+                ))
+                .size(12.5),
+            );
+            if ui
+                .add(
+                    egui::Button::new(
+                        egui::RichText::new("Auslastungsverlauf löschen")
+                            .size(12.5)
+                            .color(pal.accent),
+                    )
+                    .frame(false),
+                )
+                .clicked()
+            {
+                app.app_history_db.clear();
+                app.app_history_db.save();
+                app.shared.toast("Auslastungsverlauf gelöscht");
+            }
+        });
+    });
+    ui.add_space(6.0);
+
+    let q = app.search.trim().to_lowercase();
+    let mut rows: Vec<(String, f64, u64)> = app
         .app_history_db
         .entries()
         .iter()
         .map(|(k, v)| (k.clone(), v.cpu_seconds, v.network_bytes))
+        .filter(|(name, _, _)| q.is_empty() || name.to_lowercase().contains(&q))
         .collect();
-
-    let total_cpu: f64 = entries.iter().map(|e| e.1).sum();
-    ui.label(format!(
-        "Gesamte CPU-Zeit aller Apps: {}",
-        tm_core::format::format_cpu_time(total_cpu)
-    ));
-    ui.separator();
-
-    let mut rows = entries;
     rows.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
+    let table = TmTable::new(COLS.to_vec(), 340.0);
+    let max_cpu = rows.iter().map(|r| r.1).fold(0.0f64, f64::max).max(1.0);
+
+    let avail = ui.available_width();
+    table.header(ui, &pal, avail, None, None);
+
     egui::ScrollArea::vertical()
-        .id_salt("apphistory")
+        .id_salt("apphistory-table")
+        .auto_shrink(false)
         .show(ui, |ui| {
-            egui::Grid::new("apphist-header")
-                .num_columns(3)
-                .spacing([20.0, 4.0])
-                .show(ui, |ui| {
-                    for h in ["App", "CPU-Zeit", "Netzwerk"] {
-                        ui.label(egui::RichText::new(h).size(11.5).color(pal.text_dim));
-                    }
-                    ui.end_row();
-                });
-            ui.separator();
-            egui::Grid::new("apphist-rows")
-                .num_columns(3)
-                .spacing([20.0, 1.0])
-                .show(ui, |ui| {
-                    for (name, cpu_s, net_b) in rows.iter().take(500) {
-                        ui.monospace(name);
-                        ui.label(format!(
-                            "{}  ({:.1} %)",
-                            tm_core::format::format_cpu_time(*cpu_s),
-                            pct_of(*cpu_s, total_cpu)
-                        ));
-                        ui.label(tm_core::format::format_bytes(*net_b));
-                        ui.end_row();
-                    }
-                });
-            ui.add_space(20.0);
+            for (name, cpu_s, net_b) in rows.iter().take(500) {
+                let (rect, _resp) = table.row(ui, &pal, avail, false);
+                table.icon_cell(ui, rect, None, pal.accent);
+                let name_rect = table.col_rect(0, avail, rect);
+                ui.painter().text(
+                    egui::Pos2::new(name_rect.left() + 56.0, rect.center().y),
+                    egui::Align2::LEFT_CENTER,
+                    name,
+                    egui::FontId::proportional(12.5),
+                    pal.text,
+                );
+
+                let cells = vec![
+                    (
+                        (cpu_s / max_cpu) as f32,
+                        format::format_cpu_time(*cpu_s),
+                    ),
+                    (0.0, format::format_bytes_de(*net_b)),
+                    (0.0, "0 MB".to_string()),
+                ];
+                table.heat_cells(ui, &pal, avail, rect, 1, &cells, true);
+            }
+            ui.add_space(12.0);
         });
-}
-
-fn pct_of(v: f64, total: f64) -> f64 {
-    if total > 0.0 { v / total * 100.0 } else { 0.0 }
-}
-
-/// Format an epoch timestamp as local date "dd.mm.yyyy hh:mm".
-fn chrono_fmt_local(epoch_s: i64) -> String {
-    // Avoid a chrono dependency: compute UTC date via days math.
-    let secs = epoch_s;
-    let days = secs.div_euclid(86_400);
-    let rem = secs.rem_euclid(86_400);
-    let (h, m) = (rem / 3600, (rem % 3600) / 60);
-    // Civil-from-days algorithm (Howard Hinnant).
-    let z = days + 719_468;
-    let era = z.div_euclid(146_097);
-    let doe = z.rem_euclid(146_097);
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let mo = if mp < 10 { mp + 3 } else { mp - 9 };
-    let y = if mo <= 2 { y + 1 } else { y };
-    format!("{d:02}.{mo:02}.{y} {h:02}:{m:02}")
 }

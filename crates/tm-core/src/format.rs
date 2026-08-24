@@ -50,17 +50,179 @@ fn fmt1(v: f64, unit: &str) -> String {
     }
 }
 
-/// Uptime in the Windows TM style `d:hh:mm:ss` or `hh:mm:ss` under a day.
+/// Uptime in the Windows TM style `d:hh:mm:ss` (days are always shown,
+/// matching "0:05:43:22" in the reference).
 pub fn format_uptime(total_secs: u64) -> String {
     let d = total_secs / 86_400;
     let h = (total_secs % 86_400) / 3600;
     let m = (total_secs % 3600) / 60;
     let s = total_secs % 60;
-    if d > 0 {
-        format!("{d}:{h:02}:{m:02}:{s:02}")
-    } else {
-        format!("{h:02}:{m:02}:{s:02}")
+    format!("{d}:{h:02}:{m:02}:{s:02}")
+}
+
+// ---------------------------------------------------------------- German locale
+// The reference Task Manager runs on a de-DE system: decimal comma,
+// dot as group separator, comma numbers like "2.918,9 MB" or "4,24 GHz".
+
+/// Format a float German-style: dot group separator, comma decimals.
+fn de_fixed(v: f64, decimals: usize) -> String {
+    let v = if v.is_finite() { v } else { 0.0 };
+    let s = format!("{v:.decimals$}");
+    let (int_part, dec_part) = match s.split_once('.') {
+        Some((i, d)) => (i, Some(d)),
+        None => (s.as_str(), None),
+    };
+    // Group the integer part in threes.
+    let neg = int_part.starts_with('-');
+    let digits = if neg { &int_part[1..] } else { int_part };
+    let mut grouped = String::with_capacity(digits.len() + digits.len() / 3);
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i) % 3 == 0 {
+            grouped.push('.');
+        }
+        grouped.push(c);
     }
+    let mut out = String::new();
+    if neg {
+        out.push('-');
+    }
+    out.push_str(&grouped);
+    if let Some(d) = dec_part {
+        out.push(',');
+        out.push_str(d);
+    }
+    out
+}
+
+/// Integer with dot group separators: 238044 -> "238.044".
+pub fn format_thousands(n: u64) -> String {
+    de_fixed(n as f64, 0)
+}
+
+/// Percent German-style: "2 %" above 10, one decimal below ("0,3 %"),
+/// plain "0 %" for zero.
+pub fn format_pct_de(pct: f32) -> String {
+    if pct.abs() < 0.05 {
+        return "0 %".into();
+    }
+    if pct.abs() >= 9.95 {
+        format!("{} %", de_fixed(pct.round() as f64, 0))
+    } else {
+        format!("{} %", de_fixed(pct as f64, 1))
+    }
+}
+
+/// Header-aggregate percent, always integer like TM ("37 %").
+pub fn format_pct_de_int(pct: f32) -> String {
+    format!("{} %", de_fixed(pct.round() as f64, 0))
+}
+
+/// Bytes as German-formatted MB (Task Manager shows process memory in MB):
+/// "2.918,9 MB", "82,5 MB".
+pub fn format_mb_de(bytes: u64) -> String {
+    if bytes == 0 {
+        return "0 MB".into();
+    }
+    let mb = bytes as f64 / (1024.0 * 1024.0);
+    format!("{} MB", de_fixed(mb, 1))
+}
+
+/// Bytes with adaptive units, German format: "11,9 GB", "512 KB".
+pub fn format_bytes_de(bytes: u64) -> String {
+    let b = bytes as f64;
+    const K: f64 = 1024.0;
+    if bytes < 1024 {
+        return format!("{bytes} B");
+    }
+    if b < K * K {
+        format!("{} KB", de_fixed(b / K, 1))
+    } else if b < K * K * K {
+        format!("{} MB", de_fixed(b / (K * K), 1))
+    } else if b < K * K * K * K {
+        format!("{} GB", de_fixed(b / (K * K * K), 1))
+    } else {
+        format!("{} TB", de_fixed(b / (K * K * K * K), 1))
+    }
+}
+
+/// Disk rate German-style, always MB/s with one decimal like TM: "0,1 MB/s", "0 MB/s".
+pub fn format_rate_de(bps: f64) -> String {
+    if !bps.is_finite() || bps <= 0.0 {
+        return "0 MB/s".into();
+    }
+    let mb = bps / (1024.0 * 1024.0);
+    format!("{} MB/s", de_fixed(mb, 1))
+}
+
+/// Network rate German-style as MBit/s: "0 MBit/s", "0,1 MBit/s".
+pub fn format_mbit_de(bps: f64) -> String {
+    if !bps.is_finite() || bps <= 0.0 {
+        return "0 MBit/s".into();
+    }
+    let mbit = bps * 8.0 / (1000.0 * 1000.0);
+    if mbit >= 100.0 {
+        format!("{} MBit/s", de_fixed(mbit, 0))
+    } else {
+        format!("{} MBit/s", de_fixed(mbit, 1))
+    }
+}
+
+/// Network rate in KBit for the Performance sidebar: "48,0 KBit".
+pub fn format_kbit_de(bps: f64) -> String {
+    if !bps.is_finite() || bps <= 0.0 {
+        return "0 KBit".into();
+    }
+    let kbit = bps * 8.0 / 1024.0;
+    if kbit < 0.05 {
+        return "0 KBit".into();
+    }
+    if kbit >= 1024.0 {
+        format!("{} MBit", de_fixed(kbit / 1024.0, 1))
+    } else {
+        format!("{} KBit", de_fixed(kbit, 1))
+    }
+}
+
+/// Frequency German-style: "4,24 GHz", "3,40 GHz".
+pub fn format_freq_de(mhz: f32) -> String {
+    if mhz <= 0.0 {
+        return "—".into();
+    }
+    format!("{} GHz", de_fixed(mhz as f64 / 1000.0, 2))
+}
+
+/// Details-tab memory in KiB with group separator: "238.044 K".
+pub fn format_k_de(bytes: u64) -> String {
+    format!("{} K", format_thousands(bytes / 1024))
+}
+
+/// Details-tab CPU: zero-padded two-digit integer like TM ("00", "07").
+pub fn format_cpu_detail(pct: f32) -> String {
+    let v = pct.round() as i64;
+    if v < 100 {
+        format!("{v:02}")
+    } else {
+        format!("{v}")
+    }
+}
+
+/// Epoch seconds as "25.07.2026" (local date, no chrono dependency — UTC-based).
+pub fn format_date_de(epoch_s: i64) -> String {
+    let days = epoch_s.div_euclid(86_400);
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let mo = if mp < 10 { mp + 3 } else { mp - 9 };
+    format!("{d:02}.{mo:02}.{}", yoe + era * 400)
+}
+
+/// Seconds with one German decimal: 17.0 -> "17,0".
+pub fn format_seconds_de(secs: f64) -> String {
+    de_fixed(secs, 1)
 }
 
 /// Short duration for process CPU time columns ("123:45:06" hours:min:sec).
@@ -162,12 +324,36 @@ mod tests {
 
     #[test]
     fn uptime_formats() {
-        assert_eq!(format_uptime(0), "00:00:00");
-        assert_eq!(format_uptime(3661), "01:01:01");
+        assert_eq!(format_uptime(0), "0:00:00:00");
+        assert_eq!(format_uptime(3661), "0:01:01:01");
         assert_eq!(
             format_uptime((2 * 86400) + (4 * 3600) + (24 * 60) + 24),
             "2:04:24:24"
         );
+    }
+
+    #[test]
+    fn german_formats() {
+        assert_eq!(format_thousands(238_044), "238.044");
+        assert_eq!(format_thousands(1234), "1.234");
+        assert_eq!(format_thousands(999), "999");
+        assert_eq!(format_mb_de(3_060_688_486), "2.918,9 MB");
+        assert_eq!(format_mb_de(8_808_038), "8,4 MB");
+        assert_eq!(format_pct_de(0.3), "0,3 %");
+        assert_eq!(format_pct_de(2.0), "2,0 %");
+        assert_eq!(format_pct_de(12.4), "12 %");
+        assert_eq!(format_pct_de_int(37.4), "37 %");
+        assert_eq!(format_rate_de(0.0), "0 MB/s");
+        assert_eq!(format_rate_de(150_000.0), "0,1 MB/s");
+        assert_eq!(format_mbit_de(0.0), "0 MBit/s");
+        assert_eq!(format_freq_de(4240.0), "4,24 GHz");
+        assert_eq!(format_freq_de(3400.0), "3,40 GHz");
+        assert_eq!(format_k_de(243_765_248), "238.052 K");
+        assert_eq!(format_cpu_detail(0.2), "00");
+        assert_eq!(format_cpu_detail(7.4), "07");
+        assert_eq!(format_cpu_detail(101.0), "101");
+        assert_eq!(format_seconds_de(17.04), "17,0");
+        assert_eq!(format_bytes_de(34_253_000_000), "31,9 GB");
     }
 
     #[test]

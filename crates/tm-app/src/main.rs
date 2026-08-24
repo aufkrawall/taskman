@@ -16,6 +16,7 @@
 mod app;
 mod app_ui;
 mod fonts;
+mod icon_cache;
 mod icons;
 mod selfcheck;
 mod tabs;
@@ -61,7 +62,7 @@ fn run_gui(mock: bool, args: &[String]) {
     let options = |renderer: eframe::Renderer| eframe::NativeOptions {
         renderer,
         viewport: eframe::egui::ViewportBuilder::default()
-            .with_title("Task Manager")
+            .with_title("Task-Manager")
             .with_inner_size([settings.window_size[0], settings.window_size[1]])
             .with_min_inner_size([720.0, 480.0])
             .with_icon(icon_data()),
@@ -92,7 +93,7 @@ fn run_gui(mock: bool, args: &[String]) {
             }
             Ok(Box::new(application) as Box<dyn eframe::App>)
         };
-        match eframe::run_native("Task Manager", options(renderer), Box::new(creator)) {
+        match eframe::run_native("Task-Manager", options(renderer), Box::new(creator)) {
             Ok(()) => return,
             Err(e) => {
                 tracing::warn!(error = %e, "renderer failed; falling back");
@@ -107,11 +108,23 @@ fn run_gui(mock: bool, args: &[String]) {
     std::process::exit(1);
 
     fn preferred_renderers(pref: &str) -> Vec<eframe::Renderer> {
-        match pref.to_ascii_lowercase().as_str() {
-            "glow" => vec![eframe::Renderer::Glow],
-            "wgpu" => vec![eframe::Renderer::Wgpu],
-            _ => vec![eframe::Renderer::Wgpu, eframe::Renderer::Glow],
-        }
+        let mut all: Vec<eframe::Renderer> = Vec::new();
+        #[cfg(feature = "wgpu")]
+        all.push(eframe::Renderer::Wgpu);
+        #[cfg(feature = "glow")]
+        all.push(eframe::Renderer::Glow);
+        let want_wgpu = pref.eq_ignore_ascii_case("wgpu");
+        let want_glow = pref.eq_ignore_ascii_case("glow");
+        all.into_iter()
+            .filter(|r| match r {
+                #[cfg(feature = "wgpu")]
+                eframe::Renderer::Wgpu => !want_glow,
+                #[cfg(feature = "glow")]
+                eframe::Renderer::Glow => !want_wgpu,
+                #[allow(unreachable_patterns)]
+                _ => true,
+            })
+            .collect()
     }
 }
 
