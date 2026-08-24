@@ -20,6 +20,7 @@ pub struct LinuxCollector {
     sys: System,
     disks: Disks,
     networks: Networks,
+    users: sysinfo::Users,
     prev_net_totals: HashMap<String, (u64, u64)>,
     last_tick: Option<Instant>,
     first_tick_done: bool,
@@ -43,7 +44,7 @@ impl SystemCollector for LinuxCollector {
                 .with_cpu(sysinfo::CpuRefreshKind::nothing().with_cpu_usage().with_frequency())
                 .with_memory(MemoryRefreshKind::nothing().with_ram().with_swap()),
         );
-        self.sys.refresh_processes(
+        self.sys.refresh_processes_specifics(
             ProcessesToUpdate::All,
             true,
             ProcessRefreshKind::nothing()
@@ -54,7 +55,7 @@ impl SystemCollector for LinuxCollector {
                 .with_exe(UpdateKind::OnlyIfNotSet),
         );
         self.disks.refresh(true);
-        self.networks.refresh_list();
+        self.networks.refresh(true);
 
         let cpus = self.sys.cpus();
         let logical = cpus.len().max(1);
@@ -68,12 +69,12 @@ impl SystemCollector for LinuxCollector {
 
         let n_procs = self.sys.processes().len();
         let mut name_by_pid = HashMap::with_capacity(n_procs);
-        for (pid, p) in &self.sys.processes() {
+        for (pid, p) in self.sys.processes() {
             name_by_pid.insert(pid.as_u32(), p.name().to_string_lossy().into_owned());
         }
 
         let mut processes = Vec::with_capacity(n_procs);
-        for (pid, p) in &self.sys.processes() {
+        for (pid, p) in self.sys.processes() {
             let pid_u = pid.as_u32();
             let name = p.name().to_string_lossy().into_owned();
 
@@ -90,7 +91,7 @@ impl SystemCollector for LinuxCollector {
                         anc.push(n.clone());
                         cur = self
                             .sys
-                            .process(sysinfo::Pid::from(ppid))
+                            .process(sysinfo::Pid::from_u32(ppid))
                             .and_then(|pp| pp.parent())
                             .map(|x| x.as_u32());
                     }
@@ -125,7 +126,7 @@ impl SystemCollector for LinuxCollector {
             entry.disk_write_total = du.total_written_bytes;
             entry.has_window = has_window;
             entry.exe_path = p.exe().map(|e| e.to_path_buf());
-            entry.user = p.user_id().and_then(|uid| username_for_uid(uid.as_u32()));
+            entry.user = p.user_id().and_then(|uid| username_for_uid(&self.users, uid));
             entry.status = match p.status() {
                 sysinfo::ProcessStatus::Stop => ProcStatus::Suspended,
                 _ => ProcStatus::Running,
@@ -237,8 +238,8 @@ impl SystemCollector for LinuxCollector {
                 os_name: System::name().unwrap_or_else(|| "Linux".into()),
                 os_version: System::os_version().unwrap_or_default(),
                 kernel_version: System::kernel_version().unwrap_or_default(),
-                uptime_s: self.sys.uptime(),
-                boot_epoch_s: self.sys.boot_time() as i64,
+                uptime_s: System::uptime(),
+                boot_epoch_s: System::boot_time() as i64,
                 process_count: n_procs,
                 thread_count: threads_total(&self.sys),
                 handle_count: 0,
@@ -249,24 +250,12 @@ impl SystemCollector for LinuxCollector {
     }
 }
 
-fn username_for_uid(uid: u32) -> Option<String> {
-    static CACHE: parking_lot::Mutex<Option<HashMap<u32, String>>> = parking_lot::Mutex::new(None);
-    let mut guard = CACHE.lock();
-    if guard.is_none() {
-        let mut m = HashMap::new();
-        if let Ok(text) = std::fs::read_to_string("/etc/passwd") {
-            for line in text.lines() {
-                let parts: Vec<&str> = line.split(':').collect();
-                if parts.len() >= 3 {
-                    if let Ok(u) = parts[2].parse::<u32>() {
-                        m.entry(u).or_insert_with(|| parts[0].to_string());
-                    }
-                }
-            }
-        }
-        *guard = Some(m);
-    }
-    guard.as_ref().and_then(|m| m.get(&uid)).cloned()
+fn username_for_uid(users: &sysinfo::Users, uid: &sysinfo::Uid) -> Option<String> {
+    users
+        .list()
+        .iter()
+        .find(|u| u.id() == uid)
+        .map(|u| u.name().to_string())
 }
 
 fn proc_meminfo_field(field: &str) -> u64 {
@@ -333,7 +322,7 @@ fn base_freq_from_cpufreq() -> f32 {
 fn hostname() -> String {
     std::fs::read_to_string("/etc/hostname")
         .map(|h| h.trim().to_string())
-        .unwrap_or_else(|| std::env::var("HOSTNAME").unwrap_or_default())
+        .unwrap_or_else(|_| std::env::var("HOSTNAME").unwrap_or_default())
 }
 
 fn now_ms() -> u64 {
@@ -452,7 +441,7 @@ impl PlatformActions for LinuxActions {
                 return Err(tm_core::TmError::platform("sched_getaffinity", "failed"));
             }
             let mut mask = 0u64;
-            for cpu in 0..64u32 {
+            for cpu in 0usize..64 {
                 if libc::CPU_ISSET(cpu, &set) {
                     mask |= 1 << cpu;
                 }
@@ -467,8 +456,8 @@ impl PlatformActions for LinuxActions {
         unsafe {
             let mut set: libc::cpu_set_t = std::mem::zeroed();
             libc::CPU_ZERO(&mut set);
-            for cpu in 0..64u32 {
-                if mask & (1 << cpu) != 0 {
+            for cpu in 0usize..64 {
+                if mask & (1u64 << cpu) != 0 {
                     libc::CPU_SET(cpu, &mut set);
                 }
             }
@@ -516,6 +505,7 @@ pub fn create() -> (LinuxCollector, LinuxActions) {
             sys: System::new_all(),
             disks: Disks::new_with_refreshed_list(),
             networks: Networks::new_with_refreshed_list(),
+            users: sysinfo::Users::new_with_refreshed_list(),
             prev_net_totals: HashMap::new(),
             last_tick: None,
             first_tick_done: false,
