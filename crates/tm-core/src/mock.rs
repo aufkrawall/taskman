@@ -41,7 +41,7 @@ pub fn snapshot(seed: u32) -> Snapshot {
             vendor: "MockVendor".into(),
             architecture: "x86_64".into(),
             utilization_pct: ((s * 11.0) % 100.0),
-            per_core_pct: (0..8).map(|i| ((s * (i as f32 + 1.0)) % 100.0)).collect(),
+            per_core_pct: (0..8).map(|i| (s * (i as f32 + 1.0)) % 100.0).collect(),
             freq_mhz: 3400.0,
             freq_base_mhz: 3200.0,
             logical_count: 8,
