@@ -91,8 +91,12 @@ fn parse_raw() -> Vec<DiskStat> {
             if device.starts_with("loop") || device.starts_with("ram") {
                 continue;
             }
-            let num =
-                |i: usize| fields.get(i).and_then(|f| f.parse::<u64>().ok()).unwrap_or(0);
+            let num = |i: usize| {
+                fields
+                    .get(i)
+                    .and_then(|f| f.parse::<u64>().ok())
+                    .unwrap_or(0)
+            };
             out.push(DiskStat {
                 device,
                 reads_completed: num(3),

@@ -123,7 +123,7 @@ pub fn nice_scale(peak: f64) -> (f64, f64) {
 /// Percent label with no decimals above 10%, one decimal below (TM behavior).
 pub fn format_pct(pct: f32) -> String {
     if pct.abs() >= 9.95 {
-        format!("{:.0}%", pct)
+        format!("{pct:.0}%")
     } else {
         format!("{pct:.1}%")
     }

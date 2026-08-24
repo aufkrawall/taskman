@@ -4,7 +4,7 @@
 use eframe::egui;
 use tm_core::format;
 
-use crate::app::{TaskManApp};
+use crate::app::TaskManApp;
 use crate::theme;
 use crate::widgets::chart::LineChart;
 
@@ -68,7 +68,12 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
                 };
                 ui.painter().rect_filled(rect, 6.0, bg);
                 if selected {
-                    ui.painter().rect_stroke(rect, 6.0, egui::Stroke::new(1.2, pal.accent), egui::StrokeKind::Inside);
+                    ui.painter().rect_stroke(
+                        rect,
+                        6.0,
+                        egui::Stroke::new(1.2, pal.accent),
+                        egui::StrokeKind::Inside,
+                    );
                 }
                 let icon = match e.kind {
                     ResourceKind::Cpu => crate::icons::Icon::Cpu,
@@ -79,7 +84,10 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
                 };
                 crate::icons::draw_at(
                     ui,
-                    egui::Rect::from_center_size(rect.left_center() + egui::vec2(18.0, 0.0), egui::vec2(22.0, 22.0)),
+                    egui::Rect::from_center_size(
+                        rect.left_center() + egui::vec2(18.0, 0.0),
+                        egui::vec2(22.0, 22.0),
+                    ),
                     icon,
                     pal.text_dim,
                 );
@@ -148,13 +156,17 @@ fn build_resource_list(app: &TaskManApp) -> Vec<ResourceEntry> {
         kind: ResourceKind::Memory,
         key: "mem".into(),
         title: "Arbeitsspeicher".into(),
-        subtitle: format!("{:.1}/{:.1} GB", used_gb, total_gb),
+        subtitle: format!("{used_gb:.1}/{total_gb:.1} GB"),
         value_line: format!("{:.0} %", snap.memory.used_pct()),
     });
 
     // Disks.
     for d in &snap.disks {
-        let label = if d.label.is_empty() { d.mount.clone() } else { d.label.clone() };
+        let label = if d.label.is_empty() {
+            d.mount.clone()
+        } else {
+            d.label.clone()
+        };
         out.push(ResourceEntry {
             kind: ResourceKind::Disk,
             key: d.mount.clone(),
@@ -173,9 +185,17 @@ fn build_resource_list(app: &TaskManApp) -> Vec<ResourceEntry> {
         out.push(ResourceEntry {
             kind: ResourceKind::Network,
             key: n.name.clone(),
-            title: if n.kind.is_empty() { n.name.clone() } else { n.kind.clone() },
+            title: if n.kind.is_empty() {
+                n.name.clone()
+            } else {
+                n.kind.clone()
+            },
             subtitle: n.name.clone(),
-            value_line: format!("S: {}  E: {}", format::format_rate_short(n.sent_bps), format::format_rate_short(n.recv_bps)),
+            value_line: format!(
+                "S: {}  E: {}",
+                format::format_rate_short(n.sent_bps),
+                format::format_rate_short(n.recv_bps)
+            ),
         });
     }
 
@@ -189,7 +209,9 @@ fn build_resource_list(app: &TaskManApp) -> Vec<ResourceEntry> {
             value_line: format!(
                 "{:.0} %{}",
                 g.util_pct,
-                g.temperature_c.map(|t| format!("  {:.0} °C", t)).unwrap_or_default()
+                g.temperature_c
+                    .map(|t| format!("  {t:.0} °C"))
+                    .unwrap_or_default()
             ),
         });
     }
@@ -211,7 +233,10 @@ fn header(ui: &mut egui::Ui, icon: crate::icons::Icon, title: &str, sub: &str) {
     ui.horizontal(|ui| {
         crate::icons::draw_at(
             ui,
-            egui::Rect::from_center_size(ui.cursor().left_center() + egui::vec2(14.0, 0.0), egui::vec2(26.0, 26.0)),
+            egui::Rect::from_center_size(
+                ui.cursor().left_center() + egui::vec2(14.0, 0.0),
+                egui::vec2(26.0, 26.0),
+            ),
             icon,
             pal.accent,
         );
@@ -244,7 +269,11 @@ fn hist_vec(app: &TaskManApp) -> std::vec::Vec<crate::app::HistoryPoint> {
 /// Take the most recent `n` points as owned vec.
 fn recent(app: &TaskManApp, n: usize) -> std::vec::Vec<crate::app::HistoryPoint> {
     let mut v = hist_vec(app);
-    if v.len() <= n { v } else { v.split_off(v.len() - n) }
+    if v.len() <= n {
+        v
+    } else {
+        v.split_off(v.len() - n)
+    }
 }
 
 fn accent_color(ui: &egui::Ui) -> eframe::egui::Color32 {
@@ -254,13 +283,13 @@ fn accent_color(ui: &egui::Ui) -> eframe::egui::Color32 {
 // ---- CPU ---------------------------------------------------------------
 
 fn cpu_detail(app: &mut TaskManApp, ui: &mut egui::Ui, entry: &ResourceEntry) {
-    let Some(snap) = app.latest_snapshot() else { return; };
+    let Some(snap) = app.latest_snapshot() else {
+        return;
+    };
     header(ui, crate::icons::Icon::Cpu, "CPU", &snap.cpu.brand);
 
     let n = visible_points(app);
-    let samples: Vec<f64> = recent(app, n).iter()
-        .map(|h| h.cpu_total as f64)
-        .collect();
+    let samples: Vec<f64> = recent(app, n).iter().map(|h| h.cpu_total as f64).collect();
 
     LineChart::new(&samples, accent_color(ui), |v| format!("{v:.0} %"))
         .show_sized(ui, egui::vec2(ui.available_width(), 200.0));
@@ -268,8 +297,12 @@ fn cpu_detail(app: &mut TaskManApp, ui: &mut egui::Ui, entry: &ResourceEntry) {
     ui.add_space(8.0);
 
     // Per-logical-processor mini grid.
-    ui.label(egui::RichText::new("Logische Prozessoren").size(13.0).color(theme::palette(ui).text_dim));
-    let cores = app.history.back().map(|h| h.per_core.len()).unwrap_or(0);
+    ui.label(
+        egui::RichText::new("Logische Prozessoren")
+            .size(13.0)
+            .color(theme::palette(ui).text_dim),
+    );
+    let cores = app.history.back().map_or(0, |h| h.per_core.len());
     let cols = ((ui.available_width() / 110.0).floor() as usize).clamp(4, 8);
     let rows = cores.div_ceil(cols.max(1));
     egui::Grid::new("core-grid")
@@ -281,7 +314,8 @@ fn cpu_detail(app: &mut TaskManApp, ui: &mut egui::Ui, entry: &ResourceEntry) {
                     if idx >= cores {
                         continue;
                     }
-                    let samples: Vec<f64> = recent(app, n).iter()
+                    let samples: Vec<f64> = recent(app, n)
+                        .iter()
                         .filter_map(|h| h.per_core.get(idx).map(|v| *v as f64))
                         .collect();
                     crate::widgets::chart::mini_chart(
@@ -297,8 +331,16 @@ fn cpu_detail(app: &mut TaskManApp, ui: &mut egui::Ui, entry: &ResourceEntry) {
 
     ui.add_space(10.0);
     stats_grid(ui, |ui| {
-        stat_cell(ui, "Auslastung", &format!("{:.0} %", snap.cpu.utilization_pct));
-        stat_cell(ui, "Geschwindigkeit", &format!("{:.2} GHz", snap.cpu.freq_mhz / 1000.0));
+        stat_cell(
+            ui,
+            "Auslastung",
+            &format!("{:.0} %", snap.cpu.utilization_pct),
+        );
+        stat_cell(
+            ui,
+            "Geschwindigkeit",
+            &format!("{:.2} GHz", snap.cpu.freq_mhz / 1000.0),
+        );
         stat_cell(
             ui,
             "Basisgeschwindigkeit",
@@ -311,10 +353,18 @@ fn cpu_detail(app: &mut TaskManApp, ui: &mut egui::Ui, entry: &ResourceEntry) {
         stat_cell(ui, "Prozesse", &snap.system.process_count.to_string());
         stat_cell(ui, "Threads", &snap.system.thread_count.to_string());
         stat_cell(ui, "Handles", &snap.system.handle_count.to_string());
-        stat_cell(ui, "Betriebszeit", &format::format_uptime(snap.system.uptime_s));
+        stat_cell(
+            ui,
+            "Betriebszeit",
+            &format::format_uptime(snap.system.uptime_s),
+        );
         stat_cell(ui, "Sockets", &snap.cpu.sockets.to_string());
         stat_cell(ui, "Kerne", &snap.cpu.physical_cores.to_string());
-        stat_cell(ui, "Logische Prozessoren", &snap.cpu.logical_count.to_string());
+        stat_cell(
+            ui,
+            "Logische Prozessoren",
+            &snap.cpu.logical_count.to_string(),
+        );
         stat_cell(ui, "Virtualisierung", &snap.cpu.virtualization);
         cache_cells(ui, &snap.cpu);
     });
@@ -337,7 +387,9 @@ fn cache_cells(ui: &mut egui::Ui, cpu: &tm_core::model::CpuInfo) {
 // ---- Memory -------------------------------------------------------------
 
 fn memory_detail(app: &mut TaskManApp, ui: &mut egui::Ui, _entry: &ResourceEntry) {
-    let Some(snap) = app.latest_snapshot() else { return; };
+    let Some(snap) = app.latest_snapshot() else {
+        return;
+    };
     header(ui, crate::icons::Icon::Memory, "Arbeitsspeicher", "");
 
     let used = format::format_bytes(snap.memory.used_bytes);
@@ -345,13 +397,16 @@ fn memory_detail(app: &mut TaskManApp, ui: &mut egui::Ui, _entry: &ResourceEntry
     ui.label(format!("{used} von {total}"));
 
     let n = visible_points(app);
-    let used_samples: Vec<f64> = recent(app, n).iter()
+    let used_samples: Vec<f64> = recent(app, n)
+        .iter()
         .map(|h| bytes_to_g(h.mem_used_bytes))
         .collect();
-    let commit_samples: Vec<f64> = recent(app, n).iter()
+    let commit_samples: Vec<f64> = recent(app, n)
+        .iter()
         .map(|h| bytes_to_g(h.commit_used_bytes))
         .collect();
-    let max_used = recent(app, n).iter()
+    let max_used = recent(app, n)
+        .iter()
         .map(|h| bytes_to_g(h.mem_total_bytes))
         .fold(0.0f64, f64::max);
 
@@ -359,8 +414,13 @@ fn memory_detail(app: &mut TaskManApp, ui: &mut egui::Ui, _entry: &ResourceEntry
         .y_max(max_used)
         .show_sized(ui, egui::vec2(ui.available_width(), 170.0));
     ui.add_space(4.0);
-    ui.label(egui::RichText::new("Zugesicherter Speicher").size(12.0).color(theme::palette(ui).text_dim));
-    let commit_max = recent(app, n).iter()
+    ui.label(
+        egui::RichText::new("Zugesicherter Speicher")
+            .size(12.0)
+            .color(theme::palette(ui).text_dim),
+    );
+    let commit_max = recent(app, n)
+        .iter()
         .map(|h| bytes_to_g(h.commit_limit_bytes))
         .fold(0.0f64, f64::max)
         .max(commit_samples.iter().cloned().fold(0.0, f64::max));
@@ -374,7 +434,11 @@ fn memory_detail(app: &mut TaskManApp, ui: &mut egui::Ui, _entry: &ResourceEntry
     stats_grid(ui, |ui| {
         stat_cell(ui, "In Verwendung", &used);
         stat_cell(ui, "Verfügbar", &format::format_bytes(m.available_bytes));
-        stat_cell(ui, "Zwischengespeichert", &format::format_bytes(m.cached_bytes));
+        stat_cell(
+            ui,
+            "Zwischengespeichert",
+            &format::format_bytes(m.cached_bytes),
+        );
         stat_cell(
             ui,
             "Zugesichert",
@@ -384,10 +448,22 @@ fn memory_detail(app: &mut TaskManApp, ui: &mut egui::Ui, _entry: &ResourceEntry
                 format::format_bytes(m.commit_total_bytes)
             ),
         );
-        stat_cell(ui, "Ausgelagerter Pool", &format::format_bytes(m.paged_pool_bytes));
-        stat_cell(ui, "Nicht ausgelagerter Pool", &format::format_bytes(m.non_paged_pool_bytes));
+        stat_cell(
+            ui,
+            "Ausgelagerter Pool",
+            &format::format_bytes(m.paged_pool_bytes),
+        );
+        stat_cell(
+            ui,
+            "Nicht ausgelagerter Pool",
+            &format::format_bytes(m.non_paged_pool_bytes),
+        );
         if m.swap_total_bytes > 0 {
-            stat_cell(ui, "Auslagerungsdatei", &format::format_bytes(m.swap_used_bytes));
+            stat_cell(
+                ui,
+                "Auslagerungsdatei",
+                &format::format_bytes(m.swap_used_bytes),
+            );
         }
         stat_cell(ui, "Gesamt", &total);
     });
@@ -403,7 +479,9 @@ fn gb_fmt(v: f64) -> String {
 // ---- Disk ---------------------------------------------------------------
 
 fn disk_detail(app: &mut TaskManApp, ui: &mut egui::Ui, entry: &ResourceEntry) {
-    let Some(snap) = app.latest_snapshot() else { return; };
+    let Some(snap) = app.latest_snapshot() else {
+        return;
+    };
     let Some(disk) = snap.disks.iter().find(|d| d.mount == entry.key) else {
         return;
     };
@@ -441,7 +519,11 @@ fn disk_detail(app: &mut TaskManApp, ui: &mut egui::Ui, entry: &ResourceEntry) {
         .y_max(100.0)
         .show_sized(ui, egui::vec2(ui.available_width(), 140.0));
     ui.add_space(4.0);
-    ui.label(egui::RichText::new("Übertragungsrate (KB/s)").size(12.0).color(theme::palette(ui).text_dim));
+    ui.label(
+        egui::RichText::new("Übertragungsrate (KB/s)")
+            .size(12.0)
+            .color(theme::palette(ui).text_dim),
+    );
     let peak = read.iter().chain(write.iter()).cloned().fold(0.0, f64::max);
     LineChart::new(&read, accent_color(ui), kb_fmt)
         .y_max(peak.max(1.0))
@@ -456,10 +538,18 @@ fn disk_detail(app: &mut TaskManApp, ui: &mut egui::Ui, entry: &ResourceEntry) {
         stat_cell(ui, "Lesen", &format::format_rate(disk.read_bps));
         stat_cell(ui, "Schreiben", &format::format_rate(disk.write_bps));
         if disk.avg_resp_ms > 0.0 {
-            stat_cell(ui, "Durchschn. Reaktionszeit", &format!("{:.1} ms", disk.avg_resp_ms));
+            stat_cell(
+                ui,
+                "Durchschn. Reaktionszeit",
+                &format!("{:.1} ms", disk.avg_resp_ms),
+            );
         }
         stat_cell(ui, "Kapazität", &format::format_bytes(disk.total_bytes));
-        stat_cell(ui, "Belegt", &format::format_bytes(disk.total_bytes - disk.free_bytes));
+        stat_cell(
+            ui,
+            "Belegt",
+            &format::format_bytes(disk.total_bytes - disk.free_bytes),
+        );
         stat_cell(ui, "Frei", &format::format_bytes(disk.free_bytes));
     });
 }
@@ -471,14 +561,13 @@ fn kb_fmt(v: f64) -> String {
 // ---- Network ------------------------------------------------------------
 
 fn network_detail(app: &mut TaskManApp, ui: &mut egui::Ui, entry: &ResourceEntry) {
-    let Some(snap) = app.latest_snapshot() else { return; };
-    let Some(net) = snap.networks.iter().find(|n| n.name == entry.key) else { return; };
-    header(
-        ui,
-        crate::icons::Icon::Network,
-        &entry.title,
-        &net.name,
-    );
+    let Some(snap) = app.latest_snapshot() else {
+        return;
+    };
+    let Some(net) = snap.networks.iter().find(|n| n.name == entry.key) else {
+        return;
+    };
+    header(ui, crate::icons::Icon::Network, &entry.title, &net.name);
 
     let n = visible_points(app);
     let recv: Vec<f64> = app
@@ -496,21 +585,45 @@ fn network_detail(app: &mut TaskManApp, ui: &mut egui::Ui, entry: &ResourceEntry
     let recv = slice_last(&recv, n).to_vec();
     let sent = slice_last(&sent, n).to_vec();
 
-    ui.label(egui::RichText::new("Empfangen").size(12.0).color(theme::palette(ui).text_dim));
+    ui.label(
+        egui::RichText::new("Empfangen")
+            .size(12.0)
+            .color(theme::palette(ui).text_dim),
+    );
     LineChart::new(&recv, accent_color(ui), tm_core::format::format_rate)
         .show_sized(ui, egui::vec2(ui.available_width(), 130.0));
-    ui.label(egui::RichText::new("Gesendet").size(12.0).color(theme::palette(ui).text_dim));
-    LineChart::new(&sent, theme::palette(ui).ok_green, tm_core::format::format_rate)
-        .show_sized(ui, egui::vec2(ui.available_width(), 130.0));
+    ui.label(
+        egui::RichText::new("Gesendet")
+            .size(12.0)
+            .color(theme::palette(ui).text_dim),
+    );
+    LineChart::new(
+        &sent,
+        theme::palette(ui).ok_green,
+        tm_core::format::format_rate,
+    )
+    .show_sized(ui, egui::vec2(ui.available_width(), 130.0));
 
     ui.add_space(10.0);
     stats_grid(ui, |ui| {
         stat_cell(ui, "Empfangen (Rate)", &format::format_rate(net.recv_bps));
         stat_cell(ui, "Gesendet (Rate)", &format::format_rate(net.sent_bps));
-        stat_cell(ui, "Insgesamt empfangen", &format::format_bytes(net.total_recv_bytes));
-        stat_cell(ui, "Insgesamt gesendet", &format::format_bytes(net.total_sent_bytes));
+        stat_cell(
+            ui,
+            "Insgesamt empfangen",
+            &format::format_bytes(net.total_recv_bytes),
+        );
+        stat_cell(
+            ui,
+            "Insgesamt gesendet",
+            &format::format_bytes(net.total_sent_bytes),
+        );
         if net.link_bps > 0 {
-            stat_cell(ui, "Verbindungsgeschwindigkeit", &format!("{:.1} Gbit/s", net.link_bps as f64 / 1e9));
+            stat_cell(
+                ui,
+                "Verbindungsgeschwindigkeit",
+                &format!("{:.1} Gbit/s", net.link_bps as f64 / 1e9),
+            );
         }
     });
 }
@@ -518,8 +631,12 @@ fn network_detail(app: &mut TaskManApp, ui: &mut egui::Ui, entry: &ResourceEntry
 // ---- GPU ------------------------------------------------------------------
 
 fn gpu_detail(app: &mut TaskManApp, ui: &mut egui::Ui, entry: &ResourceEntry) {
-    let Some(snap) = app.latest_snapshot() else { return; };
-    let Some(gpu) = snap.gpus.iter().find(|g| g.id.to_string() == entry.key) else { return; };
+    let Some(snap) = app.latest_snapshot() else {
+        return;
+    };
+    let Some(gpu) = snap.gpus.iter().find(|g| g.id.to_string() == entry.key) else {
+        return;
+    };
     header(ui, crate::icons::Icon::Gpu, &gpu.name, "");
 
     let n = visible_points(app);
@@ -542,7 +659,11 @@ fn gpu_detail(app: &mut TaskManApp, ui: &mut egui::Ui, entry: &ResourceEntry) {
         .y_max(100.0)
         .show_sized(ui, egui::vec2(ui.available_width(), 160.0));
     ui.add_space(4.0);
-    ui.label(egui::RichText::new("GPU-Speicher").size(12.0).color(theme::palette(ui).text_dim));
+    ui.label(
+        egui::RichText::new("GPU-Speicher")
+            .size(12.0)
+            .color(theme::palette(ui).text_dim),
+    );
     LineChart::new(&mem, theme::palette(ui).ok_green, mb_fmt)
         .show_sized(ui, egui::vec2(ui.available_width(), 120.0));
 
@@ -568,7 +689,11 @@ fn gpu_detail(app: &mut TaskManApp, ui: &mut egui::Ui, entry: &ResourceEntry) {
         }
         // Engine breakdown.
         for e in gpu.engines.iter().take(4) {
-            stat_cell(ui, &format!("Engine {}", e.name), &format!("{:.0} %", e.util_pct));
+            stat_cell(
+                ui,
+                &format!("Engine {}", e.name),
+                &format!("{:.0} %", e.util_pct),
+            );
         }
     });
 }

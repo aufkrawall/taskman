@@ -4,12 +4,12 @@
 use std::collections::HashMap;
 use tm_core::error::{Result, TmError};
 use tm_core::model::{StartupImpact, StartupItem};
-use windows::core::PCWSTR;
 use windows::Win32::System::Registry::{
-    RegCloseKey, RegCreateKeyExW, RegDeleteValueW, RegEnumValueW, RegOpenKeyExW, RegQueryValueExW,
-    RegSetValueExW, HKEY, HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, KEY_READ, KEY_WRITE,
-    REG_BINARY, REG_OPTION_NON_VOLATILE, REG_SZ,
+    HKEY, HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, KEY_READ, KEY_WRITE, REG_BINARY,
+    REG_OPTION_NON_VOLATILE, REG_SZ, RegCloseKey, RegCreateKeyExW, RegDeleteValueW, RegEnumValueW,
+    RegOpenKeyExW, RegQueryValueExW, RegSetValueExW,
 };
+use windows::core::PCWSTR;
 
 const RUN_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
 const APPROVED_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved";
@@ -48,12 +48,14 @@ pub fn list_startup() -> Vec<StartupItem> {
     // Registry run keys.
     for loc in LOCATIONS {
         let values = read_registry_values(loc.hive, loc.subkey);
-        let approved = read_registry_binary(loc.hive, &format!(r"{APPROVED_KEY}\{}", loc.approved_subkey));
+        let approved = read_registry_binary(
+            loc.hive,
+            &format!(r"{APPROVED_KEY}\{}", loc.approved_subkey),
+        );
         for (name, command) in values {
             let enabled = approved
                 .get(&name)
-                .map(|data| data.first().is_some_and(|b| b & 1 == 0))
-                .unwrap_or(true);
+                .is_none_or(|data| data.first().is_some_and(|b| b & 1 == 0));
             out.push(StartupItem {
                 id: format!("reg:{}:{}", loc.label, name),
                 name,
@@ -82,13 +84,19 @@ pub fn list_startup() -> Vec<StartupItem> {
         ),
     ] {
         let Some(dir_path) = dir_path else { continue };
-        let Ok(entries) = std::fs::read_dir(&dir_path) else { continue };
+        let Ok(entries) = std::fs::read_dir(&dir_path) else {
+            continue;
+        };
         let folder_approved_key = if is_common {
             format!(r"HKLM\{APPROVED_KEY}\StartupFolder")
         } else {
             format!(r"HKCU\{APPROVED_KEY}\StartupFolder")
         };
-        let hive = if is_common { HKEY_LOCAL_MACHINE } else { HKEY_CURRENT_USER };
+        let hive = if is_common {
+            HKEY_LOCAL_MACHINE
+        } else {
+            HKEY_CURRENT_USER
+        };
         let approved = read_registry_binary(hive, "StartupFolder");
         for e in entries.flatten() {
             let file_name = e.file_name().to_string_lossy().to_string();
@@ -100,14 +108,12 @@ pub fn list_startup() -> Vec<StartupItem> {
             }
             let enabled = approved
                 .get(&file_name)
-                .map(|data| data.first().is_some_and(|b| b & 1 == 0))
-                .unwrap_or(true);
+                .is_none_or(|data| data.first().is_some_and(|b| b & 1 == 0));
             out.push(StartupItem {
                 id: format!("folder:{dir_path}:{file_name}"),
                 name: std::path::Path::new(&file_name)
                     .file_stem()
-                    .map(|s| s.to_string_lossy().to_string())
-                    .unwrap_or_else(|| file_name.clone()),
+                    .map_or_else(|| file_name.clone(), |s| s.to_string_lossy().to_string()),
                 command: e.path().to_string_lossy().to_string(),
                 location: folder_approved_key.clone(),
                 publisher: None,
@@ -117,7 +123,7 @@ pub fn list_startup() -> Vec<StartupItem> {
         }
     }
 
-    out.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+    out.sort_by_key(|a| a.name.to_lowercase());
     out
 }
 
@@ -191,7 +197,9 @@ fn set_folder_startup_enabled(_item_id: &str, enabled: bool) -> Result<()> {
     // Folder items use the StartupFolder approvals key with the *file name*.
     // The caller passes the full id; extract trailing component.
     let file_name = _item_id.rsplit(':').next().unwrap_or_default();
-    let (hive, _label) = if _item_id.contains(r"HKLM") || _item_id.starts_with("folder:") && _item_id.contains("ProgramData") {
+    let (hive, _label) = if _item_id.contains(r"HKLM")
+        || _item_id.starts_with("folder:") && _item_id.contains("ProgramData")
+    {
         (HKEY_LOCAL_MACHINE, "common")
     } else {
         (HKEY_CURRENT_USER, "user")
@@ -212,7 +220,10 @@ fn set_folder_startup_enabled(_item_id: &str, enabled: bool) -> Result<()> {
             None,
         );
         if status.is_err() {
-            return Err(TmError::platform("RegCreateKeyExW(folder)", format!("{status:?}")));
+            return Err(TmError::platform(
+                "RegCreateKeyExW(folder)",
+                format!("{status:?}"),
+            ));
         }
         let name_w = wstr(file_name);
         if enabled {
@@ -222,11 +233,19 @@ fn set_folder_startup_enabled(_item_id: &str, enabled: bool) -> Result<()> {
             let mut data: [u8; 12] = [0; 12];
             data[0] = 0x03;
             data[4..12].copy_from_slice(&now_ft.to_le_bytes());
-            let status =
-                RegSetValueExW(key, PCWSTR::from_raw(name_w.as_ptr()), None, REG_BINARY, Some(&data));
+            let status = RegSetValueExW(
+                key,
+                PCWSTR::from_raw(name_w.as_ptr()),
+                None,
+                REG_BINARY,
+                Some(&data),
+            );
             if status.is_err() {
                 let _ = RegCloseKey(key);
-                return Err(TmError::platform("RegSetValueExW(folder)", format!("{status:?}")));
+                return Err(TmError::platform(
+                    "RegSetValueExW(folder)",
+                    format!("{status:?}"),
+                ));
             }
         }
         let _ = RegCloseKey(key);
@@ -246,7 +265,15 @@ fn read_registry_values(hive: HKEY, subkey: &str) -> Vec<(String, String)> {
     unsafe {
         let path = wstr(subkey);
         let mut key = HKEY::default();
-        if RegOpenKeyExW(hive, PCWSTR::from_raw(path.as_ptr()), None, KEY_READ, &mut key).is_err() {
+        if RegOpenKeyExW(
+            hive,
+            PCWSTR::from_raw(path.as_ptr()),
+            None,
+            KEY_READ,
+            &mut key,
+        )
+        .is_err()
+        {
             return out;
         }
         let mut index: u32 = 0;
@@ -276,20 +303,24 @@ fn read_registry_values(hive: HKEY, subkey: &str) -> Vec<(String, String)> {
                 key,
                 PCWSTR::from_raw(name_query.as_ptr()),
                 None,
-                Some(&mut kind as *mut u32 as *mut windows::Win32::System::Registry::REG_VALUE_TYPE),
+                Some(
+                    &mut kind as *mut u32 as *mut windows::Win32::System::Registry::REG_VALUE_TYPE,
+                ),
                 Some(data.as_mut_ptr()),
                 Some(&mut actual),
             )
             .is_ok();
             let value = if ok && kind == REG_SZ.0 {
                 let wide: Vec<u16> = data[..(actual as usize).min(data.len())]
-                    .chunks_exact(2)
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
                     .map(|c| u16::from_le_bytes([c[0], c[1]]))
                     .take_while(|&c| c != 0)
                     .collect();
                 String::from_utf16_lossy(&wide)
             } else if ok {
-                format!("{} bytes", actual)
+                format!("{actual} bytes")
             } else {
                 String::new()
             };
@@ -309,7 +340,15 @@ fn read_registry_binary(hive: HKEY, subkey: &str) -> HashMap<String, Vec<u8>> {
     unsafe {
         let path = wstr(subkey);
         let mut key = HKEY::default();
-        if RegOpenKeyExW(hive, PCWSTR::from_raw(path.as_ptr()), None, KEY_READ, &mut key).is_err() {
+        if RegOpenKeyExW(
+            hive,
+            PCWSTR::from_raw(path.as_ptr()),
+            None,
+            KEY_READ,
+            &mut key,
+        )
+        .is_err()
+        {
             return out;
         }
         let mut index: u32 = 0;
@@ -339,7 +378,9 @@ fn read_registry_binary(hive: HKEY, subkey: &str) -> HashMap<String, Vec<u8>> {
                 key,
                 PCWSTR::from_raw(name_query.as_ptr()),
                 None,
-                Some(&mut kind as *mut u32 as *mut windows::Win32::System::Registry::REG_VALUE_TYPE),
+                Some(
+                    &mut kind as *mut u32 as *mut windows::Win32::System::Registry::REG_VALUE_TYPE,
+                ),
                 Some(data.as_mut_ptr()),
                 Some(&mut actual),
             )
@@ -359,8 +400,7 @@ fn read_registry_binary(hive: HKEY, subkey: &str) -> HashMap<String, Vec<u8>> {
 
 fn systemtime_to_filetime(t: std::time::SystemTime) -> u64 {
     t.duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64 / 100)
-        .unwrap_or(0)
+        .map_or(0, |d| d.as_nanos() as u64 / 100)
         // FILETIME epoch offset (1601-01-01)
         + 116_444_736_000_000_000
 }

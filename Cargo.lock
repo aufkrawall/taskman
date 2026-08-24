@@ -3182,6 +3182,7 @@ dependencies = [
  "tm-core",
  "tm-platform",
  "tracing",
+ "windows",
 ]
 
 [[package]]

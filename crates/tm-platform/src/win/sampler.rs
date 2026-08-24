@@ -35,7 +35,11 @@ impl Sampler {
         let mut sys = System::new();
         sys.refresh_specifics(
             RefreshKind::nothing()
-                .with_cpu(sysinfo::CpuRefreshKind::nothing().with_cpu_usage().with_frequency())
+                .with_cpu(
+                    sysinfo::CpuRefreshKind::nothing()
+                        .with_cpu_usage()
+                        .with_frequency(),
+                )
                 .with_memory(MemoryRefreshKind::nothing().with_ram().with_swap()),
         );
         sys.refresh_processes_specifics(
@@ -77,15 +81,18 @@ impl Sampler {
     fn sample_inner(&mut self, started: Instant) -> Result<Snapshot> {
         let interval_s = self
             .last_tick
-            .map(|t| started.duration_since(t).as_secs_f64())
-            .unwrap_or(1.0)
+            .map_or(1.0, |t| started.duration_since(t).as_secs_f64())
             .clamp(0.05, 3600.0);
         self.last_tick = Some(started);
 
         // ---- refresh raw data --------------------------------------------------
         self.sys.refresh_specifics(
             RefreshKind::nothing()
-                .with_cpu(sysinfo::CpuRefreshKind::nothing().with_cpu_usage().with_frequency())
+                .with_cpu(
+                    sysinfo::CpuRefreshKind::nothing()
+                        .with_cpu_usage()
+                        .with_frequency(),
+                )
                 .with_memory(MemoryRefreshKind::nothing().with_ram().with_swap()),
         );
         self.sys.refresh_processes_specifics(
@@ -101,7 +108,8 @@ impl Sampler {
         self.disks.refresh(true);
         self.networks.refresh(true);
 
-        let window_owners: HashSet<u32> = windows_enum::visible_window_owners().into_iter().collect();
+        let window_owners: HashSet<u32> =
+            windows_enum::visible_window_owners().into_iter().collect();
         let thread_counts = threads_map::thread_counts();
 
         // ---- CPU -----------------------------------------------------------------
@@ -160,7 +168,7 @@ impl Sampler {
                 name: &name,
                 ancestor_names: &anc,
                 has_window,
-                system_session: session_id.map(|s| s == 0).unwrap_or(false),
+                system_session: session_id.is_some_and(|s| s == 0),
             });
 
             let user = p
@@ -244,10 +252,10 @@ impl Sampler {
                 media,
                 total_bytes: d.total_space(),
                 free_bytes: d.available_space(),
-                active_pct: perf.map(|x| x.active_pct).unwrap_or(0.0),
-                read_bps: perf.map(|x| x.read_bps).unwrap_or(0.0),
-                write_bps: perf.map(|x| x.write_bps).unwrap_or(0.0),
-                avg_resp_ms: perf.map(|x| x.avg_resp_ms).unwrap_or(0.0),
+                active_pct: perf.map_or(0.0, |x| x.active_pct),
+                read_bps: perf.map_or(0.0, |x| x.read_bps),
+                write_bps: perf.map_or(0.0, |x| x.write_bps),
+                avg_resp_ms: perf.map_or(0.0, |x| x.avg_resp_ms),
                 total_read_bytes: 0,
                 total_written_bytes: 0,
             });
@@ -258,14 +266,16 @@ impl Sampler {
         for (name, data) in &self.networks {
             let recv_total = data.total_received();
             let sent_total = data.total_transmitted();
-            let (recv_bps, sent_bps) =
-                match (self.prev_net_totals.get(name.as_str()).copied(), self.first_tick_done) {
-                    (Some((pr, ps)), true) => (
-                        recv_total.saturating_sub(pr) as f64 / interval_s,
-                        sent_total.saturating_sub(ps) as f64 / interval_s,
-                    ),
-                    _ => (0.0, 0.0),
-                };
+            let (recv_bps, sent_bps) = match (
+                self.prev_net_totals.get(name.as_str()).copied(),
+                self.first_tick_done,
+            ) {
+                (Some((pr, ps)), true) => (
+                    recv_total.saturating_sub(pr) as f64 / interval_s,
+                    sent_total.saturating_sub(ps) as f64 / interval_s,
+                ),
+                _ => (0.0, 0.0),
+            };
             nets.push(NetworkInfo {
                 name: name.to_string(),
                 desc: String::new(),
@@ -290,11 +300,20 @@ impl Sampler {
             timestamp_ms: now_ms(),
             sample_duration_ms: started.elapsed().as_millis() as u64,
             cpu: CpuInfo {
-                brand: cpus.first().map(|c| c.brand().to_string()).unwrap_or_default(),
-                vendor: cpus.first().map(|c| c.vendor_id().to_string()).unwrap_or_default(),
+                brand: cpus
+                    .first()
+                    .map(|c| c.brand().to_string())
+                    .unwrap_or_default(),
+                vendor: cpus
+                    .first()
+                    .map(|c| c.vendor_id().to_string())
+                    .unwrap_or_default(),
                 architecture: std::env::consts::ARCH.to_string(),
                 utilization_pct: utilization.clamp(0.0, 100.0),
-                per_core_pct: cpus.iter().map(|c| c.cpu_usage().clamp(0.0, 100.0)).collect(),
+                per_core_pct: cpus
+                    .iter()
+                    .map(|c| c.cpu_usage().clamp(0.0, 100.0))
+                    .collect(),
                 freq_mhz: freq,
                 freq_base_mhz: self.cpu_static.base_mhz,
                 logical_count: logical,
@@ -380,6 +399,5 @@ fn hostname() -> String {
 fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
+        .map_or(0, |d| d.as_millis() as u64)
 }

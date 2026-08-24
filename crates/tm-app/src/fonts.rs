@@ -51,13 +51,18 @@ pub fn install(ctx: egui::Context) {
 
     // Bold variant where we can find one.
     let bold_candidates: &[(&str, Vec<String>)] = &[
-        ("SegoeUI-Bold", vec![r"C:\Windows\Fonts\segoeuib.ttf".into()]),
-        ("NotoSans-Bold", vec![
-            "/usr/share/fonts/truetype/noto/NotoSans-Bold.ttf".into(),
-        ]),
-        ("DejaVuSans-Bold", vec![
-            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf".into(),
-        ]),
+        (
+            "SegoeUI-Bold",
+            vec![r"C:\Windows\Fonts\segoeuib.ttf".into()],
+        ),
+        (
+            "NotoSans-Bold",
+            vec!["/usr/share/fonts/truetype/noto/NotoSans-Bold.ttf".into()],
+        ),
+        (
+            "DejaVuSans-Bold",
+            vec!["/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf".into()],
+        ),
     ];
     for (name, paths) in bold_candidates {
         if let Some(data) = load_first(paths) {
@@ -74,7 +79,10 @@ pub fn install(ctx: egui::Context) {
 
     // --- monospace numbers ---------------------------------------------------
     let mono_candidates: &[(&str, Vec<String>)] = &[
-        ("CascadiaMono", vec![r"C:\Windows\Fonts\CascadiaMono.ttf".into()]),
+        (
+            "CascadiaMono",
+            vec![r"C:\Windows\Fonts\CascadiaMono.ttf".into()],
+        ),
         ("Consolas", vec![r"C:\Windows\Fonts\consola.ttf".into()]),
         (
             "JetBrainsMono",
@@ -84,7 +92,13 @@ pub fn install(ctx: egui::Context) {
             "DejaVuSansMono",
             vec!["/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf".into()],
         ),
-        ("Menlo", vec!["/System/Library/Fonts/Menlo.ttc".into(), "/System/Library/Fonts/Monaco.ttf".into()]),
+        (
+            "Menlo",
+            vec![
+                "/System/Library/Fonts/Menlo.ttc".into(),
+                "/System/Library/Fonts/Monaco.ttf".into(),
+            ],
+        ),
     ];
     for (name, paths) in mono_candidates {
         if let Some(data) = load_first(paths) {

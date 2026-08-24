@@ -45,6 +45,8 @@ impl<'a> LineChart<'a> {
         self
     }
 
+    /// Full-area variant kept for embedded/dashboard use.
+    #[allow(dead_code)]
     pub fn show(self, ui: &mut egui::Ui) -> Response {
         let (rect, response) = ui.allocate_exact_size(ui.available_size(), egui::Sense::hover());
         self.paint(ui, rect);
@@ -65,7 +67,21 @@ impl<'a> LineChart<'a> {
 
         // Background card.
         painter.rect_filled(rect, 4.0, pal.card_bg);
-        painter.rect_stroke(rect, 4.0, Stroke::new(1.0, pal.stroke), egui::StrokeKind::Inside);
+        if !self.series.label.is_empty() {
+            painter.text(
+                Pos2::new(rect.right() - 6.0, rect.top() + 4.0),
+                egui::Align2::RIGHT_TOP,
+                &self.series.label,
+                egui::FontId::proportional(10.5),
+                pal.text_dim,
+            );
+        }
+        painter.rect_stroke(
+            rect,
+            4.0,
+            Stroke::new(1.0, pal.stroke),
+            egui::StrokeKind::Inside,
+        );
 
         if samples.is_empty() {
             return;
@@ -100,11 +116,13 @@ impl<'a> LineChart<'a> {
         // Area + line path.
         let n = samples.len().max(2);
         let x = |i: usize| rect.left() + rect.width() * i as f32 / (n - 1) as f32;
-        let yy = |v: f64| {
-            rect.bottom() - (v.clamp(0.0, y_max) / y_max) as f32 * rect.height()
-        };
+        let yy = |v: f64| rect.bottom() - (v.clamp(0.0, y_max) / y_max) as f32 * rect.height();
 
-        let mut pts: Vec<Pos2> = samples.iter().enumerate().map(|(i, v)| Pos2::new(x(i), yy(*v))).collect();
+        let mut pts: Vec<Pos2> = samples
+            .iter()
+            .enumerate()
+            .map(|(i, v)| Pos2::new(x(i), yy(*v)))
+            .collect();
 
         if !pts.is_empty() {
             let fill_color = Color32::from_rgba_premultiplied(
@@ -142,27 +160,30 @@ impl<'a> LineChart<'a> {
         }
 
         // Hover crosshair + tooltip.
-        if let Some(pos) = ui.input(|i| i.pointer.hover_pos()) {
-            if rect.contains(pos) {
-                let frac = ((pos.x - rect.left()) / rect.width()).clamp(0.0, 1.0);
-                let idx = ((frac * (n - 1) as f32).round()) as usize;
-                if let Some(v) = samples.get(idx) {
-                    let py = yy(*v);
-                    painter.line_segment(
-                        [Pos2::new(pos.x, rect.top()), Pos2::new(pos.x, rect.bottom())],
-                        Stroke::new(1.0, pal.chart_grid.gamma_multiply(1.6)),
-                    );
-                    painter.circle_filled(Pos2::new(x(idx.min(n - 1)), py), 3.0, color);
+        if let Some(pos) = ui.input(|i| i.pointer.hover_pos())
+            && rect.contains(pos)
+        {
+            let frac = ((pos.x - rect.left()) / rect.width()).clamp(0.0, 1.0);
+            let idx = ((frac * (n - 1) as f32).round()) as usize;
+            if let Some(v) = samples.get(idx) {
+                let py = yy(*v);
+                painter.line_segment(
+                    [
+                        Pos2::new(pos.x, rect.top()),
+                        Pos2::new(pos.x, rect.bottom()),
+                    ],
+                    Stroke::new(1.0, pal.chart_grid.gamma_multiply(1.6)),
+                );
+                painter.circle_filled(Pos2::new(x(idx.min(n - 1)), py), 3.0, color);
 
-                    let text = format!("{} · {}s ago", (self.fmt)(*v), n.saturating_sub(idx + 1));
-                    painter.text(
-                        Pos2::new(pos.x + 8.0, rect.top() + 4.0),
-                        egui::Align2::LEFT_TOP,
-                        text,
-                        egui::FontId::proportional(11.0),
-                        pal.text,
-                    );
-                }
+                let text = format!("{} · {}s ago", (self.fmt)(*v), n.saturating_sub(idx + 1));
+                painter.text(
+                    Pos2::new(pos.x + 8.0, rect.top() + 4.0),
+                    egui::Align2::LEFT_TOP,
+                    text,
+                    egui::FontId::proportional(11.0),
+                    pal.text,
+                );
             }
         }
     }
@@ -175,7 +196,12 @@ pub fn mini_chart(ui: &mut egui::Ui, size: Vec2, samples: &[f64], color: Color32
     let pal = crate::theme::palette(ui);
 
     painter.rect_filled(rect, 2.0, pal.card_bg);
-    painter.rect_stroke(rect, 2.0, Stroke::new(0.75, pal.stroke), egui::StrokeKind::Inside);
+    painter.rect_stroke(
+        rect,
+        2.0,
+        Stroke::new(0.75, pal.stroke),
+        egui::StrokeKind::Inside,
+    );
 
     if samples.len() < 2 {
         return response;
@@ -185,7 +211,11 @@ pub fn mini_chart(ui: &mut egui::Ui, size: Vec2, samples: &[f64], color: Color32
     let x = |i: usize| rect.left() + rect.width() * i as f32 / (n - 1) as f32;
     let y = |v: f64| rect.bottom() - (v.clamp(0.0, 100.0) / 100.0) as f32 * rect.height();
 
-    let pts: Vec<Pos2> = samples.iter().enumerate().map(|(i, v)| Pos2::new(x(i), y(*v))).collect();
+    let pts: Vec<Pos2> = samples
+        .iter()
+        .enumerate()
+        .map(|(i, v)| Pos2::new(x(i), y(*v)))
+        .collect();
 
     let fill = Color32::from_rgba_premultiplied(color.r(), color.g(), color.b(), 55);
     let mut area = pts.clone();
@@ -195,13 +225,13 @@ pub fn mini_chart(ui: &mut egui::Ui, size: Vec2, samples: &[f64], color: Color32
     painter.add(Shape::line(pts, Stroke::new(1.0, color)));
 
     // Hover shows exact value.
-    if let Some(pos) = ui.input(|i| i.pointer.hover_pos()) {
-        if rect.contains(pos) {
-            let frac = ((pos.x - rect.left()) / rect.width()).clamp(0.0, 1.0);
-            let idx = ((frac * (n - 1) as f32).round()) as usize;
-            if let Some(v) = samples.get(idx) {
-                response.clone().on_hover_text(format!("{v:.1}%"));
-            }
+    if let Some(pos) = ui.input(|i| i.pointer.hover_pos())
+        && rect.contains(pos)
+    {
+        let frac = ((pos.x - rect.left()) / rect.width()).clamp(0.0, 1.0);
+        let idx = ((frac * (n - 1) as f32).round()) as usize;
+        if let Some(v) = samples.get(idx) {
+            response.clone().on_hover_text(format!("{v:.1}%"));
         }
     }
     response

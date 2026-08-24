@@ -1,6 +1,7 @@
 //! Root application state & layout: navigation rail, tab routing, status bar,
 //! settings dialog, run-new-task dialog, toast notifications.
 
+use crate::app_ui::apply_theme;
 use eframe::egui;
 use parking_lot::Mutex as PlMutex;
 use std::collections::VecDeque;
@@ -8,9 +9,7 @@ use std::sync::Arc;
 use tm_core::engine::EngineHandle;
 use tm_core::model::Snapshot;
 use tm_core::settings::Settings;
-use crate::app_ui::apply_theme;
 use tm_platform::actions::PlatformActions;
-
 
 const HISTORY_CAP: usize = 240;
 
@@ -24,9 +23,9 @@ pub struct HistoryPoint {
     pub mem_total_bytes: u64,
     pub commit_used_bytes: u64,
     pub commit_limit_bytes: u64,
-    pub disks: Vec<(String, f32, f64, f64)>,   // mount, active%, read bps, write bps
-    pub nets: Vec<(String, f64, f64)>,         // name, recv bps, sent bps
-    pub gpus: Vec<(usize, f32, u64)>,          // id, util%, mem used
+    pub disks: Vec<(String, f32, f64, f64)>, // mount, active%, read bps, write bps
+    pub nets: Vec<(String, f64, f64)>,       // name, recv bps, sent bps
+    pub gpus: Vec<(usize, f32, u64)>,        // id, util%, mem used
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -77,13 +76,15 @@ impl Tab {
     }
 }
 
+type CachedVec<T> = Arc<PlMutex<Option<(Vec<T>, std::time::Instant)>>>;
+
 /// Shared UI-side caches that individual tabs mutate.
 pub struct SharedState {
     pub settings: Settings,
     /// Cached service/startup/user lists refreshed lazily.
     pub services_cache: Arc<PlMutex<Option<crate::tabs::services::Cache>>>,
-    pub startup_cache: Arc<PlMutex<Option<(Vec<tm_core::model::StartupItem>, std::time::Instant)>>>,
-    pub sessions_cache: Arc<PlMutex<Option<(Vec<tm_core::model::UserSession>, std::time::Instant)>>>,
+    pub startup_cache: CachedVec<tm_core::model::StartupItem>,
+    pub sessions_cache: CachedVec<tm_core::model::UserSession>,
     /// Toast queue (message, born instant).
     pub toasts: Arc<PlMutex<Vec<(String, std::time::Instant)>>>,
 }
@@ -131,28 +132,23 @@ fn dirs_data() -> std::path::PathBuf {
     #[cfg(target_os = "windows")]
     {
         std::env::var("LOCALAPPDATA")
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(|_| std::path::PathBuf::from("."))
+            .map_or_else(|_| std::path::PathBuf::from("."), std::path::PathBuf::from)
     }
     #[cfg(not(target_os = "windows"))]
     {
         std::env::var("XDG_DATA_HOME")
             .map(std::path::PathBuf::from)
             .or_else(|| {
-                std::env::var("HOME").ok().map(|h| {
-                    std::path::PathBuf::from(h).join(".local/share")
-                })
+                std::env::var("HOME")
+                    .ok()
+                    .map(|h| std::path::PathBuf::from(h).join(".local/share"))
             })
             .unwrap_or_else(|_| std::path::PathBuf::from("."))
     }
 }
 
 impl TaskManApp {
-    pub fn new(
-        cc: &eframe::CreationContext<'_>,
-        engine: EngineHandle,
-        mock: bool,
-    ) -> Self {
+    pub fn new(cc: &eframe::CreationContext<'_>, engine: EngineHandle, mock: bool) -> Self {
         let (_c, actions) = if mock {
             // Mock mode still wants a real action surface for testing menus;
             // platform actions are harmless against a mock snapshot.
@@ -163,9 +159,10 @@ impl TaskManApp {
         let settings = Settings::load();
         apply_theme(&cc.egui_ctx, settings.theme);
         if settings.always_on_top {
-            cc.egui_ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(
-                egui::WindowLevel::AlwaysOnTop,
-            ));
+            cc.egui_ctx
+                .send_viewport_cmd(egui::ViewportCommand::WindowLevel(
+                    egui::WindowLevel::AlwaysOnTop,
+                ));
         }
 
         let history_path = dirs_data().join("app-history.json");
@@ -205,7 +202,7 @@ impl TaskManApp {
     /// Pull the newest snapshot into local history buffers.
     fn poll_engine(&mut self) -> Option<Arc<Snapshot>> {
         let latest = self.engine.latest()?;
-        if latest.timestamp_ms as u64 != self.history.back().map(|h| h.t_ms).unwrap_or(0)
+        if latest.timestamp_ms != self.history.back().map_or(0, |h| h.t_ms)
             && self.ticks_seen != u64::MAX
         {
             let pt = HistoryPoint {
@@ -226,7 +223,11 @@ impl TaskManApp {
                     .iter()
                     .map(|n| (n.name.clone(), n.recv_bps, n.sent_bps))
                     .collect(),
-                gpus: latest.gpus.iter().map(|g| (g.id, g.util_pct, g.mem_used_bytes)).collect(),
+                gpus: latest
+                    .gpus
+                    .iter()
+                    .map(|g| (g.id, g.util_pct, g.mem_used_bytes))
+                    .collect(),
             };
             if self.history.len() == HISTORY_CAP {
                 self.history.pop_front();
@@ -275,7 +276,12 @@ impl eframe::App for TaskManApp {
             self.save_app_history();
         }
         // Wake up for the next sample.
-        ctx.request_repaint_after(self.engine.interval().div_f64(2.0).max(std::time::Duration::from_millis(50)));
+        ctx.request_repaint_after(
+            self.engine
+                .interval()
+                .div_f64(2.0)
+                .max(std::time::Duration::from_millis(50)),
+        );
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
@@ -294,7 +300,11 @@ impl eframe::App for TaskManApp {
 
         // ------------------------------------------------ main content
         egui::CentralPanel::default()
-            .frame(egui::Frame::NONE.fill(pal.window_bg).inner_margin(egui::Margin::same(10)))
+            .frame(
+                egui::Frame::NONE
+                    .fill(pal.window_bg)
+                    .inner_margin(egui::Margin::same(10)),
+            )
             .show(ui, |ui| match self.tab {
                 Tab::Processes => crate::tabs::processes::show(self, ui),
                 Tab::Performance => crate::tabs::performance::show(self, ui),

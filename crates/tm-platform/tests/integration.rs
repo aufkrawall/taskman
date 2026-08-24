@@ -1,7 +1,6 @@
 //! Integration tests running against the REAL system.
 //! These exercise the platform layer end-to-end without a GUI.
 
-use tm_core::engine::SystemCollector;
 use tm_core::model::*;
 
 #[test]
@@ -14,7 +13,10 @@ fn sample_produces_sane_snapshot() {
 
     assert!(s2.cpu.logical_count >= 1);
     assert!(!s2.cpu.brand.is_empty());
-    assert!(s2.memory.total_bytes > 1024 * 1024 * 1024, "total memory sane");
+    assert!(
+        s2.memory.total_bytes > 1024 * 1024 * 1024,
+        "total memory sane"
+    );
     assert!(s2.processes.len() > 20, "expected many processes");
     assert!(!s2.disks.is_empty());
     for d in &s2.disks {
@@ -46,9 +48,11 @@ fn windows_extras() {
     let services = actions.list_services().expect("services");
     assert!(services.len() > 50);
     assert!(services.iter().any(|s| !s.name.is_empty()));
-    assert!(services
-        .iter()
-        .any(|s| matches!(s.status, ServiceStatus::Running | ServiceStatus::Stopped)));
+    assert!(
+        services
+            .iter()
+            .any(|s| matches!(s.status, ServiceStatus::Running | ServiceStatus::Stopped))
+    );
 
     // Startup items parse.
     let startup = actions.list_startup().expect("startup");
@@ -62,7 +66,11 @@ fn windows_extras() {
     assert!(!sessions.is_empty());
 
     // Process classification sanity.
-    assert!(snap.processes.iter().any(|p| p.category == ProcCategory::System));
+    assert!(
+        snap.processes
+            .iter()
+            .any(|p| p.category == ProcCategory::System)
+    );
 }
 
 #[cfg(target_os = "windows")]

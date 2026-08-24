@@ -22,22 +22,17 @@ pub fn adapters() -> Vec<AdapterInfo> {
             return out;
         };
         let mut idx = 0u32;
-        loop {
-            match factory.EnumAdapters1(idx) {
-                Ok(adapter) => {
-                    if let Ok(desc) = adapter.GetDesc1() {
-                        out.push(AdapterInfo {
-                            name: utf16_to_string(&desc.Description),
-                            dedicated_vram: desc.DedicatedVideoMemory as u64,
-                            luid_high: desc.AdapterLuid.HighPart,
-                            luid_low: desc.AdapterLuid.LowPart,
-                            driver_version: String::new(),
-                        });
-                    }
-                    idx += 1;
-                }
-                Err(_) => break,
+        while let Ok(adapter) = factory.EnumAdapters1(idx) {
+            if let Ok(desc) = adapter.GetDesc1() {
+                out.push(AdapterInfo {
+                    name: utf16_to_string(&desc.Description),
+                    dedicated_vram: desc.DedicatedVideoMemory as u64,
+                    luid_high: desc.AdapterLuid.HighPart,
+                    luid_low: desc.AdapterLuid.LowPart,
+                    driver_version: String::new(),
+                });
             }
+            idx += 1;
         }
     }
     out
@@ -50,13 +45,17 @@ fn utf16_to_string(buf: &[u16]) -> String {
 
 /// Merge DXGI adapters with PDH engine stats into `GpuInfo`s.
 pub fn merge(adapters: Vec<AdapterInfo>, engines: Vec<GpuEngine>) -> Vec<GpuInfo> {
-    let total_util = engines.first().map(|e| e.util_pct).unwrap_or(0.0);
+    let total_util = engines.first().map_or(0.0, |e| e.util_pct);
     adapters
         .into_iter()
         .enumerate()
         .map(|(id, a)| GpuInfo {
             id,
-            name: if a.name.is_empty() { format!("GPU {id}") } else { a.name },
+            name: if a.name.is_empty() {
+                format!("GPU {id}")
+            } else {
+                a.name
+            },
             driver_version: a.driver_version,
             util_pct: total_util,
             mem_used_bytes: 0,

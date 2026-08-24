@@ -122,10 +122,10 @@ impl Settings {
     }
 
     pub fn save(&self) {
-        if let Some(p) = default_path() {
-            if let Err(e) = self.save_to(&p) {
-                tracing::warn!(error = %e, "failed to save settings");
-            }
+        if let Some(p) = default_path()
+            && let Err(e) = self.save_to(&p)
+        {
+            tracing::warn!(error = %e, "failed to save settings");
         }
     }
 }
@@ -138,12 +138,14 @@ mod tests {
     fn roundtrip() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("sub").join("settings.json");
-        let mut s = Settings::default();
-        s.theme = ThemeMode::Dark;
-        s.update_speed = UpdateSpeed::High;
-        s.graph_seconds = 120;
-        s.ui_zoom = 1.25;
-        s.window_size = [800.0, 600.0];
+        let s = Settings {
+            theme: ThemeMode::Dark,
+            update_speed: UpdateSpeed::High,
+            graph_seconds: 120,
+            ui_zoom: 1.25,
+            window_size: [800.0, 600.0],
+            ..Settings::default()
+        };
         s.save_to(&path).unwrap();
         let loaded = Settings::load_from(&path);
         assert_eq!(loaded.theme, ThemeMode::Dark);
@@ -173,8 +175,17 @@ mod tests {
 
     #[test]
     fn intervals_sane() {
-        assert_eq!(UpdateSpeed::High.interval(), std::time::Duration::from_millis(500));
-        assert_eq!(UpdateSpeed::Normal.interval(), std::time::Duration::from_secs(1));
-        assert_eq!(UpdateSpeed::Low.interval(), std::time::Duration::from_secs(4));
+        assert_eq!(
+            UpdateSpeed::High.interval(),
+            std::time::Duration::from_millis(500)
+        );
+        assert_eq!(
+            UpdateSpeed::Normal.interval(),
+            std::time::Duration::from_secs(1)
+        );
+        assert_eq!(
+            UpdateSpeed::Low.interval(),
+            std::time::Duration::from_secs(4)
+        );
     }
 }

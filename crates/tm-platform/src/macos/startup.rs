@@ -6,13 +6,21 @@ use tm_core::model::{StartupImpact, StartupItem};
 pub fn list_plists() -> Vec<StartupItem> {
     let home = std::env::var("HOME").unwrap_or_default();
     let dirs = [
-        (PathBuf::from(format!("{home}/Library/LaunchAgents")), "LaunchAgents (user)"),
-        (PathBuf::from("/Library/LaunchAgents"), "LaunchAgents (all users)"),
+        (
+            PathBuf::from(format!("{home}/Library/LaunchAgents")),
+            "LaunchAgents (user)",
+        ),
+        (
+            PathBuf::from("/Library/LaunchAgents"),
+            "LaunchAgents (all users)",
+        ),
         (PathBuf::from("/Library/LaunchDaemons"), "LaunchDaemons"),
     ];
     let mut items = Vec::new();
     for (dir, label) in dirs {
-        let Ok(entries) = std::fs::read_dir(&dir) else { continue };
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
         for e in entries.flatten() {
             let path = e.path();
             if path.extension().and_then(|x| x.to_str()) != Some("plist") {
@@ -26,7 +34,9 @@ pub fn list_plists() -> Vec<StartupItem> {
             items.push(StartupItem {
                 id: format!("plist:{}", path.display()),
                 name,
-                command: parsed.program.unwrap_or_else(|| path.to_string_lossy().to_string()),
+                command: parsed
+                    .program
+                    .unwrap_or_else(|| path.to_string_lossy().to_string()),
                 location: format!("{label} ({})", dir.display()),
                 publisher: None,
                 enabled: true,

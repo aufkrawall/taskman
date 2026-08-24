@@ -2,13 +2,12 @@
 //! physical disk activity, plus misc system-wide stats.
 
 use std::collections::HashMap;
-use windows::core::PCWSTR;
 use windows::Win32::System::Performance::{
-    PdhAddEnglishCounterW, PdhCloseQuery, PdhCollectQueryData, PdhGetFormattedCounterArrayW,
-    PdhOpenQueryW, PDH_FMT_COUNTERVALUE_ITEM_W, PDH_FMT_DOUBLE, PDH_HCOUNTER, PDH_HQUERY,
+    PDH_FMT_COUNTERVALUE_ITEM_W, PDH_FMT_DOUBLE, PDH_HCOUNTER, PDH_HQUERY, PdhAddEnglishCounterW,
+    PdhCloseQuery, PdhCollectQueryData, PdhGetFormattedCounterArrayW, PdhOpenQueryW,
 };
 use windows::Win32::System::ProcessStatus::{GetPerformanceInfo, PERFORMANCE_INFORMATION};
-
+use windows::core::PCWSTR;
 
 /// Per-disk performance sample.
 #[derive(Debug, Clone, Default)]
@@ -106,11 +105,23 @@ impl Pdh {
             }
             let mut counters = Vec::new();
             for (path, kind) in [
-                ("\\GPU Engine(*)\\Utilization Percentage", CounterKind::GpuEngine),
-                ("\\GPU Process Memory(*)\\Local Usage", CounterKind::GpuProcMem),
+                (
+                    "\\GPU Engine(*)\\Utilization Percentage",
+                    CounterKind::GpuEngine,
+                ),
+                (
+                    "\\GPU Process Memory(*)\\Local Usage",
+                    CounterKind::GpuProcMem,
+                ),
                 ("\\PhysicalDisk(*)\\% Idle Time", CounterKind::DiskIdle),
-                ("\\PhysicalDisk(*)\\Disk Read Bytes/sec", CounterKind::DiskRead),
-                ("\\PhysicalDisk(*)\\Disk Write Bytes/sec", CounterKind::DiskWrite),
+                (
+                    "\\PhysicalDisk(*)\\Disk Read Bytes/sec",
+                    CounterKind::DiskRead,
+                ),
+                (
+                    "\\PhysicalDisk(*)\\Disk Write Bytes/sec",
+                    CounterKind::DiskWrite,
+                ),
                 (
                     "\\PhysicalDisk(*)\\Avg. Disk sec/Transfer",
                     CounterKind::DiskSec,
@@ -118,7 +129,8 @@ impl Pdh {
             ] {
                 let wide: Vec<u16> = path.encode_utf16().chain([0]).collect();
                 let mut hcounter = PDH_HCOUNTER::default();
-                let status = PdhAddEnglishCounterW(q, PCWSTR::from_raw(wide.as_ptr()), 0, &mut hcounter);
+                let status =
+                    PdhAddEnglishCounterW(q, PCWSTR::from_raw(wide.as_ptr()), 0, &mut hcounter);
                 if status != 0 {
                     match kind {
                         CounterKind::GpuEngine | CounterKind::GpuProcMem => {
@@ -129,7 +141,10 @@ impl Pdh {
                     tracing::debug!(status, path, "PdhAddEnglishCounterW failed");
                     continue;
                 }
-                counters.push(Counter { handle: hcounter, kind });
+                counters.push(Counter {
+                    handle: hcounter,
+                    kind,
+                });
             }
             tracing::info!(
                 counters = counters.len(),
@@ -170,7 +185,10 @@ impl Pdh {
         true
     }
 
-    fn read_pairs(&self, counter_handle: windows::Win32::System::Performance::PDH_HCOUNTER) -> Vec<(String, f64)> {
+    fn read_pairs(
+        &self,
+        counter_handle: windows::Win32::System::Performance::PDH_HCOUNTER,
+    ) -> Vec<(String, f64)> {
         let mut out = Vec::new();
         unsafe {
             let mut size: u32 = 0;
@@ -197,8 +215,10 @@ impl Pdh {
             if status != 0 {
                 return out;
             }
-            let items =
-                std::slice::from_raw_parts(buf.as_ptr() as *const PDH_FMT_COUNTERVALUE_ITEM_W, count2 as usize);
+            let items = std::slice::from_raw_parts(
+                buf.as_ptr() as *const PDH_FMT_COUNTERVALUE_ITEM_W,
+                count2 as usize,
+            );
             for item in items {
                 let name = item.szName.to_string().unwrap_or_default();
                 let val = item.FmtValue.Anonymous.doubleValue;
@@ -266,7 +286,11 @@ impl Pdh {
                 util_pct: util.clamp(0.0, 100.0),
             })
             .collect();
-        out.sort_by(|a, b| b.util_pct.partial_cmp(&a.util_pct).unwrap_or(std::cmp::Ordering::Equal));
+        out.sort_by(|a, b| {
+            b.util_pct
+                .partial_cmp(&a.util_pct)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         out.truncate(6);
         out
     }
@@ -360,11 +384,13 @@ pub struct WinMemory {
 }
 
 pub fn query_windows_memory() -> WinMemory {
-    
     let mut perf = PERFORMANCE_INFORMATION::default();
     unsafe {
-        if GetPerformanceInfo(&mut perf, std::mem::size_of::<PERFORMANCE_INFORMATION>() as u32)
-            .is_err()
+        if GetPerformanceInfo(
+            &mut perf,
+            std::mem::size_of::<PERFORMANCE_INFORMATION>() as u32,
+        )
+        .is_err()
         {
             return WinMemory {
                 cached: 0,
@@ -387,11 +413,13 @@ pub fn query_windows_memory() -> WinMemory {
 
 /// System-wide handle/thread counts from GetPerformanceInfo.
 pub fn global_handle_thread_count() -> (usize, usize) {
-    
     let mut perf = PERFORMANCE_INFORMATION::default();
     unsafe {
-        if GetPerformanceInfo(&mut perf, std::mem::size_of::<PERFORMANCE_INFORMATION>() as u32)
-            .is_err()
+        if GetPerformanceInfo(
+            &mut perf,
+            std::mem::size_of::<PERFORMANCE_INFORMATION>() as u32,
+        )
+        .is_err()
         {
             return (0, 0);
         }

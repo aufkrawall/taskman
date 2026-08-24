@@ -10,7 +10,11 @@ fn autostart_dirs() -> Vec<PathBuf> {
     let config_home = std::env::var("XDG_CONFIG_HOME")
         .ok()
         .map(PathBuf::from)
-        .or_else(|| std::env::var("HOME").ok().map(|h| PathBuf::from(h).join(".config")));
+        .or_else(|| {
+            std::env::var("HOME")
+                .ok()
+                .map(|h| PathBuf::from(h).join(".config"))
+        });
     if let Some(c) = config_home {
         out.push(c.join("autostart"));
     }
@@ -21,10 +25,14 @@ fn autostart_dirs() -> Vec<PathBuf> {
 pub fn list_autostart() -> Vec<StartupItem> {
     let mut items = Vec::new();
     for dir in autostart_dirs() {
-        let Ok(entries) = std::fs::read_dir(&dir) else { continue };
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
         for e in entries.flatten() {
             let path = e.path();
-            let Some(name) = path.file_name().and_then(|n| n.to_str()) else { continue };
+            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
             let enabled = !name.ends_with(".disabled");
             if !(name.ends_with(".desktop") || name.ends_with(".desktop.disabled")) {
                 continue;
@@ -37,7 +45,9 @@ pub fn list_autostart() -> Vec<StartupItem> {
                         .trim_end_matches(".desktop")
                         .to_string()
                 }),
-                command: parsed.exec.unwrap_or_else(|| path.to_string_lossy().to_string()),
+                command: parsed
+                    .exec
+                    .unwrap_or_else(|| path.to_string_lossy().to_string()),
                 location: format!("autostart ({})", dir.display()),
                 publisher: None,
                 enabled,
@@ -55,7 +65,10 @@ struct DesktopFile {
 }
 
 fn parse_desktop(path: &Path) -> DesktopFile {
-    let mut out = DesktopFile { name: None, exec: None };
+    let mut out = DesktopFile {
+        name: None,
+        exec: None,
+    };
     if let Ok(text) = std::fs::read_to_string(path) {
         for line in text.lines() {
             if let Some(v) = line.strip_prefix("Name=") {

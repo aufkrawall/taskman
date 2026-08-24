@@ -24,7 +24,11 @@ pub fn list_launchctl() -> Result<Vec<ServiceInfo>> {
             display_name: label,
             description: format!("status {}", fields[1]),
             pid,
-            status: if pid.is_some() { ServiceStatus::Running } else { ServiceStatus::Stopped },
+            status: if pid.is_some() {
+                ServiceStatus::Running
+            } else {
+                ServiceStatus::Stopped
+            },
             group: String::new(),
             startup_type: String::new(),
             account: String::new(),
@@ -46,10 +50,15 @@ pub fn control_label(label: &str, action: super::super::actions::ServiceAction) 
     } else {
         cmd.arg(verb).arg(label);
     }
-    let status = cmd.status().map_err(|e| TmError::platform("spawn launchctl", e.to_string()))?;
+    let status = cmd
+        .status()
+        .map_err(|e| TmError::platform("spawn launchctl", e.to_string()))?;
     if status.success() {
         Ok(())
     } else {
-        Err(TmError::platform("launchctl", format!("{verb} {label} failed")))
+        Err(TmError::platform(
+            "launchctl",
+            format!("{verb} {label} failed"),
+        ))
     }
 }

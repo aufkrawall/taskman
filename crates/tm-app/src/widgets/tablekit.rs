@@ -50,14 +50,18 @@ impl ProcColumn {
     pub fn is_heat(self) -> bool {
         matches!(
             self,
-            ProcColumn::Cpu | ProcColumn::Memory | ProcColumn::Disk | ProcColumn::Network | ProcColumn::Gpu
+            ProcColumn::Cpu
+                | ProcColumn::Memory
+                | ProcColumn::Disk
+                | ProcColumn::Network
+                | ProcColumn::Gpu
         )
     }
 }
 
 /// Right-aligned cell with optional heat-mapped background.
 pub fn heat_cell_r(ui: &mut egui::Ui, pal: &crate::theme::Palette, intensity: f32, text: String) {
-    let h = ui.available_height().min(24.0).max(18.0);
+    let h = ui.available_height().clamp(18.0, 24.0);
     let w = ui.available_width().max(40.0);
     let (rect, _) = ui.allocate_exact_size(egui::vec2(w, h), egui::Sense::hover());
     let intensity = intensity.clamp(0.0, 1.0);
@@ -82,7 +86,10 @@ pub fn sort_arrow(ui: &mut egui::Ui, ascending: bool, active: bool) {
     if !active {
         return;
     }
-    let (rect, _) = ui.allocate_exact_size(egui::vec2(10.0, ui.available_height()), egui::Sense::hover());
+    let (rect, _) = ui.allocate_exact_size(
+        egui::vec2(10.0, ui.available_height()),
+        egui::Sense::hover(),
+    );
     let c = rect.center();
     let color = ui.style().visuals.widgets.active.fg_stroke.color;
     let (a, b, cc) = if ascending {

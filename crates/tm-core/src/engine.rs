@@ -6,7 +6,7 @@
 
 use crate::error::{Result, TmError};
 use crate::model::Snapshot;
-use crossbeam_channel::{bounded, select, Receiver, Sender};
+use crossbeam_channel::{Receiver, Sender, bounded, select};
 use parking_lot::RwLock;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -172,7 +172,9 @@ fn run_loop(
         // Wait out the rest of the interval while staying responsive to cmds.
         let elapsed = started.elapsed();
         let interval = *shared.interval.read();
-        let wait = interval.saturating_sub(elapsed).max(Duration::from_millis(5));
+        let wait = interval
+            .saturating_sub(elapsed)
+            .max(Duration::from_millis(5));
 
         select! {
             recv(cmd_rx) -> msg => match msg {

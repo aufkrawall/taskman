@@ -7,23 +7,14 @@
 
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
-use tracing_subscriber::{fmt, EnvFilter, Layer};
+use tracing_subscriber::{EnvFilter, Layer, fmt};
 
 /// Where logs are written.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Default)]
 pub struct LogConfig {
     pub console: bool,
     /// Explicit level overriding RUST_LOG.
     pub level: Option<tracing::level_filters::LevelFilter>,
-}
-
-impl Default for LogConfig {
-    fn default() -> Self {
-        Self {
-            console: false,
-            level: None,
-        }
-    }
 }
 
 static INIT: std::sync::Once = std::sync::Once::new();
@@ -35,9 +26,10 @@ fn default_targets() -> String {
 
 fn make_filter(cfg: &LogConfig) -> EnvFilter {
     match cfg.level {
-        Some(l) => EnvFilter::new(format!("tm=trace,{}", l)),
-        None => EnvFilter::try_from_default_env()
-            .unwrap_or_else(|_| EnvFilter::new(default_targets())),
+        Some(l) => EnvFilter::new(format!("tm=trace,{l}")),
+        None => {
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default_targets()))
+        }
     }
 }
 
@@ -60,12 +52,11 @@ pub fn init(cfg: LogConfig) -> Option<tracing_appender::non_blocking::WorkerGuar
             .map(|d| d.join("taskman").join("logs"))
             .and_then(|log_dir| {
                 std::fs::create_dir_all(&log_dir)
-                    .map_err(|e| eprintln!("taskman: cannot create log dir {}: {e}", log_dir.display()))
+                    .map_err(|e| {
+                        eprintln!("taskman: cannot create log dir {}: {e}", log_dir.display())
+                    })
                     .ok()?;
-                let appender = tracing_appender::rolling::daily(
-                    &log_dir,
-                    "taskman.log",
-                );
+                let appender = tracing_appender::rolling::daily(&log_dir, "taskman.log");
                 let (writer, g) = tracing_appender::non_blocking(appender);
                 result_guard = Some(g);
                 Some(

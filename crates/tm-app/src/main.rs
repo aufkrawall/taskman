@@ -1,5 +1,12 @@
 //! taskman — a cross-platform task manager.
 //!
+//! Windows note: the release build hides the console (`windows` subsystem);
+//! CLI output (--selfcheck) re-attaches to the parent console when present.
+#![cfg_attr(
+    all(target_os = "windows", not(debug_assertions)),
+    windows_subsystem = "windows"
+)]
+//!
 //! CLI:
 //!   taskman                 open the GUI
 //!   taskman --selfcheck     sample the system headlessly, print a summary, exit
@@ -11,13 +18,16 @@ mod app_ui;
 mod fonts;
 mod icons;
 mod selfcheck;
-mod theme;
 mod tabs;
+mod theme;
 mod widgets;
 
 use std::time::Duration;
 
 fn main() {
+    #[cfg(all(target_os = "windows", not(debug_assertions)))]
+    attach_parent_console();
+
     let args: Vec<String> = std::env::args().skip(1).collect();
     let verbose = args.iter().any(|a| a == "--verbose" || a == "-v");
     let mock = args.iter().any(|a| a == "--mock");
@@ -44,7 +54,6 @@ fn main() {
 }
 
 fn run_gui(mock: bool, args: &[String]) {
-
     // Engine starts BEFORE the window so the first frame already has data.
     let settings = tm_core::settings::Settings::load();
     let engine = spawn_engine(mock, settings.update_speed.interval());
@@ -108,7 +117,11 @@ fn run_gui(mock: bool, args: &[String]) {
 
 fn spawn_engine(mock: bool, interval: Duration) -> tm_core::EngineHandle {
     let (collector, _actions) = if mock {
-        (Box::new(tm_core::mock::MockCollector::new()) as Box<dyn tm_core::engine::SystemCollector>, None)
+        (
+            Box::new(tm_core::mock::MockCollector::new())
+                as Box<dyn tm_core::engine::SystemCollector>,
+            None,
+        )
     } else {
         let (c, a) = tm_platform::create_stack();
         (c, Some(a))
@@ -126,9 +139,9 @@ fn icon_data() -> eframe::egui::IconData {
     for y in 0..S {
         for x in 0..S {
             let i = (y * S + x) * 4;
-            let in_chip = x >= 16 && x < 48 && y >= 16 && y < 48;
-            let pin_v = (x >= 24 && x < 40) && (y < 12 || y >= 52);
-            let pin_h = (y >= 24 && y < 40) && (x < 12 || x >= 52);
+            let in_chip = (16..48).contains(&x) && (16..48).contains(&y);
+            let pin_v = (24..40).contains(&x) && !(12..52).contains(&y);
+            let pin_h = (24..40).contains(&y) && !(12..52).contains(&x);
             let color = if in_chip {
                 accent
             } else if pin_v || pin_h {
@@ -145,6 +158,20 @@ fn icon_data() -> eframe::egui::IconData {
     eframe::egui::IconData {
         width: S as u32,
         height: S as u32,
-        rgba: rgba.into(),
+        rgba,
     }
 }
+
+/// Best-effort console attachment so `--selfcheck` output is visible when
+/// launched from an existing terminal despite the GUI subsystem.
+#[cfg(all(target_os = "windows", not(debug_assertions)))]
+fn attach_parent_console() {
+    use windows::Win32::System::Console::{ATTACH_PARENT_PROCESS, AttachConsole};
+    unsafe {
+        let _ = AttachConsole(ATTACH_PARENT_PROCESS);
+    }
+}
+
+#[cfg(any(not(target_os = "windows"), debug_assertions))]
+#[allow(dead_code)]
+fn attach_parent_console() {}
