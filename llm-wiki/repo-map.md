@@ -66,8 +66,14 @@ Rust workspace, three crates in a strict dependency chain
   GPU instance parsing (unit-tested real-world strings).
 - `crates/tm-platform/src/win/cpu_load.rs` — hand-rolled NT structure
   offsets; verify against Process Hacker definitions before "fixing".
-- `crates/tm-app/src/widgets/tablekit.rs` — resize math relies on storing
-  drag-START widths in egui temp data; do not revert to cumulative deltas.
+- `crates/tm-app/src/widgets/tablekit.rs` — resize math MUST accumulate
+  each frame's `drag_delta()` onto the LIVE width; `drag_delta()` is
+  per-frame movement (NOT cumulative) in egui 0.36, so frozen drag-start
+  widths pin boundaries at their start position. Regression-tested with
+  real pointer events (`dragging_name_boundary_tracks_cursor_across_frames`).
+  Resize handles are registered after ALL header cells so they win hit
+  testing across their full ±6 px; double-click restore is detected via
+  input state because drag-only widgets never receive click flags.
 
 ## Test Matrix
 

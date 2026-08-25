@@ -1,5 +1,39 @@
 # Recent Activity
 
+## 2026-08-26 — Column/splitter resize ACTUALLY fixed (egui delta semantics)
+
+**Root cause of "columns can't be resized" (persisted across the 2026-08-25
+fix):** implement.md §8.1 claimed `Response::drag_delta()` is cumulative from
+drag start — FALSE in egui 0.36. It is `pointer.delta()` = movement since the
+LAST FRAME; only `total_drag_delta()` is cumulative. The shipped math froze a
+drag-start width (`start_w + drag_delta().x`), so every frame reset the width
+to ~its starting value: boundaries jiggled sub-pixel and snapped back when
+the pointer paused. The 2026-08-25 fix (materializing the elastic Name
+column) addressed a real but DIFFERENT failure layered on top; neither made
+resizing work.
+
+Fix (tablekit.rs + performance.rs splitter): accumulate each frame's delta
+onto the LIVE width, `width = (width + dx).clamp(min,max)`; drop the
+drag-start temp-data machinery entirely.
+
+Also fixed in the same pass:
+- Resize handles were registered DURING the cell loop, so each next header
+  cell covered the right half (±6 px) of its neighbor's handle and won hit
+  testing there — grabs landed on the cell and quick clicks even toggled
+  sorting. Handles are now ALL created after the cell loop (topmost), full
+  ±6 px grabbable; the last column keeps its right-edge handle.
+- Double-click-to-default never worked: a `Sense::drag()` widget never
+  receives egui click flags, so `double_clicked()` was always false. Now
+  detected via `pointer.button_double_clicked(Primary)` while hovered.
+- Regression tests drive REAL pointer events through an egui `Context`
+  (`ctx.run_ui` + RawInput events; clear `out.textures_delta` or egui panics
+  headlessly). Verified the test FAILS against the old math (730 ≠ 760).
+  Test-authoring gotchas: egui counts multi-clicks ACROSS sequences within
+  0.3 s (space sequences >0.3 s apart); boundary x positions must be derived
+  from CURRENT column widths after any mutation.
+
+implement.md §8.1/§14.1 corrected in place.
+
 ## 2026-08-25 — UI polish pass + Linux backend repaired & verified under WSLg
 
 **Column resize root cause (tablekit.rs):** the elastic name column absorbed
