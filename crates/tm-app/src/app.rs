@@ -264,6 +264,19 @@ impl TaskManApp {
                     egui::WindowLevel::AlwaysOnTop,
                 ));
         }
+        // Diagnostics: open a dialog right away (TASKMAN_DIALOG=settings|run)
+        // or select a Performance resource (TASKMAN_PERF=<index>) so UI tests
+        // can capture them without input automation.
+        let open_dialog = std::env::var("TASKMAN_DIALOG").unwrap_or_default();
+        let (show_settings, run_dialog_open) = match open_dialog.as_str() {
+            "settings" => (true, false),
+            "run" => (false, true),
+            _ => (false, false),
+        };
+        let perf_selected = std::env::var("TASKMAN_PERF")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(0);
         Self {
             engine,
             actions,
@@ -282,8 +295,8 @@ impl TaskManApp {
             history: VecDeque::with_capacity(HISTORY_CAP),
             app_history_db: tm_core::AppHistoryDb::open(history_path),
             tab: Tab::Processes,
-            show_settings: false,
-            run_dialog_open: false,
+            show_settings,
+            run_dialog_open,
             run_dialog_text: String::new(),
             run_elevated: false,
             ticks_seen: 0,
@@ -295,7 +308,7 @@ impl TaskManApp {
             svc_jump: Arc::new(Mutex::new(None)),
             search: String::new(),
             processes_state: crate::tabs::processes::State::new(),
-            perf_selected: 0,
+            perf_selected,
             details_state: Default::default(),
             selected_pid: None,
             selected_user: None,

@@ -10,7 +10,10 @@
 //!   queries per process per tick.
 
 use crate::win::cpu_load::{CpuLoadAccountant, LoadSample};
-use crate::win::{cpu_info, gpu, perfcounters, process_ops, threads_map, version, windows_enum};
+use crate::win::{
+    cpu_info, gpu, memory_info, net_info, perfcounters, process_ops, threads_map, version,
+    windows_enum,
+};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -50,6 +53,8 @@ pub struct Sampler {
     tick_no: u64,
     attrs: HashMap<u32, PidAttrs>,
     gpu_adapters: Option<Vec<gpu::AdapterInfo>>,
+    /// Static RAM hardware facts (SMBIOS), probed once.
+    ram_static: memory_info::RamStatic,
     pdh: Mutex<perfcounters::Pdh>,
     /// Time-based CPU accountant (see [`cpu_load`]); replaces sysinfo/PDH
     /// CPU usage which was noisy and mis-normalized.
@@ -81,7 +86,6 @@ impl Sampler {
             sys,
             disks: Disks::new(),
             networks: Networks::new(),
-            pdh: Mutex::new(perfcounters::Pdh::new()),
             cpu_static: cpu_info::CpuStatic::probe(),
             prev_net_totals: HashMap::new(),
             last_tick: None,
@@ -90,6 +94,8 @@ impl Sampler {
             tick_no: 0,
             attrs: HashMap::new(),
             gpu_adapters: None,
+            ram_static: memory_info::probe(),
+            pdh: Mutex::new(perfcounters::Pdh::new()),
             cpu_load: CpuLoadAccountant::new(),
             last_load: None,
         }
@@ -387,6 +393,9 @@ impl Sampler {
         }
 
         // ---- networks -----------------------------------------------------------------
+        // Per-adapter facts (desc/link/oper/SSID) come from the native walk;
+        // keyed by friendly name, which is exactly what sysinfo exposes.
+        let adapter_info = net_info::adapters();
         let mut nets = Vec::new();
         for (name, data) in &self.networks {
             let recv_total = data.total_received();
@@ -401,17 +410,18 @@ impl Sampler {
                 ),
                 _ => (0.0, 0.0),
             };
+            let ai = adapter_info.get(name.as_str());
             nets.push(NetworkInfo {
                 name: name.to_string(),
-                desc: String::new(),
+                desc: ai.map_or_else(String::new, |a| a.desc.clone()),
                 kind: classify_adapter(name),
-                oper_up: recv_total > 0 || sent_total > 0,
+                oper_up: ai.is_some_and(|a| a.oper_up),
                 recv_bps,
                 sent_bps,
                 total_recv_bytes: recv_total,
                 total_sent_bytes: sent_total,
-                link_bps: 0,
-                ssid: None,
+                link_bps: ai.map_or(0, |a| a.link_bps),
+                ssid: ai.and_then(|a| a.ssid.clone()),
             });
         }
         self.prev_net_totals.clear();
@@ -452,6 +462,15 @@ impl Sampler {
                 non_paged_pool_bytes: win_mem.non_paged_pool,
                 swap_total_bytes: 0,
                 swap_used_bytes: 0,
+                installed_bytes: self.ram_static.installed_bytes,
+                hw_reserved_bytes: self.ram_static.installed_bytes.saturating_sub(mem_total),
+                speed_mts: self.ram_static.speed_mts,
+                speed_max_mts: self.ram_static.speed_max_mts,
+                slots_used: self.ram_static.slots_used,
+                slots_total: self.ram_static.slots_total,
+                form_factor: self.ram_static.form_factor.clone(),
+                manufacturer: self.ram_static.manufacturer.clone(),
+                part_number: self.ram_static.part_number.clone(),
             },
             disks,
             networks: nets,

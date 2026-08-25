@@ -92,22 +92,41 @@ pub fn from_lang_tag(tag: &str) -> LocaleFmt {
     let lower = base.to_ascii_lowercase();
     // Comma-decimal languages (primary subtag is enough).
     const COMMA_DECIMAL: [&str; 22] = [
-        "de", "es", "fr", "it", "pt", "nl", "ru", "pl", "tr", "cs", "sk", "hu", "ro", "el",
-        "da", "sv", "no", "nb", "nn", "fi", "hr", "sr",
+        "de", "es", "fr", "it", "pt", "nl", "ru", "pl", "tr", "cs", "sk", "hu", "ro", "el", "da",
+        "sv", "no", "nb", "nn", "fi", "hr", "sr",
     ];
     if COMMA_DECIMAL.iter().any(|l| lower.starts_with(l)) {
-        return LocaleFmt { decimal: ',', grouping: Some('.'), date_order: DateOrder::Dmy, lang_tag: leak(base) };
+        return LocaleFmt {
+            decimal: ',',
+            grouping: Some('.'),
+            date_order: DateOrder::Dmy,
+            lang_tag: leak(base),
+        };
     }
     // English variants differ in dates: GB uses DMY, US MDY.
     if lower.starts_with("en") {
-        let order = if lower.contains("-gb") || lower.contains("-ie") || lower.contains("-au") || lower.contains("-nz") {
+        let order = if lower.contains("-gb")
+            || lower.contains("-ie")
+            || lower.contains("-au")
+            || lower.contains("-nz")
+        {
             DateOrder::Dmy
         } else {
             DateOrder::Mdy
         };
-        return LocaleFmt { decimal: '.', grouping: Some(','), date_order: order, lang_tag: leak(base) };
+        return LocaleFmt {
+            decimal: '.',
+            grouping: Some(','),
+            date_order: order,
+            lang_tag: leak(base),
+        };
     }
-    LocaleFmt { decimal: '.', grouping: Some(','), date_order: DateOrder::Ymd, lang_tag: leak(base) }
+    LocaleFmt {
+        decimal: '.',
+        grouping: Some(','),
+        date_order: DateOrder::Ymd,
+        lang_tag: leak(base),
+    }
 }
 
 fn leak(s: String) -> &'static str {

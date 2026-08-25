@@ -4,8 +4,8 @@
 //! decimal point elsewhere. Unit words follow the UI language
 //! ([`crate::i18n`]).
 
-use crate::locale::{self, DateOrder, LocaleFmt};
 use crate::i18n::{self, Lang};
+use crate::locale::{self, DateOrder, LocaleFmt};
 
 /// Format a float with the active locale's separators and grouping.
 pub fn num_fixed(v: f64, decimals: usize) -> String {
@@ -191,9 +191,21 @@ pub fn format_kbit(bps: f64) -> String {
     if kbit < 0.05 {
         return format!("0 {unit}");
     }
-    let div = if matches!(i18n::lang(), Lang::De) { 1024.0 } else { 1000.0 };
+    let div = if matches!(i18n::lang(), Lang::De) {
+        1024.0
+    } else {
+        1000.0
+    };
     if kbit >= div {
-        format!("{} {}", num_fixed(kbit / div, 1), if matches!(i18n::lang(), Lang::De) { "MBit" } else { "Mbps" })
+        format!(
+            "{} {}",
+            num_fixed(kbit / div, 1),
+            if matches!(i18n::lang(), Lang::De) {
+                "MBit"
+            } else {
+                "Mbps"
+            }
+        )
     } else {
         format!("{} {unit}", num_fixed(kbit, 1))
     }
@@ -377,7 +389,10 @@ mod tests {
         assert_eq!(format_date_in(epoch, locale::DE_DE), "25.07.2026");
         let us = locale::EN_US;
         assert_eq!(format_date_in(epoch, us), "7/25/2026");
-        let iso = locale::LocaleFmt { date_order: locale::DateOrder::Ymd, ..us };
+        let iso = locale::LocaleFmt {
+            date_order: locale::DateOrder::Ymd,
+            ..us
+        };
         assert_eq!(format_date_in(epoch, iso), "2026-07-25");
     }
 
@@ -392,8 +407,14 @@ mod tests {
 
     #[test]
     fn freq() {
-        assert_eq!(format_freq_mhz(4560.0), format!("{} GHz", num_fixed(4.56, 2)));
-        assert_eq!(format_freq_mhz(3400.0), format!("{} GHz", num_fixed(3.40, 2)));
+        assert_eq!(
+            format_freq_mhz(4560.0),
+            format!("{} GHz", num_fixed(4.56, 2))
+        );
+        assert_eq!(
+            format_freq_mhz(3400.0),
+            format!("{} GHz", num_fixed(3.40, 2))
+        );
         assert_eq!(format_freq_mhz(0.0), "");
     }
 

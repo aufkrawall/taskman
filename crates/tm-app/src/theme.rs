@@ -95,6 +95,27 @@ pub fn install_visuals(ctx: &egui::Context) {
             style.visuals.menu_corner_radius = CornerRadius::same(8);
             style.spacing.item_spacing = egui::vec2(8.0, 6.0);
             style.spacing.button_padding = egui::vec2(10.0, 4.0);
+            // Win11-style overlay scroll bars: always visible as a thin
+            // handle, expanding on hover, floating ABOVE the content without
+            // reserving layout space — this keeps the table header and body
+            // column layouts pixel-aligned whether or not a bar is shown.
+            style.spacing.scroll = egui::style::ScrollStyle {
+                floating: true,
+                bar_width: 12.0,
+                floating_width: 5.0,
+                floating_allocated_width: 0.0,
+                bar_inner_margin: 2.0,
+                bar_outer_margin: 2.0,
+                foreground_color: true,
+                // Visible while idle — a scrollbar you can't see is useless.
+                dormant_handle_opacity: 0.5,
+                dormant_background_opacity: 0.0,
+                active_handle_opacity: 0.65,
+                active_background_opacity: 0.30,
+                interact_handle_opacity: 1.0,
+                interact_background_opacity: 0.45,
+                ..Default::default()
+            };
         });
     }
 }
@@ -107,7 +128,19 @@ pub fn dark_visuals() -> Visuals {
     v.window_fill = Color32::from_rgb(0x2b, 0x2b, 0x2b);
     v.selection.bg_fill = DARK.accent.gamma_multiply(0.35);
     v.selection.stroke = egui::Stroke::new(1.0, DARK.accent);
-    v.widgets.inactive.bg_fill = DARK.card_bg;
+    // Checkbox/radio/slider backgrounds MUST contrast with the window fill
+    // (0x2b2b2b): a same-color fill with no stroke renders the control box
+    // invisible until the first hover switches to the `hovered` visuals.
+    // Keep `weak_bg_fill` for buttons; give must-fill widgets their own look.
+    v.widgets.inactive.bg_fill = Color32::from_rgb(0x33, 0x33, 0x33);
+    v.widgets.inactive.bg_stroke = egui::Stroke::new(1.0, Color32::from_rgb(0x76, 0x76, 0x76));
+    v.widgets.inactive.fg_stroke = egui::Stroke::new(1.6, Color32::from_rgb(0xd4, 0xd4, 0xd4));
+    v.widgets.hovered.bg_fill = Color32::from_rgb(0x3a, 0x3a, 0x3a);
+    v.widgets.hovered.bg_stroke = egui::Stroke::new(1.0, Color32::from_rgb(0x9a, 0x9a, 0x9a));
+    v.widgets.hovered.fg_stroke = egui::Stroke::new(1.6, Color32::WHITE);
+    v.widgets.active.bg_fill = Color32::from_rgb(0x40, 0x40, 0x40);
+    v.widgets.active.bg_stroke = egui::Stroke::new(1.0, DARK.accent);
+    v.widgets.active.fg_stroke = egui::Stroke::new(1.6, Color32::WHITE);
     v.override_text_color = Some(DARK.text);
     v
 }
@@ -120,7 +153,17 @@ pub fn light_visuals() -> Visuals {
     v.window_fill = Color32::WHITE;
     v.selection.bg_fill = LIGHT.accent.gamma_multiply(0.30);
     v.selection.stroke = egui::Stroke::new(1.0, LIGHT.accent);
-    v.widgets.inactive.bg_fill = LIGHT.card_bg;
+    // Same treatment as dark mode: visible border + fill for must-fill
+    // widgets so checkboxes never blend into the dialog background.
+    v.widgets.inactive.bg_fill = Color32::WHITE;
+    v.widgets.inactive.bg_stroke = egui::Stroke::new(1.0, Color32::from_rgb(0x8a, 0x8a, 0x8a));
+    v.widgets.inactive.fg_stroke = egui::Stroke::new(1.6, Color32::from_rgb(0x33, 0x33, 0x33));
+    v.widgets.hovered.bg_fill = Color32::from_rgb(0xf0, 0xf6, 0xfc);
+    v.widgets.hovered.bg_stroke = egui::Stroke::new(1.0, LIGHT.accent);
+    v.widgets.hovered.fg_stroke = egui::Stroke::new(1.6, Color32::from_rgb(0x11, 0x11, 0x11));
+    v.widgets.active.bg_fill = Color32::from_rgb(0xe2, 0xee, 0xfa);
+    v.widgets.active.bg_stroke = egui::Stroke::new(1.0, LIGHT.accent);
+    v.widgets.active.fg_stroke = egui::Stroke::new(1.6, Color32::BLACK);
     v
 }
 

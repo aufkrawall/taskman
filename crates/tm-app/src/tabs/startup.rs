@@ -11,7 +11,7 @@ use tm_core::model::{StartupImpact, StartupItem};
 use crate::app::TaskManApp;
 use crate::icons::Icon;
 use crate::theme;
-use crate::widgets::tablekit::{TmColumn};
+use crate::widgets::tablekit::TmColumn;
 
 fn columns() -> Vec<TmColumn> {
     vec![
@@ -68,13 +68,8 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
             });
             let can_enable = sel.as_ref().is_some_and(|s| !s.enabled);
             let can_disable = sel.as_ref().is_some_and(|s| s.enabled);
-            if crate::app_ui::cmd_button(
-                ui,
-                &pal,
-                Icon::Check,
-                i18n::tr(K::EnableCmd),
-                can_enable,
-            ) {
+            if crate::app_ui::cmd_button(ui, &pal, Icon::Check, i18n::tr(K::EnableCmd), can_enable)
+            {
                 toggle_selected(app, true);
             }
             if crate::app_ui::cmd_button(
@@ -134,12 +129,15 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
     let q = app.search.trim().to_lowercase();
     let mut table = app.make_table("startup", columns(), 340.0);
     let avail = crate::widgets::tablekit::table_avail(ui);
-    table.header(ui, &pal, avail, None, None);
-
-    egui::ScrollArea::vertical()
-        .id_salt("startup-table")
-        .auto_shrink(false)
-        .show(ui, |ui| {
+    crate::widgets::tablekit::scrolled_table(
+        "startup",
+        ui,
+        &pal,
+        &mut table,
+        avail,
+        None,
+        None,
+        |ui, table, avail, _content_w| {
             for (i, item) in items.iter_mut().enumerate() {
                 if !q.is_empty() && !item.name.to_lowercase().contains(&q) {
                     continue;
@@ -218,9 +216,7 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
                                     i18n::tr(K::DisabledWord)
                                 });
                             }
-                            Err(e) => {
-                                app.shared.toast(i18n::trf(K::ErrMsg, &[&e.to_string()]))
-                            }
+                            Err(e) => app.shared.toast(i18n::trf(K::ErrMsg, &[&e.to_string()])),
                         }
                         ui.close();
                     }
@@ -247,7 +243,8 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
                 });
             }
             ui.add_space(12.0);
-        });
+        },
+    );
     app.persist_table(&table);
 }
 

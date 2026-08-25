@@ -95,9 +95,7 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
                             app.efficiency_pids.remove(&pid);
                         }
                     }
-                    Err(e) => app
-                        .shared
-                        .toast(i18n::trf(K::ErrMsg, &[&e.to_string()])),
+                    Err(e) => app.shared.toast(i18n::trf(K::ErrMsg, &[&e.to_string()])),
                 }
             }
             if crate::app_ui::cmd_button(
@@ -149,32 +147,21 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
     let aggs = agg.strings();
 
     let avail = crate::widgets::tablekit::table_avail(ui);
-    if let Some(col) = table.header(
+    let clicked = crate::widgets::tablekit::scrolled_table(
+        "processes",
         ui,
         &pal,
+        &mut table,
         avail,
         Some((app.processes_state.sort_col, app.processes_state.ascending)),
         Some(&aggs),
-    ) {
-        if app.processes_state.sort_col == col {
-            app.processes_state.ascending = !app.processes_state.ascending;
-        } else {
-            app.processes_state.sort_col = col;
-            // Numeric columns default descending, name ascending.
-            app.processes_state.ascending = col == 0 || !table.cols[col].numeric;
-        }
-    }
-
-    egui::ScrollArea::vertical()
-        .id_salt("proc-table")
-        .auto_shrink(false)
-        .show(ui, |ui| {
+        |ui, table, avail, content_w| {
             let searching = !app.search.trim().is_empty();
             let maxima = column_maxima(rows);
 
             if searching {
                 for row in rows.iter().filter(|r| r.group < 2) {
-                    row_ui(app, ui, &pal, &table, avail, row, &maxima);
+                    row_ui(app, ui, &pal, table, avail, row, &maxima);
                 }
             } else {
                 for gi in 0..2usize {
@@ -188,18 +175,28 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
                     } else {
                         rows.iter().filter(|r| r.group == 1).count()
                     };
-                    group_header(app, ui, &pal, label, total);
+                    group_header(app, ui, &pal, label, total, content_w);
                     if app.processes_state.group_collapsed[gi] {
                         continue;
                     }
                     for row in rows.iter().filter(|r| r.group == gi) {
-                        row_ui(app, ui, &pal, &table, avail, row, &maxima);
+                        row_ui(app, ui, &pal, table, avail, row, &maxima);
                     }
                     ui.add_space(6.0);
                 }
             }
             ui.add_space(12.0);
-        });
+        },
+    );
+    if let Some(col) = clicked {
+        if app.processes_state.sort_col == col {
+            app.processes_state.ascending = !app.processes_state.ascending;
+        } else {
+            app.processes_state.sort_col = col;
+            // Numeric columns default descending, name ascending.
+            app.processes_state.ascending = col == 0 || !table.cols[col].numeric;
+        }
+    }
     app.persist_table(&table);
     app.processes_state.cache = cache;
 }
@@ -211,10 +208,16 @@ fn group_header(
     pal: &theme::Palette,
     label: &str,
     count: usize,
+    width: f32,
 ) {
-    let gi = if label == i18n::tr(K::GroupApps) { 0 } else { 1 };
-    let (rect, resp) =
-        ui.allocate_exact_size(egui::vec2(ui.available_width(), 38.0), egui::Sense::click());
+    let gi = if label == i18n::tr(K::GroupApps) {
+        0
+    } else {
+        1
+    };
+    // Exactly the table's content width — matching the rows keeps the
+    // horizontal scroll extents (and thus header/body alignment) identical.
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(width, 38.0), egui::Sense::click());
     if resp.hovered() {
         ui.painter()
             .rect_filled(rect, 4.0, egui::Color32::from_white_alpha(8));
@@ -331,9 +334,7 @@ fn context_menu(app: &mut TaskManApp, ui: &mut egui::Ui, row: &Row) {
     ui.set_min_width(210.0);
     if ui.button(i18n::tr(K::EndTask)).clicked() {
         match app.actions.kill_process(row.pid, false) {
-            Ok(()) => app
-                .shared
-                .toast(i18n::trf(K::NameEndedToast, &[&row.name])),
+            Ok(()) => app.shared.toast(i18n::trf(K::NameEndedToast, &[&row.name])),
             Err(e) => app.shared.toast(i18n::trf(K::ErrMsg, &[&e.to_string()])),
         }
         ui.close();

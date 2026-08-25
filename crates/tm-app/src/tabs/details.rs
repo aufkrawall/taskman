@@ -10,7 +10,7 @@ use tm_core::model::{PriorityClass, ProcStatus, ProcessEntry};
 use crate::app::TaskManApp;
 use crate::icons::Icon;
 use crate::theme;
-use crate::widgets::tablekit::{TmColumn};
+use crate::widgets::tablekit::TmColumn;
 
 fn columns() -> Vec<TmColumn> {
     vec![
@@ -52,6 +52,7 @@ pub struct Row {
     pub platform: &'static str,
     pub elevated: &'static str,
     pub uac: &'static str,
+    pub gpu_s: String,
 }
 
 pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
@@ -94,10 +95,8 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
             );
             if ui
                 .add(
-                    egui::Button::new(
-                        egui::RichText::new("✕").size(12.0).color(pal.text_dim),
-                    )
-                    .frame(false),
+                    egui::Button::new(egui::RichText::new("✕").size(12.0).color(pal.text_dim))
+                        .frame(false),
                 )
                 .clicked()
             {
@@ -127,25 +126,15 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
     let rows = &cache.as_ref().expect("cache").rows;
 
     let avail = crate::widgets::tablekit::table_avail(ui);
-    if let Some(col) = table.header(
+    let clicked = crate::widgets::tablekit::scrolled_table(
+        "details",
         ui,
         &pal,
+        &mut table,
         avail,
         Some((app.details_state.sort_col, app.details_state.ascending)),
         None,
-    ) {
-        if app.details_state.sort_col == col {
-            app.details_state.ascending = !app.details_state.ascending;
-        } else {
-            app.details_state.sort_col = col;
-            app.details_state.ascending = col == 0 || !table.cols[col.min(table.cols.len() - 1)].numeric;
-        }
-    }
-
-    egui::ScrollArea::vertical()
-        .id_salt("details-table")
-        .auto_shrink(false)
-        .show(ui, |ui| {
+        |ui, table, avail, _content_w| {
             for row in rows {
                 let selected = app.selected_pid == Some(row.pid);
                 let (rect, resp) = table.row(ui, &pal, avail, selected);
@@ -180,7 +169,7 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
                 table.text_cell(ui, avail, rect, 6, row.platform, &pal, false);
                 table.text_cell(ui, avail, rect, 7, row.elevated, &pal, false);
                 table.text_cell(ui, avail, rect, 8, row.uac, &pal, false);
-                table.text_cell(ui, avail, rect, 9, "", &pal, false);
+                table.text_cell(ui, avail, rect, 9, &row.gpu_s, &pal, false);
 
                 if resp.clicked() {
                     app.selected_pid = Some(row.pid);
@@ -193,7 +182,17 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
                 });
             }
             ui.add_space(12.0);
-        });
+        },
+    );
+    if let Some(col) = clicked {
+        if app.details_state.sort_col == col {
+            app.details_state.ascending = !app.details_state.ascending;
+        } else {
+            app.details_state.sort_col = col;
+            app.details_state.ascending =
+                col == 0 || !table.cols[col.min(table.cols.len() - 1)].numeric;
+        }
+    }
     app.persist_table(&table);
     app.details_state.cache = cache;
 }
@@ -291,6 +290,10 @@ fn build_rows(
                 platform,
                 elevated,
                 uac,
+                gpu_s: p
+                    .gpu_util_pct
+                    .map(format::format_pct_cell)
+                    .unwrap_or_default(),
             }
         })
         .collect()
@@ -307,11 +310,7 @@ fn status_rank(s: ProcStatus) -> u8 {
 /// Context menu mirroring the Win11 TM Details tab.
 pub fn context_menu(app: &mut TaskManApp, ui: &mut egui::Ui, p: &ProcessEntry) {
     ui.set_min_width(230.0);
-    ui.label(
-        egui::RichText::new(p.shown_name())
-            .strong()
-            .size(12.5),
-    );
+    ui.label(egui::RichText::new(p.shown_name()).strong().size(12.5));
     ui.separator();
 
     if ui.button(i18n::tr(K::CopyName)).clicked() {
@@ -344,7 +343,9 @@ pub fn context_menu(app: &mut TaskManApp, ui: &mut egui::Ui, p: &ProcessEntry) {
         ] {
             if ui.button(i18n::tr(key)).clicked() {
                 match app.actions.set_priority(p.pid, cls) {
-                    Ok(()) => app.shared.toast(i18n::trf(K::PrioritySetMsg, &[i18n::tr(key)])),
+                    Ok(()) => app
+                        .shared
+                        .toast(i18n::trf(K::PrioritySetMsg, &[i18n::tr(key)])),
                     Err(e) => app.shared.toast(i18n::trf(K::ErrMsg, &[&e.to_string()])),
                 }
                 ui.close();
@@ -407,7 +408,11 @@ pub fn context_menu(app: &mut TaskManApp, ui: &mut egui::Ui, p: &ProcessEntry) {
         }
     }
 
-    if let Some(path) = p.exe_path.as_ref().map(|x| x.to_string_lossy().into_owned()) {
+    if let Some(path) = p
+        .exe_path
+        .as_ref()
+        .map(|x| x.to_string_lossy().into_owned())
+    {
         if ui.button(i18n::tr(K::OpenFileLocation)).clicked() {
             if let Err(e) = app.actions.open_file_location(&path) {
                 app.shared.toast(i18n::trf(K::ErrMsg, &[&e.to_string()]));
@@ -521,8 +526,7 @@ pub fn process_properties_dialog(app: &mut TaskManApp, ctx: &egui::Context) {
                     ui.end_row();
                     ui.weak(i18n::tr(K::PropPath));
                     ui.add(
-                        egui::TextEdit::singleline(&mut path.clone())
-                            .desired_width(f32::INFINITY),
+                        egui::TextEdit::singleline(&mut path.clone()).desired_width(f32::INFINITY),
                     );
                     ui.end_row();
                 });
@@ -554,61 +558,64 @@ pub fn affinity_dialog(
     _pal: &theme::Palette,
 ) {
     let mut open = true;
-    egui::Window::new(format!(
-        "{} {pid}",
-        i18n::tr(K::AffinityTitle)
-    ))
-    .open(&mut open)
-    .collapsible(false)
-    .resizable(false)
-    .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-    .show(ctx, |ui| {
-        let sys_mask = app.actions.system_affinity_mask().unwrap_or(u64::MAX);
-        let mut new_mask = mask;
-        egui::Grid::new("affinity")
-            .num_columns(8)
-            .spacing([6.0, 6.0])
-            .show(ui, |ui| {
-                for cpu in 0..64usize {
-                    let allowed = sys_mask & (1u64 << cpu) != 0;
-                    let mut on = mask & (1u64 << cpu) != 0;
-                    if ui
-                        .add_enabled(allowed, egui::Checkbox::new(&mut on, cpu.to_string()))
+    egui::Window::new(format!("{} {pid}", i18n::tr(K::AffinityTitle)))
+        .open(&mut open)
+        .collapsible(false)
+        .resizable(false)
+        .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+        .show(ctx, |ui| {
+            let sys_mask = app.actions.system_affinity_mask().unwrap_or(u64::MAX);
+            let mut new_mask = mask;
+            let pal = theme::palette_ctx(ctx);
+            egui::Grid::new("affinity")
+                .num_columns(8)
+                .spacing([6.0, 6.0])
+                .show(ui, |ui| {
+                    for cpu in 0..64usize {
+                        let allowed = sys_mask & (1u64 << cpu) != 0;
+                        let mut on = mask & (1u64 << cpu) != 0;
+                        if crate::widgets::controls::checkbox_enabled(
+                            ui,
+                            &mut on,
+                            &cpu.to_string(),
+                            allowed,
+                            &pal,
+                        )
                         .changed()
-                    {
-                        if on {
-                            new_mask |= 1u64 << cpu;
-                        } else {
-                            new_mask &= !(1u64 << cpu);
+                        {
+                            if on {
+                                new_mask |= 1u64 << cpu;
+                            } else {
+                                new_mask &= !(1u64 << cpu);
+                            }
+                        }
+                        if (cpu + 1) % 8 == 0 {
+                            ui.end_row();
                         }
                     }
-                    if (cpu + 1) % 8 == 0 {
-                        ui.end_row();
+                });
+            if new_mask == 0 {
+                ui.label(
+                    egui::RichText::new(i18n::tr(K::AffinityWarn)).color(theme::DARK.heat_high),
+                );
+            }
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                if ui.button(i18n::tr(K::Cancel)).clicked() {
+                    app.affinity_dialog = None;
+                }
+                if ui
+                    .add_enabled(new_mask != 0, egui::Button::new(i18n::tr(K::Apply)))
+                    .clicked()
+                {
+                    match app.actions.set_affinity_mask(pid, new_mask) {
+                        Ok(()) => app.shared.toast(i18n::tr(K::AffinitySet)),
+                        Err(e) => app.shared.toast(i18n::trf(K::ErrMsg, &[&e.to_string()])),
                     }
+                    app.affinity_dialog = None;
                 }
             });
-        if new_mask == 0 {
-            ui.label(
-                egui::RichText::new(i18n::tr(K::AffinityWarn)).color(theme::DARK.heat_high),
-            );
-        }
-        ui.add_space(8.0);
-        ui.horizontal(|ui| {
-            if ui.button(i18n::tr(K::Cancel)).clicked() {
-                app.affinity_dialog = None;
-            }
-            if ui
-                .add_enabled(new_mask != 0, egui::Button::new(i18n::tr(K::Apply)))
-                .clicked()
-            {
-                match app.actions.set_affinity_mask(pid, new_mask) {
-                    Ok(()) => app.shared.toast(i18n::tr(K::AffinitySet)),
-                    Err(e) => app.shared.toast(i18n::trf(K::ErrMsg, &[&e.to_string()])),
-                }
-                app.affinity_dialog = None;
-            }
         });
-    });
     if !open {
         app.affinity_dialog = None;
     }

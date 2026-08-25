@@ -60,7 +60,16 @@ fn run_gui(mock: bool, args: &[String]) {
 
     // Engine starts BEFORE the window so the first frame already has data.
     // (The collector itself initializes lazily on the engine thread.)
-    let settings = tm_core::settings::Settings::load();
+    let mut settings = tm_core::settings::Settings::load();
+    // Diagnostics/UI tests: --size=WxH overrides the persisted window size
+    // for this run.
+    if let Some(sz) = args
+        .iter()
+        .find_map(|a| a.strip_prefix("--size=").map(|s| s.to_string()))
+        .and_then(|s| parse_size_arg(&s))
+    {
+        settings.window_size = sz;
+    }
     tm_core::i18n::set_lang(settings.language.resolve());
     let window_size = [settings.window_size[0], settings.window_size[1]];
     let engine = spawn_engine(mock, settings.update_speed.interval());
@@ -86,12 +95,11 @@ fn run_gui(mock: bool, args: &[String]) {
         };
         #[cfg(feature = "wgpu")]
         {
-            opts.wgpu_options = eframe::WgpuConfiguration::default().with_surface_config(
-                eframe::SurfaceConfig {
+            opts.wgpu_options =
+                eframe::WgpuConfiguration::default().with_surface_config(eframe::SurfaceConfig {
                     present_mode: eframe::wgpu::PresentMode::Fifo,
                     desired_maximum_frame_latency: Some(2),
-                },
-            );
+                });
         }
         opts
     };
@@ -157,6 +165,13 @@ fn run_gui(mock: bool, args: &[String]) {
             })
             .collect()
     }
+}
+
+/// Parse a `WxH` CLI argument (diagnostics `--size=`).
+fn parse_size_arg(s: &str) -> Option<[f32; 2]> {
+    let (w, h) = s.split_once(['x', 'X'])?;
+    let (w, h) = (w.trim().parse::<f32>().ok()?, h.trim().parse::<f32>().ok()?);
+    (w >= 200.0 && h >= 150.0).then_some([w, h])
 }
 
 fn spawn_engine(mock: bool, interval: Duration) -> tm_core::EngineHandle {

@@ -25,6 +25,60 @@ pub fn table_avail(ui: &egui::Ui) -> f32 {
     (ui.available_width() - 6.0).max(300.0)
 }
 
+/// Render a table header + body with full scrolling support.
+///
+/// The header sits in its own horizontal-only scroll area whose offset
+/// mirrors the body's; the body is a `ScrollArea::both()`, so whenever the
+/// user widens columns past the window (or shrinks the window below the
+/// minimum table width) a horizontal scroll bar appears and header + rows
+/// stay aligned while scrolling. The vertical bar lives only on the body —
+/// the header never scrolls out of view.
+///
+/// `rows` receives `(ui, avail, content_width)`; use `content_width` for
+/// full-width decorations (group headers) so they cover the scrolled span.
+/// Returns the clicked header column (for sorting).
+#[allow(clippy::too_many_arguments)]
+pub fn scrolled_table(
+    id: &'static str,
+    ui: &mut egui::Ui,
+    pal: &Palette,
+    table: &mut TmTable,
+    avail: f32,
+    sort: Option<(usize, bool)>,
+    aggregates: Option<&[String]>,
+    rows: impl FnOnce(&mut egui::Ui, &TmTable, f32, f32),
+) -> Option<usize> {
+    let content_w = table.total_width(avail);
+    let hdr_id = egui::Id::new(("tm-hdrscroll", id));
+    let rows_prev_x = ui
+        .ctx()
+        .data(|d| d.get_temp::<f32>(egui::Id::new(("tm-rowsx", id))))
+        .unwrap_or(0.0);
+
+    // Header: horizontal-only, no visible bar; follows the body's offset.
+    // On the non-scrolling (vertical) axis the area must shrink to the
+    // header's height — with `auto_shrink(false)` it would claim all
+    // remaining panel height and squeeze the body out of view.
+    let hdr = egui::ScrollArea::horizontal()
+        .id_salt(hdr_id)
+        .auto_shrink(egui::Vec2b::new(false, true))
+        .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
+        .horizontal_scroll_offset(rows_prev_x)
+        .show(ui, |ui| table.header(ui, pal, avail, sort, aggregates));
+
+    // Body: both axes; x is pinned to the header's current offset (a no-op
+    // unless the header was wheel-scrolled), leaving y free for the user.
+    let body = egui::ScrollArea::both()
+        .id_salt(egui::Id::new(("tm-rowscroll", id)))
+        .auto_shrink(false)
+        .horizontal_scroll_offset(hdr.state.offset.x)
+        .show(ui, |ui| rows(ui, table, avail, avail.max(content_w)));
+
+    ui.ctx()
+        .data_mut(|d| d.insert_temp(egui::Id::new(("tm-rowsx", id)), body.state.offset.x));
+    hdr.inner
+}
+
 #[derive(Debug, Clone)]
 pub struct TmColumn {
     pub id: &'static str,
@@ -74,7 +128,12 @@ pub struct TmTable {
 impl TmTable {
     /// Build a table, restoring previously saved widths for the non-name
     /// columns when available.
-    pub fn new(id: &'static str, cols: Vec<TmColumn>, saved: Option<&[f32]>, name_min: f32) -> Self {
+    pub fn new(
+        id: &'static str,
+        cols: Vec<TmColumn>,
+        saved: Option<&[f32]>,
+        name_min: f32,
+    ) -> Self {
         let mut t = Self {
             id,
             cols,
@@ -136,8 +195,8 @@ impl TmTable {
     /// dragged boundary moves with the cursor, the right edge stays put).
     pub fn last_width(&self, avail: f32) -> f32 {
         let last = self.cols.len() - 1;
-        let others: f32 = self.name_width(avail)
-            + self.cols[1..last].iter().map(|c| c.width).sum::<f32>();
+        let others: f32 =
+            self.name_width(avail) + self.cols[1..last].iter().map(|c| c.width).sum::<f32>();
         (avail - others).max(MIN_COL_W)
     }
 

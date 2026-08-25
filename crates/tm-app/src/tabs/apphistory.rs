@@ -7,7 +7,7 @@ use tm_core::i18n::{self, K};
 
 use crate::app::TaskManApp;
 use crate::theme;
-use crate::widgets::tablekit::{TmColumn};
+use crate::widgets::tablekit::TmColumn;
 
 fn columns() -> Vec<TmColumn> {
     vec![
@@ -79,12 +79,15 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
     let max_cpu = rows.iter().map(|r| r.1).fold(0.0f64, f64::max).max(1.0);
 
     let avail = crate::widgets::tablekit::table_avail(ui);
-    table.header(ui, &pal, avail, None, None);
-
-    egui::ScrollArea::vertical()
-        .id_salt("apphistory-table")
-        .auto_shrink(false)
-        .show(ui, |ui| {
+    crate::widgets::tablekit::scrolled_table(
+        "apphistory",
+        ui,
+        &pal,
+        &mut table,
+        avail,
+        None,
+        None,
+        |ui, table, avail, _content_w| {
             for (name, cpu_s, net_b) in rows.iter().take(500) {
                 let (rect, _resp) = table.row(ui, &pal, avail, false);
                 table.icon_cell(ui, rect, None, pal.accent);
@@ -105,6 +108,7 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
                 table.heat_cells(ui, &pal, avail, rect, 1, &cells, true);
             }
             ui.add_space(12.0);
-        });
+        },
+    );
     app.persist_table(&table);
 }

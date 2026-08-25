@@ -205,6 +205,7 @@ impl SystemCollector for MacCollector {
                 non_paged_pool_bytes: 0,
                 swap_total_bytes: self.sys.total_swap(),
                 swap_used_bytes: self.sys.used_swap(),
+                ..Default::default()
             },
             disks: self
                 .disks
