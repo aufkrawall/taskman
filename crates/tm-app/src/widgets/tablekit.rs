@@ -63,10 +63,12 @@ pub struct TmTable {
     pub cols: Vec<TmColumn>,
     /// Minimum width of the flexible first (name) column.
     pub name_min: f32,
-    /// A width was modified since the last [`Self::take_persist`].
+    /// A width was modified during THIS frame's header() call.
     dirty: bool,
     /// Whether any resize handle was being dragged during the last header().
     dragging: bool,
+    /// Whether any resize handle was dragged during the previous frame.
+    prev_dragging: bool,
 }
 
 impl TmTable {
@@ -79,49 +81,88 @@ impl TmTable {
             name_min,
             dirty: false,
             dragging: false,
+            prev_dragging: false,
         };
         if let Some(saved) = saved {
-            for (c, w) in t.cols.iter_mut().skip(1).zip(saved.iter()) {
-                if *w >= MIN_COL_W && *w <= MAX_COL_W {
-                    c.width = *w;
+            if saved.len() == t.cols.len() {
+                // Current schema: one entry per column (incl. the name).
+                for (c, w) in t.cols.iter_mut().zip(saved.iter()) {
+                    if *w >= MIN_COL_W && *w <= MAX_COL_W {
+                        c.width = *w;
+                    }
+                }
+            } else {
+                // Legacy schema: non-name columns only, name stays elastic.
+                for (c, w) in t.cols.iter_mut().skip(1).zip(saved.iter()) {
+                    if *w >= MIN_COL_W && *w <= MAX_COL_W {
+                        c.width = *w;
+                    }
                 }
             }
         }
         t
     }
 
-    /// Current widths of the non-name columns (for persistence).
+    /// Current widths of ALL columns (for persistence). The name column is
+    /// `0.0` while it is still elastic (never user-resized).
     pub fn stored_widths(&self) -> Vec<f32> {
-        self.cols.iter().skip(1).map(|c| c.width).collect()
+        self.cols.iter().map(|c| c.width).collect()
     }
 
-    /// Returns the widths to persist exactly once per completed resize drag
-    /// (`still_dragging` comes from [`Self::dragging`], read right after
-    /// `header`).
-    pub fn take_persist(&mut self, still_dragging: bool) -> Option<Vec<f32>> {
-        if self.dirty && !still_dragging {
-            self.dirty = false;
-            Some(self.stored_widths())
-        } else {
-            None
+    /// A width changed during this frame's `header()` call.
+    pub fn changed_this_frame(&self) -> bool {
+        self.dirty
+    }
+
+    /// A resize drag ended with this or the previous frame.
+    pub fn drag_just_ended(&self) -> bool {
+        !self.dragging && self.prev_dragging
+    }
+
+    /// The name column is elastic until the user drags its boundary once
+    /// (`width > 0` = stored width); afterwards it keeps the stored size.
+    pub fn name_width(&self, avail: f32) -> f32 {
+        match self.cols[0].width {
+            w if w > 0.0 => w.clamp(self.name_min, MAX_COL_W),
+            _ => {
+                let fixed: f32 = self.cols[1..].iter().map(|c| c.width).sum();
+                (avail - fixed).max(self.name_min)
+            }
         }
     }
 
-    /// Resolved width of the name (first) column given the available width.
-    pub fn name_width(&self, avail: f32) -> f32 {
-        let fixed: f32 = self.cols[1..].iter().map(|c| c.width).sum();
-        (avail - fixed).max(self.name_min)
+    /// Effective width of the LAST column: it always stretches/shrinks so the
+    /// table exactly fills the window (classic Task Manager behavior — every
+    /// dragged boundary moves with the cursor, the right edge stays put).
+    pub fn last_width(&self, avail: f32) -> f32 {
+        let last = self.cols.len() - 1;
+        let others: f32 = self.name_width(avail)
+            + self.cols[1..last].iter().map(|c| c.width).sum::<f32>();
+        (avail - others).max(MIN_COL_W)
+    }
+
+    /// Effective width of column `i`.
+    pub fn col_width(&self, i: usize, avail: f32) -> f32 {
+        if i == 0 {
+            self.name_width(avail)
+        } else if i == self.cols.len() - 1 {
+            self.last_width(avail)
+        } else {
+            self.cols[i].width
+        }
     }
 
     pub fn total_width(&self, avail: f32) -> f32 {
-        self.name_width(avail) + self.cols[1..].iter().map(|c| c.width).sum::<f32>()
+        let last = self.cols.len() - 1;
+        self.name_width(avail)
+            + self.cols[1..last].iter().map(|c| c.width).sum::<f32>()
+            + self.last_width(avail)
     }
 
     pub fn col_rect(&self, i: usize, avail: f32, row: Rect) -> Rect {
-        let name_w = self.name_width(avail);
         let mut x = row.left();
-        for (ci, c) in self.cols.iter().enumerate() {
-            let w = if ci == 0 { name_w } else { c.width };
+        for ci in 0..self.cols.len() {
+            let w = self.col_width(ci, avail);
             if ci == i {
                 return Rect::from_min_max(Pos2::new(x, row.top()), Pos2::new(x + w, row.bottom()));
             }
@@ -140,23 +181,20 @@ impl TmTable {
 
     /// Left-edge x of column `i` inside `rect`.
     fn boundary_x(&self, rect: Rect, avail: f32, i: usize) -> f32 {
-        let name_w = self.name_width(avail);
         let mut x = rect.left();
-        for (ci, c) in self.cols.iter().enumerate() {
-            if ci == i {
-                break;
-            }
-            x += if ci == 0 { name_w } else { c.width };
+        for ci in 0..i.min(self.cols.len()) {
+            x += self.col_width(ci, avail);
         }
         x
     }
 
     /// Paint the header. Returns the clicked column index (for sorting).
     ///
-    /// Every boundary right of the first (name) column carries an invisible
-    /// drag handle: drag to resize, double-click to restore the built-in
-    /// default width. The name column stays elastic and absorbs differences,
-    /// so the table always fills the window without horizontal scrolling.
+    /// Every boundary between two columns carries an invisible drag handle.
+    /// Dragging resizes the column to the LEFT of the boundary — the boundary
+    /// itself follows the cursor, exactly like Windows Task Manager. The last
+    /// column absorbs the remaining window width, so the table always fills
+    /// the window. Double-click restores the built-in default width.
     pub fn header(
         &mut self,
         ui: &mut egui::Ui,
@@ -174,9 +212,9 @@ impl TmTable {
         let total_w = self.total_width(avail);
         let (rect, _) = ui.allocate_exact_size(egui::vec2(total_w, h), Sense::hover());
         let painter = ui.painter_at(rect.expand(2.0));
-        let name_w = self.name_width(avail);
         let mut clicked = None;
         let mut dragging_now = false;
+        self.dirty = false;
         let mut x = rect.left();
         let mut agg_idx = 0usize;
 
@@ -188,7 +226,7 @@ impl TmTable {
         let mut resize_hits: Vec<(usize, egui::Response)> = Vec::new();
 
         for (i, col) in self.cols.iter().enumerate() {
-            let w = if i == 0 { name_w } else { col.width };
+            let w = self.col_width(i, avail);
             let cell =
                 Rect::from_min_max(Pos2::new(x, rect.top()), Pos2::new(x + w, rect.bottom()));
 
@@ -283,13 +321,14 @@ impl TmTable {
                 pal.text_dim,
             );
 
-            // ---- resize handle on this column's LEFT edge (never on the
-            // name column, whose width is elastic).
+            // ---- resize handle on this column's LEFT edge: dragging it
+            // resizes the column to the LEFT of the boundary (the boundary
+            // follows the cursor). No handle left of the first column.
             if i >= 1 {
                 let bx = bounds[i];
                 let handle = Rect::from_min_max(
-                    Pos2::new(bx - 5.0, rect.top()),
-                    Pos2::new(bx + 5.0, rect.bottom()),
+                    Pos2::new(bx - 6.0, rect.top()),
+                    Pos2::new(bx + 6.0, rect.bottom()),
                 );
                 let rresp = ui.interact(handle, table_id.with(("resize", col.id)), Sense::drag());
                 if rresp.hovered() || rresp.dragged() {
@@ -302,19 +341,28 @@ impl TmTable {
         }
 
         // Apply resize results now that painting borrowed nothing mutable.
+        // Boundary i (left edge of column i) resizes column i-1.
         for (i, rresp) in resize_hits {
             if rresp.dragged() {
                 dragging_now = true;
             }
             let dx = rresp.drag_delta().x;
-            let col = &mut self.cols[i];
+            let min_w = if i == 1 { self.name_min } else { MIN_COL_W };
+            // The elastic name column stores 0.0 until first resized;
+            // seed it with the current effective width on the first drag.
+            if i == 1 && dx != 0.0 && self.cols[0].width <= 0.0 {
+                self.cols[0].width = self.name_width(avail);
+            }
+            let target = &mut self.cols[i - 1];
             if dx != 0.0 {
-                col.width = (col.width + dx).clamp(MIN_COL_W, MAX_COL_W);
+                target.width = (target.width + dx).clamp(min_w, MAX_COL_W);
                 self.dirty = true;
                 dragging_now = true;
             }
             if rresp.double_clicked() {
-                col.width = col.default_w.clamp(MIN_COL_W, MAX_COL_W);
+                // Restores the built-in default; `0.0` on the name column
+                // switches it back to elastic.
+                target.width = target.default_w.clamp(0.0, MAX_COL_W);
                 self.dirty = true;
             }
             // Subtle affordance: brighten hovered separators.
@@ -344,6 +392,7 @@ impl TmTable {
             egui::StrokeKind::Inside,
         );
 
+        self.prev_dragging = self.dragging;
         self.dragging = dragging_now;
         clicked
     }
