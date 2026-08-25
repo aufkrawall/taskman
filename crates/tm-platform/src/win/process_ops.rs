@@ -389,11 +389,9 @@ pub fn open_url(url: &str) -> Result<()> {
 /// Write a minidump of `pid` to `path` via dbghelp's MiniDumpWriteDump.
 pub fn create_dump_file(pid: u32, path: &std::path::Path) -> Result<()> {
     use windows::Win32::Storage::FileSystem::{
-        CreateFileW, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL,
+        CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_ALWAYS,
     };
-    use windows::Win32::System::Diagnostics::Debug::{
-        MiniDumpWriteDump, MINIDUMP_TYPE,
-    };
+    use windows::Win32::System::Diagnostics::Debug::{MINIDUMP_TYPE, MiniDumpWriteDump};
 
     let hproc = open_process(
         pid,
@@ -418,9 +416,8 @@ pub fn create_dump_file(pid: u32, path: &std::path::Path) -> Result<()> {
             )
         }
         .map_err(|e| TmError::platform("CreateFileW(dump)", e.to_string()))?;
-        let dump_result = unsafe {
-            MiniDumpWriteDump(hproc, pid, hfile, MINIDUMP_TYPE(0), None, None, None)
-        };
+        let dump_result =
+            unsafe { MiniDumpWriteDump(hproc, pid, hfile, MINIDUMP_TYPE(0), None, None, None) };
         let _ = unsafe { CloseHandle(hfile) };
         dump_result.map_err(|e| TmError::platform("MiniDumpWriteDump", e.to_string()))
     })();

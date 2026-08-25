@@ -53,6 +53,23 @@ pub fn last_bios_time_ms() -> Option<u64> {
     }
 }
 
+/// Refresh rate of the primary display's current mode, from the active
+/// DEVMODE (`EnumDisplaySettingsW(ENUM_CURRENT_SETTINGS)`). Values below 20
+/// Hz are treated as "driver reports nonsense" (0/1 are seen on some
+/// virtual display adapters) and mapped to None.
+pub fn display_refresh_hz() -> Option<f32> {
+    use windows::Win32::Graphics::Gdi::{DEVMODEW, ENUM_CURRENT_SETTINGS, EnumDisplaySettingsW};
+    let mut dm = DEVMODEW {
+        dmSize: std::mem::size_of::<DEVMODEW>() as u16,
+        ..Default::default()
+    };
+    let ok = unsafe { EnumDisplaySettingsW(None, ENUM_CURRENT_SETTINGS, &mut dm) }.as_bool();
+    if !ok || dm.dmDisplayFrequency < 20 {
+        return None;
+    }
+    Some(dm.dmDisplayFrequency as f32)
+}
+
 /// Collector combining sysinfo sampling with Win32/PDH extras.
 pub struct WinCollector {
     inner: sampler::Sampler,

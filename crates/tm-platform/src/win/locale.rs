@@ -7,11 +7,11 @@ use tm_core::locale::{DateOrder, LocaleFmt};
 /// decimal separator, grouping flag and short-date pattern with
 /// `GetLocaleInfoEx`. Returns None when unavailable (falls back to env vars).
 pub fn detect_locale() -> Option<LocaleFmt> {
-    use windows::core::PCWSTR;
     use windows::Win32::Globalization::{
         GetLocaleInfoEx, GetUserDefaultLocaleName, LOCALE_SDECIMAL, LOCALE_SGROUPING,
         LOCALE_SSHORTDATE,
     };
+    use windows::core::PCWSTR;
 
     let mut buf = [0u16; 85]; // LOCALE_NAME_MAX_LENGTH
     let len = unsafe { GetUserDefaultLocaleName(&mut buf) };
@@ -24,13 +24,7 @@ pub fn detect_locale() -> Option<LocaleFmt> {
 
     let info = |lcid: u32| -> Option<String> {
         let mut out = [0u16; 80];
-        let n = unsafe {
-            GetLocaleInfoEx(
-                PCWSTR::from_raw(name.as_ptr()),
-                lcid,
-                Some(&mut out),
-            )
-        };
+        let n = unsafe { GetLocaleInfoEx(PCWSTR::from_raw(name.as_ptr()), lcid, Some(&mut out)) };
         (n > 0).then(|| String::from_utf16_lossy(&out[..n as usize - 1]))
     };
 

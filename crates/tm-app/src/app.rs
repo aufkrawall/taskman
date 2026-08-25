@@ -183,6 +183,15 @@ pub struct TaskManApp {
     pub efficiency_pids: std::collections::HashSet<u32>,
     // Services tab.
     pub services_selected_name: Option<String>,
+
+    /// Frame-rate diagnostics (TASKMAN_FPS_PROBE=1): forces continuous
+    /// repaints, measures achieved fps against the display's refresh rate.
+    pub fps_probe: bool,
+    pub last_frame: Option<std::time::Instant>,
+    pub fps_window_start: std::time::Instant,
+    pub fps_frames: u32,
+    pub fps_ema_ms: f64,
+    pub display_hz: Option<f32>,
 }
 
 fn dirs_data() -> std::path::PathBuf {
@@ -235,6 +244,26 @@ impl TaskManApp {
         i18n::set_lang(settings.language.resolve());
 
         let history_path = dirs_data().join("app-history.json");
+        // Frame-rate diagnostics: TASKMAN_FPS_PROBE=1 forces a continuous
+        // frame stream and overlays/logs the achieved rate vs display Hz.
+        let fps_probe = std::env::var("TASKMAN_FPS_PROBE")
+            .ok()
+            .is_some_and(|v| !v.is_empty() && v != "0");
+        let display_hz = if fps_probe {
+            tm_platform::display_refresh_hz()
+        } else {
+            None
+        };
+        if fps_probe {
+            tracing::info!(?display_hz, "fps probe active (continuous repaints)");
+            // Keep the window visible: an occluded window gets its presents
+            // throttled by the compositor, which would corrupt the
+            // measurement.
+            cc.egui_ctx
+                .send_viewport_cmd(egui::ViewportCommand::WindowLevel(
+                    egui::WindowLevel::AlwaysOnTop,
+                ));
+        }
         Self {
             engine,
             actions,
@@ -272,6 +301,12 @@ impl TaskManApp {
             selected_user: None,
             efficiency_pids: std::collections::HashSet::new(),
             services_selected_name: None,
+            fps_probe,
+            last_frame: None,
+            fps_window_start: std::time::Instant::now(),
+            fps_frames: 0,
+            fps_ema_ms: 0.0,
+            display_hz,
         }
     }
 
@@ -354,12 +389,17 @@ impl eframe::App for TaskManApp {
             self.maybe_save_app_history();
         }
         // Wake up for the next sample.
-        ctx.request_repaint_after(
-            self.engine
-                .interval()
-                .div_f64(2.0)
-                .max(std::time::Duration::from_millis(50)),
-        );
+        let mut wake_in = self
+            .engine
+            .interval()
+            .div_f64(2.0)
+            .max(std::time::Duration::from_millis(50));
+        // Frame-rate diagnostics: stream frames continuously so the achieved
+        // rate can be compared against the display's refresh rate.
+        if self.fps_probe {
+            wake_in = wake_in.min(std::time::Duration::from_millis(1));
+        }
+        ctx.request_repaint_after(wake_in);
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
@@ -404,6 +444,11 @@ impl eframe::App for TaskManApp {
         }
         crate::app_ui::draw_toasts(self, &ctx);
 
+        // Frame-rate diagnostics overlay (TASKMAN_FPS_PROBE=1).
+        if self.fps_probe {
+            self.update_fps_probe(&ctx);
+        }
+
         // Global shortcuts.
         if ctx.input(|i| i.key_pressed(egui::Key::F5)) {
             self.engine.request_refresh();
@@ -430,6 +475,65 @@ impl TaskManApp {
     /// The active UI language.
     pub fn lang(&self) -> i18n::Lang {
         i18n::lang()
+    }
+
+    /// Frame-rate diagnostics (TASKMAN_FPS_PROBE=1): measures the interval
+    /// between consecutive frames, keeps a short-window average and draws a
+    /// compact overlay comparing the achieved rate with the display's
+    /// refresh rate. Once per second the numbers are also logged.
+    fn update_fps_probe(&mut self, ctx: &egui::Context) {
+        const EMA: f64 = 0.15; // ~7-frame time constant at 144 Hz
+        const OUTLIER_MS: f64 = 500.0; // window hidden / machine slept
+
+        let now = std::time::Instant::now();
+        if let Some(prev) = self.last_frame {
+            let dt_ms = (now - prev).as_secs_f64() * 1000.0;
+            if dt_ms < OUTLIER_MS {
+                self.fps_frames += 1;
+                self.fps_ema_ms = if self.fps_ema_ms <= 0.0 {
+                    dt_ms
+                } else {
+                    self.fps_ema_ms + EMA * (dt_ms - self.fps_ema_ms)
+                };
+            }
+        }
+        self.last_frame = Some(now);
+
+        let elapsed = now.duration_since(self.fps_window_start);
+        if elapsed.as_secs_f64() >= 1.0 {
+            let fps = self.fps_frames as f64 / elapsed.as_secs_f64();
+            tracing::info!(
+                fps,
+                frame_ms = format_args!("{:.2}", self.fps_ema_ms),
+                display_hz = self.display_hz.unwrap_or(0.0),
+                "fps probe"
+            );
+            self.fps_frames = 0;
+            self.fps_window_start = now;
+        }
+
+        // Overlay: top-right, unobtrusive, only in probe mode.
+        let hz = self
+            .display_hz
+            .map_or_else(|| "?".to_string(), |h| format!("{h:.0}"));
+        let line = if self.fps_ema_ms > 0.0 {
+            format!(
+                "{:.1} fps · {:.1} ms · {} Hz",
+                1000.0 / self.fps_ema_ms.max(0.01),
+                self.fps_ema_ms,
+                hz
+            )
+        } else {
+            format!("… fps · {hz} Hz")
+        };
+        egui::Area::new(egui::Id::new("tm_fps_overlay"))
+            .anchor(egui::Align2::RIGHT_TOP, [-8.0, 26.0])
+            .order(egui::Order::Foreground)
+            .show(ctx, |ui| {
+                egui::Frame::popup(ui.style()).show(ui, |ui| {
+                    ui.monospace(line);
+                });
+            });
     }
 
     /// Translate a key into the active UI language.
@@ -506,9 +610,10 @@ impl TaskManApp {
     pub fn end_selected(&mut self) {
         if let Some(pid) = self.selected_pid.take() {
             match self.actions.kill_process(pid, false) {
-                Ok(()) => self
-                    .shared
-                    .toast(tm_core::i18n::trf(K::ProcessEndedToast, &[&pid.to_string()])),
+                Ok(()) => self.shared.toast(tm_core::i18n::trf(
+                    K::ProcessEndedToast,
+                    &[&pid.to_string()],
+                )),
                 Err(e) => self
                     .shared
                     .toast(tm_core::i18n::trf(K::ErrMsg, &[&e.to_string()])),
