@@ -449,13 +449,25 @@ impl TaskManApp {
         TmTable::new(id, cols, saved, name_min)
     }
 
-    /// Persist resized column widths once a drag gesture finished.
-    pub fn persist_table(&mut self, table: &mut TmTable) {
-        if let Some(w) = table.take_persist(table.dragging()) {
+    /// Persist resized column widths.
+    ///
+    /// The table object is rebuilt every frame from the stored widths, so the
+    /// in-memory settings map must be updated on EVERY frame with changes —
+    /// otherwise the drag delta would be discarded on the next rebuild and
+    /// the column would never move. The (atomic) disk write happens only
+    /// when the drag gesture finishes.
+    pub fn persist_table(&mut self, table: &TmTable) {
+        if table.changed_this_frame() {
             self.shared
                 .settings
                 .col_widths
-                .insert(table.id.to_string(), w);
+                .insert(table.id.to_string(), table.stored_widths());
+            // Single-shot changes (double-click reset) finish immediately.
+            if !table.dragging() {
+                self.shared.settings.save();
+            }
+        }
+        if table.drag_just_ended() {
             self.shared.settings.save();
         }
     }

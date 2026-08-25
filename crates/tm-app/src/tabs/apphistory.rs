@@ -106,5 +106,5 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
             }
             ui.add_space(12.0);
         });
-    app.persist_table(&mut table);
+    app.persist_table(&table);
 }
