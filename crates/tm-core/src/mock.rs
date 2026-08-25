@@ -36,6 +36,8 @@ pub fn snapshot(seed: u32) -> Snapshot {
         timestamp_ms: now,
         sample_duration_ms: 1,
         cpu: CpuInfo {
+            kernel_pct: 0.0,
+            per_core_kernel_pct: Vec::new(),
             brand: "Mock CPU 8-Core".into(),
             vendor: "MockVendor".into(),
             architecture: "x86_64".into(),
@@ -99,6 +101,8 @@ pub fn snapshot(seed: u32) -> Snapshot {
             ssid: None,
         }],
         gpus: vec![GpuInfo {
+            shared_used_bytes: 0,
+            luid: None,
             id: 0,
             name: "Mock RTX GPU".into(),
             driver_version: "999.99".into(),

@@ -85,6 +85,10 @@ impl SystemCollector for WinCollector {
     fn backend_name(&self) -> &'static str {
         "windows/sysinfo+pdh+nt-cpu"
     }
+
+    fn set_demand(&mut self, demand: tm_core::demand::TelemetryDemand) {
+        self.inner.set_demand(demand);
+    }
 }
 
 /// Windows action surface.
@@ -161,6 +165,9 @@ impl PlatformActions for WinActions {
     fn run_new_task(&self, command_line: &str, elevate: bool) -> Result<()> {
         process_ops::run_new_task(command_line, elevate)
     }
+    fn run_new_task_probe(&self, command_line: &str, elevate: bool) -> Result<()> {
+        process_ops::run_new_task_probe(command_line, elevate)
+    }
     fn relaunch_elevated(&self) -> Result<()> {
         process_ops::relaunch_elevated()
     }
@@ -190,11 +197,12 @@ impl PlatformActions for WinActions {
     }
 }
 
-pub fn create() -> (WinCollector, WinActions) {
-    (
-        WinCollector {
-            inner: sampler::Sampler::new(),
-        },
-        WinActions,
-    )
+pub fn create_collector() -> WinCollector {
+    WinCollector {
+        inner: sampler::Sampler::new(),
+    }
+}
+
+pub fn create_actions() -> WinActions {
+    WinActions
 }

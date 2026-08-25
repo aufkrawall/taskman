@@ -11,7 +11,7 @@ use tm_core::model::{StartupImpact, StartupItem};
 use crate::app::TaskManApp;
 use crate::icons::Icon;
 use crate::theme;
-use crate::widgets::tablekit::TmColumn;
+use crate::widgets::tablekit::{self, TmColumn};
 
 fn columns() -> Vec<TmColumn> {
     vec![
@@ -24,6 +24,7 @@ fn columns() -> Vec<TmColumn> {
 
 pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
     let pal = theme::palette(ui);
+    let frame_ctx = ui.ctx().clone();
 
     // Lazy refresh in the background (registry + folder scan off the UI thread).
     {
@@ -39,38 +40,47 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
             let toasts = app.shared.toasts.clone();
             let done = app.shared.startup_fetch.flag();
             let actions = app.actions.clone();
-            let _ = std::thread::Builder::new()
-                .name("tm-startup-fetch".into())
-                .spawn(move || {
-                    let items = actions.list_startup();
-                    if let Err(e) = &items {
-                        crate::app::toast_from(
-                            &toasts,
-                            i18n::trf(K::StartupUnavailable, &[&e.to_string()]),
-                        );
-                    }
-                    *tm_core::sync::lock(&cache) =
-                        Some((items.unwrap_or_default(), Instant::now()));
-                    done.store(false, std::sync::atomic::Ordering::Relaxed);
-                });
+            let wake = {
+                let ctx = frame_ctx.clone();
+                move || ctx.request_repaint()
+            };
+            let job = move || {
+                let items = actions.list_startup();
+                if let Err(e) = &items {
+                    crate::app::toast_from(
+                        &toasts,
+                        i18n::trf(K::StartupUnavailable, &[&e.to_string()]),
+                    );
+                }
+                *tm_core::sync::lock(&cache) = Some((items.unwrap_or_default(), Instant::now()));
+                done.store(false, std::sync::atomic::Ordering::Relaxed);
+                wake();
+            };
+            match &app.shared.executor {
+                Some(executor) => executor.run_quiet(|| {}, job),
+                None => job(),
+            }
         }
     }
 
-    let selected_idx = app.selected_startup_idx;
+    let selected_id = app.selected_startup_id.clone();
     crate::app_ui::tab_header(
         app,
         ui,
         &pal,
         |app, ui| {
-            let sel: Option<StartupItem> = selected_idx.and_then(|i| {
+            let sel: Option<StartupItem> = selected_id.as_ref().and_then(|id| {
                 let guard = tm_core::sync::lock(&app.shared.startup_cache);
-                guard.as_ref().and_then(|(v, _)| v.get(i)).cloned()
+                guard
+                    .as_ref()
+                    .and_then(|(v, _)| v.iter().find(|it| &it.id == id))
+                    .cloned()
             });
             let can_enable = sel.as_ref().is_some_and(|s| !s.enabled);
             let can_disable = sel.as_ref().is_some_and(|s| s.enabled);
             if crate::app_ui::cmd_button(ui, &pal, Icon::Check, i18n::tr(K::EnableCmd), can_enable)
             {
-                toggle_selected(app, true);
+                toggle_selected(app, true, ui.ctx());
             }
             if crate::app_ui::cmd_button(
                 ui,
@@ -79,7 +89,7 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
                 i18n::tr(K::DisableCmd),
                 can_disable,
             ) {
-                toggle_selected(app, false);
+                toggle_selected(app, false, ui.ctx());
             }
             if crate::app_ui::cmd_button(
                 ui,
@@ -92,8 +102,11 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
             }
             let _ = &sel;
         },
-        |_app, ui| {
+        |app, ui| {
             if ui.button(i18n::tr(K::RefreshNow)).clicked() {
+                // Invalidate the cache so the worker refetches immediately.
+                *tm_core::sync::lock(&app.shared.startup_cache) = None;
+                app.refresh_all();
                 ui.close();
             }
         },
@@ -110,7 +123,7 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
             i18n::tr(K::SecondsSuffix)
         );
         ui.painter().text(
-            egui::Pos2::new(rect.right() - 16.0, rect.center().y),
+            egui::Pos2::new(rect.right() - 6.0, rect.center().y),
             egui::Align2::RIGHT_CENTER,
             text,
             egui::FontId::proportional(12.5),
@@ -123,13 +136,23 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
     let cache_arc = app.shared.startup_cache.clone();
     let mut guard = tm_core::sync::lock(&cache_arc);
     let Some((items, _)) = guard.as_mut() else {
+        // Background fetch still in flight — centered placeholder like the
+        // other tabs instead of a blank pane.
+        ui.centered_and_justified(|ui| ui.label(i18n::tr(K::GatheringData)));
         return;
     };
 
     let q = app.search.trim().to_lowercase();
     let mut table = app.make_table("startup", columns(), 340.0);
     let avail = crate::widgets::tablekit::table_avail(ui);
-    crate::widgets::tablekit::scrolled_table(
+    // Precompute visible indexes so show_rows can virtualize them.
+    let visible: Vec<usize> = items
+        .iter()
+        .enumerate()
+        .filter(|(_, it)| q.is_empty() || it.name.to_lowercase().contains(&q))
+        .map(|(i, _)| i)
+        .collect();
+    tablekit::scrolled_rows(
         "startup",
         ui,
         &pal,
@@ -137,19 +160,19 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
         avail,
         None,
         None,
-        |ui, table, avail, _content_w| {
-            for (i, item) in items.iter_mut().enumerate() {
-                if !q.is_empty() && !item.name.to_lowercase().contains(&q) {
-                    continue;
-                }
-                let selected = app.selected_startup_idx == Some(i);
+        visible.len(),
+        |ui, table, avail, _content_w, range| {
+            for vi in range {
+                let i = visible[vi];
+                let item = &mut items[i];
+                let selected = app.selected_startup_id.as_deref() == Some(item.id.as_str());
                 let (rect, resp) = table.row(ui, &pal, avail, selected);
 
                 // Icon: real shell icon from the command's executable.
                 let exe = exe_from_command(&item.command);
                 let tex = exe
                     .as_deref()
-                    .and_then(|p| app.shared.icons.get(ui.ctx(), app.actions.as_ref(), p, 4));
+                    .and_then(|p| app.shared.icons.get(ui.ctx(), &app.actions, p, 4));
                 table.icon_cell(ui, rect, tex.as_ref(), pal.accent);
                 let name_rect = table.col_rect(0, avail, rect);
                 ui.painter().text(
@@ -193,31 +216,34 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
                 );
 
                 if resp.clicked() {
-                    app.selected_startup_idx = Some(i);
+                    app.selected_startup_id = Some(item.id.clone());
                 }
                 resp.context_menu(|ui| {
                     ui.set_min_width(180.0);
+                    let ctx = ui.ctx().clone();
                     let label = if item.enabled {
                         i18n::tr(K::DisableCmd)
                     } else {
                         i18n::tr(K::EnableCmd)
                     };
                     if ui.button(label).clicked() {
+                        // Registry/folder toggling runs on the action executor.
                         let new_enabled = !item.enabled;
-                        match app
-                            .actions
-                            .set_startup_enabled(&item.id, &item.location, new_enabled)
-                        {
-                            Ok(()) => {
-                                item.enabled = new_enabled;
-                                app.shared.toast(if new_enabled {
-                                    i18n::tr(K::EnabledWord)
-                                } else {
-                                    i18n::tr(K::DisabledWord)
-                                });
+                        let id = item.id.clone();
+                        let location = item.location.clone();
+                        let actions = app.actions.clone();
+                        let ok_msg = move || {
+                            if new_enabled {
+                                i18n::tr(K::EnabledWord).to_string()
+                            } else {
+                                i18n::tr(K::DisabledWord).to_string()
                             }
-                            Err(e) => app.shared.toast(i18n::trf(K::ErrMsg, &[&e.to_string()])),
-                        }
+                        };
+                        let ctx2 = ctx.clone();
+                        app.run_action(&ctx2, ok_msg, move || {
+                            actions.set_startup_enabled(&id, &location, new_enabled)
+                        });
+                        item.enabled = new_enabled; // optimistic; refetch corrects
                         ui.close();
                     }
                     if ui.button(i18n::tr(K::Properties)).clicked() {
@@ -248,27 +274,28 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
     app.persist_table(&table);
 }
 
-fn toggle_selected(app: &mut TaskManApp, enable: bool) {
+fn toggle_selected(app: &mut TaskManApp, enable: bool, ctx: &egui::Context) {
     let guard = app.shared.startup_cache.clone();
     let mut cache = tm_core::sync::lock(&guard);
     if let Some((items, _)) = cache.as_mut()
-        && let Some(idx) = app.selected_startup_idx
-        && let Some(item) = items.get_mut(idx)
+        && let Some(id) = app.selected_startup_id.clone()
+        && let Some(item) = items.iter_mut().find(|it| it.id == id)
     {
-        match app
-            .actions
-            .set_startup_enabled(&item.id, &item.location, enable)
-        {
-            Ok(()) => {
-                item.enabled = enable;
-                app.shared.toast(if enable {
-                    i18n::tr(K::EnabledWord)
-                } else {
-                    i18n::tr(K::DisabledWord)
-                });
+        // Selection is by stable id; list indexes shift on refresh.
+        let actions = app.actions.clone();
+        let item_id = item.id.clone();
+        let location = item.location.clone();
+        let ok_msg = move || {
+            if enable {
+                i18n::tr(K::EnabledWord).to_string()
+            } else {
+                i18n::tr(K::DisabledWord).to_string()
             }
-            Err(e) => app.shared.toast(i18n::trf(K::ErrMsg, &[&e.to_string()])),
-        }
+        };
+        app.run_action(ctx, ok_msg, move || {
+            actions.set_startup_enabled(&item_id, &location, enable)
+        });
+        item.enabled = enable; // optimistic; next fetch corrects
     }
 }
 

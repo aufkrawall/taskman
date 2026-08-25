@@ -290,43 +290,134 @@ pub fn set_efficiency_mode(pid: u32, on: bool) -> Result<()> {
     }
 }
 
-// ------------------------------------------------------------------ elevation / launch
+/// Query the current EcoQoS / power-throttling state of `pid` so externally
+/// applied efficiency states are reflected correctly (implement.md §11.6).
+pub fn efficiency_mode_state(pid: u32) -> Option<bool> {
+    use windows::Win32::System::Threading::{
+        GetProcessInformation, PROCESS_POWER_THROTTLING_EXECUTION_SPEED,
+        PROCESS_POWER_THROTTLING_STATE, ProcessPowerThrottling,
+    };
+    unsafe {
+        let h = open_process(pid, th::PROCESS_QUERY_LIMITED_INFORMATION).ok()?;
+        let mut info = PROCESS_POWER_THROTTLING_STATE::default();
+        let ok = GetProcessInformation(
+            h,
+            ProcessPowerThrottling,
+            &mut info as *mut _ as *mut _,
+            std::mem::size_of::<PROCESS_POWER_THROTTLING_STATE>() as u32,
+        )
+        .is_ok();
+        let _ = CloseHandle(h);
+        if !ok {
+            return None;
+        }
+        // ControlMask says whether throttling is managed at all; StateMask
+        // carries the enabled flag.
+        Some(
+            info.ControlMask & PROCESS_POWER_THROTTLING_EXECUTION_SPEED != 0
+                && info.StateMask & PROCESS_POWER_THROTTLING_EXECUTION_SPEED == 0,
+        )
+    }
+}
 
-pub fn is_elevated() -> bool {
-    use windows::Win32::Foundation::HANDLE;
+/// Per-process token security facts (implement.md §12.2/§12.3):
+/// real `TokenElevation` plus UAC virtualization state from
+/// `TokenVirtualizationAllowed`/`TokenVirtualizationEnabled`. Access-denied
+/// yields `None` fields — never fabricated values.
+pub struct TokenSecurity {
+    pub elevated: Option<bool>,
+    pub virtualization: Option<tm_core::model::UacVirtualization>,
+}
+
+pub fn token_security(pid: u32) -> TokenSecurity {
     use windows::Win32::Security::{
         GetTokenInformation, TOKEN_ELEVATION, TOKEN_QUERY, TokenElevation,
+        TokenVirtualizationAllowed, TokenVirtualizationEnabled,
     };
     use windows::Win32::System::Threading::OpenProcessToken;
+
+    let mut out = TokenSecurity {
+        elevated: None,
+        virtualization: None,
+    };
     unsafe {
-        let Ok(process) = th::OpenProcess(
-            th::PROCESS_QUERY_LIMITED_INFORMATION,
-            false,
-            std::process::id(),
-        ) else {
-            return false;
+        let Ok(h) = open_process(pid, th::PROCESS_QUERY_LIMITED_INFORMATION) else {
+            return out;
         };
         let mut token = HANDLE::default();
-        let elevated = OpenProcessToken(process, TOKEN_QUERY, &mut token).map(|()| {
+        if OpenProcessToken(h, TOKEN_QUERY, &mut token).is_ok() {
+            // --- elevation ---
             let mut elev = TOKEN_ELEVATION::default();
-            let mut ret_len: u32 = 0;
-            GetTokenInformation(
+            let mut ret: u32 = 0;
+            if GetTokenInformation(
                 token,
                 TokenElevation,
                 Some(&mut elev as *mut _ as *mut _),
                 std::mem::size_of::<TOKEN_ELEVATION>() as u32,
-                &mut ret_len,
+                &mut ret,
             )
             .is_ok()
-                && elev.TokenIsElevated != 0
-        });
-        let _ = CloseHandle(token);
-        let _ = CloseHandle(process);
-        matches!(elevated, Ok(true))
+            {
+                out.elevated = Some(elev.TokenIsElevated != 0);
+            }
+
+            // --- UAC virtualization ---
+            let query_dword =
+                |cls: windows::Win32::Security::TOKEN_INFORMATION_CLASS| -> Option<u32> {
+                    let mut val: u32 = 0;
+                    let mut ret: u32 = 0;
+                    GetTokenInformation(
+                        token,
+                        cls,
+                        Some(&mut val as *mut u32 as *mut _),
+                        std::mem::size_of::<u32>() as u32,
+                        &mut ret,
+                    )
+                    .ok()?;
+                    Some(val)
+                };
+            let allowed = query_dword(TokenVirtualizationAllowed);
+            let enabled = query_dword(TokenVirtualizationEnabled);
+            out.virtualization = match (allowed, enabled) {
+                (Some(a), Some(e)) => Some(if a == 0 {
+                    tm_core::model::UacVirtualization::NotAllowed
+                } else if e != 0 {
+                    tm_core::model::UacVirtualization::Enabled
+                } else {
+                    tm_core::model::UacVirtualization::Disabled
+                }),
+                _ => None,
+            };
+
+            let _ = CloseHandle(token);
+        }
+        let _ = CloseHandle(h);
     }
+    out
+}
+
+// ------------------------------------------------------------------ elevation / launch
+
+pub fn is_elevated() -> bool {
+    token_security(std::process::id()).elevated.unwrap_or(false)
 }
 
 pub fn run_new_task(command_line: &str, elevate: bool) -> Result<()> {
+    let (file, params) = split_command(command_line);
+    if file.is_empty() {
+        return Err(TmError::platform("run_new_task", "empty command"));
+    }
+    // Never wait on the caller's thread: ShellExecuteExW itself is quick,
+    // but the old 500 ms failure-probe wait blocked UI-thread callers such
+    // as "services.msc" / "ms-settings:" jumps for up to half a second
+    // (implement.md §18.1). Failure probing is opt-in via
+    // [`run_new_task_probe`] and belongs on worker threads only.
+    shell_execute(&file, params.as_deref(), elevate, false)
+}
+
+/// Like [`run_new_task`] but waits up to 500 ms to surface immediate
+/// launch failures. Must be called off the UI thread.
+pub fn run_new_task_probe(command_line: &str, elevate: bool) -> Result<()> {
     let (file, params) = split_command(command_line);
     if file.is_empty() {
         return Err(TmError::platform("run_new_task", "empty command"));
@@ -389,7 +480,7 @@ pub fn open_url(url: &str) -> Result<()> {
 /// Write a minidump of `pid` to `path` via dbghelp's MiniDumpWriteDump.
 pub fn create_dump_file(pid: u32, path: &std::path::Path) -> Result<()> {
     use windows::Win32::Storage::FileSystem::{
-        CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_ALWAYS,
+        CREATE_ALWAYS, CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ, FILE_SHARE_WRITE,
     };
     use windows::Win32::System::Diagnostics::Debug::{MINIDUMP_TYPE, MiniDumpWriteDump};
 
@@ -410,7 +501,9 @@ pub fn create_dump_file(pid: u32, path: &std::path::Path) -> Result<()> {
                 windows::Win32::Storage::FileSystem::FILE_GENERIC_WRITE.0,
                 FILE_SHARE_READ | FILE_SHARE_WRITE,
                 None,
-                OPEN_ALWAYS,
+                // CREATE_ALWAYS truncates an existing dump; OPEN_ALWAYS could
+                // leave stale trailing bytes when the new dump is shorter.
+                CREATE_ALWAYS,
                 FILE_ATTRIBUTE_NORMAL,
                 None,
             )

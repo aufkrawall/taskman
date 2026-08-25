@@ -9,21 +9,52 @@
 //! update_speed=normal
 //! window_size=1100x720
 //!
-//! [columns]
-//! processes=42,110,90
+//! [columns.processes]
+//! name=340
+//! cpu=110
 //! ```
 //!
 //! Rules:
 //! * Unknown sections/keys and invalid values are ignored, so the file stays
 //!   forward-compatible and safe to hand-edit.
 //! * [`Settings::save`] is the automatic-save entry point; it is gated by
-//!   `save_config` (**enabled by default**). `save_to` always writes.
+//!   `save_config` (**enabled by default**). `save_to`/`save_forced` always
+//!   write — toggling the autosave switch itself persists immediately so the
+//!   choice survives restart (implement.md §17.2).
 //! * A legacy `settings.json` from older builds is migrated once when no
 //!   config.ini exists yet.
+//! * Column preferences are keyed by **stable column id** (`[columns.<table>]`
+//!   sections); positional `[columns]` entries of old builds are migrated
+//!   once through each table's historical hard-coded column order.
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+
+/// Test/isolation override (implement.md §23): when set, all config files
+/// live under this directory instead of the user profile.
+pub fn taskman_config_dir() -> PathBuf {
+    std::env::var("TASKMAN_CONFIG_DIR").map_or_else(
+        |_| {
+            dirs::config_local_dir()
+                .unwrap_or_else(|| PathBuf::from("."))
+                .join("taskman")
+        },
+        PathBuf::from,
+    )
+}
+
+/// Test/isolation override for data files (app history, logs).
+pub fn taskman_data_dir() -> PathBuf {
+    std::env::var("TASKMAN_DATA_DIR").map_or_else(
+        |_| {
+            dirs::data_local_dir()
+                .unwrap_or_else(|| PathBuf::from("."))
+                .join("taskman")
+        },
+        PathBuf::from,
+    )
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum ThemeMode {
@@ -70,16 +101,21 @@ pub struct Settings {
     /// Remember window size/position between runs.
     pub remember_window: bool,
     pub window_size: [f32; 2],
-    /// Show per-process network column even when the platform can't measure it.
-    pub show_net_column_anyway: bool,
+    /// Task-Manager-style start page used unless a CLI flag overrides it.
+    pub default_start_page: String,
     /// Navigation rail collapsed to icons only (hamburger toggle).
     pub sidebar_collapsed: bool,
     /// UI language; `System` follows the OS display language.
     pub language: crate::i18n::LangChoice,
-    /// User-resized column widths per table (`table id -> widths`).
-    pub col_widths: BTreeMap<String, Vec<f32>>,
+    /// User-resized column widths per table, keyed by stable column id:
+    /// `table id -> column id -> width`.
+    pub col_widths: BTreeMap<String, BTreeMap<String, f32>>,
     /// Width of the Performance tab's left card column.
     pub perf_card_width: f32,
+    /// Performance CPU graph mode: "overall" | "logical".
+    pub cpu_graph_mode: String,
+    /// Overlay kernel time (darker band) in the CPU graphs.
+    pub show_kernel_times: bool,
 }
 
 impl Default for Settings {
@@ -93,25 +129,15 @@ impl Default for Settings {
             ui_zoom: 1.0,
             remember_window: true,
             window_size: [1100.0, 720.0],
-            show_net_column_anyway: true,
+            default_start_page: "processes".into(),
             sidebar_collapsed: false,
             language: Default::default(),
             col_widths: BTreeMap::new(),
             perf_card_width: 252.0,
+            cpu_graph_mode: "overall".into(),
+            show_kernel_times: false,
         }
     }
-}
-
-fn config_dir() -> Option<PathBuf> {
-    dirs::config_local_dir().map(|d| d.join("taskman"))
-}
-
-fn default_path() -> Option<PathBuf> {
-    config_dir().map(|d| d.join("config.ini"))
-}
-
-fn legacy_json_path() -> Option<PathBuf> {
-    config_dir().map(|d| d.join("settings.json"))
 }
 
 // ------------------------------------------------------------------ INI core
@@ -171,20 +197,18 @@ fn unescape_ini(v: &str) -> String {
     out
 }
 
-fn render_ini(body: String, columns: &BTreeMap<String, Vec<f32>>) -> String {
-    let mut out = String::with_capacity(512 + columns.len() * 40);
+fn render_ini(body: String, columns: &BTreeMap<String, BTreeMap<String, f32>>) -> String {
+    let mut out = String::with_capacity(512);
     out.push_str("# taskman configuration — edited values apply on the next start.\n");
     out.push_str("# Delete this file to reset all settings to their defaults.\n\n");
     out.push_str(&body);
-    if !columns.is_empty() {
-        out.push_str("\n[columns]\n# table id = comma-separated column widths\n");
-        for (id, widths) in columns {
-            let list: Vec<String> = widths.iter().map(|w| w.to_string()).collect();
-            out.push_str(&format!(
-                "{}={}\n",
-                escape_ini(id),
-                escape_ini(&list.join(","))
-            ));
+    for (table, cols) in columns {
+        if cols.is_empty() {
+            continue;
+        }
+        out.push_str(&format!("\n[columns.{table}]\n# column id = width px\n"));
+        for (col, w) in cols {
+            out.push_str(&format!("{}={}\n", escape_ini(col), fmt_width(*w)));
         }
     }
     out
@@ -202,6 +226,12 @@ fn parse_bool(s: &str) -> Option<bool> {
 
 fn parse_f32(s: &str) -> Option<f32> {
     s.parse::<f32>().ok().filter(|v| v.is_finite())
+}
+
+/// Widths as compact decimal text ("340", "110.5").
+fn fmt_width(w: f32) -> String {
+    let s = format!("{w:.1}");
+    s.strip_suffix(".0").map(str::to_owned).unwrap_or(s)
 }
 
 fn parse_u32(s: &str) -> Option<u32> {
@@ -229,6 +259,40 @@ fn parse_widths(s: &str) -> Option<Vec<f32>> {
         }
     }
     (!out.is_empty()).then_some(out)
+}
+
+/// Historical hard-coded column order per table (pre-ID-schema builds).
+/// Used exactly once to migrate positional `[columns]` widths forward.
+pub const LEGACY_COLUMN_ORDER: &[(&str, &[&str])] = &[
+    (
+        "processes",
+        &["name", "status", "cpu", "mem", "disk", "net"],
+    ),
+    (
+        "details",
+        &[
+            "name", "pid", "status", "user", "cpu", "mem", "platform", "elevated", "uac", "gpu",
+        ],
+    ),
+    ("users", &["user", "status", "cpu", "mem", "disk", "net"]),
+    ("startup", &["name", "pub", "status", "impact"]),
+    ("services", &["name", "pid", "desc", "status", "group"]),
+    ("apphistory", &["name", "cpu", "net", "notif"]),
+];
+
+/// Migrate one table's positional width list to `(column id, width)` pairs.
+/// Extra positional entries beyond the known order are ignored; unknown
+/// future ids never break loading (implement.md §25.30).
+pub fn migrate_positional_widths(table: &str, widths: &[f32]) -> BTreeMap<String, f32> {
+    let mut out = BTreeMap::new();
+    if let Some((_, order)) = LEGACY_COLUMN_ORDER.iter().find(|(t, _)| *t == table) {
+        for (col, w) in order.iter().zip(widths.iter()) {
+            if *w >= 40.0 && *w <= 1200.0 {
+                out.insert((*col).to_string(), *w);
+            }
+        }
+    }
+    out
 }
 
 impl crate::i18n::LangChoice {
@@ -330,7 +394,7 @@ impl Settings {
         }
         s.always_on_top = b("general", "always_on_top", s.always_on_top);
         if let Some(v) = get("general", "graph_seconds").and_then(|v| parse_u32(v)) {
-            s.graph_seconds = v.clamp(5, 3600);
+            s.graph_seconds = v.clamp(10, 600);
         }
         if let Some(v) = get("general", "ui_zoom")
             .and_then(|v| parse_f32(v))
@@ -342,11 +406,21 @@ impl Settings {
         if let Some(v) = get("general", "window_size").and_then(|v| parse_window_size(v)) {
             s.window_size = [v[0].clamp(200.0, 16384.0), v[1].clamp(150.0, 16384.0)];
         }
-        s.show_net_column_anyway = b(
-            "general",
-            "show_net_column_anyway",
-            s.show_net_column_anyway,
-        );
+        if let Some(v) = get("general", "default_start_page") {
+            let page = v.trim().to_ascii_lowercase();
+            if matches!(
+                page.as_str(),
+                "processes"
+                    | "performance"
+                    | "apphistory"
+                    | "startup"
+                    | "users"
+                    | "details"
+                    | "services"
+            ) {
+                s.default_start_page = page;
+            }
+        }
         s.sidebar_collapsed = b("general", "sidebar_collapsed", s.sidebar_collapsed);
         if let Some(v) =
             get("general", "language").and_then(|v| crate::i18n::LangChoice::from_cfg(v))
@@ -359,29 +433,68 @@ impl Settings {
         {
             s.perf_card_width = v;
         }
-
-        // Column widths live in their own section: `table id = w,w,w`.
-        for ((section, key), value) in &kv {
-            if section == "columns"
-                && let Some(widths) = parse_widths(value)
-            {
-                s.col_widths.insert(key.clone(), widths);
+        if let Some(v) = get("general", "cpu_graph_mode") {
+            let mode = v.trim().to_ascii_lowercase();
+            if mode == "overall" || mode == "logical" {
+                s.cpu_graph_mode = mode;
             }
+        }
+        s.show_kernel_times = b("general", "show_kernel_times", s.show_kernel_times);
+
+        // Column widths, ID-keyed schema: `[columns.<table>] <col>=<width>`.
+        // Unknown future column ids are preserved verbatim (harmless) rather
+        // than corrupting anything.
+        let mut saw_legacy = false;
+        for ((section, key), value) in &kv {
+            if let Some(table) = section.strip_prefix("columns.") {
+                if table == "columns" {
+                    continue;
+                }
+                if let Some(w) = parse_f32(value)
+                    && (40.0..=1200.0).contains(&w)
+                {
+                    s.col_widths
+                        .entry(table.to_string())
+                        .or_default()
+                        .insert(key.clone(), w);
+                }
+            } else if section == "columns" {
+                saw_legacy = true;
+            }
+        }
+
+        // One-time migration from the old positional `[columns]` schema.
+        if saw_legacy {
+            tracing::info!("migrating positional column widths to column-id schema");
+            for ((_, table), value) in kv.iter().filter(|((sec, _), _)| sec == "columns") {
+                if let Some(widths) = parse_widths(value) {
+                    let migrated = migrate_positional_widths(table, &widths);
+                    if !migrated.is_empty() {
+                        let entry = s.col_widths.entry(table.clone()).or_default();
+                        for (id, w) in migrated {
+                            entry.entry(id).or_insert(w);
+                        }
+                    }
+                }
+            }
+            // The legacy sections are dropped from the file on next save.
+        }
+
+        // remember_window=false: geometry is neither restored nor persisted.
+        if !s.remember_window {
+            s.window_size = Settings::default().window_size;
         }
         s
     }
 
     pub fn load() -> Self {
-        let Some(ini) = default_path() else {
-            return Self::default();
-        };
+        let ini = taskman_config_dir().join("config.ini");
         if ini.exists() {
             return Self::load_from(&ini);
         }
         // One-time migration from the legacy JSON settings of older builds.
-        if let Some(json) = legacy_json_path()
-            && json.exists()
-        {
+        let json = taskman_config_dir().join("settings.json");
+        if json.exists() {
             match std::fs::read_to_string(&json) {
                 Ok(text) => match serde_json::from_str::<Settings>(&text) {
                     Ok(mut s) => {
@@ -409,6 +522,11 @@ impl Settings {
 
     /// Write settings to `path` as INI. Always writes, regardless of the
     /// `save_config` switch (used by tests and explicit exports).
+    ///
+    /// Durable atomic write (implement.md §17.3): same-dir temp file,
+    /// write+flush, rename over the destination. Rust's `std::fs::rename`
+    /// replaces an existing destination on Windows, so no extra workaround
+    /// is needed.
     pub fn save_to(&self, path: &Path) -> std::io::Result<()> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
@@ -423,12 +541,11 @@ impl Settings {
             ("ui_zoom", self.ui_zoom.to_string()),
             ("remember_window", self.remember_window.to_string()),
             ("window_size", write_window_size(self.window_size)),
-            (
-                "show_net_column_anyway",
-                self.show_net_column_anyway.to_string(),
-            ),
+            ("default_start_page", self.default_start_page.clone()),
             ("sidebar_collapsed", self.sidebar_collapsed.to_string()),
             ("perf_card_width", self.perf_card_width.to_string()),
+            ("cpu_graph_mode", self.cpu_graph_mode.clone()),
+            ("show_kernel_times", self.show_kernel_times.to_string()),
         ];
         let mut body = String::from("[general]\n");
         for (k, v) in g {
@@ -442,6 +559,15 @@ impl Settings {
         Ok(())
     }
 
+    fn default_path() -> Option<PathBuf> {
+        if let Some(dir) = test_path_override()
+            && let Some(dir) = dir.as_ref()
+        {
+            return Some(dir.join("config.ini"));
+        }
+        Some(taskman_config_dir().join("config.ini"))
+    }
+
     /// Automatic-save entry point used by the UI. Honors the user's
     /// `save_config` choice (default: on).
     pub fn save(&self) {
@@ -449,10 +575,149 @@ impl Settings {
             tracing::trace!("config autosave disabled; skipping");
             return;
         }
-        if let Some(p) = default_path()
+        if let Some(p) = Self::default_path()
             && let Err(e) = self.save_to(&p)
         {
             tracing::warn!(error = %e, "failed to save settings");
+        }
+    }
+
+    /// Unconditional save that bypasses the autosave gate. Used when the
+    /// user turns autosave OFF (so that choice itself persists), presses
+    /// Reset, or explicitly closes the settings dialog.
+    pub fn save_forced(&self) {
+        if let Some(p) = Self::default_path()
+            && let Err(e) = self.save_to(&p)
+        {
+            tracing::warn!(error = %e, "failed to save settings (forced)");
+        }
+    }
+}
+
+static TEST_PATH_OVERRIDE: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
+
+/// Tests that flip the process-global path override take this lock so they
+/// cannot interleave.
+#[cfg(test)]
+static TEST_OVERRIDE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn test_path_override() -> Option<std::sync::MutexGuard<'static, Option<PathBuf>>> {
+    TEST_PATH_OVERRIDE.lock().ok()
+}
+
+/// Redirect [`Settings::save`] / [`save_forced`] for the whole process.
+/// Test isolation only — production code must not call this.
+#[doc(hidden)]
+pub fn set_default_path_override_for_tests(dir: Option<PathBuf>) {
+    if let Ok(mut g) = TEST_PATH_OVERRIDE.lock() {
+        *g = dir;
+    }
+}
+
+// ----------------------------------------------------------- settings writer
+
+/// Single serialized settings writer thread (implement.md §17.1).
+///
+/// UI threads hand over immutable snapshots; the writer coalesces bursts
+/// (~250 ms) into one atomic disk write, so a slow disk / antivirus cannot
+/// hitch a frame. One thread total — never a thread per setting change.
+pub struct SettingsWriter {
+    tx: std::sync::mpsc::Sender<WriteMsg>,
+    join: Option<std::thread::JoinHandle<()>>,
+}
+
+enum WriteMsg {
+    /// Autosave write (already gated by the caller).
+    Write(std::sync::Arc<Settings>),
+    /// Unconditional write that ignores the autosave gate.
+    Force(std::sync::Arc<Settings>),
+    Flush(std::sync::mpsc::Sender<()>),
+    Shutdown,
+}
+
+const COALESCE_WINDOW: std::time::Duration = std::time::Duration::from_millis(250);
+
+impl SettingsWriter {
+    pub fn start() -> Self {
+        let (tx, rx) = std::sync::mpsc::channel::<WriteMsg>();
+        let join = std::thread::Builder::new()
+            .name("tm-settings-writer".into())
+            .spawn(move || settings_writer_loop(rx))
+            .ok();
+        Self { tx, join }
+    }
+
+    /// Queue an autosave (gating happens at the call site).
+    pub fn enqueue(&self, settings: &Settings) {
+        let _ = self
+            .tx
+            .send(WriteMsg::Write(std::sync::Arc::new(settings.clone())));
+    }
+
+    /// Queue an unconditional write (bypasses the autosave gate) — used when
+    /// the user turns autosave off, presses Reset, or closes the dialog.
+    pub fn force(&self, settings: &Settings) {
+        let _ = self
+            .tx
+            .send(WriteMsg::Force(std::sync::Arc::new(settings.clone())));
+    }
+
+    /// Blocking flush of everything queued so far (bounded wait).
+    pub fn flush(&self) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        if self.tx.send(WriteMsg::Flush(tx)).is_ok() {
+            let _ = rx.recv_timeout(std::time::Duration::from_secs(3));
+        }
+    }
+}
+
+impl Drop for SettingsWriter {
+    fn drop(&mut self) {
+        let _ = self.tx.send(WriteMsg::Shutdown);
+        if let Some(j) = self.join.take() {
+            let _ = j.join();
+        }
+    }
+}
+
+fn settings_writer_loop(rx: std::sync::mpsc::Receiver<WriteMsg>) {
+    // Pending newest snapshot + whether any queued request was forced
+    // (a forced request upgrades the coalesced write).
+    let mut pending: Option<(std::sync::Arc<Settings>, bool)> = None;
+    loop {
+        let msg = if pending.is_some() {
+            // Coalesce everything arriving within the window.
+            match rx.recv_timeout(COALESCE_WINDOW) {
+                Ok(m) => m,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    if let Some((s, _)) = pending.take() {
+                        s.save_forced();
+                    }
+                    continue;
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+        } else {
+            match rx.recv() {
+                Ok(m) => m,
+                Err(_) => break,
+            }
+        };
+        match msg {
+            WriteMsg::Write(s) => pending = Some((s, false)),
+            WriteMsg::Force(s) => pending = Some((s, true)),
+            WriteMsg::Flush(reply) => {
+                if let Some((s, _)) = pending.take() {
+                    s.save_forced();
+                }
+                let _ = reply.send(());
+            }
+            WriteMsg::Shutdown => {
+                if let Some((s, _)) = pending.take() {
+                    s.save_forced();
+                }
+                break;
+            }
         }
     }
 }
@@ -475,14 +740,18 @@ mod tests {
         };
         s.save_config = false;
         s.always_on_top = true;
-        s.remember_window = false;
-        s.show_net_column_anyway = false;
+        s.remember_window = true;
         s.sidebar_collapsed = true;
         s.language = crate::i18n::LangChoice::De;
         s.perf_card_width = 300.5;
+        s.cpu_graph_mode = "logical".into();
+        s.show_kernel_times = true;
+        s.col_widths.insert(
+            "processes".into(),
+            BTreeMap::from([("name".into(), 340.0), ("cpu".into(), 110.5)]),
+        );
         s.col_widths
-            .insert("processes".into(), vec![42.0, 110.5, 90.25, 1234.75]);
-        s.col_widths.insert("details".into(), vec![80.0]);
+            .insert("details".into(), BTreeMap::from([("pid".into(), 80.0)]));
 
         s.save_to(&path).unwrap();
         let loaded = Settings::load_from(&path);
@@ -517,7 +786,7 @@ whatever=yes
         assert_eq!(s.theme, ThemeMode::Light);
         // Out-of-range values are clamped (graph_seconds), or fall back to
         // defaults when no sensible clamp exists (ui_zoom).
-        assert_eq!(s.graph_seconds, 3600);
+        assert_eq!(s.graph_seconds, 600);
         assert_eq!(s.ui_zoom, Settings::default().ui_zoom);
         assert_eq!(s.window_size, Settings::default().window_size);
         // Unknown keys/sections are ignored without failing the file.
@@ -537,8 +806,33 @@ whatever=yes
     #[test]
     fn broken_column_line_is_dropped_whole() {
         let s = Settings::from_ini_text("[columns]\nprocesses=40,oops,60\nother=30,70\n");
+        // The broken line contributes nothing...
         assert!(!s.col_widths.contains_key("processes"));
-        assert_eq!(s.col_widths.get("other"), Some(&vec![30.0, 70.0]));
+        // ...and unknown legacy tables have no historical column order to
+        // migrate against, so they are dropped rather than guessed.
+        assert!(
+            s.col_widths.get("other").is_none_or(|m| m.is_empty()),
+            "no invented mapping for unknown tables"
+        );
+    }
+
+    #[test]
+    fn table_preferences_migrate_positional_widths_to_ids() {
+        // Old builds wrote: processes=42,110,90  → name,status,cpu,...
+        let s = Settings::from_ini_text("[columns]\nprocesses=340,190,110\n");
+        let p = s.col_widths.get("processes").expect("migrated");
+        assert_eq!(p.get("name"), Some(&340.0));
+        assert_eq!(p.get("status"), Some(&190.0));
+        assert_eq!(p.get("cpu"), Some(&110.0));
+        assert!(!p.contains_key("mem"));
+    }
+
+    #[test]
+    fn unknown_future_column_ids_do_not_break_settings_load() {
+        let s = Settings::from_ini_text("[columns.details]\nnpu_engine=120\nname=300\n");
+        let d = s.col_widths.get("details").expect("details present");
+        assert_eq!(d.get("npu_engine"), Some(&120.0));
+        assert_eq!(d.get("name"), Some(&300.0));
     }
 
     #[test]
@@ -564,6 +858,52 @@ whatever=yes
         let path2 = dir.path().join("auto.ini");
         on.save_to(&path2).unwrap();
         assert_eq!(Settings::load_from(&path2), on);
+    }
+
+    #[test]
+    fn settings_save_config_false_persists_itself() {
+        // Turning autosave off must persist that preference even though the
+        // gate would normally block writes (implement.md §12/§17.2):
+        // save_forced bypasses the gate and the flag round-trips.
+        let _serial = TEST_OVERRIDE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.ini");
+        set_default_path_override_for_tests(Some(dir.path().to_path_buf()));
+
+        let mut s = Settings::default();
+        s.save_to(&path).unwrap(); // initial state on disk: autosave on
+        s.save_config = false;
+        s.save_forced(); // what toggling the checkbox off must do
+        let reloaded = Settings::load_from(&path);
+        assert!(
+            !reloaded.save_config,
+            "autosave-off choice must survive restart"
+        );
+        // The gate still blocks ordinary saves (no way to observe on disk
+        // without changing the file — verified by the writer tests above).
+    }
+
+    #[test]
+    fn remember_window_false_does_not_restore_or_persist_geometry() {
+        let s = Settings::from_ini_text("[general]\nremember_window=false\nwindow_size=999x888\n");
+        assert!(!s.remember_window);
+        assert_eq!(
+            s.window_size,
+            Settings::default().window_size,
+            "saved geometry must not be restored"
+        );
+
+        // And persistence skips geometry while disabled.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("c.ini");
+        let s2 = Settings {
+            remember_window: false,
+            window_size: [1234.0, 777.0],
+            ..Settings::default()
+        };
+        s2.save_to(&path).unwrap();
+        let l = Settings::load_from(&path);
+        assert_eq!(l.window_size, Settings::default().window_size);
     }
 
     #[test]
@@ -598,5 +938,27 @@ whatever=yes
             UpdateSpeed::Low.interval(),
             std::time::Duration::from_secs(4)
         );
+    }
+
+    #[test]
+    fn writer_coalesces_and_flushes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.ini");
+        let _serial = TEST_OVERRIDE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        set_default_path_override_for_tests(Some(dir.path().to_path_buf()));
+        let writer = SettingsWriter::start();
+
+        let s = Settings {
+            graph_seconds: 30,
+            ..Settings::default()
+        };
+        writer.enqueue(&s);
+        let mut s2 = s.clone();
+        s2.graph_seconds = 45;
+        writer.enqueue(&s2); // newer generation wins
+        writer.flush();
+
+        let loaded = Settings::load_from(&path);
+        assert_eq!(loaded.graph_seconds, 45);
     }
 }

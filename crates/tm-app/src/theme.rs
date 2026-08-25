@@ -1,7 +1,7 @@
 //! Theme: Windows-11-Task-Manager palette for dark and light mode plus the
 //! blue heat-map gradient used by the table value cells.
 
-use eframe::egui::{self, Color32, CornerRadius, Visuals};
+use eframe::egui::{self, Color32, CornerRadius, FontId, Visuals};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Palette {
@@ -91,6 +91,20 @@ pub fn install_visuals(ctx: &egui::Context) {
             } else {
                 style.visuals = light_visuals();
             }
+            apply_text_aa(&mut style.visuals.text_options);
+            // Centralized text-style ladder so egui widgets and the
+            // hand-painted chrome share one scale: body/button/table text
+            // 12.5, dialog section headings = tab titles 15.5, monospace
+            // 12.0 (debug overlay). Without this, egui's defaults (13.0/18.0)
+            // leak into every dialog, menu and label next to 12.5 chrome.
+            style.text_styles = [
+                (egui::TextStyle::Small, FontId::proportional(11.0)),
+                (egui::TextStyle::Body, FontId::proportional(12.5)),
+                (egui::TextStyle::Button, FontId::proportional(12.5)),
+                (egui::TextStyle::Heading, FontId::proportional(15.5)),
+                (egui::TextStyle::Monospace, FontId::proportional(12.0)),
+            ]
+            .into();
             style.visuals.window_corner_radius = CornerRadius::same(8);
             style.visuals.menu_corner_radius = CornerRadius::same(8);
             style.spacing.item_spacing = egui::vec2(8.0, 6.0);
@@ -118,6 +132,34 @@ pub fn install_visuals(ctx: &egui::Context) {
             };
         });
     }
+}
+
+/// Text antialiasing tuned for Windows' ClearType look.
+///
+/// What "ClearType" maps to inside egui (which does grayscale AA only —
+/// true RGB-subpixel rendering is upstream issue emilk/egui#2639):
+/// * `font_hinting` stays on (default): stems snap toward the pixel grid,
+///   like ClearType's hinted rendering.
+/// * Glyph positions snap to physical pixels (`TessellationOptions`
+///   `round_text_to_pixels`, also default-on).
+/// * `subpixel_binning` goes OFF: it renders every glyph at four fractional
+///   x-offsets which then get bilinearly sampled — softer edges, blurrier
+///   small text. Off = crisper stems at native scale, at the cost of
+///   slightly less even kerning (the classic crisp-Windows tradeoff).
+///   Restore binning with `TASKMAN_TEXT_BINNING=1` on fractional-DPI
+///   displays where evenness matters more than sharpness.
+/// * The glyph-coverage→alpha curve keeps egui's per-mode defaults
+///   (light: linear; dark: 2·c−c², which keeps bright-on-dark text sharp).
+fn apply_text_aa(opts: &mut egui::epaint::TextOptions) {
+    static BINNING: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    opts.subpixel_binning = *BINNING.get_or_init(|| {
+        std::env::var("TASKMAN_TEXT_BINNING")
+            .map(|v| !v.is_empty() && v != "0")
+            .unwrap_or(false)
+    });
+    // Hinting is already the default; assert the intent so a future default
+    // flip cannot silently soften our text.
+    opts.font_hinting = true;
 }
 
 pub fn dark_visuals() -> Visuals {

@@ -41,27 +41,40 @@ pub fn display_refresh_hz() -> Option<f32> {
     None
 }
 
-/// Build the platform's collector + action pair.
+/// Build only the platform action surface (process control, services,
+/// startup apps, ...).
 ///
-/// Returns `(collector, actions)`. Never fails: platforms degrade gracefully
-/// and surface per-feature errors through their APIs at runtime.
-pub fn create_stack() -> (
-    Box<dyn tm_core::engine::SystemCollector>,
-    Box<dyn actions::PlatformActions>,
-) {
+/// This is deliberately separate from [`create_collector`]: constructing
+/// actions must never pay for sampler construction (sysinfo warmup, CPU
+/// topology probing, SMBIOS parsing). GUI startup uses this and defers the
+/// collector to the engine thread.
+pub fn create_actions() -> Box<dyn actions::PlatformActions> {
     #[cfg(target_os = "windows")]
     {
-        let (c, a) = win::create();
-        (Box::new(c), Box::new(a))
+        Box::new(win::create_actions())
     }
     #[cfg(target_os = "linux")]
     {
-        let (c, a) = linux::create();
-        (Box::new(c), Box::new(a))
+        Box::new(linux::create_actions())
     }
     #[cfg(target_os = "macos")]
     {
-        let (c, a) = macos::create();
-        (Box::new(c), Box::new(a))
+        Box::new(macos::create_actions())
+    }
+}
+
+/// Build only the system collector.
+pub fn create_collector() -> Box<dyn tm_core::engine::SystemCollector> {
+    #[cfg(target_os = "windows")]
+    {
+        Box::new(win::create_collector())
+    }
+    #[cfg(target_os = "linux")]
+    {
+        Box::new(linux::create_collector())
+    }
+    #[cfg(target_os = "macos")]
+    {
+        Box::new(macos::create_collector())
     }
 }

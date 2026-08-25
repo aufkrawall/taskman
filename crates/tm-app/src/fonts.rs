@@ -1,14 +1,57 @@
 //! Font setup: prefer OS-native fonts for a native look (Segoe UI on Windows,
 //! SF Pro via SFNS on macOS, Noto/DejaVu on Linux), fall back to egui's
 //! bundled defaults. Glyphs rasterize at device pixels → sharp at any DPI.
+//!
+//! Startup architecture (implement.md §5.3): system font files (megabyte-scale
+//! on some systems) are read on a background thread; the first frame renders
+//! with egui's embedded defaults, and the system fonts are swapped in once
+//! loaded — one controlled relayout with a repaint request, no synchronous
+//! disk I/O before first paint.
 
 use eframe::egui::{self, FontData, FontDefinitions};
 use std::sync::Arc;
 
-pub fn install(ctx: egui::Context) {
-    let mut fonts = FontDefinitions::default();
+/// Kick off the background load and swap fonts in when ready.
+pub fn install_async(ctx: egui::Context) {
+    let ctx2 = ctx.clone();
+    let spawned = std::thread::Builder::new()
+        .name("tm-fonts".into())
+        .spawn(move || {
+            let defs = build_definitions();
+            // Hand the result back through the UI thread: egui types are not
+            // Send across in a useful way here, so signal + apply next frame.
+            *apply_result().lock().unwrap_or_else(|e| e.into_inner()) = Some(defs);
+            ctx2.request_repaint();
+        });
+    if spawned.is_err() {
+        // No worker available: fall back to synchronous install so the app
+        // still gets its native fonts (rare; startup cost acceptable then).
+        let defs = build_definitions();
+        ctx.set_fonts(defs);
+    }
+}
 
-    let mut inserted = 0usize;
+/// One-slot handoff from the loader thread to the UI pass.
+fn apply_result() -> &'static std::sync::Mutex<Option<FontDefinitions>> {
+    static SLOT: std::sync::OnceLock<std::sync::Mutex<Option<FontDefinitions>>> =
+        std::sync::OnceLock::new();
+    SLOT.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+/// Called once per frame from the UI: applies loaded fonts exactly once.
+pub fn poll_async_apply(ctx: &egui::Context) {
+    let ready = apply_result()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .take();
+    if let Some(defs) = ready {
+        tracing::info!("system fonts applied after first frame");
+        ctx.set_fonts(defs);
+    }
+}
+
+fn build_definitions() -> FontDefinitions {
+    let mut fonts = FontDefinitions::default();
 
     // --- proportional text -------------------------------------------------
     let candidates: &[(&str, Vec<String>)] = &[
@@ -44,7 +87,6 @@ pub fn install(ctx: egui::Context) {
                 .entry(egui::FontFamily::Proportional)
                 .or_default()
                 .insert(0, name.to_string());
-            inserted += 1;
             break;
         }
     }
@@ -109,13 +151,11 @@ pub fn install(ctx: egui::Context) {
                 .entry(egui::FontFamily::Monospace)
                 .or_default()
                 .insert(0, name.to_string());
-            inserted += 1;
             break;
         }
     }
 
-    tracing::info!(fonts_installed = inserted, "font setup complete");
-    ctx.set_fonts(fonts);
+    fonts
 }
 
 fn load_first(paths: &[String]) -> Option<FontData> {

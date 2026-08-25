@@ -1,26 +1,38 @@
 //! Root application state & layout: navigation rail, top search, per-tab
 //! command bars, dialogs, toasts.
+//!
+//! Startup/responsiveness architecture (implement.md §4/§7):
+//! * No collector construction here — the GUI gets actions cheaply and hands
+//!   a lazy factory to the engine, which starts **after the first frame**.
+//! * Engine publications and background-worker completions wake the UI via
+//!   `Context::request_repaint`; there is no interval-based polling loop.
+//! * App history loads asynchronously; settings/history writes run on single
+//!   dedicated writer threads so no disk hiccup can hitch a frame.
+//! * Platform control actions (kill/priority/service/session/...) run on one
+//!   shared action-executor thread.
 
+use crate::action_executor::ActionExecutor;
 use crate::app_ui::apply_theme;
 use crate::widgets::tablekit::{TmColumn, TmTable};
 use eframe::egui;
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use tm_core::demand::TelemetryDemand;
 use tm_core::engine::EngineHandle;
 use tm_core::i18n::{self, K};
 use tm_core::model::Snapshot;
-use tm_core::settings::Settings;
+use tm_core::settings::{Settings, SettingsWriter};
 use tm_platform::actions::PlatformActions;
-
-const HISTORY_CAP: usize = 240;
 
 /// One tick of history used to drive all Performance-tab charts.
 #[derive(Debug, Clone, Default)]
 pub struct HistoryPoint {
     pub t_ms: u64,
     pub cpu_total: f32,
+    pub cpu_kernel: f32,
     pub per_core: Vec<f32>,
+    pub per_core_kernel: Vec<f32>,
     pub mem_used_bytes: u64,
     pub mem_total_bytes: u64,
     pub commit_used_bytes: u64,
@@ -53,21 +65,35 @@ impl Tab {
         Tab::Services,
     ];
 
-    pub fn key(self) -> K {
+    /// Canonical key used by `--tab=`, the default-start-page setting and
+    /// persistence.
+    pub fn key(self) -> &'static str {
         match self {
-            Tab::Processes => K::TabProcesses,
-            Tab::Performance => K::TabPerformance,
-            Tab::AppHistory => K::TabAppHistory,
-            Tab::Startup => K::TabStartup,
-            Tab::Users => K::TabUsers,
-            Tab::Details => K::TabDetails,
-            Tab::Services => K::TabServices,
+            Tab::Processes => "processes",
+            Tab::Performance => "performance",
+            Tab::AppHistory => "apphistory",
+            Tab::Startup => "startup",
+            Tab::Users => "users",
+            Tab::Details => "details",
+            Tab::Services => "services",
         }
+    }
+
+    fn from_key(s: &str) -> Option<Self> {
+        Self::ALL.iter().copied().find(|t| t.key() == s)
     }
 
     /// Localized label for the active UI language.
     pub fn label(self) -> &'static str {
-        i18n::tr(self.key())
+        match self {
+            Tab::Processes => i18n::tr(K::TabProcesses),
+            Tab::Performance => i18n::tr(K::TabPerformance),
+            Tab::AppHistory => i18n::tr(K::TabAppHistory),
+            Tab::Startup => i18n::tr(K::TabStartup),
+            Tab::Users => i18n::tr(K::TabUsers),
+            Tab::Details => i18n::tr(K::TabDetails),
+            Tab::Services => i18n::tr(K::TabServices),
+        }
     }
 
     pub fn icon(self) -> crate::icons::Icon {
@@ -83,6 +109,47 @@ impl Tab {
         }
     }
 }
+
+/// Exact process identity for selection/navigation/destructive actions —
+/// never a bare PID (PID reuse, implement.md §11.5/§19.2).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProcessIdentity {
+    pub pid: u32,
+    pub start_epoch_s: Option<i64>,
+}
+
+// ---------------------------------------------------------------- toasts
+
+static TOAST_SEQ: AtomicU64 = AtomicU64::new(1);
+
+/// A toast with a stable monotonic id (the old identity derived from elapsed
+/// time changed across frames, breaking egui layout state).
+#[derive(Debug, Clone)]
+pub struct Toast {
+    pub id: u64,
+    pub msg: String,
+    pub born: std::time::Instant,
+}
+
+pub const TOAST_TTL: std::time::Duration = std::time::Duration::from_secs(4);
+const MAX_TOASTS: usize = 6;
+
+pub type ToastQueue = Mutex<Vec<Toast>>;
+
+/// Push a toast from any thread.
+pub fn toast_from(queue: &ToastQueue, msg: impl Into<String>) {
+    let mut t = tm_core::sync::lock(queue);
+    t.push(Toast {
+        id: TOAST_SEQ.fetch_add(1, Ordering::Relaxed),
+        msg: msg.into(),
+        born: std::time::Instant::now(),
+    });
+    if t.len() > MAX_TOASTS {
+        t.remove(0);
+    }
+}
+
+// ---------------------------------------------------------------- guards
 
 type CachedVec<T> = Arc<Mutex<Option<(Vec<T>, std::time::Instant)>>>;
 
@@ -112,14 +179,20 @@ impl InFlight {
 /// behind locks so worker threads can publish results without blocking frames.
 pub struct SharedState {
     pub settings: Settings,
+    /// Debounced disk writer for settings (single worker thread).
+    pub settings_writer: SettingsWriter,
     /// Cached service/startup/user lists refreshed lazily in the background.
     pub services_cache: Arc<Mutex<Option<crate::tabs::services::Cache>>>,
     pub startup_cache: CachedVec<tm_core::model::StartupItem>,
     pub sessions_cache: CachedVec<tm_core::model::UserSession>,
-    /// Shell icon textures keyed by executable path.
+    /// Shell icon textures keyed by executable path (lazy worker inside).
     pub icons: crate::icon_cache::IconCache,
-    /// Toast queue (message, born instant). Workers push, the UI drains.
-    pub toasts: Arc<Mutex<Vec<(String, std::time::Instant)>>>,
+    /// Toast queue. Workers push, the UI drains.
+    pub toasts: Arc<ToastQueue>,
+    /// Single executor for platform control actions (never the UI thread).
+    /// `None` only if the worker thread could not spawn; actions then run
+    /// inline (degraded but functional).
+    pub executor: Option<ActionExecutor>,
     // In-flight markers so slow platform queries run off the UI thread exactly once.
     pub services_fetch: InFlight,
     pub startup_fetch: InFlight,
@@ -128,12 +201,9 @@ pub struct SharedState {
 }
 
 impl SharedState {
+    /// Push a toast from UI code.
     pub fn toast(&self, msg: impl Into<String>) {
-        let mut t = tm_core::sync::lock(&self.toasts);
-        t.push((msg.into(), std::time::Instant::now()));
-        if t.len() > 6 {
-            t.remove(0);
-        }
+        crate::app::toast_from(&self.toasts, msg);
     }
 
     pub fn service_control_busy(&self) -> bool {
@@ -141,20 +211,26 @@ impl SharedState {
     }
 }
 
-/// Push a toast from any thread.
-pub fn toast_from(toasts: &Mutex<Vec<(String, std::time::Instant)>>, msg: String) {
-    let mut t = tm_core::sync::lock(toasts);
-    t.push((msg, std::time::Instant::now()));
-    if t.len() > 6 {
-        t.remove(0);
+impl Drop for SharedState {
+    fn drop(&mut self) {
+        // Final bounded flush so the last changes survive shutdown without
+        // blocking arbitrarily long (implement.md §17.1).
+        self.settings_writer.flush();
     }
 }
 
+/// Cross-tab navigation target: select exactly this process in Details.
+#[derive(Debug, Clone)]
+pub struct PendingDetailsFocus(pub ProcessIdentity);
+
 pub struct TaskManApp {
     pub engine: EngineHandle,
+
     pub actions: Arc<dyn PlatformActions>,
     pub shared: SharedState,
     pub history: VecDeque<HistoryPoint>,
+    /// Cap derived from the configured graph window at the fastest interval.
+    pub history_cap: usize,
     pub app_history_db: tm_core::AppHistoryDb,
     pub tab: Tab,
     pub show_settings: bool,
@@ -164,8 +240,8 @@ pub struct TaskManApp {
     pub ticks_seen: u64,
     pub affinity_dialog: Option<(u32, u64)>, // pid, current mask
     pub startup_props: Option<tm_core::model::StartupItem>,
-    pub selected_startup_idx: Option<usize>,
-    pub last_save: std::time::Instant,
+    /// Selection by stable item id (list indexes shift on refresh).
+    pub selected_startup_id: Option<String>,
     /// Process-properties dialog target pid.
     pub proc_props: Option<u32>,
     /// Cross-tab jump: services tab should select this service name.
@@ -176,13 +252,23 @@ pub struct TaskManApp {
 
     // Tab states.
     pub processes_state: crate::tabs::processes::State,
-    pub perf_selected: usize,
+    pub perf_selected_key: String,
     pub details_state: crate::tabs::details::State,
     pub selected_pid: Option<u32>,
     pub selected_user: Option<u32>,
     pub efficiency_pids: std::collections::HashSet<u32>,
     // Services tab.
     pub services_selected_name: Option<String>,
+
+    /// Pending cross-tab navigation ("Go to details" with exact identity).
+    pub pending_details_focus: Option<PendingDetailsFocus>,
+    /// Pid to scroll into view on the details tab (consumed when reached).
+    pub scroll_to_pid: Option<u32>,
+
+    /// Engine starts after the first presented frame (lazy start).
+    engine_started: bool,
+    /// Last demand bitmask shipped to the engine (send only on change).
+    last_demand_bits: u64,
 
     /// Frame-rate diagnostics (TASKMAN_FPS_PROBE=1): forces continuous
     /// repaints, measures achieved fps against the display's refresh rate.
@@ -194,37 +280,13 @@ pub struct TaskManApp {
     pub display_hz: Option<f32>,
 }
 
-fn dirs_data() -> std::path::PathBuf {
-    #[cfg(target_os = "windows")]
-    {
-        std::env::var("LOCALAPPDATA")
-            .map_or_else(|_| std::path::PathBuf::from("."), std::path::PathBuf::from)
-    }
-    #[cfg(not(target_os = "windows"))]
-    {
-        std::env::var("XDG_DATA_HOME")
-            .map(std::path::PathBuf::from)
-            .or_else(|| {
-                std::env::var("HOME")
-                    .ok()
-                    .map(|h| std::path::PathBuf::from(h).join(".local/share"))
-            })
-            .unwrap_or_else(|_| std::path::PathBuf::from("."))
-    }
-}
-
 impl TaskManApp {
     pub fn new(
         cc: &eframe::CreationContext<'_>,
-        engine: EngineHandle,
         mock: bool,
         settings: Settings,
+        initial_tab: Option<String>,
     ) -> Self {
-        // Mock mode still wants a real action surface for testing menus;
-        // platform actions are harmless against a mock snapshot.
-        let (_c, actions) = tm_platform::create_stack();
-        let _ = mock;
-        let actions: Arc<dyn PlatformActions> = Arc::from(actions);
         apply_theme(&cc.egui_ctx, settings.theme);
         if settings.ui_zoom != 1.0 {
             cc.egui_ctx.set_zoom_factor(settings.ui_zoom);
@@ -236,14 +298,36 @@ impl TaskManApp {
                 ));
         }
 
-        let mut icons = crate::icon_cache::IconCache::default();
-        icons.start_worker(actions.clone());
-
         // Active UI language: resolved from the persisted choice against the
         // OS-detected locale.
         i18n::set_lang(settings.language.resolve());
 
-        let history_path = dirs_data().join("app-history.json");
+        let ctx = cc.egui_ctx.clone();
+
+        // ---- engine: parked until the first frame completes ----------------
+        // The notifier makes sampling event-driven: every publication wakes
+        // the UI exactly once instead of the old double-poll per interval.
+        let interval = settings.update_speed.interval();
+        let notifier: tm_core::engine::NotifyFn = {
+            let ctx = ctx.clone();
+            Arc::new(move || ctx.request_repaint())
+        };
+        let factory: tm_core::engine::CollectorFactory = if mock {
+            Box::new(|| Box::new(tm_core::mock::MockCollector::new()))
+        } else {
+            Box::new(tm_platform::create_collector)
+        };
+        let (engine, _join) = tm_core::engine::spawn_lazy(factory, interval, Some(notifier))
+            .expect("failed to spawn sampling engine");
+        if settings.update_speed == tm_core::settings::UpdateSpeed::Paused {
+            engine.pause();
+        }
+        crate::StartupTrace::mark("engine_spawned_lazy");
+
+        // ---- cheap platform surface only -----------------------------------
+        // Never construct a collector just to get actions (§4.3).
+        let actions: Arc<dyn PlatformActions> = Arc::from(tm_platform::create_actions());
+
         // Frame-rate diagnostics: TASKMAN_FPS_PROBE=1 forces a continuous
         // frame stream and overlays/logs the achieved rate vs display Hz.
         let fps_probe = std::env::var("TASKMAN_FPS_PROBE")
@@ -265,36 +349,59 @@ impl TaskManApp {
                 ));
         }
         // Diagnostics: open a dialog right away (TASKMAN_DIALOG=settings|run)
-        // or select a Performance resource (TASKMAN_PERF=<index>) so UI tests
-        // can capture them without input automation.
+        // or select a Performance resource by key (TASKMAN_PERF=<key>) so UI
+        // tests can capture them without input automation.
         let open_dialog = std::env::var("TASKMAN_DIALOG").unwrap_or_default();
         let (show_settings, run_dialog_open) = match open_dialog.as_str() {
             "settings" => (true, false),
             "run" => (false, true),
             _ => (false, false),
         };
-        let perf_selected = std::env::var("TASKMAN_PERF")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or(0);
+        let perf_selected_key = std::env::var("TASKMAN_PERF").unwrap_or_else(|_| "cpu".into());
+
+        // History capacity sized for the largest configured window at the
+        // fastest interval (implement.md §14.3).
+        let min_interval_s = tm_core::settings::UpdateSpeed::High
+            .interval()
+            .as_secs_f64();
+        let history_cap =
+            ((settings.graph_seconds as f64 / min_interval_s).ceil() as usize).clamp(120, 1440);
+
+        // App history loads on a worker; observations wait for it (ms-scale).
+        let history_path = tm_core::settings::taskman_data_dir().join("app-history.json");
+        let app_history_db = tm_core::AppHistoryDb::open_deferred(history_path);
+
+        // Start page: CLI/diagnostic override wins, otherwise the setting.
+        let tab = initial_tab
+            .as_deref()
+            .and_then(tab_from_cli)
+            .or_else(|| Tab::from_key(&settings.default_start_page))
+            .unwrap_or(Tab::Processes);
+
+        let toasts: Arc<ToastQueue> = Arc::new(Mutex::new(Vec::new()));
+        let executor = ActionExecutor::start();
+
         Self {
             engine,
             actions,
             shared: SharedState {
+                settings_writer: SettingsWriter::start(),
                 settings,
                 services_cache: Arc::new(Mutex::new(None)),
                 startup_cache: Arc::new(Mutex::new(None)),
                 sessions_cache: Arc::new(Mutex::new(None)),
-                icons,
-                toasts: Arc::new(Mutex::new(Vec::new())),
+                icons: crate::icon_cache::IconCache::default(),
+                toasts,
+                executor,
                 services_fetch: InFlight::default(),
                 startup_fetch: InFlight::default(),
                 sessions_fetch: InFlight::default(),
                 service_control: InFlight::default(),
             },
-            history: VecDeque::with_capacity(HISTORY_CAP),
-            app_history_db: tm_core::AppHistoryDb::open(history_path),
-            tab: Tab::Processes,
+            history: VecDeque::with_capacity(history_cap + 8),
+            history_cap,
+            app_history_db,
+            tab,
             show_settings,
             run_dialog_open,
             run_dialog_text: String::new(),
@@ -302,18 +409,21 @@ impl TaskManApp {
             ticks_seen: 0,
             affinity_dialog: None,
             startup_props: None,
-            selected_startup_idx: None,
-            last_save: std::time::Instant::now(),
+            selected_startup_id: None,
             proc_props: None,
             svc_jump: Arc::new(Mutex::new(None)),
             search: String::new(),
             processes_state: crate::tabs::processes::State::new(),
-            perf_selected,
+            perf_selected_key,
             details_state: Default::default(),
             selected_pid: None,
             selected_user: None,
             efficiency_pids: std::collections::HashSet::new(),
             services_selected_name: None,
+            pending_details_focus: None,
+            scroll_to_pid: None,
+            engine_started: false,
+            last_demand_bits: 0,
             fps_probe,
             last_frame: None,
             fps_window_start: std::time::Instant::now(),
@@ -323,16 +433,17 @@ impl TaskManApp {
         }
     }
 
-    /// Pull the newest snapshot into local history buffers.
+    /// Pull the newest snapshot into local history buffers (called once per
+    /// actual repaint — the engine notifier guarantees freshness).
     fn poll_engine(&mut self) -> Option<Arc<Snapshot>> {
         let latest = self.engine.latest()?;
-        if latest.timestamp_ms != self.history.back().map_or(0, |h| h.t_ms)
-            && self.ticks_seen != u64::MAX
-        {
+        if latest.timestamp_ms != self.history.back().map_or(0, |h| h.t_ms) {
             let pt = HistoryPoint {
                 t_ms: latest.timestamp_ms,
                 cpu_total: latest.cpu.utilization_pct,
+                cpu_kernel: latest.cpu.kernel_pct,
                 per_core: latest.cpu.per_core_pct.clone(),
+                per_core_kernel: latest.cpu.per_core_kernel_pct.clone(),
                 mem_used_bytes: latest.memory.used_bytes,
                 mem_total_bytes: latest.memory.total_bytes,
                 commit_used_bytes: latest.memory.commit_used_bytes,
@@ -353,7 +464,7 @@ impl TaskManApp {
                     .map(|g| (g.id, g.util_pct, g.mem_used_bytes))
                     .collect(),
             };
-            if self.history.len() == HISTORY_CAP {
+            if self.history.len() >= self.history_cap {
                 self.history.pop_front();
             }
             self.history.push_back(pt);
@@ -369,55 +480,133 @@ impl TaskManApp {
         }
     }
 
-    fn maybe_save_app_history(&mut self) {
-        if self.last_save.elapsed() > std::time::Duration::from_secs(30) {
-            // Serialize + file I/O happen on a worker thread; the UI keeps
-            // running from the in-memory copy meanwhile.
-            self.app_history_db.save_async();
-            self.last_save = std::time::Instant::now();
+    /// Derive telemetry demand from the visible surface and ship it when it
+    /// changes (implement.md §6.3). Cheap: one atomic command on change.
+    fn update_demand(&mut self) {
+        let mut d = TelemetryDemand::core(); // core + adapter rates + tokens
+        match self.tab {
+            Tab::Performance => {
+                d = d
+                    .union(TelemetryDemand::DISK_RATE)
+                    .union(TelemetryDemand::GPU_ADAPTER);
+            }
+            Tab::Details if self.details_state.has_gpu_column_visible() => {
+                d = d
+                    .union(TelemetryDemand::PROCESS_GPU)
+                    .union(TelemetryDemand::PROCESS_GPU_MEMORY)
+                    .union(TelemetryDemand::GPU_ADAPTER);
+            }
+            _ => {}
+        }
+        if d.bits() != self.last_demand_bits {
+            self.last_demand_bits = d.bits();
+            self.engine.set_demand(d);
+        }
+    }
+
+    /// Invalidate every tab-local cache and force one fresh sample (F5 /
+    /// "Refresh now" must do real work in running AND paused mode).
+    pub fn refresh_all(&mut self) {
+        self.engine.request_refresh();
+        *tm_core::sync::lock(&self.shared.services_cache) = None;
+        *tm_core::sync::lock(&self.shared.startup_cache) = None;
+        *tm_core::sync::lock(&self.shared.sessions_cache) = None;
+        // Display caches rebuild on the next snapshot/tick generation.
+        self.processes_state.invalidate();
+        self.details_state.invalidate();
+    }
+
+    /// Queue a debounced autosave honoring the master switch.
+    pub fn save_settings(&mut self) {
+        if self.shared.settings.save_config {
+            let snap = self.shared.settings.clone();
+            self.shared.settings_writer.enqueue(&snap);
+        }
+    }
+
+    /// Queue a save that ignores the autosave gate (reset, explicit close,
+    /// toggling autosave itself).
+    pub fn save_settings_forced(&mut self) {
+        let snap = self.shared.settings.clone();
+        self.shared.settings_writer.force(&snap);
+    }
+
+    /// Run a platform action on the executor with a localized result toast;
+    /// completion wakes the UI. Falls back to running inline when no
+    /// executor exists.
+    pub fn run_action(
+        &mut self,
+        ctx: &egui::Context,
+        success_msg: impl FnOnce() -> String + Send + 'static,
+        job: impl FnOnce() -> Result<(), tm_core::TmError> + Send + 'static,
+    ) {
+        let toasts = self.shared.toasts.clone();
+        let wake = {
+            let ctx = ctx.clone();
+            move || ctx.request_repaint()
+        };
+        match &self.shared.executor {
+            Some(executor) => executor.run(toasts, wake, success_msg, job),
+            None => {
+                let res = job();
+                let msg = match res {
+                    Ok(()) => success_msg(),
+                    Err(e) => i18n::trf(K::ErrMsg, &[&e.to_string()]),
+                };
+                crate::app::toast_from(&toasts, msg);
+            }
         }
     }
 }
 
-impl TaskManApp {
-    pub fn set_initial_tab(&mut self, name: &str) {
-        self.tab = match name.to_ascii_lowercase().as_str() {
-            "processes" | "prozesse" => Tab::Processes,
-            "performance" | "leistung" => Tab::Performance,
-            "apphistory" | "history" | "appverlauf" => Tab::AppHistory,
-            "startup" | "autostart" => Tab::Startup,
-            "users" | "benutzer" => Tab::Users,
-            "details" => Tab::Details,
-            "services" | "dienste" => Tab::Services,
-            _ => self.tab,
-        };
-        tracing::info!(tab = ?self.tab, "initial tab applied");
+/// Parse a `--tab=` value (accepts both English and German aliases).
+fn tab_from_cli(name: &str) -> Option<Tab> {
+    match name.to_ascii_lowercase().as_str() {
+        "processes" | "prozesse" => Some(Tab::Processes),
+        "performance" | "leistung" => Some(Tab::Performance),
+        "apphistory" | "history" | "appverlauf" => Some(Tab::AppHistory),
+        "startup" | "autostart" => Some(Tab::Startup),
+        "users" | "benutzer" => Some(Tab::Users),
+        "details" => Some(Tab::Details),
+        "services" | "dienste" => Some(Tab::Services),
+        _ => None,
     }
 }
 
 impl eframe::App for TaskManApp {
     /// Data pass: runs before each `ui`, and while the window is hidden.
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Adopt asynchronously loaded app history as soon as it arrives.
+        self.app_history_db.poll_load();
+
+        // Single poll per repaint — publications wake us via the notifier,
+        // so no periodic request_repaint_after is needed anymore.
         if self.poll_engine().is_some() {
-            self.maybe_save_app_history();
+            self.app_history_db.save_async();
         }
-        // Wake up for the next sample.
-        let mut wake_in = self
-            .engine
-            .interval()
-            .div_f64(2.0)
-            .max(std::time::Duration::from_millis(50));
-        // Frame-rate diagnostics: stream frames continuously so the achieved
-        // rate can be compared against the display's refresh rate.
+
+        // Ship telemetry-demand changes (tab switches etc.).
+        self.update_demand();
+
+        // Only animations need timed repaints; everything else is woken by
+        // events (engine publication, worker completion, input).
         if self.fps_probe {
-            wake_in = wake_in.min(std::time::Duration::from_millis(1));
+            ctx.request_repaint_after(std::time::Duration::from_millis(1));
+        } else {
+            let next_expiry = tm_core::sync::lock(&self.shared.toasts)
+                .iter()
+                .map(|t| TOAST_TTL.saturating_sub(t.born.elapsed()))
+                .min();
+            if let Some(wait) = next_expiry {
+                ctx.request_repaint_after(wait.min(std::time::Duration::from_millis(33)));
+            }
         }
-        ctx.request_repaint_after(wake_in);
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         crate::theme::ensure_visuals(&ctx);
+        crate::fonts::poll_async_apply(&ctx);
         self.poll_engine();
 
         let pal = crate::theme::palette_ctx(&ctx);
@@ -462,24 +651,39 @@ impl eframe::App for TaskManApp {
             self.update_fps_probe(&ctx);
         }
 
-        // Global shortcuts.
+        // Global shortcuts: F5 refreshes data AND tab-local caches even when
+        // sampling is paused (the engine forces exactly one sample).
         if ctx.input(|i| i.key_pressed(egui::Key::F5)) {
-            self.engine.request_refresh();
+            self.refresh_all();
         }
 
-        // Track window size for persistence.
-        let size = ctx.input(|i| i.viewport().inner_rect.map(|r| r.size()));
-        if let Some(sz) = size {
-            self.shared.settings.window_size = [sz.x, sz.y];
+        // Track window size for persistence (only while remembering).
+        if self.shared.settings.remember_window {
+            let size = ctx.input(|i| i.viewport().inner_rect.map(|r| r.size()));
+            if let Some(sz) = size {
+                self.shared.settings.window_size = [sz.x, sz.y];
+            }
+        }
+
+        // First frame fully submitted → NOW start sampling. Everything below
+        // this line in the process lifetime happens after the shell painted.
+        if !self.engine_started {
+            self.engine_started = true;
+            self.engine.start();
+            tracing::info!("engine started after first frame");
         }
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
-        self.shared.settings.save();
-        // Final synchronous flush so nothing is lost at shutdown.
+        // Persist final settings (honors the autosave gate; the gate choice
+        // itself was already force-persisted when toggled).
+        self.save_settings();
+        self.shared.settings_writer.flush();
+        // Final synchronous flush so history is not lost at shutdown.
         self.app_history_db.save();
     }
 }
+
 impl TaskManApp {
     pub fn latest_snapshot(&self) -> Option<Arc<Snapshot>> {
         self.engine.latest()
@@ -488,6 +692,77 @@ impl TaskManApp {
     /// The active UI language.
     pub fn lang(&self) -> i18n::Lang {
         i18n::lang()
+    }
+
+    /// Translate a key into the active UI language.
+    #[allow(dead_code)]
+    pub fn tr(&self, key: K) -> &'static str {
+        i18n::tr_in(self.lang(), key)
+    }
+
+    /// Build a table with this tab's persisted column widths restored.
+    pub fn make_table(&self, id: &'static str, cols: Vec<TmColumn>, name_min: f32) -> TmTable {
+        let saved = self.shared.settings.col_widths.get(id);
+        TmTable::new(id, cols, saved, name_min)
+    }
+
+    /// Persist resized column widths through the debounced settings writer.
+    ///
+    /// Every logical width change marks the snapshot dirty; coalescing in
+    /// the writer (~250 ms) replaces the old mouse-up save, which depended
+    /// on fragile previous-frame gesture state.
+    pub fn persist_table(&mut self, table: &TmTable) {
+        if table.changed_this_frame() {
+            self.shared
+                .settings
+                .col_widths
+                .insert(table.id.to_string(), table.stored_widths());
+            self.save_settings();
+        }
+    }
+
+    /// Jump to the services tab and highlight the service hosted by `pid`.
+    pub fn goto_services_for_pid(&mut self, pid: u32, ctx: &egui::Context) {
+        self.tab = crate::app::Tab::Services;
+        let actions = self.actions.clone();
+        let jump = self.svc_jump.clone();
+        let toasts = self.shared.toasts.clone();
+        let wake = {
+            let ctx = ctx.clone();
+            move || ctx.request_repaint()
+        };
+        let job = move || match actions.list_services() {
+            Ok(list) => {
+                if let Some(svc) = list.iter().find(|s| s.pid == Some(pid)) {
+                    *tm_core::sync::lock(&jump) = Some(svc.name.clone());
+                } else {
+                    crate::app::toast_from(
+                        &toasts,
+                        tm_core::i18n::trf(tm_core::i18n::K::NoServiceForPid, &[&pid.to_string()]),
+                    );
+                }
+            }
+            Err(e) => crate::app::toast_from(
+                &toasts,
+                tm_core::i18n::trf(tm_core::i18n::K::ErrMsg, &[&e.to_string()]),
+            ),
+        };
+        match &self.shared.executor {
+            Some(executor) => executor.run_quiet(wake, job),
+            None => job(),
+        }
+    }
+
+    /// End the selected process (toolbar "Task beenden") — on the executor.
+    pub fn end_selected(&mut self, ctx: &egui::Context) {
+        if let Some(pid) = self.selected_pid.take() {
+            let actions = self.actions.clone();
+            self.run_action(
+                ctx,
+                move || i18n::trf(K::ProcessEndedToast, &[&pid.to_string()]),
+                move || actions.kill_process(pid, false),
+            );
+        }
     }
 
     /// Frame-rate diagnostics (TASKMAN_FPS_PROBE=1): measures the interval
@@ -547,90 +822,5 @@ impl TaskManApp {
                     ui.monospace(line);
                 });
             });
-    }
-
-    /// Translate a key into the active UI language.
-    #[allow(dead_code)]
-    pub fn tr(&self, key: K) -> &'static str {
-        i18n::tr_in(self.lang(), key)
-    }
-
-    /// Build a table with this tab's persisted column widths restored.
-    pub fn make_table(&self, id: &'static str, cols: Vec<TmColumn>, name_min: f32) -> TmTable {
-        let saved = self
-            .shared
-            .settings
-            .col_widths
-            .get(id)
-            .map(|v| v.as_slice());
-        TmTable::new(id, cols, saved, name_min)
-    }
-
-    /// Persist resized column widths.
-    ///
-    /// The table object is rebuilt every frame from the stored widths, so the
-    /// in-memory settings map must be updated on EVERY frame with changes —
-    /// otherwise the drag delta would be discarded on the next rebuild and
-    /// the column would never move. The (atomic) disk write happens only
-    /// when the drag gesture finishes.
-    pub fn persist_table(&mut self, table: &TmTable) {
-        if table.changed_this_frame() {
-            self.shared
-                .settings
-                .col_widths
-                .insert(table.id.to_string(), table.stored_widths());
-            // Single-shot changes (double-click reset) finish immediately.
-            if !table.dragging() {
-                self.shared.settings.save();
-            }
-        }
-        if table.drag_just_ended() {
-            self.shared.settings.save();
-        }
-    }
-
-    /// Jump to the services tab and highlight the service hosted by `pid`
-    /// once the SCM query completes (worker fills [`Self::svc_jump`]).
-    pub fn goto_services_for_pid(&mut self, pid: u32) {
-        self.tab = crate::app::Tab::Services;
-        let actions = self.actions.clone();
-        let jump = self.svc_jump.clone();
-        let toasts = self.shared.toasts.clone();
-        let _ = std::thread::Builder::new()
-            .name("tm-svc-jump".into())
-            .spawn(move || match actions.list_services() {
-                Ok(list) => {
-                    if let Some(svc) = list.iter().find(|s| s.pid == Some(pid)) {
-                        *tm_core::sync::lock(&jump) = Some(svc.name.clone());
-                    } else {
-                        crate::app::toast_from(
-                            &toasts,
-                            tm_core::i18n::trf(
-                                tm_core::i18n::K::NoServiceForPid,
-                                &[&pid.to_string()],
-                            ),
-                        );
-                    }
-                }
-                Err(e) => crate::app::toast_from(
-                    &toasts,
-                    tm_core::i18n::trf(tm_core::i18n::K::ErrMsg, &[&e.to_string()]),
-                ),
-            });
-    }
-
-    /// End the selected process (toolbar "Task beenden").
-    pub fn end_selected(&mut self) {
-        if let Some(pid) = self.selected_pid.take() {
-            match self.actions.kill_process(pid, false) {
-                Ok(()) => self.shared.toast(tm_core::i18n::trf(
-                    K::ProcessEndedToast,
-                    &[&pid.to_string()],
-                )),
-                Err(e) => self
-                    .shared
-                    .toast(tm_core::i18n::trf(K::ErrMsg, &[&e.to_string()])),
-            }
-        }
     }
 }

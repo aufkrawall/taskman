@@ -98,8 +98,8 @@ pub fn sidebar(app: &mut TaskManApp, ui_root: &mut egui::Ui, pal: &Palette) {
                 }),
         )
         .show(ui_root, |ui| {
-            // Hamburger toggle.
-            if icon_button(ui, pal, Icon::Hamburger, 32.0) {
+            // Hamburger toggle; centered in the rail when collapsed.
+            if icon_button(ui, pal, Icon::Hamburger, 32.0, collapsed) {
                 app.shared.settings.sidebar_collapsed = !collapsed;
                 app.shared.settings.save();
             }
@@ -181,18 +181,30 @@ fn nav_item(
             Pos2::new(rect.left() + 42.0, rect.center().y),
             Align2::LEFT_CENTER,
             label,
-            FontId::proportional(13.0),
+            FontId::proportional(12.5),
             pal.text,
         );
     }
     resp
 }
 
-fn icon_button(ui: &mut egui::Ui, pal: &Palette, icon: Icon, size: f32) -> bool {
-    let (rect, resp) = ui.allocate_exact_size(egui::vec2(size, size), Sense::click());
+/// Square icon-only button. `center` centers it in the available width
+/// (collapsed rail) instead of left-aligning a fixed-size square.
+fn icon_button(ui: &mut egui::Ui, pal: &Palette, icon: Icon, size: f32, center: bool) -> bool {
+    let w = if center {
+        ui.available_width().max(size)
+    } else {
+        size
+    };
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(w, size), Sense::click());
     if resp.hovered() {
+        let hover = if center {
+            Rect::from_center_size(rect.center(), egui::vec2(size, size))
+        } else {
+            rect
+        };
         ui.painter()
-            .rect_filled(rect, 4.0, Color32::from_white_alpha(12));
+            .rect_filled(hover, 4.0, Color32::from_white_alpha(12));
     }
     crate::icons::draw_at(
         ui,
@@ -240,7 +252,15 @@ pub fn cmd_button(
     label: &str,
     enabled: bool,
 ) -> bool {
-    let w = 28.0 + label.chars().count() as f32 * 7.1 + 6.0;
+    // Measure the label instead of guessing per-char widths — the old
+    // chars·7.1 heuristic under/overshot per locale, leaving either dead
+    // padding or text overflowing the hover rect.
+    let text_w = ui
+        .painter()
+        .layout_no_wrap(label.to_owned(), FontId::proportional(12.5), Color32::WHITE)
+        .size()
+        .x;
+    let w = 28.0 + text_w + 6.0;
     let (rect, resp) = ui.allocate_exact_size(egui::vec2(w, 30.0), Sense::click());
     let mut clicked = false;
     if enabled {
@@ -403,6 +423,9 @@ pub fn settings_dialog(app: &mut TaskManApp, ctx: &egui::Context, _pal: &theme::
 
             // Autosave master switch (default on). Toggling it ON writes the
             // flag itself immediately so the choice survives a crash.
+            // Autosave master switch (default on). Toggling it OFF writes the
+            // flag itself immediately (forced) so the choice survives restart
+            // even though ordinary autosaving stops.
             let mut autosave = app.shared.settings.save_config;
             if crate::widgets::controls::checkbox(
                 ui,
@@ -413,9 +436,7 @@ pub fn settings_dialog(app: &mut TaskManApp, ctx: &egui::Context, _pal: &theme::
             .changed()
             {
                 app.shared.settings.save_config = autosave;
-                if autosave {
-                    app.shared.settings.save();
-                }
+                app.save_settings_forced();
             }
 
             ui.add_space(10.0);
@@ -471,16 +492,17 @@ pub fn settings_dialog(app: &mut TaskManApp, ctx: &egui::Context, _pal: &theme::
                         i18n::tr(K::WindowTitle).to_string(),
                     ));
                     // Resetting preferences must not flip the user's
-                    // autosave choice.
+                    // autosave choice; an explicit Reset persists regardless
+                    // of the gate (implement.md §17.2).
                     let keep_autosave = app.shared.settings.save_config;
                     app.shared.settings = defaults;
                     app.shared.settings.save_config = keep_autosave;
-                    app.shared.settings.save();
+                    app.save_settings_forced();
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui.button(i18n::tr(K::Close)).clicked() {
                         app.show_settings = false;
-                        app.shared.settings.save();
+                        app.save_settings_forced();
                     }
                 });
             });
@@ -539,16 +561,15 @@ pub fn run_task_dialog(app: &mut TaskManApp, ctx: &egui::Context, _pal: &theme::
                         std::thread::Builder::new()
                             .name("tm-run".into())
                             .spawn(move || {
-                                let result = actions.run_new_task(&cmdline, elevated);
-                                let mut t = toasts.lock().unwrap_or_else(|e| e.into_inner());
+                                // Worker thread: the brief wait that surfaces
+                                // immediate launch failures lives here, not on
+                                // the UI path (§18.1).
+                                let result = actions.run_new_task_probe(&cmdline, elevated);
                                 let msg = match result {
                                     Ok(()) => i18n::trf(K::StartedMsg, &[&cmdline]),
                                     Err(e) => i18n::trf(K::ErrMsg, &[&e.to_string()]),
                                 };
-                                t.push((msg, std::time::Instant::now()));
-                                if t.len() > 6 {
-                                    t.remove(0);
-                                }
+                                crate::app::toast_from(&toasts, msg);
                             });
                     if spawned.is_err() {
                         app.shared.toast(i18n::tr(K::LaunchFailed));
@@ -564,12 +585,14 @@ pub fn run_task_dialog(app: &mut TaskManApp, ctx: &egui::Context, _pal: &theme::
 
 pub fn draw_toasts(app: &TaskManApp, ctx: &egui::Context) {
     let mut toasts = tm_core::sync::lock(&app.shared.toasts);
-    toasts.retain(|(_, born)| born.elapsed() < std::time::Duration::from_secs(4));
+    toasts.retain(|t| t.born.elapsed() < crate::app::TOAST_TTL);
+    // Stable ids keep egui layout state across frames; the fade animation is
+    // the only reason for timed repaints here.
     let mut y_offset = 0.0f32;
-    for (msg, born) in toasts.iter() {
-        let age = born.elapsed().as_secs_f32();
-        let alpha = ((4.0 - age) * 255.0).clamp(90.0, 255.0) as u8;
-        let id = egui::Id::new(format!("toast-{}", born.elapsed().as_nanos()));
+    for toast in toasts.iter() {
+        let age = toast.born.elapsed().as_secs_f32();
+        let alpha = (((4.0f32 - age) * 255.0).clamp(90.0, 255.0)) as u8;
+        let id = egui::Id::new(("toast", toast.id));
         egui::Area::new(id)
             .anchor(Align2::RIGHT_BOTTOM, [-12.0, -12.0 - y_offset])
             .order(egui::Order::Foreground)
@@ -581,7 +604,7 @@ pub fn draw_toasts(app: &TaskManApp, ctx: &egui::Context) {
                     .show(ui, |ui| {
                         ui.set_max_width(380.0);
                         ui.label(
-                            egui::RichText::new(msg)
+                            egui::RichText::new(&toast.msg)
                                 .size(12.5)
                                 .color(Color32::from_white_alpha(alpha)),
                         );

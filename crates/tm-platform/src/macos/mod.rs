@@ -357,16 +357,17 @@ fn send_signal(pid: u32, sig: i32) -> Result<()> {
     }
 }
 
-pub fn create() -> (MacCollector, MacActions) {
-    (
-        MacCollector {
-            sys: System::new_all(),
-            disks: Disks::new_with_refreshed_list(),
-            networks: Networks::new_with_refreshed_list(),
-            prev_net_totals: HashMap::new(),
-            last_tick: None,
-            first_tick_done: false,
-        },
-        MacActions,
-    )
+pub fn create_collector() -> MacCollector {
+    MacCollector {
+        sys: System::new_all(),
+        disks: Disks::new_with_refreshed_list(),
+        networks: Networks::new_with_refreshed_list(),
+        prev_net_totals: HashMap::new(),
+        last_tick: None,
+        first_tick_done: false,
+    }
+}
+
+pub fn create_actions() -> MacActions {
+    MacActions
 }

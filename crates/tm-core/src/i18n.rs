@@ -178,6 +178,11 @@ keys! {
     ColGroup => ["Gruppe", "Group"],
     GroupApps => ["Apps", "Apps"],
     GroupBackground => ["Hintergrundprozesse", "Background processes"],
+    GroupWindows => ["Windows-Prozesse", "Windows processes"],
+    ColGpu => ["GPU", "GPU"],
+    UacUnknown => ["Unbekannt", "Unknown"],
+    SelectColumns => ["Spalten auswählen…", "Select columns…"],
+    ColumnRequired => ["Erforderlich", "Required"],
 
     // ------------------------------------------------ statuses
     StRunning => ["Wird ausgeführt", "Running"],
@@ -236,6 +241,11 @@ keys! {
     SpdLow => ["Niedrig (4 s)", "Low (4 s)"],
     SpdPaused => ["Angehalten", "Paused"],
     GraphWindowLabel => ["Diagrammfenster:", "Graph window:"],
+    DefaultStartPageLabel => ["Startseite:", "Default start page:"],
+    CpuGraphOverall => ["Gesamtauslastung", "Overall utilization"],
+    CpuGraphLogical => ["Logische Prozessoren", "Logical processors"],
+    ShowKernelTimes => ["Kernelzeiten anzeigen", "Show kernel times"],
+    MinShort => ["Min.", "min"],
     ScaleLabel => ["Skalierung:", "Scale:"],
     LanguageLabel => ["Sprache:", "Language:"],
     AlwaysOnTop => ["Immer im Vordergrund", "Always on top"],

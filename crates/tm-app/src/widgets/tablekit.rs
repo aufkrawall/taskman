@@ -1,6 +1,17 @@
 //! Task-Manager-style table building blocks: bordered two-line headers with
 //! aggregate values, full-row selection, blue heat-mapped value cells,
 //! chevrons, sort carets — and user-resizable column widths.
+//!
+//! Correctness notes (implement.md §8/§9):
+//! * Column resizing stores the **drag-start width** in egui's persistent
+//!   temp memory keyed by `(table, column)`; during a drag the new width is
+//!   `start_width + cumulative delta`. Adding the cumulative delta to an
+//!   already-updated width (the old bug) compounded every frame.
+//! * Column geometry (`col_rect`) is precomputed once per frame into a
+//!   layout vector, so cell lookup is O(1) instead of O(columns).
+//! * [`scrolled_rows`] renders only the visible row window (fixed height),
+//!   so tables scale to tens of thousands of rows.
+//! * Widths persist by stable column id, not positional index.
 
 use eframe::egui::{self, Align2, Color32, CursorIcon, FontId, Pos2, Rect, Sense, Stroke};
 use tm_core::format;
@@ -8,7 +19,7 @@ use tm_core::format;
 use crate::icons;
 use crate::theme::Palette;
 
-/// Row height used by all TM tables.
+/// Row height used by all TM tables (also the virtualization unit).
 pub const ROW_H: f32 = 33.0;
 /// Header height for tables with aggregates (two-line).
 pub const HEADER_H: f32 = 56.0;
@@ -37,6 +48,7 @@ pub fn table_avail(ui: &egui::Ui) -> f32 {
 /// `rows` receives `(ui, avail, content_width)`; use `content_width` for
 /// full-width decorations (group headers) so they cover the scrolled span.
 /// Returns the clicked header column (for sorting).
+#[allow(dead_code)] // kept as the escape hatch for non-uniform row content
 #[allow(clippy::too_many_arguments)]
 pub fn scrolled_table(
     id: &'static str,
@@ -79,10 +91,56 @@ pub fn scrolled_table(
     hdr.inner
 }
 
+/// Virtualized variant of [`scrolled_table`] for uniform fixed-height rows.
+///
+/// Only the visible row range (+ egui's internal overscan) is painted, so
+/// widget count scales with the viewport instead of the dataset. `rows`
+/// receives the visible `Range<usize>` and must paint exactly those rows.
+#[allow(clippy::too_many_arguments)]
+pub fn scrolled_rows(
+    id: &'static str,
+    ui: &mut egui::Ui,
+    pal: &Palette,
+    table: &mut TmTable,
+    avail: f32,
+    sort: Option<(usize, bool)>,
+    aggregates: Option<&[String]>,
+    row_count: usize,
+    rows: impl FnOnce(&mut egui::Ui, &TmTable, f32, f32, std::ops::Range<usize>),
+) -> Option<usize> {
+    let content_w = table.total_width(avail);
+    let hdr_id = egui::Id::new(("tm-hdrscroll", id));
+    let rows_prev_x = ui
+        .ctx()
+        .data(|d| d.get_temp::<f32>(egui::Id::new(("tm-rowsx", id))))
+        .unwrap_or(0.0);
+
+    let hdr = egui::ScrollArea::horizontal()
+        .id_salt(hdr_id)
+        .auto_shrink(egui::Vec2b::new(false, true))
+        .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
+        .horizontal_scroll_offset(rows_prev_x)
+        .show(ui, |ui| table.header(ui, pal, avail, sort, aggregates));
+
+    let body = egui::ScrollArea::both()
+        .id_salt(egui::Id::new(("tm-rowscroll", id)))
+        .auto_shrink(false)
+        .horizontal_scroll_offset(hdr.state.offset.x)
+        .show_rows(ui, ROW_H, row_count, |ui, range| {
+            rows(ui, table, avail, avail.max(content_w), range)
+        });
+
+    ui.ctx()
+        .data_mut(|d| d.insert_temp(egui::Id::new(("tm-rowsx", id)), body.state.offset.x));
+    hdr.inner
+}
+
 #[derive(Debug, Clone)]
 pub struct TmColumn {
     pub id: &'static str,
     pub label: &'static str,
+    /// Current width; the FIRST column is the designated elastic column and
+    /// additionally absorbs leftover viewport width.
     pub width: f32,
     /// Built-in width (double-click on the separator restores it).
     pub default_w: f32,
@@ -109,6 +167,24 @@ impl TmColumn {
             numeric: true,
         }
     }
+    /// The elastic name/description column: `width == 0` means "not yet
+    /// user-resized"; the effective width fills the remaining viewport.
+    pub const fn elastic(id: &'static str, label: &'static str, min_w: f32) -> Self {
+        Self {
+            id,
+            label,
+            width: 0.0,
+            default_w: min_w,
+            numeric: false,
+        }
+    }
+}
+
+/// One-frame cached column geometry (implement.md §8.7).
+struct Layout {
+    avail: f32,
+    /// (left x offset relative to row, width) per column.
+    cols: Vec<(f32, f32)>,
 }
 
 pub struct TmTable {
@@ -117,55 +193,47 @@ pub struct TmTable {
     pub cols: Vec<TmColumn>,
     /// Minimum width of the flexible first (name) column.
     pub name_min: f32,
-    /// A width was modified during THIS frame's header() call.
+    /// Precomputed geometry for this frame (rebuilt when `avail` changes).
+    layout: std::cell::RefCell<Option<Layout>>,
+    /// Set when any width was modified during THIS frame's `header()`.
     dirty: bool,
-    /// Whether any resize handle was being dragged during the last header().
-    dragging: bool,
-    /// Whether any resize handle was dragged during the previous frame.
-    prev_dragging: bool,
 }
 
 impl TmTable {
-    /// Build a table, restoring previously saved widths for the non-name
-    /// columns when available.
+    /// Build a table, restoring previously saved widths by column id when
+    /// available. Unknown future ids in the map are simply never read.
     pub fn new(
         id: &'static str,
         cols: Vec<TmColumn>,
-        saved: Option<&[f32]>,
+        saved: Option<&std::collections::BTreeMap<String, f32>>,
         name_min: f32,
     ) -> Self {
         let mut t = Self {
             id,
             cols,
             name_min,
+            layout: std::cell::RefCell::new(None),
             dirty: false,
-            dragging: false,
-            prev_dragging: false,
         };
         if let Some(saved) = saved {
-            if saved.len() == t.cols.len() {
-                // Current schema: one entry per column (incl. the name).
-                for (c, w) in t.cols.iter_mut().zip(saved.iter()) {
-                    if *w >= MIN_COL_W && *w <= MAX_COL_W {
-                        c.width = *w;
-                    }
-                }
-            } else {
-                // Legacy schema: non-name columns only, name stays elastic.
-                for (c, w) in t.cols.iter_mut().skip(1).zip(saved.iter()) {
-                    if *w >= MIN_COL_W && *w <= MAX_COL_W {
-                        c.width = *w;
-                    }
+            for c in t.cols.iter_mut() {
+                if let Some(w) = saved.get(c.id)
+                    && (MIN_COL_W..=MAX_COL_W).contains(w)
+                {
+                    c.width = *w;
                 }
             }
         }
         t
     }
 
-    /// Current widths of ALL columns (for persistence). The name column is
-    /// `0.0` while it is still elastic (never user-resized).
-    pub fn stored_widths(&self) -> Vec<f32> {
-        self.cols.iter().map(|c| c.width).collect()
+    /// Current widths keyed by column id (for persistence).
+    pub fn stored_widths(&self) -> std::collections::BTreeMap<String, f32> {
+        self.cols
+            .iter()
+            .filter(|c| c.width > 0.0)
+            .map(|c| (c.id.to_string(), c.width))
+            .collect()
     }
 
     /// A width changed during this frame's `header()` call.
@@ -173,61 +241,66 @@ impl TmTable {
         self.dirty
     }
 
-    /// A resize drag ended with this or the previous frame.
-    pub fn drag_just_ended(&self) -> bool {
-        !self.dragging && self.prev_dragging
-    }
-
-    /// The name column is elastic until the user drags its boundary once
-    /// (`width > 0` = stored width); afterwards it keeps the stored size.
-    pub fn name_width(&self, avail: f32) -> f32 {
-        match self.cols[0].width {
-            w if w > 0.0 => w.clamp(self.name_min, MAX_COL_W),
-            _ => {
-                let fixed: f32 = self.cols[1..].iter().map(|c| c.width).sum();
-                (avail - fixed).max(self.name_min)
-            }
+    /// Effective width of the elastic first column: absorbs leftover
+    /// viewport width when the other columns leave room; otherwise keeps
+    /// its stored/default width and the table scrolls horizontally.
+    fn name_effective(&self, avail: f32) -> f32 {
+        let stored = self.cols[0]
+            .width
+            .max(self.name_min.min(self.cols[0].default_w.max(MIN_COL_W)));
+        let others: f32 = self.cols[1..].iter().map(|c| c.width).sum();
+        let spare = avail - others;
+        if spare > stored {
+            spare
+        } else {
+            stored.max(MIN_COL_W)
         }
-    }
-
-    /// Effective width of the LAST column: it always stretches/shrinks so the
-    /// table exactly fills the window (classic Task Manager behavior — every
-    /// dragged boundary moves with the cursor, the right edge stays put).
-    pub fn last_width(&self, avail: f32) -> f32 {
-        let last = self.cols.len() - 1;
-        let others: f32 =
-            self.name_width(avail) + self.cols[1..last].iter().map(|c| c.width).sum::<f32>();
-        (avail - others).max(MIN_COL_W)
     }
 
     /// Effective width of column `i`.
     pub fn col_width(&self, i: usize, avail: f32) -> f32 {
         if i == 0 {
-            self.name_width(avail)
-        } else if i == self.cols.len() - 1 {
-            self.last_width(avail)
+            self.name_effective(avail)
         } else {
-            self.cols[i].width
+            self.cols
+                .get(i)
+                .map_or(MIN_COL_W, |c| c.width.max(MIN_COL_W))
         }
     }
 
     pub fn total_width(&self, avail: f32) -> f32 {
-        let last = self.cols.len() - 1;
-        self.name_width(avail)
-            + self.cols[1..last].iter().map(|c| c.width).sum::<f32>()
-            + self.last_width(avail)
+        (0..self.cols.len()).map(|i| self.col_width(i, avail)).sum()
+    }
+
+    /// Build (once per frame / per avail) the x-offset layout.
+    fn ensure_layout(&self, avail: f32) {
+        let mut slot = self.layout.borrow_mut();
+        if let Some(l) = slot.as_ref()
+            && l.avail == avail
+        {
+            return;
+        }
+        let mut cols = Vec::with_capacity(self.cols.len());
+        let mut x = 0.0f32;
+        for i in 0..self.cols.len() {
+            let w = self.col_width(i, avail);
+            cols.push((x, w));
+            x += w;
+        }
+        *slot = Some(Layout { avail, cols });
     }
 
     pub fn col_rect(&self, i: usize, avail: f32, row: Rect) -> Rect {
-        let mut x = row.left();
-        for ci in 0..self.cols.len() {
-            let w = self.col_width(ci, avail);
-            if ci == i {
-                return Rect::from_min_max(Pos2::new(x, row.top()), Pos2::new(x + w, row.bottom()));
-            }
-            x += w;
+        self.ensure_layout(avail);
+        let l = self.layout.borrow();
+        let Some(l) = l.as_ref() else { return row };
+        match l.cols.get(i) {
+            Some(&(x, w)) => Rect::from_min_max(
+                Pos2::new(row.left() + x, row.top()),
+                Pos2::new(row.left() + x + w, row.bottom()),
+            ),
+            None => row,
         }
-        row
     }
 
     fn numeric_span(&self, avail: f32, row: Rect, from: usize) -> Rect {
@@ -240,20 +313,22 @@ impl TmTable {
 
     /// Left-edge x of column `i` inside `rect`.
     fn boundary_x(&self, rect: Rect, avail: f32, i: usize) -> f32 {
-        let mut x = rect.left();
-        for ci in 0..i.min(self.cols.len()) {
-            x += self.col_width(ci, avail);
-        }
-        x
+        self.ensure_layout(avail);
+        let l = self.layout.borrow();
+        let off = l
+            .as_ref()
+            .and_then(|l| l.cols.get(i))
+            .map_or(0.0, |&(x, _)| x);
+        rect.left() + off
     }
 
     /// Paint the header. Returns the clicked column index (for sorting).
     ///
     /// Every boundary between two columns carries an invisible drag handle.
-    /// Dragging resizes the column to the LEFT of the boundary — the boundary
-    /// itself follows the cursor, exactly like Windows Task Manager. The last
-    /// column absorbs the remaining window width, so the table always fills
-    /// the window. Double-click restores the built-in default width.
+    /// Dragging resizes the column to the LEFT of the boundary — the
+    /// boundary follows the cursor, exactly like Windows Task Manager.
+    /// Drag-start width is persisted in egui temp memory so the cumulative
+    /// `drag_delta()` maps 1:1 onto the boundary movement (§8.1).
     pub fn header(
         &mut self,
         ui: &mut egui::Ui,
@@ -267,6 +342,7 @@ impl TmTable {
         } else {
             HEADER_H1
         };
+        self.layout.borrow_mut().take(); // widths may change below
         let table_id = egui::Id::new(("tmtable", self.id));
         let total_w = self.total_width(avail);
         let (rect, _) = ui.allocate_exact_size(egui::vec2(total_w, h), Sense::hover());
@@ -329,13 +405,24 @@ impl TmTable {
                 agg_idx += 1;
             }
 
-            // Aggregate value above numeric labels.
+            // Sorted state of THIS column; also decides where the aggregate
+            // sits (shifted left so the caret fits next to it).
+            let sorted = sort.filter(|(si, _)| *si == i);
+
+            // Aggregate value above numeric labels — drawn exactly once
+            // (the old code painted it a second time in the sorted branch,
+            // ghosting the text at two overlapping x positions).
             if two_line
                 && agg_idx > 0
                 && let Some(agg) = aggregates.and_then(|a| a.get(agg_idx - 1))
             {
+                let agg_x = if sorted.is_some() {
+                    cell.right() - 26.0
+                } else {
+                    cell.right() - 10.0
+                };
                 painter.text(
-                    Pos2::new(cell.right() - 10.0, cell.top() + 14.0),
+                    Pos2::new(agg_x, cell.top() + 14.0),
                     Align2::RIGHT_CENTER,
                     agg,
                     FontId::proportional(12.5),
@@ -343,32 +430,29 @@ impl TmTable {
                 );
             }
 
-            // Sort caret above the label of the sorted column.
-            if let Some((si, asc)) = sort
-                && si == i
-            {
+            // Sort caret above the label of the sorted column. Anchored to
+            // the label's edge — numeric columns right-aligned like their
+            // values, text columns right after the label. Centering it in
+            // the column would float far away on wide name columns.
+            if let Some((_, asc)) = sorted {
                 let cx = if col.numeric {
                     cell.right() - 16.0
                 } else {
-                    cell.center().x
+                    let label_w = painter
+                        .layout_no_wrap(
+                            col.label.to_owned(),
+                            FontId::proportional(12.5),
+                            Color32::WHITE,
+                        )
+                        .size()
+                        .x;
+                    tx + label_w + 9.0
                 };
                 let cy = if two_line {
                     cell.top() + 14.0
                 } else {
                     cell.top() + 10.0
                 };
-                if two_line
-                    && agg_idx > 0
-                    && let Some(agg) = aggregates.and_then(|a| a.get(agg_idx - 1))
-                {
-                    painter.text(
-                        Pos2::new(cell.right() - 26.0, cell.top() + 14.0),
-                        Align2::RIGHT_CENTER,
-                        agg,
-                        FontId::proportional(12.5),
-                        pal.text,
-                    );
-                }
                 caret(painter.clone(), Pos2::new(cx, cy), asc, pal.text_dim);
             }
 
@@ -405,23 +489,46 @@ impl TmTable {
             if rresp.dragged() {
                 dragging_now = true;
             }
-            let dx = rresp.drag_delta().x;
-            let min_w = if i == 1 { self.name_min } else { MIN_COL_W };
-            // The elastic name column stores 0.0 until first resized;
-            // seed it with the current effective width on the first drag.
-            if i == 1 && dx != 0.0 && self.cols[0].width <= 0.0 {
-                self.cols[0].width = self.name_width(avail);
+            let target_col_id = self.cols[i - 1].id;
+            let drag_key = table_id.with(("resize-start", target_col_id));
+
+            if rresp.drag_started() {
+                // Remember the width at gesture start; the cumulative delta
+                // applies against THIS value for the whole drag.
+                let start = if i - 1 == 0 {
+                    self.name_effective(avail)
+                } else {
+                    self.cols[i - 1].width.max(MIN_COL_W)
+                };
+                ui.ctx().data_mut(|d| d.insert_temp(drag_key, start));
             }
-            let target = &mut self.cols[i - 1];
-            if dx != 0.0 {
-                target.width = (target.width + dx).clamp(min_w, MAX_COL_W);
-                self.dirty = true;
-                dragging_now = true;
+
+            if rresp.dragged() {
+                let dx = rresp.drag_delta().x;
+                if dx != 0.0 {
+                    let start_w = ui
+                        .ctx()
+                        .data(|d| d.get_temp::<f32>(drag_key))
+                        .unwrap_or_else(|| {
+                            if i - 1 == 0 {
+                                self.name_effective(avail)
+                            } else {
+                                self.cols[i - 1].width
+                            }
+                        });
+                    let min_w = if i == 1 { self.name_min } else { MIN_COL_W };
+                    let new_w = (start_w + dx).clamp(min_w, MAX_COL_W);
+                    self.cols[i - 1].width = new_w;
+                    self.layout.borrow_mut().take();
+                    self.dirty = true;
+                    dragging_now = true;
+                }
             }
             if rresp.double_clicked() {
-                // Restores the built-in default; `0.0` on the name column
-                // switches it back to elastic.
-                target.width = target.default_w.clamp(0.0, MAX_COL_W);
+                // Restores the built-in default; `0.0` on the elastic name
+                // column switches it back to fill-the-spare-space mode.
+                self.cols[i - 1].width = self.cols[i - 1].default_w.clamp(0.0, MAX_COL_W);
+                self.layout.borrow_mut().take();
                 self.dirty = true;
             }
             // Subtle affordance: brighten hovered separators.
@@ -451,14 +558,8 @@ impl TmTable {
             egui::StrokeKind::Inside,
         );
 
-        self.prev_dragging = self.dragging;
-        self.dragging = dragging_now;
+        let _ = dragging_now; // drag state lives in egui temp data now
         clicked
-    }
-
-    /// Whether a resize drag is in progress (call after `header`).
-    pub fn dragging(&self) -> bool {
-        self.dragging
     }
 
     /// Paint a row background. Returns the row rect and response.
@@ -548,16 +649,11 @@ impl TmTable {
         expanded: bool,
         enabled: bool,
         pal: &Palette,
+        seed: egui::Id,
     ) -> bool {
         let c = Pos2::new(row.left() + 16.0, row.center().y);
         let hit = Rect::from_center_size(c, egui::vec2(24.0, ROW_H));
-        let resp = ui.interact(
-            hit,
-            egui::Id::new("chev")
-                .with(row.top().to_bits())
-                .with(hit.left().to_bits()),
-            Sense::click(),
-        );
+        let resp = ui.interact(hit, seed.with("chev"), Sense::click());
         if enabled {
             let icon = if expanded {
                 icons::Icon::ChevronDown

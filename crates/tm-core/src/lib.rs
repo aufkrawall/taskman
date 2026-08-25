@@ -6,6 +6,7 @@
 
 pub mod app_history;
 pub mod classify;
+pub mod demand;
 pub mod engine;
 pub mod error;
 pub mod format;
@@ -18,6 +19,7 @@ pub mod settings;
 pub mod sync;
 
 pub use app_history::AppHistoryDb;
-pub use engine::{EngineCmd, EngineHandle, EngineState};
+pub use demand::TelemetryDemand;
+pub use engine::{CollectorFactory, EngineCmd, EngineHandle, EngineState, NotifyFn};
 pub use error::{Result, TmError};
 pub use model::*;

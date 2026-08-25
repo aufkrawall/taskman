@@ -553,17 +553,18 @@ fn send_signal(pid: u32, sig: i32) -> Result<()> {
     }
 }
 
-pub fn create() -> (LinuxCollector, LinuxActions) {
-    (
-        LinuxCollector {
-            sys: System::new_all(),
-            disks: Disks::new_with_refreshed_list(),
-            networks: Networks::new_with_refreshed_list(),
-            users: sysinfo::Users::new_with_refreshed_list(),
-            prev_net_totals: HashMap::new(),
-            last_tick: None,
-            first_tick_done: false,
-        },
-        LinuxActions,
-    )
+pub fn create_collector() -> LinuxCollector {
+    LinuxCollector {
+        sys: System::new_all(),
+        disks: Disks::new_with_refreshed_list(),
+        networks: Networks::new_with_refreshed_list(),
+        users: sysinfo::Users::new_with_refreshed_list(),
+        prev_net_totals: HashMap::new(),
+        last_tick: None,
+        first_tick_done: false,
+    }
+}
+
+pub fn create_actions() -> LinuxActions {
+    LinuxActions
 }
