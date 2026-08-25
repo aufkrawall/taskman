@@ -21,6 +21,12 @@
 - The light gate does NOT cover lint or cross-crate breakage.
 - The heavy gate covers formatting, clippy with warnings-as-errors, all
   workspace tests (incl. Windows integration tests), and release packaging.
+- **Always end a code-change session with a release build**
+  (`python build.py --host-only`; already covered when the heavy gate ran)
+  so `target/release/taskman.exe` — the binary the user actually launches —
+  is never stale relative to the commit. The dev loop above only refreshes
+  `target/debug`; a warm incremental release rebuild is cheap by design
+  (thin LTO, parallel codegen).
 - **Release/deployment:** `python build.py` produces host + Linux x86_64
   release artifacts into `dist/` by default. See `llm-wiki/build.md`. Linux
   cross-builds need `cross` or `cargo-zigbuild`; without one the step is

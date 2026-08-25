@@ -33,6 +33,17 @@ Flags: `--host-only`, `--linux-only`, `--debug`, `--no-package`,
 Nested inside a release artifact build when run as
 `python build.py --host-only --check`.
 
+## Local release binary freshness
+
+`target/release/taskman.exe` is the binary that gets launched locally.
+The dev loop (`cargo build -p tm-app`, `cargo test -p …`) only refreshes
+`target/debug`, so it goes stale unless a release build runs. Convention:
+every code-change session closes with `python build.py --host-only`
+(redundant after `--check`, which builds release anyway). Thanks to the
+profile policy below, a warm incremental release rebuild is cheap
+(seconds for tm-app-only changes); cargo then reports "Finished" without
+recompiling when the binary already matches the sources.
+
 ## Profile policy (deliberate, do not regress)
 
 | Setting | Value | Why |
