@@ -111,7 +111,9 @@ impl SystemCollector for MacCollector {
             entry.display = name.clone();
             entry.ppid = p.parent().map(|x| x.as_u32());
             entry.category = category;
-            entry.cpu_pct = (p.cpu_usage() / nb_cpus * 100.0).clamp(0.0, 100.0);
+            // sysinfo returns percent of ONE core; normalize to share of
+            // total machine capacity (TM-style, max 100).
+            entry.cpu_pct = (p.cpu_usage() / nb_cpus).clamp(0.0, 100.0);
             entry.mem_bytes = p.memory();
             entry.commit_bytes = Some(p.virtual_memory());
             entry.start_epoch_s = Some(p.start_time() as i64);

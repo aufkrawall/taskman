@@ -9,9 +9,10 @@
 //!   handle count) are cached across ticks instead of issuing 4 native
 //!   queries per process per tick.
 
+use crate::win::cpu_load::{CpuLoadAccountant, LoadSample};
 use crate::win::{cpu_info, gpu, perfcounters, process_ops, threads_map, version, windows_enum};
 use std::collections::{HashMap, HashSet};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use sysinfo::{
     Disks, MemoryRefreshKind, Networks, ProcessRefreshKind, ProcessesToUpdate, RefreshKind, System,
@@ -50,6 +51,11 @@ pub struct Sampler {
     attrs: HashMap<u32, PidAttrs>,
     gpu_adapters: Option<Vec<gpu::AdapterInfo>>,
     pdh: Mutex<perfcounters::Pdh>,
+    /// Time-based CPU accountant (see [`cpu_load`]); replaces sysinfo/PDH
+    /// CPU usage which was noisy and mis-normalized.
+    cpu_load: CpuLoadAccountant,
+    /// Last valid CPU-load sample; held when a tick's window is unusable.
+    last_load: Option<Arc<LoadSample>>,
 }
 
 impl Sampler {
@@ -84,6 +90,8 @@ impl Sampler {
             tick_no: 0,
             attrs: HashMap::new(),
             gpu_adapters: None,
+            cpu_load: CpuLoadAccountant::new(),
+            last_load: None,
         }
     }
 
@@ -101,20 +109,19 @@ impl Sampler {
     }
 
     fn refresh_raw(&mut self) {
+        // NOTE: no `.with_cpu_usage()` / `.with_cpu()` here — all CPU load
+        // values come from `cpu_load` (NtQuerySystemInformation deltas).
+        // Besides correctness this saves sysinfo's per-process
+        // GetProcessTimes/GetSystemTimes storm every tick.
         self.sys.refresh_specifics(
             RefreshKind::nothing()
-                .with_cpu(
-                    sysinfo::CpuRefreshKind::nothing()
-                        .with_cpu_usage()
-                        .with_frequency(),
-                )
+                .with_cpu(sysinfo::CpuRefreshKind::nothing().with_frequency())
                 .with_memory(MemoryRefreshKind::nothing().with_ram().with_swap()),
         );
         self.sys.refresh_processes_specifics(
             ProcessesToUpdate::All,
             true,
             ProcessRefreshKind::nothing()
-                .with_cpu()
                 .with_memory()
                 .with_disk_usage()
                 .with_user(UpdateKind::OnlyIfNotSet)
@@ -148,7 +155,7 @@ impl Sampler {
 
 impl SystemCollector for Sampler {
     fn backend_name(&self) -> &'static str {
-        "windows/sysinfo+pdh"
+        "windows/sysinfo+pdh+nt-cpu"
     }
 
     fn sample(&mut self, started: Instant) -> Result<Snapshot> {
@@ -166,6 +173,16 @@ impl Sampler {
             .clamp(0.05, 3600.0);
         self.last_tick = Some(started);
 
+        // ---- CPU load first ---------------------------------------------------
+        // Sampled before everything else so its delta window stays tight and
+        // independent of how long the rest of the tick takes. Time-based and
+        // therefore immune to boost clocks (see win/cpu_load.rs). When a
+        // window is too short to be trustworthy we keep the previous sample.
+        if let Some(s) = self.cpu_load.sample() {
+            self.last_load = Some(s);
+        }
+        let load = self.last_load.clone();
+
         // ---- refresh raw data --------------------------------------------------
         self.refresh_raw();
 
@@ -174,11 +191,10 @@ impl Sampler {
         let thread_counts = threads_map::thread_counts();
 
         // ---- CPU -----------------------------------------------------------------
-        // Extract everything needed from `sys.cpus()` up front so the
-        // immutable sysinfo borrow ends before the mutable passes below.
-        let (cpu_brand, cpu_vendor, per_core_pct, utilization, freq) = {
+        // Static identity/frequency from sysinfo; load numbers exclusively
+        // from the time-based accountant above.
+        let (cpu_brand, cpu_vendor, freq) = {
             let cpus = self.sys.cpus();
-            let logical = cpus.len().max(1);
             (
                 cpus.first()
                     .map(|c| c.brand().to_string())
@@ -186,12 +202,18 @@ impl Sampler {
                 cpus.first()
                     .map(|c| c.vendor_id().to_string())
                     .unwrap_or_default(),
-                cpus.iter()
-                    .map(|c| c.cpu_usage().clamp(0.0, 100.0))
-                    .collect::<Vec<f32>>(),
-                cpus.iter().map(|c| c.cpu_usage()).sum::<f32>() / logical as f32,
-                cpus.iter().map(|c| c.frequency() as f32).sum::<f32>() / logical as f32,
+                cpus.iter().map(|c| c.frequency() as f32).sum::<f32>() / cpus.len().max(1) as f32,
             )
+        };
+        let logical = load
+            .as_ref()
+            .map(|l| l.per_core_pct.len())
+            .filter(|n| *n > 0)
+            .unwrap_or_else(|| self.sys.cpus().len())
+            .max(1);
+        let (utilization, per_core_pct) = match load.as_ref() {
+            Some(l) => (l.global_pct.clamp(0.0, 100.0), l.per_core_pct.clone()),
+            None => (0.0, vec![0.0; logical]),
         };
 
         // ---- memory ----------------------------------------------------------------
@@ -229,8 +251,6 @@ impl Sampler {
         };
 
         // ---- processes ------------------------------------------------------------
-        let logical = per_core_pct.len().max(1);
-        let nb_cpus = logical as f32;
         let n_procs = self.sys.processes().len();
 
         // Purge attribute-cache entries of processes that no longer exist.
@@ -268,11 +288,14 @@ impl Sampler {
             entry.ppid = p.parent().map(|x| x.as_u32());
             entry.status = map_status(p.status());
             entry.user = user;
-            entry.cpu_pct = (p.cpu_usage() / nb_cpus * 100.0).clamp(0.0, 100.0);
+            // Time-based share of total machine capacity + absolute CPU time,
+            // both straight from the kernel's accumulators (cpu_load.rs).
+            let pc = load.as_ref().and_then(|l| l.procs.get(&pid_u));
+            entry.cpu_pct = pc.map_or(0.0, |c| c.pct);
             entry.mem_bytes = p.memory();
             entry.commit_bytes = Some(p.virtual_memory());
             entry.start_epoch_s = Some(p.start_time() as i64);
-            entry.cpu_time_s = Some(p.accumulated_cpu_time() as f64 / 1000.0);
+            entry.cpu_time_s = pc.map(|c| c.total_time_100ns as f64 / 10_000_000.0);
             entry.disk_read_bps = du.read_bytes as f64 / interval_s;
             entry.disk_write_bps = du.written_bytes as f64 / interval_s;
             entry.disk_read_total = du.total_read_bytes;
