@@ -3,6 +3,40 @@
 
 use eframe::egui::{self, Color32, Pos2, Response, Shape, Stroke, Vec2};
 
+/// Fill the area between an x-monotone polyline and a horizontal baseline.
+///
+/// egui tessellates polygon fills as a fan from the first vertex
+/// (`fill_closed_path`), which is only correct for CONVEX polygons — on
+/// concave spans the fan cuts straight across dips, overfilling above the
+/// line and leaving unpainted gaps under it (the "fake ramp / cliff"
+/// artifact that made every graph look wrong). An explicit triangle strip
+/// along the polyline fills exactly between line and baseline.
+fn fill_area_to_baseline(painter: &egui::Painter, pts: &[Pos2], baseline_y: f32, fill: Color32) {
+    painter.add(Shape::mesh(area_strip_mesh(pts, baseline_y, fill)));
+}
+
+/// Triangle strip for [`fill_area_to_baseline`]: two vertices per point
+/// (the sample and its baseline projection), two triangles per segment.
+fn area_strip_mesh(pts: &[Pos2], baseline_y: f32, fill: Color32) -> egui::Mesh {
+    let mut mesh = egui::Mesh::default();
+    if pts.len() < 2 || fill == Color32::TRANSPARENT {
+        return mesh;
+    }
+    mesh.vertices.reserve(pts.len() * 2);
+    mesh.indices.reserve((pts.len() - 1) * 6);
+    for p in pts {
+        let top = mesh.vertices.len() as u32;
+        mesh.colored_vertex(*p, fill);
+        mesh.colored_vertex(Pos2::new(p.x, baseline_y), fill);
+        if top >= 2 {
+            let (lt, lb) = (top - 2, top - 1);
+            mesh.add_triangle(lt, top, lb);
+            mesh.add_triangle(lb, top, top + 1);
+        }
+    }
+    mesh
+}
+
 /// Sparkline painted into an explicit rect (no allocation) — used inside
 /// hand-laid cards.
 pub fn paint_sparkline(ui: &egui::Ui, rect: egui::Rect, samples: &[f64], color: Color32) {
@@ -32,10 +66,7 @@ pub fn paint_sparkline(ui: &egui::Ui, rect: egui::Rect, samples: &[f64], color: 
         .collect();
 
     let fill = Color32::from_rgba_premultiplied(color.r(), color.g(), color.b(), 55);
-    let mut area = pts.clone();
-    area.push(Pos2::new(pts[pts.len() - 1].x, rect.bottom()));
-    area.push(Pos2::new(pts[0].x, rect.bottom()));
-    painter.add(Shape::convex_polygon(area, fill, Stroke::NONE));
+    fill_area_to_baseline(&painter, &pts, rect.bottom(), fill);
     painter.add(Shape::line(pts, Stroke::new(1.25, color)));
 }
 
@@ -81,10 +112,7 @@ pub fn core_chart(
         .map(|(i, v)| Pos2::new(x(i), y(*v)))
         .collect();
     let fill = Color32::from_rgba_premultiplied(color.r(), color.g(), color.b(), 75);
-    let mut area = pts.clone();
-    area.push(Pos2::new(rect.right(), rect.bottom()));
-    area.push(Pos2::new(rect.left(), rect.bottom()));
-    painter.add(Shape::convex_polygon(area, fill, Stroke::NONE));
+    fill_area_to_baseline(&painter, &pts, rect.bottom(), fill);
 
     // Kernel overlay: darker band under the user portion. Painted AFTER the
     // user fill but BEFORE the line, so it darkens the lower region without
@@ -97,10 +125,7 @@ pub fn core_chart(
             .collect();
         let kfill =
             Color32::from_rgba_premultiplied(color.r() / 2, color.g() / 2, color.b() / 2, 110);
-        let mut karea = kpts.clone();
-        karea.push(Pos2::new(rect.right(), rect.bottom()));
-        karea.push(Pos2::new(rect.left(), rect.bottom()));
-        painter.add(Shape::convex_polygon(karea, kfill, Stroke::NONE));
+        fill_area_to_baseline(&painter, &kpts, rect.bottom(), kfill);
     }
     painter.add(Shape::line(pts, Stroke::new(1.4, color)));
 
@@ -179,10 +204,7 @@ pub fn chart_multi(
             .map(|(i, v)| Pos2::new(x_at(i, n), y(*v)))
             .collect();
         let fill = Color32::from_rgba_premultiplied(s.color.r(), s.color.g(), s.color.b(), 60);
-        let mut area = pts.clone();
-        area.push(Pos2::new(rect.right(), rect.bottom()));
-        area.push(Pos2::new(rect.left(), rect.bottom()));
-        painter.add(Shape::convex_polygon(area, fill, Stroke::NONE));
+        fill_area_to_baseline(&painter, &pts, rect.bottom(), fill);
     }
     // Lines in a SECOND pass: an outer series' translucent fill must never
     // dim an inner series' line (the old single-pass order made overlapping
@@ -206,13 +228,25 @@ pub fn chart_multi(
         && rect.contains(pos)
     {
         let frac = ((pos.x - rect.left()) / rect.width()).clamp(0.0, 1.0);
+        // Time-proportional x: map the pointer TIME back to the nearest
+        // sample — even-spacing math skips across sampling gaps.
+        let time_idx = t_span.map(|(t0, span)| {
+            let ts = timestamps_ms.unwrap();
+            let tq = (t0 as f32 + frac * span as f32) as u64;
+            ts.partition_point(|&t| t < tq).saturating_sub(1)
+        });
         let mut tip = String::new();
         for s in series {
             let n = s.samples.len();
             if n < 2 {
                 continue;
             }
-            let idx = ((frac * (n - 1) as f32).round()) as usize;
+            let idx = time_idx
+                .map_or_else(
+                    || (frac * (n - 1) as f32).round() as usize,
+                    |i| i.min(n - 1),
+                )
+                .min(n - 1);
             if let Some(v) = s.samples.get(idx) {
                 if !tip.is_empty() {
                     tip.push_str(" \u{b7} ");
@@ -225,4 +259,60 @@ pub fn chart_multi(
         }
     }
     response
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The area fill must be a triangle STRIP along the polyline: every
+    /// triangle spans at most one segment's x-range. The old fan
+    /// triangulation (`Shape::convex_polygon`) created long edges from the
+    /// first vertex to distant peaks, cutting straight across concave dips —
+    /// the "fake ramp" rendering artifact.
+    #[test]
+    fn area_strip_never_spans_more_than_one_segment() {
+        // Concave profile: peak in the middle, dips at both ends.
+        let pts = vec![
+            Pos2::new(0.0, 0.0),
+            Pos2::new(5.0, 10.0),
+            Pos2::new(10.0, 0.0),
+        ];
+        let mesh = area_strip_mesh(&pts, 12.0, Color32::BLUE);
+        assert_eq!(mesh.vertices.len(), 2 * pts.len());
+        assert_eq!(mesh.indices.len(), 6 * (pts.len() - 1));
+        let dx = 5.0; // segment width
+        for tri in mesh.indices.chunks_exact(3) {
+            let xs: Vec<f32> = tri
+                .iter()
+                .map(|&i| mesh.vertices[i as usize].pos.x)
+                .collect();
+            let span = xs.iter().cloned().fold(f32::MIN, f32::max)
+                - xs.iter().cloned().fold(f32::MAX, f32::min);
+            assert!(
+                span <= dx + f32::EPSILON,
+                "triangle spans {span} px — wider than one segment (fan edge)"
+            );
+        }
+    }
+
+    /// Degenerate inputs produce an empty mesh instead of panicking.
+    #[test]
+    fn area_strip_handles_degenerate_input() {
+        assert!(area_strip_mesh(&[], 0.0, Color32::BLUE).indices.is_empty());
+        assert!(
+            area_strip_mesh(&[Pos2::ZERO], 0.0, Color32::BLUE)
+                .indices
+                .is_empty()
+        );
+        assert!(
+            area_strip_mesh(
+                &[Pos2::ZERO, Pos2::new(1.0, 1.0)],
+                0.0,
+                Color32::TRANSPARENT
+            )
+            .indices
+            .is_empty()
+        );
+    }
 }
