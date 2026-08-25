@@ -206,7 +206,13 @@ pub fn draw(ui: &egui::Ui, icon: Icon, rect: Rect, color: Color32) {
         Icon::Leaf => {
             // Simple leaf: two arcs meeting at tip.
             painter.add(Shape::line(
-                vec![p(-6.0, 6.0), p(-6.0, -1.0), p(0.0, -6.5), p(6.0, -1.0), p(6.0, 6.0)],
+                vec![
+                    p(-6.0, 6.0),
+                    p(-6.0, -1.0),
+                    p(0.0, -6.5),
+                    p(6.0, -1.0),
+                    p(6.0, 6.0),
+                ],
                 stroke,
             ));
             line(p(-6.0, 6.0), p(6.0, 6.0));
@@ -256,7 +262,13 @@ pub fn draw(ui: &egui::Ui, icon: Icon, rect: Rect, color: Color32) {
             circle(p(0.0, -3.5), 3.6, true);
             // Shoulders as filled arc approximation.
             painter.add(Shape::convex_polygon(
-                vec![p(-7.0, 8.0), p(-5.5, 3.5), p(0.0, 1.5), p(5.5, 3.5), p(7.0, 8.0)],
+                vec![
+                    p(-7.0, 8.0),
+                    p(-5.5, 3.5),
+                    p(0.0, 1.5),
+                    p(5.5, 3.5),
+                    p(7.0, 8.0),
+                ],
                 color,
                 Stroke::NONE,
             ));
@@ -310,7 +322,10 @@ pub fn draw_app_window(ui: &egui::Ui, rect: Rect, color: Color32) {
         egui::StrokeKind::Inside,
     );
     // Title bar strip.
-    let strip = Rect::from_min_max(r.left_top(), egui::pos2(r.right(), r.top() + r.height() * 0.32));
+    let strip = Rect::from_min_max(
+        r.left_top(),
+        egui::pos2(r.right(), r.top() + r.height() * 0.32),
+    );
     painter.rect_filled(strip, 2.0, color.gamma_multiply(0.8));
 }
 

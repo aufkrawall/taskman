@@ -1,21 +1,39 @@
 //! sysinfo-driven sampler producing full `Snapshot`s on Windows.
+//!
+//! Performance notes:
+//! * Construction is intentionally cheap — the expensive first refresh runs
+//!   on the engine thread so process startup is not blocked behind it.
+//! * PDH counters are collected exactly once per tick and read multiple times.
+//! * DXGI adapter info is probed once (it never changes at runtime).
+//! * Slow-changing per-process attributes (session id, WOW64, priority,
+//!   handle count) are cached across ticks instead of issuing 4 native
+//!   queries per process per tick.
 
 use crate::win::{cpu_info, gpu, perfcounters, process_ops, threads_map, version, windows_enum};
-use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet};
+use std::sync::Mutex;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use sysinfo::{
-    Disks, MemoryRefreshKind, Networks, Pid, ProcessRefreshKind, ProcessesToUpdate, RefreshKind,
-    System, UpdateKind, Users,
+    Disks, MemoryRefreshKind, Networks, ProcessRefreshKind, ProcessesToUpdate, RefreshKind, System,
+    UpdateKind, Users,
 };
 use tm_core::classify;
-
-fn tm_category_app() -> tm_core::model::ProcCategory {
-    tm_core::model::ProcCategory::App
-}
 use tm_core::engine::SystemCollector;
 use tm_core::error::Result;
 use tm_core::model::*;
+
+/// Refresh cadence (in ticks) for slow-changing per-process attributes.
+const ATTR_REFRESH_TICKS: u64 = 10;
+
+#[derive(Clone)]
+struct PidAttrs {
+    session_id: Option<u32>,
+    wow64: Option<bool>,
+    priority: PriorityClass,
+    handles: Option<u32>,
+    /// Tick number when these values were last queried natively.
+    refreshed_at_tick: u64,
+}
 
 /// Everything that carries state between ticks.
 pub struct Sampler {
@@ -27,16 +45,21 @@ pub struct Sampler {
     prev_net_totals: HashMap<String, (u64, u64)>,
     last_tick: Option<Instant>,
     first_tick_done: bool,
+    initialized: bool,
+    tick_no: u64,
+    attrs: HashMap<u32, PidAttrs>,
+    gpu_adapters: Option<Vec<gpu::AdapterInfo>>,
     pdh: Mutex<perfcounters::Pdh>,
 }
 
 impl Sampler {
+    /// Cheap construction: no blocking system queries here. All heavy state
+    /// (user map, disk/network lists, first full refresh) is built lazily on
+    /// the first `sample()` call, which runs on the engine thread.
     pub fn new() -> Self {
-        let mut users = Users::new_with_refreshed_list();
-        let user_names = build_user_map(&users);
-        users.refresh();
-
         let mut sys = System::new();
+        // Lightweight warmup only: CPU/memory are quick and make the very
+        // first rates valid sooner. Process enumeration happens in `sample`.
         sys.refresh_specifics(
             RefreshKind::nothing()
                 .with_cpu(
@@ -46,50 +69,38 @@ impl Sampler {
                 )
                 .with_memory(MemoryRefreshKind::nothing().with_ram().with_swap()),
         );
-        sys.refresh_processes_specifics(
-            ProcessesToUpdate::All,
-            true,
-            ProcessRefreshKind::nothing()
-                .with_cpu()
-                .with_memory()
-                .with_disk_usage()
-                .with_user(UpdateKind::Always)
-                .with_exe(UpdateKind::OnlyIfNotSet),
-        );
 
         Self {
-            user_names,
+            user_names: HashMap::new(),
             sys,
-            disks: Disks::new_with_refreshed_list(),
-            networks: Networks::new_with_refreshed_list(),
+            disks: Disks::new(),
+            networks: Networks::new(),
             pdh: Mutex::new(perfcounters::Pdh::new()),
             cpu_static: cpu_info::CpuStatic::probe(),
             prev_net_totals: HashMap::new(),
             last_tick: None,
             first_tick_done: false,
+            initialized: false,
+            tick_no: 0,
+            attrs: HashMap::new(),
+            gpu_adapters: None,
         }
     }
-}
 
-impl SystemCollector for Sampler {
-    fn backend_name(&self) -> &'static str {
-        "windows/sysinfo+pdh"
+    /// One-time heavy initialization on the engine thread.
+    fn lazy_init(&mut self) {
+        if self.initialized {
+            return;
+        }
+        // `new_with_refreshed_list` already performs the first enumeration.
+        let users = Users::new_with_refreshed_list();
+        self.user_names = build_user_map(&users);
+        self.disks = Disks::new_with_refreshed_list();
+        self.networks = Networks::new_with_refreshed_list();
+        self.initialized = true;
     }
 
-    fn sample(&mut self, started: Instant) -> Result<Snapshot> {
-        self.sample_inner(started)
-    }
-}
-
-impl Sampler {
-    fn sample_inner(&mut self, started: Instant) -> Result<Snapshot> {
-        let interval_s = self
-            .last_tick
-            .map_or(1.0, |t| started.duration_since(t).as_secs_f64())
-            .clamp(0.05, 3600.0);
-        self.last_tick = Some(started);
-
-        // ---- refresh raw data --------------------------------------------------
+    fn refresh_raw(&mut self) {
         self.sys.refresh_specifics(
             RefreshKind::nothing()
                 .with_cpu(
@@ -111,16 +122,77 @@ impl Sampler {
         );
         self.disks.refresh(true);
         self.networks.refresh(true);
+    }
+
+    /// Cached slow-changing attributes for one pid; refreshes them natively
+    /// at most every [`ATTR_REFRESH_TICKS`] ticks (4 native calls instead of
+    /// ~4 × processes per tick).
+    fn attrs_for(&mut self, pid: u32) -> PidAttrs {
+        let now_tick = self.tick_no;
+        if let Some(a) = self.attrs.get(&pid)
+            && now_tick - a.refreshed_at_tick < ATTR_REFRESH_TICKS
+        {
+            return a.clone();
+        }
+        let fresh = PidAttrs {
+            session_id: process_ops::session_id_of(pid),
+            wow64: process_ops::is_wow64(pid),
+            priority: process_ops::priority_class_of(pid),
+            handles: process_ops::handle_count(pid),
+            refreshed_at_tick: now_tick,
+        };
+        self.attrs.insert(pid, fresh.clone());
+        fresh
+    }
+}
+
+impl SystemCollector for Sampler {
+    fn backend_name(&self) -> &'static str {
+        "windows/sysinfo+pdh"
+    }
+
+    fn sample(&mut self, started: Instant) -> Result<Snapshot> {
+        self.lazy_init();
+        self.tick_no += 1;
+        self.sample_inner(started)
+    }
+}
+
+impl Sampler {
+    fn sample_inner(&mut self, started: Instant) -> Result<Snapshot> {
+        let interval_s = self
+            .last_tick
+            .map_or(1.0, |t| started.duration_since(t).as_secs_f64())
+            .clamp(0.05, 3600.0);
+        self.last_tick = Some(started);
+
+        // ---- refresh raw data --------------------------------------------------
+        self.refresh_raw();
 
         let window_owners: HashSet<u32> =
             windows_enum::visible_window_owners().into_iter().collect();
         let thread_counts = threads_map::thread_counts();
 
         // ---- CPU -----------------------------------------------------------------
-        let cpus = self.sys.cpus();
-        let logical = cpus.len().max(1);
-        let utilization: f32 = cpus.iter().map(|c| c.cpu_usage()).sum::<f32>() / logical as f32;
-        let freq: f32 = cpus.iter().map(|c| c.frequency() as f32).sum::<f32>() / logical as f32;
+        // Extract everything needed from `sys.cpus()` up front so the
+        // immutable sysinfo borrow ends before the mutable passes below.
+        let (cpu_brand, cpu_vendor, per_core_pct, utilization, freq) = {
+            let cpus = self.sys.cpus();
+            let logical = cpus.len().max(1);
+            (
+                cpus.first()
+                    .map(|c| c.brand().to_string())
+                    .unwrap_or_default(),
+                cpus.first()
+                    .map(|c| c.vendor_id().to_string())
+                    .unwrap_or_default(),
+                cpus.iter()
+                    .map(|c| c.cpu_usage().clamp(0.0, 100.0))
+                    .collect::<Vec<f32>>(),
+                cpus.iter().map(|c| c.cpu_usage()).sum::<f32>() / logical as f32,
+                cpus.iter().map(|c| c.frequency() as f32).sum::<f32>() / logical as f32,
+            )
+        };
 
         // ---- memory ----------------------------------------------------------------
         let mem_total = self.sys.total_memory();
@@ -128,67 +200,64 @@ impl Sampler {
         let mem_avail = self.sys.available_memory();
         let win_mem = perfcounters::query_windows_memory();
 
-        // ---- processes -----------------------------------------------------------------
+        // ---- PDH: collect exactly once, read three times -----------------------
+        let collected = {
+            let pdh = &mut self.pdh;
+            let guard = pdh.get_mut().unwrap_or_else(|e| e.into_inner());
+            guard.collect_once()
+        };
+        let (gpu_per_process, gpu_engines, disk_perf) = {
+            let pdh = &self.pdh;
+            let mut guard = pdh.lock().unwrap_or_else(|e| e.into_inner());
+            (
+                if collected {
+                    guard.read_gpu_process_stats()
+                } else {
+                    None
+                },
+                if collected {
+                    guard.read_engine_stats()
+                } else {
+                    Vec::new()
+                },
+                if collected {
+                    guard.read_disks()
+                } else {
+                    Vec::new()
+                },
+            )
+        };
+
+        // ---- processes ------------------------------------------------------------
+        let logical = per_core_pct.len().max(1);
         let nb_cpus = logical as f32;
         let n_procs = self.sys.processes().len();
-        let mut processes = Vec::with_capacity(n_procs);
 
-        let mut name_by_pid: HashMap<u32, String> = HashMap::with_capacity(n_procs);
-        for (pid, p) in self.sys.processes() {
-            name_by_pid.insert(pid.as_u32(), p.name().to_string_lossy().into_owned());
+        // Purge attribute-cache entries of processes that no longer exist.
+        if self.tick_no.is_multiple_of(16) {
+            let alive: HashSet<u32> = self.sys.processes().keys().map(|p| p.as_u32()).collect();
+            self.attrs.retain(|pid, _| alive.contains(pid));
         }
+
+        let mut processes: Vec<ProcessEntry> = Vec::with_capacity(n_procs);
 
         for (pid, p) in self.sys.processes() {
             let pid_u = pid.as_u32();
+            // Single owned copy of the name per process (reused everywhere).
             let name = p.name().to_string_lossy().into_owned();
-
-            // Walk ancestors (bounded) for classification.
-            let mut anc: Vec<String> = Vec::new();
-            let mut cur_pid = p.parent().map(|x| x.as_u32());
-            let mut hops = 0;
-            while let Some(ppid) = cur_pid {
-                hops += 1;
-                if hops > 8 {
-                    break;
-                }
-                match name_by_pid.get(&ppid) {
-                    Some(n) => {
-                        anc.push(n.clone());
-                        cur_pid = self
-                            .sys
-                            .process(Pid::from_u32(ppid))
-                            .and_then(|pp| pp.parent())
-                            .map(|x| x.as_u32());
-                    }
-                    None => break,
-                }
-            }
-
+            let exe_owned = p.exe().map(|e| e.to_path_buf());
             let has_window = window_owners.contains(&pid_u);
-            let session_id = process_ops::session_id_of(pid_u);
 
-            let category = classify::classify(classify::ClassifyInput {
-                pid: pid_u,
-                name: &name,
-                ancestor_names: &anc,
-                has_window,
-                system_session: session_id.is_some_and(|s| s == 0),
-            });
-
-            let mut user = p
+            let user = p
                 .user_id()
                 .and_then(|uid| self.user_names.get(uid).cloned());
-            // System processes have no owning user; TM shows "SYSTEM".
-            if user.is_none() && session_id.is_some_and(|sid| sid == 0) {
-                user = Some("SYSTEM".to_string());
-            }
-
             let du = p.disk_usage();
 
             let mut entry = ProcessEntry::new(pid_u, name.clone());
             // Friendly name (FileDescription) like TM: "Windows-Explorer".
-            if let Some(exe) = p.exe().map(|e| e.to_string_lossy().into_owned()) {
-                let ver = version::query(&exe);
+            if let Some(exe) = exe_owned.as_ref() {
+                let exe_str = exe.to_string_lossy();
+                let ver = version::query(&exe_str);
                 if !ver[0].is_empty() {
                     entry.display = ver[0].clone();
                 }
@@ -197,10 +266,8 @@ impl Sampler {
                 }
             }
             entry.ppid = p.parent().map(|x| x.as_u32());
-            entry.category = category;
             entry.status = map_status(p.status());
             entry.user = user;
-            entry.session_id = session_id;
             entry.cpu_pct = (p.cpu_usage() / nb_cpus * 100.0).clamp(0.0, 100.0);
             entry.mem_bytes = p.memory();
             entry.commit_bytes = Some(p.virtual_memory());
@@ -211,104 +278,41 @@ impl Sampler {
             entry.disk_read_total = du.total_read_bytes;
             entry.disk_write_total = du.total_written_bytes;
             entry.has_window = has_window;
-            entry.exe_path = p.exe().map(|e| e.to_path_buf());
-            entry.priority = process_ops::priority_class_of(pid_u);
-            entry.handles = process_ops::handle_count(pid_u);
-            entry.wow64 = process_ops::is_wow64(pid_u);
+            entry.exe_path = exe_owned;
             entry.threads = thread_counts.get(&pid_u).copied();
             processes.push(entry);
         }
 
-        // ---- App grouping (TM semantics) --------------------------------
+        // ---- slow-changing native attributes (cached, TTL-based) --------------
+        // Applied in a separate pass so the &mut self cache never overlaps
+        // the immutable sysinfo iteration above.
+        for p in processes.iter_mut() {
+            let a = self.attrs_for(p.pid);
+            p.session_id = a.session_id;
+            p.priority = a.priority;
+            p.handles = a.handles;
+            p.wow64 = a.wow64;
+            // System processes have no owning user; TM shows "SYSTEM".
+            if p.user.is_none() && a.session_id.is_some_and(|sid| sid == 0) {
+                p.user = Some("SYSTEM".to_string());
+            }
+        }
+
+        // ---- classification refinement + App grouping (TM semantics) -------------
         // Every process with a visible window is an app root; windowless
         // ancestors below system boundaries fold in ("Steam (2)" absorbs
         // steamwebhelper's window; Terminal absorbs its shell children).
         // The ancestor walk stops at windowed processes and at system
         // processes (svchost/services/...), matching Task Manager.
-        {
-            let idx_by_pid: HashMap<u32, usize> =
-                processes.iter().enumerate().map(|(i, p)| (p.pid, i)).collect();
-            let mut children: HashMap<usize, Vec<usize>> = HashMap::new();
-            for (i, p) in processes.iter().enumerate() {
-                if let Some(ppid) = p.ppid
-                    && ppid != p.pid
-                    && let Some(&pi) = idx_by_pid.get(&ppid)
-                {
-                    children.entry(pi).or_default().push(i);
-                }
-            }
-            let is_boundary = |name: &str| -> bool {
-                const SYSTEM: [&str; 12] = [
-                    "svchost.exe",
-                    "services.exe",
-                    "csrss.exe",
-                    "smss.exe",
-                    "wininit.exe",
-                    "winlogon.exe",
-                    "lsass.exe",
-                    "lsaiso.exe",
-                    "dwm.exe",
-                    "fontdrvhost.exe",
-                    "system",
-                    "registry",
-                ];
-                SYSTEM.iter().any(|s| name.eq_ignore_ascii_case(s))
-            };
-            // App roots: windowed processes walked up to the topmost
-            // non-windowed, non-system ancestor.
-            let mut roots: Vec<usize> = Vec::new();
-            for (i, p) in processes.iter().enumerate() {
-                if !p.has_window {
-                    continue;
-                }
-                let mut cur = i;
-                loop {
-                    let next = processes[cur]
-                        .ppid
-                        .and_then(|pp| idx_by_pid.get(&pp).copied());
-                    match next {
-                        Some(pi)
-                            if pi != cur
-                                && !processes[pi].has_window
-                                && !is_boundary(&processes[pi].name) =>
-                        {
-                            cur = pi;
-                        }
-                        _ => break,
-                    }
-                }
-                if !roots.contains(&cur) {
-                    roots.push(cur);
-                }
-            }
-            // Propagate App from roots down through descendants. Windowed
-            // children are roots themselves and are not descended into.
-            let root_set: std::collections::HashSet<usize> = roots.iter().copied().collect();
-            for &r in &root_set {
-                processes[r].app_root = true;
-            }
-            let mut stack: Vec<usize> = roots;
-            let mut seen: Vec<usize> = stack.clone();
-            while let Some(i) = stack.pop() {
-                processes[i].category = tm_category_app();
-                if let Some(kids) = children.get(&i) {
-                    for &k in kids {
-                        if !root_set.contains(&k) && !seen.contains(&k) {
-                            seen.push(k);
-                            stack.push(k);
-                        }
-                    }
-                }
-            }
-        }
+        refine_categories_and_group_apps(&mut processes);
 
         // ---- GPU ---------------------------------------------------------------
-        let gpu_adapters = gpu::adapters();
-        let (gpu_per_process, gpu_engines) = {
-            let pdh = &mut self.pdh;
-            let mut guard = pdh.lock();
-            (guard.process_gpu_stats(), guard.engine_stats())
-        };
+        // Static adapter info is probed once; it does not change at runtime.
+        if self.gpu_adapters.is_none() {
+            self.gpu_adapters = Some(gpu::adapters());
+        }
+        let gpu_adapters = self.gpu_adapters.as_deref().unwrap_or(&[]).to_vec();
+
         for e in processes.iter_mut() {
             if let Some(g) = gpu_per_process.as_ref().and_then(|m| m.get(&e.pid)) {
                 e.gpu_util_pct = Some(g.util_pct);
@@ -318,11 +322,6 @@ impl Sampler {
         let gpus = gpu::merge(gpu_adapters, gpu_engines);
 
         // ---- disks -----------------------------------------------------------------
-        let disk_perf = {
-            let pdh = &mut self.pdh;
-            let mut guard = pdh.lock();
-            guard.sample_disks()
-        };
         let mut disks = Vec::new();
         for d in self.disks.list() {
             let mount = d.mount_point().to_string_lossy().to_string();
@@ -351,7 +350,6 @@ impl Sampler {
             disks.push(DiskInfo {
                 id,
                 mount: mount.clone(),
-                // keep id assignment below
                 label: String::new(),
                 media,
                 total_bytes: d.total_space(),
@@ -393,10 +391,11 @@ impl Sampler {
                 ssid: None,
             });
         }
-        self.prev_net_totals = nets
-            .iter()
-            .map(|n| (n.name.clone(), (n.total_recv_bytes, n.total_sent_bytes)))
-            .collect();
+        self.prev_net_totals.clear();
+        for n in &nets {
+            self.prev_net_totals
+                .insert(n.name.clone(), (n.total_recv_bytes, n.total_sent_bytes));
+        }
 
         // ---- assemble --------------------------------------------------------------------
         let (handles_global, threads_global) = perfcounters::global_handle_thread_count();
@@ -404,20 +403,11 @@ impl Sampler {
             timestamp_ms: now_ms(),
             sample_duration_ms: started.elapsed().as_millis() as u64,
             cpu: CpuInfo {
-                brand: cpus
-                    .first()
-                    .map(|c| c.brand().to_string())
-                    .unwrap_or_default(),
-                vendor: cpus
-                    .first()
-                    .map(|c| c.vendor_id().to_string())
-                    .unwrap_or_default(),
+                brand: cpu_brand,
+                vendor: cpu_vendor,
                 architecture: std::env::consts::ARCH.to_string(),
                 utilization_pct: utilization.clamp(0.0, 100.0),
-                per_core_pct: cpus
-                    .iter()
-                    .map(|c| c.cpu_usage().clamp(0.0, 100.0))
-                    .collect(),
+                per_core_pct,
                 freq_mhz: freq,
                 freq_base_mhz: self.cpu_static.base_mhz,
                 logical_count: logical,
@@ -461,6 +451,125 @@ impl Sampler {
     }
 }
 
+/// Walk ancestors for each process (bounded hops, zero extra allocations —
+/// names are borrowed from the vec itself), then run the classifier with the
+/// real ancestor chain and fold app subtrees together.
+fn refine_categories_and_group_apps(processes: &mut [ProcessEntry]) {
+    // pid -> index for O(1) parent lookups.
+    let idx_by_pid: HashMap<u32, usize> = processes
+        .iter()
+        .enumerate()
+        .map(|(i, p)| (p.pid, i))
+        .collect();
+
+    // --- refined classification with real ancestors -------------------------
+    for i in 0..processes.len() {
+        let mut anc: Vec<&str> = Vec::new();
+        let mut cur_pid = processes[i].ppid;
+        let mut hops = 0usize;
+        while let Some(ppid) = cur_pid {
+            hops += 1;
+            if hops > 8 || ppid == processes[i].pid {
+                break;
+            }
+            match idx_by_pid.get(&ppid) {
+                Some(&j) => {
+                    anc.push(processes[j].name.as_str());
+                    cur_pid = processes[j].ppid;
+                }
+                None => break,
+            }
+        }
+        let name = processes[i].name.clone();
+        let input = classify::ClassifyInput {
+            pid: processes[i].pid,
+            name: &name,
+            ancestor_names: &anc,
+            has_window: processes[i].has_window,
+            system_session: processes[i].session_id.is_some_and(|s| s == 0),
+        };
+        let cat = classify::classify(input);
+        processes[i].category = cat;
+    }
+
+    // --- app-root grouping -----------------------------------------------
+    let children: HashMap<usize, Vec<usize>> = {
+        let mut m: HashMap<usize, Vec<usize>> = HashMap::new();
+        for (i, p) in processes.iter().enumerate() {
+            if let Some(ppid) = p.ppid
+                && ppid != p.pid
+                && let Some(&pi) = idx_by_pid.get(&ppid)
+            {
+                m.entry(pi).or_default().push(i);
+            }
+        }
+        m
+    };
+    let is_boundary = |name: &str| -> bool {
+        const SYSTEM: [&str; 12] = [
+            "svchost.exe",
+            "services.exe",
+            "csrss.exe",
+            "smss.exe",
+            "wininit.exe",
+            "winlogon.exe",
+            "lsass.exe",
+            "lsaiso.exe",
+            "dwm.exe",
+            "fontdrvhost.exe",
+            "system",
+            "registry",
+        ];
+        SYSTEM.iter().any(|s| name.eq_ignore_ascii_case(s))
+    };
+    // App roots: windowed processes walked up to the topmost
+    // non-windowed, non-system ancestor.
+    let mut roots: Vec<usize> = Vec::new();
+    for (i, p) in processes.iter().enumerate() {
+        if !p.has_window {
+            continue;
+        }
+        let mut cur = i;
+        loop {
+            let next = processes[cur]
+                .ppid
+                .and_then(|pp| idx_by_pid.get(&pp).copied());
+            match next {
+                Some(pi)
+                    if pi != cur
+                        && !processes[pi].has_window
+                        && !is_boundary(&processes[pi].name) =>
+                {
+                    cur = pi;
+                }
+                _ => break,
+            }
+        }
+        if !roots.contains(&cur) {
+            roots.push(cur);
+        }
+    }
+    // Propagate App from roots down through descendants. Windowed
+    // children are roots themselves and are not descended into.
+    let root_set: HashSet<usize> = roots.iter().copied().collect();
+    for &r in &root_set {
+        processes[r].app_root = true;
+    }
+    let mut stack: Vec<usize> = roots;
+    let mut seen: Vec<usize> = stack.clone();
+    while let Some(i) = stack.pop() {
+        processes[i].category = ProcCategory::App;
+        if let Some(kids) = children.get(&i) {
+            for &k in kids {
+                if !root_set.contains(&k) && !seen.contains(&k) {
+                    seen.push(k);
+                    stack.push(k);
+                }
+            }
+        }
+    }
+}
+
 fn build_user_map(users: &Users) -> HashMap<sysinfo::Uid, String> {
     let mut m = HashMap::new();
     for u in users.list() {
@@ -484,7 +593,9 @@ fn disk_id_for_mount(mount: &str) -> String {
 /// TM-style disk id "0 (C:)" from the PDH instance "0 C:".
 fn physical_disk_id(instance: &str, mount: &str) -> String {
     let num = instance.split_whitespace().next().unwrap_or("0");
-    let letter = mount.trim_end_matches([char::from_u32(92).unwrap(), '/']).to_uppercase();
+    let letter = mount
+        .trim_end_matches([char::from_u32(92).unwrap(), '/'])
+        .to_uppercase();
     format!("{num} ({letter})")
 }
 

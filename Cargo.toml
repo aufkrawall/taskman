@@ -12,13 +12,9 @@ license = "MIT"
 tm-core = { path = "crates/tm-core" }
 tm-platform = { path = "crates/tm-platform" }
 
-anyhow = "1"
-thiserror = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 dirs = "6"
-parking_lot = "0.12"
-crossbeam-channel = "0.5"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "local-time"] }
 tracing-appender = "0.2"

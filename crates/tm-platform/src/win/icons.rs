@@ -2,23 +2,23 @@
 //! RGBA so the GUI can upload them as egui textures. Mirrors what Task
 //! Manager shows in its process lists.
 
-use windows::core::PCWSTR;
+use windows::Win32::Graphics::Gdi::BI_RGB;
+use windows::Win32::Graphics::Gdi::BITMAPINFO;
+use windows::Win32::Graphics::Gdi::BITMAPINFOHEADER;
 use windows::Win32::Graphics::Gdi::CreateCompatibleDC;
+use windows::Win32::Graphics::Gdi::DIB_RGB_COLORS;
 use windows::Win32::Graphics::Gdi::DeleteDC;
 use windows::Win32::Graphics::Gdi::DeleteObject;
 use windows::Win32::Graphics::Gdi::GetBitmapBits;
 use windows::Win32::Graphics::Gdi::GetDIBits;
 use windows::Win32::Graphics::Gdi::SelectObject;
-use windows::Win32::Graphics::Gdi::BITMAPINFO;
-use windows::Win32::Graphics::Gdi::BITMAPINFOHEADER;
-use windows::Win32::Graphics::Gdi::BI_RGB;
-use windows::Win32::Graphics::Gdi::DIB_RGB_COLORS;
-use windows::Win32::UI::Shell::SHGetFileInfoW;
 use windows::Win32::UI::Shell::SHFILEINFOW;
 use windows::Win32::UI::Shell::SHGFI_ICON;
+use windows::Win32::UI::Shell::SHGetFileInfoW;
 use windows::Win32::UI::WindowsAndMessaging::DestroyIcon;
 use windows::Win32::UI::WindowsAndMessaging::GetIconInfoExW;
 use windows::Win32::UI::WindowsAndMessaging::ICONINFOEXW;
+use windows::core::PCWSTR;
 
 /// Decoded icon: converted to straight-alpha RGBA, `w*h*4` bytes.
 pub struct IconRgba {
@@ -150,7 +150,8 @@ unsafe fn bitmap_to_rgba(
             let mdc = CreateCompatibleDC(None);
             let mold = SelectObject(mdc, mask.into());
             mask_bits = vec![0u8; mask_stride * h as usize];
-            let got: i32 = GetBitmapBits(mask, mask_bits.len() as i32, mask_bits.as_mut_ptr().cast());
+            let got: i32 =
+                GetBitmapBits(mask, mask_bits.len() as i32, mask_bits.as_mut_ptr().cast());
             SelectObject(mdc, mold);
             let _ = DeleteDC(mdc);
             if got == 0 {

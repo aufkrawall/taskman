@@ -48,6 +48,7 @@ struct Counter {
     kind: CounterKind,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum CounterKind {
     GpuEngine,
     GpuProcMem,
@@ -63,9 +64,11 @@ pub struct Pdh {
     counters: Vec<Counter>,
     gpu_available: bool,
     disk_available: bool,
-    last_collect: Option<std::time::Instant>,
     /// True after two collections — required for rate-type counters.
     warm: bool,
+    collections_done: u32,
+    /// Reused transfer buffer for `PdhGetFormattedCounterArrayW`.
+    scratch: Vec<u8>,
 }
 
 // SAFETY: PDH handles are process-global and only used from the engine thread
@@ -79,17 +82,18 @@ impl Default for Pdh {
 }
 
 impl Pdh {
+    /// Cheap constructor — the actual query is opened lazily on first use so
+    /// process startup does not pay the counter-registration cost.
     pub fn new() -> Self {
-        let mut pdh = Self {
+        Self {
             warm: false,
             query: None,
             counters: Vec::new(),
             gpu_available: true,
             disk_available: true,
-            last_collect: None,
-        };
-        pdh.try_open();
-        pdh
+            collections_done: 0,
+            scratch: Vec::new(),
+        }
     }
 
     fn try_open(&mut self) {
@@ -155,38 +159,37 @@ impl Pdh {
             self.query = Some(q);
             self.counters = counters;
             self.warm = false;
-            self.last_collect = None;
+            self.collections_done = 0;
         }
     }
 
-    /// Collect once per tick; subsequent reads reuse the collected data.
-    fn collect(&mut self) -> bool {
+    /// Collect exactly once per sampling tick; all subsequent reads in that
+    /// tick reuse the collected data. Returns false while unavailable/warming.
+    pub fn collect_once(&mut self) -> bool {
+        if !self.gpu_available && !self.disk_available {
+            return false;
+        }
+        self.try_open();
         let Some(q) = self.query else { return false };
         unsafe {
             if PdhCollectQueryData(q) != 0 {
                 return false;
             }
         }
+        self.collections_done = self.collections_done.saturating_add(1);
         if !self.warm {
-            if self.last_collect.is_some() {
-                // Second collection makes rate counters produce valid values.
-                unsafe {
-                    if PdhCollectQueryData(q) != 0 {
-                        return false;
-                    }
-                }
+            // Rate counters need two samples before values are valid.
+            if self.collections_done >= 2 {
                 self.warm = true;
             } else {
-                self.last_collect = Some(std::time::Instant::now());
                 return false;
             }
         }
-        self.last_collect = Some(std::time::Instant::now());
         true
     }
 
     fn read_pairs(
-        &self,
+        &mut self,
         counter_handle: windows::Win32::System::Performance::PDH_HCOUNTER,
     ) -> Vec<(String, f64)> {
         let mut out = Vec::new();
@@ -203,7 +206,11 @@ impl Pdh {
             if size == 0 {
                 return out;
             }
-            let mut buf = vec![0u8; size as usize];
+            // Reuse the scratch buffer across counter reads (same tick and
+            // across ticks) to avoid a heap allocation per counter.
+            self.scratch.clear();
+            self.scratch.resize(size as usize, 0);
+            let buf = &mut self.scratch;
             let mut count2: u32 = 0;
             let status = PdhGetFormattedCounterArrayW(
                 counter_handle,
@@ -228,19 +235,23 @@ impl Pdh {
         out
     }
 
-    pub fn process_gpu_stats(&mut self) -> Option<HashMap<u32, GpuProc>> {
-        if !self.gpu_available {
-            return None;
-        }
-        self.try_open();
-        if !self.collect() {
+    /// Snapshot of `(handle, kind)` pairs so counter reads can borrow `self`
+    /// mutably (scratch buffer) without conflicting with the counters list.
+    fn counter_list(&self) -> Vec<(PDH_HCOUNTER, CounterKind)> {
+        self.counters.iter().map(|c| (c.handle, c.kind)).collect()
+    }
+
+    /// Per-process GPU stats from data already collected this tick via
+    /// [`collect_once`]. Returns None when GPU counters are unavailable.
+    pub fn read_gpu_process_stats(&mut self) -> Option<HashMap<u32, GpuProc>> {
+        if !self.gpu_available || !self.warm {
             return None;
         }
         let mut map: HashMap<u32, GpuProc> = HashMap::new();
-        for c in &self.counters {
-            match c.kind {
+        for (handle, kind) in self.counter_list() {
+            match kind {
                 CounterKind::GpuEngine => {
-                    for (name, v) in self.read_pairs(c.handle) {
+                    for (name, v) in self.read_pairs(handle) {
                         if let Some(pid) = parse_instance_pid(&name) {
                             let e = map.entry(pid).or_default();
                             e.util_pct += v as f32;
@@ -248,7 +259,7 @@ impl Pdh {
                     }
                 }
                 CounterKind::GpuProcMem => {
-                    for (name, v) in self.read_pairs(c.handle) {
+                    for (name, v) in self.read_pairs(handle) {
                         if let Some(pid) = parse_instance_pid(&name) {
                             let e = map.entry(pid).or_default();
                             e.mem_bytes += v.max(0.0) as u64;
@@ -265,16 +276,16 @@ impl Pdh {
     }
 
     /// Engine utilization aggregated by engine type across all GPUs.
-    pub fn engine_stats(&mut self) -> Vec<tm_core::model::GpuEngine> {
-        if !self.gpu_available {
+    pub fn read_engine_stats(&mut self) -> Vec<tm_core::model::GpuEngine> {
+        if !self.gpu_available || !self.warm {
             return Vec::new();
         }
         let mut totals: HashMap<String, f32> = HashMap::new();
-        for c in &self.counters {
-            if !matches!(c.kind, CounterKind::GpuEngine) {
+        for (handle, kind) in self.counter_list() {
+            if kind != CounterKind::GpuEngine {
                 continue;
             }
-            for (name, v) in self.read_pairs(c.handle) {
+            for (name, v) in self.read_pairs(handle) {
                 let eng = parse_engtype(&name).unwrap_or_else(|| "Other".into());
                 *totals.entry(eng).or_insert(0.0) += v as f32;
             }
@@ -295,37 +306,34 @@ impl Pdh {
         out
     }
 
-    pub fn sample_disks(&mut self) -> Vec<DiskPerf> {
-        if !self.disk_available {
-            return Vec::new();
-        }
-        self.try_open();
-        if !self.collect() {
+    /// Disk performance samples from data already collected this tick.
+    pub fn read_disks(&mut self) -> Vec<DiskPerf> {
+        if !self.disk_available || !self.warm {
             return Vec::new();
         }
         let mut idle: HashMap<String, f64> = HashMap::new();
         let mut read: HashMap<String, f64> = HashMap::new();
         let mut write: HashMap<String, f64> = HashMap::new();
         let mut sec: HashMap<String, f64> = HashMap::new();
-        for c in &self.counters {
-            match c.kind {
+        for (handle, kind) in self.counter_list() {
+            match kind {
                 CounterKind::DiskIdle => {
-                    for (n, v) in self.read_pairs(c.handle) {
+                    for (n, v) in self.read_pairs(handle) {
                         idle.insert(n, v);
                     }
                 }
                 CounterKind::DiskRead => {
-                    for (n, v) in self.read_pairs(c.handle) {
+                    for (n, v) in self.read_pairs(handle) {
                         read.insert(n, v);
                     }
                 }
                 CounterKind::DiskWrite => {
-                    for (n, v) in self.read_pairs(c.handle) {
+                    for (n, v) in self.read_pairs(handle) {
                         write.insert(n, v);
                     }
                 }
                 CounterKind::DiskSec => {
-                    for (n, v) in self.read_pairs(c.handle) {
+                    for (n, v) in self.read_pairs(handle) {
                         sec.insert(n, v);
                     }
                 }

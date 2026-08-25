@@ -3,7 +3,7 @@
 mod cpu_info;
 mod gpu;
 pub mod icons;
-mod version;
+pub mod locale;
 mod perfcounters;
 mod process_ops;
 mod sampler;
@@ -11,6 +11,7 @@ mod services;
 mod startup;
 mod threads_map;
 pub(crate) mod users;
+mod version;
 mod windows_enum;
 
 use crate::actions::*;
@@ -22,12 +23,15 @@ use tm_core::model::*;
 /// Manager shows as "Letzte BIOS-Zeit". Registry: FwPOSTTime under Session
 /// Manager\Power (0/missing = unknown).
 pub fn last_bios_time_ms() -> Option<u64> {
-    use windows::Win32::System::Registry::{RegGetValueW, HKEY_LOCAL_MACHINE, RRF_RT_REG_DWORD};
+    use windows::Win32::System::Registry::{HKEY_LOCAL_MACHINE, RRF_RT_REG_DWORD, RegGetValueW};
     let sub: Vec<u16> = "SYSTEM\x5cCurrentControlSet\x5cControl\x5cSession Manager\x5cPower"
         .encode_utf16()
         .chain(std::iter::once(0))
         .collect();
-    let value: Vec<u16> = "FwPOSTTime".encode_utf16().chain(std::iter::once(0)).collect();
+    let value: Vec<u16> = "FwPOSTTime"
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
     let mut data: u32 = 0;
     let mut size = std::mem::size_of::<u32>() as u32;
     let rc = unsafe {
@@ -140,6 +144,18 @@ impl PlatformActions for WinActions {
     fn relaunch_elevated(&self) -> Result<()> {
         process_ops::relaunch_elevated()
     }
+    fn create_dump_file(&self, pid: u32, path: &std::path::Path) -> Result<()> {
+        process_ops::create_dump_file(pid, path)
+    }
+    fn open_file_location(&self, path: &str) -> Result<()> {
+        process_ops::open_file_location(path)
+    }
+    fn open_properties(&self, path: &str) -> Result<()> {
+        process_ops::open_properties(path)
+    }
+    fn open_url(&self, url: &str) -> Result<()> {
+        process_ops::open_url(url)
+    }
 
     fn last_bios_time_ms(&self) -> Option<u64> {
         last_bios_time_ms()
@@ -153,8 +169,6 @@ impl PlatformActions for WinActions {
         "win32"
     }
 }
-
-
 
 pub fn create() -> (WinCollector, WinActions) {
     (

@@ -66,13 +66,50 @@ powershell -NoProfile -ExecutionPolicy Bypass -File bench/bench-window-ms.ps1 <a
 ## Final app measurements (v2, full Task-Manager UI)
 
 Same machine, `cargo build --release` (fat LTO, strip=symbols, panic=abort).
-Startup = spawn → `MainWindowHandle` (40 ms polling), single run.
+Startup = spawn → `MainWindowHandle` (40 ms polling), median of 4 runs.
 
-| Build                        | Binary    | Startup-to-window |
-|------------------------------|-----------|-------------------|
-| default (wgpu + glow)        | 11.9 MB   | ~0.5–0.7 s        |
-| `--no-default-features --features glow` | 7.2 MB | ~0.5–0.6 s  |
+| Build                        | Binary    | Startup-to-window | Working set |
+|------------------------------|-----------|-------------------|-------------|
+| default (wgpu + glow)        | 12.5 MB   | ~0.55–0.60 s      | ~28 MB      |
+| `--no-default-features --features glow` | 7.6 MB | ~0.55–0.60 s | ~28 MB      |
 
 The glow-only build is the size-optimized option (`cargo build --release
 --no-default-features --features glow`); both stay well under the 1 s budget
-while sampling ~240 processes at 1 Hz in the background.
+while sampling ~280 processes at 1 Hz in the background.
+
+## v3 performance pass (this tree)
+
+Same machine/method as above, HEAD vs this tree, default (wgpu+glow) builds:
+
+| Metric                       | HEAD        | v3          | Δ            |
+|------------------------------|-------------|-------------|--------------|
+| Startup-to-window (median)   | ~586 ms     | ~546 ms     | −40 ms       |
+| Working set at window        | ~30 MB      | ~28 MB      | −2 MB        |
+| Binary (default)             | 12.46 MB    | 12.53 MB    | +0.6 %       |
+| Binary (glow-only)           | 7.52 MB     | 7.60 MB     | +1 %         |
+| Direct dependencies          | 4 more      | −4          | see below    |
+| Sampling tick (280 procs)    | —           | 40–55 ms    | 1 Hz budget  |
+| Services enumeration         | UI thread   | worker, ~1 ms SCM + enrich | no UI stall |
+
+Changes behind the numbers:
+
+* **No UI-thread blocking**: services/startup/users lists, service
+  start/stop/restart waits (up to 15 s!), "Neuen Task ausführen" (500 ms),
+  F5 refresh (up to 10 s), icon extraction and app-history autosave all run
+  on worker threads now; results arrive via channels/toasts.
+* **Sampler hot path**: PDH collected once per tick (was twice), DXGI adapter
+  probe cached, per-pid native attribute queries (session id/WOW64/priority/
+  handles) cached with a 10-tick TTL instead of ~4 syscalls × 280 procs/tick,
+  ancestor walk without per-hop `String` clones, cheap `Sampler::new` (heavy
+  init moved to the engine thread → window appears sooner).
+* **Per-frame**: Performance-tab charts read the history tail without cloning
+  it, Details sort comparator allocates nothing, Users-tab debug print removed,
+  process-tree aggregation is iterative + cycle-safe (was recursive).
+* **Dependencies dropped** (all replaced with std, no side effects):
+  `egui_extras` (was entirely unused), `crossbeam-channel` (→ `std::sync::mpsc`
+  + `recv_timeout`), `parking_lot` (→ `std::sync` with poison-tolerant
+  helpers), `thiserror` (hand-written impls). Binary size stays flat because
+  the new worker-thread code offsets the removals.
+* **Settings switches** apply and persist instantly (atomic JSON write per
+  change); new UI-zoom switch (80–125 %) wired to the previously dead
+  `ui_zoom` setting.

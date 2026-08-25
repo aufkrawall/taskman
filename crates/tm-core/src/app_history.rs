@@ -150,18 +150,32 @@ impl AppHistoryDb {
         self.prev = next_prev;
     }
 
-    pub fn save(&self) {
-        let Some(path) = &self.path else { return };
+    /// Serialize + write on a background thread (periodic autosave). The
+    /// caller never blocks; ordering is best-effort, which is fine for a
+    /// cumulative stats file that is also saved synchronously on exit.
+    pub fn save_async(&self) {
+        let Some(path) = self.path.clone() else {
+            return;
+        };
         let file = DbFile {
             since_epoch_s: self.since_epoch_s,
             entries: self.entries.clone(),
         };
+        let spawned = std::thread::Builder::new()
+            .name("tm-hist-save".into())
+            .spawn(move || Self::write_atomic(&path, &file));
+        if let Err(e) = spawned {
+            tracing::warn!(error = %e, "failed to spawn app-history writer");
+        }
+    }
+
+    fn write_atomic(path: &std::path::Path, file: &DbFile) {
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
         let tmp = path.with_extension("json.tmp");
         match std::fs::File::create(&tmp).and_then(|mut f| {
-            serde_json::to_writer(&mut f, &file)?;
+            serde_json::to_writer(&mut f, file)?;
             f.flush()
         }) {
             Ok(()) => {
@@ -171,6 +185,15 @@ impl AppHistoryDb {
             }
             Err(e) => tracing::warn!(error = %e, "failed to write app-history db"),
         }
+    }
+
+    pub fn save(&self) {
+        let Some(path) = &self.path else { return };
+        let file = DbFile {
+            since_epoch_s: self.since_epoch_s,
+            entries: self.entries.clone(),
+        };
+        Self::write_atomic(path, &file);
     }
 }
 

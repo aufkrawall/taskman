@@ -1,6 +1,7 @@
 //! User settings with atomic JSON persistence.
 
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -31,15 +32,6 @@ impl UpdateSpeed {
             UpdateSpeed::Paused => std::time::Duration::from_secs(3600),
         }
     }
-
-    pub fn label(self) -> &'static str {
-        match self {
-            UpdateSpeed::High => "High (0.5 s)",
-            UpdateSpeed::Normal => "Normal (1 s)",
-            UpdateSpeed::Low => "Low (4 s)",
-            UpdateSpeed::Paused => "Paused",
-        }
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -59,6 +51,12 @@ pub struct Settings {
     pub show_net_column_anyway: bool,
     /// Navigation rail collapsed to icons only (hamburger toggle).
     pub sidebar_collapsed: bool,
+    /// UI language; `System` follows the OS display language.
+    pub language: crate::i18n::LangChoice,
+    /// User-resized column widths per table (`table id -> widths`).
+    pub col_widths: BTreeMap<String, Vec<f32>>,
+    /// Width of the Performance tab's left card column.
+    pub perf_card_width: f32,
 }
 
 impl Default for Settings {
@@ -73,6 +71,9 @@ impl Default for Settings {
             window_size: [1100.0, 720.0],
             show_net_column_anyway: true,
             sidebar_collapsed: false,
+            language: Default::default(),
+            col_widths: BTreeMap::new(),
+            perf_card_width: 252.0,
         }
     }
 }
@@ -85,19 +86,24 @@ impl Settings {
     /// Load settings from `path` (or the platform default). A missing file
     /// yields defaults; a corrupt file is renamed aside and defaults returned.
     pub fn load_from(path: &Path) -> Self {
-        match std::fs::read_to_string(path) {
-            Ok(text) => match serde_json::from_str(&text) {
-                Ok(s) => {
-                    tracing::debug!(path = %path.display(), "settings loaded");
-                    s
+        match std::fs::read(path) {
+            Ok(bytes) => {
+                // Tolerate a UTF-8 BOM (e.g. files edited with PowerShell).
+                let text = String::from_utf8_lossy(&bytes);
+                let text = text.strip_prefix('\u{feff}').unwrap_or(&text);
+                match serde_json::from_str(text) {
+                    Ok(s) => {
+                        tracing::debug!(path = %path.display(), "settings loaded");
+                        s
+                    }
+                    Err(e) => {
+                        tracing::warn!(path = %path.display(), error = %e, "settings corrupt; using defaults");
+                        let bak = path.with_extension("json.bad");
+                        let _ = std::fs::rename(path, bak);
+                        Self::default()
+                    }
                 }
-                Err(e) => {
-                    tracing::warn!(path = %path.display(), error = %e, "settings corrupt; using defaults");
-                    let bak = path.with_extension("json.bad");
-                    let _ = std::fs::rename(path, bak);
-                    Self::default()
-                }
-            },
+            }
             Err(_) => {
                 tracing::debug!(path = %path.display(), "no settings file yet; using defaults");
                 Self::default()

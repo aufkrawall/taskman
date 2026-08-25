@@ -3,19 +3,19 @@
 //! column. Cached per path — version info never changes at runtime.
 
 use std::collections::HashMap;
-use parking_lot::Mutex as PlMutex;
-use windows::core::PCWSTR;
+use std::sync::Mutex;
 use windows::Win32::Storage::FileSystem::{
     GetFileVersionInfoSizeW, GetFileVersionInfoW, VerQueryValueW,
 };
+use windows::core::PCWSTR;
 
-static CACHE: PlMutex<Option<HashMap<String, [String; 2]>>> = PlMutex::new(None);
+static CACHE: Mutex<Option<HashMap<String, [String; 2]>>> = Mutex::new(None);
 
 /// (file description, company name) for an executable; empty strings when
 /// unavailable. Results are cached process-wide.
 pub fn query(path: &str) -> [String; 2] {
     {
-        let guard = CACHE.lock();
+        let guard = tm_core::sync::lock(&CACHE);
         if let Some(map) = guard.as_ref()
             && let Some(v) = map.get(path)
         {
@@ -23,7 +23,7 @@ pub fn query(path: &str) -> [String; 2] {
         }
     }
     let result = query_uncached(path);
-    let mut guard = CACHE.lock();
+    let mut guard = tm_core::sync::lock(&CACHE);
     guard
         .get_or_insert_with(HashMap::new)
         .insert(path.to_string(), result.clone());

@@ -5,7 +5,8 @@ param(
     [Parameter(Mandatory=$true)][string]$Out,
     [int]$WaitSeconds = 6,
     [int]$Width = 1600,
-    [int]$Height = 900
+    [int]$Height = 900,
+    [string]$Lang = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -70,8 +71,9 @@ public class WinEnum {
 $settingsDir = Join-Path $env:LOCALAPPDATA "taskman"
 New-Item -ItemType Directory -Force -Path $settingsDir | Out-Null
 $settingsPath = Join-Path $settingsDir "settings.json"
-@{ window_size = @($Width, $Height); theme = "Dark"; update_speed = "High"; graph_seconds = 60; always_on_top = $false } |
-    ConvertTo-Json | Set-Content -Path $settingsPath -Encoding UTF8
+$seed = @{ window_size = @($Width, $Height); theme = "Dark"; update_speed = "High"; graph_seconds = 60; always_on_top = $false }
+if ($Lang -ne "") { $seed.language = $Lang }
+$seed | ConvertTo-Json | Set-Content -Path $settingsPath -Encoding UTF8
 
 $p = Start-Process -FilePath $exe -ArgumentList "--tab=$Tab" -PassThru -WindowStyle Minimized
 $hwnd = [IntPtr]::Zero
@@ -79,6 +81,7 @@ for ($i = 0; $i -lt 150; $i++) {
     Start-Sleep -Milliseconds 200
     if ($p.HasExited) { throw "taskman exited early with code $($p.ExitCode)" }
     $hwnd = [WinEnum]::FindByTitle("Task-Manager")
+    if ($hwnd -eq [IntPtr]::Zero) { $hwnd = [WinEnum]::FindByTitle("Task Manager") }
     if ($hwnd -ne [IntPtr]::Zero) { break }
 }
 if ($hwnd -eq [IntPtr]::Zero) { Stop-Process -Id $p.Id -Force; throw "no window appeared" }

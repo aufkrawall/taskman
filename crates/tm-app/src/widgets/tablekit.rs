@@ -1,8 +1,8 @@
 //! Task-Manager-style table building blocks: bordered two-line headers with
 //! aggregate values, full-row selection, blue heat-mapped value cells,
-//! chevrons and sort carets.
+//! chevrons, sort carets — and user-resizable column widths.
 
-use eframe::egui::{self, Align2, Color32, FontId, Pos2, Rect, Sense, Stroke};
+use eframe::egui::{self, Align2, Color32, CursorIcon, FontId, Pos2, Rect, Sense, Stroke};
 use tm_core::format;
 
 use crate::icons;
@@ -15,33 +15,96 @@ pub const HEADER_H: f32 = 56.0;
 /// Header height for single-line headers (Details/Services/Startup).
 pub const HEADER_H1: f32 = 30.0;
 
+/// Hard limits for user-resized columns.
+const MIN_COL_W: f32 = 40.0;
+const MAX_COL_W: f32 = 1200.0;
+
+/// Available width for a full-width table: a few px of safety margin so the
+/// last column's right-aligned labels never touch the window border.
+pub fn table_avail(ui: &egui::Ui) -> f32 {
+    (ui.available_width() - 6.0).max(300.0)
+}
+
 #[derive(Debug, Clone)]
 pub struct TmColumn {
     pub id: &'static str,
     pub label: &'static str,
     pub width: f32,
+    /// Built-in width (double-click on the separator restores it).
+    pub default_w: f32,
     /// Numeric columns get a right-aligned two-line header (aggregate on top).
     pub numeric: bool,
 }
 
 impl TmColumn {
     pub const fn text(id: &'static str, label: &'static str, width: f32) -> Self {
-        Self { id, label, width, numeric: false }
+        Self {
+            id,
+            label,
+            width,
+            default_w: width,
+            numeric: false,
+        }
     }
     pub const fn num(id: &'static str, label: &'static str, width: f32) -> Self {
-        Self { id, label, width, numeric: true }
+        Self {
+            id,
+            label,
+            width,
+            default_w: width,
+            numeric: true,
+        }
     }
 }
 
 pub struct TmTable {
+    /// Stable id used for persisting resized widths in the settings file.
+    pub id: &'static str,
     pub cols: Vec<TmColumn>,
     /// Minimum width of the flexible first (name) column.
     pub name_min: f32,
+    /// A width was modified since the last [`Self::take_persist`].
+    dirty: bool,
+    /// Whether any resize handle was being dragged during the last header().
+    dragging: bool,
 }
 
 impl TmTable {
-    pub fn new(cols: Vec<TmColumn>, name_min: f32) -> Self {
-        Self { cols, name_min }
+    /// Build a table, restoring previously saved widths for the non-name
+    /// columns when available.
+    pub fn new(id: &'static str, cols: Vec<TmColumn>, saved: Option<&[f32]>, name_min: f32) -> Self {
+        let mut t = Self {
+            id,
+            cols,
+            name_min,
+            dirty: false,
+            dragging: false,
+        };
+        if let Some(saved) = saved {
+            for (c, w) in t.cols.iter_mut().skip(1).zip(saved.iter()) {
+                if *w >= MIN_COL_W && *w <= MAX_COL_W {
+                    c.width = *w;
+                }
+            }
+        }
+        t
+    }
+
+    /// Current widths of the non-name columns (for persistence).
+    pub fn stored_widths(&self) -> Vec<f32> {
+        self.cols.iter().skip(1).map(|c| c.width).collect()
+    }
+
+    /// Returns the widths to persist exactly once per completed resize drag
+    /// (`still_dragging` comes from [`Self::dragging`], read right after
+    /// `header`).
+    pub fn take_persist(&mut self, still_dragging: bool) -> Option<Vec<f32>> {
+        if self.dirty && !still_dragging {
+            self.dirty = false;
+            Some(self.stored_widths())
+        } else {
+            None
+        }
     }
 
     /// Resolved width of the name (first) column given the available width.
@@ -69,33 +132,68 @@ impl TmTable {
 
     fn numeric_span(&self, avail: f32, row: Rect, from: usize) -> Rect {
         let left = self.col_rect(from, avail, row).left();
-        Rect::from_min_max(Pos2::new(left, row.top()), Pos2::new(row.right(), row.bottom()))
+        Rect::from_min_max(
+            Pos2::new(left, row.top()),
+            Pos2::new(row.right(), row.bottom()),
+        )
     }
 
-    /// Paint the header. Returns the clicked column index.
+    /// Left-edge x of column `i` inside `rect`.
+    fn boundary_x(&self, rect: Rect, avail: f32, i: usize) -> f32 {
+        let name_w = self.name_width(avail);
+        let mut x = rect.left();
+        for (ci, c) in self.cols.iter().enumerate() {
+            if ci == i {
+                break;
+            }
+            x += if ci == 0 { name_w } else { c.width };
+        }
+        x
+    }
+
+    /// Paint the header. Returns the clicked column index (for sorting).
+    ///
+    /// Every boundary right of the first (name) column carries an invisible
+    /// drag handle: drag to resize, double-click to restore the built-in
+    /// default width. The name column stays elastic and absorbs differences,
+    /// so the table always fills the window without horizontal scrolling.
     pub fn header(
-        &self,
+        &mut self,
         ui: &mut egui::Ui,
         pal: &Palette,
         avail: f32,
         sort: Option<(usize, bool)>,
         aggregates: Option<&[String]>,
     ) -> Option<usize> {
-        let h = if aggregates.is_some() { HEADER_H } else { HEADER_H1 };
+        let h = if aggregates.is_some() {
+            HEADER_H
+        } else {
+            HEADER_H1
+        };
+        let table_id = egui::Id::new(("tmtable", self.id));
         let total_w = self.total_width(avail);
         let (rect, _) = ui.allocate_exact_size(egui::vec2(total_w, h), Sense::hover());
         let painter = ui.painter_at(rect.expand(2.0));
         let name_w = self.name_width(avail);
         let mut clicked = None;
+        let mut dragging_now = false;
         let mut x = rect.left();
         let mut agg_idx = 0usize;
 
+        // Snapshot boundaries before any mutation this frame.
+        let bounds: Vec<f32> = (0..self.cols.len())
+            .map(|i| self.boundary_x(rect, avail, i))
+            .collect();
+        // Handle responses collected during painting, applied afterwards.
+        let mut resize_hits: Vec<(usize, egui::Response)> = Vec::new();
+
         for (i, col) in self.cols.iter().enumerate() {
             let w = if i == 0 { name_w } else { col.width };
-            let cell = Rect::from_min_max(Pos2::new(x, rect.top()), Pos2::new(x + w, rect.bottom()));
+            let cell =
+                Rect::from_min_max(Pos2::new(x, rect.top()), Pos2::new(x + w, rect.bottom()));
 
             // Hover + click.
-            let resp = ui.interact(cell, egui::Id::new(("hdr", col.id)), Sense::click());
+            let resp = ui.interact(cell, table_id.with(("hdr", col.id)), Sense::click());
             if resp.hovered() {
                 painter.rect_filled(cell, 0.0, Color32::from_white_alpha(6));
             }
@@ -106,21 +204,35 @@ impl TmTable {
             // Vertical separators between header cells + bottom border.
             if i > 0 {
                 painter.line_segment(
-                    [Pos2::new(x, rect.top() + 4.0), Pos2::new(x, rect.bottom() - 4.0)],
+                    [
+                        Pos2::new(x, rect.top() + 4.0),
+                        Pos2::new(x, rect.bottom() - 4.0),
+                    ],
                     Stroke::new(1.0, pal.stroke),
                 );
             }
 
             let two_line = aggregates.is_some() && col.numeric;
-            let label_y = if two_line { cell.bottom() - 14.0 } else { cell.center().y };
-            let align = if col.numeric { Align2::RIGHT_CENTER } else { Align2::LEFT_CENTER };
-            let tx = if col.numeric { cell.right() - 10.0 } else { cell.left() + 10.0 };
+            let label_y = if two_line {
+                cell.bottom() - 14.0
+            } else {
+                cell.center().y
+            };
+            let align = if col.numeric {
+                Align2::RIGHT_CENTER
+            } else {
+                Align2::LEFT_CENTER
+            };
+            let tx = if col.numeric {
+                cell.right() - 10.0
+            } else {
+                cell.left() + 10.0
+            };
             if col.numeric {
                 agg_idx += 1;
             }
 
-            // Aggregate value above numeric labels (agg_idx-1 indexes the
-            // aggregates slice for this numeric column).
+            // Aggregate value above numeric labels.
             if two_line
                 && agg_idx > 0
                 && let Some(agg) = aggregates.and_then(|a| a.get(agg_idx - 1))
@@ -136,23 +248,32 @@ impl TmTable {
 
             // Sort caret above the label of the sorted column.
             if let Some((si, asc)) = sort
-                && si == i {
-                    let cx = if col.numeric { cell.right() - 16.0 } else { cell.center().x };
-                    let cy = if two_line { cell.top() + 14.0 } else { cell.top() + 10.0 };
-                    if two_line
-                        && agg_idx > 0
-                        && let Some(agg) = aggregates.and_then(|a| a.get(agg_idx - 1))
-                    {
-                        painter.text(
-                            Pos2::new(cell.right() - 26.0, cell.top() + 14.0),
-                            Align2::RIGHT_CENTER,
-                            agg,
-                            FontId::proportional(12.5),
-                            pal.text,
-                        );
-                    }
-                    caret(painter.clone(), Pos2::new(cx, cy), asc, pal.text_dim);
+                && si == i
+            {
+                let cx = if col.numeric {
+                    cell.right() - 16.0
+                } else {
+                    cell.center().x
+                };
+                let cy = if two_line {
+                    cell.top() + 14.0
+                } else {
+                    cell.top() + 10.0
+                };
+                if two_line
+                    && agg_idx > 0
+                    && let Some(agg) = aggregates.and_then(|a| a.get(agg_idx - 1))
+                {
+                    painter.text(
+                        Pos2::new(cell.right() - 26.0, cell.top() + 14.0),
+                        Align2::RIGHT_CENTER,
+                        agg,
+                        FontId::proportional(12.5),
+                        pal.text,
+                    );
                 }
+                caret(painter.clone(), Pos2::new(cx, cy), asc, pal.text_dim);
+            }
 
             painter.text(
                 Pos2::new(tx, label_y),
@@ -161,12 +282,59 @@ impl TmTable {
                 FontId::proportional(12.5),
                 pal.text_dim,
             );
+
+            // ---- resize handle on this column's LEFT edge (never on the
+            // name column, whose width is elastic).
+            if i >= 1 {
+                let bx = bounds[i];
+                let handle = Rect::from_min_max(
+                    Pos2::new(bx - 5.0, rect.top()),
+                    Pos2::new(bx + 5.0, rect.bottom()),
+                );
+                let rresp = ui.interact(handle, table_id.with(("resize", col.id)), Sense::drag());
+                if rresp.hovered() || rresp.dragged() {
+                    ui.ctx().set_cursor_icon(CursorIcon::ResizeHorizontal);
+                }
+                resize_hits.push((i, rresp));
+            }
+
             x += w;
+        }
+
+        // Apply resize results now that painting borrowed nothing mutable.
+        for (i, rresp) in resize_hits {
+            if rresp.dragged() {
+                dragging_now = true;
+            }
+            let dx = rresp.drag_delta().x;
+            let col = &mut self.cols[i];
+            if dx != 0.0 {
+                col.width = (col.width + dx).clamp(MIN_COL_W, MAX_COL_W);
+                self.dirty = true;
+                dragging_now = true;
+            }
+            if rresp.double_clicked() {
+                col.width = col.default_w.clamp(MIN_COL_W, MAX_COL_W);
+                self.dirty = true;
+            }
+            // Subtle affordance: brighten hovered separators.
+            if rresp.hovered() && !rresp.dragged() {
+                painter.line_segment(
+                    [
+                        Pos2::new(bounds[i], rect.top() + 3.0),
+                        Pos2::new(bounds[i], rect.bottom() - 3.0),
+                    ],
+                    Stroke::new(1.5, pal.accent.gamma_multiply(0.6)),
+                );
+            }
         }
 
         // Bottom border of the header + box around the name cell (TM look).
         painter.line_segment(
-            [Pos2::new(rect.left(), rect.bottom()), Pos2::new(rect.right(), rect.bottom())],
+            [
+                Pos2::new(rect.left(), rect.bottom()),
+                Pos2::new(rect.right(), rect.bottom()),
+            ],
             Stroke::new(1.0, pal.stroke),
         );
         painter.rect_stroke(
@@ -175,10 +343,17 @@ impl TmTable {
             Stroke::new(1.0, pal.stroke),
             egui::StrokeKind::Inside,
         );
+
+        self.dragging = dragging_now;
         clicked
     }
 
-    /// Allocate + paint a row background. Returns the row rect and response.
+    /// Whether a resize drag is in progress (call after `header`).
+    pub fn dragging(&self) -> bool {
+        self.dragging
+    }
+
+    /// Paint a row background. Returns the row rect and response.
     pub fn row(
         &self,
         ui: &mut egui::Ui,
@@ -276,7 +451,11 @@ impl TmTable {
             Sense::click(),
         );
         if enabled {
-            let icon = if expanded { icons::Icon::ChevronDown } else { icons::Icon::ChevronRight };
+            let icon = if expanded {
+                icons::Icon::ChevronDown
+            } else {
+                icons::Icon::ChevronRight
+            };
             let mut r = hit;
             r.set_left(c.x - 9.0);
             r.set_right(c.x + 9.0);
@@ -327,7 +506,11 @@ pub fn caret(painter: egui::Painter, c: Pos2, ascending: bool, color: Color32) {
             Pos2::new(c.x, c.y + 3.0),
         )
     };
-    painter.add(egui::Shape::convex_polygon(vec![a, b, t], color, Stroke::NONE));
+    painter.add(egui::Shape::convex_polygon(
+        vec![a, b, t],
+        color,
+        Stroke::NONE,
+    ));
 }
 
 /// Header aggregates for the resource columns: system CPU %, memory %,
@@ -341,7 +524,11 @@ pub struct Aggregates {
 
 impl Aggregates {
     pub fn from_snapshot(snap: &tm_core::model::Snapshot) -> Self {
-        let disk_pct = snap.disks.iter().map(|d| d.active_pct).fold(0.0f32, f32::max);
+        let disk_pct = snap
+            .disks
+            .iter()
+            .map(|d| d.active_pct)
+            .fold(0.0f32, f32::max);
         // Network utilization: sum of (rate/link) across up adapters.
         let mut net_pct = 0.0f32;
         for n in &snap.networks {
@@ -357,14 +544,13 @@ impl Aggregates {
         }
     }
 
-    /// Strings aligned to the numeric columns (CPU, Arbeitsspeicher,
-    /// Datenträger, Netzwerk).
+    /// Strings aligned to the numeric columns (CPU, Memory, Disk, Network).
     pub fn strings(&self) -> [String; 4] {
         [
-            format::format_pct_de_int(self.cpu_pct),
-            format::format_pct_de_int(self.mem_pct),
-            format::format_pct_de_int(self.disk_pct),
-            format::format_pct_de_int(self.net_pct),
+            format::format_pct_hdr(self.cpu_pct),
+            format::format_pct_hdr(self.mem_pct),
+            format::format_pct_hdr(self.disk_pct),
+            format::format_pct_hdr(self.net_pct),
         ]
     }
 }
