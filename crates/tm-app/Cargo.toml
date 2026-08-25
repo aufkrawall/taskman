@@ -23,10 +23,9 @@ eframe = { version = "=0.36.1", default-features = false, features = [
   "wayland",
   "x11",
 ] }
-egui_extras = { version = "=0.36.1", features = ["serde"] }
 tracing = { workspace = true }
 serde_json = { workspace = true }
-parking_lot = { workspace = true }
+rfd = "0.15"
 
 [package.metadata.notes]
 renderer = "wgpu primary, glow fallback; wayland+x11 enabled for native Linux"

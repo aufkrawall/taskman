@@ -82,7 +82,7 @@ impl SystemCollector for LinuxCollector {
             let pid_u = pid.as_u32();
             let name = p.name().to_string_lossy().into_owned();
 
-            let mut anc: Vec<String> = Vec::new();
+            let mut anc: Vec<&str> = Vec::new();
             let mut cur = p.parent().map(|x| x.as_u32());
             let mut hops = 0;
             while let Some(ppid) = cur {
@@ -92,7 +92,7 @@ impl SystemCollector for LinuxCollector {
                 }
                 match name_by_pid.get(&ppid) {
                     Some(n) => {
-                        anc.push(n.clone());
+                        anc.push(n.as_str());
                         cur = self
                             .sys
                             .process(sysinfo::Pid::from_u32(ppid))

@@ -1,7 +1,7 @@
 //! Enumerate pids owning visible top-level windows (used for App detection,
 //! mirroring Task Manager's "Apps" grouping).
 
-use parking_lot::Mutex;
+use std::sync::Mutex;
 
 /// Cached result refreshed once per sampling tick by the collector.
 static CACHE: Mutex<Option<Vec<u32>>> = Mutex::new(None);
@@ -14,15 +14,14 @@ pub fn visible_window_owners() -> Vec<u32> {
             windows::Win32::Foundation::LPARAM(&mut out as *mut _ as isize),
         );
     }
-    let mut guard = CACHE.lock();
-    *guard = Some(out.clone());
+    *tm_core::sync::lock(&CACHE) = Some(out.clone());
     out
 }
 
 /// Peek at the last enumerated owners without touching windows (cheap).
 #[allow(dead_code)]
 pub fn last_known_owners() -> Vec<u32> {
-    CACHE.lock().clone().unwrap_or_default()
+    tm_core::sync::lock(&CACHE).clone().unwrap_or_default()
 }
 
 unsafe extern "system" fn enum_cb(
@@ -73,4 +72,3 @@ unsafe extern "system" fn enum_cb(
     }
     windows::core::BOOL(1)
 }
-

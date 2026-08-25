@@ -340,6 +340,94 @@ pub fn relaunch_elevated() -> Result<()> {
     shell_execute(&exe.to_string_lossy(), None, true, false)
 }
 
+// ------------------------------------------------------------------ shell helpers
+
+/// Reveal `path` in Explorer with the file preselected.
+pub fn open_file_location(path: &str) -> Result<()> {
+    if path.is_empty() {
+        return Err(TmError::platform("open_file_location", "no path"));
+    }
+    shell_execute(
+        "explorer.exe",
+        Some(&format!("/select,\"{path}\"")),
+        false,
+        false,
+    )
+}
+
+/// Open the Explorer Properties dialog for `path` (SEE_MASK_INVOKEIDLIST
+/// with the "properties" verb).
+pub fn open_properties(path: &str) -> Result<()> {
+    use windows::Win32::UI::Shell::{
+        SEE_MASK_INVOKEIDLIST, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW,
+    };
+    let file_w: Vec<u16> = path.encode_utf16().chain([0]).collect();
+    let verb_w: Vec<u16> = "properties\0".encode_utf16().collect();
+    let mut info = SHELLEXECUTEINFOW {
+        cbSize: std::mem::size_of::<SHELLEXECUTEINFOW>() as u32,
+        fMask: SEE_MASK_NOCLOSEPROCESS | SEE_MASK_INVOKEIDLIST,
+        lpVerb: PCWSTR::from_raw(verb_w.as_ptr()),
+        lpFile: PCWSTR::from_raw(file_w.as_ptr()),
+        nShow: SW_SHOWNORMAL.0,
+        ..Default::default()
+    };
+    unsafe {
+        ShellExecuteExW(&mut info)
+            .map_err(|e| TmError::platform("ShellExecuteExW(properties)", e.to_string()))?;
+        if !info.hProcess.is_invalid() {
+            let _ = CloseHandle(info.hProcess);
+        }
+    }
+    Ok(())
+}
+
+/// Open a URL / document with the default handler.
+pub fn open_url(url: &str) -> Result<()> {
+    shell_execute(url, None, false, false)
+}
+
+/// Write a minidump of `pid` to `path` via dbghelp's MiniDumpWriteDump.
+pub fn create_dump_file(pid: u32, path: &std::path::Path) -> Result<()> {
+    use windows::Win32::Storage::FileSystem::{
+        CreateFileW, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL,
+    };
+    use windows::Win32::System::Diagnostics::Debug::{
+        MiniDumpWriteDump, MINIDUMP_TYPE,
+    };
+
+    let hproc = open_process(
+        pid,
+        th::PROCESS_QUERY_INFORMATION | th::PROCESS_VM_READ | th::PROCESS_DUP_HANDLE,
+    )?;
+    let result = (|| {
+        let wide: Vec<u16> = path
+            .as_os_str()
+            .to_string_lossy()
+            .encode_utf16()
+            .chain([0])
+            .collect();
+        let hfile = unsafe {
+            CreateFileW(
+                PCWSTR::from_raw(wide.as_ptr()),
+                windows::Win32::Storage::FileSystem::FILE_GENERIC_WRITE.0,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                None,
+                OPEN_ALWAYS,
+                FILE_ATTRIBUTE_NORMAL,
+                None,
+            )
+        }
+        .map_err(|e| TmError::platform("CreateFileW(dump)", e.to_string()))?;
+        let dump_result = unsafe {
+            MiniDumpWriteDump(hproc, pid, hfile, MINIDUMP_TYPE(0), None, None, None)
+        };
+        let _ = unsafe { CloseHandle(hfile) };
+        dump_result.map_err(|e| TmError::platform("MiniDumpWriteDump", e.to_string()))
+    })();
+    let _ = unsafe { CloseHandle(hproc) };
+    result
+}
+
 fn shell_execute(file: &str, params: Option<&str>, elevate: bool, wait: bool) -> Result<()> {
     use windows::Win32::UI::Shell::{
         SEE_MASK_FLAG_NO_UI, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW,

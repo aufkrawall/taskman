@@ -57,7 +57,7 @@ pub struct ClassifyInput<'a> {
     pub pid: u32,
     pub name: &'a str,
     /// Chain from direct parent up to root (ppid, ppid-of-ppid, ...).
-    pub ancestor_names: &'a [String],
+    pub ancestor_names: &'a [&'a str],
     pub has_window: bool,
     /// Session 0 on Windows / uid 0 root daemon context.
     pub system_session: bool,
@@ -94,13 +94,9 @@ pub fn classify(input: ClassifyInput<'_>) -> ProcCategory {
 mod tests {
     use super::*;
 
-    fn names(v: &[&str]) -> Vec<String> {
-        v.iter().map(|s| s.to_string()).collect()
-    }
-
     #[test]
     fn windowed_process_is_app() {
-        let anc = names(&["explorer.exe"]);
+        let anc = ["explorer.exe"];
         assert_eq!(
             classify(ClassifyInput {
                 pid: 4000,
@@ -129,7 +125,7 @@ mod tests {
 
     #[test]
     fn child_of_services_is_system() {
-        let anc = names(&["services.exe"]);
+        let anc = ["services.exe"];
         assert_eq!(
             classify(ClassifyInput {
                 pid: 3000,

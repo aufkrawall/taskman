@@ -9,11 +9,13 @@ pub mod classify;
 pub mod engine;
 pub mod error;
 pub mod format;
+pub mod i18n;
+pub mod locale;
 pub mod logging;
 pub mod mock;
 pub mod model;
-pub mod ring;
 pub mod settings;
+pub mod sync;
 
 pub use app_history::AppHistoryDb;
 pub use engine::{EngineCmd, EngineHandle, EngineState};

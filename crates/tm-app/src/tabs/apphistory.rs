@@ -3,17 +3,20 @@
 
 use eframe::egui;
 use tm_core::format;
+use tm_core::i18n::{self, K};
 
 use crate::app::TaskManApp;
 use crate::theme;
-use crate::widgets::tablekit::{TmColumn, TmTable};
+use crate::widgets::tablekit::{TmColumn};
 
-const COLS: [TmColumn; 4] = [
-    TmColumn::text("name", "Name", 0.0),
-    TmColumn::num("cpu", "CPU-Zeit", 150.0),
-    TmColumn::num("net", "Netzwerk", 140.0),
-    TmColumn::num("notif", "Benachrichtigungen", 170.0),
-];
+fn columns() -> Vec<TmColumn> {
+    vec![
+        TmColumn::text("name", i18n::tr(K::ColName), 0.0),
+        TmColumn::num("cpu", i18n::tr(K::ColCpuTime), 150.0),
+        TmColumn::num("net", i18n::tr(K::ColNetwork), 140.0),
+        TmColumn::num("notif", i18n::tr(K::ColNotifications), 170.0),
+    ]
+}
 
 pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
     let pal = theme::palette(ui);
@@ -24,27 +27,29 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
         &pal,
         |_app, _ui| {},
         |_app, ui| {
-            if ui.button("Jetzt aktualisieren (F5)").clicked() {
+            if ui.button(i18n::tr(K::RefreshNow)).clicked() {
                 ui.close();
             }
         },
     );
 
     // Caption + clear link, like TM.
-    let since = format::format_date_de(app.app_history_db.since_epoch_s());
+    let since = format::format_date(app.app_history_db.since_epoch_s());
     ui.horizontal(|ui| {
         ui.add_space(16.0);
         ui.vertical(|ui| {
             ui.label(
                 egui::RichText::new(format!(
-                    "Ressourcenauslastung seit {since} für aktuelle Benutzer- und Systemkonten."
+                    "{} {since} {}",
+                    i18n::tr(K::HistorySinceLine),
+                    i18n::tr(K::HistoryForAccounts)
                 ))
                 .size(12.5),
             );
             if ui
                 .add(
                     egui::Button::new(
-                        egui::RichText::new("Auslastungsverlauf löschen")
+                        egui::RichText::new(i18n::tr(K::ClearHistoryLink))
                             .size(12.5)
                             .color(pal.accent),
                     )
@@ -54,7 +59,7 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
             {
                 app.app_history_db.clear();
                 app.app_history_db.save();
-                app.shared.toast("Auslastungsverlauf gelöscht");
+                app.shared.toast(i18n::tr(K::HistoryCleared));
             }
         });
     });
@@ -70,10 +75,10 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
         .collect();
     rows.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
-    let table = TmTable::new(COLS.to_vec(), 340.0);
+    let mut table = app.make_table("apphistory", columns(), 340.0);
     let max_cpu = rows.iter().map(|r| r.1).fold(0.0f64, f64::max).max(1.0);
 
-    let avail = ui.available_width();
+    let avail = crate::widgets::tablekit::table_avail(ui);
     table.header(ui, &pal, avail, None, None);
 
     egui::ScrollArea::vertical()
@@ -93,15 +98,13 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
                 );
 
                 let cells = vec![
-                    (
-                        (cpu_s / max_cpu) as f32,
-                        format::format_cpu_time(*cpu_s),
-                    ),
-                    (0.0, format::format_bytes_de(*net_b)),
+                    ((cpu_s / max_cpu) as f32, format::format_cpu_time(*cpu_s)),
+                    (0.0, format::format_bytes_loc(*net_b)),
                     (0.0, "0 MB".to_string()),
                 ];
                 table.heat_cells(ui, &pal, avail, rect, 1, &cells, true);
             }
             ui.add_space(12.0);
         });
+    app.persist_table(&mut table);
 }

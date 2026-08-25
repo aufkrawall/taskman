@@ -2,12 +2,13 @@
 //! detail pages on the right (per-core grid for CPU, big rolling charts,
 //! big-value stats + key/value list below).
 
-use eframe::egui::{self, Align2, FontId, Pos2};
+use eframe::egui::{self, Align2, CursorIcon, FontId, Pos2};
 use tm_core::format;
+use tm_core::i18n::{self, K};
 
 use crate::app::{HistoryPoint, TaskManApp};
 use crate::theme::{self, Palette};
-use crate::widgets::chart::{chart_multi, core_chart, MultiSeries};
+use crate::widgets::chart::{MultiSeries, chart_multi, core_chart};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResourceKind {
@@ -34,7 +35,7 @@ fn visible_points(app: &TaskManApp) -> usize {
 pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
     let pal = theme::palette(ui);
     let Some(_snap) = app.latest_snapshot() else {
-        ui.centered_and_justified(|ui| ui.label("Sammle Daten…"));
+        ui.centered_and_justified(|ui| ui.label(i18n::tr(K::GatheringData)));
         return;
     };
 
@@ -44,7 +45,7 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
         &pal,
         |_app, _ui| {},
         |_app, ui| {
-            if ui.button("Jetzt aktualisieren (F5)").clicked() {
+            if ui.button(i18n::tr(K::RefreshNow)).clicked() {
                 ui.close();
             }
         },
@@ -56,11 +57,12 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
     }
 
     ui.horizontal_top(|ui| {
-        // ---------------- left column of cards ------------------------------
+        // ---------------- left column of cards (user-resizable) -------------
+        let mut card_w = app.shared.settings.perf_card_width.clamp(180.0, 520.0);
         egui::ScrollArea::vertical()
             .id_salt("perf-cards")
             .show(ui, |ui| {
-                ui.set_width(252.0);
+                ui.set_width(card_w);
                 ui.vertical(|ui| {
                     for (i, e) in entries.iter().enumerate() {
                         card_ui(app, ui, &pal, i, e);
@@ -68,6 +70,28 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
                     ui.add_space(8.0);
                 });
             });
+
+        // Drag splitter between the card column and the detail area.
+        let split_h = ui.available_height();
+        let (srect, sresp) =
+            ui.allocate_exact_size(egui::vec2(10.0, split_h), egui::Sense::drag());
+        if sresp.hovered() || sresp.dragged() {
+            ui.ctx().set_cursor_icon(CursorIcon::ResizeHorizontal);
+        }
+        if sresp.dragged() {
+            card_w = (card_w + sresp.drag_delta().x).clamp(180.0, 520.0);
+            app.shared.settings.perf_card_width = card_w;
+            ui.painter().line_segment(
+                [
+                    Pos2::new(srect.center().x, srect.top()),
+                    Pos2::new(srect.center().x, srect.bottom()),
+                ],
+                egui::Stroke::new(2.0, pal.accent),
+            );
+        }
+        if sresp.drag_stopped() {
+            app.shared.settings.save();
+        }
 
         ui.add_space(6.0);
 
@@ -118,14 +142,8 @@ fn card_ui(app: &mut TaskManApp, ui: &mut egui::Ui, pal: &Palette, i: usize, e: 
     let n = visible_points(app);
     let color = pal.accent;
     let samples = match e.kind {
-        ResourceKind::Cpu => {
-            let v: Vec<f64> = recent(app, n).iter().map(|h| h.cpu_total as f64).collect();
-            v
-        }
-        ResourceKind::Memory => recent(app, n)
-            .iter()
-            .map(|h| pct_of(h.mem_used_bytes, h.mem_total_bytes))
-            .collect(),
+        ResourceKind::Cpu => series(app, n, |h| h.cpu_total as f64),
+        ResourceKind::Memory => series(app, n, |h| pct_of(h.mem_used_bytes, h.mem_total_bytes)),
         ResourceKind::Disk => disk_series(app, &e.key, n, |d| d.1 as f64),
         ResourceKind::Network => net_series(app, &e.key, n, 1),
         ResourceKind::Gpu => gpu_series(app, &e.key, n, 1),
@@ -160,7 +178,11 @@ fn card_ui(app: &mut TaskManApp, ui: &mut egui::Ui, pal: &Palette, i: usize, e: 
 }
 
 fn pct_of(v: u64, total: u64) -> f64 {
-    if total == 0 { 0.0 } else { v as f64 / total as f64 * 100.0 }
+    if total == 0 {
+        0.0
+    } else {
+        v as f64 / total as f64 * 100.0
+    }
 }
 
 fn build_resource_list(app: &TaskManApp) -> Vec<ResourceEntry> {
@@ -177,21 +199,21 @@ fn build_resource_list(app: &TaskManApp) -> Vec<ResourceEntry> {
         subtitle: String::new(),
         value_line: format!(
             "{}  {}",
-            format::format_pct_de_int(snap.cpu.utilization_pct),
-            format::format_freq_de(snap.cpu.freq_mhz)
+            format::format_pct_hdr(snap.cpu.utilization_pct),
+            format::format_freq_ghz(snap.cpu.freq_mhz)
         ),
     });
 
     out.push(ResourceEntry {
         kind: ResourceKind::Memory,
         key: "mem".into(),
-        title: "Arbeitsspeicher".into(),
+        title: i18n::tr(K::MemTitle).into(),
         subtitle: String::new(),
         value_line: format!(
             "{}/{} ({})",
-            format::format_bytes_de(snap.memory.used_bytes),
-            format::format_bytes_de(snap.memory.total_bytes),
-            format::format_pct_de_int(snap.memory.used_pct())
+            format::format_bytes_loc(snap.memory.used_bytes),
+            format::format_bytes_loc(snap.memory.total_bytes),
+            format::format_pct_hdr(snap.memory.used_pct())
         ),
     });
 
@@ -199,9 +221,9 @@ fn build_resource_list(app: &TaskManApp) -> Vec<ResourceEntry> {
         out.push(ResourceEntry {
             kind: ResourceKind::Disk,
             key: d.mount.clone(),
-            title: format!("Datenträger {}", d.id),
+            title: format!("{} {}", i18n::tr(K::DiskTitle), d.id),
             subtitle: disk_media_label(d),
-            value_line: format::format_pct_de_int(d.active_pct),
+            value_line: format::format_pct_hdr(d.active_pct),
         });
     }
 
@@ -212,12 +234,19 @@ fn build_resource_list(app: &TaskManApp) -> Vec<ResourceEntry> {
         out.push(ResourceEntry {
             kind: ResourceKind::Network,
             key: n.name.clone(),
-            title: if n.kind.is_empty() { n.name.clone() } else { n.kind.clone() },
-            subtitle: if n.kind.is_empty() { String::new() } else { n.name.clone() },
-            value_line: format!(
-                "Ges.: {}  Empf.: {}",
-                format::format_kbit_de(n.sent_bps),
-                format::format_kbit_de(n.recv_bps)
+            title: if n.kind.is_empty() {
+                n.name.clone()
+            } else {
+                n.kind.clone()
+            },
+            subtitle: if n.kind.is_empty() {
+                String::new()
+            } else {
+                n.name.clone()
+            },
+            value_line: i18n::trf(
+                K::CardSentRecv,
+                &[&format::format_kbit(n.sent_bps), &format::format_kbit(n.recv_bps)],
             ),
         });
     }
@@ -230,7 +259,7 @@ fn build_resource_list(app: &TaskManApp) -> Vec<ResourceEntry> {
             subtitle: g.name.clone(),
             value_line: format!(
                 "{}{}",
-                format::format_pct_de_int(g.util_pct),
+                format::format_pct_hdr(g.util_pct),
                 g.temperature_c
                     .map(|t| format!("  ({t:.0} °C)"))
                     .unwrap_or_default()
@@ -247,9 +276,15 @@ fn disk_media_label(d: &tm_core::model::DiskInfo) -> String {
 
 // ---------------------------------------------------------------- helpers
 
-fn recent(app: &TaskManApp, n: usize) -> Vec<HistoryPoint> {
+/// Iterator over the newest `n` history points without cloning them.
+fn tail(app: &TaskManApp, n: usize) -> impl DoubleEndedIterator<Item = &HistoryPoint> {
     let skip = app.history.len().saturating_sub(n);
-    app.history.iter().skip(skip).cloned().collect()
+    app.history.iter().skip(skip)
+}
+
+/// Extract one numeric series from the newest `n` points.
+fn series(app: &TaskManApp, n: usize, f: impl Fn(&HistoryPoint) -> f64) -> Vec<f64> {
+    tail(app, n).map(f).collect()
 }
 
 fn disk_series(
@@ -258,16 +293,14 @@ fn disk_series(
     n: usize,
     pick: impl Fn(&(String, f32, f64, f64)) -> f64,
 ) -> Vec<f64> {
-    recent(app, n)
-        .iter()
+    tail(app, n)
         .filter_map(|h| h.disks.iter().find(|(m, ..)| m == key))
         .map(pick)
         .collect()
 }
 
 fn net_series(app: &TaskManApp, key: &str, n: usize, idx: usize) -> Vec<f64> {
-    recent(app, n)
-        .iter()
+    tail(app, n)
         .filter_map(|h| h.nets.iter().find(|(m, ..)| m == key))
         .filter(|t| t.1 > 0.0 || t.2 > 0.0)
         .map(|t| if idx == 1 { t.1 } else { t.2 })
@@ -275,8 +308,7 @@ fn net_series(app: &TaskManApp, key: &str, n: usize, idx: usize) -> Vec<f64> {
 }
 
 fn gpu_series(app: &TaskManApp, key: &str, n: usize, idx: usize) -> Vec<f64> {
-    recent(app, n)
-        .iter()
+    tail(app, n)
         .filter_map(|h| h.gpus.iter().find(|(id, ..)| id.to_string() == key))
         .map(|t| if idx == 1 { t.1 as f64 } else { t.2 as f64 })
         .collect()
@@ -284,7 +316,8 @@ fn gpu_series(app: &TaskManApp, key: &str, n: usize, idx: usize) -> Vec<f64> {
 
 /// Page title row: big name left, detail right.
 fn page_title(ui: &mut egui::Ui, pal: &Palette, title: &str, right: &str) {
-    let (rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 40.0), egui::Sense::hover());
+    let (rect, _) =
+        ui.allocate_exact_size(egui::vec2(ui.available_width(), 40.0), egui::Sense::hover());
     ui.painter().text(
         Pos2::new(rect.left() + 16.0, rect.center().y),
         Align2::LEFT_CENTER,
@@ -303,7 +336,8 @@ fn page_title(ui: &mut egui::Ui, pal: &Palette, title: &str, right: &str) {
 
 /// Caption row: dim caption left, scale max right.
 fn caption(ui: &mut egui::Ui, pal: &Palette, left: &str, right: &str) {
-    let (rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 20.0), egui::Sense::hover());
+    let (rect, _) =
+        ui.allocate_exact_size(egui::vec2(ui.available_width(), 20.0), egui::Sense::hover());
     ui.painter().text(
         Pos2::new(rect.left() + 16.0, rect.center().y),
         Align2::LEFT_CENTER,
@@ -360,7 +394,8 @@ fn med_stat(ui: &mut egui::Ui, pal: &Palette, label: &str, value: &str, w: f32) 
 
 /// Key/value row for the right-hand details list.
 fn kv_row(ui: &mut egui::Ui, pal: &Palette, key: &str, value: &str) {
-    let (rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 21.0), egui::Sense::hover());
+    let (rect, _) =
+        ui.allocate_exact_size(egui::vec2(ui.available_width(), 21.0), egui::Sense::hover());
     ui.painter().text(
         Pos2::new(rect.left(), rect.center().y),
         Align2::LEFT_CENTER,
@@ -384,9 +419,11 @@ fn content_width(ui: &egui::Ui) -> f32 {
 // ---------------------------------------------------------------- CPU page
 
 fn cpu_page(app: &mut TaskManApp, ui: &mut egui::Ui, pal: &Palette) {
-    let Some(snap) = app.latest_snapshot() else { return };
+    let Some(snap) = app.latest_snapshot() else {
+        return;
+    };
     page_title(ui, pal, "CPU", &snap.cpu.brand);
-    caption(ui, pal, "Auslastung in 60 Sekunden (%)", "100 %");
+    caption(ui, pal, i18n::tr(K::Utilization60sPct), "100 %");
 
     let n = visible_points(app);
     let width = content_width(ui);
@@ -398,14 +435,13 @@ fn cpu_page(app: &mut TaskManApp, ui: &mut egui::Ui, pal: &Palette) {
         let gap = 6.0;
         let cell_w = ((width - 32.0 - gap * (cols - 1) as f32) / cols as f32).max(60.0);
         let cell_h = 84.0;
-        let history: Vec<Vec<f64>> = (0..cores)
-            .map(|idx| {
-                recent(app, n)
-                    .iter()
-                    .filter_map(|h| h.per_core.get(idx).map(|v| *v as f64))
-                    .collect()
-            })
-            .collect();
+        // One pass over the history tail fills every core's series.
+        let mut history: Vec<Vec<f64>> = (0..cores).map(|_| Vec::with_capacity(n)).collect();
+        for h in tail(app, n) {
+            for (dst, v) in history.iter_mut().zip(h.per_core.iter()) {
+                dst.push(*v as f64);
+            }
+        }
         egui::Grid::new("core-grid")
             .spacing([gap, gap])
             .start_row(0)
@@ -430,27 +466,45 @@ fn cpu_page(app: &mut TaskManApp, ui: &mut egui::Ui, pal: &Palette) {
                 big_stat(
                     ui,
                     pal,
-                    "Auslastung",
-                    &format::format_pct_de_int(snap.cpu.utilization_pct),
+                    i18n::tr(K::StatUtilization),
+                    &format::format_pct_hdr(snap.cpu.utilization_pct),
                     w,
                 );
                 big_stat(
                     ui,
                     pal,
-                    "Geschwindigkeit",
-                    &format::format_freq_de(snap.cpu.freq_mhz),
+                    i18n::tr(K::StatSpeed),
+                    &format::format_freq_ghz(snap.cpu.freq_mhz),
                     w + 30.0,
                 );
             });
             ui.horizontal_top(|ui| {
-                med_stat(ui, pal, "Prozesse", &snap.system.process_count.to_string(), w);
-                med_stat(ui, pal, "Threads", &snap.system.thread_count.to_string(), w);
-                med_stat(ui, pal, "Handles", &snap.system.handle_count.to_string(), w);
+                med_stat(
+                    ui,
+                    pal,
+                    i18n::tr(K::StatProcesses),
+                    &snap.system.process_count.to_string(),
+                    w,
+                );
+                med_stat(
+                    ui,
+                    pal,
+                    i18n::tr(K::StatThreads),
+                    &snap.system.thread_count.to_string(),
+                    w,
+                );
+                med_stat(
+                    ui,
+                    pal,
+                    i18n::tr(K::StatHandles),
+                    &snap.system.handle_count.to_string(),
+                    w,
+                );
             });
             big_stat(
                 ui,
                 pal,
-                "Betriebszeit",
+                i18n::tr(K::StatUptime),
                 &format::format_uptime(snap.system.uptime_s),
                 w + 60.0,
             );
@@ -459,28 +513,37 @@ fn cpu_page(app: &mut TaskManApp, ui: &mut egui::Ui, pal: &Palette) {
         ui.add_space(30.0);
         ui.vertical(|ui| {
             let gb = |kb: u64| -> String {
-                if kb == 0 { "—".into() } else { format::format_bytes_de(kb * 1024) }
+                if kb == 0 {
+                    "—".into()
+                } else {
+                    format::format_bytes_loc(kb * 1024)
+                }
             };
             kv_row(
                 ui,
                 pal,
-                "Basisgeschwindigkeit:",
+                i18n::tr(K::KvBaseSpeed),
                 &if snap.cpu.freq_base_mhz > 0.0 {
-                    format::format_freq_de(snap.cpu.freq_base_mhz)
+                    format::format_freq_ghz(snap.cpu.freq_base_mhz)
                 } else {
                     "—".into()
                 },
             );
-            kv_row(ui, pal, "Sockets:", &snap.cpu.sockets.to_string());
-            kv_row(ui, pal, "Kerne:", &snap.cpu.physical_cores.to_string());
-            kv_row(ui, pal, "Logische Prozessoren:", &snap.cpu.logical_count.to_string());
+            kv_row(ui, pal, i18n::tr(K::KvSockets), &snap.cpu.sockets.to_string());
+            kv_row(ui, pal, i18n::tr(K::KvCores), &snap.cpu.physical_cores.to_string());
             kv_row(
                 ui,
                 pal,
-                "Virtualisierung:",
+                i18n::tr(K::KvLogical),
+                &snap.cpu.logical_count.to_string(),
+            );
+            kv_row(
+                ui,
+                pal,
+                i18n::tr(K::KvVirtualization),
                 match snap.cpu.virtualization.as_str() {
-                    "Enabled" => "Aktiviert",
-                    "Disabled" => "Deaktiviert",
+                    "Enabled" => i18n::tr(K::VirtEnabled),
+                    "Disabled" => i18n::tr(K::VirtDisabled),
                     other => other,
                 },
             );
@@ -495,49 +558,60 @@ fn cpu_page(app: &mut TaskManApp, ui: &mut egui::Ui, pal: &Palette) {
 // ---------------------------------------------------------------- Memory page
 
 fn memory_page(app: &mut TaskManApp, ui: &mut egui::Ui, pal: &Palette) {
-    let Some(snap) = app.latest_snapshot() else { return };
+    let Some(snap) = app.latest_snapshot() else {
+        return;
+    };
     let total_gb = snap.memory.total_bytes as f64 / 1024.0 / 1024.0 / 1024.0;
     page_title(
         ui,
         pal,
-        "Arbeitsspeicher",
+        i18n::tr(K::MemTitle),
         &format!(
             "{}/{} ({})",
-            format::format_bytes_de(snap.memory.used_bytes),
-            format::format_bytes_de(snap.memory.total_bytes),
-            format::format_pct_de_int(snap.memory.used_pct())
+            format::format_bytes_loc(snap.memory.used_bytes),
+            format::format_bytes_loc(snap.memory.total_bytes),
+            format::format_pct_hdr(snap.memory.used_pct())
         ),
     );
     caption(
         ui,
         pal,
-        "Speicherauslastung in 60 Sekunden",
-        &format::format_bytes_de(snap.memory.total_bytes),
+        i18n::tr(K::MemUsage60s),
+        &format::format_bytes_loc(snap.memory.total_bytes),
     );
 
     let n = visible_points(app);
     let width = content_width(ui);
-    let used: Vec<f64> = recent(app, n)
-        .iter()
-        .map(|h| h.mem_used_bytes as f64 / 1024.0 / 1024.0 / 1024.0)
-        .collect();
+    let used: Vec<f64> = series(app, n, |h| {
+        h.mem_used_bytes as f64 / 1024.0 / 1024.0 / 1024.0
+    });
     chart_multi(
         ui,
         egui::vec2(width - 32.0, 180.0),
-        &[MultiSeries { samples: used, color: pal.accent }],
+        &[MultiSeries {
+            samples: used,
+            color: pal.accent,
+        }],
         total_gb.max(0.1),
     );
 
-    caption(ui, pal, "Zugesicherter Speicher", &format::format_bytes_de(snap.memory.commit_total_bytes));
-    let commit: Vec<f64> = recent(app, n)
-        .iter()
-        .map(|h| h.commit_used_bytes as f64 / 1024.0 / 1024.0 / 1024.0)
-        .collect();
+    caption(
+        ui,
+        pal,
+        i18n::tr(K::CommittedMem),
+        &format::format_bytes_loc(snap.memory.commit_total_bytes),
+    );
+    let commit: Vec<f64> = series(app, n, |h| {
+        h.commit_used_bytes as f64 / 1024.0 / 1024.0 / 1024.0
+    });
     let commit_limit = snap.memory.commit_total_bytes as f64 / 1024.0 / 1024.0 / 1024.0;
     chart_multi(
         ui,
         egui::vec2(width - 32.0, 120.0),
-        &[MultiSeries { samples: commit, color: theme::DARK.ok_green }],
+        &[MultiSeries {
+            samples: commit,
+            color: theme::DARK.ok_green,
+        }],
         commit_limit.max(0.1),
     );
 
@@ -547,37 +621,70 @@ fn memory_page(app: &mut TaskManApp, ui: &mut egui::Ui, pal: &Palette) {
         ui.add_space(16.0);
         ui.vertical(|ui| {
             let w = 170.0;
-            big_stat(ui, pal, "In Verwendung", &format::format_bytes_de(m.used_bytes), w + 20.0);
             big_stat(
                 ui,
                 pal,
-                "Zugesichert",
+                i18n::tr(K::StatInUse),
+                &format::format_bytes_loc(m.used_bytes),
+                w + 20.0,
+            );
+            big_stat(
+                ui,
+                pal,
+                i18n::tr(K::StatCommitted),
                 &format!(
                     "{}/{}",
-                    format::format_bytes_de(m.commit_used_bytes),
-                    format::format_bytes_de(m.commit_total_bytes)
+                    format::format_bytes_loc(m.commit_used_bytes),
+                    format::format_bytes_loc(m.commit_total_bytes)
                 ),
                 w + 60.0,
             );
             ui.horizontal_top(|ui| {
-                med_stat(ui, pal, "Zwischengespeichert", &format::format_bytes_de(m.cached_bytes), w);
-                med_stat(ui, pal, "Ausgelagerter Pool", &format::format_bytes_de(m.paged_pool_bytes), w);
                 med_stat(
                     ui,
                     pal,
-                    "Nicht ausgelagerter Pool",
-                    &format::format_bytes_de(m.non_paged_pool_bytes),
+                    i18n::tr(K::StatCached),
+                    &format::format_bytes_loc(m.cached_bytes),
+                    w,
+                );
+                med_stat(
+                    ui,
+                    pal,
+                    i18n::tr(K::StatPagedPool),
+                    &format::format_bytes_loc(m.paged_pool_bytes),
+                    w,
+                );
+                med_stat(
+                    ui,
+                    pal,
+                    i18n::tr(K::StatNonPagedPool),
+                    &format::format_bytes_loc(m.non_paged_pool_bytes),
                     w + 40.0,
                 );
             });
         });
         ui.add_space(30.0);
         ui.vertical(|ui| {
-            kv_row(ui, pal, "Gesamt:", &format::format_bytes_de(m.total_bytes));
-            kv_row(ui, pal, "Verfügbar:", &format::format_bytes_de(m.available_bytes));
-            kv_row(ui, pal, "Commit-Limit:", &format::format_bytes_de(m.commit_total_bytes));
+            kv_row(ui, pal, i18n::tr(K::KvTotal), &format::format_bytes_loc(m.total_bytes));
+            kv_row(
+                ui,
+                pal,
+                i18n::tr(K::KvAvailable),
+                &format::format_bytes_loc(m.available_bytes),
+            );
+            kv_row(
+                ui,
+                pal,
+                i18n::tr(K::KvCommitLimit),
+                &format::format_bytes_loc(m.commit_total_bytes),
+            );
             if m.swap_total_bytes > 0 {
-                kv_row(ui, pal, "Auslagerungsdatei:", &format::format_bytes_de(m.swap_used_bytes));
+                kv_row(
+                    ui,
+                    pal,
+                    i18n::tr(K::KvPagefile),
+                    &format::format_bytes_loc(m.swap_used_bytes),
+                );
             }
         });
     });
@@ -587,10 +694,14 @@ fn memory_page(app: &mut TaskManApp, ui: &mut egui::Ui, pal: &Palette) {
 // ---------------------------------------------------------------- Disk page
 
 fn disk_page(app: &mut TaskManApp, ui: &mut egui::Ui, pal: &Palette, entry: &ResourceEntry) {
-    let Some(snap) = app.latest_snapshot() else { return };
-    let Some(disk) = snap.disks.iter().find(|d| d.mount == entry.key) else { return };
+    let Some(snap) = app.latest_snapshot() else {
+        return;
+    };
+    let Some(disk) = snap.disks.iter().find(|d| d.mount == entry.key) else {
+        return;
+    };
     page_title(ui, pal, &entry.title, &disk_media_label(disk));
-    caption(ui, pal, "Aktive Zeit in 60 Sekunden", "100 %");
+    caption(ui, pal, i18n::tr(K::ActiveTime60s), "100 %");
 
     let n = visible_points(app);
     let width = content_width(ui);
@@ -598,25 +709,38 @@ fn disk_page(app: &mut TaskManApp, ui: &mut egui::Ui, pal: &Palette, entry: &Res
     chart_multi(
         ui,
         egui::vec2(width - 32.0, 160.0),
-        &[MultiSeries { samples: active, color: pal.accent }],
+        &[MultiSeries {
+            samples: active,
+            color: pal.accent,
+        }],
         100.0,
     );
 
     let read = disk_series(app, &entry.key, n, |d| d.2 / 1024.0);
     let write = disk_series(app, &entry.key, n, |d| d.3 / 1024.0);
-    let peak = read.iter().chain(write.iter()).cloned().fold(0.0f64, f64::max);
+    let peak = read
+        .iter()
+        .chain(write.iter())
+        .cloned()
+        .fold(0.0f64, f64::max);
     caption(
         ui,
         pal,
-        "Übertragungsrate in 60 Sekunden (KB/s)",
+        i18n::tr(K::TransferRate60s),
         &format!("{:.0}", peak.max(1.0)),
     );
     chart_multi(
         ui,
         egui::vec2(width - 32.0, 160.0),
         &[
-            MultiSeries { samples: read, color: pal.accent },
-            MultiSeries { samples: write, color: theme::DARK.ok_green },
+            MultiSeries {
+                samples: read,
+                color: pal.accent,
+            },
+            MultiSeries {
+                samples: write,
+                color: theme::DARK.ok_green,
+            },
         ],
         peak.max(1.0),
     );
@@ -626,9 +750,27 @@ fn disk_page(app: &mut TaskManApp, ui: &mut egui::Ui, pal: &Palette, entry: &Res
         ui.add_space(16.0);
         ui.vertical(|ui| {
             let w = 170.0;
-            big_stat(ui, pal, "Aktive Zeit", &format::format_pct_de_int(disk.active_pct), w);
-            big_stat(ui, pal, "Lesen", &format::format_rate_de(disk.read_bps), w);
-            big_stat(ui, pal, "Schreiben", &format::format_rate_de(disk.write_bps), w);
+            big_stat(
+                ui,
+                pal,
+                i18n::tr(K::StatActiveTime),
+                &format::format_pct_hdr(disk.active_pct),
+                w,
+            );
+            big_stat(
+                ui,
+                pal,
+                i18n::tr(K::StatRead),
+                &format::format_rate_mb(disk.read_bps),
+                w,
+            );
+            big_stat(
+                ui,
+                pal,
+                i18n::tr(K::StatWrite),
+                &format::format_rate_mb(disk.write_bps),
+                w,
+            );
         });
         ui.add_space(30.0);
         ui.vertical(|ui| {
@@ -636,18 +778,28 @@ fn disk_page(app: &mut TaskManApp, ui: &mut egui::Ui, pal: &Palette, entry: &Res
                 kv_row(
                     ui,
                     pal,
-                    "Durchschnittl. Reaktionszeit:",
+                    i18n::tr(K::KvAvgResponse),
                     &format!("{:.1} ms", disk.avg_resp_ms),
                 );
             }
-            kv_row(ui, pal, "Kapazität:", &format::format_bytes_de(disk.total_bytes));
             kv_row(
                 ui,
                 pal,
-                "Belegt:",
-                &format::format_bytes_de(disk.total_bytes - disk.free_bytes),
+                i18n::tr(K::KvCapacity),
+                &format::format_bytes_loc(disk.total_bytes),
             );
-            kv_row(ui, pal, "Frei:", &format::format_bytes_de(disk.free_bytes));
+            kv_row(
+                ui,
+                pal,
+                i18n::tr(K::KvUsedSpace),
+                &format::format_bytes_loc(disk.total_bytes - disk.free_bytes),
+            );
+            kv_row(
+                ui,
+                pal,
+                i18n::tr(K::KvFreeSpace),
+                &format::format_bytes_loc(disk.free_bytes),
+            );
         });
     });
     ui.add_space(16.0);
@@ -656,8 +808,12 @@ fn disk_page(app: &mut TaskManApp, ui: &mut egui::Ui, pal: &Palette, entry: &Res
 // ---------------------------------------------------------------- Network page
 
 fn network_page(app: &mut TaskManApp, ui: &mut egui::Ui, pal: &Palette, entry: &ResourceEntry) {
-    let Some(snap) = app.latest_snapshot() else { return };
-    let Some(net) = snap.networks.iter().find(|n| n.name == entry.key) else { return };
+    let Some(snap) = app.latest_snapshot() else {
+        return;
+    };
+    let Some(net) = snap.networks.iter().find(|n| n.name == entry.key) else {
+        return;
+    };
     page_title(ui, pal, &entry.title, &net.name);
 
     let n = visible_points(app);
@@ -665,21 +821,37 @@ fn network_page(app: &mut TaskManApp, ui: &mut egui::Ui, pal: &Palette, entry: &
 
     let recv = net_series(app, &entry.key, n, 1);
     let r_max = recv.iter().cloned().fold(0.0f64, f64::max).max(1.0);
-    caption(ui, pal, "Empfangen in 60 Sekunden (KBit/s)", &format!("{:.1}", r_max * 8.0 / 1024.0));
+    caption(
+        ui,
+        pal,
+        i18n::tr(K::Receive60s),
+        &format!("{:.1}", r_max * 8.0 / 1024.0),
+    );
     chart_multi(
         ui,
         egui::vec2(width - 32.0, 150.0),
-        &[MultiSeries { samples: recv, color: pal.accent }],
+        &[MultiSeries {
+            samples: recv,
+            color: pal.accent,
+        }],
         r_max,
     );
 
     let sent = net_series(app, &entry.key, n, 2);
     let s_max = sent.iter().cloned().fold(0.0f64, f64::max).max(1.0);
-    caption(ui, pal, "Senden in 60 Sekunden (KBit/s)", &format!("{:.1}", s_max * 8.0 / 1024.0));
+    caption(
+        ui,
+        pal,
+        i18n::tr(K::Send60s),
+        &format!("{:.1}", s_max * 8.0 / 1024.0),
+    );
     chart_multi(
         ui,
         egui::vec2(width - 32.0, 150.0),
-        &[MultiSeries { samples: sent, color: theme::DARK.ok_green }],
+        &[MultiSeries {
+            samples: sent,
+            color: theme::DARK.ok_green,
+        }],
         s_max,
     );
 
@@ -691,32 +863,38 @@ fn network_page(app: &mut TaskManApp, ui: &mut egui::Ui, pal: &Palette, entry: &
             big_stat(
                 ui,
                 pal,
-                "Empfangen",
-                &format::format_kbit_de(net.recv_bps),
+                i18n::tr(K::StatReceive),
+                &format::format_kbit(net.recv_bps),
                 w,
             );
-            big_stat(ui, pal, "Senden", &format::format_kbit_de(net.sent_bps), w);
+            big_stat(
+                ui,
+                pal,
+                i18n::tr(K::StatSend),
+                &format::format_kbit(net.sent_bps),
+                w,
+            );
         });
         ui.add_space(30.0);
         ui.vertical(|ui| {
             kv_row(
                 ui,
                 pal,
-                "Insgesamt empfangen:",
-                &format::format_bytes_de(net.total_recv_bytes),
+                i18n::tr(K::KvTotalReceived),
+                &format::format_bytes_loc(net.total_recv_bytes),
             );
             kv_row(
                 ui,
                 pal,
-                "Insgesamt gesendet:",
-                &format::format_bytes_de(net.total_sent_bytes),
+                i18n::tr(K::KvTotalSent),
+                &format::format_bytes_loc(net.total_sent_bytes),
             );
             if net.link_bps > 0 {
                 kv_row(
                     ui,
                     pal,
-                    "Verbindungsgeschwindigkeit:",
-                    &format::format_mbit_de(net.link_bps as f64),
+                    i18n::tr(K::KvLinkSpeed),
+                    &format::format_mbit(net.link_bps as f64),
                 );
             }
             if let Some(ssid) = &net.ssid {
@@ -730,19 +908,26 @@ fn network_page(app: &mut TaskManApp, ui: &mut egui::Ui, pal: &Palette, entry: &
 // ---------------------------------------------------------------- GPU page
 
 fn gpu_page(app: &mut TaskManApp, ui: &mut egui::Ui, pal: &Palette, entry: &ResourceEntry) {
-    let Some(snap) = app.latest_snapshot() else { return };
-    let Some(gpu) = snap.gpus.iter().find(|g| g.id.to_string() == entry.key) else { return };
+    let Some(snap) = app.latest_snapshot() else {
+        return;
+    };
+    let Some(gpu) = snap.gpus.iter().find(|g| g.id.to_string() == entry.key) else {
+        return;
+    };
     page_title(ui, pal, &entry.title, &gpu.name);
 
     let n = visible_points(app);
     let width = content_width(ui);
 
     let util = gpu_series(app, &entry.key, n, 1);
-    caption(ui, pal, "Auslastung in 60 Sekunden (%)", "100 %");
+    caption(ui, pal, i18n::tr(K::Utilization60sPct), "100 %");
     chart_multi(
         ui,
         egui::vec2(width - 32.0, 150.0),
-        &[MultiSeries { samples: util, color: pal.accent }],
+        &[MultiSeries {
+            samples: util,
+            color: pal.accent,
+        }],
         100.0,
     );
 
@@ -754,15 +939,18 @@ fn gpu_page(app: &mut TaskManApp, ui: &mut egui::Ui, pal: &Palette, entry: &Reso
     caption(
         ui,
         pal,
-        "GPU-Speicher in 60 Sekunden",
-        &format::format_bytes_de(mem_max),
+        i18n::tr(K::GpuMem60s),
+        &format::format_bytes_loc(mem_max),
     );
     let mem_gb: Vec<f64> = mem.iter().map(|v| v / 1024.0 / 1024.0).collect();
     let max_gb = mem_max as f64 / 1024.0 / 1024.0;
     chart_multi(
         ui,
         egui::vec2(width - 32.0, 150.0),
-        &[MultiSeries { samples: mem_gb, color: theme::DARK.ok_green }],
+        &[MultiSeries {
+            samples: mem_gb,
+            color: theme::DARK.ok_green,
+        }],
         max_gb,
     );
 
@@ -771,12 +959,18 @@ fn gpu_page(app: &mut TaskManApp, ui: &mut egui::Ui, pal: &Palette, entry: &Reso
         ui.add_space(16.0);
         ui.vertical(|ui| {
             let w = 170.0;
-            big_stat(ui, pal, "Auslastung", &format::format_pct_de_int(gpu.util_pct), w);
             big_stat(
                 ui,
                 pal,
-                "GPU-Speicher",
-                &format::format_bytes_de(gpu.mem_used_bytes),
+                i18n::tr(K::StatUtilization),
+                &format::format_pct_hdr(gpu.util_pct),
+                w,
+            );
+            big_stat(
+                ui,
+                pal,
+                i18n::tr(K::GpuMemStat),
+                &format::format_bytes_loc(gpu.mem_used_bytes),
                 w,
             );
         });
@@ -786,22 +980,22 @@ fn gpu_page(app: &mut TaskManApp, ui: &mut egui::Ui, pal: &Palette, entry: &Reso
                 kv_row(
                     ui,
                     pal,
-                    "Dedizierter Speicher:",
-                    &format::format_bytes_de(gpu.mem_total_bytes),
+                    i18n::tr(K::KvDedicatedMem),
+                    &format::format_bytes_loc(gpu.mem_total_bytes),
                 );
             }
             if let Some(t) = gpu.temperature_c {
-                kv_row(ui, pal, "Temperatur:", &format!("{t:.0} °C"));
+                kv_row(ui, pal, i18n::tr(K::KvTemperature), &format!("{t:.0} °C"));
             }
             if !gpu.driver_version.is_empty() {
-                kv_row(ui, pal, "Treiberversion:", &gpu.driver_version);
+                kv_row(ui, pal, i18n::tr(K::KvDriverVersion), &gpu.driver_version);
             }
             for e in gpu.engines.iter().take(4) {
                 kv_row(
                     ui,
                     pal,
-                    &format!("Engine {}:", e.name),
-                    &format::format_pct_de_int(e.util_pct),
+                    &format!("{} {}:", i18n::tr(K::KvEnginePrefix), e.name),
+                    &format::format_pct_hdr(e.util_pct),
                 );
             }
         });

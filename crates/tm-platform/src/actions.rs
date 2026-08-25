@@ -116,6 +116,26 @@ pub trait PlatformActions: Send + Sync {
         Err(tm_core::TmError::Unsupported("elevation"))
     }
 
+    /// Write a minidump of `pid` to `path` (Details tab: "Create dump file").
+    fn create_dump_file(&self, _pid: u32, _path: &std::path::Path) -> Result<()> {
+        Err(tm_core::TmError::Unsupported("create dump"))
+    }
+    /// Reveal `path` in the platform file manager, preselected.
+    fn open_file_location(&self, _path: &str) -> Result<()> {
+        let _ = _path;
+        Err(tm_core::TmError::Unsupported("open file location"))
+    }
+    /// Open the shell's Properties dialog for `path`.
+    fn open_properties(&self, _path: &str) -> Result<()> {
+        let _ = _path;
+        Err(tm_core::TmError::Unsupported("properties"))
+    }
+    /// Open a URL (or any document) with the default handler.
+    fn open_url(&self, _url: &str) -> Result<()> {
+        let _ = _url;
+        Err(tm_core::TmError::Unsupported("open url"))
+    }
+
     /// Firmware POST time of the last boot in ms ("Letzte BIOS-Zeit");
     /// None when the platform cannot provide it.
     fn last_bios_time_ms(&self) -> Option<u64> {

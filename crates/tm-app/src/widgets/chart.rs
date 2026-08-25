@@ -100,12 +100,7 @@ pub struct MultiSeries {
 
 /// Bordered chart with several filled series sharing one y scale
 /// (disk read+write, memory+commit, ...).
-pub fn chart_multi(
-    ui: &mut egui::Ui,
-    size: Vec2,
-    series: &[MultiSeries],
-    y_max: f64,
-) -> Response {
+pub fn chart_multi(ui: &mut egui::Ui, size: Vec2, series: &[MultiSeries], y_max: f64) -> Response {
     let (rect, response) = ui.allocate_exact_size(size, egui::Sense::hover());
     let painter = ui.painter_at(rect.expand(1.0));
     let pal = crate::theme::palette(ui);
@@ -135,7 +130,12 @@ pub fn chart_multi(
             .samples
             .iter()
             .enumerate()
-            .map(|(i, v)| Pos2::new(rect.left() + rect.width() * i as f32 / (n - 1) as f32, y(*v)))
+            .map(|(i, v)| {
+                Pos2::new(
+                    rect.left() + rect.width() * i as f32 / (n - 1) as f32,
+                    y(*v),
+                )
+            })
             .collect();
         let fill = Color32::from_rgba_premultiplied(s.color.r(), s.color.g(), s.color.b(), 45);
         let mut area = pts.clone();

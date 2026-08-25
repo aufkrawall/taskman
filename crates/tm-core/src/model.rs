@@ -238,7 +238,7 @@ impl ProcCategory {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, Default)]
 pub enum ProcStatus {
     #[default]
     Running,
@@ -248,7 +248,7 @@ pub enum ProcStatus {
 }
 
 /// Base priority classes as exposed by Windows; other platforms map onto these.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, Default)]
 pub enum PriorityClass {
     Realtime,
     High,

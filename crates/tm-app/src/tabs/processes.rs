@@ -5,21 +5,24 @@
 use eframe::egui;
 use std::collections::{HashMap, HashSet};
 use tm_core::format;
+use tm_core::i18n::{self, K};
 use tm_core::model::{ProcStatus, ProcessEntry, Snapshot};
 
 use crate::app::TaskManApp;
 use crate::icons::Icon;
 use crate::theme;
-use crate::widgets::tablekit::{Aggregates, TmColumn, TmTable};
+use crate::widgets::tablekit::{Aggregates, TmColumn};
 
-const COLS: [TmColumn; 6] = [
-    TmColumn::text("name", "Name", 0.0),
-    TmColumn::text("status", "Status", 190.0),
-    TmColumn::num("cpu", "CPU", 110.0),
-    TmColumn::num("mem", "Arbeitsspeicher", 110.0),
-    TmColumn::num("disk", "Datenträger", 110.0),
-    TmColumn::num("net", "Netzwerk", 110.0),
-];
+fn columns() -> Vec<TmColumn> {
+    vec![
+        TmColumn::text("name", i18n::tr(K::ColName), 0.0),
+        TmColumn::text("status", i18n::tr(K::ColStatus), 190.0),
+        TmColumn::num("cpu", i18n::tr(K::ColCpu), 110.0),
+        TmColumn::num("mem", i18n::tr(K::ColMemory), 110.0),
+        TmColumn::num("disk", i18n::tr(K::ColDisk), 110.0),
+        TmColumn::num("net", i18n::tr(K::ColNetwork), 110.0),
+    ]
+}
 
 #[derive(Default)]
 pub struct State {
@@ -27,7 +30,7 @@ pub struct State {
     pub ascending: bool,
     /// Expanded parent pids.
     pub expanded: HashSet<u32>,
-    /// Expanded user rows (Benutzer tab reuses the same table kit).
+    /// Expanded user rows (Benutzer tab reuses the same state).
     pub expanded_users: HashSet<u32>,
     /// Collapsed group headers [Apps, Hintergrundprozesse].
     pub group_collapsed: [bool; 2],
@@ -64,7 +67,7 @@ pub struct Row {
 pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
     let pal = theme::palette(ui);
     let Some(snap) = app.latest_snapshot() else {
-        ui.centered_and_justified(|ui| ui.label("Sammle Daten…"));
+        ui.centered_and_justified(|ui| ui.label(i18n::tr(K::GatheringData)));
         return;
     };
 
@@ -79,7 +82,7 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
                 ui,
                 &pal,
                 Icon::Leaf,
-                "Effizienzmodus",
+                i18n::tr(K::EfficiencyMode),
                 caps.efficiency_mode && app.selected_pid.is_some(),
             ) && let Some(pid) = app.selected_pid
             {
@@ -92,16 +95,23 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
                             app.efficiency_pids.remove(&pid);
                         }
                     }
-                    Err(e) => app.shared.toast(format!("Fehler: {e}")),
+                    Err(e) => app
+                        .shared
+                        .toast(i18n::trf(K::ErrMsg, &[&e.to_string()])),
                 }
             }
-            if crate::app_ui::cmd_button(ui, &pal, Icon::Close, "Task beenden", app.selected_pid.is_some())
-            {
+            if crate::app_ui::cmd_button(
+                ui,
+                &pal,
+                Icon::Close,
+                i18n::tr(K::EndTask),
+                app.selected_pid.is_some(),
+            ) {
                 app.end_selected();
             }
         },
         |app, ui| {
-            if ui.button("Alle erweitern").clicked() {
+            if ui.button(i18n::tr(K::ExpandAll)).clicked() {
                 if let Some(snap) = app.latest_snapshot() {
                     for p in &snap.processes {
                         app.processes_state.expanded.insert(p.pid);
@@ -109,14 +119,14 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
                 }
                 ui.close();
             }
-            if ui.button("Alle reduzieren").clicked() {
+            if ui.button(i18n::tr(K::CollapseAll)).clicked() {
                 app.processes_state.expanded.clear();
                 ui.close();
             }
         },
     );
 
-    let table = TmTable::new(COLS.to_vec(), 340.0);
+    let mut table = app.make_table("processes", columns(), 340.0);
 
     // Rebuild the row model only when the snapshot/search/sort changes.
     let key = (
@@ -138,7 +148,7 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
     let agg = Aggregates::from_snapshot(&snap);
     let aggs = agg.strings();
 
-    let avail = ui.available_width();
+    let avail = crate::widgets::tablekit::table_avail(ui);
     if let Some(col) = table.header(
         ui,
         &pal,
@@ -151,7 +161,7 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
         } else {
             app.processes_state.sort_col = col;
             // Numeric columns default descending, name ascending.
-            app.processes_state.ascending = !COLS[col].numeric;
+            app.processes_state.ascending = col == 0 || !table.cols[col].numeric;
         }
     }
 
@@ -159,7 +169,6 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
         .id_salt("proc-table")
         .auto_shrink(false)
         .show(ui, |ui| {
-
             let searching = !app.search.trim().is_empty();
             let maxima = column_maxima(rows);
 
@@ -169,7 +178,11 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
                 }
             } else {
                 for gi in 0..2usize {
-                    let label = if gi == 0 { "Apps" } else { "Hintergrundprozesse" };
+                    let label = if gi == 0 {
+                        i18n::tr(K::GroupApps)
+                    } else {
+                        i18n::tr(K::GroupBackground)
+                    };
                     let total = if gi == 0 {
                         rows.iter().filter(|r| r.group == 0 && r.depth == 0).count()
                     } else {
@@ -187,6 +200,7 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
             }
             ui.add_space(12.0);
         });
+    app.persist_table(&mut table);
     app.processes_state.cache = cache;
 }
 
@@ -198,13 +212,12 @@ fn group_header(
     label: &str,
     count: usize,
 ) {
-    let gi = if label == "Apps" { 0 } else { 1 };
-    let (rect, resp) = ui.allocate_exact_size(
-        egui::vec2(ui.available_width(), 38.0),
-        egui::Sense::click(),
-    );
+    let gi = if label == i18n::tr(K::GroupApps) { 0 } else { 1 };
+    let (rect, resp) =
+        ui.allocate_exact_size(egui::vec2(ui.available_width(), 38.0), egui::Sense::click());
     if resp.hovered() {
-        ui.painter().rect_filled(rect, 4.0, egui::Color32::from_white_alpha(8));
+        ui.painter()
+            .rect_filled(rect, 4.0, egui::Color32::from_white_alpha(8));
     }
     ui.painter().text(
         egui::Pos2::new(rect.left() + 18.0, rect.center().y),
@@ -218,11 +231,12 @@ fn group_header(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn row_ui(
     app: &mut TaskManApp,
     ui: &mut egui::Ui,
     pal: &theme::Palette,
-    table: &TmTable,
+    table: &crate::widgets::tablekit::TmTable,
     avail: f32,
     row: &Row,
     maxima: &[f64; 4],
@@ -231,7 +245,14 @@ fn row_ui(
     let (rect, resp) = table.row(ui, pal, avail, selected);
 
     // Chevron + icon + name.
-    let toggled = row.children && table.chevron(ui, rect, app.processes_state.expanded.contains(&row.pid), true, pal);
+    let toggled = row.children
+        && table.chevron(
+            ui,
+            rect,
+            app.processes_state.expanded.contains(&row.pid),
+            true,
+            pal,
+        );
     if toggled {
         if app.processes_state.expanded.contains(&row.pid) {
             app.processes_state.expanded.remove(&row.pid);
@@ -244,10 +265,18 @@ fn row_ui(
         .icon_path
         .as_ref()
         .and_then(|p| app.shared.icons.get(ui.ctx(), app.actions.as_ref(), p, 6));
-    table.icon_cell(ui, rect.translate(egui::vec2(row.depth as f32 * 22.0, 0.0)), tex.as_ref(), pal.accent);
+    table.icon_cell(
+        ui,
+        rect.translate(egui::vec2(row.depth as f32 * 22.0, 0.0)),
+        tex.as_ref(),
+        pal.accent,
+    );
     let name_rect = table.col_rect(0, avail, rect);
     ui.painter().text(
-        egui::Pos2::new(name_rect.left() + 58.0 + row.depth as f32 * 22.0, rect.center().y),
+        egui::Pos2::new(
+            name_rect.left() + 58.0 + row.depth as f32 * 22.0,
+            rect.center().y,
+        ),
         egui::Align2::LEFT_CENTER,
         &row.name,
         egui::FontId::proportional(12.5),
@@ -256,7 +285,7 @@ fn row_ui(
 
     // Status text + efficiency leaf.
     if row.suspended {
-        table.text_cell(ui, avail, rect, 1, "Angehalten", pal, false);
+        table.text_cell(ui, avail, rect, 1, i18n::tr(K::StSuspended), pal, false);
     }
     if app.efficiency_pids.contains(&row.pid) {
         let status_rect = table.col_rect(1, avail, rect);
@@ -273,10 +302,10 @@ fn row_ui(
 
     // Heat cells.
     let texts = [
-        format::format_pct_de(row.values[0].min(100.0) as f32),
-        format::format_mb_de(row.values[1] as u64),
-        format::format_rate_de(row.values[2]),
-        format::format_mbit_de(row.values[3]),
+        format::format_pct_cell(row.values[0].min(100.0) as f32),
+        format::format_mb(row.values[1] as u64),
+        format::format_rate_mb(row.values[2]),
+        format::format_mbit(row.values[3]),
     ];
     let intensity = [
         (row.values[0].min(100.0) / 100.0) as f32,
@@ -285,8 +314,11 @@ fn row_ui(
         (row.values[3] / maxima[3].max(1.0)) as f32,
     ];
     let active = row.values.iter().any(|&v| v > 0.0);
-    let cells: Vec<(f32, String)> =
-        intensity.iter().zip(texts.iter()).map(|(t, s)| (*t, s.clone())).collect();
+    let cells: Vec<(f32, String)> = intensity
+        .iter()
+        .zip(texts.iter())
+        .map(|(t, s)| (*t, s.clone()))
+        .collect();
     table.heat_cells(ui, pal, avail, rect, 2, &cells, active);
 
     if resp.clicked() {
@@ -296,24 +328,28 @@ fn row_ui(
 }
 
 fn context_menu(app: &mut TaskManApp, ui: &mut egui::Ui, row: &Row) {
-    ui.set_min_width(200.0);
-    if ui.button("Task beenden").clicked() {
+    ui.set_min_width(210.0);
+    if ui.button(i18n::tr(K::EndTask)).clicked() {
         match app.actions.kill_process(row.pid, false) {
-            Ok(()) => app.shared.toast(format!("{} beendet", row.name)),
-            Err(e) => app.shared.toast(format!("Fehler: {e}")),
+            Ok(()) => app
+                .shared
+                .toast(i18n::trf(K::NameEndedToast, &[&row.name])),
+            Err(e) => app.shared.toast(i18n::trf(K::ErrMsg, &[&e.to_string()])),
         }
         ui.close();
     }
     #[cfg(target_os = "windows")]
-    if ui.button("Struktur beenden").clicked() {
+    if ui.button(i18n::tr(K::EndTree)).clicked() {
         match app.actions.kill_process(row.pid, true) {
-            Ok(()) => app.shared.toast(format!("Struktur von {} beendet", row.name)),
-            Err(e) => app.shared.toast(format!("Fehler: {e}")),
+            Ok(()) => app
+                .shared
+                .toast(i18n::trf(K::TreeOfEndedToast, &[&row.name])),
+            Err(e) => app.shared.toast(i18n::trf(K::ErrMsg, &[&e.to_string()])),
         }
         ui.close();
     }
     ui.separator();
-    if ui.button("Effizienzmodus").clicked() {
+    if ui.button(i18n::tr(K::EfficiencyMode)).clicked() {
         let on = !app.efficiency_pids.contains(&row.pid);
         match app.actions.set_efficiency_mode(row.pid, on) {
             Ok(()) => {
@@ -323,13 +359,35 @@ fn context_menu(app: &mut TaskManApp, ui: &mut egui::Ui, row: &Row) {
                     app.efficiency_pids.remove(&row.pid);
                 }
             }
-            Err(e) => app.shared.toast(format!("Fehler: {e}")),
+            Err(e) => app.shared.toast(i18n::trf(K::ErrMsg, &[&e.to_string()])),
         }
         ui.close();
     }
-    if ui.button("Im Detail anzeigen").clicked() {
+    if ui.button(i18n::tr(K::GoToDetails)).clicked() {
         app.details_state.filter = row.name.clone();
         app.tab = crate::app::Tab::Details;
+        ui.close();
+    }
+    #[cfg(target_os = "windows")]
+    {
+        if ui.button(i18n::tr(K::GoToServices)).clicked() {
+            app.goto_services_for_pid(row.pid);
+            ui.close();
+        }
+    }
+    ui.separator();
+    if ui.button(i18n::tr(K::OpenFileLocation)).clicked() {
+        match row.icon_path.as_deref() {
+            Some(path) => match app.actions.open_file_location(path) {
+                Ok(()) => {}
+                Err(e) => app.shared.toast(i18n::trf(K::ErrMsg, &[&e.to_string()])),
+            },
+            None => app.shared.toast(i18n::tr(K::NoFileForProcess)),
+        }
+        ui.close();
+    }
+    if ui.button(i18n::tr(K::Properties)).clicked() {
+        app.proc_props = Some(row.pid);
         ui.close();
     }
     let _ = row.suspended;
@@ -359,10 +417,7 @@ fn build_rows(
     let all: Vec<&ProcessEntry> = snap.processes.iter().collect();
     // Subtree aggregates computed once per process (used for sorting + rows).
     let all_children = children_map(&all);
-    let mut subtree: HashMap<u32, [f64; 4]> = HashMap::with_capacity(all.len());
-    for p in &all {
-        subtree.insert(p.pid, subtree_values(p, &all_children));
-    }
+    let subtree = subtree_values(&all, &all_children);
 
     // The sampler marks whole app-subtrees as `App`; the topmost process of
     // each subtree is the root (TM's "Steam (2)" style grouping).
@@ -441,7 +496,6 @@ fn children_map<'a>(list: &[&'a ProcessEntry]) -> HashMap<u32, Vec<&'a ProcessEn
     }
     m
 }
-
 #[allow(clippy::too_many_arguments)]
 fn emit_tree<'a>(
     out: &mut Vec<Row>,
@@ -508,7 +562,10 @@ fn make_row(
         pid: p.pid,
         depth,
         name,
-        icon_path: p.exe_path.as_ref().map(|p| p.to_string_lossy().into_owned()),
+        icon_path: p
+            .exe_path
+            .as_ref()
+            .map(|p| p.to_string_lossy().into_owned()),
         children,
         group,
         values: *values,
@@ -516,42 +573,97 @@ fn make_row(
     }
 }
 
-/// Aggregate cpu/mem/disk/net over a process and all its descendants.
+/// Aggregate cpu/mem/disk/net over each process and all its descendants.
+///
+/// Iterative with memoization (O(n)) and a cycle guard — a malformed ppid
+/// loop can never recurse to a stack overflow. Returns an empty map when the
+/// children graph is empty.
 fn subtree_values(
-    p: &ProcessEntry,
+    all: &[&ProcessEntry],
     children: &HashMap<u32, Vec<&ProcessEntry>>,
-) -> [f64; 4] {
-    let mut v = [
-        p.cpu_pct as f64,
-        p.mem_bytes as f64,
-        p.disk_read_bps + p.disk_write_bps,
-        p.net_recv_bps.unwrap_or(0.0) + p.net_sent_bps.unwrap_or(0.0),
-    ];
-    if let Some(kids) = children.get(&p.pid) {
-        for k in kids {
-            let kv = subtree_values(k, children);
-            for i in 0..4 {
-                v[i] += kv[i];
+) -> HashMap<u32, [f64; 4]> {
+    let own = |p: &ProcessEntry| {
+        [
+            p.cpu_pct as f64,
+            p.mem_bytes as f64,
+            p.disk_read_bps + p.disk_write_bps,
+            p.net_recv_bps.unwrap_or(0.0) + p.net_sent_bps.unwrap_or(0.0),
+        ]
+    };
+    let mut out: HashMap<u32, [f64; 4]> = HashMap::with_capacity(all.len());
+    if children.is_empty() {
+        for p in all {
+            out.insert(p.pid, own(p));
+        }
+        return out;
+    }
+    // Post-order traversal state: 0 = unseen, 1 = in progress, 2 = done.
+    let by_pid: HashMap<u32, &ProcessEntry> = all.iter().map(|p| (p.pid, *p)).collect();
+    let mut state: HashMap<u32, u8> = HashMap::with_capacity(all.len());
+    for root in all {
+        let mut stack: Vec<(u32, bool)> = vec![(root.pid, false)];
+        while let Some((pid, expanded)) = stack.pop() {
+            if expanded {
+                let Some(p) = by_pid.get(&pid) else { continue };
+                let mut v = own(p);
+                if let Some(kids) = children.get(&pid) {
+                    for k in kids {
+                        if let Some(kv) = out.get(&k.pid) {
+                            for i in 0..4 {
+                                v[i] += kv[i];
+                            }
+                        }
+                    }
+                }
+                out.insert(pid, v);
+                continue;
+            }
+            match state.get(&pid) {
+                Some(2) => continue,
+                Some(1) => {
+                    // Cycle: treat the node as its own subtree root.
+                    continue;
+                }
+                _ => {}
+            }
+            state.insert(pid, 1);
+            stack.push((pid, true));
+            if let Some(kids) = children.get(&pid) {
+                for k in kids {
+                    if !matches!(state.get(&k.pid), Some(1 | 2)) {
+                        stack.push((k.pid, false));
+                    }
+                }
             }
         }
+        // Any node still missing (cycle members) gets its own values only.
+        for p in all {
+            out.entry(p.pid).or_insert_with(|| own(p));
+        }
     }
-    v
+    out
 }
 
-fn sort_entries(
-    v: &mut [&ProcessEntry],
-    col: usize,
-    asc: bool,
-    subtree: &HashMap<u32, [f64; 4]>,
-) {
+fn sort_entries(v: &mut [&ProcessEntry], col: usize, asc: bool, subtree: &HashMap<u32, [f64; 4]>) {
     let sv = |p: &ProcessEntry, i: usize| subtree.get(&p.pid).map_or(0.0, |s| s[i]);
     v.sort_by(|a, b| {
         let o = match col {
-            2 => sv(a, 0).partial_cmp(&sv(b, 0)).unwrap_or(std::cmp::Ordering::Equal),
-            3 => sv(a, 1).partial_cmp(&sv(b, 1)).unwrap_or(std::cmp::Ordering::Equal),
-            4 => sv(a, 2).partial_cmp(&sv(b, 2)).unwrap_or(std::cmp::Ordering::Equal),
-            5 => sv(a, 3).partial_cmp(&sv(b, 3)).unwrap_or(std::cmp::Ordering::Equal),
-            _ => a.shown_name().to_lowercase().cmp(&b.shown_name().to_lowercase()),
+            2 => sv(a, 0)
+                .partial_cmp(&sv(b, 0))
+                .unwrap_or(std::cmp::Ordering::Equal),
+            3 => sv(a, 1)
+                .partial_cmp(&sv(b, 1))
+                .unwrap_or(std::cmp::Ordering::Equal),
+            4 => sv(a, 2)
+                .partial_cmp(&sv(b, 2))
+                .unwrap_or(std::cmp::Ordering::Equal),
+            5 => sv(a, 3)
+                .partial_cmp(&sv(b, 3))
+                .unwrap_or(std::cmp::Ordering::Equal),
+            _ => a
+                .shown_name()
+                .to_lowercase()
+                .cmp(&b.shown_name().to_lowercase()),
         };
         if asc { o } else { o.reverse() }
     });

@@ -1,46 +1,61 @@
 //! Users tab: TM-style table (Benutzer/Status/CPU/Arbeitsspeicher/Datenträger/
 //! Netzwerk) with aggregate header, expandable per-user app groups and the
-//! Trennen / Benutzerkonten verwalten commands.
+//! Trennen/Abmelden / Benutzerkonten verwalten commands.
 
 use eframe::egui;
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 use tm_core::format;
+use tm_core::i18n::{self, K};
 use tm_core::model::{ProcCategory, UserSession};
 
 use crate::app::TaskManApp;
 use crate::icons::Icon;
 use crate::theme;
-use crate::widgets::tablekit::{Aggregates, TmColumn, TmTable};
+use crate::widgets::tablekit::{Aggregates, TmColumn};
 
-const COLS: [TmColumn; 6] = [
-    TmColumn::text("user", "Benutzer", 0.0),
-    TmColumn::text("status", "Status", 190.0),
-    TmColumn::num("cpu", "CPU", 110.0),
-    TmColumn::num("mem", "Arbeitsspeicher", 110.0),
-    TmColumn::num("disk", "Datenträger", 110.0),
-    TmColumn::num("net", "Netzwerk", 110.0),
-];
+fn columns() -> Vec<TmColumn> {
+    vec![
+        TmColumn::text("user", i18n::tr(K::TabUsers), 0.0),
+        TmColumn::text("status", i18n::tr(K::ColStatus), 190.0),
+        TmColumn::num("cpu", i18n::tr(K::ColCpu), 110.0),
+        TmColumn::num("mem", i18n::tr(K::ColMemory), 110.0),
+        TmColumn::num("disk", i18n::tr(K::ColDisk), 110.0),
+        TmColumn::num("net", i18n::tr(K::ColNetwork), 110.0),
+    ]
+}
 
 pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
     let pal = theme::palette(ui);
 
-    // Lazy refresh of the session list.
+    // Lazy refresh of the session list in the background.
     {
-        let cache = app.shared.sessions_cache.clone();
-        let mut guard = cache.lock();
-        let stale = match guard.as_ref() {
-            Some((_, t)) => t.elapsed() > Duration::from_secs(5),
-            None => true,
-        };
-        if stale {
-            match app.actions.list_user_sessions() {
-                Ok(sessions) => *guard = Some((sessions, Instant::now())),
-                Err(e) => {
-                    app.shared.toast(format!("Sitzungen nicht verfügbar: {e}"));
-                    *guard = Some((vec![], Instant::now()));
-                }
+        let stale = {
+            let guard = tm_core::sync::lock(&app.shared.sessions_cache);
+            match guard.as_ref() {
+                Some((_, t)) => t.elapsed() > Duration::from_secs(5),
+                None => true,
             }
+        };
+        if stale && app.shared.sessions_fetch.begin() {
+            let cache = app.shared.sessions_cache.clone();
+            let toasts = app.shared.toasts.clone();
+            let done = app.shared.sessions_fetch.flag();
+            let actions = app.actions.clone();
+            let _ = std::thread::Builder::new()
+                .name("tm-sess-fetch".into())
+                .spawn(move || {
+                    let sessions = actions.list_user_sessions();
+                    if let Err(e) = &sessions {
+                        crate::app::toast_from(
+                            &toasts,
+                            i18n::trf(K::SessionsUnavailable, &[&e.to_string()]),
+                        );
+                    }
+                    *tm_core::sync::lock(&cache) =
+                        Some((sessions.unwrap_or_default(), Instant::now()));
+                    done.store(false, std::sync::atomic::Ordering::Relaxed);
+                });
         }
     }
 
@@ -51,35 +66,53 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
         &pal,
         |app, ui| {
             let enabled = app.selected_user.is_some() && caps.user_disconnect;
-            if crate::app_ui::cmd_button(ui, &pal, Icon::SlashCircle, "Trennen", enabled)
-                && let Some(id) = app.selected_user {
-                    match app
-                        .actions
-                        .control_user_session(id, tm_platform::actions::UserSessionAction::Disconnect)
-                    {
-                        Ok(()) => app.shared.toast("Sitzung getrennt"),
-                        Err(e) => app.shared.toast(format!("Fehler: {e}")),
-                    }
-                }
-            if crate::app_ui::cmd_button(ui, &pal, Icon::Users, "Benutzerkonten verwalten", true) {
+            if crate::app_ui::cmd_button(
+                ui,
+                &pal,
+                Icon::SlashCircle,
+                i18n::tr(K::DisconnectUser),
+                enabled,
+            ) && let Some(id) = app.selected_user
+            {
+                session_action(app, id, tm_platform::actions::UserSessionAction::Disconnect);
+            }
+            if crate::app_ui::cmd_button(
+                ui,
+                &pal,
+                Icon::Person,
+                i18n::tr(K::SignOut),
+                enabled,
+            ) && let Some(id) = app.selected_user
+            {
+                session_action(app, id, tm_platform::actions::UserSessionAction::Logoff);
+            }
+            if crate::app_ui::cmd_button(
+                ui,
+                &pal,
+                Icon::Users,
+                i18n::tr(K::ManageUserAccounts),
+                true,
+            ) {
                 let _ = app.actions.run_new_task("ms-settings:otherusers", false);
             }
         },
         |_app, _ui| {},
     );
 
-    let guard = app.shared.sessions_cache.clone();
-    let cache = guard.lock();
-    let Some((sessions, _)) = cache.as_ref() else { return };
-    let Some(snap) = app.latest_snapshot() else { return };
+    let sessions_arc = app.shared.sessions_cache.clone();
+    let guard = tm_core::sync::lock(&sessions_arc);
+    let Some((sessions, _)) = guard.as_ref() else {
+        return;
+    };
+    let Some(snap) = app.latest_snapshot() else {
+        return;
+    };
 
     // Real user sessions only — drop session 0 / services sessions.
     let sessions: Vec<&UserSession> = sessions
         .iter()
         .filter(|s| {
-            s.id != 0
-                && !s.user.is_empty()
-                && !s.user.to_lowercase().starts_with("session")
+            s.id != 0 && !s.user.is_empty() && !s.user.to_lowercase().starts_with("session")
         })
         .collect();
 
@@ -96,11 +129,22 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
     let mut aggs: HashMap<u32, Agg> = HashMap::new();
     for s in &sessions {
         let name = s.user.trim_start_matches('(').trim_end_matches(')');
-        aggs.insert(s.id, Agg { cpu: 0.0, mem: 0.0, disk: 0.0, net: 0.0, count: 0, apps: HashMap::new() });
+        aggs.insert(
+            s.id,
+            Agg {
+                cpu: 0.0,
+                mem: 0.0,
+                disk: 0.0,
+                net: 0.0,
+                count: 0,
+                apps: HashMap::new(),
+            },
+        );
         let entry = aggs.get_mut(&s.id).expect("just inserted");
         for p in &snap.processes {
             if let Some(u) = &p.user
-                && (u.eq_ignore_ascii_case(&s.user) || (!name.is_empty() && u.eq_ignore_ascii_case(name)))
+                && (u.eq_ignore_ascii_case(&s.user)
+                    || (!name.is_empty() && u.eq_ignore_ascii_case(name)))
             {
                 entry.cpu += p.cpu_pct as f64;
                 entry.mem += p.mem_bytes as f64;
@@ -116,30 +160,21 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
                 e.0[3] += p.net_recv_bps.unwrap_or(0.0) + p.net_sent_bps.unwrap_or(0.0);
                 e.1 += 1;
                 if e.2.is_none() {
-                    e.2 = p.exe_path.as_ref().map(|x| x.to_string_lossy().into_owned());
+                    e.2 = p
+                        .exe_path
+                        .as_ref()
+                        .map(|x| x.to_string_lossy().into_owned());
                 }
             }
         }
     }
 
     let q = app.search.trim().to_lowercase();
-    let table = TmTable::new(COLS.to_vec(), 340.0);
+    let mut table = app.make_table("users", columns(), 340.0);
     let agg_hdr = Aggregates::from_snapshot(&snap);
     let aggs_hdr = agg_hdr.strings();
-    {
-        let total: f32 = snap.processes.iter().map(|p| p.cpu_pct).sum();
-        eprintln!(
-            "USERS-DBG: sys_cpu={:.1} sum_proc_cpu={:.1} mem_used={} mem_total={} used_pct={:.1} aggs={:?}",
-            snap.cpu.utilization_pct,
-            total,
-            snap.memory.used_bytes,
-            snap.memory.total_bytes,
-            snap.memory.used_pct(),
-            aggs_hdr,
-        );
-    }
 
-    let avail = ui.available_width();
+    let avail = crate::widgets::tablekit::table_avail(ui);
     table.header(ui, &pal, avail, None, Some(&aggs_hdr));
 
     egui::ScrollArea::vertical()
@@ -181,21 +216,21 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
                     pal.text,
                 );
 
-                // Status: session state (German); TM shows active users blank.
+                // Status: session state (localized); TM shows active users blank.
                 let status = match s.state {
                     tm_core::model::UserSessionState::Active => "",
-                    tm_core::model::UserSessionState::Disconnected => "Getrennt",
-                    tm_core::model::UserSessionState::Idle => "Leerlauf",
-                    tm_core::model::UserSessionState::Connected => "Verbunden",
+                    tm_core::model::UserSessionState::Disconnected => i18n::tr(K::StDisconnected),
+                    tm_core::model::UserSessionState::Idle => i18n::tr(K::StIdle),
+                    tm_core::model::UserSessionState::Connected => i18n::tr(K::StConnected),
                     _ => "",
                 };
                 table.text_cell(ui, avail, rect, 1, status, &pal, false);
 
                 let texts = [
-                    format::format_pct_de(a.cpu.min(100.0) as f32),
-                    format::format_mb_de(a.mem as u64),
-                    format::format_rate_de(a.disk),
-                    format::format_mbit_de(a.net),
+                    format::format_pct_cell(a.cpu.min(100.0) as f32),
+                    format::format_mb(a.mem as u64),
+                    format::format_rate_mb(a.disk),
+                    format::format_mbit(a.net),
                 ];
                 let active_row = a.cpu > 0.0 || a.mem > 0.0 || a.disk > 0.0 || a.net > 0.0;
                 let cells: Vec<(f32, String)> = vec![
@@ -209,18 +244,48 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
                 if resp.clicked() {
                     app.selected_user = Some(s.id);
                 }
+                if caps.user_disconnect {
+                    resp.context_menu(|ui| {
+                        ui.set_min_width(150.0);
+                        if ui.button(i18n::tr(K::DisconnectUser)).clicked() {
+                            session_action(
+                                app,
+                                s.id,
+                                tm_platform::actions::UserSessionAction::Disconnect,
+                            );
+                            ui.close();
+                        }
+                        if ui.button(i18n::tr(K::SignOut)).clicked() {
+                            session_action(
+                                app,
+                                s.id,
+                                tm_platform::actions::UserSessionAction::Logoff,
+                            );
+                            ui.close();
+                        }
+                    });
+                }
 
                 // Expanded: grouped app rows for this user.
                 if app.users_expanded_contains(s.id) {
                     type AppRow<'a> = (&'a String, &'a ([f64; 4], usize, Option<String>));
                     let mut apps: Vec<AppRow<'_>> = a.apps.iter().collect();
-                    apps.sort_by(|x, y| y.1 .0[1].partial_cmp(&x.1 .0[1]).unwrap_or(std::cmp::Ordering::Equal));
+                    apps.sort_by(|x, y| {
+                        y.1.0[1]
+                            .partial_cmp(&x.1.0[1])
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                    });
                     for (name, (vals, count, exe)) in apps {
                         let (r2, resp2) = table.row(ui, &pal, avail, false);
-                        let tex = exe
-                            .as_ref()
-                            .and_then(|p| app.shared.icons.get(ui.ctx(), app.actions.as_ref(), p, 6));
-                        table.icon_cell(ui, r2.translate(egui::vec2(22.0, 0.0)), tex.as_ref(), pal.accent);
+                        let tex = exe.as_ref().and_then(|p| {
+                            app.shared.icons.get(ui.ctx(), app.actions.as_ref(), p, 6)
+                        });
+                        table.icon_cell(
+                            ui,
+                            r2.translate(egui::vec2(22.0, 0.0)),
+                            tex.as_ref(),
+                            pal.accent,
+                        );
                         let nr = table.col_rect(0, avail, r2);
                         let label = if *count > 1 {
                             format!("{name} ({count})")
@@ -235,10 +300,10 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
                             pal.text,
                         );
                         let texts = [
-                            format::format_pct_de(vals[0] as f32),
-                            format::format_mb_de(vals[1] as u64),
-                            format::format_rate_de(vals[2]),
-                            format::format_mbit_de(vals[3]),
+                            format::format_pct_cell(vals[0] as f32),
+                            format::format_mb(vals[1] as u64),
+                            format::format_rate_mb(vals[2]),
+                            format::format_mbit(vals[3]),
                         ];
                         let cells = vec![
                             ((vals[0] / 100.0) as f32, texts[0].clone()),
@@ -246,7 +311,15 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
                             (0.0, texts[2].clone()),
                             (0.0, texts[3].clone()),
                         ];
-                        table.heat_cells(ui, &pal, avail, r2, 2, &cells, vals.iter().any(|&v| v > 0.0));
+                        table.heat_cells(
+                            ui,
+                            &pal,
+                            avail,
+                            r2,
+                            2,
+                            &cells,
+                            vals.iter().any(|&v| v > 0.0),
+                        );
                         if resp2.clicked() {
                             app.selected_user = Some(s.id);
                         }
@@ -255,6 +328,17 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
             }
             ui.add_space(12.0);
         });
+    app.persist_table(&mut table);
+}
+
+fn session_action(app: &mut TaskManApp, id: u32, action: tm_platform::actions::UserSessionAction) {
+    match app.actions.control_user_session(id, action) {
+        Ok(()) => app.shared.toast(match action {
+            tm_platform::actions::UserSessionAction::Disconnect => i18n::tr(K::SessionDisconnected),
+            tm_platform::actions::UserSessionAction::Logoff => i18n::tr(K::UserSignedOut),
+        }),
+        Err(e) => app.shared.toast(i18n::trf(K::ErrMsg, &[&e.to_string()])),
+    }
 }
 
 // Small helpers to keep the borrow checker happy inside the loop above.

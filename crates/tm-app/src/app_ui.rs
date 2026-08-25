@@ -1,7 +1,9 @@
 //! UI chrome of the root app: top search bar, navigation rail (hamburger
-//! collapsible), per-tab command header, dialogs, toasts.
+//! collapsible), per-tab command header, dialogs, toasts. Fully localized
+//! (DE/EN) via tm-core::i18n.
 
 use eframe::egui::{self, Align2, Color32, FontId, Pos2, Rect, Sense, Stroke};
+use tm_core::i18n::{self, K};
 use tm_core::settings::{Settings, ThemeMode};
 
 use crate::app::TaskManApp;
@@ -26,20 +28,21 @@ pub const SIDEBAR_W_COLLAPSED: f32 = 54.0;
 pub fn top_search_panel(app: &mut TaskManApp, ui_root: &mut egui::Ui, pal: &Palette) {
     egui::Panel::top(egui::Id::new("topsearch"))
         .resizable(false)
-        .frame(egui::Frame::NONE.fill(pal.window_bg).inner_margin(egui::Margin::symmetric(0, 6)))
+        .frame(
+            egui::Frame::NONE
+                .fill(pal.window_bg)
+                .inner_margin(egui::Margin::symmetric(0, 6)),
+        )
         .show(ui_root, |ui| {
             let box_w = 560.0f32.min(ui.available_width() * 0.7);
             let x = (ui.available_width() - box_w) / 2.0;
-            let (rect, _) = ui.allocate_exact_size(
-                egui::vec2(ui.available_width(), 34.0),
-                Sense::hover(),
-            );
+            let (rect, _) =
+                ui.allocate_exact_size(egui::vec2(ui.available_width(), 34.0), Sense::hover());
             let box_rect = Rect::from_min_size(
                 Pos2::new(rect.left() + x, rect.top()),
                 egui::vec2(box_w, 34.0),
             );
-            ui.painter()
-                .rect_filled(box_rect, 16.0, pal.card_bg);
+            ui.painter().rect_filled(box_rect, 16.0, pal.card_bg);
             ui.painter().rect_stroke(
                 box_rect,
                 16.0,
@@ -63,7 +66,7 @@ pub fn top_search_panel(app: &mut TaskManApp, ui_root: &mut egui::Ui, pal: &Pale
             let mut edit_ui = ui.new_child(egui::UiBuilder::new().max_rect(edit_rect));
             edit_ui.add(
                 egui::TextEdit::singleline(&mut app.search)
-                    .hint_text("Nach Namen, Herausgeber oder PID suchen")
+                    .hint_text(i18n::tr(K::SearchHint))
                     .font(FontId::proportional(12.5))
                     .frame(egui::Frame::NONE)
                     .desired_width(edit_rect.width()),
@@ -75,7 +78,11 @@ pub fn top_search_panel(app: &mut TaskManApp, ui_root: &mut egui::Ui, pal: &Pale
 
 pub fn sidebar(app: &mut TaskManApp, ui_root: &mut egui::Ui, pal: &Palette) {
     let collapsed = app.shared.settings.sidebar_collapsed;
-    let w = if collapsed { SIDEBAR_W_COLLAPSED } else { SIDEBAR_W };
+    let w = if collapsed {
+        SIDEBAR_W_COLLAPSED
+    } else {
+        SIDEBAR_W
+    };
     egui::Panel::left(egui::Id::new("nav"))
         .resizable(false)
         .min_size(w)
@@ -83,7 +90,12 @@ pub fn sidebar(app: &mut TaskManApp, ui_root: &mut egui::Ui, pal: &Palette) {
         .frame(
             egui::Frame::NONE
                 .fill(pal.sidebar_bg)
-                .inner_margin(egui::Margin { left: 8, right: 8, top: 4, bottom: 8 }),
+                .inner_margin(egui::Margin {
+                    left: 8,
+                    right: 8,
+                    top: 4,
+                    bottom: 8,
+                }),
         )
         .show(ui_root, |ui| {
             // Hamburger toggle.
@@ -105,12 +117,19 @@ pub fn sidebar(app: &mut TaskManApp, ui_root: &mut egui::Ui, pal: &Palette) {
 
             // Bottom: settings gear.
             ui.add_space(ui.available_height() - 36.0);
-            let resp = nav_item(ui, pal, Icon::Settings, "Einstellungen", false, collapsed);
+            let resp = nav_item(
+                ui,
+                pal,
+                Icon::Settings,
+                i18n::tr(K::Settings),
+                false,
+                collapsed,
+            );
             if resp.clicked() {
                 app.show_settings = true;
             }
             if collapsed && resp.hovered() {
-                resp.on_hover_text("Einstellungen");
+                resp.on_hover_text(i18n::tr(K::Settings));
             }
         });
 }
@@ -130,7 +149,15 @@ fn nav_item(
     );
     let painter = ui.painter();
     if selected {
-        painter.rect_filled(rect, 4.0, Color32::from_white_alpha(if pal.sidebar_bg == theme::LIGHT.sidebar_bg { 255 - 30 } else { 26 }));
+        painter.rect_filled(
+            rect,
+            4.0,
+            Color32::from_white_alpha(if pal.sidebar_bg == theme::LIGHT.sidebar_bg {
+                255 - 30
+            } else {
+                26
+            }),
+        );
         let bar = Rect::from_min_size(
             Pos2::new(rect.left(), rect.center().y - 10.0),
             egui::vec2(3.0, 20.0),
@@ -141,8 +168,7 @@ fn nav_item(
     }
 
     if collapsed {
-        let icon_rect =
-            Rect::from_center_size(rect.center(), egui::vec2(20.0, 20.0));
+        let icon_rect = Rect::from_center_size(rect.center(), egui::vec2(20.0, 20.0));
         icons::draw_at(ui, icon_rect, icon, pal.text);
     } else {
         let icon_rect = Rect::from_center_size(
@@ -164,7 +190,8 @@ fn nav_item(
 fn icon_button(ui: &mut egui::Ui, pal: &Palette, icon: Icon, size: f32) -> bool {
     let (rect, resp) = ui.allocate_exact_size(egui::vec2(size, size), Sense::click());
     if resp.hovered() {
-        ui.painter().rect_filled(rect, 4.0, Color32::from_white_alpha(12));
+        ui.painter()
+            .rect_filled(rect, 4.0, Color32::from_white_alpha(12));
     }
     crate::icons::draw_at(
         ui,
@@ -186,7 +213,7 @@ pub fn tab_header(
     extra: impl FnOnce(&mut TaskManApp, &mut egui::Ui),
     menu: impl FnOnce(&mut TaskManApp, &mut egui::Ui),
 ) {
-    let title = app.tab.label().to_string();
+    let title = app.tab.label();
     ui.horizontal(|ui| {
         ui.add_space(16.0);
         ui.label(egui::RichText::new(title).size(15.5).strong());
@@ -195,7 +222,7 @@ pub fn tab_header(
             ellipsis_menu(app, ui, pal, menu);
             extra(app, ui);
             vsep(ui, pal);
-            if cmd_button(ui, pal, Icon::RunTask, "Neuen Task ausführen", true) {
+            if cmd_button(ui, pal, Icon::RunTask, i18n::tr(K::RunNewTask), true) {
                 app.run_dialog_open = true;
             }
         });
@@ -205,7 +232,13 @@ pub fn tab_header(
 }
 
 /// Flat command button with icon + label, Win11 toolbar style.
-pub fn cmd_button(ui: &mut egui::Ui, pal: &Palette, icon: Icon, label: &str, enabled: bool) -> bool {
+pub fn cmd_button(
+    ui: &mut egui::Ui,
+    pal: &Palette,
+    icon: Icon,
+    label: &str,
+    enabled: bool,
+) -> bool {
     let w = 28.0 + label.chars().count() as f32 * 7.1 + 6.0;
     let (rect, resp) = ui.allocate_exact_size(egui::vec2(w, 30.0), Sense::click());
     let mut clicked = false;
@@ -217,10 +250,17 @@ pub fn cmd_button(ui: &mut egui::Ui, pal: &Palette, icon: Icon, label: &str, ena
             clicked = true;
         }
     }
-    let color = if enabled { pal.text } else { pal.text_dim.gamma_multiply(0.55) };
+    let color = if enabled {
+        pal.text
+    } else {
+        pal.text_dim.gamma_multiply(0.55)
+    };
     crate::icons::draw_at(
         ui,
-        Rect::from_center_size(Pos2::new(rect.left() + 14.0, rect.center().y), egui::vec2(17.0, 17.0)),
+        Rect::from_center_size(
+            Pos2::new(rect.left() + 14.0, rect.center().y),
+            egui::vec2(17.0, 17.0),
+        ),
         icon,
         color,
     );
@@ -238,7 +278,10 @@ pub fn cmd_button(ui: &mut egui::Ui, pal: &Palette, icon: Icon, label: &str, ena
 pub fn vsep(ui: &mut egui::Ui, pal: &Palette) {
     let (rect, _) = ui.allocate_exact_size(egui::vec2(9.0, 26.0), Sense::hover());
     ui.painter().line_segment(
-        [Pos2::new(rect.center().x, rect.top() + 3.0), Pos2::new(rect.center().x, rect.bottom() - 3.0)],
+        [
+            Pos2::new(rect.center().x, rect.top() + 3.0),
+            Pos2::new(rect.center().x, rect.bottom() - 3.0),
+        ],
         Stroke::new(1.0, pal.stroke),
     );
 }
@@ -258,35 +301,38 @@ pub fn ellipsis_menu(
 
 // ---------------------------------------------------------------- dialogs
 
+/// Every switch applies instantly AND persists right away (tiny atomic JSON
+/// write, ~1 ms) so a crash can never lose the last change.
 pub fn settings_dialog(app: &mut TaskManApp, ctx: &egui::Context, _pal: &theme::Palette) {
     let mut open = true;
-    egui::Window::new("Einstellungen")
+    egui::Window::new(i18n::tr(K::Settings))
         .open(&mut open)
         .collapsible(false)
         .resizable(false)
         .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
         .show(ctx, |ui| {
-            ui.set_width(360.0);
+            ui.set_width(380.0);
 
-            ui.heading("Design");
+            ui.heading(i18n::tr(K::DesignHeading));
             ui.horizontal(|ui| {
-                for (mode, label) in [
-                    (ThemeMode::System, "System"),
-                    (ThemeMode::Light, "Hell"),
-                    (ThemeMode::Dark, "Dunkel"),
+                for (mode, key) in [
+                    (ThemeMode::System, K::ThemeSystem),
+                    (ThemeMode::Light, K::ThemeLight),
+                    (ThemeMode::Dark, K::ThemeDark),
                 ] {
                     if ui
-                        .selectable_label(app.shared.settings.theme == mode, label)
+                        .selectable_label(app.shared.settings.theme == mode, i18n::tr(key))
                         .clicked()
                     {
                         app.shared.settings.theme = mode;
                         apply_theme(ctx, mode);
+                        app.shared.settings.save();
                     }
                 }
             });
 
             ui.add_space(10.0);
-            ui.heading("Aktualisierungsgeschwindigkeit");
+            ui.heading(i18n::tr(K::UpdateSpeedHeading));
             ui.horizontal_wrapped(|ui| {
                 for speed in [
                     tm_core::settings::UpdateSpeed::High,
@@ -294,8 +340,14 @@ pub fn settings_dialog(app: &mut TaskManApp, ctx: &egui::Context, _pal: &theme::
                     tm_core::settings::UpdateSpeed::Low,
                     tm_core::settings::UpdateSpeed::Paused,
                 ] {
+                    let key = match speed {
+                        tm_core::settings::UpdateSpeed::High => K::SpdHigh,
+                        tm_core::settings::UpdateSpeed::Normal => K::SpdNormal,
+                        tm_core::settings::UpdateSpeed::Low => K::SpdLow,
+                        tm_core::settings::UpdateSpeed::Paused => K::SpdPaused,
+                    };
                     if ui
-                        .selectable_label(app.shared.settings.update_speed == speed, speed.label())
+                        .selectable_label(app.shared.settings.update_speed == speed, i18n::tr(key))
                         .clicked()
                     {
                         app.shared.settings.update_speed = speed;
@@ -306,30 +358,83 @@ pub fn settings_dialog(app: &mut TaskManApp, ctx: &egui::Context, _pal: &theme::
                                 app.engine.set_interval(speed.interval());
                             }
                         }
+                        app.shared.settings.save();
+                    }
+                }
+            });
+
+            ui.add_space(10.0);
+            // ---- language switcher (applies live, persists immediately)
+            ui.heading(i18n::tr(K::LanguageLabel));
+            ui.horizontal(|ui| {
+                for (choice, label) in [
+                    (
+                        tm_core::i18n::LangChoice::System,
+                        i18n::tr(K::ThemeSystem),
+                    ),
+                    (tm_core::i18n::LangChoice::De, "Deutsch"),
+                    (tm_core::i18n::LangChoice::En, "English"),
+                ] {
+                    if ui
+                        .selectable_label(app.shared.settings.language == choice, label)
+                        .clicked()
+                    {
+                        app.shared.settings.language = choice;
+                        i18n::set_lang(choice.resolve());
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Title(
+                            i18n::tr(K::WindowTitle).to_string(),
+                        ));
+                        app.shared.settings.save();
                     }
                 }
             });
 
             ui.add_space(10.0);
             let mut on_top = app.shared.settings.always_on_top;
-            if ui.checkbox(&mut on_top, "Immer im Vordergrund").changed() {
+            if ui.checkbox(&mut on_top, i18n::tr(K::AlwaysOnTop)).changed() {
                 app.shared.settings.always_on_top = on_top;
                 ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(if on_top {
                     egui::WindowLevel::AlwaysOnTop
                 } else {
                     egui::WindowLevel::Normal
                 }));
+                app.shared.settings.save();
             }
 
             ui.add_space(10.0);
-            ui.label("Diagrammfenster:");
+            ui.label(i18n::tr(K::GraphWindowLabel));
             ui.horizontal(|ui| {
                 for secs in [30u32, 60, 120] {
                     if ui
-                        .selectable_label(app.shared.settings.graph_seconds == secs, format!("{secs} s"))
+                        .selectable_label(
+                            app.shared.settings.graph_seconds == secs,
+                            format!("{secs} s"),
+                        )
                         .clicked()
                     {
                         app.shared.settings.graph_seconds = secs;
+                        app.shared.settings.save();
+                    }
+                }
+            });
+
+            ui.add_space(10.0);
+            ui.label(i18n::tr(K::ScaleLabel));
+            ui.horizontal(|ui| {
+                for (zoom, label) in [
+                    (0.8f32, "80 %"),
+                    (0.9, "90 %"),
+                    (1.0, "100 %"),
+                    (1.1, "110 %"),
+                    (1.25, "125 %"),
+                ] {
+                    if ui
+                        .selectable_label((app.shared.settings.ui_zoom - zoom).abs() < 0.01, label)
+                        .clicked()
+                    {
+                        app.shared.settings.ui_zoom = zoom;
+                        ctx.set_zoom_factor(zoom);
+                        app.shared.settings.save();
                     }
                 }
             });
@@ -337,15 +442,22 @@ pub fn settings_dialog(app: &mut TaskManApp, ctx: &egui::Context, _pal: &theme::
             ui.add_space(14.0);
             ui.separator();
             ui.horizontal(|ui| {
-                if ui.button("Zurücksetzen").clicked() {
+                if ui.button(i18n::tr(K::Reset)).clicked() {
                     let defaults = Settings::default();
                     apply_theme(ctx, defaults.theme);
+                    ctx.set_zoom_factor(defaults.ui_zoom);
                     app.engine.resume();
                     app.engine.set_interval(defaults.update_speed.interval());
+                    // Language follows System again after a reset.
+                    i18n::set_lang(defaults.language.resolve());
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Title(
+                        i18n::tr(K::WindowTitle).to_string(),
+                    ));
                     app.shared.settings = defaults;
+                    app.shared.settings.save();
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.button("Schließen").clicked() {
+                    if ui.button(i18n::tr(K::Close)).clicked() {
                         app.show_settings = false;
                         app.shared.settings.save();
                     }
@@ -359,38 +471,63 @@ pub fn settings_dialog(app: &mut TaskManApp, ctx: &egui::Context, _pal: &theme::
 
 pub fn run_task_dialog(app: &mut TaskManApp, ctx: &egui::Context, _pal: &theme::Palette) {
     let mut open = true;
-    egui::Window::new("Neuen Task ausführen")
+    egui::Window::new(i18n::tr(K::RunDialogTitle))
         .open(&mut open)
         .collapsible(false)
         .resizable(false)
         .anchor(Align2::CENTER_CENTER, [0.0, -40.0])
         .show(ctx, |ui| {
             ui.set_width(420.0);
-            ui.label("Name des Programms, Ordners oder Dokuments:");
+            ui.label(i18n::tr(K::RunPrompt));
             ui.add_space(4.0);
             let resp = ui.add(
                 egui::TextEdit::singleline(&mut app.run_dialog_text)
-                    .hint_text("z. B. notepad")
+                    .hint_text(i18n::tr(K::RunHint))
                     .desired_width(f32::INFINITY),
             );
             resp.request_focus();
             ui.add_space(4.0);
-            ui.checkbox(&mut app.run_elevated, "Mit Administratorrechten ausführen");
+            ui.checkbox(&mut app.run_elevated, i18n::tr(K::RunElevated));
             ui.add_space(8.0);
             ui.horizontal(|ui| {
-                if ui.button("Abbrechen").clicked() {
+                if ui.button(i18n::tr(K::Cancel)).clicked() {
                     app.run_dialog_open = false;
                 }
+                // Browse for an executable/document to run.
+                if ui.button(i18n::tr(K::Browse)).clicked()
+                    && let Some(path) = rfd::FileDialog::new().pick_file()
+                {
+                    app.run_dialog_text = path.to_string_lossy().into_owned();
+                }
                 let enter = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                if (ui.button("OK").clicked() || enter) && !app.run_dialog_text.trim().is_empty() {
+                if (ui.button(i18n::tr(K::Ok)).clicked() || enter)
+                    && !app.run_dialog_text.trim().is_empty()
+                {
+                    // Launch (including the brief failure-probe wait) happens on
+                    // a worker thread; the dialog closes immediately.
+                    let actions = app.actions.clone();
                     let cmdline = app.run_dialog_text.trim().to_string();
-                    match app.actions.run_new_task(&cmdline, app.run_elevated) {
-                        Ok(()) => {
-                            app.shared.toast(format!("Gestartet: {cmdline}"));
-                            app.run_dialog_open = false;
-                        }
-                        Err(e) => app.shared.toast(format!("Fehler: {e}")),
+                    let elevated = app.run_elevated;
+                    let toasts = app.shared.toasts.clone();
+                    let spawned =
+                        std::thread::Builder::new()
+                            .name("tm-run".into())
+                            .spawn(move || {
+                                let result = actions.run_new_task(&cmdline, elevated);
+                                let mut t = toasts.lock().unwrap_or_else(|e| e.into_inner());
+                                let msg = match result {
+                                    Ok(()) => i18n::trf(K::StartedMsg, &[&cmdline]),
+                                    Err(e) => i18n::trf(K::ErrMsg, &[&e.to_string()]),
+                                };
+                                t.push((msg, std::time::Instant::now()));
+                                if t.len() > 6 {
+                                    t.remove(0);
+                                }
+                            });
+                    if spawned.is_err() {
+                        app.shared.toast(i18n::tr(K::LaunchFailed));
                     }
+                    app.run_dialog_open = false;
                 }
             });
         });
@@ -400,7 +537,7 @@ pub fn run_task_dialog(app: &mut TaskManApp, ctx: &egui::Context, _pal: &theme::
 }
 
 pub fn draw_toasts(app: &TaskManApp, ctx: &egui::Context) {
-    let mut toasts = app.shared.toasts.lock();
+    let mut toasts = tm_core::sync::lock(&app.shared.toasts);
     toasts.retain(|(_, born)| born.elapsed() < std::time::Duration::from_secs(4));
     let mut y_offset = 0.0f32;
     for (msg, born) in toasts.iter() {

@@ -11,6 +11,21 @@ pub mod linux;
 #[cfg(target_os = "macos")]
 pub mod macos;
 
+/// OS locale detection: number/date formatting rules from regional settings.
+/// Windows queries the NLS APIs; other platforms fall back to env vars.
+pub fn detect_locale() -> tm_core::locale::LocaleFmt {
+    #[cfg(target_os = "windows")]
+    {
+        win::locale::detect_locale().unwrap_or_else(|| {
+            tm_core::locale::detect_env().unwrap_or_default()
+        })
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        tm_core::locale::detect_env().unwrap_or_default()
+    }
+}
+
 /// Build the platform's collector + action pair.
 ///
 /// Returns `(collector, actions)`. Never fails: platforms degrade gracefully

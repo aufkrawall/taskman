@@ -55,18 +55,45 @@ fn main() {
 }
 
 fn run_gui(mock: bool, args: &[String]) {
-    // Engine starts BEFORE the window so the first frame already has data.
-    let settings = tm_core::settings::Settings::load();
-    let engine = spawn_engine(mock, settings.update_speed.interval());
+    // Locale first: number/date formats + default UI language follow the OS.
+    tm_core::locale::init(tm_platform::detect_locale());
 
-    let options = |renderer: eframe::Renderer| eframe::NativeOptions {
-        renderer,
-        viewport: eframe::egui::ViewportBuilder::default()
-            .with_title("Task-Manager")
-            .with_inner_size([settings.window_size[0], settings.window_size[1]])
-            .with_min_inner_size([720.0, 480.0])
-            .with_icon(icon_data()),
-        ..Default::default()
+    // Engine starts BEFORE the window so the first frame already has data.
+    // (The collector itself initializes lazily on the engine thread.)
+    let settings = tm_core::settings::Settings::load();
+    tm_core::i18n::set_lang(settings.language.resolve());
+    let window_size = [settings.window_size[0], settings.window_size[1]];
+    let engine = spawn_engine(mock, settings.update_speed.interval());
+    if settings.update_speed == tm_core::settings::UpdateSpeed::Paused {
+        engine.pause();
+    }
+
+    let title = tm_core::i18n::tr(tm_core::i18n::K::WindowTitle).to_string();
+
+    // Renderer config: explicit FIFO present mode — always vsync'd through the
+    // desktop compositor at the display's refresh rate. Unlike Mailbox/
+    // Immediate this never bypasses composition, so it cannot tear or trip up
+    // VRR (G-Sync/FreeSync) displays or DWM fullscreen optimizations.
+    let options = |renderer: eframe::Renderer| {
+        let mut opts = eframe::NativeOptions {
+            renderer,
+            viewport: eframe::egui::ViewportBuilder::default()
+                .with_title(title.clone())
+                .with_inner_size(window_size)
+                .with_min_inner_size([720.0, 480.0])
+                .with_icon(icon_data()),
+            ..Default::default()
+        };
+        #[cfg(feature = "wgpu")]
+        {
+            opts.wgpu_options = eframe::WgpuConfiguration::default().with_surface_config(
+                eframe::SurfaceConfig {
+                    present_mode: eframe::wgpu::PresentMode::Fifo,
+                    desired_maximum_frame_latency: Some(2),
+                },
+            );
+        }
+        opts
     };
 
     let renderer_pref = std::env::var("TASKMAN_RENDERER").unwrap_or_default();
@@ -84,10 +111,11 @@ fn run_gui(mock: bool, args: &[String]) {
         let engine_handle = engine.clone();
         let use_mock = mock;
         let initial_tab = initial_tab.clone();
+        let app_settings = settings.clone();
         let creator = move |cc: &eframe::CreationContext<'_>| {
             fonts::install(cc.egui_ctx.clone());
             theme::apply_startup(&cc.egui_ctx);
-            let mut application = app::TaskManApp::new(cc, engine_handle, use_mock);
+            let mut application = app::TaskManApp::new(cc, engine_handle, use_mock, app_settings);
             if let Some(t) = &initial_tab {
                 application.set_initial_tab(t);
             }
@@ -107,8 +135,11 @@ fn run_gui(mock: bool, args: &[String]) {
     );
     std::process::exit(1);
 
+    // Conditional element lists can't be expressed with `vec![]` because of
+    // the cfg gates, so keep push-style construction here.
+    #[allow(clippy::vec_init_then_push)]
     fn preferred_renderers(pref: &str) -> Vec<eframe::Renderer> {
-        let mut all: Vec<eframe::Renderer> = Vec::new();
+        let mut all = Vec::<eframe::Renderer>::with_capacity(2);
         #[cfg(feature = "wgpu")]
         all.push(eframe::Renderer::Wgpu);
         #[cfg(feature = "glow")]

@@ -1,6 +1,5 @@
 //! /proc/diskstats parsing with delta tracking.
 
-use parking_lot::Mutex;
 use std::collections::HashMap;
 
 #[derive(Debug, Clone)]
@@ -52,7 +51,7 @@ fn prev_store() -> &'static Mutex<HashMap<String, Prev>> {
 /// Parse /proc/diskstats and attach previous-tick deltas.
 pub fn read() -> Vec<DiskStat> {
     let raw = parse_raw();
-    let mut prev_map = prev_store().lock();
+    let mut prev_map = tm_core::sync::lock(prev_store());
 
     let out: Vec<DiskStat> = raw
         .into_iter()
