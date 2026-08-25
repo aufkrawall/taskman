@@ -78,6 +78,12 @@ pub struct LoadSample {
     pub global_pct: f32,
     /// Busy ratio per logical CPU in [0, 100], index == processor number.
     pub per_core_pct: Vec<f32>,
+    /// Kernel-mode busy share per logical CPU in [0, 100] (the "kernel
+    /// times" overlay; kernel includes idle so only the non-idle part is
+    /// counted). Same length as `per_core_pct`.
+    pub per_core_kernel_pct: Vec<f32>,
+    /// Average kernel-mode busy share across CPUs [0, 100].
+    pub global_kernel_pct: f32,
     /// Per-process values; PIDs absent here were not seen or are new.
     pub procs: HashMap<u32, ProcCpu>,
 }
@@ -338,6 +344,19 @@ fn build_sample(
         per_core_pct.iter().sum::<f32>() / per_core_pct.len() as f32
     };
 
+    // Kernel overlay: fraction of each core's window spent in kernel mode
+    // EXCLUDING idle (kernel accumulates idle time).
+    let per_core_kernel_pct: Vec<f32> = cores
+        .iter()
+        .zip(prev.cores.iter())
+        .map(|(c, p)| core_kernel_busy_pct(*p, *c))
+        .collect();
+    let global_kernel_pct = if per_core_kernel_pct.is_empty() {
+        0.0
+    } else {
+        per_core_kernel_pct.iter().sum::<f32>() / per_core_kernel_pct.len() as f32
+    };
+
     // Whole-machine time capacity within the window, 100 ns units.
     let capacity_100ns = dt_s * 1e7 * nb_cores;
 
@@ -365,8 +384,22 @@ fn build_sample(
     LoadSample {
         global_pct,
         per_core_pct,
+        per_core_kernel_pct,
+        global_kernel_pct,
         procs: out,
     }
+}
+
+/// Kernel-mode (non-idle) fraction of one logical CPU in [0, 100].
+fn core_kernel_busy_pct(p: CoreRaw, c: CoreRaw) -> f32 {
+    let d_kernel = (c.kernel.saturating_sub(p.kernel)).max(0) as f64;
+    let d_user = (c.user.saturating_sub(p.user)).max(0) as f64;
+    let d_idle = (c.idle.saturating_sub(p.idle)).max(0) as f64;
+    let total = d_kernel + d_user;
+    if total <= f64::EPSILON {
+        return 0.0;
+    }
+    ((((d_kernel - d_idle).max(0.0)) / total) * 100.0).clamp(0.0, 100.0) as f32
 }
 
 /// Busy fraction of one logical CPU between two readings in [0, 100].

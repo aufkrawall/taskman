@@ -10,8 +10,7 @@ pub fn run(mock: bool) -> i32 {
     let collector: Box<dyn tm_core::engine::SystemCollector> = if mock {
         Box::new(tm_core::mock::MockCollector::new())
     } else {
-        let (c, _) = tm_platform::create_stack();
-        c
+        tm_platform::create_collector()
     };
 
     let (handle, join) = match tm_core::engine::spawn(collector, interval) {

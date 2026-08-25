@@ -1,5 +1,6 @@
 fn main() {
-    let (mut collector, actions) = tm_platform::create_stack();
+    let mut collector = tm_platform::create_collector();
+    let actions = tm_platform::create_actions();
     println!("backend: {}", collector.backend_name());
     let snap = collector.sample(std::time::Instant::now()).unwrap();
     println!(

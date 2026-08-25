@@ -48,6 +48,11 @@ pub struct CpuInfo {
     pub utilization_pct: f32,
     /// Utilization per logical processor 0..=100.
     pub per_core_pct: Vec<f32>,
+    /// Kernel-mode share per logical processor 0..=100 (Windows; empty when
+    /// the platform does not split user/kernel time).
+    pub per_core_kernel_pct: Vec<f32>,
+    /// Aggregate kernel-mode share 0..=100 (0 = unknown/unavailable).
+    pub kernel_pct: f32,
     /// Current average frequency across cores, MHz.
     pub freq_mhz: f32,
     /// Advertised base frequency, MHz (0 = unknown).
@@ -211,6 +216,14 @@ pub struct GpuEngine {
     pub util_pct: f32,
 }
 
+/// Adapter LUID as exposed by DXGI/PDH — the join key between static adapter
+/// discovery and per-engine counter instances.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct AdapterLuid {
+    pub high: i32,
+    pub low: u32,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct GpuInfo {
     /// Zero-based adapter index.
@@ -222,7 +235,11 @@ pub struct GpuInfo {
     pub mem_total_bytes: u64,
     /// Dedicated (VRAM) usage where distinguishable.
     pub dedicated_used_bytes: u64,
+    /// Shared/system-memory usage where distinguishable (0 = unknown).
+    pub shared_used_bytes: u64,
     pub temperature_c: Option<f32>,
+    /// LUID of this adapter when known; PDH engine records join on this.
+    pub luid: Option<AdapterLuid>,
     pub engines: Vec<GpuEngine>,
 }
 
@@ -277,6 +294,29 @@ pub enum PriorityClass {
     Unknown,
 }
 
+/// UAC virtualization state from the process token (Windows); never inferred
+/// or fabricated — `None` means the token could not be queried.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum UacVirtualization {
+    Enabled,
+    Disabled,
+    NotAllowed,
+    #[default]
+    Unknown,
+}
+
+impl UacVirtualization {
+    pub fn label(self) -> &'static str {
+        match self {
+            // Localized via i18n at the call site; these are stable keys.
+            UacVirtualization::Enabled => "Enabled",
+            UacVirtualization::Disabled => "Disabled",
+            UacVirtualization::NotAllowed => "Not allowed",
+            UacVirtualization::Unknown => "Unknown",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProcessEntry {
     pub pid: u32,
@@ -316,6 +356,12 @@ pub struct ProcessEntry {
 
     pub gpu_util_pct: Option<f32>,
     pub gpu_mem_bytes: Option<u64>,
+    /// Dedicated GPU memory used by this process where measurable.
+    pub gpu_dedicated_bytes: Option<u64>,
+    /// Shared GPU memory used by this process where measurable.
+    pub gpu_shared_bytes: Option<u64>,
+    /// Dominant GPU engine label, e.g. "GPU 0 - 3D" (never a percentage).
+    pub gpu_engine_label: Option<String>,
 
     pub handles: Option<u32>,
     pub threads: Option<u32>,
@@ -340,6 +386,11 @@ pub struct ProcessEntry {
     pub wow64: Option<bool>,
     /// True when the process hosts exactly one service (Windows services host).
     pub service_name: Option<String>,
+    /// Token virtualization state (TokenVirtualizationAllowed/Enabled).
+    /// None = could not be queried — never inferred from user name or pid.
+    pub uac_virtualization: Option<UacVirtualization>,
+    /// Windows EcoQoS / power throttling state (None = unknown).
+    pub power_throttled: Option<bool>,
 }
 
 impl ProcessEntry {
@@ -379,6 +430,9 @@ impl ProcessEntry {
             net_sent_total: None,
             gpu_util_pct: None,
             gpu_mem_bytes: None,
+            gpu_dedicated_bytes: None,
+            gpu_shared_bytes: None,
+            gpu_engine_label: None,
             handles: None,
             threads: None,
             page_faults_per_s: None,
@@ -392,6 +446,8 @@ impl ProcessEntry {
             elevated: None,
             wow64: None,
             service_name: None,
+            uac_virtualization: None,
+            power_throttled: None,
         }
     }
 

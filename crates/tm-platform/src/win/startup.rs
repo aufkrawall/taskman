@@ -68,36 +68,33 @@ pub fn list_startup() -> Vec<StartupItem> {
         }
     }
 
-    // Startup folders (user + common).
-    for (dir_path, is_common) in [
+    // Startup folders (user + common). The approval state lives under the
+    // FULL StartupApproved\StartupFolder subkey — passing just "StartupFolder"
+    // would open a nonexistent key next to Explorer's, silently reporting
+    // disabled items as enabled.
+    for (scope, dir_path) in [
         (
+            FolderScope::User,
             std::env::var("APPDATA")
                 .map(|a| format!(r"{a}\Microsoft\Windows\Start Menu\Programs\Startup"))
                 .ok(),
-            false,
         ),
         (
+            FolderScope::Common,
             std::env::var("PROGRAMDATA")
                 .map(|p| format!(r"{p}\Microsoft\Windows\Start Menu\Programs\StartUp"))
                 .ok(),
-            true,
         ),
     ] {
         let Some(dir_path) = dir_path else { continue };
         let Ok(entries) = std::fs::read_dir(&dir_path) else {
             continue;
         };
-        let folder_approved_key = if is_common {
-            format!(r"HKLM\{APPROVED_KEY}\StartupFolder")
-        } else {
-            format!(r"HKCU\{APPROVED_KEY}\StartupFolder")
+        let hive = match scope {
+            FolderScope::Common => HKEY_LOCAL_MACHINE,
+            FolderScope::User => HKEY_CURRENT_USER,
         };
-        let hive = if is_common {
-            HKEY_LOCAL_MACHINE
-        } else {
-            HKEY_CURRENT_USER
-        };
-        let approved = read_registry_binary(hive, "StartupFolder");
+        let approved = read_registry_binary(hive, &format!(r"{APPROVED_KEY}\StartupFolder"));
         for e in entries.flatten() {
             let file_name = e.file_name().to_string_lossy().to_string();
             if !file_name.to_ascii_lowercase().ends_with(".lnk")
@@ -109,14 +106,16 @@ pub fn list_startup() -> Vec<StartupItem> {
             let enabled = approved
                 .get(&file_name)
                 .is_none_or(|data| data.first().is_some_and(|b| b & 1 == 0));
+            // Stable structured identity: scope is encoded explicitly instead
+            // of guessed from path substrings like "ProgramData".
             out.push(StartupItem {
-                id: format!("folder:{dir_path}:{file_name}"),
+                id: format!("folder:{scope}:{dir_path}\\{file_name}"),
                 name: std::path::Path::new(&file_name)
                     .file_stem()
                     .map_or_else(|| file_name.clone(), |s| s.to_string_lossy().to_string()),
                 command: e.path().to_string_lossy().to_string(),
-                location: folder_approved_key.clone(),
-                publisher: None,
+                location: startup_folder_label(scope),
+                publisher: resolve_publisher(&e.path().to_string_lossy()),
                 enabled,
                 impact: StartupImpact::Unknown,
             });
@@ -127,14 +126,43 @@ pub fn list_startup() -> Vec<StartupItem> {
     out
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FolderScope {
+    User,
+    Common,
+}
+
+impl std::fmt::Display for FolderScope {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            FolderScope::User => "user",
+            FolderScope::Common => "common",
+        })
+    }
+}
+
+fn startup_folder_label(scope: FolderScope) -> String {
+    match scope {
+        FolderScope::User => r"HKCU\...Explorer\StartupApproved\StartupFolder".to_string(),
+        FolderScope::Common => r"HKLM\...Explorer\StartupApproved\StartupFolder".to_string(),
+    }
+}
+
 /// Toggle via the StartupApproved registry mechanism:
 /// - disable → write `03 00 00 00 <8-byte FILETIME>`
 /// - enable  → delete the approval value (default = enabled)
 pub fn set_startup_enabled(item_id: &str, _location: &str, enabled: bool) -> Result<()> {
-    let Some(rest) = item_id.strip_prefix("reg:") else {
-        return set_folder_startup_enabled(item_id, enabled);
-    };
-    // rest = "<label>:<value-name>"; labels contain ':'? No — our labels don't.
+    if let Some(rest) = item_id.strip_prefix("reg:") {
+        return set_reg_startup_enabled(rest, enabled);
+    }
+    if let Some(rest) = item_id.strip_prefix("folder:") {
+        return set_folder_startup_enabled(rest, enabled);
+    }
+    Err(TmError::platform("startup", "malformed item id"))
+}
+
+fn set_reg_startup_enabled(rest: &str, enabled: bool) -> Result<()> {
+    // rest = "<label>:<value-name>"; our labels contain no ':'.
     let Some((label, value_name)) = rest.split_once(':') else {
         return Err(TmError::platform("startup", "malformed item id"));
     };
@@ -193,16 +221,24 @@ pub fn set_startup_enabled(item_id: &str, _location: &str, enabled: bool) -> Res
     Ok(())
 }
 
-fn set_folder_startup_enabled(_item_id: &str, enabled: bool) -> Result<()> {
-    // Folder items use the StartupFolder approvals key with the *file name*.
-    // The caller passes the full id; extract trailing component.
-    let file_name = _item_id.rsplit(':').next().unwrap_or_default();
-    let (hive, _label) = if _item_id.contains(r"HKLM")
-        || _item_id.starts_with("folder:") && _item_id.contains("ProgramData")
-    {
-        (HKEY_LOCAL_MACHINE, "common")
-    } else {
-        (HKEY_CURRENT_USER, "user")
+fn set_folder_startup_enabled(rest: &str, enabled: bool) -> Result<()> {
+    // rest = "user|common:<dir>\\<file name>"; the file name is the approval
+    // value inside StartupApproved\StartupFolder.
+    let Some((scope_str, tail)) = rest.split_once(':') else {
+        return Err(TmError::platform("startup", "malformed folder id"));
+    };
+    let scope = match scope_str {
+        "user" => FolderScope::User,
+        "common" => FolderScope::Common,
+        _ => return Err(TmError::platform("startup", "unknown folder scope")),
+    };
+    let file_name = tail.rsplit('\\').next().unwrap_or_default();
+    if file_name.is_empty() {
+        return Err(TmError::platform("startup", "folder id without file name"));
+    }
+    let hive = match scope {
+        FolderScope::Common => HKEY_LOCAL_MACHINE,
+        FolderScope::User => HKEY_CURRENT_USER,
     };
     unsafe {
         let mut key = HKEY::default();
@@ -227,7 +263,17 @@ fn set_folder_startup_enabled(_item_id: &str, enabled: bool) -> Result<()> {
         }
         let name_w = wstr(file_name);
         if enabled {
-            let _ = RegDeleteValueW(key, PCWSTR::from_raw(name_w.as_ptr()));
+            // Missing value is fine (already enabled); everything else must
+            // surface — silently swallowing access-denied made "enable"
+            // appear to succeed when it did nothing.
+            let status = RegDeleteValueW(key, PCWSTR::from_raw(name_w.as_ptr()));
+            if status.is_err() && status.0 != 2 {
+                let _ = RegCloseKey(key);
+                return Err(TmError::platform(
+                    "RegDeleteValueW(folder)",
+                    format!("{status:?}"),
+                ));
+            }
         } else {
             let now_ft = systemtime_to_filetime(std::time::SystemTime::now());
             let mut data: [u8; 12] = [0; 12];
@@ -252,6 +298,71 @@ fn set_folder_startup_enabled(_item_id: &str, enabled: bool) -> Result<()> {
     }
     tracing::info!(item = file_name, enabled, "startup folder item toggled");
     Ok(())
+}
+
+// ------------------------------------------------------------------ helpers
+
+/// Resolve the display executable behind a startup command and query its
+/// version-resource company as the publisher column value. Runs on the
+/// startup worker thread; failures simply leave the publisher empty.
+fn resolve_publisher(command: &str) -> Option<String> {
+    let exe = resolve_command_target(command)?;
+    let ver = crate::win::version::query(&exe);
+    (!ver[1].is_empty()).then(|| ver[1].clone())
+}
+
+/// Best-effort target extraction from common startup command shapes:
+/// quoted paths, argument-bearing commands, environment variables and
+/// `.lnk` shortcuts (resolved through their link target arguments kept
+/// intact). The original command stays untouched for diagnostics.
+fn resolve_command_target(command: &str) -> Option<String> {
+    let cmd = command.trim();
+    let candidate = if let Some(rest) = cmd.strip_prefix('"') {
+        rest.split('"').next()?.to_string()
+    } else if cmd.to_ascii_lowercase().ends_with(".lnk") {
+        cmd.to_string()
+    } else {
+        cmd.split_whitespace().next()?.to_string()
+    };
+    if candidate.is_empty() {
+        return None;
+    }
+    // Expand %VAR% forms so version lookup finds real files.
+    let expanded = expand_env_vars(&candidate);
+    if std::path::Path::new(&expanded).exists() {
+        return Some(expanded);
+    }
+    // A .lnk points at its target elsewhere; try the raw name first.
+    if candidate.to_ascii_lowercase().ends_with(".exe") && std::path::Path::new(&candidate).exists()
+    {
+        return Some(candidate);
+    }
+    None
+}
+
+fn expand_env_vars(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(start) = rest.find('%') {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + 1..];
+        match after.find('%') {
+            Some(end) => {
+                let name = &after[..end];
+                match std::env::var(name) {
+                    Ok(v) => out.push_str(&v),
+                    Err(_) => out.push_str(&rest[start..start + end + 2]),
+                }
+                rest = &after[end + 1..];
+            }
+            None => {
+                out.push('%');
+                rest = after;
+            }
+        }
+    }
+    out.push_str(rest);
+    out
 }
 
 // ------------------------------------------------------------------ registry helpers

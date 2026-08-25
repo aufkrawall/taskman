@@ -2,6 +2,13 @@
 //!
 //! Windows note: the release build hides the console (`windows` subsystem);
 //! CLI output (--selfcheck) re-attaches to the parent console when present.
+//!
+//! Startup architecture (implement.md §4): parse args → attach console only
+//! for console modes → install no-disk-IO early logging → read settings →
+//! hand a *lazy collector factory* to the GUI. The engine thread constructs
+//! the sampler only after the first frame has been painted, so renderer/GPU
+//! initialization never competes with heavy sampling.
+
 #![cfg_attr(
     all(target_os = "windows", not(debug_assertions)),
     windows_subsystem = "windows"
@@ -13,6 +20,7 @@
 //!   taskman --mock          use the deterministic mock collector (with GUI or --selfcheck)
 //!   taskman --verbose       debug logging to console + file
 
+mod action_executor;
 mod app;
 mod app_ui;
 mod fonts;
@@ -23,26 +31,46 @@ mod tabs;
 mod theme;
 mod widgets;
 
-use std::time::Duration;
+use std::time::Instant;
+
+/// Compact startup trace: one record per phase, emitted through tracing as
+/// soon as logging exists (implement.md §3.1). Process-global so both main
+/// and the eframe creator can mark phases without threading state through
+/// non-Send closures.
+pub struct StartupTrace;
+
+impl StartupTrace {
+    pub fn mark(name: &'static str) {
+        static T0: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+        let elapsed = T0.get_or_init(Instant::now).elapsed().as_millis();
+        tracing::info!(ms = elapsed as u64, phase = name, "startup");
+    }
+}
 
 fn main() {
-    #[cfg(all(target_os = "windows", not(debug_assertions)))]
-    attach_parent_console();
-
     let args: Vec<String> = std::env::args().skip(1).collect();
     let verbose = args.iter().any(|a| a == "--verbose" || a == "-v");
     let mock = args.iter().any(|a| a == "--mock");
     let selfcheck = args.iter().any(|a| a == "--selfcheck");
 
-    // Logging: file always; console when verbose or selfcheck.
-    let _log_guard = tm_core::logging::init(tm_core::logging::LogConfig {
-        console: verbose || selfcheck,
-        level: if verbose {
-            Some("debug".parse().expect("static"))
-        } else {
-            None
-        },
-    });
+    // Console attachment happens only for explicit console modes — a normal
+    // GUI launch must not pay for it (implement.md §5.1).
+    #[cfg(all(target_os = "windows", not(debug_assertions)))]
+    if selfcheck || verbose {
+        attach_parent_console();
+    }
+
+    if selfcheck || verbose {
+        // CLI paths keep synchronous logging; they live or die by their output.
+        let _log_guard = tm_core::logging::init(tm_core::logging::LogConfig {
+            console: true,
+            level: verbose.then(|| "debug".parse().expect("static")),
+        });
+    } else {
+        // GUI: bounded in-memory ring first, disk after the first frame.
+        tm_core::logging::init_early(false);
+    }
+    StartupTrace::mark("args_parsed");
 
     tracing::info!(args = ?args, "taskman starting");
 
@@ -58,9 +86,9 @@ fn run_gui(mock: bool, args: &[String]) {
     // Locale first: number/date formats + default UI language follow the OS.
     tm_core::locale::init(tm_platform::detect_locale());
 
-    // Engine starts BEFORE the window so the first frame already has data.
-    // (The collector itself initializes lazily on the engine thread.)
     let mut settings = tm_core::settings::Settings::load();
+    StartupTrace::mark("minimal_config_loaded");
+
     // Diagnostics/UI tests: --size=WxH overrides the persisted window size
     // for this run.
     if let Some(sz) = args
@@ -72,9 +100,15 @@ fn run_gui(mock: bool, args: &[String]) {
     }
     tm_core::i18n::set_lang(settings.language.resolve());
     let window_size = [settings.window_size[0], settings.window_size[1]];
-    let engine = spawn_engine(mock, settings.update_speed.interval());
-    if settings.update_speed == tm_core::settings::UpdateSpeed::Paused {
-        engine.pause();
+
+    // The engine is NOT started here. The app receives a lazy factory and
+    // starts it on its own engine thread after the first frame (§4.4).
+    let initial_tab_arg = args
+        .iter()
+        .find_map(|a| a.strip_prefix("--tab=").map(|t| t.to_string()))
+        .or_else(|| std::env::var("TASKMAN_TAB").ok());
+    if let Some(t) = &initial_tab_arg {
+        eprintln!("initial tab requested: {t}");
     }
 
     let title = tm_core::i18n::tr(tm_core::i18n::K::WindowTitle).to_string();
@@ -105,28 +139,21 @@ fn run_gui(mock: bool, args: &[String]) {
     };
 
     let renderer_pref = std::env::var("TASKMAN_RENDERER").unwrap_or_default();
-    let initial_tab = args
-        .iter()
-        .find_map(|a| a.strip_prefix("--tab=").map(|t| t.to_string()))
-        .or_else(|| std::env::var("TASKMAN_TAB").ok());
-    if let Some(t) = &initial_tab {
-        eprintln!("initial tab requested: {t}");
-    }
+    StartupTrace::mark("run_native_enter");
 
     let mut last_err = None;
     for renderer in preferred_renderers(&renderer_pref) {
         tracing::info!(?renderer, "trying renderer");
-        let engine_handle = engine.clone();
         let use_mock = mock;
-        let initial_tab = initial_tab.clone();
+        let initial_tab = initial_tab_arg.clone();
         let app_settings = settings.clone();
         let creator = move |cc: &eframe::CreationContext<'_>| {
-            fonts::install(cc.egui_ctx.clone());
+            StartupTrace::mark("creation_context_enter");
             theme::apply_startup(&cc.egui_ctx);
-            let mut application = app::TaskManApp::new(cc, engine_handle, use_mock, app_settings);
-            if let Some(t) = &initial_tab {
-                application.set_initial_tab(t);
-            }
+            // Fonts load asynchronously off the UI thread; the first frame(s)
+            // render with egui's embedded defaults (§5.3).
+            fonts::install_async(cc.egui_ctx.clone());
+            let application = app::TaskManApp::new(cc, use_mock, app_settings, initial_tab);
             Ok(Box::new(application) as Box<dyn eframe::App>)
         };
         match eframe::run_native("Task-Manager", options(renderer), Box::new(creator)) {
@@ -134,6 +161,9 @@ fn run_gui(mock: bool, args: &[String]) {
             Err(e) => {
                 tracing::warn!(error = %e, "renderer failed; falling back");
                 last_err = Some(e);
+                // Fallback safety: any workers/persistence started by the
+                // failed attempt are owned per-TaskManApp and dropped with
+                // it; nothing process-global leaks between attempts.
             }
         }
     }
@@ -174,22 +204,6 @@ fn parse_size_arg(s: &str) -> Option<[f32; 2]> {
     (w >= 200.0 && h >= 150.0).then_some([w, h])
 }
 
-fn spawn_engine(mock: bool, interval: Duration) -> tm_core::EngineHandle {
-    let (collector, _actions) = if mock {
-        (
-            Box::new(tm_core::mock::MockCollector::new())
-                as Box<dyn tm_core::engine::SystemCollector>,
-            None,
-        )
-    } else {
-        let (c, a) = tm_platform::create_stack();
-        (c, Some(a))
-    };
-    let (handle, _join) =
-        tm_core::engine::spawn(collector, interval).expect("failed to spawn sampling engine");
-    handle
-}
-
 /// Generate the app icon at runtime — a simple CPU-chip glyph on a blue square.
 fn icon_data() -> eframe::egui::IconData {
     const S: usize = 64;
@@ -221,8 +235,8 @@ fn icon_data() -> eframe::egui::IconData {
     }
 }
 
-/// Best-effort console attachment so `--selfcheck` output is visible when
-/// launched from an existing terminal despite the GUI subsystem.
+/// Best-effort console attachment so CLI output is visible when launched from
+/// an existing terminal despite the GUI subsystem.
 #[cfg(all(target_os = "windows", not(debug_assertions)))]
 fn attach_parent_console() {
     use windows::Win32::System::Console::{ATTACH_PARENT_PROCESS, AttachConsole};

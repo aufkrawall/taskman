@@ -107,7 +107,14 @@ pub trait PlatformActions: Send + Sync {
         false
     }
     /// Launch `command_line`; optionally request elevation via OS dialog.
+    /// Never blocks the caller meaningfully.
     fn run_new_task(&self, command_line: &str, elevate: bool) -> Result<()> {
+        let _ = (command_line, elevate);
+        Err(tm_core::TmError::Unsupported("run new task"))
+    }
+    /// Like [`PlatformActions::run_new_task`] but briefly waits to surface
+    /// immediate launch failures. Worker threads only.
+    fn run_new_task_probe(&self, command_line: &str, elevate: bool) -> Result<()> {
         let _ = (command_line, elevate);
         Err(tm_core::TmError::Unsupported("run new task"))
     }

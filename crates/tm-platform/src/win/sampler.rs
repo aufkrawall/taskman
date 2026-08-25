@@ -22,12 +22,15 @@ use sysinfo::{
     UpdateKind, Users,
 };
 use tm_core::classify;
+use tm_core::demand::TelemetryDemand;
 use tm_core::engine::SystemCollector;
 use tm_core::error::Result;
 use tm_core::model::*;
 
-/// Refresh cadence (in ticks) for slow-changing per-process attributes.
-const ATTR_REFRESH_TICKS: u64 = 10;
+/// Refresh cadence for slow-changing per-process attributes. Time-based
+/// (not tick-count based) so behavior stays identical at High/Normal/Low
+/// update speeds; entries also invalidate when the process identity changes.
+const ATTR_REFRESH_TTL: std::time::Duration = std::time::Duration::from_secs(10);
 
 #[derive(Clone)]
 struct PidAttrs {
@@ -35,8 +38,13 @@ struct PidAttrs {
     wow64: Option<bool>,
     priority: PriorityClass,
     handles: Option<u32>,
-    /// Tick number when these values were last queried natively.
-    refreshed_at_tick: u64,
+    elevated: Option<bool>,
+    uac_virtualization: Option<UacVirtualization>,
+    power_throttled: Option<bool>,
+    /// Process identity guard against PID reuse.
+    start_epoch_s: Option<i64>,
+    /// When these values were last queried natively.
+    refreshed_at: Instant,
 }
 
 /// Everything that carries state between ticks.
@@ -45,7 +53,7 @@ pub struct Sampler {
     disks: Disks,
     networks: Networks,
     user_names: HashMap<sysinfo::Uid, String>,
-    cpu_static: cpu_info::CpuStatic,
+    cpu_static: Option<cpu_info::CpuStatic>,
     prev_net_totals: HashMap<String, (u64, u64)>,
     last_tick: Option<Instant>,
     first_tick_done: bool,
@@ -54,8 +62,13 @@ pub struct Sampler {
     attrs: HashMap<u32, PidAttrs>,
     gpu_adapters: Option<Vec<gpu::AdapterInfo>>,
     /// Static RAM hardware facts (SMBIOS), probed once.
-    ram_static: memory_info::RamStatic,
-    pdh: Mutex<perfcounters::Pdh>,
+    ram_static: Option<memory_info::RamStatic>,
+    pdh: Mutex<perfcounters::PdhCounters>,
+    /// Current telemetry demand from the UI (drives expensive providers).
+    demand: TelemetryDemand,
+    /// Cached native network adapter metadata with a wall-clock TTL so the
+    /// SSID/description walk does not run every sampling tick.
+    net_meta_cache: Option<(Instant, HashMap<String, net_info::AdapterInfo>)>,
     /// Time-based CPU accountant (see [`cpu_load`]); replaces sysinfo/PDH
     /// CPU usage which was noisy and mis-normalized.
     cpu_load: CpuLoadAccountant,
@@ -69,16 +82,11 @@ impl Sampler {
     /// the first `sample()` call, which runs on the engine thread.
     pub fn new() -> Self {
         let mut sys = System::new();
-        // Lightweight warmup only: CPU/memory are quick and make the very
-        // first rates valid sooner. Process enumeration happens in `sample`.
+        // Lightweight warmup only. Even the static CPU/SMBIOS probes are
+        // deferred: they parse firmware tables and must not run on whatever
+        // thread constructed us (implement.md §6.1).
         sys.refresh_specifics(
-            RefreshKind::nothing()
-                .with_cpu(
-                    sysinfo::CpuRefreshKind::nothing()
-                        .with_cpu_usage()
-                        .with_frequency(),
-                )
-                .with_memory(MemoryRefreshKind::nothing().with_ram().with_swap()),
+            RefreshKind::nothing().with_memory(MemoryRefreshKind::nothing().with_ram().with_swap()),
         );
 
         Self {
@@ -86,7 +94,7 @@ impl Sampler {
             sys,
             disks: Disks::new(),
             networks: Networks::new(),
-            cpu_static: cpu_info::CpuStatic::probe(),
+            cpu_static: None,
             prev_net_totals: HashMap::new(),
             last_tick: None,
             first_tick_done: false,
@@ -94,8 +102,10 @@ impl Sampler {
             tick_no: 0,
             attrs: HashMap::new(),
             gpu_adapters: None,
-            ram_static: memory_info::probe(),
-            pdh: Mutex::new(perfcounters::Pdh::new()),
+            ram_static: None,
+            pdh: Mutex::new(perfcounters::PdhCounters::new()),
+            demand: TelemetryDemand::core(),
+            net_meta_cache: None,
             cpu_load: CpuLoadAccountant::new(),
             last_load: None,
         }
@@ -106,6 +116,9 @@ impl Sampler {
         if self.initialized {
             return;
         }
+        // Static hardware facts: SMBIOS parsing + CPUID topology probing.
+        self.cpu_static = Some(cpu_info::CpuStatic::probe());
+        self.ram_static = Some(memory_info::probe());
         // `new_with_refreshed_list` already performs the first enumeration.
         let users = Users::new_with_refreshed_list();
         self.user_names = build_user_map(&users);
@@ -140,22 +153,39 @@ impl Sampler {
     /// Cached slow-changing attributes for one pid; refreshes them natively
     /// at most every [`ATTR_REFRESH_TICKS`] ticks (4 native calls instead of
     /// ~4 × processes per tick).
-    fn attrs_for(&mut self, pid: u32) -> PidAttrs {
-        let now_tick = self.tick_no;
+    fn attrs_for(&mut self, pid: u32, start_epoch_s: Option<i64>) -> PidAttrs {
         if let Some(a) = self.attrs.get(&pid)
-            && now_tick - a.refreshed_at_tick < ATTR_REFRESH_TICKS
+            && a.refreshed_at.elapsed() < ATTR_REFRESH_TTL
+            && a.start_epoch_s == start_epoch_s
         {
             return a.clone();
         }
+        let security = if self.demand.wants(TelemetryDemand::TOKEN_SECURITY) {
+            process_ops::token_security(pid)
+        } else {
+            process_ops::TokenSecurity {
+                elevated: None,
+                virtualization: None,
+            }
+        };
         let fresh = PidAttrs {
             session_id: process_ops::session_id_of(pid),
             wow64: process_ops::is_wow64(pid),
             priority: process_ops::priority_class_of(pid),
             handles: process_ops::handle_count(pid),
-            refreshed_at_tick: now_tick,
+            elevated: security.elevated,
+            uac_virtualization: security.virtualization,
+            power_throttled: process_ops::efficiency_mode_state(pid),
+            start_epoch_s,
+            refreshed_at: Instant::now(),
         };
         self.attrs.insert(pid, fresh.clone());
         fresh
+    }
+
+    /// Demand update from the UI (cheap atomic handoff upstream).
+    pub fn set_demand(&mut self, d: TelemetryDemand) {
+        self.demand = d;
     }
 }
 
@@ -228,31 +258,20 @@ impl Sampler {
         let mem_avail = self.sys.available_memory();
         let win_mem = perfcounters::query_windows_memory();
 
-        // ---- PDH: collect exactly once, read three times -----------------------
-        let collected = {
-            let pdh = &mut self.pdh;
-            let guard = pdh.get_mut().unwrap_or_else(|e| e.into_inner());
-            guard.collect_once()
-        };
-        let (gpu_per_process, gpu_engines, disk_perf) = {
-            let pdh = &self.pdh;
-            let mut guard = pdh.lock().unwrap_or_else(|e| e.into_inner());
+        // ---- PDH: demand-gated groups, one collection per tick -----------------
+        // The UI's TelemetryDemand decides which expensive providers stay
+        // warm; each group keeps its own query and two-sample warm-up.
+        {
+            let demand = self.demand;
+            let guard = self.pdh.get_mut().unwrap_or_else(|e| e.into_inner());
+            guard.tick(demand);
+        }
+        let (gpu_engine_records, gpu_mem_records, disk_perf) = {
+            let guard = self.pdh.get_mut().unwrap_or_else(|e| e.into_inner());
             (
-                if collected {
-                    guard.read_gpu_process_stats()
-                } else {
-                    None
-                },
-                if collected {
-                    guard.read_engine_stats()
-                } else {
-                    Vec::new()
-                },
-                if collected {
-                    guard.read_disks()
-                } else {
-                    Vec::new()
-                },
+                guard.read_gpu_engines().unwrap_or_default(),
+                guard.read_gpu_memory().unwrap_or_default(),
+                guard.read_disks(),
             )
         };
 
@@ -316,11 +335,14 @@ impl Sampler {
         // Applied in a separate pass so the &mut self cache never overlaps
         // the immutable sysinfo iteration above.
         for p in processes.iter_mut() {
-            let a = self.attrs_for(p.pid);
+            let a = self.attrs_for(p.pid, p.start_epoch_s);
             p.session_id = a.session_id;
             p.priority = a.priority;
             p.handles = a.handles;
             p.wow64 = a.wow64;
+            p.elevated = a.elevated;
+            p.uac_virtualization = a.uac_virtualization;
+            p.power_throttled = a.power_throttled;
             // System processes have no owning user; TM shows "SYSTEM".
             if p.user.is_none() && a.session_id.is_some_and(|sid| sid == 0) {
                 p.user = Some("SYSTEM".to_string());
@@ -337,18 +359,36 @@ impl Sampler {
 
         // ---- GPU ---------------------------------------------------------------
         // Static adapter info is probed once; it does not change at runtime.
-        if self.gpu_adapters.is_none() {
+        // DXGI enumeration is skipped entirely until GPU telemetry is first
+        // demanded so a default Processes page cannot wake a dormant dGPU.
+        if (!gpu_engine_records.is_empty() || !gpu_mem_records.is_empty() || self.demand.any_gpu())
+            && self.gpu_adapters.is_none()
+        {
             self.gpu_adapters = Some(gpu::adapters());
         }
-        let gpu_adapters = self.gpu_adapters.as_deref().unwrap_or(&[]).to_vec();
+        let gpus = match self.gpu_adapters.clone() {
+            Some(adapters) => gpu::merge(adapters, &gpu_engine_records, &gpu_mem_records),
+            None => Vec::new(),
+        };
 
-        for e in processes.iter_mut() {
-            if let Some(g) = gpu_per_process.as_ref().and_then(|m| m.get(&e.pid)) {
-                e.gpu_util_pct = Some(g.util_pct);
-                e.gpu_mem_bytes = Some(g.mem_bytes);
+        // Per-process values: busiest-engine utilization plus the dominant
+        // engine label ("GPU 0 - 3D") and dedicated/shared memory.
+        if !gpu_engine_records.is_empty() || !gpu_mem_records.is_empty() {
+            let per_pid: HashMap<u32, gpu::ProcessGpuView> =
+                gpu::process_gpu_view(&gpu_engine_records, &gpu_mem_records)
+                    .into_iter()
+                    .map(|v| (v.pid, v))
+                    .collect();
+            for e in processes.iter_mut() {
+                if let Some(g) = per_pid.get(&e.pid) {
+                    e.gpu_util_pct = Some(g.util_pct);
+                    e.gpu_dedicated_bytes = Some(g.dedicated_bytes);
+                    e.gpu_shared_bytes = Some(g.shared_bytes);
+                    e.gpu_mem_bytes = Some(g.dedicated_bytes);
+                    e.gpu_engine_label = g.dominant_engine.clone();
+                }
             }
         }
-        let gpus = gpu::merge(gpu_adapters, gpu_engines);
 
         // ---- disks -----------------------------------------------------------------
         let mut disks = Vec::new();
@@ -393,9 +433,18 @@ impl Sampler {
         }
 
         // ---- networks -----------------------------------------------------------------
-        // Per-adapter facts (desc/link/oper/SSID) come from the native walk;
-        // keyed by friendly name, which is exactly what sysinfo exposes.
-        let adapter_info = net_info::adapters();
+        // Byte-rate counters run on the sampling cadence; the native adapter
+        // metadata walk (desc/link/SSID) is cached for NET_META_TTL so it does
+        // not run every tick (implement.md §6.5).
+        const NET_META_TTL: std::time::Duration = std::time::Duration::from_secs(5);
+        let adapter_info = match &self.net_meta_cache {
+            Some((at, map)) if at.elapsed() < NET_META_TTL => map.clone(),
+            _ => {
+                let fresh = net_info::adapters();
+                self.net_meta_cache = Some((Instant::now(), fresh.clone()));
+                fresh
+            }
+        };
         let mut nets = Vec::new();
         for (name, data) in &self.networks {
             let recv_total = data.total_received();
@@ -441,15 +490,22 @@ impl Sampler {
                 architecture: std::env::consts::ARCH.to_string(),
                 utilization_pct: utilization.clamp(0.0, 100.0),
                 per_core_pct,
+                per_core_kernel_pct: load
+                    .as_ref()
+                    .map_or_else(Vec::new, |l| l.per_core_kernel_pct.clone()),
+                kernel_pct: load.as_ref().map_or(0.0, |l| l.global_kernel_pct),
                 freq_mhz: freq,
-                freq_base_mhz: self.cpu_static.base_mhz,
+                freq_base_mhz: self.cpu_static.as_ref().map_or(0.0, |c| c.base_mhz),
                 logical_count: logical,
-                physical_cores: self.cpu_static.physical_cores,
-                sockets: self.cpu_static.sockets,
-                l1_kb: self.cpu_static.l1_kb_total,
-                l2_kb: self.cpu_static.l2_kb_total,
-                l3_kb: self.cpu_static.l3_kb_total,
-                virtualization: self.cpu_static.virtualization.clone(),
+                physical_cores: self.cpu_static.as_ref().map_or(0, |c| c.physical_cores),
+                sockets: self.cpu_static.as_ref().map_or(0, |c| c.sockets),
+                l1_kb: self.cpu_static.as_ref().map_or(0, |c| c.l1_kb_total),
+                l2_kb: self.cpu_static.as_ref().map_or(0, |c| c.l2_kb_total),
+                l3_kb: self.cpu_static.as_ref().map_or(0, |c| c.l3_kb_total),
+                virtualization: self
+                    .cpu_static
+                    .as_ref()
+                    .map_or_else(String::new, |c| c.virtualization.clone()),
             },
             memory: MemoryInfo {
                 total_bytes: mem_total,
@@ -462,15 +518,28 @@ impl Sampler {
                 non_paged_pool_bytes: win_mem.non_paged_pool,
                 swap_total_bytes: 0,
                 swap_used_bytes: 0,
-                installed_bytes: self.ram_static.installed_bytes,
-                hw_reserved_bytes: self.ram_static.installed_bytes.saturating_sub(mem_total),
-                speed_mts: self.ram_static.speed_mts,
-                speed_max_mts: self.ram_static.speed_max_mts,
-                slots_used: self.ram_static.slots_used,
-                slots_total: self.ram_static.slots_total,
-                form_factor: self.ram_static.form_factor.clone(),
-                manufacturer: self.ram_static.manufacturer.clone(),
-                part_number: self.ram_static.part_number.clone(),
+                installed_bytes: self.ram_static.as_ref().map_or(0, |r| r.installed_bytes),
+                hw_reserved_bytes: self
+                    .ram_static
+                    .as_ref()
+                    .map_or(0, |r| r.installed_bytes)
+                    .saturating_sub(mem_total),
+                speed_mts: self.ram_static.as_ref().map_or(0, |r| r.speed_mts),
+                speed_max_mts: self.ram_static.as_ref().map_or(0, |r| r.speed_max_mts),
+                slots_used: self.ram_static.as_ref().map_or(0, |r| r.slots_used),
+                slots_total: self.ram_static.as_ref().map_or(0, |r| r.slots_total),
+                form_factor: self
+                    .ram_static
+                    .as_ref()
+                    .map_or_else(String::new, |r| r.form_factor.clone()),
+                manufacturer: self
+                    .ram_static
+                    .as_ref()
+                    .map_or_else(String::new, |r| r.manufacturer.clone()),
+                part_number: self
+                    .ram_static
+                    .as_ref()
+                    .map_or_else(String::new, |r| r.part_number.clone()),
             },
             disks,
             networks: nets,

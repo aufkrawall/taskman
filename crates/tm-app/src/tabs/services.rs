@@ -13,7 +13,7 @@ use tm_core::model::{ServiceInfo, ServiceStatus};
 use crate::app::TaskManApp;
 use crate::icons::Icon;
 use crate::theme;
-use crate::widgets::tablekit::TmColumn;
+use crate::widgets::tablekit::{self, TmColumn};
 
 fn columns() -> Vec<TmColumn> {
     vec![
@@ -149,7 +149,12 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
     // below need `&mut TaskManApp`.
     let cache_arc = app.shared.services_cache.clone();
     let guard = tm_core::sync::lock(&cache_arc);
-    let Some(ref c) = *guard else { return };
+    let Some(ref c) = *guard else {
+        // Background fetch still in flight — centered placeholder instead
+        // of a blank pane.
+        ui.centered_and_justified(|ui| ui.label(i18n::tr(K::GatheringData)));
+        return;
+    };
 
     let q = app.search.trim().to_lowercase();
     let mut rows: Vec<&ServiceInfo> = c
@@ -166,7 +171,7 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
 
     let mut table = app.make_table("services", columns(), 340.0);
     let avail = crate::widgets::tablekit::table_avail(ui);
-    crate::widgets::tablekit::scrolled_table(
+    tablekit::scrolled_rows(
         "services",
         ui,
         &pal,
@@ -174,8 +179,10 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
         avail,
         None,
         None,
-        |ui, table, avail, _content_w| {
-            for s in rows {
+        rows.len(),
+        |ui, table, avail, _content_w, range| {
+            for ri in range {
+                let s = rows[ri];
                 let selected = app.services_selected_name.as_deref() == Some(s.name.as_str());
                 let (rect, resp) = table.row(ui, &pal, avail, selected);
 
@@ -238,7 +245,6 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
                     }
                 });
             }
-            ui.add_space(12.0);
         },
     );
     app.persist_table(&table);

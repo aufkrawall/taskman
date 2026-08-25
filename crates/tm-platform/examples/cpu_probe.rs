@@ -8,7 +8,7 @@ use std::time::Instant;
 use tm_core::model::Snapshot;
 
 fn main() {
-    let (mut collector, _actions) = tm_platform::create_stack();
+    let mut collector = tm_platform::create_collector();
     println!("backend: {}", collector.backend_name());
 
     // Warm-up tick (no reference window yet; load values are zeros).

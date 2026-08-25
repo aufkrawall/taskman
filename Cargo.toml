@@ -25,14 +25,27 @@ windows = { version = "0.62", features = [
 ] }
 
 [profile.release]
-lto = "fat"
-codegen-units = 1
+# Compile-time-first choice: thin LTO + parallel codegen units keep release
+# builds fast and multicore; fat LTO bought single-digit milliseconds of
+# startup at several minutes of serialized linking. The app's startup floor
+# is the renderer/framework init, not our codegen quality.
+lto = "thin"
 strip = "symbols"
 opt-level = 3
 panic = "abort"
 
 [profile.release.package."*"]
 opt-level = 3
+
+[profile.dev]
+# Line-tables-only keeps panic backtraces meaningful while avoiding the
+# multi-GB DWARF that full debuginfo produces when 16 parallel rustc
+# processes each hold a copy in RAM (the "RAM explosion" during builds).
+debug = "line-tables-only"
+
+[profile.test]
+# Tests inherit from dev; keep the same memory-conscious debuginfo.
+debug = "line-tables-only"
 
 [profile.dev.package."*"]
 # Optimize heavy third-party deps even in dev so wgpu/sysinfo stay usable while debugging.
