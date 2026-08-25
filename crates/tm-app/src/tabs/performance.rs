@@ -87,6 +87,27 @@ mod tests {
         assert!(window_label(60).contains('1'));
         assert!(window_label(120).contains('2'));
     }
+
+    /// Regression: the series extractors used to SKIP window points without
+    /// the requested device (and net_series even dropped zero-traffic
+    /// samples). The shortened series then desynchronized from the shared
+    /// timestamp vector, plotting samples at wrong x positions.
+    #[test]
+    fn series_extractors_stay_aligned_with_window() {
+        let mut hit = pt(500);
+        hit.nets = vec![("eth".into(), 10.0, 20.0)];
+        hit.disks = vec![("C:".into(), 50.0, 1.0, 2.0)];
+        let win = vec![pt(0), hit, pt(1000)];
+
+        let net = net_series(&win, "eth", 1);
+        assert_eq!(net, vec![0.0, 10.0, 0.0], "len must equal window len");
+        let sent = net_series(&win, "eth", 2);
+        assert_eq!(sent, vec![0.0, 20.0, 0.0]);
+        let disk = disk_series(&win, "C:", |d| d.1 as f64);
+        assert_eq!(disk, vec![0.0, 50.0, 0.0]);
+        let gpu = gpu_series(&win, "0", 1);
+        assert_eq!(gpu, vec![0.0, 0.0, 0.0]);
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -477,24 +498,36 @@ fn disk_series(
     key: &str,
     pick: impl Fn(&(String, f32, f64, f64)) -> f64,
 ) -> Vec<f64> {
+    // One value PER window point (0.0 when absent): series indices must stay
+    // aligned with the shared timestamps, otherwise samples plot at wrong
+    // x positions (cliffs and shifted curves).
     win.iter()
-        .filter_map(|h| h.disks.iter().find(|(m, ..)| m == key))
-        .map(pick)
+        .map(|h| h.disks.iter().find(|(m, ..)| m == key).map_or(0.0, &pick))
         .collect()
 }
 
 fn net_series(win: &[HistoryPoint], key: &str, idx: usize) -> Vec<f64> {
+    // No zero-filtering here either: dropping samples shortens the series
+    // and desynchronizes it from `timestamps_ms`. Zero traffic plots as
+    // zero — honest and aligned.
     win.iter()
-        .filter_map(|h| h.nets.iter().find(|(m, ..)| m == key))
-        .filter(|t| t.1 > 0.0 || t.2 > 0.0)
-        .map(|t| if idx == 1 { t.1 } else { t.2 })
+        .map(|h| {
+            h.nets
+                .iter()
+                .find(|(m, ..)| m == key)
+                .map_or(0.0, |t| if idx == 1 { t.1 } else { t.2 })
+        })
         .collect()
 }
 
 fn gpu_series(win: &[HistoryPoint], key: &str, idx: usize) -> Vec<f64> {
     win.iter()
-        .filter_map(|h| h.gpus.iter().find(|(id, ..)| id.to_string() == key))
-        .map(|t| if idx == 1 { t.1 as f64 } else { t.2 as f64 })
+        .map(|h| {
+            h.gpus
+                .iter()
+                .find(|(id, ..)| id.to_string() == key)
+                .map_or(0.0, |t| if idx == 1 { t.1 as f64 } else { t.2 as f64 })
+        })
         .collect()
 }
 

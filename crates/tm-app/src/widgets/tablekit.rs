@@ -192,7 +192,11 @@ impl TmColumn {
         }
     }
     /// The elastic name/description column: `width == 0` means "not yet
-    /// user-resized"; the effective width fills the remaining viewport.
+    /// user-resized"; the effective width then fills the remaining viewport.
+    /// The FIRST manual resize on the table materializes this width (the
+    /// absorber would otherwise cancel the drag delta under the cursor);
+    /// double-clicking the name separator restores fill mode via the same
+    /// sentinel.
     pub const fn elastic(id: &'static str, label: &'static str, min_w: f32) -> Self {
         Self {
             id,
@@ -265,19 +269,27 @@ impl TmTable {
         self.dirty
     }
 
-    /// Effective width of the elastic first column: absorbs leftover
-    /// viewport width when the other columns leave room; otherwise keeps
-    /// its stored/default width and the table scrolls horizontally.
+    /// Effective width of the elastic first column.
+    ///
+    /// Elastic ONLY while untouched (`width == 0.0`, the [`TmColumn::elastic`
+    /// sentinel]): it then fills the viewport slack left by the other
+    /// columns. The moment ANY column is drag-resized, `header()` freezes
+    /// (materializes) the name width — otherwise this absorber would hand
+    /// back every dragged pixel in the same frame, cancelling the delta at
+    /// the boundary under the cursor (the dragged separator stayed put while
+    /// the Name/Status divider shifted — "columns can't be resized"), and it
+    /// flipped regimes around `spare == stored`, which read as wobbling.
     fn name_effective(&self, avail: f32) -> f32 {
-        let stored = self.cols[0]
-            .width
-            .max(self.name_min.min(self.cols[0].default_w.max(MIN_COL_W)));
-        let others: f32 = self.cols[1..].iter().map(|c| c.width).sum();
+        let w = self.cols[0].width;
+        if w > 0.0 {
+            return w.max(MIN_COL_W);
+        }
+        let others: f32 = self.cols[1..].iter().map(|c| c.width.max(MIN_COL_W)).sum();
         let spare = avail - others;
-        if spare > stored {
+        if spare > self.name_min {
             spare
         } else {
-            stored.max(MIN_COL_W)
+            self.name_min.max(MIN_COL_W)
         }
     }
 
@@ -540,6 +552,17 @@ impl TmTable {
             let drag_key = table_id.with(("resize-start", target_col_id));
 
             if rresp.drag_started() {
+                // Freeze the elastic name column at its current effective
+                // width, once, before any delta is applied: from the first
+                // manual resize on ALL columns are explicitly sized, so the
+                // boundary under the cursor tracks the pointer 1:1 instead
+                // of fighting the slack absorber (see `name_effective`).
+                // Value-preserving at this instant — no visual jump.
+                if self.cols[0].width == 0.0 {
+                    self.cols[0].width = self.name_effective(avail);
+                    self.layout.borrow_mut().take();
+                    self.dirty = true;
+                }
                 // Remember the width at gesture start; the cumulative delta
                 // applies against THIS value for the whole drag.
                 let start = if i - 1 == 0 {
@@ -572,9 +595,13 @@ impl TmTable {
                 }
             }
             if rresp.double_clicked() {
-                // Restores the built-in default; `0.0` on the elastic name
-                // column switches it back to fill-the-spare-space mode.
-                self.cols[i - 1].width = self.cols[i - 1].default_w.clamp(0.0, MAX_COL_W);
+                // Restores the built-in default; for the name column the
+                // `0.0` sentinel switches back to fill-the-spare-space mode.
+                self.cols[i - 1].width = if i - 1 == 0 {
+                    0.0
+                } else {
+                    self.cols[i - 1].default_w.clamp(MIN_COL_W, MAX_COL_W)
+                };
                 self.layout.borrow_mut().take();
                 self.dirty = true;
             }
@@ -800,5 +827,62 @@ impl Aggregates {
             format::format_pct_hdr(self.disk_pct),
             format::format_pct_hdr(self.net_pct),
         ]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn table() -> TmTable {
+        TmTable::new(
+            "t",
+            vec![
+                TmColumn::elastic("name", "Name", 340.0),
+                TmColumn::text("a", "A", 200.0),
+                TmColumn::num("b", "B", 100.0),
+            ],
+            None,
+            340.0,
+        )
+    }
+
+    /// Regression: the elastic name column absorbed the viewport slack EVERY
+    /// frame, so a manual drag of any other boundary was cancelled in the
+    /// same frame — the dragged separator never moved ("columns can't be
+    /// resized"). Materializing the name width at drag start must make the
+    /// delta stick to the boundary under the cursor.
+    #[test]
+    fn materialized_name_stops_absorbing_drag_deltas() {
+        let mut t = table();
+        let avail = 1000.0;
+        // Virgin table: elastic absorber fills the slack (200+100 fixed).
+        assert_eq!(t.col_width(0, avail), 700.0);
+
+        // `header()` does exactly this on the first drag_started:
+        t.cols[0].width = t.name_effective(avail);
+
+        // Growing column B by 300 must grow the TOTAL by 300 — i.e. B's left
+        // boundary follows the cursor — instead of being absorbed away.
+        let before = t.total_width(avail);
+        t.cols[2].width += 300.0;
+        assert_eq!(t.total_width(avail), before + 300.0);
+        // And the name column must NOT re-absorb on later frames.
+        assert_eq!(t.col_width(0, avail), 700.0);
+    }
+
+    /// While still untouched, the elastic column keeps filling slack and
+    /// respects its minimum when the viewport gets too narrow.
+    #[test]
+    fn virgin_elastic_fills_slack_and_respects_min() {
+        let mut t = table();
+        assert_eq!(t.col_width(0, 1200.0), 900.0);
+        // Viewport leaves less than the minimum -> clamped to name_min.
+        assert_eq!(t.col_width(0, 400.0), 340.0);
+        // Double-click restore re-enables fill mode via the sentinel.
+        t.cols[0].width = 500.0;
+        assert_eq!(t.col_width(0, 1200.0), 500.0);
+        t.cols[0].width = 0.0;
+        assert_eq!(t.col_width(0, 1200.0), 900.0);
     }
 }
