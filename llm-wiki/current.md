@@ -18,7 +18,9 @@ remaining gaps are tracked in `known-debt.md`.
 - Event-driven UI: engine publications and worker completions request
   repaint; interval polling removed; toast ids stable; toasts drive timed
   repaints only while visible.
-- Correctness fixes: table/splitter drag-start-width resize math; F5 forces
+- Correctness fixes: table/splitter resize math accumulates per-frame
+  `drag_delta()` onto the live width (drag-start snapshots were wrong —
+  `drag_delta()` is NOT cumulative in egui); F5 forces
   one sample even when paused (state preserved); StartupApproved folder
   subkey path bug; minidump CREATE_ALWAYS truncation; non-blocking
   `run_new_task`; PID-reuse-safe process identity for destructive actions;

@@ -200,24 +200,18 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
             });
 
         // Drag splitter between the card column and the detail area.
-        // Width applies from the DRAG-START value plus the cumulative delta;
-        // adding deltas to the already-updated width compounded per frame
-        // (the same bug class as table columns, §14.1).
+        // egui's `drag_delta()` is movement since LAST FRAME, so it must
+        // accumulate onto the LIVE width each frame. A frozen drag-start
+        // value plus one frame of delta reset `card_w` to ~its starting
+        // value every frame, so the splitter never followed the cursor
+        // (the same root cause as the table column resize bug).
         let split_h = ui.available_height();
         let (srect, sresp) = ui.allocate_exact_size(egui::vec2(10.0, split_h), egui::Sense::drag());
         if sresp.hovered() || sresp.dragged() {
             ui.ctx().set_cursor_icon(CursorIcon::ResizeHorizontal);
         }
-        let drag_key = egui::Id::new("perf-splitter-start-w");
-        if sresp.drag_started() {
-            ui.ctx().data_mut(|d| d.insert_temp(drag_key, card_w));
-        }
         if sresp.dragged() {
-            let start_w = ui
-                .ctx()
-                .data(|d| d.get_temp::<f32>(drag_key))
-                .unwrap_or(card_w);
-            card_w = (start_w + sresp.drag_delta().x).clamp(180.0, 520.0);
+            card_w = (card_w + sresp.drag_delta().x).clamp(180.0, 520.0);
             app.shared.settings.perf_card_width = card_w;
             ui.painter().line_segment(
                 [

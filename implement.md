@@ -59,9 +59,15 @@ Do not start optimizing from profiler guesses until the baseline instrumentation
    - This is the opposite of an “instant shell first, telemetry second” architecture.
 
 3. **Table column resizing is mathematically wrong.**
-   - `egui::Response::drag_delta()` is cumulative from drag start.
-   - `tablekit.rs` adds that cumulative delta to a width that was already updated on previous frames, causing compounding/overshoot.
-   - The Performance sidebar splitter has the same pattern.
+   - CORRECTION (verified against egui 0.36 source): `Response::drag_delta()`
+     is movement since the LAST FRAME (`pointer.delta()`); only
+     `total_drag_delta()` is cumulative since the press.
+   - The original fix therefore froze a drag-start width and added one frame
+     of delta to it every frame, which reset the width to ~its starting
+     value each frame — the boundary never followed the cursor.
+   - Correct pattern: accumulate each per-frame `drag_delta()` onto the LIVE
+     width (`width = (width + delta).clamp(min, max)`).
+   - The Performance sidebar splitter had the same pattern.
 
 4. **Table drag-end persistence state is ineffective.**
    - `TmTable` is reconstructed every frame, but `prev_dragging` lives inside `TmTable`, so the previous-frame state is lost. `drag_just_ended()` cannot reliably work as intended.
@@ -605,29 +611,27 @@ This is both a correctness fix and the foundation for Task Manager parity.
 
 **File:** `crates/tm-app/src/widgets/tablekit.rs`
 
-Do not add cumulative `drag_delta()` to the already-updated persisted width.
-
-Store drag-start width in persistent egui temp data keyed by `(table_id, boundary/column_id)`:
+CORRECTED after verifying egui 0.36 semantics: `drag_delta()` is PER-FRAME
+movement, NOT cumulative from drag start (that is `total_drag_delta()`).
+Storing a drag-start width and adding one frame of delta to it pinned the
+column at its starting width. Accumulate the per-frame delta onto the live
+width instead:
 
 ```rust
-struct ResizeDrag {
-    start_width: f32,
-}
-
 if response.drag_started() {
-    store(start_width);
+    // materialize any elastic/slack-absorbing column once, value-preserving
 }
 if response.dragged() {
-    width = (start_width + response.drag_delta().x).clamp(min, max);
-}
-if response.drag_stopped() {
-    clear();
+    width = (width + response.drag_delta().x).clamp(min, max);
 }
 ```
 
-Use a similar persistent drag-start value for the Performance resource-list splitter in `tabs/performance.rs`.
+Same fix for the Performance resource-list splitter in `tabs/performance.rs`.
 
-Add regression automation: drag +180 px; the boundary must move approximately +180 px, not increasingly farther on each frame.
+Regression automation must drive REAL pointer events through an egui
+`Context` (see `tablekit::tests::dragging_name_boundary_tracks_cursor_across_frames`):
+drag +60 px over two frames; the boundary must land exactly +60 px, not stay
+near its starting width.
 
 ### 8.2 Remove `prev_dragging` from ephemeral `TmTable`
 
@@ -1190,7 +1194,9 @@ Requirements:
 
 ### 14.1 Splitter drag bug
 
-Use drag-start width + cumulative delta, not current width + cumulative delta.
+CORRECTED: accumulate each frame's `drag_delta()` (per-frame movement) onto
+the current width; do not freeze a drag-start width and add one frame of
+delta to it.
 
 ### 14.2 Stable resource IDs
 
@@ -1759,8 +1765,10 @@ At minimum add:
 
 1. `engine_refresh_while_paused`
 2. `sample_now_publication_semantics` if tick generation is unified
-3. `table_resize_uses_drag_start_width`
-4. `performance_splitter_resize_uses_drag_start_width`
+3. `dragging_name_boundary_tracks_cursor_across_frames` (real pointer events
+   through an egui `Context`; supersedes the flawed drag-start-width idea)
+4. `performance_splitter` accumulation is covered by manual verification +
+   the tablekit input-driven tests (same one-line math)
 5. `table_preferences_migrate_positional_widths_to_ids`
 6. `details_every_column_sorts_its_own_field`
 7. `process_expansion_invalidates_display_cache`
