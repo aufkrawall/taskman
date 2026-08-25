@@ -2,3 +2,4 @@
 bench/*/target
 bench/dist
 *.log.tmp
+*.png

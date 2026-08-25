@@ -13,7 +13,7 @@ use tm_core::model::{ServiceInfo, ServiceStatus};
 use crate::app::TaskManApp;
 use crate::icons::Icon;
 use crate::theme;
-use crate::widgets::tablekit::{TmColumn};
+use crate::widgets::tablekit::TmColumn;
 
 fn columns() -> Vec<TmColumn> {
     vec![
@@ -51,7 +51,10 @@ fn ensure_fresh(app: &TaskManApp) {
                 let items = actions.list_services();
                 let fetched = Instant::now();
                 if let Err(e) = &items {
-                    crate::app::toast_from(&toasts, i18n::trf(K::ServicesUnavailable, &[&e.to_string()]));
+                    crate::app::toast_from(
+                        &toasts,
+                        i18n::trf(K::ServicesUnavailable, &[&e.to_string()]),
+                    );
                 }
                 *tm_core::sync::lock(&cache) = Some(Cache {
                     items: items.unwrap_or_default(),
@@ -163,12 +166,15 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
 
     let mut table = app.make_table("services", columns(), 340.0);
     let avail = crate::widgets::tablekit::table_avail(ui);
-    table.header(ui, &pal, avail, None, None);
-
-    egui::ScrollArea::vertical()
-        .id_salt("svc-table")
-        .auto_shrink(false)
-        .show(ui, |ui| {
+    crate::widgets::tablekit::scrolled_table(
+        "services",
+        ui,
+        &pal,
+        &mut table,
+        avail,
+        None,
+        None,
+        |ui, table, avail, _content_w| {
             for s in rows {
                 let selected = app.services_selected_name.as_deref() == Some(s.name.as_str());
                 let (rect, resp) = table.row(ui, &pal, avail, selected);
@@ -233,7 +239,8 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
                 });
             }
             ui.add_space(12.0);
-        });
+        },
+    );
     app.persist_table(&table);
 }
 
@@ -277,10 +284,7 @@ fn control(app: &mut TaskManApp, action: tm_platform::actions::ServiceAction) {
                     &toasts,
                     format!("'{}' {}", name, i18n::tr(K::ServiceDoneToast)),
                 ),
-                Err(e) => crate::app::toast_from(
-                    &toasts,
-                    i18n::trf(K::ErrMsg, &[&e.to_string()]),
-                ),
+                Err(e) => crate::app::toast_from(&toasts, i18n::trf(K::ErrMsg, &[&e.to_string()])),
             }
             // Force the next frame's lazy refresh to pick up the new state.
             *tm_core::sync::lock(&services_cache) = None;

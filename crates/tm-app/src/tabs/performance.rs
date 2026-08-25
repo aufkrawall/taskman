@@ -73,8 +73,7 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
 
         // Drag splitter between the card column and the detail area.
         let split_h = ui.available_height();
-        let (srect, sresp) =
-            ui.allocate_exact_size(egui::vec2(10.0, split_h), egui::Sense::drag());
+        let (srect, sresp) = ui.allocate_exact_size(egui::vec2(10.0, split_h), egui::Sense::drag());
         if sresp.hovered() || sresp.dragged() {
             ui.ctx().set_cursor_icon(CursorIcon::ResizeHorizontal);
         }
@@ -231,6 +230,14 @@ fn build_resource_list(app: &TaskManApp) -> Vec<ResourceEntry> {
         if n.kind == "Loopback" {
             continue;
         }
+        // Card subtitle: adapter model when known, else the interface name.
+        let subtitle = if !n.desc.is_empty() {
+            n.desc.clone()
+        } else if n.kind.is_empty() {
+            String::new()
+        } else {
+            n.name.clone()
+        };
         out.push(ResourceEntry {
             kind: ResourceKind::Network,
             key: n.name.clone(),
@@ -239,14 +246,13 @@ fn build_resource_list(app: &TaskManApp) -> Vec<ResourceEntry> {
             } else {
                 n.kind.clone()
             },
-            subtitle: if n.kind.is_empty() {
-                String::new()
-            } else {
-                n.name.clone()
-            },
+            subtitle,
             value_line: i18n::trf(
                 K::CardSentRecv,
-                &[&format::format_kbit(n.sent_bps), &format::format_kbit(n.recv_bps)],
+                &[
+                    &format::format_kbit(n.sent_bps),
+                    &format::format_kbit(n.recv_bps),
+                ],
             ),
         });
     }
@@ -416,6 +422,33 @@ fn content_width(ui: &egui::Ui) -> f32 {
     ui.available_width() - 32.0
 }
 
+/// Page-bottom layout: big stats on the left, key/value details on the
+/// right — or stacked vertically when the detail area is too narrow for
+/// both (otherwise egui squeezes the kv column to zero width and the
+/// details silently vanish).
+fn stats_block(
+    ui: &mut egui::Ui,
+    stats_w: f32,
+    stats: impl FnOnce(&mut egui::Ui),
+    details: impl FnOnce(&mut egui::Ui),
+) {
+    const KV_MIN: f32 = 260.0;
+    const GAP: f32 = 30.0;
+    if ui.available_width() >= 16.0 + stats_w + GAP + KV_MIN {
+        ui.horizontal_top(|ui| {
+            ui.add_space(16.0);
+            stats(ui);
+            ui.add_space(GAP);
+            details(ui);
+        });
+    } else {
+        ui.add_space(16.0);
+        stats(ui);
+        ui.add_space(12.0);
+        details(ui);
+    }
+}
+
 // ---------------------------------------------------------------- CPU page
 
 fn cpu_page(app: &mut TaskManApp, ui: &mut egui::Ui, pal: &Palette) {
@@ -458,8 +491,7 @@ fn cpu_page(app: &mut TaskManApp, ui: &mut egui::Ui, pal: &Palette) {
     ui.add_space(10.0);
 
     // Stats: left big values, right key/value list.
-    ui.horizontal_top(|ui| {
-        ui.add_space(16.0);
+    stats_block(ui, 490.0, |ui| {
         ui.vertical(|ui| {
             let w = 150.0;
             ui.horizontal_top(|ui| {
@@ -509,8 +541,7 @@ fn cpu_page(app: &mut TaskManApp, ui: &mut egui::Ui, pal: &Palette) {
                 w + 60.0,
             );
         });
-
-        ui.add_space(30.0);
+    }, |ui| {
         ui.vertical(|ui| {
             let gb = |kb: u64| -> String {
                 if kb == 0 {
@@ -529,8 +560,18 @@ fn cpu_page(app: &mut TaskManApp, ui: &mut egui::Ui, pal: &Palette) {
                     "—".into()
                 },
             );
-            kv_row(ui, pal, i18n::tr(K::KvSockets), &snap.cpu.sockets.to_string());
-            kv_row(ui, pal, i18n::tr(K::KvCores), &snap.cpu.physical_cores.to_string());
+            kv_row(
+                ui,
+                pal,
+                i18n::tr(K::KvSockets),
+                &snap.cpu.sockets.to_string(),
+            );
+            kv_row(
+                ui,
+                pal,
+                i18n::tr(K::KvCores),
+                &snap.cpu.physical_cores.to_string(),
+            );
             kv_row(
                 ui,
                 pal,
@@ -617,8 +658,7 @@ fn memory_page(app: &mut TaskManApp, ui: &mut egui::Ui, pal: &Palette) {
 
     ui.add_space(10.0);
     let m = &snap.memory;
-    ui.horizontal_top(|ui| {
-        ui.add_space(16.0);
+    stats_block(ui, 590.0, |ui| {
         ui.vertical(|ui| {
             let w = 170.0;
             big_stat(
@@ -663,9 +703,14 @@ fn memory_page(app: &mut TaskManApp, ui: &mut egui::Ui, pal: &Palette) {
                 );
             });
         });
-        ui.add_space(30.0);
+    }, |ui| {
         ui.vertical(|ui| {
-            kv_row(ui, pal, i18n::tr(K::KvTotal), &format::format_bytes_loc(m.total_bytes));
+            kv_row(
+                ui,
+                pal,
+                i18n::tr(K::KvTotal),
+                &format::format_bytes_loc(m.total_bytes),
+            );
             kv_row(
                 ui,
                 pal,
@@ -684,6 +729,35 @@ fn memory_page(app: &mut TaskManApp, ui: &mut egui::Ui, pal: &Palette) {
                     pal,
                     i18n::tr(K::KvPagefile),
                     &format::format_bytes_loc(m.swap_used_bytes),
+                );
+            }
+            // Hardware facts (SMBIOS) — the original Task Manager's
+            // Speed / Slots used / Form factor / Hardware reserved rows.
+            if m.speed_mts > 0 {
+                kv_row(
+                    ui,
+                    pal,
+                    i18n::tr(K::KvRamSpeed),
+                    &format!("{} MT/s", m.speed_mts),
+                );
+            }
+            if m.slots_total > 0 {
+                kv_row(
+                    ui,
+                    pal,
+                    i18n::tr(K::KvSlotsUsed),
+                    &format!("{} / {}", m.slots_used, m.slots_total),
+                );
+            }
+            if !m.form_factor.is_empty() {
+                kv_row(ui, pal, i18n::tr(K::KvFormFactor), &m.form_factor);
+            }
+            if m.installed_bytes > 0 {
+                kv_row(
+                    ui,
+                    pal,
+                    i18n::tr(K::KvHwReserved),
+                    &format::format_bytes_loc(m.hw_reserved_bytes),
                 );
             }
         });
@@ -746,8 +820,7 @@ fn disk_page(app: &mut TaskManApp, ui: &mut egui::Ui, pal: &Palette, entry: &Res
     );
 
     ui.add_space(10.0);
-    ui.horizontal_top(|ui| {
-        ui.add_space(16.0);
+    stats_block(ui, 560.0, |ui| {
         ui.vertical(|ui| {
             let w = 170.0;
             big_stat(
@@ -772,7 +845,7 @@ fn disk_page(app: &mut TaskManApp, ui: &mut egui::Ui, pal: &Palette, entry: &Res
                 w,
             );
         });
-        ui.add_space(30.0);
+    }, |ui| {
         ui.vertical(|ui| {
             if disk.avg_resp_ms > 0.0 {
                 kv_row(
@@ -856,8 +929,7 @@ fn network_page(app: &mut TaskManApp, ui: &mut egui::Ui, pal: &Palette, entry: &
     );
 
     ui.add_space(10.0);
-    ui.horizontal_top(|ui| {
-        ui.add_space(16.0);
+    stats_block(ui, 400.0, |ui| {
         ui.vertical(|ui| {
             let w = 180.0;
             big_stat(
@@ -875,7 +947,7 @@ fn network_page(app: &mut TaskManApp, ui: &mut egui::Ui, pal: &Palette, entry: &
                 w,
             );
         });
-        ui.add_space(30.0);
+    }, |ui| {
         ui.vertical(|ui| {
             kv_row(
                 ui,
@@ -889,6 +961,9 @@ fn network_page(app: &mut TaskManApp, ui: &mut egui::Ui, pal: &Palette, entry: &
                 i18n::tr(K::KvTotalSent),
                 &format::format_bytes_loc(net.total_sent_bytes),
             );
+            if !net.desc.is_empty() {
+                kv_row(ui, pal, i18n::tr(K::KvAdapter), &net.desc);
+            }
             if net.link_bps > 0 {
                 kv_row(
                     ui,
@@ -955,8 +1030,7 @@ fn gpu_page(app: &mut TaskManApp, ui: &mut egui::Ui, pal: &Palette, entry: &Reso
     );
 
     ui.add_space(10.0);
-    ui.horizontal_top(|ui| {
-        ui.add_space(16.0);
+    stats_block(ui, 400.0, |ui| {
         ui.vertical(|ui| {
             let w = 170.0;
             big_stat(
@@ -974,7 +1048,7 @@ fn gpu_page(app: &mut TaskManApp, ui: &mut egui::Ui, pal: &Palette, entry: &Reso
                 w,
             );
         });
-        ui.add_space(30.0);
+    }, |ui| {
         ui.vertical(|ui| {
             if gpu.mem_total_bytes > 0 {
                 kv_row(

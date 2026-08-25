@@ -83,6 +83,23 @@ pub struct MemoryInfo {
     pub non_paged_pool_bytes: u64,
     pub swap_total_bytes: u64,
     pub swap_used_bytes: u64,
+    /// Physically installed RAM (SMBIOS), before hardware reservations.
+    pub installed_bytes: u64,
+    /// Memory reserved by hardware/firmware (installed - usable).
+    pub hw_reserved_bytes: u64,
+    /// Configured DRAM clock of the fastest populated module, MT/s (0 = unknown).
+    pub speed_mts: u32,
+    /// Maximum supported module speed, MT/s (0 = unknown).
+    pub speed_max_mts: u32,
+    /// Populated memory slots / total slots (0 = unknown).
+    pub slots_used: u32,
+    pub slots_total: u32,
+    /// "DIMM" / "SODIMM" / ... of the first populated module (empty = unknown).
+    pub form_factor: String,
+    /// Module manufacturer of the first populated module (empty = unknown).
+    pub manufacturer: String,
+    /// Module part number of the first populated module (empty = unknown).
+    pub part_number: String,
 }
 
 impl MemoryInfo {

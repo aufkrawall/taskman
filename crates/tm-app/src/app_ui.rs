@@ -389,7 +389,9 @@ pub fn settings_dialog(app: &mut TaskManApp, ctx: &egui::Context, _pal: &theme::
 
             ui.add_space(10.0);
             let mut on_top = app.shared.settings.always_on_top;
-            if ui.checkbox(&mut on_top, i18n::tr(K::AlwaysOnTop)).changed() {
+            if crate::widgets::controls::checkbox(ui, &mut on_top, i18n::tr(K::AlwaysOnTop), _pal)
+                .changed()
+            {
                 app.shared.settings.always_on_top = on_top;
                 ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(if on_top {
                     egui::WindowLevel::AlwaysOnTop
@@ -402,9 +404,13 @@ pub fn settings_dialog(app: &mut TaskManApp, ctx: &egui::Context, _pal: &theme::
             // Autosave master switch (default on). Toggling it ON writes the
             // flag itself immediately so the choice survives a crash.
             let mut autosave = app.shared.settings.save_config;
-            if ui
-                .checkbox(&mut autosave, i18n::tr(K::SaveConfigAuto))
-                .changed()
+            if crate::widgets::controls::checkbox(
+                ui,
+                &mut autosave,
+                i18n::tr(K::SaveConfigAuto),
+                _pal,
+            )
+            .changed()
             {
                 app.shared.settings.save_config = autosave;
                 if autosave {
@@ -502,7 +508,12 @@ pub fn run_task_dialog(app: &mut TaskManApp, ctx: &egui::Context, _pal: &theme::
             );
             resp.request_focus();
             ui.add_space(4.0);
-            ui.checkbox(&mut app.run_elevated, i18n::tr(K::RunElevated));
+            crate::widgets::controls::checkbox(
+                ui,
+                &mut app.run_elevated,
+                i18n::tr(K::RunElevated),
+                _pal,
+            );
             ui.add_space(8.0);
             ui.horizontal(|ui| {
                 if ui.button(i18n::tr(K::Cancel)).clicked() {

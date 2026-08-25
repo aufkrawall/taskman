@@ -76,13 +76,8 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
             {
                 session_action(app, id, tm_platform::actions::UserSessionAction::Disconnect);
             }
-            if crate::app_ui::cmd_button(
-                ui,
-                &pal,
-                Icon::Person,
-                i18n::tr(K::SignOut),
-                enabled,
-            ) && let Some(id) = app.selected_user
+            if crate::app_ui::cmd_button(ui, &pal, Icon::Person, i18n::tr(K::SignOut), enabled)
+                && let Some(id) = app.selected_user
             {
                 session_action(app, id, tm_platform::actions::UserSessionAction::Logoff);
             }
@@ -175,16 +170,25 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
     let aggs_hdr = agg_hdr.strings();
 
     let avail = crate::widgets::tablekit::table_avail(ui);
-    table.header(ui, &pal, avail, None, Some(&aggs_hdr));
-
-    egui::ScrollArea::vertical()
-        .id_salt("users-table")
-        .auto_shrink(false)
-        .show(ui, |ui| {
+    crate::widgets::tablekit::scrolled_table(
+        "users",
+        ui,
+        &pal,
+        &mut table,
+        avail,
+        None,
+        Some(&aggs_hdr),
+        |ui, table, avail, _content_w| {
             for s in &sessions {
                 let Some(a) = aggs.get(&s.id) else { continue };
                 let display = match &s.domain {
-                    Some(d) if !d.is_empty() && d != "REDACTED-HOSTNAME" => {
+                    // Local accounts: TM shows the bare user name; only
+                    // prefix foreign domains (no hardcoded host names).
+                    Some(d)
+                        if !d.is_empty()
+                            && !d.eq_ignore_ascii_case(&snap.system.hostname)
+                            && !s.user.ends_with(&format!("@{d}")) =>
+                    {
                         format!("{d}\\{}", s.user)
                     }
                     _ => s.user.clone(),
@@ -327,7 +331,8 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
                 }
             }
             ui.add_space(12.0);
-        });
+        },
+    );
     app.persist_table(&table);
 }
 
