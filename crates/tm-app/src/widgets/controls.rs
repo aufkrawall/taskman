@@ -6,9 +6,17 @@ use eframe::egui::{self, Color32, CornerRadius, FontId, Pos2, Rect, Sense, Strok
 
 use crate::theme::Palette;
 
+/// Straight-alpha RGB lerp `a -> b` at fraction `t`.
+fn blend(a: Color32, b: Color32, t: f32) -> Color32 {
+    let f = t.clamp(0.0, 1.0);
+    let mix = |x: u8, y: u8| (x as f32 + (y as f32 - x as f32) * f).round() as u8;
+    Color32::from_rgb(mix(a.r(), b.r()), mix(a.g(), b.g()), mix(a.b(), b.b()))
+}
+
 /// A Task-Manager-style checkbox: 18×18 rounded box, 1 px border; checked =
-/// accent fill with a white check mark; disabled = dimmed. Fully painted
-/// here, so it renders identically on the first frame — no hover required.
+/// accent fill with a white check mark; disabled = dimmed; hover = accent
+/// border over a faint theme-appropriate tint. Fully painted here, so it
+/// renders identically on the first frame — no hover required.
 pub fn checkbox(
     ui: &mut egui::Ui,
     checked: &mut bool,
@@ -58,23 +66,26 @@ pub fn checkbox_enabled(
     let pressed = enabled && resp.is_pointer_button_down_on();
 
     let (fill, border) = if *checked {
-        (
-            if pressed {
-                pal.accent.gamma_multiply(0.75)
-            } else {
-                pal.accent
-            },
-            Stroke::NONE,
-        )
+        if pressed {
+            (pal.accent.gamma_multiply(0.75), Stroke::NONE)
+        } else if hovered {
+            // Checked hover: deepen/brighten the accent toward the text
+            // color — never a white flood (which glared in dark mode).
+            (blend(pal.accent, pal.text, 0.12), Stroke::NONE)
+        } else {
+            (pal.accent, Stroke::NONE)
+        }
     } else if pressed {
         (
             Color32::from_rgba_premultiplied(0, 0, 0, 20),
             Stroke::new(1.0, pal.text_dim),
         )
     } else if hovered {
+        // Win11-style hover: accent border over a faint tint of the local
+        // card background — reads correctly on dark AND light surfaces.
         (
-            Color32::from_rgba_premultiplied(255, 255, 255, 14),
-            Stroke::new(1.0, pal.text),
+            blend(pal.card_bg, pal.accent, 0.10),
+            Stroke::new(1.0, pal.accent),
         )
     } else {
         (

@@ -30,10 +30,20 @@ pub const HEADER_H1: f32 = 30.0;
 const MIN_COL_W: f32 = 40.0;
 const MAX_COL_W: f32 = 1200.0;
 
-/// Available width for a full-width table: a few px of safety margin so the
-/// last column's right-aligned labels never touch the window border.
+/// Empty strip kept clear on the RIGHT of the table content so the floating
+/// vertical scroll bar (which egui paints ON TOP of the scroll area, without
+/// reserving layout space) never covers the last column, and so the last
+/// column keeps visible padding to the window border.
+const BODY_PAD_RIGHT: i8 = 10;
+/// Same idea for the horizontal bar: it floats over the BOTTOM of the body,
+/// so the content ends a few px above it instead of under it.
+const BODY_PAD_BOTTOM: i8 = 8;
+
+/// Available width for a full-width table. The margin keeps the last
+/// column's right-aligned labels clear of both the window border and the
+/// floating scroll bar strip (`BODY_PAD_RIGHT` plus breathing room).
 pub fn table_avail(ui: &egui::Ui) -> f32 {
-    (ui.available_width() - 6.0).max(300.0)
+    (ui.available_width() - 16.0).max(300.0)
 }
 
 /// Render a table header + body with full scrolling support.
@@ -80,9 +90,17 @@ pub fn scrolled_table(
 
     // Body: both axes; x is pinned to the header's current offset (a no-op
     // unless the header was wheel-scrolled), leaving y free for the user.
+    // The right/bottom content margins keep the floating scroll bars from
+    // painting over cells (see `BODY_PAD_*`).
     let body = egui::ScrollArea::both()
         .id_salt(egui::Id::new(("tm-rowscroll", id)))
         .auto_shrink(false)
+        .content_margin(egui::Margin {
+            left: 0,
+            right: BODY_PAD_RIGHT,
+            top: 0,
+            bottom: BODY_PAD_BOTTOM,
+        })
         .horizontal_scroll_offset(hdr.state.offset.x)
         .show(ui, |ui| rows(ui, table, avail, avail.max(content_w)));
 
@@ -125,6 +143,12 @@ pub fn scrolled_rows(
     let body = egui::ScrollArea::both()
         .id_salt(egui::Id::new(("tm-rowscroll", id)))
         .auto_shrink(false)
+        .content_margin(egui::Margin {
+            left: 0,
+            right: BODY_PAD_RIGHT,
+            top: 0,
+            bottom: BODY_PAD_BOTTOM,
+        })
         .horizontal_scroll_offset(hdr.state.offset.x)
         .show_rows(ui, ROW_H, row_count, |ui, range| {
             rows(ui, table, avail, avail.max(content_w), range)
@@ -353,10 +377,13 @@ impl TmTable {
         let mut x = rect.left();
         let mut agg_idx = 0usize;
 
-        // Snapshot boundaries before any mutation this frame.
-        let bounds: Vec<f32> = (0..self.cols.len())
+        // Snapshot boundaries before any mutation this frame. The extra
+        // final entry is the right edge of the LAST column, which carries
+        // its own resize handle like every interior boundary.
+        let mut bounds: Vec<f32> = (0..self.cols.len())
             .map(|i| self.boundary_x(rect, avail, i))
             .collect();
+        bounds.push(rect.left() + total_w);
         // Handle responses collected during painting, applied afterwards.
         let mut resize_hits: Vec<(usize, egui::Response)> = Vec::new();
 
@@ -483,6 +510,26 @@ impl TmTable {
             x += w;
         }
 
+        // Right edge of the last column: same drag behavior as interior
+        // boundaries so the final column stays resizable (TM parity).
+        let last = self.cols.len();
+        if last > 0 {
+            let bx = bounds[last];
+            let handle = Rect::from_min_max(
+                Pos2::new(bx - 6.0, rect.top()),
+                Pos2::new(bx + 4.0, rect.bottom()),
+            );
+            let rresp = ui.interact(
+                handle,
+                table_id.with(("resize", self.cols[last - 1].id)),
+                Sense::drag(),
+            );
+            if rresp.hovered() || rresp.dragged() {
+                ui.ctx().set_cursor_icon(CursorIcon::ResizeHorizontal);
+            }
+            resize_hits.push((last, rresp));
+        }
+
         // Apply resize results now that painting borrowed nothing mutable.
         // Boundary i (left edge of column i) resizes column i-1.
         for (i, rresp) in resize_hits {
@@ -543,19 +590,16 @@ impl TmTable {
             }
         }
 
-        // Bottom border of the header + box around the name cell (TM look).
+        // Bottom border of the header. Every header cell looks alike: only
+        // the separators BETWEEN columns plus this shared bottom line (the
+        // old extra box around the name cell made it stand out and put its
+        // visual border half a pixel off the actual resize boundary).
         painter.line_segment(
             [
                 Pos2::new(rect.left(), rect.bottom()),
                 Pos2::new(rect.right(), rect.bottom()),
             ],
             Stroke::new(1.0, pal.stroke),
-        );
-        painter.rect_stroke(
-            self.col_rect(0, avail, rect).shrink(0.5),
-            0.0,
-            Stroke::new(1.0, pal.stroke),
-            egui::StrokeKind::Inside,
         );
 
         let _ = dragging_now; // drag state lives in egui temp data now

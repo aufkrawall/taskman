@@ -155,7 +155,7 @@ impl SystemCollector for LinuxCollector {
             // Match the parent device for partitions ("sda2" -> "sda").
             let ds = diskstats.iter().find(|s| {
                 dev == s.device
-                    || dev.starts_with(&format!("{}/", s.device)) == false
+                    || !dev.starts_with(&format!("{}/", s.device))
                         && dev.trim_end_matches(char::is_numeric) == s.device
             });
             disks.push(DiskInfo {
@@ -230,6 +230,10 @@ impl SystemCollector for LinuxCollector {
                     .iter()
                     .map(|c| c.cpu_usage().clamp(0.0, 100.0))
                     .collect(),
+                // Linux sampling has no user/kernel split here (model docs:
+                // empty / 0 = unknown).
+                per_core_kernel_pct: Vec::new(),
+                kernel_pct: 0.0,
                 freq_mhz: freq,
                 freq_base_mhz: base_freq_from_cpufreq(),
                 logical_count: logical,
@@ -304,15 +308,14 @@ fn physical_cores() -> usize {
     if let Ok(text) = std::fs::read_to_string("/proc/cpuinfo") {
         let mut ids = Vec::new();
         for line in text.lines() {
-            if let Some(rest) = line.strip_prefix("core id") {
-                if let Some(v) = rest
+            if let Some(rest) = line.strip_prefix("core id")
+                && let Some(v) = rest
                     .trim_start_matches(['\t', ' ', ':'])
                     .trim()
                     .parse::<u32>()
                     .ok()
-                {
-                    ids.push(v);
-                }
+            {
+                ids.push(v);
             }
         }
         ids.sort_unstable();
@@ -341,10 +344,9 @@ fn parse_cache_size(text: &str) -> u64 {
 
 fn base_freq_from_cpufreq() -> f32 {
     if let Ok(khz) = std::fs::read_to_string("/sys/devices/system/cpu/cpu0/cpufreq/base_frequency")
+        && let Ok(k) = khz.trim().parse::<f32>()
     {
-        if let Ok(k) = khz.trim().parse::<f32>() {
-            return k / 1000.0;
-        }
+        return k / 1000.0;
     }
     0.0
 }
@@ -404,7 +406,10 @@ fn drm_gpus() -> Vec<GpuInfo> {
                 mem_used_bytes: vram_used,
                 mem_total_bytes: vram_total,
                 dedicated_used_bytes: vram_used,
+                shared_used_bytes: 0,
                 temperature_c: None,
+                // No DXGI on Linux; LUID is a Windows-only join key.
+                luid: None,
                 engines: vec![GpuEngine {
                     name: "3D".into(),
                     util_pct: busy,

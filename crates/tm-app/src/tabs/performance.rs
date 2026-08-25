@@ -111,6 +111,14 @@ pub struct ResourceEntry {
 /// and charts all share it so their edges line up.
 const GUTTER: f32 = 16.0;
 
+/// Kernel-time shade: a darker tone of the accent hue — Task Manager draws
+/// the kernel share as a deeper band of the SAME color, not a clashing
+/// second hue (§14.4). `pal`-derived, so it stays readable in both themes
+/// (the old hardcoded dark-theme green washed out in light mode).
+fn kernel_color(pal: &Palette) -> Color32 {
+    pal.accent.gamma_multiply(0.55)
+}
+
 pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
     let pal = theme::palette(ui);
     let Some(_snap) = app.latest_snapshot() else {
@@ -733,6 +741,7 @@ fn cpu_page(app: &mut TaskManApp, ui: &mut egui::Ui, pal: &Palette) {
         });
     } else {
         // Overall utilization: one aggregate series (+ kernel overlay).
+        // Kernel first so the primary total series paints on top.
         let total = total_series.clone();
         let kernel = kernel_series.clone();
         let resp = page_chart(
@@ -741,12 +750,12 @@ fn cpu_page(app: &mut TaskManApp, ui: &mut egui::Ui, pal: &Palette) {
             180.0,
             &[
                 MultiSeries {
-                    samples: total.clone(),
-                    color: pal.accent,
+                    samples: kernel.clone(),
+                    color: kernel_color(pal),
                 },
                 MultiSeries {
-                    samples: kernel.clone(),
-                    color: theme::DARK.ok_green,
+                    samples: total.clone(),
+                    color: pal.accent,
                 },
             ],
             100.0,
@@ -768,7 +777,7 @@ fn cpu_page(app: &mut TaskManApp, ui: &mut egui::Ui, pal: &Palette) {
                 90.0,
                 &[MultiSeries {
                     samples: kernel,
-                    color: theme::DARK.ok_green,
+                    color: kernel_color(pal),
                 }],
                 100.0,
                 Some(&ts),
@@ -975,7 +984,7 @@ fn memory_page(app: &mut TaskManApp, ui: &mut egui::Ui, pal: &Palette) {
         120.0,
         &[MultiSeries {
             samples: commit,
-            color: theme::DARK.ok_green,
+            color: pal.ok_green,
         }],
         commit_limit.max(0.1),
         Some(&ts),
@@ -1147,7 +1156,7 @@ fn disk_page(app: &mut TaskManApp, ui: &mut egui::Ui, pal: &Palette, entry: &Res
             },
             MultiSeries {
                 samples: write,
-                color: theme::DARK.ok_green,
+                color: pal.ok_green,
             },
         ],
         peak.max(1.0),
@@ -1267,7 +1276,7 @@ fn network_page(app: &mut TaskManApp, ui: &mut egui::Ui, pal: &Palette, entry: &
         150.0,
         &[MultiSeries {
             samples: sent,
-            color: theme::DARK.ok_green,
+            color: pal.ok_green,
         }],
         s_max,
         Some(&ts),
@@ -1390,7 +1399,7 @@ fn gpu_page(app: &mut TaskManApp, ui: &mut egui::Ui, pal: &Palette, entry: &Reso
         150.0,
         &[MultiSeries {
             samples: mem_gb,
-            color: theme::DARK.ok_green,
+            color: pal.ok_green,
         }],
         max_gb,
         Some(&ts),

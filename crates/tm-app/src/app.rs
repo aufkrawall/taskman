@@ -722,6 +722,9 @@ impl TaskManApp {
     }
 
     /// Jump to the services tab and highlight the service hosted by `pid`.
+    /// Windows-only callers today (service→PID lookup); kept compiled on all
+    /// targets so the API surface stays identical.
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
     pub fn goto_services_for_pid(&mut self, pid: u32, ctx: &egui::Context) {
         self.tab = crate::app::Tab::Services;
         let actions = self.actions.clone();
