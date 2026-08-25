@@ -31,8 +31,7 @@ impl Lang {
 }
 
 /// User-facing language preference persisted in settings.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub enum LangChoice {
     #[default]
     System,
@@ -240,6 +239,10 @@ keys! {
     ScaleLabel => ["Skalierung:", "Scale:"],
     LanguageLabel => ["Sprache:", "Language:"],
     AlwaysOnTop => ["Immer im Vordergrund", "Always on top"],
+    SaveConfigAuto => [
+        "Einstellungen automatisch in config.ini speichern",
+        "Save settings automatically to config.ini"
+    ],
     ColumnsHeading => ["Spaltenbreiten zurücksetzen", "Column widths"],
     ResetColWidths => ["Standardbreiten", "Default widths"],
     ColWidthsResetToast => ["Spaltenbreiten zurückgesetzt", "Column widths reset"],

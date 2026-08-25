@@ -101,6 +101,7 @@ pub fn sidebar(app: &mut TaskManApp, ui_root: &mut egui::Ui, pal: &Palette) {
             // Hamburger toggle.
             if icon_button(ui, pal, Icon::Hamburger, 32.0) {
                 app.shared.settings.sidebar_collapsed = !collapsed;
+                app.shared.settings.save();
             }
             ui.add_space(8.0);
 
@@ -368,10 +369,7 @@ pub fn settings_dialog(app: &mut TaskManApp, ctx: &egui::Context, _pal: &theme::
             ui.heading(i18n::tr(K::LanguageLabel));
             ui.horizontal(|ui| {
                 for (choice, label) in [
-                    (
-                        tm_core::i18n::LangChoice::System,
-                        i18n::tr(K::ThemeSystem),
-                    ),
+                    (tm_core::i18n::LangChoice::System, i18n::tr(K::ThemeSystem)),
                     (tm_core::i18n::LangChoice::De, "Deutsch"),
                     (tm_core::i18n::LangChoice::En, "English"),
                 ] {
@@ -399,6 +397,19 @@ pub fn settings_dialog(app: &mut TaskManApp, ctx: &egui::Context, _pal: &theme::
                     egui::WindowLevel::Normal
                 }));
                 app.shared.settings.save();
+            }
+
+            // Autosave master switch (default on). Toggling it ON writes the
+            // flag itself immediately so the choice survives a crash.
+            let mut autosave = app.shared.settings.save_config;
+            if ui
+                .checkbox(&mut autosave, i18n::tr(K::SaveConfigAuto))
+                .changed()
+            {
+                app.shared.settings.save_config = autosave;
+                if autosave {
+                    app.shared.settings.save();
+                }
             }
 
             ui.add_space(10.0);
@@ -453,7 +464,11 @@ pub fn settings_dialog(app: &mut TaskManApp, ctx: &egui::Context, _pal: &theme::
                     ctx.send_viewport_cmd(egui::ViewportCommand::Title(
                         i18n::tr(K::WindowTitle).to_string(),
                     ));
+                    // Resetting preferences must not flip the user's
+                    // autosave choice.
+                    let keep_autosave = app.shared.settings.save_config;
                     app.shared.settings = defaults;
+                    app.shared.settings.save_config = keep_autosave;
                     app.shared.settings.save();
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
