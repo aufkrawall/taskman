@@ -16,14 +16,29 @@ pub mod macos;
 pub fn detect_locale() -> tm_core::locale::LocaleFmt {
     #[cfg(target_os = "windows")]
     {
-        win::locale::detect_locale().unwrap_or_else(|| {
-            tm_core::locale::detect_env().unwrap_or_default()
-        })
+        win::locale::detect_locale()
+            .unwrap_or_else(|| tm_core::locale::detect_env().unwrap_or_default())
     }
     #[cfg(not(target_os = "windows"))]
     {
         tm_core::locale::detect_env().unwrap_or_default()
     }
+}
+
+/// Refresh rate of the primary display's current mode in Hz.
+///
+/// Reads the active DEVMODE via `EnumDisplaySettingsW`; this is what vsync
+/// (FIFO present) actually paces frames to, so it is the honest ceiling for
+/// frame-rate diagnostics. Returns None when the driver reports nothing
+/// useful (some virtual/adapters report 0 or 1).
+#[cfg(target_os = "windows")]
+pub fn display_refresh_hz() -> Option<f32> {
+    win::display_refresh_hz()
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn display_refresh_hz() -> Option<f32> {
+    None
 }
 
 /// Build the platform's collector + action pair.
