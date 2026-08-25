@@ -1,6 +1,7 @@
 //! /proc/diskstats parsing with delta tracking.
 
 use std::collections::HashMap;
+use std::sync::Mutex;
 
 #[derive(Debug, Clone)]
 pub struct DiskStat {

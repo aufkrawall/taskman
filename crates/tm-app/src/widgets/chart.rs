@@ -36,7 +36,7 @@ pub fn paint_sparkline(ui: &egui::Ui, rect: egui::Rect, samples: &[f64], color: 
     area.push(Pos2::new(pts[pts.len() - 1].x, rect.bottom()));
     area.push(Pos2::new(pts[0].x, rect.bottom()));
     painter.add(Shape::convex_polygon(area, fill, Stroke::NONE));
-    painter.add(Shape::line(pts, Stroke::new(1.0, color)));
+    painter.add(Shape::line(pts, Stroke::new(1.25, color)));
 }
 
 /// Per-logical-processor tile: bordered, faint horizontal grid, filled area.
@@ -80,14 +80,15 @@ pub fn core_chart(
         .enumerate()
         .map(|(i, v)| Pos2::new(x(i), y(*v)))
         .collect();
-    let fill = Color32::from_rgba_premultiplied(color.r(), color.g(), color.b(), 60);
+    let fill = Color32::from_rgba_premultiplied(color.r(), color.g(), color.b(), 75);
     let mut area = pts.clone();
     area.push(Pos2::new(rect.right(), rect.bottom()));
     area.push(Pos2::new(rect.left(), rect.bottom()));
     painter.add(Shape::convex_polygon(area, fill, Stroke::NONE));
-    painter.add(Shape::line(pts, Stroke::new(1.2, color)));
 
-    // Kernel overlay: darker band under the user portion.
+    // Kernel overlay: darker band under the user portion. Painted AFTER the
+    // user fill but BEFORE the line, so it darkens the lower region without
+    // burying the series line (the old order drew the line first).
     if let Some(k) = kernels {
         let kpts: Vec<Pos2> = k
             .iter()
@@ -101,6 +102,7 @@ pub fn core_chart(
         karea.push(Pos2::new(rect.left(), rect.bottom()));
         painter.add(Shape::convex_polygon(karea, kfill, Stroke::NONE));
     }
+    painter.add(Shape::line(pts, Stroke::new(1.4, color)));
 
     // Hover value.
     if let Some(pos) = ui.input(|i| i.pointer.hover_pos())
@@ -176,12 +178,27 @@ pub fn chart_multi(
             .enumerate()
             .map(|(i, v)| Pos2::new(x_at(i, n), y(*v)))
             .collect();
-        let fill = Color32::from_rgba_premultiplied(s.color.r(), s.color.g(), s.color.b(), 45);
+        let fill = Color32::from_rgba_premultiplied(s.color.r(), s.color.g(), s.color.b(), 60);
         let mut area = pts.clone();
         area.push(Pos2::new(rect.right(), rect.bottom()));
         area.push(Pos2::new(rect.left(), rect.bottom()));
         painter.add(Shape::convex_polygon(area, fill, Stroke::NONE));
-        painter.add(Shape::line(pts, Stroke::new(1.2, s.color)));
+    }
+    // Lines in a SECOND pass: an outer series' translucent fill must never
+    // dim an inner series' line (the old single-pass order made overlapping
+    // series muddy and hard to read).
+    for s in series {
+        let n = s.samples.len();
+        if n < 2 {
+            continue;
+        }
+        let pts: Vec<Pos2> = s
+            .samples
+            .iter()
+            .enumerate()
+            .map(|(i, v)| Pos2::new(x_at(i, n), y(*v)))
+            .collect();
+        painter.add(Shape::line(pts, Stroke::new(1.5, s.color)));
     }
 
     // Hover: values of every series at the pointer.
