@@ -1,6 +1,7 @@
 //! Windows backend.
 
 mod cpu_info;
+pub(crate) mod cpu_load;
 mod gpu;
 pub mod icons;
 pub mod locale;
@@ -63,7 +64,7 @@ impl SystemCollector for WinCollector {
     }
 
     fn backend_name(&self) -> &'static str {
-        "windows-sysinfo+pdh"
+        "windows/sysinfo+pdh+nt-cpu"
     }
 }
 
