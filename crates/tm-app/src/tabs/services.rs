@@ -1,9 +1,5 @@
 //! Services tab: SCM-backed list (Name/PID/Beschreibung/Status/Gruppe) with
-//! localized status labels, row selection and the Starten/Beenden/Neu starten/
-//! Dienste öffnen command bar.
-//!
-//! All SCM work (enumeration with per-service enrichment, start/stop/restart
-//! waits) runs on worker threads — the UI thread never blocks on it.
+//! localized status labels, row selection and service controls.
 
 use eframe::egui;
 use std::time::{Duration, Instant};
@@ -17,7 +13,6 @@ use crate::widgets::tablekit::{self, TmColumn};
 
 fn columns() -> Vec<TmColumn> {
     vec![
-        // Audit P0.1/§27: configured width instead of the `0.0` sentinel.
         TmColumn::text("name", i18n::tr(K::ColName), 240.0),
         TmColumn::text("pid", i18n::tr(K::ColPid), 90.0),
         TmColumn::text("desc", i18n::tr(K::ColDescription), 460.0),
@@ -31,7 +26,6 @@ pub struct Cache {
     pub fetched: Instant,
 }
 
-/// Kick off a background refresh when the cache is stale.
 fn ensure_fresh(app: &TaskManApp, ctx: &egui::Context) {
     let stale = {
         let guard = tm_core::sync::lock(&app.shared.services_cache);
@@ -45,9 +39,6 @@ fn ensure_fresh(app: &TaskManApp, ctx: &egui::Context) {
         let done = app.shared.services_fetch.flag();
         let toasts = app.shared.toasts.clone();
         let actions = app.actions.clone();
-        // Wake the UI on completion (audit §23): without this the Services
-        // page could sit on "Gathering data" while sampling is paused,
-        // because no engine tick arrives to pick up the result.
         let wake = {
             let c = ctx.clone();
             move || c.request_repaint()
@@ -78,15 +69,12 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
     let frame_ctx = ui.ctx().clone();
     ensure_fresh(app, &frame_ctx);
 
-    // Consume a cross-tab jump ("Gehe zu Dienst(en)").
     if let Some(name) = tm_core::sync::lock(&app.svc_jump).take() {
         app.services_selected_name = Some(name);
-        // Make sure the target row exists in a fresh cache.
         *tm_core::sync::lock(&app.shared.services_cache) = None;
         ensure_fresh(app, &frame_ctx);
     }
 
-    // Selected row's live status (for enabling Start/Stop buttons).
     let selected_status = {
         let guard = tm_core::sync::lock(&app.shared.services_cache);
         guard
@@ -158,13 +146,9 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
         },
     );
 
-    // Clone the Arc so the guard never borrows from `app` itself — closures
-    // below need `&mut TaskManApp`.
     let cache_arc = app.shared.services_cache.clone();
     let guard = tm_core::sync::lock(&cache_arc);
     let Some(ref c) = *guard else {
-        // Background fetch still in flight — centered placeholder instead
-        // of a blank pane.
         ui.centered_and_justified(|ui| ui.label(i18n::tr(K::GatheringData)));
         return;
     };
@@ -183,6 +167,30 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
     rows.sort_by_key(|a| a.name.to_lowercase());
 
     let mut table = app.make_table("services", columns());
+    let mut fit: Vec<f32> = table
+        .cols
+        .iter()
+        .map(|c| tablekit::text_width(ui, c.label, tablekit::FONT_HDR_LABEL) + 28.0)
+        .collect();
+    for s in &rows {
+        let values = [
+            s.name.as_str(),
+            "",
+            s.display_name.as_str(),
+            status_label(app, s.status),
+            s.group.as_str(),
+        ];
+        fit[0] = fit[0].max(tablekit::text_width(ui, values[0], tablekit::FONT_ROW) + 66.0);
+        let pid = s.pid.map(|p| p.to_string()).unwrap_or_default();
+        fit[1] = fit[1].max(tablekit::text_width(ui, &pid, tablekit::FONT_ROW) + 22.0);
+        for i in 2..5 {
+            fit[i] = fit[i].max(tablekit::text_width(ui, values[i], tablekit::FONT_ROW) + 22.0);
+        }
+    }
+    for (i, width) in fit.into_iter().enumerate() {
+        table.set_auto_fit_width(i, width.ceil());
+    }
+
     let avail = crate::widgets::tablekit::table_avail(ui);
     tablekit::scrolled_rows(
         "services",
@@ -199,14 +207,13 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
                 let selected = app.services_selected_name.as_deref() == Some(s.name.as_str());
                 let (rect, resp) = table.row(ui, &pal, selected);
 
-                // Gear glyph per row.
                 let icon_rect = egui::Rect::from_center_size(
                     egui::Pos2::new(rect.left() + 38.0, rect.center().y),
                     egui::vec2(16.0, 16.0),
                 );
                 crate::icons::draw_at(ui, icon_rect, Icon::Properties, pal.text_dim);
                 let name_rect = table.col_rect(0, rect);
-                ui.painter().text(
+                ui.painter_at(name_rect).text(
                     egui::Pos2::new(name_rect.left() + 56.0, rect.center().y),
                     egui::Align2::LEFT_CENTER,
                     &s.name,
@@ -276,11 +283,9 @@ fn status_label(app: &TaskManApp, st: ServiceStatus) -> &'static str {
     }
 }
 
-/// Run the service action on a worker thread (start/stop can take many
-/// seconds); the result arrives as a toast, the cache invalidates itself.
 fn control(app: &mut TaskManApp, ctx: &egui::Context, action: tm_platform::actions::ServiceAction) {
     if !app.shared.service_control.begin() {
-        return; // already one in flight
+        return;
     }
     let Some(name) = app.services_selected_name.clone() else {
         app.shared.service_control.end();
@@ -288,14 +293,10 @@ fn control(app: &mut TaskManApp, ctx: &egui::Context, action: tm_platform::actio
     };
     let actions = app.actions.clone();
     let toasts = app.shared.toasts.clone();
-
-    // Invalidate immediately so the UI reflects the transition.
     *tm_core::sync::lock(&app.shared.services_cache) = None;
 
     let done_flag = app.shared.service_control.flag();
     let services_cache = app.shared.services_cache.clone();
-    // Wake the UI when the (potentially slow) service action finishes so the
-    // new state renders even without a concurrent engine tick (audit §23).
     let wake = {
         let c = ctx.clone();
         move || c.request_repaint()
@@ -311,7 +312,6 @@ fn control(app: &mut TaskManApp, ctx: &egui::Context, action: tm_platform::actio
                 ),
                 Err(e) => crate::app::toast_from(&toasts, i18n::trf(K::ErrMsg, &[&e.to_string()])),
             }
-            // Force the next frame's lazy refresh to pick up the new state.
             *tm_core::sync::lock(&services_cache) = None;
             done_flag.store(false, std::sync::atomic::Ordering::Relaxed);
             wake();
