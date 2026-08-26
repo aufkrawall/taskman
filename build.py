@@ -1,24 +1,8 @@
 #!/usr/bin/env python3
 """Release build driver for taskman.
 
-Default behavior (`python build.py`):
-  1. Build an optimized release binary for the HOST platform.
-  2. Build the Linux x86_64 release binary as well — the workspace ships a
-     real Linux collector (crates/tm-platform/src/linux), so Linux is a
-     first-class target. Cross-building a GUI app needs a cross toolchain
-     (`cross` or `cargo-zigbuild`); if neither is installed the Linux step
-     is skipped with a clear note instead of failing the Windows artifact.
-  3. Package both binaries into dist/ as taskman-v<version>-<platform>.
-
-Exit code is 0 if every *attempted* target succeeded. Use
---require-all-targets to make a skipped Linux build a hard error.
-
-Examples:
-    python build.py                     # release: host + linux, packaged
-    python build.py --host-only         # just this machine's release build
-    python build.py --linux-only        # just the linux cross build
-    python build.py --debug             # debug profile instead of release
-    python build.py --check             # fmt + clippy + tests gate first
+Default behavior (`python build.py`): build the host and Linux x86_64 release
+(where a cross toolchain is available), then package platform artifacts.
 """
 
 from __future__ import annotations
@@ -37,6 +21,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent
 DIST = ROOT / "dist"
 LINUX_TARGET = "x86_64-unknown-linux-gnu"
+LINUX_DESKTOP = ROOT / "packaging" / "linux" / "io.github.aufkrawall.Taskman.desktop"
 
 
 def log(msg: str) -> None:
@@ -56,7 +41,6 @@ def cargo() -> str:
     exe = "cargo.exe" if platform.system() == "Windows" else "cargo"
     if shutil.which(exe):
         return exe
-    # Common rustup location when ~/.cargo/bin is not on PATH.
     fallback = Path.home() / ".cargo" / "bin" / exe
     if fallback.exists():
         return str(fallback)
@@ -76,23 +60,14 @@ def have(tool: str) -> bool:
 
 
 def linux_cross_command(profile: str) -> tuple[list[str], str] | None:
-    """Return (command, out_dir) for the best available Linux cross toolchain."""
     if have("cross"):
-        # cross builds inside a container with the Linux sysroot + GTK deps.
         return (
             ["cross", "build", "--profile", profile, "--target", LINUX_TARGET],
             str(ROOT / "target" / LINUX_TARGET / profile),
         )
     if have("cargo-zigbuild"):
         return (
-            [
-                "cargo",
-                "zigbuild",
-                "--profile",
-                profile,
-                "--target",
-                LINUX_TARGET,
-            ],
+            ["cargo", "zigbuild", "--profile", profile, "--target", LINUX_TARGET],
             str(ROOT / "target" / LINUX_TARGET / profile),
         )
     return None
@@ -111,7 +86,6 @@ def build_host(profile: str) -> Path | None:
 
 
 def build_linux(profile: str) -> tuple[Path | None, bool]:
-    """Returns (binary path or None, attempted?)."""
     cmd = linux_cross_command(profile)
     if cmd is None:
         log(
@@ -190,7 +164,6 @@ def main() -> int:
 
     failures = 0
     artifacts: list[tuple[str, list[tuple[Path, str]]]] = []
-
     host_requested = not args.linux_only
     linux_requested = not args.host_only
 
@@ -201,13 +174,23 @@ def main() -> int:
         else:
             log(f"host binary ready: {exe}")
             arc = "taskman.exe" if exe.suffix == ".exe" else "taskman"
-            artifacts.append((f"taskman-v{version}-{host_tag()}", [(exe, arc)]))
+            host_files = [(exe, arc)]
+            if platform.system() == "Linux" and LINUX_DESKTOP.exists():
+                host_files.append(
+                    (LINUX_DESKTOP, "share/applications/io.github.aufkrawall.Taskman.desktop")
+                )
+            artifacts.append((f"taskman-v{version}-{host_tag()}", host_files))
 
     if linux_requested:
         exe, attempted = build_linux(profile)
         if exe is not None:
             log(f"linux binary ready: {exe}")
-            artifacts.append((f"taskman-v{version}-linux-x86_64", [(exe, "taskman")]))
+            files = [(exe, "taskman")]
+            if LINUX_DESKTOP.exists():
+                files.append(
+                    (LINUX_DESKTOP, "share/applications/io.github.aufkrawall.Taskman.desktop")
+                )
+            artifacts.append((f"taskman-v{version}-linux-x86_64", files))
         elif attempted:
             failures += 1
         elif args.require_all_targets:
@@ -216,7 +199,6 @@ def main() -> int:
 
     if not args.no_package:
         for name, files in artifacts:
-            # Windows binaries ship as .zip; everything else as .tar.gz.
             if files[0][0].suffix == ".exe":
                 dest = package_zip(name, files)
             else:

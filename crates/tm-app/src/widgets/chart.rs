@@ -37,6 +37,22 @@ fn area_strip_mesh(pts: &[Pos2], baseline_y: f32, fill: Color32) -> egui::Mesh {
     mesh
 }
 
+/// Scale used by Performance-card sparklines.
+///
+/// Percentage resources (CPU/memory/disk/GPU) naturally stay <= 100. Network
+/// cards feed this widget byte rates, so treating every value as a percentage
+/// used to clamp virtually all Ethernet traffic to 100 and paint the preview
+/// completely blue. Values above 100 therefore opt into a dynamic raw-value
+/// scale with a small amount of headroom.
+fn sparkline_y_max(samples: &[f64]) -> f64 {
+    let max = samples
+        .iter()
+        .copied()
+        .filter(|v| v.is_finite() && *v > 0.0)
+        .fold(0.0f64, f64::max);
+    if max > 100.0 { (max * 1.05).max(1.0) } else { 100.0 }
+}
+
 /// Sparkline painted into an explicit rect (no allocation) — used inside
 /// hand-laid cards.
 pub fn paint_sparkline(ui: &egui::Ui, rect: egui::Rect, samples: &[f64], color: Color32) {
@@ -56,8 +72,12 @@ pub fn paint_sparkline(ui: &egui::Ui, rect: egui::Rect, samples: &[f64], color: 
     }
 
     let n = samples.len();
+    let y_max = sparkline_y_max(samples);
     let x = |i: usize| rect.left() + rect.width() * i as f32 / (n - 1) as f32;
-    let y = |v: f64| rect.bottom() - (v.clamp(0.0, 100.0) / 100.0) as f32 * rect.height();
+    let y = |v: f64| {
+        let v = if v.is_finite() { v.max(0.0) } else { 0.0 };
+        rect.bottom() - (v.min(y_max) / y_max) as f32 * rect.height()
+    };
 
     let pts: Vec<Pos2> = samples
         .iter()
@@ -264,6 +284,13 @@ pub fn chart_multi(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sparkline_percentage_and_raw_rate_scales_are_distinct() {
+        assert_eq!(sparkline_y_max(&[0.0, 25.0, 83.0]), 100.0);
+        assert!(sparkline_y_max(&[1_000.0, 2_000.0, 4_000.0]) > 4_000.0);
+        assert_eq!(sparkline_y_max(&[f64::NAN, -1.0]), 100.0);
+    }
 
     /// The area fill must be a triangle STRIP along the polyline: every
     /// triangle spans at most one segment's x-range. The old fan

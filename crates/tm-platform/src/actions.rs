@@ -23,6 +23,15 @@ pub struct Capabilities {
     pub per_process_network: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TaskManagerReplacementState {
+    Unsupported,
+    Disabled,
+    Enabled,
+    Stale(String),
+    Conflict(String),
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ServiceAction {
     Start,
@@ -106,56 +115,47 @@ pub trait PlatformActions: Send + Sync {
     fn is_elevated(&self) -> bool {
         false
     }
-    /// Launch `command_line`; optionally request elevation via OS dialog.
-    /// Never blocks the caller meaningfully.
     fn run_new_task(&self, command_line: &str, elevate: bool) -> Result<()> {
         let _ = (command_line, elevate);
         Err(tm_core::TmError::Unsupported("run new task"))
     }
-    /// Like [`PlatformActions::run_new_task`] but briefly waits to surface
-    /// immediate launch failures. Worker threads only.
     fn run_new_task_probe(&self, command_line: &str, elevate: bool) -> Result<()> {
         let _ = (command_line, elevate);
         Err(tm_core::TmError::Unsupported("run new task"))
     }
-    /// Restart this app with elevation (UAC prompt on Windows).
     fn relaunch_elevated(&self) -> Result<()> {
         Err(tm_core::TmError::Unsupported("elevation"))
     }
 
-    /// Write a minidump of `pid` to `path` (Details tab: "Create dump file").
+    // ------------------------------------------------ shell integration
+    fn task_manager_replacement_state(&self) -> TaskManagerReplacementState {
+        TaskManagerReplacementState::Unsupported
+    }
+    fn set_task_manager_replacement(&self, _enabled: bool) -> Result<()> {
+        Err(tm_core::TmError::Unsupported("Task Manager replacement"))
+    }
+
     fn create_dump_file(&self, _pid: u32, _path: &std::path::Path) -> Result<()> {
         Err(tm_core::TmError::Unsupported("create dump"))
     }
-    /// Reveal `path` in the platform file manager, preselected.
     fn open_file_location(&self, _path: &str) -> Result<()> {
-        let _ = _path;
         Err(tm_core::TmError::Unsupported("open file location"))
     }
-    /// Open the shell's Properties dialog for `path`.
     fn open_properties(&self, _path: &str) -> Result<()> {
-        let _ = _path;
         Err(tm_core::TmError::Unsupported("properties"))
     }
-    /// Open a URL (or any document) with the default handler.
     fn open_url(&self, _url: &str) -> Result<()> {
-        let _ = _url;
         Err(tm_core::TmError::Unsupported("open url"))
     }
 
-    /// Firmware POST time of the last boot in ms ("Letzte BIOS-Zeit");
-    /// None when the platform cannot provide it.
     fn last_bios_time_ms(&self) -> Option<u64> {
         None
     }
 
-    /// Shell icon for an executable path as straight-alpha RGBA (w, h, bytes).
-    /// None when unavailable (non-Windows, system processes without file).
     fn process_icon_rgba(&self, _exe_path: &str) -> Option<(u32, u32, Vec<u8>)> {
         None
     }
 
-    /// Human-readable name of the platform backend.
     fn backend_name(&self) -> &'static str {
         "unknown"
     }

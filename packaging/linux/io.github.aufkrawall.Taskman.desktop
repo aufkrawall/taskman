@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Taskman
+Comment=Cross-platform task manager and system monitor
+Exec=taskman
+Icon=utilities-system-monitor
+Terminal=false
+Categories=System;Monitor;
+Keywords=task;manager;process;system;monitor;
+StartupNotify=true
