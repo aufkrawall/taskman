@@ -1,13 +1,16 @@
 # Current State
 
-Last cross-checked: 2026-08-25
+Last cross-checked: 2026-08-26
 
 ## Summary
 
 Windows Task Manager-style desktop app (Rust, eframe/egui), three-crate
 workspace. The large audit/implementation plan in `implement.md` has been
-implemented to the extent verifiable without interactive Windows sessions;
-remaining gaps are tracked in `known-debt.md`.
+implemented to the extent verifiable without interactive Windows sessions.
+The 2026 parity audit (`audit.md`) re-baselined remaining work into six
+phases; **Phase 1 (correctness) is complete** — see
+`log/recent.md` and `known-debt.md` for what changed and which deviations
+are accepted (Phases 2-6 open).
 
 ## Recently landed (2026-08-25)
 

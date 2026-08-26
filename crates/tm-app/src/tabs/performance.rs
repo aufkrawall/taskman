@@ -152,8 +152,12 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
         ui,
         &pal,
         |_app, _ui| {},
-        |_app, ui| {
+        |app, ui| {
             if ui.button(i18n::tr(K::RefreshNow)).clicked() {
+                // Regression fix (audit §9): this used to close the menu
+                // without doing anything — Refresh now must actually force a
+                // fresh sample plus tab-local cache invalidation.
+                app.refresh_all();
                 ui.close();
             }
         },

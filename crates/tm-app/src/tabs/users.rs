@@ -15,12 +15,14 @@ use tm_core::model::UserSession;
 
 use crate::app::TaskManApp;
 use crate::icons::Icon;
+use crate::search;
 use crate::theme;
-use crate::widgets::tablekit::{self, Aggregates, TmColumn};
+use crate::widgets::tablekit::{self, Aggregates, HeatCell, TmColumn};
 
 fn columns() -> Vec<TmColumn> {
     vec![
-        TmColumn::elastic("user", i18n::tr(K::TabUsers), 340.0),
+        // Audit P0.1: configured width — no elastic viewport fill.
+        TmColumn::text("user", i18n::tr(K::TabUsers), 340.0),
         TmColumn::text("status", i18n::tr(K::ColStatus), 190.0),
         TmColumn::num("cpu", i18n::tr(K::ColCpu), 110.0),
         TmColumn::num("mem", i18n::tr(K::ColMemory), 110.0),
@@ -50,6 +52,40 @@ enum URow {
         values: [f64; 4],
         count: usize,
     },
+}
+
+/// Per-column heat normalization across the WHOLE Users display model
+/// (audit P0.2): one maximum per resource column over user headers and app
+/// rows alike, computed before virtualization.
+struct HeatMax {
+    cpu: f64,
+    mem: f64,
+    disk: f64,
+}
+
+impl HeatMax {
+    fn intensity(&self, v: &[f64; 4]) -> [f32; 4] {
+        [
+            tablekit::norm(v[0], self.cpu),
+            tablekit::norm(v[1], self.mem),
+            tablekit::norm(v[2], self.disk),
+            0.0, // network unavailable on this platform
+        ]
+    }
+
+    fn over(rows: impl Iterator<Item = [f64; 4]>) -> Self {
+        let mut m = Self {
+            cpu: 0.0,
+            mem: 0.0,
+            disk: 0.0,
+        };
+        for v in rows {
+            m.cpu = m.cpu.max(v[0]);
+            m.mem = m.mem.max(v[1]);
+            m.disk = m.disk.max(v[2]);
+        }
+        m
+    }
 }
 
 pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
@@ -216,12 +252,20 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
     }
 
     // ---- flatten into display rows -----------------------------------------
-    let q = app.search.trim().to_lowercase();
+    // Search (audit §5): a user row stays visible only when the query
+    // matches the user's display name OR one of their aggregated apps. The
+    // old condition ("name matches OR count > 0") kept every active user
+    // visible regardless of the query — search effectively failed here.
+    let q = search::Query::new(&app.search);
     let mut rows: Vec<URow> = Vec::new();
     for (i, s) in sessions.iter().enumerate() {
         let display = display_name(s, &snap.system.hostname);
         let a = &aggs[&s.id];
-        if !q.is_empty() && !display.to_lowercase().contains(&q) && a.count == 0 {
+        if !q.is_empty()
+            && !q.matches_any(
+                std::iter::once(display.as_str()).chain(a.apps.keys().map(String::as_str)),
+            )
+        {
             continue;
         }
         rows.push(URow::User(i));
@@ -244,10 +288,21 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
         }
     }
 
+    // Per-column maxima over all DISPLAYED rows (headers + apps), before
+    // virtualization (audit P0.2).
+    let heat_max = HeatMax::over(rows.iter().map(|r| match r {
+        URow::User(i) => {
+            let s = sessions[*i];
+            let a = &aggs[&s.id];
+            [a.cpu, a.mem, a.disk, 0.0]
+        }
+        URow::App { values, .. } => *values,
+    }));
+
     let agg_hdr = Aggregates::from_snapshot(&snap);
     let aggs_hdr = agg_hdr.strings();
 
-    let mut table = app.make_table("users", columns(), 340.0);
+    let mut table = app.make_table("users", columns());
     let avail = tablekit::table_avail(ui);
     tablekit::scrolled_rows(
         "users",
@@ -258,7 +313,7 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
         None,
         Some(&aggs_hdr),
         rows.len(),
-        |ui, table, avail, content_w, range| {
+        |ui, table, _avail, _content_w, range| {
             for ri in range {
                 match rows.get(ri) {
                     Some(URow::User(i)) => {
@@ -270,8 +325,7 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
                             ui,
                             &pal,
                             table,
-                            avail,
-                            content_w,
+                            &heat_max,
                             s,
                             a,
                             &display,
@@ -290,11 +344,11 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
                             ui,
                             &pal,
                             table,
-                            avail,
                             name,
                             exe.as_deref(),
                             values,
                             *count,
+                            &heat_max,
                         );
                     }
                     None => {}
@@ -311,16 +365,14 @@ fn user_row_ui(
     ui: &mut egui::Ui,
     pal: &theme::Palette,
     table: &tablekit::TmTable,
-    avail: f32,
-    content_w: f32,
+    heat_max: &HeatMax,
     s: &UserSession,
     a: &Agg,
     display: &str,
     can_disconnect: bool,
 ) {
-    let _ = content_w;
     let selected = app.selected_user == Some(s.id);
-    let (rect, resp) = table.row(ui, pal, avail, selected);
+    let (rect, resp) = table.row(ui, pal, selected);
 
     let expanded = app.processes_state.expanded_users.contains(&s.id);
     let seed = egui::Id::new(("user-chev", s.id));
@@ -333,7 +385,7 @@ fn user_row_ui(
         egui::vec2(18.0, 18.0),
     );
     crate::icons::draw_at(ui, icon_rect, Icon::Person, pal.accent);
-    let name_rect = table.col_rect(0, avail, rect);
+    let name_rect = table.col_rect(0, rect);
     ui.painter().text(
         egui::Pos2::new(name_rect.left() + 56.0, rect.center().y),
         egui::Align2::LEFT_CENTER,
@@ -350,7 +402,7 @@ fn user_row_ui(
         tm_core::model::UserSessionState::Connected => i18n::tr(K::StConnected),
         _ => "",
     };
-    table.text_cell(ui, avail, rect, 1, status, pal, false);
+    table.text_cell(ui, rect, 1, status, pal, false);
 
     let texts = [
         format::format_pct_cell(a.cpu.min(100.0) as f32),
@@ -359,15 +411,14 @@ fn user_row_ui(
         "—".to_string(), // per-user network is not measurable (§16.6)
     ];
     let active_row = a.cpu > 0.0 || a.mem > 0.0 || a.disk > 0.0;
-    // Intensities only drive top-consumer detection (flat TM heat): 1.0
-    // marks "this cell has a real value"; network stays 0 (unavailable).
-    let cells: Vec<(f32, String)> = vec![
-        (if a.cpu > 0.0 { 1.0 } else { 0.0 }, texts[0].clone()),
-        (if a.mem > 0.0 { 1.0 } else { 0.0 }, texts[1].clone()),
-        (if a.disk > 0.0 { 1.0 } else { 0.0 }, texts[2].clone()),
-        (0.0, texts[3].clone()),
-    ];
-    table.heat_cells(ui, pal, avail, rect, 2, &cells, active_row);
+    // Intensities normalized per column across the whole model (audit P0.2).
+    let cells: Vec<HeatCell> = heat_max
+        .intensity(&[a.cpu, a.mem, a.disk, 0.0])
+        .iter()
+        .zip(texts.iter())
+        .map(|(t, txt)| HeatCell::new(*t, txt.clone()))
+        .collect();
+    table.heat_cells(ui, pal, rect, 2, &cells, active_row);
 
     if resp.clicked() {
         app.selected_user = Some(s.id);
@@ -404,13 +455,13 @@ fn app_row_ui(
     ui: &mut egui::Ui,
     pal: &theme::Palette,
     table: &tablekit::TmTable,
-    avail: f32,
     name: &str,
     exe: Option<&str>,
     vals: &[f64; 4],
     count: usize,
+    heat_max: &HeatMax,
 ) {
-    let (rect, _resp) = table.row(ui, pal, avail, false);
+    let (rect, _resp) = table.row(ui, pal, false);
     let tex = exe.and_then(|p| app.shared.icons.get(ui.ctx(), &app.actions, p, 6));
     table.icon_cell(
         ui,
@@ -418,7 +469,7 @@ fn app_row_ui(
         tex.as_ref(),
         pal.accent,
     );
-    let nr = table.col_rect(0, avail, rect);
+    let nr = table.col_rect(0, rect);
     let label = if count > 1 {
         format!("{name} ({count})")
     } else {
@@ -437,21 +488,13 @@ fn app_row_ui(
         format::format_rate_mb(vals[2]),
         "—".to_string(),
     ];
-    let cells = vec![
-        (if vals[0] > 0.0 { 1.0 } else { 0.0 }, texts[0].clone()),
-        (if vals[1] > 0.0 { 1.0 } else { 0.0 }, texts[1].clone()),
-        (if vals[2] > 0.0 { 1.0 } else { 0.0 }, texts[2].clone()),
-        (0.0, texts[3].clone()),
-    ];
-    table.heat_cells(
-        ui,
-        pal,
-        avail,
-        rect,
-        2,
-        &cells,
-        vals.iter().any(|&v| v > 0.0),
-    );
+    let cells: Vec<HeatCell> = heat_max
+        .intensity(vals)
+        .iter()
+        .zip(texts.iter())
+        .map(|(t, txt)| HeatCell::new(*t, txt.clone()))
+        .collect();
+    table.heat_cells(ui, pal, rect, 2, &cells, vals.iter().any(|&v| v > 0.0));
 }
 
 fn display_name(s: &UserSession, hostname: &str) -> String {

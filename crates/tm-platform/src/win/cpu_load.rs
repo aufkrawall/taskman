@@ -13,17 +13,24 @@
 //!
 //! Because all values are plain fractions of wall-clock time, the result is
 //! completely independent of CPU frequency: boost clocks, park/unpark,
-//! power schemes and driver games do not move it. This is deliberately NOT
-//! what modern Task Manager displays — TM uses frequency-weighted
-//! "% Processor Utility", which reads higher than the true busy ratio while
-//! cores are boosting (and can exceed 100% before clamping).
+//! power schemes and driver games do not move it.
 //!
-//! Semantics produced here match classic tools (Process Explorer, `top`,
-//! pre-2010 Task Manager):
+//! Which Task Manager metric this matches (2026 status):
+//! Since the 2025 Task Manager update, the Processes, Performance and Users
+//! pages use the standardized TIME-BASED CPU workload this module computes.
+//! The older frequency-weighted "% Processor Utility" no longer drives those
+//! pages; it survives only as the optional **CPU Utility** column in the
+//! Details tab. So this accountant is directionally aligned with CURRENT
+//! Task Manager semantics. A separate legacy utility provider (frequency /
+//! performance-state aware) is planned as an explicit second metric so both
+//! can be offered side by side — do NOT rewrite this calculation to imitate
+//! utility (it would silently break current-parity).
+//!
+//! Semantics produced here:
 //! * global/per-core ∈ [0, 100] = fraction of time not in the idle thread.
 //! * per-process ∈ [0, 100] = process' CPU-time delta divided by the whole
 //!   machine's time capacity in the window ("share of total capacity",
-//!   TM Details-tab style).
+//!   TM Processes/Details style).
 
 use std::collections::HashMap;
 use std::sync::Arc;

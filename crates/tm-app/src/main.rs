@@ -26,6 +26,7 @@ mod app_ui;
 mod fonts;
 mod icon_cache;
 mod icons;
+mod search;
 mod selfcheck;
 mod tabs;
 mod theme;

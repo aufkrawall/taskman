@@ -8,17 +8,19 @@
 
 use eframe::egui;
 use std::cmp::Ordering as CmpOrdering;
+use std::collections::BTreeSet;
 use tm_core::format;
 use tm_core::i18n::{self, K};
 use tm_core::model::{PriorityClass, ProcStatus, ProcessEntry, UacVirtualization};
 
 use crate::app::TaskManApp;
 use crate::icons::Icon;
+use crate::search;
 use crate::theme;
 use crate::widgets::tablekit::{self, TmColumn};
 
 /// Stable detail-column identity.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum ColumnId {
     Name,
     Pid,
@@ -107,9 +109,29 @@ fn cmp_option_str(a: Option<&str>, b: Option<&str>) -> CmpOrdering {
     }
 }
 
+#[derive(Clone, Copy)]
 struct ColSpec {
     cid: ColumnId,
     col: fn() -> TmColumn,
+}
+
+impl ColSpec {
+    /// Localized label of this column (Select-columns dialog).
+    fn label(self) -> &'static str {
+        match self.cid {
+            ColumnId::Name => i18n::tr(K::ColName),
+            ColumnId::Pid => i18n::tr(K::ColPid),
+            ColumnId::Status => i18n::tr(K::ColStatus),
+            ColumnId::User => i18n::tr(K::ColUsername),
+            ColumnId::Cpu => i18n::tr(K::ColCpu),
+            ColumnId::Memory => i18n::tr(K::ColMemory),
+            ColumnId::Platform => i18n::tr(K::ColPlatform),
+            ColumnId::Elevated => i18n::tr(K::ColElevated),
+            ColumnId::Uac => i18n::tr(K::ColUac),
+            ColumnId::GpuUtil => i18n::tr(K::ColGpu),
+            ColumnId::GpuEngine => i18n::tr(K::ColGpuEngine),
+        }
+    }
 }
 
 /// The registered catalog. Adding a column here automatically participates
@@ -117,7 +139,8 @@ struct ColSpec {
 const COLUMNS: &[ColSpec] = &[
     ColSpec {
         cid: ColumnId::Name,
-        col: || TmColumn::elastic("name", i18n::tr(K::ColName), 340.0),
+        // Audit P0.1 parity: configured width instead of viewport fill.
+        col: || TmColumn::text("name", i18n::tr(K::ColName), 340.0),
     },
     ColSpec {
         cid: ColumnId::Pid,
@@ -162,25 +185,46 @@ const COLUMNS: &[ColSpec] = &[
     },
 ];
 
-fn columns() -> Vec<TmColumn> {
-    COLUMNS.iter().map(|c| (c.col)()).collect()
-}
-
 pub struct State {
     /// Sorted column expressed by id (stable across catalog changes).
     pub sort_col: ColumnId,
     pub ascending: bool,
     pub filter: String,
     pub cache: Option<Cache>,
-    /// GPU-related columns are optional; visible only when demanded so the
-    /// default view does not wake GPU telemetry.
-    pub show_gpu_columns: bool,
+    /// Which registered columns are currently displayed. This set IS the
+    /// single source of truth: telemetry demand derives from it (audit P0.3)
+    /// — no separate boolean can drift from what the table actually shows.
+    pub visible: BTreeSet<ColumnId>,
+    /// Select-columns dialog open flag.
+    pub select_columns_open: bool,
 }
 
 impl State {
-    /// GPU telemetry demand hook used by the app's demand computation.
-    pub fn has_gpu_column_visible(&self) -> bool {
-        self.show_gpu_columns
+    /// True when any VISIBLE column requires GPU-family telemetry. Deriving
+    /// demand from the real column state closes the old mismatch where GPU
+    /// columns could render while their sampling was never requested.
+    pub fn requires_gpu_telemetry(&self) -> bool {
+        self.visible
+            .iter()
+            .any(|cid| matches!(cid, ColumnId::GpuUtil | ColumnId::GpuEngine))
+    }
+
+    /// Whether this column id should be painted this frame.
+    pub fn is_visible(&self, cid: ColumnId) -> bool {
+        self.visible.contains(&cid)
+    }
+
+    /// Toggle one column's visibility (Select-columns dialog).
+    pub fn set_visible(&mut self, cid: ColumnId, on: bool) {
+        // Never allow hiding EVERY column.
+        if !on && self.visible.len() <= 1 && self.visible.contains(&cid) {
+            return;
+        }
+        if on {
+            self.visible.insert(cid);
+        } else {
+            self.visible.remove(&cid);
+        }
     }
 
     /// Language generation participates in the row-cache key so labels
@@ -202,7 +246,8 @@ impl Default for State {
             ascending: true,
             filter: String::new(),
             cache: None,
-            show_gpu_columns: false,
+            visible: COLUMNS.iter().map(|c| c.cid).collect(),
+            select_columns_open: false,
         }
     }
 }
@@ -216,7 +261,6 @@ pub struct Row {
     pub gpu_util_s: String,
     pub pid: u32,
     /// Process identity guard, carried into destructive actions.
-    #[allow(dead_code)]
     pub start_epoch_s: Option<i64>,
     pub name: String,
     pub icon_path: Option<String>,
@@ -229,6 +273,26 @@ pub struct Row {
     pub elevated: &'static str,
     pub uac: &'static str,
     pub gpu_engine_s: String,
+}
+
+impl Row {
+    /// The display string for a registered column id — the mapping painted
+    /// by the dynamic visible-column renderer.
+    pub fn field(&self, cid: ColumnId) -> &str {
+        match cid {
+            ColumnId::Name => &self.name,
+            ColumnId::Pid => &self.pid_s,
+            ColumnId::Status => self.status,
+            ColumnId::User => &self.user,
+            ColumnId::Cpu => &self.cpu_s,
+            ColumnId::Memory => &self.mem_s,
+            ColumnId::Platform => self.platform,
+            ColumnId::Elevated => self.elevated,
+            ColumnId::Uac => self.uac,
+            ColumnId::GpuUtil => &self.gpu_util_s,
+            ColumnId::GpuEngine => &self.gpu_engine_s,
+        }
+    }
 }
 
 pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
@@ -248,7 +312,7 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
                 &pal,
                 Icon::Close,
                 i18n::tr(K::EndTask),
-                app.selected_pid.is_some(),
+                app.selected_process.is_some(),
             ) {
                 let ctx = ui.ctx().clone();
                 app.end_selected(&ctx);
@@ -257,6 +321,13 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
         |app, ui| {
             if ui.button(i18n::tr(K::RefreshNow)).clicked() {
                 app.refresh_all();
+                ui.close();
+            }
+            // Select columns (audit P0.3/§14 groundwork): visibility set
+            // doubles as the telemetry-demand source, so the dialog and the
+            // sampling engine can never disagree.
+            if ui.button(i18n::tr(K::SelectColumns)).clicked() {
+                app.details_state.select_columns_open = true;
                 ui.close();
             }
         },
@@ -286,13 +357,22 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
     // Consume a pending cross-tab navigation: select the EXACT process
     // identity and scroll it into view (§11.5).
     if let Some(focus) = app.pending_details_focus.take() {
-        app.selected_pid = Some(focus.0.pid);
+        app.selected_process = Some(focus.0.clone());
         app.search.clear();
         app.details_state.filter.clear();
         app.scroll_to_pid = Some(focus.0.pid);
     }
 
-    let mut table = app.make_table("details", columns(), 340.0);
+    // Visible column list for THIS frame (hidden columns are skipped in both
+    // header and body so indices always agree).
+    let visible_cols: Vec<ColSpec> = COLUMNS
+        .iter()
+        .copied()
+        .filter(|c| app.details_state.is_visible(c.cid))
+        .collect();
+    let cols_rendered: Vec<TmColumn> = visible_cols.iter().map(|c| (c.col)()).collect();
+
+    let mut table = app.make_table("details", cols_rendered);
 
     // Rebuild the row model only when snapshot/search/sort/lang changes.
     let key = (
@@ -313,64 +393,76 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
     let rows = &cache.as_ref().expect("cache").rows;
 
     let avail = tablekit::table_avail(ui);
+    let sorted_pos = visible_cols
+        .iter()
+        .position(|c| c.cid == app.details_state.sort_col);
     let clicked = tablekit::scrolled_rows(
         "details",
         ui,
         &pal,
         &mut table,
         avail,
-        Some((
-            sort_display_index(app.details_state.sort_col),
-            app.details_state.ascending,
-        )),
+        sorted_pos.map(|p| (p, app.details_state.ascending)),
         None,
         rows.len(),
-        |ui, table, avail, _content_w, range| {
+        |ui, table, _avail, _content_w, range| {
             for i in range {
                 let Some(row) = rows.get(i) else { continue };
-                let selected = app.selected_pid == Some(row.pid);
+                let selected = app
+                    .selected_process
+                    .as_ref()
+                    .is_some_and(|sp| sp.pid == row.pid);
                 let scroll_hint = app.scroll_to_pid.is_some_and(|p| p == row.pid);
-                let (rect, resp) = table.row(ui, &pal, avail, selected);
+                let (rect, resp) = table.row(ui, &pal, selected);
                 if scroll_hint {
                     resp.scroll_to_me(Some(egui::Align::Center));
                     app.scroll_to_pid = None;
                 }
 
-                let tex = row
-                    .icon_path
-                    .as_ref()
-                    .and_then(|p| app.shared.icons.get(ui.ctx(), &app.actions, p, 6));
-                table.icon_cell(ui, rect, tex.as_ref(), pal.accent);
-                let name_rect = table.col_rect(0, avail, rect);
-                ui.painter().text(
-                    egui::Pos2::new(name_rect.left() + 56.0, rect.center().y),
-                    egui::Align2::LEFT_CENTER,
-                    &row.name,
-                    egui::FontId::proportional(tablekit::FONT_ROW),
-                    pal.text,
-                );
+                let tex_visible = visible_cols
+                    .first()
+                    .is_some_and(|c| c.cid == ColumnId::Name);
+                if tex_visible {
+                    let tex = row
+                        .icon_path
+                        .as_ref()
+                        .and_then(|p| app.shared.icons.get(ui.ctx(), &app.actions, p, 6));
+                    table.icon_cell(ui, rect, tex.as_ref(), pal.accent);
+                    let name_rect = table.col_rect(0, rect);
+                    ui.painter().text(
+                        egui::Pos2::new(name_rect.left() + 56.0, rect.center().y),
+                        egui::Align2::LEFT_CENTER,
+                        &row.name,
+                        egui::FontId::proportional(tablekit::FONT_ROW),
+                        pal.text,
+                    );
+                }
 
-                table.text_cell(ui, avail, rect, 1, &row.pid_s, &pal, false);
-                table.text_cell(ui, avail, rect, 2, row.status, &pal, false);
-                table.text_cell(ui, avail, rect, 3, &row.user, &pal, false);
-                table.text_cell(ui, avail, rect, 4, &row.cpu_s, &pal, false);
-                // Memory: right-aligned like TM.
-                let mem_rect = table.col_rect(5, avail, rect);
-                ui.painter().text(
-                    egui::Pos2::new(mem_rect.right() - 10.0, rect.center().y),
-                    egui::Align2::RIGHT_CENTER,
-                    &row.mem_s,
-                    egui::FontId::proportional(tablekit::FONT_ROW),
-                    pal.text,
-                );
-                table.text_cell(ui, avail, rect, 6, row.platform, &pal, false);
-                table.text_cell(ui, avail, rect, 7, row.elevated, &pal, false);
-                table.text_cell(ui, avail, rect, 8, row.uac, &pal, false);
-                table.text_cell(ui, avail, rect, 9, &row.gpu_util_s, &pal, false);
-                table.text_cell(ui, avail, rect, 10, &row.gpu_engine_s, &pal, false);
+                // Remaining VISIBLE columns paint by position; memory stays
+                // right-aligned like TM.
+                let first_text_col = if tex_visible { 1 } else { 0 };
+                for (pos, spec) in visible_cols.iter().enumerate().skip(first_text_col) {
+                    let cid = spec.cid;
+                    let text = row.field(cid);
+                    if cid == ColumnId::Memory {
+                        let mem_rect = table.col_rect(pos, rect);
+                        ui.painter().text(
+                            egui::Pos2::new(mem_rect.right() - 10.0, rect.center().y),
+                            egui::Align2::RIGHT_CENTER,
+                            text,
+                            egui::FontId::proportional(tablekit::FONT_ROW),
+                            pal.text,
+                        );
+                    } else {
+                        table.text_cell(ui, rect, pos, text, &pal, false);
+                    }
+                }
 
                 if resp.clicked() {
-                    app.selected_pid = Some(row.pid);
+                    app.selected_process = Some(crate::app::ProcessIdentity {
+                        pid: row.pid,
+                        start_epoch_s: row.start_epoch_s,
+                    });
                 }
                 resp.context_menu(|ui| {
                     // Re-fetch the live entry for the context menu actions.
@@ -382,8 +474,9 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
         },
     );
     if let Some(display_idx) = clicked
-        && let Some(cid) = column_id_at(display_idx)
+        && let Some(spec) = visible_cols.get(display_idx)
     {
+        let cid = spec.cid;
         if app.details_state.sort_col == cid {
             app.details_state.ascending = !app.details_state.ascending;
         } else {
@@ -393,14 +486,52 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
     }
     app.persist_table(&table);
     app.details_state.cache = cache;
+
+    select_columns_dialog(app, &ctx_from(ui), &pal);
 }
 
-fn sort_display_index(cid: ColumnId) -> usize {
-    COLUMNS.iter().position(|c| c.cid == cid).unwrap_or(0)
+/// Small helper: clone the context out of the frame UI.
+fn ctx_from(ui: &egui::Ui) -> egui::Context {
+    ui.ctx().clone()
 }
 
-fn column_id_at(idx: usize) -> Option<ColumnId> {
-    COLUMNS.get(idx).map(|c| c.cid)
+/// Select-columns dialog (audit P0.3 / §14 groundwork): one checkbox per
+/// registered column. The resulting visibility set IS the source of truth
+/// for both rendering and telemetry demand, so the two can never drift.
+fn select_columns_dialog(app: &mut TaskManApp, ctx: &egui::Context, pal: &theme::Palette) {
+    if !app.details_state.select_columns_open {
+        return;
+    }
+    let mut open = true;
+    egui::Window::new(i18n::tr(K::SelectColumns))
+        .open(&mut open)
+        .collapsible(false)
+        .resizable(false)
+        .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+        .show(ctx, |ui| {
+            ui.set_min_width(260.0);
+            egui::ScrollArea::vertical()
+                .max_height(340.0)
+                .show(ui, |ui| {
+                    for spec in COLUMNS.iter().copied() {
+                        let mut on = app.details_state.is_visible(spec.cid);
+                        if crate::widgets::controls::checkbox(ui, &mut on, spec.label(), pal)
+                            .changed()
+                        {
+                            app.details_state.set_visible(spec.cid, on);
+                        }
+                    }
+                });
+            ui.add_space(8.0);
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.button(i18n::tr(K::Close)).clicked() {
+                    app.details_state.select_columns_open = false;
+                }
+            });
+        });
+    if !open {
+        app.details_state.select_columns_open = false;
+    }
 }
 
 fn cid_is_numeric(cid: ColumnId) -> bool {
@@ -417,19 +548,17 @@ fn effective_search(app: &TaskManApp) -> String {
 
 fn build_rows(
     snap: &tm_core::model::Snapshot,
-    search: &str,
+    raw_search: &str,
     sort_col: ColumnId,
     ascending: bool,
 ) -> Vec<Row> {
-    let q = search.trim().to_lowercase();
+    // Shared matcher (audit §5): binary name, display name, PID and
+    // publisher/company — identical semantics to the Processes tab.
+    let q = search::Query::new(raw_search);
     let mut list: Vec<&ProcessEntry> = snap
         .processes
         .iter()
-        .filter(|p| {
-            q.is_empty()
-                || p.name.to_lowercase().contains(&q)
-                || p.shown_name().to_lowercase().contains(&q)
-        })
+        .filter(|p| q.matches_process(p))
         .collect();
 
     list.sort_by(|a, b| {
@@ -567,7 +696,9 @@ pub fn context_menu(app: &mut TaskManApp, ui: &mut egui::Ui, p: &ProcessEntry) {
 
     #[cfg(target_os = "windows")]
     {
-        let eco_on = app.efficiency_pids.contains(&p.pid);
+        // Efficiency-mode state comes straight from the OS snapshot (audit
+        // §8) — power_throttled as reported by the sampler.
+        let eco_on = p.power_throttled == Some(true);
         if ui
             .button(if eco_on {
                 i18n::tr(K::EfficiencyModeOff)
@@ -576,19 +707,14 @@ pub fn context_menu(app: &mut TaskManApp, ui: &mut egui::Ui, p: &ProcessEntry) {
             })
             .clicked()
         {
-            let actions = app.actions.clone();
-            let pid = p.pid;
-            let enable_eco = !eco_on;
-            app.run_action(
+            crate::tabs::processes::toggle_efficiency_mode(
+                app,
                 &ctx,
-                || i18n::tr(K::EfficiencyChanged).to_string(),
-                move || actions.set_efficiency_mode(pid, enable_eco),
+                &crate::app::ProcessIdentity {
+                    pid: p.pid,
+                    start_epoch_s: p.start_epoch_s,
+                },
             );
-            if eco_on {
-                app.efficiency_pids.remove(&p.pid);
-            } else {
-                app.efficiency_pids.insert(p.pid);
-            }
             ui.close();
         }
         // Jump to the service hosted by this process (svchost.exe etc.).

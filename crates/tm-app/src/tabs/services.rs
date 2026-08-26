@@ -17,7 +17,8 @@ use crate::widgets::tablekit::{self, TmColumn};
 
 fn columns() -> Vec<TmColumn> {
     vec![
-        TmColumn::text("name", i18n::tr(K::ColName), 0.0),
+        // Audit P0.1/§27: configured width instead of the `0.0` sentinel.
+        TmColumn::text("name", i18n::tr(K::ColName), 240.0),
         TmColumn::text("pid", i18n::tr(K::ColPid), 90.0),
         TmColumn::text("desc", i18n::tr(K::ColDescription), 460.0),
         TmColumn::text("status", i18n::tr(K::ColStatus), 130.0),
@@ -30,9 +31,8 @@ pub struct Cache {
     pub fetched: Instant,
 }
 
-/// Kick off a background refresh when the cache is stale; returns whether a
-/// fetch is currently running (for the subtle status hint).
-fn ensure_fresh(app: &TaskManApp) {
+/// Kick off a background refresh when the cache is stale.
+fn ensure_fresh(app: &TaskManApp, ctx: &egui::Context) {
     let stale = {
         let guard = tm_core::sync::lock(&app.shared.services_cache);
         match guard.as_ref() {
@@ -45,6 +45,13 @@ fn ensure_fresh(app: &TaskManApp) {
         let done = app.shared.services_fetch.flag();
         let toasts = app.shared.toasts.clone();
         let actions = app.actions.clone();
+        // Wake the UI on completion (audit §23): without this the Services
+        // page could sit on "Gathering data" while sampling is paused,
+        // because no engine tick arrives to pick up the result.
+        let wake = {
+            let c = ctx.clone();
+            move || c.request_repaint()
+        };
         let _ = std::thread::Builder::new()
             .name("tm-svc-fetch".into())
             .spawn(move || {
@@ -61,20 +68,22 @@ fn ensure_fresh(app: &TaskManApp) {
                     fetched,
                 });
                 done.store(false, std::sync::atomic::Ordering::Relaxed);
+                wake();
             });
     }
 }
 
 pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
     let pal = theme::palette(ui);
-    ensure_fresh(app);
+    let frame_ctx = ui.ctx().clone();
+    ensure_fresh(app, &frame_ctx);
 
     // Consume a cross-tab jump ("Gehe zu Dienst(en)").
     if let Some(name) = tm_core::sync::lock(&app.svc_jump).take() {
         app.services_selected_name = Some(name);
         // Make sure the target row exists in a fresh cache.
         *tm_core::sync::lock(&app.shared.services_cache) = None;
-        ensure_fresh(app);
+        ensure_fresh(app, &frame_ctx);
     }
 
     // Selected row's live status (for enabling Start/Stop buttons).
@@ -105,7 +114,7 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
                 i18n::tr(K::StartService),
                 stopped && !busy,
             ) {
-                control(app, tm_platform::actions::ServiceAction::Start);
+                control(app, &frame_ctx, tm_platform::actions::ServiceAction::Start);
             }
             if crate::app_ui::cmd_button(
                 ui,
@@ -114,7 +123,7 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
                 i18n::tr(K::StopService),
                 running && !busy,
             ) {
-                control(app, tm_platform::actions::ServiceAction::Stop);
+                control(app, &frame_ctx, tm_platform::actions::ServiceAction::Stop);
             }
             if crate::app_ui::cmd_button(
                 ui,
@@ -123,7 +132,11 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
                 i18n::tr(K::RestartService),
                 running && !busy,
             ) {
-                control(app, tm_platform::actions::ServiceAction::Restart);
+                control(
+                    app,
+                    &frame_ctx,
+                    tm_platform::actions::ServiceAction::Restart,
+                );
             }
             crate::app_ui::vsep(ui, &pal);
             if crate::app_ui::cmd_button(
@@ -139,7 +152,7 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
         |_app, ui| {
             if ui.button(i18n::tr(K::RefreshNow)).clicked() {
                 *tm_core::sync::lock(&_app.shared.services_cache) = None;
-                ensure_fresh(_app);
+                ensure_fresh(_app, &ui.ctx().clone());
                 ui.close();
             }
         },
@@ -169,7 +182,7 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
         .collect();
     rows.sort_by_key(|a| a.name.to_lowercase());
 
-    let mut table = app.make_table("services", columns(), 340.0);
+    let mut table = app.make_table("services", columns());
     let avail = crate::widgets::tablekit::table_avail(ui);
     tablekit::scrolled_rows(
         "services",
@@ -180,11 +193,11 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
         None,
         None,
         rows.len(),
-        |ui, table, avail, _content_w, range| {
+        |ui, table, _avail, _content_w, range| {
             for ri in range {
                 let s = rows[ri];
                 let selected = app.services_selected_name.as_deref() == Some(s.name.as_str());
-                let (rect, resp) = table.row(ui, &pal, avail, selected);
+                let (rect, resp) = table.row(ui, &pal, selected);
 
                 // Gear glyph per row.
                 let icon_rect = egui::Rect::from_center_size(
@@ -192,7 +205,7 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
                     egui::vec2(16.0, 16.0),
                 );
                 crate::icons::draw_at(ui, icon_rect, Icon::Properties, pal.text_dim);
-                let name_rect = table.col_rect(0, avail, rect);
+                let name_rect = table.col_rect(0, rect);
                 ui.painter().text(
                     egui::Pos2::new(name_rect.left() + 56.0, rect.center().y),
                     egui::Align2::LEFT_CENTER,
@@ -202,35 +215,35 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
                 );
                 table.text_cell(
                     ui,
-                    avail,
                     rect,
                     1,
                     &s.pid.map(|p| p.to_string()).unwrap_or_default(),
                     &pal,
                     false,
                 );
-                table.text_cell(ui, avail, rect, 2, &s.display_name, &pal, false);
-                table.text_cell(ui, avail, rect, 3, status_label(app, s.status), &pal, false);
-                table.text_cell(ui, avail, rect, 4, &s.group, &pal, false);
+                table.text_cell(ui, rect, 2, &s.display_name, &pal, false);
+                table.text_cell(ui, rect, 3, status_label(app, s.status), &pal, false);
+                table.text_cell(ui, rect, 4, &s.group, &pal, false);
 
                 if resp.clicked() {
                     app.services_selected_name = Some(s.name.clone());
                 }
                 resp.context_menu(|ui| {
                     ui.set_min_width(170.0);
+                    let mctx = ui.ctx().clone();
                     if ui.button(i18n::tr(K::StartService)).clicked() {
                         app.services_selected_name = Some(s.name.clone());
-                        control(app, tm_platform::actions::ServiceAction::Start);
+                        control(app, &mctx, tm_platform::actions::ServiceAction::Start);
                         ui.close();
                     }
                     if ui.button(i18n::tr(K::StopService)).clicked() {
                         app.services_selected_name = Some(s.name.clone());
-                        control(app, tm_platform::actions::ServiceAction::Stop);
+                        control(app, &mctx, tm_platform::actions::ServiceAction::Stop);
                         ui.close();
                     }
                     if ui.button(i18n::tr(K::RestartService)).clicked() {
                         app.services_selected_name = Some(s.name.clone());
-                        control(app, tm_platform::actions::ServiceAction::Restart);
+                        control(app, &mctx, tm_platform::actions::ServiceAction::Restart);
                         ui.close();
                     }
                     ui.separator();
@@ -265,7 +278,7 @@ fn status_label(app: &TaskManApp, st: ServiceStatus) -> &'static str {
 
 /// Run the service action on a worker thread (start/stop can take many
 /// seconds); the result arrives as a toast, the cache invalidates itself.
-fn control(app: &mut TaskManApp, action: tm_platform::actions::ServiceAction) {
+fn control(app: &mut TaskManApp, ctx: &egui::Context, action: tm_platform::actions::ServiceAction) {
     if !app.shared.service_control.begin() {
         return; // already one in flight
     }
@@ -281,6 +294,12 @@ fn control(app: &mut TaskManApp, action: tm_platform::actions::ServiceAction) {
 
     let done_flag = app.shared.service_control.flag();
     let services_cache = app.shared.services_cache.clone();
+    // Wake the UI when the (potentially slow) service action finishes so the
+    // new state renders even without a concurrent engine tick (audit §23).
+    let wake = {
+        let c = ctx.clone();
+        move || c.request_repaint()
+    };
     let spawned = std::thread::Builder::new()
         .name("tm-svc-ctl".into())
         .spawn(move || {
@@ -295,6 +314,7 @@ fn control(app: &mut TaskManApp, action: tm_platform::actions::ServiceAction) {
             // Force the next frame's lazy refresh to pick up the new state.
             *tm_core::sync::lock(&services_cache) = None;
             done_flag.store(false, std::sync::atomic::Ordering::Relaxed);
+            wake();
         });
     if spawned.is_err() {
         app.shared.toast(i18n::tr(K::ActionFailed));

@@ -2,6 +2,11 @@
 //! aggregate values, full-row selection, blue heat-mapped value cells,
 //! chevrons, sort carets — and user-resizable column widths.
 //!
+//! Width model (audit P0.1 parity): every column keeps its configured /
+//! persisted width; unused viewport space stays blank client area on the
+//! right, exactly like native Task Manager. A horizontal scroll bar appears
+//! only when the summed real widths exceed the viewport.
+//!
 //! Correctness notes:
 //! * Column resizing accumulates each frame's `drag_delta()` onto the LIVE
 //!   width. In egui 0.36 `drag_delta()` is movement SINCE LAST FRAME
@@ -80,7 +85,7 @@ pub fn scrolled_table(
     aggregates: Option<&[String]>,
     rows: impl FnOnce(&mut egui::Ui, &TmTable, f32, f32),
 ) -> Option<usize> {
-    let content_w = table.total_width(avail);
+    let content_w = table.total_width();
     let hdr_id = egui::Id::new(("tm-hdrscroll", id));
     let rows_prev_x = ui
         .ctx()
@@ -99,7 +104,7 @@ pub fn scrolled_table(
         .auto_shrink(egui::Vec2b::new(false, true))
         .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
         .horizontal_scroll_offset(rows_prev_x)
-        .show(ui, |ui| table.header(ui, pal, avail, sort, aggregates));
+        .show(ui, |ui| table.header(ui, pal, sort, aggregates));
 
     // Body: both axes; x is pinned to the header's current offset (a no-op
     // unless the header was wheel-scrolled), leaving y free for the user.
@@ -139,7 +144,7 @@ pub fn scrolled_rows(
     row_count: usize,
     rows: impl FnOnce(&mut egui::Ui, &TmTable, f32, f32, std::ops::Range<usize>),
 ) -> Option<usize> {
-    let content_w = table.total_width(avail);
+    let content_w = table.total_width();
     let hdr_id = egui::Id::new(("tm-hdrscroll", id));
     let rows_prev_x = ui
         .ctx()
@@ -153,7 +158,7 @@ pub fn scrolled_rows(
         .auto_shrink(egui::Vec2b::new(false, true))
         .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
         .horizontal_scroll_offset(rows_prev_x)
-        .show(ui, |ui| table.header(ui, pal, avail, sort, aggregates));
+        .show(ui, |ui| table.header(ui, pal, sort, aggregates));
 
     let body = egui::ScrollArea::both()
         .id_salt(egui::Id::new(("tm-rowscroll", id)))
@@ -178,8 +183,9 @@ pub fn scrolled_rows(
 pub struct TmColumn {
     pub id: &'static str,
     pub label: &'static str,
-    /// Current width; the FIRST column is the designated elastic column and
-    /// additionally absorbs leftover viewport width.
+    /// Current width in px. No implicit elasticity: native Task Manager does
+    /// NOT stretch the first column across the viewport — unused space stays
+    /// empty to the right (audit P0.1).
     pub width: f32,
     /// Built-in width (double-click on the separator restores it).
     pub default_w: f32,
@@ -206,37 +212,48 @@ impl TmColumn {
             numeric: true,
         }
     }
-    /// The elastic name/description column: `width == 0` means "not yet
-    /// user-resized"; the effective width then fills the remaining viewport.
-    /// The FIRST manual resize on the table materializes this width (the
-    /// absorber would otherwise cancel the drag delta under the cursor);
-    /// double-clicking the name separator restores fill mode via the same
-    /// sentinel.
-    pub const fn elastic(id: &'static str, label: &'static str, min_w: f32) -> Self {
-        Self {
-            id,
-            label,
-            width: 0.0,
-            default_w: min_w,
-            numeric: false,
-        }
-    }
 }
 
 /// One-frame cached column geometry (implement.md §8.7).
 struct Layout {
-    avail: f32,
     /// (left x offset relative to row, width) per column.
     cols: Vec<(f32, f32)>,
+}
+
+/// One pre-normalized numeric heat cell (audit P0.2): the caller computes
+/// the intensity against the column's maximum over the whole display model
+/// BEFORE virtualization, then hands it here for painting.
+#[derive(Debug, Clone)]
+pub struct HeatCell {
+    /// 0..=1; exactly `1.0` marks the column's top consumer.
+    pub intensity: f32,
+    pub text: String,
+}
+
+impl HeatCell {
+    pub fn new(intensity: f32, text: impl Into<String>) -> Self {
+        Self {
+            intensity,
+            text: text.into(),
+        }
+    }
+}
+
+/// Normalize `value` against its column's maximum into 0..=1. A zero
+/// maximum yields 0 — nothing is highlighted without real data.
+pub fn norm(value: f64, max: f64) -> f32 {
+    if max <= 0.0 {
+        0.0
+    } else {
+        ((value / max) as f32).clamp(0.0, 1.0)
+    }
 }
 
 pub struct TmTable {
     /// Stable id used for persisting resized widths in the settings file.
     pub id: &'static str,
     pub cols: Vec<TmColumn>,
-    /// Minimum width of the flexible first (name) column.
-    pub name_min: f32,
-    /// Precomputed geometry for this frame (rebuilt when `avail` changes).
+    /// Precomputed geometry for this frame.
     layout: std::cell::RefCell<Option<Layout>>,
     /// Set when any width was modified during THIS frame's `header()`.
     dirty: bool,
@@ -249,12 +266,10 @@ impl TmTable {
         id: &'static str,
         cols: Vec<TmColumn>,
         saved: Option<&std::collections::BTreeMap<String, f32>>,
-        name_min: f32,
     ) -> Self {
         let mut t = Self {
             id,
             cols,
-            name_min,
             layout: std::cell::RefCell::new(None),
             dirty: false,
         };
@@ -274,7 +289,6 @@ impl TmTable {
     pub fn stored_widths(&self) -> std::collections::BTreeMap<String, f32> {
         self.cols
             .iter()
-            .filter(|c| c.width > 0.0)
             .map(|c| (c.id.to_string(), c.width))
             .collect()
     }
@@ -284,65 +298,36 @@ impl TmTable {
         self.dirty
     }
 
-    /// Effective width of the elastic first column.
-    ///
-    /// Elastic ONLY while untouched (`width == 0.0`, the [`TmColumn::elastic`
-    /// sentinel]): it then fills the viewport slack left by the other
-    /// columns. The moment ANY column is drag-resized, `header()` freezes
-    /// (materializes) the name width — otherwise this absorber would hand
-    /// back every dragged pixel in the same frame, cancelling the delta at
-    /// the boundary under the cursor (the dragged separator stayed put while
-    /// the Name/Status divider shifted — "columns can't be resized"), and it
-    /// flipped regimes around `spare == stored`, which read as wobbling.
-    fn name_effective(&self, avail: f32) -> f32 {
-        let w = self.cols[0].width;
-        if w > 0.0 {
-            return w.max(MIN_COL_W);
-        }
-        let others: f32 = self.cols[1..].iter().map(|c| c.width.max(MIN_COL_W)).sum();
-        let spare = avail - others;
-        if spare > self.name_min {
-            spare
-        } else {
-            self.name_min.max(MIN_COL_W)
-        }
+    /// Effective width of column `i`: its configured/persisted width — no
+    /// index-based special casing (audit P0.1 / §27).
+    pub fn col_width(&self, i: usize) -> f32 {
+        self.cols
+            .get(i)
+            .map_or(MIN_COL_W, |c| c.width.max(MIN_COL_W))
     }
 
-    /// Effective width of column `i`.
-    pub fn col_width(&self, i: usize, avail: f32) -> f32 {
-        if i == 0 {
-            self.name_effective(avail)
-        } else {
-            self.cols
-                .get(i)
-                .map_or(MIN_COL_W, |c| c.width.max(MIN_COL_W))
-        }
+    pub fn total_width(&self) -> f32 {
+        self.cols.iter().map(|c| c.width.max(MIN_COL_W)).sum()
     }
 
-    pub fn total_width(&self, avail: f32) -> f32 {
-        (0..self.cols.len()).map(|i| self.col_width(i, avail)).sum()
-    }
-
-    /// Build (once per frame / per avail) the x-offset layout.
-    fn ensure_layout(&self, avail: f32) {
+    /// Build (once, until any width mutates) the x-offset layout.
+    fn ensure_layout(&self) {
         let mut slot = self.layout.borrow_mut();
-        if let Some(l) = slot.as_ref()
-            && l.avail == avail
-        {
+        if slot.is_some() {
             return;
         }
         let mut cols = Vec::with_capacity(self.cols.len());
         let mut x = 0.0f32;
-        for i in 0..self.cols.len() {
-            let w = self.col_width(i, avail);
+        for c in &self.cols {
+            let w = c.width.max(MIN_COL_W);
             cols.push((x, w));
             x += w;
         }
-        *slot = Some(Layout { avail, cols });
+        *slot = Some(Layout { cols });
     }
 
-    pub fn col_rect(&self, i: usize, avail: f32, row: Rect) -> Rect {
-        self.ensure_layout(avail);
+    pub fn col_rect(&self, i: usize, row: Rect) -> Rect {
+        self.ensure_layout();
         let l = self.layout.borrow();
         let Some(l) = l.as_ref() else { return row };
         match l.cols.get(i) {
@@ -354,8 +339,8 @@ impl TmTable {
         }
     }
 
-    fn numeric_span(&self, avail: f32, row: Rect, from: usize) -> Rect {
-        let left = self.col_rect(from, avail, row).left();
+    fn numeric_span(&self, row: Rect, from: usize) -> Rect {
+        let left = self.col_rect(from, row).left();
         Rect::from_min_max(
             Pos2::new(left, row.top()),
             Pos2::new(row.right(), row.bottom()),
@@ -363,8 +348,8 @@ impl TmTable {
     }
 
     /// Left-edge x of column `i` inside `rect`.
-    fn boundary_x(&self, rect: Rect, avail: f32, i: usize) -> f32 {
-        self.ensure_layout(avail);
+    fn boundary_x(&self, rect: Rect, i: usize) -> f32 {
+        self.ensure_layout();
         let l = self.layout.borrow();
         let off = l
             .as_ref()
@@ -386,7 +371,6 @@ impl TmTable {
         &mut self,
         ui: &mut egui::Ui,
         pal: &Palette,
-        avail: f32,
         sort: Option<(usize, bool)>,
         aggregates: Option<&[String]>,
     ) -> Option<usize> {
@@ -397,7 +381,7 @@ impl TmTable {
         };
         self.layout.borrow_mut().take(); // widths may change below
         let table_id = egui::Id::new(("tmtable", self.id));
-        let total_w = self.total_width(avail);
+        let total_w = self.total_width();
         let (rect, _) = ui.allocate_exact_size(egui::vec2(total_w, h), Sense::hover());
         let painter = ui.painter_at(rect.expand(2.0));
         let mut clicked = None;
@@ -409,12 +393,12 @@ impl TmTable {
         // final entry is the right edge of the LAST column, which carries
         // its own resize handle like every interior boundary.
         let mut bounds: Vec<f32> = (0..self.cols.len())
-            .map(|i| self.boundary_x(rect, avail, i))
+            .map(|i| self.boundary_x(rect, i))
             .collect();
         bounds.push(rect.left() + total_w);
 
         for (i, col) in self.cols.iter().enumerate() {
-            let w = self.col_width(i, avail);
+            let w = self.col_width(i);
             let cell =
                 Rect::from_min_max(Pos2::new(x, rect.top()), Pos2::new(x + w, rect.bottom()));
 
@@ -548,18 +532,6 @@ impl TmTable {
                 );
             }
 
-            // First frame of a drag: freeze the elastic name column at its
-            // current effective width before any delta is applied. From the
-            // first manual resize on ALL columns are explicitly sized, so
-            // the slack absorber in `name_effective` can no longer hand the
-            // dragged pixels back within the same frame. Value-preserving —
-            // no visual jump.
-            if rresp.drag_started() && self.cols[0].width == 0.0 {
-                self.cols[0].width = self.name_effective(avail);
-                self.layout.borrow_mut().take();
-                self.dirty = true;
-            }
-
             if rresp.dragged() {
                 let dx = rresp.drag_delta().x;
                 if dx != 0.0 {
@@ -568,24 +540,14 @@ impl TmTable {
                     // frame's delta to a frozen drag-start width instead
                     // reset the width to ~its starting value on every frame
                     // (the boundary never followed the cursor).
-                    let min_w = if i == 1 {
-                        self.name_min.max(MIN_COL_W)
-                    } else {
-                        MIN_COL_W
-                    };
-                    let current = if i - 1 == 0 {
-                        self.name_effective(avail)
-                    } else {
-                        self.cols[i - 1].width.max(MIN_COL_W)
-                    };
-                    self.cols[i - 1].width = (current + dx).clamp(min_w, MAX_COL_W);
+                    let current = self.col_width(i - 1);
+                    self.cols[i - 1].width = (current + dx).clamp(MIN_COL_W, MAX_COL_W);
                     self.layout.borrow_mut().take();
                     self.dirty = true;
                 }
             }
 
-            // Double-click restores the built-in default (for the elastic
-            // name column the `0.0` sentinel switches back to fill mode).
+            // Double-click restores the built-in default.
             // A drag-only widget never receives egui's click flags, so the
             // second press is detected directly on the input state while
             // the pointer rests on the handle.
@@ -594,11 +556,7 @@ impl TmTable {
                     .ctx()
                     .input(|i| i.pointer.button_double_clicked(PointerButton::Primary))
             {
-                self.cols[i - 1].width = if i - 1 == 0 {
-                    0.0
-                } else {
-                    self.cols[i - 1].default_w.clamp(MIN_COL_W, MAX_COL_W)
-                };
+                self.cols[i - 1].width = self.cols[i - 1].default_w.clamp(MIN_COL_W, MAX_COL_W);
                 self.layout.borrow_mut().take();
                 self.dirty = true;
             }
@@ -620,14 +578,8 @@ impl TmTable {
     }
 
     /// Paint a row background. Returns the row rect and response.
-    pub fn row(
-        &self,
-        ui: &mut egui::Ui,
-        pal: &Palette,
-        avail: f32,
-        selected: bool,
-    ) -> (Rect, egui::Response) {
-        let total_w = self.total_width(avail);
+    pub fn row(&self, ui: &mut egui::Ui, pal: &Palette, selected: bool) -> (Rect, egui::Response) {
+        let total_w = self.total_width();
         let (rect, resp) = ui.allocate_exact_size(
             egui::vec2(total_w, ROW_H),
             Sense::click().union(Sense::hover()),
@@ -642,18 +594,16 @@ impl TmTable {
     }
 
     /// Left-aligned text cell.
-    #[allow(clippy::too_many_arguments)]
     pub fn text_cell(
         &self,
         ui: &egui::Ui,
-        avail: f32,
         row: Rect,
         i: usize,
         text: &str,
         pal: &Palette,
         dim: bool,
     ) {
-        let cell = self.col_rect(i, avail, row);
+        let cell = self.col_rect(i, row);
         ui.painter().text(
             Pos2::new(cell.left() + 10.0, cell.center().y),
             Align2::LEFT_CENTER,
@@ -665,45 +615,41 @@ impl TmTable {
 
     /// The contiguous blue heat block over numeric columns `from..`:
     /// base navy when the row is active, the brighter `heat_top` fill on
-    /// each column's top-consumer cell (Win11 TM semantics), and thin
-    /// separators between adjacent cells.
-    #[allow(clippy::too_many_arguments)]
+    /// each column's top-consumer cell, and thin separators between
+    /// adjacent cells.
+    ///
+    /// Paints EXACTLY what it is told (audit P0.2): every [`HeatCell`]
+    /// intensity is precomputed by the caller, normalized against that
+    /// column's maximum over the WHOLE display model — before row
+    /// virtualization. An intensity of exactly `1.0` marks the column's
+    /// top consumer (ties all light up); this function never derives
+    /// maxima from the single row it happens to paint.
     pub fn heat_cells(
         &self,
         ui: &egui::Ui,
         pal: &Palette,
-        avail: f32,
         row: Rect,
         from: usize,
-        cells: &[(f32, String)],
+        cells: &[HeatCell],
         row_active: bool,
     ) {
-        let span = self.numeric_span(avail, row, from);
+        let span = self.numeric_span(row, from);
         let painter = ui.painter_at(row.expand(2.0));
         if row_active {
             painter.rect_filled(span, 0.0, pal.heat_base);
         }
-        // Top-consumer detection: the highest non-zero intensity wins the
-        // brighter fill; ties light every tied cell (TM behaves the same).
-        let top = cells
-            .iter()
-            .map(|(t, _)| *t)
-            .fold(0.0f32, f32::max)
-            .max(0.05);
-        for (k, (t, text)) in cells.iter().enumerate() {
-            let cell = self.col_rect(from + k, avail, row);
-            if row_active && *t > 0.02 {
-                // TM: flat base for every active cell; only the column's
-                // top consumer gets the brighter fill (no value gradient).
-                if *t >= top - f32::EPSILON && top > 0.05 {
-                    painter.rect_filled(cell, 0.0, pal.heat_top);
-                }
+        for (k, cell_data) in cells.iter().enumerate() {
+            let cell = self.col_rect(from + k, row);
+            // TM: flat base for every active cell; only the column's top
+            // consumer gets the brighter fill (no value gradient).
+            if row_active && cell_data.intensity >= 1.0 - f32::EPSILON {
+                painter.rect_filled(cell, 0.0, pal.heat_top);
             }
-            if !text.is_empty() {
+            if !cell_data.text.is_empty() {
                 painter.text(
                     Pos2::new(cell.right() - 10.0, cell.center().y),
                     Align2::RIGHT_CENTER,
-                    text,
+                    &cell_data.text,
                     FontId::proportional(FONT_ROW),
                     pal.text,
                 );
@@ -848,58 +794,56 @@ mod tests {
         TmTable::new(
             "t",
             vec![
-                TmColumn::elastic("name", "Name", 340.0),
+                TmColumn::text("name", "Name", 340.0),
                 TmColumn::text("a", "A", 200.0),
                 TmColumn::num("b", "B", 100.0),
             ],
             None,
-            340.0,
         )
     }
 
-    /// Regression: the elastic name column absorbed the viewport slack EVERY
-    /// frame, so a manual drag of any other boundary was cancelled in the
-    /// same frame — the dragged separator never moved ("columns can't be
-    /// resized"). Materializing the name width at drag start must make the
-    /// delta stick to the boundary under the cursor.
+    /// Regression (audit P0.1): the first column used to absorb all unused
+    /// viewport width, stretching Name across the window and pushing numeric
+    /// columns to the right edge. Native TM keeps configured widths and
+    /// leaves blank client area on the right instead.
     #[test]
-    fn materialized_name_stops_absorbing_drag_deltas() {
-        let mut t = table();
-        let avail = 1000.0;
-        // Virgin table: elastic absorber fills the slack (200+100 fixed).
-        assert_eq!(t.col_width(0, avail), 700.0);
-
-        // `header()` does exactly this on the first drag_started:
-        t.cols[0].width = t.name_effective(avail);
-
-        // Growing column B by 300 must grow the TOTAL by 300 — i.e. B's left
-        // boundary follows the cursor — instead of being absorbed away.
-        let before = t.total_width(avail);
-        t.cols[2].width += 300.0;
-        assert_eq!(t.total_width(avail), before + 300.0);
-        // And the name column must NOT re-absorb on later frames.
-        assert_eq!(t.col_width(0, avail), 700.0);
+    fn columns_keep_configured_widths_at_any_viewport() {
+        let t = table();
+        assert_eq!(t.col_width(0), 340.0);
+        assert_eq!(t.col_width(1), 200.0);
+        assert_eq!(t.col_width(2), 100.0);
+        assert_eq!(t.total_width(), 640.0);
+        // Total width must not depend on the viewport at all.
+        assert_eq!(t.total_width(), t.total_width());
     }
 
-    /// While still untouched, the elastic column keeps filling slack and
-    /// respects its minimum when the viewport gets too narrow.
+    /// Saved widths restore by column id; out-of-range values are ignored.
     #[test]
-    fn virgin_elastic_fills_slack_and_respects_min() {
-        let mut t = table();
-        assert_eq!(t.col_width(0, 1200.0), 900.0);
-        // Viewport leaves less than the minimum -> clamped to name_min.
-        assert_eq!(t.col_width(0, 400.0), 340.0);
-        // Double-click restore re-enables fill mode via the sentinel.
-        t.cols[0].width = 500.0;
-        assert_eq!(t.col_width(0, 1200.0), 500.0);
-        t.cols[0].width = 0.0;
-        assert_eq!(t.col_width(0, 1200.0), 900.0);
+    fn saved_widths_restore_by_id() {
+        let t = table();
+        let saved = std::collections::BTreeMap::from([
+            ("a".to_string(), 250.0f32),
+            ("name".to_string(), 599.0f32),
+            ("b".to_string(), 3.0f32), // below MIN_COL_W -> ignored
+        ]);
+        let restored = TmTable::new("t", t.cols.clone(), Some(&saved));
+        assert_eq!(restored.col_width(0), 599.0);
+        assert_eq!(restored.col_width(1), 250.0);
+        assert_eq!(restored.col_width(2), 100.0); // default, invalid saved value
+    }
+
+    /// Normalized heat intensities: 1.0 exactly marks the column's top
+    /// consumer; zero-max columns normalize everything to 0 (audit P0.2).
+    #[test]
+    fn heat_normalization_marks_top_consumer() {
+        assert_eq!(norm(30.0, 30.0), 1.0);
+        assert!((norm(15.0, 30.0) - 0.5).abs() < 1e-6);
+        assert_eq!(norm(7.0, 0.0), 0.0, "no maximum -> nothing highlighted");
+        assert_eq!(norm(0.0, 42.0), 0.0);
     }
 
     // ---- input-driven regression tests: real egui passes with synthetic
     // pointer events, exercising the actual drag pipeline in `header()`. ----
-
-    const AVAIL: f32 = 1000.0;
 
     fn ptr_moved(x: f32, y: f32) -> egui::Event {
         egui::Event::PointerMoved(egui::Pos2::new(x, y))
@@ -936,7 +880,7 @@ mod tests {
                 .frame(egui::Frame::NONE)
                 .show(root, |ui| {
                     left.set(ui.cursor().left());
-                    table.header(ui, &crate::theme::DARK, AVAIL, None, None);
+                    table.header(ui, &crate::theme::DARK, None, None);
                 });
         });
         // No renderer here: consume the font texture deltas so egui does not
@@ -945,20 +889,16 @@ mod tests {
         left.get()
     }
 
-    /// Regression (2026-08): `drag_delta()` is movement since the LAST
-    /// FRAME, so adding it to a frozen drag-start width reset the column to
-    /// ~its starting width every frame — the boundary never followed the
-    /// cursor. Live accumulation must land exactly on the pointer instead.
+    /// Dragging the name|A boundary tracks the cursor exactly (+30 px per
+    /// pass), and only THAT column changes.
     #[test]
     fn dragging_name_boundary_tracks_cursor_across_frames() {
         let ctx = egui::Context::default();
         let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1600.0, 900.0));
         let mut t = table();
-        // Virgin elastic name column fills the slack: Name|A boundary at 700.
-        assert_eq!(t.col_width(0, AVAIL), 700.0);
-
-        let l = header_frame(&ctx, &mut t, screen, 0.000, vec![]); // register rects
-        let grab = egui::Pos2::new(l + 700.0, 20.0);
+        // Name|A boundary at x = 340.
+        let l = header_frame(&ctx, &mut t, screen, 0.000, vec![]);
+        let grab = egui::Pos2::new(l + 340.0, 20.0);
         header_frame(&ctx, &mut t, screen, 0.016, vec![ptr_moved(grab.x, grab.y)]);
         header_frame(
             &ctx,
@@ -990,21 +930,20 @@ mod tests {
         );
 
         // +30 px per pass for two passes: exactly +60 total.
-        assert_eq!(t.col_width(0, AVAIL), 760.0);
-        // The materialized width persists beyond the elastic absorber.
-        assert_eq!(t.cols[0].width, 760.0);
+        assert_eq!(t.col_width(0), 400.0);
+        assert_eq!(t.col_width(1), 200.0, "neighbour column untouched");
     }
 
     /// Dragging a non-name boundary shrinks/grows THAT column and leaves the
-    /// materialized name width alone.
+    /// name column alone.
     #[test]
     fn dragging_other_boundary_resizes_that_column_only() {
         let ctx = egui::Context::default();
         let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1600.0, 900.0));
         let mut t = table();
-        // A|B boundary at virgin x = 700 (name) + 200 (A) = 900.
+        // A|B boundary at x = 340 + 200 = 540.
         let l = header_frame(&ctx, &mut t, screen, 0.000, vec![]);
-        let grab = egui::Pos2::new(l + 900.0, 20.0);
+        let grab = egui::Pos2::new(l + 540.0, 20.0);
         header_frame(&ctx, &mut t, screen, 0.016, vec![ptr_moved(grab.x, grab.y)]);
         header_frame(
             &ctx,
@@ -1036,25 +975,21 @@ mod tests {
         );
 
         assert_eq!(t.cols[1].width, 120.0); // 200 - 80
-        assert_eq!(t.cols[0].width, 700.0); // name frozen at drag start
-        assert_eq!(t.col_width(0, AVAIL), 700.0);
+        assert_eq!(t.cols[0].width, 340.0, "first column unaffected");
     }
 
-    /// Double-clicking a boundary restores the built-in default; on the
-    /// elastic name column it re-enables fill mode via the `0.0` sentinel.
+    /// Double-clicking a boundary restores the built-in default width.
     #[test]
-    fn double_click_on_boundary_restores_default_and_fill_mode() {
+    fn double_click_on_boundary_restores_default() {
         let ctx = egui::Context::default();
         let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1600.0, 900.0));
         let mut t = table();
-        // Explicit widths: name 500, A distorted to 300 so its restore is
-        // observable, B 100. Boundaries then sit at x = 500 / 800 / 1100.
-        t.cols[0].width = 500.0;
+        // Distort A so its restore is observable: boundaries then sit at
+        // x = 340 / 640 / 740.
         t.cols[1].width = 300.0;
         let l = header_frame(&ctx, &mut t, screen, 0.000, vec![]);
 
-        // A|B boundary at x = 500 + 300 = 800; double-click restores A.
-        let bx = l + 800.0;
+        let bx = l + 640.0;
         header_frame(&ctx, &mut t, screen, 0.016, vec![ptr_moved(bx, 20.0)]);
         header_frame(
             &ctx,
@@ -1085,42 +1020,5 @@ mod tests {
             vec![ptr_button(bx, 20.0, false)],
         );
         assert_eq!(t.cols[1].width, 200.0);
-
-        // Name|A boundary now at x = 500; double-click returns the name
-        // column to fill-the-spare-space mode (sentinel 0.0). Start well
-        // past the multi-click window so these register as fresh single/
-        // double clicks instead of continuing the previous count.
-        let bx = l + 500.0;
-        header_frame(&ctx, &mut t, screen, 1.200, vec![ptr_moved(bx, 20.0)]);
-        header_frame(
-            &ctx,
-            &mut t,
-            screen,
-            1.216,
-            vec![ptr_button(bx, 20.0, true)],
-        );
-        header_frame(
-            &ctx,
-            &mut t,
-            screen,
-            1.232,
-            vec![ptr_button(bx, 20.0, false)],
-        );
-        header_frame(
-            &ctx,
-            &mut t,
-            screen,
-            1.248,
-            vec![ptr_button(bx, 20.0, true)],
-        );
-        header_frame(
-            &ctx,
-            &mut t,
-            screen,
-            1.264,
-            vec![ptr_button(bx, 20.0, false)],
-        );
-        assert_eq!(t.cols[0].width, 0.0);
-        assert_eq!(t.col_width(0, AVAIL), 700.0); // refills the slack again
     }
 }
