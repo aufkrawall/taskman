@@ -230,6 +230,8 @@ pub struct TaskManApp {
     pub shared: SharedState,
     pub history: VecDeque<HistoryPoint>,
     /// Cap derived from the configured graph window at the fastest interval.
+    /// Recomputed whenever `graph_seconds` changes (audit §10) — a wider
+    /// window setting must never silently truncate the visible history.
     pub history_cap: usize,
     pub app_history_db: tm_core::AppHistoryDb,
     pub tab: Tab,
@@ -254,9 +256,11 @@ pub struct TaskManApp {
     pub processes_state: crate::tabs::processes::State,
     pub perf_selected_key: String,
     pub details_state: crate::tabs::details::State,
-    pub selected_pid: Option<u32>,
+    /// Selected process by EXACT identity (audit §7): the toolbar's End Task
+    /// and Efficiency commands validate start-time identity against the live
+    /// snapshot before dispatching, so a recycled PID is never targeted.
+    pub selected_process: Option<ProcessIdentity>,
     pub selected_user: Option<u32>,
-    pub efficiency_pids: std::collections::HashSet<u32>,
     // Services tab.
     pub services_selected_name: Option<String>,
 
@@ -360,12 +364,9 @@ impl TaskManApp {
         let perf_selected_key = std::env::var("TASKMAN_PERF").unwrap_or_else(|_| "cpu".into());
 
         // History capacity sized for the largest configured window at the
-        // fastest interval (implement.md §14.3).
-        let min_interval_s = tm_core::settings::UpdateSpeed::High
-            .interval()
-            .as_secs_f64();
-        let history_cap =
-            ((settings.graph_seconds as f64 / min_interval_s).ceil() as usize).clamp(120, 1440);
+        // fastest interval (implement.md §14.3); recomputed on changes.
+        let min_interval_s = history_min_interval_s();
+        let history_cap = history_cap_for(settings.graph_seconds, min_interval_s);
 
         // App history loads on a worker; observations wait for it (ms-scale).
         let history_path = tm_core::settings::taskman_data_dir().join("app-history.json");
@@ -416,9 +417,8 @@ impl TaskManApp {
             processes_state: crate::tabs::processes::State::new(),
             perf_selected_key,
             details_state: Default::default(),
-            selected_pid: None,
+            selected_process: None,
             selected_user: None,
-            efficiency_pids: std::collections::HashSet::new(),
             services_selected_name: None,
             pending_details_focus: None,
             scroll_to_pid: None,
@@ -490,7 +490,7 @@ impl TaskManApp {
                     .union(TelemetryDemand::DISK_RATE)
                     .union(TelemetryDemand::GPU_ADAPTER);
             }
-            Tab::Details if self.details_state.has_gpu_column_visible() => {
+            Tab::Details if self.details_state.requires_gpu_telemetry() => {
                 d = d
                     .union(TelemetryDemand::PROCESS_GPU)
                     .union(TelemetryDemand::PROCESS_GPU_MEMORY)
@@ -581,6 +581,18 @@ impl eframe::App for TaskManApp {
 
         // Single poll per repaint — publications wake us via the notifier,
         // so no periodic request_repaint_after is needed anymore.
+        // Recompute the history capacity when the graph window setting
+        // changes (audit §10): a wider window must never be truncated by a
+        // deque sized at startup.
+        let want_cap =
+            history_cap_for(self.shared.settings.graph_seconds, history_min_interval_s());
+        if want_cap != self.history_cap {
+            self.history_cap = want_cap;
+            while self.history.len() > want_cap {
+                self.history.pop_front();
+            }
+            tracing::debug!(cap = want_cap, "graph window changed; history resized");
+        }
         if self.poll_engine().is_some() {
             self.app_history_db.save_async();
         }
@@ -657,6 +669,17 @@ impl eframe::App for TaskManApp {
             self.refresh_all();
         }
 
+        // Global search shortcut (audit §5): Alt+F as documented by native
+        // Task Manager, plus Ctrl+F as most users expect. egui ignores
+        // ctrl-modified characters inside text edits, so this cannot leak
+        // an 'f' into whatever field currently holds focus.
+        let search_focus =
+            ctx.input(|i| i.key_pressed(egui::Key::F) && (i.modifiers.alt || i.modifiers.ctrl));
+        if search_focus {
+            let id = egui::Id::new("global-search");
+            ctx.memory_mut(|m| m.request_focus(id));
+        }
+
         // Track window size for persistence (only while remembering).
         if self.shared.settings.remember_window {
             let size = ctx.input(|i| i.viewport().inner_rect.map(|r| r.size()));
@@ -684,9 +707,33 @@ impl eframe::App for TaskManApp {
     }
 }
 
+/// Fastest sampling interval the engine can run at; used to size the
+/// graph-history buffer conservatively (never more points than needed).
+pub(crate) fn history_min_interval_s() -> f64 {
+    tm_core::settings::UpdateSpeed::High
+        .interval()
+        .as_secs_f64()
+}
+
+/// Deque capacity for `seconds` of visible history sampled at the fastest
+/// configured speed. Split out for unit testing (audit §10).
+pub(crate) fn history_cap_for(seconds: u32, min_interval_s: f64) -> usize {
+    ((seconds as f64 / min_interval_s).ceil() as usize).clamp(120, 1440)
+}
+
 impl TaskManApp {
     pub fn latest_snapshot(&self) -> Option<Arc<Snapshot>> {
         self.engine.latest()
+    }
+
+    /// Whether a stored process identity still matches the live snapshot
+    /// (start-time check; audit §7). `None` start times degrade gracefully:
+    /// presence alone is then accepted.
+    pub fn identity_is_live(&self, identity: &ProcessIdentity) -> bool {
+        self.latest_snapshot()
+            .as_ref()
+            .and_then(|s| s.process(identity.pid))
+            .is_none_or(|p| p.start_epoch_s.is_none() || p.start_epoch_s == identity.start_epoch_s)
     }
 
     /// The active UI language.
@@ -694,16 +741,10 @@ impl TaskManApp {
         i18n::lang()
     }
 
-    /// Translate a key into the active UI language.
-    #[allow(dead_code)]
-    pub fn tr(&self, key: K) -> &'static str {
-        i18n::tr_in(self.lang(), key)
-    }
-
     /// Build a table with this tab's persisted column widths restored.
-    pub fn make_table(&self, id: &'static str, cols: Vec<TmColumn>, name_min: f32) -> TmTable {
+    pub fn make_table(&self, id: &'static str, cols: Vec<TmColumn>) -> TmTable {
         let saved = self.shared.settings.col_widths.get(id);
-        TmTable::new(id, cols, saved, name_min)
+        TmTable::new(id, cols, saved)
     }
 
     /// Persist resized column widths through the debounced settings writer.
@@ -757,15 +798,25 @@ impl TaskManApp {
     }
 
     /// End the selected process (toolbar "Task beenden") — on the executor.
+    ///
+    /// Uses the stored EXACT process identity and validates it against the
+    /// live snapshot before dispatching (audit §7): a PID recycled between
+    /// selection and command can never be killed by mistake.
     pub fn end_selected(&mut self, ctx: &egui::Context) {
-        if let Some(pid) = self.selected_pid.take() {
-            let actions = self.actions.clone();
-            self.run_action(
-                ctx,
-                move || i18n::trf(K::ProcessEndedToast, &[&pid.to_string()]),
-                move || actions.kill_process(pid, false),
-            );
+        let Some(identity) = self.selected_process.take() else {
+            return;
+        };
+        if !self.identity_is_live(&identity) {
+            self.shared.toast(i18n::tr(K::ProcessExited));
+            return;
         }
+        let pid = identity.pid;
+        let actions = self.actions.clone();
+        self.run_action(
+            ctx,
+            move || i18n::trf(K::ProcessEndedToast, &[&pid.to_string()]),
+            move || actions.kill_process(pid, false),
+        );
     }
 
     /// Frame-rate diagnostics (TASKMAN_FPS_PROBE=1): measures the interval
@@ -825,5 +876,27 @@ impl TaskManApp {
                     ui.monospace(line);
                 });
             });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Audit §10: history capacity derives from the configured graph window
+    /// sampled at the fastest speed, clamped to sane bounds.
+    #[test]
+    fn history_cap_matches_window_and_speed() {
+        // 60 s at 0.5 s fastest interval = 120 points.
+        assert_eq!(history_cap_for(60, 0.5), 120);
+        // 120 s window doubles the requirement.
+        assert_eq!(history_cap_for(120, 0.5), 240);
+        // Clamp floor.
+        assert_eq!(history_cap_for(10, 0.5), 120);
+        // Clamp ceiling (600 s max setting -> 1200 < 1440 cap).
+        assert_eq!(history_cap_for(600, 0.5), 1200);
+        // Non-divisible windows round UP so the requested span always fits
+        // (240 s / 1.5 s = exactly 160 here).
+        assert_eq!(history_cap_for(241, 1.5), 161);
     }
 }

@@ -15,7 +15,9 @@ use crate::widgets::tablekit::{self, TmColumn};
 
 fn columns() -> Vec<TmColumn> {
     vec![
-        TmColumn::text("name", i18n::tr(K::ColName), 0.0),
+        // Audit P0.1/§27: configured width instead of the `0.0` sentinel that
+        // used to trip elastic fill behavior.
+        TmColumn::text("name", i18n::tr(K::ColName), 280.0),
         TmColumn::text("pub", i18n::tr(K::ColPublisher), 240.0),
         TmColumn::text("status", i18n::tr(K::ColStatus), 140.0),
         TmColumn::text("impact", i18n::tr(K::ColImpact), 150.0),
@@ -142,14 +144,15 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
         return;
     };
 
-    let q = app.search.trim().to_lowercase();
-    let mut table = app.make_table("startup", columns(), 340.0);
+    let q = crate::search::Query::new(&app.search);
+    let mut table = app.make_table("startup", columns());
     let avail = crate::widgets::tablekit::table_avail(ui);
     // Precompute visible indexes so show_rows can virtualize them.
+    // Search fields (audit §5): name AND publisher.
     let visible: Vec<usize> = items
         .iter()
         .enumerate()
-        .filter(|(_, it)| q.is_empty() || it.name.to_lowercase().contains(&q))
+        .filter(|(_, it)| q.matches_any([it.name.as_str(), it.publisher.as_deref().unwrap_or("")]))
         .map(|(i, _)| i)
         .collect();
     tablekit::scrolled_rows(
@@ -161,12 +164,12 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
         None,
         None,
         visible.len(),
-        |ui, table, avail, _content_w, range| {
+        |ui, table, _avail, _content_w, range| {
             for vi in range {
                 let i = visible[vi];
                 let item = &mut items[i];
                 let selected = app.selected_startup_id.as_deref() == Some(item.id.as_str());
-                let (rect, resp) = table.row(ui, &pal, avail, selected);
+                let (rect, resp) = table.row(ui, &pal, selected);
 
                 // Icon: real shell icon from the command's executable.
                 let exe = exe_from_command(&item.command);
@@ -174,7 +177,7 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
                     .as_deref()
                     .and_then(|p| app.shared.icons.get(ui.ctx(), &app.actions, p, 4));
                 table.icon_cell(ui, rect, tex.as_ref(), pal.accent);
-                let name_rect = table.col_rect(0, avail, rect);
+                let name_rect = table.col_rect(0, rect);
                 ui.painter().text(
                     egui::Pos2::new(name_rect.left() + 56.0, rect.center().y),
                     egui::Align2::LEFT_CENTER,
@@ -185,7 +188,6 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
 
                 table.text_cell(
                     ui,
-                    avail,
                     rect,
                     1,
                     item.publisher.as_deref().unwrap_or(""),
@@ -194,7 +196,6 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
                 );
                 table.text_cell(
                     ui,
-                    avail,
                     rect,
                     2,
                     if item.enabled {
@@ -207,7 +208,6 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
                 );
                 table.text_cell(
                     ui,
-                    avail,
                     rect,
                     3,
                     impact_label(app.lang(), item.impact),

@@ -63,7 +63,15 @@ pub fn list_startup() -> Vec<StartupItem> {
                 location: loc.label.to_string(),
                 publisher: None,
                 enabled,
-                impact: StartupImpact::Unknown,
+                // Audit §13: native TM shows "None" for disabled items — a
+                // disabled app cannot have been measured at all. Real
+                // Low/Medium/High telemetry (CPU ms / disk KB thresholds)
+                // arrives with the SRUM-backed startup provider.
+                impact: if enabled {
+                    StartupImpact::Unknown
+                } else {
+                    StartupImpact::None
+                },
             });
         }
     }
@@ -117,7 +125,13 @@ pub fn list_startup() -> Vec<StartupItem> {
                 location: startup_folder_label(scope),
                 publisher: resolve_publisher(&e.path().to_string_lossy()),
                 enabled,
-                impact: StartupImpact::Unknown,
+                // Disabled → None; only ENABLED items without measured
+                // telemetry are "Not measured" (audit §13).
+                impact: if enabled {
+                    StartupImpact::Unknown
+                } else {
+                    StartupImpact::None
+                },
             });
         }
     }

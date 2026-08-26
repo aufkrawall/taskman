@@ -73,7 +73,10 @@ pub fn top_search_panel(app: &mut TaskManApp, ui_root: &mut egui::Ui, pal: &Pale
                     .hint_text(i18n::tr(K::SearchHint))
                     .font(FontId::proportional(15.0))
                     .frame(egui::Frame::NONE)
-                    .desired_width(edit_rect.width()),
+                    .desired_width(edit_rect.width())
+                    // Stable id so Alt+F / Ctrl+F (audit §5) can focus the
+                    // global search field from anywhere.
+                    .id(egui::Id::new("global-search")),
             );
         });
 }

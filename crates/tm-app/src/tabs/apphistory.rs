@@ -14,7 +14,7 @@ fn columns() -> Vec<TmColumn> {
         // Only metrics we actually measure. The old fake "Notifications"
         // column (hard-coded "0 MB") was removed until a real Windows data
         // source exists (implement.md §16.8).
-        TmColumn::elastic("name", i18n::tr(K::ColName), 340.0),
+        TmColumn::text("name", i18n::tr(K::ColName), 340.0),
         TmColumn::num("cpu", i18n::tr(K::ColCpuTime), 150.0),
         TmColumn::num("net", i18n::tr(K::ColNetwork), 140.0),
     ]
@@ -69,7 +69,7 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
     });
     ui.add_space(6.0);
 
-    let q = app.search.trim().to_lowercase();
+    let q = crate::search::Query::new(&app.search);
     let db_names = app.app_history_db.display_name_map();
     let mut rows: Vec<(String, f64, u64)> = app
         .app_history_db
@@ -79,12 +79,16 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
             let shown = db_names.get(k).cloned().unwrap_or_else(|| k.clone());
             (shown, v.cpu_seconds, v.network_bytes)
         })
-        .filter(|(name, _, _)| q.is_empty() || name.to_lowercase().contains(&q))
+        .filter(|(name, _, _)| q.matches_any([name.as_str()]))
         .collect();
     rows.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
-    let mut table = app.make_table("apphistory", columns(), 340.0);
-    let max_cpu = rows.iter().map(|r| r.1).fold(0.0f64, f64::max).max(1.0);
+    let mut table = app.make_table("apphistory", columns());
+    // Per-column maxima over the whole model BEFORE virtualization
+    // (audit P0.2) — CPU time and network traffic each highlight their own
+    // top consumer.
+    let max_cpu = rows.iter().map(|r| r.1).fold(0.0f64, f64::max);
+    let max_net = rows.iter().map(|r| r.2 as f64).fold(0.0f64, f64::max);
 
     let avail = crate::widgets::tablekit::table_avail(ui);
     // Fully virtualized: no silent 500-row truncation (§16.8).
@@ -97,14 +101,14 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
         None,
         None,
         rows.len(),
-        |ui, table, avail, _content_w, range| {
+        |ui, table, _avail, _content_w, range| {
             for ri in range {
                 let Some((name, cpu_s, net_b)) = rows.get(ri) else {
                     continue;
                 };
-                let (rect, resp) = table.row(ui, &pal, avail, false);
+                let (rect, resp) = table.row(ui, &pal, false);
                 table.icon_cell(ui, rect, None, pal.accent);
-                let name_rect = table.col_rect(0, avail, rect);
+                let name_rect = table.col_rect(0, rect);
                 ui.painter().text(
                     egui::Pos2::new(name_rect.left() + 56.0, rect.center().y),
                     egui::Align2::LEFT_CENTER,
@@ -113,19 +117,16 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
                     pal.text,
                 );
                 let cells = vec![
-                    // Top-consumer heat only: the highest CPU-time row
-                    // lights up brighter; net column stays unhighlighted.
-                    (
-                        if *cpu_s > 0.0 {
-                            (*cpu_s / max_cpu) as f32
-                        } else {
-                            0.0
-                        },
+                    tablekit::HeatCell::new(
+                        tablekit::norm(*cpu_s, max_cpu),
                         format::format_cpu_time(*cpu_s),
                     ),
-                    (0.0f32, format::format_bytes_loc(*net_b)),
+                    tablekit::HeatCell::new(
+                        tablekit::norm(*net_b as f64, max_net),
+                        format::format_bytes_loc(*net_b),
+                    ),
                 ];
-                table.heat_cells(ui, &pal, avail, rect, 1, &cells, true);
+                table.heat_cells(ui, &pal, rect, 1, &cells, true);
                 let _ = resp;
             }
         },

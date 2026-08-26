@@ -2,6 +2,60 @@
 
 # Recent Activity
 
+## 2026-08-26 — audit.md Phase 1 (correctness) implemented
+
+All 11 Phase-1 items from the 2026 parity audit landed, each with
+regression tests:
+
+1. **Table width architecture (P0.1)**: `TmColumn::elastic` and the
+   index-0/"width==0 sentinel" fill behavior REMOVED. Every column uses its
+   configured/persisted width; unused viewport space stays blank on the
+   right like native TM. `TmTable::new`/`make_table` lost the `name_min`
+   param; `col_width(i)`/`total_width()` no longer take `avail`; layout is
+   width-driven (rebuilt only on mutation). Double-click restores
+   `default_w`.
+2. **Per-column heat normalization (P0.2)**: `heat_cells` now paints given
+   `HeatCell { intensity, text }` values; callers normalize per COLUMN over
+   the whole display model BEFORE virtualization (`tablekit::norm`,
+   processes' `normalize_heat`, users' `HeatMax`, apphistory maxima).
+   "value>0 ⇒ 1.0" binary intensities are gone.
+3. **Details GPU demand (P0.3)**: `show_gpu_columns` bool removed;
+   `State.visible: BTreeSet<ColumnId>` is the single source of truth, both
+   for rendering (dynamic column list) and `requires_gpu_telemetry()`
+   demand derivation. Minimal Select-columns dialog added ("…" overflow),
+   session-only persistence (see known-debt.md).
+4. **Users search fixed**: old condition kept every active user visible;
+   now query matches user display name OR any aggregated app name.
+5. **Global search + shortcuts**: new `tm-app/src/search.rs` `Query`
+   matcher (binary name/display/PID/publisher) used by Processes, Details,
+   Startup (+publisher) and App History. Alt+F and Ctrl+F focus the global
+   search field (`egui::Id::new("global-search")`).
+6. **Performance Refresh now**: actually calls `refresh_all()`.
+7. **Startup impact**: disabled items report `None` (win/startup.rs);
+   enabled-without-data stays Unknown; real thresholds = later SRUM work.
+8. **Group counters (P0.4/P0.5)**: `DisplayRow::GroupHeader(gi, total)`
+   carries unflattened classification counts; grouped labels use O(n)
+   whole-subtree process counts (`subtree_values_and_counts`). RowData lost
+   its now-unread `group` field.
+9. **Selection identity (§7)**: `selected_pid` replaced by
+   `selected_process: Option<ProcessIdentity>`; `end_selected` validates
+   start-time identity against the live snapshot before dispatch
+   (`TaskManApp::identity_is_live`); Efficiency toggles validate too.
+10. **Efficiency mode from OS state (§8)**: leaf icon/menu derive from
+    `ProcessEntry.power_throttled`; `efficiency_pids` HashSet deleted;
+    toggle issues one forced refresh so paused mode updates as well.
+11. **History capacity (§10)**: `history_cap_for()` recomputes whenever
+    `graph_seconds` changes (logic pass), truncating overflow.
+
+Also fixed in passing (§23): services fetch + service-control workers wake
+the UI via `Context::request_repaint` (Services page could stick on
+"Gathering data" while paused). Stale cpu_load.rs doc rewritten to the 2026
+metric split (current pages = time-based; utility survives as Details
+"CPU Utility" column; legacy provider = future work).
+
+Gates: fmt+clippy(-D warnings)+workspace tests+release build all green on
+Windows (`build.py --check`, then `--host-only`); selfcheck --mock ok.
+
 ## 2026-08-26 — Visual parity pass vs real Win11 TM (taskmanpngs/ reference)
 
 Measured the real Task Manager screenshots (taskmanpngs/1..7.png, captured at
