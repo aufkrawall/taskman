@@ -24,7 +24,9 @@ pub const SIDEBAR_W_COLLAPSED: f32 = 54.0;
 
 // ---------------------------------------------------------------- top search
 
-/// Centered search field spanning the top of the window.
+/// Centered search field spanning the top of the window. The blank strip on
+/// either side behaves as an additional native titlebar drag region while the
+/// search box remains a normal interactive text control.
 pub fn top_search_panel(app: &mut TaskManApp, ui_root: &mut egui::Ui, pal: &Palette) {
     egui::Panel::top(egui::Id::new("topsearch"))
         .resizable(false)
@@ -42,6 +44,22 @@ pub fn top_search_panel(app: &mut TaskManApp, ui_root: &mut egui::Ui, pal: &Pale
                 Pos2::new(rect.left() + x, rect.top()),
                 egui::vec2(box_w, 34.0),
             );
+
+            // Register only the blank left/right pieces as drag handles. Do
+            // not put a transparent drag widget over the search box: that
+            // would steal focus, text selection and double-click gestures.
+            let left_drag = Rect::from_min_max(rect.min, Pos2::new(box_rect.left(), rect.bottom()));
+            let right_drag =
+                Rect::from_min_max(Pos2::new(box_rect.right(), rect.top()), rect.max);
+            for (id, drag_rect) in [("top-drag-left", left_drag), ("top-drag-right", right_drag)] {
+                if drag_rect.width() > 0.0 {
+                    let resp = ui.interact(drag_rect, egui::Id::new(id), Sense::drag());
+                    if resp.drag_started() {
+                        ui.ctx().send_viewport_cmd(egui::ViewportCommand::StartDrag);
+                    }
+                }
+            }
+
             ui.painter().rect_filled(box_rect, 16.0, pal.card_bg);
             ui.painter().rect_stroke(
                 box_rect,
@@ -74,8 +92,6 @@ pub fn top_search_panel(app: &mut TaskManApp, ui_root: &mut egui::Ui, pal: &Pale
                     .font(FontId::proportional(15.0))
                     .frame(egui::Frame::NONE)
                     .desired_width(edit_rect.width())
-                    // Stable id so Alt+F / Ctrl+F (audit §5) can focus the
-                    // global search field from anywhere.
                     .id(egui::Id::new("global-search")),
             );
         });
@@ -105,7 +121,6 @@ pub fn sidebar(app: &mut TaskManApp, ui_root: &mut egui::Ui, pal: &Palette) {
                 }),
         )
         .show(ui_root, |ui| {
-            // Hamburger toggle; centered in the rail when collapsed.
             if icon_button(ui, pal, Icon::Hamburger, 32.0, collapsed) {
                 app.shared.settings.sidebar_collapsed = !collapsed;
                 app.shared.settings.save();
@@ -123,7 +138,6 @@ pub fn sidebar(app: &mut TaskManApp, ui_root: &mut egui::Ui, pal: &Palette) {
                 }
             }
 
-            // Bottom: settings gear.
             ui.add_space(ui.available_height() - 36.0);
             let resp = nav_item(
                 ui,
@@ -195,14 +209,8 @@ fn nav_item(
     resp
 }
 
-/// Square icon-only button. `center` centers it in the available width
-/// (collapsed rail) instead of left-aligning a fixed-size square.
 fn icon_button(ui: &mut egui::Ui, pal: &Palette, icon: Icon, size: f32, center: bool) -> bool {
-    let w = if center {
-        ui.available_width().max(size)
-    } else {
-        size
-    };
+    let w = if center { ui.available_width().max(size) } else { size };
     let (rect, resp) = ui.allocate_exact_size(egui::vec2(w, size), Sense::click());
     if resp.hovered() {
         let hover = if center {
@@ -210,8 +218,7 @@ fn icon_button(ui: &mut egui::Ui, pal: &Palette, icon: Icon, size: f32, center: 
         } else {
             rect
         };
-        ui.painter()
-            .rect_filled(hover, 4.0, Color32::from_white_alpha(12));
+        ui.painter().rect_filled(hover, 4.0, Color32::from_white_alpha(12));
     }
     crate::icons::draw_at(
         ui,
@@ -224,8 +231,6 @@ fn icon_button(ui: &mut egui::Ui, pal: &Palette, icon: Icon, size: f32, center: 
 
 // ---------------------------------------------------------------- tab header
 
-/// Per-tab command bar: bold title left; right-aligned command buttons
-/// ("Neuen Task ausführen", tab-specific ones, "…" overflow).
 pub fn tab_header(
     app: &mut TaskManApp,
     ui: &mut egui::Ui,
@@ -251,7 +256,6 @@ pub fn tab_header(
     ui.add_space(2.0);
 }
 
-/// Flat command button with icon + label, Win11 toolbar style.
 pub fn cmd_button(
     ui: &mut egui::Ui,
     pal: &Palette,
@@ -259,9 +263,6 @@ pub fn cmd_button(
     label: &str,
     enabled: bool,
 ) -> bool {
-    // Measure the label instead of guessing per-char widths — the old
-    // chars·7.1 heuristic under/overshot per locale, leaving either dead
-    // padding or text overflowing the hover rect.
     let text_w = ui
         .painter()
         .layout_no_wrap(label.to_owned(), FontId::proportional(13.0), Color32::WHITE)
@@ -278,11 +279,7 @@ pub fn cmd_button(
             clicked = true;
         }
     }
-    let color = if enabled {
-        pal.text
-    } else {
-        pal.text_dim.gamma_multiply(0.55)
-    };
+    let color = if enabled { pal.text } else { pal.text_dim.gamma_multiply(0.55) };
     crate::icons::draw_at(
         ui,
         Rect::from_center_size(
@@ -302,7 +299,6 @@ pub fn cmd_button(
     clicked && enabled
 }
 
-/// Thin vertical separator between button groups.
 pub fn vsep(ui: &mut egui::Ui, pal: &Palette) {
     let (rect, _) = ui.allocate_exact_size(egui::vec2(9.0, 26.0), Sense::hover());
     ui.painter().line_segment(
@@ -314,7 +310,6 @@ pub fn vsep(ui: &mut egui::Ui, pal: &Palette) {
     );
 }
 
-/// The "…" overflow menu (egui handles opening/closing/positioning).
 pub fn ellipsis_menu(
     app: &mut TaskManApp,
     ui: &mut egui::Ui,
@@ -329,8 +324,6 @@ pub fn ellipsis_menu(
 
 // ---------------------------------------------------------------- dialogs
 
-/// Every switch applies instantly AND persists right away (tiny atomic JSON
-/// write, ~1 ms) so a crash can never lose the last change.
 pub fn settings_dialog(app: &mut TaskManApp, ctx: &egui::Context, _pal: &theme::Palette) {
     let mut open = true;
     egui::Window::new(i18n::tr(K::Settings))
@@ -348,10 +341,7 @@ pub fn settings_dialog(app: &mut TaskManApp, ctx: &egui::Context, _pal: &theme::
                     (ThemeMode::Light, K::ThemeLight),
                     (ThemeMode::Dark, K::ThemeDark),
                 ] {
-                    if ui
-                        .selectable_label(app.shared.settings.theme == mode, i18n::tr(key))
-                        .clicked()
-                    {
+                    if ui.selectable_label(app.shared.settings.theme == mode, i18n::tr(key)).clicked() {
                         app.shared.settings.theme = mode;
                         apply_theme(ctx, mode);
                         app.shared.settings.save();
@@ -374,10 +364,7 @@ pub fn settings_dialog(app: &mut TaskManApp, ctx: &egui::Context, _pal: &theme::
                         tm_core::settings::UpdateSpeed::Low => K::SpdLow,
                         tm_core::settings::UpdateSpeed::Paused => K::SpdPaused,
                     };
-                    if ui
-                        .selectable_label(app.shared.settings.update_speed == speed, i18n::tr(key))
-                        .clicked()
-                    {
+                    if ui.selectable_label(app.shared.settings.update_speed == speed, i18n::tr(key)).clicked() {
                         app.shared.settings.update_speed = speed;
                         match speed {
                             tm_core::settings::UpdateSpeed::Paused => app.engine.pause(),
@@ -392,7 +379,6 @@ pub fn settings_dialog(app: &mut TaskManApp, ctx: &egui::Context, _pal: &theme::
             });
 
             ui.add_space(10.0);
-            // ---- language switcher (applies live, persists immediately)
             ui.heading(i18n::tr(K::LanguageLabel));
             ui.horizontal(|ui| {
                 for (choice, label) in [
@@ -400,10 +386,7 @@ pub fn settings_dialog(app: &mut TaskManApp, ctx: &egui::Context, _pal: &theme::
                     (tm_core::i18n::LangChoice::De, "Deutsch"),
                     (tm_core::i18n::LangChoice::En, "English"),
                 ] {
-                    if ui
-                        .selectable_label(app.shared.settings.language == choice, label)
-                        .clicked()
-                    {
+                    if ui.selectable_label(app.shared.settings.language == choice, label).clicked() {
                         app.shared.settings.language = choice;
                         i18n::set_lang(choice.resolve());
                         ctx.send_viewport_cmd(egui::ViewportCommand::Title(
@@ -416,9 +399,7 @@ pub fn settings_dialog(app: &mut TaskManApp, ctx: &egui::Context, _pal: &theme::
 
             ui.add_space(10.0);
             let mut on_top = app.shared.settings.always_on_top;
-            if crate::widgets::controls::checkbox(ui, &mut on_top, i18n::tr(K::AlwaysOnTop), _pal)
-                .changed()
-            {
+            if crate::widgets::controls::checkbox(ui, &mut on_top, i18n::tr(K::AlwaysOnTop), _pal).changed() {
                 app.shared.settings.always_on_top = on_top;
                 ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(if on_top {
                     egui::WindowLevel::AlwaysOnTop
@@ -428,11 +409,6 @@ pub fn settings_dialog(app: &mut TaskManApp, ctx: &egui::Context, _pal: &theme::
                 app.shared.settings.save();
             }
 
-            // Autosave master switch (default on). Toggling it ON writes the
-            // flag itself immediately so the choice survives a crash.
-            // Autosave master switch (default on). Toggling it OFF writes the
-            // flag itself immediately (forced) so the choice survives restart
-            // even though ordinary autosaving stops.
             let mut autosave = app.shared.settings.save_config;
             if crate::widgets::controls::checkbox(
                 ui,
@@ -451,10 +427,7 @@ pub fn settings_dialog(app: &mut TaskManApp, ctx: &egui::Context, _pal: &theme::
             ui.horizontal(|ui| {
                 for secs in [30u32, 60, 120] {
                     if ui
-                        .selectable_label(
-                            app.shared.settings.graph_seconds == secs,
-                            format!("{secs} s"),
-                        )
+                        .selectable_label(app.shared.settings.graph_seconds == secs, format!("{secs} s"))
                         .clicked()
                     {
                         app.shared.settings.graph_seconds = secs;
@@ -473,16 +446,61 @@ pub fn settings_dialog(app: &mut TaskManApp, ctx: &egui::Context, _pal: &theme::
                     (1.1, "110 %"),
                     (1.25, "125 %"),
                 ] {
-                    if ui
-                        .selectable_label((app.shared.settings.ui_zoom - zoom).abs() < 0.01, label)
-                        .clicked()
-                    {
+                    if ui.selectable_label((app.shared.settings.ui_zoom - zoom).abs() < 0.01, label).clicked() {
                         app.shared.settings.ui_zoom = zoom;
                         ctx.set_zoom_factor(zoom);
                         app.shared.settings.save();
                     }
                 }
             });
+
+            #[cfg(target_os = "windows")]
+            {
+                use tm_platform::actions::TaskManagerReplacementState;
+                ui.add_space(14.0);
+                ui.heading("Advanced");
+                let state = app.actions.task_manager_replacement_state();
+                let mut replace = matches!(
+                    state,
+                    TaskManagerReplacementState::Enabled | TaskManagerReplacementState::Stale(_)
+                );
+                if crate::widgets::controls::checkbox(
+                    ui,
+                    &mut replace,
+                    "Replace Windows Task Manager",
+                    _pal,
+                )
+                .changed()
+                {
+                    let actions = app.actions.clone();
+                    app.run_action(
+                        ctx,
+                        || "Task Manager integration requested".to_string(),
+                        move || actions.set_task_manager_replacement(replace),
+                    );
+                }
+                match state {
+                    TaskManagerReplacementState::Stale(_) => {
+                        ui.label(
+                            egui::RichText::new(
+                                "The registered Taskman path is stale. Toggle off/on to repair it.",
+                            )
+                            .size(11.5)
+                            .color(_pal.text_dim),
+                        );
+                    }
+                    TaskManagerReplacementState::Conflict(value) => {
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "Another application currently replaces Task Manager: {value}"
+                            ))
+                            .size(11.5)
+                            .color(_pal.text_dim),
+                        );
+                    }
+                    _ => {}
+                }
+            }
 
             ui.add_space(14.0);
             ui.separator();
@@ -493,14 +511,10 @@ pub fn settings_dialog(app: &mut TaskManApp, ctx: &egui::Context, _pal: &theme::
                     ctx.set_zoom_factor(defaults.ui_zoom);
                     app.engine.resume();
                     app.engine.set_interval(defaults.update_speed.interval());
-                    // Language follows System again after a reset.
                     i18n::set_lang(defaults.language.resolve());
                     ctx.send_viewport_cmd(egui::ViewportCommand::Title(
                         i18n::tr(K::WindowTitle).to_string(),
                     ));
-                    // Resetting preferences must not flip the user's
-                    // autosave choice; an explicit Reset persists regardless
-                    // of the gate (implement.md §17.2).
                     let keep_autosave = app.shared.settings.save_config;
                     app.shared.settings = defaults;
                     app.shared.settings.save_config = keep_autosave;
@@ -548,7 +562,6 @@ pub fn run_task_dialog(app: &mut TaskManApp, ctx: &egui::Context, _pal: &theme::
                 if ui.button(i18n::tr(K::Cancel)).clicked() {
                     app.run_dialog_open = false;
                 }
-                // Browse for an executable/document to run.
                 if ui.button(i18n::tr(K::Browse)).clicked()
                     && let Some(path) = rfd::FileDialog::new().pick_file()
                 {
@@ -558,26 +571,20 @@ pub fn run_task_dialog(app: &mut TaskManApp, ctx: &egui::Context, _pal: &theme::
                 if (ui.button(i18n::tr(K::Ok)).clicked() || enter)
                     && !app.run_dialog_text.trim().is_empty()
                 {
-                    // Launch (including the brief failure-probe wait) happens on
-                    // a worker thread; the dialog closes immediately.
                     let actions = app.actions.clone();
                     let cmdline = app.run_dialog_text.trim().to_string();
                     let elevated = app.run_elevated;
                     let toasts = app.shared.toasts.clone();
-                    let spawned =
-                        std::thread::Builder::new()
-                            .name("tm-run".into())
-                            .spawn(move || {
-                                // Worker thread: the brief wait that surfaces
-                                // immediate launch failures lives here, not on
-                                // the UI path (§18.1).
-                                let result = actions.run_new_task_probe(&cmdline, elevated);
-                                let msg = match result {
-                                    Ok(()) => i18n::trf(K::StartedMsg, &[&cmdline]),
-                                    Err(e) => i18n::trf(K::ErrMsg, &[&e.to_string()]),
-                                };
-                                crate::app::toast_from(&toasts, msg);
-                            });
+                    let spawned = std::thread::Builder::new()
+                        .name("tm-run".into())
+                        .spawn(move || {
+                            let result = actions.run_new_task_probe(&cmdline, elevated);
+                            let msg = match result {
+                                Ok(()) => i18n::trf(K::StartedMsg, &[&cmdline]),
+                                Err(e) => i18n::trf(K::ErrMsg, &[&e.to_string()]),
+                            };
+                            crate::app::toast_from(&toasts, msg);
+                        });
                     if spawned.is_err() {
                         app.shared.toast(i18n::tr(K::LaunchFailed));
                     }
@@ -593,8 +600,6 @@ pub fn run_task_dialog(app: &mut TaskManApp, ctx: &egui::Context, _pal: &theme::
 pub fn draw_toasts(app: &TaskManApp, ctx: &egui::Context) {
     let mut toasts = tm_core::sync::lock(&app.shared.toasts);
     toasts.retain(|t| t.born.elapsed() < crate::app::TOAST_TTL);
-    // Stable ids keep egui layout state across frames; the fade animation is
-    // the only reason for timed repaints here.
     let mut y_offset = 0.0f32;
     for toast in toasts.iter() {
         let age = toast.born.elapsed().as_secs_f32();
