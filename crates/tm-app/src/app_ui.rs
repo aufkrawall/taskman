@@ -34,7 +34,7 @@ pub fn top_search_panel(app: &mut TaskManApp, ui_root: &mut egui::Ui, pal: &Pale
                 .inner_margin(egui::Margin::symmetric(0, 6)),
         )
         .show(ui_root, |ui| {
-            let box_w = 560.0f32.min(ui.available_width() * 0.7);
+            let box_w = 495.0f32.min(ui.available_width() * 0.7);
             let x = (ui.available_width() - box_w) / 2.0;
             let (rect, _) =
                 ui.allocate_exact_size(egui::vec2(ui.available_width(), 34.0), Sense::hover());
@@ -63,11 +63,15 @@ pub fn top_search_panel(app: &mut TaskManApp, ui_root: &mut egui::Ui, pal: &Pale
                 Pos2::new(box_rect.left() + 34.0, box_rect.top() + 3.0),
                 Pos2::new(box_rect.right() - 10.0, box_rect.bottom() - 3.0),
             );
-            let mut edit_ui = ui.new_child(egui::UiBuilder::new().max_rect(edit_rect));
+            let mut edit_ui = ui.new_child(
+                egui::UiBuilder::new()
+                    .max_rect(edit_rect)
+                    .layout(egui::Layout::left_to_right(egui::Align::Center)),
+            );
             edit_ui.add(
                 egui::TextEdit::singleline(&mut app.search)
                     .hint_text(i18n::tr(K::SearchHint))
-                    .font(FontId::proportional(12.5))
+                    .font(FontId::proportional(15.0))
                     .frame(egui::Frame::NONE)
                     .desired_width(edit_rect.width()),
             );
@@ -143,7 +147,7 @@ fn nav_item(
     selected: bool,
     collapsed: bool,
 ) -> egui::Response {
-    let h = 34.0;
+    let h = 38.0;
     let (rect, resp) = ui.allocate_exact_size(
         egui::vec2(ui.available_width(), h),
         Sense::click().union(Sense::hover()),
@@ -160,8 +164,8 @@ fn nav_item(
             }),
         );
         let bar = Rect::from_min_size(
-            Pos2::new(rect.left(), rect.center().y - 10.0),
-            egui::vec2(3.0, 20.0),
+            Pos2::new(rect.left(), rect.center().y - 9.0),
+            egui::vec2(3.0, 18.0),
         );
         painter.rect_filled(bar, 2.0, pal.accent);
     } else if resp.hovered() {
@@ -181,7 +185,7 @@ fn nav_item(
             Pos2::new(rect.left() + 42.0, rect.center().y),
             Align2::LEFT_CENTER,
             label,
-            FontId::proportional(12.5),
+            FontId::proportional(15.0),
             pal.text,
         );
     }
@@ -257,7 +261,7 @@ pub fn cmd_button(
     // padding or text overflowing the hover rect.
     let text_w = ui
         .painter()
-        .layout_no_wrap(label.to_owned(), FontId::proportional(12.5), Color32::WHITE)
+        .layout_no_wrap(label.to_owned(), FontId::proportional(13.0), Color32::WHITE)
         .size()
         .x;
     let w = 28.0 + text_w + 6.0;
@@ -289,7 +293,7 @@ pub fn cmd_button(
         Pos2::new(rect.left() + 28.0, rect.center().y),
         Align2::LEFT_CENTER,
         label,
-        FontId::proportional(12.5),
+        FontId::proportional(13.0),
         color,
     );
     clicked && enabled
@@ -605,7 +609,7 @@ pub fn draw_toasts(app: &TaskManApp, ctx: &egui::Context) {
                         ui.set_max_width(380.0);
                         ui.label(
                             egui::RichText::new(&toast.msg)
-                                .size(12.5)
+                                .size(13.0)
                                 .color(Color32::from_white_alpha(alpha)),
                         );
                     });

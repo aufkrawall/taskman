@@ -268,7 +268,7 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
             ui.add_space(16.0);
             ui.label(
                 egui::RichText::new(format!("\"{}\"", app.details_state.filter))
-                    .size(12.5)
+                    .size(13.0)
                     .color(pal.accent),
             );
             if ui
@@ -346,7 +346,7 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
                     egui::Pos2::new(name_rect.left() + 56.0, rect.center().y),
                     egui::Align2::LEFT_CENTER,
                     &row.name,
-                    egui::FontId::proportional(12.5),
+                    egui::FontId::proportional(tablekit::FONT_ROW),
                     pal.text,
                 );
 
@@ -360,7 +360,7 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
                     egui::Pos2::new(mem_rect.right() - 10.0, rect.center().y),
                     egui::Align2::RIGHT_CENTER,
                     &row.mem_s,
-                    egui::FontId::proportional(12.5),
+                    egui::FontId::proportional(tablekit::FONT_ROW),
                     pal.text,
                 );
                 table.text_cell(ui, avail, rect, 6, row.platform, &pal, false);
@@ -497,7 +497,7 @@ fn build_rows(
 pub fn context_menu(app: &mut TaskManApp, ui: &mut egui::Ui, p: &ProcessEntry) {
     let ctx = ui.ctx().clone();
     ui.set_min_width(230.0);
-    ui.label(egui::RichText::new(p.shown_name()).strong().size(12.5));
+    ui.label(egui::RichText::new(p.shown_name()).strong().size(13.0));
     ui.separator();
 
     if ui.button(i18n::tr(K::CopyName)).clicked() {
@@ -738,7 +738,7 @@ pub fn process_properties_dialog(app: &mut TaskManApp, ctx: &egui::Context) {
                     egui::ScrollArea::horizontal()
                         .id_salt("proc-path-ro")
                         .show(ui, |ui| {
-                            ui.label(egui::RichText::new(&path).size(12.5).monospace());
+                            ui.label(egui::RichText::new(&path).size(13.0).monospace());
                         });
                     if ui.button(i18n::tr(K::CopyName)).clicked() {
                         ui.ctx().copy_text(path.clone());

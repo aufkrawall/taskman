@@ -285,8 +285,8 @@ fn card_ui(
     // drawn unclipped, so long adapter names would bleed past the card.
     let tx = rect.left() + 84.0;
     let max_text_w = rect.right() - 8.0 - tx;
-    let title_font = FontId::proportional(13.5);
-    let small_font = FontId::proportional(11.5);
+    let title_font = FontId::proportional(17.0);
+    let small_font = FontId::proportional(13.0);
     ui.painter().text(
         Pos2::new(tx, rect.top() + 13.0),
         Align2::LEFT_CENTER,
@@ -528,19 +528,19 @@ fn gpu_series(win: &[HistoryPoint], key: &str, idx: usize) -> Vec<f64> {
 /// Page title row: big name left, detail right.
 fn page_title(ui: &mut egui::Ui, pal: &Palette, title: &str, right: &str) {
     let (rect, _) =
-        ui.allocate_exact_size(egui::vec2(ui.available_width(), 40.0), egui::Sense::hover());
+        ui.allocate_exact_size(egui::vec2(ui.available_width(), 44.0), egui::Sense::hover());
     ui.painter().text(
         Pos2::new(rect.left() + GUTTER, rect.center().y),
         Align2::LEFT_CENTER,
         title,
-        FontId::proportional(26.0),
+        FontId::proportional(31.0),
         pal.text,
     );
     ui.painter().text(
         Pos2::new(rect.right() - GUTTER, rect.center().y),
         Align2::RIGHT_CENTER,
         right,
-        FontId::proportional(14.0),
+        FontId::proportional(17.0),
         pal.text,
     );
 }
@@ -567,20 +567,20 @@ fn caption(ui: &mut egui::Ui, pal: &Palette, left: &str, right: &str) {
 
 /// Big-value stat (label above, large number below).
 fn big_stat(ui: &mut egui::Ui, pal: &Palette, label: &str, value: &str, w: f32) {
-    let (rect, _) = ui.allocate_exact_size(egui::vec2(w, 46.0), egui::Sense::hover());
-    let label_font = FontId::proportional(11.5);
-    let value_font = FontId::proportional(21.0);
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(w, 56.0), egui::Sense::hover());
+    let label_font = FontId::proportional(13.0);
+    let value_font = FontId::proportional(23.0);
     let label = ellipsize(ui, label, &label_font, w - 4.0);
     let value = ellipsize(ui, value, &value_font, w - 4.0);
     ui.painter().text(
-        Pos2::new(rect.left(), rect.top() + 8.0),
+        Pos2::new(rect.left(), rect.top() + 9.0),
         Align2::LEFT_CENTER,
         &label,
         label_font,
         pal.text_dim,
     );
     ui.painter().text(
-        Pos2::new(rect.left(), rect.bottom() - 8.0),
+        Pos2::new(rect.left(), rect.bottom() - 12.0),
         Align2::LEFT_CENTER,
         &value,
         value_font,
@@ -590,20 +590,20 @@ fn big_stat(ui: &mut egui::Ui, pal: &Palette, label: &str, value: &str, w: f32) 
 
 /// Medium stat (label above, medium number below).
 fn med_stat(ui: &mut egui::Ui, pal: &Palette, label: &str, value: &str, w: f32) {
-    let (rect, _) = ui.allocate_exact_size(egui::vec2(w, 40.0), egui::Sense::hover());
-    let label_font = FontId::proportional(11.5);
-    let value_font = FontId::proportional(16.0);
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(w, 48.0), egui::Sense::hover());
+    let label_font = FontId::proportional(13.0);
+    let value_font = FontId::proportional(23.0);
     let label = ellipsize(ui, label, &label_font, w - 4.0);
     let value = ellipsize(ui, value, &value_font, w - 4.0);
     ui.painter().text(
-        Pos2::new(rect.left(), rect.top() + 8.0),
+        Pos2::new(rect.left(), rect.top() + 9.0),
         Align2::LEFT_CENTER,
         &label,
         label_font,
         pal.text_dim,
     );
     ui.painter().text(
-        Pos2::new(rect.left(), rect.bottom() - 8.0),
+        Pos2::new(rect.left(), rect.bottom() - 12.0),
         Align2::LEFT_CENTER,
         &value,
         value_font,
@@ -616,9 +616,9 @@ fn med_stat(ui: &mut egui::Ui, pal: &Palette, label: &str, value: &str, w: f32) 
 /// collide with the value and long values stay inside the page gutter.
 fn kv_row(ui: &mut egui::Ui, pal: &Palette, key: &str, value: &str) {
     let (rect, _) =
-        ui.allocate_exact_size(egui::vec2(ui.available_width(), 21.0), egui::Sense::hover());
-    let key_font = FontId::proportional(12.5);
-    let value_font = FontId::proportional(12.5);
+        ui.allocate_exact_size(egui::vec2(ui.available_width(), 23.0), egui::Sense::hover());
+    let key_font = FontId::proportional(13.0);
+    let value_font = FontId::proportional(13.0);
     let value_x = rect.left() + 190.0;
     let key = ellipsize(ui, key, &key_font, 190.0 - 8.0);
     let value = ellipsize(ui, value, &value_font, rect.right() - GUTTER - value_x);

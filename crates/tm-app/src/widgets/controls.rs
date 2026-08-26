@@ -40,7 +40,7 @@ pub fn checkbox_enabled(
         0.0
     } else {
         ui.painter()
-            .layout_no_wrap(text.to_owned(), FontId::proportional(12.5), Color32::WHITE)
+            .layout_no_wrap(text.to_owned(), FontId::proportional(13.0), Color32::WHITE)
             .size()
             .x
     };
@@ -127,7 +127,7 @@ pub fn checkbox_enabled(
             Pos2::new(box_rect.right() + spacing, rect.center().y),
             egui::Align2::LEFT_CENTER,
             text,
-            FontId::proportional(12.5),
+            FontId::proportional(13.0),
             color,
         );
     }
