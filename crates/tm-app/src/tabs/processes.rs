@@ -230,6 +230,7 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
 
     let agg = Aggregates::from_snapshot(&snap);
     let aggs = agg.strings();
+    prepare_auto_fit_widths(ui, &mut table, &rows, &aggs);
 
     let avail = tablekit::table_avail(ui);
     let clicked = tablekit::scrolled_rows(
@@ -266,6 +267,54 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
     }
     app.persist_table(&table);
     app.processes_state.cache = cache;
+}
+
+/// Intrinsic widths come from the complete flattened display model, never
+/// the virtualized visible range. This makes separator double-click stable
+/// regardless of scroll position and accounts for tree indentation/icons.
+fn prepare_auto_fit_widths(
+    ui: &egui::Ui,
+    table: &mut tablekit::TmTable,
+    rows: &[DisplayRow],
+    aggs: &[String; 4],
+) {
+    let header = |i: usize| tablekit::text_width(ui, table.cols[i].label, tablekit::FONT_HDR_LABEL) + 28.0;
+    let mut widths = (0..table.cols.len()).map(header).collect::<Vec<_>>();
+
+    for row in rows {
+        let DisplayRow::Process(row) = row else { continue };
+        widths[0] = widths[0].max(
+            tablekit::text_width(ui, &row.name, tablekit::FONT_ROW)
+                + 66.0
+                + row.depth as f32 * 22.0,
+        );
+        if row.suspended {
+            widths[1] = widths[1].max(
+                tablekit::text_width(ui, i18n::tr(K::StSuspended), tablekit::FONT_ROW) + 42.0,
+            );
+        }
+        let values = [
+            format::format_pct_cell(row.values[0].min(100.0) as f32),
+            format::format_mb(row.values[1] as u64),
+            format::format_rate_mb(row.values[2]),
+            if row.net_available {
+                format::format_mbit(row.values[3])
+            } else {
+                "—".to_string()
+            },
+        ];
+        for (i, text) in values.iter().enumerate() {
+            widths[i + 2] = widths[i + 2]
+                .max(tablekit::text_width(ui, text, tablekit::FONT_ROW) + 22.0);
+        }
+    }
+    for (i, agg) in aggs.iter().enumerate() {
+        widths[i + 2] = widths[i + 2]
+            .max(tablekit::text_width(ui, agg, tablekit::FONT_AGG) + 36.0);
+    }
+    for (i, width) in widths.into_iter().enumerate() {
+        table.set_auto_fit_width(i, width.ceil());
+    }
 }
 
 /// Collapsible group header ("Apps (5)") at standard row height so the list
@@ -346,7 +395,7 @@ fn row_ui(
         pal.accent,
     );
     let name_rect = table.col_rect(0, rect);
-    ui.painter().text(
+    ui.painter_at(name_rect).text(
         egui::Pos2::new(
             name_rect.left() + 56.0 + row.depth as f32 * 22.0,
             rect.center().y,
@@ -433,8 +482,6 @@ fn context_menu(app: &mut TaskManApp, ui: &mut egui::Ui, row: &RowData) {
         ui.close();
     }
     if ui.button(i18n::tr(K::GoToDetails)).clicked() {
-        // Exact-identity navigation, not a text filter that could match a
-        // same-named different process (§11.5).
         app.pending_details_focus = Some(crate::app::PendingDetailsFocus(
             crate::app::ProcessIdentity {
                 pid: row.pid,
@@ -467,8 +514,6 @@ fn context_menu(app: &mut TaskManApp, ui: &mut egui::Ui, row: &RowData) {
     }
 }
 
-/// Kill a process after validating its creation identity against the live
-/// snapshot, so a recycled PID can never be targeted by mistake (§19.2).
 fn end_process_checked(
     app: &mut TaskManApp,
     ctx: &egui::Context,
@@ -497,10 +542,6 @@ fn end_process_checked(
     );
 }
 
-// ---------------------------------------------------------------- row model
-
-/// Build the visible flattened row list: three TM groups, each an
-/// arbitrary-depth tree, sorted per column with subtree aggregates.
 fn build_display_rows(
     snap: &Snapshot,
     raw_search: &str,
@@ -510,19 +551,12 @@ fn build_display_rows(
     group_collapsed: &[bool; 3],
 ) -> Vec<DisplayRow> {
     let q = search::Query::new(raw_search);
-
-    // ---- classification into exactly three groups --------------------------
-    // The sampler already assigns ProcCategory (App/Background/System); the
-    // UI must keep System separate from Background (§11.4).
     let all: Vec<&ProcessEntry> = snap.processes.iter().collect();
     let children_all = children_map(&all);
     let (subtree, subtree_count) = subtree_values_and_counts(&all, &children_all);
-
     let mut out = Vec::new();
 
     if !q.is_empty() {
-        // Search: flat list of direct matches (name/display/PID/publisher)
-        // across all groups (audit §5).
         let mut matched: Vec<&ProcessEntry> = all
             .iter()
             .copied()
@@ -544,9 +578,6 @@ fn build_display_rows(
         };
         let members: Vec<&ProcessEntry> =
             all.iter().copied().filter(|p| p.category == cat).collect();
-        // Group TOTALS derive from the classification model itself, NOT from
-        // the flattened emission below — expansion must never change them
-        // (audit P0.4).
         let total = members.len();
         out.push(DisplayRow::GroupHeader(gi, total));
         if group_collapsed[gi as usize] {
@@ -576,10 +607,6 @@ fn build_display_rows(
     out
 }
 
-/// Normalize every row's heat intensities against per-column maxima taken
-/// over ALL flattened rows (audit P0.2) — done BEFORE virtualization, so
-/// page size / scroll position cannot influence highlighting. Network data
-/// participates only where the platform reports real telemetry.
 fn normalize_heat(rows: &mut [DisplayRow]) {
     let mut max = [0.0f64; 4];
     for r in rows.iter() {
@@ -602,7 +629,6 @@ fn normalize_heat(rows: &mut [DisplayRow]) {
     }
 }
 
-/// Flat row for search results (no tree decoration).
 fn make_flat_row(p: &ProcessEntry, subtree: &HashMap<u32, [f64; 4]>) -> DisplayRow {
     DisplayRow::Process(RowData {
         pid: p.pid,
@@ -636,12 +662,6 @@ fn children_map<'a>(list: &[&'a ProcessEntry]) -> HashMap<u32, Vec<&'a ProcessEn
     m
 }
 
-/// Emit one group's tree iteratively with arbitrary depth and a visited set
-/// guarding against corrupt/self-referential ancestry (§11.2).
-///
-/// Grouped labels report the WHOLE subtree process count (audit P0.5):
-/// `Brave Browser (43)` counts every descendant, computed in one O(n) pass
-/// by [`subtree_aggregates`], not just direct children.
 #[allow(clippy::too_many_arguments)]
 fn emit_tree<'a>(
     out: &mut Vec<DisplayRow>,
@@ -655,18 +675,12 @@ fn emit_tree<'a>(
 ) {
     let mut sorted_roots: Vec<&ProcessEntry> = roots.to_vec();
     sort_entries(&mut sorted_roots, sort_col, ascending, subtree);
-
-    // Stack entries: (process, depth). Children are pushed in reverse so the
-    // first child pops next, preserving display order.
     let mut stack: Vec<(&ProcessEntry, usize)> =
         sorted_roots.iter().rev().map(|&r| (r, 0usize)).collect();
     let mut visited: HashSet<u32> = HashSet::new();
-    // Sibling lists are pre-sorted once per parent to keep the stack simple.
     let mut sorted_children: HashMap<u32, Vec<&ProcessEntry>> = HashMap::new();
 
     while let Some((proc, depth)) = stack.pop() {
-        // Cycle guard: a pid appearing twice in one emission path would loop
-        // forever; treat the second arrival as a leaf.
         if !visited.insert(proc.pid) {
             continue;
         }
@@ -679,8 +693,6 @@ fn emit_tree<'a>(
             })
             .clone();
         let has_children = !kids.is_empty();
-        // Whole-subtree grouping count (>1 processes grouped under this
-        // parent), independent of which descendants happen to be expanded.
         let count = subtree_count.get(&proc.pid).copied().unwrap_or(1);
         let name = if count > 1 {
             format!("{} ({})", proc.shown_name(), count)
@@ -711,12 +723,6 @@ fn emit_tree<'a>(
     }
 }
 
-/// Aggregate cpu/mem/disk/net AND the number of processes (including self)
-/// over each process and ALL its descendants in O(n): iterative post-order
-/// with memoization and cycle guards (§11.3). The gray-set cycle guard
-/// makes corrupt ancestry cycles TERMINATE: a back-edge to a gray node is
-/// skipped instead of re-entering, so the stack stays bounded by n + edges
-/// (without it the cycle 1→2→1 re-pushed Enter frames forever and ate RAM).
 fn subtree_values_and_counts<'a>(
     all: &[&'a ProcessEntry],
     children: &HashMap<u32, Vec<&'a ProcessEntry>>,
@@ -737,8 +743,6 @@ fn subtree_values_and_counts<'a>(
         Enter(u32),
         Combine(u32, Vec<&'b ProcessEntry>, [f64; 4]),
     }
-    // `done` = fully aggregated (black); `in_progress` = on the current
-    // traversal path (gray).
     let mut done: HashSet<u32> = HashSet::with_capacity(all.len());
     let mut in_progress: HashSet<u32> = HashSet::with_capacity(all.len());
 
@@ -756,9 +760,6 @@ fn subtree_values_and_counts<'a>(
                             for i in 0..4 {
                                 acc[i] += v[i];
                             }
-                            // A child skipped as part of a corrupt cycle
-                            // contributes its own values but may lack a
-                            // count; default 1 covers that case.
                             cnt += counts.get(&k.pid).copied().unwrap_or(1);
                         }
                     }
@@ -768,9 +769,6 @@ fn subtree_values_and_counts<'a>(
                     in_progress.remove(&pid);
                 }
                 Frame::Enter(pid) => {
-                    // Black: aggregated already. Gray: back-edge into the
-                    // active path — a corrupt cycle; skip (the ancestor's
-                    // Combine falls back to that child's own values).
                     if done.contains(&pid) || in_progress.contains(&pid) {
                         continue;
                     }
@@ -796,7 +794,6 @@ fn subtree_values_and_counts<'a>(
                         done.insert(pid);
                         in_progress.remove(&pid);
                     } else {
-                        // Revisit after descendants complete.
                         stack.push(Frame::Combine(pid, kids, own(p)));
                         for k in pending {
                             stack.push(Frame::Enter(k.pid));
@@ -815,7 +812,6 @@ fn subtree_values_and_counts<'a>(
 
 fn sort_entries(v: &mut [&ProcessEntry], col: usize, asc: bool, subtree: &HashMap<u32, [f64; 4]>) {
     let sv = |p: &ProcessEntry, i: usize| subtree.get(&p.pid).map_or(0.0, |s| s[i]);
-    // Normalized names are compared without allocating per comparison.
     v.sort_by(|a, b| {
         let o = match col {
             2 => sv(a, 0)
@@ -836,7 +832,6 @@ fn sort_entries(v: &mut [&ProcessEntry], col: usize, asc: bool, subtree: &HashMa
     });
 }
 
-/// Case-insensitive ordering without per-comparison allocation.
 fn cmp_ignore_case(a: &str, b: &str) -> std::cmp::Ordering {
     let mut ai = a.chars().flat_map(char::to_lowercase);
     let mut bi = b.chars().flat_map(char::to_lowercase);
@@ -866,8 +861,6 @@ mod tests {
         p
     }
 
-    /// Count of process rows directly under the Nth GroupHeader row
-    /// (headers interleave with their groups' members).
     fn members_under(rows: &[DisplayRow], nth_header: usize) -> Option<usize> {
         let start = rows
             .iter()
@@ -908,12 +901,7 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(
-            headers,
-            vec![(0, 1), (1, 1), (2, 1)],
-            "three distinct group headers"
-        );
-        // Members live BETWEEN the group headers.
+        assert_eq!(headers, vec![(0, 1), (1, 1), (2, 1)]);
         assert_eq!(
             (
                 members_under(&rows, 0),
@@ -924,12 +912,8 @@ mod tests {
         );
     }
 
-    /// Regression (audit P0.4): expanding/collapsing trees must never change
-    /// group header totals — they count the classification model, not the
-    /// flattened emission.
     #[test]
     fn group_totals_are_independent_of_expansion_state() {
-        // App chain 1→2→3 plus background root 4.
         let snap = snap_of(vec![
             proc(1, None, "app", ProcCategory::App),
             proc(2, Some(1), "child", ProcCategory::App),
@@ -940,7 +924,6 @@ mod tests {
         let mut expanded = HashSet::new();
         expanded.insert(1u32);
         expanded.insert(2u32);
-
         let collapsed_rows = build_display_rows(&snap, "", 0, true, &HashSet::new(), &groups);
         let expanded_rows = build_display_rows(&snap, "", 0, true, &expanded, &groups);
         let header_total = |rows: &[DisplayRow]| -> usize {
@@ -951,13 +934,8 @@ mod tests {
                 })
                 .unwrap()
         };
-        assert_eq!(header_total(&collapsed_rows), 3, "Apps totals all members");
-        assert_eq!(
-            header_total(&expanded_rows),
-            header_total(&collapsed_rows),
-            "expansion must not change Apps (N)"
-        );
-        // And a collapsed GROUP HEADER still reports the full count.
+        assert_eq!(header_total(&collapsed_rows), 3);
+        assert_eq!(header_total(&expanded_rows), header_total(&collapsed_rows));
         let groups_closed = [true, false, false];
         let closed = build_display_rows(&snap, "", 0, true, &HashSet::new(), &groups_closed);
         assert_eq!(header_total(&closed), 3);
@@ -982,12 +960,11 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(depths, vec![0, 1, 2, 3], "arbitrary depth emitted");
+        assert_eq!(depths, vec![0, 1, 2, 3]);
     }
 
     #[test]
     fn process_tree_cycle_terminates() {
-        // Malformed ancestry: 2 -> 1 -> 2 ...
         let snap = snap_of(vec![
             proc(1, Some(2), "a", ProcCategory::Background),
             proc(2, Some(1), "b", ProcCategory::Background),
@@ -1006,17 +983,12 @@ mod tests {
             .collect();
         assert_eq!(
             procs.len(),
-            procs.iter().collect::<std::collections::HashSet<_>>().len(),
-            "no duplicate emission under cycles"
+            procs.iter().collect::<std::collections::HashSet<_>>().len()
         );
     }
 
-    /// Regression (audit P0.5): grouped labels show the WHOLE subtree
-    /// process count ("Brave Browser (43)" style), not direct children only.
     #[test]
     fn grouped_label_counts_entire_subtree() {
-        // Chain 1→2→3→4: expanding ONLY the root previously labeled it (2)
-        // from kids.len()+1; it must read (4).
         let snap = snap_of(vec![
             proc(1, None, "Brave", ProcCategory::App),
             proc(2, Some(1), "Child", ProcCategory::App),
@@ -1034,9 +1006,7 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(labels[0], "Brave (4)", "root label spans whole subtree");
-        // Subtree count works even while fully collapsed (only the parent
-        // row is emitted, still carrying the total).
+        assert_eq!(labels[0], "Brave (4)");
         let collapsed = build_display_rows(&snap, "", 0, true, &HashSet::new(), &groups);
         let collapsed_labels: Vec<&str> = collapsed
             .iter()
@@ -1046,8 +1016,6 @@ mod tests {
             })
             .collect();
         assert_eq!(collapsed_labels[0], "Brave (4)");
-        // O(n) counts land per node too.
-        // The mid node keeps its own subtree count as well.
         let mut e2 = HashSet::new();
         e2.insert(1u32);
         e2.insert(2u32);
@@ -1073,21 +1041,15 @@ mod tests {
         let all: Vec<&ProcessEntry> = snap.processes.iter().collect();
         let children = children_map(&all);
         let (st, cnt) = subtree_values_and_counts(&all, &children);
-        // root = own + mid + leaf = cpu 1+2+3 = 6, mem 6000
         assert_eq!(st[&1][0], 6.0);
         assert_eq!(st[&1][1], 6000.0);
         assert_eq!(st[&2][0], 5.0);
         assert_eq!(st[&3][0], 3.0);
-        // Counts include self: leaf 1, mid 2, root 3.
         assert_eq!((cnt[&3], cnt[&2], cnt[&1]), (1, 2, 3));
     }
 
-    /// Regression (audit P0.2): heat intensities are normalized against
-    /// per-column maxima over ALL rows — not "any nonzero = 1.0" within a
-    /// row, which used to light dozens of top-consumer cells at once.
     #[test]
     fn heat_normalizes_per_column_across_the_whole_model() {
-        // Two background processes with very different CPU/memory.
         let mut heavy = proc(10, None, "heavy.exe", ProcCategory::Background);
         heavy.cpu_pct = 90.0;
         heavy.mem_bytes = 800_000_000;
@@ -1115,20 +1077,15 @@ mod tests {
                 _ => None,
             })
             .collect();
-
-        // Only ONE row may be the CPU column's top consumer...
         assert_eq!(
             heat.iter().filter(|h| h[0] >= 1.0 - f32::EPSILON).count(),
-            1,
-            "exactly one CPU top consumer"
+            1
         );
         assert_eq!(
             heat.iter().filter(|h| h[1] >= 1.0 - f32::EPSILON).count(),
-            1,
-            "exactly one memory top consumer"
+            1
         );
-        // ...and normalization must rank heavy > light > zero.
-        assert!(heat[0][0] > heat[1][0], "intensity follows magnitude");
+        assert!(heat[0][0] > heat[1][0]);
         assert!(heat[1][0] > heat[2][0] || heat[2][0] == 0.0);
     }
 
@@ -1148,9 +1105,8 @@ mod tests {
                 _ => None,
             })
             .unwrap();
-        assert!(!d.net_available, "unavailability must be preserved");
-        assert_eq!(d.heat[3], 0.0, "no fabricated network heat");
-        // The renderer maps !net_available to "—"; verify the flag drives it.
+        assert!(!d.net_available);
+        assert_eq!(d.heat[3], 0.0);
         assert_eq!(
             if d.net_available {
                 format::format_mbit(d.values[3])
@@ -1161,8 +1117,6 @@ mod tests {
         );
     }
 
-    /// Global search matches binary name, display name, PID and publisher
-    /// (audit §5).
     #[test]
     fn search_matches_pid_and_publisher() {
         let mut p = ProcessEntry::new(4242, "codestrings.exe");
@@ -1177,7 +1131,6 @@ mod tests {
                 .count();
             assert_eq!(n, 1, "query '{q}' must find the process");
         }
-        // And a miss misses.
         let rows = build_display_rows(
             &snap_of(snap.processes.clone()),
             "zzz-not-there",
