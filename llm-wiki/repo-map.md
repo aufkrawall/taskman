@@ -1,6 +1,6 @@
 # Repo Map (code map)
 
-Last cross-checked: 2026-08-25
+Last cross-checked: 2026-08-27
 
 Primary sources:
 - workspace tree (verified against working tree)
@@ -42,11 +42,13 @@ Rust workspace, three crates in a strict dependency chain
     (TaskManApp: engine starts AFTER first frame, event-driven repaints,
     action executor, toast ids, demand updates per tab), `app_ui.rs`
     (chrome + dialogs incl. settings), `tabs/*` (processes/details/users/
-    services/startup/apphistory/performance), `widgets/tablekit.rs`
-    (TM-style tables: drag-start-width resize math, O(1) layout,
-    `scrolled_rows` virtualization), `widgets/chart.rs` (timestamp-aware
-    charts, kernel overlay), `icon_cache.rs` (lazy worker, upload budget,
-    bounded LRU), `fonts.rs` (async system-font load after first frame),
+    services/startup/apphistory/performance; Processes derives a presentation
+    ownership topology from window owners and shell-launch boundaries rather
+    than treating raw PPID as UI ownership), `widgets/tablekit.rs` (TM-style
+    tables: drag-start-width resize math, O(1) layout, `scrolled_rows`
+    virtualization), `widgets/chart.rs` (timestamp-aware charts, kernel
+    overlay), `icon_cache.rs` (lazy worker, upload budget, bounded LRU),
+    `fonts.rs` (async system-font load after first frame),
     `action_executor.rs`.
 
 ## Important Support and Output Paths
@@ -74,6 +76,11 @@ Rust workspace, three crates in a strict dependency chain
   Resize handles are registered after ALL header cells so they win hit
   testing across their full ±6 px; double-click restore is detected via
   input state because drag-only widgets never receive click flags.
+- `crates/tm-app/src/tabs/processes.rs` — Processes UI intentionally uses a
+  presentation-only app tree: Explorer/common shells are launch boundaries,
+  independently discovered windowed app roots are detached from raw PPID,
+  and aggregates follow that display topology. Do not collapse this back to
+  a literal PPID tree; raw `ProcessEntry.ppid` remains OS truth elsewhere.
 
 ## Test Matrix
 

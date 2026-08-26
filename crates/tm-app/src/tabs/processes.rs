@@ -5,11 +5,15 @@
 //! height virtualizer, so row count does not affect frame cost.
 //!
 //! Correctness notes from the 2026 audit:
-//! * Group header counts (`Apps (5)`) come from the unflattened process
-//!   classification model — expanding/collapsing trees can never change
-//!   them (P0.4).
-//! * Grouped labels like `Brave Browser (43)` report the WHOLE subtree
-//!   process count, computed in one O(n) pass, not direct children (P0.5).
+//! * App rows are presentation groups, not raw parent-process trees. Shell
+//!   launchers such as Explorer do not absorb programs the user launched;
+//!   each visible app family is promoted to its own top-level row.
+//! * Group header counts never depend on expansion state (P0.4). Apps counts
+//!   top-level app groups like native Task Manager; Background/Windows count
+//!   their unflattened process members.
+//! * Grouped labels like `Brave Browser (43)` report the WHOLE display
+//!   subtree process count, computed in one O(n) pass, not direct children
+//!   (P0.5).
 //! * Heat intensities are normalized per COLUMN over the whole display
 //!   model before virtualization (P0.2) — `heat_cells` only paints.
 
@@ -42,9 +46,8 @@ fn columns() -> Vec<TmColumn> {
 /// height so `show_rows` can virtualize the whole list.
 #[derive(Debug, Clone)]
 pub enum DisplayRow {
-    /// Group index (0=Apps 1=Background 2=Windows) + its UNFLATTENED member
-    /// count, computed once from the classification model so expansion
-    /// state cannot change it (audit P0.4).
+    /// Group index (0=Apps 1=Background 2=Windows) + the native-style group
+    /// count, computed before flattening so expansion state cannot change it.
     GroupHeader(u8, usize),
     Process(RowData),
 }
@@ -57,7 +60,7 @@ pub struct RowData {
     pub name: String,
     pub icon_path: Option<String>,
     pub children: bool,
-    /// cpu %, mem bytes, disk bps, net bps (aggregated over the subtree).
+    /// cpu %, mem bytes, disk bps, net bps (aggregated over the display subtree).
     pub values: [f64; 4],
     /// Per-column heat intensity normalized against the WHOLE display model
     /// before virtualization (audit P0.2): exactly 1.0 marks the column's
@@ -542,6 +545,16 @@ fn end_process_checked(
     );
 }
 
+/// Task Manager's Processes page is not a literal PPID tree. In particular,
+/// Explorer is a launcher boundary: programs started from the shell become
+/// independent app groups even though their real parent PID is explorer.exe.
+/// We derive a presentation-only category/root model and leave Snapshot/PPID
+/// data untouched so Details and process actions continue to see OS truth.
+struct DisplayGroups {
+    category: HashMap<u32, ProcCategory>,
+    app_roots: HashSet<u32>,
+}
+
 fn build_display_rows(
     snap: &Snapshot,
     raw_search: &str,
@@ -552,7 +565,8 @@ fn build_display_rows(
 ) -> Vec<DisplayRow> {
     let q = search::Query::new(raw_search);
     let all: Vec<&ProcessEntry> = snap.processes.iter().collect();
-    let children_all = children_map(&all);
+    let grouping = derive_display_groups(&all);
+    let children_all = display_children_map(&all, &grouping.category, &grouping.app_roots);
     let (subtree, subtree_count) = subtree_values_and_counts(&all, &children_all);
     let mut out = Vec::new();
 
@@ -576,22 +590,25 @@ fn build_display_rows(
             1 => ProcCategory::Background,
             _ => ProcCategory::System,
         };
-        let members: Vec<&ProcessEntry> =
-            all.iter().copied().filter(|p| p.category == cat).collect();
-        let total = members.len();
+        let members: Vec<&ProcessEntry> = all
+            .iter()
+            .copied()
+            .filter(|p| grouping.category.get(&p.pid).copied().unwrap_or(p.category) == cat)
+            .collect();
+        let children = display_children_map(&members, &grouping.category, &grouping.app_roots);
+        let roots = tree_roots(&members, &children);
+        // Native Task Manager's "Apps (N)" counts top-level app groups, while
+        // Background/Windows counters count processes. This is why Brave (28)
+        // contributes one to Apps, not twenty-eight.
+        let total = if cat == ProcCategory::App {
+            roots.len()
+        } else {
+            members.len()
+        };
         out.push(DisplayRow::GroupHeader(gi, total));
         if group_collapsed[gi as usize] {
             continue;
         }
-        let children = children_map(&members);
-        let roots: Vec<&ProcessEntry> = members
-            .iter()
-            .copied()
-            .filter(|p| {
-                p.ppid
-                    .is_none_or(|pp| pp == p.pid || !children.contains_key(&pp))
-            })
-            .collect();
         emit_tree(
             &mut out,
             &roots,
@@ -605,6 +622,182 @@ fn build_display_rows(
     }
     normalize_heat(&mut out);
     out
+}
+
+fn derive_display_groups(all: &[&ProcessEntry]) -> DisplayGroups {
+    let by_pid: HashMap<u32, &ProcessEntry> = all.iter().map(|p| (p.pid, *p)).collect();
+
+    // Non-Windows/mock backends may not provide window ownership. Preserve
+    // their collector classification rather than demoting every App simply
+    // because the Windows-specific signal is absent.
+    if !all.iter().any(|p| p.has_window) {
+        let category: HashMap<u32, ProcCategory> = all.iter().map(|p| (p.pid, p.category)).collect();
+        let mut app_roots: HashSet<u32> = all
+            .iter()
+            .copied()
+            .filter(|p| p.category == ProcCategory::App && p.app_root)
+            .map(|p| p.pid)
+            .collect();
+        if app_roots.is_empty() {
+            for p in all.iter().copied().filter(|p| p.category == ProcCategory::App) {
+                let parent_is_app = p
+                    .ppid
+                    .filter(|ppid| *ppid != p.pid)
+                    .and_then(|ppid| by_pid.get(&ppid).copied())
+                    .is_some_and(|parent| parent.category == ProcCategory::App);
+                if !parent_is_app {
+                    app_roots.insert(p.pid);
+                }
+            }
+        }
+        return DisplayGroups {
+            category,
+            app_roots,
+        };
+    }
+
+    // The platform category is authoritative for Windows/system processes.
+    // For user/session processes, rebuild App membership from visible-window
+    // ownership so a shell parent cannot turn all of its descendants into
+    // foreground Apps.
+    let mut category: HashMap<u32, ProcCategory> = all
+        .iter()
+        .map(|p| {
+            let system = p.category == ProcCategory::System || is_system_boundary(&p.name);
+            (
+                p.pid,
+                if system {
+                    ProcCategory::System
+                } else {
+                    ProcCategory::Background
+                },
+            )
+        })
+        .collect();
+
+    let mut raw_children: HashMap<u32, Vec<&ProcessEntry>> = HashMap::new();
+    for p in all {
+        if let Some(ppid) = p.ppid
+            && ppid != p.pid
+            && by_pid.contains_key(&ppid)
+        {
+            raw_children.entry(ppid).or_default().push(*p);
+        }
+    }
+
+    let mut app_roots = HashSet::new();
+    for p in all.iter().copied().filter(|p| p.has_window) {
+        if category.get(&p.pid) == Some(&ProcCategory::System) {
+            continue;
+        }
+        let mut cur = p;
+        let mut seen = HashSet::new();
+        seen.insert(cur.pid);
+        while let Some(ppid) = cur.ppid {
+            if ppid == cur.pid || !seen.insert(ppid) {
+                break;
+            }
+            let Some(parent) = by_pid.get(&ppid).copied() else {
+                break;
+            };
+            if category.get(&parent.pid) == Some(&ProcCategory::System)
+                || is_launch_boundary(&parent.name)
+            {
+                break;
+            }
+            // Multiple visible windows owned by the same executable still
+            // belong to one app family. A different visible parent is an
+            // independent foreground app and therefore a hard boundary.
+            if parent.has_window && !same_process_family(parent, cur) {
+                break;
+            }
+            cur = parent;
+        }
+        app_roots.insert(cur.pid);
+    }
+
+    // App roots own their helper descendants, except for shell roots that are
+    // launch surfaces rather than application families. Never cross another
+    // independently discovered app root or a system-process boundary.
+    let mut stack: Vec<u32> = app_roots.iter().copied().collect();
+    let mut seen_app = HashSet::new();
+    while let Some(pid) = stack.pop() {
+        if !seen_app.insert(pid) || category.get(&pid) == Some(&ProcCategory::System) {
+            continue;
+        }
+        category.insert(pid, ProcCategory::App);
+        let Some(proc) = by_pid.get(&pid).copied() else {
+            continue;
+        };
+        if is_non_owning_shell(&proc.name) {
+            continue;
+        }
+        if let Some(kids) = raw_children.get(&pid) {
+            for child in kids {
+                if app_roots.contains(&child.pid)
+                    || category.get(&child.pid) == Some(&ProcCategory::System)
+                {
+                    continue;
+                }
+                stack.push(child.pid);
+            }
+        }
+    }
+
+    DisplayGroups {
+        category,
+        app_roots,
+    }
+}
+
+fn same_process_family(a: &ProcessEntry, b: &ProcessEntry) -> bool {
+    a.name.eq_ignore_ascii_case(&b.name)
+}
+
+/// Parent processes that launch independent foreground applications rather
+/// than semantically owning them. Explorer is the important case; console
+/// shells cover GUI programs launched from Terminal/cmd/PowerShell.
+fn is_launch_boundary(name: &str) -> bool {
+    const LAUNCHERS: &[&str] = &[
+        "explorer.exe",
+        "cmd.exe",
+        "powershell.exe",
+        "pwsh.exe",
+        "wsl.exe",
+        "wt.exe",
+        "SearchHost.exe",
+        "SearchApp.exe",
+        "StartMenuExperienceHost.exe",
+        "ShellExperienceHost.exe",
+    ];
+    LAUNCHERS.iter().any(|n| name.eq_ignore_ascii_case(n))
+}
+
+/// Explorer's desktop/taskbar process can own a visible window itself, but
+/// its arbitrary launched children must never be folded into that row.
+fn is_non_owning_shell(name: &str) -> bool {
+    name.eq_ignore_ascii_case("explorer.exe") || name.eq_ignore_ascii_case("explorer")
+}
+
+fn is_system_boundary(name: &str) -> bool {
+    const SYSTEM: &[&str] = &[
+        "system",
+        "registry",
+        "memory compression",
+        "secure system",
+        "smss.exe",
+        "csrss.exe",
+        "wininit.exe",
+        "services.exe",
+        "lsass.exe",
+        "lsaiso.exe",
+        "svchost.exe",
+        "winlogon.exe",
+        "dwm.exe",
+        "fontdrvhost.exe",
+        "system idle process",
+    ];
+    SYSTEM.iter().any(|n| name.eq_ignore_ascii_case(n))
 }
 
 fn normalize_heat(rows: &mut [DisplayRow]) {
@@ -648,18 +841,74 @@ fn make_flat_row(p: &ProcessEntry, subtree: &HashMap<u32, [f64; 4]>) -> DisplayR
     })
 }
 
-fn children_map<'a>(list: &[&'a ProcessEntry]) -> HashMap<u32, Vec<&'a ProcessEntry>> {
+/// Build the parent→child topology used only by the Processes presentation.
+/// Cross-category edges are cut, and every independently discovered App root
+/// is detached from its real PPID so Explorer-launched programs stay peers.
+fn display_children_map<'a>(
+    list: &[&'a ProcessEntry],
+    category: &HashMap<u32, ProcCategory>,
+    app_roots: &HashSet<u32>,
+) -> HashMap<u32, Vec<&'a ProcessEntry>> {
     let pids: HashSet<u32> = list.iter().map(|p| p.pid).collect();
     let mut m: HashMap<u32, Vec<&ProcessEntry>> = HashMap::new();
     for p in list {
+        let child_cat = category.get(&p.pid).copied().unwrap_or(p.category);
+        if child_cat == ProcCategory::App && app_roots.contains(&p.pid) {
+            continue;
+        }
         if let Some(ppid) = p.ppid
             && ppid != p.pid
             && pids.contains(&ppid)
+            && category.get(&ppid).copied() == Some(child_cat)
         {
-            m.entry(ppid).or_default().push(p);
+            m.entry(ppid).or_default().push(*p);
         }
     }
     m
+}
+
+/// Roots for every connected display component. The second pass also keeps
+/// malformed/cyclic PPID graphs visible instead of silently dropping them.
+fn tree_roots<'a>(
+    members: &[&'a ProcessEntry],
+    children: &HashMap<u32, Vec<&'a ProcessEntry>>,
+) -> Vec<&'a ProcessEntry> {
+    let linked: HashSet<u32> = children
+        .values()
+        .flat_map(|kids| kids.iter().map(|p| p.pid))
+        .collect();
+    let mut roots: Vec<&ProcessEntry> = members
+        .iter()
+        .copied()
+        .filter(|p| !linked.contains(&p.pid))
+        .collect();
+
+    let mut covered = HashSet::new();
+    let mut stack: Vec<u32> = roots.iter().map(|p| p.pid).collect();
+    while let Some(pid) = stack.pop() {
+        if !covered.insert(pid) {
+            continue;
+        }
+        if let Some(kids) = children.get(&pid) {
+            stack.extend(kids.iter().map(|p| p.pid));
+        }
+    }
+    for p in members {
+        if covered.contains(&p.pid) {
+            continue;
+        }
+        roots.push(*p);
+        stack.push(p.pid);
+        while let Some(pid) = stack.pop() {
+            if !covered.insert(pid) {
+                continue;
+            }
+            if let Some(kids) = children.get(&pid) {
+                stack.extend(kids.iter().map(|kid| kid.pid));
+            }
+        }
+    }
+    roots
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -856,6 +1105,7 @@ mod tests {
         let mut p = ProcessEntry::new(pid, name);
         p.ppid = ppid;
         p.category = cat;
+        p.has_window = cat == ProcCategory::App && ppid.is_none();
         p.cpu_pct = 1.0 * pid as f32;
         p.mem_bytes = 1000 * pid as u64;
         p
@@ -934,11 +1184,122 @@ mod tests {
                 })
                 .unwrap()
         };
-        assert_eq!(header_total(&collapsed_rows), 3);
+        assert_eq!(header_total(&collapsed_rows), 1);
         assert_eq!(header_total(&expanded_rows), header_total(&collapsed_rows));
         let groups_closed = [true, false, false];
         let closed = build_display_rows(&snap, "", 0, true, &HashSet::new(), &groups_closed);
-        assert_eq!(header_total(&closed), 3);
+        assert_eq!(header_total(&closed), 1);
+    }
+
+    #[test]
+    fn explorer_launched_programs_are_independent_app_groups() {
+        let explorer = proc(1, None, "explorer.exe", ProcCategory::App);
+        let mut brave = proc(2, Some(1), "brave.exe", ProcCategory::App);
+        brave.has_window = false;
+        let mut brave_window = proc(3, Some(2), "brave.exe", ProcCategory::App);
+        brave_window.has_window = true;
+        let brave_helper = proc(4, Some(2), "brave.exe", ProcCategory::App);
+        let mut code = proc(5, Some(1), "Code.exe", ProcCategory::App);
+        code.has_window = true;
+        // Simulate the old collector result: every Explorer descendant was
+        // labeled App even though this tray helper has no foreground window.
+        let tray = proc(6, Some(1), "trayhelper.exe", ProcCategory::App);
+
+        let rows = build_display_rows(
+            &snap_of(vec![
+                explorer,
+                brave,
+                brave_window,
+                brave_helper,
+                code,
+                tray,
+            ]),
+            "",
+            0,
+            true,
+            &HashSet::new(),
+            &[false; 3],
+        );
+
+        let app_total = rows
+            .iter()
+            .find_map(|r| match r {
+                DisplayRow::GroupHeader(0, n) => Some(*n),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(app_total, 3);
+
+        let app_rows: Vec<&RowData> = rows
+            .iter()
+            .skip_while(|r| !matches!(r, DisplayRow::GroupHeader(0, _)))
+            .skip(1)
+            .take_while(|r| !matches!(r, DisplayRow::GroupHeader(..)))
+            .filter_map(|r| match r {
+                DisplayRow::Process(d) => Some(d),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(app_rows.len(), 3);
+        assert!(app_rows.iter().all(|r| r.depth == 0));
+
+        let explorer_row = app_rows.iter().find(|r| r.pid == 1).unwrap();
+        assert_eq!(explorer_row.name, "explorer.exe");
+        assert_eq!(explorer_row.values[0], 1.0);
+
+        let brave_row = app_rows.iter().find(|r| r.pid == 2).unwrap();
+        assert_eq!(brave_row.name, "brave.exe (3)");
+        assert_eq!(brave_row.values[0], 9.0);
+
+        let bg_pids: Vec<u32> = rows
+            .iter()
+            .skip_while(|r| !matches!(r, DisplayRow::GroupHeader(1, _)))
+            .skip(1)
+            .take_while(|r| !matches!(r, DisplayRow::GroupHeader(..)))
+            .filter_map(|r| match r {
+                DisplayRow::Process(d) => Some(d.pid),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(bg_pids, vec![6]);
+    }
+
+    #[test]
+    fn shell_launched_gui_is_not_folded_into_terminal_group() {
+        let terminal = proc(10, None, "WindowsTerminal.exe", ProcCategory::App);
+        let shell = proc(11, Some(10), "powershell.exe", ProcCategory::App);
+        let mut notepad = proc(12, Some(11), "notepad.exe", ProcCategory::App);
+        notepad.has_window = true;
+        let rows = build_display_rows(
+            &snap_of(vec![terminal, shell, notepad]),
+            "",
+            0,
+            true,
+            &HashSet::new(),
+            &[false; 3],
+        );
+        let app_total = rows
+            .iter()
+            .find_map(|r| match r {
+                DisplayRow::GroupHeader(0, n) => Some(*n),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(app_total, 2);
+        let app_rows: Vec<&RowData> = rows
+            .iter()
+            .skip_while(|r| !matches!(r, DisplayRow::GroupHeader(0, _)))
+            .skip(1)
+            .take_while(|r| !matches!(r, DisplayRow::GroupHeader(..)))
+            .filter_map(|r| match r {
+                DisplayRow::Process(d) => Some(d),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(app_rows.len(), 2);
+        assert!(app_rows.iter().all(|r| r.depth == 0));
+        assert_eq!(app_rows.iter().find(|r| r.pid == 10).unwrap().name, "WindowsTerminal.exe (2)");
+        assert_eq!(app_rows.iter().find(|r| r.pid == 12).unwrap().name, "notepad.exe");
     }
 
     #[test]
@@ -964,7 +1325,7 @@ mod tests {
     }
 
     #[test]
-    fn process_tree_cycle_terminates() {
+    fn process_tree_cycle_terminates_and_remains_visible() {
         let snap = snap_of(vec![
             proc(1, Some(2), "a", ProcCategory::Background),
             proc(2, Some(1), "b", ProcCategory::Background),
@@ -981,6 +1342,7 @@ mod tests {
                 _ => None,
             })
             .collect();
+        assert_eq!(procs.len(), 2);
         assert_eq!(
             procs.len(),
             procs.iter().collect::<std::collections::HashSet<_>>().len()
@@ -1039,7 +1401,8 @@ mod tests {
             proc(3, Some(2), "leaf", ProcCategory::Background),
         ]);
         let all: Vec<&ProcessEntry> = snap.processes.iter().collect();
-        let children = children_map(&all);
+        let grouping = derive_display_groups(&all);
+        let children = display_children_map(&all, &grouping.category, &grouping.app_roots);
         let (st, cnt) = subtree_values_and_counts(&all, &children);
         assert_eq!(st[&1][0], 6.0);
         assert_eq!(st[&1][1], 6000.0);
