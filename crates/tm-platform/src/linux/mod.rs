@@ -1,4 +1,4 @@
-//! Linux backend: sysinfo + /proc + systemctl + XDG autostart.
+//! Linux backend: sysinfo + procfs/sysfs + systemd + XDG autostart.
 
 mod diskstats;
 pub(crate) mod services;
@@ -6,6 +6,7 @@ mod startup;
 
 use crate::actions::*;
 use std::collections::{HashMap, HashSet};
+use std::path::Path;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use sysinfo::{
     Disks, MemoryRefreshKind, Networks, ProcessRefreshKind, ProcessesToUpdate, RefreshKind, System,
@@ -28,7 +29,7 @@ pub struct LinuxCollector {
 
 impl SystemCollector for LinuxCollector {
     fn backend_name(&self) -> &'static str {
-        "linux/sysinfo+procfs"
+        "linux/sysinfo+procfs+sysfs"
     }
 
     fn sample(&mut self, started: Instant) -> Result<Snapshot> {
@@ -66,9 +67,11 @@ impl SystemCollector for LinuxCollector {
         let utilization = cpus.iter().map(|c| c.cpu_usage()).sum::<f32>() / logical as f32;
         let freq = cpus.iter().map(|c| c.frequency() as f32).sum::<f32>() / logical as f32;
         let nb_cpus = logical as f32;
+        let (physical_cores, sockets) = cpu_topology();
 
-        // Window ownership requires a display connection; without one we
-        // classify by heuristics only.
+        // Wayland intentionally prevents arbitrary clients from enumerating
+        // every other client's top-level windows. Keep classification honest
+        // rather than introducing compositor-specific unsafe heuristics.
         let window_owners: HashSet<u32> = HashSet::new();
 
         let n_procs = self.sys.processes().len();
@@ -104,7 +107,7 @@ impl SystemCollector for LinuxCollector {
             }
 
             let has_window = window_owners.contains(&pid_u);
-            let kernel_thread = pid_u == 2 || name.starts_with('['); // kthreadd children show in brackets
+            let kernel_thread = pid_u == 2 || name.starts_with('[');
             let category = classify::classify(classify::ClassifyInput {
                 pid: pid_u,
                 name: &name,
@@ -118,13 +121,11 @@ impl SystemCollector for LinuxCollector {
             entry.display = name.clone();
             entry.ppid = p.parent().map(|x| x.as_u32());
             entry.category = category;
-            // sysinfo returns percent of ONE core; normalize to share of
-            // total machine capacity (TM-style, max 100).
             entry.cpu_pct = (p.cpu_usage() / nb_cpus).clamp(0.0, 100.0);
             entry.mem_bytes = p.memory();
             entry.commit_bytes = Some(p.virtual_memory());
+            entry.peak_mem_bytes = proc_status_kb(pid_u, "VmHWM");
             entry.start_epoch_s = Some(p.start_time() as i64);
-            // accumulated_cpu_time is milliseconds on Linux.
             entry.cpu_time_s = Some(p.accumulated_cpu_time() as f64 / 1000.0);
             entry.disk_read_bps = du.read_bytes as f64 / interval_s;
             entry.disk_write_bps = du.written_bytes as f64 / interval_s;
@@ -139,6 +140,11 @@ impl SystemCollector for LinuxCollector {
                 sysinfo::ProcessStatus::Stop => ProcStatus::Suspended,
                 _ => ProcStatus::Running,
             };
+            entry.threads = p.tasks().map(|tasks| tasks.len() as u32);
+            entry.handles = fd_count(pid_u);
+            entry.command_line = proc_cmdline(pid_u);
+            entry.priority = proc_priority(pid_u);
+            entry.elevated = entry.user.as_deref().map(|u| u == "root");
             processes.push(entry);
         }
 
@@ -146,18 +152,17 @@ impl SystemCollector for LinuxCollector {
         let mut disks = Vec::new();
         for d in self.disks.list() {
             let mount = d.mount_point().to_string_lossy().to_string();
-            let dev = d.name().to_string_lossy().to_string(); // e.g. "nvme0n1p2" or "sda2"
+            let dev = d.name().to_string_lossy().to_string();
+            let block = block_device_name(&dev);
+            let parent = parent_block_device(&block);
             let media = match d.kind() {
                 sysinfo::DiskKind::SSD => MediaKind::Ssd,
                 sysinfo::DiskKind::HDD => MediaKind::Hdd,
                 _ => MediaKind::Unknown,
             };
-            // Match the parent device for partitions ("sda2" -> "sda").
-            let ds = diskstats.iter().find(|s| {
-                dev == s.device
-                    || !dev.starts_with(&format!("{}/", s.device))
-                        && dev.trim_end_matches(char::is_numeric) == s.device
-            });
+            let ds = diskstats
+                .iter()
+                .find(|s| s.device == block || parent.as_deref() == Some(s.device.as_str()));
             disks.push(DiskInfo {
                 id: dev.clone(),
                 mount,
@@ -188,22 +193,17 @@ impl SystemCollector for LinuxCollector {
                 ),
                 _ => (0.0, 0.0),
             };
+            let meta = net_meta(name);
             nets.push(NetworkInfo {
                 name: name.to_string(),
-                desc: String::new(),
-                kind: if name.contains("wl") {
-                    "Wi-Fi".into()
-                } else if name == "lo" {
-                    "Loopback".into()
-                } else {
-                    "Ethernet".into()
-                },
-                oper_up: recv_total > 0 || sent_total > 0,
+                desc: meta.desc,
+                kind: meta.kind,
+                oper_up: meta.oper_up,
                 recv_bps,
                 sent_bps,
                 total_recv_bytes: recv_total,
                 total_sent_bytes: sent_total,
-                link_bps: 0,
+                link_bps: meta.link_bps,
                 ssid: None,
             });
         }
@@ -230,27 +230,26 @@ impl SystemCollector for LinuxCollector {
                     .iter()
                     .map(|c| c.cpu_usage().clamp(0.0, 100.0))
                     .collect(),
-                // Linux sampling has no user/kernel split here (model docs:
-                // empty / 0 = unknown).
                 per_core_kernel_pct: Vec::new(),
                 kernel_pct: 0.0,
                 freq_mhz: freq,
                 freq_base_mhz: base_freq_from_cpufreq(),
                 logical_count: logical,
-                physical_cores: physical_cores(),
-                sockets: 1,
-                l1_kb: 0,
-                l2_kb: 0,
-                l3_kb: cache_l3_kb(),
+                physical_cores,
+                sockets,
+                l1_kb: cache_total_kb(1),
+                l2_kb: cache_total_kb(2),
+                l3_kb: cache_total_kb(3),
                 virtualization: "Unknown".into(),
             },
             memory: MemoryInfo {
                 total_bytes: self.sys.total_memory(),
                 used_bytes: self.sys.used_memory(),
                 available_bytes: self.sys.available_memory(),
-                cached_bytes: proc_meminfo_field("Cached"),
-                commit_total_bytes: 0,
-                commit_used_bytes: 0,
+                cached_bytes: proc_meminfo_field("Cached")
+                    .saturating_add(proc_meminfo_field("SReclaimable")),
+                commit_total_bytes: proc_meminfo_field("CommitLimit"),
+                commit_used_bytes: proc_meminfo_field("Committed_AS"),
                 paged_pool_bytes: 0,
                 non_paged_pool_bytes: 0,
                 swap_total_bytes: self.sys.total_swap(),
@@ -289,7 +288,7 @@ fn username_for_uid(users: &sysinfo::Users, uid: &sysinfo::Uid) -> Option<String
 fn proc_meminfo_field(field: &str) -> u64 {
     if let Ok(text) = std::fs::read_to_string("/proc/meminfo") {
         for line in text.lines() {
-            if line.starts_with(field) {
+            if line.split(':').next() == Some(field) {
                 let num: String = line
                     .chars()
                     .skip_while(|c| !c.is_ascii_digit())
@@ -304,31 +303,110 @@ fn proc_meminfo_field(field: &str) -> u64 {
     0
 }
 
-fn physical_cores() -> usize {
-    if let Ok(text) = std::fs::read_to_string("/proc/cpuinfo") {
-        let mut ids = Vec::new();
-        for line in text.lines() {
-            if let Some(rest) = line.strip_prefix("core id")
-                && let Some(v) = rest
-                    .trim_start_matches(['\t', ' ', ':'])
-                    .trim()
-                    .parse::<u32>()
-                    .ok()
-            {
-                ids.push(v);
-            }
+fn proc_status_kb(pid: u32, field: &str) -> Option<u64> {
+    let text = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
+    for line in text.lines() {
+        if line.split(':').next() == Some(field) {
+            let kb = line
+                .split_whitespace()
+                .find_map(|part| part.parse::<u64>().ok())?;
+            return Some(kb * 1024);
         }
-        ids.sort_unstable();
-        ids.dedup();
-        return ids.len();
     }
-    0
+    None
 }
 
-fn cache_l3_kb() -> u64 {
-    std::fs::read_to_string("/sys/devices/system/cpu/cpu0/cache/index3/size")
-        .map(|t| parse_cache_size(&t))
-        .unwrap_or(0)
+fn fd_count(pid: u32) -> Option<u32> {
+    let count = std::fs::read_dir(format!("/proc/{pid}/fd")).ok()?.count();
+    u32::try_from(count).ok()
+}
+
+fn proc_cmdline(pid: u32) -> Option<String> {
+    let bytes = std::fs::read(format!("/proc/{pid}/cmdline")).ok()?;
+    if bytes.is_empty() {
+        return None;
+    }
+    let parts: Vec<String> = bytes
+        .split(|&b| b == 0)
+        .filter(|p| !p.is_empty())
+        .map(|p| String::from_utf8_lossy(p).into_owned())
+        .collect();
+    (!parts.is_empty()).then(|| parts.join(" "))
+}
+
+/// Linux nice value from /proc/<pid>/stat field 19, mapped onto the portable
+/// Task Manager priority classes. Parsing after the final ')' avoids spaces
+/// and parentheses in process names corrupting positional fields.
+fn proc_priority(pid: u32) -> PriorityClass {
+    let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+        return PriorityClass::Unknown;
+    };
+    let Some(end_name) = stat.rfind(')') else {
+        return PriorityClass::Unknown;
+    };
+    let fields: Vec<&str> = stat[end_name + 1..].split_whitespace().collect();
+    // After comm, field[0] is stat field 3. Nice is stat field 19 => index 16.
+    let Some(nice) = fields.get(16).and_then(|s| s.parse::<i32>().ok()) else {
+        return PriorityClass::Unknown;
+    };
+    match nice {
+        i32::MIN..=-10 => PriorityClass::High,
+        -9..=-1 => PriorityClass::AboveNormal,
+        0 => PriorityClass::Normal,
+        1..=9 => PriorityClass::BelowNormal,
+        _ => PriorityClass::Low,
+    }
+}
+
+fn cpu_topology() -> (usize, usize) {
+    let mut cores: HashSet<(u32, u32)> = HashSet::new();
+    let mut packages: HashSet<u32> = HashSet::new();
+    let Ok(entries) = std::fs::read_dir("/sys/devices/system/cpu") else {
+        return (0, 0);
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        if !name.starts_with("cpu") || !name[3..].chars().all(|c| c.is_ascii_digit()) {
+            continue;
+        }
+        let topo = entry.path().join("topology");
+        let package = read_u32(topo.join("physical_package_id"));
+        let core = read_u32(topo.join("core_id"));
+        if let (Some(package), Some(core)) = (package, core) {
+            packages.insert(package);
+            cores.insert((package, core));
+        }
+    }
+    (cores.len(), packages.len())
+}
+
+fn read_u32(path: impl AsRef<Path>) -> Option<u32> {
+    std::fs::read_to_string(path).ok()?.trim().parse().ok()
+}
+
+fn cache_total_kb(level: u8) -> u64 {
+    // CPU0 lists every cache level. Deduplicate shared caches by their
+    // shared_cpu_list; sum distinct entries of the requested level.
+    let Ok(entries) = std::fs::read_dir("/sys/devices/system/cpu/cpu0/cache") else {
+        return 0;
+    };
+    let mut seen = HashSet::new();
+    let mut total = 0u64;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if read_u32(path.join("level")) != Some(level as u32) {
+            continue;
+        }
+        let shared = std::fs::read_to_string(path.join("shared_cpu_list"))
+            .unwrap_or_else(|_| entry.file_name().to_string_lossy().into_owned());
+        if !seen.insert(shared) {
+            continue;
+        }
+        if let Ok(size) = std::fs::read_to_string(path.join("size")) {
+            total = total.saturating_add(parse_cache_size(&size));
+        }
+    }
+    total
 }
 
 fn parse_cache_size(text: &str) -> u64 {
@@ -343,12 +421,87 @@ fn parse_cache_size(text: &str) -> u64 {
 }
 
 fn base_freq_from_cpufreq() -> f32 {
-    if let Ok(khz) = std::fs::read_to_string("/sys/devices/system/cpu/cpu0/cpufreq/base_frequency")
-        && let Ok(k) = khz.trim().parse::<f32>()
-    {
-        return k / 1000.0;
+    let Ok(entries) = std::fs::read_dir("/sys/devices/system/cpu/cpufreq") else {
+        return 0.0;
+    };
+    entries
+        .flatten()
+        .filter(|e| e.file_name().to_string_lossy().starts_with("policy"))
+        .filter_map(|e| {
+            std::fs::read_to_string(e.path().join("base_frequency"))
+                .ok()?
+                .trim()
+                .parse::<f32>()
+                .ok()
+        })
+        .map(|khz| khz / 1000.0)
+        .fold(0.0f32, f32::max)
+}
+
+struct NetMeta {
+    kind: String,
+    oper_up: bool,
+    link_bps: u64,
+    desc: String,
+}
+
+fn net_meta(name: &str) -> NetMeta {
+    let base = Path::new("/sys/class/net").join(name);
+    let kind = if name == "lo" {
+        "Loopback"
+    } else if base.join("wireless").exists() {
+        "Wi-Fi"
+    } else if base.join("device").exists() {
+        "Ethernet"
+    } else {
+        "Virtual"
     }
-    0.0
+    .to_string();
+    let operstate = std::fs::read_to_string(base.join("operstate"))
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    let carrier = std::fs::read_to_string(base.join("carrier"))
+        .ok()
+        .is_some_and(|s| s.trim() == "1");
+    let oper_up = matches!(operstate.as_str(), "up" | "unknown") && (carrier || name == "lo");
+    let link_bps = std::fs::read_to_string(base.join("speed"))
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .filter(|&mbps| mbps > 0 && mbps < 1_000_000)
+        .map_or(0, |mbps| mbps * 1_000_000);
+    let desc = std::fs::read_to_string(base.join("device/uevent"))
+        .ok()
+        .and_then(|text| {
+            text.lines()
+                .find_map(|l| l.strip_prefix("DRIVER=").map(str::to_string))
+        })
+        .unwrap_or_default();
+    NetMeta {
+        kind,
+        oper_up,
+        link_bps,
+        desc,
+    }
+}
+
+fn block_device_name(dev: &str) -> String {
+    Path::new(dev)
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| dev.to_string())
+}
+
+fn parent_block_device(dev: &str) -> Option<String> {
+    let class = Path::new("/sys/class/block").join(dev);
+    if !class.join("partition").exists() {
+        return None;
+    }
+    let target = std::fs::canonicalize(class).ok()?;
+    target
+        .parent()?
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
 }
 
 fn hostname() -> String {
@@ -372,7 +525,6 @@ fn threads_total(sys: &System) -> usize {
         .sum()
 }
 
-/// GPU list from DRM sysfs (amdgpu/i915 expose busy %).
 fn drm_gpus() -> Vec<GpuInfo> {
     let mut out = Vec::new();
     if let Ok(entries) = std::fs::read_dir("/sys/class/drm") {
@@ -408,7 +560,6 @@ fn drm_gpus() -> Vec<GpuInfo> {
                 dedicated_used_bytes: vram_used,
                 shared_used_bytes: 0,
                 temperature_c: None,
-                // No DXGI on Linux; LUID is a Windows-only join key.
                 luid: None,
                 engines: vec![GpuEngine {
                     name: "3D".into(),
@@ -459,14 +610,7 @@ impl PlatformActions for LinuxActions {
         send_signal(pid, libc::SIGTERM)
     }
     fn suspend_process(&self, pid: u32, suspend: bool) -> Result<()> {
-        send_signal(
-            pid,
-            if suspend {
-                libc::SIGSTOP
-            } else {
-                libc::SIGCONT
-            },
-        )
+        send_signal(pid, if suspend { libc::SIGSTOP } else { libc::SIGCONT })
     }
     fn set_priority(&self, pid: u32, priority: PriorityClass) -> Result<()> {
         let nice: i32 = match priority {
@@ -480,18 +624,13 @@ impl PlatformActions for LinuxActions {
         if rc == 0 {
             Ok(())
         } else {
-            Err(tm_core::TmError::platform(
-                "setpriority",
-                "permission denied",
-            ))
+            Err(tm_core::TmError::platform("setpriority", "permission denied"))
         }
     }
     fn get_affinity_mask(&self, pid: u32) -> Result<u64> {
         unsafe {
             let mut set: libc::cpu_set_t = std::mem::zeroed();
-            if libc::sched_getaffinity(pid as i32, std::mem::size_of::<libc::cpu_set_t>(), &mut set)
-                != 0
-            {
+            if libc::sched_getaffinity(pid as i32, std::mem::size_of::<libc::cpu_set_t>(), &mut set) != 0 {
                 return Err(tm_core::TmError::platform("sched_getaffinity", "failed"));
             }
             let mut mask = 0u64;
@@ -515,9 +654,7 @@ impl PlatformActions for LinuxActions {
                     libc::CPU_SET(cpu, &mut set);
                 }
             }
-            if libc::sched_setaffinity(pid as i32, std::mem::size_of::<libc::cpu_set_t>(), &set)
-                != 0
-            {
+            if libc::sched_setaffinity(pid as i32, std::mem::size_of::<libc::cpu_set_t>(), &set) != 0 {
                 return Err(tm_core::TmError::platform("sched_setaffinity", "failed"));
             }
             Ok(())
@@ -551,10 +688,7 @@ fn send_signal(pid: u32, sig: i32) -> Result<()> {
     if rc == 0 {
         Ok(())
     } else {
-        Err(tm_core::TmError::platform(
-            "kill",
-            format!("signal {sig} failed"),
-        ))
+        Err(tm_core::TmError::platform("kill", format!("signal {sig} failed")))
     }
 }
 
@@ -572,4 +706,27 @@ pub fn create_collector() -> LinuxCollector {
 
 pub fn create_actions() -> LinuxActions {
     LinuxActions
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn proc_stat_priority_parser_mapping_is_stable() {
+        // Mapping itself is deliberately coarse but matches set_priority().
+        assert_eq!(map_nice(-5), PriorityClass::AboveNormal);
+        assert_eq!(map_nice(0), PriorityClass::Normal);
+        assert_eq!(map_nice(10), PriorityClass::Low);
+    }
+
+    fn map_nice(nice: i32) -> PriorityClass {
+        match nice {
+            i32::MIN..=-10 => PriorityClass::High,
+            -9..=-1 => PriorityClass::AboveNormal,
+            0 => PriorityClass::Normal,
+            1..=9 => PriorityClass::BelowNormal,
+            _ => PriorityClass::Low,
+        }
+    }
 }
