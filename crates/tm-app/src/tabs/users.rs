@@ -21,18 +21,15 @@ use crate::widgets::tablekit::{self, Aggregates, HeatCell, TmColumn};
 
 fn columns() -> Vec<TmColumn> {
     vec![
-        // Audit P0.1: configured width — no elastic viewport fill.
         TmColumn::text("user", i18n::tr(K::TabUsers), 340.0),
         TmColumn::text("status", i18n::tr(K::ColStatus), 190.0),
         TmColumn::num("cpu", i18n::tr(K::ColCpu), 110.0),
         TmColumn::num("mem", i18n::tr(K::ColMemory), 110.0),
         TmColumn::num("disk", i18n::tr(K::ColDisk), 110.0),
-        // Per-process network is not measurable; render "—" (§16.6).
         TmColumn::num("net", i18n::tr(K::ColNetwork), 110.0),
     ]
 }
 
-/// Per-session aggregates from the single process pass.
 struct Agg {
     cpu: f64,
     mem: f64,
@@ -41,11 +38,8 @@ struct Agg {
     apps: HashMap<String, ([f64; 4], usize, Option<String>)>,
 }
 
-/// Flattened row model: user headers + their grouped app rows.
 enum URow {
-    /// Session header row.
     User(usize),
-    /// Grouped app row under a user.
     App {
         name: String,
         exe: Option<String>,
@@ -54,9 +48,6 @@ enum URow {
     },
 }
 
-/// Per-column heat normalization across the WHOLE Users display model
-/// (audit P0.2): one maximum per resource column over user headers and app
-/// rows alike, computed before virtualization.
 struct HeatMax {
     cpu: f64,
     mem: f64,
@@ -69,7 +60,7 @@ impl HeatMax {
             tablekit::norm(v[0], self.cpu),
             tablekit::norm(v[1], self.mem),
             tablekit::norm(v[2], self.disk),
-            0.0, // network unavailable on this platform
+            0.0,
         ]
     }
 
@@ -92,7 +83,6 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
     let pal = theme::palette(ui);
     let ctx = ui.ctx().clone();
 
-    // Lazy refresh of the session list in the background.
     {
         let stale = {
             let guard = tm_core::sync::lock(&app.shared.sessions_cache);
@@ -168,7 +158,6 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
                 i18n::tr(K::ManageUserAccounts),
                 true,
             ) {
-                // Non-blocking launch (§18.1) — never wait on the UI thread.
                 let _ = app.actions.run_new_task("ms-settings:otherusers", false);
             }
         },
@@ -183,8 +172,6 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
     let sessions_arc = app.shared.sessions_cache.clone();
     let guard = tm_core::sync::lock(&sessions_arc);
     let Some((sessions_all, _)) = guard.as_ref() else {
-        // Background fetch still in flight — centered placeholder instead
-        // of a blank pane.
         ui.centered_and_justified(|ui| ui.label(i18n::tr(K::GatheringData)));
         return;
     };
@@ -192,7 +179,6 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
         return;
     };
 
-    // Real user sessions only — drop session 0 / services sessions.
     let sessions: Vec<&UserSession> = sessions_all
         .iter()
         .filter(|s| {
@@ -200,7 +186,6 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
         })
         .collect();
 
-    // ---- one-pass aggregation keyed by session id --------------------------
     let mut aggs: HashMap<u32, Agg> = HashMap::with_capacity(sessions.len());
     for s in &sessions {
         aggs.insert(
@@ -216,8 +201,6 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
     }
     for p in &snap.processes {
         let sid = p.session_id.or_else(|| {
-            // Fallback when the sampler lacks the session id: match the first
-            // session with this username (rare; ids are authoritative).
             sessions
                 .iter()
                 .find(|s| {
@@ -228,9 +211,7 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
                 .map(|s| s.id)
         });
         let Some(sid) = sid else { continue };
-        let Some(a) = aggs.get_mut(&sid) else {
-            continue;
-        };
+        let Some(a) = aggs.get_mut(&sid) else { continue };
         a.cpu += p.cpu_pct as f64;
         a.mem += p.mem_bytes as f64;
         a.disk += p.disk_read_bps + p.disk_write_bps;
@@ -251,11 +232,6 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
         e.1 += 1;
     }
 
-    // ---- flatten into display rows -----------------------------------------
-    // Search (audit §5): a user row stays visible only when the query
-    // matches the user's display name OR one of their aggregated apps. The
-    // old condition ("name matches OR count > 0") kept every active user
-    // visible regardless of the query — search effectively failed here.
     let q = search::Query::new(&app.search);
     let mut rows: Vec<URow> = Vec::new();
     for (i, s) in sessions.iter().enumerate() {
@@ -288,8 +264,6 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
         }
     }
 
-    // Per-column maxima over all DISPLAYED rows (headers + apps), before
-    // virtualization (audit P0.2).
     let heat_max = HeatMax::over(rows.iter().map(|r| match r {
         URow::User(i) => {
             let s = sessions[*i];
@@ -303,6 +277,7 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
     let aggs_hdr = agg_hdr.strings();
 
     let mut table = app.make_table("users", columns());
+    prepare_auto_fit_widths(ui, app, &mut table, &rows, &sessions, &aggs, &snap, &aggs_hdr);
     let avail = tablekit::table_avail(ui);
     tablekit::scrolled_rows(
         "users",
@@ -337,7 +312,6 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
                         exe,
                         values,
                         count,
-                        ..
                     }) => {
                         app_row_ui(
                             app,
@@ -357,6 +331,81 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
         },
     );
     app.persist_table(&table);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prepare_auto_fit_widths(
+    ui: &egui::Ui,
+    app: &TaskManApp,
+    table: &mut tablekit::TmTable,
+    rows: &[URow],
+    sessions: &[&UserSession],
+    aggs: &HashMap<u32, Agg>,
+    snap: &tm_core::model::Snapshot,
+    agg_hdr: &[String; 4],
+) {
+    let mut fit: Vec<f32> = table
+        .cols
+        .iter()
+        .map(|c| tablekit::text_width(ui, c.label, tablekit::FONT_HDR_LABEL) + 28.0)
+        .collect();
+    for row in rows {
+        let (name, status, values, name_extra) = match row {
+            URow::User(i) => {
+                let s = sessions[*i];
+                let a = &aggs[&s.id];
+                (
+                    format!("{} ({})", display_name(s, &snap.system.hostname), a.count),
+                    session_status_label(s),
+                    [a.cpu, a.mem, a.disk, 0.0],
+                    66.0,
+                )
+            }
+            URow::App {
+                name,
+                values,
+                count,
+                ..
+            } => (
+                if *count > 1 {
+                    format!("{name} ({count})")
+                } else {
+                    name.clone()
+                },
+                "",
+                *values,
+                88.0,
+            ),
+        };
+        fit[0] = fit[0].max(tablekit::text_width(ui, &name, tablekit::FONT_ROW) + name_extra);
+        fit[1] = fit[1].max(tablekit::text_width(ui, status, tablekit::FONT_ROW) + 22.0);
+        let texts = [
+            format::format_pct_cell(values[0].min(100.0) as f32),
+            format::format_mb(values[1] as u64),
+            format::format_rate_mb(values[2]),
+            "—".to_string(),
+        ];
+        for (i, text) in texts.iter().enumerate() {
+            fit[i + 2] = fit[i + 2].max(tablekit::text_width(ui, text, tablekit::FONT_ROW) + 22.0);
+        }
+    }
+    for (i, agg) in agg_hdr.iter().enumerate() {
+        fit[i + 2] = fit[i + 2].max(tablekit::text_width(ui, agg, tablekit::FONT_AGG) + 36.0);
+    }
+    for (i, width) in fit.into_iter().enumerate() {
+        table.set_auto_fit_width(i, width.ceil());
+    }
+    let _ = app;
+}
+
+fn session_status_label(s: &UserSession) -> &'static str {
+    match s.state {
+        tm_core::model::UserSessionState::Active => "",
+        tm_core::model::UserSessionState::Disconnected => i18n::tr(K::StDisconnected),
+        tm_core::model::UserSessionState::Idle => i18n::tr(K::StIdle),
+        tm_core::model::UserSessionState::Connected => i18n::tr(K::StConnected),
+        _ => "",
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -386,7 +435,7 @@ fn user_row_ui(
     );
     crate::icons::draw_at(ui, icon_rect, Icon::Person, pal.accent);
     let name_rect = table.col_rect(0, rect);
-    ui.painter().text(
+    ui.painter_at(name_rect).text(
         egui::Pos2::new(name_rect.left() + 56.0, rect.center().y),
         egui::Align2::LEFT_CENTER,
         format!("{} ({})", display, a.count),
@@ -394,24 +443,15 @@ fn user_row_ui(
         pal.text,
     );
 
-    // Status: session state (localized); TM shows active users blank.
-    let status = match s.state {
-        tm_core::model::UserSessionState::Active => "",
-        tm_core::model::UserSessionState::Disconnected => i18n::tr(K::StDisconnected),
-        tm_core::model::UserSessionState::Idle => i18n::tr(K::StIdle),
-        tm_core::model::UserSessionState::Connected => i18n::tr(K::StConnected),
-        _ => "",
-    };
-    table.text_cell(ui, rect, 1, status, pal, false);
+    table.text_cell(ui, rect, 1, session_status_label(s), pal, false);
 
     let texts = [
         format::format_pct_cell(a.cpu.min(100.0) as f32),
         format::format_mb(a.mem as u64),
         format::format_rate_mb(a.disk),
-        "—".to_string(), // per-user network is not measurable (§16.6)
+        "—".to_string(),
     ];
     let active_row = a.cpu > 0.0 || a.mem > 0.0 || a.disk > 0.0;
-    // Intensities normalized per column across the whole model (audit P0.2).
     let cells: Vec<HeatCell> = heat_max
         .intensity(&[a.cpu, a.mem, a.disk, 0.0])
         .iter()
@@ -475,7 +515,7 @@ fn app_row_ui(
     } else {
         name.to_string()
     };
-    ui.painter().text(
+    ui.painter_at(nr).text(
         egui::Pos2::new(nr.left() + 56.0 + 22.0, rect.center().y),
         egui::Align2::LEFT_CENTER,
         label,
@@ -499,8 +539,6 @@ fn app_row_ui(
 
 fn display_name(s: &UserSession, hostname: &str) -> String {
     match &s.domain {
-        // Local accounts: TM shows the bare user name; only prefix foreign
-        // domains (no hardcoded host names).
         Some(d)
             if !d.is_empty()
                 && !d.eq_ignore_ascii_case(hostname)

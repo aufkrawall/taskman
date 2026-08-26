@@ -12,6 +12,7 @@ mod process_ops;
 mod sampler;
 mod services;
 mod startup;
+mod taskmgr_replacement;
 mod threads_map;
 pub(crate) mod users;
 mod version;
@@ -22,9 +23,6 @@ use tm_core::engine::SystemCollector;
 use tm_core::error::Result;
 use tm_core::model::*;
 
-/// Firmware POST duration of the last boot in ms — the same value the Task
-/// Manager shows as "Letzte BIOS-Zeit". Registry: FwPOSTTime under Session
-/// Manager\Power (0/missing = unknown).
 pub fn last_bios_time_ms() -> Option<u64> {
     use windows::Win32::System::Registry::{HKEY_LOCAL_MACHINE, RRF_RT_REG_DWORD, RegGetValueW};
     let sub: Vec<u16> = "SYSTEM\x5cCurrentControlSet\x5cControl\x5cSession Manager\x5cPower"
@@ -55,10 +53,6 @@ pub fn last_bios_time_ms() -> Option<u64> {
     }
 }
 
-/// Refresh rate of the primary display's current mode, from the active
-/// DEVMODE (`EnumDisplaySettingsW(ENUM_CURRENT_SETTINGS)`). Values below 20
-/// Hz are treated as "driver reports nonsense" (0/1 are seen on some
-/// virtual display adapters) and mapped to None.
 pub fn display_refresh_hz() -> Option<f32> {
     use windows::Win32::Graphics::Gdi::{DEVMODEW, ENUM_CURRENT_SETTINGS, EnumDisplaySettingsW};
     let mut dm = DEVMODEW {
@@ -72,7 +66,11 @@ pub fn display_refresh_hz() -> Option<f32> {
     Some(dm.dmDisplayFrequency as f32)
 }
 
-/// Collector combining sysinfo sampling with Win32/PDH extras.
+/// Entry point used only by the short-lived elevated helper process.
+pub fn set_task_manager_replacement_direct(enabled: bool) -> Result<()> {
+    taskmgr_replacement::set_direct(enabled)
+}
+
 pub struct WinCollector {
     inner: sampler::Sampler,
 }
@@ -91,7 +89,6 @@ impl SystemCollector for WinCollector {
     }
 }
 
-/// Windows action surface.
 #[derive(Default)]
 pub struct WinActions;
 
@@ -109,7 +106,7 @@ impl PlatformActions for WinActions {
             set_affinity: true,
             efficiency_mode: true,
             run_new_task: true,
-            per_process_network: false, // would require ETW
+            per_process_network: false,
         }
     }
 
@@ -119,21 +116,18 @@ impl PlatformActions for WinActions {
     fn control_service(&self, name: &str, action: ServiceAction) -> Result<()> {
         services::control_service(name, action)
     }
-
     fn list_startup(&self) -> Result<Vec<StartupItem>> {
         Ok(startup::list_startup())
     }
     fn set_startup_enabled(&self, item_id: &str, location: &str, enabled: bool) -> Result<()> {
         startup::set_startup_enabled(item_id, location, enabled)
     }
-
     fn list_user_sessions(&self) -> Result<Vec<UserSession>> {
         users::list_sessions()
     }
     fn control_user_session(&self, session_id: u32, action: UserSessionAction) -> Result<()> {
         users::control_session(session_id, action)
     }
-
     fn kill_process(&self, pid: u32, tree: bool) -> Result<()> {
         process_ops::kill_process(pid, tree)
     }
@@ -158,7 +152,6 @@ impl PlatformActions for WinActions {
     fn set_efficiency_mode(&self, pid: u32, on: bool) -> Result<()> {
         process_ops::set_efficiency_mode(pid, on)
     }
-
     fn is_elevated(&self) -> bool {
         process_ops::is_elevated()
     }
@@ -171,6 +164,31 @@ impl PlatformActions for WinActions {
     fn relaunch_elevated(&self) -> Result<()> {
         process_ops::relaunch_elevated()
     }
+
+    fn task_manager_replacement_state(&self) -> TaskManagerReplacementState {
+        match taskmgr_replacement::state() {
+            taskmgr_replacement::State::Disabled => TaskManagerReplacementState::Disabled,
+            taskmgr_replacement::State::Enabled => TaskManagerReplacementState::Enabled,
+            taskmgr_replacement::State::Stale(v) => TaskManagerReplacementState::Stale(v),
+            taskmgr_replacement::State::Conflict(v) => TaskManagerReplacementState::Conflict(v),
+        }
+    }
+
+    fn set_task_manager_replacement(&self, enabled: bool) -> Result<()> {
+        // HKLM writes need elevation. Keep the main GUI unelevated and launch
+        // a short-lived helper through the existing ShellExecute("runas") path.
+        if process_ops::is_elevated() {
+            return taskmgr_replacement::set_direct(enabled);
+        }
+        let exe = std::env::current_exe()
+            .map_err(|e| tm_core::TmError::platform("current_exe", e.to_string()))?;
+        let action = if enabled { "enable" } else { "disable" };
+        process_ops::run_new_task(
+            &format!("\"{}\" --taskmgr-integration={action}", exe.to_string_lossy()),
+            true,
+        )
+    }
+
     fn create_dump_file(&self, pid: u32, path: &std::path::Path) -> Result<()> {
         process_ops::create_dump_file(pid, path)
     }
@@ -183,15 +201,12 @@ impl PlatformActions for WinActions {
     fn open_url(&self, url: &str) -> Result<()> {
         process_ops::open_url(url)
     }
-
     fn last_bios_time_ms(&self) -> Option<u64> {
         last_bios_time_ms()
     }
-
     fn process_icon_rgba(&self, exe_path: &str) -> Option<(u32, u32, Vec<u8>)> {
         icons::extract_icon_rgba(exe_path).map(|ic| (ic.width, ic.height, ic.rgba))
     }
-
     fn backend_name(&self) -> &'static str {
         "win32"
     }

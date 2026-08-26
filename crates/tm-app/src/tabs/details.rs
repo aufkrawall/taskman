@@ -1,10 +1,7 @@
 //! Details tab: dense flat process table with stable column ids.
 //!
-//! Sorting is keyed by [`ColumnId`], never by positional index — adding or
-//! reordering a column cannot silently break comparator mappings (§12.1).
-//! Elevation and UAC virtualization come from real token queries; missing
-//! telemetry renders as "Unknown", never fabricated values. GPU engine shows
-//! the dominant engine label, not a percentage.
+//! Sorting is keyed by [`ColumnId`], never by positional index. Missing
+//! telemetry renders as "—"/"Unknown", never as a fabricated zero.
 
 use eframe::egui;
 use std::cmp::Ordering as CmpOrdering;
@@ -19,7 +16,6 @@ use crate::search;
 use crate::theme;
 use crate::widgets::tablekit::{self, TmColumn};
 
-/// Stable detail-column identity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum ColumnId {
     Name,
@@ -33,34 +29,46 @@ pub enum ColumnId {
     Uac,
     GpuUtil,
     GpuEngine,
+    Priority,
+    Threads,
+    Handles,
+    CpuTime,
+    Commit,
+    PeakMemory,
+    GpuDedicated,
+    GpuShared,
+    CommandLine,
 }
 
 impl ColumnId {
-    /// Typed comparator for THIS column's own field — the single source of
-    /// truth for both sorting behavior and the every-column-sorts-its-field
-    /// regression test.
     pub fn compare(self, a: &ProcessEntry, b: &ProcessEntry) -> CmpOrdering {
         match self {
             ColumnId::Name => cmp_ignore_case(a.shown_name(), b.shown_name()),
             ColumnId::Pid => a.pid.cmp(&b.pid),
             ColumnId::Status => status_rank(a.status).cmp(&status_rank(b.status)),
             ColumnId::User => cmp_option_str(a.user.as_deref(), b.user.as_deref()),
-            ColumnId::Cpu => a
-                .cpu_pct
-                .partial_cmp(&b.cpu_pct)
-                .unwrap_or(CmpOrdering::Equal),
+            ColumnId::Cpu => a.cpu_pct.partial_cmp(&b.cpu_pct).unwrap_or(CmpOrdering::Equal),
             ColumnId::Memory => a.mem_bytes.cmp(&b.mem_bytes),
             ColumnId::Platform => a.wow64.cmp(&b.wow64),
             ColumnId::Elevated => a.elevated.cmp(&b.elevated),
-            // UAC virtualization must sort by its own value, never priority.
             ColumnId::Uac => uac_rank(a.uac_virtualization).cmp(&uac_rank(b.uac_virtualization)),
             ColumnId::GpuUtil => a
                 .gpu_util_pct
                 .partial_cmp(&b.gpu_util_pct)
                 .unwrap_or(CmpOrdering::Equal),
-            // Engine labels sort lexically; processes without an engine go last.
             ColumnId::GpuEngine => {
                 cmp_option_str(a.gpu_engine_label.as_deref(), b.gpu_engine_label.as_deref())
+            }
+            ColumnId::Priority => a.priority.cmp(&b.priority),
+            ColumnId::Threads => a.threads.cmp(&b.threads),
+            ColumnId::Handles => a.handles.cmp(&b.handles),
+            ColumnId::CpuTime => cmp_option_f64(a.cpu_time_s, b.cpu_time_s),
+            ColumnId::Commit => a.commit_bytes.cmp(&b.commit_bytes),
+            ColumnId::PeakMemory => a.peak_mem_bytes.cmp(&b.peak_mem_bytes),
+            ColumnId::GpuDedicated => a.gpu_dedicated_bytes.cmp(&b.gpu_dedicated_bytes),
+            ColumnId::GpuShared => a.gpu_shared_bytes.cmp(&b.gpu_shared_bytes),
+            ColumnId::CommandLine => {
+                cmp_option_str(a.command_line.as_deref(), b.command_line.as_deref())
             }
         }
     }
@@ -109,14 +117,23 @@ fn cmp_option_str(a: Option<&str>, b: Option<&str>) -> CmpOrdering {
     }
 }
 
+fn cmp_option_f64(a: Option<f64>, b: Option<f64>) -> CmpOrdering {
+    match (a, b) {
+        (Some(x), Some(y)) => x.partial_cmp(&y).unwrap_or(CmpOrdering::Equal),
+        (Some(_), None) => CmpOrdering::Less,
+        (None, Some(_)) => CmpOrdering::Greater,
+        (None, None) => CmpOrdering::Equal,
+    }
+}
+
 #[derive(Clone, Copy)]
 struct ColSpec {
     cid: ColumnId,
     col: fn() -> TmColumn,
+    default_visible: bool,
 }
 
 impl ColSpec {
-    /// Localized label of this column (Select-columns dialog).
     fn label(self) -> &'static str {
         match self.cid {
             ColumnId::Name => i18n::tr(K::ColName),
@@ -130,93 +147,69 @@ impl ColSpec {
             ColumnId::Uac => i18n::tr(K::ColUac),
             ColumnId::GpuUtil => i18n::tr(K::ColGpu),
             ColumnId::GpuEngine => i18n::tr(K::ColGpuEngine),
+            ColumnId::Priority => i18n::tr(K::Priority),
+            ColumnId::Threads => i18n::tr(K::StatThreads),
+            ColumnId::Handles => i18n::tr(K::StatHandles),
+            ColumnId::CpuTime => "CPU time",
+            ColumnId::Commit => "Commit size",
+            ColumnId::PeakMemory => "Peak working set",
+            ColumnId::GpuDedicated => "Dedicated GPU memory",
+            ColumnId::GpuShared => "Shared GPU memory",
+            ColumnId::CommandLine => "Command line",
         }
     }
 }
 
-/// The registered catalog. Adding a column here automatically participates
-/// in sorting, persistence and rendering order.
 const COLUMNS: &[ColSpec] = &[
-    ColSpec {
-        cid: ColumnId::Name,
-        // Audit P0.1 parity: configured width instead of viewport fill.
-        col: || TmColumn::text("name", i18n::tr(K::ColName), 340.0),
-    },
-    ColSpec {
-        cid: ColumnId::Pid,
-        col: || TmColumn::text("pid", i18n::tr(K::ColPid), 90.0),
-    },
-    ColSpec {
-        cid: ColumnId::Status,
-        col: || TmColumn::text("status", i18n::tr(K::ColStatus), 150.0),
-    },
-    ColSpec {
-        cid: ColumnId::User,
-        col: || TmColumn::text("user", i18n::tr(K::ColUsername), 120.0),
-    },
-    ColSpec {
-        cid: ColumnId::Cpu,
-        col: || TmColumn::num("cpu", i18n::tr(K::ColCpu), 64.0),
-    },
-    ColSpec {
-        cid: ColumnId::Memory,
-        col: || TmColumn::num("mem", i18n::tr(K::ColMemory), 130.0),
-    },
-    ColSpec {
-        cid: ColumnId::Platform,
-        col: || TmColumn::text("platform", i18n::tr(K::ColPlatform), 90.0),
-    },
-    ColSpec {
-        cid: ColumnId::Elevated,
-        col: || TmColumn::text("elevated", i18n::tr(K::ColElevated), 110.0),
-    },
-    ColSpec {
-        cid: ColumnId::Uac,
-        col: || TmColumn::text("uac", i18n::tr(K::ColUac), 160.0),
-    },
-    // Separate GPU utilization (%) and GPU engine label columns (§12.4).
-    ColSpec {
-        cid: ColumnId::GpuUtil,
-        col: || TmColumn::num("gpu", i18n::tr(K::ColGpu), 80.0),
-    },
-    ColSpec {
-        cid: ColumnId::GpuEngine,
-        col: || TmColumn::text("gpuengine", i18n::tr(K::ColGpuEngine), 170.0),
-    },
+    ColSpec { cid: ColumnId::Name, col: || TmColumn::text("name", i18n::tr(K::ColName), 340.0), default_visible: true },
+    ColSpec { cid: ColumnId::Pid, col: || TmColumn::text("pid", i18n::tr(K::ColPid), 90.0), default_visible: true },
+    ColSpec { cid: ColumnId::Status, col: || TmColumn::text("status", i18n::tr(K::ColStatus), 150.0), default_visible: true },
+    ColSpec { cid: ColumnId::User, col: || TmColumn::text("user", i18n::tr(K::ColUsername), 120.0), default_visible: true },
+    ColSpec { cid: ColumnId::Cpu, col: || TmColumn::num("cpu", i18n::tr(K::ColCpu), 64.0), default_visible: true },
+    ColSpec { cid: ColumnId::Memory, col: || TmColumn::num("mem", i18n::tr(K::ColMemory), 130.0), default_visible: true },
+    ColSpec { cid: ColumnId::Platform, col: || TmColumn::text("platform", i18n::tr(K::ColPlatform), 90.0), default_visible: true },
+    ColSpec { cid: ColumnId::Elevated, col: || TmColumn::text("elevated", i18n::tr(K::ColElevated), 110.0), default_visible: true },
+    ColSpec { cid: ColumnId::Uac, col: || TmColumn::text("uac", i18n::tr(K::ColUac), 160.0), default_visible: true },
+    ColSpec { cid: ColumnId::GpuUtil, col: || TmColumn::num("gpu", i18n::tr(K::ColGpu), 80.0), default_visible: true },
+    ColSpec { cid: ColumnId::GpuEngine, col: || TmColumn::text("gpuengine", i18n::tr(K::ColGpuEngine), 170.0), default_visible: true },
+    ColSpec { cid: ColumnId::Priority, col: || TmColumn::text("priority", i18n::tr(K::Priority), 130.0), default_visible: false },
+    ColSpec { cid: ColumnId::Threads, col: || TmColumn::num("threads", i18n::tr(K::StatThreads), 90.0), default_visible: false },
+    ColSpec { cid: ColumnId::Handles, col: || TmColumn::num("handles", i18n::tr(K::StatHandles), 90.0), default_visible: false },
+    ColSpec { cid: ColumnId::CpuTime, col: || TmColumn::num("cputime", "CPU time", 110.0), default_visible: false },
+    ColSpec { cid: ColumnId::Commit, col: || TmColumn::num("commit", "Commit size", 130.0), default_visible: false },
+    ColSpec { cid: ColumnId::PeakMemory, col: || TmColumn::num("peakmem", "Peak working set", 145.0), default_visible: false },
+    ColSpec { cid: ColumnId::GpuDedicated, col: || TmColumn::num("gpudedicated", "Dedicated GPU memory", 165.0), default_visible: false },
+    ColSpec { cid: ColumnId::GpuShared, col: || TmColumn::num("gpushared", "Shared GPU memory", 155.0), default_visible: false },
+    ColSpec { cid: ColumnId::CommandLine, col: || TmColumn::text("commandline", "Command line", 360.0), default_visible: false },
 ];
 
 pub struct State {
-    /// Sorted column expressed by id (stable across catalog changes).
     pub sort_col: ColumnId,
     pub ascending: bool,
     pub filter: String,
     pub cache: Option<Cache>,
-    /// Which registered columns are currently displayed. This set IS the
-    /// single source of truth: telemetry demand derives from it (audit P0.3)
-    /// — no separate boolean can drift from what the table actually shows.
     pub visible: BTreeSet<ColumnId>,
-    /// Select-columns dialog open flag.
     pub select_columns_open: bool,
 }
 
 impl State {
-    /// True when any VISIBLE column requires GPU-family telemetry. Deriving
-    /// demand from the real column state closes the old mismatch where GPU
-    /// columns could render while their sampling was never requested.
     pub fn requires_gpu_telemetry(&self) -> bool {
-        self.visible
-            .iter()
-            .any(|cid| matches!(cid, ColumnId::GpuUtil | ColumnId::GpuEngine))
+        self.visible.iter().any(|cid| {
+            matches!(
+                cid,
+                ColumnId::GpuUtil
+                    | ColumnId::GpuEngine
+                    | ColumnId::GpuDedicated
+                    | ColumnId::GpuShared
+            )
+        })
     }
 
-    /// Whether this column id should be painted this frame.
     pub fn is_visible(&self, cid: ColumnId) -> bool {
         self.visible.contains(&cid)
     }
 
-    /// Toggle one column's visibility (Select-columns dialog).
     pub fn set_visible(&mut self, cid: ColumnId, on: bool) {
-        // Never allow hiding EVERY column.
         if !on && self.visible.len() <= 1 && self.visible.contains(&cid) {
             return;
         }
@@ -224,16 +217,18 @@ impl State {
             self.visible.insert(cid);
         } else {
             self.visible.remove(&cid);
+            if self.sort_col == cid {
+                self.sort_col = ColumnId::Name;
+                self.ascending = true;
+            }
         }
+        self.invalidate();
     }
 
-    /// Language generation participates in the row-cache key so labels
-    /// rebuild on live language switches.
     pub fn lang_generation(&self) -> u64 {
         i18n::lang() as u64
     }
 
-    /// Drop the display cache (F5 / language change).
     pub fn invalidate(&mut self) {
         self.cache = None;
     }
@@ -246,7 +241,11 @@ impl Default for State {
             ascending: true,
             filter: String::new(),
             cache: None,
-            visible: COLUMNS.iter().map(|c| c.cid).collect(),
+            visible: COLUMNS
+                .iter()
+                .filter(|c| c.default_visible)
+                .map(|c| c.cid)
+                .collect(),
             select_columns_open: false,
         }
     }
@@ -258,39 +257,54 @@ pub struct Cache {
 }
 
 pub struct Row {
-    pub gpu_util_s: String,
     pub pid: u32,
-    /// Process identity guard, carried into destructive actions.
     pub start_epoch_s: Option<i64>,
     pub name: String,
     pub icon_path: Option<String>,
     pub pid_s: String,
-    pub status: &'static str,
+    pub status: String,
     pub user: String,
     pub cpu_s: String,
     pub mem_s: String,
-    pub platform: &'static str,
-    pub elevated: &'static str,
-    pub uac: &'static str,
+    pub platform: String,
+    pub elevated: String,
+    pub uac: String,
+    pub gpu_util_s: String,
     pub gpu_engine_s: String,
+    pub priority_s: String,
+    pub threads_s: String,
+    pub handles_s: String,
+    pub cpu_time_s: String,
+    pub commit_s: String,
+    pub peak_mem_s: String,
+    pub gpu_dedicated_s: String,
+    pub gpu_shared_s: String,
+    pub command_line_s: String,
 }
 
 impl Row {
-    /// The display string for a registered column id — the mapping painted
-    /// by the dynamic visible-column renderer.
     pub fn field(&self, cid: ColumnId) -> &str {
         match cid {
             ColumnId::Name => &self.name,
             ColumnId::Pid => &self.pid_s,
-            ColumnId::Status => self.status,
+            ColumnId::Status => &self.status,
             ColumnId::User => &self.user,
             ColumnId::Cpu => &self.cpu_s,
             ColumnId::Memory => &self.mem_s,
-            ColumnId::Platform => self.platform,
-            ColumnId::Elevated => self.elevated,
-            ColumnId::Uac => self.uac,
+            ColumnId::Platform => &self.platform,
+            ColumnId::Elevated => &self.elevated,
+            ColumnId::Uac => &self.uac,
             ColumnId::GpuUtil => &self.gpu_util_s,
             ColumnId::GpuEngine => &self.gpu_engine_s,
+            ColumnId::Priority => &self.priority_s,
+            ColumnId::Threads => &self.threads_s,
+            ColumnId::Handles => &self.handles_s,
+            ColumnId::CpuTime => &self.cpu_time_s,
+            ColumnId::Commit => &self.commit_s,
+            ColumnId::PeakMemory => &self.peak_mem_s,
+            ColumnId::GpuDedicated => &self.gpu_dedicated_s,
+            ColumnId::GpuShared => &self.gpu_shared_s,
+            ColumnId::CommandLine => &self.command_line_s,
         }
     }
 }
@@ -323,9 +337,6 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
                 app.refresh_all();
                 ui.close();
             }
-            // Select columns (audit P0.3/§14 groundwork): visibility set
-            // doubles as the telemetry-demand source, so the dialog and the
-            // sampling engine can never disagree.
             if ui.button(i18n::tr(K::SelectColumns)).clicked() {
                 app.details_state.select_columns_open = true;
                 ui.close();
@@ -333,7 +344,6 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
         },
     );
 
-    // Live search filter from the details tab itself.
     if !app.details_state.filter.is_empty() {
         ui.horizontal(|ui| {
             ui.add_space(16.0);
@@ -354,8 +364,6 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
         });
     }
 
-    // Consume a pending cross-tab navigation: select the EXACT process
-    // identity and scroll it into view (§11.5).
     if let Some(focus) = app.pending_details_focus.take() {
         app.selected_process = Some(focus.0.clone());
         app.search.clear();
@@ -363,18 +371,14 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
         app.scroll_to_pid = Some(focus.0.pid);
     }
 
-    // Visible column list for THIS frame (hidden columns are skipped in both
-    // header and body so indices always agree).
     let visible_cols: Vec<ColSpec> = COLUMNS
         .iter()
         .copied()
         .filter(|c| app.details_state.is_visible(c.cid))
         .collect();
     let cols_rendered: Vec<TmColumn> = visible_cols.iter().map(|c| (c.col)()).collect();
-
     let mut table = app.make_table("details", cols_rendered);
 
-    // Rebuild the row model only when snapshot/search/sort/lang changes.
     let key = (
         snap.timestamp_ms,
         app.details_state.lang_generation(),
@@ -391,11 +395,22 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
         });
     }
     let rows = &cache.as_ref().expect("cache").rows;
+    prepare_auto_fit_widths(ui, &mut table, &visible_cols, rows);
 
     let avail = tablekit::table_avail(ui);
     let sorted_pos = visible_cols
         .iter()
         .position(|c| c.cid == app.details_state.sort_col);
+
+    // Capture the on-screen header bounds before the table consumes the body.
+    // Secondary-click in this area opens the same visibility dialog as the
+    // overflow command, matching Task Manager's column-header affordance.
+    let header_min = ui.cursor().min;
+    let header_rect = egui::Rect::from_min_size(
+        header_min,
+        egui::vec2(avail.min(table.total_width()), tablekit::HEADER_H1),
+    );
+
     let clicked = tablekit::scrolled_rows(
         "details",
         ui,
@@ -429,7 +444,7 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
                         .and_then(|p| app.shared.icons.get(ui.ctx(), &app.actions, p, 6));
                     table.icon_cell(ui, rect, tex.as_ref(), pal.accent);
                     let name_rect = table.col_rect(0, rect);
-                    ui.painter().text(
+                    ui.painter_at(name_rect).text(
                         egui::Pos2::new(name_rect.left() + 56.0, rect.center().y),
                         egui::Align2::LEFT_CENTER,
                         &row.name,
@@ -438,16 +453,14 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
                     );
                 }
 
-                // Remaining VISIBLE columns paint by position; memory stays
-                // right-aligned like TM.
                 let first_text_col = if tex_visible { 1 } else { 0 };
                 for (pos, spec) in visible_cols.iter().enumerate().skip(first_text_col) {
                     let cid = spec.cid;
                     let text = row.field(cid);
-                    if cid == ColumnId::Memory {
-                        let mem_rect = table.col_rect(pos, rect);
-                        ui.painter().text(
-                            egui::Pos2::new(mem_rect.right() - 10.0, rect.center().y),
+                    if cid_is_numeric(cid) {
+                        let cell = table.col_rect(pos, rect);
+                        ui.painter_at(cell).text(
+                            egui::Pos2::new(cell.right() - 10.0, rect.center().y),
                             egui::Align2::RIGHT_CENTER,
                             text,
                             egui::FontId::proportional(tablekit::FONT_ROW),
@@ -465,7 +478,6 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
                     });
                 }
                 resp.context_menu(|ui| {
-                    // Re-fetch the live entry for the context menu actions.
                     if let Some(p) = snap.process(row.pid) {
                         context_menu(app, ui, p);
                     }
@@ -473,6 +485,15 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
             }
         },
     );
+
+    let header_secondary = ui.ctx().input(|i| {
+        i.pointer.button_clicked(egui::PointerButton::Secondary)
+            && i.pointer.interact_pos().is_some_and(|p| header_rect.contains(p))
+    });
+    if header_secondary {
+        app.details_state.select_columns_open = true;
+    }
+
     if let Some(display_idx) = clicked
         && let Some(spec) = visible_cols.get(display_idx)
     {
@@ -490,14 +511,26 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
     select_columns_dialog(app, &ctx_from(ui), &pal);
 }
 
-/// Small helper: clone the context out of the frame UI.
+fn prepare_auto_fit_widths(
+    ui: &egui::Ui,
+    table: &mut tablekit::TmTable,
+    visible_cols: &[ColSpec],
+    rows: &[Row],
+) {
+    for (pos, spec) in visible_cols.iter().enumerate() {
+        let mut width = tablekit::text_width(ui, spec.label(), tablekit::FONT_HDR_LABEL) + 28.0;
+        for row in rows {
+            let extra = if spec.cid == ColumnId::Name { 66.0 } else { 22.0 };
+            width = width.max(tablekit::text_width(ui, row.field(spec.cid), tablekit::FONT_ROW) + extra);
+        }
+        table.set_auto_fit_width(pos, width.ceil());
+    }
+}
+
 fn ctx_from(ui: &egui::Ui) -> egui::Context {
     ui.ctx().clone()
 }
 
-/// Select-columns dialog (audit P0.3 / §14 groundwork): one checkbox per
-/// registered column. The resulting visibility set IS the source of truth
-/// for both rendering and telemetry demand, so the two can never drift.
 fn select_columns_dialog(app: &mut TaskManApp, ctx: &egui::Context, pal: &theme::Palette) {
     if !app.details_state.select_columns_open {
         return;
@@ -509,9 +542,9 @@ fn select_columns_dialog(app: &mut TaskManApp, ctx: &egui::Context, pal: &theme:
         .resizable(false)
         .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
         .show(ctx, |ui| {
-            ui.set_min_width(260.0);
+            ui.set_min_width(300.0);
             egui::ScrollArea::vertical()
-                .max_height(340.0)
+                .max_height(430.0)
                 .show(ui, |ui| {
                     for spec in COLUMNS.iter().copied() {
                         let mut on = app.details_state.is_visible(spec.cid);
@@ -535,7 +568,20 @@ fn select_columns_dialog(app: &mut TaskManApp, ctx: &egui::Context, pal: &theme:
 }
 
 fn cid_is_numeric(cid: ColumnId) -> bool {
-    matches!(cid, ColumnId::Pid | ColumnId::Cpu | ColumnId::Memory)
+    matches!(
+        cid,
+        ColumnId::Pid
+            | ColumnId::Cpu
+            | ColumnId::Memory
+            | ColumnId::GpuUtil
+            | ColumnId::Threads
+            | ColumnId::Handles
+            | ColumnId::CpuTime
+            | ColumnId::Commit
+            | ColumnId::PeakMemory
+            | ColumnId::GpuDedicated
+            | ColumnId::GpuShared
+    )
 }
 
 fn effective_search(app: &TaskManApp) -> String {
@@ -546,14 +592,28 @@ fn effective_search(app: &TaskManApp) -> String {
     }
 }
 
+fn priority_label(p: PriorityClass) -> &'static str {
+    match p {
+        PriorityClass::Realtime => i18n::tr(K::PrioRealtime),
+        PriorityClass::High => i18n::tr(K::PrioHigh),
+        PriorityClass::AboveNormal => i18n::tr(K::PrioAboveNormal),
+        PriorityClass::Normal => i18n::tr(K::PrioNormal),
+        PriorityClass::BelowNormal => i18n::tr(K::PrioBelowNormal),
+        PriorityClass::Low => i18n::tr(K::PrioLow),
+        PriorityClass::Unknown => "—",
+    }
+}
+
+fn opt_u64_bytes(v: Option<u64>) -> String {
+    v.map(format::format_k).unwrap_or_else(|| "—".into())
+}
+
 fn build_rows(
     snap: &tm_core::model::Snapshot,
     raw_search: &str,
     sort_col: ColumnId,
     ascending: bool,
 ) -> Vec<Row> {
-    // Shared matcher (audit §5): binary name, display name, PID and
-    // publisher/company — identical semantics to the Processes tab.
     let q = search::Query::new(raw_search);
     let mut list: Vec<&ProcessEntry> = snap
         .processes
@@ -569,54 +629,53 @@ fn build_rows(
     list.into_iter()
         .map(|p| {
             let status = match p.status {
-                ProcStatus::Running => "",
-                ProcStatus::Suspended => i18n::tr(K::StSuspended),
-                ProcStatus::NotResponding => i18n::tr(K::StNotResponding),
+                ProcStatus::Running => "".to_string(),
+                ProcStatus::Suspended => i18n::tr(K::StSuspended).to_string(),
+                ProcStatus::NotResponding => i18n::tr(K::StNotResponding).to_string(),
             };
             let platform = match p.wow64 {
-                Some(true) => i18n::tr(K::Bit32),
-                _ => i18n::tr(K::Bit64),
+                Some(true) => i18n::tr(K::Bit32).to_string(),
+                Some(false) => i18n::tr(K::Bit64).to_string(),
+                None => "—".to_string(),
             };
-            // Real token elevation when queried; SYSTEM/Idle fallback stays
-            // because their tokens cannot be opened at all.
             let elevated = match p.elevated {
-                Some(true) => i18n::tr(K::Yes),
-                Some(false) => i18n::tr(K::No),
+                Some(true) => i18n::tr(K::Yes).to_string(),
+                Some(false) => i18n::tr(K::No).to_string(),
                 None if p.user.as_deref() == Some("SYSTEM") || matches!(p.pid, 4 | 0) => {
-                    i18n::tr(K::Yes)
+                    i18n::tr(K::Yes).to_string()
                 }
-                None => i18n::tr(K::UacUnknown),
+                None => i18n::tr(K::UacUnknown).to_string(),
             };
-            // Token virtualization state — never inferred from user/pid.
             let uac = match p.uac_virtualization {
-                Some(UacVirtualization::Enabled) => i18n::tr(K::EnabledWord),
-                Some(UacVirtualization::Disabled) => i18n::tr(K::DisabledWord),
-                Some(UacVirtualization::NotAllowed) => i18n::tr(K::NotAllowed),
-                _ => i18n::tr(K::UacUnknown),
+                Some(UacVirtualization::Enabled) => i18n::tr(K::EnabledWord).to_string(),
+                Some(UacVirtualization::Disabled) => i18n::tr(K::DisabledWord).to_string(),
+                Some(UacVirtualization::NotAllowed) => i18n::tr(K::NotAllowed).to_string(),
+                _ => i18n::tr(K::UacUnknown).to_string(),
             };
             Row {
-                gpu_util_s: p
-                    .gpu_util_pct
-                    .map(format::format_pct_cell)
-                    .unwrap_or_default(),
                 pid: p.pid,
                 start_epoch_s: p.start_epoch_s,
                 name: p.shown_name().to_string(),
-                icon_path: p
-                    .exe_path
-                    .as_ref()
-                    .map(|x| x.to_string_lossy().into_owned()),
+                icon_path: p.exe_path.as_ref().map(|x| x.to_string_lossy().into_owned()),
                 pid_s: p.pid.to_string(),
                 status,
-                user: p.user.clone().unwrap_or_default(),
+                user: p.user.clone().unwrap_or_else(|| "—".into()),
                 cpu_s: format::format_cpu_detail(p.cpu_pct),
                 mem_s: format::format_k(p.mem_bytes),
                 platform,
                 elevated,
                 uac,
-                // The engine column shows the dominant engine label — not a
-                // percentage (§12.4).
-                gpu_engine_s: p.gpu_engine_label.clone().unwrap_or_default(),
+                gpu_util_s: p.gpu_util_pct.map(format::format_pct_cell).unwrap_or_else(|| "—".into()),
+                gpu_engine_s: p.gpu_engine_label.clone().unwrap_or_else(|| "—".into()),
+                priority_s: priority_label(p.priority).to_string(),
+                threads_s: p.threads.map(|v| v.to_string()).unwrap_or_else(|| "—".into()),
+                handles_s: p.handles.map(|v| v.to_string()).unwrap_or_else(|| "—".into()),
+                cpu_time_s: p.cpu_time_s.map(|v| format!("{v:.2} s")).unwrap_or_else(|| "—".into()),
+                commit_s: opt_u64_bytes(p.commit_bytes),
+                peak_mem_s: opt_u64_bytes(p.peak_mem_bytes),
+                gpu_dedicated_s: opt_u64_bytes(p.gpu_dedicated_bytes),
+                gpu_shared_s: opt_u64_bytes(p.gpu_shared_bytes),
+                command_line_s: p.command_line.clone().unwrap_or_else(|| "—".into()),
             }
         })
         .collect()
@@ -686,9 +745,7 @@ pub fn context_menu(app: &mut TaskManApp, ui: &mut egui::Ui, p: &ProcessEntry) {
         let actions = app.actions.clone();
         let pid = p.pid;
         let target_suspended = !suspended;
-        app.run_action(&ctx, String::new, move || {
-            actions.suspend_process(pid, target_suspended)
-        });
+        app.run_action(&ctx, String::new, move || actions.suspend_process(pid, target_suspended));
         ui.close();
     }
 
@@ -696,8 +753,6 @@ pub fn context_menu(app: &mut TaskManApp, ui: &mut egui::Ui, p: &ProcessEntry) {
 
     #[cfg(target_os = "windows")]
     {
-        // Efficiency-mode state comes straight from the OS snapshot (audit
-        // §8) — power_throttled as reported by the sampler.
         let eco_on = p.power_throttled == Some(true);
         if ui
             .button(if eco_on {
@@ -717,24 +772,17 @@ pub fn context_menu(app: &mut TaskManApp, ui: &mut egui::Ui, p: &ProcessEntry) {
             );
             ui.close();
         }
-        // Jump to the service hosted by this process (svchost.exe etc.).
         if ui.button(i18n::tr(K::GoToServices)).clicked() {
             app.goto_services_for_pid(p.pid, &ctx);
             ui.close();
         }
     }
 
-    if let Some(path) = p
-        .exe_path
-        .as_ref()
-        .map(|x| x.to_string_lossy().into_owned())
-    {
+    if let Some(path) = p.exe_path.as_ref().map(|x| x.to_string_lossy().into_owned()) {
         if ui.button(i18n::tr(K::OpenFileLocation)).clicked() {
             let actions = app.actions.clone();
             let path2 = path.clone();
-            app.run_action(&ctx, String::new, move || {
-                actions.open_file_location(&path2)
-            });
+            app.run_action(&ctx, String::new, move || actions.open_file_location(&path2));
             ui.close();
         }
         if ui.button(i18n::tr(K::CreateDumpFile)).clicked() {
@@ -743,7 +791,6 @@ pub fn context_menu(app: &mut TaskManApp, ui: &mut egui::Ui, p: &ProcessEntry) {
         }
         if ui.button(i18n::tr(K::Properties)).clicked() {
             if let Err(e) = app.actions.open_properties(&path) {
-                // Fall back to our own read-only dialog.
                 tracing::debug!(error = %e, "shell properties failed; using built-in dialog");
                 app.proc_props = Some(p.pid);
             }
@@ -760,7 +807,6 @@ fn end_process(
     tree: bool,
     name: &str,
 ) {
-    // Identity validation against the live snapshot before a destructive op.
     let live_ok = app
         .latest_snapshot()
         .as_ref()
@@ -785,7 +831,6 @@ fn end_process(
     );
 }
 
-/// Ask where to save, then write a minidump on the action executor.
 fn create_dump(app: &mut TaskManApp, ctx: &egui::Context, p: &ProcessEntry) {
     let default_name = format!("{}.dmp", p.shown_name());
     let Some(path) = rfd::FileDialog::new()
@@ -804,8 +849,6 @@ fn create_dump(app: &mut TaskManApp, ctx: &egui::Context, p: &ProcessEntry) {
     );
 }
 
-/// Built-in read-only process properties dialog (fallback when the shell's
-/// own Properties dialog is unavailable).
 pub fn process_properties_dialog(app: &mut TaskManApp, ctx: &egui::Context) {
     let mut open = true;
     egui::Window::new(i18n::tr(K::Properties))
@@ -858,9 +901,6 @@ pub fn process_properties_dialog(app: &mut TaskManApp, ctx: &egui::Context) {
                     });
                     ui.end_row();
                     ui.weak(i18n::tr(K::PropPath));
-                    // Read-only display + explicit copy button: the old code
-                    // edited `&mut path.clone()`, so edits vanished silently
-                    // while looking editable.
                     egui::ScrollArea::horizontal()
                         .id_salt("proc-path-ro")
                         .show(ui, |ui| {
@@ -890,12 +930,6 @@ pub fn process_properties_dialog(app: &mut TaskManApp, ctx: &egui::Context) {
     }
 }
 
-/// Affinity checkbox dialog (up to 64 logical processors).
-///
-/// Known limitation (documented in known-debt): machines with multiple
-/// processor groups (>64 logical CPUs) cannot express affinity beyond group
-/// zero through this dialog; the platform API is u64-mask based and needs a
-/// processor-group-aware redesign before it can be trusted there.
 pub fn affinity_dialog(
     app: &mut TaskManApp,
     ctx: &egui::Context,
@@ -972,83 +1006,56 @@ pub fn affinity_dialog(
 mod tests {
     use super::*;
 
-    /// Every registered sortable column must compare its OWN field: two
-    /// entries differing only in that field must order differently (and two
-    /// identical ones must tie). This kills the class of bugs where UAC
-    /// sorted by priority or GPU fell through to name (§25.6).
     #[test]
     fn details_every_column_sorts_its_own_field() {
-        // Fixtures start FULLY identical; each arm below then differs exactly
-        // one field so a wrong comparator cannot hide behind other deltas.
         let mk = || ProcessEntry::new(100, "same.exe");
         for spec in COLUMNS {
             let (mut a, mut b) = (mk(), mk());
-            // First: identical entries tie on every column...
-            assert_eq!(
-                spec.cid.compare(&a, &b),
-                CmpOrdering::Equal,
-                "{:?} must tie for identical entries",
-                spec.cid
-            );
-            // ...then differ exactly one field per column.
+            assert_eq!(spec.cid.compare(&a, &b), CmpOrdering::Equal);
             match spec.cid {
-                ColumnId::Name => {
-                    a.display = "aaa".into();
-                    a.name = "aaa".into();
-                    b.display = "zzz".into();
-                    b.name = "zzz".into();
-                }
-                ColumnId::Pid => {
-                    a.pid = 1;
-                    b.pid = 2;
-                }
-                ColumnId::Status => {
-                    a.status = ProcStatus::Running;
-                    b.status = ProcStatus::NotResponding;
-                }
-                ColumnId::User => {
-                    a.user = Some("alice".into());
-                    b.user = Some("bob".into());
-                }
-                ColumnId::Cpu => {
-                    a.cpu_pct = 5.0;
-                    b.cpu_pct = 50.0;
-                }
-                ColumnId::Memory => {
-                    a.mem_bytes = 100;
-                    b.mem_bytes = 200;
-                }
-                ColumnId::Platform => {
-                    a.wow64 = Some(false);
-                    b.wow64 = Some(true);
-                }
-                ColumnId::Elevated => {
-                    a.elevated = Some(false);
-                    b.elevated = Some(true);
-                }
-                ColumnId::Uac => {
-                    a.uac_virtualization = Some(UacVirtualization::Disabled);
-                    b.uac_virtualization = Some(UacVirtualization::NotAllowed);
-                }
-                ColumnId::GpuUtil => {
-                    a.gpu_util_pct = None;
-                    b.gpu_util_pct = Some(30.0);
-                }
-                ColumnId::GpuEngine => {
-                    a.gpu_engine_label = Some("GPU 0 - 3D".into());
-                    b.gpu_engine_label = Some("GPU 0 - VideoDecode".into());
-                }
+                ColumnId::Name => { a.display = "aaa".into(); a.name = "aaa".into(); b.display = "zzz".into(); b.name = "zzz".into(); }
+                ColumnId::Pid => { a.pid = 1; b.pid = 2; }
+                ColumnId::Status => { a.status = ProcStatus::Running; b.status = ProcStatus::NotResponding; }
+                ColumnId::User => { a.user = Some("alice".into()); b.user = Some("bob".into()); }
+                ColumnId::Cpu => { a.cpu_pct = 5.0; b.cpu_pct = 50.0; }
+                ColumnId::Memory => { a.mem_bytes = 100; b.mem_bytes = 200; }
+                ColumnId::Platform => { a.wow64 = Some(false); b.wow64 = Some(true); }
+                ColumnId::Elevated => { a.elevated = Some(false); b.elevated = Some(true); }
+                ColumnId::Uac => { a.uac_virtualization = Some(UacVirtualization::Disabled); b.uac_virtualization = Some(UacVirtualization::NotAllowed); }
+                ColumnId::GpuUtil => { a.gpu_util_pct = None; b.gpu_util_pct = Some(30.0); }
+                ColumnId::GpuEngine => { a.gpu_engine_label = Some("GPU 0 - 3D".into()); b.gpu_engine_label = Some("GPU 0 - VideoDecode".into()); }
+                ColumnId::Priority => { a.priority = PriorityClass::Low; b.priority = PriorityClass::High; }
+                ColumnId::Threads => { a.threads = Some(1); b.threads = Some(2); }
+                ColumnId::Handles => { a.handles = Some(1); b.handles = Some(2); }
+                ColumnId::CpuTime => { a.cpu_time_s = Some(1.0); b.cpu_time_s = Some(2.0); }
+                ColumnId::Commit => { a.commit_bytes = Some(1); b.commit_bytes = Some(2); }
+                ColumnId::PeakMemory => { a.peak_mem_bytes = Some(1); b.peak_mem_bytes = Some(2); }
+                ColumnId::GpuDedicated => { a.gpu_dedicated_bytes = Some(1); b.gpu_dedicated_bytes = Some(2); }
+                ColumnId::GpuShared => { a.gpu_shared_bytes = Some(1); b.gpu_shared_bytes = Some(2); }
+                ColumnId::CommandLine => { a.command_line = Some("a".into()); b.command_line = Some("b".into()); }
             }
-            assert_ne!(
-                spec.cid.compare(&a, &b),
-                CmpOrdering::Equal,
-                "{:?} must detect a difference in its own field",
-                spec.cid
-            );
+            assert_ne!(spec.cid.compare(&a, &b), CmpOrdering::Equal, "{:?}", spec.cid);
         }
     }
 
-    /// Regression: UAC virtualization no longer sorts by priority class.
+    #[test]
+    fn advanced_columns_are_hidden_by_default() {
+        let s = State::default();
+        assert!(!s.is_visible(ColumnId::Priority));
+        assert!(!s.is_visible(ColumnId::GpuDedicated));
+        assert!(s.is_visible(ColumnId::Name));
+    }
+
+    #[test]
+    fn hiding_sorted_column_resets_to_name() {
+        let mut s = State::default();
+        s.set_visible(ColumnId::Priority, true);
+        s.sort_col = ColumnId::Priority;
+        s.set_visible(ColumnId::Priority, false);
+        assert_eq!(s.sort_col, ColumnId::Name);
+        assert!(s.ascending);
+    }
+
     #[test]
     fn uac_sort_ignores_priority() {
         let (mut a, mut b) = (mk_proc(1, "x.exe"), mk_proc(2, "x.exe"));
@@ -1056,15 +1063,9 @@ mod tests {
         b.priority = PriorityClass::Low;
         a.uac_virtualization = Some(UacVirtualization::Enabled);
         b.uac_virtualization = Some(UacVirtualization::Enabled);
-        assert_eq!(
-            ColumnId::Uac.compare(&a, &b),
-            CmpOrdering::Equal,
-            "equal virtualization must tie even with different priorities"
-        );
+        assert_eq!(ColumnId::Uac.compare(&a, &b), CmpOrdering::Equal);
     }
 
-    /// Regression: GPU utilization sorts numerically, not by name —
-    /// deliberately with names ordered opposite to the values.
     #[test]
     fn gpu_util_sorts_by_value() {
         let (mut a, mut b) = (mk_proc(1, "z.exe"), mk_proc(2, "a.exe"));
