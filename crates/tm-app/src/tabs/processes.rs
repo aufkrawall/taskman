@@ -190,15 +190,6 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
 
     let agg = Aggregates::from_snapshot(&snap);
     let aggs = agg.strings();
-    // Memory heat normalizes against the largest row so one heavy process
-    // does not flatten everyone else's bar.
-    let mem_max = rows
-        .iter()
-        .filter_map(|r| match r {
-            DisplayRow::Process(d) => Some(d.values[1]),
-            _ => None,
-        })
-        .fold(1.0f64, f64::max);
 
     let avail = tablekit::table_avail(ui);
     let clicked = tablekit::scrolled_rows(
@@ -217,7 +208,7 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
                         group_header(app, ui, &pal, *gi, &rows, content_w);
                     }
                     Some(DisplayRow::Process(row)) => {
-                        row_ui(app, ui, &pal, table, avail, row, mem_max);
+                        row_ui(app, ui, &pal, table, avail, row);
                     }
                     None => {}
                 }
@@ -261,8 +252,8 @@ fn group_header(
     // horizontal scroll extents (and thus header/body alignment) identical.
     let (rect, resp) =
         ui.allocate_exact_size(egui::vec2(width, tablekit::ROW_H), egui::Sense::click());
-    ui.painter()
-        .rect_filled(rect, 3.0, pal.card_bg.gamma_multiply(0.5));
+    // TM group headers sit directly on the window background — no fill band
+    // (the old subtle tint read as a misplaced stripe).
     let cx = rect.left() + 14.0;
     let caret_rect =
         egui::Rect::from_center_size(egui::Pos2::new(cx, rect.center().y), egui::vec2(16.0, 16.0));
@@ -280,7 +271,7 @@ fn group_header(
         egui::Pos2::new(rect.left() + 28.0, rect.center().y),
         egui::Align2::LEFT_CENTER,
         format!("{label} ({total})"),
-        egui::FontId::proportional(14.0),
+        egui::FontId::proportional(20.0),
         pal.text,
     );
     if resp.clicked() {
@@ -288,7 +279,6 @@ fn group_header(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn row_ui(
     app: &mut TaskManApp,
     ui: &mut egui::Ui,
@@ -296,7 +286,6 @@ fn row_ui(
     table: &tablekit::TmTable,
     avail: f32,
     row: &RowData,
-    mem_max: f64,
 ) {
     let selected = app.selected_pid == Some(row.pid);
     let (rect, resp) = table.row(ui, pal, avail, selected);
@@ -327,7 +316,7 @@ fn row_ui(
         ),
         egui::Align2::LEFT_CENTER,
         &row.name,
-        egui::FontId::proportional(12.5),
+        egui::FontId::proportional(tablekit::FONT_ROW),
         pal.text,
     );
 
@@ -359,9 +348,12 @@ fn row_ui(
             "—".to_string()
         },
     ];
+    // Heat cells. Intensities only drive top-consumer detection (flat TM
+    // heat): 1.0 = real value in this column; disk/net stay unhighlighted
+    // (per-process disk is aggregated only, network unavailable on Windows).
     let intensity = [
-        (row.values[0].min(100.0) / 100.0) as f32,
-        (row.values[1] / mem_max.max(1.0)) as f32,
+        if row.values[0] > 0.0 { 1.0 } else { 0.0 },
+        if row.values[1] > 0.0 { 1.0 } else { 0.0 },
         0.0f32,
         0.0f32,
     ];

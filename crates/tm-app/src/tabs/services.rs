@@ -197,7 +197,7 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
                     egui::Pos2::new(name_rect.left() + 56.0, rect.center().y),
                     egui::Align2::LEFT_CENTER,
                     &s.name,
-                    egui::FontId::proportional(12.5),
+                    egui::FontId::proportional(tablekit::FONT_ROW),
                     pal.text,
                 );
                 table.text_cell(

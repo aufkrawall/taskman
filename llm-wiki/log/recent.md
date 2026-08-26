@@ -1,5 +1,40 @@
 # Recent Activity
 
+# Recent Activity
+
+## 2026-08-26 — Visual parity pass vs real Win11 TM (taskmanpngs/ reference)
+
+Measured the real Task Manager screenshots (taskmanpngs/1..7.png, captured at
+133% scaling) pixel-by-pixel and re-derived the design tokens. Reference
+logical sizes (Segoe cap≈0.75·font): rows 13, header labels 12, header
+aggregates 17, group headers 20–21, sidebar/search/tab-title 15, titlebar 13,
+kv rows 13 (pitch 22.5), captions 11, stat values 23, card titles 17,
+page title 31. Colors (dark): content 0x191919, sidebar/chrome 0x202020
+(sidebar LIGHTER than content), header separators 0x2D2D2D, heat base
+(17,36,62), top-consumer cell (8,51,110), heat cell separators (41,50,63).
+
+Changes:
+- theme.rs: new palette (window 0x191919, sidebar 0x202020, stroke 0x2D2D2D,
+  heat_top/heat_sep added), Body/Button text style 13.
+- tablekit.rs: ROW_H 32, HEADER_H 57; `ui.spacing_mut().item_spacing.y = 0`
+  before show_rows so rows TOUCH (the 6px default gap striped the heat
+  bands); header agg font 17 at top+19, label font 12 at bottom−13;
+  heat_cells now draws the flat TM style: base fill + brighter `heat_top`
+  cell for each column's top consumer (max intensity) + 1px separators
+  between cells. `heat_blue` gradient kept (dead_code) for future use.
+- processes.rs: group headers 20px, NO background band (ref has none);
+  heat intensities are binary (value>0 ⇒ 1.0) — top consumer per column wins.
+- users.rs/apphistory.rs: same binary intensity model.
+- app_ui.rs: nav items 15px text, h=38, accent bar 3×18; search box 495px
+  wide with 15px font; cmd buttons 13px; toasts 13px.
+- performance.rs: page title 31, right detail 17, card titles 17, card value
+  lines 13, captions 11.5, big/med stat values 23 with 13px labels
+  (56/48px blocks), kv rows 13px pitch 23.
+- chart.rs: clippy `chunks_exact(3)` → `as_chunks::<3>()`.
+
+Verified against ref by downscaling our 200%-DPI captures by 2/3 and
+comparing crops side by side (shots/ui3-*.png).
+
 ## 2026-08-26 — Column/splitter resize ACTUALLY fixed (egui delta semantics)
 
 **Root cause of "columns can't be resized" (persisted across the 2026-08-25

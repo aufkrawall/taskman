@@ -24,11 +24,17 @@ use crate::icons;
 use crate::theme::Palette;
 
 /// Row height used by all TM tables (also the virtualization unit).
-pub const ROW_H: f32 = 33.0;
+pub const ROW_H: f32 = 32.0;
 /// Header height for tables with aggregates (two-line).
-pub const HEADER_H: f32 = 56.0;
+pub const HEADER_H: f32 = 57.0;
 /// Header height for single-line headers (Details/Services/Startup).
 pub const HEADER_H1: f32 = 30.0;
+
+/// Font sizes measured from Win11 TM: header aggregate values are notably
+/// larger than row text, header labels slightly smaller.
+pub const FONT_ROW: f32 = 13.0;
+pub const FONT_HDR_LABEL: f32 = 12.0;
+pub const FONT_AGG: f32 = 17.0;
 
 /// Hard limits for user-resized columns.
 const MIN_COL_W: f32 = 40.0;
@@ -80,6 +86,9 @@ pub fn scrolled_table(
         .ctx()
         .data(|d| d.get_temp::<f32>(egui::Id::new(("tm-rowsx", id))))
         .unwrap_or(0.0);
+    // TM rows touch: no vertical item spacing between rendered rows (the
+    // default 6 px gap made the heat bands look striped).
+    ui.spacing_mut().item_spacing.y = 0.0;
 
     // Header: horizontal-only, no visible bar; follows the body's offset.
     // On the non-scrolling (vertical) axis the area must shrink to the
@@ -136,6 +145,8 @@ pub fn scrolled_rows(
         .ctx()
         .data(|d| d.get_temp::<f32>(egui::Id::new(("tm-rowsx", id))))
         .unwrap_or(0.0);
+    // See `scrolled_table`: rows must touch.
+    ui.spacing_mut().item_spacing.y = 0.0;
 
     let hdr = egui::ScrollArea::horizontal()
         .id_salt(hdr_id)
@@ -429,7 +440,7 @@ impl TmTable {
 
             let two_line = aggregates.is_some() && col.numeric;
             let label_y = if two_line {
-                cell.bottom() - 14.0
+                cell.bottom() - 13.0
             } else {
                 cell.center().y
             };
@@ -459,15 +470,15 @@ impl TmTable {
                 && let Some(agg) = aggregates.and_then(|a| a.get(agg_idx - 1))
             {
                 let agg_x = if sorted.is_some() {
-                    cell.right() - 26.0
+                    cell.right() - 28.0
                 } else {
                     cell.right() - 10.0
                 };
                 painter.text(
-                    Pos2::new(agg_x, cell.top() + 14.0),
+                    Pos2::new(agg_x, cell.top() + 19.0),
                     Align2::RIGHT_CENTER,
                     agg,
-                    FontId::proportional(12.5),
+                    FontId::proportional(FONT_AGG),
                     pal.text,
                 );
             }
@@ -483,7 +494,7 @@ impl TmTable {
                     let label_w = painter
                         .layout_no_wrap(
                             col.label.to_owned(),
-                            FontId::proportional(12.5),
+                            FontId::proportional(FONT_HDR_LABEL),
                             Color32::WHITE,
                         )
                         .size()
@@ -491,7 +502,7 @@ impl TmTable {
                     tx + label_w + 9.0
                 };
                 let cy = if two_line {
-                    cell.top() + 14.0
+                    cell.top() + 19.0
                 } else {
                     cell.top() + 10.0
                 };
@@ -502,7 +513,7 @@ impl TmTable {
                 Pos2::new(tx, label_y),
                 align,
                 col.label,
-                FontId::proportional(12.5),
+                FontId::proportional(FONT_HDR_LABEL),
                 pal.text_dim,
             );
 
@@ -647,13 +658,15 @@ impl TmTable {
             Pos2::new(cell.left() + 10.0, cell.center().y),
             Align2::LEFT_CENTER,
             text,
-            FontId::proportional(12.5),
+            FontId::proportional(FONT_ROW),
             if dim { pal.text_dim } else { pal.text },
         );
     }
 
     /// The contiguous blue heat block over numeric columns `from..`:
-    /// base navy when the row is active, per-cell brighter blue by intensity.
+    /// base navy when the row is active, the brighter `heat_top` fill on
+    /// each column's top-consumer cell (Win11 TM semantics), and thin
+    /// separators between adjacent cells.
     #[allow(clippy::too_many_arguments)]
     pub fn heat_cells(
         &self,
@@ -670,18 +683,40 @@ impl TmTable {
         if row_active {
             painter.rect_filled(span, 0.0, pal.heat_base);
         }
+        // Top-consumer detection: the highest non-zero intensity wins the
+        // brighter fill; ties light every tied cell (TM behaves the same).
+        let top = cells
+            .iter()
+            .map(|(t, _)| *t)
+            .fold(0.0f32, f32::max)
+            .max(0.05);
         for (k, (t, text)) in cells.iter().enumerate() {
             let cell = self.col_rect(from + k, avail, row);
             if row_active && *t > 0.02 {
-                painter.rect_filled(cell, 0.0, crate::theme::heat_blue(pal, *t));
+                // TM: flat base for every active cell; only the column's
+                // top consumer gets the brighter fill (no value gradient).
+                if *t >= top - f32::EPSILON && top > 0.05 {
+                    painter.rect_filled(cell, 0.0, pal.heat_top);
+                }
             }
             if !text.is_empty() {
                 painter.text(
                     Pos2::new(cell.right() - 10.0, cell.center().y),
                     Align2::RIGHT_CENTER,
                     text,
-                    FontId::proportional(12.5),
+                    FontId::proportional(FONT_ROW),
                     pal.text,
+                );
+            }
+            // Thin separator between adjacent cells (TM draws the column
+            // boundary through the blue band).
+            if row_active && k + 1 < cells.len() {
+                painter.line_segment(
+                    [
+                        Pos2::new(cell.right(), row.top()),
+                        Pos2::new(cell.right(), row.bottom()),
+                    ],
+                    Stroke::new(1.0, pal.heat_sep),
                 );
             }
         }

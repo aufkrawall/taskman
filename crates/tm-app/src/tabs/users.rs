@@ -338,7 +338,7 @@ fn user_row_ui(
         egui::Pos2::new(name_rect.left() + 56.0, rect.center().y),
         egui::Align2::LEFT_CENTER,
         format!("{} ({})", display, a.count),
-        egui::FontId::proportional(12.5),
+        egui::FontId::proportional(tablekit::FONT_ROW),
         pal.text,
     );
 
@@ -359,10 +359,12 @@ fn user_row_ui(
         "—".to_string(), // per-user network is not measurable (§16.6)
     ];
     let active_row = a.cpu > 0.0 || a.mem > 0.0 || a.disk > 0.0;
+    // Intensities only drive top-consumer detection (flat TM heat): 1.0
+    // marks "this cell has a real value"; network stays 0 (unavailable).
     let cells: Vec<(f32, String)> = vec![
-        ((a.cpu.min(100.0) / 100.0) as f32, texts[0].clone()),
-        (0.35, texts[1].clone()),
-        (0.0, texts[2].clone()),
+        (if a.cpu > 0.0 { 1.0 } else { 0.0 }, texts[0].clone()),
+        (if a.mem > 0.0 { 1.0 } else { 0.0 }, texts[1].clone()),
+        (if a.disk > 0.0 { 1.0 } else { 0.0 }, texts[2].clone()),
         (0.0, texts[3].clone()),
     ];
     table.heat_cells(ui, pal, avail, rect, 2, &cells, active_row);
@@ -426,7 +428,7 @@ fn app_row_ui(
         egui::Pos2::new(nr.left() + 56.0 + 22.0, rect.center().y),
         egui::Align2::LEFT_CENTER,
         label,
-        egui::FontId::proportional(12.5),
+        egui::FontId::proportional(tablekit::FONT_ROW),
         pal.text,
     );
     let texts = [
@@ -436,9 +438,9 @@ fn app_row_ui(
         "—".to_string(),
     ];
     let cells = vec![
-        ((vals[0] / 100.0) as f32, texts[0].clone()),
-        (0.3, texts[1].clone()),
-        (0.0, texts[2].clone()),
+        (if vals[0] > 0.0 { 1.0 } else { 0.0 }, texts[0].clone()),
+        (if vals[1] > 0.0 { 1.0 } else { 0.0 }, texts[1].clone()),
+        (if vals[2] > 0.0 { 1.0 } else { 0.0 }, texts[2].clone()),
         (0.0, texts[3].clone()),
     ];
     table.heat_cells(

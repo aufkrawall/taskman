@@ -7,7 +7,7 @@ use tm_core::i18n::{self, K};
 
 use crate::app::TaskManApp;
 use crate::theme;
-use crate::widgets::tablekit::TmColumn;
+use crate::widgets::tablekit::{self, TmColumn};
 
 fn columns() -> Vec<TmColumn> {
     vec![
@@ -47,13 +47,13 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
                     i18n::tr(K::HistorySinceLine),
                     i18n::tr(K::HistoryForAccounts)
                 ))
-                .size(12.5),
+                .size(13.0),
             );
             if ui
                 .add(
                     egui::Button::new(
                         egui::RichText::new(i18n::tr(K::ClearHistoryLink))
-                            .size(12.5)
+                            .size(13.0)
                             .color(pal.accent),
                     )
                     .frame(false),
@@ -109,12 +109,21 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
                     egui::Pos2::new(name_rect.left() + 56.0, rect.center().y),
                     egui::Align2::LEFT_CENTER,
                     name,
-                    egui::FontId::proportional(12.5),
+                    egui::FontId::proportional(tablekit::FONT_ROW),
                     pal.text,
                 );
                 let cells = vec![
-                    ((cpu_s / max_cpu) as f32, format::format_cpu_time(*cpu_s)),
-                    (0.0, format::format_bytes_loc(*net_b)),
+                    // Top-consumer heat only: the highest CPU-time row
+                    // lights up brighter; net column stays unhighlighted.
+                    (
+                        if *cpu_s > 0.0 {
+                            (*cpu_s / max_cpu) as f32
+                        } else {
+                            0.0
+                        },
+                        format::format_cpu_time(*cpu_s),
+                    ),
+                    (0.0f32, format::format_bytes_loc(*net_b)),
                 ];
                 table.heat_cells(ui, &pal, avail, rect, 1, &cells, true);
                 let _ = resp;

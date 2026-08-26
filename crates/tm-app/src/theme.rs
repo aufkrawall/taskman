@@ -21,24 +21,31 @@ pub struct Palette {
     /// Heat gradient stops (low → high utilization), blue like Win11 TM.
     pub heat_low: Color32,
     pub heat_high: Color32,
+    /// Highlight fill for the top-consumer cell of each resource column.
+    pub heat_top: Color32,
+    /// Thin separators drawn between heat cells inside the blue band.
+    pub heat_sep: Color32,
     pub ok_green: Color32,
 }
 
 pub const DARK: Palette = Palette {
-    window_bg: Color32::from_rgb(0x20, 0x20, 0x20),
-    panel_bg: Color32::from_rgb(0x27, 0x27, 0x27),
+    // Win11 TM dark: content area 0x191919, sidebar/chrome slightly lighter.
+    window_bg: Color32::from_rgb(0x19, 0x19, 0x19),
+    panel_bg: Color32::from_rgb(0x20, 0x20, 0x20),
     card_bg: Color32::from_rgb(0x2b, 0x2b, 0x2b),
     card_bg_hover: Color32::from_rgb(0x38, 0x38, 0x38),
-    sidebar_bg: Color32::from_rgb(0x1b, 0x1b, 0x1b),
+    sidebar_bg: Color32::from_rgb(0x20, 0x20, 0x20),
     text: Color32::from_rgb(0xff, 0xff, 0xff),
     text_dim: Color32::from_rgb(0x9d, 0x9d, 0x9d),
     accent: Color32::from_rgb(0x4c, 0xc2, 0xff),
     accent_text: Color32::from_rgb(0x00, 0x1b, 0x2e),
-    stroke: Color32::from_rgb(0x38, 0x38, 0x38),
+    stroke: Color32::from_rgb(0x2d, 0x2d, 0x2d),
     chart_grid: Color32::from_rgb(0x37, 0x37, 0x37),
-    heat_base: Color32::from_rgb(0x1a, 0x2a, 0x4a),
+    heat_base: Color32::from_rgb(0x11, 0x24, 0x3e),
     heat_low: Color32::from_rgb(0x1c, 0x30, 0x58),
     heat_high: Color32::from_rgb(0x3f, 0x76, 0xd0),
+    heat_top: Color32::from_rgb(0x08, 0x33, 0x6e),
+    heat_sep: Color32::from_rgb(0x29, 0x32, 0x3f),
     ok_green: Color32::from_rgb(0x6c, 0xcb, 0x6f),
 };
 
@@ -57,6 +64,8 @@ pub const LIGHT: Palette = Palette {
     heat_base: Color32::from_rgb(0xea, 0xf1, 0xfb),
     heat_low: Color32::from_rgb(0xd8, 0xe8, 0xfa),
     heat_high: Color32::from_rgb(0x9f, 0xc8, 0xf0),
+    heat_top: Color32::from_rgb(0xc5, 0xdd, 0xf7),
+    heat_sep: Color32::from_rgb(0xc8, 0xc8, 0xc8),
     ok_green: Color32::from_rgb(0x0f, 0x7b, 0x0f),
 };
 
@@ -93,14 +102,15 @@ pub fn install_visuals(ctx: &egui::Context) {
             }
             apply_text_aa(&mut style.visuals.text_options);
             // Centralized text-style ladder so egui widgets and the
-            // hand-painted chrome share one scale: body/button/table text
-            // 12.5, dialog section headings = tab titles 15.5, monospace
-            // 12.0 (debug overlay). Without this, egui's defaults (13.0/18.0)
-            // leak into every dialog, menu and label next to 12.5 chrome.
+            // hand-painted chrome share one scale, matched to Win11 TM's
+            // measured sizes: body/button/table text 13, dialog section
+            // headings = tab titles 15.5, monospace 12.0 (debug overlay).
+            // Without this, egui's defaults (13.0/18.0) leak into every
+            // dialog, menu and label next to 13 px chrome.
             style.text_styles = [
                 (egui::TextStyle::Small, FontId::proportional(11.0)),
-                (egui::TextStyle::Body, FontId::proportional(12.5)),
-                (egui::TextStyle::Button, FontId::proportional(12.5)),
+                (egui::TextStyle::Body, FontId::proportional(13.0)),
+                (egui::TextStyle::Button, FontId::proportional(13.0)),
                 (egui::TextStyle::Heading, FontId::proportional(15.5)),
                 (egui::TextStyle::Monospace, FontId::proportional(12.0)),
             ]
@@ -166,7 +176,7 @@ pub fn dark_visuals() -> Visuals {
     let mut v = Visuals::dark();
     v.panel_fill = DARK.panel_bg;
     v.extreme_bg_color = DARK.window_bg;
-    v.faint_bg_color = Color32::from_rgb(0x2a, 0x2a, 0x2a);
+    v.faint_bg_color = Color32::from_rgb(0x24, 0x24, 0x24);
     v.window_fill = Color32::from_rgb(0x2b, 0x2b, 0x2b);
     v.selection.bg_fill = DARK.accent.gamma_multiply(0.35);
     v.selection.stroke = egui::Stroke::new(1.0, DARK.accent);
@@ -174,7 +184,7 @@ pub fn dark_visuals() -> Visuals {
     // (0x2b2b2b): a same-color fill with no stroke renders the control box
     // invisible until the first hover switches to the `hovered` visuals.
     // Keep `weak_bg_fill` for buttons; give must-fill widgets their own look.
-    v.widgets.inactive.bg_fill = Color32::from_rgb(0x33, 0x33, 0x33);
+    v.widgets.inactive.bg_fill = Color32::from_rgb(0x37, 0x37, 0x37);
     v.widgets.inactive.bg_stroke = egui::Stroke::new(1.0, Color32::from_rgb(0x76, 0x76, 0x76));
     v.widgets.inactive.fg_stroke = egui::Stroke::new(1.6, Color32::from_rgb(0xd4, 0xd4, 0xd4));
     v.widgets.hovered.bg_fill = Color32::from_rgb(0x3a, 0x3a, 0x3a);
@@ -209,8 +219,10 @@ pub fn light_visuals() -> Visuals {
     v
 }
 
-/// Map normalized intensity [0..=1] to the blue heat gradient
-/// (Win11 Task Manager style value-cell background).
+/// Map normalized intensity [0..=1] to the blue heat gradient. Kept for
+/// future per-value heat rendering (tables currently use the flat TM style:
+/// base fill + brighter top-consumer cell only).
+#[allow(dead_code)]
 pub fn heat_blue(pal: &Palette, t: f32) -> Color32 {
     let t = t.clamp(0.0, 1.0);
     let f = t * t; // ease-in: small values stay near the base navy

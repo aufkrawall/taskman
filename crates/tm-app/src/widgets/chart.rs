@@ -282,7 +282,7 @@ mod tests {
         assert_eq!(mesh.vertices.len(), 2 * pts.len());
         assert_eq!(mesh.indices.len(), 6 * (pts.len() - 1));
         let dx = 5.0; // segment width
-        for tri in mesh.indices.chunks_exact(3) {
+        for tri in mesh.indices.as_chunks::<3>().0 {
             let xs: Vec<f32> = tri
                 .iter()
                 .map(|&i| mesh.vertices[i as usize].pos.x)
