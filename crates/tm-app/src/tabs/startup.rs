@@ -15,8 +15,6 @@ use crate::widgets::tablekit::{self, TmColumn};
 
 fn columns() -> Vec<TmColumn> {
     vec![
-        // Audit P0.1/§27: configured width instead of the `0.0` sentinel that
-        // used to trip elastic fill behavior.
         TmColumn::text("name", i18n::tr(K::ColName), 280.0),
         TmColumn::text("pub", i18n::tr(K::ColPublisher), 240.0),
         TmColumn::text("status", i18n::tr(K::ColStatus), 140.0),
@@ -28,7 +26,6 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
     let pal = theme::palette(ui);
     let frame_ctx = ui.ctx().clone();
 
-    // Lazy refresh in the background (registry + folder scan off the UI thread).
     {
         let stale = {
             let guard = tm_core::sync::lock(&app.shared.startup_cache);
@@ -102,11 +99,9 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
             ) {
                 app.startup_props = sel.clone();
             }
-            let _ = &sel;
         },
         |app, ui| {
             if ui.button(i18n::tr(K::RefreshNow)).clicked() {
-                // Invalidate the cache so the worker refetches immediately.
                 *tm_core::sync::lock(&app.shared.startup_cache) = None;
                 app.refresh_all();
                 ui.close();
@@ -114,7 +109,6 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
         },
     );
 
-    // "Letzte BIOS-Zeit:  17,0 Sekunden" — top right, like TM.
     if let Some(ms) = app.actions.last_bios_time_ms() {
         let (rect, _) =
             ui.allocate_exact_size(egui::vec2(ui.available_width(), 22.0), egui::Sense::hover());
@@ -133,28 +127,50 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
         );
     }
 
-    // Clone the Arc so the guard never borrows from `app` itself (the
-    // closures below need `&mut TaskManApp`).
     let cache_arc = app.shared.startup_cache.clone();
     let mut guard = tm_core::sync::lock(&cache_arc);
     let Some((items, _)) = guard.as_mut() else {
-        // Background fetch still in flight — centered placeholder like the
-        // other tabs instead of a blank pane.
         ui.centered_and_justified(|ui| ui.label(i18n::tr(K::GatheringData)));
         return;
     };
 
     let q = crate::search::Query::new(&app.search);
     let mut table = app.make_table("startup", columns());
-    let avail = crate::widgets::tablekit::table_avail(ui);
-    // Precompute visible indexes so show_rows can virtualize them.
-    // Search fields (audit §5): name AND publisher.
     let visible: Vec<usize> = items
         .iter()
         .enumerate()
         .filter(|(_, it)| q.matches_any([it.name.as_str(), it.publisher.as_deref().unwrap_or("")]))
         .map(|(i, _)| i)
         .collect();
+
+    let mut fit: Vec<f32> = table
+        .cols
+        .iter()
+        .map(|c| tablekit::text_width(ui, c.label, tablekit::FONT_HDR_LABEL) + 28.0)
+        .collect();
+    for &i in &visible {
+        let item = &items[i];
+        let status = if item.enabled {
+            i18n::tr(K::EnabledWord)
+        } else {
+            i18n::tr(K::DisabledWord)
+        };
+        let values = [
+            item.name.as_str(),
+            item.publisher.as_deref().unwrap_or(""),
+            status,
+            impact_label(app.lang(), item.impact),
+        ];
+        fit[0] = fit[0].max(tablekit::text_width(ui, values[0], tablekit::FONT_ROW) + 66.0);
+        for i in 1..4 {
+            fit[i] = fit[i].max(tablekit::text_width(ui, values[i], tablekit::FONT_ROW) + 22.0);
+        }
+    }
+    for (i, width) in fit.into_iter().enumerate() {
+        table.set_auto_fit_width(i, width.ceil());
+    }
+
+    let avail = crate::widgets::tablekit::table_avail(ui);
     tablekit::scrolled_rows(
         "startup",
         ui,
@@ -171,14 +187,13 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
                 let selected = app.selected_startup_id.as_deref() == Some(item.id.as_str());
                 let (rect, resp) = table.row(ui, &pal, selected);
 
-                // Icon: real shell icon from the command's executable.
                 let exe = exe_from_command(&item.command);
                 let tex = exe
                     .as_deref()
                     .and_then(|p| app.shared.icons.get(ui.ctx(), &app.actions, p, 4));
                 table.icon_cell(ui, rect, tex.as_ref(), pal.accent);
                 let name_rect = table.col_rect(0, rect);
-                ui.painter().text(
+                ui.painter_at(name_rect).text(
                     egui::Pos2::new(name_rect.left() + 56.0, rect.center().y),
                     egui::Align2::LEFT_CENTER,
                     &item.name,
@@ -227,7 +242,6 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
                         i18n::tr(K::EnableCmd)
                     };
                     if ui.button(label).clicked() {
-                        // Registry/folder toggling runs on the action executor.
                         let new_enabled = !item.enabled;
                         let id = item.id.clone();
                         let location = item.location.clone();
@@ -243,7 +257,7 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
                         app.run_action(&ctx2, ok_msg, move || {
                             actions.set_startup_enabled(&id, &location, new_enabled)
                         });
-                        item.enabled = new_enabled; // optimistic; refetch corrects
+                        item.enabled = new_enabled;
                         ui.close();
                     }
                     if ui.button(i18n::tr(K::Properties)).clicked() {
@@ -281,7 +295,6 @@ fn toggle_selected(app: &mut TaskManApp, enable: bool, ctx: &egui::Context) {
         && let Some(id) = app.selected_startup_id.clone()
         && let Some(item) = items.iter_mut().find(|it| it.id == id)
     {
-        // Selection is by stable id; list indexes shift on refresh.
         let actions = app.actions.clone();
         let item_id = item.id.clone();
         let location = item.location.clone();
@@ -295,11 +308,10 @@ fn toggle_selected(app: &mut TaskManApp, enable: bool, ctx: &egui::Context) {
         app.run_action(ctx, ok_msg, move || {
             actions.set_startup_enabled(&item_id, &location, enable)
         });
-        item.enabled = enable; // optimistic; next fetch corrects
+        item.enabled = enable;
     }
 }
 
-/// Localized impact labels ("Keine", "Nicht gemessen", ...).
 fn impact_label(lang: tm_core::i18n::Lang, impact: StartupImpact) -> &'static str {
     match impact {
         StartupImpact::None => i18n::tr_in(lang, K::ImpactNone),
@@ -310,7 +322,6 @@ fn impact_label(lang: tm_core::i18n::Lang, impact: StartupImpact) -> &'static st
     }
 }
 
-/// Percent-encode a query term well enough for a search URL.
 fn urlencoding_lite(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for b in s.bytes() {
@@ -325,7 +336,6 @@ fn urlencoding_lite(s: &str) -> String {
     out
 }
 
-/// Best-effort executable path out of a startup command line.
 fn exe_from_command(cmd: &str) -> Option<String> {
     let cmd = cmd.trim();
     if let Some(rest) = cmd.strip_prefix('"')
@@ -333,11 +343,9 @@ fn exe_from_command(cmd: &str) -> Option<String> {
     {
         return Some(exe.to_string());
     }
-    // First whitespace-separated token that looks like a path.
     cmd.split_whitespace().next().map(str::to_string)
 }
 
-/// Properties dialog ("Eigenschaften").
 pub fn properties_dialog(app: &mut TaskManApp, ctx: &egui::Context, _pal: &theme::Palette) {
     let mut open = true;
     egui::Window::new(i18n::tr(K::Properties))
