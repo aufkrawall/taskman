@@ -131,7 +131,7 @@ fn run_gui(mock: bool, args: &[String]) {
             opts.wgpu_options =
                 eframe::WgpuConfiguration::default().with_surface_config(eframe::SurfaceConfig {
                     present_mode: eframe::wgpu::PresentMode::Fifo,
-                    desired_maximum_frame_latency: Some(2),
+                    desired_maximum_frame_latency: Some(1),
                 });
         }
         opts
