@@ -7,6 +7,8 @@ use std::path::{Path, PathBuf};
 use tm_core::error::{Result, TmError};
 use tm_core::model::{StartupImpact, StartupItem};
 
+const TASKMAN_OVERRIDE_KEY: &str = "X-Taskman-Override=true";
+
 fn config_home() -> Option<PathBuf> {
     std::env::var("XDG_CONFIG_HOME")
         .ok()
@@ -76,9 +78,9 @@ pub fn list_autostart() -> Vec<StartupItem> {
                 // Stable identity is the XDG desktop-file id (basename), not
                 // the currently winning physical path.
                 id: format!("xdg:{file_name}"),
-                name: parsed.name.unwrap_or_else(|| {
-                    file_name.trim_end_matches(".desktop").to_string()
-                }),
+                name: parsed
+                    .name
+                    .unwrap_or_else(|| file_name.trim_end_matches(".desktop").to_string()),
                 command: parsed
                     .exec
                     .unwrap_or_else(|| parsed.source.to_string_lossy().to_string()),
@@ -133,6 +135,12 @@ fn parse_bool(s: &str) -> Option<bool> {
     }
 }
 
+fn is_taskman_override(path: &Path) -> bool {
+    std::fs::read_to_string(path)
+        .ok()
+        .is_some_and(|text| text.lines().any(|line| line.trim() == TASKMAN_OVERRIDE_KEY))
+}
+
 pub fn set_enabled(item_id: &str, enabled: bool) -> Result<()> {
     let Some(file_name) = item_id.strip_prefix("xdg:") else {
         return Err(TmError::platform("startup", "unknown item"));
@@ -147,13 +155,24 @@ pub fn set_enabled(item_id: &str, enabled: bool) -> Result<()> {
     let user_path = dir.join(file_name);
 
     if user_path.exists() {
-        set_hidden_in_file(&user_path, !enabled)?;
+        if enabled && is_taskman_override(&user_path) {
+            // Taskman created this file only to shadow a lower-precedence
+            // system entry. Removing it is the only correct way to re-enable
+            // that original entry; Hidden=false would keep shadowing it with
+            // an override that has no Exec line.
+            std::fs::remove_file(&user_path)
+                .map_err(|e| TmError::platform("remove autostart override", e.to_string()))?;
+        } else {
+            // User-owned desktop files stay user-owned; modify only Hidden.
+            set_hidden_in_file(&user_path, !enabled)?;
+        }
     } else if !enabled {
         // Same filename + Hidden=true is the standards-compliant user override
-        // for a system-wide autostart entry.
+        // for a system-wide autostart entry. Mark it so Taskman can safely
+        // remove only its own minimal override when re-enabling.
         let stem = file_name.trim_end_matches(".desktop");
         let text = format!(
-            "[Desktop Entry]\nType=Application\nName={stem}\nHidden=true\n"
+            "[Desktop Entry]\nType=Application\nName={stem}\nHidden=true\n{TASKMAN_OVERRIDE_KEY}\n"
         );
         std::fs::write(&user_path, text)
             .map_err(|e| TmError::platform("write autostart override", e.to_string()))?;
@@ -218,7 +237,7 @@ mod tests {
     }
 
     #[test]
-    fn hidden_update_preserves_desktop_file() {
+    fn hidden_update_preserves_user_desktop_file() {
         let dir = std::env::temp_dir().join(format!("taskman-xdg-edit-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
         let path = dir.join("test.desktop");
@@ -227,6 +246,21 @@ mod tests {
         let text = std::fs::read_to_string(&path).unwrap();
         assert!(text.contains("Exec=test"));
         assert!(text.contains("Hidden=true"));
+        assert!(!is_taskman_override(&path));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn owned_minimal_override_is_identifiable() {
+        let dir = std::env::temp_dir().join(format!("taskman-xdg-own-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("test.desktop");
+        std::fs::write(
+            &path,
+            format!("[Desktop Entry]\nHidden=true\n{TASKMAN_OVERRIDE_KEY}\n"),
+        )
+        .unwrap();
+        assert!(is_taskman_override(&path));
         let _ = std::fs::remove_dir_all(dir);
     }
 }
