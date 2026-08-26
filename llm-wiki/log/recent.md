@@ -2,6 +2,29 @@
 
 # Recent Activity
 
+## 2026-08-27 — Processes app-grouping parity
+
+The Processes page now builds a presentation topology instead of treating
+raw PPID as UI ownership. Explorer and common shell launchers are boundaries,
+so programs the user starts from Explorer/cmd/PowerShell/Terminal appear as
+independent app groups while helpers remain under their app family. Raw
+`ProcessEntry.ppid` is unchanged.
+
+- App membership is rebuilt from visible-window ownership while preserving
+  System classification; no-window backends retain collector categories.
+- Display parent edges are cut across category boundaries and at app roots,
+  so Explorer no longer inherits CPU/memory/subtree counts from launched apps.
+- `Apps (N)` now counts top-level app groups (matching native `Apps (9)`);
+  Background/Windows keep unflattened process counts.
+- Cyclic/malformed PPID components stay visible instead of disappearing.
+- Regression coverage covers Explorer launches, shell-launched GUI apps,
+  app-group totals, aggregate boundaries, and cycle visibility.
+- CPU load/accounting code was not changed.
+
+Validation: code was statically reviewed through the GitHub connector. This
+environment has no Rust toolchain/Windows runtime, so the requested local
+build remains the final compile/runtime/UI check.
+
 ## 2026-08-26 — audit.md Phase 1 (correctness) implemented
 
 All 11 Phase-1 items from the 2026 parity audit landed, each with
