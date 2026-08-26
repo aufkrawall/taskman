@@ -36,7 +36,6 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
         },
     );
 
-    // Caption + clear link, like TM.
     let since = format::format_date(app.app_history_db.since_epoch_s());
     ui.horizontal(|ui| {
         ui.add_space(16.0);
@@ -60,8 +59,6 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
                 )
                 .clicked()
             {
-                // clear() enqueues exactly one save on the writer; the extra
-                // synchronous save here double-wrote (§16.3).
                 app.app_history_db.clear();
                 app.shared.toast(i18n::tr(K::HistoryCleared));
             }
@@ -84,6 +81,24 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
     rows.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
     let mut table = app.make_table("apphistory", columns());
+    let mut fit = [
+        tablekit::text_width(ui, table.cols[0].label, tablekit::FONT_HDR_LABEL) + 28.0,
+        tablekit::text_width(ui, table.cols[1].label, tablekit::FONT_HDR_LABEL) + 28.0,
+        tablekit::text_width(ui, table.cols[2].label, tablekit::FONT_HDR_LABEL) + 28.0,
+    ];
+    for (name, cpu_s, net_b) in &rows {
+        fit[0] = fit[0].max(tablekit::text_width(ui, name, tablekit::FONT_ROW) + 66.0);
+        fit[1] = fit[1].max(
+            tablekit::text_width(ui, &format::format_cpu_time(*cpu_s), tablekit::FONT_ROW) + 22.0,
+        );
+        fit[2] = fit[2].max(
+            tablekit::text_width(ui, &format::format_bytes_loc(*net_b), tablekit::FONT_ROW) + 22.0,
+        );
+    }
+    for (i, width) in fit.into_iter().enumerate() {
+        table.set_auto_fit_width(i, width.ceil());
+    }
+
     // Per-column maxima over the whole model BEFORE virtualization
     // (audit P0.2) — CPU time and network traffic each highlight their own
     // top consumer.
@@ -91,7 +106,6 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
     let max_net = rows.iter().map(|r| r.2 as f64).fold(0.0f64, f64::max);
 
     let avail = crate::widgets::tablekit::table_avail(ui);
-    // Fully virtualized: no silent 500-row truncation (§16.8).
     crate::widgets::tablekit::scrolled_rows(
         "apphistory",
         ui,
@@ -109,7 +123,7 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
                 let (rect, resp) = table.row(ui, &pal, false);
                 table.icon_cell(ui, rect, None, pal.accent);
                 let name_rect = table.col_rect(0, rect);
-                ui.painter().text(
+                ui.painter_at(name_rect).text(
                     egui::Pos2::new(name_rect.left() + 56.0, rect.center().y),
                     egui::Align2::LEFT_CENTER,
                     name,
