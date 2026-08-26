@@ -1,6 +1,6 @@
 # Current State
 
-Last cross-checked: 2026-08-26
+Last cross-checked: 2026-08-27
 
 ## Summary
 
@@ -12,7 +12,7 @@ phases; **Phase 1 (correctness) is complete** — see
 `log/recent.md` and `known-debt.md` for what changed and which deviations
 are accepted (Phases 2-6 open).
 
-## Recently landed (2026-08-25)
+## Recently landed (2026-08-27)
 
 - Startup architecture: single collector built lazily ON the engine thread
   after the first presented frame; no duplicate platform stack; console
@@ -33,6 +33,12 @@ are accepted (Phases 2-6 open).
   migration, O(1) layout geometry, fixed-height virtualization everywhere,
   three Processes groups (Apps/Background/Windows), arbitrary-depth tree
   with cycle-safe O(n) subtree aggregation.
+- Processes presentation parity: app grouping is window-ownership driven
+  instead of a literal PPID tree. Explorer/console-shell launch boundaries
+  keep user-launched programs as independent top-level Apps; app resource
+  aggregates follow the display topology; `Apps (N)` counts app groups like
+  native Task Manager while Background/Windows keep process counts. Raw PPID
+  remains untouched.
 - Telemetry: TelemetryDemand gating (GPU/PDH groups warm on demand),
   LUID-aware multi-GPU merge (busiest-engine semantics, dominant engine
   label per process), real token elevation/UAC virtualization/EcoQoS state,
