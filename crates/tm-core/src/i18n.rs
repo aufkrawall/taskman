@@ -260,6 +260,20 @@ keys! {
     ColumnsHeading => ["Spaltenbreiten zurücksetzen", "Column widths"],
     ResetColWidths => ["Standardbreiten", "Default widths"],
     ColWidthsResetToast => ["Spaltenbreiten zurückgesetzt", "Column widths reset"],
+    ElevatedHeading => ["Administratorrechte", "Administrator privileges"],
+    ElevatedRunning => [
+        "Mit Administratorrechten ausgeführt.",
+        "Running with administrator privileges."
+    ],
+    ElevatedNotRunning => [
+        "Ohne Administratorrechte ausgeführt; Aktionen für erhöhte Prozesse sind eingeschränkt.",
+        "Running without administrator privileges; actions on elevated processes are limited."
+    ],
+    RestartElevated => ["Als Administrator neu starten", "Restart as administrator"],
+    RelaunchElevatedToast => [
+        "Neustart mit Administratorrechten…",
+        "Restarting with administrator privileges…"
+    ],
 
     // ------------------------------------------------ startup tab
     LastBiosTime => ["Letzte BIOS-Zeit:", "Last BIOS time:"],
