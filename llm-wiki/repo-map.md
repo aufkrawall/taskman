@@ -78,10 +78,13 @@ Rust workspace, three crates in a strict dependency chain
   testing across their full ±6 px; double-click restore is detected via
   input state because drag-only widgets never receive click flags.
 - `crates/tm-app/src/tabs/processes.rs` — Processes UI intentionally uses a
-  presentation-only app tree: Explorer/common shells are launch boundaries,
-  independently discovered windowed app roots are detached from raw PPID,
-  and aggregates follow that display topology. Do not collapse this back to
-  a literal PPID tree; raw `ProcessEntry.ppid` remains OS truth elsewhere.
+  presentation-only app tree for Apps (Explorer/common shells are launch
+  boundaries, independently discovered windowed app roots are detached from
+  raw PPID, aggregates follow the display topology), while Background/Windows
+  groups are FLAT lists (TM parity — a busy build tool under a console shell
+  must stay identifiable) and busy absorbed external tasks (≥ 1 % CPU,
+  different image) are promoted into Background. Do not collapse this back
+  to a literal PPID tree; raw `ProcessEntry.ppid` remains OS truth elsewhere.
 
 ## Test Matrix
 

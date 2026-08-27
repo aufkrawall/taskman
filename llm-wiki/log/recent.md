@@ -29,20 +29,28 @@ Three user-reported bugs fixed:
    Counter needs 2 PDH collections before formatting succeeds (matches
    existing `QueryGroup` warm-up). Verified live: idle 4.2 GHz, under load
    4.4 GHz (base 3.4).
-3. **High-CPU background/CLI tasks invisible on Processes page**: idle
-   helpers absorbed into app families are fine, but busy external tasks
-   (builds/compilers spawned by editors/terminals) were only visible as
-   anonymous aggregate inside the family row. New promotion pass in
-   `derive_display_groups` (`promote_busy_external_tasks`,
-   `is_external_family_member`, `PROMOTE_CPU_PCT = 1.0`): an absorbed
-   non-root process with cpu share ≥ 1 % whose image differs from every
-   family ancestor is reclassified to Background (with its absorbed
-   descendants, wholesale) and appears as an ordinary top-level Background
-   tree; same-image helpers (Chrome renderers etc.) stay folded like TM app
-   children. Two-phase decisions (against pre-promotion categories) keep the
-   result iteration-order independent. Existing test fixtures set explicit
-   low `cpu_pct` where promotion would otherwise trigger (proc() helper
-   defaults cpu = 1.0×pid).
+3. **High-CPU background/CLI tasks invisible on Processes page**: TWO root
+   causes, both fixed:
+   - **Background/Windows groups render as TREES** — a busy build tool under
+     a console shell (cmd → cargo → rustc, all Background) was hidden as a
+     child row under the unexpanded shell row; only the aggregate leaked
+     into the parent. Fix: Task Manager parity — **Background/Windows groups
+     are FLAT lists** (every process its own depth-0 row with its OWN values,
+     sorted by the current column, no expand handles). Only the Apps group
+     keeps the family tree. Verified with a live-system repro test: busy
+     powershell under cmd becomes a visible flat row.
+   - App-absorbed external tasks: promotion pass in `derive_display_groups`
+     (`promote_busy_external_tasks`, `is_external_family_member`,
+     `PROMOTE_CPU_PCT = 1.0`): an absorbed non-root process with cpu share
+     ≥ 1 % whose image differs from every family ancestor is reclassified to
+     Background (with its absorbed descendants, wholesale) and appears as an
+     ordinary flat Background row; same-image helpers (Chrome renderers
+     etc.) stay folded like TM app children. Two-phase decisions (against
+     pre-promotion categories) keep the result iteration-order independent.
+   Existing test fixtures set explicit low `cpu_pct` where promotion would
+   otherwise trigger (proc() helper defaults cpu = 1.0×pid). NOTE:
+   `cpu_pct` is share of TOTAL machine capacity — a full core on a 16-thread
+   machine shows as 6.25, not 100; don't key logic off raw "100%".
 
 ## 2026-08-27 — window placement UX, type-ahead scroll fixes, dialog chevrons
 
