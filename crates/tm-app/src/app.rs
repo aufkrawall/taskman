@@ -381,6 +381,7 @@ impl TaskManApp {
 
         let toasts: Arc<ToastQueue> = Arc::new(Mutex::new(Vec::new()));
         let executor = ActionExecutor::start();
+        let details_state = crate::tabs::details::State::from_settings(&settings);
 
         Self {
             engine,
@@ -416,7 +417,7 @@ impl TaskManApp {
             search: String::new(),
             processes_state: crate::tabs::processes::State::new(),
             perf_selected_key,
-            details_state: Default::default(),
+            details_state,
             selected_process: None,
             selected_user: None,
             services_selected_name: None,
@@ -680,11 +681,33 @@ impl eframe::App for TaskManApp {
             ctx.memory_mut(|m| m.request_focus(id));
         }
 
-        // Track window size for persistence (only while remembering).
+        // Persist normal window bounds continuously so an ordinary close has
+        // the latest placement even if the final platform frame omits bounds.
+        // Never overwrite normal bounds with minimized/maximized geometry.
         if self.shared.settings.remember_window {
-            let size = ctx.input(|i| i.viewport().inner_rect.map(|r| r.size()));
-            if let Some(sz) = size {
-                self.shared.settings.window_size = [sz.x, sz.y];
+            let (maximized, minimized, inner_rect, outer_rect) = ctx.input(|i| {
+                let viewport = i.viewport();
+                (
+                    viewport.maximized.unwrap_or(false),
+                    viewport.minimized.unwrap_or(false),
+                    viewport.inner_rect,
+                    viewport.outer_rect,
+                )
+            });
+            self.shared.settings.window_maximized = maximized;
+            if !maximized && !minimized {
+                if let Some(rect) = inner_rect {
+                    let sz = rect.size();
+                    if sz.x.is_finite() && sz.y.is_finite() {
+                        self.shared.settings.window_size = [sz.x, sz.y];
+                    }
+                }
+                if let Some(rect) = outer_rect {
+                    let pos = rect.min;
+                    if pos.x.is_finite() && pos.y.is_finite() {
+                        self.shared.settings.window_position = Some([pos.x, pos.y]);
+                    }
+                }
             }
         }
 
