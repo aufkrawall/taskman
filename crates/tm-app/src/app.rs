@@ -491,7 +491,8 @@ impl TaskManApp {
             Tab::Performance => {
                 d = d
                     .union(TelemetryDemand::DISK_RATE)
-                    .union(TelemetryDemand::GPU_ADAPTER);
+                    .union(TelemetryDemand::GPU_ADAPTER)
+                    .union(TelemetryDemand::CPU_SPEED);
             }
             Tab::Details if self.details_state.requires_gpu_telemetry() => {
                 d = d

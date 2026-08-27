@@ -26,7 +26,8 @@ Rust workspace, three crates in a strict dependency chain
 - `crates/tm-platform`
   - OS collectors/actions behind traits (`actions.rs`). Windows stack under
     `win/`: `sampler.rs` (sysinfo + NtQuerySystemInformation CPU accountant,
-    time-based attr TTL cache with token security queries), `cpu_load.rs`
+    time-based attr TTL cache with token security + command-line queries,
+    measured CPU speed from PDH `% Processor Performance`), `cpu_load.rs`
     (time-based CPU accounting incl. kernel/user split), `perfcounters.rs`
     (PDH split GpuPdh/DiskPdh groups with demand gating + LUID-preserving
     GPU instance parser), `gpu.rs` (DXGI discovery + LUID-keyed merge,

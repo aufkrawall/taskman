@@ -62,6 +62,83 @@ pub fn priority_class_of(pid: u32) -> PriorityClass {
     }
 }
 
+/// Full command line via ntdll!NtQueryInformationProcess with
+/// ProcessCommandLineInformation (windows-rs PROCESSINFOCLASS = 60, verified
+/// against this machine's ntdll — older references claiming class 92 do not
+/// match current Windows builds). Works with only
+/// PROCESS_QUERY_LIMITED_INFORMATION because the kernel serves the string
+/// from its cached process parameters; elevated/protected processes simply
+/// fail to open and yield None (Details renders "—").
+pub fn command_line_of(pid: u32) -> Option<String> {
+    use windows::Wdk::System::Threading::{
+        NtQueryInformationProcess, ProcessCommandLineInformation,
+    };
+    use windows::Win32::Foundation::UNICODE_STRING;
+
+    /// Command lines are bounded by the NT RTL (UNICODE_STRING max is 64 KiB);
+    /// anything claiming more is a bogus ReturnLength.
+    const MAX_QUERY_BYTES: u32 = 64 * 1024;
+    const STATUS_INFO_LENGTH_MISMATCH: i32 = 0xC000_0004u32 as i32;
+
+    unsafe {
+        let Ok(h) = open_process(pid, th::PROCESS_QUERY_LIMITED_INFORMATION) else {
+            return None;
+        };
+        let out = (|| {
+            // Size probe, then an exact-sized buffer (standard NT pattern).
+            let mut needed: u32 = 0;
+            let status = NtQueryInformationProcess(
+                h,
+                ProcessCommandLineInformation,
+                std::ptr::null_mut(),
+                0,
+                &mut needed,
+            );
+            if status.0 != STATUS_INFO_LENGTH_MISMATCH || needed == 0 {
+                return None;
+            }
+            let needed = needed.min(MAX_QUERY_BYTES);
+            let mut buf = vec![0u8; needed as usize];
+            let mut written: u32 = 0;
+            let status = NtQueryInformationProcess(
+                h,
+                ProcessCommandLineInformation,
+                buf.as_mut_ptr() as _,
+                needed,
+                &mut written,
+            );
+            if status.0 != 0 {
+                return None;
+            }
+            // The kernel writes a UNICODE_STRING whose Buffer points into our
+            // buffer; map it back to an offset and bounds-check strictly.
+            if buf.len() < std::mem::size_of::<UNICODE_STRING>() {
+                return None;
+            }
+            let us = std::ptr::read_unaligned(buf.as_ptr() as *const UNICODE_STRING);
+            let buf_ptr = us.Buffer.0;
+            let len = us.Length as usize;
+            if buf_ptr.is_null() || len == 0 || !len.is_multiple_of(2) {
+                return None;
+            }
+            let base = buf_ptr as usize - buf.as_ptr() as usize;
+            if base + len > buf.len() {
+                return None;
+            }
+            let chars = std::slice::from_raw_parts(buf.as_ptr().add(base) as *const u16, len / 2);
+            let s = String::from_utf16_lossy(chars);
+            let s = s.trim_end_matches('\0');
+            if s.is_empty() {
+                None
+            } else {
+                Some(s.to_string())
+            }
+        })();
+        let _ = CloseHandle(h);
+        out
+    }
+}
+
 fn map_priority(class: u32) -> PriorityClass {
     if class == th::REALTIME_PRIORITY_CLASS.0 {
         PriorityClass::Realtime
@@ -567,5 +644,48 @@ fn split_command(cmd: &str) -> (String, Option<String>) {
     match cmd.split_once(' ') {
         Some((f, p)) => (f.to_string(), Some(p.trim().to_string())),
         None => (cmd.to_string(), None),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn command_line_of_own_process_is_the_exe_path() {
+        // The test binary itself is always queryable. Argument retrieval is
+        // covered by the spawned-child test; here only plausibility matters,
+        // because the harness invokes the binary with varying arguments.
+        let cmdline = command_line_of(std::process::id()).expect("own command line");
+        assert!(
+            cmdline.to_ascii_lowercase().contains("tm_platform"),
+            "unexpected: {cmdline}"
+        );
+    }
+
+    #[test]
+    fn command_line_of_spawned_child_contains_arguments() {
+        let mut child = std::process::Command::new("cmd")
+            .args(["/C", "ping", "-n", "30", "127.0.0.1"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn child");
+        let pid = child.id();
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        let cmdline = command_line_of(pid).expect("command line retrievable");
+        assert!(
+            cmdline.to_ascii_lowercase().contains("ping -n 30"),
+            "unexpected: {cmdline}"
+        );
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    #[test]
+    fn command_line_of_invalid_pid_is_none() {
+        // PID reuse makes a fixed "unused" pid impossible, but a pid this
+        // large cannot exist and OpenProcess must fail cleanly.
+        assert_eq!(command_line_of(u32::MAX - 8), None);
     }
 }

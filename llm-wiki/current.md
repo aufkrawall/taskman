@@ -14,6 +14,16 @@ are accepted (Phases 2-6 open).
 
 ## Recently landed (2026-08-27)
 
+- Details command lines on Windows via
+  `NtQueryInformationProcess(ProcessCommandLineInformation)` (= 60 on current
+  builds; needs only QUERY_LIMITED), cached in `PidAttrs` (10 s TTL).
+- Performance CPU speed is measured (base × PDH `% Processor Performance`,
+  demand-gated `CPU_SPEED`; sysinfo/CallNtPowerInformation CurrentMhz only a
+  failure fallback — it reports the fixed nominal clock on modern Windows).
+- Processes page: busy external tasks (≥ 1 % CPU share, different image than
+  every family ancestor) absorbed into app families are promoted to visible
+  top-level Background rows incl. their descendants (`promote_busy_external_tasks`).
+
 - Window placement: "Remember window size and position" checkbox in the
   settings dialog (the flag previously had no UI); maximized state is
   persisted in `window-state.ini` and restored at startup, while maximized

@@ -1,5 +1,49 @@
 # Recent Activity
 
+## 2026-08-27 — command lines, real CPU speed, high-CPU background visibility
+
+Three user-reported bugs fixed:
+
+1. **Details command line always "—" on Windows**: `ProcessEntry.command_line`
+   was never populated (only the Linux backend did). Fix:
+   `process_ops::command_line_of(pid)` via
+   `NtQueryInformationProcess(ProcessCommandLineInformation)`. IMPORTANT
+   finding: on this Windows build the correct PROCESSINFOCLASS value is **60**
+   (matching windows-rs 0.62's `Wdk_System_Threading` binding) — the older
+   "class 92" reference does not work here (STATUS_INFO_LENGTH_MISMATCH with
+   any buffer). Works with only `PROCESS_QUERY_LIMITED_INFORMATION` (no
+   VM_READ); elevated/protected processes fail to open → None → "—". Wired
+   through the 10 s TTL `PidAttrs` cache in `sampler.rs` (new field
+   `command_line`); integration + unit tests spawn a child and assert the
+   args are retrieved.
+2. **Performance CPU speed stuck at base clock**: sysinfo's frequency comes
+   from `CallNtPowerInformation(ProcessorInformation)` `CurrentMhz`, which
+   reports the *nominal* clock constantly on modern Windows (verified: static
+   3401 MHz on a 5700X even under load; WMI CurrentClockSpeed identical).
+   Fix, Task-Manager-style: new demand-gated PDH group `cpu` with single
+   counter `\Processor Information(_Total)\% Processor Performance`
+   (`perfcounters.rs`; new `TelemetryDemand::CPU_SPEED` bit 8, set for
+   Tab::Performance). `sampler.rs` computes `freq_mhz = base × pct/100`.
+   Fallback ladder: counter warming → 0 (UI renders "—", never fakes data);
+   counter permanently unavailable (`cpu_counter_failed`) → sysinfo value.
+   Counter needs 2 PDH collections before formatting succeeds (matches
+   existing `QueryGroup` warm-up). Verified live: idle 4.2 GHz, under load
+   4.4 GHz (base 3.4).
+3. **High-CPU background/CLI tasks invisible on Processes page**: idle
+   helpers absorbed into app families are fine, but busy external tasks
+   (builds/compilers spawned by editors/terminals) were only visible as
+   anonymous aggregate inside the family row. New promotion pass in
+   `derive_display_groups` (`promote_busy_external_tasks`,
+   `is_external_family_member`, `PROMOTE_CPU_PCT = 1.0`): an absorbed
+   non-root process with cpu share ≥ 1 % whose image differs from every
+   family ancestor is reclassified to Background (with its absorbed
+   descendants, wholesale) and appears as an ordinary top-level Background
+   tree; same-image helpers (Chrome renderers etc.) stay folded like TM app
+   children. Two-phase decisions (against pre-promotion categories) keep the
+   result iteration-order independent. Existing test fixtures set explicit
+   low `cpu_pct` where promotion would otherwise trigger (proc() helper
+   defaults cpu = 1.0×pid).
+
 ## 2026-08-27 — window placement UX, type-ahead scroll fixes, dialog chevrons
 
 Three user-reported issues fixed:

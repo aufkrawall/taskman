@@ -117,3 +117,31 @@ fn suspend_resume_own_child() {
     let _ = actions.kill_single(pid);
     let _ = child.wait();
 }
+
+#[cfg(target_os = "windows")]
+#[test]
+fn sampled_snapshot_carries_command_lines() {
+    let mut child = std::process::Command::new("cmd")
+        .args(["/C", "ping", "-n", "30", "127.0.0.1"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn child");
+    let pid = child.id();
+    std::thread::sleep(std::time::Duration::from_millis(150));
+
+    let mut collector = tm_platform::create_collector();
+    let snap = collector.sample(std::time::Instant::now()).expect("sample");
+    let entry = snap
+        .processes
+        .iter()
+        .find(|p| p.pid == pid)
+        .expect("child in snapshot");
+    let cmdline = entry.command_line.as_deref().expect("command line set");
+    assert!(
+        cmdline.to_ascii_lowercase().contains("ping -n 30"),
+        "unexpected command line: {cmdline}"
+    );
+    let _ = child.kill();
+    let _ = child.wait();
+}

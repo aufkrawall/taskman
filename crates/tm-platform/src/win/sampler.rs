@@ -41,6 +41,8 @@ struct PidAttrs {
     elevated: Option<bool>,
     uac_virtualization: Option<UacVirtualization>,
     power_throttled: Option<bool>,
+    /// Full command line (Details page); immutable after process start.
+    command_line: Option<String>,
     /// Process identity guard against PID reuse.
     start_epoch_s: Option<i64>,
     /// When these values were last queried natively.
@@ -176,6 +178,7 @@ impl Sampler {
             elevated: security.elevated,
             uac_virtualization: security.virtualization,
             power_throttled: process_ops::efficiency_mode_state(pid),
+            command_line: process_ops::command_line_of(pid),
             start_epoch_s,
             refreshed_at: Instant::now(),
         };
@@ -229,7 +232,7 @@ impl Sampler {
         // ---- CPU -----------------------------------------------------------------
         // Static identity/frequency from sysinfo; load numbers exclusively
         // from the time-based accountant above.
-        let (cpu_brand, cpu_vendor, freq) = {
+        let (cpu_brand, cpu_vendor, sysinfo_freq_mhz) = {
             let cpus = self.sys.cpus();
             (
                 cpus.first()
@@ -266,13 +269,29 @@ impl Sampler {
             let guard = self.pdh.get_mut().unwrap_or_else(|e| e.into_inner());
             guard.tick(demand);
         }
-        let (gpu_engine_records, gpu_mem_records, disk_perf) = {
+        let (gpu_engine_records, gpu_mem_records, disk_perf, cpu_perf_pct, cpu_pdh_failed) = {
             let guard = self.pdh.get_mut().unwrap_or_else(|e| e.into_inner());
             (
                 guard.read_gpu_engines().unwrap_or_default(),
                 guard.read_gpu_memory().unwrap_or_default(),
                 guard.read_disks(),
+                guard.read_cpu_perf_pct(),
+                guard.cpu_counter_failed(),
             )
+        };
+
+        // Current speed, Task-Manager style: base clock × average
+        // "% Processor Performance" across all cores. sysinfo's frequency
+        // (CallNtPowerInformation CurrentMhz) reports the fixed nominal clock
+        // on modern Windows, so it is only a fallback when the counter is
+        // unavailable on this system. While the counter warms up we report
+        // 0 — the UI renders that as "—" instead of pretending the nominal
+        // clock were the measured speed.
+        let freq_base_mhz = self.cpu_static.as_ref().map_or(0.0, |c| c.base_mhz);
+        let freq = match cpu_perf_pct {
+            Some(pct) if freq_base_mhz > 0.0 => freq_base_mhz * pct / 100.0,
+            _ if cpu_pdh_failed => sysinfo_freq_mhz,
+            _ => 0.0,
         };
 
         // ---- processes ------------------------------------------------------------
@@ -343,6 +362,7 @@ impl Sampler {
             p.elevated = a.elevated;
             p.uac_virtualization = a.uac_virtualization;
             p.power_throttled = a.power_throttled;
+            p.command_line = a.command_line;
             // System processes have no owning user; TM shows "SYSTEM".
             if p.user.is_none() && a.session_id.is_some_and(|sid| sid == 0) {
                 p.user = Some("SYSTEM".to_string());
