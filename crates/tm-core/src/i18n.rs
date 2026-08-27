@@ -362,6 +362,7 @@ keys! {
     // sampling window — compiler churn, scripts, installers).
     SystemInterrupts => ["Systeminterrupts", "System interrupts"],
     TerminatedProcesses => ["Beendete Prozesse ({})", "Terminated processes ({})"],
+    TerminatedProcessesPlain => ["Beendete Prozesse", "Terminated processes"],
     TerminatedTooltip => ["CPU von Prozessen, die sich seit der letzten Aktualisierung beendet haben: {}", "CPU of processes that exited since the last refresh: {}"],
     PropPath => ["Pfad:", "Path:"],
     PrioritySetMsg => ["Priorität: {}", "Priority: {}"],
