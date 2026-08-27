@@ -27,8 +27,11 @@ Rust workspace, three crates in a strict dependency chain
   - OS collectors/actions behind traits (`actions.rs`). Windows stack under
     `win/`: `sampler.rs` (sysinfo + NtQuerySystemInformation CPU accountant,
     time-based attr TTL cache with token security + command-line queries,
-    measured CPU speed from PDH `% Processor Performance`), `cpu_load.rs`
-    (time-based CPU accounting incl. kernel/user split), `perfcounters.rs`
+    measured CPU speed from PDH `% Processor Performance`, interrupt-time
+    counter, synthetic CPU pseudo-rows "System Interrupts"/"Terminated
+    processes"), `cpu_load.rs`
+    (time-based CPU accounting incl. kernel/user split, new-process credit,
+    unattributed-residual + exited-image attribution), `perfcounters.rs`
     (PDH split GpuPdh/DiskPdh groups with demand gating + LUID-preserving
     GPU instance parser), `gpu.rs` (DXGI discovery + LUID-keyed merge,
     busiest-engine semantics), `process_ops.rs` (kill/suspend/priority/
@@ -68,7 +71,11 @@ Rust workspace, three crates in a strict dependency chain
 - `crates/tm-platform/src/win/perfcounters.rs` — PDH group lifecycle +
   GPU instance parsing (unit-tested real-world strings).
 - `crates/tm-platform/src/win/cpu_load.rs` — hand-rolled NT structure
-  offsets; verify against Process Hacker definitions before "fixing".
+  offsets; verify against Process Hacker definitions before "fixing" — but
+  note the live-kernel test proved `ImageName.Buffer` is an ABSOLUTE
+  pointer into the output buffer on this build (PH's record-relative
+  convention decoded 0/285 names); `parse_image_name` tries all
+  conventions, validated, and the live test pins it.
 - `crates/tm-app/src/widgets/tablekit.rs` — resize math MUST accumulate
   each frame's `drag_delta()` onto the LIVE width; `drag_delta()` is
   per-frame movement (NOT cumulative) in egui 0.36, so frozen drag-start

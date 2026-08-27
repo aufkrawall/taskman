@@ -357,6 +357,12 @@ keys! {
     NoServiceForPid => ["Kein Dienst mit PID {} gefunden", "No service with PID {} found"],
     NoFileForProcess => ["Kein Dateipfad verfügbar", "No file path available"],
     ProcessExited => ["(Prozess wurde beendet)", "(process has exited)"],
+    // Pseudo-rows for CPU time no live process can be charged with
+    // (interrupt/DPC servicing; programs that terminated during the
+    // sampling window — compiler churn, scripts, installers).
+    SystemInterrupts => ["Systeminterrupts", "System interrupts"],
+    TerminatedProcesses => ["Beendete Prozesse ({})", "Terminated processes ({})"],
+    TerminatedTooltip => ["CPU von Prozessen, die sich seit der letzten Aktualisierung beendet haben: {}", "CPU of processes that exited since the last refresh: {}"],
     PropPath => ["Pfad:", "Path:"],
     PrioritySetMsg => ["Priorität: {}", "Priority: {}"],
     ProcessEnded => ["beendet", "ended"],

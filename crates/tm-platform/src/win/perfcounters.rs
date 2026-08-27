@@ -305,6 +305,10 @@ const DISK_SEC: &str = "\\PhysicalDisk(*)\\Avg. Disk sec/Transfer";
 /// sysinfo's frequency (CallNtPowerInformation CurrentMhz) reports the fixed
 /// nominal clock on modern Windows, so it cannot show real-time speed.
 const CPU_PERF_PCT: &str = "\\Processor Information(_Total)\\% Processor Performance";
+/// Interrupt/DPC servicing share. Not chargeable to any process, so without
+/// it heavy driver work would look like unexplained "ghost" CPU on the
+/// process pages (native TM shows it as the "System interrupts" row).
+const CPU_INTERRUPT_PCT: &str = "\\Processor Information(_Total)\\% Interrupt Time";
 
 /// Split PDH state: each expensive provider warms up only on demand.
 pub struct PdhCounters {
@@ -313,9 +317,13 @@ pub struct PdhCounters {
     /// Single-instance CPU speed counter (cheap, but demand-gated like the
     /// rest so the sampling tick stays free of unneeded collections).
     cpu: Option<QueryGroup>,
+    /// Interrupt-time counter, kept warm whenever the process tables are
+    /// shown so the CPU residual can be split into interrupts vs. rest.
+    interrupt: Option<QueryGroup>,
     gpu_failed: bool,
     disk_failed: bool,
     cpu_failed: bool,
+    interrupt_failed: bool,
 }
 
 impl Default for PdhCounters {
@@ -330,9 +338,11 @@ impl PdhCounters {
             gpu: None,
             disk: None,
             cpu: None,
+            interrupt: None,
             gpu_failed: false,
             disk_failed: false,
             cpu_failed: false,
+            interrupt_failed: false,
         }
     }
 
@@ -392,6 +402,24 @@ impl PdhCounters {
                 c.collect();
             }
             c.maybe_sleep(want_cpu);
+        }
+
+        // --- Interrupt time group (core demand: needed to explain the CPU
+        // residual on the Processes page, not only the Performance page) ---
+        let want_interrupt = demand.wants(TelemetryDemand::CORE_PROCESS) && !self.interrupt_failed;
+        if want_interrupt && self.interrupt.is_none() {
+            let mut g = QueryGroup::new();
+            g.open(&[CPU_INTERRUPT_PCT]);
+            if !g.is_open() || g.counters.is_empty() {
+                self.interrupt_failed = true;
+            }
+            self.interrupt = Some(g);
+        }
+        if let Some(g) = &mut self.interrupt {
+            if g.is_open() {
+                g.collect();
+            }
+            g.maybe_sleep(want_interrupt);
         }
     }
 
@@ -512,6 +540,35 @@ impl PdhCounters {
         self.cpu_failed
     }
 
+    /// Interrupt/DPC servicing share (percent of total capacity) from data
+    /// already collected this tick. None while unavailable or warming up;
+    /// callers must treat that as unknown and never as zero.
+    pub fn read_interrupt_pct(&mut self) -> Option<f32> {
+        let g = self.interrupt.as_mut()?;
+        if !g.is_open() || !g.warm {
+            return None;
+        }
+        for (handle, path) in Self::counters_snapshot(g) {
+            if path != CPU_INTERRUPT_PCT {
+                continue;
+            }
+            let pairs = g.read_pairs(handle);
+            if pairs.is_empty() {
+                continue;
+            }
+            let usable: Vec<f64> = pairs
+                .into_iter()
+                .map(|(_, v)| v)
+                .filter(|v| *v >= 0.0)
+                .collect();
+            if !usable.is_empty() {
+                let avg = usable.iter().sum::<f64>() / usable.len() as f64;
+                return Some((avg as f32).clamp(0.0, 100.0));
+            }
+        }
+        None
+    }
+
     /// Disk performance samples from data already collected this tick.
     pub fn read_disks(&mut self) -> Vec<DiskPerf> {
         let Some(d) = self.disk.as_mut() else {
@@ -577,6 +634,9 @@ impl Drop for PdhCounters {
         }
         if let Some(mut c) = self.cpu.take() {
             c.close();
+        }
+        if let Some(mut g) = self.interrupt.take() {
+            g.close();
         }
     }
 }

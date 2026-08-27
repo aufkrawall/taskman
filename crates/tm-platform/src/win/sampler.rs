@@ -25,12 +25,43 @@ use tm_core::classify;
 use tm_core::demand::TelemetryDemand;
 use tm_core::engine::SystemCollector;
 use tm_core::error::Result;
+use tm_core::i18n::{self, K};
 use tm_core::model::*;
 
 /// Refresh cadence for slow-changing per-process attributes. Time-based
 /// (not tick-count based) so behavior stays identical at High/Normal/Low
 /// update speeds; entries also invalidate when the process identity changes.
 const ATTR_REFRESH_TTL: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// CPU pseudo-rows ("System interrupts", "Terminated processes") only show
+/// above this share of total capacity so an idle system gains no noise rows.
+const PSEUDO_ROW_MIN_PCT: f32 = 0.5;
+/// Ticks a pseudo row stays visible after it last exceeded the threshold, so
+/// bursty churn between samples does not make the rows flicker on/off.
+const PSEUDO_ROW_HOLD_TICKS: u32 = 5;
+/// Sentinel pids for the CPU pseudo-rows. Real Windows pids are small
+/// multiples of 4, so these can never collide; process actions must refuse
+/// them (ProcessEntry::synthetic).
+const PSEUDO_PID_INTERRUPTS: u32 = u32::MAX;
+const PSEUDO_PID_TERMINATED: u32 = u32::MAX - 1;
+
+/// Held display state of one CPU pseudo-row across ticks.
+#[derive(Debug, Clone)]
+struct HeldPseudoRow {
+    pct: f32,
+    /// Exited-image summary for the tooltip (empty for interrupts).
+    detail: String,
+    /// Number of exited processes (0 for interrupts).
+    count: u32,
+    ticks_left: u32,
+}
+
+/// Hold-decay slots for the two CPU pseudo-rows.
+#[derive(Debug, Default, Clone)]
+struct PseudoRowHold {
+    interrupts: Option<HeldPseudoRow>,
+    terminated: Option<HeldPseudoRow>,
+}
 
 #[derive(Clone)]
 struct PidAttrs {
@@ -76,6 +107,8 @@ pub struct Sampler {
     cpu_load: CpuLoadAccountant,
     /// Last valid CPU-load sample; held when a tick's window is unusable.
     last_load: Option<Arc<LoadSample>>,
+    /// Hold-decay state of the CPU pseudo-rows.
+    pseudo: PseudoRowHold,
 }
 
 impl Sampler {
@@ -110,6 +143,7 @@ impl Sampler {
             net_meta_cache: None,
             cpu_load: CpuLoadAccountant::new(),
             last_load: None,
+            pseudo: PseudoRowHold::default(),
         }
     }
 
@@ -279,6 +313,12 @@ impl Sampler {
                 guard.cpu_counter_failed(),
             )
         };
+        // Unknown interrupt time must never be treated as zero; the pseudo-
+        // row split below handles `None` by skipping the subtraction.
+        let interrupt_pct = {
+            let guard = self.pdh.get_mut().unwrap_or_else(|e| e.into_inner());
+            guard.read_interrupt_pct()
+        };
 
         // Current speed, Task-Manager style: base clock × average
         // "% Processor Performance" across all cores. sysinfo's frequency
@@ -376,6 +416,21 @@ impl Sampler {
         // The ancestor walk stops at windowed processes and at system
         // processes (svchost/services/...), matching Task Manager.
         refine_categories_and_group_apps(&mut processes);
+
+        // ---- CPU attribution pseudo-rows ------------------------------------------
+        // The per-core accumulators see ALL busy time; live processes cannot
+        // be charged with interrupt/DPC servicing or with work of processes
+        // that terminated during the window (compiler churn). Surface both
+        // as synthetic rows so sorted-by-CPU pages never show load that no
+        // row owns. Appended AFTER grouping so the classifier never touches
+        // them; they carry fixed categories.
+        let (interrupt_row, terminated_row) =
+            self.update_pseudo_rows(load.as_deref(), interrupt_pct);
+        append_pseudo_rows(
+            &mut processes,
+            interrupt_row.as_ref(),
+            terminated_row.as_ref(),
+        );
 
         // ---- GPU ---------------------------------------------------------------
         // Static adapter info is probed once; it does not change at runtime.
@@ -580,6 +635,101 @@ impl Sampler {
         self.first_tick_done = true;
         Ok(snap)
     }
+
+    /// Refresh the hold-decay slots of the CPU pseudo-rows and return the
+    /// rows to display this tick.
+    ///
+    /// A measured interrupt value is authoritative (low → row hides
+    /// immediately); only an UNKNOWN measurement (`None`, e.g. counter
+    /// warming up or unavailable) keeps the held value decaying. The
+    /// terminated-processes share is the unattributed CPU residual minus
+    /// the measured interrupt share, so the same busy time is never shown
+    /// twice; when interrupts are unknown the residual is shown whole
+    /// rather than being silently dropped.
+    fn update_pseudo_rows(
+        &mut self,
+        load: Option<&LoadSample>,
+        interrupt_meas: Option<f32>,
+    ) -> (Option<HeldPseudoRow>, Option<HeldPseudoRow>) {
+        match interrupt_meas {
+            Some(v) if v >= PSEUDO_ROW_MIN_PCT => {
+                self.pseudo.interrupts = Some(HeldPseudoRow {
+                    pct: v,
+                    detail: String::new(),
+                    count: 0,
+                    ticks_left: PSEUDO_ROW_HOLD_TICKS,
+                });
+            }
+            Some(_) => self.pseudo.interrupts = None,
+            None => decay_pseudo(&mut self.pseudo.interrupts),
+        }
+
+        match load {
+            Some(l) => {
+                let terminated = (l.unattributed_pct - interrupt_meas.unwrap_or(0.0)).max(0.0);
+                if terminated >= PSEUDO_ROW_MIN_PCT {
+                    let detail = l
+                        .exited_images
+                        .iter()
+                        .map(|e| format!("{} ×{}", e.name, e.count))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    self.pseudo.terminated = Some(HeldPseudoRow {
+                        pct: terminated,
+                        detail,
+                        count: l.exited_count,
+                        ticks_left: PSEUDO_ROW_HOLD_TICKS,
+                    });
+                } else {
+                    decay_pseudo(&mut self.pseudo.terminated);
+                }
+            }
+            None => decay_pseudo(&mut self.pseudo.terminated),
+        }
+
+        (
+            self.pseudo.interrupts.clone(),
+            self.pseudo.terminated.clone(),
+        )
+    }
+}
+
+fn decay_pseudo(slot: &mut Option<HeldPseudoRow>) {
+    if let Some(h) = slot {
+        h.ticks_left -= 1;
+        if h.ticks_left == 0 {
+            *slot = None;
+        }
+    }
+}
+
+/// Append the CPU pseudo-rows as synthetic process entries. "System
+/// interrupts" lives in the Windows-processes group (TM parity), the
+/// terminated processes in Background — both sort and heat-map like any
+/// other row, so high unattributable CPU is never invisible.
+fn append_pseudo_rows(
+    processes: &mut Vec<ProcessEntry>,
+    interrupts: Option<&HeldPseudoRow>,
+    terminated: Option<&HeldPseudoRow>,
+) {
+    if let Some(h) = interrupts {
+        let mut e = ProcessEntry::new(PSEUDO_PID_INTERRUPTS, "System Interrupts");
+        e.display = i18n::tr(K::SystemInterrupts).to_string();
+        e.category = ProcCategory::System;
+        e.cpu_pct = h.pct.clamp(0.0, 100.0);
+        e.synthetic = true;
+        e.description = Some(h.detail.clone());
+        processes.push(e);
+    }
+    if let Some(h) = terminated {
+        let mut e = ProcessEntry::new(PSEUDO_PID_TERMINATED, "Terminated Processes");
+        e.display = i18n::trf(K::TerminatedProcesses, &[&h.count.to_string()]);
+        e.category = ProcCategory::Background;
+        e.cpu_pct = h.pct.clamp(0.0, 100.0);
+        e.synthetic = true;
+        e.description = Some(h.detail.clone());
+        processes.push(e);
+    }
 }
 
 /// Walk ancestors for each process (bounded hops, zero extra allocations —
@@ -753,4 +903,107 @@ fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_millis() as u64)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::win::cpu_load::ExitedImage;
+
+    fn sample(unattributed_pct: f32, exited: u32) -> LoadSample {
+        LoadSample {
+            global_pct: 0.0,
+            per_core_pct: Vec::new(),
+            per_core_kernel_pct: Vec::new(),
+            global_kernel_pct: 0.0,
+            procs: HashMap::new(),
+            unattributed_pct,
+            exited_count: exited,
+            exited_images: if exited > 0 {
+                vec![ExitedImage {
+                    name: "rustc.exe".into(),
+                    count: exited,
+                }]
+            } else {
+                Vec::new()
+            },
+        }
+    }
+
+    #[test]
+    fn interrupt_measurement_is_authoritative_and_residual_never_double_counts() {
+        let mut s = Sampler::new();
+
+        // Measured high → row appears.
+        let (irq, _) = s.update_pseudo_rows(Some(&sample(0.0, 0)), Some(7.0));
+        assert_eq!(irq.unwrap().pct, 7.0);
+
+        // Measured low → row hides immediately, no stale hold.
+        let (irq, _) = s.update_pseudo_rows(None, Some(0.1));
+        assert!(irq.is_none());
+
+        // Unattributed residual is split against the measured interrupts:
+        // 12 % residual − 4 % interrupts = 8 % terminated.
+        let (_, term) = s.update_pseudo_rows(Some(&sample(12.0, 3)), Some(4.0));
+        let t = term.expect("terminated row shown");
+        assert!((t.pct - 8.0).abs() < 1e-4, "got {}", t.pct);
+        assert_eq!(t.count, 3);
+        assert!(t.detail.contains("rustc.exe"));
+
+        // Unknown interrupt measurement must never be read as zero: the full
+        // residual stays visible instead of being silently dropped.
+        let (_, term) = s.update_pseudo_rows(Some(&sample(12.0, 3)), None);
+        assert_eq!(term.unwrap().pct, 12.0);
+    }
+
+    #[test]
+    fn pseudo_rows_hold_between_ticks_then_expire() {
+        let mut s = Sampler::new();
+        let (irq, term) = s.update_pseudo_rows(Some(&sample(9.0, 1)), None);
+        assert!(irq.is_none(), "below threshold");
+        assert_eq!(term.as_ref().unwrap().pct, 9.0);
+
+        // Quiet ticks keep the rows visible while the hold lasts…
+        for _ in 1..PSEUDO_ROW_HOLD_TICKS {
+            let (_, term) = s.update_pseudo_rows(Some(&sample(0.0, 0)), None);
+            assert!(term.is_some(), "row must not flicker off");
+        }
+        // …and disappear once the hold expires.
+        for _ in 0..2 {
+            let (_, term) = s.update_pseudo_rows(Some(&sample(0.0, 0)), None);
+            if term.is_none() {
+                return;
+            }
+        }
+        panic!("terminated row never expired after hold");
+    }
+
+    #[test]
+    fn appended_pseudo_rows_are_marked_and_categorized() {
+        let irq = HeldPseudoRow {
+            pct: 2.0,
+            detail: String::new(),
+            count: 0,
+            ticks_left: 1,
+        };
+        let term = HeldPseudoRow {
+            pct: 40.0,
+            detail: "rustc.exe ×5".into(),
+            count: 5,
+            ticks_left: 1,
+        };
+        let mut processes: Vec<ProcessEntry> = Vec::new();
+        append_pseudo_rows(&mut processes, Some(&irq), Some(&term));
+        assert_eq!(processes.len(), 2);
+        assert!(processes.iter().all(|p| p.synthetic));
+        let by_pid = |pid: u32| processes.iter().find(|p| p.pid == pid).unwrap();
+        let i = by_pid(PSEUDO_PID_INTERRUPTS);
+        assert_eq!(i.category, ProcCategory::System);
+        assert_eq!(i.cpu_pct, 2.0);
+        let t = by_pid(PSEUDO_PID_TERMINATED);
+        assert_eq!(t.category, ProcCategory::Background);
+        assert_eq!(t.cpu_pct, 40.0);
+        assert!(t.display.contains('5'), "count in label: {}", t.display);
+        assert_eq!(t.description.as_deref(), Some("rustc.exe ×5"));
+    }
 }

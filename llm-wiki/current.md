@@ -14,6 +14,18 @@ are accepted (Phases 2-6 open).
 
 ## Recently landed (2026-08-27)
 
+- CPU attribution completeness: the time-based accountant credits new
+  processes their since-creation time and reports the unattributed CPU
+  residual (`unattributed_pct`) plus the image names of processes that
+  exited during the window. The sampler surfaces the residual as synthetic
+  `ProcessEntry` rows (`synthetic: bool`, sentinel pids `u32::MAX`/
+  `u32::MAX-1`) — "System Interrupts" (measured `% Interrupt Time` PDH
+  counter, Windows group) and "Terminated processes (N)" (Background, with
+  exited-image hover tooltip) — shown only above 0.5 % with 5-tick hold
+  decay; no context menu on synthetic rows. NT `ImageName.Buffer` is an
+  absolute pointer into the output buffer on this build (pinned by a
+  live-kernel unit test); the parser also accepts the old offset
+  conventions, all validated.
 - Details command lines on Windows via
   `NtQueryInformationProcess(ProcessCommandLineInformation)` (= 60 on current
   builds; needs only QUERY_LIMITED), cached in `PidAttrs` (10 s TTL).

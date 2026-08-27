@@ -391,6 +391,10 @@ pub struct ProcessEntry {
     pub uac_virtualization: Option<UacVirtualization>,
     /// Windows EcoQoS / power throttling state (None = unknown).
     pub power_throttled: Option<bool>,
+    /// Pseudo-row that does not correspond to an OS process (CPU
+    /// attribution helpers like "System interrupts" / "Terminated
+    /// processes"). Must never receive destructive process actions.
+    pub synthetic: bool,
 }
 
 impl ProcessEntry {
@@ -448,6 +452,7 @@ impl ProcessEntry {
             service_name: None,
             uac_virtualization: None,
             power_throttled: None,
+            synthetic: false,
         }
     }
 

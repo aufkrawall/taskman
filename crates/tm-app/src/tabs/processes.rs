@@ -80,6 +80,11 @@ pub struct RowData {
     /// (Efficiency mode) — rendered straight from the snapshot, never from
     /// client-side bookkeeping (audit §8).
     pub power_throttled: bool,
+    /// Pseudo-row ("System interrupts", "Terminated processes"): no OS
+    /// process behind it — destructive actions are withheld.
+    pub synthetic: bool,
+    /// Localized hover explanation (why CPU is unattributable), if any.
+    pub tooltip: Option<String>,
 }
 
 #[derive(Default)]
@@ -497,7 +502,15 @@ fn row_ui(
             start_epoch_s: row.start_epoch_s,
         });
     }
-    resp.context_menu(|ui| context_menu(app, ui, row));
+    // on_hover_text/context_menu consume the response (builder style).
+    let resp = match &row.tooltip {
+        Some(tip) => resp.on_hover_text(tip),
+        None => resp,
+    };
+    // Pseudo-rows carry no killable process — no action menu at all.
+    if !row.synthetic {
+        resp.context_menu(|ui| context_menu(app, ui, row));
+    }
 }
 
 fn context_menu(app: &mut TaskManApp, ui: &mut egui::Ui, row: &RowData) {
@@ -805,6 +818,8 @@ fn emit_flat_with_family_groups(
                 net_available,
                 suspended: p.status == ProcStatus::Suspended,
                 power_throttled: p.power_throttled == Some(true),
+                synthetic: p.synthetic,
+                tooltip: synthetic_tooltip(p),
             }));
             if expanded.contains(&p.pid) {
                 let mut kids: Vec<&ProcessEntry> = fam.iter().skip(1).copied().collect();
@@ -1125,6 +1140,8 @@ fn make_flat_row(p: &ProcessEntry, subtree: &HashMap<u32, [f64; 4]>) -> DisplayR
         net_available: p.net_recv_bps.is_some() || p.net_sent_bps.is_some(),
         suspended: p.status == ProcStatus::Suspended,
         power_throttled: p.power_throttled == Some(true),
+        synthetic: p.synthetic,
+        tooltip: synthetic_tooltip(p),
     })
 }
 
@@ -1155,7 +1172,21 @@ fn make_own_row(p: &ProcessEntry, depth: usize) -> DisplayRow {
         net_available: p.net_recv_bps.is_some() || p.net_sent_bps.is_some(),
         suspended: p.status == ProcStatus::Suspended,
         power_throttled: p.power_throttled == Some(true),
+        synthetic: p.synthetic,
+        tooltip: synthetic_tooltip(p),
     })
+}
+
+/// Localized hover text for the CPU pseudo-rows explaining WHICH programs
+/// account for the unattributable load.
+fn synthetic_tooltip(p: &ProcessEntry) -> Option<String> {
+    if !p.synthetic {
+        return None;
+    }
+    p.description
+        .as_deref()
+        .filter(|d| !d.is_empty())
+        .map(|d| i18n::trf(K::TerminatedTooltip, &[d]))
 }
 
 /// Build the parent→child topology used only by the Processes presentation.
@@ -1280,6 +1311,8 @@ fn emit_tree<'a>(
             net_available: proc.net_recv_bps.is_some() || proc.net_sent_bps.is_some(),
             suspended: proc.status == ProcStatus::Suspended,
             power_throttled: proc.power_throttled == Some(true),
+            synthetic: proc.synthetic,
+            tooltip: synthetic_tooltip(proc),
         }));
         if has_children && expanded.contains(&proc.pid) {
             for k in kids.into_iter().rev() {
@@ -2112,5 +2145,91 @@ mod tests {
         let apps = rows_in_group(&rows, 0);
         assert_eq!(apps.len(), 1);
         assert_eq!(apps[0].name, "Code.exe", "family aggregate loses subtree");
+    }
+
+    fn pseudo(pid: u32, name: &str, cat: ProcCategory) -> ProcessEntry {
+        let mut p = proc(pid, None, name, cat);
+        p.synthetic = true;
+        p
+    }
+
+    #[test]
+    fn cpu_pseudo_rows_surface_in_their_groups_and_sort_by_cpu() {
+        let mut term = pseudo(
+            u32::MAX - 1,
+            "Terminated Processes",
+            ProcCategory::Background,
+        );
+        term.display = "Terminated processes (3)".into();
+        term.cpu_pct = 45.0;
+        term.description = Some("rustc.exe \u{d7}2, cargo.exe \u{d7}1".into());
+        let mut irq = pseudo(u32::MAX, "System Interrupts", ProcCategory::System);
+        irq.cpu_pct = 3.0;
+        let mut app = proc(2, None, "app.exe", ProcCategory::App);
+        app.cpu_pct = 5.0;
+        app.has_window = true;
+
+        // Sorted by CPU descending (column 2): the terminated-processes row
+        // must top the Background group — the historical "100 % CPU, no
+        // responsible process" blind spot.
+        let rows = build_display_rows(
+            &snap_of(vec![app, term, irq]),
+            "",
+            2,
+            false,
+            &HashSet::new(),
+            &[false; 3],
+        );
+        let bg = rows_in_group(&rows, 1);
+        assert_eq!(bg.len(), 1, "exactly the terminated-processes row");
+        assert!(bg[0].synthetic);
+        assert_eq!(bg[0].name, "Terminated processes (3)");
+        assert_eq!(bg[0].values[0], 45.0);
+        let win = rows_in_group(&rows, 2);
+        assert_eq!(win.len(), 1, "exactly the interrupts row");
+        assert!(win[0].synthetic);
+        assert_eq!(win[0].values[0], 3.0);
+        let apps = rows_in_group(&rows, 0);
+        assert_eq!(apps.len(), 1);
+        assert!(!apps[0].synthetic);
+    }
+
+    #[test]
+    fn terminated_pseudo_row_carries_localized_tooltip() {
+        let mut term = pseudo(
+            u32::MAX - 1,
+            "Terminated Processes",
+            ProcCategory::Background,
+        );
+        term.description = Some("rustc.exe \u{d7}2".into());
+        term.cpu_pct = 9.0;
+        let rows = build_display_rows(
+            &snap_of(vec![term]),
+            "",
+            2,
+            false,
+            &HashSet::new(),
+            &[false; 3],
+        );
+        let bg = rows_in_group(&rows, 1);
+        assert_eq!(bg.len(), 1);
+        let tip = bg[0].tooltip.as_deref().expect("tooltip set");
+        assert!(
+            tip.contains("rustc.exe \u{d7}2"),
+            "tooltip names the image: {tip}"
+        );
+
+        // Real processes never get the pseudo-row tooltip.
+        let mut real = proc(9, None, "bg.exe", ProcCategory::Background);
+        real.description = Some("whatever".into());
+        let rows = build_display_rows(
+            &snap_of(vec![real]),
+            "",
+            2,
+            false,
+            &HashSet::new(),
+            &[false; 3],
+        );
+        assert!(rows_in_group(&rows, 1)[0].tooltip.is_none());
     }
 }
