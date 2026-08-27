@@ -7,7 +7,15 @@
 //! Correctness notes from the 2026 audit:
 //! * App rows are presentation groups, not raw parent-process trees. Shell
 //!   launchers such as Explorer do not absorb programs the user launched;
-//!   each visible app family is promoted to its own top-level row.
+//!   each visible app family is promoted to its own top-level row. Shell-
+//!   session brokers (sihost, RuntimeBroker, dllhost, ...) broker Start-menu
+//!   /COM launches and are launch boundaries too, as are browsers.
+//! * A visible window folds into a windowless ancestor's family only when
+//!   they are plausibly the same application (same image or same publisher);
+//!   otherwise the windowed process is its own app row. Busy absorbed
+//!   external helpers (no window, >= 1% CPU, different image) are promoted
+//!   to individually visible Background rows; windowed processes are never
+//!   demoted to Background.
 //! * Group header counts never depend on expansion state (P0.4). Apps counts
 //!   top-level app groups like native Task Manager; Background/Windows count
 //!   their unflattened process members.
@@ -695,22 +703,122 @@ fn build_display_rows(
                 expanded,
             );
         } else {
-            // Task Manager parity: Background/Windows groups are FLAT lists —
-            // every process is its own top-level row with its own values.
-            // Tree-nesting here would hide a busy build tool under its
-            // unexpanded console-shell row, making heavy CLI/background work
-            // unidentifiable.
-            let own: HashMap<u32, [f64; 4]> =
-                members.iter().map(|p| (p.pid, own_values(p))).collect();
-            let mut flat: Vec<&ProcessEntry> = members;
-            sort_entries(&mut flat, sort_col, ascending, &own);
-            for p in flat {
-                out.push(make_own_row(p));
-            }
+            // Task Manager parity: Background/Windows groups are flat lists
+            // in which connected same-image families collapse into one
+            // expandable "Name (N)" row ("Dropbox (7)"). Mixed-image trees
+            // stay fully flat so a busy build tool under a console shell is
+            // never hidden inside an unexpanded parent.
+            emit_flat_with_family_groups(
+                &mut out, &members, &children, &subtree, sort_col, ascending, expanded,
+            );
         }
     }
     normalize_heat(&mut out);
     out
+}
+
+/// All processes of the connected same-image family rooted at `p`, or None
+/// when any descendant runs a different executable image.
+fn same_image_family<'a>(
+    p: &'a ProcessEntry,
+    children: &HashMap<u32, Vec<&'a ProcessEntry>>,
+) -> Option<Vec<&'a ProcessEntry>> {
+    let mut out = vec![p];
+    let mut seen: HashSet<u32> = HashSet::new();
+    seen.insert(p.pid);
+    let mut stack = vec![p];
+    while let Some(cur) = stack.pop() {
+        for kid in children.get(&cur.pid).into_iter().flatten() {
+            if !seen.insert(kid.pid) {
+                continue;
+            }
+            if !kid.name.eq_ignore_ascii_case(&p.name) {
+                return None;
+            }
+            out.push(*kid);
+            stack.push(kid);
+        }
+    }
+    Some(out)
+}
+
+/// Flat Background/Windows rendering with same-image family collapse: every
+/// process gets its own row (own values, no nesting), except families whose
+/// members all share the root's image — they render as one expandable
+/// "Name (N)" row with the family aggregate, expanding to member rows.
+fn emit_flat_with_family_groups(
+    out: &mut Vec<DisplayRow>,
+    members: &[&ProcessEntry],
+    children: &HashMap<u32, Vec<&ProcessEntry>>,
+    subtree: &HashMap<u32, [f64; 4]>,
+    sort_col: usize,
+    ascending: bool,
+    expanded: &HashSet<u32>,
+) {
+    let mut family_heads: HashMap<u32, Vec<&ProcessEntry>> = HashMap::new();
+    let mut swallowed: HashSet<u32> = HashSet::new();
+    for p in members {
+        if let Some(fam) = same_image_family(p, children)
+            && fam.len() > 1
+        {
+            family_heads.insert(p.pid, fam.clone());
+            for member in fam.iter().skip(1) {
+                swallowed.insert(member.pid);
+            }
+        }
+    }
+
+    // Representative values: family heads sort by their aggregate, plain
+    // rows by their own values.
+    let mut repr: HashMap<u32, [f64; 4]> = HashMap::with_capacity(members.len());
+    for p in members {
+        if family_heads.contains_key(&p.pid) {
+            repr.insert(p.pid, subtree.get(&p.pid).copied().unwrap_or([0.0; 4]));
+        } else if !swallowed.contains(&p.pid) {
+            repr.insert(p.pid, own_values(p));
+        }
+    }
+    let mut display: Vec<&ProcessEntry> = members
+        .iter()
+        .copied()
+        .filter(|p| !swallowed.contains(&p.pid))
+        .collect();
+    sort_entries(&mut display, sort_col, ascending, &repr);
+
+    for p in display {
+        if let Some(fam) = family_heads.get(&p.pid) {
+            let net_available = fam
+                .iter()
+                .any(|k| k.net_recv_bps.is_some() || k.net_sent_bps.is_some());
+            out.push(DisplayRow::Process(RowData {
+                pid: p.pid,
+                start_epoch_s: p.start_epoch_s,
+                depth: 0,
+                name: format!("{} ({})", p.shown_name(), fam.len()),
+                icon_path: p
+                    .exe_path
+                    .as_ref()
+                    .map(|x| x.to_string_lossy().into_owned()),
+                children: true,
+                values: repr.get(&p.pid).copied().unwrap_or([0.0; 4]),
+                heat: [0.0; 4],
+                net_available,
+                suspended: p.status == ProcStatus::Suspended,
+                power_throttled: p.power_throttled == Some(true),
+            }));
+            if expanded.contains(&p.pid) {
+                let mut kids: Vec<&ProcessEntry> = fam.iter().skip(1).copied().collect();
+                let own: HashMap<u32, [f64; 4]> =
+                    kids.iter().map(|k| (k.pid, own_values(k))).collect();
+                sort_entries(&mut kids, sort_col, ascending, &own);
+                for k in kids {
+                    out.push(make_own_row(k, 1));
+                }
+            }
+        } else {
+            out.push(make_own_row(p, 0));
+        }
+    }
 }
 
 fn derive_display_groups(all: &[&ProcessEntry]) -> DisplayGroups {
@@ -799,10 +907,13 @@ fn derive_display_groups(all: &[&ProcessEntry]) -> DisplayGroups {
             {
                 break;
             }
-            // Multiple visible windows owned by the same executable still
-            // belong to one app family. A different visible parent is an
-            // independent foreground app and therefore a hard boundary.
-            if parent.has_window && !same_process_family(parent, cur) {
+            // A visible window only folds into an ancestor's family when
+            // they are plausibly the same application (same executable or
+            // same publisher). Start-menu/COM launches are brokered by
+            // windowless shell-session processes (sihost, RuntimeBroker,
+            // dllhost, ...); without this check those brokers adopt the
+            // launched app and hide it inside an anonymous family.
+            if !plausibly_same_application(parent, cur) {
                 break;
             }
             cur = parent;
@@ -844,8 +955,18 @@ fn derive_display_groups(all: &[&ProcessEntry]) -> DisplayGroups {
     }
 }
 
-fn same_process_family(a: &ProcessEntry, b: &ProcessEntry) -> bool {
-    a.name.eq_ignore_ascii_case(&b.name)
+/// Two processes plausibly belong to the same application when they share
+/// the executable image or the publisher (company) from version metadata.
+/// Unknown publisher data falls back to the permissive default so missing
+/// version info never splits an existing family.
+fn plausibly_same_application(a: &ProcessEntry, b: &ProcessEntry) -> bool {
+    if a.name.eq_ignore_ascii_case(&b.name) {
+        return true;
+    }
+    match (&a.company, &b.company) {
+        (Some(x), Some(y)) => x.eq_ignore_ascii_case(y),
+        _ => true,
+    }
 }
 
 /// High-CPU external tasks must stay recognizable on the Processes page even
@@ -868,7 +989,13 @@ fn promote_busy_external_tasks<'a>(
         .iter()
         .copied()
         .filter(|p| {
-            p.cpu_pct >= PROMOTE_CPU_PCT
+            // A process with a visible window is a foreground app — it may
+            // be mis-absorbed, but demoting it to Background would mislabel
+            // it worse (HitmanPro started from the Start menu). Mis-absorbed
+            // windowed processes are handled by plausibly_same_application
+            // instead, which makes them their own app root.
+            !p.has_window
+                && p.cpu_pct >= PROMOTE_CPU_PCT
                 && category.get(&p.pid) == Some(&ProcCategory::App)
                 && !app_roots.contains(&p.pid)
                 && is_external_family_member(p, by_pid, &category)
@@ -882,7 +1009,11 @@ fn promote_busy_external_tasks<'a>(
         category.insert(pid, ProcCategory::Background);
         if let Some(kids) = raw_children.get(&pid) {
             for kid in kids {
-                if category.get(&kid.pid) == Some(&ProcCategory::App)
+                // Windowed children stay Apps: detached from their promoted
+                // parent they surface as their own app root instead of a
+                // GUI window landing in Background.
+                if !kid.has_window
+                    && category.get(&kid.pid) == Some(&ProcCategory::App)
                     && !app_roots.contains(&kid.pid)
                 {
                     stack.push(kid.pid);
@@ -895,7 +1026,10 @@ fn promote_busy_external_tasks<'a>(
 
 /// Parent processes that launch independent foreground applications rather
 /// than semantically owning them. Explorer is the important case; console
-/// shells cover GUI programs launched from Terminal/cmd/PowerShell.
+/// shells cover GUI programs launched from Terminal/cmd/PowerShell. Browsers
+/// are launch surfaces for downloaded/opened executables. The shell-session
+/// brokers cover Start-menu/COM activation, which reports the launching
+/// broker (not explorer) as the parent process.
 fn is_launch_boundary(name: &str) -> bool {
     const LAUNCHERS: &[&str] = &[
         "explorer.exe",
@@ -908,6 +1042,20 @@ fn is_launch_boundary(name: &str) -> bool {
         "SearchApp.exe",
         "StartMenuExperienceHost.exe",
         "ShellExperienceHost.exe",
+        "sihost.exe",
+        "RuntimeBroker.exe",
+        "dllhost.exe",
+        "applicationframehost.exe",
+        "backgroundtaskhost.exe",
+        "textinputhost.exe",
+        "smartscreen.exe",
+        "msedge.exe",
+        "chrome.exe",
+        "brave.exe",
+        "chromium.exe",
+        "firefox.exe",
+        "opera.exe",
+        "vivaldi.exe",
     ];
     LAUNCHERS.iter().any(|n| name.eq_ignore_ascii_case(n))
 }
@@ -991,11 +1139,11 @@ fn own_values(p: &ProcessEntry) -> [f64; 4] {
 }
 
 /// Flat Background/Windows row: plain name, own values, no expand handle.
-fn make_own_row(p: &ProcessEntry) -> DisplayRow {
+fn make_own_row(p: &ProcessEntry, depth: usize) -> DisplayRow {
     DisplayRow::Process(RowData {
         pid: p.pid,
         start_epoch_s: p.start_epoch_s,
-        depth: 0,
+        depth,
         name: p.shown_name().to_string(),
         icon_path: p
             .exe_path
@@ -1359,8 +1507,12 @@ mod tests {
     #[test]
     fn explorer_launched_programs_are_independent_app_groups() {
         let explorer = proc(1, None, "explorer.exe", ProcCategory::App);
+        // Browser main owns a window; its windowless helper stays folded.
+        // brave.exe is a launch boundary: a same-image secondary window
+        // (like a PWA) starts its own group, and DIFFERENT-image programs
+        // launched by the browser are never absorbed at all.
         let mut brave = proc(2, Some(1), "brave.exe", ProcCategory::App);
-        brave.has_window = false;
+        brave.has_window = true;
         let mut brave_window = proc(3, Some(2), "brave.exe", ProcCategory::App);
         brave_window.has_window = true;
         let brave_helper = proc(4, Some(2), "brave.exe", ProcCategory::App);
@@ -1393,7 +1545,7 @@ mod tests {
                 _ => None,
             })
             .unwrap();
-        assert_eq!(app_total, 3);
+        assert_eq!(app_total, 4);
 
         let app_rows: Vec<&RowData> = rows
             .iter()
@@ -1405,16 +1557,21 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(app_rows.len(), 3);
+        assert_eq!(app_rows.len(), 4);
         assert!(app_rows.iter().all(|r| r.depth == 0));
 
         let explorer_row = app_rows.iter().find(|r| r.pid == 1).unwrap();
         assert_eq!(explorer_row.name, "explorer.exe");
         assert_eq!(explorer_row.values[0], 1.0);
 
+        // Browser main + helper are one family; the secondary same-image
+        // window is its own group (Task Manager shows PWAs separately).
         let brave_row = app_rows.iter().find(|r| r.pid == 2).unwrap();
-        assert_eq!(brave_row.name, "brave.exe (3)");
-        assert_eq!(brave_row.values[0], 9.0);
+        assert_eq!(brave_row.name, "brave.exe (2)");
+        assert_eq!(brave_row.values[0], 6.0);
+        let pwa_row = app_rows.iter().find(|r| r.pid == 3).unwrap();
+        assert_eq!(pwa_row.name, "brave.exe");
+        assert_eq!(pwa_row.values[0], 3.0);
 
         let bg_pids: Vec<u32> = rows
             .iter()
@@ -1700,6 +1857,64 @@ mod tests {
     }
 
     #[test]
+    fn background_same_image_family_collapses_into_expandable_group() {
+        // Task Manager shows e.g. "Dropbox (7)": a connected family whose
+        // members all share the image collapses into one expandable row with
+        // the family aggregate.
+        let mut main = proc(1, Some(99), "Dropbox.exe", ProcCategory::Background);
+        main.cpu_pct = 1.0;
+        let mut sub1 = proc(2, Some(1), "Dropbox.exe", ProcCategory::Background);
+        sub1.cpu_pct = 2.0;
+        let sub2 = proc(3, Some(1), "Dropbox.exe", ProcCategory::Background);
+        let sub3 = proc(4, Some(2), "Dropbox.exe", ProcCategory::Background);
+        let groups = [false; 3];
+        let collapsed = build_display_rows(
+            &snap_of(vec![main.clone(), sub1.clone(), sub2.clone(), sub3.clone()]),
+            "",
+            0,
+            true,
+            &HashSet::new(),
+            &groups,
+        );
+        let bg = rows_in_group(&collapsed, 1);
+        assert_eq!(bg.len(), 1, "family renders as one row");
+        assert_eq!(bg[0].name, "Dropbox.exe (4)");
+        assert_eq!(bg[0].values[0], 10.0, "family aggregate (1+2+3+4)");
+        assert!(bg[0].children, "group row is expandable");
+
+        let mut expanded = HashSet::new();
+        expanded.insert(1u32);
+        let open = build_display_rows(
+            &snap_of(vec![main, sub1.clone(), sub2.clone(), sub3.clone()]),
+            "",
+            0,
+            true,
+            &expanded,
+            &groups,
+        );
+        let bg_open = rows_in_group(&open, 1);
+        assert_eq!(bg_open.len(), 4, "group row plus members");
+        assert_eq!(bg_open[0].name, "Dropbox.exe (4)");
+        assert!(bg_open[1..].iter().all(|r| r.depth == 1));
+        assert!(bg_open[1..].iter().all(|r| !r.children));
+    }
+
+    #[test]
+    fn background_same_name_separate_families_stay_separate_rows() {
+        // Task Manager does NOT merge unrelated same-name processes
+        // (EpicWebHelper appears twice ungrouped): only connected families
+        // collapse.
+        let a = proc(1, None, "helper.exe", ProcCategory::Background);
+        let b = proc(2, None, "helper.exe", ProcCategory::Background);
+        let groups = [false; 3];
+        let rows = build_display_rows(&snap_of(vec![a, b]), "", 0, true, &HashSet::new(), &groups);
+        let bg = rows_in_group(&rows, 1);
+        assert_eq!(bg.len(), 2);
+        assert!(bg.iter().all(|r| !r.children));
+        assert!(bg.iter().all(|r| !r.name.contains('(')));
+    }
+
+    #[test]
     fn background_group_renders_flat_so_busy_children_stay_visible() {
         // A console-shell chain classified Background (e.g. cmd from the
         // shell): the busy build tool must be its own row without needing to
@@ -1728,6 +1943,86 @@ mod tests {
         let cargo = bg.iter().find(|r| r.pid == 2).unwrap();
         assert_eq!(cargo.values[0], 6.0, "row shows the process's own CPU");
         assert!(!cargo.children, "no expand handle needed to see it");
+    }
+
+    #[test]
+    fn browser_or_shell_launched_windowed_app_is_its_own_app_row() {
+        // A windowed program whose parent chain runs through shell/session
+        // brokers (Start menu, COM activation, browser download) must become
+        // its own app row — not be absorbed into the broker's family.
+        let mut broker = proc(1, None, "shellbroker.exe", ProcCategory::Background);
+        broker.company = Some("Microsoft Corporation".into());
+        let mut app = proc(2, Some(1), "HitmanPro_x64.exe", ProcCategory::App);
+        app.has_window = true;
+        app.company = Some("Sophos Limited".into());
+        let groups = [false; 3];
+        let rows = build_display_rows(
+            &snap_of(vec![broker, app]),
+            "",
+            0,
+            true,
+            &HashSet::new(),
+            &groups,
+        );
+        let apps = rows_in_group(&rows, 0);
+        assert_eq!(
+            apps.iter().map(|r| (r.pid, r.depth)).collect::<Vec<_>>(),
+            vec![(2, 0)],
+            "the launched app is its own top-level app row"
+        );
+        // The broker stays Background (windowless, no window of its own).
+        let bg = rows_in_group(&rows, 1);
+        assert!(bg.iter().any(|r| r.pid == 1));
+        assert!(!bg.iter().any(|r| r.pid == 2), "app must not be Background");
+    }
+
+    #[test]
+    fn shell_broker_parent_is_a_launch_boundary_even_without_publisher_data() {
+        // Same scenario, but version metadata is unavailable: the well-known
+        // broker names must still act as launch boundaries.
+        let broker = proc(1, None, "runtimebroker.exe", ProcCategory::Background);
+        let mut app = proc(2, Some(1), "app.exe", ProcCategory::App);
+        app.has_window = true;
+        let groups = [false; 3];
+        let rows = build_display_rows(
+            &snap_of(vec![broker, app]),
+            "",
+            0,
+            true,
+            &HashSet::new(),
+            &groups,
+        );
+        let apps = rows_in_group(&rows, 0);
+        assert_eq!(apps.iter().map(|r| r.pid).collect::<Vec<_>>(), vec![2]);
+    }
+
+    #[test]
+    fn windowed_busy_family_member_is_never_demoted_to_background() {
+        // steamwebhelper owns the Steam window and burns CPU; it is part of
+        // the Steam family (same publisher) and must stay in Apps — busy or
+        // not, a GUI process is never a Background row.
+        let mut steam = proc(1, None, "steam.exe", ProcCategory::App);
+        steam.has_window = false;
+        steam.company = Some("Valve Corporation".into());
+        let mut helper = proc(2, Some(1), "steamwebhelper.exe", ProcCategory::App);
+        helper.has_window = true;
+        helper.company = Some("Valve Corporation".into());
+        helper.cpu_pct = 40.0;
+        let groups = [false; 3];
+        let rows = build_display_rows(
+            &snap_of(vec![steam, helper]),
+            "",
+            0,
+            true,
+            &HashSet::new(),
+            &groups,
+        );
+        let bg = rows_in_group(&rows, 1);
+        assert!(bg.is_empty(), "busy windowed family member stays Apps");
+        let apps = rows_in_group(&rows, 0);
+        assert_eq!(apps.len(), 1);
+        assert_eq!(apps[0].name, "steam.exe (2)");
+        assert_eq!(apps[0].values[0], 41.0, "family aggregate keeps helper");
     }
 
     #[test]

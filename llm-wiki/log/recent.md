@@ -47,6 +47,25 @@ Three user-reported bugs fixed:
      ordinary flat Background row; same-image helpers (Chrome renderers
      etc.) stay folded like TM app children. Two-phase decisions (against
      pre-promotion categories) keep the result iteration-order independent.
+     Guards learned from the HitmanPro report: **windowed processes are
+     never demoted** (they are foreground apps), and the wholesale descent
+     skips windowed children (they surface as their own app roots).
+   - **Windowed absorption refined (`plausibly_same_application`)**: a
+     windowed process folds into a windowless ancestor's family only when
+     they share the image or the publisher (company from version metadata;
+     unknown publisher falls back to permissive). Start-menu/COM launches
+     are brokered by windowless shell-session processes (sihost,
+     RuntimeBroker, dllhost — NOT explorer), which would otherwise adopt
+     the launched app (HitmanPro case); those brokers plus browsers are
+     launch boundaries now. Boundary check precedes the company check, so
+     same-image secondary browser windows/PWAs start their own rows
+     (TM shows PWAs separately); non-boundary same-company families
+     (steam.exe/steamwebhelper) still absorb.
+   - **Background/Windows family collapse (TM parity per user's TM
+     screenshot)**: connected same-image families render as one expandable
+     `Name (N)` row with the family aggregate ("Dropbox (7)"), expanding to
+     member rows; unrelated same-name processes and mixed-image trees stay
+     flat (`emit_flat_with_family_groups`, `same_image_family`).
    Existing test fixtures set explicit low `cpu_pct` where promotion would
    otherwise trigger (proc() helper defaults cpu = 1.0×pid). NOTE:
    `cpu_pct` is share of TOTAL machine capacity — a full core on a 16-thread
