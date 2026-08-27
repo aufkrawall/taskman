@@ -33,6 +33,15 @@ are accepted (Phases 2-6 open).
   migration, O(1) layout geometry, fixed-height virtualization everywhere,
   three Processes groups (Apps/Background/Windows), arbitrary-depth tree
   with cycle-safe O(n) subtree aggregation.
+- Process-list interaction: plain alphabetic typing on Processes and Details
+  selects the next displayed matching process, cycles repeated initials, and
+  scrolls virtualized rows into view without stealing input from text edits.
+  Details' Select columns dialog is compact and lets enabled columns move
+  left/right in the rendered table while keeping sort semantics ID-based.
+- Native window placement: fresh installs start at 1280×800; remembered size
+  continues through `config.ini`, while desktop-space position is restored
+  from `window-state.ini` and written only on a clean close when both config
+  autosave and remember-window are enabled.
 - Processes presentation parity: app grouping is window-ownership driven
   instead of a literal PPID tree. Explorer/console-shell launch boundaries
   keep user-launched programs as independent top-level Apps; app resource
