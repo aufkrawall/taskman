@@ -231,6 +231,8 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
     }
     let rows = cache.as_ref().expect("cache").rows.clone();
 
+    handle_type_select(app, &rows, ui.ctx());
+
     let agg = Aggregates::from_snapshot(&snap);
     let aggs = agg.strings();
     prepare_auto_fit_widths(ui, &mut table, &rows, &aggs);
@@ -270,6 +272,42 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
     }
     app.persist_table(&table);
     app.processes_state.cache = cache;
+}
+
+fn handle_type_select(app: &mut TaskManApp, rows: &[DisplayRow], ctx: &egui::Context) {
+    if app.show_settings
+        || app.run_dialog_open
+        || app.affinity_dialog.is_some()
+        || app.proc_props.is_some()
+        || app.startup_props.is_some()
+    {
+        return;
+    }
+    let Some(ch) = search::list_type_select_char(ctx) else {
+        return;
+    };
+    let current = app.selected_process.as_ref().and_then(|selected| {
+        rows.iter().position(|row| match row {
+            DisplayRow::Process(row) => {
+                row.pid == selected.pid && row.start_epoch_s == selected.start_epoch_s
+            }
+            DisplayRow::GroupHeader(..) => false,
+        })
+    });
+    let Some(index) = search::cycle_match_index(rows.len(), current, |index| match &rows[index] {
+        DisplayRow::Process(row) => search::starts_with_char(&row.name, ch),
+        DisplayRow::GroupHeader(..) => false,
+    }) else {
+        return;
+    };
+    let DisplayRow::Process(row) = &rows[index] else {
+        return;
+    };
+    app.selected_process = Some(crate::app::ProcessIdentity {
+        pid: row.pid,
+        start_epoch_s: row.start_epoch_s,
+    });
+    tablekit::request_scroll_to_row(ctx, "processes", index);
 }
 
 /// Intrinsic widths come from the complete flattened display model, never
