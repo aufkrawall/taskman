@@ -18,11 +18,13 @@ mod search;
 mod selfcheck;
 mod tabs;
 mod theme;
+mod ui_state;
 mod widgets;
 
 use std::time::Instant;
 
 const APP_ID: &str = "io.github.aufkrawall.Taskman";
+const DEFAULT_WINDOW_SIZE: [f32; 2] = [1280.0, 800.0];
 
 pub struct StartupTrace;
 
@@ -90,7 +92,15 @@ fn main() {
 fn run_gui(mock: bool, args: &[String]) {
     tm_core::locale::init(tm_platform::detect_locale());
 
+    // A genuinely fresh install gets a roomier first window. Existing users
+    // keep their recorded dimensions, including legacy-JSON migrations.
+    let config_dir = tm_core::settings::taskman_config_dir();
+    let has_saved_settings = config_dir.join("config.ini").exists()
+        || config_dir.join("settings.json").exists();
     let mut settings = tm_core::settings::Settings::load();
+    if !has_saved_settings {
+        settings.window_size = DEFAULT_WINDOW_SIZE;
+    }
     StartupTrace::mark("minimal_config_loaded");
 
     if let Some(sz) = args
@@ -102,6 +112,8 @@ fn run_gui(mock: bool, args: &[String]) {
     }
     tm_core::i18n::set_lang(settings.language.resolve());
     let window_size = [settings.window_size[0], settings.window_size[1]];
+    let restore_position = has_saved_settings && settings.remember_window;
+    let window_position = restore_position.then(ui_state::window_position).flatten();
 
     let initial_tab_arg = args
         .iter()
@@ -114,16 +126,20 @@ fn run_gui(mock: bool, args: &[String]) {
     let title = tm_core::i18n::tr(tm_core::i18n::K::WindowTitle).to_string();
 
     let options = |renderer: eframe::Renderer| {
+        let mut viewport = eframe::egui::ViewportBuilder::default()
+            .with_title(title.clone())
+            // Wayland compositors use app_id to associate windows with
+            // the matching desktop entry/icon and group them correctly.
+            .with_app_id(APP_ID)
+            .with_inner_size(window_size)
+            .with_min_inner_size([720.0, 480.0])
+            .with_icon(icon_data());
+        if let Some(pos) = window_position {
+            viewport = viewport.with_position(pos);
+        }
         let mut opts = eframe::NativeOptions {
             renderer,
-            viewport: eframe::egui::ViewportBuilder::default()
-                .with_title(title.clone())
-                // Wayland compositors use app_id to associate windows with
-                // the matching desktop entry/icon and group them correctly.
-                .with_app_id(APP_ID)
-                .with_inner_size(window_size)
-                .with_min_inner_size([720.0, 480.0])
-                .with_icon(icon_data()),
+            viewport,
             ..Default::default()
         };
         #[cfg(feature = "wgpu")]
@@ -151,7 +167,7 @@ fn run_gui(mock: bool, args: &[String]) {
             theme::apply_startup(&cc.egui_ctx);
             fonts::install_async(cc.egui_ctx.clone());
             let application = app::TaskManApp::new(cc, use_mock, app_settings, initial_tab);
-            Ok(Box::new(application) as Box<dyn eframe::App>)
+            Ok(Box::new(NativeApp::new(application)) as Box<dyn eframe::App>)
         };
         match eframe::run_native("Task-Manager", options(renderer), Box::new(creator)) {
             Ok(()) => return,
@@ -186,6 +202,41 @@ fn run_gui(mock: bool, args: &[String]) {
                 _ => true,
             })
             .collect()
+    }
+}
+
+/// Thin native-shell wrapper. TaskManApp already owns all UI/application
+/// state; this layer only records the viewport's desktop-space position and
+/// delegates every application hook unchanged.
+struct NativeApp {
+    inner: app::TaskManApp,
+}
+
+impl NativeApp {
+    fn new(inner: app::TaskManApp) -> Self {
+        Self { inner }
+    }
+}
+
+impl eframe::App for NativeApp {
+    fn logic(&mut self, ctx: &eframe::egui::Context, frame: &mut eframe::Frame) {
+        <app::TaskManApp as eframe::App>::logic(&mut self.inner, ctx, frame);
+    }
+
+    fn ui(&mut self, ui: &mut eframe::egui::Ui, frame: &mut eframe::Frame) {
+        <app::TaskManApp as eframe::App>::ui(&mut self.inner, ui, frame);
+        if self.inner.shared.settings.remember_window
+            && let Some(pos) = ui.ctx().input(|i| i.viewport().outer_rect.map(|r| r.min))
+        {
+            ui_state::set_window_position([pos.x, pos.y]);
+        }
+    }
+
+    fn on_exit(&mut self, gl: Option<&eframe::glow::Context>) {
+        if self.inner.shared.settings.save_config && self.inner.shared.settings.remember_window {
+            ui_state::save();
+        }
+        <app::TaskManApp as eframe::App>::on_exit(&mut self.inner, gl);
     }
 }
 
