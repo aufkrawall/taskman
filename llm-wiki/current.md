@@ -14,6 +14,12 @@ are accepted (Phases 2-6 open).
 
 ## Recently landed (2026-08-27)
 
+- TM-parity resource sorting: the Apps/Background/Windows sections exist
+  only when sorted by Name/Status; CPU/memory/disk/network sorts flatten
+  everything into one globally sorted list (`sort_blocks_globally` reorders
+  depth-0 head blocks with expanded children attached), so the top CPU
+  consumer — including the "Terminated processes" pseudo-row — is always
+  the first row. Group-collapse toggles apply only to the grouped view.
 - CPU attribution completeness: the time-based accountant credits new
   processes their since-creation time and reports the unattributed CPU
   residual (`unattributed_pct`) plus the image names of processes that

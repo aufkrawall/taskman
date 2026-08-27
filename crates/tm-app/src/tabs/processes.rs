@@ -700,9 +700,17 @@ fn build_display_rows(
         } else {
             members.len()
         };
-        out.push(DisplayRow::GroupHeader(gi, total));
-        if group_collapsed[gi as usize] {
-            continue;
+        // TM parity: the three group sections exist only in the Name/Status
+        // sorted views. Any resource sort (CPU/memory/disk/network) flattens
+        // the list into ONE globally sorted sequence, so the top consumer is
+        // always the first row no matter which category it belongs to. App
+        // families and same-image groups stay collapsible inside that flat
+        // list.
+        if sort_col < 2 {
+            out.push(DisplayRow::GroupHeader(gi, total));
+            if group_collapsed[gi as usize] {
+                continue;
+            }
         }
         if cat == ProcCategory::App {
             emit_tree(
@@ -726,8 +734,47 @@ fn build_display_rows(
             );
         }
     }
+    if sort_col >= 2 {
+        sort_blocks_globally(&mut out, sort_col, ascending);
+    }
     normalize_heat(&mut out);
     out
+}
+
+/// Resource-sorted view: reorder the per-section emission into ONE global
+/// order. The emitters above produce self-contained blocks (a depth-0 head
+/// row plus its expanded, nested children); sorting whole blocks keeps
+/// expanded families attached to their head while the heads compete
+/// globally by the chosen resource column — exactly native Task Manager's
+/// behavior. Group headers are dropped here (they only exist for Name
+/// sorts).
+fn sort_blocks_globally(rows: &mut Vec<DisplayRow>, sort_col: usize, ascending: bool) {
+    debug_assert!((2..=5).contains(&sort_col), "resource column expected");
+    let mut blocks: Vec<Vec<DisplayRow>> = Vec::new();
+    for r in rows.drain(..) {
+        let DisplayRow::Process(d) = r else { continue };
+        if d.depth == 0 {
+            blocks.push(vec![DisplayRow::Process(d)]);
+        } else {
+            // Expanded children were emitted directly after their head;
+            // they keep riding along with it.
+            if let Some(last) = blocks.last_mut() {
+                last.push(DisplayRow::Process(d));
+            }
+        }
+    }
+    let vi = sort_col - 2; // columns cpu/mem/disk/net map onto values[0..=3]
+    blocks.sort_by(|a, b| {
+        let (Some(DisplayRow::Process(x)), Some(DisplayRow::Process(y))) = (a.first(), b.first())
+        else {
+            return std::cmp::Ordering::Equal;
+        };
+        let o = x.values[vi]
+            .partial_cmp(&y.values[vi])
+            .unwrap_or(std::cmp::Ordering::Equal);
+        if ascending { o } else { o.reverse() }
+    });
+    rows.extend(blocks.into_iter().flatten());
 }
 
 /// All processes of the connected same-image family rooted at `p`, or None
@@ -2154,7 +2201,7 @@ mod tests {
     }
 
     #[test]
-    fn cpu_pseudo_rows_surface_in_their_groups_and_sort_by_cpu() {
+    fn cpu_sort_flattens_groups_and_puts_top_consumer_first() {
         let mut term = pseudo(
             u32::MAX - 1,
             "Terminated Processes",
@@ -2169,29 +2216,103 @@ mod tests {
         app.cpu_pct = 5.0;
         app.has_window = true;
 
-        // Sorted by CPU descending (column 2): the terminated-processes row
-        // must top the Background group — the historical "100 % CPU, no
-        // responsible process" blind spot.
+        // Sorted by CPU descending (column 2): native TM flattens the group
+        // sections and sorts ALL categories together — the terminated-
+        // processes row (45 %) must be the very first row.
         let rows = build_display_rows(
-            &snap_of(vec![app, term, irq]),
+            &snap_of(vec![app.clone(), term.clone(), irq.clone()]),
             "",
             2,
             false,
             &HashSet::new(),
             &[false; 3],
         );
+        let flat: Vec<&RowData> = rows
+            .iter()
+            .filter_map(|r| match r {
+                DisplayRow::Process(d) => Some(d),
+                DisplayRow::GroupHeader(..) => None,
+            })
+            .collect();
+        assert!(
+            rows.iter()
+                .all(|r| !matches!(r, DisplayRow::GroupHeader(..))),
+            "resource sorts have no group sections"
+        );
+        assert_eq!(
+            flat.iter().map(|d| d.pid).collect::<Vec<_>>(),
+            vec![u32::MAX - 1, 2, u32::MAX],
+            "global order by CPU desc across all categories"
+        );
+        assert!(flat[0].synthetic);
+        assert_eq!(flat[0].values[0], 45.0);
+        assert!(!flat[1].synthetic);
+
+        // Name sort (column 0) keeps the TM group sections.
+        let rows = build_display_rows(
+            &snap_of(vec![app, term, irq]),
+            "",
+            0,
+            true,
+            &HashSet::new(),
+            &[false; 3],
+        );
+        let headers: Vec<u8> = rows
+            .iter()
+            .filter_map(|r| match r {
+                DisplayRow::GroupHeader(g, _) => Some(*g),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(headers, vec![0, 1, 2]);
         let bg = rows_in_group(&rows, 1);
-        assert_eq!(bg.len(), 1, "exactly the terminated-processes row");
+        assert_eq!(bg.len(), 1);
         assert!(bg[0].synthetic);
-        assert_eq!(bg[0].name, "Terminated processes (3)");
-        assert_eq!(bg[0].values[0], 45.0);
         let win = rows_in_group(&rows, 2);
-        assert_eq!(win.len(), 1, "exactly the interrupts row");
-        assert!(win[0].synthetic);
+        assert_eq!(win.len(), 1);
         assert_eq!(win[0].values[0], 3.0);
-        let apps = rows_in_group(&rows, 0);
-        assert_eq!(apps.len(), 1);
-        assert!(!apps[0].synthetic);
+    }
+
+    #[test]
+    fn expanded_family_stays_attached_when_blocks_resort() {
+        // A same-image app family with a busy child (same image → never
+        // promoted out of the family): in the CPU-sorted flat view the
+        // family head competes with its subtree aggregate; expanding it
+        // must keep the child directly below the head even though the head
+        // alone would sort far lower.
+        let mut head = proc(1, None, "fam.exe", ProcCategory::App);
+        head.has_window = true;
+        head.cpu_pct = 0.0;
+        let mut worker = proc(2, Some(1), "fam.exe", ProcCategory::App);
+        worker.cpu_pct = 30.0;
+        let mut other = proc(3, None, "other.exe", ProcCategory::App);
+        other.has_window = true;
+        other.cpu_pct = 10.0;
+        let mut expanded = HashSet::new();
+        expanded.insert(1u32);
+        let rows = build_display_rows(
+            &snap_of(vec![head, worker, other]),
+            "",
+            2,
+            false,
+            &expanded,
+            &[false; 3],
+        );
+        let pids: Vec<u32> = rows
+            .iter()
+            .filter_map(|r| match r {
+                DisplayRow::Process(d) => Some(d.pid),
+                _ => None,
+            })
+            .collect();
+        // fam.exe family aggregates to 30 % → first block; its expanded
+        // worker rides along; other.exe (10 %) follows. Headers are gone
+        // in this view.
+        assert_eq!(pids, vec![1, 2, 3]);
+        let DisplayRow::Process(head_row) = &rows[0] else {
+            panic!("first row must be a process row");
+        };
+        assert!(head_row.children, "family head stays expandable");
     }
 
     #[test]
@@ -2203,11 +2324,12 @@ mod tests {
         );
         term.description = Some("rustc.exe \u{d7}2".into());
         term.cpu_pct = 9.0;
+        // Name sort → grouped sections (rows_in_group needs headers).
         let rows = build_display_rows(
             &snap_of(vec![term]),
             "",
-            2,
-            false,
+            0,
+            true,
             &HashSet::new(),
             &[false; 3],
         );
@@ -2225,8 +2347,8 @@ mod tests {
         let rows = build_display_rows(
             &snap_of(vec![real]),
             "",
-            2,
-            false,
+            0,
+            true,
             &HashSet::new(),
             &[false; 3],
         );

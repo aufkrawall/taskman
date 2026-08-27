@@ -723,7 +723,15 @@ fn append_pseudo_rows(
     }
     if let Some(h) = terminated {
         let mut e = ProcessEntry::new(PSEUDO_PID_TERMINATED, "Terminated Processes");
-        e.display = i18n::trf(K::TerminatedProcesses, &[&h.count.to_string()]);
+        // A residual can exist without observed exits (born-and-dead-inside-
+        // one-window churn is never sampled alive, plus accounting tail) —
+        // showing "(0)" would read as a bug, so the count is only shown
+        // when there is one.
+        e.display = if h.count > 0 {
+            i18n::trf(K::TerminatedProcesses, &[&h.count.to_string()])
+        } else {
+            i18n::tr(K::TerminatedProcessesPlain).to_string()
+        };
         e.category = ProcCategory::Background;
         e.cpu_pct = h.pct.clamp(0.0, 100.0);
         e.synthetic = true;

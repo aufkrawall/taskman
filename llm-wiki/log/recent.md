@@ -1,5 +1,37 @@
 # Recent Activity
 
+## 2026-08-27 — TM-parity resource sorting (flat list, no group sections)
+
+Follow-up to the attribution fix, from a side-by-side screenshot: native
+Win11 Task Manager keeps the Apps/Background/Windows sections ONLY when
+sorted by Name; any resource sort (CPU/memory/disk/network) flattens the
+whole list into ONE globally sorted sequence (family groups like
+"Brave (29)" stay collapsible). We kept the sections, burying top
+consumers.
+
+Fix in `build_display_rows` (tm-app/tabs/processes.rs): group headers and
+collapse are applied only for `sort_col < 2` (Name/Status); for resource
+sorts `sort_blocks_globally` reorders the per-section emission: the
+emitters produce self-contained BLOCKS (depth-0 head row + its expanded,
+nested children), blocks are sorted by the head's representative value
+(subtree aggregate for family/tree heads, own values otherwise) and
+concatenated. Expanded families therefore stay attached while heads
+compete globally. Group-collapse state is ignored in the flat view
+(native TM offers no group toggles there either). Do NOT "fix" this back
+to per-section grouping for resource sorts.
+
+Also: the "Terminated processes" pseudo-row shows its count only when > 0
+(a residual without observed exits — born-and-dead-within-one-window
+churn is never sampled alive — must not read "(0)"); new i18n key
+`TerminatedProcessesPlain`. NOTE for tests: a busy DIFFERENT-image child
+of an app (≥ 1 % cpu) is intentionally promoted to a Background top-level
+row by `promote_busy_external_tasks`, so it competes globally in the flat
+view — block-attachment tests need same-image children.
+
+Tests: flat ordering across categories (top consumer first, no headers),
+name sort keeps sections, expanded same-image family stays attached,
+pseudo-row label/tooltip.
+
 ## 2026-08-27 — CPU attribution completeness (terminated processes, interrupts)
 
 User report: while compiling in a terminal, the Processes page showed NO
