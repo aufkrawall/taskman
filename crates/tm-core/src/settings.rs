@@ -7,11 +7,15 @@
 //! save_config=true
 //! theme=dark
 //! update_speed=normal
-//! window_size=1100x720
+//! window_size=1200x800
+//! window_position=120,80
 //!
 //! [columns.processes]
 //! name=340
 //! cpu=110
+//!
+//! [column_order]
+//! details=name,pid,status,user,cpu,mem
 //! ```
 //!
 //! Rules:
@@ -101,6 +105,10 @@ pub struct Settings {
     /// Remember window size/position between runs.
     pub remember_window: bool,
     pub window_size: [f32; 2],
+    /// Last normal (non-maximized) outer-window position in logical points.
+    pub window_position: Option<[f32; 2]>,
+    /// Restore the window maximized when it was maximized at shutdown.
+    pub window_maximized: bool,
     /// Task-Manager-style start page used unless a CLI flag overrides it.
     pub default_start_page: String,
     /// Navigation rail collapsed to icons only (hamburger toggle).
@@ -110,6 +118,9 @@ pub struct Settings {
     /// User-resized column widths per table, keyed by stable column id:
     /// `table id -> column id -> width`.
     pub col_widths: BTreeMap<String, BTreeMap<String, f32>>,
+    /// Ordered active column ids per table. For Details this persists both
+    /// visibility and user-selected order without tying either to positions.
+    pub col_order: BTreeMap<String, Vec<String>>,
     /// Width of the Performance tab's left card column.
     pub perf_card_width: f32,
     /// Performance CPU graph mode: "overall" | "logical".
@@ -128,11 +139,14 @@ impl Default for Settings {
             graph_seconds: 60,
             ui_zoom: 1.0,
             remember_window: true,
-            window_size: [1100.0, 720.0],
+            window_size: [1200.0, 800.0],
+            window_position: None,
+            window_maximized: false,
             default_start_page: "processes".into(),
             sidebar_collapsed: false,
             language: Default::default(),
             col_widths: BTreeMap::new(),
+            col_order: BTreeMap::new(),
             perf_card_width: 252.0,
             cpu_graph_mode: "overall".into(),
             show_kernel_times: false,
@@ -197,8 +211,12 @@ fn unescape_ini(v: &str) -> String {
     out
 }
 
-fn render_ini(body: String, columns: &BTreeMap<String, BTreeMap<String, f32>>) -> String {
-    let mut out = String::with_capacity(512);
+fn render_ini(
+    body: String,
+    columns: &BTreeMap<String, BTreeMap<String, f32>>,
+    column_order: &BTreeMap<String, Vec<String>>,
+) -> String {
+    let mut out = String::with_capacity(640);
     out.push_str("# taskman configuration — edited values apply on the next start.\n");
     out.push_str("# Delete this file to reset all settings to their defaults.\n\n");
     out.push_str(&body);
@@ -209,6 +227,16 @@ fn render_ini(body: String, columns: &BTreeMap<String, BTreeMap<String, f32>>) -
         out.push_str(&format!("\n[columns.{table}]\n# column id = width px\n"));
         for (col, w) in cols {
             out.push_str(&format!("{}={}\n", escape_ini(col), fmt_width(*w)));
+        }
+    }
+    let active_orders = column_order
+        .iter()
+        .filter(|(_, ids)| !ids.is_empty())
+        .collect::<Vec<_>>();
+    if !active_orders.is_empty() {
+        out.push_str("\n[column_order]\n# ordered active column ids\n");
+        for (table, ids) in active_orders {
+            out.push_str(&format!("{}={}\n", escape_ini(table), ids.join(",")));
         }
     }
     out
@@ -239,13 +267,32 @@ fn parse_u32(s: &str) -> Option<u32> {
 }
 
 fn write_window_size(sz: [f32; 2]) -> String {
-    format!("{}x{}", sz[0], sz[1])
+    format!("{}x{}", fmt_width(sz[0]), fmt_width(sz[1]))
 }
 
 fn parse_window_size(s: &str) -> Option<[f32; 2]> {
     let (w, h) = s.split_once(['x', 'X'])?;
     let (w, h) = (parse_f32(w.trim())?, parse_f32(h.trim())?);
     Some([w, h])
+}
+
+fn write_window_position(pos: [f32; 2]) -> String {
+    format!("{},{}", fmt_width(pos[0]), fmt_width(pos[1]))
+}
+
+fn parse_window_position(s: &str) -> Option<[f32; 2]> {
+    let (x, y) = s.split_once(',')?;
+    Some([parse_f32(x.trim())?, parse_f32(y.trim())?])
+}
+
+fn parse_id_list(s: &str) -> Option<Vec<String>> {
+    let ids = s
+        .split(',')
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .map(str::to_ascii_lowercase)
+        .collect::<Vec<_>>();
+    (!ids.is_empty()).then_some(ids)
 }
 
 fn parse_widths(s: &str) -> Option<Vec<f32>> {
@@ -406,6 +453,10 @@ impl Settings {
         if let Some(v) = get("general", "window_size").and_then(|v| parse_window_size(v)) {
             s.window_size = [v[0].clamp(200.0, 16384.0), v[1].clamp(150.0, 16384.0)];
         }
+        if let Some(v) = get("general", "window_position").and_then(|v| parse_window_position(v)) {
+            s.window_position = Some(v);
+        }
+        s.window_maximized = b("general", "window_maximized", s.window_maximized);
         if let Some(v) = get("general", "default_start_page") {
             let page = v.trim().to_ascii_lowercase();
             if matches!(
@@ -460,6 +511,10 @@ impl Settings {
                 }
             } else if section == "columns" {
                 saw_legacy = true;
+            } else if section == "column_order"
+                && let Some(ids) = parse_id_list(value)
+            {
+                s.col_order.insert(key.clone(), ids);
             }
         }
 
@@ -482,7 +537,10 @@ impl Settings {
 
         // remember_window=false: geometry is neither restored nor persisted.
         if !s.remember_window {
-            s.window_size = Settings::default().window_size;
+            let defaults = Settings::default();
+            s.window_size = defaults.window_size;
+            s.window_position = None;
+            s.window_maximized = false;
         }
         s
     }
@@ -531,7 +589,7 @@ impl Settings {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let g = &[
+        let mut g = vec![
             ("save_config", self.save_config.to_string()),
             ("language", self.language.as_cfg().to_string()),
             ("theme", self.theme.as_cfg().to_string()),
@@ -541,18 +599,22 @@ impl Settings {
             ("ui_zoom", self.ui_zoom.to_string()),
             ("remember_window", self.remember_window.to_string()),
             ("window_size", write_window_size(self.window_size)),
+            ("window_maximized", self.window_maximized.to_string()),
             ("default_start_page", self.default_start_page.clone()),
             ("sidebar_collapsed", self.sidebar_collapsed.to_string()),
             ("perf_card_width", self.perf_card_width.to_string()),
             ("cpu_graph_mode", self.cpu_graph_mode.clone()),
             ("show_kernel_times", self.show_kernel_times.to_string()),
         ];
+        if let Some(pos) = self.window_position {
+            g.insert(9, ("window_position", write_window_position(pos)));
+        }
         let mut body = String::from("[general]\n");
         for (k, v) in g {
-            body.push_str(&format!("{k}={}\n", escape_ini(v)));
+            body.push_str(&format!("{k}={}\n", escape_ini(&v)));
         }
         let tmp = path.with_extension("ini.tmp");
-        std::fs::write(&tmp, render_ini(body, &self.col_widths))?;
+        std::fs::write(&tmp, render_ini(body, &self.col_widths, &self.col_order))?;
         // Atomic-ish replace so a crash mid-write never corrupts settings.
         std::fs::rename(&tmp, path)?;
         tracing::debug!(path = %path.display(), "settings saved");
@@ -736,6 +798,8 @@ mod tests {
             graph_seconds: 120,
             ui_zoom: 1.25,
             window_size: [800.0, 600.0],
+            window_position: Some([-120.5, 48.0]),
+            window_maximized: true,
             ..Settings::default()
         };
         s.save_config = false;
@@ -752,6 +816,10 @@ mod tests {
         );
         s.col_widths
             .insert("details".into(), BTreeMap::from([("pid".into(), 80.0)]));
+        s.col_order.insert(
+            "details".into(),
+            vec!["pid".into(), "name".into(), "threads".into()],
+        );
 
         s.save_to(&path).unwrap();
         let loaded = Settings::load_from(&path);
@@ -777,6 +845,7 @@ unknown_key=42
 graph_seconds=99999
 ui_zoom=7.0
 window_size=not-a-size
+window_position=oops
 
 [stranger_section]
 whatever=yes
@@ -789,6 +858,7 @@ whatever=yes
         assert_eq!(s.graph_seconds, 600);
         assert_eq!(s.ui_zoom, Settings::default().ui_zoom);
         assert_eq!(s.window_size, Settings::default().window_size);
+        assert_eq!(s.window_position, None);
         // Unknown keys/sections are ignored without failing the file.
         assert_eq!(s.update_speed, Settings::default().update_speed);
     }
@@ -796,11 +866,12 @@ whatever=yes
     #[test]
     fn value_aliases_are_accepted() {
         let s = Settings::from_ini_text(
-            "[general]\nsave_config=off\nalways_on_top=YES\nwindow_size=640X480\n",
+            "[general]\nsave_config=off\nalways_on_top=YES\nwindow_size=640X480\nwindow_position=-50.5,25\n",
         );
         assert!(!s.save_config);
         assert!(s.always_on_top);
         assert_eq!(s.window_size, [640.0, 480.0]);
+        assert_eq!(s.window_position, Some([-50.5, 25.0]));
     }
 
     #[test]
@@ -829,10 +900,16 @@ whatever=yes
 
     #[test]
     fn unknown_future_column_ids_do_not_break_settings_load() {
-        let s = Settings::from_ini_text("[columns.details]\nnpu_engine=120\nname=300\n");
+        let s = Settings::from_ini_text(
+            "[columns.details]\nnpu_engine=120\nname=300\n\n[column_order]\ndetails=name,npu_engine,pid\n",
+        );
         let d = s.col_widths.get("details").expect("details present");
         assert_eq!(d.get("npu_engine"), Some(&120.0));
         assert_eq!(d.get("name"), Some(&300.0));
+        assert_eq!(
+            s.col_order.get("details"),
+            Some(&vec!["name".into(), "npu_engine".into(), "pid".into()])
+        );
     }
 
     #[test]
@@ -884,26 +961,29 @@ whatever=yes
     }
 
     #[test]
-    fn remember_window_false_does_not_restore_or_persist_geometry() {
-        let s = Settings::from_ini_text("[general]\nremember_window=false\nwindow_size=999x888\n");
-        assert!(!s.remember_window);
-        assert_eq!(
-            s.window_size,
-            Settings::default().window_size,
-            "saved geometry must not be restored"
+    fn remember_window_false_does_not_restore_geometry() {
+        let s = Settings::from_ini_text(
+            "[general]\nremember_window=false\nwindow_size=999x888\nwindow_position=-10,20\nwindow_maximized=true\n",
         );
+        assert!(!s.remember_window);
+        assert_eq!(s.window_size, Settings::default().window_size);
+        assert_eq!(s.window_position, None);
+        assert!(!s.window_maximized);
 
-        // And persistence skips geometry while disabled.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("c.ini");
         let s2 = Settings {
             remember_window: false,
             window_size: [1234.0, 777.0],
+            window_position: Some([42.0, 31.0]),
+            window_maximized: true,
             ..Settings::default()
         };
         s2.save_to(&path).unwrap();
         let l = Settings::load_from(&path);
         assert_eq!(l.window_size, Settings::default().window_size);
+        assert_eq!(l.window_position, None);
+        assert!(!l.window_maximized);
     }
 
     #[test]
