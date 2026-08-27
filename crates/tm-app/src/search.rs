@@ -54,7 +54,7 @@ impl Query {
 /// keyboard layouts and non-ASCII letters behave naturally. Modified input is
 /// ignored so application shortcuts never become list-navigation keystrokes.
 pub fn list_initial(ctx: &egui::Context) -> Option<char> {
-    if ctx.wants_keyboard_input() {
+    if ctx.egui_wants_keyboard_input() {
         return None;
     }
     ctx.input(|i| {
