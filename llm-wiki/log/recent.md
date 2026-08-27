@@ -1,5 +1,33 @@
 # Recent Activity
 
+## 2026-08-27 — Performance chart freeze (VecDeque ring wrap)
+
+User report: sometimes the Performance graphs / card sparkline previews
+stop updating while the rest of the app stays live. Root cause was NOT the
+engine/wakeup path (engine → `request_repaint` → eframe event loop was
+verified sound) but `TaskManApp.history`: a `VecDeque` with capacity
+`history_cap + 8` that `poll_engine` keeps at `len == history_cap` via
+pop-front/push-back. Once the ring wraps (after ~cap ticks — 2 min at
+Normal speed), `as_slices()` returns TWO runs and the newest points live in
+the SECOND one — which `performance::window()` discarded (`let (full, _)`).
+Every frame then rendered a stale front-run: frozen for 119 of every 120
+ticks (verified with a standalone ring probe). The one-tick catch-up blip
+per cycle explains the "sometimes" flavor.
+
+Fix: history is a plain contiguous `Vec<HistoryPoint>` (always
+append-ordered; `push_history_point` extracted for the regression test
+`history_retention_keeps_newest_point_visible`). Sibling hardening in the
+same symptom class: `visible_slice` now scans backward from the newest
+sample instead of `partition_point` (robust against a backward wall-clock
+step leaving future-stamped older points), and `chart_multi` computes its
+x-span with `saturating_sub` (the old `last - first` wrapped/panicked on
+such data). If history ever becomes a deque again, windowing must handle
+both slices or call `make_contiguous` — see the field doc in `app.rs`.
+
+Tests: retention-through-wrap (app.rs), backward-clock-step window
+(performance.rs); `cargo test -p tm-app` 55 passed, clippy clean, release
+build packaged.
+
 ## 2026-08-27 — TM-parity resource sorting (flat list, no group sections)
 
 Follow-up to the attribution fix, from a side-by-side screenshot: native

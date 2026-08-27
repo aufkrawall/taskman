@@ -84,6 +84,10 @@ Rust workspace, three crates in a strict dependency chain
   Resize handles are registered after ALL header cells so they win hit
   testing across their full ±6 px; double-click restore is detected via
   input state because drag-only widgets never receive click flags.
+- `crates/tm-app/src/app.rs` — `TaskManApp.history` (Performance-chart data)
+  MUST stay a contiguous, append-ordered `Vec<HistoryPoint>`; it was a
+  `VecDeque` whose ring wrap once froze all Performance charts (see
+  `log/recent.md` 2026-08-27). `performance::window` slices it directly.
 - `crates/tm-app/src/tabs/processes.rs` — Processes UI intentionally uses a
   presentation-only app tree for Apps (Explorer/common shells, shell-session
   brokers and browsers are launch boundaries; a windowed process folds into

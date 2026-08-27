@@ -203,11 +203,13 @@ pub fn chart_multi(
     );
 
     let y = |v: f64| rect.bottom() - (v.clamp(0.0, y_max) / y_max) as f32 * rect.height();
-    // Time-proportional x mapping over the shared window.
+    // Time-proportional x mapping over the shared window. `saturating_sub`
+    // because a wall-clock step backward can put a future-stamped older
+    // point at the front (then `last - first` would underflow/wrap).
     let t_span = timestamps_ms.and_then(|ts| {
         let first = *ts.first()?;
         let last = *ts.last()?;
-        Some((first, (last - first).max(1)))
+        Some((first, last.saturating_sub(first).max(1)))
     });
     let x_at = |i: usize, n: usize| match t_span {
         Some((t0, span)) => {

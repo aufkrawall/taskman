@@ -19,7 +19,17 @@ pub fn visible_slice(history: &[HistoryPoint], seconds: u32) -> &[HistoryPoint] 
         return &[];
     };
     let cutoff = last.t_ms.saturating_sub(seconds as u64 * 1000);
-    let start = history.partition_point(|h| h.t_ms < cutoff);
+    // Backward scan instead of `partition_point`: history is appended in
+    // sample order, but a wall-clock step BACKWARD (NTP correction after
+    // resume) leaves older points with larger timestamps. A binary search
+    // over that temporarily-unsorted buffer can drop the newest points and
+    // freeze the charts until they age out; scanning back from the newest
+    // sample always keeps the latest data in view (at worst the window is
+    // briefly too wide until the stale points are evicted).
+    let mut start = history.len();
+    while start > 0 && history[start - 1].t_ms >= cutoff {
+        start -= 1;
+    }
     &history[start..]
 }
 
@@ -80,6 +90,26 @@ mod tests {
         assert_eq!(visible_slice(&irr, 60).len(), 4);
         // Window of 10 s keeps only the last two.
         assert_eq!(visible_slice(&irr, 10).len(), 2);
+    }
+
+    /// Regression: a wall-clock step BACKWARD (e.g. NTP correction after
+    /// resume) leaves older points with larger timestamps than the newest
+    /// ones. The slice must still keep the newest samples in view — a
+    /// binary search over the temporarily-unsorted buffer could not
+    /// guarantee that, and the charts degraded with it.
+    #[test]
+    fn visible_slice_keeps_newest_point_after_backward_clock_step() {
+        let mut hist: Vec<HistoryPoint> = (0..120u64).map(|i| pt(i * 1000)).collect();
+        // Clock jumps back 30 s; new samples append with smaller timestamps.
+        hist.push(pt(90_000));
+        hist.push(pt(91_000));
+        let win = visible_slice(&hist, 60);
+        assert_eq!(
+            win.last().unwrap().t_ms,
+            91_000,
+            "newest point must stay in view"
+        );
+        assert!(win.len() >= 2, "window must still hold plottable data");
     }
 
     #[test]
@@ -500,11 +530,9 @@ fn page_chart(
     .inner
 }
 
-/// Iterator over the newest `n` history points without cloning them.
 /// The time-windowed history slice shared by all pages this frame.
 fn window(app: &TaskManApp) -> &[HistoryPoint] {
-    let (full, _) = app.history.as_slices();
-    visible_slice(full, app.shared.settings.graph_seconds)
+    visible_slice(&app.history, app.shared.settings.graph_seconds)
 }
 
 fn series(win: &[HistoryPoint], f: impl Fn(&HistoryPoint) -> f64) -> Vec<f64> {
