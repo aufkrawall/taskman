@@ -87,7 +87,10 @@ fn build_definitions() -> FontDefinitions {
     // a separate face purely from RichText::strong, so do not pretend this is
     // native DirectWrite/Fontconfig shaping; it is kept for glyph fallback.
     let bold_candidates: &[(&str, Vec<String>)] = &[
-        ("SegoeUI-Bold", vec![r"C:\Windows\Fonts\segoeuib.ttf".into()]),
+        (
+            "SegoeUI-Bold",
+            vec![r"C:\Windows\Fonts\segoeuib.ttf".into()],
+        ),
         (
             "NotoSans-Bold",
             vec!["/usr/share/fonts/truetype/noto/NotoSans-Bold.ttf".into()],
@@ -115,7 +118,10 @@ fn build_definitions() -> FontDefinitions {
         mono_candidates.push(("FontconfigMono", vec![path]));
     }
     mono_candidates.extend([
-        ("CascadiaMono", vec![r"C:\Windows\Fonts\CascadiaMono.ttf".into()]),
+        (
+            "CascadiaMono",
+            vec![r"C:\Windows\Fonts\CascadiaMono.ttf".into()],
+        ),
         ("Consolas", vec![r"C:\Windows\Fonts\consola.ttf".into()]),
         (
             "JetBrainsMono",

@@ -14,6 +14,20 @@ are accepted (Phases 2-6 open).
 
 ## Recently landed (2026-08-27)
 
+- Window placement: "Remember window size and position" checkbox in the
+  settings dialog (the flag previously had no UI); maximized state is
+  persisted in `window-state.ini` and restored at startup, while maximized
+  sessions never clobber the stored restore size/position with monitor
+  geometry.
+- Type-ahead lists: plain-letter navigation on Processes/Details scrolls
+  virtualized rows into view vertically-only (one-shot `focus_row` param
+  on `tablekit::scrolled_rows`; `Response::scroll_to_me` was both
+  virtualization-blind and two-axis). The Performance card column has the
+  same type-ahead via `search::cycle_match` (generic over the identity
+  type).
+- Details' Select columns dialog uses painted chevron up/down buttons,
+  offset 16 px left of the floating scrollbar (the old right-aligned text
+  arrows were unclickable under it).
 - Startup architecture: single collector built lazily ON the engine thread
   after the first presented frame; no duplicate platform stack; console
   attach only for CLI modes; early ring logging with deferred file attach;
@@ -35,13 +49,14 @@ are accepted (Phases 2-6 open).
   with cycle-safe O(n) subtree aggregation.
 - Process-list interaction: plain alphabetic typing on Processes and Details
   selects the next displayed matching process, cycles repeated initials, and
-  scrolls virtualized rows into view without stealing input from text edits.
+  scrolls virtualized rows into view (vertical-only, virtualization-aware —
+  see the 2026-08-27 log entry) without stealing input from text edits.
   Details' Select columns dialog is compact and lets enabled columns move
-  left/right in the rendered table while keeping sort semantics ID-based.
+  up/down in the rendered table while keeping sort semantics ID-based.
 - Native window placement: fresh installs start at 1280×800; remembered size
-  continues through `config.ini`, while desktop-space position is restored
-  from `window-state.ini` and written only on a clean close when both config
-  autosave and remember-window are enabled.
+  continues through `config.ini`, while desktop-space position and maximized
+  state are restored from `window-state.ini` and written only on a clean
+  close when both config autosave and remember-window are enabled.
 - Processes presentation parity: app grouping is window-ownership driven
   instead of a literal PPID tree. Explorer/console-shell launch boundaries
   keep user-launched programs as independent top-level Apps; app resource

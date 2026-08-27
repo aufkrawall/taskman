@@ -7,6 +7,7 @@ use tm_core::format;
 use tm_core::i18n::{self, K};
 
 use crate::app::{HistoryPoint, TaskManApp};
+use crate::search;
 use crate::theme::{self, Palette};
 use crate::widgets::chart::{MultiSeries, chart_multi, core_chart};
 
@@ -172,6 +173,21 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
             .map_or_else(|| "cpu".into(), |e| e.key.clone());
     }
 
+    // Task-Manager-style type navigation over the resource cards: a plain
+    // letter selects the next card whose title begins with it, and the card
+    // column scrolls vertically to keep it in view.
+    if let Some(initial) = search::list_initial(ui.ctx()) {
+        let selected = Some(app.perf_selected_key.clone());
+        if let Some(key) = search::cycle_match(
+            entries.iter().map(|e| (e.key.clone(), e.title.as_str())),
+            selected,
+            initial,
+        ) {
+            app.perf_selected_key = key.clone();
+            app.perf_jump_to = Some(key);
+        }
+    }
+
     ui.horizontal_top(|ui| {
         // ---------------- left column of cards (user-resizable) -------------
         let mut card_w = app.shared.settings.perf_card_width.clamp(180.0, 520.0);
@@ -275,6 +291,14 @@ fn card_ui(
     }
     if resp.clicked() {
         app.perf_selected_key = e.key.clone();
+    }
+
+    // Consume a one-shot type-ahead scroll request for this card. The card
+    // list is fully rendered (not virtualized), so the response always
+    // exists; `None` align scrolls minimally on the vertical axis only.
+    if app.perf_jump_to.as_deref() == Some(e.key.as_str()) {
+        resp.scroll_to_me(None);
+        app.perf_jump_to = None;
     }
 
     // Mini graph on the left, painted into the card rect.

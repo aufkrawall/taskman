@@ -49,8 +49,7 @@ pub fn top_search_panel(app: &mut TaskManApp, ui_root: &mut egui::Ui, pal: &Pale
             // not put a transparent drag widget over the search box: that
             // would steal focus, text selection and double-click gestures.
             let left_drag = Rect::from_min_max(rect.min, Pos2::new(box_rect.left(), rect.bottom()));
-            let right_drag =
-                Rect::from_min_max(Pos2::new(box_rect.right(), rect.top()), rect.max);
+            let right_drag = Rect::from_min_max(Pos2::new(box_rect.right(), rect.top()), rect.max);
             for (id, drag_rect) in [("top-drag-left", left_drag), ("top-drag-right", right_drag)] {
                 if drag_rect.width() > 0.0 {
                     let resp = ui.interact(drag_rect, egui::Id::new(id), Sense::drag());
@@ -210,7 +209,11 @@ fn nav_item(
 }
 
 fn icon_button(ui: &mut egui::Ui, pal: &Palette, icon: Icon, size: f32, center: bool) -> bool {
-    let w = if center { ui.available_width().max(size) } else { size };
+    let w = if center {
+        ui.available_width().max(size)
+    } else {
+        size
+    };
     let (rect, resp) = ui.allocate_exact_size(egui::vec2(w, size), Sense::click());
     if resp.hovered() {
         let hover = if center {
@@ -218,7 +221,8 @@ fn icon_button(ui: &mut egui::Ui, pal: &Palette, icon: Icon, size: f32, center: 
         } else {
             rect
         };
-        ui.painter().rect_filled(hover, 4.0, Color32::from_white_alpha(12));
+        ui.painter()
+            .rect_filled(hover, 4.0, Color32::from_white_alpha(12));
     }
     crate::icons::draw_at(
         ui,
@@ -279,7 +283,11 @@ pub fn cmd_button(
             clicked = true;
         }
     }
-    let color = if enabled { pal.text } else { pal.text_dim.gamma_multiply(0.55) };
+    let color = if enabled {
+        pal.text
+    } else {
+        pal.text_dim.gamma_multiply(0.55)
+    };
     crate::icons::draw_at(
         ui,
         Rect::from_center_size(
@@ -341,7 +349,10 @@ pub fn settings_dialog(app: &mut TaskManApp, ctx: &egui::Context, _pal: &theme::
                     (ThemeMode::Light, K::ThemeLight),
                     (ThemeMode::Dark, K::ThemeDark),
                 ] {
-                    if ui.selectable_label(app.shared.settings.theme == mode, i18n::tr(key)).clicked() {
+                    if ui
+                        .selectable_label(app.shared.settings.theme == mode, i18n::tr(key))
+                        .clicked()
+                    {
                         app.shared.settings.theme = mode;
                         apply_theme(ctx, mode);
                         app.shared.settings.save();
@@ -364,7 +375,10 @@ pub fn settings_dialog(app: &mut TaskManApp, ctx: &egui::Context, _pal: &theme::
                         tm_core::settings::UpdateSpeed::Low => K::SpdLow,
                         tm_core::settings::UpdateSpeed::Paused => K::SpdPaused,
                     };
-                    if ui.selectable_label(app.shared.settings.update_speed == speed, i18n::tr(key)).clicked() {
+                    if ui
+                        .selectable_label(app.shared.settings.update_speed == speed, i18n::tr(key))
+                        .clicked()
+                    {
                         app.shared.settings.update_speed = speed;
                         match speed {
                             tm_core::settings::UpdateSpeed::Paused => app.engine.pause(),
@@ -386,7 +400,10 @@ pub fn settings_dialog(app: &mut TaskManApp, ctx: &egui::Context, _pal: &theme::
                     (tm_core::i18n::LangChoice::De, "Deutsch"),
                     (tm_core::i18n::LangChoice::En, "English"),
                 ] {
-                    if ui.selectable_label(app.shared.settings.language == choice, label).clicked() {
+                    if ui
+                        .selectable_label(app.shared.settings.language == choice, label)
+                        .clicked()
+                    {
                         app.shared.settings.language = choice;
                         i18n::set_lang(choice.resolve());
                         ctx.send_viewport_cmd(egui::ViewportCommand::Title(
@@ -399,7 +416,9 @@ pub fn settings_dialog(app: &mut TaskManApp, ctx: &egui::Context, _pal: &theme::
 
             ui.add_space(10.0);
             let mut on_top = app.shared.settings.always_on_top;
-            if crate::widgets::controls::checkbox(ui, &mut on_top, i18n::tr(K::AlwaysOnTop), _pal).changed() {
+            if crate::widgets::controls::checkbox(ui, &mut on_top, i18n::tr(K::AlwaysOnTop), _pal)
+                .changed()
+            {
                 app.shared.settings.always_on_top = on_top;
                 ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(if on_top {
                     egui::WindowLevel::AlwaysOnTop
@@ -422,12 +441,28 @@ pub fn settings_dialog(app: &mut TaskManApp, ctx: &egui::Context, _pal: &theme::
                 app.save_settings_forced();
             }
 
+            let mut remember = app.shared.settings.remember_window;
+            if crate::widgets::controls::checkbox(
+                ui,
+                &mut remember,
+                i18n::tr(K::RememberWindow),
+                _pal,
+            )
+            .changed()
+            {
+                app.shared.settings.remember_window = remember;
+                app.shared.settings.save();
+            }
+
             ui.add_space(10.0);
             ui.label(i18n::tr(K::GraphWindowLabel));
             ui.horizontal(|ui| {
                 for secs in [30u32, 60, 120] {
                     if ui
-                        .selectable_label(app.shared.settings.graph_seconds == secs, format!("{secs} s"))
+                        .selectable_label(
+                            app.shared.settings.graph_seconds == secs,
+                            format!("{secs} s"),
+                        )
                         .clicked()
                     {
                         app.shared.settings.graph_seconds = secs;
@@ -446,7 +481,10 @@ pub fn settings_dialog(app: &mut TaskManApp, ctx: &egui::Context, _pal: &theme::
                     (1.1, "110 %"),
                     (1.25, "125 %"),
                 ] {
-                    if ui.selectable_label((app.shared.settings.ui_zoom - zoom).abs() < 0.01, label).clicked() {
+                    if ui
+                        .selectable_label((app.shared.settings.ui_zoom - zoom).abs() < 0.01, label)
+                        .clicked()
+                    {
                         app.shared.settings.ui_zoom = zoom;
                         ctx.set_zoom_factor(zoom);
                         app.shared.settings.save();
@@ -575,16 +613,17 @@ pub fn run_task_dialog(app: &mut TaskManApp, ctx: &egui::Context, _pal: &theme::
                     let cmdline = app.run_dialog_text.trim().to_string();
                     let elevated = app.run_elevated;
                     let toasts = app.shared.toasts.clone();
-                    let spawned = std::thread::Builder::new()
-                        .name("tm-run".into())
-                        .spawn(move || {
-                            let result = actions.run_new_task_probe(&cmdline, elevated);
-                            let msg = match result {
-                                Ok(()) => i18n::trf(K::StartedMsg, &[&cmdline]),
-                                Err(e) => i18n::trf(K::ErrMsg, &[&e.to_string()]),
-                            };
-                            crate::app::toast_from(&toasts, msg);
-                        });
+                    let spawned =
+                        std::thread::Builder::new()
+                            .name("tm-run".into())
+                            .spawn(move || {
+                                let result = actions.run_new_task_probe(&cmdline, elevated);
+                                let msg = match result {
+                                    Ok(()) => i18n::trf(K::StartedMsg, &[&cmdline]),
+                                    Err(e) => i18n::trf(K::ErrMsg, &[&e.to_string()]),
+                                };
+                                crate::app::toast_from(&toasts, msg);
+                            });
                     if spawned.is_err() {
                         app.shared.toast(i18n::tr(K::LaunchFailed));
                     }

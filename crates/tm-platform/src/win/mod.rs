@@ -184,7 +184,10 @@ impl PlatformActions for WinActions {
             .map_err(|e| tm_core::TmError::platform("current_exe", e.to_string()))?;
         let action = if enabled { "enable" } else { "disable" };
         process_ops::run_new_task(
-            &format!("\"{}\" --taskmgr-integration={action}", exe.to_string_lossy()),
+            &format!(
+                "\"{}\" --taskmgr-integration={action}",
+                exe.to_string_lossy()
+            ),
             true,
         )
     }

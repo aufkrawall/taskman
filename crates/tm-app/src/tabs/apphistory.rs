@@ -115,6 +115,7 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
         None,
         None,
         rows.len(),
+        None,
         |ui, table, _avail, _content_w, range| {
             for ri in range {
                 let Some((name, cpu_s, net_b)) = rows.get(ri) else {

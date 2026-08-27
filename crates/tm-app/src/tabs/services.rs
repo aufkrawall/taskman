@@ -201,6 +201,7 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
         None,
         None,
         rows.len(),
+        None,
         |ui, table, _avail, _content_w, range| {
             for ri in range {
                 let s = rows[ri];

@@ -124,6 +124,13 @@ pub fn scrolled_table(
 }
 
 /// Virtualized variant of [`scrolled_table`] for uniform fixed-height rows.
+///
+/// `focus_row` consumes a one-shot scroll request (type-ahead or cross-tab
+/// selection) by bringing that flat row index into view vertically. It must
+/// bypass `Response::scroll_to_me` for two reasons: the row may lie outside
+/// the currently rendered virtualization window (the response never exists,
+/// so nothing would scroll), and `scroll_to_me` always targets both axes,
+/// which yanked the horizontal offset toward the full-width row.
 #[allow(clippy::too_many_arguments)]
 pub fn scrolled_rows(
     id: &'static str,
@@ -134,6 +141,7 @@ pub fn scrolled_rows(
     sort: Option<(usize, bool)>,
     aggregates: Option<&[String]>,
     row_count: usize,
+    focus_row: Option<usize>,
     rows: impl FnOnce(&mut egui::Ui, &TmTable, f32, f32, std::ops::Range<usize>),
 ) -> Option<usize> {
     let content_w = table.total_width();
@@ -141,6 +149,10 @@ pub fn scrolled_rows(
     let rows_prev_x = ui
         .ctx()
         .data(|d| d.get_temp::<f32>(egui::Id::new(("tm-rowsx", id))))
+        .unwrap_or(0.0);
+    let rows_prev_y = ui
+        .ctx()
+        .data(|d| d.get_temp::<f32>(egui::Id::new(("tm-rowsy", id))))
         .unwrap_or(0.0);
     ui.spacing_mut().item_spacing.y = 0.0;
 
@@ -151,22 +163,48 @@ pub fn scrolled_rows(
         .horizontal_scroll_offset(rows_prev_x)
         .show(ui, |ui| table.header(ui, pal, sort, aggregates));
 
-    let body = egui::ScrollArea::both()
-        .id_salt(egui::Id::new(("tm-rowscroll", id)))
-        .auto_shrink(false)
-        .content_margin(egui::Margin {
-            left: 0,
-            right: BODY_PAD_RIGHT,
-            top: 0,
-            bottom: BODY_PAD_BOTTOM,
-        })
-        .horizontal_scroll_offset(hdr.state.offset.x)
-        .show_rows(ui, ROW_H, row_count, |ui, range| {
+    // Vertical-only minimal-move scroll target, computed against the last
+    // frame's offset. The builder offset is applied on this frame only
+    // (callers hand us `Some` exactly once per request).
+    let vertical_offset = focus_row.map(|row| {
+        let viewport_h = ui.available_height();
+        let row_top = row as f32 * ROW_H;
+        let row_bottom = row_top + ROW_H;
+        let target = if row_top < rows_prev_y {
+            row_top
+        } else if row_bottom > rows_prev_y + viewport_h {
+            row_bottom - viewport_h
+        } else {
+            rows_prev_y // already visible
+        };
+        let content_h = ROW_H * row_count as f32;
+        target.clamp(0.0, (content_h - viewport_h).max(0.0))
+    });
+
+    let body = {
+        let area = egui::ScrollArea::both()
+            .id_salt(egui::Id::new(("tm-rowscroll", id)))
+            .auto_shrink(false)
+            .content_margin(egui::Margin {
+                left: 0,
+                right: BODY_PAD_RIGHT,
+                top: 0,
+                bottom: BODY_PAD_BOTTOM,
+            })
+            .horizontal_scroll_offset(hdr.state.offset.x);
+        let area = match vertical_offset {
+            Some(y) => area.vertical_scroll_offset(y),
+            None => area,
+        };
+        area.show_rows(ui, ROW_H, row_count, |ui, range| {
             rows(ui, table, avail, avail.max(content_w), range)
-        });
+        })
+    };
 
     ui.ctx()
         .data_mut(|d| d.insert_temp(egui::Id::new(("tm-rowsx", id)), body.state.offset.x));
+    ui.ctx()
+        .data_mut(|d| d.insert_temp(egui::Id::new(("tm-rowsy", id)), body.state.offset.y));
     hdr.inner
 }
 
@@ -915,5 +953,84 @@ mod tests {
             vec![ptr_button(bx, 20.0, false)],
         );
         assert_eq!(t.cols[1].width, 267.0);
+    }
+
+    /// Regression (type-ahead scroll): a focus row outside the rendered
+    /// virtualization window must be scrolled into view VERTICALLY, and the
+    /// horizontal offset (independently scrollable table) must never move.
+    #[test]
+    fn focus_row_scrolls_vertically_only_even_for_unrendered_rows() {
+        let ctx = egui::Context::default();
+        // 640 px of columns in a ~520 px viewport → horizontal scrolling is
+        // active, exactly the situation that used to produce the sideways
+        // jump on type-ahead.
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(520.0, 300.0));
+        let y_of = |offset: f32| {
+            ctx.data(|d| {
+                d.get_temp::<f32>(egui::Id::new(("tm-rowsy", "t-focus")))
+                    .unwrap_or(offset)
+            })
+        };
+        let frame = |t: f64, focus: Option<usize>| {
+            let raw = egui::RawInput {
+                screen_rect: Some(screen),
+                time: Some(t),
+                predicted_dt: 1.0 / 60.0,
+                ..Default::default()
+            };
+            let mut t8 = table();
+            let mut out = ctx.run_ui(raw, |root| {
+                egui::CentralPanel::default()
+                    .frame(egui::Frame::NONE)
+                    .show(root, |ui| {
+                        let avail = table_avail(ui);
+                        scrolled_rows(
+                            "t-focus",
+                            ui,
+                            &crate::theme::DARK,
+                            &mut t8,
+                            avail,
+                            None,
+                            None,
+                            100,
+                            focus,
+                            |ui, table, _a, _c, range| {
+                                let _ = ui;
+                                for _ in range {
+                                    table.row(ui, &crate::theme::DARK, false);
+                                }
+                            },
+                        );
+                    });
+            });
+            out.textures_delta.clear();
+        };
+
+        // Baseline frame without a request: at the top.
+        frame(0.000, None);
+        assert_eq!(y_of(0.0), 0.0);
+
+        // Focus a far row (50 * 32 px = 1600 px down, viewport ≈ 270 px):
+        // it must become visible and the horizontal offset must stay put.
+        frame(0.016, Some(50));
+        let y = y_of(0.0);
+        let row_top = 50.0 * ROW_H;
+        let row_bottom = row_top + ROW_H;
+        assert!(y > 0.0, "off-screen focus row did not scroll");
+        assert!(
+            y <= row_top && y + 270.0 >= row_bottom - 1.0,
+            "row [{row_top}, {row_bottom}] not inside view after focus (offset {y})"
+        );
+        assert_eq!(
+            ctx.data(|d| d
+                .get_temp::<f32>(egui::Id::new(("tm-rowsx", "t-focus")))
+                .unwrap_or(0.0)),
+            0.0,
+            "horizontal offset must not move on a vertical focus request"
+        );
+
+        // A visible row is left where it is (no re-centering jitter).
+        frame(0.032, Some(50));
+        assert_eq!(y_of(0.0), y);
     }
 }

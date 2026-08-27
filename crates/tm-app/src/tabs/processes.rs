@@ -239,7 +239,7 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
     // wrap in the exact flattened/sorted order shown on screen.
     if let Some(initial) = search::list_initial(ui.ctx()) {
         let selected = app.selected_process.as_ref().map(|p| p.pid);
-        if let Some(pid) = search::cycle_process_initial(
+        if let Some(pid) = search::cycle_match(
             rows.iter().filter_map(|row| match row {
                 DisplayRow::Process(row) => Some((row.pid, row.name.as_str())),
                 DisplayRow::GroupHeader(..) => None,
@@ -263,6 +263,14 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
     prepare_auto_fit_widths(ui, &mut table, &rows, &aggs);
 
     let avail = tablekit::table_avail(ui);
+    // Consume any pending scroll request as a flat display-row index so the
+    // table can bring it into view vertically even when it lies outside the
+    // currently rendered virtualization window.
+    let focus_row = app.processes_state.scroll_to_pid.take().and_then(|pid| {
+        rows.iter()
+            .position(|r| matches!(r, DisplayRow::Process(p) if p.pid == pid))
+    });
+
     let clicked = tablekit::scrolled_rows(
         "processes",
         ui,
@@ -272,6 +280,7 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
         Some((app.processes_state.sort_col, app.processes_state.ascending)),
         Some(&aggs),
         rows.len(),
+        focus_row,
         |ui, table, _avail, content_w, range| {
             for i in range {
                 match rows.get(i) {
@@ -308,20 +317,22 @@ fn prepare_auto_fit_widths(
     rows: &[DisplayRow],
     aggs: &[String; 4],
 ) {
-    let header = |i: usize| tablekit::text_width(ui, table.cols[i].label, tablekit::FONT_HDR_LABEL) + 28.0;
+    let header =
+        |i: usize| tablekit::text_width(ui, table.cols[i].label, tablekit::FONT_HDR_LABEL) + 28.0;
     let mut widths = (0..table.cols.len()).map(header).collect::<Vec<_>>();
 
     for row in rows {
-        let DisplayRow::Process(row) = row else { continue };
+        let DisplayRow::Process(row) = row else {
+            continue;
+        };
         widths[0] = widths[0].max(
             tablekit::text_width(ui, &row.name, tablekit::FONT_ROW)
                 + 66.0
                 + row.depth as f32 * 22.0,
         );
         if row.suspended {
-            widths[1] = widths[1].max(
-                tablekit::text_width(ui, i18n::tr(K::StSuspended), tablekit::FONT_ROW) + 42.0,
-            );
+            widths[1] = widths[1]
+                .max(tablekit::text_width(ui, i18n::tr(K::StSuspended), tablekit::FONT_ROW) + 42.0);
         }
         let values = [
             format::format_pct_cell(row.values[0].min(100.0) as f32),
@@ -334,13 +345,12 @@ fn prepare_auto_fit_widths(
             },
         ];
         for (i, text) in values.iter().enumerate() {
-            widths[i + 2] = widths[i + 2]
-                .max(tablekit::text_width(ui, text, tablekit::FONT_ROW) + 22.0);
+            widths[i + 2] =
+                widths[i + 2].max(tablekit::text_width(ui, text, tablekit::FONT_ROW) + 22.0);
         }
     }
     for (i, agg) in aggs.iter().enumerate() {
-        widths[i + 2] = widths[i + 2]
-            .max(tablekit::text_width(ui, agg, tablekit::FONT_AGG) + 36.0);
+        widths[i + 2] = widths[i + 2].max(tablekit::text_width(ui, agg, tablekit::FONT_AGG) + 36.0);
     }
     for (i, width) in widths.into_iter().enumerate() {
         table.set_auto_fit_width(i, width.ceil());
@@ -404,12 +414,7 @@ fn row_ui(
         .selected_process
         .as_ref()
         .is_some_and(|sp| sp.pid == row.pid);
-    let scroll_hint = app.processes_state.scroll_to_pid == Some(row.pid);
     let (rect, resp) = table.row(ui, pal, selected);
-    if scroll_hint {
-        resp.scroll_to_me(Some(egui::Align::Center));
-        app.processes_state.scroll_to_pid = None;
-    }
 
     // Chevron + icon + name.
     let expanded = app.processes_state.expanded.contains(&row.pid);
@@ -663,7 +668,8 @@ fn derive_display_groups(all: &[&ProcessEntry]) -> DisplayGroups {
     // their collector classification rather than demoting every App simply
     // because the Windows-specific signal is absent.
     if !all.iter().any(|p| p.has_window) {
-        let category: HashMap<u32, ProcCategory> = all.iter().map(|p| (p.pid, p.category)).collect();
+        let category: HashMap<u32, ProcCategory> =
+            all.iter().map(|p| (p.pid, p.category)).collect();
         let mut app_roots: HashSet<u32> = all
             .iter()
             .copied()
@@ -671,7 +677,11 @@ fn derive_display_groups(all: &[&ProcessEntry]) -> DisplayGroups {
             .map(|p| p.pid)
             .collect();
         if app_roots.is_empty() {
-            for p in all.iter().copied().filter(|p| p.category == ProcCategory::App) {
+            for p in all
+                .iter()
+                .copied()
+                .filter(|p| p.category == ProcCategory::App)
+            {
                 let parent_is_app = p
                     .ppid
                     .filter(|ppid| *ppid != p.pid)
@@ -1330,8 +1340,14 @@ mod tests {
             .collect();
         assert_eq!(app_rows.len(), 2);
         assert!(app_rows.iter().all(|r| r.depth == 0));
-        assert_eq!(app_rows.iter().find(|r| r.pid == 10).unwrap().name, "WindowsTerminal.exe (2)");
-        assert_eq!(app_rows.iter().find(|r| r.pid == 12).unwrap().name, "notepad.exe");
+        assert_eq!(
+            app_rows.iter().find(|r| r.pid == 10).unwrap().name,
+            "WindowsTerminal.exe (2)"
+        );
+        assert_eq!(
+            app_rows.iter().find(|r| r.pid == 12).unwrap().name,
+            "notepad.exe"
+        );
     }
 
     #[test]
