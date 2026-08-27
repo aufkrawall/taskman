@@ -20,6 +20,8 @@ impl TelemetryDemand {
     pub const PROCESS_GPU: Self = Self(1 << 5);
     pub const PROCESS_GPU_MEMORY: Self = Self(1 << 6);
     pub const TOKEN_SECURITY: Self = Self(1 << 7);
+    /// CPU current-speed PDH counter (Performance page only).
+    pub const CPU_SPEED: Self = Self(1 << 8);
 
     /// Union.
     pub fn union(self, other: Self) -> Self {

@@ -592,6 +592,43 @@ struct DisplayGroups {
     app_roots: HashSet<u32>,
 }
 
+/// Share of total machine capacity at which an external task absorbed into an
+/// app family is promoted to an individually visible Background row. High
+/// enough to never list idle helpers, low enough that any single-core-heavy
+/// workload (builds, compilers, CLI tools) surfaces on every realistic core
+/// count.
+const PROMOTE_CPU_PCT: f32 = 1.0;
+
+/// True when no ancestor inside the process's app family shares its image
+/// name — i.e. the process is an external task the family spawned, not part
+/// of the application's own process group (renderer/helper processes reuse
+/// the main executable and stay folded like Task Manager's app children).
+fn is_external_family_member(
+    p: &ProcessEntry,
+    by_pid: &HashMap<u32, &ProcessEntry>,
+    category: &HashMap<u32, ProcCategory>,
+) -> bool {
+    let mut cur = p;
+    let mut seen: HashSet<u32> = HashSet::new();
+    seen.insert(cur.pid);
+    while let Some(ppid) = cur.ppid {
+        if ppid == cur.pid || !seen.insert(ppid) {
+            break;
+        }
+        let Some(parent) = by_pid.get(&ppid).copied() else {
+            break;
+        };
+        if category.get(&parent.pid) != Some(&ProcCategory::App) {
+            break;
+        }
+        if parent.name.eq_ignore_ascii_case(&p.name) {
+            return false;
+        }
+        cur = parent;
+    }
+    true
+}
+
 fn build_display_rows(
     snap: &Snapshot,
     raw_search: &str,
@@ -787,13 +824,58 @@ fn derive_display_groups(all: &[&ProcessEntry]) -> DisplayGroups {
     }
 
     DisplayGroups {
-        category,
+        category: promote_busy_external_tasks(all, &by_pid, &raw_children, category, &app_roots),
         app_roots,
     }
 }
 
 fn same_process_family(a: &ProcessEntry, b: &ProcessEntry) -> bool {
     a.name.eq_ignore_ascii_case(&b.name)
+}
+
+/// High-CPU external tasks must stay recognizable on the Processes page even
+/// though idle helpers of an app are folded into its family row. Everything
+/// a family spawned that is not one of its own images and that burns real
+/// CPU is lifted out into the Background group (with its own descendants),
+/// where it appears as an ordinary top-level tree. Decisions are made
+/// against the pre-promotion categories so the result never depends on
+/// iteration order.
+fn promote_busy_external_tasks<'a>(
+    all: &[&'a ProcessEntry],
+    by_pid: &HashMap<u32, &'a ProcessEntry>,
+    raw_children: &HashMap<u32, Vec<&'a ProcessEntry>>,
+    mut category: HashMap<u32, ProcCategory>,
+    app_roots: &HashSet<u32>,
+) -> HashMap<u32, ProcCategory> {
+    // Decide against the pre-promotion categories so the result never
+    // depends on iteration order.
+    let busy_external: Vec<u32> = all
+        .iter()
+        .copied()
+        .filter(|p| {
+            p.cpu_pct >= PROMOTE_CPU_PCT
+                && category.get(&p.pid) == Some(&ProcCategory::App)
+                && !app_roots.contains(&p.pid)
+                && is_external_family_member(p, by_pid, &category)
+        })
+        .map(|p| p.pid)
+        .collect();
+    // Move the promoted task and its absorbed descendants wholesale so the
+    // family does not split across groups.
+    let mut stack: Vec<u32> = busy_external;
+    while let Some(pid) = stack.pop() {
+        category.insert(pid, ProcCategory::Background);
+        if let Some(kids) = raw_children.get(&pid) {
+            for kid in kids {
+                if category.get(&kid.pid) == Some(&ProcCategory::App)
+                    && !app_roots.contains(&kid.pid)
+                {
+                    stack.push(kid.pid);
+                }
+            }
+        }
+    }
+    category
 }
 
 /// Parent processes that launch independent foreground applications rather
@@ -1206,12 +1288,16 @@ mod tests {
 
     #[test]
     fn group_totals_are_independent_of_expansion_state() {
-        let snap = snap_of(vec![
+        let mut snap_procs = vec![
             proc(1, None, "app", ProcCategory::App),
             proc(2, Some(1), "child", ProcCategory::App),
             proc(3, Some(2), "grandchild", ProcCategory::App),
             proc(4, None, "bg", ProcCategory::Background),
-        ]);
+        ];
+        for p in &mut snap_procs {
+            p.cpu_pct = 0.0;
+        }
+        let snap = snap_of(snap_procs);
         let groups = [false; 3];
         let mut expanded = HashSet::new();
         expanded.insert(1u32);
@@ -1309,7 +1395,10 @@ mod tests {
     #[test]
     fn shell_launched_gui_is_not_folded_into_terminal_group() {
         let terminal = proc(10, None, "WindowsTerminal.exe", ProcCategory::App);
-        let shell = proc(11, Some(10), "powershell.exe", ProcCategory::App);
+        let mut shell = proc(11, Some(10), "powershell.exe", ProcCategory::App);
+        // Real shells idle below the promotion threshold; keep the fixture
+        // faithful to that so the shell stays folded into the terminal group.
+        shell.cpu_pct = 0.0;
         let mut notepad = proc(12, Some(11), "notepad.exe", ProcCategory::App);
         notepad.has_window = true;
         let rows = build_display_rows(
@@ -1352,12 +1441,16 @@ mod tests {
 
     #[test]
     fn process_tree_supports_three_plus_levels() {
-        let snap = snap_of(vec![
+        let mut snap_procs = vec![
             proc(1, None, "root", ProcCategory::App),
             proc(2, Some(1), "child", ProcCategory::App),
             proc(3, Some(2), "grandchild", ProcCategory::App),
             proc(4, Some(3), "great", ProcCategory::App),
-        ]);
+        ];
+        for p in &mut snap_procs {
+            p.cpu_pct = 0.0;
+        }
+        let snap = snap_of(snap_procs);
         let mut expanded = HashSet::new();
         expanded.extend([1u32, 2u32, 3u32]);
         let groups = [false; 3];
@@ -1399,12 +1492,16 @@ mod tests {
 
     #[test]
     fn grouped_label_counts_entire_subtree() {
-        let snap = snap_of(vec![
+        let mut snap_procs = vec![
             proc(1, None, "Brave", ProcCategory::App),
             proc(2, Some(1), "Child", ProcCategory::App),
             proc(3, Some(2), "GC", ProcCategory::App),
             proc(4, Some(3), "GGC", ProcCategory::App),
-        ]);
+        ];
+        for p in &mut snap_procs {
+            p.cpu_pct = 0.0;
+        }
+        let snap = snap_of(snap_procs);
         let groups = [false; 3];
         let mut expanded = HashSet::new();
         expanded.insert(1u32);
@@ -1551,5 +1648,104 @@ mod tests {
             &[false; 3],
         );
         assert!(rows.is_empty());
+    }
+
+    fn rows_in_group(rows: &[DisplayRow], gi: u8) -> Vec<&RowData> {
+        rows.iter()
+            .skip_while(|r| !matches!(r, DisplayRow::GroupHeader(g, _) if *g == gi))
+            .skip(1)
+            .take_while(|r| !matches!(r, DisplayRow::GroupHeader(..)))
+            .filter_map(|r| match r {
+                DisplayRow::Process(d) => Some(d),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn busy_external_helper_is_promoted_to_background() {
+        let mut code = proc(1, None, "Code.exe", ProcCategory::App);
+        code.has_window = true;
+        let mut build = proc(2, Some(1), "cargo.exe", ProcCategory::App);
+        build.cpu_pct = 8.0;
+        let mut watcher = proc(3, Some(1), "watcher.exe", ProcCategory::App);
+        watcher.cpu_pct = 0.0;
+        let groups = [false; 3];
+        let rows = build_display_rows(
+            &snap_of(vec![code, build, watcher]),
+            "",
+            0,
+            true,
+            &HashSet::new(),
+            &groups,
+        );
+
+        let bg = rows_in_group(&rows, 1);
+        assert_eq!(bg.iter().map(|r| r.pid).collect::<Vec<_>>(), vec![2]);
+        assert_eq!(bg[0].depth, 0, "promoted task is a top-level row");
+        assert_eq!(bg[0].values[0], 8.0);
+
+        // The idle helper stays folded into the app family (no spam).
+        let apps = rows_in_group(&rows, 0);
+        assert_eq!(apps.len(), 1);
+        assert_eq!(apps[0].pid, 1);
+        assert_eq!(apps[0].name, "Code.exe (2)");
+        // Promoted CPU no longer counts into the family aggregate (only the
+        // root's own 1.0% from the fixture remains).
+        assert_eq!(apps[0].values[0], 1.0);
+    }
+
+    #[test]
+    fn busy_same_image_helper_stays_in_family() {
+        let mut brave = proc(1, None, "brave.exe", ProcCategory::App);
+        brave.has_window = true;
+        let mut renderer = proc(2, Some(1), "brave.exe", ProcCategory::App);
+        renderer.cpu_pct = 40.0;
+        let groups = [false; 3];
+        let mut expanded = HashSet::new();
+        expanded.insert(1u32);
+        let rows = build_display_rows(
+            &snap_of(vec![brave, renderer]),
+            "",
+            0,
+            true,
+            &expanded,
+            &groups,
+        );
+        let bg = rows_in_group(&rows, 1);
+        assert!(bg.is_empty(), "same-image helpers must not be promoted");
+        let apps = rows_in_group(&rows, 0);
+        assert_eq!(apps.len(), 2, "family row plus expandable child");
+        assert_eq!(apps[0].values[0], 41.0, "family aggregate keeps child");
+    }
+
+    #[test]
+    fn promoted_task_brings_absorbed_descendants_to_background() {
+        let mut code = proc(1, None, "Code.exe", ProcCategory::App);
+        code.has_window = true;
+        let mut cargo = proc(2, Some(1), "cargo.exe", ProcCategory::App);
+        cargo.cpu_pct = 8.0;
+        let mut rustc = proc(3, Some(2), "rustc.exe", ProcCategory::App);
+        rustc.cpu_pct = 0.0; // idle: must follow via wholesale descent
+        let groups = [false; 3];
+        let mut expanded = HashSet::new();
+        expanded.insert(2u32);
+        let rows = build_display_rows(
+            &snap_of(vec![code, cargo, rustc]),
+            "",
+            0,
+            true,
+            &expanded,
+            &groups,
+        );
+        let bg = rows_in_group(&rows, 1);
+        assert_eq!(
+            bg.iter().map(|r| (r.pid, r.depth)).collect::<Vec<_>>(),
+            vec![(2, 0), (3, 1)],
+            "promoted task and its idle descendants form a Background subtree"
+        );
+        let apps = rows_in_group(&rows, 0);
+        assert_eq!(apps.len(), 1);
+        assert_eq!(apps[0].name, "Code.exe", "family aggregate loses subtree");
     }
 }

@@ -301,13 +301,21 @@ const DISK_IDLE: &str = "\\PhysicalDisk(*)\\% Idle Time";
 const DISK_READ: &str = "\\PhysicalDisk(*)\\Disk Read Bytes/sec";
 const DISK_WRITE: &str = "\\PhysicalDisk(*)\\Disk Write Bytes/sec";
 const DISK_SEC: &str = "\\PhysicalDisk(*)\\Avg. Disk sec/Transfer";
+/// Task-Manager-style current speed source: base clock × this percentage.
+/// sysinfo's frequency (CallNtPowerInformation CurrentMhz) reports the fixed
+/// nominal clock on modern Windows, so it cannot show real-time speed.
+const CPU_PERF_PCT: &str = "\\Processor Information(_Total)\\% Processor Performance";
 
 /// Split PDH state: each expensive provider warms up only on demand.
 pub struct PdhCounters {
     gpu: Option<QueryGroup>,
     disk: Option<QueryGroup>,
+    /// Single-instance CPU speed counter (cheap, but demand-gated like the
+    /// rest so the sampling tick stays free of unneeded collections).
+    cpu: Option<QueryGroup>,
     gpu_failed: bool,
     disk_failed: bool,
+    cpu_failed: bool,
 }
 
 impl Default for PdhCounters {
@@ -321,8 +329,10 @@ impl PdhCounters {
         Self {
             gpu: None,
             disk: None,
+            cpu: None,
             gpu_failed: false,
             disk_failed: false,
+            cpu_failed: false,
         }
     }
 
@@ -362,6 +372,26 @@ impl PdhCounters {
                 d.collect();
             }
             d.maybe_sleep(want_disk);
+        }
+
+        // --- CPU speed group ---
+        let want_cpu = demand.wants(TelemetryDemand::CPU_SPEED) && !self.cpu_failed;
+        if want_cpu && self.cpu.is_none() {
+            let mut c = QueryGroup::new();
+            c.open(&[CPU_PERF_PCT]);
+            if !c.is_open() || c.counters.is_empty() {
+                // Query itself failed OR the counter path does not exist on
+                // this system → fall back to the nominal frequency instead
+                // of rendering "—" forever.
+                self.cpu_failed = true;
+            }
+            self.cpu = Some(c);
+        }
+        if let Some(c) = &mut self.cpu {
+            if c.is_open() {
+                c.collect();
+            }
+            c.maybe_sleep(want_cpu);
         }
     }
 
@@ -445,6 +475,43 @@ impl PdhCounters {
         Some(out)
     }
 
+    /// Average `% Processor Performance` (percent of nominal frequency) from
+    /// data already collected this tick. None while the counter is warming
+    /// up, sleeping, or unavailable on this system; non-positive raw values
+    /// are treated as unusable rather than reported.
+    pub fn read_cpu_perf_pct(&mut self) -> Option<f32> {
+        let g = self.cpu.as_mut()?;
+        if !g.is_open() || !g.warm {
+            return None;
+        }
+        for (handle, path) in Self::counters_snapshot(g) {
+            if path != CPU_PERF_PCT {
+                continue;
+            }
+            let pairs = g.read_pairs(handle);
+            if pairs.is_empty() {
+                continue;
+            }
+            let usable: Vec<f64> = pairs
+                .into_iter()
+                .map(|(_, v)| v)
+                .filter(|v| *v > 0.0)
+                .collect();
+            if !usable.is_empty() {
+                let avg = usable.iter().sum::<f64>() / usable.len() as f64;
+                return Some(avg as f32);
+            }
+        }
+        None
+    }
+
+    /// True when the CPU speed counter could not be opened at all this
+    /// session (system without the counter) — callers fall back to the
+    /// nominal frequency instead of showing "—" forever.
+    pub fn cpu_counter_failed(&self) -> bool {
+        self.cpu_failed
+    }
+
     /// Disk performance samples from data already collected this tick.
     pub fn read_disks(&mut self) -> Vec<DiskPerf> {
         let Some(d) = self.disk.as_mut() else {
@@ -507,6 +574,9 @@ impl Drop for PdhCounters {
         }
         if let Some(mut d) = self.disk.take() {
             d.close();
+        }
+        if let Some(mut c) = self.cpu.take() {
+            c.close();
         }
     }
 }
@@ -616,5 +686,31 @@ mod tests {
         assert_eq!(p4.pid, Some(42));
         assert_eq!(p4.engine_type, None);
         assert_eq!(p4.phys_index, None);
+    }
+
+    // Live counter: needs two collections before a format succeeds, then
+    // reports a sane percentage of the nominal frequency (real system, fast).
+    #[test]
+    fn cpu_perf_counter_warms_and_reads_sane_percentage() {
+        let mut pdh = PdhCounters::new();
+        let demand = TelemetryDemand::core().union(TelemetryDemand::CPU_SPEED);
+        pdh.tick(demand);
+        assert!(pdh.read_cpu_perf_pct().is_none(), "must be warming");
+        if pdh.cpu_counter_failed() {
+            // Exotic system without Processor Information counters.
+            return;
+        }
+        // The counter is usable after the second collection; poll with a
+        // bounded deadline instead of assuming one more tick always suffices.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let pct = loop {
+            pdh.tick(demand);
+            if let Some(pct) = pdh.read_cpu_perf_pct() {
+                break pct;
+            }
+            assert!(std::time::Instant::now() < deadline, "counter never warmed");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        };
+        assert!(pct > 0.0 && pct < 10_000.0, "implausible {pct}%");
     }
 }
