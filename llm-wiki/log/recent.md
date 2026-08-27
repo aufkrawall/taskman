@@ -1,29 +1,45 @@
 # Recent Activity
 
-## 2026-08-28 — Settings: restart-as-administrator (elevation section)
+## 2026-08-28 — Settings: always-start-elevated policy + one-shot restart
 
-New Windows-only "Administratorrechte" / "Administrator privileges" section
-in the settings dialog (inside the existing `Advanced` block, below the
-Task Manager replacement): shows whether THIS process is elevated and, when
-it is not, offers "Als Administrator neu starten" / "Restart as
-administrator". Wiring notes:
+Windows-only "Administratorrechte" / "Administrator privileges" section in
+the settings dialog (inside the existing `Advanced` block, below the Task
+Manager replacement):
 
-- `PlatformActions::relaunch_elevated` (ShellExecuteExW "runas", already in
-  tm-platform) is dispatched through the shared action executor; on success
-  the job sends `ViewportCommand::Close` from the executor thread — safe
-  because `Context` is Send+Sync and commands queue into the next frame.
-  eframe 0.36 then exits the event loop gracefully (`should_close`), so
-  `on_exit` still flushes settings + app history. A declined UAC prompt
-  fails the job and surfaces the standard error toast; the single executor
-  worker also serializes repeat clicks, so two prompts cannot race.
-- Elevation cannot change within a running process, so `TaskManApp::new`
-  queries `actions.is_elevated()` exactly once (`is_elevated` field) instead
-  of touching the process token per frame.
-- Verified visually via `tools/capture.ps1` with `TASKMAN_DIALOG=settings`
-  (isolated config/data dirs); UAC consent path not exercisable headlessly.
+- **Status line** — whether THIS process is elevated. `TaskManApp::new`
+  queries `actions.is_elevated()` exactly once (`is_elevated` field);
+  elevation is fixed at process creation, never per frame.
+- **"Always start with administrator privileges"** (`start_elevated`,
+  `[general] start_elevated` in config.ini): at startup, `run_gui` checks
+  the setting BEFORE any window exists and, when this launch is unelevated,
+  re-execs via `tm_platform::win::relaunch_elevated_with_args(args)`
+  (ShellExecuteExW "runas", CLI args forwarded) and `std::process::exit(0)`.
+  The elevated child re-reads the setting, is elevated, and proceeds — no
+  loop. A declined UAC prompt logs a warning and degrades to a normal
+  unelevated start (retried next launch). Guards: `TASKMAN_CONFIG_DIR`
+  override (test/isolated context) never auto-elevates; `--selfcheck` and
+  the `--taskmgr-integration` helper exit before the check. Every launch
+  therefore shows a UAC consent prompt — inherent for third-party exes
+  (Task Manager itself auto-elevates via its system-binary status).
+- **"Restart as administrator" button** — one-shot elevation of the
+  current session: `PlatformActions::relaunch_elevated()` (no args) on the
+  action executor; on success the job sends `ViewportCommand::Close` from
+  the executor thread — safe because `Context` is Send+Sync and commands
+  queue into the next frame; eframe 0.36 exits the event loop gracefully
+  (`should_close`), so `on_exit` still flushes settings + app history. A
+  declined prompt surfaces the standard error toast; the single executor
+  worker serializes repeat clicks, so two prompts cannot race.
 
-`build.py --check` (fmt + clippy `-D warnings` + workspace tests, incl.
-release build) passed.
+Tooling note: `tools/capture.ps1` now seeds an isolated temp config dir
+(`TASKMAN_CONFIG_DIR` + `config.ini`, ASCII on purpose — a UTF-8 BOM would
+break the INI parser's first `[general]` header) instead of writing legacy
+`settings.json` into the REAL config dir; this also keeps captures working
+when `start_elevated` is on (auto-elevation is skipped under the override).
+
+Verified visually via `tools/capture.ps1` with `TASKMAN_DIALOG=settings`;
+UAC consent paths not exercisable headlessly. `build.py --check`
+(fmt + clippy `-D warnings` + workspace tests, incl. release build)
+passed.
 
 ## 2026-08-27 — Details column prefs persist; last resize handle grabbable
 

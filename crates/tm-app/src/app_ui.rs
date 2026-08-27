@@ -568,6 +568,21 @@ pub fn settings_dialog(app: &mut TaskManApp, ctx: &egui::Context, _pal: &theme::
                         },
                     );
                 }
+                let mut start_elevated = app.shared.settings.start_elevated;
+                if crate::widgets::controls::checkbox(
+                    ui,
+                    &mut start_elevated,
+                    i18n::tr(K::StartElevated),
+                    _pal,
+                )
+                .changed()
+                {
+                    // Policy for FUTURE launches: startup re-execs elevated
+                    // when unelevated (main.rs); the current session is not
+                    // touched — use the restart button above to elevate now.
+                    app.shared.settings.start_elevated = start_elevated;
+                    app.shared.settings.save();
+                }
             }
 
             ui.add_space(14.0);

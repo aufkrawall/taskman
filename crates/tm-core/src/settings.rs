@@ -131,6 +131,10 @@ pub struct Settings {
     pub cpu_graph_mode: String,
     /// Overlay kernel time (darker band) in the CPU graphs.
     pub show_kernel_times: bool,
+    /// Windows: start with administrator privileges. When this launch is
+    /// unelevated, the process re-execs itself elevated (runas/UAC) before
+    /// the window opens.
+    pub start_elevated: bool,
 }
 
 impl Default for Settings {
@@ -153,6 +157,7 @@ impl Default for Settings {
             perf_card_width: 252.0,
             cpu_graph_mode: "overall".into(),
             show_kernel_times: false,
+            start_elevated: false,
         }
     }
 }
@@ -445,6 +450,7 @@ impl Settings {
             s.ui_zoom = v;
         }
         s.remember_window = b("general", "remember_window", s.remember_window);
+        s.start_elevated = b("general", "start_elevated", s.start_elevated);
         if let Some(v) = get("general", "window_size").and_then(|v| parse_window_size(v)) {
             s.window_size = [v[0].clamp(200.0, 16384.0), v[1].clamp(150.0, 16384.0)];
         }
@@ -615,6 +621,7 @@ impl Settings {
             ("perf_card_width", self.perf_card_width.to_string()),
             ("cpu_graph_mode", self.cpu_graph_mode.clone()),
             ("show_kernel_times", self.show_kernel_times.to_string()),
+            ("start_elevated", self.start_elevated.to_string()),
         ];
         let mut body = String::from("[general]\n");
         for (k, v) in g {
@@ -818,6 +825,7 @@ mod tests {
         s.perf_card_width = 300.5;
         s.cpu_graph_mode = "logical".into();
         s.show_kernel_times = true;
+        s.start_elevated = true;
         s.col_widths.insert(
             "processes".into(),
             BTreeMap::from([("name".into(), 340.0), ("cpu".into(), 110.5)]),

@@ -14,13 +14,15 @@ are accepted (Phases 2-6 open).
 
 ## Recently landed (2026-08-28)
 
-- Settings dialog (Windows, "Advanced" block) shows this process's
-  elevation status and, when unelevated, a "Restart as administrator"
-  button: `relaunch_elevated()` on the action executor, then a graceful
-  `ViewportCommand::Close` from the executor thread (eframe exits normally,
-  `on_exit` flushes); declined UAC surfaces the error toast. Elevation is
-  cached once at startup (`TaskManApp::is_elevated`). See
-  `log/recent.md` 2026-08-28.
+- Settings dialog (Windows, "Advanced" block): elevation status, a persisted
+  "Always start with administrator privileges" policy (startup re-execs
+  elevated via runas before the window opens; declined UAC degrades to an
+  unelevated start; `TASKMAN_CONFIG_DIR` overrides skip it), and a one-shot
+  "Restart as administrator" button (`relaunch_elevated()` on the action
+  executor, then a graceful `ViewportCommand::Close` from the executor
+  thread; declined UAC surfaces the error toast). Elevation is cached once
+  at startup (`TaskManApp::is_elevated`). `tools/capture.ps1` now uses an
+  isolated temp config dir. See `log/recent.md` 2026-08-28.
 - Chart-freeze fix: `TaskManApp.history` was a `VecDeque` whose ring buffer
   wraps after `history_cap` pop/push cycles; the Performance tab read only
   `as_slices().0` (the OLD half), so all graphs and card sparklines froze on

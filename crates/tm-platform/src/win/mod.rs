@@ -71,6 +71,26 @@ pub fn set_task_manager_replacement_direct(enabled: bool) -> Result<()> {
     taskmgr_replacement::set_direct(enabled)
 }
 
+/// Whether THIS process runs with an elevated (admin) token.
+pub fn is_elevated() -> bool {
+    process_ops::is_elevated()
+}
+
+/// Spawn a new elevated instance of the current exe (runas verb → UAC
+/// consent), passing `args` through, and return once it is spawning.
+/// Backs the "always start elevated" setting at startup; the interactive
+/// settings-dialog restart uses the no-args `relaunch_elevated` action
+/// instead.
+pub fn relaunch_elevated_with_args(args: &[String]) -> Result<()> {
+    let exe = std::env::current_exe()
+        .map_err(|e| tm_core::TmError::platform("current_exe", e.to_string()))?;
+    let mut cmdline = format!("\"{}\"", exe.to_string_lossy());
+    for a in args {
+        cmdline.push_str(&format!(" \"{a}\""));
+    }
+    process_ops::run_new_task(&cmdline, true)
+}
+
 pub struct WinCollector {
     inner: sampler::Sampler,
 }
