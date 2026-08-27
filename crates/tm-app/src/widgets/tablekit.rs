@@ -51,7 +51,11 @@ const MAX_COL_W: f32 = 1200.0;
 /// Empty strip kept clear on the RIGHT of the table content so the floating
 /// vertical scroll bar (which egui paints ON TOP of the scroll area, without
 /// reserving layout space) never covers the last column, and so the last
-/// column keeps visible padding to the window border.
+/// column keeps visible padding to the window border. The header reserves
+/// the same strip: without it the last resize handle sits flush at the
+/// viewport edge once the content is scrolled fully right and egui's
+/// hit-testing (clipped to the scroll area) leaves only a few unreachable
+/// pixels of it.
 const BODY_PAD_RIGHT: i8 = 10;
 /// Same idea for the horizontal bar: it floats over the BOTTOM of the body,
 /// so the content ends a few px above it instead of under it.
@@ -103,6 +107,10 @@ pub fn scrolled_table(
         .id_salt(hdr_id)
         .auto_shrink(egui::Vec2b::new(false, true))
         .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
+        .content_margin(egui::Margin {
+            right: BODY_PAD_RIGHT,
+            ..Default::default()
+        })
         .horizontal_scroll_offset(rows_prev_x)
         .show(ui, |ui| table.header(ui, pal, sort, aggregates));
 
@@ -160,6 +168,10 @@ pub fn scrolled_rows(
         .id_salt(hdr_id)
         .auto_shrink(egui::Vec2b::new(false, true))
         .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
+        .content_margin(egui::Margin {
+            right: BODY_PAD_RIGHT,
+            ..Default::default()
+        })
         .horizontal_scroll_offset(rows_prev_x)
         .show(ui, |ui| table.header(ui, pal, sort, aggregates));
 
@@ -953,6 +965,78 @@ mod tests {
             vec![ptr_button(bx, 20.0, false)],
         );
         assert_eq!(t.cols[1].width, 267.0);
+    }
+
+    /// Regression: when the table content is wider than the viewport, the
+    /// last resize boundary sits flush at the right edge once fully scrolled
+    /// right. The header's right content margin (same strip as the body)
+    /// must keep that handle fully inside the scroll area's clip rect so it
+    /// stays grabbable; without it the drag below lands a few pixels left of
+    /// the sliver egui leaves clickable and the width never changes.
+    #[test]
+    fn last_boundary_is_grabbable_when_scrolled_fully_right() {
+        let ctx = egui::Context::default();
+        // 640 px of columns in a ~520 px viewport → horizontal scrolling is
+        // active and can reach the far end.
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(520.0, 300.0));
+        let mut t = table();
+
+        let frame = |t: &mut TmTable, time: f64, events: Vec<egui::Event>| {
+            let raw = egui::RawInput {
+                screen_rect: Some(screen),
+                time: Some(time),
+                predicted_dt: 1.0 / 60.0,
+                events,
+                ..Default::default()
+            };
+            let mut out = ctx.run_ui(raw, |root| {
+                egui::CentralPanel::default()
+                    .frame(egui::Frame::NONE)
+                    .show(root, |ui| {
+                        let avail = table_avail(ui);
+                        scrolled_rows(
+                            "t-last",
+                            ui,
+                            &crate::theme::DARK,
+                            t,
+                            avail,
+                            None,
+                            None,
+                            3,
+                            None,
+                            |ui, table, _a, _c, range| {
+                                for _ in range {
+                                    table.row(ui, &crate::theme::DARK, false);
+                                }
+                            },
+                        );
+                    });
+            });
+            out.textures_delta.clear();
+        };
+
+        // Warm-up frame (egui's per-pass memory is created lazily, so the
+        // offset below can only be injected between passes).
+        frame(&mut t, 0.000, vec![]);
+        // Force both scroll areas fully right via the stored body offset that
+        // `scrolled_rows` feeds back into the header each frame; egui clamps
+        // it to the content maximum.
+        ctx.data_mut(|d| d.insert_temp(egui::Id::new(("tm-rowsx", "t-last")), 10_000.0f32));
+        frame(&mut t, 0.016, vec![]); // header applies the clamped offset
+
+        // The last boundary (right edge of column "b") is now at
+        // viewport_right - BODY_PAD_RIGHT; grab exactly there.
+        let grab = egui::Pos2::new(520.0 - f32::from(BODY_PAD_RIGHT), 20.0);
+        frame(&mut t, 0.032, vec![ptr_moved(grab.x, grab.y)]);
+        frame(&mut t, 0.048, vec![ptr_button(grab.x, grab.y, true)]);
+        frame(&mut t, 0.064, vec![ptr_moved(grab.x - 40.0, grab.y)]);
+        frame(
+            &mut t,
+            0.080,
+            vec![ptr_button(grab.x - 40.0, grab.y, false)],
+        );
+        assert_eq!(t.col_width(2), 60.0, "last column resized via its handle");
+        assert_eq!(t.col_width(0), 340.0, "first column unaffected");
     }
 
     /// Regression (type-ahead scroll): a focus row outside the rendered

@@ -17,7 +17,9 @@ Rust workspace, three crates in a strict dependency chain
     disks, networks, GPU incl. `AdapterLuid`, processes incl.
     elevation/UAC/power-throttle fields), `engine.rs` (sampling engine:
     lazy start via collector factory, event notifier, Refresh-while-paused),
-    `settings.rs` (INI config + ID-keyed column prefs + debounced
+    `settings.rs` (INI config + ID-keyed column prefs: widths, visibility
+    overrides and user order under `[columns.<table>]` / `.visible` /
+    `.order` sections + debounced
     SettingsWriter), `app_history.rs` (per-app usage db, single serialized
     writer thread with generations), `demand.rs` (TelemetryDemand bitmask),
     `logging.rs` (early ring sink → deferred file attach), `classify.rs`

@@ -72,7 +72,14 @@ are accepted (Phases 2-6 open).
   type).
 - Details' Select columns dialog uses painted chevron up/down buttons,
   offset 16 px left of the floating scrollbar (the old right-aligned text
-  arrows were unclickable under it).
+  arrows were unclickable under it). Its visibility/order choices persist
+  per table in `config.ini` (`[columns.<t>.visible]`/`[columns.<t>.order]`
+  sections — overrides only, applied at startup with empty-table/sort
+  guards; see the 2026-08-27 log entry).
+- Table headers reserve the same right content margin as the body
+  (`BODY_PAD_RIGHT`): without it, once a table scrolls fully right the
+  last resize handle sits flush at the viewport edge and egui's clipped
+  hit-testing leaves only a few pixels of it grabbable.
 - Startup architecture: single collector built lazily ON the engine thread
   after the first presented frame; no duplicate platform stack; console
   attach only for CLI modes; early ring logging with deferred file attach;

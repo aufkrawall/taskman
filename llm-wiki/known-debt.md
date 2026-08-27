@@ -19,10 +19,11 @@ The 2026 audit (`audit.md`) defined six phases. **Phase 1 (correctness) was
 implemented on 2026-08-26** (see `log/recent.md`). Phases 2–6 remain open
 by design; do not re-audit them as new findings:
 
-- Phase 2 table parity: generic column registry, Details Select columns with
-  persisted state + additional columns (Threads/Handles/Base priority/
-  Command line/…), CPU Utility as a second explicit metric + metric switcher,
-  sorting for Startup/App History/Users/Services.
+- Phase 2 table parity: generic column registry (Details Select columns
+  already persist visibility/order overrides since 2026-08-27; the generic
+  registry stays open), additional columns (Threads/Handles/Base priority/
+  Command line/…), CPU Utility as a second explicit metric + metric
+  switcher, sorting for Startup/App History/Users/Services.
 - Phase 3 telemetry: ETW/SRUM per-process network provider, native App
   History source, real Startup Impact thresholds, packaged startup tasks,
   Shell-link publisher resolution via IShellLink/IPersistFile, Memory
@@ -41,11 +42,6 @@ by design; do not re-audit them as new findings:
 
 ## Deliberate deviations / session-limited fixes
 
-- **Details column visibility is session-only** (2026-08-26): the
-  Select-columns dialog state lives in `details::State.visible`
-  (`BTreeSet<ColumnId>`), not in `config.ini`. Fixing persistence properly
-  belongs to the Phase 2 column registry (which will persist per-column
-  visibility by stable id).
 - **Efficiency-mode UI latency** (2026-08-26): after a toggle the UI waits
   for the next sample (plus one forced refresh) to reflect Windows'
   returned EcoQoS state. A spinner/pending affordance could be added if the
