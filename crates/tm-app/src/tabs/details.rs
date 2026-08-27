@@ -183,12 +183,22 @@ const COLUMNS: &[ColSpec] = &[
     ColSpec { cid: ColumnId::CommandLine, col: || TmColumn::text("commandline", "Command line", 360.0), default_visible: false },
 ];
 
+fn spec_for(cid: ColumnId) -> ColSpec {
+    *COLUMNS
+        .iter()
+        .find(|spec| spec.cid == cid)
+        .expect("known Details column")
+}
+
 pub struct State {
     pub sort_col: ColumnId,
     pub ascending: bool,
     pub filter: String,
     pub cache: Option<Cache>,
     pub visible: BTreeSet<ColumnId>,
+    /// Stable display order. Hidden columns remain here so toggling them back
+    /// on never destroys the user's relative ordering of active columns.
+    pub order: Vec<ColumnId>,
     pub select_columns_open: bool,
 }
 
@@ -218,11 +228,66 @@ impl State {
         } else {
             self.visible.remove(&cid);
             if self.sort_col == cid {
-                self.sort_col = ColumnId::Name;
+                self.sort_col = self
+                    .order
+                    .iter()
+                    .copied()
+                    .find(|candidate| self.visible.contains(candidate))
+                    .unwrap_or(ColumnId::Name);
                 self.ascending = true;
             }
         }
         self.invalidate();
+    }
+
+    fn ordered_visible(&self) -> Vec<ColSpec> {
+        self.order
+            .iter()
+            .copied()
+            .filter(|cid| self.visible.contains(cid))
+            .map(spec_for)
+            .collect()
+    }
+
+    fn visible_rank(&self, cid: ColumnId) -> Option<usize> {
+        self.order
+            .iter()
+            .copied()
+            .filter(|candidate| self.visible.contains(candidate))
+            .position(|candidate| candidate == cid)
+    }
+
+    fn visible_count(&self) -> usize {
+        self.order
+            .iter()
+            .filter(|candidate| self.visible.contains(candidate))
+            .count()
+    }
+
+    fn move_visible(&mut self, cid: ColumnId, delta: isize) -> bool {
+        let visible: Vec<ColumnId> = self
+            .order
+            .iter()
+            .copied()
+            .filter(|candidate| self.visible.contains(candidate))
+            .collect();
+        let Some(pos) = visible.iter().position(|candidate| *candidate == cid) else {
+            return false;
+        };
+        let target = pos as isize + delta;
+        if target < 0 || target >= visible.len() as isize {
+            return false;
+        }
+        let other = visible[target as usize];
+        let a = self.order.iter().position(|candidate| *candidate == cid).unwrap();
+        let b = self
+            .order
+            .iter()
+            .position(|candidate| *candidate == other)
+            .unwrap();
+        self.order.swap(a, b);
+        self.invalidate();
+        true
     }
 
     pub fn lang_generation(&self) -> u64 {
@@ -246,6 +311,7 @@ impl Default for State {
                 .filter(|c| c.default_visible)
                 .map(|c| c.cid)
                 .collect(),
+            order: COLUMNS.iter().map(|c| c.cid).collect(),
             select_columns_open: false,
         }
     }
@@ -371,11 +437,7 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
         app.scroll_to_pid = Some(focus.0.pid);
     }
 
-    let visible_cols: Vec<ColSpec> = COLUMNS
-        .iter()
-        .copied()
-        .filter(|c| app.details_state.is_visible(c.cid))
-        .collect();
+    let visible_cols = app.details_state.ordered_visible();
     let cols_rendered: Vec<TmColumn> = visible_cols.iter().map(|c| (c.col)()).collect();
     let mut table = app.make_table("details", cols_rendered);
 
@@ -395,6 +457,25 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
         });
     }
     let rows = &cache.as_ref().expect("cache").rows;
+
+    // Native-style type navigation follows the current filtered/sorted list,
+    // cycles repeated initials, and scrolls the virtual row into view.
+    if let Some(initial) = search::list_initial(ui.ctx()) {
+        let selected = app.selected_process.as_ref().map(|p| p.pid);
+        if let Some(pid) = search::cycle_process_initial(
+            rows.iter().map(|row| (row.pid, row.name.as_str())),
+            selected,
+            initial,
+        ) && let Some(row) = rows.iter().find(|row| row.pid == pid)
+        {
+            app.selected_process = Some(crate::app::ProcessIdentity {
+                pid: row.pid,
+                start_epoch_s: row.start_epoch_s,
+            });
+            app.scroll_to_pid = Some(row.pid);
+        }
+    }
+
     prepare_auto_fit_widths(ui, &mut table, &visible_cols, rows);
 
     let avail = tablekit::table_avail(ui);
@@ -434,30 +515,26 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
                     app.scroll_to_pid = None;
                 }
 
-                let tex_visible = visible_cols
-                    .first()
-                    .is_some_and(|c| c.cid == ColumnId::Name);
-                if tex_visible {
-                    let tex = row
-                        .icon_path
-                        .as_ref()
-                        .and_then(|p| app.shared.icons.get(ui.ctx(), &app.actions, p, 6));
-                    table.icon_cell(ui, rect, tex.as_ref(), pal.accent);
-                    let name_rect = table.col_rect(0, rect);
-                    ui.painter_at(name_rect).text(
-                        egui::Pos2::new(name_rect.left() + 56.0, rect.center().y),
-                        egui::Align2::LEFT_CENTER,
-                        &row.name,
-                        egui::FontId::proportional(tablekit::FONT_ROW),
-                        pal.text,
-                    );
-                }
-
-                let first_text_col = if tex_visible { 1 } else { 0 };
-                for (pos, spec) in visible_cols.iter().enumerate().skip(first_text_col) {
+                // Name decorations follow the Name column even after it has
+                // been moved away from the first position.
+                for (pos, spec) in visible_cols.iter().enumerate() {
                     let cid = spec.cid;
                     let text = row.field(cid);
-                    if cid_is_numeric(cid) {
+                    if cid == ColumnId::Name {
+                        let cell = table.col_rect(pos, rect);
+                        let tex = row
+                            .icon_path
+                            .as_ref()
+                            .and_then(|p| app.shared.icons.get(ui.ctx(), &app.actions, p, 6));
+                        table.icon_cell(ui, cell, tex.as_ref(), pal.accent);
+                        ui.painter_at(cell).text(
+                            egui::Pos2::new(cell.left() + 56.0, rect.center().y),
+                            egui::Align2::LEFT_CENTER,
+                            &row.name,
+                            egui::FontId::proportional(tablekit::FONT_ROW),
+                            pal.text,
+                        );
+                    } else if cid_is_numeric(cid) {
                         let cell = table.col_rect(pos, rect);
                         ui.painter_at(cell).text(
                             egui::Pos2::new(cell.right() - 10.0, rect.center().y),
@@ -542,20 +619,58 @@ fn select_columns_dialog(app: &mut TaskManApp, ctx: &egui::Context, pal: &theme:
         .resizable(false)
         .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
         .show(ctx, |ui| {
-            ui.set_min_width(300.0);
+            ui.set_min_width(330.0);
+            ui.spacing_mut().item_spacing.y = 2.0;
             egui::ScrollArea::vertical()
-                .max_height(430.0)
+                .max_height(330.0)
                 .show(ui, |ui| {
-                    for spec in COLUMNS.iter().copied() {
-                        let mut on = app.details_state.is_visible(spec.cid);
-                        if crate::widgets::controls::checkbox(ui, &mut on, spec.label(), pal)
-                            .changed()
-                        {
-                            app.details_state.set_visible(spec.cid, on);
-                        }
+                    // Iterate a snapshot because arrow clicks mutate the live
+                    // ordering. The updated order is visible next frame.
+                    let order = app.details_state.order.clone();
+                    for cid in order {
+                        let spec = spec_for(cid);
+                        let mut on = app.details_state.is_visible(cid);
+                        let rank = app.details_state.visible_rank(cid);
+                        let count = app.details_state.visible_count();
+                        ui.horizontal(|ui| {
+                            if crate::widgets::controls::checkbox(ui, &mut on, spec.label(), pal)
+                                .changed()
+                            {
+                                app.details_state.set_visible(cid, on);
+                            }
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    if on {
+                                        let can_right = rank.is_some_and(|r| r + 1 < count);
+                                        let can_left = rank.is_some_and(|r| r > 0);
+                                        if ui
+                                            .add_enabled(
+                                                can_right,
+                                                egui::Button::new("→").frame(false),
+                                            )
+                                            .on_hover_text("Move column right")
+                                            .clicked()
+                                        {
+                                            app.details_state.move_visible(cid, 1);
+                                        }
+                                        if ui
+                                            .add_enabled(
+                                                can_left,
+                                                egui::Button::new("←").frame(false),
+                                            )
+                                            .on_hover_text("Move column left")
+                                            .clicked()
+                                        {
+                                            app.details_state.move_visible(cid, -1);
+                                        }
+                                    }
+                                },
+                            );
+                        });
                     }
                 });
-            ui.add_space(8.0);
+            ui.separator();
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui.button(i18n::tr(K::Close)).clicked() {
                     app.details_state.select_columns_open = false;
@@ -1047,13 +1162,22 @@ mod tests {
     }
 
     #[test]
-    fn hiding_sorted_column_resets_to_name() {
+    fn hiding_sorted_column_uses_a_visible_fallback() {
         let mut s = State::default();
         s.set_visible(ColumnId::Priority, true);
         s.sort_col = ColumnId::Priority;
         s.set_visible(ColumnId::Priority, false);
-        assert_eq!(s.sort_col, ColumnId::Name);
+        assert!(s.is_visible(s.sort_col));
         assert!(s.ascending);
+    }
+
+    #[test]
+    fn active_columns_can_be_reordered() {
+        let mut s = State::default();
+        assert_eq!(s.ordered_visible()[0].cid, ColumnId::Name);
+        assert!(s.move_visible(ColumnId::Pid, -1));
+        assert_eq!(s.ordered_visible()[0].cid, ColumnId::Pid);
+        assert!(!s.move_visible(ColumnId::Pid, -1));
     }
 
     #[test]
