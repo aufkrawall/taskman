@@ -50,7 +50,11 @@ fn sparkline_y_max(samples: &[f64]) -> f64 {
         .copied()
         .filter(|v| v.is_finite() && *v > 0.0)
         .fold(0.0f64, f64::max);
-    if max > 100.0 { (max * 1.05).max(1.0) } else { 100.0 }
+    if max > 100.0 {
+        (max * 1.05).max(1.0)
+    } else {
+        100.0
+    }
 }
 
 /// Sparkline painted into an explicit rect (no allocation) — used inside

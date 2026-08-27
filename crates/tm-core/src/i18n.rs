@@ -253,6 +253,10 @@ keys! {
         "Einstellungen automatisch in config.ini speichern",
         "Save settings automatically to config.ini"
     ],
+    RememberWindow => [
+        "Fenstergröße und -position merken",
+        "Remember window size and position"
+    ],
     ColumnsHeading => ["Spaltenbreiten zurücksetzen", "Column widths"],
     ResetColWidths => ["Standardbreiten", "Default widths"],
     ColWidthsResetToast => ["Spaltenbreiten zurückgesetzt", "Column widths reset"],

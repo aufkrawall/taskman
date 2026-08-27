@@ -23,6 +23,7 @@ pub enum Icon {
     Close,
     ChevronRight,
     ChevronDown,
+    ChevronUp,
     Plus,
     Check,
     Hamburger,
@@ -189,6 +190,10 @@ pub fn draw(ui: &egui::Ui, icon: Icon, rect: Rect, color: Color32) {
         Icon::ChevronDown => {
             line(p(-6.0, -3.0), p(0.0, 4.0));
             line(p(0.0, 4.0), p(6.0, -3.0));
+        }
+        Icon::ChevronUp => {
+            line(p(-6.0, 3.0), p(0.0, -4.0));
+            line(p(0.0, -4.0), p(6.0, 3.0));
         }
         Icon::Plus => {
             line(p(0.0, -6.0), p(0.0, 6.0));

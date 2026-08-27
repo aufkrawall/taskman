@@ -62,8 +62,8 @@ pub fn set_direct(enabled: bool) -> Result<()> {
 }
 
 pub fn own_command() -> Result<String> {
-    let exe = std::env::current_exe()
-        .map_err(|e| TmError::platform("current_exe", e.to_string()))?;
+    let exe =
+        std::env::current_exe().map_err(|e| TmError::platform("current_exe", e.to_string()))?;
     Ok(format!("\"{}\" {OWNER_MARKER}", exe.to_string_lossy()))
 }
 
@@ -142,7 +142,10 @@ fn write_debugger(value: &str) -> Result<()> {
             None,
         );
         if status.is_err() {
-            return Err(TmError::platform("RegCreateKeyExW(IFEO)", format!("{status:?}")));
+            return Err(TmError::platform(
+                "RegCreateKeyExW(IFEO)",
+                format!("{status:?}"),
+            ));
         }
         let name = wstr(VALUE_DEBUGGER);
         let wide = wstr(value);
@@ -156,7 +159,10 @@ fn write_debugger(value: &str) -> Result<()> {
         );
         let _ = RegCloseKey(key);
         if status.is_err() {
-            Err(TmError::platform("RegSetValueExW(IFEO)", format!("{status:?}")))
+            Err(TmError::platform(
+                "RegSetValueExW(IFEO)",
+                format!("{status:?}"),
+            ))
         } else {
             Ok(())
         }
@@ -183,7 +189,10 @@ fn delete_debugger() -> Result<()> {
         let _ = RegCloseKey(key);
         // ERROR_FILE_NOT_FOUND: already disabled.
         if status.is_err() && status.0 != 2 {
-            Err(TmError::platform("RegDeleteValueW(IFEO)", format!("{status:?}")))
+            Err(TmError::platform(
+                "RegDeleteValueW(IFEO)",
+                format!("{status:?}"),
+            ))
         } else {
             Ok(())
         }

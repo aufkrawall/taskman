@@ -146,7 +146,13 @@ fn base_mhz_from_smbios_table(table: &[u8]) -> f32 {
         }
         i = end + 2;
     }
-    best_current.max(best_max) as f32
+    // SMBIOS "Current Speed" reflects the configured clock; "Max Speed" is
+    // only a fallback when current is absent/unknown (test parity).
+    if best_current != 0 {
+        best_current as f32
+    } else {
+        best_max as f32
+    }
 }
 
 fn collect_topology(out: &mut CpuStatic) {

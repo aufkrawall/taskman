@@ -211,7 +211,9 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
                 .map(|s| s.id)
         });
         let Some(sid) = sid else { continue };
-        let Some(a) = aggs.get_mut(&sid) else { continue };
+        let Some(a) = aggs.get_mut(&sid) else {
+            continue;
+        };
         a.cpu += p.cpu_pct as f64;
         a.mem += p.mem_bytes as f64;
         a.disk += p.disk_read_bps + p.disk_write_bps;
@@ -277,7 +279,9 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
     let aggs_hdr = agg_hdr.strings();
 
     let mut table = app.make_table("users", columns());
-    prepare_auto_fit_widths(ui, app, &mut table, &rows, &sessions, &aggs, &snap, &aggs_hdr);
+    prepare_auto_fit_widths(
+        ui, app, &mut table, &rows, &sessions, &aggs, &snap, &aggs_hdr,
+    );
     let avail = tablekit::table_avail(ui);
     tablekit::scrolled_rows(
         "users",
@@ -288,6 +292,7 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
         None,
         Some(&aggs_hdr),
         rows.len(),
+        None,
         |ui, table, _avail, _content_w, range| {
             for ri in range {
                 match rows.get(ri) {

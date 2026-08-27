@@ -255,6 +255,8 @@ pub struct TaskManApp {
     // Tab states.
     pub processes_state: crate::tabs::processes::State,
     pub perf_selected_key: String,
+    /// One-shot type-ahead scroll target for the Performance card column.
+    pub perf_jump_to: Option<String>,
     pub details_state: crate::tabs::details::State,
     /// Selected process by EXACT identity (audit §7): the toolbar's End Task
     /// and Efficiency commands validate start-time identity against the live
@@ -416,6 +418,7 @@ impl TaskManApp {
             search: String::new(),
             processes_state: crate::tabs::processes::State::new(),
             perf_selected_key,
+            perf_jump_to: None,
             details_state: Default::default(),
             selected_process: None,
             selected_user: None,
@@ -680,10 +683,18 @@ impl eframe::App for TaskManApp {
             ctx.memory_mut(|m| m.request_focus(id));
         }
 
-        // Track window size for persistence (only while remembering).
+        // Track window size for persistence (only while remembering). A
+        // maximized window's inner size is the monitor's, not the restore
+        // geometry — keep the last normal size so a relaunch does not open
+        // fullscreen-sized; maximized state itself persists separately.
         if self.shared.settings.remember_window {
-            let size = ctx.input(|i| i.viewport().inner_rect.map(|r| r.size()));
-            if let Some(sz) = size {
+            let (size, maximized) = ctx.input(|i| {
+                (
+                    i.viewport().inner_rect.map(|r| r.size()),
+                    i.viewport().maximized.unwrap_or(false),
+                )
+            });
+            if !maximized && let Some(sz) = size {
                 self.shared.settings.window_size = [sz.x, sz.y];
             }
         }

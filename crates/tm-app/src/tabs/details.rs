@@ -47,7 +47,10 @@ impl ColumnId {
             ColumnId::Pid => a.pid.cmp(&b.pid),
             ColumnId::Status => status_rank(a.status).cmp(&status_rank(b.status)),
             ColumnId::User => cmp_option_str(a.user.as_deref(), b.user.as_deref()),
-            ColumnId::Cpu => a.cpu_pct.partial_cmp(&b.cpu_pct).unwrap_or(CmpOrdering::Equal),
+            ColumnId::Cpu => a
+                .cpu_pct
+                .partial_cmp(&b.cpu_pct)
+                .unwrap_or(CmpOrdering::Equal),
             ColumnId::Memory => a.mem_bytes.cmp(&b.mem_bytes),
             ColumnId::Platform => a.wow64.cmp(&b.wow64),
             ColumnId::Elevated => a.elevated.cmp(&b.elevated),
@@ -161,26 +164,106 @@ impl ColSpec {
 }
 
 const COLUMNS: &[ColSpec] = &[
-    ColSpec { cid: ColumnId::Name, col: || TmColumn::text("name", i18n::tr(K::ColName), 340.0), default_visible: true },
-    ColSpec { cid: ColumnId::Pid, col: || TmColumn::text("pid", i18n::tr(K::ColPid), 90.0), default_visible: true },
-    ColSpec { cid: ColumnId::Status, col: || TmColumn::text("status", i18n::tr(K::ColStatus), 150.0), default_visible: true },
-    ColSpec { cid: ColumnId::User, col: || TmColumn::text("user", i18n::tr(K::ColUsername), 120.0), default_visible: true },
-    ColSpec { cid: ColumnId::Cpu, col: || TmColumn::num("cpu", i18n::tr(K::ColCpu), 64.0), default_visible: true },
-    ColSpec { cid: ColumnId::Memory, col: || TmColumn::num("mem", i18n::tr(K::ColMemory), 130.0), default_visible: true },
-    ColSpec { cid: ColumnId::Platform, col: || TmColumn::text("platform", i18n::tr(K::ColPlatform), 90.0), default_visible: true },
-    ColSpec { cid: ColumnId::Elevated, col: || TmColumn::text("elevated", i18n::tr(K::ColElevated), 110.0), default_visible: true },
-    ColSpec { cid: ColumnId::Uac, col: || TmColumn::text("uac", i18n::tr(K::ColUac), 160.0), default_visible: true },
-    ColSpec { cid: ColumnId::GpuUtil, col: || TmColumn::num("gpu", i18n::tr(K::ColGpu), 80.0), default_visible: true },
-    ColSpec { cid: ColumnId::GpuEngine, col: || TmColumn::text("gpuengine", i18n::tr(K::ColGpuEngine), 170.0), default_visible: true },
-    ColSpec { cid: ColumnId::Priority, col: || TmColumn::text("priority", i18n::tr(K::Priority), 130.0), default_visible: false },
-    ColSpec { cid: ColumnId::Threads, col: || TmColumn::num("threads", i18n::tr(K::StatThreads), 90.0), default_visible: false },
-    ColSpec { cid: ColumnId::Handles, col: || TmColumn::num("handles", i18n::tr(K::StatHandles), 90.0), default_visible: false },
-    ColSpec { cid: ColumnId::CpuTime, col: || TmColumn::num("cputime", "CPU time", 110.0), default_visible: false },
-    ColSpec { cid: ColumnId::Commit, col: || TmColumn::num("commit", "Commit size", 130.0), default_visible: false },
-    ColSpec { cid: ColumnId::PeakMemory, col: || TmColumn::num("peakmem", "Peak working set", 145.0), default_visible: false },
-    ColSpec { cid: ColumnId::GpuDedicated, col: || TmColumn::num("gpudedicated", "Dedicated GPU memory", 165.0), default_visible: false },
-    ColSpec { cid: ColumnId::GpuShared, col: || TmColumn::num("gpushared", "Shared GPU memory", 155.0), default_visible: false },
-    ColSpec { cid: ColumnId::CommandLine, col: || TmColumn::text("commandline", "Command line", 360.0), default_visible: false },
+    ColSpec {
+        cid: ColumnId::Name,
+        col: || TmColumn::text("name", i18n::tr(K::ColName), 340.0),
+        default_visible: true,
+    },
+    ColSpec {
+        cid: ColumnId::Pid,
+        col: || TmColumn::text("pid", i18n::tr(K::ColPid), 90.0),
+        default_visible: true,
+    },
+    ColSpec {
+        cid: ColumnId::Status,
+        col: || TmColumn::text("status", i18n::tr(K::ColStatus), 150.0),
+        default_visible: true,
+    },
+    ColSpec {
+        cid: ColumnId::User,
+        col: || TmColumn::text("user", i18n::tr(K::ColUsername), 120.0),
+        default_visible: true,
+    },
+    ColSpec {
+        cid: ColumnId::Cpu,
+        col: || TmColumn::num("cpu", i18n::tr(K::ColCpu), 64.0),
+        default_visible: true,
+    },
+    ColSpec {
+        cid: ColumnId::Memory,
+        col: || TmColumn::num("mem", i18n::tr(K::ColMemory), 130.0),
+        default_visible: true,
+    },
+    ColSpec {
+        cid: ColumnId::Platform,
+        col: || TmColumn::text("platform", i18n::tr(K::ColPlatform), 90.0),
+        default_visible: true,
+    },
+    ColSpec {
+        cid: ColumnId::Elevated,
+        col: || TmColumn::text("elevated", i18n::tr(K::ColElevated), 110.0),
+        default_visible: true,
+    },
+    ColSpec {
+        cid: ColumnId::Uac,
+        col: || TmColumn::text("uac", i18n::tr(K::ColUac), 160.0),
+        default_visible: true,
+    },
+    ColSpec {
+        cid: ColumnId::GpuUtil,
+        col: || TmColumn::num("gpu", i18n::tr(K::ColGpu), 80.0),
+        default_visible: true,
+    },
+    ColSpec {
+        cid: ColumnId::GpuEngine,
+        col: || TmColumn::text("gpuengine", i18n::tr(K::ColGpuEngine), 170.0),
+        default_visible: true,
+    },
+    ColSpec {
+        cid: ColumnId::Priority,
+        col: || TmColumn::text("priority", i18n::tr(K::Priority), 130.0),
+        default_visible: false,
+    },
+    ColSpec {
+        cid: ColumnId::Threads,
+        col: || TmColumn::num("threads", i18n::tr(K::StatThreads), 90.0),
+        default_visible: false,
+    },
+    ColSpec {
+        cid: ColumnId::Handles,
+        col: || TmColumn::num("handles", i18n::tr(K::StatHandles), 90.0),
+        default_visible: false,
+    },
+    ColSpec {
+        cid: ColumnId::CpuTime,
+        col: || TmColumn::num("cputime", "CPU time", 110.0),
+        default_visible: false,
+    },
+    ColSpec {
+        cid: ColumnId::Commit,
+        col: || TmColumn::num("commit", "Commit size", 130.0),
+        default_visible: false,
+    },
+    ColSpec {
+        cid: ColumnId::PeakMemory,
+        col: || TmColumn::num("peakmem", "Peak working set", 145.0),
+        default_visible: false,
+    },
+    ColSpec {
+        cid: ColumnId::GpuDedicated,
+        col: || TmColumn::num("gpudedicated", "Dedicated GPU memory", 165.0),
+        default_visible: false,
+    },
+    ColSpec {
+        cid: ColumnId::GpuShared,
+        col: || TmColumn::num("gpushared", "Shared GPU memory", 155.0),
+        default_visible: false,
+    },
+    ColSpec {
+        cid: ColumnId::CommandLine,
+        col: || TmColumn::text("commandline", "Command line", 360.0),
+        default_visible: false,
+    },
 ];
 
 fn spec_for(cid: ColumnId) -> ColSpec {
@@ -279,7 +362,11 @@ impl State {
             return false;
         }
         let other = visible[target as usize];
-        let a = self.order.iter().position(|candidate| *candidate == cid).unwrap();
+        let a = self
+            .order
+            .iter()
+            .position(|candidate| *candidate == cid)
+            .unwrap();
         let b = self
             .order
             .iter()
@@ -462,7 +549,7 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
     // cycles repeated initials, and scrolls the virtual row into view.
     if let Some(initial) = search::list_initial(ui.ctx()) {
         let selected = app.selected_process.as_ref().map(|p| p.pid);
-        if let Some(pid) = search::cycle_process_initial(
+        if let Some(pid) = search::cycle_match(
             rows.iter().map(|row| (row.pid, row.name.as_str())),
             selected,
             initial,
@@ -492,6 +579,13 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
         egui::vec2(avail.min(table.total_width()), tablekit::HEADER_H1),
     );
 
+    // Consume any pending scroll request (type-ahead or cross-tab focus) as
+    // a row index for the table's vertical-only scroll-to-row.
+    let focus_row = app
+        .scroll_to_pid
+        .take()
+        .and_then(|pid| rows.iter().position(|row| row.pid == pid));
+
     let clicked = tablekit::scrolled_rows(
         "details",
         ui,
@@ -501,6 +595,7 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
         sorted_pos.map(|p| (p, app.details_state.ascending)),
         None,
         rows.len(),
+        focus_row,
         |ui, table, _avail, _content_w, range| {
             for i in range {
                 let Some(row) = rows.get(i) else { continue };
@@ -508,12 +603,7 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
                     .selected_process
                     .as_ref()
                     .is_some_and(|sp| sp.pid == row.pid);
-                let scroll_hint = app.scroll_to_pid.is_some_and(|p| p == row.pid);
                 let (rect, resp) = table.row(ui, &pal, selected);
-                if scroll_hint {
-                    resp.scroll_to_me(Some(egui::Align::Center));
-                    app.scroll_to_pid = None;
-                }
 
                 // Name decorations follow the Name column even after it has
                 // been moved away from the first position.
@@ -565,7 +655,9 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
 
     let header_secondary = ui.ctx().input(|i| {
         i.pointer.button_clicked(egui::PointerButton::Secondary)
-            && i.pointer.interact_pos().is_some_and(|p| header_rect.contains(p))
+            && i.pointer
+                .interact_pos()
+                .is_some_and(|p| header_rect.contains(p))
     });
     if header_secondary {
         app.details_state.select_columns_open = true;
@@ -597,8 +689,13 @@ fn prepare_auto_fit_widths(
     for (pos, spec) in visible_cols.iter().enumerate() {
         let mut width = tablekit::text_width(ui, spec.label(), tablekit::FONT_HDR_LABEL) + 28.0;
         for row in rows {
-            let extra = if spec.cid == ColumnId::Name { 66.0 } else { 22.0 };
-            width = width.max(tablekit::text_width(ui, row.field(spec.cid), tablekit::FONT_ROW) + extra);
+            let extra = if spec.cid == ColumnId::Name {
+                66.0
+            } else {
+                22.0
+            };
+            width = width
+                .max(tablekit::text_width(ui, row.field(spec.cid), tablekit::FONT_ROW) + extra);
         }
         table.set_auto_fit_width(pos, width.ceil());
     }
@@ -642,25 +739,31 @@ fn select_columns_dialog(app: &mut TaskManApp, ctx: &egui::Context, pal: &theme:
                                 egui::Layout::right_to_left(egui::Align::Center),
                                 |ui| {
                                     if on {
-                                        let can_right = rank.is_some_and(|r| r + 1 < count);
-                                        let can_left = rank.is_some_and(|r| r > 0);
-                                        if ui
-                                            .add_enabled(
-                                                can_right,
-                                                egui::Button::new("→").frame(false),
-                                            )
-                                            .on_hover_text("Move column right")
-                                            .clicked()
+                                        let can_down = rank.is_some_and(|r| r + 1 < count);
+                                        let can_up = rank.is_some_and(|r| r > 0);
+                                        // Keep clear of the floating vertical
+                                        // scroll bar, which paints on top of
+                                        // the content's right edge.
+                                        ui.add_space(16.0);
+                                        if crate::widgets::controls::icon_button(
+                                            ui,
+                                            crate::icons::Icon::ChevronDown,
+                                            can_down,
+                                            pal,
+                                        )
+                                        .on_hover_text("Move column down")
+                                        .clicked()
                                         {
                                             app.details_state.move_visible(cid, 1);
                                         }
-                                        if ui
-                                            .add_enabled(
-                                                can_left,
-                                                egui::Button::new("←").frame(false),
-                                            )
-                                            .on_hover_text("Move column left")
-                                            .clicked()
+                                        if crate::widgets::controls::icon_button(
+                                            ui,
+                                            crate::icons::Icon::ChevronUp,
+                                            can_up,
+                                            pal,
+                                        )
+                                        .on_hover_text("Move column up")
+                                        .clicked()
                                         {
                                             app.details_state.move_visible(cid, -1);
                                         }
@@ -771,7 +874,10 @@ fn build_rows(
                 pid: p.pid,
                 start_epoch_s: p.start_epoch_s,
                 name: p.shown_name().to_string(),
-                icon_path: p.exe_path.as_ref().map(|x| x.to_string_lossy().into_owned()),
+                icon_path: p
+                    .exe_path
+                    .as_ref()
+                    .map(|x| x.to_string_lossy().into_owned()),
                 pid_s: p.pid.to_string(),
                 status,
                 user: p.user.clone().unwrap_or_else(|| "—".into()),
@@ -780,12 +886,24 @@ fn build_rows(
                 platform,
                 elevated,
                 uac,
-                gpu_util_s: p.gpu_util_pct.map(format::format_pct_cell).unwrap_or_else(|| "—".into()),
+                gpu_util_s: p
+                    .gpu_util_pct
+                    .map(format::format_pct_cell)
+                    .unwrap_or_else(|| "—".into()),
                 gpu_engine_s: p.gpu_engine_label.clone().unwrap_or_else(|| "—".into()),
                 priority_s: priority_label(p.priority).to_string(),
-                threads_s: p.threads.map(|v| v.to_string()).unwrap_or_else(|| "—".into()),
-                handles_s: p.handles.map(|v| v.to_string()).unwrap_or_else(|| "—".into()),
-                cpu_time_s: p.cpu_time_s.map(|v| format!("{v:.2} s")).unwrap_or_else(|| "—".into()),
+                threads_s: p
+                    .threads
+                    .map(|v| v.to_string())
+                    .unwrap_or_else(|| "—".into()),
+                handles_s: p
+                    .handles
+                    .map(|v| v.to_string())
+                    .unwrap_or_else(|| "—".into()),
+                cpu_time_s: p
+                    .cpu_time_s
+                    .map(|v| format!("{v:.2} s"))
+                    .unwrap_or_else(|| "—".into()),
                 commit_s: opt_u64_bytes(p.commit_bytes),
                 peak_mem_s: opt_u64_bytes(p.peak_mem_bytes),
                 gpu_dedicated_s: opt_u64_bytes(p.gpu_dedicated_bytes),
@@ -860,7 +978,9 @@ pub fn context_menu(app: &mut TaskManApp, ui: &mut egui::Ui, p: &ProcessEntry) {
         let actions = app.actions.clone();
         let pid = p.pid;
         let target_suspended = !suspended;
-        app.run_action(&ctx, String::new, move || actions.suspend_process(pid, target_suspended));
+        app.run_action(&ctx, String::new, move || {
+            actions.suspend_process(pid, target_suspended)
+        });
         ui.close();
     }
 
@@ -893,11 +1013,17 @@ pub fn context_menu(app: &mut TaskManApp, ui: &mut egui::Ui, p: &ProcessEntry) {
         }
     }
 
-    if let Some(path) = p.exe_path.as_ref().map(|x| x.to_string_lossy().into_owned()) {
+    if let Some(path) = p
+        .exe_path
+        .as_ref()
+        .map(|x| x.to_string_lossy().into_owned())
+    {
         if ui.button(i18n::tr(K::OpenFileLocation)).clicked() {
             let actions = app.actions.clone();
             let path2 = path.clone();
-            app.run_action(&ctx, String::new, move || actions.open_file_location(&path2));
+            app.run_action(&ctx, String::new, move || {
+                actions.open_file_location(&path2)
+            });
             ui.close();
         }
         if ui.button(i18n::tr(K::CreateDumpFile)).clicked() {
@@ -1128,28 +1254,95 @@ mod tests {
             let (mut a, mut b) = (mk(), mk());
             assert_eq!(spec.cid.compare(&a, &b), CmpOrdering::Equal);
             match spec.cid {
-                ColumnId::Name => { a.display = "aaa".into(); a.name = "aaa".into(); b.display = "zzz".into(); b.name = "zzz".into(); }
-                ColumnId::Pid => { a.pid = 1; b.pid = 2; }
-                ColumnId::Status => { a.status = ProcStatus::Running; b.status = ProcStatus::NotResponding; }
-                ColumnId::User => { a.user = Some("alice".into()); b.user = Some("bob".into()); }
-                ColumnId::Cpu => { a.cpu_pct = 5.0; b.cpu_pct = 50.0; }
-                ColumnId::Memory => { a.mem_bytes = 100; b.mem_bytes = 200; }
-                ColumnId::Platform => { a.wow64 = Some(false); b.wow64 = Some(true); }
-                ColumnId::Elevated => { a.elevated = Some(false); b.elevated = Some(true); }
-                ColumnId::Uac => { a.uac_virtualization = Some(UacVirtualization::Disabled); b.uac_virtualization = Some(UacVirtualization::NotAllowed); }
-                ColumnId::GpuUtil => { a.gpu_util_pct = None; b.gpu_util_pct = Some(30.0); }
-                ColumnId::GpuEngine => { a.gpu_engine_label = Some("GPU 0 - 3D".into()); b.gpu_engine_label = Some("GPU 0 - VideoDecode".into()); }
-                ColumnId::Priority => { a.priority = PriorityClass::Low; b.priority = PriorityClass::High; }
-                ColumnId::Threads => { a.threads = Some(1); b.threads = Some(2); }
-                ColumnId::Handles => { a.handles = Some(1); b.handles = Some(2); }
-                ColumnId::CpuTime => { a.cpu_time_s = Some(1.0); b.cpu_time_s = Some(2.0); }
-                ColumnId::Commit => { a.commit_bytes = Some(1); b.commit_bytes = Some(2); }
-                ColumnId::PeakMemory => { a.peak_mem_bytes = Some(1); b.peak_mem_bytes = Some(2); }
-                ColumnId::GpuDedicated => { a.gpu_dedicated_bytes = Some(1); b.gpu_dedicated_bytes = Some(2); }
-                ColumnId::GpuShared => { a.gpu_shared_bytes = Some(1); b.gpu_shared_bytes = Some(2); }
-                ColumnId::CommandLine => { a.command_line = Some("a".into()); b.command_line = Some("b".into()); }
+                ColumnId::Name => {
+                    a.display = "aaa".into();
+                    a.name = "aaa".into();
+                    b.display = "zzz".into();
+                    b.name = "zzz".into();
+                }
+                ColumnId::Pid => {
+                    a.pid = 1;
+                    b.pid = 2;
+                }
+                ColumnId::Status => {
+                    a.status = ProcStatus::Running;
+                    b.status = ProcStatus::NotResponding;
+                }
+                ColumnId::User => {
+                    a.user = Some("alice".into());
+                    b.user = Some("bob".into());
+                }
+                ColumnId::Cpu => {
+                    a.cpu_pct = 5.0;
+                    b.cpu_pct = 50.0;
+                }
+                ColumnId::Memory => {
+                    a.mem_bytes = 100;
+                    b.mem_bytes = 200;
+                }
+                ColumnId::Platform => {
+                    a.wow64 = Some(false);
+                    b.wow64 = Some(true);
+                }
+                ColumnId::Elevated => {
+                    a.elevated = Some(false);
+                    b.elevated = Some(true);
+                }
+                ColumnId::Uac => {
+                    a.uac_virtualization = Some(UacVirtualization::Disabled);
+                    b.uac_virtualization = Some(UacVirtualization::NotAllowed);
+                }
+                ColumnId::GpuUtil => {
+                    a.gpu_util_pct = None;
+                    b.gpu_util_pct = Some(30.0);
+                }
+                ColumnId::GpuEngine => {
+                    a.gpu_engine_label = Some("GPU 0 - 3D".into());
+                    b.gpu_engine_label = Some("GPU 0 - VideoDecode".into());
+                }
+                ColumnId::Priority => {
+                    a.priority = PriorityClass::Low;
+                    b.priority = PriorityClass::High;
+                }
+                ColumnId::Threads => {
+                    a.threads = Some(1);
+                    b.threads = Some(2);
+                }
+                ColumnId::Handles => {
+                    a.handles = Some(1);
+                    b.handles = Some(2);
+                }
+                ColumnId::CpuTime => {
+                    a.cpu_time_s = Some(1.0);
+                    b.cpu_time_s = Some(2.0);
+                }
+                ColumnId::Commit => {
+                    a.commit_bytes = Some(1);
+                    b.commit_bytes = Some(2);
+                }
+                ColumnId::PeakMemory => {
+                    a.peak_mem_bytes = Some(1);
+                    b.peak_mem_bytes = Some(2);
+                }
+                ColumnId::GpuDedicated => {
+                    a.gpu_dedicated_bytes = Some(1);
+                    b.gpu_dedicated_bytes = Some(2);
+                }
+                ColumnId::GpuShared => {
+                    a.gpu_shared_bytes = Some(1);
+                    b.gpu_shared_bytes = Some(2);
+                }
+                ColumnId::CommandLine => {
+                    a.command_line = Some("a".into());
+                    b.command_line = Some("b".into());
+                }
             }
-            assert_ne!(spec.cid.compare(&a, &b), CmpOrdering::Equal, "{:?}", spec.cid);
+            assert_ne!(
+                spec.cid.compare(&a, &b),
+                CmpOrdering::Equal,
+                "{:?}",
+                spec.cid
+            );
         }
     }
 

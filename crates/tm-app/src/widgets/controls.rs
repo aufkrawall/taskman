@@ -142,3 +142,34 @@ pub fn checkbox_enabled(
     });
     resp
 }
+
+/// Small frameless icon button for dialog row affordances (e.g. the
+/// Select-columns dialog's move up/down chevrons). Disabled state dims the
+/// glyph and swallows clicks; hover gets a faint highlight.
+pub fn icon_button(
+    ui: &mut egui::Ui,
+    icon: crate::icons::Icon,
+    enabled: bool,
+    pal: &Palette,
+) -> egui::Response {
+    let sense = if enabled {
+        Sense::click()
+    } else {
+        Sense::hover()
+    };
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(22.0, 20.0), sense);
+    let active = enabled && resp.hovered();
+    if active {
+        ui.painter()
+            .rect_filled(rect, 3.0, Color32::from_white_alpha(12));
+    }
+    let color = if !enabled {
+        pal.text_dim.gamma_multiply(0.45)
+    } else if active || resp.is_pointer_button_down_on() {
+        pal.text
+    } else {
+        pal.text_dim
+    };
+    crate::icons::draw_at(ui, rect.shrink2(egui::vec2(4.0, 3.0)), icon, color);
+    resp
+}

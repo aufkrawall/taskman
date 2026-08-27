@@ -14,7 +14,11 @@ fn config_home() -> Option<PathBuf> {
         .ok()
         .filter(|s| !s.is_empty())
         .map(PathBuf::from)
-        .or_else(|| std::env::var("HOME").ok().map(|h| PathBuf::from(h).join(".config")))
+        .or_else(|| {
+            std::env::var("HOME")
+                .ok()
+                .map(|h| PathBuf::from(h).join(".config"))
+        })
 }
 
 /// Low-to-high precedence so later entries naturally override earlier ones.
@@ -48,10 +52,14 @@ pub fn list_autostart() -> Vec<StartupItem> {
     // display purposes, while its Hidden flag still wins semantically.
     let mut merged: BTreeMap<String, DesktopFile> = BTreeMap::new();
     for dir in autostart_dirs_low_to_high() {
-        let Ok(entries) = std::fs::read_dir(&dir) else { continue };
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
         for e in entries.flatten() {
             let path = e.path();
-            let Some(file_name) = path.file_name().and_then(|n| n.to_str()) else { continue };
+            let Some(file_name) = path.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
             if !file_name.ends_with(".desktop") {
                 continue;
             }
@@ -195,13 +203,19 @@ fn set_hidden_in_file(path: &Path, hidden: bool) -> Result<()> {
         let line = raw.trim();
         if line.starts_with('[') {
             if in_entry && !wrote {
-                out.push_str(&format!("Hidden={}\n", if hidden { "true" } else { "false" }));
+                out.push_str(&format!(
+                    "Hidden={}\n",
+                    if hidden { "true" } else { "false" }
+                ));
                 wrote = true;
             }
             in_entry = line == "[Desktop Entry]";
         }
         if in_entry && line.starts_with("Hidden=") {
-            out.push_str(&format!("Hidden={}\n", if hidden { "true" } else { "false" }));
+            out.push_str(&format!(
+                "Hidden={}\n",
+                if hidden { "true" } else { "false" }
+            ));
             wrote = true;
         } else {
             out.push_str(raw);
@@ -209,10 +223,12 @@ fn set_hidden_in_file(path: &Path, hidden: bool) -> Result<()> {
         }
     }
     if in_entry && !wrote {
-        out.push_str(&format!("Hidden={}\n", if hidden { "true" } else { "false" }));
+        out.push_str(&format!(
+            "Hidden={}\n",
+            if hidden { "true" } else { "false" }
+        ));
     }
-    std::fs::write(path, out)
-        .map_err(|e| TmError::platform("write autostart entry", e.to_string()))
+    std::fs::write(path, out).map_err(|e| TmError::platform("write autostart entry", e.to_string()))
 }
 
 #[cfg(test)]

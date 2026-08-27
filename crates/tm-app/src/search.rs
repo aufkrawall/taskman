@@ -72,17 +72,18 @@ pub fn list_initial(ctx: &egui::Context) -> Option<char> {
     })
 }
 
-/// Find the next displayed process whose name starts with `initial`. If the
+/// Find the next displayed entry whose name starts with `initial`. If the
 /// current selection is one of the matches, repeated presses cycle and wrap;
 /// otherwise the first match is selected. The iterator order is therefore the
-/// exact order the caller renders on screen.
-pub fn cycle_process_initial<'a>(
-    rows: impl IntoIterator<Item = (u32, &'a str)>,
-    selected_pid: Option<u32>,
+/// exact order the caller renders on screen. Identity type `T` is whatever
+/// the caller uses to select (PID, resource key, ...).
+pub fn cycle_match<'a, T: PartialEq + Clone>(
+    items: impl IntoIterator<Item = (T, &'a str)>,
+    selected: Option<T>,
     initial: char,
-) -> Option<u32> {
+) -> Option<T> {
     let needle = initial.to_lowercase().collect::<String>();
-    let matches = rows
+    let matches = items
         .into_iter()
         .filter(|(_, name)| {
             name.trim_start()
@@ -90,14 +91,17 @@ pub fn cycle_process_initial<'a>(
                 .next()
                 .is_some_and(|c| c.to_lowercase().collect::<String>() == needle)
         })
-        .map(|(pid, _)| pid)
+        .map(|(id, _)| id)
         .collect::<Vec<_>>();
     if matches.is_empty() {
         return None;
     }
-    selected_pid
-        .and_then(|pid| matches.iter().position(|candidate| *candidate == pid))
-        .map_or(Some(matches[0]), |pos| Some(matches[(pos + 1) % matches.len()]))
+    selected
+        .and_then(|sel| matches.iter().position(|candidate| *candidate == sel))
+        .map_or_else(
+            || Some(matches[0].clone()),
+            |pos| Some(matches[(pos + 1) % matches.len()].clone()),
+        )
 }
 
 #[cfg(test)]
@@ -153,11 +157,20 @@ mod tests {
     #[test]
     fn list_initial_cycles_and_wraps_in_display_order() {
         let rows = [(1, "Alpha"), (2, "Beta"), (3, "another"), (4, "Äther")];
-        assert_eq!(cycle_process_initial(rows, None, 'a'), Some(1));
-        assert_eq!(cycle_process_initial(rows, Some(1), 'A'), Some(3));
-        assert_eq!(cycle_process_initial(rows, Some(3), 'a'), Some(1));
-        assert_eq!(cycle_process_initial(rows, Some(2), 'a'), Some(1));
-        assert_eq!(cycle_process_initial(rows, None, 'z'), None);
-        assert_eq!(cycle_process_initial(rows, None, 'ä'), Some(4));
+        assert_eq!(cycle_match(rows, None, 'a'), Some(1));
+        assert_eq!(cycle_match(rows, Some(1), 'A'), Some(3));
+        assert_eq!(cycle_match(rows, Some(3), 'a'), Some(1));
+        assert_eq!(cycle_match(rows, Some(2), 'a'), Some(1));
+        assert_eq!(cycle_match(rows, None, 'z'), None);
+        assert_eq!(cycle_match(rows, None, 'ä'), Some(4));
+    }
+
+    #[test]
+    fn cycle_match_works_with_non_pid_identities() {
+        let rows = [("cpu", "CPU"), ("disk0", "Disk 0 (C:)"), ("gpu0", "GPU 0")];
+        assert_eq!(cycle_match(rows, None, 'd'), Some("disk0"));
+        assert_eq!(cycle_match(rows, Some("disk0"), 'd'), Some("disk0"));
+        assert_eq!(cycle_match(rows, Some("gpu0"), 'd'), Some("disk0"));
+        assert_eq!(cycle_match(rows, None, 'x'), None);
     }
 }

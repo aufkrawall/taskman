@@ -95,8 +95,8 @@ fn run_gui(mock: bool, args: &[String]) {
     // A genuinely fresh install gets a roomier first window. Existing users
     // keep their recorded dimensions, including legacy-JSON migrations.
     let config_dir = tm_core::settings::taskman_config_dir();
-    let has_saved_settings = config_dir.join("config.ini").exists()
-        || config_dir.join("settings.json").exists();
+    let has_saved_settings =
+        config_dir.join("config.ini").exists() || config_dir.join("settings.json").exists();
     let mut settings = tm_core::settings::Settings::load();
     if !has_saved_settings {
         settings.window_size = DEFAULT_WINDOW_SIZE;
@@ -114,6 +114,7 @@ fn run_gui(mock: bool, args: &[String]) {
     let window_size = [settings.window_size[0], settings.window_size[1]];
     let restore_position = has_saved_settings && settings.remember_window;
     let window_position = restore_position.then(ui_state::window_position).flatten();
+    let restore_maximized = restore_position && ui_state::window_maximized();
 
     let initial_tab_arg = args
         .iter()
@@ -136,6 +137,9 @@ fn run_gui(mock: bool, args: &[String]) {
             .with_icon(icon_data());
         if let Some(pos) = window_position {
             viewport = viewport.with_position(pos);
+        }
+        if restore_maximized {
+            viewport = viewport.with_maximized(true);
         }
         let mut opts = eframe::NativeOptions {
             renderer,
@@ -225,10 +229,19 @@ impl eframe::App for NativeApp {
 
     fn ui(&mut self, ui: &mut eframe::egui::Ui, frame: &mut eframe::Frame) {
         <app::TaskManApp as eframe::App>::ui(&mut self.inner, ui, frame);
-        if self.inner.shared.settings.remember_window
-            && let Some(pos) = ui.ctx().input(|i| i.viewport().outer_rect.map(|r| r.min))
-        {
-            ui_state::set_window_position([pos.x, pos.y]);
+        if self.inner.shared.settings.remember_window {
+            let (pos, maximized) = ui.ctx().input(|i| {
+                (
+                    i.viewport().outer_rect.map(|r| r.min),
+                    i.viewport().maximized.unwrap_or(false),
+                )
+            });
+            // A maximized window's outer rect is the monitor's, not the
+            // restore geometry — keep the last normal position instead.
+            if !maximized && let Some(pos) = pos {
+                ui_state::set_window_position([pos.x, pos.y]);
+            }
+            ui_state::set_window_maximized(maximized);
         }
     }
 

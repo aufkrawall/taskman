@@ -1,6 +1,53 @@
 # Recent Activity
 
-# Recent Activity
+## 2026-08-27 — window placement UX, type-ahead scroll fixes, dialog chevrons
+
+Three user-reported issues fixed:
+
+1. **Window size/position not persisted**: root cause on the affected
+   machine was `remember_window=false` in `config.ini` — a setting with NO
+   settings-dialog UI, so it could not be re-enabled. The Settings dialog
+   now has a "Remember window size and position" checkbox (i18n key
+   `RememberWindow`, persists via autosave). Additionally, maximized state
+   is now part of placement: while maximized, neither the restore size nor
+   the position is clobbered with monitor geometry; `window-state.ini`
+   gains a `maximized=` key and startup re-maximizes via
+   `ViewportBuilder::with_maximized`. See `ui_state.rs` (Placement struct)
+   and `NativeApp::ui` in main.rs.
+2. **Select-columns dialog arrows**: the →/← text buttons sat under the
+   floating vertical scrollbar (right edge) and could not be clicked. They
+   are now painted chevron icons (`controls::icon_button`, new
+   `icons::Icon::ChevronUp`), moved 16 px left of the scrollbar strip, and
+   reordered to ↑/↓ (up = earlier position, down = later).
+3. **Type-ahead scroll**: plain-letter navigation (Processes/Details)
+   used `Response::scroll_to_me(Some(Center))` on a virtualized row, which
+   (a) never fired for rows outside the rendered window (no vertical
+   scroll at all) and (b) when it fired, targeted BOTH scroll axes,
+   yanking the table horizontally. `tablekit::scrolled_rows` now takes a
+   one-shot `focus_row: Option<usize>` and computes a vertical-only,
+   minimal-move offset from the last frame's y-offset (`tm-rowsy` temp)
+   applied via `ScrollArea::vertical_scroll_offset` on the request frame
+   only. Callers pass the index from `scroll_to_pid.take()`; the per-row
+   `scroll_to_me` mechanism is gone. Regression test:
+   `focus_row_scrolls_vertically_only_even_for_unrendered_rows`.
+   `search::cycle_process_initial` was genericized to `cycle_match<T:
+   PartialEq + Clone>` and the Performance card column gained the same
+   type-ahead (jump + vertical scroll via `scroll_to_me(None)`, which for
+   full-width items can never move horizontally).
+
+Also fixed (found by the heavy gate): `cpu_info::base_mhz_from_smbios_table`
+returned `max(current, max)` while its tests document current-speed-
+preferred-with-max-fallback — pre-existing failing test
+`smbios_type4_current_speed_is_preferred`, now green.
+
+Note: HEAD was not fmt-clean under the local rustfmt
+(1.10.0-nightly 2026-08-25); `python build.py --check` failed on the
+pristine tree. The formatting drift in previously untouched files
+(fonts.rs, chart.rs, linux/*, win/mod.rs, taskmgr_replacement.rs) is
+mechanical rustfmt output required to keep this machine's gate green.
+
+Validation: `python build.py --check` (fmt, clippy -D warnings, all
+workspace tests) + release build/packaging + `--selfcheck --mock` pass.
 
 ## 2026-08-27 — Processes app-grouping parity
 

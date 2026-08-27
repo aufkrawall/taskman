@@ -610,7 +610,14 @@ impl PlatformActions for LinuxActions {
         send_signal(pid, libc::SIGTERM)
     }
     fn suspend_process(&self, pid: u32, suspend: bool) -> Result<()> {
-        send_signal(pid, if suspend { libc::SIGSTOP } else { libc::SIGCONT })
+        send_signal(
+            pid,
+            if suspend {
+                libc::SIGSTOP
+            } else {
+                libc::SIGCONT
+            },
+        )
     }
     fn set_priority(&self, pid: u32, priority: PriorityClass) -> Result<()> {
         let nice: i32 = match priority {
@@ -624,13 +631,18 @@ impl PlatformActions for LinuxActions {
         if rc == 0 {
             Ok(())
         } else {
-            Err(tm_core::TmError::platform("setpriority", "permission denied"))
+            Err(tm_core::TmError::platform(
+                "setpriority",
+                "permission denied",
+            ))
         }
     }
     fn get_affinity_mask(&self, pid: u32) -> Result<u64> {
         unsafe {
             let mut set: libc::cpu_set_t = std::mem::zeroed();
-            if libc::sched_getaffinity(pid as i32, std::mem::size_of::<libc::cpu_set_t>(), &mut set) != 0 {
+            if libc::sched_getaffinity(pid as i32, std::mem::size_of::<libc::cpu_set_t>(), &mut set)
+                != 0
+            {
                 return Err(tm_core::TmError::platform("sched_getaffinity", "failed"));
             }
             let mut mask = 0u64;
@@ -654,7 +666,9 @@ impl PlatformActions for LinuxActions {
                     libc::CPU_SET(cpu, &mut set);
                 }
             }
-            if libc::sched_setaffinity(pid as i32, std::mem::size_of::<libc::cpu_set_t>(), &set) != 0 {
+            if libc::sched_setaffinity(pid as i32, std::mem::size_of::<libc::cpu_set_t>(), &set)
+                != 0
+            {
                 return Err(tm_core::TmError::platform("sched_setaffinity", "failed"));
             }
             Ok(())
@@ -688,7 +702,10 @@ fn send_signal(pid: u32, sig: i32) -> Result<()> {
     if rc == 0 {
         Ok(())
     } else {
-        Err(tm_core::TmError::platform("kill", format!("signal {sig} failed")))
+        Err(tm_core::TmError::platform(
+            "kill",
+            format!("signal {sig} failed"),
+        ))
     }
 }
 
