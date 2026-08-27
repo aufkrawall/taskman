@@ -78,6 +78,14 @@ pub fn text_width(ui: &egui::Ui, text: &str, font_size: f32) -> f32 {
         .x
 }
 
+/// Request that the next virtualized render of `id` center the given model
+/// row. The request is consumed exactly once by [`scrolled_rows`]. This is
+/// used for keyboard/list navigation where the destination row may currently
+/// be outside the virtualized render range.
+pub fn request_scroll_to_row(ctx: &egui::Context, id: &'static str, row: usize) {
+    ctx.data_mut(|d| d.insert_temp(egui::Id::new(("tm-scroll-row", id)), row));
+}
+
 /// Render a table header + body with full scrolling support.
 #[allow(dead_code)]
 #[allow(clippy::too_many_arguments)]
@@ -151,7 +159,10 @@ pub fn scrolled_rows(
         .horizontal_scroll_offset(rows_prev_x)
         .show(ui, |ui| table.header(ui, pal, sort, aggregates));
 
-    let body = egui::ScrollArea::both()
+    let requested_row = ui.ctx().data_mut(|d| {
+        d.remove_temp::<usize>(egui::Id::new(("tm-scroll-row", id)))
+    });
+    let mut body_area = egui::ScrollArea::both()
         .id_salt(egui::Id::new(("tm-rowscroll", id)))
         .auto_shrink(false)
         .content_margin(egui::Margin {
@@ -160,10 +171,17 @@ pub fn scrolled_rows(
             top: 0,
             bottom: BODY_PAD_BOTTOM,
         })
-        .horizontal_scroll_offset(hdr.state.offset.x)
-        .show_rows(ui, ROW_H, row_count, |ui, range| {
-            rows(ui, table, avail, avail.max(content_w), range)
-        });
+        .horizontal_scroll_offset(hdr.state.offset.x);
+    if let Some(row) = requested_row.filter(|row| *row < row_count) {
+        // Center when possible. ScrollArea clamps the final value to its
+        // actual content extent, so first/last rows naturally land at edges.
+        let viewport_h = ui.available_height();
+        let centered = row as f32 * ROW_H - (viewport_h - ROW_H).max(0.0) * 0.5;
+        body_area = body_area.vertical_scroll_offset(centered.max(0.0));
+    }
+    let body = body_area.show_rows(ui, ROW_H, row_count, |ui, range| {
+        rows(ui, table, avail, avail.max(content_w), range)
+    });
 
     ui.ctx()
         .data_mut(|d| d.insert_temp(egui::Id::new(("tm-rowsx", id)), body.state.offset.x));
