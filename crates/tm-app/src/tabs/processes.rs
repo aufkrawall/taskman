@@ -15,7 +15,7 @@
 //!   subtree process count, computed in one O(n) pass, not direct children
 //!   (P0.5).
 //! * Heat intensities are normalized per COLUMN over the whole display
-//!   model before virtualization (P0.2) — `heat_cells` only paints.
+//!   model before virtualization (audit P0.2) — `heat_cells` only paints.
 
 use eframe::egui;
 use std::collections::{HashMap, HashSet};
@@ -84,6 +84,9 @@ pub struct State {
     pub expanded_users: HashSet<u32>,
     /// Collapsed group headers [Apps, Background, Windows].
     pub group_collapsed: [bool; 3],
+    /// Process selected by keyboard type-navigation and waiting to be scrolled
+    /// into the virtualized visible range.
+    scroll_to_pid: Option<u32>,
     cache: Option<Cache>,
     view_generation: u64,
 }
@@ -231,6 +234,30 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
     }
     let rows = cache.as_ref().expect("cache").rows.clone();
 
+    // Task-Manager-style type navigation: a plain letter selects the next
+    // visible process beginning with that letter. Repeated presses cycle and
+    // wrap in the exact flattened/sorted order shown on screen.
+    if let Some(initial) = search::list_initial(ui.ctx()) {
+        let selected = app.selected_process.as_ref().map(|p| p.pid);
+        if let Some(pid) = search::cycle_process_initial(
+            rows.iter().filter_map(|row| match row {
+                DisplayRow::Process(row) => Some((row.pid, row.name.as_str())),
+                DisplayRow::GroupHeader(..) => None,
+            }),
+            selected,
+            initial,
+        ) && let Some(row) = rows.iter().find_map(|row| match row {
+            DisplayRow::Process(row) if row.pid == pid => Some(row),
+            _ => None,
+        }) {
+            app.selected_process = Some(crate::app::ProcessIdentity {
+                pid: row.pid,
+                start_epoch_s: row.start_epoch_s,
+            });
+            app.processes_state.scroll_to_pid = Some(row.pid);
+        }
+    }
+
     let agg = Aggregates::from_snapshot(&snap);
     let aggs = agg.strings();
     prepare_auto_fit_widths(ui, &mut table, &rows, &aggs);
@@ -377,7 +404,12 @@ fn row_ui(
         .selected_process
         .as_ref()
         .is_some_and(|sp| sp.pid == row.pid);
+    let scroll_hint = app.processes_state.scroll_to_pid == Some(row.pid);
     let (rect, resp) = table.row(ui, pal, selected);
+    if scroll_hint {
+        resp.scroll_to_me(Some(egui::Align::Center));
+        app.processes_state.scroll_to_pid = None;
+    }
 
     // Chevron + icon + name.
     let expanded = app.processes_state.expanded.contains(&row.pid);
