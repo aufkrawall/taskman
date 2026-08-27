@@ -31,6 +31,19 @@
 //! * per-process ∈ [0, 100] = process' CPU-time delta divided by the whole
 //!   machine's time capacity in the window ("share of total capacity",
 //!   TM Processes/Details style).
+//!
+//! Attribution completeness: the per-core accumulators see ALL busy time,
+//! but the process table only contains processes alive at sample time.
+//! Two gaps are closed here so busy work is never left unidentified:
+//! * Processes born inside the window are credited their full accumulated
+//!   time since creation (which for them is exactly in-window time).
+//! * Everything not chargeable to a live process — CPU of processes that
+//!   terminated during the window (compilers, scripts, installers churn
+//!   through whole generations per tick), plus kernel DPC/ISR servicing —
+//!   is reported as `unattributed_pct` together with the image names of
+//!   the processes that exited, so the UI can render honest pseudo-rows
+//!   ("Terminated processes", "System interrupts") instead of silently
+//!   dropping the load.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -62,12 +75,15 @@ struct CoreRaw {
 }
 
 /// Per-process raw time accumulators in 100 ns units.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct ProcRaw {
     /// Creation time as reported by the kernel; guards against PID reuse.
     create_time: i64,
     kernel: i64,
     user: i64,
+    /// Image base name from the kernel table (empty when unparseable).
+    /// Remembered for processes that exit so their CPU churn can be named.
+    name: Box<str>,
 }
 
 /// Per-process load for one sampling window.
@@ -77,6 +93,14 @@ pub struct ProcCpu {
     pub pct: f32,
     /// Absolute user+kernel time since process start, 100 ns units.
     pub total_time_100ns: u64,
+}
+
+/// One executable image observed among the processes that terminated
+/// during the sampling window.
+#[derive(Debug, Clone)]
+pub struct ExitedImage {
+    pub name: String,
+    pub count: u32,
 }
 
 /// One consistent CPU-load sample.
@@ -93,6 +117,14 @@ pub struct LoadSample {
     pub global_kernel_pct: f32,
     /// Per-process values; PIDs absent here were not seen or are new.
     pub procs: HashMap<u32, ProcCpu>,
+    /// Busy time in the window that could not be charged to any live
+    /// process (terminated processes, DPC/ISR servicing, accounting
+    /// residue), as share of total capacity in [0, 100].
+    pub unattributed_pct: f32,
+    /// Number of processes that terminated during the window.
+    pub exited_count: u32,
+    /// Most frequently exited images (deduped, highest count first).
+    pub exited_images: Vec<ExitedImage>,
 }
 
 struct PrevSample {
@@ -268,6 +300,8 @@ impl CpuLoadAccountant {
             let user = read_i64(buf, pos + off.user_time);
             let kernel = read_i64(buf, pos + off.kernel_time);
             let pid = read_usize(buf, pos + off.pid) as u32;
+            let buf_base = buf.as_ptr() as usize;
+            let name = parse_image_name(buf, buf_base, pos, written, &off);
 
             // pid 0 is the Idle process whose "CPU time" is just idle time.
             if pid != 0 && kernel >= 0 && user >= 0 {
@@ -277,6 +311,7 @@ impl CpuLoadAccountant {
                         create_time,
                         kernel,
                         user,
+                        name,
                     },
                 );
             }
@@ -301,6 +336,10 @@ struct Offsets {
     user_time: usize,
     kernel_time: usize,
     pid: usize,
+    /// UNICODE_STRING ImageName (Length @ +0, Buffer pointer field follows).
+    image_name: usize,
+    /// Field holding the name offset, relative to the record start.
+    image_name_buffer: usize,
     min_size: usize,
 }
 
@@ -310,22 +349,28 @@ impl Offsets {
             // NextEntryOffset@0, NumberOfThreads@4, WorkingSetPrivateSize@8,
             // HardFaultCount@16, HighWatermark@20, CycleTime@24,
             // CreateTime@32, UserTime@40, KernelTime@48,
-            // ImageName@56 (UNICODE_STRING, 16 B), BasePriority@72,
-            // UniqueProcessId@80, InheritedFrom@88, HandleCount@96, SessionId@100.
+            // ImageName@56 (UNICODE_STRING, 16 B: Length@56, Buffer@64),
+            // BasePriority@72, UniqueProcessId@80, InheritedFrom@88,
+            // HandleCount@96, SessionId@100.
             Self {
                 create_time: 32,
                 user_time: 40,
                 kernel_time: 48,
                 pid: 80,
+                image_name: 56,
+                image_name_buffer: 64,
                 min_size: 104,
             }
         } else {
-            // Same order, pointer-sized handles/pointers.
+            // Same order, pointer-sized handles/pointers (UNICODE_STRING is
+            // 8 B: Length@56, Buffer@60).
             Self {
                 create_time: 32,
                 user_time: 40,
                 kernel_time: 48,
                 pid: 68,
+                image_name: 56,
+                image_name_buffer: 60,
                 min_size: 84,
             }
         }
@@ -366,27 +411,85 @@ fn build_sample(
 
     // Whole-machine time capacity within the window, 100 ns units.
     let capacity_100ns = dt_s * 1e7 * nb_cores;
+    let capacity = |time_100ns: u64| -> f32 {
+        if capacity_100ns <= f64::EPSILON {
+            return 0.0;
+        }
+        ((time_100ns as f64 / capacity_100ns) * 100.0).clamp(0.0, 100.0) as f32
+    };
 
     let mut out = HashMap::with_capacity(procs.len());
+    // Sum of all in-window CPU time chargeable to LIVE processes.
+    let mut accounted_100ns: u64 = 0;
     for (&pid, cur) in procs {
         let total_now = nonneg(cur.kernel) + nonneg(cur.user);
-        let pct = prev
-            .procs
-            .get(&pid)
-            .filter(|p| p.create_time == cur.create_time)
-            .map_or(0.0, |p| {
+        let in_window = match prev.procs.get(&pid) {
+            // Same identity: the delta since the previous sample.
+            Some(p) if p.create_time == cur.create_time => {
                 let t_prev = nonneg(p.kernel) + nonneg(p.user);
-                let d = total_now.saturating_sub(t_prev) as f64;
-                (((d / capacity_100ns) * 100.0).clamp(0.0, 100.0)) as f32
-            });
+                total_now.saturating_sub(t_prev)
+            }
+            // Born (or reborn under a reused pid) inside the window: the
+            // kernel accumulators run since creation, and creation happened
+            // after the previous sample — so the full accumulator IS
+            // in-window time. Crediting it here is what makes short-lived
+            // but nontrivial processes (compilers!) visible on their first
+            // sample instead of starting at a fabricated 0 %.
+            _ => total_now,
+        };
+        accounted_100ns += in_window;
         out.insert(
             pid,
             ProcCpu {
-                pct,
+                pct: capacity(in_window),
                 total_time_100ns: total_now,
             },
         );
     }
+
+    // Processes that disappeared since the previous sample. Their final
+    // accumulators are unobservable, so their in-window time cannot be
+    // charged to a row — but they can be NAMED, and their share is captured
+    // in the unattributed residual below.
+    let mut exited_count: u32 = 0;
+    let mut exited_by_name: HashMap<&str, u32> = HashMap::new();
+    for (pid, p) in &prev.procs {
+        let gone = procs
+            .get(pid)
+            .is_none_or(|c| c.create_time != p.create_time);
+        if gone {
+            exited_count += 1;
+            if !p.name.is_empty() {
+                *exited_by_name.entry(&p.name).or_insert(0) += 1;
+            }
+        }
+    }
+    let mut exited_images: Vec<ExitedImage> = exited_by_name
+        .into_iter()
+        .map(|(name, count)| ExitedImage {
+            name: name.to_string(),
+            count,
+        })
+        .collect();
+    exited_images.sort_by(|a, b| b.count.cmp(&a.count).then_with(|| a.name.cmp(&b.name)));
+    exited_images.truncate(8);
+
+    // Global busy time straight from the per-core accumulators (what the
+    // Performance page reports). Whatever it exceeds the live processes'
+    // chargeable time belongs to terminated processes, interrupt/DPC
+    // servicing and accounting residue — surfaced honestly instead of
+    // vanishing between the rows.
+    let busy_100ns: u64 = cores
+        .iter()
+        .zip(prev.cores.iter())
+        .map(|(c, p)| {
+            let d_kernel = c.kernel.saturating_sub(p.kernel) as u64;
+            let d_user = c.user.saturating_sub(p.user) as u64;
+            let d_idle = c.idle.saturating_sub(p.idle) as u64;
+            (d_kernel + d_user).saturating_sub(d_idle)
+        })
+        .sum();
+    let unattributed_100ns = busy_100ns.saturating_sub(accounted_100ns);
 
     LoadSample {
         global_pct,
@@ -394,7 +497,65 @@ fn build_sample(
         per_core_kernel_pct,
         global_kernel_pct,
         procs: out,
+        unattributed_pct: capacity(unattributed_100ns),
+        exited_count,
+        exited_images,
     }
+}
+
+/// Decode the ImageName of one process record.
+///
+/// The name payload lives inside the same output buffer, but WHERE the
+/// UNICODE_STRING Buffer field points has varied across Windows builds:
+/// modern NT (which writes the caller's buffer in place) stores an absolute
+/// pointer, older conventions use an offset relative to the record start or
+/// the table start. Every candidate is bounds-checked and must decode to
+/// control-character-free text; any doubt yields an empty name rather than
+/// garbage (see the live-kernel unit test pinning this down).
+fn parse_image_name(
+    buf: &[u8],
+    buf_base: usize,
+    record: usize,
+    written: usize,
+    off: &Offsets,
+) -> Box<str> {
+    if record + off.image_name_buffer + std::mem::size_of::<usize>() > written {
+        return "".into();
+    }
+    let raw = read_usize(buf, record + off.image_name_buffer);
+    let len_bytes = read_u32(buf, record + off.image_name) as usize & 0xFFFF;
+    // Sanity: real image names are short, even-length UTF-16.
+    if raw == 0
+        || len_bytes == 0
+        || len_bytes > 512
+        || !len_bytes.is_multiple_of(2)
+        || len_bytes > written
+    {
+        return "".into();
+    }
+    // Candidate name locations, tried in order:
+    let candidates = [
+        raw.checked_sub(buf_base), // absolute pointer into our buffer
+        Some(raw),                 // offset from the table start
+        record.checked_add(raw),   // offset from the record start
+    ];
+    for start in candidates.into_iter().flatten() {
+        if start >= written || len_bytes > written - start {
+            continue;
+        }
+        let units: Vec<u16> = buf[start..start + len_bytes]
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|c| u16::from_ne_bytes(*c))
+            .collect();
+        let s = String::from_utf16_lossy(&units);
+        // Control characters would mean we misread the layout — reject.
+        if !s.chars().any(char::is_control) {
+            return s.into();
+        }
+    }
+    "".into()
 }
 
 /// Kernel-mode (non-idle) fraction of one logical CPU in [0, 100].
@@ -525,6 +686,31 @@ mod tests {
         CoreRaw { idle, kernel, user }
     }
 
+    /// Validates the self-relative ImageName interpretation against the
+    /// real kernel table: one live NtQuerySystemInformation call, decoded
+    /// names must match known system processes.
+    #[test]
+    fn live_kernel_table_yields_sane_image_names() {
+        let mut acc = CpuLoadAccountant::new();
+        let procs = acc.query_procs().expect("NtQuerySystemInformation");
+        assert!(procs.len() > 10, "suspiciously empty process table");
+        let named = procs.values().filter(|p| !p.name.is_empty()).count();
+        assert!(
+            named > procs.len() / 2,
+            "most processes must decode a name ({named}/{})",
+            procs.len()
+        );
+        // The kernel's own name for the System process (always present).
+        assert_eq!(&*procs.get(&4).expect("pid 4 present").name, "System");
+        for p in procs.values() {
+            assert!(
+                !p.name.chars().any(char::is_control),
+                "garbage: {:?}",
+                p.name
+            );
+        }
+    }
+
     #[test]
     fn idle_core_is_zero_and_busy_core_is_hundred() {
         // Window of exactly 1 s: each accumulator advanced by 1e7 (100 ns units).
@@ -585,15 +771,18 @@ mod tests {
                     create_time: 111,
                     kernel: 1e7 as i64,
                     user: 1e7 as i64,
+                    name: "stay.exe".into(),
                 },
             ),
-            // Same pid, different identity later → treated as new process.
+            // Same pid, different identity later → the old one exited, the
+            // new one is credited from its creation.
             (
                 200,
                 ProcRaw {
                     create_time: 222,
                     kernel: 5e7 as i64,
                     user: 0,
+                    name: "old.exe".into(),
                 },
             ),
         ]);
@@ -604,14 +793,16 @@ mod tests {
                     create_time: 111,
                     kernel: 3e7 as i64,
                     user: 3e7 as i64,
+                    name: "stay.exe".into(),
                 },
             ),
             (
                 200,
                 ProcRaw {
                     create_time: 999, // reused pid
-                    kernel: 6e7 as i64,
+                    kernel: 2e7 as i64,
                     user: 0,
+                    name: "new.exe".into(),
                 },
             ),
         ]);
@@ -620,7 +811,7 @@ mod tests {
             cores: vec![core(0, 0, 0)],
             procs: prev_procs,
         };
-        let cores = vec![core(0, 4e7 as i64, 4e7 as i64)];
+        let cores = vec![core(0, 6e7 as i64, 0)];
         let out = build_sample(&prev, &cores, &cur_procs, 4.0 /* s */);
 
         // Process 100: Δ(kernel+user) = 4e7 over 4 s on 1 core (cap = 4e7)
@@ -629,11 +820,149 @@ mod tests {
         assert_eq!(p100.pct, 100.0);
         assert_eq!(p100.total_time_100ns, 6e7 as u64);
 
-        // Reused pid has no matching predecessor → 0 % this tick.
+        // Reused pid: no matching predecessor → credited its full lifetime
+        // (2e7 of 4e7 capacity = 50 %), never a fabricated 0.
         let p200 = out.procs.get(&200).unwrap();
-        assert_eq!(p200.pct, 0.0);
+        assert_eq!(p200.pct, 50.0);
 
-        // One fully-busy core → global 100.
+        // One core busy 6e7 of 4e7-window capacity → global clamped to 100.
         assert_eq!(out.global_pct, 100.0);
+
+        // old.exe exited during the window and is named.
+        assert_eq!(out.exited_count, 1);
+        assert_eq!(out.exited_images.len(), 1);
+        assert_eq!(out.exited_images[0].name, "old.exe");
+    }
+
+    #[test]
+    fn process_born_inside_window_is_credited_from_creation() {
+        // 4 logical CPUs, 1 s window → capacity 4e7 per core-second.
+        let prev = PrevSample {
+            at: Instant::now(),
+            cores: vec![core(0, 0, 0); 4],
+            procs: HashMap::new(),
+        };
+        // New process burned 2 full core-seconds before its first sample.
+        let cur = HashMap::from([(
+            7,
+            ProcRaw {
+                create_time: 1,
+                kernel: 1e7 as i64,
+                user: 1e7 as i64,
+                name: "rustc.exe".into(),
+            },
+        )]);
+        let cores = vec![core(0, 1e7 as i64, 0); 4];
+        let out = build_sample(&prev, &cores, &cur, 1.0);
+        assert_eq!(out.procs.get(&7).unwrap().pct, 50.0);
+        // Busy cores account 4e7, live process accounts 2e7 → rest is
+        // unattributed accounting residue.
+        assert_eq!(out.unattributed_pct, 50.0);
+    }
+
+    #[test]
+    fn terminated_process_time_becomes_unattributed_and_named() {
+        // 1 core, 1 s window: total busy 1e7, of which the surviving
+        // process burned 0.2e7. The exited rustc.exe owned the rest.
+        let prev = PrevSample {
+            at: Instant::now(),
+            cores: vec![core(0, 0, 0)],
+            procs: HashMap::from([
+                (
+                    10,
+                    ProcRaw {
+                        create_time: 1,
+                        kernel: 0,
+                        user: 0,
+                        name: "rustc.exe".into(),
+                    },
+                ),
+                (
+                    11,
+                    ProcRaw {
+                        create_time: 1,
+                        kernel: 0,
+                        user: 0,
+                        name: "rustc.exe".into(),
+                    },
+                ),
+            ]),
+        };
+        let cur = HashMap::from([(
+            12,
+            ProcRaw {
+                create_time: 1,
+                kernel: 0.2e7 as i64,
+                user: 0,
+                name: "cargo.exe".into(),
+            },
+        )]);
+        let cores = vec![core(0, 1e7 as i64, 0)];
+        let out = build_sample(&prev, &cores, &cur, 1.0);
+        assert_eq!(out.procs.get(&12).unwrap().pct, 20.0);
+        assert_eq!(out.unattributed_pct, 80.0);
+        assert_eq!(out.exited_count, 2);
+        assert_eq!(out.exited_images.len(), 1);
+        assert_eq!(out.exited_images[0].name, "rustc.exe");
+        assert_eq!(out.exited_images[0].count, 2);
+    }
+
+    #[test]
+    fn image_name_decodes_all_buffer_conventions() {
+        let off = Offsets::get();
+        let rec = vec![0u8; off.min_size];
+        let name: Vec<u16> = "rustc.exe".encode_utf16().collect();
+
+        // Convention A: absolute pointer into the output buffer.
+        let base = 0x0001_0000_0000usize; // pretend buffer base address
+        let mut buf = rec.clone();
+        let abs_start = base + buf.len();
+        for u in &name {
+            buf.extend_from_slice(&u.to_ne_bytes());
+        }
+        let written = buf.len();
+        buf[off.image_name..off.image_name + 2]
+            .copy_from_slice(&((name.len() * 2) as u16).to_ne_bytes());
+        buf[off.image_name_buffer..off.image_name_buffer + std::mem::size_of::<usize>()]
+            .copy_from_slice(&abs_start.to_ne_bytes());
+        assert_eq!(
+            &*parse_image_name(&buf, base, 0, written, &off),
+            "rustc.exe",
+            "absolute-pointer convention"
+        );
+
+        // Convention B: offset relative to the record start (old builds).
+        let mut buf = rec.clone();
+        let name_off = buf.len();
+        for u in &name {
+            buf.extend_from_slice(&u.to_ne_bytes());
+        }
+        let written = buf.len();
+        buf[off.image_name..off.image_name + 2]
+            .copy_from_slice(&((name.len() * 2) as u16).to_ne_bytes());
+        buf[off.image_name_buffer..off.image_name_buffer + std::mem::size_of::<usize>()]
+            .copy_from_slice(&name_off.to_ne_bytes());
+        assert_eq!(
+            &*parse_image_name(&buf, base, 0, written, &off),
+            "rustc.exe",
+            "record-relative convention"
+        );
+
+        // Out-of-bounds pointer → empty, never garbage.
+        buf[off.image_name_buffer..off.image_name_buffer + std::mem::size_of::<usize>()]
+            .copy_from_slice(&999_999usize.to_ne_bytes());
+        assert_eq!(&*parse_image_name(&buf, base, 0, written, &off), "");
+
+        // Control characters (misread layout) → rejected.
+        let mut bad = rec;
+        bad[off.image_name..off.image_name + 2].copy_from_slice(&4u16.to_ne_bytes());
+        bad.truncate(off.min_size);
+        bad.extend_from_slice(&3u16.to_ne_bytes());
+        bad.extend_from_slice(&7u16.to_ne_bytes());
+        let bw = bad.len();
+        bad[off.image_name_buffer..off.image_name_buffer + std::mem::size_of::<usize>()]
+            .copy_from_slice(&off.min_size.to_ne_bytes());
+        assert_eq!(&*parse_image_name(&bad, base, 0, bw, &off), "");
+        let _ = rec; // rec cloned into bad above
     }
 }

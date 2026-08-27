@@ -1,5 +1,61 @@
 # Recent Activity
 
+## 2026-08-27 — CPU attribution completeness (terminated processes, interrupts)
+
+User report: while compiling in a terminal, the Processes page showed NO
+process owning the CPU load even when sorted by CPU. Root cause was in the
+time-based accountant (`win/cpu_load.rs::build_sample`), not in grouping:
+
+- **New processes got a fabricated 0 %** on their first sample
+  (`.map_or(0.0, ...)` when absent from the previous sample).
+- **Processes that terminated during the sampling window contributed their
+  whole in-window CPU time to NO row**: the per-process loop iterates the
+  CURRENT `SystemProcessInformation` table only, so a `rustc.exe` born and
+  dead inside one ~1 s window (typical for small crates) was never seen at
+  all. The global number (per-core accumulators) sees everything — hence
+  "high load, no responsible process".
+
+Fix (accounting completeness, all in `cpu_load.rs` + `win/sampler.rs`):
+1. Processes born inside the window are credited their accumulated time
+   since creation (which for them is exactly in-window time); reused pids
+   get the same treatment (create_time guard).
+2. `LoadSample` now carries `unattributed_pct` (global busy − Σ live-process
+   in-window time) plus `exited_count`/`exited_images` (image names parsed
+   from the NT table's `ImageName`, remembered from the previous sample).
+3. `sampler.rs` splits the residual: measured `% Interrupt Time` (new PDH
+   group `interrupt`, gated on CORE_PROCESS, counter path
+   `\Processor Information(_Total)\% Interrupt Time`) → "System Interrupts"
+   row (System/Windows group, TM parity); the rest → "Terminated processes
+   (N)" row (Background) with exited image names as a localized hover
+   tooltip. Both are SYNTHETIC `ProcessEntry` rows (`synthetic: bool` on the
+   model, sentinel pids `u32::MAX`/`u32::MAX-1`), appended AFTER
+   `refine_categories_and_group_apps` so the classifier never touches them;
+   they sort/heat-map/search like any row. Rows show only above 0.5 % with
+   a 5-tick hold-decay (`HeldPseudoRow`/`PseudoRowHold`) so bursty churn
+   does not flicker; a measured-low interrupt value hides immediately (only
+   UNKNOWN measurement decays — never read missing as zero).
+4. Actions are withheld: no context menu on synthetic rows; the header
+   aggregate comes from `snap.cpu.utilization_pct`, so no double counting;
+   users tab skips them (no session); details shows them like native TM
+   shows "System interrupts" (Del/kill guarded by `identity_is_live`).
+
+KEY EMPIRICAL FINDINGS (pinned by a live-kernel unit test
+`live_kernel_table_yields_sane_image_names`):
+- `SYSTEM_PROCESS_INFORMATION.ImageName.Buffer` is an **absolute pointer
+  into the output buffer** on this Windows build (NT writes the caller's
+  buffer in place — matches ReactOS `SpiCurrent->ImageName.Buffer =
+  (void*)(Current + CurrentSize)`); the Process-Hacker-style record-relative
+  interpretation decoded 0/285 names here. `parse_image_name` therefore
+  tries absolute / table-relative / record-relative candidates, all bounds-
+  and control-character-validated, empty name on any doubt. The i18n
+  `keys!` macro CANNOT take multi-line array entries (`expr` fragment
+  matcher breaks on the newline before `,`) — keep entries single-line.
+
+Tests: accountant unit tests (new-process credit, residual → exited
+names, buffer conventions, live table), sampler hold/decay + append tests,
+Processes-tab presentation tests (pseudo rows in the right groups, sorted
+by CPU, tooltip only for synthetic rows).
+
 ## 2026-08-27 — command lines, real CPU speed, high-CPU background visibility
 
 Three user-reported bugs fixed:
