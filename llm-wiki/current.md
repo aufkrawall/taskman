@@ -20,9 +20,11 @@ are accepted (Phases 2-6 open).
 - Performance CPU speed is measured (base × PDH `% Processor Performance`,
   demand-gated `CPU_SPEED`; sysinfo/CallNtPowerInformation CurrentMhz only a
   failure fallback — it reports the fixed nominal clock on modern Windows).
-- Processes page: busy external tasks (≥ 1 % CPU share, different image than
-  every family ancestor) absorbed into app families are promoted to visible
-  top-level Background rows incl. their descendants (`promote_busy_external_tasks`).
+- Processes page: Background/Windows groups are FLAT lists (TM parity — own
+  values, no nesting) so busy CLI/background work under console shells is
+  identifiable; busy external tasks (≥ 1 % CPU share, different image than
+  every family ancestor) absorbed into app families are additionally promoted
+  into Background (`promote_busy_external_tasks`).
 
 - Window placement: "Remember window size and position" checkbox in the
   settings dialog (the flag previously had no UI); maximized state is

@@ -683,16 +683,31 @@ fn build_display_rows(
         if group_collapsed[gi as usize] {
             continue;
         }
-        emit_tree(
-            &mut out,
-            &roots,
-            &children,
-            &subtree,
-            &subtree_count,
-            sort_col,
-            ascending,
-            expanded,
-        );
+        if cat == ProcCategory::App {
+            emit_tree(
+                &mut out,
+                &roots,
+                &children,
+                &subtree,
+                &subtree_count,
+                sort_col,
+                ascending,
+                expanded,
+            );
+        } else {
+            // Task Manager parity: Background/Windows groups are FLAT lists —
+            // every process is its own top-level row with its own values.
+            // Tree-nesting here would hide a busy build tool under its
+            // unexpanded console-shell row, making heavy CLI/background work
+            // unidentifiable.
+            let own: HashMap<u32, [f64; 4]> =
+                members.iter().map(|p| (p.pid, own_values(p))).collect();
+            let mut flat: Vec<&ProcessEntry> = members;
+            sort_entries(&mut flat, sort_col, ascending, &own);
+            for p in flat {
+                out.push(make_own_row(p));
+            }
+        }
     }
     normalize_heat(&mut out);
     out
@@ -965,6 +980,36 @@ fn make_flat_row(p: &ProcessEntry, subtree: &HashMap<u32, [f64; 4]>) -> DisplayR
     })
 }
 
+/// The process's own resource values (no subtree aggregation).
+fn own_values(p: &ProcessEntry) -> [f64; 4] {
+    [
+        p.cpu_pct as f64,
+        p.mem_bytes as f64,
+        p.disk_read_bps + p.disk_write_bps,
+        p.net_recv_bps.unwrap_or(0.0) + p.net_sent_bps.unwrap_or(0.0),
+    ]
+}
+
+/// Flat Background/Windows row: plain name, own values, no expand handle.
+fn make_own_row(p: &ProcessEntry) -> DisplayRow {
+    DisplayRow::Process(RowData {
+        pid: p.pid,
+        start_epoch_s: p.start_epoch_s,
+        depth: 0,
+        name: p.shown_name().to_string(),
+        icon_path: p
+            .exe_path
+            .as_ref()
+            .map(|x| x.to_string_lossy().into_owned()),
+        children: false,
+        values: own_values(p),
+        heat: [0.0; 4],
+        net_available: p.net_recv_bps.is_some() || p.net_sent_bps.is_some(),
+        suspended: p.status == ProcStatus::Suspended,
+        power_throttled: p.power_throttled == Some(true),
+    })
+}
+
 /// Build the parent→child topology used only by the Processes presentation.
 /// Cross-category edges are cut, and every independently discovered App root
 /// is detached from its real PPID so Explorer-launched programs stay peers.
@@ -1100,14 +1145,6 @@ fn subtree_values_and_counts<'a>(
     all: &[&'a ProcessEntry],
     children: &HashMap<u32, Vec<&'a ProcessEntry>>,
 ) -> (HashMap<u32, [f64; 4]>, HashMap<u32, u32>) {
-    let own = |p: &ProcessEntry| {
-        [
-            p.cpu_pct as f64,
-            p.mem_bytes as f64,
-            p.disk_read_bps + p.disk_write_bps,
-            p.net_recv_bps.unwrap_or(0.0) + p.net_sent_bps.unwrap_or(0.0),
-        ]
-    };
     let mut out: HashMap<u32, [f64; 4]> = HashMap::with_capacity(all.len());
     let mut counts: HashMap<u32, u32> = HashMap::with_capacity(all.len());
     let by_pid: HashMap<u32, &'a ProcessEntry> = all.iter().map(|p| (p.pid, *p)).collect();
@@ -1162,12 +1199,12 @@ fn subtree_values_and_counts<'a>(
                         })
                         .collect();
                     if pending.is_empty() {
-                        out.insert(pid, own(p));
+                        out.insert(pid, own_values(p));
                         counts.insert(pid, 1);
                         done.insert(pid);
                         in_progress.remove(&pid);
                     } else {
-                        stack.push(Frame::Combine(pid, kids, own(p)));
+                        stack.push(Frame::Combine(pid, kids, own_values(p)));
                         for k in pending {
                             stack.push(Frame::Enter(k.pid));
                         }
@@ -1177,7 +1214,7 @@ fn subtree_values_and_counts<'a>(
         }
     }
     for p in all {
-        out.entry(p.pid).or_insert_with(|| own(p));
+        out.entry(p.pid).or_insert_with(|| own_values(p));
         counts.entry(p.pid).or_insert(1);
     }
     (out, counts)
@@ -1663,6 +1700,37 @@ mod tests {
     }
 
     #[test]
+    fn background_group_renders_flat_so_busy_children_stay_visible() {
+        // A console-shell chain classified Background (e.g. cmd from the
+        // shell): the busy build tool must be its own row without needing to
+        // expand anything — this was the "100% CPU not identifiable" bug.
+        let mut shell = proc(1, Some(99), "cmd.exe", ProcCategory::Background);
+        shell.cpu_pct = 0.0;
+        let mut build = proc(2, Some(1), "cargo.exe", ProcCategory::Background);
+        build.cpu_pct = 6.0;
+        let mut leaf = proc(3, Some(2), "rustc.exe", ProcCategory::Background);
+        leaf.cpu_pct = 0.0;
+        let groups = [false; 3];
+        let rows = build_display_rows(
+            &snap_of(vec![shell, build, leaf]),
+            "",
+            0,
+            true,
+            &HashSet::new(),
+            &groups,
+        );
+        let bg = rows_in_group(&rows, 1);
+        // Name-sorted (default); every process is a flat top-level row.
+        assert_eq!(
+            bg.iter().map(|r| (r.pid, r.depth)).collect::<Vec<_>>(),
+            vec![(2, 0), (1, 0), (3, 0)]
+        );
+        let cargo = bg.iter().find(|r| r.pid == 2).unwrap();
+        assert_eq!(cargo.values[0], 6.0, "row shows the process's own CPU");
+        assert!(!cargo.children, "no expand handle needed to see it");
+    }
+
+    #[test]
     fn busy_external_helper_is_promoted_to_background() {
         let mut code = proc(1, None, "Code.exe", ProcCategory::App);
         code.has_window = true;
@@ -1739,10 +1807,12 @@ mod tests {
             &groups,
         );
         let bg = rows_in_group(&rows, 1);
+        // Background is flat: promoted task and its descendants are separate
+        // top-level rows.
         assert_eq!(
             bg.iter().map(|r| (r.pid, r.depth)).collect::<Vec<_>>(),
-            vec![(2, 0), (3, 1)],
-            "promoted task and its idle descendants form a Background subtree"
+            vec![(2, 0), (3, 0)],
+            "promoted task and its descendants are individually visible"
         );
         let apps = rows_in_group(&rows, 0);
         assert_eq!(apps.len(), 1);
