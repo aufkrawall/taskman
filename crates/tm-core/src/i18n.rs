@@ -270,6 +270,10 @@ keys! {
         "Running without administrator privileges; actions on elevated processes are limited."
     ],
     RestartElevated => ["Als Administrator neu starten", "Restart as administrator"],
+    StartElevated => [
+        "Immer mit Administratorrechten starten",
+        "Always start with administrator privileges"
+    ],
     RelaunchElevatedToast => [
         "Neustart mit Administratorrechten…",
         "Restarting with administrator privileges…"

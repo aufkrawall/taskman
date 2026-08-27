@@ -103,6 +103,27 @@ fn run_gui(mock: bool, args: &[String]) {
     }
     StartupTrace::mark("minimal_config_loaded");
 
+    // "Always start elevated" policy (Windows): when the persisted setting
+    // asks for it and this launch is unelevated, re-exec with the runas verb
+    // before any window exists. A declined UAC prompt degrades to a normal
+    // unelevated start (logged; retried on the next launch). Isolated
+    // test/config-override contexts never auto-elevate.
+    #[cfg(target_os = "windows")]
+    if settings.start_elevated
+        && std::env::var_os("TASKMAN_CONFIG_DIR").is_none()
+        && !tm_platform::win::is_elevated()
+    {
+        match tm_platform::win::relaunch_elevated_with_args(args) {
+            Ok(()) => {
+                tracing::info!("start_elevated: re-execing elevated");
+                std::process::exit(0);
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "auto-elevation failed; starting unelevated");
+            }
+        }
+    }
+
     if let Some(sz) = args
         .iter()
         .find_map(|a| a.strip_prefix("--size=").map(|s| s.to_string()))

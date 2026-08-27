@@ -67,13 +67,17 @@ public class WinEnum {
 "@
 [WinEnum]::SetProcessDPIAware() | Out-Null
 
-# Pre-seed settings so every tab screenshots at the same window size.
-$settingsDir = Join-Path $env:LOCALAPPDATA "taskman"
-New-Item -ItemType Directory -Force -Path $settingsDir | Out-Null
-$settingsPath = Join-Path $settingsDir "settings.json"
-$seed = @{ window_size = @($Width, $Height); theme = "Dark"; update_speed = "High"; graph_seconds = 60; always_on_top = $false }
-if ($Lang -ne "") { $seed.language = $Lang }
-$seed | ConvertTo-Json | Set-Content -Path $settingsPath -Encoding UTF8
+# Seed an ISOLATED config dir so every tab screenshots at the same window
+# size without touching the real config — and so the "always start
+# elevated" policy never fires (TASKMAN_CONFIG_DIR disables auto-elevation;
+# a UAC prompt or an exited early process would break this script).
+$configDir = Join-Path $env:TEMP "taskman-capture-config"
+New-Item -ItemType Directory -Force -Path $configDir | Out-Null
+$env:TASKMAN_CONFIG_DIR = $configDir
+$seed = "[general]`r`nwindow_size=$($Width)x$($Height)`r`ntheme=dark`r`nupdate_speed=high`r`ngraph_seconds=60`r`nalways_on_top=off"
+if ($Lang -ne "") { $seed += "`r`nlanguage=$($Lang.ToLowerInvariant())" }
+# Ascii (not UTF8) on purpose: no BOM, which the INI parser would choke on.
+Set-Content -Path (Join-Path $configDir "config.ini") -Value $seed -Encoding Ascii
 
 $p = Start-Process -FilePath $exe -ArgumentList "--tab=$Tab" -PassThru -WindowStyle Minimized
 $hwnd = [IntPtr]::Zero
