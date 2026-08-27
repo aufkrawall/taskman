@@ -1,11 +1,11 @@
 //! Details tab: dense flat process table with stable column ids.
 //!
-//! Sorting is keyed by [`ColumnId`], never by positional index. Missing
-//! telemetry renders as "—"/"Unknown", never as a fabricated zero.
+//! Sorting, visibility and ordering are keyed by [`ColumnId`], never by
+//! positional index. Missing telemetry renders as "—"/"Unknown", never as a
+//! fabricated zero.
 
 use eframe::egui;
 use std::cmp::Ordering as CmpOrdering;
-use std::collections::BTreeSet;
 use tm_core::format;
 use tm_core::i18n::{self, K};
 use tm_core::model::{PriorityClass, ProcStatus, ProcessEntry, UacVirtualization};
@@ -41,6 +41,57 @@ pub enum ColumnId {
 }
 
 impl ColumnId {
+    fn id(self) -> &'static str {
+        match self {
+            ColumnId::Name => "name",
+            ColumnId::Pid => "pid",
+            ColumnId::Status => "status",
+            ColumnId::User => "user",
+            ColumnId::Cpu => "cpu",
+            ColumnId::Memory => "mem",
+            ColumnId::Platform => "platform",
+            ColumnId::Elevated => "elevated",
+            ColumnId::Uac => "uac",
+            ColumnId::GpuUtil => "gpu",
+            ColumnId::GpuEngine => "gpuengine",
+            ColumnId::Priority => "priority",
+            ColumnId::Threads => "threads",
+            ColumnId::Handles => "handles",
+            ColumnId::CpuTime => "cputime",
+            ColumnId::Commit => "commit",
+            ColumnId::PeakMemory => "peakmem",
+            ColumnId::GpuDedicated => "gpudedicated",
+            ColumnId::GpuShared => "gpushared",
+            ColumnId::CommandLine => "commandline",
+        }
+    }
+
+    fn from_id(id: &str) -> Option<Self> {
+        Some(match id {
+            "name" => ColumnId::Name,
+            "pid" => ColumnId::Pid,
+            "status" => ColumnId::Status,
+            "user" => ColumnId::User,
+            "cpu" => ColumnId::Cpu,
+            "mem" => ColumnId::Memory,
+            "platform" => ColumnId::Platform,
+            "elevated" => ColumnId::Elevated,
+            "uac" => ColumnId::Uac,
+            "gpu" => ColumnId::GpuUtil,
+            "gpuengine" => ColumnId::GpuEngine,
+            "priority" => ColumnId::Priority,
+            "threads" => ColumnId::Threads,
+            "handles" => ColumnId::Handles,
+            "cputime" => ColumnId::CpuTime,
+            "commit" => ColumnId::Commit,
+            "peakmem" => ColumnId::PeakMemory,
+            "gpudedicated" => ColumnId::GpuDedicated,
+            "gpushared" => ColumnId::GpuShared,
+            "commandline" => ColumnId::CommandLine,
+            _ => return None,
+        })
+    }
+
     pub fn compare(self, a: &ProcessEntry, b: &ProcessEntry) -> CmpOrdering {
         match self {
             ColumnId::Name => cmp_ignore_case(a.shown_name(), b.shown_name()),
@@ -183,18 +234,48 @@ const COLUMNS: &[ColSpec] = &[
     ColSpec { cid: ColumnId::CommandLine, col: || TmColumn::text("commandline", "Command line", 360.0), default_visible: false },
 ];
 
+fn default_visible_order() -> Vec<ColumnId> {
+    COLUMNS
+        .iter()
+        .filter(|c| c.default_visible)
+        .map(|c| c.cid)
+        .collect()
+}
+
+fn spec_for(cid: ColumnId) -> Option<ColSpec> {
+    COLUMNS.iter().copied().find(|spec| spec.cid == cid)
+}
+
 pub struct State {
     pub sort_col: ColumnId,
     pub ascending: bool,
     pub filter: String,
     pub cache: Option<Cache>,
-    pub visible: BTreeSet<ColumnId>,
+    pub visible_order: Vec<ColumnId>,
     pub select_columns_open: bool,
 }
 
 impl State {
+    pub fn from_settings(settings: &tm_core::settings::Settings) -> Self {
+        let mut state = Self::default();
+        if let Some(saved) = settings.col_order.get("details") {
+            let mut order = Vec::with_capacity(saved.len());
+            for id in saved {
+                if let Some(cid) = ColumnId::from_id(id)
+                    && !order.contains(&cid)
+                {
+                    order.push(cid);
+                }
+            }
+            if !order.is_empty() {
+                state.visible_order = order;
+            }
+        }
+        state
+    }
+
     pub fn requires_gpu_telemetry(&self) -> bool {
-        self.visible.iter().any(|cid| {
+        self.visible_order.iter().any(|cid| {
             matches!(
                 cid,
                 ColumnId::GpuUtil
@@ -206,23 +287,42 @@ impl State {
     }
 
     pub fn is_visible(&self, cid: ColumnId) -> bool {
-        self.visible.contains(&cid)
+        self.visible_order.contains(&cid)
     }
 
-    pub fn set_visible(&mut self, cid: ColumnId, on: bool) {
-        if !on && self.visible.len() <= 1 && self.visible.contains(&cid) {
-            return;
+    pub fn set_visible(&mut self, cid: ColumnId, on: bool) -> bool {
+        let present = self.is_visible(cid);
+        if on == present {
+            return false;
+        }
+        if !on && self.visible_order.len() <= 1 {
+            return false;
         }
         if on {
-            self.visible.insert(cid);
+            self.visible_order.push(cid);
         } else {
-            self.visible.remove(&cid);
+            self.visible_order.retain(|c| *c != cid);
             if self.sort_col == cid {
-                self.sort_col = ColumnId::Name;
-                self.ascending = true;
+                let fallback = self.visible_order.first().copied().unwrap_or(ColumnId::Name);
+                self.sort_col = fallback;
+                self.ascending = !cid_is_numeric(fallback);
             }
         }
         self.invalidate();
+        true
+    }
+
+    pub fn move_visible(&mut self, cid: ColumnId, delta: isize) -> bool {
+        let Some(index) = self.visible_order.iter().position(|c| *c == cid) else {
+            return false;
+        };
+        let target = index as isize + delta;
+        if target < 0 || target >= self.visible_order.len() as isize {
+            return false;
+        }
+        self.visible_order.swap(index, target as usize);
+        self.invalidate();
+        true
     }
 
     pub fn lang_generation(&self) -> u64 {
@@ -241,11 +341,7 @@ impl Default for State {
             ascending: true,
             filter: String::new(),
             cache: None,
-            visible: COLUMNS
-                .iter()
-                .filter(|c| c.default_visible)
-                .map(|c| c.cid)
-                .collect(),
+            visible_order: default_visible_order(),
             select_columns_open: false,
         }
     }
@@ -371,10 +467,11 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
         app.scroll_to_pid = Some(focus.0.pid);
     }
 
-    let visible_cols: Vec<ColSpec> = COLUMNS
+    let visible_cols: Vec<ColSpec> = app
+        .details_state
+        .visible_order
         .iter()
-        .copied()
-        .filter(|c| app.details_state.is_visible(c.cid))
+        .filter_map(|cid| spec_for(*cid))
         .collect();
     let cols_rendered: Vec<TmColumn> = visible_cols.iter().map(|c| (c.col)()).collect();
     let mut table = app.make_table("details", cols_rendered);
@@ -395,6 +492,17 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
         });
     }
     let rows = &cache.as_ref().expect("cache").rows;
+
+    // Cross-tab navigation and letter-key selection can target a row that is
+    // not currently virtualized. Seed the table's next vertical offset from
+    // the model index so the destination is rendered immediately.
+    if let Some(pid) = app.scroll_to_pid
+        && let Some(index) = rows.iter().position(|row| row.pid == pid)
+    {
+        tablekit::request_scroll_to_row(ui.ctx(), "details", index);
+    }
+    handle_type_select(app, rows, ui.ctx());
+
     prepare_auto_fit_widths(ui, &mut table, &visible_cols, rows);
 
     let avail = tablekit::table_avail(ui);
@@ -403,8 +511,8 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
         .position(|c| c.cid == app.details_state.sort_col);
 
     // Capture the on-screen header bounds before the table consumes the body.
-    // Secondary-click in this area opens the same visibility dialog as the
-    // overflow command, matching Task Manager's column-header affordance.
+    // Secondary-click in this area opens the same visibility/order dialog as
+    // the overflow command.
     let header_min = ui.cursor().min;
     let header_rect = egui::Rect::from_min_size(
         header_min,
@@ -426,7 +534,7 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
                 let selected = app
                     .selected_process
                     .as_ref()
-                    .is_some_and(|sp| sp.pid == row.pid);
+                    .is_some_and(|sp| sp.pid == row.pid && sp.start_epoch_s == row.start_epoch_s);
                 let scroll_hint = app.scroll_to_pid.is_some_and(|p| p == row.pid);
                 let (rect, resp) = table.row(ui, &pal, selected);
                 if scroll_hint {
@@ -511,6 +619,37 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
     select_columns_dialog(app, &ctx_from(ui), &pal);
 }
 
+fn handle_type_select(app: &mut TaskManApp, rows: &[Row], ctx: &egui::Context) {
+    if app.details_state.select_columns_open
+        || app.show_settings
+        || app.run_dialog_open
+        || app.affinity_dialog.is_some()
+        || app.proc_props.is_some()
+    {
+        return;
+    }
+    let Some(ch) = search::list_type_select_char(ctx) else {
+        return;
+    };
+    let current = app.selected_process.as_ref().and_then(|selected| {
+        rows.iter().position(|row| {
+            row.pid == selected.pid && row.start_epoch_s == selected.start_epoch_s
+        })
+    });
+    let Some(index) = search::cycle_match_index(rows.len(), current, |index| {
+        search::starts_with_char(&rows[index].name, ch)
+    }) else {
+        return;
+    };
+    let row = &rows[index];
+    app.selected_process = Some(crate::app::ProcessIdentity {
+        pid: row.pid,
+        start_epoch_s: row.start_epoch_s,
+    });
+    app.scroll_to_pid = None;
+    tablekit::request_scroll_to_row(ctx, "details", index);
+}
+
 fn prepare_auto_fit_widths(
     ui: &egui::Ui,
     table: &mut tablekit::TmTable,
@@ -531,6 +670,17 @@ fn ctx_from(ui: &egui::Ui) -> egui::Context {
     ui.ctx().clone()
 }
 
+fn persist_column_layout(app: &mut TaskManApp) {
+    let ids = app
+        .details_state
+        .visible_order
+        .iter()
+        .map(|cid| cid.id().to_string())
+        .collect();
+    app.shared.settings.col_order.insert("details".into(), ids);
+    app.save_settings();
+}
+
 fn select_columns_dialog(app: &mut TaskManApp, ctx: &egui::Context, pal: &theme::Palette) {
     if !app.details_state.select_columns_open {
         return;
@@ -542,20 +692,81 @@ fn select_columns_dialog(app: &mut TaskManApp, ctx: &egui::Context, pal: &theme:
         .resizable(false)
         .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
         .show(ctx, |ui| {
-            ui.set_min_width(300.0);
+            // Compact width/spacing: the old dialog inherited a large blank
+            // client area even though every row is a short checkbox label.
+            ui.set_width(330.0);
+            ui.spacing_mut().item_spacing.y = 2.0;
+            let mut layout_changed = false;
             egui::ScrollArea::vertical()
-                .max_height(430.0)
+                .max_height(360.0)
                 .show(ui, |ui| {
-                    for spec in COLUMNS.iter().copied() {
-                        let mut on = app.details_state.is_visible(spec.cid);
+                    // Active columns are shown first in their actual render
+                    // order. Arrows change that order without coupling saved
+                    // widths/sorting to positional indexes.
+                    let active = app.details_state.visible_order.clone();
+                    for (index, cid) in active.iter().copied().enumerate() {
+                        let Some(spec) = spec_for(cid) else { continue };
+                        let mut remove = false;
+                        let mut move_up = false;
+                        let mut move_down = false;
+                        ui.horizontal(|ui| {
+                            let mut on = true;
+                            if crate::widgets::controls::checkbox(ui, &mut on, spec.label(), pal)
+                                .changed()
+                            {
+                                remove = !on;
+                            }
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    move_down = ui
+                                        .add_enabled(
+                                            index + 1 < active.len(),
+                                            egui::Button::new("↓")
+                                                .min_size(egui::vec2(28.0, 22.0)),
+                                        )
+                                        .clicked();
+                                    move_up = ui
+                                        .add_enabled(
+                                            index > 0,
+                                            egui::Button::new("↑")
+                                                .min_size(egui::vec2(28.0, 22.0)),
+                                        )
+                                        .clicked();
+                                },
+                            );
+                        });
+                        if remove {
+                            layout_changed |= app.details_state.set_visible(cid, false);
+                        } else if move_up {
+                            layout_changed |= app.details_state.move_visible(cid, -1);
+                        } else if move_down {
+                            layout_changed |= app.details_state.move_visible(cid, 1);
+                        }
+                    }
+
+                    let hidden: Vec<ColSpec> = COLUMNS
+                        .iter()
+                        .copied()
+                        .filter(|spec| !app.details_state.is_visible(spec.cid))
+                        .collect();
+                    if !hidden.is_empty() {
+                        ui.separator();
+                    }
+                    for spec in hidden {
+                        let mut on = false;
                         if crate::widgets::controls::checkbox(ui, &mut on, spec.label(), pal)
                             .changed()
+                            && on
                         {
-                            app.details_state.set_visible(spec.cid, on);
+                            layout_changed |= app.details_state.set_visible(spec.cid, true);
                         }
                     }
                 });
-            ui.add_space(8.0);
+            if layout_changed {
+                persist_column_layout(app);
+            }
+            ui.add_space(4.0);
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui.button(i18n::tr(K::Close)).clicked() {
                     app.details_state.select_columns_open = false;
@@ -1047,13 +1258,36 @@ mod tests {
     }
 
     #[test]
-    fn hiding_sorted_column_resets_to_name() {
+    fn hiding_sorted_column_resets_to_first_visible_column() {
         let mut s = State::default();
         s.set_visible(ColumnId::Priority, true);
         s.sort_col = ColumnId::Priority;
         s.set_visible(ColumnId::Priority, false);
         assert_eq!(s.sort_col, ColumnId::Name);
         assert!(s.ascending);
+    }
+
+    #[test]
+    fn visible_columns_can_be_reordered() {
+        let mut s = State::default();
+        assert_eq!(s.visible_order[0..2], [ColumnId::Name, ColumnId::Pid]);
+        assert!(s.move_visible(ColumnId::Pid, -1));
+        assert_eq!(s.visible_order[0..2], [ColumnId::Pid, ColumnId::Name]);
+        assert!(!s.move_visible(ColumnId::Pid, -1));
+    }
+
+    #[test]
+    fn saved_visibility_and_order_restore_by_stable_id() {
+        let mut settings = tm_core::settings::Settings::default();
+        settings.col_order.insert(
+            "details".into(),
+            vec!["pid".into(), "name".into(), "threads".into(), "future".into()],
+        );
+        let s = State::from_settings(&settings);
+        assert_eq!(
+            s.visible_order,
+            [ColumnId::Pid, ColumnId::Name, ColumnId::Threads]
+        );
     }
 
     #[test]
