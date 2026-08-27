@@ -15,7 +15,6 @@ use crate::action_executor::ActionExecutor;
 use crate::app_ui::apply_theme;
 use crate::widgets::tablekit::{TmColumn, TmTable};
 use eframe::egui;
-use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use tm_core::demand::TelemetryDemand;
@@ -228,7 +227,13 @@ pub struct TaskManApp {
 
     pub actions: Arc<dyn PlatformActions>,
     pub shared: SharedState,
-    pub history: VecDeque<HistoryPoint>,
+    /// Rolling tick history for all Performance-tab charts. MUST stay a
+    /// contiguous, append-ordered buffer (plain `Vec`): the Performance tab
+    /// slices it directly. The former `VecDeque` wrapped its ring buffer
+    /// after `history_cap` pop/push cycles, so the newest points moved into
+    /// the discarded back half of `as_slices()` and the graphs froze (only
+    /// rendering one stale-to-fresh blip per full ring cycle).
+    pub history: Vec<HistoryPoint>,
     /// Cap derived from the configured graph window at the fastest interval.
     /// Recomputed whenever `graph_seconds` changes (audit §10) — a wider
     /// window setting must never silently truncate the visible history.
@@ -401,7 +406,7 @@ impl TaskManApp {
                 sessions_fetch: InFlight::default(),
                 service_control: InFlight::default(),
             },
-            history: VecDeque::with_capacity(history_cap + 8),
+            history: Vec::with_capacity(history_cap + 8),
             history_cap,
             app_history_db,
             tab,
@@ -440,7 +445,7 @@ impl TaskManApp {
     /// actual repaint — the engine notifier guarantees freshness).
     fn poll_engine(&mut self) -> Option<Arc<Snapshot>> {
         let latest = self.engine.latest()?;
-        if latest.timestamp_ms != self.history.back().map_or(0, |h| h.t_ms) {
+        if latest.timestamp_ms != self.history.last().map_or(0, |h| h.t_ms) {
             let pt = HistoryPoint {
                 t_ms: latest.timestamp_ms,
                 cpu_total: latest.cpu.utilization_pct,
@@ -467,10 +472,7 @@ impl TaskManApp {
                     .map(|g| (g.id, g.util_pct, g.mem_used_bytes))
                     .collect(),
             };
-            if self.history.len() >= self.history_cap {
-                self.history.pop_front();
-            }
-            self.history.push_back(pt);
+            push_history_point(&mut self.history, self.history_cap, pt);
 
             // Feed the persistent app-history database.
             let interval_s = self.engine.interval().as_secs_f64().max(0.05);
@@ -593,7 +595,7 @@ impl eframe::App for TaskManApp {
         if want_cap != self.history_cap {
             self.history_cap = want_cap;
             while self.history.len() > want_cap {
-                self.history.pop_front();
+                self.history.remove(0);
             }
             tracing::debug!(cap = want_cap, "graph window changed; history resized");
         }
@@ -731,6 +733,17 @@ pub(crate) fn history_min_interval_s() -> f64 {
 /// configured speed. Split out for unit testing (audit §10).
 pub(crate) fn history_cap_for(seconds: u32, min_interval_s: f64) -> usize {
     ((seconds as f64 / min_interval_s).ceil() as usize).clamp(120, 1440)
+}
+
+/// Append one tick to the rolling history, honoring the cap. Split out so
+/// the ring-wrap regression test exercises the REAL retention code path.
+/// The history must stay a contiguous, append-ordered `Vec` — see the field
+/// doc on [`TaskManApp::history`].
+pub(crate) fn push_history_point(history: &mut Vec<HistoryPoint>, cap: usize, pt: HistoryPoint) {
+    if history.len() >= cap {
+        history.remove(0);
+    }
+    history.push(pt);
 }
 
 impl TaskManApp {
@@ -910,5 +923,35 @@ mod tests {
         // Non-divisible windows round UP so the requested span always fits
         // (240 s / 1.5 s = exactly 160 here).
         assert_eq!(history_cap_for(241, 1.5), 161);
+    }
+
+    /// Regression ("graphs stop updating"): the history was a `VecDeque`
+    /// whose ring buffer wraps after `history_cap` pop/push cycles. The
+    /// Performance tab then read only `as_slices().0` — the OLD half of the
+    /// ring — so charts froze on stale data for ~cap ticks per ring cycle,
+    /// with a single stale-to-fresh blip in between. History is a contiguous
+    /// `Vec` now; this pins that the newest point stays visible through
+    /// arbitrarily many retention cycles via the real retention code path.
+    #[test]
+    fn history_retention_keeps_newest_point_visible() {
+        let cap = history_cap_for(60, 0.5); // 120 — default window at fastest speed
+        let mut history: Vec<HistoryPoint> = Vec::with_capacity(cap + 8);
+        let ticks = cap as u64 * 3 + 8; // well past the former ring-wrap point
+        for t in 0..ticks {
+            push_history_point(
+                &mut history,
+                cap,
+                HistoryPoint {
+                    t_ms: t,
+                    ..Default::default()
+                },
+            );
+            let win = crate::tabs::performance::visible_slice(&history, 60);
+            assert_eq!(
+                win.last().map(|p| p.t_ms),
+                Some(t),
+                "newest point lost at tick {t}"
+            );
+        }
     }
 }

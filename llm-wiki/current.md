@@ -14,6 +14,17 @@ are accepted (Phases 2-6 open).
 
 ## Recently landed (2026-08-27)
 
+- Chart-freeze fix: `TaskManApp.history` was a `VecDeque` whose ring buffer
+  wraps after `history_cap` pop/push cycles; the Performance tab read only
+  `as_slices().0` (the OLD half), so all graphs and card sparklines froze on
+  stale data for ~cap ticks per ring cycle (one stale-to-fresh blip between
+  freezes) — "graphs sometimes stop updating". History is a contiguous,
+  append-ordered `Vec` now (see the field doc in `app.rs`; retention via
+  `push_history_point`, regression-tested). `visible_slice` also scans
+  backward from the newest sample instead of `partition_point`, and
+  `chart_multi`'s span math saturates, so a wall-clock step backward (NTP
+  correction after resume) degrades to a briefly-too-wide window instead of
+  a broken/frozen chart.
 - TM-parity resource sorting: the Apps/Background/Windows sections exist
   only when sorted by Name/Status; CPU/memory/disk/network sorts flatten
   everything into one globally sorted list (`sort_blocks_globally` reorders
