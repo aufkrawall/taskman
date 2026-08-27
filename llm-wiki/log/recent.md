@@ -1,5 +1,30 @@
 # Recent Activity
 
+## 2026-08-28 — Settings: restart-as-administrator (elevation section)
+
+New Windows-only "Administratorrechte" / "Administrator privileges" section
+in the settings dialog (inside the existing `Advanced` block, below the
+Task Manager replacement): shows whether THIS process is elevated and, when
+it is not, offers "Als Administrator neu starten" / "Restart as
+administrator". Wiring notes:
+
+- `PlatformActions::relaunch_elevated` (ShellExecuteExW "runas", already in
+  tm-platform) is dispatched through the shared action executor; on success
+  the job sends `ViewportCommand::Close` from the executor thread — safe
+  because `Context` is Send+Sync and commands queue into the next frame.
+  eframe 0.36 then exits the event loop gracefully (`should_close`), so
+  `on_exit` still flushes settings + app history. A declined UAC prompt
+  fails the job and surfaces the standard error toast; the single executor
+  worker also serializes repeat clicks, so two prompts cannot race.
+- Elevation cannot change within a running process, so `TaskManApp::new`
+  queries `actions.is_elevated()` exactly once (`is_elevated` field) instead
+  of touching the process token per frame.
+- Verified visually via `tools/capture.ps1` with `TASKMAN_DIALOG=settings`
+  (isolated config/data dirs); UAC consent path not exercisable headlessly.
+
+`build.py --check` (fmt + clippy `-D warnings` + workspace tests, incl.
+release build) passed.
+
 ## 2026-08-27 — Details column prefs persist; last resize handle grabbable
 
 Two user reports, both on tables:

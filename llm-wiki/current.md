@@ -1,6 +1,6 @@
 # Current State
 
-Last cross-checked: 2026-08-27
+Last cross-checked: 2026-08-28
 
 ## Summary
 
@@ -12,8 +12,15 @@ phases; **Phase 1 (correctness) is complete** — see
 `log/recent.md` and `known-debt.md` for what changed and which deviations
 are accepted (Phases 2-6 open).
 
-## Recently landed (2026-08-27)
+## Recently landed (2026-08-28)
 
+- Settings dialog (Windows, "Advanced" block) shows this process's
+  elevation status and, when unelevated, a "Restart as administrator"
+  button: `relaunch_elevated()` on the action executor, then a graceful
+  `ViewportCommand::Close` from the executor thread (eframe exits normally,
+  `on_exit` flushes); declined UAC surfaces the error toast. Elevation is
+  cached once at startup (`TaskManApp::is_elevated`). See
+  `log/recent.md` 2026-08-28.
 - Chart-freeze fix: `TaskManApp.history` was a `VecDeque` whose ring buffer
   wraps after `history_cap` pop/push cycles; the Performance tab read only
   `as_slices().0` (the OLD half), so all graphs and card sparklines froze on

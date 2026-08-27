@@ -538,6 +538,36 @@ pub fn settings_dialog(app: &mut TaskManApp, ctx: &egui::Context, _pal: &theme::
                     }
                     _ => {}
                 }
+
+                ui.add_space(10.0);
+                ui.heading(i18n::tr(K::ElevatedHeading));
+                ui.label(
+                    egui::RichText::new(if app.is_elevated {
+                        i18n::tr(K::ElevatedRunning)
+                    } else {
+                        i18n::tr(K::ElevatedNotRunning)
+                    })
+                    .size(11.5)
+                    .color(_pal.text_dim),
+                );
+                if !app.is_elevated && ui.button(i18n::tr(K::RestartElevated)).clicked() {
+                    let actions = app.actions.clone();
+                    let close_ctx = ctx.clone();
+                    app.run_action(
+                        ctx,
+                        || i18n::tr(K::RelaunchElevatedToast).to_string(),
+                        move || {
+                            actions.relaunch_elevated()?;
+                            // ShellExecuteExW returns only after UAC consent
+                            // succeeded and the elevated instance is spawning;
+                            // shut this one down gracefully so on_exit flushes
+                            // settings and history. A declined prompt surfaces
+                            // as an error toast instead.
+                            close_ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                            Ok(())
+                        },
+                    );
+                }
             }
 
             ui.add_space(14.0);

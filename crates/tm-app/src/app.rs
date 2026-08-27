@@ -226,6 +226,10 @@ pub struct TaskManApp {
     pub engine: EngineHandle,
 
     pub actions: Arc<dyn PlatformActions>,
+    /// Elevation status of THIS process; fixed at process creation, so it is
+    /// queried exactly once (settings dialog shows it and offers an elevated
+    /// restart).
+    pub is_elevated: bool,
     pub shared: SharedState,
     /// Rolling tick history for all Performance-tab charts. MUST stay a
     /// contiguous, append-ordered buffer (plain `Vec`): the Performance tab
@@ -338,6 +342,7 @@ impl TaskManApp {
         // ---- cheap platform surface only -----------------------------------
         // Never construct a collector just to get actions (§4.3).
         let actions: Arc<dyn PlatformActions> = Arc::from(tm_platform::create_actions());
+        let is_elevated = actions.is_elevated();
 
         // Frame-rate diagnostics: TASKMAN_FPS_PROBE=1 forces a continuous
         // frame stream and overlays/logs the achieved rate vs display Hz.
@@ -401,6 +406,7 @@ impl TaskManApp {
         Self {
             engine,
             actions,
+            is_elevated,
             shared: SharedState {
                 settings_writer: SettingsWriter::start(),
                 settings,
