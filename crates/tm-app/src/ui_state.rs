@@ -49,9 +49,11 @@ pub fn save() {
         tracing::warn!(error = %e, "failed to create window-state directory");
         return;
     }
-    let tmp = path.with_extension("ini.tmp");
+    // This tiny file is written only during a clean shutdown. Write it in
+    // place instead of rename-over-existing: `rename` replacement semantics
+    // differ by platform and can fail for an existing destination on Windows.
     let body = format!("# Native window placement.\nposition={},{}\n", pos[0], pos[1]);
-    if let Err(e) = std::fs::write(&tmp, body).and_then(|_| std::fs::rename(&tmp, &path)) {
+    if let Err(e) = std::fs::write(&path, body) {
         tracing::warn!(error = %e, "failed to save window position");
     }
 }
@@ -61,7 +63,10 @@ mod tests {
     #[test]
     fn position_format_allows_negative_monitor_coordinates() {
         let text = "position=-1920.5,42\n";
-        let value = text.lines().find_map(|line| line.strip_prefix("position=")).unwrap();
+        let value = text
+            .lines()
+            .find_map(|line| line.strip_prefix("position="))
+            .unwrap();
         let (x, y) = value.split_once(',').unwrap();
         assert_eq!(x.parse::<f32>().unwrap(), -1920.5);
         assert_eq!(y.parse::<f32>().unwrap(), 42.0);
