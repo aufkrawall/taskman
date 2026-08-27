@@ -84,6 +84,9 @@ pub struct State {
     pub expanded_users: HashSet<u32>,
     /// Collapsed group headers [Apps, Background, Windows].
     pub group_collapsed: [bool; 3],
+    /// Process selected by keyboard type-navigation and waiting to be scrolled
+    /// into the virtualized visible range.
+    scroll_to_pid: Option<u32>,
     cache: Option<Cache>,
     view_generation: u64,
 }
@@ -231,6 +234,30 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
     }
     let rows = cache.as_ref().expect("cache").rows.clone();
 
+    // Task-Manager-style type navigation: a plain letter selects the next
+    // visible process beginning with that letter. Repeated presses cycle and
+    // wrap in the exact flattened/sorted order shown on screen.
+    if let Some(initial) = search::list_initial(ui.ctx()) {
+        let selected = app.selected_process.as_ref().map(|p| p.pid);
+        if let Some(pid) = search::cycle_process_initial(
+            rows.iter().filter_map(|row| match row {
+                DisplayRow::Process(row) => Some((row.pid, row.name.as_str())),
+                DisplayRow::GroupHeader(..) => None,
+            }),
+            selected,
+            initial,
+        ) && let Some(row) = rows.iter().find_map(|row| match row {
+            DisplayRow::Process(row) if row.pid == pid => Some(row),
+            _ => None,
+        }) {
+            app.selected_process = Some(crate::app::ProcessIdentity {
+                pid: row.pid,
+                start_epoch_s: row.start_epoch_s,
+            });
+            app.processes_state.scroll_to_pid = Some(row.pid);
+        }
+    }
+
     let agg = Aggregates::from_snapshot(&snap);
     let aggs = agg.strings();
     prepare_auto_fit_widths(ui, &mut table, &rows, &aggs);
@@ -377,7 +404,12 @@ fn row_ui(
         .selected_process
         .as_ref()
         .is_some_and(|sp| sp.pid == row.pid);
+    let scroll_hint = app.processes_state.scroll_to_pid == Some(row.pid);
     let (rect, resp) = table.row(ui, pal, selected);
+    if scroll_hint {
+        resp.scroll_to_me(Some(egui::Align::Center));
+        app.processes_state.scroll_to_pid = None;
+    }
 
     // Chevron + icon + name.
     let expanded = app.processes_state.expanded.contains(&row.pid);
@@ -1201,19 +1233,10 @@ mod tests {
         let brave_helper = proc(4, Some(2), "brave.exe", ProcCategory::App);
         let mut code = proc(5, Some(1), "Code.exe", ProcCategory::App);
         code.has_window = true;
-        // Simulate the old collector result: every Explorer descendant was
-        // labeled App even though this tray helper has no foreground window.
         let tray = proc(6, Some(1), "trayhelper.exe", ProcCategory::App);
 
         let rows = build_display_rows(
-            &snap_of(vec![
-                explorer,
-                brave,
-                brave_window,
-                brave_helper,
-                code,
-                tray,
-            ]),
+            &snap_of(vec![explorer, brave, brave_window, brave_helper, code, tray]),
             "",
             0,
             true,
@@ -1229,37 +1252,27 @@ mod tests {
             })
             .unwrap();
         assert_eq!(app_total, 3);
-
         let app_rows: Vec<&RowData> = rows
             .iter()
             .skip_while(|r| !matches!(r, DisplayRow::GroupHeader(0, _)))
             .skip(1)
             .take_while(|r| !matches!(r, DisplayRow::GroupHeader(..)))
-            .filter_map(|r| match r {
-                DisplayRow::Process(d) => Some(d),
-                _ => None,
-            })
+            .filter_map(|r| match r { DisplayRow::Process(d) => Some(d), _ => None })
             .collect();
         assert_eq!(app_rows.len(), 3);
         assert!(app_rows.iter().all(|r| r.depth == 0));
-
         let explorer_row = app_rows.iter().find(|r| r.pid == 1).unwrap();
         assert_eq!(explorer_row.name, "explorer.exe");
         assert_eq!(explorer_row.values[0], 1.0);
-
         let brave_row = app_rows.iter().find(|r| r.pid == 2).unwrap();
         assert_eq!(brave_row.name, "brave.exe (3)");
         assert_eq!(brave_row.values[0], 9.0);
-
         let bg_pids: Vec<u32> = rows
             .iter()
             .skip_while(|r| !matches!(r, DisplayRow::GroupHeader(1, _)))
             .skip(1)
             .take_while(|r| !matches!(r, DisplayRow::GroupHeader(..)))
-            .filter_map(|r| match r {
-                DisplayRow::Process(d) => Some(d.pid),
-                _ => None,
-            })
+            .filter_map(|r| match r { DisplayRow::Process(d) => Some(d.pid), _ => None })
             .collect();
         assert_eq!(bg_pids, vec![6]);
     }
@@ -1272,30 +1285,11 @@ mod tests {
         notepad.has_window = true;
         let rows = build_display_rows(
             &snap_of(vec![terminal, shell, notepad]),
-            "",
-            0,
-            true,
-            &HashSet::new(),
-            &[false; 3],
+            "", 0, true, &HashSet::new(), &[false; 3],
         );
-        let app_total = rows
-            .iter()
-            .find_map(|r| match r {
-                DisplayRow::GroupHeader(0, n) => Some(*n),
-                _ => None,
-            })
-            .unwrap();
+        let app_total = rows.iter().find_map(|r| match r { DisplayRow::GroupHeader(0,n)=>Some(*n), _=>None }).unwrap();
         assert_eq!(app_total, 2);
-        let app_rows: Vec<&RowData> = rows
-            .iter()
-            .skip_while(|r| !matches!(r, DisplayRow::GroupHeader(0, _)))
-            .skip(1)
-            .take_while(|r| !matches!(r, DisplayRow::GroupHeader(..)))
-            .filter_map(|r| match r {
-                DisplayRow::Process(d) => Some(d),
-                _ => None,
-            })
-            .collect();
+        let app_rows: Vec<&RowData> = rows.iter().skip_while(|r| !matches!(r, DisplayRow::GroupHeader(0,_))).skip(1).take_while(|r| !matches!(r, DisplayRow::GroupHeader(..))).filter_map(|r| match r { DisplayRow::Process(d)=>Some(d), _=>None }).collect();
         assert_eq!(app_rows.len(), 2);
         assert!(app_rows.iter().all(|r| r.depth == 0));
         assert_eq!(app_rows.iter().find(|r| r.pid == 10).unwrap().name, "WindowsTerminal.exe (2)");
@@ -1304,204 +1298,59 @@ mod tests {
 
     #[test]
     fn process_tree_supports_three_plus_levels() {
-        let snap = snap_of(vec![
-            proc(1, None, "root", ProcCategory::App),
-            proc(2, Some(1), "child", ProcCategory::App),
-            proc(3, Some(2), "grandchild", ProcCategory::App),
-            proc(4, Some(3), "great", ProcCategory::App),
-        ]);
-        let mut expanded = HashSet::new();
-        expanded.extend([1u32, 2u32, 3u32]);
-        let groups = [false; 3];
-        let rows = build_display_rows(&snap, "", 0, true, &expanded, &groups);
-        let depths: Vec<usize> = rows
-            .iter()
-            .filter_map(|r| match r {
-                DisplayRow::Process(d) => Some(d.depth),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(depths, vec![0, 1, 2, 3]);
+        let snap = snap_of(vec![proc(1,None,"root",ProcCategory::App),proc(2,Some(1),"child",ProcCategory::App),proc(3,Some(2),"grandchild",ProcCategory::App),proc(4,Some(3),"great",ProcCategory::App)]);
+        let mut expanded=HashSet::new(); expanded.extend([1u32,2u32,3u32]);
+        let rows=build_display_rows(&snap,"",0,true,&expanded,&[false;3]);
+        let depths:Vec<usize>=rows.iter().filter_map(|r|match r{DisplayRow::Process(d)=>Some(d.depth),_=>None}).collect();
+        assert_eq!(depths,vec![0,1,2,3]);
     }
 
     #[test]
     fn process_tree_cycle_terminates_and_remains_visible() {
-        let snap = snap_of(vec![
-            proc(1, Some(2), "a", ProcCategory::Background),
-            proc(2, Some(1), "b", ProcCategory::Background),
-        ]);
-        let mut expanded = HashSet::new();
-        expanded.insert(1u32);
-        expanded.insert(2u32);
-        let groups = [false; 3];
-        let rows = build_display_rows(&snap, "", 0, true, &expanded, &groups);
-        let procs: Vec<u32> = rows
-            .iter()
-            .filter_map(|r| match r {
-                DisplayRow::Process(d) => Some(d.pid),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(procs.len(), 2);
-        assert_eq!(
-            procs.len(),
-            procs.iter().collect::<std::collections::HashSet<_>>().len()
-        );
+        let snap=snap_of(vec![proc(1,Some(2),"a",ProcCategory::Background),proc(2,Some(1),"b",ProcCategory::Background)]);
+        let mut expanded=HashSet::new(); expanded.insert(1); expanded.insert(2);
+        let rows=build_display_rows(&snap,"",0,true,&expanded,&[false;3]);
+        let procs:Vec<u32>=rows.iter().filter_map(|r|match r{DisplayRow::Process(d)=>Some(d.pid),_=>None}).collect();
+        assert_eq!(procs.len(),2); assert_eq!(procs.len(),procs.iter().collect::<std::collections::HashSet<_>>().len());
     }
 
     #[test]
     fn grouped_label_counts_entire_subtree() {
-        let snap = snap_of(vec![
-            proc(1, None, "Brave", ProcCategory::App),
-            proc(2, Some(1), "Child", ProcCategory::App),
-            proc(3, Some(2), "GC", ProcCategory::App),
-            proc(4, Some(3), "GGC", ProcCategory::App),
-        ]);
-        let groups = [false; 3];
-        let mut expanded = HashSet::new();
-        expanded.insert(1u32);
-        let rows = build_display_rows(&snap, "", 0, true, &expanded, &groups);
-        let labels: Vec<&str> = rows
-            .iter()
-            .filter_map(|r| match r {
-                DisplayRow::Process(d) => Some(d.name.as_str()),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(labels[0], "Brave (4)");
-        let collapsed = build_display_rows(&snap, "", 0, true, &HashSet::new(), &groups);
-        let collapsed_labels: Vec<&str> = collapsed
-            .iter()
-            .filter_map(|r| match r {
-                DisplayRow::Process(d) => Some(d.name.as_str()),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(collapsed_labels[0], "Brave (4)");
-        let mut e2 = HashSet::new();
-        e2.insert(1u32);
-        e2.insert(2u32);
-        let more = build_display_rows(&snap, "", 0, true, &e2, &groups);
-        let labels2: Vec<&str> = more
-            .iter()
-            .filter_map(|r| match r {
-                DisplayRow::Process(d) => Some(d.name.as_str()),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(labels2[0], "Brave (4)");
-        assert_eq!(labels2[1], "Child (3)");
+        let snap=snap_of(vec![proc(1,None,"Brave",ProcCategory::App),proc(2,Some(1),"Child",ProcCategory::App),proc(3,Some(2),"GC",ProcCategory::App),proc(4,Some(3),"GGC",ProcCategory::App)]);
+        let groups=[false;3]; let mut expanded=HashSet::new(); expanded.insert(1);
+        let rows=build_display_rows(&snap,"",0,true,&expanded,&groups);
+        let labels:Vec<&str>=rows.iter().filter_map(|r|match r{DisplayRow::Process(d)=>Some(d.name.as_str()),_=>None}).collect(); assert_eq!(labels[0],"Brave (4)");
+        let collapsed=build_display_rows(&snap,"",0,true,&HashSet::new(),&groups); let collapsed_labels:Vec<&str>=collapsed.iter().filter_map(|r|match r{DisplayRow::Process(d)=>Some(d.name.as_str()),_=>None}).collect(); assert_eq!(collapsed_labels[0],"Brave (4)");
+        let mut e2=HashSet::new(); e2.insert(1); e2.insert(2); let more=build_display_rows(&snap,"",0,true,&e2,&groups); let labels2:Vec<&str>=more.iter().filter_map(|r|match r{DisplayRow::Process(d)=>Some(d.name.as_str()),_=>None}).collect(); assert_eq!(labels2[0],"Brave (4)"); assert_eq!(labels2[1],"Child (3)");
     }
 
     #[test]
     fn subtree_aggregation_counts_all_descendants() {
-        let snap = snap_of(vec![
-            proc(1, None, "root", ProcCategory::Background),
-            proc(2, Some(1), "mid", ProcCategory::Background),
-            proc(3, Some(2), "leaf", ProcCategory::Background),
-        ]);
-        let all: Vec<&ProcessEntry> = snap.processes.iter().collect();
-        let grouping = derive_display_groups(&all);
-        let children = display_children_map(&all, &grouping.category, &grouping.app_roots);
-        let (st, cnt) = subtree_values_and_counts(&all, &children);
-        assert_eq!(st[&1][0], 6.0);
-        assert_eq!(st[&1][1], 6000.0);
-        assert_eq!(st[&2][0], 5.0);
-        assert_eq!(st[&3][0], 3.0);
-        assert_eq!((cnt[&3], cnt[&2], cnt[&1]), (1, 2, 3));
+        let snap=snap_of(vec![proc(1,None,"root",ProcCategory::Background),proc(2,Some(1),"mid",ProcCategory::Background),proc(3,Some(2),"leaf",ProcCategory::Background)]);
+        let all:Vec<&ProcessEntry>=snap.processes.iter().collect(); let grouping=derive_display_groups(&all); let children=display_children_map(&all,&grouping.category,&grouping.app_roots); let(st,cnt)=subtree_values_and_counts(&all,&children);
+        assert_eq!(st[&1][0],6.0); assert_eq!(st[&1][1],6000.0); assert_eq!(st[&2][0],5.0); assert_eq!(st[&3][0],3.0); assert_eq!((cnt[&3],cnt[&2],cnt[&1]),(1,2,3));
     }
 
     #[test]
     fn heat_normalizes_per_column_across_the_whole_model() {
-        let mut heavy = proc(10, None, "heavy.exe", ProcCategory::Background);
-        heavy.cpu_pct = 90.0;
-        heavy.mem_bytes = 800_000_000;
-        let mut light = proc(11, None, "light.exe", ProcCategory::Background);
-        light.cpu_pct = 9.0;
-        light.mem_bytes = 400_000_000;
-        let mut zero = proc(12, None, "zero.exe", ProcCategory::Background);
-        zero.cpu_pct = 0.0;
-        zero.mem_bytes = 100;
-
-        let groups = [false; 3];
-        let empty = HashSet::new();
-        let rows = build_display_rows(
-            &snap_of(vec![heavy, light, zero]),
-            "",
-            0,
-            true,
-            &empty,
-            &groups,
-        );
-        let heat: Vec<[f32; 4]> = rows
-            .iter()
-            .filter_map(|r| match r {
-                DisplayRow::Process(d) => Some(d.heat),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(
-            heat.iter().filter(|h| h[0] >= 1.0 - f32::EPSILON).count(),
-            1
-        );
-        assert_eq!(
-            heat.iter().filter(|h| h[1] >= 1.0 - f32::EPSILON).count(),
-            1
-        );
-        assert!(heat[0][0] > heat[1][0]);
-        assert!(heat[1][0] > heat[2][0] || heat[2][0] == 0.0);
+        let mut heavy=proc(10,None,"heavy.exe",ProcCategory::Background); heavy.cpu_pct=90.0; heavy.mem_bytes=800_000_000;
+        let mut light=proc(11,None,"light.exe",ProcCategory::Background); light.cpu_pct=9.0; light.mem_bytes=400_000_000;
+        let mut zero=proc(12,None,"zero.exe",ProcCategory::Background); zero.cpu_pct=0.0; zero.mem_bytes=100;
+        let rows=build_display_rows(&snap_of(vec![heavy,light,zero]),"",0,true,&HashSet::new(),&[false;3]);
+        let heat:Vec<[f32;4]>=rows.iter().filter_map(|r|match r{DisplayRow::Process(d)=>Some(d.heat),_=>None}).collect();
+        assert_eq!(heat.iter().filter(|h|h[0]>=1.0-f32::EPSILON).count(),1); assert_eq!(heat.iter().filter(|h|h[1]>=1.0-f32::EPSILON).count(),1); assert!(heat[0][0]>heat[1][0]); assert!(heat[1][0]>heat[2][0]||heat[2][0]==0.0);
     }
 
     #[test]
     fn missing_network_renders_unavailable_not_zero() {
-        let mut p = proc(9, None, "no-net", ProcCategory::Background);
-        p.net_recv_bps = None;
-        p.net_sent_bps = None;
-        let snap = snap_of(vec![p]);
-        let empty = HashSet::new();
-        let groups = [false; 3];
-        let rows = build_display_rows(&snap, "", 0, true, &empty, &groups);
-        let d = rows
-            .iter()
-            .find_map(|r| match r {
-                DisplayRow::Process(d) => Some(d.clone()),
-                _ => None,
-            })
-            .unwrap();
-        assert!(!d.net_available);
-        assert_eq!(d.heat[3], 0.0);
-        assert_eq!(
-            if d.net_available {
-                format::format_mbit(d.values[3])
-            } else {
-                "—".to_string()
-            },
-            "—"
-        );
+        let mut p=proc(9,None,"no-net",ProcCategory::Background); p.net_recv_bps=None; p.net_sent_bps=None; let snap=snap_of(vec![p]);
+        let rows=build_display_rows(&snap,"",0,true,&HashSet::new(),&[false;3]); let d=rows.iter().find_map(|r|match r{DisplayRow::Process(d)=>Some(d.clone()),_=>None}).unwrap(); assert!(!d.net_available); assert_eq!(d.heat[3],0.0); assert_eq!(if d.net_available{format::format_mbit(d.values[3])}else{"—".to_string()},"—");
     }
 
     #[test]
     fn search_matches_pid_and_publisher() {
-        let mut p = ProcessEntry::new(4242, "codestrings.exe");
-        p.company = Some("ExampleCorp GmbH".into());
-        let snap = snap_of(vec![p]);
-
-        for q in ["4242", "examplecorp", "codestrings"] {
-            let rows = build_display_rows(&snap, q, 0, true, &HashSet::new(), &[false; 3]);
-            let n = rows
-                .iter()
-                .filter(|r| matches!(r, DisplayRow::Process(_)))
-                .count();
-            assert_eq!(n, 1, "query '{q}' must find the process");
-        }
-        let rows = build_display_rows(
-            &snap_of(snap.processes.clone()),
-            "zzz-not-there",
-            0,
-            true,
-            &HashSet::new(),
-            &[false; 3],
-        );
-        assert!(rows.is_empty());
+        let mut p=ProcessEntry::new(4242,"codestrings.exe"); p.company=Some("ExampleCorp GmbH".into()); let snap=snap_of(vec![p]);
+        for q in ["4242","examplecorp","codestrings"] { let rows=build_display_rows(&snap,q,0,true,&HashSet::new(),&[false;3]); let n=rows.iter().filter(|r|matches!(r,DisplayRow::Process(_))).count(); assert_eq!(n,1,"query '{q}' must find the process"); }
+        let rows=build_display_rows(&snap_of(snap.processes.clone()),"zzz-not-there",0,true,&HashSet::new(),&[false;3]); assert!(rows.is_empty());
     }
 }
