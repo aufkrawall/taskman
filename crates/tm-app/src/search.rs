@@ -4,6 +4,7 @@
 //! that drift apart. The search hint promises "name, publisher or PID"; this
 //! module makes the code keep that promise.
 
+use eframe::egui;
 use tm_core::model::ProcessEntry;
 
 /// A normalized global search query.
@@ -46,6 +47,52 @@ impl Query {
             pid_s.as_str(),
         ])
     }
+}
+
+/// Return a single unmodified alphabetic key typed while no text editor owns
+/// keyboard focus. Processes/Details use this for native list type-selection;
+/// modifier shortcuts and typing into the global search must never leak into
+/// row selection.
+pub fn list_type_select_char(ctx: &egui::Context) -> Option<char> {
+    if ctx.wants_keyboard_input() {
+        return None;
+    }
+    ctx.input(|i| {
+        if i.modifiers.ctrl || i.modifiers.alt || i.modifiers.command {
+            return None;
+        }
+        i.events.iter().rev().find_map(|event| {
+            let egui::Event::Text(text) = event else {
+                return None;
+            };
+            let mut chars = text.chars();
+            let ch = chars.next()?;
+            (chars.next().is_none() && ch.is_alphabetic()).then_some(ch)
+        })
+    })
+}
+
+/// Case-insensitive first-character match used by list type-selection.
+pub fn starts_with_char(text: &str, ch: char) -> bool {
+    text.chars()
+        .next()
+        .is_some_and(|first| first.to_lowercase().eq(ch.to_lowercase()))
+}
+
+/// Find the next matching index after `current`, wrapping once. Repeated
+/// presses therefore cycle through all items beginning with the same letter.
+pub fn cycle_match_index(
+    len: usize,
+    current: Option<usize>,
+    mut matches: impl FnMut(usize) -> bool,
+) -> Option<usize> {
+    if len == 0 {
+        return None;
+    }
+    let start = current.map_or(0, |i| (i + 1) % len);
+    (0..len)
+        .map(|offset| (start + offset) % len)
+        .find(|&i| matches(i))
 }
 
 #[cfg(test)]
@@ -96,5 +143,23 @@ mod tests {
         // A text query must not be treated as a PID candidate prefix beyond
         // plain substring semantics (e.g. "abc" never matches any pid).
         assert!(!Query::new("xyz").matches_process(&proc(12345, "app.exe", None, "")));
+    }
+
+    #[test]
+    fn list_prefix_matching_is_case_insensitive() {
+        assert!(starts_with_char("Brave Browser", 'b'));
+        assert!(starts_with_char("éclair", 'É'));
+        assert!(!starts_with_char("Brave Browser", 'c'));
+    }
+
+    #[test]
+    fn cycle_match_advances_and_wraps() {
+        let names = ["Alpha", "Beta", "Bravo", "Charlie"];
+        let first = cycle_match_index(names.len(), None, |i| starts_with_char(names[i], 'b'));
+        assert_eq!(first, Some(1));
+        let second = cycle_match_index(names.len(), first, |i| starts_with_char(names[i], 'b'));
+        assert_eq!(second, Some(2));
+        let wrapped = cycle_match_index(names.len(), second, |i| starts_with_char(names[i], 'b'));
+        assert_eq!(wrapped, Some(1));
     }
 }
