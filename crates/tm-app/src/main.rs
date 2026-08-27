@@ -93,12 +93,15 @@ fn run_gui(mock: bool, args: &[String]) {
     let mut settings = tm_core::settings::Settings::load();
     StartupTrace::mark("minimal_config_loaded");
 
-    if let Some(sz) = args
+    let size_override = args
         .iter()
         .find_map(|a| a.strip_prefix("--size=").map(|s| s.to_string()))
-        .and_then(|s| parse_size_arg(&s))
-    {
+        .and_then(|s| parse_size_arg(&s));
+    if let Some(sz) = size_override {
         settings.window_size = sz;
+        // An explicit CLI size must be observable even if the previous run
+        // ended maximized. Keep the remembered position, but start normal.
+        settings.window_maximized = false;
     }
     tm_core::i18n::set_lang(settings.language.resolve());
     let window_size = [settings.window_size[0], settings.window_size[1]];
@@ -114,16 +117,25 @@ fn run_gui(mock: bool, args: &[String]) {
     let title = tm_core::i18n::tr(tm_core::i18n::K::WindowTitle).to_string();
 
     let options = |renderer: eframe::Renderer| {
+        let mut viewport = eframe::egui::ViewportBuilder::default()
+            .with_title(title.clone())
+            // Wayland compositors use app_id to associate windows with
+            // the matching desktop entry/icon and group them correctly.
+            .with_app_id(APP_ID)
+            .with_inner_size(window_size)
+            .with_min_inner_size([720.0, 480.0])
+            .with_icon(icon_data());
+        if settings.remember_window {
+            if let Some(pos) = settings.window_position {
+                viewport = viewport.with_position(pos);
+            }
+            if settings.window_maximized {
+                viewport = viewport.with_maximized(true);
+            }
+        }
         let mut opts = eframe::NativeOptions {
             renderer,
-            viewport: eframe::egui::ViewportBuilder::default()
-                .with_title(title.clone())
-                // Wayland compositors use app_id to associate windows with
-                // the matching desktop entry/icon and group them correctly.
-                .with_app_id(APP_ID)
-                .with_inner_size(window_size)
-                .with_min_inner_size([720.0, 480.0])
-                .with_icon(icon_data()),
+            viewport,
             ..Default::default()
         };
         #[cfg(feature = "wgpu")]
