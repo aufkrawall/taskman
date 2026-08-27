@@ -379,6 +379,15 @@ impl TaskManApp {
         let history_path = tm_core::settings::taskman_data_dir().join("app-history.json");
         let app_history_db = tm_core::AppHistoryDb::open_deferred(history_path);
 
+        // Details tab column visibility/order live in the settings file;
+        // apply them before the first frame so telemetry demand and the
+        // first render already match the user's saved layout.
+        let mut details_state = crate::tabs::details::State::default();
+        details_state.apply_saved_prefs(
+            settings.col_visible.get("details"),
+            settings.col_order.get("details").map(Vec::as_slice),
+        );
+
         // Start page: CLI/diagnostic override wins, otherwise the setting.
         let tab = initial_tab
             .as_deref()
@@ -424,7 +433,7 @@ impl TaskManApp {
             processes_state: crate::tabs::processes::State::new(),
             perf_selected_key,
             perf_jump_to: None,
-            details_state: Default::default(),
+            details_state,
             selected_process: None,
             selected_user: None,
             services_selected_name: None,

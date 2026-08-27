@@ -5,7 +5,7 @@
 
 use eframe::egui;
 use std::cmp::Ordering as CmpOrdering;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use tm_core::format;
 use tm_core::i18n::{self, K};
 use tm_core::model::{PriorityClass, ProcStatus, ProcessEntry, UacVirtualization};
@@ -137,6 +137,11 @@ struct ColSpec {
 }
 
 impl ColSpec {
+    /// Stable schema id (the `TmColumn` id widths are persisted under).
+    fn id(self) -> &'static str {
+        (self.col)().id
+    }
+
     fn label(self) -> &'static str {
         match self.cid {
             ColumnId::Name => i18n::tr(K::ColName),
@@ -273,6 +278,22 @@ fn spec_for(cid: ColumnId) -> ColSpec {
         .expect("known Details column")
 }
 
+fn id_of(cid: ColumnId) -> &'static str {
+    spec_for(cid).id()
+}
+
+fn cid_from_id(id: &str) -> Option<ColumnId> {
+    COLUMNS
+        .iter()
+        .find(|spec| spec.id() == id)
+        .map(|spec| spec.cid)
+}
+
+/// Built-in display order, for order-persistence diffing.
+fn default_order_ids() -> Vec<String> {
+    COLUMNS.iter().map(|spec| spec.id().to_string()).collect()
+}
+
 pub struct State {
     pub sort_col: ColumnId,
     pub ascending: bool,
@@ -321,6 +342,88 @@ impl State {
             }
         }
         self.invalidate();
+    }
+
+    /// Restore persisted user preferences: visibility overrides
+    /// (`column id -> on`; absent ids keep their built-in default) and
+    /// display order (ids unknown to this build are skipped; columns missing
+    /// from the file keep their built-in position). Guards keep the table
+    /// usable even for a hand-edited file: at least one column stays visible
+    /// and the sort column is always visible.
+    pub fn apply_saved_prefs(
+        &mut self,
+        visible: Option<&BTreeMap<String, bool>>,
+        order: Option<&[String]>,
+    ) {
+        if let Some(order) = order {
+            let mut next: Vec<ColumnId> = Vec::with_capacity(order.len());
+            for id in order {
+                if let Some(cid) = cid_from_id(id)
+                    && !next.contains(&cid)
+                {
+                    next.push(cid);
+                }
+            }
+            for spec in COLUMNS {
+                if !next.contains(&spec.cid) {
+                    next.push(spec.cid);
+                }
+            }
+            self.order = next;
+        }
+        if let Some(visible) = visible {
+            let mut next: BTreeSet<ColumnId> = COLUMNS
+                .iter()
+                .filter(|c| c.default_visible)
+                .map(|c| c.cid)
+                .collect();
+            for (id, on) in visible {
+                match cid_from_id(id) {
+                    Some(cid) if *on => {
+                        next.insert(cid);
+                    }
+                    Some(cid) => {
+                        next.remove(&cid);
+                    }
+                    None => {}
+                }
+            }
+            // A hand-edited file may hide everything; keep the defaults
+            // rather than rendering an empty table.
+            if !next.is_empty() {
+                self.visible = next;
+            }
+        }
+        if !self.visible.contains(&self.sort_col) {
+            self.sort_col = self
+                .order
+                .iter()
+                .copied()
+                .find(|candidate| self.visible.contains(candidate))
+                .unwrap_or(ColumnId::Name);
+            self.ascending = true;
+        }
+        self.invalidate();
+    }
+
+    /// Visibility entries that differ from the built-in defaults, for
+    /// persistence (empty = nothing to store).
+    pub fn saved_visibility(&self) -> BTreeMap<String, bool> {
+        COLUMNS
+            .iter()
+            .filter(|c| self.visible.contains(&c.cid) != c.default_visible)
+            .map(|c| (c.id().to_string(), self.visible.contains(&c.cid)))
+            .collect()
+    }
+
+    /// Current display order as stable ids (for persistence).
+    pub fn saved_order(&self) -> Vec<String> {
+        self.order
+            .iter()
+            .copied()
+            .map(id_of)
+            .map(str::to_string)
+            .collect()
     }
 
     fn ordered_visible(&self) -> Vec<ColSpec> {
@@ -705,6 +808,34 @@ fn ctx_from(ui: &egui::Ui) -> egui::Context {
     ui.ctx().clone()
 }
 
+/// Copy the current details column preferences into the settings snapshot
+/// and queue a debounced autosave — the same path as column widths. The
+/// order is only stored while it differs from the built-in order, and
+/// visibility entries matching the defaults are dropped, so fresh installs
+/// and never-touched tables keep following schema changes.
+fn persist_column_prefs(app: &mut TaskManApp) {
+    const TABLE: &str = "details";
+    let visibility = app.details_state.saved_visibility();
+    if visibility.is_empty() {
+        app.shared.settings.col_visible.remove(TABLE);
+    } else {
+        app.shared
+            .settings
+            .col_visible
+            .insert(TABLE.to_string(), visibility);
+    }
+    if app.details_state.saved_order() == default_order_ids() {
+        app.shared.settings.col_order.remove(TABLE);
+    } else {
+        let order = app.details_state.saved_order();
+        app.shared
+            .settings
+            .col_order
+            .insert(TABLE.to_string(), order);
+    }
+    app.save_settings();
+}
+
 fn select_columns_dialog(app: &mut TaskManApp, ctx: &egui::Context, pal: &theme::Palette) {
     if !app.details_state.select_columns_open {
         return;
@@ -734,6 +865,7 @@ fn select_columns_dialog(app: &mut TaskManApp, ctx: &egui::Context, pal: &theme:
                                 .changed()
                             {
                                 app.details_state.set_visible(cid, on);
+                                persist_column_prefs(app);
                             }
                             ui.with_layout(
                                 egui::Layout::right_to_left(egui::Align::Center),
@@ -755,6 +887,7 @@ fn select_columns_dialog(app: &mut TaskManApp, ctx: &egui::Context, pal: &theme:
                                         .clicked()
                                         {
                                             app.details_state.move_visible(cid, 1);
+                                            persist_column_prefs(app);
                                         }
                                         if crate::widgets::controls::icon_button(
                                             ui,
@@ -766,6 +899,7 @@ fn select_columns_dialog(app: &mut TaskManApp, ctx: &egui::Context, pal: &theme:
                                         .clicked()
                                         {
                                             app.details_state.move_visible(cid, -1);
+                                            persist_column_prefs(app);
                                         }
                                     }
                                 },
@@ -1352,6 +1486,80 @@ mod tests {
         assert!(!s.is_visible(ColumnId::Priority));
         assert!(!s.is_visible(ColumnId::GpuDedicated));
         assert!(s.is_visible(ColumnId::Name));
+    }
+
+    #[test]
+    fn visibility_prefs_roundtrip_through_defaults() {
+        let mut s = State::default();
+        // Showing a default-hidden advanced column must persist…
+        s.set_visible(ColumnId::Threads, true);
+        assert_eq!(s.saved_visibility().get("threads"), Some(&true));
+        let mut restored = State::default();
+        restored.apply_saved_prefs(Some(&s.saved_visibility()), None);
+        assert!(restored.is_visible(ColumnId::Threads));
+        // …and so must hiding a default-visible one.
+        s.set_visible(ColumnId::Uac, false);
+        let vis = s.saved_visibility();
+        assert_eq!(vis.get("uac"), Some(&false));
+        // Unchanged columns produce no entry.
+        assert!(!vis.contains_key("name"));
+        let mut restored2 = State::default();
+        restored2.apply_saved_prefs(Some(&vis), None);
+        assert!(!restored2.is_visible(ColumnId::Uac));
+        assert!(restored2.is_visible(ColumnId::Name));
+    }
+
+    #[test]
+    fn order_prefs_survive_and_reorder() {
+        let mut s = State::default();
+        assert_eq!(s.saved_order(), default_order_ids(), "untouched = no entry");
+        assert!(s.move_visible(ColumnId::Pid, -1));
+        let order = s.saved_order();
+        assert_ne!(order, default_order_ids());
+        assert_eq!(order[0], "pid");
+        let mut restored = State::default();
+        restored.apply_saved_prefs(None, Some(&order));
+        assert_eq!(restored.saved_order(), order);
+        assert_eq!(restored.ordered_visible()[0].cid, ColumnId::Pid);
+    }
+
+    #[test]
+    fn saved_order_skips_unknown_ids_and_appends_new_columns() {
+        let mut s = State::default();
+        let order = vec![
+            "pid".to_string(),
+            "name".to_string(),
+            "future_column".to_string(),
+        ];
+        s.apply_saved_prefs(None, Some(&order));
+        assert_eq!(s.ordered_visible()[0].cid, ColumnId::Pid);
+        assert_eq!(s.ordered_visible()[1].cid, ColumnId::Name);
+        // Columns missing from the file keep their built-in relative order.
+        let rest: Vec<_> = s.order[2..].iter().copied().map(id_of).collect();
+        assert_eq!(rest, default_order_ids()[2..]);
+    }
+
+    #[test]
+    fn saved_prefs_never_empties_the_table_or_sorts_by_hidden_column() {
+        // A hand-edited file that hides every column falls back to defaults.
+        let all_hidden: BTreeMap<String, bool> = COLUMNS
+            .iter()
+            .map(|c| (c.id().to_string(), false))
+            .collect();
+        let mut s = State::default();
+        s.apply_saved_prefs(Some(&all_hidden), None);
+        assert!(!s.visible.is_empty(), "defaults survive an empty override");
+
+        // Hiding the current sort column via prefs falls back to a visible
+        // one, same as hiding it through the dialog.
+        let mut s2 = State {
+            sort_col: ColumnId::Uac,
+            ..State::default()
+        };
+        s2.apply_saved_prefs(Some(&BTreeMap::from([("uac".to_string(), false)])), None);
+        assert!(!s2.is_visible(ColumnId::Uac));
+        assert!(s2.is_visible(s2.sort_col));
+        assert!(s2.ascending);
     }
 
     #[test]

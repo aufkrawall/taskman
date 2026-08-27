@@ -1,5 +1,45 @@
 # Recent Activity
 
+## 2026-08-27 — Details column prefs persist; last resize handle grabbable
+
+Two user reports, both on tables:
+
+1. **Column visibility/order was session-only.** The Select-columns dialog
+   state (`details::State.visible`/`order`) never reached `config.ini`.
+   Fixed with two new settings fields: `col_visible` (`table -> id -> on`,
+   ONLY entries differing from the built-in default, so future builds'
+   new columns keep their designed default) and `col_order` (`table ->
+   [ids]`, stored only while it differs from the built-in order). INI
+   schema: `[columns.<table>.visible] <id>=0|1` and
+   `[columns.<table>.order] order=<id>,<id>,...` — parsed under the
+   existing `columns.*` prefix logic via `rsplit_once('.')`. Applied at
+   startup in `TaskManApp::new` (`details::State::apply_saved_prefs`, with
+   guards: never empty the table, sort column always visible, unknown ids
+   skipped, missing ids keep built-in position); written back by
+   `details::persist_column_prefs` on every dialog mutation through the
+   usual debounced `save_settings()` path. Hidden GPU columns also lower
+   telemetry demand correctly from startup.
+
+2. **Last column's resize handle ungrabbable when the table is wider than
+   the window.** egui hit-testing clips widget rects to the scroll area's
+   clip rect; the header scroll area had NO content margin while the body
+   reserves `BODY_PAD_RIGHT` (10 px), so fully scrolled right the last
+   boundary sat flush at the viewport edge — only the inner ~6 px of the
+   ±6 px handle were clickable, effectively unreachable. Fix: the header
+   gets the same right `content_margin` as the body (both in
+   `scrolled_table` and `scrolled_rows`), which also aligns header/body
+   far-right geometry. Regression test
+   `last_boundary_is_grabbable_when_scrolled_fully_right` drives the real
+   `scrolled_rows` path (priming the stored body offset BETWEEN passes —
+   egui pass memory starts lazily, and `insert_temp` is type-generic:
+   an untyped `10_000.0` literal silently stored as f64 and was never read
+   back by the f32 reader). Verified the test fails without the fix.
+
+Tests: settings roundtrip + new-section parsing; details prefs
+roundtrip/reorder/guards; tablekit last-handle drag. `build.py --check`
+(fmt + clippy `-D warnings` + workspace tests) passed; release build
+packaged.
+
 ## 2026-08-27 — Performance chart freeze (VecDeque ring wrap)
 
 User report: sometimes the Performance graphs / card sparkline previews

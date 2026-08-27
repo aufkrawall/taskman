@@ -12,6 +12,13 @@
 //! [columns.processes]
 //! name=340
 //! cpu=110
+//!
+//! [columns.details.visible]
+//! threads=1
+//! uac=0
+//!
+//! [columns.details.order]
+//! order=pid,name,cpu
 //! ```
 //!
 //! Rules:
@@ -110,6 +117,14 @@ pub struct Settings {
     /// User-resized column widths per table, keyed by stable column id:
     /// `table id -> column id -> width`.
     pub col_widths: BTreeMap<String, BTreeMap<String, f32>>,
+    /// Column visibility overrides per table (`table id -> column id -> on`).
+    /// Only entries that differ from the table's built-in default visibility
+    /// are stored, so columns introduced by later builds keep their designed
+    /// default for users who never touched them.
+    pub col_visible: BTreeMap<String, BTreeMap<String, bool>>,
+    /// User-defined column display order per table (stable column ids).
+    /// Absent or empty means the built-in order.
+    pub col_order: BTreeMap<String, Vec<String>>,
     /// Width of the Performance tab's left card column.
     pub perf_card_width: f32,
     /// Performance CPU graph mode: "overall" | "logical".
@@ -133,6 +148,8 @@ impl Default for Settings {
             sidebar_collapsed: false,
             language: Default::default(),
             col_widths: BTreeMap::new(),
+            col_visible: BTreeMap::new(),
+            col_order: BTreeMap::new(),
             perf_card_width: 252.0,
             cpu_graph_mode: "overall".into(),
             show_kernel_times: false,
@@ -197,7 +214,12 @@ fn unescape_ini(v: &str) -> String {
     out
 }
 
-fn render_ini(body: String, columns: &BTreeMap<String, BTreeMap<String, f32>>) -> String {
+fn render_ini(
+    body: String,
+    columns: &BTreeMap<String, BTreeMap<String, f32>>,
+    visible: &BTreeMap<String, BTreeMap<String, bool>>,
+    order: &BTreeMap<String, Vec<String>>,
+) -> String {
     let mut out = String::with_capacity(512);
     out.push_str("# taskman configuration — edited values apply on the next start.\n");
     out.push_str("# Delete this file to reset all settings to their defaults.\n\n");
@@ -210,6 +232,26 @@ fn render_ini(body: String, columns: &BTreeMap<String, BTreeMap<String, f32>>) -
         for (col, w) in cols {
             out.push_str(&format!("{}={}\n", escape_ini(col), fmt_width(*w)));
         }
+    }
+    for (table, cols) in visible {
+        if cols.is_empty() {
+            continue;
+        }
+        out.push_str(&format!(
+            "\n[columns.{table}.visible]\n# column id = 0 (hidden) | 1 (shown)\n"
+        ));
+        for (col, on) in cols {
+            out.push_str(&format!("{}={}\n", escape_ini(col), i8::from(*on)));
+        }
+    }
+    for (table, ids) in order {
+        if ids.is_empty() {
+            continue;
+        }
+        out.push_str(&format!(
+            "\n[columns.{table}.order]\norder={}\n",
+            escape_ini(&ids.join(","))
+        ));
     }
     out
 }
@@ -441,25 +483,52 @@ impl Settings {
         }
         s.show_kernel_times = b("general", "show_kernel_times", s.show_kernel_times);
 
-        // Column widths, ID-keyed schema: `[columns.<table>] <col>=<width>`.
-        // Unknown future column ids are preserved verbatim (harmless) rather
-        // than corrupting anything.
+        // Column preferences, ID-keyed schema: `[columns.<table>]
+        // <col>=<width>`, `[columns.<table>.visible] <col>=0|1` and
+        // `[columns.<table>.order] order=<col>,<col>,...`. Unknown future
+        // column ids are preserved verbatim (harmless) rather than
+        // corrupting anything.
         let mut saw_legacy = false;
         for ((section, key), value) in &kv {
-            if let Some(table) = section.strip_prefix("columns.") {
-                if table == "columns" {
-                    continue;
-                }
-                if let Some(w) = parse_f32(value)
-                    && (40.0..=1200.0).contains(&w)
-                {
-                    s.col_widths
-                        .entry(table.to_string())
-                        .or_default()
-                        .insert(key.clone(), w);
-                }
-            } else if section == "columns" {
+            if section == "columns" {
                 saw_legacy = true;
+            } else if let Some(rest) = section.strip_prefix("columns.") {
+                match rest.rsplit_once('.') {
+                    Some((table, "visible")) => {
+                        if let Some(on) = parse_bool(value) {
+                            s.col_visible
+                                .entry(table.to_string())
+                                .or_default()
+                                .insert(key.clone(), on);
+                        }
+                    }
+                    Some((table, "order")) => {
+                        if key == "order" {
+                            let ids: Vec<String> = value
+                                .split(',')
+                                .map(str::trim)
+                                .filter(|id| !id.is_empty())
+                                .map(str::to_owned)
+                                .collect();
+                            if !ids.is_empty() {
+                                s.col_order.insert(table.to_string(), ids);
+                            }
+                        }
+                    }
+                    // Plain `[columns.<table>]`: widths (a table slug never
+                    // contains a dot, so the fallthrough arm is exact).
+                    _ => {
+                        if rest != "columns"
+                            && let Some(w) = parse_f32(value)
+                            && (40.0..=1200.0).contains(&w)
+                        {
+                            s.col_widths
+                                .entry(rest.to_string())
+                                .or_default()
+                                .insert(key.clone(), w);
+                        }
+                    }
+                }
             }
         }
 
@@ -552,7 +621,10 @@ impl Settings {
             body.push_str(&format!("{k}={}\n", escape_ini(v)));
         }
         let tmp = path.with_extension("ini.tmp");
-        std::fs::write(&tmp, render_ini(body, &self.col_widths))?;
+        std::fs::write(
+            &tmp,
+            render_ini(body, &self.col_widths, &self.col_visible, &self.col_order),
+        )?;
         // Atomic-ish replace so a crash mid-write never corrupts settings.
         std::fs::rename(&tmp, path)?;
         tracing::debug!(path = %path.display(), "settings saved");
@@ -752,6 +824,14 @@ mod tests {
         );
         s.col_widths
             .insert("details".into(), BTreeMap::from([("pid".into(), 80.0)]));
+        s.col_visible.insert(
+            "details".into(),
+            BTreeMap::from([("threads".into(), true), ("uac".into(), false)]),
+        );
+        s.col_order.insert(
+            "details".into(),
+            vec!["pid".into(), "name".into(), "cpu".into()],
+        );
 
         s.save_to(&path).unwrap();
         let loaded = Settings::load_from(&path);
@@ -801,6 +881,36 @@ whatever=yes
         assert!(!s.save_config);
         assert!(s.always_on_top);
         assert_eq!(s.window_size, [640.0, 480.0]);
+    }
+
+    #[test]
+    fn column_visibility_and_order_sections_parse() {
+        let s = Settings::from_ini_text(
+            "[columns.details]\nname=340\n\
+             [columns.details.visible]\nthreads=1\nuac=0\nbogus=maybe\n\
+             [columns.details.order]\norder=pid, name ,cpu\n\
+             [columns.users.visible]\npid=1\n",
+        );
+        // Width sections keep parsing alongside the new sub-sections.
+        assert_eq!(
+            s.col_widths.get("details").and_then(|m| m.get("name")),
+            Some(&340.0)
+        );
+        let dv = s
+            .col_visible
+            .get("details")
+            .expect("details visibility overrides");
+        assert_eq!(dv.get("threads"), Some(&true));
+        assert_eq!(dv.get("uac"), Some(&false));
+        assert!(!dv.contains_key("bogus"), "unparsable flags are ignored");
+        assert_eq!(
+            s.col_order.get("details"),
+            Some(&vec!["pid".to_string(), "name".into(), "cpu".into()])
+        );
+        assert_eq!(
+            s.col_visible.get("users").and_then(|m| m.get("pid")),
+            Some(&true)
+        );
     }
 
     #[test]
