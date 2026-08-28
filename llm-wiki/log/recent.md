@@ -1,5 +1,56 @@
 # Recent Activity
 
+## 2026-08-28 — Security audit: 6 fixes (parser OOB, kill-path identity, hardening)
+
+Full security audit of the workspace (source, deps, secrets, binary
+hardening, runtime). Findings implemented:
+
+- **SMBIOS Type-17 OOB panic** (`tm-platform/win/memory_info.rs`): the old
+  guard `< 0x15` admitted spec-legal 0x15–0x1A-byte records but indexed up
+  to 0x1A — index panic in `Sampler::lazy_init`, fatal because release uses
+  `panic = "abort"`. Now every field read is length-guarded via the new
+  pure `ram_static_from_table(table)` (probe is a thin wrapper), with
+  regression tests for short (0x15) and full (0x22) Type-17 records.
+- **Kill-path PID-reuse TOCTOU** (`tm-platform/win/process_ops.rs`):
+  identity was only checked UI-side against a possibly-stale snapshot; the
+  platform killed a bare pid (tree-kill children had NO identity check).
+  `PlatformActions::kill_process` now takes
+  `expected_start_epoch_s: Option<i64>`; `open_process_verified` reads the
+  creation time THROUGH the freshly opened handle (handle-bound → immune to
+  later pid reuse), ±2 s tolerance, fail-closed when the expected time is
+  set but unverifiable. Tree-kill captures each child's birth at
+  enumeration and re-verifies via the terminate handle; children without a
+  captured birth fall back to the old unverified kill (their identity has
+  nothing to do with the root's). Linux/macOS use the trait default and
+  ignore the hint (documented).
+- **Details context-menu identity gates** (`tm-app/tabs/details.rs`):
+  priority/suspend/affinity now run the same start-time check against the
+  live snapshot that End Task and Efficiency mode already had.
+- **Elevated relaunch quoting** (`tm-platform/win/mod.rs`):
+  `quote_win_arg` implements the MSVCRT/CommandLineToArgvW quoting rules
+  (escaped quotes, doubled backslashes) for
+  `relaunch_elevated_with_args`; round-trip tested against the real
+  `CommandLineToArgvW`.
+- **Sign-out confirmation** (`tm-app/tabs/users.rs` + `app.rs`):
+  session Logoff parks in `TaskManApp::pending_session_logoff` and shows a
+  confirm dialog (`session_logoff_dialog`, new `K::SignOutConfirm` key);
+  Disconnect stays immediate.
+- **Binary hardening**: `.cargo/config.toml` adds
+  `-C control-flow-guard=yes` for windows targets (verified: Guard CF
+  function table 0 → 1391 entries); `build.py` release builds add
+  `--remap-path-prefix=<home>=` (strips the build-machine user name from
+  panic locations; verified: zero "REDACTED" strings in the shipped exe).
+  RUSTFLAGS overrides config rustflags, so build.py restates the CFG flag.
+- macOS `launchctl kickstart` target now interpolates `libc::getuid()`
+  (the literal `$(id -u)` never resolved — launchctl gets no shell).
+
+Audit evidence (2026-08-28, commit 93c460d): cargo-audit clean (456
+deps), gitleaks clean (tree + 75-commit history), clippy -D warnings +
+fmt clean, 134+ tests pass, `--selfcheck` green on the hardened release
+binary. Offline app (no networking crates at all). Known coverage gap: no
+cross/zigbuild on this machine → Linux x86_64 build/ELF inspection not
+verifiable locally; ARM64/macOS targets are not built by build.py.
+
 ## 2026-08-28 — Settings: always-start-elevated policy + one-shot restart
 
 Windows-only "Administratorrechte" / "Administrator privileges" section in

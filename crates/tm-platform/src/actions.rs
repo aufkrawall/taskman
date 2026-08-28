@@ -83,9 +83,18 @@ pub trait PlatformActions: Send + Sync {
     }
 
     // ------------------------------------------------ process control
-    /// Terminate a process; `tree=true` also kills descendants.
-    fn kill_process(&self, pid: u32, tree: bool) -> Result<()> {
-        let _ = tree;
+    /// Terminate a process; `tree=true` also kills descendants. When
+    /// `expected_start_epoch_s` is `Some`, platforms that CAN verify process
+    /// identity must refuse to act on a recycled pid (creation-time check at
+    /// kill time). Platforms without such verification ignore the hint —
+    /// the UI-level snapshot check still applies there.
+    fn kill_process(
+        &self,
+        pid: u32,
+        expected_start_epoch_s: Option<i64>,
+        tree: bool,
+    ) -> Result<()> {
+        let _ = (expected_start_epoch_s, tree);
         self.kill_single(pid)
     }
     fn kill_single(&self, pid: u32) -> Result<()> {

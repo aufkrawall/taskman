@@ -1,0 +1,8 @@
+# Binary-hardening defaults for Windows targets (security audit F-11-001).
+#
+# Note: setting the RUSTFLAGS environment variable overrides these flags
+# entirely. The release build driver (build.py) restates this flag together
+# with --remap-path-prefix (machine-specific, therefore not committable here)
+# when building release artifacts.
+[target.'cfg(windows)']
+rustflags = ["-C", "control-flow-guard=yes"]

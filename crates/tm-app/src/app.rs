@@ -272,6 +272,9 @@ pub struct TaskManApp {
     /// snapshot before dispatching, so a recycled PID is never targeted.
     pub selected_process: Option<ProcessIdentity>,
     pub selected_user: Option<u32>,
+    /// Pending sign-out awaiting confirmation (session id + display name).
+    /// Logoff is a high-blast-radius action and must never be one-click.
+    pub pending_session_logoff: Option<(u32, String)>,
     // Services tab.
     pub services_selected_name: Option<String>,
 
@@ -442,6 +445,7 @@ impl TaskManApp {
             details_state,
             selected_process: None,
             selected_user: None,
+            pending_session_logoff: None,
             services_selected_name: None,
             pending_details_focus: None,
             scroll_to_pid: None,
@@ -671,6 +675,9 @@ impl eframe::App for TaskManApp {
         if let Some((pid, mask)) = self.affinity_dialog {
             crate::tabs::details::affinity_dialog(self, &ctx, pid, mask, &pal);
         }
+        if self.pending_session_logoff.is_some() {
+            crate::tabs::users::session_logoff_dialog(self, &ctx, &pal);
+        }
         if self.startup_props.is_some() {
             crate::tabs::startup::properties_dialog(self, &ctx, &pal);
         }
@@ -852,10 +859,11 @@ impl TaskManApp {
         }
         let pid = identity.pid;
         let actions = self.actions.clone();
+        let start = identity.start_epoch_s;
         self.run_action(
             ctx,
             move || i18n::trf(K::ProcessEndedToast, &[&pid.to_string()]),
-            move || actions.kill_process(pid, false),
+            move || actions.kill_process(pid, start, false),
         );
     }
 

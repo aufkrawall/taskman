@@ -150,6 +150,10 @@ keys! {
     OpenServicesApp => ["Dienste öffnen", "Open Services"],
     DisconnectUser => ["Trennen", "Disconnect"],
     SignOut => ["Abmelden", "Sign out"],
+    SignOutConfirm => [
+        "\"{}\" wird abgemeldet. Nicht gespeicherte Daten gehen verloren.",
+        "\"{}\" will be signed out. Unsaved data will be lost."]
+    ,
     ManageUserAccounts => ["Benutzerkonten verwalten", "Manage user accounts"],
     EnableCmd => ["Aktivieren", "Enable"],
     DisableCmd => ["Deaktivieren", "Disable"],

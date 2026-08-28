@@ -3,7 +3,7 @@
 
 use tm_core::error::{Result, TmError};
 use tm_core::model::PriorityClass;
-use windows::Win32::Foundation::{CloseHandle, HANDLE};
+use windows::Win32::Foundation::{CloseHandle, FILETIME, HANDLE};
 use windows::Win32::System::Threading as th;
 use windows::Win32::UI::Shell::ShellExecuteExW;
 use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
@@ -20,6 +20,65 @@ fn open_process(pid: u32, access: th::PROCESS_ACCESS_RIGHTS) -> Result<HANDLE> {
         })?;
         Ok(h)
     }
+}
+
+/// Creation time of the process a HANDLE refers to, in Unix seconds. Read
+/// through an already-open handle, so the answer describes the SAME process
+/// object no matter whether the pid was recycled after the handle was
+/// opened — this is what makes the identity check below race-free.
+fn creation_epoch_from_handle(h: HANDLE) -> Option<i64> {
+    unsafe {
+        let mut create = FILETIME::default();
+        let mut exit = FILETIME::default();
+        let mut kernel = FILETIME::default();
+        let mut user = FILETIME::default();
+        if th::GetProcessTimes(h, &mut create, &mut exit, &mut kernel, &mut user).is_err() {
+            return None;
+        }
+        let raw = (create.dwHighDateTime as i64) << 32 | create.dwLowDateTime as i64;
+        Some((raw - 116_444_736_000_000_000) / 10_000_000)
+    }
+}
+
+/// Tolerance (seconds) when comparing creation times. sysinfo derives
+/// start_epoch_s with the same truncation, but a small slack keeps harmless
+/// rounding differences from failing a legitimate kill while still being
+/// orders of magnitude below any realistic pid-reuse delay.
+const CREATION_MATCH_TOLERANCE_S: i64 = 2;
+
+fn creation_matches(expected: i64, actual: Option<i64>) -> bool {
+    match actual {
+        Some(t) => (t - expected).abs() <= CREATION_MATCH_TOLERANCE_S,
+        // Cannot verify the identity of a destructive operation → fail
+        // closed. GetProcessTimes only fails on handles that cannot
+        // terminate anyway (protected processes).
+        None => false,
+    }
+}
+
+/// Open `pid` for an operation and verify its identity first. When
+/// `expected_start_epoch_s` is `Some`, the process creation time is read
+/// through the freshly opened handle and compared BEFORE returning it; on a
+/// mismatch (pid recycled between snapshot and action) the handle is closed
+/// and an error is returned instead of acting on an unrelated process.
+fn open_process_verified(
+    pid: u32,
+    access: th::PROCESS_ACCESS_RIGHTS,
+    expected_start_epoch_s: Option<i64>,
+) -> Result<HANDLE> {
+    // Query access is needed for the creation-time check; it is grantable
+    // wherever the destructive rights below are.
+    let h = open_process(pid, access | th::PROCESS_QUERY_LIMITED_INFORMATION)?;
+    if let Some(expected) = expected_start_epoch_s {
+        let actual = creation_epoch_from_handle(h);
+        if !creation_matches(expected, actual) {
+            unsafe {
+                let _ = CloseHandle(h);
+            }
+            return Err(TmError::ProcessNotFound { pid });
+        }
+    }
+    Ok(h)
 }
 
 // ------------------------------------------------------------------ status queries
@@ -170,9 +229,19 @@ pub fn unmap_priority(p: PriorityClass) -> th::PROCESS_CREATION_FLAGS {
 
 // ------------------------------------------------------------------ termination
 
+/// Terminate without an identity check (`expected_start_epoch_s = None`).
+/// Kept for callers that hold no snapshot identity (tests, trait default).
 pub fn kill_single(pid: u32) -> Result<()> {
+    terminate_verified(pid, None)
+}
+
+/// Terminate `pid` after verifying, THROUGH the terminate handle, that its
+/// creation time still matches `expected_start_epoch_s` (see
+/// [`open_process_verified`]). A recycled pid is refused instead of killing
+/// an unrelated process.
+pub fn terminate_verified(pid: u32, expected_start_epoch_s: Option<i64>) -> Result<()> {
+    let h = open_process_verified(pid, th::PROCESS_TERMINATE, expected_start_epoch_s)?;
     unsafe {
-        let h = open_process(pid, th::PROCESS_TERMINATE)?;
         // Exit code 1 mirrors Task Manager behavior.
         let r = th::TerminateProcess(h, 1)
             .map_err(|e| TmError::platform("TerminateProcess", e.to_string()));
@@ -181,29 +250,43 @@ pub fn kill_single(pid: u32) -> Result<()> {
     }
 }
 
-pub fn kill_process(pid: u32, tree: bool) -> Result<()> {
+/// Terminate `pid` (and, with `tree`, all descendants). When
+/// `expected_start_epoch_s` is `Some`, every targeted process must still
+/// have the expected creation time at the moment its terminate handle is
+/// opened — the same identity discipline the UI applies, moved down to the
+/// one place where it can be enforced race-free.
+pub fn kill_process(pid: u32, expected_start_epoch_s: Option<i64>, tree: bool) -> Result<()> {
     if !tree {
-        return kill_single(pid);
+        return terminate_verified(pid, expected_start_epoch_s);
     }
-    let children = collect_children(pid);
+    // Descendants: capture each child's creation time right at enumeration;
+    // terminate_verified re-checks it through the handle before firing.
+    let children = collect_children_with_births(pid);
     // Kill descendants depth-first (deepest last in BFS order → reverse).
     let mut err: Option<TmError> = None;
-    for c in children.iter().rev() {
+    for (c, birth) in children.iter().rev() {
         if *c != std::process::id()
-            && let Err(e) = kill_single(*c)
+            // A child whose birth could not be fingerprinted falls back to
+            // the previous unverified kill (its creation time has nothing to
+            // do with the root's identity, so substituting that would fail
+            // every such child).
+            && let Err(e) = terminate_verified(*c, *birth)
         {
             tracing::debug!(child = c, error = %e, "tree-kill child failed");
             err.get_or_insert(e);
         }
     }
-    match kill_single(pid) {
+    match terminate_verified(pid, expected_start_epoch_s) {
         Ok(()) => err.map_or(Ok(()), Err),
         Err(e) => Err(err.unwrap_or(e)),
     }
 }
 
-/// BFS all descendant pids of `pid` via a full process snapshot.
-fn collect_children(root: u32) -> Vec<u32> {
+/// BFS all descendant pids of `pid` via a full process snapshot, capturing
+/// each child's creation time as observed AT ENUMERATION TIME. The later
+/// handle-bound re-check compares against these values, so a child that
+/// exits and whose pid is recycled before termination is refused.
+fn collect_children_with_births(root: u32) -> Vec<(u32, Option<i64>)> {
     use windows::Win32::System::Diagnostics::ToolHelp::{
         CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW,
         TH32CS_SNAPPROCESS,
@@ -239,7 +322,17 @@ fn collect_children(root: u32) -> Vec<u32> {
         if let Some(kids) = parent_map.get(&p) {
             for k in kids.clone() {
                 if seen.insert(k) {
-                    out.push(k);
+                    // Birth captured now, verified again via the handle later.
+                    let birth = open_process(k, th::PROCESS_QUERY_LIMITED_INFORMATION)
+                        .ok()
+                        .and_then(|h| {
+                            let t = creation_epoch_from_handle(h);
+                            unsafe {
+                                let _ = CloseHandle(h);
+                            }
+                            t
+                        });
+                    out.push((k, birth));
                     queue.push_back(k);
                 }
             }

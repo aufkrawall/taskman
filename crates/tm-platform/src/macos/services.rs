@@ -46,7 +46,11 @@ pub fn control_label(label: &str, action: super::super::actions::ServiceAction) 
     };
     let mut cmd = Command::new("launchctl");
     if action == Restart {
-        cmd.args(["kickstart", "-k", &format!("gui/$(id -u)/{label}")]);
+        // launchctl is invoked directly (no shell), so the uid must be
+        // interpolated here: "$(id -u)" would stay literal and the kickstart
+        // target would never resolve.
+        let uid = unsafe { libc::getuid() };
+        cmd.args(["kickstart", "-k", &format!("gui/{uid}/{label}")]);
     } else {
         cmd.arg(verb).arg(label);
     }

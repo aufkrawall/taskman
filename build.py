@@ -47,6 +47,33 @@ def cargo() -> str:
     raise SystemExit("cargo not found - install Rust 1.85+ or add ~/.cargo/bin to PATH")
 
 
+def release_rustflags(windows_target: bool) -> dict[str, str] | None:
+    """Hardening rustflags for release artifacts (security audit F-11-001).
+
+    * ``--remap-path-prefix`` strips the build machine's home directory from
+      panic location strings, so shipped binaries do not leak the local user
+      name (release profile strips symbols but keeps panic locations).
+    * Control Flow Guard is restated here because a set RUSTFLAGS variable
+      overrides the ``.cargo/config.toml`` rustflags entirely; without it the
+      packaged build would silently lose the CFG instrumentation that plain
+      ``cargo build --release`` gets from config.
+
+    Applied only to release-profile builds so dev iteration stays untouched.
+    """
+    flags: list[str] = []
+    home = Path.home()
+    if home.is_dir():
+        native = str(home)
+        flags.append(f"--remap-path-prefix={native}=")
+        if windows_target:
+            forward = native.replace("\\", "/")
+            if forward != native:
+                flags.append(f"--remap-path-prefix={forward}=")
+    if windows_target:
+        flags.append("-Ccontrol-flow-guard=yes")
+    return {"RUSTFLAGS": " ".join(flags)} if flags else None
+
+
 def read_version() -> str:
     text = (ROOT / "Cargo.toml").read_text(encoding="utf-8")
     m = re.search(r'^\s*version\s*=\s*"([^"]+)"', text, re.M)
@@ -76,7 +103,8 @@ def linux_cross_command(profile: str) -> tuple[list[str], str] | None:
 def build_host(profile: str) -> Path | None:
     exe_name = "taskman.exe" if platform.system() == "Windows" else "taskman"
     out_dir = ROOT / "target" / ("debug" if profile == "dev" else profile)
-    if not run([cargo(), "build", "--profile", profile, "--workspace"]):
+    env = release_rustflags(platform.system() == "Windows") if profile != "dev" else None
+    if not run([cargo(), "build", "--profile", profile, "--workspace"], env=env):
         return None
     exe = out_dir / exe_name
     if not exe.exists():
@@ -94,7 +122,7 @@ def build_linux(profile: str) -> tuple[Path | None, bool]:
         )
         return None, False
     command, out_dir = cmd
-    if not run(command):
+    if not run(command, env=release_rustflags(False) if profile != "dev" else None):
         return None, True
     exe = Path(out_dir) / "taskman"
     if not exe.exists():

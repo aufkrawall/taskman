@@ -1048,6 +1048,17 @@ fn build_rows(
         .collect()
 }
 
+/// Identity gate shared by every destructive context-menu action (audit:
+/// End Task and Efficiency mode had one; priority/suspend/affinity did not).
+/// The rendered row can be stale — especially while sampling is paused — so
+/// re-check the start time against the latest snapshot before dispatching.
+fn identity_still_live(app: &TaskManApp, p: &ProcessEntry) -> bool {
+    app.latest_snapshot()
+        .as_ref()
+        .and_then(|s| s.process(p.pid))
+        .is_none_or(|live| live.start_epoch_s.is_none() || live.start_epoch_s == p.start_epoch_s)
+}
+
 /// Context menu mirroring the Win11 TM Details tab.
 pub fn context_menu(app: &mut TaskManApp, ui: &mut egui::Ui, p: &ProcessEntry) {
     let ctx = ui.ctx().clone();
@@ -1084,6 +1095,11 @@ pub fn context_menu(app: &mut TaskManApp, ui: &mut egui::Ui, p: &ProcessEntry) {
             (PriorityClass::Low, K::PrioLow),
         ] {
             if ui.button(i18n::tr(key)).clicked() {
+                if !identity_still_live(app, p) {
+                    app.shared.toast(i18n::tr(K::ProcessExited));
+                    ui.close();
+                    return;
+                }
                 let actions = app.actions.clone();
                 let pid = p.pid;
                 let key_copy = key;
@@ -1095,8 +1111,12 @@ pub fn context_menu(app: &mut TaskManApp, ui: &mut egui::Ui, p: &ProcessEntry) {
     });
 
     if ui.button(i18n::tr(K::SetAffinity)).clicked() {
-        let mask = app.actions.get_affinity_mask(p.pid).unwrap_or(u64::MAX);
-        app.affinity_dialog = Some((p.pid, mask));
+        if !identity_still_live(app, p) {
+            app.shared.toast(i18n::tr(K::ProcessExited));
+        } else {
+            let mask = app.actions.get_affinity_mask(p.pid).unwrap_or(u64::MAX);
+            app.affinity_dialog = Some((p.pid, mask));
+        }
         ui.close();
     }
 
@@ -1109,6 +1129,11 @@ pub fn context_menu(app: &mut TaskManApp, ui: &mut egui::Ui, p: &ProcessEntry) {
         })
         .clicked()
     {
+        if !identity_still_live(app, p) {
+            app.shared.toast(i18n::tr(K::ProcessExited));
+            ui.close();
+            return;
+        }
         let actions = app.actions.clone();
         let pid = p.pid;
         let target_suspended = !suspended;
@@ -1202,7 +1227,7 @@ fn end_process(
                 i18n::trf(K::NameEndedToast, &[&msg_name])
             }
         },
-        move || actions.kill_process(pid, tree),
+        move || actions.kill_process(pid, start, tree),
     );
 }
 
