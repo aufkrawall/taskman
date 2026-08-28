@@ -590,6 +590,7 @@ fn end_process_checked(
     let pid = identity.pid;
     let actions = app.actions.clone();
     let msg_name = name.to_string();
+    let start = identity.start_epoch_s;
     app.run_action(
         ctx,
         move || {
@@ -599,7 +600,7 @@ fn end_process_checked(
                 i18n::trf(K::NameEndedToast, &[&msg_name])
             }
         },
-        move || actions.kill_process(pid, tree),
+        move || actions.kill_process(pid, start, tree),
     );
 }
 

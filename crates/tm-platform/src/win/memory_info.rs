@@ -25,14 +25,23 @@ pub struct RamStatic {
 
 /// Probe once at startup; never changes while the machine runs.
 pub fn probe() -> RamStatic {
-    let mut out = RamStatic::default();
     let Some(table) = smbios_table() else {
-        return out;
+        return RamStatic::default();
     };
+    ram_static_from_table(&table)
+}
+
+/// Pure Type-16/17 walker so malformed/truncated tables are testable. The
+/// table is firmware-supplied (hypervisor-controlled in VMs), so EVERY field
+/// read is length-guarded — a spec-legal short record must degrade to fewer
+/// facts, never panic (release builds use `panic = "abort"`, so one bad
+/// index would kill the whole app in `Sampler::lazy_init`).
+fn ram_static_from_table(table: &[u8]) -> RamStatic {
+    let mut out = RamStatic::default();
     let mut modules: Vec<Module> = Vec::new();
     let mut slots_total = 0u32;
 
-    for rec in records(&table) {
+    for rec in records(table) {
         match rec.r#type {
             16 => {
                 // Memory Array: Number of Possible Slots at 0Dh (word).
@@ -41,23 +50,39 @@ pub fn probe() -> RamStatic {
                 }
             }
             17 => {
-                // Memory Device.
+                // Memory Device. Field offsets grow with the SMBIOS
+                // revision: 0x15-byte records (2.3–2.5) end right after the
+                // form factor, so every later read needs its own guard.
                 let d = rec.data;
-                if d.len() < 0x15 {
+                if d.len() < 0x0F {
                     continue;
                 }
                 let size_raw = u16_from(d, 0x0C);
                 let populated = size_raw != 0 && size_raw != 0xFFFF;
                 let form_factor = form_factor_label(d[0x0E]);
-                let speed_max = valid_speed(u16_from(d, 0x15));
+                // "Speed" (word) at 15h; absent on the shortest records.
+                let speed_max = if d.len() >= 0x17 {
+                    valid_speed(u16_from(d, 0x15))
+                } else {
+                    0
+                };
                 // SMBIOS 3.0+: configured clock speed at 20h (word).
                 let speed_cfg = if d.len() >= 0x22 {
                     valid_speed(u16_from(d, 0x20))
                 } else {
                     0
                 };
-                let manufacturer = rec.string(d[0x17] as usize);
-                let part = rec.string(d[0x1A] as usize);
+                // Strings are 1-based indexes at 17h/1Ah (2.6+ records).
+                let manufacturer = if d.len() >= 0x18 {
+                    rec.string(d[0x17] as usize)
+                } else {
+                    String::new()
+                };
+                let part = if d.len() >= 0x1B {
+                    rec.string(d[0x1A] as usize)
+                } else {
+                    String::new()
+                };
                 let size_bytes = if populated { module_size_bytes(d) } else { 0 };
                 if populated {
                     modules.push(Module {
@@ -229,5 +254,67 @@ fn smbios_table() -> Option<Vec<u8>> {
         let table_len = u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]) as usize;
         let end = (8 + table_len).min(written);
         Some(buf[8..end].to_vec())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Regression: a spec-legal SMBIOS 2.x Type-17 record is only 0x15 bytes
+    /// long. The old code guarded with `< 0x15` and then read offsets up to
+    /// 0x1A — an out-of-bounds panic (release builds abort the whole app).
+    /// Short records must now contribute what they contain, never panic.
+    #[test]
+    fn short_smbios_type17_record_does_not_panic() {
+        // 0x15 formatted bytes (header incl. Size@0Ch, FormFactor@0Eh) +
+        // strings region "KINGSTON\0" + terminator.
+        let mut rec = vec![0u8; 0x15];
+        rec[0] = 17;
+        rec[1] = 0x15;
+        rec[0x0C..0x0E].copy_from_slice(&8192u16.to_le_bytes()); // 8 GB, populated
+        rec[0x0E] = 0x09; // DIMM
+        rec.extend_from_slice(b"KINGSTON\0\0");
+        let mut table = rec;
+        // A well-formed Type-16 slot record so slots_total is observable.
+        let mut t16 = vec![0u8; 0x0F];
+        t16[0] = 16;
+        t16[1] = 0x0F;
+        t16[0x0D..0x0F].copy_from_slice(&2u16.to_le_bytes()); // 2 slots
+        t16.extend_from_slice(&[0, 0]);
+        table.extend_from_slice(&t16);
+
+        let out = ram_static_from_table(&table);
+        assert_eq!(out.slots_used, 1);
+        assert_eq!(out.slots_total, 2);
+        assert_eq!(out.installed_bytes, 8192 * 1024 * 1024);
+        assert_eq!(out.form_factor, "DIMM");
+        // "Speed" (0x15h) and part number (0x1Ah) do not fit a 0x15 record.
+        assert_eq!(out.speed_mts, 0);
+        assert_eq!(out.part_number, "");
+    }
+
+    /// Full 2.6+ record: all fields must still be parsed (guards must not
+    /// hide data from LONG records).
+    #[test]
+    fn full_smbios_type17_record_parses_every_field() {
+        let mut rec = vec![0u8; 0x22];
+        rec[0] = 17;
+        rec[1] = 0x22;
+        rec[0x0C..0x0E].copy_from_slice(&16384u16.to_le_bytes());
+        rec[0x0E] = 0x0C; // SODIMM
+        rec[0x15..0x17].copy_from_slice(&5600u16.to_le_bytes()); // Speed
+        rec[0x20..0x22].copy_from_slice(&6400u16.to_le_bytes()); // Configured
+        rec[0x17] = 1; // manufacturer string #1
+        rec[0x1A] = 2; // part string #2
+        rec.extend_from_slice(b"ACME\0MX-1\0\0");
+
+        let out = ram_static_from_table(&rec);
+        assert_eq!(out.slots_used, 1);
+        assert_eq!(out.installed_bytes, 16384 * 1024 * 1024);
+        assert_eq!(out.form_factor, "SODIMM");
+        assert_eq!(out.speed_mts, 6400);
+        assert_eq!(out.manufacturer, "ACME");
+        assert_eq!(out.part_number, "MX-1");
     }
 }

@@ -18,6 +18,7 @@ use crate::icons::Icon;
 use crate::search;
 use crate::theme;
 use crate::widgets::tablekit::{self, Aggregates, HeatCell, TmColumn};
+use tm_platform::actions::UserSessionAction;
 
 fn columns() -> Vec<TmColumn> {
     vec![
@@ -561,6 +562,35 @@ fn session_action(
     id: u32,
     action: tm_platform::actions::UserSessionAction,
 ) {
+    // High blast radius: signing out a session destroys its unsaved work.
+    // Native Task Manager also confirms this step — never a one-click wipe
+    // (security audit, GUI high-blast-radius safety). Disconnect is
+    // non-destructive and stays immediate.
+    if action == UserSessionAction::Logoff {
+        let hostname = app
+            .latest_snapshot()
+            .map(|s| s.system.hostname.clone())
+            .unwrap_or_default();
+        let name = tm_core::sync::lock(&app.shared.sessions_cache)
+            .as_ref()
+            .and_then(|(list, _)| {
+                list.iter()
+                    .find(|s| s.id == id)
+                    .map(|s| display_name(s, &hostname))
+            })
+            .unwrap_or_else(|| format!("(session {id})"));
+        app.pending_session_logoff = Some((id, name));
+        return;
+    }
+    dispatch_session_action(app, ctx, id, action);
+}
+
+fn dispatch_session_action(
+    app: &mut TaskManApp,
+    ctx: &egui::Context,
+    id: u32,
+    action: tm_platform::actions::UserSessionAction,
+) {
     let actions = app.actions.clone();
     app.run_action(
         ctx,
@@ -574,4 +604,36 @@ fn session_action(
         },
         move || actions.control_user_session(id, action),
     );
+}
+
+/// Confirmation dialog for the pending sign-out (`session_action` parks
+/// Logoff here instead of dispatching it right away).
+pub fn session_logoff_dialog(app: &mut TaskManApp, ctx: &egui::Context, _pal: &theme::Palette) {
+    use egui::{Align2, Window};
+    let Some((id, name)) = app.pending_session_logoff.clone() else {
+        return;
+    };
+    let mut open = true;
+    Window::new(i18n::tr(K::SignOut))
+        .open(&mut open)
+        .collapsible(false)
+        .resizable(false)
+        .anchor(Align2::CENTER_CENTER, [0.0, -40.0])
+        .show(ctx, |ui| {
+            ui.set_width(420.0);
+            ui.label(i18n::trf(K::SignOutConfirm, &[&name]));
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                if ui.button(i18n::tr(K::Cancel)).clicked() {
+                    app.pending_session_logoff = None;
+                }
+                if ui.button(i18n::tr(K::Yes)).clicked() {
+                    app.pending_session_logoff = None;
+                    dispatch_session_action(app, ctx, id, UserSessionAction::Logoff);
+                }
+            });
+        });
+    if !open {
+        app.pending_session_logoff = None;
+    }
 }

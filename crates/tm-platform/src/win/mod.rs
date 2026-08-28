@@ -81,12 +81,56 @@ pub fn is_elevated() -> bool {
 /// Backs the "always start elevated" setting at startup; the interactive
 /// settings-dialog restart uses the no-args `relaunch_elevated` action
 /// instead.
+/// Quote one argument per the MSVCRT/CommandLineToArgvW rules. The elevated
+/// relaunch crosses a privilege boundary (the UAC-approved process parses
+/// this command line itself), so the quoting must be correct by
+/// construction: embedded quotes must not be able to terminate an argument
+/// and splice in extra ones, and trailing backslashes must not escape the
+/// closing quote. Arguments without spaces, tabs or quotes pass through
+/// unchanged, so plain flags look exactly as before.
+fn quote_win_arg(arg: &str) -> String {
+    if !arg.is_empty() && !arg.contains([' ', '\t', '"']) {
+        return arg.to_string();
+    }
+    let mut out = String::with_capacity(arg.len() + 3);
+    out.push('"');
+    let mut backslashes = 0usize;
+    for c in arg.chars() {
+        match c {
+            '\\' => {
+                backslashes += 1;
+                out.push('\\');
+            }
+            '"' => {
+                // Every pending backslash now precedes a quote and must be
+                // doubled; the quote itself becomes an escaped literal.
+                for _ in 0..backslashes {
+                    out.push('\\');
+                }
+                backslashes = 0;
+                out.push_str("\\\"");
+            }
+            _ => {
+                backslashes = 0;
+                out.push(c);
+            }
+        }
+    }
+    // Backslashes directly before the closing quote double up too.
+    for _ in 0..backslashes {
+        out.push('\\');
+    }
+    out.push('"');
+    out
+}
+
 pub fn relaunch_elevated_with_args(args: &[String]) -> Result<()> {
     let exe = std::env::current_exe()
         .map_err(|e| tm_core::TmError::platform("current_exe", e.to_string()))?;
     let mut cmdline = format!("\"{}\"", exe.to_string_lossy());
     for a in args {
-        cmdline.push_str(&format!(" \"{a}\""));
+        cmdline.push(' ');
+        cmdline.push_str(&quote_win_arg(a));
     }
     process_ops::run_new_task(&cmdline, true)
 }
@@ -148,8 +192,13 @@ impl PlatformActions for WinActions {
     fn control_user_session(&self, session_id: u32, action: UserSessionAction) -> Result<()> {
         users::control_session(session_id, action)
     }
-    fn kill_process(&self, pid: u32, tree: bool) -> Result<()> {
-        process_ops::kill_process(pid, tree)
+    fn kill_process(
+        &self,
+        pid: u32,
+        expected_start_epoch_s: Option<i64>,
+        tree: bool,
+    ) -> Result<()> {
+        process_ops::kill_process(pid, expected_start_epoch_s, tree)
     }
     fn kill_single(&self, pid: u32) -> Result<()> {
         process_ops::kill_single(pid)
@@ -243,4 +292,55 @@ pub fn create_collector() -> WinCollector {
 
 pub fn create_actions() -> WinActions {
     WinActions
+}
+
+#[cfg(all(test, target_os = "windows"))]
+mod tests {
+    use super::*;
+
+    /// Parse with the OS ground truth (CommandLineToArgvW — the same rules
+    /// the elevated relaunch's target uses). The returned argv buffer is
+    /// intentionally leaked: test-only, the process exits right after.
+    fn parse_args(line: &str) -> Vec<String> {
+        use windows::core::PCWSTR;
+        let wide: Vec<u16> = line.encode_utf16().chain([0]).collect();
+        let mut argc = 0i32;
+        let argv = unsafe {
+            windows::Win32::UI::Shell::CommandLineToArgvW(
+                PCWSTR::from_raw(wide.as_ptr()),
+                &mut argc,
+            )
+        };
+        assert!(!argv.is_null(), "CommandLineToArgvW failed");
+        (0..argc as usize)
+            .map(|i| unsafe { (*argv.add(i)).to_string().unwrap_or_default() })
+            .collect()
+    }
+
+    /// The quoting must survive the OS parser exactly: embedded quotes may
+    /// neither terminate an argument nor splice extra ones in.
+    #[test]
+    fn relaunch_arg_quoting_round_trips_through_command_line_parsing() {
+        let cases: Vec<Vec<String>> = vec![
+            vec![],
+            vec!["--tab=processes".into()],
+            vec!["--tab=pro cesses".into()],
+            vec!["with\"quote".into()],
+            vec!["ends-with\\".into()],
+            vec!["bs\\before\"quote".into(), String::new()],
+            vec!["-v".into(), "--size=800x600".into(), "ünïcode".into()],
+        ];
+        for args in cases {
+            // argv[0] is parsed in a special mode, so a plain marker stands
+            // in for the exe; the ARGS are what the elevated taskman parses
+            // in standard mode.
+            let mut line = String::from("taskman");
+            for a in &args {
+                line.push(' ');
+                line.push_str(&quote_win_arg(a));
+            }
+            let parsed = parse_args(&line);
+            assert_eq!(&parsed[1..], args.as_slice(), "cmdline: {line}");
+        }
+    }
 }
