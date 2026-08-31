@@ -178,6 +178,30 @@ pub fn format_mbit(bps: f64) -> String {
     }
 }
 
+/// Per-process network rate for the Processes / App History tables.
+///
+/// Native Task Manager fixes this column to Mbit/s, where realistic
+/// per-process traffic — a few KB/s — always renders as "0,0" and the column
+/// reads as broken. We show BYTES instead, with the same 1024-based KB/MB
+/// units and one decimal as the neighbouring Disk column, so the two read
+/// consistently and small rates stay legible.
+pub fn format_process_net_rate(bps: f64) -> String {
+    const K: f64 = 1024.0;
+    if !bps.is_finite() || bps <= 0.0 {
+        return "0 KB/s".into();
+    }
+    if bps >= K * K {
+        return format!("{} MB/s", num_fixed(bps / (K * K), 1));
+    }
+    let kb = bps / K;
+    if kb < 0.05 {
+        // Some traffic, but below the smallest printable step: say so rather
+        // than rounding a real measurement down to a flat zero.
+        return format!("<{} KB/s", num_fixed(0.1, 1));
+    }
+    format!("{} KB/s", num_fixed(kb, 1))
+}
+
 /// Network volume for the Performance sidebar: "48,0 KBit" / "48.0 kbps".
 pub fn format_kbit(bps: f64) -> String {
     let unit = i18n::unit_kbit();
@@ -324,6 +348,31 @@ pub fn nice_scale(peak: f64) -> (f64, f64) {
         step /= 2.0;
     }
     (nice_max, step)
+}
+
+#[cfg(test)]
+mod net_rate_tests {
+    use super::*;
+
+    /// The Processes column must not read as a flat zero at the rates real
+    /// processes actually move, which is what a fixed Mbit/s unit produced.
+    #[test]
+    fn process_net_rate_uses_byte_units_and_stays_readable() {
+        // 1.6 KB/s — a typical background talker.
+        let text = format_process_net_rate(1_600.0);
+        assert!(text.ends_with("KB/s"), "{text}");
+        assert!(text.contains("1,6") || text.contains("1.6"), "{text}");
+        // At and above 1 MB/s the unit matches the Disk column.
+        let text = format_process_net_rate(2.0 * 1024.0 * 1024.0);
+        assert!(text.ends_with("MB/s") && text.starts_with('2'), "{text}");
+        // Exactly zero is a measurement of no traffic, printed plainly.
+        assert_eq!(format_process_net_rate(0.0), "0 KB/s");
+        // A trickle must not be rounded away to a flat zero.
+        assert!(format_process_net_rate(1.0).starts_with('<'));
+        // Garbage in never panics or prints NaN.
+        assert_eq!(format_process_net_rate(f64::NAN), "0 KB/s");
+        assert_eq!(format_process_net_rate(-5.0), "0 KB/s");
+    }
 }
 
 #[cfg(test)]

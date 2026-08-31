@@ -449,7 +449,7 @@ fn prepare_auto_fit_widths(
             format::format_mb(row.values[1] as u64),
             format::format_rate_mb(row.values[2]),
             if row.net_available {
-                format::format_mbit(row.values[3])
+                format::format_process_net_rate(row.values[3])
             } else {
                 "—".to_string()
             },
@@ -569,7 +569,7 @@ fn row_ui(
         format::format_mb(row.values[1] as u64),
         format::format_rate_mb(row.values[2]),
         if row.net_available {
-            format::format_mbit(row.values[3])
+            format::format_process_net_rate(row.values[3])
         } else {
             "—".to_string()
         },
@@ -2186,9 +2186,12 @@ mod tests {
         assert!(head.net_available, "a measured rate is not 'unavailable'");
         // 1000 + 250 (own) + 500 + 0 (child) bytes/s over the family.
         assert!((head.values[3] - 1_750.0).abs() < f64::EPSILON);
-        // ...and the column renders a rate, not the unavailable dash.
-        let rendered = format::format_mbit(head.values[3]);
-        assert!(rendered != "—" && rendered.starts_with('0'), "{rendered}");
+        // ...and the column renders a byte rate, not the unavailable dash.
+        let rendered = format::format_process_net_rate(head.values[3]);
+        assert!(
+            rendered.ends_with("KB/s") && rendered != "0 KB/s",
+            "{rendered}"
+        );
         // A zero rate is a MEASUREMENT, so it still counts as available.
         let mut quiet = proc(3, None, "quiet.exe", ProcCategory::Background);
         quiet.net_recv_bps = Some(0.0);

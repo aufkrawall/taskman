@@ -88,7 +88,12 @@ platform boundary (`tm-core` ← `tm-platform` ← `tm-app` / `tm-service`):
 ## High-Risk / High-Value Files
 
 - `crates/tm-core/src/engine.rs` — startup/lazy-start/notifier semantics;
-  breaking these regresses the core architecture goals.
+  breaking these regresses the core architecture goals. While a lazy engine is
+  parked before `Start`, configuration commands MUST be remembered rather than
+  dropped: the UI ships its telemetry demand on its first frame (before the
+  engine starts) and only re-sends on change, so a discarded `SetDemand`
+  disables that provider for the whole session — this is exactly how
+  per-process network stayed dark. See `log/recent.md` 2026-08-31.
 - `crates/tm-platform/src/win/perfcounters.rs` — PDH group lifecycle +
   GPU instance parsing (unit-tested real-world strings).
 - `crates/tm-platform/src/win/cpu_load.rs` — hand-rolled NT structure

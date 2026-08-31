@@ -1,5 +1,45 @@
 # Recent Activity
 
+## 2026-08-31 — engine dropped pre-start demand (why the Network column stayed empty)
+
+User report: the Network column still showed "—" after the ETW work landed.
+The ETW session, the sampler wiring and the display model were all correct;
+the bug was one line in `engine::run_loop`.
+
+Root cause: while a lazily spawned engine parks waiting for `Start`, the
+command loop matched `Ok(_) => {}` and **silently discarded every other
+command**. The UI computes its telemetry demand on its FIRST frame — which is
+deliberately before the engine is started — and `update_demand` only re-sends
+when the bitmask changes. So `PROCESS_NET` was requested exactly once, into
+the void, and the collector never learned it was wanted. The ETW session was
+therefore never started, and `net_*` stayed `None` forever.
+
+This was latent before: every other demand bit is only added when leaving the
+default start page, and a tab switch re-sends. `PROCESS_NET` is the first bit
+set on the DEFAULT page, so it is the first one that could be lost for good.
+`SetInterval` had the same hole (an interval set before start was ignored).
+
+Fix: remember demand while parked and apply it right after the factory runs;
+apply `SetInterval` immediately, since the sampling loop reads the interval
+from shared state anyway. Pause/Resume/Refresh remain meaningless before
+`Start`. Two regression tests
+(`demand_sent_before_start_reaches_the_collector`,
+`interval_sent_before_start_is_honored`) fail against the old code.
+
+Diagnosis path worth remembering: an engine-level integration test that
+reproduces the UI's exact call order (`spawn_lazy` → `set_demand` → `start`)
+separated "platform layer broken" from "app layer broken" in one run — the
+platform test passed 235/235 while the GUI showed nothing, which pointed
+straight at the plumbing between them.
+
+### Network column now reads in bytes
+
+Native TM fixes this column to Mbit/s, where realistic per-process traffic (a
+few KB/s) renders as "0,0" and the column looks broken. It now uses the same
+1024-based KB/s / MB/s units and one decimal as the neighbouring Disk column
+(`format::format_process_net_rate`), so a browser at 3 KB/s is visible and the
+two rate columns read consistently. Deliberate deviation from TM parity.
+
 ## 2026-08-31 — per-process network via ETW
 
 Implemented on request, replacing the honest-but-empty "—" column.
