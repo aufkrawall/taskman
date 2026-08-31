@@ -1,5 +1,5 @@
 //! Processes tab: Apps / Background processes / Windows process groups,
-//! expandable parent→child trees of arbitrary depth with O(n) subtree
+//! expandable application groups with O(n) subtree
 //! aggregates, blue heat-mapped resource columns and the aggregate header.
 //! Rows are flattened into a display model and rendered through the fixed-
 //! height virtualizer, so row count does not affect frame cost.
@@ -75,7 +75,7 @@ pub struct RowData {
     /// top consumer.
     pub heat: [f32; 4],
     pub net_available: bool,
-    pub suspended: bool,
+    pub status: ProcStatus,
     /// True when the OS reports this process as power throttled
     /// (Efficiency mode) — rendered straight from the snapshot, never from
     /// client-side bookkeeping (audit §8).
@@ -102,7 +102,6 @@ pub struct State {
     scroll_to_pid: Option<u32>,
     cache: Option<Cache>,
     view_generation: u64,
-    raw_tree_initialized: bool,
 }
 
 impl State {
@@ -134,23 +133,10 @@ impl State {
             self.invalidate();
         }
     }
-
-    /// A literal process tree is useful only when its ancestry is visible.
-    /// Expand every known parent on first entry; subsequent user collapse
-    /// choices remain untouched for the rest of the session.
-    fn ensure_raw_tree_initialized(&mut self, snap: &Snapshot) {
-        if self.raw_tree_initialized {
-            return;
-        }
-        let parents: HashSet<u32> = snap.processes.iter().filter_map(|p| p.ppid).collect();
-        self.expanded.extend(parents);
-        self.raw_tree_initialized = true;
-        self.invalidate();
-    }
 }
 
 struct Cache {
-    key: (u64, u64, String, usize, bool, bool),
+    key: (u64, u64, String, usize, bool),
     rows: Vec<DisplayRow>,
 }
 
@@ -175,10 +161,11 @@ pub(crate) fn toggle_efficiency_mode(
     let on = !p.power_throttled.unwrap_or(false);
     let actions = app.actions.clone();
     let pid = target.pid;
+    let start = target.start_epoch_s;
     app.run_action(
         ctx,
         || i18n::tr(K::EfficiencyChanged).to_string(),
-        move || actions.set_efficiency_mode(pid, on),
+        move || actions.set_efficiency_mode_checked(pid, start, on),
     );
     // Even when sampling is paused, produce exactly one fresh sample so the
     // leaf/state re-render from returned OS state immediately.
@@ -193,10 +180,6 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
     };
 
     let caps = app.actions.capabilities();
-    if app.shared.settings.process_tree_view {
-        app.processes_state.ensure_raw_tree_initialized(&snap);
-    }
-
     crate::app_ui::tab_header(
         app,
         ui,
@@ -224,26 +207,6 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
             }
         },
         |app, ui| {
-            ui.menu_button(i18n::tr(K::ViewMode), |ui| {
-                for (tree, key) in [(false, K::GroupedView), (true, K::ProcessTreeView)] {
-                    if ui
-                        .selectable_label(
-                            app.shared.settings.process_tree_view == tree,
-                            i18n::tr(key),
-                        )
-                        .clicked()
-                    {
-                        app.shared.settings.process_tree_view = tree;
-                        if tree && let Some(snap) = app.latest_snapshot() {
-                            app.processes_state.ensure_raw_tree_initialized(&snap);
-                        }
-                        app.processes_state.invalidate();
-                        app.save_settings();
-                        ui.close();
-                    }
-                }
-            });
-            ui.separator();
             if ui.button(i18n::tr(K::ExpandAll)).clicked() {
                 if let Some(snap) = app.latest_snapshot() {
                     for p in &snap.processes {
@@ -271,7 +234,6 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
         app.search.clone(),
         app.processes_state.sort_col,
         app.processes_state.ascending,
-        app.shared.settings.process_tree_view,
     );
     let mut cache = app.processes_state.cache.take();
     let cache_stale = cache.as_ref().is_none_or(|c| c.key != key);
@@ -280,11 +242,7 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
         let groups = app.processes_state.group_collapsed;
         cache = Some(Cache {
             key: key.clone(),
-            rows: if key.5 {
-                build_process_tree_rows(&snap, &key.2, key.3, key.4, &expanded)
-            } else {
-                build_display_rows(&snap, &key.2, key.3, key.4, &expanded, &groups)
-            },
+            rows: build_display_rows(&snap, &key.2, key.3, key.4, &expanded, &groups),
         });
     }
     let rows = cache.as_ref().expect("cache").rows.clone();
@@ -361,6 +319,11 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
             // Numeric columns default descending, name ascending.
             app.processes_state.ascending = col == 0 || !table.cols[col].numeric;
         }
+        app.persist_sort(
+            "processes",
+            table.cols[col].id,
+            app.processes_state.ascending,
+        );
     }
     app.persist_table(&table);
     app.processes_state.cache = cache;
@@ -470,10 +433,8 @@ fn prepare_auto_fit_widths(
                 + 66.0
                 + row.depth as f32 * 22.0,
         );
-        if row.suspended {
-            widths[1] = widths[1]
-                .max(tablekit::text_width(ui, i18n::tr(K::StSuspended), tablekit::FONT_ROW) + 42.0);
-        }
+        let status = status_text(row);
+        widths[1] = widths[1].max(tablekit::text_width(ui, &status, tablekit::FONT_ROW) + 42.0);
         let values = [
             format::format_pct_cell(row.values[0].min(100.0) as f32),
             format::format_mb(row.values[1] as u64),
@@ -587,9 +548,7 @@ fn row_ui(
     );
 
     // Status text + efficiency leaf sourced from the SNAPSHOT (audit §8).
-    if row.suspended {
-        table.text_cell(ui, rect, 1, i18n::tr(K::StSuspended), pal, false);
-    }
+    table.text_cell(ui, rect, 1, &status_text(row), pal, false);
     if row.power_throttled {
         let status_rect = table.col_rect(1, rect);
         crate::icons::draw_at(
@@ -641,6 +600,23 @@ fn row_ui(
     // Pseudo-rows carry no killable process — no action menu at all.
     if !row.synthetic {
         resp.context_menu(|ui| context_menu(app, ui, row));
+    }
+}
+
+fn status_text(row: &RowData) -> String {
+    let base = match row.status {
+        ProcStatus::Running => "",
+        ProcStatus::Suspended => i18n::tr(K::StSuspended),
+        ProcStatus::NotResponding => i18n::tr(K::StNotResponding),
+    };
+    if row.power_throttled {
+        if base.is_empty() {
+            i18n::tr(K::StEfficiencyMode).to_string()
+        } else {
+            format!("{base}, {}", i18n::tr(K::StEfficiencyMode))
+        }
+    } else {
+        base.to_string()
     }
 }
 
@@ -909,98 +885,6 @@ fn build_display_rows(
     out
 }
 
-/// System Informer-style literal parent/child view. Unlike the native
-/// Processes presentation this never invents application ownership groups:
-/// every row is one OS process with its own resource values. Filtering keeps
-/// matched rows plus their ancestor chain so hierarchy remains intelligible.
-fn build_process_tree_rows(
-    snap: &Snapshot,
-    raw_search: &str,
-    sort_col: usize,
-    ascending: bool,
-    expanded: &HashSet<u32>,
-) -> Vec<DisplayRow> {
-    let q = search::Query::new(raw_search);
-    let all: Vec<&ProcessEntry> = snap.processes.iter().collect();
-    let by_pid: HashMap<u32, &ProcessEntry> = all.iter().map(|p| (p.pid, *p)).collect();
-    let mut visible: HashSet<u32> = if q.is_empty() {
-        all.iter().map(|p| p.pid).collect()
-    } else {
-        all.iter()
-            .copied()
-            .filter(|p| q.matches_process(p))
-            .map(|p| p.pid)
-            .collect()
-    };
-
-    if !q.is_empty() {
-        let matched: Vec<u32> = visible.iter().copied().collect();
-        for pid in matched {
-            let mut cursor = pid;
-            let mut seen = HashSet::new();
-            while seen.insert(cursor) {
-                let Some(parent) = by_pid
-                    .get(&cursor)
-                    .and_then(|process| process.ppid)
-                    .and_then(|ppid| by_pid.get(&ppid).copied())
-                else {
-                    break;
-                };
-                visible.insert(parent.pid);
-                cursor = parent.pid;
-            }
-        }
-    }
-
-    let members: Vec<&ProcessEntry> = all
-        .iter()
-        .copied()
-        .filter(|p| visible.contains(&p.pid))
-        .collect();
-    let mut children: HashMap<u32, Vec<&ProcessEntry>> = HashMap::new();
-    for process in &members {
-        if let Some(ppid) = process.ppid
-            && ppid != process.pid
-            && visible.contains(&ppid)
-        {
-            children.entry(ppid).or_default().push(*process);
-        }
-    }
-    let roots = tree_roots(&members, &children);
-    let own: HashMap<u32, [f64; 4]> = members
-        .iter()
-        .map(|process| (process.pid, own_values(process)))
-        .collect();
-    let mut sorted_roots = roots;
-    sort_entries(&mut sorted_roots, sort_col, ascending, &own);
-
-    let mut out = Vec::with_capacity(members.len());
-    let mut stack: Vec<(&ProcessEntry, usize)> = sorted_roots
-        .into_iter()
-        .rev()
-        .map(|root| (root, 0))
-        .collect();
-    let mut visited = HashSet::with_capacity(members.len());
-    while let Some((process, depth)) = stack.pop() {
-        if !visited.insert(process.pid) {
-            continue;
-        }
-        let mut kids = children.get(&process.pid).cloned().unwrap_or_default();
-        sort_entries(&mut kids, sort_col, ascending, &own);
-        let has_children = !kids.is_empty();
-        let mut row = make_own_row(process, depth);
-        if let DisplayRow::Process(data) = &mut row {
-            data.children = has_children;
-        }
-        out.push(row);
-        if has_children && (expanded.contains(&process.pid) || !q.is_empty()) {
-            stack.extend(kids.into_iter().rev().map(|kid| (kid, depth + 1)));
-        }
-    }
-    normalize_heat(&mut out);
-    out
-}
-
 /// Resource-sorted view: reorder the per-section emission into ONE global
 /// order. The emitters above produce self-contained blocks (a depth-0 head
 /// row plus its expanded, nested children); sorting whole blocks keeps
@@ -1123,7 +1007,7 @@ fn emit_flat_with_family_groups(
                 values: repr.get(&p.pid).copied().unwrap_or([0.0; 4]),
                 heat: [0.0; 4],
                 net_available,
-                suspended: p.status == ProcStatus::Suspended,
+                status: p.status,
                 power_throttled: p.power_throttled == Some(true),
                 synthetic: p.synthetic,
                 tooltip: synthetic_tooltip(p),
@@ -1445,7 +1329,7 @@ fn make_flat_row(p: &ProcessEntry, subtree: &HashMap<u32, [f64; 4]>) -> DisplayR
         values: subtree.get(&p.pid).copied().unwrap_or([0.0; 4]),
         heat: [0.0; 4],
         net_available: p.net_recv_bps.is_some() || p.net_sent_bps.is_some(),
-        suspended: p.status == ProcStatus::Suspended,
+        status: p.status,
         power_throttled: p.power_throttled == Some(true),
         synthetic: p.synthetic,
         tooltip: synthetic_tooltip(p),
@@ -1477,7 +1361,7 @@ fn make_own_row(p: &ProcessEntry, depth: usize) -> DisplayRow {
         values: own_values(p),
         heat: [0.0; 4],
         net_available: p.net_recv_bps.is_some() || p.net_sent_bps.is_some(),
-        suspended: p.status == ProcStatus::Suspended,
+        status: p.status,
         power_throttled: p.power_throttled == Some(true),
         synthetic: p.synthetic,
         tooltip: synthetic_tooltip(p),
@@ -1616,7 +1500,7 @@ fn emit_tree<'a>(
             values: subtree.get(&proc.pid).copied().unwrap_or([0.0; 4]),
             heat: [0.0; 4],
             net_available: proc.net_recv_bps.is_some() || proc.net_sent_bps.is_some(),
-            suspended: proc.status == ProcStatus::Suspended,
+            status: proc.status,
             power_throttled: proc.power_throttled == Some(true),
             synthetic: proc.synthetic,
             tooltip: synthetic_tooltip(proc),
@@ -1712,6 +1596,7 @@ fn sort_entries(v: &mut [&ProcessEntry], col: usize, asc: bool, subtree: &HashMa
     let sv = |p: &ProcessEntry, i: usize| subtree.get(&p.pid).map_or(0.0, |s| s[i]);
     v.sort_by(|a, b| {
         let o = match col {
+            1 => process_status_rank(a).cmp(&process_status_rank(b)),
             2 => sv(a, 0)
                 .partial_cmp(&sv(b, 0))
                 .unwrap_or(std::cmp::Ordering::Equal),
@@ -1728,6 +1613,15 @@ fn sort_entries(v: &mut [&ProcessEntry], col: usize, asc: bool, subtree: &HashMa
         };
         if asc { o } else { o.reverse() }
     });
+}
+
+fn process_status_rank(process: &ProcessEntry) -> (u8, bool) {
+    let status = match process.status {
+        ProcStatus::Running => 0,
+        ProcStatus::Suspended => 1,
+        ProcStatus::NotResponding => 2,
+    };
+    (status, process.power_throttled == Some(true))
 }
 
 fn cmp_ignore_case(a: &str, b: &str) -> std::cmp::Ordering {
@@ -1784,53 +1678,6 @@ mod tests {
     }
 
     #[test]
-    fn literal_process_tree_preserves_ppid_depth_and_own_values() {
-        let mut root = proc(10, None, "root.exe", ProcCategory::Background);
-        root.cpu_pct = 2.0;
-        let mut child = proc(11, Some(10), "child.exe", ProcCategory::App);
-        child.cpu_pct = 80.0;
-        let leaf = proc(12, Some(11), "leaf.exe", ProcCategory::System);
-        let snap = snap_of(vec![root, child, leaf]);
-        let rows = build_process_tree_rows(&snap, "", 0, true, &HashSet::from([10, 11]));
-        let data: Vec<&RowData> = rows
-            .iter()
-            .filter_map(|row| match row {
-                DisplayRow::Process(row) => Some(row),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(
-            data.iter().map(|row| row.pid).collect::<Vec<_>>(),
-            [10, 11, 12]
-        );
-        assert_eq!(
-            data.iter().map(|row| row.depth).collect::<Vec<_>>(),
-            [0, 1, 2]
-        );
-        assert_eq!(data[0].values[0], 2.0, "parent is not subtree-aggregated");
-        assert_eq!(data[1].values[0], 80.0);
-    }
-
-    #[test]
-    fn literal_tree_filter_keeps_ancestor_context() {
-        let snap = snap_of(vec![
-            proc(10, None, "root.exe", ProcCategory::Background),
-            proc(11, Some(10), "child.exe", ProcCategory::App),
-            proc(12, Some(11), "needle.exe", ProcCategory::System),
-            proc(20, None, "unrelated.exe", ProcCategory::Background),
-        ]);
-        let rows = build_process_tree_rows(&snap, "needle", 0, true, &HashSet::new());
-        let pids: Vec<u32> = rows
-            .iter()
-            .filter_map(|row| match row {
-                DisplayRow::Process(row) => Some(row.pid),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(pids, [10, 11, 12]);
-    }
-
-    #[test]
     fn process_groups_system_separate_from_background() {
         let snap = snap_of(vec![
             proc(1, None, "explorer.exe", ProcCategory::App),
@@ -1855,6 +1702,22 @@ mod tests {
                 members_under(&rows, 2)
             ),
             (Some(1), Some(1), Some(1))
+        );
+    }
+
+    #[test]
+    fn status_column_sorts_status_instead_of_name() {
+        let mut running = proc(1, None, "z-running.exe", ProcCategory::Background);
+        let mut suspended = proc(2, None, "a-suspended.exe", ProcCategory::Background);
+        let mut hung = proc(3, None, "b-hung.exe", ProcCategory::Background);
+        running.status = ProcStatus::Running;
+        suspended.status = ProcStatus::Suspended;
+        hung.status = ProcStatus::NotResponding;
+        let mut rows = vec![&hung, &suspended, &running];
+        sort_entries(&mut rows, 1, true, &HashMap::new());
+        assert_eq!(
+            rows.iter().map(|process| process.pid).collect::<Vec<_>>(),
+            [1, 2, 3]
         );
     }
 

@@ -20,6 +20,8 @@ use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{EnvFilter, Layer, fmt};
 
+const MAX_LOG_FILES: usize = 14;
+
 /// Where logs are written.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct LogConfig {
@@ -180,7 +182,21 @@ pub fn attach_file_logging(cfg: LogConfig) -> Option<tracing_appender::non_block
         eprintln!("taskman: cannot create log dir {}: {e}", log_dir.display());
         return None;
     }
-    let appender = tracing_appender::rolling::daily(&log_dir, "taskman.log");
+    let appender = match tracing_appender::rolling::RollingFileAppender::builder()
+        .rotation(tracing_appender::rolling::Rotation::DAILY)
+        .filename_prefix("taskman.log")
+        .max_log_files(MAX_LOG_FILES)
+        .build(&log_dir)
+    {
+        Ok(appender) => appender,
+        Err(error) => {
+            eprintln!(
+                "taskman: cannot open log appender {}: {error}",
+                log_dir.display()
+            );
+            return None;
+        }
+    };
     let (writer, guard) = tracing_appender::non_blocking(appender);
 
     // Replay before publishing the writer so ordering stays monotonic.
@@ -209,26 +225,52 @@ pub fn attach_file_logging(cfg: LogConfig) -> Option<tracing_appender::non_block
 /// are no-ops. Returns the appender guard that must be kept alive for the
 /// process lifetime (flushes asynchronously). Use for CLI/headless paths.
 pub fn init(cfg: LogConfig) -> Option<tracing_appender::non_blocking::WorkerGuard> {
+    let log_dir = crate::settings::taskman_data_dir().join("logs");
+    init_in_dir(cfg, &log_dir, "taskman.log")
+}
+
+/// Initialize synchronous logging at an explicit protected directory. This
+/// is used by non-interactive components such as the Windows service, whose
+/// logs must not inherit the interactive user's writable data directory.
+pub fn init_in_dir(
+    cfg: LogConfig,
+    log_dir: &std::path::Path,
+    file_name: &str,
+) -> Option<tracing_appender::non_blocking::WorkerGuard> {
     let mut result_guard = None;
     INIT.call_once(|| {
         let filter = make_filter(&cfg);
 
         // File sink: daily-rolling under the platform log dir.
-        let log_dir = crate::settings::taskman_data_dir().join("logs");
         let file_layer = {
-            match std::fs::create_dir_all(&log_dir) {
+            match std::fs::create_dir_all(log_dir) {
                 Ok(()) => {
-                    let appender = tracing_appender::rolling::daily(&log_dir, "taskman.log");
-                    let (writer, g) = tracing_appender::non_blocking(appender);
-                    result_guard = Some(g);
-                    Some(
-                        fmt::layer()
-                            .with_writer(std::sync::Mutex::new(writer))
-                            .with_ansi(false)
-                            .with_target(true)
-                            .with_line_number(true)
-                            .with_filter(filter.clone()),
-                    )
+                    match tracing_appender::rolling::RollingFileAppender::builder()
+                        .rotation(tracing_appender::rolling::Rotation::DAILY)
+                        .filename_prefix(file_name)
+                        .max_log_files(MAX_LOG_FILES)
+                        .build(log_dir)
+                    {
+                        Ok(appender) => {
+                            let (writer, guard) = tracing_appender::non_blocking(appender);
+                            result_guard = Some(guard);
+                            Some(
+                                fmt::layer()
+                                    .with_writer(std::sync::Mutex::new(writer))
+                                    .with_ansi(false)
+                                    .with_target(true)
+                                    .with_line_number(true)
+                                    .with_filter(filter.clone()),
+                            )
+                        }
+                        Err(error) => {
+                            eprintln!(
+                                "taskman: cannot open log appender {}: {error}",
+                                log_dir.display()
+                            );
+                            None
+                        }
+                    }
                 }
                 Err(e) => {
                     eprintln!("taskman: cannot create log dir {}: {e}", log_dir.display());

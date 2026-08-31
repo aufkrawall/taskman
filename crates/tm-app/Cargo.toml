@@ -31,7 +31,12 @@ rfd = "0.15"
 renderer = "wgpu primary, glow fallback; wayland+x11 enabled for native Linux"
 
 [target.'cfg(windows)'.dependencies]
-windows = { version = "0.62", features = ["Win32_System_Console"] }
+windows = { version = "0.62", features = [
+  "Win32_Foundation",
+  "Win32_System_Console",
+  "Win32_System_Threading",
+] }
+tray-icon = { version = "0.24.2", default-features = false }
 wgpu = { version = "30", default-features = false, features = ["dx12"], optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]

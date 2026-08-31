@@ -31,6 +31,27 @@ enum SortColumn {
     Path,
 }
 
+impl SortColumn {
+    fn id(self) -> &'static str {
+        match self {
+            Self::Name => "name",
+            Self::Base => "base",
+            Self::Size => "size",
+            Self::Path => "path",
+        }
+    }
+
+    fn from_id(id: &str) -> Option<Self> {
+        match id {
+            "name" => Some(Self::Name),
+            "base" => Some(Self::Base),
+            "size" => Some(Self::Size),
+            "path" => Some(Self::Path),
+            _ => None,
+        }
+    }
+}
+
 pub struct State {
     identity: ProcessIdentity,
     process_name: String,
@@ -46,13 +67,18 @@ pub struct State {
 }
 
 impl State {
-    fn new(identity: ProcessIdentity, process_name: String) -> Self {
+    fn new(
+        identity: ProcessIdentity,
+        process_name: String,
+        sort: SortColumn,
+        ascending: bool,
+    ) -> Self {
         Self {
             identity,
             process_name,
             filter: String::new(),
-            sort: SortColumn::Name,
-            ascending: true,
+            sort,
+            ascending,
             selected_base: None,
             scroll_to_base: None,
             load: Arc::new(Mutex::new(LoadState::Loading)),
@@ -72,7 +98,12 @@ pub fn open(app: &mut TaskManApp, process: &tm_core::model::ProcessEntry, ctx: &
         app.shared.toast(i18n::tr(K::ProcessExited));
         return;
     }
-    let mut state = State::new(identity, process.shown_name().to_string());
+    let saved_sort = app.shared.settings.table_sort.get("modules");
+    let sort = saved_sort
+        .and_then(|saved| SortColumn::from_id(&saved.column))
+        .unwrap_or(SortColumn::Name);
+    let ascending = saved_sort.is_none_or(|saved| saved.ascending);
+    let mut state = State::new(identity, process.shown_name().to_string(), sort, ascending);
     begin_fetch(&mut state, app.actions.clone(), ctx);
     app.module_dialog = Some(state);
 }
@@ -172,11 +203,7 @@ fn visible_modules(state: &State, modules: &[ProcessModule]) -> Vec<ProcessModul
     let needle = state.filter.trim().to_ascii_lowercase();
     let mut rows = modules
         .iter()
-        .filter(|module| {
-            needle.is_empty()
-                || module.name.to_ascii_lowercase().contains(&needle)
-                || module.path.to_ascii_lowercase().contains(&needle)
-        })
+        .filter(|module| module_matches_filter(module, &needle))
         .cloned()
         .collect::<Vec<_>>();
     rows.sort_by(|a, b| {
@@ -188,6 +215,12 @@ fn visible_modules(state: &State, modules: &[ProcessModule]) -> Vec<ProcessModul
         }
     });
     rows
+}
+
+fn module_matches_filter(module: &ProcessModule, needle: &str) -> bool {
+    needle.is_empty()
+        || module.name.to_ascii_lowercase().contains(needle)
+        || module.path.to_ascii_lowercase().contains(needle)
 }
 
 pub fn dialog(app: &mut TaskManApp, ctx: &egui::Context, pal: &theme::Palette) {
@@ -205,6 +238,16 @@ pub fn dialog(app: &mut TaskManApp, ctx: &egui::Context, pal: &theme::Palette) {
     let mut request_unload = None;
     let can_unload = app.actions.capabilities().unload_module;
     let snapshot = tm_core::sync::lock(&state.load).clone();
+    let selected_module = match &snapshot {
+        LoadState::Ready(modules) => state
+            .selected_base
+            .and_then(|base| modules.iter().find(|module| module.base_address == base))
+            .filter(|module| {
+                module_matches_filter(module, &state.filter.trim().to_ascii_lowercase())
+            })
+            .cloned(),
+        _ => None,
+    };
 
     egui::Window::new(title)
         .open(&mut open)
@@ -226,6 +269,23 @@ pub fn dialog(app: &mut TaskManApp, ctx: &egui::Context, pal: &theme::Palette) {
                     .clicked()
                 {
                     request_refresh = true;
+                }
+                let unload = ui
+                    .add_enabled(
+                        can_unload
+                            && selected_module
+                                .as_ref()
+                                .is_some_and(|module| module.unloadable)
+                            && !state.unload.busy(),
+                        egui::Button::new(i18n::tr(K::UnloadModule)),
+                    )
+                    .on_disabled_hover_text(if selected_module.is_none() {
+                        i18n::tr(K::SelectModuleFirst)
+                    } else {
+                        i18n::tr(K::ModuleProtected)
+                    });
+                if unload.clicked() {
+                    request_unload = selected_module.clone();
                 }
                 if state.fetch.busy() || state.unload.busy() {
                     ui.spinner();
@@ -387,6 +447,7 @@ pub fn dialog(app: &mut TaskManApp, ctx: &egui::Context, pal: &theme::Palette) {
                             state.sort = next;
                             state.ascending = !matches!(next, SortColumn::Base | SortColumn::Size);
                         }
+                        app.persist_sort("modules", state.sort.id(), state.ascending);
                     }
                     app.persist_table(&table);
                 }
@@ -473,6 +534,8 @@ mod tests {
                 start_epoch_s: None,
             },
             "target.exe".into(),
+            SortColumn::Name,
+            true,
         );
         let modules = vec![module("alpha.dll", 1, 1), module("beta.dll", 2, 2)];
         state.filter = "alpha".into();

@@ -115,8 +115,17 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
                 wake();
             };
             match &app.shared.executor {
-                Some(executor) => executor.run_quiet(|| {}, job),
-                None => job(),
+                Some(executor) => {
+                    if !executor.run_quiet(|| {}, job) {
+                        app.shared.sessions_fetch.end();
+                        app.shared.toast(i18n::tr(K::ActionQueueFull));
+                    }
+                }
+                None => {
+                    drop(job);
+                    app.shared.sessions_fetch.end();
+                    app.shared.toast(i18n::tr(K::ActionFailed));
+                }
             }
         }
     }
@@ -356,6 +365,8 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
     );
     if let Some(column) = clicked {
         app.users_sort.clicked(column, column >= 2);
+        let ids = ["user", "status", "cpu", "mem", "disk", "net"];
+        app.persist_sort("users", ids[column], app.users_sort.ascending);
     }
     app.persist_table(&table);
 }

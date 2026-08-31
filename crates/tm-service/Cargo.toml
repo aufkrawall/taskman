@@ -1,0 +1,18 @@
+[package]
+name = "tm-service"
+description = "Hardened Windows action broker for TaskMan"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "taskman-service"
+path = "src/main.rs"
+
+[dependencies]
+tm-core = { workspace = true }
+tm-platform = { workspace = true }
+tracing = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+windows-service = { workspace = true }

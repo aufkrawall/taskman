@@ -36,7 +36,12 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::io::Read;
 use std::path::{Path, PathBuf};
+
+use crate::model::PriorityClass;
+
+const MAX_SETTINGS_BYTES: usize = 4 * 1024 * 1024;
 
 /// Test/isolation override (implement.md §23): when set, all config files
 /// live under this directory instead of the user profile.
@@ -93,6 +98,42 @@ impl UpdateSpeed {
     }
 }
 
+/// Persisted sort for one table, keyed by stable table/column identifiers.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SortPreference {
+    pub column: String,
+    pub ascending: bool,
+}
+
+/// Optional policy applied whenever an executable starts. Rules are keyed by
+/// normalized full image path, never by PID or bare file name, so unrelated
+/// programs cannot accidentally inherit each other's scheduling policy.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct ProcessRule {
+    pub priority: Option<PriorityClass>,
+    pub affinity_mask: Option<u64>,
+}
+
+impl ProcessRule {
+    pub fn is_empty(&self) -> bool {
+        self.priority.is_none() && self.affinity_mask.is_none()
+    }
+}
+
+/// Stable key used by saved process policies. Windows image paths are case
+/// insensitive and may arrive with either slash style across providers.
+pub fn process_rule_key(path: &Path) -> String {
+    let value = path.to_string_lossy();
+    #[cfg(target_os = "windows")]
+    {
+        value.replace('/', "\\").to_lowercase()
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        value.into_owned()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
@@ -125,15 +166,24 @@ pub struct Settings {
     /// User-defined column display order per table (stable column ids).
     /// Absent or empty means the built-in order.
     pub col_order: BTreeMap<String, Vec<String>>,
+    /// Sort choice per table, using the same stable column ids as widths.
+    pub table_sort: BTreeMap<String, SortPreference>,
+    /// Scheduling policies keyed by normalized executable image path.
+    pub process_rules: BTreeMap<String, ProcessRule>,
     /// Width of the Performance tab's left card column.
     pub perf_card_width: f32,
     /// Performance CPU graph mode: "overall" | "logical".
     pub cpu_graph_mode: String,
     /// Overlay kernel time (darker band) in the CPU graphs.
     pub show_kernel_times: bool,
-    /// Processes page presentation: false = Task-Manager-style categories,
-    /// true = literal parent/child process tree (System Informer-style).
-    pub process_tree_view: bool,
+    /// Details page presentation: false = flat list, true = literal
+    /// parent/child process tree (System Informer-style).
+    #[serde(alias = "process_tree_view")]
+    pub details_tree_view: bool,
+    /// Hide the main window instead of exiting when its close button is used.
+    pub close_to_tray: bool,
+    /// Register this executable for per-user Windows logon startup.
+    pub start_with_windows: bool,
     /// Windows: start with administrator privileges. When this launch is
     /// unelevated, the process re-execs itself elevated (runas/UAC) before
     /// the window opens.
@@ -157,10 +207,14 @@ impl Default for Settings {
             col_widths: BTreeMap::new(),
             col_visible: BTreeMap::new(),
             col_order: BTreeMap::new(),
+            table_sort: BTreeMap::new(),
+            process_rules: BTreeMap::new(),
             perf_card_width: 252.0,
             cpu_graph_mode: "overall".into(),
             show_kernel_times: false,
-            process_tree_view: false,
+            details_tree_view: false,
+            close_to_tray: false,
+            start_with_windows: false,
             start_elevated: false,
         }
     }
@@ -228,6 +282,8 @@ fn render_ini(
     columns: &BTreeMap<String, BTreeMap<String, f32>>,
     visible: &BTreeMap<String, BTreeMap<String, bool>>,
     order: &BTreeMap<String, Vec<String>>,
+    sort: &BTreeMap<String, SortPreference>,
+    process_rules: &BTreeMap<String, ProcessRule>,
 ) -> String {
     let mut out = String::with_capacity(512);
     out.push_str("# taskman configuration — edited values apply on the next start.\n");
@@ -261,6 +317,31 @@ fn render_ini(
             "\n[columns.{table}.order]\norder={}\n",
             escape_ini(&ids.join(","))
         ));
+    }
+    if !sort.is_empty() {
+        out.push_str("\n[sort]\n# table = stable column id, ascending\n");
+        for (table, preference) in sort {
+            out.push_str(&format!(
+                "{}={},{}\n",
+                escape_ini(table),
+                escape_ini(&preference.column),
+                preference.ascending
+            ));
+        }
+    }
+    let rules = process_rules
+        .iter()
+        .filter(|(_, rule)| !rule.is_empty())
+        .collect::<Vec<_>>();
+    if !rules.is_empty() {
+        out.push_str(
+            "\n[process-rules]\n# rule.N = JSON [normalized image path, scheduling policy]\n",
+        );
+        for (index, (path, rule)) in rules.into_iter().enumerate() {
+            if let Ok(record) = serde_json::to_string(&(path, rule)) {
+                out.push_str(&format!("rule.{index}={}\n", escape_ini(&record)));
+            }
+        }
     }
     out
 }
@@ -408,7 +489,20 @@ impl Settings {
     /// Load settings from `path` (or the platform default). A missing file
     /// yields defaults; unparsable values fall back per-key to defaults.
     pub fn load_from(path: &Path) -> Self {
-        match std::fs::read(path) {
+        let bytes = (|| -> std::io::Result<Vec<u8>> {
+            let file = std::fs::File::open(path)?;
+            let mut bytes = Vec::with_capacity(16 * 1024);
+            file.take((MAX_SETTINGS_BYTES + 1) as u64)
+                .read_to_end(&mut bytes)?;
+            if bytes.len() > MAX_SETTINGS_BYTES {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "settings file exceeds 4 MiB",
+                ));
+            }
+            Ok(bytes)
+        })();
+        match bytes {
             Ok(bytes) => {
                 // Tolerate a UTF-8 BOM (e.g. files edited with PowerShell).
                 let text = String::from_utf8_lossy(&bytes);
@@ -417,8 +511,8 @@ impl Settings {
                 tracing::debug!(path = %path.display(), "settings loaded");
                 s
             }
-            Err(_) => {
-                tracing::debug!(path = %path.display(), "no settings file yet; using defaults");
+            Err(error) => {
+                tracing::debug!(path = %path.display(), %error, "settings unavailable; using defaults");
                 Self::default()
             }
         }
@@ -492,7 +586,14 @@ impl Settings {
             }
         }
         s.show_kernel_times = b("general", "show_kernel_times", s.show_kernel_times);
-        s.process_tree_view = b("general", "process_tree_view", s.process_tree_view);
+        // `process_tree_view` was briefly shipped for the Processes page.
+        // Preserve that preference while moving the literal tree to Details.
+        s.details_tree_view = get("general", "details_tree_view")
+            .and_then(|v| parse_bool(v))
+            .or_else(|| get("general", "process_tree_view").and_then(|v| parse_bool(v)))
+            .unwrap_or(s.details_tree_view);
+        s.close_to_tray = b("general", "close_to_tray", s.close_to_tray);
+        s.start_with_windows = b("general", "start_with_windows", s.start_with_windows);
 
         // Column preferences, ID-keyed schema: `[columns.<table>]
         // <col>=<width>`, `[columns.<table>.visible] <col>=0|1` and
@@ -503,6 +604,28 @@ impl Settings {
         for ((section, key), value) in &kv {
             if section == "columns" {
                 saw_legacy = true;
+            } else if section == "sort" {
+                let Some((column, ascending)) = value.rsplit_once(',') else {
+                    continue;
+                };
+                if !column.trim().is_empty()
+                    && let Some(ascending) = parse_bool(ascending.trim())
+                {
+                    s.table_sort.insert(
+                        key.clone(),
+                        SortPreference {
+                            column: column.trim().to_string(),
+                            ascending,
+                        },
+                    );
+                }
+            } else if section == "process-rules" && key.starts_with("rule.") {
+                if let Ok((path, rule)) = serde_json::from_str::<(String, ProcessRule)>(value)
+                    && !path.trim().is_empty()
+                    && !rule.is_empty()
+                {
+                    s.process_rules.insert(path, rule);
+                }
             } else if let Some(rest) = section.strip_prefix("columns.") {
                 match rest.rsplit_once('.') {
                     Some((table, "visible")) => {
@@ -626,7 +749,9 @@ impl Settings {
             ("perf_card_width", self.perf_card_width.to_string()),
             ("cpu_graph_mode", self.cpu_graph_mode.clone()),
             ("show_kernel_times", self.show_kernel_times.to_string()),
-            ("process_tree_view", self.process_tree_view.to_string()),
+            ("details_tree_view", self.details_tree_view.to_string()),
+            ("close_to_tray", self.close_to_tray.to_string()),
+            ("start_with_windows", self.start_with_windows.to_string()),
             ("start_elevated", self.start_elevated.to_string()),
         ];
         let mut body = String::from("[general]\n");
@@ -636,7 +761,14 @@ impl Settings {
         let tmp = path.with_extension("ini.tmp");
         std::fs::write(
             &tmp,
-            render_ini(body, &self.col_widths, &self.col_visible, &self.col_order),
+            render_ini(
+                body,
+                &self.col_widths,
+                &self.col_visible,
+                &self.col_order,
+                &self.table_sort,
+                &self.process_rules,
+            ),
         )?;
         // Atomic-ish replace so a crash mid-write never corrupts settings.
         std::fs::rename(&tmp, path)?;
@@ -831,7 +963,9 @@ mod tests {
         s.perf_card_width = 300.5;
         s.cpu_graph_mode = "logical".into();
         s.show_kernel_times = true;
-        s.process_tree_view = true;
+        s.details_tree_view = true;
+        s.close_to_tray = true;
+        s.start_with_windows = true;
         s.start_elevated = true;
         s.col_widths.insert(
             "processes".into(),
@@ -847,6 +981,20 @@ mod tests {
             "details".into(),
             vec!["pid".into(), "name".into(), "cpu".into()],
         );
+        s.table_sort.insert(
+            "details".into(),
+            SortPreference {
+                column: "cpu".into(),
+                ascending: false,
+            },
+        );
+        s.process_rules.insert(
+            process_rule_key(Path::new(r"C:\Program Files\Example\worker.exe")),
+            ProcessRule {
+                priority: Some(PriorityClass::AboveNormal),
+                affinity_mask: Some(0x35),
+            },
+        );
 
         s.save_to(&path).unwrap();
         let loaded = Settings::load_from(&path);
@@ -857,6 +1005,14 @@ mod tests {
     fn missing_file_gives_defaults() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("nope.ini");
+        assert_eq!(Settings::load_from(&path), Settings::default());
+    }
+
+    #[test]
+    fn oversized_settings_fail_closed_to_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.ini");
+        std::fs::write(&path, vec![b'x'; MAX_SETTINGS_BYTES + 1]).unwrap();
         assert_eq!(Settings::load_from(&path), Settings::default());
     }
 
@@ -926,6 +1082,39 @@ whatever=yes
             s.col_visible.get("users").and_then(|m| m.get("pid")),
             Some(&true)
         );
+    }
+
+    #[test]
+    fn legacy_process_tree_setting_migrates_to_details() {
+        let s = Settings::from_ini_text("[general]\nprocess_tree_view=true\n");
+        assert!(s.details_tree_view);
+        let newer =
+            Settings::from_ini_text("[general]\nprocess_tree_view=true\ndetails_tree_view=false\n");
+        assert!(
+            !newer.details_tree_view,
+            "new key wins over the legacy alias"
+        );
+    }
+
+    #[test]
+    fn invalid_sort_and_process_rules_are_ignored() {
+        let s = Settings::from_ini_text(
+            r#"[sort]
+details=cpu,false
+broken=no-comma
+[process-rules]
+rule.0=not-json
+rule.1=["c:\\\\ok.exe",{"priority":"High","affinity_mask":3}]
+"#,
+        );
+        assert_eq!(
+            s.table_sort.get("details"),
+            Some(&SortPreference {
+                column: "cpu".into(),
+                ascending: false,
+            })
+        );
+        assert_eq!(s.process_rules.len(), 1);
     }
 
     #[test]

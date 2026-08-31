@@ -422,8 +422,8 @@ fn read_registry_values(hive: HKEY, subkey: &str) -> Vec<(String, String)> {
                 break;
             }
             let name = String::from_utf16_lossy(&name_buf[..name_len as usize]);
-            let mut data = vec![0u8; data_len.max(1) as usize];
-            let mut actual = data_len;
+            let mut data = vec![0u8; data_len.clamp(1, 64 * 1024) as usize];
+            let mut actual = data.len() as u32;
             let name_query = wstr(&name);
             let ok = RegQueryValueExW(
                 key,
@@ -497,8 +497,8 @@ fn read_registry_binary(hive: HKEY, subkey: &str) -> HashMap<String, Vec<u8>> {
                 break;
             }
             let name = String::from_utf16_lossy(&name_buf[..name_len as usize]);
-            let mut data = vec![0u8; data_len.max(1) as usize];
-            let mut actual = data_len;
+            let mut data = vec![0u8; data_len.clamp(1, 64 * 1024) as usize];
+            let mut actual = data.len() as u32;
             let name_query = wstr(&name);
             if RegQueryValueExW(
                 key,

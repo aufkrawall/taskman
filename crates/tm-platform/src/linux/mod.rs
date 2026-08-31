@@ -595,6 +595,7 @@ impl PlatformActions for LinuxActions {
             per_process_network: false,
             process_modules: false,
             unload_module: false,
+            start_with_windows: false,
         }
     }
 

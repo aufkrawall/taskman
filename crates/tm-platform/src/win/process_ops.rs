@@ -44,20 +44,57 @@ fn creation_epoch_from_handle(h: HANDLE) -> Option<i64> {
     i64::try_from(raw.saturating_sub(116_444_736_000_000_000) / 10_000_000).ok()
 }
 
-/// Tolerance (seconds) when comparing creation times. sysinfo derives
-/// start_epoch_s with the same truncation, but a small slack keeps harmless
-/// rounding differences from failing a legitimate kill while still being
-/// orders of magnitude below any realistic pid-reuse delay.
-const CREATION_MATCH_TOLERANCE_S: i64 = 2;
-
 fn creation_matches(expected: i64, actual: Option<i64>) -> bool {
     match actual {
-        Some(t) => (t - expected).abs() <= CREATION_MATCH_TOLERANCE_S,
+        // sysinfo and this handle-bound path both truncate the same FILETIME
+        // value to Unix seconds. Exact matching minimizes the PID-reuse
+        // window and also avoids arithmetic overflow on hostile IPC input.
+        Some(actual) => actual == expected,
         // Cannot verify the identity of a destructive operation → fail
         // closed. GetProcessTimes only fails on handles that cannot
         // terminate anyway (protected processes).
         None => false,
     }
+}
+
+fn refuse_critical_handle(pid: u32, process: HANDLE) -> Result<()> {
+    if pid <= 4 {
+        return Err(TmError::platform(
+            "process safety",
+            "system process is protected",
+        ));
+    }
+    let mut critical = windows::core::BOOL::default();
+    unsafe { th::IsProcessCritical(process, &mut critical) }
+        .map_err(|error| TmError::platform("IsProcessCritical", error.to_string()))?;
+    if critical.as_bool() {
+        return Err(TmError::platform(
+            "process safety",
+            "critical Windows process is protected",
+        ));
+    }
+    Ok(())
+}
+
+/// Open and identity-check the exact handle that will perform a destructive
+/// action, then establish critical-process state on that same handle.
+fn open_destructive_process_verified(
+    pid: u32,
+    access: th::PROCESS_ACCESS_RIGHTS,
+    expected_start_epoch_s: Option<i64>,
+) -> Result<HANDLE> {
+    let process = open_process_verified(
+        pid,
+        access | th::PROCESS_QUERY_LIMITED_INFORMATION,
+        expected_start_epoch_s,
+    )?;
+    if let Err(error) = refuse_critical_handle(pid, process) {
+        unsafe {
+            let _ = CloseHandle(process);
+        }
+        return Err(error);
+    }
+    Ok(process)
 }
 
 /// Open `pid` for an operation and verify its identity first. When
@@ -83,6 +120,20 @@ fn open_process_verified(
         }
     }
     Ok(h)
+}
+
+/// Refuse operations that can destabilize the entire machine. The service
+/// broker calls this for every target, and local elevated actions use the same
+/// guard for every destructive process action. Failure to establish critical
+/// state is itself a refusal: a LocalSystem caller must never treat missing
+/// safety telemetry as permission.
+pub(crate) fn refuse_critical_process(pid: u32) -> Result<()> {
+    let process = open_process(pid, th::PROCESS_QUERY_LIMITED_INFORMATION)?;
+    let result = refuse_critical_handle(pid, process);
+    unsafe {
+        let _ = CloseHandle(process);
+    }
+    result
 }
 
 // ------------------------------------------------------------------ modules
@@ -239,7 +290,7 @@ pub fn unload_process_module(
         ));
     }
 
-    let process = open_process_verified(
+    let process = open_destructive_process_verified(
         pid,
         th::PROCESS_CREATE_THREAD
             | th::PROCESS_QUERY_INFORMATION
@@ -324,13 +375,15 @@ pub fn unload_process_module(
                 remote_proc,
             )
         });
+        let remote_module = usize::try_from(base_address)
+            .map_err(|_| TmError::platform("unload module", "module address is out of range"))?;
         let thread = unsafe {
             th::CreateRemoteThread(
                 process,
                 None,
                 0,
                 start,
-                Some(base_address as usize as *const core::ffi::c_void),
+                Some(remote_module as *const core::ffi::c_void),
                 0,
                 None,
             )
@@ -473,8 +526,8 @@ pub fn command_line_of(pid: u32) -> Option<String> {
             if buf_ptr.is_null() || len == 0 || !len.is_multiple_of(2) {
                 return None;
             }
-            let base = buf_ptr as usize - buf.as_ptr() as usize;
-            if base + len > buf.len() {
+            let base = (buf_ptr as usize).checked_sub(buf.as_ptr() as usize)?;
+            if base.checked_add(len).is_none_or(|end| end > buf.len()) {
                 return None;
             }
             let chars = std::slice::from_raw_parts(buf.as_ptr().add(base) as *const u16, len / 2);
@@ -533,14 +586,16 @@ pub fn kill_single(pid: u32) -> Result<()> {
 /// [`open_process_verified`]). A recycled pid is refused instead of killing
 /// an unrelated process.
 pub fn terminate_verified(pid: u32, expected_start_epoch_s: Option<i64>) -> Result<()> {
-    let h = open_process_verified(pid, th::PROCESS_TERMINATE, expected_start_epoch_s)?;
-    unsafe {
-        // Exit code 1 mirrors Task Manager behavior.
-        let r = th::TerminateProcess(h, 1)
-            .map_err(|e| TmError::platform("TerminateProcess", e.to_string()));
-        let _ = CloseHandle(h);
-        r
-    }
+    let h = open_destructive_process_verified(pid, th::PROCESS_TERMINATE, expected_start_epoch_s)?;
+    let result = terminate_handle(h);
+    let _ = unsafe { CloseHandle(h) };
+    result
+}
+
+fn terminate_handle(process: HANDLE) -> Result<()> {
+    // Exit code 1 mirrors Task Manager behavior.
+    unsafe { th::TerminateProcess(process, 1) }
+        .map_err(|error| TmError::platform("TerminateProcess", error.to_string()))
 }
 
 /// Terminate `pid` (and, with `tree`, all descendants). When
@@ -549,27 +604,52 @@ pub fn terminate_verified(pid: u32, expected_start_epoch_s: Option<i64>) -> Resu
 /// opened — the same identity discipline the UI applies, moved down to the
 /// one place where it can be enforced race-free.
 pub fn kill_process(pid: u32, expected_start_epoch_s: Option<i64>, tree: bool) -> Result<()> {
+    kill_process_excluding(pid, expected_start_epoch_s, tree, None)
+}
+
+pub(crate) fn kill_process_excluding(
+    pid: u32,
+    expected_start_epoch_s: Option<i64>,
+    tree: bool,
+    protected_pid: Option<u32>,
+) -> Result<()> {
     if !tree {
         return terminate_verified(pid, expected_start_epoch_s);
     }
+    // Validate and pin the root before enumerating descendants. The previous
+    // order could terminate descendants first and discover only afterwards
+    // that the selected root PID had been recycled.
+    let root =
+        open_destructive_process_verified(pid, th::PROCESS_TERMINATE, expected_start_epoch_s)?;
+    let root_creation = creation_filetime_from_handle(root);
     // Descendants: capture each child's creation time right at enumeration;
     // terminate_verified re-checks it through the handle before firing.
     let children = collect_children_with_births(pid);
+    if let Err(error) = verify_pid_still_refers_to(pid, root_creation) {
+        let _ = unsafe { CloseHandle(root) };
+        return Err(error);
+    }
     // Kill descendants depth-first (deepest last in BFS order → reverse).
     let mut err: Option<TmError> = None;
     for (c, birth) in children.iter().rev() {
-        if *c != std::process::id()
-            // A child whose birth could not be fingerprinted falls back to
-            // the previous unverified kill (its creation time has nothing to
-            // do with the root's identity, so substituting that would fail
-            // every such child).
-            && let Err(e) = terminate_verified(*c, *birth)
-        {
+        if *c == std::process::id() || protected_pid == Some(*c) {
+            continue;
+        }
+        let result = match birth {
+            Some(birth) => terminate_verified(*c, Some(*birth)),
+            None => Err(TmError::platform(
+                "terminate process tree",
+                format!("could not establish the creation time of child process {c}"),
+            )),
+        };
+        if let Err(e) = result {
             tracing::debug!(child = c, error = %e, "tree-kill child failed");
             err.get_or_insert(e);
         }
     }
-    match terminate_verified(pid, expected_start_epoch_s) {
+    let root_result = terminate_handle(root);
+    let _ = unsafe { CloseHandle(root) };
+    match root_result {
         Ok(()) => err.map_or(Ok(()), Err),
         Err(e) => Err(err.unwrap_or(e)),
     }
@@ -661,6 +741,14 @@ fn ntdll_fn(name: &str) -> Option<NtSuspendFn> {
 }
 
 pub fn suspend_process(pid: u32, suspend: bool) -> Result<()> {
+    suspend_process_checked(pid, None, suspend)
+}
+
+pub fn suspend_process_checked(
+    pid: u32,
+    expected_start_epoch_s: Option<i64>,
+    suspend: bool,
+) -> Result<()> {
     let f = ntdll_fn(if suspend {
         "NtSuspendProcess"
     } else {
@@ -668,7 +756,11 @@ pub fn suspend_process(pid: u32, suspend: bool) -> Result<()> {
     })
     .ok_or(TmError::Unsupported("ntdll suspend/resume"))?;
     unsafe {
-        let h = open_process(pid, th::PROCESS_SUSPEND_RESUME)?;
+        let h = open_destructive_process_verified(
+            pid,
+            th::PROCESS_SUSPEND_RESUME,
+            expected_start_epoch_s,
+        )?;
         let rc = f(h);
         let _ = CloseHandle(h);
         if rc == 0 {
@@ -685,8 +777,26 @@ pub fn suspend_process(pid: u32, suspend: bool) -> Result<()> {
 // ------------------------------------------------------------------ priority / affinity
 
 pub fn set_priority(pid: u32, priority: PriorityClass) -> Result<()> {
+    set_priority_checked(pid, None, priority)
+}
+
+pub fn set_priority_checked(
+    pid: u32,
+    expected_start_epoch_s: Option<i64>,
+    priority: PriorityClass,
+) -> Result<()> {
+    if priority == PriorityClass::Unknown {
+        return Err(TmError::platform(
+            "SetPriorityClass",
+            "an explicit priority class is required",
+        ));
+    }
     unsafe {
-        let h = open_process(pid, th::PROCESS_SET_INFORMATION)?;
+        let h = open_destructive_process_verified(
+            pid,
+            th::PROCESS_SET_INFORMATION,
+            expected_start_epoch_s,
+        )?;
         let r = th::SetPriorityClass(h, unmap_priority(priority))
             .map_err(|e| TmError::platform("SetPriorityClass", e.to_string()));
         let _ = CloseHandle(h);
@@ -695,8 +805,16 @@ pub fn set_priority(pid: u32, priority: PriorityClass) -> Result<()> {
 }
 
 pub fn get_affinity(pid: u32) -> Result<u64> {
+    get_affinity_checked(pid, None)
+}
+
+pub fn get_affinity_checked(pid: u32, expected_start_epoch_s: Option<i64>) -> Result<u64> {
     unsafe {
-        let h = open_process(pid, th::PROCESS_QUERY_LIMITED_INFORMATION)?;
+        let h = open_process_verified(
+            pid,
+            th::PROCESS_QUERY_LIMITED_INFORMATION,
+            expected_start_epoch_s,
+        )?;
         let mut proc_mask: usize = 0;
         let mut sys_mask: usize = 0;
         let r = th::GetProcessAffinityMask(h, &mut proc_mask, &mut sys_mask)
@@ -708,14 +826,42 @@ pub fn get_affinity(pid: u32) -> Result<u64> {
 }
 
 pub fn system_affinity() -> Result<u64> {
-    let pid = std::process::id();
-    get_affinity(pid)
+    unsafe {
+        let h = open_process(std::process::id(), th::PROCESS_QUERY_LIMITED_INFORMATION)?;
+        let mut process_mask: usize = 0;
+        let mut system_mask: usize = 0;
+        let result = th::GetProcessAffinityMask(h, &mut process_mask, &mut system_mask)
+            .map_err(|error| TmError::platform("GetProcessAffinityMask(system)", error.to_string()))
+            .map(|_| system_mask as u64);
+        let _ = CloseHandle(h);
+        result
+    }
 }
 
 pub fn set_affinity(pid: u32, mask: u64) -> Result<()> {
+    set_affinity_checked(pid, None, mask)
+}
+
+pub fn set_affinity_checked(
+    pid: u32,
+    expected_start_epoch_s: Option<i64>,
+    mask: u64,
+) -> Result<()> {
+    let native_mask = usize::try_from(mask)
+        .map_err(|_| TmError::platform("SetProcessAffinityMask", "mask is out of range"))?;
+    if native_mask == 0 {
+        return Err(TmError::platform(
+            "SetProcessAffinityMask",
+            "mask cannot be zero",
+        ));
+    }
     unsafe {
-        let h = open_process(pid, th::PROCESS_SET_INFORMATION)?;
-        let r = th::SetProcessAffinityMask(h, mask as usize)
+        let h = open_destructive_process_verified(
+            pid,
+            th::PROCESS_SET_INFORMATION,
+            expected_start_epoch_s,
+        )?;
+        let r = th::SetProcessAffinityMask(h, native_mask)
             .map_err(|e| TmError::platform("SetProcessAffinityMask", e.to_string()));
         let _ = CloseHandle(h);
         r
@@ -725,20 +871,37 @@ pub fn set_affinity(pid: u32, mask: u64) -> Result<()> {
 // ------------------------------------------------------------------ efficiency mode (EcoQoS)
 
 pub fn set_efficiency_mode(pid: u32, on: bool) -> Result<()> {
+    set_efficiency_mode_checked(pid, None, on)
+}
+
+pub fn set_efficiency_mode_checked(
+    pid: u32,
+    expected_start_epoch_s: Option<i64>,
+    on: bool,
+) -> Result<()> {
     use windows::Win32::System::Threading::{
-        PROCESS_POWER_THROTTLING_EXECUTION_SPEED, PROCESS_POWER_THROTTLING_STATE,
-        ProcessPowerThrottling, SetProcessInformation,
+        PROCESS_POWER_THROTTLING_CURRENT_VERSION, PROCESS_POWER_THROTTLING_EXECUTION_SPEED,
+        PROCESS_POWER_THROTTLING_STATE, ProcessPowerThrottling, SetProcessInformation,
     };
     unsafe {
-        let h = open_process(pid, th::PROCESS_SET_INFORMATION)?;
-        // State=0 + Control set → throttling ON; State=flag → throttling OFF.
+        let h = open_destructive_process_verified(
+            pid,
+            th::PROCESS_SET_INFORMATION,
+            expected_start_epoch_s,
+        )?;
+        // Enabling opts into EcoQoS. Disabling releases explicit control and
+        // restores Windows' system-managed QoS behavior.
         let state = PROCESS_POWER_THROTTLING_STATE {
-            Version: 1,
-            ControlMask: PROCESS_POWER_THROTTLING_EXECUTION_SPEED,
-            StateMask: if on {
-                0u32
-            } else {
+            Version: PROCESS_POWER_THROTTLING_CURRENT_VERSION,
+            ControlMask: if on {
                 PROCESS_POWER_THROTTLING_EXECUTION_SPEED
+            } else {
+                0
+            },
+            StateMask: if on {
+                PROCESS_POWER_THROTTLING_EXECUTION_SPEED
+            } else {
+                0
             },
         };
         let r = SetProcessInformation(
@@ -774,13 +937,16 @@ pub fn efficiency_mode_state(pid: u32) -> Option<bool> {
         if !ok {
             return None;
         }
-        // ControlMask says whether throttling is managed at all; StateMask
-        // carries the enabled flag.
-        Some(
-            info.ControlMask & PROCESS_POWER_THROTTLING_EXECUTION_SPEED != 0
-                && info.StateMask & PROCESS_POWER_THROTTLING_EXECUTION_SPEED == 0,
-        )
+        Some(power_throttling_enabled(
+            info.ControlMask,
+            info.StateMask,
+            PROCESS_POWER_THROTTLING_EXECUTION_SPEED,
+        ))
     }
+}
+
+fn power_throttling_enabled(control_mask: u32, state_mask: u32, flag: u32) -> bool {
+    control_mask & flag != 0 && state_mask & flag != 0
 }
 
 /// Per-process token security facts (implement.md §12.2/§12.3):
@@ -859,6 +1025,70 @@ pub fn token_security(pid: u32) -> TokenSecurity {
     out
 }
 
+/// Enable or disable token virtualization for an exact live process. This is
+/// the narrow equivalent of Task Manager's Details context-menu action: the
+/// process handle is identity/critical checked first, the token must report
+/// that virtualization is allowed, and only the virtualization DWORD is set.
+pub fn set_uac_virtualization_checked(
+    pid: u32,
+    expected_start_epoch_s: Option<i64>,
+    enabled: bool,
+) -> Result<()> {
+    use windows::Win32::Security::{
+        GetTokenInformation, SetTokenInformation, TOKEN_ADJUST_DEFAULT, TOKEN_QUERY,
+        TokenVirtualizationAllowed, TokenVirtualizationEnabled,
+    };
+    use windows::Win32::System::Threading::OpenProcessToken;
+
+    unsafe {
+        let process = open_destructive_process_verified(
+            pid,
+            th::PROCESS_QUERY_LIMITED_INFORMATION,
+            expected_start_epoch_s,
+        )?;
+        let mut token = HANDLE::default();
+        let result = (|| -> Result<()> {
+            OpenProcessToken(process, TOKEN_QUERY | TOKEN_ADJUST_DEFAULT, &mut token)
+                .map_err(|error| TmError::platform("OpenProcessToken", error.to_string()))?;
+
+            let mut allowed = 0u32;
+            let mut returned = 0u32;
+            GetTokenInformation(
+                token,
+                TokenVirtualizationAllowed,
+                Some(&mut allowed as *mut u32 as *mut _),
+                std::mem::size_of::<u32>() as u32,
+                &mut returned,
+            )
+            .map_err(|error| {
+                TmError::platform("GetTokenInformation(virtualization)", error.to_string())
+            })?;
+            if allowed == 0 {
+                return Err(TmError::platform(
+                    "UAC virtualization",
+                    "virtualization is not allowed for this process token",
+                ));
+            }
+
+            let value = u32::from(enabled);
+            SetTokenInformation(
+                token,
+                TokenVirtualizationEnabled,
+                &value as *const u32 as *const _,
+                std::mem::size_of::<u32>() as u32,
+            )
+            .map_err(|error| {
+                TmError::platform("SetTokenInformation(virtualization)", error.to_string())
+            })
+        })();
+        if !token.is_invalid() {
+            let _ = CloseHandle(token);
+        }
+        let _ = CloseHandle(process);
+        result
+    }
+}
+
 // ------------------------------------------------------------------ elevation / launch
 
 pub fn is_elevated() -> bool {
@@ -888,10 +1118,89 @@ pub fn run_new_task_probe(command_line: &str, elevate: bool) -> Result<()> {
     shell_execute(&file, params.as_deref(), elevate, true)
 }
 
+/// Launch a helper and wait off the UI thread for its real exit status.
+/// Intended for explicit installer/uninstaller flows where "spawned" is not
+/// a sufficient success condition.
+pub(crate) fn run_new_task_wait(
+    command_line: &str,
+    elevate: bool,
+    timeout: std::time::Duration,
+) -> Result<()> {
+    use windows::Win32::Foundation::{WAIT_OBJECT_0, WAIT_TIMEOUT};
+    use windows::Win32::UI::Shell::{
+        SEE_MASK_FLAG_NO_UI, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW,
+    };
+
+    let (file, params) = split_command(command_line);
+    if file.is_empty() {
+        return Err(TmError::platform("run_new_task", "empty command"));
+    }
+    let file_w: Vec<u16> = file.encode_utf16().chain([0]).collect();
+    let params_w: Option<Vec<u16>> = params.map(|value| value.encode_utf16().chain([0]).collect());
+    let verb_w: Option<Vec<u16>> = elevate.then(|| "runas\0".encode_utf16().collect());
+    let mut info = SHELLEXECUTEINFOW {
+        cbSize: std::mem::size_of::<SHELLEXECUTEINFOW>() as u32,
+        fMask: SEE_MASK_NOCLOSEPROCESS | SEE_MASK_FLAG_NO_UI,
+        lpVerb: verb_w
+            .as_ref()
+            .map_or(PCWSTR::null(), |value| PCWSTR::from_raw(value.as_ptr())),
+        lpFile: PCWSTR::from_raw(file_w.as_ptr()),
+        lpParameters: params_w
+            .as_ref()
+            .map_or(PCWSTR::null(), |value| PCWSTR::from_raw(value.as_ptr())),
+        nShow: SW_SHOWNORMAL.0,
+        ..Default::default()
+    };
+    unsafe {
+        ShellExecuteExW(&mut info).map_err(|error| {
+            TmError::platform("ShellExecuteExW", format!("{error} (elevation denied?)"))
+        })?;
+        if info.hProcess.is_invalid() {
+            return Err(TmError::platform(
+                "elevated helper",
+                "Windows did not return a process handle",
+            ));
+        }
+        let timeout_ms = timeout.as_millis().min(u128::from(u32::MAX)) as u32;
+        let wait = th::WaitForSingleObject(info.hProcess, timeout_ms);
+        let result = if wait == WAIT_OBJECT_0 {
+            let mut exit_code = 0u32;
+            match th::GetExitCodeProcess(info.hProcess, &mut exit_code) {
+                Err(error) => Err(TmError::platform("elevated helper exit", error.to_string())),
+                Ok(()) if exit_code == 0 => Ok(()),
+                Ok(()) => Err(TmError::platform(
+                    "elevated helper",
+                    format!("helper exited with status {exit_code}"),
+                )),
+            }
+        } else if wait == WAIT_TIMEOUT {
+            Err(TmError::platform(
+                "elevated helper",
+                format!(
+                    "helper did not finish within {} seconds; its final state is unknown",
+                    timeout.as_secs()
+                ),
+            ))
+        } else {
+            Err(TmError::platform(
+                "elevated helper wait",
+                std::io::Error::last_os_error().to_string(),
+            ))
+        };
+        let _ = CloseHandle(info.hProcess);
+        result
+    }
+}
+
 pub fn relaunch_elevated() -> Result<()> {
     let exe =
         std::env::current_exe().map_err(|e| TmError::platform("current_exe", e.to_string()))?;
-    shell_execute(&exe.to_string_lossy(), None, true, false)
+    shell_execute(
+        &exe.to_string_lossy(),
+        Some("--single-instance-handoff"),
+        true,
+        false,
+    )
 }
 
 // ------------------------------------------------------------------ shell helpers
@@ -1043,6 +1352,23 @@ fn split_command(cmd: &str) -> (String, Option<String>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn process_creation_identity_matches_exactly_and_without_overflow() {
+        assert!(creation_matches(100, Some(100)));
+        assert!(!creation_matches(100, Some(99)));
+        assert!(!creation_matches(100, Some(101)));
+        assert!(!creation_matches(i64::MIN, Some(i64::MAX)));
+        assert!(!creation_matches(100, None));
+    }
+
+    #[test]
+    fn power_throttling_requires_control_and_enabled_state_bits() {
+        let flag = 0x1;
+        assert!(power_throttling_enabled(flag, flag, flag));
+        assert!(!power_throttling_enabled(flag, 0, flag));
+        assert!(!power_throttling_enabled(0, flag, flag));
+    }
 
     #[test]
     fn only_third_party_dlls_are_unloadable() {

@@ -128,6 +128,8 @@ keys! {
     SearchHint => ["Nach Namen, Herausgeber oder PID suchen", "Type a name, publisher or PID to search"],
     Settings => ["Einstellungen", "Settings"],
     GatheringData => ["Sammle Daten…", "Gathering data…"],
+    TrayOpen => ["TaskMan öffnen", "Open TaskMan"],
+    TrayExit => ["TaskMan beenden", "Exit TaskMan"],
 
     // ------------------------------------------------ command bar
     RunNewTask => ["Neuen Task ausführen", "Run new task"],
@@ -143,6 +145,7 @@ keys! {
     ExpandAll => ["Alle erweitern", "Expand all"],
     CollapseAll => ["Alle reduzieren", "Collapse all"],
     ViewMode => ["Ansicht", "View"],
+    FlatView => ["Flache Liste", "Flat list"],
     GroupedView => ["Nach Typ gruppiert", "Grouped by type"],
     ProcessTreeView => ["Prozessstruktur", "Process tree"],
     RefreshNow => ["Jetzt aktualisieren (F5)", "Refresh now (F5)"],
@@ -165,6 +168,7 @@ keys! {
         "Programmabbilder und Windows-Systemmodule werden nicht entladen",
         "Program images and Windows system modules cannot be unloaded"
     ],
+    SelectModuleFirst => ["Zuerst ein Modul auswählen", "Select a module first"],
     CopyPath => ["Pfad kopieren", "Copy path"],
     Properties => ["Eigenschaften", "Properties"],
     OnlineSearch => ["Online suchen", "Search online"],
@@ -221,6 +225,15 @@ keys! {
     GroupWindows => ["Windows-Prozesse", "Windows processes"],
     ColGpu => ["GPU", "GPU"],
     UacUnknown => ["Unbekannt", "Unknown"],
+    UacVirtualization => ["UAC-Virtualisierung", "UAC virtualization"],
+    UacVirtualizationConfirm => [
+        "UAC-Virtualisierung für {} ändern? Dies kann die Funktion des Prozesses beeinflussen.",
+        "Change UAC virtualization for {}? This can affect how the process works."
+    ],
+    UacVirtualizationChanged => [
+        "UAC-Virtualisierung geändert",
+        "UAC virtualization changed"
+    ],
     SelectColumns => ["Spalten auswählen…", "Select columns…"],
     ColumnRequired => ["Erforderlich", "Required"],
 
@@ -228,6 +241,7 @@ keys! {
     StRunning => ["Wird ausgeführt", "Running"],
     StSuspended => ["Angehalten", "Suspended"],
     StNotResponding => ["Nicht reagiert", "Not responding"],
+    StEfficiencyMode => ["Effizienzmodus", "Efficiency mode"],
     StDisconnected => ["Getrennt", "Disconnected"],
     StIdle => ["Leerlauf", "Idle"],
     StConnected => ["Verbunden", "Connected"],
@@ -250,7 +264,19 @@ keys! {
     PrioNormal => ["Normal", "Normal"],
     PrioBelowNormal => ["Unter normal", "Below normal"],
     PrioLow => ["Niedrig", "Low"],
+    SavePriorityForProgram => [
+        "Priorität für dieses Programm speichern",
+        "Save priority for this program"
+    ],
     SetAffinity => ["Affinität festlegen…", "Set affinity…"],
+    SaveAffinityForProgram => [
+        "Affinität für dieses Programm speichern",
+        "Save affinity for this program"
+    ],
+    SaveRuleNeedsPath => [
+        "Nur für Prozesse mit bekanntem Abbildpfad verfügbar",
+        "Available only when the process image path is known"
+    ],
     SuspendProc => ["Anhalten", "Suspend"],
     ResumeProc => ["Fortsetzen", "Resume"],
     AffinityTitle => ["Prozessoraffinität — PID", "Processor affinity — PID"],
@@ -283,6 +309,7 @@ keys! {
     GraphWindowLabel => ["Diagrammfenster:", "Graph window:"],
     DefaultStartPageLabel => ["Startseite:", "Default start page:"],
     ProcessViewLabel => ["Prozessansicht:", "Process view:"],
+    DetailsViewLabel => ["Detailansicht:", "Details view:"],
     CpuGraphOverall => ["Gesamtauslastung", "Overall utilization"],
     CpuGraphLogical => ["Logische Prozessoren", "Logical processors"],
     ShowKernelTimes => ["Kernelzeiten anzeigen", "Show kernel times"],
@@ -290,6 +317,14 @@ keys! {
     ScaleLabel => ["Skalierung:", "Scale:"],
     LanguageLabel => ["Sprache:", "Language:"],
     AlwaysOnTop => ["Immer im Vordergrund", "Always on top"],
+    CloseToTray => [
+        "Beim Schließen in den Infobereich minimieren",
+        "Close to the notification area"
+    ],
+    StartWithWindows => [
+        "Mit Windows im Infobereich starten",
+        "Start with Windows in the notification area"
+    ],
     SaveConfigAuto => [
         "Einstellungen automatisch in config.ini speichern",
         "Save settings automatically to config.ini"
@@ -314,6 +349,30 @@ keys! {
     StartElevated => [
         "Immer mit Administratorrechten starten",
         "Always start with administrator privileges"
+    ],
+    CoreServiceHeading => ["TaskMan-Core-Dienst", "TaskMan core service"],
+    CheckingAdvancedState => ["Status wird geprüft…", "Checking status…"],
+    CoreServiceNotInstalled => [
+        "Nicht installiert. Geschützte Aktionen verwenden bei Bedarf weiterhin die Benutzerrechte oder UAC.",
+        "Not installed. Protected actions continue to use the user token or UAC when needed."
+    ],
+    CoreServiceStopped => ["Installiert, aber beendet.", "Installed but stopped."],
+    CoreServiceStarting => ["Wird gestartet…", "Starting…"],
+    CoreServiceRunning => [
+        "Aktiv (Version {}). Die Oberfläche kann ohne Administratorrechte bleiben.",
+        "Active (version {}). The GUI can remain unelevated."
+    ],
+    CoreServiceDegraded => ["Dienstproblem: {}", "Service problem: {}"],
+    InstallCoreService => ["Core-Dienst installieren…", "Install core service…"],
+    RepairCoreService => ["Core-Dienst reparieren…", "Repair core service…"],
+    RemoveCoreService => ["Core-Dienst entfernen…", "Remove core service…"],
+    CoreServiceInstallRequested => [
+        "Dienstinstallation angefordert. TaskMan danach schließen und neu öffnen; der geschützte Start erfolgt automatisch.",
+        "Service installation requested. Close and reopen TaskMan afterward; the protected copy starts automatically."
+    ],
+    CoreServiceRemoveRequested => [
+        "Dienstentfernung angefordert",
+        "Service removal requested"
     ],
     RelaunchElevatedToast => [
         "Neustart mit Administratorrechten…",
@@ -442,6 +501,14 @@ keys! {
     ErrorPrefix => ["Fehler:", "Error:"],
     PrioritySet => ["Priorität:", "Priority:"],
     AffinitySet => ["Affinität gesetzt", "Affinity updated"],
+    SavedProcessRuleFailed => [
+        "Gespeicherte Prozessregel für PID {} konnte nicht angewendet werden: {}",
+        "Could not apply saved process rule for PID {}: {}"
+    ],
+    ActionQueueFull => [
+        "Zu viele Systemaktionen warten; bitte erneut versuchen",
+        "Too many system actions are queued; please try again"
+    ],
     EfficiencyChanged => ["Effizienzmodus geändert", "Efficiency mode changed"],
 
     // ------------------------------------------------ misc words

@@ -203,6 +203,13 @@ def main() -> int:
             log(f"host binary ready: {exe}")
             arc = "taskman.exe" if exe.suffix == ".exe" else "taskman"
             host_files = [(exe, arc)]
+            if platform.system() == "Windows":
+                service_exe = exe.with_name("taskman-service.exe")
+                if not service_exe.exists():
+                    log(f"core service binary missing after build: {service_exe}")
+                    failures += 1
+                else:
+                    host_files.append((service_exe, "taskman-service.exe"))
             if platform.system() == "Linux" and LINUX_DESKTOP.exists():
                 host_files.append(
                     (LINUX_DESKTOP, "share/applications/io.github.aufkrawall.Taskman.desktop")

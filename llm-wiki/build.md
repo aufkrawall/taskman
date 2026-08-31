@@ -11,14 +11,15 @@ Primary sources:
 
 `python build.py` (default) does, in order:
 
-1. Host release build (`cargo build --profile release --workspace`).
+1. Host release build (`cargo build --profile release --workspace`). On
+   Windows this must produce both `taskman.exe` and `taskman-service.exe`.
 2. Linux x86_64 release cross-build **by default** — the workspace ships a
    real Linux collector (`crates/tm-platform/src/linux/`). Cross toolchain
    is auto-detected: `cross` first, then `cargo-zigbuild`. Without either,
    the step is skipped with a note (exit code still 0 unless
    `--require-all-targets`).
-3. Packaging into `dist/`: Windows → `.zip`, Linux → `.tar.gz`, named
-   `taskman-v<version>-<platform>`.
+3. Packaging into `dist/`: Windows → `.zip` containing the GUI and service;
+   Linux → `.tar.gz`, named `taskman-v<version>-<platform>`.
 
 Flags: `--host-only`, `--linux-only`, `--debug`, `--no-package`,
 `--require-all-targets`, `--check`.
@@ -55,8 +56,9 @@ recompiling when the binary already matches the sources.
 
 Measured on the 16-core dev machine: cold workspace release ≈ 2 min
 (dependency-bound: wgpu/eframe), warm incremental dev rebuild of the whole
-chain ≈ 4 s. The crate chain tm-core → tm-platform → tm-app is linear, so
-cross-crate changes rebuild serially by nature.
+chain ≈ 4 s. The shared chain tm-core → tm-platform then fans out to
+tm-app/tm-service, so cross-crate changes rebuild the shared portion before
+the final binaries can build independently.
 
 ## Renderer/backend policy
 
@@ -71,9 +73,15 @@ The GUI tries WGPU first and retains Glow as the compatibility fallback.
 Surface presentation is FIFO with one-frame maximum latency, and WGPU prefers
 the low-power adapter unless `WGPU_POWER_PREF` overrides it. This trims unused
 backend dependency/code without making older or unusual graphics systems a
-hard failure. The 2026-08-31 Windows release measured 13,470,208 bytes versus
-14,656,000 before backend trimming (8.09% smaller, even after adding the module
-inspector and UI features). See `debug-tools.md` for overrides.
+hard failure. The first 2026-08-31 backend-trim build measured 13,470,208
+bytes. The final service/tray/reliability build is 13,873,664 bytes versus the
+14,656,000-byte pre-pass baseline (782,336 bytes / 5.34% smaller) while adding
+the new features. The separate always-running service is 1,378,816 bytes. See
+`debug-tools.md` for overrides.
+
+The service has no GUI/eframe dependency. Keeping it in a separate binary
+prevents an always-running renderer, GPU stack, or broad GUI parser from
+becoming part of the LocalSystem attack surface.
 
 ## Test isolation
 

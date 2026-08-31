@@ -9,8 +9,8 @@ Primary sources:
 
 ## Core Tree
 
-Rust workspace, three crates in a strict dependency chain
-(`tm-core` ← `tm-platform` ← `tm-app`):
+Rust workspace with four crates. The GUI and Windows service both reuse the
+platform boundary (`tm-core` ← `tm-platform` ← `tm-app` / `tm-service`):
 
 - `crates/tm-core`
   - Platform-agnostic heart. `model.rs` (Snapshot data model — CPU, memory,
@@ -18,12 +18,15 @@ Rust workspace, three crates in a strict dependency chain
     `AdapterLuid`, processes incl.
     elevation/UAC/power-throttle fields), `engine.rs` (sampling engine:
     lazy start via collector factory, event notifier, Refresh-while-paused),
-    `settings.rs` (INI config + persisted grouped/literal-tree process view +
+    `settings.rs` (INI config + persisted Details tree view, per-table sort +
+    per-image priority/affinity rules, tray/autostart options +
+    bounded 4 MiB startup input +
     ID-keyed column prefs: widths, visibility overrides and user order under
     `[columns.<table>]` / `.visible` / `.order` sections + debounced
     SettingsWriter), `app_history.rs` (per-app usage db, single serialized
     writer thread with generations), `demand.rs` (TelemetryDemand bitmask),
-    `logging.rs` (early ring sink → deferred file attach), `classify.rs`
+    `logging.rs` (early ring sink → deferred file attach; elevated installer
+    helper remains memory/console-only), `classify.rs`
     (Apps/Background/System classification), `i18n.rs` (DE/EN keys macro),
     `format.rs`, `mock.rs`.
 - `crates/tm-platform`
@@ -38,11 +41,15 @@ Rust workspace, three crates in a strict dependency chain
     (PDH split GpuPdh/DiskPdh groups with demand gating + LUID-preserving
     GPU instance parser), `gpu.rs` (DXGI discovery + LUID-keyed merge,
     busiest-engine semantics), `process_ops.rs` (kill/suspend/priority/
-    affinity/EcoQoS/token security, identity-safe minidumps, ToolHelp module
+    affinity/EcoQoS/UAC virtualization/token security, identity-safe minidumps, ToolHelp module
     enumeration, guarded same-architecture DLL unload, non-blocking launch),
     `startup.rs` (Run keys + Startup folders + StartupApproved incl. the
     folder-subkey fix and best-effort publisher resolution), `services.rs`,
     `users.rs`, `net_info.rs` (cached adapter/link/IP/SSID/signal metadata),
+    `core_service.rs` (versioned authenticated named-pipe broker plus secure
+    SCM/Program Files/ProgramData install lifecycle, including pinned
+    reparse/hard-link-resistant owner/group/DACL repair), `autostart.rs` (owned-command-
+    only HKCU startup migration), `windows_enum.rs` (one-pass top-window/hung-state inventory),
     `version.rs` (cached PE metadata). Linux/macOS backends exist and are
     built by default (`build.py`).
 - `crates/tm-app`
@@ -52,14 +59,20 @@ Rust workspace, three crates in a strict dependency chain
     action executor, toast ids, demand updates per tab), `app_ui.rs`
     (chrome + dialogs incl. scrolling settings and Delete confirmation),
     `tabs/*` (processes/details/modules/users/services/startup/apphistory/
-    performance; Processes can switch between presentation ownership and a
-    literal raw-PPID tree; Modules is an async on-demand inspector),
+    performance; Processes keeps native grouped presentation, Details can
+    switch between flat and literal raw-PPID tree; Modules is an async
+    on-demand inspector with guarded unload),
     `widgets/tablekit.rs` (TM-style
     tables: drag-start-width resize math, O(1) layout, `scrolled_rows`
     virtualization), `widgets/chart.rs` (timestamp-aware charts, kernel
     overlay), `icon_cache.rs` (lazy worker, upload budget, bounded LRU),
     `fonts.rs` (async system-font load after first frame),
     `action_executor.rs`.
+- `crates/tm-service`
+  - Windows service executable. Starts under SCM as delayed-auto LocalSystem,
+    raises only the control plane to above-normal priority, attaches protected
+    ProgramData logging, reports `RUNNING` only after the broker is ready, and
+    owns no telemetry/UI state. Non-Windows builds are an explicit stub.
 
 ## Important Support and Output Paths
 
@@ -102,8 +115,13 @@ Rust workspace, three crates in a strict dependency chain
   connected same-image families collapse into expandable `Name (N)` rows and
   busy absorbed external tasks (≥ 1 % CPU, different image, windowless) are
   promoted into Background. Do not collapse this back to a literal PPID
-  tree as the only mode; raw `ProcessEntry.ppid` remains OS truth and is now
-  exposed as a separate persisted System Informer-style view.
+  tree. Raw `ProcessEntry.ppid` remains OS truth and is exposed by the
+  persisted System Informer-style tree on the Details page.
+- `crates/tm-platform/src/win/core_service.rs` — privileged trust boundary.
+  Do not add arbitrary commands, output paths, or telemetry to its protocol.
+  Preserve exact PID+creation-time checks, client/server executable binding,
+  bounded framing/queues, protected ACLs, reparse rejection, and pinned-copy
+  upgrade semantics. See `core-service.md`.
 - `crates/tm-platform/src/win/process_ops.rs` module unload — remote
   `FreeLibrary` is intentionally guarded by exact process creation timestamp,
   exact module base/path re-enumeration, same-architecture checks, and
@@ -116,4 +134,8 @@ Rust workspace, three crates in a strict dependency chain
 - `cargo test -p tm-platform` — pure logic (GPU parsing, merges) + Windows
   integration tests (spawn/kill children, live sample sanity).
 - `cargo test -p tm-app` — table/process/performance/detail logic tests.
+- `cargo test -p tm-service` — service entry/build surface (broker unit tests
+  live in `tm-platform`).
 - Headless smoke: `taskman --selfcheck [--mock]`.
+- Service headless smoke: `taskman-service --selfcheck` (does not install or
+  start the service).

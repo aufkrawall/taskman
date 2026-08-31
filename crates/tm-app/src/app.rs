@@ -9,13 +9,14 @@
 //! * App history loads asynchronously; settings/history writes run on single
 //!   dedicated writer threads so no disk hiccup can hitch a frame.
 //! * Short platform control actions (kill/priority/service/session/...) run
-//!   on one shared action-executor thread; long dump/module work gets lazy,
-//!   dedicated workers so it cannot block unrelated controls.
+//!   on two bounded action lanes; long dump/module work gets lazy, dedicated
+//!   workers so it cannot block unrelated controls.
 
 use crate::action_executor::ActionExecutor;
 use crate::app_ui::apply_theme;
 use crate::widgets::tablekit::{TmColumn, TmTable};
 use eframe::egui;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use tm_core::demand::TelemetryDemand;
@@ -112,7 +113,7 @@ impl Tab {
 
 /// Exact process identity for selection/navigation/destructive actions —
 /// never a bare PID (PID reuse, implement.md §11.5/§19.2).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ProcessIdentity {
     pub pid: u32,
     pub start_epoch_s: Option<i64>,
@@ -189,9 +190,9 @@ pub struct SharedState {
     pub icons: crate::icon_cache::IconCache,
     /// Toast queue. Workers push, the UI drains.
     pub toasts: Arc<ToastQueue>,
-    /// Single executor for platform control actions (never the UI thread).
-    /// `None` only if the worker thread could not spawn; actions then run
-    /// inline (degraded but functional).
+    /// Bounded executor for platform control actions (never the UI thread).
+    /// `None` only if no worker thread could be created; controls then fail
+    /// visibly while the monitor remains responsive.
     pub executor: Option<ActionExecutor>,
     // In-flight markers so slow platform queries run off the UI thread exactly once.
     pub services_fetch: InFlight,
@@ -233,6 +234,26 @@ pub struct PendingProcessEnd {
     pub tree: bool,
 }
 
+/// Token virtualization changes can alter legacy file/registry behavior, so
+/// the Details context menu parks them behind an explicit warning.
+#[derive(Debug, Clone)]
+pub struct PendingUacVirtualization {
+    pub identity: ProcessIdentity,
+    pub name: String,
+    pub enabled: bool,
+}
+
+struct ProcessRuleResult {
+    identity: ProcessIdentity,
+    error: Option<String>,
+}
+
+#[cfg(target_os = "windows")]
+struct AdvancedStateResult {
+    core_service: tm_platform::actions::CoreServiceState,
+    task_manager: tm_platform::actions::TaskManagerReplacementState,
+}
+
 pub struct TaskManApp {
     pub engine: EngineHandle,
 
@@ -260,7 +281,7 @@ pub struct TaskManApp {
     pub run_dialog_text: String,
     pub run_elevated: bool,
     pub ticks_seen: u64,
-    pub affinity_dialog: Option<(u32, u64)>, // pid, current mask
+    pub affinity_dialog: Option<crate::tabs::details::AffinityDialog>,
     pub startup_props: Option<tm_core::model::StartupItem>,
     /// Selection by stable item id (list indexes shift on refresh).
     pub selected_startup_id: Option<String>,
@@ -294,6 +315,8 @@ pub struct TaskManApp {
     pub pending_session_logoff: Option<(u32, String)>,
     /// Delete-key termination awaits confirmation here.
     pub pending_process_end: Option<PendingProcessEnd>,
+    /// Details context-menu UAC virtualization change awaiting confirmation.
+    pub pending_uac_virtualization: Option<PendingUacVirtualization>,
     // Services tab.
     pub services_selected_name: Option<String>,
 
@@ -318,6 +341,27 @@ pub struct TaskManApp {
     /// App-history disk snapshots are intentionally less frequent than
     /// telemetry samples; shutdown still performs a synchronous flush.
     last_app_history_save: std::time::Instant,
+    /// Exact process identities that already had their saved scheduling rule
+    /// evaluated. Pruned every snapshot so the set stays bounded.
+    process_rules_applied: HashSet<ProcessIdentity>,
+    process_rules_inflight: HashSet<ProcessIdentity>,
+    process_rule_failures: HashMap<ProcessIdentity, u8>,
+    process_rule_results: Arc<Mutex<Vec<ProcessRuleResult>>>,
+    process_rules_enabled: bool,
+    /// Machine-wide integration state is queried off the UI thread. A stuck
+    /// service/SCM must never freeze the Settings window.
+    #[cfg(target_os = "windows")]
+    pub core_service_state: Option<tm_platform::actions::CoreServiceState>,
+    #[cfg(target_os = "windows")]
+    pub task_manager_replacement_state: Option<tm_platform::actions::TaskManagerReplacementState>,
+    #[cfg(target_os = "windows")]
+    advanced_state_result: Arc<Mutex<Option<AdvancedStateResult>>>,
+    #[cfg(target_os = "windows")]
+    advanced_state_inflight: bool,
+    #[cfg(target_os = "windows")]
+    advanced_state_last_refresh: Option<std::time::Instant>,
+    #[cfg(target_os = "windows")]
+    pub core_service_change_inflight: Arc<AtomicBool>,
 }
 
 impl TaskManApp {
@@ -417,6 +461,37 @@ impl TaskManApp {
             settings.col_visible.get("details"),
             settings.col_order.get("details").map(Vec::as_slice),
         );
+        if let Some(sort) = settings.table_sort.get("details") {
+            details_state.apply_saved_sort(&sort.column, sort.ascending);
+        }
+
+        let mut processes_state = crate::tabs::processes::State::new();
+        if let Some(sort) = restored_sort(
+            &settings,
+            "processes",
+            &["name", "status", "cpu", "mem", "disk", "net"],
+        ) {
+            processes_state.sort_col = sort.column;
+            processes_state.ascending = sort.ascending;
+        }
+        let startup_sort =
+            restored_sort(&settings, "startup", &["name", "pub", "status", "impact"])
+                .unwrap_or_else(|| crate::widgets::tablekit::SortState::new(0, true));
+        let services_sort = restored_sort(
+            &settings,
+            "services",
+            &["name", "pid", "desc", "status", "group"],
+        )
+        .unwrap_or_else(|| crate::widgets::tablekit::SortState::new(0, true));
+        let users_sort = restored_sort(
+            &settings,
+            "users",
+            &["user", "status", "cpu", "mem", "disk", "net"],
+        )
+        .unwrap_or_else(|| crate::widgets::tablekit::SortState::new(0, true));
+        let app_history_sort =
+            restored_sort(&settings, "apphistory", &["name", "cpu", "net", "notif"])
+                .unwrap_or_else(|| crate::widgets::tablekit::SortState::new(1, false));
 
         // Start page: CLI/diagnostic override wins, otherwise the setting.
         let tab = initial_tab
@@ -427,6 +502,9 @@ impl TaskManApp {
 
         let toasts: Arc<ToastQueue> = Arc::new(Mutex::new(Vec::new()));
         let executor = ActionExecutor::start();
+        if executor.is_none() {
+            tracing::error!("action workers could not start; blocking controls are disabled");
+        }
 
         Self {
             engine,
@@ -463,18 +541,19 @@ impl TaskManApp {
             module_dialog: None,
             svc_jump: Arc::new(Mutex::new(None)),
             search: String::new(),
-            processes_state: crate::tabs::processes::State::new(),
+            processes_state,
             perf_selected_key,
             perf_jump_to: None,
             details_state,
-            startup_sort: crate::widgets::tablekit::SortState::new(0, true),
-            services_sort: crate::widgets::tablekit::SortState::new(0, true),
-            users_sort: crate::widgets::tablekit::SortState::new(0, true),
-            app_history_sort: crate::widgets::tablekit::SortState::new(1, false),
+            startup_sort,
+            services_sort,
+            users_sort,
+            app_history_sort,
             selected_process: None,
             selected_user: None,
             pending_session_logoff: None,
             pending_process_end: None,
+            pending_uac_virtualization: None,
             services_selected_name: None,
             pending_details_focus: None,
             scroll_to_pid: None,
@@ -487,12 +566,62 @@ impl TaskManApp {
             fps_ema_ms: 0.0,
             display_hz,
             last_app_history_save: std::time::Instant::now(),
+            process_rules_applied: HashSet::new(),
+            process_rules_inflight: HashSet::new(),
+            process_rule_failures: HashMap::new(),
+            process_rule_results: Arc::new(Mutex::new(Vec::new())),
+            process_rules_enabled: !mock,
+            #[cfg(target_os = "windows")]
+            core_service_state: None,
+            #[cfg(target_os = "windows")]
+            task_manager_replacement_state: None,
+            #[cfg(target_os = "windows")]
+            advanced_state_result: Arc::new(Mutex::new(None)),
+            #[cfg(target_os = "windows")]
+            advanced_state_inflight: false,
+            #[cfg(target_os = "windows")]
+            advanced_state_last_refresh: None,
+            #[cfg(target_os = "windows")]
+            core_service_change_inflight: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    #[cfg(target_os = "windows")]
+    pub fn poll_advanced_state(&mut self, ctx: &egui::Context) {
+        if let Some(result) = tm_core::sync::lock(&self.advanced_state_result).take() {
+            self.core_service_state = Some(result.core_service);
+            self.task_manager_replacement_state = Some(result.task_manager);
+            self.advanced_state_inflight = false;
+            self.advanced_state_last_refresh = Some(std::time::Instant::now());
+        }
+
+        let due = self
+            .advanced_state_last_refresh
+            .is_none_or(|last| last.elapsed() >= std::time::Duration::from_secs(3));
+        if due && !self.advanced_state_inflight {
+            let actions = self.actions.clone();
+            let result = self.advanced_state_result.clone();
+            let wake = ctx.clone();
+            match std::thread::Builder::new()
+                .name("tm-advanced-state".into())
+                .spawn(move || {
+                    let state = AdvancedStateResult {
+                        core_service: actions.core_service_state(),
+                        task_manager: actions.task_manager_replacement_state(),
+                    };
+                    *tm_core::sync::lock(&result) = Some(state);
+                    wake.request_repaint();
+                }) {
+                Ok(_) => self.advanced_state_inflight = true,
+                Err(error) => tracing::warn!(%error, "cannot start advanced-state query"),
+            }
+        }
+        ctx.request_repaint_after(std::time::Duration::from_secs(3));
     }
 
     /// Pull the newest snapshot into local history buffers (called once per
     /// actual repaint — the engine notifier guarantees freshness).
-    fn poll_engine(&mut self) -> Option<Arc<Snapshot>> {
+    fn poll_engine(&mut self, ctx: &egui::Context) -> Option<Arc<Snapshot>> {
         let latest = self.engine.latest()?;
         if latest.timestamp_ms != self.history.last().map_or(0, |h| h.t_ms) {
             let pt = HistoryPoint {
@@ -526,11 +655,150 @@ impl TaskManApp {
             // Feed the persistent app-history database.
             let interval_s = self.engine.interval().as_secs_f64().max(0.05);
             self.app_history_db.observe(&latest, interval_s);
+            self.apply_saved_process_rules(&latest, ctx);
 
             self.ticks_seen += 1;
             Some(latest)
         } else {
             None
+        }
+    }
+
+    fn apply_saved_process_rules(&mut self, snapshot: &Snapshot, ctx: &egui::Context) {
+        if !self.process_rules_enabled {
+            return;
+        }
+
+        let live = snapshot
+            .processes
+            .iter()
+            .filter_map(|process| {
+                process.start_epoch_s.map(|start_epoch_s| ProcessIdentity {
+                    pid: process.pid,
+                    start_epoch_s: Some(start_epoch_s),
+                })
+            })
+            .collect::<HashSet<_>>();
+        self.process_rules_applied
+            .retain(|identity| live.contains(identity));
+        self.process_rules_inflight
+            .retain(|identity| live.contains(identity));
+        self.process_rule_failures
+            .retain(|identity, _| live.contains(identity));
+
+        let completed = std::mem::take(&mut *tm_core::sync::lock(&self.process_rule_results));
+        for result in completed {
+            self.process_rules_inflight.remove(&result.identity);
+            if let Some(error) = result.error {
+                let failures = self
+                    .process_rule_failures
+                    .entry(result.identity.clone())
+                    .or_default();
+                *failures = failures.saturating_add(1);
+                if *failures == 3 {
+                    tracing::warn!(
+                        pid = result.identity.pid,
+                        %error,
+                        "saved process scheduling rule failed after three attempts"
+                    );
+                    self.shared.toast(i18n::trf(
+                        K::SavedProcessRuleFailed,
+                        &[&result.identity.pid.to_string(), &error],
+                    ));
+                }
+            } else {
+                self.process_rule_failures.remove(&result.identity);
+                self.process_rules_applied.insert(result.identity);
+            }
+        }
+
+        let mut pending = Vec::new();
+        for process in &snapshot.processes {
+            let (Some(start_epoch_s), Some(path)) = (process.start_epoch_s, &process.exe_path)
+            else {
+                continue;
+            };
+            let identity = ProcessIdentity {
+                pid: process.pid,
+                start_epoch_s: Some(start_epoch_s),
+            };
+            if self.process_rules_applied.contains(&identity)
+                || self.process_rules_inflight.contains(&identity)
+                || self
+                    .process_rule_failures
+                    .get(&identity)
+                    .copied()
+                    .unwrap_or(0)
+                    >= 3
+            {
+                continue;
+            }
+            let key = tm_core::settings::process_rule_key(path);
+            if let Some(rule) = self.shared.settings.process_rules.get(&key)
+                && !rule.is_empty()
+            {
+                pending.push((identity, rule.clone()));
+            }
+        }
+
+        for (identity, rule) in pending {
+            self.process_rules_inflight.insert(identity.clone());
+            let actions = self.actions.clone();
+            let results = self.process_rule_results.clone();
+            let dispatch_results = self.process_rule_results.clone();
+            let completed_identity = identity.clone();
+            let queued_identity = identity.clone();
+            let job = move || {
+                let outcome = (|| -> Result<(), tm_core::TmError> {
+                    if let Some(priority) = rule.priority {
+                        actions.set_priority_checked(
+                            identity.pid,
+                            identity.start_epoch_s,
+                            priority,
+                        )?;
+                    }
+                    if let Some(saved_mask) = rule.affinity_mask {
+                        let system_mask = actions.system_affinity_mask()?;
+                        let mask = saved_mask & system_mask;
+                        if mask == 0 {
+                            return Err(tm_core::TmError::platform(
+                                "saved process affinity",
+                                "saved mask has no processors available on this system",
+                            ));
+                        }
+                        actions.set_affinity_mask_checked(
+                            identity.pid,
+                            identity.start_epoch_s,
+                            mask,
+                        )?;
+                    }
+                    Ok(())
+                })();
+                tm_core::sync::lock(&results).push(ProcessRuleResult {
+                    identity: completed_identity,
+                    error: outcome.err().map(|error| error.to_string()),
+                });
+            };
+            let wake_ctx = ctx.clone();
+            match &self.shared.executor {
+                Some(executor) => {
+                    if !executor.run_quiet(move || wake_ctx.request_repaint(), job) {
+                        self.process_rules_inflight.remove(&queued_identity);
+                        tm_core::sync::lock(&dispatch_results).push(ProcessRuleResult {
+                            identity: queued_identity,
+                            error: Some(i18n::tr(K::ActionQueueFull).to_string()),
+                        });
+                    }
+                }
+                None => {
+                    drop(job);
+                    self.process_rules_inflight.remove(&queued_identity);
+                    tm_core::sync::lock(&dispatch_results).push(ProcessRuleResult {
+                        identity: queued_identity,
+                        error: Some(i18n::tr(K::ActionFailed).to_string()),
+                    });
+                }
+            }
         }
     }
 
@@ -587,14 +855,15 @@ impl TaskManApp {
     }
 
     /// Run a platform action on the executor with a localized result toast;
-    /// completion wakes the UI. Falls back to running inline when no
-    /// executor exists.
+    /// completion wakes the UI. If worker creation failed, preserve UI
+    /// responsiveness and report the action unavailable rather than running
+    /// a potentially blocking platform call inline.
     pub fn run_action(
         &mut self,
         ctx: &egui::Context,
         success_msg: impl FnOnce() -> String + Send + 'static,
         job: impl FnOnce() -> Result<(), tm_core::TmError> + Send + 'static,
-    ) {
+    ) -> bool {
         let toasts = self.shared.toasts.clone();
         let wake = {
             let ctx = ctx.clone();
@@ -603,12 +872,11 @@ impl TaskManApp {
         match &self.shared.executor {
             Some(executor) => executor.run(toasts, wake, success_msg, job),
             None => {
-                let res = job();
-                let msg = match res {
-                    Ok(()) => success_msg(),
-                    Err(e) => i18n::trf(K::ErrMsg, &[&e.to_string()]),
-                };
-                crate::app::toast_from(&toasts, msg);
+                drop(job);
+                drop(success_msg);
+                crate::app::toast_from(&toasts, i18n::tr(K::ActionFailed));
+                wake();
+                false
             }
         }
     }
@@ -639,6 +907,19 @@ fn tab_from_cli(name: &str) -> Option<Tab> {
     }
 }
 
+fn restored_sort(
+    settings: &Settings,
+    table: &str,
+    column_ids: &[&str],
+) -> Option<crate::widgets::tablekit::SortState> {
+    let saved = settings.table_sort.get(table)?;
+    let column = column_ids.iter().position(|id| *id == saved.column)?;
+    Some(crate::widgets::tablekit::SortState::new(
+        column,
+        saved.ascending,
+    ))
+}
+
 impl eframe::App for TaskManApp {
     /// Data pass: runs before each `ui`, and while the window is hidden.
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
@@ -659,7 +940,7 @@ impl eframe::App for TaskManApp {
             }
             tracing::debug!(cap = want_cap, "graph window changed; history resized");
         }
-        if self.poll_engine().is_some()
+        if self.poll_engine(ctx).is_some()
             && self.last_app_history_save.elapsed() >= std::time::Duration::from_secs(30)
         {
             self.app_history_db.save_async();
@@ -688,7 +969,7 @@ impl eframe::App for TaskManApp {
         let ctx = ui.ctx().clone();
         crate::theme::ensure_visuals(&ctx);
         crate::fonts::poll_async_apply(&ctx);
-        self.poll_engine();
+        self.poll_engine(&ctx);
 
         let pal = crate::theme::palette_ctx(&ctx);
 
@@ -716,14 +997,17 @@ impl eframe::App for TaskManApp {
         if self.run_dialog_open {
             crate::app_ui::run_task_dialog(self, &ctx, &pal);
         }
-        if let Some((pid, mask)) = self.affinity_dialog {
-            crate::tabs::details::affinity_dialog(self, &ctx, pid, mask, &pal);
+        if self.affinity_dialog.is_some() {
+            crate::tabs::details::affinity_dialog(self, &ctx, &pal);
         }
         if self.pending_session_logoff.is_some() {
             crate::tabs::users::session_logoff_dialog(self, &ctx, &pal);
         }
         if self.pending_process_end.is_some() {
             crate::app_ui::process_end_dialog(self, &ctx);
+        }
+        if self.pending_uac_virtualization.is_some() {
+            crate::tabs::details::uac_virtualization_dialog(self, &ctx);
         }
         if self.startup_props.is_some() {
             crate::tabs::startup::properties_dialog(self, &ctx, &pal);
@@ -755,6 +1039,7 @@ impl eframe::App for TaskManApp {
             || self.affinity_dialog.is_some()
             || self.pending_session_logoff.is_some()
             || self.pending_process_end.is_some()
+            || self.pending_uac_virtualization.is_some()
             || self.startup_props.is_some()
             || self.proc_props.is_some()
             || self.module_dialog.is_some()
@@ -883,6 +1168,23 @@ impl TaskManApp {
         }
     }
 
+    /// Persist a table sort by stable identifiers (never by display index,
+    /// because optional/reordered columns can change that index).
+    pub fn persist_sort(&mut self, table: &str, column: &str, ascending: bool) {
+        let next = tm_core::settings::SortPreference {
+            column: column.to_string(),
+            ascending,
+        };
+        if self.shared.settings.table_sort.get(table) == Some(&next) {
+            return;
+        }
+        self.shared
+            .settings
+            .table_sort
+            .insert(table.to_string(), next);
+        self.save_settings();
+    }
+
     /// Jump to the services tab and highlight the service hosted by `pid`.
     /// Windows-only callers today (service→PID lookup); kept compiled on all
     /// targets so the API surface stays identical.
@@ -913,8 +1215,15 @@ impl TaskManApp {
             ),
         };
         match &self.shared.executor {
-            Some(executor) => executor.run_quiet(wake, job),
-            None => job(),
+            Some(executor) => {
+                if !executor.run_quiet(wake, job) {
+                    self.shared.toast(i18n::tr(K::ActionQueueFull));
+                }
+            }
+            None => {
+                drop(job);
+                self.shared.toast(i18n::tr(K::ActionFailed));
+            }
         }
     }
 

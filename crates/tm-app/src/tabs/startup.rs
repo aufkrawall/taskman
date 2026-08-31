@@ -57,8 +57,17 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
                 wake();
             };
             match &app.shared.executor {
-                Some(executor) => executor.run_quiet(|| {}, job),
-                None => job(),
+                Some(executor) => {
+                    if !executor.run_quiet(|| {}, job) {
+                        app.shared.startup_fetch.end();
+                        app.shared.toast(i18n::tr(K::ActionQueueFull));
+                    }
+                }
+                None => {
+                    drop(job);
+                    app.shared.startup_fetch.end();
+                    app.shared.toast(i18n::tr(K::ActionFailed));
+                }
             }
         }
     }
@@ -258,10 +267,12 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
                             }
                         };
                         let ctx2 = ctx.clone();
-                        app.run_action(&ctx2, ok_msg, move || {
+                        let dispatched = app.run_action(&ctx2, ok_msg, move || {
                             actions.set_startup_enabled(&id, &location, new_enabled)
                         });
-                        item.enabled = new_enabled;
+                        if dispatched {
+                            item.enabled = new_enabled;
+                        }
                         ui.close();
                     }
                     if ui.button(i18n::tr(K::Properties)).clicked() {
@@ -288,6 +299,8 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
     );
     if let Some(column) = clicked {
         app.startup_sort.clicked(column, false);
+        let ids = ["name", "pub", "status", "impact"];
+        app.persist_sort("startup", ids[column], app.startup_sort.ascending);
     }
     app.persist_table(&table);
 }
@@ -346,10 +359,12 @@ fn toggle_selected(app: &mut TaskManApp, enable: bool, ctx: &egui::Context) {
                 i18n::tr(K::DisabledWord).to_string()
             }
         };
-        app.run_action(ctx, ok_msg, move || {
+        let dispatched = app.run_action(ctx, ok_msg, move || {
             actions.set_startup_enabled(&item_id, &location, enable)
         });
-        item.enabled = enable;
+        if dispatched {
+            item.enabled = enable;
+        }
     }
 }
 

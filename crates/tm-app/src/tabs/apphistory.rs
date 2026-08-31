@@ -217,6 +217,8 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
     );
     if let Some(column) = clicked {
         app.app_history_sort.clicked(column, column != 0);
+        let ids = ["name", "cpu", "net", "notif"];
+        app.persist_sort("apphistory", ids[column], app.app_history_sort.ascending);
     }
     app.persist_table(&table);
 }

@@ -435,18 +435,21 @@ pub fn settings_dialog(app: &mut TaskManApp, ctx: &egui::Context, _pal: &theme::
             });
 
             ui.add_space(10.0);
-            ui.label(i18n::tr(K::ProcessViewLabel));
+            ui.label(i18n::tr(K::DetailsViewLabel));
             ui.horizontal(|ui| {
-                for (tree, key) in [(false, K::GroupedView), (true, K::ProcessTreeView)] {
+                for (tree, key) in [(false, K::FlatView), (true, K::ProcessTreeView)] {
                     if ui
                         .selectable_label(
-                            app.shared.settings.process_tree_view == tree,
+                            app.shared.settings.details_tree_view == tree,
                             i18n::tr(key),
                         )
                         .clicked()
                     {
-                        app.shared.settings.process_tree_view = tree;
-                        app.processes_state.invalidate();
+                        app.shared.settings.details_tree_view = tree;
+                        if tree && let Some(snapshot) = app.latest_snapshot() {
+                            app.details_state.ensure_tree_initialized(&snapshot);
+                        }
+                        app.details_state.invalidate();
                         app.save_settings();
                     }
                 }
@@ -492,6 +495,46 @@ pub fn settings_dialog(app: &mut TaskManApp, ctx: &egui::Context, _pal: &theme::
                 app.shared.settings.save();
             }
 
+            #[cfg(target_os = "windows")]
+            {
+                let mut close_to_tray = app.shared.settings.close_to_tray;
+                if crate::widgets::controls::checkbox(
+                    ui,
+                    &mut close_to_tray,
+                    i18n::tr(K::CloseToTray),
+                    _pal,
+                )
+                .changed()
+                {
+                    app.shared.settings.close_to_tray = close_to_tray;
+                    app.save_settings();
+                }
+
+                let mut start_with_windows = app.shared.settings.start_with_windows;
+                if crate::widgets::controls::checkbox(
+                    ui,
+                    &mut start_with_windows,
+                    i18n::tr(K::StartWithWindows),
+                    _pal,
+                )
+                .changed()
+                {
+                    match app
+                        .actions
+                        .set_start_with_windows(start_with_windows, true)
+                    {
+                        Ok(()) => {
+                            app.shared.settings.start_with_windows = start_with_windows;
+                            app.save_settings();
+                        }
+                        Err(error) => app.shared.toast(i18n::trf(
+                            K::ErrMsg,
+                            &[&error.to_string()],
+                        )),
+                    }
+                }
+            }
+
             ui.add_space(10.0);
             ui.label(i18n::tr(K::GraphWindowLabel));
             ui.horizontal(|ui| {
@@ -532,49 +575,135 @@ pub fn settings_dialog(app: &mut TaskManApp, ctx: &egui::Context, _pal: &theme::
 
             #[cfg(target_os = "windows")]
             {
-                use tm_platform::actions::TaskManagerReplacementState;
+                use tm_platform::actions::{CoreServiceState, TaskManagerReplacementState};
                 ui.add_space(14.0);
                 ui.heading("Advanced");
-                let state = app.actions.task_manager_replacement_state();
-                let mut replace = matches!(
-                    state,
-                    TaskManagerReplacementState::Enabled | TaskManagerReplacementState::Stale(_)
+
+                ui.heading(i18n::tr(K::CoreServiceHeading));
+                app.poll_advanced_state(ctx);
+                let core_state = app.core_service_state.clone();
+                let state_text = match core_state.as_ref() {
+                    None => i18n::tr(K::CheckingAdvancedState).into(),
+                    Some(CoreServiceState::Unsupported) => {
+                        i18n::tr(K::CoreServiceNotInstalled).into()
+                    }
+                    Some(CoreServiceState::NotInstalled) => {
+                        i18n::tr(K::CoreServiceNotInstalled).into()
+                    }
+                    Some(CoreServiceState::Stopped) => i18n::tr(K::CoreServiceStopped).into(),
+                    Some(CoreServiceState::Starting) => i18n::tr(K::CoreServiceStarting).into(),
+                    Some(CoreServiceState::Running { version }) => {
+                        i18n::trf(K::CoreServiceRunning, &[version])
+                    }
+                    Some(CoreServiceState::Degraded(detail)) => {
+                        i18n::trf(K::CoreServiceDegraded, &[detail])
+                    }
+                };
+                ui.label(
+                    egui::RichText::new(state_text)
+                        .size(11.5)
+                        .color(_pal.text_dim),
                 );
-                if crate::widgets::controls::checkbox(
-                    ui,
-                    &mut replace,
-                    "Replace Windows Task Manager",
-                    _pal,
-                )
-                .changed()
+                let install = matches!(
+                    core_state,
+                    Some(
+                        CoreServiceState::NotInstalled
+                            | CoreServiceState::Stopped
+                            | CoreServiceState::Degraded(_)
+                    )
+                );
+                let supported = core_state
+                    .as_ref()
+                    .is_some_and(|state| {
+                        !matches!(
+                            state,
+                            CoreServiceState::Unsupported | CoreServiceState::Starting
+                        )
+                    })
+                    && !app
+                        .core_service_change_inflight
+                        .load(std::sync::atomic::Ordering::Acquire);
+                let button_key = match core_state.as_ref() {
+                    Some(CoreServiceState::NotInstalled) => K::InstallCoreService,
+                    Some(CoreServiceState::Stopped | CoreServiceState::Degraded(_)) => {
+                        K::RepairCoreService
+                    }
+                    _ => K::RemoveCoreService,
+                };
+                if ui
+                    .add_enabled(supported, egui::Button::new(i18n::tr(button_key)))
+                    .clicked()
                 {
                     let actions = app.actions.clone();
-                    app.run_action(
+                    let inflight = app.core_service_change_inflight.clone();
+                    inflight.store(true, std::sync::atomic::Ordering::Release);
+                    let completion = inflight.clone();
+                    let dispatched = app.run_action(
                         ctx,
-                        || "Task Manager integration requested".to_string(),
-                        move || actions.set_task_manager_replacement(replace),
+                        move || {
+                            i18n::tr(if install {
+                                K::CoreServiceInstallRequested
+                            } else {
+                                K::CoreServiceRemoveRequested
+                            })
+                            .to_string()
+                        },
+                        move || {
+                            let outcome = actions.set_core_service_installed(install);
+                            completion.store(false, std::sync::atomic::Ordering::Release);
+                            outcome
+                        },
                     );
+                    if !dispatched {
+                        inflight.store(false, std::sync::atomic::Ordering::Release);
+                    }
                 }
-                match state {
-                    TaskManagerReplacementState::Stale(_) => {
-                        ui.label(
-                            egui::RichText::new(
-                                "The registered Taskman path is stale. Toggle off/on to repair it.",
-                            )
-                            .size(11.5)
-                            .color(_pal.text_dim),
+
+                ui.add_space(10.0);
+                if let Some(state) = app.task_manager_replacement_state.clone() {
+                    let mut replace = matches!(
+                        state,
+                        TaskManagerReplacementState::Enabled
+                            | TaskManagerReplacementState::Stale(_)
+                    );
+                    if crate::widgets::controls::checkbox(
+                        ui,
+                        &mut replace,
+                        "Replace Windows Task Manager",
+                        _pal,
+                    )
+                    .changed()
+                    {
+                        let actions = app.actions.clone();
+                        app.run_action(
+                            ctx,
+                            || "Task Manager integration requested".to_string(),
+                            move || actions.set_task_manager_replacement(replace),
                         );
                     }
-                    TaskManagerReplacementState::Conflict(value) => {
-                        ui.label(
-                            egui::RichText::new(format!(
-                                "Another application currently replaces Task Manager: {value}"
-                            ))
-                            .size(11.5)
-                            .color(_pal.text_dim),
-                        );
+                    match state {
+                        TaskManagerReplacementState::Stale(_) => {
+                            ui.label(
+                                egui::RichText::new(
+                                    "The registered Taskman path is stale. Toggle off/on to repair it.",
+                                )
+                                .size(11.5)
+                                .color(_pal.text_dim),
+                            );
+                        }
+                        TaskManagerReplacementState::Conflict(value) => {
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "Another application currently replaces Task Manager: {value}"
+                                ))
+                                .size(11.5)
+                                .color(_pal.text_dim),
+                            );
+                        }
+                        _ => {}
                     }
-                    _ => {}
+                } else {
+                    ui.label(i18n::tr(K::CheckingAdvancedState));
                 }
 
                 ui.add_space(10.0);
@@ -601,6 +730,7 @@ pub fn settings_dialog(app: &mut TaskManApp, ctx: &egui::Context, _pal: &theme::
                             // shut this one down gracefully so on_exit flushes
                             // settings and history. A declined prompt surfaces
                             // as an error toast instead.
+                            crate::request_programmatic_exit();
                             close_ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                             Ok(())
                         },
@@ -632,7 +762,17 @@ pub fn settings_dialog(app: &mut TaskManApp, ctx: &egui::Context, _pal: &theme::
                     app.shared.toast(i18n::tr(K::ColWidthsResetToast));
                 }
                 if ui.button(i18n::tr(K::Reset)).clicked() {
-                    let defaults = Settings::default();
+                    let mut defaults = Settings::default();
+                    #[cfg(target_os = "windows")]
+                    if let Err(error) = app.actions.set_start_with_windows(false, true)
+                    {
+                        // The registry is authoritative for autostart. If it
+                        // could not be cleared, keep the matching setting and
+                        // surface the mismatch instead of claiming a reset.
+                        defaults.start_with_windows = app.shared.settings.start_with_windows;
+                        app.shared
+                            .toast(i18n::trf(K::ErrMsg, &[&error.to_string()]));
+                    }
                     apply_theme(ctx, defaults.theme);
                     ctx.set_zoom_factor(defaults.ui_zoom);
                     app.engine.resume();

@@ -272,6 +272,8 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
     );
     if let Some(column) = clicked {
         app.services_sort.clicked(column, column == 1);
+        let ids = ["name", "pid", "desc", "status", "group"];
+        app.persist_sort("services", ids[column], app.services_sort.ascending);
     }
     app.persist_table(&table);
 }

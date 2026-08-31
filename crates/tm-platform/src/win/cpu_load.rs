@@ -53,6 +53,9 @@ use windows::Wdk::System::SystemInformation::{
     NtQuerySystemInformation, SystemProcessInformation, SystemProcessorPerformanceInformation,
 };
 use windows::Win32::System::SystemInformation::{GetSystemInfo, SYSTEM_INFO};
+use windows::Win32::System::WindowsProgramming::{
+    SYSTEM_PROCESS_INFORMATION, SYSTEM_THREAD_INFORMATION,
+};
 
 /// Deltas over windows shorter than this are dominated by quantization and
 /// scheduling-accounting delay (process times are updated at context-switch
@@ -138,6 +141,9 @@ pub struct CpuLoadAccountant {
     prev: Option<PrevSample>,
     proc_buf: Vec<u8>,
     core_buf: Vec<u8>,
+    /// Suspended processes from the newest successful kernel table, keyed by
+    /// PID and creation time so PID reuse cannot inherit stale state.
+    suspended: HashMap<u32, i64>,
 }
 
 impl Default for CpuLoadAccountant {
@@ -154,7 +160,20 @@ impl CpuLoadAccountant {
             proc_buf: vec![0u8; 512 * 1024],
             // Generous for up to 640 logical processors (24 B each).
             core_buf: vec![0u8; 16 * 1024],
+            suspended: HashMap::new(),
         }
+    }
+
+    /// Whether the newest native process table identifies this exact process
+    /// as suspended. Unknown/malformed thread telemetry returns false rather
+    /// than manufacturing a suspended state.
+    pub fn is_suspended(&self, pid: u32, start_epoch_s: Option<i64>) -> bool {
+        let Some(start_epoch_s) = start_epoch_s else {
+            return false;
+        };
+        self.suspended
+            .get(&pid)
+            .is_some_and(|native_start| *native_start == start_epoch_s)
     }
 
     /// Take one sample. Returns `None` for the first call (no reference
@@ -166,8 +185,16 @@ impl CpuLoadAccountant {
 
         // Query cores first, then the process table: keeps the bracket
         // between the two tables tight.
-        let cores = self.query_cores()?;
-        let procs = self.query_procs()?;
+        let Some(cores) = self.query_cores() else {
+            // The process table was not refreshed either, so an older
+            // suspended label is no longer trustworthy.
+            self.suspended.clear();
+            return None;
+        };
+        let Some(procs) = self.query_procs() else {
+            self.suspended.clear();
+            return None;
+        };
 
         if cores.is_empty() {
             return None;
@@ -290,12 +317,21 @@ impl CpuLoadAccountant {
         let buf = &self.proc_buf;
 
         let mut map = HashMap::with_capacity(256);
+        let mut suspended = HashMap::new();
         let mut pos = 0usize;
         loop {
             if pos.checked_add(off.min_size)? > written {
                 break;
             }
             let next = read_u32(buf, pos) as usize;
+            let record_end = if next == 0 {
+                written
+            } else if next >= off.min_size {
+                pos.checked_add(next).filter(|end| *end <= written)?
+            } else {
+                break;
+            };
+            let number_of_threads = read_u32(buf, pos + 4);
             let create_time = read_i64(buf, pos + off.create_time);
             let user = read_i64(buf, pos + off.user_time);
             let kernel = read_i64(buf, pos + off.kernel_time);
@@ -305,6 +341,11 @@ impl CpuLoadAccountant {
 
             // pid 0 is the Idle process whose "CPU time" is just idle time.
             if pid != 0 && kernel >= 0 && user >= 0 {
+                if process_suspended(buf, pos, record_end, number_of_threads) == Some(true)
+                    && let Some(start_epoch_s) = filetime_to_unix_seconds(create_time)
+                {
+                    suspended.insert(pid, start_epoch_s);
+                }
                 map.insert(
                     pid,
                     ProcRaw {
@@ -318,14 +359,56 @@ impl CpuLoadAccountant {
             if next == 0 {
                 break;
             }
-            // Corrupt-chain guard: entries must at least cover the header.
-            if next < off.min_size || written - pos <= next {
-                break;
-            }
-            pos += next;
+            pos = record_end;
         }
+        self.suspended = suspended;
         Some(map)
     }
+}
+
+const THREAD_STATE_WAITING: u32 = 5;
+const WAIT_REASON_SUSPENDED: u32 = 5;
+const WINDOWS_TO_UNIX_EPOCH_100NS: i64 = 116_444_736_000_000_000;
+
+fn filetime_to_unix_seconds(create_time: i64) -> Option<i64> {
+    create_time
+        .checked_sub(WINDOWS_TO_UNIX_EPOCH_100NS)
+        .filter(|value| *value >= 0)
+        .map(|value| value / 10_000_000)
+}
+
+/// `SYSTEM_PROCESS_INFORMATION` is immediately followed by its thread array.
+/// A process is suspended only when it has at least one thread and every
+/// thread is waiting specifically because it is suspended. Bounds failures
+/// remain unknown so corrupt/version-skewed data never becomes a false label.
+fn process_suspended(
+    buffer: &[u8],
+    record: usize,
+    record_end: usize,
+    thread_count: u32,
+) -> Option<bool> {
+    if thread_count == 0 {
+        return Some(false);
+    }
+    let thread_size = std::mem::size_of::<SYSTEM_THREAD_INFORMATION>();
+    let threads = record.checked_add(std::mem::size_of::<SYSTEM_PROCESS_INFORMATION>())?;
+    let bytes = (thread_count as usize).checked_mul(thread_size)?;
+    let threads_end = threads.checked_add(bytes)?;
+    if threads_end > record_end || threads_end > buffer.len() {
+        return None;
+    }
+
+    let state_offset = std::mem::offset_of!(SYSTEM_THREAD_INFORMATION, ThreadState);
+    let reason_offset = std::mem::offset_of!(SYSTEM_THREAD_INFORMATION, WaitReason);
+    for index in 0..thread_count as usize {
+        let base = threads + index * thread_size;
+        if read_u32(buffer, base + state_offset) != THREAD_STATE_WAITING
+            || read_u32(buffer, base + reason_offset) != WAIT_REASON_SUSPENDED
+        {
+            return Some(false);
+        }
+    }
+    Some(true)
 }
 
 /// Byte offsets into `SYSTEM_PROCESS_INFORMATION`. The kernel does not
@@ -709,6 +792,41 @@ mod tests {
                 p.name
             );
         }
+    }
+
+    #[test]
+    fn suspended_state_requires_every_thread_and_rejects_truncation() {
+        let header = std::mem::size_of::<SYSTEM_PROCESS_INFORMATION>();
+        let thread = std::mem::size_of::<SYSTEM_THREAD_INFORMATION>();
+        let state = std::mem::offset_of!(SYSTEM_THREAD_INFORMATION, ThreadState);
+        let reason = std::mem::offset_of!(SYSTEM_THREAD_INFORMATION, WaitReason);
+        let mut buffer = vec![0u8; header + 2 * thread];
+        for index in 0..2 {
+            let base = header + index * thread;
+            buffer[base + state..base + state + 4]
+                .copy_from_slice(&THREAD_STATE_WAITING.to_ne_bytes());
+            buffer[base + reason..base + reason + 4]
+                .copy_from_slice(&WAIT_REASON_SUSPENDED.to_ne_bytes());
+        }
+        assert_eq!(process_suspended(&buffer, 0, buffer.len(), 2), Some(true));
+
+        buffer[header + thread + reason..header + thread + reason + 4]
+            .copy_from_slice(&0u32.to_ne_bytes());
+        assert_eq!(process_suspended(&buffer, 0, buffer.len(), 2), Some(false));
+        assert_eq!(process_suspended(&buffer, 0, header + thread, 2), None);
+        assert_eq!(process_suspended(&buffer, 0, header, 0), Some(false));
+    }
+
+    #[test]
+    fn native_creation_time_matches_unix_seconds() {
+        assert_eq!(
+            filetime_to_unix_seconds(WINDOWS_TO_UNIX_EPOCH_100NS + 42 * 10_000_000),
+            Some(42)
+        );
+        assert_eq!(
+            filetime_to_unix_seconds(WINDOWS_TO_UNIX_EPOCH_100NS - 1),
+            None
+        );
     }
 
     #[test]
