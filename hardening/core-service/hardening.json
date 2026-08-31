@@ -1,0 +1,207 @@
+{
+  "documentType": "codex-security.hardening-analysis",
+  "schemaVersion": "1.0",
+  "analysisId": "hardening_20260831_taskman_core_service",
+  "sourceEvidence": {
+    "kind": "source_collection",
+    "label": "TaskMan action, startup, settings, and application ownership source",
+    "collectionSha256": "6588135e9f18606e014663a5fe5779209ae9d9575cbe4a7c48c19fba413a9b7a",
+    "artifactCount": 6,
+    "targetRevision": "13696d08f17e03754cb842c74c52ceb59c06991a",
+    "sourceDrift": "present"
+  },
+  "implementationEvidence": {
+    "kind": "source_collection",
+    "label": "Implemented TaskMan protected action broker and GUI reliability boundary",
+    "collectionSha256": "5803bebd8726401a016092fdb3846f2b75866d9058885e60ffae87f1fc4141d6",
+    "artifactCount": 16,
+    "targetRevision": "fefaeb9376428128f7bee952f957c10559eb9813",
+    "sourceDrift": "none",
+    "files": [
+      {"evidenceId":"E101","path":"build.py","sha256":"25d2e8c1beb5541d18ef7348fb06c36a78cc0253c0d1f6366a0b4d0bffa4dfca"},
+      {"evidenceId":"E102","path":"Cargo.toml","sha256":"9ba6d6b2f8c87f78f0539c3e3c2d7e5fc50c35d6b823bd9de8b8b787f47b30d3"},
+      {"evidenceId":"E103","path":"crates/tm-app/src/app_ui.rs","sha256":"438787837d3fb72714c8a9b631be67b42e08c9c4de0c04f9a881a9181020b0e9"},
+      {"evidenceId":"E104","path":"crates/tm-app/src/app.rs","sha256":"ed073e93400417af58ab877497440b8f14d23fc1421c26282feb1de4c725c917"},
+      {"evidenceId":"E105","path":"crates/tm-app/src/main.rs","sha256":"802debbe2cf6ff372b69acb33654acf25f719493509298068ab706499707b42a"},
+      {"evidenceId":"E106","path":"crates/tm-app/src/tabs/details.rs","sha256":"9a530926572090183b4f45ab413ca480b78f060e473f93fd08bfef5247f7dac1"},
+      {"evidenceId":"E107","path":"crates/tm-app/src/tabs/modules.rs","sha256":"da56b7708fc9908ed4a1f7fb3480de84a2903ee28bd9985a63e5ac189c3eaa01"},
+      {"evidenceId":"E108","path":"crates/tm-app/src/tabs/processes.rs","sha256":"0adeab80e46cd2dfae8c79913ffb920ede69d394ca87b04999c7b6b1c867273a"},
+      {"evidenceId":"E109","path":"crates/tm-core/src/logging.rs","sha256":"3b4a246d9f3861015cc8252f5acdc58cfd3ff5bc2da0670f603e7ff543facf3c"},
+      {"evidenceId":"E110","path":"crates/tm-core/src/settings.rs","sha256":"029df28e59f4299cccd94ac6b581c3a5f2e73c91e3431faf3ed2b4ce956955d9"},
+      {"evidenceId":"E111","path":"crates/tm-platform/src/actions.rs","sha256":"fc7bffa383ebf0dfbd8d5c2ee6869c16563c163881832ae0837070c61041db09"},
+      {"evidenceId":"E112","path":"crates/tm-platform/src/win/autostart.rs","sha256":"7f3065fc87bb188ae5e0479eb31579fec07e65aeb2ed7d7b399aa57bd94551d4"},
+      {"evidenceId":"E113","path":"crates/tm-platform/src/win/core_service.rs","sha256":"6a353ce8f89234906195332d48f2f4cf1c65009a5915dc70be95e9c4541437ce"},
+      {"evidenceId":"E114","path":"crates/tm-platform/src/win/process_ops.rs","sha256":"cf1fbe49f2b4fcb98282b40ccc17fc0f485422c537b59cf655be8664e7c13343"},
+      {"evidenceId":"E115","path":"crates/tm-platform/src/win/taskmgr_replacement.rs","sha256":"12d8052586fba99070fb10fca61bd6b782bff48d1e7aff70ffc9cce946b65aac"},
+      {"evidenceId":"E116","path":"crates/tm-service/src/main.rs","sha256":"0b31eeb0d10cf05b6e54165ec3b9b79fe4e676fec7bf2b1f42ccc176fbffe2f9"}
+    ]
+  },
+  "assessment": {
+    "outcome": "opportunities_identified",
+    "summary": "A protected action-only service can remove routine GUI elevation while avoiding SYSTEM-level telemetry disclosure and generic privileged RPC primitives."
+  },
+  "constraints": {
+    "profile": "high_assurance_desktop",
+    "changeHorizons": ["incremental", "medium_term"],
+    "nonNegotiables": [
+      "The service never executes from user-writable storage.",
+      "The IPC protocol contains no arbitrary command execution or arbitrary privileged output path.",
+      "Every process mutation verifies PID and expected creation time.",
+      "Normal GUI startup remains unelevated and non-Windows builds remain valid."
+    ],
+    "assumptions": [
+      "The first release is authorized for one installing Windows account.",
+      "The binaries are not yet Authenticode-signed.",
+      "No measured broker latency or working-set baseline was supplied."
+    ]
+  },
+  "opportunities": [
+    {
+      "opportunityId": "privileged-action-boundary",
+      "title": "Own the privileged action boundary",
+      "summary": "Separate per-user presentation and telemetry from a narrow, protected set of privileged controls.",
+      "diagnosis": "The current GUI-owned action surface mixes read-only, destructive, shell, command-launch, and file-output capabilities, so wholesale elevation or wholesale RPC would grant more authority than the requirement needs.",
+      "evidence": [
+        {
+          "claimType": "observed",
+          "sourceKind": "source",
+          "evidenceId": "E003",
+          "path": "crates/tm-platform/src/actions.rs",
+          "claim": "One trait currently contains process controls, service controls, arbitrary task launch, shell operations, and dump-file creation."
+        },
+        {
+          "claimType": "observed",
+          "sourceKind": "source",
+          "evidenceId": "E005",
+          "path": "crates/tm-app/src/main.rs",
+          "claim": "The persisted elevation mode re-executes the entire GUI before its window is created."
+        },
+        {
+          "claimType": "inferred",
+          "sourceKind": "source",
+          "evidenceId": "E004",
+          "path": "crates/tm-platform/src/win/mod.rs",
+          "claim": "Moving the current action surface wholesale behind a SYSTEM pipe would create generic privileged execution and file-write primitives."
+        }
+      ],
+      "desiredInvariants": [
+        "Only administrator-protected installed code can act as the broker client or service.",
+        "The pipe is local-only, ACL-restricted, bounded, versioned, and bound to the kernel-reported client process.",
+        "Only explicitly allowlisted semantic operations cross the privileged boundary.",
+        "Privileged service state contains no per-user GUI preferences or SYSTEM-level snapshot cache."
+      ],
+      "proposalPath": "proposals/privileged-action-boundary.md",
+      "options": [
+        {
+          "optionId": "elevated-ui",
+          "title": "Elevate the entire GUI through UAC or Task Scheduler",
+          "kind": "baseline",
+          "summary": "Preserve direct Win32 calls and make GUI elevation persistent or easier to trigger.",
+          "diagramPaths": {
+            "before": "diagrams/privileged-action-boundary-before.mmd",
+            "after": "diagrams/privileged-action-boundary-elevated-ui-after.mmd"
+          },
+          "evidenceCoverage": [
+            {
+              "evidenceId": "E005",
+              "effect": "addresses",
+              "tacticalFixRequired": false,
+              "rationale": "The existing whole-GUI elevation path directly implements this option."
+            },
+            {
+              "evidenceId": "E003",
+              "effect": "unaffected",
+              "tacticalFixRequired": true,
+              "rationale": "The mixed action boundary remains fully privileged."
+            }
+          ],
+          "tradeoffs": [
+            {"dimension":"security","direction":"regresses","confidence":"high","basis":"source-derived","assessment":"Renderer, configuration, clipboard, shell, search, and file-dialog inputs all remain inside the elevated process.","validationPlan":"Inventory every GUI-controlled input and process mitigation in the elevated build."},
+            {"dimension":"performance","direction":"neutral","confidence":"high","basis":"source-derived","assessment":"No IPC or second resident process is introduced.","validationPlan":"Compare startup trace markers before and after task-based launch."},
+            {"dimension":"memory","direction":"neutral","confidence":"high","basis":"source-derived","assessment":"The process count and main caches remain unchanged.","validationPlan":"Compare private working set at idle."},
+            {"dimension":"reliability","direction":"improves","confidence":"medium","basis":"source-derived","assessment":"Protected actions avoid access-denied failures, but capability remains coupled to the GUI lifecycle.","validationPlan":"Exercise actions and GUI crash/restart under load."},
+            {"dimension":"operability","direction":"regresses","confidence":"medium","basis":"analogous","assessment":"Task registration, run-level, and task-file ACL state become support dependencies.","validationPlan":"Inspect scheduled-task registration and removal on clean and upgraded installs."},
+            {"dimension":"migration","direction":"improves","confidence":"high","basis":"source-derived","assessment":"Existing direct action code requires little change.","validationPlan":"Run current action integration coverage unchanged."}
+          ],
+          "residualRisks": ["The broad GUI attack surface runs with administrative rights.", "Scheduled-task ACL or executable-path drift can make elevation unsafe."],
+          "implementationReadiness": {
+            "affectedComponents": ["crates/tm-app/src/main.rs", "crates/tm-platform/src/win/mod.rs"],
+            "workPackages": ["Register and validate a highest-run-level task.", "Route launches through the task."],
+            "acceptanceCriteria": ["The task path and task DACL are administrator-protected."],
+            "migrationNotes": ["Keep UAC fallback when the task is absent."],
+            "rollback": "Delete the task and restore direct unelevated launch."
+          }
+        },
+        {
+          "optionId": "protected-action-broker",
+          "title": "Install a protected action-only service",
+          "kind": "isolation",
+          "summary": "Keep telemetry and UI per-user while an authenticated LocalSystem broker owns a fixed control allowlist.",
+          "diagramPaths": {
+            "before": "diagrams/privileged-action-boundary-before.mmd",
+            "after": "diagrams/privileged-action-boundary-protected-broker-after.mmd"
+          },
+          "evidenceCoverage": [
+            {"evidenceId":"E003","effect":"addresses","tacticalFixRequired":true,"rationale":"Only an explicit subset of semantic actions enters the broker protocol; generic launch and file paths stay local."},
+            {"evidenceId":"E004","effect":"addresses","tacticalFixRequired":true,"rationale":"Windows actions gain a broker transport while final Win32 code retains exact target checks."},
+            {"evidenceId":"E005","effect":"mitigates","tacticalFixRequired":false,"rationale":"Routine protected actions no longer require whole-GUI elevation."},
+            {"evidenceId":"E006","effect":"addresses","tacticalFixRequired":true,"rationale":"The GUI retains the sampler and gains bounded action transport/fallback."}
+          ],
+          "tradeoffs": [
+            {"dimension":"security","direction":"improves","confidence":"high","basis":"source-derived","assessment":"Privilege is confined to protected installed code and a narrow command allowlist; same-user GUI injection remains.","validationPlan":"Audit ACLs, pipe client PID/path binding, protocol allowlist, and wrong-client rejection on a disposable VM."},
+            {"dimension":"performance","direction":"regresses","confidence":"medium","basis":"hypothetical","assessment":"Privileged actions gain one local IPC serialization and scheduling hop.","validationPlan":"Measure 100 ping and affinity requests; require p95 below 10 ms."},
+            {"dimension":"memory","direction":"regresses","confidence":"medium","basis":"hypothetical","assessment":"One small resident process and bounded worker buffers are added; no snapshots are retained.","validationPlan":"Measure idle private working set and assert queue/frame caps in tests."},
+            {"dimension":"reliability","direction":"improves","confidence":"medium","basis":"source-derived","assessment":"SCM can restart the broker independently and the GUI retains local fallback; IPC introduces a split failure mode.","validationPlan":"Stop, crash, restart, overload, and version-mismatch the broker while the GUI remains running."},
+            {"dimension":"operability","direction":"regresses","confidence":"high","basis":"source-derived","assessment":"Installation, protected ACLs, service status, logs, upgrades, and uninstall become owned product behavior.","validationPlan":"Read back SCM config and filesystem/pipe ACLs after install and uninstall."},
+            {"dimension":"migration","direction":"regresses","confidence":"medium","basis":"source-derived","assessment":"Actions need explicit protocol mappings and packaging needs a second executable, but fallback permits incremental rollout.","validationPlan":"Run local and brokered action tests with service absent, stopped, healthy, and incompatible."}
+          ],
+          "residualRisks": ["Authorized-user code injection into the installed GUI can borrow its broker authority.", "Unsigned binaries lack publisher provenance.", "Unsafe Win32 ACL and pipe code can contain implementation defects.", "An authorized local account can attempt denial of service."],
+          "implementationReadiness": {
+            "affectedComponents": ["Cargo.toml", "build.py", "crates/tm-core/src/settings.rs", "crates/tm-platform/src/actions.rs", "crates/tm-platform/src/win", "crates/tm-app/src/main.rs", "crates/tm-app/src/app_ui.rs", "crates/tm-service"],
+            "workPackages": ["Implement bounded protocol and authenticated pipe.", "Implement protected installer and SCM configuration.", "Map allowlisted actions and preserve fallback.", "Add GUI status controls and package both binaries."],
+            "acceptanceCriteria": ["Wrong user, remote client, wrong executable, wrong hash, oversized frame, unknown command, and recycled PID are rejected.", "No protocol request contains a generic command line or arbitrary privileged output path.", "The GUI runs and samples normally with the service absent."],
+            "migrationNotes": ["Keep the service opt-in until install readback passes.", "Do not move telemetry into the service."],
+            "rollback": "Stop/delete the service registration and continue with local actions/UAC helpers; protected files may remain for safe reinstall."
+          }
+        },
+        {
+          "optionId": "privileged-sampler-and-broker",
+          "title": "Move telemetry and controls into the service",
+          "kind": "foundational",
+          "summary": "Make the service the always-running owner of system snapshots and actions.",
+          "diagramPaths": {
+            "before": "diagrams/privileged-action-boundary-before.mmd",
+            "after": "diagrams/privileged-action-boundary-system-sampler-after.mmd"
+          },
+          "evidenceCoverage": [
+            {"evidenceId":"E006","effect":"addresses","tacticalFixRequired":true,"rationale":"Sampling ownership moves out of the GUI but requires a replacement engine/protocol."},
+            {"evidenceId":"E002","effect":"unaffected","tacticalFixRequired":true,"rationale":"Per-user settings still cannot be trusted as service authorization policy."}
+          ],
+          "tradeoffs": [
+            {"dimension":"security","direction":"regresses","confidence":"high","basis":"source-derived","assessment":"SYSTEM snapshots can disclose other users' protected process metadata unless every field is authorization-filtered.","validationPlan":"Create a multi-user privacy threat model and field-level disclosure matrix."},
+            {"dimension":"performance","direction":"regresses","confidence":"medium","basis":"hypothetical","assessment":"Continuous collection, large serialization, copies, and IPC backpressure enter the hot path.","validationPlan":"Benchmark 500 ms snapshots with 10,000 processes and slow/paused clients."},
+            {"dimension":"memory","direction":"regresses","confidence":"medium","basis":"hypothetical","assessment":"Snapshot caches and per-client queues increase retained memory.","validationPlan":"Measure peak and steady-state service memory with multiple clients."},
+            {"dimension":"reliability","direction":"unknown","confidence":"medium","basis":"source-derived","assessment":"Sampling survives GUI restarts but adds cache coherency, client lag, and schema mismatch failure modes.","validationPlan":"Fault-inject service/client restarts and partial snapshot delivery."},
+            {"dimension":"operability","direction":"regresses","confidence":"high","basis":"source-derived","assessment":"Telemetry schema, privacy policy, service upgrades, and cache diagnostics become operational dependencies.","validationPlan":"Prototype rolling version compatibility and multi-session diagnostics."},
+            {"dimension":"migration","direction":"regresses","confidence":"high","basis":"source-derived","assessment":"The mature collector engine and demand model need a distributed replacement.","validationPlan":"Run dual collectors and compare every field before cutover."}
+          ],
+          "residualRisks": ["Cross-user telemetry disclosure.", "Large IPC parser and cache attack surface.", "Always-on sampling resource cost."],
+          "implementationReadiness": {
+            "affectedComponents": ["crates/tm-core/src/engine.rs", "crates/tm-platform", "crates/tm-app/src/app.rs", "crates/tm-service"],
+            "workPackages": ["Define user-scoped snapshot policy.", "Implement distributed demand and backpressure.", "Migrate with dual sampling."],
+            "acceptanceCriteria": ["No user can observe fields unavailable to their own token.", "Slow clients cannot grow service memory without bound."],
+            "migrationNotes": ["Requires a separate privacy review before implementation."],
+            "rollback": "Switch GUI factory back to the local collector and discard service caches."
+          }
+        }
+      ],
+      "recommendedOptionId": "protected-action-broker",
+      "recommendation": "Use the protected action broker while telemetry remains in the interactive user's process; reconsider the privileged sampler only with an explicit multi-user telemetry requirement."
+    }
+  ],
+  "openQuestions": [
+    "Which Authenticode publisher will sign public binaries?",
+    "Will the first installer support one authorized SID only?",
+    "Which disposable-VM matrix will gate installed ACL, recovery, upgrade, and rollback behavior?"
+  ]
+}

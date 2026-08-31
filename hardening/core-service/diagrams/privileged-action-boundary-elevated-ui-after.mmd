@@ -1,0 +1,11 @@
+flowchart LR
+    U[Interactive user] -->|UAC at launch or scheduled task| EGUI[Elevated TaskMan GUI]
+    EGUI -->|sampling and controls| OS[Windows telemetry and control APIs]
+    CFG[(Per-user config)] <--> EGUI
+    WDIR[Launch directory] --> EGUI
+
+    subgraph ElevatedBoundary[Administrative trust boundary]
+      EGUI
+      CFG
+      OS
+    end

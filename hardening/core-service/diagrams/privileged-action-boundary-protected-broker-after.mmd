@@ -1,0 +1,24 @@
+flowchart LR
+    U[Authorized interactive user] --> GUI[Unelevated TaskMan GUI]
+    GUI -->|read-only local sampling| TEL[Windows telemetry APIs]
+    GUI -->|versioned, bounded local IPC| PIPE[Local-only named pipe]
+    PIPE -->|DACL + client PID/path + exact process identity| SVC[TaskMan Core Service]
+    SVC -->|allowlisted controls only| CAP[Privileged process/service controls]
+    ACL[Admin-protected Program Files binaries] --> GUI
+    ACL --> SVC
+    PCFG[(SYSTEM/Admin-only broker manifest)] --> SVC
+    UCFG[(Per-user GUI config)] <--> GUI
+
+    subgraph UserSession[User-session trust boundary]
+      GUI
+      TEL
+      UCFG
+    end
+    subgraph IPCBoundary[Authenticated IPC boundary]
+      PIPE
+    end
+    subgraph ServiceBoundary[LocalSystem service boundary]
+      SVC
+      PCFG
+      CAP
+    end
