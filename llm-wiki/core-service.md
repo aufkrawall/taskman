@@ -38,11 +38,23 @@ contract.
   fields are rejected.
 - The pipe rejects remote clients and uses first-instance creation to prevent
   pre-creation/squatting. Its protected DACL denies Network, grants full access
-  to System/Administrators, and grants the one installing user only read,
-  write, and synchronize access.
+  to System/Administrators, and grants the one installing user
+  `FILE_READ_DATA | FILE_WRITE_DATA | FILE_READ_ATTRIBUTES | SYNCHRONIZE`
+  (`USER_PIPE_ACCESS`). npfs silently requires FILE_READ_ATTRIBUTES beyond the
+  requested data rights for pipe client ends, so an ACE with only the data
+  bits denies every non-elevated client — elevated clients only worked
+  through the generic Administrators ACE. Do not "simplify" either side of
+  that mask/request pair.
 - The broker gets the kernel-reported client PID, resolves its executable, and
   requires the protected installed GUI path. The client likewise gets the
-  kernel-reported server PID and requires the protected installed service path.
+  kernel-reported server PID and requires the protected installed service
+  path. Resolving the server image needs PROCESS_QUERY_LIMITED_INFORMATION on
+  a LocalSystem process, which non-elevated GUI tokens are denied, so the
+  client falls back to the SCM view: the pipe server PID must be the PID the
+  SCM reports for `TaskmanCore` and the configured image (quotes stripped;
+  windows-service keeps them) must be the protected path.
+  `live_service_identity_verifies_without_elevation` covers this against a
+  running service and self-skips when the pipe is unreachable.
 - A protected manifest pins protocol/schema, authorized user SID, exact GUI and
   service paths, and SHA-256 hashes. The service validates it before listening.
 - Two workers, a bounded queue of 16, and a matching 19-instance pipe cap keep
