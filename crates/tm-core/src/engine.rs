@@ -270,18 +270,32 @@ fn run_loop(
 ) {
     // The collector only exists after Start; before that the thread parks
     // here without touching any platform APIs.
+    //
+    // Configuration that arrives while parked MUST be remembered rather than
+    // dropped. The UI computes its telemetry demand on its first frame, which
+    // is deliberately BEFORE the engine is started, and it only re-sends when
+    // the value changes — so a demand discarded here is lost for the rest of
+    // the session. That is how per-process network stayed dark on the default
+    // start page: `PROCESS_NET` was requested exactly once, into the void.
+    let mut pending_demand: Option<crate::demand::TelemetryDemand> = None;
     let mut collector: Box<dyn SystemCollector> = if start_immediately {
         factory()
     } else {
         loop {
             match cmd_rx.recv() {
                 Ok(EngineCmd::Start) => break factory(),
+                Ok(EngineCmd::SetDemand(d)) => pending_demand = Some(d),
+                // The sampling loop reads the interval from shared state, so
+                // applying it now is exactly what the running loop would do.
+                Ok(EngineCmd::SetInterval(i)) => *sync::write(&shared.interval) = i,
                 Ok(EngineCmd::Shutdown) => {
                     *sync::write(&shared.state) = EngineState::Stopped;
                     shared.notify();
                     return;
                 }
-                Ok(_) => {} // ignore until started
+                // Pause/Resume/Refresh are transitions of a running engine;
+                // Start is what brings it up, so they stay meaningless here.
+                Ok(_) => {}
                 Err(std::sync::mpsc::RecvError) => {
                     *sync::write(&shared.state) = EngineState::Stopped;
                     return;
@@ -289,6 +303,9 @@ fn run_loop(
             }
         }
     };
+    if let Some(demand) = pending_demand.take() {
+        collector.set_demand(demand);
+    }
     *sync::write(&shared.state) = EngineState::Running;
     shared.notify();
     tracing::info!(backend = collector.backend_name(), "engine running");
@@ -399,6 +416,70 @@ mod tests {
             std::thread::sleep(Duration::from_millis(5));
         }
         cond()
+    }
+
+    /// Regression: telemetry demand sent while the lazy engine is still
+    /// parked must reach the collector once it is built. The UI ships its
+    /// demand on the first frame — before `start()` — and only re-sends on
+    /// change, so dropping it here disables that provider for the session.
+    #[test]
+    fn demand_sent_before_start_reaches_the_collector() {
+        #[derive(Clone, Default)]
+        struct Seen(Arc<std::sync::Mutex<Vec<u64>>>);
+        struct DemandCollector(Seen);
+        impl SystemCollector for DemandCollector {
+            fn sample(&mut self, _now: Instant) -> Result<Snapshot> {
+                Ok(tiny_snapshot())
+            }
+            fn backend_name(&self) -> &'static str {
+                "demand-mock"
+            }
+            fn set_demand(&mut self, demand: crate::demand::TelemetryDemand) {
+                self.0.0.lock().unwrap().push(demand.bits());
+            }
+        }
+
+        let seen = Seen::default();
+        let factory_seen = seen.clone();
+        let (h, join) = spawn_lazy(
+            Box::new(move || Box::new(DemandCollector(factory_seen))),
+            Duration::from_millis(15),
+            None,
+        )
+        .unwrap();
+
+        // Exactly the UI's order: demand first, engine start second.
+        let wanted = crate::demand::TelemetryDemand::core()
+            .union(crate::demand::TelemetryDemand::PROCESS_NET);
+        h.set_demand(wanted);
+        h.start();
+
+        assert!(
+            wait_for(|| seen.0.lock().unwrap().contains(&wanted.bits()), 5000),
+            "collector never received the pre-start demand: {:?}",
+            seen.0.lock().unwrap()
+        );
+        h.shutdown();
+        join.join().unwrap();
+    }
+
+    /// An interval set before start must also survive, for the same reason.
+    #[test]
+    fn interval_sent_before_start_is_honored() {
+        let (h, join) = spawn_lazy(
+            Box::new(|| Box::new(TinyCollector)),
+            Duration::from_secs(600),
+            None,
+        )
+        .unwrap();
+        h.set_interval(Duration::from_millis(15));
+        h.start();
+        assert!(
+            wait_for(|| h.tick_count() >= 3, 5000),
+            "engine kept the stale 10-minute interval"
+        );
+        h.shutdown();
+        join.join().unwrap();
     }
 
     #[test]

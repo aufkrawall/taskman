@@ -15,6 +15,14 @@ can cross a protected, allowlisted service boundary after one explicit install.
 
 ## Recently landed (2026-08-31 — per-process network)
 
+- **Engine fix that made it visible:** a parked lazy engine used to discard
+  every command except `Start`, so the demand the UI sends on its first frame
+  (before the engine starts) was lost, and since `update_demand` only re-sends
+  on change, `PROCESS_NET` never reached the collector. Pre-start `SetDemand`
+  and `SetInterval` are now honored, with regression tests.
+- The Network column uses 1024-based KB/s / MB/s like the Disk column rather
+  than TM's fixed Mbit/s, in which real per-process traffic always read "0,0".
+
 - `win/net_etw.rs` supplies the Processes/App History Network column from a
   private real-time ETW session on `Microsoft-Windows-Kernel-Network`,
   accumulating the payload `(pid, size)` prefix of the TCP/UDP data events.

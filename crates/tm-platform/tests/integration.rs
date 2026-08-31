@@ -264,3 +264,40 @@ fn show_top_network_processes() {
     }
     assert!(!top.is_empty(), "no process carried a network reading");
 }
+
+/// Reproduces the GUI's exact plumbing: a lazily spawned engine, demand sent
+/// through the command channel, snapshots read from the handle. Run elevated;
+/// ignored by default because the ETW session needs administrator rights.
+#[cfg(target_os = "windows")]
+#[test]
+#[ignore = "needs elevation"]
+fn engine_delivers_process_network_when_demanded() {
+    use tm_core::demand::TelemetryDemand;
+    let factory: tm_core::engine::CollectorFactory = Box::new(tm_platform::create_collector);
+    let (engine, _join) =
+        tm_core::engine::spawn_lazy(factory, std::time::Duration::from_millis(400), None)
+            .expect("engine");
+    engine.start();
+    // Exactly what update_demand() ships when the Processes page is visible.
+    engine.set_demand(TelemetryDemand::core().union(TelemetryDemand::PROCESS_NET));
+
+    let mut with_values = 0usize;
+    let mut total = 0usize;
+    for _ in 0..12 {
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        if let Some(snap) = engine.latest() {
+            let real: Vec<_> = snap.processes.iter().filter(|p| !p.synthetic).collect();
+            total = real.len();
+            with_values = real.iter().filter(|p| p.net_recv_bps.is_some()).count();
+            if with_values > 0 {
+                break;
+            }
+        }
+    }
+    eprintln!("processes with a network reading: {with_values}/{total}");
+    assert!(total > 0, "engine never published a snapshot");
+    assert!(
+        with_values == total,
+        "demand did not reach the collector: {with_values}/{total}"
+    );
+}
