@@ -827,6 +827,10 @@ impl PlatformActions for BrokeredActions {
         }
     }
 
+    fn switch_to_installed_gui(&self, args: &[String]) -> Result<bool> {
+        relaunch_into_installed_gui(args)
+    }
+
     fn create_dump_file(
         &self,
         pid: u32,
@@ -1377,15 +1381,39 @@ fn service_state(client: &BrokerClient) -> CoreServiceState {
     };
     match service.query_status() {
         Ok(status) => match status.current_state {
-            ServiceState::Running => CoreServiceState::Degraded(
-                "service is running but broker authentication failed".into(),
-            ),
+            ServiceState::Running => {
+                // A session running outside the protected install location can
+                // never satisfy the broker's image-path check, so its ping
+                // fails even while the service is healthy. Report that
+                // distinctly: "repair" cannot help, switching to the
+                // installed copy can.
+                let current_exe = std::env::current_exe().ok();
+                let installed_gui = expected_installed_gui_path().ok();
+                if foreign_client_session(current_exe.as_deref(), installed_gui.as_deref()) {
+                    CoreServiceState::ForeignClient
+                } else {
+                    CoreServiceState::Degraded(
+                        "service is running but broker authentication failed".into(),
+                    )
+                }
+            }
             ServiceState::StartPending | ServiceState::ContinuePending => {
                 CoreServiceState::Starting
             }
             _ => CoreServiceState::Stopped,
         },
         Err(error) => CoreServiceState::Degraded(error.to_string()),
+    }
+}
+
+/// True when this process's image is not the protected installed GUI, which
+/// the broker's client authorization rejects regardless of service health.
+/// Unresolvable paths must keep the honest degraded classification instead of
+/// claiming the session is foreign.
+fn foreign_client_session(current_exe: Option<&Path>, installed_gui: Option<&Path>) -> bool {
+    match (current_exe, installed_gui) {
+        (Some(current), Some(installed)) => !paths_match(current, installed),
+        _ => false,
     }
 }
 
@@ -1486,6 +1514,41 @@ pub fn redirect_to_installed_gui(args: &[String]) -> Result<bool> {
     }
 
     super::process_ops::run_new_task(&gui_command(&installed, args), false)?;
+    Ok(true)
+}
+
+/// Mid-session counterpart of [`redirect_to_installed_gui`]: hand this
+/// session over to the protected installed GUI. Used when the state surface
+/// reports [`CoreServiceState::ForeignClient`], because no reinstall can make
+/// a foreign image pass the broker's client authorization. Returns
+/// `Ok(false)` when there is no installed generation to switch into.
+pub fn relaunch_into_installed_gui(args: &[String]) -> Result<bool> {
+    if super::is_elevated() {
+        return Err(TmError::platform(
+            "core service GUI switch",
+            "an elevated session cannot hand over; the installed GUI would inherit its elevation",
+        ));
+    }
+    let installed = expected_installed_gui_path()?;
+    if !installed.is_file() || has_reparse_attribute(&installed)? {
+        return Ok(false);
+    }
+    use windows_service::service::ServiceAccess;
+    use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
+    let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)
+        .map_err(|error| TmError::platform("open service manager", error.to_string()))?;
+    if manager
+        .open_service(SERVICE_NAME, ServiceAccess::QUERY_STATUS)
+        .is_err()
+    {
+        return Ok(false);
+    }
+    // The installed replacement must outlive this closing session: the
+    // handoff flag makes it wait for this instance's single-instance mutex
+    // instead of bouncing off the guard and exiting.
+    let mut forwarded = args.to_vec();
+    forwarded.push("--single-instance-handoff".to_string());
+    super::process_ops::run_new_task(&gui_command(&installed, &forwarded), false)?;
     Ok(true)
 }
 
@@ -2371,5 +2434,24 @@ mod tests {
         ] {
             assert!(!owned_service_log_name(std::ffi::OsStr::new(name)));
         }
+    }
+
+    #[test]
+    fn foreign_client_classification_follows_the_installed_image() {
+        // The test binary stands in for the installed GUI; it exists, so
+        // paths_match can canonicalize it.
+        let installed = std::env::current_exe().unwrap();
+        assert!(!foreign_client_session(Some(&installed), Some(&installed)));
+        // Case differences must not misclassify the authorized client.
+        let upper = PathBuf::from(installed.to_string_lossy().to_uppercase());
+        assert!(!foreign_client_session(Some(&upper), Some(&installed)));
+        // A different existing image (dev tree / portable copy) is foreign.
+        let foreign = std::env::temp_dir().join("taskman-foreign-client-probe.exe");
+        std::fs::write(&foreign, b"probe").unwrap();
+        assert!(foreign_client_session(Some(&foreign), Some(&installed)));
+        let _ = std::fs::remove_file(&foreign);
+        // Unresolvable paths keep the honest degraded classification.
+        assert!(!foreign_client_session(None, Some(&installed)));
+        assert!(!foreign_client_session(Some(&installed), None));
     }
 }

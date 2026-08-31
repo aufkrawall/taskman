@@ -42,8 +42,15 @@ pub enum CoreServiceState {
     NotInstalled,
     Stopped,
     Starting,
-    Running { version: String },
+    Running {
+        version: String,
+    },
     Degraded(String),
+    /// The service is installed and healthy, but this session's executable
+    /// sits outside the protected install location, so the broker's
+    /// image-path authorization will keep rejecting it. "Repair" cannot fix
+    /// this; the session must switch to the installed GUI.
+    ForeignClient,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -245,6 +252,11 @@ pub trait PlatformActions: Send + Sync {
     }
     fn set_core_service_installed(&self, _installed: bool) -> Result<()> {
         Err(tm_core::TmError::Unsupported("core service"))
+    }
+    /// Hand the current session over to the protected installed GUI. Returns
+    /// `Ok(false)` when there is no installed generation to switch into.
+    fn switch_to_installed_gui(&self, _args: &[String]) -> Result<bool> {
+        Ok(false)
     }
 
     /// Create a user-mode dump. `expected_start_epoch_s` has the same
