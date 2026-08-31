@@ -259,8 +259,7 @@ impl Sampler {
         // ---- refresh raw data --------------------------------------------------
         self.refresh_raw();
 
-        let window_owners: HashSet<u32> =
-            windows_enum::visible_window_owners().into_iter().collect();
+        let window_owners = windows_enum::window_owners();
         let thread_counts = threads_map::thread_counts();
 
         // ---- CPU -----------------------------------------------------------------
@@ -350,7 +349,7 @@ impl Sampler {
             // Single owned copy of the name per process (reused everywhere).
             let name = p.name().to_string_lossy().into_owned();
             let exe_owned = p.exe().map(|e| e.to_path_buf());
-            let has_window = window_owners.contains(&pid_u);
+            let has_window = window_owners.visible.contains(&pid_u);
 
             let user = p
                 .user_id()
@@ -371,6 +370,14 @@ impl Sampler {
             }
             entry.ppid = p.parent().map(|x| x.as_u32());
             entry.status = map_status(p.status());
+            if self
+                .cpu_load
+                .is_suspended(pid_u, Some(p.start_time() as i64))
+            {
+                entry.status = ProcStatus::Suspended;
+            } else if window_owners.not_responding.contains(&pid_u) {
+                entry.status = ProcStatus::NotResponding;
+            }
             entry.user = user;
             // Time-based share of total machine capacity + absolute CPU time,
             // both straight from the kernel's accumulators (cpu_load.rs).

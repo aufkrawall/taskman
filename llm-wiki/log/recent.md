@@ -1,18 +1,87 @@
 # Recent Activity
 
+## 2026-08-31 — protected core service, persistent Details controls, overload resilience
+
+Implemented the requested split architecture: the ordinary GUI owns all
+telemetry/UI/user-path work, while a new delayed-auto LocalSystem
+`taskman-service.exe` owns only versioned allowlisted control requests.
+
+- **Service boundary:** local/remote-rejecting first-instance named pipe;
+  one-user protected DACL; kernel client/server PID plus protected image-path
+  binding; 64 KiB framed request/response caps; unknown-field rejection; two
+  workers, queue cap 16, and pipe-instance cap 19. A protected ProgramData
+  manifest pins schema, protocol, SID, paths, and SHA-256 hashes. Explicit
+  broker rejection—and any post-authentication transport failure with an
+  unknown outcome—never falls back to the GUI token.
+- **Action safety:** brokered process actions require a positive sampled
+  creation time, reject system/service/requesting-GUI/critical targets, then
+  repeat exact identity and critical checks on the handle used by the action.
+  Tree kill refuses unidentified descendants. Module unload stays narrowly
+  allowlisted and re-enumerates exact base/path; module inventory and dumps
+  remain local. UAC virtualization is a similarly narrow token operation with
+  current-state menu marker, allowed-state check, and warning dialog.
+- **Filesystem/SCM:** Program Files binaries are protected System/Admin-full,
+  Users-read/execute; ProgramData manifest/logs are System/Admin-only with
+  protected Administrator ownership. Directory/file handles are pinned against
+  conflicting mutation while owner/group/DACL are assigned. Log startup
+  accepts only the exact daily service-log name shape and rejects
+  reparse/nested/non-file/hard-linked entries,
+  and retains at most 14 daily files. The elevated helper never opens the
+  interactive user's file log or mutates per-user redirect state. Install
+  rejects reparse points, pins source and existing-destination handles against
+  mutation, rejects hard-linked installed binaries, hashes pinned content,
+  uses synchronized/write-through staging + atomic move, and verifies the
+  destination. Upgrade waits for the old service process. SCM is
+  delayed-auto LocalSystem with service SID, only `SeDebugPrivilege`, and
+  restart actions at 5/15/60 seconds.
+- **GUI handoff:** the successful one-time UAC install writes a per-user marker
+  only after the helper's SCM start request succeeds; SCM reports readiness
+  independently once the pipe is listening. Matching package/portable launches
+  redirect before any window to the protected GUI, with Windows-safe argument
+  quoting; a differing package hash remains local for repair/upgrade. Existing
+  autostart and owned Task Manager replacement entries are migrated. Uninstall
+  removes SCM capability and the marker while leaving protected files.
+- **Parity/state:** literal PPID tree is on Details (not Processes); current
+  priority and UAC states are marked; priority/affinity can be persisted per
+  executable; sort state persists across all process/list tables; Process
+  status reports suspended/not-responding/efficiency; modules can be unloaded;
+  Delete confirms termination; close-to-tray and HKCU autostart are optional.
+- **Resilience/startup:** two independent bounded 32-job GUI action lanes,
+  no renderer-thread fallback, explicit overload feedback, above-normal (not high/realtime) control-plane
+  priority, single-instance restore signaling, bounded ownership handoff for
+  explicit elevation, condition-variable-coordinated SCM listener wakeup, lazy
+  tray, background affinity and advanced-settings probes. Autostart migration
+  rewrites only commands proven to be TaskMan-owned; settings input is capped
+  at 4 MiB before parsing. A broker-worker panic aborts service mode so SCM
+  recovery restarts a clean process rather than retaining degraded capacity.
+  Windows WGPU remains D3D12-only with Glow fallback.
+
+Final headless verification passed format, Clippy with warnings denied, all
+166 workspace tests (71 app, 50 core, 40 platform library, 5 Windows
+integration), the host release/package build, and the service protocol
+self-check. The ZIP contains the 13,873,664-byte GUI and 1,378,816-byte service.
+Linux cross packaging was skipped because neither supported cross toolchain is
+installed. No GUI, UAC helper, ACL mutation, or service install/start occurred.
+
+The earlier 2026-08-28 kill-path note below is historical: the current code
+uses exact same-second creation identity (no ±2-second tolerance) and refuses
+tree descendants whose creation identity could not be captured (no unverified
+fallback).
+
 ## 2026-08-31 — GUI parity, literal process tree, Modules inspector, D3D12 trim
 
 Broad parity/ergonomics pass against current Windows 11 Task Manager plus
 selected System Informer diagnostics. No GUI/capture executable was launched
 during verification so the active desktop remained undisturbed.
 
-- **Process interaction:** selectable persisted grouped vs literal PPID tree;
-  hierarchy-preserving search and sibling sorting; expand/collapse controls;
+- **Process interaction:** native grouped ownership stays on Processes, while
+  Details offers a persisted literal PPID tree; hierarchy-preserving search
+  and sibling sorting; expand/collapse controls;
   arrow/Home/End/Page navigation; Delete opens an identity-bound end-process
   confirmation. Processes/Details menus now consistently expose copy, online
   search, file location, properties, dumps, and modules where supported.
 - **Modules:** new async on-demand name/path/base/size inspector. Unload is a
-  double-confirmed diagnostic action restricted to same-architecture
+  confirmation-gated diagnostic action restricted to same-architecture
   third-party DLLs. ToolHelp enumeration handles transient `ERROR_BAD_LENGTH`,
   surfaces unexpected iteration errors, and revalidates the exact process
   creation FILETIME plus module base/path before remote `FreeLibrary`; main,

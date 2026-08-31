@@ -23,9 +23,11 @@ pub struct Capabilities {
     pub per_process_network: bool,
     pub process_modules: bool,
     pub unload_module: bool,
+    pub start_with_windows: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(target_os = "windows", derive(serde::Serialize, serde::Deserialize))]
 pub enum TaskManagerReplacementState {
     Unsupported,
     Disabled,
@@ -34,7 +36,18 @@ pub enum TaskManagerReplacementState {
     Conflict(String),
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CoreServiceState {
+    Unsupported,
+    NotInstalled,
+    Stopped,
+    Starting,
+    Running { version: String },
+    Degraded(String),
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(target_os = "windows", derive(serde::Serialize, serde::Deserialize))]
 pub enum ServiceAction {
     Start,
     Stop,
@@ -42,6 +55,7 @@ pub enum ServiceAction {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(target_os = "windows", derive(serde::Serialize, serde::Deserialize))]
 pub enum UserSessionAction {
     Disconnect,
     Logoff,
@@ -118,11 +132,34 @@ pub trait PlatformActions: Send + Sync {
     fn suspend_process(&self, _pid: u32, _suspend: bool) -> Result<()> {
         Err(tm_core::TmError::Unsupported("suspend/resume"))
     }
+    fn suspend_process_checked(
+        &self,
+        pid: u32,
+        _expected_start_epoch_s: Option<i64>,
+        suspend: bool,
+    ) -> Result<()> {
+        self.suspend_process(pid, suspend)
+    }
     fn set_priority(&self, _pid: u32, _priority: PriorityClass) -> Result<()> {
         Err(tm_core::TmError::Unsupported("set priority"))
     }
+    fn set_priority_checked(
+        &self,
+        pid: u32,
+        _expected_start_epoch_s: Option<i64>,
+        priority: PriorityClass,
+    ) -> Result<()> {
+        self.set_priority(pid, priority)
+    }
     fn get_affinity_mask(&self, _pid: u32) -> Result<u64> {
         Err(tm_core::TmError::Unsupported("affinity"))
+    }
+    fn get_affinity_mask_checked(
+        &self,
+        pid: u32,
+        _expected_start_epoch_s: Option<i64>,
+    ) -> Result<u64> {
+        self.get_affinity_mask(pid)
     }
     fn system_affinity_mask(&self) -> Result<u64> {
         Err(tm_core::TmError::Unsupported("affinity"))
@@ -130,8 +167,32 @@ pub trait PlatformActions: Send + Sync {
     fn set_affinity_mask(&self, _pid: u32, _mask: u64) -> Result<()> {
         Err(tm_core::TmError::Unsupported("affinity"))
     }
+    fn set_affinity_mask_checked(
+        &self,
+        pid: u32,
+        _expected_start_epoch_s: Option<i64>,
+        mask: u64,
+    ) -> Result<()> {
+        self.set_affinity_mask(pid, mask)
+    }
     fn set_efficiency_mode(&self, _pid: u32, _on: bool) -> Result<()> {
         Err(tm_core::TmError::Unsupported("efficiency mode"))
+    }
+    fn set_efficiency_mode_checked(
+        &self,
+        pid: u32,
+        _expected_start_epoch_s: Option<i64>,
+        on: bool,
+    ) -> Result<()> {
+        self.set_efficiency_mode(pid, on)
+    }
+    fn set_uac_virtualization_checked(
+        &self,
+        _pid: u32,
+        _expected_start_epoch_s: Option<i64>,
+        _enabled: bool,
+    ) -> Result<()> {
+        Err(tm_core::TmError::Unsupported("UAC virtualization"))
     }
     fn list_process_modules(
         &self,
@@ -175,6 +236,15 @@ pub trait PlatformActions: Send + Sync {
     }
     fn set_task_manager_replacement(&self, _enabled: bool) -> Result<()> {
         Err(tm_core::TmError::Unsupported("Task Manager replacement"))
+    }
+    fn set_start_with_windows(&self, _enabled: bool, _start_minimized: bool) -> Result<()> {
+        Err(tm_core::TmError::Unsupported("start with Windows"))
+    }
+    fn core_service_state(&self) -> CoreServiceState {
+        CoreServiceState::Unsupported
+    }
+    fn set_core_service_installed(&self, _installed: bool) -> Result<()> {
+        Err(tm_core::TmError::Unsupported("core service"))
     }
 
     /// Create a user-mode dump. `expected_start_epoch_s` has the same

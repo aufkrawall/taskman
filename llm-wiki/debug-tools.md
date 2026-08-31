@@ -18,10 +18,13 @@ Primary sources:
 | Full gate | fmt, clippy `-D warnings`, workspace tests | `python build.py --check` |
 | Release | refresh the user-launched host artifact | `python build.py --host-only` |
 | Self-check | headless collector JSON smoke test; starts the binary but not its GUI | `target/release/taskman.exe --selfcheck [--mock]` |
+| Service self-check | headless broker framing/ACL/path summary; does not install/start SCM service | `target/release/taskman-service.exe --selfcheck` |
 
 Cargo tests and `build.py` do not open TaskMan windows. The capture helper and
 plain `taskman.exe` do; do not use those while the desktop must remain
 undisturbed. Windows integration tests may spawn short-lived helper processes.
+The service self-check is non-mutating: it does not write Program Files,
+ProgramData, registry, or SCM state.
 
 ## Renderer diagnostics
 

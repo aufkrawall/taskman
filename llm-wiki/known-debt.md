@@ -50,6 +50,33 @@ the main image, Windows-path modules, critical loader modules, cross-bitness
 targets, and TaskMan itself. Broader injection would add risk without useful
 Task-Manager parity and is not planned.
 
+## Core-service production hardening still outstanding
+
+The service boundary, ACL installer, bounded protocol, identity checks, and
+recovery policy are implemented. These release-engineering/operational items
+remain follow-up rather than being simulated in headless tests:
+
+- Sign both binaries and add publisher/signature verification to install and
+  update policy. Protected paths plus pinned SHA-256 hashes prevent ordinary
+  user replacement, but signing is still the right production provenance
+  layer.
+- Exercise install, upgrade, rollback, reparse/hard-link/pre-opened-handle
+  attacks, ACL readback, SCM failure recovery, multi-session denial, and no-service fallback in a
+  disposable Windows VM. The automated gate intentionally does not mutate the
+  developer machine's Program Files, ProgramData, registry, or SCM.
+- The pipe authorizes exactly one installing user SID. Multi-user support must
+  add explicit per-user enrollment/revocation and auditability; broadening the
+  DACL to `Authenticated Users` is not acceptable.
+- Two workers, queue depth 16, 64 KiB frames, and 19 pipe instances bound
+  broker resource growth, but I/O is synchronous. An already authenticated
+  client can stall both workers. Validate slow legitimate operations under
+  load, then use overlapped I/O with explicit per-request deadlines if the VM
+  fault-injection matrix confirms safe timeout values.
+- Uninstall removes the service registration and user redirect but leaves the
+  protected binaries/data. A signed standalone uninstaller could schedule
+  cleanup after the GUI exits; in-place recursive deletion is intentionally not
+  attempted by the running app.
+
 ## Deliberate deviations / session-limited fixes
 
 - **Efficiency-mode UI latency** (2026-08-26): after a toggle the UI waits

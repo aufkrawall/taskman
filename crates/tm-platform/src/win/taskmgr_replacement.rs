@@ -1,6 +1,7 @@
 //! Optional Windows Task Manager replacement through Image File Execution
 //! Options. The registry is the source of truth; config.ini never mirrors it.
 
+use std::path::Path;
 use tm_core::error::{Result, TmError};
 use windows::Win32::System::Registry::{
     HKEY_LOCAL_MACHINE, KEY_READ, KEY_WRITE, REG_OPTION_NON_VOLATILE, REG_SZ, RegCloseKey,
@@ -23,16 +24,30 @@ pub enum State {
     Conflict(String),
 }
 
-pub fn state() -> State {
-    let Some(value) = read_debugger() else {
-        return State::Disabled;
+enum DebuggerValue {
+    Absent,
+    Text(String),
+    Invalid,
+}
+
+pub fn state_for_exe(exe: &Path) -> State {
+    let value = match read_debugger() {
+        DebuggerValue::Absent => return State::Disabled,
+        DebuggerValue::Text(value) => value,
+        DebuggerValue::Invalid => {
+            return State::Conflict(
+                "the existing debugger registration is unreadable or malformed".into(),
+            );
+        }
     };
-    if !value.contains(OWNER_MARKER) {
+    if !is_owned_command(&value) {
         return State::Conflict(value);
     }
-    match own_command() {
-        Ok(own) if normalize_command(&value) == normalize_command(&own) => State::Enabled,
-        _ => State::Stale(value),
+    let own = own_command_for(exe);
+    if normalize_command(&value) == normalize_command(&own) {
+        State::Enabled
+    } else {
+        State::Stale(value)
     }
 }
 
@@ -40,7 +55,13 @@ pub fn state() -> State {
 /// is necessary. Existing third-party replacements are never overwritten or
 /// deleted.
 pub fn set_direct(enabled: bool) -> Result<()> {
-    let current = state();
+    let exe =
+        std::env::current_exe().map_err(|e| TmError::platform("current_exe", e.to_string()))?;
+    set_direct_for_exe(enabled, &exe)
+}
+
+pub fn set_direct_for_exe(enabled: bool, exe: &Path) -> Result<()> {
+    let current = state_for_exe(exe);
     if enabled {
         if let State::Conflict(value) = current {
             return Err(TmError::platform(
@@ -48,7 +69,7 @@ pub fn set_direct(enabled: bool) -> Result<()> {
                 format!("another debugger is already registered: {value}"),
             ));
         }
-        write_debugger(&own_command()?)
+        write_debugger(&own_command_for(exe))
     } else {
         match current {
             State::Disabled => Ok(()),
@@ -61,30 +82,43 @@ pub fn set_direct(enabled: bool) -> Result<()> {
     }
 }
 
-pub fn own_command() -> Result<String> {
-    let exe =
-        std::env::current_exe().map_err(|e| TmError::platform("current_exe", e.to_string()))?;
-    Ok(format!("\"{}\" {OWNER_MARKER}", exe.to_string_lossy()))
+fn own_command_for(exe: &Path) -> String {
+    format!("\"{}\" {OWNER_MARKER}", exe.to_string_lossy())
+}
+
+fn is_owned_command(value: &str) -> bool {
+    let Some(quoted_path) = value.trim().strip_suffix(OWNER_MARKER).map(str::trim_end) else {
+        return false;
+    };
+    let Some(path) = quoted_path
+        .strip_prefix('"')
+        .and_then(|path| path.strip_suffix('"'))
+    else {
+        return false;
+    };
+    !path.is_empty() && !path.contains('"')
 }
 
 fn normalize_command(s: &str) -> String {
-    s.trim().replace('/', "\\").to_ascii_lowercase()
+    s.trim().replace('/', "\\").to_lowercase()
 }
 
-fn read_debugger() -> Option<String> {
+fn read_debugger() -> DebuggerValue {
     unsafe {
         let mut key = Default::default();
         let path = wstr(IFEO_TASKMGR);
-        if RegOpenKeyExW(
+        let opened = RegOpenKeyExW(
             HKEY_LOCAL_MACHINE,
             PCWSTR::from_raw(path.as_ptr()),
             None,
             KEY_READ,
             &mut key,
-        )
-        .is_err()
-        {
-            return None;
+        );
+        if opened.0 == 2 {
+            return DebuggerValue::Absent;
+        }
+        if opened.is_err() {
+            return DebuggerValue::Invalid;
         }
         let name = wstr(VALUE_DEBUGGER);
         let mut kind = REG_SZ;
@@ -97,9 +131,17 @@ fn read_debugger() -> Option<String> {
             None,
             Some(&mut bytes),
         );
-        if first.is_err() || kind != REG_SZ || bytes < 2 {
+        if first.0 == 2 {
             let _ = RegCloseKey(key);
-            return None;
+            return DebuggerValue::Absent;
+        }
+        if first.is_err()
+            || kind != REG_SZ
+            || !(2..=64 * 1024).contains(&bytes)
+            || !bytes.is_multiple_of(2)
+        {
+            let _ = RegCloseKey(key);
+            return DebuggerValue::Invalid;
         }
         let mut data = vec![0u8; bytes as usize];
         let ok = RegQueryValueExW(
@@ -112,8 +154,13 @@ fn read_debugger() -> Option<String> {
         )
         .is_ok();
         let _ = RegCloseKey(key);
-        if !ok {
-            return None;
+        if !ok
+            || kind != REG_SZ
+            || bytes < 2
+            || !bytes.is_multiple_of(2)
+            || bytes as usize > data.len()
+        {
+            return DebuggerValue::Invalid;
         }
         let wide: Vec<u16> = data[..bytes as usize]
             .as_chunks::<2>()
@@ -122,7 +169,7 @@ fn read_debugger() -> Option<String> {
             .map(|b| u16::from_le_bytes(*b))
             .take_while(|&c| c != 0)
             .collect();
-        Some(String::from_utf16_lossy(&wide))
+        DebuggerValue::Text(String::from_utf16_lossy(&wide))
     }
 }
 
@@ -209,13 +256,24 @@ mod tests {
 
     #[test]
     fn owner_marker_survives_paths_with_spaces() {
-        let own = "\"C:\\Program Files\\Taskman\\taskman.exe\" --taskmgr-replacement-launch";
+        let path = Path::new(r"C:\Program Files\Taskman\taskman.exe");
+        let own = own_command_for(path);
+        assert_eq!(
+            own,
+            "\"C:\\Program Files\\Taskman\\taskman.exe\" --taskmgr-replacement-launch"
+        );
         assert!(own.contains(OWNER_MARKER));
-        assert_eq!(normalize_command(own), normalize_command(own));
+        assert_eq!(normalize_command(&own), normalize_command(&own));
     }
 
     #[test]
     fn unrelated_debugger_is_not_owned() {
-        assert!(!"C:\\Sysinternals\\procexp64.exe".contains(OWNER_MARKER));
+        assert!(!is_owned_command(r"C:\Sysinternals\procexp64.exe"));
+        assert!(!is_owned_command(&format!(
+            r#""C:\Sysinternals\procexp64.exe" {OWNER_MARKER} --extra"#
+        )));
+        assert!(is_owned_command(&own_command_for(Path::new(
+            r"C:\Program Files\TaskMan\taskman.exe"
+        ))));
     }
 }

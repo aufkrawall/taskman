@@ -1,11 +1,13 @@
-//! Details tab: dense flat process table with stable column ids.
+//! Details tab: dense process table with stable column ids and an optional
+//! System Informer-style literal parent/child tree.
 //!
 //! Sorting is keyed by [`ColumnId`], never by positional index. Missing
 //! telemetry renders as "—"/"Unknown", never as a fabricated zero.
 
 use eframe::egui;
 use std::cmp::Ordering as CmpOrdering;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::sync::{Arc, Mutex};
 use tm_core::format;
 use tm_core::i18n::{self, K};
 use tm_core::model::{PriorityClass, ProcStatus, ProcessEntry, UacVirtualization};
@@ -15,6 +17,19 @@ use crate::icons::Icon;
 use crate::search;
 use crate::theme;
 use crate::widgets::tablekit::{self, TmColumn};
+
+type AffinityLoadResult = Arc<Mutex<Option<std::result::Result<(u64, u64), String>>>>;
+
+#[derive(Debug, Clone)]
+pub struct AffinityDialog {
+    pub identity: crate::app::ProcessIdentity,
+    pub mask: Option<u64>,
+    pub system_mask: Option<u64>,
+    pub error: Option<String>,
+    pub load_result: AffinityLoadResult,
+    pub save_for_program: bool,
+    pub rule_key: Option<String>,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum ColumnId {
@@ -374,6 +389,10 @@ pub struct State {
     /// on never destroys the user's relative ordering of active columns.
     pub order: Vec<ColumnId>,
     pub select_columns_open: bool,
+    /// Expanded process identities for the literal Details tree.
+    pub expanded: HashSet<u32>,
+    view_generation: u64,
+    tree_initialized: bool,
 }
 
 impl State {
@@ -557,6 +576,35 @@ impl State {
     pub fn invalidate(&mut self) {
         self.cache = None;
     }
+
+    pub fn toggle_expanded(&mut self, pid: u32) {
+        if !self.expanded.remove(&pid) {
+            self.expanded.insert(pid);
+        }
+        self.view_generation = self.view_generation.wrapping_add(1);
+        self.invalidate();
+    }
+
+    pub fn ensure_tree_initialized(&mut self, snap: &tm_core::model::Snapshot) {
+        if self.tree_initialized {
+            return;
+        }
+        self.expanded
+            .extend(snap.processes.iter().filter_map(|process| process.ppid));
+        self.tree_initialized = true;
+        self.view_generation = self.view_generation.wrapping_add(1);
+        self.invalidate();
+    }
+
+    pub fn apply_saved_sort(&mut self, column: &str, ascending: bool) {
+        if let Some(cid) = cid_from_id(column)
+            && self.visible.contains(&cid)
+        {
+            self.sort_col = cid;
+            self.ascending = ascending;
+            self.invalidate();
+        }
+    }
 }
 
 impl Default for State {
@@ -573,12 +621,15 @@ impl Default for State {
                 .collect(),
             order: COLUMNS.iter().map(|c| c.cid).collect(),
             select_columns_open: false,
+            expanded: HashSet::new(),
+            view_generation: 0,
+            tree_initialized: false,
         }
     }
 }
 
 pub struct Cache {
-    pub key: (u64, u64, String, ColumnId, bool),
+    pub key: (u64, u64, String, ColumnId, bool, bool, u64),
     pub rows: Vec<Row>,
 }
 
@@ -587,6 +638,8 @@ pub struct Row {
     pub start_epoch_s: Option<i64>,
     pub name: String,
     pub icon_path: Option<String>,
+    pub depth: usize,
+    pub children: bool,
     pub pid_s: String,
     pub status: String,
     pub user: String,
@@ -657,6 +710,9 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
         ui.centered_and_justified(|ui| ui.label(i18n::tr(K::GatheringData)));
         return;
     };
+    if app.shared.settings.details_tree_view {
+        app.details_state.ensure_tree_initialized(&snap);
+    }
 
     crate::app_ui::tab_header(
         app,
@@ -675,6 +731,46 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
             }
         },
         |app, ui| {
+            ui.menu_button(i18n::tr(K::ViewMode), |ui| {
+                for (tree, key) in [(false, K::FlatView), (true, K::ProcessTreeView)] {
+                    if ui
+                        .selectable_label(
+                            app.shared.settings.details_tree_view == tree,
+                            i18n::tr(key),
+                        )
+                        .clicked()
+                    {
+                        app.shared.settings.details_tree_view = tree;
+                        if tree && let Some(snapshot) = app.latest_snapshot() {
+                            app.details_state.ensure_tree_initialized(&snapshot);
+                        }
+                        app.details_state.invalidate();
+                        app.save_settings();
+                        ui.close();
+                    }
+                }
+            });
+            if app.shared.settings.details_tree_view {
+                if ui.button(i18n::tr(K::ExpandAll)).clicked() {
+                    if let Some(snapshot) = app.latest_snapshot() {
+                        app.details_state
+                            .expanded
+                            .extend(snapshot.processes.iter().map(|process| process.pid));
+                    }
+                    app.details_state.view_generation =
+                        app.details_state.view_generation.wrapping_add(1);
+                    app.details_state.invalidate();
+                    ui.close();
+                }
+                if ui.button(i18n::tr(K::CollapseAll)).clicked() {
+                    app.details_state.expanded.clear();
+                    app.details_state.view_generation =
+                        app.details_state.view_generation.wrapping_add(1);
+                    app.details_state.invalidate();
+                    ui.close();
+                }
+            }
+            ui.separator();
             if ui.button(i18n::tr(K::RefreshNow)).clicked() {
                 app.refresh_all();
                 ui.close();
@@ -723,13 +819,22 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
         effective_search(app),
         app.details_state.sort_col,
         app.details_state.ascending,
+        app.shared.settings.details_tree_view,
+        app.details_state.view_generation,
     );
     let mut cache = app.details_state.cache.take();
     let stale = cache.as_ref().is_none_or(|c| c.key != key);
     if stale {
         cache = Some(Cache {
             key: key.clone(),
-            rows: build_rows(&snap, &key.2, key.3, key.4),
+            rows: build_rows(
+                &snap,
+                &key.2,
+                key.3,
+                key.4,
+                key.5,
+                &app.details_state.expanded,
+            ),
         });
     }
     let rows = &cache.as_ref().expect("cache").rows;
@@ -752,24 +857,7 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
         }
     }
 
-    if let Some(nav) = search::list_nav(ui.ctx()) {
-        let current = app
-            .selected_process
-            .as_ref()
-            .and_then(|selected| rows.iter().position(|row| row.pid == selected.pid));
-        let page_rows = (ui.ctx().content_rect().height() / tablekit::ROW_H)
-            .floor()
-            .max(1.0) as usize;
-        if let Some(index) = search::moved_index(rows.len(), current, nav, page_rows)
-            && let Some(row) = rows.get(index)
-        {
-            app.selected_process = Some(crate::app::ProcessIdentity {
-                pid: row.pid,
-                start_epoch_s: row.start_epoch_s,
-            });
-            app.scroll_to_pid = Some(row.pid);
-        }
-    }
+    handle_keyboard_navigation(app, ui.ctx(), rows);
 
     prepare_auto_fit_widths(ui, &mut table, &visible_cols, rows);
 
@@ -820,13 +908,29 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
                     let text = row.field(cid);
                     if cid == ColumnId::Name {
                         let cell = table.col_rect(pos, rect);
+                        let indented_cell =
+                            cell.translate(egui::vec2(row.depth as f32 * 22.0, 0.0));
+                        let expanded = app.details_state.expanded.contains(&row.pid);
+                        let seed = egui::Id::new((
+                            "details-chev",
+                            row.pid,
+                            row.start_epoch_s.unwrap_or(0),
+                        ));
+                        if row.children
+                            && table.chevron(ui, indented_cell, expanded, true, &pal, seed)
+                        {
+                            app.details_state.toggle_expanded(row.pid);
+                        }
                         let tex = row
                             .icon_path
                             .as_ref()
                             .and_then(|p| app.shared.icons.get(ui.ctx(), &app.actions, p, 6));
-                        table.icon_cell(ui, cell, tex.as_ref(), pal.accent);
+                        table.icon_cell(ui, indented_cell, tex.as_ref(), pal.accent);
                         ui.painter_at(cell).text(
-                            egui::Pos2::new(cell.left() + 56.0, rect.center().y),
+                            egui::Pos2::new(
+                                cell.left() + 56.0 + row.depth as f32 * 22.0,
+                                rect.center().y,
+                            ),
                             egui::Align2::LEFT_CENTER,
                             &row.name,
                             egui::FontId::proportional(tablekit::FONT_ROW),
@@ -854,7 +958,7 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
                 }
                 resp.context_menu(|ui| {
                     if let Some(p) = snap.process(row.pid) {
-                        context_menu(app, ui, p);
+                        context_menu(app, ui, p, row.children);
                     }
                 });
             }
@@ -881,11 +985,76 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
             app.details_state.sort_col = cid;
             app.details_state.ascending = !cid_is_numeric(cid);
         }
+        app.persist_sort("details", id_of(cid), app.details_state.ascending);
     }
     app.persist_table(&table);
     app.details_state.cache = cache;
 
     select_columns_dialog(app, &ctx_from(ui), &pal);
+}
+
+fn select_detail_row(app: &mut TaskManApp, row: &Row) {
+    app.selected_process = Some(crate::app::ProcessIdentity {
+        pid: row.pid,
+        start_epoch_s: row.start_epoch_s,
+    });
+    app.scroll_to_pid = Some(row.pid);
+}
+
+/// Native list navigation plus tree-aware Left/Right movement. The flattened
+/// rows remain virtualized, so selection also records a one-shot scroll target.
+fn handle_keyboard_navigation(app: &mut TaskManApp, ctx: &egui::Context, rows: &[Row]) {
+    let selected_pos = app
+        .selected_process
+        .as_ref()
+        .and_then(|selected| rows.iter().position(|row| row.pid == selected.pid));
+    let page_rows = (ctx.content_rect().height() / tablekit::ROW_H)
+        .floor()
+        .max(1.0) as usize;
+    if let Some(nav) = search::list_nav(ctx)
+        && let Some(index) = search::moved_index(rows.len(), selected_pos, nav, page_rows)
+        && let Some(row) = rows.get(index)
+    {
+        select_detail_row(app, row);
+    }
+
+    if !app.shared.settings.details_tree_view || ctx.egui_wants_keyboard_input() {
+        return;
+    }
+    let (left, right) = ctx.input(|input| {
+        (
+            input.key_pressed(egui::Key::ArrowLeft),
+            input.key_pressed(egui::Key::ArrowRight),
+        )
+    });
+    let Some(index) = app
+        .selected_process
+        .as_ref()
+        .and_then(|selected| rows.iter().position(|row| row.pid == selected.pid))
+    else {
+        return;
+    };
+    let row = &rows[index];
+    if right && row.children {
+        if !app.details_state.expanded.contains(&row.pid) {
+            app.details_state.toggle_expanded(row.pid);
+        } else if let Some(child) = rows.get(index + 1)
+            && child.depth > row.depth
+        {
+            select_detail_row(app, child);
+        }
+    } else if left {
+        if row.children && app.details_state.expanded.contains(&row.pid) {
+            app.details_state.toggle_expanded(row.pid);
+        } else if row.depth > 0
+            && let Some(parent) = rows[..index]
+                .iter()
+                .rev()
+                .find(|candidate| candidate.depth < row.depth)
+        {
+            select_detail_row(app, parent);
+        }
+    }
 }
 
 fn prepare_auto_fit_widths(
@@ -898,7 +1067,7 @@ fn prepare_auto_fit_widths(
         let mut width = tablekit::text_width(ui, spec.label(), tablekit::FONT_HDR_LABEL) + 28.0;
         for row in rows {
             let extra = if spec.cid == ColumnId::Name {
-                66.0
+                66.0 + row.depth as f32 * 22.0
             } else {
                 22.0
             };
@@ -971,6 +1140,9 @@ fn select_columns_dialog(app: &mut TaskManApp, ctx: &egui::Context, pal: &theme:
                             {
                                 app.details_state.set_visible(cid, on);
                                 persist_column_prefs(app);
+                                let sort_col = app.details_state.sort_col;
+                                let ascending = app.details_state.ascending;
+                                app.persist_sort("details", id_of(sort_col), ascending);
                             }
                             ui.with_layout(
                                 egui::Layout::right_to_left(egui::Align::Center),
@@ -1075,113 +1247,242 @@ fn build_rows(
     raw_search: &str,
     sort_col: ColumnId,
     ascending: bool,
+    tree: bool,
+    expanded: &HashSet<u32>,
 ) -> Vec<Row> {
     let q = search::Query::new(raw_search);
-    let mut list: Vec<&ProcessEntry> = snap
+    if !tree {
+        let mut list: Vec<&ProcessEntry> = snap
+            .processes
+            .iter()
+            .filter(|process| !process.synthetic && q.matches_process(process))
+            .collect();
+        sort_processes(&mut list, sort_col, ascending);
+        return list
+            .into_iter()
+            .map(|process| row_from_process(process, 0, false))
+            .collect();
+    }
+
+    let all: Vec<&ProcessEntry> = snap
         .processes
         .iter()
-        .filter(|p| !p.synthetic && q.matches_process(p))
+        .filter(|process| !process.synthetic)
         .collect();
-
-    list.sort_by(|a, b| {
-        let o = sort_col.compare(a, b);
-        if ascending { o } else { o.reverse() }
-    });
-
-    list.into_iter()
-        .map(|p| {
-            let status = match p.status {
-                ProcStatus::Running => "".to_string(),
-                ProcStatus::Suspended => i18n::tr(K::StSuspended).to_string(),
-                ProcStatus::NotResponding => i18n::tr(K::StNotResponding).to_string(),
-            };
-            let platform = match p.wow64 {
-                Some(true) => i18n::tr(K::Bit32).to_string(),
-                Some(false) => i18n::tr(K::Bit64).to_string(),
-                None => "—".to_string(),
-            };
-            let elevated = match p.elevated {
-                Some(true) => i18n::tr(K::Yes).to_string(),
-                Some(false) => i18n::tr(K::No).to_string(),
-                None if p.user.as_deref() == Some("SYSTEM") || matches!(p.pid, 4 | 0) => {
-                    i18n::tr(K::Yes).to_string()
-                }
-                None => i18n::tr(K::UacUnknown).to_string(),
-            };
-            let uac = match p.uac_virtualization {
-                Some(UacVirtualization::Enabled) => i18n::tr(K::EnabledWord).to_string(),
-                Some(UacVirtualization::Disabled) => i18n::tr(K::DisabledWord).to_string(),
-                Some(UacVirtualization::NotAllowed) => i18n::tr(K::NotAllowed).to_string(),
-                _ => i18n::tr(K::UacUnknown).to_string(),
-            };
-            Row {
-                pid: p.pid,
-                start_epoch_s: p.start_epoch_s,
-                name: p.shown_name().to_string(),
-                icon_path: p
-                    .exe_path
-                    .as_ref()
-                    .map(|x| x.to_string_lossy().into_owned()),
-                pid_s: p.pid.to_string(),
-                status,
-                user: p.user.clone().unwrap_or_else(|| "—".into()),
-                cpu_s: format::format_cpu_detail(p.cpu_pct),
-                mem_s: format::format_k(p.mem_bytes),
-                platform,
-                elevated,
-                uac,
-                gpu_util_s: p
-                    .gpu_util_pct
-                    .map(format::format_pct_cell)
-                    .unwrap_or_else(|| "—".into()),
-                gpu_engine_s: p.gpu_engine_label.clone().unwrap_or_else(|| "—".into()),
-                priority_s: priority_label(p.priority).to_string(),
-                threads_s: p
-                    .threads
-                    .map(|v| v.to_string())
-                    .unwrap_or_else(|| "—".into()),
-                handles_s: p
-                    .handles
-                    .map(|v| v.to_string())
-                    .unwrap_or_else(|| "—".into()),
-                cpu_time_s: p
-                    .cpu_time_s
-                    .map(|v| format!("{v:.2} s"))
-                    .unwrap_or_else(|| "—".into()),
-                commit_s: opt_u64_bytes(p.commit_bytes),
-                peak_mem_s: opt_u64_bytes(p.peak_mem_bytes),
-                gpu_dedicated_s: opt_u64_bytes(p.gpu_dedicated_bytes),
-                gpu_shared_s: opt_u64_bytes(p.gpu_shared_bytes),
-                description_s: p
-                    .description
-                    .as_ref()
-                    .filter(|value| !value.trim().is_empty())
-                    .cloned()
-                    .unwrap_or_else(|| p.display.clone()),
-                publisher_s: p.company.clone().unwrap_or_else(|| "—".into()),
-                ppid_s: p
-                    .ppid
-                    .map(|value| value.to_string())
-                    .unwrap_or_else(|| "—".into()),
-                session_id_s: p
-                    .session_id
-                    .map(|value| value.to_string())
-                    .unwrap_or_else(|| "—".into()),
-                image_path_s: p
-                    .exe_path
-                    .as_ref()
-                    .map(|path| path.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| "—".into()),
-                page_faults_s: p
-                    .page_faults_per_s
-                    .map(|value| format::format_thousands(value.into()))
-                    .unwrap_or_else(|| "—".into()),
-                io_read_s: format::format_bytes_loc(p.disk_read_total),
-                io_write_s: format::format_bytes_loc(p.disk_write_total),
-                command_line_s: p.command_line.clone().unwrap_or_else(|| "—".into()),
+    let by_pid: HashMap<u32, &ProcessEntry> =
+        all.iter().map(|process| (process.pid, *process)).collect();
+    let mut visible: HashSet<u32> = all
+        .iter()
+        .copied()
+        .filter(|process| q.matches_process(process))
+        .map(|process| process.pid)
+        .collect();
+    if !q.is_empty() {
+        for matched in visible.clone() {
+            let mut cursor = matched;
+            let mut seen = HashSet::new();
+            while seen.insert(cursor) {
+                let Some(parent) = by_pid
+                    .get(&cursor)
+                    .and_then(|process| process.ppid)
+                    .and_then(|pid| by_pid.get(&pid).copied())
+                else {
+                    break;
+                };
+                visible.insert(parent.pid);
+                cursor = parent.pid;
             }
+        }
+    }
+
+    let members: Vec<&ProcessEntry> = all
+        .into_iter()
+        .filter(|process| visible.contains(&process.pid))
+        .collect();
+    let mut children: HashMap<u32, Vec<&ProcessEntry>> = HashMap::new();
+    for process in &members {
+        if let Some(parent) = process.ppid
+            && parent != process.pid
+            && visible.contains(&parent)
+        {
+            children.entry(parent).or_default().push(*process);
+        }
+    }
+    for siblings in children.values_mut() {
+        sort_processes(siblings, sort_col, ascending);
+    }
+
+    let mut roots: Vec<&ProcessEntry> = members
+        .iter()
+        .copied()
+        .filter(|process| {
+            process
+                .ppid
+                .is_none_or(|parent| parent == process.pid || !visible.contains(&parent))
         })
-        .collect()
+        .collect();
+    // Malformed/cyclic parent graphs can have no natural root. Pick one
+    // representative per still-uncovered component so every process remains
+    // reachable while the render walk's visited set prevents loops.
+    let mut covered = HashSet::new();
+    for root in roots.clone() {
+        mark_tree_component(root.pid, &children, &mut covered);
+    }
+    for process in &members {
+        if !covered.contains(&process.pid) {
+            roots.push(*process);
+            mark_tree_component(process.pid, &children, &mut covered);
+        }
+    }
+    sort_processes(&mut roots, sort_col, ascending);
+
+    let mut rows = Vec::with_capacity(members.len());
+    let mut visited = HashSet::with_capacity(members.len());
+    let mut stack: Vec<(&ProcessEntry, usize)> =
+        roots.into_iter().rev().map(|root| (root, 0)).collect();
+    while let Some((process, depth)) = stack.pop() {
+        if !visited.insert(process.pid) {
+            continue;
+        }
+        let kids = children
+            .get(&process.pid)
+            .into_iter()
+            .flatten()
+            .copied()
+            .filter(|child| !visited.contains(&child.pid))
+            .collect::<Vec<_>>();
+        let has_children = !kids.is_empty();
+        rows.push(row_from_process(process, depth, has_children));
+        if has_children && (expanded.contains(&process.pid) || !q.is_empty()) {
+            stack.extend(kids.into_iter().rev().map(|child| (child, depth + 1)));
+        }
+    }
+    rows
+}
+
+fn sort_processes(list: &mut Vec<&ProcessEntry>, sort_col: ColumnId, ascending: bool) {
+    list.sort_by(|a, b| {
+        let order = sort_col.compare(a, b).then_with(|| a.pid.cmp(&b.pid));
+        if ascending { order } else { order.reverse() }
+    });
+}
+
+fn mark_tree_component(
+    root: u32,
+    children: &HashMap<u32, Vec<&ProcessEntry>>,
+    covered: &mut HashSet<u32>,
+) {
+    let mut stack = vec![root];
+    while let Some(pid) = stack.pop() {
+        if !covered.insert(pid) {
+            continue;
+        }
+        stack.extend(
+            children
+                .get(&pid)
+                .into_iter()
+                .flatten()
+                .map(|child| child.pid),
+        );
+    }
+}
+
+fn process_status_text(process: &ProcessEntry) -> String {
+    let base = match process.status {
+        ProcStatus::Running => "",
+        ProcStatus::Suspended => i18n::tr(K::StSuspended),
+        ProcStatus::NotResponding => i18n::tr(K::StNotResponding),
+    };
+    if process.power_throttled == Some(true) {
+        if base.is_empty() {
+            i18n::tr(K::StEfficiencyMode).to_string()
+        } else {
+            format!("{base}, {}", i18n::tr(K::StEfficiencyMode))
+        }
+    } else {
+        base.to_string()
+    }
+}
+
+fn row_from_process(p: &ProcessEntry, depth: usize, children: bool) -> Row {
+    let platform = match p.wow64 {
+        Some(true) => i18n::tr(K::Bit32).to_string(),
+        Some(false) => i18n::tr(K::Bit64).to_string(),
+        None => "—".to_string(),
+    };
+    let elevated = match p.elevated {
+        Some(true) => i18n::tr(K::Yes).to_string(),
+        Some(false) => i18n::tr(K::No).to_string(),
+        None => i18n::tr(K::UacUnknown).to_string(),
+    };
+    let uac = match p.uac_virtualization {
+        Some(UacVirtualization::Enabled) => i18n::tr(K::EnabledWord).to_string(),
+        Some(UacVirtualization::Disabled) => i18n::tr(K::DisabledWord).to_string(),
+        Some(UacVirtualization::NotAllowed) => i18n::tr(K::NotAllowed).to_string(),
+        _ => i18n::tr(K::UacUnknown).to_string(),
+    };
+    Row {
+        pid: p.pid,
+        start_epoch_s: p.start_epoch_s,
+        name: p.shown_name().to_string(),
+        icon_path: p
+            .exe_path
+            .as_ref()
+            .map(|path| path.to_string_lossy().into_owned()),
+        depth,
+        children,
+        pid_s: p.pid.to_string(),
+        status: process_status_text(p),
+        user: p.user.clone().unwrap_or_else(|| "—".into()),
+        cpu_s: format::format_cpu_detail(p.cpu_pct),
+        mem_s: format::format_k(p.mem_bytes),
+        platform,
+        elevated,
+        uac,
+        gpu_util_s: p
+            .gpu_util_pct
+            .map(format::format_pct_cell)
+            .unwrap_or_else(|| "—".into()),
+        gpu_engine_s: p.gpu_engine_label.clone().unwrap_or_else(|| "—".into()),
+        priority_s: priority_label(p.priority).to_string(),
+        threads_s: p
+            .threads
+            .map_or_else(|| "—".into(), |value| value.to_string()),
+        handles_s: p
+            .handles
+            .map_or_else(|| "—".into(), |value| value.to_string()),
+        cpu_time_s: p
+            .cpu_time_s
+            .map(|value| format!("{value:.2} s"))
+            .unwrap_or_else(|| "—".into()),
+        commit_s: opt_u64_bytes(p.commit_bytes),
+        peak_mem_s: opt_u64_bytes(p.peak_mem_bytes),
+        gpu_dedicated_s: opt_u64_bytes(p.gpu_dedicated_bytes),
+        gpu_shared_s: opt_u64_bytes(p.gpu_shared_bytes),
+        description_s: p
+            .description
+            .as_ref()
+            .filter(|value| !value.trim().is_empty())
+            .cloned()
+            .unwrap_or_else(|| p.display.clone()),
+        publisher_s: p.company.clone().unwrap_or_else(|| "—".into()),
+        ppid_s: p.ppid.map_or_else(|| "—".into(), |value| value.to_string()),
+        session_id_s: p
+            .session_id
+            .map_or_else(|| "—".into(), |value| value.to_string()),
+        image_path_s: p
+            .exe_path
+            .as_ref()
+            .map(|path| path.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "—".into()),
+        page_faults_s: p
+            .page_faults_per_s
+            .map(|value| format::format_thousands(value.into()))
+            .unwrap_or_else(|| "—".into()),
+        io_read_s: format::format_bytes_loc(p.disk_read_total),
+        io_write_s: format::format_bytes_loc(p.disk_write_total),
+        command_line_s: p.command_line.clone().unwrap_or_else(|| "—".into()),
+    }
 }
 
 /// Identity gate shared by every destructive context-menu action (audit:
@@ -1195,12 +1496,69 @@ fn identity_still_live(app: &TaskManApp, p: &ProcessEntry) -> bool {
     })
 }
 
+fn scheduling_rule_key(process: &ProcessEntry) -> Option<String> {
+    process
+        .exe_path
+        .as_deref()
+        .map(tm_core::settings::process_rule_key)
+}
+
+fn update_saved_priority(app: &mut TaskManApp, key: &str, priority: Option<PriorityClass>) {
+    let empty = {
+        let rule = app
+            .shared
+            .settings
+            .process_rules
+            .entry(key.to_string())
+            .or_default();
+        rule.priority = priority;
+        rule.is_empty()
+    };
+    if empty {
+        app.shared.settings.process_rules.remove(key);
+    }
+    app.save_settings();
+}
+
+fn update_saved_affinity(app: &mut TaskManApp, key: &str, affinity_mask: Option<u64>) {
+    let empty = {
+        let rule = app
+            .shared
+            .settings
+            .process_rules
+            .entry(key.to_string())
+            .or_default();
+        rule.affinity_mask = affinity_mask;
+        rule.is_empty()
+    };
+    if empty {
+        app.shared.settings.process_rules.remove(key);
+    }
+    app.save_settings();
+}
+
 /// Context menu mirroring the Win11 TM Details tab.
-pub fn context_menu(app: &mut TaskManApp, ui: &mut egui::Ui, p: &ProcessEntry) {
+pub fn context_menu(app: &mut TaskManApp, ui: &mut egui::Ui, p: &ProcessEntry, has_children: bool) {
     let ctx = ui.ctx().clone();
     ui.set_min_width(230.0);
     ui.label(egui::RichText::new(p.shown_name()).strong().size(13.0));
     ui.separator();
+
+    if app.shared.settings.details_tree_view && has_children {
+        let expanded = app.details_state.expanded.contains(&p.pid);
+        if ui
+            .button(if expanded {
+                i18n::tr(K::Collapse)
+            } else {
+                i18n::tr(K::Expand)
+            })
+            .clicked()
+        {
+            app.details_state.toggle_expanded(p.pid);
+            ui.close();
+        }
+        ui.separator();
+    }
 
     if ui.button(i18n::tr(K::CopyName)).clicked() {
         ui.ctx().copy_text(p.shown_name().to_string());
@@ -1234,6 +1592,14 @@ pub fn context_menu(app: &mut TaskManApp, ui: &mut egui::Ui, p: &ProcessEntry) {
     }
 
     ui.menu_button(i18n::tr(K::Priority), |ui| {
+        let rule_key = scheduling_rule_key(p);
+        let mut save_priority = rule_key.as_ref().is_some_and(|key| {
+            app.shared
+                .settings
+                .process_rules
+                .get(key)
+                .is_some_and(|rule| rule.priority.is_some())
+        });
         for (cls, key) in [
             (PriorityClass::Realtime, K::PrioRealtime),
             (PriorityClass::High, K::PrioHigh),
@@ -1242,7 +1608,9 @@ pub fn context_menu(app: &mut TaskManApp, ui: &mut egui::Ui, p: &ProcessEntry) {
             (PriorityClass::BelowNormal, K::PrioBelowNormal),
             (PriorityClass::Low, K::PrioLow),
         ] {
-            if ui.button(i18n::tr(key)).clicked() {
+            let current = p.priority == cls;
+            let label = format!("{}  {}", if current { "✓" } else { "  " }, i18n::tr(key));
+            if ui.selectable_label(current, label).clicked() {
                 if !identity_still_live(app, p) {
                     app.shared.toast(i18n::tr(K::ProcessExited));
                     ui.close();
@@ -1250,11 +1618,32 @@ pub fn context_menu(app: &mut TaskManApp, ui: &mut egui::Ui, p: &ProcessEntry) {
                 }
                 let actions = app.actions.clone();
                 let pid = p.pid;
+                let start = p.start_epoch_s;
                 let key_copy = key;
                 let msg = move || i18n::trf(K::PrioritySetMsg, &[i18n::tr(key_copy)]);
-                app.run_action(&ctx, msg, move || actions.set_priority(pid, cls));
+                app.run_action(&ctx, msg, move || {
+                    actions.set_priority_checked(pid, start, cls)
+                });
+                if save_priority && let Some(rule_key) = rule_key.as_deref() {
+                    update_saved_priority(app, rule_key, Some(cls));
+                }
                 ui.close();
             }
+        }
+        ui.separator();
+        let menu_pal = theme::palette(ui);
+        let save = crate::widgets::controls::checkbox_enabled(
+            ui,
+            &mut save_priority,
+            i18n::tr(K::SavePriorityForProgram),
+            rule_key.is_some() && p.priority != PriorityClass::Unknown,
+            &menu_pal,
+        )
+        .on_disabled_hover_text(i18n::tr(K::SaveRuleNeedsPath));
+        if save.changed()
+            && let Some(rule_key) = rule_key.as_deref()
+        {
+            update_saved_priority(app, rule_key, save_priority.then_some(p.priority));
         }
     });
 
@@ -1262,8 +1651,60 @@ pub fn context_menu(app: &mut TaskManApp, ui: &mut egui::Ui, p: &ProcessEntry) {
         if !identity_still_live(app, p) {
             app.shared.toast(i18n::tr(K::ProcessExited));
         } else {
-            let mask = app.actions.get_affinity_mask(p.pid).unwrap_or(u64::MAX);
-            app.affinity_dialog = Some((p.pid, mask));
+            let identity = crate::app::ProcessIdentity {
+                pid: p.pid,
+                start_epoch_s: p.start_epoch_s,
+            };
+            let rule_key = scheduling_rule_key(p);
+            let save_for_program = rule_key.as_ref().is_some_and(|key| {
+                app.shared
+                    .settings
+                    .process_rules
+                    .get(key)
+                    .is_some_and(|rule| rule.affinity_mask.is_some())
+            });
+            let load_result = Arc::new(Mutex::new(None));
+            app.affinity_dialog = Some(AffinityDialog {
+                identity: identity.clone(),
+                mask: None,
+                system_mask: None,
+                error: None,
+                load_result: load_result.clone(),
+                save_for_program,
+                rule_key,
+            });
+            let actions = app.actions.clone();
+            let worker_result = load_result.clone();
+            let job = move || {
+                let result = actions
+                    .get_affinity_mask_checked(identity.pid, identity.start_epoch_s)
+                    .and_then(|mask| {
+                        actions
+                            .system_affinity_mask()
+                            .map(|system_mask| (mask, system_mask))
+                    })
+                    .map_err(|error| error.to_string());
+                *tm_core::sync::lock(&worker_result) = Some(result);
+            };
+            let wake = {
+                let ctx = ctx.clone();
+                move || ctx.request_repaint()
+            };
+            match &app.shared.executor {
+                Some(executor) => {
+                    if !executor.run_quiet(wake, job) {
+                        *tm_core::sync::lock(&load_result) =
+                            Some(Err(i18n::tr(K::ActionQueueFull).to_string()));
+                        ctx.request_repaint();
+                    }
+                }
+                None => {
+                    drop(job);
+                    *tm_core::sync::lock(&load_result) =
+                        Some(Err(i18n::tr(K::ActionFailed).to_string()));
+                    ctx.request_repaint();
+                }
+            }
         }
         ui.close();
     }
@@ -1284,9 +1725,10 @@ pub fn context_menu(app: &mut TaskManApp, ui: &mut egui::Ui, p: &ProcessEntry) {
         }
         let actions = app.actions.clone();
         let pid = p.pid;
+        let start = p.start_epoch_s;
         let target_suspended = !suspended;
         app.run_action(&ctx, String::new, move || {
-            actions.suspend_process(pid, target_suspended)
+            actions.suspend_process_checked(pid, start, target_suspended)
         });
         ui.close();
     }
@@ -1312,6 +1754,38 @@ pub fn context_menu(app: &mut TaskManApp, ui: &mut egui::Ui, p: &ProcessEntry) {
                     start_epoch_s: p.start_epoch_s,
                 },
             );
+            ui.close();
+        }
+        let uac_enabled = p.uac_virtualization == Some(UacVirtualization::Enabled);
+        let uac_changeable = matches!(
+            p.uac_virtualization,
+            Some(UacVirtualization::Enabled | UacVirtualization::Disabled)
+        );
+        let uac_label = format!(
+            "{}  {}",
+            if uac_enabled { "✓" } else { "  " },
+            i18n::tr(K::UacVirtualization)
+        );
+        if ui
+            .add_enabled(
+                uac_changeable,
+                egui::Button::new(uac_label).selected(uac_enabled),
+            )
+            .on_disabled_hover_text(i18n::tr(K::NotAllowed))
+            .clicked()
+        {
+            if !identity_still_live(app, p) {
+                app.shared.toast(i18n::tr(K::ProcessExited));
+            } else {
+                app.pending_uac_virtualization = Some(crate::app::PendingUacVirtualization {
+                    identity: crate::app::ProcessIdentity {
+                        pid: p.pid,
+                        start_epoch_s: p.start_epoch_s,
+                    },
+                    name: p.shown_name().to_string(),
+                    enabled: !uac_enabled,
+                });
+            }
             ui.close();
         }
         if ui.button(i18n::tr(K::GoToServices)).clicked() {
@@ -1343,6 +1817,66 @@ pub fn context_menu(app: &mut TaskManApp, ui: &mut egui::Ui, p: &ProcessEntry) {
                 app.proc_props = Some(p.pid);
             }
             ui.close();
+        }
+    }
+}
+
+pub fn uac_virtualization_dialog(app: &mut TaskManApp, ctx: &egui::Context) {
+    let Some(pending) = app.pending_uac_virtualization.clone() else {
+        return;
+    };
+    let mut open = true;
+    let mut decision = ctx.input(|input| {
+        if input.key_pressed(egui::Key::Escape) {
+            Some(false)
+        } else if input.key_pressed(egui::Key::Enter) {
+            Some(true)
+        } else {
+            None
+        }
+    });
+    egui::Window::new(i18n::tr(K::UacVirtualization))
+        .open(&mut open)
+        .collapsible(false)
+        .resizable(false)
+        .anchor(egui::Align2::CENTER_CENTER, [0.0, -40.0])
+        .show(ctx, |ui| {
+            ui.set_width(430.0);
+            ui.label(i18n::trf(K::UacVirtualizationConfirm, &[&pending.name]));
+            ui.add_space(10.0);
+            ui.horizontal(|ui| {
+                if ui.button(i18n::tr(K::Cancel)).clicked() {
+                    decision = Some(false);
+                }
+                if ui.button(i18n::tr(K::Apply)).clicked() {
+                    decision = Some(true);
+                }
+            });
+        });
+    if !open {
+        decision = Some(false);
+    }
+    if let Some(confirm) = decision {
+        app.pending_uac_virtualization = None;
+        if confirm {
+            if !app.identity_is_live(&pending.identity) {
+                app.shared.toast(i18n::tr(K::ProcessExited));
+                return;
+            }
+            let actions = app.actions.clone();
+            let identity = pending.identity;
+            let enabled = pending.enabled;
+            app.run_action(
+                ctx,
+                || i18n::tr(K::UacVirtualizationChanged).to_string(),
+                move || {
+                    actions.set_uac_virtualization_checked(
+                        identity.pid,
+                        identity.start_epoch_s,
+                        enabled,
+                    )
+                },
+            );
         }
     }
 }
@@ -1450,12 +1984,13 @@ pub fn process_properties_dialog(app: &mut TaskManApp, ctx: &egui::Context) {
                     ui.label(status);
                     ui.end_row();
                     ui.weak(i18n::tr(K::ColUsername));
-                    ui.label(p.user.clone().unwrap_or_default());
+                    ui.label(p.user.clone().unwrap_or_else(|| "—".into()));
                     ui.end_row();
                     ui.weak(i18n::tr(K::ColPlatform));
                     ui.label(match p.wow64 {
                         Some(true) => i18n::tr(K::Bit32),
-                        _ => i18n::tr(K::Bit64),
+                        Some(false) => i18n::tr(K::Bit64),
+                        None => "—",
                     });
                     ui.end_row();
                     ui.weak(i18n::tr(K::PropPath));
@@ -1488,81 +2023,232 @@ pub fn process_properties_dialog(app: &mut TaskManApp, ctx: &egui::Context) {
     }
 }
 
-pub fn affinity_dialog(
-    app: &mut TaskManApp,
-    ctx: &egui::Context,
-    pid: u32,
-    mask: u64,
-    _pal: &theme::Palette,
-) {
+pub fn affinity_dialog(app: &mut TaskManApp, ctx: &egui::Context, pal: &theme::Palette) {
+    let Some(mut dialog) = app.affinity_dialog.take() else {
+        return;
+    };
+    if dialog.mask.is_none()
+        && dialog.error.is_none()
+        && let Some(result) = tm_core::sync::lock(&dialog.load_result).take()
+    {
+        match result {
+            Ok((mask, system_mask)) => {
+                dialog.mask = Some(mask);
+                dialog.system_mask = Some(system_mask);
+            }
+            Err(error) => dialog.error = Some(error),
+        }
+    }
+    let pid = dialog.identity.pid;
     let mut open = true;
+    let mut apply = false;
+    let mut cancel = false;
     egui::Window::new(format!("{} {pid}", i18n::tr(K::AffinityTitle)))
         .open(&mut open)
         .collapsible(false)
         .resizable(false)
         .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
         .show(ctx, |ui| {
-            let sys_mask = app.actions.system_affinity_mask().unwrap_or(u64::MAX);
-            let mut new_mask = mask;
-            let pal = theme::palette_ctx(ctx);
-            egui::Grid::new("affinity")
-                .num_columns(8)
-                .spacing([6.0, 6.0])
-                .show(ui, |ui| {
-                    for cpu in 0..64usize {
-                        let allowed = sys_mask & (1u64 << cpu) != 0;
-                        let mut on = mask & (1u64 << cpu) != 0;
-                        if crate::widgets::controls::checkbox_enabled(
-                            ui,
-                            &mut on,
-                            &cpu.to_string(),
-                            allowed,
-                            &pal,
-                        )
-                        .changed()
-                        {
-                            if on {
-                                new_mask |= 1u64 << cpu;
-                            } else {
-                                new_mask &= !(1u64 << cpu);
+            let controls_pal = theme::palette_ctx(ctx);
+            match (
+                dialog.mask.as_mut(),
+                dialog.system_mask,
+                dialog.error.as_deref(),
+            ) {
+                (_, _, Some(error)) => {
+                    ui.colored_label(pal.heat_high, error);
+                }
+                (Some(mask), Some(system_mask), None) => {
+                    egui::Grid::new("affinity")
+                        .num_columns(8)
+                        .spacing([6.0, 6.0])
+                        .show(ui, |ui| {
+                            for cpu in 0..64usize {
+                                let allowed = system_mask & (1u64 << cpu) != 0;
+                                let mut on = *mask & (1u64 << cpu) != 0;
+                                if crate::widgets::controls::checkbox_enabled(
+                                    ui,
+                                    &mut on,
+                                    &cpu.to_string(),
+                                    allowed,
+                                    &controls_pal,
+                                )
+                                .changed()
+                                {
+                                    if on {
+                                        *mask |= 1u64 << cpu;
+                                    } else {
+                                        *mask &= !(1u64 << cpu);
+                                    }
+                                }
+                                if (cpu + 1) % 8 == 0 {
+                                    ui.end_row();
+                                }
                             }
-                        }
-                        if (cpu + 1) % 8 == 0 {
-                            ui.end_row();
-                        }
+                        });
+                    if *mask == 0 {
+                        ui.label(
+                            egui::RichText::new(i18n::tr(K::AffinityWarn))
+                                .color(theme::DARK.heat_high),
+                        );
                     }
-                });
-            if new_mask == 0 {
-                ui.label(
-                    egui::RichText::new(i18n::tr(K::AffinityWarn)).color(theme::DARK.heat_high),
-                );
+                }
+                _ => {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label(i18n::tr(K::GatheringData));
+                    });
+                }
+            }
+            if dialog.error.is_none() {
+                let save = crate::widgets::controls::checkbox_enabled(
+                    ui,
+                    &mut dialog.save_for_program,
+                    i18n::tr(K::SaveAffinityForProgram),
+                    dialog.rule_key.is_some() && dialog.mask.is_some(),
+                    &controls_pal,
+                )
+                .on_disabled_hover_text(i18n::tr(K::SaveRuleNeedsPath));
+                let _ = save;
             }
             ui.add_space(8.0);
             ui.horizontal(|ui| {
                 if ui.button(i18n::tr(K::Cancel)).clicked() {
-                    app.affinity_dialog = None;
+                    cancel = true;
                 }
                 if ui
-                    .add_enabled(new_mask != 0, egui::Button::new(i18n::tr(K::Apply)))
+                    .add_enabled(
+                        dialog.mask.is_some_and(|mask| mask != 0) && dialog.error.is_none(),
+                        egui::Button::new(i18n::tr(K::Apply)),
+                    )
                     .clicked()
                 {
-                    let actions = app.actions.clone();
-                    let toast_msg = || i18n::tr(K::AffinitySet).to_string();
-                    app.run_action(&ctx.clone(), toast_msg, move || {
-                        actions.set_affinity_mask(pid, new_mask)
-                    });
-                    app.affinity_dialog = None;
+                    apply = true;
                 }
             });
         });
-    if !open {
-        app.affinity_dialog = None;
+    if apply {
+        let actions = app.actions.clone();
+        let identity = dialog.identity.clone();
+        let mask = dialog.mask.expect("apply requires a loaded affinity mask");
+        let toast_msg = || i18n::tr(K::AffinitySet).to_string();
+        app.run_action(ctx, toast_msg, move || {
+            actions.set_affinity_mask_checked(identity.pid, identity.start_epoch_s, mask)
+        });
+        if let Some(rule_key) = dialog.rule_key.as_deref() {
+            update_saved_affinity(app, rule_key, dialog.save_for_program.then_some(mask));
+        }
+    } else if open && !cancel {
+        app.affinity_dialog = Some(dialog);
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn tree_process(pid: u32, ppid: Option<u32>, name: &str) -> ProcessEntry {
+        let mut process = ProcessEntry::new(pid, name);
+        process.ppid = ppid;
+        process.start_epoch_s = Some(pid as i64);
+        process
+    }
+
+    fn tree_snapshot(processes: Vec<ProcessEntry>) -> tm_core::model::Snapshot {
+        tm_core::model::Snapshot {
+            timestamp_ms: 1,
+            processes,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn details_tree_preserves_hierarchy_and_expansion() {
+        let snapshot = tree_snapshot(vec![
+            tree_process(10, None, "root.exe"),
+            tree_process(11, Some(10), "child.exe"),
+            tree_process(12, Some(11), "leaf.exe"),
+        ]);
+        let collapsed = build_rows(
+            &snapshot,
+            "",
+            ColumnId::Name,
+            true,
+            true,
+            &HashSet::from([10]),
+        );
+        assert_eq!(
+            collapsed
+                .iter()
+                .map(|row| (row.pid, row.depth))
+                .collect::<Vec<_>>(),
+            [(10, 0), (11, 1)]
+        );
+
+        let expanded = build_rows(
+            &snapshot,
+            "",
+            ColumnId::Name,
+            true,
+            true,
+            &HashSet::from([10, 11]),
+        );
+        assert_eq!(
+            expanded
+                .iter()
+                .map(|row| (row.pid, row.depth))
+                .collect::<Vec<_>>(),
+            [(10, 0), (11, 1), (12, 2)]
+        );
+    }
+
+    #[test]
+    fn details_tree_filter_keeps_ancestors_and_breaks_cycles() {
+        let snapshot = tree_snapshot(vec![
+            tree_process(10, None, "root.exe"),
+            tree_process(11, Some(10), "child.exe"),
+            tree_process(12, Some(11), "needle.exe"),
+            tree_process(20, None, "unrelated.exe"),
+        ]);
+        let filtered = build_rows(
+            &snapshot,
+            "needle",
+            ColumnId::Name,
+            true,
+            true,
+            &HashSet::new(),
+        );
+        assert_eq!(
+            filtered.iter().map(|row| row.pid).collect::<Vec<_>>(),
+            [10, 11, 12]
+        );
+
+        let cyclic = tree_snapshot(vec![
+            tree_process(30, Some(31), "a.exe"),
+            tree_process(31, Some(30), "b.exe"),
+        ]);
+        let rows = build_rows(
+            &cyclic,
+            "",
+            ColumnId::Name,
+            true,
+            true,
+            &HashSet::from([30, 31]),
+        );
+        let unique = rows.iter().map(|row| row.pid).collect::<HashSet<_>>();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(unique, HashSet::from([30, 31]));
+    }
+
+    #[test]
+    fn saved_sort_cannot_restore_a_hidden_column() {
+        let mut state = State::default();
+        state.set_visible(ColumnId::Cpu, false);
+        let fallback = state.sort_col;
+        state.apply_saved_sort("cpu", false);
+        assert_eq!(state.sort_col, fallback);
+        assert!(state.visible.contains(&state.sort_col));
+    }
 
     #[test]
     fn details_every_column_sorts_its_own_field() {

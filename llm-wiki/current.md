@@ -4,18 +4,70 @@ Last cross-checked: 2026-08-31
 
 ## Summary
 
-Windows Task Manager-style desktop app (Rust, eframe/egui), three-crate
-workspace. The large audit/implementation plan in `implement.md` has been
+Windows Task Manager-style desktop app (Rust, eframe/egui), four-crate
+workspace with a separate optional Windows core-service executable. The large audit/implementation plan in `implement.md` has been
 implemented to the extent verifiable without interactive Windows sessions.
 The 2026 parity audit (`audit.md`) is now substantially implemented across
 correctness, table interaction, Performance visuals, and advanced process
 diagnostics; remaining telemetry and accessibility work is itemized precisely
-in `known-debt.md`.
+in `known-debt.md`. Normal GUI startup remains unelevated; privileged controls
+can cross a protected, allowlisted service boundary after one explicit install.
 
-## Recently landed (2026-08-31)
+## Recently landed (2026-08-31 — protected service and reliability)
 
-- Processes now offers two persisted presentations: native-style grouped
-  ownership and a System Informer-style literal PPID tree. The raw tree keeps
+- Added `taskman-service.exe`, a delayed-auto LocalSystem SCM service that owns
+  only allowlisted privileged controls. Sampling, rendering, settings, module
+  inventory, dumps, shell commands, and user-selected paths stay in the GUI.
+- Protocol v1 is a local-only, first-instance named pipe with a protected
+  one-user DACL, kernel-derived client/server PID and protected executable-path
+  checks, 64 KiB framed requests/responses, unknown-field rejection, two
+  workers, and a bounded queue. Explicit authorization/safety rejection never
+  falls back to a weaker local path.
+- Process actions require exact PID + positive creation time at the broker and
+  revalidate it on the action handle. Critical/system/service/requesting-GUI
+  targets are refused; tree kill no longer acts on descendants without captured
+  creation identity. Module unload also re-enumerates exact base/path and keeps
+  main/system/loader/cross-bitness protections.
+- Installer copies both binaries into ACL-protected Program Files through a
+  pinned, single-link, hash-verified, synchronized staging path and protects the manifest/
+  logs in admin/System-only ProgramData. It rejects reparse points and
+  hard-linked or foreign-named log files, pins directories/files against conflicting mutation
+  handles while assigning protected owner/group/DACL, and never opens a
+  per-user file log or writes per-user redirect state from the elevated helper.
+  Upgrade waits
+  for the old service process; SCM uses a service SID, only
+  `SeDebugPrivilege`, delayed auto-start, and 5/15/60-second recovery. See
+  `core-service.md`.
+- Successful install records a per-user redirect to the protected GUI after
+  the SCM start request is accepted; SCM readiness remains independently
+  observable. Matching portable launches transfer there before any window
+  exists, while a different package hash stays open to repair/upgrade the
+  protected generation. Existing autostart and owned Task Manager replacement
+  are migrated. Uninstall removes the privileged SCM capability and marker
+  while leaving protected files for safe rollback/reinstall.
+- Reliability work adds two independent bounded GUI action lanes, explicit
+  overload reporting, above-normal (never high/realtime) GUI/service control
+  priority, single-instance restore signaling plus a bounded explicit-elevation
+  ownership handoff, eventful race-free SCM accept-loop wakeup, lazy tray
+  creation, close-to-tray, owned-command-only per-user autostart migration, and
+  a 4 MiB fail-closed settings-input cap at startup. Service worker panics
+  abort into SCM recovery instead of leaving a falsely healthy half-broker.
+- Details now persists literal process-tree mode, table sort, and per-image
+  priority/affinity rules. Its menus show current priority/UAC markers, can
+  safely toggle UAC virtualization, and use background affinity queries.
+  Processes reports suspended, not-responding, and efficiency-mode states.
+- Table sort order persists across sessions on Processes, Details, Modules,
+  Startup, Services, Users, and App History. Delete on process tables opens an
+  identity-bound termination dialog; quiet body column guides improve scanning.
+- Final window-free verification passed formatting, warnings-as-errors Clippy,
+  and all 166 workspace tests, followed by the host release/package build and
+  service protocol self-check. The package contains `taskman.exe` (13,873,664
+  bytes) and `taskman-service.exe` (1,378,816 bytes).
+
+## Recently landed (2026-08-31 — GUI parity and diagnostics)
+
+- Details now offers flat and a persisted System Informer-style literal PPID
+  tree while Processes retains native-style grouped ownership. The raw tree keeps
   ancestors during search, sorts siblings without destroying hierarchy,
   supports expand/collapse commands and tree-aware keyboard navigation, and
   never exposes actions on synthetic CPU-attribution rows.
@@ -23,7 +75,7 @@ in `known-debt.md`.
   process termination through an explicit dialog. Context menus now include
   consistent copy/search/location/properties/dump/module actions as applicable.
 - The on-demand Modules inspector enumerates DLL name/path/base/size outside the
-  hot sampling path. Unload is an explicitly dangerous, double-confirmed action
+  hot sampling path. Unload is an explicitly dangerous, confirmation-gated action
   restricted to same-architecture third-party DLLs; process creation time and
   exact module base/path are revalidated immediately before the remote
   `FreeLibrary` request. The image and Windows modules are fail-closed.
@@ -44,7 +96,7 @@ in `known-debt.md`.
 - Registry startup entries now resolve publisher metadata on their background
   fetch. App History labels unsupported per-process network as unavailable
   (`—`) and states clearly that its database is local rather than Windows SRUM.
-- Verification was headless by request: the full format/clippy/test gate and
+- That GUI-parity pass was verified headlessly: the full format/clippy/test gate and
   all 148 tests passed, followed by the host release build; no TaskMan GUI,
   capture helper, or module-unload action was launched. `taskman.exe` is
   13,470,208 bytes, down 1,185,792 bytes (8.09%) from the pre-pass binary.
@@ -192,4 +244,5 @@ in `known-debt.md`.
 
 - Analyze wait chain, processor-group-aware affinity (>64 CPUs), packaged/
   MSIX startup tasks, ETW per-process network, live kernel dump, AccessKit
-  accessibility pass — see `known-debt.md` for scope notes.
+  accessibility pass, production code signing, and disposable-VM service ACL/
+  recovery validation — see `known-debt.md` and `core-service.md`.

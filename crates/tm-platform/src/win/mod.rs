@@ -1,5 +1,7 @@
 //! Windows backend.
 
+mod autostart;
+pub mod core_service;
 mod cpu_info;
 pub(crate) mod cpu_load;
 mod gpu;
@@ -71,9 +73,46 @@ pub fn set_task_manager_replacement_direct(enabled: bool) -> Result<()> {
     taskmgr_replacement::set_direct(enabled)
 }
 
+pub(crate) fn task_manager_replacement_state_for(
+    exe: &std::path::Path,
+) -> TaskManagerReplacementState {
+    match taskmgr_replacement::state_for_exe(exe) {
+        taskmgr_replacement::State::Disabled => TaskManagerReplacementState::Disabled,
+        taskmgr_replacement::State::Enabled => TaskManagerReplacementState::Enabled,
+        taskmgr_replacement::State::Stale(value) => TaskManagerReplacementState::Stale(value),
+        taskmgr_replacement::State::Conflict(value) => TaskManagerReplacementState::Conflict(value),
+    }
+}
+
+pub(crate) fn set_task_manager_replacement_direct_for(
+    enabled: bool,
+    exe: &std::path::Path,
+) -> Result<()> {
+    taskmgr_replacement::set_direct_for_exe(enabled, exe)
+}
+
 /// Whether THIS process runs with an elevated (admin) token.
 pub fn is_elevated() -> bool {
     process_ops::is_elevated()
+}
+
+/// Keep the UI/service control plane responsive when ordinary workloads
+/// saturate the machine. Above-normal is intentional: HIGH/REALTIME can starve
+/// input and disk-flush threads and would make a Task Manager replacement less
+/// reliable rather than more reliable.
+pub fn prioritize_control_plane() {
+    use windows::Win32::System::Threading::{
+        ABOVE_NORMAL_PRIORITY_CLASS, GetCurrentProcess, GetCurrentThread, SetPriorityClass,
+        SetThreadPriority, THREAD_PRIORITY_ABOVE_NORMAL,
+    };
+    unsafe {
+        if let Err(error) = SetPriorityClass(GetCurrentProcess(), ABOVE_NORMAL_PRIORITY_CLASS) {
+            tracing::debug!(%error, "could not raise TaskMan process priority");
+        }
+        if let Err(error) = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL) {
+            tracing::debug!(%error, "could not raise TaskMan control-thread priority");
+        }
+    }
 }
 
 /// Spawn a new elevated instance of the current exe (runas verb → UAC
@@ -173,6 +212,7 @@ impl PlatformActions for WinActions {
             per_process_network: false,
             process_modules: true,
             unload_module: true,
+            start_with_windows: true,
         }
     }
 
@@ -208,11 +248,34 @@ impl PlatformActions for WinActions {
     fn suspend_process(&self, pid: u32, suspend: bool) -> Result<()> {
         process_ops::suspend_process(pid, suspend)
     }
+    fn suspend_process_checked(
+        &self,
+        pid: u32,
+        expected_start_epoch_s: Option<i64>,
+        suspend: bool,
+    ) -> Result<()> {
+        process_ops::suspend_process_checked(pid, expected_start_epoch_s, suspend)
+    }
     fn set_priority(&self, pid: u32, priority: PriorityClass) -> Result<()> {
         process_ops::set_priority(pid, priority)
     }
+    fn set_priority_checked(
+        &self,
+        pid: u32,
+        expected_start_epoch_s: Option<i64>,
+        priority: PriorityClass,
+    ) -> Result<()> {
+        process_ops::set_priority_checked(pid, expected_start_epoch_s, priority)
+    }
     fn get_affinity_mask(&self, pid: u32) -> Result<u64> {
         process_ops::get_affinity(pid)
+    }
+    fn get_affinity_mask_checked(
+        &self,
+        pid: u32,
+        expected_start_epoch_s: Option<i64>,
+    ) -> Result<u64> {
+        process_ops::get_affinity_checked(pid, expected_start_epoch_s)
     }
     fn system_affinity_mask(&self) -> Result<u64> {
         process_ops::system_affinity()
@@ -220,8 +283,32 @@ impl PlatformActions for WinActions {
     fn set_affinity_mask(&self, pid: u32, mask: u64) -> Result<()> {
         process_ops::set_affinity(pid, mask)
     }
+    fn set_affinity_mask_checked(
+        &self,
+        pid: u32,
+        expected_start_epoch_s: Option<i64>,
+        mask: u64,
+    ) -> Result<()> {
+        process_ops::set_affinity_checked(pid, expected_start_epoch_s, mask)
+    }
     fn set_efficiency_mode(&self, pid: u32, on: bool) -> Result<()> {
         process_ops::set_efficiency_mode(pid, on)
+    }
+    fn set_efficiency_mode_checked(
+        &self,
+        pid: u32,
+        expected_start_epoch_s: Option<i64>,
+        on: bool,
+    ) -> Result<()> {
+        process_ops::set_efficiency_mode_checked(pid, expected_start_epoch_s, on)
+    }
+    fn set_uac_virtualization_checked(
+        &self,
+        pid: u32,
+        expected_start_epoch_s: Option<i64>,
+        enabled: bool,
+    ) -> Result<()> {
+        process_ops::set_uac_virtualization_checked(pid, expected_start_epoch_s, enabled)
     }
     fn list_process_modules(
         &self,
@@ -253,12 +340,10 @@ impl PlatformActions for WinActions {
     }
 
     fn task_manager_replacement_state(&self) -> TaskManagerReplacementState {
-        match taskmgr_replacement::state() {
-            taskmgr_replacement::State::Disabled => TaskManagerReplacementState::Disabled,
-            taskmgr_replacement::State::Enabled => TaskManagerReplacementState::Enabled,
-            taskmgr_replacement::State::Stale(v) => TaskManagerReplacementState::Stale(v),
-            taskmgr_replacement::State::Conflict(v) => TaskManagerReplacementState::Conflict(v),
-        }
+        let Ok(exe) = std::env::current_exe() else {
+            return TaskManagerReplacementState::Disabled;
+        };
+        task_manager_replacement_state_for(&exe)
     }
 
     fn set_task_manager_replacement(&self, enabled: bool) -> Result<()> {
@@ -277,6 +362,10 @@ impl PlatformActions for WinActions {
             ),
             true,
         )
+    }
+
+    fn set_start_with_windows(&self, enabled: bool, start_minimized: bool) -> Result<()> {
+        autostart::set_enabled(enabled, start_minimized)
     }
 
     fn create_dump_file(
@@ -313,8 +402,8 @@ pub fn create_collector() -> WinCollector {
     }
 }
 
-pub fn create_actions() -> WinActions {
-    WinActions
+pub fn create_actions() -> core_service::BrokeredActions {
+    core_service::BrokeredActions::default()
 }
 
 #[cfg(all(test, target_os = "windows"))]

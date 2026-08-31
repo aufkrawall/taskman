@@ -1,13 +1,20 @@
 //! Enumerate pids owning visible top-level windows (used for App detection,
 //! mirroring Task Manager's "Apps" grouping).
 
+use std::collections::HashSet;
 use std::sync::Mutex;
 
-/// Cached result refreshed once per sampling tick by the collector.
-static CACHE: Mutex<Option<Vec<u32>>> = Mutex::new(None);
+#[derive(Clone, Default)]
+pub struct WindowOwners {
+    pub visible: HashSet<u32>,
+    pub not_responding: HashSet<u32>,
+}
 
-pub fn visible_window_owners() -> Vec<u32> {
-    let mut out: Vec<u32> = Vec::new();
+/// Cached result refreshed once per sampling tick by the collector.
+static CACHE: Mutex<Option<WindowOwners>> = Mutex::new(None);
+
+pub fn window_owners() -> WindowOwners {
+    let mut out = WindowOwners::default();
     unsafe {
         let _ = windows::Win32::UI::WindowsAndMessaging::EnumWindows(
             Some(enum_cb),
@@ -21,7 +28,10 @@ pub fn visible_window_owners() -> Vec<u32> {
 /// Peek at the last enumerated owners without touching windows (cheap).
 #[allow(dead_code)]
 pub fn last_known_owners() -> Vec<u32> {
-    tm_core::sync::lock(&CACHE).clone().unwrap_or_default()
+    tm_core::sync::lock(&CACHE)
+        .as_ref()
+        .map(|owners| owners.visible.iter().copied().collect())
+        .unwrap_or_default()
 }
 
 unsafe extern "system" fn enum_cb(
@@ -30,7 +40,8 @@ unsafe extern "system" fn enum_cb(
 ) -> windows::core::BOOL {
     use windows::Win32::Graphics::Dwm::{DWMWA_CLOAKED, DwmGetWindowAttribute};
     use windows::Win32::UI::WindowsAndMessaging::{
-        GWL_EXSTYLE, GetWindowLongPtrW, GetWindowThreadProcessId, IsWindowVisible, WS_EX_TOOLWINDOW,
+        GWL_EXSTYLE, GetWindowLongPtrW, GetWindowThreadProcessId, IsHungAppWindow, IsWindowVisible,
+        WS_EX_TOOLWINDOW,
     };
 
     unsafe {
@@ -64,10 +75,13 @@ unsafe extern "system" fn enum_cb(
             return windows::core::BOOL(1);
         }
 
-        // SAFETY: lparam points at our Vec<u32> for the duration of EnumWindows.
-        let out = &mut *(lparam.0 as *mut Vec<u32>);
-        if !out.contains(&pid) {
-            out.push(pid);
+        // SAFETY: lparam points at our WindowOwners for the duration of
+        // EnumWindows. IsHungAppWindow is a local state query and does not
+        // send a blocking message into the target process.
+        let out = &mut *(lparam.0 as *mut WindowOwners);
+        out.visible.insert(pid);
+        if IsHungAppWindow(hwnd).as_bool() {
+            out.not_responding.insert(pid);
         }
     }
     windows::core::BOOL(1)

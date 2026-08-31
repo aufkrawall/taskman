@@ -26,6 +26,14 @@ use std::time::Instant;
 const APP_ID: &str = "io.github.aufkrawall.Taskman";
 const DEFAULT_WINDOW_SIZE: [f32; 2] = [1280.0, 800.0];
 
+#[cfg(target_os = "windows")]
+static PROGRAMMATIC_EXIT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub(crate) fn request_programmatic_exit() {
+    #[cfg(target_os = "windows")]
+    PROGRAMMATIC_EXIT.store(true, std::sync::atomic::Ordering::Release);
+}
+
 pub struct StartupTrace;
 
 impl StartupTrace {
@@ -61,6 +69,33 @@ fn main() {
         std::process::exit(code);
     }
 
+    // Elevated install/remove helper for the protected core service. Like the
+    // IFEO helper above, this path performs no GUI or renderer initialization.
+    #[cfg(target_os = "windows")]
+    if let Some(operation) = args
+        .iter()
+        .find_map(|argument| argument.strip_prefix("--core-service="))
+    {
+        let authorized_user_sid = args
+            .iter()
+            .find_map(|argument| argument.strip_prefix("--core-service-user="));
+        // Never let an elevated helper attach the ordinary per-user file
+        // logger: that path is intentionally user-writable. The bounded early
+        // sink is memory/console-only; the installed service attaches files
+        // only after validating its protected ProgramData directory.
+        tm_core::logging::init_early(true);
+        let code =
+            match tm_platform::win::core_service::handle_helper(operation, authorized_user_sid) {
+                Ok(()) => 0,
+                Err(error) => {
+                    tracing::error!(%error, %operation, "core service helper failed");
+                    eprintln!("taskman: core service {operation} failed: {error}");
+                    1
+                }
+            };
+        std::process::exit(code);
+    }
+
     let verbose = args.iter().any(|a| a == "--verbose" || a == "-v");
     let mock = args.iter().any(|a| a == "--mock");
     let selfcheck = args.iter().any(|a| a == "--selfcheck");
@@ -84,6 +119,18 @@ fn main() {
     if selfcheck {
         let code = selfcheck::run(mock);
         std::process::exit(code);
+    }
+
+    // A service install pins the trusted GUI under Program Files. Future
+    // portable/package launches hand off to that copy before creating a
+    // renderer or window, preserving the broker's strict image-path policy.
+    #[cfg(all(target_os = "windows", not(debug_assertions)))]
+    if std::env::var_os("TASKMAN_CONFIG_DIR").is_none() {
+        match tm_platform::win::core_service::redirect_to_installed_gui(&args) {
+            Ok(true) => return,
+            Ok(false) => {}
+            Err(error) => tracing::warn!(%error, "protected GUI redirect unavailable"),
+        }
     }
 
     run_gui(mock, &args);
@@ -124,6 +171,24 @@ fn run_gui(mock: bool, args: &[String]) {
         }
     }
 
+    // Acquire only after the optional elevation handoff. Otherwise the
+    // unelevated parent would still own the mutex when its elevated child
+    // starts, causing that child to signal the parent and exit immediately.
+    #[cfg(target_os = "windows")]
+    let elevation_handoff = args
+        .iter()
+        .any(|argument| argument == "--single-instance-handoff");
+    let _single_instance = match SingleInstance::acquire(elevation_handoff) {
+        Ok(Some(instance)) => instance,
+        Ok(None) => return,
+        Err(error) => {
+            tracing::warn!(%error, "single-instance coordination unavailable");
+            SingleInstance::uncoordinated()
+        }
+    };
+    #[cfg(target_os = "windows")]
+    tm_platform::win::prioritize_control_plane();
+
     if let Some(sz) = args
         .iter()
         .find_map(|a| a.strip_prefix("--size=").map(|s| s.to_string()))
@@ -141,6 +206,9 @@ fn run_gui(mock: bool, args: &[String]) {
         .iter()
         .find_map(|a| a.strip_prefix("--tab=").map(|t| t.to_string()))
         .or_else(|| std::env::var("TASKMAN_TAB").ok());
+    let initially_hidden = args
+        .iter()
+        .any(|argument| argument == "--minimized-to-tray");
     if let Some(t) = &initial_tab_arg {
         eprintln!("initial tab requested: {t}");
     }
@@ -155,6 +223,7 @@ fn run_gui(mock: bool, args: &[String]) {
             .with_app_id(APP_ID)
             .with_inner_size(window_size)
             .with_min_inner_size([720.0, 480.0])
+            .with_visible(!initially_hidden)
             .with_icon(icon_data());
         if let Some(pos) = window_position {
             viewport = viewport.with_position(pos);
@@ -203,12 +272,16 @@ fn run_gui(mock: bool, args: &[String]) {
         let use_mock = mock;
         let initial_tab = initial_tab_arg.clone();
         let app_settings = settings.clone();
+        let start_hidden = initially_hidden;
         let creator = move |cc: &eframe::CreationContext<'_>| {
             StartupTrace::mark("creation_context_enter");
             theme::apply_startup(&cc.egui_ctx);
             fonts::install_async(cc.egui_ctx.clone());
             let application = app::TaskManApp::new(cc, use_mock, app_settings, initial_tab);
-            Ok(Box::new(NativeApp::new(application)) as Box<dyn eframe::App>)
+            Ok(
+                Box::new(NativeApp::new(application, &cc.egui_ctx, start_hidden))
+                    as Box<dyn eframe::App>,
+            )
         };
         match eframe::run_native("Task-Manager", options(renderer), Box::new(creator)) {
             Ok(()) => return,
@@ -269,11 +342,41 @@ fn compiled_wgpu_backends() -> eframe::wgpu::Backends {
 /// delegates every application hook unchanged.
 struct NativeApp {
     inner: app::TaskManApp,
+    #[cfg(target_os = "windows")]
+    tray: Option<TrayShell>,
+    #[cfg(target_os = "windows")]
+    tray_init_attempted: bool,
+    hidden_to_tray: bool,
+    initial_hide_pending: bool,
+    #[cfg(target_os = "windows")]
+    exit_requested: bool,
 }
 
 impl NativeApp {
-    fn new(inner: app::TaskManApp) -> Self {
-        Self { inner }
+    fn new(inner: app::TaskManApp, ctx: &eframe::egui::Context, initially_hidden: bool) -> Self {
+        #[cfg(target_os = "windows")]
+        {
+            // The single-instance show event needs a repaint target even when
+            // close-to-tray is disabled and no tray icon has been created.
+            *tm_core::sync::lock(TRAY_CONTEXT.get_or_init(Default::default)) = Some(ctx.clone());
+        }
+        #[cfg(target_os = "windows")]
+        let tray_requested = initially_hidden || inner.shared.settings.close_to_tray;
+        #[cfg(target_os = "windows")]
+        let tray = tray_requested.then(|| TrayShell::new(ctx)).flatten();
+        #[cfg(not(target_os = "windows"))]
+        let _ = ctx;
+        Self {
+            inner,
+            #[cfg(target_os = "windows")]
+            tray,
+            #[cfg(target_os = "windows")]
+            tray_init_attempted: tray_requested,
+            hidden_to_tray: initially_hidden,
+            initial_hide_pending: initially_hidden,
+            #[cfg(target_os = "windows")]
+            exit_requested: false,
+        }
     }
 
     fn shutdown(&mut self) {
@@ -284,13 +387,206 @@ impl NativeApp {
     }
 }
 
+/// Per-session single-instance guard. A second Ctrl+Shift+Esc/shortcut launch
+/// signals the existing process to restore from the tray instead of starting
+/// another sampler and renderer under heavy load.
+#[cfg(target_os = "windows")]
+struct SingleInstance {
+    _mutex: windows::Win32::Foundation::HANDLE,
+    _show_event: windows::Win32::Foundation::HANDLE,
+    listener: Option<std::thread::JoinHandle<()>>,
+    owns_mutex: bool,
+}
+
+#[cfg(target_os = "windows")]
+impl SingleInstance {
+    fn acquire(elevation_handoff: bool) -> windows::core::Result<Option<Self>> {
+        use windows::Win32::Foundation::{
+            CloseHandle, ERROR_ALREADY_EXISTS, ERROR_TIMEOUT, GetLastError, HANDLE, WAIT_ABANDONED,
+            WAIT_OBJECT_0, WAIT_TIMEOUT,
+        };
+        use windows::Win32::System::Threading::{
+            CreateEventW, CreateMutexW, INFINITE, SetEvent, WaitForSingleObject,
+        };
+        use windows::core::PCWSTR;
+
+        let mutex_name: Vec<u16> = "Local\\TaskMan.Instance.v1"
+            .encode_utf16()
+            .chain([0])
+            .collect();
+        let event_name: Vec<u16> = "Local\\TaskMan.Show.v1".encode_utf16().chain([0]).collect();
+        let mutex = unsafe { CreateMutexW(None, true, PCWSTR(mutex_name.as_ptr()))? };
+        let already_exists = unsafe { GetLastError() == ERROR_ALREADY_EXISTS };
+        let event = match unsafe { CreateEventW(None, false, false, PCWSTR(event_name.as_ptr())) } {
+            Ok(event) => event,
+            Err(error) => {
+                unsafe {
+                    let _ = CloseHandle(mutex);
+                }
+                return Err(error);
+            }
+        };
+        if already_exists {
+            if elevation_handoff {
+                // The old instance queues its close immediately after the
+                // elevated process is launched. Wait for it to release/abandon
+                // ownership so the replacement cannot be rejected as a
+                // duplicate. On a pathological timeout, return an error and
+                // let the caller choose the uncoordinated reliability fallback.
+                let wait = unsafe { WaitForSingleObject(mutex, 15_000) };
+                if wait != WAIT_OBJECT_0 && wait != WAIT_ABANDONED {
+                    let error = if wait == WAIT_TIMEOUT {
+                        ERROR_TIMEOUT.to_hresult()
+                    } else {
+                        windows::core::HRESULT::from_thread()
+                    };
+                    unsafe {
+                        let _ = CloseHandle(event);
+                        let _ = CloseHandle(mutex);
+                    }
+                    return Err(windows::core::Error::from_hresult(error));
+                }
+                // Continue into the common listener setup: the replacement is
+                // now the primary instance and must respond to later launches.
+            } else {
+                unsafe {
+                    if let Err(error) = SetEvent(event) {
+                        let _ = CloseHandle(event);
+                        let _ = CloseHandle(mutex);
+                        return Err(error);
+                    }
+                    let _ = CloseHandle(event);
+                    let _ = CloseHandle(mutex);
+                }
+                return Ok(None);
+            }
+        }
+
+        SHOW_LISTENER_SHUTDOWN.store(false, std::sync::atomic::Ordering::Release);
+        let event_raw = event.0 as usize;
+        let listener = match std::thread::Builder::new()
+            .name("tm-show-listener".into())
+            .spawn(move || {
+                loop {
+                    let event = HANDLE(event_raw as *mut core::ffi::c_void);
+                    if unsafe { WaitForSingleObject(event, INFINITE) } != WAIT_OBJECT_0 {
+                        break;
+                    }
+                    if SHOW_LISTENER_SHUTDOWN.load(std::sync::atomic::Ordering::Acquire) {
+                        break;
+                    }
+                    signal_tray(TRAY_ACTION_OPEN);
+                }
+            }) {
+            Ok(listener) => Some(listener),
+            Err(error) => {
+                // Extremely low-resource fallback: the UI polls this event on
+                // its existing repaint cadence, so a failed listener allocation
+                // does not permanently break Ctrl+Shift+Esc restore behavior.
+                tracing::warn!(%error, "single-instance listener could not start; using UI polling");
+                SHOW_EVENT_FALLBACK.store(event.0 as usize, std::sync::atomic::Ordering::Release);
+                None
+            }
+        };
+        Ok(Some(Self {
+            _mutex: mutex,
+            _show_event: event,
+            listener,
+            owns_mutex: true,
+        }))
+    }
+
+    fn uncoordinated() -> Self {
+        Self {
+            _mutex: windows::Win32::Foundation::HANDLE::default(),
+            _show_event: windows::Win32::Foundation::HANDLE::default(),
+            listener: None,
+            owns_mutex: false,
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+impl Drop for SingleInstance {
+    fn drop(&mut self) {
+        use windows::Win32::Foundation::CloseHandle;
+        use windows::Win32::System::Threading::{ReleaseMutex, SetEvent};
+
+        unsafe {
+            SHOW_EVENT_FALLBACK.store(0, std::sync::atomic::Ordering::Release);
+            if let Some(listener) = self.listener.take() {
+                SHOW_LISTENER_SHUTDOWN.store(true, std::sync::atomic::Ordering::Release);
+                if !self._show_event.is_invalid() {
+                    let _ = SetEvent(self._show_event);
+                }
+                let _ = listener.join();
+            }
+            if self.owns_mutex && !self._mutex.is_invalid() {
+                let _ = ReleaseMutex(self._mutex);
+            }
+            if !self._show_event.is_invalid() {
+                let _ = CloseHandle(self._show_event);
+            }
+            if !self._mutex.is_invalid() {
+                let _ = CloseHandle(self._mutex);
+            }
+        }
+    }
+}
+
 impl eframe::App for NativeApp {
     fn logic(&mut self, ctx: &eframe::egui::Context, frame: &mut eframe::Frame) {
+        #[cfg(target_os = "windows")]
+        poll_show_event_fallback(ctx);
+        #[cfg(target_os = "windows")]
+        self.handle_tray_actions(ctx);
+        if self.initial_hide_pending {
+            #[cfg(target_os = "windows")]
+            if self.tray.is_some() {
+                ctx.send_viewport_cmd(eframe::egui::ViewportCommand::Visible(false));
+            } else {
+                self.hidden_to_tray = false;
+                ctx.send_viewport_cmd(eframe::egui::ViewportCommand::Visible(true));
+            }
+            #[cfg(not(target_os = "windows"))]
+            {
+                self.hidden_to_tray = false;
+                ctx.send_viewport_cmd(eframe::egui::ViewportCommand::Visible(true));
+            }
+            self.initial_hide_pending = false;
+        }
         <app::TaskManApp as eframe::App>::logic(&mut self.inner, ctx, frame);
     }
 
     fn ui(&mut self, ui: &mut eframe::egui::Ui, frame: &mut eframe::Frame) {
         <app::TaskManApp as eframe::App>::ui(&mut self.inner, ui, frame);
+        #[cfg(target_os = "windows")]
+        {
+            self.handle_tray_actions(ui.ctx());
+            let tray_enabled = self.inner.shared.settings.close_to_tray || self.hidden_to_tray;
+            if tray_enabled && self.tray.is_none() && !self.tray_init_attempted {
+                self.tray_init_attempted = true;
+                self.tray = TrayShell::new(ui.ctx());
+            }
+            if let Some(tray) = &mut self.tray {
+                tray.set_visible(tray_enabled);
+            }
+            let close_requested = ui.ctx().input(|input| input.viewport().close_requested());
+            if close_requested && PROGRAMMATIC_EXIT.load(std::sync::atomic::Ordering::Acquire) {
+                self.exit_requested = true;
+            }
+            if close_requested
+                && !self.exit_requested
+                && self.inner.shared.settings.close_to_tray
+                && self.tray.is_some()
+            {
+                ui.ctx()
+                    .send_viewport_cmd(eframe::egui::ViewportCommand::CancelClose);
+                ui.ctx()
+                    .send_viewport_cmd(eframe::egui::ViewportCommand::Visible(false));
+                self.hidden_to_tray = true;
+            }
+        }
         if self.inner.shared.settings.remember_window {
             let (pos, maximized) = ui.ctx().input(|i| {
                 (
@@ -315,6 +611,151 @@ impl eframe::App for NativeApp {
     #[cfg(not(feature = "glow"))]
     fn on_exit(&mut self) {
         self.shutdown();
+    }
+}
+
+#[cfg(target_os = "windows")]
+const TRAY_ACTION_OPEN: u8 = 1;
+#[cfg(target_os = "windows")]
+const TRAY_ACTION_EXIT: u8 = 2;
+#[cfg(target_os = "windows")]
+static TRAY_ACTION: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+#[cfg(target_os = "windows")]
+static TRAY_CONTEXT: std::sync::OnceLock<std::sync::Mutex<Option<eframe::egui::Context>>> =
+    std::sync::OnceLock::new();
+#[cfg(target_os = "windows")]
+static SHOW_EVENT_FALLBACK: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+#[cfg(target_os = "windows")]
+static SHOW_LISTENER_SHUTDOWN: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+#[cfg(target_os = "windows")]
+static TRAY_HANDLERS: std::sync::Once = std::sync::Once::new();
+
+#[cfg(target_os = "windows")]
+fn signal_tray(action: u8) {
+    TRAY_ACTION.fetch_max(action, std::sync::atomic::Ordering::AcqRel);
+    if let Some(context) = TRAY_CONTEXT.get()
+        && let Some(context) = tm_core::sync::lock(context).as_ref()
+    {
+        context.request_repaint();
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn poll_show_event_fallback(ctx: &eframe::egui::Context) {
+    use windows::Win32::Foundation::{HANDLE, WAIT_OBJECT_0};
+    use windows::Win32::System::Threading::WaitForSingleObject;
+
+    let raw = SHOW_EVENT_FALLBACK.load(std::sync::atomic::Ordering::Acquire);
+    if raw == 0 {
+        return;
+    }
+    let event = HANDLE(raw as *mut core::ffi::c_void);
+    if unsafe { WaitForSingleObject(event, 0) } == WAIT_OBJECT_0 {
+        signal_tray(TRAY_ACTION_OPEN);
+    }
+    ctx.request_repaint_after(std::time::Duration::from_millis(250));
+}
+
+#[cfg(target_os = "windows")]
+struct TrayShell {
+    icon: tray_icon::TrayIcon,
+    visible: bool,
+}
+
+#[cfg(target_os = "windows")]
+impl TrayShell {
+    fn new(ctx: &eframe::egui::Context) -> Option<Self> {
+        *tm_core::sync::lock(TRAY_CONTEXT.get_or_init(Default::default)) = Some(ctx.clone());
+        TRAY_HANDLERS.call_once(|| {
+            tray_icon::menu::MenuEvent::set_event_handler(Some(
+                |event: tray_icon::menu::MenuEvent| match event.id.0.as_str() {
+                    "taskman-open" => signal_tray(TRAY_ACTION_OPEN),
+                    "taskman-exit" => signal_tray(TRAY_ACTION_EXIT),
+                    _ => {}
+                },
+            ));
+            tray_icon::TrayIconEvent::set_event_handler(Some(|event: tray_icon::TrayIconEvent| {
+                if matches!(event, tray_icon::TrayIconEvent::DoubleClick { .. }) {
+                    signal_tray(TRAY_ACTION_OPEN);
+                }
+            }));
+        });
+
+        let menu = tray_icon::menu::Menu::new();
+        let open = tray_icon::menu::MenuItem::with_id(
+            "taskman-open",
+            tm_core::i18n::tr(tm_core::i18n::K::TrayOpen),
+            true,
+            None,
+        );
+        let exit = tray_icon::menu::MenuItem::with_id(
+            "taskman-exit",
+            tm_core::i18n::tr(tm_core::i18n::K::TrayExit),
+            true,
+            None,
+        );
+        if let Err(error) = menu.append_items(&[&open, &exit]) {
+            tracing::warn!(%error, "cannot create tray menu");
+            return None;
+        }
+        let icon_data = icon_data();
+        let icon =
+            match tray_icon::Icon::from_rgba(icon_data.rgba, icon_data.width, icon_data.height) {
+                Ok(icon) => icon,
+                Err(error) => {
+                    tracing::warn!(%error, "cannot create tray icon image");
+                    return None;
+                }
+            };
+        match tray_icon::TrayIconBuilder::new()
+            .with_menu(Box::new(menu))
+            .with_menu_on_left_click(false)
+            .with_tooltip(tm_core::i18n::tr(tm_core::i18n::K::WindowTitle))
+            .with_icon(icon)
+            .build()
+        {
+            Ok(icon) => {
+                let _ = icon.set_visible(false);
+                Some(Self {
+                    icon,
+                    visible: false,
+                })
+            }
+            Err(error) => {
+                tracing::warn!(%error, "cannot create notification-area icon");
+                None
+            }
+        }
+    }
+
+    fn set_visible(&mut self, visible: bool) {
+        if visible == self.visible {
+            return;
+        }
+        match self.icon.set_visible(visible) {
+            Ok(()) => self.visible = visible,
+            Err(error) => tracing::warn!(%error, visible, "cannot update tray visibility"),
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+impl NativeApp {
+    fn handle_tray_actions(&mut self, ctx: &eframe::egui::Context) {
+        match TRAY_ACTION.swap(0, std::sync::atomic::Ordering::AcqRel) {
+            TRAY_ACTION_OPEN => {
+                self.hidden_to_tray = false;
+                ctx.send_viewport_cmd(eframe::egui::ViewportCommand::Visible(true));
+                ctx.send_viewport_cmd(eframe::egui::ViewportCommand::Focus);
+            }
+            TRAY_ACTION_EXIT => {
+                self.exit_requested = true;
+                self.hidden_to_tray = false;
+                ctx.send_viewport_cmd(eframe::egui::ViewportCommand::Close);
+            }
+            _ => {}
+        }
     }
 }
 
@@ -344,7 +785,7 @@ fn icon_data() -> eframe::egui::IconData {
             rgba[i] = color[0];
             rgba[i + 1] = color[1];
             rgba[i + 2] = color[2];
-            rgba[i + 3] = 255;
+            rgba[i + 3] = if in_chip || pin_v || pin_h { 255 } else { 0 };
         }
     }
     eframe::egui::IconData {
