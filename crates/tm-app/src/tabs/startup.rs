@@ -3,6 +3,7 @@
 //! Aktivieren/Deaktivieren/Eigenschaften command bar.
 
 use eframe::egui;
+use std::cmp::Ordering;
 use std::time::{Duration, Instant};
 use tm_core::format;
 use tm_core::i18n::{self, K};
@@ -136,12 +137,14 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
 
     let q = crate::search::Query::new(&app.search);
     let mut table = app.make_table("startup", columns());
-    let visible: Vec<usize> = items
+    let mut visible: Vec<usize> = items
         .iter()
         .enumerate()
         .filter(|(_, it)| q.matches_any([it.name.as_str(), it.publisher.as_deref().unwrap_or("")]))
         .map(|(i, _)| i)
         .collect();
+    let sort = app.startup_sort;
+    visible.sort_by(|a, b| compare_items(&items[*a], &items[*b], sort));
 
     let mut fit: Vec<f32> = table
         .cols
@@ -171,13 +174,13 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
     }
 
     let avail = crate::widgets::tablekit::table_avail(ui);
-    tablekit::scrolled_rows(
+    let clicked = tablekit::scrolled_rows(
         "startup",
         ui,
         &pal,
         &mut table,
         avail,
-        None,
+        Some((app.startup_sort.column, app.startup_sort.ascending)),
         None,
         visible.len(),
         None,
@@ -266,10 +269,7 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
                         ui.close();
                     }
                     if ui.button(i18n::tr(K::OnlineSearch)).clicked() {
-                        let url = format!(
-                            "https://www.bing.com/search?q={}",
-                            urlencoding_lite(&item.name)
-                        );
+                        let url = crate::search::online_search_url(&item.name);
                         if let Err(e) = app.actions.open_url(&url) {
                             app.shared.toast(i18n::trf(K::ErrMsg, &[&e.to_string()]));
                         }
@@ -286,7 +286,47 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
             ui.add_space(12.0);
         },
     );
+    if let Some(column) = clicked {
+        app.startup_sort.clicked(column, false);
+    }
     app.persist_table(&table);
+}
+
+fn compare_items(a: &StartupItem, b: &StartupItem, sort: tablekit::SortState) -> Ordering {
+    let primary = match sort.column {
+        0 => a
+            .name
+            .to_ascii_lowercase()
+            .cmp(&b.name.to_ascii_lowercase()),
+        1 => a
+            .publisher
+            .as_deref()
+            .unwrap_or("")
+            .to_ascii_lowercase()
+            .cmp(&b.publisher.as_deref().unwrap_or("").to_ascii_lowercase()),
+        2 => a.enabled.cmp(&b.enabled),
+        _ => impact_rank(a.impact).cmp(&impact_rank(b.impact)),
+    };
+    let primary = if sort.ascending {
+        primary
+    } else {
+        primary.reverse()
+    };
+    primary.then_with(|| {
+        a.name
+            .to_ascii_lowercase()
+            .cmp(&b.name.to_ascii_lowercase())
+    })
+}
+
+fn impact_rank(impact: StartupImpact) -> u8 {
+    match impact {
+        StartupImpact::None => 0,
+        StartupImpact::Low => 1,
+        StartupImpact::Medium => 2,
+        StartupImpact::High => 3,
+        StartupImpact::Unknown => 4,
+    }
 }
 
 fn toggle_selected(app: &mut TaskManApp, enable: bool, ctx: &egui::Context) {
@@ -321,20 +361,6 @@ fn impact_label(lang: tm_core::i18n::Lang, impact: StartupImpact) -> &'static st
         StartupImpact::High => i18n::tr_in(lang, K::ImpactHigh),
         StartupImpact::Unknown => i18n::tr_in(lang, K::ImpactUnknown),
     }
-}
-
-fn urlencoding_lite(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for b in s.bytes() {
-        match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                out.push(b as char)
-            }
-            b' ' => out.push('+'),
-            _ => out.push_str(&format!("%{b:02X}")),
-        }
-    }
-    out
 }
 
 fn exe_from_command(cmd: &str) -> Option<String> {

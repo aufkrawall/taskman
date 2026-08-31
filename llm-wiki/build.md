@@ -1,6 +1,6 @@
 # Build System
 
-Last verified: 2026-08-25
+Last verified: 2026-08-31
 
 Primary sources:
 - `build.py`
@@ -57,6 +57,23 @@ Measured on the 16-core dev machine: cold workspace release ≈ 2 min
 (dependency-bound: wgpu/eframe), warm incremental dev rebuild of the whole
 chain ≈ 4 s. The crate chain tm-core → tm-platform → tm-app is linear, so
 cross-crate changes rebuild serially by nature.
+
+## Renderer/backend policy
+
+`tm-app` enables eframe WGPU without its broad default backend set, then adds
+one target-native backend through a target-specific direct `wgpu` dependency:
+
+- Windows: D3D12 only (no Vulkan WGPU backend in the Windows binary).
+- Linux: Vulkan only.
+- macOS: Metal only.
+
+The GUI tries WGPU first and retains Glow as the compatibility fallback.
+Surface presentation is FIFO with one-frame maximum latency, and WGPU prefers
+the low-power adapter unless `WGPU_POWER_PREF` overrides it. This trims unused
+backend dependency/code without making older or unusual graphics systems a
+hard failure. The 2026-08-31 Windows release measured 13,470,208 bytes versus
+14,656,000 before backend trimming (8.09% smaller, even after adding the module
+inspector and UI features). See `debug-tools.md` for overrides.
 
 ## Test isolation
 

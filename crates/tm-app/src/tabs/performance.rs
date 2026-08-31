@@ -119,6 +119,19 @@ mod tests {
         assert!(window_label(120).contains('2'));
     }
 
+    #[test]
+    fn logical_grid_adapts_to_core_count_and_width() {
+        let (cols_16, width_16, height_16) = logical_grid_layout(800.0, 16);
+        assert_eq!(cols_16, 4);
+        assert!(width_16 > height_16);
+
+        let (cols_64, _, _) = logical_grid_layout(800.0, 64);
+        assert!(cols_64 >= 8, "64 threads should not become a 16-row strip");
+
+        let (narrow, _, _) = logical_grid_layout(360.0, 16);
+        assert!(narrow < cols_16);
+    }
+
     /// Regression: the series extractors used to SKIP window points without
     /// the requested device (and net_series even dropped zero-traffic
     /// samples). The shortened series then desynchronized from the shared
@@ -150,6 +163,16 @@ pub enum ResourceKind {
     Gpu,
 }
 
+fn resource_color(pal: &Palette, kind: ResourceKind) -> Color32 {
+    match kind {
+        ResourceKind::Cpu => pal.cpu_graph,
+        ResourceKind::Memory => pal.memory_graph,
+        ResourceKind::Disk => pal.disk_graph,
+        ResourceKind::Network => pal.network_graph,
+        ResourceKind::Gpu => pal.gpu_graph,
+    }
+}
+
 #[derive(Clone)]
 pub struct ResourceEntry {
     pub kind: ResourceKind,
@@ -168,7 +191,7 @@ const GUTTER: f32 = 16.0;
 /// second hue (§14.4). `pal`-derived, so it stays readable in both themes
 /// (the old hardcoded dark-theme green washed out in light mode).
 fn kernel_color(pal: &Palette) -> Color32 {
-    pal.accent.gamma_multiply(0.55)
+    pal.cpu_graph.gamma_multiply(0.55)
 }
 
 pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
@@ -336,7 +359,7 @@ fn card_ui(
         Pos2::new(rect.left() + 10.0, rect.top() + 12.0),
         egui::vec2(62.0, 40.0),
     );
-    let color = pal.accent;
+    let color = resource_color(pal, e.kind);
     crate::widgets::chart::paint_sparkline(ui, chart_rect, samples, color);
 
     // Text block: title / subtitle / value. Ellipsized — painter text is
@@ -733,6 +756,39 @@ fn stats_block(
 
 // ---------------------------------------------------------------- CPU page
 
+fn logical_grid_layout(width: f32, cores: usize) -> (usize, f32, f32) {
+    const GAP: f32 = 6.0;
+    if cores == 0 {
+        return (1, width.max(60.0), 48.0);
+    }
+    let min_cols = if cores > 1 { 2 } else { 1 };
+    let max_cols = (((width + GAP) / (78.0 + GAP)).floor() as usize)
+        .max(min_cols)
+        .min(cores);
+    let page_aspect = (width / 420.0).clamp(1.0, 2.4);
+    let target =
+        ((cores as f32 * page_aspect / 1.8).sqrt().round() as usize).clamp(min_cols, max_cols);
+
+    // Prefer an even final row when a nearby column count divides the core
+    // count. This keeps 16→4×4 and 64→8×8 while still adapting on narrow UI.
+    let start = target.saturating_sub(2).max(min_cols);
+    let end = (target + 2).min(max_cols);
+    let cols = (start..=end)
+        .min_by(|a, b| {
+            let score = |cols: usize| {
+                let blanks = (cols - cores % cols) % cols;
+                (cols.abs_diff(target) as f32) + blanks as f32 * 0.45
+            };
+            score(*a)
+                .partial_cmp(&score(*b))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .unwrap_or(target);
+    let cell_width = ((width - GAP * (cols - 1) as f32) / cols as f32).max(42.0);
+    let cell_height = (cell_width / 1.9).clamp(48.0, 86.0);
+    (cols, cell_width, cell_height)
+}
+
 fn cpu_page(app: &mut TaskManApp, ui: &mut egui::Ui, pal: &Palette) {
     let Some(snap) = app.latest_snapshot() else {
         return;
@@ -759,27 +815,6 @@ fn cpu_page(app: &mut TaskManApp, ui: &mut egui::Ui, pal: &Palette) {
 
     page_title(ui, pal, "CPU", &snap.cpu.brand);
 
-    // Graph-mode switcher, also reachable via right-click on the charts.
-    ui.horizontal(|ui| {
-        let mut mode = app.shared.settings.cpu_graph_mode.clone();
-        for (m, key) in [
-            ("overall", K::CpuGraphOverall),
-            ("logical", K::CpuGraphLogical),
-        ] {
-            if ui.selectable_label(mode == m, i18n::tr(key)).clicked() {
-                mode = m.to_string();
-                app.shared.settings.cpu_graph_mode = mode.clone();
-                app.save_settings();
-            }
-        }
-        let mut show_k = app.shared.settings.show_kernel_times;
-        if crate::widgets::controls::checkbox(ui, &mut show_k, i18n::tr(K::ShowKernelTimes), pal)
-            .changed()
-        {
-            app.shared.settings.show_kernel_times = show_k;
-            app.save_settings();
-        }
-    });
     caption(
         ui,
         pal,
@@ -797,11 +832,11 @@ fn cpu_page(app: &mut TaskManApp, ui: &mut egui::Ui, pal: &Palette) {
     let width = content_width(ui);
 
     if logical_mode && cores > 0 {
-        // Per-logical-processor grid: 4 columns like TM.
-        let cols = 4usize;
+        // Responsive per-logical-processor grid. Four columns remains the
+        // common 16-thread layout; high-core-count CPUs gain columns instead
+        // of creating a needlessly tall page.
+        let (cols, cell_w, cell_h) = logical_grid_layout(width, cores);
         let gap = 6.0;
-        let cell_w = ((width - gap * (cols - 1) as f32) / cols as f32).max(60.0);
-        let cell_h = 84.0;
         ui.horizontal_top(|ui| {
             ui.add_space(GUTTER);
             egui::Grid::new("core-grid")
@@ -809,13 +844,14 @@ fn cpu_page(app: &mut TaskManApp, ui: &mut egui::Ui, pal: &Palette) {
                 .start_row(0)
                 .show(ui, |ui| {
                     for i in 0..cores {
-                        core_chart(
+                        let response = core_chart(
                             ui,
                             egui::vec2(cell_w, cell_h),
                             &core_hist[i],
                             kernels.then_some(&core_kern[i]),
-                            pal.accent,
+                            pal.cpu_graph,
                         );
+                        cpu_graph_context_menu(app, &response);
                         if (i + 1) % cols == 0 {
                             ui.end_row();
                         }
@@ -825,47 +861,19 @@ fn cpu_page(app: &mut TaskManApp, ui: &mut egui::Ui, pal: &Palette) {
     } else {
         // Overall utilization: one aggregate series (+ kernel overlay).
         // Kernel first so the primary total series paints on top.
-        let total = total_series.clone();
-        let kernel = kernel_series.clone();
-        let resp = page_chart(
-            ui,
-            width,
-            180.0,
-            &[
-                MultiSeries {
-                    samples: kernel.clone(),
-                    color: kernel_color(pal),
-                },
-                MultiSeries {
-                    samples: total.clone(),
-                    color: pal.accent,
-                },
-            ],
-            100.0,
-            Some(&ts),
-        );
-        cpu_graph_context_menu(app, &resp);
+        let mut chart_series = Vec::with_capacity(2);
         if kernels {
-            caption(
-                ui,
-                pal,
-                &i18n::trf(K::ShowKernelTimes, &[])
-                    .replace("Anzeigen/", "")
-                    .replace("Show ", ""),
-                "100 %",
-            );
-            let _ = page_chart(
-                ui,
-                width,
-                90.0,
-                &[MultiSeries {
-                    samples: kernel,
-                    color: kernel_color(pal),
-                }],
-                100.0,
-                Some(&ts),
-            );
+            chart_series.push(MultiSeries {
+                samples: kernel_series,
+                color: kernel_color(pal),
+            });
         }
+        chart_series.push(MultiSeries {
+            samples: total_series,
+            color: pal.cpu_graph,
+        });
+        let resp = page_chart(ui, width, 180.0, &chart_series, 100.0, Some(&ts));
+        cpu_graph_context_menu(app, &resp);
     }
 
     ui.add_space(10.0);
@@ -985,12 +993,24 @@ fn cpu_page(app: &mut TaskManApp, ui: &mut egui::Ui, pal: &Palette) {
 /// toggle the kernel-times overlay (§14.4).
 fn cpu_graph_context_menu(app: &mut TaskManApp, resp: &egui::Response) {
     resp.context_menu(|ui| {
-        if ui.button(i18n::tr(K::CpuGraphOverall)).clicked() {
+        if ui
+            .selectable_label(
+                app.shared.settings.cpu_graph_mode == "overall",
+                i18n::tr(K::CpuGraphOverall),
+            )
+            .clicked()
+        {
             app.shared.settings.cpu_graph_mode = "overall".into();
             app.save_settings();
             ui.close();
         }
-        if ui.button(i18n::tr(K::CpuGraphLogical)).clicked() {
+        if ui
+            .selectable_label(
+                app.shared.settings.cpu_graph_mode == "logical",
+                i18n::tr(K::CpuGraphLogical),
+            )
+            .clicked()
+        {
             app.shared.settings.cpu_graph_mode = "logical".into();
             app.save_settings();
             ui.close();
@@ -1045,7 +1065,7 @@ fn memory_page(app: &mut TaskManApp, ui: &mut egui::Ui, pal: &Palette) {
         180.0,
         &[MultiSeries {
             samples: used,
-            color: pal.accent,
+            color: pal.memory_graph,
         }],
         total_gb.max(0.1),
         Some(&ts),
@@ -1067,7 +1087,7 @@ fn memory_page(app: &mut TaskManApp, ui: &mut egui::Ui, pal: &Palette) {
         120.0,
         &[MultiSeries {
             samples: commit,
-            color: pal.ok_green,
+            color: pal.memory_graph.gamma_multiply(0.62),
         }],
         commit_limit.max(0.1),
         Some(&ts),
@@ -1209,7 +1229,7 @@ fn disk_page(app: &mut TaskManApp, ui: &mut egui::Ui, pal: &Palette, entry: &Res
         160.0,
         &[MultiSeries {
             samples: active,
-            color: pal.accent,
+            color: pal.disk_graph,
         }],
         100.0,
         Some(&ts),
@@ -1235,11 +1255,11 @@ fn disk_page(app: &mut TaskManApp, ui: &mut egui::Ui, pal: &Palette, entry: &Res
         &[
             MultiSeries {
                 samples: read,
-                color: pal.accent,
+                color: pal.disk_graph,
             },
             MultiSeries {
                 samples: write,
-                color: pal.ok_green,
+                color: pal.disk_graph.gamma_multiply(0.62),
             },
         ],
         peak.max(1.0),
@@ -1326,42 +1346,35 @@ fn network_page(app: &mut TaskManApp, ui: &mut egui::Ui, pal: &Palette, entry: &
     let width = content_width(ui);
 
     let recv = net_series(win, &entry.key, 1);
-    let r_max = recv.iter().cloned().fold(0.0f64, f64::max).max(1.0);
-    caption(
-        ui,
-        pal,
-        i18n::tr(K::Receive60s),
-        &format!("{:.1}", r_max * 8.0 / 1024.0),
-    );
-    page_chart(
-        ui,
-        width,
-        150.0,
-        &[MultiSeries {
-            samples: recv,
-            color: pal.accent,
-        }],
-        r_max,
-        Some(&ts),
-    );
-
     let sent = net_series(win, &entry.key, 2);
-    let s_max = sent.iter().cloned().fold(0.0f64, f64::max).max(1.0);
+    let peak = recv
+        .iter()
+        .chain(sent.iter())
+        .copied()
+        .fold(0.0f64, f64::max)
+        .max(1.0);
+    let window = window_label(app.shared.settings.graph_seconds);
     caption(
         ui,
         pal,
-        i18n::tr(K::Send60s),
-        &format!("{:.1}", s_max * 8.0 / 1024.0),
+        &i18n::trf(K::ThroughputWindow, &[&window]),
+        &format::format_mbit(peak),
     );
     page_chart(
         ui,
         width,
-        150.0,
-        &[MultiSeries {
-            samples: sent,
-            color: pal.ok_green,
-        }],
-        s_max,
+        230.0,
+        &[
+            MultiSeries {
+                samples: recv,
+                color: pal.network_graph,
+            },
+            MultiSeries {
+                samples: sent,
+                color: pal.network_graph.gamma_multiply(0.62),
+            },
+        ],
+        peak,
         Some(&ts),
     );
 
@@ -1416,6 +1429,20 @@ fn network_page(app: &mut TaskManApp, ui: &mut egui::Ui, pal: &Palette, entry: &
                 if let Some(ssid) = &net.ssid {
                     kv_row(ui, pal, "SSID:", ssid);
                 }
+                if let Some(signal) = net.signal_quality_pct {
+                    kv_row(
+                        ui,
+                        pal,
+                        i18n::tr(K::KvSignal),
+                        &format!("{} %", signal.min(100)),
+                    );
+                }
+                if let Some(ipv4) = &net.ipv4 {
+                    kv_row(ui, pal, i18n::tr(K::KvIpv4), ipv4);
+                }
+                if let Some(ipv6) = &net.ipv6 {
+                    kv_row(ui, pal, i18n::tr(K::KvIpv6), ipv6);
+                }
             });
         },
     );
@@ -1457,7 +1484,7 @@ fn gpu_page(app: &mut TaskManApp, ui: &mut egui::Ui, pal: &Palette, entry: &Reso
         150.0,
         &[MultiSeries {
             samples: util,
-            color: pal.accent,
+            color: pal.gpu_graph,
         }],
         100.0,
         Some(&ts),
@@ -1482,7 +1509,7 @@ fn gpu_page(app: &mut TaskManApp, ui: &mut egui::Ui, pal: &Palette, entry: &Reso
         150.0,
         &[MultiSeries {
             samples: mem_gb,
-            color: pal.ok_green,
+            color: pal.gpu_graph.gamma_multiply(0.62),
         }],
         max_gb,
         Some(&ts),

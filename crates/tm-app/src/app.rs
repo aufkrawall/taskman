@@ -8,8 +8,9 @@
 //!   `Context::request_repaint`; there is no interval-based polling loop.
 //! * App history loads asynchronously; settings/history writes run on single
 //!   dedicated writer threads so no disk hiccup can hitch a frame.
-//! * Platform control actions (kill/priority/service/session/...) run on one
-//!   shared action-executor thread.
+//! * Short platform control actions (kill/priority/service/session/...) run
+//!   on one shared action-executor thread; long dump/module work gets lazy,
+//!   dedicated workers so it cannot block unrelated controls.
 
 use crate::action_executor::ActionExecutor;
 use crate::app_ui::apply_theme;
@@ -197,6 +198,8 @@ pub struct SharedState {
     pub startup_fetch: InFlight,
     pub sessions_fetch: InFlight,
     pub service_control: InFlight,
+    /// Guard for the dedicated, lazily spawned long-running dump worker.
+    pub dump_write: InFlight,
 }
 
 impl SharedState {
@@ -221,6 +224,14 @@ impl Drop for SharedState {
 /// Cross-tab navigation target: select exactly this process in Details.
 #[derive(Debug, Clone)]
 pub struct PendingDetailsFocus(pub ProcessIdentity);
+
+/// Destructive keyboard action parked behind an explicit confirmation.
+#[derive(Debug, Clone)]
+pub struct PendingProcessEnd {
+    pub identity: ProcessIdentity,
+    pub name: String,
+    pub tree: bool,
+}
 
 pub struct TaskManApp {
     pub engine: EngineHandle,
@@ -255,6 +266,8 @@ pub struct TaskManApp {
     pub selected_startup_id: Option<String>,
     /// Process-properties dialog target pid.
     pub proc_props: Option<u32>,
+    /// On-demand System Informer-style loaded-module inspector.
+    pub module_dialog: Option<crate::tabs::modules::State>,
     /// Cross-tab jump: services tab should select this service name.
     pub svc_jump: Arc<Mutex<Option<String>>>,
 
@@ -267,6 +280,10 @@ pub struct TaskManApp {
     /// One-shot type-ahead scroll target for the Performance card column.
     pub perf_jump_to: Option<String>,
     pub details_state: crate::tabs::details::State,
+    pub startup_sort: crate::widgets::tablekit::SortState,
+    pub services_sort: crate::widgets::tablekit::SortState,
+    pub users_sort: crate::widgets::tablekit::SortState,
+    pub app_history_sort: crate::widgets::tablekit::SortState,
     /// Selected process by EXACT identity (audit §7): the toolbar's End Task
     /// and Efficiency commands validate start-time identity against the live
     /// snapshot before dispatching, so a recycled PID is never targeted.
@@ -275,6 +292,8 @@ pub struct TaskManApp {
     /// Pending sign-out awaiting confirmation (session id + display name).
     /// Logoff is a high-blast-radius action and must never be one-click.
     pub pending_session_logoff: Option<(u32, String)>,
+    /// Delete-key termination awaits confirmation here.
+    pub pending_process_end: Option<PendingProcessEnd>,
     // Services tab.
     pub services_selected_name: Option<String>,
 
@@ -296,6 +315,9 @@ pub struct TaskManApp {
     pub fps_frames: u32,
     pub fps_ema_ms: f64,
     pub display_hz: Option<f32>,
+    /// App-history disk snapshots are intentionally less frequent than
+    /// telemetry samples; shutdown still performs a synchronous flush.
+    last_app_history_save: std::time::Instant,
 }
 
 impl TaskManApp {
@@ -423,6 +445,7 @@ impl TaskManApp {
                 startup_fetch: InFlight::default(),
                 sessions_fetch: InFlight::default(),
                 service_control: InFlight::default(),
+                dump_write: InFlight::default(),
             },
             history: Vec::with_capacity(history_cap + 8),
             history_cap,
@@ -437,15 +460,21 @@ impl TaskManApp {
             startup_props: None,
             selected_startup_id: None,
             proc_props: None,
+            module_dialog: None,
             svc_jump: Arc::new(Mutex::new(None)),
             search: String::new(),
             processes_state: crate::tabs::processes::State::new(),
             perf_selected_key,
             perf_jump_to: None,
             details_state,
+            startup_sort: crate::widgets::tablekit::SortState::new(0, true),
+            services_sort: crate::widgets::tablekit::SortState::new(0, true),
+            users_sort: crate::widgets::tablekit::SortState::new(0, true),
+            app_history_sort: crate::widgets::tablekit::SortState::new(1, false),
             selected_process: None,
             selected_user: None,
             pending_session_logoff: None,
+            pending_process_end: None,
             services_selected_name: None,
             pending_details_focus: None,
             scroll_to_pid: None,
@@ -457,6 +486,7 @@ impl TaskManApp {
             fps_frames: 0,
             fps_ema_ms: 0.0,
             display_hz,
+            last_app_history_save: std::time::Instant::now(),
         }
     }
 
@@ -582,6 +612,17 @@ impl TaskManApp {
             }
         }
     }
+
+    /// Shared shutdown path for both eframe trait signatures (the optional
+    /// Glow context changes the signature at compile time).
+    pub(crate) fn shutdown(&mut self) {
+        // Persist final settings (honors the autosave gate; the gate choice
+        // itself was already force-persisted when toggled).
+        self.save_settings();
+        self.shared.settings_writer.flush();
+        // Final synchronous flush so history is not lost at shutdown.
+        self.app_history_db.save();
+    }
 }
 
 /// Parse a `--tab=` value (accepts both English and German aliases).
@@ -618,8 +659,11 @@ impl eframe::App for TaskManApp {
             }
             tracing::debug!(cap = want_cap, "graph window changed; history resized");
         }
-        if self.poll_engine().is_some() {
+        if self.poll_engine().is_some()
+            && self.last_app_history_save.elapsed() >= std::time::Duration::from_secs(30)
+        {
             self.app_history_db.save_async();
+            self.last_app_history_save = std::time::Instant::now();
         }
 
         // Ship telemetry-demand changes (tab switches etc.).
@@ -678,11 +722,17 @@ impl eframe::App for TaskManApp {
         if self.pending_session_logoff.is_some() {
             crate::tabs::users::session_logoff_dialog(self, &ctx, &pal);
         }
+        if self.pending_process_end.is_some() {
+            crate::app_ui::process_end_dialog(self, &ctx);
+        }
         if self.startup_props.is_some() {
             crate::tabs::startup::properties_dialog(self, &ctx, &pal);
         }
         if self.proc_props.is_some() {
             crate::tabs::details::process_properties_dialog(self, &ctx);
+        }
+        if self.module_dialog.is_some() {
+            crate::tabs::modules::dialog(self, &ctx, &pal);
         }
         crate::app_ui::draw_toasts(self, &ctx);
 
@@ -695,6 +745,26 @@ impl eframe::App for TaskManApp {
         // sampling is paused (the engine forces exactly one sample).
         if ctx.input(|i| i.key_pressed(egui::Key::F5)) {
             self.refresh_all();
+        }
+
+        // Native shortcut: Delete on Processes/Details requests process
+        // termination. It is confirmation-only and never steals Delete from
+        // a text editor or from another modal operation.
+        let modal_open = self.show_settings
+            || self.run_dialog_open
+            || self.affinity_dialog.is_some()
+            || self.pending_session_logoff.is_some()
+            || self.pending_process_end.is_some()
+            || self.startup_props.is_some()
+            || self.proc_props.is_some()
+            || self.module_dialog.is_some()
+            || self.details_state.select_columns_open;
+        if !modal_open
+            && matches!(self.tab, Tab::Processes | Tab::Details)
+            && !ctx.egui_wants_keyboard_input()
+            && ctx.input(|i| i.key_pressed(egui::Key::Delete))
+        {
+            self.confirm_selected_process_end();
         }
 
         // Global search shortcut (audit §5): Alt+F as documented by native
@@ -733,13 +803,14 @@ impl eframe::App for TaskManApp {
         }
     }
 
+    #[cfg(feature = "glow")]
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
-        // Persist final settings (honors the autosave gate; the gate choice
-        // itself was already force-persisted when toggled).
-        self.save_settings();
-        self.shared.settings_writer.flush();
-        // Final synchronous flush so history is not lost at shutdown.
-        self.app_history_db.save();
+        self.shutdown();
+    }
+
+    #[cfg(not(feature = "glow"))]
+    fn on_exit(&mut self) {
+        self.shutdown();
     }
 }
 
@@ -780,7 +851,10 @@ impl TaskManApp {
         self.latest_snapshot()
             .as_ref()
             .and_then(|s| s.process(identity.pid))
-            .is_none_or(|p| p.start_epoch_s.is_none() || p.start_epoch_s == identity.start_epoch_s)
+            .is_some_and(|p| {
+                !p.synthetic
+                    && (p.start_epoch_s.is_none() || p.start_epoch_s == identity.start_epoch_s)
+            })
     }
 
     /// The active UI language.
@@ -844,27 +918,85 @@ impl TaskManApp {
         }
     }
 
-    /// End the selected process (toolbar "Task beenden") — on the executor.
-    ///
-    /// Uses the stored EXACT process identity and validates it against the
-    /// live snapshot before dispatching (audit §7): a PID recycled between
-    /// selection and command can never be killed by mistake.
-    pub fn end_selected(&mut self, ctx: &egui::Context) {
-        let Some(identity) = self.selected_process.take() else {
-            return;
-        };
+    /// End one exact process identity on the short-action executor.
+    pub fn end_process_identity(
+        &mut self,
+        ctx: &egui::Context,
+        identity: ProcessIdentity,
+        tree: bool,
+        name: String,
+    ) {
         if !self.identity_is_live(&identity) {
             self.shared.toast(i18n::tr(K::ProcessExited));
             return;
         }
         let pid = identity.pid;
-        let actions = self.actions.clone();
         let start = identity.start_epoch_s;
+        let actions = self.actions.clone();
         self.run_action(
             ctx,
-            move || i18n::trf(K::ProcessEndedToast, &[&pid.to_string()]),
-            move || actions.kill_process(pid, start, false),
+            move || {
+                if tree {
+                    i18n::trf(K::TreeOfEndedToast, &[&name])
+                } else {
+                    i18n::trf(K::NameEndedToast, &[&name])
+                }
+            },
+            move || actions.kill_process(pid, start, tree),
         );
+    }
+
+    /// Park the selected live process behind the Delete-key confirmation.
+    fn confirm_selected_process_end(&mut self) {
+        let Some(identity) = self.selected_process.clone() else {
+            return;
+        };
+        if !self.identity_is_live(&identity) {
+            self.selected_process = None;
+            self.shared.toast(i18n::tr(K::ProcessExited));
+            return;
+        }
+        let Some(name) = self
+            .latest_snapshot()
+            .as_ref()
+            .and_then(|snapshot| snapshot.process(identity.pid))
+            .filter(|process| !process.synthetic)
+            .map(|process| process.shown_name().to_string())
+        else {
+            self.selected_process = None;
+            self.shared.toast(i18n::tr(K::ProcessExited));
+            return;
+        };
+        self.pending_process_end = Some(PendingProcessEnd {
+            identity,
+            name,
+            tree: false,
+        });
+    }
+
+    /// End the selected process (toolbar "Task beenden") — on the executor.
+    /// Uses the stored exact identity; a vanished or recycled PID is refused.
+    pub fn end_selected(&mut self, ctx: &egui::Context) {
+        let Some(identity) = self.selected_process.clone() else {
+            return;
+        };
+        if !self.identity_is_live(&identity) {
+            self.selected_process = None;
+            self.shared.toast(i18n::tr(K::ProcessExited));
+            return;
+        }
+        let Some(name) = self
+            .latest_snapshot()
+            .as_ref()
+            .and_then(|snapshot| snapshot.process(identity.pid))
+            .filter(|process| !process.synthetic)
+            .map(|process| process.shown_name().to_string())
+        else {
+            self.selected_process = None;
+            self.shared.toast(i18n::tr(K::ProcessExited));
+            return;
+        };
+        self.end_process_identity(ctx, identity, false, name);
     }
 
     /// Frame-rate diagnostics (TASKMAN_FPS_PROBE=1): measures the interval

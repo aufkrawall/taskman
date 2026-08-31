@@ -99,6 +99,9 @@ pub fn snapshot(seed: u32) -> Snapshot {
             total_sent_bytes: 13_000_000_000,
             link_bps: 1_000_000_000,
             ssid: None,
+            ipv4: Some("192.0.2.10".into()),
+            ipv6: Some("2001:db8::10".into()),
+            signal_quality_pct: None,
         }],
         gpus: vec![GpuInfo {
             shared_used_bytes: 0,

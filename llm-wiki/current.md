@@ -1,16 +1,53 @@
 # Current State
 
-Last cross-checked: 2026-08-28
+Last cross-checked: 2026-08-31
 
 ## Summary
 
 Windows Task Manager-style desktop app (Rust, eframe/egui), three-crate
 workspace. The large audit/implementation plan in `implement.md` has been
 implemented to the extent verifiable without interactive Windows sessions.
-The 2026 parity audit (`audit.md`) re-baselined remaining work into six
-phases; **Phase 1 (correctness) is complete** — see
-`log/recent.md` and `known-debt.md` for what changed and which deviations
-are accepted (Phases 2-6 open).
+The 2026 parity audit (`audit.md`) is now substantially implemented across
+correctness, table interaction, Performance visuals, and advanced process
+diagnostics; remaining telemetry and accessibility work is itemized precisely
+in `known-debt.md`.
+
+## Recently landed (2026-08-31)
+
+- Processes now offers two persisted presentations: native-style grouped
+  ownership and a System Informer-style literal PPID tree. The raw tree keeps
+  ancestors during search, sorts siblings without destroying hierarchy,
+  supports expand/collapse commands and tree-aware keyboard navigation, and
+  never exposes actions on synthetic CPU-attribution rows.
+- Processes and Details gained arrow/Home/End/Page navigation; Delete requests
+  process termination through an explicit dialog. Context menus now include
+  consistent copy/search/location/properties/dump/module actions as applicable.
+- The on-demand Modules inspector enumerates DLL name/path/base/size outside the
+  hot sampling path. Unload is an explicitly dangerous, double-confirmed action
+  restricted to same-architecture third-party DLLs; process creation time and
+  exact module base/path are revalidated immediately before the remote
+  `FreeLibrary` request. The image and Windows modules are fail-closed.
+- Details adds typed optional columns for description, publisher, parent PID,
+  session ID, image path, page faults/sec, and I/O read/write totals. Startup,
+  App History, Users, and Services headers now sort; tables draw quiet body
+  column guides, and settings can reset persisted widths.
+- Performance uses lighter chart treatment and resource-specific colors. CPU
+  graph controls live in graph context menus, logical CPU tiles adapt to core
+  count and width, and Network combines receive/send while showing cached
+  native IPv4, IPv6, SSID, signal, link speed, and adapter description.
+- Windows WGPU is explicitly D3D12-only, with FIFO/one-frame surface latency
+  and low-power adapter preference; Vulkan is not compiled into the Windows
+  WGPU backend. Linux remains Vulkan, macOS Metal, and Glow remains a fallback.
+  This removes unused WGPU backend dependencies without sacrificing the
+  compatibility escape hatch. App-history persistence is coalesced to every
+  30 seconds plus clean shutdown instead of writing after every sample.
+- Registry startup entries now resolve publisher metadata on their background
+  fetch. App History labels unsupported per-process network as unavailable
+  (`—`) and states clearly that its database is local rather than Windows SRUM.
+- Verification was headless by request: the full format/clippy/test gate and
+  all 148 tests passed, followed by the host release build; no TaskMan GUI,
+  capture helper, or module-unload action was launched. `taskman.exe` is
+  13,470,208 bytes, down 1,185,792 bytes (8.09%) from the pre-pass binary.
 
 ## Recently landed (2026-08-28)
 

@@ -102,6 +102,7 @@ pub struct State {
     scroll_to_pid: Option<u32>,
     cache: Option<Cache>,
     view_generation: u64,
+    raw_tree_initialized: bool,
 }
 
 impl State {
@@ -133,10 +134,23 @@ impl State {
             self.invalidate();
         }
     }
+
+    /// A literal process tree is useful only when its ancestry is visible.
+    /// Expand every known parent on first entry; subsequent user collapse
+    /// choices remain untouched for the rest of the session.
+    fn ensure_raw_tree_initialized(&mut self, snap: &Snapshot) {
+        if self.raw_tree_initialized {
+            return;
+        }
+        let parents: HashSet<u32> = snap.processes.iter().filter_map(|p| p.ppid).collect();
+        self.expanded.extend(parents);
+        self.raw_tree_initialized = true;
+        self.invalidate();
+    }
 }
 
 struct Cache {
-    key: (u64, u64, String, usize, bool),
+    key: (u64, u64, String, usize, bool, bool),
     rows: Vec<DisplayRow>,
 }
 
@@ -179,6 +193,9 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
     };
 
     let caps = app.actions.capabilities();
+    if app.shared.settings.process_tree_view {
+        app.processes_state.ensure_raw_tree_initialized(&snap);
+    }
 
     crate::app_ui::tab_header(
         app,
@@ -207,6 +224,26 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
             }
         },
         |app, ui| {
+            ui.menu_button(i18n::tr(K::ViewMode), |ui| {
+                for (tree, key) in [(false, K::GroupedView), (true, K::ProcessTreeView)] {
+                    if ui
+                        .selectable_label(
+                            app.shared.settings.process_tree_view == tree,
+                            i18n::tr(key),
+                        )
+                        .clicked()
+                    {
+                        app.shared.settings.process_tree_view = tree;
+                        if tree && let Some(snap) = app.latest_snapshot() {
+                            app.processes_state.ensure_raw_tree_initialized(&snap);
+                        }
+                        app.processes_state.invalidate();
+                        app.save_settings();
+                        ui.close();
+                    }
+                }
+            });
+            ui.separator();
             if ui.button(i18n::tr(K::ExpandAll)).clicked() {
                 if let Some(snap) = app.latest_snapshot() {
                     for p in &snap.processes {
@@ -234,6 +271,7 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
         app.search.clone(),
         app.processes_state.sort_col,
         app.processes_state.ascending,
+        app.shared.settings.process_tree_view,
     );
     let mut cache = app.processes_state.cache.take();
     let cache_stale = cache.as_ref().is_none_or(|c| c.key != key);
@@ -242,7 +280,11 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
         let groups = app.processes_state.group_collapsed;
         cache = Some(Cache {
             key: key.clone(),
-            rows: build_display_rows(&snap, &key.2, key.3, key.4, &expanded, &groups),
+            rows: if key.5 {
+                build_process_tree_rows(&snap, &key.2, key.3, key.4, &expanded)
+            } else {
+                build_display_rows(&snap, &key.2, key.3, key.4, &expanded, &groups)
+            },
         });
     }
     let rows = cache.as_ref().expect("cache").rows.clone();
@@ -254,8 +296,9 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
         let selected = app.selected_process.as_ref().map(|p| p.pid);
         if let Some(pid) = search::cycle_match(
             rows.iter().filter_map(|row| match row {
-                DisplayRow::Process(row) => Some((row.pid, row.name.as_str())),
+                DisplayRow::Process(row) if !row.synthetic => Some((row.pid, row.name.as_str())),
                 DisplayRow::GroupHeader(..) => None,
+                DisplayRow::Process(_) => None,
             }),
             selected,
             initial,
@@ -270,6 +313,8 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
             app.processes_state.scroll_to_pid = Some(row.pid);
         }
     }
+
+    handle_keyboard_navigation(app, ui.ctx(), &rows);
 
     let agg = Aggregates::from_snapshot(&snap);
     let aggs = agg.strings();
@@ -319,6 +364,88 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
     }
     app.persist_table(&table);
     app.processes_state.cache = cache;
+}
+
+/// Arrow/Home/End/Page navigation for the virtualized process model, plus
+/// tree-aware Left/Right behavior. Selection is always an exact identity;
+/// synthetic accounting rows are deliberately skipped.
+fn handle_keyboard_navigation(app: &mut TaskManApp, ctx: &egui::Context, rows: &[DisplayRow]) {
+    let process_rows: Vec<(usize, &RowData)> = rows
+        .iter()
+        .enumerate()
+        .filter_map(|(display_idx, row)| match row {
+            DisplayRow::Process(row) if !row.synthetic => Some((display_idx, row)),
+            _ => None,
+        })
+        .collect();
+    let selected_pid = app.selected_process.as_ref().map(|p| p.pid);
+    let selected_pos =
+        selected_pid.and_then(|pid| process_rows.iter().position(|(_, row)| row.pid == pid));
+    let page_rows = (ctx.content_rect().height() / tablekit::ROW_H)
+        .floor()
+        .max(1.0) as usize;
+    if let Some(nav) = search::list_nav(ctx)
+        && let Some(next) = search::moved_index(process_rows.len(), selected_pos, nav, page_rows)
+        && let Some((_, row)) = process_rows.get(next)
+    {
+        select_row(app, row);
+    }
+
+    if ctx.egui_wants_keyboard_input() {
+        return;
+    }
+    let (left, right) = ctx.input(|i| {
+        (
+            i.key_pressed(egui::Key::ArrowLeft),
+            i.key_pressed(egui::Key::ArrowRight),
+        )
+    });
+    let Some(pid) = app.selected_process.as_ref().map(|p| p.pid) else {
+        return;
+    };
+    let Some(display_idx) = rows
+        .iter()
+        .position(|row| matches!(row, DisplayRow::Process(p) if p.pid == pid))
+    else {
+        return;
+    };
+    let DisplayRow::Process(current) = &rows[display_idx] else {
+        return;
+    };
+
+    if right && current.children {
+        if !app.processes_state.expanded.contains(&pid) {
+            app.processes_state.toggle_expanded(pid);
+        } else if let Some(DisplayRow::Process(child)) = rows.get(display_idx + 1)
+            && child.depth > current.depth
+            && !child.synthetic
+        {
+            select_row(app, child);
+        }
+    } else if left {
+        if current.children && app.processes_state.expanded.contains(&pid) {
+            app.processes_state.toggle_expanded(pid);
+        } else if current.depth > 0
+            && let Some(parent) = rows[..display_idx].iter().rev().find_map(|row| match row {
+                DisplayRow::Process(parent)
+                    if !parent.synthetic && parent.depth < current.depth =>
+                {
+                    Some(parent)
+                }
+                _ => None,
+            })
+        {
+            select_row(app, parent);
+        }
+    }
+}
+
+fn select_row(app: &mut TaskManApp, row: &RowData) {
+    app.selected_process = Some(crate::app::ProcessIdentity {
+        pid: row.pid,
+        start_epoch_s: row.start_epoch_s,
+    });
+    app.processes_state.scroll_to_pid = Some(row.pid);
 }
 
 /// Intrinsic widths come from the complete flattened display model, never
@@ -497,10 +624,14 @@ fn row_ui(
     table.heat_cells(ui, pal, rect, 2, &cells, cells_active);
 
     if resp.clicked() {
-        app.selected_process = Some(crate::app::ProcessIdentity {
-            pid: row.pid,
-            start_epoch_s: row.start_epoch_s,
-        });
+        if row.synthetic {
+            app.selected_process = None;
+        } else {
+            app.selected_process = Some(crate::app::ProcessIdentity {
+                pid: row.pid,
+                start_epoch_s: row.start_epoch_s,
+            });
+        }
     }
     // on_hover_text/context_menu consume the response (builder style).
     let resp = match &row.tooltip {
@@ -516,6 +647,21 @@ fn row_ui(
 fn context_menu(app: &mut TaskManApp, ui: &mut egui::Ui, row: &RowData) {
     let ctx = ui.ctx().clone();
     ui.set_min_width(210.0);
+    if row.children {
+        let expanded = app.processes_state.expanded.contains(&row.pid);
+        if ui
+            .button(if expanded {
+                i18n::tr(K::Collapse)
+            } else {
+                i18n::tr(K::Expand)
+            })
+            .clicked()
+        {
+            app.processes_state.toggle_expanded(row.pid);
+            ui.close();
+        }
+        ui.separator();
+    }
     if ui.button(i18n::tr(K::EndTask)).clicked() {
         let identity = crate::app::ProcessIdentity {
             pid: row.pid,
@@ -558,6 +704,11 @@ fn context_menu(app: &mut TaskManApp, ui: &mut egui::Ui, row: &RowData) {
         ui.close();
     }
     ui.separator();
+    if ui.button(i18n::tr(K::CopyName)).clicked() {
+        ui.ctx().copy_text(row.name.clone());
+        app.shared.toast(i18n::tr(K::Copied));
+        ui.close();
+    }
     if ui.button(i18n::tr(K::OpenFileLocation)).clicked() {
         match row.icon_path.as_deref() {
             Some(path) => {
@@ -566,6 +717,41 @@ fn context_menu(app: &mut TaskManApp, ui: &mut egui::Ui, row: &RowData) {
                 app.run_action(&ctx, String::new, move || actions.open_file_location(&path));
             }
             None => app.shared.toast(i18n::tr(K::NoFileForProcess)),
+        }
+        ui.close();
+    }
+    #[cfg(target_os = "windows")]
+    if ui.button(i18n::tr(K::CreateDumpFile)).clicked() {
+        let process = app
+            .latest_snapshot()
+            .as_ref()
+            .and_then(|snapshot| snapshot.process(row.pid))
+            .cloned();
+        if let Some(process) = process {
+            crate::tabs::details::create_dump(app, &ctx, &process);
+        } else {
+            app.shared.toast(i18n::tr(K::ProcessExited));
+        }
+        ui.close();
+    }
+    if app.actions.capabilities().process_modules && ui.button(i18n::tr(K::ViewModules)).clicked() {
+        let process = app
+            .latest_snapshot()
+            .as_ref()
+            .and_then(|snapshot| snapshot.process(row.pid))
+            .cloned();
+        if let Some(process) = process {
+            crate::tabs::modules::open(app, &process, &ctx);
+        } else {
+            app.shared.toast(i18n::tr(K::ProcessExited));
+        }
+        ui.close();
+    }
+    if ui.button(i18n::tr(K::OnlineSearch)).clicked() {
+        let url = search::online_search_url(&row.name);
+        if let Err(error) = app.actions.open_url(&url) {
+            app.shared
+                .toast(i18n::trf(K::ErrMsg, &[&error.to_string()]));
         }
         ui.close();
     }
@@ -582,26 +768,7 @@ fn end_process_checked(
     tree: bool,
     name: &str,
 ) {
-    let live_ok = app.identity_is_live(identity);
-    if !live_ok {
-        app.shared.toast(i18n::tr(K::ProcessExited));
-        return;
-    }
-    let pid = identity.pid;
-    let actions = app.actions.clone();
-    let msg_name = name.to_string();
-    let start = identity.start_epoch_s;
-    app.run_action(
-        ctx,
-        move || {
-            if tree {
-                i18n::trf(K::TreeOfEndedToast, &[&msg_name])
-            } else {
-                i18n::trf(K::NameEndedToast, &[&msg_name])
-            }
-        },
-        move || actions.kill_process(pid, start, tree),
-    );
+    app.end_process_identity(ctx, identity.clone(), tree, name.to_string());
 }
 
 /// Task Manager's Processes page is not a literal PPID tree. In particular,
@@ -737,6 +904,98 @@ fn build_display_rows(
     }
     if sort_col >= 2 {
         sort_blocks_globally(&mut out, sort_col, ascending);
+    }
+    normalize_heat(&mut out);
+    out
+}
+
+/// System Informer-style literal parent/child view. Unlike the native
+/// Processes presentation this never invents application ownership groups:
+/// every row is one OS process with its own resource values. Filtering keeps
+/// matched rows plus their ancestor chain so hierarchy remains intelligible.
+fn build_process_tree_rows(
+    snap: &Snapshot,
+    raw_search: &str,
+    sort_col: usize,
+    ascending: bool,
+    expanded: &HashSet<u32>,
+) -> Vec<DisplayRow> {
+    let q = search::Query::new(raw_search);
+    let all: Vec<&ProcessEntry> = snap.processes.iter().collect();
+    let by_pid: HashMap<u32, &ProcessEntry> = all.iter().map(|p| (p.pid, *p)).collect();
+    let mut visible: HashSet<u32> = if q.is_empty() {
+        all.iter().map(|p| p.pid).collect()
+    } else {
+        all.iter()
+            .copied()
+            .filter(|p| q.matches_process(p))
+            .map(|p| p.pid)
+            .collect()
+    };
+
+    if !q.is_empty() {
+        let matched: Vec<u32> = visible.iter().copied().collect();
+        for pid in matched {
+            let mut cursor = pid;
+            let mut seen = HashSet::new();
+            while seen.insert(cursor) {
+                let Some(parent) = by_pid
+                    .get(&cursor)
+                    .and_then(|process| process.ppid)
+                    .and_then(|ppid| by_pid.get(&ppid).copied())
+                else {
+                    break;
+                };
+                visible.insert(parent.pid);
+                cursor = parent.pid;
+            }
+        }
+    }
+
+    let members: Vec<&ProcessEntry> = all
+        .iter()
+        .copied()
+        .filter(|p| visible.contains(&p.pid))
+        .collect();
+    let mut children: HashMap<u32, Vec<&ProcessEntry>> = HashMap::new();
+    for process in &members {
+        if let Some(ppid) = process.ppid
+            && ppid != process.pid
+            && visible.contains(&ppid)
+        {
+            children.entry(ppid).or_default().push(*process);
+        }
+    }
+    let roots = tree_roots(&members, &children);
+    let own: HashMap<u32, [f64; 4]> = members
+        .iter()
+        .map(|process| (process.pid, own_values(process)))
+        .collect();
+    let mut sorted_roots = roots;
+    sort_entries(&mut sorted_roots, sort_col, ascending, &own);
+
+    let mut out = Vec::with_capacity(members.len());
+    let mut stack: Vec<(&ProcessEntry, usize)> = sorted_roots
+        .into_iter()
+        .rev()
+        .map(|root| (root, 0))
+        .collect();
+    let mut visited = HashSet::with_capacity(members.len());
+    while let Some((process, depth)) = stack.pop() {
+        if !visited.insert(process.pid) {
+            continue;
+        }
+        let mut kids = children.get(&process.pid).cloned().unwrap_or_default();
+        sort_entries(&mut kids, sort_col, ascending, &own);
+        let has_children = !kids.is_empty();
+        let mut row = make_own_row(process, depth);
+        if let DisplayRow::Process(data) = &mut row {
+            data.children = has_children;
+        }
+        out.push(row);
+        if has_children && (expanded.contains(&process.pid) || !q.is_empty()) {
+            stack.extend(kids.into_iter().rev().map(|kid| (kid, depth + 1)));
+        }
     }
     normalize_heat(&mut out);
     out
@@ -1522,6 +1781,53 @@ mod tests {
             processes: ps,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn literal_process_tree_preserves_ppid_depth_and_own_values() {
+        let mut root = proc(10, None, "root.exe", ProcCategory::Background);
+        root.cpu_pct = 2.0;
+        let mut child = proc(11, Some(10), "child.exe", ProcCategory::App);
+        child.cpu_pct = 80.0;
+        let leaf = proc(12, Some(11), "leaf.exe", ProcCategory::System);
+        let snap = snap_of(vec![root, child, leaf]);
+        let rows = build_process_tree_rows(&snap, "", 0, true, &HashSet::from([10, 11]));
+        let data: Vec<&RowData> = rows
+            .iter()
+            .filter_map(|row| match row {
+                DisplayRow::Process(row) => Some(row),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            data.iter().map(|row| row.pid).collect::<Vec<_>>(),
+            [10, 11, 12]
+        );
+        assert_eq!(
+            data.iter().map(|row| row.depth).collect::<Vec<_>>(),
+            [0, 1, 2]
+        );
+        assert_eq!(data[0].values[0], 2.0, "parent is not subtree-aggregated");
+        assert_eq!(data[1].values[0], 80.0);
+    }
+
+    #[test]
+    fn literal_tree_filter_keeps_ancestor_context() {
+        let snap = snap_of(vec![
+            proc(10, None, "root.exe", ProcCategory::Background),
+            proc(11, Some(10), "child.exe", ProcCategory::App),
+            proc(12, Some(11), "needle.exe", ProcCategory::System),
+            proc(20, None, "unrelated.exe", ProcCategory::Background),
+        ]);
+        let rows = build_process_tree_rows(&snap, "needle", 0, true, &HashSet::new());
+        let pids: Vec<u32> = rows
+            .iter()
+            .filter_map(|row| match row {
+                DisplayRow::Process(row) => Some(row.pid),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(pids, [10, 11, 12]);
     }
 
     #[test]

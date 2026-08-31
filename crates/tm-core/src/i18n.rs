@@ -138,11 +138,34 @@ keys! {
     EfficiencyModeOff => ["Effizienzmodus aus", "Turn off efficiency mode"],
     GoToDetails => ["Gehe zu Details", "Go to details"],
     GoToServices => ["Gehe zu Dienst(en)", "Go to service(s)"],
+    Expand => ["Erweitern", "Expand"],
+    Collapse => ["Reduzieren", "Collapse"],
     ExpandAll => ["Alle erweitern", "Expand all"],
     CollapseAll => ["Alle reduzieren", "Collapse all"],
+    ViewMode => ["Ansicht", "View"],
+    GroupedView => ["Nach Typ gruppiert", "Grouped by type"],
+    ProcessTreeView => ["Prozessstruktur", "Process tree"],
     RefreshNow => ["Jetzt aktualisieren (F5)", "Refresh now (F5)"],
     OpenFileLocation => ["Dateispeicherort öffnen", "Open file location"],
     CreateDumpFile => ["Speicherabbild erstellen", "Create dump file"],
+    Modules => ["Module", "Modules"],
+    ViewModules => ["Module anzeigen", "View modules"],
+    UnloadModule => ["Modul entladen", "Unload module"],
+    UnloadModuleConfirm => [
+        "\"{}\" wirklich aus \"{}\" entladen?",
+        "Unload \"{}\" from \"{}\"?"
+    ],
+    UnloadModuleWarning => [
+        "Das erzwungene Entladen kann den Zielprozess sofort abstürzen lassen oder beschädigen. Nur zu Diagnosezwecken verwenden.",
+        "Forced unloading can immediately crash or corrupt the target process. Use only for diagnostics."
+    ],
+    ModuleUnloadedMsg => ["Modul entladen: {}", "Module unloaded: {}"],
+    ModuleBusy => ["Eine Modulaktion läuft bereits", "A module action is already running"],
+    ModuleProtected => [
+        "Programmabbilder und Windows-Systemmodule werden nicht entladen",
+        "Program images and Windows system modules cannot be unloaded"
+    ],
+    CopyPath => ["Pfad kopieren", "Copy path"],
     Properties => ["Eigenschaften", "Properties"],
     OnlineSearch => ["Online suchen", "Search online"],
     CopyName => ["Namen kopieren", "Copy name"],
@@ -154,6 +177,10 @@ keys! {
         "\"{}\" wird abgemeldet. Nicht gespeicherte Daten gehen verloren.",
         "\"{}\" will be signed out. Unsaved data will be lost."]
     ,
+    EndProcessConfirm => [
+        "\"{}\" (PID {}) wirklich beenden? Nicht gespeicherte Daten dieses Prozesses gehen verloren.",
+        "End \"{}\" (PID {})? Unsaved data in this process will be lost."
+    ],
     ManageUserAccounts => ["Benutzerkonten verwalten", "Manage user accounts"],
     EnableCmd => ["Aktivieren", "Enable"],
     DisableCmd => ["Deaktivieren", "Disable"],
@@ -179,6 +206,15 @@ keys! {
     ColCpuTime => ["CPU-Zeit", "CPU time"],
     ColNotifications => ["Benachrichtigungen", "Notifications"],
     ColDescription => ["Beschreibung", "Description"],
+    ColParentPid => ["Übergeordnete PID", "Parent PID"],
+    ColSessionId => ["Sitzungs-ID", "Session ID"],
+    ColImagePath => ["Abbildpfadname", "Image path name"],
+    ColPageFaults => ["Seitenfehler/s", "Page faults/sec"],
+    ColIoRead => ["E/A-Lesebytes", "I/O read bytes"],
+    ColIoWrite => ["E/A-Schreibbytes", "I/O write bytes"],
+    ColBaseAddress => ["Basisadresse", "Base address"],
+    ColSize => ["Größe", "Size"],
+    ColPath => ["Pfad", "Path"],
     ColGroup => ["Gruppe", "Group"],
     GroupApps => ["Apps", "Apps"],
     GroupBackground => ["Hintergrundprozesse", "Background processes"],
@@ -246,6 +282,7 @@ keys! {
     SpdPaused => ["Angehalten", "Paused"],
     GraphWindowLabel => ["Diagrammfenster:", "Graph window:"],
     DefaultStartPageLabel => ["Startseite:", "Default start page:"],
+    ProcessViewLabel => ["Prozessansicht:", "Process view:"],
     CpuGraphOverall => ["Gesamtauslastung", "Overall utilization"],
     CpuGraphLogical => ["Logische Prozessoren", "Logical processors"],
     ShowKernelTimes => ["Kernelzeiten anzeigen", "Show kernel times"],
@@ -310,6 +347,10 @@ keys! {
     HistoryForAccounts => ["für aktuelle Benutzer- und Systemkonten.", "for the current user and system accounts."],
     ClearHistoryLink => ["Auslastungsverlauf löschen", "Delete usage history"],
     HistoryCleared => ["Auslastungsverlauf gelöscht", "Usage history deleted"],
+    HistoryLocalNote => [
+        "Lokaler Verlauf, der nur während der Ausführung von Taskman erfasst wird; der Windows-SRUM-Verlauf wird nicht importiert.",
+        "Local history collected only while Taskman is running; Windows SRUM history is not imported."
+    ],
 
     // ------------------------------------------------ performance tab
     Utilization60sPct => ["Auslastung in 60 Sekunden (%)", "Utilization for 60 seconds (%)"],
@@ -361,6 +402,10 @@ keys! {
     KvTotalReceived => ["Insgesamt empfangen:", "Total received:"],
     KvTotalSent => ["Insgesamt gesendet:", "Total sent:"],
     KvLinkSpeed => ["Verbindungsgeschwindigkeit:", "Connection speed:"],
+    KvIpv4 => ["IPv4-Adresse:", "IPv4 address:"],
+    KvIpv6 => ["IPv6-Adresse:", "IPv6 address:"],
+    KvSignal => ["Signalstärke:", "Signal strength:"],
+    ThroughputWindow => ["Durchsatz, {}", "Throughput, {}"],
     CardSentRecv => ["Ges.: {}  Empf.: {}", "S: {}  R: {}"],
     GpuTitle => ["GPU", "GPU"],
     GpuMemStat => ["GPU-Speicher", "GPU memory"],
@@ -376,6 +421,7 @@ keys! {
     StartedMsg => ["Gestartet: {}", "Started: {}"],
     ErrMsg => ["Fehler: {}", "Error: {}"],
     DumpWrittenMsg => ["Speicherabbild gespeichert: {}", "Dump written: {}"],
+    DumpAlreadyRunning => ["Ein Speicherabbild wird bereits erstellt", "A dump is already being created"],
     NoServiceForPid => ["Kein Dienst mit PID {} gefunden", "No service with PID {} found"],
     NoFileForProcess => ["Kein Dateipfad verfügbar", "No file path available"],
     ProcessExited => ["(Prozess wurde beendet)", "(process has exited)"],

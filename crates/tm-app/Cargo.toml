@@ -11,7 +11,7 @@ path = "src/main.rs"
 
 [features]
 default = ["wgpu", "glow"]
-wgpu = ["eframe/wgpu"]
+wgpu = ["eframe/wgpu_no_default_features", "dep:wgpu"]
 glow = ["eframe/glow"]
 
 [dependencies]
@@ -32,3 +32,10 @@ renderer = "wgpu primary, glow fallback; wayland+x11 enabled for native Linux"
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.62", features = ["Win32_System_Console"] }
+wgpu = { version = "30", default-features = false, features = ["dx12"], optional = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+wgpu = { version = "30", default-features = false, features = ["vulkan"], optional = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+wgpu = { version = "30", default-features = false, features = ["metal"], optional = true }

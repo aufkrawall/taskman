@@ -7,7 +7,46 @@ The repository has been audited against:
 - The actual Rust implementation, rather than assuming `implement.md` accurately describes the current state.
 - Current Microsoft Task Manager documentation through 2026.
 
-This is an **interim implementation report**. Static/source and screenshot auditing has been performed, but the project could not be compiled or executed in the available environment because the Rust `cargo` toolchain is not installed. Therefore runtime-only defects, Windows API failures, memory leaks, GPU-driver-specific behavior, and frame-time measurements have not been independently verified.
+## Implementation update — 2026-08-31
+
+The initial report below was a static audit. The toolchain is now available
+and its highest-value recommendations have been implemented and verified with
+headless compilation/tests. Interactive GUI capture was intentionally skipped
+for this pass so no windows would interrupt the active desktop session.
+
+Implemented since the audit:
+
+- A selectable, persisted literal PPID process tree alongside the native
+  grouped Processes view; hierarchy-aware filtering, expansion commands,
+  arrow/Home/End/Page navigation, and a confirmation-gated Delete shortcut.
+- Broader process context menus, PID-reuse-safe dumps, and an on-demand loaded
+  Modules inspector. Module unloading is background-only, double-confirmed,
+  same-architecture, exact-process/exact-module revalidated, and blocked for
+  the image and Windows system modules.
+- Additional typed Details columns (description, publisher, parent PID,
+  session, image path, page faults, and I/O totals), sortable secondary tabs,
+  body column guides, shared online-search encoding, and resettable widths.
+- Performance visual cleanup: lighter charts, resource-specific colors,
+  context-menu CPU graph controls, responsive logical-CPU grids, a combined
+  network throughput graph, and cached IPv4/IPv6/Wi-Fi signal metadata.
+- Windows WGPU now compiles and requests D3D12 only (Vulkan is no longer part
+  of the Windows WGPU backend set), prefers the low-power adapter for this 2D
+  UI, keeps FIFO/one-frame latency, and retains Glow as a compatibility
+  fallback. App-history writes are coalesced to 30 seconds plus shutdown.
+
+Still intentionally open: ETW per-process network, native SRUM App History,
+measured Startup Impact and packaged startup tasks, memory-composition and
+full GPU-engine histories, CPU Utility, live kernel dumps/wait-chain analysis,
+processor-group affinity, full accessibility/high-contrast work, and the 2026
+NPU/NPU Engine/NPU memory/Isolation columns. Microsoft documents the latter as
+optional current Windows columns; they need new capability-gated telemetry,
+not fabricated zero values.
+
+Validation for this update: the full headless gate passed (format, clippy with
+warnings denied, and 148 tests across `tm-core`, `tm-platform`, `tm-app`, and
+Windows integration), followed by the host release build. The shipped EXE is
+13,470,208 bytes, 1,185,792 bytes (8.09%) smaller than the 14,656,000-byte
+pre-pass baseline despite the added diagnostics.
 
 ---
 

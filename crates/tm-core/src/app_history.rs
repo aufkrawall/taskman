@@ -28,6 +28,10 @@ use std::sync::mpsc::{Receiver, Sender};
 pub struct AppUsage {
     pub cpu_seconds: f64,
     pub network_bytes: u64,
+    /// At least one real per-process network counter was observed for this
+    /// application. False means unavailable, not a measured zero.
+    #[serde(default)]
+    pub network_available: bool,
 }
 
 /// Stable app identity: package-style id or normalized executable path;
@@ -247,7 +251,12 @@ impl AppHistoryDb {
 
     fn apply_loaded_file(&mut self, text: &str, path: &std::path::Path) {
         match serde_json::from_str::<DbFile>(text) {
-            Ok(dbf) => {
+            Ok(mut dbf) => {
+                // Files written before `network_available` existed can still
+                // prove availability when they contain non-zero traffic.
+                for usage in dbf.entries.values_mut() {
+                    usage.network_available |= usage.network_bytes > 0;
+                }
                 self.since_epoch_s = dbf.since_epoch_s;
                 self.entries = dbf.entries;
                 self.names = dbf.names;
@@ -409,6 +418,8 @@ impl AppHistoryDb {
                 (Some(r), Some(s)) => Some(r + s),
                 _ => None,
             };
+            let network_available =
+                net_total.is_some() || p.net_recv_bps.is_some() || p.net_sent_bps.is_some();
 
             let key = entry_key(p);
             let prev = self.prev.get(&p.pid);
@@ -442,8 +453,12 @@ impl AppHistoryDb {
                     * interval_s.max(0.0)) as u64
             };
 
-            if d_cpu > 1e-6 || d_net > 0 || !self.entries.contains_key(&key) {
-                let e = self.entries.entry(key.clone()).or_default();
+            let e = self.entries.entry(key.clone()).or_default();
+            // Availability is state, not a delta. Record it even on a quiet
+            // tick so a measured zero can never be mistaken for unsupported
+            // telemetry in the App history table.
+            e.network_available |= network_available;
+            if d_cpu > 1e-6 || d_net > 0 {
                 e.cpu_seconds += d_cpu;
                 e.network_bytes += d_net;
             }
@@ -506,6 +521,7 @@ mod tests {
         let e = db.entries().get("app.exe").unwrap();
         assert!((e.cpu_seconds - 2.5).abs() < 1e-6);
         assert_eq!(e.network_bytes, 500);
+        assert!(e.network_available);
         assert!(db.entries().get("svc.exe").is_none());
     }
 
@@ -520,6 +536,28 @@ mod tests {
         let e = db.entries().get("app.exe").unwrap();
         assert_eq!(e.cpu_seconds, 0.0);
         assert_eq!(e.network_bytes, 0);
+        assert!(e.network_available, "a real measured zero stays available");
+    }
+
+    #[test]
+    fn missing_network_remains_unavailable_until_a_real_counter_appears() {
+        let mut p = ProcessEntry::new(4, "app.exe");
+        p.category = ProcCategory::App;
+        p.cpu_time_s = Some(0.0);
+        let mut db = AppHistoryDb::in_memory();
+        let mut snap = Snapshot {
+            timestamp_ms: 1000,
+            processes: vec![p],
+            ..Default::default()
+        };
+        db.observe(&snap, 1.0);
+        assert!(!db.entries()["app.exe"].network_available);
+
+        snap.processes[0].net_recv_bps = Some(0.0);
+        snap.timestamp_ms += 1000;
+        db.observe(&snap, 1.0);
+        assert!(db.entries()["app.exe"].network_available);
+        assert_eq!(db.entries()["app.exe"].network_bytes, 0);
     }
 
     /// A recycled PID whose new counters are HIGHER than the old process'
@@ -584,6 +622,7 @@ mod tests {
         let e = db2.entries().get("app.exe").unwrap();
         assert!((e.cpu_seconds - 3.0).abs() < 1e-6);
         assert_eq!(e.network_bytes, 2048);
+        assert!(e.network_available);
         assert!(db2.since_epoch_s() > 0);
     }
 

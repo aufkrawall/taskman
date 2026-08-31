@@ -7,6 +7,7 @@
 //! same-named accounts on different domains.
 
 use eframe::egui;
+use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 use tm_core::format;
@@ -237,24 +238,41 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
 
     let q = search::Query::new(&app.search);
     let mut rows: Vec<URow> = Vec::new();
-    for (i, s) in sessions.iter().enumerate() {
-        let display = display_name(s, &snap.system.hostname);
+    let mut visible_sessions = sessions
+        .iter()
+        .enumerate()
+        .filter_map(|(index, session)| {
+            let display = display_name(session, &snap.system.hostname);
+            let agg = &aggs[&session.id];
+            (q.is_empty()
+                || q.matches_any(
+                    std::iter::once(display.as_str()).chain(agg.apps.keys().map(String::as_str)),
+                ))
+            .then_some(index)
+        })
+        .collect::<Vec<_>>();
+    let sort = app.users_sort;
+    visible_sessions.sort_by(|left, right| {
+        let a = sessions[*left];
+        let b = sessions[*right];
+        compare_users(
+            a,
+            &aggs[&a.id],
+            b,
+            &aggs[&b.id],
+            &snap.system.hostname,
+            sort,
+        )
+    });
+    for i in visible_sessions {
+        let s = sessions[i];
         let a = &aggs[&s.id];
-        if !q.is_empty()
-            && !q.matches_any(
-                std::iter::once(display.as_str()).chain(a.apps.keys().map(String::as_str)),
-            )
-        {
-            continue;
-        }
         rows.push(URow::User(i));
         if app.processes_state.expanded_users.contains(&s.id) {
             type AppEntry = ([f64; 4], usize, Option<String>);
             let mut apps: Vec<(&String, &AppEntry)> = a.apps.iter().collect();
-            apps.sort_by(|x, y| {
-                y.1.0[1]
-                    .partial_cmp(&x.1.0[1])
-                    .unwrap_or(std::cmp::Ordering::Equal)
+            apps.sort_by(|left, right| {
+                compare_user_apps(left.0, &left.1.0, right.0, &right.1.0, sort)
             });
             for (name, (vals, count, exe)) in apps {
                 rows.push(URow::App {
@@ -284,13 +302,13 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
         ui, app, &mut table, &rows, &sessions, &aggs, &snap, &aggs_hdr,
     );
     let avail = tablekit::table_avail(ui);
-    tablekit::scrolled_rows(
+    let clicked = tablekit::scrolled_rows(
         "users",
         ui,
         &pal,
         &mut table,
         avail,
-        None,
+        Some((app.users_sort.column, app.users_sort.ascending)),
         Some(&aggs_hdr),
         rows.len(),
         None,
@@ -336,7 +354,72 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
             }
         },
     );
+    if let Some(column) = clicked {
+        app.users_sort.clicked(column, column >= 2);
+    }
     app.persist_table(&table);
+}
+
+fn directed(order: Ordering, ascending: bool) -> Ordering {
+    if ascending { order } else { order.reverse() }
+}
+
+fn compare_users(
+    a: &UserSession,
+    aa: &Agg,
+    b: &UserSession,
+    ba: &Agg,
+    hostname: &str,
+    sort: tablekit::SortState,
+) -> Ordering {
+    let a_name = display_name(a, hostname).to_ascii_lowercase();
+    let b_name = display_name(b, hostname).to_ascii_lowercase();
+    let primary = match sort.column {
+        0 | 5 => a_name.cmp(&b_name),
+        1 => session_state_rank(a.state).cmp(&session_state_rank(b.state)),
+        2 => aa.cpu.partial_cmp(&ba.cpu).unwrap_or(Ordering::Equal),
+        3 => aa.mem.partial_cmp(&ba.mem).unwrap_or(Ordering::Equal),
+        _ => aa.disk.partial_cmp(&ba.disk).unwrap_or(Ordering::Equal),
+    };
+    directed(primary, sort.ascending).then_with(|| a_name.cmp(&b_name))
+}
+
+fn compare_user_apps(
+    a_name: &str,
+    a_values: &[f64; 4],
+    b_name: &str,
+    b_values: &[f64; 4],
+    sort: tablekit::SortState,
+) -> Ordering {
+    let names = || {
+        a_name
+            .to_ascii_lowercase()
+            .cmp(&b_name.to_ascii_lowercase())
+    };
+    let primary = match sort.column {
+        2..=4 => a_values[sort.column - 2]
+            .partial_cmp(&b_values[sort.column - 2])
+            .unwrap_or(Ordering::Equal),
+        _ => names(),
+    };
+    directed(primary, sort.ascending).then_with(names)
+}
+
+fn session_state_rank(state: tm_core::model::UserSessionState) -> u8 {
+    use tm_core::model::UserSessionState as State;
+    match state {
+        State::Active => 0,
+        State::Connected => 1,
+        State::ConnectQuery => 2,
+        State::Shadowing => 3,
+        State::Disconnected => 4,
+        State::Idle => 5,
+        State::Listen => 6,
+        State::Reset => 7,
+        State::Down => 8,
+        State::Init => 9,
+        State::Unknown => 10,
+    }
 }
 
 #[allow(clippy::too_many_arguments)]

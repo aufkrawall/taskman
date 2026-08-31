@@ -131,6 +131,9 @@ pub struct Settings {
     pub cpu_graph_mode: String,
     /// Overlay kernel time (darker band) in the CPU graphs.
     pub show_kernel_times: bool,
+    /// Processes page presentation: false = Task-Manager-style categories,
+    /// true = literal parent/child process tree (System Informer-style).
+    pub process_tree_view: bool,
     /// Windows: start with administrator privileges. When this launch is
     /// unelevated, the process re-execs itself elevated (runas/UAC) before
     /// the window opens.
@@ -157,6 +160,7 @@ impl Default for Settings {
             perf_card_width: 252.0,
             cpu_graph_mode: "overall".into(),
             show_kernel_times: false,
+            process_tree_view: false,
             start_elevated: false,
         }
     }
@@ -488,6 +492,7 @@ impl Settings {
             }
         }
         s.show_kernel_times = b("general", "show_kernel_times", s.show_kernel_times);
+        s.process_tree_view = b("general", "process_tree_view", s.process_tree_view);
 
         // Column preferences, ID-keyed schema: `[columns.<table>]
         // <col>=<width>`, `[columns.<table>.visible] <col>=0|1` and
@@ -621,6 +626,7 @@ impl Settings {
             ("perf_card_width", self.perf_card_width.to_string()),
             ("cpu_graph_mode", self.cpu_graph_mode.clone()),
             ("show_kernel_times", self.show_kernel_times.to_string()),
+            ("process_tree_view", self.process_tree_view.to_string()),
             ("start_elevated", self.start_elevated.to_string()),
         ];
         let mut body = String::from("[general]\n");
@@ -825,6 +831,7 @@ mod tests {
         s.perf_card_width = 300.5;
         s.cpu_graph_mode = "logical".into();
         s.show_kernel_times = true;
+        s.process_tree_view = true;
         s.start_elevated = true;
         s.col_widths.insert(
             "processes".into(),

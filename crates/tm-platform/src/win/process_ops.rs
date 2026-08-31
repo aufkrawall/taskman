@@ -1,6 +1,7 @@
 //! Per-process control operations: kill, suspend, priority, affinity,
 //! efficiency mode, elevation, launching.
 
+use crate::actions::ProcessModule;
 use tm_core::error::{Result, TmError};
 use tm_core::model::PriorityClass;
 use windows::Win32::Foundation::{CloseHandle, FILETIME, HANDLE};
@@ -22,11 +23,8 @@ fn open_process(pid: u32, access: th::PROCESS_ACCESS_RIGHTS) -> Result<HANDLE> {
     }
 }
 
-/// Creation time of the process a HANDLE refers to, in Unix seconds. Read
-/// through an already-open handle, so the answer describes the SAME process
-/// object no matter whether the pid was recycled after the handle was
-/// opened — this is what makes the identity check below race-free.
-fn creation_epoch_from_handle(h: HANDLE) -> Option<i64> {
+/// Raw 100 ns creation timestamp of the process object a HANDLE refers to.
+fn creation_filetime_from_handle(h: HANDLE) -> Option<u64> {
     unsafe {
         let mut create = FILETIME::default();
         let mut exit = FILETIME::default();
@@ -35,9 +33,15 @@ fn creation_epoch_from_handle(h: HANDLE) -> Option<i64> {
         if th::GetProcessTimes(h, &mut create, &mut exit, &mut kernel, &mut user).is_err() {
             return None;
         }
-        let raw = (create.dwHighDateTime as i64) << 32 | create.dwLowDateTime as i64;
-        Some((raw - 116_444_736_000_000_000) / 10_000_000)
+        Some((u64::from(create.dwHighDateTime) << 32) | u64::from(create.dwLowDateTime))
     }
+}
+
+/// Creation time in Unix seconds for matching sampler identities. It is read
+/// through an already-open handle, so PID recycling cannot change the answer.
+fn creation_epoch_from_handle(h: HANDLE) -> Option<i64> {
+    let raw = creation_filetime_from_handle(h)?;
+    i64::try_from(raw.saturating_sub(116_444_736_000_000_000) / 10_000_000).ok()
 }
 
 /// Tolerance (seconds) when comparing creation times. sysinfo derives
@@ -79,6 +83,295 @@ fn open_process_verified(
         }
     }
     Ok(h)
+}
+
+// ------------------------------------------------------------------ modules
+
+fn wide_array_to_string(value: &[u16]) -> String {
+    let end = value
+        .iter()
+        .position(|unit| *unit == 0)
+        .unwrap_or(value.len());
+    String::from_utf16_lossy(&value[..end])
+}
+
+fn module_is_unloadable(name: &str, path: &str, is_main_image: bool) -> bool {
+    if is_main_image || path.trim().is_empty() || !name.to_ascii_lowercase().ends_with(".dll") {
+        return false;
+    }
+    let name = name.to_ascii_lowercase();
+    let path = path.replace('/', "\\").to_ascii_lowercase();
+    !matches!(
+        name.as_str(),
+        "ntdll.dll"
+            | "kernel32.dll"
+            | "kernelbase.dll"
+            | "wow64.dll"
+            | "wow64win.dll"
+            | "wow64cpu.dll"
+    ) && !name.starts_with("api-ms-win-")
+        && !path.contains("\\windows\\")
+}
+
+/// Snapshot all executable modules mapped into `pid`. Tool Help can briefly
+/// report ERROR_BAD_LENGTH while the loader list changes, so retry that one
+/// documented transient error without adding timing sleeps.
+fn module_snapshot(pid: u32) -> Result<Vec<ProcessModule>> {
+    use windows::Win32::Foundation::{ERROR_BAD_LENGTH, ERROR_NO_MORE_FILES};
+    use windows::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, MODULEENTRY32W, Module32FirstW, Module32NextW, TH32CS_SNAPMODULE,
+        TH32CS_SNAPMODULE32,
+    };
+
+    let snapshot = {
+        let mut final_error = None;
+        let mut handle = None;
+        for _ in 0..8 {
+            match unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, pid) }
+            {
+                Ok(value) => {
+                    handle = Some(value);
+                    break;
+                }
+                Err(error) if error.code() == ERROR_BAD_LENGTH.to_hresult() => {
+                    final_error = Some(error);
+                }
+                Err(error) => {
+                    return Err(TmError::platform(
+                        "CreateToolhelp32Snapshot(modules)",
+                        error.to_string(),
+                    ));
+                }
+            }
+        }
+        handle.ok_or_else(|| {
+            TmError::platform(
+                "CreateToolhelp32Snapshot(modules)",
+                final_error.map_or_else(|| "module list kept changing".into(), |e| e.to_string()),
+            )
+        })?
+    };
+
+    let result = (|| {
+        let mut entry = MODULEENTRY32W {
+            dwSize: std::mem::size_of::<MODULEENTRY32W>() as u32,
+            ..Default::default()
+        };
+        unsafe { Module32FirstW(snapshot, &mut entry) }
+            .map_err(|error| TmError::platform("Module32FirstW", error.to_string()))?;
+        let mut modules = Vec::new();
+        loop {
+            let name = wide_array_to_string(&entry.szModule);
+            let path = wide_array_to_string(&entry.szExePath);
+            let is_main_image = modules.is_empty();
+            modules.push(ProcessModule {
+                name: name.clone(),
+                path: path.clone(),
+                base_address: entry.modBaseAddr as usize as u64,
+                size_bytes: entry.modBaseSize.into(),
+                unloadable: module_is_unloadable(&name, &path, is_main_image),
+            });
+            if let Err(error) = unsafe { Module32NextW(snapshot, &mut entry) } {
+                if error.code() == ERROR_NO_MORE_FILES.to_hresult() {
+                    break;
+                }
+                return Err(TmError::platform("Module32NextW", error.to_string()));
+            }
+        }
+        Ok(modules)
+    })();
+    let _ = unsafe { CloseHandle(snapshot) };
+    result
+}
+
+pub fn list_process_modules(
+    pid: u32,
+    expected_start_epoch_s: Option<i64>,
+) -> Result<Vec<ProcessModule>> {
+    let process = open_process_verified(
+        pid,
+        th::PROCESS_QUERY_LIMITED_INFORMATION,
+        expected_start_epoch_s,
+    )?;
+    let opened_creation = creation_filetime_from_handle(process);
+    let result = module_snapshot(pid).and_then(|modules| {
+        verify_pid_still_refers_to(pid, opened_creation)?;
+        Ok(modules)
+    });
+    let _ = unsafe { CloseHandle(process) };
+    result
+}
+
+/// Tool Help enumerates by PID rather than by our already-open handle. Check
+/// once more after enumeration so a target that exited and had its PID reused
+/// cannot make the inspector display an unrelated process's module list.
+fn verify_pid_still_refers_to(pid: u32, opened_creation: Option<u64>) -> Result<()> {
+    let current = open_process(pid, th::PROCESS_QUERY_LIMITED_INFORMATION)?;
+    let current_creation = creation_filetime_from_handle(current);
+    let _ = unsafe { CloseHandle(current) };
+    let Some(opened_creation) = opened_creation else {
+        return Err(TmError::ProcessNotFound { pid });
+    };
+    if current_creation == Some(opened_creation) {
+        Ok(())
+    } else {
+        Err(TmError::ProcessNotFound { pid })
+    }
+}
+
+/// Release a third-party DLL by running FreeLibrary inside the target. The
+/// operation is deliberately fail-closed: exact process identity and module
+/// base/path are revalidated, main/system images are refused, and cross-
+/// architecture injection is not attempted.
+pub fn unload_process_module(
+    pid: u32,
+    expected_start_epoch_s: Option<i64>,
+    base_address: u64,
+    expected_path: &str,
+) -> Result<()> {
+    use windows::Win32::Foundation::WAIT_OBJECT_0;
+    use windows::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
+
+    if pid == std::process::id() {
+        return Err(TmError::platform(
+            "unload module",
+            "refusing to unload modules from TaskMan itself",
+        ));
+    }
+
+    let process = open_process_verified(
+        pid,
+        th::PROCESS_CREATE_THREAD
+            | th::PROCESS_QUERY_INFORMATION
+            | th::PROCESS_VM_OPERATION
+            | th::PROCESS_VM_WRITE
+            | th::PROCESS_VM_READ,
+        expected_start_epoch_s,
+    )?;
+    let result = (|| {
+        let opened_creation = creation_filetime_from_handle(process);
+        let self_wow = is_wow64(std::process::id()).ok_or(TmError::Unsupported(
+            "module unload when caller architecture is unknown",
+        ))?;
+        let target_wow = is_wow64(pid).ok_or(TmError::Unsupported(
+            "module unload when target architecture is unknown",
+        ))?;
+        if self_wow != target_wow {
+            return Err(TmError::Unsupported("cross-architecture module unload"));
+        }
+
+        let modules = module_snapshot(pid)?;
+        verify_pid_still_refers_to(pid, opened_creation)?;
+        let module = modules
+            .iter()
+            .find(|module| {
+                module.base_address == base_address
+                    && module.path.eq_ignore_ascii_case(expected_path)
+            })
+            .ok_or_else(|| TmError::platform("unload module", "module is no longer loaded"))?;
+        if !module.unloadable {
+            return Err(TmError::platform(
+                "unload module",
+                "the process image and Windows system modules are protected",
+            ));
+        }
+
+        let kernel32_w: Vec<u16> = "kernel32.dll\0".encode_utf16().collect();
+        let local_kernel32 = unsafe { GetModuleHandleW(PCWSTR::from_raw(kernel32_w.as_ptr())) }
+            .map_err(|error| TmError::platform("GetModuleHandleW", error.to_string()))?;
+        let free_library =
+            unsafe { GetProcAddress(local_kernel32, windows::core::s!("FreeLibrary")) }
+                .ok_or_else(|| TmError::platform("GetProcAddress", "FreeLibrary was not found"))?;
+        let local_proc = free_library as usize;
+        // Modern Kernel32 exports may be forwarded into KernelBase. Locate
+        // the module that ACTUALLY owns the returned address before applying
+        // its relative offset in the target; assuming Kernel32's base here
+        // can produce a valid-looking but wrong remote start address.
+        let local_modules = module_snapshot(std::process::id())?;
+        let local_owner = local_modules
+            .iter()
+            .find(|module| {
+                let start = module.base_address as usize;
+                let end = start.saturating_add(module.size_bytes as usize);
+                (start..end).contains(&local_proc)
+            })
+            .ok_or_else(|| TmError::platform("unload module", "FreeLibrary owner was not found"))?;
+        let remote_owner = modules
+            .iter()
+            .find(|module| module.name.eq_ignore_ascii_case(&local_owner.name))
+            .ok_or_else(|| {
+                TmError::platform(
+                    "unload module",
+                    "the target loader runtime does not match the caller",
+                )
+            })?;
+        let local_base = local_owner.base_address as usize;
+        let offset = local_proc
+            .checked_sub(local_base)
+            .ok_or_else(|| TmError::platform("unload module", "invalid FreeLibrary address"))?;
+        if offset >= remote_owner.size_bytes as usize {
+            return Err(TmError::platform(
+                "unload module",
+                "the target loader runtime does not match the caller",
+            ));
+        }
+        let remote_proc = usize::try_from(remote_owner.base_address)
+            .ok()
+            .and_then(|base| base.checked_add(offset))
+            .ok_or_else(|| TmError::platform("unload module", "remote address overflow"))?;
+        let start: th::LPTHREAD_START_ROUTINE = Some(unsafe {
+            std::mem::transmute::<usize, unsafe extern "system" fn(*mut core::ffi::c_void) -> u32>(
+                remote_proc,
+            )
+        });
+        let thread = unsafe {
+            th::CreateRemoteThread(
+                process,
+                None,
+                0,
+                start,
+                Some(base_address as usize as *const core::ffi::c_void),
+                0,
+                None,
+            )
+        }
+        .map_err(|error| TmError::platform("CreateRemoteThread", error.to_string()))?;
+        let wait = unsafe { th::WaitForSingleObject(thread, 15_000) };
+        if wait != WAIT_OBJECT_0 {
+            let _ = unsafe { CloseHandle(thread) };
+            return Err(TmError::platform(
+                "unload module",
+                "timed out; target state is unknown",
+            ));
+        }
+        let mut exit_code = 0u32;
+        let exit_result = unsafe { th::GetExitCodeThread(thread, &mut exit_code) }
+            .map_err(|error| TmError::platform("GetExitCodeThread", error.to_string()));
+        let _ = unsafe { CloseHandle(thread) };
+        exit_result?;
+        if exit_code == 0 {
+            return Err(TmError::platform(
+                "FreeLibrary",
+                "target rejected the unload",
+            ));
+        }
+        // FreeLibrary releases one loader reference. Be precise when another
+        // reference keeps the DLL mapped instead of claiming it was unloaded.
+        let remaining = module_snapshot(pid)?;
+        verify_pid_still_refers_to(pid, opened_creation)?;
+        if remaining.iter().any(|candidate| {
+            candidate.base_address == base_address
+                && candidate.path.eq_ignore_ascii_case(expected_path)
+        }) {
+            return Err(TmError::platform(
+                "FreeLibrary",
+                "a loader reference was released, but the module remains loaded",
+            ));
+        }
+        Ok(())
+    })();
+    let _ = unsafe { CloseHandle(process) };
+    result
 }
 
 // ------------------------------------------------------------------ status queries
@@ -648,15 +941,22 @@ pub fn open_url(url: &str) -> Result<()> {
 }
 
 /// Write a minidump of `pid` to `path` via dbghelp's MiniDumpWriteDump.
-pub fn create_dump_file(pid: u32, path: &std::path::Path) -> Result<()> {
+/// The creation time is verified through the dump handle before any output
+/// file is created, so a recycled pid can never dump an unrelated process.
+pub fn create_dump_file(
+    pid: u32,
+    expected_start_epoch_s: Option<i64>,
+    path: &std::path::Path,
+) -> Result<()> {
     use windows::Win32::Storage::FileSystem::{
         CREATE_ALWAYS, CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ, FILE_SHARE_WRITE,
     };
     use windows::Win32::System::Diagnostics::Debug::{MINIDUMP_TYPE, MiniDumpWriteDump};
 
-    let hproc = open_process(
+    let hproc = open_process_verified(
         pid,
         th::PROCESS_QUERY_INFORMATION | th::PROCESS_VM_READ | th::PROCESS_DUP_HANDLE,
+        expected_start_epoch_s,
     )?;
     let result = (|| {
         let wide: Vec<u16> = path
@@ -743,6 +1043,36 @@ fn split_command(cmd: &str) -> (String, Option<String>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_third_party_dlls_are_unloadable() {
+        assert!(module_is_unloadable(
+            "plugin.dll",
+            r"C:\Tools\plugin.dll",
+            false
+        ));
+        assert!(!module_is_unloadable(
+            "target.exe",
+            r"C:\Tools\target.exe",
+            true
+        ));
+        assert!(!module_is_unloadable(
+            "kernel32.dll",
+            r"C:\Windows\System32\kernel32.dll",
+            false
+        ));
+        assert!(!module_is_unloadable(
+            "vendor.dll",
+            r"C:\Windows\System32\vendor.dll",
+            false
+        ));
+        assert!(!module_is_unloadable(
+            "component.dll",
+            r"C:\Windows\WinSxS\component.dll",
+            false
+        ));
+        assert!(!module_is_unloadable("unknown.dll", "", false));
+    }
 
     #[test]
     fn command_line_of_own_process_is_the_exe_path() {

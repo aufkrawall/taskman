@@ -1,24 +1,30 @@
 //! Per-adapter network facts the sampler can't get from sysinfo: hardware
-//! description, negotiated link speed, oper status and the Wi-Fi SSID.
+//! description, negotiated link speed, oper status, unicast addresses and
+//! Wi-Fi connection details.
 //!
 //! Sources: `GetAdaptersAddresses` (description/link/oper status, keyed by
 //! the adapter's friendly name — the same name sysinfo exposes) and
 //! `WlanQueryInterface` (SSID of the active wireless connection, joined via
 //! the adapter GUID).
 
-use std::collections::HashMap;
+use std::{
+    collections::HashMap,
+    net::{Ipv4Addr, Ipv6Addr},
+};
 
 use windows::Win32::Foundation::{ERROR_BUFFER_OVERFLOW, ERROR_SUCCESS};
 use windows::Win32::NetworkManagement::IpHelper::{
-    GAA_FLAG_SKIP_ANYCAST, GAA_FLAG_SKIP_DNS_SERVER, GAA_FLAG_SKIP_MULTICAST,
-    GAA_FLAG_SKIP_UNICAST, GetAdaptersAddresses, IP_ADAPTER_ADDRESSES_LH,
+    GAA_FLAG_SKIP_ANYCAST, GAA_FLAG_SKIP_DNS_SERVER, GAA_FLAG_SKIP_MULTICAST, GetAdaptersAddresses,
+    IP_ADAPTER_ADDRESSES_LH, IP_ADAPTER_UNICAST_ADDRESS_LH,
 };
 use windows::Win32::NetworkManagement::Ndis::IfOperStatusUp;
 use windows::Win32::NetworkManagement::WiFi::{
     WLAN_CONNECTION_ATTRIBUTES, WLAN_INTERFACE_INFO_LIST, WlanCloseHandle, WlanEnumInterfaces,
     WlanFreeMemory, WlanOpenHandle, WlanQueryInterface, wlan_intf_opcode_current_connection,
 };
-use windows::Win32::Networking::WinSock::AF_UNSPEC;
+use windows::Win32::Networking::WinSock::{
+    AF_INET, AF_INET6, AF_UNSPEC, SOCKADDR_IN, SOCKADDR_IN6,
+};
 
 #[derive(Debug, Clone, Default)]
 pub struct AdapterInfo {
@@ -29,10 +35,20 @@ pub struct AdapterInfo {
     pub oper_up: bool,
     /// SSID of the active wireless connection, when this is Wi-Fi.
     pub ssid: Option<String>,
+    pub ipv4: Option<String>,
+    pub ipv6: Option<String>,
+    pub signal_quality_pct: Option<u32>,
+}
+
+#[derive(Debug, Clone)]
+struct WifiInfo {
+    ssid: String,
+    signal_quality_pct: u32,
 }
 
 /// FriendlyName → adapter facts. One `GetAdaptersAddresses` call plus (when a
-/// wireless adapter exists) one WLAN enumeration — cheap enough per tick.
+/// wireless adapter exists) one WLAN enumeration. The sampler caches this
+/// metadata because address and WLAN discovery do not belong on every tick.
 pub fn adapters() -> HashMap<String, AdapterInfo> {
     let Some(buf) = adapter_addresses() else {
         return HashMap::new();
@@ -55,14 +71,18 @@ pub fn adapters() -> HashMap<String, AdapterInfo> {
         } else {
             adapter.ReceiveLinkSpeed
         };
-        let ssid = ssids.get(&format!("{:?}", adapter.NetworkGuid).to_lowercase());
+        let wifi = ssids.get(&format!("{:?}", adapter.NetworkGuid).to_lowercase());
+        let (ipv4, ipv6) = preferred_unicast_addresses(adapter.FirstUnicastAddress);
         out.insert(
             name,
             AdapterInfo {
                 desc,
                 link_bps,
                 oper_up,
-                ssid: ssid.cloned(),
+                ssid: wifi.map(|info| info.ssid.clone()),
+                ipv4,
+                ipv6,
+                signal_quality_pct: wifi.map(|info| info.signal_quality_pct),
             },
         );
     }
@@ -71,7 +91,7 @@ pub fn adapters() -> HashMap<String, AdapterInfo> {
 
 /// SSID per wireless interface, keyed by the lowercase debug form of the
 /// interface GUID (matches `IP_ADAPTER_ADDRESSES_LH::NetworkGuid`).
-fn wifi_ssids_by_guid() -> HashMap<String, String> {
+fn wifi_ssids_by_guid() -> HashMap<String, WifiInfo> {
     unsafe {
         let mut handle = Default::default();
         let mut negotiated = 0u32;
@@ -106,7 +126,13 @@ fn wifi_ssids_by_guid() -> HashMap<String, String> {
                             let bytes = &ssid.ucSSID[..(ssid.uSSIDLength as usize).min(32)];
                             out.insert(
                                 format!("{:?}", item.InterfaceGuid).to_lowercase(),
-                                String::from_utf8_lossy(bytes).into_owned(),
+                                WifiInfo {
+                                    ssid: String::from_utf8_lossy(bytes).into_owned(),
+                                    signal_quality_pct: attrs
+                                        .wlanAssociationAttributes
+                                        .wlanSignalQuality
+                                        .min(100),
+                                },
                             );
                         }
                     }
@@ -120,15 +146,68 @@ fn wifi_ssids_by_guid() -> HashMap<String, String> {
     }
 }
 
-/// One `GetAdaptersAddresses` call with adapter-level flags only.
-fn adapter_addresses() -> Option<Vec<u8>> {
-    let flags = GAA_FLAG_SKIP_UNICAST
-        | GAA_FLAG_SKIP_ANYCAST
-        | GAA_FLAG_SKIP_MULTICAST
-        | GAA_FLAG_SKIP_DNS_SERVER;
+fn preferred_unicast_addresses(
+    mut cursor: *mut IP_ADAPTER_UNICAST_ADDRESS_LH,
+) -> (Option<String>, Option<String>) {
+    let mut ipv4 = None;
+    let mut ipv4_fallback = None;
+    let mut ipv6 = None;
+    let mut ipv6_fallback = None;
+
+    while !cursor.is_null() {
+        // SAFETY: the linked list and pointed-to socket addresses remain owned
+        // by the `GetAdaptersAddresses` buffer for the duration of this walk.
+        let address = unsafe { &*cursor };
+        cursor = address.Next;
+        let socket = address.Address.lpSockaddr;
+        let socket_len = usize::try_from(address.Address.iSockaddrLength).unwrap_or(0);
+        if socket.is_null()
+            || socket_len
+                < std::mem::size_of::<windows::Win32::Networking::WinSock::ADDRESS_FAMILY>()
+        {
+            continue;
+        }
+        let family = unsafe { (*socket).sa_family };
+        if family == AF_INET && socket_len >= std::mem::size_of::<SOCKADDR_IN>() {
+            let sockaddr = unsafe { &*socket.cast::<SOCKADDR_IN>() };
+            let octets = unsafe { sockaddr.sin_addr.S_un.S_un_b };
+            let candidate = Ipv4Addr::new(octets.s_b1, octets.s_b2, octets.s_b3, octets.s_b4);
+            if !candidate.is_unspecified() && !candidate.is_loopback() {
+                if candidate.is_link_local() {
+                    ipv4_fallback.get_or_insert(candidate);
+                } else {
+                    ipv4.get_or_insert(candidate);
+                }
+            }
+        } else if family == AF_INET6 && socket_len >= std::mem::size_of::<SOCKADDR_IN6>() {
+            let sockaddr = unsafe { &*socket.cast::<SOCKADDR_IN6>() };
+            let candidate = Ipv6Addr::from(unsafe { sockaddr.sin6_addr.u.Byte });
+            if !candidate.is_unspecified() && !candidate.is_loopback() {
+                if candidate.is_unicast_link_local() {
+                    ipv6_fallback.get_or_insert(candidate);
+                } else {
+                    ipv6.get_or_insert(candidate);
+                }
+            }
+        }
+    }
+
+    (
+        ipv4.or(ipv4_fallback).map(|address| address.to_string()),
+        ipv6.or(ipv6_fallback).map(|address| address.to_string()),
+    )
+}
+
+/// One `GetAdaptersAddresses` call including unicast-address metadata.
+fn adapter_addresses() -> Option<Vec<u64>> {
+    let flags = GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_SKIP_DNS_SERVER;
     let mut size: u32 = 15 * 1024;
     loop {
-        let mut buf = vec![0u8; size as usize];
+        // The API writes pointer/u64-bearing C structs into this buffer. A
+        // u64 backing allocation provides the required alignment; `Vec<u8>`
+        // would happen to be aligned on today's allocator but cannot promise it.
+        let words = (size as usize).div_ceil(std::mem::size_of::<u64>());
+        let mut buf = vec![0u64; words];
         let ret = unsafe {
             GetAdaptersAddresses(
                 AF_UNSPEC.0 as u32,

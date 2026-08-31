@@ -44,6 +44,29 @@ pub const FONT_ROW: f32 = 13.0;
 pub const FONT_HDR_LABEL: f32 = 12.0;
 pub const FONT_AGG: f32 = 17.0;
 
+/// Persistent sort state shared by the simpler table tabs. Text columns
+/// start ascending; numeric columns start descending on first click.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SortState {
+    pub column: usize,
+    pub ascending: bool,
+}
+
+impl SortState {
+    pub const fn new(column: usize, ascending: bool) -> Self {
+        Self { column, ascending }
+    }
+
+    pub fn clicked(&mut self, column: usize, numeric: bool) {
+        if self.column == column {
+            self.ascending = !self.ascending;
+        } else {
+            self.column = column;
+            self.ascending = !numeric;
+        }
+    }
+}
+
 /// Hard limits for user-resized columns.
 const MIN_COL_W: f32 = 40.0;
 const MAX_COL_W: f32 = 1200.0;
@@ -583,6 +606,16 @@ impl TmTable {
         } else if resp.hovered() {
             painter.rect_filled(rect, 0.0, Color32::from_white_alpha(8));
         }
+        // Carry the header's column boundaries through the body. Native
+        // Task Manager keeps these guides very quiet, but without them wide
+        // text tables are unnecessarily hard to scan horizontally.
+        for i in 1..self.cols.len() {
+            let x = self.boundary_x(rect, i);
+            painter.line_segment(
+                [Pos2::new(x, rect.top()), Pos2::new(x, rect.bottom())],
+                Stroke::new(0.75, pal.stroke.gamma_multiply(0.72)),
+            );
+        }
         (rect, resp)
     }
 
@@ -635,11 +668,11 @@ impl TmTable {
                     pal.text,
                 );
             }
-            if row_active && k + 1 < cells.len() {
+            if row_active {
                 painter.line_segment(
                     [
-                        Pos2::new(cell.right(), row.top()),
-                        Pos2::new(cell.right(), row.bottom()),
+                        Pos2::new(cell.left(), row.top()),
+                        Pos2::new(cell.left(), row.bottom()),
                     ],
                     Stroke::new(1.0, pal.heat_sep),
                 );
@@ -761,6 +794,17 @@ impl Aggregates {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sort_state_uses_natural_first_direction_then_toggles() {
+        let mut sort = SortState::new(0, true);
+        sort.clicked(1, true);
+        assert_eq!(sort, SortState::new(1, false));
+        sort.clicked(1, true);
+        assert_eq!(sort, SortState::new(1, true));
+        sort.clicked(2, false);
+        assert_eq!(sort, SortState::new(2, true));
+    }
 
     fn table() -> TmTable {
         TmTable::new(
