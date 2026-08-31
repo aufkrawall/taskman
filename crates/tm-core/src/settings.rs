@@ -221,15 +221,12 @@ pub struct Settings {
     pub cpu_graph_mode: String,
     /// Overlay kernel time (darker band) in the CPU graphs.
     pub show_kernel_times: bool,
-    /// Details page presentation: false = flat list, true = literal
-    /// parent/child process tree (System Informer-style).
-    #[serde(alias = "process_tree_view")]
-    pub details_tree_view: bool,
-    /// Details tree presented in STRICT hierarchy: no column sort at all,
-    /// children under their parent in creation order (System Informer's
-    /// third click on a column header). Only meaningful with
-    /// [`Settings::details_tree_view`]; the sort column itself stays in
-    /// `[sort]`, which has no room for a third state.
+    /// Details page shows the literal parent/child process tree: the Name
+    /// column's third sort state (no column ordering at all). There is no
+    /// separate tree switch — this IS the sort state, kept here because
+    /// `[sort]` stores only a column plus an ascending flag and has no room
+    /// for a third value. Superseded `details_tree_view`.
+    #[serde(alias = "details_tree_view", alias = "process_tree_view")]
     pub details_tree_hierarchical: bool,
     /// Hide the main window instead of exiting when its close button is used.
     pub close_to_tray: bool,
@@ -268,7 +265,6 @@ impl Default for Settings {
             perf_card_width: 252.0,
             cpu_graph_mode: "overall".into(),
             show_kernel_times: false,
-            details_tree_view: false,
             details_tree_hierarchical: false,
             close_to_tray: false,
             start_with_windows: false,
@@ -688,15 +684,15 @@ impl Settings {
         s.show_kernel_times = b("general", "show_kernel_times", s.show_kernel_times);
         // `process_tree_view` was briefly shipped for the Processes page.
         // Preserve that preference while moving the literal tree to Details.
-        s.details_tree_view = get("general", "details_tree_view")
+        // `details_tree_view` (and before it `process_tree_view`) was a
+        // separate flat/tree switch. The tree is now the Name column's third
+        // sort state, so an old file's "tree" preference restores as exactly
+        // that rather than being silently dropped.
+        s.details_tree_hierarchical = get("general", "details_tree_hierarchical")
             .and_then(|v| parse_bool(v))
+            .or_else(|| get("general", "details_tree_view").and_then(|v| parse_bool(v)))
             .or_else(|| get("general", "process_tree_view").and_then(|v| parse_bool(v)))
-            .unwrap_or(s.details_tree_view);
-        s.details_tree_hierarchical = b(
-            "general",
-            "details_tree_hierarchical",
-            s.details_tree_hierarchical,
-        );
+            .unwrap_or(s.details_tree_hierarchical);
         s.close_to_tray = b("general", "close_to_tray", s.close_to_tray);
         s.start_with_windows = b("general", "start_with_windows", s.start_with_windows);
         if let Some(v) = get("general", "text_smoothing").and_then(|v| TextSmoothing::from_cfg(v)) {
@@ -865,7 +861,6 @@ impl Settings {
             ("perf_card_width", self.perf_card_width.to_string()),
             ("cpu_graph_mode", self.cpu_graph_mode.clone()),
             ("show_kernel_times", self.show_kernel_times.to_string()),
-            ("details_tree_view", self.details_tree_view.to_string()),
             (
                 "details_tree_hierarchical",
                 self.details_tree_hierarchical.to_string(),
@@ -1139,7 +1134,6 @@ text_smoothing=banana
         s.perf_card_width = 300.5;
         s.cpu_graph_mode = "logical".into();
         s.show_kernel_times = true;
-        s.details_tree_view = true;
         s.details_tree_hierarchical = true;
         s.close_to_tray = true;
         s.start_with_windows = true;
@@ -1262,15 +1256,34 @@ whatever=yes
     }
 
     #[test]
-    fn legacy_process_tree_setting_migrates_to_details() {
-        let s = Settings::from_ini_text("[general]\nprocess_tree_view=true\n");
-        assert!(s.details_tree_view);
-        let newer =
-            Settings::from_ini_text("[general]\nprocess_tree_view=true\ndetails_tree_view=false\n");
-        assert!(
-            !newer.details_tree_view,
-            "new key wins over the legacy alias"
+    /// The Details tree switch has been renamed twice — `process_tree_view`
+    /// then `details_tree_view` — and is now the Name column's third sort
+    /// state (`details_tree_hierarchical`). Each rename must carry the older
+    /// preference forward, with the newest key present winning.
+    fn legacy_process_tree_settings_migrate_to_the_hierarchical_sort() {
+        let oldest = Settings::from_ini_text(
+            "[general]
+process_tree_view=true
+",
         );
+        assert!(oldest.details_tree_hierarchical);
+        let middle = Settings::from_ini_text(
+            "[general]
+process_tree_view=true
+details_tree_view=false
+",
+        );
+        assert!(
+            !middle.details_tree_hierarchical,
+            "newer key wins over the older alias"
+        );
+        let newest = Settings::from_ini_text(
+            "[general]
+details_tree_view=false
+details_tree_hierarchical=true
+",
+        );
+        assert!(newest.details_tree_hierarchical, "current key wins");
     }
 
     #[test]

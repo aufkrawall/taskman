@@ -84,6 +84,9 @@ struct ProcRaw {
     create_time: i64,
     kernel: i64,
     user: i64,
+    /// Process base priority. The kernel reports it for EVERY process,
+    /// including the protected ones no handle can be opened for.
+    base_priority: i32,
     /// Image base name from the kernel table (empty when unparseable).
     /// Remembered for processes that exit so their CPU churn can be named.
     name: Box<str>,
@@ -162,6 +165,40 @@ impl CpuLoadAccountant {
             core_buf: vec![0u8; 16 * 1024],
             suspended: HashMap::new(),
         }
+    }
+
+    /// Process creation time (Unix seconds) from the newest native process
+    /// table.
+    ///
+    /// sysinfo reads this through a process HANDLE and reports 0 when it
+    /// cannot open one — roughly half the process list for an unelevated
+    /// session. The kernel table carries a creation time for every process,
+    /// so this is what turns a fabricated `Some(0)` into either the real
+    /// identity or an honest `None`.
+    pub fn start_epoch_of(&self, pid: u32) -> Option<i64> {
+        let raw = self.prev.as_ref()?.procs.get(&pid)?;
+        filetime_to_unix_seconds(raw.create_time)
+    }
+
+    /// Process base priority from the newest native process table.
+    ///
+    /// The kernel reports this for EVERY process, including the protected
+    /// ones that refuse `OpenProcess` — which makes it the only priority
+    /// source that covers System, Registry, csrss and PPL services. Read from
+    /// the retained raw table rather than from [`LoadSample`] on purpose: a
+    /// load sample needs two ticks to exist, and the priority must be right
+    /// on the FIRST snapshot the UI ever shows.
+    ///
+    /// Identity-guarded like [`Self::is_suspended`]: a recycled PID must not
+    /// inherit the dead process's priority.
+    pub fn base_priority(&self, pid: u32, start_epoch_s: Option<i64>) -> Option<i32> {
+        let raw = self.prev.as_ref()?.procs.get(&pid)?;
+        if let Some(expected) = start_epoch_s
+            && filetime_to_unix_seconds(raw.create_time) != Some(expected)
+        {
+            return None;
+        }
+        Some(raw.base_priority)
     }
 
     /// Whether the newest native process table identifies this exact process
@@ -336,6 +373,7 @@ impl CpuLoadAccountant {
             let user = read_i64(buf, pos + off.user_time);
             let kernel = read_i64(buf, pos + off.kernel_time);
             let pid = read_usize(buf, pos + off.pid) as u32;
+            let base_priority = read_u32(buf, pos + off.base_priority) as i32;
             let buf_base = buf.as_ptr() as usize;
             let name = parse_image_name(buf, buf_base, pos, written, &off);
 
@@ -352,6 +390,7 @@ impl CpuLoadAccountant {
                         create_time,
                         kernel,
                         user,
+                        base_priority,
                         name,
                     },
                 );
@@ -423,6 +462,7 @@ struct Offsets {
     image_name: usize,
     /// Field holding the name offset, relative to the record start.
     image_name_buffer: usize,
+    base_priority: usize,
     min_size: usize,
 }
 
@@ -442,11 +482,12 @@ impl Offsets {
                 pid: 80,
                 image_name: 56,
                 image_name_buffer: 64,
+                base_priority: 72,
                 min_size: 104,
             }
         } else {
             // Same order, pointer-sized handles/pointers (UNICODE_STRING is
-            // 8 B: Length@56, Buffer@60).
+            // 8 B: Length@56, Buffer@60, so BasePriority@64).
             Self {
                 create_time: 32,
                 user_time: 40,
@@ -454,6 +495,7 @@ impl Offsets {
                 pid: 68,
                 image_name: 56,
                 image_name_buffer: 60,
+                base_priority: 64,
                 min_size: 84,
             }
         }
@@ -769,6 +811,60 @@ mod tests {
         CoreRaw { idle, kernel, user }
     }
 
+    /// The hand-written offsets must agree with the layout the `windows`
+    /// crate declares for `SYSTEM_PROCESS_INFORMATION`. They are written out
+    /// by hand because the record is variable-length and read straight from a
+    /// byte buffer, but that is no reason to guess: this pins every one of
+    /// them, on 32- and 64-bit alike.
+    #[test]
+    fn hand_written_offsets_match_the_declared_layout() {
+        use std::mem::offset_of;
+        let off = Offsets::get();
+        assert_eq!(
+            off.create_time,
+            offset_of!(SYSTEM_PROCESS_INFORMATION, Reserved1) + 24,
+            "CreateTime sits inside the crate's Reserved1 blob"
+        );
+        assert_eq!(
+            off.image_name,
+            offset_of!(SYSTEM_PROCESS_INFORMATION, ImageName)
+        );
+        assert_eq!(
+            off.base_priority,
+            offset_of!(SYSTEM_PROCESS_INFORMATION, BasePriority)
+        );
+        assert_eq!(
+            off.pid,
+            offset_of!(SYSTEM_PROCESS_INFORMATION, UniqueProcessId)
+        );
+        assert!(off.min_size >= offset_of!(SYSTEM_PROCESS_INFORMATION, SessionId) + 4);
+    }
+
+    /// Base priority is the ONLY priority source for protected processes, so
+    /// a wrong offset would silently mislabel every one of them. One live
+    /// kernel table: every process must report a schedulable base priority
+    /// and the well-known system processes must land in their known classes.
+    #[test]
+    fn live_kernel_table_yields_sane_base_priorities() {
+        let mut acc = CpuLoadAccountant::new();
+        let procs = acc.query_procs().expect("NtQuerySystemInformation");
+        for (pid, p) in &procs {
+            assert!(
+                (1..=31).contains(&p.base_priority),
+                "pid {pid} ({}) reports base priority {}",
+                p.name,
+                p.base_priority
+            );
+        }
+        // The System process runs at the normal class base priority (8).
+        assert_eq!(procs.get(&4).expect("pid 4 present").base_priority, 8);
+        // A desktop always has at least one plain normal-class process.
+        assert!(
+            procs.values().any(|p| p.base_priority == 8),
+            "no process at the normal base priority - offset is probably wrong"
+        );
+    }
+
     /// Validates the self-relative ImageName interpretation against the
     /// real kernel table: one live NtQuerySystemInformation call, decoded
     /// names must match known system processes.
@@ -889,6 +985,7 @@ mod tests {
                     create_time: 111,
                     kernel: 1e7 as i64,
                     user: 1e7 as i64,
+                    base_priority: 8,
                     name: "stay.exe".into(),
                 },
             ),
@@ -900,6 +997,7 @@ mod tests {
                     create_time: 222,
                     kernel: 5e7 as i64,
                     user: 0,
+                    base_priority: 8,
                     name: "old.exe".into(),
                 },
             ),
@@ -911,6 +1009,7 @@ mod tests {
                     create_time: 111,
                     kernel: 3e7 as i64,
                     user: 3e7 as i64,
+                    base_priority: 8,
                     name: "stay.exe".into(),
                 },
             ),
@@ -920,6 +1019,7 @@ mod tests {
                     create_time: 999, // reused pid
                     kernel: 2e7 as i64,
                     user: 0,
+                    base_priority: 8,
                     name: "new.exe".into(),
                 },
             ),
@@ -967,6 +1067,7 @@ mod tests {
                 create_time: 1,
                 kernel: 1e7 as i64,
                 user: 1e7 as i64,
+                base_priority: 8,
                 name: "rustc.exe".into(),
             },
         )]);
@@ -992,6 +1093,7 @@ mod tests {
                         create_time: 1,
                         kernel: 0,
                         user: 0,
+                        base_priority: 8,
                         name: "rustc.exe".into(),
                     },
                 ),
@@ -1001,6 +1103,7 @@ mod tests {
                         create_time: 1,
                         kernel: 0,
                         user: 0,
+                        base_priority: 8,
                         name: "rustc.exe".into(),
                     },
                 ),
@@ -1012,6 +1115,7 @@ mod tests {
                 create_time: 1,
                 kernel: 0.2e7 as i64,
                 user: 0,
+                base_priority: 8,
                 name: "cargo.exe".into(),
             },
         )]);

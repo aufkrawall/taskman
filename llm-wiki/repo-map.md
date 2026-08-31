@@ -99,7 +99,12 @@ platform boundary (`tm-core` ← `tm-platform` ← `tm-app` / `tm-service`):
   per-process network stayed dark. See `log/recent.md` 2026-08-31.
 - `crates/tm-platform/src/win/perfcounters.rs` — PDH group lifecycle +
   GPU instance parsing (unit-tested real-world strings).
-- `crates/tm-platform/src/win/cpu_load.rs` — hand-rolled NT structure
+- `crates/tm-platform/src/win/cpu_load.rs` — also the ONLY source of process
+  identity and priority for the ~half of the process list that refuses
+  `OpenProcess`: `start_epoch_of` and `base_priority` read the retained raw
+  kernel table (never `LoadSample`, which needs two ticks to exist).
+  sysinfo's `start_time()` is 0 for those processes and must never be stored
+  as `Some(0)` — no handle check can ever match it. Hand-rolled NT structure
   offsets; verify against Process Hacker definitions before "fixing" — but
   note the live-kernel test proved `ImageName.Buffer` is an ABSOLUTE
   pointer into the output buffer on this build (PH's record-relative
@@ -134,8 +139,9 @@ platform boundary (`tm-core` ← `tm-platform` ← `tm-app` / `tm-service`):
   persisted System Informer-style tree on the Details page, which is expanded
   by DEFAULT (`details::State.collapsed` tracks the exceptions) so newly
   appearing subtrees are never silently hidden. That tree has THREE sort
-  states (`details::SortOrder`), not two: a third click on the sorted column
-  drops the column sort entirely and orders siblings by creation time.
+  states (`details::SortOrder`), not two, and the tree is not a mode: it IS
+  the Name column's third state. Clicking any OTHER column must leave it and
+  sort purely by that column.
 - `crates/tm-app/src/theme.rs` — `ScrollStyle.floating` must stay TRUE. egui
   decides whether a bar is needed against the OUTER rect for floating bars
   and against the shrunken INNER rect for solid ones, so a solid bar can

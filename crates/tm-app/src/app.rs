@@ -464,16 +464,18 @@ impl TaskManApp {
             settings.col_visible.get("details"),
             settings.col_order.get("details").map(Vec::as_slice),
         );
-        if let Some(sort) = settings.table_sort.get("details") {
-            // The Details tree's third order (strict hierarchy) has no
-            // ascending flag to live in, so it is restored from the general
-            // section alongside the tree-view switch itself.
-            let hierarchical = settings.details_tree_view && settings.details_tree_hierarchical;
-            details_state.apply_saved_sort(
-                &sort.column,
-                crate::tabs::details::SortOrder::from_saved(sort.ascending, hierarchical),
-            );
-        }
+        // The Details tree is the Name column's third sort state, and that
+        // state has no ascending flag to live in, so it rides in the general
+        // section instead. It must be applied even when no `[sort]` entry
+        // exists — a config migrated from the old `details_tree_view` switch
+        // has exactly that shape, and dropping it would silently discard the
+        // user's tree preference.
+        let saved = settings.table_sort.get("details");
+        details_state.apply_saved_sort(
+            saved.map_or("name", |sort| sort.column.as_str()),
+            saved.is_none_or(|sort| sort.ascending),
+            settings.details_tree_hierarchical,
+        );
 
         let mut processes_state = crate::tabs::processes::State::new();
         if let Some(sort) = restored_sort(

@@ -541,7 +541,18 @@ impl Sampler {
             entry.cpu_pct = pc.map_or(0.0, |c| c.pct);
             entry.mem_bytes = p.memory();
             entry.commit_bytes = Some(p.virtual_memory());
-            entry.start_epoch_s = Some(p.start_time() as i64);
+            // sysinfo reads the creation time through a process handle and
+            // yields 0 when it cannot open one — about half the process list
+            // for an unelevated session. A `Some(0)` is a FABRICATED identity
+            // that no later handle check can ever match, so fall back to the
+            // kernel process table, which reports a creation time for every
+            // process, and leave it unknown when even that has none.
+            let sysinfo_start = p.start_time();
+            entry.start_epoch_s = if sysinfo_start > 0 {
+                Some(sysinfo_start as i64)
+            } else {
+                self.cpu_load.start_epoch_of(pid_u)
+            };
             entry.cpu_time_s = pc.map(|c| c.total_time_100ns as f64 / 10_000_000.0);
             entry.disk_read_bps = du.read_bytes as f64 / interval_s;
             entry.disk_write_bps = du.written_bytes as f64 / interval_s;
@@ -560,6 +571,17 @@ impl Sampler {
             let a = self.attrs_for(p.pid, p.start_epoch_s);
             p.session_id = a.session_id;
             p.priority = a.priority;
+            // Protected processes (System, Registry, Secure System, csrss,
+            // PPL services) refuse OpenProcess, so GetPriorityClass cannot
+            // see them and `a.priority` is Unknown — the Details column read
+            // "—" and the context menu ticked nothing. The kernel process
+            // table already carries a base priority for EVERY process; map
+            // that instead of reporting the value as unknowable.
+            if p.priority == PriorityClass::Unknown
+                && let Some(base) = self.cpu_load.base_priority(p.pid, p.start_epoch_s)
+            {
+                p.priority = process_ops::priority_class_from_base(base);
+            }
             p.handles = a.handles;
             p.wow64 = a.wow64;
             p.elevated = a.elevated;
