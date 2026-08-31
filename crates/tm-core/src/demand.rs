@@ -14,7 +14,7 @@ impl TelemetryDemand {
     pub const CORE_PROCESS: Self = Self(1 << 0);
     pub const DISK_RATE: Self = Self(1 << 1);
     pub const NET_ADAPTER_RATE: Self = Self(1 << 2);
-    #[allow(dead_code)] // reserved: ETW per-process network (future parity)
+    /// ETW per-process network session (Processes / App History pages).
     pub const PROCESS_NET: Self = Self(1 << 3);
     pub const GPU_ADAPTER: Self = Self(1 << 4);
     pub const PROCESS_GPU: Self = Self(1 << 5);

@@ -8,6 +8,7 @@ mod gpu;
 pub mod icons;
 pub mod locale;
 pub mod memory_info;
+mod net_etw;
 mod net_info;
 mod perfcounters;
 mod process_ops;

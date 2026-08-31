@@ -11,7 +11,7 @@
 
 use crate::win::cpu_load::{CpuLoadAccountant, LoadSample};
 use crate::win::{
-    cpu_info, gpu, memory_info, net_info, perfcounters, process_ops, threads_map, version,
+    cpu_info, gpu, memory_info, net_etw, net_info, perfcounters, process_ops, threads_map, version,
     windows_enum,
 };
 use std::collections::{HashMap, HashSet};
@@ -116,8 +116,25 @@ pub struct Sampler {
     cpu_load: CpuLoadAccountant,
     /// Last valid CPU-load sample; held when a tick's window is unusable.
     last_load: Option<Arc<LoadSample>>,
+    /// Set once `NetworkUsage::start` has failed, so an unelevated session
+    /// does not retry an always-denied API on every tick.
+    net_usage_denied: bool,
     /// Hold-decay state of the CPU pseudo-rows.
     pseudo: PseudoRowHold,
+    /// ETW per-process network trace, started lazily and only while the UI
+    /// demands it. `None` means unavailable (no rights, or not demanded), and
+    /// the snapshot then reports unknown — never zero.
+    net_usage: Option<net_etw::NetworkUsage>,
+    /// Previous cumulative per-process byte counters, keyed by identity so a
+    /// recycled PID cannot inherit a dead process's totals.
+    prev_proc_net: HashMap<u32, ProcNetSample>,
+}
+
+/// One process's cumulative network counters at the previous tick.
+#[derive(Debug, Clone, Copy)]
+struct ProcNetSample {
+    start_epoch_s: Option<i64>,
+    bytes: net_etw::PidBytes,
 }
 
 impl Sampler {
@@ -152,7 +169,10 @@ impl Sampler {
             net_meta_cache: None,
             cpu_load: CpuLoadAccountant::new(),
             last_load: None,
+            net_usage_denied: false,
             pseudo: PseudoRowHold::default(),
+            net_usage: None,
+            prev_proc_net: HashMap::new(),
         }
     }
 
@@ -237,6 +257,75 @@ impl Sampler {
     /// Demand update from the UI (cheap atomic handoff upstream).
     pub fn set_demand(&mut self, d: TelemetryDemand) {
         self.demand = d;
+    }
+
+    /// Start or stop the ETW network trace to match the current demand.
+    ///
+    /// A failed start is remembered as "unavailable" for the rest of the
+    /// process: without administrator rights `StartTraceW` denies every
+    /// attempt, and retrying once per tick would be pure noise.
+    fn update_net_usage(&mut self) {
+        let wanted = self.demand.wants(TelemetryDemand::PROCESS_NET);
+        if wanted && self.net_usage.is_none() && !self.net_usage_denied {
+            self.net_usage = net_etw::NetworkUsage::start();
+            if self.net_usage.is_none() {
+                self.net_usage_denied = true;
+            }
+        } else if !wanted && self.net_usage.is_some() {
+            // Dropping stops the session and joins its consumer thread.
+            self.net_usage = None;
+            self.prev_proc_net.clear();
+        }
+    }
+
+    /// Fill per-process network rates from the ETW totals.
+    ///
+    /// Every process gets a value while the trace runs — an idle process
+    /// really did move zero bytes — and every process keeps `None` while it
+    /// does not, because "unknown" and "zero" are different answers.
+    fn apply_process_network(&mut self, processes: &mut [ProcessEntry], interval_s: f64) {
+        let Some(usage) = &self.net_usage else {
+            return;
+        };
+        let live: std::collections::HashSet<u32> = processes.iter().map(|p| p.pid).collect();
+        let totals = usage.totals_pruned(&live);
+        let mut next = HashMap::with_capacity(processes.len());
+        for process in processes.iter_mut() {
+            if process.synthetic {
+                continue;
+            }
+            let bytes = totals.get(&process.pid).copied().unwrap_or_default();
+            let previous = self
+                .prev_proc_net
+                .get(&process.pid)
+                .filter(|prev| prev.start_epoch_s == process.start_epoch_s);
+            let rate = |now: u64, before: u64| {
+                // saturating_sub also covers the first tick after a pruned
+                // PID reappears, where the counter restarts at zero.
+                now.saturating_sub(before) as f64 / interval_s
+            };
+            let (recv_bps, sent_bps) = match previous {
+                Some(prev) => (
+                    rate(bytes.received, prev.bytes.received),
+                    rate(bytes.sent, prev.bytes.sent),
+                ),
+                // First observation of this process: totals are known, but a
+                // rate needs two points.
+                None => (0.0, 0.0),
+            };
+            process.net_recv_total = Some(bytes.received);
+            process.net_sent_total = Some(bytes.sent);
+            process.net_recv_bps = Some(recv_bps);
+            process.net_sent_bps = Some(sent_bps);
+            next.insert(
+                process.pid,
+                ProcNetSample {
+                    start_epoch_s: process.start_epoch_s,
+                    bytes,
+                },
+            );
+        }
+        self.prev_proc_net = next;
     }
 }
 
@@ -437,6 +526,12 @@ impl Sampler {
         // The ancestor walk stops at windowed processes and at system
         // processes (svchost/services/...), matching Task Manager.
         refine_categories_and_group_apps(&mut processes);
+
+        // ---- per-process network (ETW) --------------------------------------------
+        // Runs after the process list is final so pruning sees exactly the
+        // live PIDs, and after categories so synthetic rows can be skipped.
+        self.update_net_usage();
+        self.apply_process_network(&mut processes, interval_s);
 
         // ---- CPU attribution pseudo-rows ------------------------------------------
         // The per-core accumulators see ALL busy time; live processes cannot

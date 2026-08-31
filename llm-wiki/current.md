@@ -13,6 +13,20 @@ diagnostics; remaining telemetry and accessibility work is itemized precisely
 in `known-debt.md`. Normal GUI startup remains unelevated; privileged controls
 can cross a protected, allowlisted service boundary after one explicit install.
 
+## Recently landed (2026-08-31 — per-process network)
+
+- `win/net_etw.rs` supplies the Processes/App History Network column from a
+  private real-time ETW session on `Microsoft-Windows-Kernel-Network`,
+  accumulating the payload `(pid, size)` prefix of the TCP/UDP data events.
+  The event-header PID is deliberately NOT used — kernel network events fire
+  in System context.
+- Requires administrator rights. Unelevated, the session never starts and
+  every process keeps `None` → "—", with a hover explanation; availability is
+  all-or-nothing so a fabricated zero can never appear.
+- Demand-gated on `TelemetryDemand::PROCESS_NET`, so the session exists only
+  while a page that shows the column is visible. Measured overhead 4.0 % of
+  one core versus ~3 % without.
+
 ## Recently landed (2026-08-31 — text rendering and graphics mode)
 
 - **Text**: Segoe UI Variable (`SegUIVar.ttf`, pinned `wght=400`/`opsz=10.5`)

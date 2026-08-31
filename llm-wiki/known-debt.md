@@ -24,7 +24,7 @@ items across Phases 2–6. The following concrete gaps remain:
   but Processes and Users still expose fixed column sets rather than every
   native optional header-menu column. A shared cross-tab column registry is
   still desirable when the missing telemetry providers below are added.
-- **Telemetry fidelity:** ETW per-process network; native SRUM App History;
+- **Telemetry fidelity:** native SRUM App History;
   measured Startup Impact; packaged/MSIX startup tasks; full `.lnk` target
   resolution through `IShellLink`/`IPersistFile`; memory-composition
   categories/bar; full per-GPU-engine histories and static GPU details.

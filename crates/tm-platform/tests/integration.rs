@@ -186,3 +186,81 @@ fn efficiency_mode_state_is_known_for_own_process() {
     actions.set_efficiency_mode(me, false).expect("disable");
     assert_eq!(observed, Some(true), "enabled EcoQoS must be read back");
 }
+
+#[cfg(target_os = "windows")]
+#[test]
+fn per_process_network_is_unknown_or_measured_never_fabricated() {
+    // The ETW session needs administrator rights. Whichever way this test
+    // runs, the invariant is the same: either EVERY real process carries a
+    // network reading, or NONE does. A mix would mean we invented zeros for
+    // the processes the trace happened not to see.
+    let mut collector = tm_platform::create_collector();
+    collector.set_demand(
+        tm_core::demand::TelemetryDemand::core()
+            .union(tm_core::demand::TelemetryDemand::PROCESS_NET),
+    );
+    let _ = collector.sample(std::time::Instant::now()).expect("tick 1");
+    std::thread::sleep(std::time::Duration::from_millis(400));
+    let snap = collector.sample(std::time::Instant::now()).expect("tick 2");
+
+    let real: Vec<_> = snap.processes.iter().filter(|p| !p.synthetic).collect();
+    assert!(!real.is_empty());
+    let measured = real.iter().filter(|p| p.net_recv_bps.is_some()).count();
+    assert!(
+        measured == 0 || measured == real.len(),
+        "network telemetry must be all-or-nothing, got {measured}/{}",
+        real.len()
+    );
+    if measured == 0 {
+        eprintln!("per-process network unavailable (not elevated) - reported as unknown");
+        return;
+    }
+    // When it IS available the numbers must be sane: no negative rates, and
+    // totals must be consistent with the reported direction.
+    for p in &real {
+        assert!(p.net_recv_bps.unwrap() >= 0.0, "{} negative recv", p.name);
+        assert!(p.net_sent_bps.unwrap() >= 0.0, "{} negative sent", p.name);
+        assert!(p.net_recv_total.is_some() && p.net_sent_total.is_some());
+    }
+    // Synthetic CPU pseudo-rows never get a fabricated reading.
+    for p in snap.processes.iter().filter(|p| p.synthetic) {
+        assert!(p.net_recv_bps.is_none(), "pseudo-row must stay unknown");
+    }
+}
+
+/// Diagnostic (run elevated): prints the busiest processes by network rate so
+/// the ETW attribution can be eyeballed against Task Manager. Ignored by
+/// default because it needs administrator rights AND live traffic.
+#[cfg(target_os = "windows")]
+#[test]
+#[ignore = "needs elevation and live network traffic"]
+fn show_top_network_processes() {
+    use tm_core::demand::TelemetryDemand;
+    let mut collector = tm_platform::create_collector();
+    collector.set_demand(TelemetryDemand::core().union(TelemetryDemand::PROCESS_NET));
+    let mut top = Vec::new();
+    for _ in 0..6 {
+        let snap = collector.sample(std::time::Instant::now()).expect("tick");
+        std::thread::sleep(std::time::Duration::from_millis(1000));
+        top = snap
+            .processes
+            .iter()
+            .filter_map(|p| {
+                let rate = p.net_recv_bps? + p.net_sent_bps?;
+                Some((
+                    rate,
+                    p.name.clone(),
+                    p.pid,
+                    p.net_recv_total?,
+                    p.net_sent_total?,
+                ))
+            })
+            .collect::<Vec<_>>();
+    }
+    top.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
+    eprintln!("--- top network processes (bytes/s, cumulative recv/sent) ---");
+    for (rate, name, pid, recv, sent) in top.iter().take(10) {
+        eprintln!("{name:<28} pid={pid:<7} {rate:>12.0} B/s   recv={recv:<12} sent={sent}");
+    }
+    assert!(!top.is_empty(), "no process carried a network reading");
+}

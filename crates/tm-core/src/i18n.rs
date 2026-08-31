@@ -323,6 +323,10 @@ keys! {
         "Graustufen-Kantenglättung. Subpixel-Darstellung (ClearType) unterstützt die Oberfläche nicht.",
         "Grayscale anti-aliasing. Sub-pixel rendering (ClearType) is not supported by the UI toolkit."
     ],
+    NetPerProcessUnavailable => [
+        "Netzwerk pro Prozess benötigt Administratorrechte (ETW-Sitzung).",
+        "Per-process network needs administrator rights (ETW session)."
+    ],
     RenderModeLabel => ["Grafikausgabe:", "Graphics:"],
     RenderAuto => ["Automatisch (GPU)", "Automatic (GPU)"],
     RenderCompat => ["Kompatibilität (OpenGL)", "Compatibility (OpenGL)"],

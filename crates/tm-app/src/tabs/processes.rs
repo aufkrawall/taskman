@@ -580,6 +580,9 @@ fn row_ui(
         .map(|(s, t)| HeatCell::new(*t, s.clone()))
         .collect();
     table.heat_cells(ui, pal, rect, 2, &cells);
+    let net_tip = (!row.net_available)
+        .then(|| unavailable_network_tip(ui, table, rect))
+        .flatten();
 
     if resp.clicked() {
         if row.synthetic {
@@ -594,15 +597,31 @@ fn row_ui(
     // on_hover_text/context_menu consume the response (builder style). A
     // status glyph under the cursor explains itself first; otherwise the
     // row's own explanation (e.g. unattributable CPU) applies.
-    let resp = match (status_tip, &row.tooltip) {
-        (Some(tip), _) => resp.on_hover_text(tip),
-        (None, Some(tip)) => resp.on_hover_text(tip),
-        (None, None) => resp,
+    let resp = match (status_tip, net_tip, &row.tooltip) {
+        (Some(tip), _, _) => resp.on_hover_text(tip),
+        (None, Some(tip), _) => resp.on_hover_text(tip),
+        (None, None, Some(tip)) => resp.on_hover_text(tip),
+        (None, None, None) => resp,
     };
     // Pseudo-rows carry no killable process — no action menu at all.
     if !row.synthetic {
         resp.context_menu(|ui| context_menu(app, ui, row));
     }
+}
+
+/// Explain the "—" in the Network column instead of leaving the user to
+/// wonder. Per-process bytes come from an ETW session, which Windows only
+/// grants to administrators; without it the honest answer is "unknown", and
+/// this says why.
+fn unavailable_network_tip(
+    ui: &egui::Ui,
+    table: &tablekit::TmTable,
+    rect: egui::Rect,
+) -> Option<&'static str> {
+    let cell = table.col_rect(5, rect);
+    let pointer = ui.ctx().pointer_latest_pos()?;
+    cell.contains(pointer)
+        .then_some(i18n::tr(K::NetPerProcessUnavailable))
 }
 
 /// Width the status glyph strip needs; also the auto-fit contribution when
@@ -2142,6 +2161,54 @@ mod tests {
         );
         assert!(heat[0][0] > heat[1][0]);
         assert!(heat[1][0] > heat[2][0] || heat[2][0] == 0.0);
+    }
+
+    /// The counterpart to `missing_network_renders_unavailable_not_zero`:
+    /// once the ETW trace supplies rates they must reach the Network column
+    /// as a real value, and a family row must sum its members.
+    #[test]
+    fn measured_network_reaches_the_column_and_aggregates() {
+        let mut root = proc(1, None, "svc.exe", ProcCategory::Background);
+        root.net_recv_bps = Some(1_000.0);
+        root.net_sent_bps = Some(250.0);
+        let mut child = proc(2, Some(1), "svc.exe", ProcCategory::Background);
+        child.net_recv_bps = Some(500.0);
+        child.net_sent_bps = Some(0.0);
+        let snap = snap_of(vec![root, child]);
+        let rows = build_display_rows(&snap, "", 0, true, &HashSet::new(), &[false; 3]);
+        let head = rows
+            .iter()
+            .find_map(|row| match row {
+                DisplayRow::Process(row) if row.pid == 1 => Some(row.clone()),
+                _ => None,
+            })
+            .expect("family head row");
+        assert!(head.net_available, "a measured rate is not 'unavailable'");
+        // 1000 + 250 (own) + 500 + 0 (child) bytes/s over the family.
+        assert!((head.values[3] - 1_750.0).abs() < f64::EPSILON);
+        // ...and the column renders a rate, not the unavailable dash.
+        let rendered = format::format_mbit(head.values[3]);
+        assert!(rendered != "—" && rendered.starts_with('0'), "{rendered}");
+        // A zero rate is a MEASUREMENT, so it still counts as available.
+        let mut quiet = proc(3, None, "quiet.exe", ProcCategory::Background);
+        quiet.net_recv_bps = Some(0.0);
+        quiet.net_sent_bps = Some(0.0);
+        let rows = build_display_rows(
+            &snap_of(vec![quiet]),
+            "",
+            0,
+            true,
+            &HashSet::new(),
+            &[false; 3],
+        );
+        let row = rows
+            .iter()
+            .find_map(|row| match row {
+                DisplayRow::Process(row) => Some(row.clone()),
+                _ => None,
+            })
+            .unwrap();
+        assert!(row.net_available, "measured zero must not read as unknown");
     }
 
     #[test]
