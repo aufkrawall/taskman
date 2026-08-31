@@ -21,7 +21,54 @@ mod theme;
 mod ui_state;
 mod widgets;
 
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::Instant;
+
+/// The rendering path this process actually started on. The renderer and
+/// adapter are chosen once, before the window exists, so the settings dialog
+/// compares the live value against the persisted one to decide whether to
+/// show its "takes effect at the next start" note.
+static ACTIVE_RENDER_MODE: AtomicU8 = AtomicU8::new(0);
+
+fn store_render_mode(mode: tm_core::settings::RenderMode) {
+    use tm_core::settings::RenderMode;
+    ACTIVE_RENDER_MODE.store(
+        match mode {
+            RenderMode::Auto => 0,
+            RenderMode::Compatibility => 1,
+            RenderMode::Software => 2,
+        },
+        Ordering::Relaxed,
+    );
+}
+
+pub fn active_render_mode() -> tm_core::settings::RenderMode {
+    use tm_core::settings::RenderMode;
+    match ACTIVE_RENDER_MODE.load(Ordering::Relaxed) {
+        1 => RenderMode::Compatibility,
+        2 => RenderMode::Software,
+        _ => RenderMode::Auto,
+    }
+}
+
+/// Effective rendering path: the persisted setting unless
+/// `TASKMAN_GPU=auto|compatibility|software` (or the legacy `0`/`1`)
+/// overrides it for diagnostics.
+fn effective_render_mode(settings: &tm_core::settings::Settings) -> tm_core::settings::RenderMode {
+    use tm_core::settings::RenderMode;
+    match std::env::var("TASKMAN_GPU")
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "" => settings.render_mode,
+        "0" | "off" | "false" | "software" | "cpu" | "warp" => RenderMode::Software,
+        "gl" | "opengl" | "compatibility" => RenderMode::Compatibility,
+        "1" | "on" | "true" | "auto" => RenderMode::Auto,
+        _ => settings.render_mode,
+    }
+}
 
 const APP_ID: &str = "io.github.aufkrawall.Taskman";
 const DEFAULT_WINDOW_SIZE: [f32; 2] = [1280.0, 800.0];
@@ -197,6 +244,8 @@ fn run_gui(mock: bool, args: &[String]) {
         settings.window_size = sz;
     }
     tm_core::i18n::set_lang(settings.language.resolve());
+    let render_mode = effective_render_mode(&settings);
+    store_render_mode(render_mode);
     let window_size = [settings.window_size[0], settings.window_size[1]];
     let restore_position = has_saved_settings && settings.remember_window;
     let window_position = restore_position.then(ui_state::window_position).flatten();
@@ -241,8 +290,8 @@ fn run_gui(mock: bool, args: &[String]) {
             let mut opts = opts;
             let mut config =
                 eframe::WgpuConfiguration::default().with_surface_config(eframe::SurfaceConfig {
-                    present_mode: eframe::wgpu::PresentMode::Fifo,
-                    desired_maximum_frame_latency: Some(1),
+                    present_mode: present_mode_pref(),
+                    desired_maximum_frame_latency: frame_latency_pref(),
                 });
             let eframe::egui_wgpu::WgpuSetup::CreateNew(setup) = &mut config.wgpu_setup else {
                 unreachable!("default wgpu configuration creates a fresh instance")
@@ -257,13 +306,27 @@ fn run_gui(mock: bool, args: &[String]) {
             // remains an opt-in override for diagnostics.
             setup.power_preference = eframe::wgpu::PowerPreference::from_env()
                 .unwrap_or(eframe::wgpu::PowerPreference::LowPower);
+            // "GPU acceleration off" means the platform's software
+            // rasterizer (WARP on Windows, lavapipe on Linux), which
+            // enumerates as a CPU-type adapter on the same backend. If the
+            // host has none, keep rendering rather than refusing to start —
+            // the settings dialog reports what actually happened.
+            if render_mode == tm_core::settings::RenderMode::Software {
+                setup.native_adapter_selector = Some(std::sync::Arc::new(select_software_adapter));
+            }
             opts.wgpu_options = config;
             opts
         };
         opts
     };
 
-    let renderer_pref = std::env::var("TASKMAN_RENDERER").unwrap_or_default();
+    // Compatibility mode IS the OpenGL backend; an explicit TASKMAN_RENDERER
+    // still wins so the diagnostic override keeps working.
+    let renderer_pref = match std::env::var("TASKMAN_RENDERER") {
+        Ok(v) if !v.is_empty() => v,
+        _ if render_mode == tm_core::settings::RenderMode::Compatibility => "glow".to_string(),
+        _ => String::new(),
+    };
     StartupTrace::mark("run_native_enter");
 
     let mut last_err = None;
@@ -314,6 +377,65 @@ fn run_gui(mock: bool, args: &[String]) {
                 _ => true,
             })
             .collect()
+    }
+}
+
+/// Pick the software rasterizer among the enumerated adapters, preferring
+/// one that can actually present to our surface. Falls back to any adapter so
+/// a machine without a software rasterizer still gets a window.
+#[cfg(feature = "wgpu")]
+fn select_software_adapter(
+    adapters: &[eframe::wgpu::Adapter],
+    surface: Option<&eframe::wgpu::Surface<'_>>,
+) -> Result<eframe::wgpu::Adapter, String> {
+    let compatible = |a: &eframe::wgpu::Adapter| surface.is_none_or(|s| a.is_surface_supported(s));
+    let is_cpu =
+        |a: &eframe::wgpu::Adapter| a.get_info().device_type == eframe::wgpu::DeviceType::Cpu;
+    let chosen = adapters
+        .iter()
+        .find(|a| is_cpu(a) && compatible(a))
+        .or_else(|| adapters.iter().find(|a| is_cpu(a)))
+        .inspect(|a| {
+            tracing::info!(adapter = %a.get_info().name, "software rendering active");
+        })
+        .or_else(|| {
+            // Report what actually happened instead of pretending the choice
+            // took effect; the settings dialog reads this back.
+            store_render_mode(tm_core::settings::RenderMode::Auto);
+            tracing::warn!("no software rasterizer available; staying on the GPU adapter");
+            adapters.iter().find(|a| compatible(a))
+        })
+        .ok_or_else(|| "no usable wgpu adapter".to_string())?;
+    Ok(chosen.clone())
+}
+
+/// `TASKMAN_PRESENT=fifo|immediate|mailbox|autovsync` (diagnostics).
+#[cfg(feature = "wgpu")]
+fn present_mode_pref() -> eframe::wgpu::PresentMode {
+    use eframe::wgpu::PresentMode;
+    match std::env::var("TASKMAN_PRESENT")
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "immediate" => PresentMode::Immediate,
+        "mailbox" => PresentMode::Mailbox,
+        "autovsync" => PresentMode::AutoVsync,
+        _ => PresentMode::Fifo,
+    }
+}
+
+/// `TASKMAN_FRAME_LATENCY=n` (diagnostics); 0 means "leave it to wgpu".
+#[cfg(feature = "wgpu")]
+fn frame_latency_pref() -> Option<u32> {
+    match std::env::var("TASKMAN_FRAME_LATENCY")
+        .ok()
+        .and_then(|v| v.trim().parse::<u32>().ok())
+    {
+        Some(0) => None,
+        Some(n) => Some(n),
+        None => Some(1),
     }
 }
 

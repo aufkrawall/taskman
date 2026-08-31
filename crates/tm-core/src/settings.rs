@@ -98,6 +98,51 @@ impl UpdateSpeed {
     }
 }
 
+/// Glyph anti-aliasing weight.
+///
+/// egui rasterizes glyphs into a single-channel coverage atlas, so RGB
+/// sub-pixel anti-aliasing (ClearType) is not available; what IS tunable is
+/// the coverage-to-alpha ramp, which decides how heavy the strokes come out.
+/// See `llm-wiki/known-debt.md` for why the sub-pixel part cannot be fixed
+/// from this side.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum TextSmoothing {
+    /// Raw coverage: the thinnest, crispest strokes. Windows UI text is
+    /// rendered close to this weight, which is why it is the default.
+    #[default]
+    Sharp,
+    /// egui's per-theme ramp — light mode linear, dark mode `2c - c^2`,
+    /// which inflates partially covered pixels to keep bright-on-dark text
+    /// from looking spindly, at the cost of heavier strokes.
+    Standard,
+    /// Standard plus sub-pixel binning: glyphs are cached at four fractional
+    /// horizontal offsets for more even spacing, and look softer for it.
+    Smooth,
+}
+
+/// Which rendering path the GUI starts on.
+///
+/// Measured on a Ryzen 7 5700X + RTX (16 logical CPUs), continuous repaint:
+/// D3D12 on the GPU 0.3 cores, OpenGL on the GPU 1.0 core, and the D3D12
+/// software rasterizer (WARP) 14 cores at 2.9 fps — WARP's per-frame cost is
+/// fixed (identical for a 500x320 and a 2000x1200 window, and identical for
+/// an empty and a full window), so nothing this app draws can bring it down.
+/// That is why "no GPU" is offered as the OpenGL path, and [`Self::Software`]
+/// carries an explicit warning.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum RenderMode {
+    /// D3D12/Vulkan/Metal through wgpu, falling back to OpenGL.
+    #[default]
+    Auto,
+    /// Force the OpenGL backend: a completely separate driver path, for
+    /// machines where the D3D12/Vulkan driver misbehaves. Still GPU-accelerated,
+    /// and still comfortably real-time.
+    Compatibility,
+    /// CPU rasterizer (WARP on Windows). Correct, but very slow — see the
+    /// numbers above.
+    Software,
+}
+
 /// Persisted sort for one table, keyed by stable table/column identifiers.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SortPreference {
@@ -188,6 +233,11 @@ pub struct Settings {
     /// unelevated, the process re-execs itself elevated (runas/UAC) before
     /// the window opens.
     pub start_elevated: bool,
+    /// Glyph anti-aliasing weight. Applies live.
+    pub text_smoothing: TextSmoothing,
+    /// Rendering path. Read once during startup — the renderer and adapter are
+    /// chosen before the window exists — so changing it needs a restart.
+    pub render_mode: RenderMode,
 }
 
 impl Default for Settings {
@@ -216,6 +266,8 @@ impl Default for Settings {
             close_to_tray: false,
             start_with_windows: false,
             start_elevated: false,
+            text_smoothing: TextSmoothing::default(),
+            render_mode: RenderMode::default(),
         }
     }
 }
@@ -463,6 +515,47 @@ impl ThemeMode {
     }
 }
 
+impl RenderMode {
+    fn as_cfg(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Compatibility => "compatibility",
+            Self::Software => "software",
+        }
+    }
+    fn from_cfg(s: &str) -> Option<Self> {
+        match s.to_ascii_lowercase().as_str() {
+            "auto" | "automatic" | "automatisch" | "gpu" | "true" | "on" => Some(Self::Auto),
+            "compatibility" | "kompatibilitaet" | "opengl" | "gl" => Some(Self::Compatibility),
+            "software" | "cpu" | "warp" | "false" | "off" => Some(Self::Software),
+            _ => None,
+        }
+    }
+
+    /// True when this mode still renders on the GPU.
+    pub fn is_accelerated(self) -> bool {
+        !matches!(self, Self::Software)
+    }
+}
+
+impl TextSmoothing {
+    fn as_cfg(self) -> &'static str {
+        match self {
+            Self::Sharp => "sharp",
+            Self::Standard => "standard",
+            Self::Smooth => "smooth",
+        }
+    }
+    fn from_cfg(s: &str) -> Option<Self> {
+        match s.to_ascii_lowercase().as_str() {
+            "sharp" | "scharf" => Some(Self::Sharp),
+            "standard" | "normal" => Some(Self::Standard),
+            "smooth" | "weich" => Some(Self::Smooth),
+            _ => None,
+        }
+    }
+}
+
 impl UpdateSpeed {
     fn as_cfg(self) -> &'static str {
         match self {
@@ -594,6 +687,17 @@ impl Settings {
             .unwrap_or(s.details_tree_view);
         s.close_to_tray = b("general", "close_to_tray", s.close_to_tray);
         s.start_with_windows = b("general", "start_with_windows", s.start_with_windows);
+        if let Some(v) = get("general", "text_smoothing").and_then(|v| TextSmoothing::from_cfg(v)) {
+            s.text_smoothing = v;
+        }
+        // `gpu_acceleration=off` is accepted as a synonym for the software
+        // path so a hand-edited config keeps working.
+        if let Some(v) = get("general", "render_mode")
+            .and_then(|v| RenderMode::from_cfg(v))
+            .or_else(|| get("general", "gpu_acceleration").and_then(|v| RenderMode::from_cfg(v)))
+        {
+            s.render_mode = v;
+        }
 
         // Column preferences, ID-keyed schema: `[columns.<table>]
         // <col>=<width>`, `[columns.<table>.visible] <col>=0|1` and
@@ -753,6 +857,8 @@ impl Settings {
             ("close_to_tray", self.close_to_tray.to_string()),
             ("start_with_windows", self.start_with_windows.to_string()),
             ("start_elevated", self.start_elevated.to_string()),
+            ("text_smoothing", self.text_smoothing.as_cfg().to_string()),
+            ("render_mode", self.render_mode.as_cfg().to_string()),
         ];
         let mut body = String::from("[general]\n");
         for (k, v) in g {
@@ -941,6 +1047,60 @@ fn settings_writer_loop(rx: std::sync::mpsc::Receiver<WriteMsg>) {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn render_mode_round_trips_and_accepts_the_legacy_bool() {
+        for mode in [
+            RenderMode::Auto,
+            RenderMode::Compatibility,
+            RenderMode::Software,
+        ] {
+            assert_eq!(RenderMode::from_cfg(mode.as_cfg()), Some(mode));
+        }
+        // A hand-edited `gpu_acceleration=off` must still land on software.
+        let s = Settings::from_ini_text(
+            "[general]
+gpu_acceleration=off
+",
+        );
+        assert_eq!(s.render_mode, RenderMode::Software);
+        assert!(!s.render_mode.is_accelerated());
+        // An explicit render_mode wins over the legacy key.
+        let s = Settings::from_ini_text(
+            "[general]
+gpu_acceleration=off
+render_mode=compatibility
+",
+        );
+        assert_eq!(s.render_mode, RenderMode::Compatibility);
+        assert!(s.render_mode.is_accelerated());
+        assert_eq!(Settings::default().render_mode, RenderMode::Auto);
+    }
+
+    #[test]
+    fn text_smoothing_round_trips_and_defaults_to_sharp() {
+        for mode in [
+            TextSmoothing::Sharp,
+            TextSmoothing::Standard,
+            TextSmoothing::Smooth,
+        ] {
+            assert_eq!(TextSmoothing::from_cfg(mode.as_cfg()), Some(mode));
+        }
+        assert_eq!(Settings::default().text_smoothing, TextSmoothing::Sharp);
+        let s = Settings::from_ini_text(
+            "[general]
+text_smoothing=smooth
+",
+        );
+        assert_eq!(s.text_smoothing, TextSmoothing::Smooth);
+        // Unknown values never corrupt the setting.
+        let s = Settings::from_ini_text(
+            "[general]
+text_smoothing=banana
+",
+        );
+        assert_eq!(s.text_smoothing, TextSmoothing::Sharp);
+    }
     use super::*;
 
     #[test]

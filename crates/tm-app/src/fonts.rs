@@ -1,11 +1,24 @@
-//! Font setup: prefer OS-native fonts for a native look (Segoe UI on Windows,
-//! SF Pro via SFNS on macOS, Fontconfig-selected faces on Linux), fall back
-//! to known distro paths and then egui's bundled defaults.
+//! Font setup: prefer OS-native fonts for a native look (Segoe UI Variable
+//! on Windows 11, SF Pro via SFNS on macOS, Fontconfig-selected faces on
+//! Linux), fall back to known distro paths and then egui's bundled defaults.
 //!
 //! System font files are read on a background thread so startup stays fast.
+//!
+//! ## Why the hinting tweak matters more than anything else here
+//!
+//! epaint rasterizes through `skrifa`, which runs the font's real TrueType
+//! instructions — but epaint's DEFAULT `SmoothHinting` sets both
+//! `preserve_linear_metrics: true` and `symmetric_rendering: true`, and both
+//! of those switch horizontal grid-fitting OFF. Vertical stems then land on
+//! fractional pixel columns and get split across two grey columns, which is
+//! the "blurry, fat" look. Windows grid-fits horizontally, which is what puts
+//! a stem fully inside one pixel column. [`hinting_target`] turns that back on
+//! for the sharp profile.
 
+use eframe::egui::epaint::text::{FontTweak, HintingTarget, SmoothHinting, VariationCoords};
 use eframe::egui::{self, FontData, FontDefinitions};
 use std::sync::Arc;
+use tm_core::settings::TextSmoothing;
 
 pub fn install_async(ctx: egui::Context) {
     let ctx2 = ctx.clone();
@@ -19,6 +32,42 @@ pub fn install_async(ctx: egui::Context) {
     if spawned.is_err() {
         let defs = build_definitions();
         ctx.set_fonts(defs);
+    }
+}
+
+/// Re-apply the system fonts with the current [`TextSmoothing`] tweak.
+///
+/// The hinting target lives in each face's [`FontTweak`], not in the global
+/// text options, so changing the smoothing profile has to hand egui a fresh
+/// [`FontDefinitions`]. The parsed font FILES are reused; only the tweak
+/// changes, and this runs on a settings click, not per frame.
+pub fn reapply(ctx: &egui::Context) {
+    ctx.set_fonts(build_definitions());
+}
+
+/// Grid-fitting profile for the active smoothing choice.
+///
+/// `preserve_linear_metrics: false` + `symmetric_rendering: false` is the
+/// combination epaint documents as "lets the (auto)hinter snap horizontally
+/// for crisper stems"; egui positions glyphs from the shaper's advances, so
+/// this changes sharpness, not layout.
+fn hinting_target(smoothing: TextSmoothing) -> HintingTarget {
+    match smoothing {
+        TextSmoothing::Sharp => HintingTarget::Smooth(SmoothHinting {
+            light: false,
+            symmetric_rendering: false,
+            preserve_linear_metrics: false,
+        }),
+        TextSmoothing::Standard | TextSmoothing::Smooth => HintingTarget::default(),
+    }
+}
+
+/// Tweak applied to every face we install.
+fn tweak(smoothing: TextSmoothing, coords: VariationCoords) -> FontTweak {
+    FontTweak {
+        hinting_target: hinting_target(smoothing),
+        coords,
+        ..Default::default()
     }
 }
 
@@ -40,22 +89,38 @@ pub fn poll_async_apply(ctx: &egui::Context) {
 }
 
 fn build_definitions() -> FontDefinitions {
+    let smoothing = crate::theme::text_smoothing();
     let mut fonts = FontDefinitions::default();
 
-    let mut proportional_candidates: Vec<(&str, Vec<String>)> = Vec::new();
+    // Variable-font axes for Segoe UI Variable: regular weight at the "Text"
+    // optical size, which is the face Windows 11 itself uses for UI chrome.
+    // `opsz` 10.5 is the font's own default; naming it keeps us independent of
+    // that default and documents the intent.
+    let ui_coords = || VariationCoords::new([(b"wght", 400.0), (b"opsz", 10.5)]);
+
+    let mut proportional_candidates: Vec<(&str, Vec<String>, VariationCoords)> = Vec::new();
     #[cfg(target_os = "linux")]
     if let Some(path) = fontconfig_match("sans-serif") {
-        proportional_candidates.push(("FontconfigSans", vec![path]));
+        proportional_candidates.push(("FontconfigSans", vec![path], VariationCoords::default()));
     }
     proportional_candidates.extend([
+        // Windows 11's actual UI face first; `segoeui.ttf` is the Windows 10
+        // static fallback.
+        (
+            "SegoeUIVariable",
+            vec![r"C:\Windows\Fonts\SegUIVar.ttf".into()],
+            ui_coords(),
+        ),
         (
             "SegoeUI",
-            vec![
-                r"C:\Windows\Fonts\segoeui.ttf".into(),
-                r"C:\Windows\Fonts\SegoeUIVar.ttf".into(),
-            ],
+            vec![r"C:\Windows\Fonts\segoeui.ttf".into()],
+            VariationCoords::default(),
         ),
-        ("SFNS", vec!["/System/Library/Fonts/SFNS.ttf".into()]),
+        (
+            "SFNS",
+            vec!["/System/Library/Fonts/SFNS.ttf".into()],
+            VariationCoords::default(),
+        ),
         (
             "NotoSans",
             vec![
@@ -63,16 +128,19 @@ fn build_definitions() -> FontDefinitions {
                 "/usr/share/fonts/TTF/NotoSans-Regular.ttf".into(),
                 "/usr/share/noto-cjk/NotoSansCJK-Regular.ttc".into(),
             ],
+            VariationCoords::default(),
         ),
         (
             "DejaVuSans",
             vec!["/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf".into()],
+            VariationCoords::default(),
         ),
     ]);
 
-    for (name, paths) in &proportional_candidates {
+    for (name, paths, coords) in &proportional_candidates {
         if let Some(data) = load_first(paths) {
             tracing::info!(font = *name, "using system proportional font");
+            let data = data.tweak(tweak(smoothing, coords.clone()));
             fonts.font_data.insert((*name).to_string(), Arc::new(data));
             fonts
                 .families
@@ -102,6 +170,7 @@ fn build_definitions() -> FontDefinitions {
     ];
     for (name, paths) in bold_candidates {
         if let Some(data) = load_first(paths) {
+            let data = data.tweak(tweak(smoothing, VariationCoords::default()));
             fonts.font_data.insert(name.to_string(), Arc::new(data));
             fonts
                 .families
@@ -142,6 +211,7 @@ fn build_definitions() -> FontDefinitions {
     for (name, paths) in &mono_candidates {
         if let Some(data) = load_first(paths) {
             tracing::info!(font = *name, "using system monospace font");
+            let data = data.tweak(tweak(smoothing, VariationCoords::default()));
             fonts.font_data.insert((*name).to_string(), Arc::new(data));
             fonts
                 .families

@@ -371,6 +371,9 @@ impl TaskManApp {
         settings: Settings,
         initial_tab: Option<String>,
     ) -> Self {
+        // Publish the glyph-weight choice BEFORE the first visuals install,
+        // so the very first frame already rasterizes at the chosen weight.
+        crate::theme::set_text_smoothing(settings.text_smoothing);
         apply_theme(&cc.egui_ctx, settings.theme);
         if settings.ui_zoom != 1.0 {
             cc.egui_ctx.set_zoom_factor(settings.ui_zoom);

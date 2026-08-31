@@ -1,7 +1,38 @@
 //! Theme: Windows-11-Task-Manager palette for dark and light mode plus the
 //! blue heat-map gradient used by the table value cells.
 
+use std::sync::atomic::{AtomicU8, Ordering};
+
 use eframe::egui::{self, Color32, CornerRadius, FontId, Visuals};
+use tm_core::settings::TextSmoothing;
+
+/// Active glyph-weight choice. Process-global like the UI language, because
+/// [`install_visuals`] is called from contexts that do not carry settings
+/// (startup, per-frame theme re-check).
+static SMOOTHING: AtomicU8 = AtomicU8::new(0);
+
+fn smoothing_code(v: TextSmoothing) -> u8 {
+    match v {
+        TextSmoothing::Sharp => 0,
+        TextSmoothing::Standard => 1,
+        TextSmoothing::Smooth => 2,
+    }
+}
+
+/// Publish the user's glyph-weight choice. Returns true when it changed, so
+/// the caller can reinstall visuals; egui rebuilds the glyph atlas by itself
+/// once the new text options reach it, so no restart is needed.
+pub fn set_text_smoothing(v: TextSmoothing) -> bool {
+    SMOOTHING.swap(smoothing_code(v), Ordering::Relaxed) != smoothing_code(v)
+}
+
+pub fn text_smoothing() -> TextSmoothing {
+    match SMOOTHING.load(Ordering::Relaxed) {
+        1 => TextSmoothing::Standard,
+        2 => TextSmoothing::Smooth,
+        _ => TextSmoothing::Sharp,
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Palette {
@@ -94,15 +125,27 @@ pub fn apply_startup(ctx: &egui::Context) {
     install_visuals(ctx);
 }
 
-/// Re-install custom visuals when the active dark/light mode changed.
-/// Cheap enough to call every frame.
+/// Force the glyph atlas to be rebuilt with the current text options.
+/// `install_visuals` alone is enough — egui compares the incoming
+/// `TextOptions` against the atlas's and recreates it on a difference — but
+/// the repaint request makes the change visible immediately instead of at the
+/// next unrelated event.
+pub fn refresh_text_rendering(ctx: &egui::Context) {
+    install_visuals(ctx);
+    ctx.request_repaint();
+}
+
+/// Re-install custom visuals when the active dark/light mode or the glyph
+/// weight changed. Cheap enough to call every frame.
 pub fn ensure_visuals(ctx: &egui::Context) {
-    // Track the dark flag per theme; reinstall custom visuals when it changed.
-    let dark_dark = ctx.style_of(egui::Theme::Dark).visuals.dark_mode;
-    let applied = ctx.data(|d| d.get_temp::<bool>(egui::Id::new("tm-visuals-dark")));
-    if applied != Some(dark_dark) {
+    let state = (
+        ctx.style_of(egui::Theme::Dark).visuals.dark_mode,
+        SMOOTHING.load(Ordering::Relaxed),
+    );
+    let applied = ctx.data(|d| d.get_temp::<(bool, u8)>(egui::Id::new("tm-visuals-dark")));
+    if applied != Some(state) {
         install_visuals(ctx);
-        ctx.data_mut(|d| d.insert_temp(egui::Id::new("tm-visuals-dark"), dark_dark));
+        ctx.data_mut(|d| d.insert_temp(egui::Id::new("tm-visuals-dark"), state));
     }
 }
 
@@ -114,7 +157,7 @@ pub fn install_visuals(ctx: &egui::Context) {
             } else {
                 style.visuals = light_visuals();
             }
-            apply_text_aa(&mut style.visuals.text_options);
+            apply_text_aa(&mut style.visuals.text_options, theme);
             // Centralized text-style ladder so egui widgets and the
             // hand-painted chrome share one scale, matched to Win11 TM's
             // measured sizes: body/button/table text 13, dialog section
@@ -158,32 +201,59 @@ pub fn install_visuals(ctx: &egui::Context) {
     }
 }
 
-/// Text antialiasing tuned for Windows' ClearType look.
+/// Glyph anti-aliasing, as close to the Windows UI look as egui allows.
 ///
-/// What "ClearType" maps to inside egui (which does grayscale AA only —
-/// true RGB-subpixel rendering is upstream issue emilk/egui#2639):
-/// * `font_hinting` stays on (default): stems snap toward the pixel grid,
-///   like ClearType's hinted rendering.
+/// IMPORTANT — what is NOT possible here: egui stores every glyph in a
+/// single-channel coverage atlas and tints it in the shader, so there is no
+/// per-channel (RGB sub-pixel) coverage anywhere in the pipeline. True
+/// ClearType would need a 3-channel atlas plus dual-source blending in both
+/// the glow and wgpu backends; upstream tracks this as emilk/egui#2639.
+/// Everything below therefore tunes GRAYSCALE anti-aliasing.
+///
+/// What we do control:
+/// * `font_hinting` stays on: stems snap toward the pixel grid, like
+///   ClearType's hinted rendering.
 /// * Glyph positions snap to physical pixels (`TessellationOptions`
-///   `round_text_to_pixels`, also default-on).
-/// * `subpixel_binning` goes OFF: it renders every glyph at four fractional
-///   x-offsets which then get bilinearly sampled — softer edges, blurrier
-///   small text. Off = crisper stems at native scale, at the cost of
-///   slightly less even kerning (the classic crisp-Windows tradeoff).
-///   Restore binning with `TASKMAN_TEXT_BINNING=1` on fractional-DPI
-///   displays where evenness matters more than sharpness.
-/// * The glyph-coverage→alpha curve keeps egui's per-mode defaults
-///   (light: linear; dark: 2·c−c², which keeps bright-on-dark text sharp).
-fn apply_text_aa(opts: &mut egui::epaint::TextOptions) {
-    static BINNING: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    opts.subpixel_binning = *BINNING.get_or_init(|| {
-        std::env::var("TASKMAN_TEXT_BINNING")
-            .map(|v| !v.is_empty() && v != "0")
-            .unwrap_or(false)
-    });
+///   `round_text_to_pixels`, default-on).
+/// * `subpixel_binning` caches each glyph at four fractional x-offsets which
+///   are then bilinearly sampled — more even spacing, softer stems. Only
+///   [`TextSmoothing::Smooth`] asks for it.
+/// * The coverage→alpha ramp decides stroke WEIGHT. egui's dark-mode default
+///   `2c − c²` lifts every partially covered pixel (0.5 → 0.75), which reads
+///   as fat and blurry next to native Windows text;
+///   [`TextSmoothing::Sharp`] uses raw coverage instead.
+fn apply_text_aa(opts: &mut egui::epaint::TextOptions, theme: egui::Theme) {
+    use egui::epaint::FontColorTransferFunction as Ramp;
+    let smoothing = env_smoothing().unwrap_or_else(text_smoothing);
+    let per_theme = match theme {
+        egui::Theme::Dark => Ramp::DARK_MODE_DEFAULT,
+        egui::Theme::Light => Ramp::LIGHT_MODE_DEFAULT,
+    };
+    let (ramp, binning) = match smoothing {
+        TextSmoothing::Sharp => (Ramp::Off, false),
+        TextSmoothing::Standard => (per_theme, false),
+        TextSmoothing::Smooth => (per_theme, true),
+    };
+    opts.color_transfer_function = ramp;
+    opts.subpixel_binning = binning;
     // Hinting is already the default; assert the intent so a future default
     // flip cannot silently soften our text.
     opts.font_hinting = true;
+}
+
+/// `TASKMAN_TEXT_SMOOTHING=sharp|standard|smooth` overrides the setting for
+/// A/B comparisons without touching the user's config.
+fn env_smoothing() -> Option<TextSmoothing> {
+    static OVERRIDE: std::sync::OnceLock<Option<TextSmoothing>> = std::sync::OnceLock::new();
+    *OVERRIDE.get_or_init(|| {
+        let raw = std::env::var("TASKMAN_TEXT_SMOOTHING").ok()?;
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "sharp" => Some(TextSmoothing::Sharp),
+            "standard" => Some(TextSmoothing::Standard),
+            "smooth" => Some(TextSmoothing::Smooth),
+            _ => None,
+        }
+    })
 }
 
 pub fn dark_visuals() -> Visuals {
