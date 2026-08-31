@@ -55,6 +55,12 @@ contract.
   windows-service keeps them) must be the protected path.
   `live_service_identity_verifies_without_elevation` covers this against a
   running service and self-skips when the pipe is unreachable.
+- After writing a response (or a rejection) the broker drops its pipe handle
+  without `DisconnectNamedPipe`: disconnecting discards outbound bytes the
+  client has not read yet, which raced the client's read and made roughly
+  every second response vanish (the state display flapped between Running and
+  "authentication failed"). Dropping the handle lets the client drain the
+  response; the instance is released when the client's end closes.
 - A protected manifest pins protocol/schema, authorized user SID, exact GUI and
   service paths, and SHA-256 hashes. The service validates it before listening.
 - Two workers, a bounded queue of 16, and a matching 19-instance pipe cap keep

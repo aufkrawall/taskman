@@ -1,5 +1,23 @@
 # Recent Activity
 
+## 2026-08-31 — response-delivery race: state display flapped Running/Degraded
+
+User report: the Advanced state alternated between "Active" and "broker
+authentication failed". `handle_client` called `DisconnectNamedPipe`
+immediately after writing the response; npfs discards queued outbound bytes
+on disconnect, so the client's read raced the teardown — measured 24/40
+delivered (drop: 40/40, flush+disconnect: 40/40). Lost pings surfaced as the
+generic degraded message while the SCM still reported Running. Became visible
+only after the DACL/identity fixes let non-elevated pings reach the response
+stage at all.
+
+Fix: broker drops its handle instead of disconnecting, in `handle_client` and
+`reject_client` alike; the client drains the response and releases the
+instance when its end closes. Also empirically validated
+`USER_PIPE_ACCESS`/npfs requirements with a self-made-pipe bisection
+(see tools history): grants without FILE_READ_ATTRIBUTES deny pipe client
+opens regardless of requested mask.
+
 ## 2026-08-31 — real root cause: pipe DACL missing FILE_READ_ATTRIBUTES
 
 Follow-up to the ForeignClient fix: the installed (non-elevated) GUI still

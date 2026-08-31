@@ -35,9 +35,8 @@ use windows::Win32::Storage::FileSystem::{
     PIPE_ACCESS_DUPLEX,
 };
 use windows::Win32::System::Pipes::{
-    ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, GetNamedPipeClientProcessId,
-    GetNamedPipeServerProcessId, PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE,
-    PIPE_WAIT, WaitNamedPipeW,
+    ConnectNamedPipe, CreateNamedPipeW, GetNamedPipeClientProcessId, GetNamedPipeServerProcessId,
+    PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE, PIPE_WAIT, WaitNamedPipeW,
 };
 use windows::Win32::System::Threading::{
     GetCurrentProcess, OpenProcess, OpenProcessToken, PROCESS_ACCESS_RIGHTS,
@@ -1093,9 +1092,11 @@ fn handle_client(work: ClientWork, actions: &super::WinActions) {
     {
         tracing::warn!(%error, "broker client request failed");
     }
-    unsafe {
-        let _ = DisconnectNamedPipe(HANDLE(pipe.as_raw_handle()));
-    }
+    // Deliberately no DisconnectNamedPipe here: it discards response bytes the
+    // client has not read yet, so a racing client lost its response and saw
+    // "action state is unknown". Dropping the handle lets the client drain
+    // the response first; the pipe instance is released when the client's end
+    // closes.
 }
 
 fn reject_client(mut pipe: File, detail: impl Into<String>) {
@@ -1106,9 +1107,8 @@ fn reject_client(mut pipe: File, detail: impl Into<String>) {
     if let Ok(payload) = serde_json::to_vec(&response) {
         let _ = write_frame(&mut pipe, FRAME_RESPONSE, &payload, MAX_RESPONSE_BYTES);
     }
-    unsafe {
-        let _ = DisconnectNamedPipe(HANDLE(pipe.as_raw_handle()));
-    }
+    // Drop without DisconnectNamedPipe so the rejection text survives the
+    // teardown race; see the note in handle_client.
 }
 
 fn checked_target(
