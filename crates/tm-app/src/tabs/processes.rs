@@ -247,23 +247,26 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
     }
     let rows = cache.as_ref().expect("cache").rows.clone();
 
-    // Task-Manager-style type navigation: a plain letter selects the next
-    // visible process beginning with that letter. Repeated presses cycle and
-    // wrap in the exact flattened/sorted order shown on screen.
-    if let Some(initial) = search::list_initial(ui.ctx()) {
+    // Task-Manager-style type navigation: typed letters accumulate into a
+    // word, so "svc" lands on svchost.exe instead of jumping to whatever
+    // starts with "c". One letter (or the same letter repeated) still cycles
+    // and wraps in the exact flattened/sorted order shown on screen.
+    if let Some(typed) = search::list_type_ahead(ui.ctx(), "processes") {
         let selected = app.selected_process.as_ref().map(|p| p.pid);
-        if let Some(pid) = search::cycle_match(
-            rows.iter().filter_map(|row| match row {
+        let candidates = rows
+            .iter()
+            .filter_map(|row| match row {
                 DisplayRow::Process(row) if !row.synthetic => Some((row.pid, row.name.as_str())),
                 DisplayRow::GroupHeader(..) => None,
                 DisplayRow::Process(_) => None,
-            }),
-            selected,
-            initial,
-        ) && let Some(row) = rows.iter().find_map(|row| match row {
-            DisplayRow::Process(row) if row.pid == pid => Some(row),
-            _ => None,
-        }) {
+            })
+            .collect::<Vec<_>>();
+        if let Some(pid) = search::type_ahead_match(candidates, selected, &typed)
+            && let Some(row) = rows.iter().find_map(|row| match row {
+                DisplayRow::Process(row) if row.pid == pid => Some(row),
+                _ => None,
+            })
+        {
             app.selected_process = Some(crate::app::ProcessIdentity {
                 pid: row.pid,
                 start_epoch_s: row.start_epoch_s,
@@ -433,8 +436,14 @@ fn prepare_auto_fit_widths(
                 + 66.0
                 + row.depth as f32 * 22.0,
         );
-        let status = status_text(row);
-        widths[1] = widths[1].max(tablekit::text_width(ui, &status, tablekit::FONT_ROW) + 42.0);
+        // The Status cell renders glyphs plus at most the "not responding"
+        // text, so auto-fit measures exactly that, not the tooltip wording.
+        let glyphs = u8::from(row.status == ProcStatus::Suspended) + u8::from(row.power_throttled);
+        let mut status_w = 20.0 + f32::from(glyphs) * STATUS_GLYPH_W;
+        if row.status == ProcStatus::NotResponding {
+            status_w += tablekit::text_width(ui, i18n::tr(K::StNotResponding), tablekit::FONT_ROW);
+        }
+        widths[1] = widths[1].max(status_w);
         let values = [
             format::format_pct_cell(row.values[0].min(100.0) as f32),
             format::format_mb(row.values[1] as u64),
@@ -547,20 +556,11 @@ fn row_ui(
         pal.text,
     );
 
-    // Status text + efficiency leaf sourced from the SNAPSHOT (audit §8).
-    table.text_cell(ui, rect, 1, &status_text(row), pal, false);
-    if row.power_throttled {
-        let status_rect = table.col_rect(1, rect);
-        crate::icons::draw_at(
-            ui,
-            egui::Rect::from_center_size(
-                egui::Pos2::new(status_rect.right() - 16.0, rect.center().y),
-                egui::vec2(16.0, 16.0),
-            ),
-            Icon::Leaf,
-            pal.ok_green,
-        );
-    }
+    // Status column, sourced from the SNAPSHOT (audit §8). Native Task
+    // Manager draws glyphs here — an orange pause for suspended, a green leaf
+    // for efficiency mode — and puts the words in a tooltip; only
+    // "not responding" stays spelled out.
+    let status_tip = status_cell(ui, pal, table, rect, row);
 
     // Heat cells: intensities were normalized per column across the whole
     // display model during cache build (audit P0.2); here we only paint.
@@ -579,8 +579,7 @@ fn row_ui(
         .zip(row.heat.iter())
         .map(|(s, t)| HeatCell::new(*t, s.clone()))
         .collect();
-    let cells_active = row.values.iter().any(|&v| v > 0.0);
-    table.heat_cells(ui, pal, rect, 2, &cells, cells_active);
+    table.heat_cells(ui, pal, rect, 2, &cells);
 
     if resp.clicked() {
         if row.synthetic {
@@ -592,10 +591,13 @@ fn row_ui(
             });
         }
     }
-    // on_hover_text/context_menu consume the response (builder style).
-    let resp = match &row.tooltip {
-        Some(tip) => resp.on_hover_text(tip),
-        None => resp,
+    // on_hover_text/context_menu consume the response (builder style). A
+    // status glyph under the cursor explains itself first; otherwise the
+    // row's own explanation (e.g. unattributable CPU) applies.
+    let resp = match (status_tip, &row.tooltip) {
+        (Some(tip), _) => resp.on_hover_text(tip),
+        (None, Some(tip)) => resp.on_hover_text(tip),
+        (None, None) => resp,
     };
     // Pseudo-rows carry no killable process — no action menu at all.
     if !row.synthetic {
@@ -603,21 +605,58 @@ fn row_ui(
     }
 }
 
-fn status_text(row: &RowData) -> String {
-    let base = match row.status {
-        ProcStatus::Running => "",
-        ProcStatus::Suspended => i18n::tr(K::StSuspended),
-        ProcStatus::NotResponding => i18n::tr(K::StNotResponding),
-    };
-    if row.power_throttled {
-        if base.is_empty() {
-            i18n::tr(K::StEfficiencyMode).to_string()
-        } else {
-            format!("{base}, {}", i18n::tr(K::StEfficiencyMode))
+/// Width the status glyph strip needs; also the auto-fit contribution when
+/// a row has no "not responding" text.
+const STATUS_GLYPH_W: f32 = 22.0;
+
+/// Paint the Status cell: glyphs first, then any remaining text after them,
+/// and report what the glyph under the cursor means.
+///
+/// The word behind each glyph stays discoverable through the ROW's tooltip
+/// rather than a widget of its own: an extra hover target stacked on the row
+/// would steal the row's own hover state and make the highlight flicker off
+/// whenever the cursor crossed an icon.
+fn status_cell(
+    ui: &egui::Ui,
+    pal: &theme::Palette,
+    table: &tablekit::TmTable,
+    rect: egui::Rect,
+    row: &RowData,
+) -> Option<&'static str> {
+    let cell = table.col_rect(1, rect);
+    let pointer = ui.ctx().pointer_latest_pos();
+    let mut x = cell.left() + 10.0;
+    let mut hovered = None;
+    let mut glyph = |icon: Icon, color: egui::Color32, tip: &'static str| {
+        let r = egui::Rect::from_center_size(
+            egui::Pos2::new(x + 8.0, rect.center().y),
+            egui::vec2(16.0, 16.0),
+        );
+        if cell.contains(r.right_center()) {
+            crate::icons::draw_at(ui, r, icon, color);
+            if pointer.is_some_and(|p| r.expand(3.0).contains(p)) {
+                hovered = Some(tip);
+            }
         }
-    } else {
-        base.to_string()
+        x += STATUS_GLYPH_W;
+    };
+    if row.status == ProcStatus::Suspended {
+        glyph(Icon::Pause, pal.warn_orange, i18n::tr(K::StSuspended));
     }
+    if row.power_throttled {
+        glyph(Icon::Leaf, pal.ok_green, i18n::tr(K::StEfficiencyMode));
+    }
+    if row.status == ProcStatus::NotResponding {
+        let text_rect = egui::Rect::from_min_max(egui::Pos2::new(x, cell.top()), cell.max);
+        ui.painter_at(text_rect).text(
+            egui::Pos2::new(x, rect.center().y),
+            egui::Align2::LEFT_CENTER,
+            i18n::tr(K::StNotResponding),
+            egui::FontId::proportional(tablekit::FONT_ROW),
+            pal.text,
+        );
+    }
+    hovered
 }
 
 fn context_menu(app: &mut TaskManApp, ui: &mut egui::Ui, row: &RowData) {
@@ -806,7 +845,7 @@ fn build_display_rows(
     let all: Vec<&ProcessEntry> = snap.processes.iter().collect();
     let grouping = derive_display_groups(&all);
     let children_all = display_children_map(&all, &grouping.category, &grouping.app_roots);
-    let (subtree, subtree_count) = subtree_values_and_counts(&all, &children_all);
+    let subtree = subtree_values_and_counts(&all, &children_all);
     let mut out = Vec::new();
 
     if !q.is_empty() {
@@ -815,7 +854,7 @@ fn build_display_rows(
             .copied()
             .filter(|p| q.matches_process(p))
             .collect();
-        sort_entries(&mut matched, sort_col, ascending, &subtree);
+        sort_entries(&mut matched, sort_col, ascending, &subtree.values);
         for p in matched {
             out.push(make_flat_row(p, &subtree));
         }
@@ -858,14 +897,7 @@ fn build_display_rows(
         }
         if cat == ProcCategory::App {
             emit_tree(
-                &mut out,
-                &roots,
-                &children,
-                &subtree,
-                &subtree_count,
-                sort_col,
-                ascending,
-                expanded,
+                &mut out, &roots, &children, &subtree, sort_col, ascending, expanded,
             );
         } else {
             // Task Manager parity: Background/Windows groups are flat lists
@@ -954,7 +986,7 @@ fn emit_flat_with_family_groups(
     out: &mut Vec<DisplayRow>,
     members: &[&ProcessEntry],
     children: &HashMap<u32, Vec<&ProcessEntry>>,
-    subtree: &HashMap<u32, [f64; 4]>,
+    subtree: &Subtree,
     sort_col: usize,
     ascending: bool,
     expanded: &HashSet<u32>,
@@ -977,7 +1009,7 @@ fn emit_flat_with_family_groups(
     let mut repr: HashMap<u32, [f64; 4]> = HashMap::with_capacity(members.len());
     for p in members {
         if family_heads.contains_key(&p.pid) {
-            repr.insert(p.pid, subtree.get(&p.pid).copied().unwrap_or([0.0; 4]));
+            repr.insert(p.pid, subtree.values(p.pid));
         } else if !swallowed.contains(&p.pid) {
             repr.insert(p.pid, own_values(p));
         }
@@ -1008,7 +1040,9 @@ fn emit_flat_with_family_groups(
                 heat: [0.0; 4],
                 net_available,
                 status: p.status,
-                power_throttled: p.power_throttled == Some(true),
+                // The family row stands for every member, so it reports the
+                // family's efficiency state — not just the head's.
+                power_throttled: fam.iter().any(|k| k.power_throttled == Some(true)),
                 synthetic: p.synthetic,
                 tooltip: synthetic_tooltip(p),
             }));
@@ -1315,7 +1349,7 @@ fn normalize_heat(rows: &mut [DisplayRow]) {
     }
 }
 
-fn make_flat_row(p: &ProcessEntry, subtree: &HashMap<u32, [f64; 4]>) -> DisplayRow {
+fn make_flat_row(p: &ProcessEntry, subtree: &Subtree) -> DisplayRow {
     DisplayRow::Process(RowData {
         pid: p.pid,
         start_epoch_s: p.start_epoch_s,
@@ -1326,7 +1360,7 @@ fn make_flat_row(p: &ProcessEntry, subtree: &HashMap<u32, [f64; 4]>) -> DisplayR
             .as_ref()
             .map(|x| x.to_string_lossy().into_owned()),
         children: false,
-        values: subtree.get(&p.pid).copied().unwrap_or([0.0; 4]),
+        values: subtree.values(p.pid),
         heat: [0.0; 4],
         net_available: p.net_recv_bps.is_some() || p.net_sent_bps.is_some(),
         status: p.status,
@@ -1450,19 +1484,17 @@ fn tree_roots<'a>(
     roots
 }
 
-#[allow(clippy::too_many_arguments)]
 fn emit_tree<'a>(
     out: &mut Vec<DisplayRow>,
     roots: &[&'a ProcessEntry],
     children: &HashMap<u32, Vec<&'a ProcessEntry>>,
-    subtree: &HashMap<u32, [f64; 4]>,
-    subtree_count: &HashMap<u32, u32>,
+    subtree: &Subtree,
     sort_col: usize,
     ascending: bool,
     expanded: &HashSet<u32>,
 ) {
     let mut sorted_roots: Vec<&ProcessEntry> = roots.to_vec();
-    sort_entries(&mut sorted_roots, sort_col, ascending, subtree);
+    sort_entries(&mut sorted_roots, sort_col, ascending, &subtree.values);
     let mut stack: Vec<(&ProcessEntry, usize)> =
         sorted_roots.iter().rev().map(|&r| (r, 0usize)).collect();
     let mut visited: HashSet<u32> = HashSet::new();
@@ -1476,12 +1508,12 @@ fn emit_tree<'a>(
             .entry(proc.pid)
             .or_insert_with(|| {
                 let mut v = children.get(&proc.pid).cloned().unwrap_or_default();
-                sort_entries(&mut v, sort_col, ascending, subtree);
+                sort_entries(&mut v, sort_col, ascending, &subtree.values);
                 v
             })
             .clone();
         let has_children = !kids.is_empty();
-        let count = subtree_count.get(&proc.pid).copied().unwrap_or(1);
+        let count = subtree.count(proc.pid);
         let name = if count > 1 {
             format!("{} ({})", proc.shown_name(), count)
         } else {
@@ -1497,11 +1529,13 @@ fn emit_tree<'a>(
                 .as_ref()
                 .map(|x| x.to_string_lossy().into_owned()),
             children: has_children,
-            values: subtree.get(&proc.pid).copied().unwrap_or([0.0; 4]),
+            values: subtree.values(proc.pid),
             heat: [0.0; 4],
             net_available: proc.net_recv_bps.is_some() || proc.net_sent_bps.is_some(),
             status: proc.status,
-            power_throttled: proc.power_throttled == Some(true),
+            // An app row summarizes its whole family (see [`Subtree`]), so a
+            // collapsed browser shows the leaf its renderers earned.
+            power_throttled: subtree.efficiency(proc.pid),
             synthetic: proc.synthetic,
             tooltip: synthetic_tooltip(proc),
         }));
@@ -1513,17 +1547,44 @@ fn emit_tree<'a>(
     }
 }
 
+/// Per-pid subtree rollups shared by every Processes row builder.
+struct Subtree {
+    /// cpu %, mem bytes, disk bps, net bps summed over the display subtree.
+    values: HashMap<u32, [f64; 4]>,
+    counts: HashMap<u32, u32>,
+    /// True when the process OR any of its display descendants runs in
+    /// efficiency mode. A collapsed `Brave Browser (24)` row summarizes its
+    /// children's resources, so it must summarize their power state too —
+    /// that is where native Task Manager shows the leaf.
+    efficiency: HashMap<u32, bool>,
+}
+
+impl Subtree {
+    fn values(&self, pid: u32) -> [f64; 4] {
+        self.values.get(&pid).copied().unwrap_or([0.0; 4])
+    }
+
+    fn count(&self, pid: u32) -> u32 {
+        self.counts.get(&pid).copied().unwrap_or(1)
+    }
+
+    fn efficiency(&self, pid: u32) -> bool {
+        self.efficiency.get(&pid).copied().unwrap_or(false)
+    }
+}
+
 fn subtree_values_and_counts<'a>(
     all: &[&'a ProcessEntry],
     children: &HashMap<u32, Vec<&'a ProcessEntry>>,
-) -> (HashMap<u32, [f64; 4]>, HashMap<u32, u32>) {
+) -> Subtree {
     let mut out: HashMap<u32, [f64; 4]> = HashMap::with_capacity(all.len());
     let mut counts: HashMap<u32, u32> = HashMap::with_capacity(all.len());
+    let mut eco: HashMap<u32, bool> = HashMap::with_capacity(all.len());
     let by_pid: HashMap<u32, &'a ProcessEntry> = all.iter().map(|p| (p.pid, *p)).collect();
 
     enum Frame<'b> {
         Enter(u32),
-        Combine(u32, Vec<&'b ProcessEntry>, [f64; 4]),
+        Combine(u32, Vec<&'b ProcessEntry>, [f64; 4], bool),
     }
     let mut done: HashSet<u32> = HashSet::with_capacity(all.len());
     let mut in_progress: HashSet<u32> = HashSet::with_capacity(all.len());
@@ -1535,7 +1596,7 @@ fn subtree_values_and_counts<'a>(
         let mut stack: Vec<Frame> = vec![Frame::Enter(root.pid)];
         while let Some(frame) = stack.pop() {
             match frame {
-                Frame::Combine(pid, kids, mut acc) => {
+                Frame::Combine(pid, kids, mut acc, mut throttled) => {
                     let mut cnt: u32 = 1;
                     for k in &kids {
                         if let Some(v) = out.get(&k.pid) {
@@ -1543,10 +1604,12 @@ fn subtree_values_and_counts<'a>(
                                 acc[i] += v[i];
                             }
                             cnt += counts.get(&k.pid).copied().unwrap_or(1);
+                            throttled |= eco.get(&k.pid).copied().unwrap_or(false);
                         }
                     }
                     out.insert(pid, acc);
                     counts.insert(pid, cnt);
+                    eco.insert(pid, throttled);
                     done.insert(pid);
                     in_progress.remove(&pid);
                 }
@@ -1573,10 +1636,16 @@ fn subtree_values_and_counts<'a>(
                     if pending.is_empty() {
                         out.insert(pid, own_values(p));
                         counts.insert(pid, 1);
+                        eco.insert(pid, p.power_throttled == Some(true));
                         done.insert(pid);
                         in_progress.remove(&pid);
                     } else {
-                        stack.push(Frame::Combine(pid, kids, own_values(p)));
+                        stack.push(Frame::Combine(
+                            pid,
+                            kids,
+                            own_values(p),
+                            p.power_throttled == Some(true),
+                        ));
                         for k in pending {
                             stack.push(Frame::Enter(k.pid));
                         }
@@ -1589,7 +1658,11 @@ fn subtree_values_and_counts<'a>(
         out.entry(p.pid).or_insert_with(|| own_values(p));
         counts.entry(p.pid).or_insert(1);
     }
-    (out, counts)
+    Subtree {
+        values: out,
+        counts,
+        efficiency: eco,
+    }
 }
 
 fn sort_entries(v: &mut [&ProcessEntry], col: usize, asc: bool, subtree: &HashMap<u32, [f64; 4]>) {
@@ -1992,12 +2065,42 @@ mod tests {
         let all: Vec<&ProcessEntry> = snap.processes.iter().collect();
         let grouping = derive_display_groups(&all);
         let children = display_children_map(&all, &grouping.category, &grouping.app_roots);
-        let (st, cnt) = subtree_values_and_counts(&all, &children);
-        assert_eq!(st[&1][0], 6.0);
-        assert_eq!(st[&1][1], 6000.0);
-        assert_eq!(st[&2][0], 5.0);
-        assert_eq!(st[&3][0], 3.0);
-        assert_eq!((cnt[&3], cnt[&2], cnt[&1]), (1, 2, 3));
+        let st = subtree_values_and_counts(&all, &children);
+        assert_eq!(st.values(1)[0], 6.0);
+        assert_eq!(st.values(1)[1], 6000.0);
+        assert_eq!(st.values(2)[0], 5.0);
+        assert_eq!(st.values(3)[0], 3.0);
+        assert_eq!((st.count(3), st.count(2), st.count(1)), (1, 2, 3));
+    }
+
+    /// A collapsed family row stands for its members, so one efficiency-mode
+    /// descendant must light the leaf on the head row — that is where native
+    /// Task Manager shows it for a browser.
+    #[test]
+    fn efficiency_mode_rolls_up_to_the_group_row() {
+        let mut root = proc(1, None, "brave.exe", ProcCategory::App);
+        root.has_window = true;
+        let mut renderer = proc(2, Some(1), "brave.exe", ProcCategory::App);
+        renderer.power_throttled = Some(true);
+        let quiet = proc(3, Some(1), "brave.exe", ProcCategory::App);
+        let snap = snap_of(vec![root, renderer, quiet]);
+        let all: Vec<&ProcessEntry> = snap.processes.iter().collect();
+        let grouping = derive_display_groups(&all);
+        let children = display_children_map(&all, &grouping.category, &grouping.app_roots);
+        let st = subtree_values_and_counts(&all, &children);
+        assert!(st.efficiency(1), "head inherits its renderer's leaf");
+        assert!(st.efficiency(2));
+        assert!(!st.efficiency(3), "an untouched sibling stays plain");
+
+        let rows = build_display_rows(&snap, "", 0, true, &HashSet::new(), &[false; 3]);
+        let head = rows
+            .iter()
+            .find_map(|row| match row {
+                DisplayRow::Process(row) if row.pid == 1 => Some(row),
+                _ => None,
+            })
+            .expect("head row");
+        assert!(head.power_throttled, "collapsed app row shows the leaf");
     }
 
     #[test]

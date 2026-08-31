@@ -21,16 +21,17 @@ pub struct Palette {
     pub gpu_graph: Color32,
     pub stroke: Color32,
     pub chart_grid: Color32,
-    /// Base navy behind every active row's numeric cells.
+    /// Floor of the heat gradient: the tint EVERY numeric cell carries, even
+    /// at zero. Win11 TM has no uncolored value cells, so neither do we.
     pub heat_base: Color32,
-    /// Heat gradient stops (low → high utilization), blue like Win11 TM.
-    pub heat_low: Color32,
+    /// Top of the heat gradient (the column's busiest process).
     pub heat_high: Color32,
-    /// Highlight fill for the top-consumer cell of each resource column.
-    pub heat_top: Color32,
     /// Thin separators drawn between heat cells inside the blue band.
     pub heat_sep: Color32,
+    /// Efficiency-mode leaf.
     pub ok_green: Color32,
+    /// Suspended/paused status glyph.
+    pub warn_orange: Color32,
 }
 
 pub const DARK: Palette = Palette {
@@ -51,12 +52,11 @@ pub const DARK: Palette = Palette {
     gpu_graph: Color32::from_rgb(0xe0, 0x91, 0x4f),
     stroke: Color32::from_rgb(0x2d, 0x2d, 0x2d),
     chart_grid: Color32::from_rgb(0x37, 0x37, 0x37),
-    heat_base: Color32::from_rgb(0x11, 0x24, 0x3e),
-    heat_low: Color32::from_rgb(0x1c, 0x30, 0x58),
-    heat_high: Color32::from_rgb(0x3f, 0x76, 0xd0),
-    heat_top: Color32::from_rgb(0x08, 0x33, 0x6e),
+    heat_base: Color32::from_rgb(0x14, 0x27, 0x40),
+    heat_high: Color32::from_rgb(0x2e, 0x6f, 0xc4),
     heat_sep: Color32::from_rgb(0x29, 0x32, 0x3f),
     ok_green: Color32::from_rgb(0x6c, 0xcb, 0x6f),
+    warn_orange: Color32::from_rgb(0xf2, 0xa2, 0x3c),
 };
 
 pub const LIGHT: Palette = Palette {
@@ -76,12 +76,11 @@ pub const LIGHT: Palette = Palette {
     gpu_graph: Color32::from_rgb(0xa8, 0x5a, 0x20),
     stroke: Color32::from_rgb(0xdd, 0xdd, 0xdd),
     chart_grid: Color32::from_rgb(0xe2, 0xe2, 0xe2),
-    heat_base: Color32::from_rgb(0xea, 0xf1, 0xfb),
-    heat_low: Color32::from_rgb(0xd8, 0xe8, 0xfa),
-    heat_high: Color32::from_rgb(0x9f, 0xc8, 0xf0),
-    heat_top: Color32::from_rgb(0xc5, 0xdd, 0xf7),
+    heat_base: Color32::from_rgb(0xef, 0xf5, 0xfd),
+    heat_high: Color32::from_rgb(0x8a, 0xba, 0xea),
     heat_sep: Color32::from_rgb(0xc8, 0xc8, 0xc8),
     ok_green: Color32::from_rgb(0x0f, 0x7b, 0x0f),
+    warn_orange: Color32::from_rgb(0xb4, 0x6b, 0x00),
 };
 
 /// Active palette derived from egui's dark-mode flag.
@@ -234,22 +233,28 @@ pub fn light_visuals() -> Visuals {
     v
 }
 
-/// Map normalized intensity [0..=1] to the blue heat gradient. Kept for
-/// future per-value heat rendering (tables currently use the flat TM style:
-/// base fill + brighter top-consumer cell only).
-#[allow(dead_code)]
+/// Map a normalized per-column intensity `[0..=1]` to the blue heat gradient
+/// used by every numeric table cell.
+///
+/// Two deliberate properties, both taken from Win11 TM:
+/// * `t == 0` still returns `heat_base` — an idle process shows a pale blue
+///   cell, never an unpainted hole in the band.
+/// * The ramp is ease-OUT (`sqrt`), not ease-in. Intensities are normalized
+///   against the column MAXIMUM, so with one busy process the entire rest of
+///   the column sits near zero; an ease-in curve collapsed all of them onto
+///   the base tint and made the heat map look binary.
 pub fn heat_blue(pal: &Palette, t: f32) -> Color32 {
-    let t = t.clamp(0.0, 1.0);
-    let f = t * t; // ease-in: small values stay near the base navy
-    let lerp = |a: Color32, b: Color32, f: f32| -> Color32 {
-        Color32::from_rgba_premultiplied(
-            (a.r() as f32 + (b.r() as f32 - a.r() as f32) * f) as u8,
-            (a.g() as f32 + (b.g() as f32 - a.g() as f32) * f) as u8,
-            (a.b() as f32 + (b.b() as f32 - a.b() as f32) * f) as u8,
-            255,
-        )
+    let f = t.clamp(0.0, 1.0).sqrt();
+    lerp_rgb(pal.heat_base, pal.heat_high, f)
+}
+
+fn lerp_rgb(a: Color32, b: Color32, f: f32) -> Color32 {
+    let ch = |a: u8, b: u8| {
+        (a as f32 + (b as f32 - a as f32) * f)
+            .round()
+            .clamp(0.0, 255.0) as u8
     };
-    lerp(pal.heat_low, pal.heat_high, f)
+    Color32::from_rgb(ch(a.r(), b.r()), ch(a.g(), b.g()), ch(a.b(), b.b()))
 }
 
 /// Palette for a context (outside of any Ui).
@@ -257,5 +262,54 @@ pub fn palette_ctx(ctx: &egui::Context) -> Palette {
     match ctx.theme() {
         egui::Theme::Dark => DARK,
         egui::Theme::Light => LIGHT,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The heat map must have no unpainted floor and must rise smoothly:
+    /// an idle process still shows the base tint, and every step up in
+    /// intensity is at least as blue as the one below it.
+    #[test]
+    fn heat_gradient_starts_at_the_base_tint_and_rises_monotonically() {
+        for pal in [DARK, LIGHT] {
+            assert_eq!(heat_blue(&pal, 0.0), pal.heat_base);
+            assert_eq!(heat_blue(&pal, 1.0), pal.heat_high);
+            assert_eq!(heat_blue(&pal, -3.0), pal.heat_base, "clamped");
+            assert_eq!(heat_blue(&pal, 7.0), pal.heat_high, "clamped");
+
+            let mut previous = heat_blue(&pal, 0.0);
+            for step in 1..=20 {
+                let next = heat_blue(&pal, step as f32 / 20.0);
+                let toward_high = |a: Color32, b: Color32| {
+                    // distance to heat_high must never grow
+                    let d = |c: Color32| {
+                        (c.r() as i32 - pal.heat_high.r() as i32).abs()
+                            + (c.g() as i32 - pal.heat_high.g() as i32).abs()
+                            + (c.b() as i32 - pal.heat_high.b() as i32).abs()
+                    };
+                    d(b) <= d(a)
+                };
+                assert!(toward_high(previous, next), "step {step} regressed");
+                previous = next;
+            }
+        }
+    }
+
+    /// A low but non-zero share of the column maximum must be visibly
+    /// bluer than an idle cell — the old ease-in curve crushed it back onto
+    /// the base tint and made the heat map look binary.
+    #[test]
+    fn small_intensities_are_visible_above_the_base() {
+        for pal in [DARK, LIGHT] {
+            let idle = heat_blue(&pal, 0.0);
+            let small = heat_blue(&pal, 0.05);
+            let delta = (small.r() as i32 - idle.r() as i32).abs()
+                + (small.g() as i32 - idle.g() as i32).abs()
+                + (small.b() as i32 - idle.b() as i32).abs();
+            assert!(delta >= 8, "5% of the column max is invisible: {delta}");
+        }
     }
 }

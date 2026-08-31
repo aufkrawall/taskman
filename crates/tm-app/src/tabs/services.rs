@@ -168,7 +168,9 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
     let sort = app.services_sort;
     rows.sort_by(|a, b| compare_services(a, b, sort));
 
-    let mut table = app.make_table("services", columns());
+    let mut table = app
+        .make_table("services", columns())
+        .with_row_height(tablekit::ROW_H_DENSE);
     let mut fit: Vec<f32> = table
         .cols
         .iter()

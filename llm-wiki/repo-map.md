@@ -95,7 +95,12 @@ platform boundary (`tm-core` ← `tm-platform` ← `tm-app` / `tm-service`):
   pointer into the output buffer on this build (PH's record-relative
   convention decoded 0/285 names); `parse_image_name` tries all
   conventions, validated, and the live test pins it.
-- `crates/tm-app/src/widgets/tablekit.rs` — resize math MUST accumulate
+- `crates/tm-app/src/widgets/tablekit.rs` — the blue value band is OPAQUE and
+  is painted after the row fill, so `row()` records its selection/hover color
+  in `row_overlay` and `heat_cells` re-applies it; dropping that makes hover
+  stop dead at the first value column. Row height is per-table (`row_h`,
+  `ROW_H_DENSE`) and `scrolled_rows` must virtualize on it, never on `ROW_H`.
+  Resize math MUST accumulate
   each frame's `drag_delta()` onto the LIVE width; `drag_delta()` is
   per-frame movement (NOT cumulative) in egui 0.36, so frozen drag-start
   widths pin boundaries at their start position. Regression-tested with
@@ -116,7 +121,9 @@ platform boundary (`tm-core` ← `tm-platform` ← `tm-app` / `tm-service`):
   busy absorbed external tasks (≥ 1 % CPU, different image, windowless) are
   promoted into Background. Do not collapse this back to a literal PPID
   tree. Raw `ProcessEntry.ppid` remains OS truth and is exposed by the
-  persisted System Informer-style tree on the Details page.
+  persisted System Informer-style tree on the Details page, which is expanded
+  by DEFAULT (`details::State.collapsed` tracks the exceptions) so newly
+  appearing subtrees are never silently hidden.
 - `crates/tm-platform/src/win/core_service.rs` — privileged trust boundary.
   Do not add arbitrary commands, output paths, or telemetry to its protocol.
   Preserve exact PID+creation-time checks, client/server executable binding,

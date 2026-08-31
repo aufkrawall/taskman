@@ -1,5 +1,66 @@
 # Recent Activity
 
+## 2026-08-31 — Processes/Details table parity: heat map, status glyphs, type-ahead, tree
+
+Seven user-reported gaps against native Task Manager and System Informer,
+plus the root cause behind two of them.
+
+Root cause found (efficiency mode never showed): `GetProcessInformation`
+with `ProcessPowerThrottling` treats `PROCESS_POWER_THROTTLING_STATE.Version`
+as an INPUT field. `efficiency_mode_state` passed a zeroed struct, so the
+call failed with `ERROR_INVALID_PARAMETER` (87) for EVERY pid and
+`power_throttled` was `None` system-wide — the leaf could never appear.
+Verified out-of-band with a P/Invoke probe before and after (Version 0: 87
+for all 235 processes; Version 1: Brave/Edge renderers report
+ControlMask/StateMask `EXECUTION_SPEED`). Regression test:
+`efficiency_mode_state_is_known_for_own_process`. Efficiency mode also moved
+to its own 2 s sub-TTL (`POWER_THROTTLE_REFRESH_TTL`) inside the 10 s
+attribute cache: it is a live status column, and one
+OpenProcess/GetProcessInformation pair per process is cheap.
+
+UI changes:
+- **Heat map** (`theme::heat_blue` + `TmTable::heat_cells`): every numeric
+  cell is now filled from a continuous gradient whose FLOOR is `heat_base`;
+  the old model painted a flat band only for rows with a non-zero value and
+  a single binary top-consumer highlight, so idle processes had unpainted
+  holes. Curve is ease-OUT (`sqrt`) — intensities are normalized against the
+  column maximum, so the old ease-in curve collapsed everything but the top
+  consumer onto the base tint. `heat_low`/`heat_top` are gone.
+- **Hover reaches the value columns**: the heat band is opaque and is painted
+  after the row fill, so hovering only lit the name area. `TmTable::row`
+  records its selection/hover fill in `row_overlay`; `heat_cells` re-applies
+  it over the band. Light mode gets a dark wash (`row_hover_fill`) — a white
+  one over a light background was invisible.
+- **Status column glyphs** (Processes): orange pause for suspended, green
+  leaf for efficiency mode, words moved into the row tooltip; only
+  "not responding" stays spelled out. The glyphs deliberately do NOT create
+  their own hover widgets — that would steal the row's hover state and make
+  the highlight flicker.
+- **Group rows summarize efficiency mode** (`Subtree::efficiency`): a
+  collapsed `Brave Browser (24)` row already aggregates CPU/memory, so it now
+  aggregates the power state too. That is where native TM shows the leaf, and
+  it is what the user actually reported missing.
+- **Type-ahead** (`search::list_type_ahead`): typed characters accumulate
+  into a word for 1 s, so "svc" lands on svchost.exe instead of jumping to
+  whatever starts with "c". One letter — or the same letter repeated — still
+  cycles. All text events in a frame are consumed in order (fast typing
+  delivers several per frame); buffers are keyed per list.
+- **Dense rows** (`ROW_H_DENSE = 22`, `TmTable::row_h`): Details, Services and
+  Modules pack their rows like native TM's Details tab. Processes/Users/
+  Startup/App history keep the airy 32 px app-list spacing. `scrolled_rows`
+  virtualizes on the table's own height; page-up/down counts match.
+- **Details tree is expanded by default**: `State.collapsed` replaces
+  `State.expanded`, so the tree always shows the COMPLETE hierarchy —
+  including subtrees whose parents started after the page was opened, which
+  the one-shot `ensure_tree_initialized` left collapsed. Parent links whose
+  parent started AFTER the child are rejected (`is_plausible_parent`),
+  matching System Informer's PID-reuse guard; unknown timestamps never
+  reject. Indent tightened to 18 px.
+
+Verified visually against live captures (leaf on Brave/Claude/Codex, pause on
+a deliberately suspended process, sampled cell fills monotone
+`#2E6FC4 > #2962AB > #2960A9 > #1C3D68 > #162C4A`).
+
 ## 2026-08-31 — foreign-session UX: repair now hands over to the installed copy
 
 User report: the state "somewhat randomly" showed ForeignClient. Root cause:

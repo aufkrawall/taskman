@@ -312,12 +312,14 @@ pub fn dialog(app: &mut TaskManApp, ctx: &egui::Context, pal: &theme::Palette) {
                 }
                 LoadState::Ready(modules) => {
                     let rows = visible_modules(&state, modules);
-                    if let Some(initial) = search::list_initial(ctx)
-                        && let Some(base) = search::cycle_match(
+                    let typed = search::list_type_ahead(ctx, "modules");
+                    if let Some(typed) = typed
+                        && let Some(base) = search::type_ahead_match(
                             rows.iter()
-                                .map(|module| (module.base_address, module.name.as_str())),
+                                .map(|module| (module.base_address, module.name.as_str()))
+                                .collect::<Vec<_>>(),
                             state.selected_base,
-                            initial,
+                            &typed,
                         )
                     {
                         state.selected_base = Some(base);
@@ -327,8 +329,9 @@ pub fn dialog(app: &mut TaskManApp, ctx: &egui::Context, pal: &theme::Palette) {
                         let current = state.selected_base.and_then(|base| {
                             rows.iter().position(|module| module.base_address == base)
                         });
-                        let page_rows =
-                            (ui.available_height() / tablekit::ROW_H).floor().max(1.0) as usize;
+                        let page_rows = (ui.available_height() / tablekit::ROW_H_DENSE)
+                            .floor()
+                            .max(1.0) as usize;
                         if let Some(index) =
                             search::moved_index(rows.len(), current, nav, page_rows)
                             && let Some(module) = rows.get(index)
@@ -344,7 +347,9 @@ pub fn dialog(app: &mut TaskManApp, ctx: &egui::Context, pal: &theme::Palette) {
                         TmColumn::num("size", i18n::tr(K::ColSize), 110.0),
                         TmColumn::text("path", i18n::tr(K::ColPath), 390.0),
                     ];
-                    let mut table = app.make_table("modules", cols);
+                    let mut table = app
+                        .make_table("modules", cols)
+                        .with_row_height(tablekit::ROW_H_DENSE);
                     let sorted = match state.sort {
                         SortColumn::Name => 0,
                         SortColumn::Base => 1,

@@ -229,13 +229,13 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
     // Task-Manager-style type navigation over the resource cards: a plain
     // letter selects the next card whose title begins with it, and the card
     // column scrolls vertically to keep it in view.
-    if let Some(initial) = search::list_initial(ui.ctx()) {
+    if let Some(typed) = search::list_type_ahead(ui.ctx(), "performance") {
         let selected = Some(app.perf_selected_key.clone());
-        if let Some(key) = search::cycle_match(
-            entries.iter().map(|e| (e.key.clone(), e.title.as_str())),
-            selected,
-            initial,
-        ) {
+        let candidates = entries
+            .iter()
+            .map(|e| (e.key.clone(), e.title.as_str()))
+            .collect::<Vec<_>>();
+        if let Some(key) = search::type_ahead_match(candidates, selected, &typed) {
             app.perf_selected_key = key.clone();
             app.perf_jump_to = Some(key);
         }

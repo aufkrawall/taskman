@@ -1,7 +1,7 @@
 //! Small vector icons drawn with egui's painter — crisp at any DPI, zero
 //! binary size, theme-aware stroke color.
 
-use eframe::egui::{self, Color32, Pos2, Rect, Shape, Stroke, Vec2};
+use eframe::egui::{self, Color32, CornerRadius, Pos2, Rect, Shape, Stroke, Vec2};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[allow(dead_code)] // full glyph set kept for future tabs
@@ -28,6 +28,7 @@ pub enum Icon {
     Check,
     Hamburger,
     Leaf,
+    Pause,
     Ellipsis,
     Play,
     StopSquare,
@@ -209,19 +210,39 @@ pub fn draw(ui: &egui::Ui, icon: Icon, rect: Rect, color: Color32) {
             }
         }
         Icon::Leaf => {
-            // Simple leaf: two arcs meeting at tip.
-            painter.add(Shape::line(
-                vec![
-                    p(-6.0, 6.0),
-                    p(-6.0, -1.0),
-                    p(0.0, -6.5),
-                    p(6.0, -1.0),
-                    p(6.0, 6.0),
-                ],
-                stroke,
-            ));
-            line(p(-6.0, 6.0), p(6.0, 6.0));
-            line(p(-4.5, 3.0), p(4.5, -4.0));
+            // Efficiency-mode leaf: a filled teardrop blade tilted 45 deg
+            // with a stem, matching the Win11 Task Manager status glyph. The
+            // blade is a closed path built from two mirrored quadratic arcs
+            // between the tip (top-right) and the base (bottom-left).
+            let tip = p(8.0, -8.0);
+            let base = p(-5.0, 5.0);
+            let arc = |ctrl: Pos2| {
+                let mut pts = Vec::with_capacity(13);
+                for i in 0..=12 {
+                    let t = i as f32 / 12.0;
+                    let u = 1.0 - t;
+                    pts.push(Pos2::new(
+                        u * u * base.x + 2.0 * u * t * ctrl.x + t * t * tip.x,
+                        u * u * base.y + 2.0 * u * t * ctrl.y + t * t * tip.y,
+                    ));
+                }
+                pts
+            };
+            let mut blade = arc(p(9.0, 2.5));
+            blade.extend(arc(p(-1.5, -8.5)).into_iter().rev());
+            painter.add(Shape::convex_polygon(blade, color, Stroke::NONE));
+            // Stem, drawn from the base away from the blade.
+            line(base, p(-9.0, 9.0));
+        }
+        Icon::Pause => {
+            // Suspended: two filled bars, like the native pause glyph.
+            for dx in [-6.0f32, 2.5] {
+                painter.add(Shape::rect_filled(
+                    Rect::from_min_max(p(dx, -6.5), p(dx + 3.5, 6.5)),
+                    CornerRadius::same(1),
+                    color,
+                ));
+            }
         }
         Icon::Ellipsis => {
             circle(p(-6.0, 0.0), 1.6, true);

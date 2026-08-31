@@ -32,6 +32,10 @@ use tm_core::model::*;
 /// (not tick-count based) so behavior stays identical at High/Normal/Low
 /// update speeds; entries also invalidate when the process identity changes.
 const ATTR_REFRESH_TTL: std::time::Duration = std::time::Duration::from_secs(10);
+/// Efficiency mode (EcoQoS) is a live status column, not a slow-changing
+/// attribute: browsers toggle it as tabs go background. Refresh it on its own
+/// short TTL so the leaf is not up to [`ATTR_REFRESH_TTL`] stale.
+const POWER_THROTTLE_REFRESH_TTL: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// CPU pseudo-rows ("System interrupts", "Terminated processes") only show
 /// above this share of total capacity so an idle system gains no noise rows.
@@ -78,6 +82,11 @@ struct PidAttrs {
     start_epoch_s: Option<i64>,
     /// When these values were last queried natively.
     refreshed_at: Instant,
+    /// Efficiency mode flips whenever a browser backgrounds a tab, so it
+    /// gets its own short TTL — a single cheap
+    /// OpenProcess/GetProcessInformation pair, unlike the PEB and token
+    /// reads that justify the long TTL for everything else.
+    power_refreshed_at: Instant,
 }
 
 /// Everything that carries state between ticks.
@@ -190,10 +199,14 @@ impl Sampler {
     /// at most every [`ATTR_REFRESH_TICKS`] ticks (4 native calls instead of
     /// ~4 × processes per tick).
     fn attrs_for(&mut self, pid: u32, start_epoch_s: Option<i64>) -> PidAttrs {
-        if let Some(a) = self.attrs.get(&pid)
+        if let Some(a) = self.attrs.get_mut(&pid)
             && a.refreshed_at.elapsed() < ATTR_REFRESH_TTL
             && a.start_epoch_s == start_epoch_s
         {
+            if a.power_refreshed_at.elapsed() >= POWER_THROTTLE_REFRESH_TTL {
+                a.power_throttled = process_ops::efficiency_mode_state(pid);
+                a.power_refreshed_at = Instant::now();
+            }
             return a.clone();
         }
         let security = if self.demand.wants(TelemetryDemand::TOKEN_SECURITY) {
@@ -215,6 +228,7 @@ impl Sampler {
             command_line: process_ops::command_line_of(pid),
             start_epoch_s,
             refreshed_at: Instant::now(),
+            power_refreshed_at: Instant::now(),
         };
         self.attrs.insert(pid, fresh.clone());
         fresh

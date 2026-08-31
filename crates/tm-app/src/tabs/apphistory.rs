@@ -210,7 +210,7 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
                         },
                     ),
                 ];
-                table.heat_cells(ui, &pal, rect, 1, &cells, true);
+                table.heat_cells(ui, &pal, rect, 1, &cells);
                 let _ = resp;
             }
         },
