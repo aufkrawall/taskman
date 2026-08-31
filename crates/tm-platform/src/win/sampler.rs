@@ -11,8 +11,8 @@
 
 use crate::win::cpu_load::{CpuLoadAccountant, LoadSample};
 use crate::win::{
-    cpu_info, gpu, memory_info, net_etw, net_info, perfcounters, process_ops, threads_map, version,
-    windows_enum,
+    core_service, cpu_info, gpu, memory_info, net_etw, net_info, perfcounters, process_ops,
+    threads_map, version, windows_enum,
 };
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
@@ -116,19 +116,36 @@ pub struct Sampler {
     cpu_load: CpuLoadAccountant,
     /// Last valid CPU-load sample; held when a tick's window is unusable.
     last_load: Option<Arc<LoadSample>>,
-    /// Set once `NetworkUsage::start` has failed, so an unelevated session
-    /// does not retry an always-denied API on every tick.
-    net_usage_denied: bool,
     /// Hold-decay state of the CPU pseudo-rows.
     pseudo: PseudoRowHold,
-    /// ETW per-process network trace, started lazily and only while the UI
-    /// demands it. `None` means unavailable (no rights, or not demanded), and
-    /// the snapshot then reports unknown — never zero.
-    net_usage: Option<net_etw::NetworkUsage>,
+    /// Where per-process network counters come from this session.
+    net_source: NetSource,
     /// Previous cumulative per-process byte counters, keyed by identity so a
     /// recycled PID cannot inherit a dead process's totals.
     prev_proc_net: HashMap<u32, ProcNetSample>,
 }
+
+/// Where per-process network counters come from.
+///
+/// Starting an ETW session needs administrator rights, which the GUI
+/// deliberately does not have. The protected LocalSystem service hosts the
+/// trace instead and answers a read-only query, so the ordinary unelevated GUI
+/// still gets real numbers; running the trace under our own token is only the
+/// fallback for when the service is absent and we happen to be elevated.
+enum NetSource {
+    /// Not probed yet (also the state after the UI stops asking).
+    Undecided,
+    /// The protected service answers.
+    Broker,
+    /// Our own token runs the trace.
+    Local(net_etw::NetworkUsage),
+    /// Neither works; keep reporting unknown, and re-probe occasionally so
+    /// installing the service later starts working without an app restart.
+    Unavailable { since: Instant },
+}
+
+/// How long to wait before re-probing after both sources failed.
+const NET_SOURCE_RETRY: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// One process's cumulative network counters at the previous tick.
 #[derive(Debug, Clone, Copy)]
@@ -169,9 +186,8 @@ impl Sampler {
             net_meta_cache: None,
             cpu_load: CpuLoadAccountant::new(),
             last_load: None,
-            net_usage_denied: false,
             pseudo: PseudoRowHold::default(),
-            net_usage: None,
+            net_source: NetSource::Undecided,
             prev_proc_net: HashMap::new(),
         }
     }
@@ -259,22 +275,51 @@ impl Sampler {
         self.demand = d;
     }
 
-    /// Start or stop the ETW network trace to match the current demand.
+    /// Cumulative per-process counters for this tick, or `None` when the
+    /// answer is genuinely unknown.
     ///
-    /// A failed start is remembered as "unavailable" for the rest of the
-    /// process: without administrator rights `StartTraceW` denies every
-    /// attempt, and retrying once per tick would be pure noise.
-    fn update_net_usage(&mut self) {
-        let wanted = self.demand.wants(TelemetryDemand::PROCESS_NET);
-        if wanted && self.net_usage.is_none() && !self.net_usage_denied {
-            self.net_usage = net_etw::NetworkUsage::start();
-            if self.net_usage.is_none() {
-                self.net_usage_denied = true;
-            }
-        } else if !wanted && self.net_usage.is_some() {
-            // Dropping stops the session and joins its consumer thread.
-            self.net_usage = None;
+    /// Never returns an empty map to mean "no traffic": an unknown answer and
+    /// a measured zero are different, and only the caller's `None` branch may
+    /// leave the snapshot fields unset.
+    fn net_totals(&mut self, live: &HashSet<u32>) -> Option<HashMap<u32, net_etw::PidBytes>> {
+        if !self.demand.wants(TelemetryDemand::PROCESS_NET) {
+            // Dropping a local session here stops it and joins its consumer.
+            self.net_source = NetSource::Undecided;
             self.prev_proc_net.clear();
+            return None;
+        }
+        if let NetSource::Unavailable { since } = &self.net_source {
+            if since.elapsed() < NET_SOURCE_RETRY {
+                return None;
+            }
+            self.net_source = NetSource::Undecided;
+        }
+        if matches!(self.net_source, NetSource::Undecided) {
+            let (source, first) = probe_net_source();
+            self.net_source = source;
+            if first.is_some() {
+                return first;
+            }
+        }
+        match &self.net_source {
+            NetSource::Broker => match core_service::brokered_process_network() {
+                core_service::BrokeredNetwork::Sample(sample) if sample.active => {
+                    Some(sample_to_map(&sample))
+                }
+                // The service is there but its own trace failed: unknown.
+                core_service::BrokeredNetwork::Sample(_) => None,
+                other => {
+                    if let core_service::BrokeredNetwork::Rejected(detail) = &other {
+                        tracing::warn!(%detail, "broker refused network counters");
+                    }
+                    self.net_source = NetSource::Unavailable {
+                        since: Instant::now(),
+                    };
+                    None
+                }
+            },
+            NetSource::Local(usage) => Some(usage.totals_pruned(live)),
+            _ => None,
         }
     }
 
@@ -284,11 +329,10 @@ impl Sampler {
     /// really did move zero bytes — and every process keeps `None` while it
     /// does not, because "unknown" and "zero" are different answers.
     fn apply_process_network(&mut self, processes: &mut [ProcessEntry], interval_s: f64) {
-        let Some(usage) = &self.net_usage else {
+        let live: HashSet<u32> = processes.iter().map(|p| p.pid).collect();
+        let Some(totals) = self.net_totals(&live) else {
             return;
         };
-        let live: std::collections::HashSet<u32> = processes.iter().map(|p| p.pid).collect();
-        let totals = usage.totals_pruned(&live);
         let mut next = HashMap::with_capacity(processes.len());
         for process in processes.iter_mut() {
             if process.synthetic {
@@ -530,7 +574,6 @@ impl Sampler {
         // ---- per-process network (ETW) --------------------------------------------
         // Runs after the process list is final so pruning sees exactly the
         // live PIDs, and after categories so synthetic rows can be skipped.
-        self.update_net_usage();
         self.apply_process_network(&mut processes, interval_s);
 
         // ---- CPU attribution pseudo-rows ------------------------------------------
@@ -811,6 +854,53 @@ impl Sampler {
             self.pseudo.terminated.clone(),
         )
     }
+}
+
+/// Probe both sources once, returning the chosen one plus the sample it
+/// already produced (so the probe does not cost an extra round trip).
+fn probe_net_source() -> (NetSource, Option<HashMap<u32, net_etw::PidBytes>>) {
+    match core_service::brokered_process_network() {
+        core_service::BrokeredNetwork::Sample(sample) if sample.active => {
+            (NetSource::Broker, Some(sample_to_map(&sample)))
+        }
+        // An explicit refusal is a policy decision; do not route around it.
+        core_service::BrokeredNetwork::Rejected(detail) => {
+            tracing::warn!(%detail, "broker refused network counters");
+            (
+                NetSource::Unavailable {
+                    since: Instant::now(),
+                },
+                None,
+            )
+        }
+        // No service (or one too old to know the request), and no trace of its
+        // own: fall back to our token, which only works when elevated.
+        _ => match net_etw::NetworkUsage::start(net_etw::TraceRole::App) {
+            Some(usage) => (NetSource::Local(usage), None),
+            None => (
+                NetSource::Unavailable {
+                    since: Instant::now(),
+                },
+                None,
+            ),
+        },
+    }
+}
+
+fn sample_to_map(sample: &core_service::ProcessNetworkSample) -> HashMap<u32, net_etw::PidBytes> {
+    sample
+        .entries
+        .iter()
+        .map(|entry| {
+            (
+                entry.pid,
+                net_etw::PidBytes {
+                    received: entry.received,
+                    sent: entry.sent,
+                },
+            )
+        })
+        .collect()
 }
 
 fn decay_pseudo(slot: &mut Option<HeldPseudoRow>) {

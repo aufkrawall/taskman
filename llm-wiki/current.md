@@ -13,6 +13,17 @@ diagnostics; remaining telemetry and accessibility work is itemized precisely
 in `known-debt.md`. Normal GUI startup remains unelevated; privileged controls
 can cross a protected, allowlisted service boundary after one explicit install.
 
+## Recently landed (2026-08-31 — per-process network without elevation)
+
+- Broker protocol v2 adds one read-only `ProcessNetworkCounters` request. The
+  LocalSystem service hosts the ETW trace and answers a bounded aggregate, so
+  the ordinary unelevated GUI shows real per-process rates. This reverses the
+  documented "no telemetry endpoint" invariant on purpose; the reasoning and
+  the constraints that keep it narrow are in `core-service.md`.
+- ETW session names are fixed per role. A pid in the name meant every killed
+  process leaked a session, and enough orphans stop Windows delivering events
+  to the provider at all — which presents as "nothing uses the network".
+
 ## Recently landed (2026-08-31 — per-process network)
 
 - **Engine fix that made it visible:** a parked lazy engine used to discard

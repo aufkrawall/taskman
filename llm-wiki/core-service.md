@@ -75,9 +75,44 @@ identity could not be captured; it never falls back to an unverified child PID.
 
 Allowlisted operations are process/tree termination, suspend/resume, priority,
 affinity, efficiency mode, UAC virtualization, guarded module unload, service
-control, user-session control, and Task Manager replacement integration.
-There is deliberately no generic Win32 call, shell command, file write, dump
-path, or telemetry endpoint.
+control, user-session control, Task Manager replacement integration, and one
+read-only telemetry query (`ProcessNetworkCounters`). There is deliberately no
+generic Win32 call, shell command, file write, or dump path.
+
+### The one telemetry endpoint, and why it was allowed
+
+This protocol previously had NO telemetry endpoint at all. `ProcessNetworkCounters`
+was added deliberately, protocol v2, after weighing it:
+
+- Per-process network bytes come from an ETW session, which Windows grants only
+  to administrators. Keeping it GUI-side meant the whole GUI had to run
+  elevated to show one column — exactly what this service exists to avoid
+  ("reliable protected actions without elevating the whole GUI").
+- The stated risk of a telemetry endpoint is cross-user disclosure. The same
+  broker already lets the pinned user terminate, suspend, reprioritize,
+  re-affinitize and unload modules from arbitrary processes including other
+  users'. Reading a byte counter for those processes is strictly less powerful
+  than killing them.
+- The response is a bounded aggregate: a pid and two counters, no paths, no
+  content, no command lines. It is the only request that can change nothing,
+  and so the only one that skips `checked_target`.
+
+Constraints that keep it honest:
+
+- `active` is part of the response. A pid missing from `entries` means
+  "measured zero" only when `active` is true; otherwise the answer is unknown
+  and the UI must render "—". Fabricating a zero is a product invariant
+  violation, not a cosmetic one.
+- Only non-zero entries are sent, capped at `NET_MAX_ENTRIES` (700). A
+  worst-case entry encodes to ~79 bytes, so the cap keeps the frame inside
+  `MAX_RESPONSE_BYTES`; `a_capped_network_response_fits_the_frame_limit` pins
+  that arithmetic.
+- The service owns the trace lifecycle: started on the first request, stopped
+  by a watchdog after `NET_TRACE_IDLE` (30 s) without one, so it is not
+  tracing when no window is showing the column.
+- Counters are pruned to processes that still exist, using the SERVICE's own
+  ToolHelp snapshot. A pid list supplied by the client would let the client
+  shape the answer.
 
 ## Filesystem and SCM installation
 

@@ -1,5 +1,49 @@
 # Recent Activity
 
+## 2026-08-31 — per-process network without elevating the GUI (broker v2)
+
+The GUI needed administrator rights to show the Network column, which defeats
+the point of having a LocalSystem broker. Protocol v2 adds
+`ProcessNetworkCounters`: the service hosts the ETW session and answers a
+read-only, bounded query, so an ordinary unelevated GUI gets real numbers.
+This deliberately reverses the "no telemetry endpoint" invariant — the
+reasoning is recorded in `core-service.md`.
+
+Version bumped rather than adding a variant to v1 on purpose: an older service
+then fails the HANDSHAKE, which the client can tell apart from a REJECTION and
+therefore fall back on. Slipping the variant into v1 would have made
+"unsupported" indistinguishable from "denied", and the no-fallback-on-rejection
+rule depends on that distinction. Cost: a one-time service reinstall.
+
+### The bug this uncovered: leaked ETW sessions
+
+First end-to-end run showed 0 KB/s everywhere despite a live 50 MB download.
+The service HAD started its trace (log confirmed) and the GUI's requests were
+accepted, so the counters had to be arriving empty. `network_trace_raw_vs_pruned`
+separated the two candidate causes and reported `raw entries=0, live pids=273`
+— the trace was receiving no events at all, so pruning was innocent.
+
+Root cause: the session name included the pid. `Drop` stops the session, but a
+force-killed or crashed process never runs `Drop`, and the next start picked a
+DIFFERENT name — so orphans accumulated instead of being reclaimed. Four had
+piled up from processes killed during development, and once enough sessions
+have one provider enabled Windows stops delivering events to them. The module
+doc even claimed stale sessions were reclaimed by name; that was never true
+with a pid in it.
+
+Fix: fixed, role-scoped names (`TaskMan-Net-Service`, `TaskMan-Net-App`) so
+each host reclaims its own orphan through the existing
+`ERROR_ALREADY_EXISTS` → stop → restart path, and never the other's.
+`session_names_are_fixed_per_role_and_never_contain_the_pid` pins it. Also
+hardened `totals_pruned`: an EMPTY live-pid set now means "the caller could not
+enumerate", not "nothing is alive" — pruning against it would have wiped every
+counter and produced the same silent all-zero symptom.
+
+Verified: after cleanup, `raw entries=9, busiest = pid 23092 recv 50,075,955`
+(exactly the 50 MB download), and the unelevated installed GUI sorted by
+Network shows `codex.exe 633,1 KB/s` at the top. One session exists, and
+force-killing plus restarting the GUI no longer adds any.
+
 ## 2026-08-31 — engine dropped pre-start demand (why the Network column stayed empty)
 
 User report: the Network column still showed "—" after the ETW work landed.

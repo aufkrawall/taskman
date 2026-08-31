@@ -18,9 +18,13 @@
 //!   the snapshot keeps reporting `None`, which the UI renders as "—". It must
 //!   NEVER fall back to reporting zero bytes: that would be a fabricated
 //!   measurement (core product invariant).
-//! * **A session outlives its process if it is not stopped.** The name is
-//!   per-PID and a stale session with the same name is stopped and restarted,
-//!   so a previous crash cannot permanently wedge the feature.
+//! * **A session outlives its process if it is not stopped**, and a killed
+//!   process never runs `Drop`. The session name is therefore FIXED per role
+//!   (not per-PID): a stale session is found by name on the next start and
+//!   reclaimed. A per-PID name cannot do that — every start picks a new name,
+//!   so orphans accumulate, and once enough of them have the provider enabled
+//!   Windows stops delivering events to new sessions. That failure looks
+//!   exactly like "no traffic anywhere", which is how it was found.
 //! * **`ProcessTrace` blocks** until the session is stopped, so it owns a
 //!   dedicated thread and never runs on the sampler.
 
@@ -125,12 +129,23 @@ pub struct NetworkUsage {
 // alive exactly between `start` and `Drop`; nothing else touches it.
 unsafe impl Send for NetworkUsage {}
 
+/// Which component hosts the trace. Each role owns one fixed session name so
+/// it can reclaim its own orphan without ever stopping the other's session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TraceRole {
+    /// The protected LocalSystem service (the normal host).
+    Service,
+    /// The GUI's own token, used only when there is no service and the GUI
+    /// happens to be elevated.
+    App,
+}
+
 impl NetworkUsage {
-    /// Start a real-time session. Returns `None` when ETW is unavailable to
-    /// this token (the common unelevated case), which keeps per-process
-    /// network reported as unknown rather than zero.
-    pub fn start() -> Option<Self> {
-        let name = session_name();
+    /// Start a real-time session for `role`. Returns `None` when ETW is
+    /// unavailable to this token (the common unelevated case), which keeps
+    /// per-process network reported as unknown rather than zero.
+    pub fn start(role: TraceRole) -> Option<Self> {
+        let name = session_name(role);
         let shared = Arc::new(Shared {
             totals: Mutex::new(HashMap::new()),
             live: AtomicBool::new(true),
@@ -206,9 +221,21 @@ impl NetworkUsage {
         })
     }
 
+    /// Current cumulative byte counters, exactly as observed.
+    pub fn totals(&self) -> HashMap<u32, PidBytes> {
+        match self.shared.totals.lock() {
+            Ok(totals) => totals.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        }
+    }
+
     /// Current cumulative byte counters, pruned to the processes that still
     /// exist. Pruning here bounds the map and stops a recycled PID from
     /// inheriting a dead process's totals across a gap.
+    ///
+    /// An EMPTY `live_pids` means "the caller could not enumerate processes",
+    /// never "nothing is alive": pruning against it would wipe every counter
+    /// and report a system with no traffic at all.
     pub fn totals_pruned(
         &self,
         live_pids: &std::collections::HashSet<u32>,
@@ -216,6 +243,9 @@ impl NetworkUsage {
         let Ok(mut totals) = self.shared.totals.lock() else {
             return HashMap::new();
         };
+        if live_pids.is_empty() {
+            return totals.clone();
+        }
         totals.retain(|pid, _| live_pids.contains(pid));
         totals.clone()
     }
@@ -257,11 +287,14 @@ unsafe extern "system" fn on_event(record: *mut EVENT_RECORD) {
     unsafe { &*shared }.record(pid, size, dir);
 }
 
-/// Session name, unique per process so two running copies never collide.
-fn session_name() -> Vec<u16> {
-    format!("TaskMan-Net-{}\0", std::process::id())
-        .encode_utf16()
-        .collect()
+/// Fixed session name per role. See the module docs: this MUST NOT include
+/// the pid, or an orphaned session can never be reclaimed.
+fn session_name(role: TraceRole) -> Vec<u16> {
+    let name = match role {
+        TraceRole::Service => "TaskMan-Net-Service\0",
+        TraceRole::App => "TaskMan-Net-App\0",
+    };
+    name.encode_utf16().collect()
 }
 
 /// `EVENT_TRACE_PROPERTIES` plus room for the trailing session name, which
@@ -420,7 +453,7 @@ mod tests {
 
     #[test]
     fn properties_buffer_reserves_room_for_the_session_name() {
-        let name = session_name();
+        let name = session_name(TraceRole::Service);
         let buffer = properties_buffer(&name);
         assert_eq!(
             buffer.len(),
@@ -437,11 +470,26 @@ mod tests {
         }
     }
 
+    /// The names must be FIXED and role-scoped. A pid in the name would make
+    /// every orphaned session unreclaimable, and once enough orphans have the
+    /// provider enabled, Windows delivers events to none of them — which
+    /// presents as "no process uses the network".
     #[test]
-    fn session_name_is_process_unique_and_nul_terminated() {
-        let name = session_name();
-        assert_eq!(name.last(), Some(&0));
-        let text = String::from_utf16_lossy(&name[..name.len() - 1]);
-        assert_eq!(text, format!("TaskMan-Net-{}", std::process::id()));
+    fn session_names_are_fixed_per_role_and_never_contain_the_pid() {
+        let pid = std::process::id().to_string();
+        let text = |role| {
+            let name = session_name(role);
+            assert_eq!(name.last(), Some(&0), "must be NUL terminated");
+            String::from_utf16_lossy(&name[..name.len() - 1])
+        };
+        let service = text(TraceRole::Service);
+        let app = text(TraceRole::App);
+        assert_eq!(service, "TaskMan-Net-Service");
+        assert_eq!(app, "TaskMan-Net-App");
+        assert!(!service.contains(&pid) && !app.contains(&pid));
+        // The two roles must not fight over one session.
+        assert_ne!(service, app);
+        // Stable across calls, so a restart finds its own orphan.
+        assert_eq!(text(TraceRole::Service), service);
     }
 }

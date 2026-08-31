@@ -46,8 +46,9 @@ platform boundary (`tm-core` ← `tm-platform` ← `tm-app` / `tm-service`):
     `startup.rs` (Run keys + Startup folders + StartupApproved incl. the
     folder-subkey fix and best-effort publisher resolution), `services.rs`,
     `users.rs`, `net_info.rs` (cached adapter/link/IP/SSID/signal metadata),
-    `net_etw.rs` (demand-gated real-time ETW session for per-process network
-    bytes; needs elevation, reports unknown rather than zero without it),
+    `net_etw.rs` (real-time ETW session for per-process network bytes; the
+    session name MUST stay fixed per role — a pid in it leaks an orphaned
+    session on every kill until the provider stops delivering events),
     `core_service.rs` (versioned authenticated named-pipe broker plus secure
     SCM/Program Files/ProgramData install lifecycle, including pinned
     reparse/hard-link-resistant owner/group/DACL repair), `autostart.rs` (owned-command-
