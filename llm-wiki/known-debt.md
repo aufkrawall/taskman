@@ -37,6 +37,19 @@ items across Phases 2–6. The following concrete gaps remain:
   instead of nested beneath it the way System Informer shows it. Restoring
   the link would mean re-introducing a parent the collector API did not
   report; the honest root is preferred over a synthesized edge.
+- **Sub-pixel (ClearType) text:** impossible without forking epaint and both
+  render backends. epaint keeps a single-channel glyph coverage atlas and the
+  renderers blend with one scalar alpha; per-channel coverage needs a
+  3-channel atlas plus dual-source blending or per-channel write masks
+  (upstream: emilk/egui#2639). Measured: 0 RGB channel spread in our text vs
+  visible fringing in the reference Task Manager capture. The `text_smoothing`
+  setting tunes grayscale weight and grid-fitting, which is all that is
+  reachable.
+- **Software rendering performance:** `render_mode = software` uses WARP and
+  costs ~14 cores at 2.9 fps on a 16-thread desktop. The cost is fixed per
+  frame (window size and UI content do not change it), so it is a wgpu/WARP
+  property, not something the app can optimize. Kept as an explicitly warned
+  option; `compatibility` (OpenGL) is the fallback that stays real-time.
 - **CPU compatibility:** current `cpu_load.rs` intentionally matches the
   standardized time-based CPU metric. The legacy frequency-weighted
   **CPU Utility** provider/column/switcher still does not exist; do not mutate

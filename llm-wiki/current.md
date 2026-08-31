@@ -13,6 +13,28 @@ diagnostics; remaining telemetry and accessibility work is itemized precisely
 in `known-debt.md`. Normal GUI startup remains unelevated; privileged controls
 can cross a protected, allowlisted service boundary after one explicit install.
 
+## Recently landed (2026-08-31 — text rendering and graphics mode)
+
+- **Text**: Segoe UI Variable (`SegUIVar.ttf`, pinned `wght=400`/`opsz=10.5`)
+  replaces the Win10 static Segoe UI, and a new `text_smoothing`
+  (`sharp` default / `standard` / `smooth`) controls both halves of glyph
+  weight: the coverage→alpha ramp in the visuals' text options and the
+  grid-fitting target in each face's `FontTweak`. epaint's defaults switch
+  horizontal grid-fitting OFF and lift dark-mode coverage by `2c − c²`, which
+  together produce the "blurry and fat" look; `sharp` reverses both. Applies
+  live, no restart.
+- **Sub-pixel (ClearType) rendering stays impossible** — epaint's glyph atlas
+  is single-channel and both renderers blend with one scalar alpha. Measured:
+  0 RGB channel spread in our text, visible fringing in the reference Task
+  Manager capture. See `known-debt.md`.
+- **`render_mode`** (`auto` / `compatibility` / `software`) replaces the
+  transient `gpu_acceleration` bool and is read once at startup. `auto` is
+  wgpu/D3D12 (0.2–0.3 cores at continuous repaint), `compatibility` forces the
+  OpenGL backend (1.0–1.1 cores) for machines with a broken D3D driver, and
+  `software` is WARP — correct but ~14 cores at 2.9 fps, with a fixed
+  per-frame cost the app cannot influence, so the settings dialog warns about
+  it explicitly.
+
 ## Recently landed (2026-08-31 — table look, status glyphs and tree)
 
 - **Efficiency mode was never detected.** `GetProcessInformation` with

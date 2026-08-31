@@ -315,6 +315,30 @@ keys! {
     ShowKernelTimes => ["Kernelzeiten anzeigen", "Show kernel times"],
     MinShort => ["Min.", "min"],
     ScaleLabel => ["Skalierung:", "Scale:"],
+    TextSmoothingLabel => ["Schriftglättung:", "Font smoothing:"],
+    SmoothingSharp => ["Scharf", "Sharp"],
+    SmoothingStandard => ["Standard", "Standard"],
+    SmoothingSmooth => ["Weich", "Smooth"],
+    TextSmoothingHint => [
+        "Graustufen-Kantenglättung. Subpixel-Darstellung (ClearType) unterstützt die Oberfläche nicht.",
+        "Grayscale anti-aliasing. Sub-pixel rendering (ClearType) is not supported by the UI toolkit."
+    ],
+    RenderModeLabel => ["Grafikausgabe:", "Graphics:"],
+    RenderAuto => ["Automatisch (GPU)", "Automatic (GPU)"],
+    RenderCompat => ["Kompatibilität (OpenGL)", "Compatibility (OpenGL)"],
+    RenderSoftware => ["Software (CPU)", "Software (CPU)"],
+    RenderModeHint => [
+        "Kompatibilität nutzt einen anderen Treiberpfad, falls Direct3D Probleme macht.",
+        "Compatibility uses a different driver path in case Direct3D misbehaves."
+    ],
+    RenderSoftwareWarning => [
+        "Software-Rendering rechnet jedes Bild auf der CPU und ist um ein Vielfaches langsamer (auf diesem System ~3 Bilder/s bei hoher CPU-Last).",
+        "Software rendering computes every frame on the CPU and is far slower (~3 frames/s at high CPU load on this system)."
+    ],
+    RestartRequired => [
+        "Wird beim nächsten Start übernommen.",
+        "Takes effect at the next start."
+    ],
     LanguageLabel => ["Sprache:", "Language:"],
     AlwaysOnTop => ["Immer im Vordergrund", "Always on top"],
     CloseToTray => [

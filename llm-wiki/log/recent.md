@@ -1,5 +1,66 @@
 # Recent Activity
 
+## 2026-08-31 — text rendering limits, graphics mode, and two measured findings
+
+### ClearType is not reachable from this side (measured, not assumed)
+
+User report: "fonts don't seem to have coloured sub-pixels, they look blurry
+and fat". Confirmed by measurement: across a text region of our own window the
+maximum per-pixel RGB channel spread is **0** — pure grayscale coverage. The
+same measurement on the reference Windows Task Manager capture
+(`taskmanpngs/1.png`) shows orange/blue fringes, i.e. real sub-pixel AA.
+
+Why it cannot be fixed here: epaint stores every glyph in a SINGLE-channel
+coverage atlas and tints it in the shader, and the renderers blend with one
+scalar alpha. Per-channel coverage would need a 3-channel atlas plus either
+dual-source blending or per-channel colour write masks in BOTH the wgpu and
+glow backends — a fork of epaint + egui-wgpu + egui_glow. Upstream tracks it
+as emilk/egui#2639. Recorded in `known-debt.md`.
+
+What DID improve, and why:
+- **Segoe UI Variable** (`SegUIVar.ttf`, the real Win11 UI face) is now
+  preferred over the Win10 static `segoeui.ttf`, pinned to `wght=400`,
+  `opsz=10.5` through `FontTweak::coords`.
+- **Horizontal grid-fitting.** epaint's default `SmoothHinting` sets
+  `preserve_linear_metrics: true` AND `symmetric_rendering: true`, both of
+  which switch x-direction grid-fitting OFF, so vertical stems straddle two
+  grey columns. The `Sharp` profile turns both off. Measured on a stem:
+  `237 252 187 92` → `220 255 220 114` (a fully-lit column appears).
+- **Coverage ramp.** egui's dark-mode default `2c − c²` lifts every partially
+  covered pixel (0.5 → 0.75) — that is the "fat" look. `Sharp` uses raw
+  coverage; measured ink over a fixed text region drops 277 → 225 (−19 %).
+- All three are one user setting, `text_smoothing = sharp|standard|smooth`
+  (default `sharp`), applied live; `TASKMAN_TEXT_SMOOTHING` overrides it for
+  A/B comparisons.
+
+### Software rendering is not viable on this stack (measured)
+
+`render_mode` replaces the short-lived `gpu_acceleration` bool with
+`auto | compatibility | software`. Continuous-repaint measurements on this
+machine (Ryzen 7 5700X, 16 logical CPUs, 2400x1350 window):
+
+| mode | backend | cost |
+| --- | --- | --- |
+| auto | wgpu D3D12, GPU | **0.2–0.3 cores** |
+| compatibility | glow/OpenGL, GPU | **1.0–1.1 cores** |
+| software | wgpu D3D12, WARP | **14 cores at 2.9 fps** |
+
+WARP's cost is FIXED per frame, not fill rate: identical at 500x320 and
+2000x1200 (10.5 vs 14.0 cores), identical for a near-empty paused window and a
+full process list, and unchanged by present mode or frame latency. Nothing
+this app draws can bring it down. Even at the normal 1 Hz sampling tick,
+software mode sits at ~10 cores. It is therefore shipped with an explicit
+warning in the settings dialog, and "no GPU trouble" is served by
+`compatibility` (OpenGL — a different driver stack, still real-time).
+
+### Per-process network is still not implemented
+
+Checked on request: no Windows collector ever writes `net_recv_bps` /
+`net_sent_bps` / `net_recv_total` / `net_sent_total` (the only writers are in
+an `app_history` unit test), so the Processes and App History network columns
+render "—" for every row. That is the intended honest-unavailable behavior,
+not a regression; the ETW work is listed in `known-debt.md`.
+
 ## 2026-08-31 — Processes/Details table parity: heat map, status glyphs, type-ahead, tree
 
 Seven user-reported gaps against native Task Manager and System Informer,

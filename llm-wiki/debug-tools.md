@@ -29,6 +29,16 @@ ProgramData, registry, or SCM state.
 ## Renderer diagnostics
 
 - Default order is WGPU, then Glow. `TASKMAN_RENDERER=wgpu|glow` forces one.
+- `TASKMAN_GPU=auto|compatibility|software` overrides the persisted
+  `render_mode` for one run (`0`/`1` still map to software/auto).
+  `compatibility` is the Glow/OpenGL path; `software` selects the CPU adapter
+  (WARP on Windows), which is correct but costs ~14 cores at 2.9 fps — see
+  `known-debt.md` before using it for anything but a comparison.
+- `TASKMAN_PRESENT=fifo|immediate|mailbox|autovsync` and
+  `TASKMAN_FRAME_LATENCY=<n>` (0 = leave it to wgpu) tune the swapchain while
+  investigating frame pacing.
+- `TASKMAN_TEXT_SMOOTHING=sharp|standard|smooth` overrides the persisted glyph
+  weight/grid-fitting profile for A/B comparison without touching config.ini.
 - Windows WGPU compiles only D3D12; Linux only Vulkan; macOS only Metal.
   `WGPU_BACKEND` may narrow the compiled set but cannot enable a backend that
   was not compiled for that host.

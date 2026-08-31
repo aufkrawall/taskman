@@ -4,7 +4,7 @@
 
 use eframe::egui::{self, Align2, Color32, FontId, Pos2, Rect, Sense, Stroke};
 use tm_core::i18n::{self, K};
-use tm_core::settings::{Settings, ThemeMode};
+use tm_core::settings::{RenderMode, Settings, TextSmoothing, ThemeMode};
 
 use crate::app::TaskManApp;
 use crate::icons;
@@ -453,6 +453,75 @@ pub fn settings_dialog(app: &mut TaskManApp, ctx: &egui::Context, _pal: &theme::
             });
 
             ui.add_space(10.0);
+            ui.label(i18n::tr(K::TextSmoothingLabel));
+            ui.horizontal(|ui| {
+                for (mode, key) in [
+                    (TextSmoothing::Sharp, K::SmoothingSharp),
+                    (TextSmoothing::Standard, K::SmoothingStandard),
+                    (TextSmoothing::Smooth, K::SmoothingSmooth),
+                ] {
+                    if ui
+                        .selectable_label(
+                            app.shared.settings.text_smoothing == mode,
+                            i18n::tr(key),
+                        )
+                        .clicked()
+                    {
+                        app.shared.settings.text_smoothing = mode;
+                        // Two halves have to be re-pushed: the coverage ramp
+                        // lives in the visuals' text options, the grid-fitting
+                        // target in each face's FontTweak.
+                        theme::set_text_smoothing(mode);
+                        theme::refresh_text_rendering(ctx);
+                        crate::fonts::reapply(ctx);
+                        app.save_settings();
+                    }
+                }
+            });
+            ui.label(
+                egui::RichText::new(i18n::tr(K::TextSmoothingHint))
+                    .size(11.0)
+                    .color(_pal.text_dim),
+            );
+
+            ui.add_space(10.0);
+            ui.label(i18n::tr(K::RenderModeLabel));
+            ui.horizontal_wrapped(|ui| {
+                for (mode, key) in [
+                    (RenderMode::Auto, K::RenderAuto),
+                    (RenderMode::Compatibility, K::RenderCompat),
+                    (RenderMode::Software, K::RenderSoftware),
+                ] {
+                    if ui
+                        .selectable_label(app.shared.settings.render_mode == mode, i18n::tr(key))
+                        .clicked()
+                    {
+                        app.shared.settings.render_mode = mode;
+                        app.shared.settings.save();
+                    }
+                }
+            });
+            ui.label(
+                egui::RichText::new(i18n::tr(K::RenderModeHint))
+                    .size(11.0)
+                    .color(_pal.text_dim),
+            );
+            if app.shared.settings.render_mode == RenderMode::Software {
+                ui.label(
+                    egui::RichText::new(i18n::tr(K::RenderSoftwareWarning))
+                        .size(11.0)
+                        .color(_pal.warn_orange),
+                );
+            }
+            if app.shared.settings.render_mode != crate::active_render_mode() {
+                ui.label(
+                    egui::RichText::new(i18n::tr(K::RestartRequired))
+                        .size(11.0)
+                        .color(_pal.text_dim),
+                );
+            }
+
+            ui.add_space(10.0);
             let mut on_top = app.shared.settings.always_on_top;
             if crate::widgets::controls::checkbox(ui, &mut on_top, i18n::tr(K::AlwaysOnTop), _pal)
                 .changed()
@@ -777,6 +846,9 @@ pub fn settings_dialog(app: &mut TaskManApp, ctx: &egui::Context, _pal: &theme::
                             .toast(i18n::trf(K::ErrMsg, &[&error.to_string()]));
                     }
                     apply_theme(ctx, defaults.theme);
+                    theme::set_text_smoothing(defaults.text_smoothing);
+                    theme::refresh_text_rendering(ctx);
+                    crate::fonts::reapply(ctx);
                     ctx.set_zoom_factor(defaults.ui_zoom);
                     app.engine.resume();
                     app.engine.set_interval(defaults.update_speed.interval());
