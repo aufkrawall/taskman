@@ -50,6 +50,12 @@ items across Phases 2–6. The following concrete gaps remain:
   frame (window size and UI content do not change it), so it is a wgpu/WARP
   property, not something the app can optimize. Kept as an explicitly warned
   option; `compatibility` (OpenGL) is the fallback that stays real-time.
+- **Service upgrade over a RUNNING service fails.** `stop_service_for_upgrade`
+  opens the live service process with `SYNCHRONIZE` to wait for its exit, and
+  that `OpenProcess` returns access denied even from an elevated installer, so
+  `--core-service=install` aborts with "open core service process: Zugriff
+  verweigert". Workaround: `sc stop TaskmanCore` before installing. Not
+  investigated further; it predates the v2 work and only affects upgrades.
 - **CPU compatibility:** current `cpu_load.rs` intentionally matches the
   standardized time-based CPU metric. The legacy frequency-weighted
   **CPU Utility** provider/column/switcher still does not exist; do not mutate

@@ -54,7 +54,12 @@ pub const SERVICE_DISPLAY_NAME: &str = "TaskMan Core Service";
 pub const SERVICE_EXE_NAME: &str = "taskman-service.exe";
 pub const GUI_EXE_NAME: &str = "taskman.exe";
 pub const SERVICE_LOG_FILE_PREFIX: &str = "taskman-service.log";
-pub const PROTOCOL_VERSION: u16 = 1;
+// v2 added `ProcessNetworkCounters`. A version bump (rather than a new
+// variant on v1) is deliberate: it makes an older service fail the handshake,
+// which the client can tell apart from a REJECTION and therefore fall back on.
+// Sneaking the variant into v1 would have made "unsupported" look like
+// "denied", and the no-fallback-on-rejection rule depends on that distinction.
+pub const PROTOCOL_VERSION: u16 = 2;
 
 const PIPE_NAME: &str = r"\\.\pipe\Taskman.Core.v1";
 const FRAME_MAGIC: [u8; 4] = *b"TMB1";
@@ -153,6 +158,32 @@ enum BrokerRequest {
     SetTaskManagerReplacement {
         enabled: bool,
     },
+    /// Read-only per-process network counters (see [`ProcessNetworkSample`]).
+    ProcessNetworkCounters,
+}
+
+/// Cumulative per-process network bytes as answered by the broker.
+///
+/// This is the protocol's only telemetry response, and it is deliberately
+/// shaped to stay small and unambiguous:
+/// * `active` distinguishes "the trace is running, so a process missing from
+///   `entries` moved zero bytes" from "no trace, the answer is unknown". The
+///   product invariant is that unknown must never render as zero.
+/// * only processes with non-zero counters are listed; on a normal desktop
+///   that is a few dozen entries, far inside the 64 KiB response cap.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProcessNetworkSample {
+    pub active: bool,
+    pub entries: Vec<ProcessNetworkEntry>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProcessNetworkEntry {
+    pub pid: u32,
+    pub received: u64,
+    pub sent: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -162,6 +193,7 @@ enum BrokerValue {
     Unit,
     AffinityMask(u64),
     TaskManagerReplacementState(TaskManagerReplacementState),
+    ProcessNetwork(ProcessNetworkSample),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -460,6 +492,28 @@ impl BrokerClient {
             ));
         }
         response.value.map_err(BrokerCallError::Rejected)
+    }
+}
+
+/// Outcome of asking the broker for per-process network counters.
+///
+/// `Unavailable` and `Rejected` are kept apart on purpose: the first means
+/// "no service, or one too old to know this request", where falling back to
+/// our own token is correct; the second is the service declining, which must
+/// never be worked around locally.
+pub(crate) enum BrokeredNetwork {
+    Sample(ProcessNetworkSample),
+    Unavailable,
+    Rejected(String),
+}
+
+/// Ask the protected service for per-process network counters.
+pub(crate) fn brokered_process_network() -> BrokeredNetwork {
+    match BrokerClient.call(BrokerRequest::ProcessNetworkCounters) {
+        Ok(BrokerValue::ProcessNetwork(sample)) => BrokeredNetwork::Sample(sample),
+        Ok(_) => BrokeredNetwork::Rejected("unexpected response type".into()),
+        Err(BrokerCallError::Unavailable(_)) => BrokeredNetwork::Unavailable,
+        Err(BrokerCallError::Rejected(detail)) => BrokeredNetwork::Rejected(detail),
     }
 }
 
@@ -1139,6 +1193,153 @@ fn valid_service_name(name: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.' | b' '))
 }
 
+/// How long the broker keeps the network trace alive after the last request.
+/// The GUI polls once per sampling tick while a page that shows the column is
+/// visible, so a few missed ticks (paused sampling, a slow frame) must not
+/// tear the session down and lose the counters.
+const NET_TRACE_IDLE: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Hard cap on entries in one response, sized so even worst-case counters fit
+/// `MAX_RESPONSE_BYTES`: a maximal entry encodes to ~79 bytes
+/// (`{"pid":4294967295,"received":<u64>,"sent":<u64>},`), so 64 KiB holds
+/// roughly 820. A desktop produces a few dozen entries, so this only exists so
+/// a pathological machine cannot push the frame past the cap and turn the
+/// feature into a hard error. Pinned by
+/// `a_capped_network_response_fits_the_frame_limit`.
+const NET_MAX_ENTRIES: usize = 700;
+
+/// The broker-hosted ETW trace. Started on the first request and stopped by a
+/// watchdog once the GUI stops asking, so the service is not tracing whenever
+/// nobody is looking at the column.
+struct NetTrace {
+    usage: super::net_etw::NetworkUsage,
+    last_request: std::time::Instant,
+}
+
+fn net_trace() -> &'static std::sync::Mutex<Option<NetTrace>> {
+    static SLOT: std::sync::OnceLock<std::sync::Mutex<Option<NetTrace>>> =
+        std::sync::OnceLock::new();
+    SLOT.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+/// Answer one `ProcessNetworkCounters` request, starting the trace if needed.
+///
+/// Counters are pruned to processes that still exist. The service, not the
+/// caller, decides what is live: it is the one holding the cumulative map, and
+/// trusting a pid list from the client would let the client shape the answer.
+fn process_network_sample() -> ProcessNetworkSample {
+    let mut slot = match net_trace().lock() {
+        Ok(slot) => slot,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    if slot.is_none() {
+        match super::net_etw::NetworkUsage::start(super::net_etw::TraceRole::Service) {
+            Some(usage) => {
+                *slot = Some(NetTrace {
+                    usage,
+                    last_request: std::time::Instant::now(),
+                });
+                spawn_net_trace_watchdog();
+            }
+            None => {
+                // LocalSystem should always be able to start a session; if it
+                // cannot, report unknown rather than a fabricated zero.
+                tracing::warn!("broker could not start the per-process network trace");
+                return ProcessNetworkSample::default();
+            }
+        }
+    }
+    let Some(trace) = slot.as_mut() else {
+        return ProcessNetworkSample::default();
+    };
+    trace.last_request = std::time::Instant::now();
+    let live = live_pids();
+    let totals = trace.usage.totals_pruned(&live);
+    let mut entries: Vec<ProcessNetworkEntry> = totals
+        .into_iter()
+        .filter(|(_, bytes)| bytes.received != 0 || bytes.sent != 0)
+        .map(|(pid, bytes)| ProcessNetworkEntry {
+            pid,
+            received: bytes.received,
+            sent: bytes.sent,
+        })
+        .collect();
+    if entries.len() > NET_MAX_ENTRIES {
+        // Keep the busiest; a truncated tail is all near-zero anyway.
+        entries.sort_unstable_by_key(|entry| {
+            std::cmp::Reverse(entry.received.saturating_add(entry.sent))
+        });
+        entries.truncate(NET_MAX_ENTRIES);
+    }
+    ProcessNetworkSample {
+        active: true,
+        entries,
+    }
+}
+
+/// Stop the trace once the GUI stops polling. Without this the session would
+/// outlive the last interested window and trace forever.
+fn spawn_net_trace_watchdog() {
+    static STARTED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    if STARTED.set(()).is_err() {
+        return;
+    }
+    let _ = std::thread::Builder::new()
+        .name("tm-net-idle".into())
+        .spawn(|| {
+            loop {
+                std::thread::sleep(std::time::Duration::from_secs(5));
+                let mut slot = match net_trace().lock() {
+                    Ok(slot) => slot,
+                    Err(poisoned) => poisoned.into_inner(),
+                };
+                if slot
+                    .as_ref()
+                    .is_some_and(|trace| trace.last_request.elapsed() >= NET_TRACE_IDLE)
+                {
+                    // Dropping stops the session and joins its consumer.
+                    *slot = None;
+                    tracing::info!("per-process network trace stopped (idle)");
+                }
+            }
+        });
+}
+
+/// Test hook for [`live_pids`], so an integration test can check the same
+/// enumeration the broker prunes with.
+#[doc(hidden)]
+pub fn live_pids_for_test() -> std::collections::HashSet<u32> {
+    live_pids()
+}
+
+/// PIDs that currently exist, from a ToolHelp snapshot (~1 ms).
+fn live_pids() -> std::collections::HashSet<u32> {
+    use windows::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW,
+        TH32CS_SNAPPROCESS,
+    };
+    let mut pids = std::collections::HashSet::new();
+    unsafe {
+        let Ok(snapshot) = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) else {
+            return pids;
+        };
+        let mut entry = PROCESSENTRY32W {
+            dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
+            ..Default::default()
+        };
+        if Process32FirstW(snapshot, &mut entry).is_ok() {
+            loop {
+                pids.insert(entry.th32ProcessID);
+                if Process32NextW(snapshot, &mut entry).is_err() {
+                    break;
+                }
+            }
+        }
+        let _ = CloseHandle(snapshot);
+    }
+    pids
+}
+
 fn dispatch(
     actions: &super::WinActions,
     request: BrokerRequest,
@@ -1148,6 +1349,11 @@ fn dispatch(
         BrokerRequest::Ping => Ok(BrokerValue::Pong {
             version: env!("CARGO_PKG_VERSION").to_string(),
         }),
+        // The one read-only telemetry request. It takes no target and can
+        // change nothing, so it deliberately skips `checked_target`.
+        BrokerRequest::ProcessNetworkCounters => {
+            Ok(BrokerValue::ProcessNetwork(process_network_sample()))
+        }
         BrokerRequest::KillProcess {
             pid,
             expected_start_epoch_s,
@@ -2402,6 +2608,79 @@ fn uninstall() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The telemetry response must survive a round trip through the wire
+    /// format, and `active` must be part of it: without that flag the client
+    /// cannot tell "measured zero" from "unknown", which is the whole
+    /// never-fabricate-a-zero invariant.
+    #[test]
+    fn process_network_sample_round_trips_with_its_active_flag() {
+        let sample = ProcessNetworkSample {
+            active: true,
+            entries: vec![ProcessNetworkEntry {
+                pid: 4321,
+                received: 9_000,
+                sent: 120,
+            }],
+        };
+        let value = BrokerValue::ProcessNetwork(sample);
+        let encoded = serde_json::to_vec(&value).unwrap();
+        let decoded: BrokerValue = serde_json::from_slice(&encoded).unwrap();
+        let BrokerValue::ProcessNetwork(decoded) = decoded else {
+            panic!("wrong variant");
+        };
+        assert!(decoded.active);
+        assert_eq!(decoded.entries.len(), 1);
+        assert_eq!(decoded.entries[0].pid, 4321);
+        assert_eq!(decoded.entries[0].received, 9_000);
+        assert_eq!(decoded.entries[0].sent, 120);
+
+        // The default is the "unknown" answer, not an empty measurement.
+        let unknown = ProcessNetworkSample::default();
+        assert!(!unknown.active && unknown.entries.is_empty());
+    }
+
+    /// The request carries no target and must stay a bare tag on the wire —
+    /// this is the one broker request that can change nothing.
+    #[test]
+    fn process_network_request_takes_no_parameters() {
+        let encoded = serde_json::to_string(&BrokerRequest::ProcessNetworkCounters).unwrap();
+        // Exactly the internally-tagged unit variant: no pid, no target, no
+        // knob a caller could steer. (`deny_unknown_fields` does not apply to
+        // unit variants of an internally tagged enum, which is harmless here
+        // precisely because there is no field to confuse.)
+        assert_eq!(encoded, r#"{"operation":"process_network_counters"}"#);
+        assert!(matches!(
+            serde_json::from_str::<BrokerRequest>(&encoded).unwrap(),
+            BrokerRequest::ProcessNetworkCounters
+        ));
+    }
+
+    /// A full-size answer has to fit the response frame. 2000 entries is the
+    /// hard cap; a desktop produces a few dozen.
+    #[test]
+    fn a_capped_network_response_fits_the_frame_limit() {
+        let sample = ProcessNetworkSample {
+            active: true,
+            entries: (0..NET_MAX_ENTRIES as u32)
+                .map(|i| ProcessNetworkEntry {
+                    pid: 100_000 + i,
+                    received: u64::MAX,
+                    sent: u64::MAX,
+                })
+                .collect(),
+        };
+        let response = BrokerResponse {
+            protocol_version: PROTOCOL_VERSION,
+            value: Ok(BrokerValue::ProcessNetwork(sample)),
+        };
+        let encoded = serde_json::to_vec(&response).unwrap();
+        assert!(
+            encoded.len() <= MAX_RESPONSE_BYTES,
+            "worst-case response {} exceeds the {MAX_RESPONSE_BYTES}-byte cap",
+            encoded.len()
+        );
+    }
 
     #[test]
     fn live_service_identity_verifies_without_elevation() {

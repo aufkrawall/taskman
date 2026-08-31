@@ -301,3 +301,44 @@ fn engine_delivers_process_network_when_demanded() {
         "demand did not reach the collector: {with_values}/{total}"
     );
 }
+
+/// Diagnostic (run elevated): separates "the trace saw no events" from "the
+/// counters were pruned away", which look identical from the GUI.
+#[cfg(target_os = "windows")]
+#[test]
+#[ignore = "needs elevation and live network traffic"]
+fn network_trace_raw_vs_pruned() {
+    let Some(usage) = tm_platform::win::net_etw_test_start() else {
+        eprintln!("could not start a trace (not elevated?)");
+        return;
+    };
+    let mut child = std::process::Command::new("curl.exe")
+        .args([
+            "-s",
+            "-o",
+            "NUL",
+            "https://speed.cloudflare.com/__down?bytes=50000000",
+        ])
+        .spawn()
+        .expect("spawn curl");
+    std::thread::sleep(std::time::Duration::from_secs(6));
+    let raw = usage.totals();
+    let live = tm_platform::win::live_pids_for_test();
+    let pruned = usage.totals_pruned(&live);
+    let _ = child.kill();
+    let _ = child.wait();
+    eprintln!(
+        "raw entries={}  live pids={}  pruned entries={}",
+        raw.len(),
+        live.len(),
+        pruned.len()
+    );
+    let busiest = raw
+        .iter()
+        .max_by_key(|(_, b)| b.received + b.sent)
+        .map(|(pid, b)| (*pid, b.received, b.sent));
+    eprintln!("busiest raw = {busiest:?}");
+    assert!(!raw.is_empty(), "the trace received no events at all");
+    assert!(!live.is_empty(), "process enumeration returned nothing");
+    assert!(!pruned.is_empty(), "pruning removed every counter");
+}

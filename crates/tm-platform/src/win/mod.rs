@@ -10,6 +10,18 @@ pub mod locale;
 pub mod memory_info;
 mod net_etw;
 mod net_info;
+
+/// Test-only handles into the ETW network trace, so integration tests can
+/// tell "no events" apart from "pruned away" without exposing the module.
+#[doc(hidden)]
+pub fn net_etw_test_start() -> Option<net_etw::NetworkUsage> {
+    net_etw::NetworkUsage::start(net_etw::TraceRole::App)
+}
+
+#[doc(hidden)]
+pub fn live_pids_for_test() -> std::collections::HashSet<u32> {
+    core_service::live_pids_for_test()
+}
 mod perfcounters;
 mod process_ops;
 mod sampler;
