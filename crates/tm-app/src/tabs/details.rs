@@ -16,6 +16,7 @@ use crate::app::TaskManApp;
 use crate::icons::Icon;
 use crate::search;
 use crate::theme;
+use crate::widgets::menu;
 use crate::widgets::tablekit::{self, TmColumn};
 
 type AffinityLoadResult = Arc<Mutex<Option<std::result::Result<(u64, u64), String>>>>;
@@ -110,6 +111,60 @@ impl ColumnId {
             ColumnId::CommandLine => {
                 cmp_option_str(a.command_line.as_deref(), b.command_line.as_deref())
             }
+        }
+    }
+}
+
+/// Order the Details list is presented in.
+///
+/// The tree has a third state that no column sort can express: children
+/// strictly under their parent in creation order, with no alphabetical (or
+/// any other) reordering at all. System Informer reaches it by clicking the
+/// sorted column a THIRD time, and so do we — the two-way toggle alone left
+/// the tree as a mix of hierarchy and alphabet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SortOrder {
+    Ascending,
+    Descending,
+    /// No column sort at all — pure hierarchy. Tree view only; a flat list
+    /// has no hierarchy to fall back to, so it never enters this state.
+    Hierarchical,
+}
+
+impl SortOrder {
+    /// Direction to sort in. Hierarchical order sorts nothing, but siblings
+    /// still need a deterministic tie-break, and ascending creation order is
+    /// what "hierarchical" means.
+    pub fn ascending(self) -> bool {
+        !matches!(self, SortOrder::Descending)
+    }
+
+    /// Arrow the header should draw, or `None` when no column is sorted.
+    pub fn arrow(self) -> Option<bool> {
+        match self {
+            SortOrder::Ascending => Some(true),
+            SortOrder::Descending => Some(false),
+            SortOrder::Hierarchical => None,
+        }
+    }
+
+    /// Next state when the user clicks the column that is ALREADY sorted.
+    fn next(self, tree: bool) -> Self {
+        match (self, tree) {
+            (SortOrder::Ascending, _) => SortOrder::Descending,
+            (SortOrder::Descending, true) => SortOrder::Hierarchical,
+            (SortOrder::Descending, false) => SortOrder::Ascending,
+            (SortOrder::Hierarchical, _) => SortOrder::Ascending,
+        }
+    }
+
+    /// Persisted form. Stored beside the sort column so a restored session
+    /// comes back in the same order the user left it in.
+    pub fn from_saved(ascending: bool, hierarchical: bool) -> Self {
+        match (hierarchical, ascending) {
+            (true, _) => SortOrder::Hierarchical,
+            (false, true) => SortOrder::Ascending,
+            (false, false) => SortOrder::Descending,
         }
     }
 }
@@ -381,7 +436,7 @@ fn default_order_ids() -> Vec<String> {
 
 pub struct State {
     pub sort_col: ColumnId,
-    pub ascending: bool,
+    pub sort_order: SortOrder,
     pub filter: String,
     pub cache: Option<Cache>,
     pub visible: BTreeSet<ColumnId>,
@@ -430,7 +485,7 @@ impl State {
                     .copied()
                     .find(|candidate| self.visible.contains(candidate))
                     .unwrap_or(ColumnId::Name);
-                self.ascending = true;
+                self.sort_order = SortOrder::Ascending;
             }
         }
         self.invalidate();
@@ -493,7 +548,7 @@ impl State {
                 .copied()
                 .find(|candidate| self.visible.contains(candidate))
                 .unwrap_or(ColumnId::Name);
-            self.ascending = true;
+            self.sort_order = SortOrder::Ascending;
         }
         self.invalidate();
     }
@@ -592,14 +647,40 @@ impl State {
         self.invalidate();
     }
 
-    pub fn apply_saved_sort(&mut self, column: &str, ascending: bool) {
+    pub fn apply_saved_sort(&mut self, column: &str, order: SortOrder) {
         if let Some(cid) = cid_from_id(column)
             && self.visible.contains(&cid)
         {
             self.sort_col = cid;
-            self.ascending = ascending;
+            self.sort_order = order;
             self.invalidate();
         }
+    }
+
+    /// Switch between the flat list and the tree. Hierarchical order only
+    /// exists in the tree, so leaving it must not strand the flat list with
+    /// an unsorted, arbitrary process order.
+    pub fn set_tree(&mut self, tree: bool) {
+        if !tree && self.sort_order == SortOrder::Hierarchical {
+            self.sort_order = SortOrder::Ascending;
+        }
+        self.invalidate();
+    }
+
+    /// Apply a header click on `cid` and report the resulting order.
+    pub fn clicked_column(&mut self, cid: ColumnId, tree: bool) -> SortOrder {
+        if self.sort_col == cid {
+            self.sort_order = self.sort_order.next(tree);
+        } else {
+            self.sort_col = cid;
+            self.sort_order = if cid_is_numeric(cid) {
+                SortOrder::Descending
+            } else {
+                SortOrder::Ascending
+            };
+        }
+        self.invalidate();
+        self.sort_order
     }
 }
 
@@ -607,7 +688,7 @@ impl Default for State {
     fn default() -> Self {
         Self {
             sort_col: ColumnId::Name,
-            ascending: true,
+            sort_order: SortOrder::Ascending,
             filter: String::new(),
             cache: None,
             visible: COLUMNS
@@ -624,7 +705,7 @@ impl Default for State {
 }
 
 pub struct Cache {
-    pub key: (u64, u64, String, ColumnId, bool, bool, u64),
+    pub key: (u64, u64, String, ColumnId, SortOrder, bool, u64),
     pub rows: Vec<Row>,
 }
 
@@ -722,31 +803,51 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
             }
         },
         |app, ui| {
-            ui.menu_button(i18n::tr(K::ViewMode), |ui| {
+            menu::submenu(ui, i18n::tr(K::ViewMode), |ui| {
                 for (tree, key) in [(false, K::FlatView), (true, K::ProcessTreeView)] {
-                    if ui
-                        .selectable_label(
-                            app.shared.settings.details_tree_view == tree,
-                            i18n::tr(key),
-                        )
-                        .clicked()
-                    {
+                    let current = app.shared.settings.details_tree_view == tree;
+                    if menu::check(ui, i18n::tr(key), current).clicked() {
                         app.shared.settings.details_tree_view = tree;
-                        app.details_state.invalidate();
+                        app.details_state.set_tree(tree);
                         app.save_settings();
+                        // `set_tree` can drop the hierarchical order; persist
+                        // the result so a restart does not resurrect it.
+                        let (sort_col, order) =
+                            (app.details_state.sort_col, app.details_state.sort_order);
+                        persist_sort_pref(app, sort_col, order);
+                        ui.close();
+                    }
+                }
+                if app.shared.settings.details_tree_view {
+                    menu::separator(ui);
+                    // The tree's third order: no column sort at all, children
+                    // strictly under their parent in creation order — System
+                    // Informer's default, reachable there by clicking the
+                    // sorted column a third time (which we also do).
+                    let hierarchical = app.details_state.sort_order == SortOrder::Hierarchical;
+                    if menu::check(ui, i18n::tr(K::HierarchicalOrder), hierarchical).clicked() {
+                        let next = if hierarchical {
+                            SortOrder::Ascending
+                        } else {
+                            SortOrder::Hierarchical
+                        };
+                        app.details_state.sort_order = next;
+                        app.details_state.invalidate();
+                        let sort_col = app.details_state.sort_col;
+                        persist_sort_pref(app, sort_col, next);
                         ui.close();
                     }
                 }
             });
             if app.shared.settings.details_tree_view {
-                if ui.button(i18n::tr(K::ExpandAll)).clicked() {
+                if menu::item(ui, i18n::tr(K::ExpandAll)).clicked() {
                     app.details_state.collapsed.clear();
                     app.details_state.view_generation =
                         app.details_state.view_generation.wrapping_add(1);
                     app.details_state.invalidate();
                     ui.close();
                 }
-                if ui.button(i18n::tr(K::CollapseAll)).clicked() {
+                if menu::item(ui, i18n::tr(K::CollapseAll)).clicked() {
                     if let Some(snapshot) = app.latest_snapshot() {
                         app.details_state
                             .collapsed
@@ -758,12 +859,12 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
                     ui.close();
                 }
             }
-            ui.separator();
-            if ui.button(i18n::tr(K::RefreshNow)).clicked() {
+            menu::separator(ui);
+            if menu::item(ui, i18n::tr(K::RefreshNow)).clicked() {
                 app.refresh_all();
                 ui.close();
             }
-            if ui.button(i18n::tr(K::SelectColumns)).clicked() {
+            if menu::item(ui, i18n::tr(K::SelectColumns)).clicked() {
                 app.details_state.select_columns_open = true;
                 ui.close();
             }
@@ -810,7 +911,7 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
         app.details_state.lang_generation(),
         effective_search(app),
         app.details_state.sort_col,
-        app.details_state.ascending,
+        app.details_state.sort_order,
         app.shared.settings.details_tree_view,
         app.details_state.view_generation,
     );
@@ -882,7 +983,7 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
         &pal,
         &mut table,
         avail,
-        sorted_pos.map(|p| (p, app.details_state.ascending)),
+        sorted_pos.and_then(|p| app.details_state.sort_order.arrow().map(|asc| (p, asc))),
         None,
         rows.len(),
         focus_row,
@@ -950,7 +1051,7 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
                         start_epoch_s: row.start_epoch_s,
                     });
                 }
-                resp.context_menu(|ui| {
+                menu::context_menu(&resp, |ui| {
                     if let Some(p) = snap.process(row.pid) {
                         context_menu(app, ui, p, row.children);
                     }
@@ -973,13 +1074,9 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
         && let Some(spec) = visible_cols.get(display_idx)
     {
         let cid = spec.cid;
-        if app.details_state.sort_col == cid {
-            app.details_state.ascending = !app.details_state.ascending;
-        } else {
-            app.details_state.sort_col = cid;
-            app.details_state.ascending = !cid_is_numeric(cid);
-        }
-        app.persist_sort("details", id_of(cid), app.details_state.ascending);
+        let tree = app.shared.settings.details_tree_view;
+        let order = app.details_state.clicked_column(cid, tree);
+        persist_sort_pref(app, cid, order);
     }
     app.persist_table(&table);
     app.details_state.cache = cache;
@@ -1136,8 +1233,8 @@ fn select_columns_dialog(app: &mut TaskManApp, ctx: &egui::Context, pal: &theme:
                                 app.details_state.set_visible(cid, on);
                                 persist_column_prefs(app);
                                 let sort_col = app.details_state.sort_col;
-                                let ascending = app.details_state.ascending;
-                                app.persist_sort("details", id_of(sort_col), ascending);
+                                let order = app.details_state.sort_order;
+                                persist_sort_pref(app, sort_col, order);
                             }
                             ui.with_layout(
                                 egui::Layout::right_to_left(egui::Align::Center),
@@ -1145,10 +1242,7 @@ fn select_columns_dialog(app: &mut TaskManApp, ctx: &egui::Context, pal: &theme:
                                     if on {
                                         let can_down = rank.is_some_and(|r| r + 1 < count);
                                         let can_up = rank.is_some_and(|r| r > 0);
-                                        // Keep clear of the floating vertical
-                                        // scroll bar, which paints on top of
-                                        // the content's right edge.
-                                        ui.add_space(16.0);
+                                        ui.add_space(4.0);
                                         if crate::widgets::controls::icon_button(
                                             ui,
                                             crate::icons::Icon::ChevronDown,
@@ -1189,6 +1283,20 @@ fn select_columns_dialog(app: &mut TaskManApp, ctx: &egui::Context, pal: &theme:
     if !open {
         app.details_state.select_columns_open = false;
     }
+}
+
+/// Persist the Details sort.
+///
+/// The strict-hierarchy state is not expressible as an ascending flag, so it
+/// rides in `[general]` beside the tree-view switch rather than corrupting
+/// the `[sort]` line format every other table shares.
+fn persist_sort_pref(app: &mut TaskManApp, cid: ColumnId, order: SortOrder) {
+    let hierarchical = order == SortOrder::Hierarchical;
+    if app.shared.settings.details_tree_hierarchical != hierarchical {
+        app.shared.settings.details_tree_hierarchical = hierarchical;
+        app.save_settings();
+    }
+    app.persist_sort("details", id_of(cid), order.ascending());
 }
 
 fn cid_is_numeric(cid: ColumnId) -> bool {
@@ -1241,7 +1349,7 @@ fn build_rows(
     snap: &tm_core::model::Snapshot,
     raw_search: &str,
     sort_col: ColumnId,
-    ascending: bool,
+    order: SortOrder,
     tree: bool,
     collapsed: &HashSet<u32>,
 ) -> Vec<Row> {
@@ -1252,7 +1360,10 @@ fn build_rows(
             .iter()
             .filter(|process| !process.synthetic && q.matches_process(process))
             .collect();
-        sort_processes(&mut list, sort_col, ascending);
+        // A flat list has no hierarchy to fall back to, so
+        // [`SortOrder::Hierarchical`] cannot reach it (`State::set_tree`);
+        // if it ever did, creation order is still a defined order.
+        sort_processes(&mut list, sort_col, order);
         return list
             .into_iter()
             .map(|process| row_from_process(process, 0, false))
@@ -1307,7 +1418,7 @@ fn build_rows(
         }
     }
     for siblings in children.values_mut() {
-        sort_processes(siblings, sort_col, ascending);
+        sort_processes(siblings, sort_col, order);
     }
 
     let attached: HashSet<u32> = children.values().flatten().map(|child| child.pid).collect();
@@ -1329,7 +1440,7 @@ fn build_rows(
             mark_tree_component(process.pid, &children, &mut covered);
         }
     }
-    sort_processes(&mut roots, sort_col, ascending);
+    sort_processes(&mut roots, sort_col, order);
 
     let mut rows = Vec::with_capacity(members.len());
     let mut visited = HashSet::with_capacity(members.len());
@@ -1370,10 +1481,30 @@ fn is_plausible_parent(parent: &ProcessEntry, child: &ProcessEntry) -> bool {
     }
 }
 
-fn sort_processes(list: &mut Vec<&ProcessEntry>, sort_col: ColumnId, ascending: bool) {
+/// Order one sibling list.
+///
+/// [`SortOrder::Hierarchical`] deliberately ignores `sort_col` entirely and
+/// falls back to CREATION order. It cannot fall back to the snapshot's own
+/// order: processes come out of a hash map, so "unsorted" would reshuffle
+/// the whole tree on every tick. Start time plus PID is stable, and it is
+/// the order the OS actually created the children in.
+fn sort_processes(list: &mut [&ProcessEntry], sort_col: ColumnId, order: SortOrder) {
+    if order == SortOrder::Hierarchical {
+        list.sort_by(|a, b| {
+            a.start_epoch_s
+                .cmp(&b.start_epoch_s)
+                .then_with(|| a.pid.cmp(&b.pid))
+        });
+        return;
+    }
+    let ascending = order.ascending();
     list.sort_by(|a, b| {
-        let order = sort_col.compare(a, b).then_with(|| a.pid.cmp(&b.pid));
-        if ascending { order } else { order.reverse() }
+        let ordering = sort_col.compare(a, b).then_with(|| a.pid.cmp(&b.pid));
+        if ascending {
+            ordering
+        } else {
+            ordering.reverse()
+        }
     });
 }
 
@@ -1551,31 +1682,29 @@ fn update_saved_affinity(app: &mut TaskManApp, key: &str, affinity_mask: Option<
 pub fn context_menu(app: &mut TaskManApp, ui: &mut egui::Ui, p: &ProcessEntry, has_children: bool) {
     let ctx = ui.ctx().clone();
     ui.set_min_width(230.0);
-    ui.label(egui::RichText::new(p.shown_name()).strong().size(13.0));
-    ui.separator();
+    menu::title(ui, p.shown_name());
+    menu::separator(ui);
 
     if app.shared.settings.details_tree_view && has_children {
         let expanded = app.details_state.is_expanded(p.pid);
-        if ui
-            .button(if expanded {
-                i18n::tr(K::Collapse)
-            } else {
-                i18n::tr(K::Expand)
-            })
-            .clicked()
-        {
+        let label = if expanded {
+            i18n::tr(K::Collapse)
+        } else {
+            i18n::tr(K::Expand)
+        };
+        if menu::item(ui, label).clicked() {
             app.details_state.toggle_expanded(p.pid);
             ui.close();
         }
-        ui.separator();
+        menu::separator(ui);
     }
 
-    if ui.button(i18n::tr(K::CopyName)).clicked() {
+    if menu::item(ui, i18n::tr(K::CopyName)).clicked() {
         ui.ctx().copy_text(p.shown_name().to_string());
         app.shared.toast(i18n::tr(K::Copied));
         ui.close();
     }
-    if ui.button(i18n::tr(K::OnlineSearch)).clicked() {
+    if menu::item(ui, i18n::tr(K::OnlineSearch)).clicked() {
         let url = search::online_search_url(p.shown_name());
         if let Err(error) = app.actions.open_url(&url) {
             app.shared
@@ -1583,16 +1712,18 @@ pub fn context_menu(app: &mut TaskManApp, ui: &mut egui::Ui, p: &ProcessEntry, h
         }
         ui.close();
     }
-    if app.actions.capabilities().process_modules && ui.button(i18n::tr(K::ViewModules)).clicked() {
+    if app.actions.capabilities().process_modules
+        && menu::item(ui, i18n::tr(K::ViewModules)).clicked()
+    {
         crate::tabs::modules::open(app, p, &ctx);
         ui.close();
     }
-    if ui.button(i18n::tr(K::EndTask)).clicked() {
+    if menu::item(ui, i18n::tr(K::EndTask)).clicked() {
         end_process(app, &ctx, p.pid, p.start_epoch_s, false, p.shown_name());
         ui.close();
     }
     #[cfg(target_os = "windows")]
-    if ui.button(i18n::tr(K::EndTree)).clicked() {
+    if menu::item(ui, i18n::tr(K::EndTree)).clicked() {
         end_process(app, &ctx, p.pid, p.start_epoch_s, true, p.shown_name());
         ui.close();
     }
@@ -1601,7 +1732,7 @@ pub fn context_menu(app: &mut TaskManApp, ui: &mut egui::Ui, p: &ProcessEntry, h
         let _ = p.name.as_str();
     }
 
-    ui.menu_button(i18n::tr(K::Priority), |ui| {
+    menu::submenu(ui, i18n::tr(K::Priority), |ui| {
         let rule_key = scheduling_rule_key(p);
         let mut save_priority = rule_key.as_ref().is_some_and(|key| {
             app.shared
@@ -1619,8 +1750,7 @@ pub fn context_menu(app: &mut TaskManApp, ui: &mut egui::Ui, p: &ProcessEntry, h
             (PriorityClass::Low, K::PrioLow),
         ] {
             let current = p.priority == cls;
-            let label = format!("{}  {}", if current { "✓" } else { "  " }, i18n::tr(key));
-            if ui.selectable_label(current, label).clicked() {
+            if menu::check(ui, i18n::tr(key), current).clicked() {
                 if !identity_still_live(app, p) {
                     app.shared.toast(i18n::tr(K::ProcessExited));
                     ui.close();
@@ -1631,7 +1761,7 @@ pub fn context_menu(app: &mut TaskManApp, ui: &mut egui::Ui, p: &ProcessEntry, h
                 let start = p.start_epoch_s;
                 let key_copy = key;
                 let msg = move || i18n::trf(K::PrioritySetMsg, &[i18n::tr(key_copy)]);
-                app.run_action(&ctx, msg, move || {
+                app.run_action_refreshing(&ctx, msg, move || {
                     actions.set_priority_checked(pid, start, cls)
                 });
                 if save_priority && let Some(rule_key) = rule_key.as_deref() {
@@ -1640,14 +1770,12 @@ pub fn context_menu(app: &mut TaskManApp, ui: &mut egui::Ui, p: &ProcessEntry, h
                 ui.close();
             }
         }
-        ui.separator();
-        let menu_pal = theme::palette(ui);
-        let save = crate::widgets::controls::checkbox_enabled(
+        menu::separator(ui);
+        let save = menu::toggle_enabled(
             ui,
-            &mut save_priority,
             i18n::tr(K::SavePriorityForProgram),
+            &mut save_priority,
             rule_key.is_some() && p.priority != PriorityClass::Unknown,
-            &menu_pal,
         )
         .on_disabled_hover_text(i18n::tr(K::SaveRuleNeedsPath));
         if save.changed()
@@ -1657,7 +1785,7 @@ pub fn context_menu(app: &mut TaskManApp, ui: &mut egui::Ui, p: &ProcessEntry, h
         }
     });
 
-    if ui.button(i18n::tr(K::SetAffinity)).clicked() {
+    if menu::item(ui, i18n::tr(K::SetAffinity)).clicked() {
         if !identity_still_live(app, p) {
             app.shared.toast(i18n::tr(K::ProcessExited));
         } else {
@@ -1720,14 +1848,12 @@ pub fn context_menu(app: &mut TaskManApp, ui: &mut egui::Ui, p: &ProcessEntry, h
     }
 
     let suspended = p.status == ProcStatus::Suspended;
-    if ui
-        .button(if suspended {
-            i18n::tr(K::ResumeProc)
-        } else {
-            i18n::tr(K::SuspendProc)
-        })
-        .clicked()
-    {
+    let suspend_label = if suspended {
+        i18n::tr(K::ResumeProc)
+    } else {
+        i18n::tr(K::SuspendProc)
+    };
+    if menu::item(ui, suspend_label).clicked() {
         if !identity_still_live(app, p) {
             app.shared.toast(i18n::tr(K::ProcessExited));
             ui.close();
@@ -1737,24 +1863,28 @@ pub fn context_menu(app: &mut TaskManApp, ui: &mut egui::Ui, p: &ProcessEntry, h
         let pid = p.pid;
         let start = p.start_epoch_s;
         let target_suspended = !suspended;
-        app.run_action(&ctx, String::new, move || {
+        app.run_action_refreshing(&ctx, String::new, move || {
             actions.suspend_process_checked(pid, start, target_suspended)
         });
         ui.close();
     }
 
-    ui.separator();
+    menu::separator(ui);
 
     #[cfg(target_os = "windows")]
     {
         let eco_on = p.power_throttled == Some(true);
-        if ui
-            .button(if eco_on {
-                i18n::tr(K::EfficiencyModeOff)
-            } else {
-                i18n::tr(K::EfficiencyModeOn)
-            })
-            .clicked()
+        // A tick on one "Efficiency mode" entry, not two opposite verbs:
+        // the menu shows the process's CURRENT state, the way Task Manager
+        // and every other Windows menu toggle does.
+        if menu::check_enabled(
+            ui,
+            i18n::tr(K::EfficiencyMode),
+            eco_on,
+            p.power_throttled.is_some(),
+        )
+        .on_disabled_hover_text(i18n::tr(K::NotAllowed))
+        .clicked()
         {
             crate::tabs::processes::toggle_efficiency_mode(
                 app,
@@ -1771,18 +1901,14 @@ pub fn context_menu(app: &mut TaskManApp, ui: &mut egui::Ui, p: &ProcessEntry, h
             p.uac_virtualization,
             Some(UacVirtualization::Enabled | UacVirtualization::Disabled)
         );
-        let uac_label = format!(
-            "{}  {}",
-            if uac_enabled { "✓" } else { "  " },
-            i18n::tr(K::UacVirtualization)
-        );
-        if ui
-            .add_enabled(
-                uac_changeable,
-                egui::Button::new(uac_label).selected(uac_enabled),
-            )
-            .on_disabled_hover_text(i18n::tr(K::NotAllowed))
-            .clicked()
+        if menu::check_enabled(
+            ui,
+            i18n::tr(K::UacVirtualization),
+            uac_enabled,
+            uac_changeable,
+        )
+        .on_disabled_hover_text(i18n::tr(K::NotAllowed))
+        .clicked()
         {
             if !identity_still_live(app, p) {
                 app.shared.toast(i18n::tr(K::ProcessExited));
@@ -1798,7 +1924,7 @@ pub fn context_menu(app: &mut TaskManApp, ui: &mut egui::Ui, p: &ProcessEntry, h
             }
             ui.close();
         }
-        if ui.button(i18n::tr(K::GoToServices)).clicked() {
+        if menu::item(ui, i18n::tr(K::GoToServices)).clicked() {
             app.goto_services_for_pid(p.pid, &ctx);
             ui.close();
         }
@@ -1809,7 +1935,7 @@ pub fn context_menu(app: &mut TaskManApp, ui: &mut egui::Ui, p: &ProcessEntry, h
         .as_ref()
         .map(|x| x.to_string_lossy().into_owned())
     {
-        if ui.button(i18n::tr(K::OpenFileLocation)).clicked() {
+        if menu::item(ui, i18n::tr(K::OpenFileLocation)).clicked() {
             let actions = app.actions.clone();
             let path2 = path.clone();
             app.run_action(&ctx, String::new, move || {
@@ -1817,11 +1943,11 @@ pub fn context_menu(app: &mut TaskManApp, ui: &mut egui::Ui, p: &ProcessEntry, h
             });
             ui.close();
         }
-        if ui.button(i18n::tr(K::CreateDumpFile)).clicked() {
+        if menu::item(ui, i18n::tr(K::CreateDumpFile)).clicked() {
             create_dump(app, &ctx, p);
             ui.close();
         }
-        if ui.button(i18n::tr(K::Properties)).clicked() {
+        if menu::item(ui, i18n::tr(K::Properties)).clicked() {
             if let Err(e) = app.actions.open_properties(&path) {
                 tracing::debug!(error = %e, "shell properties failed; using built-in dialog");
                 app.proc_props = Some(p.pid);
@@ -1876,7 +2002,7 @@ pub fn uac_virtualization_dialog(app: &mut TaskManApp, ctx: &egui::Context) {
             let actions = app.actions.clone();
             let identity = pending.identity;
             let enabled = pending.enabled;
-            app.run_action(
+            app.run_action_refreshing(
                 ctx,
                 || i18n::tr(K::UacVirtualizationChanged).to_string(),
                 move || {
@@ -2183,10 +2309,17 @@ mod tests {
             tree_process(12, Some(11), "leaf.exe"),
         ]);
         let depths = |collapsed: HashSet<u32>| {
-            build_rows(&snapshot, "", ColumnId::Name, true, true, &collapsed)
-                .iter()
-                .map(|row| (row.pid, row.depth))
-                .collect::<Vec<_>>()
+            build_rows(
+                &snapshot,
+                "",
+                ColumnId::Name,
+                SortOrder::Ascending,
+                true,
+                &collapsed,
+            )
+            .iter()
+            .map(|row| (row.pid, row.depth))
+            .collect::<Vec<_>>()
         };
         assert_eq!(depths(HashSet::new()), [(10, 0), (11, 1), (12, 2)]);
         assert_eq!(depths(HashSet::from([11])), [(10, 0), (11, 1)]);
@@ -2205,7 +2338,7 @@ mod tests {
             &tree_snapshot(vec![recycled, child]),
             "",
             ColumnId::Name,
-            true,
+            SortOrder::Ascending,
             true,
             &HashSet::new(),
         );
@@ -2226,7 +2359,7 @@ mod tests {
             &tree_snapshot(vec![parent, child]),
             "",
             ColumnId::Name,
-            true,
+            SortOrder::Ascending,
             true,
             &HashSet::new(),
         );
@@ -2250,7 +2383,7 @@ mod tests {
             &snapshot,
             "needle",
             ColumnId::Name,
-            true,
+            SortOrder::Ascending,
             true,
             &HashSet::new(),
         );
@@ -2266,10 +2399,91 @@ mod tests {
         a.start_epoch_s = Some(1);
         b.start_epoch_s = Some(1);
         let cyclic = tree_snapshot(vec![a, b]);
-        let rows = build_rows(&cyclic, "", ColumnId::Name, true, true, &HashSet::new());
+        let rows = build_rows(
+            &cyclic,
+            "",
+            ColumnId::Name,
+            SortOrder::Ascending,
+            true,
+            &HashSet::new(),
+        );
         let unique = rows.iter().map(|row| row.pid).collect::<HashSet<_>>();
         assert_eq!(rows.len(), 2);
         assert_eq!(unique, HashSet::from([30, 31]));
+    }
+
+    /// The tree's third order must be a LITERAL hierarchy: the sort column is
+    /// ignored entirely and siblings appear in creation order. Sorting by
+    /// Name on the same snapshot must produce a different sibling order —
+    /// otherwise "hierarchical" is just the alphabet again, which is exactly
+    /// the mixed form this replaced.
+    #[test]
+    fn hierarchical_order_ignores_the_sort_column() {
+        let mut root = tree_process(10, None, "root.exe");
+        root.start_epoch_s = Some(1);
+        // Children created in the order zulu, alpha — the reverse of the
+        // alphabet, so the two orders cannot accidentally agree.
+        let mut zulu = tree_process(11, Some(10), "zulu.exe");
+        zulu.start_epoch_s = Some(2);
+        let mut alpha = tree_process(12, Some(10), "alpha.exe");
+        alpha.start_epoch_s = Some(3);
+        let snapshot = tree_snapshot(vec![root, alpha, zulu]);
+
+        let pids = |order| {
+            build_rows(&snapshot, "", ColumnId::Name, order, true, &HashSet::new())
+                .iter()
+                .map(|row| row.pid)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            pids(SortOrder::Hierarchical),
+            [10, 11, 12],
+            "hierarchical order must follow creation, not the alphabet"
+        );
+        assert_eq!(pids(SortOrder::Ascending), [10, 12, 11]);
+        assert_eq!(pids(SortOrder::Descending), [10, 11, 12]);
+    }
+
+    /// Clicking the sorted column cycles ascending -> descending -> hierarchy
+    /// in the tree (System Informer), but stays a two-way toggle in the flat
+    /// list, which has no hierarchy to fall back to.
+    #[test]
+    fn tree_sort_cycles_through_the_hierarchical_state() {
+        let mut s = State::default();
+        assert_eq!(s.sort_order, SortOrder::Ascending);
+        assert_eq!(
+            s.clicked_column(ColumnId::Name, true),
+            SortOrder::Descending
+        );
+        assert_eq!(
+            s.clicked_column(ColumnId::Name, true),
+            SortOrder::Hierarchical
+        );
+        assert_eq!(s.clicked_column(ColumnId::Name, true), SortOrder::Ascending);
+
+        // Flat list: never enters the hierarchical state.
+        let mut f = State::default();
+        assert_eq!(
+            f.clicked_column(ColumnId::Name, false),
+            SortOrder::Descending
+        );
+        assert_eq!(
+            f.clicked_column(ColumnId::Name, false),
+            SortOrder::Ascending
+        );
+
+        // Leaving the tree must not strand the flat list unsorted.
+        let mut t = State {
+            sort_order: SortOrder::Hierarchical,
+            ..State::default()
+        };
+        t.set_tree(false);
+        assert_eq!(t.sort_order, SortOrder::Ascending);
+
+        // No column is sorted in the hierarchical state, so no header arrow.
+        assert_eq!(SortOrder::Hierarchical.arrow(), None);
+        assert_eq!(SortOrder::Ascending.arrow(), Some(true));
+        assert_eq!(SortOrder::Descending.arrow(), Some(false));
     }
 
     #[test]
@@ -2277,7 +2491,7 @@ mod tests {
         let mut state = State::default();
         state.set_visible(ColumnId::Cpu, false);
         let fallback = state.sort_col;
-        state.apply_saved_sort("cpu", false);
+        state.apply_saved_sort("cpu", SortOrder::Descending);
         assert_eq!(state.sort_col, fallback);
         assert!(state.visible.contains(&state.sort_col));
     }
@@ -2492,7 +2706,7 @@ mod tests {
         s2.apply_saved_prefs(Some(&BTreeMap::from([("uac".to_string(), false)])), None);
         assert!(!s2.is_visible(ColumnId::Uac));
         assert!(s2.is_visible(s2.sort_col));
-        assert!(s2.ascending);
+        assert_eq!(s2.sort_order, SortOrder::Ascending);
     }
 
     #[test]
@@ -2502,7 +2716,7 @@ mod tests {
         s.sort_col = ColumnId::Priority;
         s.set_visible(ColumnId::Priority, false);
         assert!(s.is_visible(s.sort_col));
-        assert!(s.ascending);
+        assert_eq!(s.sort_order, SortOrder::Ascending);
     }
 
     #[test]

@@ -324,10 +324,14 @@ pub fn ellipsis_menu(
     _pal: &Palette,
     items: impl FnOnce(&mut TaskManApp, &mut egui::Ui),
 ) {
-    ui.menu_button(egui::RichText::new("…").size(16.0), |ui| {
-        ui.set_min_width(170.0);
-        items(app, ui);
-    });
+    crate::widgets::menu::menu_button(
+        ui,
+        egui::Button::new(egui::RichText::new("…").size(16.0)),
+        |ui| {
+            ui.set_min_width(180.0);
+            items(app, ui);
+        },
+    );
 }
 
 // ---------------------------------------------------------------- dialogs

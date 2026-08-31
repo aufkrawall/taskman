@@ -8,6 +8,7 @@ use tm_core::i18n::{self, K};
 
 use crate::app::TaskManApp;
 use crate::theme;
+use crate::widgets::menu;
 use crate::widgets::tablekit::{self, TmColumn};
 
 fn columns() -> Vec<TmColumn> {
@@ -66,7 +67,7 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
         &pal,
         |_app, _ui| {},
         |_app, ui| {
-            if ui.button(i18n::tr(K::RefreshNow)).clicked() {
+            if menu::item(ui, i18n::tr(K::RefreshNow)).clicked() {
                 _app.refresh_all();
                 ui.close();
             }

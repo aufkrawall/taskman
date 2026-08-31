@@ -535,6 +535,18 @@ impl Default for BrokeredActions {
     }
 }
 
+/// Mark `pid`'s cached slow-changing attributes stale after a successful
+/// control action. The broker path bypasses `process_ops` entirely, so
+/// without this the sampler would keep serving the pre-change priority /
+/// efficiency / virtualization state for the rest of its attribute TTL
+/// exactly when the privileged path is the one that succeeded.
+fn noting_attrs(pid: u32, result: Result<()>) -> Result<()> {
+    if result.is_ok() {
+        super::process_ops::note_attrs_changed(pid);
+    }
+    result
+}
+
 impl BrokeredActions {
     fn unit_or_local(
         &self,
@@ -674,16 +686,19 @@ impl PlatformActions for BrokeredActions {
         let Some(start_epoch_s) = expected_start_epoch_s else {
             return self.local.set_priority_checked(pid, None, priority);
         };
-        self.unit_or_local(
-            BrokerRequest::SetPriority {
-                pid,
-                expected_start_epoch_s: Some(start_epoch_s),
-                priority,
-            },
-            || {
-                self.local
-                    .set_priority_checked(pid, Some(start_epoch_s), priority)
-            },
+        noting_attrs(
+            pid,
+            self.unit_or_local(
+                BrokerRequest::SetPriority {
+                    pid,
+                    expected_start_epoch_s: Some(start_epoch_s),
+                    priority,
+                },
+                || {
+                    self.local
+                        .set_priority_checked(pid, Some(start_epoch_s), priority)
+                },
+            ),
         )
     }
 
@@ -758,16 +773,19 @@ impl PlatformActions for BrokeredActions {
         let Some(start_epoch_s) = expected_start_epoch_s else {
             return self.local.set_efficiency_mode_checked(pid, None, on);
         };
-        self.unit_or_local(
-            BrokerRequest::SetEfficiencyMode {
-                pid,
-                expected_start_epoch_s: Some(start_epoch_s),
-                enabled: on,
-            },
-            || {
-                self.local
-                    .set_efficiency_mode_checked(pid, Some(start_epoch_s), on)
-            },
+        noting_attrs(
+            pid,
+            self.unit_or_local(
+                BrokerRequest::SetEfficiencyMode {
+                    pid,
+                    expected_start_epoch_s: Some(start_epoch_s),
+                    enabled: on,
+                },
+                || {
+                    self.local
+                        .set_efficiency_mode_checked(pid, Some(start_epoch_s), on)
+                },
+            ),
         )
     }
 
@@ -782,16 +800,19 @@ impl PlatformActions for BrokeredActions {
                 .local
                 .set_uac_virtualization_checked(pid, None, enabled);
         };
-        self.unit_or_local(
-            BrokerRequest::SetUacVirtualization {
-                pid,
-                expected_start_epoch_s: Some(start_epoch_s),
-                enabled,
-            },
-            || {
-                self.local
-                    .set_uac_virtualization_checked(pid, Some(start_epoch_s), enabled)
-            },
+        noting_attrs(
+            pid,
+            self.unit_or_local(
+                BrokerRequest::SetUacVirtualization {
+                    pid,
+                    expected_start_epoch_s: Some(start_epoch_s),
+                    enabled,
+                },
+                || {
+                    self.local
+                        .set_uac_virtualization_checked(pid, Some(start_epoch_s), enabled)
+                },
+            ),
         )
     }
 

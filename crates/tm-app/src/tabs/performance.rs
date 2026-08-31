@@ -10,6 +10,7 @@ use crate::app::{HistoryPoint, TaskManApp};
 use crate::search;
 use crate::theme::{self, Palette};
 use crate::widgets::chart::{MultiSeries, chart_multi, core_chart};
+use crate::widgets::menu;
 
 /// Time-based visible slice: every point whose timestamp lies inside the
 /// configured window (§14.3). Works identically at High/Normal/Low update
@@ -207,7 +208,7 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
         &pal,
         |_app, _ui| {},
         |app, ui| {
-            if ui.button(i18n::tr(K::RefreshNow)).clicked() {
+            if menu::item(ui, i18n::tr(K::RefreshNow)).clicked() {
                 // Regression fix (audit §9): this used to close the menu
                 // without doing anything — Refresh now must actually force a
                 // fresh sample plus tab-local cache invalidation.
@@ -992,38 +993,21 @@ fn cpu_page(app: &mut TaskManApp, ui: &mut egui::Ui, pal: &Palette) {
 /// Right-click menu on the CPU graphs: change graph to overall/logical and
 /// toggle the kernel-times overlay (§14.4).
 fn cpu_graph_context_menu(app: &mut TaskManApp, resp: &egui::Response) {
-    resp.context_menu(|ui| {
-        if ui
-            .selectable_label(
-                app.shared.settings.cpu_graph_mode == "overall",
-                i18n::tr(K::CpuGraphOverall),
-            )
-            .clicked()
-        {
-            app.shared.settings.cpu_graph_mode = "overall".into();
-            app.save_settings();
-            ui.close();
+    menu::context_menu(resp, |ui| {
+        for (mode, key) in [
+            ("overall", K::CpuGraphOverall),
+            ("logical", K::CpuGraphLogical),
+        ] {
+            let current = app.shared.settings.cpu_graph_mode == mode;
+            if menu::check(ui, i18n::tr(key), current).clicked() {
+                app.shared.settings.cpu_graph_mode = mode.into();
+                app.save_settings();
+                ui.close();
+            }
         }
-        if ui
-            .selectable_label(
-                app.shared.settings.cpu_graph_mode == "logical",
-                i18n::tr(K::CpuGraphLogical),
-            )
-            .clicked()
-        {
-            app.shared.settings.cpu_graph_mode = "logical".into();
-            app.save_settings();
-            ui.close();
-        }
+        menu::separator(ui);
         let mut k = app.shared.settings.show_kernel_times;
-        if crate::widgets::controls::checkbox(
-            ui,
-            &mut k,
-            i18n::tr(K::ShowKernelTimes),
-            &theme::palette_ctx(ui.ctx()),
-        )
-        .changed()
-        {
+        if menu::toggle(ui, i18n::tr(K::ShowKernelTimes), &mut k).changed() {
             app.shared.settings.show_kernel_times = k;
             app.save_settings();
         }

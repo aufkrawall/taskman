@@ -1,5 +1,92 @@
 # Recent Activity
 
+## 2026-08-31 — menus, scroll bars, stale process attributes, hierarchical tree
+
+Four user-reported UI defects, three of which had a shared shape: the fix was
+never in the tab that showed the symptom.
+
+### Context menus were not menus
+
+egui's `menu_style` sets `button_padding = (2, 0)` and then lets the global
+`item_spacing.y` (6 px) separate the entries. The result was a column of
+text-height labels with dead gaps between them — the gaps neither highlight
+nor activate the entry under the cursor.
+
+`widgets/menu.rs` now paints every entry itself: one uniform 28 px full-width
+row, `item_spacing.y = 0`, a left check gutter so ticked and unticked labels
+share a left edge, and a right gutter for submenu arrows. `menu::context_menu`
+installs the style on the popup, and submenus inherit it through
+`MenuConfig`. Two details that are easy to get wrong:
+
+- Use `allocate_at_least`, NOT `allocate_exact_size`. Menus lay out
+  top-down-JUSTIFIED and the "exact" variant re-aligns the desired size back
+  inside the justified frame, leaving each row only as wide as its own label.
+- The tick is a hand-painted polyline. `✓` is not in every installed UI font
+  and a missing glyph renders as a tofu BOX — which is what the user was
+  seeing and reported as "the checkbox looks ugly". The same reasoning
+  retires `controls::checkbox` from inside menus (it drew a real 18×18 box
+  next to menu text).
+
+`entries_are_uniform_full_width_and_gapless` pins height, width and the
+absence of gaps.
+
+### Priority changes took up to ten seconds to appear
+
+`win/sampler.rs` caches slow-changing per-PID attributes (priority, EcoQoS,
+UAC virtualization) behind `ATTR_REFRESH_TTL` (10 s). Nothing invalidated
+that cache when WE changed one of those attributes, so the menu kept ticking
+the old priority until the TTL expired.
+
+Two halves, both needed:
+
+- `process_ops::note_attrs_changed` / `take_changed_attrs` — a process-global
+  invalidation list drained by the sampler at the top of every tick. The
+  broker path bypasses `process_ops`, so `core_service.rs` records it too
+  (`noting_attrs`).
+- `TaskManApp::run_action_refreshing` — refresh AFTER the action completes.
+  `toggle_efficiency_mode` used to call `engine.request_refresh()` beside the
+  dispatch, which races the executor's worker thread and samples the
+  still-unchanged process.
+
+No optimistic UI echo, deliberately: Windows silently downgrades a Realtime
+request to High without `SeIncreaseBasePriority`, so echoing the requested
+class would tick a value the OS never applied.
+
+### Scroll bars painted over content
+
+`ScrollStyle.floating_allocated_width` was 0, so the bars covered the last
+~14 px of every table row, Performance card and dialog. It is now 14
+(`bar_width` + `bar_outer_margin`), which moves the bar just outside the
+content rect while keeping the thin-idle/expand-on-hover look.
+
+`floating` stays TRUE on purpose. egui measures "is the content too large"
+against the OUTER rect for floating bars and against the shrunken INNER rect
+for solid ones; with solid bars, content whose height depends on its width
+can flip the bar on and off every frame.
+
+Consequence for `tablekit`: header and body are two independent scroll areas
+sharing one horizontal offset. The body now reserves a bar lane and the
+header (bars hidden) does not, so the header is fed the body's previous-frame
+reservation via `prev_bar_use`/`store_bar_use`. Without it the two clamp the
+shared offset at different maxima. `BODY_PAD_RIGHT`/`BODY_PAD_BOTTOM` dropped
+to 6/4 — they are breathing room now, not bar clearance.
+
+### The Details tree was a mix of hierarchy and alphabet
+
+The tree sorted siblings by the active column, so it was never a literal
+hierarchy. `details::SortOrder` adds a third state: clicking the sorted
+column a third time (tree only) reaches `Hierarchical`, which ignores the
+sort column entirely and orders siblings by CREATION time — System
+Informer's cycle. It is also reachable from View ▸ Strict hierarchy.
+
+Creation order, not snapshot order: `sys.processes()` is a hash map, so
+"unsorted" would reshuffle the whole tree every tick. `start_epoch_s` then
+PID is stable and is the order the OS actually created the children in.
+
+Persistence: the shared `[sort]` line format is `column,ascending` and has no
+room for a third state, so the flag rides in `[general]` as
+`details_tree_hierarchical` next to `details_tree_view`.
+
 ## 2026-08-31 — per-process network without elevating the GUI (broker v2)
 
 The GUI needed administrator rights to show the Network column, which defeats

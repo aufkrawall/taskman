@@ -10,6 +10,7 @@ use tm_core::model::{ServiceInfo, ServiceStatus};
 use crate::app::TaskManApp;
 use crate::icons::Icon;
 use crate::theme;
+use crate::widgets::menu;
 use crate::widgets::tablekit::{self, TmColumn};
 
 fn columns() -> Vec<TmColumn> {
@@ -139,7 +140,7 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
             }
         },
         |_app, ui| {
-            if ui.button(i18n::tr(K::RefreshNow)).clicked() {
+            if menu::item(ui, i18n::tr(K::RefreshNow)).clicked() {
                 *tm_core::sync::lock(&_app.shared.services_cache) = None;
                 ensure_fresh(_app, &ui.ctx().clone());
                 ui.close();
@@ -240,30 +241,30 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
                 if resp.clicked() {
                     app.services_selected_name = Some(s.name.clone());
                 }
-                resp.context_menu(|ui| {
+                menu::context_menu(&resp, |ui| {
                     ui.set_min_width(170.0);
                     let mctx = ui.ctx().clone();
-                    if ui.button(i18n::tr(K::StartService)).clicked() {
+                    if menu::item(ui, i18n::tr(K::StartService)).clicked() {
                         app.services_selected_name = Some(s.name.clone());
                         control(app, &mctx, tm_platform::actions::ServiceAction::Start);
                         ui.close();
                     }
-                    if ui.button(i18n::tr(K::StopService)).clicked() {
+                    if menu::item(ui, i18n::tr(K::StopService)).clicked() {
                         app.services_selected_name = Some(s.name.clone());
                         control(app, &mctx, tm_platform::actions::ServiceAction::Stop);
                         ui.close();
                     }
-                    if ui.button(i18n::tr(K::RestartService)).clicked() {
+                    if menu::item(ui, i18n::tr(K::RestartService)).clicked() {
                         app.services_selected_name = Some(s.name.clone());
                         control(app, &mctx, tm_platform::actions::ServiceAction::Restart);
                         ui.close();
                     }
-                    ui.separator();
-                    if ui.button(i18n::tr(K::OpenServicesApp)).clicked() {
+                    menu::separator(ui);
+                    if menu::item(ui, i18n::tr(K::OpenServicesApp)).clicked() {
                         let _ = app.actions.run_new_task("services.msc", false);
                         ui.close();
                     }
-                    if ui.button(i18n::tr(K::CopyName)).clicked() {
+                    if menu::item(ui, i18n::tr(K::CopyName)).clicked() {
                         ui.ctx().copy_text(s.name.clone());
                         app.shared.toast(i18n::tr(K::Copied));
                         ui.close();

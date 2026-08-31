@@ -18,6 +18,7 @@ use crate::app::TaskManApp;
 use crate::icons::Icon;
 use crate::search;
 use crate::theme;
+use crate::widgets::menu;
 use crate::widgets::tablekit::{self, Aggregates, HeatCell, TmColumn};
 use tm_platform::actions::UserSessionAction;
 
@@ -564,9 +565,9 @@ fn user_row_ui(
     }
     if can_disconnect {
         let ctx = ui.ctx().clone();
-        resp.context_menu(|ui| {
+        menu::context_menu(&resp, |ui| {
             ui.set_min_width(150.0);
-            if ui.button(i18n::tr(K::DisconnectUser)).clicked() {
+            if menu::item(ui, i18n::tr(K::DisconnectUser)).clicked() {
                 session_action(
                     app,
                     &ctx,
@@ -575,7 +576,7 @@ fn user_row_ui(
                 );
                 ui.close();
             }
-            if ui.button(i18n::tr(K::SignOut)).clicked() {
+            if menu::item(ui, i18n::tr(K::SignOut)).clicked() {
                 session_action(
                     app,
                     &ctx,

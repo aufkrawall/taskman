@@ -35,6 +35,7 @@ use crate::app::TaskManApp;
 use crate::icons::Icon;
 use crate::search;
 use crate::theme;
+use crate::widgets::menu;
 use crate::widgets::tablekit::{self, Aggregates, HeatCell, TmColumn};
 
 fn columns() -> Vec<TmColumn> {
@@ -162,14 +163,15 @@ pub(crate) fn toggle_efficiency_mode(
     let actions = app.actions.clone();
     let pid = target.pid;
     let start = target.start_epoch_s;
-    app.run_action(
+    // Even when sampling is paused, produce exactly one fresh sample so the
+    // leaf/state re-render from returned OS state immediately — but only
+    // AFTER the action landed. Refreshing beside the dispatch (as this did)
+    // sampled the process before the worker thread had touched it.
+    app.run_action_refreshing(
         ctx,
         || i18n::tr(K::EfficiencyChanged).to_string(),
         move || actions.set_efficiency_mode_checked(pid, start, on),
     );
-    // Even when sampling is paused, produce exactly one fresh sample so the
-    // leaf/state re-render from returned OS state immediately.
-    app.engine.request_refresh();
 }
 
 pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
@@ -207,7 +209,7 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
             }
         },
         |app, ui| {
-            if ui.button(i18n::tr(K::ExpandAll)).clicked() {
+            if menu::item(ui, i18n::tr(K::ExpandAll)).clicked() {
                 if let Some(snap) = app.latest_snapshot() {
                     for p in &snap.processes {
                         app.processes_state.expanded.insert(p.pid);
@@ -216,7 +218,7 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
                 app.processes_state.invalidate();
                 ui.close();
             }
-            if ui.button(i18n::tr(K::CollapseAll)).clicked() {
+            if menu::item(ui, i18n::tr(K::CollapseAll)).clicked() {
                 app.processes_state.expanded.clear();
                 app.processes_state.invalidate();
                 ui.close();
@@ -605,7 +607,7 @@ fn row_ui(
     };
     // Pseudo-rows carry no killable process — no action menu at all.
     if !row.synthetic {
-        resp.context_menu(|ui| context_menu(app, ui, row));
+        menu::context_menu(&resp, |ui| context_menu(app, ui, row));
     }
 }
 
@@ -680,23 +682,21 @@ fn status_cell(
 
 fn context_menu(app: &mut TaskManApp, ui: &mut egui::Ui, row: &RowData) {
     let ctx = ui.ctx().clone();
-    ui.set_min_width(210.0);
+    ui.set_min_width(220.0);
     if row.children {
         let expanded = app.processes_state.expanded.contains(&row.pid);
-        if ui
-            .button(if expanded {
-                i18n::tr(K::Collapse)
-            } else {
-                i18n::tr(K::Expand)
-            })
-            .clicked()
-        {
+        let label = if expanded {
+            i18n::tr(K::Collapse)
+        } else {
+            i18n::tr(K::Expand)
+        };
+        if menu::item(ui, label).clicked() {
             app.processes_state.toggle_expanded(row.pid);
             ui.close();
         }
-        ui.separator();
+        menu::separator(ui);
     }
-    if ui.button(i18n::tr(K::EndTask)).clicked() {
+    if menu::item(ui, i18n::tr(K::EndTask)).clicked() {
         let identity = crate::app::ProcessIdentity {
             pid: row.pid,
             start_epoch_s: row.start_epoch_s,
@@ -705,7 +705,7 @@ fn context_menu(app: &mut TaskManApp, ui: &mut egui::Ui, row: &RowData) {
         ui.close();
     }
     #[cfg(target_os = "windows")]
-    if ui.button(i18n::tr(K::EndTree)).clicked() {
+    if menu::item(ui, i18n::tr(K::EndTree)).clicked() {
         let identity = crate::app::ProcessIdentity {
             pid: row.pid,
             start_epoch_s: row.start_epoch_s,
@@ -713,8 +713,8 @@ fn context_menu(app: &mut TaskManApp, ui: &mut egui::Ui, row: &RowData) {
         end_process_checked(app, &ctx, &identity, true, &row.name);
         ui.close();
     }
-    ui.separator();
-    if ui.button(i18n::tr(K::EfficiencyMode)).clicked() {
+    menu::separator(ui);
+    if menu::check(ui, i18n::tr(K::EfficiencyMode), row.power_throttled).clicked() {
         let identity = crate::app::ProcessIdentity {
             pid: row.pid,
             start_epoch_s: row.start_epoch_s,
@@ -722,7 +722,7 @@ fn context_menu(app: &mut TaskManApp, ui: &mut egui::Ui, row: &RowData) {
         toggle_efficiency_mode(app, &ctx, &identity);
         ui.close();
     }
-    if ui.button(i18n::tr(K::GoToDetails)).clicked() {
+    if menu::item(ui, i18n::tr(K::GoToDetails)).clicked() {
         app.pending_details_focus = Some(crate::app::PendingDetailsFocus(
             crate::app::ProcessIdentity {
                 pid: row.pid,
@@ -733,17 +733,17 @@ fn context_menu(app: &mut TaskManApp, ui: &mut egui::Ui, row: &RowData) {
         ui.close();
     }
     #[cfg(target_os = "windows")]
-    if ui.button(i18n::tr(K::GoToServices)).clicked() {
+    if menu::item(ui, i18n::tr(K::GoToServices)).clicked() {
         app.goto_services_for_pid(row.pid, &ctx);
         ui.close();
     }
-    ui.separator();
-    if ui.button(i18n::tr(K::CopyName)).clicked() {
+    menu::separator(ui);
+    if menu::item(ui, i18n::tr(K::CopyName)).clicked() {
         ui.ctx().copy_text(row.name.clone());
         app.shared.toast(i18n::tr(K::Copied));
         ui.close();
     }
-    if ui.button(i18n::tr(K::OpenFileLocation)).clicked() {
+    if menu::item(ui, i18n::tr(K::OpenFileLocation)).clicked() {
         match row.icon_path.as_deref() {
             Some(path) => {
                 let actions = app.actions.clone();
@@ -755,7 +755,7 @@ fn context_menu(app: &mut TaskManApp, ui: &mut egui::Ui, row: &RowData) {
         ui.close();
     }
     #[cfg(target_os = "windows")]
-    if ui.button(i18n::tr(K::CreateDumpFile)).clicked() {
+    if menu::item(ui, i18n::tr(K::CreateDumpFile)).clicked() {
         let process = app
             .latest_snapshot()
             .as_ref()
@@ -768,7 +768,9 @@ fn context_menu(app: &mut TaskManApp, ui: &mut egui::Ui, row: &RowData) {
         }
         ui.close();
     }
-    if app.actions.capabilities().process_modules && ui.button(i18n::tr(K::ViewModules)).clicked() {
+    if app.actions.capabilities().process_modules
+        && menu::item(ui, i18n::tr(K::ViewModules)).clicked()
+    {
         let process = app
             .latest_snapshot()
             .as_ref()
@@ -781,7 +783,7 @@ fn context_menu(app: &mut TaskManApp, ui: &mut egui::Ui, row: &RowData) {
         }
         ui.close();
     }
-    if ui.button(i18n::tr(K::OnlineSearch)).clicked() {
+    if menu::item(ui, i18n::tr(K::OnlineSearch)).clicked() {
         let url = search::online_search_url(&row.name);
         if let Err(error) = app.actions.open_url(&url) {
             app.shared
@@ -789,7 +791,7 @@ fn context_menu(app: &mut TaskManApp, ui: &mut egui::Ui, row: &RowData) {
         }
         ui.close();
     }
-    if ui.button(i18n::tr(K::Properties)).clicked() {
+    if menu::item(ui, i18n::tr(K::Properties)).clicked() {
         app.proc_props = Some(row.pid);
         ui.close();
     }

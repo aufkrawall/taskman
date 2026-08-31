@@ -22,6 +22,10 @@
 //! * [`scrolled_rows`] renders only the visible row window (fixed height),
 //!   so tables scale to tens of thousands of rows.
 //! * Widths persist by stable column id, not positional index.
+//! * Header and body are two independently laid-out scroll areas sharing one
+//!   horizontal offset. The body's scroll bars reserve layout space, so the
+//!   header must reserve the SAME space (`prev_bar_use`) or the two end at
+//!   different x and clamp the shared offset at different maxima.
 
 use eframe::egui::{
     self, Align2, Color32, CursorIcon, FontId, PointerButton, Pos2, Rect, Sense, Stroke,
@@ -76,22 +80,46 @@ impl SortState {
 const MIN_COL_W: f32 = 40.0;
 const MAX_COL_W: f32 = 1200.0;
 
-/// Empty strip kept clear on the RIGHT of the table content so the floating
-/// vertical scroll bar (which egui paints ON TOP of the scroll area, without
-/// reserving layout space) never covers the last column, and so the last
-/// column keeps visible padding to the window border. The header reserves
-/// the same strip: without it the last resize handle sits flush at the
-/// viewport edge once the content is scrolled fully right and egui's
-/// hit-testing (clipped to the scroll area) leaves only a few unreachable
-/// pixels of it.
-const BODY_PAD_RIGHT: i8 = 10;
-/// Same idea for the horizontal bar: it floats over the BOTTOM of the body,
-/// so the content ends a few px above it instead of under it.
-const BODY_PAD_BOTTOM: i8 = 8;
+/// Breathing room kept clear on the RIGHT of the table content, between the
+/// last column and the vertical scroll bar's own (reserved) lane. It also
+/// keeps the last resize handle grabbable: without any trailing content the
+/// handle sits flush at the viewport edge once scrolled fully right, and
+/// egui's hit-testing — clipped to the scroll area — leaves only a couple of
+/// unreachable pixels of it.
+const BODY_PAD_RIGHT: i8 = 6;
+/// Same idea below the last row.
+const BODY_PAD_BOTTOM: i8 = 4;
+
+/// Stash key for the layout space the body's scroll bars took last frame.
+/// The header is a SEPARATE scroll area with its own bars hidden, so it
+/// would otherwise stay a bar-width wider than the body: the two share one
+/// horizontal offset but would clamp it at different maxima, and the header
+/// would run on into the vertical bar's lane.
+fn bar_use_id(id: &'static str) -> egui::Id {
+    egui::Id::new(("tm-rowsbar", id))
+}
+
+/// Space the body's scroll bars reserved on the previous frame, as
+/// `(vertical bar width, horizontal bar height)`. Zero on the first frame,
+/// which is also when no bar can be shown yet.
+fn prev_bar_use(ui: &egui::Ui, id: &'static str) -> egui::Vec2 {
+    ui.ctx()
+        .data(|d| d.get_temp::<egui::Vec2>(bar_use_id(id)))
+        .unwrap_or(egui::Vec2::ZERO)
+}
+
+/// Record this frame's bar reservation for the next frame's header.
+fn store_bar_use(ui: &egui::Ui, id: &'static str, outer: egui::Vec2, inner: egui::Rect) {
+    let use_ = egui::vec2(
+        (outer.x - inner.width()).max(0.0),
+        (outer.y - inner.height()).max(0.0),
+    );
+    ui.ctx().data_mut(|d| d.insert_temp(bar_use_id(id), use_));
+}
 
 /// Available width for a full-width table. The margin keeps the last
-/// column's right-aligned labels clear of both the window border and the
-/// floating scroll bar strip (`BODY_PAD_RIGHT` plus breathing room).
+/// column's right-aligned labels clear of the window border and of the
+/// vertical scroll bar's reserved lane.
 pub fn table_avail(ui: &egui::Ui) -> f32 {
     (ui.available_width() - 16.0).max(300.0)
 }
@@ -130,10 +158,13 @@ pub fn scrolled_table(
         .data(|d| d.get_temp::<f32>(egui::Id::new(("tm-rowsx", id))))
         .unwrap_or(0.0);
     ui.spacing_mut().item_spacing.y = 0.0;
+    let bar_use = prev_bar_use(ui, id);
+    let outer = ui.available_size_before_wrap();
 
     let hdr = egui::ScrollArea::horizontal()
         .id_salt(hdr_id)
         .auto_shrink(egui::Vec2b::new(false, true))
+        .max_width((outer.x - bar_use.x).max(0.0))
         .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
         .content_margin(egui::Margin {
             right: BODY_PAD_RIGHT,
@@ -142,6 +173,7 @@ pub fn scrolled_table(
         .horizontal_scroll_offset(rows_prev_x)
         .show(ui, |ui| table.header(ui, pal, sort, aggregates));
 
+    let body_outer = ui.available_size_before_wrap();
     let body = egui::ScrollArea::both()
         .id_salt(egui::Id::new(("tm-rowscroll", id)))
         .auto_shrink(false)
@@ -154,6 +186,7 @@ pub fn scrolled_table(
         .horizontal_scroll_offset(hdr.state.offset.x)
         .show(ui, |ui| rows(ui, table, avail, avail.max(content_w)));
 
+    store_bar_use(ui, id, body_outer, body.inner_rect);
     ui.ctx()
         .data_mut(|d| d.insert_temp(egui::Id::new(("tm-rowsx", id)), body.state.offset.x));
     hdr.inner
@@ -191,10 +224,13 @@ pub fn scrolled_rows(
         .data(|d| d.get_temp::<f32>(egui::Id::new(("tm-rowsy", id))))
         .unwrap_or(0.0);
     ui.spacing_mut().item_spacing.y = 0.0;
+    let bar_use = prev_bar_use(ui, id);
+    let outer = ui.available_size_before_wrap();
 
     let hdr = egui::ScrollArea::horizontal()
         .id_salt(hdr_id)
         .auto_shrink(egui::Vec2b::new(false, true))
+        .max_width((outer.x - bar_use.x).max(0.0))
         .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
         .content_margin(egui::Margin {
             right: BODY_PAD_RIGHT,
@@ -208,7 +244,9 @@ pub fn scrolled_rows(
     // (callers hand us `Some` exactly once per request).
     let row_h = table.row_h;
     let vertical_offset = focus_row.map(|row| {
-        let viewport_h = ui.available_height();
+        // The horizontal bar's reserved lane is not viewport: counting it
+        // would scroll a bottom row that far short of actually being visible.
+        let viewport_h = (ui.available_height() - bar_use.y).max(row_h);
         let row_top = row as f32 * row_h;
         let row_bottom = row_top + row_h;
         let target = if row_top < rows_prev_y {
@@ -222,6 +260,7 @@ pub fn scrolled_rows(
         target.clamp(0.0, (content_h - viewport_h).max(0.0))
     });
 
+    let body_outer = ui.available_size_before_wrap();
     let body = {
         let area = egui::ScrollArea::both()
             .id_salt(egui::Id::new(("tm-rowscroll", id)))
@@ -242,6 +281,7 @@ pub fn scrolled_rows(
         })
     };
 
+    store_bar_use(ui, id, body_outer, body.inner_rect);
     ui.ctx()
         .data_mut(|d| d.insert_temp(egui::Id::new(("tm-rowsx", id)), body.state.offset.x));
     ui.ctx()
@@ -1222,6 +1262,76 @@ mod tests {
         );
         assert_eq!(t.col_width(2), 60.0, "last column resized via its handle");
         assert_eq!(t.col_width(0), 340.0, "first column unaffected");
+    }
+
+    /// The scroll bars reserve layout space, so a table whose rows overflow
+    /// vertically gets a narrower BODY. The header is a separate scroll area
+    /// with its own bars hidden, so it must be narrowed by exactly the same
+    /// amount — otherwise it runs on into the bar's lane and the two areas
+    /// clamp their shared horizontal offset at different maxima.
+    #[test]
+    fn header_reserves_the_same_scroll_bar_lane_as_the_body() {
+        let ctx = egui::Context::default();
+        // The reserved lane is OUR style choice, not an egui default: without
+        // installing it the test would silently measure egui's overlay bars.
+        crate::theme::install_visuals(&ctx);
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(520.0, 200.0));
+        let mut t = table();
+        let body_right = std::cell::Cell::new(0.0f32);
+
+        let frame = |t: &mut TmTable, time: f64| {
+            let raw = egui::RawInput {
+                screen_rect: Some(screen),
+                time: Some(time),
+                predicted_dt: 1.0 / 60.0,
+                ..Default::default()
+            };
+            let mut out = ctx.run_ui(raw, |root| {
+                egui::CentralPanel::default()
+                    .frame(egui::Frame::NONE)
+                    .show(root, |ui| {
+                        let avail = table_avail(ui);
+                        scrolled_rows(
+                            "t-lane",
+                            ui,
+                            &crate::theme::DARK,
+                            t,
+                            avail,
+                            None,
+                            None,
+                            // Far more rows than fit in 200 px → vertical bar.
+                            400,
+                            None,
+                            |ui, table, _a, _c, range| {
+                                body_right.set(ui.clip_rect().right());
+                                for _ in range {
+                                    table.row(ui, &crate::theme::DARK, false);
+                                }
+                            },
+                        );
+                    });
+            });
+            out.textures_delta.clear();
+        };
+
+        // Two frames: the bar's reservation is only known after the body has
+        // been laid out once.
+        frame(&mut t, 0.000);
+        frame(&mut t, 0.016);
+
+        let lane = ctx
+            .data(|d| d.get_temp::<egui::Vec2>(bar_use_id("t-lane")))
+            .unwrap_or(egui::Vec2::ZERO);
+        assert!(
+            lane.x > 0.0,
+            "an overflowing table must reserve a vertical scroll-bar lane"
+        );
+        assert!(
+            body_right.get() <= screen.right() - lane.x + 0.51,
+            "body content reaches into the scroll-bar lane: {} vs {}",
+            body_right.get(),
+            screen.right() - lane.x
+        );
     }
 
     /// Regression (type-ahead scroll): a focus row outside the rendered

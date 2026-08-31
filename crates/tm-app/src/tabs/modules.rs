@@ -14,6 +14,7 @@ use tm_platform::actions::{PlatformActions, ProcessModule};
 use crate::app::{InFlight, ProcessIdentity, TaskManApp};
 use crate::search;
 use crate::theme;
+use crate::widgets::menu;
 use crate::widgets::tablekit::{self, TmColumn};
 
 #[derive(Debug, Clone)]
@@ -400,13 +401,13 @@ pub fn dialog(app: &mut TaskManApp, ctx: &egui::Context, pal: &theme::Palette) {
                                 if response.clicked() {
                                     state.selected_base = Some(module.base_address);
                                 }
-                                response.context_menu(|ui| {
-                                    if ui.button(i18n::tr(K::CopyPath)).clicked() {
+                                menu::context_menu(&response, |ui| {
+                                    if menu::item(ui, i18n::tr(K::CopyPath)).clicked() {
                                         ui.ctx().copy_text(module.path.clone());
                                         app.shared.toast(i18n::tr(K::Copied));
                                         ui.close();
                                     }
-                                    if ui.button(i18n::tr(K::OpenFileLocation)).clicked() {
+                                    if menu::item(ui, i18n::tr(K::OpenFileLocation)).clicked() {
                                         if let Err(error) =
                                             app.actions.open_file_location(&module.path)
                                         {
@@ -415,7 +416,7 @@ pub fn dialog(app: &mut TaskManApp, ctx: &egui::Context, pal: &theme::Palette) {
                                         }
                                         ui.close();
                                     }
-                                    if ui.button(i18n::tr(K::Properties)).clicked() {
+                                    if menu::item(ui, i18n::tr(K::Properties)).clicked() {
                                         if let Err(error) =
                                             app.actions.open_properties(&module.path)
                                         {
@@ -424,13 +425,13 @@ pub fn dialog(app: &mut TaskManApp, ctx: &egui::Context, pal: &theme::Palette) {
                                         }
                                         ui.close();
                                     }
-                                    ui.separator();
-                                    let unload = ui
-                                        .add_enabled(
-                                            can_unload && module.unloadable && !state.unload.busy(),
-                                            egui::Button::new(i18n::tr(K::UnloadModule)),
-                                        )
-                                        .on_disabled_hover_text(i18n::tr(K::ModuleProtected));
+                                    menu::separator(ui);
+                                    let unload = menu::item_enabled(
+                                        ui,
+                                        i18n::tr(K::UnloadModule),
+                                        can_unload && module.unloadable && !state.unload.busy(),
+                                    )
+                                    .on_disabled_hover_text(i18n::tr(K::ModuleProtected));
                                     if unload.clicked() {
                                         request_unload = Some(module.clone());
                                         ui.close();

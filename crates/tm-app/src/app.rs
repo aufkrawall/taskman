@@ -465,7 +465,14 @@ impl TaskManApp {
             settings.col_order.get("details").map(Vec::as_slice),
         );
         if let Some(sort) = settings.table_sort.get("details") {
-            details_state.apply_saved_sort(&sort.column, sort.ascending);
+            // The Details tree's third order (strict hierarchy) has no
+            // ascending flag to live in, so it is restored from the general
+            // section alongside the tree-view switch itself.
+            let hierarchical = settings.details_tree_view && settings.details_tree_hierarchical;
+            details_state.apply_saved_sort(
+                &sort.column,
+                crate::tabs::details::SortOrder::from_saved(sort.ascending, hierarchical),
+            );
         }
 
         let mut processes_state = crate::tabs::processes::State::new();
@@ -888,6 +895,31 @@ impl TaskManApp {
                 false
             }
         }
+    }
+
+    /// Like [`TaskManApp::run_action`], but forces one out-of-band sample
+    /// once the action has COMPLETED.
+    ///
+    /// Process attributes the sampler caches per PID (priority, efficiency
+    /// mode, UAC virtualization) are what a context menu ticks, so a control
+    /// action must be followed by a fresh sample or the menu keeps showing
+    /// the old value. Refreshing beside the job instead of behind it is a
+    /// race that samples the still-unchanged process — actions run on the
+    /// executor's worker threads, not here.
+    pub fn run_action_refreshing(
+        &mut self,
+        ctx: &egui::Context,
+        success_msg: impl FnOnce() -> String + Send + 'static,
+        job: impl FnOnce() -> Result<(), tm_core::TmError> + Send + 'static,
+    ) -> bool {
+        let engine = self.engine.clone();
+        self.run_action(ctx, success_msg, move || {
+            let result = job();
+            if result.is_ok() {
+                engine.request_refresh();
+            }
+            result
+        })
     }
 
     /// Shared shutdown path for both eframe trait signatures (the optional

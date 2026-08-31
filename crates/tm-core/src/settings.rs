@@ -225,6 +225,12 @@ pub struct Settings {
     /// parent/child process tree (System Informer-style).
     #[serde(alias = "process_tree_view")]
     pub details_tree_view: bool,
+    /// Details tree presented in STRICT hierarchy: no column sort at all,
+    /// children under their parent in creation order (System Informer's
+    /// third click on a column header). Only meaningful with
+    /// [`Settings::details_tree_view`]; the sort column itself stays in
+    /// `[sort]`, which has no room for a third state.
+    pub details_tree_hierarchical: bool,
     /// Hide the main window instead of exiting when its close button is used.
     pub close_to_tray: bool,
     /// Register this executable for per-user Windows logon startup.
@@ -263,6 +269,7 @@ impl Default for Settings {
             cpu_graph_mode: "overall".into(),
             show_kernel_times: false,
             details_tree_view: false,
+            details_tree_hierarchical: false,
             close_to_tray: false,
             start_with_windows: false,
             start_elevated: false,
@@ -685,6 +692,11 @@ impl Settings {
             .and_then(|v| parse_bool(v))
             .or_else(|| get("general", "process_tree_view").and_then(|v| parse_bool(v)))
             .unwrap_or(s.details_tree_view);
+        s.details_tree_hierarchical = b(
+            "general",
+            "details_tree_hierarchical",
+            s.details_tree_hierarchical,
+        );
         s.close_to_tray = b("general", "close_to_tray", s.close_to_tray);
         s.start_with_windows = b("general", "start_with_windows", s.start_with_windows);
         if let Some(v) = get("general", "text_smoothing").and_then(|v| TextSmoothing::from_cfg(v)) {
@@ -854,6 +866,10 @@ impl Settings {
             ("cpu_graph_mode", self.cpu_graph_mode.clone()),
             ("show_kernel_times", self.show_kernel_times.to_string()),
             ("details_tree_view", self.details_tree_view.to_string()),
+            (
+                "details_tree_hierarchical",
+                self.details_tree_hierarchical.to_string(),
+            ),
             ("close_to_tray", self.close_to_tray.to_string()),
             ("start_with_windows", self.start_with_windows.to_string()),
             ("start_elevated", self.start_elevated.to_string()),
@@ -1124,6 +1140,7 @@ text_smoothing=banana
         s.cpu_graph_mode = "logical".into();
         s.show_kernel_times = true;
         s.details_tree_view = true;
+        s.details_tree_hierarchical = true;
         s.close_to_tray = true;
         s.start_with_windows = true;
         s.start_elevated = true;

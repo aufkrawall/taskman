@@ -67,7 +67,9 @@ platform boundary (`tm-core` ← `tm-platform` ← `tm-app` / `tm-service`):
     on-demand inspector with guarded unload),
     `widgets/tablekit.rs` (TM-style
     tables: drag-start-width resize math, O(1) layout, `scrolled_rows`
-    virtualization), `widgets/chart.rs` (timestamp-aware charts, kernel
+    virtualization), `widgets/menu.rs` (classic full-width Windows-style
+    context menus: uniform 28 px gapless rows, painted check gutter,
+    submenus), `widgets/chart.rs` (timestamp-aware charts, kernel
     overlay), `icon_cache.rs` (lazy worker, upload budget, bounded LRU),
     `fonts.rs` (async system-font load after first frame),
     `action_executor.rs`.
@@ -131,7 +133,15 @@ platform boundary (`tm-core` ← `tm-platform` ← `tm-app` / `tm-service`):
   tree. Raw `ProcessEntry.ppid` remains OS truth and is exposed by the
   persisted System Informer-style tree on the Details page, which is expanded
   by DEFAULT (`details::State.collapsed` tracks the exceptions) so newly
-  appearing subtrees are never silently hidden.
+  appearing subtrees are never silently hidden. That tree has THREE sort
+  states (`details::SortOrder`), not two: a third click on the sorted column
+  drops the column sort entirely and orders siblings by creation time.
+- `crates/tm-app/src/theme.rs` — `ScrollStyle.floating` must stay TRUE. egui
+  decides whether a bar is needed against the OUTER rect for floating bars
+  and against the shrunken INNER rect for solid ones, so a solid bar can
+  oscillate on width-dependent content. Space reservation comes from
+  `floating_allocated_width`, not from turning `floating` off; `tablekit`'s
+  header must mirror the body's reservation (`prev_bar_use`).
 - `crates/tm-platform/src/win/core_service.rs` — privileged trust boundary.
   Do not add arbitrary commands, output paths, or telemetry to its protocol.
   Preserve exact PID+creation-time checks, client/server executable binding,
