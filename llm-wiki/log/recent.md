@@ -1,5 +1,22 @@
 # Recent Activity
 
+## 2026-08-31 — foreign-session UX: repair now hands over to the installed copy
+
+User report: the state "somewhat randomly" showed ForeignClient. Root cause:
+not a bug in the state machine — the installed generation and the dev-tree
+build had diverged (the final fmt/gate rebuild changed the hash after the
+install), so dev-tree launches stopped hash-matching the installed copy and
+the startup redirect declined by design; the service log confirmed the
+rejected client paths were all `target\release\taskman.exe`. Launching the
+installed copy showed Active — hence the perceived randomness across
+launches.
+
+UX fixes: repair from a ForeignClient session now installs this build AND
+hands the session over to the installed copy (`dispatch_core_service_repair_and_switch`,
+reusing `switch_to_installed_gui`), closing the loop in one click; the
+ForeignClient text explains the rebuild/portable scenario and names both
+buttons. The installed generation was refreshed to the current release build.
+
 ## 2026-08-31 — response-delivery race: state display flapped Running/Degraded
 
 User report: the Advanced state alternated between "Active" and "broker
