@@ -390,9 +390,12 @@ pub struct State {
     pub order: Vec<ColumnId>,
     pub select_columns_open: bool,
     /// Expanded process identities for the literal Details tree.
-    pub expanded: HashSet<u32>,
+    /// Pids the user explicitly COLLAPSED. Everything else is expanded, so
+    /// the tree always shows the complete parent/child hierarchy — including
+    /// processes that started after the page was first opened. Tracking the
+    /// exceptions instead of the expansions is what keeps it that way.
+    pub collapsed: HashSet<u32>,
     view_generation: u64,
-    tree_initialized: bool,
 }
 
 impl State {
@@ -577,21 +580,14 @@ impl State {
         self.cache = None;
     }
 
-    pub fn toggle_expanded(&mut self, pid: u32) {
-        if !self.expanded.remove(&pid) {
-            self.expanded.insert(pid);
-        }
-        self.view_generation = self.view_generation.wrapping_add(1);
-        self.invalidate();
+    pub fn is_expanded(&self, pid: u32) -> bool {
+        !self.collapsed.contains(&pid)
     }
 
-    pub fn ensure_tree_initialized(&mut self, snap: &tm_core::model::Snapshot) {
-        if self.tree_initialized {
-            return;
+    pub fn toggle_expanded(&mut self, pid: u32) {
+        if !self.collapsed.remove(&pid) {
+            self.collapsed.insert(pid);
         }
-        self.expanded
-            .extend(snap.processes.iter().filter_map(|process| process.ppid));
-        self.tree_initialized = true;
         self.view_generation = self.view_generation.wrapping_add(1);
         self.invalidate();
     }
@@ -621,9 +617,8 @@ impl Default for State {
                 .collect(),
             order: COLUMNS.iter().map(|c| c.cid).collect(),
             select_columns_open: false,
-            expanded: HashSet::new(),
+            collapsed: HashSet::new(),
             view_generation: 0,
-            tree_initialized: false,
         }
     }
 }
@@ -710,10 +705,6 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
         ui.centered_and_justified(|ui| ui.label(i18n::tr(K::GatheringData)));
         return;
     };
-    if app.shared.settings.details_tree_view {
-        app.details_state.ensure_tree_initialized(&snap);
-    }
-
     crate::app_ui::tab_header(
         app,
         ui,
@@ -741,9 +732,6 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
                         .clicked()
                     {
                         app.shared.settings.details_tree_view = tree;
-                        if tree && let Some(snapshot) = app.latest_snapshot() {
-                            app.details_state.ensure_tree_initialized(&snapshot);
-                        }
                         app.details_state.invalidate();
                         app.save_settings();
                         ui.close();
@@ -752,18 +740,18 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
             });
             if app.shared.settings.details_tree_view {
                 if ui.button(i18n::tr(K::ExpandAll)).clicked() {
-                    if let Some(snapshot) = app.latest_snapshot() {
-                        app.details_state
-                            .expanded
-                            .extend(snapshot.processes.iter().map(|process| process.pid));
-                    }
+                    app.details_state.collapsed.clear();
                     app.details_state.view_generation =
                         app.details_state.view_generation.wrapping_add(1);
                     app.details_state.invalidate();
                     ui.close();
                 }
                 if ui.button(i18n::tr(K::CollapseAll)).clicked() {
-                    app.details_state.expanded.clear();
+                    if let Some(snapshot) = app.latest_snapshot() {
+                        app.details_state
+                            .collapsed
+                            .extend(snapshot.processes.iter().map(|process| process.pid));
+                    }
                     app.details_state.view_generation =
                         app.details_state.view_generation.wrapping_add(1);
                     app.details_state.invalidate();
@@ -811,7 +799,11 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
 
     let visible_cols = app.details_state.ordered_visible();
     let cols_rendered: Vec<TmColumn> = visible_cols.iter().map(|c| (c.col)()).collect();
-    let mut table = app.make_table("details", cols_rendered);
+    // Native TM packs the Details list; the 32 px app-list row height reads
+    // as broken gaps between entries here.
+    let mut table = app
+        .make_table("details", cols_rendered)
+        .with_row_height(tablekit::ROW_H_DENSE);
 
     let key = (
         snap.timestamp_ms,
@@ -833,21 +825,23 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
                 key.3,
                 key.4,
                 key.5,
-                &app.details_state.expanded,
+                &app.details_state.collapsed,
             ),
         });
     }
     let rows = &cache.as_ref().expect("cache").rows;
 
     // Native-style type navigation follows the current filtered/sorted list,
-    // cycles repeated initials, and scrolls the virtual row into view.
-    if let Some(initial) = search::list_initial(ui.ctx()) {
+    // accumulates fast keystrokes into one word, cycles repeated initials,
+    // and scrolls the virtual row into view.
+    if let Some(typed) = search::list_type_ahead(ui.ctx(), "details") {
         let selected = app.selected_process.as_ref().map(|p| p.pid);
-        if let Some(pid) = search::cycle_match(
-            rows.iter().map(|row| (row.pid, row.name.as_str())),
-            selected,
-            initial,
-        ) && let Some(row) = rows.iter().find(|row| row.pid == pid)
+        let candidates = rows
+            .iter()
+            .map(|row| (row.pid, row.name.as_str()))
+            .collect::<Vec<_>>();
+        if let Some(pid) = search::type_ahead_match(candidates, selected, &typed)
+            && let Some(row) = rows.iter().find(|row| row.pid == pid)
         {
             app.selected_process = Some(crate::app::ProcessIdentity {
                 pid: row.pid,
@@ -909,8 +903,8 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
                     if cid == ColumnId::Name {
                         let cell = table.col_rect(pos, rect);
                         let indented_cell =
-                            cell.translate(egui::vec2(row.depth as f32 * 22.0, 0.0));
-                        let expanded = app.details_state.expanded.contains(&row.pid);
+                            cell.translate(egui::vec2(row.depth as f32 * TREE_INDENT, 0.0));
+                        let expanded = app.details_state.is_expanded(row.pid);
                         let seed = egui::Id::new((
                             "details-chev",
                             row.pid,
@@ -928,7 +922,7 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
                         table.icon_cell(ui, indented_cell, tex.as_ref(), pal.accent);
                         ui.painter_at(cell).text(
                             egui::Pos2::new(
-                                cell.left() + 56.0 + row.depth as f32 * 22.0,
+                                cell.left() + 56.0 + row.depth as f32 * TREE_INDENT,
                                 rect.center().y,
                             ),
                             egui::Align2::LEFT_CENTER,
@@ -1008,7 +1002,8 @@ fn handle_keyboard_navigation(app: &mut TaskManApp, ctx: &egui::Context, rows: &
         .selected_process
         .as_ref()
         .and_then(|selected| rows.iter().position(|row| row.pid == selected.pid));
-    let page_rows = (ctx.content_rect().height() / tablekit::ROW_H)
+    // Page movement must count the rows this page actually renders.
+    let page_rows = (ctx.content_rect().height() / tablekit::ROW_H_DENSE)
         .floor()
         .max(1.0) as usize;
     if let Some(nav) = search::list_nav(ctx)
@@ -1036,7 +1031,7 @@ fn handle_keyboard_navigation(app: &mut TaskManApp, ctx: &egui::Context, rows: &
     };
     let row = &rows[index];
     if right && row.children {
-        if !app.details_state.expanded.contains(&row.pid) {
+        if !app.details_state.is_expanded(row.pid) {
             app.details_state.toggle_expanded(row.pid);
         } else if let Some(child) = rows.get(index + 1)
             && child.depth > row.depth
@@ -1044,7 +1039,7 @@ fn handle_keyboard_navigation(app: &mut TaskManApp, ctx: &egui::Context, rows: &
             select_detail_row(app, child);
         }
     } else if left {
-        if row.children && app.details_state.expanded.contains(&row.pid) {
+        if row.children && app.details_state.is_expanded(row.pid) {
             app.details_state.toggle_expanded(row.pid);
         } else if row.depth > 0
             && let Some(parent) = rows[..index]
@@ -1067,7 +1062,7 @@ fn prepare_auto_fit_widths(
         let mut width = tablekit::text_width(ui, spec.label(), tablekit::FONT_HDR_LABEL) + 28.0;
         for row in rows {
             let extra = if spec.cid == ColumnId::Name {
-                66.0 + row.depth as f32 * 22.0
+                66.0 + row.depth as f32 * TREE_INDENT
             } else {
                 22.0
             };
@@ -1248,7 +1243,7 @@ fn build_rows(
     sort_col: ColumnId,
     ascending: bool,
     tree: bool,
-    expanded: &HashSet<u32>,
+    collapsed: &HashSet<u32>,
 ) -> Vec<Row> {
     let q = search::Query::new(raw_search);
     if !tree {
@@ -1304,6 +1299,9 @@ fn build_rows(
         if let Some(parent) = process.ppid
             && parent != process.pid
             && visible.contains(&parent)
+            && by_pid
+                .get(&parent)
+                .is_some_and(|parent| is_plausible_parent(parent, process))
         {
             children.entry(parent).or_default().push(*process);
         }
@@ -1312,14 +1310,11 @@ fn build_rows(
         sort_processes(siblings, sort_col, ascending);
     }
 
+    let attached: HashSet<u32> = children.values().flatten().map(|child| child.pid).collect();
     let mut roots: Vec<&ProcessEntry> = members
         .iter()
         .copied()
-        .filter(|process| {
-            process
-                .ppid
-                .is_none_or(|parent| parent == process.pid || !visible.contains(&parent))
-        })
+        .filter(|process| !attached.contains(&process.pid))
         .collect();
     // Malformed/cyclic parent graphs can have no natural root. Pick one
     // representative per still-uncovered component so every process remains
@@ -1353,11 +1348,26 @@ fn build_rows(
             .collect::<Vec<_>>();
         let has_children = !kids.is_empty();
         rows.push(row_from_process(process, depth, has_children));
-        if has_children && (expanded.contains(&process.pid) || !q.is_empty()) {
+        if has_children && (!collapsed.contains(&process.pid) || !q.is_empty()) {
             stack.extend(kids.into_iter().rev().map(|child| (child, depth + 1)));
         }
     }
     rows
+}
+
+/// Horizontal step per tree level, shared by rendering and auto-fit. Matched
+/// to System Informer's compact indentation so deep trees stay on screen.
+const TREE_INDENT: f32 = 18.0;
+
+/// A PID may be recycled the moment its process exits, so a raw parent link
+/// can point at a process that started LATER than its supposed child. System
+/// Informer rejects those links and shows the child as a root; so do we.
+/// Unknown timestamps are never treated as evidence — the link stands.
+fn is_plausible_parent(parent: &ProcessEntry, child: &ProcessEntry) -> bool {
+    match (parent.start_epoch_s, child.start_epoch_s) {
+        (Some(parent_start), Some(child_start)) => parent_start <= child_start,
+        _ => true,
+    }
 }
 
 fn sort_processes(list: &mut Vec<&ProcessEntry>, sort_col: ColumnId, ascending: bool) {
@@ -1545,7 +1555,7 @@ pub fn context_menu(app: &mut TaskManApp, ui: &mut egui::Ui, p: &ProcessEntry, h
     ui.separator();
 
     if app.shared.settings.details_tree_view && has_children {
-        let expanded = app.details_state.expanded.contains(&p.pid);
+        let expanded = app.details_state.is_expanded(p.pid);
         if ui
             .button(if expanded {
                 i18n::tr(K::Collapse)
@@ -2162,43 +2172,69 @@ mod tests {
         }
     }
 
+    /// The tree is expanded by DEFAULT: an empty state must show the whole
+    /// hierarchy, including subtrees whose parents appeared long after the
+    /// page was first opened. Only explicit collapses hide anything.
     #[test]
-    fn details_tree_preserves_hierarchy_and_expansion() {
+    fn details_tree_is_fully_expanded_until_the_user_collapses() {
         let snapshot = tree_snapshot(vec![
             tree_process(10, None, "root.exe"),
             tree_process(11, Some(10), "child.exe"),
             tree_process(12, Some(11), "leaf.exe"),
         ]);
-        let collapsed = build_rows(
-            &snapshot,
+        let depths = |collapsed: HashSet<u32>| {
+            build_rows(&snapshot, "", ColumnId::Name, true, true, &collapsed)
+                .iter()
+                .map(|row| (row.pid, row.depth))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(depths(HashSet::new()), [(10, 0), (11, 1), (12, 2)]);
+        assert_eq!(depths(HashSet::from([11])), [(10, 0), (11, 1)]);
+        assert_eq!(depths(HashSet::from([10])), [(10, 0)]);
+    }
+
+    /// A recycled PID can make a process look like its own ancestor's child.
+    /// A parent that started AFTER the child is not a parent.
+    #[test]
+    fn details_tree_rejects_parents_that_started_after_their_child() {
+        let mut child = tree_process(500, Some(900), "orphan.exe");
+        child.start_epoch_s = Some(100);
+        let mut recycled = tree_process(900, None, "recycled.exe");
+        recycled.start_epoch_s = Some(400);
+        let rows = build_rows(
+            &tree_snapshot(vec![recycled, child]),
             "",
             ColumnId::Name,
             true,
             true,
-            &HashSet::from([10]),
+            &HashSet::new(),
         );
         assert_eq!(
-            collapsed
-                .iter()
+            rows.iter()
                 .map(|row| (row.pid, row.depth))
                 .collect::<Vec<_>>(),
-            [(10, 0), (11, 1)]
+            [(500, 0), (900, 0)],
+            "both stay roots; the stale link must not nest them"
         );
 
-        let expanded = build_rows(
-            &snapshot,
+        // The same shape with a plausible timeline DOES nest.
+        let mut child = tree_process(500, Some(900), "child.exe");
+        child.start_epoch_s = Some(400);
+        let mut parent = tree_process(900, None, "parent.exe");
+        parent.start_epoch_s = Some(100);
+        let rows = build_rows(
+            &tree_snapshot(vec![parent, child]),
             "",
             ColumnId::Name,
             true,
             true,
-            &HashSet::from([10, 11]),
+            &HashSet::new(),
         );
         assert_eq!(
-            expanded
-                .iter()
+            rows.iter()
                 .map(|row| (row.pid, row.depth))
                 .collect::<Vec<_>>(),
-            [(10, 0), (11, 1), (12, 2)]
+            [(900, 0), (500, 1)]
         );
     }
 
@@ -2223,18 +2259,14 @@ mod tests {
             [10, 11, 12]
         );
 
-        let cyclic = tree_snapshot(vec![
-            tree_process(30, Some(31), "a.exe"),
-            tree_process(31, Some(30), "b.exe"),
-        ]);
-        let rows = build_rows(
-            &cyclic,
-            "",
-            ColumnId::Name,
-            true,
-            true,
-            &HashSet::from([30, 31]),
-        );
+        let mut a = tree_process(30, Some(31), "a.exe");
+        let mut b = tree_process(31, Some(30), "b.exe");
+        // Same start time on both, so neither link is rejected as stale and
+        // only the render walk's visited set can break the cycle.
+        a.start_epoch_s = Some(1);
+        b.start_epoch_s = Some(1);
+        let cyclic = tree_snapshot(vec![a, b]);
+        let rows = build_rows(&cyclic, "", ColumnId::Name, true, true, &HashSet::new());
         let unique = rows.iter().map(|row| row.pid).collect::<HashSet<_>>();
         assert_eq!(rows.len(), 2);
         assert_eq!(unique, HashSet::from([30, 31]));

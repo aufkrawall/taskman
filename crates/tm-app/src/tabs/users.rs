@@ -551,14 +551,13 @@ fn user_row_ui(
         format::format_rate_mb(a.disk),
         "—".to_string(),
     ];
-    let active_row = a.cpu > 0.0 || a.mem > 0.0 || a.disk > 0.0;
     let cells: Vec<HeatCell> = heat_max
         .intensity(&[a.cpu, a.mem, a.disk, 0.0])
         .iter()
         .zip(texts.iter())
         .map(|(t, txt)| HeatCell::new(*t, txt.clone()))
         .collect();
-    table.heat_cells(ui, pal, rect, 2, &cells, active_row);
+    table.heat_cells(ui, pal, rect, 2, &cells);
 
     if resp.clicked() {
         app.selected_user = Some(s.id);
@@ -634,7 +633,7 @@ fn app_row_ui(
         .zip(texts.iter())
         .map(|(t, txt)| HeatCell::new(*t, txt.clone()))
         .collect();
-    table.heat_cells(ui, pal, rect, 2, &cells, vals.iter().any(|&v| v > 0.0));
+    table.heat_cells(ui, pal, rect, 2, &cells);
 }
 
 fn display_name(s: &UserSession, hostname: &str) -> String {

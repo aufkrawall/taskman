@@ -32,6 +32,11 @@ items across Phases 2–6. The following concrete gaps remain:
   NPU Shared Memory, and Isolation/AppContainer, plus neural-engine
   Performance entries. These require capability-gated model/collector work;
   absent hardware or telemetry must remain `—`, never zero.
+- **Details tree roots:** `System` (pid 4) reports parent pid 0 and sysinfo
+  maps that to `None`, so it renders as a root next to `[System Process]`
+  instead of nested beneath it the way System Informer shows it. Restoring
+  the link would mean re-introducing a parent the collector API did not
+  report; the honest root is preferred over a synthesized edge.
 - **CPU compatibility:** current `cpu_load.rs` intentionally matches the
   standardized time-based CPU metric. The legacy frequency-weighted
   **CPU Utility** provider/column/switcher still does not exist; do not mutate

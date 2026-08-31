@@ -918,14 +918,23 @@ pub fn set_efficiency_mode_checked(
 
 /// Query the current EcoQoS / power-throttling state of `pid` so externally
 /// applied efficiency states are reflected correctly (implement.md §11.6).
+///
+/// `Version` is an INPUT field for the query too: `GetProcessInformation`
+/// rejects a zeroed struct with `ERROR_INVALID_PARAMETER` (87), which made
+/// every process report "unknown" and hid the efficiency-mode leaf for the
+/// browsers that actually use EcoQoS.
 pub fn efficiency_mode_state(pid: u32) -> Option<bool> {
     use windows::Win32::System::Threading::{
-        GetProcessInformation, PROCESS_POWER_THROTTLING_EXECUTION_SPEED,
-        PROCESS_POWER_THROTTLING_STATE, ProcessPowerThrottling,
+        GetProcessInformation, PROCESS_POWER_THROTTLING_CURRENT_VERSION,
+        PROCESS_POWER_THROTTLING_EXECUTION_SPEED, PROCESS_POWER_THROTTLING_STATE,
+        ProcessPowerThrottling,
     };
     unsafe {
         let h = open_process(pid, th::PROCESS_QUERY_LIMITED_INFORMATION).ok()?;
-        let mut info = PROCESS_POWER_THROTTLING_STATE::default();
+        let mut info = PROCESS_POWER_THROTTLING_STATE {
+            Version: PROCESS_POWER_THROTTLING_CURRENT_VERSION,
+            ..Default::default()
+        };
         let ok = GetProcessInformation(
             h,
             ProcessPowerThrottling,

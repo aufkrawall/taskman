@@ -145,3 +145,44 @@ fn sampled_snapshot_carries_command_lines() {
     let _ = child.kill();
     let _ = child.wait();
 }
+
+#[cfg(target_os = "windows")]
+#[test]
+fn efficiency_mode_state_is_known_for_own_process() {
+    // Regression: `GetProcessInformation(ProcessPowerThrottling)` needs
+    // `Version` set on INPUT. With a zeroed struct it failed with
+    // ERROR_INVALID_PARAMETER for every pid, so the snapshot reported
+    // "unknown" everywhere and the Processes tab never drew the efficiency
+    // leaf. Our own process is always openable, so its state must be known.
+    let mut collector = tm_platform::create_collector();
+    let snap = collector.sample(std::time::Instant::now()).expect("tick");
+    let me = std::process::id();
+    let own = snap
+        .processes
+        .iter()
+        .find(|p| p.pid == me)
+        .expect("own process in snapshot");
+    assert_eq!(
+        own.power_throttled,
+        Some(false),
+        "own process must report a KNOWN, not-throttled efficiency state"
+    );
+
+    // Toggling it on must be observable. A FRESH collector is used because
+    // the sampler caches per-pid attributes for ATTR_REFRESH_TTL; the test
+    // asserts the query, not the cache.
+    let actions = tm_platform::create_actions();
+    actions
+        .set_efficiency_mode(me, true)
+        .expect("enable EcoQoS");
+    let mut collector = tm_platform::create_collector();
+    let snap = collector.sample(std::time::Instant::now()).expect("tick 2");
+    let observed = snap
+        .processes
+        .iter()
+        .find(|p| p.pid == me)
+        .expect("own")
+        .power_throttled;
+    actions.set_efficiency_mode(me, false).expect("disable");
+    assert_eq!(observed, Some(true), "enabled EcoQoS must be read back");
+}

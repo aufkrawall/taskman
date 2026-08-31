@@ -49,27 +49,91 @@ impl Query {
     }
 }
 
-/// Return one plain alphabetic character typed while no text editor owns
-/// keyboard focus. This deliberately uses text events instead of key codes so
-/// keyboard layouts and non-ASCII letters behave naturally. Modified input is
-/// ignored so application shortcuts never become list-navigation keystrokes.
-pub fn list_initial(ctx: &egui::Context) -> Option<char> {
+/// How long a type-ahead buffer keeps collecting keystrokes. Windows' list
+/// views use roughly one second of silence to end a search word; typing
+/// faster than this appends instead of restarting.
+const TYPE_AHEAD_TIMEOUT_S: f64 = 1.0;
+
+/// What a burst of typed characters should do to the selection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TypeAhead {
+    /// Select the FIRST entry whose name starts with this accumulated
+    /// prefix. Typing "svc" quickly must land on `svchost.exe`, never on
+    /// whatever starts with the last letter alone.
+    Prefix(String),
+    /// The same letter pressed repeatedly: step to the next entry with that
+    /// initial and wrap, exactly like native list views.
+    Cycle(char),
+}
+
+/// Characters that participate in type-ahead. Letters and digits cover the
+/// native behavior; `.`, `-` and `_` let a user type through real process
+/// names like `svchost.exe` or `msedge-webview`.
+fn type_ahead_char(c: char) -> bool {
+    c.is_alphanumeric() || matches!(c, '.' | '-' | '_')
+}
+
+/// Collect every plain character typed this frame while no text editor owns
+/// keyboard focus. Text events (not key codes) keep keyboard layouts and
+/// non-ASCII letters natural; modified input is ignored so application
+/// shortcuts never become list-navigation keystrokes.
+fn typed_chars(ctx: &egui::Context) -> Vec<char> {
     if ctx.egui_wants_keyboard_input() {
-        return None;
+        return Vec::new();
     }
     ctx.input(|i| {
         if i.modifiers.alt || i.modifiers.ctrl || i.modifiers.command {
-            return None;
+            return Vec::new();
         }
-        i.events.iter().rev().find_map(|event| {
-            let egui::Event::Text(text) = event else {
-                return None;
-            };
-            let mut chars = text.chars();
-            let c = chars.next()?;
-            (chars.next().is_none() && c.is_alphabetic()).then_some(c)
-        })
+        i.events
+            .iter()
+            .filter_map(|event| {
+                let egui::Event::Text(text) = event else {
+                    return None;
+                };
+                let mut chars = text.chars();
+                let c = chars.next()?;
+                (chars.next().is_none() && type_ahead_char(c)).then_some(c)
+            })
+            .collect()
     })
+}
+
+/// Accumulating type-ahead for one list, keyed by `id` so tabs never inherit
+/// each other's buffer.
+///
+/// A single frame can deliver SEVERAL text events when the user types fast,
+/// so all of them are appended in order; only the buffer decides what to
+/// match. Anything typed after [`TYPE_AHEAD_TIMEOUT_S`] of silence starts a
+/// new word.
+pub fn list_type_ahead(ctx: &egui::Context, id: &'static str) -> Option<TypeAhead> {
+    let typed = typed_chars(ctx);
+    if typed.is_empty() {
+        return None;
+    }
+    let now = ctx.input(|i| i.time);
+    let key = egui::Id::new(("tm-typeahead", id));
+    let previous = ctx.data(|d| d.get_temp::<(String, f64)>(key));
+    let mut buffer = match previous {
+        Some((buffer, last)) if now - last <= TYPE_AHEAD_TIMEOUT_S => buffer,
+        _ => String::new(),
+    };
+    buffer.extend(typed);
+    ctx.data_mut(|d| d.insert_temp(key, (buffer.clone(), now)));
+
+    let mut chars = buffer.chars();
+    let first = chars.next()?;
+    // Native rule: one letter — or the same letter repeated — cycles through
+    // its matches; a real word narrows the match by prefix instead.
+    if chars.all(|c| same_letter(c, first)) {
+        Some(TypeAhead::Cycle(first))
+    } else {
+        Some(TypeAhead::Prefix(buffer))
+    }
+}
+
+fn same_letter(a: char, b: char) -> bool {
+    a.to_lowercase().eq(b.to_lowercase())
 }
 
 /// Keyboard movement understood by virtualized list/table pages.
@@ -179,6 +243,33 @@ pub fn cycle_match<'a, T: PartialEq + Clone>(
         )
 }
 
+/// Find the first displayed entry whose name starts with `prefix`
+/// (case-insensitively). Unlike [`cycle_match`] this never advances past a
+/// match, so extending the prefix keeps refining the SAME selection instead
+/// of walking away from it.
+pub fn prefix_match<'a, T>(
+    items: impl IntoIterator<Item = (T, &'a str)>,
+    prefix: &str,
+) -> Option<T> {
+    let needle = prefix.to_lowercase();
+    items.into_iter().find_map(|(id, name)| {
+        let name = name.trim_start().to_lowercase();
+        name.starts_with(&needle).then_some(id)
+    })
+}
+
+/// Apply one type-ahead burst to a list, returning the identity to select.
+pub fn type_ahead_match<'a, T: PartialEq + Clone>(
+    items: impl IntoIterator<Item = (T, &'a str)> + Clone,
+    selected: Option<T>,
+    typed: &TypeAhead,
+) -> Option<T> {
+    match typed {
+        TypeAhead::Cycle(initial) => cycle_match(items, selected, *initial),
+        TypeAhead::Prefix(prefix) => prefix_match(items, prefix),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -258,6 +349,129 @@ mod tests {
         assert_eq!(moved_index(20, Some(17), ListNav::PageDown, 10), Some(19));
         assert_eq!(moved_index(20, Some(17), ListNav::First, 10), Some(0));
         assert_eq!(moved_index(20, Some(1), ListNav::Last, 10), Some(19));
+    }
+
+    fn typed_ctx(ctx: &egui::Context, chars: &[char], time: f64) {
+        let events = chars
+            .iter()
+            .map(|c| egui::Event::Text(c.to_string()))
+            .collect();
+        let mut out = ctx.run_ui(
+            egui::RawInput {
+                time: Some(time),
+                events,
+                ..Default::default()
+            },
+            |_| {},
+        );
+        out.textures_delta.clear();
+    }
+
+    /// The regression from the report: typing "svc" fast must not leave the
+    /// selection on whatever starts with "c".
+    #[test]
+    fn fast_typing_accumulates_into_a_prefix() {
+        let ctx = egui::Context::default();
+        typed_ctx(&ctx, &['s'], 0.0);
+        assert_eq!(
+            list_type_ahead(&ctx, "t"),
+            Some(TypeAhead::Cycle('s')),
+            "a single letter still cycles like a native list"
+        );
+        typed_ctx(&ctx, &['v'], 0.05);
+        assert_eq!(
+            list_type_ahead(&ctx, "t"),
+            Some(TypeAhead::Prefix("sv".into()))
+        );
+        typed_ctx(&ctx, &['c'], 0.10);
+        assert_eq!(
+            list_type_ahead(&ctx, "t"),
+            Some(TypeAhead::Prefix("svc".into()))
+        );
+    }
+
+    /// Several text events can land in ONE frame when typing fast; all of
+    /// them must reach the buffer in order.
+    #[test]
+    fn several_characters_in_one_frame_all_count() {
+        let ctx = egui::Context::default();
+        typed_ctx(&ctx, &['s', 'v', 'c'], 0.0);
+        assert_eq!(
+            list_type_ahead(&ctx, "t"),
+            Some(TypeAhead::Prefix("svc".into()))
+        );
+    }
+
+    #[test]
+    fn a_pause_starts_a_new_word() {
+        let ctx = egui::Context::default();
+        typed_ctx(&ctx, &['s'], 0.0);
+        assert_eq!(list_type_ahead(&ctx, "t"), Some(TypeAhead::Cycle('s')));
+        typed_ctx(&ctx, &['v'], 0.0 + TYPE_AHEAD_TIMEOUT_S + 0.5);
+        assert_eq!(
+            list_type_ahead(&ctx, "t"),
+            Some(TypeAhead::Cycle('v')),
+            "after the timeout the buffer restarts"
+        );
+    }
+
+    #[test]
+    fn repeating_one_letter_keeps_cycling() {
+        let ctx = egui::Context::default();
+        typed_ctx(&ctx, &['s'], 0.0);
+        assert_eq!(list_type_ahead(&ctx, "t"), Some(TypeAhead::Cycle('s')));
+        typed_ctx(&ctx, &['s'], 0.05);
+        assert_eq!(list_type_ahead(&ctx, "t"), Some(TypeAhead::Cycle('s')));
+        typed_ctx(&ctx, &['S'], 0.10);
+        assert_eq!(list_type_ahead(&ctx, "t"), Some(TypeAhead::Cycle('s')));
+    }
+
+    #[test]
+    fn separate_lists_keep_separate_buffers() {
+        let ctx = egui::Context::default();
+        typed_ctx(&ctx, &['s'], 0.0);
+        assert_eq!(
+            list_type_ahead(&ctx, "processes"),
+            Some(TypeAhead::Cycle('s'))
+        );
+        assert_eq!(
+            list_type_ahead(&ctx, "details"),
+            Some(TypeAhead::Cycle('s')),
+            "a second list starts its own word from the same keystroke"
+        );
+    }
+
+    #[test]
+    fn prefix_match_takes_the_first_display_order_hit() {
+        let rows = [
+            (1, "conhost.exe"),
+            (2, "svchost.exe"),
+            (3, "SVCHOST.EXE"),
+            (4, "services.exe"),
+        ];
+        assert_eq!(prefix_match(rows, "svc"), Some(2));
+        assert_eq!(prefix_match(rows, "SVCH"), Some(2));
+        assert_eq!(prefix_match(rows, "se"), Some(4));
+        assert_eq!(prefix_match(rows, "zz"), None);
+    }
+
+    #[test]
+    fn type_ahead_match_routes_cycle_and_prefix() {
+        let rows = [(1, "svchost.exe"), (2, "services.exe"), (3, "conhost.exe")];
+        assert_eq!(
+            type_ahead_match(rows, None, &TypeAhead::Cycle('s')),
+            Some(1)
+        );
+        assert_eq!(
+            type_ahead_match(rows, Some(1), &TypeAhead::Cycle('s')),
+            Some(2),
+            "repeating the letter advances"
+        );
+        assert_eq!(
+            type_ahead_match(rows, Some(1), &TypeAhead::Prefix("svc".into())),
+            Some(1),
+            "extending the word refines instead of advancing"
+        );
     }
 
     #[test]

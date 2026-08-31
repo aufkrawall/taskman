@@ -446,9 +446,6 @@ pub fn settings_dialog(app: &mut TaskManApp, ctx: &egui::Context, _pal: &theme::
                         .clicked()
                     {
                         app.shared.settings.details_tree_view = tree;
-                        if tree && let Some(snapshot) = app.latest_snapshot() {
-                            app.details_state.ensure_tree_initialized(&snapshot);
-                        }
                         app.details_state.invalidate();
                         app.save_settings();
                     }

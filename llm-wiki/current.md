@@ -13,6 +13,40 @@ diagnostics; remaining telemetry and accessibility work is itemized precisely
 in `known-debt.md`. Normal GUI startup remains unelevated; privileged controls
 can cross a protected, allowlisted service boundary after one explicit install.
 
+## Recently landed (2026-08-31 — table look, status glyphs and tree)
+
+- **Efficiency mode was never detected.** `GetProcessInformation` with
+  `ProcessPowerThrottling` requires `PROCESS_POWER_THROTTLING_STATE.Version`
+  set on INPUT; a zeroed struct fails with `ERROR_INVALID_PARAMETER` for
+  every pid, so `power_throttled` was `None` system-wide. Fixed in
+  `process_ops::efficiency_mode_state` and pinned by an integration test.
+  The flag now refreshes on its own 2 s sub-TTL inside the 10 s attribute
+  cache, because it is a live status, not a slow-changing attribute.
+- **Heat map.** Every numeric cell is painted from a continuous
+  `theme::heat_blue` gradient whose floor is `heat_base`, so idle processes
+  no longer leave unpainted holes in the blue band. The curve is ease-OUT:
+  intensities are normalized against the column maximum, and the previous
+  ease-in curve collapsed everything but the top consumer onto the base tint.
+- **Row hover reaches the value columns.** `TmTable::row` records its
+  selection/hover fill; `heat_cells` re-applies it over the opaque blue band
+  it paints. Light mode uses a dark wash instead of an invisible white one.
+- **Status column glyphs on Processes**: orange pause (suspended) and green
+  leaf (efficiency mode), with the wording in the row tooltip; only
+  "not responding" stays as text. A collapsed group row (`Brave Browser (24)`)
+  aggregates the leaf over its display subtree exactly as it aggregates
+  CPU/memory — that is where native Task Manager shows it.
+- **Type-ahead accumulates.** `search::list_type_ahead` buffers keystrokes for
+  1 s, so typing "svc" fast selects svchost.exe instead of the last letter's
+  first match; a single letter (or one repeated) still cycles and wraps.
+- **Dense list pages.** `TmTable::row_h` / `ROW_H_DENSE` (22 px) pack Details,
+  Services and Modules like native TM's Details tab; Processes, Users,
+  Startup and App History keep the 32 px app-list spacing.
+- **Details tree is fully hierarchical by default.** `details::State.collapsed`
+  replaces `expanded`, so the tree shows the complete hierarchy at all times
+  instead of leaving subtrees that appeared after page load collapsed. Parent
+  links whose parent started after the child are rejected
+  (`is_plausible_parent`), matching System Informer's PID-reuse guard.
+
 ## Recently landed (2026-08-31 — protected service and reliability)
 
 - Added `taskman-service.exe`, a delayed-auto LocalSystem SCM service that owns

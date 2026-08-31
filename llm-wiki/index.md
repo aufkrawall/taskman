@@ -1,6 +1,6 @@
 # llm-wiki Index
 
-Last cross-checked: 2026-08-31 (GUI parity and protected core-service pass)
+Last cross-checked: 2026-08-31 (table look, status glyphs, type-ahead, Details tree)
 
 Primary sources:
 

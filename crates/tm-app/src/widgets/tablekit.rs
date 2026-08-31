@@ -31,8 +31,13 @@ use tm_core::format;
 use crate::icons;
 use crate::theme::Palette;
 
-/// Row height used by all TM tables (also the virtualization unit).
+/// Row height used by the icon-carrying TM tables (also the virtualization
+/// unit). Processes/Users/Startup/App history use this airy Win11 spacing.
 pub const ROW_H: f32 = 32.0;
+/// Compact row height for the dense list pages (Details, Services, Modules).
+/// Native Task Manager's Details tab packs its rows with no visible gap; the
+/// 32 px app-list spacing there reads as broken whitespace between entries.
+pub const ROW_H_DENSE: f32 = 22.0;
 /// Header height for tables with aggregates (two-line).
 pub const HEADER_H: f32 = 57.0;
 /// Header height for single-line headers (Details/Services/Startup).
@@ -201,10 +206,11 @@ pub fn scrolled_rows(
     // Vertical-only minimal-move scroll target, computed against the last
     // frame's offset. The builder offset is applied on this frame only
     // (callers hand us `Some` exactly once per request).
+    let row_h = table.row_h;
     let vertical_offset = focus_row.map(|row| {
         let viewport_h = ui.available_height();
-        let row_top = row as f32 * ROW_H;
-        let row_bottom = row_top + ROW_H;
+        let row_top = row as f32 * row_h;
+        let row_bottom = row_top + row_h;
         let target = if row_top < rows_prev_y {
             row_top
         } else if row_bottom > rows_prev_y + viewport_h {
@@ -212,7 +218,7 @@ pub fn scrolled_rows(
         } else {
             rows_prev_y // already visible
         };
-        let content_h = ROW_H * row_count as f32;
+        let content_h = row_h * row_count as f32;
         target.clamp(0.0, (content_h - viewport_h).max(0.0))
     });
 
@@ -231,7 +237,7 @@ pub fn scrolled_rows(
             Some(y) => area.vertical_scroll_offset(y),
             None => area,
         };
-        area.show_rows(ui, ROW_H, row_count, |ui, range| {
+        area.show_rows(ui, row_h, row_count, |ui, range| {
             rows(ui, table, avail, avail.max(content_w), range)
         })
     };
@@ -303,6 +309,12 @@ pub fn norm(value: f64, max: f64) -> f32 {
 pub struct TmTable {
     pub id: &'static str,
     pub cols: Vec<TmColumn>,
+    /// Height of every body row; also the virtualization unit.
+    pub row_h: f32,
+    /// Fill the last [`TmTable::row`] painted for selection/hover, so cells
+    /// that paint an OPAQUE background (the heat band) can restore it on top
+    /// of themselves instead of swallowing the highlight.
+    row_overlay: std::cell::Cell<Option<Color32>>,
     layout: std::cell::RefCell<Option<Layout>>,
     dirty: bool,
     /// Full-model intrinsic widths supplied by the tab before `header()`.
@@ -321,6 +333,8 @@ impl TmTable {
             id,
             auto_widths: vec![None; cols.len()],
             cols,
+            row_h: ROW_H,
+            row_overlay: std::cell::Cell::new(None),
             layout: std::cell::RefCell::new(None),
             dirty: false,
         };
@@ -334,6 +348,12 @@ impl TmTable {
             }
         }
         t
+    }
+
+    /// Switch this table to a different row height (see [`ROW_H_DENSE`]).
+    pub fn with_row_height(mut self, row_h: f32) -> Self {
+        self.row_h = row_h;
+        self
     }
 
     pub fn stored_widths(&self) -> std::collections::BTreeMap<String, f32> {
@@ -597,14 +617,23 @@ impl TmTable {
     pub fn row(&self, ui: &mut egui::Ui, pal: &Palette, selected: bool) -> (Rect, egui::Response) {
         let total_w = self.total_width();
         let (rect, resp) = ui.allocate_exact_size(
-            egui::vec2(total_w, ROW_H),
+            egui::vec2(total_w, self.row_h),
             Sense::click().union(Sense::hover()),
         );
         let painter = ui.painter_at(rect.expand(2.0));
-        if selected {
-            painter.rect_filled(rect, 0.0, pal.accent.gamma_multiply(0.22));
+        // Remember the fill so [`TmTable::heat_cells`] can restore it ON TOP
+        // of its opaque blue band; without that the highlight stopped dead at
+        // the first value column and only the name area lit up on hover.
+        let overlay = if selected {
+            Some(pal.accent.gamma_multiply(0.22))
         } else if resp.hovered() {
-            painter.rect_filled(rect, 0.0, Color32::from_white_alpha(8));
+            Some(row_hover_fill(pal))
+        } else {
+            None
+        };
+        self.row_overlay.set(overlay);
+        if let Some(fill) = overlay {
+            painter.rect_filled(rect, 0.0, fill);
         }
         // Carry the header's column boundaries through the body. Native
         // Task Manager keeps these guides very quiet, but without them wide
@@ -640,6 +669,12 @@ impl TmTable {
         );
     }
 
+    /// Paint the blue value band for the numeric columns starting at `from`.
+    ///
+    /// Every cell is filled, always: intensity only picks a point on the
+    /// [`crate::theme::heat_blue`] gradient, whose floor is `heat_base`. An
+    /// idle process therefore shows a pale blue cell instead of a hole in the
+    /// band -- native Task Manager has no uncolored value cells either.
     pub fn heat_cells(
         &self,
         ui: &egui::Ui,
@@ -647,36 +682,36 @@ impl TmTable {
         row: Rect,
         from: usize,
         cells: &[HeatCell],
-        row_active: bool,
     ) {
-        let span = self.numeric_span(row, from);
         let painter = ui.painter_at(row.expand(2.0));
-        if row_active {
-            painter.rect_filled(span, 0.0, pal.heat_base);
-        }
         for (k, cell_data) in cells.iter().enumerate() {
             let cell = self.col_rect(from + k, row);
-            if row_active && cell_data.intensity >= 1.0 - f32::EPSILON {
-                painter.rect_filled(cell, 0.0, pal.heat_top);
+            painter.rect_filled(cell, 0.0, crate::theme::heat_blue(pal, cell_data.intensity));
+            painter.line_segment(
+                [
+                    Pos2::new(cell.left(), row.top()),
+                    Pos2::new(cell.left(), row.bottom()),
+                ],
+                Stroke::new(1.0, pal.heat_sep),
+            );
+        }
+        // Re-apply the row's selection/hover fill over the band we just
+        // painted, then the value texts on top of that.
+        if let Some(fill) = self.row_overlay.get() {
+            painter.rect_filled(self.numeric_span(row, from), 0.0, fill);
+        }
+        for (k, cell_data) in cells.iter().enumerate() {
+            if cell_data.text.is_empty() {
+                continue;
             }
-            if !cell_data.text.is_empty() {
-                ui.painter_at(cell).text(
-                    Pos2::new(cell.right() - 10.0, cell.center().y),
-                    Align2::RIGHT_CENTER,
-                    &cell_data.text,
-                    FontId::proportional(FONT_ROW),
-                    pal.text,
-                );
-            }
-            if row_active {
-                painter.line_segment(
-                    [
-                        Pos2::new(cell.left(), row.top()),
-                        Pos2::new(cell.left(), row.bottom()),
-                    ],
-                    Stroke::new(1.0, pal.heat_sep),
-                );
-            }
+            let cell = self.col_rect(from + k, row);
+            ui.painter_at(cell).text(
+                Pos2::new(cell.right() - 10.0, cell.center().y),
+                Align2::RIGHT_CENTER,
+                &cell_data.text,
+                FontId::proportional(FONT_ROW),
+                pal.text,
+            );
         }
     }
 
@@ -690,7 +725,7 @@ impl TmTable {
         seed: egui::Id,
     ) -> bool {
         let c = Pos2::new(row.left() + 16.0, row.center().y);
-        let hit = Rect::from_center_size(c, egui::vec2(24.0, ROW_H));
+        let hit = Rect::from_center_size(c, egui::vec2(24.0, self.row_h));
         let resp = ui.interact(hit, seed.with("chev"), Sense::click());
         if enabled {
             let icon = if expanded {
@@ -701,7 +736,8 @@ impl TmTable {
             let mut r = hit;
             r.set_left(c.x - 9.0);
             r.set_right(c.x + 9.0);
-            icons::draw_at(ui, r.shrink2(egui::vec2(0.0, 8.0)), icon, pal.text_dim);
+            let inset = ((self.row_h - 16.0) * 0.5).max(0.0);
+            icons::draw_at(ui, r.shrink2(egui::vec2(0.0, inset)), icon, pal.text_dim);
         }
         resp.clicked()
     }
@@ -713,9 +749,10 @@ impl TmTable {
         tex: Option<&egui::TextureHandle>,
         tint: Color32,
     ) {
+        let side = 18.0f32.min(self.row_h - 6.0);
         let r = Rect::from_center_size(
             Pos2::new(row.left() + 38.0, row.center().y),
-            egui::vec2(18.0, 18.0),
+            egui::vec2(side, side),
         );
         let painter = ui.painter_at(row);
         match tex {
@@ -729,6 +766,16 @@ impl TmTable {
             }
             None => icons::draw_app_window(ui, r, tint),
         }
+    }
+}
+
+/// Hover tint for a table row. Light mode needs a dark wash: a white one
+/// over an already light background is invisible.
+pub fn row_hover_fill(pal: &Palette) -> Color32 {
+    if pal.text.r() > 128 {
+        Color32::from_white_alpha(14)
+    } else {
+        Color32::from_black_alpha(16)
     }
 }
 
@@ -840,6 +887,100 @@ mod tests {
         assert_eq!(restored.col_width(0), 599.0);
         assert_eq!(restored.col_width(1), 250.0);
         assert_eq!(restored.col_width(2), 100.0);
+    }
+
+    /// Paint one body row (selection/hover fill + heat band) and return every
+    /// solid rectangle the frame produced, in paint order.
+    fn heat_row_frame(hover: bool) -> Vec<(Rect, Color32)> {
+        let ctx = egui::Context::default();
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1600.0, 900.0));
+        let table = table();
+        let pal = crate::theme::DARK;
+        let cells = [HeatCell::new(0.0, "0%"), HeatCell::new(1.0, "99%")];
+        let pos = if hover {
+            egui::Pos2::new(500.0, 10.0)
+        } else {
+            egui::Pos2::new(1500.0, 800.0)
+        };
+        // Two frames: egui derives hover from the PREVIOUS frame's widget
+        // rects, so the first pass only registers the row.
+        let mut out = None;
+        for frame in 0..2 {
+            let mut done = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(screen),
+                    time: Some(frame as f64 * 0.016),
+                    events: vec![egui::Event::PointerMoved(pos)],
+                    ..Default::default()
+                },
+                |root| {
+                    egui::CentralPanel::default()
+                        .frame(egui::Frame::NONE)
+                        .show(root, |ui| {
+                            ui.spacing_mut().item_spacing.y = 0.0;
+                            let (rect, _) = table.row(ui, &pal, false);
+                            table.heat_cells(ui, &pal, rect, 1, &cells);
+                        });
+                },
+            );
+            done.textures_delta.clear();
+            out = Some(done);
+        }
+        let out = out.expect("frame");
+        out.shapes
+            .into_iter()
+            .filter_map(|clipped| match clipped.shape {
+                egui::Shape::Rect(r) => Some((r.rect, r.fill)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Regression: the opaque heat band used to be painted AFTER the row
+    /// highlight, so hovering a process lit up only the name area and left
+    /// the blue value columns untouched.
+    #[test]
+    fn hover_highlight_reaches_the_blue_value_columns() {
+        let table = table();
+        let pal = crate::theme::DARK;
+        let hover_fill = row_hover_fill(&pal);
+        let rects = heat_row_frame(true);
+        let numeric_left = table.col_width(0);
+        let painted_over_band = rects
+            .iter()
+            .any(|(rect, fill)| *fill == hover_fill && rect.right() > numeric_left + 1.0);
+        assert!(
+            painted_over_band,
+            "hover fill must be re-applied across the value columns: {rects:?}"
+        );
+        assert!(
+            !heat_row_frame(false)
+                .iter()
+                .any(|(_, fill)| *fill == hover_fill),
+            "an unhovered row must not paint the hover fill at all"
+        );
+    }
+
+    /// Regression: cells whose value was zero were left unpainted, so idle
+    /// processes showed holes in the blue band.
+    #[test]
+    fn every_value_cell_is_painted_even_at_zero() {
+        let pal = crate::theme::DARK;
+        let rects = heat_row_frame(false);
+        for (label, intensity) in [("zero", 0.0f32), ("max", 1.0)] {
+            let want = crate::theme::heat_blue(&pal, intensity);
+            assert!(
+                rects.iter().any(|(_, fill)| *fill == want),
+                "{label}-intensity cell must be filled with {want:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn dense_tables_lay_out_rows_at_the_compact_height() {
+        let dense = table().with_row_height(ROW_H_DENSE);
+        assert_eq!(dense.row_h, ROW_H_DENSE);
+        assert_eq!(table().row_h, ROW_H, "default stays the airy app-list row");
     }
 
     #[test]
