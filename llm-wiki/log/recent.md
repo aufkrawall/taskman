@@ -1,5 +1,28 @@
 # Recent Activity
 
+## 2026-08-31 — real root cause: pipe DACL missing FILE_READ_ATTRIBUTES
+
+Follow-up to the ForeignClient fix: the installed (non-elevated) GUI still
+reported "broker authentication failed". Empirical ACL bisection on self-made
+pipes proved npfs requires `DesiredAccess | SYNCHRONIZE |
+FILE_READ_ATTRIBUTES` for pipe client ends; the broker's user ACE granted
+only `0x00100083`'s predecessor `0x00100003` (no attributes), so every
+non-elevated client was denied at open and elevated ones only worked via the
+Administrators generic-all ACE. Second bug: the client's server-identity
+check opened the LocalSystem service process, which non-elevated tokens
+cannot do, so non-elevated GUIs could never complete the handshake.
+
+Fixes: user ACE + client request now share `USER_PIPE_ACCESS = 0x00100083`
+(data + attributes + synchronize); `verify_pipe_server` falls back to the SCM
+view (pipe server PID == `ServiceStatus.process_id`, configured image ==
+protected path, quotes stripped because windows-service keeps them) when the
+direct image check is denied; the switch action is allowed from elevated
+sessions (user-initiated, elevation inherited intentionally); ForeignClient
+state keeps a secondary Repair button so a newer dev build can still upgrade
+the protected generation. Verified live: non-elevated open + identity + ping
+delivery against the reinstalled service; live test
+`live_service_identity_verifies_without_elevation` added.
+
 ## 2026-08-31 — ForeignClient state: honest GUI↔service connection reporting
 
 User report: the GUI said the core service "does not work" and repair "fails".

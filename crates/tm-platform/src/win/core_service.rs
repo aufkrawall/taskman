@@ -72,6 +72,17 @@ const PIPE_INSTANCE_CAP: u32 = (WORKER_COUNT + WORK_QUEUE_CAP + 1) as u32;
 const MANIFEST_SCHEMA: u32 = 1;
 const CLIENT_REGISTRY_KEY: &str = r"Software\TaskMan";
 const CLIENT_REGISTRY_VALUE: &str = "CoreServiceGui";
+
+/// The pipe access the installing user's ACE grants and the client requests:
+/// FILE_READ_DATA | FILE_WRITE_DATA | FILE_READ_ATTRIBUTES | SYNCHRONIZE.
+/// npfs silently requires FILE_READ_ATTRIBUTES beyond the requested data
+/// rights when opening a pipe client end, so an ACE granting only the data
+/// bits (plus SYNCHRONIZE) denies every client that relies on it — i.e.
+/// every non-elevated GUI, which has no generic/administrator ACE to fall
+/// back on. The user ACE and the client's desired access must both include
+/// the attribute right, and requesting generic rights would additionally
+/// pull in FILE_CREATE_PIPE_INSTANCE, which the user ACE must not grant.
+const USER_PIPE_ACCESS: u32 = 0x0010_0083;
 const INSTALL_SDDL: &str = "O:BAG:BAD:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;GRGX;;;BU)";
 const SERVICE_DATA_SDDL: &str = "O:BAG:BAD:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)";
 
@@ -338,10 +349,11 @@ fn pipe_sddl(authorized_sid: &str) -> Result<String> {
             "authorized user SID is malformed",
         ));
     }
-    // The user ACE deliberately grants only synchronous read/write data, not
+    // The user ACE deliberately grants only synchronous read/write data plus
+    // the attribute right the client end requires, not
     // FILE_CREATE_PIPE_INSTANCE (which generic write would also grant).
     Ok(format!(
-        "D:P(D;;GA;;;NU)(A;;GA;;;SY)(A;;GA;;;BA)(A;;0x00100003;;;{authorized_sid})"
+        "D:P(D;;GA;;;NU)(A;;GA;;;SY)(A;;GA;;;BA)(A;;{USER_PIPE_ACCESS:#08x};;;{authorized_sid})"
     ))
 }
 
@@ -420,11 +432,10 @@ impl BrokerClient {
     fn call(&self, request: BrokerRequest) -> std::result::Result<BrokerValue, BrokerCallError> {
         let mut pipe = open_client_pipe()?;
         let server_pid = server_pid(&pipe)?;
-        let server_path = process_image_path(server_pid)?;
         let expected = expected_installed_service_path().map_err(|error| {
             BrokerCallError::Unavailable(format!("cannot resolve service path: {error}"))
         })?;
-        if !paths_match(&server_path, &expected) {
+        if !verify_pipe_server(server_pid, &expected)? {
             return Err(BrokerCallError::Rejected(
                 "named-pipe server is not the protected TaskMan service".into(),
             ));
@@ -871,11 +882,13 @@ impl PlatformActions for BrokeredActions {
 fn open_client_pipe() -> std::result::Result<File, BrokerCallError> {
     let name = wide(PIPE_NAME);
     let open = || unsafe {
-        // Exact data rights match the user ACE and avoid requesting
-        // FILE_CREATE_PIPE_INSTANCE through GENERIC_WRITE.
+        // Exact rights match the user ACE (data read/write, attributes, and
+        // synchronize) and avoid requesting FILE_CREATE_PIPE_INSTANCE through
+        // GENERIC_WRITE. See USER_PIPE_ACCESS for why the attribute right is
+        // part of the request.
         CreateFileW(
             PCWSTR(name.as_ptr()),
-            0x0010_0003,
+            USER_PIPE_ACCESS,
             FILE_SHARE_MODE(0),
             None,
             OPEN_EXISTING,
@@ -914,6 +927,64 @@ fn server_pid(pipe: &File) -> std::result::Result<u32, BrokerCallError> {
         ));
     }
     Ok(pid)
+}
+
+/// Verify the connected pipe server is the protected service process.
+///
+/// The direct image-path check opens the LocalSystem service process with
+/// PROCESS_QUERY_LIMITED_INFORMATION, which a non-elevated GUI token is
+/// denied — that must degrade, not fail the handshake. On denial the SCM
+/// view is used instead: the pipe server PID must be the PID the SCM
+/// reports for our service, and the service's configured image must be the
+/// protected install path. Both are readable by ordinary users, and
+/// registering a service under our name requires administrator rights, so
+/// an impostor cannot satisfy the pairing without already being admin.
+fn verify_pipe_server(
+    server_pid: u32,
+    expected: &Path,
+) -> std::result::Result<bool, BrokerCallError> {
+    match process_image_path(server_pid) {
+        Ok(server_path) => return Ok(paths_match(&server_path, expected)),
+        Err(BrokerCallError::Rejected(detail)) => {
+            tracing::debug!(
+                server_pid,
+                %detail,
+                "pipe server image check unavailable; verifying through the SCM"
+            );
+        }
+        Err(error) => return Err(error),
+    }
+    use windows_service::service::ServiceAccess;
+    use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
+    let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)
+        .map_err(|error| {
+            BrokerCallError::Unavailable(format!("cannot open service manager: {error}"))
+        })?;
+    let service = manager
+        .open_service(
+            SERVICE_NAME,
+            ServiceAccess::QUERY_STATUS | ServiceAccess::QUERY_CONFIG,
+        )
+        .map_err(|error| {
+            BrokerCallError::Unavailable(format!(
+                "cannot open the core service for identity verification: {error}"
+            ))
+        })?;
+    let status = service.query_status().map_err(|error| {
+        BrokerCallError::Unavailable(format!("cannot query core service status: {error}"))
+    })?;
+    if status.process_id != Some(server_pid) {
+        return Ok(false);
+    }
+    let config = service.query_config().map_err(|error| {
+        BrokerCallError::Unavailable(format!("cannot query core service config: {error}"))
+    })?;
+    // The SCM reports the image path as configured, typically quoted because
+    // it contains spaces. windows-service keeps the quotes; strip them before
+    // comparing paths.
+    let configured = config.executable_path.to_string_lossy();
+    let configured = configured.trim_matches('"');
+    Ok(paths_match(Path::new(configured), expected))
 }
 
 fn client_pid(pipe: &File) -> Result<u32> {
@@ -1523,12 +1594,9 @@ pub fn redirect_to_installed_gui(args: &[String]) -> Result<bool> {
 /// a foreign image pass the broker's client authorization. Returns
 /// `Ok(false)` when there is no installed generation to switch into.
 pub fn relaunch_into_installed_gui(args: &[String]) -> Result<bool> {
-    if super::is_elevated() {
-        return Err(TmError::platform(
-            "core service GUI switch",
-            "an elevated session cannot hand over; the installed GUI would inherit its elevation",
-        ));
-    }
+    // Unlike the startup redirect, an elevated session may switch: this is an
+    // explicit user action, so the installed GUI inheriting the session's
+    // elevation is intended, not silently preserved.
     let installed = expected_installed_gui_path()?;
     if !installed.is_file() || has_reparse_attribute(&installed)? {
         return Ok(false);
@@ -2336,6 +2404,27 @@ mod tests {
     use super::*;
 
     #[test]
+    fn live_service_identity_verifies_without_elevation() {
+        // Live verification against the installed service: skip silently when
+        // the service is not running so offline test runs stay green.
+        let Ok(pipe) = open_client_pipe() else {
+            eprintln!("core service pipe not reachable; skipping");
+            return;
+        };
+        let Ok(server_pid) = server_pid(&pipe) else {
+            eprintln!("no pipe server identity; skipping");
+            return;
+        };
+        drop(pipe);
+        let expected = expected_installed_service_path().unwrap();
+        let verified = verify_pipe_server(server_pid, &expected).expect("identity check failed");
+        assert!(
+            verified,
+            "pipe server {server_pid} is not the registered service"
+        );
+    }
+
+    #[test]
     fn protocol_round_trip_is_bounded_and_versioned() {
         let request = BrokerRequest::KillProcess {
             pid: 101,
@@ -2395,7 +2484,9 @@ mod tests {
     #[test]
     fn pipe_acl_accepts_only_well_formed_sid_text() {
         let sddl = pipe_sddl("S-1-5-21-1-2-3-1001").unwrap();
-        assert!(sddl.contains("0x00100003"));
+        // The user ACE must cover the rights a pipe client end needs (data
+        // read/write, attributes, synchronize); see USER_PIPE_ACCESS.
+        assert!(sddl.contains(&format!("{USER_PIPE_ACCESS:#08x}")));
         assert!(sddl.contains("S-1-5-21-1-2-3-1001"));
         for bad in ["", "S-2-5", "S-1-", "S-1-5S", "S-1-5;GA", "not-a-sid"] {
             assert!(pipe_sddl(bad).is_err(), "accepted {bad}");

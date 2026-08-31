@@ -634,61 +634,36 @@ pub fn settings_dialog(app: &mut TaskManApp, ctx: &egui::Context, _pal: &theme::
                     Some(CoreServiceState::ForeignClient) => K::SwitchToInstalledCoreService,
                     _ => K::RemoveCoreService,
                 };
-                if ui
-                    .add_enabled(supported, egui::Button::new(i18n::tr(button_key)))
-                    .clicked()
-                {
-                    let actions = app.actions.clone();
-                    let inflight = app.core_service_change_inflight.clone();
-                    inflight.store(true, std::sync::atomic::Ordering::Release);
-                    let completion = inflight.clone();
-                    if matches!(core_state.as_ref(), Some(CoreServiceState::ForeignClient)) {
-                        // No reinstall can make a foreign image pass the
-                        // broker's client authorization; hand the session to
-                        // the installed GUI instead.
-                        let args: Vec<String> = std::env::args().skip(1).collect();
-                        let close_ctx = ctx.clone();
-                        let dispatched = app.run_action(
-                            ctx,
-                            || i18n::tr(K::CoreServiceSwitchRequested).to_string(),
-                            move || {
-                                let switched = actions.switch_to_installed_gui(&args)?;
-                                completion.store(false, std::sync::atomic::Ordering::Release);
-                                if switched {
-                                    // Shut down gracefully so on_exit flushes
-                                    // settings and history while the installed
-                                    // replacement waits on the handoff.
-                                    crate::request_programmatic_exit();
-                                    close_ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                                }
-                                Ok(())
-                            },
-                        );
-                        if !dispatched {
-                            inflight.store(false, std::sync::atomic::Ordering::Release);
-                        }
-                    } else {
-                        let dispatched = app.run_action(
-                            ctx,
-                            move || {
-                                i18n::tr(if install {
-                                    K::CoreServiceInstallRequested
-                                } else {
-                                    K::CoreServiceRemoveRequested
-                                })
-                                .to_string()
-                            },
-                            move || {
-                                let outcome = actions.set_core_service_installed(install);
-                                completion.store(false, std::sync::atomic::Ordering::Release);
-                                outcome
-                            },
-                        );
-                        if !dispatched {
-                            inflight.store(false, std::sync::atomic::Ordering::Release);
+                let foreign = matches!(core_state.as_ref(), Some(CoreServiceState::ForeignClient));
+                ui.horizontal(|ui| {
+                    if ui
+                        .add_enabled(supported, egui::Button::new(i18n::tr(button_key)))
+                        .clicked()
+                    {
+                        if foreign {
+                            // No reinstall can make a foreign image pass the
+                            // broker's client authorization; hand the session
+                            // to the installed GUI instead.
+                            dispatch_core_service_switch(app, ctx);
+                        } else {
+                            dispatch_core_service_change(app, ctx, install);
                         }
                     }
-                }
+                    if foreign {
+                        // Repair stays reachable: it is how a newer
+                        // portable/dev build upgrades the protected generation
+                        // before switching.
+                        if ui
+                            .add_enabled(
+                                supported,
+                                egui::Button::new(i18n::tr(K::RepairCoreService)),
+                            )
+                            .clicked()
+                        {
+                            dispatch_core_service_change(app, ctx, true);
+                        }
+                    }
+                });
 
                 ui.add_space(10.0);
                 if let Some(state) = app.task_manager_replacement_state.clone() {
@@ -940,6 +915,62 @@ pub fn run_task_dialog(app: &mut TaskManApp, ctx: &egui::Context, _pal: &theme::
         });
     if !open {
         app.run_dialog_open = false;
+    }
+}
+
+/// Dispatch the core-service install/remove change on an action lane. The
+/// inflight flag disables the buttons until the operation completes.
+fn dispatch_core_service_change(app: &mut TaskManApp, ctx: &egui::Context, install: bool) {
+    let actions = app.actions.clone();
+    let inflight = app.core_service_change_inflight.clone();
+    inflight.store(true, std::sync::atomic::Ordering::Release);
+    let completion = inflight.clone();
+    let dispatched = app.run_action(
+        ctx,
+        move || {
+            i18n::tr(if install {
+                K::CoreServiceInstallRequested
+            } else {
+                K::CoreServiceRemoveRequested
+            })
+            .to_string()
+        },
+        move || {
+            let outcome = actions.set_core_service_installed(install);
+            completion.store(false, std::sync::atomic::Ordering::Release);
+            outcome
+        },
+    );
+    if !dispatched {
+        inflight.store(false, std::sync::atomic::Ordering::Release);
+    }
+}
+
+/// Dispatch the handover to the protected installed GUI. Shutting down
+/// gracefully lets on_exit flush settings and history while the installed
+/// replacement waits on the single-instance handoff.
+fn dispatch_core_service_switch(app: &mut TaskManApp, ctx: &egui::Context) {
+    let actions = app.actions.clone();
+    let inflight = app.core_service_change_inflight.clone();
+    inflight.store(true, std::sync::atomic::Ordering::Release);
+    let completion = inflight.clone();
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let close_ctx = ctx.clone();
+    let dispatched = app.run_action(
+        ctx,
+        || i18n::tr(K::CoreServiceSwitchRequested).to_string(),
+        move || {
+            let switched = actions.switch_to_installed_gui(&args)?;
+            completion.store(false, std::sync::atomic::Ordering::Release);
+            if switched {
+                crate::request_programmatic_exit();
+                close_ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+            Ok(())
+        },
+    );
+    if !dispatched {
+        inflight.store(false, std::sync::atomic::Ordering::Release);
     }
 }
 
