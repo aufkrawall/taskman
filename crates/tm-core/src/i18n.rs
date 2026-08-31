@@ -364,12 +364,16 @@ keys! {
     ],
     CoreServiceDegraded => ["Dienstproblem: {}", "Service problem: {}"],
     CoreServiceForeignClient => [
-        "Der Dienst läuft, aber dieses TaskMan-Programm ist nicht der installierte Client. Der Dienst nimmt es bewusst nicht an; wechsle zur installierten Kopie, um den Dienst zu nutzen.",
-        "The service is running, but this TaskMan executable is not the installed client. The service rejects it by design; switch to the installed copy to use the service."
+        "Der Dienst läuft, aber dieses TaskMan-Programm ist nicht die installierte Kopie — der Dienst akzeptiert nur den geschützten Installationsort, etwa nach einem Neubau oder beim Start aus dem Build-Ordner. 'Reparieren' installiert diese Version, 'Wechseln' startet die installierte Kopie.",
+        "The service is running, but this TaskMan executable is not the installed copy — the service only accepts the protected install location, e.g. after a rebuild or when started from a build folder. 'Repair' installs this build; 'Switch' starts the installed copy."
     ],
     CoreServiceSwitchRequested => [
         "Wechsle zur installierten Kopie…",
         "Switching to the installed copy…"
+    ],
+    CoreServiceRepairSwitchRequested => [
+        "Installiere diese Version; wechsle danach zur installierten Kopie…",
+        "Installing this build; switching to the installed copy afterwards…"
     ],
     InstallCoreService => ["Core-Dienst installieren…", "Install core service…"],
     RepairCoreService => ["Core-Dienst reparieren…", "Repair core service…"],

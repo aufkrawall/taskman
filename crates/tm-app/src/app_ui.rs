@@ -660,7 +660,7 @@ pub fn settings_dialog(app: &mut TaskManApp, ctx: &egui::Context, _pal: &theme::
                             )
                             .clicked()
                         {
-                            dispatch_core_service_change(app, ctx, true);
+                            dispatch_core_service_repair_and_switch(app, ctx);
                         }
                     }
                 });
@@ -939,6 +939,36 @@ fn dispatch_core_service_change(app: &mut TaskManApp, ctx: &egui::Context, insta
             let outcome = actions.set_core_service_installed(install);
             completion.store(false, std::sync::atomic::Ordering::Release);
             outcome
+        },
+    );
+    if !dispatched {
+        inflight.store(false, std::sync::atomic::Ordering::Release);
+    }
+}
+
+/// Dispatch a repair from a foreign session: install this build as the
+/// protected generation, then hand the session over to the installed copy —
+/// the running session's image path stays rejected until it switches, so a
+/// bare repair would leave the user in the same "not the installed client"
+/// state they tried to leave.
+fn dispatch_core_service_repair_and_switch(app: &mut TaskManApp, ctx: &egui::Context) {
+    let actions = app.actions.clone();
+    let inflight = app.core_service_change_inflight.clone();
+    inflight.store(true, std::sync::atomic::Ordering::Release);
+    let completion = inflight.clone();
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let close_ctx = ctx.clone();
+    let dispatched = app.run_action(
+        ctx,
+        || i18n::tr(K::CoreServiceRepairSwitchRequested).to_string(),
+        move || {
+            actions.set_core_service_installed(true)?;
+            if actions.switch_to_installed_gui(&args)? {
+                crate::request_programmatic_exit();
+                close_ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+            completion.store(false, std::sync::atomic::Ordering::Release);
+            Ok(())
         },
     );
     if !dispatched {
