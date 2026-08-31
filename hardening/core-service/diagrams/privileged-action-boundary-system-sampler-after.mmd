@@ -1,0 +1,18 @@
+flowchart LR
+    U[Interactive user] --> GUI[Unelevated TaskMan GUI]
+    GUI -->|snapshot and command IPC| PIPE[Local IPC]
+    PIPE --> SVC[Privileged sampler and action service]
+    SVC -->|system-wide reads| TEL[All-user telemetry]
+    SVC -->|privileged writes| CAP[Process/service controls]
+    SVC --> FILTER[Per-user snapshot filter]
+    FILTER --> PIPE
+
+    subgraph UserSession[User-session trust boundary]
+      GUI
+    end
+    subgraph ServiceBoundary[LocalSystem service boundary]
+      SVC
+      FILTER
+      TEL
+      CAP
+    end

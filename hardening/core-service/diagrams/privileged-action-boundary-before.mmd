@@ -1,0 +1,18 @@
+flowchart LR
+    U[Interactive user] --> GUI[TaskMan GUI]
+    GUI -->|read-only sampling| OS[Windows telemetry APIs]
+    GUI -->|direct control calls| CAP[Privileged process/service controls]
+    GUI -->|UAC re-launch or helper| EGUI[Elevated TaskMan process]
+    EGUI --> CAP
+    CFG[(Per-user config)] <--> GUI
+    WDIR[User-writable launch directory] --> GUI
+
+    subgraph UserSession[User-session trust boundary]
+      GUI
+      CFG
+      WDIR
+    end
+    subgraph ElevatedBoundary[Administrative trust boundary]
+      EGUI
+      CAP
+    end
