@@ -1,5 +1,62 @@
 # Recent Activity
 
+## 2026-08-31 — tray polish, and the fabricated start time behind "no priority"
+
+### Half the process list had no identity
+
+Reported as "the priority tick is missing for some processes". It was 130 of
+261, and the priority was only the visible half of it.
+
+sysinfo reads a process's creation time through a process HANDLE and returns
+**0** when it cannot open one — which unelevated is every svchost, every
+protected service, System, Registry, Secure System. `sampler.rs` stored that
+verbatim as `start_epoch_s = Some(0)`: a fabricated identity that no
+`creation_epoch_from_handle` check can ever match, quietly poisoning every
+PID-reuse guard for those processes. `GetPriorityClass` failed for exactly the
+same set, leaving `PriorityClass::Unknown`.
+
+Both now come from the kernel process table, which reports a creation time AND
+a base priority for every process without opening anything:
+
+- `cpu_load::start_epoch_of` fills a missing start time (and leaves it `None`
+  when even the kernel table has none — never `Some(0)`).
+- `cpu_load::base_priority` + `process_ops::priority_class_from_base` resolve
+  the class from the base priority (4/6/8/10/13/24 → Idle…Realtime, compared
+  as RANGES because a foreground normal process commonly reads 9).
+  `GetPriorityClass` still wins where a handle opens; this is the fallback.
+
+Both accessors read the retained raw table, NOT `LoadSample`: a load sample
+needs two ticks to exist, and the first snapshot is the one the UI shows.
+Result: unknown priorities went 130 → 1 (pid 0, which the kernel table
+excludes by design). `hand_written_offsets_match_the_declared_layout` pins the
+`BasePriority` offset against the `windows` crate's own struct, and
+`unopenable_processes_still_report_an_identity_and_a_priority` pins the
+end-to-end behavior including "no process may carry `Some(0)`".
+
+### The Details tree is now a sort state, not a mode
+
+The flat/tree switch is gone from settings and from the overflow menu's View
+submenu. The tree IS `SortOrder::Hierarchical`, reachable only from the Name
+column: click it a third time. Clicking any other column lands on a plain
+direction, which is what leaves the tree — the user asked for an ordering by
+THAT column, and a tree would keep children pinned under their parents. The
+overflow menu keeps one "Process tree (Name column)" tick as the discoverable
+way in and out.
+
+`details_tree_view` (and the older `process_tree_view`) migrate into
+`details_tree_hierarchical`, and the restore path runs even when no `[sort]`
+entry exists — a migrated config has exactly that shape.
+
+### Tray icon
+
+- A single left click restores the window; double click still works.
+- The notification-area menu follows the app's effective light/dark theme.
+  There is no supported API: Windows themes popup menus from a process-wide
+  preference set by two unnamed uxtheme exports (ordinal 135
+  `SetPreferredAppMode`, 136 `FlushMenuThemes`). muda's `MenuTheme` is not a
+  substitute — it documents itself as affecting a window's menu BAR only.
+  Both lookups fail soft.
+
 ## 2026-08-31 — menus, scroll bars, stale process attributes, hierarchical tree
 
 Four user-reported UI defects, three of which had a shared shape: the fix was

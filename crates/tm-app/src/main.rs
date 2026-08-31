@@ -692,6 +692,7 @@ impl eframe::App for NativeApp {
             }
             if let Some(tray) = &mut self.tray {
                 tray.set_visible(tray_enabled);
+                tray.sync_menu_theme(ui.ctx().theme());
             }
             let close_requested = ui.ctx().input(|input| input.viewport().close_requested());
             if close_requested && PROGRAMMATIC_EXIT.load(std::sync::atomic::Ordering::Acquire) {
@@ -779,10 +780,57 @@ fn poll_show_event_fallback(ctx: &eframe::egui::Context) {
     ctx.request_repaint_after(std::time::Duration::from_millis(250));
 }
 
+/// Make Win32 popup menus (the notification-area menu is one) follow a
+/// light or dark theme.
+///
+/// There is no supported API for this. Windows themes menus from a
+/// PROCESS-wide preference that Explorer sets through two undocumented
+/// uxtheme exports available by ordinal only: 135 `SetPreferredAppMode` and
+/// 136 `FlushMenuThemes`. muda's `MenuTheme` is no substitute — it documents
+/// itself as affecting the menu BAR of a window, not popup or context menus.
+///
+/// Everything here fails soft: a missing export or an older Windows simply
+/// leaves the menu in its default (light) colors.
+#[cfg(target_os = "windows")]
+fn set_popup_menu_theme(dark: bool) {
+    use windows::Win32::Foundation::{FARPROC, HMODULE};
+    use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
+    use windows::core::{PCSTR, w};
+
+    /// `PreferredAppMode`: 0 Default, 1 AllowDark, 2 ForceDark, 3 ForceLight.
+    /// Force rather than allow, because the app's own theme setting may
+    /// deliberately disagree with the system one.
+    const FORCE_DARK: i32 = 2;
+    const FORCE_LIGHT: i32 = 3;
+
+    static UXTHEME: std::sync::OnceLock<Option<(usize, usize)>> = std::sync::OnceLock::new();
+    let exports = *UXTHEME.get_or_init(|| unsafe {
+        let module: HMODULE = LoadLibraryW(w!("uxtheme.dll")).ok()?;
+        // Ordinals, not names: these two are exported without names.
+        let by_ordinal = |ordinal: u16| -> FARPROC {
+            GetProcAddress(module, PCSTR(ordinal as usize as *const u8))
+        };
+        let set_mode = by_ordinal(135)? as usize;
+        let flush = by_ordinal(136)? as usize;
+        Some((set_mode, flush))
+    });
+    let Some((set_mode, flush)) = exports else {
+        return;
+    };
+    unsafe {
+        let set_preferred_app_mode: extern "system" fn(i32) -> i32 = std::mem::transmute(set_mode);
+        let flush_menu_themes: extern "system" fn() = std::mem::transmute(flush);
+        set_preferred_app_mode(if dark { FORCE_DARK } else { FORCE_LIGHT });
+        flush_menu_themes();
+    }
+}
+
 #[cfg(target_os = "windows")]
 struct TrayShell {
     icon: tray_icon::TrayIcon,
     visible: bool,
+    /// Theme the popup menu is currently themed for; `None` until applied.
+    menu_dark: Option<bool>,
 }
 
 #[cfg(target_os = "windows")]
@@ -798,7 +846,23 @@ impl TrayShell {
                 },
             ));
             tray_icon::TrayIconEvent::set_event_handler(Some(|event: tray_icon::TrayIconEvent| {
-                if matches!(event, tray_icon::TrayIconEvent::DoubleClick { .. }) {
+                // A SINGLE left click restores the window, like every other
+                // notification-area icon on Windows. Double click keeps
+                // working (it also emits two Click events, and reopening an
+                // already open window is a no-op). The right button belongs
+                // to the context menu, so it is deliberately not matched.
+                let opens = matches!(
+                    event,
+                    tray_icon::TrayIconEvent::Click {
+                        button: tray_icon::MouseButton::Left,
+                        button_state: tray_icon::MouseButtonState::Up,
+                        ..
+                    } | tray_icon::TrayIconEvent::DoubleClick {
+                        button: tray_icon::MouseButton::Left,
+                        ..
+                    }
+                );
+                if opens {
                     signal_tray(TRAY_ACTION_OPEN);
                 }
             }));
@@ -842,6 +906,7 @@ impl TrayShell {
                 Some(Self {
                     icon,
                     visible: false,
+                    menu_dark: None,
                 })
             }
             Err(error) => {
@@ -859,6 +924,17 @@ impl TrayShell {
             Ok(()) => self.visible = visible,
             Err(error) => tracing::warn!(%error, visible, "cannot update tray visibility"),
         }
+    }
+
+    /// Keep the notification-area menu on the app's effective theme, which
+    /// follows Windows unless the user pinned light or dark in settings.
+    fn sync_menu_theme(&mut self, theme: eframe::egui::Theme) {
+        let dark = theme == eframe::egui::Theme::Dark;
+        if self.menu_dark == Some(dark) {
+            return;
+        }
+        set_popup_menu_theme(dark);
+        self.menu_dark = Some(dark);
     }
 }
 

@@ -439,24 +439,6 @@ pub fn settings_dialog(app: &mut TaskManApp, ctx: &egui::Context, _pal: &theme::
             });
 
             ui.add_space(10.0);
-            ui.label(i18n::tr(K::DetailsViewLabel));
-            ui.horizontal(|ui| {
-                for (tree, key) in [(false, K::FlatView), (true, K::ProcessTreeView)] {
-                    if ui
-                        .selectable_label(
-                            app.shared.settings.details_tree_view == tree,
-                            i18n::tr(key),
-                        )
-                        .clicked()
-                    {
-                        app.shared.settings.details_tree_view = tree;
-                        app.details_state.invalidate();
-                        app.save_settings();
-                    }
-                }
-            });
-
-            ui.add_space(10.0);
             ui.label(i18n::tr(K::TextSmoothingLabel));
             ui.horizontal(|ui| {
                 for (mode, key) in [

@@ -13,6 +13,20 @@ diagnostics; remaining telemetry and accessibility work is itemized precisely
 in `known-debt.md`. Normal GUI startup remains unelevated; privileged controls
 can cross a protected, allowlisted service boundary after one explicit install.
 
+## Recently landed (2026-08-31 — identity/priority fallback, tray, tree sort)
+
+- `start_epoch_s` is never a fabricated `Some(0)` any more: sysinfo returns 0
+  whenever it cannot open a process handle (half the list unelevated), so the
+  kernel process table fills it instead. The same table supplies a base
+  priority, which resolves the priority class for every process no handle can
+  be opened for — unknown priorities went from 130/261 to 1 (pid 0).
+- The Details process tree is no longer a mode. It IS the Name column's third
+  sort state; clicking any other column leaves it and sorts purely by that
+  column. `details_tree_view` migrated into `details_tree_hierarchical`.
+- Tray: a single left click restores the window, and the notification-area
+  menu follows the app's light/dark theme (undocumented uxtheme ordinals 135
+  and 136 — the only way Windows themes popup menus).
+
 ## Recently landed (2026-08-31 — menu/scroll-bar/tree polish)
 
 - Context menus are drawn by `widgets/menu.rs`: uniform 28 px full-width rows

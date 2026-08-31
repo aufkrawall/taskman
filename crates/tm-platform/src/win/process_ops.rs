@@ -467,6 +467,32 @@ pub fn priority_class_of(pid: u32) -> PriorityClass {
     }
 }
 
+/// Derive the priority class from the process BASE PRIORITY the kernel
+/// reports in `SystemProcessInformation`.
+///
+/// This is the fallback for every process that refuses `OpenProcess` —
+/// System, Registry, Secure System, csrss, smss and every protected
+/// (PPL/anti-malware) service. `GetPriorityClass` cannot see those at all, so
+/// without this their priority stayed permanently "Unknown": the Details
+/// column showed "—" and the context menu ticked nothing. System Informer
+/// resolves them exactly this way.
+///
+/// The comparisons are RANGES, not equalities: the class base priorities are
+/// 4/6/8/10/13/24, but a process whose threads were individually adjusted can
+/// report an intermediate value (a foreground normal process commonly reads
+/// 9), and that must still resolve to the enclosing class.
+pub fn priority_class_from_base(base_priority: i32) -> PriorityClass {
+    match base_priority {
+        b if b <= 0 => PriorityClass::Unknown,
+        b if b >= 24 => PriorityClass::Realtime,
+        b if b >= 13 => PriorityClass::High,
+        b if b >= 10 => PriorityClass::AboveNormal,
+        b if b >= 8 => PriorityClass::Normal,
+        b if b >= 6 => PriorityClass::BelowNormal,
+        _ => PriorityClass::Low,
+    }
+}
+
 /// Full command line via ntdll!NtQueryInformationProcess with
 /// ProcessCommandLineInformation (windows-rs PROCESSINFOCLASS = 60, verified
 /// against this machine's ntdll — older references claiming class 92 do not
@@ -1435,6 +1461,37 @@ mod tests {
             take_changed_attrs().is_empty(),
             "a drained invalidation must not repeat"
         );
+    }
+
+    /// Every class base priority must map back to its own class, the
+    /// in-between values must resolve to the enclosing class (a foreground
+    /// normal process commonly reports 9), and a missing value must stay
+    /// Unknown rather than being reported as Idle.
+    #[test]
+    fn base_priority_maps_to_the_enclosing_priority_class() {
+        use PriorityClass::*;
+        for (base, expected) in [
+            (0, Unknown),
+            (-1, Unknown),
+            (4, Low),
+            (5, Low),
+            (6, BelowNormal),
+            (7, BelowNormal),
+            (8, Normal),
+            (9, Normal),
+            (10, AboveNormal),
+            (12, AboveNormal),
+            (13, High),
+            (23, High),
+            (24, Realtime),
+            (31, Realtime),
+        ] {
+            assert_eq!(
+                priority_class_from_base(base),
+                expected,
+                "base priority {base}"
+            );
+        }
     }
 
     #[test]

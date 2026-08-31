@@ -117,17 +117,19 @@ impl ColumnId {
 
 /// Order the Details list is presented in.
 ///
-/// The tree has a third state that no column sort can express: children
-/// strictly under their parent in creation order, with no alphabetical (or
-/// any other) reordering at all. System Informer reaches it by clicking the
-/// sorted column a THIRD time, and so do we — the two-way toggle alone left
-/// the tree as a mix of hierarchy and alphabet.
+/// The Name column has a third state that no direction flag can express:
+/// children strictly under their parent in creation order, with no
+/// alphabetical (or any other) reordering at all. That state IS the process
+/// tree — there is no separate tree switch. System Informer works the same
+/// way: click Name until the arrow disappears and the hierarchy appears, and
+/// click any other column to leave it and sort by that column alone.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SortOrder {
     Ascending,
     Descending,
-    /// No column sort at all — pure hierarchy. Tree view only; a flat list
-    /// has no hierarchy to fall back to, so it never enters this state.
+    /// No column sort at all — the literal parent/child tree. Reachable only
+    /// from [`ColumnId::Name`]; every other column is a plain flat list, so
+    /// clicking one leaves the tree.
     Hierarchical,
 }
 
@@ -149,8 +151,9 @@ impl SortOrder {
     }
 
     /// Next state when the user clicks the column that is ALREADY sorted.
-    fn next(self, tree: bool) -> Self {
-        match (self, tree) {
+    /// `offers_hierarchy` is true only for the Name column.
+    fn next(self, offers_hierarchy: bool) -> Self {
+        match (self, offers_hierarchy) {
             (SortOrder::Ascending, _) => SortOrder::Descending,
             (SortOrder::Descending, true) => SortOrder::Hierarchical,
             (SortOrder::Descending, false) => SortOrder::Ascending,
@@ -158,10 +161,16 @@ impl SortOrder {
         }
     }
 
-    /// Persisted form. Stored beside the sort column so a restored session
-    /// comes back in the same order the user left it in.
-    pub fn from_saved(ascending: bool, hierarchical: bool) -> Self {
-        match (hierarchical, ascending) {
+    /// Whether `cid` can reach [`SortOrder::Hierarchical`] at all.
+    fn offered_by(cid: ColumnId) -> bool {
+        cid == ColumnId::Name
+    }
+
+    /// Persisted form. The hierarchy flag is only honored for the column
+    /// that can produce it, so a hand-edited config cannot leave the table
+    /// unsorted under, say, the CPU column.
+    pub fn from_saved(cid: ColumnId, ascending: bool, hierarchical: bool) -> Self {
+        match (hierarchical && Self::offered_by(cid), ascending) {
             (true, _) => SortOrder::Hierarchical,
             (false, true) => SortOrder::Ascending,
             (false, false) => SortOrder::Descending,
@@ -647,30 +656,31 @@ impl State {
         self.invalidate();
     }
 
-    pub fn apply_saved_sort(&mut self, column: &str, order: SortOrder) {
+    pub fn apply_saved_sort(&mut self, column: &str, ascending: bool, hierarchical: bool) {
         if let Some(cid) = cid_from_id(column)
             && self.visible.contains(&cid)
         {
             self.sort_col = cid;
-            self.sort_order = order;
+            self.sort_order = SortOrder::from_saved(cid, ascending, hierarchical);
             self.invalidate();
         }
     }
 
-    /// Switch between the flat list and the tree. Hierarchical order only
-    /// exists in the tree, so leaving it must not strand the flat list with
-    /// an unsorted, arbitrary process order.
-    pub fn set_tree(&mut self, tree: bool) {
-        if !tree && self.sort_order == SortOrder::Hierarchical {
-            self.sort_order = SortOrder::Ascending;
-        }
-        self.invalidate();
+    /// Whether the page currently shows the parent/child tree. There is no
+    /// separate switch: the tree IS the Name column's third sort state.
+    pub fn is_tree(&self) -> bool {
+        self.sort_order == SortOrder::Hierarchical
     }
 
     /// Apply a header click on `cid` and report the resulting order.
-    pub fn clicked_column(&mut self, cid: ColumnId, tree: bool) -> SortOrder {
+    ///
+    /// Clicking any column other than Name always lands on a plain
+    /// direction, which is what leaves the tree: the user asked for an
+    /// ordering by THAT column, and a tree would keep children pinned under
+    /// parents instead.
+    pub fn clicked_column(&mut self, cid: ColumnId) -> SortOrder {
         if self.sort_col == cid {
-            self.sort_order = self.sort_order.next(tree);
+            self.sort_order = self.sort_order.next(SortOrder::offered_by(cid));
         } else {
             self.sort_col = cid;
             self.sort_order = if cid_is_numeric(cid) {
@@ -705,7 +715,7 @@ impl Default for State {
 }
 
 pub struct Cache {
-    pub key: (u64, u64, String, ColumnId, SortOrder, bool, u64),
+    pub key: (u64, u64, String, ColumnId, SortOrder, u64),
     pub rows: Vec<Row>,
 }
 
@@ -803,43 +813,25 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
             }
         },
         |app, ui| {
-            menu::submenu(ui, i18n::tr(K::ViewMode), |ui| {
-                for (tree, key) in [(false, K::FlatView), (true, K::ProcessTreeView)] {
-                    let current = app.shared.settings.details_tree_view == tree;
-                    if menu::check(ui, i18n::tr(key), current).clicked() {
-                        app.shared.settings.details_tree_view = tree;
-                        app.details_state.set_tree(tree);
-                        app.save_settings();
-                        // `set_tree` can drop the hierarchical order; persist
-                        // the result so a restart does not resurrect it.
-                        let (sort_col, order) =
-                            (app.details_state.sort_col, app.details_state.sort_order);
-                        persist_sort_pref(app, sort_col, order);
-                        ui.close();
-                    }
-                }
-                if app.shared.settings.details_tree_view {
-                    menu::separator(ui);
-                    // The tree's third order: no column sort at all, children
-                    // strictly under their parent in creation order — System
-                    // Informer's default, reachable there by clicking the
-                    // sorted column a third time (which we also do).
-                    let hierarchical = app.details_state.sort_order == SortOrder::Hierarchical;
-                    if menu::check(ui, i18n::tr(K::HierarchicalOrder), hierarchical).clicked() {
-                        let next = if hierarchical {
-                            SortOrder::Ascending
-                        } else {
-                            SortOrder::Hierarchical
-                        };
-                        app.details_state.sort_order = next;
-                        app.details_state.invalidate();
-                        let sort_col = app.details_state.sort_col;
-                        persist_sort_pref(app, sort_col, next);
-                        ui.close();
-                    }
-                }
-            });
-            if app.shared.settings.details_tree_view {
+            // The process tree has no switch of its own: it is the Name
+            // column's third sort state. This entry is the discoverable way
+            // in and out of it, and it names the gesture so the header click
+            // does not have to be guessed.
+            let hierarchical = app.details_state.is_tree();
+            if menu::check(ui, i18n::tr(K::ProcessTreeView), hierarchical).clicked() {
+                let order = if hierarchical {
+                    app.details_state.sort_col = ColumnId::Name;
+                    SortOrder::Ascending
+                } else {
+                    app.details_state.sort_col = ColumnId::Name;
+                    SortOrder::Hierarchical
+                };
+                app.details_state.sort_order = order;
+                app.details_state.invalidate();
+                persist_sort_pref(app, ColumnId::Name, order);
+                ui.close();
+            }
+            if app.details_state.is_tree() {
                 if menu::item(ui, i18n::tr(K::ExpandAll)).clicked() {
                     app.details_state.collapsed.clear();
                     app.details_state.view_generation =
@@ -912,7 +904,6 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
         effective_search(app),
         app.details_state.sort_col,
         app.details_state.sort_order,
-        app.shared.settings.details_tree_view,
         app.details_state.view_generation,
     );
     let mut cache = app.details_state.cache.take();
@@ -920,14 +911,7 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
     if stale {
         cache = Some(Cache {
             key: key.clone(),
-            rows: build_rows(
-                &snap,
-                &key.2,
-                key.3,
-                key.4,
-                key.5,
-                &app.details_state.collapsed,
-            ),
+            rows: build_rows(&snap, &key.2, key.3, key.4, &app.details_state.collapsed),
         });
     }
     let rows = &cache.as_ref().expect("cache").rows;
@@ -1074,8 +1058,7 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
         && let Some(spec) = visible_cols.get(display_idx)
     {
         let cid = spec.cid;
-        let tree = app.shared.settings.details_tree_view;
-        let order = app.details_state.clicked_column(cid, tree);
+        let order = app.details_state.clicked_column(cid);
         persist_sort_pref(app, cid, order);
     }
     app.persist_table(&table);
@@ -1110,7 +1093,7 @@ fn handle_keyboard_navigation(app: &mut TaskManApp, ctx: &egui::Context, rows: &
         select_detail_row(app, row);
     }
 
-    if !app.shared.settings.details_tree_view || ctx.egui_wants_keyboard_input() {
+    if !app.details_state.is_tree() || ctx.egui_wants_keyboard_input() {
         return;
     }
     let (left, right) = ctx.input(|input| {
@@ -1350,19 +1333,17 @@ fn build_rows(
     raw_search: &str,
     sort_col: ColumnId,
     order: SortOrder,
-    tree: bool,
     collapsed: &HashSet<u32>,
 ) -> Vec<Row> {
     let q = search::Query::new(raw_search);
-    if !tree {
+    // The tree is not a mode: it is exactly the Name column's unsorted
+    // state. Any other order is a plain flat list.
+    if order != SortOrder::Hierarchical {
         let mut list: Vec<&ProcessEntry> = snap
             .processes
             .iter()
             .filter(|process| !process.synthetic && q.matches_process(process))
             .collect();
-        // A flat list has no hierarchy to fall back to, so
-        // [`SortOrder::Hierarchical`] cannot reach it (`State::set_tree`);
-        // if it ever did, creation order is still a defined order.
         sort_processes(&mut list, sort_col, order);
         return list
             .into_iter()
@@ -1685,7 +1666,7 @@ pub fn context_menu(app: &mut TaskManApp, ui: &mut egui::Ui, p: &ProcessEntry, h
     menu::title(ui, p.shown_name());
     menu::separator(ui);
 
-    if app.shared.settings.details_tree_view && has_children {
+    if app.details_state.is_tree() && has_children {
         let expanded = app.details_state.is_expanded(p.pid);
         let label = if expanded {
             i18n::tr(K::Collapse)
@@ -2313,8 +2294,7 @@ mod tests {
                 &snapshot,
                 "",
                 ColumnId::Name,
-                SortOrder::Ascending,
-                true,
+                SortOrder::Hierarchical,
                 &collapsed,
             )
             .iter()
@@ -2338,8 +2318,7 @@ mod tests {
             &tree_snapshot(vec![recycled, child]),
             "",
             ColumnId::Name,
-            SortOrder::Ascending,
-            true,
+            SortOrder::Hierarchical,
             &HashSet::new(),
         );
         assert_eq!(
@@ -2359,8 +2338,7 @@ mod tests {
             &tree_snapshot(vec![parent, child]),
             "",
             ColumnId::Name,
-            SortOrder::Ascending,
-            true,
+            SortOrder::Hierarchical,
             &HashSet::new(),
         );
         assert_eq!(
@@ -2383,8 +2361,7 @@ mod tests {
             &snapshot,
             "needle",
             ColumnId::Name,
-            SortOrder::Ascending,
-            true,
+            SortOrder::Hierarchical,
             &HashSet::new(),
         );
         assert_eq!(
@@ -2403,8 +2380,7 @@ mod tests {
             &cyclic,
             "",
             ColumnId::Name,
-            SortOrder::Ascending,
-            true,
+            SortOrder::Hierarchical,
             &HashSet::new(),
         );
         let unique = rows.iter().map(|row| row.pid).collect::<HashSet<_>>();
@@ -2412,78 +2388,98 @@ mod tests {
         assert_eq!(unique, HashSet::from([30, 31]));
     }
 
-    /// The tree's third order must be a LITERAL hierarchy: the sort column is
-    /// ignored entirely and siblings appear in creation order. Sorting by
-    /// Name on the same snapshot must produce a different sibling order —
-    /// otherwise "hierarchical" is just the alphabet again, which is exactly
-    /// the mixed form this replaced.
+    /// The Name column's third state must be a LITERAL hierarchy: the sort
+    /// column is ignored entirely and siblings appear in creation order. The
+    /// other two states are plain FLAT lists — that is what "clicking a
+    /// column leaves the tree" means, and it is why the same snapshot must
+    /// come out in three visibly different orders.
     #[test]
-    fn hierarchical_order_ignores_the_sort_column() {
+    fn hierarchical_order_is_a_tree_and_every_other_order_is_flat() {
         let mut root = tree_process(10, None, "root.exe");
         root.start_epoch_s = Some(1);
-        // Children created in the order zulu, alpha — the reverse of the
-        // alphabet, so the two orders cannot accidentally agree.
+        // Children created zulu-then-alpha — the reverse of the alphabet, so
+        // creation order and name order cannot accidentally agree.
         let mut zulu = tree_process(11, Some(10), "zulu.exe");
         zulu.start_epoch_s = Some(2);
         let mut alpha = tree_process(12, Some(10), "alpha.exe");
         alpha.start_epoch_s = Some(3);
         let snapshot = tree_snapshot(vec![root, alpha, zulu]);
 
-        let pids = |order| {
-            build_rows(&snapshot, "", ColumnId::Name, order, true, &HashSet::new())
+        let rows = |col, order| {
+            build_rows(&snapshot, "", col, order, &HashSet::new())
                 .iter()
-                .map(|row| row.pid)
+                .map(|row| (row.pid, row.depth))
                 .collect::<Vec<_>>()
         };
         assert_eq!(
-            pids(SortOrder::Hierarchical),
-            [10, 11, 12],
-            "hierarchical order must follow creation, not the alphabet"
+            rows(ColumnId::Name, SortOrder::Hierarchical),
+            [(10, 0), (11, 1), (12, 1)],
+            "hierarchical order must nest and follow creation, not the alphabet"
         );
-        assert_eq!(pids(SortOrder::Ascending), [10, 12, 11]);
-        assert_eq!(pids(SortOrder::Descending), [10, 11, 12]);
+        assert_eq!(
+            rows(ColumnId::Name, SortOrder::Ascending),
+            [(12, 0), (10, 0), (11, 0)],
+            "name ascending is a flat alphabetical list"
+        );
+        assert_eq!(
+            rows(ColumnId::Name, SortOrder::Descending),
+            [(11, 0), (10, 0), (12, 0)]
+        );
+        // Sorting by another column is flat too: the busiest process must be
+        // able to reach the top instead of staying pinned under its parent.
+        assert!(
+            rows(ColumnId::Pid, SortOrder::Descending)
+                .iter()
+                .all(|(_, depth)| *depth == 0),
+            "a non-Name column must never render a tree"
+        );
     }
 
-    /// Clicking the sorted column cycles ascending -> descending -> hierarchy
-    /// in the tree (System Informer), but stays a two-way toggle in the flat
-    /// list, which has no hierarchy to fall back to.
+    /// Clicking Name cycles ascending -> descending -> hierarchy; clicking
+    /// any other column is a plain two-way toggle AND leaves the tree, so the
+    /// ordering is purely by that column.
     #[test]
-    fn tree_sort_cycles_through_the_hierarchical_state() {
+    fn only_the_name_column_reaches_the_hierarchical_state() {
         let mut s = State::default();
         assert_eq!(s.sort_order, SortOrder::Ascending);
-        assert_eq!(
-            s.clicked_column(ColumnId::Name, true),
-            SortOrder::Descending
-        );
-        assert_eq!(
-            s.clicked_column(ColumnId::Name, true),
-            SortOrder::Hierarchical
-        );
-        assert_eq!(s.clicked_column(ColumnId::Name, true), SortOrder::Ascending);
+        assert_eq!(s.clicked_column(ColumnId::Name), SortOrder::Descending);
+        assert_eq!(s.clicked_column(ColumnId::Name), SortOrder::Hierarchical);
+        assert!(s.is_tree());
+        assert_eq!(s.clicked_column(ColumnId::Name), SortOrder::Ascending);
+        assert!(!s.is_tree());
 
-        // Flat list: never enters the hierarchical state.
-        let mut f = State::default();
-        assert_eq!(
-            f.clicked_column(ColumnId::Name, false),
-            SortOrder::Descending
-        );
-        assert_eq!(
-            f.clicked_column(ColumnId::Name, false),
-            SortOrder::Ascending
-        );
+        // Any other column: two-way only, never a tree.
+        let mut n = State::default();
+        assert_eq!(n.clicked_column(ColumnId::Cpu), SortOrder::Descending);
+        assert_eq!(n.clicked_column(ColumnId::Cpu), SortOrder::Ascending);
+        assert_eq!(n.clicked_column(ColumnId::Cpu), SortOrder::Descending);
+        assert!(!n.is_tree());
 
-        // Leaving the tree must not strand the flat list unsorted.
+        // Leaving the tree by clicking a different column.
         let mut t = State {
+            sort_col: ColumnId::Name,
             sort_order: SortOrder::Hierarchical,
             ..State::default()
         };
-        t.set_tree(false);
-        assert_eq!(t.sort_order, SortOrder::Ascending);
+        assert_eq!(t.clicked_column(ColumnId::Cpu), SortOrder::Descending);
+        assert!(!t.is_tree(), "clicking CPU must leave the tree");
+        assert_eq!(t.sort_col, ColumnId::Cpu);
 
         // No column is sorted in the hierarchical state, so no header arrow.
         assert_eq!(SortOrder::Hierarchical.arrow(), None);
         assert_eq!(SortOrder::Ascending.arrow(), Some(true));
         assert_eq!(SortOrder::Descending.arrow(), Some(false));
+
+        // A persisted hierarchy flag under a column that cannot produce it
+        // (hand-edited config) degrades to a normal direction.
+        assert_eq!(
+            SortOrder::from_saved(ColumnId::Cpu, false, true),
+            SortOrder::Descending
+        );
+        assert_eq!(
+            SortOrder::from_saved(ColumnId::Name, true, true),
+            SortOrder::Hierarchical
+        );
     }
 
     #[test]
@@ -2491,7 +2487,7 @@ mod tests {
         let mut state = State::default();
         state.set_visible(ColumnId::Cpu, false);
         let fallback = state.sort_col;
-        state.apply_saved_sort("cpu", SortOrder::Descending);
+        state.apply_saved_sort("cpu", false, false);
         assert_eq!(state.sort_col, fallback);
         assert!(state.visible.contains(&state.sort_col));
     }

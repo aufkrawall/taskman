@@ -3,6 +3,68 @@
 
 use tm_core::model::*;
 
+/// Half the process list is unopenable for an unelevated session, and
+/// everything sysinfo reads through a process HANDLE fails for those: the
+/// creation time came back as a fabricated `Some(0)` and the priority class
+/// as `Unknown`. Both now come from the kernel process table instead, which
+/// reports them for every process — including pid 4, which can never be
+/// opened on any machine.
+#[test]
+fn unopenable_processes_still_report_an_identity_and_a_priority() {
+    let mut collector = tm_platform::create_collector();
+    // The very first snapshot must already be right: the UI shows it.
+    let snapshot = collector.sample(std::time::Instant::now()).expect("tick");
+
+    let system = snapshot
+        .processes
+        .iter()
+        .find(|p| p.pid == 4)
+        .expect("the System process is always present");
+    assert_ne!(
+        system.priority,
+        PriorityClass::Unknown,
+        "pid 4 must resolve through the kernel base priority"
+    );
+    // The ordinary path must not have regressed: our own process opens fine,
+    // so its class still comes from GetPriorityClass.
+    let me = std::process::id();
+    let own = snapshot
+        .processes
+        .iter()
+        .find(|p| p.pid == me)
+        .expect("own process present");
+    assert_ne!(own.priority, PriorityClass::Unknown);
+
+    // A start time of 0 is not a process identity, it is a failed query
+    // wearing one — no handle check can ever match it.
+    for p in &snapshot.processes {
+        assert_ne!(
+            p.start_epoch_s,
+            Some(0),
+            "pid {} ({}) carries a fabricated start time",
+            p.pid,
+            p.name
+        );
+    }
+
+    // pid 0 (the idle pseudo-process) is absent from the kernel table by
+    // design and stays honestly unknown; a handful of processes may be born
+    // between the two enumerations. Anything beyond that means the fallback
+    // stopped working.
+    let unknown: Vec<&str> = snapshot
+        .processes
+        .iter()
+        .filter(|p| !p.synthetic && p.pid != 0 && p.priority == PriorityClass::Unknown)
+        .map(|p| p.name.as_str())
+        .collect();
+    assert!(
+        unknown.len() <= 3,
+        "{} of {} processes have no priority class: {unknown:?}",
+        unknown.len(),
+        snapshot.processes.len()
+    );
+}
+
 #[test]
 fn sample_produces_sane_snapshot() {
     let mut collector = tm_platform::create_collector();
