@@ -176,15 +176,29 @@ pub fn install_visuals(ctx: &egui::Context) {
             style.visuals.menu_corner_radius = CornerRadius::same(8);
             style.spacing.item_spacing = egui::vec2(8.0, 6.0);
             style.spacing.button_padding = egui::vec2(10.0, 4.0);
-            // Win11-style overlay scroll bars: always visible as a thin
-            // handle, expanding on hover, floating ABOVE the content without
-            // reserving layout space — this keeps the table header and body
-            // column layouts pixel-aligned whether or not a bar is shown.
+            // Win11-style scroll bars: a thin idle handle that expands on
+            // hover — but with their full lane RESERVED, never painted over
+            // the content.
+            //
+            // `floating` here means "draw like an overlay bar" (thin handle,
+            // hover expansion, foreground color). `floating_allocated_width`
+            // is what decides whether the bar costs layout space: at 0 the
+            // bar sits INSIDE the viewport and covers the last ~14 px of
+            // every row, card and dialog it belongs to. Reserving the full
+            // bar width (`bar_width` + `bar_outer_margin`) moves it just
+            // outside the content rect, so nothing is ever occluded and the
+            // handle still animates within its own lane.
+            //
+            // Do NOT "simplify" this to `floating: false`. egui decides
+            // whether a bar is needed against the OUTER rect for floating
+            // bars and against the shrunken INNER rect for solid ones — with
+            // solid bars, content whose height depends on its width (wrapped
+            // labels) can flip the bar on and off every frame.
             style.spacing.scroll = egui::style::ScrollStyle {
                 floating: true,
                 bar_width: 12.0,
                 floating_width: 5.0,
-                floating_allocated_width: 0.0,
+                floating_allocated_width: 14.0,
                 bar_inner_margin: 2.0,
                 bar_outer_margin: 2.0,
                 foreground_color: true,

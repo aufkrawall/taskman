@@ -13,6 +13,22 @@ diagnostics; remaining telemetry and accessibility work is itemized precisely
 in `known-debt.md`. Normal GUI startup remains unelevated; privileged controls
 can cross a protected, allowlisted service boundary after one explicit install.
 
+## Recently landed (2026-08-31 — menu/scroll-bar/tree polish)
+
+- Context menus are drawn by `widgets/menu.rs`: uniform 28 px full-width rows
+  with no gaps, a painted check gutter instead of checkbox widgets, and
+  submenus in the same style. Every tab's menus and the `…` overflow menus go
+  through it.
+- Scroll bars reserve their lane (`floating_allocated_width`) instead of
+  painting over the last ~14 px of content. `tablekit` mirrors the body's
+  reservation onto the header so the two stay aligned.
+- Priority / efficiency-mode / UAC-virtualization changes now invalidate the
+  sampler's per-PID attribute cache and refresh AFTER the action lands, so the
+  menu stops showing the old value for up to ten seconds.
+- The Details tree gained a third sort state: a third click on the sorted
+  column (or View ▸ Strict hierarchy) drops the column sort and orders
+  siblings by creation time — a literal hierarchy, like System Informer.
+
 ## Recently landed (2026-08-31 — per-process network without elevation)
 
 - Broker protocol v2 adds one read-only `ProcessNetworkCounters` request. The

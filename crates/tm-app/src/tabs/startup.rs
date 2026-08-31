@@ -12,6 +12,7 @@ use tm_core::model::{StartupImpact, StartupItem};
 use crate::app::TaskManApp;
 use crate::icons::Icon;
 use crate::theme;
+use crate::widgets::menu;
 use crate::widgets::tablekit::{self, TmColumn};
 
 fn columns() -> Vec<TmColumn> {
@@ -111,7 +112,7 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
             }
         },
         |app, ui| {
-            if ui.button(i18n::tr(K::RefreshNow)).clicked() {
+            if menu::item(ui, i18n::tr(K::RefreshNow)).clicked() {
                 *tm_core::sync::lock(&app.shared.startup_cache) = None;
                 app.refresh_all();
                 ui.close();
@@ -246,7 +247,7 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
                 if resp.clicked() {
                     app.selected_startup_id = Some(item.id.clone());
                 }
-                resp.context_menu(|ui| {
+                menu::context_menu(&resp, |ui| {
                     ui.set_min_width(180.0);
                     let ctx = ui.ctx().clone();
                     let label = if item.enabled {
@@ -254,7 +255,7 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
                     } else {
                         i18n::tr(K::EnableCmd)
                     };
-                    if ui.button(label).clicked() {
+                    if menu::item(ui, label).clicked() {
                         let new_enabled = !item.enabled;
                         let id = item.id.clone();
                         let location = item.location.clone();
@@ -275,18 +276,18 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
                         }
                         ui.close();
                     }
-                    if ui.button(i18n::tr(K::Properties)).clicked() {
+                    if menu::item(ui, i18n::tr(K::Properties)).clicked() {
                         app.startup_props = Some(item.clone());
                         ui.close();
                     }
-                    if ui.button(i18n::tr(K::OnlineSearch)).clicked() {
+                    if menu::item(ui, i18n::tr(K::OnlineSearch)).clicked() {
                         let url = crate::search::online_search_url(&item.name);
                         if let Err(e) = app.actions.open_url(&url) {
                             app.shared.toast(i18n::trf(K::ErrMsg, &[&e.to_string()]));
                         }
                         ui.close();
                     }
-                    if ui.button(i18n::tr(K::OpenFileLocation)).clicked()
+                    if menu::item(ui, i18n::tr(K::OpenFileLocation)).clicked()
                         && let Some(exe) = exe_from_command(&item.command)
                         && let Err(e) = app.actions.open_file_location(&exe)
                     {

@@ -489,6 +489,15 @@ impl Sampler {
             self.attrs.retain(|pid, _| alive.contains(pid));
         }
 
+        // Drop cached attributes for processes WE just changed. Priority,
+        // EcoQoS and UAC virtualization otherwise stay stale for the rest of
+        // [`ATTR_REFRESH_TTL`], which is what made a context-menu priority
+        // change take up to ten seconds to show up (and made the immediate
+        // post-action refresh re-read the cache instead of the process).
+        for pid in process_ops::take_changed_attrs() {
+            self.attrs.remove(&pid);
+        }
+
         let mut processes: Vec<ProcessEntry> = Vec::with_capacity(n_procs);
 
         for (pid, p) in self.sys.processes() {

@@ -774,6 +774,44 @@ pub fn suspend_process_checked(
     }
 }
 
+// -------------------------------------------------- attribute-cache invalidation
+
+/// PIDs whose slow-changing attributes we have just changed ourselves.
+///
+/// [`crate::win::sampler`] caches priority, EcoQoS and UAC virtualization per
+/// PID behind a multi-second TTL, so without this a control action stayed
+/// invisible for the rest of that TTL: the context menu the user had just
+/// used kept ticking the OLD priority, and an out-of-band refresh re-read the
+/// cache instead of the process. Recording the PID here makes the very next
+/// sample query it natively again.
+static CHANGED_ATTRS: std::sync::Mutex<Vec<u32>> = std::sync::Mutex::new(Vec::new());
+/// Lock-free fast path: the sampler asks once per tick and almost always
+/// finds nothing.
+static CHANGED_ANY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Record that `pid`'s cached attributes are stale. Cheap and infallible;
+/// a poisoned lock only means one refresh is skipped, never a failed action.
+pub fn note_attrs_changed(pid: u32) {
+    if let Ok(mut pending) = CHANGED_ATTRS.lock() {
+        if !pending.contains(&pid) {
+            pending.push(pid);
+        }
+        CHANGED_ANY.store(true, std::sync::atomic::Ordering::Release);
+    }
+}
+
+/// Take every PID recorded since the last call.
+pub fn take_changed_attrs() -> Vec<u32> {
+    use std::sync::atomic::Ordering;
+    if !CHANGED_ANY.swap(false, Ordering::AcqRel) {
+        return Vec::new();
+    }
+    match CHANGED_ATTRS.lock() {
+        Ok(mut pending) => std::mem::take(&mut *pending),
+        Err(_) => Vec::new(),
+    }
+}
+
 // ------------------------------------------------------------------ priority / affinity
 
 pub fn set_priority(pid: u32, priority: PriorityClass) -> Result<()> {
@@ -800,6 +838,9 @@ pub fn set_priority_checked(
         let r = th::SetPriorityClass(h, unmap_priority(priority))
             .map_err(|e| TmError::platform("SetPriorityClass", e.to_string()));
         let _ = CloseHandle(h);
+        if r.is_ok() {
+            note_attrs_changed(pid);
+        }
         r
     }
 }
@@ -912,6 +953,9 @@ pub fn set_efficiency_mode_checked(
         )
         .map_err(|e| TmError::platform("SetProcessInformation(EcoQoS)", e.to_string()));
         let _ = CloseHandle(h);
+        if r.is_ok() {
+            note_attrs_changed(pid);
+        }
         r
     }
 }
@@ -1094,6 +1138,9 @@ pub fn set_uac_virtualization_checked(
             let _ = CloseHandle(token);
         }
         let _ = CloseHandle(process);
+        if result.is_ok() {
+            note_attrs_changed(pid);
+        }
         result
     }
 }
@@ -1369,6 +1416,25 @@ mod tests {
         assert!(!creation_matches(100, Some(101)));
         assert!(!creation_matches(i64::MIN, Some(i64::MAX)));
         assert!(!creation_matches(100, None));
+    }
+
+    /// The sampler caches per-PID attributes behind a multi-second TTL, so a
+    /// control action must be able to punch a hole in it. Draining is
+    /// destructive (each recorded PID is reported exactly once) and the
+    /// empty case must stay allocation-free — it runs on every sample tick.
+    #[test]
+    fn changed_attrs_are_recorded_once_and_drained_exactly_once() {
+        assert!(take_changed_attrs().is_empty(), "starts clean");
+        note_attrs_changed(4242);
+        note_attrs_changed(4242);
+        note_attrs_changed(99);
+        let mut taken = take_changed_attrs();
+        taken.sort_unstable();
+        assert_eq!(taken, [99, 4242], "each pid recorded once");
+        assert!(
+            take_changed_attrs().is_empty(),
+            "a drained invalidation must not repeat"
+        );
     }
 
     #[test]
