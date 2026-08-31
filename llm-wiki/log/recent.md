@@ -1,5 +1,41 @@
 # Recent Activity
 
+## 2026-08-31 — per-process network via ETW
+
+Implemented on request, replacing the honest-but-empty "—" column.
+`win/net_etw.rs` runs a private real-time ETW session on
+`Microsoft-Windows-Kernel-Network` and accumulates the `size` field of the
+TCP/UDP data events per PID.
+
+Details that matter:
+- **The PID comes from the event PAYLOAD, not `EventHeader.ProcessId`.**
+  Kernel network events fire in arbitrary (usually System) context, so the
+  header PID is not the traffic owner. All eight data events — TCP/UDP ×
+  v4/v6 × sent/received — begin with `PID: u32, size: u32`, and that prefix is
+  the only thing parsed.
+- Only the *data* event ids (10/26/42/58 sent, 11/27/43/59 received) are
+  counted. Connect/disconnect/retransmit/ACK events are ignored, or
+  retransmitted bytes would be billed twice.
+- **Administrator rights are required** to start an ETW session. Without them
+  the monitor stays inactive and every process keeps `None`, which renders as
+  "—" — never a fabricated zero. Availability is all-or-nothing and pinned by
+  `per_process_network_is_unknown_or_measured_never_fabricated`. A failed
+  start is remembered so an unelevated session does not retry a
+  permanently-denied API every tick.
+- Demand-gated on `TelemetryDemand::PROCESS_NET` (the bit was already
+  reserved): the session runs only while Processes or App History is on
+  screen, and `Drop` stops it and joins the consumer thread.
+- Rates are deltas of cumulative counters over the tick interval, keyed by
+  `(pid, start_epoch_s)` so a recycled PID cannot inherit a dead process's
+  totals; the map is pruned to live PIDs each tick to bound memory.
+
+Verified elevated against live traffic — EpicGamesLauncher/python/claude all
+attributed with sane recv/sent, and the two ends of a localhost pair showing
+mirrored counters. Measured overhead with the session running: 4.0 % of one
+core vs ~3 % without it. The Network cells now explain themselves on hover
+when unavailable ("needs administrator rights") instead of showing a bare
+dash.
+
 ## 2026-08-31 — text rendering limits, graphics mode, and two measured findings
 
 ### ClearType is not reachable from this side (measured, not assumed)

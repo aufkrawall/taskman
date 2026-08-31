@@ -809,6 +809,12 @@ impl TaskManApp {
     /// changes (implement.md §6.3). Cheap: one atomic command on change.
     fn update_demand(&mut self) {
         let mut d = TelemetryDemand::core(); // core + adapter rates + tokens
+        // The Processes and App History pages both show per-process network,
+        // which is an ETW session on Windows — only keep it running while one
+        // of those pages is actually on screen.
+        if matches!(self.tab, Tab::Processes | Tab::AppHistory) {
+            d = d.union(TelemetryDemand::PROCESS_NET);
+        }
         match self.tab {
             Tab::Performance => {
                 d = d
