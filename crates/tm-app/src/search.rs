@@ -72,6 +72,81 @@ pub fn list_initial(ctx: &egui::Context) -> Option<char> {
     })
 }
 
+/// Keyboard movement understood by virtualized list/table pages.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ListNav {
+    Previous,
+    Next,
+    First,
+    Last,
+    PageUp,
+    PageDown,
+}
+
+/// Return one unmodified list-navigation key while no text editor owns
+/// keyboard focus. This keeps arrows/Delete available to the search box and
+/// dialogs whenever they are actually editing text.
+pub fn list_nav(ctx: &egui::Context) -> Option<ListNav> {
+    if ctx.egui_wants_keyboard_input() {
+        return None;
+    }
+    ctx.input(|i| {
+        if i.modifiers.alt || i.modifiers.ctrl || i.modifiers.command || i.modifiers.shift {
+            return None;
+        }
+        [
+            (egui::Key::ArrowUp, ListNav::Previous),
+            (egui::Key::ArrowDown, ListNav::Next),
+            (egui::Key::Home, ListNav::First),
+            (egui::Key::End, ListNav::Last),
+            (egui::Key::PageUp, ListNav::PageUp),
+            (egui::Key::PageDown, ListNav::PageDown),
+        ]
+        .into_iter()
+        .find_map(|(key, nav)| i.key_pressed(key).then_some(nav))
+    })
+}
+
+/// Move a selected index through a list. No selection starts at the nearest
+/// edge for the requested direction; page movement uses a caller-supplied
+/// visible-row estimate and always clamps to a valid entry.
+pub fn moved_index(
+    len: usize,
+    current: Option<usize>,
+    nav: ListNav,
+    page_rows: usize,
+) -> Option<usize> {
+    if len == 0 {
+        return None;
+    }
+    let last = len - 1;
+    let page = page_rows.max(1);
+    Some(match nav {
+        ListNav::Previous => current.unwrap_or(0).saturating_sub(1),
+        ListNav::Next => current.map_or(0, |i| (i + 1).min(last)),
+        ListNav::First => 0,
+        ListNav::Last => last,
+        ListNav::PageUp => current.unwrap_or(0).saturating_sub(page),
+        ListNav::PageDown => current.map_or(0, |i| (i + page).min(last)),
+    })
+}
+
+/// URL for the context-menu "Search online" action. Kept here so every tab
+/// uses the same UTF-8 percent encoding instead of hand-rolling variants.
+pub fn online_search_url(term: &str) -> String {
+    let mut encoded = String::with_capacity(term.len());
+    for &b in term.as_bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                encoded.push(b as char);
+            }
+            b' ' => encoded.push('+'),
+            _ => encoded.push_str(&format!("%{b:02X}")),
+        }
+    }
+    format!("https://www.bing.com/search?q={encoded}")
+}
+
 /// Find the next displayed entry whose name starts with `initial`. If the
 /// current selection is one of the matches, repeated presses cycle and wrap;
 /// otherwise the first match is selected. The iterator order is therefore the
@@ -172,5 +247,24 @@ mod tests {
         assert_eq!(cycle_match(rows, Some("disk0"), 'd'), Some("disk0"));
         assert_eq!(cycle_match(rows, Some("gpu0"), 'd'), Some("disk0"));
         assert_eq!(cycle_match(rows, None, 'x'), None);
+    }
+
+    #[test]
+    fn list_navigation_clamps_and_pages() {
+        assert_eq!(moved_index(0, None, ListNav::Next, 10), None);
+        assert_eq!(moved_index(20, None, ListNav::Next, 10), Some(0));
+        assert_eq!(moved_index(20, Some(0), ListNav::Previous, 10), Some(0));
+        assert_eq!(moved_index(20, Some(7), ListNav::PageDown, 10), Some(17));
+        assert_eq!(moved_index(20, Some(17), ListNav::PageDown, 10), Some(19));
+        assert_eq!(moved_index(20, Some(17), ListNav::First, 10), Some(0));
+        assert_eq!(moved_index(20, Some(1), ListNav::Last, 10), Some(19));
+    }
+
+    #[test]
+    fn online_search_url_encodes_utf8_and_reserved_bytes() {
+        assert_eq!(
+            online_search_url("A&B ä"),
+            "https://www.bing.com/search?q=A%26B+%C3%A4"
+        );
     }
 }

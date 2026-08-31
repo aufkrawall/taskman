@@ -204,7 +204,16 @@ pub struct NetworkInfo {
     /// Negotiated link speed in bits/s (0 = unknown).
     pub link_bps: u64,
     /// SSID for Wi-Fi adapters when discoverable.
+    #[serde(default)]
     pub ssid: Option<String>,
+    /// Preferred unicast addresses for the adapter when discoverable.
+    #[serde(default)]
+    pub ipv4: Option<String>,
+    #[serde(default)]
+    pub ipv6: Option<String>,
+    /// Native WLAN signal quality in percent (0–100).
+    #[serde(default)]
+    pub signal_quality_pct: Option<u32>,
 }
 
 // ---------------------------------------------------------------- GPU

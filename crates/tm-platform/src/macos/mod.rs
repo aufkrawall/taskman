@@ -159,6 +159,9 @@ impl SystemCollector for MacCollector {
                 total_sent_bytes: sent_total,
                 link_bps: 0,
                 ssid: None,
+                ipv4: None,
+                ipv6: None,
+                signal_quality_pct: None,
             });
         }
         self.prev_net_totals = nets
@@ -282,6 +285,8 @@ impl PlatformActions for MacActions {
             efficiency_mode: false,
             run_new_task: true,
             per_process_network: false,
+            process_modules: false,
+            unload_module: false,
         }
     }
 

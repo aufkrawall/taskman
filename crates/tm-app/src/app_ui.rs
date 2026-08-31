@@ -337,7 +337,10 @@ pub fn settings_dialog(app: &mut TaskManApp, ctx: &egui::Context, _pal: &theme::
     egui::Window::new(i18n::tr(K::Settings))
         .open(&mut open)
         .collapsible(false)
-        .resizable(false)
+        .resizable(true)
+        .default_size([420.0, 640.0])
+        .min_size([400.0, 360.0])
+        .vscroll(true)
         .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
         .show(ctx, |ui| {
             ui.set_width(380.0);
@@ -410,6 +413,41 @@ pub fn settings_dialog(app: &mut TaskManApp, ctx: &egui::Context, _pal: &theme::
                             i18n::tr(K::WindowTitle).to_string(),
                         ));
                         app.shared.settings.save();
+                    }
+                }
+            });
+
+            ui.add_space(10.0);
+            ui.label(i18n::tr(K::DefaultStartPageLabel));
+            ui.horizontal_wrapped(|ui| {
+                for tab in crate::app::Tab::ALL {
+                    if ui
+                        .selectable_label(
+                            app.shared.settings.default_start_page == tab.key(),
+                            tab.label(),
+                        )
+                        .clicked()
+                    {
+                        app.shared.settings.default_start_page = tab.key().to_string();
+                        app.save_settings();
+                    }
+                }
+            });
+
+            ui.add_space(10.0);
+            ui.label(i18n::tr(K::ProcessViewLabel));
+            ui.horizontal(|ui| {
+                for (tree, key) in [(false, K::GroupedView), (true, K::ProcessTreeView)] {
+                    if ui
+                        .selectable_label(
+                            app.shared.settings.process_tree_view == tree,
+                            i18n::tr(key),
+                        )
+                        .clicked()
+                    {
+                        app.shared.settings.process_tree_view = tree;
+                        app.processes_state.invalidate();
+                        app.save_settings();
                     }
                 }
             });
@@ -588,6 +626,11 @@ pub fn settings_dialog(app: &mut TaskManApp, ctx: &egui::Context, _pal: &theme::
             ui.add_space(14.0);
             ui.separator();
             ui.horizontal(|ui| {
+                if ui.button(i18n::tr(K::ResetColWidths)).clicked() {
+                    app.shared.settings.col_widths.clear();
+                    app.save_settings();
+                    app.shared.toast(i18n::tr(K::ColWidthsResetToast));
+                }
                 if ui.button(i18n::tr(K::Reset)).clicked() {
                     let defaults = Settings::default();
                     apply_theme(ctx, defaults.theme);
@@ -613,6 +656,54 @@ pub fn settings_dialog(app: &mut TaskManApp, ctx: &egui::Context, _pal: &theme::
         });
     if !open {
         app.show_settings = false;
+    }
+}
+
+/// Confirmation shown only for the Delete-key process shortcut. Toolbar and
+/// context-menu termination retain their native one-click behavior.
+pub fn process_end_dialog(app: &mut TaskManApp, ctx: &egui::Context) {
+    let Some(pending) = app.pending_process_end.clone() else {
+        return;
+    };
+    let mut open = true;
+    let mut decision = ctx.input(|input| {
+        if input.key_pressed(egui::Key::Escape) {
+            Some(false)
+        } else if input.key_pressed(egui::Key::Enter) {
+            Some(true)
+        } else {
+            None
+        }
+    });
+    egui::Window::new(i18n::tr(K::EndTask))
+        .open(&mut open)
+        .collapsible(false)
+        .resizable(false)
+        .anchor(Align2::CENTER_CENTER, [0.0, -40.0])
+        .show(ctx, |ui| {
+            ui.set_width(430.0);
+            ui.label(i18n::trf(
+                K::EndProcessConfirm,
+                &[&pending.name, &pending.identity.pid.to_string()],
+            ));
+            ui.add_space(10.0);
+            ui.horizontal(|ui| {
+                if ui.button(i18n::tr(K::Cancel)).clicked() {
+                    decision = Some(false);
+                }
+                if ui.button(i18n::tr(K::EndTask)).clicked() {
+                    decision = Some(true);
+                }
+            });
+        });
+    if !open {
+        decision = Some(false);
+    }
+    if let Some(confirm) = decision {
+        app.pending_process_end = None;
+        if confirm {
+            app.end_process_identity(ctx, pending.identity, pending.tree, pending.name);
+        }
     }
 }
 

@@ -171,6 +171,8 @@ impl PlatformActions for WinActions {
             efficiency_mode: true,
             run_new_task: true,
             per_process_network: false,
+            process_modules: true,
+            unload_module: true,
         }
     }
 
@@ -221,6 +223,22 @@ impl PlatformActions for WinActions {
     fn set_efficiency_mode(&self, pid: u32, on: bool) -> Result<()> {
         process_ops::set_efficiency_mode(pid, on)
     }
+    fn list_process_modules(
+        &self,
+        pid: u32,
+        expected_start_epoch_s: Option<i64>,
+    ) -> Result<Vec<ProcessModule>> {
+        process_ops::list_process_modules(pid, expected_start_epoch_s)
+    }
+    fn unload_process_module(
+        &self,
+        pid: u32,
+        expected_start_epoch_s: Option<i64>,
+        base_address: u64,
+        expected_path: &str,
+    ) -> Result<()> {
+        process_ops::unload_process_module(pid, expected_start_epoch_s, base_address, expected_path)
+    }
     fn is_elevated(&self) -> bool {
         process_ops::is_elevated()
     }
@@ -261,8 +279,13 @@ impl PlatformActions for WinActions {
         )
     }
 
-    fn create_dump_file(&self, pid: u32, path: &std::path::Path) -> Result<()> {
-        process_ops::create_dump_file(pid, path)
+    fn create_dump_file(
+        &self,
+        pid: u32,
+        expected_start_epoch_s: Option<i64>,
+        path: &std::path::Path,
+    ) -> Result<()> {
+        process_ops::create_dump_file(pid, expected_start_epoch_s, path)
     }
     fn open_file_location(&self, path: &str) -> Result<()> {
         process_ops::open_file_location(path)

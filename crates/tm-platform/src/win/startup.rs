@@ -56,12 +56,13 @@ pub fn list_startup() -> Vec<StartupItem> {
             let enabled = approved
                 .get(&name)
                 .is_none_or(|data| data.first().is_some_and(|b| b & 1 == 0));
+            let publisher = resolve_publisher(&command);
             out.push(StartupItem {
                 id: format!("reg:{}:{}", loc.label, name),
                 name,
                 command,
                 location: loc.label.to_string(),
-                publisher: None,
+                publisher,
                 enabled,
                 // Audit §13: native TM shows "None" for disabled items — a
                 // disabled app cannot have been measured at all. Real

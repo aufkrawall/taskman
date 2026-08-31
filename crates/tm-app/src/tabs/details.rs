@@ -37,6 +37,14 @@ pub enum ColumnId {
     PeakMemory,
     GpuDedicated,
     GpuShared,
+    Description,
+    Publisher,
+    ParentPid,
+    SessionId,
+    ImagePath,
+    PageFaults,
+    IoRead,
+    IoWrite,
     CommandLine,
 }
 
@@ -70,6 +78,20 @@ impl ColumnId {
             ColumnId::PeakMemory => a.peak_mem_bytes.cmp(&b.peak_mem_bytes),
             ColumnId::GpuDedicated => a.gpu_dedicated_bytes.cmp(&b.gpu_dedicated_bytes),
             ColumnId::GpuShared => a.gpu_shared_bytes.cmp(&b.gpu_shared_bytes),
+            ColumnId::Description => cmp_option_str(
+                a.description.as_deref().or(Some(a.display.as_str())),
+                b.description.as_deref().or(Some(b.display.as_str())),
+            ),
+            ColumnId::Publisher => cmp_option_str(a.company.as_deref(), b.company.as_deref()),
+            ColumnId::ParentPid => a.ppid.cmp(&b.ppid),
+            ColumnId::SessionId => a.session_id.cmp(&b.session_id),
+            ColumnId::ImagePath => cmp_option_str(
+                a.exe_path.as_ref().and_then(|path| path.to_str()),
+                b.exe_path.as_ref().and_then(|path| path.to_str()),
+            ),
+            ColumnId::PageFaults => a.page_faults_per_s.cmp(&b.page_faults_per_s),
+            ColumnId::IoRead => a.disk_read_total.cmp(&b.disk_read_total),
+            ColumnId::IoWrite => a.disk_write_total.cmp(&b.disk_write_total),
             ColumnId::CommandLine => {
                 cmp_option_str(a.command_line.as_deref(), b.command_line.as_deref())
             }
@@ -163,6 +185,14 @@ impl ColSpec {
             ColumnId::PeakMemory => "Peak working set",
             ColumnId::GpuDedicated => "Dedicated GPU memory",
             ColumnId::GpuShared => "Shared GPU memory",
+            ColumnId::Description => i18n::tr(K::ColDescription),
+            ColumnId::Publisher => i18n::tr(K::ColPublisher),
+            ColumnId::ParentPid => i18n::tr(K::ColParentPid),
+            ColumnId::SessionId => i18n::tr(K::ColSessionId),
+            ColumnId::ImagePath => i18n::tr(K::ColImagePath),
+            ColumnId::PageFaults => i18n::tr(K::ColPageFaults),
+            ColumnId::IoRead => i18n::tr(K::ColIoRead),
+            ColumnId::IoWrite => i18n::tr(K::ColIoWrite),
             ColumnId::CommandLine => "Command line",
         }
     }
@@ -262,6 +292,46 @@ const COLUMNS: &[ColSpec] = &[
     ColSpec {
         cid: ColumnId::GpuShared,
         col: || TmColumn::num("gpushared", "Shared GPU memory", 155.0),
+        default_visible: false,
+    },
+    ColSpec {
+        cid: ColumnId::Description,
+        col: || TmColumn::text("description", i18n::tr(K::ColDescription), 260.0),
+        default_visible: false,
+    },
+    ColSpec {
+        cid: ColumnId::Publisher,
+        col: || TmColumn::text("publisher", i18n::tr(K::ColPublisher), 220.0),
+        default_visible: false,
+    },
+    ColSpec {
+        cid: ColumnId::ParentPid,
+        col: || TmColumn::num("ppid", i18n::tr(K::ColParentPid), 110.0),
+        default_visible: false,
+    },
+    ColSpec {
+        cid: ColumnId::SessionId,
+        col: || TmColumn::num("session", i18n::tr(K::ColSessionId), 100.0),
+        default_visible: false,
+    },
+    ColSpec {
+        cid: ColumnId::ImagePath,
+        col: || TmColumn::text("imagepath", i18n::tr(K::ColImagePath), 360.0),
+        default_visible: false,
+    },
+    ColSpec {
+        cid: ColumnId::PageFaults,
+        col: || TmColumn::num("pagefaults", i18n::tr(K::ColPageFaults), 120.0),
+        default_visible: false,
+    },
+    ColSpec {
+        cid: ColumnId::IoRead,
+        col: || TmColumn::num("ioread", i18n::tr(K::ColIoRead), 145.0),
+        default_visible: false,
+    },
+    ColSpec {
+        cid: ColumnId::IoWrite,
+        col: || TmColumn::num("iowrite", i18n::tr(K::ColIoWrite), 155.0),
         default_visible: false,
     },
     ColSpec {
@@ -535,6 +605,14 @@ pub struct Row {
     pub peak_mem_s: String,
     pub gpu_dedicated_s: String,
     pub gpu_shared_s: String,
+    pub description_s: String,
+    pub publisher_s: String,
+    pub ppid_s: String,
+    pub session_id_s: String,
+    pub image_path_s: String,
+    pub page_faults_s: String,
+    pub io_read_s: String,
+    pub io_write_s: String,
     pub command_line_s: String,
 }
 
@@ -560,6 +638,14 @@ impl Row {
             ColumnId::PeakMemory => &self.peak_mem_s,
             ColumnId::GpuDedicated => &self.gpu_dedicated_s,
             ColumnId::GpuShared => &self.gpu_shared_s,
+            ColumnId::Description => &self.description_s,
+            ColumnId::Publisher => &self.publisher_s,
+            ColumnId::ParentPid => &self.ppid_s,
+            ColumnId::SessionId => &self.session_id_s,
+            ColumnId::ImagePath => &self.image_path_s,
+            ColumnId::PageFaults => &self.page_faults_s,
+            ColumnId::IoRead => &self.io_read_s,
+            ColumnId::IoWrite => &self.io_write_s,
             ColumnId::CommandLine => &self.command_line_s,
         }
     }
@@ -657,6 +743,25 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
             selected,
             initial,
         ) && let Some(row) = rows.iter().find(|row| row.pid == pid)
+        {
+            app.selected_process = Some(crate::app::ProcessIdentity {
+                pid: row.pid,
+                start_epoch_s: row.start_epoch_s,
+            });
+            app.scroll_to_pid = Some(row.pid);
+        }
+    }
+
+    if let Some(nav) = search::list_nav(ui.ctx()) {
+        let current = app
+            .selected_process
+            .as_ref()
+            .and_then(|selected| rows.iter().position(|row| row.pid == selected.pid));
+        let page_rows = (ui.ctx().content_rect().height() / tablekit::ROW_H)
+            .floor()
+            .max(1.0) as usize;
+        if let Some(index) = search::moved_index(rows.len(), current, nav, page_rows)
+            && let Some(row) = rows.get(index)
         {
             app.selected_process = Some(crate::app::ProcessIdentity {
                 pid: row.pid,
@@ -933,6 +1038,11 @@ fn cid_is_numeric(cid: ColumnId) -> bool {
             | ColumnId::PeakMemory
             | ColumnId::GpuDedicated
             | ColumnId::GpuShared
+            | ColumnId::ParentPid
+            | ColumnId::SessionId
+            | ColumnId::PageFaults
+            | ColumnId::IoRead
+            | ColumnId::IoWrite
     )
 }
 
@@ -970,7 +1080,7 @@ fn build_rows(
     let mut list: Vec<&ProcessEntry> = snap
         .processes
         .iter()
-        .filter(|p| q.matches_process(p))
+        .filter(|p| !p.synthetic && q.matches_process(p))
         .collect();
 
     list.sort_by(|a, b| {
@@ -1042,6 +1152,32 @@ fn build_rows(
                 peak_mem_s: opt_u64_bytes(p.peak_mem_bytes),
                 gpu_dedicated_s: opt_u64_bytes(p.gpu_dedicated_bytes),
                 gpu_shared_s: opt_u64_bytes(p.gpu_shared_bytes),
+                description_s: p
+                    .description
+                    .as_ref()
+                    .filter(|value| !value.trim().is_empty())
+                    .cloned()
+                    .unwrap_or_else(|| p.display.clone()),
+                publisher_s: p.company.clone().unwrap_or_else(|| "—".into()),
+                ppid_s: p
+                    .ppid
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "—".into()),
+                session_id_s: p
+                    .session_id
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "—".into()),
+                image_path_s: p
+                    .exe_path
+                    .as_ref()
+                    .map(|path| path.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "—".into()),
+                page_faults_s: p
+                    .page_faults_per_s
+                    .map(|value| format::format_thousands(value.into()))
+                    .unwrap_or_else(|| "—".into()),
+                io_read_s: format::format_bytes_loc(p.disk_read_total),
+                io_write_s: format::format_bytes_loc(p.disk_write_total),
                 command_line_s: p.command_line.clone().unwrap_or_else(|| "—".into()),
             }
         })
@@ -1053,10 +1189,10 @@ fn build_rows(
 /// The rendered row can be stale — especially while sampling is paused — so
 /// re-check the start time against the latest snapshot before dispatching.
 fn identity_still_live(app: &TaskManApp, p: &ProcessEntry) -> bool {
-    app.latest_snapshot()
-        .as_ref()
-        .and_then(|s| s.process(p.pid))
-        .is_none_or(|live| live.start_epoch_s.is_none() || live.start_epoch_s == p.start_epoch_s)
+    app.identity_is_live(&crate::app::ProcessIdentity {
+        pid: p.pid,
+        start_epoch_s: p.start_epoch_s,
+    })
 }
 
 /// Context menu mirroring the Win11 TM Details tab.
@@ -1069,6 +1205,18 @@ pub fn context_menu(app: &mut TaskManApp, ui: &mut egui::Ui, p: &ProcessEntry) {
     if ui.button(i18n::tr(K::CopyName)).clicked() {
         ui.ctx().copy_text(p.shown_name().to_string());
         app.shared.toast(i18n::tr(K::Copied));
+        ui.close();
+    }
+    if ui.button(i18n::tr(K::OnlineSearch)).clicked() {
+        let url = search::online_search_url(p.shown_name());
+        if let Err(error) = app.actions.open_url(&url) {
+            app.shared
+                .toast(i18n::trf(K::ErrMsg, &[&error.to_string()]));
+        }
+        ui.close();
+    }
+    if app.actions.capabilities().process_modules && ui.button(i18n::tr(K::ViewModules)).clicked() {
+        crate::tabs::modules::open(app, p, &ctx);
         ui.close();
     }
     if ui.button(i18n::tr(K::EndTask)).clicked() {
@@ -1207,46 +1355,56 @@ fn end_process(
     tree: bool,
     name: &str,
 ) {
-    let live_ok = app
-        .latest_snapshot()
-        .as_ref()
-        .and_then(|s| s.process(pid))
-        .is_none_or(|p| p.start_epoch_s.is_none() || p.start_epoch_s == start);
-    if !live_ok {
-        app.shared.toast(i18n::tr(K::ProcessExited));
-        return;
-    }
-    let actions = app.actions.clone();
-    let msg_name = name.to_string();
-    app.run_action(
+    app.end_process_identity(
         ctx,
-        move || {
-            if tree {
-                i18n::trf(K::TreeOfEndedToast, &[&msg_name])
-            } else {
-                i18n::trf(K::NameEndedToast, &[&msg_name])
-            }
+        crate::app::ProcessIdentity {
+            pid,
+            start_epoch_s: start,
         },
-        move || actions.kill_process(pid, start, tree),
+        tree,
+        name.to_string(),
     );
 }
 
-fn create_dump(app: &mut TaskManApp, ctx: &egui::Context, p: &ProcessEntry) {
+pub(crate) fn create_dump(app: &mut TaskManApp, ctx: &egui::Context, p: &ProcessEntry) {
+    if !identity_still_live(app, p) {
+        app.shared.toast(i18n::tr(K::ProcessExited));
+        return;
+    }
+    if !app.shared.dump_write.begin() {
+        app.shared.toast(i18n::tr(K::DumpAlreadyRunning));
+        return;
+    }
     let default_name = format!("{}.dmp", p.shown_name());
     let Some(path) = rfd::FileDialog::new()
         .set_file_name(&default_name)
         .save_file()
     else {
+        app.shared.dump_write.end();
         return;
     };
     let actions = app.actions.clone();
     let pid = p.pid;
-    let path_s = path.clone();
-    app.run_action(
-        ctx,
-        move || i18n::trf(K::DumpWrittenMsg, &[&path_s.to_string_lossy()]),
-        move || actions.create_dump_file(pid, &path),
-    );
+    let start = p.start_epoch_s;
+    let path_s = path.to_string_lossy().into_owned();
+    let toasts = app.shared.toasts.clone();
+    let in_flight = app.shared.dump_write.clone();
+    let wake = ctx.clone();
+    let spawned = std::thread::Builder::new()
+        .name("tm-dump".into())
+        .spawn(move || {
+            let message = match actions.create_dump_file(pid, start, &path) {
+                Ok(()) => i18n::trf(K::DumpWrittenMsg, &[&path_s]),
+                Err(error) => i18n::trf(K::ErrMsg, &[&error.to_string()]),
+            };
+            crate::app::toast_from(&toasts, message);
+            in_flight.end();
+            wake.request_repaint();
+        });
+    if spawned.is_err() {
+        app.shared.dump_write.end();
+        app.shared.toast(i18n::tr(K::ActionFailed));
+    }
 }
 
 pub fn process_properties_dialog(app: &mut TaskManApp, ctx: &egui::Context) {
@@ -1490,6 +1648,38 @@ mod tests {
                 ColumnId::GpuShared => {
                     a.gpu_shared_bytes = Some(1);
                     b.gpu_shared_bytes = Some(2);
+                }
+                ColumnId::Description => {
+                    a.description = Some("a".into());
+                    b.description = Some("b".into());
+                }
+                ColumnId::Publisher => {
+                    a.company = Some("a".into());
+                    b.company = Some("b".into());
+                }
+                ColumnId::ParentPid => {
+                    a.ppid = Some(1);
+                    b.ppid = Some(2);
+                }
+                ColumnId::SessionId => {
+                    a.session_id = Some(1);
+                    b.session_id = Some(2);
+                }
+                ColumnId::ImagePath => {
+                    a.exe_path = Some("a".into());
+                    b.exe_path = Some("b".into());
+                }
+                ColumnId::PageFaults => {
+                    a.page_faults_per_s = Some(1);
+                    b.page_faults_per_s = Some(2);
+                }
+                ColumnId::IoRead => {
+                    a.disk_read_total = 1;
+                    b.disk_read_total = 2;
+                }
+                ColumnId::IoWrite => {
+                    a.disk_write_total = 1;
+                    b.disk_write_total = 2;
                 }
                 ColumnId::CommandLine => {
                     a.command_line = Some("a".into());

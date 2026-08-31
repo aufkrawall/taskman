@@ -1,6 +1,6 @@
 # Repo Map (code map)
 
-Last cross-checked: 2026-08-27
+Last cross-checked: 2026-08-31
 
 Primary sources:
 - workspace tree (verified against working tree)
@@ -14,12 +14,13 @@ Rust workspace, three crates in a strict dependency chain
 
 - `crates/tm-core`
   - Platform-agnostic heart. `model.rs` (Snapshot data model — CPU, memory,
-    disks, networks, GPU incl. `AdapterLuid`, processes incl.
+    disks, networks incl. optional IP/signal metadata, GPU incl.
+    `AdapterLuid`, processes incl.
     elevation/UAC/power-throttle fields), `engine.rs` (sampling engine:
     lazy start via collector factory, event notifier, Refresh-while-paused),
-    `settings.rs` (INI config + ID-keyed column prefs: widths, visibility
-    overrides and user order under `[columns.<table>]` / `.visible` /
-    `.order` sections + debounced
+    `settings.rs` (INI config + persisted grouped/literal-tree process view +
+    ID-keyed column prefs: widths, visibility overrides and user order under
+    `[columns.<table>]` / `.visible` / `.order` sections + debounced
     SettingsWriter), `app_history.rs` (per-app usage db, single serialized
     writer thread with generations), `demand.rs` (TelemetryDemand bitmask),
     `logging.rs` (early ring sink → deferred file attach), `classify.rs`
@@ -37,9 +38,11 @@ Rust workspace, three crates in a strict dependency chain
     (PDH split GpuPdh/DiskPdh groups with demand gating + LUID-preserving
     GPU instance parser), `gpu.rs` (DXGI discovery + LUID-keyed merge,
     busiest-engine semantics), `process_ops.rs` (kill/suspend/priority/
-    affinity/EcoQoS/token security/minidump CREATE_ALWAYS/non-blocking
-    launch), `startup.rs` (Run keys + Startup folders + StartupApproved
-    incl. the folder-subkey fix), `services.rs`, `users.rs`, `net_info.rs`,
+    affinity/EcoQoS/token security, identity-safe minidumps, ToolHelp module
+    enumeration, guarded same-architecture DLL unload, non-blocking launch),
+    `startup.rs` (Run keys + Startup folders + StartupApproved incl. the
+    folder-subkey fix and best-effort publisher resolution), `services.rs`,
+    `users.rs`, `net_info.rs` (cached adapter/link/IP/SSID/signal metadata),
     `version.rs` (cached PE metadata). Linux/macOS backends exist and are
     built by default (`build.py`).
 - `crates/tm-app`
@@ -47,10 +50,11 @@ Rust workspace, three crates in a strict dependency chain
     early logging → lazy engine factory; StartupTrace markers), `app.rs`
     (TaskManApp: engine starts AFTER first frame, event-driven repaints,
     action executor, toast ids, demand updates per tab), `app_ui.rs`
-    (chrome + dialogs incl. settings), `tabs/*` (processes/details/users/
-    services/startup/apphistory/performance; Processes derives a presentation
-    ownership topology from window owners and shell-launch boundaries rather
-    than treating raw PPID as UI ownership), `widgets/tablekit.rs` (TM-style
+    (chrome + dialogs incl. scrolling settings and Delete confirmation),
+    `tabs/*` (processes/details/modules/users/services/startup/apphistory/
+    performance; Processes can switch between presentation ownership and a
+    literal raw-PPID tree; Modules is an async on-demand inspector),
+    `widgets/tablekit.rs` (TM-style
     tables: drag-start-width resize math, O(1) layout, `scrolled_rows`
     virtualization), `widgets/chart.rs` (timestamp-aware charts, kernel
     overlay), `icon_cache.rs` (lazy worker, upload budget, bounded LRU),
@@ -98,7 +102,13 @@ Rust workspace, three crates in a strict dependency chain
   connected same-image families collapse into expandable `Name (N)` rows and
   busy absorbed external tasks (≥ 1 % CPU, different image, windowless) are
   promoted into Background. Do not collapse this back to a literal PPID
-  tree; raw `ProcessEntry.ppid` remains OS truth elsewhere.
+  tree as the only mode; raw `ProcessEntry.ppid` remains OS truth and is now
+  exposed as a separate persisted System Informer-style view.
+- `crates/tm-platform/src/win/process_ops.rs` module unload — remote
+  `FreeLibrary` is intentionally guarded by exact process creation timestamp,
+  exact module base/path re-enumeration, same-architecture checks, and
+  system/main-image refusals. Keep it off the sampler and UI thread, and never
+  weaken the second confirmation in `tabs/modules.rs`.
 
 ## Test Matrix
 

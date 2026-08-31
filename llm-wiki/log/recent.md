@@ -1,5 +1,47 @@
 # Recent Activity
 
+## 2026-08-31 — GUI parity, literal process tree, Modules inspector, D3D12 trim
+
+Broad parity/ergonomics pass against current Windows 11 Task Manager plus
+selected System Informer diagnostics. No GUI/capture executable was launched
+during verification so the active desktop remained undisturbed.
+
+- **Process interaction:** selectable persisted grouped vs literal PPID tree;
+  hierarchy-preserving search and sibling sorting; expand/collapse controls;
+  arrow/Home/End/Page navigation; Delete opens an identity-bound end-process
+  confirmation. Processes/Details menus now consistently expose copy, online
+  search, file location, properties, dumps, and modules where supported.
+- **Modules:** new async on-demand name/path/base/size inspector. Unload is a
+  double-confirmed diagnostic action restricted to same-architecture
+  third-party DLLs. ToolHelp enumeration handles transient `ERROR_BAD_LENGTH`,
+  surfaces unexpected iteration errors, and revalidates the exact process
+  creation FILETIME plus module base/path before remote `FreeLibrary`; main,
+  Windows, critical-loader, cross-bitness, and self targets fail closed.
+- **Tables/settings:** Details gains description, publisher, parent PID,
+  session ID, image path, page faults/sec, and I/O read/write columns;
+  Startup/App History/Users/Services sort by headers; quiet column guides,
+  keyboard list movement, and a Reset column widths setting were added.
+  Settings is now resizable/scrollable and exposes the default page/process
+  presentation. Registry startup publishers are resolved best-effort.
+- **Performance/data:** lighter/resource-colored charts, graph-context CPU
+  controls, responsive logical-CPU grids, combined network throughput, and
+  cached native IPv4/IPv6/SSID/signal details. Unsupported App History network
+  is `—` rather than a fabricated zero; the UI labels history as local-only.
+  History disk writes are coalesced to 30 seconds plus shutdown.
+- **Renderer/size:** WGPU is built with one native backend per target (D3D12
+  on Windows, Vulkan on Linux, Metal on macOS), low-power adapter preference,
+  FIFO/one-frame latency; Glow remains the fallback. This removes unused WGPU
+  backend dependencies without removing recovery for problematic drivers.
+
+Headless verification: `python build.py --check` passed format, clippy with
+warnings denied, and 148 tests (69 app, 47 core, 27 platform, 5 Windows
+integration); `python build.py --host-only` refreshed/package-checked the final
+artifact. The EXE is 13,470,208 bytes versus the 14,656,000-byte baseline:
+1,185,792 bytes / 8.09% smaller despite the added diagnostics. The feature
+graph and binary string check contain DX12 but no Vulkan loader/API on Windows.
+Linux packaging was skipped because neither `cross` nor `cargo-zigbuild` is
+installed, as permitted by the non-`--require-all-targets` gate.
+
 ## 2026-08-28 — Security audit: 6 fixes (parser OOB, kill-path identity, hardening)
 
 Full security audit of the workspace (source, deps, secrets, binary

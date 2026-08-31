@@ -1,40 +1,50 @@
 # Debug Tools
 
-<!--
-TEMPLATE NOTE: Available debugging tools, paths, and diagnostic workflows
-for this project. Keep entries factual and re-verify paths periodically —
-they drift across machines and installs. Delete this note once real
-content replaces it.
--->
-
-Last cross-checked: <YYYY-MM-DD>
+Last cross-checked: 2026-08-31
 
 Primary sources:
 - `AGENTS.md`
-- <tool installers / documentation this table is derived from>
+- `crates/tm-app/src/main.rs`
+- `crates/tm-app/src/app.rs`
+- `tools/capture.ps1`
 
-## Tools
+## Headless diagnostics
 
-| Tool | Purpose | Installed/default path |
+| Tool | Purpose | Invocation |
 | --- | --- | --- |
-| `<tool>` | `<what it's for>` | `<path or how it's discovered>` |
+| Core tests | model/settings/history/engine logic | `cargo test -p tm-core` |
+| Platform tests | collectors/actions plus short-lived Windows process integration tests | `cargo test -p tm-platform` |
+| App tests | tables, process topology, sorting, charts, module-dialog model | `cargo test -p tm-app` |
+| Full gate | fmt, clippy `-D warnings`, workspace tests | `python build.py --check` |
+| Release | refresh the user-launched host artifact | `python build.py --host-only` |
+| Self-check | headless collector JSON smoke test; starts the binary but not its GUI | `target/release/taskman.exe --selfcheck [--mock]` |
 
-## Diagnostic Workflows
+Cargo tests and `build.py` do not open TaskMan windows. The capture helper and
+plain `taskman.exe` do; do not use those while the desktop must remain
+undisturbed. Windows integration tests may spawn short-lived helper processes.
 
-<!-- Step-by-step notes for common diagnostic tasks: how to read a crash
-dump with the right symbol path, how to enable verbose/debug logging, how
-to reproduce a known class of failure, etc. Keep each workflow short and
-link to source anchors rather than pasting large log excerpts. -->
+## Renderer diagnostics
 
-### `<workflow name, e.g. "Analyzing a crash dump">`
+- Default order is WGPU, then Glow. `TASKMAN_RENDERER=wgpu|glow` forces one.
+- Windows WGPU compiles only D3D12; Linux only Vulkan; macOS only Metal.
+  `WGPU_BACKEND` may narrow the compiled set but cannot enable a backend that
+  was not compiled for that host.
+- WGPU defaults to the low-power adapter for this 2D monitor UI.
+  `WGPU_POWER_PREF=high` is the opt-in discrete/high-performance override.
+- `TASKMAN_FPS_PROBE=1` forces continuous repaint and displays frame rate, but
+  it requires launching the GUI and should be reserved for an interactive run.
 
-<steps>
+## UI/capture diagnostics
 
-## Tool path resolution
+- `TASKMAN_DIALOG=settings|run` opens the chosen dialog at startup.
+- `TASKMAN_PERF=cpu|mem|<resource-key>` preselects a Performance resource.
+- `TASKMAN_TAB=<tab-key>` preselects a page.
+- `tools/capture.ps1` automates a window capture with isolated config/data;
+  read its header before use. It is intentionally not part of headless gates.
 
-<!-- If tool paths vary across machines/environments, document the
-precedence order for resolving them (explicit env var > PATH discovery >
-known-good default path > fallback), rather than treating a hardcoded
-example path as ground truth. -->
+## Data and logs
 
-1. <precedence step>
+- `TASKMAN_DATA_DIR` and `TASKMAN_CONFIG_DIR` redirect state for tests or
+  reproductions. Prefer fresh temporary directories.
+- Daily logs live under `<taskman-data-dir>/logs/`. Treat them as sensitive;
+  they are never test fixtures or commit artifacts.

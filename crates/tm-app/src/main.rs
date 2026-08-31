@@ -162,19 +162,35 @@ fn run_gui(mock: bool, args: &[String]) {
         if restore_maximized {
             viewport = viewport.with_maximized(true);
         }
-        let mut opts = eframe::NativeOptions {
+        let opts = eframe::NativeOptions {
             renderer,
             viewport,
             ..Default::default()
         };
         #[cfg(feature = "wgpu")]
-        {
-            opts.wgpu_options =
+        let opts = {
+            let mut opts = opts;
+            let mut config =
                 eframe::WgpuConfiguration::default().with_surface_config(eframe::SurfaceConfig {
                     present_mode: eframe::wgpu::PresentMode::Fifo,
                     desired_maximum_frame_latency: Some(1),
                 });
-        }
+            let eframe::egui_wgpu::WgpuSetup::CreateNew(setup) = &mut config.wgpu_setup else {
+                unreachable!("default wgpu configuration creates a fresh instance")
+            };
+            // Compile and enumerate only the native backend for each host.
+            // On Windows this makes D3D12 explicit and avoids loading the
+            // Vulkan stack before the existing Glow fallback is considered.
+            setup.instance_descriptor.backends =
+                eframe::wgpu::Backends::from_env().unwrap_or_else(compiled_wgpu_backends);
+            // This is a 2D monitor, so prefer the low-power adapter by
+            // default rather than waking a discrete GPU. WGPU_POWER_PREF
+            // remains an opt-in override for diagnostics.
+            setup.power_preference = eframe::wgpu::PowerPreference::from_env()
+                .unwrap_or(eframe::wgpu::PowerPreference::LowPower);
+            opts.wgpu_options = config;
+            opts
+        };
         opts
     };
 
@@ -215,18 +231,36 @@ fn run_gui(mock: bool, args: &[String]) {
         all.push(eframe::Renderer::Wgpu);
         #[cfg(feature = "glow")]
         all.push(eframe::Renderer::Glow);
-        let want_wgpu = pref.eq_ignore_ascii_case("wgpu");
-        let want_glow = pref.eq_ignore_ascii_case("glow");
         all.into_iter()
             .filter(|r| match r {
                 #[cfg(feature = "wgpu")]
-                eframe::Renderer::Wgpu => !want_glow,
+                eframe::Renderer::Wgpu => !pref.eq_ignore_ascii_case("glow"),
                 #[cfg(feature = "glow")]
-                eframe::Renderer::Glow => !want_wgpu,
+                eframe::Renderer::Glow => !pref.eq_ignore_ascii_case("wgpu"),
                 #[allow(unreachable_patterns)]
                 _ => true,
             })
             .collect()
+    }
+}
+
+#[cfg(feature = "wgpu")]
+fn compiled_wgpu_backends() -> eframe::wgpu::Backends {
+    #[cfg(target_os = "windows")]
+    {
+        eframe::wgpu::Backends::DX12
+    }
+    #[cfg(target_os = "linux")]
+    {
+        eframe::wgpu::Backends::VULKAN
+    }
+    #[cfg(target_os = "macos")]
+    {
+        eframe::wgpu::Backends::METAL
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "macos")))]
+    {
+        eframe::wgpu::Backends::PRIMARY
     }
 }
 
@@ -240,6 +274,13 @@ struct NativeApp {
 impl NativeApp {
     fn new(inner: app::TaskManApp) -> Self {
         Self { inner }
+    }
+
+    fn shutdown(&mut self) {
+        if self.inner.shared.settings.save_config && self.inner.shared.settings.remember_window {
+            ui_state::save();
+        }
+        self.inner.shutdown();
     }
 }
 
@@ -266,11 +307,14 @@ impl eframe::App for NativeApp {
         }
     }
 
-    fn on_exit(&mut self, gl: Option<&eframe::glow::Context>) {
-        if self.inner.shared.settings.save_config && self.inner.shared.settings.remember_window {
-            ui_state::save();
-        }
-        <app::TaskManApp as eframe::App>::on_exit(&mut self.inner, gl);
+    #[cfg(feature = "glow")]
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        self.shutdown();
+    }
+
+    #[cfg(not(feature = "glow"))]
+    fn on_exit(&mut self) {
+        self.shutdown();
     }
 }
 

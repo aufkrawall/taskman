@@ -2,6 +2,7 @@
 //! localized status labels, row selection and service controls.
 
 use eframe::egui;
+use std::cmp::Ordering;
 use std::time::{Duration, Instant};
 use tm_core::i18n::{self, K};
 use tm_core::model::{ServiceInfo, ServiceStatus};
@@ -14,7 +15,7 @@ use crate::widgets::tablekit::{self, TmColumn};
 fn columns() -> Vec<TmColumn> {
     vec![
         TmColumn::text("name", i18n::tr(K::ColName), 240.0),
-        TmColumn::text("pid", i18n::tr(K::ColPid), 90.0),
+        TmColumn::num("pid", i18n::tr(K::ColPid), 90.0),
         TmColumn::text("desc", i18n::tr(K::ColDescription), 460.0),
         TmColumn::text("status", i18n::tr(K::ColStatus), 130.0),
         TmColumn::text("group", i18n::tr(K::ColGroup), 150.0),
@@ -164,7 +165,8 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
                 || s.description.to_lowercase().contains(&q)
         })
         .collect();
-    rows.sort_by_key(|a| a.name.to_lowercase());
+    let sort = app.services_sort;
+    rows.sort_by(|a, b| compare_services(a, b, sort));
 
     let mut table = app.make_table("services", columns());
     let mut fit: Vec<f32> = table
@@ -192,13 +194,13 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
     }
 
     let avail = crate::widgets::tablekit::table_avail(ui);
-    tablekit::scrolled_rows(
+    let clicked = tablekit::scrolled_rows(
         "services",
         ui,
         &pal,
         &mut table,
         avail,
-        None,
+        Some((app.services_sort.column, app.services_sort.ascending)),
         None,
         rows.len(),
         None,
@@ -221,13 +223,13 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
                     egui::FontId::proportional(tablekit::FONT_ROW),
                     pal.text,
                 );
-                table.text_cell(
-                    ui,
-                    rect,
-                    1,
-                    &s.pid.map(|p| p.to_string()).unwrap_or_default(),
-                    &pal,
-                    false,
+                let pid_cell = table.col_rect(1, rect);
+                ui.painter_at(pid_cell).text(
+                    egui::pos2(pid_cell.right() - 10.0, pid_cell.center().y),
+                    egui::Align2::RIGHT_CENTER,
+                    s.pid.map(|pid| pid.to_string()).unwrap_or_default(),
+                    egui::FontId::proportional(tablekit::FONT_ROW),
+                    pal.text,
                 );
                 table.text_cell(ui, rect, 2, &s.display_name, &pal, false);
                 table.text_cell(ui, rect, 3, status_label(app, s.status), &pal, false);
@@ -268,7 +270,55 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
             }
         },
     );
+    if let Some(column) = clicked {
+        app.services_sort.clicked(column, column == 1);
+    }
     app.persist_table(&table);
+}
+
+fn compare_services(a: &ServiceInfo, b: &ServiceInfo, sort: tablekit::SortState) -> Ordering {
+    if sort.column == 1 && a.pid.is_some() != b.pid.is_some() {
+        return b.pid.is_some().cmp(&a.pid.is_some());
+    }
+    let primary = match sort.column {
+        0 => a
+            .name
+            .to_ascii_lowercase()
+            .cmp(&b.name.to_ascii_lowercase()),
+        1 => a.pid.cmp(&b.pid),
+        2 => a
+            .display_name
+            .to_ascii_lowercase()
+            .cmp(&b.display_name.to_ascii_lowercase()),
+        3 => service_status_rank(a.status).cmp(&service_status_rank(b.status)),
+        _ => a
+            .group
+            .to_ascii_lowercase()
+            .cmp(&b.group.to_ascii_lowercase()),
+    };
+    let primary = if sort.ascending {
+        primary
+    } else {
+        primary.reverse()
+    };
+    primary.then_with(|| {
+        a.name
+            .to_ascii_lowercase()
+            .cmp(&b.name.to_ascii_lowercase())
+    })
+}
+
+fn service_status_rank(status: ServiceStatus) -> u8 {
+    match status {
+        ServiceStatus::Running => 0,
+        ServiceStatus::StartPending => 1,
+        ServiceStatus::ContinuePending => 2,
+        ServiceStatus::PausePending => 3,
+        ServiceStatus::Paused => 4,
+        ServiceStatus::StopPending => 5,
+        ServiceStatus::Stopped => 6,
+        ServiceStatus::Unknown => 7,
+    }
 }
 
 fn status_label(app: &TaskManApp, st: ServiceStatus) -> &'static str {

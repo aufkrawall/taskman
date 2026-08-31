@@ -21,6 +21,8 @@ pub struct Capabilities {
     pub efficiency_mode: bool,
     pub run_new_task: bool,
     pub per_process_network: bool,
+    pub process_modules: bool,
+    pub unload_module: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -51,6 +53,18 @@ pub struct ProcessExtra {
     pub status: Option<ProcStatus>,
     pub elevated: Option<bool>,
     pub wow64: Option<bool>,
+}
+
+/// One executable image mapped into a process. Module enumeration is an
+/// explicit, on-demand diagnostic query rather than part of the hot sample.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProcessModule {
+    pub name: String,
+    pub path: String,
+    pub base_address: u64,
+    pub size_bytes: u64,
+    /// False for the process image and loader-critical Windows DLLs.
+    pub unloadable: bool,
 }
 
 pub trait PlatformActions: Send + Sync {
@@ -119,6 +133,25 @@ pub trait PlatformActions: Send + Sync {
     fn set_efficiency_mode(&self, _pid: u32, _on: bool) -> Result<()> {
         Err(tm_core::TmError::Unsupported("efficiency mode"))
     }
+    fn list_process_modules(
+        &self,
+        _pid: u32,
+        _expected_start_epoch_s: Option<i64>,
+    ) -> Result<Vec<ProcessModule>> {
+        Err(tm_core::TmError::Unsupported("process modules"))
+    }
+    /// Ask the target process to release one exact mapped module. This is a
+    /// diagnostic escape hatch: callers must confirmation-gate it, and the
+    /// platform must revalidate process identity plus module base/path.
+    fn unload_process_module(
+        &self,
+        _pid: u32,
+        _expected_start_epoch_s: Option<i64>,
+        _base_address: u64,
+        _expected_path: &str,
+    ) -> Result<()> {
+        Err(tm_core::TmError::Unsupported("unload module"))
+    }
 
     // ------------------------------------------------ launching / elevation
     fn is_elevated(&self) -> bool {
@@ -144,7 +177,14 @@ pub trait PlatformActions: Send + Sync {
         Err(tm_core::TmError::Unsupported("Task Manager replacement"))
     }
 
-    fn create_dump_file(&self, _pid: u32, _path: &std::path::Path) -> Result<()> {
+    /// Create a user-mode dump. `expected_start_epoch_s` has the same
+    /// PID-reuse protection contract as [`Self::kill_process`].
+    fn create_dump_file(
+        &self,
+        _pid: u32,
+        _expected_start_epoch_s: Option<i64>,
+        _path: &std::path::Path,
+    ) -> Result<()> {
         Err(tm_core::TmError::Unsupported("create dump"))
     }
     fn open_file_location(&self, _path: &str) -> Result<()> {

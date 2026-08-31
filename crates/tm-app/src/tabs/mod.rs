@@ -2,6 +2,7 @@
 
 pub mod apphistory;
 pub mod details;
+pub mod modules;
 pub mod performance;
 pub mod processes;
 pub mod services;

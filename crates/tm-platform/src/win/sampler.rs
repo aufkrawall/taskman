@@ -546,6 +546,9 @@ impl Sampler {
                 total_sent_bytes: sent_total,
                 link_bps: ai.map_or(0, |a| a.link_bps),
                 ssid: ai.and_then(|a| a.ssid.clone()),
+                ipv4: ai.and_then(|a| a.ipv4.clone()),
+                ipv6: ai.and_then(|a| a.ipv6.clone()),
+                signal_quality_pct: ai.and_then(|a| a.signal_quality_pct),
             });
         }
         self.prev_net_totals.clear();

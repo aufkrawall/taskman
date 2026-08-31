@@ -89,7 +89,7 @@ pub fn paint_sparkline(ui: &egui::Ui, rect: egui::Rect, samples: &[f64], color: 
         .map(|(i, v)| Pos2::new(x(i), y(*v)))
         .collect();
 
-    let fill = Color32::from_rgba_premultiplied(color.r(), color.g(), color.b(), 55);
+    let fill = Color32::from_rgba_premultiplied(color.r(), color.g(), color.b(), 34);
     fill_area_to_baseline(&painter, &pts, rect.bottom(), fill);
     painter.add(Shape::line(pts, Stroke::new(1.25, color)));
 }
@@ -117,6 +117,13 @@ pub fn core_chart(
             Stroke::new(1.0, pal.chart_grid),
         );
     }
+    for k in 1..4 {
+        let x = rect.left() + rect.width() * k as f32 / 4.0;
+        painter.line_segment(
+            [Pos2::new(x, rect.top()), Pos2::new(x, rect.bottom())],
+            Stroke::new(0.75, pal.chart_grid),
+        );
+    }
     painter.rect_stroke(
         rect,
         0.0,
@@ -135,7 +142,7 @@ pub fn core_chart(
         .enumerate()
         .map(|(i, v)| Pos2::new(x(i), y(*v)))
         .collect();
-    let fill = Color32::from_rgba_premultiplied(color.r(), color.g(), color.b(), 75);
+    let fill = Color32::from_rgba_premultiplied(color.r(), color.g(), color.b(), 36);
     fill_area_to_baseline(&painter, &pts, rect.bottom(), fill);
 
     // Kernel overlay: darker band under the user portion. Painted AFTER the
@@ -148,7 +155,7 @@ pub fn core_chart(
             .map(|(i, v)| Pos2::new(x(i), y(*v)))
             .collect();
         let kfill =
-            Color32::from_rgba_premultiplied(color.r() / 2, color.g() / 2, color.b() / 2, 110);
+            Color32::from_rgba_premultiplied(color.r() / 2, color.g() / 2, color.b() / 2, 70);
         fill_area_to_baseline(&painter, &kpts, rect.bottom(), kfill);
     }
     painter.add(Shape::line(pts, Stroke::new(1.4, color)));
@@ -195,6 +202,13 @@ pub fn chart_multi(
             Stroke::new(1.0, pal.chart_grid),
         );
     }
+    for k in 1..6 {
+        let x = rect.left() + rect.width() * k as f32 / 6.0;
+        painter.line_segment(
+            [Pos2::new(x, rect.top()), Pos2::new(x, rect.bottom())],
+            Stroke::new(0.75, pal.chart_grid),
+        );
+    }
     painter.rect_stroke(
         rect,
         0.0,
@@ -229,7 +243,7 @@ pub fn chart_multi(
             .enumerate()
             .map(|(i, v)| Pos2::new(x_at(i, n), y(*v)))
             .collect();
-        let fill = Color32::from_rgba_premultiplied(s.color.r(), s.color.g(), s.color.b(), 60);
+        let fill = Color32::from_rgba_premultiplied(s.color.r(), s.color.g(), s.color.b(), 34);
         fill_area_to_baseline(&painter, &pts, rect.bottom(), fill);
     }
     // Lines in a SECOND pass: an outer series' translucent fill must never
@@ -246,7 +260,7 @@ pub fn chart_multi(
             .enumerate()
             .map(|(i, v)| Pos2::new(x_at(i, n), y(*v)))
             .collect();
-        painter.add(Shape::line(pts, Stroke::new(1.5, s.color)));
+        painter.add(Shape::line(pts, Stroke::new(1.25, s.color)));
     }
 
     // Hover: values of every series at the pointer.
