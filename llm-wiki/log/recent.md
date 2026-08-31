@@ -1,5 +1,25 @@
 # Recent Activity
 
+## 2026-08-31 — ForeignClient state: honest GUI↔service connection reporting
+
+User report: the GUI said the core service "does not work" and repair "fails".
+Diagnosis against the live machine showed the service, manifest, and pipe DACL
+all healthy; the service log proved the running GUI had been launched from
+`target\release\taskman.exe`, which the broker's path-based client
+authorization rejects by design. The install behind the Repair button had
+actually succeeded (fresh manifest + service restart), but the foreign session
+kept being rejected forever and the generic "broker authentication failed"
+detail made a successful repair look broken.
+
+Fix: `service_state` classifies a healthy service + non-installed client image
+as `CoreServiceState::ForeignClient` (new enum variant, unit-tested helper
+`foreign_client_session`); the Advanced section shows an explanatory text and
+a "Switch to installed copy" button backed by
+`core_service::relaunch_into_installed_gui` (spawns the installed GUI with
+`--single-instance-handoff`, then programmatic-exits the foreign session;
+elevated sessions refuse). i18n keys: `CoreServiceForeignClient`,
+`CoreServiceSwitchRequested`, `SwitchToInstalledCoreService`.
+
 ## 2026-08-31 — protected core service, persistent Details controls, overload resilience
 
 Implemented the requested split architecture: the ordinary GUI owns all

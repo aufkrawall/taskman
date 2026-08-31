@@ -363,8 +363,20 @@ keys! {
         "Active (version {}). The GUI can remain unelevated."
     ],
     CoreServiceDegraded => ["Dienstproblem: {}", "Service problem: {}"],
+    CoreServiceForeignClient => [
+        "Der Dienst läuft, aber dieses TaskMan-Programm ist nicht der installierte Client. Der Dienst nimmt es bewusst nicht an; wechsle zur installierten Kopie, um den Dienst zu nutzen.",
+        "The service is running, but this TaskMan executable is not the installed client. The service rejects it by design; switch to the installed copy to use the service."
+    ],
+    CoreServiceSwitchRequested => [
+        "Wechsle zur installierten Kopie…",
+        "Switching to the installed copy…"
+    ],
     InstallCoreService => ["Core-Dienst installieren…", "Install core service…"],
     RepairCoreService => ["Core-Dienst reparieren…", "Repair core service…"],
+    SwitchToInstalledCoreService => [
+        "Zur installierten Kopie wechseln…",
+        "Switch to installed copy…"
+    ],
     RemoveCoreService => ["Core-Dienst entfernen…", "Remove core service…"],
     CoreServiceInstallRequested => [
         "Dienstinstallation angefordert. TaskMan danach schließen und neu öffnen; der geschützte Start erfolgt automatisch.",

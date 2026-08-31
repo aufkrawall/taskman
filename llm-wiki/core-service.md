@@ -116,6 +116,18 @@ capability and would make rollback less reliable.
 - The GUI and service use above-normal process/control-thread priority. High or
   realtime priority is intentionally avoided because it can starve input,
   storage, or recovery work during overload.
+- Broker client authorization is image-PATH based: any session running outside
+  the protected install location (dev tree, portable copy) is rejected with
+  "client is not the protected TaskMan GUI" even when the service is healthy.
+  `service_state` classifies this as `CoreServiceState::ForeignClient` instead
+  of a generic auth failure, and the Advanced settings surface offers a
+  "switch to installed copy" action
+  (`core_service::relaunch_into_installed_gui`) that spawns the installed GUI
+  with `--single-instance-handoff` and closes the foreign session. A successful
+  repair/upgrade from a foreign session therefore needs this switch (or an app
+  restart, which the startup redirect handles) before the service is usable;
+  repair itself does not fail. Elevated sessions refuse the switch so
+  elevation is never silently preserved.
 - GUI actions run in two independent bounded executor lanes (32 each), so one
   wedged OS API cannot stall every action and overload is surfaced explicitly.
   Platform calls are never run inline on the renderer thread if worker startup

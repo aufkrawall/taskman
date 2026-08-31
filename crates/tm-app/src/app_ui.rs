@@ -595,6 +595,9 @@ pub fn settings_dialog(app: &mut TaskManApp, ctx: &egui::Context, _pal: &theme::
                     Some(CoreServiceState::Running { version }) => {
                         i18n::trf(K::CoreServiceRunning, &[version])
                     }
+                    Some(CoreServiceState::ForeignClient) => {
+                        i18n::tr(K::CoreServiceForeignClient).into()
+                    }
                     Some(CoreServiceState::Degraded(detail)) => {
                         i18n::trf(K::CoreServiceDegraded, &[detail])
                     }
@@ -628,6 +631,7 @@ pub fn settings_dialog(app: &mut TaskManApp, ctx: &egui::Context, _pal: &theme::
                     Some(CoreServiceState::Stopped | CoreServiceState::Degraded(_)) => {
                         K::RepairCoreService
                     }
+                    Some(CoreServiceState::ForeignClient) => K::SwitchToInstalledCoreService,
                     _ => K::RemoveCoreService,
                 };
                 if ui
@@ -638,24 +642,51 @@ pub fn settings_dialog(app: &mut TaskManApp, ctx: &egui::Context, _pal: &theme::
                     let inflight = app.core_service_change_inflight.clone();
                     inflight.store(true, std::sync::atomic::Ordering::Release);
                     let completion = inflight.clone();
-                    let dispatched = app.run_action(
-                        ctx,
-                        move || {
-                            i18n::tr(if install {
-                                K::CoreServiceInstallRequested
-                            } else {
-                                K::CoreServiceRemoveRequested
-                            })
-                            .to_string()
-                        },
-                        move || {
-                            let outcome = actions.set_core_service_installed(install);
-                            completion.store(false, std::sync::atomic::Ordering::Release);
-                            outcome
-                        },
-                    );
-                    if !dispatched {
-                        inflight.store(false, std::sync::atomic::Ordering::Release);
+                    if matches!(core_state.as_ref(), Some(CoreServiceState::ForeignClient)) {
+                        // No reinstall can make a foreign image pass the
+                        // broker's client authorization; hand the session to
+                        // the installed GUI instead.
+                        let args: Vec<String> = std::env::args().skip(1).collect();
+                        let close_ctx = ctx.clone();
+                        let dispatched = app.run_action(
+                            ctx,
+                            || i18n::tr(K::CoreServiceSwitchRequested).to_string(),
+                            move || {
+                                let switched = actions.switch_to_installed_gui(&args)?;
+                                completion.store(false, std::sync::atomic::Ordering::Release);
+                                if switched {
+                                    // Shut down gracefully so on_exit flushes
+                                    // settings and history while the installed
+                                    // replacement waits on the handoff.
+                                    crate::request_programmatic_exit();
+                                    close_ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                                }
+                                Ok(())
+                            },
+                        );
+                        if !dispatched {
+                            inflight.store(false, std::sync::atomic::Ordering::Release);
+                        }
+                    } else {
+                        let dispatched = app.run_action(
+                            ctx,
+                            move || {
+                                i18n::tr(if install {
+                                    K::CoreServiceInstallRequested
+                                } else {
+                                    K::CoreServiceRemoveRequested
+                                })
+                                .to_string()
+                            },
+                            move || {
+                                let outcome = actions.set_core_service_installed(install);
+                                completion.store(false, std::sync::atomic::Ordering::Release);
+                                outcome
+                            },
+                        );
+                        if !dispatched {
+                            inflight.store(false, std::sync::atomic::Ordering::Release);
+                        }
                     }
                 }
 
