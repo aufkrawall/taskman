@@ -226,11 +226,15 @@ impl Drop for SharedState {
 #[derive(Debug, Clone)]
 pub struct PendingDetailsFocus(pub ProcessIdentity);
 
-/// Destructive keyboard action parked behind an explicit confirmation.
+/// Destructive action parked behind an explicit confirmation.
+///
+/// Carries every target, because a multi-row selection is exactly when a
+/// confirmation earns its place: the Delete key over 30 selected rows would
+/// otherwise be one keystroke away from ending 30 processes.
 #[derive(Debug, Clone)]
 pub struct PendingProcessEnd {
-    pub identity: ProcessIdentity,
-    pub name: String,
+    /// Identity plus the display name to report, per target.
+    pub targets: Vec<(ProcessIdentity, String)>,
     pub tree: bool,
 }
 
@@ -314,7 +318,13 @@ pub struct TaskManApp {
     /// Selected process by EXACT identity (audit §7): the toolbar's End Task
     /// and Efficiency commands validate start-time identity against the live
     /// snapshot before dispatching, so a recycled PID is never targeted.
-    pub selected_process: Option<ProcessIdentity>,
+    /// The process rows selected on Processes/Details. Shared by both tables
+    /// so a selection survives switching between them.
+    pub selection: crate::selection::Selection,
+    /// "Select all" requested from an overflow menu. The menu runs before the
+    /// row model for this frame exists, so the tab consumes the request once
+    /// it knows what "all" currently means.
+    pub select_all_requested: bool,
     pub selected_user: Option<u32>,
     /// Pending sign-out awaiting confirmation (session id + display name).
     /// Logoff is a high-blast-radius action and must never be one-click.
@@ -567,7 +577,8 @@ impl TaskManApp {
             services_sort,
             users_sort,
             app_history_sort,
-            selected_process: None,
+            selection: crate::selection::Selection::default(),
+            select_all_requested: false,
             title_bar_applied: None,
             selected_user: None,
             pending_session_logoff: None,
@@ -675,6 +686,25 @@ impl TaskManApp {
             let interval_s = self.engine.interval().as_secs_f64().max(0.05);
             self.app_history_db.observe(&latest, interval_s);
             self.apply_saved_process_rules(&latest, ctx);
+            // Rows that exited leave the selection with them, so the toolbar
+            // never offers to end a process that is already gone and a
+            // recycled pid can never inherit a selection.
+            let live: HashSet<u32> = latest
+                .processes
+                .iter()
+                .filter(|process| !process.synthetic)
+                .map(|process| process.pid)
+                .collect();
+            if !self.selection.is_empty() {
+                let snapshot = latest.clone();
+                self.selection.retain_live(|identity| {
+                    live.contains(&identity.pid)
+                        && snapshot.process(identity.pid).is_some_and(|process| {
+                            process.start_epoch_s.is_none()
+                                || process.start_epoch_s == identity.start_epoch_s
+                        })
+                });
+            }
 
             self.ticks_seen += 1;
             Some(latest)
@@ -1306,32 +1336,53 @@ impl TaskManApp {
         );
     }
 
-    /// Park the selected live process behind the Delete-key confirmation.
-    fn confirm_selected_process_end(&mut self) {
-        let Some(identity) = self.selected_process.clone() else {
-            return;
+    /// Resolve every selected row to a live identity plus its display name,
+    /// dropping the ones that exited (and the synthetic CPU-attribution
+    /// pseudo-rows, which own no process at all).
+    pub fn live_selection_targets(&self) -> Vec<(ProcessIdentity, String)> {
+        let Some(snapshot) = self.latest_snapshot() else {
+            return Vec::new();
         };
-        if !self.identity_is_live(&identity) {
-            self.selected_process = None;
-            self.shared.toast(i18n::tr(K::ProcessExited));
+        self.selection
+            .all()
+            .iter()
+            .filter(|identity| self.identity_is_live(identity))
+            .filter_map(|identity| {
+                snapshot
+                    .process(identity.pid)
+                    .filter(|process| !process.synthetic)
+                    .map(|process| (identity.clone(), process.shown_name().to_string()))
+            })
+            .collect()
+    }
+
+    /// Park the selected live processes behind the Delete-key confirmation.
+    fn confirm_selected_process_end(&mut self) {
+        let targets = self.live_selection_targets();
+        if targets.is_empty() {
+            if !self.selection.is_empty() {
+                self.selection.clear();
+                self.shared.toast(i18n::tr(K::ProcessExited));
+            }
             return;
         }
-        let Some(name) = self
-            .latest_snapshot()
-            .as_ref()
-            .and_then(|snapshot| snapshot.process(identity.pid))
-            .filter(|process| !process.synthetic)
-            .map(|process| process.shown_name().to_string())
-        else {
-            self.selected_process = None;
-            self.shared.toast(i18n::tr(K::ProcessExited));
-            return;
-        };
         self.pending_process_end = Some(PendingProcessEnd {
-            identity,
-            name,
+            targets,
             tree: false,
         });
+    }
+
+    /// End a whole confirmed batch. Each target is an independent job on the
+    /// action executor, so one refusal never cancels the rest.
+    pub fn end_process_batch(
+        &mut self,
+        ctx: &egui::Context,
+        targets: Vec<(ProcessIdentity, String)>,
+        tree: bool,
+    ) {
+        for (identity, name) in targets {
+            self.end_process_identity(ctx, identity, tree, name);
+        }
     }
 
     /// Make Windows paint its caption in the app's own colors.
@@ -1370,29 +1421,26 @@ impl TaskManApp {
         self.title_bar_applied = Some((caption, dark));
     }
 
-    /// End the selected process (toolbar "Task beenden") — on the executor.
-    /// Uses the stored exact identity; a vanished or recycled PID is refused.
+    /// End the selected processes (toolbar "Task beenden") — on the executor.
+    /// Uses the stored exact identities; vanished or recycled PIDs are
+    /// refused. A single row keeps Task Manager's one-click behavior; several
+    /// rows go through the confirmation, because that is a different question.
     pub fn end_selected(&mut self, ctx: &egui::Context) {
-        let Some(identity) = self.selected_process.clone() else {
-            return;
-        };
-        if !self.identity_is_live(&identity) {
-            self.selected_process = None;
+        let mut targets = self.live_selection_targets();
+        if targets.is_empty() {
+            self.selection.clear();
             self.shared.toast(i18n::tr(K::ProcessExited));
             return;
         }
-        let Some(name) = self
-            .latest_snapshot()
-            .as_ref()
-            .and_then(|snapshot| snapshot.process(identity.pid))
-            .filter(|process| !process.synthetic)
-            .map(|process| process.shown_name().to_string())
-        else {
-            self.selected_process = None;
-            self.shared.toast(i18n::tr(K::ProcessExited));
+        if targets.len() == 1 {
+            let (identity, name) = targets.remove(0);
+            self.end_process_identity(ctx, identity, false, name);
             return;
-        };
-        self.end_process_identity(ctx, identity, false, name);
+        }
+        self.pending_process_end = Some(PendingProcessEnd {
+            targets,
+            tree: false,
+        });
     }
 
     /// Frame-rate diagnostics (TASKMAN_FPS_PROBE=1): measures the interval

@@ -339,9 +339,26 @@ pub fn tab_header(
     menu: impl FnOnce(&mut TaskManApp, &mut egui::Ui),
 ) {
     let title = app.tab.label();
+    // How many rows a multi-select command would act on. The toolbar buttons
+    // are the same size either way, so without this the difference between
+    // ending one process and ending thirty is invisible until the dialog.
+    let selected = matches!(
+        app.tab,
+        crate::app::Tab::Processes | crate::app::Tab::Details
+    )
+    .then(|| app.selection.len())
+    .filter(|count| *count > 1);
     ui.horizontal(|ui| {
         ui.add_space(16.0);
         ui.label(egui::RichText::new(title).size(15.5).strong());
+        if let Some(count) = selected {
+            ui.add_space(10.0);
+            ui.label(
+                egui::RichText::new(i18n::trf(K::SelectedCount, &[&count.to_string()]))
+                    .size(12.5)
+                    .color(pal.text_dim),
+            );
+        }
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             ui.add_space(8.0);
             ellipsis_menu(app, ui, pal, menu);
@@ -959,8 +976,9 @@ pub fn settings_dialog(app: &mut TaskManApp, ctx: &egui::Context, _pal: &theme::
     }
 }
 
-/// Confirmation shown only for the Delete-key process shortcut. Toolbar and
-/// context-menu termination retain their native one-click behavior.
+/// Confirmation for the Delete-key shortcut and for any termination that
+/// covers more than one selected row. A single-row toolbar or context-menu
+/// termination retains its native one-click behavior.
 pub fn process_end_dialog(app: &mut TaskManApp, ctx: &egui::Context) {
     let Some(pending) = app.pending_process_end.clone() else {
         return;
@@ -982,10 +1000,31 @@ pub fn process_end_dialog(app: &mut TaskManApp, ctx: &egui::Context) {
         .anchor(Align2::CENTER_CENTER, [0.0, -40.0])
         .show(ctx, |ui| {
             ui.set_width(430.0);
-            ui.label(i18n::trf(
-                K::EndProcessConfirm,
-                &[&pending.name, &pending.identity.pid.to_string()],
-            ));
+            match pending.targets.as_slice() {
+                [(identity, name)] => {
+                    ui.label(i18n::trf(
+                        K::EndProcessConfirm,
+                        &[name, &identity.pid.to_string()],
+                    ));
+                }
+                targets => {
+                    ui.label(i18n::trf(
+                        K::EndProcessesConfirm,
+                        &[&targets.len().to_string()],
+                    ));
+                    ui.add_space(6.0);
+                    // Name every target: "end 27 processes" is not informed
+                    // consent, and the list is the only place the user can
+                    // see what the range selection actually caught.
+                    egui::ScrollArea::vertical()
+                        .max_height(160.0)
+                        .show(ui, |ui| {
+                            for (identity, name) in targets {
+                                ui.label(format!("{name}  ({})", identity.pid));
+                            }
+                        });
+                }
+            }
             ui.add_space(10.0);
             ui.horizontal(|ui| {
                 if ui.button(i18n::tr(K::Cancel)).clicked() {
@@ -1002,7 +1041,7 @@ pub fn process_end_dialog(app: &mut TaskManApp, ctx: &egui::Context) {
     if let Some(confirm) = decision {
         app.pending_process_end = None;
         if confirm {
-            app.end_process_identity(ctx, pending.identity, pending.tree, pending.name);
+            app.end_process_batch(ctx, pending.targets, pending.tree);
         }
     }
 }

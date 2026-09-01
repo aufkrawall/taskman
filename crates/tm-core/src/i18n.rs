@@ -184,6 +184,12 @@ keys! {
         "\"{}\" (PID {}) wirklich beenden? Nicht gespeicherte Daten dieses Prozesses gehen verloren.",
         "End \"{}\" (PID {})? Unsaved data in this process will be lost."
     ],
+    EndProcessesConfirm => [
+        "{} Prozesse wirklich beenden? Nicht gespeicherte Daten dieser Prozesse gehen verloren.",
+        "End {} processes? Unsaved data in these processes will be lost."
+    ],
+    SelectedCount => ["{} ausgewählt", "{} selected"],
+    SelectAll => ["Alle auswählen", "Select all"],
     ManageUserAccounts => ["Benutzerkonten verwalten", "Manage user accounts"],
     EnableCmd => ["Aktivieren", "Enable"],
     DisableCmd => ["Deaktivieren", "Disable"],
