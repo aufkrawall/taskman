@@ -344,6 +344,13 @@ fn apply_text_aa(opts: &mut egui::epaint::TextOptions, theme: egui::Theme) {
 /// Blend gamma and contrast for a smoothing profile under sub-pixel rendering.
 ///
 /// Shared with `text_compare` so the comparison harness renders what the app renders.
+/// Weight tuning for [`TextSmoothing::Sharp`] under sub-pixel rendering.
+///
+/// Set by eye against native Windows text on a dark UI at 150% scaling, which is the
+/// regime where the difference is visible at all. `0.72`/`0.0` was measurably too thin.
+const SHARP_GAMMA_SCALE: f32 = 0.88;
+const SHARP_CONTRAST: f32 = 0.25;
+
 pub fn cleartype_weight(
     smoothing: TextSmoothing,
     params: &tm_platform::text_rendering::Params,
@@ -351,7 +358,7 @@ pub fn cleartype_weight(
     match smoothing {
         // Thin and crisp: closest to native Windows on a dark UI. Measured at 150%
         // scaling this removes ~14% of the ink and sharpens the stems.
-        TextSmoothing::Sharp => (params.gamma * 0.72, 0.0),
+        TextSmoothing::Sharp => (params.gamma * SHARP_GAMMA_SCALE, SHARP_CONTRAST),
         // The display's own DirectWrite parameters, unmodified.
         TextSmoothing::Standard | TextSmoothing::Smooth => (params.gamma, params.contrast),
     }

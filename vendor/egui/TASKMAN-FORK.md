@@ -124,6 +124,24 @@ ported by hand. It therefore carries a provenance header:
 //! UPSTREAM_BASE: <sha of glow_integration.rs at the last rebase>
 ```
 
+**Three things in that file are easy to get wrong and produce silent breakage.** All
+three were shipped broken once and are called out here so a future port does not repeat
+them:
+
+- **`egui_winit` does not raise the close event.** `WindowEvent::CloseRequested` only
+  returns `repaint: true`; the backend must push `egui::ViewportEvent::Close` into its own
+  `ViewportInfo`, or the app never learns the user clicked the close button. taskman vetoes
+  the close and hides to the tray, so this is the path that feature runs on.
+- **Return `EventResult::CloseRequested`, not `Exit`.** The wrapper runs `save_and_destroy`
+  only on the former, and windows must be dropped while the event loop still runs.
+- **Return `EventResult::Exit` once `running` is `None`.** `CloseRequested` tears the
+  window down but does *not* end the loop; the exit comes from the next event arriving
+  after the teardown. Returning `Wait` there leaves a live process with no window, which
+  looks exactly like "the close button does nothing".
+
+Also: `ViewportInfo::events` must be cleared once handed to egui, or a Close event repeats
+every frame.
+
 `tools/fork-rebase.sh` in the parent repo diffs that sha against the new tag so the port is
 a small review, not a re-derivation. **Update `UPSTREAM_BASE` in the same commit as the
 port.**

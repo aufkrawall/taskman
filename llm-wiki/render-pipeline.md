@@ -111,7 +111,7 @@ used to select is not consulted on the sub-pixel path at all:
 
 | profile | grid-fit | binning | blend | ink @150% |
 | --- | --- | --- | --- | --- |
-| `Sharp` | yes | no | `gamma * 0.72`, no contrast boost | 899 |
+| `Sharp` | yes | no | `gamma * 0.88`, contrast 0.25 | 991 |
 | `Standard` | no | no | the display's own parameters | 1117 |
 | `Smooth` | no | yes | the display's own parameters | -- |
 
@@ -119,7 +119,8 @@ used to select is not consulted on the sub-pixel path at all:
 
 **Measure at 150% scaling, not 100%.** At 100% the three profiles are indistinguishable
 (edge sharpness 75.4 / 75.3 / 75.5) and the weight question is invisible. At 150%, where
-stems are ~2 px, `Sharp` is 20% less ink *and* sharper. An earlier comparison at 100% led
+stems are ~2 px, `Sharp` is ~11% less ink *and* sharper. (0.72/0.0 was tried first and
+read as too thin -- these constants are set by eye against native Windows text.) An earlier comparison at 100% led
 to the wrong conclusion for exactly this reason.
 
 `crates/tm-app/src/text_compare.rs` renders every profile, filter and blend to magnified
