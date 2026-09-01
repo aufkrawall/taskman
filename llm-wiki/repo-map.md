@@ -53,7 +53,7 @@ platform boundary (`tm-core` ← `tm-platform` ← `tm-app` / `tm-service`):
     SCM/Program Files/ProgramData install lifecycle, including pinned
     reparse/hard-link-resistant owner/group/DACL repair), `autostart.rs` (owned-command-
     only HKCU startup migration), `windows_enum.rs` (one-pass top-window/hung-state inventory),
-    `window_chrome.rs` (DWM caption colour / dark mode / backdrop),
+    `window_chrome.rs` (DWM caption colour / dark mode / backdrop / cloaking),
     `version.rs` (cached PE metadata). Linux/macOS backends exist and are
     built by default (`build.py`).
 - `crates/tm-app`
@@ -152,7 +152,9 @@ platform boundary (`tm-core` ← `tm-platform` ← `tm-app` / `tm-service`):
   states (`details::SortOrder`), not two, and the tree is not a mode: it IS
   the Name column's third state. Clicking any OTHER column must leave it and
   sort purely by that column.
-- `crates/tm-app/src/theme.rs` — `ScrollStyle.floating` must stay TRUE. egui
+- `crates/tm-app/src/theme.rs` — `ScrollStyle.fade.strength` must stay 0:
+  egui's edge fades read as a shadow lying on a dense table rather than as
+  depth. `ScrollStyle.floating` must stay TRUE. egui
   decides whether a bar is needed against the OUTER rect for floating bars
   and against the shrunken INNER rect for solid ones, so a solid bar can
   oscillate on width-dependent content. Space reservation comes from

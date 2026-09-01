@@ -69,6 +69,31 @@ by hand (time + distance since the last press in the region): handing the press
 to the window manager ends egui's view of it, so its own click bookkeeping
 never completes.
 
+### The white flash restoring from the tray
+
+`software_integration.rs` skips painting entirely while the window is hidden
+(upstream documents an invisible window burning a whole core, emilk/egui#7776,
+and forced repaints into one grow the stack until the process dies). A hidden
+window also receives no `WM_PAINT`, so there is no way to have a frame ready
+before it appears: `ShowWindow` composes the empty window and the app's first
+frame lands a beat later.
+
+Restores go through `NativeApp::restore_window` now, which sets `DWMWA_CLOAK`
+BEFORE `Visible(true)`. A cloaked window is "visible" to Windows —
+`window.is_visible()` returns true, so painting resumes — but DWM does not
+display it. `finish_restore` uncloaks two frames later.
+
+Two frames, and the countdown runs at the START of a frame, not the end: the
+`Visible(true)` viewport command is applied AFTER the frame that issued it, so
+the first frame that can present into a visible window is the next one, and
+the one after that is safe to reveal. Counting at the end of a frame reaches
+zero before anything has been presented, which is the flash again. It also
+runs unconditionally every frame rather than from a one-shot callback, so no
+path can leave the window invisible.
+
+Cloaking is deliberately NOT the tray-hide mechanism: a cloaked window keeps
+its taskbar button.
+
 ### The rest
 
 - **Search** matched name/display/publisher/PID only. It now also covers
@@ -90,6 +115,10 @@ never completes.
   `IMMERSIVE_DARK_MODE`, pushed only when the theme changes (each attribute
   recomposes the frame). What is NOT reachable, and why, is in `known-debt.md`.
 - **Search box** gained a clear button; Escape clears it too.
+- **Scroll fades off.** egui paints a 20 px background-coloured ramp at the
+  top and bottom of every scroll area (`ScrollFadeStyle`, strength 0.5). Over
+  a dense table it reads as a shadow lying on the list — a second, moving edge
+  beside the header and the window frame. `strength: 0.0` in `theme.rs`.
 - `ROW_H_DENSE` 22 → 20 px. That is the floor: 13 px row text needs a ~17 px
   line box and `icon_cell` derives its glyph side from `row_h - 6`.
 

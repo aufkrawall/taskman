@@ -266,6 +266,16 @@ pub fn install_visuals(ctx: &egui::Context) {
                 active_background_opacity: 0.30,
                 interact_handle_opacity: 1.0,
                 interact_background_opacity: 0.45,
+                // No fade-out gradients at the edges of a scroll area. egui
+                // paints a 20 px background-coloured ramp at the top and
+                // bottom of anything scrollable, which over a dense table of
+                // rows reads as a shadow lying on the list — a second,
+                // moving edge next to the header and the window frame. Task
+                // Manager's lists have hard edges; so do these.
+                fade: egui::style::ScrollFadeStyle {
+                    strength: 0.0,
+                    ..Default::default()
+                },
                 ..Default::default()
             };
         });
