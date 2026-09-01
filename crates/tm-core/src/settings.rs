@@ -224,6 +224,15 @@ pub struct Settings {
     pub perf_card_width: f32,
     /// Performance CPU graph mode: "overall" | "logical".
     pub cpu_graph_mode: String,
+    /// Performance GPU graph mode: `"overall"` (the busiest engine, which is
+    /// what the adapter's utilization number means), `"all"` (every engine
+    /// overlaid), or a PDH engine-type name such as `"3D"`, `"VideoEncode"`
+    /// or `"Compute"`.
+    ///
+    /// One value for every adapter on purpose: engine names are shared across
+    /// adapters, and a mode naming an engine the selected adapter does not
+    /// expose falls back to the overall graph rather than showing a flat zero.
+    pub gpu_graph_mode: String,
     /// Overlay kernel time (darker band) in the CPU graphs.
     pub show_kernel_times: bool,
     /// Details page shows the literal parent/child process tree: the Name
@@ -269,6 +278,7 @@ impl Default for Settings {
             process_rules: BTreeMap::new(),
             perf_card_width: 252.0,
             cpu_graph_mode: "overall".into(),
+            gpu_graph_mode: "overall".into(),
             show_kernel_times: false,
             details_tree_hierarchical: false,
             close_to_tray: false,
@@ -686,6 +696,18 @@ impl Settings {
                 s.cpu_graph_mode = mode;
             }
         }
+        if let Some(v) = get("general", "gpu_graph_mode") {
+            // Engine names come from PDH, so there is no closed set to
+            // validate against; bound the length and reject anything with
+            // structure instead.
+            let mode = v.trim();
+            if !mode.is_empty()
+                && mode.len() <= 32
+                && mode.chars().all(|c| c.is_alphanumeric() || c == '_')
+            {
+                s.gpu_graph_mode = mode.to_string();
+            }
+        }
         s.show_kernel_times = b("general", "show_kernel_times", s.show_kernel_times);
         // `process_tree_view` was briefly shipped for the Processes page.
         // Preserve that preference while moving the literal tree to Details.
@@ -865,6 +887,7 @@ impl Settings {
             ("sidebar_collapsed", self.sidebar_collapsed.to_string()),
             ("perf_card_width", self.perf_card_width.to_string()),
             ("cpu_graph_mode", self.cpu_graph_mode.clone()),
+            ("gpu_graph_mode", self.gpu_graph_mode.clone()),
             ("show_kernel_times", self.show_kernel_times.to_string()),
             (
                 "details_tree_hierarchical",

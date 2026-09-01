@@ -153,6 +153,61 @@ mod tests {
         let gpu = gpu_series(&win, "0", 1);
         assert_eq!(gpu, vec![0.0, 0.0, 0.0]);
     }
+
+    /// The adapter's own utilization is the BUSIEST engine, so charting one
+    /// specific engine has to read the per-engine samples — otherwise "Video
+    /// Encode" would silently plot the 3D load.
+    #[test]
+    fn a_gpu_engine_series_follows_that_engine_only() {
+        let mut busy = pt(500);
+        busy.gpus = vec![(0, 90.0, 0)];
+        busy.gpu_engines = vec![
+            (0, "3D".into(), 90.0),
+            (0, "VideoEncode".into(), 12.0),
+            (1, "3D".into(), 5.0),
+        ];
+        let win = vec![pt(0), busy, pt(1000)];
+
+        assert_eq!(
+            gpu_engine_series(&win, "0", "VideoEncode"),
+            vec![0.0, 12.0, 0.0]
+        );
+        assert_eq!(gpu_engine_series(&win, "0", "3D"), vec![0.0, 90.0, 0.0]);
+        // Another adapter's engine of the same name must not bleed in.
+        assert_eq!(gpu_engine_series(&win, "1", "3D"), vec![0.0, 5.0, 0.0]);
+        // An engine this adapter never reported is a flat, honest zero.
+        assert_eq!(gpu_engine_series(&win, "0", "Copy"), vec![0.0, 0.0, 0.0]);
+    }
+
+    /// An engine that has gone idle drops out of the snapshot's truncated,
+    /// utilization-sorted list — but it must stay in the menu, because
+    /// "what was the encoder doing" is asked after the encoding stops.
+    #[test]
+    fn the_engine_menu_remembers_engines_seen_in_the_window() {
+        let mut earlier = pt(0);
+        earlier.gpu_engines = vec![(0, "VideoEncode".into(), 40.0)];
+        let win = vec![earlier, pt(1000)];
+        let snapshot = [tm_core::model::GpuEngine {
+            name: "3D".into(),
+            util_pct: 7.0,
+        }];
+
+        let names = gpu_engine_names(&win, &snapshot, "0");
+        assert_eq!(names, vec!["3D".to_string(), "VideoEncode".to_string()]);
+        // Ordering is by role, not by the order they were discovered in.
+        let mut reversed = names.clone();
+        reversed.reverse();
+        assert_eq!(gpu_engine_names(&win, &snapshot, "0"), names);
+        assert_ne!(reversed, names);
+    }
+
+    #[test]
+    fn engine_labels_are_spelled_the_way_people_read_them() {
+        assert_eq!(engine_label("VideoEncode"), "Video Encode");
+        assert_eq!(engine_label("VideoDecode"), "Video Decode");
+        assert_eq!(engine_label("3D"), "3D");
+        assert_eq!(engine_label("Compute"), "Compute");
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -594,6 +649,72 @@ fn net_series(win: &[HistoryPoint], key: &str, idx: usize) -> Vec<f64> {
         .collect()
 }
 
+/// Utilization history of ONE engine type on one adapter.
+///
+/// A tick where the adapter reported no instance of that engine is a real
+/// zero, not a gap: PDH only publishes an engine instance while something is
+/// scheduled on it, so "no NVENC instance" means nothing was encoding.
+fn gpu_engine_series(win: &[HistoryPoint], key: &str, engine: &str) -> Vec<f64> {
+    win.iter()
+        .map(|h| {
+            h.gpu_engines
+                .iter()
+                .filter(|(id, name, _)| id.to_string() == key && name == engine)
+                .map(|(.., util)| f64::from(*util))
+                .fold(0.0f64, f64::max)
+        })
+        .collect()
+}
+
+/// Engine types this adapter has reported at any point in the visible window,
+/// in a stable order.
+///
+/// Taken from the history and not just the newest snapshot on purpose: the
+/// snapshot's engine list is sorted by utilization and truncated, so an engine
+/// that has just gone idle would drop out of the menu the moment the user
+/// wanted to look at what it had been doing.
+fn gpu_engine_names(
+    win: &[HistoryPoint],
+    snapshot: &[tm_core::model::GpuEngine],
+    key: &str,
+) -> Vec<String> {
+    let mut names: Vec<String> = snapshot.iter().map(|e| e.name.clone()).collect();
+    for (id, name, _) in win.iter().flat_map(|h| h.gpu_engines.iter()) {
+        if id.to_string() == key && !names.iter().any(|known| known == name) {
+            names.push(name.clone());
+        }
+    }
+    names.sort_by(|a, b| engine_rank(a).cmp(&engine_rank(b)).then_with(|| a.cmp(b)));
+    names
+}
+
+/// Task Manager's engine ordering: the ones a person looks for first.
+/// Anything unrecognized keeps its name order after them.
+fn engine_rank(name: &str) -> u8 {
+    match name {
+        "3D" => 0,
+        "Compute" => 1,
+        "Copy" => 2,
+        "VideoDecode" => 3,
+        "VideoEncode" => 4,
+        "VideoProcessing" => 5,
+        "Security" => 6,
+        _ => 7,
+    }
+}
+
+/// Human-readable engine label. PDH reports the raw D3D engine-type names, and
+/// "VideoEncode" in the graph caption of a task manager should read the way it
+/// does in every other task manager.
+fn engine_label(name: &str) -> String {
+    match name {
+        "VideoDecode" => "Video Decode".to_string(),
+        "VideoEncode" => "Video Encode".to_string(),
+        "VideoProcessing" => "Video Processing".to_string(),
+        other => other.to_string(),
+    }
+}
+
 fn gpu_series(win: &[HistoryPoint], key: &str, idx: usize) -> Vec<f64> {
     win.iter()
         .map(|h| {
@@ -1012,6 +1133,43 @@ fn cpu_graph_context_menu(app: &mut TaskManApp, resp: &egui::Response) {
             app.save_settings();
         }
     });
+}
+
+/// Right-click menu on the GPU utilization graph: "change graph to", the way
+/// Task Manager exposes the same choice.
+///
+/// The adapter's own utilization number is the BUSIEST engine, not a sum, so
+/// "Overall" and a single engine are answers to different questions —
+/// switching to Video Encode is the only way to see whether NVENC is busy
+/// while the 3D engine is pinned.
+fn gpu_graph_context_menu(app: &mut TaskManApp, resp: &egui::Response, engines: &[String]) {
+    let current = app.shared.settings.gpu_graph_mode.clone();
+    let mut chosen = None;
+    menu::context_menu(resp, |ui| {
+        menu::title(ui, i18n::tr(K::ChangeGraphTo));
+        menu::separator(ui);
+        if menu::check(ui, i18n::tr(K::CpuGraphOverall), current == "overall").clicked() {
+            chosen = Some("overall".to_string());
+            ui.close();
+        }
+        if menu::check(ui, i18n::tr(K::GpuAllEngines), current == "all").clicked() {
+            chosen = Some("all".to_string());
+            ui.close();
+        }
+        if !engines.is_empty() {
+            menu::separator(ui);
+        }
+        for engine in engines {
+            if menu::check(ui, &engine_label(engine), current == *engine).clicked() {
+                chosen = Some(engine.clone());
+                ui.close();
+            }
+        }
+    });
+    if let Some(mode) = chosen {
+        app.shared.settings.gpu_graph_mode = mode;
+        app.save_settings();
+    }
 }
 
 // ---------------------------------------------------------------- Memory page
@@ -1448,31 +1606,65 @@ fn gpu_page(app: &mut TaskManApp, ui: &mut egui::Ui, pal: &Palette, entry: &Reso
     let ts = timestamps(win);
     let width = content_width(ui);
 
-    let util = gpu_series(win, &entry.key, 1);
+    // Which engine the top graph shows. An engine this adapter never reported
+    // falls back to the overall (busiest-engine) view rather than drawing a
+    // flat zero the user cannot tell from an idle engine.
+    let engines = gpu_engine_names(win, &gpu.engines, &entry.key);
+    let mode = app.shared.settings.gpu_graph_mode.clone();
+    let mode = if mode == "overall" || mode == "all" || engines.contains(&mode) {
+        mode
+    } else {
+        "overall".to_string()
+    };
+
+    let (series_list, title) = match mode.as_str() {
+        "all" => (
+            engines
+                .iter()
+                .enumerate()
+                .map(|(index, name)| MultiSeries {
+                    samples: gpu_engine_series(win, &entry.key, name),
+                    // One hue, stepped in brightness: these are shares of the
+                    // same adapter, and a second accent colour on this page
+                    // would read as a different resource.
+                    color: pal
+                        .gpu_graph
+                        .gamma_multiply(1.0 - 0.13 * (index.min(5) as f32)),
+                })
+                .collect::<Vec<_>>(),
+            i18n::tr(K::GpuAllEngines).to_string(),
+        ),
+        "overall" => (
+            vec![MultiSeries {
+                samples: gpu_series(win, &entry.key, 1),
+                color: pal.gpu_graph,
+            }],
+            i18n::tr(K::Utilization60sPct)
+                .split(' ')
+                .next()
+                .unwrap_or("")
+                .to_string(),
+        ),
+        engine => (
+            vec![MultiSeries {
+                samples: gpu_engine_series(win, &entry.key, engine),
+                color: pal.gpu_graph,
+            }],
+            engine_label(engine),
+        ),
+    };
     caption(
         ui,
         pal,
         &format!(
-            "{}, {}",
-            i18n::tr(K::Utilization60sPct)
-                .split(' ')
-                .next()
-                .unwrap_or(""),
+            "{title}, {}",
             window_label(app.shared.settings.graph_seconds)
         ),
         "100 %",
     );
-    page_chart(
-        ui,
-        width,
-        150.0,
-        &[MultiSeries {
-            samples: util,
-            color: pal.gpu_graph,
-        }],
-        100.0,
-        Some(&ts),
-    );
+    // The menu mutates settings, so it runs once the history borrow that
+    // built these series has ended — at the bottom of this function.
+    let chart = page_chart(ui, width, 150.0, &series_list, 100.0, Some(&ts));
 
     let mem = gpu_series(win, &entry.key, 2);
     let mem_max = gpu
@@ -1542,12 +1734,13 @@ fn gpu_page(app: &mut TaskManApp, ui: &mut egui::Ui, pal: &Palette, entry: &Reso
                     kv_row(
                         ui,
                         pal,
-                        &format!("{} {}:", i18n::tr(K::KvEnginePrefix), e.name),
+                        &format!("{} {}:", i18n::tr(K::KvEnginePrefix), engine_label(&e.name)),
                         &format::format_pct_hdr(e.util_pct),
                     );
                 }
             });
         },
     );
+    gpu_graph_context_menu(app, &chart, &engines);
     ui.add_space(16.0);
 }
