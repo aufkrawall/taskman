@@ -24,6 +24,31 @@ Primary sources:
 Flags: `--host-only`, `--linux-only`, `--debug`, `--no-package`,
 `--require-all-targets`, `--check`.
 
+## Pushing: git-LFS must be uninstalled locally
+
+`git push` fails in any clone that has git-LFS active:
+
+```
+Git LFS upload failed: (missing) vendor/egui/crates/egui_demo_lib/tests/snapshots/...png
+hint: Your push was rejected due to missing or corrupt local objects.
+```
+
+The vendored egui subtree carries ~230 git-LFS pointer stubs for demo/kittest snapshots
+whose objects 404 from upstream's LFS server and were never copied here. LFS's `pre-push`
+hook scans outgoing commits for pointer content — it ignores `.gitattributes`, so the
+commented-out `*.png filter=lfs` rules in `vendor/egui/.gitattributes` (which do stop a
+clone from trying to smudge them) do not help.
+
+This repository stores nothing in LFS. Run once per clone:
+
+```bash
+git lfs uninstall --local
+git config --local lfs.allowincompletepush true
+```
+
+Both are local settings that cannot be committed. See
+`vendor/egui/TASKMAN-FORK.md` for why the stub files are kept rather than deleted.
+
 ## Quality gate
 
 `python build.py --check` runs the full gate:
