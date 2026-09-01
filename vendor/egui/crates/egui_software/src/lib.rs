@@ -45,12 +45,15 @@
 //! }
 //! ```
 
+mod gamma;
 mod raster;
 mod target;
 mod text;
 mod texture;
 
+pub use gamma::TextGamma;
 pub use target::{PixelRect, Target, clip_rect_to_pixels, pack_rgb};
+pub use text::TextBlend;
 pub use texture::{Texture, TextureStore};
 
 use ecolor::Color32;
@@ -99,6 +102,10 @@ pub struct ShapeContext {
 pub struct Painter {
     textures: TextureStore,
     text_mode: TextMode,
+    /// Sub-pixel mode and the gamma tables it needs. Set by the backend from the platform's
+    /// own text-rendering parameters; `Off` by default so nothing changes until asked.
+    subpixel: epaint::text::SubpixelMode,
+    gamma: gamma::TextGamma,
     /// Primitives that named a texture we do not have. Counted rather than logged per
     /// occurrence, because a missing texture usually means *every* glyph is missing and
     /// per-primitive logging would bury the actual cause.
@@ -112,6 +119,27 @@ impl Painter {
 
     pub fn set_text_mode(&mut self, mode: TextMode) {
         self.text_mode = mode;
+    }
+
+    /// Configure sub-pixel (`ClearType`) text.
+    ///
+    /// `mode` must match what the glyph atlas was rasterized with -- see
+    /// [`epaint::text::SubpixelMode`]. Enabling it here while the atlas holds grayscale
+    /// coverage (or the reverse) produces wrong colours, so both are driven from the same
+    /// setting in the backend.
+    ///
+    /// `gamma` and `contrast` come from the platform: on Windows,
+    /// `IDWriteGlyphRunAnalysis::GetAlphaBlendParams`. The tables are rebuilt only when
+    /// the values actually change.
+    pub fn set_subpixel(&mut self, mode: epaint::text::SubpixelMode, gamma: f32, contrast: f32) {
+        self.subpixel = mode;
+        if !self.gamma.matches(gamma, contrast) {
+            self.gamma = gamma::TextGamma::new(gamma, contrast);
+        }
+    }
+
+    pub fn subpixel(&self) -> epaint::text::SubpixelMode {
+        self.subpixel
     }
 
     pub fn text_mode(&self) -> TextMode {
@@ -352,7 +380,11 @@ impl Painter {
                             resolve(base + 2, false),
                             resolve(base + 3, false),
                         ];
-                        if text::blit_quad(target, clip, &quad, atlas) {
+                        let blend = text::TextBlend {
+                            subpixel: self.subpixel,
+                            gamma: &self.gamma,
+                        };
+                        if text::blit_quad(target, clip, &quad, atlas, blend) {
                             // Only mark it consumed once the blit actually happened.
                             // Marking it before would swallow the quads second triangle
                             // on the fallback path and draw half of every italic glyph.

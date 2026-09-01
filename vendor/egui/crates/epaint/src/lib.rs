@@ -64,7 +64,7 @@ pub use self::{
     stats::PaintStats,
     stroke::{PathStroke, Stroke, StrokeKind},
     tessellator::{TessellationOptions, Tessellator},
-    text::{FontFamily, FontId, Fonts, FontsView, Galley, TextOptions},
+    text::{FontFamily, FontId, Fonts, FontsView, Galley, LcdFilter, SubpixelMode, TextOptions},
     // TASKMAN-FORK: `PreparedDisc` appears in the public signature of
     // `Tessellator::new`, but upstream does not re-export it, so the type is unnameable
     // outside epaint and an external tessellator caller cannot store one. Upstreamable

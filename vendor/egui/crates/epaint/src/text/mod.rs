@@ -1,6 +1,9 @@
 //! Everything related to text, fonts, text layout, cursors etc.
 
 pub mod cursor;
+// TASKMAN-FORK: sub-pixel (LCD) glyph coverage.
+pub mod subpixel;
+pub use subpixel::{LcdFilter, SubpixelMode};
 mod font;
 mod fonts;
 mod index;
@@ -51,6 +54,29 @@ pub struct TextOptions {
     ///
     /// Default: `true`.
     pub subpixel_binning: bool,
+
+    /// TASKMAN-FORK: rasterize glyphs with per-channel (LCD sub-pixel) coverage.
+    ///
+    /// This changes what an atlas texel *means*, so it is a contract with the renderer
+    /// rather than a quality setting -- see [`crate::text::SubpixelMode`]. Only enable it
+    /// when the active backend blends each channel against its own coverage; a GPU
+    /// backend cannot, and will draw rainbow-tinted text.
+    ///
+    /// Default: [`SubpixelMode::Off`].
+    pub subpixel: SubpixelMode,
+
+    /// TASKMAN-FORK: the FIR filter applied across sub-pixel samples.
+    ///
+    /// Unused when [`Self::subpixel`] is off.
+    pub lcd_filter: LcdFilter,
+
+    /// TASKMAN-FORK: blend per-channel coverage toward grayscale.
+    ///
+    /// `1.0` is full sub-pixel rendering, `0.0` is grayscale. Mirrors `DirectWrite`'s
+    /// `ClearType` level, which users set in the `ClearType` tuner.
+    ///
+    /// Default: `1.0`.
+    pub cleartype_level: f32,
 }
 
 impl Default for TextOptions {
@@ -60,6 +86,9 @@ impl Default for TextOptions {
             color_transfer_function: crate::FontColorTransferFunction::default(),
             font_hinting: true,
             subpixel_binning: true,
+            subpixel: SubpixelMode::Off,
+            lcd_filter: LcdFilter::FREETYPE_DEFAULT,
+            cleartype_level: 1.0,
         }
     }
 }

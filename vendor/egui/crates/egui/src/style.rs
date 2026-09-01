@@ -2437,6 +2437,14 @@ impl Visuals {
                 color_transfer_function,
                 font_hinting,
                 subpixel_binning,
+                // TASKMAN-FORK: sub-pixel (ClearType) rasterization. Deliberately not
+                // exposed in this style editor -- the mode is a contract with the active
+                // renderer rather than a free choice, and the gamma/contrast values come
+                // from the platform. A control here would let a user hand a sub-pixel
+                // atlas to a GPU backend, which draws rainbow-tinted text.
+                subpixel: _,
+                lcd_filter: _,
+                cleartype_level: _,
             } = text_options;
 
             color_transfer_function_ui(ui, color_transfer_function);
