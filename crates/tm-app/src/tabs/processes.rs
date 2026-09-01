@@ -991,7 +991,7 @@ fn build_display_rows(
             // stay fully flat so a busy build tool under a console shell is
             // never hidden inside an unexpanded parent.
             emit_flat_with_family_groups(
-                &mut out, &members, &children, &subtree, sort_col, ascending, expanded,
+                &mut out, &members, &children, sort_col, ascending, expanded,
             );
         }
     }
@@ -1040,38 +1040,114 @@ fn sort_blocks_globally(rows: &mut Vec<DisplayRow>, sort_col: usize, ascending: 
 
 /// All processes of the connected same-image family rooted at `p`, or None
 /// when any descendant runs a different executable image.
-fn same_image_family<'a>(
+/// Whether `kid` belongs to `root`'s application rather than merely being
+/// something it launched.
+///
+/// Two ways in, and they are not equally permissive:
+///
+/// * **The same image.** A browser's renderer processes, a service's workers —
+///   the same program, unconditionally part of the family however busy it is.
+///   This is Task Manager's own rule and the reason a 40 % renderer stays
+///   inside its browser row.
+/// * **The same publisher**, for a helper that runs under a different image
+///   (`steamwebhelper` under Steam). This one is guarded, because a publisher
+///   match is much weaker evidence than an image match: the helper must be
+///   windowless and idle, so no visible program and no visible CPU load can
+///   disappear into a collapsed row, and neither end may be a system or
+///   launch boundary — `services.exe` must not swallow the service hosts and
+///   a shell must not swallow what a user started from it.
+fn joins_family(root: &ProcessEntry, kid: &ProcessEntry) -> bool {
+    if kid.name.eq_ignore_ascii_case(&root.name) {
+        return true;
+    }
+    let same_publisher = match (root.company.as_deref(), kid.company.as_deref()) {
+        (Some(a), Some(b)) => !a.is_empty() && a.eq_ignore_ascii_case(b),
+        _ => false,
+    };
+    same_publisher
+        && !kid.has_window
+        && kid.cpu_pct < PROMOTE_CPU_PCT
+        && !is_system_boundary(&root.name)
+        && !is_system_boundary(&kid.name)
+        && !is_launch_boundary(&root.name)
+}
+
+/// The connected family `p` heads: itself plus every descendant that
+/// [`joins_family`] accepts.
+///
+/// A descendant that does not join is left where it is AND is not descended
+/// into, so its own subtree stays with it. Previously one foreign descendant
+/// rejected the whole family, which is why a browser with a single
+/// `crashpad_handler` beside twenty renderers rendered as twenty-one flat
+/// rows instead of one group.
+fn application_family<'a>(
     p: &'a ProcessEntry,
     children: &HashMap<u32, Vec<&'a ProcessEntry>>,
-) -> Option<Vec<&'a ProcessEntry>> {
+) -> Vec<&'a ProcessEntry> {
     let mut out = vec![p];
     let mut seen: HashSet<u32> = HashSet::new();
     seen.insert(p.pid);
     let mut stack = vec![p];
     while let Some(cur) = stack.pop() {
         for kid in children.get(&cur.pid).into_iter().flatten() {
-            if !seen.insert(kid.pid) {
+            if !seen.insert(kid.pid) || !joins_family(p, kid) {
                 continue;
-            }
-            if !kid.name.eq_ignore_ascii_case(&p.name) {
-                return None;
             }
             out.push(*kid);
             stack.push(kid);
         }
     }
-    Some(out)
+    out
 }
 
-/// Flat Background/Windows rendering with same-image family collapse: every
-/// process gets its own row (own values, no nesting), except families whose
-/// members all share the root's image — they render as one expandable
-/// "Name (N)" row with the family aggregate, expanding to member rows.
+/// Sum of the members' OWN values.
+///
+/// Not the subtree aggregate: a family may now leave foreign descendants
+/// outside itself, and those are rendered as their own rows. Counting them in
+/// the group row too would show the same load twice.
+fn family_values(members: &[&ProcessEntry]) -> [f64; 4] {
+    let mut total = [0.0f64; 4];
+    for member in members {
+        for (slot, value) in total.iter_mut().zip(own_values(member)) {
+            *slot += value;
+        }
+    }
+    total
+}
+
+/// Repeat runs of one program started by one parent — eight `node.exe` under
+/// a task runner, a dozen helpers under one host.
+///
+/// The family rule above cannot see these: they are siblings, so the only
+/// process connecting them is a parent of a different image, and the family
+/// walk starts from a root that is not one of them. Two or more identical
+/// images under one parent is not a heuristic, though; it is literally the
+/// same program run several times by the same launcher.
+///
+/// Windows' own service hosts are excluded. `svchost.exe` is the row a person
+/// opens the Windows group to find, and native Task Manager lists every one of
+/// them; folding eighty of them behind one chevron would remove the reason
+/// that group exists.
+fn sibling_run_key(p: &ProcessEntry) -> Option<(u32, String)> {
+    if is_system_boundary(&p.name) || p.has_window {
+        return None;
+    }
+    p.ppid
+        .filter(|ppid| *ppid != p.pid)
+        .map(|ppid| (ppid, p.name.to_lowercase()))
+}
+
+/// Flat Background/Windows rendering with application grouping: every process
+/// gets its own row (own values, no nesting), except processes that belong to
+/// one application — they render as one expandable "Name (N)" row carrying the
+/// group's aggregate.
+///
+/// Two things group: a connected family under one root ([`application_family`])
+/// and a repeat run of one image under one parent ([`sibling_run_key`]).
 fn emit_flat_with_family_groups(
     out: &mut Vec<DisplayRow>,
     members: &[&ProcessEntry],
     children: &HashMap<u32, Vec<&ProcessEntry>>,
-    subtree: &Subtree,
     sort_col: usize,
     ascending: bool,
     expanded: &HashSet<u32>,
@@ -1079,22 +1155,50 @@ fn emit_flat_with_family_groups(
     let mut family_heads: HashMap<u32, Vec<&ProcessEntry>> = HashMap::new();
     let mut swallowed: HashSet<u32> = HashSet::new();
     for p in members {
-        if let Some(fam) = same_image_family(p, children)
-            && fam.len() > 1
-        {
-            family_heads.insert(p.pid, fam.clone());
+        // A process already inside another family cannot head one of its own,
+        // otherwise a chain would be emitted twice.
+        if swallowed.contains(&p.pid) {
+            continue;
+        }
+        let fam = application_family(p, children);
+        if fam.len() > 1 {
             for member in fam.iter().skip(1) {
                 swallowed.insert(member.pid);
             }
+            family_heads.insert(p.pid, fam);
         }
     }
 
-    // Representative values: family heads sort by their aggregate, plain
-    // rows by their own values.
+    // Repeat runs of one image under one parent, over whatever the family
+    // walk did not already claim. The lowest pid heads the run so the group's
+    // expansion state survives the list re-sorting on every tick.
+    let mut runs: HashMap<(u32, String), Vec<&ProcessEntry>> = HashMap::new();
+    for p in members {
+        if swallowed.contains(&p.pid) || family_heads.contains_key(&p.pid) {
+            continue;
+        }
+        if let Some(key) = sibling_run_key(p) {
+            runs.entry(key).or_default().push(p);
+        }
+    }
+    for (_, mut run) in runs {
+        if run.len() < 2 {
+            continue;
+        }
+        run.sort_by_key(|p| p.pid);
+        let head = run[0].pid;
+        for member in run.iter().skip(1) {
+            swallowed.insert(member.pid);
+        }
+        family_heads.insert(head, run);
+    }
+
+    // Representative values: group heads sort by their family aggregate,
+    // plain rows by their own values.
     let mut repr: HashMap<u32, [f64; 4]> = HashMap::with_capacity(members.len());
     for p in members {
-        if family_heads.contains_key(&p.pid) {
-            repr.insert(p.pid, subtree.values(p.pid));
+        if let Some(fam) = family_heads.get(&p.pid) {
+            repr.insert(p.pid, family_values(fam));
         } else if !swallowed.contains(&p.pid) {
             repr.insert(p.pid, own_values(p));
         }
@@ -2386,6 +2490,177 @@ mod tests {
         assert_eq!(bg_open[0].name, "Dropbox.exe (4)");
         assert!(bg_open[1..].iter().all(|r| r.depth == 1));
         assert!(bg_open[1..].iter().all(|r| !r.children));
+    }
+
+    /// One foreign helper used to reject the WHOLE family: a browser with
+    /// twenty renderers and a single crash handler rendered as twenty-one
+    /// flat rows. The renderers group; the crash handler stays its own row
+    /// and is not counted twice.
+    #[test]
+    fn a_foreign_descendant_no_longer_breaks_up_the_family() {
+        let mut main = proc(1, Some(99), "brave.exe", ProcCategory::Background);
+        main.cpu_pct = 1.0;
+        let mut renderer = proc(2, Some(1), "brave.exe", ProcCategory::Background);
+        renderer.cpu_pct = 2.0;
+        let mut renderer2 = proc(3, Some(1), "brave.exe", ProcCategory::Background);
+        renderer2.cpu_pct = 3.0;
+        let mut crash = proc(4, Some(1), "crashpad_handler.exe", ProcCategory::Background);
+        crash.cpu_pct = 4.0;
+
+        let rows = build_display_rows(
+            &snap_of(vec![main, renderer, renderer2, crash]),
+            "",
+            0,
+            true,
+            &HashSet::new(),
+            &[false; 3],
+        );
+        let bg = rows_in_group(&rows, 1);
+        assert_eq!(bg.len(), 2, "one family row plus the foreign helper");
+        assert_eq!(bg[0].name, "brave.exe (3)");
+        assert_eq!(
+            bg[0].values[0], 6.0,
+            "1 + 2 + 3, the crash handler excluded"
+        );
+        assert_eq!(bg[1].name, "crashpad_handler.exe");
+        assert!(!bg[1].children);
+    }
+
+    /// Siblings are connected only through a parent of a different image, so
+    /// the family walk cannot see them — but eight `node.exe` started by one
+    /// task runner are still eight copies of one program.
+    #[test]
+    fn repeat_runs_of_one_image_under_one_parent_group() {
+        let mut runner = proc(1, Some(99), "taskrunner.exe", ProcCategory::Background);
+        runner.cpu_pct = 0.5;
+        let mut kids: Vec<ProcessEntry> = (2..=4)
+            .map(|pid| {
+                let mut k = proc(pid, Some(1), "node.exe", ProcCategory::Background);
+                k.cpu_pct = 1.0;
+                k
+            })
+            .collect();
+        let mut all = vec![runner];
+        all.append(&mut kids);
+
+        let rows = build_display_rows(&snap_of(all), "", 0, true, &HashSet::new(), &[false; 3]);
+        let bg = rows_in_group(&rows, 1);
+        assert_eq!(bg.len(), 2, "the runner plus one grouped run");
+        let run = bg
+            .iter()
+            .find(|r| r.name.starts_with("node.exe"))
+            .expect("run row");
+        assert_eq!(run.name, "node.exe (3)");
+        assert_eq!(run.pid, 2, "the lowest pid heads the run, so it is stable");
+        assert!(run.children);
+        assert_eq!(run.values[0], 3.0);
+    }
+
+    /// The same image under DIFFERENT parents is not a run: those are
+    /// unrelated invocations and Task Manager keeps them apart.
+    #[test]
+    fn identical_images_under_different_parents_do_not_group() {
+        let a = proc(1, Some(90), "helper.exe", ProcCategory::Background);
+        let b = proc(2, Some(91), "helper.exe", ProcCategory::Background);
+        let rows = build_display_rows(
+            &snap_of(vec![a, b]),
+            "",
+            0,
+            true,
+            &HashSet::new(),
+            &[false; 3],
+        );
+        let bg = rows_in_group(&rows, 1);
+        assert_eq!(bg.len(), 2);
+        assert!(bg.iter().all(|r| !r.children));
+    }
+
+    /// `svchost.exe` is the row a person opens the Windows group to find.
+    /// Native Task Manager lists every one of them, so folding them behind a
+    /// chevron would remove the reason that group exists.
+    #[test]
+    fn windows_service_hosts_are_never_folded_into_one_row() {
+        let services = proc(1, Some(90), "services.exe", ProcCategory::System);
+        let hosts: Vec<ProcessEntry> = (2..=5)
+            .map(|pid| {
+                let mut host = proc(pid, Some(1), "svchost.exe", ProcCategory::System);
+                host.cpu_pct = 0.1;
+                host.company = Some("Microsoft Corporation".into());
+                host
+            })
+            .collect();
+        let mut all = vec![services];
+        all.extend(hosts);
+        // Same publisher on the parent too: the family rule must still refuse.
+        all[0].company = Some("Microsoft Corporation".into());
+
+        let rows = build_display_rows(&snap_of(all), "", 0, true, &HashSet::new(), &[false; 3]);
+        let sys = rows_in_group(&rows, 2);
+        assert_eq!(sys.len(), 5, "every host keeps its own row: {sys:?}");
+        assert!(sys.iter().all(|r| !r.children));
+    }
+
+    /// A helper of the same publisher running under a different image
+    /// (`steamwebhelper` under Steam) folds in — but only while it is idle
+    /// and windowless, so nothing a user can see or feel disappears.
+    #[test]
+    fn an_idle_same_publisher_helper_joins_the_family_but_a_busy_one_does_not() {
+        let publisher = || Some("Valve Corporation".to_string());
+        let mut steam = proc(1, Some(99), "steam.exe", ProcCategory::Background);
+        steam.cpu_pct = 0.2;
+        steam.company = publisher();
+        let mut idle = proc(2, Some(1), "steamwebhelper.exe", ProcCategory::Background);
+        idle.cpu_pct = 0.1;
+        idle.company = publisher();
+
+        let rows = build_display_rows(
+            &snap_of(vec![steam.clone(), idle.clone()]),
+            "",
+            0,
+            true,
+            &HashSet::new(),
+            &[false; 3],
+        );
+        let bg = rows_in_group(&rows, 1);
+        assert_eq!(bg.len(), 1, "idle helper folds in");
+        assert_eq!(bg[0].name, "steam.exe (2)");
+
+        let mut busy = idle;
+        busy.cpu_pct = 20.0;
+        let rows = build_display_rows(
+            &snap_of(vec![steam, busy]),
+            "",
+            0,
+            true,
+            &HashSet::new(),
+            &[false; 3],
+        );
+        let bg = rows_in_group(&rows, 1);
+        assert_eq!(bg.len(), 2, "a busy helper stays its own row: {bg:?}");
+    }
+
+    /// A different publisher is not evidence of anything. `cargo.exe` under
+    /// `cmd.exe` must never fold in even when it is idle.
+    #[test]
+    fn a_different_publisher_never_folds_in() {
+        let mut shell = proc(1, Some(99), "cmd.exe", ProcCategory::Background);
+        shell.cpu_pct = 0.1;
+        shell.company = Some("Microsoft Corporation".into());
+        let mut tool = proc(2, Some(1), "cargo.exe", ProcCategory::Background);
+        tool.cpu_pct = 0.1;
+        tool.company = Some("The Rust Project".into());
+
+        let rows = build_display_rows(
+            &snap_of(vec![shell, tool]),
+            "",
+            0,
+            true,
+            &HashSet::new(),
+            &[false; 3],
+        );
+        let bg = rows_in_group(&rows, 1);
+        assert_eq!(bg.len(), 2);
+        assert!(bg.iter().all(|r| !r.children));
     }
 
     #[test]
