@@ -46,8 +46,10 @@ Ten reported gaps in one pass; `log/recent.md` carries the root causes.
   was nothing behind it when `ShowWindow` composed it.
 - **egui's scroll-edge fades are off.** They read as shadows lying on the
   tables.
-- **Details names carry the image name**: `Description (image.exe)`, dropping
-  the bracket when it would only repeat the name.
+- **Row names split by page**: Details shows the image name only
+  (`svchost.exe`), Processes shows `Description (image.exe)`. Process counts
+  use square brackets on Processes (`Microsoft Edge (msedge.exe) [24]`,
+  `Apps [7]`) so they cannot be read as an image name.
 
 ## Recently landed (2026-09-01 — CPU renderer and ClearType text)
 
