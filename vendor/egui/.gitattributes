@@ -1,7 +1,14 @@
 * text=auto eol=lf
 Cargo.lock linguist-generated=false
-*.png filter=lfs diff=lfs merge=lfs -text
-*.gif filter=lfs diff=lfs merge=lfs -text
+# TASKMAN-FORK: upstream tracks *.png / *.gif here through git-LFS, but those objects
+# 404 from the upstream LFS server and were never copied into this repo's LFS store.
+# The ~229 files under crates/egui_demo_app and crates/egui_kittest are therefore inert
+# pointer stubs (~30 KB total). Leaving the filter active would make a fresh clone of
+# tmproject try to smudge them and fail. We build none of those crates, so the rules are
+# disabled rather than the files deleted -- deleting them would conflict on every
+# `git subtree pull`. Restore these two lines if the fork ever needs real LFS assets.
+# *.png filter=lfs diff=lfs merge=lfs -text
+# *.gif filter=lfs diff=lfs merge=lfs -text
 
 # Exclude some small files from LFS:
 crates/eframe/data/* !filter !diff !merge text=auto eol=lf

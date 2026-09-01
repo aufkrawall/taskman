@@ -1,3 +1,8 @@
+// TASKMAN-FORK: raise the trait-solver recursion limit.
+// wgpu 30's `Global` type graph exceeds the default 128-step auto-trait
+// solver budget. Registry deps hide this via --cap-lints; a path dep does not,
+// and rustc is phasing the warning into a hard error (rust-lang/rust#159228).
+#![recursion_limit = "256"]
 //! This crates provides bindings between [`egui`](https://github.com/emilk/egui) and [wgpu](https://crates.io/crates/wgpu).
 //!
 //! If you're targeting WebGL you also need to turn on the

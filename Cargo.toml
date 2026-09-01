@@ -1,6 +1,10 @@
 [workspace]
 resolver = "2"
 members = ["crates/tm-core", "crates/tm-platform", "crates/tm-app", "crates/tm-service"]
+# `vendor/egui` is our egui fork (see llm-wiki/render-pipeline.md). It carries its own
+# [workspace] and uses `workspace = true` field inheritance plus relative path deps, so it
+# must stay a separate workspace; it is reached only through [patch.crates-io] below.
+exclude = ["vendor/egui"]
 
 [workspace.package]
 version = "0.1.0"
@@ -53,3 +57,26 @@ debug = "line-tables-only"
 [profile.dev.package."*"]
 # Optimize heavy third-party deps even in dev so wgpu/sysinfo stay usable while debugging.
 opt-level = 2
+
+# --- Vendored egui fork -------------------------------------------------------
+#
+# Sub-pixel (ClearType) text and the native CPU renderer both live in a fork of
+# emilk/egui, vendored at `vendor/egui` via `git subtree --squash` from tag 0.36.1.
+#
+# EVERY egui-repo crate that appears in Cargo.lock must be patched. Patching only
+# some of them puts two incompatible copies of egui in the graph, and the errors
+# that produces ("expected `egui::Context`, found `egui::Context`") are miserable
+# to diagnose. Verify with `cargo tree -d` after any change here.
+#
+# Note that `cargo clippy/test --workspace` does NOT reach an excluded workspace:
+# the fork has its own quality gate, `tools/check-fork.ps1`, run by build.py --check.
+[patch.crates-io]
+emath = { path = "vendor/egui/crates/emath" }
+ecolor = { path = "vendor/egui/crates/ecolor" }
+epaint = { path = "vendor/egui/crates/epaint" }
+epaint_default_fonts = { path = "vendor/egui/crates/epaint_default_fonts" }
+egui = { path = "vendor/egui/crates/egui" }
+egui-winit = { path = "vendor/egui/crates/egui-winit" }
+egui_glow = { path = "vendor/egui/crates/egui_glow" }
+egui-wgpu = { path = "vendor/egui/crates/egui-wgpu" }
+eframe = { path = "vendor/egui/crates/eframe" }
