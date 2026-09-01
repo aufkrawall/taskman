@@ -2,11 +2,11 @@
 Cargo.lock linguist-generated=false
 # TASKMAN-FORK: upstream tracks *.png / *.gif here through git-LFS, but those objects
 # 404 from the upstream LFS server and were never copied into this repo's LFS store.
-# The ~229 files under crates/egui_demo_app and crates/egui_kittest are therefore inert
-# pointer stubs (~30 KB total). Leaving the filter active would make a fresh clone of
-# tmproject try to smudge them and fail. We build none of those crates, so the rules are
-# disabled rather than the files deleted -- deleting them would conflict on every
-# `git subtree pull`. Restore these two lines if the fork ever needs real LFS assets.
+# The filter rules are disabled so a fresh clone does not try to smudge them, and the
+# 230 pointer stubs they used to describe have been removed from this fork's history:
+# GitHub rejects any push that carries a pointer whose object it does not have
+# (GH008), which made the whole repository unpushable. See TASKMAN-FORK.md.
+# `git subtree pull` will re-add them; delete them again in the same commit.
 # *.png filter=lfs diff=lfs merge=lfs -text
 # *.gif filter=lfs diff=lfs merge=lfs -text
 
