@@ -60,6 +60,7 @@ opt-level = 2
 emath = { version = "0.36.1", path = "crates/emath", default-features = false }
 ecolor = { version = "0.36.1", path = "crates/ecolor", default-features = false }
 epaint = { version = "0.36.1", path = "crates/epaint", default-features = false }
+egui_software = { version = "0.36.1", path = "crates/egui_software" }
 epaint_default_fonts = { version = "0.36.1", path = "crates/epaint_default_fonts" }
 egui = { version = "0.36.1", path = "crates/egui", default-features = false }
 egui-winit = { version = "0.36.1", path = "crates/egui-winit", default-features = false }

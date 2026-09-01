@@ -10,7 +10,10 @@ name = "taskman"
 path = "src/main.rs"
 
 [features]
-default = ["wgpu", "glow"]
+default = ["software", "wgpu", "glow"]
+# The native CPU renderer. Tried first: it needs no driver, and it is the only backend
+# that can do sub-pixel (ClearType) text. The GPU backends stay as fallbacks for now.
+software = ["eframe/software"]
 wgpu = ["eframe/wgpu_no_default_features", "dep:wgpu"]
 glow = ["eframe/glow"]
 

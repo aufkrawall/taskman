@@ -395,6 +395,47 @@ fn run_and_exit(event_loop: EventLoop<UserEvent>, winit_app: impl WinitApp) -> R
 
 // ----------------------------------------------------------------------------
 
+// TASKMAN-FORK: the CPU renderer. Mirrors the glow pair below.
+
+#[cfg(feature = "software")]
+pub fn run_software(
+    app_name: &str,
+    mut native_options: epi::NativeOptions,
+    egui_ctx: Option<egui::Context>,
+    app_creator: epi::AppCreator<'_>,
+) -> Result {
+    use super::software_integration::SoftwareWinitApp;
+
+    #[cfg(not(target_os = "ios"))]
+    if native_options.run_and_return {
+        return with_event_loop(native_options, |event_loop, native_options| {
+            let mut app = SoftwareWinitApp::new(event_loop, app_name, native_options, app_creator);
+            app.set_egui_ctx(egui_ctx);
+            run_and_return(event_loop, app)
+        })?;
+    }
+
+    let event_loop = create_event_loop(&mut native_options)?;
+    let mut app = SoftwareWinitApp::new(&event_loop, app_name, native_options, app_creator);
+    app.set_egui_ctx(egui_ctx);
+    run_and_exit(event_loop, app)
+}
+
+#[cfg(feature = "software")]
+pub fn create_software<'a>(
+    app_name: &str,
+    native_options: epi::NativeOptions,
+    app_creator: epi::AppCreator<'a>,
+    event_loop: &EventLoop<UserEvent>,
+) -> impl ApplicationHandler<UserEvent> + 'a {
+    use super::software_integration::SoftwareWinitApp;
+
+    let app = SoftwareWinitApp::new(event_loop, app_name, native_options, app_creator);
+    WinitAppWrapper::new(app, true)
+}
+
+// ----------------------------------------------------------------------------
+
 #[cfg(feature = "glow")]
 pub fn run_glow(
     app_name: &str,

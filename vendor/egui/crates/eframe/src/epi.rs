@@ -10,7 +10,11 @@
 use std::any::Any;
 
 #[cfg(not(target_arch = "wasm32"))]
-#[cfg(any(feature = "glow", feature = "wgpu_no_default_features"))]
+#[cfg(any(
+    feature = "glow",
+    feature = "wgpu_no_default_features",
+    feature = "software"
+))]
 pub use crate::native::winit_integration::UserEvent;
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -22,7 +26,11 @@ use raw_window_handle::{
 use static_assertions::assert_not_impl_any;
 
 #[cfg(not(target_arch = "wasm32"))]
-#[cfg(any(feature = "glow", feature = "wgpu_no_default_features"))]
+#[cfg(any(
+    feature = "glow",
+    feature = "wgpu_no_default_features",
+    feature = "software"
+))]
 pub use winit::{event_loop::EventLoopBuilder, window::WindowAttributes};
 
 /// Hook into the building of an event loop before it is run
@@ -30,7 +38,11 @@ pub use winit::{event_loop::EventLoopBuilder, window::WindowAttributes};
 /// You can configure any platform specific details required on top of the default configuration
 /// done by `EFrame`.
 #[cfg(not(target_arch = "wasm32"))]
-#[cfg(any(feature = "glow", feature = "wgpu_no_default_features"))]
+#[cfg(any(
+    feature = "glow",
+    feature = "wgpu_no_default_features",
+    feature = "software"
+))]
 pub type EventLoopBuilderHook = Box<dyn FnOnce(&mut EventLoopBuilder<UserEvent>)>;
 
 /// Hook into the building of a the native window.
@@ -38,7 +50,11 @@ pub type EventLoopBuilderHook = Box<dyn FnOnce(&mut EventLoopBuilder<UserEvent>)
 /// You can configure any platform specific details required on top of the default configuration
 /// done by `eframe`.
 #[cfg(not(target_arch = "wasm32"))]
-#[cfg(any(feature = "glow", feature = "wgpu_no_default_features"))]
+#[cfg(any(
+    feature = "glow",
+    feature = "wgpu_no_default_features",
+    feature = "software"
+))]
 pub type WindowBuilderHook = Box<dyn FnOnce(egui::ViewportBuilder) -> egui::ViewportBuilder>;
 
 type DynError = Box<dyn std::error::Error + Send + Sync>;
@@ -324,7 +340,11 @@ pub struct NativeOptions {
     pub stencil_buffer: u8,
 
     /// What rendering backend to use.
-    #[cfg(any(feature = "glow", feature = "wgpu_no_default_features"))]
+    #[cfg(any(
+        feature = "glow",
+        feature = "wgpu_no_default_features",
+        feature = "software"
+    ))]
     pub renderer: Renderer,
 
     /// This controls what happens when you close the main eframe window.
@@ -347,7 +367,11 @@ pub struct NativeOptions {
     /// event loop before it is run.
     ///
     /// Note: A [`NativeOptions`] clone will not include any `event_loop_builder` hook.
-    #[cfg(any(feature = "glow", feature = "wgpu_no_default_features"))]
+    #[cfg(any(
+        feature = "glow",
+        feature = "wgpu_no_default_features",
+        feature = "software"
+    ))]
     pub event_loop_builder: Option<EventLoopBuilderHook>,
 
     /// Hook into the building of a window.
@@ -356,7 +380,11 @@ pub struct NativeOptions {
     /// window appearance.
     ///
     /// Note: A [`NativeOptions`] clone will not include any `window_builder` hook.
-    #[cfg(any(feature = "glow", feature = "wgpu_no_default_features"))]
+    #[cfg(any(
+        feature = "glow",
+        feature = "wgpu_no_default_features",
+        feature = "software"
+    ))]
     pub window_builder: Option<WindowBuilderHook>,
 
     /// On desktop: make the window position to be centered at initialization.
@@ -408,10 +436,18 @@ impl Clone for NativeOptions {
         Self {
             viewport: self.viewport.clone(),
 
-            #[cfg(any(feature = "glow", feature = "wgpu_no_default_features"))]
+            #[cfg(any(
+                feature = "glow",
+                feature = "wgpu_no_default_features",
+                feature = "software"
+            ))]
             event_loop_builder: None, // Skip any builder callbacks if cloning
 
-            #[cfg(any(feature = "glow", feature = "wgpu_no_default_features"))]
+            #[cfg(any(
+                feature = "glow",
+                feature = "wgpu_no_default_features",
+                feature = "software"
+            ))]
             window_builder: None, // Skip any builder callbacks if cloning
 
             #[cfg(feature = "glow")]
@@ -440,15 +476,27 @@ impl Default for NativeOptions {
             depth_buffer: 0,
             stencil_buffer: 0,
 
-            #[cfg(any(feature = "glow", feature = "wgpu_no_default_features"))]
+            #[cfg(any(
+                feature = "glow",
+                feature = "wgpu_no_default_features",
+                feature = "software"
+            ))]
             renderer: Renderer::default(),
 
             run_and_return: true,
 
-            #[cfg(any(feature = "glow", feature = "wgpu_no_default_features"))]
+            #[cfg(any(
+                feature = "glow",
+                feature = "wgpu_no_default_features",
+                feature = "software"
+            ))]
             event_loop_builder: None,
 
-            #[cfg(any(feature = "glow", feature = "wgpu_no_default_features"))]
+            #[cfg(any(
+                feature = "glow",
+                feature = "wgpu_no_default_features",
+                feature = "software"
+            ))]
             window_builder: None,
 
             centered: false,
@@ -478,7 +526,11 @@ impl Default for NativeOptions {
 #[cfg(target_arch = "wasm32")]
 pub struct WebOptions {
     /// What rendering backend to use.
-    #[cfg(any(feature = "glow", feature = "wgpu_no_default_features"))]
+    #[cfg(any(
+        feature = "glow",
+        feature = "wgpu_no_default_features",
+        feature = "software"
+    ))]
     pub renderer: Renderer,
 
     /// Sets the number of bits in the depth buffer.
@@ -533,7 +585,11 @@ pub struct WebOptions {
 impl Default for WebOptions {
     fn default() -> Self {
         Self {
-            #[cfg(any(feature = "glow", feature = "wgpu_no_default_features"))]
+            #[cfg(any(
+                feature = "glow",
+                feature = "wgpu_no_default_features",
+                feature = "software"
+            ))]
             renderer: Renderer::default(),
 
             depth_buffer: 0,
@@ -581,11 +637,22 @@ pub enum WebGlContextOption {
 /// What rendering backend to use.
 ///
 /// You need to enable the "glow" and "wgpu" features to have a choice.
-#[cfg(any(feature = "glow", feature = "wgpu_no_default_features"))]
+#[cfg(any(
+    feature = "glow",
+    feature = "wgpu_no_default_features",
+    feature = "software"
+))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
 #[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
 pub enum Renderer {
+    /// TASKMAN-FORK: paint on the CPU with `egui_software`, present with `softbuffer`.
+    ///
+    /// No GPU, no driver, no shader compiler -- and the only backend that can do
+    /// sub-pixel (ClearType) text, which needs per-channel alpha blending.
+    #[cfg(feature = "software")]
+    Software,
+
     /// Use [`egui_glow`] renderer for [`glow`](https://github.com/grovesNL/glow).
     #[cfg(feature = "glow")]
     Glow,
@@ -595,14 +662,27 @@ pub enum Renderer {
     Wgpu,
 }
 
-#[cfg(any(feature = "glow", feature = "wgpu_no_default_features"))]
+#[cfg(any(
+    feature = "glow",
+    feature = "wgpu_no_default_features",
+    feature = "software"
+))]
 impl Default for Renderer {
     fn default() -> Self {
         #[cfg(not(feature = "glow"))]
         #[cfg(not(feature = "wgpu_no_default_features"))]
+        #[cfg(not(feature = "software"))]
         compile_error!(
-            "eframe: you must enable at least one of the rendering backend features: 'glow' or 'wgpu'"
+            "eframe: you must enable at least one of the rendering backend features: 'glow', 'wgpu' or 'software'"
         );
+
+        // TASKMAN-FORK: a software-only build has nothing else to fall back on. When a
+        // GPU backend is also compiled in, the historical default is kept -- `Software`
+        // stays opt-in, chosen explicitly through `NativeOptions::renderer`.
+        #[cfg(not(feature = "glow"))]
+        #[cfg(not(feature = "wgpu_no_default_features"))]
+        #[cfg(feature = "software")]
+        return Self::Software;
 
         #[cfg(feature = "glow")]
         #[cfg(not(feature = "wgpu_no_default_features"))]
@@ -620,10 +700,17 @@ impl Default for Renderer {
     }
 }
 
-#[cfg(any(feature = "glow", feature = "wgpu_no_default_features"))]
+#[cfg(any(
+    feature = "glow",
+    feature = "wgpu_no_default_features",
+    feature = "software"
+))]
 impl std::fmt::Display for Renderer {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            #[cfg(feature = "software")]
+            Self::Software => "software".fmt(f),
+
             #[cfg(feature = "glow")]
             Self::Glow => "glow".fmt(f),
 
@@ -633,12 +720,19 @@ impl std::fmt::Display for Renderer {
     }
 }
 
-#[cfg(any(feature = "glow", feature = "wgpu_no_default_features"))]
+#[cfg(any(
+    feature = "glow",
+    feature = "wgpu_no_default_features",
+    feature = "software"
+))]
 impl std::str::FromStr for Renderer {
     type Err = String;
 
     fn from_str(name: &str) -> Result<Self, String> {
         match name.to_lowercase().as_str() {
+            #[cfg(feature = "software")]
+            "software" => Ok(Self::Software),
+
             #[cfg(feature = "glow")]
             "glow" => Ok(Self::Glow),
 
