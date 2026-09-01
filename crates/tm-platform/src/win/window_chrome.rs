@@ -12,8 +12,8 @@
 
 use windows::Win32::Foundation::{COLORREF, HWND};
 use windows::Win32::Graphics::Dwm::{
-    DWMWA_BORDER_COLOR, DWMWA_CAPTION_COLOR, DWMWA_SYSTEMBACKDROP_TYPE, DWMWA_TEXT_COLOR,
-    DWMWA_USE_IMMERSIVE_DARK_MODE, DWMWINDOWATTRIBUTE, DwmSetWindowAttribute,
+    DWMWA_BORDER_COLOR, DWMWA_CAPTION_COLOR, DWMWA_CLOAK, DWMWA_SYSTEMBACKDROP_TYPE,
+    DWMWA_TEXT_COLOR, DWMWA_USE_IMMERSIVE_DARK_MODE, DWMWINDOWATTRIBUTE, DwmSetWindowAttribute,
 };
 
 /// What the caption should look like, in the app's own terms.
@@ -98,6 +98,29 @@ pub fn apply(hwnd: isize, look: TitleBar) {
     set_attr(hwnd, DWMWA_CAPTION_COLOR, &colorref(look.caption));
     set_attr(hwnd, DWMWA_TEXT_COLOR, &colorref(look.text));
     set_attr(hwnd, DWMWA_BORDER_COLOR, &colorref(look.border));
+}
+
+/// Hide or reveal a window at the COMPOSITOR, without changing whether
+/// Windows considers it shown.
+///
+/// This exists to kill the white flash when the window comes back from the
+/// tray. `ShowWindow(SW_HIDE)` drops the window's composed content, and a
+/// hidden window receives no `WM_PAINT`, so there is no way to have a frame
+/// ready before it appears: DWM composes the empty window first and the app's
+/// first frame lands one beat later. Cloaking inverts the order — show the
+/// window cloaked so it starts painting, then uncloak once a real frame has
+/// been presented.
+///
+/// A cloaked window is still "visible" to Windows (it keeps its taskbar
+/// button and its focus), which is exactly why this is used only for the
+/// handful of frames around a restore and never as the tray-hide mechanism.
+pub fn set_cloaked(hwnd: isize, cloaked: bool) {
+    let hwnd = HWND(hwnd as *mut std::ffi::c_void);
+    set_attr(
+        hwnd,
+        DWMWA_CLOAK,
+        &windows::core::BOOL::from(cloaked).0.cast_unsigned(),
+    );
 }
 
 /// Whether the user has Windows' "Transparency effects" turned on.

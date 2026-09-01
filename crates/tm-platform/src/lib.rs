@@ -71,6 +71,16 @@ pub fn apply_title_bar(
 ) {
 }
 
+/// Hide or reveal a window at the compositor — see
+/// [`win::window_chrome::set_cloaked`]. Non-Windows hosts ignore it.
+#[cfg(target_os = "windows")]
+pub fn set_window_cloaked(hwnd: isize, cloaked: bool) {
+    win::window_chrome::set_cloaked(hwnd, cloaked);
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn set_window_cloaked(_hwnd: isize, _cloaked: bool) {}
+
 /// Build only the platform action surface (process control, services,
 /// startup apps, ...).
 ///

@@ -515,6 +515,13 @@ struct NativeApp {
     initial_hide_pending: bool,
     #[cfg(target_os = "windows")]
     exit_requested: bool,
+    /// Native window handle, cached the first time a frame hands it over.
+    #[cfg(target_os = "windows")]
+    hwnd: Option<isize>,
+    /// Frames still owed before the window is uncloaked after a restore.
+    /// See [`NativeApp::restore_window`]; 0 means "not cloaked by us".
+    #[cfg(target_os = "windows")]
+    uncloak_in: u8,
 }
 
 impl NativeApp {
@@ -541,6 +548,10 @@ impl NativeApp {
             initial_hide_pending: initially_hidden,
             #[cfg(target_os = "windows")]
             exit_requested: false,
+            #[cfg(target_os = "windows")]
+            hwnd: None,
+            #[cfg(target_os = "windows")]
+            uncloak_in: 0,
         }
     }
 
@@ -703,6 +714,10 @@ impl eframe::App for NativeApp {
     fn logic(&mut self, ctx: &eframe::egui::Context, frame: &mut eframe::Frame) {
         #[cfg(target_os = "windows")]
         poll_show_event_fallback(ctx);
+        // Before the tray actions, so a restore requested THIS frame cannot
+        // spend one of the frames it is owed on the frame that requested it.
+        #[cfg(target_os = "windows")]
+        self.finish_restore(ctx);
         #[cfg(target_os = "windows")]
         self.handle_tray_actions(ctx);
         if self.initial_hide_pending {
@@ -724,6 +739,15 @@ impl eframe::App for NativeApp {
     }
 
     fn ui(&mut self, ui: &mut eframe::egui::Ui, frame: &mut eframe::Frame) {
+        #[cfg(target_os = "windows")]
+        if self.hwnd.is_none() {
+            use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+            if let Ok(handle) = frame.window_handle()
+                && let RawWindowHandle::Win32(win32) = handle.as_raw()
+            {
+                self.hwnd = Some(win32.hwnd.get());
+            }
+        }
         <app::TaskManApp as eframe::App>::ui(&mut self.inner, ui, frame);
         #[cfg(target_os = "windows")]
         {
@@ -983,12 +1007,57 @@ impl TrayShell {
 
 #[cfg(target_os = "windows")]
 impl NativeApp {
+    /// Bring the window back from the tray without the white flash.
+    ///
+    /// `ShowWindow` alone composes an unpainted window: a hidden window gets
+    /// no `WM_PAINT`, so the app cannot have a frame ready before it appears,
+    /// and DWM fills the gap with the empty surface. Cloaking first means the
+    /// window is shown — and therefore painting — while still invisible to the
+    /// compositor; [`Self::finish_restore`] uncloaks it once a real frame has
+    /// been presented.
+    fn restore_window(&mut self, ctx: &eframe::egui::Context) {
+        self.hidden_to_tray = false;
+        if let Some(hwnd) = self.hwnd {
+            tm_platform::set_window_cloaked(hwnd, true);
+            // Two frames. `Visible(true)` below is queued and applied after
+            // THIS frame, so the first frame that can present into a visible
+            // window is the next one; the one after that reveals it.
+            self.uncloak_in = 2;
+        }
+        ctx.send_viewport_cmd(eframe::egui::ViewportCommand::Visible(true));
+        ctx.send_viewport_cmd(eframe::egui::ViewportCommand::Focus);
+        // The UI is event driven and the engine may be paused, so the frames
+        // the countdown needs have to be asked for explicitly.
+        ctx.request_repaint();
+    }
+
+    /// Uncloak once the frames owed by [`Self::restore_window`] have gone by.
+    ///
+    /// Driven from the START of every frame rather than a one-shot callback,
+    /// for two reasons. A frame's paint has been presented by the time the
+    /// next one begins, so counting here means the window is only revealed
+    /// once real content is behind it. And running unconditionally every
+    /// frame means the window can never be left invisible: whatever happens
+    /// in between, the countdown keeps ticking and reaches zero.
+    fn finish_restore(&mut self, ctx: &eframe::egui::Context) {
+        if self.uncloak_in == 0 {
+            return;
+        }
+        self.uncloak_in -= 1;
+        if self.uncloak_in == 0 {
+            if let Some(hwnd) = self.hwnd {
+                tm_platform::set_window_cloaked(hwnd, false);
+            }
+        } else {
+            // The countdown must not stall on an idle, event-driven UI.
+            ctx.request_repaint();
+        }
+    }
+
     fn handle_tray_actions(&mut self, ctx: &eframe::egui::Context) {
         match TRAY_ACTION.swap(0, std::sync::atomic::Ordering::AcqRel) {
             TRAY_ACTION_OPEN => {
-                self.hidden_to_tray = false;
-                ctx.send_viewport_cmd(eframe::egui::ViewportCommand::Visible(true));
-                ctx.send_viewport_cmd(eframe::egui::ViewportCommand::Focus);
+                self.restore_window(ctx);
             }
             TRAY_ACTION_EXIT => {
                 self.exit_requested = true;

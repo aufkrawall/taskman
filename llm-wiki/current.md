@@ -40,6 +40,12 @@ Ten reported gaps in one pass; `log/recent.md` carries the root causes.
   mode and the Windows 11 backdrop request. The limits are in `known-debt.md`.
 - Window drags from the strip below the caption start on the button press, the
   search box has a clear button, and the dense list rows are 20 px.
+- **No white flash restoring from the tray.** The window is cloaked
+  (`DWMWA_CLOAK`) before it is shown and uncloaked two frames later, once a
+  real frame has been presented — a hidden window is never painted, so there
+  was nothing behind it when `ShowWindow` composed it.
+- **egui's scroll-edge fades are off.** They read as shadows lying on the
+  tables.
 
 ## Recently landed (2026-09-01 — CPU renderer and ClearType text)
 
