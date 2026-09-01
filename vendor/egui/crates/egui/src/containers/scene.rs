@@ -76,7 +76,7 @@ bitflags::bitflags! {
 impl Default for Scene {
     fn default() -> Self {
         Self {
-            zoom_range: Rangef::new(f32::EPSILON, 1.0),
+            zoom_range: Rangef::new(<f32>::EPSILON, 1.0),
             sense: Sense::click_and_drag(),
             max_inner_size: Vec2::splat(1000.0),
             drag_pan_buttons: DragPanButtons::all(),

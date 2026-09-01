@@ -149,6 +149,29 @@ def package_tar(name: str, files: list[tuple[Path, str]]) -> Path:
     return dest
 
 
+def check_fork() -> bool:
+    """Lint and test the vendored egui fork at vendor/egui.
+
+    The workspace gate above cannot cover it: `cargo clippy --workspace` only passes
+    `-D warnings` to the packages it selected, and vendor/egui is deliberately an excluded
+    separate workspace (it needs its own `workspace = true` field inheritance). Without
+    this step the fork's crates -- including the CPU renderer -- sit outside the gate.
+
+    Skipped with a note when the fork is absent, so a checkout that has not run
+    `git subtree add` yet still builds.
+    """
+    fork = ROOT / "vendor" / "egui"
+    if not (fork / "Cargo.toml").exists():
+        log("vendor/egui not present - skipping fork gate")
+        return True
+    script = ROOT / "tools" / "check-fork.ps1"
+    shell = shutil.which("pwsh") or shutil.which("powershell")
+    if shell is None:
+        log("no pwsh/powershell found - skipping fork gate (CI must provide one)")
+        return True
+    return run([shell, "-NoProfile", "-File", str(script)])
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--debug", action="store_true", help="build the dev profile instead of release")
@@ -186,6 +209,7 @@ def main() -> int:
             ]
         )
         ok &= run([cargo(), "test", "--workspace", "--all-features"])
+        ok &= check_fork()
         if not ok:
             log("quality gate failed")
             return 1
