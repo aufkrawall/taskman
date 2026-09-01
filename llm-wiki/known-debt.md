@@ -27,7 +27,8 @@ items across Phases 2–6. The following concrete gaps remain:
 - **Telemetry fidelity:** native SRUM App History;
   measured Startup Impact; packaged/MSIX startup tasks; full `.lnk` target
   resolution through `IShellLink`/`IPersistFile`; memory-composition
-  categories/bar; full per-GPU-engine histories and static GPU details.
+  categories/bar; static GPU details. (Per-GPU-engine histories landed
+  2026-09-01 — `HistoryPoint.gpu_engines` plus the "change graph to" menu.)
 - **Current 2026 optional columns:** NPU, NPU Engine, NPU Dedicated Memory,
   NPU Shared Memory, and Isolation/AppContainer, plus neural-engine
   Performance entries. These require capability-gated model/collector work;
@@ -66,6 +67,34 @@ items across Phases 2–6. The following concrete gaps remain:
   high repaint rates; confirming it needs a native stack trace, which a Rust stack
   overflow on Windows does not provide. Not chased further because the trigger is a
   diagnostic env var.
+- **A translucent strip below the caption is not reachable from here.** The
+  caption itself is painted to match what the app draws under it
+  (`win/window_chrome.rs`: caption/text/border colours plus
+  `IMMERSIVE_DARK_MODE`), and the Windows 11 backdrop is requested when the
+  user has "Transparency effects" on — but DWM composes that material BEHIND
+  the window, and it can only show where the window is transparent. It is not:
+  the default renderer is the CPU one, presenting through `BitBlt` from a DIB
+  whose alpha byte is always zero, so the client area is opaque by
+  construction. An explicit caption colour also wins over the material on the
+  caption, which is the deliberate trade — an exact colour match makes the
+  caption and the search strip read as one surface, which a translucent
+  caption over an opaque strip would not.
+  Doing it properly means a presentation path carrying per-pixel alpha:
+  writing 0xFF alpha everywhere except a declared glass region in
+  `software_integration.rs`, `DwmExtendFrameIntoClientArea` for that region,
+  and `with_transparent(true)` plus an alpha-aware clear on the wgpu/glow
+  paths. Not attempted; it is a fork-level change that cannot be verified
+  headlessly.
+
+- **`ProcessEntry.service_name` is never populated on Windows.** The field and
+  its consumers (search, and the single-service naming a Details/Processes row
+  could use) exist, but no collector fills it, so every `svchost.exe` row reads
+  as the same "Host Process for Windows Services". This is also why the
+  Processes page deliberately does NOT group service hosts into one row: the
+  individual rows are already indistinguishable, and hiding them behind a
+  chevron would remove the only way to reach them. Filling the field from the
+  services enumeration would fix both.
+
 - **Service upgrade over a RUNNING service fails.** `stop_service_for_upgrade`
   opens the live service process with `SYNCHRONIZE` to wait for its exit, and
   that `OpenProcess` returns access denied even from an elevated installer, so

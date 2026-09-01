@@ -1,6 +1,6 @@
 # llm-wiki Index
 
-Last cross-checked: 2026-08-31 (table look, status glyphs, type-ahead, Details tree)
+Last cross-checked: 2026-09-01 (process owners, multi-select, GPU engines, chrome)
 
 Primary sources:
 
