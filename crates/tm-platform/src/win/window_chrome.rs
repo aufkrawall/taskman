@@ -31,9 +31,22 @@ pub struct TitleBar {
     /// highlights of the caption buttons — those are not covered by
     /// `DWMWA_TEXT_COLOR`.
     pub dark: bool,
-    /// Ask DWM for the Windows 11 Mica material behind the window. Visible
-    /// wherever DWM composes the frame itself; it does not make an opaque
-    /// client area translucent.
+    /// Ask DWM for the Windows 11 Mica material behind the window, honoring
+    /// the user's "Transparency effects" setting.
+    ///
+    /// What this can and cannot do is worth being exact about. DWM composes
+    /// the material BEHIND the window and it shows through wherever the
+    /// window is transparent. The window's client area is opaque — the CPU
+    /// renderer presents through `BitBlt` from a DIB, which carries no usable
+    /// alpha — so the material can only appear where DWM draws: the frame,
+    /// the rounded corners and the caption. And on the caption an explicit
+    /// [`Self::caption`] colour wins over the material.
+    ///
+    /// So this is a real request, not decoration, but a caption colour is the
+    /// stronger of the two and is what makes the caption and the strip the
+    /// app paints directly below it read as one surface. Making that strip
+    /// itself translucent would take a presentation path that carries
+    /// per-pixel alpha, which the CPU renderer does not have.
     pub backdrop: bool,
 }
 
