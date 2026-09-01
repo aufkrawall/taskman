@@ -1,6 +1,6 @@
 # Current State
 
-Last cross-checked: 2026-08-31
+Last cross-checked: 2026-09-01
 
 ## Summary
 
@@ -12,6 +12,34 @@ correctness, table interaction, Performance visuals, and advanced process
 diagnostics; remaining telemetry and accessibility work is itemized precisely
 in `known-debt.md`. Normal GUI startup remains unelevated; privileged controls
 can cross a protected, allowlisted service boundary after one explicit install.
+
+## Recently landed (2026-09-01 — CPU renderer and ClearType text)
+
+egui is now vendored as a fork at `vendor/egui` (subtree, tag 0.36.1). Two things
+that stock egui cannot do are implemented there; `llm-wiki/render-pipeline.md` is
+the design and `vendor/egui/TASKMAN-FORK.md` is the divergence inventory and
+rebase runbook.
+
+- **A native CPU renderer.** New `egui_software` crate plus
+  `eframe::Renderer::Software`, presenting through `softbuffer` (`CreateDIBSection`
+  + `BitBlt` on Win32). It reimplements `egui_glow`'s pipeline rather than
+  inventing one, so a golden-image diff against the GPU is a valid test. Idle cost
+  in the tray is 0.04 cores -- the same as wgpu and glow, i.e. rendering is
+  effectively free and what remains is the sampling engine.
+- **Sub-pixel (ClearType) text**, which the debt list called impossible. Glyphs are
+  rasterized at 3x horizontal resolution, filtered to per-channel coverage, and
+  blended per channel with gamma and enhanced contrast taken from
+  `IDWriteRenderingParams` for the monitor -- including the user's own
+  `cttune.exe` calibration. It is gated on the display, the user's font-smoothing
+  settings, and per-monitor DPI awareness, because enabling it where it is not
+  valid looks worse than grayscale.
+- `render_mode = software` keeps its name and its meaning to the user ("no GPU")
+  but no longer means WARP at ~3 fps. `Auto` now prefers the CPU renderer and
+  falls back to the GPU.
+- The fork has its own quality gate, `tools/check-fork.ps1`, run by
+  `build.py --check`: `cargo clippy --workspace` does not reach an excluded
+  workspace, so without it the fork's crates sat outside the gate entirely.
+- `tools/measure-cpu.ps1` measures the app's own CPU cost per renderer.
 
 ## Recently landed (2026-08-31 — identity/priority fallback, tray, tree sort)
 
