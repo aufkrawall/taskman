@@ -51,7 +51,21 @@ were loud enough to drown our own output:
 **Drop both on any rebase where upstream has fixed them.** They are marked in-source with
 `TASKMAN-FORK:` where a comment fits.
 
-### 1. `epaint`: opt-in sub-pixel glyph rasterization
+### 1. `epaint`: reach the tessellator from outside
+
+Two accessors upstream simply forgot. `Tessellator::new` is public and takes the atlas
+size and its prepared discs, but neither was reachable from outside epaint, so that public
+constructor could not actually be called. `egui_software` needs it to tessellate the
+non-text shapes itself.
+
+| File | Change | Why |
+| --- | --- | --- |
+| `crates/epaint/src/lib.rs` | re-export `PreparedDisc` | it appears in `Tessellator::new`s signature but was unnameable |
+| `crates/epaint/src/text/fonts.rs` | add `FontsImpl::texture_atlas()` | `FontsView.fonts` is public but the atlas behind it was not |
+
+Both are upstreamable as plain oversight fixes; drop them if upstream adds equivalents.
+
+### 2. `epaint`: opt-in sub-pixel glyph rasterization
 
 *(not yet implemented — this section is the contract)*
 
@@ -76,11 +90,11 @@ if opts.subpixel.is_off() {
 
 so the conflict, when it comes, is one block and not a merge of two rasterizers.
 
-### 2. `egui_software`: the CPU painter
+### 3. `egui_software`: the CPU painter
 
 `crates/egui_software/` — **entirely new, zero rebase surface.**
 
-### 3. `eframe`: `Renderer::Software`
+### 4. `eframe`: `Renderer::Software`
 
 | File | Nature |
 | --- | --- |
