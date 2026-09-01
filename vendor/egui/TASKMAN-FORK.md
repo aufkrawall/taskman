@@ -158,6 +158,33 @@ git-LFS and those objects currently 404 from the upstream server. We never build
 crates, so checking the pointer files out instead is harmless — but without the variable the
 subtree operation aborts partway.
 
+### git-LFS breaks `git push` in a fresh clone
+
+The ~230 inert pointer stubs that come with the subtree are enough to make git-LFS refuse
+every push to the parent repo:
+
+```
+Git LFS upload failed:
+  (missing) vendor/egui/crates/egui_demo_lib/tests/snapshots/.../dpi_2.00.png
+hint: Your push was rejected due to missing or corrupt local objects.
+```
+
+git-LFS's `pre-push` hook scans the outgoing commits for pointer CONTENT and tries to upload
+the objects behind them. It does not consult `.gitattributes` — commenting the `*.png
+filter=lfs` rules out (which this fork does, so clones do not try to smudge) has no effect on
+it. The objects do not exist anywhere: not locally, and not on upstream's LFS server.
+
+This repository stores nothing in LFS, so the fix is to take LFS out of it:
+
+```bash
+git lfs uninstall --local          # removes .git/hooks/{pre-push,post-*} and filter.lfs.*
+git config --local lfs.allowincompletepush true   # in case a later `git lfs install` returns
+```
+
+Both are LOCAL settings — git cannot commit them — so **a fresh clone has to run them
+again**. Deleting the stub files instead would fix it once and for all, but they would come
+back (or conflict) on every `git subtree pull`, so the two commands are the cheaper trade.
+
 After pulling:
 
 1. `cargo tree -d` from the parent repo — there must be no duplicated egui-repo crate. Two
