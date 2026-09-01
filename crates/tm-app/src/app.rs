@@ -538,6 +538,12 @@ impl TaskManApp {
             .unwrap_or(Tab::Processes);
 
         let toasts: Arc<ToastQueue> = Arc::new(Mutex::new(Vec::new()));
+        // A replacement registration that names a missing executable is not
+        // a cosmetic inconsistency: Windows then fails to launch the
+        // debugger command and Ctrl+Shift+Esc opens NOTHING, not even the
+        // built-in Task Manager. Check once per start, off the startup path.
+        #[cfg(target_os = "windows")]
+        check_task_manager_replacement(&actions, &toasts, &ctx);
         let executor = ActionExecutor::start();
         if executor.is_none() {
             tracing::error!("action workers could not start; blocking controls are disabled");
@@ -988,6 +994,65 @@ impl TaskManApp {
         self.shared.settings_writer.flush();
         // Final synchronous flush so history is not lost at shutdown.
         self.app_history_db.save();
+    }
+}
+
+/// Repair a dangling Task Manager registration where that costs the user
+/// nothing, and report it where it does not.
+///
+/// Runs on its own thread: it reads HKLM and may talk to the core service,
+/// neither of which belongs on the path to the first frame.
+#[cfg(target_os = "windows")]
+fn check_task_manager_replacement(
+    actions: &Arc<dyn PlatformActions>,
+    toasts: &Arc<ToastQueue>,
+    ctx: &egui::Context,
+) {
+    use tm_platform::actions::TaskManagerReplacementState;
+
+    // An isolated config context is a test or a capture run, not the
+    // installation whose hotkey registration this would be about.
+    if std::env::var_os("TASKMAN_CONFIG_DIR").is_some() {
+        return;
+    }
+    let actions = actions.clone();
+    let toasts = toasts.clone();
+    let ctx = ctx.clone();
+    let spawned = std::thread::Builder::new()
+        .name("tm-taskmgr-check".into())
+        .spawn(move || {
+            let TaskManagerReplacementState::Stale(value) = actions.task_manager_replacement_state()
+            else {
+                return;
+            };
+            if !tm_platform::win::replacement_target_missing(&value) {
+                // Another copy of taskman owns the hotkey and is still
+                // installed. Which copy answers is the user's choice, not a
+                // fault to repair behind their back.
+                return;
+            }
+            match actions.repair_task_manager_replacement() {
+                Ok(true) => {
+                    tracing::info!(previous = %value, "repaired the Task Manager registration")
+                }
+                Ok(false) => {
+                    tracing::warn!(
+                        registered = %value,
+                        "the Task Manager registration names a missing executable"
+                    );
+                    toast_from(
+                        &toasts,
+                        "Ctrl+Shift+Esc points at a Taskman that no longer exists. Open Settings to repair it.",
+                    );
+                    ctx.request_repaint();
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "cannot repair the Task Manager registration")
+                }
+            }
+        });
+    if let Err(error) = spawned {
+        tracing::warn!(%error, "cannot check the Task Manager registration");
     }
 }
 

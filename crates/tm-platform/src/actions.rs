@@ -244,6 +244,13 @@ pub trait PlatformActions: Send + Sync {
     fn set_task_manager_replacement(&self, _enabled: bool) -> Result<()> {
         Err(tm_core::TmError::Unsupported("Task Manager replacement"))
     }
+    /// Re-point an own, but broken, registration at this installation
+    /// WITHOUT asking the user for anything. `Ok(false)` means the repair
+    /// needs a consent prompt and was therefore not attempted; the caller
+    /// then has to ask instead of silently elevating.
+    fn repair_task_manager_replacement(&self) -> Result<bool> {
+        Ok(false)
+    }
     fn set_start_with_windows(&self, _enabled: bool, _start_minimized: bool) -> Result<()> {
         Err(tm_core::TmError::Unsupported("start with Windows"))
     }

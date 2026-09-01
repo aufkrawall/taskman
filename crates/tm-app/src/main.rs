@@ -191,6 +191,26 @@ fn main() {
 }
 
 fn run_gui(mock: bool, args: &[String]) {
+    // FIRST, before locale, settings or anything else that can block on a
+    // loaded disk: a launch that only has to raise the window this session
+    // already shows should do nothing else. Doing it before the elevation
+    // policy below also keeps Ctrl+Shift+Esc from raising a UAC prompt on
+    // every press once "always start elevated" is on, for a window that is
+    // already open. The elevated replacement of an explicit "restart
+    // elevated" is the one launch that must not defer to its predecessor.
+    #[cfg(target_os = "windows")]
+    let elevation_handoff = args
+        .iter()
+        .any(|argument| argument == "--single-instance-handoff");
+    #[cfg(target_os = "windows")]
+    if !elevation_handoff
+        && tm_platform::win::instance::activate_existing()
+            == tm_platform::win::instance::Activation::Activated
+    {
+        tracing::info!("handed this launch to the running instance");
+        return;
+    }
+
     tm_core::locale::init(tm_platform::detect_locale());
 
     // A genuinely fresh install gets a roomier first window. Existing users
@@ -225,19 +245,21 @@ fn run_gui(mock: bool, args: &[String]) {
         }
     }
 
-    // Acquire only after the optional elevation handoff. Otherwise the
+    // Register only after the optional elevation handoff. Otherwise the
     // unelevated parent would still own the mutex when its elevated child
     // starts, causing that child to signal the parent and exit immediately.
+    // An instance that cannot be reached leaves this launch UNCOORDINATED
+    // rather than dead: a task manager that refuses to open because another
+    // copy is wedged fails at the one moment it is needed.
     #[cfg(target_os = "windows")]
-    let elevation_handoff = args
-        .iter()
-        .any(|argument| argument == "--single-instance-handoff");
-    let _single_instance = match SingleInstance::acquire(elevation_handoff) {
-        Ok(Some(instance)) => instance,
-        Ok(None) => return,
-        Err(error) => {
-            tracing::warn!(%error, "single-instance coordination unavailable");
-            SingleInstance::uncoordinated()
+    let _single_instance = match tm_platform::win::instance::acquire(elevation_handoff, || {
+        signal_tray(TRAY_ACTION_OPEN)
+    }) {
+        tm_platform::win::instance::Role::Primary(primary) => Some(primary),
+        tm_platform::win::instance::Role::Deferred => return,
+        tm_platform::win::instance::Role::Uncoordinated => {
+            tracing::warn!("starting without single-instance coordination");
+            None
         }
     };
     #[cfg(target_os = "windows")]
@@ -262,9 +284,24 @@ fn run_gui(mock: bool, args: &[String]) {
         .iter()
         .find_map(|a| a.strip_prefix("--tab=").map(|t| t.to_string()))
         .or_else(|| std::env::var("TASKMAN_TAB").ok());
-    let initially_hidden = args
+    // Windows appends taskmgr's own command line to the IFEO debugger
+    // command, so a hotkey launch carries arbitrary trailing arguments. Only
+    // the marker is read from them, and a launch through the hotkey always
+    // shows its window: whatever the autostart entry asks for, the user just
+    // asked for a task manager.
+    #[cfg(target_os = "windows")]
+    let replacement_launch = args
         .iter()
-        .any(|argument| argument == "--minimized-to-tray");
+        .any(|argument| argument == tm_platform::win::REPLACEMENT_LAUNCH_ARG);
+    #[cfg(not(target_os = "windows"))]
+    let replacement_launch = false;
+    if replacement_launch {
+        tracing::info!("launched as the Windows Task Manager replacement");
+    }
+    let initially_hidden = !replacement_launch
+        && args
+            .iter()
+            .any(|argument| argument == "--minimized-to-tray");
     if let Some(t) = &initial_tab_arg {
         eprintln!("initial tab requested: {t}");
     }
@@ -563,153 +600,6 @@ impl NativeApp {
     }
 }
 
-/// Per-session single-instance guard. A second Ctrl+Shift+Esc/shortcut launch
-/// signals the existing process to restore from the tray instead of starting
-/// another sampler and renderer under heavy load.
-#[cfg(target_os = "windows")]
-struct SingleInstance {
-    _mutex: windows::Win32::Foundation::HANDLE,
-    _show_event: windows::Win32::Foundation::HANDLE,
-    listener: Option<std::thread::JoinHandle<()>>,
-    owns_mutex: bool,
-}
-
-#[cfg(target_os = "windows")]
-impl SingleInstance {
-    fn acquire(elevation_handoff: bool) -> windows::core::Result<Option<Self>> {
-        use windows::Win32::Foundation::{
-            CloseHandle, ERROR_ALREADY_EXISTS, ERROR_TIMEOUT, GetLastError, HANDLE, WAIT_ABANDONED,
-            WAIT_OBJECT_0, WAIT_TIMEOUT,
-        };
-        use windows::Win32::System::Threading::{
-            CreateEventW, CreateMutexW, INFINITE, SetEvent, WaitForSingleObject,
-        };
-        use windows::core::PCWSTR;
-
-        let mutex_name: Vec<u16> = "Local\\TaskMan.Instance.v1"
-            .encode_utf16()
-            .chain([0])
-            .collect();
-        let event_name: Vec<u16> = "Local\\TaskMan.Show.v1".encode_utf16().chain([0]).collect();
-        let mutex = unsafe { CreateMutexW(None, true, PCWSTR(mutex_name.as_ptr()))? };
-        let already_exists = unsafe { GetLastError() == ERROR_ALREADY_EXISTS };
-        let event = match unsafe { CreateEventW(None, false, false, PCWSTR(event_name.as_ptr())) } {
-            Ok(event) => event,
-            Err(error) => {
-                unsafe {
-                    let _ = CloseHandle(mutex);
-                }
-                return Err(error);
-            }
-        };
-        if already_exists {
-            if elevation_handoff {
-                // The old instance queues its close immediately after the
-                // elevated process is launched. Wait for it to release/abandon
-                // ownership so the replacement cannot be rejected as a
-                // duplicate. On a pathological timeout, return an error and
-                // let the caller choose the uncoordinated reliability fallback.
-                let wait = unsafe { WaitForSingleObject(mutex, 15_000) };
-                if wait != WAIT_OBJECT_0 && wait != WAIT_ABANDONED {
-                    let error = if wait == WAIT_TIMEOUT {
-                        ERROR_TIMEOUT.to_hresult()
-                    } else {
-                        windows::core::HRESULT::from_thread()
-                    };
-                    unsafe {
-                        let _ = CloseHandle(event);
-                        let _ = CloseHandle(mutex);
-                    }
-                    return Err(windows::core::Error::from_hresult(error));
-                }
-                // Continue into the common listener setup: the replacement is
-                // now the primary instance and must respond to later launches.
-            } else {
-                unsafe {
-                    if let Err(error) = SetEvent(event) {
-                        let _ = CloseHandle(event);
-                        let _ = CloseHandle(mutex);
-                        return Err(error);
-                    }
-                    let _ = CloseHandle(event);
-                    let _ = CloseHandle(mutex);
-                }
-                return Ok(None);
-            }
-        }
-
-        SHOW_LISTENER_SHUTDOWN.store(false, std::sync::atomic::Ordering::Release);
-        let event_raw = event.0 as usize;
-        let listener = match std::thread::Builder::new()
-            .name("tm-show-listener".into())
-            .spawn(move || {
-                loop {
-                    let event = HANDLE(event_raw as *mut core::ffi::c_void);
-                    if unsafe { WaitForSingleObject(event, INFINITE) } != WAIT_OBJECT_0 {
-                        break;
-                    }
-                    if SHOW_LISTENER_SHUTDOWN.load(std::sync::atomic::Ordering::Acquire) {
-                        break;
-                    }
-                    signal_tray(TRAY_ACTION_OPEN);
-                }
-            }) {
-            Ok(listener) => Some(listener),
-            Err(error) => {
-                // Extremely low-resource fallback: the UI polls this event on
-                // its existing repaint cadence, so a failed listener allocation
-                // does not permanently break Ctrl+Shift+Esc restore behavior.
-                tracing::warn!(%error, "single-instance listener could not start; using UI polling");
-                SHOW_EVENT_FALLBACK.store(event.0 as usize, std::sync::atomic::Ordering::Release);
-                None
-            }
-        };
-        Ok(Some(Self {
-            _mutex: mutex,
-            _show_event: event,
-            listener,
-            owns_mutex: true,
-        }))
-    }
-
-    fn uncoordinated() -> Self {
-        Self {
-            _mutex: windows::Win32::Foundation::HANDLE::default(),
-            _show_event: windows::Win32::Foundation::HANDLE::default(),
-            listener: None,
-            owns_mutex: false,
-        }
-    }
-}
-
-#[cfg(target_os = "windows")]
-impl Drop for SingleInstance {
-    fn drop(&mut self) {
-        use windows::Win32::Foundation::CloseHandle;
-        use windows::Win32::System::Threading::{ReleaseMutex, SetEvent};
-
-        unsafe {
-            SHOW_EVENT_FALLBACK.store(0, std::sync::atomic::Ordering::Release);
-            if let Some(listener) = self.listener.take() {
-                SHOW_LISTENER_SHUTDOWN.store(true, std::sync::atomic::Ordering::Release);
-                if !self._show_event.is_invalid() {
-                    let _ = SetEvent(self._show_event);
-                }
-                let _ = listener.join();
-            }
-            if self.owns_mutex && !self._mutex.is_invalid() {
-                let _ = ReleaseMutex(self._mutex);
-            }
-            if !self._show_event.is_invalid() {
-                let _ = CloseHandle(self._show_event);
-            }
-            if !self._mutex.is_invalid() {
-                let _ = CloseHandle(self._mutex);
-            }
-        }
-    }
-}
-
 impl eframe::App for NativeApp {
     fn logic(&mut self, ctx: &eframe::egui::Context, frame: &mut eframe::Frame) {
         #[cfg(target_os = "windows")]
@@ -746,6 +636,9 @@ impl eframe::App for NativeApp {
                 && let RawWindowHandle::Win32(win32) = handle.as_raw()
             {
                 self.hwnd = Some(win32.hwnd.get());
+                // Later launches read this to tell a slow instance from a
+                // wedged one.
+                tm_platform::win::instance::publish_window(win32.hwnd.get());
             }
         }
         <app::TaskManApp as eframe::App>::ui(&mut self.inner, ui, frame);
@@ -814,11 +707,6 @@ static TRAY_ACTION: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::n
 static TRAY_CONTEXT: std::sync::OnceLock<std::sync::Mutex<Option<eframe::egui::Context>>> =
     std::sync::OnceLock::new();
 #[cfg(target_os = "windows")]
-static SHOW_EVENT_FALLBACK: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-#[cfg(target_os = "windows")]
-static SHOW_LISTENER_SHUTDOWN: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-#[cfg(target_os = "windows")]
 static TRAY_HANDLERS: std::sync::Once = std::sync::Once::new();
 
 #[cfg(target_os = "windows")]
@@ -831,17 +719,14 @@ fn signal_tray(action: u8) {
     }
 }
 
+/// Only armed when the show-request listener thread could not be created;
+/// the UI then carries the request on its own repaint cadence.
 #[cfg(target_os = "windows")]
 fn poll_show_event_fallback(ctx: &eframe::egui::Context) {
-    use windows::Win32::Foundation::{HANDLE, WAIT_OBJECT_0};
-    use windows::Win32::System::Threading::WaitForSingleObject;
-
-    let raw = SHOW_EVENT_FALLBACK.load(std::sync::atomic::Ordering::Acquire);
-    if raw == 0 {
+    if !tm_platform::win::instance::show_polling_armed() {
         return;
     }
-    let event = HANDLE(raw as *mut core::ffi::c_void);
-    if unsafe { WaitForSingleObject(event, 0) } == WAIT_OBJECT_0 {
+    if tm_platform::win::instance::poll_show_request() {
         signal_tray(TRAY_ACTION_OPEN);
     }
     ctx.request_repaint_after(std::time::Duration::from_millis(250));
@@ -1016,8 +901,17 @@ impl NativeApp {
     /// compositor; [`Self::finish_restore`] uncloaks it once a real frame has
     /// been presented.
     fn restore_window(&mut self, ctx: &eframe::egui::Context) {
+        let was_hidden = self.hidden_to_tray;
         self.hidden_to_tray = false;
-        if let Some(hwnd) = self.hwnd {
+        // A launch that arrives while this instance is still starting
+        // minimized must win: the pending hide would otherwise put the
+        // window straight back into the tray in the same frame.
+        self.initial_hide_pending = false;
+        // Only a window that is genuinely hidden needs the cloak: it is the
+        // one that would otherwise be composed before it has painted. A
+        // minimized window keeps its last frame, and cloaking it would only
+        // add a blink to the restore animation.
+        if was_hidden && let Some(hwnd) = self.hwnd {
             tm_platform::set_window_cloaked(hwnd, true);
             // Two frames. `Visible(true)` below is queued and applied after
             // THIS frame, so the first frame that can present into a visible
@@ -1025,7 +919,17 @@ impl NativeApp {
             self.uncloak_in = 2;
         }
         ctx.send_viewport_cmd(eframe::egui::ViewportCommand::Visible(true));
+        // Un-minimize BEFORE asking for focus. Focus is a no-op on a
+        // minimized window (winit checks that explicitly), which is why a
+        // hotkey press used to leave a minimized task manager exactly where
+        // it was.
+        ctx.send_viewport_cmd(eframe::egui::ViewportCommand::Minimized(false));
         ctx.send_viewport_cmd(eframe::egui::ViewportCommand::Focus);
+        // Tell a waiting launch that the request has been processed by the
+        // thread that actually draws: that, and not the request arriving, is
+        // what proves this instance is alive enough to keep the request.
+        #[cfg(target_os = "windows")]
+        tm_platform::win::instance::acknowledge_show();
         // The UI is event driven and the engine may be paused, so the frames
         // the countdown needs have to be asked for explicitly.
         ctx.request_repaint();

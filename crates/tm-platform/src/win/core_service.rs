@@ -346,7 +346,7 @@ fn read_frame(
     Ok(payload)
 }
 
-struct SecurityDescriptor(PSECURITY_DESCRIPTOR);
+pub(super) struct SecurityDescriptor(pub(super) PSECURITY_DESCRIPTOR);
 
 impl Drop for SecurityDescriptor {
     fn drop(&mut self) {
@@ -358,7 +358,7 @@ impl Drop for SecurityDescriptor {
     }
 }
 
-fn security_descriptor(sddl: &str) -> Result<SecurityDescriptor> {
+pub(super) fn security_descriptor(sddl: &str) -> Result<SecurityDescriptor> {
     let encoded = wide(sddl);
     let mut descriptor = PSECURITY_DESCRIPTOR::default();
     unsafe {
@@ -885,6 +885,26 @@ impl PlatformActions for BrokeredActions {
         self.unit_or_local(BrokerRequest::SetTaskManagerReplacement { enabled }, || {
             self.local.set_task_manager_replacement(enabled)
         })
+    }
+
+    fn repair_task_manager_replacement(&self) -> Result<bool> {
+        // The broker owns an unprompted HKLM write, and it always re-points
+        // at the protected GUI it verified — exactly the executable that is
+        // guaranteed to still be there.
+        match self
+            .client
+            .call(BrokerRequest::SetTaskManagerReplacement { enabled: true })
+        {
+            Ok(BrokerValue::Unit) => Ok(true),
+            Ok(_) => Err(TmError::platform(
+                "core service",
+                "unexpected response type",
+            )),
+            Err(BrokerCallError::Unavailable(_)) => self.local.repair_task_manager_replacement(),
+            Err(BrokerCallError::Rejected(detail)) => {
+                Err(TmError::platform("core service", detail))
+            }
+        }
     }
 
     fn set_start_with_windows(&self, enabled: bool, start_minimized: bool) -> Result<()> {
@@ -2238,7 +2258,7 @@ fn replace_file_from_pinned_source(source: &Path, destination: &Path, sddl: &str
     Ok(())
 }
 
-fn current_user_sid() -> Result<String> {
+pub(super) fn current_user_sid() -> Result<String> {
     let mut token = HANDLE::default();
     unsafe {
         OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token)

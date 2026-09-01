@@ -856,14 +856,30 @@ pub fn settings_dialog(app: &mut TaskManApp, ctx: &egui::Context, _pal: &theme::
                         );
                     }
                     match state {
-                        TaskManagerReplacementState::Stale(_) => {
+                        TaskManagerReplacementState::Stale(value) => {
+                            // A registered path that no longer exists is not
+                            // a mismatch to live with: Windows cannot launch
+                            // it, so the hotkey opens nothing at all — the
+                            // built-in Task Manager included.
+                            let missing =
+                                tm_platform::win::replacement_target_missing(&value);
                             ui.label(
-                                egui::RichText::new(
-                                    "The registered Taskman path is stale. Toggle off/on to repair it.",
-                                )
+                                egui::RichText::new(if missing {
+                                    "Ctrl+Shift+Esc points at a Taskman that no longer exists and currently opens nothing."
+                                } else {
+                                    "Another Taskman installation is registered for Ctrl+Shift+Esc."
+                                })
                                 .size(11.5)
                                 .color(_pal.text_dim),
                             );
+                            if ui.button("Repair").clicked() {
+                                let actions = app.actions.clone();
+                                app.run_action(
+                                    ctx,
+                                    || "Task Manager integration requested".to_string(),
+                                    move || actions.set_task_manager_replacement(true),
+                                );
+                            }
                         }
                         TaskManagerReplacementState::Conflict(value) => {
                             ui.label(
