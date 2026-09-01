@@ -1472,6 +1472,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "egui_software"
+version = "0.36.1"
+dependencies = [
+ "ecolor",
+ "egui",
+ "emath",
+ "epaint",
+]
+
+[[package]]
 name = "egui_tests"
 version = "0.36.1"
 dependencies = [

@@ -987,6 +987,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "egui_software"
+version = "0.36.1"
+dependencies = [
+ "ecolor",
+ "emath",
+ "epaint",
+]
+
+[[package]]
 name = "either"
 version = "1.18.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3384,6 +3393,8 @@ name = "tm-app"
 version = "0.1.0"
 dependencies = [
  "eframe",
+ "egui_software",
+ "png",
  "rfd",
  "serde_json",
  "tm-core",
