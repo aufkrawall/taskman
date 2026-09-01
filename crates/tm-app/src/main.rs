@@ -369,17 +369,7 @@ fn run_gui(mock: bool, args: &[String]) {
                     as Box<dyn eframe::App>,
             )
         };
-        // Gamma and contrast are display properties and can be read now; the renderer
-        // needs them at construction. Whether sub-pixel text is *permitted* cannot be
-        // decided here -- one of its gates is per-monitor DPI awareness, which winit only
-        // sets while building its event loop -- so that happens in the creator below,
-        // once a window exists.
-        let blend = tm_platform::text_rendering::blend_params(None);
-        let mut opts = options(renderer);
-        opts.software_options = eframe::SoftwareOptions {
-            text_gamma: blend.gamma,
-            text_contrast: blend.contrast,
-        };
+        let opts = options(renderer);
 
         match eframe::run_native("Task-Manager", opts, Box::new(creator)) {
             Ok(()) => return,

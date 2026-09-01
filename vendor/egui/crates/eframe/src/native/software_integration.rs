@@ -72,9 +72,6 @@ struct SoftwareWinitRunning<'app> {
     info: ViewportInfo,
 
     painter: egui_software::Painter,
-    /// Blend-time text parameters, from `NativeOptions::software_options`.
-    text_gamma: f32,
-    text_contrast: f32,
     /// `Context` must outlive `Surface`, and both borrow the window, so they are kept
     /// together and behind an `Rc<RefCell<..>>` for the same reason glow keeps its
     /// painter that way: the repaint callback needs a weak handle.
@@ -279,8 +276,6 @@ impl<'app> SoftwareWinitApp<'app> {
             egui_winit,
             info,
             painter: egui_software::Painter::new(),
-            text_gamma: self.native_options.software_options.text_gamma,
-            text_contrast: self.native_options.software_options.text_contrast,
             surface: Rc::new(RefCell::new(SurfaceState {
                 surface,
                 _context: context,
@@ -370,9 +365,15 @@ impl SoftwareWinitRunning<'_> {
             // what actually holds the coverage, so asking it makes the blend mode and the
             // rasterization mode agree by construction -- the one failure here that does
             // not error, it just draws wrong colours.
-            let subpixel = self.integration.egui_ctx.fonts(|f| f.options().subpixel);
-            self.painter
-                .set_subpixel(subpixel, self.text_gamma, self.text_contrast);
+            // Sub-pixel mode *and* its blend parameters both come from the atlas's
+            // options, so the way glyphs were rasterized and the way they are blended
+            // cannot disagree. That is the one failure here that does not error -- it
+            // just draws wrong colours.
+            let (subpixel, gamma, contrast) = self.integration.egui_ctx.fonts(|f| {
+                let o = f.options();
+                (o.subpixel, o.text_gamma, o.text_contrast)
+            });
+            self.painter.set_subpixel(subpixel, gamma, contrast);
 
             let clear = self.app.clear_color(
                 &self

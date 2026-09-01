@@ -2445,6 +2445,8 @@ impl Visuals {
                 subpixel: _,
                 lcd_filter: _,
                 cleartype_level: _,
+                text_gamma: _,
+                text_contrast: _,
             } = text_options;
 
             color_transfer_function_ui(ui, color_transfer_function);

@@ -347,9 +347,6 @@ pub struct NativeOptions {
     ))]
     pub renderer: Renderer,
 
-    /// TASKMAN-FORK: text-blend tuning for [`Renderer::Software`]. Ignored otherwise.
-    pub software_options: SoftwareOptions,
-
     /// This controls what happens when you close the main eframe window.
     ///
     /// If `true`, execution will continue after the eframe window is closed.
@@ -485,7 +482,6 @@ impl Default for NativeOptions {
                 feature = "software"
             ))]
             renderer: Renderer::default(),
-            software_options: SoftwareOptions::default(),
 
             run_and_return: true,
 
@@ -637,33 +633,6 @@ pub enum WebGlContextOption {
 }
 
 // ----------------------------------------------------------------------------
-/// TASKMAN-FORK: tuning for the software (CPU) renderer's text blending.
-///
-/// These are *blend*-time parameters, deliberately not part of `epaint::TextOptions`:
-/// changing them must not invalidate the glyph atlas, which depends only on how glyphs
-/// were rasterized. They come from the platform -- on Windows from
-/// `IDWriteGlyphRunAnalysis::GetAlphaBlendParams` for the monitor the window is on, which
-/// carries the user's own ClearType-tuner calibration.
-///
-/// eframe cannot query them without depending on platform APIs, so the application
-/// supplies them. The defaults are Windows' own.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct SoftwareOptions {
-    /// Gamma of the text blend space. Windows' default is 1.8.
-    pub text_gamma: f32,
-
-    /// Enhanced-contrast boost applied to coverage. Windows' default is 0.5.
-    pub text_contrast: f32,
-}
-
-impl Default for SoftwareOptions {
-    fn default() -> Self {
-        Self {
-            text_gamma: 1.8,
-            text_contrast: 0.5,
-        }
-    }
-}
 
 /// What rendering backend to use.
 ///
