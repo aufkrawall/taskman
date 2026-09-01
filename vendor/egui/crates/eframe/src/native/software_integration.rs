@@ -323,6 +323,9 @@ impl SoftwareWinitRunning<'_> {
 
         let mut raw_input = self.egui_winit.take_egui_input(&self.window);
         raw_input.viewports = std::iter::once((ViewportId::ROOT, self.info.clone())).collect();
+        // Handed to egui now, so they must not be delivered again next frame -- a Close
+        // event that repeats would fire the app's close handling on every frame forever.
+        self.info.events.clear();
 
         // --- user code; holds no borrow of the surface ---
         let full_output = self.integration.update(
@@ -482,7 +485,7 @@ impl SoftwareWinitRunning<'_> {
             .maybe_autosave(self.app.as_mut(), Some(&self.window));
 
         if self.integration.should_close() {
-            return Ok(EventResult::Exit);
+            return Ok(EventResult::CloseRequested);
         }
 
         let _ = event_loop;
@@ -595,8 +598,13 @@ impl WinitApp for SoftwareWinitApp<'_> {
         window_id: WindowId,
         event: winit::event::WindowEvent,
     ) -> Result<EventResult> {
+        // Once `save_and_destroy` has run, `running` is gone and the window has been
+        // dropped. Any event arriving after that means the shutdown is complete and the
+        // loop should end: `CloseRequested` only tears the window down, it does not exit,
+        // so without this the process lives on with no window and the close button
+        // appears to do nothing.
         let Some(running) = &mut self.running else {
-            return Ok(EventResult::Wait);
+            return Ok(EventResult::Exit);
         };
         if running.window.id() != window_id {
             return Ok(EventResult::Wait);
@@ -621,10 +629,18 @@ impl WinitApp for SoftwareWinitApp<'_> {
         match &event {
             winit::event::WindowEvent::CloseRequested => {
                 if running.integration.should_close() {
-                    return Ok(EventResult::Exit);
+                    // `CloseRequested`, not `Exit`: the wrapper runs `save_and_destroy`
+                    // on this variant, and windows must be dropped while the event loop
+                    // is still running for winit to clean up properly.
+                    return Ok(EventResult::CloseRequested);
                 }
-                // The app may have vetoed the close (taskman closes to the tray), so a
-                // repaint is needed to let it act on the request.
+
+                // `egui_winit` does NOT translate this into a viewport event -- it only
+                // asks for a repaint -- so the backend has to raise it, or the app never
+                // learns the user clicked the close button. taskman vetoes the close and
+                // hides to the tray instead, which is exactly the path this feeds.
+                running.info.events.push(egui::ViewportEvent::Close);
+                running.integration.egui_ctx.request_repaint();
                 return Ok(EventResult::RepaintNext(window_id));
             }
             winit::event::WindowEvent::Destroyed => return Ok(EventResult::Exit),
