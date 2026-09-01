@@ -195,10 +195,14 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
                 i18n::tr(K::EfficiencyMode),
                 caps.efficiency_mode && !app.selection.is_empty(),
             ) {
-                // Efficiency mode is a per-process toggle, so a multi-row
-                // selection flips every row it covers.
-                for (identity, _) in app.live_selection_targets() {
-                    toggle_efficiency_mode(app, &ctx, &identity);
+                let targets = app.live_selection_targets();
+                match targets.as_slice() {
+                    [(identity, _)] => toggle_efficiency_mode(app, &ctx, &identity.clone()),
+                    _ => {
+                        let on = !app.primary_efficiency_mode();
+                        let targets = targets.into_iter().map(|(identity, _)| identity).collect();
+                        app.set_efficiency_mode_batch(&ctx, targets, on);
+                    }
                 }
             }
             if crate::app_ui::cmd_button(
@@ -296,7 +300,6 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
             .position(|r| matches!(r, DisplayRow::Process(p) if p.pid == pid))
     });
 
-    let order = selectable_identities(&rows);
     let clicked = tablekit::scrolled_rows(
         "processes",
         ui,
@@ -314,7 +317,7 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
                         group_header(app, ui, &pal, *gi, *total, content_w);
                     }
                     Some(DisplayRow::Process(row)) => {
-                        row_ui(app, ui, &pal, table, row, &order);
+                        row_ui(app, ui, &pal, table, row, &rows);
                     }
                     None => {}
                 }
@@ -357,22 +360,26 @@ fn handle_keyboard_navigation(app: &mut TaskManApp, ctx: &egui::Context, rows: &
     let page_rows = (ctx.content_rect().height() / tablekit::ROW_H)
         .floor()
         .max(1.0) as usize;
-    let order: Vec<crate::app::ProcessIdentity> = process_rows
-        .iter()
-        .map(|(_, row)| identity_of(row))
-        .collect();
+    // The display order is only materialized for the two gestures that need
+    // it. This runs every frame over the whole process list.
+    let order = || -> Vec<crate::app::ProcessIdentity> {
+        process_rows
+            .iter()
+            .map(|(_, row)| identity_of(row))
+            .collect()
+    };
     let select_all = std::mem::take(&mut app.select_all_requested)
         || (!ctx.egui_wants_keyboard_input()
             && ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::A)));
     if select_all {
-        app.selection.select_all(&order);
+        app.selection.select_all(&order());
     }
     if let Some(nav) = search::list_nav(ctx)
         && let Some(next) = search::moved_index(process_rows.len(), selected_pos, nav, page_rows)
         && let Some((_, row)) = process_rows.get(next)
     {
         if ctx.input(|i| i.modifiers.shift) {
-            app.selection.select_range(identity_of(row), &order);
+            app.selection.select_range(identity_of(row), &order());
             app.processes_state.scroll_to_pid = Some(row.pid);
         } else {
             select_row(app, row);
@@ -557,7 +564,7 @@ fn row_ui(
     pal: &theme::Palette,
     table: &tablekit::TmTable,
     row: &RowData,
-    order: &[crate::app::ProcessIdentity],
+    all_rows: &[DisplayRow],
 ) {
     let selected = app.selection.contains_pid(row.pid);
     let (rect, resp) = table.row(ui, pal, selected);
@@ -628,7 +635,10 @@ fn row_ui(
         } else {
             let kind =
                 crate::selection::ClickKind::from_modifiers(&ui.input(|input| input.modifiers));
-            app.selection.click(kind, identity_of(row), order);
+            // Materialized here rather than once per frame: a Shift range is
+            // the only thing that needs it, and this runs on a click.
+            app.selection
+                .click(kind, identity_of(row), &selectable_identities(all_rows));
         }
     }
     // A right-click inside an existing multi-selection keeps it, so the menu
@@ -778,9 +788,13 @@ fn context_menu(app: &mut TaskManApp, ui: &mut egui::Ui, row: &RowData) {
     .clicked()
     {
         if batch {
-            for (identity, _) in app.live_selection_targets() {
-                toggle_efficiency_mode(app, &ctx, &identity);
-            }
+            let on = !row.power_throttled;
+            let targets = app
+                .live_selection_targets()
+                .into_iter()
+                .map(|(identity, _)| identity)
+                .collect();
+            app.set_efficiency_mode_batch(&ctx, targets, on);
         } else {
             toggle_efficiency_mode(app, &ctx, &identity_of(row));
         }

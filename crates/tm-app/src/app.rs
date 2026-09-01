@@ -1390,17 +1390,103 @@ impl TaskManApp {
         });
     }
 
-    /// End a whole confirmed batch. Each target is an independent job on the
-    /// action executor, so one refusal never cancels the rest.
+    /// End a whole confirmed batch.
+    ///
+    /// ONE job on the executor, not one per target. The executor is bounded at
+    /// 64 queued jobs on purpose, so a 200-row selection would overflow it and
+    /// answer with a toast storm; a single job also means a single summary
+    /// toast and a single post-action refresh. Individual refusals are counted
+    /// rather than aborting the batch — a protected process in the middle of a
+    /// selection must not stop the rest.
     pub fn end_process_batch(
         &mut self,
         ctx: &egui::Context,
-        targets: Vec<(ProcessIdentity, String)>,
+        mut targets: Vec<(ProcessIdentity, String)>,
         tree: bool,
     ) {
-        for (identity, name) in targets {
+        if targets.len() == 1 {
+            let (identity, name) = targets.remove(0);
             self.end_process_identity(ctx, identity, tree, name);
+            return;
         }
+        let total = targets.len();
+        let actions = self.actions.clone();
+        let ended = Arc::new(AtomicU64::new(0));
+        let counter = ended.clone();
+        self.run_action_refreshing(
+            ctx,
+            move || {
+                // Evaluated on the worker AFTER the job, so the count is final.
+                let ok = ended.load(Ordering::Relaxed) as usize;
+                if ok == total {
+                    i18n::trf(K::ProcessesEndedToast, &[&total.to_string()])
+                } else {
+                    i18n::trf(
+                        K::ProcessesEndedPartial,
+                        &[&ok.to_string(), &total.to_string()],
+                    )
+                }
+            },
+            move || {
+                for (identity, _) in targets {
+                    if actions
+                        .kill_process(identity.pid, identity.start_epoch_s, tree)
+                        .is_ok()
+                    {
+                        counter.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+                Ok(())
+            },
+        );
+    }
+
+    /// Set efficiency mode on a whole selection, to ONE state.
+    ///
+    /// Toggling each row against its own current state would leave a mixed
+    /// selection mixed the other way round, which is never what "turn this on
+    /// for these" means. The state comes from `on`; callers derive it from the
+    /// row the user acted on. Batched into one executor job for the same
+    /// reasons as [`Self::end_process_batch`].
+    pub fn set_efficiency_mode_batch(
+        &mut self,
+        ctx: &egui::Context,
+        targets: Vec<ProcessIdentity>,
+        on: bool,
+    ) {
+        let total = targets.len();
+        if total == 0 {
+            return;
+        }
+        let actions = self.actions.clone();
+        self.run_action_refreshing(
+            ctx,
+            move || i18n::trf(K::EfficiencyChangedCount, &[&total.to_string()]),
+            move || {
+                for identity in targets {
+                    let _ = actions.set_efficiency_mode_checked(
+                        identity.pid,
+                        identity.start_epoch_s,
+                        on,
+                    );
+                }
+                Ok(())
+            },
+        );
+    }
+
+    /// Whether the primary selected row currently has efficiency mode on.
+    /// A batch toggle flips away from this one answer.
+    pub fn primary_efficiency_mode(&self) -> bool {
+        self.selection
+            .primary()
+            .and_then(|identity| {
+                self.latest_snapshot()
+                    .as_ref()
+                    .and_then(|snapshot| snapshot.process(identity.pid))
+                    .and_then(|process| process.power_throttled)
+            })
+            .unwrap_or(false)
     }
 
     /// Make Windows paint its caption in the app's own colors.

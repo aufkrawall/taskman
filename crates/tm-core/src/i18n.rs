@@ -189,6 +189,15 @@ keys! {
         "End {} processes? Unsaved data in these processes will be lost."
     ],
     SelectedCount => ["{} ausgewählt", "{} selected"],
+    ProcessesEndedToast => ["{} Prozesse beendet", "Ended {} processes"],
+    ProcessesEndedPartial => [
+        "{} von {} Prozessen beendet",
+        "Ended {} of {} processes"
+    ],
+    EfficiencyChangedCount => [
+        "Effizienzmodus für {} Prozesse geändert",
+        "Efficiency mode changed for {} processes"
+    ],
     SelectAll => ["Alle auswählen", "Select all"],
     ManageUserAccounts => ["Benutzerkonten verwalten", "Manage user accounts"],
     EnableCmd => ["Aktivieren", "Enable"],
