@@ -22,4 +22,7 @@ epaint = { workspace = true }
 # Only for the crate-level doc example, which shows the real integration path through
 # `egui::Context`. The library itself deliberately depends on epaint alone, so it can be
 # used without pulling in the whole of egui.
-egui = { workspace = true }
+# `default_fonts` is not optional here: the workspace dependency sets
+# default-features = false, and without bundled fonts every galley in the tests lays out
+# with zero glyphs -- which looks exactly like a renderer that draws nothing.
+egui = { workspace = true, features = ["default_fonts"] }

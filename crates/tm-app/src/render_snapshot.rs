@@ -24,7 +24,7 @@
 //! CI as they do locally.
 
 use eframe::egui::{self, FontId, Pos2, Rect, pos2, vec2};
-use egui_software::{Painter, Target, pack_rgb};
+use egui_software::{Painter, ShapeContext, Target, pack_rgb};
 
 use crate::theme::{self, Palette};
 use crate::widgets::chart::{self, MultiSeries};
@@ -302,12 +302,19 @@ fn render() -> Vec<u32> {
     let mut output = build_frame(&ctx);
     apply(&mut painter, &mut output);
 
-    let primitives = ctx.tessellate(output.shapes, output.pixels_per_point);
+    // Paint from untessellated shapes so the glyph blitter is exercised -- that is the
+    // path the Software renderer uses, and the one sub-pixel text will hang off.
+    let shape_ctx = ShapeContext {
+        pixels_per_point: output.pixels_per_point,
+        options: ctx.tessellation_options(|o| *o),
+        font_tex_size: ctx.fonts(|f| f.font_image_size()),
+        prepared_discs: ctx.fonts(|f| f.fonts.texture_atlas().prepared_discs()),
+    };
 
     let mut buf = vec![0u32; (WIDTH * HEIGHT) as usize];
     let mut target = Target::new(&mut buf, WIDTH, HEIGHT).expect("target fits");
     Painter::clear(&mut target, theme::DARK.window_bg);
-    painter.paint(&mut target, output.pixels_per_point, &primitives);
+    painter.paint_shapes(&mut target, &shape_ctx, output.shapes);
     assert_eq!(
         painter.missing_texture_draws(),
         0,

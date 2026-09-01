@@ -195,8 +195,19 @@ fn shade(v: &[ScreenVertex; 3], l0: f32, l1: f32, l2: f32, texture: Option<&Text
     let c1 = v[1].color.to_array();
     let c2 = v[2].color.to_array();
     let mut out = [0.0f32; 4];
-    for i in 0..4 {
-        out[i] = c0[i] as f32 * l0 + c1[i] as f32 * l1 + c2[i] as f32 * l2;
+    if v[0].color == v[1].color && v[1].color == v[2].color {
+        // Uniform colour, which is most of what egui emits -- solid fills, and every
+        // glyph quad. Interpolating a constant is not free of error: the barycentrics
+        // sum to 1 only up to float rounding, so `c*l0 + c*l1 + c*l2` can land an LSB
+        // below `c` and produce a pixel that differs from the direct blit. Taking the
+        // colour as-is is both exact and cheaper.
+        for i in 0..4 {
+            out[i] = c0[i] as f32;
+        }
+    } else {
+        for i in 0..4 {
+            out[i] = c0[i] as f32 * l0 + c1[i] as f32 * l1 + c2[i] as f32 * l2;
+        }
     }
 
     if let Some(tex) = texture {
@@ -215,7 +226,7 @@ fn shade(v: &[ScreenVertex; 3], l0: f32, l1: f32, l2: f32, texture: Option<&Text
 /// The framebuffer is opaque, so the separate destination-alpha blend factor the GPU uses
 /// has no observable effect and is not computed.
 #[inline]
-fn blend_over(src: [f32; 4], dst: u32) -> u32 {
+pub(crate) fn blend_over(src: [f32; 4], dst: u32) -> u32 {
     let inv_a = 1.0 - src[3] * (1.0 / 255.0);
     let dr = ((dst >> 16) & 0xff) as f32;
     let dg = ((dst >> 8) & 0xff) as f32;

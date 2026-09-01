@@ -1013,6 +1013,16 @@ impl FontsImpl {
         self.atlas.options()
     }
 
+    // TASKMAN-FORK: the glyph atlas is needed by anyone who tessellates outside
+    // `Context::tessellate` -- `Tessellator::new` takes its size and its prepared discs,
+    // but neither `FontsImpl` nor `FontsView` exposed a way to reach them, so that public
+    // constructor was uncallable from outside epaint. Upstreamable; drop once upstream
+    // has an equivalent accessor.
+    #[inline]
+    pub fn texture_atlas(&self) -> &TextureAtlas {
+        &self.atlas
+    }
+
     /// Take the recycled shaping buffer (or create a new one if already taken).
     pub fn take_shape_buffer(&mut self) -> harfrust::UnicodeBuffer {
         self.shape_buffer.take().unwrap_or_default()

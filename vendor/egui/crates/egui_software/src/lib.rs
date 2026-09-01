@@ -47,13 +47,19 @@
 
 mod raster;
 mod target;
+mod text;
 mod texture;
 
 pub use target::{PixelRect, Target, clip_rect_to_pixels, pack_rgb};
 pub use texture::{Texture, TextureStore};
 
 use ecolor::Color32;
-use epaint::{ClippedPrimitive, ImageDelta, Mesh, Primitive, TextureId};
+use emath::GuiRounding as _;
+use epaint::text::Galley;
+use epaint::{
+    ClippedPrimitive, ClippedShape, ImageDelta, Mesh, PreparedDisc, Primitive, Shape,
+    TessellationOptions, Tessellator, TextShape, TextureId,
+};
 
 use raster::ScreenVertex;
 
@@ -61,9 +67,38 @@ use raster::ScreenVertex;
 ///
 /// Owns the resident textures, so it must outlive the frames that reference them and be
 /// fed every [`epaint::textures::TexturesDelta`] in order.
+/// How text is drawn.
+///
+/// Both modes produce the same pixels for ordinary text; `blit_glyphs_never_matches`
+/// asserts it. The setting exists so that test can compare them, and so a bug in the fast
+/// path can be worked around without a rebuild of the tessellated one.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum TextMode {
+    /// Blit each glyph directly from the atlas. Required for sub-pixel rendering.
+    #[default]
+    Blit,
+    /// Send glyph quads through the triangle rasterizer like any other geometry.
+    Tessellate,
+}
+
+/// The inputs [`Painter::paint_shapes`] needs to tessellate non-text shapes itself.
+///
+/// These are exactly what `egui::Context::tessellate` reads out of the context, and a
+/// caller holding an `egui::Context` can build one with
+/// `ctx.fonts(|f| f.texture_atlas())` plus the memory's tessellation options.
+#[derive(Clone)]
+pub struct ShapeContext {
+    pub pixels_per_point: f32,
+    pub options: TessellationOptions,
+    /// Size of the font atlas in texels, for UV normalization.
+    pub font_tex_size: [usize; 2],
+    pub prepared_discs: Vec<PreparedDisc>,
+}
+
 #[derive(Default)]
 pub struct Painter {
     textures: TextureStore,
+    text_mode: TextMode,
     /// Primitives that named a texture we do not have. Counted rather than logged per
     /// occurrence, because a missing texture usually means *every* glyph is missing and
     /// per-primitive logging would bury the actual cause.
@@ -73,6 +108,14 @@ pub struct Painter {
 impl Painter {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn set_text_mode(&mut self, mode: TextMode) {
+        self.text_mode = mode;
+    }
+
+    pub fn text_mode(&self) -> TextMode {
+        self.text_mode
     }
 
     /// Apply one `set` entry from a [`epaint::textures::TexturesDelta`].
@@ -135,6 +178,225 @@ impl Painter {
                     // thing `egui_glow` does when its callback feature is off.
                 }
             }
+        }
+    }
+
+    /// Paint **untessellated** shapes, intercepting text so glyphs are blitted directly.
+    ///
+    /// This is the entry point the `Software` renderer uses. [`Painter::paint`] remains
+    /// available for callers that already have tessellated primitives, and produces the
+    /// same output for everything except that it cannot do sub-pixel text.
+    ///
+    /// Draw order is preserved exactly: non-text shapes accumulate into a batch that is
+    /// flushed through the tessellator whenever a text shape interrupts it, so a label
+    /// drawn over a panel still lands over that panel.
+    pub fn paint_shapes(
+        &mut self,
+        target: &mut Target<'_>,
+        ctx: &ShapeContext,
+        shapes: Vec<ClippedShape>,
+    ) {
+        if self.text_mode == TextMode::Tessellate {
+            let primitives = Self::tessellate(ctx, shapes);
+            self.paint(target, ctx.pixels_per_point, &primitives);
+            return;
+        }
+
+        let bounds = target.bounds();
+        let mut batch: Vec<ClippedShape> = Vec::new();
+
+        for clipped in shapes {
+            // Only unrotated text can be blitted; a rotated `TextShape` is not an
+            // axis-aligned quad, so it goes through the tessellator like any other
+            // geometry and comes out grayscale.
+            let is_blittable_text = matches!(&clipped.shape, Shape::Text(t) if t.angle == 0.0);
+
+            if !is_blittable_text {
+                batch.push(clipped);
+                continue;
+            }
+
+            // Flush everything queued before this text, so ordering is preserved.
+            if !batch.is_empty() {
+                let primitives = Self::tessellate(ctx, std::mem::take(&mut batch));
+                self.paint(target, ctx.pixels_per_point, &primitives);
+            }
+
+            let clip = clip_rect_to_pixels(clipped.clip_rect, ctx.pixels_per_point, bounds);
+            let Shape::Text(text) = &clipped.shape else {
+                unreachable!("checked above")
+            };
+            self.paint_text(target, clip, clipped.clip_rect, ctx, text);
+        }
+
+        if !batch.is_empty() {
+            let primitives = Self::tessellate(ctx, batch);
+            self.paint(target, ctx.pixels_per_point, &primitives);
+        }
+    }
+
+    fn tessellate(ctx: &ShapeContext, shapes: Vec<ClippedShape>) -> Vec<ClippedPrimitive> {
+        Tessellator::new(
+            ctx.pixels_per_point,
+            ctx.options,
+            ctx.font_tex_size,
+            ctx.prepared_discs.clone(),
+        )
+        .tessellate_shapes(shapes)
+    }
+
+    /// Draw one [`TextShape`], blitting its glyphs and rasterizing everything else in the
+    /// row mesh (selection backgrounds, strike-through) in the original order.
+    ///
+    /// The transforms mirror `Tessellator::tessellate_text` line for line: the galley
+    /// position rounding, the per-row cull, and the three colour rules. Any divergence
+    /// would put text a pixel away from where the GPU puts it.
+    fn paint_text(
+        &mut self,
+        target: &mut Target<'_>,
+        clip: PixelRect,
+        clip_points: emath::Rect,
+        ctx: &ShapeContext,
+        text: &TextShape,
+    ) {
+        let galley: &Galley = &text.galley;
+        if galley.is_empty() || text.opacity_factor <= 0.0 {
+            return;
+        }
+
+        let ppp = ctx.pixels_per_point;
+        let galley_pos = if ctx.options.round_text_to_pixels {
+            text.pos.round_to_pixels(ppp)
+        } else {
+            text.pos
+        };
+
+        let Some(atlas) = self.textures.get(TextureId::Managed(0)) else {
+            self.missing_texture_draws += 1;
+            return;
+        };
+
+        for row in &galley.rows {
+            if row.visuals.mesh.is_empty() {
+                continue;
+            }
+            let final_row_pos = galley_pos + row.pos.to_vec2();
+            let row_rect = row.visuals.mesh_bounds.translate(final_row_pos.to_vec2());
+            if ctx.options.coarse_tessellation_culling && !clip_points.intersects(row_rect) {
+                // Culling per row matters: one `Shape::Text` can span hundreds of lines.
+                continue;
+            }
+
+            let mesh = &row.visuals.mesh;
+            let glyphs = &row.visuals.glyph_vertex_range;
+
+            // The galley mesh stores UVs in TEXELS, and the two consumers want different
+            // units: the blitter needs texels (normalizing and multiplying back would
+            // throw away the exactness the 1:1 blit relies on), while the triangle
+            // rasterizer samples with normalized coordinates like the GPU does. Feeding
+            // texels to the latter samples far off the edge of the atlas and silently
+            // draws nothing, so the two are kept deliberately separate.
+            let uv_scale = emath::vec2(
+                1.0 / ctx.font_tex_size[0] as f32,
+                1.0 / ctx.font_tex_size[1] as f32,
+            );
+            let resolve = |i: usize, normalize_uv: bool| -> ScreenVertex {
+                let v = mesh.vertices[i];
+                let mut color = v.color;
+                if let Some(override_color) = text.override_text_color {
+                    // Only the glyphs, not backgrounds or strike-through.
+                    if glyphs.contains(&i) {
+                        color = override_color;
+                    }
+                } else if color == Color32::PLACEHOLDER {
+                    color = text.fallback_color;
+                }
+                if text.opacity_factor < 1.0 {
+                    color = color.gamma_multiply(text.opacity_factor);
+                }
+                let pos = final_row_pos + v.pos.to_vec2();
+                let (u, vv) = if normalize_uv {
+                    (v.uv.x * uv_scale.x, v.uv.y * uv_scale.y)
+                } else {
+                    (v.uv.x, v.uv.y)
+                };
+                ScreenVertex {
+                    x: pos.x * ppp,
+                    y: pos.y * ppp,
+                    u,
+                    v: vv,
+                    color,
+                }
+            };
+
+            // Walk triangles in emission order so backgrounds stay under the glyphs and
+            // strike-through stays over them. A glyph quad is four consecutive vertices,
+            // so it is blitted once, when its first triangle appears.
+            let mut last_quad_base: Option<usize> = None;
+            for tri in mesh.indices.chunks_exact(3) {
+                let idx = [tri[0] as usize, tri[1] as usize, tri[2] as usize];
+                if idx.iter().any(|i| *i >= mesh.vertices.len()) {
+                    continue;
+                }
+
+                if idx.iter().all(|i| glyphs.contains(i)) {
+                    let lowest = idx.iter().copied().min().unwrap_or(glyphs.start);
+                    let base = glyphs.start + ((lowest - glyphs.start) / 4) * 4;
+                    if last_quad_base == Some(base) {
+                        continue; // the second triangle of a quad already blitted
+                    }
+                    if base + 3 < mesh.vertices.len() {
+                        let quad = [
+                            resolve(base, false),
+                            resolve(base + 1, false),
+                            resolve(base + 2, false),
+                            resolve(base + 3, false),
+                        ];
+                        if text::blit_quad(target, clip, &quad, atlas) {
+                            // Only mark it consumed once the blit actually happened.
+                            // Marking it before would swallow the quads second triangle
+                            // on the fallback path and draw half of every italic glyph.
+                            last_quad_base = Some(base);
+                            continue;
+                        }
+                    }
+                    // Not a clean 1:1 quad (italics, an odd scale): fall through so both
+                    // of its triangles draw through the general path.
+                }
+
+                raster::triangle(
+                    target,
+                    clip,
+                    [
+                        resolve(idx[0], true),
+                        resolve(idx[1], true),
+                        resolve(idx[2], true),
+                    ],
+                    Some(atlas),
+                );
+            }
+        }
+
+        // The underline is a separate stroke, drawn after the rows like the tessellator
+        // does. Routed through the batch path so its geometry is epaint's, not ours.
+        if text.underline != epaint::Stroke::NONE {
+            let mut shapes = Vec::new();
+            for row in &galley.rows {
+                if row.visuals.mesh.is_empty() {
+                    continue;
+                }
+                let final_row_pos = galley_pos + row.pos.to_vec2();
+                let row_rect = row.visuals.mesh_bounds.translate(final_row_pos.to_vec2());
+                shapes.push(ClippedShape {
+                    clip_rect: clip_points,
+                    shape: Shape::line_segment(
+                        [row_rect.left_bottom(), row_rect.right_bottom()],
+                        text.underline,
+                    ),
+                });
+            }
+            let primitives = Self::tessellate(ctx, shapes);
+            self.paint(target, ppp, &primitives);
         }
     }
 
