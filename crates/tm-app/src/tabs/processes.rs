@@ -435,6 +435,26 @@ fn handle_keyboard_navigation(app: &mut TaskManApp, ctx: &egui::Context, rows: &
     }
 }
 
+/// Name for the Processes list: the friendly description with the exact image
+/// name behind it — `Microsoft Edge (msedge.exe)`.
+///
+/// Processes is the app list, so the description leads; the image name is
+/// what a person types into a search, a script or a ticket, so it is there
+/// too. A process with no version metadata has no description to lead with,
+/// and `explorer.exe (explorer.exe)` helps nobody, so the bracket is dropped
+/// when it would only repeat the name.
+///
+/// Process COUNTS use square brackets (`Microsoft Edge (msedge.exe) [24]`)
+/// precisely so the two cannot be confused.
+fn process_display_name(p: &ProcessEntry) -> String {
+    let shown = p.shown_name();
+    if shown.eq_ignore_ascii_case(&p.name) {
+        p.name.clone()
+    } else {
+        format!("{shown} ({})", p.name)
+    }
+}
+
 fn identity_of(row: &RowData) -> crate::app::ProcessIdentity {
     crate::app::ProcessIdentity {
         pid: row.pid,
@@ -512,8 +532,9 @@ fn prepare_auto_fit_widths(
     }
 }
 
-/// Collapsible group header ("Apps (5)") at standard row height so the list
-/// stays virtualizable.
+/// Collapsible group header ("Apps [5]") at standard row height so the list
+/// stays virtualizable. The count is in square brackets like every other
+/// process count on this page, because round ones now mean an image name.
 fn group_header(
     app: &mut TaskManApp,
     ui: &mut egui::Ui,
@@ -549,7 +570,7 @@ fn group_header(
     ui.painter().text(
         egui::Pos2::new(rect.left() + 28.0, rect.center().y),
         egui::Align2::LEFT_CENTER,
-        format!("{label} ({total})"),
+        format!("{label} [{total}]"),
         egui::FontId::proportional(20.0),
         pal.text,
     );
@@ -1233,7 +1254,7 @@ fn emit_flat_with_family_groups(
                 pid: p.pid,
                 start_epoch_s: p.start_epoch_s,
                 depth: 0,
-                name: format!("{} ({})", p.shown_name(), fam.len()),
+                name: format!("{} [{}]", process_display_name(p), fam.len()),
                 icon_path: p
                     .exe_path
                     .as_ref()
@@ -1557,7 +1578,7 @@ fn make_flat_row(p: &ProcessEntry, subtree: &Subtree) -> DisplayRow {
         pid: p.pid,
         start_epoch_s: p.start_epoch_s,
         depth: 0,
-        name: p.shown_name().to_string(),
+        name: process_display_name(p),
         icon_path: p
             .exe_path
             .as_ref()
@@ -1589,7 +1610,7 @@ fn make_own_row(p: &ProcessEntry, depth: usize) -> DisplayRow {
         pid: p.pid,
         start_epoch_s: p.start_epoch_s,
         depth,
-        name: p.shown_name().to_string(),
+        name: process_display_name(p),
         icon_path: p
             .exe_path
             .as_ref()
@@ -1718,9 +1739,9 @@ fn emit_tree<'a>(
         let has_children = !kids.is_empty();
         let count = subtree.count(proc.pid);
         let name = if count > 1 {
-            format!("{} ({})", proc.shown_name(), count)
+            format!("{} [{}]", process_display_name(proc), count)
         } else {
-            proc.shown_name().to_string()
+            process_display_name(proc)
         };
         out.push(DisplayRow::Process(RowData {
             pid: proc.pid,
@@ -2093,7 +2114,7 @@ mod tests {
         // Browser main + helper are one family; the secondary same-image
         // window is its own group (Task Manager shows PWAs separately).
         let brave_row = app_rows.iter().find(|r| r.pid == 2).unwrap();
-        assert_eq!(brave_row.name, "brave.exe (2)");
+        assert_eq!(brave_row.name, "brave.exe [2]");
         assert_eq!(brave_row.values[0], 6.0);
         let pwa_row = app_rows.iter().find(|r| r.pid == 3).unwrap();
         assert_eq!(pwa_row.name, "brave.exe");
@@ -2151,7 +2172,7 @@ mod tests {
         assert!(app_rows.iter().all(|r| r.depth == 0));
         assert_eq!(
             app_rows.iter().find(|r| r.pid == 10).unwrap().name,
-            "WindowsTerminal.exe (2)"
+            "WindowsTerminal.exe [2]"
         );
         assert_eq!(
             app_rows.iter().find(|r| r.pid == 12).unwrap().name,
@@ -2233,7 +2254,7 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(labels[0], "Brave (4)");
+        assert_eq!(labels[0], "Brave [4]");
         let collapsed = build_display_rows(&snap, "", 0, true, &HashSet::new(), &groups);
         let collapsed_labels: Vec<&str> = collapsed
             .iter()
@@ -2242,7 +2263,7 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(collapsed_labels[0], "Brave (4)");
+        assert_eq!(collapsed_labels[0], "Brave [4]");
         let mut e2 = HashSet::new();
         e2.insert(1u32);
         e2.insert(2u32);
@@ -2254,8 +2275,8 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(labels2[0], "Brave (4)");
-        assert_eq!(labels2[1], "Child (3)");
+        assert_eq!(labels2[0], "Brave [4]");
+        assert_eq!(labels2[1], "Child [3]");
     }
 
     #[test]
@@ -2465,7 +2486,7 @@ mod tests {
 
     #[test]
     fn background_same_image_family_collapses_into_expandable_group() {
-        // Task Manager shows e.g. "Dropbox (7)": a connected family whose
+        // Task Manager shows e.g. "Dropbox [7]": a connected family whose
         // members all share the image collapses into one expandable row with
         // the family aggregate.
         let mut main = proc(1, Some(99), "Dropbox.exe", ProcCategory::Background);
@@ -2485,7 +2506,7 @@ mod tests {
         );
         let bg = rows_in_group(&collapsed, 1);
         assert_eq!(bg.len(), 1, "family renders as one row");
-        assert_eq!(bg[0].name, "Dropbox.exe (4)");
+        assert_eq!(bg[0].name, "Dropbox.exe [4]");
         assert_eq!(bg[0].values[0], 10.0, "family aggregate (1+2+3+4)");
         assert!(bg[0].children, "group row is expandable");
 
@@ -2501,7 +2522,7 @@ mod tests {
         );
         let bg_open = rows_in_group(&open, 1);
         assert_eq!(bg_open.len(), 4, "group row plus members");
-        assert_eq!(bg_open[0].name, "Dropbox.exe (4)");
+        assert_eq!(bg_open[0].name, "Dropbox.exe [4]");
         assert!(bg_open[1..].iter().all(|r| r.depth == 1));
         assert!(bg_open[1..].iter().all(|r| !r.children));
     }
@@ -2531,7 +2552,7 @@ mod tests {
         );
         let bg = rows_in_group(&rows, 1);
         assert_eq!(bg.len(), 2, "one family row plus the foreign helper");
-        assert_eq!(bg[0].name, "brave.exe (3)");
+        assert_eq!(bg[0].name, "brave.exe [3]");
         assert_eq!(
             bg[0].values[0], 6.0,
             "1 + 2 + 3, the crash handler excluded"
@@ -2564,7 +2585,7 @@ mod tests {
             .iter()
             .find(|r| r.name.starts_with("node.exe"))
             .expect("run row");
-        assert_eq!(run.name, "node.exe (3)");
+        assert_eq!(run.name, "node.exe [3]");
         assert_eq!(run.pid, 2, "the lowest pid heads the run, so it is stable");
         assert!(run.children);
         assert_eq!(run.values[0], 3.0);
@@ -2637,7 +2658,7 @@ mod tests {
         );
         let bg = rows_in_group(&rows, 1);
         assert_eq!(bg.len(), 1, "idle helper folds in");
-        assert_eq!(bg[0].name, "steam.exe (2)");
+        assert_eq!(bg[0].name, "steam.exe [2]");
 
         let mut busy = idle;
         busy.cpu_pct = 20.0;
@@ -2677,6 +2698,51 @@ mod tests {
         assert!(bg.iter().all(|r| !r.children));
     }
 
+    /// Processes is the app list, so the friendly description leads — but the
+    /// image name is what a person types into a search or a ticket, so it is
+    /// there too. Counts use SQUARE brackets so the two cannot be confused.
+    #[test]
+    fn a_process_row_names_the_description_and_the_image() {
+        let mut edge = ProcessEntry::new(1, "msedge.exe");
+        edge.display = "Microsoft Edge".into();
+        assert_eq!(process_display_name(&edge), "Microsoft Edge (msedge.exe)");
+
+        // No version metadata: nothing to lead with, and repeating the name
+        // in brackets helps nobody.
+        let bare = ProcessEntry::new(2, "mystery.exe");
+        assert_eq!(process_display_name(&bare), "mystery.exe");
+
+        // A description that only differs in case is still a repeat.
+        let mut cased = ProcessEntry::new(3, "Explorer.exe");
+        cased.display = "explorer.exe".into();
+        assert_eq!(process_display_name(&cased), "Explorer.exe");
+    }
+
+    /// The two bracket styles carry different meanings and must not collide:
+    /// round is the image name, square is how many processes the row stands
+    /// for.
+    #[test]
+    fn a_group_row_keeps_the_image_name_and_the_count_apart() {
+        let mut main = proc(1, Some(99), "Dropbox.exe", ProcCategory::Background);
+        main.display = "Dropbox".into();
+        main.cpu_pct = 0.1;
+        let mut kid = proc(2, Some(1), "Dropbox.exe", ProcCategory::Background);
+        kid.display = "Dropbox".into();
+        kid.cpu_pct = 0.1;
+
+        let rows = build_display_rows(
+            &snap_of(vec![main, kid]),
+            "",
+            0,
+            true,
+            &HashSet::new(),
+            &[false; 3],
+        );
+        let bg = rows_in_group(&rows, 1);
+        assert_eq!(bg.len(), 1);
+        assert_eq!(bg[0].name, "Dropbox (Dropbox.exe) [2]");
+    }
+
     #[test]
     fn background_same_name_separate_families_stay_separate_rows() {
         // Task Manager does NOT merge unrelated same-name processes
@@ -2689,7 +2755,7 @@ mod tests {
         let bg = rows_in_group(&rows, 1);
         assert_eq!(bg.len(), 2);
         assert!(bg.iter().all(|r| !r.children));
-        assert!(bg.iter().all(|r| !r.name.contains('(')));
+        assert!(bg.iter().all(|r| !r.name.contains('[')), "no count suffix");
     }
 
     #[test]
@@ -2799,7 +2865,7 @@ mod tests {
         assert!(bg.is_empty(), "busy windowed family member stays Apps");
         let apps = rows_in_group(&rows, 0);
         assert_eq!(apps.len(), 1);
-        assert_eq!(apps[0].name, "steam.exe (2)");
+        assert_eq!(apps[0].name, "steam.exe [2]");
         assert_eq!(apps[0].values[0], 41.0, "family aggregate keeps helper");
     }
 
@@ -2830,7 +2896,7 @@ mod tests {
         let apps = rows_in_group(&rows, 0);
         assert_eq!(apps.len(), 1);
         assert_eq!(apps[0].pid, 1);
-        assert_eq!(apps[0].name, "Code.exe (2)");
+        assert_eq!(apps[0].name, "Code.exe [2]");
         // Promoted CPU no longer counts into the family aggregate (only the
         // root's own 1.0% from the fixture remains).
         assert_eq!(apps[0].values[0], 1.0);

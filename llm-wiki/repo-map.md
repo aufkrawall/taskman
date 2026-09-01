@@ -130,6 +130,12 @@ platform boundary (`tm-core` ← `tm-platform` ← `tm-app` / `tm-service`):
   MUST stay a contiguous, append-ordered `Vec<HistoryPoint>`; it was a
   `VecDeque` whose ring wrap once froze all Performance charts (see
   `log/recent.md` 2026-08-27). `performance::window` slices it directly.
+- Row naming is deliberately different per page and is NOT a candidate for
+  unification: `details::detail_name` is the image name alone (the diagnostic
+  page; the description is an optional column there), while
+  `processes::process_display_name` is `Description (image.exe)` (the app
+  list). Process counts on Processes use SQUARE brackets — `Microsoft Edge
+  (msedge.exe) [24]`, `Apps [7]` — because round ones mean an image name.
 - `crates/tm-app/src/tabs/processes.rs` — Processes UI intentionally uses a
   presentation-only app tree for Apps (Explorer/common shells, shell-session
   brokers and browsers are launch boundaries; a windowed process folds into
