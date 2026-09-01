@@ -78,3 +78,59 @@ pub fn create_collector() -> Box<dyn tm_core::engine::SystemCollector> {
         Box::new(macos::create_collector())
     }
 }
+
+/// Sub-pixel (`ClearType`) text-rendering parameters for the current display.
+///
+/// Windows reports the user's font-smoothing choice and their per-monitor `cttune.exe`
+/// calibration; every other platform reports "off" for now. Sub-pixel rendering is only
+/// correct when our pixels map one-to-one onto the panel's, so this is a capability query
+/// rather than a preference -- see `win::text_rendering` for the gates it applies.
+pub mod text_rendering {
+    /// Plain data, deliberately free of any platform type so the renderer and the egui
+    /// fork stay platform-independent.
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    pub struct Params {
+        pub enabled: bool,
+        pub bgr: bool,
+        pub gamma: f32,
+        pub contrast: f32,
+        pub cleartype_level: f32,
+    }
+
+    impl Default for Params {
+        fn default() -> Self {
+            Self {
+                enabled: false,
+                bgr: false,
+                gamma: 1.8,
+                contrast: 0.5,
+                cleartype_level: 1.0,
+            }
+        }
+    }
+
+    /// Query the display showing `hwnd` (or the primary display when `None`).
+    #[cfg(target_os = "windows")]
+    pub fn query(hwnd: Option<isize>) -> Params {
+        let p = crate::win::text_rendering::query(hwnd);
+        Params {
+            enabled: p.enabled,
+            bgr: p.bgr,
+            gamma: p.gamma,
+            contrast: p.contrast,
+            cleartype_level: p.cleartype_level,
+        }
+    }
+
+    /// Non-Windows: sub-pixel rendering is off.
+    ///
+    /// The rasterizer and blend path are platform-independent, so enabling this elsewhere
+    /// is a matter of finding the equivalent signal -- fontconfig's `rgba` on X11, and on
+    /// Wayland only when the surface is not fractionally scaled, because the compositor
+    /// would resample the fringes. Neither is wired up yet, and guessing wrong looks
+    /// worse than grayscale.
+    #[cfg(not(target_os = "windows"))]
+    pub fn query(_hwnd: Option<isize>) -> Params {
+        Params::default()
+    }
+}
