@@ -41,7 +41,11 @@ pub const ROW_H: f32 = 32.0;
 /// Compact row height for the dense list pages (Details, Services, Modules).
 /// Native Task Manager's Details tab packs its rows with no visible gap; the
 /// 32 px app-list spacing there reads as broken whitespace between entries.
-pub const ROW_H_DENSE: f32 = 22.0;
+///
+/// 20 px is the floor: [`FONT_ROW`] at 13 px needs a ~17 px line box, and
+/// [`TmTable::icon_cell`] derives its glyph side from `row_h - 6`, so going
+/// lower starts shrinking the icons rather than the gap.
+pub const ROW_H_DENSE: f32 = 20.0;
 /// Header height for tables with aggregates (two-line).
 pub const HEADER_H: f32 = 57.0;
 /// Header height for single-line headers (Details/Services/Startup).
