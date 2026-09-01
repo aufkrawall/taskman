@@ -2074,6 +2074,38 @@ fn end_process(
     );
 }
 
+/// `YYYYMMDD-HHMMSS` (UTC) for a dump file name.
+///
+/// UTC rather than local time because the only jobs this has are ordering and
+/// uniqueness, and UTC does both without a DST fold. Built from the wall clock
+/// rather than a formatting crate because it must never fail: a dump the user
+/// just waited for cannot be lost to a name.
+fn local_timestamp_for_filename() -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    let days = now / 86_400;
+    let seconds = now % 86_400;
+    // Civil-from-days (Howard Hinnant's algorithm), which is exact and has no
+    // table to get wrong.
+    let z = days as i64 + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    format!(
+        "{y:04}{m:02}{d:02}-{:02}{:02}{:02}",
+        seconds / 3600,
+        (seconds % 3600) / 60,
+        seconds % 60
+    )
+}
+
 pub(crate) fn create_dump(app: &mut TaskManApp, ctx: &egui::Context, p: &ProcessEntry) {
     if !identity_still_live(app, p) {
         app.shared.toast(i18n::tr(K::ProcessExited));
@@ -2083,7 +2115,15 @@ pub(crate) fn create_dump(app: &mut TaskManApp, ctx: &egui::Context, p: &Process
         app.shared.toast(i18n::tr(K::DumpAlreadyRunning));
         return;
     }
-    let default_name = format!("{}.dmp", p.shown_name());
+    // Name the file after what it is a dump OF. Two dumps of the same program
+    // are the normal case (before and after a hang), and "brave.exe.dmp" twice
+    // means the second one silently replaces the first.
+    let default_name = format!(
+        "{}_{}_{}.dmp",
+        p.name.trim_end_matches(".exe").trim_end_matches(".EXE"),
+        p.pid,
+        local_timestamp_for_filename()
+    );
     let Some(path) = rfd::FileDialog::new()
         .set_file_name(&default_name)
         .save_file()
@@ -2320,6 +2360,31 @@ pub fn affinity_dialog(app: &mut TaskManApp, ctx: &egui::Context, pal: &theme::P
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The dump file name must be sortable and must never collide, which
+    /// makes the date arithmetic load-bearing rather than cosmetic.
+    #[test]
+    fn dump_timestamps_are_well_formed_and_sortable() {
+        let stamp = local_timestamp_for_filename();
+        assert_eq!(stamp.len(), 15, "YYYYMMDD-HHMMSS: {stamp}");
+        assert_eq!(&stamp[8..9], "-");
+        assert!(
+            stamp.chars().enumerate().all(|(i, c)| if i == 8 {
+                c == '-'
+            } else {
+                c.is_ascii_digit()
+            }),
+            "{stamp}"
+        );
+        let year: u32 = stamp[..4].parse().expect("year");
+        assert!((2020..2200).contains(&year), "implausible year in {stamp}");
+        let month: u32 = stamp[4..6].parse().expect("month");
+        assert!((1..=12).contains(&month), "{stamp}");
+        let day: u32 = stamp[6..8].parse().expect("day");
+        assert!((1..=31).contains(&day), "{stamp}");
+        let hour: u32 = stamp[9..11].parse().expect("hour");
+        assert!(hour < 24, "{stamp}");
+    }
 
     fn tree_process(pid: u32, ppid: Option<u32>, name: &str) -> ProcessEntry {
         let mut process = ProcessEntry::new(pid, name);
