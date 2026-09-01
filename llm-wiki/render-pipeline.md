@@ -101,6 +101,32 @@ specification** — Microsoft has never documented DirectWrite's exact one; this
 Skia and Chromium converged on. The *parameters* are not guesswork: they come from
 `IDWriteRenderingParams` for the monitor, carrying the user's own `cttune.exe` calibration.
 
+## Text weight, and what `TextSmoothing` now means
+
+`DirectWrite`'s gamma and contrast describe *DirectWrite's* curve. Fed unchanged into this
+one they lift a half-covered pixel from 128 to 178 on a dark UI, which reads as fat and
+glowing next to native Windows text -- Windows errs thin. So the smoothing profile became
+a weight control, which is the useful thing left for it to be now that the coverage ramp it
+used to select is not consulted on the sub-pixel path at all:
+
+| profile | grid-fit | binning | blend | ink @150% |
+| --- | --- | --- | --- | --- |
+| `Sharp` | yes | no | `gamma * 0.72`, no contrast boost | 899 |
+| `Standard` | no | no | the display's own parameters | 1117 |
+| `Smooth` | no | yes | the display's own parameters | -- |
+
+`theme::cleartype_weight` is the single definition, shared with the comparison harness.
+
+**Measure at 150% scaling, not 100%.** At 100% the three profiles are indistinguishable
+(edge sharpness 75.4 / 75.3 / 75.5) and the weight question is invisible. At 150%, where
+stems are ~2 px, `Sharp` is 20% less ink *and* sharper. An earlier comparison at 100% led
+to the wrong conclusion for exactly this reason.
+
+`crates/tm-app/src/text_compare.rs` renders every profile, filter and blend to magnified
+PNGs: `TASKMAN_TEXT_COMPARE=target/t cargo test -p tm-app text_compare`. The LCD filter is
+the other real knob -- unfiltered 96.6 sharpness at 92.0 fringe, `FREETYPE_DEFAULT` 75.3 at
+64.1, `CLASSIC` 69.9 at 58.8.
+
 ## When sub-pixel text is refused
 
 Enabling it where it is not valid looks *worse* than grayscale, so it is gated on:

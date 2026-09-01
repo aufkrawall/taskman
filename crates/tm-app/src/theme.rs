@@ -316,6 +316,20 @@ fn apply_text_aa(opts: &mut egui::epaint::TextOptions, theme: egui::Theme) {
     if !subpixel.is_off() {
         let params = subpixel_params();
         opts.cleartype_level = params.cleartype_level;
+
+        // Under sub-pixel rendering the smoothing profile becomes a WEIGHT control, which
+        // is the only thing left for it to be: the coverage ramp it used to select is not
+        // consulted by the sub-pixel rasterizer at all.
+        //
+        // The reason a control is needed rather than just DirectWrite's numbers: those
+        // numbers describe DirectWrite's own curve, and this is a different curve (see
+        // `egui_software::gamma`). Fed in unchanged on a dark UI they lift a half-covered
+        // pixel from 128 to 178, which reads as fat and glowing next to native Windows
+        // text -- Windows errs thin. Measured at 150% scaling, dropping the contrast
+        // boost and pulling gamma back takes ~14% of the ink out and sharpens the stems.
+        let (gamma, contrast) = cleartype_weight(smoothing, &params);
+        opts.text_gamma = gamma;
+        opts.text_contrast = contrast;
         // A sub-pixel atlas holds three times as many distinct coverage values per glyph
         // and one extra pixel of margin per side. 2048 overflows, and the atlas's
         // response to overflow is to restart a third smaller, which shows up as visibly
@@ -325,6 +339,22 @@ fn apply_text_aa(opts: &mut egui::epaint::TextOptions, theme: egui::Theme) {
     // Hinting is already the default; assert the intent so a future default
     // flip cannot silently soften our text.
     opts.font_hinting = true;
+}
+
+/// Blend gamma and contrast for a smoothing profile under sub-pixel rendering.
+///
+/// Shared with `text_compare` so the comparison harness renders what the app renders.
+pub fn cleartype_weight(
+    smoothing: TextSmoothing,
+    params: &tm_platform::text_rendering::Params,
+) -> (f32, f32) {
+    match smoothing {
+        // Thin and crisp: closest to native Windows on a dark UI. Measured at 150%
+        // scaling this removes ~14% of the ink and sharpens the stems.
+        TextSmoothing::Sharp => (params.gamma * 0.72, 0.0),
+        // The display's own DirectWrite parameters, unmodified.
+        TextSmoothing::Standard | TextSmoothing::Smooth => (params.gamma, params.contrast),
+    }
 }
 
 /// `TASKMAN_TEXT_SMOOTHING=sharp|standard|smooth` overrides the setting for

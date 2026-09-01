@@ -77,6 +77,22 @@ pub struct TextOptions {
     ///
     /// Default: `1.0`.
     pub cleartype_level: f32,
+
+    /// TASKMAN-FORK: gamma of the text blend space.
+    ///
+    /// Strictly a *blend*-time value -- it does not affect how glyphs are rasterized, so
+    /// changing it invalidates the atlas for nothing. It lives here anyway because this
+    /// is the one channel a renderer can read the text configuration from, and it is only
+    /// ever changed when the user picks a different smoothing profile, which rebuilds the
+    /// atlas regardless.
+    ///
+    /// Windows' default is 1.8. Lower renders thinner.
+    pub text_gamma: f32,
+
+    /// TASKMAN-FORK: enhanced-contrast boost applied to coverage before blending.
+    ///
+    /// Windows' default is 0.5. Zero renders thinner.
+    pub text_contrast: f32,
 }
 
 impl Default for TextOptions {
@@ -89,6 +105,8 @@ impl Default for TextOptions {
             subpixel: SubpixelMode::Off,
             lcd_filter: LcdFilter::FREETYPE_DEFAULT,
             cleartype_level: 1.0,
+            text_gamma: 1.8,
+            text_contrast: 0.5,
         }
     }
 }
