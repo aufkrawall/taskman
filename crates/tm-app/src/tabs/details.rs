@@ -67,7 +67,11 @@ pub enum ColumnId {
 impl ColumnId {
     pub fn compare(self, a: &ProcessEntry, b: &ProcessEntry) -> CmpOrdering {
         match self {
-            ColumnId::Name => cmp_ignore_case(a.shown_name(), b.shown_name()),
+            // Matches what `detail_name` renders — description first, image
+            // name as the tie-break — without composing the string for every
+            // comparison in the sort.
+            ColumnId::Name => cmp_ignore_case(a.shown_name(), b.shown_name())
+                .then_with(|| cmp_ignore_case(&a.name, &b.name)),
             ColumnId::Pid => a.pid.cmp(&b.pid),
             ColumnId::Status => status_rank(a.status).cmp(&status_rank(b.status)),
             ColumnId::User => cmp_option_str(a.user.as_deref(), b.user.as_deref()),
@@ -1071,6 +1075,28 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
     select_columns_dialog(app, &ctx_from(ui), &pal);
 }
 
+/// Name for the Details list: the friendly description with the exact image
+/// name behind it — `Host Process for Windows Services (svchost.exe)`.
+///
+/// Details is the diagnostic page; the description alone is the one thing it
+/// must not show on its own, because a dozen processes share a description
+/// ("Host Process for Windows Services", "Microsoft Edge WebView2") and the
+/// image name is what a person needs to type into a search, a script or a
+/// support ticket. The description still leads, because it is what identifies
+/// the program at a glance.
+///
+/// A process with no version metadata has no description to lead with, and
+/// `explorer.exe (explorer.exe)` helps nobody, so the bracket is dropped when
+/// it would only repeat the name.
+fn detail_name(p: &ProcessEntry) -> String {
+    let shown = p.shown_name();
+    if shown.eq_ignore_ascii_case(&p.name) {
+        p.name.clone()
+    } else {
+        format!("{shown} ({})", p.name)
+    }
+}
+
 fn identity_of(row: &Row) -> crate::app::ProcessIdentity {
     crate::app::ProcessIdentity {
         pid: row.pid,
@@ -1578,7 +1604,7 @@ fn row_from_process(p: &ProcessEntry, depth: usize, children: bool) -> Row {
     Row {
         pid: p.pid,
         start_epoch_s: p.start_epoch_s,
-        name: p.shown_name().to_string(),
+        name: detail_name(p),
         icon_path: p
             .exe_path
             .as_ref()
@@ -2360,6 +2386,57 @@ pub fn affinity_dialog(app: &mut TaskManApp, ctx: &egui::Context, pal: &theme::P
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Details is the diagnostic page: the description alone is ambiguous
+    /// (a dozen processes share "Host Process for Windows Services") and the
+    /// image name is what a person types into a search or a ticket.
+    #[test]
+    fn the_details_name_carries_the_image_name_behind_the_description() {
+        let mut host = ProcessEntry::new(900, "svchost.exe");
+        host.display = "Host Process for Windows Services".into();
+        assert_eq!(
+            detail_name(&host),
+            "Host Process for Windows Services (svchost.exe)"
+        );
+
+        // No version metadata: `shown_name` falls back to the image name, and
+        // repeating it in brackets would help nobody.
+        let bare = ProcessEntry::new(901, "mystery.exe");
+        assert_eq!(detail_name(&bare), "mystery.exe");
+
+        // A description that only differs in case is still a repeat.
+        let mut cased = ProcessEntry::new(902, "Explorer.exe");
+        cased.display = "explorer.exe".into();
+        assert_eq!(detail_name(&cased), "Explorer.exe");
+    }
+
+    /// Sorting has to follow what the column renders, or two rows with the
+    /// same description come out in an order the list cannot explain.
+    #[test]
+    fn the_name_column_sorts_by_description_then_image_name() {
+        let mut first = ProcessEntry::new(1, "svchost.exe");
+        first.display = "Host Process for Windows Services".into();
+        let mut second = ProcessEntry::new(2, "taskhostw.exe");
+        second.display = "Host Process for Windows Services".into();
+
+        assert_eq!(
+            ColumnId::Name.compare(&first, &second),
+            CmpOrdering::Less,
+            "same description falls back to the image name"
+        );
+        assert_eq!(
+            ColumnId::Name.compare(&second, &first),
+            CmpOrdering::Greater
+        );
+
+        let mut other = ProcessEntry::new(3, "aaa.exe");
+        other.display = "Zebra".into();
+        assert_eq!(
+            ColumnId::Name.compare(&first, &other),
+            CmpOrdering::Less,
+            "description still leads"
+        );
+    }
 
     /// The dump file name must be sortable and must never collide, which
     /// makes the date arithmetic load-bearing rather than cosmetic.

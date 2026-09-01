@@ -46,6 +46,8 @@ Ten reported gaps in one pass; `log/recent.md` carries the root causes.
   was nothing behind it when `ShowWindow` composed it.
 - **egui's scroll-edge fades are off.** They read as shadows lying on the
   tables.
+- **Details names carry the image name**: `Description (image.exe)`, dropping
+  the bracket when it would only repeat the name.
 
 ## Recently landed (2026-09-01 — CPU renderer and ClearType text)
 
