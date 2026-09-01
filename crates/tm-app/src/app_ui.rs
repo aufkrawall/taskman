@@ -27,6 +27,10 @@ pub const SIDEBAR_W_COLLAPSED: f32 = 54.0;
 /// Centered search field spanning the top of the window. The blank strip on
 /// either side behaves as an additional native titlebar drag region while the
 /// search box remains a normal interactive text control.
+///
+/// This strip fills with `window_bg`, which is also what the native caption
+/// directly above it is painted with (`TaskManApp::sync_title_bar`) — the two
+/// are meant to read as one surface.
 pub fn top_search_panel(app: &mut TaskManApp, ui_root: &mut egui::Ui, pal: &Palette) {
     egui::Panel::top(egui::Id::new("topsearch"))
         .resizable(false)
@@ -52,10 +56,7 @@ pub fn top_search_panel(app: &mut TaskManApp, ui_root: &mut egui::Ui, pal: &Pale
             let right_drag = Rect::from_min_max(Pos2::new(box_rect.right(), rect.top()), rect.max);
             for (id, drag_rect) in [("top-drag-left", left_drag), ("top-drag-right", right_drag)] {
                 if drag_rect.width() > 0.0 {
-                    let resp = ui.interact(drag_rect, egui::Id::new(id), Sense::drag());
-                    if resp.drag_started() {
-                        ui.ctx().send_viewport_cmd(egui::ViewportCommand::StartDrag);
-                    }
+                    titlebar_drag_region(ui, egui::Id::new(id), drag_rect);
                 }
             }
 
@@ -76,16 +77,30 @@ pub fn top_search_panel(app: &mut TaskManApp, ui_root: &mut egui::Ui, pal: &Pale
                 pal.text_dim,
             );
 
+            // The clear button only exists while there is something to clear,
+            // so the field's text never has to end short of the rounded edge
+            // for a control that is not there.
+            let has_text = !app.search.is_empty();
+            let clear_rect = Rect::from_center_size(
+                Pos2::new(box_rect.right() - 18.0, box_rect.center().y),
+                egui::vec2(24.0, 24.0),
+            );
+            let text_right = if has_text {
+                clear_rect.left() - 4.0
+            } else {
+                box_rect.right() - 10.0
+            };
+
             let edit_rect = Rect::from_min_max(
                 Pos2::new(box_rect.left() + 34.0, box_rect.top() + 3.0),
-                Pos2::new(box_rect.right() - 10.0, box_rect.bottom() - 3.0),
+                Pos2::new(text_right, box_rect.bottom() - 3.0),
             );
             let mut edit_ui = ui.new_child(
                 egui::UiBuilder::new()
                     .max_rect(edit_rect)
                     .layout(egui::Layout::left_to_right(egui::Align::Center)),
             );
-            edit_ui.add(
+            let edit = edit_ui.add(
                 egui::TextEdit::singleline(&mut app.search)
                     .hint_text(i18n::tr(K::SearchHint))
                     .font(FontId::proportional(15.0))
@@ -93,7 +108,88 @@ pub fn top_search_panel(app: &mut TaskManApp, ui_root: &mut egui::Ui, pal: &Pale
                     .desired_width(edit_rect.width())
                     .id(egui::Id::new("global-search")),
             );
+
+            if has_text {
+                let resp = ui
+                    .interact(
+                        clear_rect,
+                        egui::Id::new("global-search-clear"),
+                        Sense::click(),
+                    )
+                    .on_hover_text(i18n::tr(K::ClearSearch));
+                if resp.hovered() {
+                    ui.painter()
+                        .circle_filled(clear_rect.center(), 11.0, pal.card_bg_hover);
+                }
+                crate::icons::draw_at(
+                    ui,
+                    Rect::from_center_size(clear_rect.center(), egui::vec2(11.0, 11.0)),
+                    Icon::Close,
+                    if resp.hovered() {
+                        pal.text
+                    } else {
+                        pal.text_dim
+                    },
+                );
+                if resp.clicked() {
+                    app.search.clear();
+                }
+            }
+
+            // Escape clears rather than only unfocusing: with the field empty
+            // it is the same keystroke that leaves it, and a stale filter is
+            // the one thing a user cannot see the cause of.
+            if edit.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                app.search.clear();
+            }
         });
+}
+
+/// Make `rect` behave like the native title bar: press-and-move drags the
+/// window, double-click maximizes/restores it.
+///
+/// The window move starts on the BUTTON PRESS, not on egui's `drag_started()`.
+/// egui only reports a drag once the pointer has travelled past its drag
+/// threshold, and everything up to that point is movement the window did not
+/// follow — so the window jumped to catch up the moment the drag was
+/// recognized, and dragging here felt worse than dragging the real caption.
+/// `StartDrag` hands the gesture to the window manager, which then owns the
+/// whole move, so issuing it early costs nothing.
+fn titlebar_drag_region(ui: &egui::Ui, id: egui::Id, rect: Rect) {
+    /// Double-click window, in seconds. Windows' own is configurable
+    /// (`SPI_GETDOUBLECLICKTIME`, 500 ms by default); this only decides
+    /// between "maximize" and "move", so the default is close enough.
+    const DOUBLE_CLICK_S: f64 = 0.5;
+
+    let resp = ui.interact(rect, id, Sense::click_and_drag());
+    let (pressed, now, pos) = ui.input(|i| {
+        (
+            i.pointer.primary_pressed(),
+            i.time,
+            i.pointer.interact_pos(),
+        )
+    });
+    if !pressed || !resp.contains_pointer() {
+        return;
+    }
+
+    // Double-click is detected here rather than through `Response`: handing
+    // the gesture to the window manager below ends egui's view of the press,
+    // so its own click/double-click bookkeeping never completes.
+    let previous = ui.ctx().data(|d| d.get_temp::<(f64, Pos2)>(id));
+    let position = pos.unwrap_or(rect.center());
+    ui.ctx().data_mut(|d| d.insert_temp(id, (now, position)));
+    if let Some((last, last_pos)) = previous
+        && now - last <= DOUBLE_CLICK_S
+        && last_pos.distance(position) <= 8.0
+    {
+        let maximized = ui.input(|i| i.viewport().maximized.unwrap_or(false));
+        ui.ctx()
+            .send_viewport_cmd(egui::ViewportCommand::Maximized(!maximized));
+        return;
+    }
+
+    ui.ctx().send_viewport_cmd(egui::ViewportCommand::StartDrag);
 }
 
 // ---------------------------------------------------------------- sidebar

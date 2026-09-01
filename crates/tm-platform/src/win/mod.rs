@@ -33,6 +33,8 @@ pub mod text_rendering;
 mod threads_map;
 pub(crate) mod users;
 mod version;
+/// Native caption appearance (DWM attributes) — see `window_chrome`.
+pub mod window_chrome;
 mod windows_enum;
 
 use crate::actions::*;
