@@ -1,6 +1,6 @@
 # Build System
 
-Last verified: 2026-08-31
+Last verified: 2026-09-01
 
 Primary sources:
 - `build.py`
@@ -30,6 +30,10 @@ Flags: `--host-only`, `--linux-only`, `--debug`, `--no-package`,
 - `cargo fmt --all -- --check`
 - `cargo clippy --workspace --all-targets --all-features -- -D warnings`
 - `cargo test --workspace --all-features`
+- `tools/check-fork.ps1` -- the vendored egui fork's own fmt/clippy/test. **Not
+  redundant:** `cargo clippy --workspace -- -D warnings` only passes those flags to the
+  packages cargo selected, and `vendor/egui` is a deliberately excluded separate
+  workspace. Without this step the fork's crates sit outside the gate entirely.
 
 Nested inside a release artifact build when run as
 `python build.py --host-only --check`.
@@ -69,7 +73,9 @@ one target-native backend through a target-specific direct `wgpu` dependency:
 - Linux: Vulkan only.
 - macOS: Metal only.
 
-The GUI tries WGPU first and retains Glow as the compatibility fallback.
+The GUI now tries the native CPU renderer (`Renderer::Software`) first; WGPU and Glow
+remain as fallbacks. The CPU path needs no driver, starts without enumerating adapters or
+compiling shaders, and is the only backend that can do sub-pixel text.
 Surface presentation is FIFO with one-frame maximum latency, and WGPU prefers
 the low-power adapter unless `WGPU_POWER_PREF` overrides it. This trims unused
 backend dependency/code without making older or unusual graphics systems a

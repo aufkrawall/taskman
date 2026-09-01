@@ -170,3 +170,12 @@ platform boundary (`tm-core` ← `tm-platform` ← `tm-app` / `tm-service`):
 - Headless smoke: `taskman --selfcheck [--mock]`.
 - Service headless smoke: `taskman-service --selfcheck` (does not install or
   start the service).
+
+## Rendering
+
+`vendor/egui/` is a vendored fork of egui (subtree, tag 0.36.1). It exists for two
+things that stock egui cannot do: sub-pixel (ClearType) text and a native CPU renderer.
+`vendor/egui/TASKMAN-FORK.md` is the divergence inventory and rebase runbook;
+`llm-wiki/render-pipeline.md` is the design. The fork has its own quality gate,
+`tools/check-fork.ps1`, because `cargo clippy --workspace` does not reach an excluded
+workspace.

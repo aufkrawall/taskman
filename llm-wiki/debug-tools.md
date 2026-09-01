@@ -37,6 +37,15 @@ ProgramData, registry, or SCM state.
 - `TASKMAN_PRESENT=fifo|immediate|mailbox|autovsync` and
   `TASKMAN_FRAME_LATENCY=<n>` (0 = leave it to wgpu) tune the swapchain while
   investigating frame pacing.
+- `TASKMAN_SUBPIXEL=0|1` forces sub-pixel (ClearType) text off or on. It cannot
+  enable it on a GPU renderer: a sub-pixel atlas blended with one scalar alpha
+  draws rainbow-tinted text, so the interlock in `theme.rs` wins. With no
+  override, the mode follows Windows' own font-smoothing settings and the
+  per-monitor ClearType calibration.
+- `TASKMAN_RENDERER=software|wgpu|glow` now includes the native CPU renderer.
+  It is what `render_mode = software` selects and what the default order tries
+  first. `TASKMAN_PRESENT` and `TASKMAN_FRAME_LATENCY` are wgpu swapchain knobs
+  and do nothing on the CPU path.
 - `TASKMAN_TEXT_SMOOTHING=sharp|standard|smooth` overrides the persisted glyph
   weight/grid-fitting profile for A/B comparison without touching config.ini.
 - Windows WGPU compiles only D3D12; Linux only Vulkan; macOS only Metal.

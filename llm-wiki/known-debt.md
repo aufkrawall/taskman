@@ -1,6 +1,6 @@
 # Known and Accepted Debt
 
-Last verified: 2026-08-31
+Last verified: 2026-09-01
 
 Primary sources:
 - `AGENTS.md`
@@ -37,19 +37,18 @@ items across Phases 2–6. The following concrete gaps remain:
   instead of nested beneath it the way System Informer shows it. Restoring
   the link would mean re-introducing a parent the collector API did not
   report; the honest root is preferred over a synthesized edge.
-- **Sub-pixel (ClearType) text:** impossible without forking epaint and both
-  render backends. epaint keeps a single-channel glyph coverage atlas and the
-  renderers blend with one scalar alpha; per-channel coverage needs a
-  3-channel atlas plus dual-source blending or per-channel write masks
-  (upstream: emilk/egui#2639). Measured: 0 RGB channel spread in our text vs
-  visible fringing in the reference Task Manager capture. The `text_smoothing`
-  setting tunes grayscale weight and grid-fitting, which is all that is
-  reachable.
-- **Software rendering performance:** `render_mode = software` uses WARP and
-  costs ~14 cores at 2.9 fps on a 16-thread desktop. The cost is fixed per
-  frame (window size and UI content do not change it), so it is a wgpu/WARP
-  property, not something the app can optimize. Kept as an explicitly warned
-  option; `compatibility` (OpenGL) is the fallback that stays real-time.
+- **Sub-pixel (ClearType) text: DONE** (2026-09-01). Kept only so the reasoning is not
+  re-derived, because this entry was half wrong. epaint's atlas is *not* single-channel --
+  it has stored `Color32` since 0.36 -- so per-channel coverage needed no new format at
+  all. What was genuinely blocked is per-channel *blending*: on a GPU that needs
+  dual-source blending (upstream emilk/egui#2639), and on a CPU it is a multiply. Both the
+  3x rasterization and the per-channel blend now live in `vendor/egui`. See
+  `render-pipeline.md`.
+- **Software rendering performance: SUPERSEDED** (2026-09-01). `render_mode = software`
+  no longer means WARP -- a D3D12 driver emulated on the CPU at ~14 cores and 2.9 fps --
+  but a native CPU rasterizer that draws the UI directly. The old measurement was correct
+  and is retained here only to explain why the option used to carry a warning. Do not
+  reintroduce the WARP adapter selector.
 - **Service upgrade over a RUNNING service fails.** `stop_service_for_upgrade`
   opens the live service process with `SYNCHRONIZE` to wait for its exit, and
   that `OpenProcess` returns access denied even from an elevated installer, so
