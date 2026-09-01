@@ -352,7 +352,24 @@ fn run_gui(mock: bool, args: &[String]) {
                     as Box<dyn eframe::App>,
             )
         };
-        match eframe::run_native("Task-Manager", options(renderer), Box::new(creator)) {
+        // Sub-pixel text is only correct on a renderer that blends per channel, and only
+        // where the display and the user's settings allow it. Both are resolved here,
+        // before the context exists, so the very first frame rasterizes correctly rather
+        // than rebuilding the atlas after one grayscale frame.
+        let text_params = tm_platform::text_rendering::query(None);
+        #[cfg(feature = "software")]
+        let is_software = matches!(renderer, eframe::Renderer::Software);
+        #[cfg(not(feature = "software"))]
+        let is_software = false;
+        theme::set_subpixel_capable(is_software, text_params);
+
+        let mut opts = options(renderer);
+        opts.software_options = eframe::SoftwareOptions {
+            text_gamma: text_params.gamma,
+            text_contrast: text_params.contrast,
+        };
+
+        match eframe::run_native("Task-Manager", opts, Box::new(creator)) {
             Ok(()) => return,
             Err(e) => {
                 tracing::warn!(error = %e, "renderer failed; falling back");

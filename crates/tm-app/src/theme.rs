@@ -6,6 +6,62 @@ use std::sync::atomic::{AtomicU8, Ordering};
 use eframe::egui::{self, Color32, CornerRadius, FontId, Visuals};
 use tm_core::settings::TextSmoothing;
 
+/// Whether the active renderer can display sub-pixel (`ClearType`) text.
+///
+/// This is an interlock, not a preference. An atlas rasterized with per-channel coverage
+/// is only meaningful to a renderer that blends per channel; handing it to `egui_glow` or
+/// `egui-wgpu` draws rainbow-tinted text. `main.rs` sets this once the renderer is known.
+static SUBPIXEL_CAPABLE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The platform's text-rendering parameters, resolved once at startup.
+static SUBPIXEL_PARAMS: std::sync::Mutex<Option<tm_platform::text_rendering::Params>> =
+    std::sync::Mutex::new(None);
+
+/// Record that the active renderer blends per channel, and the display's parameters.
+pub fn set_subpixel_capable(capable: bool, params: tm_platform::text_rendering::Params) {
+    SUBPIXEL_CAPABLE.store(capable, Ordering::Relaxed);
+    *SUBPIXEL_PARAMS.lock().unwrap_or_else(|e| e.into_inner()) = Some(params);
+}
+
+/// The sub-pixel mode to rasterize glyphs with, or `Off`.
+pub fn subpixel_mode() -> egui::epaint::text::SubpixelMode {
+    use egui::epaint::text::SubpixelMode;
+    if let Some(forced) = env_subpixel() {
+        // The override still cannot enable it on a renderer that would draw it wrong.
+        if !forced || !SUBPIXEL_CAPABLE.load(Ordering::Relaxed) {
+            return SubpixelMode::Off;
+        }
+    } else if !SUBPIXEL_CAPABLE.load(Ordering::Relaxed) {
+        return SubpixelMode::Off;
+    }
+    let params = *SUBPIXEL_PARAMS.lock().unwrap_or_else(|e| e.into_inner());
+    match params {
+        Some(p) if p.enabled || env_subpixel() == Some(true) => {
+            if p.bgr {
+                SubpixelMode::Bgr
+            } else {
+                SubpixelMode::Rgb
+            }
+        }
+        _ => SubpixelMode::Off,
+    }
+}
+
+/// The display's text blend parameters, for the software renderer.
+pub fn subpixel_params() -> tm_platform::text_rendering::Params {
+    (*SUBPIXEL_PARAMS.lock().unwrap_or_else(|e| e.into_inner())).unwrap_or_default()
+}
+
+/// `TASKMAN_SUBPIXEL=0|1` forces sub-pixel text off or on for A/B comparison.
+fn env_subpixel() -> Option<bool> {
+    static OVERRIDE: std::sync::OnceLock<Option<bool>> = std::sync::OnceLock::new();
+    *OVERRIDE.get_or_init(|| match std::env::var("TASKMAN_SUBPIXEL").ok()?.trim() {
+        "0" | "off" | "false" => Some(false),
+        "1" | "on" | "true" => Some(true),
+        _ => None,
+    })
+}
+
 /// Active glyph-weight choice. Process-global like the UI language, because
 /// [`install_visuals`] is called from contexts that do not carry settings
 /// (startup, per-frame theme re-check).
@@ -141,8 +197,9 @@ pub fn ensure_visuals(ctx: &egui::Context) {
     let state = (
         ctx.style_of(egui::Theme::Dark).visuals.dark_mode,
         SMOOTHING.load(Ordering::Relaxed),
+        SUBPIXEL_CAPABLE.load(Ordering::Relaxed),
     );
-    let applied = ctx.data(|d| d.get_temp::<(bool, u8)>(egui::Id::new("tm-visuals-dark")));
+    let applied = ctx.data(|d| d.get_temp::<(bool, u8, bool)>(egui::Id::new("tm-visuals-dark")));
     if applied != Some(state) {
         install_visuals(ctx);
         ctx.data_mut(|d| d.insert_temp(egui::Id::new("tm-visuals-dark"), state));
@@ -250,6 +307,21 @@ fn apply_text_aa(opts: &mut egui::epaint::TextOptions, theme: egui::Theme) {
     };
     opts.color_transfer_function = ramp;
     opts.subpixel_binning = binning;
+
+    // Sub-pixel (ClearType) coverage. Orthogonal to the grayscale weight above: it
+    // changes how glyphs are RASTERIZED, and is gated on the active renderer being able
+    // to blend per channel at all.
+    let subpixel = subpixel_mode();
+    opts.subpixel = subpixel;
+    if !subpixel.is_off() {
+        let params = subpixel_params();
+        opts.cleartype_level = params.cleartype_level;
+        // A sub-pixel atlas holds three times as many distinct coverage values per glyph
+        // and one extra pixel of margin per side. 2048 overflows, and the atlas's
+        // response to overflow is to restart a third smaller, which shows up as visibly
+        // corrupted glyphs rather than as an error.
+        opts.max_texture_side = opts.max_texture_side.max(4096);
+    }
     // Hinting is already the default; assert the intent so a future default
     // flip cannot silently soften our text.
     opts.font_hinting = true;

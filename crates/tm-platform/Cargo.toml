@@ -42,6 +42,9 @@ windows = { version = "0.62", features = [
   "Win32_Graphics_Dwm",
   "Win32_Graphics_Dxgi",
   "Win32_Graphics_Gdi",
+  # Sub-pixel text: the monitor's ClearType parameters, and the DPI-awareness gate.
+  "Win32_Graphics_DirectWrite",
+  "Win32_UI_HiDpi",
   "Win32_NetworkManagement_IpHelper",
   "Win32_NetworkManagement_Ndis",
   "Win32_NetworkManagement_WiFi",

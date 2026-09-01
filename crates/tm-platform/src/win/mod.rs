@@ -28,6 +28,8 @@ mod sampler;
 mod services;
 mod startup;
 mod taskmgr_replacement;
+/// Sub-pixel (ClearType) text-rendering parameters and their validity gates.
+pub mod text_rendering;
 mod threads_map;
 pub(crate) mod users;
 mod version;
