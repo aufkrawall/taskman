@@ -125,7 +125,11 @@ keys! {
     TabUsers => ["Benutzer", "Users"],
     TabDetails => ["Details", "Details"],
     TabServices => ["Dienste", "Services"],
-    SearchHint => ["Nach Namen, Herausgeber oder PID suchen", "Type a name, publisher or PID to search"],
+    SearchHint => [
+        "Nach Name, Pfad, Herausgeber, Benutzer oder PID suchen",
+        "Search by name, path, publisher, user or PID"
+    ],
+    ClearSearch => ["Suche löschen", "Clear search"],
     Settings => ["Einstellungen", "Settings"],
     GatheringData => ["Sammle Daten…", "Gathering data…"],
     TrayOpen => ["TaskMan öffnen", "Open TaskMan"],

@@ -87,6 +87,10 @@ struct ProcRaw {
     /// Process base priority. The kernel reports it for EVERY process,
     /// including the protected ones no handle can be opened for.
     base_priority: i32,
+    /// Terminal-services session the process runs in. Reported by the kernel
+    /// for EVERY process, including the protected ones `OpenProcess` refuses
+    /// — which is what makes session 0 identifiable without a handle.
+    session_id: u32,
     /// Image base name from the kernel table (empty when unparseable).
     /// Remembered for processes that exit so their CPU churn can be named.
     name: Box<str>,
@@ -199,6 +203,22 @@ impl CpuLoadAccountant {
             return None;
         }
         Some(raw.base_priority)
+    }
+
+    /// Terminal-services session id from the newest native process table.
+    ///
+    /// `ProcessIdInformation`/`OpenProcess` answer this only for processes a
+    /// handle can be opened for; the kernel table answers it for all of them,
+    /// which is what lets a protected session-0 process still be attributed
+    /// to a system account. Identity-guarded like [`Self::base_priority`].
+    pub fn session_id_of(&self, pid: u32, start_epoch_s: Option<i64>) -> Option<u32> {
+        let raw = self.prev.as_ref()?.procs.get(&pid)?;
+        if let Some(expected) = start_epoch_s
+            && filetime_to_unix_seconds(raw.create_time) != Some(expected)
+        {
+            return None;
+        }
+        Some(raw.session_id)
     }
 
     /// Whether the newest native process table identifies this exact process
@@ -374,6 +394,7 @@ impl CpuLoadAccountant {
             let kernel = read_i64(buf, pos + off.kernel_time);
             let pid = read_usize(buf, pos + off.pid) as u32;
             let base_priority = read_u32(buf, pos + off.base_priority) as i32;
+            let session_id = read_u32(buf, pos + off.session_id);
             let buf_base = buf.as_ptr() as usize;
             let name = parse_image_name(buf, buf_base, pos, written, &off);
 
@@ -391,6 +412,7 @@ impl CpuLoadAccountant {
                         kernel,
                         user,
                         base_priority,
+                        session_id,
                         name,
                     },
                 );
@@ -463,6 +485,7 @@ struct Offsets {
     /// Field holding the name offset, relative to the record start.
     image_name_buffer: usize,
     base_priority: usize,
+    session_id: usize,
     min_size: usize,
 }
 
@@ -483,6 +506,7 @@ impl Offsets {
                 image_name: 56,
                 image_name_buffer: 64,
                 base_priority: 72,
+                session_id: 100,
                 min_size: 104,
             }
         } else {
@@ -496,6 +520,7 @@ impl Offsets {
                 image_name: 56,
                 image_name_buffer: 60,
                 base_priority: 64,
+                session_id: 80,
                 min_size: 84,
             }
         }
@@ -837,7 +862,43 @@ mod tests {
             off.pid,
             offset_of!(SYSTEM_PROCESS_INFORMATION, UniqueProcessId)
         );
+        assert_eq!(
+            off.session_id,
+            offset_of!(SYSTEM_PROCESS_INFORMATION, SessionId)
+        );
         assert!(off.min_size >= offset_of!(SYSTEM_PROCESS_INFORMATION, SessionId) + 4);
+    }
+
+    /// Session ids come from the same kernel table for the same reason base
+    /// priorities do: it is the only source that covers the processes no
+    /// handle can be opened for, and session 0 is what identifies a process
+    /// as system-owned when its token cannot be read at all.
+    #[test]
+    fn live_kernel_table_yields_session_ids_for_every_process() {
+        let mut acc = CpuLoadAccountant::new();
+        let procs = acc.query_procs().expect("NtQuerySystemInformation");
+        acc.prev = Some(PrevSample {
+            at: Instant::now(),
+            cores: Vec::new(),
+            procs,
+        });
+        let own = acc
+            .session_id_of(std::process::id(), None)
+            .expect("this process is in the table");
+        // Session 0 holds the service hosts; an interactive test run is not
+        // in it, and either way at least one process must report each.
+        let table = &acc.prev.as_ref().expect("sample").procs;
+        assert!(
+            table.values().any(|p| p.session_id == 0),
+            "Windows always has session-0 processes"
+        );
+        assert!(
+            table.values().any(|p| p.session_id == own),
+            "this process's own session must be represented"
+        );
+        // A creation-time mismatch must refuse to answer rather than let a
+        // recycled pid inherit a session.
+        assert_eq!(acc.session_id_of(std::process::id(), Some(1)), None);
     }
 
     /// Base priority is the ONLY priority source for protected processes, so
@@ -986,6 +1047,7 @@ mod tests {
                     kernel: 1e7 as i64,
                     user: 1e7 as i64,
                     base_priority: 8,
+                    session_id: 0,
                     name: "stay.exe".into(),
                 },
             ),
@@ -998,6 +1060,7 @@ mod tests {
                     kernel: 5e7 as i64,
                     user: 0,
                     base_priority: 8,
+                    session_id: 0,
                     name: "old.exe".into(),
                 },
             ),
@@ -1010,6 +1073,7 @@ mod tests {
                     kernel: 3e7 as i64,
                     user: 3e7 as i64,
                     base_priority: 8,
+                    session_id: 0,
                     name: "stay.exe".into(),
                 },
             ),
@@ -1020,6 +1084,7 @@ mod tests {
                     kernel: 2e7 as i64,
                     user: 0,
                     base_priority: 8,
+                    session_id: 0,
                     name: "new.exe".into(),
                 },
             ),
@@ -1068,6 +1133,7 @@ mod tests {
                 kernel: 1e7 as i64,
                 user: 1e7 as i64,
                 base_priority: 8,
+                session_id: 0,
                 name: "rustc.exe".into(),
             },
         )]);
@@ -1094,6 +1160,7 @@ mod tests {
                         kernel: 0,
                         user: 0,
                         base_priority: 8,
+                        session_id: 0,
                         name: "rustc.exe".into(),
                     },
                 ),
@@ -1104,6 +1171,7 @@ mod tests {
                         kernel: 0,
                         user: 0,
                         base_priority: 8,
+                        session_id: 0,
                         name: "rustc.exe".into(),
                     },
                 ),
@@ -1116,6 +1184,7 @@ mod tests {
                 kernel: 0.2e7 as i64,
                 user: 0,
                 base_priority: 8,
+                session_id: 0,
                 name: "cargo.exe".into(),
             },
         )]);

@@ -155,15 +155,19 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
         return;
     };
 
-    let q = app.search.trim().to_lowercase();
+    let q = crate::search::Query::new(&app.search);
     let mut rows: Vec<&ServiceInfo> = c
         .items
         .iter()
         .filter(|s| {
-            q.is_empty()
-                || s.name.to_lowercase().contains(&q)
-                || s.display_name.to_lowercase().contains(&q)
-                || s.description.to_lowercase().contains(&q)
+            let pid = s.pid.map(|pid| pid.to_string()).unwrap_or_default();
+            q.matches_any([
+                s.name.as_str(),
+                s.display_name.as_str(),
+                s.description.as_str(),
+                s.group.as_str(),
+                pid.as_str(),
+            ])
         })
         .collect();
     let sort = app.services_sort;

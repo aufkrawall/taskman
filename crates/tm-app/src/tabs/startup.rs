@@ -150,7 +150,14 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
     let mut visible: Vec<usize> = items
         .iter()
         .enumerate()
-        .filter(|(_, it)| q.matches_any([it.name.as_str(), it.publisher.as_deref().unwrap_or("")]))
+        .filter(|(_, it)| {
+            q.matches_any([
+                it.name.as_str(),
+                it.publisher.as_deref().unwrap_or(""),
+                it.command.as_str(),
+                it.location.as_str(),
+            ])
+        })
         .map(|(i, _)| i)
         .collect();
     let sort = app.startup_sort;
