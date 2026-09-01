@@ -52,8 +52,21 @@ fn utf16_to_string(buf: &[u16]) -> String {
     String::from_utf16_lossy(&buf[..len])
 }
 
+/// How many engine types one adapter may report.
+///
+/// Every engine type has to survive, not just the busy ones: the Performance
+/// page lets the user chart a SPECIFIC engine, and an encoder that is idle
+/// right now is exactly the one they are about to ask about. A modern GPU
+/// exposes 3D, Compute, Copy, VideoDecode, VideoEncode, VideoProcessing,
+/// Security and a couple of vendor engines, so the cap is a sanity bound
+/// against a driver publishing unbounded instance names, not a display limit.
+const MAX_ENGINE_TYPES: usize = 16;
+
 /// Aggregated per-engine-type utilization of one adapter (max across
 /// instances of that type — engines run concurrently, summing overstates).
+///
+/// Sorted by busiest first, which is what makes `engines[0]` the engine the
+/// adapter's own utilization number came from.
 fn adapter_engines<'a>(
     records: impl IntoIterator<Item = &'a crate::win::perfcounters::GpuEngineRecord>,
 ) -> Vec<GpuEngine> {
@@ -69,12 +82,15 @@ fn adapter_engines<'a>(
             util_pct: util.clamp(0.0, 100.0),
         })
         .collect();
+    // Busiest first, then by name so an all-idle adapter still reports a
+    // stable order instead of the hash map's.
     out.sort_by(|a, b| {
         b.util_pct
             .partial_cmp(&a.util_pct)
             .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.name.cmp(&b.name))
     });
-    out.truncate(6);
+    out.truncate(MAX_ENGINE_TYPES);
     out
 }
 
@@ -265,7 +281,17 @@ mod tests {
         assert_eq!(merged.len(), 1);
         let g = &merged[0];
         assert!((g.util_pct - 95.0).abs() < f32::EPSILON, "busiest engine");
-        assert_eq!(g.engines[0].name, "Copy");
+        assert_eq!(
+            g.engines[0].name, "Copy",
+            "busiest engine is reported first"
+        );
+        // An idle engine must survive: the Performance page charts engines by
+        // name, and an encoder at 0 % is exactly what a user asks to see.
+        assert!(
+            g.engines.iter().any(|e| e.name == "3D"),
+            "idle engines are kept: {:?}",
+            g.engines
+        );
         assert_eq!(g.mem_used_bytes, 10);
         assert_eq!(g.shared_used_bytes, 4);
 

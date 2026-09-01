@@ -42,6 +42,15 @@ pub struct HistoryPoint {
     pub disks: Vec<(String, f32, f64, f64)>, // mount, active%, read bps, write bps
     pub nets: Vec<(String, f64, f64)>,       // name, recv bps, sent bps
     pub gpus: Vec<(usize, f32, u64)>,        // id, util%, mem used
+    /// Per-adapter, per-engine utilization: `(gpu id, engine name, util %)`.
+    ///
+    /// Kept alongside `gpus` rather than inside it because the engine set is
+    /// discovered from PDH and can differ between ticks — a laptop's discrete
+    /// GPU has no engine instances at all until something uses it. Names are
+    /// owned per point for the same reason `disks` and `nets` own theirs: the
+    /// alternative is an index into a registry that must then be kept in sync
+    /// with a history buffer that outlives any single snapshot.
+    pub gpu_engines: Vec<(usize, String, f32)>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -678,6 +687,15 @@ impl TaskManApp {
                     .gpus
                     .iter()
                     .map(|g| (g.id, g.util_pct, g.mem_used_bytes))
+                    .collect(),
+                gpu_engines: latest
+                    .gpus
+                    .iter()
+                    .flat_map(|g| {
+                        g.engines
+                            .iter()
+                            .map(move |e| (g.id, e.name.clone(), e.util_pct))
+                    })
                     .collect(),
             };
             push_history_point(&mut self.history, self.history_cap, pt);

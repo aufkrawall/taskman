@@ -315,6 +315,8 @@ keys! {
     DefaultStartPageLabel => ["Startseite:", "Default start page:"],
     ProcessViewLabel => ["Prozessansicht:", "Process view:"],
     CpuGraphOverall => ["Gesamtauslastung", "Overall utilization"],
+    ChangeGraphTo => ["Diagramm ändern zu", "Change graph to"],
+    GpuAllEngines => ["Alle Engines", "All engines"],
     CpuGraphLogical => ["Logische Prozessoren", "Logical processors"],
     ShowKernelTimes => ["Kernelzeiten anzeigen", "Show kernel times"],
     MinShort => ["Min.", "min"],
