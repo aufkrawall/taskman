@@ -322,16 +322,16 @@ keys! {
         "Per-process network needs administrator rights (ETW session)."
     ],
     RenderModeLabel => ["Grafikausgabe:", "Graphics:"],
-    RenderAuto => ["Automatisch (GPU)", "Automatic (GPU)"],
+    RenderAuto => ["Automatisch", "Automatic"],
     RenderCompat => ["Kompatibilität (OpenGL)", "Compatibility (OpenGL)"],
     RenderSoftware => ["Software (CPU)", "Software (CPU)"],
     RenderModeHint => [
-        "Kompatibilität nutzt einen anderen Treiberpfad, falls Direct3D Probleme macht.",
-        "Compatibility uses a different driver path in case Direct3D misbehaves."
+        "Automatisch bevorzugt den CPU-Renderer und weicht auf die GPU aus, falls er nicht startet. Kompatibilität erzwingt OpenGL.",
+        "Automatic prefers the CPU renderer and falls back to the GPU if it cannot start. Compatibility forces OpenGL."
     ],
     RenderSoftwareWarning => [
-        "Software-Rendering rechnet jedes Bild auf der CPU und ist um ein Vielfaches langsamer (auf diesem System ~3 Bilder/s bei hoher CPU-Last).",
-        "Software rendering computes every frame on the CPU and is far slower (~3 frames/s at high CPU load on this system)."
+        "Zeichnet ohne Grafiktreiber direkt auf der CPU. Nur dieser Modus kann ClearType-Subpixel-Text darstellen.",
+        "Draws directly on the CPU with no graphics driver. This is the only mode that can render ClearType sub-pixel text."
     ],
     RestartRequired => [
         "Wird beim nächsten Start übernommen.",

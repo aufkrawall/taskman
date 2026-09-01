@@ -49,6 +49,23 @@ items across Phases 2–6. The following concrete gaps remain:
   but a native CPU rasterizer that draws the UI directly. The old measurement was correct
   and is retained here only to explain why the option used to carry a warning. Do not
   reintroduce the WARP adapter selector.
+- **Stack overflow under `TASKMAN_FPS_PROBE=1` on the software renderer.** Forcing
+  continuous repaints crashes the process after a few seconds with "thread 'main' has
+  overflowed its stack". Diagnostic-only: normal operation is event driven and stable
+  (verified over repeated 15-20 s runs), and the GPU backends do not reproduce it.
+  What is *known*, so it is not re-investigated from scratch:
+  - It is **not** the rasterizer. Replacing the entire paint with a no-op still
+    overflows, while routing the same frame through the slower tessellated path does
+    not. It tracks frame *rate*, not painted content.
+  - It is not re-entrancy of `run_ui_and_paint` -- a thread-local depth guard never
+    fired -- and not `softbuffer::present`, which was stubbed out with no effect.
+  - Upstream documents a related Windows behaviour: an invisible window burns a whole
+    core (emilk/egui#7776), mitigated there by a 10 ms sleep. That mitigation is in
+    place here and does not prevent this.
+  The remaining suspicion is window-procedure frames accumulating around the paint at
+  high repaint rates; confirming it needs a native stack trace, which a Rust stack
+  overflow on Windows does not provide. Not chased further because the trigger is a
+  diagnostic env var.
 - **Service upgrade over a RUNNING service fails.** `stop_service_for_upgrade`
   opens the live service process with `SYNCHRONIZE` to wait for its exit, and
   that `OpenProcess` returns access denied even from an elevated installer, so

@@ -47,6 +47,7 @@
 
 mod gamma;
 mod raster;
+mod span;
 mod target;
 mod text;
 mod texture;
@@ -105,7 +106,9 @@ pub struct Painter {
     /// Sub-pixel mode and the gamma tables it needs. Set by the backend from the platform's
     /// own text-rendering parameters; `Off` by default so nothing changes until asked.
     subpixel: epaint::text::SubpixelMode,
-    gamma: gamma::TextGamma,
+    /// Boxed: the tables are ~4.9 KB, which is far too much to carry inline in a type
+    /// that gets moved around and constructed inside a render loop.
+    gamma: Box<gamma::TextGamma>,
     /// Primitives that named a texture we do not have. Counted rather than logged per
     /// occurrence, because a missing texture usually means *every* glyph is missing and
     /// per-primitive logging would bury the actual cause.
@@ -134,7 +137,7 @@ impl Painter {
     pub fn set_subpixel(&mut self, mode: epaint::text::SubpixelMode, gamma: f32, contrast: f32) {
         self.subpixel = mode;
         if !self.gamma.matches(gamma, contrast) {
-            self.gamma = gamma::TextGamma::new(gamma, contrast);
+            *self.gamma = gamma::TextGamma::new(gamma, contrast);
         }
     }
 
@@ -224,8 +227,10 @@ impl Painter {
         ctx: &ShapeContext,
         shapes: Vec<ClippedShape>,
     ) {
+        let mut tess = Self::tessellator(ctx);
+
         if self.text_mode == TextMode::Tessellate {
-            let primitives = Self::tessellate(ctx, shapes);
+            let primitives = tess.tessellate_shapes(shapes);
             self.paint(target, ctx.pixels_per_point, &primitives);
             return;
         }
@@ -239,38 +244,62 @@ impl Painter {
             // geometry and comes out grayscale.
             let is_blittable_text = matches!(&clipped.shape, Shape::Text(t) if t.angle == 0.0);
 
-            if !is_blittable_text {
+            // A plain pixel-aligned rect is a span fill, not geometry. This is the single
+            // biggest cost in the renderer: panel and window backgrounds alone cover
+            // every pixel, and pushing them through the tessellator and the gouraud
+            // rasterizer spends ~50 operations per pixel computing a constant.
+            let fast_rect = match &clipped.shape {
+                Shape::Rect(r) => {
+                    span::fast_rect(r, ctx.pixels_per_point, ctx.options.round_rects_to_pixels)
+                }
+                _ => None,
+            };
+
+            if !is_blittable_text && fast_rect.is_none() {
                 batch.push(clipped);
                 continue;
             }
 
-            // Flush everything queued before this text, so ordering is preserved.
+            // Flush everything queued before this, so draw order is preserved exactly.
             if !batch.is_empty() {
-                let primitives = Self::tessellate(ctx, std::mem::take(&mut batch));
+                let primitives = tess.tessellate_shapes(std::mem::take(&mut batch));
                 self.paint(target, ctx.pixels_per_point, &primitives);
             }
 
             let clip = clip_rect_to_pixels(clipped.clip_rect, ctx.pixels_per_point, bounds);
+
+            if let Some(rect) = fast_rect {
+                let Shape::Rect(r) = &clipped.shape else {
+                    unreachable!("fast_rect only matches Shape::Rect")
+                };
+                span::fill(target, clip, rect, r.fill);
+                continue;
+            }
+
             let Shape::Text(text) = &clipped.shape else {
                 unreachable!("checked above")
             };
-            self.paint_text(target, clip, clipped.clip_rect, ctx, text);
+            self.paint_text(target, clip, clipped.clip_rect, ctx, text, &mut tess);
         }
 
         if !batch.is_empty() {
-            let primitives = Self::tessellate(ctx, batch);
+            let primitives = tess.tessellate_shapes(batch);
             self.paint(target, ctx.pixels_per_point, &primitives);
         }
     }
 
-    fn tessellate(ctx: &ShapeContext, shapes: Vec<ClippedShape>) -> Vec<ClippedPrimitive> {
+    /// A tessellator configured for this frame.
+    ///
+    /// Built once and reused across every batch flush. Constructing one per flush cloned
+    /// the prepared-disc list each time, and a frame can flush hundreds of times -- once
+    /// per run of shapes interrupted by text or by a fast-path rect.
+    fn tessellator(ctx: &ShapeContext) -> Tessellator {
         Tessellator::new(
             ctx.pixels_per_point,
             ctx.options,
             ctx.font_tex_size,
             ctx.prepared_discs.clone(),
         )
-        .tessellate_shapes(shapes)
     }
 
     /// Draw one [`TextShape`], blitting its glyphs and rasterizing everything else in the
@@ -286,6 +315,7 @@ impl Painter {
         clip_points: emath::Rect,
         ctx: &ShapeContext,
         text: &TextShape,
+        tess: &mut Tessellator,
     ) {
         let galley: &Galley = &text.galley;
         if galley.is_empty() || text.opacity_factor <= 0.0 {
@@ -427,7 +457,7 @@ impl Painter {
                     ),
                 });
             }
-            let primitives = Self::tessellate(ctx, shapes);
+            let primitives = tess.tessellate_shapes(shapes);
             self.paint(target, ppp, &primitives);
         }
     }

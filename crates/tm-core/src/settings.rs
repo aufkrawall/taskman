@@ -122,16 +122,21 @@ pub enum TextSmoothing {
 
 /// Which rendering path the GUI starts on.
 ///
-/// Measured on a Ryzen 7 5700X + RTX (16 logical CPUs), continuous repaint:
-/// D3D12 on the GPU 0.3 cores, OpenGL on the GPU 1.0 core, and the D3D12
-/// software rasterizer (WARP) 14 cores at 2.9 fps — WARP's per-frame cost is
-/// fixed (identical for a 500x320 and a 2000x1200 window, and identical for
-/// an empty and a full window), so nothing this app draws can bring it down.
-/// That is why "no GPU" is offered as the OpenGL path, and [`Self::Software`]
-/// carries an explicit warning.
+/// Which renderer to use.
+///
+/// [`Self::Software`] used to mean WARP -- a D3D12 driver emulated on the CPU, measured at
+/// ~14 cores and 2.9 fps on a 16-thread desktop, with a per-frame cost that did not depend
+/// on window size or content. It now means a native CPU rasterizer that draws the UI
+/// directly, which is a different thing entirely: no driver, no shader compiler, and the
+/// only path that can render sub-pixel (ClearType) text. Do not reintroduce the WARP
+/// adapter selector.
+///
+/// The persisted value keeps its name and its meaning to the user ("no GPU"), so no config
+/// migration is needed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum RenderMode {
-    /// D3D12/Vulkan/Metal through wgpu, falling back to OpenGL.
+    /// Try the renderers in their preferred order: the CPU rasterizer first, then
+    /// D3D12/Vulkan/Metal through wgpu, then OpenGL.
     #[default]
     Auto,
     /// Force the OpenGL backend: a completely separate driver path, for

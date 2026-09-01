@@ -110,9 +110,23 @@ pub mod text_rendering {
     }
 
     /// Query the display showing `hwnd` (or the primary display when `None`).
+    ///
+    /// **Only valid once a window exists** -- one of the gates depends on DPI awareness,
+    /// which winit sets while building its event loop.
     #[cfg(target_os = "windows")]
     pub fn query(hwnd: Option<isize>) -> Params {
-        let p = crate::win::text_rendering::query(hwnd);
+        convert(crate::win::text_rendering::query(hwnd))
+    }
+
+    /// Blend parameters only, without the validity gates. Safe to call before a window
+    /// exists; ignore `enabled` on the result.
+    #[cfg(target_os = "windows")]
+    pub fn blend_params(hwnd: Option<isize>) -> Params {
+        convert(crate::win::text_rendering::blend_params(hwnd))
+    }
+
+    #[cfg(target_os = "windows")]
+    fn convert(p: crate::win::text_rendering::TextRenderingParams) -> Params {
         Params {
             enabled: p.enabled,
             bgr: p.bgr,
@@ -131,6 +145,12 @@ pub mod text_rendering {
     /// worse than grayscale.
     #[cfg(not(target_os = "windows"))]
     pub fn query(_hwnd: Option<isize>) -> Params {
+        Params::default()
+    }
+
+    /// Non-Windows: the neutral defaults.
+    #[cfg(not(target_os = "windows"))]
+    pub fn blend_params(_hwnd: Option<isize>) -> Params {
         Params::default()
     }
 }

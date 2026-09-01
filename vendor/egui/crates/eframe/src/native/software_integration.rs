@@ -44,7 +44,9 @@ use crate::{
     App, AppCreator, CreationContext, NativeOptions, Result,
     native::{
         epi_integration::{self, EpiIntegration},
-        winit_integration::{EventResult, UserEvent, WinitApp, create_egui_context},
+        winit_integration::{
+            EventResult, UserEvent, WinitApp, create_egui_context, sleep_if_invisible_or_minimized,
+        },
     },
 };
 
@@ -77,6 +79,16 @@ struct SoftwareWinitRunning<'app> {
     /// together and behind an `Rc<RefCell<..>>` for the same reason glow keeps its
     /// painter that way: the repaint callback needs a weak handle.
     surface: Rc<RefCell<SurfaceState>>,
+
+    /// Whether any frame has been presented yet. The first one has to happen even
+    /// while the window is hidden, because it is what triggers `post_rendering` to show
+    /// the window.
+    has_presented_once: bool,
+
+    /// Set once the first frame has actually reached the screen, so the log records
+    /// that the CPU path is live and what it decided about sub-pixel text. A renderer
+    /// that starts but never paints is otherwise indistinguishable from one that works.
+    logged_first_frame: bool,
 
     /// Texture deltas that arrived while the window was not paintable (minimised, or
     /// zero-sized). Dropping a `TexturesDelta` panics, and skipping one would leave the
@@ -274,6 +286,8 @@ impl<'app> SoftwareWinitApp<'app> {
                 _context: context,
                 size: (0, 0),
             })),
+            has_presented_once: false,
+            logged_first_frame: false,
             pending_deltas: Default::default(),
         });
 
@@ -335,9 +349,21 @@ impl SoftwareWinitRunning<'_> {
         self.egui_winit
             .handle_platform_output(&self.window, platform_output);
 
+        // The *first* frame must be painted even though the window is still hidden:
+        // `post_rendering` below is what reveals it, and eframe deliberately keeps the
+        // window hidden until something has been drawn to avoid a white flash. After
+        // that, painting a window nobody can see is pure waste -- and worse than waste
+        // on Windows, where upstream documents an invisible window burning a whole core
+        // (emilk/egui#7776). Forced continuous repaints into a hidden window also grow
+        // the stack until the process dies, which is reproducible here with the painting
+        // removed entirely, so it is the repaint loop and not the rasterizer.
+        //
+        // Skipping is safe because visibility changes arrive as viewport commands, which
+        // are processed below regardless -- restoring from the tray resumes painting.
         let size = self.window.inner_size();
-        let paintable =
-            size.width > 0 && size.height > 0 && !self.window.is_minimized().unwrap_or(false);
+        let hidden =
+            self.window.is_visible() == Some(false) || self.window.is_minimized() == Some(true);
+        let paintable = size.width > 0 && size.height > 0 && (!hidden || !self.has_presented_once);
 
         if paintable {
             // Take the sub-pixel mode from the ATLAS, not from the style. The atlas is
@@ -400,6 +426,17 @@ impl SoftwareWinitRunning<'_> {
                     self.painter.paint_shapes(&mut target, &shape_ctx, shapes);
                 }
 
+                self.has_presented_once = true;
+                if !self.logged_first_frame {
+                    self.logged_first_frame = true;
+                    log::info!(
+                        "software renderer: first frame {}x{} px, sub-pixel text {:?}",
+                        size.width,
+                        size.height,
+                        subpixel
+                    );
+                }
+
                 buffer.present().map_err(|err| {
                     crate::Error::AppCreation(format!("softbuffer present: {err}").into())
                 })?;
@@ -435,6 +472,8 @@ impl SoftwareWinitRunning<'_> {
                 );
             }
         }
+
+        sleep_if_invisible_or_minimized(Some(&self.window));
 
         self.integration
             .report_frame_time(frame_timer.total_time_sec());
