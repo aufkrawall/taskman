@@ -274,11 +274,33 @@ fn norm(v: f64, max: f64) -> f32 {
 
 /// Render one frame with the software painter and return the pixel buffer.
 fn render() -> Vec<u32> {
+    render_with(egui::epaint::text::SubpixelMode::Off)
+}
+
+/// Render one frame, optionally with sub-pixel (`ClearType`) glyph coverage.
+///
+/// The mode has to be set in two places that must agree: `TextOptions` decides how the
+/// glyph atlas is *rasterized*, and the painter decides how those texels are *blended*.
+/// Setting one without the other is the failure mode worth guarding against -- it does
+/// not error, it just draws wrong colours.
+fn render_with(subpixel: egui::epaint::text::SubpixelMode) -> Vec<u32> {
     let ctx = egui::Context::default();
     theme::install_visuals(&ctx);
     ctx.set_theme(egui::ThemePreference::Dark);
+    if !subpixel.is_off() {
+        for theme in [egui::Theme::Dark, egui::Theme::Light] {
+            ctx.style_mut_of(theme, |style| {
+                style.visuals.text_options.subpixel = subpixel;
+            });
+        }
+    }
 
     let mut painter = Painter::new();
+    if !subpixel.is_off() {
+        // Windows' defaults. The real values come from the platform at run time; here
+        // they only have to be representative.
+        painter.set_subpixel(subpixel, 1.8, 0.5);
+    }
 
     // Two passes: egui resolves sizes and hover state from the previous frame, so the
     // first pass is a layout warm-up and the second is the one worth painting. Both
@@ -472,6 +494,88 @@ mod tests {
              paint their fills or lines"
         );
     }
+
+    /// Per-pixel RGB spread: how far apart the channels are.
+    ///
+    /// This is the measurement `llm-wiki/known-debt.md` records as the way to tell
+    /// sub-pixel text from grayscale. Grayscale coverage cannot produce any spread of its
+    /// own, because every channel receives the same coverage.
+    fn spread(px: u32) -> u32 {
+        let (r, g, b) = ((px >> 16) & 0xff, (px >> 8) & 0xff, px & 0xff);
+        r.max(g).max(b) - r.min(g).min(b)
+    }
+
+    /// Enabling sub-pixel rendering must introduce colour fringing on glyph edges.
+    ///
+    /// This is the end-to-end proof that the whole chain works: `TextOptions.subpixel`
+    /// reaches the rasterizer, the rasterizer writes per-channel coverage into the atlas,
+    /// the blitter recognises those texels, and the per-channel gamma blend reaches the
+    /// framebuffer. A break anywhere collapses the fringing to nothing.
+    ///
+    /// The comparison is made *between the two renders* rather than against an absolute
+    /// threshold in some region: taskman's UI is full of genuinely coloured pixels (the
+    /// blue heat band, the chart series, the selected row), so "this area should be
+    /// grey" is not a claim that holds. What does hold is that switching the mode on
+    /// changes glyph edges and nothing else.
+    #[test]
+    fn subpixel_rendering_adds_colour_fringing_to_glyph_edges() {
+        use egui::epaint::text::SubpixelMode;
+
+        let gray = render_with(SubpixelMode::Off);
+        let lcd = render_with(SubpixelMode::Rgb);
+        assert_eq!(gray.len(), lcd.len());
+
+        let mut changed = 0usize;
+        let mut more_fringed = 0usize;
+        let mut worst_gain = 0u32;
+        for (g, l) in gray.iter().zip(&lcd) {
+            if g == l {
+                continue;
+            }
+            changed += 1;
+            let (sg, sl) = (spread(*g), spread(*l));
+            if sl > sg {
+                more_fringed += 1;
+                worst_gain = worst_gain.max(sl - sg);
+            }
+        }
+
+        assert!(
+            changed > 1000,
+            "only {changed} pixels changed when sub-pixel was enabled -- the mode is \
+             not reaching the rasterizer or the blitter"
+        );
+        assert!(
+            more_fringed > 500,
+            "{more_fringed} of {changed} changed pixels gained channel spread; sub-pixel \
+             coverage is not surviving to the framebuffer"
+        );
+        assert!(
+            worst_gain > 8,
+            "the strongest fringe gained only {worst_gain} of spread, which is not \
+             distinguishable from rounding"
+        );
+    }
+
+    /// Sub-pixel text must stay *text*: the fringing belongs on glyph edges, not smeared
+    /// across the whole frame. Solid fills have no coverage gradient, so they must come
+    /// out identical in both modes.
+    #[test]
+    fn subpixel_rendering_leaves_solid_fills_untouched() {
+        use egui::epaint::text::SubpixelMode;
+
+        let gray = render_with(SubpixelMode::Off);
+        let lcd = render_with(SubpixelMode::Rgb);
+
+        // The middle of the sidebar band: a solid fill with no text over it.
+        for y in (100..500u32).step_by(37) {
+            let i = (y * WIDTH + 2) as usize;
+            assert_eq!(
+                gray[i], lcd[i],
+                "solid sidebar fill changed at y={y} when sub-pixel was enabled"
+            );
+        }
+    }
 }
 
 /// Write the CPU-rendered frame to a PNG so it can actually be looked at.
@@ -496,4 +600,13 @@ fn write_cpu_frame_snapshot_when_requested() {
             .join(path)
     };
     write_png(&path, &render());
+
+    // ...and the sub-pixel version alongside it, for an A/B look.
+    let lcd = path.with_file_name(format!(
+        "{}-cleartype.png",
+        path.file_stem()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| "frame".to_owned())
+    ));
+    write_png(&lcd, &render_with(egui::epaint::text::SubpixelMode::Rgb));
 }

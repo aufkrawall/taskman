@@ -263,12 +263,36 @@ impl FontCell {
             Some(())
         })?;
 
-        let bounds = path.control_box().expand();
+        // TASKMAN-FORK: sub-pixel rasterization needs one extra pixel of margin on each
+        // side, because the 5-tap filter reaches 2/3 of a pixel past the outermost lit
+        // sub-pixel. Expanding by a whole *physical* pixel keeps `UvRect::offset` an
+        // integer number of pixels, which is what lets `tessellate_glyphs`' rounding --
+        // and the software renderer's 1:1 blit -- stay exact.
+        let subpixel = atlas.options().subpixel;
+        let mut bounds = path.control_box().expand();
+        if !subpixel.is_off() {
+            bounds.x0 -= 1.0;
+            bounds.x1 += 1.0;
+        }
         let width = bounds.width() as u16;
         let height = bounds.height() as u16;
 
         let uv_rect = if width == 0 || height == 0 {
             UvRect::default()
+        } else if !subpixel.is_off() {
+            let glyph_pos = rasterize_subpixel(atlas, &path, bounds, width, height);
+            let offset_in_pixels = vec2(bounds.x0 as f32, bounds.y0 as f32);
+            let offset =
+                offset_in_pixels / metrics.pixels_per_point + metrics.y_offset_in_points * Vec2::Y;
+            UvRect {
+                offset,
+                size: vec2(width as f32, height as f32) / metrics.pixels_per_point,
+                min: [glyph_pos.0 as u16, glyph_pos.1 as u16],
+                max: [
+                    (glyph_pos.0 + width as usize) as u16,
+                    (glyph_pos.1 + height as usize) as u16,
+                ],
+            }
         } else {
             let mut ctx = vello_cpu::RenderContext::new(width, height);
             ctx.set_transform(kurbo::Affine::translate((-bounds.x0, -bounds.y0)));
@@ -312,6 +336,66 @@ impl FontCell {
 
         Some(GlyphAllocation { uv_rect })
     }
+}
+
+/// TASKMAN-FORK: rasterize one glyph with per-channel (LCD) coverage.
+///
+/// The outline is filled at **3x horizontal resolution** so each of a pixel's three
+/// sub-pixels gets its own coverage sample, then a short symmetric FIR filter turns
+/// those samples into per-pixel RGB coverage.
+///
+/// Hinting is deliberately *not* re-run at 3x: the caller has already grid-fit the
+/// outline against the physical pixel grid, and only the sampling is finer. That is
+/// what `FreeType` and `DirectWrite` both do, and doing it the other way would snap stems
+/// to sub-pixel boundaries and destroy the vertical alignment hinting exists for.
+fn rasterize_subpixel(
+    atlas: &mut TextureAtlas,
+    path: &kurbo::BezPath,
+    bounds: kurbo::Rect,
+    width: u16,
+    height: u16,
+) -> (usize, usize) {
+    let opts = *atlas.options();
+    let w3 = width as usize * 3;
+
+    let mut ctx = vello_cpu::RenderContext::new(w3 as u16, height);
+    // `kurbo::Affine` composes right-to-left: translate into the bitmap, then stretch
+    // horizontally by three.
+    ctx.set_transform(
+        kurbo::Affine::scale_non_uniform(3.0, 1.0)
+            * kurbo::Affine::translate((-bounds.x0, -bounds.y0)),
+    );
+    ctx.set_paint(color::OpaqueColor::<color::Srgb>::WHITE);
+    ctx.fill_path(path);
+    let mut dest = vello_cpu::Pixmap::new(w3 as u16, height);
+    let mut resources = vello_cpu::Resources::new();
+    ctx.render(&mut dest, &mut resources);
+
+    let pixels = dest.data_as_u8_slice();
+    let (glyph_pos, image) = atlas.allocate((width as usize, height as usize));
+
+    let mut samples: Vec<u8> = Vec::with_capacity(w3);
+    let mut filtered: Vec<[u8; 3]> = Vec::with_capacity(width as usize);
+    for y in 0..height as usize {
+        // The glyph is painted white, so the alpha channel is the coverage.
+        samples.clear();
+        samples.extend((0..w3).map(|x| pixels[4 * (y * w3 + x) + 3]));
+
+        crate::text::subpixel::filter_row(&samples, width as usize, opts.lcd_filter, &mut filtered);
+
+        for (x, rgb) in filtered.iter().enumerate() {
+            let rgb = crate::text::subpixel::apply_cleartype_level(*rgb, opts.cleartype_level);
+            // R, G and B carry per-channel coverage; alpha carries a representative
+            // coverage so a renderer that cannot blend per channel still has
+            // something sane to fall back on. `max` rather than the mean, so thin
+            // stems do not disappear on that path.
+            let a = rgb[0].max(rgb[1]).max(rgb[2]);
+            image[(x + glyph_pos.0, y + glyph_pos.1)] =
+                Color32::from_rgba_premultiplied(rgb[0], rgb[1], rgb[2], a);
+        }
+    }
+
+    glyph_pos
 }
 
 struct VelloPen<'a> {
