@@ -187,22 +187,38 @@ pub use web::{WebLogger, WebRunner};
 // When compiling natively
 
 #[cfg(not(target_arch = "wasm32"))]
-#[cfg(any(feature = "glow", feature = "wgpu_no_default_features"))]
+#[cfg(any(
+    feature = "glow",
+    feature = "wgpu_no_default_features",
+    feature = "software"
+))]
 mod native;
 
 #[cfg(target_os = "macos")]
 pub use native::macos::WindowChromeMetrics;
 
 #[cfg(not(target_arch = "wasm32"))]
-#[cfg(any(feature = "glow", feature = "wgpu_no_default_features"))]
+#[cfg(any(
+    feature = "glow",
+    feature = "wgpu_no_default_features",
+    feature = "software"
+))]
 pub use native::run::EframeWinitApplication;
 
 #[cfg(not(any(target_arch = "wasm32", target_os = "ios")))]
-#[cfg(any(feature = "glow", feature = "wgpu_no_default_features"))]
+#[cfg(any(
+    feature = "glow",
+    feature = "wgpu_no_default_features",
+    feature = "software"
+))]
 pub use native::run::EframePumpStatus;
 
 #[cfg(not(target_arch = "wasm32"))]
-#[cfg(any(feature = "glow", feature = "wgpu_no_default_features"))]
+#[cfg(any(
+    feature = "glow",
+    feature = "wgpu_no_default_features",
+    feature = "software"
+))]
 #[cfg(feature = "persistence")]
 pub use native::file_storage::storage_dir;
 
@@ -283,7 +299,11 @@ pub(crate) fn maybe_attach_inspection_plugin(_ctx: &egui::Context, _label: Optio
 /// # Errors
 /// This function can fail if we fail to set up a graphics context.
 #[cfg(not(target_arch = "wasm32"))]
-#[cfg(any(feature = "glow", feature = "wgpu_no_default_features"))]
+#[cfg(any(
+    feature = "glow",
+    feature = "wgpu_no_default_features",
+    feature = "software"
+))]
 #[allow(clippy::allow_attributes, clippy::needless_pass_by_value)]
 pub fn run_native(
     app_name: &str,
@@ -301,7 +321,11 @@ pub fn run_native(
 /// # Errors
 /// This function can fail if we fail to set up a graphics context.
 #[cfg(not(target_arch = "wasm32"))]
-#[cfg(any(feature = "glow", feature = "wgpu_no_default_features"))]
+#[cfg(any(
+    feature = "glow",
+    feature = "wgpu_no_default_features",
+    feature = "software"
+))]
 #[allow(clippy::allow_attributes, clippy::needless_pass_by_value)]
 pub fn run_native_ext(
     app_name: &str,
@@ -312,6 +336,12 @@ pub fn run_native_ext(
     let renderer = init_native(app_name, &mut native_options);
 
     match renderer {
+        #[cfg(feature = "software")]
+        Renderer::Software => {
+            log::debug!("Using the software (CPU) renderer");
+            native::run::run_software(app_name, native_options, egui_ctx, app_creator)
+        }
+
         #[cfg(feature = "glow")]
         Renderer::Glow => {
             log::debug!("Using the glow renderer");
@@ -372,7 +402,11 @@ pub fn run_native_ext(
 ///
 /// See the `external_eventloop` example for a more complete example.
 #[cfg(not(target_arch = "wasm32"))]
-#[cfg(any(feature = "glow", feature = "wgpu_no_default_features"))]
+#[cfg(any(
+    feature = "glow",
+    feature = "wgpu_no_default_features",
+    feature = "software"
+))]
 pub fn create_native<'a>(
     app_name: &str,
     mut native_options: NativeOptions,
@@ -382,6 +416,17 @@ pub fn create_native<'a>(
     let renderer = init_native(app_name, &mut native_options);
 
     match renderer {
+        #[cfg(feature = "software")]
+        Renderer::Software => {
+            log::debug!("Using the software (CPU) renderer");
+            EframeWinitApplication::new(native::run::create_software(
+                app_name,
+                native_options,
+                app_creator,
+                event_loop,
+            ))
+        }
+
         #[cfg(feature = "glow")]
         Renderer::Glow => {
             log::debug!("Using the glow renderer");
@@ -407,7 +452,11 @@ pub fn create_native<'a>(
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-#[cfg(any(feature = "glow", feature = "wgpu_no_default_features"))]
+#[cfg(any(
+    feature = "glow",
+    feature = "wgpu_no_default_features",
+    feature = "software"
+))]
 fn init_native(app_name: &str, native_options: &mut NativeOptions) -> Renderer {
     #[cfg(not(feature = "__screenshot"))]
     assert!(
@@ -427,6 +476,8 @@ fn init_native(app_name: &str, native_options: &mut NativeOptions) -> Renderer {
     #[cfg(all(feature = "glow", feature = "wgpu_no_default_features"))]
     {
         match native_options.renderer {
+            #[cfg(feature = "software")]
+            Renderer::Software => "software",
             Renderer::Glow => "glow",
             Renderer::Wgpu => "wgpu",
         };
@@ -474,7 +525,11 @@ fn init_native(app_name: &str, native_options: &mut NativeOptions) -> Renderer {
 /// # Errors
 /// This function can fail if we fail to set up a graphics context.
 #[cfg(not(target_arch = "wasm32"))]
-#[cfg(any(feature = "glow", feature = "wgpu_no_default_features"))]
+#[cfg(any(
+    feature = "glow",
+    feature = "wgpu_no_default_features",
+    feature = "software"
+))]
 pub fn run_ui_native(
     app_name: &str,
     native_options: NativeOptions,

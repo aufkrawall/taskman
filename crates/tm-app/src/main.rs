@@ -327,6 +327,9 @@ fn run_gui(mock: bool, args: &[String]) {
     // still wins so the diagnostic override keeps working.
     let renderer_pref = match std::env::var("TASKMAN_RENDERER") {
         Ok(v) if !v.is_empty() => v,
+        // "No GPU" now means the native CPU rasterizer, not a WARP adapter emulating a
+        // D3D12 driver. Compatibility mode still means OpenGL.
+        _ if render_mode == tm_core::settings::RenderMode::Software => "software".to_string(),
         _ if render_mode == tm_core::settings::RenderMode::Compatibility => "glow".to_string(),
         _ => String::new(),
     };
@@ -363,21 +366,38 @@ fn run_gui(mock: bool, args: &[String]) {
     );
     std::process::exit(1);
 
+    /// Renderers to try, in order.
+    ///
+    /// The native CPU renderer goes first: it needs no driver, starts without enumerating
+    /// adapters or compiling shaders, and is the only backend that can do sub-pixel
+    /// (ClearType) text. The GPU backends remain as fallbacks so an unusual display
+    /// stack -- or a bug in the new path -- still yields a usable window.
+    ///
+    /// `TASKMAN_RENDERER` picks exactly one; anything else is filtered out.
     #[allow(clippy::vec_init_then_push)]
     fn preferred_renderers(pref: &str) -> Vec<eframe::Renderer> {
-        let mut all = Vec::<eframe::Renderer>::with_capacity(2);
+        let mut all = Vec::<eframe::Renderer>::with_capacity(3);
+        #[cfg(feature = "software")]
+        all.push(eframe::Renderer::Software);
         #[cfg(feature = "wgpu")]
         all.push(eframe::Renderer::Wgpu);
         #[cfg(feature = "glow")]
         all.push(eframe::Renderer::Glow);
         all.into_iter()
-            .filter(|r| match r {
-                #[cfg(feature = "wgpu")]
-                eframe::Renderer::Wgpu => !pref.eq_ignore_ascii_case("glow"),
-                #[cfg(feature = "glow")]
-                eframe::Renderer::Glow => !pref.eq_ignore_ascii_case("wgpu"),
-                #[allow(unreachable_patterns)]
-                _ => true,
+            .filter(|r| {
+                if pref.is_empty() {
+                    return true;
+                }
+                match r {
+                    #[cfg(feature = "software")]
+                    eframe::Renderer::Software => pref.eq_ignore_ascii_case("software"),
+                    #[cfg(feature = "wgpu")]
+                    eframe::Renderer::Wgpu => pref.eq_ignore_ascii_case("wgpu"),
+                    #[cfg(feature = "glow")]
+                    eframe::Renderer::Glow => pref.eq_ignore_ascii_case("glow"),
+                    #[allow(unreachable_patterns)]
+                    _ => true,
+                }
             })
             .collect()
     }

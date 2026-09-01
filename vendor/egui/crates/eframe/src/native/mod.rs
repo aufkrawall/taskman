@@ -3,6 +3,10 @@ mod epi_integration;
 mod event_loop_context;
 pub mod run;
 
+// TASKMAN-FORK: the CPU renderer.
+#[cfg(feature = "software")]
+mod software_integration;
+
 #[cfg(target_os = "macos")]
 pub(crate) mod macos;
 

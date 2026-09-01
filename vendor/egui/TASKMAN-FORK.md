@@ -105,6 +105,15 @@ so the conflict, when it comes, is one block and not a merge of two rasterizers.
 | `crates/eframe/src/native/run.rs` | **edit** — `run_software{,_and_return}` |
 | `crates/eframe/Cargo.toml` | **edit** — `softbuffer` dep + `software` feature |
 
+**Deliberate limitation: the software backend supports the ROOT VIEWPORT ONLY.** Most of
+`glow_integration.rs` is multi-window machinery -- deferred viewports, immediate
+viewports, per-viewport surfaces, and parent/child repaint routing. Child viewports are
+logged and ignored rather than half-supported; a partial implementation of viewport
+lifetime is the kind of thing that works in testing and strands a window on someone's
+desktop in production. `ViewportCommand`s acting on the root window (title, visibility,
+close, decorations, always-on-top) are handled in full through `egui_winit`. taskman uses
+no child viewports.
+
 `software_integration.rs` is adapted from `glow_integration.rs` with glutin/GL removed. It
 is the single largest recurring maintenance cost in this fork: upstream fixes to viewport
 lifetime, AccessKit teardown and immediate-viewport handling land in glow's copy and must be
