@@ -115,6 +115,13 @@ its taskbar button.
   `IMMERSIVE_DARK_MODE`, pushed only when the theme changes (each attribute
   recomposes the frame). What is NOT reachable, and why, is in `known-debt.md`.
 - **Search box** gained a clear button; Escape clears it too.
+- **The Details Name column shows both**: `Host Process for Windows Services
+  (svchost.exe)`. The description alone is ambiguous — a dozen processes share
+  one — and Details is the page where the exact image name is the thing a
+  person needs to type into a search or a ticket. The bracket is dropped when
+  it would only repeat the name (`explorer.exe`). `ColumnId::Name` sorts by
+  description then image name so the order matches what is rendered, without
+  composing the string inside the comparator.
 - **Scroll fades off.** egui paints a 20 px background-coloured ramp at the
   top and bottom of every scroll area (`ScrollFadeStyle`, strength 0.5). Over
   a dense table it reads as a shadow lying on the list — a second, moving edge
