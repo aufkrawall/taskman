@@ -18,6 +18,7 @@ mod icons;
 #[cfg(test)]
 mod render_snapshot;
 mod search;
+mod selection;
 mod selfcheck;
 mod tabs;
 /// Side-by-side comparison of the text-smoothing profiles; see the module docs.

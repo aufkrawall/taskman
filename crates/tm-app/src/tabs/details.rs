@@ -806,7 +806,7 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
                 &pal,
                 Icon::Close,
                 i18n::tr(K::EndTask),
-                app.selected_process.is_some(),
+                !app.selection.is_empty(),
             ) {
                 let ctx = ui.ctx().clone();
                 app.end_selected(&ctx);
@@ -852,6 +852,10 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
                 }
             }
             menu::separator(ui);
+            if menu::item(ui, i18n::tr(K::SelectAll)).clicked() {
+                app.select_all_requested = true;
+                ui.close();
+            }
             if menu::item(ui, i18n::tr(K::RefreshNow)).clicked() {
                 app.refresh_all();
                 ui.close();
@@ -884,7 +888,7 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
     }
 
     if let Some(focus) = app.pending_details_focus.take() {
-        app.selected_process = Some(focus.0.clone());
+        app.selection.select_single(focus.0.clone());
         app.search.clear();
         app.details_state.filter.clear();
         app.scroll_to_pid = Some(focus.0.pid);
@@ -920,7 +924,7 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
     // accumulates fast keystrokes into one word, cycles repeated initials,
     // and scrolls the virtual row into view.
     if let Some(typed) = search::list_type_ahead(ui.ctx(), "details") {
-        let selected = app.selected_process.as_ref().map(|p| p.pid);
+        let selected = app.selection.primary().map(|p| p.pid);
         let candidates = rows
             .iter()
             .map(|row| (row.pid, row.name.as_str()))
@@ -928,11 +932,7 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
         if let Some(pid) = search::type_ahead_match(candidates, selected, &typed)
             && let Some(row) = rows.iter().find(|row| row.pid == pid)
         {
-            app.selected_process = Some(crate::app::ProcessIdentity {
-                pid: row.pid,
-                start_epoch_s: row.start_epoch_s,
-            });
-            app.scroll_to_pid = Some(row.pid);
+            select_detail_row(app, row);
         }
     }
 
@@ -974,10 +974,7 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
         |ui, table, _avail, _content_w, range| {
             for i in range {
                 let Some(row) = rows.get(i) else { continue };
-                let selected = app
-                    .selected_process
-                    .as_ref()
-                    .is_some_and(|sp| sp.pid == row.pid);
+                let selected = app.selection.contains_pid(row.pid);
                 let (rect, resp) = table.row(ui, &pal, selected);
 
                 // Name decorations follow the Name column even after it has
@@ -1030,10 +1027,17 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
                 }
 
                 if resp.clicked() {
-                    app.selected_process = Some(crate::app::ProcessIdentity {
-                        pid: row.pid,
-                        start_epoch_s: row.start_epoch_s,
-                    });
+                    let kind = crate::selection::ClickKind::from_modifiers(
+                        &ui.input(|input| input.modifiers),
+                    );
+                    app.selection
+                        .click(kind, identity_of(row), &row_identities(rows));
+                }
+                // A right-click INSIDE an existing multi-selection keeps it
+                // (native list-view behavior); outside it, the menu applies
+                // to the row it was opened on, so the selection follows.
+                if resp.secondary_clicked() && !app.selection.contains_pid(row.pid) {
+                    app.selection.select_single(identity_of(row));
                 }
                 menu::context_menu(&resp, |ui| {
                     if let Some(p) = snap.process(row.pid) {
@@ -1067,11 +1071,29 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
     select_columns_dialog(app, &ctx_from(ui), &pal);
 }
 
-fn select_detail_row(app: &mut TaskManApp, row: &Row) {
-    app.selected_process = Some(crate::app::ProcessIdentity {
+fn identity_of(row: &Row) -> crate::app::ProcessIdentity {
+    crate::app::ProcessIdentity {
         pid: row.pid,
         start_epoch_s: row.start_epoch_s,
-    });
+    }
+}
+
+/// Every displayed row as an identity, in display order — the order a
+/// Shift-click range is taken in.
+fn row_identities(rows: &[Row]) -> Vec<crate::app::ProcessIdentity> {
+    rows.iter().map(identity_of).collect()
+}
+
+fn select_detail_row(app: &mut TaskManApp, row: &Row) {
+    app.selection.select_single(identity_of(row));
+    app.scroll_to_pid = Some(row.pid);
+}
+
+/// Keyboard range extension: Shift+arrow grows the selection from the anchor
+/// instead of replacing it, like every native list view.
+fn extend_detail_selection(app: &mut TaskManApp, row: &Row, rows: &[Row]) {
+    app.selection
+        .select_range(identity_of(row), &row_identities(rows));
     app.scroll_to_pid = Some(row.pid);
 }
 
@@ -1079,18 +1101,28 @@ fn select_detail_row(app: &mut TaskManApp, row: &Row) {
 /// rows remain virtualized, so selection also records a one-shot scroll target.
 fn handle_keyboard_navigation(app: &mut TaskManApp, ctx: &egui::Context, rows: &[Row]) {
     let selected_pos = app
-        .selected_process
-        .as_ref()
+        .selection
+        .primary()
         .and_then(|selected| rows.iter().position(|row| row.pid == selected.pid));
     // Page movement must count the rows this page actually renders.
     let page_rows = (ctx.content_rect().height() / tablekit::ROW_H_DENSE)
         .floor()
         .max(1.0) as usize;
+    let select_all = std::mem::take(&mut app.select_all_requested)
+        || (!ctx.egui_wants_keyboard_input()
+            && ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::A)));
+    if select_all {
+        app.selection.select_all(&row_identities(rows));
+    }
     if let Some(nav) = search::list_nav(ctx)
         && let Some(index) = search::moved_index(rows.len(), selected_pos, nav, page_rows)
         && let Some(row) = rows.get(index)
     {
-        select_detail_row(app, row);
+        if ctx.input(|i| i.modifiers.shift) {
+            extend_detail_selection(app, row, rows);
+        } else {
+            select_detail_row(app, row);
+        }
     }
 
     if !app.details_state.is_tree() || ctx.egui_wants_keyboard_input() {
@@ -1103,8 +1135,8 @@ fn handle_keyboard_navigation(app: &mut TaskManApp, ctx: &egui::Context, rows: &
         )
     });
     let Some(index) = app
-        .selected_process
-        .as_ref()
+        .selection
+        .primary()
         .and_then(|selected| rows.iter().position(|row| row.pid == selected.pid))
     else {
         return;
@@ -1699,13 +1731,38 @@ pub fn context_menu(app: &mut TaskManApp, ui: &mut egui::Ui, p: &ProcessEntry, h
         crate::tabs::modules::open(app, p, &ctx);
         ui.close();
     }
-    if menu::item(ui, i18n::tr(K::EndTask)).clicked() {
-        end_process(app, &ctx, p.pid, p.start_epoch_s, false, p.shown_name());
+    // With several rows selected the menu was opened on one of them, so the
+    // repeatable commands apply to the whole selection — the point of having
+    // selected them. The label says how many, so it is never a surprise.
+    let batch = app.selection.len() > 1 && app.selection.contains_pid(p.pid);
+    let selected_count = app.selection.len();
+    let end_label = move |base: &str| {
+        if batch {
+            format!("{base} ({selected_count})")
+        } else {
+            base.to_string()
+        }
+    };
+    if menu::item(ui, &end_label(i18n::tr(K::EndTask))).clicked() {
+        if batch {
+            let ctx = ctx.clone();
+            app.end_selected(&ctx);
+        } else {
+            end_process(app, &ctx, p.pid, p.start_epoch_s, false, p.shown_name());
+        }
         ui.close();
     }
     #[cfg(target_os = "windows")]
-    if menu::item(ui, i18n::tr(K::EndTree)).clicked() {
-        end_process(app, &ctx, p.pid, p.start_epoch_s, true, p.shown_name());
+    if menu::item(ui, &end_label(i18n::tr(K::EndTree))).clicked() {
+        if batch {
+            let targets = app.live_selection_targets();
+            app.pending_process_end = Some(crate::app::PendingProcessEnd {
+                targets,
+                tree: true,
+            });
+        } else {
+            end_process(app, &ctx, p.pid, p.start_epoch_s, true, p.shown_name());
+        }
         ui.close();
     }
     #[cfg(not(target_os = "windows"))]

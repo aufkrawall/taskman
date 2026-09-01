@@ -193,17 +193,20 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
                 &pal,
                 Icon::Leaf,
                 i18n::tr(K::EfficiencyMode),
-                caps.efficiency_mode && app.selected_process.is_some(),
-            ) && let Some(identity) = app.selected_process.clone()
-            {
-                toggle_efficiency_mode(app, &ctx, &identity);
+                caps.efficiency_mode && !app.selection.is_empty(),
+            ) {
+                // Efficiency mode is a per-process toggle, so a multi-row
+                // selection flips every row it covers.
+                for (identity, _) in app.live_selection_targets() {
+                    toggle_efficiency_mode(app, &ctx, &identity);
+                }
             }
             if crate::app_ui::cmd_button(
                 ui,
                 &pal,
                 Icon::Close,
                 i18n::tr(K::EndTask),
-                app.selected_process.is_some(),
+                !app.selection.is_empty(),
             ) {
                 app.end_selected(&ctx);
             }
@@ -221,6 +224,11 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
             if menu::item(ui, i18n::tr(K::CollapseAll)).clicked() {
                 app.processes_state.expanded.clear();
                 app.processes_state.invalidate();
+                ui.close();
+            }
+            menu::separator(ui);
+            if menu::item(ui, i18n::tr(K::SelectAll)).clicked() {
+                app.select_all_requested = true;
                 ui.close();
             }
         },
@@ -254,7 +262,7 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
     // starts with "c". One letter (or the same letter repeated) still cycles
     // and wraps in the exact flattened/sorted order shown on screen.
     if let Some(typed) = search::list_type_ahead(ui.ctx(), "processes") {
-        let selected = app.selected_process.as_ref().map(|p| p.pid);
+        let selected = app.selection.primary().map(|p| p.pid);
         let candidates = rows
             .iter()
             .filter_map(|row| match row {
@@ -269,11 +277,7 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
                 _ => None,
             })
         {
-            app.selected_process = Some(crate::app::ProcessIdentity {
-                pid: row.pid,
-                start_epoch_s: row.start_epoch_s,
-            });
-            app.processes_state.scroll_to_pid = Some(row.pid);
+            select_row(app, row);
         }
     }
 
@@ -292,6 +296,7 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
             .position(|r| matches!(r, DisplayRow::Process(p) if p.pid == pid))
     });
 
+    let order = selectable_identities(&rows);
     let clicked = tablekit::scrolled_rows(
         "processes",
         ui,
@@ -309,7 +314,7 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
                         group_header(app, ui, &pal, *gi, *total, content_w);
                     }
                     Some(DisplayRow::Process(row)) => {
-                        row_ui(app, ui, &pal, table, row);
+                        row_ui(app, ui, &pal, table, row, &order);
                     }
                     None => {}
                 }
@@ -346,17 +351,32 @@ fn handle_keyboard_navigation(app: &mut TaskManApp, ctx: &egui::Context, rows: &
             _ => None,
         })
         .collect();
-    let selected_pid = app.selected_process.as_ref().map(|p| p.pid);
+    let selected_pid = app.selection.primary().map(|p| p.pid);
     let selected_pos =
         selected_pid.and_then(|pid| process_rows.iter().position(|(_, row)| row.pid == pid));
     let page_rows = (ctx.content_rect().height() / tablekit::ROW_H)
         .floor()
         .max(1.0) as usize;
+    let order: Vec<crate::app::ProcessIdentity> = process_rows
+        .iter()
+        .map(|(_, row)| identity_of(row))
+        .collect();
+    let select_all = std::mem::take(&mut app.select_all_requested)
+        || (!ctx.egui_wants_keyboard_input()
+            && ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::A)));
+    if select_all {
+        app.selection.select_all(&order);
+    }
     if let Some(nav) = search::list_nav(ctx)
         && let Some(next) = search::moved_index(process_rows.len(), selected_pos, nav, page_rows)
         && let Some((_, row)) = process_rows.get(next)
     {
-        select_row(app, row);
+        if ctx.input(|i| i.modifiers.shift) {
+            app.selection.select_range(identity_of(row), &order);
+            app.processes_state.scroll_to_pid = Some(row.pid);
+        } else {
+            select_row(app, row);
+        }
     }
 
     if ctx.egui_wants_keyboard_input() {
@@ -368,7 +388,7 @@ fn handle_keyboard_navigation(app: &mut TaskManApp, ctx: &egui::Context, rows: &
             i.key_pressed(egui::Key::ArrowRight),
         )
     });
-    let Some(pid) = app.selected_process.as_ref().map(|p| p.pid) else {
+    let Some(pid) = app.selection.primary().map(|p| p.pid) else {
         return;
     };
     let Some(display_idx) = rows
@@ -408,11 +428,27 @@ fn handle_keyboard_navigation(app: &mut TaskManApp, ctx: &egui::Context, rows: &
     }
 }
 
-fn select_row(app: &mut TaskManApp, row: &RowData) {
-    app.selected_process = Some(crate::app::ProcessIdentity {
+fn identity_of(row: &RowData) -> crate::app::ProcessIdentity {
+    crate::app::ProcessIdentity {
         pid: row.pid,
         start_epoch_s: row.start_epoch_s,
-    });
+    }
+}
+
+/// Every selectable row as an identity, in display order — the order a
+/// Shift-click range is taken in. Group headers and the synthetic
+/// CPU-attribution rows are not selectable and so are not in it.
+fn selectable_identities(rows: &[DisplayRow]) -> Vec<crate::app::ProcessIdentity> {
+    rows.iter()
+        .filter_map(|row| match row {
+            DisplayRow::Process(row) if !row.synthetic => Some(identity_of(row)),
+            _ => None,
+        })
+        .collect()
+}
+
+fn select_row(app: &mut TaskManApp, row: &RowData) {
+    app.selection.select_single(identity_of(row));
     app.processes_state.scroll_to_pid = Some(row.pid);
 }
 
@@ -521,11 +557,9 @@ fn row_ui(
     pal: &theme::Palette,
     table: &tablekit::TmTable,
     row: &RowData,
+    order: &[crate::app::ProcessIdentity],
 ) {
-    let selected = app
-        .selected_process
-        .as_ref()
-        .is_some_and(|sp| sp.pid == row.pid);
+    let selected = app.selection.contains_pid(row.pid);
     let (rect, resp) = table.row(ui, pal, selected);
 
     // Chevron + icon + name.
@@ -588,13 +622,19 @@ fn row_ui(
 
     if resp.clicked() {
         if row.synthetic {
-            app.selected_process = None;
+            // A pseudo-row owns no process; selecting it would arm the
+            // toolbar for a target that cannot be acted on.
+            app.selection.clear();
         } else {
-            app.selected_process = Some(crate::app::ProcessIdentity {
-                pid: row.pid,
-                start_epoch_s: row.start_epoch_s,
-            });
+            let kind =
+                crate::selection::ClickKind::from_modifiers(&ui.input(|input| input.modifiers));
+            app.selection.click(kind, identity_of(row), order);
         }
+    }
+    // A right-click inside an existing multi-selection keeps it, so the menu
+    // can act on the whole set; outside it the selection follows the row.
+    if resp.secondary_clicked() && !row.synthetic && !app.selection.contains_pid(row.pid) {
+        app.selection.select_single(identity_of(row));
     }
     // on_hover_text/context_menu consume the response (builder style). A
     // status glyph under the cursor explains itself first; otherwise the
@@ -696,30 +736,54 @@ fn context_menu(app: &mut TaskManApp, ui: &mut egui::Ui, row: &RowData) {
         }
         menu::separator(ui);
     }
-    if menu::item(ui, i18n::tr(K::EndTask)).clicked() {
-        let identity = crate::app::ProcessIdentity {
-            pid: row.pid,
-            start_epoch_s: row.start_epoch_s,
-        };
-        end_process_checked(app, &ctx, &identity, false, &row.name);
+    // With several rows selected the menu was opened on one of them, so the
+    // repeatable commands apply to the whole selection — the point of having
+    // selected them. The label says how many, so it is never a surprise.
+    let batch = app.selection.len() > 1 && app.selection.contains_pid(row.pid);
+    let selected_count = app.selection.len();
+    let batch_label = move |base: &str| {
+        if batch {
+            format!("{base} ({selected_count})")
+        } else {
+            base.to_string()
+        }
+    };
+    if menu::item(ui, &batch_label(i18n::tr(K::EndTask))).clicked() {
+        if batch {
+            app.end_selected(&ctx);
+        } else {
+            end_process_checked(app, &ctx, &identity_of(row), false, &row.name);
+        }
         ui.close();
     }
     #[cfg(target_os = "windows")]
-    if menu::item(ui, i18n::tr(K::EndTree)).clicked() {
-        let identity = crate::app::ProcessIdentity {
-            pid: row.pid,
-            start_epoch_s: row.start_epoch_s,
-        };
-        end_process_checked(app, &ctx, &identity, true, &row.name);
+    if menu::item(ui, &batch_label(i18n::tr(K::EndTree))).clicked() {
+        if batch {
+            let targets = app.live_selection_targets();
+            app.pending_process_end = Some(crate::app::PendingProcessEnd {
+                targets,
+                tree: true,
+            });
+        } else {
+            end_process_checked(app, &ctx, &identity_of(row), true, &row.name);
+        }
         ui.close();
     }
     menu::separator(ui);
-    if menu::check(ui, i18n::tr(K::EfficiencyMode), row.power_throttled).clicked() {
-        let identity = crate::app::ProcessIdentity {
-            pid: row.pid,
-            start_epoch_s: row.start_epoch_s,
-        };
-        toggle_efficiency_mode(app, &ctx, &identity);
+    if menu::check(
+        ui,
+        &batch_label(i18n::tr(K::EfficiencyMode)),
+        row.power_throttled,
+    )
+    .clicked()
+    {
+        if batch {
+            for (identity, _) in app.live_selection_targets() {
+                toggle_efficiency_mode(app, &ctx, &identity);
+            }
+        } else {
+            toggle_efficiency_mode(app, &ctx, &identity_of(row));
+        }
         ui.close();
     }
     if menu::item(ui, i18n::tr(K::GoToDetails)).clicked() {
