@@ -14,6 +14,9 @@ mod app_ui;
 mod fonts;
 mod icon_cache;
 mod icons;
+/// Headless CPU rendering of the real widgets; see the module docs.
+#[cfg(test)]
+mod render_snapshot;
 mod search;
 mod selfcheck;
 mod tabs;

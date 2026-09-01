@@ -44,3 +44,10 @@ wgpu = { version = "30", default-features = false, features = ["vulkan"], option
 
 [target.'cfg(target_os = "macos")'.dependencies]
 wgpu = { version = "30", default-features = false, features = ["metal"], optional = true }
+
+[dev-dependencies]
+# Headless CPU rendering of the real widgets (src/render_snapshot.rs). `egui_software`
+# is our CPU painter in the vendored egui fork; it is not published, so it is reached by
+# path rather than through [patch.crates-io].
+egui_software = { path = "../../vendor/egui/crates/egui_software" }
+png = "0.18"

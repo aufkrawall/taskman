@@ -1,0 +1,25 @@
+[package]
+name = "egui_software"
+version.workspace = true
+authors = ["taskman"]
+description = "CPU (software) renderer for egui"
+edition.workspace = true
+rust-version.workspace = true
+license = "MIT OR Apache-2.0"
+publish = false
+
+[lints]
+workspace = true
+
+[lib]
+
+[dependencies]
+emath = { workspace = true }
+ecolor = { workspace = true }
+epaint = { workspace = true }
+
+[dev-dependencies]
+# Only for the crate-level doc example, which shows the real integration path through
+# `egui::Context`. The library itself deliberately depends on epaint alone, so it can be
+# used without pulling in the whole of egui.
+egui = { workspace = true }
