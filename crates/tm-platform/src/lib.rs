@@ -41,6 +41,36 @@ pub fn display_refresh_hz() -> Option<f32> {
     None
 }
 
+/// Paint the native window caption so it matches what the app draws directly
+/// below it, and follow the user's Windows transparency preference.
+///
+/// `hwnd` is the raw window handle; a non-Windows host ignores it. Call only
+/// when the appearance actually changes — every attribute recomposes the
+/// window frame.
+#[cfg(target_os = "windows")]
+pub fn apply_title_bar(hwnd: isize, caption: [u8; 3], text: [u8; 3], border: [u8; 3], dark: bool) {
+    win::window_chrome::apply(
+        hwnd,
+        win::window_chrome::TitleBar {
+            caption,
+            text,
+            border,
+            dark,
+            backdrop: win::window_chrome::transparency_effects_enabled(),
+        },
+    );
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn apply_title_bar(
+    _hwnd: isize,
+    _caption: [u8; 3],
+    _text: [u8; 3],
+    _border: [u8; 3],
+    _dark: bool,
+) {
+}
+
 /// Build only the platform action surface (process control, services,
 /// startup apps, ...).
 ///

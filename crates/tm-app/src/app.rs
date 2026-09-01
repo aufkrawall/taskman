@@ -295,6 +295,12 @@ pub struct TaskManApp {
     /// Global top search ("Nach Namen, Herausgeber oder PID suchen").
     pub search: String,
 
+    /// Caption appearance last pushed to DWM (`(caption rgb, dark)`).
+    /// The native title bar is not repainted per frame — each DWM attribute
+    /// recomposes the window frame — so it is only written when the theme
+    /// actually changes.
+    title_bar_applied: Option<([u8; 3], bool)>,
+
     // Tab states.
     pub processes_state: crate::tabs::processes::State,
     pub perf_selected_key: String,
@@ -562,6 +568,7 @@ impl TaskManApp {
             users_sort,
             app_history_sort,
             selected_process: None,
+            title_bar_applied: None,
             selected_user: None,
             pending_session_logoff: None,
             pending_process_end: None,
@@ -1015,6 +1022,7 @@ impl eframe::App for TaskManApp {
         self.poll_engine(&ctx);
 
         let pal = crate::theme::palette_ctx(&ctx);
+        self.sync_title_bar(&ctx, &pal, _frame);
 
         // ------------------------------------------------ top-level panels
         crate::app_ui::top_search_panel(self, ui, &pal);
@@ -1324,6 +1332,42 @@ impl TaskManApp {
             name,
             tree: false,
         });
+    }
+
+    /// Make Windows paint its caption in the app's own colors.
+    ///
+    /// The strip immediately below the caption is the search panel, which
+    /// fills with `window_bg`; matching the caption to it is what turns two
+    /// visibly different bands into one surface. Without this the caption
+    /// also keeps light-mode glyphs over a dark UI, because the button
+    /// highlights are drawn by DWM and only `IMMERSIVE_DARK_MODE` reaches
+    /// them.
+    fn sync_title_bar(
+        &mut self,
+        ctx: &egui::Context,
+        pal: &crate::theme::Palette,
+        frame: &eframe::Frame,
+    ) {
+        let dark = matches!(ctx.theme(), egui::Theme::Dark);
+        let caption = [pal.window_bg.r(), pal.window_bg.g(), pal.window_bg.b()];
+        if self.title_bar_applied == Some((caption, dark)) {
+            return;
+        }
+        use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+        let Ok(handle) = frame.window_handle() else {
+            return;
+        };
+        let RawWindowHandle::Win32(win32) = handle.as_raw() else {
+            return;
+        };
+        tm_platform::apply_title_bar(
+            win32.hwnd.get(),
+            caption,
+            [pal.text.r(), pal.text.g(), pal.text.b()],
+            [pal.window_bg.r(), pal.window_bg.g(), pal.window_bg.b()],
+            dark,
+        );
+        self.title_bar_applied = Some((caption, dark));
     }
 
     /// End the selected process (toolbar "Task beenden") — on the executor.

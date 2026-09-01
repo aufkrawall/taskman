@@ -39,6 +39,10 @@ windows = { version = "0.62", features = [
   "Win32_System_Console",
   "Win32_System_Threading",
 ] }
+# Only to read the HWND out of `eframe::Frame` so the native caption can be
+# painted in the app's colors. Pinned to the version eframe itself uses --
+# a second copy of the crate would make its `HasWindowHandle` impl unusable.
+raw-window-handle = "0.6.2"
 tray-icon = { version = "0.24.2", default-features = false }
 wgpu = { version = "30", default-features = false, features = ["dx12"], optional = true }
 
