@@ -237,6 +237,13 @@ rebase runbook.
   creation, close-to-tray, owned-command-only per-user autostart migration, and
   a 4 MiB fail-closed settings-input cap at startup. Service worker panics
   abort into SCM recovery instead of leaving a falsely healthy half-broker.
+- The Task Manager hotkey is answered before a launch does anything else:
+  the running instance is asked to show itself (with the foreground right
+  handed over), un-minimizes, and acknowledges from its UI thread. No
+  acknowledgement — a wedged, dying or squatted instance — makes the
+  launch open its own window instead of exiting silently, and an own
+  registration naming a missing executable is repaired wherever that
+  needs no consent prompt.
 - Details now persists literal process-tree mode, table sort, and per-image
   priority/affinity rules. Its menus show current priority/UAC markers, can
   safely toggle UAC virtualization, and use background affinity queries.

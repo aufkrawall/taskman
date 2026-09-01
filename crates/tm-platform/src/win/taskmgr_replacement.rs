@@ -69,6 +69,7 @@ pub fn set_direct_for_exe(enabled: bool, exe: &Path) -> Result<()> {
                 format!("another debugger is already registered: {value}"),
             ));
         }
+        validate_target(exe)?;
         write_debugger(&own_command_for(exe))
     } else {
         match current {
@@ -82,21 +83,66 @@ pub fn set_direct_for_exe(enabled: bool, exe: &Path) -> Result<()> {
     }
 }
 
+/// Reject registrations that would break the hotkey instead of serving it.
+///
+/// Every rejection here is a state in which pressing Ctrl+Shift+Esc does
+/// NOTHING — not even open the built-in Task Manager, because Windows
+/// launches the debugger command instead of taskmgr and gives up when that
+/// fails. That makes these cheap checks worth doing before the write rather
+/// than diagnosing them afterwards.
+fn validate_target(exe: &Path) -> Result<()> {
+    let name = exe
+        .file_name()
+        .map(|name| name.to_string_lossy().to_ascii_lowercase())
+        .unwrap_or_default();
+    if name == "taskmgr.exe" {
+        // The debugger of taskmgr.exe is itself launched through
+        // CreateProcess, so an executable with that name would re-enter its
+        // own registration forever.
+        return Err(TmError::platform(
+            "Task Manager replacement",
+            "an executable named taskmgr.exe cannot replace the Task Manager",
+        ));
+    }
+    let path = exe.to_string_lossy();
+    if path.is_empty() || path.contains('"') {
+        return Err(TmError::platform(
+            "Task Manager replacement",
+            "the executable path cannot be quoted as a debugger command",
+        ));
+    }
+    if !exe.is_file() {
+        return Err(TmError::platform(
+            "Task Manager replacement",
+            format!("{} is not an executable file", exe.display()),
+        ));
+    }
+    Ok(())
+}
+
 fn own_command_for(exe: &Path) -> String {
     format!("\"{}\" {OWNER_MARKER}", exe.to_string_lossy())
 }
 
 fn is_owned_command(value: &str) -> bool {
-    let Some(quoted_path) = value.trim().strip_suffix(OWNER_MARKER).map(str::trim_end) else {
-        return false;
-    };
-    let Some(path) = quoted_path
+    owned_path(value).is_some()
+}
+
+/// The executable a taskman-owned debugger command names.
+fn owned_path(value: &str) -> Option<&str> {
+    let quoted_path = value.trim().strip_suffix(OWNER_MARKER).map(str::trim_end)?;
+    let path = quoted_path
         .strip_prefix('"')
-        .and_then(|path| path.strip_suffix('"'))
-    else {
-        return false;
-    };
-    !path.is_empty() && !path.contains('"')
+        .and_then(|path| path.strip_suffix('"'))?;
+    (!path.is_empty() && !path.contains('"')).then_some(path)
+}
+
+/// Whether an owned registration names an executable that is no longer
+/// there. Windows cannot launch a debugger that does not exist, so this is
+/// the state in which the hotkey silently opens nothing at all — the one
+/// stale case that has to be repaired rather than reported.
+pub fn target_missing(value: &str) -> bool {
+    owned_path(value).is_some_and(|path| !Path::new(path).is_file())
 }
 
 fn normalize_command(s: &str) -> String {
@@ -264,6 +310,28 @@ mod tests {
         );
         assert!(own.contains(OWNER_MARKER));
         assert_eq!(normalize_command(&own), normalize_command(&own));
+    }
+
+    /// A registration Windows cannot launch takes the built-in Task Manager
+    /// down with it, so these are refused before the write.
+    #[test]
+    fn a_registration_that_would_break_the_hotkey_is_refused() {
+        let own_exe = std::env::current_exe().expect("test executable");
+        assert!(validate_target(&own_exe).is_ok());
+        assert!(validate_target(&own_exe.with_file_name("TaskMgr.exe")).is_err());
+        assert!(validate_target(&own_exe.with_file_name("nothing-here.exe")).is_err());
+        assert!(validate_target(Path::new(r#"C:\dir\we"ird.exe"#)).is_err());
+    }
+
+    #[test]
+    fn a_missing_registered_executable_is_detected() {
+        let own_exe = std::env::current_exe().expect("test executable");
+        assert!(!target_missing(&own_command_for(&own_exe)));
+        assert!(target_missing(&own_command_for(
+            &own_exe.with_file_name("gone.exe")
+        )));
+        // Someone else's debugger is never ours to judge.
+        assert!(!target_missing(r"C:\nowhere\procexp64.exe"));
     }
 
     #[test]

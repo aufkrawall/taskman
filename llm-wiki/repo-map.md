@@ -52,13 +52,21 @@ platform boundary (`tm-core` ← `tm-platform` ← `tm-app` / `tm-service`):
     `core_service.rs` (versioned authenticated named-pipe broker plus secure
     SCM/Program Files/ProgramData install lifecycle, including pinned
     reparse/hard-link-resistant owner/group/DACL repair), `autostart.rs` (owned-command-
-    only HKCU startup migration), `windows_enum.rs` (one-pass top-window/hung-state inventory),
+    only HKCU startup migration), `taskmgr_replacement.rs` (owned IFEO
+    `Debugger` registration for taskmgr.exe plus the guards that keep a
+    registration launchable), `instance.rs` (session-local instance
+    coordination: mutex + show/acknowledge events + a published pid/HWND
+    section, low-integrity-labelled so an unelevated hotkey launch reaches
+    an elevated instance; an unacknowledged request starts its own
+    instance), `windows_enum.rs` (one-pass top-window/hung-state inventory),
     `window_chrome.rs` (DWM caption colour / dark mode / backdrop / cloaking),
     `version.rs` (cached PE metadata). Linux/macOS backends exist and are
     built by default (`build.py`).
 - `crates/tm-app`
   - eframe GUI. `main.rs` (startup sequence: args → console only for CLI →
-    early logging → lazy engine factory; StartupTrace markers), `app.rs`
+    early logging → hand a duplicate launch to the running instance → lazy
+    engine factory; StartupTrace markers; tray shell and the cloak-restore
+    dance), `app.rs`
     (TaskManApp: engine starts AFTER first frame, event-driven repaints,
     action executor, toast ids, demand updates per tab), `app_ui.rs`
     (chrome + dialogs incl. scrolling settings and Delete confirmation),

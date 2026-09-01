@@ -37,7 +37,9 @@ renderer = "wgpu primary, glow fallback; wayland+x11 enabled for native Linux"
 windows = { version = "0.62", features = [
   "Win32_Foundation",
   "Win32_System_Console",
-  "Win32_System_Threading",
+  # Popup-menu theming reaches two uxtheme exports by ordinal; instance
+  # coordination itself lives in tm-platform.
+  "Win32_System_LibraryLoader",
 ] }
 # Only to read the HWND out of `eframe::Frame` so the native caption can be
 # painted in the app's colors. Pinned to the version eframe itself uses --

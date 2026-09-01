@@ -1,5 +1,81 @@
 # Recent Activity
 
+## 2026-09-02 — the Task Manager hotkey has to work when nothing else does
+
+Audit of the Ctrl+Shift+Esc path (IFEO `Debugger` on taskmgr.exe → our exe).
+Six ways a press could produce nothing, and what each needed:
+
+### A minimized instance stayed minimized
+
+`restore_window` sent `Visible(true)` + `Focus`. winit's `focus_window` is a
+documented no-op while `is_minimized`, and `ShowWindow(SW_SHOW)` does not
+un-minimize either, so a hotkey press on a minimized task manager did exactly
+nothing. The restore now sends `Minimized(false)` between the two. The cloak
+that hides the first unpainted frame is now applied only when the window was
+genuinely hidden to the tray — a minimized window still holds its last frame,
+so cloaking it only added a blink.
+
+### The window came back behind everything
+
+The restore ran in the OLD process, which has no foreground right; Windows
+answers `SetForegroundWindow` from a background process with a taskbar flash.
+The right belongs to the process the shell just launched, so the LAUNCH now
+calls `AllowSetForegroundWindow(primary_pid)` before it signals, and the
+instance it wakes can take the foreground.
+
+### A wedged instance swallowed every press
+
+The second launch set the show event and exited unconditionally. If the
+running instance was hung — the exact situation one reaches for a task
+manager in — the press produced nothing at all, forever. There is now an
+acknowledgement event, set by the UI thread that actually processed the
+restore. No acknowledgement inside the deadline means the launch opens its
+own window instead of exiting. `Local\TaskMan.Primary.v2` publishes the
+primary's pid and HWND so the launch can tell the cases apart: a dead pid
+gives up immediately, a window that times out on `WM_NULL`
+(`SMTO_ABORTIFHUNG`, the shell's own "not responding" question) gives up
+after ~2 s, anything else keeps its request for the extended deadline. A
+denied `SendMessageTimeout` is inconclusive, not wedged: UIPI refuses the
+message when an unelevated launch probes an elevated instance, and only
+`ERROR_TIMEOUT` may cost an instance its request.
+
+Verified live: a second launch defers in ~96 ms; with the first instance
+suspended (`NtSuspendProcess`), the second one has its own window in ~2.1 s.
+
+### An elevated instance could not be reached at all
+
+The coordination objects were created with default security. An instance
+started elevated labels them high integrity, so the medium-integrity launch
+the shell starts on Ctrl+Shift+Esc was denied every access and silently
+started a SECOND task manager. All four objects now carry `S:(ML;;NW;;;LW)`
+plus a DACL for this user, Administrators and SYSTEM. The names moved to
+`.v2`: an old instance would take the show event without ever acknowledging
+it, and mixed generations only exist across an upgrade.
+
+### Raising an open window asked for consent
+
+With "always start elevated" on, every press re-execed through UAC before it
+discovered that the window it wanted was already open. The handoff now runs
+FIRST in `run_gui` — before locale, settings and the elevation policy — so
+showing an existing window costs nothing.
+
+### Registrations that cannot be launched
+
+Windows runs the `Debugger` command INSTEAD of taskmgr.exe; if that command
+cannot start, the hotkey opens nothing at all — not even the built-in Task
+Manager. `set_direct_for_exe` therefore refuses to register a path that is
+not a file, cannot be quoted, or is itself named taskmgr.exe (which would
+re-enter its own registration forever). A registration that has since gone
+dangling is detected at startup and repaired wherever that needs no consent
+prompt (elevated session, or the core service broker, which re-points at the
+protected GUI); otherwise the settings dialog says the hotkey currently opens
+nothing and offers a one-click Repair — the old advice was to toggle the
+checkbox off and on, which costs two UAC prompts.
+
+Single-instance coordination moved out of `tm-app/src/main.rs` into
+`tm-platform/src/win/instance.rs`; the app now only supplies the wake
+callback, publishes its HWND, and acknowledges. `build.py --check` passed.
+
 ## 2026-09-01 — process owners, multi-select, GPU engines, window chrome
 
 Ten reported gaps, fixed together. The ones with a root cause worth keeping:

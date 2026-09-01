@@ -6,6 +6,8 @@ mod cpu_info;
 pub(crate) mod cpu_load;
 mod gpu;
 pub mod icons;
+/// Cross-process coordination between the instances of one session.
+pub mod instance;
 pub mod locale;
 pub mod memory_info;
 mod net_etw;
@@ -41,6 +43,13 @@ use crate::actions::*;
 use tm_core::engine::SystemCollector;
 use tm_core::error::Result;
 use tm_core::model::*;
+
+/// Whether an own registration names an executable that is no longer there.
+/// The hotkey then opens nothing at all, because Windows cannot launch the
+/// debugger command it was told to run in place of taskmgr.exe.
+pub fn replacement_target_missing(value: &str) -> bool {
+    taskmgr_replacement::target_missing(value)
+}
 
 pub fn last_bios_time_ms() -> Option<u64> {
     use windows::Win32::System::Registry::{HKEY_LOCAL_MACHINE, RRF_RT_REG_DWORD, RegGetValueW};
@@ -84,6 +93,10 @@ pub fn display_refresh_hz() -> Option<f32> {
     }
     Some(dm.dmDisplayFrequency as f32)
 }
+
+/// The argument the IFEO registration puts on the command line, so a launch
+/// through the Windows Task Manager hotkey can be told apart from any other.
+pub use taskmgr_replacement::OWNER_MARKER as REPLACEMENT_LAUNCH_ARG;
 
 /// Entry point used only by the short-lived elevated helper process.
 pub fn set_task_manager_replacement_direct(enabled: bool) -> Result<()> {
@@ -379,6 +392,18 @@ impl PlatformActions for WinActions {
             ),
             true,
         )
+    }
+
+    fn repair_task_manager_replacement(&self) -> Result<bool> {
+        // Without the service there is no unprompted path to HKLM, and a UAC
+        // prompt nobody asked for is worse than a reported fault.
+        if !process_ops::is_elevated() {
+            return Ok(false);
+        }
+        let exe = std::env::current_exe()
+            .map_err(|e| tm_core::TmError::platform("current_exe", e.to_string()))?;
+        taskmgr_replacement::set_direct_for_exe(true, &exe)?;
+        Ok(true)
     }
 
     fn set_start_with_windows(&self, enabled: bool, start_minimized: bool) -> Result<()> {
