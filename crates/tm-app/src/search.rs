@@ -1,8 +1,13 @@
 //! Shared global-search matching (audit §5): ONE normalized query applied to
-//! every tab's candidate fields — binary name, display name, PID and
-//! publisher/company for processes — instead of per-tab string comparisons
-//! that drift apart. The search hint promises "name, publisher or PID"; this
-//! module makes the code keep that promise.
+//! every tab's candidate fields instead of per-tab string comparisons that
+//! drift apart.
+//!
+//! For processes the fields are everything that identifies the program to a
+//! person: binary name, friendly/display name, description, publisher,
+//! owning account, PID, image path and full command line. Restricting it to
+//! the name meant a search for a folder, a switch, a service host's account
+//! or a vendor string found nothing even though the answer was on screen in
+//! another column.
 
 use eframe::egui;
 use tm_core::model::ProcessEntry;
@@ -33,18 +38,31 @@ impl Query {
                 .any(|c| c.to_lowercase().contains(&self.q))
     }
 
-    /// Process search fields: binary name, shown/display name, PID and
-    /// publisher/company ("Nach Namen, Herausgeber oder PID suchen").
+    /// Every process field a person could reasonably search by.
+    ///
+    /// Ordered cheapest-first: the short identity strings decide almost every
+    /// match, and the command line (which can be kilobytes) is only ever
+    /// lowercased when nothing before it matched.
     pub fn matches_process(&self, p: &ProcessEntry) -> bool {
         if self.q.is_empty() {
             return true;
         }
         let pid_s = p.pid.to_string();
-        self.matches_any([
+        if self.matches_any([
             p.name.as_str(),
             p.shown_name(),
+            p.description.as_deref().unwrap_or(""),
             p.company.as_deref().unwrap_or(""),
+            p.user.as_deref().unwrap_or(""),
+            p.service_name.as_deref().unwrap_or(""),
             pid_s.as_str(),
+        ]) {
+            return true;
+        }
+        let path = p.exe_path.as_ref().map(|path| path.to_string_lossy());
+        self.matches_any([
+            path.as_deref().unwrap_or(""),
+            p.command_line.as_deref().unwrap_or(""),
         ])
     }
 }
@@ -305,6 +323,39 @@ mod tests {
         assert!(Query::new("4242").matches_process(&proc(4242, "unrelated.exe", None, "")));
         // ...but not unrelated processes.
         assert!(!Query::new("4242").matches_process(&proc(7, "other.exe", None, "")));
+    }
+
+    /// Everything the columns show about a process must be reachable from
+    /// the one search box; matching only the name was the complaint.
+    #[test]
+    fn path_command_line_user_and_description_all_match() {
+        let mut p = proc(9, "svchost.exe", Some("Microsoft"), "");
+        p.exe_path = Some(std::path::PathBuf::from(
+            "C:\\Windows\\System32\\svchost.exe",
+        ));
+        p.command_line = Some("svchost.exe -k NetworkService -p".into());
+        p.user = Some("NETWORK SERVICE".into());
+        p.description = Some("Host Process for Windows Services".into());
+        p.service_name = Some("Dnscache".into());
+
+        assert!(Query::new("system32").matches_process(&p), "image path");
+        assert!(Query::new("-k Network").matches_process(&p), "command line");
+        assert!(Query::new("network service").matches_process(&p), "user");
+        assert!(
+            Query::new("host process").matches_process(&p),
+            "description"
+        );
+        assert!(Query::new("dnscache").matches_process(&p), "service name");
+        assert!(!Query::new("chrome").matches_process(&p));
+    }
+
+    /// The long command line must not be lowercased on every keystroke for
+    /// every process when a short identity field already answered.
+    #[test]
+    fn a_name_match_short_circuits_before_the_command_line() {
+        let mut p = proc(9, "brave.exe", None, "");
+        p.command_line = Some("x".repeat(4096));
+        assert!(Query::new("brave").matches_process(&p));
     }
 
     #[test]

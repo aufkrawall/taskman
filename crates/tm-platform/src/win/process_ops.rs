@@ -1104,6 +1104,159 @@ pub fn token_security(pid: u32) -> TokenSecurity {
     out
 }
 
+/// Account name that owns `pid`, formatted like Task Manager's User column
+/// ("DOMAIN\user", or a bare well-known name such as "SYSTEM").
+///
+/// sysinfo answers this from its own token query and returns nothing for
+/// roughly half the process list, because it asks for more access than a
+/// bare identity read needs. `PROCESS_QUERY_LIMITED_INFORMATION` is granted
+/// for almost every process — protected ones included — and is enough to
+/// open the token for `TOKEN_QUERY`, which is why this covers the session-0
+/// service hosts whose User column used to read "—".
+///
+/// Returns `None` when the owner genuinely cannot be determined; callers must
+/// never substitute a guessed account for it.
+pub fn token_user(pid: u32) -> Option<String> {
+    use windows::Win32::Security::{GetTokenInformation, TOKEN_QUERY, TOKEN_USER, TokenUser};
+    use windows::Win32::System::Threading::OpenProcessToken;
+
+    unsafe {
+        let h = open_process(pid, th::PROCESS_QUERY_LIMITED_INFORMATION).ok()?;
+        let mut token = HANDLE::default();
+        if OpenProcessToken(h, TOKEN_QUERY, &mut token).is_err() {
+            let _ = CloseHandle(h);
+            return None;
+        }
+        // TOKEN_USER is a fixed header pointing at a variable-length SID that
+        // the kernel appends behind it, so the buffer must be sized by the
+        // first (deliberately failing) call rather than by the struct.
+        let mut needed: u32 = 0;
+        let _ = GetTokenInformation(token, TokenUser, None, 0, &mut needed);
+        let mut buffer =
+            vec![0u8; needed.clamp(std::mem::size_of::<TOKEN_USER>() as u32, 4096) as usize];
+        let ok = GetTokenInformation(
+            token,
+            TokenUser,
+            Some(buffer.as_mut_ptr().cast()),
+            buffer.len() as u32,
+            &mut needed,
+        )
+        .is_ok();
+        let _ = CloseHandle(token);
+        let _ = CloseHandle(h);
+        if !ok {
+            return None;
+        }
+        let user = &*(buffer.as_ptr() as *const TOKEN_USER);
+        account_name_of_sid(user.User.Sid)
+    }
+}
+
+/// Memo for SID → account name. `LookupAccountSidW` can reach out to a domain
+/// controller, and a domain-joined machine runs hundreds of processes under a
+/// handful of accounts, so the answer is resolved once per distinct SID for
+/// the life of the process. Account names do not change under a live SID.
+static SID_NAMES: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<String, Option<String>>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+/// String form of a SID ("S-1-5-18"), used as the memo key.
+unsafe fn sid_to_string(sid: windows::Win32::Security::PSID) -> Option<String> {
+    use windows::Win32::Foundation::{HLOCAL, LocalFree};
+    use windows::Win32::Security::Authorization::ConvertSidToStringSidW;
+
+    unsafe {
+        let mut text = windows::core::PWSTR::null();
+        ConvertSidToStringSidW(sid, &mut text).ok()?;
+        if text.is_null() {
+            return None;
+        }
+        let owned = text.to_string().ok();
+        let _ = LocalFree(Some(HLOCAL(text.0.cast())));
+        owned
+    }
+}
+
+/// Resolve a SID to "DOMAIN\name", dropping the domain for the well-known
+/// local accounts Task Manager shows bare ("SYSTEM", "LOCAL SERVICE",
+/// "NETWORK SERVICE" all live in the pseudo-domain "NT-AUTORITÄT"/"NT
+/// AUTHORITY", which only adds noise to a narrow column).
+unsafe fn account_name_of_sid(sid: windows::Win32::Security::PSID) -> Option<String> {
+    let key = unsafe { sid_to_string(sid) };
+    if let Some(key) = key.as_ref()
+        && let Ok(cache) = SID_NAMES.lock()
+        && let Some(hit) = cache.get(key)
+    {
+        return hit.clone();
+    }
+    let resolved = unsafe { lookup_account_name(sid) };
+    if let Some(key) = key
+        && let Ok(mut cache) = SID_NAMES.lock()
+    {
+        cache.insert(key, resolved.clone());
+    }
+    resolved
+}
+
+/// The uncached `LookupAccountSidW` round trip behind [`account_name_of_sid`].
+unsafe fn lookup_account_name(sid: windows::Win32::Security::PSID) -> Option<String> {
+    use windows::Win32::Security::{LookupAccountSidW, SID_NAME_USE};
+
+    let mut name_len: u32 = 0;
+    let mut domain_len: u32 = 0;
+    let mut kind = SID_NAME_USE::default();
+    unsafe {
+        // First call sizes both output buffers; it always fails.
+        let _ = LookupAccountSidW(
+            PCWSTR::null(),
+            sid,
+            None,
+            &mut name_len,
+            None,
+            &mut domain_len,
+            &mut kind,
+        );
+        if name_len == 0 || name_len > 1024 || domain_len > 1024 {
+            return None;
+        }
+        let mut name = vec![0u16; name_len as usize];
+        let mut domain = vec![0u16; domain_len.max(1) as usize];
+        LookupAccountSidW(
+            PCWSTR::null(),
+            sid,
+            Some(windows::core::PWSTR(name.as_mut_ptr())),
+            &mut name_len,
+            Some(windows::core::PWSTR(domain.as_mut_ptr())),
+            &mut domain_len,
+            &mut kind,
+        )
+        .ok()?;
+        let name = String::from_utf16_lossy(&name[..name_len as usize]);
+        let domain = String::from_utf16_lossy(&domain[..domain_len as usize]);
+        if name.is_empty() {
+            return None;
+        }
+        Some(if domain.is_empty() || is_authority_domain(&domain) {
+            name
+        } else {
+            format!("{domain}\\{name}")
+        })
+    }
+}
+
+/// The NT AUTHORITY pseudo-domain under every locale name it is known by.
+/// Localized Windows returns the translated string, so an English-only
+/// comparison would leave "NT-AUTORITÄT\SYSTEM" in the column on a German
+/// system where Task Manager shows "SYSTEM".
+fn is_authority_domain(domain: &str) -> bool {
+    let normalized: String = domain
+        .chars()
+        .filter(|c| c.is_alphanumeric())
+        .collect::<String>()
+        .to_uppercase();
+    normalized.starts_with("NTAUTHORIT") || normalized.starts_with("NTAUTORIT")
+}
+
 /// Enable or disable token virtualization for an exact live process. This is
 /// the narrow equivalent of Task Manager's Details context-menu action: the
 /// process handle is identity/critical checked first, the token must report
@@ -1331,9 +1484,56 @@ pub fn open_url(url: &str) -> Result<()> {
     shell_execute(url, None, false, false)
 }
 
+/// What a debugger needs from a process dump, as flags for `MiniDumpWriteDump`.
+///
+/// `MiniDumpNormal` (a bare 0, which is what this used to pass) writes stacks
+/// and module headers and nothing else: WinDbg opens it, then answers almost
+/// every question with "memory access error". A dump worth the filename is a
+/// FULL one, which is also what Task Manager's "Create dump file" writes, so
+/// these flags mirror the set `procdump -ma` uses:
+///
+/// * `WithFullMemory` — the whole address space; without it heaps, globals
+///   and captured objects are simply absent.
+/// * `WithFullMemoryInfo` — the VAD/region metadata that lets a debugger tell
+///   committed memory from reserved and attribute an address to a mapping.
+/// * `WithHandleData` — the handle table, for deadlock and leak analysis.
+/// * `WithThreadInfo` — thread times, TEB pointers, start addresses.
+/// * `WithUnloadedModules` — resolves stacks that return into a freed DLL.
+/// * `IgnoreInaccessibleMemory` — a full-memory dump of a live process WILL
+///   meet regions that cannot be read (guard pages, memory a driver locked).
+///   Without this flag one such region fails the entire dump, which is the
+///   other half of why dumps here were unusable.
+///
+/// Deliberately NOT included: `WithTokenInformation` (SIDs and privileges of
+/// the account, not needed to debug) and `WithProcessThreadData`'s
+/// registry-handle variants. A dump is user data; it should carry what a
+/// debugger needs and nothing extra.
+const DUMP_TYPE_FULL: i32 = 0x0000_0002 // MiniDumpWithFullMemory
+    | 0x0000_0004  // MiniDumpWithHandleData
+    | 0x0000_0020  // MiniDumpWithUnloadedModules
+    | 0x0000_0800  // MiniDumpWithFullMemoryInfo
+    | 0x0000_1000  // MiniDumpWithThreadInfo
+    | 0x0002_0000; // MiniDumpIgnoreInaccessibleMemory
+
+/// Fallback for the rare process whose address space cannot be captured at
+/// all (a target that is exiting, or one whose working set the kernel refuses
+/// to walk). Keeps everything except full memory, so the result is still a
+/// real crash dump rather than nothing.
+const DUMP_TYPE_REDUCED: i32 = 0x0000_0001 // MiniDumpWithDataSegs
+    | 0x0000_0004  // MiniDumpWithHandleData
+    | 0x0000_0020  // MiniDumpWithUnloadedModules
+    | 0x0000_0100  // MiniDumpWithIndirectlyReferencedMemory
+    | 0x0000_0800  // MiniDumpWithFullMemoryInfo
+    | 0x0000_1000  // MiniDumpWithThreadInfo
+    | 0x0002_0000; // MiniDumpIgnoreInaccessibleMemory
+
 /// Write a minidump of `pid` to `path` via dbghelp's MiniDumpWriteDump.
 /// The creation time is verified through the dump handle before any output
 /// file is created, so a recycled pid can never dump an unrelated process.
+///
+/// The dump is a full-memory one ([`DUMP_TYPE_FULL`]) so it can actually be
+/// debugged; a target that refuses to yield its whole address space is
+/// retried once at [`DUMP_TYPE_REDUCED`] rather than failing outright.
 pub fn create_dump_file(
     pid: u32,
     expected_start_epoch_s: Option<i64>,
@@ -1344,6 +1544,12 @@ pub fn create_dump_file(
     };
     use windows::Win32::System::Diagnostics::Debug::{MINIDUMP_TYPE, MiniDumpWriteDump};
 
+    // A full-memory dump reads the target's whole address space, so
+    // PROCESS_VM_READ is not optional and PROCESS_QUERY_INFORMATION (not the
+    // LIMITED variant) is what dbghelp needs to enumerate it. Debug privilege
+    // is what makes this work across integrity levels at all; asking for it
+    // is a no-op for a token that does not hold it.
+    enable_debug_privilege();
     let hproc = open_process_verified(
         pid,
         th::PROCESS_QUERY_INFORMATION | th::PROCESS_VM_READ | th::PROCESS_DUP_HANDLE,
@@ -1370,13 +1576,86 @@ pub fn create_dump_file(
             )
         }
         .map_err(|e| TmError::platform("CreateFileW(dump)", e.to_string()))?;
-        let dump_result =
-            unsafe { MiniDumpWriteDump(hproc, pid, hfile, MINIDUMP_TYPE(0), None, None, None) };
+        let mut dump_result = unsafe {
+            MiniDumpWriteDump(
+                hproc,
+                pid,
+                hfile,
+                MINIDUMP_TYPE(DUMP_TYPE_FULL),
+                None,
+                None,
+                None,
+            )
+        };
+        if dump_result.is_err() {
+            // Rewind: the failed attempt left a partial file behind, and
+            // MiniDumpWriteDump writes from the current position.
+            let _ = unsafe {
+                windows::Win32::Storage::FileSystem::SetFilePointerEx(
+                    hfile,
+                    0,
+                    None,
+                    windows::Win32::Storage::FileSystem::FILE_BEGIN,
+                )
+            };
+            let _ = unsafe { windows::Win32::Storage::FileSystem::SetEndOfFile(hfile) };
+            dump_result = unsafe {
+                MiniDumpWriteDump(
+                    hproc,
+                    pid,
+                    hfile,
+                    MINIDUMP_TYPE(DUMP_TYPE_REDUCED),
+                    None,
+                    None,
+                    None,
+                )
+            };
+        }
         let _ = unsafe { CloseHandle(hfile) };
         dump_result.map_err(|e| TmError::platform("MiniDumpWriteDump", e.to_string()))
     })();
     let _ = unsafe { CloseHandle(hproc) };
     result
+}
+
+/// Best-effort `SeDebugPrivilege` enable on the current token.
+///
+/// Only an elevated token holds the privilege at all; for everyone else this
+/// fails and changes nothing, which is exactly the intended behavior — it
+/// grants no access, it only stops Windows from withholding access the token
+/// was already entitled to.
+fn enable_debug_privilege() {
+    use windows::Win32::Security::{
+        AdjustTokenPrivileges, LUID_AND_ATTRIBUTES, LookupPrivilegeValueW, SE_PRIVILEGE_ENABLED,
+        TOKEN_ADJUST_PRIVILEGES, TOKEN_PRIVILEGES, TOKEN_QUERY,
+    };
+    use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+    use windows::core::w;
+
+    unsafe {
+        let mut token = HANDLE::default();
+        if OpenProcessToken(
+            GetCurrentProcess(),
+            TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY,
+            &mut token,
+        )
+        .is_err()
+        {
+            return;
+        }
+        let mut luid = Default::default();
+        if LookupPrivilegeValueW(PCWSTR::null(), w!("SeDebugPrivilege"), &mut luid).is_ok() {
+            let privileges = TOKEN_PRIVILEGES {
+                PrivilegeCount: 1,
+                Privileges: [LUID_AND_ATTRIBUTES {
+                    Luid: luid,
+                    Attributes: SE_PRIVILEGE_ENABLED,
+                }],
+            };
+            let _ = AdjustTokenPrivileges(token, false, Some(&privileges), 0, None, None);
+        }
+        let _ = CloseHandle(token);
+    }
 }
 
 fn shell_execute(file: &str, params: Option<&str>, elevate: bool, wait: bool) -> Result<()> {
@@ -1434,6 +1713,64 @@ fn split_command(cmd: &str) -> (String, Option<String>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The User column was empty for most of the process list because the
+    /// only source was sysinfo's token read. This asserts the native path
+    /// answers for THIS process (an ordinary user token) and for the session-0
+    /// service hosts an unelevated session cannot open with more than
+    /// QUERY_LIMITED access — the exact case that used to render "—".
+    #[test]
+    fn token_user_resolves_the_owning_account_including_service_hosts() {
+        let own = token_user(std::process::id()).expect("own process has an owner");
+        assert!(!own.is_empty());
+        assert!(!own.contains('\u{0}'), "no embedded NULs: {own}");
+
+        // svchost.exe instances run as SYSTEM / LOCAL SERVICE / NETWORK
+        // SERVICE in session 0. At least one must resolve, otherwise the
+        // column is back to being blank for every system process.
+        let mut system = sysinfo::System::new();
+        system.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
+        let hosts: Vec<u32> = system
+            .processes()
+            .iter()
+            .filter(|(_, p)| p.name().eq_ignore_ascii_case("svchost.exe"))
+            .map(|(pid, _)| pid.as_u32())
+            .collect();
+        assert!(!hosts.is_empty(), "Windows always runs service hosts");
+        let resolved = hosts.iter().filter_map(|pid| token_user(*pid)).count();
+        assert!(
+            resolved > 0,
+            "no service host owner resolved out of {} candidates",
+            hosts.len()
+        );
+    }
+
+    /// The NT AUTHORITY pseudo-domain is localized, so recognizing only the
+    /// English spelling would leave "NT-AUTORITÄT\\SYSTEM" in a column that
+    /// is 120 px wide on a German system.
+    #[test]
+    fn the_authority_pseudo_domain_is_recognized_in_every_spelling() {
+        assert!(is_authority_domain("NT AUTHORITY"));
+        assert!(is_authority_domain("NT-AUTORITÄT"));
+        assert!(is_authority_domain("nt authority"));
+        assert!(!is_authority_domain("CONTOSO"));
+        assert!(!is_authority_domain("DESKTOP-1234"));
+    }
+
+    /// A dump that a debugger cannot read is not a dump. Full memory and the
+    /// inaccessible-region tolerance are the two flags whose absence made the
+    /// old `MiniDumpNormal` output useless, so both are pinned here.
+    #[test]
+    fn the_dump_flags_describe_a_debuggable_full_dump() {
+        const WITH_FULL_MEMORY: i32 = 0x0000_0002;
+        const IGNORE_INACCESSIBLE: i32 = 0x0002_0000;
+        assert_ne!(DUMP_TYPE_FULL & WITH_FULL_MEMORY, 0);
+        assert_ne!(DUMP_TYPE_FULL & IGNORE_INACCESSIBLE, 0);
+        // The fallback deliberately drops full memory and nothing else that
+        // a debugger needs to resolve a stack.
+        assert_eq!(DUMP_TYPE_REDUCED & WITH_FULL_MEMORY, 0);
+        assert_ne!(DUMP_TYPE_REDUCED & IGNORE_INACCESSIBLE, 0);
+    }
 
     #[test]
     fn process_creation_identity_matches_exactly_and_without_overflow() {

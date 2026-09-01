@@ -78,6 +78,10 @@ struct PidAttrs {
     power_throttled: Option<bool>,
     /// Full command line (Details page); immutable after process start.
     command_line: Option<String>,
+    /// Owning account ("DOMAIN\\user" / "SYSTEM"); immutable after process
+    /// start. sysinfo leaves this unset for every process it cannot open,
+    /// which is most of session 0 — see [`process_ops::token_user`].
+    user: Option<String>,
     /// Process identity guard against PID reuse.
     start_epoch_s: Option<i64>,
     /// When these values were last queried natively.
@@ -245,6 +249,14 @@ impl Sampler {
             }
             return a.clone();
         }
+        // The owning account cannot change while a process lives, so a TTL
+        // refresh of the mutable attributes must not pay for the token +
+        // account lookup again. Only a different identity forces a re-read.
+        let known_user = self
+            .attrs
+            .get(&pid)
+            .filter(|a| a.start_epoch_s == start_epoch_s)
+            .and_then(|a| a.user.clone());
         let security = if self.demand.wants(TelemetryDemand::TOKEN_SECURITY) {
             process_ops::token_security(pid)
         } else {
@@ -255,6 +267,7 @@ impl Sampler {
         };
         let fresh = PidAttrs {
             session_id: process_ops::session_id_of(pid),
+            user: known_user.or_else(|| process_ops::token_user(pid)),
             wow64: process_ops::is_wow64(pid),
             priority: process_ops::priority_class_of(pid),
             handles: process_ops::handle_count(pid),
@@ -588,9 +601,23 @@ impl Sampler {
             p.uac_virtualization = a.uac_virtualization;
             p.power_throttled = a.power_throttled;
             p.command_line = a.command_line;
-            // System processes have no owning user; TM shows "SYSTEM".
-            if p.user.is_none() && a.session_id.is_some_and(|sid| sid == 0) {
-                p.user = Some("SYSTEM".to_string());
+            // The User column is filled from three sources, strongest first:
+            // sysinfo's own token read, our narrower token read (which
+            // succeeds for the session-0 service hosts sysinfo cannot open),
+            // and finally the session id — session 0 has no interactive owner
+            // and belongs to the system, which is what Task Manager shows for
+            // the handful of protected processes no token can be read from.
+            // Anything else stays unknown; a guessed account is worse than "—".
+            if p.user.is_none() {
+                p.user = a.user;
+            }
+            if p.user.is_none() {
+                let session = a
+                    .session_id
+                    .or_else(|| self.cpu_load.session_id_of(p.pid, p.start_epoch_s));
+                if session == Some(0) {
+                    p.user = Some("SYSTEM".to_string());
+                }
             }
         }
 
