@@ -13,6 +13,34 @@ diagnostics; remaining telemetry and accessibility work is itemized precisely
 in `known-debt.md`. Normal GUI startup remains unelevated; privileged controls
 can cross a protected, allowlisted service boundary after one explicit install.
 
+## Recently landed (2026-09-01 — owners, multi-select, GPU engines, chrome)
+
+Ten reported gaps in one pass; `log/recent.md` carries the root causes.
+
+- **Process owners resolve natively.** `process_ops::token_user` reads
+  `TokenUser` through `PROCESS_QUERY_LIMITED_INFORMATION` (memoized per SID,
+  because `LookupAccountSidW` can reach a domain controller) and the kernel
+  process table now supplies `session_id` for the protected processes no handle
+  opens. The Details User column was "—" for most of session 0.
+- **Search covers every field a person would search by** — description, user,
+  service name, image path and command line on top of name/publisher/PID —
+  cheapest field first. Startup and Services use the same `Query`.
+- **Dumps are full-memory dumps.** `MINIDUMP_TYPE(0)` wrote stacks and module
+  headers; one unreadable region also failed the whole write.
+- **Multi-select** on Processes and Details (`selection.rs`): native list-view
+  gestures, identities not indexes, fan-out limited to repeatable commands, and
+  a confirmation that names every target when there is more than one.
+- **Per-GPU-engine graphs** with a "change graph to" context menu, so NVENC is
+  answerable while the 3D engine is pinned (the adapter number is the busiest
+  engine, not a sum).
+- **Application grouping on Processes** tolerates foreign descendants, absorbs
+  idle same-publisher helpers, and collapses repeat runs of one image under one
+  parent. Service hosts are deliberately exempt.
+- **Native caption** painted to match the strip below it, with immersive dark
+  mode and the Windows 11 backdrop request. The limits are in `known-debt.md`.
+- Window drags from the strip below the caption start on the button press, the
+  search box has a clear button, and the dense list rows are 20 px.
+
 ## Recently landed (2026-09-01 — CPU renderer and ClearType text)
 
 egui is now vendored as a fork at `vendor/egui` (subtree, tag 0.36.1). Two things

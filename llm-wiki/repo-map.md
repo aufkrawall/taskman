@@ -1,6 +1,6 @@
 # Repo Map (code map)
 
-Last cross-checked: 2026-08-31
+Last cross-checked: 2026-09-01
 
 Primary sources:
 - workspace tree (verified against working tree)
@@ -53,6 +53,7 @@ platform boundary (`tm-core` ← `tm-platform` ← `tm-app` / `tm-service`):
     SCM/Program Files/ProgramData install lifecycle, including pinned
     reparse/hard-link-resistant owner/group/DACL repair), `autostart.rs` (owned-command-
     only HKCU startup migration), `windows_enum.rs` (one-pass top-window/hung-state inventory),
+    `window_chrome.rs` (DWM caption colour / dark mode / backdrop),
     `version.rs` (cached PE metadata). Linux/macOS backends exist and are
     built by default (`build.py`).
 - `crates/tm-app`
@@ -65,6 +66,8 @@ platform boundary (`tm-core` ← `tm-platform` ← `tm-app` / `tm-service`):
     performance; Processes keeps native grouped presentation, Details can
     switch between flat and literal raw-PPID tree; Modules is an async
     on-demand inspector with guarded unload),
+    `selection.rs` (multi-row process selection shared by Processes and
+    Details: native click gestures, identity-keyed, primary vs. full set),
     `widgets/tablekit.rs` (TM-style
     tables: drag-start-width resize math, O(1) layout, `scrolled_rows`
     virtualization), `widgets/menu.rs` (classic full-width Windows-style
@@ -132,10 +135,17 @@ platform boundary (`tm-core` ← `tm-platform` ← `tm-app` / `tm-service`):
   brokers and browsers are launch boundaries; a windowed process folds into
   a windowless ancestor only when plausibly the same application — same
   image or publisher), while Background/Windows groups are flat lists where
-  connected same-image families collapse into expandable `Name (N)` rows and
+  a process's own application collapses into an expandable `Name (N)` row and
   busy absorbed external tasks (≥ 1 % CPU, different image, windowless) are
-  promoted into Background. Do not collapse this back to a literal PPID
-  tree. Raw `ProcessEntry.ppid` remains OS truth and is exposed by the
+  promoted into Background. "Its own application" is two rules of deliberately
+  different strength (`joins_family`): the same image joins unconditionally,
+  the same PUBLISHER under a different image joins only while windowless, idle
+  and away from a system/launch boundary. Repeat runs of one image under one
+  parent group separately (`sibling_run_key`), because the family walk cannot
+  see siblings; `svchost.exe` is exempt. A group's aggregate is
+  `family_values` — the MEMBERS' own values, not the subtree's, because a
+  foreign descendant left outside the group is rendered as its own row and must
+  not be counted twice. Do not collapse this back to a literal PPID tree. Raw `ProcessEntry.ppid` remains OS truth and is exposed by the
   persisted System Informer-style tree on the Details page, which is expanded
   by DEFAULT (`details::State.collapsed` tracks the exceptions) so newly
   appearing subtrees are never silently hidden. That tree has THREE sort

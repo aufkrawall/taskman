@@ -1,5 +1,98 @@
 # Recent Activity
 
+## 2026-09-01 — process owners, multi-select, GPU engines, window chrome
+
+Ten reported gaps, fixed together. The ones with a root cause worth keeping:
+
+### The User column was empty for most of the process list
+
+sysinfo resolves a process owner through its own token query, which asks for
+more access than an identity read needs and fails for roughly half the list —
+all of session 0 unelevated. The old fallback ("session id 0 → SYSTEM") needed
+`session_id_of`, which needs `OpenProcess`, so it did not fire for exactly the
+processes that had triggered it.
+
+`process_ops::token_user` opens the token through
+`PROCESS_QUERY_LIMITED_INFORMATION` (granted for almost every process,
+protected ones included) and resolves `TokenUser` → `LookupAccountSidW`.
+Answers are memoized per SID string for the life of the process: a
+domain-joined machine runs hundreds of processes under a handful of accounts,
+and `LookupAccountSidW` can reach a domain controller. The resolved name is
+also carried forward across the attribute cache's TTL refresh — a process's
+owner cannot change while it lives.
+
+The kernel process table now also yields `session_id` (offset 100 on 64-bit,
+80 on 32-bit, pinned against the `windows` crate's struct), so the session-0
+fallback works even for the processes no handle opens at all. The domain is
+dropped for the NT AUTHORITY pseudo-domain **in every locale spelling** —
+matching only the English one left "NT-AUTORITÄT\SYSTEM" in a 120 px column
+on a German system.
+
+### Dumps were not debuggable
+
+`MiniDumpWriteDump` was called with `MINIDUMP_TYPE(0)` — `MiniDumpNormal`:
+stacks and module headers, no memory. WinDbg opens it and then answers almost
+every question with "memory access error". Worse, without
+`IgnoreInaccessibleMemory` a single unreadable region (guard page, driver-locked
+memory) fails the whole write.
+
+`DUMP_TYPE_FULL` is now the `procdump -ma` set minus token information (SIDs
+and privileges are not needed to debug, and a dump is user data). A target that
+refuses its whole address space is retried once at `DUMP_TYPE_REDUCED` — after
+rewinding the file, because `MiniDumpWriteDump` writes from the current
+position and the failed attempt left bytes behind.
+
+### Grouping rejected a family for one foreign child
+
+`same_image_family` returned `None` the moment any descendant had a different
+image, so a browser with twenty renderers and one `crashpad_handler` rendered
+as twenty-one flat rows. `application_family` keeps the members that belong and
+leaves the rest where they are — which is why the group aggregate had to become
+the members' own values (`family_values`) rather than the subtree's: a
+descendant shown as its own row must not also be counted inside the group.
+
+Two rules group now, and the difference in strength between them is the design:
+same image joins unconditionally (that is what keeps a 40 % renderer inside its
+browser row), same PUBLISHER under a different image joins only while windowless
+and idle and never across a system or launch boundary. Plus repeat runs of one
+image under one parent (`sibling_run_key`), which the family walk cannot see
+because the only process connecting them has a different image. `svchost.exe` is
+excluded from run grouping on purpose — see `known-debt.md`.
+
+### Dragging by the strip below the caption
+
+`StartDrag` was sent from egui's `drag_started()`, which only fires once the
+pointer has passed egui's drag threshold. Every pixel before that was movement
+the window did not follow, so it jumped to catch up. It goes on the button
+press now, like the real caption. Double-click-to-maximize had to be detected
+by hand (time + distance since the last press in the region): handing the press
+to the window manager ends egui's view of it, so its own click bookkeeping
+never completes.
+
+### The rest
+
+- **Search** matched name/display/publisher/PID only. It now also covers
+  description, owning user, service name, image path and command line,
+  cheapest field first so the kilobyte-long command line is only scanned when
+  nothing else matched. Startup and Services route through the same `Query`.
+- **Multi-select** (`selection.rs`) backs both process tables with the native
+  list-view gesture set. Rows are held as identities, never indexes — the list
+  re-sorts on every tick. Fan-out is limited to the repeatable commands; the
+  single-target ones follow a separate `primary`. More than one target always
+  goes through the confirmation, which lists every one by name and pid.
+- **GPU engines**: `HistoryPoint.gpu_engines` plus a "change graph to" menu
+  (Overall / All engines / each engine). The menu's engine list comes from the
+  history window, not the snapshot — the snapshot's list is sorted by
+  utilization, so an engine that just went idle would drop out exactly when the
+  user wanted to look at what it had been doing. The collector no longer
+  truncates to the six busiest for the same reason.
+- **Window chrome** (`win/window_chrome.rs`): caption/text/border colours plus
+  `IMMERSIVE_DARK_MODE`, pushed only when the theme changes (each attribute
+  recomposes the frame). What is NOT reachable, and why, is in `known-debt.md`.
+- **Search box** gained a clear button; Escape clears it too.
+- `ROW_H_DENSE` 22 → 20 px. That is the floor: 13 px row text needs a ~17 px
+  line box and `icon_cell` derives its glyph side from `row_h - 6`.
+
 ## 2026-08-31 — tray polish, and the fabricated start time behind "no priority"
 
 ### Half the process list had no identity
