@@ -20,6 +20,9 @@ mod render_snapshot;
 mod search;
 mod selfcheck;
 mod tabs;
+/// Side-by-side comparison of the text-smoothing profiles; see the module docs.
+#[cfg(test)]
+mod text_compare;
 mod theme;
 mod ui_state;
 mod widgets;
