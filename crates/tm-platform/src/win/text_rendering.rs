@@ -68,9 +68,15 @@ impl TextRenderingParams {
 
 /// Query the effective text-rendering parameters for the monitor showing `hwnd`.
 ///
-/// Pass `None` before a window exists; the primary monitor's parameters are used.
+/// **Call this only after the window exists.** One of the gates -- per-monitor DPI
+/// awareness -- is a property the windowing library sets while creating its event loop,
+/// so asking earlier reports the process default and always answers "disabled". That
+/// mistake is silent: text simply comes out grayscale and nothing says why.
+///
+/// Pass `None` to use the primary monitor.
 pub fn query(hwnd: Option<isize>) -> TextRenderingParams {
     if !system_wants_cleartype() {
+        tracing::debug!("font smoothing is off or not ClearType; sub-pixel text disabled");
         return TextRenderingParams::disabled();
     }
     if !is_per_monitor_dpi_aware() {
@@ -79,6 +85,18 @@ pub fn query(hwnd: Option<isize>) -> TextRenderingParams {
         tracing::debug!("not per-monitor DPI aware; sub-pixel text disabled");
         return TextRenderingParams::disabled();
     }
+    let params = dwrite_params(hwnd).unwrap_or_default();
+    tracing::debug!(?params, "sub-pixel text parameters");
+    params
+}
+
+/// The monitor's blend parameters, **without** the validity gates.
+///
+/// Gamma, contrast and stripe order are properties of the display and the user's
+/// calibration; they are meaningful whether or not sub-pixel rendering ends up being
+/// used, and unlike [`query`] this is safe to call before a window exists. The renderer
+/// needs them at construction time, and `enabled` on the result must be ignored.
+pub fn blend_params(hwnd: Option<isize>) -> TextRenderingParams {
     dwrite_params(hwnd).unwrap_or_default()
 }
 

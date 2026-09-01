@@ -493,10 +493,13 @@ pub fn settings_dialog(app: &mut TaskManApp, ctx: &egui::Context, _pal: &theme::
                     .color(_pal.text_dim),
             );
             if app.shared.settings.render_mode == RenderMode::Software {
+                // Informational, not a warning: this used to select WARP, a D3D12 driver
+                // emulated on the CPU at ~3 fps. It now selects a native rasterizer, so
+                // the orange caution colour would be actively misleading.
                 ui.label(
                     egui::RichText::new(i18n::tr(K::RenderSoftwareWarning))
                         .size(11.0)
-                        .color(_pal.warn_orange),
+                        .color(_pal.text_dim),
                 );
             }
             if app.shared.settings.render_mode != crate::active_render_mode() {

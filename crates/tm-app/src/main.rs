@@ -342,8 +342,22 @@ fn run_gui(mock: bool, args: &[String]) {
         let initial_tab = initial_tab_arg.clone();
         let app_settings = settings.clone();
         let start_hidden = initially_hidden;
+        #[cfg(feature = "software")]
+        let is_software = matches!(renderer, eframe::Renderer::Software);
+        #[cfg(not(feature = "software"))]
+        let is_software = false;
+
         let creator = move |cc: &eframe::CreationContext<'_>| {
             StartupTrace::mark("creation_context_enter");
+            // Now the window exists, so the DPI-awareness gate reports the truth. Doing
+            // this before `apply_startup` means the very first frame already rasterizes
+            // at the right coverage rather than rebuilding the atlas a frame later.
+            // `None` means the primary monitor. eframe keeps the raw handle private, and the
+            // gate that actually mattered here -- per-monitor DPI awareness -- is a property
+            // of the thread rather than of the window, so it is unaffected. The only thing
+            // lost is picking up a *secondary* monitor's own ClearType calibration, which
+            // differs from the primary's only if the user tuned them separately.
+            theme::set_subpixel_capable(is_software, tm_platform::text_rendering::query(None));
             theme::apply_startup(&cc.egui_ctx);
             fonts::install_async(cc.egui_ctx.clone());
             let application = app::TaskManApp::new(cc, use_mock, app_settings, initial_tab);
@@ -352,21 +366,16 @@ fn run_gui(mock: bool, args: &[String]) {
                     as Box<dyn eframe::App>,
             )
         };
-        // Sub-pixel text is only correct on a renderer that blends per channel, and only
-        // where the display and the user's settings allow it. Both are resolved here,
-        // before the context exists, so the very first frame rasterizes correctly rather
-        // than rebuilding the atlas after one grayscale frame.
-        let text_params = tm_platform::text_rendering::query(None);
-        #[cfg(feature = "software")]
-        let is_software = matches!(renderer, eframe::Renderer::Software);
-        #[cfg(not(feature = "software"))]
-        let is_software = false;
-        theme::set_subpixel_capable(is_software, text_params);
-
+        // Gamma and contrast are display properties and can be read now; the renderer
+        // needs them at construction. Whether sub-pixel text is *permitted* cannot be
+        // decided here -- one of its gates is per-monitor DPI awareness, which winit only
+        // sets while building its event loop -- so that happens in the creator below,
+        // once a window exists.
+        let blend = tm_platform::text_rendering::blend_params(None);
         let mut opts = options(renderer);
         opts.software_options = eframe::SoftwareOptions {
-            text_gamma: text_params.gamma,
-            text_contrast: text_params.contrast,
+            text_gamma: blend.gamma,
+            text_contrast: blend.contrast,
         };
 
         match eframe::run_native("Task-Manager", opts, Box::new(creator)) {
