@@ -158,32 +158,42 @@ git-LFS and those objects currently 404 from the upstream server. We never build
 crates, so checking the pointer files out instead is harmless — but without the variable the
 subtree operation aborts partway.
 
-### git-LFS breaks `git push` in a fresh clone
+### The snapshot stubs are deleted, and must stay deleted
 
-The ~230 inert pointer stubs that come with the subtree are enough to make git-LFS refuse
-every push to the parent repo:
+`git subtree pull` re-adds ~230 git-LFS pointer stubs (demo/kittest/example snapshot PNGs
+and GIFs). **Delete them again in the same commit.** They make the entire repository
+unpushable, which is not a style preference:
 
 ```
-Git LFS upload failed:
-  (missing) vendor/egui/crates/egui_demo_lib/tests/snapshots/.../dpi_2.00.png
-hint: Your push was rejected due to missing or corrupt local objects.
+remote: error: GH008: Your push referenced at least 214 unknown Git LFS objects
+remote: ! [remote rejected] (pre-receive hook declined)
 ```
 
-git-LFS's `pre-push` hook scans the outgoing commits for pointer CONTENT and tries to upload
-the objects behind them. It does not consult `.gitattributes` — commenting the `*.png
-filter=lfs` rules out (which this fork does, so clones do not try to smudge) has no effect on
-it. The objects do not exist anywhere: not locally, and not on upstream's LFS server.
+The objects behind those pointers exist nowhere — not here, not on upstream's LFS server,
+which 404s them. GitHub validates every pointer in a push against the repository's LFS
+store and declines the whole push when one is missing. There is no way to satisfy it: the
+content is gone. Locally the same thing happens one step earlier, in git-LFS's own
+`pre-push` hook (`Git LFS upload failed: (missing) ...`).
 
-This repository stores nothing in LFS, so the fix is to take LFS out of it:
+Neither check consults `.gitattributes`, so commenting the `*.png filter=lfs` rules out —
+which this fork does, and which correctly stops a clone from trying to smudge them — has
+no effect on either. Only the absence of the pointer FILES does.
+
+They were removed from the fork's history with a `git filter-branch --index-filter` keyed
+on **blob OID**, not on path. Two path-based passes both left files behind:
+`git rev-list --objects` names each blob once, under whichever path it met first, so paths
+sharing a blob are invisible to it — and the synthetic `Squashed 'vendor/egui/' content`
+commit spells every path without the `vendor/egui/` prefix, so nothing matched there at
+all. The OID set has neither problem. Nothing this workspace builds referenced them; the
+full gate passes unchanged.
+
+If a clone ever ends up with LFS active again (a stray `git lfs install`), this stops the
+hook without touching history:
 
 ```bash
 git lfs uninstall --local          # removes .git/hooks/{pre-push,post-*} and filter.lfs.*
-git config --local lfs.allowincompletepush true   # in case a later `git lfs install` returns
+git config --local lfs.allowincompletepush true
 ```
-
-Both are LOCAL settings — git cannot commit them — so **a fresh clone has to run them
-again**. Deleting the stub files instead would fix it once and for all, but they would come
-back (or conflict) on every `git subtree pull`, so the two commands are the cheaper trade.
 
 After pulling:
 

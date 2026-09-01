@@ -24,30 +24,34 @@ Primary sources:
 Flags: `--host-only`, `--linux-only`, `--debug`, `--no-package`,
 `--require-all-targets`, `--check`.
 
-## Pushing: git-LFS must be uninstalled locally
+## Pushing: no git-LFS pointers may enter this repository
 
-`git push` fails in any clone that has git-LFS active:
+Vendoring egui made the repository unpushable, in two places at once:
 
 ```
-Git LFS upload failed: (missing) vendor/egui/crates/egui_demo_lib/tests/snapshots/...png
-hint: Your push was rejected due to missing or corrupt local objects.
+Git LFS upload failed: (missing) vendor/egui/.../dpi_2.00.png     # local pre-push hook
+remote: error: GH008: Your push referenced at least 214 unknown Git LFS objects
 ```
 
-The vendored egui subtree carries ~230 git-LFS pointer stubs for demo/kittest snapshots
-whose objects 404 from upstream's LFS server and were never copied here. LFS's `pre-push`
-hook scans outgoing commits for pointer content — it ignores `.gitattributes`, so the
-commented-out `*.png filter=lfs` rules in `vendor/egui/.gitattributes` (which do stop a
-clone from trying to smudge them) do not help.
+egui tracks its demo/kittest snapshot PNGs in git-LFS, and those objects 404 from
+upstream's LFS server — so the subtree brought ~230 pointer files describing content that
+exists nowhere. GitHub validates every pointer in a push against the repository's LFS store
+and declines the push when one is missing.
 
-This repository stores nothing in LFS. Run once per clone:
+The stubs are therefore **deleted from this fork's history**, and `git subtree pull` must
+delete them again each time it re-adds them. Nothing here builds those crates. Neither the
+local hook nor GitHub's check consults `.gitattributes`, so disabling the `*.png
+filter=lfs` rules (which this fork does, and which is what stops a clone from trying to
+smudge them) does not substitute for removing the files. See
+`vendor/egui/TASKMAN-FORK.md` for the removal procedure and why it has to key on blob OID
+rather than on path.
+
+If a clone ends up with LFS machinery active anyway, this disarms it locally:
 
 ```bash
 git lfs uninstall --local
 git config --local lfs.allowincompletepush true
 ```
-
-Both are local settings that cannot be committed. See
-`vendor/egui/TASKMAN-FORK.md` for why the stub files are kept rather than deleted.
 
 ## Quality gate
 
