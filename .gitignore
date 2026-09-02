@@ -4,3 +4,4 @@ bench/dist
 /dist
 *.log.tmp
 *.png
+CLAUDE.md
