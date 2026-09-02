@@ -1685,9 +1685,17 @@ fn shell_execute(file: &str, params: Option<&str>, elevate: bool, wait: bool) ->
         ShellExecuteExW(&mut info).map_err(|e| {
             TmError::platform("ShellExecuteExW", format!("{e} (elevation denied?)"))
         })?;
-        if wait && !info.hProcess.is_invalid() {
-            // Brief wait so failures surface quickly; don't block forever.
-            let _ = th::WaitForSingleObject(info.hProcess, 500);
+        // SEE_MASK_NOCLOSEPROCESS makes the caller the owner of the returned
+        // process handle, so it must be closed on EVERY path — not only the
+        // waiting one. Leaking it keeps the launched process's kernel object
+        // alive after it exits (an unreapable entry whose pid cannot be
+        // reused) for as long as this long-running app lives, once per "Run
+        // new task", "Open file location" and opened URL.
+        if !info.hProcess.is_invalid() {
+            if wait {
+                // Brief wait so failures surface quickly; don't block forever.
+                let _ = th::WaitForSingleObject(info.hProcess, 500);
+            }
             let _ = CloseHandle(info.hProcess);
         }
     }
@@ -1881,6 +1889,27 @@ mod tests {
         );
     }
 
+    /// Poll `probe` until it answers or the deadline passes.
+    ///
+    /// A fixed sleep would be a bet on how fast the kernel publishes a new
+    /// process's parameters, and that bet loses on a loaded machine — which is
+    /// the machine a task manager's tests run on.
+    fn poll_for<T>(
+        mut probe: impl FnMut() -> Option<T>,
+        timeout: std::time::Duration,
+    ) -> Option<T> {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            if let Some(value) = probe() {
+                return Some(value);
+            }
+            if std::time::Instant::now() >= deadline {
+                return None;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
     #[test]
     fn command_line_of_spawned_child_contains_arguments() {
         let mut child = std::process::Command::new("cmd")
@@ -1890,8 +1919,8 @@ mod tests {
             .spawn()
             .expect("spawn child");
         let pid = child.id();
-        std::thread::sleep(std::time::Duration::from_millis(150));
-        let cmdline = command_line_of(pid).expect("command line retrievable");
+        let cmdline = poll_for(|| command_line_of(pid), std::time::Duration::from_secs(10))
+            .expect("command line retrievable");
         assert!(
             cmdline.to_ascii_lowercase().contains("ping -n 30"),
             "unexpected: {cmdline}"

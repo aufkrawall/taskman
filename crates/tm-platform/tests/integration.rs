@@ -3,6 +3,43 @@
 
 use tm_core::model::*;
 
+/// Poll `probe` until it answers or the deadline passes.
+///
+/// A newly spawned child is not immediately visible to every query the kernel
+/// answers about it, but *how long* it takes is a property of the machine's
+/// load — the very load a task manager is opened for. A fixed sleep bets on
+/// that number; this waits for the condition instead (AGENTS.md: no sleeps in
+/// tests, poll with bounded deadlines).
+fn poll_for<T>(mut probe: impl FnMut() -> Option<T>, timeout: std::time::Duration) -> Option<T> {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if let Some(value) = probe() {
+            return Some(value);
+        }
+        if std::time::Instant::now() >= deadline {
+            return None;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+}
+
+/// Wait until `pid` appears in a fresh process snapshot.
+fn wait_until_visible(pid: u32) {
+    let found = poll_for(
+        || {
+            let mut system = sysinfo::System::new();
+            system.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
+            system
+                .processes()
+                .keys()
+                .any(|candidate| candidate.as_u32() == pid)
+                .then_some(())
+        },
+        std::time::Duration::from_secs(10),
+    );
+    assert!(found.is_some(), "spawned child {pid} never became visible");
+}
+
 /// Half the process list is unopenable for an unelevated session, and
 /// everything sysinfo reads through a process HANDLE fails for those: the
 /// creation time came back as a fabricated `Some(0)` and the priority class
@@ -148,18 +185,20 @@ fn kill_spawned_child() {
         .spawn()
         .expect("spawn child");
     let pid = child.id();
-    std::thread::sleep(std::time::Duration::from_millis(200));
+    wait_until_visible(pid);
 
     actions.kill_single(pid).expect("kill child");
-    // Give it a moment; then verify exit.
-    for _ in 0..50 {
-        match child.try_wait() {
-            Ok(Some(_)) => return,
-            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(50)),
-            Err(_) => break,
-        }
-    }
-    panic!("child did not exit after TerminateProcess");
+    let exited = poll_for(
+        || match child.try_wait() {
+            Ok(status) => status.map(Some),
+            Err(_) => Some(None),
+        },
+        std::time::Duration::from_secs(10),
+    );
+    assert!(
+        matches!(exited, Some(Some(_))),
+        "child did not exit after TerminateProcess"
+    );
 }
 
 #[cfg(target_os = "windows")]
@@ -172,7 +211,7 @@ fn suspend_resume_own_child() {
         .spawn()
         .expect("spawn");
     let pid = child.id();
-    std::thread::sleep(std::time::Duration::from_millis(150));
+    wait_until_visible(pid);
 
     actions.suspend_process(pid, true).expect("suspend");
     actions.suspend_process(pid, false).expect("resume");
@@ -190,7 +229,7 @@ fn sampled_snapshot_carries_command_lines() {
         .spawn()
         .expect("spawn child");
     let pid = child.id();
-    std::thread::sleep(std::time::Duration::from_millis(150));
+    wait_until_visible(pid);
 
     let mut collector = tm_platform::create_collector();
     let snap = collector.sample(std::time::Instant::now()).expect("sample");

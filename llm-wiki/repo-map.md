@@ -1,6 +1,6 @@
 # Repo Map (code map)
 
-Last cross-checked: 2026-09-01
+Last cross-checked: 2026-09-02
 
 Primary sources:
 - workspace tree (verified against working tree)
@@ -96,8 +96,12 @@ platform boundary (`tm-core` ← `tm-platform` ← `tm-app` / `tm-service`):
 - `dist/` — packaged releases from `build.py` (gitignored)
 - `bench/` — framework comparison apps + timing scripts
 - `tools/` — capture/UI-test PowerShell helpers
-- `implement.md` — audit + implementation plan this codebase follows
-  (§ numbering is referenced from code comments)
+- `implement.md` — **REMOVED** (commit `fc4ecb7c`). The `implement.md §N`
+  citations still in ~30 source comments and in `AGENTS.md` are historical
+  provenance, not a live cross-reference: the sections they name no longer
+  exist anywhere in the tree. Treat them as "this decision came from the
+  original plan"; the current behavior is the code and, for accepted
+  trade-offs, `known-debt.md`. Do not add new `§` citations.
 
 ## High-Risk / High-Value Files
 

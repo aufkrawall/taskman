@@ -100,11 +100,12 @@ impl UpdateSpeed {
 
 /// Glyph anti-aliasing weight.
 ///
-/// egui rasterizes glyphs into a single-channel coverage atlas, so RGB
-/// sub-pixel anti-aliasing (ClearType) is not available; what IS tunable is
-/// the coverage-to-alpha ramp, which decides how heavy the strokes come out.
-/// See `llm-wiki/known-debt.md` for why the sub-pixel part cannot be fixed
-/// from this side.
+/// This is the coverage-to-alpha ramp, which decides how heavy the strokes
+/// come out. It is independent of sub-pixel (ClearType) rendering: that is a
+/// capability of the display and the active renderer, not a preference, and it
+/// has been available on the CPU rasterizer since 2026-09-01 (see
+/// `llm-wiki/render-pipeline.md`). The forked epaint atlas stores `Color32`,
+/// so all three weights below apply per channel when sub-pixel is active.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum TextSmoothing {
     /// Raw coverage: the thinnest, crispest strokes. Windows UI text is
@@ -122,14 +123,11 @@ pub enum TextSmoothing {
 
 /// Which rendering path the GUI starts on.
 ///
-/// Which renderer to use.
-///
 /// [`Self::Software`] used to mean WARP -- a D3D12 driver emulated on the CPU, measured at
 /// ~14 cores and 2.9 fps on a 16-thread desktop, with a per-frame cost that did not depend
 /// on window size or content. It now means a native CPU rasterizer that draws the UI
 /// directly, which is a different thing entirely: no driver, no shader compiler, and the
-/// only path that can render sub-pixel (ClearType) text. Do not reintroduce the WARP
-/// adapter selector.
+/// only path that can render sub-pixel (ClearType) text.
 ///
 /// The persisted value keeps its name and its meaning to the user ("no GPU"), so no config
 /// migration is needed.
@@ -143,8 +141,12 @@ pub enum RenderMode {
     /// machines where the D3D12/Vulkan driver misbehaves. Still GPU-accelerated,
     /// and still comfortably real-time.
     Compatibility,
-    /// CPU rasterizer (WARP on Windows). Correct, but very slow — see the
-    /// numbers above.
+    /// The native CPU rasterizer — no driver, no adapter, and the only path
+    /// that renders sub-pixel (ClearType) text. It is also the DEFAULT first
+    /// choice in `Auto`, not a slow last resort. If that renderer cannot be
+    /// built, the wgpu fallback honours this mode by selecting a CPU-type
+    /// adapter (WARP on Windows), which *is* slow; the settings dialog reports
+    /// which path actually came up.
     Software,
 }
 
@@ -1043,16 +1045,20 @@ impl Drop for SettingsWriter {
 }
 
 fn settings_writer_loop(rx: std::sync::mpsc::Receiver<WriteMsg>) {
-    // Pending newest snapshot + whether any queued request was forced
-    // (a forced request upgrades the coalesced write).
-    let mut pending: Option<(std::sync::Arc<Settings>, bool)> = None;
+    // Newest queued snapshot. Both message kinds drain through `save_forced`
+    // on purpose: the autosave gate is applied at the CALL SITE
+    // (`TaskManApp::save_settings`), so a snapshot that reached this queue has
+    // already been approved for writing. Re-checking `save_config` here would
+    // additionally break the one case that must always persist — the write
+    // that records the user turning autosave OFF.
+    let mut pending: Option<std::sync::Arc<Settings>> = None;
     loop {
         let msg = if pending.is_some() {
             // Coalesce everything arriving within the window.
             match rx.recv_timeout(COALESCE_WINDOW) {
                 Ok(m) => m,
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                    if let Some((s, _)) = pending.take() {
+                    if let Some(s) = pending.take() {
                         s.save_forced();
                     }
                     continue;
@@ -1066,16 +1072,15 @@ fn settings_writer_loop(rx: std::sync::mpsc::Receiver<WriteMsg>) {
             }
         };
         match msg {
-            WriteMsg::Write(s) => pending = Some((s, false)),
-            WriteMsg::Force(s) => pending = Some((s, true)),
+            WriteMsg::Write(s) | WriteMsg::Force(s) => pending = Some(s),
             WriteMsg::Flush(reply) => {
-                if let Some((s, _)) = pending.take() {
+                if let Some(s) = pending.take() {
                     s.save_forced();
                 }
                 let _ = reply.send(());
             }
             WriteMsg::Shutdown => {
-                if let Some((s, _)) = pending.take() {
+                if let Some(s) = pending.take() {
                     s.save_forced();
                 }
                 break;

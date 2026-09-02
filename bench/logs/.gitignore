@@ -1,1 +1,6 @@
-bench/logs/*.log
+# Patterns here are relative to THIS directory. The previous rule was
+# `bench/logs/*.log`, which — because a pattern containing a slash is anchored
+# to the .gitignore's own directory — resolved to `bench/logs/bench/logs/*.log`
+# and matched nothing. That is how four build logs carrying the build
+# machine's home path were committed in the first place.
+*.log
