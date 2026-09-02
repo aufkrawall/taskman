@@ -2,8 +2,11 @@
 
 The repository has been audited against:
 
-- The seven native Windows 11 Task Manager screenshots in `taskmanpngs/`.
-- The project's current/final screenshots in `shots/`.
+- The seven native Windows 11 Task Manager reference screenshots in
+  `taskmanpngs/` (untracked local captures, kept out of the repository for
+  privacy).
+- The project's own development screenshots in `shots/` (likewise untracked
+  local captures).
 - The actual Rust implementation, rather than assuming `implement.md` accurately describes the current state.
 - Current Microsoft Task Manager documentation through 2026.
 

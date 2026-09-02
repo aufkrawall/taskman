@@ -1,5 +1,18 @@
 # Recent Activity
 
+## 2026-09-02 — publish preparation: untracked captures, scrubbed history
+
+Preparing the repository for publication. `shots/` and `taskmanpngs/`
+(development, final, and native-reference window captures) are no longer
+tracked — they show the developer's real user name and installed software,
+and the `.gitignore` `*.png` rule now actually covers them. Personal-path
+and hostname strings in tracked docs were reworded
+(`hardening/core-service/context.md` and two entries below), README,
+LICENSE and CI were added, and the full git history was rewritten with
+git-filter-repo to purge every historical capture and personal-path/
+hostname string. Commit SHAs cited in docs written before this entry are
+pre-rewrite provenance and no longer resolve.
+
 ## 2026-09-02 — full-repository audit: what the smoke test never looked at
 
 A whole-tree audit (source, tests, gates, release artifacts). The workspace
@@ -897,7 +910,7 @@ hardening, runtime). Findings implemented:
   `-C control-flow-guard=yes` for windows targets (verified: Guard CF
   function table 0 → 1391 entries); `build.py` release builds add
   `--remap-path-prefix=<home>=` (strips the build-machine user name from
-  panic locations; verified: zero "REDACTED" strings in the shipped exe).
+  panic locations; verified: zero personal-name strings in the shipped exe).
   RUSTFLAGS overrides config rustflags, so build.py restates the CFG flag.
 - macOS `launchctl kickstart` target now interpolates `libc::getuid()`
   (the literal `$(id -u)` never resolved — launchctl gets no shell).
@@ -1423,7 +1436,7 @@ values (empty vec / 0 / None) matching model docs & mock. Verified:
 **WSL/Windows dual-host gotcha:** WSL builds produce `target/release/taskman`
 (ELF) while the launched binary is `taskman.exe` — a WSL-side
 `build.py --host-only` does NOT refresh the exe. Refresh it from WSL via
-interop: `cmd.exe /c "... && set PATH=C:\Users\REDACTED\.cargo\bin;%PATH% &&
+interop: `cmd.exe /c "... && set PATH=%USERPROFILE%\.cargo\bin;%PATH% &&
 py.exe build.py --host-only"` (works; selfcheck via powershell
 Start-Process -RedirectStandardOutput since GUI-subsystem console attach
 fails through the interop pipe). Consider separate CARGO_TARGET_DIR per

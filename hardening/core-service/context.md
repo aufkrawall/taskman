@@ -1,6 +1,6 @@
 # Working Context: Core Service Boundary
 
-This analysis was prepared in `C:/Users/REDACTED/Programme/build/tmproject` from
+This analysis was prepared in the project's working tree from
 source review at Git revision `13696d08f17e03754cb842c74c52ceb59c06991a`
 plus the in-progress GUI parity changes requested in the same development
 session.
