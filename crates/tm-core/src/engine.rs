@@ -230,29 +230,22 @@ fn spawn_inner(
 
 /// Sample once, publish it, bump the tick counter, notify the UI.
 ///
-/// `count_tick` distinguishes regular cadence ticks from forced refreshes;
-/// both publish into the same slot so the UI always sees the newest data.
+/// Cadence ticks, forced refreshes and `SampleNow` all publish into the same
+/// slot and all advance `tick_count`: the counter is the visible generation
+/// that UI caches invalidate on, so an out-of-band sample that did not bump it
+/// would leave those caches serving the previous snapshot.
 fn sample_and_publish(
     collector: &mut Box<dyn SystemCollector>,
     shared: &Shared,
-    count_tick: bool,
 ) -> Result<Arc<Snapshot>> {
     let started = Instant::now();
     let snap = collector.sample(started)?;
     let dur = started.elapsed();
     let arc = Arc::new(snap);
     *sync::write(&shared.latest) = Some(arc.clone());
-    if count_tick {
-        shared
-            .tick_count
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    } else {
-        // A forced refresh still advances the visible generation so UI caches
-        // built on tick_count/timestamp invalidate correctly.
-        shared
-            .tick_count
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    }
+    shared
+        .tick_count
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     shared.notify();
     if dur > Duration::from_millis(250) {
         tracing::warn!(dur_ms = dur.as_millis() as u64, "slow sampling tick");
@@ -310,18 +303,40 @@ fn run_loop(
     shared.notify();
     tracing::info!(backend = collector.backend_name(), "engine running");
 
+    // A collector that keeps failing must not do so silently: the UI would
+    // just keep showing the last good snapshot with no clue why it froze.
+    // Rate-limited so a persistently failing provider cannot flood the log.
+    let mut failures: u64 = 0;
+    let mut last_report: Option<Instant> = None;
+    let report_failure = |error: &TmError, failures: u64, last: &mut Option<Instant>| {
+        let due = last.is_none_or(|at| at.elapsed() >= Duration::from_secs(30));
+        if due {
+            *last = Some(Instant::now());
+            tracing::warn!(%error, failures, "sampling tick failed; keeping the previous snapshot");
+        }
+    };
+
     loop {
         let started = Instant::now();
 
         // Take the sample unless paused.
-        if *sync::read(&shared.state) == EngineState::Running
-            && let Err(e @ TmError::Unsupported(_)) =
-                sample_and_publish(&mut collector, shared, true)
-        {
-            // Collector lacks this platform's support entirely; park.
-            tracing::error!(error = %e, "collector unsupported; pausing engine");
-            *sync::write(&shared.state) = EngineState::Paused;
-            shared.notify();
+        if *sync::read(&shared.state) == EngineState::Running {
+            match sample_and_publish(&mut collector, shared) {
+                Ok(_) => {
+                    failures = 0;
+                    last_report = None;
+                }
+                Err(e @ TmError::Unsupported(_)) => {
+                    // Collector lacks this platform's support entirely; park.
+                    tracing::error!(error = %e, "collector unsupported; pausing engine");
+                    *sync::write(&shared.state) = EngineState::Paused;
+                    shared.notify();
+                }
+                Err(e) => {
+                    failures += 1;
+                    report_failure(&e, failures, &mut last_report);
+                }
+            }
         }
 
         // Wait out the rest of the interval while staying responsive to cmds.
@@ -356,24 +371,30 @@ fn run_loop(
             Ok(EngineCmd::Refresh) => {
                 // Force exactly one sample regardless of paused state; the
                 // pause/running mode itself must not change (F5 semantics).
-                if let Err(e @ TmError::Unsupported(_)) =
-                    sample_and_publish(&mut collector, shared, true)
-                {
-                    tracing::error!(error = %e, "refresh failed; pausing engine");
-                    *sync::write(&shared.state) = EngineState::Paused;
-                    shared.notify();
-                }
-            }
-            Ok(EngineCmd::SampleNow(reply)) => {
-                match sample_and_publish(&mut collector, shared, false) {
-                    Ok(arc) => {
-                        let _ = reply.send(arc);
+                match sample_and_publish(&mut collector, shared) {
+                    Ok(_) => {
+                        failures = 0;
+                        last_report = None;
+                    }
+                    Err(e @ TmError::Unsupported(_)) => {
+                        tracing::error!(error = %e, "refresh failed; pausing engine");
+                        *sync::write(&shared.state) = EngineState::Paused;
+                        shared.notify();
                     }
                     Err(e) => {
-                        tracing::error!(error = %e, "sample_now failed");
+                        failures += 1;
+                        report_failure(&e, failures, &mut last_report);
                     }
                 }
             }
+            Ok(EngineCmd::SampleNow(reply)) => match sample_and_publish(&mut collector, shared) {
+                Ok(arc) => {
+                    let _ = reply.send(arc);
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, "sample_now failed");
+                }
+            },
             Ok(EngineCmd::Shutdown) => break,
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => break,

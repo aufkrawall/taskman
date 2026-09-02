@@ -2697,8 +2697,8 @@ mod tests {
         ));
     }
 
-    /// A full-size answer has to fit the response frame. 2000 entries is the
-    /// hard cap; a desktop produces a few dozen.
+    /// A full-size answer has to fit the response frame. [`NET_MAX_ENTRIES`]
+    /// is the hard cap; a desktop produces a few dozen.
     #[test]
     fn a_capped_network_response_fits_the_frame_limit() {
         let sample = ProcessNetworkSample {

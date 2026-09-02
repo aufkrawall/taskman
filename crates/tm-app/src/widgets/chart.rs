@@ -225,12 +225,22 @@ pub fn chart_multi(
         let last = *ts.last()?;
         Some((first, last.saturating_sub(first).max(1)))
     });
+    // Callers must hand over one timestamp per sample (every series extractor
+    // maps over the same window). Indexing blind would turn a future
+    // desynchronization — a bug class this code has already seen once, see
+    // `series_extractors_stay_aligned_with_window` — into a panic in the paint
+    // path, i.e. a crashed task manager. A short timestamp slice degrades to
+    // even spacing for the samples it cannot place instead.
+    let even = |i: usize, n: usize| rect.left() + rect.width() * i as f32 / (n - 1) as f32;
     let x_at = |i: usize, n: usize| match t_span {
-        Some((t0, span)) => {
-            let t = timestamps_ms.unwrap()[i].saturating_sub(t0);
-            rect.left() + rect.width() * (t as f32 / span as f32).clamp(0.0, 1.0)
-        }
-        None => rect.left() + rect.width() * i as f32 / (n - 1) as f32,
+        Some((t0, span)) => match timestamps_ms.and_then(|ts| ts.get(i)) {
+            Some(stamp) => {
+                let t = stamp.saturating_sub(t0);
+                rect.left() + rect.width() * (t as f32 / span as f32).clamp(0.0, 1.0)
+            }
+            None => even(i, n),
+        },
+        None => even(i, n),
     };
     for s in series {
         let n = s.samples.len();
@@ -270,8 +280,7 @@ pub fn chart_multi(
         let frac = ((pos.x - rect.left()) / rect.width()).clamp(0.0, 1.0);
         // Time-proportional x: map the pointer TIME back to the nearest
         // sample — even-spacing math skips across sampling gaps.
-        let time_idx = t_span.map(|(t0, span)| {
-            let ts = timestamps_ms.unwrap();
+        let time_idx = t_span.zip(timestamps_ms).map(|((t0, span), ts)| {
             let tq = (t0 as f32 + frac * span as f32) as u64;
             ts.partition_point(|&t| t < tq).saturating_sub(1)
         });
@@ -304,6 +313,51 @@ pub fn chart_multi(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A series longer than the shared timestamp slice must still paint.
+    ///
+    /// Every Performance extractor maps over the same window, so today the two
+    /// always match — but they desynchronized once before
+    /// (`performance::tests::series_extractors_stay_aligned_with_window`), and
+    /// back then this code indexed the timestamps by series index. In the
+    /// paint path that is not a wrong x position, it is a panic: the task
+    /// manager disappears while the user is looking at it.
+    #[test]
+    fn a_series_longer_than_its_timestamps_degrades_instead_of_panicking() {
+        let ctx = egui::Context::default();
+        let stamps: Vec<u64> = (0..4).map(|i| 1_000 + i * 250).collect();
+        let paint = |samples: Vec<f64>| {
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        Pos2::ZERO,
+                        egui::vec2(400.0, 200.0),
+                    )),
+                    ..Default::default()
+                },
+                |ui| {
+                    chart_multi(
+                        ui,
+                        Vec2::new(320.0, 120.0),
+                        &[MultiSeries {
+                            samples: samples.clone(),
+                            color: Color32::BLUE,
+                        }],
+                        100.0,
+                        Some(&stamps),
+                    );
+                },
+            );
+            // Nothing paints this frame to a surface, so the font-atlas delta
+            // has to be dropped explicitly.
+            output.textures_delta.clear();
+            output.shapes.len()
+        };
+        // Ten samples against four timestamps, then the reverse. Returning at
+        // all — rather than unwinding out of the paint path — is the assertion.
+        assert!(paint((0..10).map(|i| f64::from(i) * 7.0).collect()) > 0);
+        assert!(paint(vec![1.0, 2.0]) > 0);
+    }
 
     #[test]
     fn sparkline_percentage_and_raw_rate_scales_are_distinct() {

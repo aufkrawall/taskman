@@ -54,6 +54,24 @@ impl TelemetryDemand {
             .union(Self::NET_ADAPTER_RATE)
             .union(Self::TOKEN_SECURITY)
     }
+
+    /// Every provider at once.
+    ///
+    /// Not a UI state — no page wants all of this — but exactly what a
+    /// diagnostic run must ask for. `--selfcheck` used to sample at
+    /// [`Self::core`] and then report `"gpus":[]`, which reads as "this
+    /// machine has no GPU" when it actually means "the GPU providers were
+    /// never switched on". Keep this in sync when a bit is added; the unit
+    /// test below pins that.
+    pub fn all() -> Self {
+        Self::core()
+            .union(Self::DISK_RATE)
+            .union(Self::PROCESS_NET)
+            .union(Self::GPU_ADAPTER)
+            .union(Self::PROCESS_GPU)
+            .union(Self::PROCESS_GPU_MEMORY)
+            .union(Self::CPU_SPEED)
+    }
 }
 
 #[cfg(test)]
@@ -79,5 +97,29 @@ mod tests {
                 | TelemetryDemand::PROCESS_GPU.bits()
         );
         assert_eq!(TelemetryDemand::from_bits(both.bits()), both);
+    }
+
+    /// `all()` must cover every declared bit. A provider added without being
+    /// listed there silently drops out of `--selfcheck`, which is exactly how
+    /// the GPU providers went unexercised by the headless smoke test.
+    #[test]
+    fn all_contains_every_declared_bit() {
+        let all = TelemetryDemand::all();
+        for (name, bit) in [
+            ("CORE_PROCESS", TelemetryDemand::CORE_PROCESS),
+            ("DISK_RATE", TelemetryDemand::DISK_RATE),
+            ("NET_ADAPTER_RATE", TelemetryDemand::NET_ADAPTER_RATE),
+            ("PROCESS_NET", TelemetryDemand::PROCESS_NET),
+            ("GPU_ADAPTER", TelemetryDemand::GPU_ADAPTER),
+            ("PROCESS_GPU", TelemetryDemand::PROCESS_GPU),
+            ("PROCESS_GPU_MEMORY", TelemetryDemand::PROCESS_GPU_MEMORY),
+            ("TOKEN_SECURITY", TelemetryDemand::TOKEN_SECURITY),
+            ("CPU_SPEED", TelemetryDemand::CPU_SPEED),
+        ] {
+            assert!(all.wants(bit), "all() is missing {name}");
+        }
+        // Every bit and nothing beyond the declared ones.
+        assert_eq!(all.bits().count_ones(), 9);
+        assert!(all.any_gpu());
     }
 }

@@ -72,7 +72,7 @@
 - No enforced file-size ceiling; keep modules focused like the existing tab
   modules.
 - Missing telemetry must render as unavailable ("—"/"Unknown"), NEVER as a
-  fabricated zero/false (core product invariant from implement.md §31).
+  fabricated zero/false (core product invariant).
 - Treat logs, dumps, captures, and user data as sensitive; never commit
   secrets, dumps, logs, or large generated artifacts (`dist/`, `target/`,
   `*.png` are gitignored).

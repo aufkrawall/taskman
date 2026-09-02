@@ -1,5 +1,81 @@
 # Recent Activity
 
+## 2026-09-02 — full-repository audit: what the smoke test never looked at
+
+A whole-tree audit (source, tests, gates, release artifacts). The workspace
+was already clean under `python build.py --check` and the shipped binaries
+already carry ASLR/DEP/CFG with no build-machine paths in them, so the
+findings are about coverage and lifetime, not about broken features.
+
+### `--selfcheck` was sampling with the Processes page's demand
+
+`selfcheck::run` built a collector and never called `set_demand`, so it ran at
+the sampler's default `TelemetryDemand::core()` — CORE_PROCESS,
+NET_ADAPTER_RATE, TOKEN_SECURITY. Everything else is demand-gated, and DXGI
+enumeration is skipped outright until `demand.any_gpu()` (`sampler.rs`), so the
+documented headless smoke test never touched the GPU, disk-rate, per-process
+network or CPU-speed providers — the four most fragile collectors in the tree.
+Worse, it *printed* the result: `"gpus":[]` on a machine with an RTX 5070,
+which reads as "no GPU found" rather than "never asked". That is the
+fabricate-nothing invariant leaking out of the UI and into the diagnostics.
+
+Now `TelemetryDemand::all()` (new, with a test pinning that it covers every
+declared bit, so a future provider cannot silently drop out of it), four ticks
+instead of three because the PDH groups are two-sample counters that also open
+lazily, and `freq_mhz` + `process_net_readings` in the summary so the CPU-speed
+and ETW paths are visible rather than merely exercised. Verified on this
+machine: `"gpus":["NVIDIA GeForce RTX 5070","Microsoft Basic Render Driver"]`,
+`freq_mhz: 4136.3`.
+
+### ShellExecuteEx handles were leaked on every non-waiting launch
+
+`process_ops::shell_execute` always sets `SEE_MASK_NOCLOSEPROCESS`, but closed
+`info.hProcess` only inside `if wait`. Four of the five call sites pass
+`wait = false`: "Run new task", "Open file location", "Open URL" and
+`relaunch_elevated`. Each one leaked a process handle for the app's lifetime,
+which also keeps the launched process's kernel object alive after it exits and
+pins its pid. Closed unconditionally now.
+
+### The engine dropped every non-`Unsupported` sampling error on the floor
+
+`run_loop` matched only `Err(TmError::Unsupported(_))`. Any other collector
+failure was discarded with no log and no state change, so a collector failing
+every tick presented as a frozen UI with a silent log. Now counted and reported
+through a 30 s rate-limited `warn!`. While there: `sample_and_publish`'s
+`count_tick` parameter had two byte-identical branches — removed, with the
+reason the counter always advances written down instead.
+
+### chart_multi indexed its timestamps by series index
+
+`timestamps_ms.unwrap()[i]`, where `i` runs over a *series*. Every caller
+happens to build both from the same window, so it is safe today — but that
+exact desynchronization already happened once
+(`performance::tests::series_extractors_stay_aligned_with_window`), and in the
+paint path the consequence is not a shifted curve, it is a panic in the middle
+of a frame. Now `.get(i)` with an even-spacing fallback, pinned by
+`a_series_longer_than_its_timestamps_degrades_instead_of_panicking`.
+
+### `bench/logs/.gitignore` never matched anything
+
+The file contained `bench/logs/*.log`. A pattern with a slash is anchored to
+the directory holding the `.gitignore`, so it resolved to
+`bench/logs/bench/logs/*.log`. That is how four cargo build logs carrying the
+build machine's home path came to be tracked, in a repo whose build driver goes
+out of its way to `--remap-path-prefix` that same string out of the shipped
+binaries. Pattern fixed to `*.log`, logs untracked (kept on disk).
+
+### `implement.md` is gone but 30 comments still cite it
+
+Deleted in `fc4ecb7c`; `repo-map.md` still listed it as a live path and
+`AGENTS.md` still cited `§31`. The `§` numbers in source comments are now
+documented as historical provenance rather than a resolvable reference.
+
+Also: four tests waited on a spawned child with a fixed `sleep` — the thing
+AGENTS.md forbids — replaced with bounded `poll_for`/`wait_until_visible`
+loops; a stray `eprintln!` on the GUI startup path became `tracing::info!`;
+and the `TextSmoothing`/`RenderMode` doc comments no longer claim that
+sub-pixel text is impossible and that `Software` means WARP.
+
 ## 2026-09-02 — the Task Manager hotkey has to work when nothing else does
 
 Audit of the Ctrl+Shift+Esc path (IFEO `Debugger` on taskmgr.exe → our exe).

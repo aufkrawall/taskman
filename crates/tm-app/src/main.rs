@@ -302,8 +302,10 @@ fn run_gui(mock: bool, args: &[String]) {
         && args
             .iter()
             .any(|argument| argument == "--minimized-to-tray");
-    if let Some(t) = &initial_tab_arg {
-        eprintln!("initial tab requested: {t}");
+    if let Some(tab) = &initial_tab_arg {
+        // Startup diagnostics belong in the log, not on a stderr the windows
+        // subsystem has no console for.
+        tracing::info!(tab = %tab, "initial tab requested");
     }
 
     let title = tm_core::i18n::tr(tm_core::i18n::K::WindowTitle).to_string();

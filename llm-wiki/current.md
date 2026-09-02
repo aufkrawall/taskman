@@ -1,12 +1,14 @@
 # Current State
 
-Last cross-checked: 2026-09-01
+Last cross-checked: 2026-09-02
 
 ## Summary
 
 Windows Task Manager-style desktop app (Rust, eframe/egui), four-crate
-workspace with a separate optional Windows core-service executable. The large audit/implementation plan in `implement.md` has been
-implemented to the extent verifiable without interactive Windows sessions.
+workspace with a separate optional Windows core-service executable. The large
+audit/implementation plan that used to live in `implement.md` (deleted in
+`fc4ecb7c`; see `repo-map.md`) was implemented to the extent verifiable without
+interactive Windows sessions.
 The 2026 parity audit (`audit.md`) is now substantially implemented across
 correctness, table interaction, Performance visuals, and advanced process
 diagnostics; remaining telemetry and accessibility work is itemized precisely
