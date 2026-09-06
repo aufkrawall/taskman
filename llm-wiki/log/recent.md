@@ -1,5 +1,62 @@
 # Recent Activity
 
+## 2026-09-06 — the tray owns a thread; unload stops lying; two tofu glyphs
+
+1. **Tray menu freezes — the modal loop left the UI thread.** The tray icon's
+   window was created on the UI thread (that is where `TrayShell::new` ran),
+   so the right-click handler — and with it `TrackPopupMenuEx` — executed
+   inside the egui/winit dispatch. A popup menu pumps a nested modal message
+   loop; running that loop inside the frame pipeline re-entered winit/egui
+   with repaints, input and tray messages in orders the framework is not
+   built for: the "cursed" freezes. The tray now lives on its own thread
+   (`tray_thread_main`): icon creation, the event handler, the menu and a
+   plain `GetMessageW` loop all run there; the UI side (`TrayShell`) is only
+   atomics and `PostThreadMessageW`. Visibility handoff protocol: the UI
+   stores the desired state BEFORE reading the thread id; the thread
+   publishes its id BEFORE its first read; both SeqCst — the two overlap
+   windows are mutually exclusive, and a lost post (queue not up yet) is
+   covered by the thread's initial apply. `TrayShell::shutdown` posts
+   `WM_QUIT` so the thread drops the icon on its own thread — the only
+   thread allowed to `DestroyWindow` it — instead of leaving a ghost icon.
+   `MAIN_HWND` (used only as the old menu's hwnd fallback) is gone. Note for
+   live testing: menu behavior is GUI-only and cannot be verified headlessly.
+2. **Module unload stopped claiming false success.** `FreeLibrary` releases
+   ONE loader reference and returns TRUE even when remaining references keep
+   the module mapped — which is the norm for implicitly-linked DLLs. The old
+   code toasted "module unloaded" anyway, then re-listed and showed the
+   module still sitting there: the feature read as broken. Now the platform
+   (`unload_process_module`) re-enumerates after the call and returns an
+   honest error ("still in use and remains loaded") when it is; the UI keeps
+   its existing list in that case instead of refreshing. Two related UI
+   fixes: a failed re-list after a SUCCESSFUL unload no longer throws the
+   dialog into its error state (unelevated GUIs cannot list an elevated
+   target's modules at all — the list just stays), and a selection whose
+   module vanished falls back to the first unloadable so the button does not
+   dead-end right after a success.
+3. **Module unload refuses Windows-owned locations again — precisely.**
+   Commit 607c9a3 had removed the `\windows\` path check (case-sensitive
+   substring) to unblock non-core DLLs; the side effect was that any
+   `C:\Windows\System32\*.dll` passed the unloadability gate, and FreeLibrary
+   actually unmapping one can tear the target down. The replacement
+   (`is_windows_owned_path_under`) refuses the Windows root directory and
+   the `system32\` (incl. DriverStore), `syswow64\` and `winsxs\` trees —
+   case-insensitive, separator-normalized, and not fooled by a prefix string
+   (`C:\Windows-esque\` stays allowed). `ext-ms-*` proxies are refused by
+   name next to `api-ms-win-*`. Everything outside those roots (app plugins,
+   hooks, overlays) remains unloadable, keeping the intent of the removal.
+4. **The GPU caption's dropdown marker was a tofu box.** `"{title} ▾, {window}"`
+   typed U+25BE, which Segoe UI Variable has no glyph for — the placeholder
+   square in the user's screenshot. The marker is now hand-painted
+   (`caption_dropdown`), the same policy as `menu.rs`'s tick: never rely on
+   font coverage for an affordance. The Details filter chip's `✕` (U+2715)
+   had the same latent problem and became `×` (U+00D7, Latin-1, in every
+   font).
+
+Verified: `python build.py --check` (fmt, clippy `-D warnings`, all
+workspace tests incl. Windows integration, fork gate) plus release build and
+`--selfcheck` (`"ok":true`). Menu, restore and unload outcome are GUI-runtime
+behavior and await user confirmation.
+
 ## 2026-09-06 — ServiceCatalog, DriverStore paths, multi-session process user/elevation & platform resolution
 
 Comprehensive resolution of platform (32-bit vs 64-bit), user name, elevation, and UAC virtualization for protected processes and service helpers across sessions (Session 0 and interactive sessions):

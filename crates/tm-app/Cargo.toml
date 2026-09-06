@@ -37,9 +37,12 @@ renderer = "wgpu primary, glow fallback; wayland+x11 enabled for native Linux"
 windows = { version = "0.62", features = [
   "Win32_Foundation",
   "Win32_System_Console",
-  # Popup-menu theming reaches two uxtheme exports by ordinal; instance
-  # coordination itself lives in tm-platform.
+  # GetCurrentThreadId lives here: the tray thread publishes its id so the
+  # UI thread can post visibility changes to it. Popup-menu theming reaches
+  # two uxtheme exports by ordinal; instance coordination itself lives in
+  # tm-platform.
   "Win32_System_LibraryLoader",
+  "Win32_System_Threading",
   "Win32_UI_WindowsAndMessaging",
 ] }
 # Only to read the HWND out of `eframe::Frame` so the native caption can be

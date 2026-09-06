@@ -574,7 +574,11 @@ impl NativeApp {
         #[cfg(target_os = "windows")]
         let tray_requested = initially_hidden || inner.shared.settings.close_to_tray;
         #[cfg(target_os = "windows")]
-        let tray = tray_requested.then(|| TrayShell::new(ctx)).flatten();
+        let tray = if tray_requested {
+            TrayShell::new(true)
+        } else {
+            None
+        };
         #[cfg(not(target_os = "windows"))]
         let _ = ctx;
         Self {
@@ -595,6 +599,10 @@ impl NativeApp {
     }
 
     fn shutdown(&mut self) {
+        #[cfg(target_os = "windows")]
+        if let Some(tray) = &mut self.tray {
+            tray.shutdown();
+        }
         if self.inner.shared.settings.save_config && self.inner.shared.settings.remember_window {
             ui_state::save();
         }
@@ -638,7 +646,6 @@ impl eframe::App for NativeApp {
                 && let RawWindowHandle::Win32(win32) = handle.as_raw()
             {
                 self.hwnd = Some(win32.hwnd.get());
-                MAIN_HWND.store(win32.hwnd.get(), std::sync::atomic::Ordering::Release);
                 // Later launches read this to tell a slow instance from a
                 // wedged one.
                 tm_platform::win::instance::publish_window(win32.hwnd.get());
@@ -651,7 +658,7 @@ impl eframe::App for NativeApp {
             let tray_enabled = self.inner.shared.settings.close_to_tray || self.hidden_to_tray;
             if tray_enabled && self.tray.is_none() && !self.tray_init_attempted {
                 self.tray_init_attempted = true;
-                self.tray = TrayShell::new(ui.ctx());
+                self.tray = TrayShell::new(tray_enabled);
             }
             if let Some(tray) = &mut self.tray {
                 tray.set_visible(tray_enabled);
@@ -780,33 +787,50 @@ fn set_popup_menu_theme(dark: bool) {
     }
 }
 
+/// Handle of the dedicated tray thread; 0 until that thread has created the
+/// icon window — which is also what gives the thread its message queue.
 #[cfg(target_os = "windows")]
-static MAIN_HWND: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
+static TRAY_THREAD_ID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+/// Visibility the tray thread should apply. The UI thread writes it, the
+/// tray thread reads it once at startup and again on every apply message.
+#[cfg(target_os = "windows")]
+static TRAY_DESIRED_VISIBLE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+/// Thread message asking the tray thread to re-apply the desired visibility.
+/// Thread messages carry no window, so it never reaches `tray_proc`.
+#[cfg(target_os = "windows")]
+const TRAY_MSG_APPLY_VISIBLE: u32 = windows::Win32::UI::WindowsAndMessaging::WM_APP + 1;
+
 #[cfg(target_os = "windows")]
 static TRAY_HWND: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
 
+/// Show the notification-area context menu.
+///
+/// This always runs on the dedicated tray thread, never on the UI thread:
+/// `TrackPopupMenuEx` pumps a modal message loop, and running that loop
+/// inside the UI thread's egui/winit dispatch re-entered the frame pipeline
+/// — repaints, input and tray messages arrived in orders the framework is
+/// not built for, which froze the app in ways that were hard to reproduce.
+/// On the tray thread the only thing a open menu blocks is a thread whose
+/// one other job (delivering tray clicks) belongs to the open menu anyway.
 #[cfg(target_os = "windows")]
 fn show_native_tray_menu() {
     use windows::Win32::Foundation::{HWND, LPARAM, POINT, WPARAM};
-    use windows::Win32::UI::Input::KeyboardAndMouse::ReleaseCapture;
     use windows::Win32::UI::WindowsAndMessaging::{
-        CreatePopupMenu, DestroyMenu, GetCursorPos, GetDesktopWindow, InsertMenuW, MF_BYPOSITION,
-        MF_STRING, PostMessageW, SetForegroundWindow, SetMenuDefaultItem, TPM_RETURNCMD,
-        TPM_RIGHTBUTTON, TrackPopupMenuEx, WM_NULL,
+        CreatePopupMenu, DestroyMenu, GetCursorPos, InsertMenuW, MF_BYPOSITION, MF_STRING,
+        PostMessageW, SetForegroundWindow, SetMenuDefaultItem, TPM_RETURNCMD, TPM_RIGHTBUTTON,
+        TrackPopupMenuEx, WM_NULL,
     };
     use windows::core::PCWSTR;
 
+    // The handler that calls this fires from the icon's own window
+    // procedure, so the icon window exists and lives on this thread —
+    // exactly what `TrackPopupMenuEx` requires of its hwnd argument.
     let tray_raw = TRAY_HWND.load(std::sync::atomic::Ordering::Acquire);
-    let hwnd = if tray_raw != 0 {
-        HWND(tray_raw as *mut _)
-    } else {
-        let hwnd_raw = MAIN_HWND.load(std::sync::atomic::Ordering::Acquire);
-        if hwnd_raw != 0 {
-            HWND(hwnd_raw as *mut _)
-        } else {
-            unsafe { GetDesktopWindow() }
-        }
-    };
+    if tray_raw == 0 {
+        return;
+    }
+    let hwnd = HWND(tray_raw as *mut _);
 
     let Ok(hmenu) = (unsafe { CreatePopupMenu() }) else {
         return;
@@ -834,7 +858,9 @@ fn show_native_tray_menu() {
         );
         let _ = SetMenuDefaultItem(hmenu, 1, 0);
 
-        let _ = ReleaseCapture();
+        // Explorer grants the foreground right for a tray click to the
+        // window registered with the icon; without this the menu would not
+        // dismiss on outside clicks.
         let _ = SetForegroundWindow(hwnd);
         let mut pt = POINT::default();
         let _ = GetCursorPos(&mut pt);
@@ -857,84 +883,150 @@ fn show_native_tray_menu() {
     }
 }
 
+/// Entry of the dedicated tray thread: build the icon here, serve tray
+/// events (whose handler runs on this thread, inside the icon's window
+/// procedure), and apply visibility changes asked for by the UI thread.
+///
+/// The icon is created on this thread on purpose: a `tray_icon::TrayIcon`
+/// window is bound to the thread that made it, so the popup menu — the only
+/// blocking part of the tray — pumps its modal loop HERE and never inside
+/// the UI thread's event dispatch.
+#[cfg(target_os = "windows")]
+fn tray_thread_main() {
+    use windows::Win32::System::Threading::GetCurrentThreadId;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        DispatchMessageW, GetMessageW, MSG, TranslateMessage,
+    };
+
+    TRAY_HANDLERS.call_once(|| {
+        tray_icon::TrayIconEvent::set_event_handler(Some(|event: tray_icon::TrayIconEvent| {
+            match event {
+                tray_icon::TrayIconEvent::Click {
+                    button: tray_icon::MouseButton::Left,
+                    button_state: tray_icon::MouseButtonState::Up,
+                    ..
+                }
+                | tray_icon::TrayIconEvent::DoubleClick {
+                    button: tray_icon::MouseButton::Left,
+                    ..
+                } => {
+                    signal_tray(TRAY_ACTION_OPEN);
+                }
+                tray_icon::TrayIconEvent::Click {
+                    button: tray_icon::MouseButton::Right,
+                    button_state: tray_icon::MouseButtonState::Up,
+                    ..
+                } => {
+                    show_native_tray_menu();
+                }
+                _ => {}
+            }
+        }));
+    });
+
+    let icon_data = icon_data();
+    let icon = match tray_icon::Icon::from_rgba(icon_data.rgba, icon_data.width, icon_data.height) {
+        Ok(icon) => icon,
+        Err(error) => {
+            tracing::warn!(%error, "cannot create tray icon image");
+            return;
+        }
+    };
+    let icon = match tray_icon::TrayIconBuilder::new()
+        .with_tooltip(tm_core::i18n::tr(tm_core::i18n::K::WindowTitle))
+        .with_icon(icon)
+        .build()
+    {
+        Ok(icon) => icon,
+        Err(error) => {
+            tracing::warn!(%error, "cannot create notification-area icon");
+            return;
+        }
+    };
+    TRAY_HWND.store(
+        icon.window_handle() as isize,
+        std::sync::atomic::Ordering::Release,
+    );
+    // Publish the thread id only after the icon window exists: the window
+    // creation is what gives this thread a message queue, and a post to a
+    // queue-less thread is lost. `TrayShell::set_visible` documents why the
+    // visibility handoff stays race-free around this publish.
+    TRAY_THREAD_ID.store(
+        unsafe { GetCurrentThreadId() },
+        std::sync::atomic::Ordering::SeqCst,
+    );
+    let _ = icon.set_visible(TRAY_DESIRED_VISIBLE.load(std::sync::atomic::Ordering::SeqCst));
+
+    let mut msg = MSG::default();
+    loop {
+        let result = unsafe { GetMessageW(&mut msg, None, 0, 0) };
+        // 0 = WM_QUIT (posted by `TrayShell::shutdown`), -1 = error.
+        if result.0 <= 0 {
+            break;
+        }
+        if msg.hwnd.0.is_null() && msg.message == TRAY_MSG_APPLY_VISIBLE {
+            let _ =
+                icon.set_visible(TRAY_DESIRED_VISIBLE.load(std::sync::atomic::Ordering::SeqCst));
+            continue;
+        }
+        let _ = unsafe { TranslateMessage(&msg) };
+        unsafe { DispatchMessageW(&msg) };
+    }
+
+    // Dropping the icon on its own thread removes the notification-area
+    // entry and destroys the window; `DestroyWindow` would fail from any
+    // other thread.
+    TRAY_HWND.store(0, std::sync::atomic::Ordering::Release);
+    TRAY_THREAD_ID.store(0, std::sync::atomic::Ordering::SeqCst);
+}
+
 #[cfg(target_os = "windows")]
 struct TrayShell {
-    icon: tray_icon::TrayIcon,
-    visible: bool,
+    /// Last value this handle pushed into `TRAY_DESIRED_VISIBLE`.
+    visible: Option<bool>,
     /// Theme the popup menu is currently themed for; `None` until applied.
     menu_dark: Option<bool>,
+    shutdown: bool,
 }
 
 #[cfg(target_os = "windows")]
 impl TrayShell {
-    fn new(ctx: &eframe::egui::Context) -> Option<Self> {
-        *tm_core::sync::lock(TRAY_CONTEXT.get_or_init(Default::default)) = Some(ctx.clone());
-        TRAY_HANDLERS.call_once(|| {
-            tray_icon::TrayIconEvent::set_event_handler(Some(|event: tray_icon::TrayIconEvent| {
-                match event {
-                    tray_icon::TrayIconEvent::Click {
-                        button: tray_icon::MouseButton::Left,
-                        button_state: tray_icon::MouseButtonState::Up,
-                        ..
-                    }
-                    | tray_icon::TrayIconEvent::DoubleClick {
-                        button: tray_icon::MouseButton::Left,
-                        ..
-                    } => {
-                        signal_tray(TRAY_ACTION_OPEN);
-                    }
-                    tray_icon::TrayIconEvent::Click {
-                        button: tray_icon::MouseButton::Right,
-                        button_state: tray_icon::MouseButtonState::Up,
-                        ..
-                    } => {
-                        show_native_tray_menu();
-                    }
-                    _ => {}
-                }
-            }));
-        });
-
-        let icon_data = icon_data();
-        let icon =
-            match tray_icon::Icon::from_rgba(icon_data.rgba, icon_data.width, icon_data.height) {
-                Ok(icon) => icon,
-                Err(error) => {
-                    tracing::warn!(%error, "cannot create tray icon image");
-                    return None;
-                }
-            };
-        match tray_icon::TrayIconBuilder::new()
-            .with_tooltip(tm_core::i18n::tr(tm_core::i18n::K::WindowTitle))
-            .with_icon(icon)
-            .build()
-        {
-            Ok(icon) => {
-                let _ = icon.set_visible(false);
-                TRAY_HWND.store(
-                    icon.window_handle() as isize,
-                    std::sync::atomic::Ordering::Release,
-                );
-                Some(Self {
-                    icon,
-                    visible: false,
-                    menu_dark: None,
-                })
-            }
-            Err(error) => {
-                tracing::warn!(%error, "cannot create notification-area icon");
-                None
-            }
-        }
+    /// Spawn the tray thread and remember what it should show first. The
+    /// icon appears as soon as the thread has created it; a failed spawn
+    /// means no tray, the same visible outcome as a failed icon creation.
+    fn new(initially_visible: bool) -> Option<Self> {
+        TRAY_DESIRED_VISIBLE.store(initially_visible, std::sync::atomic::Ordering::SeqCst);
+        std::thread::Builder::new()
+            .name("tm-tray".into())
+            .spawn(tray_thread_main)
+            .ok()?;
+        Some(Self {
+            visible: Some(initially_visible),
+            menu_dark: None,
+            shutdown: false,
+        })
     }
 
     fn set_visible(&mut self, visible: bool) {
-        if visible == self.visible {
+        if self.shutdown || self.visible == Some(visible) {
             return;
         }
-        match self.icon.set_visible(visible) {
-            Ok(()) => self.visible = visible,
-            Err(error) => tracing::warn!(%error, visible, "cannot update tray visibility"),
+        self.visible = Some(visible);
+        // Store BEFORE reading the thread id; the tray thread publishes its
+        // id BEFORE its first read of the desired state. SeqCst on both
+        // sides makes the two overlap cases mutually exclusive: if this
+        // load still sees 0, our store is ordered before the thread's first
+        // read and the initial apply already covers it; otherwise the apply
+        // message below does. A failed post (queue not up yet) is fine for
+        // the same reason.
+        TRAY_DESIRED_VISIBLE.store(visible, std::sync::atomic::Ordering::SeqCst);
+        let tid = TRAY_THREAD_ID.load(std::sync::atomic::Ordering::SeqCst);
+        if tid != 0 {
+            unsafe {
+                use windows::Win32::Foundation::{LPARAM, WPARAM};
+                use windows::Win32::UI::WindowsAndMessaging::PostThreadMessageW;
+                let _ = PostThreadMessageW(tid, TRAY_MSG_APPLY_VISIBLE, WPARAM(0), LPARAM(0));
+            }
         }
     }
 
@@ -947,6 +1039,30 @@ impl TrayShell {
         }
         set_popup_menu_theme(dark);
         self.menu_dark = Some(dark);
+    }
+
+    /// Hide the icon and end the tray thread, so a clean exit removes the
+    /// notification-area entry immediately instead of leaving a ghost icon
+    /// until Explorer notices the dead process. The thread drops the icon
+    /// on its own thread, which is the only thread allowed to destroy its
+    /// window.
+    fn shutdown(&mut self) {
+        if self.shutdown {
+            return;
+        }
+        self.shutdown = true;
+        self.visible = Some(false);
+        TRAY_DESIRED_VISIBLE.store(false, std::sync::atomic::Ordering::SeqCst);
+        // Claim the id so late visibility changes cannot post anywhere, then
+        // ask the thread to quit; it still finishes any open menu first.
+        let tid = TRAY_THREAD_ID.swap(0, std::sync::atomic::Ordering::SeqCst);
+        if tid != 0 {
+            unsafe {
+                use windows::Win32::Foundation::{LPARAM, WPARAM};
+                use windows::Win32::UI::WindowsAndMessaging::{PostThreadMessageW, WM_QUIT};
+                let _ = PostThreadMessageW(tid, WM_QUIT, WPARAM(0), LPARAM(0));
+            }
+        }
     }
 }
 

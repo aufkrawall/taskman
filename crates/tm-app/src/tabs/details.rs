@@ -878,7 +878,9 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
             );
             if ui
                 .add(
-                    egui::Button::new(egui::RichText::new("✕").size(12.0).color(pal.text_dim))
+                    // `×` (U+00D7) rather than `✕`: the dingbat is missing
+                    // from several UI fonts and renders as a tofu box.
+                    egui::Button::new(egui::RichText::new("×").size(13.0).color(pal.text_dim))
                         .frame(false),
                 )
                 .clicked()

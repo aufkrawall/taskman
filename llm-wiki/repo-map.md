@@ -65,8 +65,11 @@ platform boundary (`tm-core` ← `tm-platform` ← `tm-app` / `tm-service`):
 - `crates/tm-app`
   - eframe GUI. `main.rs` (startup sequence: args → console only for CLI →
     early logging → hand a duplicate launch to the running instance → lazy
-    engine factory; StartupTrace markers; tray shell and the cloak-restore
-    dance), `app.rs`
+    engine factory; StartupTrace markers; the tray thread — icon, event
+    handler and the native popup menu all live on a dedicated thread because
+    `TrackPopupMenuEx` pumps a modal loop that must never re-enter the
+    UI thread's egui/winit dispatch; the UI side is atomics +
+    `PostThreadMessageW` — and the cloak-restore dance), `app.rs`
     (TaskManApp: engine starts AFTER first frame, event-driven repaints,
     action executor, toast ids, demand updates per tab), `app_ui.rs`
     (chrome + dialogs incl. scrolling settings and Delete confirmation),
@@ -186,8 +189,12 @@ platform boundary (`tm-core` ← `tm-platform` ← `tm-app` / `tm-service`):
 - `crates/tm-platform/src/win/process_ops.rs` module unload — remote
   `FreeLibrary` is intentionally guarded by exact process creation timestamp,
   exact module base/path re-enumeration, same-architecture checks, and
-  system/main-image refusals. Keep it off the sampler and UI thread, and never
-  weaken the second confirmation in `tabs/modules.rs`.
+  system/main-image refusals; a released-but-still-mapped module is an ERROR
+  (never a success — the UI's list stays put so the outcome reads true).
+  `is_windows_owned_path_under` refuses the Windows root and its
+  system32/syswow64/winsxs trees regardless of casing. Keep it off the
+  sampler and UI thread, and never weaken the second confirmation in
+  `tabs/modules.rs`.
 
 ## Test Matrix
 

@@ -165,11 +165,20 @@ fn begin_unload(app: &TaskManApp, state: &mut State, module: ProcessModule, ctx:
             );
             let message = match result {
                 Ok(()) => {
-                    *tm_core::sync::lock(&load) =
-                        match actions.list_process_modules(identity.pid, identity.start_epoch_s) {
-                            Ok(modules) => LoadState::Ready(modules),
-                            Err(error) => LoadState::Error(error.to_string()),
-                        };
+                    // The unload succeeded. A failed re-enumeration must not
+                    // throw the dialog into its error state — an unelevated
+                    // GUI cannot list an elevated target's modules at all —
+                    // so the previous list simply stays.
+                    match actions.list_process_modules(identity.pid, identity.start_epoch_s) {
+                        Ok(modules) => {
+                            *tm_core::sync::lock(&load) = LoadState::Ready(modules);
+                        }
+                        Err(error) => tracing::warn!(
+                            pid = identity.pid,
+                            %error,
+                            "module re-list after unload failed; keeping the previous list"
+                        ),
+                    }
                     i18n::trf(K::ModuleUnloadedMsg, &[&module_name])
                 }
                 Err(error) => i18n::trf(K::ErrMsg, &[&error.to_string()]),
@@ -241,7 +250,13 @@ pub fn dialog(app: &mut TaskManApp, ctx: &egui::Context, pal: &theme::Palette) {
     let snapshot = tm_core::sync::lock(&state.load).clone();
     let selected_module = match &snapshot {
         LoadState::Ready(modules) => {
-            if state.selected_base.is_none() {
+            // Initial preselect, and a fallback when the selection died with
+            // its module (it was just unloaded, or the target dropped it) —
+            // otherwise the unload button dead-ends right after a success.
+            let selection_alive = state
+                .selected_base
+                .is_some_and(|base| modules.iter().any(|m| m.base_address == base));
+            if !selection_alive {
                 state.selected_base = modules
                     .iter()
                     .find(|m| m.unloadable)

@@ -780,6 +780,51 @@ fn caption(ui: &mut egui::Ui, pal: &Palette, left: &str, right: &str) -> egui::R
     resp
 }
 
+/// Caption whose left label carries a "this switches" dropdown marker and
+/// then a trailing part (", 1min"). The marker is drawn, not typed: a `▾`
+/// glyph renders as a tofu box in any font that lacks it (Segoe UI Variable
+/// does), and a switchable graph's affordance must never read as a broken
+/// placeholder.
+fn caption_dropdown(ui: &mut egui::Ui, pal: &Palette, title: &str, rest: &str) -> egui::Response {
+    let (rect, resp) =
+        ui.allocate_exact_size(egui::vec2(ui.available_width(), 20.0), egui::Sense::click());
+    let resp = resp.on_hover_cursor(CursorIcon::ContextMenu);
+    let painter = ui.painter();
+    let font = FontId::proportional(11.5);
+    let title_width = painter
+        .layout_no_wrap(title.to_owned(), font.clone(), pal.text_dim)
+        .size()
+        .x;
+    let left = rect.left() + GUTTER;
+    let center_y = rect.center().y;
+    painter.text(
+        Pos2::new(left, center_y),
+        Align2::LEFT_CENTER,
+        title,
+        font.clone(),
+        pal.text_dim,
+    );
+    let marker_x = left + title_width + 5.0;
+    let s = 3.2f32;
+    painter.add(egui::Shape::convex_polygon(
+        vec![
+            Pos2::new(marker_x - s, center_y - s * 0.45),
+            Pos2::new(marker_x + s, center_y - s * 0.45),
+            Pos2::new(marker_x, center_y + s * 0.7),
+        ],
+        pal.text_dim,
+        egui::Stroke::NONE,
+    ));
+    painter.text(
+        Pos2::new(marker_x + s + 4.0, center_y),
+        Align2::LEFT_CENTER,
+        format!(", {rest}"),
+        font,
+        pal.text_dim,
+    );
+    resp
+}
+
 /// Big-value stat (label above, large number below).
 fn big_stat(ui: &mut egui::Ui, pal: &Palette, label: &str, value: &str, w: f32) {
     let (rect, _) = ui.allocate_exact_size(egui::vec2(w, 56.0), egui::Sense::hover());
@@ -1667,14 +1712,11 @@ fn gpu_page(app: &mut TaskManApp, ui: &mut egui::Ui, pal: &Palette, entry: &Reso
             engine_label(engine),
         ),
     };
-    let cap_resp = caption(
+    let cap_resp = caption_dropdown(
         ui,
         pal,
-        &format!(
-            "{title} ▾, {}",
-            window_label(app.shared.settings.graph_seconds)
-        ),
-        "100 %",
+        &title,
+        &window_label(app.shared.settings.graph_seconds),
     );
     // The menu mutates settings, so it runs once the history borrow that
     // built these series has ended — at the bottom of this function.

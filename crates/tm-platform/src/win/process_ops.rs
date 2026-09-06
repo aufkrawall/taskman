@@ -161,6 +161,9 @@ fn module_is_unloadable(name: &str, path: &str, is_main_image: bool) -> bool {
     if norm.ends_with(".exe") {
         return false;
     }
+    if norm.starts_with("api-ms-win-") || norm.starts_with("ext-ms-") {
+        return false;
+    }
     !matches!(
         norm.as_str(),
         "ntdll.dll"
@@ -169,7 +172,33 @@ fn module_is_unloadable(name: &str, path: &str, is_main_image: bool) -> bool {
             | "wow64.dll"
             | "wow64win.dll"
             | "wow64cpu.dll"
-    ) && !norm.starts_with("api-ms-win-")
+    ) && !is_windows_owned_path(path)
+}
+
+/// Modules the Windows loader owns. FreeLibrary on one of these either does
+/// nothing (references remain) or actually unmaps a DLL the target still
+/// needs — both outcomes are worse than refusing up front. Third-party DLLs
+/// (the legitimate unload targets: app plugins, hooks, overlays) live
+/// outside these roots.
+fn is_windows_owned_path(path: &str) -> bool {
+    let root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into());
+    is_windows_owned_path_under(path, &root)
+}
+
+/// The check behind [`is_windows_owned_path`], parameterized by the Windows
+/// directory so tests do not depend on the real install location.
+fn is_windows_owned_path_under(path: &str, root: &str) -> bool {
+    // Normalize separators and casing so the comparison cannot be escaped.
+    let norm = path.to_ascii_lowercase().replace('/', "\\");
+    let root = root.to_ascii_lowercase().trim_end_matches('\\').to_string();
+    let Some(rest) = norm.strip_prefix(&root).and_then(|r| r.strip_prefix('\\')) else {
+        return false;
+    };
+    // Directly under the Windows root, or in a system component directory.
+    !rest.contains('\\')
+        || rest.starts_with("system32\\")
+        || rest.starts_with("syswow64\\")
+        || rest.starts_with("winsxs\\")
 }
 
 /// Snapshot all executable modules mapped into `pid`. Tool Help can briefly
@@ -419,19 +448,22 @@ pub fn unload_process_module(
                 "target rejected the unload (module may be statically linked or pinned by the application)",
             ));
         }
-        // FreeLibrary releases one loader reference. If other references keep it
-        // mapped, that is expected behavior — not a failure.
+        // FreeLibrary releases ONE loader reference. Report honestly whether
+        // that actually unmapped the module: a "success" toast next to a
+        // module that is still listed reads as the feature being broken, and
+        // implicitly-linked DLLs keep a static reference no FreeLibrary can
+        // drop. The caller keeps its list in that case instead of refreshing
+        // it.
         let remaining = module_snapshot(pid)?;
         verify_pid_still_refers_to(pid, opened_creation)?;
         if remaining.iter().any(|candidate| {
             candidate.base_address == base_address
                 && candidate.path.eq_ignore_ascii_case(expected_path)
         }) {
-            tracing::info!(
-                pid,
-                expected_path,
-                "a loader reference was released, but remaining references keep the module mapped"
-            );
+            return Err(TmError::platform(
+                "FreeLibrary",
+                "one reference was released, but the module is still in use and remains loaded",
+            ));
         }
         Ok(())
     })();
@@ -2104,10 +2136,15 @@ mod tests {
     }
 
     #[test]
-    fn only_non_core_dlls_are_unloadable() {
+    fn third_party_dlls_outside_windows_are_unloadable() {
         assert!(module_is_unloadable(
             "plugin.dll",
             r"C:\Tools\plugin.dll",
+            false
+        ));
+        assert!(module_is_unloadable(
+            "overlay.dll",
+            r"C:\Program Files\Overlay\overlay.dll",
             false
         ));
         assert!(!module_is_unloadable(
@@ -2130,17 +2167,47 @@ mod tests {
             r"C:\Windows\System32\api-ms-win-core-file-l1-1-0.dll",
             false
         ));
-        assert!(module_is_unloadable(
-            "vendor.dll",
-            r"C:\Windows\System32\vendor.dll",
-            false
-        ));
-        assert!(module_is_unloadable(
-            "component.dll",
-            r"C:\Windows\WinSxS\component.dll",
+        assert!(!module_is_unloadable(
+            "ext-ms-win-shell-shell32-l1-2-0.dll",
+            r"C:\Tools\ext-ms-win-shell-shell32-l1-2-0.dll",
             false
         ));
         assert!(!module_is_unloadable("unknown.dll", "", false));
+    }
+
+    #[test]
+    fn windows_owned_locations_refuse_every_module() {
+        // Root-independent: the same verdicts must hold for any install
+        // location of the Windows directory.
+        let root = r"C:\Win11";
+        assert!(is_windows_owned_path_under(
+            r"C:\Win11\system32\a.dll",
+            root
+        ));
+        assert!(is_windows_owned_path_under(
+            r"C:\Win11/System32/a.dll",
+            root
+        ));
+        assert!(is_windows_owned_path_under(
+            r"C:\WIN11\SYSWOW64\a.dll",
+            root
+        ));
+        assert!(is_windows_owned_path_under(
+            r"C:\Win11\WinSxS\amd64_x\a.dll",
+            root
+        ));
+        assert!(is_windows_owned_path_under(
+            r"C:\Win11\system32\driverstore\x\y.dll",
+            root
+        ));
+        assert!(is_windows_owned_path_under(r"C:\Win11\direct.dll", root));
+        assert!(!is_windows_owned_path_under(r"C:\Tools\a.dll", root));
+        // A directory that merely starts with the same text is not under it.
+        assert!(!is_windows_owned_path_under(r"C:\Win11-ish\a.dll", root));
+        assert!(!is_windows_owned_path_under(
+            r"C:\Windows\System32\a.dll",
+            root
+        ));
     }
 
     #[test]

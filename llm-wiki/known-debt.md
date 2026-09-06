@@ -119,8 +119,10 @@ items across Phases 2–6. The following concrete gaps remain:
 
 The new Modules inspector is deliberately on-demand and Windows-only. Its
 unload command supports only same-architecture third-party DLLs and refuses
-the main image, Windows-path modules, critical loader modules, cross-bitness
-targets, and TaskMan itself. Broader injection would add risk without useful
+the main image, Windows-owned locations (the Windows root and its
+system32/syswow64/winsxs trees, DriverStore included), critical loader
+modules, `api-ms-win-*`/`ext-ms-*` proxies, cross-bitness targets, and
+TaskMan itself. Broader injection would add risk without useful
 Task-Manager parity and is not planned.
 
 ## Core-service production hardening still outstanding
