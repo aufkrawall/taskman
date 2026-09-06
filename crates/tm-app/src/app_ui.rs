@@ -1042,12 +1042,23 @@ pub fn process_end_dialog(app: &mut TaskManApp, ctx: &egui::Context) {
                 }
             }
             ui.add_space(10.0);
+            let pal = crate::theme::palette_ctx(ctx);
             ui.horizontal(|ui| {
                 if ui.button(i18n::tr(K::Cancel)).clicked() {
                     decision = Some(false);
                 }
-                if ui.button(i18n::tr(K::EndTask)).clicked() {
+                let end_btn = egui::Button::new(
+                    egui::RichText::new(i18n::tr(K::EndTask))
+                        .color(pal.accent_text)
+                        .strong(),
+                )
+                .fill(pal.accent);
+                let resp = ui.add(end_btn);
+                if resp.clicked() {
                     decision = Some(true);
+                }
+                if ui.memory(|m| m.focused().is_none()) {
+                    resp.request_focus();
                 }
             });
         });

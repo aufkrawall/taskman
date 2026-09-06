@@ -105,10 +105,10 @@ pub fn core_chart(
     color: Color32,
 ) -> Response {
     let (rect, response) = ui.allocate_exact_size(size, egui::Sense::hover());
-    let painter = ui.painter_at(rect.expand(1.0));
     let pal = crate::theme::palette(ui);
+    let painter = ui.painter_at(rect).with_clip_rect(rect);
 
-    painter.rect_filled(rect, 0.0, pal.window_bg);
+    painter.rect_filled(rect, 4.0, pal.card_bg);
     // Quarter gridlines.
     for k in 1..4 {
         let y = rect.top() + rect.height() * k as f32 / 4.0;
@@ -126,7 +126,7 @@ pub fn core_chart(
     }
     painter.rect_stroke(
         rect,
-        0.0,
+        4.0,
         Stroke::new(1.0, pal.stroke),
         egui::StrokeKind::Inside,
     );
@@ -191,10 +191,10 @@ pub fn chart_multi(
     timestamps_ms: Option<&[u64]>,
 ) -> Response {
     let (rect, response) = ui.allocate_exact_size(size, egui::Sense::hover());
-    let painter = ui.painter_at(rect.expand(1.0));
     let pal = crate::theme::palette(ui);
+    let painter = ui.painter_at(rect).with_clip_rect(rect);
 
-    painter.rect_filled(rect, 0.0, pal.window_bg);
+    painter.rect_filled(rect, 4.0, pal.card_bg);
     for k in 1..4 {
         let y = rect.top() + rect.height() * k as f32 / 4.0;
         painter.line_segment(
@@ -211,7 +211,7 @@ pub fn chart_multi(
     }
     painter.rect_stroke(
         rect,
-        0.0,
+        4.0,
         Stroke::new(1.0, pal.stroke),
         egui::StrokeKind::Inside,
     );

@@ -204,6 +204,7 @@ impl Sampler {
         // Static hardware facts: SMBIOS parsing + CPUID topology probing.
         self.cpu_static = Some(cpu_info::CpuStatic::probe());
         self.ram_static = Some(memory_info::probe());
+        process_ops::enable_debug_privilege();
         // `new_with_refreshed_list` already performs the first enumeration.
         let users = Users::new_with_refreshed_list();
         self.user_names = build_user_map(&users);
@@ -552,8 +553,6 @@ impl Sampler {
             // both straight from the kernel's accumulators (cpu_load.rs).
             let pc = load.as_ref().and_then(|l| l.procs.get(&pid_u));
             entry.cpu_pct = pc.map_or(0.0, |c| c.pct);
-            entry.mem_bytes = p.memory();
-            entry.commit_bytes = Some(p.virtual_memory());
             // sysinfo reads the creation time through a process handle and
             // yields 0 when it cannot open one — about half the process list
             // for an unelevated session. A `Some(0)` is a FABRICATED identity
@@ -566,6 +565,23 @@ impl Sampler {
             } else {
                 self.cpu_load.start_epoch_of(pid_u)
             };
+            entry.mem_bytes = p.memory();
+            if entry.mem_bytes == 0
+                && let Some(ws) = self.cpu_load.working_set_of(pid_u, entry.start_epoch_s)
+            {
+                entry.mem_bytes = ws;
+            }
+            let virt = p.virtual_memory();
+            if virt > 0 {
+                entry.commit_bytes = Some(virt);
+            } else if let Some(commit) = self.cpu_load.commit_of(pid_u, entry.start_epoch_s) {
+                entry.commit_bytes = Some(commit);
+            } else {
+                entry.commit_bytes = Some(0);
+            }
+            entry.peak_mem_bytes = self
+                .cpu_load
+                .peak_working_set_of(pid_u, entry.start_epoch_s);
             entry.cpu_time_s = pc.map(|c| c.total_time_100ns as f64 / 10_000_000.0);
             entry.disk_read_bps = du.read_bytes as f64 / interval_s;
             entry.disk_write_bps = du.written_bytes as f64 / interval_s;
@@ -573,7 +589,10 @@ impl Sampler {
             entry.disk_write_total = du.total_written_bytes;
             entry.has_window = has_window;
             entry.exe_path = exe_owned;
-            entry.threads = thread_counts.get(&pid_u).copied();
+            entry.threads = thread_counts
+                .get(&pid_u)
+                .copied()
+                .or_else(|| self.cpu_load.thread_count_of(pid_u, entry.start_epoch_s));
             processes.push(entry);
         }
 
@@ -595,8 +614,33 @@ impl Sampler {
             {
                 p.priority = process_ops::priority_class_from_base(base);
             }
-            p.handles = a.handles;
+            p.handles = a
+                .handles
+                .or_else(|| self.cpu_load.handle_count_of(p.pid, p.start_epoch_s));
             p.wow64 = a.wow64;
+            if p.wow64.is_none() {
+                if p.pid == 0
+                    || p.pid == 4
+                    || matches!(
+                        p.name.as_str(),
+                        "[System Process]"
+                            | "System"
+                            | "Secure System"
+                            | "Registry"
+                            | "Memory Compression"
+                    )
+                {
+                    p.wow64 = Some(false);
+                } else if let Some(exe_path) = &p.exe_path {
+                    p.wow64 = process_ops::pe_is_wow64(exe_path);
+                } else if p.name.to_ascii_lowercase().ends_with(".exe") {
+                    let sys32_candidate =
+                        std::path::PathBuf::from(r"C:\Windows\System32").join(&p.name);
+                    if sys32_candidate.is_file() {
+                        p.wow64 = process_ops::pe_is_wow64(&sys32_candidate);
+                    }
+                }
+            }
             p.elevated = a.elevated;
             p.uac_virtualization = a.uac_virtualization;
             p.power_throttled = a.power_throttled;
@@ -617,6 +661,42 @@ impl Sampler {
                     .or_else(|| self.cpu_load.session_id_of(p.pid, p.start_epoch_s));
                 if session == Some(0) {
                     p.user = Some("SYSTEM".to_string());
+                }
+            }
+
+            // If token_security could not query elevation (e.g. kernel processes,
+            // protected processes or session 0 services), infer it from identity:
+            // Kernel pseudo-processes and Session 0 / SYSTEM services always run
+            // with full system elevation and no UAC virtualization.
+            if p.elevated.is_none() {
+                let is_kernel_or_system = p.pid == 0
+                    || p.pid == 4
+                    || matches!(
+                        p.name.as_str(),
+                        "[System Process]"
+                            | "System"
+                            | "Secure System"
+                            | "Registry"
+                            | "Memory Compression"
+                            | "smss.exe"
+                            | "csrss.exe"
+                            | "wininit.exe"
+                            | "services.exe"
+                    );
+                let session = a
+                    .session_id
+                    .or_else(|| self.cpu_load.session_id_of(p.pid, p.start_epoch_s));
+                let is_service_account = p.user.as_deref().is_some_and(|u| {
+                    u.eq_ignore_ascii_case("SYSTEM")
+                        || u.eq_ignore_ascii_case("LOCAL SERVICE")
+                        || u.eq_ignore_ascii_case("NETWORK SERVICE")
+                });
+
+                if is_kernel_or_system || session == Some(0) || is_service_account {
+                    p.elevated = Some(true);
+                    if p.uac_virtualization.is_none() {
+                        p.uac_virtualization = Some(tm_core::model::UacVirtualization::NotAllowed);
+                    }
                 }
             }
         }

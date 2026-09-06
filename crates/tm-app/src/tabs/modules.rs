@@ -398,7 +398,7 @@ pub fn dialog(app: &mut TaskManApp, ctx: &egui::Context, pal: &theme::Palette) {
                                     pal.text,
                                 );
                                 table.text_cell(ui, rect, 3, &module.path, pal, true);
-                                if response.clicked() {
+                                if response.clicked() || response.secondary_clicked() {
                                     state.selected_base = Some(module.base_address);
                                 }
                                 menu::context_menu(&response, |ui| {

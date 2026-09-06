@@ -40,6 +40,7 @@ windows = { version = "0.62", features = [
   # Popup-menu theming reaches two uxtheme exports by ordinal; instance
   # coordination itself lives in tm-platform.
   "Win32_System_LibraryLoader",
+  "Win32_UI_WindowsAndMessaging",
 ] }
 # Only to read the HWND out of `eframe::Frame` so the native caption can be
 # painted in the app's colors. Pinned to the version eframe itself uses --

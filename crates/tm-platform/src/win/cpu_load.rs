@@ -91,6 +91,11 @@ struct ProcRaw {
     /// for EVERY process, including the protected ones `OpenProcess` refuses
     /// — which is what makes session 0 identifiable without a handle.
     session_id: u32,
+    handle_count: u32,
+    thread_count: u32,
+    working_set: u64,
+    peak_working_set: u64,
+    commit: u64,
     /// Image base name from the kernel table (empty when unparseable).
     /// Remembered for processes that exit so their CPU churn can be named.
     name: Box<str>,
@@ -219,6 +224,61 @@ impl CpuLoadAccountant {
             return None;
         }
         Some(raw.session_id)
+    }
+
+    /// Process working set (in bytes) from the newest native process table.
+    pub fn working_set_of(&self, pid: u32, start_epoch_s: Option<i64>) -> Option<u64> {
+        let raw = self.prev.as_ref()?.procs.get(&pid)?;
+        if let Some(expected) = start_epoch_s
+            && filetime_to_unix_seconds(raw.create_time) != Some(expected)
+        {
+            return None;
+        }
+        Some(raw.working_set)
+    }
+
+    /// Process peak working set (in bytes) from the newest native process table.
+    pub fn peak_working_set_of(&self, pid: u32, start_epoch_s: Option<i64>) -> Option<u64> {
+        let raw = self.prev.as_ref()?.procs.get(&pid)?;
+        if let Some(expected) = start_epoch_s
+            && filetime_to_unix_seconds(raw.create_time) != Some(expected)
+        {
+            return None;
+        }
+        Some(raw.peak_working_set)
+    }
+
+    /// Process commit size (PagefileUsage / private bytes) from the newest native process table.
+    pub fn commit_of(&self, pid: u32, start_epoch_s: Option<i64>) -> Option<u64> {
+        let raw = self.prev.as_ref()?.procs.get(&pid)?;
+        if let Some(expected) = start_epoch_s
+            && filetime_to_unix_seconds(raw.create_time) != Some(expected)
+        {
+            return None;
+        }
+        Some(raw.commit)
+    }
+
+    /// Process handle count from the newest native process table.
+    pub fn handle_count_of(&self, pid: u32, start_epoch_s: Option<i64>) -> Option<u32> {
+        let raw = self.prev.as_ref()?.procs.get(&pid)?;
+        if let Some(expected) = start_epoch_s
+            && filetime_to_unix_seconds(raw.create_time) != Some(expected)
+        {
+            return None;
+        }
+        Some(raw.handle_count)
+    }
+
+    /// Process thread count from the newest native process table.
+    pub fn thread_count_of(&self, pid: u32, start_epoch_s: Option<i64>) -> Option<u32> {
+        let raw = self.prev.as_ref()?.procs.get(&pid)?;
+        if let Some(expected) = start_epoch_s
+            && filetime_to_unix_seconds(raw.create_time) != Some(expected)
+        {
+            return None;
+        }
+        Some(raw.thread_count)
     }
 
     /// Whether the newest native process table identifies this exact process
@@ -395,12 +455,18 @@ impl CpuLoadAccountant {
             let pid = read_usize(buf, pos + off.pid) as u32;
             let base_priority = read_u32(buf, pos + off.base_priority) as i32;
             let session_id = read_u32(buf, pos + off.session_id);
+            let handle_count = read_u32(buf, pos + off.handle_count);
+            let peak_working_set = read_usize(buf, pos + off.peak_working_set) as u64;
+            let working_set = read_usize(buf, pos + off.working_set) as u64;
+            let commit = read_usize(buf, pos + off.commit) as u64;
             let buf_base = buf.as_ptr() as usize;
             let name = parse_image_name(buf, buf_base, pos, written, &off);
 
-            // pid 0 is the Idle process whose "CPU time" is just idle time.
-            if pid != 0 && kernel >= 0 && user >= 0 {
-                if process_suspended(buf, pos, record_end, number_of_threads) == Some(true)
+            // Record telemetry for all processes. PID 0 is Idle (its CPU delta is
+            // skipped in build_sample, but working set/commit/threads are valid).
+            if kernel >= 0 && user >= 0 {
+                if pid != 0
+                    && process_suspended(buf, pos, record_end, number_of_threads) == Some(true)
                     && let Some(start_epoch_s) = filetime_to_unix_seconds(create_time)
                 {
                     suspended.insert(pid, start_epoch_s);
@@ -413,6 +479,11 @@ impl CpuLoadAccountant {
                         user,
                         base_priority,
                         session_id,
+                        handle_count,
+                        thread_count: number_of_threads,
+                        working_set,
+                        peak_working_set,
+                        commit,
                         name,
                     },
                 );
@@ -486,6 +557,10 @@ struct Offsets {
     image_name_buffer: usize,
     base_priority: usize,
     session_id: usize,
+    handle_count: usize,
+    peak_working_set: usize,
+    working_set: usize,
+    commit: usize,
     min_size: usize,
 }
 
@@ -497,31 +572,39 @@ impl Offsets {
             // CreateTime@32, UserTime@40, KernelTime@48,
             // ImageName@56 (UNICODE_STRING, 16 B: Length@56, Buffer@64),
             // BasePriority@72, UniqueProcessId@80, InheritedFrom@88,
-            // HandleCount@96, SessionId@100.
+            // HandleCount@96, SessionId@100, PeakWorkingSet@136, WorkingSet@144,
+            // PagefileUsage@184.
             Self {
                 create_time: 32,
                 user_time: 40,
                 kernel_time: 48,
-                pid: 80,
                 image_name: 56,
                 image_name_buffer: 64,
                 base_priority: 72,
+                pid: 80,
+                handle_count: 96,
                 session_id: 100,
-                min_size: 104,
+                peak_working_set: 136,
+                working_set: 144,
+                commit: 184,
+                min_size: 192,
             }
         } else {
-            // Same order, pointer-sized handles/pointers (UNICODE_STRING is
-            // 8 B: Length@56, Buffer@60, so BasePriority@64).
+            // Same order, pointer-sized handles/pointers.
             Self {
                 create_time: 32,
                 user_time: 40,
                 kernel_time: 48,
-                pid: 68,
                 image_name: 56,
                 image_name_buffer: 60,
                 base_priority: 64,
+                pid: 68,
+                handle_count: 76,
                 session_id: 80,
-                min_size: 84,
+                peak_working_set: 100,
+                working_set: 104,
+                commit: 124,
+                min_size: 132,
             }
         }
     }
@@ -572,6 +655,16 @@ fn build_sample(
     // Sum of all in-window CPU time chargeable to LIVE processes.
     let mut accounted_100ns: u64 = 0;
     for (&pid, cur) in procs {
+        if pid == 0 {
+            out.insert(
+                pid,
+                ProcCpu {
+                    pct: 0.0,
+                    total_time_100ns: 0,
+                },
+            );
+            continue;
+        }
         let total_now = nonneg(cur.kernel) + nonneg(cur.user);
         let in_window = match prev.procs.get(&pid) {
             // Same identity: the delta since the previous sample.
@@ -604,6 +697,9 @@ fn build_sample(
     let mut exited_count: u32 = 0;
     let mut exited_by_name: HashMap<&str, u32> = HashMap::new();
     for (pid, p) in &prev.procs {
+        if *pid == 0 {
+            continue;
+        }
         let gone = procs
             .get(pid)
             .is_none_or(|c| c.create_time != p.create_time);
@@ -910,6 +1006,10 @@ mod tests {
         let mut acc = CpuLoadAccountant::new();
         let procs = acc.query_procs().expect("NtQuerySystemInformation");
         for (pid, p) in &procs {
+            if *pid == 0 {
+                assert_eq!(p.base_priority, 0, "pid 0 is the idle process");
+                continue;
+            }
             assert!(
                 (1..=31).contains(&p.base_priority),
                 "pid {pid} ({}) reports base priority {}",
@@ -1037,57 +1137,31 @@ mod tests {
         assert_eq!(pct, 100.0);
     }
 
+    fn proc_raw(create_time: i64, kernel: i64, user: i64, name: &str) -> ProcRaw {
+        ProcRaw {
+            create_time,
+            kernel,
+            user,
+            base_priority: 8,
+            session_id: 0,
+            handle_count: 0,
+            thread_count: 1,
+            working_set: 0,
+            peak_working_set: 0,
+            commit: 0,
+            name: name.into(),
+        }
+    }
+
     #[test]
     fn build_sample_maps_processes_and_excludes_pid_reuse_ghosts() {
         let prev_procs: HashMap<u32, ProcRaw> = HashMap::from([
-            (
-                100,
-                ProcRaw {
-                    create_time: 111,
-                    kernel: 1e7 as i64,
-                    user: 1e7 as i64,
-                    base_priority: 8,
-                    session_id: 0,
-                    name: "stay.exe".into(),
-                },
-            ),
-            // Same pid, different identity later → the old one exited, the
-            // new one is credited from its creation.
-            (
-                200,
-                ProcRaw {
-                    create_time: 222,
-                    kernel: 5e7 as i64,
-                    user: 0,
-                    base_priority: 8,
-                    session_id: 0,
-                    name: "old.exe".into(),
-                },
-            ),
+            (100, proc_raw(111, 1e7 as i64, 1e7 as i64, "stay.exe")),
+            (200, proc_raw(222, 5e7 as i64, 0, "old.exe")),
         ]);
         let cur_procs: HashMap<u32, ProcRaw> = HashMap::from([
-            (
-                100,
-                ProcRaw {
-                    create_time: 111,
-                    kernel: 3e7 as i64,
-                    user: 3e7 as i64,
-                    base_priority: 8,
-                    session_id: 0,
-                    name: "stay.exe".into(),
-                },
-            ),
-            (
-                200,
-                ProcRaw {
-                    create_time: 999, // reused pid
-                    kernel: 2e7 as i64,
-                    user: 0,
-                    base_priority: 8,
-                    session_id: 0,
-                    name: "new.exe".into(),
-                },
-            ),
+            (100, proc_raw(111, 3e7 as i64, 3e7 as i64, "stay.exe")),
+            (200, proc_raw(999, 2e7 as i64, 0, "new.exe")),
         ]);
         let prev = PrevSample {
             at: Instant::now(),
@@ -1126,17 +1200,7 @@ mod tests {
             procs: HashMap::new(),
         };
         // New process burned 2 full core-seconds before its first sample.
-        let cur = HashMap::from([(
-            7,
-            ProcRaw {
-                create_time: 1,
-                kernel: 1e7 as i64,
-                user: 1e7 as i64,
-                base_priority: 8,
-                session_id: 0,
-                name: "rustc.exe".into(),
-            },
-        )]);
+        let cur = HashMap::from([(7, proc_raw(1, 1e7 as i64, 1e7 as i64, "rustc.exe"))]);
         let cores = vec![core(0, 1e7 as i64, 0); 4];
         let out = build_sample(&prev, &cores, &cur, 1.0);
         assert_eq!(out.procs.get(&7).unwrap().pct, 50.0);
@@ -1153,41 +1217,11 @@ mod tests {
             at: Instant::now(),
             cores: vec![core(0, 0, 0)],
             procs: HashMap::from([
-                (
-                    10,
-                    ProcRaw {
-                        create_time: 1,
-                        kernel: 0,
-                        user: 0,
-                        base_priority: 8,
-                        session_id: 0,
-                        name: "rustc.exe".into(),
-                    },
-                ),
-                (
-                    11,
-                    ProcRaw {
-                        create_time: 1,
-                        kernel: 0,
-                        user: 0,
-                        base_priority: 8,
-                        session_id: 0,
-                        name: "rustc.exe".into(),
-                    },
-                ),
+                (10, proc_raw(1, 0, 0, "rustc.exe")),
+                (11, proc_raw(1, 0, 0, "rustc.exe")),
             ]),
         };
-        let cur = HashMap::from([(
-            12,
-            ProcRaw {
-                create_time: 1,
-                kernel: 0.2e7 as i64,
-                user: 0,
-                base_priority: 8,
-                session_id: 0,
-                name: "cargo.exe".into(),
-            },
-        )]);
+        let cur = HashMap::from([(12, proc_raw(1, 0.2e7 as i64, 0, "cargo.exe"))]);
         let cores = vec![core(0, 1e7 as i64, 0)];
         let out = build_sample(&prev, &cores, &cur, 1.0);
         assert_eq!(out.procs.get(&12).unwrap().pct, 20.0);
@@ -1255,5 +1289,27 @@ mod tests {
             .copy_from_slice(&off.min_size.to_ne_bytes());
         assert_eq!(&*parse_image_name(&bad, base, 0, bw, &off), "");
         let _ = rec; // rec cloned into bad above
+    }
+
+    #[test]
+    fn spi_offsets_match_struct_layout() {
+        let off = Offsets::get();
+        assert_eq!(
+            off.working_set,
+            std::mem::offset_of!(SYSTEM_PROCESS_INFORMATION, WorkingSetSize)
+        );
+        assert_eq!(
+            off.peak_working_set,
+            std::mem::offset_of!(SYSTEM_PROCESS_INFORMATION, PeakWorkingSetSize)
+        );
+        assert_eq!(
+            off.commit,
+            std::mem::offset_of!(SYSTEM_PROCESS_INFORMATION, PagefileUsage)
+        );
+        assert_eq!(
+            off.handle_count,
+            std::mem::offset_of!(SYSTEM_PROCESS_INFORMATION, HandleCount)
+        );
+        assert!(off.min_size <= std::mem::size_of::<SYSTEM_PROCESS_INFORMATION>());
     }
 }

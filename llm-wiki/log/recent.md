@@ -1,5 +1,21 @@
 # Recent Activity
 
+## 2026-09-06 — UI polish, system process telemetry, tray responsiveness & app icon
+
+Seven targeted fixes and polish items across `tm-app` and `tm-platform`:
+
+1. **Tray context menu responsiveness**: Replaced `tray-icon`'s internal menu and 15ms `Shell_NotifyIconGetRect` timer with native Win32 `TrackPopupMenuEx(TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_NONOTIFY)` and `PostMessageW(WM_NULL)`, eliminating cursor hover lag and slow opening.
+2. **Delete confirmation dialog**: Styled "End task" button with accent fill and requested default focus so it is both visually and interactively preselected.
+3. **Protected/system process telemetry on Details page**:
+   - `cpu_load.rs`: Extracted `working_set`, `peak_working_set`, `commit`, `handle_count`, and `thread_count` from `SYSTEM_PROCESS_INFORMATION`, which queries all processes including PID 0, PID 4, and protected processes without opening handles.
+   - `sampler.rs`: Falls back to kernel process table when `sysinfo` reports 0 for memory, commit, handles, and threads.
+   - `process_ops.rs`: Added `pe_is_wow64` inspecting executable PE `Machine` header for 32 vs 64-bit detection when handles cannot be opened; native 64-bit kernel processes (PID 0, 4, etc.) report `Some(false)`.
+   - Enabled `SeDebugPrivilege` at startup and attributed kernel/Session 0/SYSTEM service processes as elevated.
+4. **Performance graph separation**: Styled performance charts and core charts with `pal.card_bg`, 4px corner radius, outer border stroke, and clipped painters.
+5. **GPU engine selection**: Standard engines (`3D`, `Copy`, `VideoEncode`, `VideoDecode`, `Compute`) are always included in the GPU graph dropdown and context menu, allowing monitoring of idle/spiking encoders.
+6. **Module unload button**: Removed overly restrictive `\windows\` path check from `module_is_unloadable`, allowing non-core DLLs to be unloaded with proper user confirmation.
+7. **Application icon**: Generated Fluent-style Windows 11 task manager icon and embedded multi-resolution `.ico` and `app.res` into `taskman.exe`.
+
 ## 2026-09-02 — publish preparation: untracked captures, scrubbed history
 
 Preparing the repository for publication. `shots/` and `taskmanpngs/`

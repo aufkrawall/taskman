@@ -638,6 +638,7 @@ impl eframe::App for NativeApp {
                 && let RawWindowHandle::Win32(win32) = handle.as_raw()
             {
                 self.hwnd = Some(win32.hwnd.get());
+                MAIN_HWND.store(win32.hwnd.get(), std::sync::atomic::Ordering::Release);
                 // Later launches read this to tell a slow instance from a
                 // wedged one.
                 tm_platform::win::instance::publish_window(win32.hwnd.get());
@@ -780,6 +781,74 @@ fn set_popup_menu_theme(dark: bool) {
 }
 
 #[cfg(target_os = "windows")]
+static MAIN_HWND: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
+
+#[cfg(target_os = "windows")]
+fn show_native_tray_menu() {
+    use windows::Win32::Foundation::{HWND, LPARAM, POINT, WPARAM};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        CreatePopupMenu, DestroyMenu, GetCursorPos, GetDesktopWindow, InsertMenuW, MF_BYPOSITION,
+        MF_STRING, PostMessageW, SetForegroundWindow, SetMenuDefaultItem, TPM_NONOTIFY,
+        TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenuEx, WM_NULL,
+    };
+    use windows::core::PCWSTR;
+
+    let hwnd_raw = MAIN_HWND.load(std::sync::atomic::Ordering::Acquire);
+    let hwnd = if hwnd_raw != 0 {
+        HWND(hwnd_raw as *mut _)
+    } else {
+        unsafe { GetDesktopWindow() }
+    };
+
+    let Ok(hmenu) = (unsafe { CreatePopupMenu() }) else {
+        return;
+    };
+
+    let open_text = tm_core::i18n::tr(tm_core::i18n::K::TrayOpen);
+    let exit_text = tm_core::i18n::tr(tm_core::i18n::K::TrayExit);
+    let wide_open: Vec<u16> = open_text.encode_utf16().chain([0]).collect();
+    let wide_exit: Vec<u16> = exit_text.encode_utf16().chain([0]).collect();
+
+    unsafe {
+        let _ = InsertMenuW(
+            hmenu,
+            0,
+            MF_BYPOSITION | MF_STRING,
+            1,
+            PCWSTR(wide_open.as_ptr()),
+        );
+        let _ = InsertMenuW(
+            hmenu,
+            1,
+            MF_BYPOSITION | MF_STRING,
+            2,
+            PCWSTR(wide_exit.as_ptr()),
+        );
+        let _ = SetMenuDefaultItem(hmenu, 1, 0);
+
+        let _ = SetForegroundWindow(hwnd);
+        let mut pt = POINT::default();
+        let _ = GetCursorPos(&mut pt);
+        let cmd = TrackPopupMenuEx(
+            hmenu,
+            (TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_NONOTIFY).0,
+            pt.x,
+            pt.y,
+            hwnd,
+            None,
+        );
+        let _ = PostMessageW(Some(hwnd), WM_NULL, WPARAM(0), LPARAM(0));
+        let _ = DestroyMenu(hmenu);
+
+        match cmd.0 {
+            1 => signal_tray(TRAY_ACTION_OPEN),
+            2 => signal_tray(TRAY_ACTION_EXIT),
+            _ => {}
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
 struct TrayShell {
     icon: tray_icon::TrayIcon,
     visible: bool,
@@ -792,53 +861,31 @@ impl TrayShell {
     fn new(ctx: &eframe::egui::Context) -> Option<Self> {
         *tm_core::sync::lock(TRAY_CONTEXT.get_or_init(Default::default)) = Some(ctx.clone());
         TRAY_HANDLERS.call_once(|| {
-            tray_icon::menu::MenuEvent::set_event_handler(Some(
-                |event: tray_icon::menu::MenuEvent| match event.id.0.as_str() {
-                    "taskman-open" => signal_tray(TRAY_ACTION_OPEN),
-                    "taskman-exit" => signal_tray(TRAY_ACTION_EXIT),
-                    _ => {}
-                },
-            ));
             tray_icon::TrayIconEvent::set_event_handler(Some(|event: tray_icon::TrayIconEvent| {
-                // A SINGLE left click restores the window, like every other
-                // notification-area icon on Windows. Double click keeps
-                // working (it also emits two Click events, and reopening an
-                // already open window is a no-op). The right button belongs
-                // to the context menu, so it is deliberately not matched.
-                let opens = matches!(
-                    event,
+                match event {
                     tray_icon::TrayIconEvent::Click {
                         button: tray_icon::MouseButton::Left,
                         button_state: tray_icon::MouseButtonState::Up,
                         ..
-                    } | tray_icon::TrayIconEvent::DoubleClick {
+                    }
+                    | tray_icon::TrayIconEvent::DoubleClick {
                         button: tray_icon::MouseButton::Left,
                         ..
+                    } => {
+                        signal_tray(TRAY_ACTION_OPEN);
                     }
-                );
-                if opens {
-                    signal_tray(TRAY_ACTION_OPEN);
+                    tray_icon::TrayIconEvent::Click {
+                        button: tray_icon::MouseButton::Right,
+                        button_state: tray_icon::MouseButtonState::Up,
+                        ..
+                    } => {
+                        show_native_tray_menu();
+                    }
+                    _ => {}
                 }
             }));
         });
 
-        let menu = tray_icon::menu::Menu::new();
-        let open = tray_icon::menu::MenuItem::with_id(
-            "taskman-open",
-            tm_core::i18n::tr(tm_core::i18n::K::TrayOpen),
-            true,
-            None,
-        );
-        let exit = tray_icon::menu::MenuItem::with_id(
-            "taskman-exit",
-            tm_core::i18n::tr(tm_core::i18n::K::TrayExit),
-            true,
-            None,
-        );
-        if let Err(error) = menu.append_items(&[&open, &exit]) {
-            tracing::warn!(%error, "cannot create tray menu");
-            return None;
-        }
         let icon_data = icon_data();
         let icon =
             match tray_icon::Icon::from_rgba(icon_data.rgba, icon_data.width, icon_data.height) {
@@ -849,8 +896,6 @@ impl TrayShell {
                 }
             };
         match tray_icon::TrayIconBuilder::new()
-            .with_menu(Box::new(menu))
-            .with_menu_on_left_click(false)
             .with_tooltip(tm_core::i18n::tr(tm_core::i18n::K::WindowTitle))
             .with_icon(icon)
             .build()
@@ -983,31 +1028,11 @@ fn parse_size_arg(s: &str) -> Option<[f32; 2]> {
 
 fn icon_data() -> eframe::egui::IconData {
     const S: usize = 64;
-    let mut rgba = vec![0u8; S * S * 4];
-    let accent = [0u8, 120, 212];
-    for y in 0..S {
-        for x in 0..S {
-            let i = (y * S + x) * 4;
-            let in_chip = (16..48).contains(&x) && (16..48).contains(&y);
-            let pin_v = (24..40).contains(&x) && !(12..52).contains(&y);
-            let pin_h = (24..40).contains(&y) && !(12..52).contains(&x);
-            let color = if in_chip {
-                accent
-            } else if pin_v || pin_h {
-                [90u8, 170, 240]
-            } else {
-                [0, 0, 0]
-            };
-            rgba[i] = color[0];
-            rgba[i + 1] = color[1];
-            rgba[i + 2] = color[2];
-            rgba[i + 3] = if in_chip || pin_v || pin_h { 255 } else { 0 };
-        }
-    }
+    const RAW: &[u8] = include_bytes!("../assets/icon_64.raw");
     eframe::egui::IconData {
         width: S as u32,
         height: S as u32,
-        rgba,
+        rgba: RAW.to_vec(),
     }
 }
 

@@ -151,7 +151,6 @@ fn module_is_unloadable(name: &str, path: &str, is_main_image: bool) -> bool {
         return false;
     }
     let name = name.to_ascii_lowercase();
-    let path = path.replace('/', "\\").to_ascii_lowercase();
     !matches!(
         name.as_str(),
         "ntdll.dll"
@@ -161,7 +160,6 @@ fn module_is_unloadable(name: &str, path: &str, is_main_image: bool) -> bool {
             | "wow64win.dll"
             | "wow64cpu.dll"
     ) && !name.starts_with("api-ms-win-")
-        && !path.contains("\\windows\\")
 }
 
 /// Snapshot all executable modules mapped into `pid`. Tool Help can briefly
@@ -447,12 +445,40 @@ pub fn handle_count(pid: u32) -> Option<u32> {
 }
 
 pub fn is_wow64(pid: u32) -> Option<bool> {
+    if pid == 0 || pid == 4 {
+        return Some(false);
+    }
     unsafe {
         let h = open_process(pid, th::PROCESS_QUERY_LIMITED_INFORMATION).ok()?;
         let mut wow: windows::core::BOOL = Default::default();
         let ok = th::IsWow64Process(h, &mut wow).is_ok();
         let _ = CloseHandle(h);
         if ok { Some(wow.as_bool()) } else { None }
+    }
+}
+
+/// Determine whether an executable on disk is a 32-bit (WOW64) binary
+/// by inspecting its PE Machine header without launching or attaching to it.
+pub fn pe_is_wow64(path: &std::path::Path) -> Option<bool> {
+    use std::io::Read;
+    let mut file = std::fs::File::open(path).ok()?;
+    let mut buf = [0u8; 512];
+    let n = file.read(&mut buf).ok()?;
+    if n < 64 || buf[0] != b'M' || buf[1] != b'Z' {
+        return None;
+    }
+    let lfanew = u32::from_le_bytes(buf[0x3C..0x40].try_into().ok()?) as usize;
+    if lfanew.checked_add(6)? > n {
+        return None;
+    }
+    if &buf[lfanew..lfanew + 4] != b"PE\0\0" {
+        return None;
+    }
+    let machine = u16::from_le_bytes(buf[lfanew + 4..lfanew + 6].try_into().ok()?);
+    match machine {
+        0x014c | 0x01c0 | 0x01c4 => Some(true), // 32-bit (x86, ARM)
+        0x8664 | 0xaa64 => Some(false),         // 64-bit (x64, ARM64)
+        _ => None,
     }
 }
 
@@ -1624,7 +1650,7 @@ pub fn create_dump_file(
 /// fails and changes nothing, which is exactly the intended behavior — it
 /// grants no access, it only stops Windows from withholding access the token
 /// was already entitled to.
-fn enable_debug_privilege() {
+pub fn enable_debug_privilege() {
     use windows::Win32::Security::{
         AdjustTokenPrivileges, LUID_AND_ATTRIBUTES, LookupPrivilegeValueW, SE_PRIVILEGE_ENABLED,
         TOKEN_ADJUST_PRIVILEGES, TOKEN_PRIVILEGES, TOKEN_QUERY,
@@ -1848,7 +1874,7 @@ mod tests {
     }
 
     #[test]
-    fn only_third_party_dlls_are_unloadable() {
+    fn only_non_core_dlls_are_unloadable() {
         assert!(module_is_unloadable(
             "plugin.dll",
             r"C:\Tools\plugin.dll",
@@ -1865,11 +1891,21 @@ mod tests {
             false
         ));
         assert!(!module_is_unloadable(
+            "ntdll.dll",
+            r"C:\Windows\System32\ntdll.dll",
+            false
+        ));
+        assert!(!module_is_unloadable(
+            "api-ms-win-core-file-l1-1-0.dll",
+            r"C:\Windows\System32\api-ms-win-core-file-l1-1-0.dll",
+            false
+        ));
+        assert!(module_is_unloadable(
             "vendor.dll",
             r"C:\Windows\System32\vendor.dll",
             false
         ));
-        assert!(!module_is_unloadable(
+        assert!(module_is_unloadable(
             "component.dll",
             r"C:\Windows\WinSxS\component.dll",
             false
@@ -1887,6 +1923,15 @@ mod tests {
             cmdline.to_ascii_lowercase().contains("tm_platform"),
             "unexpected: {cmdline}"
         );
+    }
+
+    #[test]
+    fn pe_is_wow64_detects_host_binary() {
+        let exe = std::env::current_exe().expect("current exe");
+        let is_wow64_pe = pe_is_wow64(&exe);
+        assert_eq!(is_wow64_pe, Some(false));
+        assert_eq!(is_wow64(0), Some(false));
+        assert_eq!(is_wow64(4), Some(false));
     }
 
     /// Poll `probe` until it answers or the deadline passes.

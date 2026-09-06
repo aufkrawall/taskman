@@ -185,7 +185,7 @@ mod tests {
     #[test]
     fn the_engine_menu_remembers_engines_seen_in_the_window() {
         let mut earlier = pt(0);
-        earlier.gpu_engines = vec![(0, "VideoEncode".into(), 40.0)];
+        earlier.gpu_engines = vec![(0, "CustomSecurity".into(), 40.0)];
         let win = vec![earlier, pt(1000)];
         let snapshot = [tm_core::model::GpuEngine {
             name: "3D".into(),
@@ -193,7 +193,9 @@ mod tests {
         }];
 
         let names = gpu_engine_names(&win, &snapshot, "0");
-        assert_eq!(names, vec!["3D".to_string(), "VideoEncode".to_string()]);
+        assert!(names.contains(&"3D".to_string()));
+        assert!(names.contains(&"VideoEncode".to_string()));
+        assert!(names.contains(&"CustomSecurity".to_string()));
         // Ordering is by role, not by the order they were discovered in.
         let mut reversed = names.clone();
         reversed.reverse();
@@ -678,9 +680,20 @@ fn gpu_engine_names(
     snapshot: &[tm_core::model::GpuEngine],
     key: &str,
 ) -> Vec<String> {
-    let mut names: Vec<String> = snapshot.iter().map(|e| e.name.clone()).collect();
+    let mut names: Vec<String> = vec![
+        "3D".into(),
+        "Copy".into(),
+        "VideoEncode".into(),
+        "VideoDecode".into(),
+        "Compute".into(),
+    ];
+    for e in snapshot {
+        if !names.contains(&e.name) {
+            names.push(e.name.clone());
+        }
+    }
     for (id, name, _) in win.iter().flat_map(|h| h.gpu_engines.iter()) {
-        if id.to_string() == key && !names.iter().any(|known| known == name) {
+        if id.to_string() == key && !names.contains(name) {
             names.push(name.clone());
         }
     }
@@ -693,10 +706,10 @@ fn gpu_engine_names(
 fn engine_rank(name: &str) -> u8 {
     match name {
         "3D" => 0,
-        "Compute" => 1,
-        "Copy" => 2,
+        "Copy" => 1,
+        "VideoEncode" => 2,
         "VideoDecode" => 3,
-        "VideoEncode" => 4,
+        "Compute" => 4,
         "VideoProcessing" => 5,
         "Security" => 6,
         _ => 7,
@@ -879,7 +892,7 @@ fn stats_block(
 // ---------------------------------------------------------------- CPU page
 
 fn logical_grid_layout(width: f32, cores: usize) -> (usize, f32, f32) {
-    const GAP: f32 = 6.0;
+    const GAP: f32 = 8.0;
     if cores == 0 {
         return (1, width.max(60.0), 48.0);
     }
@@ -958,7 +971,7 @@ fn cpu_page(app: &mut TaskManApp, ui: &mut egui::Ui, pal: &Palette) {
         // common 16-thread layout; high-core-count CPUs gain columns instead
         // of creating a needlessly tall page.
         let (cols, cell_w, cell_h) = logical_grid_layout(width, cores);
-        let gap = 6.0;
+        let gap = 8.0;
         ui.horizontal_top(|ui| {
             ui.add_space(GUTTER);
             egui::Grid::new("core-grid")
