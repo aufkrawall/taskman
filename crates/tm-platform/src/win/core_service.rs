@@ -835,25 +835,18 @@ impl PlatformActions for BrokeredActions {
         base_address: u64,
         expected_path: &str,
     ) -> Result<()> {
-        let Some(start_epoch_s) = expected_start_epoch_s else {
-            return self
-                .local
-                .unload_process_module(pid, None, base_address, expected_path);
-        };
+        let start_epoch_s =
+            expected_start_epoch_s.or_else(|| super::process_ops::creation_epoch_of(pid));
         self.unit_or_local(
             BrokerRequest::UnloadModule {
                 pid,
-                expected_start_epoch_s: Some(start_epoch_s),
+                expected_start_epoch_s: start_epoch_s,
                 base_address,
                 expected_path: expected_path.to_string(),
             },
             || {
-                self.local.unload_process_module(
-                    pid,
-                    Some(start_epoch_s),
-                    base_address,
-                    expected_path,
-                )
+                self.local
+                    .unload_process_module(pid, start_epoch_s, base_address, expected_path)
             },
         )
     }
@@ -1211,7 +1204,8 @@ fn checked_target(
     expected_start_epoch_s: Option<i64>,
     requesting_gui_pid: u32,
 ) -> Result<()> {
-    if expected_start_epoch_s.is_none_or(|created| created <= 0) {
+    let created = expected_start_epoch_s.or_else(|| super::process_ops::creation_epoch_of(pid));
+    if created.is_none_or(|created| created <= 0) {
         return Err(TmError::platform(
             "broker target",
             "a valid process creation time is required",

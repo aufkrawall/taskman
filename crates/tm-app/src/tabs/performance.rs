@@ -760,9 +760,9 @@ fn page_title(ui: &mut egui::Ui, pal: &Palette, title: &str, right: &str) {
 }
 
 /// Caption row: dim caption left, scale max right.
-fn caption(ui: &mut egui::Ui, pal: &Palette, left: &str, right: &str) {
-    let (rect, _) =
-        ui.allocate_exact_size(egui::vec2(ui.available_width(), 20.0), egui::Sense::hover());
+fn caption(ui: &mut egui::Ui, pal: &Palette, left: &str, right: &str) -> egui::Response {
+    let (rect, resp) =
+        ui.allocate_exact_size(egui::vec2(ui.available_width(), 20.0), egui::Sense::click());
     ui.painter().text(
         Pos2::new(rect.left() + GUTTER, rect.center().y),
         Align2::LEFT_CENTER,
@@ -777,6 +777,7 @@ fn caption(ui: &mut egui::Ui, pal: &Palette, left: &str, right: &str) {
         FontId::proportional(11.5),
         pal.text_dim,
     );
+    resp
 }
 
 /// Big-value stat (label above, large number below).
@@ -1666,11 +1667,11 @@ fn gpu_page(app: &mut TaskManApp, ui: &mut egui::Ui, pal: &Palette, entry: &Reso
             engine_label(engine),
         ),
     };
-    caption(
+    let cap_resp = caption(
         ui,
         pal,
         &format!(
-            "{title}, {}",
+            "{title} ▾, {}",
             window_label(app.shared.settings.graph_seconds)
         ),
         "100 %",
@@ -1755,5 +1756,6 @@ fn gpu_page(app: &mut TaskManApp, ui: &mut egui::Ui, pal: &Palette, entry: &Reso
         },
     );
     gpu_graph_context_menu(app, &chart, &engines);
+    gpu_graph_context_menu(app, &cap_resp, &engines);
     ui.add_space(16.0);
 }

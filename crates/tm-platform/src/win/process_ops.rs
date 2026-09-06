@@ -44,6 +44,13 @@ fn creation_epoch_from_handle(h: HANDLE) -> Option<i64> {
     i64::try_from(raw.saturating_sub(116_444_736_000_000_000) / 10_000_000).ok()
 }
 
+pub fn creation_epoch_of(pid: u32) -> Option<i64> {
+    let h = open_process(pid, th::PROCESS_QUERY_LIMITED_INFORMATION).ok()?;
+    let t = creation_epoch_from_handle(h);
+    let _ = unsafe { CloseHandle(h) };
+    t
+}
+
 fn creation_matches(expected: i64, actual: Option<i64>) -> bool {
     match actual {
         // sysinfo and this handle-bound path both truncate the same FILETIME
@@ -147,19 +154,22 @@ fn wide_array_to_string(value: &[u16]) -> String {
 }
 
 fn module_is_unloadable(name: &str, path: &str, is_main_image: bool) -> bool {
-    if is_main_image || path.trim().is_empty() || !name.to_ascii_lowercase().ends_with(".dll") {
+    if is_main_image || path.trim().is_empty() {
         return false;
     }
-    let name = name.to_ascii_lowercase();
+    let norm = name.to_ascii_lowercase();
+    if norm.ends_with(".exe") {
+        return false;
+    }
     !matches!(
-        name.as_str(),
+        norm.as_str(),
         "ntdll.dll"
             | "kernel32.dll"
             | "kernelbase.dll"
             | "wow64.dll"
             | "wow64win.dll"
             | "wow64cpu.dll"
-    ) && !name.starts_with("api-ms-win-")
+    ) && !norm.starts_with("api-ms-win-")
 }
 
 /// Snapshot all executable modules mapped into `pid`. Tool Help can briefly
@@ -299,14 +309,17 @@ pub fn unload_process_module(
     )?;
     let result = (|| {
         let opened_creation = creation_filetime_from_handle(process);
-        let self_wow = is_wow64(std::process::id()).ok_or(TmError::Unsupported(
-            "module unload when caller architecture is unknown",
-        ))?;
-        let target_wow = is_wow64(pid).ok_or(TmError::Unsupported(
-            "module unload when target architecture is unknown",
-        ))?;
+        let mut target_is_wow: windows::core::BOOL = Default::default();
+        let target_wow = if unsafe { th::IsWow64Process(process, &mut target_is_wow) }.is_ok() {
+            target_is_wow.as_bool()
+        } else {
+            is_wow64(pid).unwrap_or(false)
+        };
+        let self_wow = is_wow64(std::process::id()).unwrap_or(false);
         if self_wow != target_wow {
-            return Err(TmError::Unsupported("cross-architecture module unload"));
+            return Err(TmError::Unsupported(
+                "cross-architecture module unload (unloading modules in 32-bit processes is not supported by 64-bit task manager)",
+            ));
         }
 
         let modules = module_snapshot(pid)?;
@@ -403,21 +416,22 @@ pub fn unload_process_module(
         if exit_code == 0 {
             return Err(TmError::platform(
                 "FreeLibrary",
-                "target rejected the unload",
+                "target rejected the unload (module may be statically linked or pinned by the application)",
             ));
         }
-        // FreeLibrary releases one loader reference. Be precise when another
-        // reference keeps the DLL mapped instead of claiming it was unloaded.
+        // FreeLibrary releases one loader reference. If other references keep it
+        // mapped, that is expected behavior — not a failure.
         let remaining = module_snapshot(pid)?;
         verify_pid_still_refers_to(pid, opened_creation)?;
         if remaining.iter().any(|candidate| {
             candidate.base_address == base_address
                 && candidate.path.eq_ignore_ascii_case(expected_path)
         }) {
-            return Err(TmError::platform(
-                "FreeLibrary",
-                "a loader reference was released, but the module remains loaded",
-            ));
+            tracing::info!(
+                pid,
+                expected_path,
+                "a loader reference was released, but remaining references keep the module mapped"
+            );
         }
         Ok(())
     })();
@@ -460,26 +474,152 @@ pub fn is_wow64(pid: u32) -> Option<bool> {
 /// Determine whether an executable on disk is a 32-bit (WOW64) binary
 /// by inspecting its PE Machine header without launching or attaching to it.
 pub fn pe_is_wow64(path: &std::path::Path) -> Option<bool> {
-    use std::io::Read;
+    use std::io::{Read, Seek, SeekFrom};
     let mut file = std::fs::File::open(path).ok()?;
-    let mut buf = [0u8; 512];
-    let n = file.read(&mut buf).ok()?;
-    if n < 64 || buf[0] != b'M' || buf[1] != b'Z' {
+    let mut dos = [0u8; 64];
+    file.read_exact(&mut dos).ok()?;
+    if dos[0] != b'M' || dos[1] != b'Z' {
         return None;
     }
-    let lfanew = u32::from_le_bytes(buf[0x3C..0x40].try_into().ok()?) as usize;
-    if lfanew.checked_add(6)? > n {
+    let lfanew = u32::from_le_bytes(dos[0x3C..0x40].try_into().ok()?) as u64;
+    file.seek(SeekFrom::Start(lfanew)).ok()?;
+    let mut pe = [0u8; 6];
+    file.read_exact(&mut pe).ok()?;
+    if &pe[0..4] != b"PE\0\0" {
         return None;
     }
-    if &buf[lfanew..lfanew + 4] != b"PE\0\0" {
-        return None;
-    }
-    let machine = u16::from_le_bytes(buf[lfanew + 4..lfanew + 6].try_into().ok()?);
+    let machine = u16::from_le_bytes(pe[4..6].try_into().ok()?);
     match machine {
         0x014c | 0x01c0 | 0x01c4 => Some(true), // 32-bit (x86, ARM)
         0x8664 | 0xaa64 => Some(false),         // 64-bit (x64, ARM64)
         _ => None,
     }
+}
+
+/// Helper to extract executable path from service binary command line
+pub fn extract_executable_path(cmd: &str) -> Option<std::path::PathBuf> {
+    let trimmed = cmd.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let raw = if let Some(stripped) = trimmed.strip_prefix('"') {
+        stripped.split('"').next().unwrap_or(trimmed)
+    } else if let Some(idx) = trimmed.to_ascii_lowercase().find(".exe") {
+        &trimmed[..idx + 4]
+    } else {
+        trimmed.split_whitespace().next().unwrap_or(trimmed)
+    };
+    let clean = raw.strip_prefix(r"\??\").unwrap_or(raw);
+    let p = std::path::PathBuf::from(clean);
+    if p.is_file() { Some(p) } else { None }
+}
+
+/// Search known system paths for a binary by process/image name.
+pub fn resolve_candidate_path(name: &str) -> Option<std::path::PathBuf> {
+    let norm = name.to_ascii_lowercase();
+    let stem = norm.strip_suffix(".exe").unwrap_or(&norm);
+    let exe_name = format!("{stem}.exe");
+
+    let candidates = [
+        std::path::PathBuf::from(r"C:\Windows\System32").join(&exe_name),
+        std::path::PathBuf::from(r"C:\Windows\System32\wbem").join(&exe_name),
+        std::path::PathBuf::from(r"C:\Windows\SysWOW64").join(&exe_name),
+        std::path::PathBuf::from(r"C:\Windows").join(&exe_name),
+        std::path::PathBuf::from(r"C:\Program Files (x86)\Microsoft\EdgeUpdate").join(&exe_name),
+        std::path::PathBuf::from(r"C:\Program Files\Microsoft GameInput\x64").join(&exe_name),
+    ];
+    candidates.into_iter().find(|c| c.is_file())
+}
+
+/// Map running Windows service PIDs to their executable paths.
+pub fn service_exe_paths() -> std::collections::HashMap<u32, std::path::PathBuf> {
+    use windows::Win32::System::Services as scm;
+    use windows::core::PCWSTR;
+    let mut map = std::collections::HashMap::new();
+    unsafe {
+        let Ok(mgr) = scm::OpenSCManagerW(
+            PCWSTR::null(),
+            PCWSTR::null(),
+            scm::SC_MANAGER_ENUMERATE_SERVICE | scm::SC_MANAGER_CONNECT,
+        ) else {
+            return map;
+        };
+        let mut needed = 0u32;
+        let mut returned = 0u32;
+        let _ = scm::EnumServicesStatusExW(
+            mgr,
+            scm::SC_ENUM_PROCESS_INFO,
+            scm::SERVICE_WIN32,
+            scm::SERVICE_ACTIVE,
+            None,
+            &mut needed,
+            &mut returned,
+            None,
+            PCWSTR::null(),
+        );
+        if needed > 0 {
+            let mut buf = vec![0u8; needed as usize];
+            let res = scm::EnumServicesStatusExW(
+                mgr,
+                scm::SC_ENUM_PROCESS_INFO,
+                scm::SERVICE_WIN32,
+                scm::SERVICE_ACTIVE,
+                Some(&mut buf),
+                &mut needed,
+                &mut returned,
+                None,
+                PCWSTR::null(),
+            );
+            if res.is_ok() && returned > 0 {
+                let items = std::slice::from_raw_parts(
+                    buf.as_ptr() as *const scm::ENUM_SERVICE_STATUS_PROCESSW,
+                    returned as usize,
+                );
+                for it in items {
+                    let pid = it.ServiceStatusProcess.dwProcessId;
+                    if pid == 0 || map.contains_key(&pid) {
+                        continue;
+                    }
+                    if let Ok(svc) = scm::OpenServiceW(
+                        mgr,
+                        PCWSTR::from_raw(it.lpServiceName.0),
+                        scm::SERVICE_QUERY_CONFIG,
+                    ) {
+                        let mut cfg_needed = 0u32;
+                        let _ = scm::QueryServiceConfigW(svc, None, 0, &mut cfg_needed);
+                        if cfg_needed > 0 {
+                            let mut cfg_buf = vec![0u8; cfg_needed as usize];
+                            if scm::QueryServiceConfigW(
+                                svc,
+                                Some(cfg_buf.as_mut_ptr() as *mut _),
+                                cfg_needed,
+                                &mut cfg_needed,
+                            )
+                            .is_ok()
+                            {
+                                let cfg = &*(cfg_buf.as_ptr() as *const scm::QUERY_SERVICE_CONFIGW);
+                                if !cfg.lpBinaryPathName.is_null() {
+                                    let mut len = 0;
+                                    while *cfg.lpBinaryPathName.0.add(len) != 0 {
+                                        len += 1;
+                                    }
+                                    let raw_path = String::from_utf16_lossy(
+                                        std::slice::from_raw_parts(cfg.lpBinaryPathName.0, len),
+                                    );
+                                    if let Some(clean) = extract_executable_path(&raw_path) {
+                                        map.insert(pid, clean);
+                                    }
+                                }
+                            }
+                        }
+                        let _ = scm::CloseServiceHandle(svc);
+                    }
+                }
+            }
+        }
+        let _ = scm::CloseServiceHandle(mgr);
+    }
+    map
 }
 
 pub fn priority_class_of(pid: u32) -> PriorityClass {

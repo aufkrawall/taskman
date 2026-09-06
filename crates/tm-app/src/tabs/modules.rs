@@ -240,13 +240,21 @@ pub fn dialog(app: &mut TaskManApp, ctx: &egui::Context, pal: &theme::Palette) {
     let can_unload = app.actions.capabilities().unload_module;
     let snapshot = tm_core::sync::lock(&state.load).clone();
     let selected_module = match &snapshot {
-        LoadState::Ready(modules) => state
-            .selected_base
-            .and_then(|base| modules.iter().find(|module| module.base_address == base))
-            .filter(|module| {
-                module_matches_filter(module, &state.filter.trim().to_ascii_lowercase())
-            })
-            .cloned(),
+        LoadState::Ready(modules) => {
+            if state.selected_base.is_none() {
+                state.selected_base = modules
+                    .iter()
+                    .find(|m| m.unloadable)
+                    .map(|m| m.base_address);
+            }
+            state
+                .selected_base
+                .and_then(|base| modules.iter().find(|module| module.base_address == base))
+                .filter(|module| {
+                    module_matches_filter(module, &state.filter.trim().to_ascii_lowercase())
+                })
+                .cloned()
+        }
         _ => None,
     };
 

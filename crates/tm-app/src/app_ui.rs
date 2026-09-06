@@ -1043,22 +1043,75 @@ pub fn process_end_dialog(app: &mut TaskManApp, ctx: &egui::Context) {
             }
             ui.add_space(10.0);
             let pal = crate::theme::palette_ctx(ctx);
+            let cancel_id = ui.make_persistent_id("end_task_cancel_btn");
+            let end_id = ui.make_persistent_id("end_task_confirm_btn");
+
+            let has_focused = ctx.memory(|m| m.focused());
+            let mut current_focus = match has_focused {
+                Some(id) if id == cancel_id => Some(false),
+                Some(id) if id == end_id => Some(true),
+                _ => None,
+            };
+            // Default preselection is EndTask.
+            if current_focus.is_none() {
+                current_focus = Some(true);
+            }
+
+            let tab_pressed = ctx.input(|i| i.key_pressed(egui::Key::Tab));
+            let left_pressed = ctx.input(|i| i.key_pressed(egui::Key::ArrowLeft));
+            let right_pressed = ctx.input(|i| i.key_pressed(egui::Key::ArrowRight));
+            if tab_pressed || left_pressed || right_pressed {
+                current_focus = Some(!current_focus.unwrap_or(true));
+            }
+
+            if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+                decision = Some(false);
+            } else if ctx
+                .input(|i| i.key_pressed(egui::Key::Enter) || i.key_pressed(egui::Key::Space))
+            {
+                decision = Some(current_focus.unwrap_or(true));
+            }
+
+            let is_cancel_focused = current_focus == Some(false);
+            let is_end_focused = current_focus.unwrap_or(true);
+
             ui.horizontal(|ui| {
-                if ui.button(i18n::tr(K::Cancel)).clicked() {
-                    decision = Some(false);
+                let mut cancel_btn = egui::Button::new(i18n::tr(K::Cancel));
+                if is_cancel_focused {
+                    cancel_btn = cancel_btn.stroke(egui::Stroke::new(2.0, pal.accent));
                 }
-                let end_btn = egui::Button::new(
+                let cancel_resp = ui.add(cancel_btn);
+
+                let mut end_btn = egui::Button::new(
                     egui::RichText::new(i18n::tr(K::EndTask))
                         .color(pal.accent_text)
                         .strong(),
                 )
                 .fill(pal.accent);
-                let resp = ui.add(end_btn);
-                if resp.clicked() {
+                if is_end_focused {
+                    end_btn = end_btn.stroke(egui::Stroke::new(2.0, pal.accent_text));
+                }
+                let end_resp = ui.add(end_btn);
+
+                // Mouse dragging selection: keeping mouse pressed and moving over buttons changes selection
+                if ctx.input(|i| i.pointer.primary_down()) {
+                    if cancel_resp.hovered() {
+                        current_focus = Some(false);
+                    } else if end_resp.hovered() {
+                        current_focus = Some(true);
+                    }
+                }
+
+                if cancel_resp.clicked() {
+                    decision = Some(false);
+                } else if end_resp.clicked() {
                     decision = Some(true);
                 }
-                if ui.memory(|m| m.focused().is_none()) {
-                    resp.request_focus();
+
+                if current_focus == Some(false) {
+                    cancel_resp.request_focus();
+                } else {
+                    end_resp.request_focus();
                 }
             });
         });

@@ -513,12 +513,17 @@ impl Sampler {
         }
 
         let mut processes: Vec<ProcessEntry> = Vec::with_capacity(n_procs);
+        let service_paths = process_ops::service_exe_paths();
 
         for (pid, p) in self.sys.processes() {
             let pid_u = pid.as_u32();
             // Single owned copy of the name per process (reused everywhere).
             let name = p.name().to_string_lossy().into_owned();
-            let exe_owned = p.exe().map(|e| e.to_path_buf());
+            let exe_owned = p
+                .exe()
+                .map(|e| e.to_path_buf())
+                .or_else(|| service_paths.get(&pid_u).cloned())
+                .or_else(|| process_ops::resolve_candidate_path(&name));
             let has_window = window_owners.visible.contains(&pid_u);
 
             let user = p
@@ -619,25 +624,36 @@ impl Sampler {
                 .or_else(|| self.cpu_load.handle_count_of(p.pid, p.start_epoch_s));
             p.wow64 = a.wow64;
             if p.wow64.is_none() {
+                let norm = p.name.to_ascii_lowercase();
+                let stem = norm.strip_suffix(".exe").unwrap_or(&norm);
                 if p.pid == 0
                     || p.pid == 4
                     || matches!(
-                        p.name.as_str(),
-                        "[System Process]"
-                            | "System"
-                            | "Secure System"
-                            | "Registry"
-                            | "Memory Compression"
+                        stem,
+                        "[system process]"
+                            | "system"
+                            | "secure system"
+                            | "registry"
+                            | "memory compression"
+                            | "csrss"
+                            | "winlogon"
+                            | "fontdrvhost"
+                            | "dwm"
+                            | "smss"
+                            | "wininit"
+                            | "services"
+                            | "lsass"
+                            | "sihost"
+                            | "taskhostw"
                     )
                 {
                     p.wow64 = Some(false);
                 } else if let Some(exe_path) = &p.exe_path {
                     p.wow64 = process_ops::pe_is_wow64(exe_path);
-                } else if p.name.to_ascii_lowercase().ends_with(".exe") {
-                    let sys32_candidate =
-                        std::path::PathBuf::from(r"C:\Windows\System32").join(&p.name);
-                    if sys32_candidate.is_file() {
-                        p.wow64 = process_ops::pe_is_wow64(&sys32_candidate);
+                } else if let Some(cand) = process_ops::resolve_candidate_path(&p.name) {
+                    p.wow64 = process_ops::pe_is_wow64(&cand);
+                    if p.exe_path.is_none() {
+                        p.exe_path = Some(cand);
                     }
                 }
             }
@@ -669,19 +685,25 @@ impl Sampler {
             // Kernel pseudo-processes and Session 0 / SYSTEM services always run
             // with full system elevation and no UAC virtualization.
             if p.elevated.is_none() {
+                let norm = p.name.to_ascii_lowercase();
+                let stem = norm.strip_suffix(".exe").unwrap_or(&norm);
                 let is_kernel_or_system = p.pid == 0
                     || p.pid == 4
                     || matches!(
-                        p.name.as_str(),
-                        "[System Process]"
-                            | "System"
-                            | "Secure System"
-                            | "Registry"
-                            | "Memory Compression"
-                            | "smss.exe"
-                            | "csrss.exe"
-                            | "wininit.exe"
-                            | "services.exe"
+                        stem,
+                        "[system process]"
+                            | "system"
+                            | "secure system"
+                            | "registry"
+                            | "memory compression"
+                            | "smss"
+                            | "csrss"
+                            | "wininit"
+                            | "services"
+                            | "lsass"
+                            | "winlogon"
+                            | "fontdrvhost"
+                            | "dwm"
                     );
                 let session = a
                     .session_id

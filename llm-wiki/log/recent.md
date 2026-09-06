@@ -1,10 +1,34 @@
 # Recent Activity
 
+## 2026-09-06 — Tray focus & dismiss, GPU graph right-click, dialog keyboard nav, service platforms & module unloading
+
+Five follow-up fixes addressing tray menu focus, GPU engine switching, dialog keyboard navigation, platform detection for protected/service processes, and module unloading:
+
+1. **Tray context menu stuck / no hover highlights**:
+   - `TrackPopupMenuEx` was previously passing `MAIN_HWND`. When minimized to tray, `MAIN_HWND` is hidden (`IsWindowVisible == false`), causing `SetForegroundWindow` to fail. Explorer only grants foreground rights to the window registered with the tray icon.
+   - Stored `TRAY_HWND` (`icon.window_handle() as isize`). Updated `show_native_tray_menu()` to call `ReleaseCapture()` before `TrackPopupMenuEx`, pass `TRAY_HWND` to `SetForegroundWindow` and `TrackPopupMenuEx`, omit `TPM_NONOTIFY` so notifications route correctly to the tray window, and finalize with `PostMessageW(TRAY_HWND, WM_NULL)`. Menu now closes properly when clicking outside and highlights entries on hover.
+2. **GPU usage graph context menu**:
+   - `chart_multi` and `core_chart` allocated their canvas using `egui::Sense::hover()`, which silently ignores click events in egui. Changed allocation to `Sense::click()`.
+   - Exposed context menu both on secondary-click over the GPU chart and via the caption dropdown indicator (`"{title} ▾, {window}"`), allowing selection of Total GPU load, 3D, Video Encode, Video Decode, Compute, etc.
+3. **Delete confirmation dialog keyboard & mouse navigation**:
+   - Added explicit keyboard navigation in `end_task_dialog`: `Tab` / `Shift+Tab` / `Left` / `Right` cycles selection between "End task" and "Cancel"; `Escape` cancels; `Enter` or `Space` executes the currently focused button.
+   - Added mouse drag selection: holding the primary mouse button down while hovering over a button updates visual focus without triggering early; only click releases confirm.
+   - Added distinct visual focus rings around the selected button.
+4. **Details page platform resolution (32-bit vs 64-bit)**:
+   - Protected processes and Session 0 services (`WmiPrvSE.exe`, `MicrosoftEdgeUpdate.exe`, `NVDisplay.Container.exe`, `GameInputSvc.exe`, `csrss.exe`, `winlogon.exe`, `fontdrvhost.exe`, `dwm.exe`) returned Access Denied on `OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION)`.
+   - Added `service_exe_paths()` querying SCM for service binary paths and `resolve_candidate_path()` searching `System32`, `System32\wbem`, `SysWOW64`, `Windows`, EdgeUpdate, and GameInput directories.
+   - Normalizes process names by stripping `.exe` and matching stems. Hardcoded native 64-bit (`Some(false)`) attribution for known 64-bit OS core subsystem binaries (`csrss`, `winlogon`, `fontdrvhost`, `dwm`, etc.).
+5. **Details page module unloading**:
+   - `LoadState::Ready` pre-selects the first unloadable module so the "Unload Module" button is not grayed out on dialog open.
+   - Broadened `module_is_unloadable` to allow `.mui`, `.ocx`, `.cpl`, `.ime`, `.node` while rejecting main image binaries (`.exe`) and core NT subsystem binaries (`ntdll`, `kernel32`, `kernelbase`, `wow64*`, `api-ms-win-*`).
+   - `core_service.rs` uses `creation_epoch_of(pid)` dynamically when start epoch is unknown so requests route to the elevated broker instead of failing locally with Access Denied.
+   - Treated `FreeLibrary` reference decrements where remaining references keep the module in memory as non-fatal success.
+
 ## 2026-09-06 — UI polish, system process telemetry, tray responsiveness & app icon
 
 Seven targeted fixes and polish items across `tm-app` and `tm-platform`:
 
-1. **Tray context menu responsiveness**: Replaced `tray-icon`'s internal menu and 15ms `Shell_NotifyIconGetRect` timer with native Win32 `TrackPopupMenuEx(TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_NONOTIFY)` and `PostMessageW(WM_NULL)`, eliminating cursor hover lag and slow opening.
+1. **Tray context menu responsiveness**: Replaced `tray-icon`'s internal menu and 15ms `Shell_NotifyIconGetRect` timer with native Win32 `TrackPopupMenuEx(TPM_RETURNCMD | TPM_RIGHTBUTTON)` and `PostMessageW(WM_NULL)`, eliminating cursor hover lag and slow opening.
 2. **Delete confirmation dialog**: Styled "End task" button with accent fill and requested default focus so it is both visually and interactively preselected.
 3. **Protected/system process telemetry on Details page**:
    - `cpu_load.rs`: Extracted `working_set`, `peak_working_set`, `commit`, `handle_count`, and `thread_count` from `SYSTEM_PROCESS_INFORMATION`, which queries all processes including PID 0, PID 4, and protected processes without opening handles.

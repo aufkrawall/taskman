@@ -782,22 +782,30 @@ fn set_popup_menu_theme(dark: bool) {
 
 #[cfg(target_os = "windows")]
 static MAIN_HWND: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
+#[cfg(target_os = "windows")]
+static TRAY_HWND: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
 
 #[cfg(target_os = "windows")]
 fn show_native_tray_menu() {
     use windows::Win32::Foundation::{HWND, LPARAM, POINT, WPARAM};
+    use windows::Win32::UI::Input::KeyboardAndMouse::ReleaseCapture;
     use windows::Win32::UI::WindowsAndMessaging::{
         CreatePopupMenu, DestroyMenu, GetCursorPos, GetDesktopWindow, InsertMenuW, MF_BYPOSITION,
-        MF_STRING, PostMessageW, SetForegroundWindow, SetMenuDefaultItem, TPM_NONOTIFY,
-        TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenuEx, WM_NULL,
+        MF_STRING, PostMessageW, SetForegroundWindow, SetMenuDefaultItem, TPM_RETURNCMD,
+        TPM_RIGHTBUTTON, TrackPopupMenuEx, WM_NULL,
     };
     use windows::core::PCWSTR;
 
-    let hwnd_raw = MAIN_HWND.load(std::sync::atomic::Ordering::Acquire);
-    let hwnd = if hwnd_raw != 0 {
-        HWND(hwnd_raw as *mut _)
+    let tray_raw = TRAY_HWND.load(std::sync::atomic::Ordering::Acquire);
+    let hwnd = if tray_raw != 0 {
+        HWND(tray_raw as *mut _)
     } else {
-        unsafe { GetDesktopWindow() }
+        let hwnd_raw = MAIN_HWND.load(std::sync::atomic::Ordering::Acquire);
+        if hwnd_raw != 0 {
+            HWND(hwnd_raw as *mut _)
+        } else {
+            unsafe { GetDesktopWindow() }
+        }
     };
 
     let Ok(hmenu) = (unsafe { CreatePopupMenu() }) else {
@@ -826,12 +834,13 @@ fn show_native_tray_menu() {
         );
         let _ = SetMenuDefaultItem(hmenu, 1, 0);
 
+        let _ = ReleaseCapture();
         let _ = SetForegroundWindow(hwnd);
         let mut pt = POINT::default();
         let _ = GetCursorPos(&mut pt);
         let cmd = TrackPopupMenuEx(
             hmenu,
-            (TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_NONOTIFY).0,
+            (TPM_RETURNCMD | TPM_RIGHTBUTTON).0,
             pt.x,
             pt.y,
             hwnd,
@@ -902,6 +911,10 @@ impl TrayShell {
         {
             Ok(icon) => {
                 let _ = icon.set_visible(false);
+                TRAY_HWND.store(
+                    icon.window_handle() as isize,
+                    std::sync::atomic::Ordering::Release,
+                );
                 Some(Self {
                     icon,
                     visible: false,

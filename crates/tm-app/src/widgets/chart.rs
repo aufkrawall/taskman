@@ -104,7 +104,7 @@ pub fn core_chart(
     kernels: Option<&[f64]>,
     color: Color32,
 ) -> Response {
-    let (rect, response) = ui.allocate_exact_size(size, egui::Sense::hover());
+    let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
     let pal = crate::theme::palette(ui);
     let painter = ui.painter_at(rect).with_clip_rect(rect);
 
@@ -190,7 +190,7 @@ pub fn chart_multi(
     y_max: f64,
     timestamps_ms: Option<&[u64]>,
 ) -> Response {
-    let (rect, response) = ui.allocate_exact_size(size, egui::Sense::hover());
+    let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
     let pal = crate::theme::palette(ui);
     let painter = ui.painter_at(rect).with_clip_rect(rect);
 
