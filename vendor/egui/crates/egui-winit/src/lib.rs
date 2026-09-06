@@ -1458,6 +1458,7 @@ fn key_from_named_key(named_key: winit::keyboard::NamedKey) -> Option<egui::Key>
 
     Some(match named_key {
         NamedKey::Enter => Key::Enter,
+        NamedKey::ContextMenu => Key::ContextMenu,
         NamedKey::Tab => Key::Tab,
         NamedKey::ArrowDown => Key::ArrowDown,
         NamedKey::ArrowLeft => Key::ArrowLeft,
@@ -1531,6 +1532,7 @@ fn key_from_key_code(key: winit::keyboard::KeyCode) -> Option<egui::Key> {
         KeyCode::ArrowRight => Key::ArrowRight,
         KeyCode::ArrowUp => Key::ArrowUp,
 
+        KeyCode::ContextMenu => Key::ContextMenu,
         KeyCode::Escape => Key::Escape,
         KeyCode::Tab => Key::Tab,
         KeyCode::Backspace => Key::Backspace,

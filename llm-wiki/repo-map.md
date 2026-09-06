@@ -217,8 +217,10 @@ platform boundary (`tm-core` ← `tm-platform` ← `tm-app` / `tm-service`):
 
 ## Rendering
 
-`vendor/egui/` is a vendored fork of egui (subtree, tag 0.36.1). It exists for two
-things that stock egui cannot do: sub-pixel (ClearType) text and a native CPU renderer.
+`vendor/egui/` is a vendored fork of egui (subtree, tag 0.36.1). It exists for a
+few things that stock egui cannot do: sub-pixel (ClearType) text, a native CPU
+renderer, and the keyboard Menu/Application key (`Key::ContextMenu`, fork
+divergence #5 in `TASKMAN-FORK.md`).
 `vendor/egui/TASKMAN-FORK.md` is the divergence inventory and rebase runbook;
 `llm-wiki/render-pipeline.md` is the design. The fork has its own quality gate,
 `tools/check-fork.ps1`, because `cargo clippy --workspace` does not reach an excluded

@@ -1000,15 +1000,19 @@ pub fn process_end_dialog(app: &mut TaskManApp, ctx: &egui::Context) {
         return;
     };
     let mut open = true;
-    let mut decision = ctx.input(|input| {
-        if input.key_pressed(egui::Key::Escape) {
-            Some(false)
-        } else if input.key_pressed(egui::Key::Enter) {
-            Some(true)
-        } else {
-            None
-        }
-    });
+    // The dialog owns its keyboard: consuming the keys keeps egui's built-in
+    // Tab navigation and focused-widget Enter activation from fighting the
+    // two-button focus below. (Tab used to move egui's focus to a different
+    // widget entirely, which left the selection ring frozen on End task.)
+    let mut decision = None;
+    let escape = ctx.input_mut(|input| input.consume_key(Default::default(), egui::Key::Escape));
+    let enter = ctx.input_mut(|input| input.consume_key(Default::default(), egui::Key::Enter));
+    let space = ctx.input_mut(|input| input.consume_key(Default::default(), egui::Key::Space));
+    let tab = ctx.input_mut(|input| input.consume_key(Default::default(), egui::Key::Tab));
+    let shift_tab =
+        ctx.input_mut(|input| input.consume_key(egui::Modifiers::SHIFT, egui::Key::Tab));
+    let left = ctx.input_mut(|input| input.consume_key(Default::default(), egui::Key::ArrowLeft));
+    let right = ctx.input_mut(|input| input.consume_key(Default::default(), egui::Key::ArrowRight));
     egui::Window::new(i18n::tr(K::EndTask))
         .open(&mut open)
         .collapsible(false)
@@ -1057,18 +1061,13 @@ pub fn process_end_dialog(app: &mut TaskManApp, ctx: &egui::Context) {
                 current_focus = Some(true);
             }
 
-            let tab_pressed = ctx.input(|i| i.key_pressed(egui::Key::Tab));
-            let left_pressed = ctx.input(|i| i.key_pressed(egui::Key::ArrowLeft));
-            let right_pressed = ctx.input(|i| i.key_pressed(egui::Key::ArrowRight));
-            if tab_pressed || left_pressed || right_pressed {
+            if tab || shift_tab || left || right {
                 current_focus = Some(!current_focus.unwrap_or(true));
             }
 
-            if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            if escape {
                 decision = Some(false);
-            } else if ctx
-                .input(|i| i.key_pressed(egui::Key::Enter) || i.key_pressed(egui::Key::Space))
-            {
+            } else if enter || space {
                 decision = Some(current_focus.unwrap_or(true));
             }
 

@@ -569,7 +569,8 @@ fn user_row_ui(
     }
     if can_disconnect {
         let ctx = ui.ctx().clone();
-        menu::context_menu(&resp, |ui| {
+        let keyboard_open = menu::keyboard_menu_requested(&ctx) && app.selected_user == Some(s.id);
+        menu::context_menu_kb(&resp, keyboard_open, |ui| {
             ui.set_min_width(150.0);
             if menu::item(ui, i18n::tr(K::DisconnectUser)).clicked() {
                 session_action(

@@ -678,7 +678,14 @@ fn row_ui(
     };
     // Pseudo-rows carry no killable process — no action menu at all.
     if !row.synthetic {
-        menu::context_menu(&resp, |ui| context_menu(app, ui, row));
+        // The Menu key (or Shift+F10) opens the menu of the current
+        // selection, anchored to its row — the keyboard counterpart of a
+        // right click.
+        let keyboard_open = menu::keyboard_menu_requested(ui.ctx())
+            && app.selection.primary().is_some_and(|primary| {
+                primary.pid == row.pid && primary.start_epoch_s == row.start_epoch_s
+            });
+        menu::context_menu_kb(&resp, keyboard_open, |ui| context_menu(app, ui, row));
     }
 }
 

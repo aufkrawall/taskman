@@ -1042,7 +1042,11 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
                 if resp.secondary_clicked() && !app.selection.contains_pid(row.pid) {
                     app.selection.select_single(identity_of(row));
                 }
-                menu::context_menu(&resp, |ui| {
+                let keyboard_open = menu::keyboard_menu_requested(ui.ctx())
+                    && app.selection.primary().is_some_and(|primary| {
+                        primary.pid == row.pid && primary.start_epoch_s == row.start_epoch_s
+                    });
+                menu::context_menu_kb(&resp, keyboard_open, |ui| {
                     if let Some(p) = snap.process(row.pid) {
                         context_menu(app, ui, p, row.children);
                     }

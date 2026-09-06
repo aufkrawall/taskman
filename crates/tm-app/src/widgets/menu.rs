@@ -61,6 +61,33 @@ pub fn context_menu(resp: &Response, add: impl FnOnce(&mut Ui)) {
     egui::Popup::context_menu(resp).style(style).show(add);
 }
 
+/// True for the one frame on which the user asked for the context menu of
+/// the current selection with the keyboard: the Menu/Application key (next
+/// to Right Ctrl), or its standard Shift+F10 accelerator.
+pub fn keyboard_menu_requested(ctx: &egui::Context) -> bool {
+    ctx.input(|input| {
+        input.key_pressed(egui::Key::ContextMenu)
+            || (input.key_pressed(egui::Key::F10) && input.modifiers.shift)
+    })
+}
+
+/// Context menu that also opens from the keyboard: when `keyboard_open` is
+/// set (the row is the current selection and [`keyboard_menu_requested`]
+/// fired this frame), the same popup is forced open, anchored to the row —
+/// which is where Windows puts a keyboard-invoked menu — instead of waiting
+/// for a secondary click.
+pub fn context_menu_kb(resp: &Response, keyboard_open: bool, add: impl FnOnce(&mut Ui)) {
+    let popup = egui::Popup::context_menu(resp);
+    let popup = if keyboard_open {
+        popup
+            .open_memory(egui::containers::SetOpenCommand::Bool(true))
+            .at_position(resp.rect.left_bottom())
+    } else {
+        popup
+    };
+    popup.style(style).show(add);
+}
+
 /// A drop-down button in the app chrome that opens a menu in the same style.
 pub fn menu_button(
     ui: &mut Ui,

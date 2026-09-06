@@ -429,7 +429,9 @@ pub fn dialog(app: &mut TaskManApp, ctx: &egui::Context, pal: &theme::Palette) {
                                 if response.clicked() || response.secondary_clicked() {
                                     state.selected_base = Some(module.base_address);
                                 }
-                                menu::context_menu(&response, |ui| {
+                                let keyboard_open = menu::keyboard_menu_requested(ui.ctx())
+                                    && state.selected_base == Some(module.base_address);
+                                menu::context_menu_kb(&response, keyboard_open, |ui| {
                                     if menu::item(ui, i18n::tr(K::CopyPath)).clicked() {
                                         ui.ctx().copy_text(module.path.clone());
                                         app.shared.toast(i18n::tr(K::Copied));

@@ -254,7 +254,9 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
                 if resp.clicked() {
                     app.selected_startup_id = Some(item.id.clone());
                 }
-                menu::context_menu(&resp, |ui| {
+                let keyboard_open = menu::keyboard_menu_requested(ui.ctx())
+                    && app.selected_startup_id.as_deref() == Some(item.id.as_str());
+                menu::context_menu_kb(&resp, keyboard_open, |ui| {
                     ui.set_min_width(180.0);
                     let ctx = ui.ctx().clone();
                     let label = if item.enabled {

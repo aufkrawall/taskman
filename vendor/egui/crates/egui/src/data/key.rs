@@ -18,6 +18,11 @@ pub enum Key {
     Enter,
     Space,
 
+    /// The Menu key (also called the Application key), next to Right Ctrl on
+    /// most keyboards: Windows' "open the context menu of the focused item"
+    /// key. `Shift+F10` is its standard accelerator.
+    ContextMenu,
+
     Insert,
     Delete,
     Home,
@@ -243,6 +248,7 @@ impl Key {
         Self::ArrowLeft,
         Self::ArrowRight,
         Self::ArrowUp,
+        Self::ContextMenu,
         Self::Escape,
         Self::Tab,
         Self::Backspace,
@@ -381,6 +387,7 @@ impl Key {
             "⏵" | "ArrowRight" | "Right" => Self::ArrowRight,
             "⏶" | "ArrowUp" | "Up" => Self::ArrowUp,
 
+            "ContextMenu" | "Menu" | "Apps" => Self::ContextMenu,
             "Escape" | "Esc" => Self::Escape,
             "Tab" => Self::Tab,
             "Backspace" => Self::Backspace,
@@ -623,6 +630,7 @@ impl Key {
             Self::X => "X",
             Self::Y => "Y",
             Self::Z => "Z",
+            Self::ContextMenu => "ContextMenu",
             Self::F1 => "F1",
             Self::F2 => "F2",
             Self::F3 => "F3",

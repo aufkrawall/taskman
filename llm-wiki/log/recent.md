@@ -1,5 +1,37 @@
 # Recent Activity
 
+## 2026-09-06 (later still yet) — the Menu key works; Tab cycles the End-task dialog; advapi32's 64 references are real
+
+1. **The keyboard Menu/Application key now opens the selected row's context
+   menu.** It never reached the app at all: egui's `Key` enum has no entry
+   for it and egui-winit dropped it in BOTH key translations, so the press
+   died in the backend. Fork divergence #5: `Key::ContextMenu` in egui
+   (variant + `Key::ALL` + name mapping) and both `NamedKey::ContextMenu`
+   and `KeyCode::ContextMenu` mapped in egui-winit. In the app,
+   `menu::keyboard_menu_requested` (Menu key, or Shift+F10) plus
+   `menu::context_menu_kb` force the selected row's OWN popup open, anchored
+   to the row (`Popup::at_position`) — the keyboard counterpart of a right
+   click, wired into Processes, Details, Users, Services, Startup and the
+   Modules dialog. Because row popups are identity-keyed, the keyboard menu
+   is bound to the selection, not a slot.
+2. **Tab in the End-task dialog moved egui's focus, not our selection.** The
+   dialog toggled its own focus variable on Tab, but the button ALSO held
+   real egui focus (request_focus), so pressing Tab moved egui's built-in
+   navigation to a different widget entirely; the memory-derived selection
+   read `None`, defaulted back to End task, and the ring looked frozen. The
+   dialog now CONSUMES Tab/Shift+Tab/ArrowLeft/ArrowRight/Enter/Space/Escape
+   (`InputState::consume_key`) and decides inside the window with its own
+   focus state — egui's navigation and focused-button Enter activation can
+   no longer race it.
+3. **"Released 64 references, but advapi32.dll is still in use" is the
+   feature working, correctly bounded.** Every statically-importing module
+   holds one loader reference; mspaint's module graph references advapi32
+   from far more than 64 modules, so the refcount never reaches zero — and
+   should not: the DLL is load-bearing. The budget stays at 64 on purpose;
+   pushing further turns a protected process into a guaranteed crash.
+   Repeated attempts are harmless while references remain (nothing unmaps
+   below zero), so the only cost of the bound is honesty about futility.
+
 ## 2026-09-06 (later yet) — unload repeats FreeLibrary until the module actually leaves
 
 Live test showed the honest-outcome change was not enough: unloading

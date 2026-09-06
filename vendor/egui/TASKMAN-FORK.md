@@ -146,6 +146,21 @@ every frame.
 a small review, not a re-derivation. **Update `UPSTREAM_BASE` in the same commit as the
 port.**
 
+### 5. `egui` + `egui-winit`: the Menu/Application key exists
+
+Upstream's `Key` enum has no entry for the Menu key (the Application key next to
+Right Ctrl), and egui-winit drops it in both key translations, so `key_pressed` could
+never see it. taskman binds it (and Shift+F10) to "open the context menu of the
+current selection".
+
+| File | Change | Why |
+| --- | --- | --- |
+| `crates/egui/src/data/key.rs` | `Key::ContextMenu` variant + `Key::ALL` + name mapping (accepts "ContextMenu"/"Menu"/"Apps") | The key must exist before it can be pressed. |
+| `crates/egui-winit/src/lib.rs` | `NamedKey::ContextMenu` and `KeyCode::ContextMenu` map to it in `key_from_named_key` / `key_from_key_code` | Windows reports the Menu key as both; without either mapping the press dies in the backend. |
+
+Droppable when upstream adds the key; the variant sits with the command keys, so a
+rebase conflict there is a prompt to check this table.
+
 ## Rebase runbook
 
 ```

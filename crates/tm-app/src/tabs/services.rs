@@ -245,7 +245,9 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
                 if resp.clicked() {
                     app.services_selected_name = Some(s.name.clone());
                 }
-                menu::context_menu(&resp, |ui| {
+                let keyboard_open = menu::keyboard_menu_requested(ui.ctx())
+                    && app.services_selected_name.as_deref() == Some(s.name.as_str());
+                menu::context_menu_kb(&resp, keyboard_open, |ui| {
                     ui.set_min_width(170.0);
                     let mctx = ui.ctx().clone();
                     if menu::item(ui, i18n::tr(K::StartService)).clicked() {
