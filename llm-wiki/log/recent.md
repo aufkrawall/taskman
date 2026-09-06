@@ -1,5 +1,34 @@
 # Recent Activity
 
+## 2026-09-06 (later yet) — unload repeats FreeLibrary until the module actually leaves
+
+Live test showed the honest-outcome change was not enough: unloading
+`AcGenral.DLL` (the AppCompat shim DLL Windows injects) reported "reference
+released, but still in use". That is the correct description of ONE
+FreeLibrary call — it drops exactly one loader reference, and injected or
+statically-imported DLLs are referenced several times, so a single call
+almost never unmaps anything. "Forced unload" now means what it says: the
+platform repeats the remote FreeLibrary — re-validating process identity and
+the exact module base/path on every attempt — until the module is gone or
+`MAX_FREE_LIBRARY_CALLS` (64) is spent. The outcome carries the honest count
+(`ModuleUnloadOutcome { still_mapped, released }`, over the broker as
+`BrokerValue::ModuleUnload { still_mapped, released }`), and the still-mapped
+toast says how many references were dropped ("Released 12 references, but X
+is still in use…") so a futile attempt is distinguishable from a pinned
+module the target refuses to let go (FreeLibrary returning FALSE still fails
+loudly).
+
+`module_unload_releases_every_reference_and_reports_the_count` pins the
+semantics end-to-end on the real loader: a spawned child is made to load
+`WTSAPI32.dll` three times through remote `LoadLibraryW` calls (the exact
+mirror of the unload's remote FreeLibrary), and one unload request must
+release exactly 3 references and remove the module. The test drives the
+LOCAL `WinActions` surface on purpose — it tests loader semantics, not the
+broker transport (and the installed service generation lags the workspace
+build; its `ModuleUnload` answer lacks `released`, which the new client
+reports as an undecidable error until the service is upgraded through the
+normal repair/upgrade flow).
+
 ## 2026-09-06 (later still) — row context menus are bound to the row's owner, not its slot
 
 User report: right-clicking a process on Details opened a menu that changed

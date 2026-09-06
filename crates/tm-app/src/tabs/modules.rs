@@ -9,7 +9,7 @@ use std::cmp::Ordering;
 use std::sync::{Arc, Mutex};
 use tm_core::format;
 use tm_core::i18n::{self, K};
-use tm_platform::actions::{ModuleUnloadOutcome, PlatformActions, ProcessModule};
+use tm_platform::actions::{PlatformActions, ProcessModule};
 
 use crate::app::{InFlight, ProcessIdentity, TaskManApp};
 use crate::search;
@@ -168,7 +168,7 @@ fn begin_unload(app: &TaskManApp, state: &mut State, module: ProcessModule, ctx:
                 // keeps the old one rather than throwing the dialog into
                 // its error state — an unelevated GUI cannot list an
                 // elevated target's modules at all).
-                Ok(ModuleUnloadOutcome::Unmapped) => {
+                Ok(outcome) if !outcome.still_mapped => {
                     match actions.list_process_modules(identity.pid, identity.start_epoch_s) {
                         Ok(modules) => {
                             *tm_core::sync::lock(&load) = LoadState::Ready(modules);
@@ -181,11 +181,12 @@ fn begin_unload(app: &TaskManApp, state: &mut State, module: ProcessModule, ctx:
                     }
                     i18n::trf(K::ModuleUnloadedMsg, &[&module_name])
                 }
-                // FreeLibrary released one reference, but the target still
-                // holds more — expected for implicitly-linked DLLs, not a
+                // References were dropped, but the target still holds more —
+                // expected for implicitly-linked or re-loaded modules, not a
                 // failure. The list is already accurate as it stands.
-                Ok(ModuleUnloadOutcome::StillMapped) => {
-                    i18n::trf(K::ModuleStillMappedMsg, &[&module_name])
+                Ok(outcome) => {
+                    let released = outcome.released.to_string();
+                    i18n::trf(K::ModuleStillMappedMsg, &[&released, &module_name])
                 }
                 Err(error) => i18n::trf(K::ErrMsg, &[&error.to_string()]),
             };

@@ -91,18 +91,21 @@ pub struct ProcessModule {
     pub size_bytes: u64,
 }
 
-/// What actually happened when a module unload ran. FreeLibrary releases one
-/// loader reference and succeeds even when further references keep the module
-/// mapped — the normal case for implicitly-linked DLLs — so the two states
-/// must be reported apart instead of both reading as "done" or both as
-/// "failed".
+/// What actually happened when a module unload ran.
+///
+/// FreeLibrary releases ONE loader reference per call and succeeds even when
+/// further references keep the module mapped — the normal case, since
+/// injected and statically-imported DLLs are referenced several times — so
+/// the call repeats until the module leaves or the bounded budget is spent.
+/// The two end states must be reported apart instead of both reading as
+/// "done" or both as "failed", and the honest count travels with them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ModuleUnloadOutcome {
-    /// The module is no longer mapped in the target.
-    Unmapped,
-    /// A reference was released, but the target still holds more and the
-    /// module remains loaded. Expected behavior, not an error.
-    StillMapped,
+pub struct ModuleUnloadOutcome {
+    /// True when references remain and the module is still mapped. Expected
+    /// for pinned or still-used modules, not an error.
+    pub still_mapped: bool,
+    /// Loader references the repeated FreeLibrary calls dropped.
+    pub released: u32,
 }
 
 pub trait PlatformActions: Send + Sync {

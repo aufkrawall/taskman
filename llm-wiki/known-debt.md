@@ -125,9 +125,10 @@ crash warning. What remains is technical, not policy: same-architecture
 targets only (a 64-bit FreeLibrary address cannot be injected into a 32-bit
 process), process-level trust rules at the broker (critical/system/requesting-
 GUI targets refused), TaskMan refusing to act on itself, and the exact
-process identity + module base/path revalidation at action time. The honest
-`ModuleUnloadOutcome` (unmapped vs. a reference released but still in use)
-is what the user sees; most statically-imported DLLs cannot actually leave.
+process identity + module base/path revalidation at action time. The unload repeats
+FreeLibrary until the module leaves or the bounded budget is spent, and the
+honest `ModuleUnloadOutcome` (still mapped, with how many references were
+dropped) is what the user sees; permanently pinned or re-loaded modules stay.
 
 ## Core-service production hardening still outstanding
 

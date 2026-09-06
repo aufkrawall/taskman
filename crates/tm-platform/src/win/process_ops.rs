@@ -255,12 +255,18 @@ fn verify_pid_still_refers_to(pid: u32, opened_creation: Option<u64>) -> Result<
     }
 }
 
-/// Release a third-party DLL by running FreeLibrary inside the target. The
-/// operation is deliberately fail-closed: exact process identity and module
-/// base/path are revalidated, main/system images are refused, and cross-
-/// architecture injection is not attempted. The outcome distinguishes "the
-/// module left" from "a reference was released but it is still in use" —
-/// FreeLibrary succeeds in both cases.
+/// One FreeLibrary call drops ONE loader reference. Injected and
+/// statically-imported DLLs are referenced several times, so the call
+/// repeats until the module actually leaves. Bounded, so a module the
+/// target keeps re-loading or permanently pins cannot spin this forever.
+const MAX_FREE_LIBRARY_CALLS: u32 = 64;
+
+/// Release a DLL by running FreeLibrary inside the target, repeatedly,
+/// until it is no longer mapped. The operation is deliberately fail-closed:
+/// exact process identity and module base/path are revalidated on every
+/// attempt, and cross-architecture injection is not attempted. The outcome
+/// distinguishes "the module left" from "references were released but it is
+/// still in use" — FreeLibrary succeeds in both.
 pub fn unload_process_module(
     pid: u32,
     expected_start_epoch_s: Option<i64>,
@@ -301,19 +307,22 @@ pub fn unload_process_module(
             ));
         }
 
-        let modules = module_snapshot(pid)?;
+        let mut modules = module_snapshot(pid)?;
         verify_pid_still_refers_to(pid, opened_creation)?;
         // Which module to unload is the user's call; the only action-time
         // requirement is that it is still mapped exactly where it was
         // selected. If the load state changed underneath the dialog, the
         // exact base/path match fails closed here.
-        modules
-            .iter()
-            .find(|module| {
-                module.base_address == base_address
-                    && module.path.eq_ignore_ascii_case(expected_path)
-            })
-            .ok_or_else(|| TmError::platform("unload module", "module is no longer loaded"))?;
+        let is_selected = |candidate: &ProcessModule| {
+            candidate.base_address == base_address
+                && candidate.path.eq_ignore_ascii_case(expected_path)
+        };
+        if !modules.iter().any(is_selected) {
+            return Err(TmError::platform(
+                "unload module",
+                "module is no longer loaded",
+            ));
+        }
 
         let kernel32_w: Vec<u16> = "kernel32.dll\0".encode_utf16().collect();
         let local_kernel32 = unsafe { GetModuleHandleW(PCWSTR::from_raw(kernel32_w.as_ptr())) }
@@ -365,58 +374,65 @@ pub fn unload_process_module(
         });
         let remote_module = usize::try_from(base_address)
             .map_err(|_| TmError::platform("unload module", "module address is out of range"))?;
-        let thread = unsafe {
-            th::CreateRemoteThread(
-                process,
-                None,
-                0,
-                start,
-                Some(remote_module as *const core::ffi::c_void),
-                0,
-                None,
-            )
-        }
-        .map_err(|error| TmError::platform("CreateRemoteThread", error.to_string()))?;
-        let wait = unsafe { th::WaitForSingleObject(thread, 15_000) };
-        if wait != WAIT_OBJECT_0 {
+
+        let mut released: u32 = 0;
+        loop {
+            if released >= MAX_FREE_LIBRARY_CALLS {
+                tracing::info!(
+                    pid,
+                    expected_path,
+                    released,
+                    "references were released, but the module is still mapped"
+                );
+                return Ok(ModuleUnloadOutcome {
+                    still_mapped: true,
+                    released,
+                });
+            }
+
+            let thread = unsafe {
+                th::CreateRemoteThread(
+                    process,
+                    None,
+                    0,
+                    start,
+                    Some(remote_module as *const core::ffi::c_void),
+                    0,
+                    None,
+                )
+            }
+            .map_err(|error| TmError::platform("CreateRemoteThread", error.to_string()))?;
+            let wait = unsafe { th::WaitForSingleObject(thread, 15_000) };
+            if wait != WAIT_OBJECT_0 {
+                let _ = unsafe { CloseHandle(thread) };
+                return Err(TmError::platform(
+                    "unload module",
+                    "timed out; target state is unknown",
+                ));
+            }
+            let mut exit_code = 0u32;
+            let exit_result = unsafe { th::GetExitCodeThread(thread, &mut exit_code) }
+                .map_err(|error| TmError::platform("GetExitCodeThread", error.to_string()));
             let _ = unsafe { CloseHandle(thread) };
-            return Err(TmError::platform(
-                "unload module",
-                "timed out; target state is unknown",
-            ));
-        }
-        let mut exit_code = 0u32;
-        let exit_result = unsafe { th::GetExitCodeThread(thread, &mut exit_code) }
-            .map_err(|error| TmError::platform("GetExitCodeThread", error.to_string()));
-        let _ = unsafe { CloseHandle(thread) };
-        exit_result?;
-        if exit_code == 0 {
-            return Err(TmError::platform(
-                "FreeLibrary",
-                "target rejected the unload (module may be statically linked or pinned by the application)",
-            ));
-        }
-        // FreeLibrary releases ONE loader reference. Report honestly whether
-        // that actually unmapped the module: a "success" toast next to a
-        // module that is still listed reads as the feature being broken, and
-        // implicitly-linked DLLs keep a static reference no FreeLibrary can
-        // drop. The caller keeps its list in that case instead of refreshing
-        // it.
-        let remaining = module_snapshot(pid)?;
-        verify_pid_still_refers_to(pid, opened_creation)?;
-        let still_mapped = remaining.iter().any(|candidate| {
-            candidate.base_address == base_address
-                && candidate.path.eq_ignore_ascii_case(expected_path)
-        });
-        if still_mapped {
-            tracing::info!(
-                pid,
-                expected_path,
-                "a loader reference was released, but remaining references keep the module mapped"
-            );
-            Ok(ModuleUnloadOutcome::StillMapped)
-        } else {
-            Ok(ModuleUnloadOutcome::Unmapped)
+            exit_result?;
+            if exit_code == 0 {
+                return Err(TmError::platform(
+                    "FreeLibrary",
+                    "target rejected the unload (module may be statically linked or pinned by the application)",
+                ));
+            }
+            released += 1;
+
+            // The target may have unloaded the module itself in between; a
+            // reused PID fails the identity check before anything else.
+            modules = module_snapshot(pid)?;
+            verify_pid_still_refers_to(pid, opened_creation)?;
+            if !modules.iter().any(is_selected) {
+                return Ok(ModuleUnloadOutcome {
+                    still_mapped: false,
+                    released,
+                });
+            }
         }
     })();
     let _ = unsafe { CloseHandle(process) };

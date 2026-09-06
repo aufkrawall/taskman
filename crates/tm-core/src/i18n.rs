@@ -163,8 +163,8 @@ keys! {
     ],
     ModuleUnloadedMsg => ["Modul entladen: {}", "Module unloaded: {}"],
     ModuleStillMappedMsg => [
-        "Referenz freigegeben, aber {} wird noch verwendet und bleibt geladen",
-        "Reference released, but {} is still in use and remains loaded"
+        "{} Referenzen freigegeben, aber {} wird noch verwendet und bleibt geladen",
+        "Released {} references, but {} is still in use and remains loaded"
     ],
     ModuleBusy => ["Eine Modulaktion läuft bereits", "A module action is already running"],
     SelectModuleFirst => ["Zuerst ein Modul auswählen", "Select a module first"],

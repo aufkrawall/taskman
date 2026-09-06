@@ -194,11 +194,14 @@ platform boundary (`tm-core` ← `tm-platform` ← `tm-app` / `tm-service`):
   `FreeLibrary` is intentionally guarded by exact process creation timestamp,
   exact module base/path re-enumeration, same-architecture checks, and
   self/critical-process refusals. WHICH module to unload is the user's call
-  (product decision 2026-09-06): there is no protected-module gate, and the
-  honest `ModuleUnloadOutcome` (unmapped vs. reference released but still
-  mapped) crosses the broker as `BrokerValue::ModuleUnload` — never as an
-  error string. Keep it off the sampler and UI thread, and never weaken the
-  second confirmation in `tabs/modules.rs`.
+  (product decision 2026-09-06): there is no protected-module gate. One
+  FreeLibrary drops ONE loader reference, so the unload REPEATS the remote
+  call (bounded by `MAX_FREE_LIBRARY_CALLS`, identity + base/path
+  revalidated per attempt) until the module leaves; the honest
+  `ModuleUnloadOutcome { still_mapped, released }` crosses the broker as
+  `BrokerValue::ModuleUnload` — never as an error string. Keep it off the
+  sampler and UI thread, and never weaken the second confirmation in
+  `tabs/modules.rs`.
 
 ## Test Matrix
 

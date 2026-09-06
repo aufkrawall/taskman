@@ -198,11 +198,13 @@ enum BrokerValue {
     ProcessNetwork(ProcessNetworkSample),
     /// Result of `UnloadModule`. `still_mapped` is the honest outcome: a
     /// released reference does not imply the module left, and the UI words
-    /// the two states differently. An older service answers `Unit` here,
+    /// the two states differently; `released` is the number of loader
+    /// references FreeLibrary dropped. An older service answers `Unit` here,
     /// which the client reports as an undecidable outcome rather than a
     /// fabricated success.
     ModuleUnload {
         still_mapped: bool,
+        released: u32,
     },
 }
 
@@ -855,10 +857,12 @@ impl PlatformActions for BrokeredActions {
                 expected_path: expected_path.to_string(),
             },
             |value| match value {
-                BrokerValue::ModuleUnload { still_mapped } => Some(if still_mapped {
-                    ModuleUnloadOutcome::StillMapped
-                } else {
-                    ModuleUnloadOutcome::Unmapped
+                BrokerValue::ModuleUnload {
+                    still_mapped,
+                    released,
+                } => Some(ModuleUnloadOutcome {
+                    still_mapped,
+                    released,
                 }),
                 _ => None,
             },
@@ -1498,13 +1502,16 @@ fn dispatch(
                     "invalid module identity",
                 ));
             }
-            let still_mapped = actions.unload_process_module(
+            let outcome = actions.unload_process_module(
                 pid,
                 expected_start_epoch_s,
                 base_address,
                 &expected_path,
-            )? == ModuleUnloadOutcome::StillMapped;
-            Ok(BrokerValue::ModuleUnload { still_mapped })
+            )?;
+            Ok(BrokerValue::ModuleUnload {
+                still_mapped: outcome.still_mapped,
+                released: outcome.released,
+            })
         }
         BrokerRequest::ControlService { name, action } => {
             if !valid_service_name(&name) || name.eq_ignore_ascii_case(SERVICE_NAME) {

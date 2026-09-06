@@ -443,3 +443,204 @@ fn network_trace_raw_vs_pruned() {
     assert!(!live.is_empty(), "process enumeration returned nothing");
     assert!(!pruned.is_empty(), "pruning removed every counter");
 }
+
+/// The reason a single FreeLibrary can never unload most DLLs: it releases
+/// ONE loader reference, and anything injected or statically imported is
+/// referenced several times. The unload must repeat until the module leaves
+/// and report how many references it dropped. Proven end-to-end: a child is
+/// made to load a DLL three times through remote LoadLibraryW calls (the
+/// exact mirror of the unload's remote FreeLibrary), and one unload request
+/// has to release all three and unmapped the module.
+#[cfg(target_os = "windows")]
+#[test]
+fn module_unload_releases_every_reference_and_reports_the_count() {
+    use tm_platform::actions::PlatformActions;
+
+    const DLL: &str = r"C:\Windows\System32\WTSAPI32.dll";
+    const DLL_NAME: &str = "WTSAPI32.DLL";
+    const LOADS: u32 = 3;
+
+    // The LOCAL action surface: this test is about the unload loop's loader
+    // semantics, not the broker transport. (The installed service may be an
+    // older generation; every other brokered integration test already pins
+    // the transport.)
+    let actions = tm_platform::win::WinActions;
+    let mut child = std::process::Command::new("cmd")
+        .args(["/C", "ping", "-n", "30", "127.0.0.1"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn child");
+    let pid = child.id();
+    wait_until_visible(pid);
+
+    let cleanup = |child: &mut std::process::Child| {
+        let _ = actions.kill_single(child.id());
+        let _ = child.wait();
+    };
+
+    // Identity for the action calls, straight from the same source the UI
+    // uses, so the test also pins the snapshot-epoch path.
+    let mut collector = tm_platform::create_collector();
+    let epoch = poll_for(
+        || {
+            collector
+                .sample(std::time::Instant::now())
+                .ok()
+                .and_then(|snap| snap.process(pid).map(|p| p.start_epoch_s))
+        },
+        std::time::Duration::from_secs(10),
+    )
+    .expect("child epoch in snapshot");
+
+    // The probe DLL must not already be mapped.
+    let initial = actions
+        .list_process_modules(pid, epoch)
+        .expect("child module list");
+    assert!(
+        !initial
+            .iter()
+            .any(|m| m.name.eq_ignore_ascii_case(DLL_NAME)),
+        "{DLL_NAME} is unexpectedly preloaded in the child"
+    );
+
+    // Locate LoadLibraryW in the child the same way the unload locates
+    // FreeLibrary: local address, owning module, same-named module in the
+    // target, relative offset.
+    let local_modules = actions
+        .list_process_modules(std::process::id(), None)
+        .expect("own module list");
+    let child_modules = actions
+        .list_process_modules(pid, epoch)
+        .expect("child modules");
+    let load_library_w = unsafe {
+        windows::Win32::System::LibraryLoader::GetProcAddress(
+            windows::Win32::System::LibraryLoader::GetModuleHandleW(
+                windows::core::PCWSTR::from_raw(
+                    "kernel32.dll\0"
+                        .encode_utf16()
+                        .collect::<Vec<u16>>()
+                        .as_ptr(),
+                ),
+            )
+            .expect("kernel32 handle"),
+            windows::core::s!("LoadLibraryW"),
+        )
+        .expect("LoadLibraryW address")
+    } as usize;
+    let local_owner = local_modules
+        .iter()
+        .find(|m| {
+            let start = m.base_address as usize;
+            (start..start.saturating_add(m.size_bytes as usize)).contains(&load_library_w)
+        })
+        .expect("LoadLibraryW owner")
+        .clone();
+    let remote_owner = child_modules
+        .iter()
+        .find(|m| m.name.eq_ignore_ascii_case(&local_owner.name))
+        .expect("child loader runtime")
+        .clone();
+    let remote_proc =
+        remote_owner.base_address as usize + (load_library_w - local_owner.base_address as usize);
+
+    let child_handle = unsafe {
+        windows::Win32::System::Threading::OpenProcess(
+            windows::Win32::System::Threading::PROCESS_CREATE_THREAD
+                | windows::Win32::System::Threading::PROCESS_QUERY_INFORMATION
+                | windows::Win32::System::Threading::PROCESS_VM_OPERATION
+                | windows::Win32::System::Threading::PROCESS_VM_WRITE
+                | windows::Win32::System::Threading::PROCESS_VM_READ,
+            false,
+            pid,
+        )
+        .expect("open child")
+    };
+
+    // Write the UTF-16 DLL path into the child.
+    let path_utf16: Vec<u16> = DLL.encode_utf16().chain([0]).collect();
+    let bytes_len = path_utf16.len() * 2;
+    let remote_string = unsafe {
+        windows::Win32::System::Memory::VirtualAllocEx(
+            child_handle,
+            None,
+            bytes_len,
+            windows::Win32::System::Memory::MEM_RESERVE
+                | windows::Win32::System::Memory::MEM_COMMIT,
+            windows::Win32::System::Memory::PAGE_READWRITE,
+        )
+    };
+    assert!(!remote_string.is_null(), "could not allocate in the child");
+    unsafe {
+        windows::Win32::System::Diagnostics::Debug::WriteProcessMemory(
+            child_handle,
+            remote_string,
+            path_utf16.as_ptr().cast(),
+            bytes_len,
+            None,
+        )
+        .expect("write path into child");
+    }
+
+    let start: windows::Win32::System::Threading::LPTHREAD_START_ROUTINE = Some(unsafe {
+        std::mem::transmute::<usize, unsafe extern "system" fn(*mut core::ffi::c_void) -> u32>(
+            remote_proc,
+        )
+    });
+    for _ in 0..LOADS {
+        let thread = unsafe {
+            windows::Win32::System::Threading::CreateRemoteThread(
+                child_handle,
+                None,
+                0,
+                start,
+                Some(remote_string),
+                0,
+                None,
+            )
+            .expect("remote LoadLibraryW")
+        };
+        let waited =
+            unsafe { windows::Win32::System::Threading::WaitForSingleObject(thread, 15_000) };
+        assert_eq!(
+            waited,
+            windows::Win32::Foundation::WAIT_OBJECT_0,
+            "remote load did not finish"
+        );
+        let mut exit_code = 0u32;
+        unsafe {
+            windows::Win32::System::Threading::GetExitCodeThread(thread, &mut exit_code)
+                .expect("load exit code");
+        }
+        let _ = unsafe { windows::Win32::Foundation::CloseHandle(thread) };
+        assert_ne!(exit_code, 0, "LoadLibraryW in the child failed");
+    }
+    // The remote string is child memory, not a handle: it is reclaimed when
+    // the child exits.
+    let _ = unsafe { windows::Win32::Foundation::CloseHandle(child_handle) };
+
+    let mapped = actions
+        .list_process_modules(pid, epoch)
+        .expect("child modules after loads");
+    let module = mapped
+        .iter()
+        .find(|m| m.name.eq_ignore_ascii_case(DLL_NAME))
+        .expect("injected DLL mapped in child")
+        .clone();
+
+    // The actual behavior under test: one request drops EVERY reference.
+    let outcome = actions
+        .unload_process_module(pid, epoch, module.base_address, &module.path)
+        .expect("unload request");
+    assert!(!outcome.still_mapped, "module still mapped after unloading");
+    assert_eq!(outcome.released, LOADS, "unexpected reference count");
+    let after = actions
+        .list_process_modules(pid, epoch)
+        .expect("child modules after unload");
+    assert!(
+        !after.iter().any(|m| m.name.eq_ignore_ascii_case(DLL_NAME)),
+        "module still listed after a reported-unmapped unload"
+    );
+
+    cleanup(&mut child);
+}
