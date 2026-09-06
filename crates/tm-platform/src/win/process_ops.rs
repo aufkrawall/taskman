@@ -527,22 +527,52 @@ pub fn resolve_candidate_path(name: &str) -> Option<std::path::PathBuf> {
         std::path::PathBuf::from(r"C:\Windows").join(&exe_name),
         std::path::PathBuf::from(r"C:\Program Files (x86)\Microsoft\EdgeUpdate").join(&exe_name),
         std::path::PathBuf::from(r"C:\Program Files\Microsoft GameInput\x64").join(&exe_name),
+        std::path::PathBuf::from(r"C:\Program Files\NVIDIA Corporation\Display.NvContainer")
+            .join(&exe_name),
     ];
     candidates.into_iter().find(|c| c.is_file())
 }
 
-/// Map running Windows service PIDs to their executable paths.
-pub fn service_exe_paths() -> std::collections::HashMap<u32, std::path::PathBuf> {
+#[derive(Debug, Clone, Default)]
+pub struct ServiceCatalog {
+    pub paths_by_pid: std::collections::HashMap<u32, std::path::PathBuf>,
+    pub paths_by_name: std::collections::HashMap<String, std::path::PathBuf>,
+    pub accounts_by_name: std::collections::HashMap<String, String>,
+}
+
+pub fn normalize_service_account(raw: &str) -> String {
+    let s = raw.trim();
+    if s.eq_ignore_ascii_case("LocalSystem") {
+        return "SYSTEM".to_string();
+    }
+    if let Some((dom, user)) = s.split_once('\\')
+        && (is_authority_domain(dom) || dom == ".")
+    {
+        return normalize_service_account(user);
+    }
+    if s.eq_ignore_ascii_case("SYSTEM") {
+        "SYSTEM".to_string()
+    } else if s.eq_ignore_ascii_case("LocalService") {
+        "LOCAL SERVICE".to_string()
+    } else if s.eq_ignore_ascii_case("NetworkService") {
+        "NETWORK SERVICE".to_string()
+    } else {
+        s.to_string()
+    }
+}
+
+/// Catalog running Windows services: their executable paths and service accounts.
+pub fn service_catalog() -> ServiceCatalog {
     use windows::Win32::System::Services as scm;
     use windows::core::PCWSTR;
-    let mut map = std::collections::HashMap::new();
+    let mut catalog = ServiceCatalog::default();
     unsafe {
         let Ok(mgr) = scm::OpenSCManagerW(
             PCWSTR::null(),
             PCWSTR::null(),
             scm::SC_MANAGER_ENUMERATE_SERVICE | scm::SC_MANAGER_CONNECT,
         ) else {
-            return map;
+            return catalog;
         };
         let mut needed = 0u32;
         let mut returned = 0u32;
@@ -577,9 +607,6 @@ pub fn service_exe_paths() -> std::collections::HashMap<u32, std::path::PathBuf>
                 );
                 for it in items {
                     let pid = it.ServiceStatusProcess.dwProcessId;
-                    if pid == 0 || map.contains_key(&pid) {
-                        continue;
-                    }
                     if let Ok(svc) = scm::OpenServiceW(
                         mgr,
                         PCWSTR::from_raw(it.lpServiceName.0),
@@ -598,7 +625,9 @@ pub fn service_exe_paths() -> std::collections::HashMap<u32, std::path::PathBuf>
                             .is_ok()
                             {
                                 let cfg = &*(cfg_buf.as_ptr() as *const scm::QUERY_SERVICE_CONFIGW);
-                                if !cfg.lpBinaryPathName.is_null() {
+                                let clean = if !cfg.lpBinaryPathName.is_null()
+                                    && !cfg.lpBinaryPathName.0.is_null()
+                                {
                                     let mut len = 0;
                                     while *cfg.lpBinaryPathName.0.add(len) != 0 {
                                         len += 1;
@@ -606,8 +635,63 @@ pub fn service_exe_paths() -> std::collections::HashMap<u32, std::path::PathBuf>
                                     let raw_path = String::from_utf16_lossy(
                                         std::slice::from_raw_parts(cfg.lpBinaryPathName.0, len),
                                     );
-                                    if let Some(clean) = extract_executable_path(&raw_path) {
-                                        map.insert(pid, clean);
+                                    extract_executable_path(&raw_path)
+                                } else {
+                                    None
+                                };
+
+                                let account = if !cfg.lpServiceStartName.is_null()
+                                    && !cfg.lpServiceStartName.0.is_null()
+                                {
+                                    let mut len = 0;
+                                    while *cfg.lpServiceStartName.0.add(len) != 0 {
+                                        len += 1;
+                                    }
+                                    if len > 0 {
+                                        let raw_account =
+                                            String::from_utf16_lossy(std::slice::from_raw_parts(
+                                                cfg.lpServiceStartName.0,
+                                                len,
+                                            ));
+                                        Some(normalize_service_account(&raw_account))
+                                    } else {
+                                        None
+                                    }
+                                } else {
+                                    None
+                                };
+
+                                if let Some(path) = clean {
+                                    if pid != 0 {
+                                        catalog
+                                            .paths_by_pid
+                                            .entry(pid)
+                                            .or_insert_with(|| path.clone());
+                                    }
+                                    if let Some(file_name) =
+                                        path.file_name().and_then(|f| f.to_str())
+                                    {
+                                        let norm = file_name.to_ascii_lowercase();
+                                        let stem =
+                                            norm.strip_suffix(".exe").unwrap_or(&norm).to_string();
+                                        catalog
+                                            .paths_by_name
+                                            .entry(norm.clone())
+                                            .or_insert_with(|| path.clone());
+                                        catalog
+                                            .paths_by_name
+                                            .entry(stem.clone())
+                                            .or_insert_with(|| path.clone());
+                                        if let Some(acc) = account.as_ref() {
+                                            catalog
+                                                .accounts_by_name
+                                                .entry(norm)
+                                                .or_insert_with(|| acc.clone());
+                                            catalog
+                                                .accounts_by_name
+                                                .entry(stem)
+                                                .or_insert_with(|| acc.clone());
+                                        }
                                     }
                                 }
                             }
@@ -619,7 +703,13 @@ pub fn service_exe_paths() -> std::collections::HashMap<u32, std::path::PathBuf>
         }
         let _ = scm::CloseServiceHandle(mgr);
     }
-    map
+    catalog
+}
+
+/// Map running Windows service PIDs to their executable paths.
+#[allow(dead_code)]
+pub fn service_exe_paths() -> std::collections::HashMap<u32, std::path::PathBuf> {
+    service_catalog().paths_by_pid
 }
 
 pub fn priority_class_of(pid: u32) -> PriorityClass {
@@ -2119,5 +2209,31 @@ mod tests {
         // PID reuse makes a fixed "unused" pid impossible, but a pid this
         // large cannot exist and OpenProcess must fail cleanly.
         assert_eq!(command_line_of(u32::MAX - 8), None);
+    }
+
+    #[test]
+    fn normalize_service_account_formats_common_identities() {
+        assert_eq!(normalize_service_account("LocalSystem"), "SYSTEM");
+        assert_eq!(normalize_service_account(r"NT AUTHORITY\SYSTEM"), "SYSTEM");
+        assert_eq!(normalize_service_account(r".\LocalSystem"), "SYSTEM");
+        assert_eq!(
+            normalize_service_account(r"NT AUTHORITY\LocalService"),
+            "LOCAL SERVICE"
+        );
+        assert_eq!(normalize_service_account("LocalService"), "LOCAL SERVICE");
+        assert_eq!(
+            normalize_service_account(r"NT AUTHORITY\NetworkService"),
+            "NETWORK SERVICE"
+        );
+        assert_eq!(normalize_service_account(r".\Julian"), "Julian");
+    }
+
+    #[test]
+    fn service_catalog_discovers_active_services() {
+        let catalog = service_catalog();
+        assert!(
+            !catalog.paths_by_name.is_empty(),
+            "Windows always has active services"
+        );
     }
 }

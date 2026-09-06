@@ -513,16 +513,35 @@ impl Sampler {
         }
 
         let mut processes: Vec<ProcessEntry> = Vec::with_capacity(n_procs);
-        let service_paths = process_ops::service_exe_paths();
+        let service_catalog = process_ops::service_catalog();
+        let mut known_paths_by_name = service_catalog.paths_by_name.clone();
+        for proc in self.sys.processes().values() {
+            if let Some(exe) = proc.exe()
+                && let Some(fname) = exe.file_name().and_then(|f| f.to_str())
+            {
+                let norm = fname.to_ascii_lowercase();
+                let stem = norm.strip_suffix(".exe").unwrap_or(&norm).to_string();
+                known_paths_by_name
+                    .entry(norm)
+                    .or_insert_with(|| exe.to_path_buf());
+                known_paths_by_name
+                    .entry(stem)
+                    .or_insert_with(|| exe.to_path_buf());
+            }
+        }
 
         for (pid, p) in self.sys.processes() {
             let pid_u = pid.as_u32();
             // Single owned copy of the name per process (reused everywhere).
             let name = p.name().to_string_lossy().into_owned();
+            let norm_name = name.to_ascii_lowercase();
+            let stem_name = norm_name.strip_suffix(".exe").unwrap_or(&norm_name);
             let exe_owned = p
                 .exe()
                 .map(|e| e.to_path_buf())
-                .or_else(|| service_paths.get(&pid_u).cloned())
+                .or_else(|| service_catalog.paths_by_pid.get(&pid_u).cloned())
+                .or_else(|| known_paths_by_name.get(&norm_name).cloned())
+                .or_else(|| known_paths_by_name.get(stem_name).cloned())
                 .or_else(|| process_ops::resolve_candidate_path(&name));
             let has_window = window_owners.visible.contains(&pid_u);
 
@@ -622,51 +641,57 @@ impl Sampler {
             p.handles = a
                 .handles
                 .or_else(|| self.cpu_load.handle_count_of(p.pid, p.start_epoch_s));
+            let norm = p.name.to_ascii_lowercase();
+            let stem = norm.strip_suffix(".exe").unwrap_or(&norm);
+            let is_kernel_or_system = p.pid == 0
+                || p.pid == 4
+                || matches!(
+                    stem,
+                    "[system process]"
+                        | "system"
+                        | "secure system"
+                        | "registry"
+                        | "memory compression"
+                        | "csrss"
+                        | "winlogon"
+                        | "fontdrvhost"
+                        | "dwm"
+                        | "smss"
+                        | "wininit"
+                        | "services"
+                        | "lsass"
+                        | "sihost"
+                        | "taskhostw"
+                        | "gameinputsvc"
+                        | "nvdisplay.container"
+                );
+
             p.wow64 = a.wow64;
             if p.wow64.is_none() {
-                let norm = p.name.to_ascii_lowercase();
-                let stem = norm.strip_suffix(".exe").unwrap_or(&norm);
-                if p.pid == 0
-                    || p.pid == 4
-                    || matches!(
-                        stem,
-                        "[system process]"
-                            | "system"
-                            | "secure system"
-                            | "registry"
-                            | "memory compression"
-                            | "csrss"
-                            | "winlogon"
-                            | "fontdrvhost"
-                            | "dwm"
-                            | "smss"
-                            | "wininit"
-                            | "services"
-                            | "lsass"
-                            | "sihost"
-                            | "taskhostw"
-                    )
-                {
-                    p.wow64 = Some(false);
-                } else if let Some(exe_path) = &p.exe_path {
+                if let Some(exe_path) = &p.exe_path {
                     p.wow64 = process_ops::pe_is_wow64(exe_path);
-                } else if let Some(cand) = process_ops::resolve_candidate_path(&p.name) {
+                } else if let Some(cand) = known_paths_by_name
+                    .get(&norm)
+                    .cloned()
+                    .or_else(|| known_paths_by_name.get(stem).cloned())
+                    .or_else(|| process_ops::resolve_candidate_path(&p.name))
+                {
                     p.wow64 = process_ops::pe_is_wow64(&cand);
                     if p.exe_path.is_none() {
                         p.exe_path = Some(cand);
                     }
+                } else if is_kernel_or_system {
+                    p.wow64 = Some(false);
                 }
             }
             p.elevated = a.elevated;
             p.uac_virtualization = a.uac_virtualization;
             p.power_throttled = a.power_throttled;
             p.command_line = a.command_line;
-            // The User column is filled from three sources, strongest first:
+            // The User column is filled from four sources, strongest first:
             // sysinfo's own token read, our narrower token read (which
             // succeeds for the session-0 service hosts sysinfo cannot open),
-            // and finally the session id — session 0 has no interactive owner
-            // and belongs to the system, which is what Task Manager shows for
-            // the handful of protected processes no token can be read from.
+            // the service catalog account, and known system/kernel session roles.
             // Anything else stays unknown; a guessed account is worse than "—".
             if p.user.is_none() {
                 p.user = a.user;
@@ -675,8 +700,32 @@ impl Sampler {
                 let session = a
                     .session_id
                     .or_else(|| self.cpu_load.session_id_of(p.pid, p.start_epoch_s));
-                if session == Some(0) {
+                if stem == "dwm" {
+                    p.user = Some(format!("DWM-{}", session.unwrap_or(1)));
+                } else if stem == "fontdrvhost" {
+                    p.user = Some(format!("UMFD-{}", session.unwrap_or(0)));
+                } else if matches!(
+                    stem,
+                    "[system process]"
+                        | "system"
+                        | "secure system"
+                        | "registry"
+                        | "memory compression"
+                        | "smss"
+                        | "csrss"
+                        | "wininit"
+                        | "services"
+                        | "lsass"
+                        | "winlogon"
+                ) || session == Some(0)
+                {
                     p.user = Some("SYSTEM".to_string());
+                } else if let Some(acc) = service_catalog
+                    .accounts_by_name
+                    .get(stem)
+                    .or_else(|| service_catalog.accounts_by_name.get(&norm))
+                {
+                    p.user = Some(acc.clone());
                 }
             }
 
@@ -685,26 +734,6 @@ impl Sampler {
             // Kernel pseudo-processes and Session 0 / SYSTEM services always run
             // with full system elevation and no UAC virtualization.
             if p.elevated.is_none() {
-                let norm = p.name.to_ascii_lowercase();
-                let stem = norm.strip_suffix(".exe").unwrap_or(&norm);
-                let is_kernel_or_system = p.pid == 0
-                    || p.pid == 4
-                    || matches!(
-                        stem,
-                        "[system process]"
-                            | "system"
-                            | "secure system"
-                            | "registry"
-                            | "memory compression"
-                            | "smss"
-                            | "csrss"
-                            | "wininit"
-                            | "services"
-                            | "lsass"
-                            | "winlogon"
-                            | "fontdrvhost"
-                            | "dwm"
-                    );
                 let session = a
                     .session_id
                     .or_else(|| self.cpu_load.session_id_of(p.pid, p.start_epoch_s));
@@ -712,6 +741,8 @@ impl Sampler {
                     u.eq_ignore_ascii_case("SYSTEM")
                         || u.eq_ignore_ascii_case("LOCAL SERVICE")
                         || u.eq_ignore_ascii_case("NETWORK SERVICE")
+                        || u.to_ascii_uppercase().starts_with("DWM-")
+                        || u.to_ascii_uppercase().starts_with("UMFD-")
                 });
 
                 if is_kernel_or_system || session == Some(0) || is_service_account {

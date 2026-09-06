@@ -1,5 +1,23 @@
 # Recent Activity
 
+## 2026-09-06 — ServiceCatalog, DriverStore paths, multi-session process user/elevation & platform resolution
+
+Comprehensive resolution of platform (32-bit vs 64-bit), user name, elevation, and UAC virtualization for protected processes and service helpers across sessions (Session 0 and interactive sessions):
+
+1. **Service catalog & DriverStore path resolution**:
+   - Replaced PID-only service paths with `ServiceCatalog` (`paths_by_pid`, `paths_by_name`, `accounts_by_name`).
+   - SCM queries for active services retrieve full binary paths (including driver repositories like `System32\DriverStore\FileRepository\...\NVDisplay.Container.exe`) and service accounts (`LocalSystem` -> `SYSTEM`, `LocalService`, `NetworkService`).
+   - Seeded `known_paths_by_name` with `service_catalog` and all paths discovered by `sysinfo`. Secondary / session-helper instances (such as `NVDisplay.Container.exe` in Session 1 spawned by Session 0) now resolve their exact executable path on disk, enabling `pe_is_wow64` and `version::query`.
+2. **Multi-session process user name attribution**:
+   - `csrss.exe` and `winlogon.exe` always run as `SYSTEM` in all sessions.
+   - `dwm.exe` runs as `DWM-<session_id>` (e.g. `DWM-1`).
+   - `fontdrvhost.exe` runs as `UMFD-<session_id>` (e.g. `UMFD-0`, `UMFD-1`).
+   - Service helpers in non-zero sessions (`GameInputSvc.exe`, `NVDisplay.Container.exe`) resolve account names via `service_catalog.accounts_by_name`.
+3. **Elevation & UAC virtualization inference**:
+   - Service accounts (`SYSTEM`, `LOCAL SERVICE`, `NETWORK SERVICE`, `DWM-*`, `UMFD-*`) and kernel/session subsystem processes are reliably recognized as elevated (`Some(true)`) with `UacVirtualization::NotAllowed`, removing "Unknown" fields in Details.
+4. **Platform (wow64) detection**:
+   - Inspects PE header of resolved executables on disk via `pe_is_wow64(exe)`. Falls back to known 64-bit subsystem rules (`is_kernel_or_system`), ensuring both 32-bit services (e.g. `steamservice.exe`, `MicrosoftEdgeUpdate.exe`) and 64-bit drivers (`NVDisplay.Container.exe`, `GameInputSvc.exe`) report correctly.
+
 ## 2026-09-06 — Tray focus & dismiss, GPU graph right-click, dialog keyboard nav, service platforms & module unloading
 
 Five follow-up fixes addressing tray menu focus, GPU engine switching, dialog keyboard navigation, platform detection for protected/service processes, and module unloading:
