@@ -353,7 +353,7 @@ impl PlatformActions for WinActions {
         expected_start_epoch_s: Option<i64>,
         base_address: u64,
         expected_path: &str,
-    ) -> Result<()> {
+    ) -> Result<ModuleUnloadOutcome> {
         process_ops::unload_process_module(pid, expected_start_epoch_s, base_address, expected_path)
     }
     fn is_elevated(&self) -> bool {

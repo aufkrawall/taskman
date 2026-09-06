@@ -162,11 +162,11 @@ keys! {
         "Forced unloading can immediately crash or corrupt the target process. Use only for diagnostics."
     ],
     ModuleUnloadedMsg => ["Modul entladen: {}", "Module unloaded: {}"],
-    ModuleBusy => ["Eine Modulaktion läuft bereits", "A module action is already running"],
-    ModuleProtected => [
-        "Programmabbilder und Windows-Systemmodule werden nicht entladen",
-        "Program images and Windows system modules cannot be unloaded"
+    ModuleStillMappedMsg => [
+        "Referenz freigegeben, aber {} wird noch verwendet und bleibt geladen",
+        "Reference released, but {} is still in use and remains loaded"
     ],
+    ModuleBusy => ["Eine Modulaktion läuft bereits", "A module action is already running"],
     SelectModuleFirst => ["Zuerst ein Modul auswählen", "Select a module first"],
     CopyPath => ["Pfad kopieren", "Copy path"],
     Properties => ["Eigenschaften", "Properties"],

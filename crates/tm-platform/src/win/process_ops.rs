@@ -1,7 +1,7 @@
 //! Per-process control operations: kill, suspend, priority, affinity,
 //! efficiency mode, elevation, launching.
 
-use crate::actions::ProcessModule;
+use crate::actions::{ModuleUnloadOutcome, ProcessModule};
 use tm_core::error::{Result, TmError};
 use tm_core::model::PriorityClass;
 use windows::Win32::Foundation::{CloseHandle, FILETIME, HANDLE};
@@ -153,54 +153,6 @@ fn wide_array_to_string(value: &[u16]) -> String {
     String::from_utf16_lossy(&value[..end])
 }
 
-fn module_is_unloadable(name: &str, path: &str, is_main_image: bool) -> bool {
-    if is_main_image || path.trim().is_empty() {
-        return false;
-    }
-    let norm = name.to_ascii_lowercase();
-    if norm.ends_with(".exe") {
-        return false;
-    }
-    if norm.starts_with("api-ms-win-") || norm.starts_with("ext-ms-") {
-        return false;
-    }
-    !matches!(
-        norm.as_str(),
-        "ntdll.dll"
-            | "kernel32.dll"
-            | "kernelbase.dll"
-            | "wow64.dll"
-            | "wow64win.dll"
-            | "wow64cpu.dll"
-    ) && !is_windows_owned_path(path)
-}
-
-/// Modules the Windows loader owns. FreeLibrary on one of these either does
-/// nothing (references remain) or actually unmaps a DLL the target still
-/// needs — both outcomes are worse than refusing up front. Third-party DLLs
-/// (the legitimate unload targets: app plugins, hooks, overlays) live
-/// outside these roots.
-fn is_windows_owned_path(path: &str) -> bool {
-    let root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into());
-    is_windows_owned_path_under(path, &root)
-}
-
-/// The check behind [`is_windows_owned_path`], parameterized by the Windows
-/// directory so tests do not depend on the real install location.
-fn is_windows_owned_path_under(path: &str, root: &str) -> bool {
-    // Normalize separators and casing so the comparison cannot be escaped.
-    let norm = path.to_ascii_lowercase().replace('/', "\\");
-    let root = root.to_ascii_lowercase().trim_end_matches('\\').to_string();
-    let Some(rest) = norm.strip_prefix(&root).and_then(|r| r.strip_prefix('\\')) else {
-        return false;
-    };
-    // Directly under the Windows root, or in a system component directory.
-    !rest.contains('\\')
-        || rest.starts_with("system32\\")
-        || rest.starts_with("syswow64\\")
-        || rest.starts_with("winsxs\\")
-}
-
 /// Snapshot all executable modules mapped into `pid`. Tool Help can briefly
 /// report ERROR_BAD_LENGTH while the loader list changes, so retry that one
 /// documented transient error without adding timing sleeps.
@@ -249,15 +201,11 @@ fn module_snapshot(pid: u32) -> Result<Vec<ProcessModule>> {
             .map_err(|error| TmError::platform("Module32FirstW", error.to_string()))?;
         let mut modules = Vec::new();
         loop {
-            let name = wide_array_to_string(&entry.szModule);
-            let path = wide_array_to_string(&entry.szExePath);
-            let is_main_image = modules.is_empty();
             modules.push(ProcessModule {
-                name: name.clone(),
-                path: path.clone(),
+                name: wide_array_to_string(&entry.szModule),
+                path: wide_array_to_string(&entry.szExePath),
                 base_address: entry.modBaseAddr as usize as u64,
                 size_bytes: entry.modBaseSize.into(),
-                unloadable: module_is_unloadable(&name, &path, is_main_image),
             });
             if let Err(error) = unsafe { Module32NextW(snapshot, &mut entry) } {
                 if error.code() == ERROR_NO_MORE_FILES.to_hresult() {
@@ -310,13 +258,15 @@ fn verify_pid_still_refers_to(pid: u32, opened_creation: Option<u64>) -> Result<
 /// Release a third-party DLL by running FreeLibrary inside the target. The
 /// operation is deliberately fail-closed: exact process identity and module
 /// base/path are revalidated, main/system images are refused, and cross-
-/// architecture injection is not attempted.
+/// architecture injection is not attempted. The outcome distinguishes "the
+/// module left" from "a reference was released but it is still in use" —
+/// FreeLibrary succeeds in both cases.
 pub fn unload_process_module(
     pid: u32,
     expected_start_epoch_s: Option<i64>,
     base_address: u64,
     expected_path: &str,
-) -> Result<()> {
+) -> Result<ModuleUnloadOutcome> {
     use windows::Win32::Foundation::WAIT_OBJECT_0;
     use windows::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
 
@@ -353,19 +303,17 @@ pub fn unload_process_module(
 
         let modules = module_snapshot(pid)?;
         verify_pid_still_refers_to(pid, opened_creation)?;
-        let module = modules
+        // Which module to unload is the user's call; the only action-time
+        // requirement is that it is still mapped exactly where it was
+        // selected. If the load state changed underneath the dialog, the
+        // exact base/path match fails closed here.
+        modules
             .iter()
             .find(|module| {
                 module.base_address == base_address
                     && module.path.eq_ignore_ascii_case(expected_path)
             })
             .ok_or_else(|| TmError::platform("unload module", "module is no longer loaded"))?;
-        if !module.unloadable {
-            return Err(TmError::platform(
-                "unload module",
-                "the process image and Windows system modules are protected",
-            ));
-        }
 
         let kernel32_w: Vec<u16> = "kernel32.dll\0".encode_utf16().collect();
         let local_kernel32 = unsafe { GetModuleHandleW(PCWSTR::from_raw(kernel32_w.as_ptr())) }
@@ -456,16 +404,20 @@ pub fn unload_process_module(
         // it.
         let remaining = module_snapshot(pid)?;
         verify_pid_still_refers_to(pid, opened_creation)?;
-        if remaining.iter().any(|candidate| {
+        let still_mapped = remaining.iter().any(|candidate| {
             candidate.base_address == base_address
                 && candidate.path.eq_ignore_ascii_case(expected_path)
-        }) {
-            return Err(TmError::platform(
-                "FreeLibrary",
-                "one reference was released, but the module is still in use and remains loaded",
-            ));
+        });
+        if still_mapped {
+            tracing::info!(
+                pid,
+                expected_path,
+                "a loader reference was released, but remaining references keep the module mapped"
+            );
+            Ok(ModuleUnloadOutcome::StillMapped)
+        } else {
+            Ok(ModuleUnloadOutcome::Unmapped)
         }
-        Ok(())
     })();
     let _ = unsafe { CloseHandle(process) };
     result
@@ -2133,81 +2085,6 @@ mod tests {
         assert!(power_throttling_enabled(flag, flag, flag));
         assert!(!power_throttling_enabled(flag, 0, flag));
         assert!(!power_throttling_enabled(0, flag, flag));
-    }
-
-    #[test]
-    fn third_party_dlls_outside_windows_are_unloadable() {
-        assert!(module_is_unloadable(
-            "plugin.dll",
-            r"C:\Tools\plugin.dll",
-            false
-        ));
-        assert!(module_is_unloadable(
-            "overlay.dll",
-            r"C:\Program Files\Overlay\overlay.dll",
-            false
-        ));
-        assert!(!module_is_unloadable(
-            "target.exe",
-            r"C:\Tools\target.exe",
-            true
-        ));
-        assert!(!module_is_unloadable(
-            "kernel32.dll",
-            r"C:\Windows\System32\kernel32.dll",
-            false
-        ));
-        assert!(!module_is_unloadable(
-            "ntdll.dll",
-            r"C:\Windows\System32\ntdll.dll",
-            false
-        ));
-        assert!(!module_is_unloadable(
-            "api-ms-win-core-file-l1-1-0.dll",
-            r"C:\Windows\System32\api-ms-win-core-file-l1-1-0.dll",
-            false
-        ));
-        assert!(!module_is_unloadable(
-            "ext-ms-win-shell-shell32-l1-2-0.dll",
-            r"C:\Tools\ext-ms-win-shell-shell32-l1-2-0.dll",
-            false
-        ));
-        assert!(!module_is_unloadable("unknown.dll", "", false));
-    }
-
-    #[test]
-    fn windows_owned_locations_refuse_every_module() {
-        // Root-independent: the same verdicts must hold for any install
-        // location of the Windows directory.
-        let root = r"C:\Win11";
-        assert!(is_windows_owned_path_under(
-            r"C:\Win11\system32\a.dll",
-            root
-        ));
-        assert!(is_windows_owned_path_under(
-            r"C:\Win11/System32/a.dll",
-            root
-        ));
-        assert!(is_windows_owned_path_under(
-            r"C:\WIN11\SYSWOW64\a.dll",
-            root
-        ));
-        assert!(is_windows_owned_path_under(
-            r"C:\Win11\WinSxS\amd64_x\a.dll",
-            root
-        ));
-        assert!(is_windows_owned_path_under(
-            r"C:\Win11\system32\driverstore\x\y.dll",
-            root
-        ));
-        assert!(is_windows_owned_path_under(r"C:\Win11\direct.dll", root));
-        assert!(!is_windows_owned_path_under(r"C:\Tools\a.dll", root));
-        // A directory that merely starts with the same text is not under it.
-        assert!(!is_windows_owned_path_under(r"C:\Win11-ish\a.dll", root));
-        assert!(!is_windows_owned_path_under(
-            r"C:\Windows\System32\a.dll",
-            root
-        ));
     }
 
     #[test]

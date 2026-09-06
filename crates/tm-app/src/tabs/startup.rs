@@ -206,7 +206,7 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
                 let i = visible[vi];
                 let item = &mut items[i];
                 let selected = app.selected_startup_id.as_deref() == Some(item.id.as_str());
-                let (rect, resp) = table.row(ui, &pal, selected);
+                let (rect, resp) = table.row(ui, &pal, selected, item.id.as_str());
 
                 let exe = exe_from_command(&item.command);
                 let tex = exe

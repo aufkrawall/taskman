@@ -588,7 +588,7 @@ fn row_ui(
     all_rows: &[DisplayRow],
 ) {
     let selected = app.selection.contains_pid(row.pid);
-    let (rect, resp) = table.row(ui, pal, selected);
+    let (rect, resp) = table.row(ui, pal, selected, (row.pid, row.start_epoch_s));
 
     // Chevron + icon + name.
     let expanded = app.processes_state.expanded.contains(&row.pid);

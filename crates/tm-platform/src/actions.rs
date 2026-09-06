@@ -78,14 +78,31 @@ pub struct ProcessExtra {
 
 /// One executable image mapped into a process. Module enumeration is an
 /// explicit, on-demand diagnostic query rather than part of the hot sample.
+///
+/// There is deliberately no "protected" marking: which module to unload is
+/// the user's call. The confirmation dialog carries the crash warning, the
+/// platform revalidates identity and base/path at action time, and the
+/// honest [`ModuleUnloadOutcome`] says whether the module actually left.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProcessModule {
     pub name: String,
     pub path: String,
     pub base_address: u64,
     pub size_bytes: u64,
-    /// False for the process image and loader-critical Windows DLLs.
-    pub unloadable: bool,
+}
+
+/// What actually happened when a module unload ran. FreeLibrary releases one
+/// loader reference and succeeds even when further references keep the module
+/// mapped — the normal case for implicitly-linked DLLs — so the two states
+/// must be reported apart instead of both reading as "done" or both as
+/// "failed".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModuleUnloadOutcome {
+    /// The module is no longer mapped in the target.
+    Unmapped,
+    /// A reference was released, but the target still holds more and the
+    /// module remains loaded. Expected behavior, not an error.
+    StillMapped,
 }
 
 pub trait PlatformActions: Send + Sync {
@@ -217,7 +234,7 @@ pub trait PlatformActions: Send + Sync {
         _expected_start_epoch_s: Option<i64>,
         _base_address: u64,
         _expected_path: &str,
-    ) -> Result<()> {
+    ) -> Result<ModuleUnloadOutcome> {
         Err(tm_core::TmError::Unsupported("unload module"))
     }
 

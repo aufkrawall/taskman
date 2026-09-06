@@ -118,12 +118,16 @@ items across Phases 2–6. The following concrete gaps remain:
   and multi-monitor-aware position restore remain.
 
 The new Modules inspector is deliberately on-demand and Windows-only. Its
-unload command supports only same-architecture third-party DLLs and refuses
-the main image, Windows-owned locations (the Windows root and its
-system32/syswow64/winsxs trees, DriverStore included), critical loader
-modules, `api-ms-win-*`/`ext-ms-*` proxies, cross-bitness targets, and
-TaskMan itself. Broader injection would add risk without useful
-Task-Manager parity and is not planned.
+unload command attempts ANY enumerated module — which module to unload is
+explicitly the user's call (product decision 2026-09-06; there is no
+"protected module" concept), gated only by the confirmation dialog and its
+crash warning. What remains is technical, not policy: same-architecture
+targets only (a 64-bit FreeLibrary address cannot be injected into a 32-bit
+process), process-level trust rules at the broker (critical/system/requesting-
+GUI targets refused), TaskMan refusing to act on itself, and the exact
+process identity + module base/path revalidation at action time. The honest
+`ModuleUnloadOutcome` (unmapped vs. a reference released but still in use)
+is what the user sees; most statically-imported DLLs cannot actually leave.
 
 ## Core-service production hardening still outstanding
 

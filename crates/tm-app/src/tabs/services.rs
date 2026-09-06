@@ -215,7 +215,7 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
             for ri in range {
                 let s = rows[ri];
                 let selected = app.services_selected_name.as_deref() == Some(s.name.as_str());
-                let (rect, resp) = table.row(ui, &pal, selected);
+                let (rect, resp) = table.row(ui, &pal, selected, s.name.as_str());
 
                 let icon_rect = egui::Rect::from_center_size(
                     egui::Pos2::new(rect.left() + 38.0, rect.center().y),

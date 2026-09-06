@@ -658,10 +658,23 @@ impl TmTable {
         clicked
     }
 
-    pub fn row(&self, ui: &mut egui::Ui, pal: &Palette, selected: bool) -> (Rect, egui::Response) {
+    /// One body row. `key` must identify the row's OWNER (pid + start time,
+    /// base address, session id, …), never the position in the list: the
+    /// response id is what egui keys a row's open context-menu popup to, and
+    /// a live list re-sorts underneath an open menu — an index-derived id
+    /// would hand the menu to whatever next lands in the slot.
+    pub fn row(
+        &self,
+        ui: &mut egui::Ui,
+        pal: &Palette,
+        selected: bool,
+        key: impl std::hash::Hash + std::fmt::Debug,
+    ) -> (Rect, egui::Response) {
         let total_w = self.total_width();
-        let (rect, resp) = ui.allocate_exact_size(
-            egui::vec2(total_w, self.row_h),
+        let (rect, _) = ui.allocate_exact_size(egui::vec2(total_w, self.row_h), Sense::hover());
+        let resp = ui.interact(
+            rect,
+            egui::Id::new(self.id).with(key),
             Sense::click().union(Sense::hover()),
         );
         let painter = ui.painter_at(rect.expand(2.0));
@@ -962,7 +975,7 @@ mod tests {
                         .frame(egui::Frame::NONE)
                         .show(root, |ui| {
                             ui.spacing_mut().item_spacing.y = 0.0;
-                            let (rect, _) = table.row(ui, &pal, false);
+                            let (rect, _) = table.row(ui, &pal, false, "snap");
                             table.heat_cells(ui, &pal, rect, 1, &cells);
                         });
                 },
@@ -1234,8 +1247,8 @@ mod tests {
                             3,
                             None,
                             |ui, table, _a, _c, range| {
-                                for _ in range {
-                                    table.row(ui, &crate::theme::DARK, false);
+                                for i in range {
+                                    table.row(ui, &crate::theme::DARK, false, i);
                                 }
                             },
                         );
@@ -1308,8 +1321,8 @@ mod tests {
                             None,
                             |ui, table, _a, _c, range| {
                                 body_right.set(ui.clip_rect().right());
-                                for _ in range {
-                                    table.row(ui, &crate::theme::DARK, false);
+                                for i in range {
+                                    table.row(ui, &crate::theme::DARK, false, i);
                                 }
                             },
                         );
@@ -1379,8 +1392,8 @@ mod tests {
                             focus,
                             |ui, table, _a, _c, range| {
                                 let _ = ui;
-                                for _ in range {
-                                    table.row(ui, &crate::theme::DARK, false);
+                                for i in range {
+                                    table.row(ui, &crate::theme::DARK, false, i);
                                 }
                             },
                         );

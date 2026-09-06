@@ -978,7 +978,7 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
             for i in range {
                 let Some(row) = rows.get(i) else { continue };
                 let selected = app.selection.contains_pid(row.pid);
-                let (rect, resp) = table.row(ui, &pal, selected);
+                let (rect, resp) = table.row(ui, &pal, selected, (row.pid, row.start_epoch_s));
 
                 // Name decorations follow the Name column even after it has
                 // been moved away from the first position.

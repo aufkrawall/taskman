@@ -231,7 +231,7 @@ fn build_frame(ctx: &egui::Context) -> egui::FullOutput {
 
                     table.header(ui, &pal, Some((2, false)), None);
                     for (i, r) in ROWS.iter().enumerate() {
-                        let (rect, _) = table.row(ui, &pal, i == 1);
+                        let (rect, _) = table.row(ui, &pal, i == 1, i);
                         table.text_cell(ui, rect, 0, r.name, &pal, false);
                         table.text_cell(ui, rect, 1, r.status, &pal, true);
                         table.heat_cells(

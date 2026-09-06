@@ -818,8 +818,8 @@ fn show_native_tray_menu() {
     use windows::Win32::Foundation::{HWND, LPARAM, POINT, WPARAM};
     use windows::Win32::UI::WindowsAndMessaging::{
         CreatePopupMenu, DestroyMenu, GetCursorPos, InsertMenuW, MF_BYPOSITION, MF_STRING,
-        PostMessageW, SetForegroundWindow, SetMenuDefaultItem, TPM_RETURNCMD, TPM_RIGHTBUTTON,
-        TrackPopupMenuEx, WM_NULL,
+        PostMessageW, SetForegroundWindow, SetMenuDefaultItem, TPM_BOTTOMALIGN, TPM_RETURNCMD,
+        TPM_RIGHTBUTTON, TrackPopupMenuEx, WM_NULL,
     };
     use windows::core::PCWSTR;
 
@@ -864,9 +864,12 @@ fn show_native_tray_menu() {
         let _ = SetForegroundWindow(hwnd);
         let mut pt = POINT::default();
         let _ = GetCursorPos(&mut pt);
+        // Bottom-aligned: the cursor sits inside the taskbar, so the menu is
+        // anchored with its bottom edge there and grows UPWARD, over the
+        // taskbar instead of overlapping (and fighting with) it.
         let cmd = TrackPopupMenuEx(
             hmenu,
-            (TPM_RETURNCMD | TPM_RIGHTBUTTON).0,
+            (TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_BOTTOMALIGN).0,
             pt.x,
             pt.y,
             hwnd,

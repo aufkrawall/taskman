@@ -45,8 +45,8 @@ use windows::Win32::System::Threading::{
 use windows::core::{PCWSTR, PWSTR};
 
 use crate::actions::{
-    Capabilities, CoreServiceState, PlatformActions, ProcessModule, ServiceAction,
-    TaskManagerReplacementState, UserSessionAction,
+    Capabilities, CoreServiceState, ModuleUnloadOutcome, PlatformActions, ProcessModule,
+    ServiceAction, TaskManagerReplacementState, UserSessionAction,
 };
 
 pub const SERVICE_NAME: &str = "TaskmanCore";
@@ -189,11 +189,21 @@ pub struct ProcessNetworkEntry {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "result", content = "value", rename_all = "snake_case")]
 enum BrokerValue {
-    Pong { version: String },
+    Pong {
+        version: String,
+    },
     Unit,
     AffinityMask(u64),
     TaskManagerReplacementState(TaskManagerReplacementState),
     ProcessNetwork(ProcessNetworkSample),
+    /// Result of `UnloadModule`. `still_mapped` is the honest outcome: a
+    /// released reference does not imply the module left, and the UI words
+    /// the two states differently. An older service answers `Unit` here,
+    /// which the client reports as an undecidable outcome rather than a
+    /// fabricated success.
+    ModuleUnload {
+        still_mapped: bool,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -834,15 +844,23 @@ impl PlatformActions for BrokeredActions {
         expected_start_epoch_s: Option<i64>,
         base_address: u64,
         expected_path: &str,
-    ) -> Result<()> {
+    ) -> Result<ModuleUnloadOutcome> {
         let start_epoch_s =
             expected_start_epoch_s.or_else(|| super::process_ops::creation_epoch_of(pid));
-        self.unit_or_local(
+        self.value_or_local(
             BrokerRequest::UnloadModule {
                 pid,
                 expected_start_epoch_s: start_epoch_s,
                 base_address,
                 expected_path: expected_path.to_string(),
+            },
+            |value| match value {
+                BrokerValue::ModuleUnload { still_mapped } => Some(if still_mapped {
+                    ModuleUnloadOutcome::StillMapped
+                } else {
+                    ModuleUnloadOutcome::Unmapped
+                }),
+                _ => None,
             },
             || {
                 self.local
@@ -1480,13 +1498,13 @@ fn dispatch(
                     "invalid module identity",
                 ));
             }
-            actions.unload_process_module(
+            let still_mapped = actions.unload_process_module(
                 pid,
                 expected_start_epoch_s,
                 base_address,
                 &expected_path,
-            )?;
-            Ok(BrokerValue::Unit)
+            )? == ModuleUnloadOutcome::StillMapped;
+            Ok(BrokerValue::ModuleUnload { still_mapped })
         }
         BrokerRequest::ControlService { name, action } => {
             if !valid_service_name(&name) || name.eq_ignore_ascii_case(SERVICE_NAME) {

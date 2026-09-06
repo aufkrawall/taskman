@@ -141,6 +141,10 @@ platform boundary (`tm-core` ← `tm-platform` ← `tm-app` / `tm-service`):
   Resize handles are registered after ALL header cells so they win hit
   testing across their full ±6 px; double-click restore is detected via
   input state because drag-only widgets never receive click flags.
+  `TmTable::row` takes a row-OWNER key (pid+start epoch, base address, …):
+  the response id is keyed by it because egui binds an open context-menu
+  popup to the response id, and an index-derived id hands the open menu to
+  whichever row next occupies the slot in a re-sorting list.
 - `crates/tm-app/src/app.rs` — `TaskManApp.history` (Performance-chart data)
   MUST stay a contiguous, append-ordered `Vec<HistoryPoint>`; it was a
   `VecDeque` whose ring wrap once froze all Performance charts (see
@@ -189,12 +193,12 @@ platform boundary (`tm-core` ← `tm-platform` ← `tm-app` / `tm-service`):
 - `crates/tm-platform/src/win/process_ops.rs` module unload — remote
   `FreeLibrary` is intentionally guarded by exact process creation timestamp,
   exact module base/path re-enumeration, same-architecture checks, and
-  system/main-image refusals; a released-but-still-mapped module is an ERROR
-  (never a success — the UI's list stays put so the outcome reads true).
-  `is_windows_owned_path_under` refuses the Windows root and its
-  system32/syswow64/winsxs trees regardless of casing. Keep it off the
-  sampler and UI thread, and never weaken the second confirmation in
-  `tabs/modules.rs`.
+  self/critical-process refusals. WHICH module to unload is the user's call
+  (product decision 2026-09-06): there is no protected-module gate, and the
+  honest `ModuleUnloadOutcome` (unmapped vs. reference released but still
+  mapped) crosses the broker as `BrokerValue::ModuleUnload` — never as an
+  error string. Keep it off the sampler and UI thread, and never weaken the
+  second confirmation in `tabs/modules.rs`.
 
 ## Test Matrix
 

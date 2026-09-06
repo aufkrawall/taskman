@@ -1,5 +1,63 @@
 # Recent Activity
 
+## 2026-09-06 (later still) — row context menus are bound to the row's owner, not its slot
+
+User report: right-clicking a process on Details opened a menu that changed
+to a DIFFERENT process when the list re-sorted (a start brought the menu's
+"process" out from under it). Root cause: `TmTable::row` derived its response
+id from egui's auto-id stream — effectively the row's position — and
+`egui::Popup::context_menu` keys the open popup to the response id. While a
+menu is open, the closure is re-run every frame for the row now occupying
+that id; in a re-sorting list that is a different process. The same defect
+existed on Processes, Users, Services, Startup, Modules and App history.
+
+Fix at the root: `TmTable::row` now takes a `key` identifying the row's
+OWNER — `(pid, start_epoch_s)` on the process tables, module base address,
+service name, startup item id, session id (users' per-user app rows key as
+`(session, name)`, which is why `URow::App` now carries the session) — and
+allocates the row response through `ui.interact(rect, Id::new(table.id).with(key), …)`.
+The id follows the process through re-sorts and re-insertions, so an open
+menu keeps showing the process it was opened on (native menus freeze their
+contents; ours keeps live values for the same process — both read as
+"sticking with the click"). If the row's owner exits or scrolls out of the
+virtualization window, the menu goes away with it instead of describing a
+stranger. Table ids are prefixed per table, so keys only need to be unique
+WITHIN one table.
+
+## 2026-09-06 (later) — unload is the user's call; the outcome crosses the pipe as data; tray menu opens above the taskbar
+
+Follow-up to the same-day unload/tray work, from live-testing feedback:
+
+1. **No protected-module concept (product decision).** The user rejected the
+   remaining gate outright: WHICH module to unload is their choice. The
+   `unloadable` flag is gone from `ProcessModule`, `module_is_unloadable` and
+   `is_windows_owned_path(_under)` are deleted, the unload button is enabled
+   for every selected module (only the platform capability and a busy action
+   grey it out), and `ModuleProtected` is retired from i18n. What deliberately
+   REMAINS is technical or process-level, not module policy: cross-architecture
+   refusal (a 64-bit FreeLibrary address cannot enter a 32-bit process),
+   the broker's critical/system/requesting-GUI target rules, TaskMan not
+   acting on itself, exact identity + base/path revalidation at action time,
+   and the confirmation dialog with its crash warning. Attempting advapi32
+   now runs — and will honestly report StillMapped while mspaint holds its
+   static imports.
+2. **The still-mapped outcome became data, not an error.** Reporting it as a
+   red "platform API failure: core service: platform API failure: FreeLibrary:
+   …" read as a malfunction, but a released reference with the module still
+   loaded is the EXPECTED result for implicitly-linked DLLs. The platform
+   trait now returns `Result<ModuleUnloadOutcome>` (`Unmapped` |
+   `StillMapped`); the broker answers the new `BrokerValue::ModuleUnload
+   { still_mapped }` variant and the client decodes it (an older service's
+   `Unit` decodes to an honest "undecidable" error — no fabricated success;
+   PROTOCOL_VERSION stays 2, so the mixed pair still handshakes). The UI
+   words the states apart: "Module unloaded: X" (then refreshes the list)
+   vs. the new neutral `ModuleStillMappedMsg` (list untouched — it is
+   already accurate).
+3. **Tray menu position.** `TPM_BOTTOMALIGN` anchors the popup's bottom edge
+   at the cursor — which sits inside the taskbar — so the menu grows upward
+   over the taskbar instead of overlapping it (topmost/focus contention the
+   user reported).
+
 ## 2026-09-06 — the tray owns a thread; unload stops lying; two tofu glyphs
 
 1. **Tray menu freezes — the modal loop left the UI thread.** The tray icon's

@@ -269,10 +269,12 @@ rebase runbook.
   process termination through an explicit dialog. Context menus now include
   consistent copy/search/location/properties/dump/module actions as applicable.
 - The on-demand Modules inspector enumerates DLL name/path/base/size outside the
-  hot sampling path. Unload is an explicitly dangerous, confirmation-gated action
-  restricted to same-architecture third-party DLLs; process creation time and
-  exact module base/path are revalidated immediately before the remote
-  `FreeLibrary` request. The image and Windows modules are fail-closed.
+  hot sampling path. Unload is an explicitly dangerous, confirmation-gated
+  action the user aims at ANY enumerated module (no protected-module concept);
+  same-architecture targets only, and process creation time plus exact module
+  base/path are revalidated immediately before the remote `FreeLibrary`
+  request. The honest outcome — unmapped, or a reference released while the
+  module stays loaded — is reported as data, not guessed from an error.
 - Details adds typed optional columns for description, publisher, parent PID,
   session ID, image path, page faults/sec, and I/O read/write totals. Startup,
   App History, Users, and Services headers now sort; tables draw quiet body

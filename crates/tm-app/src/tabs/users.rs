@@ -44,6 +44,7 @@ struct Agg {
 enum URow {
     User(usize),
     App {
+        session: u32,
         name: String,
         exe: Option<String>,
         values: [f64; 4],
@@ -286,6 +287,7 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
             });
             for (name, (vals, count, exe)) in apps {
                 rows.push(URow::App {
+                    session: s.id,
                     name: name.clone(),
                     exe: exe.clone(),
                     values: *vals,
@@ -342,6 +344,7 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
                         );
                     }
                     Some(URow::App {
+                        session,
                         name,
                         exe,
                         values,
@@ -352,6 +355,7 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
                             ui,
                             &pal,
                             table,
+                            *session,
                             name,
                             exe.as_deref(),
                             values,
@@ -522,7 +526,7 @@ fn user_row_ui(
     can_disconnect: bool,
 ) {
     let selected = app.selected_user == Some(s.id);
-    let (rect, resp) = table.row(ui, pal, selected);
+    let (rect, resp) = table.row(ui, pal, selected, ("user", s.id));
 
     let expanded = app.processes_state.expanded_users.contains(&s.id);
     let seed = egui::Id::new(("user-chev", s.id));
@@ -595,13 +599,16 @@ fn app_row_ui(
     ui: &mut egui::Ui,
     pal: &theme::Palette,
     table: &tablekit::TmTable,
+    session_id: u32,
     name: &str,
     exe: Option<&str>,
     vals: &[f64; 4],
     count: usize,
     heat_max: &HeatMax,
 ) {
-    let (rect, _resp) = table.row(ui, pal, false);
+    // Same app name can appear under two users, so the key pairs the row
+    // with its session.
+    let (rect, _resp) = table.row(ui, pal, false, ("app", session_id, name));
     let tex = exe.and_then(|p| app.shared.icons.get(ui.ctx(), &app.actions, p, 6));
     table.icon_cell(
         ui,

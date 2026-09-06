@@ -9,7 +9,7 @@ use std::cmp::Ordering;
 use std::sync::{Arc, Mutex};
 use tm_core::format;
 use tm_core::i18n::{self, K};
-use tm_platform::actions::{PlatformActions, ProcessModule};
+use tm_platform::actions::{ModuleUnloadOutcome, PlatformActions, ProcessModule};
 
 use crate::app::{InFlight, ProcessIdentity, TaskManApp};
 use crate::search;
@@ -164,11 +164,11 @@ fn begin_unload(app: &TaskManApp, state: &mut State, module: ProcessModule, ctx:
                 &module.path,
             );
             let message = match result {
-                Ok(()) => {
-                    // The unload succeeded. A failed re-enumeration must not
-                    // throw the dialog into its error state — an unelevated
-                    // GUI cannot list an elevated target's modules at all —
-                    // so the previous list simply stays.
+                // The module is gone: refresh the list (a failed re-list
+                // keeps the old one rather than throwing the dialog into
+                // its error state — an unelevated GUI cannot list an
+                // elevated target's modules at all).
+                Ok(ModuleUnloadOutcome::Unmapped) => {
                     match actions.list_process_modules(identity.pid, identity.start_epoch_s) {
                         Ok(modules) => {
                             *tm_core::sync::lock(&load) = LoadState::Ready(modules);
@@ -180,6 +180,12 @@ fn begin_unload(app: &TaskManApp, state: &mut State, module: ProcessModule, ctx:
                         ),
                     }
                     i18n::trf(K::ModuleUnloadedMsg, &[&module_name])
+                }
+                // FreeLibrary released one reference, but the target still
+                // holds more — expected for implicitly-linked DLLs, not a
+                // failure. The list is already accurate as it stands.
+                Ok(ModuleUnloadOutcome::StillMapped) => {
+                    i18n::trf(K::ModuleStillMappedMsg, &[&module_name])
                 }
                 Err(error) => i18n::trf(K::ErrMsg, &[&error.to_string()]),
             };
@@ -257,10 +263,7 @@ pub fn dialog(app: &mut TaskManApp, ctx: &egui::Context, pal: &theme::Palette) {
                 .selected_base
                 .is_some_and(|base| modules.iter().any(|m| m.base_address == base));
             if !selection_alive {
-                state.selected_base = modules
-                    .iter()
-                    .find(|m| m.unloadable)
-                    .map(|m| m.base_address);
+                state.selected_base = modules.first().map(|m| m.base_address);
             }
             state
                 .selected_base
@@ -294,19 +297,19 @@ pub fn dialog(app: &mut TaskManApp, ctx: &egui::Context, pal: &theme::Palette) {
                 {
                     request_refresh = true;
                 }
+                // Which module to unload is the user's call; every selected
+                // module can be attempted. Only the capability (module
+                // unload unavailable on this platform) and a running action
+                // grey the button out.
                 let unload = ui
                     .add_enabled(
-                        can_unload
-                            && selected_module
-                                .as_ref()
-                                .is_some_and(|module| module.unloadable)
-                            && !state.unload.busy(),
+                        can_unload && selected_module.is_some() && !state.unload.busy(),
                         egui::Button::new(i18n::tr(K::UnloadModule)),
                     )
                     .on_disabled_hover_text(if selected_module.is_none() {
                         i18n::tr(K::SelectModuleFirst)
                     } else {
-                        i18n::tr(K::ModuleProtected)
+                        i18n::tr(K::ModuleBusy)
                     });
                 if unload.clicked() {
                     request_unload = selected_module.clone();
@@ -400,7 +403,8 @@ pub fn dialog(app: &mut TaskManApp, ctx: &egui::Context, pal: &theme::Palette) {
                                     continue;
                                 };
                                 let selected = state.selected_base == Some(module.base_address);
-                                let (rect, response) = table.row(ui, pal, selected);
+                                let (rect, response) =
+                                    table.row(ui, pal, selected, module.base_address);
                                 table.text_cell(ui, rect, 0, &module.name, pal, false);
                                 let base = format!("0x{:016X}", module.base_address);
                                 let base_cell = table.col_rect(1, rect);
@@ -452,9 +456,9 @@ pub fn dialog(app: &mut TaskManApp, ctx: &egui::Context, pal: &theme::Palette) {
                                     let unload = menu::item_enabled(
                                         ui,
                                         i18n::tr(K::UnloadModule),
-                                        can_unload && module.unloadable && !state.unload.busy(),
+                                        can_unload && !state.unload.busy(),
                                     )
-                                    .on_disabled_hover_text(i18n::tr(K::ModuleProtected));
+                                    .on_disabled_hover_text(i18n::tr(K::ModuleBusy));
                                     if unload.clicked() {
                                         request_unload = Some(module.clone());
                                         ui.close();
@@ -542,7 +546,6 @@ mod tests {
             path: format!("C:\\Test\\{name}"),
             base_address: base,
             size_bytes: size,
-            unloadable: true,
         }
     }
 

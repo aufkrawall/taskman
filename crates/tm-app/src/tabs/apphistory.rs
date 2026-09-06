@@ -183,7 +183,7 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
                 let Some(row) = rows.get(ri) else {
                     continue;
                 };
-                let (rect, resp) = table.row(ui, &pal, false);
+                let (rect, resp) = table.row(ui, &pal, false, row.name.as_str());
                 table.icon_cell(ui, rect, None, pal.accent);
                 let name_rect = table.col_rect(0, rect);
                 ui.painter_at(name_rect).text(
