@@ -186,6 +186,14 @@ pub struct ProcessNetworkEntry {
     pub sent: u64,
 }
 
+fn module_unload_verified_default() -> bool {
+    true
+}
+
+fn module_unload_legacy_call_default() -> u32 {
+    1
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "result", content = "value", rename_all = "snake_case")]
 enum BrokerValue {
@@ -196,14 +204,16 @@ enum BrokerValue {
     AffinityMask(u64),
     TaskManagerReplacementState(TaskManagerReplacementState),
     ProcessNetwork(ProcessNetworkSample),
-    /// Result of `UnloadModule`. `still_mapped` is the honest outcome: a
-    /// released reference does not imply the module left, and the UI words
-    /// the two states differently; `released` is the number of loader
-    /// references FreeLibrary dropped. An older service answers `Unit` here,
-    /// which the client reports as an undecidable outcome rather than a
-    /// fabricated success.
+    /// Result of `UnloadModule`. `released` is retained only for compatibility
+    /// with the earlier v2 wire shape; it now means successful remote
+    /// FreeLibrary calls, not an observable loader-reference count. `verified`
+    /// is additive and defaults to true so both pre-count and counted v2
+    /// services remain decodable by a newer GUI.
     ModuleUnload {
         still_mapped: bool,
+        #[serde(default = "module_unload_verified_default")]
+        verified: bool,
+        #[serde(default = "module_unload_legacy_call_default")]
         released: u32,
     },
 }
@@ -847,28 +857,36 @@ impl PlatformActions for BrokeredActions {
         base_address: u64,
         expected_path: &str,
     ) -> Result<ModuleUnloadOutcome> {
-        let start_epoch_s =
-            expected_start_epoch_s.or_else(|| super::process_ops::creation_epoch_of(pid));
+        let Some(start_epoch_s) = expected_start_epoch_s.filter(|value| *value > 0) else {
+            return Err(TmError::platform(
+                "unload module",
+                "a valid sampled process creation time is required",
+            ));
+        };
         self.value_or_local(
             BrokerRequest::UnloadModule {
                 pid,
-                expected_start_epoch_s: start_epoch_s,
+                expected_start_epoch_s: Some(start_epoch_s),
                 base_address,
                 expected_path: expected_path.to_string(),
             },
             |value| match value {
                 BrokerValue::ModuleUnload {
                     still_mapped,
-                    released,
+                    verified,
+                    ..
                 } => Some(ModuleUnloadOutcome {
-                    still_mapped,
-                    released,
+                    still_mapped: verified.then_some(still_mapped),
                 }),
                 _ => None,
             },
             || {
-                self.local
-                    .unload_process_module(pid, start_epoch_s, base_address, expected_path)
+                self.local.unload_process_module(
+                    pid,
+                    Some(start_epoch_s),
+                    base_address,
+                    expected_path,
+                )
             },
         )
     }
@@ -1226,19 +1244,21 @@ fn checked_target(
     expected_start_epoch_s: Option<i64>,
     requesting_gui_pid: u32,
 ) -> Result<()> {
-    let created = expected_start_epoch_s.or_else(|| super::process_ops::creation_epoch_of(pid));
-    if created.is_none_or(|created| created <= 0) {
+    let Some(created) = expected_start_epoch_s.filter(|created| *created > 0) else {
         return Err(TmError::platform(
             "broker target",
-            "a valid process creation time is required",
+            "a valid sampled process creation time is required",
         ));
-    }
+    };
     if pid <= 4 || pid == std::process::id() || pid == requesting_gui_pid {
         return Err(TmError::platform(
             "broker target",
             "system, broker, and requesting GUI processes are protected",
         ));
     }
+    // Keep the value consumed here rather than allowing a future refactor to
+    // silently reintroduce action-time PID rebinding.
+    let _ = created;
     super::process_ops::refuse_critical_process(pid)
 }
 
@@ -1509,8 +1529,11 @@ fn dispatch(
                 &expected_path,
             )?;
             Ok(BrokerValue::ModuleUnload {
-                still_mapped: outcome.still_mapped,
-                released: outcome.released,
+                still_mapped: outcome.still_mapped.unwrap_or(true),
+                verified: outcome.still_mapped.is_some(),
+                // v2 compatibility field: one confirmation is exactly one
+                // successful remote FreeLibrary call.
+                released: 1,
             })
         }
         BrokerRequest::ControlService { name, action } => {
@@ -2698,6 +2721,39 @@ mod tests {
         // The default is the "unknown" answer, not an empty measurement.
         let unknown = ProcessNetworkSample::default();
         assert!(!unknown.active && unknown.entries.is_empty());
+    }
+
+    #[test]
+    fn module_unload_response_accepts_every_v2_outcome_shape() {
+        // The first v2 module-unload response predated the `released` field.
+        // Keep it decodable so an installed service upgrade does not turn a
+        // completed action into an "unexpected response" error.
+        let old = r#"{"result":"module_unload","value":{"still_mapped":true}}"#;
+        let BrokerValue::ModuleUnload {
+            still_mapped,
+            verified,
+            released,
+        } = serde_json::from_str::<BrokerValue>(old).unwrap()
+        else {
+            panic!("wrong variant");
+        };
+        assert!(still_mapped && verified);
+        assert_eq!(released, 1);
+
+        let current = BrokerValue::ModuleUnload {
+            still_mapped: false,
+            verified: true,
+            released: 1,
+        };
+        let encoded = serde_json::to_vec(&current).unwrap();
+        assert!(matches!(
+            serde_json::from_slice::<BrokerValue>(&encoded).unwrap(),
+            BrokerValue::ModuleUnload {
+                still_mapped: false,
+                verified: true,
+                released: 1
+            }
+        ));
     }
 
     /// The request carries no target and must stay a bare tag on the wire —
