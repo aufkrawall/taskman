@@ -46,4 +46,4 @@ jobs:
           git commit -m "Improve process grouping heuristics"
           git push origin HEAD:improve/process-grouping
 
-# Retry after correcting the repo-map patch anchor.
+# Retry after aligning the repo-map replacement boundary.
