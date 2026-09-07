@@ -1563,14 +1563,14 @@ unsafe fn lookup_account_name(sid: windows::Win32::Security::PSID) -> Option<Str
         Some(if domain.is_empty() || is_authority_domain(&domain) {
             name
         } else {
-            format!("{domain}\{name}")
+            format!("{domain}\\{name}")
         })
     }
 }
 
 /// The NT AUTHORITY pseudo-domain under every locale name it is known by.
 /// Localized Windows returns the translated string, so an English-only
-/// comparison would leave "NT-AUTORITÄT\SYSTEM" in the column on a German
+/// comparison would leave "NT-AUTORITÄT\\SYSTEM" in the column on a German
 /// system where Task Manager shows "SYSTEM".
 fn is_authority_domain(domain: &str) -> bool {
     let normalized: String = domain
@@ -2078,7 +2078,7 @@ mod tests {
     }
 
     /// The NT AUTHORITY pseudo-domain is localized, so recognizing only the
-    /// English spelling would leave "NT-AUTORITÄT\SYSTEM" in a column that
+    /// English spelling would leave "NT-AUTORITÄT\\SYSTEM" in a column that
     /// is 120 px wide on a German system.
     #[test]
     fn the_authority_pseudo_domain_is_recognized_in_every_spelling() {
