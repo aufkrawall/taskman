@@ -26,6 +26,20 @@ jobs:
         with:
           python-version: '3.12'
 
+      - name: Normalize wiki patch anchor
+        shell: pwsh
+        run: |
+          @'
+          from pathlib import Path
+          path = Path("llm-wiki/repo-map.md")
+          text = path.read_text(encoding="utf-8")
+          old = "from a system/launch boundary. Repeat runs of one image under one parent group\n  separately (`sibling_run_key`), including `svchost.exe` under `services.exe`."
+          new = "from a system/launch boundary. Repeat runs of one image under one\n  parent group separately (`sibling_run_key`), including `svchost.exe` under `services.exe`."
+          if text.count(old) != 1:
+              raise SystemExit(f"wiki anchor normalization: expected one match, found {text.count(old)}")
+          path.write_text(text.replace(old, new, 1), encoding="utf-8")
+          '@ | python -
+
       - name: Apply classification patch
         run: python .github/scripts/apply_windows_process_classification.py
 
