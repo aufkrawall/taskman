@@ -1,7 +1,9 @@
 //! Per-process control operations: kill, suspend, priority, affinity,
 //! efficiency mode, elevation, launching.
 
-use crate::actions::{ModuleUnloadOutcome, ProcessModule};
+use crate::actions::{
+    MODULE_UNLOAD_SINGLE_RELEASE_MARKER, ModuleUnloadOutcome, ProcessModule,
+};
 use tm_core::error::{Result, TmError};
 use tm_core::model::PriorityClass;
 use windows::Win32::Foundation::{CloseHandle, FILETIME, HANDLE};
@@ -325,6 +327,13 @@ pub fn unload_process_module(
     use windows::Win32::Foundation::{WAIT_OBJECT_0, WAIT_TIMEOUT};
     use windows::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
 
+    // New GUIs append a capability marker so an older v2 service cannot
+    // accidentally execute its former multi-release implementation. Current
+    // code accepts both marked (new GUI) and unmarked (old GUI/local tests)
+    // requests, but validates only the real path below.
+    let expected_path = expected_path
+        .strip_suffix(MODULE_UNLOAD_SINGLE_RELEASE_MARKER)
+        .unwrap_or(expected_path);
     let expected_start_epoch_s = expected_start_epoch_s
         .filter(|value| *value > 0)
         .ok_or_else(|| {
@@ -1678,8 +1687,8 @@ pub fn run_new_task_probe(command_line: &str, elevate: bool) -> Result<()> {
 }
 
 /// Launch a helper and wait off the UI thread for its real exit status.
-/// Intended for explicit installer/uninstaller flows where "spawned" is not
-/// a sufficient success condition.
+/// Intended for explicit installer/uninstaller flows where "spawned" is not a
+/// sufficient success condition.
 pub(crate) fn run_new_task_wait(
     command_line: &str,
     elevate: bool,
