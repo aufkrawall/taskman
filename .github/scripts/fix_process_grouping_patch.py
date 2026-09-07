@@ -14,4 +14,15 @@ new = '''def block(text: str) -> str:
 '''
 if text.count(old) != 1:
     raise SystemExit("block helper: expected exactly one match")
-path.write_text(text.replace(old, new, 1), encoding="utf-8")
+text = text.replace(old, new, 1)
+text = text.replace(
+    "windowless ancestor only when plausibly the same application",
+    "a windowless ancestor only when plausibly the same application",
+    1,
+)
+text = text.replace(
+    "windowless ancestor only with positive ownership evidence",
+    "a windowless ancestor only with positive ownership evidence",
+    1,
+)
+path.write_text(text, encoding="utf-8")
