@@ -1,0 +1,50 @@
+name: Apply Windows process classification fix
+
+on:
+  push:
+    branches:
+      - fix/windows-process-classification
+
+permissions:
+  contents: write
+
+jobs:
+  apply-and-validate:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: windows-2025
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: fix/windows-process-classification
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Apply classification patch
+        run: python .github/scripts/apply_windows_process_classification.py
+
+      - name: Format
+        run: cargo fmt --all
+
+      - name: Full quality gate
+        run: python build.py --check
+
+      - name: Host release build
+        run: python build.py --host-only
+
+      - name: Commit validated implementation
+        shell: pwsh
+        run: |
+          Remove-Item .github/scripts/apply_windows_process_classification.py
+          Remove-Item .github/workflows/apply-windows-process-classification.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "fix: classify Windows processes by OS ownership"
+          git push origin HEAD:fix/windows-process-classification
