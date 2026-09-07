@@ -25,4 +25,14 @@ text = text.replace(
     "a windowless ancestor only with positive ownership evidence",
     1,
 )
+text = text.replace(
+    "see siblings; `svchost.exe` is exempt.\n        '''",
+    "see siblings; `svchost.exe` is exempt. A group's aggregate is\n        '''",
+    1,
+)
+text = text.replace(
+    "separately (`sibling_run_key`), including `svchost.exe` under `services.exe`.\n        '''",
+    "separately (`sibling_run_key`), including `svchost.exe` under `services.exe`. A group's aggregate is\n        '''",
+    1,
+)
 path.write_text(text, encoding="utf-8")
