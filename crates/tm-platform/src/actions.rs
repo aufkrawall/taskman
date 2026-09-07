@@ -91,6 +91,16 @@ pub struct ProcessModule {
     pub size_bytes: u64,
 }
 
+/// Wire/request capability marker appended to module paths by current GUIs.
+///
+/// Windows file names cannot contain NUL, so an older v2 service cannot ever
+/// mistake the marked string for a real ToolHelp module path: its exact
+/// base/path revalidation fails before it reaches its former multi-call
+/// `FreeLibrary` loop. Current platform code strips the marker before normal
+/// validation. This makes a new GUI safe when an installed service has not yet
+/// been upgraded, without changing the whole broker protocol version.
+pub const MODULE_UNLOAD_SINGLE_RELEASE_MARKER: &str = "\0taskman-single-release-v1";
+
 /// What could be verified after one remote `FreeLibrary` request completed.
 ///
 /// TaskMan deliberately does not try to guess or drain the loader's private
