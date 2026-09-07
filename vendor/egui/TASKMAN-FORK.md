@@ -157,6 +157,7 @@ current selection".
 | --- | --- | --- |
 | `crates/egui/src/data/key.rs` | `Key::ContextMenu` variant + `Key::ALL` + name mapping (accepts "ContextMenu"/"Menu"/"Apps") | The key must exist before it can be pressed. |
 | `crates/egui-winit/src/lib.rs` | `NamedKey::ContextMenu` and `KeyCode::ContextMenu` map to it in `key_from_named_key` / `key_from_key_code` | Windows reports the Menu key as both; without either mapping the press dies in the backend. |
+| `crates/egui/src/containers/popup.rs` | `Popup::show` remembers `PopupAnchor::Position(pos)` with `open_popup_at` | Upstream only remembered `PointerFixed`. Menus opened at a fixed position via keyboard collapsed on subsequent frames because `PointerFixed` read `None` from memory. |
 
 Droppable when upstream adds the key; the variant sits with the command keys, so a
 rebase conflict there is a prompt to check this table.

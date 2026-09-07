@@ -65,10 +65,11 @@ pub fn context_menu(resp: &Response, add: impl FnOnce(&mut Ui)) {
 /// the current selection with the keyboard: the Menu/Application key (next
 /// to Right Ctrl), or its standard Shift+F10 accelerator.
 pub fn keyboard_menu_requested(ctx: &egui::Context) -> bool {
-    ctx.input(|input| {
-        input.key_pressed(egui::Key::ContextMenu)
-            || (input.key_pressed(egui::Key::F10) && input.modifiers.shift)
-    })
+    !ctx.egui_wants_keyboard_input()
+        && ctx.input(|input| {
+            input.key_pressed(egui::Key::ContextMenu)
+                || (input.key_pressed(egui::Key::F10) && input.modifiers.shift)
+        })
 }
 
 /// Context menu that also opens from the keyboard: when `keyboard_open` is
@@ -400,5 +401,164 @@ mod tests {
             (rects[3].top() - rects[2].bottom() - SEP_H).abs() < 0.51,
             "separator does not occupy exactly its own row"
         );
+    }
+
+    #[test]
+    fn context_menu_kb_opens_and_stays_open() {
+        let ctx = egui::Context::default();
+        let raw1 = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, egui::vec2(800.0, 600.0))),
+            ..Default::default()
+        };
+        let mut opened_frame_1 = false;
+        let mut opened_frame_2 = false;
+        let mut opened_frame_3 = false;
+
+        let mut out1 = ctx.run_ui(raw1, |ui| {
+            let resp = ui.label("row");
+            context_menu_kb(&resp, true, |ui| {
+                opened_frame_1 = true;
+                item(ui, "Action 1");
+            });
+        });
+        out1.textures_delta.clear();
+
+        let raw2 = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, egui::vec2(800.0, 600.0))),
+            ..Default::default()
+        };
+        let mut out2 = ctx.run_ui(raw2, |ui| {
+            let resp = ui.label("row");
+            context_menu_kb(&resp, false, |ui| {
+                opened_frame_2 = true;
+                item(ui, "Action 1");
+            });
+        });
+        out2.textures_delta.clear();
+
+        let raw3 = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, egui::vec2(800.0, 600.0))),
+            ..Default::default()
+        };
+        let mut out3 = ctx.run_ui(raw3, |ui| {
+            let resp = ui.label("row");
+            context_menu_kb(&resp, false, |ui| {
+                opened_frame_3 = true;
+                item(ui, "Action 1");
+            });
+        });
+        out3.textures_delta.clear();
+
+        assert!(opened_frame_1, "frame 1 should be opened");
+        assert!(opened_frame_2, "frame 2 should be opened");
+        assert!(opened_frame_3, "frame 3 should be opened");
+
+        // Frame 4: Escape key closes the context menu.
+        let mut opened_frame_4 = false;
+        let raw4 = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, egui::vec2(800.0, 600.0))),
+            events: vec![egui::Event::Key {
+                key: egui::Key::Escape,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::default(),
+            }],
+            ..Default::default()
+        };
+        let mut out4 = ctx.run_ui(raw4, |ui| {
+            let resp = ui.label("row");
+            context_menu_kb(&resp, false, |_ui| {
+                opened_frame_4 = true;
+            });
+        });
+        out4.textures_delta.clear();
+
+        // Frame 5: Should now be closed.
+        let mut opened_frame_5 = false;
+        let raw5 = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, egui::vec2(800.0, 600.0))),
+            ..Default::default()
+        };
+        let mut out5 = ctx.run_ui(raw5, |ui| {
+            let resp = ui.label("row");
+            context_menu_kb(&resp, false, |_ui| {
+                opened_frame_5 = true;
+            });
+        });
+        out5.textures_delta.clear();
+
+        assert!(!opened_frame_5, "menu should be closed after Escape");
+    }
+
+    #[test]
+    fn keyboard_menu_requested_triggers() {
+        let ctx = egui::Context::default();
+
+        // 1. ContextMenu key triggers
+        let raw = egui::RawInput {
+            events: vec![egui::Event::Key {
+                key: egui::Key::ContextMenu,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::default(),
+            }],
+            ..Default::default()
+        };
+        let mut triggered = false;
+        let mut out = ctx.run_ui(raw, |ui| {
+            triggered = keyboard_menu_requested(ui.ctx());
+        });
+        out.textures_delta.clear();
+        assert!(triggered, "ContextMenu key should trigger keyboard menu");
+
+        // 2. Shift+F10 triggers
+        let raw = egui::RawInput {
+            events: vec![
+                egui::Event::ModifiersChanged(egui::Modifiers {
+                    shift: true,
+                    ..Default::default()
+                }),
+                egui::Event::Key {
+                    key: egui::Key::F10,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers {
+                        shift: true,
+                        ..Default::default()
+                    },
+                },
+            ],
+            ..Default::default()
+        };
+        let mut triggered = false;
+        let mut out = ctx.run_ui(raw, |ui| {
+            triggered = keyboard_menu_requested(ui.ctx());
+        });
+        out.textures_delta.clear();
+        assert!(triggered, "Shift+F10 should trigger keyboard menu");
+
+        // 3. F10 without shift does NOT trigger
+        let raw = egui::RawInput {
+            events: vec![
+                egui::Event::ModifiersChanged(egui::Modifiers::default()),
+                egui::Event::Key {
+                    key: egui::Key::F10,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::default(),
+                },
+            ],
+            ..Default::default()
+        };
+        let mut triggered = false;
+        let mut out = ctx.run_ui(raw, |ui| {
+            triggered = keyboard_menu_requested(ui.ctx());
+        });
+        out.textures_delta.clear();
+        assert!(!triggered, "Plain F10 should not trigger keyboard menu");
     }
 }

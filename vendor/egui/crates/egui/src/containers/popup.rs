@@ -522,6 +522,9 @@ impl<'a> Popup<'a> {
                             PopupAnchor::PointerFixed => {
                                 self.ctx.memory_mut(|mem| mem.open_popup_at(id, hover_pos));
                             }
+                            PopupAnchor::Position(pos) => {
+                                self.ctx.memory_mut(|mem| mem.open_popup_at(id, Some(pos)));
+                            }
                             _ => Popup::open_id(&self.ctx, id),
                         }
                     } else {

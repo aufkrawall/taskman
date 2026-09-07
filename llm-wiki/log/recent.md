@@ -1,5 +1,21 @@
 # Recent Activity
 
+## 2026-09-07 — Keyboard context menu fix (`PopupAnchor::Position` memory persistence)
+
+1. **Context menu via Menu key / Shift+F10 opens and stays open.** The previous
+   implementation opened the popup on frame 1 using `Popup::at_position(...)`, but
+   `Popup::show` only recorded the position in egui memory (`open_popup_at`) for
+   `PopupAnchor::PointerFixed`. For `PopupAnchor::Position(pos)`, it fell back to
+   `Popup::open_id` which saved `None` as the position. On frame 2, when
+   `keyboard_open` was false and `context_menu_kb` defaulted back to
+   `Popup::context_menu(resp)` (`PointerFixed`), `Popup::position_of_id` returned
+   `None`, causing the popup to drop its anchor rect and fail to render, closing
+   instantly. `Popup::show` now stores `Some(pos)` for `PopupAnchor::Position(pos)`,
+   allowing keyboard-anchored menus to remain open and render properly.
+2. **Gate keyboard menu requests:** `menu::keyboard_menu_requested` now guards
+   with `!ctx.egui_wants_keyboard_input()`, ensuring text inputs (e.g. search fields)
+   do not inadvertently trigger table row context menus.
+
 ## 2026-09-07 — CPU renderer and application pipeline optimizations for lowest CPU load
 
 1. **`egui_software` rasterizer optimizations:**
