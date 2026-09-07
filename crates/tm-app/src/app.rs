@@ -1639,6 +1639,54 @@ impl TaskManApp {
             .unwrap_or(false)
     }
 
+    /// Suspend or resume a batch of selected processes.
+    pub fn set_suspended_batch(
+        &mut self,
+        ctx: &egui::Context,
+        targets: Vec<ProcessIdentity>,
+        suspend: bool,
+    ) {
+        let total = targets.len();
+        if total == 0 {
+            return;
+        }
+        let actions = self.actions.clone();
+        let msg = move || {
+            if total == 1 {
+                if suspend {
+                    i18n::tr(K::ProcessSuspendedToast).to_string()
+                } else {
+                    i18n::tr(K::ProcessResumedToast).to_string()
+                }
+            } else if suspend {
+                i18n::trf(K::ProcessesSuspendedToast, &[&total.to_string()])
+            } else {
+                i18n::trf(K::ProcessesResumedToast, &[&total.to_string()])
+            }
+        };
+        self.run_action_refreshing(ctx, msg, move || {
+            for identity in targets {
+                let _ =
+                    actions.suspend_process_checked(identity.pid, identity.start_epoch_s, suspend);
+            }
+            Ok(())
+        });
+    }
+
+    /// Whether the primary selected row currently has suspended status.
+    /// A batch toggle flips away from this one answer.
+    pub fn primary_suspended(&self) -> bool {
+        self.selection
+            .primary()
+            .and_then(|identity| {
+                self.latest_snapshot()
+                    .as_ref()
+                    .and_then(|snapshot| snapshot.process(identity.pid))
+                    .map(|process| process.status == tm_core::model::ProcStatus::Suspended)
+            })
+            .unwrap_or(false)
+    }
+
     /// Make Windows paint its caption in the app's own colors.
     ///
     /// The strip immediately below the caption is the search panel, which

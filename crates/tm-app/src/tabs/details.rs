@@ -729,6 +729,8 @@ pub struct Row {
     pub children: bool,
     pub pid_s: String,
     pub status: String,
+    pub proc_status: ProcStatus,
+    pub power_throttled: bool,
     pub user: String,
     pub cpu_s: String,
     pub mem_s: String,
@@ -802,6 +804,28 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
         ui,
         &pal,
         |app: &mut TaskManApp, ui| {
+            let ctx = ui.ctx().clone();
+            let caps = app.actions.capabilities();
+            let suspended = app.primary_suspended();
+            let (suspend_icon, suspend_label) = if suspended {
+                (Icon::Play, i18n::tr(K::ResumeProc))
+            } else {
+                (Icon::Pause, i18n::tr(K::SuspendProc))
+            };
+            if crate::app_ui::cmd_button(
+                ui,
+                &pal,
+                suspend_icon,
+                suspend_label,
+                caps.suspend_resume && !app.selection.is_empty(),
+            ) {
+                let targets = app
+                    .live_selection_targets()
+                    .into_iter()
+                    .map(|(identity, _)| identity)
+                    .collect();
+                app.set_suspended_batch(&ctx, targets, !suspended);
+            }
             if crate::app_ui::cmd_button(
                 ui,
                 &pal,
@@ -809,7 +833,6 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
                 i18n::tr(K::EndTask),
                 !app.selection.is_empty(),
             ) {
-                let ctx = ui.ctx().clone();
                 app.end_selected(&ctx);
             }
         },
@@ -1015,6 +1038,39 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
                             egui::FontId::proportional(tablekit::FONT_ROW),
                             pal.text,
                         );
+                    } else if cid == ColumnId::Status {
+                        let cell = table.col_rect(pos, rect);
+                        let mut x = cell.left() + 10.0;
+                        if row.proc_status == ProcStatus::Suspended {
+                            let r = egui::Rect::from_center_size(
+                                egui::Pos2::new(x + 8.0, rect.center().y),
+                                egui::vec2(16.0, 16.0),
+                            );
+                            crate::icons::draw_at(ui, r, Icon::Pause, pal.warn_orange);
+                            x += 20.0;
+                        }
+                        if row.power_throttled {
+                            let r = egui::Rect::from_center_size(
+                                egui::Pos2::new(x + 8.0, rect.center().y),
+                                egui::vec2(16.0, 16.0),
+                            );
+                            crate::icons::draw_at(ui, r, Icon::Leaf, pal.ok_green);
+                            x += 20.0;
+                        }
+                        let text_color = if row.proc_status == ProcStatus::Suspended {
+                            pal.warn_orange
+                        } else if row.proc_status == ProcStatus::NotResponding {
+                            pal.heat_high
+                        } else {
+                            pal.text
+                        };
+                        ui.painter_at(cell).text(
+                            egui::Pos2::new(x, rect.center().y),
+                            egui::Align2::LEFT_CENTER,
+                            text,
+                            egui::FontId::proportional(tablekit::FONT_ROW),
+                            text_color,
+                        );
                     } else if cid_is_numeric(cid) {
                         let cell = table.col_rect(pos, rect);
                         ui.painter_at(cell).text(
@@ -1193,6 +1249,10 @@ fn prepare_auto_fit_widths(
         for row in rows {
             let extra = if spec.cid == ColumnId::Name {
                 66.0 + row.depth as f32 * TREE_INDENT
+            } else if spec.cid == ColumnId::Status {
+                let glyphs = u8::from(row.proc_status == ProcStatus::Suspended)
+                    + u8::from(row.power_throttled);
+                22.0 + f32::from(glyphs) * 20.0
             } else {
                 22.0
             };
@@ -1605,6 +1665,8 @@ fn row_from_process(p: &ProcessEntry, depth: usize, children: bool) -> Row {
         children,
         pid_s: p.pid.to_string(),
         status: process_status_text(p),
+        proc_status: p.status,
+        power_throttled: p.power_throttled == Some(true),
         user: p.user.clone().unwrap_or_else(|| "—".into()),
         cpu_s: format::format_cpu_detail(p.cpu_pct),
         mem_s: format::format_k(p.mem_bytes),
@@ -1909,19 +1971,32 @@ pub fn context_menu(app: &mut TaskManApp, ui: &mut egui::Ui, p: &ProcessEntry, h
     } else {
         i18n::tr(K::SuspendProc)
     };
-    if menu::item(ui, suspend_label).clicked() {
-        if !identity_still_live(app, p) {
-            app.shared.toast(i18n::tr(K::ProcessExited));
-            ui.close();
-            return;
-        }
-        let actions = app.actions.clone();
-        let pid = p.pid;
-        let start = p.start_epoch_s;
+    let suspend_text = if batch {
+        format!("{suspend_label} ({selected_count})")
+    } else {
+        suspend_label.to_string()
+    };
+    if menu::item(ui, &suspend_text).clicked() {
         let target_suspended = !suspended;
-        app.run_action_refreshing(&ctx, String::new, move || {
-            actions.suspend_process_checked(pid, start, target_suspended)
-        });
+        if batch {
+            let targets = app
+                .live_selection_targets()
+                .into_iter()
+                .map(|(identity, _)| identity)
+                .collect();
+            app.set_suspended_batch(&ctx, targets, target_suspended);
+        } else {
+            if !identity_still_live(app, p) {
+                app.shared.toast(i18n::tr(K::ProcessExited));
+                ui.close();
+                return;
+            }
+            let target = crate::app::ProcessIdentity {
+                pid: p.pid,
+                start_epoch_s: p.start_epoch_s,
+            };
+            app.set_suspended_batch(&ctx, vec![target], target_suspended);
+        }
         ui.close();
     }
 
@@ -2907,6 +2982,18 @@ mod tests {
         a.gpu_util_pct = Some(80.0);
         b.gpu_util_pct = Some(10.0);
         assert_eq!(ColumnId::GpuUtil.compare(&a, &b), CmpOrdering::Greater);
+    }
+
+    #[test]
+    fn row_from_process_preserves_status_and_throttling() {
+        let mut p = mk_proc(10, "test.exe");
+        p.status = ProcStatus::Suspended;
+        p.power_throttled = Some(true);
+        let row = row_from_process(&p, 0, false);
+        assert_eq!(row.proc_status, ProcStatus::Suspended);
+        assert!(row.power_throttled);
+        assert!(row.status.contains(i18n::tr(K::StSuspended)));
+        assert!(row.status.contains(i18n::tr(K::StEfficiencyMode)));
     }
 
     fn mk_proc(pid: u32, name: &str) -> ProcessEntry {

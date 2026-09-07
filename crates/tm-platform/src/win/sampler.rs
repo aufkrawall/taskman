@@ -563,20 +563,6 @@ impl Sampler {
                 }
             }
             entry.ppid = p.parent().map(|x| x.as_u32());
-            entry.status = map_status(p.status());
-            if self
-                .cpu_load
-                .is_suspended(pid_u, Some(p.start_time() as i64))
-            {
-                entry.status = ProcStatus::Suspended;
-            } else if window_owners.not_responding.contains(&pid_u) {
-                entry.status = ProcStatus::NotResponding;
-            }
-            entry.user = user;
-            // Time-based share of total machine capacity + absolute CPU time,
-            // both straight from the kernel's accumulators (cpu_load.rs).
-            let pc = load.as_ref().and_then(|l| l.procs.get(&pid_u));
-            entry.cpu_pct = pc.map_or(0.0, |c| c.pct);
             // sysinfo reads the creation time through a process handle and
             // yields 0 when it cannot open one — about half the process list
             // for an unelevated session. A `Some(0)` is a FABRICATED identity
@@ -589,6 +575,17 @@ impl Sampler {
             } else {
                 self.cpu_load.start_epoch_of(pid_u)
             };
+            entry.status = map_status(p.status());
+            if self.cpu_load.is_suspended(pid_u, entry.start_epoch_s) {
+                entry.status = ProcStatus::Suspended;
+            } else if window_owners.not_responding.contains(&pid_u) {
+                entry.status = ProcStatus::NotResponding;
+            }
+            entry.user = user;
+            // Time-based share of total machine capacity + absolute CPU time,
+            // both straight from the kernel's accumulators (cpu_load.rs).
+            let pc = load.as_ref().and_then(|l| l.procs.get(&pid_u));
+            entry.cpu_pct = pc.map_or(0.0, |c| c.pct);
             entry.mem_bytes = p.memory();
             if entry.mem_bytes == 0
                 && let Some(ws) = self.cpu_load.working_set_of(pid_u, entry.start_epoch_s)

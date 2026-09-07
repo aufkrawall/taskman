@@ -283,14 +283,17 @@ impl CpuLoadAccountant {
 
     /// Whether the newest native process table identifies this exact process
     /// as suspended. Unknown/malformed thread telemetry returns false rather
-    /// than manufacturing a suspended state.
+    /// than manufacturing a suspended state. Skew of up to 1 second is
+    /// tolerated to accommodate rounding differences between sysinfo and
+    /// the kernel process table.
     pub fn is_suspended(&self, pid: u32, start_epoch_s: Option<i64>) -> bool {
-        let Some(start_epoch_s) = start_epoch_s else {
+        let Some(native_start) = self.suspended.get(&pid) else {
             return false;
         };
-        self.suspended
-            .get(&pid)
-            .is_some_and(|native_start| *native_start == start_epoch_s)
+        match start_epoch_s {
+            Some(expected) => (*native_start - expected).abs() <= 1,
+            None => true,
+        }
     }
 
     /// Take one sample. Returns `None` for the first call (no reference
@@ -1311,5 +1314,28 @@ mod tests {
             std::mem::offset_of!(SYSTEM_PROCESS_INFORMATION, HandleCount)
         );
         assert!(off.min_size <= std::mem::size_of::<SYSTEM_PROCESS_INFORMATION>());
+    }
+
+    #[test]
+    fn is_suspended_handles_identity_and_skew() {
+        let mut load = CpuLoadAccountant::new();
+        load.suspended.insert(1234, 1_700_000_000);
+
+        // Unknown PID returns false
+        assert!(!load.is_suspended(9999, Some(1_700_000_000)));
+
+        // Exact match
+        assert!(load.is_suspended(1234, Some(1_700_000_000)));
+
+        // 1-second skew tolerated
+        assert!(load.is_suspended(1234, Some(1_700_000_001)));
+        assert!(load.is_suspended(1234, Some(1_699_999_999)));
+
+        // 2-second difference rejected (e.g. recycled PID)
+        assert!(!load.is_suspended(1234, Some(1_700_000_002)));
+        assert!(!load.is_suspended(1234, Some(1_699_999_998)));
+
+        // None expected start accepts current snapshot's kernel determination
+        assert!(load.is_suspended(1234, None));
     }
 }

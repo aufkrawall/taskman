@@ -188,6 +188,26 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
         &pal,
         |app, ui| {
             let ctx = ui.ctx().clone();
+            let suspended = app.primary_suspended();
+            let (suspend_icon, suspend_label) = if suspended {
+                (Icon::Play, i18n::tr(K::ResumeProc))
+            } else {
+                (Icon::Pause, i18n::tr(K::SuspendProc))
+            };
+            if crate::app_ui::cmd_button(
+                ui,
+                &pal,
+                suspend_icon,
+                suspend_label,
+                caps.suspend_resume && !app.selection.is_empty(),
+            ) {
+                let targets = app
+                    .live_selection_targets()
+                    .into_iter()
+                    .map(|(identity, _)| identity)
+                    .collect();
+                app.set_suspended_batch(&ctx, targets, !suspended);
+            }
             if crate::app_ui::cmd_button(
                 ui,
                 &pal,
@@ -828,6 +848,26 @@ fn context_menu(app: &mut TaskManApp, ui: &mut egui::Ui, row: &RowData) {
         }
         ui.close();
     }
+    let suspended = row.status == ProcStatus::Suspended;
+    let suspend_label = if suspended {
+        i18n::tr(K::ResumeProc)
+    } else {
+        i18n::tr(K::SuspendProc)
+    };
+    if menu::item(ui, &batch_label(suspend_label)).clicked() {
+        let target_suspended = !suspended;
+        if batch {
+            let targets = app
+                .live_selection_targets()
+                .into_iter()
+                .map(|(identity, _)| identity)
+                .collect();
+            app.set_suspended_batch(&ctx, targets, target_suspended);
+        } else {
+            app.set_suspended_batch(&ctx, vec![identity_of(row)], target_suspended);
+        }
+        ui.close();
+    }
     if menu::item(ui, i18n::tr(K::GoToDetails)).clicked() {
         app.pending_details_focus = Some(crate::app::PendingDetailsFocus(
             crate::app::ProcessIdentity {
@@ -1270,7 +1310,13 @@ fn emit_flat_with_family_groups(
                 values: repr.get(&p.pid).copied().unwrap_or([0.0; 4]),
                 heat: [0.0; 4],
                 net_available,
-                status: p.status,
+                status: if fam.iter().any(|k| k.status == ProcStatus::NotResponding) {
+                    ProcStatus::NotResponding
+                } else if fam.iter().any(|k| k.status == ProcStatus::Suspended) {
+                    ProcStatus::Suspended
+                } else {
+                    p.status
+                },
                 // The family row stands for every member, so it reports the
                 // family's efficiency state — not just the head's.
                 power_throttled: fam.iter().any(|k| k.power_throttled == Some(true)),
@@ -1763,7 +1809,7 @@ fn emit_tree<'a>(
             values: subtree.values(proc.pid),
             heat: [0.0; 4],
             net_available: proc.net_recv_bps.is_some() || proc.net_sent_bps.is_some(),
-            status: proc.status,
+            status: subtree.status(proc.pid),
             // An app row summarizes its whole family (see [`Subtree`]), so a
             // collapsed browser shows the leaf its renderers earned.
             power_throttled: subtree.efficiency(proc.pid),
@@ -1788,6 +1834,9 @@ struct Subtree {
     /// children's resources, so it must summarize their power state too —
     /// that is where native Task Manager shows the leaf.
     efficiency: HashMap<u32, bool>,
+    /// Rolled-up status: NotResponding if any descendant hung, else Suspended
+    /// if any descendant is suspended, else the process's own status.
+    status: HashMap<u32, ProcStatus>,
 }
 
 impl Subtree {
@@ -1802,6 +1851,13 @@ impl Subtree {
     fn efficiency(&self, pid: u32) -> bool {
         self.efficiency.get(&pid).copied().unwrap_or(false)
     }
+
+    fn status(&self, pid: u32) -> ProcStatus {
+        self.status
+            .get(&pid)
+            .copied()
+            .unwrap_or(ProcStatus::Running)
+    }
 }
 
 fn subtree_values_and_counts<'a>(
@@ -1811,11 +1867,12 @@ fn subtree_values_and_counts<'a>(
     let mut out: HashMap<u32, [f64; 4]> = HashMap::with_capacity(all.len());
     let mut counts: HashMap<u32, u32> = HashMap::with_capacity(all.len());
     let mut eco: HashMap<u32, bool> = HashMap::with_capacity(all.len());
+    let mut statuses: HashMap<u32, ProcStatus> = HashMap::with_capacity(all.len());
     let by_pid: HashMap<u32, &'a ProcessEntry> = all.iter().map(|p| (p.pid, *p)).collect();
 
     enum Frame<'b> {
         Enter(u32),
-        Combine(u32, Vec<&'b ProcessEntry>, [f64; 4], bool),
+        Combine(u32, Vec<&'b ProcessEntry>, [f64; 4], bool, ProcStatus),
     }
     let mut done: HashSet<u32> = HashSet::with_capacity(all.len());
     let mut in_progress: HashSet<u32> = HashSet::with_capacity(all.len());
@@ -1827,7 +1884,7 @@ fn subtree_values_and_counts<'a>(
         let mut stack: Vec<Frame> = vec![Frame::Enter(root.pid)];
         while let Some(frame) = stack.pop() {
             match frame {
-                Frame::Combine(pid, kids, mut acc, mut throttled) => {
+                Frame::Combine(pid, kids, mut acc, mut throttled, mut status) => {
                     let mut cnt: u32 = 1;
                     for k in &kids {
                         if let Some(v) = out.get(&k.pid) {
@@ -1836,11 +1893,21 @@ fn subtree_values_and_counts<'a>(
                             }
                             cnt += counts.get(&k.pid).copied().unwrap_or(1);
                             throttled |= eco.get(&k.pid).copied().unwrap_or(false);
+                            if let Some(&child_status) = statuses.get(&k.pid) {
+                                if child_status == ProcStatus::NotResponding {
+                                    status = ProcStatus::NotResponding;
+                                } else if child_status == ProcStatus::Suspended
+                                    && status != ProcStatus::NotResponding
+                                {
+                                    status = ProcStatus::Suspended;
+                                }
+                            }
                         }
                     }
                     out.insert(pid, acc);
                     counts.insert(pid, cnt);
                     eco.insert(pid, throttled);
+                    statuses.insert(pid, status);
                     done.insert(pid);
                     in_progress.remove(&pid);
                 }
@@ -1868,6 +1935,7 @@ fn subtree_values_and_counts<'a>(
                         out.insert(pid, own_values(p));
                         counts.insert(pid, 1);
                         eco.insert(pid, p.power_throttled == Some(true));
+                        statuses.insert(pid, p.status);
                         done.insert(pid);
                         in_progress.remove(&pid);
                     } else {
@@ -1876,6 +1944,7 @@ fn subtree_values_and_counts<'a>(
                             kids,
                             own_values(p),
                             p.power_throttled == Some(true),
+                            p.status,
                         ));
                         for k in pending {
                             stack.push(Frame::Enter(k.pid));
@@ -1888,11 +1957,15 @@ fn subtree_values_and_counts<'a>(
     for p in all {
         out.entry(p.pid).or_insert_with(|| own_values(p));
         counts.entry(p.pid).or_insert(1);
+        eco.entry(p.pid)
+            .or_insert_with(|| p.power_throttled == Some(true));
+        statuses.entry(p.pid).or_insert(p.status);
     }
     Subtree {
         values: out,
         counts,
         efficiency: eco,
+        status: statuses,
     }
 }
 
@@ -2332,6 +2405,67 @@ mod tests {
             })
             .expect("head row");
         assert!(head.power_throttled, "collapsed app row shows the leaf");
+    }
+
+    #[test]
+    fn suspended_status_rolls_up_to_the_group_row() {
+        let mut root = proc(1, None, "brave.exe", ProcCategory::App);
+        root.has_window = true;
+        let mut renderer = proc(2, Some(1), "brave.exe", ProcCategory::App);
+        renderer.status = ProcStatus::Suspended;
+        let quiet = proc(3, Some(1), "brave.exe", ProcCategory::App);
+        let snap = snap_of(vec![root, renderer, quiet]);
+        let all: Vec<&ProcessEntry> = snap.processes.iter().collect();
+        let grouping = derive_display_groups(&all);
+        let children = display_children_map(&all, &grouping.category, &grouping.app_roots);
+        let st = subtree_values_and_counts(&all, &children);
+        assert_eq!(
+            st.status(1),
+            ProcStatus::Suspended,
+            "head inherits its renderer's suspended status"
+        );
+        assert_eq!(st.status(2), ProcStatus::Suspended);
+        assert_eq!(
+            st.status(3),
+            ProcStatus::Running,
+            "an untouched sibling stays running"
+        );
+
+        let rows = build_display_rows(&snap, "", 0, true, &HashSet::new(), &[false; 3]);
+        let head = rows
+            .iter()
+            .find_map(|row| match row {
+                DisplayRow::Process(row) if row.pid == 1 => Some(row),
+                _ => None,
+            })
+            .expect("head row");
+        assert_eq!(
+            head.status,
+            ProcStatus::Suspended,
+            "collapsed app row shows suspended status"
+        );
+    }
+
+    #[test]
+    fn suspended_status_rolls_up_to_background_family() {
+        let mut p1 = proc(10, Some(1), "worker.exe", ProcCategory::Background);
+        p1.status = ProcStatus::Running;
+        let mut p2 = proc(11, Some(1), "worker.exe", ProcCategory::Background);
+        p2.status = ProcStatus::Suspended;
+        let snap = snap_of(vec![p1, p2]);
+        let rows = build_display_rows(&snap, "", 0, true, &HashSet::new(), &[false; 3]);
+        let head = rows
+            .iter()
+            .find_map(|row| match row {
+                DisplayRow::Process(row) if row.pid == 10 => Some(row),
+                _ => None,
+            })
+            .expect("family head row");
+        assert_eq!(
+            head.status,
+            ProcStatus::Suspended,
+            "collapsed family head shows suspended status"
+        );
     }
 
     #[test]

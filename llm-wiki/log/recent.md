@@ -1,5 +1,32 @@
 # Recent Activity
 
+## 2026-09-07 — Bulk process suspend/resume, toolbar controls, and visual indicators
+
+1. **Bulk suspend/resume execution:** Previously in `details.rs`, the context menu
+   suspend action only targeted `p.pid`, ignoring any active multi-selection. Added
+   `TaskManApp::set_suspended_batch` and updated `details.rs` and `processes.rs`
+   context menus to route all selected processes through a single refreshing action,
+   displaying dynamic counts (e.g. `Suspend (N)` / `Resume (N)`).
+2. **Dedicated Resume / Suspend toolbar controls:** Added command buttons in both
+   the Processes and Details tab headers next to "End task", dynamically toggling
+   between `Icon::Play` ("Resume") and `Icon::Pause` ("Suspend") according to the
+   primary selected process's state (`primary_suspended`).
+3. **Suspended process detection root-cause fix:** Unelevated sessions often receive
+   `p.start_time() == 0` from sysinfo. In `crates/tm-platform/src/win/sampler.rs`,
+   `is_suspended` was called before `entry.start_epoch_s` was resolved against the
+   kernel process table fallback (`start_epoch_of`), passing `Some(0)` which always
+   failed identity verification against native start times. Fixed by resolving
+   `entry.start_epoch_s` first and tolerating 1-second second-boundary truncation
+   skew in `CpuLoadAccountant::is_suspended`.
+4. **Visual indicators on Details and Processes pages:**
+   - On the Details page, the Status column now renders `Icon::Pause` with
+     `pal.warn_orange` (and `Icon::Leaf` for efficiency mode) with status text styled
+     in `pal.warn_orange`, making suspended processes instantly recognizable.
+   - On the Processes page, group headers (application families and repeat runs) now
+     roll up child process status (`Subtree` and `emit_flat_with_family_groups`),
+     ensuring collapsed rows display the orange pause glyph whenever descendants
+     are suspended.
+
 ## 2026-09-07 — End-task dialog spatial layout and Tab focus navigation fix
 
 1. **End-task dialog Tab focus navigation:** The dialog previously compared

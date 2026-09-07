@@ -198,6 +198,16 @@ keys! {
         "Effizienzmodus für {} Prozesse geändert",
         "Efficiency mode changed for {} processes"
     ],
+    ProcessSuspendedToast => ["Prozess angehalten", "Process suspended"],
+    ProcessResumedToast => ["Prozess fortgesetzt", "Process resumed"],
+    ProcessesSuspendedToast => [
+        "{} Prozesse angehalten",
+        "Suspended {} processes"
+    ],
+    ProcessesResumedToast => [
+        "{} Prozesse fortgesetzt",
+        "Resumed {} processes"
+    ],
     SelectAll => ["Alle auswählen", "Select all"],
     ManageUserAccounts => ["Benutzerkonten verwalten", "Manage user accounts"],
     EnableCmd => ["Aktivieren", "Enable"],
