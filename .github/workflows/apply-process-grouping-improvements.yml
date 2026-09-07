@@ -24,6 +24,8 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
+      - name: Normalize patch-script indentation
+        run: python .github/scripts/fix_process_grouping_patch.py
       - name: Apply focused source patch
         run: python .github/scripts/apply_process_grouping.py
       - name: Format
@@ -37,8 +39,9 @@ jobs:
         run: |
           Remove-Item .github/workflows/apply-process-grouping-improvements.yml
           Remove-Item .github/scripts/apply_process_grouping.py
+          Remove-Item .github/scripts/fix_process_grouping_patch.py
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add -- crates/tm-app/src/tabs/processes.rs llm-wiki/repo-map.md llm-wiki/current.md llm-wiki/log/recent.md .github/workflows/apply-process-grouping-improvements.yml .github/scripts/apply_process_grouping.py
+          git add -- crates/tm-app/src/tabs/processes.rs llm-wiki/repo-map.md llm-wiki/current.md llm-wiki/log/recent.md .github/workflows/apply-process-grouping-improvements.yml .github/scripts/apply_process_grouping.py .github/scripts/fix_process_grouping_patch.py
           git commit -m "Improve process grouping heuristics"
           git push origin HEAD:improve/process-grouping
