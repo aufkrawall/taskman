@@ -234,12 +234,7 @@ pub fn draw(ui: &egui::Ui, icon: Icon, rect: Rect, color: Color32) {
             let big_base = p(-1.0, 4.0);
             let small_base = p(-1.0, 2.0);
             leaf(big_base, p(7.0, -5.0), p(8.0, 1.0), p(2.0, -6.0));
-            leaf(
-                small_base,
-                p(-7.0, -3.0),
-                p(-7.0, 1.0),
-                p(-3.0, -4.5),
-            );
+            leaf(small_base, p(-7.0, -3.0), p(-7.0, 1.0), p(-3.0, -4.5));
 
             // Shared stem plus a short vein in each blade keeps the two
             // outlines visually connected without turning them into one blob.

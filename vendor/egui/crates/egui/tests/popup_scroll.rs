@@ -19,30 +19,27 @@ fn popup_scroll_target_does_not_escape_to_parent_scroll_area() {
             ..Default::default()
         },
         |root| {
-            CentralPanel::default()
-                .frame(Frame::NONE)
-                .show(root, |ui| {
-                    let out = ScrollArea::vertical()
-                        .id_salt("outer")
-                        .max_height(100.0)
-                        .vertical_scroll_offset(120.0)
-                        .animated(false)
-                        .show(ui, |ui| {
-                            ui.set_min_height(1_000.0);
-                            let (_, owner) =
-                                ui.allocate_exact_size(vec2(100.0, 20.0), Sense::hover());
+            CentralPanel::default().frame(Frame::NONE).show(root, |ui| {
+                let out = ScrollArea::vertical()
+                    .id_salt("outer")
+                    .max_height(100.0)
+                    .vertical_scroll_offset(120.0)
+                    .animated(false)
+                    .show(ui, |ui| {
+                        ui.set_min_height(1_000.0);
+                        let (_, owner) = ui.allocate_exact_size(vec2(100.0, 20.0), Sense::hover());
 
-                            let _ = Popup::from_response(&owner)
-                                .open(true)
-                                .at_position(pos2(20.0, 180.0))
-                                .show(|ui| {
-                                    let (rect, _) = ui
-                                        .allocate_exact_size(vec2(120.0, 20.0), Sense::hover());
-                                    ui.scroll_to_rect(rect, Some(Align::Center));
-                                });
-                        });
-                    outer_offset.set(out.state.offset.y);
-                });
+                        let _ = Popup::from_response(&owner)
+                            .open(true)
+                            .at_position(pos2(20.0, 180.0))
+                            .show(|ui| {
+                                let (rect, _) =
+                                    ui.allocate_exact_size(vec2(120.0, 20.0), Sense::hover());
+                                ui.scroll_to_rect(rect, Some(Align::Center));
+                            });
+                    });
+                outer_offset.set(out.state.offset.y);
+            });
         },
     );
     output.textures_delta.clear();

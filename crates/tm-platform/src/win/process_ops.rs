@@ -1,9 +1,7 @@
 //! Per-process control operations: kill, suspend, priority, affinity,
 //! efficiency mode, elevation, launching.
 
-use crate::actions::{
-    MODULE_UNLOAD_SINGLE_RELEASE_MARKER, ModuleUnloadOutcome, ProcessModule,
-};
+use crate::actions::{MODULE_UNLOAD_SINGLE_RELEASE_MARKER, ModuleUnloadOutcome, ProcessModule};
 use tm_core::error::{Result, TmError};
 use tm_core::model::PriorityClass;
 use windows::Win32::Foundation::{CloseHandle, FILETIME, HANDLE};
@@ -271,10 +269,9 @@ fn process_machine(process: HANDLE) -> Result<u16> {
     let kernel32_w: Vec<u16> = "kernel32.dll\0".encode_utf16().collect();
     let kernel32 = unsafe { GetModuleHandleW(PCWSTR::from_raw(kernel32_w.as_ptr())) }
         .map_err(|error| TmError::platform("GetModuleHandleW", error.to_string()))?;
-    let address = unsafe { GetProcAddress(kernel32, windows::core::s!("IsWow64Process2")) }
-        .ok_or(TmError::Unsupported(
-            "module unload requires IsWow64Process2",
-        ))?;
+    let address = unsafe { GetProcAddress(kernel32, windows::core::s!("IsWow64Process2")) }.ok_or(
+        TmError::Unsupported("module unload requires IsWow64Process2"),
+    )?;
     let query = unsafe { std::mem::transmute::<usize, IsWow64Process2Fn>(address as usize) };
     let mut process_machine = 0u16;
     let mut native_machine = 0u16;
@@ -377,8 +374,7 @@ pub fn unload_process_module(
         // requirement is only that the exact image selected in the dialog is
         // still mapped at the same base in the same process generation.
         let is_selected = |candidate: &ProcessModule| {
-            candidate.base_address == base_address
-                && module_path_eq(&candidate.path, expected_path)
+            candidate.base_address == base_address && module_path_eq(&candidate.path, expected_path)
         };
         if !modules.iter().any(is_selected) {
             return Err(TmError::platform(

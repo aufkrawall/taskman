@@ -9,9 +9,7 @@ use std::cmp::Ordering;
 use std::sync::{Arc, Mutex};
 use tm_core::format;
 use tm_core::i18n::{self, K};
-use tm_platform::actions::{
-    MODULE_UNLOAD_SINGLE_RELEASE_MARKER, PlatformActions, ProcessModule,
-};
+use tm_platform::actions::{MODULE_UNLOAD_SINGLE_RELEASE_MARKER, PlatformActions, ProcessModule};
 
 use crate::app::{InFlight, ProcessIdentity, TaskManApp};
 use crate::search;
@@ -192,10 +190,7 @@ fn begin_unload(app: &TaskManApp, state: &mut State, module: ProcessModule, ctx:
             // another request only after the exact selected base/path has
             // been re-enumerated and proven to still be mapped. This keeps
             // the mixed-version safety marker and avoids the old blind loop.
-            let request_path = format!(
-                "{}{}",
-                module.path, MODULE_UNLOAD_SINGLE_RELEASE_MARKER
-            );
+            let request_path = format!("{}{}", module.path, MODULE_UNLOAD_SINGLE_RELEASE_MARKER);
             let mut releases = 0u32;
             let mut observed_still_mapped = None;
             let mut action_error: Option<String> = None;
@@ -549,9 +544,7 @@ pub fn dialog(app: &mut TaskManApp, ctx: &egui::Context, pal: &theme::Palette) {
                                     let unload = menu::item_enabled(
                                         ui,
                                         i18n::tr(K::UnloadModule),
-                                        can_unload
-                                            && !state.unload.busy()
-                                            && !state.fetch.busy(),
+                                        can_unload && !state.unload.busy() && !state.fetch.busy(),
                                     )
                                     .on_disabled_hover_text(i18n::tr(K::ModuleBusy));
                                     if unload.clicked() {
