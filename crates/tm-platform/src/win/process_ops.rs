@@ -1,7 +1,9 @@
 //! Per-process control operations: kill, suspend, priority, affinity,
 //! efficiency mode, elevation, launching.
 
-use crate::actions::{ModuleUnloadOutcome, ProcessModule};
+use crate::actions::{
+    MODULE_UNLOAD_SINGLE_RELEASE_MARKER, ModuleUnloadOutcome, ProcessModule,
+};
 use tm_core::error::{Result, TmError};
 use tm_core::model::PriorityClass;
 use windows::Win32::Foundation::{CloseHandle, FILETIME, HANDLE};
@@ -255,27 +257,97 @@ fn verify_pid_still_refers_to(pid: u32, opened_creation: Option<u64>) -> Result<
     }
 }
 
-/// One FreeLibrary call drops ONE loader reference. Injected and
-/// statically-imported DLLs are referenced several times, so the call
-/// repeats until the module actually leaves. Bounded, so a module the
-/// target keeps re-loading or permanently pins cannot spin this forever.
-const MAX_FREE_LIBRARY_CALLS: u32 = 64;
+/// Windows module paths are case-insensitive for the normal loader case, but
+/// paths can contain non-ASCII user/profile components. `eq_ignore_ascii_case`
+/// therefore is not strong enough for action-time identity revalidation.
+fn module_path_eq(left: &str, right: &str) -> bool {
+    left == right || left.to_lowercase() == right.to_lowercase()
+}
 
-/// Release a DLL by running FreeLibrary inside the target, repeatedly,
-/// until it is no longer mapped. The operation is deliberately fail-closed:
-/// exact process identity and module base/path are revalidated on every
-/// attempt, and cross-architecture injection is not attempted. The outcome
-/// distinguishes "the module left" from "references were released but it is
-/// still in use" — FreeLibrary succeeds in both.
+type IsWow64Process2Fn =
+    unsafe extern "system" fn(HANDLE, *mut u16, *mut u16) -> windows::core::BOOL;
+
+/// Return the effective PE machine for one live process. `IsWow64Process`
+/// only returns a boolean and is ambiguous on ARM64 (for example x86 and x64
+/// emulation can both be "WOW64"). Module-unload code injection needs an
+/// exact architecture match, so resolve `IsWow64Process2` dynamically and
+/// fail closed if Windows cannot establish it.
+fn process_machine(process: HANDLE) -> Result<u16> {
+    use windows::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
+
+    let kernel32_w: Vec<u16> = "kernel32.dll\0".encode_utf16().collect();
+    let kernel32 = unsafe { GetModuleHandleW(PCWSTR::from_raw(kernel32_w.as_ptr())) }
+        .map_err(|error| TmError::platform("GetModuleHandleW", error.to_string()))?;
+    let address = unsafe { GetProcAddress(kernel32, windows::core::s!("IsWow64Process2")) }
+        .ok_or(TmError::Unsupported(
+            "module unload requires IsWow64Process2",
+        ))?;
+    let query = unsafe { std::mem::transmute::<usize, IsWow64Process2Fn>(address as usize) };
+    let mut process_machine = 0u16;
+    let mut native_machine = 0u16;
+    let ok = unsafe { query(process, &mut process_machine, &mut native_machine) };
+    if !ok.as_bool() {
+        return Err(TmError::platform(
+            "IsWow64Process2",
+            std::io::Error::last_os_error().to_string(),
+        ));
+    }
+    let effective = if process_machine == 0 {
+        native_machine
+    } else {
+        process_machine
+    };
+    if effective == 0 {
+        Err(TmError::platform(
+            "IsWow64Process2",
+            "Windows returned an unknown process architecture",
+        ))
+    } else {
+        Ok(effective)
+    }
+}
+
+/// Ask the target to release exactly one loader reference for an exact mapped
+/// image. One user confirmation maps to one `FreeLibrary` call: TaskMan did
+/// not acquire the target's loader references, so blindly draining an unknown
+/// reference count can over-release a live dependency or race a same-path
+/// module that is unloaded/reloaded at the same base between iterations.
+///
+/// The operation fails closed on missing process identity and architecture,
+/// revalidates the exact module base/path immediately before the remote call,
+/// and re-enumerates afterwards. A successful `FreeLibrary` with an
+/// unavailable post-action inventory is reported as an unverified outcome,
+/// never fabricated as either success or failure.
 pub fn unload_process_module(
     pid: u32,
     expected_start_epoch_s: Option<i64>,
     base_address: u64,
     expected_path: &str,
 ) -> Result<ModuleUnloadOutcome> {
-    use windows::Win32::Foundation::WAIT_OBJECT_0;
+    use windows::Win32::Foundation::{WAIT_OBJECT_0, WAIT_TIMEOUT};
     use windows::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
 
+    // New GUIs append a capability marker so an older v2 service cannot
+    // accidentally execute its former multi-release implementation. Current
+    // code accepts both marked (new GUI) and unmarked (old GUI/local tests)
+    // requests, but validates only the real path below.
+    let expected_path = expected_path
+        .strip_suffix(MODULE_UNLOAD_SINGLE_RELEASE_MARKER)
+        .unwrap_or(expected_path);
+    let expected_start_epoch_s = expected_start_epoch_s
+        .filter(|value| *value > 0)
+        .ok_or_else(|| {
+            TmError::platform(
+                "unload module",
+                "a valid sampled process creation time is required",
+            )
+        })?;
+    if base_address == 0 || expected_path.is_empty() {
+        return Err(TmError::platform(
+            "unload module",
+            "invalid module identity",
+        ));
+    }
     if pid == std::process::id() {
         return Err(TmError::platform(
             "unload module",
@@ -283,6 +355,10 @@ pub fn unload_process_module(
         ));
     }
 
+    // Best effort only: this cannot grant a token a privilege it does not
+    // already hold, but makes elevated/local and LocalSystem execution
+    // reliable for targets whose VM/thread rights require SeDebugPrivilege.
+    enable_debug_privilege();
     let process = open_destructive_process_verified(
         pid,
         th::PROCESS_CREATE_THREAD
@@ -290,32 +366,26 @@ pub fn unload_process_module(
             | th::PROCESS_VM_OPERATION
             | th::PROCESS_VM_WRITE
             | th::PROCESS_VM_READ,
-        expected_start_epoch_s,
+        Some(expected_start_epoch_s),
     )?;
     let result = (|| {
         let opened_creation = creation_filetime_from_handle(process);
-        let mut target_is_wow: windows::core::BOOL = Default::default();
-        let target_wow = if unsafe { th::IsWow64Process(process, &mut target_is_wow) }.is_ok() {
-            target_is_wow.as_bool()
-        } else {
-            is_wow64(pid).unwrap_or(false)
-        };
-        let self_wow = is_wow64(std::process::id()).unwrap_or(false);
-        if self_wow != target_wow {
+        let target_machine = process_machine(process)?;
+        let own_machine = process_machine(unsafe { th::GetCurrentProcess() })?;
+        if own_machine != target_machine {
             return Err(TmError::Unsupported(
-                "cross-architecture module unload (unloading modules in 32-bit processes is not supported by 64-bit task manager)",
+                "cross-architecture module unload is not supported",
             ));
         }
 
-        let mut modules = module_snapshot(pid)?;
+        let modules = module_snapshot(pid)?;
         verify_pid_still_refers_to(pid, opened_creation)?;
-        // Which module to unload is the user's call; the only action-time
-        // requirement is that it is still mapped exactly where it was
-        // selected. If the load state changed underneath the dialog, the
-        // exact base/path match fails closed here.
+        // Which module to unload is the user's call; the technical action-time
+        // requirement is only that the exact image selected in the dialog is
+        // still mapped at the same base in the same process generation.
         let is_selected = |candidate: &ProcessModule| {
             candidate.base_address == base_address
-                && candidate.path.eq_ignore_ascii_case(expected_path)
+                && module_path_eq(&candidate.path, expected_path)
         };
         if !modules.iter().any(is_selected) {
             return Err(TmError::platform(
@@ -331,10 +401,12 @@ pub fn unload_process_module(
             unsafe { GetProcAddress(local_kernel32, windows::core::s!("FreeLibrary")) }
                 .ok_or_else(|| TmError::platform("GetProcAddress", "FreeLibrary was not found"))?;
         let local_proc = free_library as usize;
-        // Modern Kernel32 exports may be forwarded into KernelBase. Locate
-        // the module that ACTUALLY owns the returned address before applying
-        // its relative offset in the target; assuming Kernel32's base here
-        // can produce a valid-looking but wrong remote start address.
+
+        // Kernel32 exports can be forwarded into KernelBase. Locate the image
+        // that ACTUALLY owns the local address, then require the target to
+        // carry the same image (name, path and image size) before applying the
+        // relative offset. Matching only a basename can point at unrelated
+        // code if a target shadows a loader-runtime DLL name.
         let local_modules = module_snapshot(std::process::id())?;
         let local_owner = local_modules
             .iter()
@@ -346,7 +418,11 @@ pub fn unload_process_module(
             .ok_or_else(|| TmError::platform("unload module", "FreeLibrary owner was not found"))?;
         let remote_owner = modules
             .iter()
-            .find(|module| module.name.eq_ignore_ascii_case(&local_owner.name))
+            .find(|module| {
+                module.name.eq_ignore_ascii_case(&local_owner.name)
+                    && module.size_bytes == local_owner.size_bytes
+                    && module_path_eq(&module.path, &local_owner.path)
+            })
             .ok_or_else(|| {
                 TmError::platform(
                     "unload module",
@@ -375,65 +451,66 @@ pub fn unload_process_module(
         let remote_module = usize::try_from(base_address)
             .map_err(|_| TmError::platform("unload module", "module address is out of range"))?;
 
-        let mut released: u32 = 0;
-        loop {
-            if released >= MAX_FREE_LIBRARY_CALLS {
-                tracing::info!(
-                    pid,
-                    expected_path,
-                    released,
-                    "references were released, but the module is still mapped"
-                );
-                return Ok(ModuleUnloadOutcome {
-                    still_mapped: true,
-                    released,
-                });
-            }
-
-            let thread = unsafe {
-                th::CreateRemoteThread(
-                    process,
-                    None,
-                    0,
-                    start,
-                    Some(remote_module as *const core::ffi::c_void),
-                    0,
-                    None,
-                )
-            }
-            .map_err(|error| TmError::platform("CreateRemoteThread", error.to_string()))?;
+        let thread = unsafe {
+            th::CreateRemoteThread(
+                process,
+                None,
+                0,
+                start,
+                Some(remote_module as *const core::ffi::c_void),
+                0,
+                None,
+            )
+        }
+        .map_err(|error| TmError::platform("CreateRemoteThread", error.to_string()))?;
+        let remote_result = (|| {
             let wait = unsafe { th::WaitForSingleObject(thread, 15_000) };
-            if wait != WAIT_OBJECT_0 {
-                let _ = unsafe { CloseHandle(thread) };
+            if wait == WAIT_TIMEOUT {
                 return Err(TmError::platform(
                     "unload module",
-                    "timed out; target state is unknown",
+                    "timed out; the remote FreeLibrary call may still be running, so refresh the module list before retrying",
+                ));
+            }
+            if wait != WAIT_OBJECT_0 {
+                return Err(TmError::platform(
+                    "WaitForSingleObject(module unload)",
+                    std::io::Error::last_os_error().to_string(),
                 ));
             }
             let mut exit_code = 0u32;
-            let exit_result = unsafe { th::GetExitCodeThread(thread, &mut exit_code) }
-                .map_err(|error| TmError::platform("GetExitCodeThread", error.to_string()));
-            let _ = unsafe { CloseHandle(thread) };
-            exit_result?;
+            unsafe { th::GetExitCodeThread(thread, &mut exit_code) }
+                .map_err(|error| TmError::platform("GetExitCodeThread", error.to_string()))?;
             if exit_code == 0 {
                 return Err(TmError::platform(
                     "FreeLibrary",
-                    "target rejected the unload (module may be statically linked or pinned by the application)",
+                    "target rejected the unload request",
                 ));
             }
-            released += 1;
+            Ok(())
+        })();
+        let _ = unsafe { CloseHandle(thread) };
+        remote_result?;
 
-            // The target may have unloaded the module itself in between; a
-            // reused PID fails the identity check before anything else.
-            modules = module_snapshot(pid)?;
-            verify_pid_still_refers_to(pid, opened_creation)?;
-            if !modules.iter().any(is_selected) {
-                return Ok(ModuleUnloadOutcome {
-                    still_mapped: false,
-                    released,
-                });
+        // FreeLibrary returning TRUE means the release request completed; it
+        // does NOT mean the image left. Re-enumerate and report only what can
+        // actually be observed. If Tool Help is unavailable at this instant,
+        // preserve the successful request as an explicitly unknown outcome.
+        let still_mapped = match module_snapshot(pid) {
+            Ok(modules) => {
+                verify_pid_still_refers_to(pid, opened_creation)?;
+                Some(modules.iter().any(is_selected))
             }
-        }
+            Err(error) => {
+                tracing::warn!(
+                    pid,
+                    expected_path,
+                    %error,
+                    "module unload completed but post-action verification failed"
+                );
+                None
+            }
+        };
+        Ok(ModuleUnloadOutcome { still_mapped })
     })();
     let _ = unsafe { CloseHandle(process) };
     result
@@ -1502,7 +1579,7 @@ unsafe fn lookup_account_name(sid: windows::Win32::Security::PSID) -> Option<Str
 
 /// The NT AUTHORITY pseudo-domain under every locale name it is known by.
 /// Localized Windows returns the translated string, so an English-only
-/// comparison would leave "NT-AUTORITÄT\SYSTEM" in the column on a German
+/// comparison would leave "NT-AUTORITÄT\\SYSTEM" in the column on a German
 /// system where Task Manager shows "SYSTEM".
 fn is_authority_domain(domain: &str) -> bool {
     let normalized: String = domain
@@ -1610,8 +1687,8 @@ pub fn run_new_task_probe(command_line: &str, elevate: bool) -> Result<()> {
 }
 
 /// Launch a helper and wait off the UI thread for its real exit status.
-/// Intended for explicit installer/uninstaller flows where "spawned" is not
-/// a sufficient success condition.
+/// Intended for explicit installer/uninstaller flows where "spawned" is not a
+/// sufficient success condition.
 pub(crate) fn run_new_task_wait(
     command_line: &str,
     elevate: bool,
