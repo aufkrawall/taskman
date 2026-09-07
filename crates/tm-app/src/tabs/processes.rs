@@ -69,6 +69,11 @@ pub struct RowData {
     pub name: String,
     pub icon_path: Option<String>,
     pub children: bool,
+    /// Exact process identities represented by this visible row for End task.
+    /// A collapsed group contains every hidden member; an expanded group head
+    /// and ordinary rows contain only themselves. Other process actions keep
+    /// using the normal selection model and are deliberately unaffected.
+    termination_targets: Vec<crate::app::ProcessIdentity>,
     /// cpu %, mem bytes, disk bps, net bps (aggregated over the display subtree).
     pub values: [f64; 4],
     /// Per-column heat intensity normalized against the WHOLE display model
@@ -475,11 +480,112 @@ fn process_display_name(p: &ProcessEntry) -> String {
     }
 }
 
+fn process_identity(process: &ProcessEntry) -> crate::app::ProcessIdentity {
+    crate::app::ProcessIdentity {
+        pid: process.pid,
+        start_epoch_s: process.start_epoch_s,
+    }
+}
+
 fn identity_of(row: &RowData) -> crate::app::ProcessIdentity {
     crate::app::ProcessIdentity {
         pid: row.pid,
         start_epoch_s: row.start_epoch_s,
     }
+}
+
+/// Exact identities hidden behind one collapsed Apps-tree row. This walk is
+/// only performed for rows that are actually emitted while collapsed; an
+/// expanded branch stores single-process targets and lets its visible child
+/// rows carry their own scope. The total retained target set therefore stays
+/// linear in the visible process model rather than duplicating every subtree.
+fn collapsed_tree_targets<'a>(
+    root: &'a ProcessEntry,
+    children: &HashMap<u32, Vec<&'a ProcessEntry>>,
+) -> Vec<crate::app::ProcessIdentity> {
+    let mut targets = Vec::new();
+    let mut seen = HashSet::new();
+    let mut stack = vec![root];
+    while let Some(process) = stack.pop() {
+        if !seen.insert(process.pid) {
+            continue;
+        }
+        if !process.synthetic {
+            targets.push(process_identity(process));
+        }
+        if let Some(kids) = children.get(&process.pid) {
+            for child in kids.iter().rev() {
+                stack.push(*child);
+            }
+        }
+    }
+    targets
+}
+
+fn resolve_termination_targets(
+    app: &TaskManApp,
+    identities: impl IntoIterator<Item = crate::app::ProcessIdentity>,
+) -> Vec<(crate::app::ProcessIdentity, String)> {
+    let Some(snapshot) = app.latest_snapshot() else {
+        return Vec::new();
+    };
+    let mut seen = HashSet::new();
+    let mut targets = Vec::new();
+    for identity in identities {
+        if !seen.insert(identity.clone()) || !app.identity_is_live(&identity) {
+            continue;
+        }
+        let Some(process) = snapshot.process(identity.pid).filter(|p| !p.synthetic) else {
+            continue;
+        };
+        targets.push((identity, process.shown_name().to_string()));
+    }
+    targets
+}
+
+/// Resolve the current Processes-page selection according to what each visible
+/// row represents. A single collapsed `App [N]` row expands to all N exact
+/// identities for End task; expanded group heads and child rows stay singular.
+/// Rebuild the display model at action time so an expand/collapse click in the
+/// preceding frame can never leave destructive semantics one cache generation
+/// behind the UI.
+pub(crate) fn termination_targets_for_selection(
+    app: &TaskManApp,
+) -> Vec<(crate::app::ProcessIdentity, String)> {
+    let Some(snapshot) = app.latest_snapshot() else {
+        return Vec::new();
+    };
+    let rows = build_display_rows(
+        &snapshot,
+        &app.search,
+        app.processes_state.sort_col,
+        app.processes_state.ascending,
+        &app.processes_state.expanded,
+        &app.processes_state.group_collapsed,
+    );
+    let selected: HashSet<crate::app::ProcessIdentity> =
+        app.selection.all().iter().cloned().collect();
+    let mut matched = HashSet::new();
+    let mut represented = Vec::new();
+    for display_row in rows {
+        let DisplayRow::Process(row) = display_row else {
+            continue;
+        };
+        let identity = identity_of(&row);
+        if selected.contains(&identity) {
+            matched.insert(identity);
+            represented.extend(row.termination_targets);
+        }
+    }
+    // A selected child can become hidden when its ancestor is collapsed. Do
+    // not silently turn that pre-existing selection into the ancestor's whole
+    // group; preserve the exact selected process as a fallback.
+    represented.extend(
+        selected
+            .into_iter()
+            .filter(|identity| !matched.contains(identity)),
+    );
+    resolve_termination_targets(app, represented)
 }
 
 /// Every selectable row as an identity, in display order — the order a
@@ -810,7 +916,7 @@ fn context_menu(app: &mut TaskManApp, ui: &mut egui::Ui, row: &RowData) {
         if batch {
             app.end_selected(&ctx);
         } else {
-            end_process_checked(app, &ctx, &identity_of(row), false, &row.name);
+            end_process_checked(app, &ctx, row, false);
         }
         ui.close();
     }
@@ -823,7 +929,7 @@ fn context_menu(app: &mut TaskManApp, ui: &mut egui::Ui, row: &RowData) {
                 tree: true,
             });
         } else {
-            end_process_checked(app, &ctx, &identity_of(row), true, &row.name);
+            end_process_checked(app, &ctx, row, true);
         }
         ui.close();
     }
@@ -946,11 +1052,25 @@ fn context_menu(app: &mut TaskManApp, ui: &mut egui::Ui, row: &RowData) {
 fn end_process_checked(
     app: &mut TaskManApp,
     ctx: &egui::Context,
-    identity: &crate::app::ProcessIdentity,
+    row: &RowData,
     tree: bool,
-    name: &str,
 ) {
-    app.end_process_identity(ctx, identity.clone(), tree, name.to_string());
+    if tree {
+        // "End process tree" remains an OS/PPID-tree operation rooted at the
+        // concrete row. The presentation group's hidden membership is only the
+        // semantic of Processes-page "End task".
+        app.end_process_identity(ctx, identity_of(row), true, row.name.clone());
+        return;
+    }
+    let targets = resolve_termination_targets(app, row.termination_targets.clone());
+    if targets.is_empty() {
+        app.shared.toast(i18n::tr(K::ProcessExited));
+        return;
+    }
+    // One collapsed row is still one visible task, so keep the existing
+    // one-click context-menu behavior while batching its hidden members into
+    // one executor job and one post-action refresh.
+    app.end_process_batch(ctx, targets, false);
 }
 
 /// Task Manager's Processes page is not a literal PPID tree. In particular,
@@ -1307,6 +1427,11 @@ fn emit_flat_with_family_groups(
                     .as_ref()
                     .map(|x| x.to_string_lossy().into_owned()),
                 children: true,
+                termination_targets: if expanded.contains(&p.pid) {
+                    vec![process_identity(p)]
+                } else {
+                    fam.iter().map(|member| process_identity(member)).collect()
+                },
                 values: repr.get(&p.pid).copied().unwrap_or([0.0; 4]),
                 heat: [0.0; 4],
                 net_available,
@@ -1637,6 +1762,7 @@ fn make_flat_row(p: &ProcessEntry, subtree: &Subtree) -> DisplayRow {
             .as_ref()
             .map(|x| x.to_string_lossy().into_owned()),
         children: false,
+        termination_targets: vec![process_identity(p)],
         values: subtree.values(p.pid),
         heat: [0.0; 4],
         net_available: p.net_recv_bps.is_some() || p.net_sent_bps.is_some(),
@@ -1669,6 +1795,7 @@ fn make_own_row(p: &ProcessEntry, depth: usize) -> DisplayRow {
             .as_ref()
             .map(|x| x.to_string_lossy().into_owned()),
         children: false,
+        termination_targets: vec![process_identity(p)],
         values: own_values(p),
         heat: [0.0; 4],
         net_available: p.net_recv_bps.is_some() || p.net_sent_bps.is_some(),
@@ -1806,6 +1933,11 @@ fn emit_tree<'a>(
                 .as_ref()
                 .map(|x| x.to_string_lossy().into_owned()),
             children: has_children,
+            termination_targets: if has_children && !expanded.contains(&proc.pid) {
+                collapsed_tree_targets(proc, children)
+            } else {
+                vec![process_identity(proc)]
+            },
             values: subtree.values(proc.pid),
             heat: [0.0; 4],
             net_available: proc.net_recv_bps.is_some() || proc.net_sent_bps.is_some(),
@@ -2129,6 +2261,74 @@ mod tests {
         let groups_closed = [true, false, false];
         let closed = build_display_rows(&snap, "", 0, true, &HashSet::new(), &groups_closed);
         assert_eq!(header_total(&closed), 1);
+    }
+
+    #[test]
+    fn collapsed_group_end_targets_cover_hidden_members_only_while_collapsed() {
+        let mut processes = vec![
+            proc(1, None, "browser.exe", ProcCategory::App),
+            proc(2, Some(1), "browser.exe", ProcCategory::App),
+            proc(3, Some(2), "browser.exe", ProcCategory::App),
+        ];
+        for process in &mut processes {
+            process.cpu_pct = 0.0;
+            process.start_epoch_s = Some(1000 + i64::from(process.pid));
+        }
+        let snap = snap_of(processes);
+
+        let collapsed = build_display_rows(
+            &snap,
+            "",
+            0,
+            true,
+            &HashSet::new(),
+            &[false; 3],
+        );
+        let root = collapsed
+            .iter()
+            .find_map(|row| match row {
+                DisplayRow::Process(row) if row.pid == 1 => Some(row),
+                _ => None,
+            })
+            .expect("collapsed root");
+        let mut collapsed_targets = root
+            .termination_targets
+            .iter()
+            .map(|identity| identity.pid)
+            .collect::<Vec<_>>();
+        collapsed_targets.sort_unstable();
+        assert_eq!(collapsed_targets, [1, 2, 3]);
+
+        let expanded = HashSet::from([1u32]);
+        let rows = build_display_rows(&snap, "", 0, true, &expanded, &[false; 3]);
+        let root = rows
+            .iter()
+            .find_map(|row| match row {
+                DisplayRow::Process(row) if row.pid == 1 => Some(row),
+                _ => None,
+            })
+            .expect("expanded root");
+        assert_eq!(
+            root.termination_targets
+                .iter()
+                .map(|identity| identity.pid)
+                .collect::<Vec<_>>(),
+            [1]
+        );
+        let child = rows
+            .iter()
+            .find_map(|row| match row {
+                DisplayRow::Process(row) if row.pid == 2 => Some(row),
+                _ => None,
+            })
+            .expect("collapsed child");
+        let mut child_targets = child
+            .termination_targets
+            .iter()
+            .map(|identity| identity.pid)
+            .collect::<Vec<_>>();
+        child_targets.sort_unstable();
+        assert_eq!(child_targets, [2, 3]);
     }
 
     #[test]
