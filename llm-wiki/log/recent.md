@@ -1,5 +1,31 @@
 # Recent Activity
 
+## 2026-09-07 — Minimized windows cannot overwrite restore placement
+
+1. **Ignore iconic placement samples.** While `remember_window` is enabled, the
+   native shell no longer updates the saved position or maximized flag from a
+   minimized viewport. Windows may report iconic/off-screen geometry for a
+   minimized window while `maximized` is false; persisting that value can make a
+   later taskbar restore appear broken because the window reopens off-screen.
+2. **Normal/maximized semantics are unchanged.** Normal windows still update the
+   remembered desktop position; maximized windows still preserve the last normal
+   position while updating only the maximized flag.
+
+## 2026-09-07 — Windows-process classification requires OS ownership
+
+1. **Session 0 is not Windows ownership.** The sampler no longer classifies every
+   Session-0 process or every descendant of `services.exe`/another system process
+   as a Windows process. Third-party services such as Battle.net Update Agent and
+   Steam helpers now remain Background unless they independently qualify as Apps.
+2. **Positive first-party evidence.** Core system image names remain System. Other
+   Windows components require Microsoft file-version metadata plus a Windows-owned
+   executable path (`%SystemRoot%`, with Defender's first-party ProgramData/Program
+   Files locations covered explicitly). A vendor binary in System32 is not enough.
+3. **Foreground visibility is preserved.** A visible non-Windows executable launched
+   below a system/service process is classified as an App rather than being hidden in
+   the Windows section. Regression coverage includes Battle.net, Steam WebHelper,
+   TaskMan itself, WMI Provider Host, Defender/path ownership, and vendor-in-System32.
+
     ## 2026-09-07 — Processes grouping favors visibility and groups service hosts
 
     1. **Service-host clutter is collapsible.** Repeated `svchost.exe` siblings under

@@ -1091,6 +1091,57 @@ fn sample_to_map(sample: &core_service::ProcessNetworkSample) -> HashMap<u32, ne
         .collect()
 }
 
+fn normalize_windows_path(path: &std::path::Path) -> String {
+    path.to_string_lossy()
+        .replace('/', "\\")
+        .trim_end_matches('\\')
+        .to_ascii_lowercase()
+}
+
+fn microsoft_company(company: Option<&str>) -> bool {
+    company.is_some_and(|company| {
+        let company = company.trim();
+        company.eq_ignore_ascii_case("Microsoft Corporation")
+            || company.eq_ignore_ascii_case("Microsoft Windows")
+    })
+}
+
+/// Positive ownership test for the Processes page's "Windows processes"
+/// section. Merely running in Session 0, as SYSTEM, or below services.exe is
+/// insufficient: third-party services do all three. Windows-owned executable
+/// paths also require Microsoft file-version metadata, so a vendor binary in
+/// System32 does not become a Windows process just because of its location.
+fn is_windows_os_component(p: &ProcessEntry) -> bool {
+    let system_root = std::env::var_os("SystemRoot")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from(r"C:\Windows"));
+    is_windows_os_component_under(p.company.as_deref(), p.exe_path.as_deref(), &system_root)
+}
+
+fn is_windows_os_component_under(
+    company: Option<&str>,
+    exe_path: Option<&std::path::Path>,
+    system_root: &std::path::Path,
+) -> bool {
+    if !microsoft_company(company) {
+        return false;
+    }
+    let Some(exe_path) = exe_path else {
+        return false;
+    };
+    let path = normalize_windows_path(exe_path);
+    let root = normalize_windows_path(system_root);
+    if path == root || path.starts_with(&(root + "\\")) {
+        return true;
+    }
+
+    // Defender's engine is intentionally outside %SystemRoot% on current
+    // Windows builds, but it is still first-party Windows infrastructure.
+    path.contains(r"\programdata\microsoft\windows defender\")
+        || path.contains(r"\program files\windows defender\")
+        || path.contains(r"\program files (x86)\windows defender\")
+}
+
 fn decay_pseudo(slot: &mut Option<HeldPseudoRow>) {
     if let Some(h) = slot {
         h.ticks_left -= 1;
@@ -1148,34 +1199,20 @@ fn refine_categories_and_group_apps(processes: &mut [ProcessEntry]) {
         .map(|(i, p)| (p.pid, i))
         .collect();
 
-    // --- refined classification with real ancestors -------------------------
-    for i in 0..processes.len() {
-        let mut anc: Vec<&str> = Vec::new();
-        let mut cur_pid = processes[i].ppid;
-        let mut hops = 0usize;
-        while let Some(ppid) = cur_pid {
-            hops += 1;
-            if hops > 8 || ppid == processes[i].pid {
-                break;
-            }
-            match idx_by_pid.get(&ppid) {
-                Some(&j) => {
-                    anc.push(processes[j].name.as_str());
-                    cur_pid = processes[j].ppid;
-                }
-                None => break,
-            }
-        }
-        let name = processes[i].name.clone();
-        let input = classify::ClassifyInput {
-            pid: processes[i].pid,
+    // --- refined classification ---------------------------------------------
+    // Session 0 and services.exe ancestry mean "service context", not
+    // "belongs to Windows". Third-party updaters, launchers and helpers run
+    // there too. Only explicit core image names (handled by tm-core) or a
+    // Microsoft-owned executable from a Windows-owned path get System.
+    for p in processes.iter_mut() {
+        let system_process = is_windows_os_component(p);
+        let name = p.name.clone();
+        p.category = classify::classify(classify::ClassifyInput {
+            pid: p.pid,
             name: &name,
-            ancestor_names: &anc,
-            has_window: processes[i].has_window,
-            system_session: processes[i].session_id.is_some_and(|s| s == 0),
-        };
-        let cat = classify::classify(input);
-        processes[i].category = cat;
+            has_window: p.has_window,
+            system_process,
+        });
     }
 
     // --- app-root grouping -----------------------------------------------
@@ -1333,6 +1370,77 @@ mod tests {
                 Vec::new()
             },
         }
+    }
+
+    #[test]
+    fn windows_process_group_uses_os_ownership_not_service_ancestry() {
+        let mut services = ProcessEntry::new(100, "services.exe");
+        services.session_id = Some(0);
+
+        let mut battle = ProcessEntry::new(200, "Agent.exe");
+        battle.display = "Battle.net Update Agent".into();
+        battle.ppid = Some(100);
+        battle.session_id = Some(0);
+        battle.company = Some("Blizzard Entertainment".into());
+        battle.exe_path = Some(r"C:\ProgramData\Battle.net\Agent\Agent.exe".into());
+
+        let mut steam = ProcessEntry::new(300, "steamwebhelper.exe");
+        steam.display = "Steam Client WebHelper".into();
+        steam.ppid = Some(100);
+        steam.session_id = Some(0);
+        steam.company = Some("Valve Corporation".into());
+        steam.exe_path = Some(r"C:\Program Files (x86)\Steam\bin\cef\steamwebhelper.exe".into());
+
+        let mut taskman = ProcessEntry::new(400, "taskman.exe");
+        taskman.ppid = Some(100);
+        taskman.session_id = Some(1);
+        taskman.has_window = true;
+        taskman.exe_path = Some(r"C:\Users\dev\taskman.exe".into());
+
+        let mut wmi = ProcessEntry::new(500, "WmiPrvSE.exe");
+        wmi.ppid = Some(100);
+        wmi.session_id = Some(0);
+        wmi.company = Some("Microsoft Corporation".into());
+        wmi.exe_path = Some(r"C:\Windows\System32\wbem\WmiPrvSE.exe".into());
+
+        let mut processes = vec![services, battle, steam, taskman, wmi];
+        refine_categories_and_group_apps(&mut processes);
+
+        let category = |pid| processes.iter().find(|p| p.pid == pid).unwrap().category;
+        assert_eq!(category(100), ProcCategory::System);
+        assert_eq!(category(200), ProcCategory::Background);
+        assert_eq!(category(300), ProcCategory::Background);
+        assert_eq!(category(400), ProcCategory::App);
+        assert_eq!(category(500), ProcCategory::System);
+    }
+
+    #[test]
+    fn windows_owned_path_requires_microsoft_metadata() {
+        let root = std::path::Path::new(r"C:\Windows");
+        assert!(is_windows_os_component_under(
+            Some("Microsoft Corporation"),
+            Some(std::path::Path::new(r"C:\Windows\System32\dllhost.exe")),
+            root,
+        ));
+        assert!(is_windows_os_component_under(
+            Some("Microsoft Corporation"),
+            Some(std::path::Path::new(
+                r"C:\ProgramData\Microsoft\Windows Defender\Platform\MsMpEng.exe"
+            )),
+            root,
+        ));
+        assert!(!is_windows_os_component_under(
+            Some("Valve Corporation"),
+            Some(std::path::Path::new(r"C:\Windows\System32\vendor.exe")),
+            root,
+        ));
+        assert!(!is_windows_os_component_under(
+            Some("Microsoft Corporation"),
+            Some(std::path::Path::new(
+                r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe"
+            )),
+            root,
+        ));
     }
 
     #[test]

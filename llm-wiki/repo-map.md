@@ -167,8 +167,12 @@ platform boundary (`tm-core` ← `tm-platform` ← `tm-app` / `tm-service`):
   (≥ 1 % CPU, different image, windowless) are promoted into Background.
   `joins_family` lets the same image join unconditionally; different images
   require same-publisher + helper-like evidence while windowless, idle and away
-  from a system/launch boundary. Repeat runs of one image under one parent group
-  separately (`sibling_run_key`), including `svchost.exe` under `services.exe`. A group's aggregate is
+  from a system/launch boundary. Repeat runs of one image under one
+  parent group separately (`sibling_run_key`), including `svchost.exe` under `services.exe`.
+  Windows-process membership is NOT inherited from Session 0 or system ancestry:
+  the Windows sampler requires a core system image name or Microsoft metadata plus
+  a Windows-owned executable path, so third-party SCM services remain Background.
+  A group's aggregate is
   `family_values` — the MEMBERS' own values, not the subtree's, because a
   foreign descendant left outside the group is rendered as its own row and must
   not be counted twice. Do not collapse this back to a literal PPID tree. Raw `ProcessEntry.ppid` remains OS truth and is exposed by the

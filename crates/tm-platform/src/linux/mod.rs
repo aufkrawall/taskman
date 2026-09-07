@@ -75,45 +75,18 @@ impl SystemCollector for LinuxCollector {
         let window_owners: HashSet<u32> = HashSet::new();
 
         let n_procs = self.sys.processes().len();
-        let mut name_by_pid = HashMap::with_capacity(n_procs);
-        for (pid, p) in self.sys.processes() {
-            name_by_pid.insert(pid.as_u32(), p.name().to_string_lossy().into_owned());
-        }
-
         let mut processes = Vec::with_capacity(n_procs);
         for (pid, p) in self.sys.processes() {
             let pid_u = pid.as_u32();
             let name = p.name().to_string_lossy().into_owned();
-
-            let mut anc: Vec<&str> = Vec::new();
-            let mut cur = p.parent().map(|x| x.as_u32());
-            let mut hops = 0;
-            while let Some(ppid) = cur {
-                hops += 1;
-                if hops > 8 {
-                    break;
-                }
-                match name_by_pid.get(&ppid) {
-                    Some(n) => {
-                        anc.push(n.as_str());
-                        cur = self
-                            .sys
-                            .process(sysinfo::Pid::from_u32(ppid))
-                            .and_then(|pp| pp.parent())
-                            .map(|x| x.as_u32());
-                    }
-                    None => break,
-                }
-            }
 
             let has_window = window_owners.contains(&pid_u);
             let kernel_thread = pid_u == 2 || name.starts_with('[');
             let category = classify::classify(classify::ClassifyInput {
                 pid: pid_u,
                 name: &name,
-                ancestor_names: &anc,
                 has_window,
-                system_session: kernel_thread,
+                system_process: kernel_thread,
             });
 
             let du = p.disk_usage();

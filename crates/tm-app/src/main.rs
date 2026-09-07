@@ -681,18 +681,25 @@ impl eframe::App for NativeApp {
             }
         }
         if self.inner.shared.settings.remember_window {
-            let (pos, maximized) = ui.ctx().input(|i| {
+            let (pos, maximized, minimized) = ui.ctx().input(|i| {
                 (
                     i.viewport().outer_rect.map(|r| r.min),
                     i.viewport().maximized.unwrap_or(false),
+                    i.viewport().minimized.unwrap_or(false),
                 )
             });
-            // A maximized window's outer rect is the monitor's, not the
-            // restore geometry — keep the last normal position instead.
-            if !maximized && let Some(pos) = pos {
-                ui_state::set_window_position([pos.x, pos.y]);
+            // Never persist iconic/minimized geometry. On Windows a minimized
+            // window can expose shell/off-screen placement while simultaneously
+            // reporting maximized=false; recording that as the normal restore
+            // position can strand the next restored window off-screen.
+            if !minimized {
+                // A maximized window's outer rect is the monitor's, not the
+                // restore geometry — keep the last normal position instead.
+                if !maximized && let Some(pos) = pos {
+                    ui_state::set_window_position([pos.x, pos.y]);
+                }
+                ui_state::set_window_maximized(maximized);
             }
-            ui_state::set_window_maximized(maximized);
         }
     }
 

@@ -66,44 +66,16 @@ impl SystemCollector for MacCollector {
         let nb_cpus = logical as f32;
 
         let n_procs = self.sys.processes().len();
-        let mut name_by_pid = HashMap::with_capacity(n_procs);
-        for (pid, p) in self.sys.processes() {
-            name_by_pid.insert(pid.as_u32(), p.name().to_string_lossy().into_owned());
-        }
-
         let mut processes = Vec::with_capacity(n_procs);
         for (pid, p) in self.sys.processes() {
             let pid_u = pid.as_u32();
             let name = p.name().to_string_lossy().into_owned();
 
-            let mut anc: Vec<&str> = Vec::new();
-            let mut cur = p.parent().map(|x| x.as_u32());
-            let mut hops = 0;
-            while let Some(ppid) = cur {
-                hops += 1;
-                if hops > 8 {
-                    break;
-                }
-                match name_by_pid.get(&ppid) {
-                    Some(n) => {
-                        anc.push(n.as_str());
-                        cur = self
-                            .sys
-                            .process(sysinfo::Pid::from_u32(ppid))
-                            .and_then(|pp| pp.parent())
-                            .map(|x| x.as_u32());
-                    }
-                    None => break,
-                }
-            }
-
-            let is_windowserver_child = anc.iter().any(|a| a == "WindowServer" || a == "launchd");
             let category = classify::classify(classify::ClassifyInput {
                 pid: pid_u,
                 name: &name,
-                ancestor_names: &anc,
                 has_window: false,
-                system_session: name == "kernel_task" || name == "launchd",
+                system_process: name == "kernel_task" || name == "launchd",
             });
 
             let du = p.disk_usage();
@@ -126,7 +98,6 @@ impl SystemCollector for MacCollector {
             entry.exe_path = p.exe().map(|e| e.to_path_buf());
             entry.user = None;
             entry.status = ProcStatus::Running;
-            let _ = is_windowserver_child;
             processes.push(entry);
         }
 

@@ -56,11 +56,11 @@ fn is_system_name(name_lower: &str) -> bool {
 pub struct ClassifyInput<'a> {
     pub pid: u32,
     pub name: &'a str,
-    /// Chain from direct parent up to root (ppid, ppid-of-ppid, ...).
-    pub ancestor_names: &'a [&'a str],
     pub has_window: bool,
-    /// Session 0 on Windows / uid 0 root daemon context.
-    pub system_session: bool,
+    /// Positive platform signal that this executable is OS-owned system
+    /// infrastructure. Privilege, Session 0, or a system-process ancestor
+    /// alone are deliberately not enough.
+    pub system_process: bool,
 }
 
 pub fn classify(input: ClassifyInput<'_>) -> ProcCategory {
@@ -70,21 +70,12 @@ pub fn classify(input: ClassifyInput<'_>) -> ProcCategory {
         return ProcCategory::System;
     }
 
-    // Anything in the services/session-infrastructure ancestry is a Windows process.
-    let ancestor_is_system = input
-        .ancestor_names
-        .iter()
-        .any(|a| is_system_name(&normalize(a)));
-    if ancestor_is_system {
+    if input.system_process {
         return ProcCategory::System;
     }
 
     if input.has_window {
         return ProcCategory::App;
-    }
-
-    if input.system_session {
-        return ProcCategory::System;
     }
 
     ProcCategory::Background
@@ -96,14 +87,12 @@ mod tests {
 
     #[test]
     fn windowed_process_is_app() {
-        let anc = ["explorer.exe"];
         assert_eq!(
             classify(ClassifyInput {
                 pid: 4000,
                 name: "firefox.exe",
-                ancestor_names: &anc,
                 has_window: true,
-                system_session: false,
+                system_process: false,
             }),
             ProcCategory::App
         );
@@ -115,24 +104,34 @@ mod tests {
             classify(ClassifyInput {
                 pid: 1200,
                 name: "svchost.exe",
-                ancestor_names: &[],
                 has_window: false,
-                system_session: false,
+                system_process: false,
             }),
             ProcCategory::System
         );
     }
 
     #[test]
-    fn child_of_services_is_system() {
-        let anc = ["services.exe"];
+    fn ancestry_does_not_turn_a_third_party_service_into_windows() {
         assert_eq!(
             classify(ClassifyInput {
                 pid: 3000,
-                name: "spoolsv.exe",
-                ancestor_names: &anc,
+                name: "vendor-service.exe",
                 has_window: false,
-                system_session: false,
+                system_process: false,
+            }),
+            ProcCategory::Background
+        );
+    }
+
+    #[test]
+    fn positive_os_component_signal_is_system() {
+        assert_eq!(
+            classify(ClassifyInput {
+                pid: 3000,
+                name: "WmiPrvSE.exe",
+                has_window: false,
+                system_process: true,
             }),
             ProcCategory::System
         );
@@ -144,9 +143,8 @@ mod tests {
             classify(ClassifyInput {
                 pid: 9000,
                 name: "updatehelper.exe",
-                ancestor_names: &[],
                 has_window: false,
-                system_session: false,
+                system_process: false,
             }),
             ProcCategory::Background
         );
@@ -158,9 +156,8 @@ mod tests {
             classify(ClassifyInput {
                 pid: 4,
                 name: "System",
-                ancestor_names: &[],
                 has_window: false,
-                system_session: true,
+                system_process: true,
             }),
             ProcCategory::System
         );
@@ -172,9 +169,8 @@ mod tests {
             classify(ClassifyInput {
                 pid: 55,
                 name: "kworker/u16:2",
-                ancestor_names: &[],
                 has_window: false,
-                system_session: true,
+                system_process: true,
             }),
             ProcCategory::System
         );
@@ -182,9 +178,8 @@ mod tests {
             classify(ClassifyInput {
                 pid: 1,
                 name: "systemd",
-                ancestor_names: &[],
                 has_window: false,
-                system_session: false,
+                system_process: false,
             }),
             ProcCategory::System
         );
@@ -196,9 +191,8 @@ mod tests {
             classify(ClassifyInput {
                 pid: 700,
                 name: "SVCHOST.EXE",
-                ancestor_names: &[],
                 has_window: false,
-                system_session: false,
+                system_process: false,
             }),
             ProcCategory::System
         );
