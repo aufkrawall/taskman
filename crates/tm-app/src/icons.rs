@@ -1,7 +1,7 @@
 //! Small vector icons drawn with egui's painter — crisp at any DPI, zero
 //! binary size, theme-aware stroke color.
 
-use eframe::egui::{self, Color32, CornerRadius, Pos2, Rect, Shape, Stroke, Vec2};
+use eframe::egui::{self, Color32, Pos2, Rect, Shape, Stroke, Vec2};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[allow(dead_code)] // full glyph set kept for future tabs
@@ -210,39 +210,50 @@ pub fn draw(ui: &egui::Ui, icon: Icon, rect: Rect, color: Color32) {
             }
         }
         Icon::Leaf => {
-            // Efficiency-mode leaf: a filled teardrop blade tilted 45 deg
-            // with a stem, matching the Win11 Task Manager status glyph. The
-            // blade is a closed path built from two mirrored quadratic arcs
-            // between the tip (top-right) and the base (bottom-left).
-            let tip = p(8.0, -8.0);
-            let base = p(-5.0, 5.0);
-            let arc = |ctrl: Pos2| {
-                let mut pts = Vec::with_capacity(13);
-                for i in 0..=12 {
-                    let t = i as f32 / 12.0;
+            // Efficiency mode uses the Win11-style double-leaf outline. Two
+            // separate pointed blades read clearly at status-column size and
+            // avoid the filled teardrop/silhouette looking like a spoon.
+            let quad = |from: Pos2, control: Pos2, to: Pos2| {
+                let mut points = Vec::with_capacity(7);
+                for i in 0..=6 {
+                    let t = i as f32 / 6.0;
                     let u = 1.0 - t;
-                    pts.push(Pos2::new(
-                        u * u * base.x + 2.0 * u * t * ctrl.x + t * t * tip.x,
-                        u * u * base.y + 2.0 * u * t * ctrl.y + t * t * tip.y,
+                    points.push(Pos2::new(
+                        u * u * from.x + 2.0 * u * t * control.x + t * t * to.x,
+                        u * u * from.y + 2.0 * u * t * control.y + t * t * to.y,
                     ));
                 }
-                pts
+                points
             };
-            let mut blade = arc(p(9.0, 2.5));
-            blade.extend(arc(p(-1.5, -8.5)).into_iter().rev());
-            painter.add(Shape::convex_polygon(blade, color, Stroke::NONE));
-            // Stem, drawn from the base away from the blade.
-            line(base, p(-9.0, 9.0));
+            let leaf = |base: Pos2, tip: Pos2, outer: Pos2, inner: Pos2| {
+                let mut outline = quad(base, outer, tip);
+                outline.extend(quad(tip, inner, base).into_iter().skip(1));
+                painter.add(Shape::line(outline, stroke));
+            };
+
+            let big_base = p(-1.0, 4.0);
+            let small_base = p(-1.0, 2.0);
+            leaf(big_base, p(7.0, -5.0), p(8.0, 1.0), p(2.0, -6.0));
+            leaf(
+                small_base,
+                p(-7.0, -3.0),
+                p(-7.0, 1.0),
+                p(-3.0, -4.5),
+            );
+
+            // Shared stem plus a short vein in each blade keeps the two
+            // outlines visually connected without turning them into one blob.
+            line(p(-4.0, 8.0), big_base);
+            line(big_base, p(4.6, -2.5));
+            line(small_base, p(-5.0, -1.3));
         }
         Icon::Pause => {
-            // Suspended: two filled bars, like the native pause glyph.
-            for dx in [-6.0f32, 2.5] {
-                painter.add(Shape::rect_filled(
-                    Rect::from_min_max(p(dx, -6.5), p(dx + 3.5, 6.5)),
-                    CornerRadius::same(1),
-                    color,
-                ));
-            }
+            // Suspended: the native status glyph is a circled pause. Keep all
+            // geometry mirrored about the exact center so it stays visually
+            // balanced even in the compact Details status column.
+            circle(c, 7.0 * s / 10.0, false);
+            line(p(-2.6, -3.4), p(-2.6, 3.4));
+            line(p(2.6, -3.4), p(2.6, 3.4));
         }
         Icon::Ellipsis => {
             circle(p(-6.0, 0.0), 1.6, true);
