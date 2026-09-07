@@ -461,14 +461,100 @@ impl TaskManApp {
                     egui::WindowLevel::AlwaysOnTop,
                 ));
         }
-        // Diagnostics: open a dialog right away (TASKMAN_DIALOG=settings|run)
+        // Diagnostics: open a dialog right away (TASKMAN_DIALOG=settings|run|end_task)
         // or select a Performance resource by key (TASKMAN_PERF=<key>) so UI
         // tests can capture them without input automation.
         let open_dialog = std::env::var("TASKMAN_DIALOG").unwrap_or_default();
-        let (show_settings, run_dialog_open) = match open_dialog.as_str() {
-            "settings" => (true, false),
-            "run" => (false, true),
-            _ => (false, false),
+        let (show_settings, run_dialog_open, pending_process_end) = match open_dialog.as_str() {
+            "settings" => (true, false, None),
+            "run" => (false, true, None),
+            "end_task" => (
+                false,
+                false,
+                Some(PendingProcessEnd {
+                    targets: vec![
+                        (
+                            ProcessIdentity {
+                                pid: 18412,
+                                start_epoch_s: None,
+                            },
+                            "Claude".into(),
+                        ),
+                        (
+                            ProcessIdentity {
+                                pid: 13940,
+                                start_epoch_s: None,
+                            },
+                            "Claude".into(),
+                        ),
+                        (
+                            ProcessIdentity {
+                                pid: 21860,
+                                start_epoch_s: None,
+                            },
+                            "Claude".into(),
+                        ),
+                        (
+                            ProcessIdentity {
+                                pid: 22164,
+                                start_epoch_s: None,
+                            },
+                            "Claude".into(),
+                        ),
+                        (
+                            ProcessIdentity {
+                                pid: 3552,
+                                start_epoch_s: None,
+                            },
+                            "Claude".into(),
+                        ),
+                        (
+                            ProcessIdentity {
+                                pid: 7316,
+                                start_epoch_s: None,
+                            },
+                            "Claude".into(),
+                        ),
+                        (
+                            ProcessIdentity {
+                                pid: 8800,
+                                start_epoch_s: None,
+                            },
+                            "Claude".into(),
+                        ),
+                        (
+                            ProcessIdentity {
+                                pid: 9120,
+                                start_epoch_s: None,
+                            },
+                            "Claude".into(),
+                        ),
+                        (
+                            ProcessIdentity {
+                                pid: 10452,
+                                start_epoch_s: None,
+                            },
+                            "Claude".into(),
+                        ),
+                        (
+                            ProcessIdentity {
+                                pid: 11200,
+                                start_epoch_s: None,
+                            },
+                            "Claude".into(),
+                        ),
+                        (
+                            ProcessIdentity {
+                                pid: 12500,
+                                start_epoch_s: None,
+                            },
+                            "Claude".into(),
+                        ),
+                    ],
+                    tree: false,
+                }),
+            ),
+            _ => (false, false, None),
         };
         let perf_selected_key = std::env::var("TASKMAN_PERF").unwrap_or_else(|_| "cpu".into());
 
@@ -597,7 +683,7 @@ impl TaskManApp {
             title_bar_applied: None,
             selected_user: None,
             pending_session_logoff: None,
-            pending_process_end: None,
+            pending_process_end,
             pending_uac_virtualization: None,
             services_selected_name: None,
             pending_details_focus: None,

@@ -58,7 +58,7 @@ ProgramData, registry, or SCM state.
 
 ## UI/capture diagnostics
 
-- `TASKMAN_DIALOG=settings|run` opens the chosen dialog at startup.
+- `TASKMAN_DIALOG=settings|run|end_task` opens the chosen dialog at startup.
 - `TASKMAN_PERF=cpu|mem|<resource-key>` preselects a Performance resource.
 - `TASKMAN_TAB=<tab-key>` preselects a page.
 - `tools/capture.ps1` automates a window capture with isolated config/data;

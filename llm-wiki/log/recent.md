@@ -1,5 +1,32 @@
 # Recent Activity
 
+## 2026-09-07 — End-task dialog spatial layout and Tab focus navigation fix
+
+1. **End-task dialog Tab focus navigation:** The dialog previously compared
+   `ctx.memory(|m| m.focused())` against manually generated IDs (`cancel_id` and
+   `end_id`) that never matched the button responses' internal widget IDs.
+   Consequently, every frame without an active Tab press evaluated focus to `None`,
+   instantly resetting selection back to `Some(true)` (End task) and making Tab
+   appear broken/frozen. The dialog now persists selection in `ctx.data` temp
+   storage (`Id::new("end_task_dialog_focus_end")`), evaluates `Shift+Tab` before
+   `Tab` (per egui's modifier matching rules), supports Left/Right arrow
+   directionality, and clears temp state when the dialog closes.
+2. **End-task dialog space utilization and layout polish:**
+   - Previously `ScrollArea::vertical()` used default `auto_shrink([true, true])`,
+     shrinking the scroll area to the length of the shortest process text and
+     leaving the scrollbar stranded at x ~ 125px with ~280px of blank space to its
+     right.
+   - The process list is now housed in a framed container (`auto_shrink([false, true])`)
+     with a distinct sunken background and border. Process names are left-aligned
+     and PIDs are right-aligned in muted text (`pal.text_dim`), with the scrollbar
+     cleanly docked at the container's right edge.
+   - Max height adjusted to 168px to prevent half-clipped rows at default line height.
+   - Buttons standardized to 85x24 min-size and right-aligned at the bottom right
+     with high-contrast focus strokes (crisp white focus border on the accent End
+     task button, accent-colored stroke on Cancel).
+3. **Diagnostics:** Added `TASKMAN_DIALOG=end_task` for headless UI test captures,
+   and added `--single-instance-handoff` to `tools/capture_exact.ps1`.
+
 ## 2026-09-07 — Keyboard context menu fix (`PopupAnchor::Position` memory persistence)
 
 1. **Context menu via Menu key / Shift+F10 opens and stays open.** The previous

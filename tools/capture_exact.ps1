@@ -75,7 +75,7 @@ window_size=${Width}x${Height}
 
 $psi = New-Object System.Diagnostics.ProcessStartInfo
 $psi.FileName = $exe
-$psi.Arguments = "--tab=$Tab --size=${Width}x${Height}"
+$psi.Arguments = "--tab=$Tab --size=${Width}x${Height} --single-instance-handoff"
 $psi.UseShellExecute = $false
 $psi.EnvironmentVariables["LOCALAPPDATA"] = $sandbox
 if ($Dialog -ne "") { $psi.EnvironmentVariables["TASKMAN_DIALOG"] = $Dialog }

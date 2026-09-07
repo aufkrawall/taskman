@@ -2,7 +2,7 @@
 //! collapsible), per-tab command header, dialogs, toasts. Fully localized
 //! (DE/EN) via tm-core::i18n.
 
-use eframe::egui::{self, Align2, Color32, FontId, Pos2, Rect, Sense, Stroke};
+use eframe::egui::{self, Align2, Color32, CornerRadius, FontId, Pos2, Rect, Sense, Stroke};
 use tm_core::i18n::{self, K};
 use tm_core::settings::{RenderMode, Settings, TextSmoothing, ThemeMode};
 
@@ -1000,26 +1000,35 @@ pub fn process_end_dialog(app: &mut TaskManApp, ctx: &egui::Context) {
         return;
     };
     let mut open = true;
-    // The dialog owns its keyboard: consuming the keys keeps egui's built-in
-    // Tab navigation and focused-widget Enter activation from fighting the
-    // two-button focus below. (Tab used to move egui's focus to a different
-    // widget entirely, which left the selection ring frozen on End task.)
+    let focus_id = egui::Id::new("end_task_dialog_focus_end");
+    let mut end_focused: bool = ctx.data(|d| d.get_temp(focus_id)).unwrap_or(true);
+
     let mut decision = None;
     let escape = ctx.input_mut(|input| input.consume_key(Default::default(), egui::Key::Escape));
     let enter = ctx.input_mut(|input| input.consume_key(Default::default(), egui::Key::Enter));
     let space = ctx.input_mut(|input| input.consume_key(Default::default(), egui::Key::Space));
-    let tab = ctx.input_mut(|input| input.consume_key(Default::default(), egui::Key::Tab));
     let shift_tab =
         ctx.input_mut(|input| input.consume_key(egui::Modifiers::SHIFT, egui::Key::Tab));
+    let tab = ctx.input_mut(|input| input.consume_key(Default::default(), egui::Key::Tab));
     let left = ctx.input_mut(|input| input.consume_key(Default::default(), egui::Key::ArrowLeft));
     let right = ctx.input_mut(|input| input.consume_key(Default::default(), egui::Key::ArrowRight));
+
+    end_focused = update_end_task_dialog_focus(end_focused, tab, shift_tab, left, right);
+
+    if escape {
+        decision = Some(false);
+    } else if enter || space {
+        decision = Some(end_focused);
+    }
+
     egui::Window::new(i18n::tr(K::EndTask))
         .open(&mut open)
         .collapsible(false)
         .resizable(false)
         .anchor(Align2::CENTER_CENTER, [0.0, -40.0])
         .show(ctx, |ui| {
-            ui.set_width(430.0);
+            ui.set_width(400.0);
+            let pal = crate::theme::palette_ctx(ctx);
             match pending.targets.as_slice() {
                 [(identity, name)] => {
                     ui.label(i18n::trf(
@@ -1032,72 +1041,82 @@ pub fn process_end_dialog(app: &mut TaskManApp, ctx: &egui::Context) {
                         K::EndProcessesConfirm,
                         &[&targets.len().to_string()],
                     ));
-                    ui.add_space(6.0);
-                    // Name every target: "end 27 processes" is not informed
-                    // consent, and the list is the only place the user can
-                    // see what the range selection actually caught.
-                    egui::ScrollArea::vertical()
-                        .max_height(160.0)
+                    ui.add_space(8.0);
+                    let box_stroke = egui::Stroke::new(
+                        1.0,
+                        if ui.visuals().dark_mode {
+                            Color32::from_rgb(0x3e, 0x3e, 0x3e)
+                        } else {
+                            Color32::from_rgb(0xd8, 0xd8, 0xd8)
+                        },
+                    );
+                    let box_bg = if ui.visuals().dark_mode {
+                        Color32::from_rgb(0x1f, 0x1f, 0x1f)
+                    } else {
+                        Color32::from_rgb(0xf5, 0xf5, 0xf5)
+                    };
+                    egui::Frame::NONE
+                        .fill(box_bg)
+                        .stroke(box_stroke)
+                        .corner_radius(CornerRadius::same(4))
+                        .inner_margin(egui::Margin::symmetric(10, 6))
                         .show(ui, |ui| {
-                            for (identity, name) in targets {
-                                ui.label(format!("{name}  ({})", identity.pid));
-                            }
+                            egui::ScrollArea::vertical()
+                                .max_height(168.0)
+                                .auto_shrink([false, true])
+                                .show(ui, |ui| {
+                                    ui.spacing_mut().item_spacing.y = 3.0;
+                                    for (identity, name) in targets {
+                                        ui.horizontal(|ui| {
+                                            ui.label(name);
+                                            ui.with_layout(
+                                                egui::Layout::right_to_left(egui::Align::Center),
+                                                |ui| {
+                                                    ui.label(
+                                                        egui::RichText::new(format!(
+                                                            "PID {}",
+                                                            identity.pid
+                                                        ))
+                                                        .color(pal.text_dim),
+                                                    );
+                                                },
+                                            );
+                                        });
+                                    }
+                                });
                         });
                 }
             }
-            ui.add_space(10.0);
-            let pal = crate::theme::palette_ctx(ctx);
-            let cancel_id = ui.make_persistent_id("end_task_cancel_btn");
-            let end_id = ui.make_persistent_id("end_task_confirm_btn");
+            ui.add_space(12.0);
 
-            let has_focused = ctx.memory(|m| m.focused());
-            let mut current_focus = match has_focused {
-                Some(id) if id == cancel_id => Some(false),
-                Some(id) if id == end_id => Some(true),
-                _ => None,
-            };
-            // Default preselection is EndTask.
-            if current_focus.is_none() {
-                current_focus = Some(true);
-            }
-
-            if tab || shift_tab || left || right {
-                current_focus = Some(!current_focus.unwrap_or(true));
-            }
-
-            if escape {
-                decision = Some(false);
-            } else if enter || space {
-                decision = Some(current_focus.unwrap_or(true));
-            }
-
-            let is_cancel_focused = current_focus == Some(false);
-            let is_end_focused = current_focus.unwrap_or(true);
-
-            ui.horizontal(|ui| {
-                let mut cancel_btn = egui::Button::new(i18n::tr(K::Cancel));
-                if is_cancel_focused {
-                    cancel_btn = cancel_btn.stroke(egui::Stroke::new(2.0, pal.accent));
-                }
-                let cancel_resp = ui.add(cancel_btn);
-
+            let btn_size = egui::vec2(85.0, 24.0);
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let mut end_btn = egui::Button::new(
                     egui::RichText::new(i18n::tr(K::EndTask))
                         .color(pal.accent_text)
                         .strong(),
                 )
+                .min_size(btn_size)
                 .fill(pal.accent);
-                if is_end_focused {
-                    end_btn = end_btn.stroke(egui::Stroke::new(2.0, pal.accent_text));
+                if end_focused {
+                    end_btn = end_btn.stroke(egui::Stroke::new(2.0, Color32::WHITE));
                 }
                 let end_resp = ui.add(end_btn);
+
+                ui.add_space(8.0);
+
+                let mut cancel_btn = egui::Button::new(i18n::tr(K::Cancel)).min_size(btn_size);
+                if !end_focused {
+                    cancel_btn = cancel_btn.stroke(egui::Stroke::new(2.0, pal.accent));
+                }
+                let cancel_resp = ui.add(cancel_btn);
 
                 // Mouse dragging selection: keeping mouse pressed and moving over buttons changes selection
                 if ctx.input(|i| i.pointer.primary_down()) {
                     if cancel_resp.hovered() {
-                        current_focus = Some(false);
+                        end_focused = false;
                     } else if end_resp.hovered() {
-                        current_focus = Some(true);
+                        end_focused = true;
                     }
                 }
 
@@ -1107,17 +1126,21 @@ pub fn process_end_dialog(app: &mut TaskManApp, ctx: &egui::Context) {
                     decision = Some(true);
                 }
 
-                if current_focus == Some(false) {
-                    cancel_resp.request_focus();
-                } else {
+                if end_focused {
                     end_resp.request_focus();
+                } else {
+                    cancel_resp.request_focus();
                 }
             });
         });
+
+    ctx.data_mut(|d| d.insert_temp(focus_id, end_focused));
+
     if !open {
         decision = Some(false);
     }
     if let Some(confirm) = decision {
+        ctx.data_mut(|d| d.remove_temp::<bool>(focus_id));
         app.pending_process_end = None;
         if confirm {
             app.end_process_batch(ctx, pending.targets, pending.tree);
@@ -1302,5 +1325,89 @@ pub fn draw_toasts(app: &TaskManApp, ctx: &egui::Context) {
                     });
             });
         y_offset += 46.0;
+    }
+}
+
+#[inline]
+pub(crate) fn update_end_task_dialog_focus(
+    current: bool,
+    tab: bool,
+    shift_tab: bool,
+    left: bool,
+    right: bool,
+) -> bool {
+    if shift_tab || tab {
+        !current
+    } else if left {
+        false
+    } else if right {
+        true
+    } else {
+        current
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_end_task_dialog_focus_keyboard_transitions() {
+        // Initially End task is focused (true).
+        let mut focus = true;
+
+        // Pressing Tab toggles focus to Cancel (false).
+        focus = update_end_task_dialog_focus(focus, true, false, false, false);
+        assert!(!focus);
+
+        // Releasing Tab on subsequent frame (no keys) MUST preserve Cancel focus (false).
+        focus = update_end_task_dialog_focus(focus, false, false, false, false);
+        assert!(!focus);
+
+        // Pressing Tab again toggles back to End task (true).
+        focus = update_end_task_dialog_focus(focus, true, false, false, false);
+        assert!(focus);
+
+        // Next frame preserves End task.
+        focus = update_end_task_dialog_focus(focus, false, false, false, false);
+        assert!(focus);
+
+        // Pressing Shift+Tab toggles to Cancel (false).
+        focus = update_end_task_dialog_focus(focus, false, true, false, false);
+        assert!(!focus);
+
+        // Pressing Left arrow explicitly focuses Cancel (left button).
+        focus = update_end_task_dialog_focus(focus, false, false, true, false);
+        assert!(!focus);
+
+        // Pressing Right arrow explicitly focuses End task (right button).
+        focus = update_end_task_dialog_focus(focus, false, false, false, true);
+        assert!(focus);
+    }
+
+    #[test]
+    fn test_end_task_dialog_focus_persistence_in_context() {
+        let ctx = egui::Context::default();
+        let focus_id = egui::Id::new("end_task_dialog_focus_end");
+
+        // Frame 1: Initial dialog opening defaults to End task (true).
+        let mut focus: bool = ctx.data(|d| d.get_temp(focus_id)).unwrap_or(true);
+        assert!(focus);
+
+        // User pressed Tab.
+        focus = update_end_task_dialog_focus(focus, true, false, false, false);
+        ctx.data_mut(|d| d.insert_temp(focus_id, focus));
+        assert!(!focus);
+
+        // Frame 2: Next tick without keys, must stay on Cancel.
+        let mut focus_frame2: bool = ctx.data(|d| d.get_temp(focus_id)).unwrap_or(true);
+        focus_frame2 = update_end_task_dialog_focus(focus_frame2, false, false, false, false);
+        ctx.data_mut(|d| d.insert_temp(focus_id, focus_frame2));
+        assert!(!focus_frame2);
+
+        // Frame 3: Dialog closes -> temp data removed.
+        ctx.data_mut(|d| d.remove_temp::<bool>(focus_id));
+        let reset = ctx.data(|d| d.get_temp::<bool>(focus_id));
+        assert_eq!(reset, None);
     }
 }
