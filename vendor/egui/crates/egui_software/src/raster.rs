@@ -145,6 +145,81 @@ pub fn triangle(
 
     let inv_area = 1.0 / area as f32;
 
+    // Fast path: uniform untextured geometry (chart area fills, line strokes, polygons).
+    if texture.is_none() && v[0].color == v[1].color && v[1].color == v[2].color {
+        let color = v[0].color;
+        if color.a() == 0 {
+            return;
+        }
+        if color.a() == 255 {
+            // Opaque uniform triangle: direct store, no blending or float barycentrics.
+            let packed = crate::target::pack_rgb(color.r(), color.g(), color.b());
+            for y in bounds.min_y..bounds.max_y {
+                let mut w = row_w;
+                let Some(row) = target.row_mut(y as u32) else {
+                    for k in 0..3 {
+                        row_w[k] += step_y[k];
+                    }
+                    continue;
+                };
+
+                for x in bounds.min_x..bounds.max_x {
+                    if (w[0] | w[1] | w[2]) >= 0
+                        && let Some(dst) = row.get_mut(x as usize)
+                    {
+                        *dst = packed;
+                    }
+                    for k in 0..3 {
+                        w[k] += step_x[k];
+                    }
+                }
+
+                for k in 0..3 {
+                    row_w[k] += step_y[k];
+                }
+            }
+            return;
+        }
+
+        // Translucent uniform triangle (e.g. chart fills): hoist src and inv_a.
+        let c = color.to_array();
+        let src = [c[0] as f32, c[1] as f32, c[2] as f32, c[3] as f32];
+        let inv_a = 1.0 - src[3] * (1.0 / 255.0);
+        for y in bounds.min_y..bounds.max_y {
+            let mut w = row_w;
+            let Some(row) = target.row_mut(y as u32) else {
+                for k in 0..3 {
+                    row_w[k] += step_y[k];
+                }
+                continue;
+            };
+
+            for x in bounds.min_x..bounds.max_x {
+                if (w[0] | w[1] | w[2]) >= 0
+                    && let Some(dst) = row.get_mut(x as usize)
+                {
+                    let d = *dst;
+                    let dr = ((d >> 16) & 0xff) as f32;
+                    let dg = ((d >> 8) & 0xff) as f32;
+                    let db = (d & 0xff) as f32;
+                    let r = (src[0] + dr * inv_a).round().clamp(0.0, 255.0) as u32;
+                    let g = (src[1] + dg * inv_a).round().clamp(0.0, 255.0) as u32;
+                    let b = (src[2] + db * inv_a).round().clamp(0.0, 255.0) as u32;
+                    *dst = (r << 16) | (g << 8) | b;
+                }
+                for k in 0..3 {
+                    w[k] += step_x[k];
+                }
+            }
+
+            for k in 0..3 {
+                row_w[k] += step_y[k];
+            }
+        }
+        return;
+    }
+
+    // General path: textured and/or gouraud-interpolated triangles.
     for y in bounds.min_y..bounds.max_y {
         let mut w = row_w;
         let Some(row) = target.row_mut(y as u32) else {
@@ -155,7 +230,7 @@ pub fn triangle(
         };
 
         for x in bounds.min_x..bounds.max_x {
-            if w[0] >= 0 && w[1] >= 0 && w[2] >= 0 {
+            if (w[0] | w[1] | w[2]) >= 0 {
                 // Barycentrics. The bias shifted the edge values by at most one unit to
                 // implement the fill rule; using the unbiased weights for interpolation
                 // would cost a subtract per pixel for a sub-LSB difference in the result,

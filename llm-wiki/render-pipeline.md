@@ -33,7 +33,7 @@ tm-app/theme.rs                     the ONLY place that decides the sub-pixel mo
 [FORK] epaint                       3x rasterization -> per-channel coverage in the atlas
 [FORK] egui_software::Painter       shapes -> pixels
         |-- Shape::Text        -> glyph blit, per-channel ClearType blend
-        |-- pixel-aligned Rect -> (future) span fill
+        |-- pixel-aligned Rect -> span::fast_rect fill (flat + Shape::Vec containers)
         \-- everything else    -> epaint::Tessellator -> triangle rasterizer
 [FORK] eframe Renderer::Software -> softbuffer -> BitBlt / SHM / wl_shm / CoreGraphics
 ```
@@ -173,8 +173,12 @@ tests cannot cover, and the CPU-cost measurements in the plan need it too.
   `DWRITE_TEXTURE_CLEARTYPE_3x1` would give bitmaps identical to Windows'. It also requires
   switching layout to linear (unhinted) advances to match `MEASURING_MODE_NATURAL`, which
   inverts the grid-fitting argument in `fonts.rs`'s module doc — read that before starting.
-- **Performance work.** The renderer is correct but unoptimized: `f32` end to end, no SIMD,
-  no span fast path for axis-aligned rects, no damage tracking. See the plan for the
-  ordering and the reasoning about which of those actually matters (damage tracking is
-  worth less than it sounds: a sample tick dirties most of the window anyway).
+- **Performance work.** The rasterizer and application loops are optimized for low CPU load:
+  - Axis-aligned rect fast path (`span::fast_rect` with `Shape::Vec` recursive flattening for containers).
+  - Uniform untextured triangle fast paths (opaque and translucent) with single-branch edge testing.
+  - Text blitting with hoisted `linear_u16` LUTs, clamped row slices, and solid-glyph interior bypass.
+  - Full-target memset clear path.
+  - Taskman process table caching by reference, avoiding per-frame vector cloning.
+  - IconCache O(1) lazy expiration and direct unmultiplied upload.
+  Remaining potential work: SIMD for span fills, damage tracking.
 - **Retiring wgpu and glow.** Both are still compiled in as fallbacks.

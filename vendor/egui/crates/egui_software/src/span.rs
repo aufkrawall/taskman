@@ -109,17 +109,7 @@ pub fn fill(target: &mut Target<'_>, clip: PixelRect, rect: PixelRect, color: Co
     let [r, g, b, a] = color.to_array();
 
     if a == 255 {
-        // Opaque: a plain store. `slice::fill` on `[u32]` lowers to a vectorised
-        // memset, which is as fast as this can be.
-        let packed = crate::target::pack_rgb(r, g, b);
-        for y in bounds.min_y..bounds.max_y {
-            let Some(row) = target.row_mut(y as u32) else {
-                continue;
-            };
-            if let Some(span) = row.get_mut(bounds.min_x as usize..bounds.max_x as usize) {
-                span.fill(packed);
-            }
-        }
+        target.fill_rect(bounds, crate::target::pack_rgb(r, g, b));
         return;
     }
 

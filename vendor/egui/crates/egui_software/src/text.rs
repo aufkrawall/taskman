@@ -150,10 +150,20 @@ fn blit_rect(
     // and destination, with coverage carrying the alpha. Using the premultiplied value
     // would darken faded text twice over.
     let [sr, sg, sb, _] = color.to_srgba_unmultiplied();
+    let solid_packed = crate::target::pack_rgb(sr, sg, sb);
+
+    let atlas_w = atlas.width as i32;
+    let atlas_h = atlas.height as i32;
+
+    let is_subpixel = !blend.subpixel.is_off();
+    let swaps_rb = blend.subpixel.swaps_rb();
+    let s_lin_r = blend.gamma.linear_u16(sr);
+    let s_lin_g = blend.gamma.linear_u16(sg);
+    let s_lin_b = blend.gamma.linear_u16(sb);
 
     for y in bounds.min_y..bounds.max_y {
         let src_y = v0 + (y - y0);
-        if src_y < 0 || src_y as usize >= atlas.height {
+        if src_y < 0 || src_y >= atlas_h {
             continue;
         }
         let src_row_start = (src_y as usize) * atlas.width;
@@ -161,56 +171,99 @@ fn blit_rect(
             continue;
         };
 
-        for x in bounds.min_x..bounds.max_x {
-            let src_x = u0 + (x - x0);
-            if src_x < 0 || src_x as usize >= atlas.width {
-                continue;
-            }
-            let Some(&texel) = atlas.pixels.get(src_row_start + src_x as usize) else {
-                continue;
-            };
-            let [tr, tg, tb, ta] = texel.to_array();
-            if ta == 0 && tr == 0 && tg == 0 && tb == 0 {
-                continue; // fully uncovered: the majority of a glyph's bounding box
-            }
-            let Some(dst) = dst_row.get_mut(x as usize) else {
-                continue;
-            };
+        // Clamp horizontal range against atlas boundaries once per row.
+        let x_start = bounds.min_x.max(x0 - u0);
+        let x_end = bounds.max_x.min(x0 - u0 + atlas_w);
+        if x_start >= x_end {
+            continue;
+        }
 
-            if blend.subpixel.is_off() {
-                // Identical arithmetic to the triangle path's fragment shader and blend:
-                // multiply in gamma space, then premultiplied `src + dst * (1 - src.a)`.
-                // This must stay bit-identical -- `tests/text.rs` compares the two paths.
-                let f = |c: u8, t: u8| c as f32 * t as f32 * (1.0 / 255.0);
-                let src = [f(cr, tr), f(cg, tg), f(cb, tb), f(ca, ta)];
+        let count = (x_end - x_start) as usize;
+        let src_start = src_row_start + (u0 + (x_start - x0)) as usize;
+        let src_slice = &atlas.pixels[src_start..src_start + count];
+        let dst_slice = &mut dst_row[x_start as usize..x_start as usize + count];
+
+        if !is_subpixel {
+            let inv_255 = 1.0f32 / 255.0;
+            for (&texel, dst) in src_slice.iter().zip(dst_slice.iter_mut()) {
+                let [tr, tg, tb, ta] = texel.to_array();
+                if (ta | tr | tg | tb) == 0 {
+                    continue;
+                }
+                if ta == 255 && ca == 255 && tr == 255 && tg == 255 && tb == 255 {
+                    *dst = solid_packed;
+                    continue;
+                }
+                let src = [
+                    cr as f32 * tr as f32 * inv_255,
+                    cg as f32 * tg as f32 * inv_255,
+                    cb as f32 * tb as f32 * inv_255,
+                    ca as f32 * ta as f32 * inv_255,
+                ];
                 *dst = crate::raster::blend_over(src, *dst);
+            }
+        } else if ca == 255 {
+            // Hot path: opaque sub-pixel ClearType text.
+            if swaps_rb {
+                for (&texel, dst) in src_slice.iter().zip(dst_slice.iter_mut()) {
+                    let [tr, tg, tb, ta] = texel.to_array();
+                    if (ta | tr | tg | tb) == 0 {
+                        continue;
+                    }
+                    if tb == 255 && tg == 255 && tr == 255 {
+                        *dst = solid_packed;
+                        continue;
+                    }
+                    let d = *dst;
+                    let dr = ((d >> 16) & 0xff) as u8;
+                    let dg = ((d >> 8) & 0xff) as u8;
+                    let db = (d & 0xff) as u8;
+                    let r = blend.gamma.blend_channel_fast(s_lin_r, sr, dr, tb);
+                    let g = blend.gamma.blend_channel_fast(s_lin_g, sg, dg, tg);
+                    let b = blend.gamma.blend_channel_fast(s_lin_b, sb, db, tr);
+                    *dst = ((r as u32) << 16) | ((g as u32) << 8) | (b as u32);
+                }
             } else {
-                // Per-channel coverage. This is the whole reason a CPU renderer can do
-                // ClearType and a GPU one cannot: each channel is blended against its own
-                // coverage, which on a GPU would need dual-source blending.
-                //
-                // The atlas is always written in RGB stripe order (the filter is
-                // symmetric, so BGR panels are handled by swapping here rather than by
-                // rebuilding the atlas).
-                let (cov_r, cov_b) = if blend.subpixel.swaps_rb() {
-                    (tb, tr)
-                } else {
-                    (tr, tb)
-                };
-                let scale = |cov: u8| {
-                    // Text alpha (from `opacity_factor`, or a translucent colour) scales
-                    // coverage; it is not a separate blend stage.
-                    ((u32::from(cov) * u32::from(ca) + 127) / 255) as u8
-                };
-                let (dr, dg, db) = (
-                    ((*dst >> 16) & 0xff) as u8,
-                    ((*dst >> 8) & 0xff) as u8,
-                    (*dst & 0xff) as u8,
-                );
-                let r = blend.gamma.blend_channel(sr, dr, scale(cov_r));
-                let g = blend.gamma.blend_channel(sg, dg, scale(tg));
-                let b = blend.gamma.blend_channel(sb, db, scale(cov_b));
-                *dst = crate::target::pack_rgb(r, g, b);
+                for (&texel, dst) in src_slice.iter().zip(dst_slice.iter_mut()) {
+                    let [tr, tg, tb, ta] = texel.to_array();
+                    if (ta | tr | tg | tb) == 0 {
+                        continue;
+                    }
+                    if tr == 255 && tg == 255 && tb == 255 {
+                        *dst = solid_packed;
+                        continue;
+                    }
+                    let d = *dst;
+                    let dr = ((d >> 16) & 0xff) as u8;
+                    let dg = ((d >> 8) & 0xff) as u8;
+                    let db = (d & 0xff) as u8;
+                    let r = blend.gamma.blend_channel_fast(s_lin_r, sr, dr, tr);
+                    let g = blend.gamma.blend_channel_fast(s_lin_g, sg, dg, tg);
+                    let b = blend.gamma.blend_channel_fast(s_lin_b, sb, db, tb);
+                    *dst = ((r as u32) << 16) | ((g as u32) << 8) | (b as u32);
+                }
+            }
+        } else {
+            // Translucent sub-pixel text.
+            let scale = |cov: u8| ((u32::from(cov) * u32::from(ca) + 127) / 255) as u8;
+            for (&texel, dst) in src_slice.iter().zip(dst_slice.iter_mut()) {
+                let [tr, tg, tb, ta] = texel.to_array();
+                if (ta | tr | tg | tb) == 0 {
+                    continue;
+                }
+                let (cov_r, cov_b) = if swaps_rb { (tb, tr) } else { (tr, tb) };
+                let d = *dst;
+                let dr = ((d >> 16) & 0xff) as u8;
+                let dg = ((d >> 8) & 0xff) as u8;
+                let db = (d & 0xff) as u8;
+                let r = blend
+                    .gamma
+                    .blend_channel_fast(s_lin_r, sr, dr, scale(cov_r));
+                let g = blend.gamma.blend_channel_fast(s_lin_g, sg, dg, scale(tg));
+                let b = blend
+                    .gamma
+                    .blend_channel_fast(s_lin_b, sb, db, scale(cov_b));
+                *dst = ((r as u32) << 16) | ((g as u32) << 8) | (b as u32);
             }
         }
     }

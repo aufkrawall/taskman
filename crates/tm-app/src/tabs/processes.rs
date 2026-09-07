@@ -259,7 +259,7 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
             rows: build_display_rows(&snap, &key.2, key.3, key.4, &expanded, &groups),
         });
     }
-    let rows = cache.as_ref().expect("cache").rows.clone();
+    let rows = &cache.as_ref().expect("cache").rows;
 
     // Task-Manager-style type navigation: typed letters accumulate into a
     // word, so "svc" lands on svchost.exe instead of jumping to whatever
@@ -285,11 +285,11 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
         }
     }
 
-    handle_keyboard_navigation(app, ui.ctx(), &rows);
+    handle_keyboard_navigation(app, ui.ctx(), rows);
 
     let agg = Aggregates::from_snapshot(&snap);
     let aggs = agg.strings();
-    prepare_auto_fit_widths(ui, &mut table, &rows, &aggs);
+    prepare_auto_fit_widths(ui, &mut table, rows, &aggs);
 
     let avail = tablekit::table_avail(ui);
     // Consume any pending scroll request as a flat display-row index so the
@@ -317,7 +317,7 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
                         group_header(app, ui, &pal, *gi, *total, content_w);
                     }
                     Some(DisplayRow::Process(row)) => {
-                        row_ui(app, ui, &pal, table, row, &rows);
+                        row_ui(app, ui, &pal, table, row, rows);
                     }
                     None => {}
                 }

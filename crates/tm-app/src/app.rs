@@ -1098,8 +1098,8 @@ impl eframe::App for TaskManApp {
             history_cap_for(self.shared.settings.graph_seconds, history_min_interval_s());
         if want_cap != self.history_cap {
             self.history_cap = want_cap;
-            while self.history.len() > want_cap {
-                self.history.remove(0);
+            if self.history.len() > want_cap {
+                self.history.drain(..self.history.len() - want_cap);
             }
             tracing::debug!(cap = want_cap, "graph window changed; history resized");
         }
@@ -1132,7 +1132,6 @@ impl eframe::App for TaskManApp {
         let ctx = ui.ctx().clone();
         crate::theme::ensure_visuals(&ctx);
         crate::fonts::poll_async_apply(&ctx);
-        self.poll_engine(&ctx);
 
         let pal = crate::theme::palette_ctx(&ctx);
         self.sync_title_bar(&ctx, &pal, _frame);

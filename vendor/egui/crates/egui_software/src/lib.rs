@@ -235,10 +235,14 @@ impl Painter {
             return;
         }
 
+        let mut flat_shapes = Vec::with_capacity(shapes.len());
+        flatten_clipped_shapes(shapes, &mut flat_shapes);
+
         let bounds = target.bounds();
         let mut batch: Vec<ClippedShape> = Vec::new();
+        let mut primitives: Vec<ClippedPrimitive> = Vec::new();
 
-        for clipped in shapes {
+        for clipped in flat_shapes {
             // Only unrotated text can be blitted; a rotated `TextShape` is not an
             // axis-aligned quad, so it goes through the tessellator like any other
             // geometry and comes out grayscale.
@@ -260,10 +264,13 @@ impl Painter {
                 continue;
             }
 
-            // Flush everything queued before this, so draw order is preserved exactly.
+            // Flush everything queued before this, reusing allocations.
             if !batch.is_empty() {
-                let primitives = tess.tessellate_shapes(std::mem::take(&mut batch));
+                for shape in batch.drain(..) {
+                    tess.tessellate_clipped_shape(shape, &mut primitives);
+                }
                 self.paint(target, ctx.pixels_per_point, &primitives);
+                primitives.clear();
             }
 
             let clip = clip_rect_to_pixels(clipped.clip_rect, ctx.pixels_per_point, bounds);
@@ -283,7 +290,9 @@ impl Painter {
         }
 
         if !batch.is_empty() {
-            let primitives = tess.tessellate_shapes(batch);
+            for shape in batch.drain(..) {
+                tess.tessellate_clipped_shape(shape, &mut primitives);
+            }
             self.paint(target, ctx.pixels_per_point, &primitives);
         }
     }
@@ -318,7 +327,7 @@ impl Painter {
         tess: &mut Tessellator,
     ) {
         let galley: &Galley = &text.galley;
-        if galley.is_empty() || text.opacity_factor <= 0.0 {
+        if galley.is_empty() || text.opacity_factor <= 0.0 || clip.is_empty() {
             return;
         }
 
@@ -328,6 +337,13 @@ impl Painter {
         } else {
             text.pos
         };
+
+        if ctx.options.coarse_tessellation_culling {
+            let galley_rect = galley.rect.translate(galley_pos.to_vec2());
+            if !clip_points.intersects(galley_rect) {
+                return;
+            }
+        }
 
         let Some(atlas) = self.textures.get(TextureId::Managed(0)) else {
             self.missing_texture_draws += 1;
@@ -512,6 +528,26 @@ impl Painter {
                 sampler,
             );
         }
+    }
+}
+
+fn flatten_clipped_shapes(shapes: Vec<ClippedShape>, out: &mut Vec<ClippedShape>) {
+    out.reserve(shapes.len());
+    for clipped in shapes {
+        flatten_clipped_shape(clipped, out);
+    }
+}
+
+fn flatten_clipped_shape(clipped: ClippedShape, out: &mut Vec<ClippedShape>) {
+    match clipped.shape {
+        Shape::Noop => {}
+        Shape::Vec(children) => {
+            let clip_rect = clipped.clip_rect;
+            for shape in children {
+                flatten_clipped_shape(ClippedShape { clip_rect, shape }, out);
+            }
+        }
+        _ => out.push(clipped),
     }
 }
 

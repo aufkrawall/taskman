@@ -104,17 +104,31 @@ impl<'a> Target<'a> {
 
     /// Fill an already-clipped rectangle with an opaque colour.
     pub fn fill_rect(&mut self, rect: PixelRect, bgrx: u32) {
-        for y in rect.min_y.max(0)..rect.max_y.min(self.height as i32) {
-            let (Some(lo), Some(hi)) = (usize::try_from(rect.min_x).ok(), {
-                usize::try_from(rect.max_x).ok()
-            }) else {
-                continue;
-            };
-            if let Some(row) = self.row_mut(y as u32)
-                && let Some(span) = row.get_mut(lo..hi)
-            {
-                span.fill(bgrx);
-            }
+        let min_y = rect.min_y.max(0) as u32;
+        let max_y = (rect.max_y.max(0) as u32).min(self.height);
+        if min_y >= max_y {
+            return;
+        }
+        let min_x = rect.min_x.max(0) as usize;
+        let max_x = (rect.max_x.max(0) as usize).min(self.width as usize);
+        if min_x >= max_x {
+            return;
+        }
+        // Full target fast path (e.g. Painter::clear): single contiguous vectorised memset.
+        if min_x == 0
+            && max_x == self.width as usize
+            && min_y == 0
+            && max_y == self.height
+            && self.stride == self.width
+        {
+            let total = (self.width * self.height) as usize;
+            self.pixels[..total].fill(bgrx);
+            return;
+        }
+        let span_len = max_x - min_x;
+        for y in min_y..max_y {
+            let start = (y as usize) * (self.stride as usize) + min_x;
+            self.pixels[start..start + span_len].fill(bgrx);
         }
     }
 

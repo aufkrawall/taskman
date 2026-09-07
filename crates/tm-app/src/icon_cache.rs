@@ -68,25 +68,25 @@ impl IconCache {
         self.drain_results(ctx);
 
         let mut inner = sync::lock(&self.inner);
-        // Expire failed entries so transient failures can retry.
-        inner.tex.retain(|_, e| match e {
-            Entry::Failed(at) => at.elapsed() < FAILURE_RETRY_TTL,
-            Entry::Ready(_) => true,
-        });
         match inner.tex.get(path) {
-            Some(Entry::Ready(t)) => Some(t.clone()),
-            Some(Entry::Failed(_)) => None,
-            None => {
-                if !inner.queued.contains(path)
-                    && self.in_flight.load(std::sync::atomic::Ordering::Relaxed) < 64
-                {
-                    inner.queued.insert(path.to_string());
-                    drop(inner);
-                    self.send_request(path);
+            Some(Entry::Ready(t)) => return Some(t.clone()),
+            Some(Entry::Failed(at)) => {
+                if at.elapsed() >= FAILURE_RETRY_TTL {
+                    inner.tex.remove(path);
+                } else {
+                    return None;
                 }
-                None
             }
+            None => {}
         }
+        if !inner.queued.contains(path)
+            && self.in_flight.load(std::sync::atomic::Ordering::Relaxed) < 64
+        {
+            inner.queued.insert(path.to_string());
+            drop(inner);
+            self.send_request(path);
+        }
+        None
     }
 
     fn send_request(&self, path: &str) {
@@ -144,16 +144,8 @@ impl IconCache {
                     continue;
                 }
                 let tex = d.icon.map(|(w, h, rgba)| {
-                    // GDI returns straight alpha; egui Color32 is premultiplied.
-                    let mut premul = rgba;
-                    for px in premul.as_chunks_mut::<4>().0 {
-                        let a = px[3] as u32;
-                        px[0] = ((px[0] as u32 * a + 127) / 255) as u8;
-                        px[1] = ((px[1] as u32 * a + 127) / 255) as u8;
-                        px[2] = ((px[2] as u32 * a + 127) / 255) as u8;
-                    }
                     let img =
-                        egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], &premul);
+                        egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], &rgba);
                     ctx.load_texture(
                         format!("icon:{}", d.path),
                         img,
@@ -170,6 +162,11 @@ impl IconCache {
                 );
                 uploaded += 1;
             }
+            // Expire failed entries so transient failures can retry.
+            inner.tex.retain(|_, e| match e {
+                Entry::Failed(at) => at.elapsed() < FAILURE_RETRY_TTL,
+                Entry::Ready(_) => true,
+            });
             // LRU-style bound: evict least-recently-used entries beyond cap.
             if inner.tex.len() > CACHE_CAP {
                 let excess = inner.tex.len() - CACHE_CAP;

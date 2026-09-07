@@ -1,5 +1,38 @@
 # Recent Activity
 
+## 2026-09-07 — CPU renderer and application pipeline optimizations for lowest CPU load
+
+1. **`egui_software` rasterizer optimizations:**
+   - **Gamma table lookups hoisted:** added `linear_u16` and `blend_channel_fast`
+     so text blitting computes source linear luminance once per glyph instead of
+     per pixel.
+   - **Text blitter scanline slicing:** hoisted horizontal bounds clamping
+     once per scanline and replaced per-pixel `get()` and option unwraps with
+     direct slice zipping (`src_slice.iter().zip(dst_slice.iter_mut())`).
+   - **Solid-glyph interior fast-bypass:** when glyph coverage channels are all 255
+     and glyph alpha is 255, writes packed RGB directly, skipping blending and LUT lookups.
+   - **Uniform triangle rasterization fast paths:** uniform untextured geometry
+     (chart area fills, line strokes, polygons) skips barycentrics and float shading;
+     opaque triangles write directly, and translucent triangles hoist color math out
+     of the pixel loop. Edge testing evaluates all three edge signs with a single
+     branch via `(w[0] | w[1] | w[2]) >= 0`.
+   - **Recursive `Shape::Vec` flattening:** container frames (`egui::Frame`) wrap
+     backgrounds in `Shape::Vec`; flattening them enables `span::fast_rect` rather
+     than tessellating into Gouraud meshes.
+   - **Target memset clear:** `Target::fill_rect` delegates full-target fills to
+     `slice::fill` (vectorized memset).
+   - **Buffer reuse:** reused batch vectors across flushes in `paint_shapes` with
+     `.drain(..)` instead of allocating new vectors.
+
+2. **Taskman application pipeline optimizations:**
+   - **Processes tab row borrow:** borrowed cached rows (`&cache.rows`) instead of
+     cloning hundreds of `DisplayRow` instances with owned strings on every frame.
+   - **History deque bulk drain:** replaced O(N^2) `history.remove(0)` loop with
+     O(N) `drain(..excess)`. Removed duplicate `poll_engine` call in `ui()`.
+   - **IconCache O(1) lookup:** replaced per-lookup hashmap `retain` scan with lazy
+     TTL check on failed entries; moved general retain to `drain_results`. Removed
+     redundant manual premultiplication loop before `from_rgba_unmultiplied`.
+
 ## 2026-09-06 (later still yet) — the Menu key works; Tab cycles the End-task dialog; advapi32's 64 references are real
 
 1. **The keyboard Menu/Application key now opens the selected row's context

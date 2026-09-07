@@ -95,9 +95,18 @@ impl TextGamma {
         (self.gamma - gamma).abs() < 1e-4 && (self.contrast - contrast).abs() < 1e-4
     }
 
-    /// Blend one channel: `src` over `dst` at coverage `cov`, gamma-corrected.
-    #[inline]
-    pub fn blend_channel(&self, src: u8, dst: u8, cov: u8) -> u8 {
+    /// Pre-look up `to_linear[v]` as a `u32`.
+    #[inline(always)]
+    pub fn linear_u16(&self, v: u8) -> u32 {
+        u32::from(self.to_linear[v as usize])
+    }
+
+    /// Blend one channel with pre-looked-up `s_linear`: `src` over `dst` at coverage `cov`.
+    ///
+    /// Bit-identical to [`Self::blend_channel`], but avoids re-indexing `to_linear`
+    /// for the constant source color on every pixel in a glyph blit.
+    #[inline(always)]
+    pub fn blend_channel_fast(&self, s_linear: u32, src: u8, dst: u8, cov: u8) -> u8 {
         let a = u32::from(self.contrast_lut[cov as usize]);
         if a == 0 {
             return dst;
@@ -105,10 +114,15 @@ impl TextGamma {
         if a >= 255 {
             return src;
         }
-        let s = u32::from(self.to_linear[src as usize]);
         let d = u32::from(self.to_linear[dst as usize]);
-        let mixed = (s * a + d * (255 - a)) / 255;
+        let mixed = (s_linear * a + d * (255 - a)) / 255;
         self.from_linear[(mixed >> 4) as usize]
+    }
+
+    /// Blend one channel: `src` over `dst` at coverage `cov`, gamma-corrected.
+    #[inline]
+    pub fn blend_channel(&self, src: u8, dst: u8, cov: u8) -> u8 {
+        self.blend_channel_fast(self.linear_u16(src), src, dst, cov)
     }
 }
 
@@ -201,5 +215,21 @@ mod tests {
         assert!(g.matches(1.8, 0.5));
         assert!(!g.matches(2.2, 0.5));
         assert!(!g.matches(1.8, 0.0));
+    }
+
+    #[test]
+    fn blend_channel_fast_matches_blend_channel_exactly() {
+        let g = TextGamma::default();
+        for src in [0, 64, 128, 200, 255] {
+            let s_lin = g.linear_u16(src);
+            for dst in [0, 32, 128, 220, 255] {
+                for cov in 0..=255 {
+                    assert_eq!(
+                        g.blend_channel_fast(s_lin, src, dst, cov),
+                        g.blend_channel(src, dst, cov)
+                    );
+                }
+            }
+        }
     }
 }
