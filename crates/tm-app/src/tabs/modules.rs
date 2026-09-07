@@ -19,6 +19,8 @@ use crate::theme;
 use crate::widgets::menu;
 use crate::widgets::tablekit::{self, TmColumn};
 
+const MAX_FORCE_UNLOAD_RELEASES: u32 = 64;
+
 #[derive(Debug, Clone)]
 enum LoadState {
     Loading,
@@ -142,6 +144,28 @@ fn begin_fetch(state: &mut State, actions: Arc<dyn PlatformActions>, ctx: &egui:
     }
 }
 
+fn force_still_mapped_message(releases: u32, module_name: &str) -> String {
+    match i18n::lang() {
+        i18n::Lang::De => format!(
+            "Force-Unload nach {releases} Entladeanforderungen gestoppt: {module_name} bleibt geladen. Das Modul ist möglicherweise angeheftet oder wird weiterhin referenziert."
+        ),
+        i18n::Lang::En => format!(
+            "Force unload stopped after {releases} release requests: {module_name} remains loaded. The module may be pinned or still referenced."
+        ),
+    }
+}
+
+fn force_refresh_failed_message(releases: u32, error: &str) -> String {
+    match i18n::lang() {
+        i18n::Lang::De => format!(
+            "Force-Unload nach {releases} Entladeanforderungen gestoppt, weil die Modulliste nicht zuverlässig aktualisiert werden konnte: {error}"
+        ),
+        i18n::Lang::En => format!(
+            "Force unload stopped after {releases} release requests because the module list could not be refreshed reliably: {error}"
+        ),
+    }
+}
+
 fn begin_unload(app: &TaskManApp, state: &mut State, module: ProcessModule, ctx: &egui::Context) {
     if !app.identity_is_live(&state.identity) {
         app.shared.toast(i18n::tr(K::ProcessExited));
@@ -163,27 +187,59 @@ fn begin_unload(app: &TaskManApp, state: &mut State, module: ProcessModule, ctx:
     let spawned = std::thread::Builder::new()
         .name("tm-module-unload".into())
         .spawn(move || {
-            // Mark the request so an older v2 service cannot execute its
-            // former multi-release implementation: NUL cannot be part of a
-            // real Windows module path, so old exact path validation rejects
-            // this safely before acting. Current platform code strips it.
+            // Each platform/broker request is deliberately one FreeLibrary
+            // call. The GUI makes the confirmed action forceful by issuing
+            // another request only after the exact selected base/path has
+            // been re-enumerated and proven to still be mapped. This keeps
+            // the mixed-version safety marker and avoids the old blind loop.
             let request_path = format!(
                 "{}{}",
                 module.path, MODULE_UNLOAD_SINGLE_RELEASE_MARKER
             );
-            let result = actions.unload_process_module(
-                identity.pid,
-                identity.start_epoch_s,
-                module.base_address,
-                &request_path,
-            );
+            let mut releases = 0u32;
+            let mut observed_still_mapped = None;
+            let mut action_error: Option<String> = None;
+            let mut refresh_error: Option<String> = None;
 
-            // Always re-enumerate after an attempt, including errors and
-            // timeouts. A remote thread may have completed after a timeout,
-            // DllMain may have changed other modules, and a still-mapped DLL
-            // can have been reloaded. Never leave the pre-action inventory on
-            // screen and present it as current.
-            let (observed_still_mapped, refresh_error) =
+            for _ in 0..MAX_FORCE_UNLOAD_RELEASES {
+                let outcome = match actions.unload_process_module(
+                    identity.pid,
+                    identity.start_epoch_s,
+                    module.base_address,
+                    &request_path,
+                ) {
+                    Ok(outcome) => {
+                        releases += 1;
+                        outcome
+                    }
+                    Err(error) => {
+                        action_error = Some(error.to_string());
+                        // Even a timeout can complete remotely after the wait
+                        // expires, so always refresh once before reporting it.
+                        match actions.list_process_modules(identity.pid, identity.start_epoch_s) {
+                            Ok(modules) => {
+                                let still_mapped = modules.iter().any(|candidate| {
+                                    candidate.base_address == module.base_address
+                                        && candidate.path.eq_ignore_ascii_case(&module.path)
+                                });
+                                *tm_core::sync::lock(&load) = LoadState::Ready(modules);
+                                observed_still_mapped = Some(still_mapped);
+                            }
+                            Err(error) => {
+                                let detail = error.to_string();
+                                *tm_core::sync::lock(&load) = LoadState::Error(detail.clone());
+                                refresh_error = Some(detail);
+                            }
+                        }
+                        break;
+                    }
+                };
+
+                // Re-enumerate between EVERY release. This is the guard that
+                // makes force mode materially safer than repeatedly calling
+                // FreeLibrary against a stale HMODULE: the next request only
+                // happens if the same sampled process still has the same
+                // module at the same base/path.
                 match actions.list_process_modules(identity.pid, identity.start_epoch_s) {
                     Ok(modules) => {
                         let still_mapped = modules.iter().any(|candidate| {
@@ -191,30 +247,35 @@ fn begin_unload(app: &TaskManApp, state: &mut State, module: ProcessModule, ctx:
                                 && candidate.path.eq_ignore_ascii_case(&module.path)
                         });
                         *tm_core::sync::lock(&load) = LoadState::Ready(modules);
-                        (Some(still_mapped), None)
+                        observed_still_mapped = Some(still_mapped);
+                        if !still_mapped {
+                            break;
+                        }
                     }
                     Err(error) => {
                         let detail = error.to_string();
                         *tm_core::sync::lock(&load) = LoadState::Error(detail.clone());
-                        (None, Some(detail))
+                        refresh_error = Some(detail);
+                        // The platform may already have verified the result of
+                        // this one request. Preserve that observation for the
+                        // toast, but never issue another release without a
+                        // fresh inventory from the GUI side.
+                        observed_still_mapped = outcome.still_mapped;
+                        break;
                     }
-                };
+                }
+            }
 
-            let message = match result {
-                Ok(outcome) => match observed_still_mapped.or(outcome.still_mapped) {
-                    Some(false) => i18n::trf(K::ModuleUnloadedMsg, &[&module_name]),
-                    Some(true) => {
-                        // One confirmation is exactly one successful
-                        // FreeLibrary request; do not imply TaskMan knows or
-                        // drained the target's private loader reference count.
-                        i18n::trf(K::ModuleStillMappedMsg, &["1", &module_name])
-                    }
-                    None => refresh_error.as_deref().map_or_else(
-                        || i18n::tr(K::ActionFailed).to_string(),
-                        |error| i18n::trf(K::ErrMsg, &[error]),
-                    ),
-                },
-                Err(error) => i18n::trf(K::ErrMsg, &[&error.to_string()]),
+            let message = if observed_still_mapped == Some(false) {
+                i18n::trf(K::ModuleUnloadedMsg, &[&module_name])
+            } else if let Some(error) = action_error.as_deref() {
+                i18n::trf(K::ErrMsg, &[error])
+            } else if let Some(error) = refresh_error.as_deref() {
+                force_refresh_failed_message(releases, error)
+            } else if observed_still_mapped == Some(true) {
+                force_still_mapped_message(releases, &module_name)
+            } else {
+                i18n::tr(K::ActionFailed).to_string()
             };
             crate::app::toast_from(&toasts, message);
             in_flight.end();
