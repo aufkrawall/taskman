@@ -444,26 +444,21 @@ fn network_trace_raw_vs_pruned() {
     assert!(!pruned.is_empty(), "pruning removed every counter");
 }
 
-/// The reason a single FreeLibrary can never unload most DLLs: it releases
-/// ONE loader reference, and anything injected or statically imported is
-/// referenced several times. The unload must repeat until the module leaves
-/// and report how many references it dropped. Proven end-to-end: a child is
-/// made to load a DLL three times through remote LoadLibraryW calls (the
-/// exact mirror of the unload's remote FreeLibrary), and one unload request
-/// has to release all three and unmapped the module.
+/// Pin the safety contract of module unload on the real Windows loader. A
+/// user confirmation is one release request, never an attempt to drain an
+/// unknown loader refcount. The child explicitly loads one DLL three times;
+/// three explicit unload requests are therefore required to remove it.
 #[cfg(target_os = "windows")]
 #[test]
-fn module_unload_releases_every_reference_and_reports_the_count() {
+fn module_unload_releases_one_reference_per_explicit_request() {
     use tm_platform::actions::PlatformActions;
 
     const DLL: &str = r"C:\Windows\System32\WTSAPI32.dll";
     const DLL_NAME: &str = "WTSAPI32.DLL";
     const LOADS: u32 = 3;
 
-    // The LOCAL action surface: this test is about the unload loop's loader
-    // semantics, not the broker transport. (The installed service may be an
-    // older generation; every other brokered integration test already pins
-    // the transport.)
+    // The LOCAL action surface: this test pins the unload implementation and
+    // loader semantics rather than the installed broker generation.
     let actions = tm_platform::win::WinActions;
     let mut child = std::process::Command::new("cmd")
         .args(["/C", "ping", "-n", "30", "127.0.0.1"])
@@ -628,19 +623,34 @@ fn module_unload_releases_every_reference_and_reports_the_count() {
         .expect("injected DLL mapped in child")
         .clone();
 
-    // The actual behavior under test: one request drops EVERY reference.
-    let outcome = actions
-        .unload_process_module(pid, epoch, module.base_address, &module.path)
-        .expect("unload request");
-    assert!(!outcome.still_mapped, "module still mapped after unloading");
-    assert_eq!(outcome.released, LOADS, "unexpected reference count");
-    let after = actions
-        .list_process_modules(pid, epoch)
-        .expect("child modules after unload");
+    // A destructive broker/local unload must never rebind a bare PID to the
+    // process that happens to own it at action time.
     assert!(
-        !after.iter().any(|m| m.name.eq_ignore_ascii_case(DLL_NAME)),
-        "module still listed after a reported-unmapped unload"
+        actions
+            .unload_process_module(pid, None, module.base_address, &module.path)
+            .is_err(),
+        "PID-only module unload must fail closed"
     );
+
+    for attempt in 1..=LOADS {
+        let outcome = actions
+            .unload_process_module(pid, epoch, module.base_address, &module.path)
+            .expect("unload request");
+        let should_remain = attempt < LOADS;
+        assert_eq!(
+            outcome.still_mapped,
+            Some(should_remain),
+            "unexpected mapping state after explicit release {attempt}"
+        );
+        let after = actions
+            .list_process_modules(pid, epoch)
+            .expect("child modules after unload request");
+        assert_eq!(
+            after.iter().any(|m| m.name.eq_ignore_ascii_case(DLL_NAME)),
+            should_remain,
+            "inventory disagrees after explicit release {attempt}"
+        );
+    }
 
     cleanup(&mut child);
 }
