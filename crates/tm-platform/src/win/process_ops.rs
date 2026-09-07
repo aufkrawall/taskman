@@ -46,13 +46,6 @@ fn creation_epoch_from_handle(h: HANDLE) -> Option<i64> {
     i64::try_from(raw.saturating_sub(116_444_736_000_000_000) / 10_000_000).ok()
 }
 
-pub fn creation_epoch_of(pid: u32) -> Option<i64> {
-    let h = open_process(pid, th::PROCESS_QUERY_LIMITED_INFORMATION).ok()?;
-    let t = creation_epoch_from_handle(h);
-    let _ = unsafe { CloseHandle(h) };
-    t
-}
-
 fn creation_matches(expected: i64, actual: Option<i64>) -> bool {
     match actual {
         // sysinfo and this handle-bound path both truncate the same FILETIME
