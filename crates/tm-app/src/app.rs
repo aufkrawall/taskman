@@ -1526,7 +1526,11 @@ impl TaskManApp {
 
     /// Park the selected live processes behind the Delete-key confirmation.
     fn confirm_selected_process_end(&mut self) {
-        let targets = self.live_selection_targets();
+        let targets = if self.tab == Tab::Processes {
+            crate::tabs::processes::termination_targets_for_selection(self)
+        } else {
+            self.live_selection_targets()
+        };
         if targets.is_empty() {
             if !self.selection.is_empty() {
                 self.selection.clear();
@@ -1728,10 +1732,22 @@ impl TaskManApp {
     /// refused. A single row keeps Task Manager's one-click behavior; several
     /// rows go through the confirmation, because that is a different question.
     pub fn end_selected(&mut self, ctx: &egui::Context) {
-        let mut targets = self.live_selection_targets();
+        let visible_selection_count = self.selection.len();
+        let mut targets = if self.tab == Tab::Processes {
+            crate::tabs::processes::termination_targets_for_selection(self)
+        } else {
+            self.live_selection_targets()
+        };
         if targets.is_empty() {
             self.selection.clear();
             self.shared.toast(i18n::tr(K::ProcessExited));
+            return;
+        }
+        // One collapsed Processes row can represent several hidden processes.
+        // It is still one visible task, so preserve the toolbar's existing
+        // one-click behavior and execute its resolved members as one batch.
+        if self.tab == Tab::Processes && visible_selection_count == 1 {
+            self.end_process_batch(ctx, targets, false);
             return;
         }
         if targets.len() == 1 {
