@@ -45,3 +45,5 @@ jobs:
           git add -- crates/tm-app/src/tabs/processes.rs llm-wiki/repo-map.md llm-wiki/current.md llm-wiki/log/recent.md .github/workflows/apply-process-grouping-improvements.yml .github/scripts/apply_process_grouping.py .github/scripts/fix_process_grouping_patch.py
           git commit -m "Improve process grouping heuristics"
           git push origin HEAD:improve/process-grouping
+
+# Retry after correcting the repo-map patch anchor.
