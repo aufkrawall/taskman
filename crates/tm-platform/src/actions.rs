@@ -91,21 +91,18 @@ pub struct ProcessModule {
     pub size_bytes: u64,
 }
 
-/// What actually happened when a module unload ran.
+/// What could be verified after one remote `FreeLibrary` request completed.
 ///
-/// FreeLibrary releases ONE loader reference per call and succeeds even when
-/// further references keep the module mapped — the normal case, since
-/// injected and statically-imported DLLs are referenced several times — so
-/// the call repeats until the module leaves or the bounded budget is spent.
-/// The two end states must be reported apart instead of both reading as
-/// "done" or both as "failed", and the honest count travels with them.
+/// TaskMan deliberately does not try to guess or drain the loader's private
+/// reference count. A confirmation performs one release request, then the
+/// target's module list is re-enumerated. `None` means `FreeLibrary` returned
+/// success but the post-action inventory could not be obtained reliably; the
+/// request must not be reported as either mapped or unmapped in that case.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ModuleUnloadOutcome {
-    /// True when references remain and the module is still mapped. Expected
-    /// for pinned or still-used modules, not an error.
-    pub still_mapped: bool,
-    /// Loader references the repeated FreeLibrary calls dropped.
-    pub released: u32,
+    /// `Some(false)` when the exact base/path disappeared, `Some(true)` when
+    /// it remained mapped, and `None` when post-action verification failed.
+    pub still_mapped: Option<bool>,
 }
 
 pub trait PlatformActions: Send + Sync {
@@ -228,9 +225,11 @@ pub trait PlatformActions: Send + Sync {
     ) -> Result<Vec<ProcessModule>> {
         Err(tm_core::TmError::Unsupported("process modules"))
     }
-    /// Ask the target process to release one exact mapped module. This is a
-    /// diagnostic escape hatch: callers must confirmation-gate it, and the
-    /// platform must revalidate process identity plus module base/path.
+    /// Ask the target process to perform one `FreeLibrary` call for one exact
+    /// mapped module. This is a diagnostic escape hatch: callers must
+    /// confirmation-gate it and provide a sampled process identity, while the
+    /// platform revalidates process identity plus module base/path at action
+    /// time and verifies the module list again afterwards.
     fn unload_process_module(
         &self,
         _pid: u32,
