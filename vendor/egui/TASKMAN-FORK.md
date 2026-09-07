@@ -157,10 +157,17 @@ current selection".
 | --- | --- | --- |
 | `crates/egui/src/data/key.rs` | `Key::ContextMenu` variant + `Key::ALL` + name mapping (accepts "ContextMenu"/"Menu"/"Apps") | The key must exist before it can be pressed. |
 | `crates/egui-winit/src/lib.rs` | `NamedKey::ContextMenu` and `KeyCode::ContextMenu` map to it in `key_from_named_key` / `key_from_key_code` | Windows reports the Menu key as both; without either mapping the press dies in the backend. |
-| `crates/egui/src/containers/popup.rs` | `Popup::show` remembers `PopupAnchor::Position(pos)` with `open_popup_at` | Upstream only remembered `PointerFixed`. Menus opened at a fixed position via keyboard collapsed on subsequent frames because `PointerFixed` read `None` from memory. |
+| `crates/egui/src/containers/popup.rs` | `Popup::show` remembers `PopupAnchor::Position(pos)` with `open_popup_at` and isolates popup-local scroll targets from surrounding `ScrollArea`s | Keyboard menus must persist across frames, and popup focus/navigation must never scroll the list behind the menu. |
 
-Droppable when upstream adds the key; the variant sits with the command keys, so a
-rebase conflict there is a prompt to check this table.
+The scroll-target isolation preserves any request that already belonged to the surrounding
+UI, builds the popup with a clean target slot, then discards any unconsumed popup-local
+request before returning to the surrounding content closure. A `ScrollArea` inside the popup
+still consumes its own requests normally. This prevents row context menus from moving the
+underlying virtualized list while keeping intentional outer scroll requests intact.
+
+Droppable when upstream adds the key; the key-specific pieces sit with the command keys, so
+a rebase conflict there is a prompt to check this table. Keep the popup scroll isolation
+until upstream provides equivalent popup/scroll-area separation.
 
 ## Rebase runbook
 
