@@ -45,6 +45,9 @@ jobs:
       - name: Apply classification patch
         run: python .github/scripts/apply_windows_process_classification.py
 
+      - name: Apply window restore patch
+        run: python .github/scripts/apply_window_restore_fix.py
+
       - name: Format
         run: cargo fmt --all
 
@@ -58,9 +61,10 @@ jobs:
         shell: pwsh
         run: |
           Remove-Item .github/scripts/apply_windows_process_classification.py
+          Remove-Item .github/scripts/apply_window_restore_fix.py
           Remove-Item .github/workflows/apply-windows-process-classification.yml
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add -A
-          git commit -m "fix: classify Windows processes by OS ownership"
+          git commit -m "fix: classify Windows processes and preserve restore placement"
           git push origin HEAD:fix/windows-process-classification
