@@ -35,9 +35,11 @@ Ten reported gaps in one pass; `log/recent.md` carries the root causes.
 - **Per-GPU-engine graphs** with a "change graph to" context menu, so NVENC is
   answerable while the 3D engine is pinned (the adapter number is the busiest
   engine, not a sum).
-- **Application grouping on Processes** tolerates foreign descendants, absorbs
-  idle same-publisher helpers, and collapses repeat runs of one image under one
-  parent. Service hosts are deliberately exempt.
+- **Application grouping on Processes** keeps foreground executables visible unless
+  ownership is positively established (same image, or helper-like + matching
+  publisher), treats common game/app launchers as launch surfaces rather than game
+  owners, and collapses repeat runs of one image under one parent — including
+  `svchost.exe` service hosts, which remain individually accessible when expanded.
 - **Native caption** painted to match the strip below it, with immersive dark
   mode and the Windows 11 backdrop request. The limits are in `known-debt.md`.
 - Window drags from the strip below the caption start on the button press, the

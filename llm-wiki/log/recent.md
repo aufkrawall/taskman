@@ -1,6 +1,23 @@
 # Recent Activity
 
-## 2026-09-07 — Bulk process suspend/resume, toolbar controls, and visual indicators
+    ## 2026-09-07 — Processes grouping favors visibility and groups service hosts
+
+    1. **Service-host clutter is collapsible.** Repeated `svchost.exe` siblings under
+       `services.exe` now use the existing repeat-run grouping path, yielding one
+       expandable aggregate row instead of dozens of indistinguishable top-level rows.
+    2. **Publisher is evidence, not ownership.** Different-image background processes
+       only fold on a same-publisher match when the child also looks like an actual
+       helper/renderer/service component. Arbitrary idle programs from the same vendor
+       remain visible.
+    3. **Foreground apps fail open to visibility.** Different visible executables no
+       longer merge when publisher metadata is missing. Common app/game launchers keep
+       their UI/helper processes but launched titles (including a same-publisher game
+       such as Fortnite under Epic Games Launcher) become independent top-level App rows.
+    4. Regression coverage pins service-host collapse/expansion, same-publisher
+       non-helper separation, launcher/game separation, missing-publisher separation,
+       and the existing Steam helper behavior.
+
+    ## 2026-09-07 — Bulk process suspend/resume, toolbar controls, and visual indicators
 
 1. **Bulk suspend/resume execution:** Previously in `details.rs`, the context menu
    suspend action only targeted `p.pid`, ignoring any active multi-selection. Added

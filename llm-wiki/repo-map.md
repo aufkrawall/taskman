@@ -158,16 +158,17 @@ platform boundary (`tm-core` ← `tm-platform` ← `tm-app` / `tm-service`):
 - `crates/tm-app/src/tabs/processes.rs` — Processes UI intentionally uses a
   presentation-only app tree for Apps (Explorer/common shells, shell-session
   brokers and browsers are launch boundaries; a windowed process folds into
-  a windowless ancestor only when plausibly the same application — same
-  image or publisher), while Background/Windows groups are flat lists where
-  a process's own application collapses into an expandable `Name (N)` row and
-  busy absorbed external tasks (≥ 1 % CPU, different image, windowless) are
-  promoted into Background. "Its own application" is two rules of deliberately
-  different strength (`joins_family`): the same image joins unconditionally,
-  the same PUBLISHER under a different image joins only while windowless, idle
-  and away from a system/launch boundary. Repeat runs of one image under one
-  parent group separately (`sibling_run_key`), because the family walk cannot
-  see siblings; `svchost.exe` is exempt. A group's aggregate is
+  a windowless ancestor only with positive ownership evidence — the same
+  image, or a helper-like image with a matching publisher; missing publisher
+  metadata never merges different visible executables. Common app/game
+  launchers keep their helper UI but launched titles become peer App rows.
+  Background/Windows groups are flat lists where a process's own application
+  collapses into an expandable `Name (N)` row and busy absorbed external tasks
+  (≥ 1 % CPU, different image, windowless) are promoted into Background.
+  `joins_family` lets the same image join unconditionally; different images
+  require same-publisher + helper-like evidence while windowless, idle and away
+  from a system/launch boundary. Repeat runs of one image under one parent group
+  separately (`sibling_run_key`), including `svchost.exe` under `services.exe`. A group's aggregate is
   `family_values` — the MEMBERS' own values, not the subtree's, because a
   foreign descendant left outside the group is rendered as its own row and must
   not be counted twice. Do not collapse this back to a literal PPID tree. Raw `ProcessEntry.ppid` remains OS truth and is exposed by the
