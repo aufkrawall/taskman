@@ -1,0 +1,523 @@
+from pathlib import Path
+from textwrap import dedent
+
+
+def block(text: str) -> str:
+    return dedent(text).lstrip("\n")
+
+
+def replace_once(text: str, old: str, new: str, label: str) -> str:
+    count = text.count(old)
+    if count != 1:
+        raise SystemExit(f"{label}: expected exactly one match, found {count}")
+    return text.replace(old, new, 1)
+
+
+processes_path = Path("crates/tm-app/src/tabs/processes.rs")
+processes = processes_path.read_text(encoding="utf-8")
+
+processes = replace_once(
+    processes,
+    block(
+        r'''
+        //! * A visible window folds into a windowless ancestor's family only when
+        //!   they are plausibly the same application (same image or same publisher);
+        //!   otherwise the windowed process is its own app row. Busy absorbed
+        //!   external helpers (no window, >= 1% CPU, different image) are promoted
+        //!   to individually visible Background rows; windowed processes are never
+        //!   demoted to Background.
+        '''
+    ),
+    block(
+        r'''
+        //! * A visible window folds into an ancestor only with positive ownership
+        //!   evidence: the same image, or a helper-like executable owned by the same
+        //!   publisher. Missing publisher metadata never merges different visible
+        //!   executables. Common application/game launchers may still own their UI
+        //!   helpers, but launched programs become independent app rows. Busy absorbed
+        //!   external helpers (no window, >= 1% CPU, different image) are promoted
+        //!   to individually visible Background rows; windowed processes are never
+        //!   demoted to Background.
+        '''
+    ),
+    "module grouping policy comment",
+)
+
+processes = replace_once(
+    processes,
+    block(
+        r'''
+        /// Whether `kid` belongs to `root`'s application rather than merely being
+        /// something it launched.
+        ///
+        /// Two ways in, and they are not equally permissive:
+        ///
+        /// * **The same image.** A browser's renderer processes, a service's workers —
+        ///   the same program, unconditionally part of the family however busy it is.
+        ///   This is Task Manager's own rule and the reason a 40 % renderer stays
+        ///   inside its browser row.
+        /// * **The same publisher**, for a helper that runs under a different image
+        ///   (`steamwebhelper` under Steam). This one is guarded, because a publisher
+        ///   match is much weaker evidence than an image match: the helper must be
+        ///   windowless and idle, so no visible program and no visible CPU load can
+        ///   disappear into a collapsed row, and neither end may be a system or
+        ///   launch boundary — `services.exe` must not swallow the service hosts and
+        ///   a shell must not swallow what a user started from it.
+        fn joins_family(root: &ProcessEntry, kid: &ProcessEntry) -> bool {
+            if kid.name.eq_ignore_ascii_case(&root.name) {
+                return true;
+            }
+            let same_publisher = match (root.company.as_deref(), kid.company.as_deref()) {
+                (Some(a), Some(b)) => !a.is_empty() && a.eq_ignore_ascii_case(b),
+                _ => false,
+            };
+            same_publisher
+                && !kid.has_window
+                && kid.cpu_pct < PROMOTE_CPU_PCT
+                && !is_system_boundary(&root.name)
+                && !is_system_boundary(&kid.name)
+                && !is_launch_boundary(&root.name)
+        }
+        '''
+    ),
+    block(
+        r'''
+        /// Different-image family membership needs semantic evidence in addition to a
+        /// publisher match. This keeps an idle program from disappearing merely because
+        /// its vendor also made the parent application.
+        fn looks_like_helper_process(name: &str) -> bool {
+            const MARKERS: &[&str] = &[
+                "helper",
+                "renderer",
+                "crash",
+                "webview",
+                "webcore",
+                "utility",
+                "worker",
+                "broker",
+                "updater",
+                "update",
+                "service",
+                "agent",
+                "overlay",
+                "daemon",
+            ];
+            let lower = name.to_ascii_lowercase();
+            MARKERS.iter().any(|marker| lower.contains(marker))
+        }
+
+        /// Whether `kid` belongs to `root`'s application rather than merely being
+        /// something it launched.
+        ///
+        /// The same image joins unconditionally. A different image only joins when it
+        /// looks like an implementation helper, shares a non-empty publisher, is
+        /// windowless and idle, and neither side is a system/launch boundary.
+        fn joins_family(root: &ProcessEntry, kid: &ProcessEntry) -> bool {
+            if kid.name.eq_ignore_ascii_case(&root.name) {
+                return true;
+            }
+            let same_publisher = match (root.company.as_deref(), kid.company.as_deref()) {
+                (Some(a), Some(b)) => !a.is_empty() && a.eq_ignore_ascii_case(b),
+                _ => false,
+            };
+            same_publisher
+                && looks_like_helper_process(&kid.name)
+                && !kid.has_window
+                && kid.cpu_pct < PROMOTE_CPU_PCT
+                && !is_system_boundary(&root.name)
+                && !is_system_boundary(&kid.name)
+                && !is_launch_boundary(&root.name)
+        }
+        '''
+    ),
+    "family membership policy",
+)
+
+processes = replace_once(
+    processes,
+    block(
+        r'''
+        /// Repeat runs of one program started by one parent — eight `node.exe` under
+        /// a task runner, a dozen helpers under one host.
+        ///
+        /// The family rule above cannot see these: they are siblings, so the only
+        /// process connecting them is a parent of a different image, and the family
+        /// walk starts from a root that is not one of them. Two or more identical
+        /// images under one parent is not a heuristic, though; it is literally the
+        /// same program run several times by the same launcher.
+        ///
+        /// Windows' own service hosts are excluded. `svchost.exe` is the row a person
+        /// opens the Windows group to find, and native Task Manager lists every one of
+        /// them; folding eighty of them behind one chevron would remove the reason
+        /// that group exists.
+        fn sibling_run_key(p: &ProcessEntry) -> Option<(u32, String)> {
+            if is_system_boundary(&p.name) || p.has_window {
+                return None;
+            }
+            p.ppid
+                .filter(|ppid| *ppid != p.pid)
+                .map(|ppid| (ppid, p.name.to_lowercase()))
+        }
+        '''
+    ),
+    block(
+        r'''
+        /// Repeat runs of one program started by one parent — eight `node.exe` under
+        /// a task runner, a dozen helpers under one host, or Windows service hosts
+        /// under `services.exe`.
+        ///
+        /// The family rule above cannot see these: they are siblings, so the only
+        /// process connecting them is a parent of a different image. Repeated
+        /// `svchost.exe` instances are the deliberate system-process exception: the
+        /// collapsed Windows section stays compact while one chevron still exposes
+        /// every concrete host for inspection/actions.
+        fn sibling_run_key(p: &ProcessEntry) -> Option<(u32, String)> {
+            let groupable_service_host = p.name.eq_ignore_ascii_case("svchost.exe");
+            if (is_system_boundary(&p.name) && !groupable_service_host) || p.has_window {
+                return None;
+            }
+            p.ppid
+                .filter(|ppid| *ppid != p.pid)
+                .map(|ppid| (ppid, p.name.to_lowercase()))
+        }
+        '''
+    ),
+    "sibling run service-host policy",
+)
+
+processes = replace_once(
+    processes,
+    block(
+        r'''
+        /// Two processes plausibly belong to the same application when they share
+        /// the executable image or the publisher (company) from version metadata.
+        /// Unknown publisher data falls back to the permissive default so missing
+        /// version info never splits an existing family.
+        fn plausibly_same_application(a: &ProcessEntry, b: &ProcessEntry) -> bool {
+            if a.name.eq_ignore_ascii_case(&b.name) {
+                return true;
+            }
+            match (&a.company, &b.company) {
+                (Some(x), Some(y)) => x.eq_ignore_ascii_case(y),
+                _ => true,
+            }
+        }
+        '''
+    ),
+    block(
+        r'''
+        /// Launch surfaces that commonly own helper/UI executables while also starting
+        /// independent programs. The suffix catches vendor launchers without teaching
+        /// the grouping code every product name; the explicit list covers clients whose
+        /// image does not say "launcher".
+        fn is_application_launcher(name: &str) -> bool {
+            const CLIENT_LAUNCHERS: &[&str] = &[
+                "steam.exe",
+                "battle.net.exe",
+                "eadesktop.exe",
+                "origin.exe",
+                "upc.exe",
+                "ubisoftconnect.exe",
+                "galaxyclient.exe",
+                "goggalaxy.exe",
+                "riotclientservices.exe",
+                "riotclientux.exe",
+                "playnite.desktopapp.exe",
+                "playnite.fullscreenapp.exe",
+                "amazon games.exe",
+                "itch.exe",
+                "heroic.exe",
+                "curseforge.exe",
+            ];
+            let lower = name.to_ascii_lowercase();
+            lower.ends_with("launcher.exe")
+                || CLIENT_LAUNCHERS
+                    .iter()
+                    .any(|launcher| name.eq_ignore_ascii_case(launcher))
+        }
+
+        fn launcher_owns_visible_helper(launcher: &str, kid: &str) -> bool {
+            if looks_like_helper_process(kid) {
+                return true;
+            }
+            let kid = kid.to_ascii_lowercase();
+            let launcher = launcher.to_ascii_lowercase();
+            (launcher.starts_with("riotclient") && kid.starts_with("riotclient"))
+                || ((launcher == "eadesktop.exe" || launcher == "origin.exe")
+                    && kid == "ealocalhostsvc.exe")
+                || ((launcher == "ubisoftconnect.exe" || launcher == "upc.exe")
+                    && kid == "ubisoftwebcore.exe")
+        }
+
+        /// A visible process only folds into an ancestor when ownership evidence is
+        /// positive. Same-image processes are one application. Different images need
+        /// either a launcher-owned helper identity or a helper-like name plus the same
+        /// non-empty publisher. Missing metadata is not evidence and therefore keeps
+        /// the visible executable as its own app row.
+        fn plausibly_same_application(a: &ProcessEntry, b: &ProcessEntry) -> bool {
+            if a.name.eq_ignore_ascii_case(&b.name) {
+                return true;
+            }
+            if is_application_launcher(&a.name) {
+                return launcher_owns_visible_helper(&a.name, &b.name);
+            }
+            if !looks_like_helper_process(&b.name) {
+                return false;
+            }
+            match (a.company.as_deref(), b.company.as_deref()) {
+                (Some(x), Some(y)) => !x.is_empty() && x.eq_ignore_ascii_case(y),
+                _ => false,
+            }
+        }
+        '''
+    ),
+    "visible app ownership policy",
+)
+
+processes = replace_once(
+    processes,
+    block(
+        r'''
+            /// `svchost.exe` is the row a person opens the Windows group to find.
+            /// Native Task Manager lists every one of them, so folding them behind a
+            /// chevron would remove the reason that group exists.
+            #[test]
+            fn windows_service_hosts_are_never_folded_into_one_row() {
+                let services = proc(1, Some(90), "services.exe", ProcCategory::System);
+                let hosts: Vec<ProcessEntry> = (2..=5)
+                    .map(|pid| {
+                        let mut host = proc(pid, Some(1), "svchost.exe", ProcCategory::System);
+                        host.cpu_pct = 0.1;
+                        host.company = Some("Microsoft Corporation".into());
+                        host
+                    })
+                    .collect();
+                let mut all = vec![services];
+                all.extend(hosts);
+                // Same publisher on the parent too: the family rule must still refuse.
+                all[0].company = Some("Microsoft Corporation".into());
+
+                let rows = build_display_rows(&snap_of(all), "", 0, true, &HashSet::new(), &[false; 3]);
+                let sys = rows_in_group(&rows, 2);
+                assert_eq!(sys.len(), 5, "every host keeps its own row: {sys:?}");
+                assert!(sys.iter().all(|r| !r.children));
+            }
+        '''
+    ),
+    block(
+        r'''
+            #[test]
+            fn windows_service_hosts_fold_into_one_expandable_sibling_run() {
+                let services = proc(1, Some(90), "services.exe", ProcCategory::System);
+                let hosts: Vec<ProcessEntry> = (2..=5)
+                    .map(|pid| {
+                        let mut host = proc(pid, Some(1), "svchost.exe", ProcCategory::System);
+                        host.cpu_pct = 0.1;
+                        host.company = Some("Microsoft Corporation".into());
+                        host
+                    })
+                    .collect();
+                let mut all = vec![services];
+                all.extend(hosts);
+                all[0].company = Some("Microsoft Corporation".into());
+                let snap = snap_of(all);
+
+                let rows = build_display_rows(&snap, "", 0, true, &HashSet::new(), &[false; 3]);
+                let sys = rows_in_group(&rows, 2);
+                assert_eq!(sys.len(), 2, "services.exe plus one service-host group: {sys:?}");
+                let hosts = sys
+                    .iter()
+                    .find(|row| row.pid == 2)
+                    .expect("lowest-pid svchost heads the sibling run");
+                assert_eq!(hosts.name, "svchost.exe [4]");
+                assert!(hosts.children);
+                assert!((hosts.values[0] - 0.4).abs() < 1e-5);
+
+                let expanded = HashSet::from([2u32]);
+                let rows = build_display_rows(&snap, "", 0, true, &expanded, &[false; 3]);
+                let sys = rows_in_group(&rows, 2);
+                assert_eq!(sys.len(), 5, "expanded group exposes every host");
+                assert_eq!(sys.iter().filter(|row| row.depth == 1).count(), 3);
+            }
+        '''
+    ),
+    "svchost grouping regression",
+)
+
+processes = replace_once(
+    processes,
+    block(
+        r'''
+            /// A helper of the same publisher running under a different image
+            /// (`steamwebhelper` under Steam) folds in — but only while it is idle
+        '''
+    ),
+    block(
+        r'''
+            #[test]
+            fn same_publisher_independent_program_does_not_fold_as_a_helper() {
+                let mut parent = proc(1, Some(99), "vendor.exe", ProcCategory::Background);
+                parent.cpu_pct = 0.1;
+                parent.company = Some("Example Vendor".into());
+                let mut child = proc(2, Some(1), "game.exe", ProcCategory::Background);
+                child.cpu_pct = 0.1;
+                child.company = Some("Example Vendor".into());
+
+                let rows = build_display_rows(
+                    &snap_of(vec![parent, child]),
+                    "",
+                    0,
+                    true,
+                    &HashSet::new(),
+                    &[false; 3],
+                );
+                let bg = rows_in_group(&rows, 1);
+                assert_eq!(bg.len(), 2, "publisher alone is not ownership evidence: {bg:?}");
+                assert!(bg.iter().all(|row| !row.children));
+            }
+
+            #[test]
+            fn game_launcher_does_not_absorb_a_same_publisher_game() {
+                let mut launcher = proc(1, None, "EpicGamesLauncher.exe", ProcCategory::App);
+                launcher.has_window = true;
+                launcher.company = Some("Epic Games, Inc.".into());
+                let mut game = proc(
+                    2,
+                    Some(1),
+                    "FortniteClient-Win64-Shipping.exe",
+                    ProcCategory::App,
+                );
+                game.has_window = true;
+                game.company = Some("Epic Games, Inc.".into());
+
+                let rows = build_display_rows(
+                    &snap_of(vec![launcher, game]),
+                    "",
+                    0,
+                    true,
+                    &HashSet::new(),
+                    &[false; 3],
+                );
+                let apps = rows_in_group(&rows, 0);
+                assert_eq!(
+                    apps.iter().map(|row| (row.pid, row.depth)).collect::<Vec<_>>(),
+                    vec![(1, 0), (2, 0)],
+                    "the launched game must be a peer app row: {apps:?}"
+                );
+                assert!(apps.iter().all(|row| !row.name.contains("[2]")));
+            }
+
+            #[test]
+            fn missing_publisher_never_merges_different_visible_executables() {
+                let parent = proc(1, Some(99), "wrapper.exe", ProcCategory::Background);
+                let mut app = proc(2, Some(1), "real-app.exe", ProcCategory::App);
+                app.has_window = true;
+
+                let rows = build_display_rows(
+                    &snap_of(vec![parent, app]),
+                    "",
+                    0,
+                    true,
+                    &HashSet::new(),
+                    &[false; 3],
+                );
+                let apps = rows_in_group(&rows, 0);
+                assert_eq!(apps.iter().map(|row| row.pid).collect::<Vec<_>>(), vec![2]);
+                let bg = rows_in_group(&rows, 1);
+                assert_eq!(bg.iter().map(|row| row.pid).collect::<Vec<_>>(), vec![1]);
+            }
+
+            /// A helper of the same publisher running under a different image
+            /// (`steamwebhelper` under Steam) folds in — but only while it is idle
+        '''
+    ),
+    "grouping regression tests",
+)
+processes_path.write_text(processes, encoding="utf-8")
+
+repo_map_path = Path("llm-wiki/repo-map.md")
+repo_map = repo_map_path.read_text(encoding="utf-8")
+repo_map = replace_once(
+    repo_map,
+    block(
+        r'''
+          windowless ancestor only when plausibly the same application — same
+          image or publisher), while Background/Windows groups are flat lists where
+          a process's own application collapses into an expandable `Name (N)` row and
+          busy absorbed external tasks (≥ 1 % CPU, different image, windowless) are
+          promoted into Background. "Its own application" is two rules of deliberately
+          different strength (`joins_family`): the same image joins unconditionally,
+          the same PUBLISHER under a different image joins only while windowless, idle
+          and away from a system/launch boundary. Repeat runs of one image under one
+          parent group separately (`sibling_run_key`), because the family walk cannot
+          see siblings; `svchost.exe` is exempt.
+        '''
+    ),
+    block(
+        r'''
+          windowless ancestor only with positive ownership evidence — the same
+          image, or a helper-like image with a matching publisher; missing publisher
+          metadata never merges different visible executables. Common app/game
+          launchers keep their helper UI but launched titles become peer App rows.
+          Background/Windows groups are flat lists where a process's own application
+          collapses into an expandable `Name (N)` row and busy absorbed external tasks
+          (≥ 1 % CPU, different image, windowless) are promoted into Background.
+          `joins_family` lets the same image join unconditionally; different images
+          require same-publisher + helper-like evidence while windowless, idle and away
+          from a system/launch boundary. Repeat runs of one image under one parent group
+          separately (`sibling_run_key`), including `svchost.exe` under `services.exe`.
+        '''
+    ),
+    "repo map grouping policy",
+)
+repo_map_path.write_text(repo_map, encoding="utf-8")
+
+current_path = Path("llm-wiki/current.md")
+current = current_path.read_text(encoding="utf-8")
+current = replace_once(
+    current,
+    block(
+        r'''
+        - **Application grouping on Processes** tolerates foreign descendants, absorbs
+          idle same-publisher helpers, and collapses repeat runs of one image under one
+          parent. Service hosts are deliberately exempt.
+        '''
+    ),
+    block(
+        r'''
+        - **Application grouping on Processes** keeps foreground executables visible unless
+          ownership is positively established (same image, or helper-like + matching
+          publisher), treats common game/app launchers as launch surfaces rather than game
+          owners, and collapses repeat runs of one image under one parent — including
+          `svchost.exe` service hosts, which remain individually accessible when expanded.
+        '''
+    ),
+    "current grouping summary",
+)
+current_path.write_text(current, encoding="utf-8")
+
+recent_path = Path("llm-wiki/log/recent.md")
+recent = recent_path.read_text(encoding="utf-8")
+entry = block(
+    r'''
+    ## 2026-09-07 — Processes grouping favors visibility and groups service hosts
+
+    1. **Service-host clutter is collapsible.** Repeated `svchost.exe` siblings under
+       `services.exe` now use the existing repeat-run grouping path, yielding one
+       expandable aggregate row instead of dozens of indistinguishable top-level rows.
+    2. **Publisher is evidence, not ownership.** Different-image background processes
+       only fold on a same-publisher match when the child also looks like an actual
+       helper/renderer/service component. Arbitrary idle programs from the same vendor
+       remain visible.
+    3. **Foreground apps fail open to visibility.** Different visible executables no
+       longer merge when publisher metadata is missing. Common app/game launchers keep
+       their UI/helper processes but launched titles (including a same-publisher game
+       such as Fortnite under Epic Games Launcher) become independent top-level App rows.
+    4. Regression coverage pins service-host collapse/expansion, same-publisher
+       non-helper separation, launcher/game separation, missing-publisher separation,
+       and the existing Steam helper behavior.
+
+    '''
+)
+recent = replace_once(recent, "# Recent Activity\n\n", "# Recent Activity\n\n" + entry, "recent log heading")
+recent_path.write_text(recent, encoding="utf-8")
