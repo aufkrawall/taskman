@@ -209,11 +209,10 @@ fn begin_unload(app: &TaskManApp, state: &mut State, module: ProcessModule, ctx:
                         // drained the target's private loader reference count.
                         i18n::trf(K::ModuleStillMappedMsg, &["1", &module_name])
                     }
-                    None => refresh_error
-                        .as_deref()
-                        .map_or_else(|| i18n::tr(K::ActionFailed), |error| {
-                            i18n::trf(K::ErrMsg, &[error])
-                        }),
+                    None => refresh_error.as_deref().map_or_else(
+                        || i18n::tr(K::ActionFailed).to_string(),
+                        |error| i18n::trf(K::ErrMsg, &[error]),
+                    ),
                 },
                 Err(error) => i18n::trf(K::ErrMsg, &[&error.to_string()]),
             };
