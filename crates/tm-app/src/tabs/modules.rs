@@ -9,7 +9,9 @@ use std::cmp::Ordering;
 use std::sync::{Arc, Mutex};
 use tm_core::format;
 use tm_core::i18n::{self, K};
-use tm_platform::actions::{PlatformActions, ProcessModule};
+use tm_platform::actions::{
+    MODULE_UNLOAD_SINGLE_RELEASE_MARKER, PlatformActions, ProcessModule,
+};
 
 use crate::app::{InFlight, ProcessIdentity, TaskManApp};
 use crate::search;
@@ -161,11 +163,19 @@ fn begin_unload(app: &TaskManApp, state: &mut State, module: ProcessModule, ctx:
     let spawned = std::thread::Builder::new()
         .name("tm-module-unload".into())
         .spawn(move || {
+            // Mark the request so an older v2 service cannot execute its
+            // former multi-release implementation: NUL cannot be part of a
+            // real Windows module path, so old exact path validation rejects
+            // this safely before acting. Current platform code strips it.
+            let request_path = format!(
+                "{}{}",
+                module.path, MODULE_UNLOAD_SINGLE_RELEASE_MARKER
+            );
             let result = actions.unload_process_module(
                 identity.pid,
                 identity.start_epoch_s,
                 module.base_address,
-                &module.path,
+                &request_path,
             );
 
             // Always re-enumerate after an attempt, including errors and
