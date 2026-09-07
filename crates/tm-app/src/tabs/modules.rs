@@ -110,7 +110,9 @@ pub fn open(app: &mut TaskManApp, process: &tm_core::model::ProcessEntry, ctx: &
 }
 
 fn begin_fetch(state: &mut State, actions: Arc<dyn PlatformActions>, ctx: &egui::Context) {
-    if !state.fetch.begin() {
+    // The load Arc is shared by both workers. Never let a manual refresh race
+    // an unload's mandatory post-action refresh and overwrite newer state.
+    if state.unload.busy() || !state.fetch.begin() {
         return;
     }
     *tm_core::sync::lock(&state.load) = LoadState::Loading;
@@ -143,7 +145,9 @@ fn begin_unload(app: &TaskManApp, state: &mut State, module: ProcessModule, ctx:
         app.shared.toast(i18n::tr(K::ProcessExited));
         return;
     }
-    if !state.unload.begin() {
+    // Serialize module inventory and mutation. Besides avoiding stale UI, this
+    // prevents a refresh from racing the action-time base/path revalidation.
+    if state.fetch.busy() || !state.unload.begin() {
         app.shared.toast(i18n::tr(K::ModuleBusy));
         return;
     }
@@ -163,31 +167,44 @@ fn begin_unload(app: &TaskManApp, state: &mut State, module: ProcessModule, ctx:
                 module.base_address,
                 &module.path,
             );
-            let message = match result {
-                // The module is gone: refresh the list (a failed re-list
-                // keeps the old one rather than throwing the dialog into
-                // its error state — an unelevated GUI cannot list an
-                // elevated target's modules at all).
-                Ok(outcome) if !outcome.still_mapped => {
-                    match actions.list_process_modules(identity.pid, identity.start_epoch_s) {
-                        Ok(modules) => {
-                            *tm_core::sync::lock(&load) = LoadState::Ready(modules);
-                        }
-                        Err(error) => tracing::warn!(
-                            pid = identity.pid,
-                            %error,
-                            "module re-list after unload failed; keeping the previous list"
-                        ),
+
+            // Always re-enumerate after an attempt, including errors and
+            // timeouts. A remote thread may have completed after a timeout,
+            // DllMain may have changed other modules, and a still-mapped DLL
+            // can have been reloaded. Never leave the pre-action inventory on
+            // screen and present it as current.
+            let (observed_still_mapped, refresh_error) =
+                match actions.list_process_modules(identity.pid, identity.start_epoch_s) {
+                    Ok(modules) => {
+                        let still_mapped = modules.iter().any(|candidate| {
+                            candidate.base_address == module.base_address
+                                && candidate.path.eq_ignore_ascii_case(&module.path)
+                        });
+                        *tm_core::sync::lock(&load) = LoadState::Ready(modules);
+                        (Some(still_mapped), None)
                     }
-                    i18n::trf(K::ModuleUnloadedMsg, &[&module_name])
-                }
-                // References were dropped, but the target still holds more —
-                // expected for implicitly-linked or re-loaded modules, not a
-                // failure. The list is already accurate as it stands.
-                Ok(outcome) => {
-                    let released = outcome.released.to_string();
-                    i18n::trf(K::ModuleStillMappedMsg, &[&released, &module_name])
-                }
+                    Err(error) => {
+                        let detail = error.to_string();
+                        *tm_core::sync::lock(&load) = LoadState::Error(detail.clone());
+                        (None, Some(detail))
+                    }
+                };
+
+            let message = match result {
+                Ok(outcome) => match observed_still_mapped.or(outcome.still_mapped) {
+                    Some(false) => i18n::trf(K::ModuleUnloadedMsg, &[&module_name]),
+                    Some(true) => {
+                        // One confirmation is exactly one successful
+                        // FreeLibrary request; do not imply TaskMan knows or
+                        // drained the target's private loader reference count.
+                        i18n::trf(K::ModuleStillMappedMsg, &["1", &module_name])
+                    }
+                    None => refresh_error
+                        .as_deref()
+                        .map_or_else(|| i18n::tr(K::ActionFailed), |error| {
+                            i18n::trf(K::ErrMsg, &[error])
+                        }),
+                },
                 Err(error) => i18n::trf(K::ErrMsg, &[&error.to_string()]),
             };
             crate::app::toast_from(&toasts, message);
@@ -291,7 +308,7 @@ pub fn dialog(app: &mut TaskManApp, ctx: &egui::Context, pal: &theme::Palette) {
                 );
                 if ui
                     .add_enabled(
-                        !state.fetch.busy(),
+                        !state.fetch.busy() && !state.unload.busy(),
                         egui::Button::new(i18n::tr(K::RefreshNow)),
                     )
                     .clicked()
@@ -300,11 +317,14 @@ pub fn dialog(app: &mut TaskManApp, ctx: &egui::Context, pal: &theme::Palette) {
                 }
                 // Which module to unload is the user's call; every selected
                 // module can be attempted. Only the capability (module
-                // unload unavailable on this platform) and a running action
-                // grey the button out.
+                // unload unavailable on this platform) and a running module
+                // inventory/action grey the button out.
                 let unload = ui
                     .add_enabled(
-                        can_unload && selected_module.is_some() && !state.unload.busy(),
+                        can_unload
+                            && selected_module.is_some()
+                            && !state.unload.busy()
+                            && !state.fetch.busy(),
                         egui::Button::new(i18n::tr(K::UnloadModule)),
                     )
                     .on_disabled_hover_text(if selected_module.is_none() {
@@ -459,7 +479,9 @@ pub fn dialog(app: &mut TaskManApp, ctx: &egui::Context, pal: &theme::Palette) {
                                     let unload = menu::item_enabled(
                                         ui,
                                         i18n::tr(K::UnloadModule),
-                                        can_unload && !state.unload.busy(),
+                                        can_unload
+                                            && !state.unload.busy()
+                                            && !state.fetch.busy(),
                                     )
                                     .on_disabled_hover_text(i18n::tr(K::ModuleBusy));
                                     if unload.clicked() {
