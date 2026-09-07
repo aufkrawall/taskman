@@ -1,6 +1,8 @@
 use std::cell::Cell;
 
-use egui::{Align, CentralPanel, Context, Frame, Popup, RawInput, Rect, ScrollArea, Sense, pos2, vec2};
+use egui::{
+    Align, CentralPanel, Context, Frame, Popup, RawInput, Rect, ScrollArea, Sense, pos2, vec2,
+};
 
 /// A popup is painted on a separate layer. Scroll requests from that layer must
 /// not be consumed by a ScrollArea whose content closure happens to be building
@@ -30,7 +32,7 @@ fn popup_scroll_target_does_not_escape_to_parent_scroll_area() {
                             let (_, owner) =
                                 ui.allocate_exact_size(vec2(100.0, 20.0), Sense::hover());
 
-                            Popup::from_response(&owner)
+                            let _ = Popup::from_response(&owner)
                                 .open(true)
                                 .at_position(pos2(20.0, 180.0))
                                 .show(|ui| {
