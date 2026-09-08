@@ -1,0 +1,34 @@
+name: Apply topmost and native Task Manager improvements
+
+on:
+  push:
+    branches:
+      - improve/topmost-and-native-taskmgr
+    paths:
+      - .github/workflows/apply-topmost-native-taskmgr.yml
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: improve/topmost-and-native-taskmgr
+      - name: Apply source and documentation changes
+        run: python3 .github/scripts/apply_topmost_native_taskmgr.py
+      - name: Remove bootstrap files
+        shell: bash
+        run: |
+          rm .github/scripts/apply_topmost_native_taskmgr.py
+          rm .github/workflows/apply-topmost-native-taskmgr.yml
+      - name: Commit implementation
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add --all
+          git commit -m "Improve topmost behavior and native Task Manager access"
+          git push origin HEAD:improve/topmost-and-native-taskmgr
