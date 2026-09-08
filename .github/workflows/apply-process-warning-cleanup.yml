@@ -1,0 +1,35 @@
+name: Apply process warning cleanup
+
+on:
+  push:
+    branches: [fix/processes-dead-code-warnings]
+    paths:
+      - .github/workflows/apply-process-warning-cleanup.yml
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: fix/processes-dead-code-warnings
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Remove obsolete process grouping state
+        run: python .github/scripts/apply_process_warning_cleanup.py
+      - name: Format
+        run: cargo fmt --all
+      - name: Commit cleanup
+        shell: bash
+        run: |
+          rm .github/workflows/apply-process-warning-cleanup.yml
+          rm .github/scripts/apply_process_warning_cleanup.py
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add crates/tm-app/src/tabs/processes.rs .github/workflows/apply-process-warning-cleanup.yml .github/scripts/apply_process_warning_cleanup.py
+          git commit -m 'Fix Processes dead-code warnings'
+          git push origin HEAD:fix/processes-dead-code-warnings
