@@ -1075,8 +1075,30 @@ fn context_menu(app: &mut TaskManApp, ui: &mut egui::Ui, row: &RowData) {
         }
         ui.close();
     }
-    if menu::item(ui, i18n::tr(K::Properties)).clicked() {
-        app.proc_props = Some(row.pid);
+    menu::separator(ui);
+    #[cfg(target_os = "windows")]
+    {
+        let file_properties =
+            menu::item_enabled(ui, i18n::tr(K::FileProperties), row.icon_path.is_some())
+                .on_disabled_hover_text(i18n::tr(K::NoFileForProcess));
+        if file_properties.clicked() {
+            if let Some(path) = row.icon_path.as_deref()
+                && let Err(error) = app.actions.open_properties(path)
+            {
+                app.shared
+                    .toast(i18n::trf(K::ErrMsg, &[&error.to_string()]));
+            }
+            ui.close();
+        }
+    }
+    if menu::item(ui, i18n::tr(K::ProcessProperties)).clicked() {
+        crate::tabs::details::open_process_properties(
+            app,
+            crate::app::ProcessIdentity {
+                pid: row.pid,
+                start_epoch_s: row.start_epoch_s,
+            },
+        );
         ui.close();
     }
 }

@@ -298,8 +298,8 @@ pub struct TaskManApp {
     pub startup_props: Option<tm_core::model::StartupItem>,
     /// Selection by stable item id (list indexes shift on refresh).
     pub selected_startup_id: Option<String>,
-    /// Process-properties dialog target pid.
-    pub proc_props: Option<u32>,
+    /// Process-properties dialog bound to an exact process identity.
+    pub proc_props: Option<crate::tabs::details::ProcessPropertiesDialog>,
     /// On-demand System Informer-style loaded-module inspector.
     pub module_dialog: Option<crate::tabs::modules::State>,
     /// Cross-tab jump: services tab should select this service name.

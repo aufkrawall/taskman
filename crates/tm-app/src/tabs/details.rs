@@ -32,6 +32,25 @@ pub struct AffinityDialog {
     pub rule_key: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProcessPropertiesTab {
+    General,
+    Statistics,
+}
+
+#[derive(Debug, Clone)]
+pub struct ProcessPropertiesDialog {
+    pub identity: crate::app::ProcessIdentity,
+    tab: ProcessPropertiesTab,
+}
+
+pub fn open_process_properties(app: &mut TaskManApp, identity: crate::app::ProcessIdentity) {
+    app.proc_props = Some(ProcessPropertiesDialog {
+        identity,
+        tab: ProcessPropertiesTab::General,
+    });
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum ColumnId {
     Name,
@@ -2061,14 +2080,14 @@ pub fn context_menu(app: &mut TaskManApp, ui: &mut egui::Ui, p: &ProcessEntry, h
         }
     }
 
-    if let Some(path) = p
+    let image_path = p
         .exe_path
         .as_ref()
-        .map(|x| x.to_string_lossy().into_owned())
-    {
+        .map(|path| path.to_string_lossy().into_owned());
+    if let Some(path) = image_path.as_deref() {
         if menu::item(ui, i18n::tr(K::OpenFileLocation)).clicked() {
             let actions = app.actions.clone();
-            let path2 = path.clone();
+            let path2 = path.to_string();
             app.run_action(&ctx, String::new, move || {
                 actions.open_file_location(&path2)
             });
@@ -2078,13 +2097,33 @@ pub fn context_menu(app: &mut TaskManApp, ui: &mut egui::Ui, p: &ProcessEntry, h
             create_dump(app, &ctx, p);
             ui.close();
         }
-        if menu::item(ui, i18n::tr(K::Properties)).clicked() {
-            if let Err(e) = app.actions.open_properties(&path) {
-                tracing::debug!(error = %e, "shell properties failed; using built-in dialog");
-                app.proc_props = Some(p.pid);
+    }
+
+    menu::separator(ui);
+    #[cfg(target_os = "windows")]
+    {
+        let file_properties =
+            menu::item_enabled(ui, i18n::tr(K::FileProperties), image_path.is_some())
+                .on_disabled_hover_text(i18n::tr(K::NoFileForProcess));
+        if file_properties.clicked() {
+            if let Some(path) = image_path.as_deref()
+                && let Err(error) = app.actions.open_properties(path)
+            {
+                app.shared
+                    .toast(i18n::trf(K::ErrMsg, &[&error.to_string()]));
             }
             ui.close();
         }
+    }
+    if menu::item(ui, i18n::tr(K::ProcessProperties)).clicked() {
+        open_process_properties(
+            app,
+            crate::app::ProcessIdentity {
+                pid: p.pid,
+                start_epoch_s: p.start_epoch_s,
+            },
+        );
+        ui.close();
     }
 }
 
@@ -2248,85 +2287,443 @@ pub(crate) fn create_dump(app: &mut TaskManApp, ctx: &egui::Context, p: &Process
     }
 }
 
+fn process_properties_target<'a>(
+    snapshot: &'a tm_core::model::Snapshot,
+    identity: &crate::app::ProcessIdentity,
+) -> Option<&'a ProcessEntry> {
+    let process = snapshot.process(identity.pid)?;
+    (!process.synthetic
+        && (process.start_epoch_s.is_none() || process.start_epoch_s == identity.start_epoch_s))
+        .then_some(process)
+}
+
+fn process_properties_started(start_epoch_s: Option<i64>) -> String {
+    let Some(epoch_s) = start_epoch_s else {
+        return "—".into();
+    };
+    let seconds = epoch_s.rem_euclid(86_400);
+    format!(
+        "{} {:02}:{:02}:{:02} UTC",
+        format::format_date(epoch_s),
+        seconds / 3600,
+        (seconds % 3600) / 60,
+        seconds % 60
+    )
+}
+
+fn property_row(ui: &mut egui::Ui, label: &str, value: impl Into<String>, monospace: bool) {
+    ui.weak(format!("{label}:"));
+    let value = value.into();
+    let text = if monospace {
+        egui::RichText::new(value).size(12.5).monospace()
+    } else {
+        egui::RichText::new(value).size(13.0)
+    };
+    ui.add(egui::Label::new(text).wrap());
+    ui.end_row();
+}
+
+fn option_bytes(value: Option<u64>) -> String {
+    value
+        .map(format::format_bytes_loc)
+        .unwrap_or_else(|| "—".into())
+}
+
+fn option_rate(value: Option<f64>) -> String {
+    value.map(format::format_rate).unwrap_or_else(|| "—".into())
+}
+
+fn option_count(value: Option<u32>) -> String {
+    value.map_or_else(
+        || "—".into(),
+        |value| format::format_thousands(value.into()),
+    )
+}
+
+fn process_properties_general(
+    ui: &mut egui::Ui,
+    snapshot: &tm_core::model::Snapshot,
+    process: &ProcessEntry,
+) {
+    ui.heading(process.shown_name());
+    if let Some(description) = process
+        .description
+        .as_deref()
+        .filter(|value| !value.trim().is_empty() && *value != process.shown_name())
+    {
+        ui.label(egui::RichText::new(description).size(13.0));
+    }
+    if let Some(company) = process
+        .company
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    {
+        ui.weak(company);
+    }
+    ui.add_space(10.0);
+
+    let path = process
+        .exe_path
+        .as_ref()
+        .map(|path| path.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "—".into());
+    let parent = process
+        .ppid
+        .map(|pid| {
+            snapshot
+                .process(pid)
+                .map(|parent| format!("{} ({pid})", parent.shown_name()))
+                .unwrap_or_else(|| pid.to_string())
+        })
+        .unwrap_or_else(|| "—".into());
+    let status = match process.status {
+        ProcStatus::Running => i18n::tr(K::StRunning),
+        ProcStatus::Suspended => i18n::tr(K::StSuspended),
+        ProcStatus::NotResponding => i18n::tr(K::StNotResponding),
+    };
+    let platform = match process.wow64 {
+        Some(true) => i18n::tr(K::Bit32),
+        Some(false) => i18n::tr(K::Bit64),
+        None => "—",
+    };
+    let elevated = match process.elevated {
+        Some(true) => i18n::tr(K::Yes),
+        Some(false) => i18n::tr(K::No),
+        None => i18n::tr(K::UacUnknown),
+    };
+    let uac = match process.uac_virtualization {
+        Some(UacVirtualization::Enabled) => i18n::tr(K::EnabledWord),
+        Some(UacVirtualization::Disabled) => i18n::tr(K::DisabledWord),
+        Some(UacVirtualization::NotAllowed) => i18n::tr(K::NotAllowed),
+        _ => i18n::tr(K::UacUnknown),
+    };
+    let efficiency = match process.power_throttled {
+        Some(true) => i18n::tr(K::Yes),
+        Some(false) => i18n::tr(K::No),
+        None => i18n::tr(K::UacUnknown),
+    };
+
+    egui::Grid::new(("process-properties-general", process.pid))
+        .num_columns(2)
+        .min_col_width(155.0)
+        .spacing([18.0, 7.0])
+        .striped(true)
+        .show(ui, |ui| {
+            property_row(ui, i18n::tr(K::ColPath), path, true);
+            property_row(
+                ui,
+                i18n::tr(K::PropCommandLine),
+                process.command_line.clone().unwrap_or_else(|| "—".into()),
+                true,
+            );
+            property_row(ui, i18n::tr(K::ColPid), process.pid.to_string(), false);
+            property_row(ui, i18n::tr(K::PropParentProcess), parent, false);
+            property_row(
+                ui,
+                i18n::tr(K::ColUsername),
+                process.user.clone().unwrap_or_else(|| "—".into()),
+                false,
+            );
+            property_row(
+                ui,
+                i18n::tr(K::ColSessionId),
+                process
+                    .session_id
+                    .map_or_else(|| "—".into(), |value| value.to_string()),
+                false,
+            );
+            property_row(
+                ui,
+                i18n::tr(K::PropStarted),
+                process_properties_started(process.start_epoch_s),
+                false,
+            );
+            property_row(ui, i18n::tr(K::ColStatus), status, false);
+            property_row(ui, i18n::tr(K::ColPlatform), platform, false);
+            property_row(ui, i18n::tr(K::ColElevated), elevated, false);
+            property_row(ui, i18n::tr(K::ColUac), uac, false);
+            property_row(
+                ui,
+                i18n::tr(K::Priority),
+                priority_label(process.priority),
+                false,
+            );
+            property_row(ui, i18n::tr(K::EfficiencyMode), efficiency, false);
+            property_row(
+                ui,
+                i18n::tr(K::PropService),
+                process.service_name.clone().unwrap_or_else(|| "—".into()),
+                false,
+            );
+        });
+}
+
+fn process_properties_statistics(ui: &mut egui::Ui, process: &ProcessEntry) {
+    egui::Grid::new(("process-properties-statistics", process.pid))
+        .num_columns(2)
+        .min_col_width(190.0)
+        .spacing([18.0, 7.0])
+        .striped(true)
+        .show(ui, |ui| {
+            property_row(
+                ui,
+                i18n::tr(K::ColCpu),
+                format::format_pct_cell(process.cpu_pct),
+                false,
+            );
+            property_row(
+                ui,
+                i18n::tr(K::ColCpuTime),
+                process
+                    .cpu_time_s
+                    .map(format::format_cpu_time)
+                    .unwrap_or_else(|| "—".into()),
+                false,
+            );
+            property_row(
+                ui,
+                i18n::tr(K::PropWorkingSet),
+                format::format_bytes_loc(process.mem_bytes),
+                false,
+            );
+            property_row(
+                ui,
+                i18n::tr(K::PropPeakWorkingSet),
+                option_bytes(process.peak_mem_bytes),
+                false,
+            );
+            property_row(
+                ui,
+                i18n::tr(K::PropCommitSize),
+                option_bytes(process.commit_bytes),
+                false,
+            );
+            property_row(
+                ui,
+                i18n::tr(K::StatThreads),
+                option_count(process.threads),
+                false,
+            );
+            property_row(
+                ui,
+                i18n::tr(K::StatHandles),
+                option_count(process.handles),
+                false,
+            );
+            property_row(
+                ui,
+                i18n::tr(K::ColPageFaults),
+                option_count(process.page_faults_per_s),
+                false,
+            );
+            property_row(
+                ui,
+                i18n::tr(K::PropDiskRead),
+                format::format_rate(process.disk_read_bps),
+                false,
+            );
+            property_row(
+                ui,
+                i18n::tr(K::PropDiskWrite),
+                format::format_rate(process.disk_write_bps),
+                false,
+            );
+            property_row(
+                ui,
+                i18n::tr(K::PropIoReadTotal),
+                format::format_bytes_loc(process.disk_read_total),
+                false,
+            );
+            property_row(
+                ui,
+                i18n::tr(K::PropIoWriteTotal),
+                format::format_bytes_loc(process.disk_write_total),
+                false,
+            );
+            property_row(
+                ui,
+                i18n::tr(K::PropNetworkReceive),
+                option_rate(process.net_recv_bps),
+                false,
+            );
+            property_row(
+                ui,
+                i18n::tr(K::PropNetworkSend),
+                option_rate(process.net_sent_bps),
+                false,
+            );
+            property_row(
+                ui,
+                i18n::tr(K::PropNetworkReceivedTotal),
+                option_bytes(process.net_recv_total),
+                false,
+            );
+            property_row(
+                ui,
+                i18n::tr(K::PropNetworkSentTotal),
+                option_bytes(process.net_sent_total),
+                false,
+            );
+            property_row(
+                ui,
+                i18n::tr(K::ColGpu),
+                process
+                    .gpu_util_pct
+                    .map(format::format_pct_cell)
+                    .unwrap_or_else(|| "—".into()),
+                false,
+            );
+            property_row(
+                ui,
+                i18n::tr(K::PropGpuDedicated),
+                option_bytes(process.gpu_dedicated_bytes),
+                false,
+            );
+            property_row(
+                ui,
+                i18n::tr(K::PropGpuShared),
+                option_bytes(process.gpu_shared_bytes),
+                false,
+            );
+            property_row(
+                ui,
+                i18n::tr(K::ColGpuEngine),
+                process
+                    .gpu_engine_label
+                    .clone()
+                    .unwrap_or_else(|| "—".into()),
+                false,
+            );
+        });
+}
+
 pub fn process_properties_dialog(app: &mut TaskManApp, ctx: &egui::Context) {
+    let Some(mut dialog) = app.proc_props.take() else {
+        return;
+    };
+    let snapshot = app.latest_snapshot();
+    let process = snapshot
+        .as_deref()
+        .and_then(|snapshot| process_properties_target(snapshot, &dialog.identity))
+        .cloned();
+    let title = process.as_ref().map_or_else(
+        || {
+            format!(
+                "PID {} — {}",
+                dialog.identity.pid,
+                i18n::tr(K::ProcessProperties)
+            )
+        },
+        |process| {
+            format!(
+                "{} ({}) — {}",
+                process.shown_name(),
+                process.pid,
+                i18n::tr(K::ProcessProperties)
+            )
+        },
+    );
     let mut open = true;
-    egui::Window::new(i18n::tr(K::Properties))
+    let mut close_clicked = false;
+
+    egui::Window::new(title)
         .open(&mut open)
         .collapsible(false)
-        .resizable(false)
+        .resizable(true)
+        .default_size([720.0, 520.0])
+        .min_size([620.0, 400.0])
         .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
         .show(ctx, |ui| {
-            let pid = app.proc_props.unwrap_or(0);
-            let entry = app.latest_snapshot().and_then(|s| s.process(pid).cloned());
-            let Some(p) = entry else {
+            ui.horizontal(|ui| {
+                if ui
+                    .selectable_label(
+                        dialog.tab == ProcessPropertiesTab::General,
+                        i18n::tr(K::General),
+                    )
+                    .clicked()
+                {
+                    dialog.tab = ProcessPropertiesTab::General;
+                }
+                if ui
+                    .selectable_label(
+                        dialog.tab == ProcessPropertiesTab::Statistics,
+                        i18n::tr(K::Statistics),
+                    )
+                    .clicked()
+                {
+                    dialog.tab = ProcessPropertiesTab::Statistics;
+                }
+            });
+            ui.separator();
+
+            let Some(process) = process.as_ref() else {
+                ui.add_space(10.0);
                 ui.label(i18n::tr(K::ProcessExited));
-                ui.add_space(8.0);
+                ui.add_space(10.0);
                 if ui.button(i18n::tr(K::Close)).clicked() {
-                    app.proc_props = None;
+                    close_clicked = true;
                 }
                 return;
             };
-            ui.set_min_width(430.0);
-            let status = match p.status {
-                ProcStatus::Running => i18n::tr(K::StRunning),
-                ProcStatus::Suspended => i18n::tr(K::StSuspended),
-                ProcStatus::NotResponding => i18n::tr(K::StNotResponding),
+            let Some(snapshot) = snapshot.as_deref() else {
+                return;
             };
-            let path = p
+
+            egui::ScrollArea::vertical()
+                .auto_shrink([false, false])
+                .show(ui, |ui| match dialog.tab {
+                    ProcessPropertiesTab::General => {
+                        process_properties_general(ui, snapshot, process)
+                    }
+                    ProcessPropertiesTab::Statistics => process_properties_statistics(ui, process),
+                });
+
+            ui.separator();
+            let path = process
                 .exe_path
                 .as_ref()
-                .map(|x| x.to_string_lossy().into_owned())
-                .unwrap_or_else(|| i18n::tr(K::NoFileForProcess).to_string());
-            egui::Grid::new("proc-props")
-                .num_columns(2)
-                .spacing([14.0, 5.0])
-                .show(ui, |ui| {
-                    ui.weak(i18n::tr(K::ColName));
-                    ui.label(p.shown_name());
-                    ui.end_row();
-                    ui.weak(i18n::tr(K::ColPid));
-                    ui.label(p.pid.to_string());
-                    ui.end_row();
-                    ui.weak(i18n::tr(K::ColStatus));
-                    ui.label(status);
-                    ui.end_row();
-                    ui.weak(i18n::tr(K::ColUsername));
-                    ui.label(p.user.clone().unwrap_or_else(|| "—".into()));
-                    ui.end_row();
-                    ui.weak(i18n::tr(K::ColPlatform));
-                    ui.label(match p.wow64 {
-                        Some(true) => i18n::tr(K::Bit32),
-                        Some(false) => i18n::tr(K::Bit64),
-                        None => "—",
-                    });
-                    ui.end_row();
-                    ui.weak(i18n::tr(K::PropPath));
-                    egui::ScrollArea::horizontal()
-                        .id_salt("proc-path-ro")
-                        .show(ui, |ui| {
-                            ui.label(egui::RichText::new(&path).size(13.0).monospace());
-                        });
-                    if ui.button(i18n::tr(K::CopyName)).clicked() {
-                        ui.ctx().copy_text(path.clone());
-                    }
-                    ui.end_row();
-                });
-            ui.add_space(10.0);
+                .map(|path| path.to_string_lossy().into_owned());
             ui.horizontal(|ui| {
-                if ui.button(i18n::tr(K::OpenFileLocation)).clicked()
-                    && let Err(e) = app.actions.open_file_location(&path)
+                #[cfg(target_os = "windows")]
+                if ui
+                    .add_enabled(
+                        path.is_some(),
+                        egui::Button::new(i18n::tr(K::FileProperties)),
+                    )
+                    .clicked()
+                    && let Some(path) = path.as_deref()
+                    && let Err(error) = app.actions.open_properties(path)
                 {
-                    app.shared.toast(i18n::trf(K::ErrMsg, &[&e.to_string()]));
+                    app.shared
+                        .toast(i18n::trf(K::ErrMsg, &[&error.to_string()]));
+                }
+                if ui
+                    .add_enabled(
+                        path.is_some(),
+                        egui::Button::new(i18n::tr(K::OpenFileLocation)),
+                    )
+                    .clicked()
+                    && let Some(path) = path.as_deref()
+                    && let Err(error) = app.actions.open_file_location(path)
+                {
+                    app.shared
+                        .toast(i18n::trf(K::ErrMsg, &[&error.to_string()]));
+                }
+                if app.actions.capabilities().process_modules
+                    && ui.button(i18n::tr(K::ViewModules)).clicked()
+                {
+                    crate::tabs::modules::open(app, process, ctx);
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui.button(i18n::tr(K::Close)).clicked() {
-                        app.proc_props = None;
+                        close_clicked = true;
                     }
                 });
             });
         });
-    if !open {
-        app.proc_props = None;
+
+    if open && !close_clicked {
+        app.proc_props = Some(dialog);
     }
 }
 
@@ -2453,6 +2850,32 @@ pub fn affinity_dialog(app: &mut TaskManApp, ctx: &egui::Context, pal: &theme::P
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn process_properties_rejects_a_recycled_pid() {
+        let mut original = ProcessEntry::new(77, "original.exe");
+        original.start_epoch_s = Some(100);
+        let snapshot = tm_core::model::Snapshot {
+            processes: vec![original],
+            ..Default::default()
+        };
+        let identity = crate::app::ProcessIdentity {
+            pid: 77,
+            start_epoch_s: Some(100),
+        };
+        assert_eq!(
+            process_properties_target(&snapshot, &identity).map(|process| process.name.as_str()),
+            Some("original.exe")
+        );
+
+        let mut recycled = ProcessEntry::new(77, "recycled.exe");
+        recycled.start_epoch_s = Some(200);
+        let snapshot = tm_core::model::Snapshot {
+            processes: vec![recycled],
+            ..Default::default()
+        };
+        assert!(process_properties_target(&snapshot, &identity).is_none());
+    }
 
     /// Details shows the image name, never the description. The description
     /// is available as its own optional column.

@@ -79,8 +79,10 @@ platform boundary (`tm-core` ← `tm-platform` ← `tm-app` / `tm-service`):
     (chrome + dialogs incl. scrolling settings and Delete confirmation),
     `tabs/*` (processes/details/modules/users/services/startup/apphistory/
     performance; Processes keeps native grouped presentation, Details can
-    switch between flat and literal raw-PPID tree; Modules is an async
-    on-demand inspector with guarded unload),
+    switch between flat and literal raw-PPID tree and owns an identity-bound
+    General/Statistics Process properties dialog; process context menus keep
+    OS file properties distinct from live process properties; Modules is an
+    async on-demand inspector with guarded unload),
     `selection.rs` (multi-row process selection shared by Processes and
     Details: native click gestures, identity-keyed, primary vs. full set),
     `widgets/tablekit.rs` (TM-style
