@@ -1,0 +1,32 @@
+name: Apply topmost import correction
+
+on:
+  push:
+    branches:
+      - improve/topmost-and-native-taskmgr
+    paths:
+      - .github/workflows/apply-topmost-import-fix.yml
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: improve/topmost-and-native-taskmgr
+      - name: Correct WinEvent imports
+        run: python3 .github/scripts/fix_topmost_imports.py
+      - name: Remove bootstrap files
+        run: |
+          rm .github/scripts/fix_topmost_imports.py
+          rm .github/workflows/apply-topmost-import-fix.yml
+      - name: Commit correction
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add --all
+          git commit -m "Fix WinEvent constant imports"
+          git push origin HEAD:improve/topmost-and-native-taskmgr
