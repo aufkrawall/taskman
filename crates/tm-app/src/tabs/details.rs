@@ -20,6 +20,9 @@ use crate::widgets::menu;
 use crate::widgets::tablekit::{self, TmColumn};
 
 type AffinityLoadResult = Arc<Mutex<Option<std::result::Result<(u64, u64), String>>>>;
+#[cfg(target_os = "windows")]
+type ProcessSecurityLoadResult =
+    Arc<Mutex<Option<std::result::Result<tm_platform::win::ProcessSecurityInfo, String>>>>;
 
 #[derive(Debug, Clone)]
 pub struct AffinityDialog {
@@ -36,18 +39,35 @@ pub struct AffinityDialog {
 pub enum ProcessPropertiesTab {
     General,
     Statistics,
+    Security,
 }
 
 #[derive(Debug, Clone)]
 pub struct ProcessPropertiesDialog {
     pub identity: crate::app::ProcessIdentity,
     tab: ProcessPropertiesTab,
+    #[cfg(target_os = "windows")]
+    security: Option<tm_platform::win::ProcessSecurityInfo>,
+    #[cfg(target_os = "windows")]
+    security_error: Option<String>,
+    #[cfg(target_os = "windows")]
+    security_load_result: ProcessSecurityLoadResult,
+    #[cfg(target_os = "windows")]
+    security_started: bool,
 }
 
 pub fn open_process_properties(app: &mut TaskManApp, identity: crate::app::ProcessIdentity) {
     app.proc_props = Some(ProcessPropertiesDialog {
         identity,
         tab: ProcessPropertiesTab::General,
+        #[cfg(target_os = "windows")]
+        security: None,
+        #[cfg(target_os = "windows")]
+        security_error: None,
+        #[cfg(target_os = "windows")]
+        security_load_result: Arc::new(Mutex::new(None)),
+        #[cfg(target_os = "windows")]
+        security_started: false,
     });
 }
 
@@ -2340,10 +2360,360 @@ fn option_count(value: Option<u32>) -> String {
     )
 }
 
+#[derive(Default)]
+struct ProcessSecuritySummary {
+    image_type: String,
+    protection: String,
+    critical: String,
+    mitigations: String,
+}
+
+fn process_properties_body_height(viewport_height: f32) -> f32 {
+    (viewport_height * 0.55).clamp(260.0, 400.0)
+}
+
+#[cfg(target_os = "windows")]
+fn protection_label(level: Option<tm_platform::win::ProcessProtectionLevel>) -> String {
+    use tm_platform::win::ProcessProtectionLevel as Level;
+    match level {
+        Some(Level::None) => i18n::tr(K::NoneWord).to_string(),
+        Some(Level::Authenticode) => "Authenticode".into(),
+        Some(Level::CodeGenLight) => "CodeGen Light".into(),
+        Some(Level::AntimalwareLight) => "Antimalware Light (PPL)".into(),
+        Some(Level::LsaLight) => "LSA Light (PPL)".into(),
+        Some(Level::WindowsLight) => "Windows Light (PPL)".into(),
+        Some(Level::Windows) => "Windows".into(),
+        Some(Level::WinTcbLight) => "WinTcb Light (PPL)".into(),
+        Some(Level::WinTcb) => "WinTcb".into(),
+        Some(Level::PplApp) => "PPL App".into(),
+        Some(Level::Unknown(raw)) => format!("{} (0x{raw:08X})", i18n::tr(K::UacUnknown)),
+        None => i18n::tr(K::UacUnknown).to_string(),
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn machine_type_label(machine: Option<tm_platform::win::ProcessMachineType>) -> String {
+    use tm_platform::win::ProcessMachineType as Machine;
+    match machine {
+        Some(Machine::X86) => "x86 (32-bit)".into(),
+        Some(Machine::X64) => "AMD64 (64-bit)".into(),
+        Some(Machine::Arm32) => "ARM (32-bit)".into(),
+        Some(Machine::Arm64) => "ARM64 (64-bit)".into(),
+        Some(Machine::Unknown(raw)) => format!("0x{raw:04X}"),
+        None => i18n::tr(K::UacUnknown).to_string(),
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn active_mitigation_summary(info: &tm_platform::win::ProcessSecurityInfo) -> String {
+    let mut active = Vec::new();
+    if info.dep.is_some_and(|flags| flags & 0x1 != 0) {
+        active.push("DEP");
+    }
+    if info.aslr.is_some_and(|flags| flags & 0x7 != 0) {
+        active.push("ASLR");
+    }
+    if info.dynamic_code.is_some_and(|flags| flags & 0x1 != 0) {
+        active.push("Dynamic code");
+    }
+    if info.strict_handle.is_some_and(|flags| flags & 0x1 != 0) {
+        active.push("Strict handles");
+    }
+    if info.extension_point.is_some_and(|flags| flags & 0x1 != 0) {
+        active.push("Extension points");
+    }
+    if info
+        .control_flow_guard
+        .is_some_and(|flags| flags & 0x1 != 0)
+    {
+        active.push("CFG");
+    }
+    if info.system_call.is_some_and(|flags| flags & 0x1 != 0) {
+        active.push("Win32k lockdown");
+    }
+    if info.signature.is_some_and(|flags| flags & 0x3 != 0) {
+        active.push("Code integrity");
+    }
+    if info.font.is_some_and(|flags| flags & 0x1 != 0) {
+        active.push("Font lockdown");
+    }
+    if info.image_load.is_some_and(|flags| flags & 0x7 != 0) {
+        active.push("Image-load policy");
+    }
+    if info.child_process.is_some_and(|flags| flags & 0x1 != 0) {
+        active.push("No child processes");
+    }
+    if info.user_shadow_stack.is_some_and(|flags| flags & 0x1 != 0) {
+        active.push("CET shadow stack");
+    }
+    if info.sehop.is_some_and(|flags| flags & 0x1 != 0) {
+        active.push("SEHOP");
+    }
+    if info.side_channel.is_some_and(|flags| flags & 0x1f != 0) {
+        active.push("Side-channel isolation");
+    }
+    if info
+        .payload_restriction
+        .is_some_and(|flags| flags & 0x555 != 0)
+    {
+        active.push("Payload restrictions");
+    }
+    if active.is_empty() {
+        i18n::tr(K::NoneWord).to_string()
+    } else {
+        active.join("; ")
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn process_security_summary(dialog: &ProcessPropertiesDialog) -> ProcessSecuritySummary {
+    if let Some(info) = dialog.security.as_ref() {
+        return ProcessSecuritySummary {
+            image_type: machine_type_label(info.machine),
+            protection: protection_label(info.protection),
+            critical: info
+                .critical
+                .map(|value| i18n::tr(if value { K::Yes } else { K::No }).to_string())
+                .unwrap_or_else(|| i18n::tr(K::UacUnknown).to_string()),
+            mitigations: active_mitigation_summary(info),
+        };
+    }
+    let pending = if dialog.security_error.is_some() {
+        i18n::tr(K::SecurityUnavailable)
+    } else {
+        i18n::tr(K::GatheringData)
+    };
+    ProcessSecuritySummary {
+        image_type: pending.into(),
+        protection: pending.into(),
+        critical: pending.into(),
+        mitigations: pending.into(),
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn process_security_summary(_dialog: &ProcessPropertiesDialog) -> ProcessSecuritySummary {
+    ProcessSecuritySummary {
+        image_type: "—".into(),
+        protection: "—".into(),
+        critical: "—".into(),
+        mitigations: "—".into(),
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn security_state(flags: Option<u32>, mask: u32) -> String {
+    match flags {
+        Some(value) if value & mask != 0 => i18n::tr(K::EnabledWord).to_string(),
+        Some(_) => i18n::tr(K::DisabledWord).to_string(),
+        None => i18n::tr(K::UacUnknown).to_string(),
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn process_properties_security(
+    ui: &mut egui::Ui,
+    info: Option<&tm_platform::win::ProcessSecurityInfo>,
+    error: Option<&str>,
+) {
+    let Some(info) = info else {
+        ui.add_space(8.0);
+        if let Some(error) = error {
+            ui.label(egui::RichText::new(i18n::tr(K::SecurityUnavailable)).strong());
+            ui.weak(error);
+        } else {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label(i18n::tr(K::GatheringData));
+            });
+        }
+        return;
+    };
+
+    egui::Grid::new("process-properties-security-core")
+        .num_columns(2)
+        .min_col_width(190.0)
+        .spacing([18.0, 7.0])
+        .striped(true)
+        .show(ui, |ui| {
+            property_row(
+                ui,
+                i18n::tr(K::PropImageType),
+                machine_type_label(info.machine),
+                false,
+            );
+            property_row(
+                ui,
+                i18n::tr(K::PropProtection),
+                protection_label(info.protection),
+                false,
+            );
+            property_row(
+                ui,
+                i18n::tr(K::PropCriticalProcess),
+                info.critical
+                    .map(|value| i18n::tr(if value { K::Yes } else { K::No }).to_string())
+                    .unwrap_or_else(|| i18n::tr(K::UacUnknown).to_string()),
+                false,
+            );
+            property_row(
+                ui,
+                i18n::tr(K::PropMitigationPolicies),
+                active_mitigation_summary(info),
+                false,
+            );
+        });
+
+    ui.add_space(12.0);
+    ui.label(egui::RichText::new(i18n::tr(K::PropMitigationPolicies)).strong());
+    ui.add_space(4.0);
+    egui::Grid::new("process-properties-security-policies")
+        .num_columns(2)
+        .min_col_width(250.0)
+        .spacing([18.0, 6.0])
+        .striped(true)
+        .show(ui, |ui| {
+            let dep = match info.dep {
+                Some(flags) if flags & 0x1 != 0 && info.dep_permanent == Some(true) => {
+                    format!("{} ({})", i18n::tr(K::EnabledWord), i18n::tr(K::Permanent))
+                }
+                _ => security_state(info.dep, 0x1),
+            };
+            property_row(ui, i18n::tr(K::MitDep), dep, false);
+            property_row(
+                ui,
+                i18n::tr(K::MitAslrBottomUp),
+                security_state(info.aslr, 0x1),
+                false,
+            );
+            property_row(
+                ui,
+                i18n::tr(K::MitAslrForceRelocate),
+                security_state(info.aslr, 0x2),
+                false,
+            );
+            property_row(
+                ui,
+                i18n::tr(K::MitAslrHighEntropy),
+                security_state(info.aslr, 0x4),
+                false,
+            );
+            property_row(
+                ui,
+                i18n::tr(K::MitDynamicCode),
+                security_state(info.dynamic_code, 0x1),
+                false,
+            );
+            property_row(
+                ui,
+                i18n::tr(K::MitStrictHandles),
+                security_state(info.strict_handle, 0x1),
+                false,
+            );
+            property_row(
+                ui,
+                i18n::tr(K::MitExtensionPoints),
+                security_state(info.extension_point, 0x1),
+                false,
+            );
+            property_row(
+                ui,
+                i18n::tr(K::MitCfg),
+                security_state(info.control_flow_guard, 0x1),
+                false,
+            );
+            property_row(
+                ui,
+                i18n::tr(K::MitCfgStrict),
+                security_state(info.control_flow_guard, 0x4),
+                false,
+            );
+            property_row(
+                ui,
+                i18n::tr(K::MitWin32k),
+                security_state(info.system_call, 0x1),
+                false,
+            );
+            property_row(
+                ui,
+                i18n::tr(K::MitMicrosoftSigned),
+                security_state(info.signature, 0x1),
+                false,
+            );
+            property_row(
+                ui,
+                i18n::tr(K::MitStoreSigned),
+                security_state(info.signature, 0x2),
+                false,
+            );
+            property_row(
+                ui,
+                i18n::tr(K::MitFonts),
+                security_state(info.font, 0x1),
+                false,
+            );
+            property_row(
+                ui,
+                i18n::tr(K::MitRemoteImages),
+                security_state(info.image_load, 0x1),
+                false,
+            );
+            property_row(
+                ui,
+                i18n::tr(K::MitLowLabelImages),
+                security_state(info.image_load, 0x2),
+                false,
+            );
+            property_row(
+                ui,
+                i18n::tr(K::MitPreferSystem32),
+                security_state(info.image_load, 0x4),
+                false,
+            );
+            property_row(
+                ui,
+                i18n::tr(K::MitChildProcesses),
+                security_state(info.child_process, 0x1),
+                false,
+            );
+            property_row(
+                ui,
+                i18n::tr(K::MitCetShadowStack),
+                security_state(info.user_shadow_stack, 0x1),
+                false,
+            );
+            property_row(
+                ui,
+                i18n::tr(K::MitCetStrict),
+                security_state(info.user_shadow_stack, 0x10),
+                false,
+            );
+            property_row(
+                ui,
+                i18n::tr(K::MitSehop),
+                security_state(info.sehop, 0x1),
+                false,
+            );
+            property_row(
+                ui,
+                i18n::tr(K::MitSideChannel),
+                security_state(info.side_channel, 0x1f),
+                false,
+            );
+            property_row(
+                ui,
+                i18n::tr(K::MitPayload),
+                security_state(info.payload_restriction, 0x555),
+                false,
+            );
+        });
+}
+
 fn process_properties_general(
     ui: &mut egui::Ui,
     snapshot: &tm_core::model::Snapshot,
     process: &ProcessEntry,
+    security: &ProcessSecuritySummary,
 ) {
     ui.heading(process.shown_name());
     if let Some(description) = process
@@ -2440,6 +2810,30 @@ fn process_properties_general(
             );
             property_row(ui, i18n::tr(K::ColStatus), status, false);
             property_row(ui, i18n::tr(K::ColPlatform), platform, false);
+            property_row(
+                ui,
+                i18n::tr(K::PropImageType),
+                security.image_type.clone(),
+                false,
+            );
+            property_row(
+                ui,
+                i18n::tr(K::PropProtection),
+                security.protection.clone(),
+                false,
+            );
+            property_row(
+                ui,
+                i18n::tr(K::PropCriticalProcess),
+                security.critical.clone(),
+                false,
+            );
+            property_row(
+                ui,
+                i18n::tr(K::PropMitigationPolicies),
+                security.mitigations.clone(),
+                false,
+            );
             property_row(ui, i18n::tr(K::ColElevated), elevated, false);
             property_row(ui, i18n::tr(K::ColUac), uac, false);
             property_row(
@@ -2601,6 +2995,45 @@ pub fn process_properties_dialog(app: &mut TaskManApp, ctx: &egui::Context) {
     let Some(mut dialog) = app.proc_props.take() else {
         return;
     };
+    #[cfg(target_os = "windows")]
+    {
+        if dialog.security.is_none()
+            && dialog.security_error.is_none()
+            && let Some(result) = tm_core::sync::lock(&dialog.security_load_result).take()
+        {
+            match result {
+                Ok(info) => dialog.security = Some(info),
+                Err(error) => dialog.security_error = Some(error),
+            }
+        }
+        if !dialog.security_started && dialog.security.is_none() && dialog.security_error.is_none()
+        {
+            dialog.security_started = true;
+            let result = dialog.security_load_result.clone();
+            let identity = dialog.identity.clone();
+            let job = move || {
+                let value =
+                    tm_platform::win::process_security_info(identity.pid, identity.start_epoch_s)
+                        .map_err(|error| error.to_string());
+                *tm_core::sync::lock(&result) = Some(value);
+            };
+            let wake = {
+                let ctx = ctx.clone();
+                move || ctx.request_repaint()
+            };
+            match &app.shared.executor {
+                Some(executor) => {
+                    if !executor.run_quiet(wake, job) {
+                        dialog.security_error = Some(i18n::tr(K::ActionQueueFull).to_string());
+                    }
+                }
+                None => {
+                    drop(job);
+                    dialog.security_error = Some(i18n::tr(K::ActionFailed).to_string());
+                }
+            }
+        }
+    }
     let snapshot = app.latest_snapshot();
     let process = snapshot
         .as_deref()
@@ -2630,8 +3063,9 @@ pub fn process_properties_dialog(app: &mut TaskManApp, ctx: &egui::Context) {
         .open(&mut open)
         .collapsible(false)
         .resizable(true)
-        .default_size([720.0, 520.0])
-        .min_size([620.0, 400.0])
+        .default_size([760.0, 560.0])
+        .min_size([640.0, 420.0])
+        .max_size([980.0, 680.0])
         .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
         .show(ctx, |ui| {
             ui.horizontal(|ui| {
@@ -2653,6 +3087,16 @@ pub fn process_properties_dialog(app: &mut TaskManApp, ctx: &egui::Context) {
                 {
                     dialog.tab = ProcessPropertiesTab::Statistics;
                 }
+                #[cfg(target_os = "windows")]
+                if ui
+                    .selectable_label(
+                        dialog.tab == ProcessPropertiesTab::Security,
+                        i18n::tr(K::Security),
+                    )
+                    .clicked()
+                {
+                    dialog.tab = ProcessPropertiesTab::Security;
+                }
             });
             ui.separator();
 
@@ -2669,13 +3113,31 @@ pub fn process_properties_dialog(app: &mut TaskManApp, ctx: &egui::Context) {
                 return;
             };
 
+            // Give the content a bounded viewport. The previous non-shrinking
+            // ScrollArea fed its own ever-larger desired height back into the
+            // resizable Window on every frame, so the dialog grew until it hit
+            // the monitor edge. The viewport cap is independent of content;
+            // overflow belongs to the scroll bar, not to the outer window.
+            let body_height = process_properties_body_height(ctx.content_rect().height());
+            let security = process_security_summary(&dialog);
             egui::ScrollArea::vertical()
-                .auto_shrink([false, false])
+                .max_height(body_height)
+                .auto_shrink([false, true])
                 .show(ui, |ui| match dialog.tab {
                     ProcessPropertiesTab::General => {
-                        process_properties_general(ui, snapshot, process)
+                        process_properties_general(ui, snapshot, process, &security)
                     }
                     ProcessPropertiesTab::Statistics => process_properties_statistics(ui, process),
+                    ProcessPropertiesTab::Security => {
+                        #[cfg(target_os = "windows")]
+                        process_properties_security(
+                            ui,
+                            dialog.security.as_ref(),
+                            dialog.security_error.as_deref(),
+                        );
+                        #[cfg(not(target_os = "windows"))]
+                        ui.label("—");
+                    }
                 });
 
             ui.separator();

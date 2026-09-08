@@ -26,6 +26,7 @@ pub fn live_pids_for_test() -> std::collections::HashSet<u32> {
 }
 mod perfcounters;
 mod process_ops;
+pub use process_ops::{ProcessMachineType, ProcessProtectionLevel, ProcessSecurityInfo};
 mod sampler;
 mod services;
 mod startup;
@@ -130,6 +131,14 @@ pub(crate) fn set_task_manager_replacement_direct_for(
 /// Whether THIS process runs with an elevated (admin) token.
 pub fn is_elevated() -> bool {
     process_ops::is_elevated()
+}
+
+/// Lazily inspect one live process's Windows protection and mitigation state.
+pub fn process_security_info(
+    pid: u32,
+    expected_start_epoch_s: Option<i64>,
+) -> Result<ProcessSecurityInfo> {
+    process_ops::process_security_info(pid, expected_start_epoch_s)
 }
 
 /// Keep the UI/service control plane responsive when ordinary workloads

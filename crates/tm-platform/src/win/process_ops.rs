@@ -122,6 +122,178 @@ fn open_process_verified(
     Ok(h)
 }
 
+/// Windows process protection level reported by GetProcessInformation.
+/// Kept as a small platform-neutral enum at the public Windows boundary so the
+/// GUI does not need its own dependency on Win32 SDK constants.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProcessProtectionLevel {
+    None,
+    Authenticode,
+    CodeGenLight,
+    AntimalwareLight,
+    LsaLight,
+    WindowsLight,
+    Windows,
+    WinTcbLight,
+    WinTcb,
+    PplApp,
+    Unknown(u32),
+}
+
+/// Effective executable machine for the live process.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProcessMachineType {
+    X86,
+    X64,
+    Arm32,
+    Arm64,
+    Unknown(u16),
+}
+
+/// Security-hardening state fetched lazily by Process Properties. None means
+/// Windows did not expose that individual policy for this process/OS, never
+/// "disabled". Keeping this out of Snapshot avoids dozens of extra syscalls on
+/// every sampling tick for data that is only useful while the dialog is open.
+#[derive(Debug, Clone, Default)]
+pub struct ProcessSecurityInfo {
+    pub protection: Option<ProcessProtectionLevel>,
+    pub machine: Option<ProcessMachineType>,
+    pub critical: Option<bool>,
+    pub dep: Option<u32>,
+    pub dep_permanent: Option<bool>,
+    pub aslr: Option<u32>,
+    pub dynamic_code: Option<u32>,
+    pub strict_handle: Option<u32>,
+    pub system_call: Option<u32>,
+    pub extension_point: Option<u32>,
+    pub control_flow_guard: Option<u32>,
+    pub signature: Option<u32>,
+    pub font: Option<u32>,
+    pub image_load: Option<u32>,
+    pub child_process: Option<u32>,
+    pub user_shadow_stack: Option<u32>,
+    pub sehop: Option<u32>,
+    pub side_channel: Option<u32>,
+    pub payload_restriction: Option<u32>,
+}
+
+fn process_protection_level(process: HANDLE) -> Option<ProcessProtectionLevel> {
+    let mut info = th::PROCESS_PROTECTION_LEVEL_INFORMATION::default();
+    unsafe {
+        th::GetProcessInformation(
+            process,
+            th::ProcessProtectionLevelInfo,
+            &mut info as *mut _ as *mut std::ffi::c_void,
+            std::mem::size_of::<th::PROCESS_PROTECTION_LEVEL_INFORMATION>() as u32,
+        )
+    }
+    .ok()?;
+    let level = info.ProtectionLevel;
+    Some(if level == th::PROTECTION_LEVEL_NONE {
+        ProcessProtectionLevel::None
+    } else if level == th::PROTECTION_LEVEL_AUTHENTICODE {
+        ProcessProtectionLevel::Authenticode
+    } else if level == th::PROTECTION_LEVEL_CODEGEN_LIGHT {
+        ProcessProtectionLevel::CodeGenLight
+    } else if level == th::PROTECTION_LEVEL_ANTIMALWARE_LIGHT {
+        ProcessProtectionLevel::AntimalwareLight
+    } else if level == th::PROTECTION_LEVEL_LSA_LIGHT {
+        ProcessProtectionLevel::LsaLight
+    } else if level == th::PROTECTION_LEVEL_WINDOWS_LIGHT {
+        ProcessProtectionLevel::WindowsLight
+    } else if level == th::PROTECTION_LEVEL_WINDOWS {
+        ProcessProtectionLevel::Windows
+    } else if level == th::PROTECTION_LEVEL_WINTCB_LIGHT {
+        ProcessProtectionLevel::WinTcbLight
+    } else if level == th::PROTECTION_LEVEL_WINTCB {
+        ProcessProtectionLevel::WinTcb
+    } else if level == th::PROTECTION_LEVEL_PPL_APP {
+        ProcessProtectionLevel::PplApp
+    } else {
+        ProcessProtectionLevel::Unknown(level.0)
+    })
+}
+
+fn process_machine_type(process: HANDLE) -> Option<ProcessMachineType> {
+    process_machine(process).ok().map(|machine| match machine {
+        0x014c => ProcessMachineType::X86,
+        0x8664 => ProcessMachineType::X64,
+        0x01c4 => ProcessMachineType::Arm32,
+        0xaa64 => ProcessMachineType::Arm64,
+        other => ProcessMachineType::Unknown(other),
+    })
+}
+
+fn mitigation_flags(process: HANDLE, policy: th::PROCESS_MITIGATION_POLICY) -> Option<u32> {
+    let mut flags = 0u32;
+    unsafe {
+        th::GetProcessMitigationPolicy(
+            process,
+            policy,
+            &mut flags as *mut u32 as *mut std::ffi::c_void,
+            std::mem::size_of::<u32>(),
+        )
+    }
+    .ok()
+    .map(|()| flags)
+}
+
+/// Read the exact live process's hardening state. The identity check happens
+/// on the SAME handle that is queried, so a recycled PID can never hand the
+/// dialog security data for another process. SeDebugPrivilege is enabled on a
+/// best-effort basis to make elevated diagnostics as useful as System
+/// Informer, but the query remains read-only and honestly leaves inaccessible
+/// individual policies as None.
+pub fn process_security_info(
+    pid: u32,
+    expected_start_epoch_s: Option<i64>,
+) -> Result<ProcessSecurityInfo> {
+    enable_debug_privilege();
+    let process = open_process_verified(
+        pid,
+        th::PROCESS_QUERY_LIMITED_INFORMATION,
+        expected_start_epoch_s,
+    )?;
+    let result = (|| {
+        let protection = process_protection_level(process);
+        let machine = process_machine_type(process);
+
+        let mut critical = windows::core::BOOL::default();
+        let critical = unsafe { th::IsProcessCritical(process, &mut critical) }
+            .ok()
+            .map(|()| critical.as_bool());
+
+        let mut dep_flags = 0u32;
+        let mut dep_permanent = windows::core::BOOL::default();
+        let dep_ok =
+            unsafe { th::GetProcessDEPPolicy(process, &mut dep_flags, &mut dep_permanent) }.is_ok();
+
+        Ok(ProcessSecurityInfo {
+            protection,
+            machine,
+            critical,
+            dep: dep_ok.then_some(dep_flags),
+            dep_permanent: dep_ok.then_some(dep_permanent.as_bool()),
+            aslr: mitigation_flags(process, th::ProcessASLRPolicy),
+            dynamic_code: mitigation_flags(process, th::ProcessDynamicCodePolicy),
+            strict_handle: mitigation_flags(process, th::ProcessStrictHandleCheckPolicy),
+            system_call: mitigation_flags(process, th::ProcessSystemCallDisablePolicy),
+            extension_point: mitigation_flags(process, th::ProcessExtensionPointDisablePolicy),
+            control_flow_guard: mitigation_flags(process, th::ProcessControlFlowGuardPolicy),
+            signature: mitigation_flags(process, th::ProcessSignaturePolicy),
+            font: mitigation_flags(process, th::ProcessFontDisablePolicy),
+            image_load: mitigation_flags(process, th::ProcessImageLoadPolicy),
+            child_process: mitigation_flags(process, th::ProcessChildProcessPolicy),
+            user_shadow_stack: mitigation_flags(process, th::ProcessUserShadowStackPolicy),
+            sehop: mitigation_flags(process, th::ProcessSEHOPPolicy),
+            side_channel: mitigation_flags(process, th::ProcessSideChannelIsolationPolicy),
+            payload_restriction: mitigation_flags(process, th::ProcessPayloadRestrictionPolicy),
+        })
+    })();
+    let _ = unsafe { CloseHandle(process) };
+    result
+}
+
 /// Refuse operations that can destabilize the entire machine. The service
 /// broker calls this for every target, and local elevated actions use the same
 /// guard for every destructive process action. Failure to establish critical
