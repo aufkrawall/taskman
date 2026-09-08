@@ -907,6 +907,10 @@ impl PlatformActions for BrokeredActions {
         self.local.relaunch_elevated()
     }
 
+    fn launch_native_task_manager(&self) -> Result<()> {
+        self.local.launch_native_task_manager()
+    }
+
     fn task_manager_replacement_state(&self) -> TaskManagerReplacementState {
         match self.client.call(BrokerRequest::TaskManagerReplacementState) {
             Ok(BrokerValue::TaskManagerReplacementState(state)) => state,
