@@ -182,9 +182,9 @@ fn system_task_manager_path() -> Result<PathBuf> {
 /// value, creates no race in which Ctrl+Shift+Esc can escape TaskMan.
 pub fn launch_native_task_manager() -> Result<()> {
     use std::os::windows::ffi::OsStrExt;
-    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::Foundation::{CloseHandle, DBG_CONTINUE};
     use windows::Win32::System::Diagnostics::Debug::{
-        ContinueDebugEvent, DBG_CONTINUE, DEBUG_EVENT, DebugActiveProcessStop,
+        ContinueDebugEvent, DEBUG_EVENT, DebugActiveProcessStop,
         DebugSetProcessKillOnExit, WaitForDebugEvent,
     };
     use windows::Win32::System::Threading::{
