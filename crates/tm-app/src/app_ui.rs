@@ -1167,8 +1167,9 @@ pub fn process_end_dialog(app: &mut TaskManApp, ctx: &egui::Context) {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 enum RunTaskDialogFocus {
+    #[default]
     Command,
     Elevated,
     Cancel,
@@ -1235,7 +1236,7 @@ pub fn run_task_dialog(app: &mut TaskManApp, ctx: &egui::Context, _pal: &theme::
     let focus_id = egui::Id::new("run-task-dialog-focus");
     let mut focus = ctx
         .data(|data| data.get_temp::<RunTaskDialogFocus>(focus_id))
-        .unwrap_or(RunTaskDialogFocus::Command);
+        .unwrap_or_default();
 
     // Own the dialog's focus traversal instead of requesting text focus every
     // frame. The old unconditional `request_focus()` made Tab immediately snap
@@ -1533,6 +1534,7 @@ mod tests {
     #[test]
     fn run_task_dialog_focus_cycles_forward_and_backward() {
         use RunTaskDialogFocus::*;
+        assert_eq!(RunTaskDialogFocus::default(), Command);
         let mut focus = Command;
         for expected in [Elevated, Cancel, Browse, Ok, Command] {
             focus = focus.next(false);
