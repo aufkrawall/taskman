@@ -31,6 +31,33 @@ Primary sources:
 Flags: `--host-only`, `--linux-only`, `--debug`, `--no-package`,
 `--require-all-targets`, `--check`, `--audit`.
 
+## Publishing a release
+
+1. `main` must be green: `python build.py --check` locally (the CI workflow
+   runs the same command) plus `python build.py --audit` for the advisory and
+   secrets scan. Without `--host-only`, `--check` also builds both artifacts.
+2. Bump `[workspace.package] version` in `Cargo.toml`, run any cargo command
+   so `Cargo.lock` follows, and commit as
+   `chore(release): bump version to X.Y.Z`. Push `main`; the tag points at
+   this commit.
+3. `python build.py` produces
+   `dist/taskman-vX.Y.Z-windows-x86_64.zip` and
+   `dist/taskman-vX.Y.Z-linux-x86_64[-musl].tar.gz`. Write
+   `<sha256>  <filename>` next to each archive.
+4. Publish with the GitHub CLI:
+   `gh release create vX.Y.Z --target <bump-sha> --title 'TaskMan vX.Y.Z'
+   --notes-file <notes> --latest <archives + .sha256 files>`. This creates
+   the remote tag on the bump commit.
+5. Verify the PUBLISHED archives, not only `target/release`: the Windows zip
+   must contain `taskman.exe` + `taskman-service.exe`, and both binaries
+   should pass `--selfcheck` (`--mock` for the Windows GUI; the static Linux
+   musl binary also runs the real backend under WSL).
+
+Earlier releases (v0.1.0/v0.1.1) were published by a temporary workflow
+pushed to a throwaway `release/vX.Y.Z-*` branch; GitHub keeps those workflows
+listed after the branch and file are deleted. The local `gh release create`
+path above is simpler and directly verifiable.
+
 ## Pushing: no git-LFS pointers may enter this repository
 
 Vendoring egui made the repository unpushable, in two places at once:
