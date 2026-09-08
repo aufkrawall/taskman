@@ -196,6 +196,89 @@ pub fn scrolled_table(
     hdr.inner
 }
 
+/// Deterministic identity hash for one row, for [`ScrollAnchor`].
+///
+/// `DefaultHasher::new()` is the FIXED-seed hasher (unlike `RandomState`), so
+/// the same value hashes identically for the whole session and across runs.
+pub fn stable_key(value: impl std::hash::Hash) -> u64 {
+    use std::hash::Hasher;
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    value.hash(&mut hasher);
+    hasher.finish()
+}
+
+/// Scroll-anchoring input for [`scrolled_rows`].
+///
+/// The raw scroll offset is a pixel value, but the display model is rebuilt
+/// on every sample: a process spawning or exiting above the viewport (or a
+/// tree node being expanded) used to shift every visible row by that many row
+/// heights, which read as the list jumping while the scroll bar stayed put.
+/// With an anchor the table re-derives the offset from row identities, so the
+/// content under the viewport stays where the user was looking.
+#[derive(Clone, Copy)]
+pub struct ScrollAnchor<'a> {
+    /// True when the caller rebuilt the row model this frame.
+    pub model_changed: bool,
+    /// Identity of the primary selected row, if any. While that row is on
+    /// screen it wins over the viewport top: a process spawning above the
+    /// selection must not push the row the user is tracking out of view.
+    pub prefer_key: Option<u64>,
+    /// Stable identity of row `index` in the CURRENT model. Must be unique
+    /// among the rows a user can see and must survive while the row exists.
+    pub key_of: &'a dyn Fn(usize) -> u64,
+}
+
+/// Per-table memory for [`scrolled_rows`] anchoring: the identities of the
+/// rows that were rendered last frame, plus the viewport-relative position of
+/// the first one.
+#[derive(Clone, Default)]
+struct AnchorState {
+    /// Model index of the first key in [`AnchorState::keys`].
+    base_index: usize,
+    /// Viewport-relative y of that row's top (normally `<= 0`, because the
+    /// first stored row is usually partially scrolled off).
+    base_rel: f32,
+    /// Identities of the rendered rows, top to bottom.
+    keys: Vec<u64>,
+}
+
+impl AnchorState {
+    /// Offset that keeps the first remembered row still present at its old
+    /// viewport position, or `None` when every remembered row is gone or has
+    /// moved too far.
+    ///
+    /// `prefer` names the selected row; when it is among the remembered rows
+    /// it is tried before the top-down order. `max_shift` bounds how far a
+    /// remembered row may move. Insertions and removals shift rows by their
+    /// own count; a sort or search reorders the whole model, and following a
+    /// row across that would teleport the viewport instead of keeping it
+    /// stable, so those are left alone.
+    fn restored_offset(
+        &self,
+        key_of: &dyn Fn(usize) -> u64,
+        row_count: usize,
+        row_h: f32,
+        max_shift: usize,
+        prefer: Option<u64>,
+    ) -> Option<f32> {
+        let preferred = prefer.and_then(|key| self.keys.iter().position(|k| *k == key));
+        let order = preferred
+            .into_iter()
+            .chain((0..self.keys.len()).filter(|i| Some(*i) != preferred));
+        for k in order {
+            let key = self.keys[k];
+            if let Some(new_index) = (0..row_count).find(|&i| key_of(i) == key) {
+                if new_index.abs_diff(self.base_index + k) > max_shift {
+                    return None;
+                }
+                let rel = self.base_rel + k as f32 * row_h;
+                return Some(new_index as f32 * row_h - rel);
+            }
+        }
+        None
+    }
+}
+
 /// Virtualized variant of [`scrolled_table`] for uniform fixed-height rows.
 ///
 /// `focus_row` consumes a one-shot scroll request (type-ahead or cross-tab
@@ -204,6 +287,10 @@ pub fn scrolled_table(
 /// the currently rendered virtualization window (the response never exists,
 /// so nothing would scroll), and `scroll_to_me` always targets both axes,
 /// which yanked the horizontal offset toward the full-width row.
+///
+/// `anchor` is optional and only repositions the viewport on the frame the
+/// caller rebuilt the model; user scrolling on other frames is untouched.
+/// `focus_row` wins when both are present (the user explicitly navigated).
 #[allow(clippy::too_many_arguments)]
 pub fn scrolled_rows(
     id: &'static str,
@@ -215,6 +302,7 @@ pub fn scrolled_rows(
     aggregates: Option<&[String]>,
     row_count: usize,
     focus_row: Option<usize>,
+    anchor: Option<ScrollAnchor<'_>>,
     rows: impl FnOnce(&mut egui::Ui, &TmTable, f32, f32, std::ops::Range<usize>),
 ) -> Option<usize> {
     let content_w = table.total_width();
@@ -247,10 +335,10 @@ pub fn scrolled_rows(
     // frame's offset. The builder offset is applied on this frame only
     // (callers hand us `Some` exactly once per request).
     let row_h = table.row_h;
-    let vertical_offset = focus_row.map(|row| {
-        // The horizontal bar's reserved lane is not viewport: counting it
-        // would scroll a bottom row that far short of actually being visible.
-        let viewport_h = (ui.available_height() - bar_use.y).max(row_h);
+    // The horizontal bar's reserved lane is not viewport: counting it would
+    // scroll a bottom row that far short of actually being visible.
+    let viewport_h = (ui.available_height() - bar_use.y).max(row_h);
+    let focus_offset = focus_row.map(|row| {
         let row_top = row as f32 * row_h;
         let row_bottom = row_top + row_h;
         let target = if row_top < rows_prev_y {
@@ -263,6 +351,33 @@ pub fn scrolled_rows(
         let content_h = row_h * row_count as f32;
         target.clamp(0.0, (content_h - viewport_h).max(0.0))
     });
+
+    // Scroll anchoring: on the frame the caller rebuilt the row model, keep
+    // the first previously visible row that still exists at the same viewport
+    // position, so insertions/removals above the viewport cannot shift the
+    // content. Skipped while a focus request is pending: that gesture asked
+    // for a specific row and must not be overruled.
+    let anchor_id = egui::Id::new(("tm-rowanchor", id));
+    let vertical_offset = match (focus_offset, anchor) {
+        (Some(focus), _) => Some(focus),
+        (None, Some(anchor)) if anchor.model_changed => {
+            let prev = ui
+                .ctx()
+                .data(|d| d.get_temp::<AnchorState>(anchor_id))
+                .unwrap_or_default();
+            // A row that moved further than the screenful the user can see
+            // was reordered, not shifted by an insert/remove.
+            let max_shift = (viewport_h / row_h).ceil() as usize;
+            prev.restored_offset(
+                anchor.key_of,
+                row_count,
+                row_h,
+                max_shift,
+                anchor.prefer_key,
+            )
+        }
+        _ => None,
+    };
 
     let body_outer = ui.available_size_before_wrap();
     let body = {
@@ -290,6 +405,33 @@ pub fn scrolled_rows(
         .data_mut(|d| d.insert_temp(egui::Id::new(("tm-rowsx", id)), body.state.offset.x));
     ui.ctx()
         .data_mut(|d| d.insert_temp(egui::Id::new(("tm-rowsy", id)), body.state.offset.y));
+
+    // Remember what was on screen for the next model rebuild. The stored list
+    // covers the viewport plus one row, so a removed top row can fall back to
+    // the next surviving one instead of giving up on anchoring.
+    if let Some(anchor) = anchor {
+        let viewport_h = (body_outer.y - bar_use.y).max(row_h);
+        let offset_y = body.state.offset.y.max(0.0);
+        let base_index = ((offset_y / row_h).floor() as usize).min(row_count.saturating_sub(1));
+        let base_rel = base_index as f32 * row_h - offset_y;
+        let count =
+            ((viewport_h / row_h).ceil() as usize + 1).min(row_count.saturating_sub(base_index));
+        let keys = (base_index..base_index + count)
+            .map(|i| (anchor.key_of)(i))
+            .collect();
+        ui.ctx().data_mut(|d| {
+            d.insert_temp(
+                anchor_id,
+                AnchorState {
+                    base_index,
+                    base_rel,
+                    keys,
+                },
+            );
+        });
+    } else {
+        ui.ctx().data_mut(|d| d.remove::<AnchorState>(anchor_id));
+    }
     hdr.inner
 }
 
@@ -1246,6 +1388,7 @@ mod tests {
                             None,
                             3,
                             None,
+                            None,
                             |ui, table, _a, _c, range| {
                                 for i in range {
                                     table.row(ui, &crate::theme::DARK, false, i);
@@ -1319,6 +1462,7 @@ mod tests {
                             // Far more rows than fit in 200 px → vertical bar.
                             400,
                             None,
+                            None,
                             |ui, table, _a, _c, range| {
                                 body_right.set(ui.clip_rect().right());
                                 for i in range {
@@ -1390,6 +1534,7 @@ mod tests {
                             None,
                             100,
                             focus,
+                            None,
                             |ui, table, _a, _c, range| {
                                 let _ = ui;
                                 for i in range {
@@ -1428,5 +1573,221 @@ mod tests {
         // A visible row is left where it is (no re-centering jitter).
         frame(0.032, Some(50));
         assert_eq!(y_of(0.0), y);
+    }
+
+    /// Scroll anchoring: a model rebuild must keep the first previously
+    /// visible row at the same viewport position. Without it the raw pixel
+    /// offset stayed put while a spawned/removed process shifted every row
+    /// above the viewport by one row height.
+    #[allow(clippy::too_many_arguments)]
+    fn anchored_frame(
+        ctx: &egui::Context,
+        screen: egui::Rect,
+        t: f64,
+        table: &mut TmTable,
+        row_count: usize,
+        focus: Option<usize>,
+        model_changed: bool,
+        prefer: Option<u64>,
+        key_of: &dyn Fn(usize) -> u64,
+    ) {
+        let raw = egui::RawInput {
+            screen_rect: Some(screen),
+            time: Some(t),
+            predicted_dt: 1.0 / 60.0,
+            ..Default::default()
+        };
+        let mut out = ctx.run_ui(raw, |root| {
+            egui::CentralPanel::default()
+                .frame(egui::Frame::NONE)
+                .show(root, |ui| {
+                    let avail = table_avail(ui);
+                    scrolled_rows(
+                        "t-anchor",
+                        ui,
+                        &crate::theme::DARK,
+                        table,
+                        avail,
+                        None,
+                        None,
+                        row_count,
+                        focus,
+                        Some(ScrollAnchor {
+                            model_changed,
+                            prefer_key: prefer,
+                            key_of,
+                        }),
+                        |ui, table, _a, _c, range| {
+                            for i in range {
+                                table.row(ui, &crate::theme::DARK, false, i);
+                            }
+                        },
+                    );
+                });
+        });
+        out.textures_delta.clear();
+    }
+
+    fn anchored_offset(ctx: &egui::Context) -> f32 {
+        ctx.data(|d| {
+            d.get_temp::<f32>(egui::Id::new(("tm-rowsy", "t-anchor")))
+                .unwrap_or(0.0)
+        })
+    }
+
+    /// Scroll to a mid-list row and return the resulting offset. Keys are
+    /// `index + 1`, so the top row after focusing row 30 is key 22.
+    fn anchor_baseline(ctx: &egui::Context, table: &mut TmTable) -> f32 {
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(520.0, 300.0));
+        let key = |i: usize| i as u64 + 1;
+        anchored_frame(ctx, screen, 0.000, table, 100, Some(30), false, None, &key);
+        anchored_offset(ctx)
+    }
+
+    #[test]
+    fn insertion_above_the_viewport_keeps_the_same_row_pinned() {
+        let ctx = egui::Context::default();
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(520.0, 300.0));
+        let mut table = table();
+        let base = anchor_baseline(&ctx, &mut table);
+        assert!(base > 0.0, "focus must scroll the viewport");
+
+        let shifted = |i: usize| if i == 0 { 999 } else { i as u64 };
+        anchored_frame(
+            &ctx, screen, 0.016, &mut table, 101, None, true, None, &shifted,
+        );
+        assert!(
+            (anchored_offset(&ctx) - (base + ROW_H)).abs() < 0.51,
+            "one inserted row above must move the offset down one row: {} -> {}",
+            base,
+            anchored_offset(&ctx)
+        );
+    }
+
+    #[test]
+    fn removal_above_the_viewport_keeps_the_same_row_pinned() {
+        let ctx = egui::Context::default();
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(520.0, 300.0));
+        let mut table = table();
+        let base = anchor_baseline(&ctx, &mut table);
+
+        let shifted = |i: usize| i as u64 + 2;
+        anchored_frame(
+            &ctx, screen, 0.016, &mut table, 99, None, true, None, &shifted,
+        );
+        assert!(
+            (anchored_offset(&ctx) - (base - ROW_H)).abs() < 0.51,
+            "one removed row above must move the offset up one row: {} -> {}",
+            base,
+            anchored_offset(&ctx)
+        );
+    }
+
+    #[test]
+    fn vanished_top_row_falls_back_to_the_next_visible_row() {
+        let ctx = egui::Context::default();
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(520.0, 300.0));
+        let mut table = table();
+        let base = anchor_baseline(&ctx, &mut table);
+
+        // The row at the viewport top (key 22) exits; the next row (key 23)
+        // must keep its exact viewport position, so the offset shifts by one
+        // row just as if the top row had been removed cleanly.
+        let skipped = |i: usize| {
+            if i + 1 >= 22 {
+                i as u64 + 2
+            } else {
+                i as u64 + 1
+            }
+        };
+        anchored_frame(
+            &ctx, screen, 0.016, &mut table, 99, None, true, None, &skipped,
+        );
+        assert!(
+            (anchored_offset(&ctx) - (base - ROW_H)).abs() < 0.51,
+            "the next surviving row must stay put: {} -> {}",
+            base,
+            anchored_offset(&ctx)
+        );
+    }
+
+    #[test]
+    fn insertion_between_top_and_selection_keeps_the_selection_in_view() {
+        let ctx = egui::Context::default();
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(520.0, 300.0));
+        let mut table = table();
+        let base = anchor_baseline(&ctx, &mut table);
+
+        // Row 30 (key 31) is selected and sits at the viewport bottom. A new
+        // row lands between the viewport top (key 22) and the selection.
+        // Anchoring to the top would leave the offset alone and push the
+        // selection one row below the viewport; the selection must win.
+        let inserted = |i: usize| {
+            if i < 25 {
+                i as u64 + 1
+            } else if i == 25 {
+                999
+            } else {
+                i as u64
+            }
+        };
+        anchored_frame(
+            &ctx,
+            screen,
+            0.016,
+            &mut table,
+            101,
+            None,
+            true,
+            Some(31),
+            &inserted,
+        );
+        assert!(
+            (anchored_offset(&ctx) - (base + ROW_H)).abs() < 0.51,
+            "the selected row must stay put: {} -> {}",
+            base,
+            anchored_offset(&ctx)
+        );
+    }
+
+    #[test]
+    fn large_reorder_is_not_followed() {
+        let ctx = egui::Context::default();
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(520.0, 300.0));
+        let mut table = table();
+        let base = anchor_baseline(&ctx, &mut table);
+
+        // Rotate the model so the top row lands 40 slots away: a sort or
+        // search reorder, not an insert. Following it would teleport the
+        // viewport, so the offset must stay where the user left it.
+        let rotated = |i: usize| ((i + 60) % 100) as u64 + 1;
+        anchored_frame(
+            &ctx, screen, 0.016, &mut table, 100, None, true, None, &rotated,
+        );
+        assert!(
+            (anchored_offset(&ctx) - base).abs() < 0.51,
+            "a reordered row must not drag the viewport: {} -> {}",
+            base,
+            anchored_offset(&ctx)
+        );
+    }
+
+    #[test]
+    fn fully_replaced_model_leaves_the_offset_alone() {
+        let ctx = egui::Context::default();
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(520.0, 300.0));
+        let mut table = table();
+        let base = anchor_baseline(&ctx, &mut table);
+
+        let all_new = |i: usize| 100_000 + i as u64;
+        anchored_frame(
+            &ctx, screen, 0.016, &mut table, 100, None, true, None, &all_new,
+        );
+        assert!(
+            (anchored_offset(&ctx) - base).abs() < 0.51,
+            "with no surviving row there is nothing to anchor to: {} -> {}",
+            base,
+            anchored_offset(&ctx)
+        );
     }
 }

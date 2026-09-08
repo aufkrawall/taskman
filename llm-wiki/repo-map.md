@@ -90,7 +90,8 @@ platform boundary (`tm-core` ← `tm-platform` ← `tm-app` / `tm-service`):
     Details: native click gestures, identity-keyed, primary vs. full set),
     `widgets/tablekit.rs` (TM-style
     tables: drag-start-width resize math, O(1) layout, `scrolled_rows`
-    virtualization), `widgets/menu.rs` (classic full-width Windows-style
+    virtualization with identity-keyed scroll anchoring across model
+    rebuilds), `widgets/menu.rs` (classic full-width Windows-style
     context menus: uniform 28 px gapless rows, painted check gutter,
     submenus), `widgets/chart.rs` (timestamp-aware charts, kernel
     overlay), `icon_cache.rs` (lazy worker, upload budget, bounded LRU),
@@ -142,6 +143,11 @@ platform boundary (`tm-core` ← `tm-platform` ← `tm-app` / `tm-service`):
   in `row_overlay` and `heat_cells` re-applies it; dropping that makes hover
   stop dead at the first value column. Row height is per-table (`row_h`,
   `ROW_H_DENSE`) and `scrolled_rows` must virtualize on it, never on `ROW_H`.
+  `scrolled_rows` also anchors the vertical offset to the identities of the
+  previously visible rows (`ScrollAnchor` + `stable_key`) on model-rebuild
+  frames, preferring the primary selected row while it is visible, so
+  insertions/removals around the viewport cannot shift the content;
+  `model_changed` must only be set when the caller actually rebuilt the model.
   Resize math MUST accumulate
   each frame's `drag_delta()` onto the LIVE width; `drag_delta()` is
   per-frame movement (NOT cumulative) in egui 0.36, so frozen drag-start

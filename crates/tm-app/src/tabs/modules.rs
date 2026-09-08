@@ -483,6 +483,7 @@ pub fn dialog(app: &mut TaskManApp, ctx: &egui::Context, pal: &theme::Palette) {
                         None,
                         rows.len(),
                         focus,
+                        None,
                         |ui, table, _avail, _content_width, range| {
                             for index in range {
                                 let Some(module) = rows.get(index) else {

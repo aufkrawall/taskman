@@ -1,3 +1,4 @@
+- 2026-09-08: Processes/Details scroll stability: `tablekit::scrolled_rows` anchors the viewport to the top visible row identity across model rebuilds (new/removed processes, tree expand/collapse), and Processes ordering is deterministic (creation-order snapshot sort plus pid tie-breaks) so equal-valued or same-named rows no longer reshuffle every sample.
 - 2026-09-08: Security audit pass: the broker's installing SID must resolve to a user account (group/alias SIDs rejected), file-log verification no longer gates broker startup (a planted `ProgramData\TaskMan\logs` entry could disable the privileged control plane), Win32 scratch buffers are pointer-aligned (`aligned.rs`), Windows release binaries are CET-compatible, `build.py --audit` runs cargo-audit/gitleaks, and `tm-core` denies `unsafe_code` while `tm-platform`/`tm-app` deny `unsafe_op_in_unsafe_fn`.
 - 2026-09-08: `python build.py` now always builds the Linux x86_64 release too: glibc via `cross`/`cargo-zigbuild` when present, otherwise a self-contained static musl PIE linked by the bundled `rust-lld` (rustup std only, no zig/Docker). Fixed `crates/tm-app/build.rs` using HOST `cfg`, which attached the Windows `.res` to Linux links. Linux artifact verified by `--selfcheck` under WSL.
 - 2026-09-08: Full-repository audit fixes: non-Windows backends compile again (`cargo check --target x86_64-unknown-linux-gnu` / `aarch64-apple-darwin`), and `build.py --check` now runs those cross-target checks (CI installs both targets). MSRV corrected to 1.88 (let-chains/`as_chunks`), release `--remap-path-prefix` also strips the checkout root, config/history reads are capped, and the ETW properties buffer is word-aligned.
@@ -7,6 +8,42 @@
 - 2026-09-08: Details gained optional Network / Network receive / Network send columns. PROCESS_NET demand now follows those visible columns and stays active while Process Properties is open, fixing blank live network statistics there without running the ETW session continuously on Details.
 - 2026-09-08: Process Properties now summarizes mitigations with System Informer-style qualifiers (permanent DEP, high-entropy ASLR, prohibited/disabled wording, CF Guard and stack protection), and module inventory uses the authenticated LocalSystem broker for identity-bound SYSTEM/service inspection with bounded responses.
 # Recent Activity
+
+## 2026-09-08 — Scroll anchoring and deterministic process ordering
+
+Two independent jumpiness sources on the Processes/Details pages:
+
+1. **Raw pixel scroll offsets across model rebuilds.** The display model is
+   rebuilt on every sample; a process spawning/exiting above the viewport (or
+   a tree node expanding) shifted every visible row while the offset stayed
+   put. `tablekit::scrolled_rows` now takes an optional `ScrollAnchor`
+   (`model_changed`, `prefer_key`, stable per-row `key_of`) and re-derives
+   the vertical offset from the identities of the previously visible rows,
+   preferring the selected row while it is on screen (a spawn between the
+   viewport top and the selection must not push the row the user is tracking
+   out of view), then falling back to the top row and the next surviving one.
+   A row that moved further than a screenful is treated as a reorder
+   (sort/search) and left alone, so anchoring can never teleport the
+   viewport. `focus_row` still wins.
+   Wired for Processes (`pid`, `start_epoch_s`, aggregate flag, group-header
+   section) and Details (`pid`, `start_epoch_s`); other tabs pass `None`.
+   The Processes key includes the aggregate flag because an expanded family
+   renders its virtual head and the concrete representative with the same
+   pid/start; without it anchoring could pin the wrong row and shift the
+   list by one.
+2. **Snapshot-order-dependent sorting.** sysinfo hands the sampler a hash-map
+   order that changes between ticks. Processes' stable sorts had no
+   tie-breakers, so equal-valued (usually 0% CPU) and same-named rows swapped
+   places every sample. `build_display_rows` now sorts the snapshot by
+   `(start_epoch_s, pid)` once, and `sort_entries`/`sort_blocks_globally`
+   tie-break by pid.
+
+Tests: `insertion/removal_above_the_viewport_keeps_the_same_row_pinned`,
+`vanished_top_row_falls_back_to_the_next_visible_row`,
+`insertion_between_top_and_selection_keeps_the_selection_in_view`,
+`large_reorder_is_not_followed`, `fully_replaced_model_leaves_the_offset_alone`,
+`equal_value_rows_keep_a_stable_order_across_snapshot_permutations`,
+`expanded_family_aggregate_and_concrete_rows_have_distinct_anchor_keys`.
 
 ## 2026-09-08 — Security audit pass (broker, FFI alignment, hardening gate)
 

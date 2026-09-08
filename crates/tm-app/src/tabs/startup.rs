@@ -201,6 +201,7 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
         None,
         visible.len(),
         None,
+        None,
         |ui, table, _avail, _content_w, range| {
             for vi in range {
                 let i = visible[vi];

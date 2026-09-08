@@ -1103,6 +1103,25 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
         .take()
         .and_then(|pid| rows.iter().position(|row| row.pid == pid));
 
+    // The tree is rebuilt every sample and spawns/exits insert rows above the
+    // viewport, which used to shove the visible rows around. Anchor the top
+    // visible process by identity across rebuilds, preferring the selected
+    // row while it is on screen so a new process cannot push it out of view.
+    let selected_key = app
+        .selection
+        .primary()
+        .map(|id| tablekit::stable_key((id.pid, id.start_epoch_s)));
+    let key_of = |i: usize| {
+        rows.get(i).map_or(u64::MAX, |row| {
+            tablekit::stable_key((row.pid, row.start_epoch_s))
+        })
+    };
+    let anchor = tablekit::ScrollAnchor {
+        model_changed: stale,
+        prefer_key: selected_key,
+        key_of: &key_of,
+    };
+
     let clicked = tablekit::scrolled_rows(
         "details",
         ui,
@@ -1113,6 +1132,7 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
         None,
         rows.len(),
         focus_row,
+        Some(anchor),
         |ui, table, _avail, _content_w, range| {
             for i in range {
                 let Some(row) = rows.get(i) else { continue };

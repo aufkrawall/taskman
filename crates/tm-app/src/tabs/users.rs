@@ -324,6 +324,7 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
         Some(&aggs_hdr),
         rows.len(),
         None,
+        None,
         |ui, table, _avail, _content_w, range| {
             for ri in range {
                 match rows.get(ri) {

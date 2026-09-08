@@ -178,6 +178,7 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
         None,
         rows.len(),
         None,
+        None,
         |ui, table, _avail, _content_w, range| {
             for ri in range {
                 let Some(row) = rows.get(ri) else {

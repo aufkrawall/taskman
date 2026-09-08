@@ -344,6 +344,31 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
             .position(|r| matches!(r, DisplayRow::Process(p) if p.pid == pid && row_is_selectable(p, &app.processes_state.expanded)))
     });
 
+    // Keep the viewport pinned to the rows the user is looking at when the
+    // model is rebuilt: the list re-sorts every sample and processes spawn or
+    // exit anywhere, including above the viewport. The selected row wins
+    // while it is visible; when the selection is an expanded family head the
+    // visible highlighted row is its concrete child, not the aggregate row,
+    // so resolve the key through the selectable row.
+    let selected_key = app.selection.primary().and_then(|id| {
+        rows.iter().find_map(|row| match row {
+            DisplayRow::Process(row)
+                if row.pid == id.pid
+                    && row.start_epoch_s == id.start_epoch_s
+                    && row_is_selectable(row, &app.processes_state.expanded) =>
+            {
+                Some(process_row_key(row))
+            }
+            _ => None,
+        })
+    });
+    let key_of = |i: usize| rows.get(i).map_or(u64::MAX, display_row_key);
+    let anchor = tablekit::ScrollAnchor {
+        model_changed: cache_stale,
+        prefer_key: selected_key,
+        key_of: &key_of,
+    };
+
     let clicked = tablekit::scrolled_rows(
         "processes",
         ui,
@@ -354,6 +379,7 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
         Some(&aggs),
         rows.len(),
         focus_row,
+        Some(anchor),
         |ui, table, _avail, content_w, range| {
             for i in range {
                 match rows.get(i) {
@@ -1169,6 +1195,25 @@ fn is_external_family_member(
     true
 }
 
+/// Stable identity for scroll anchoring: process rows key on pid + creation
+/// time + aggregate flag, group headers on their section index. Unlike the
+/// row index this does not move when rows are inserted above the viewport.
+///
+/// The aggregate flag matters: an expanded family renders its virtual
+/// aggregate head AND the concrete representative directly below it, and both
+/// carry the same pid/start. Without the flag their anchor keys collide and
+/// the table can pin the wrong one, shifting the content by a row.
+fn process_row_key(row: &RowData) -> u64 {
+    tablekit::stable_key((row.pid, row.start_epoch_s, row.aggregate))
+}
+
+fn display_row_key(row: &DisplayRow) -> u64 {
+    match row {
+        DisplayRow::GroupHeader(gi, _) => tablekit::stable_key(("process-group", *gi)),
+        DisplayRow::Process(row) => process_row_key(row),
+    }
+}
+
 fn build_display_rows(
     snap: &Snapshot,
     raw_search: &str,
@@ -1178,7 +1223,13 @@ fn build_display_rows(
     group_collapsed: &[bool; 3],
 ) -> Vec<DisplayRow> {
     let q = search::Query::new(raw_search);
-    let all: Vec<&ProcessEntry> = snap.processes.iter().collect();
+    // The sampler hands us sysinfo's hash-map order, which is not stable
+    // between ticks. Sort once by creation time so every later HashMap walk,
+    // stable-sort tie and family-head choice is deterministic — otherwise
+    // rows with equal values swapped places on every sample and the list
+    // visibly churned under the cursor.
+    let mut all: Vec<&ProcessEntry> = snap.processes.iter().collect();
+    all.sort_by_key(|p| (p.start_epoch_s, p.pid));
     let grouping = derive_display_groups(&all);
     let children_all = display_children_map(&all, &grouping.category, &grouping.app_roots);
     let subtree = subtree_rollups(&all, &children_all);
@@ -1291,7 +1342,10 @@ fn sort_blocks_globally(rows: &mut Vec<DisplayRow>, sort_col: usize, ascending: 
         let o = x.values[vi]
             .partial_cmp(&y.values[vi])
             .unwrap_or(std::cmp::Ordering::Equal);
-        if ascending { o } else { o.reverse() }
+        let o = if ascending { o } else { o.reverse() };
+        // Equal values must not inherit an arbitrary emission order: without
+        // this the blocks reshuffled whenever the snapshot order changed.
+        o.then_with(|| x.pid.cmp(&y.pid))
     });
     rows.extend(blocks.into_iter().flatten());
 }
@@ -2263,7 +2317,10 @@ fn sort_entries(v: &mut [&ProcessEntry], col: usize, asc: bool, subtree: &HashMa
                 .unwrap_or(std::cmp::Ordering::Equal),
             _ => cmp_ignore_case(a.shown_name(), b.shown_name()),
         };
-        if asc { o } else { o.reverse() }
+        let o = if asc { o } else { o.reverse() };
+        // Deterministic tie-break: stable sorting alone preserves the input
+        // order, and that input (a hash-map walk) changes between samples.
+        o.then_with(|| a.pid.cmp(&b.pid))
     });
 }
 
@@ -3738,5 +3795,88 @@ mod tests {
             &[false; 3],
         );
         assert!(rows_in_group(&rows, 1)[0].tooltip.is_none());
+    }
+
+    /// Regression: sysinfo hands us a hash-map order that changes between
+    /// samples. Equal-valued rows (and same-named ones) used to inherit that
+    /// order through the stable sorts, so they swapped places every tick.
+    #[test]
+    fn equal_value_rows_keep_a_stable_order_across_snapshot_permutations() {
+        let make = || {
+            let mut a = proc(2, Some(100), "worker.exe", ProcCategory::Background);
+            let mut b = proc(3, Some(101), "worker.exe", ProcCategory::Background);
+            for process in [&mut a, &mut b] {
+                process.cpu_pct = 0.0;
+                process.mem_bytes = 0;
+                process.start_epoch_s = Some(1000);
+            }
+            (a, b)
+        };
+        let pids = |rows: &[DisplayRow]| {
+            rows.iter()
+                .filter_map(|row| match row {
+                    DisplayRow::Process(row) => Some(row.pid),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+
+        for (sort_col, ascending) in [(0usize, true), (2usize, false), (3usize, false)] {
+            let (a, b) = make();
+            let forward = build_display_rows(
+                &snap_of(vec![a, b]),
+                "",
+                sort_col,
+                ascending,
+                &HashSet::new(),
+                &[false; 3],
+            );
+            let (a, b) = make();
+            let reversed = build_display_rows(
+                &snap_of(vec![b, a]),
+                "",
+                sort_col,
+                ascending,
+                &HashSet::new(),
+                &[false; 3],
+            );
+            assert_eq!(
+                pids(&forward),
+                pids(&reversed),
+                "sort column {sort_col} must not depend on snapshot order"
+            );
+            assert_eq!(
+                pids(&forward),
+                vec![2, 3],
+                "ties break by pid (column {sort_col})"
+            );
+        }
+    }
+
+    /// An expanded family renders its virtual aggregate head and the concrete
+    /// representative as two rows with the same pid/start. Their anchor keys
+    /// must differ, or scroll anchoring can pin the wrong one and shift the
+    /// list by a row.
+    #[test]
+    fn expanded_family_aggregate_and_concrete_rows_have_distinct_anchor_keys() {
+        let mut root = proc(7, None, "app.exe", ProcCategory::App);
+        root.start_epoch_s = Some(1000);
+        let mut child = proc(8, Some(7), "app.exe", ProcCategory::App);
+        child.start_epoch_s = Some(1001);
+        let snap = snap_of(vec![root, child]);
+        let expanded = HashSet::from([7u32]);
+        let rows = build_display_rows(&snap, "", 0, true, &expanded, &[false; 3]);
+
+        let mut keys = Vec::new();
+        for row in &rows {
+            if let DisplayRow::Process(row) = row
+                && row.pid == 7
+            {
+                keys.push((row.aggregate, process_row_key(row)));
+            }
+        }
+        assert_eq!(keys.len(), 2, "aggregate head + concrete representative");
+        assert!(keys[0].0 && !keys[1].0, "aggregate row comes first");
+        assert_ne!(keys[0].1, keys[1].1, "anchor keys must be unique");
     }
 }
