@@ -1,0 +1,30 @@
+name: Apply native Task Manager launch fix
+on:
+  push:
+    branches: [fix/native-task-manager-launch]
+    paths:
+      - .github/workflows/apply-native-taskmgr-launch-fix.yml
+permissions:
+  contents: write
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: fix/native-task-manager-launch
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Apply launch fix
+        run: python .github/scripts/apply_native_taskmgr_launch_fix.py
+      - name: Commit fix
+        shell: bash
+        run: |
+          rm .github/workflows/apply-native-taskmgr-launch-fix.yml
+          rm .github/scripts/apply_native_taskmgr_launch_fix.py
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add crates/tm-platform/src/win/taskmgr_replacement.rs .github
+          git commit -m "Fix native Task Manager launch"
+          git push origin HEAD:fix/native-task-manager-launch
