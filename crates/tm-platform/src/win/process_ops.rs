@@ -398,6 +398,10 @@ pub fn list_process_modules(
     pid: u32,
     expected_start_epoch_s: Option<i64>,
 ) -> Result<Vec<ProcessModule>> {
+    // ToolHelp module snapshots of SYSTEM/service processes may require the
+    // caller's SeDebugPrivilege to be enabled even when the token owns it.
+    // This is best-effort and does not weaken the creation-time identity gate.
+    enable_debug_privilege();
     let process = open_process_verified(
         pid,
         th::PROCESS_QUERY_LIMITED_INFORMATION,

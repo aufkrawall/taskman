@@ -54,12 +54,12 @@ pub const SERVICE_DISPLAY_NAME: &str = "TaskMan Core Service";
 pub const SERVICE_EXE_NAME: &str = "taskman-service.exe";
 pub const GUI_EXE_NAME: &str = "taskman.exe";
 pub const SERVICE_LOG_FILE_PREFIX: &str = "taskman-service.log";
-// v2 added `ProcessNetworkCounters`. A version bump (rather than a new
-// variant on v1) is deliberate: it makes an older service fail the handshake,
-// which the client can tell apart from a REJECTION and therefore fall back on.
-// Sneaking the variant into v1 would have made "unsupported" look like
-// "denied", and the no-fallback-on-rejection rule depends on that distinction.
-pub const PROTOCOL_VERSION: u16 = 2;
+// v2 added `ProcessNetworkCounters`; v3 adds identity-bound module
+// inventory so an unelevated GUI can inspect SYSTEM/service processes through
+// its authenticated LocalSystem broker. Version bumps are deliberate: an old
+// service fails the handshake as unavailable, allowing the GUI's safe local
+// fallback instead of misclassifying an unknown request as a rejection.
+pub const PROTOCOL_VERSION: u16 = 3;
 
 const PIPE_NAME: &str = r"\\.\pipe\Taskman.Core.v1";
 const FRAME_MAGIC: [u8; 4] = *b"TMB1";
@@ -67,7 +67,11 @@ const FRAME_REQUEST: u16 = 1;
 const FRAME_RESPONSE: u16 = 2;
 const FRAME_HEADER_LEN: usize = 12;
 const MAX_REQUEST_BYTES: usize = 64 * 1024;
-const MAX_RESPONSE_BYTES: usize = 64 * 1024;
+// Module inventories contain paths and can legitimately exceed 64 KiB. Keep
+// responses bounded, but give the authenticated read-only inventory enough
+// room for normal large processes without silently truncating it.
+const MAX_RESPONSE_BYTES: usize = 512 * 1024;
+const MAX_MODULES_PER_RESPONSE: usize = 1024;
 const PIPE_BUFFER_BYTES: u32 = 64 * 1024;
 const WORKER_COUNT: usize = 2;
 const WORK_QUEUE_CAP: usize = 16;
@@ -145,6 +149,12 @@ enum BrokerRequest {
         pid: u32,
         expected_start_epoch_s: Option<i64>,
     },
+    /// Read-only, identity-bound module inventory. This is brokered because
+    /// ordinary GUI tokens cannot snapshot many SYSTEM/service processes.
+    ProcessModules {
+        pid: u32,
+        expected_start_epoch_s: Option<i64>,
+    },
     UnloadModule {
         pid: u32,
         expected_start_epoch_s: Option<i64>,
@@ -210,6 +220,7 @@ enum BrokerValue {
     TaskManagerReplacementState(TaskManagerReplacementState),
     ProcessNetwork(ProcessNetworkSample),
     ProcessSecurity(super::ProcessSecurityInfo),
+    ProcessModules(Vec<ProcessModule>),
     /// Result of `UnloadModule`. `released` is retained only for compatibility
     /// with the earlier v2 wire shape; it now means successful remote
     /// FreeLibrary calls, not an observable loader-reference count. `verified`
@@ -879,11 +890,27 @@ impl PlatformActions for BrokeredActions {
         pid: u32,
         expected_start_epoch_s: Option<i64>,
     ) -> Result<Vec<ProcessModule>> {
-        // Module inventory is telemetry, not a privileged action. Keeping it
-        // in the user process prevents the LocalSystem broker from becoming a
-        // cross-session information oracle. Exact unload requests are still
-        // re-enumerated and validated inside the broker before execution.
-        self.local.list_process_modules(pid, expected_start_epoch_s)
+        let Some(start_epoch_s) = expected_start_epoch_s.filter(|value| *value > 0) else {
+            // The local path still performs a handle-before/after creation-time
+            // check around ToolHelp enumeration, so processes without sampled
+            // creation metadata retain the pre-broker behavior safely.
+            return self.local.list_process_modules(pid, expected_start_epoch_s);
+        };
+        let local = || self.local.list_process_modules(pid, Some(start_epoch_s));
+        match self.client.call(BrokerRequest::ProcessModules {
+            pid,
+            expected_start_epoch_s: Some(start_epoch_s),
+        }) {
+            Ok(BrokerValue::ProcessModules(modules)) => Ok(modules),
+            Ok(_) => Err(TmError::platform(
+                "core service",
+                "unexpected process-modules response type",
+            )),
+            Err(BrokerCallError::Unavailable(_)) => local(),
+            Err(BrokerCallError::Rejected(detail)) => {
+                local().map_err(|_| TmError::platform("core service", detail))
+            }
+        }
     }
 
     fn unload_process_module(
@@ -1484,6 +1511,34 @@ fn dispatch(
             Ok(BrokerValue::ProcessSecurity(
                 super::process_ops::process_security_info(pid, Some(start_epoch_s))?,
             ))
+        }
+        BrokerRequest::ProcessModules {
+            pid,
+            expected_start_epoch_s,
+        } => {
+            let Some(start_epoch_s) = expected_start_epoch_s.filter(|value| *value > 0) else {
+                return Err(TmError::platform(
+                    "broker process modules",
+                    "a valid sampled process creation time is required",
+                ));
+            };
+            let modules = super::process_ops::list_process_modules(pid, Some(start_epoch_s))?;
+            if modules.len() > MAX_MODULES_PER_RESPONSE {
+                return Err(TmError::platform(
+                    "broker process modules",
+                    "module inventory exceeds the bounded broker entry limit",
+                ));
+            }
+            let encoded_len = serde_json::to_vec(&modules)
+                .map_err(|error| TmError::platform("broker process modules", error.to_string()))?
+                .len();
+            if encoded_len > MAX_RESPONSE_BYTES.saturating_sub(1024) {
+                return Err(TmError::platform(
+                    "broker process modules",
+                    "module inventory exceeds the bounded broker response limit",
+                ));
+            }
+            Ok(BrokerValue::ProcessModules(modules))
         }
         BrokerRequest::KillProcess {
             pid,

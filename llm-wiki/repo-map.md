@@ -49,7 +49,7 @@ platform boundary (`tm-core` ← `tm-platform` ← `tm-app` / `tm-service`):
     `net_etw.rs` (real-time ETW session for per-process network bytes; the
     session name MUST stay fixed per role — a pid in it leaks an orphaned
     session on every kill until the provider stops delivering events),
-    `core_service.rs` (versioned authenticated named-pipe broker plus secure
+    `core_service.rs` (versioned authenticated named-pipe broker, including bounded identity-bound process-security/module reads for protected targets, plus secure
     SCM/Program Files/ProgramData install lifecycle, including pinned
     reparse/hard-link-resistant owner/group/DACL repair), `autostart.rs` (owned-command-
     only HKCU startup migration), `taskmgr_replacement.rs` (owned IFEO
@@ -202,7 +202,7 @@ platform boundary (`tm-core` ← `tm-platform` ← `tm-app` / `tm-service`):
   `floating_allocated_width`, not from turning `floating` off; `tablekit`'s
   header must mirror the body's reservation (`prev_bar_use`).
 - `crates/tm-platform/src/win/core_service.rs` — privileged trust boundary.
-  Do not add arbitrary commands, output paths, or telemetry to its protocol.
+  Do not add arbitrary commands, output paths, or unbounded/generic telemetry to its protocol.
   Preserve exact PID+creation-time checks, client/server executable binding,
   bounded framing/queues, protected ACLs, reparse rejection, and pinned-copy
   upgrade semantics. See `core-service.md`.

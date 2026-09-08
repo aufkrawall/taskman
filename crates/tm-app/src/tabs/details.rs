@@ -2411,57 +2411,85 @@ fn machine_type_label(machine: Option<tm_platform::win::ProcessMachineType>) -> 
 
 #[cfg(target_os = "windows")]
 fn active_mitigation_summary(info: &tm_platform::win::ProcessSecurityInfo) -> String {
-    let mut active = Vec::new();
+    let mut active = Vec::<String>::new();
     if info.dep.is_some_and(|flags| flags & 0x1 != 0) {
-        active.push("DEP");
+        active.push(if info.dep_permanent == Some(true) {
+            "DEP (permanent)".into()
+        } else {
+            "DEP".into()
+        });
     }
-    if info.aslr.is_some_and(|flags| flags & 0x7 != 0) {
-        active.push("ASLR");
+    if let Some(flags) = info.aslr.filter(|flags| flags & 0x7 != 0) {
+        active.push(if flags & 0x4 != 0 {
+            "ASLR (high entropy)".into()
+        } else if flags & 0x2 != 0 {
+            "ASLR (forced relocation)".into()
+        } else {
+            "ASLR".into()
+        });
     }
     if info.dynamic_code.is_some_and(|flags| flags & 0x1 != 0) {
-        active.push("Dynamic code");
+        active.push("Dynamic code prohibited".into());
     }
     if info.strict_handle.is_some_and(|flags| flags & 0x1 != 0) {
-        active.push("Strict handles");
+        active.push("Strict handle checks".into());
     }
     if info.extension_point.is_some_and(|flags| flags & 0x1 != 0) {
-        active.push("Extension points");
+        active.push("Extension points disabled".into());
     }
-    if info
-        .control_flow_guard
-        .is_some_and(|flags| flags & 0x1 != 0)
-    {
-        active.push("CFG");
+    if let Some(flags) = info.control_flow_guard.filter(|flags| flags & 0x1 != 0) {
+        active.push(if flags & 0x4 != 0 {
+            "CF Guard (strict)".into()
+        } else {
+            "CF Guard".into()
+        });
     }
     if info.system_call.is_some_and(|flags| flags & 0x1 != 0) {
-        active.push("Win32k lockdown");
+        active.push("Win32k system calls disabled".into());
     }
-    if info.signature.is_some_and(|flags| flags & 0x3 != 0) {
-        active.push("Code integrity");
+    if let Some(flags) = info.signature {
+        if flags & 0x1 != 0 {
+            active.push("Microsoft-signed images only".into());
+        }
+        if flags & 0x2 != 0 {
+            active.push("Store-signed images only".into());
+        }
     }
     if info.font.is_some_and(|flags| flags & 0x1 != 0) {
-        active.push("Font lockdown");
+        active.push("Non-system fonts disabled".into());
     }
-    if info.image_load.is_some_and(|flags| flags & 0x7 != 0) {
-        active.push("Image-load policy");
+    if let Some(flags) = info.image_load {
+        if flags & 0x1 != 0 {
+            active.push("Remote images blocked".into());
+        }
+        if flags & 0x2 != 0 {
+            active.push("Low-integrity images blocked".into());
+        }
+        if flags & 0x4 != 0 {
+            active.push("Prefer System32 images".into());
+        }
     }
     if info.child_process.is_some_and(|flags| flags & 0x1 != 0) {
-        active.push("No child processes");
+        active.push("Child process creation blocked".into());
     }
-    if info.user_shadow_stack.is_some_and(|flags| flags & 0x1 != 0) {
-        active.push("CET shadow stack");
+    if let Some(flags) = info.user_shadow_stack.filter(|flags| flags & 0x1 != 0) {
+        active.push(if flags & 0x10 != 0 {
+            "Stack protection (strict)".into()
+        } else {
+            "Stack protection".into()
+        });
     }
     if info.sehop.is_some_and(|flags| flags & 0x1 != 0) {
-        active.push("SEHOP");
+        active.push("SEHOP".into());
     }
     if info.side_channel.is_some_and(|flags| flags & 0x1f != 0) {
-        active.push("Side-channel isolation");
+        active.push("Side-channel isolation".into());
     }
     if info
         .payload_restriction
         .is_some_and(|flags| flags & 0x555 != 0)
     {
-        active.push("Payload restrictions");
+        active.push("Exploit payload restrictions".into());
     }
     if active.is_empty() {
         i18n::tr(K::NoneWord).to_string()

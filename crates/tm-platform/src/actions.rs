@@ -84,6 +84,7 @@ pub struct ProcessExtra {
 /// platform revalidates identity and base/path at action time, and the
 /// honest [`ModuleUnloadOutcome`] says whether the module actually left.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(target_os = "windows", derive(serde::Serialize, serde::Deserialize))]
 pub struct ProcessModule {
     pub name: String,
     pub path: String,
@@ -93,12 +94,11 @@ pub struct ProcessModule {
 
 /// Wire/request capability marker appended to module paths by current GUIs.
 ///
-/// Windows file names cannot contain NUL, so an older v2 service cannot ever
-/// mistake the marked string for a real ToolHelp module path: its exact
-/// base/path revalidation fails before it reaches its former multi-call
-/// `FreeLibrary` loop. Current platform code strips the marker before normal
-/// validation. This makes a new GUI safe when an installed service has not yet
-/// been upgraded, without changing the whole broker protocol version.
+/// Windows file names cannot contain NUL, so a stale implementation cannot
+/// mistake the marked string for a real ToolHelp module path: exact base/path
+/// revalidation fails before any legacy multi-call `FreeLibrary` loop. Protocol
+/// v3 now also rejects older brokers at the handshake, but the marker remains a
+/// defense-in-depth invariant for direct/local and mixed-binary execution.
 pub const MODULE_UNLOAD_SINGLE_RELEASE_MARKER: &str = "\0taskman-single-release-v1";
 
 /// What could be verified after one remote `FreeLibrary` request completed.

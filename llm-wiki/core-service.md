@@ -33,7 +33,7 @@ contract.
 
 ## IPC and authorization
 
-- Protocol v1 uses `\\.\pipe\Taskman.Core.v1` with fixed 12-byte framed JSON.
+- Protocol v3 uses `\\.\pipe\Taskman.Core.v1` with fixed 12-byte framed JSON.
   Requests and responses are independently capped at 64 KiB; unknown request
   fields are rejected.
 - The pipe rejects remote clients and uses first-instance creation to prevent
@@ -75,14 +75,23 @@ identity could not be captured; it never falls back to an unverified child PID.
 
 Allowlisted operations are process/tree termination, suspend/resume, priority,
 affinity, efficiency mode, UAC virtualization, guarded module unload, service
-control, user-session control, Task Manager replacement integration, and one
-read-only telemetry query (`ProcessNetworkCounters`). There is deliberately no
-generic Win32 call, shell command, file write, or dump path.
+control, user-session control, Task Manager replacement integration, and narrow
+read-only queries for network counters, process hardening state, and exact
+PID+creation-time-bound module inventory. Module inventory exists specifically
+so the pinned GUI can inspect SYSTEM/service processes without elevating the
+whole UI; it is capped by module count, aggregate text bytes, and the 512 KiB
+response frame. There is deliberately no generic Win32 call, shell command,
+file write, or dump path.
 
-### The one telemetry endpoint, and why it was allowed
+### Read-only diagnostics endpoints
 
-This protocol previously had NO telemetry endpoint at all. `ProcessNetworkCounters`
-was added deliberately, protocol v2, after weighing it:
+The broker started with no telemetry endpoints. `ProcessNetworkCounters` was
+added deliberately in protocol v2; protocol v3 additionally carries bounded,
+identity-bound process security and module inspection needed by Process
+Properties. These reads are allowed for the same pinned GUI that already has
+stronger process-control capabilities, and they remain narrow rather than
+becoming a generic cross-session query interface. The original network decision
+was based on:
 
 - Per-process network bytes come from an ETW session, which Windows grants only
   to administrators. Keeping it GUI-side meant the whole GUI had to run
