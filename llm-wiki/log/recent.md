@@ -4,6 +4,19 @@
 - 2026-09-08: Process Properties now summarizes mitigations with System Informer-style qualifiers (permanent DEP, high-entropy ASLR, prohibited/disabled wording, CF Guard and stack protection), and module inventory uses the authenticated LocalSystem broker for identity-bound SYSTEM/service inspection with bounded responses.
 # Recent Activity
 
+## 2026-09-08 — CI gate red on main; blind-spot fix
+
+Main CI (quality gate) failed on several consecutive bot-merge commits:
+missing `cargo fmt` across four files, a test still calling the removed
+`Subtree::values()` accessor (E0599 in
+`crates/tm-app/src/tabs/processes.rs`), and clippy
+`redundant_closure_call` in `crates/tm-platform/src/win/process_ops.rs`. Fixed by
+formatting, switching the test to direct map indexing (`st.values[&1][0]`;
+asserted pids always have rollups, so no defaulting is lost), and replacing the
+IIFE with a plain block (no early returns). Root cause of the landings:
+branch CI runs were seconds-long no-ops that still reported success —
+see build.md § CI. Commit `c218a97`; CI green after.
+
 ## 2026-09-08 — Process groups use virtual aggregate parents
 
 1. **Group totals are no longer disguised as a real process.** Every expandable

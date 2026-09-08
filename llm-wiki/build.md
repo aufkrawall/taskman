@@ -67,6 +67,18 @@ git config --local lfs.allowincompletepush true
 Nested inside a release artifact build when run as
 `python build.py --host-only --check`.
 
+## CI
+
+`.github/workflows/ci.yml` runs one Windows job that executes
+`python build.py --check`; triggers are push to `main` and `pull_request`.
+The gate takes ~16 min on the runner. Pitfall observed 2026-09-08:
+feature-branch pushes produced 9–14 s "success" runs that validated
+nothing, while the corresponding main-push runs failed — bot-authored
+cleanup commits (removed `Subtree::values`, unformatted merges) landed on
+main through that blind spot. Never treat a branch-only CI success as
+green; merge validation happens on the main push. `cargo fmt` output must
+be applied as-is (no rustfmt.toml; defaults, max 100).
+
 ## Local release binary freshness
 
 `target/release/taskman.exe` is the binary that gets launched locally.
