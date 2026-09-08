@@ -318,8 +318,7 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
         if let Some(pid) = search::type_ahead_match(candidates, selected, &typed)
             && let Some(row) = rows.iter().find_map(|row| match row {
                 DisplayRow::Process(row)
-                    if row.pid == pid
-                        && row_is_selectable(row, &app.processes_state.expanded) =>
+                    if row.pid == pid && row_is_selectable(row, &app.processes_state.expanded) =>
                 {
                     Some(row)
                 }
@@ -395,9 +394,7 @@ fn handle_keyboard_navigation(app: &mut TaskManApp, ctx: &egui::Context, rows: &
         .iter()
         .enumerate()
         .filter_map(|(display_idx, row)| match row {
-            DisplayRow::Process(row)
-                if row_is_selectable(row, &app.processes_state.expanded) =>
-            {
+            DisplayRow::Process(row) if row_is_selectable(row, &app.processes_state.expanded) => {
                 Some((display_idx, row))
             }
             _ => None,
@@ -536,34 +533,6 @@ fn identity_of(row: &RowData) -> crate::app::ProcessIdentity {
 
 fn row_is_selectable(row: &RowData, expanded: &HashSet<u32>) -> bool {
     !row.synthetic && (!row.aggregate || !expanded.contains(&row.pid))
-}
-
-/// Exact identities hidden behind one collapsed Apps-tree row. This walk is
-/// only performed for rows that are actually emitted while collapsed; an
-/// expanded branch stores single-process targets and lets its visible child
-/// rows carry their own scope. The total retained target set therefore stays
-/// linear in the visible process model rather than duplicating every subtree.
-fn collapsed_tree_targets<'a>(
-    root: &'a ProcessEntry,
-    children: &HashMap<u32, Vec<&'a ProcessEntry>>,
-) -> Vec<crate::app::ProcessIdentity> {
-    let mut targets = Vec::new();
-    let mut seen = HashSet::new();
-    let mut stack = vec![root];
-    while let Some(process) = stack.pop() {
-        if !seen.insert(process.pid) {
-            continue;
-        }
-        if !process.synthetic {
-            targets.push(process_identity(process));
-        }
-        if let Some(kids) = children.get(&process.pid) {
-            for child in kids.iter().rev() {
-                stack.push(*child);
-            }
-        }
-    }
-    targets
 }
 
 fn resolve_termination_targets(
@@ -2063,9 +2032,7 @@ fn emit_tree<'a>(
         }));
 
         if expanded.contains(&root.pid) {
-            emit_expanded_tree_members(
-                out, root, children, &members, sort_col, ascending,
-            );
+            emit_expanded_tree_members(out, root, children, &members, sort_col, ascending);
         }
     }
 }
@@ -2101,7 +2068,10 @@ fn emit_expanded_tree_members<'a>(
         .iter()
         .map(|process| (process.pid, own_values(process)))
         .collect::<HashMap<_, _>>();
-    let member_pids = members.iter().map(|process| process.pid).collect::<HashSet<_>>();
+    let member_pids = members
+        .iter()
+        .map(|process| process.pid)
+        .collect::<HashSet<_>>();
     let mut seen = HashSet::new();
     let mut stack = vec![(root, 1usize)];
     while let Some((process, depth)) = stack.pop() {
@@ -2127,7 +2097,6 @@ fn emit_expanded_tree_members<'a>(
 struct Subtree {
     /// cpu %, mem bytes, disk bps, net bps summed over the display subtree.
     values: HashMap<u32, [f64; 4]>,
-    counts: HashMap<u32, u32>,
     /// True when the process OR any of its display descendants runs in
     /// efficiency mode. A collapsed `Brave Browser (24)` row summarizes its
     /// children's resources, so it must summarize their power state too —
@@ -2141,10 +2110,6 @@ struct Subtree {
 impl Subtree {
     fn values(&self, pid: u32) -> [f64; 4] {
         self.values.get(&pid).copied().unwrap_or([0.0; 4])
-    }
-
-    fn count(&self, pid: u32) -> u32 {
-        self.counts.get(&pid).copied().unwrap_or(1)
     }
 
     fn efficiency(&self, pid: u32) -> bool {
@@ -2164,7 +2129,6 @@ fn subtree_values_and_counts<'a>(
     children: &HashMap<u32, Vec<&'a ProcessEntry>>,
 ) -> Subtree {
     let mut out: HashMap<u32, [f64; 4]> = HashMap::with_capacity(all.len());
-    let mut counts: HashMap<u32, u32> = HashMap::with_capacity(all.len());
     let mut eco: HashMap<u32, bool> = HashMap::with_capacity(all.len());
     let mut statuses: HashMap<u32, ProcStatus> = HashMap::with_capacity(all.len());
     let by_pid: HashMap<u32, &'a ProcessEntry> = all.iter().map(|p| (p.pid, *p)).collect();
@@ -2184,13 +2148,11 @@ fn subtree_values_and_counts<'a>(
         while let Some(frame) = stack.pop() {
             match frame {
                 Frame::Combine(pid, kids, mut acc, mut throttled, mut status) => {
-                    let mut cnt: u32 = 1;
                     for k in &kids {
                         if let Some(v) = out.get(&k.pid) {
                             for i in 0..4 {
                                 acc[i] += v[i];
                             }
-                            cnt += counts.get(&k.pid).copied().unwrap_or(1);
                             throttled |= eco.get(&k.pid).copied().unwrap_or(false);
                             if let Some(&child_status) = statuses.get(&k.pid) {
                                 if child_status == ProcStatus::NotResponding {
@@ -2204,7 +2166,6 @@ fn subtree_values_and_counts<'a>(
                         }
                     }
                     out.insert(pid, acc);
-                    counts.insert(pid, cnt);
                     eco.insert(pid, throttled);
                     statuses.insert(pid, status);
                     done.insert(pid);
@@ -2232,7 +2193,6 @@ fn subtree_values_and_counts<'a>(
                         .collect();
                     if pending.is_empty() {
                         out.insert(pid, own_values(p));
-                        counts.insert(pid, 1);
                         eco.insert(pid, p.power_throttled == Some(true));
                         statuses.insert(pid, p.status);
                         done.insert(pid);
@@ -2255,14 +2215,12 @@ fn subtree_values_and_counts<'a>(
     }
     for p in all {
         out.entry(p.pid).or_insert_with(|| own_values(p));
-        counts.entry(p.pid).or_insert(1);
         eco.entry(p.pid)
             .or_insert_with(|| p.power_throttled == Some(true));
         statuses.entry(p.pid).or_insert(p.status);
     }
     Subtree {
         values: out,
-        counts,
         efficiency: eco,
         status: statuses,
     }
@@ -2483,7 +2441,13 @@ mod tests {
                 _ => None,
             })
             .expect("expanded concrete root");
-        assert_eq!(root.termination_targets.iter().map(|identity| identity.pid).collect::<Vec<_>>(), [1]);
+        assert_eq!(
+            root.termination_targets
+                .iter()
+                .map(|identity| identity.pid)
+                .collect::<Vec<_>>(),
+            [1]
+        );
         let child = rows
             .iter()
             .find_map(|row| match row {
@@ -2491,7 +2455,14 @@ mod tests {
                 _ => None,
             })
             .expect("expanded child");
-        assert_eq!(child.termination_targets.iter().map(|identity| identity.pid).collect::<Vec<_>>(), [2]);
+        assert_eq!(
+            child
+                .termination_targets
+                .iter()
+                .map(|identity| identity.pid)
+                .collect::<Vec<_>>(),
+            [2]
+        );
     }
 
     #[test]
@@ -2699,7 +2670,10 @@ mod tests {
         assert_eq!(apps.len(), 5, "virtual group plus all four real processes");
         assert_eq!(apps[0].name, "Brave [4]");
         assert!(apps[0].aggregate);
-        assert_eq!((apps[1].pid, apps[1].depth, apps[1].aggregate), (1, 1, false));
+        assert_eq!(
+            (apps[1].pid, apps[1].depth, apps[1].aggregate),
+            (1, 1, false)
+        );
         assert_eq!((apps[2].pid, apps[2].depth), (2, 2));
         assert_eq!((apps[3].pid, apps[3].depth), (3, 3));
         assert_eq!((apps[4].pid, apps[4].depth), (4, 4));
@@ -2728,8 +2702,14 @@ mod tests {
         assert_eq!(apps.len(), 3);
         assert!(apps[0].aggregate);
         assert_eq!(apps[0].values[0], 3.0);
-        assert_eq!((apps[1].pid, apps[1].values[0], apps[1].values[1]), (1, 1.0, 100.0));
-        assert_eq!((apps[2].pid, apps[2].values[0], apps[2].values[1]), (2, 2.0, 200.0));
+        assert_eq!(
+            (apps[1].pid, apps[1].values[0], apps[1].values[1]),
+            (1, 1.0, 100.0)
+        );
+        assert_eq!(
+            (apps[2].pid, apps[2].values[0], apps[2].values[1]),
+            (2, 2.0, 200.0)
+        );
     }
 
     #[test]
@@ -3035,10 +3015,17 @@ mod tests {
             &groups,
         );
         let bg_open = rows_in_group(&open, 1);
-        assert_eq!(bg_open.len(), 5, "virtual group row plus all four real members");
+        assert_eq!(
+            bg_open.len(),
+            5,
+            "virtual group row plus all four real members"
+        );
         assert_eq!(bg_open[0].name, "Dropbox.exe [4]");
         assert!(bg_open[0].aggregate);
-        assert_eq!(bg_open[1].pid, 1, "the concrete former head is the first child");
+        assert_eq!(
+            bg_open[1].pid, 1,
+            "the concrete former head is the first child"
+        );
         assert!(bg_open[1..].iter().all(|r| r.depth == 1 && !r.aggregate));
         assert!(bg_open[1..].iter().all(|r| !r.children));
     }
@@ -3684,7 +3671,10 @@ mod tests {
         let DisplayRow::Process(head_row) = &rows[0] else {
             panic!("first row must be a process row");
         };
-        assert!(head_row.children && head_row.aggregate, "first row is the virtual family aggregate");
+        assert!(
+            head_row.children && head_row.aggregate,
+            "first row is the virtual family aggregate"
+        );
         let DisplayRow::Process(real_root) = &rows[1] else {
             panic!("second row must be the real root");
         };
