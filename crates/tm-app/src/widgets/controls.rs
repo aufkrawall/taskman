@@ -63,6 +63,7 @@ pub fn checkbox_enabled(
     }
 
     let hovered = enabled && resp.hovered();
+    let focused = enabled && resp.has_focus();
     let pressed = enabled && resp.is_pointer_button_down_on();
 
     let (fill, border) = if *checked {
@@ -104,6 +105,16 @@ pub fn checkbox_enabled(
     p.rect_filled(box_rect, radius, fill);
     if border != Stroke::NONE {
         p.rect_stroke(box_rect, radius, border, egui::StrokeKind::Inside);
+    }
+    if focused {
+        // Keyboard focus must be visible even for this hand-painted control;
+        // egui cannot supply its normal checkbox focus ring for us.
+        p.rect_stroke(
+            box_rect.expand(2.0),
+            CornerRadius::same(6),
+            Stroke::new(1.5, pal.accent),
+            egui::StrokeKind::Outside,
+        );
     }
 
     if *checked {

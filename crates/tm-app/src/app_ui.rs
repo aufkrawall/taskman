@@ -1167,7 +1167,97 @@ pub fn process_end_dialog(app: &mut TaskManApp, ctx: &egui::Context) {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RunTaskDialogFocus {
+    Command,
+    Elevated,
+    Cancel,
+    Browse,
+    Ok,
+}
+
+impl RunTaskDialogFocus {
+    fn next(self, backwards: bool) -> Self {
+        use RunTaskDialogFocus::*;
+        const ORDER: [RunTaskDialogFocus; 5] = [Command, Elevated, Cancel, Browse, Ok];
+        let index = ORDER
+            .iter()
+            .position(|candidate| *candidate == self)
+            .expect("known run-dialog focus target");
+        let next = if backwards {
+            (index + ORDER.len() - 1) % ORDER.len()
+        } else {
+            (index + 1) % ORDER.len()
+        };
+        ORDER[next]
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RunTaskDialogAction {
+    Submit,
+    Cancel,
+    Browse,
+    ToggleElevated,
+}
+
+/// Native-dialog keyboard semantics: Enter activates the focused push button,
+/// otherwise it invokes the default OK action. Space toggles the checkbox or
+/// activates a focused push button, but remains ordinary text in the command
+/// field.
+fn run_task_dialog_key_action(
+    focus: RunTaskDialogFocus,
+    enter: bool,
+    space: bool,
+) -> Option<RunTaskDialogAction> {
+    if enter {
+        return Some(match focus {
+            RunTaskDialogFocus::Cancel => RunTaskDialogAction::Cancel,
+            RunTaskDialogFocus::Browse => RunTaskDialogAction::Browse,
+            RunTaskDialogFocus::Command | RunTaskDialogFocus::Elevated | RunTaskDialogFocus::Ok => {
+                RunTaskDialogAction::Submit
+            }
+        });
+    }
+    if space {
+        return match focus {
+            RunTaskDialogFocus::Command => None,
+            RunTaskDialogFocus::Elevated => Some(RunTaskDialogAction::ToggleElevated),
+            RunTaskDialogFocus::Cancel => Some(RunTaskDialogAction::Cancel),
+            RunTaskDialogFocus::Browse => Some(RunTaskDialogAction::Browse),
+            RunTaskDialogFocus::Ok => Some(RunTaskDialogAction::Submit),
+        };
+    }
+    None
+}
+
 pub fn run_task_dialog(app: &mut TaskManApp, ctx: &egui::Context, _pal: &theme::Palette) {
+    let focus_id = egui::Id::new("run-task-dialog-focus");
+    let mut focus = ctx
+        .data(|data| data.get_temp::<RunTaskDialogFocus>(focus_id))
+        .unwrap_or(RunTaskDialogFocus::Command);
+
+    // Own the dialog's focus traversal instead of requesting text focus every
+    // frame. The old unconditional `request_focus()` made Tab immediately snap
+    // back into the command field and made Enter depend on `lost_focus()`.
+    let shift_tab =
+        ctx.input_mut(|input| input.consume_key(egui::Modifiers::SHIFT, egui::Key::Tab));
+    let tab = ctx.input_mut(|input| input.consume_key(Default::default(), egui::Key::Tab));
+    if shift_tab || tab {
+        focus = focus.next(shift_tab);
+    }
+
+    let escape = ctx.input_mut(|input| input.consume_key(Default::default(), egui::Key::Escape));
+    let enter = ctx.input_mut(|input| input.consume_key(Default::default(), egui::Key::Enter));
+    // Do not consume Space while editing the command line.
+    let space = focus != RunTaskDialogFocus::Command
+        && ctx.input_mut(|input| input.consume_key(Default::default(), egui::Key::Space));
+    let mut action = if escape {
+        Some(RunTaskDialogAction::Cancel)
+    } else {
+        run_task_dialog_key_action(focus, enter, space)
+    };
+
     let mut open = true;
     egui::Window::new(i18n::tr(K::RunDialogTitle))
         .open(&mut open)
@@ -1178,57 +1268,127 @@ pub fn run_task_dialog(app: &mut TaskManApp, ctx: &egui::Context, _pal: &theme::
             ui.set_width(420.0);
             ui.label(i18n::tr(K::RunPrompt));
             ui.add_space(4.0);
-            let resp = ui.add(
+            let command = ui.add(
                 egui::TextEdit::singleline(&mut app.run_dialog_text)
                     .hint_text(i18n::tr(K::RunHint))
                     .desired_width(f32::INFINITY),
             );
-            resp.request_focus();
+            if command.clicked() {
+                focus = RunTaskDialogFocus::Command;
+            }
+            if focus == RunTaskDialogFocus::Command {
+                command.request_focus();
+            }
+
             ui.add_space(4.0);
-            crate::widgets::controls::checkbox(
+            let elevated = crate::widgets::controls::checkbox(
                 ui,
                 &mut app.run_elevated,
                 i18n::tr(K::RunElevated),
                 _pal,
             );
+            if elevated.clicked() {
+                focus = RunTaskDialogFocus::Elevated;
+            }
+            if focus == RunTaskDialogFocus::Elevated {
+                elevated.request_focus();
+            }
+
             ui.add_space(8.0);
             ui.horizontal(|ui| {
-                if ui.button(i18n::tr(K::Cancel)).clicked() {
-                    app.run_dialog_open = false;
+                let mut cancel_button = egui::Button::new(i18n::tr(K::Cancel));
+                if focus == RunTaskDialogFocus::Cancel {
+                    cancel_button = cancel_button.stroke(egui::Stroke::new(1.5, _pal.accent));
                 }
-                if ui.button(i18n::tr(K::Browse)).clicked()
-                    && let Some(path) = rfd::FileDialog::new().pick_file()
-                {
-                    app.run_dialog_text = path.to_string_lossy().into_owned();
+                let cancel = ui.add(cancel_button);
+                if cancel.clicked() {
+                    focus = RunTaskDialogFocus::Cancel;
+                    action = Some(RunTaskDialogAction::Cancel);
                 }
-                let enter = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                if (ui.button(i18n::tr(K::Ok)).clicked() || enter)
-                    && !app.run_dialog_text.trim().is_empty()
-                {
-                    let actions = app.actions.clone();
-                    let cmdline = app.run_dialog_text.trim().to_string();
-                    let elevated = app.run_elevated;
-                    let toasts = app.shared.toasts.clone();
-                    let spawned =
-                        std::thread::Builder::new()
-                            .name("tm-run".into())
-                            .spawn(move || {
-                                let result = actions.run_new_task_probe(&cmdline, elevated);
-                                let msg = match result {
-                                    Ok(()) => i18n::trf(K::StartedMsg, &[&cmdline]),
-                                    Err(e) => i18n::trf(K::ErrMsg, &[&e.to_string()]),
-                                };
-                                crate::app::toast_from(&toasts, msg);
-                            });
-                    if spawned.is_err() {
-                        app.shared.toast(i18n::tr(K::LaunchFailed));
-                    }
-                    app.run_dialog_open = false;
+                if focus == RunTaskDialogFocus::Cancel {
+                    cancel.request_focus();
+                }
+
+                let mut browse_button = egui::Button::new(i18n::tr(K::Browse));
+                if focus == RunTaskDialogFocus::Browse {
+                    browse_button = browse_button.stroke(egui::Stroke::new(1.5, _pal.accent));
+                }
+                let browse = ui.add(browse_button);
+                if browse.clicked() {
+                    focus = RunTaskDialogFocus::Browse;
+                    action = Some(RunTaskDialogAction::Browse);
+                }
+                if focus == RunTaskDialogFocus::Browse {
+                    browse.request_focus();
+                }
+
+                let can_submit = !app.run_dialog_text.trim().is_empty();
+                let mut ok_button = egui::Button::new(i18n::tr(K::Ok));
+                if focus == RunTaskDialogFocus::Ok {
+                    ok_button = ok_button.stroke(egui::Stroke::new(1.5, _pal.accent));
+                }
+                let ok = ui.add_enabled(can_submit, ok_button);
+                if ok.clicked() {
+                    focus = RunTaskDialogFocus::Ok;
+                    action = Some(RunTaskDialogAction::Submit);
+                }
+                if focus == RunTaskDialogFocus::Ok {
+                    ok.request_focus();
                 }
             });
         });
+
     if !open {
-        app.run_dialog_open = false;
+        action = Some(RunTaskDialogAction::Cancel);
+    }
+
+    match action {
+        Some(RunTaskDialogAction::Cancel) => {
+            app.run_dialog_open = false;
+        }
+        Some(RunTaskDialogAction::Browse) => {
+            if let Some(path) = rfd::FileDialog::new().pick_file() {
+                app.run_dialog_text = path.to_string_lossy().into_owned();
+                // A successful browse has completed the input step; make the
+                // default action the next keyboard stop rather than reopening
+                // the file picker on a second Enter.
+                focus = RunTaskDialogFocus::Ok;
+            }
+        }
+        Some(RunTaskDialogAction::ToggleElevated) => {
+            app.run_elevated = !app.run_elevated;
+        }
+        Some(RunTaskDialogAction::Submit) => {
+            if !app.run_dialog_text.trim().is_empty() {
+                let actions = app.actions.clone();
+                let cmdline = app.run_dialog_text.trim().to_string();
+                let elevated = app.run_elevated;
+                let toasts = app.shared.toasts.clone();
+                let spawned = std::thread::Builder::new()
+                    .name("tm-run".into())
+                    .spawn(move || {
+                        let result = actions.run_new_task_probe(&cmdline, elevated);
+                        let msg = match result {
+                            Ok(()) => i18n::trf(K::StartedMsg, &[&cmdline]),
+                            Err(error) => i18n::trf(K::ErrMsg, &[&error.to_string()]),
+                        };
+                        crate::app::toast_from(&toasts, msg);
+                    });
+                if spawned.is_err() {
+                    app.shared.toast(i18n::tr(K::LaunchFailed));
+                }
+                app.run_dialog_open = false;
+            } else {
+                focus = RunTaskDialogFocus::Command;
+            }
+        }
+        None => {}
+    }
+
+    if app.run_dialog_open {
+        ctx.data_mut(|data| data.insert_temp(focus_id, focus));
+    } else {
+        ctx.data_mut(|data| data.remove_temp::<RunTaskDialogFocus>(focus_id));
     }
 }
 
@@ -1369,6 +1529,54 @@ pub(crate) fn update_end_task_dialog_focus(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn run_task_dialog_focus_cycles_forward_and_backward() {
+        use RunTaskDialogFocus::*;
+        let mut focus = Command;
+        for expected in [Elevated, Cancel, Browse, Ok, Command] {
+            focus = focus.next(false);
+            assert_eq!(focus, expected);
+        }
+        for expected in [Ok, Browse, Cancel, Elevated, Command] {
+            focus = focus.next(true);
+            assert_eq!(focus, expected);
+        }
+    }
+
+    #[test]
+    fn run_task_dialog_keyboard_actions_match_native_dialog_semantics() {
+        use RunTaskDialogAction as Action;
+        use RunTaskDialogFocus as Focus;
+        assert_eq!(
+            run_task_dialog_key_action(Focus::Command, true, false),
+            Some(Action::Submit)
+        );
+        assert_eq!(
+            run_task_dialog_key_action(Focus::Elevated, true, false),
+            Some(Action::Submit)
+        );
+        assert_eq!(
+            run_task_dialog_key_action(Focus::Cancel, true, false),
+            Some(Action::Cancel)
+        );
+        assert_eq!(
+            run_task_dialog_key_action(Focus::Browse, true, false),
+            Some(Action::Browse)
+        );
+        assert_eq!(
+            run_task_dialog_key_action(Focus::Ok, true, false),
+            Some(Action::Submit)
+        );
+        assert_eq!(
+            run_task_dialog_key_action(Focus::Elevated, false, true),
+            Some(Action::ToggleElevated)
+        );
+        assert_eq!(
+            run_task_dialog_key_action(Focus::Command, false, true),
+            None
+        );
+    }
 
     #[test]
     fn test_end_task_dialog_focus_keyboard_transitions() {
