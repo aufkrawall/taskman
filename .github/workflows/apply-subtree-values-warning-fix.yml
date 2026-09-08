@@ -1,0 +1,28 @@
+name: Apply subtree values warning fix
+
+on:
+  push:
+    branches: [fix/subtree-values-dead-code]
+    paths: [.github/workflows/apply-subtree-values-warning-fix.yml]
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: fix/subtree-values-dead-code
+      - name: Remove dead accessor
+        run: python .github/scripts/remove_subtree_values.py
+      - name: Commit cleanup
+        shell: bash
+        run: |
+          git rm .github/workflows/apply-subtree-values-warning-fix.yml .github/scripts/remove_subtree_values.py
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add crates/tm-app/src/tabs/processes.rs
+          git commit -m "Remove unused subtree values accessor"
+          git push origin HEAD:fix/subtree-values-dead-code
