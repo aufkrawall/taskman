@@ -74,9 +74,24 @@ impl SystemCollector for LinuxCollector {
         // rather than introducing compositor-specific unsafe heuristics.
         let window_owners: HashSet<u32> = HashSet::new();
 
-        let n_procs = self.sys.processes().len();
+        let n_procs = self
+            .sys
+            .processes()
+            .values()
+            .filter(|p| p.thread_kind().is_none())
+            .count();
         let mut processes = Vec::with_capacity(n_procs);
         for (pid, p) in self.sys.processes() {
+            // sysinfo 0.39 keeps `tasks` enabled even in
+            // `ProcessRefreshKind::nothing()`, so every Linux task (thread) is
+            // inserted into the process map as its own entry. Windows Task
+            // Manager never lists threads as processes, and each thread entry
+            // repeats the parent's memory while splitting its CPU. Skip them;
+            // `p.tasks()` on the real process still feeds the Details thread
+            // count.
+            if p.thread_kind().is_some() {
+                continue;
+            }
             let pid_u = pid.as_u32();
             let name = p.name().to_string_lossy().into_owned();
 
@@ -113,7 +128,9 @@ impl SystemCollector for LinuxCollector {
                 sysinfo::ProcessStatus::Stop => ProcStatus::Suspended,
                 _ => ProcStatus::Running,
             };
-            entry.threads = p.tasks().map(|tasks| tasks.len() as u32);
+            // sysinfo's task set excludes the leader; Windows' count includes
+            // it, so add the main thread back for parity.
+            entry.threads = p.tasks().map(|tasks| tasks.len() as u32 + 1);
             entry.handles = fd_count(pid_u);
             entry.command_line = proc_cmdline(pid_u);
             entry.priority = proc_priority(pid_u);
@@ -496,8 +513,8 @@ fn now_ms() -> u64 {
 fn threads_total(sys: &System) -> usize {
     sys.processes()
         .values()
-        .filter_map(|p| p.tasks())
-        .map(|t| t.len())
+        .filter(|p| p.thread_kind().is_none())
+        .map(|p| p.tasks().map_or(1, |tasks| tasks.len() + 1))
         .sum()
 }
 

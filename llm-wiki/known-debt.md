@@ -44,7 +44,8 @@ items across Phases 2–6. The following concrete gaps remain:
   all. What was genuinely blocked is per-channel *blending*: on a GPU that needs
   dual-source blending (upstream emilk/egui#2639), and on a CPU it is a multiply. Both the
   3x rasterization and the per-channel blend now live in `vendor/egui`. See
-  `render-pipeline.md`.
+  `render-pipeline.md`. Linux follows fontconfig's `rgba` (`rgb`/`bgr` only) since
+  2026-09-08; vertical orders and unknown/none stay grayscale.
 - **Software rendering performance: SUPERSEDED** (2026-09-01). `render_mode = software`
   no longer means WARP -- a D3D12 driver emulated on the CPU at ~14 cores and 2.9 fps --
   but a native CPU rasterizer that draws the UI directly. The old measurement was correct

@@ -268,6 +268,12 @@ def build_linux_musl(profile: str) -> tuple[Path | None, bool]:
     if not exe.exists():
         log(f"linux musl binary missing after build: {exe}")
         return None, True
+    log(
+        "warning: static musl has no dlopen, so winit cannot load Wayland/X11 "
+        "and the GUI cannot start on a glibc distro - this artifact is "
+        "headless/--selfcheck only; install cross or cargo-zigbuild for a "
+        "GUI-capable glibc artifact"
+    )
     return exe, True
 
 

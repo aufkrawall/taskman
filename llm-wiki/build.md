@@ -21,7 +21,11 @@ Primary sources:
    through rustup on demand) linked by the bundled `rust-lld` into a static
    PIE, artifact `taskman-v<version>-linux-x86_64-musl`. That path needs no
    compiler, container or zig, so `python build.py` always produces a Linux
-   artifact on a rustup machine. It creates an empty `target/cross-stubs/libdl.a`
+   artifact on a rustup machine. **Static musl has no `dlopen`, so this
+   artifact is headless/`--selfcheck` only**: winit cannot load Wayland/X11
+   and the GUI cannot start on a glibc distro. Prefer `cross`/`cargo-zigbuild`
+   for a GUI-capable glibc artifact; `build.py` warns when it falls back.
+   It creates an empty `target/cross-stubs/libdl.a`
    because `libloading` emits `-ldl`, which musl folds into libc. The Linux
    step is skipped only when neither path is available (or with
    `--host-only`); `--require-all-targets` makes a skip fatal.

@@ -1,3 +1,4 @@
+- 2026-09-08: Linux parity + release validation: the collector no longer lists threads as processes (sysinfo 0.39 keeps `tasks` enabled by default) and thread counts include the leader; Linux sub-pixel AA follows fontconfig `rgba` (`rgb`/`bgr` only); `build.py` warns that the static-musl fallback is headless-only; v0.1.3 ships a GUI-capable glibc Linux artifact validated under WSLg.
 - 2026-09-08: Published TaskMan v0.1.2 for Windows x86_64 and Linux x86_64 (static musl PIE); both archives and their SHA-256 checksums are on GitHub. Release publication steps are now in `build.md`.
 - 2026-09-08: Processes/Details scroll stability: `tablekit::scrolled_rows` anchors the viewport to the top visible row identity across model rebuilds (new/removed processes, tree expand/collapse), and Processes ordering is deterministic (creation-order snapshot sort plus pid tie-breaks) so equal-valued or same-named rows no longer reshuffle every sample.
 - 2026-09-08: Security audit pass: the broker's installing SID must resolve to a user account (group/alias SIDs rejected), file-log verification no longer gates broker startup (a planted `ProgramData\TaskMan\logs` entry could disable the privileged control plane), Win32 scratch buffers are pointer-aligned (`aligned.rs`), Windows release binaries are CET-compatible, `build.py --audit` runs cargo-audit/gitleaks, and `tm-core` denies `unsafe_code` while `tm-platform`/`tm-app` deny `unsafe_op_in_unsafe_fn`.
@@ -9,6 +10,34 @@
 - 2026-09-08: Details gained optional Network / Network receive / Network send columns. PROCESS_NET demand now follows those visible columns and stays active while Process Properties is open, fixing blank live network statistics there without running the ETW session continuously on Details.
 - 2026-09-08: Process Properties now summarizes mitigations with System Informer-style qualifiers (permanent DEP, high-entropy ASLR, prohibited/disabled wording, CF Guard and stack protection), and module inventory uses the authenticated LocalSystem broker for identity-bound SYSTEM/service inspection with bounded responses.
 # Recent Activity
+
+## 2026-09-08 — Linux parity fixes and the first GUI-capable Linux release
+
+Validating the v0.1.2 Linux artifact under WSLg surfaced three issues:
+
+1. **Threads were listed as processes.** sysinfo 0.39 keeps `tasks` enabled
+   even in `ProcessRefreshKind::nothing()`, so every Linux task was inserted
+   into the process map. The Processes page showed `tm-engine`,
+   `dconf worker`, `gmain`, ... each repeating the parent's memory, and the
+   selfcheck counted 61 "processes" on a 39-process / 54-thread system. The
+   collector now skips `thread_kind().is_some()` entries; `p.tasks()` still
+   feeds the Details thread count, and the leader is added back so it matches
+   Windows.
+2. **The musl artifact could not run the GUI.** A fully static musl binary
+   has no `dlopen` at all (`Dynamic loading not supported`), and winit needs
+   it to load Wayland/X11. `build.py` now warns when it falls back to that
+   path; `cargo-zigbuild` produces a GUI-capable glibc artifact.
+3. **Sub-pixel text on Linux.** The fork's LCD path was already there behind
+   `TASKMAN_SUBPIXEL=1`; `text_rendering::query` now reads fontconfig's
+   `rgba` (rgb/bgr only, grayscale for unknown/none/vertical orders), so the
+   app follows the desktop's own setting. Verified under WSLg at scale 1 and
+   at app-level 150% (`WINIT_X11_SCALE_FACTOR=1.5`): text chroma 0 -> ~156
+   with balanced red/blue fringes. WSLg itself is Weston/RDP, not
+   Plasma/GNOME; its limits (no fractional scaling, `[WARN:COPY MODE]`
+   shared-memory bug, no GPU) are documented in `debug-tools.md`.
+
+v0.1.3 ships the glibc artifact and these fixes; the v0.1.2 Linux asset was
+musl and GUI-incapable.
 
 ## 2026-09-08 — Scroll anchoring and deterministic process ordering
 

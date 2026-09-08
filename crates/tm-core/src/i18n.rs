@@ -401,8 +401,8 @@ keys! {
     SmoothingStandard => ["Standard", "Standard"],
     SmoothingSmooth => ["Weich", "Smooth"],
     TextSmoothingHint => [
-        "Graustufen-Kantenglättung. Subpixel-Darstellung (ClearType) unterstützt die Oberfläche nicht.",
-        "Grayscale anti-aliasing. Sub-pixel rendering (ClearType) is not supported by the UI toolkit."
+        "Subpixel-Darstellung (ClearType/LCD) wird verwendet, wenn Anzeige und Plattform sie unterstützen; andernfalls wird der Text in Graustufen geglättet.",
+        "Sub-pixel rendering (ClearType/LCD) is used when the display and platform support it; otherwise text is grayscale anti-aliased."
     ],
     NetPerProcessUnavailable => [
         "Netzwerk pro Prozess benötigt Administratorrechte (ETW-Sitzung).",

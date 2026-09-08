@@ -191,21 +191,95 @@ pub mod text_rendering {
         }
     }
 
-    /// Non-Windows: sub-pixel rendering is off.
+    /// Linux: follow fontconfig's `rgba` sub-pixel order.
     ///
-    /// The rasterizer and blend path are platform-independent, so enabling this elsewhere
-    /// is a matter of finding the equivalent signal -- fontconfig's `rgba` on X11, and on
-    /// Wayland only when the surface is not fractionally scaled, because the compositor
-    /// would resample the fringes. Neither is wired up yet, and guessing wrong looks
-    /// worse than grayscale.
-    #[cfg(not(target_os = "windows"))]
+    /// `fc-match -v` reports the desktop's declared stripe order as an integer:
+    /// 0 unknown, 1 rgb, 2 bgr, 3 vrgb, 4 vbgr, 5 none. Only the horizontal
+    /// orders can be rendered; everything else (including an absent property,
+    /// which is what a fractional-scaling compositor that resamples fringes
+    /// wants) stays grayscale. This is the same signal GTK/Qt consume.
+    #[cfg(target_os = "linux")]
+    pub fn query(_hwnd: Option<isize>) -> Params {
+        fontconfig_subpixel()
+    }
+
+    /// Linux: the same fontconfig blend signal; safe before a window exists.
+    #[cfg(target_os = "linux")]
+    pub fn blend_params(_hwnd: Option<isize>) -> Params {
+        fontconfig_subpixel()
+    }
+
+    #[cfg(target_os = "linux")]
+    fn fontconfig_subpixel() -> Params {
+        let mut params = Params::default();
+        let Ok(out) = std::process::Command::new("fc-match")
+            .args(["-v", "sans-serif"])
+            .output()
+        else {
+            return params;
+        };
+        if !out.status.success() {
+            return params;
+        }
+        if let Some(order) = parse_fontconfig_rgba(&String::from_utf8_lossy(&out.stdout)) {
+            match order {
+                1 => {
+                    params.enabled = true;
+                    params.bgr = false;
+                }
+                2 => {
+                    params.enabled = true;
+                    params.bgr = true;
+                }
+                _ => {}
+            }
+        }
+        params
+    }
+
+    /// First `rgba:` value from `fc-match -v` output, if present.
+    #[cfg(any(target_os = "linux", test))]
+    fn parse_fontconfig_rgba(text: &str) -> Option<u8> {
+        for line in text.lines() {
+            let Some(rest) = line.strip_prefix("rgba:") else {
+                continue;
+            };
+            return rest
+                .trim()
+                .split(['(', ' '])
+                .next()
+                .and_then(|value| value.parse::<u8>().ok());
+        }
+        None
+    }
+
+    /// Other platforms: sub-pixel rendering is off.
+    ///
+    /// The rasterizer and blend path are platform-independent, so enabling
+    /// this elsewhere is a matter of finding the equivalent signal. Guessing
+    /// wrong looks worse than grayscale.
+    #[cfg(not(any(target_os = "windows", target_os = "linux")))]
     pub fn query(_hwnd: Option<isize>) -> Params {
         Params::default()
     }
 
-    /// Non-Windows: the neutral defaults.
-    #[cfg(not(target_os = "windows"))]
+    /// Other platforms: the neutral defaults.
+    #[cfg(not(any(target_os = "windows", target_os = "linux")))]
     pub fn blend_params(_hwnd: Option<isize>) -> Params {
         Params::default()
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::parse_fontconfig_rgba;
+
+        #[test]
+        fn fontconfig_rgba_orders_map_to_subpixel_modes() {
+            assert_eq!(parse_fontconfig_rgba("rgba: 1(i)(w)\n"), Some(1));
+            assert_eq!(parse_fontconfig_rgba("rgba: 2(i)(w)\n"), Some(2));
+            assert_eq!(parse_fontconfig_rgba("rgba: 5(i)(w)\n"), Some(5));
+            assert_eq!(parse_fontconfig_rgba("antialias: True(w)\n"), None);
+            assert_eq!(parse_fontconfig_rgba(""), None);
+        }
     }
 }
