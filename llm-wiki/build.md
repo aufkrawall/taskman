@@ -16,7 +16,8 @@ Primary sources:
 2. Linux x86_64 release build **by default** — the workspace ships a
    real Linux collector (`crates/tm-platform/src/linux/`). Toolchain
    resolution: `cross` first, then `cargo-zigbuild` (both produce a glibc
-   binary, artifact `taskman-v<version>-linux-x86_64`). Without either, the
+   binary, artifact `taskman-v<version>-linux-x86_64`; the zigbuild path is
+   pinned to a glibc 2.17 ABI floor for old-LTS compatibility). Without either, the
    self-contained path is used: `x86_64-unknown-linux-musl` std (installed
    through rustup on demand) linked by the bundled `rust-lld` into a static
    PIE, artifact `taskman-v<version>-linux-x86_64-musl`. That path needs no

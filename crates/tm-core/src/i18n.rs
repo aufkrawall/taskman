@@ -303,6 +303,7 @@ keys! {
     GroupApps => ["Apps", "Apps"],
     GroupBackground => ["Hintergrundprozesse", "Background processes"],
     GroupWindows => ["Windows-Prozesse", "Windows processes"],
+    GroupSystem => ["Systemprozesse", "System processes"],
     ColGpu => ["GPU", "GPU"],
     UacUnknown => ["Unbekannt", "Unknown"],
     UacVirtualization => ["UAC-Virtualisierung", "UAC virtualization"],

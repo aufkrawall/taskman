@@ -718,7 +718,10 @@ fn group_header(
     let label = match gi {
         0 => i18n::tr(K::GroupApps),
         1 => i18n::tr(K::GroupBackground),
-        _ => i18n::tr(K::GroupWindows),
+        // The third group is Windows' OS infrastructure; calling it "Windows
+        // processes" on Linux reads wrong, so use the neutral name there.
+        _ if cfg!(target_os = "windows") => i18n::tr(K::GroupWindows),
+        _ => i18n::tr(K::GroupSystem),
     };
     // Exactly the table's content width — matching the rows keeps the
     // horizontal scroll extents (and thus header/body alignment) identical.
