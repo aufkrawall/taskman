@@ -2368,8 +2368,13 @@ struct ProcessSecuritySummary {
     mitigations: String,
 }
 
-fn process_properties_body_height(viewport_height: f32) -> f32 {
-    (viewport_height * 0.55).clamp(260.0, 400.0)
+fn process_properties_body_height(available_height: f32, viewport_height: f32) -> f32 {
+    // Track the USER-RESIZED window height, not the content's desired height.
+    // The viewport-derived upper bound only protects the initial sizing pass
+    // (where egui may report an unbounded available height); it does not impose
+    // an arbitrary 680 px outer-window ceiling.
+    let viewport_limit = (viewport_height - 150.0).max(180.0);
+    (available_height - 48.0).clamp(180.0, viewport_limit)
 }
 
 #[cfg(target_os = "windows")]
@@ -3011,10 +3016,11 @@ pub fn process_properties_dialog(app: &mut TaskManApp, ctx: &egui::Context) {
             dialog.security_started = true;
             let result = dialog.security_load_result.clone();
             let identity = dialog.identity.clone();
+            let actions = app.actions.clone();
             let job = move || {
-                let value =
-                    tm_platform::win::process_security_info(identity.pid, identity.start_epoch_s)
-                        .map_err(|error| error.to_string());
+                let value = actions
+                    .process_security_info_checked(identity.pid, identity.start_epoch_s)
+                    .map_err(|error| error.to_string());
                 *tm_core::sync::lock(&result) = Some(value);
             };
             let wake = {
@@ -3065,7 +3071,6 @@ pub fn process_properties_dialog(app: &mut TaskManApp, ctx: &egui::Context) {
         .resizable(true)
         .default_size([760.0, 560.0])
         .min_size([640.0, 420.0])
-        .max_size([980.0, 680.0])
         .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
         .show(ctx, |ui| {
             ui.horizontal(|ui| {
@@ -3118,7 +3123,8 @@ pub fn process_properties_dialog(app: &mut TaskManApp, ctx: &egui::Context) {
             // resizable Window on every frame, so the dialog grew until it hit
             // the monitor edge. The viewport cap is independent of content;
             // overflow belongs to the scroll bar, not to the outer window.
-            let body_height = process_properties_body_height(ctx.content_rect().height());
+            let body_height =
+                process_properties_body_height(ui.available_height(), ctx.content_rect().height());
             let security = process_security_summary(&dialog);
             egui::ScrollArea::vertical()
                 .max_height(body_height)

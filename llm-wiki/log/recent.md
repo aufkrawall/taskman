@@ -1862,3 +1862,5 @@ Initial generic `AGENTS.md` / `llm-wiki` template. No project-specific
 history recorded yet.
 
 - 2026-09-08: Process Properties now uses a bounded scroll viewport (fixing the frame-over-frame vertical growth regression) and adds an on-demand Windows Security page. Security telemetry is identity-checked on the queried handle and includes process protection/PPL, critical state, exact image machine and active mitigation policies (DEP, ASLR, dynamic code, strict handles, CFG, Win32k lockdown, signature/font/image-load/child-process restrictions, CET, SEHOP, side-channel and payload restrictions).
+
+- 2026-09-08: Process Properties vertical sizing now follows the user's actual resizable window height while keeping only the inner scroll body bounded. Windows security inspection moved onto PlatformActions and can use the authenticated LocalSystem core-service broker for SYSTEM/service processes; the broker request remains identity-bound and read-only, with local fallback for absent/older services.

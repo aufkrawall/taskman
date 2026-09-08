@@ -355,6 +355,13 @@ impl PlatformActions for WinActions {
     ) -> Result<()> {
         process_ops::set_uac_virtualization_checked(pid, expected_start_epoch_s, enabled)
     }
+    fn process_security_info_checked(
+        &self,
+        pid: u32,
+        expected_start_epoch_s: Option<i64>,
+    ) -> Result<ProcessSecurityInfo> {
+        process_ops::process_security_info(pid, expected_start_epoch_s)
+    }
     fn list_process_modules(
         &self,
         pid: u32,

@@ -140,6 +140,11 @@ enum BrokerRequest {
         expected_start_epoch_s: Option<i64>,
         enabled: bool,
     },
+    /// Read-only, identity-bound hardening metadata used by Process Properties.
+    ProcessSecurityInfo {
+        pid: u32,
+        expected_start_epoch_s: Option<i64>,
+    },
     UnloadModule {
         pid: u32,
         expected_start_epoch_s: Option<i64>,
@@ -204,6 +209,7 @@ enum BrokerValue {
     AffinityMask(u64),
     TaskManagerReplacementState(TaskManagerReplacementState),
     ProcessNetwork(ProcessNetworkSample),
+    ProcessSecurity(super::ProcessSecurityInfo),
     /// Result of `UnloadModule`. `released` is retained only for compatibility
     /// with the earlier v2 wire shape; it now means successful remote
     /// FreeLibrary calls, not an observable loader-reference count. `verified`
@@ -838,6 +844,36 @@ impl PlatformActions for BrokeredActions {
         )
     }
 
+    fn process_security_info_checked(
+        &self,
+        pid: u32,
+        expected_start_epoch_s: Option<i64>,
+    ) -> Result<super::ProcessSecurityInfo> {
+        let Some(start_epoch_s) = expected_start_epoch_s.filter(|value| *value > 0) else {
+            return self
+                .local
+                .process_security_info_checked(pid, expected_start_epoch_s);
+        };
+        let local = || {
+            self.local
+                .process_security_info_checked(pid, Some(start_epoch_s))
+        };
+        match self.client.call(BrokerRequest::ProcessSecurityInfo {
+            pid,
+            expected_start_epoch_s: Some(start_epoch_s),
+        }) {
+            Ok(BrokerValue::ProcessSecurity(info)) => Ok(info),
+            Ok(_) => Err(TmError::platform(
+                "core service",
+                "unexpected process-security response type",
+            )),
+            Err(BrokerCallError::Unavailable(_)) => local(),
+            Err(BrokerCallError::Rejected(detail)) => {
+                local().map_err(|_| TmError::platform("core service", detail))
+            }
+        }
+    }
+
     fn list_process_modules(
         &self,
         pid: u32,
@@ -1434,6 +1470,20 @@ fn dispatch(
         // change nothing, so it deliberately skips `checked_target`.
         BrokerRequest::ProcessNetworkCounters => {
             Ok(BrokerValue::ProcessNetwork(process_network_sample()))
+        }
+        BrokerRequest::ProcessSecurityInfo {
+            pid,
+            expected_start_epoch_s,
+        } => {
+            let Some(start_epoch_s) = expected_start_epoch_s.filter(|value| *value > 0) else {
+                return Err(TmError::platform(
+                    "broker process security",
+                    "a valid sampled process creation time is required",
+                ));
+            };
+            Ok(BrokerValue::ProcessSecurity(
+                super::process_ops::process_security_info(pid, Some(start_epoch_s))?,
+            ))
         }
         BrokerRequest::KillProcess {
             pid,

@@ -228,6 +228,19 @@ pub trait PlatformActions: Send + Sync {
     ) -> Result<()> {
         Err(tm_core::TmError::Unsupported("UAC virtualization"))
     }
+    /// Lazily inspect security hardening for one exact Windows process.
+    /// This lives on the action surface so an unelevated GUI can use the
+    /// authenticated LocalSystem broker for service/SYSTEM targets.
+    #[cfg(target_os = "windows")]
+    fn process_security_info_checked(
+        &self,
+        _pid: u32,
+        _expected_start_epoch_s: Option<i64>,
+    ) -> Result<crate::win::ProcessSecurityInfo> {
+        Err(tm_core::TmError::Unsupported(
+            "process security information",
+        ))
+    }
     fn list_process_modules(
         &self,
         _pid: u32,

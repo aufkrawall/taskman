@@ -125,7 +125,7 @@ fn open_process_verified(
 /// Windows process protection level reported by GetProcessInformation.
 /// Kept as a small platform-neutral enum at the public Windows boundary so the
 /// GUI does not need its own dependency on Win32 SDK constants.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ProcessProtectionLevel {
     None,
     Authenticode,
@@ -141,7 +141,7 @@ pub enum ProcessProtectionLevel {
 }
 
 /// Effective executable machine for the live process.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ProcessMachineType {
     X86,
     X64,
@@ -154,7 +154,8 @@ pub enum ProcessMachineType {
 /// Windows did not expose that individual policy for this process/OS, never
 /// "disabled". Keeping this out of Snapshot avoids dozens of extra syscalls on
 /// every sampling tick for data that is only useful while the dialog is open.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ProcessSecurityInfo {
     pub protection: Option<ProcessProtectionLevel>,
     pub machine: Option<ProcessMachineType>,
@@ -249,11 +250,19 @@ pub fn process_security_info(
     expected_start_epoch_s: Option<i64>,
 ) -> Result<ProcessSecurityInfo> {
     enable_debug_privilege();
-    let process = open_process_verified(
-        pid,
-        th::PROCESS_QUERY_LIMITED_INFORMATION,
-        expected_start_epoch_s,
-    )?;
+    // Full query access unlocks GetProcessMitigationPolicy for normal
+    // services when the LocalSystem broker performs the query. Protected
+    // targets may grant only LIMITED_INFORMATION, so degrade to that handle
+    // and leave unsupported individual fields as None instead of failing the
+    // entire dialog.
+    let process = open_process_verified(pid, th::PROCESS_QUERY_INFORMATION, expected_start_epoch_s)
+        .or_else(|_| {
+            open_process_verified(
+                pid,
+                th::PROCESS_QUERY_LIMITED_INFORMATION,
+                expected_start_epoch_s,
+            )
+        })?;
     let result = (|| {
         let protection = process_protection_level(process);
         let machine = process_machine_type(process);
