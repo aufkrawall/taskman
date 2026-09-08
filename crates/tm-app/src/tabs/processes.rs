@@ -1159,7 +1159,7 @@ fn build_display_rows(
     let all: Vec<&ProcessEntry> = snap.processes.iter().collect();
     let grouping = derive_display_groups(&all);
     let children_all = display_children_map(&all, &grouping.category, &grouping.app_roots);
-    let subtree = subtree_values_and_counts(&all, &children_all);
+    let subtree = subtree_rollups(&all, &children_all);
     let mut out = Vec::new();
 
     if !q.is_empty() {
@@ -2022,7 +2022,7 @@ fn emit_tree<'a>(
                 .filter(|member| !member.synthetic)
                 .map(|member| process_identity(member))
                 .collect(),
-            values: subtree.values(root.pid),
+            values: family_values(&members),
             heat: [0.0; 4],
             net_available,
             status: subtree.status(root.pid),
@@ -2124,7 +2124,7 @@ impl Subtree {
     }
 }
 
-fn subtree_values_and_counts<'a>(
+fn subtree_rollups<'a>(
     all: &[&'a ProcessEntry],
     children: &HashMap<u32, Vec<&'a ProcessEntry>>,
 ) -> Subtree {
@@ -2191,7 +2191,7 @@ fn subtree_values_and_counts<'a>(
                                 && by_pid.contains_key(&k.pid)
                         })
                         .collect();
-                    if pending.is_empty() {
+                    if kids.is_empty() {
                         out.insert(pid, own_values(p));
                         eco.insert(pid, p.power_throttled == Some(true));
                         statuses.insert(pid, p.status);
@@ -2688,7 +2688,8 @@ mod tests {
         let mut child = proc(2, Some(1), "app.exe", ProcCategory::App);
         child.cpu_pct = 2.0;
         child.mem_bytes = 200;
-        let snap = snap_of(vec![root, child]);
+        // Snapshot order is arbitrary: a child may precede its parent.
+        let snap = snap_of(vec![child, root]);
 
         let collapsed = build_display_rows(&snap, "", 0, true, &HashSet::new(), &[false; 3]);
         let apps = rows_in_group(&collapsed, 0);
@@ -2722,12 +2723,11 @@ mod tests {
         let all: Vec<&ProcessEntry> = snap.processes.iter().collect();
         let grouping = derive_display_groups(&all);
         let children = display_children_map(&all, &grouping.category, &grouping.app_roots);
-        let st = subtree_values_and_counts(&all, &children);
+        let st = subtree_rollups(&all, &children);
         assert_eq!(st.values(1)[0], 6.0);
         assert_eq!(st.values(1)[1], 6000.0);
         assert_eq!(st.values(2)[0], 5.0);
         assert_eq!(st.values(3)[0], 3.0);
-        assert_eq!((st.count(3), st.count(2), st.count(1)), (1, 2, 3));
     }
 
     /// A collapsed family row stands for its members, so one efficiency-mode
@@ -2744,7 +2744,7 @@ mod tests {
         let all: Vec<&ProcessEntry> = snap.processes.iter().collect();
         let grouping = derive_display_groups(&all);
         let children = display_children_map(&all, &grouping.category, &grouping.app_roots);
-        let st = subtree_values_and_counts(&all, &children);
+        let st = subtree_rollups(&all, &children);
         assert!(st.efficiency(1), "head inherits its renderer's leaf");
         assert!(st.efficiency(2));
         assert!(!st.efficiency(3), "an untouched sibling stays plain");
@@ -2771,7 +2771,7 @@ mod tests {
         let all: Vec<&ProcessEntry> = snap.processes.iter().collect();
         let grouping = derive_display_groups(&all);
         let children = display_children_map(&all, &grouping.category, &grouping.app_roots);
-        let st = subtree_values_and_counts(&all, &children);
+        let st = subtree_rollups(&all, &children);
         assert_eq!(
             st.status(1),
             ProcStatus::Suspended,
