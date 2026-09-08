@@ -1954,6 +1954,17 @@ pub fn open_file_location(path: &str) -> Result<()> {
     if path.is_empty() {
         return Err(TmError::platform("open_file_location", "no path"));
     }
+    // The path is interpolated into `explorer.exe /select,"..."`. No valid
+    // Windows path contains a double quote, but the value can originate in a
+    // registry Run entry / desktop file (see `tabs::startup`), so reject the
+    // one character that could terminate the quoted argument rather than
+    // forwarding it to the shell.
+    if path.contains('"') {
+        return Err(TmError::platform(
+            "open_file_location",
+            "path contains a quote and cannot be passed to Explorer",
+        ));
+    }
     shell_execute(
         "explorer.exe",
         Some(&format!("/select,\"{path}\"")),
@@ -2366,6 +2377,15 @@ mod tests {
             cmdline.to_ascii_lowercase().contains("tm_platform"),
             "unexpected: {cmdline}"
         );
+    }
+
+    /// `open_file_location` builds `explorer.exe /select,"<path>"`; a value
+    /// that reaches it from a registry Run entry must not be able to close the
+    /// quote and append switches.
+    #[test]
+    fn open_file_location_rejects_quoted_paths() {
+        assert!(open_file_location("").is_err());
+        assert!(open_file_location(r#"C:\dir\evil\" /e,C:\Windows"#).is_err());
     }
 
     #[test]
