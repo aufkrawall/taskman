@@ -2742,10 +2742,10 @@ mod tests {
         let grouping = derive_display_groups(&all);
         let children = display_children_map(&all, &grouping.category, &grouping.app_roots);
         let st = subtree_rollups(&all, &children);
-        assert_eq!(st.values(1)[0], 6.0);
-        assert_eq!(st.values(1)[1], 6000.0);
-        assert_eq!(st.values(2)[0], 5.0);
-        assert_eq!(st.values(3)[0], 3.0);
+        assert_eq!(st.values[&1][0], 6.0);
+        assert_eq!(st.values[&1][1], 6000.0);
+        assert_eq!(st.values[&2][0], 5.0);
+        assert_eq!(st.values[&3][0], 3.0);
     }
 
     /// A collapsed family row stands for its members, so one efficiency-mode

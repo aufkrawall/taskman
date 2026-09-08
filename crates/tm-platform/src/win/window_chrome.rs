@@ -106,8 +106,7 @@ pub fn apply(hwnd: isize, look: TitleBar) {
     set_attr(hwnd, DWMWA_BORDER_COLOR, &colorref(look.border));
 }
 
-static STRICT_TOPMOST_HWND: std::sync::atomic::AtomicIsize =
-    std::sync::atomic::AtomicIsize::new(0);
+static STRICT_TOPMOST_HWND: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
 static STRICT_TOPMOST_ENABLED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 static STRICT_TOPMOST_HOOKS: std::sync::Once = std::sync::Once::new();
@@ -138,11 +137,7 @@ fn reassert_strict_topmost() {
             0,
             0,
             0,
-            SWP_NOMOVE
-                | SWP_NOSIZE
-                | SWP_NOACTIVATE
-                | SWP_NOOWNERZORDER
-                | SWP_NOSENDCHANGING,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_NOSENDCHANGING,
         );
     }
 }
@@ -169,15 +164,7 @@ fn install_strict_topmost_hooks() {
             EVENT_OBJECT_SHOW,
             EVENT_OBJECT_REORDER,
         ] {
-            let hook = SetWinEventHook(
-                event,
-                event,
-                None,
-                Some(strict_topmost_event),
-                0,
-                0,
-                flags,
-            );
+            let hook = SetWinEventHook(event, event, None, Some(strict_topmost_event), 0, 0, flags);
             if hook.is_invalid() {
                 tracing::warn!(event, "cannot install strict-topmost WinEvent hook");
             }
@@ -212,11 +199,7 @@ pub fn set_strict_topmost(hwnd: isize, enabled: bool) {
                 0,
                 0,
                 0,
-                SWP_NOMOVE
-                    | SWP_NOSIZE
-                    | SWP_NOACTIVATE
-                    | SWP_NOOWNERZORDER
-                    | SWP_NOSENDCHANGING,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_NOSENDCHANGING,
             );
         }
     }

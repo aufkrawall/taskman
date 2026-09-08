@@ -263,7 +263,7 @@ pub fn process_security_info(
                 expected_start_epoch_s,
             )
         })?;
-    let result = (|| {
+    let result = {
         let protection = process_protection_level(process);
         let machine = process_machine_type(process);
 
@@ -298,7 +298,7 @@ pub fn process_security_info(
             side_channel: mitigation_flags(process, th::ProcessSideChannelIsolationPolicy),
             payload_restriction: mitigation_flags(process, th::ProcessPayloadRestrictionPolicy),
         })
-    })();
+    };
     let _ = unsafe { CloseHandle(process) };
     result
 }

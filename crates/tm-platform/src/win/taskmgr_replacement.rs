@@ -191,11 +191,15 @@ fn launch_then_restore(original: &str) -> Result<()> {
         (Err(launch), Ok(())) => Err(launch),
         (Ok(()), Err(restore)) => Err(TmError::platform(
             "Windows Task Manager",
-            format!("Task Manager was launched, but TaskMan's interception could not be restored: {restore}"),
+            format!(
+                "Task Manager was launched, but TaskMan's interception could not be restored: {restore}"
+            ),
         )),
         (Err(launch), Err(restore)) => Err(TmError::platform(
             "Windows Task Manager",
-            format!("launch failed: {launch}; restoring TaskMan's interception also failed: {restore}"),
+            format!(
+                "launch failed: {launch}; restoring TaskMan's interception also failed: {restore}"
+            ),
         )),
     }
 }
@@ -447,9 +451,10 @@ mod tests {
     fn native_task_manager_path_comes_from_the_windows_system_directory() {
         let path = system_task_manager_path().expect("Windows system directory");
         assert!(path.is_absolute());
-        assert!(path
-            .file_name()
-            .is_some_and(|name| name.to_string_lossy().eq_ignore_ascii_case("taskmgr.exe")));
+        assert!(
+            path.file_name()
+                .is_some_and(|name| name.to_string_lossy().eq_ignore_ascii_case("taskmgr.exe"))
+        );
     }
 
     #[test]

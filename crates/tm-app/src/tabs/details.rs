@@ -3627,10 +3627,7 @@ mod tests {
         process.disk_read_total = 9_999_999;
         process.disk_write_total = 8_888_888;
         let row = row_from_process(&process, 0, false);
-        assert_eq!(
-            row.field(ColumnId::IoTotal),
-            format::format_rate(3_072.0)
-        );
+        assert_eq!(row.field(ColumnId::IoTotal), format::format_rate(3_072.0));
         assert_eq!(
             row.field(ColumnId::IoRead),
             format::format_bytes_loc(9_999_999)

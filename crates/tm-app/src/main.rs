@@ -127,7 +127,10 @@ fn main() {
     // while our IFEO replacement is enabled. The platform routine performs
     // the full delete/launch/restore transaction before this process exits.
     #[cfg(target_os = "windows")]
-    if args.iter().any(|argument| argument == "--native-taskmgr-helper") {
+    if args
+        .iter()
+        .any(|argument| argument == "--native-taskmgr-helper")
+    {
         let code = match tm_platform::win::launch_native_task_manager_direct() {
             Ok(()) => 0,
             Err(error) => {
