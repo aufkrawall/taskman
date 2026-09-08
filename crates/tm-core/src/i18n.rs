@@ -137,6 +137,11 @@ keys! {
 
     // ------------------------------------------------ command bar
     RunNewTask => ["Neuen Task ausführen", "Run new task"],
+    WindowsTaskManager => ["Windows-Task-Manager", "Windows Task Manager"],
+    WindowsTaskManagerStarted => [
+        "Windows-Task-Manager gestartet",
+        "Windows Task Manager started"
+    ],
     EndTask => ["Task beenden", "End task"],
     EndTree => ["Struktur beenden", "End tree"],
     EfficiencyMode => ["Effizienzmodus", "Efficiency mode"],

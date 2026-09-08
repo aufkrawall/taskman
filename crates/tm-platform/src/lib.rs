@@ -71,6 +71,16 @@ pub fn apply_title_bar(
 ) {
 }
 
+/// Make the Windows always-on-top setting win against shell-owned topmost
+/// surfaces too. Non-Windows hosts keep using the toolkit's window level.
+#[cfg(target_os = "windows")]
+pub fn set_strict_topmost(hwnd: isize, enabled: bool) {
+    win::window_chrome::set_strict_topmost(hwnd, enabled);
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn set_strict_topmost(_hwnd: isize, _enabled: bool) {}
+
 /// Hide or reveal a window at the compositor — see
 /// [`win::window_chrome::set_cloaked`]. Non-Windows hosts ignore it.
 #[cfg(target_os = "windows")]

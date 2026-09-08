@@ -15,6 +15,14 @@ use windows::Win32::Graphics::Dwm::{
     DWMWA_BORDER_COLOR, DWMWA_CAPTION_COLOR, DWMWA_CLOAK, DWMWA_SYSTEMBACKDROP_TYPE,
     DWMWA_TEXT_COLOR, DWMWA_USE_IMMERSIVE_DARK_MODE, DWMWINDOWATTRIBUTE, DwmSetWindowAttribute,
 };
+use windows::Win32::UI::Accessibility::{
+    HWINEVENTHOOK, SetWinEventHook, WINEVENT_OUTOFCONTEXT, WINEVENT_SKIPOWNPROCESS,
+};
+use windows::Win32::UI::WindowsAndMessaging::{
+    EVENT_OBJECT_REORDER, EVENT_OBJECT_SHOW, EVENT_SYSTEM_FOREGROUND, HWND_NOTOPMOST, HWND_TOPMOST,
+    IsIconic, IsWindowVisible, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOOWNERZORDER, SWP_NOSENDCHANGING,
+    SWP_NOSIZE, SetWindowPos,
+};
 
 /// What the caption should look like, in the app's own terms.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -98,6 +106,122 @@ pub fn apply(hwnd: isize, look: TitleBar) {
     set_attr(hwnd, DWMWA_CAPTION_COLOR, &colorref(look.caption));
     set_attr(hwnd, DWMWA_TEXT_COLOR, &colorref(look.text));
     set_attr(hwnd, DWMWA_BORDER_COLOR, &colorref(look.border));
+}
+
+static STRICT_TOPMOST_HWND: std::sync::atomic::AtomicIsize =
+    std::sync::atomic::AtomicIsize::new(0);
+static STRICT_TOPMOST_ENABLED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+static STRICT_TOPMOST_HOOKS: std::sync::Once = std::sync::Once::new();
+
+const OBJID_WINDOW_I32: i32 = 0;
+
+fn reassert_strict_topmost() {
+    use std::sync::atomic::Ordering;
+
+    if !STRICT_TOPMOST_ENABLED.load(Ordering::Acquire) {
+        return;
+    }
+    let raw = STRICT_TOPMOST_HWND.load(Ordering::Acquire);
+    if raw == 0 {
+        return;
+    }
+    let hwnd = HWND(raw as *mut std::ffi::c_void);
+    unsafe {
+        if !IsWindowVisible(hwnd).as_bool() || IsIconic(hwnd).as_bool() {
+            return;
+        }
+        // HWND_TOPMOST is also an insertion point. Reapplying it moves this
+        // window to the front of the topmost band without stealing focus.
+        let _ = SetWindowPos(
+            hwnd,
+            Some(HWND_TOPMOST),
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE
+                | SWP_NOSIZE
+                | SWP_NOACTIVATE
+                | SWP_NOOWNERZORDER
+                | SWP_NOSENDCHANGING,
+        );
+    }
+}
+
+unsafe extern "system" fn strict_topmost_event(
+    _hook: HWINEVENTHOOK,
+    event: u32,
+    _event_hwnd: HWND,
+    id_object: i32,
+    _id_child: i32,
+    _event_thread: u32,
+    _event_time: u32,
+) {
+    if event == EVENT_SYSTEM_FOREGROUND || id_object == OBJID_WINDOW_I32 {
+        reassert_strict_topmost();
+    }
+}
+
+fn install_strict_topmost_hooks() {
+    STRICT_TOPMOST_HOOKS.call_once(|| unsafe {
+        let flags = WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS;
+        for event in [
+            EVENT_SYSTEM_FOREGROUND,
+            EVENT_OBJECT_SHOW,
+            EVENT_OBJECT_REORDER,
+        ] {
+            let hook = SetWinEventHook(
+                event,
+                event,
+                None,
+                Some(strict_topmost_event),
+                0,
+                0,
+                flags,
+            );
+            if hook.is_invalid() {
+                tracing::warn!(event, "cannot install strict-topmost WinEvent hook");
+            }
+        }
+    });
+}
+
+/// Keep TaskMan above the Windows shell as well as ordinary top-level windows.
+///
+/// The taskbar and Start menu use topmost shell surfaces of their own, so a
+/// one-shot `HWND_TOPMOST` request does not define which topmost window wins
+/// after the shell changes z-order. The WinEvent hooks above reinsert TaskMan
+/// at the front of that band whenever a foreground/window show/reorder event
+/// occurs. `SWP_NOACTIVATE` means this never steals keyboard focus.
+pub fn set_strict_topmost(hwnd: isize, enabled: bool) {
+    use std::sync::atomic::Ordering;
+
+    let native = HWND(hwnd as *mut std::ffi::c_void);
+    if enabled {
+        STRICT_TOPMOST_HWND.store(hwnd, Ordering::Release);
+        STRICT_TOPMOST_ENABLED.store(true, Ordering::Release);
+        install_strict_topmost_hooks();
+        reassert_strict_topmost();
+    } else {
+        STRICT_TOPMOST_ENABLED.store(false, Ordering::Release);
+        STRICT_TOPMOST_HWND.store(0, Ordering::Release);
+        unsafe {
+            let _ = SetWindowPos(
+                native,
+                Some(HWND_NOTOPMOST),
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE
+                    | SWP_NOSIZE
+                    | SWP_NOACTIVATE
+                    | SWP_NOOWNERZORDER
+                    | SWP_NOSENDCHANGING,
+            );
+        }
+    }
 }
 
 /// Hide or reveal a window at the COMPOSITOR, without changing whether

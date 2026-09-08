@@ -313,6 +313,9 @@ pub struct TaskManApp {
     /// recomposes the window frame — so it is only written when the theme
     /// actually changes.
     title_bar_applied: Option<([u8; 3], bool)>,
+    /// Native Win32 strict-topmost state last applied to the root HWND.
+    #[cfg(target_os = "windows")]
+    native_topmost_applied: Option<bool>,
 
     // Tab states.
     pub processes_state: crate::tabs::processes::State,
@@ -681,6 +684,8 @@ impl TaskManApp {
             selection: crate::selection::Selection::default(),
             select_all_requested: false,
             title_bar_applied: None,
+            #[cfg(target_os = "windows")]
+            native_topmost_applied: None,
             selected_user: None,
             pending_session_logoff: None,
             pending_process_end,
@@ -1220,6 +1225,8 @@ impl eframe::App for TaskManApp {
         crate::fonts::poll_async_apply(&ctx);
 
         let pal = crate::theme::palette_ctx(&ctx);
+        #[cfg(target_os = "windows")]
+        self.sync_native_topmost(_frame);
         self.sync_title_bar(&ctx, &pal, _frame);
 
         // ------------------------------------------------ top-level panels
@@ -1689,6 +1696,23 @@ impl TaskManApp {
                     .map(|process| process.status == tm_core::model::ProcStatus::Suspended)
             })
             .unwrap_or(false)
+    }
+
+    #[cfg(target_os = "windows")]
+    fn sync_native_topmost(&mut self, frame: &eframe::Frame) {
+        let enabled = self.shared.settings.always_on_top;
+        if self.native_topmost_applied == Some(enabled) {
+            return;
+        }
+        use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+        let Ok(handle) = frame.window_handle() else {
+            return;
+        };
+        let RawWindowHandle::Win32(win32) = handle.as_raw() else {
+            return;
+        };
+        tm_platform::set_strict_topmost(win32.hwnd.get(), enabled);
+        self.native_topmost_applied = Some(enabled);
     }
 
     /// Make Windows paint its caption in the app's own colors.

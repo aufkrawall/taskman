@@ -1,5 +1,23 @@
 # Recent Activity
 
+## 2026-09-08 — Strict topmost and native Task Manager escape hatch
+
+1. **Always-on-top now wins against shell topmost surfaces.** The toolkit's
+   one-shot window level is still set, but Windows also installs out-of-context
+   WinEvent hooks for foreground, top-level show and z-order reorder events.
+   While enabled and visible, TaskMan reinserts itself at `HWND_TOPMOST` with
+   `SWP_NOACTIVATE`, preventing the taskbar/Start menu from remaining above it
+   without stealing input focus. No polling or timing retry is involved.
+2. **The built-in Task Manager remains explicitly reachable.** Every tab's top
+   command bar has a Windows Task Manager action. It starts the System32
+   `Taskmgr.exe` with `DEBUG_ONLY_THIS_PROCESS`, which deliberately bypasses
+   that image's IFEO Debugger registration, and immediately calls
+   `DebugActiveProcessStop`; TaskMan's replacement registration never has to be
+   removed or temporarily weakened.
+3. **Detach failure is fail-closed.** If Windows cannot detach the debug-created
+   Task Manager, the just-created process is terminated instead of being left
+   suspended on a long-lived action-executor debugger connection.
+
 ## 2026-09-07 — Minimized windows cannot overwrite restore placement
 
 1. **Ignore iconic placement samples.** While `remember_window` is enabled, the

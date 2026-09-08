@@ -54,12 +54,16 @@ platform boundary (`tm-core` ← `tm-platform` ← `tm-app` / `tm-service`):
     reparse/hard-link-resistant owner/group/DACL repair), `autostart.rs` (owned-command-
     only HKCU startup migration), `taskmgr_replacement.rs` (owned IFEO
     `Debugger` registration for taskmgr.exe plus the guards that keep a
-    registration launchable), `instance.rs` (session-local instance
+    registration launchable, and the explicit built-in-Task-Manager escape
+    hatch which debug-creates taskmgr and immediately detaches so IFEO stays
+    installed), `instance.rs` (session-local instance
     coordination: mutex + show/acknowledge events + a published pid/HWND
     section, low-integrity-labelled so an unelevated hotkey launch reaches
     an elevated instance; an unacknowledged request starts its own
     instance), `windows_enum.rs` (one-pass top-window/hung-state inventory),
-    `window_chrome.rs` (DWM caption colour / dark mode / backdrop / cloaking),
+    `window_chrome.rs` (DWM caption colour / dark mode / backdrop / cloaking,
+    plus an event-driven strict-topmost keeper that reasserts the root HWND on
+    foreground/show/reorder events so topmost shell surfaces cannot stay above it),
     `version.rs` (cached PE metadata). Linux/macOS backends exist and are
     built by default (`build.py`).
 - `crates/tm-app`

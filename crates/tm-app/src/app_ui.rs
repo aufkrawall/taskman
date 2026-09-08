@@ -364,6 +364,25 @@ pub fn tab_header(
             ellipsis_menu(app, ui, pal, menu);
             extra(app, ui);
             vsep(ui, pal);
+            #[cfg(target_os = "windows")]
+            {
+                if cmd_button(
+                    ui,
+                    pal,
+                    Icon::OpenExternal,
+                    i18n::tr(K::WindowsTaskManager),
+                    true,
+                ) {
+                    let actions = app.actions.clone();
+                    let ctx = ui.ctx().clone();
+                    app.run_action(
+                        &ctx,
+                        || i18n::tr(K::WindowsTaskManagerStarted).to_string(),
+                        move || actions.launch_native_task_manager(),
+                    );
+                }
+                vsep(ui, pal);
+            }
             if cmd_button(ui, pal, Icon::RunTask, i18n::tr(K::RunNewTask), true) {
                 app.run_dialog_open = true;
             }

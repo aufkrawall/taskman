@@ -267,6 +267,11 @@ pub trait PlatformActions: Send + Sync {
     }
 
     // ------------------------------------------------ shell integration
+    /// Start the built-in OS task manager even when this application owns a
+    /// Task Manager replacement/interception registration.
+    fn launch_native_task_manager(&self) -> Result<()> {
+        Err(tm_core::TmError::Unsupported("Windows Task Manager"))
+    }
     fn task_manager_replacement_state(&self) -> TaskManagerReplacementState {
         TaskManagerReplacementState::Unsupported
     }

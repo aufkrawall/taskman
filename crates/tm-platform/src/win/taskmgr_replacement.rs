@@ -1,7 +1,7 @@
 //! Optional Windows Task Manager replacement through Image File Execution
 //! Options. The registry is the source of truth; config.ini never mirrors it.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use tm_core::error::{Result, TmError};
 use windows::Win32::System::Registry::{
     HKEY_LOCAL_MACHINE, KEY_READ, KEY_WRITE, REG_OPTION_NON_VOLATILE, REG_SZ, RegCloseKey,
@@ -147,6 +147,93 @@ pub fn target_missing(value: &str) -> bool {
 
 fn normalize_command(s: &str) -> String {
     s.trim().replace('/', "\\").to_lowercase()
+}
+
+fn system_task_manager_path() -> Result<PathBuf> {
+    use std::os::windows::ffi::OsStringExt;
+    use windows::Win32::System::SystemInformation::GetSystemDirectoryW;
+
+    let mut buffer = vec![0u16; 260];
+    let mut len = unsafe { GetSystemDirectoryW(Some(&mut buffer)) } as usize;
+    if len == 0 {
+        return Err(TmError::platform(
+            "GetSystemDirectoryW",
+            std::io::Error::last_os_error().to_string(),
+        ));
+    }
+    if len >= buffer.len() {
+        buffer.resize(len + 1, 0);
+        len = unsafe { GetSystemDirectoryW(Some(&mut buffer)) } as usize;
+        if len == 0 || len >= buffer.len() {
+            return Err(TmError::platform(
+                "GetSystemDirectoryW",
+                "Windows returned an invalid system-directory length",
+            ));
+        }
+    }
+    Ok(PathBuf::from(std::ffi::OsString::from_wide(&buffer[..len])).join("Taskmgr.exe"))
+}
+
+/// Launch the built-in Windows Task Manager without changing the IFEO
+/// replacement registration. Windows deliberately suppresses an image's IFEO
+/// debugger when a debugger creates that image itself; create taskmgr with
+/// `DEBUG_ONLY_THIS_PROCESS`, then immediately detach from it. This is the
+/// debugger-safe escape hatch and, unlike temporarily deleting the registry
+/// value, creates no race in which Ctrl+Shift+Esc can escape TaskMan.
+pub fn launch_native_task_manager() -> Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::System::Diagnostics::Debug::DebugActiveProcessStop;
+    use windows::Win32::System::Threading::{
+        CreateProcessW, DEBUG_ONLY_THIS_PROCESS, PROCESS_INFORMATION, STARTUPINFOW,
+        TerminateProcess,
+    };
+    use windows::core::{PCWSTR, PWSTR};
+
+    let path = system_task_manager_path()?;
+    let application: Vec<u16> = path.as_os_str().encode_wide().chain([0]).collect();
+    // CreateProcessW is allowed to mutate its command-line buffer.
+    let mut command_line = application.clone();
+    let startup = STARTUPINFOW {
+        cb: std::mem::size_of::<STARTUPINFOW>() as u32,
+        ..Default::default()
+    };
+    let mut process = PROCESS_INFORMATION::default();
+    unsafe {
+        CreateProcessW(
+            PCWSTR::from_raw(application.as_ptr()),
+            Some(PWSTR::from_raw(command_line.as_mut_ptr())),
+            None,
+            None,
+            false,
+            DEBUG_ONLY_THIS_PROCESS,
+            None,
+            PCWSTR::null(),
+            &startup,
+            &mut process,
+        )
+    }
+    .map_err(|error| TmError::platform("CreateProcessW(Taskmgr.exe)", error.to_string()))?;
+
+    let detached = unsafe { DebugActiveProcessStop(process.dwProcessId) };
+    if let Err(error) = detached {
+        // A debug-created process waits for its debugger. Never leave a stuck
+        // Task Manager attached to one of the executor's long-lived workers.
+        unsafe {
+            let _ = TerminateProcess(process.hProcess, 1);
+            let _ = CloseHandle(process.hThread);
+            let _ = CloseHandle(process.hProcess);
+        }
+        return Err(TmError::platform(
+            "DebugActiveProcessStop(Taskmgr.exe)",
+            error.to_string(),
+        ));
+    }
+    unsafe {
+        let _ = CloseHandle(process.hThread);
+        let _ = CloseHandle(process.hProcess);
+    }
+    Ok(())
 }
 
 fn read_debugger() -> DebuggerValue {
@@ -332,6 +419,15 @@ mod tests {
         )));
         // Someone else's debugger is never ours to judge.
         assert!(!target_missing(r"C:\nowhere\procexp64.exe"));
+    }
+
+    #[test]
+    fn native_task_manager_path_comes_from_the_windows_system_directory() {
+        let path = system_task_manager_path().expect("Windows system directory");
+        assert!(path.is_absolute());
+        assert!(path
+            .file_name()
+            .is_some_and(|name| name.to_string_lossy().eq_ignore_ascii_case("taskmgr.exe")));
     }
 
     #[test]

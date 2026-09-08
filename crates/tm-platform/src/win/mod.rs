@@ -369,6 +369,10 @@ impl PlatformActions for WinActions {
         process_ops::relaunch_elevated()
     }
 
+    fn launch_native_task_manager(&self) -> Result<()> {
+        taskmgr_replacement::launch_native_task_manager()
+    }
+
     fn task_manager_replacement_state(&self) -> TaskManagerReplacementState {
         let Ok(exe) = std::env::current_exe() else {
             return TaskManagerReplacementState::Disabled;
