@@ -103,6 +103,12 @@ pub fn set_task_manager_replacement_direct(enabled: bool) -> Result<()> {
     taskmgr_replacement::set_direct(enabled)
 }
 
+/// Entry point used only by the short-lived elevated helper that opens the
+/// built-in Task Manager while preserving TaskMan's IFEO replacement.
+pub fn launch_native_task_manager_direct() -> Result<()> {
+    taskmgr_replacement::launch_native_task_manager_direct()
+}
+
 pub(crate) fn task_manager_replacement_state_for(
     exe: &std::path::Path,
 ) -> TaskManagerReplacementState {

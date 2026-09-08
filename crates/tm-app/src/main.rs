@@ -123,6 +123,21 @@ fn main() {
         std::process::exit(code);
     }
 
+    // Short-lived elevated helper for opening the real Windows Task Manager
+    // while our IFEO replacement is enabled. The platform routine performs
+    // the full delete/launch/restore transaction before this process exits.
+    #[cfg(target_os = "windows")]
+    if args.iter().any(|argument| argument == "--native-taskmgr-helper") {
+        let code = match tm_platform::win::launch_native_task_manager_direct() {
+            Ok(()) => 0,
+            Err(error) => {
+                eprintln!("taskman: native Task Manager launch failed: {error}");
+                1
+            }
+        };
+        std::process::exit(code);
+    }
+
     // Elevated install/remove helper for the protected core service. Like the
     // IFEO helper above, this path performs no GUI or renderer initialization.
     #[cfg(target_os = "windows")]
