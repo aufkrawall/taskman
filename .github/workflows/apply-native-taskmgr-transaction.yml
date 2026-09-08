@@ -1,0 +1,33 @@
+name: Apply native Task Manager transaction fix
+
+on:
+  push:
+    branches: [fix/windows-task-manager-launch-transaction]
+    paths:
+      - .github/workflows/apply-native-taskmgr-transaction.yml
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: fix/windows-task-manager-launch-transaction
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Apply launch transaction fix
+        run: python .github/scripts/apply_native_taskmgr_transaction.py
+      - name: Commit fix
+        shell: bash
+        run: |
+          rm .github/workflows/apply-native-taskmgr-transaction.yml
+          rm .github/scripts/apply_native_taskmgr_transaction.py
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add crates/tm-platform/src/win/taskmgr_replacement.rs crates/tm-platform/src/win/mod.rs crates/tm-app/src/main.rs .github
+          git commit -m "Fix native Windows Task Manager launch transaction"
+          git push origin HEAD:fix/windows-task-manager-launch-transaction
