@@ -1,12 +1,25 @@
 # Debug Tools
 
-Last cross-checked: 2026-08-31
+Last cross-checked: 2026-09-08
 
 Primary sources:
 - `AGENTS.md`
 - `crates/tm-app/src/main.rs`
 - `crates/tm-app/src/app.rs`
 - `tools/capture.ps1`
+
+## General rules
+
+- Verify a tool exists and runs before relying on it; prefer discovery
+  (`Get-Command`, `where.exe`, `command -v`) over hardcoded paths.
+- Prefer project-local or repository-pinned tools over global alternatives.
+- Treat dumps, logs, captures, extracted strings, and diagnostic output as
+  potentially sensitive.
+- Do not mutate binaries, symbols, global debugger flags, registry/system
+  settings, or persistent runtime configuration unless explicitly requested.
+- When a preferred tool is unavailable, use a safe equivalent and record the
+  coverage limitation.
+- Dump, symbol, and binary-inspection tooling: `debug-tools-security-audit.md`.
 
 ## Headless diagnostics
 

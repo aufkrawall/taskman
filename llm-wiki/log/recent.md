@@ -1,8 +1,28 @@
+- 2026-09-08: Agent/template alignment: generalized the security-audit tool inventory (removed captureengine-era DX12/hook content), merged missing upstream agent rules into AGENTS.md/CLAUDE.md, filled the codestyle page, and completed the wiki catalog.
 - 2026-09-08: Run dialog focus state now has an explicit Command default, satisfying egui IdTypeMap temporary-state removal requirements while keeping initial keyboard focus semantics centralized.
 - Run-new-task dialog now owns a native-style keyboard focus loop: Tab/Shift+Tab cycle command, elevation checkbox, Cancel, Browse and OK; Enter invokes the focused push button or default OK; Space toggles/activates focused controls; Escape cancels; the command edit is focused only while it is the active stop.
 - 2026-09-08: Details gained optional Network / Network receive / Network send columns. PROCESS_NET demand now follows those visible columns and stays active while Process Properties is open, fixing blank live network statistics there without running the ETW session continuously on Details.
 - 2026-09-08: Process Properties now summarizes mitigations with System Informer-style qualifiers (permanent DEP, high-entropy ASLR, prohibited/disabled wording, CF Guard and stack protection), and module inventory uses the authenticated LocalSystem broker for identity-bound SYSTEM/service inspection with bounded responses.
 # Recent Activity
+
+## 2026-09-08 — Agent instructions and audit-tooling template alignment
+
+1. **Security-audit inventory generalized.** `llm-wiki/debug-tools-security-audit.md`
+   now matches the current upstream template's generic core rules, tool/path
+   precedence, crash-dump/symbol guidance, runtime-tracing rules, coverage-gap
+   reporting, and project-specific-additions guidance. The captureengine-era
+   DX12/hook-DLL content and cross-project paths are gone.
+2. **TaskMan audit facts added.** Verified local tool paths, the release-symbol
+   policy (`strip = "symbols"`; dev/test keep line tables), broker invariants,
+   sensitive artifacts, and the non-mutating `taskman-service.exe --selfcheck`.
+3. **Agent rules merged.** `AGENTS.md`/`CLAUDE.md` gained the missing upstream
+   rules: large-output context hygiene, exit-status-is-not-success,
+   compatibility/contract preservation, focused behavioral diffs, low-value-test
+   guidance, binary-analysis mutation rules, and the fuller llm-wiki workflow.
+   `CLAUDE.md` is now byte-identical (LF) to `AGENTS.md`.
+4. **Wiki hygiene.** `codestyle.md` placeholders were replaced with tool-backed
+   rules, and `index.md` now lists `module-unload.md`, `render-pipeline.md`, and
+   `debug-tools-security-audit.md`.
 
 ## 2026-09-08 — CI gate red on main; blind-spot fix
 

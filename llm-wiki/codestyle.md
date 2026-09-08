@@ -1,57 +1,71 @@
 # Code Style
 
-<!--
-TEMPLATE NOTE: Record style rules that are either tool-backed (formatter/
-linter config) or strongly reflected in the current tree. Delete this note
-once real content replaces it.
--->
-
-Last cross-checked: <YYYY-MM-DD>
+Last cross-checked: 2026-09-08
 
 Primary sources:
 - `AGENTS.md`
-- `<formatter config, e.g. .clang-format / .prettierrc / pyproject.toml>`
-- `<linter config, e.g. .flake8 / .eslintrc / clippy.toml>`
-- representative source files that reflect current convention
+- `build.py` (quality gate)
+- `Cargo.toml` (edition, MSRV, profiles)
+- representative modules (`crates/tm-core/src/format.rs`,
+  `crates/tm-app/src/tabs/*`, `crates/tm-platform/src/win/*`)
 
 ## Scope
-This page records the style rules that are either tool-backed or strongly
-reflected in the current tree. Local file conventions still win if a
-touched subsystem clearly uses a different established pattern.
+
+This page records style rules that are tool-backed or strongly reflected in
+the current tree. A touched subsystem's established local pattern still wins
+when it clearly differs.
 
 ## Tool-Backed Rules
 
-<!-- Per language: column limit, indent style, brace style, naming
-conventions the linter enforces, target language version, etc. -->
+### Rust
 
-### `<language>`
-- <rule>
+- Edition 2024, MSRV 1.85 (workspace package metadata).
+- `cargo fmt --all -- --check` is enforced by `python build.py --check`.
+  There is no `rustfmt.toml`, so rustfmt defaults apply (4-space indent,
+  100-column width, standard brace and import layout). Do not add a rustfmt
+  config or reformat whole files for style-only reasons.
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings` is
+  enforced by the same gate. There is no lint ratchet or accepted baseline:
+  the tree is expected to stay warning-free.
+- Targeted `#[allow(...)]` is acceptable only when justified inline, e.g.
+  `#[allow(dead_code)] // kept for future committed-limit charts`. It is not
+  a way to silence fixable lints.
+- Keep `unsafe` minimal. Where it is unavoidable (Win32 FFI), keep the block
+  narrow and document non-obvious pointer/lifetime invariants with a
+  `SAFETY:` comment (see `crates/tm-platform/src/win/net_etw.rs` and
+  `net_info.rs`).
 
 ## Common Tree Conventions
 
-<!-- Naming conventions not enforced by tooling but consistently followed:
-PascalCase vs snake_case, prefix conventions for globals/constants, header
-guard style, etc. -->
-
-- <convention>
+- Standard Rust naming: `snake_case` modules/functions/files, `PascalCase`
+  types/traits, `SCREAMING_SNAKE_CASE` constants. No project-specific name
+  prefixes.
+- Module-level `//!` docs state purpose and architecture; public items get
+  `///` docs. Comments explain why, not what; comment density follows the
+  surrounding module.
+- GUI tabs are one module per tab under `crates/tm-app/src/tabs/` (wired by
+  `mod.rs`); Windows platform concerns are one module per concern under
+  `crates/tm-platform/src/win/`. Keep new modules focused the same way.
+- Unit tests live in `#[cfg(test)] mod tests` beside the code they cover;
+  Windows integration tests live in `crates/tm-platform/tests/integration.rs`.
+- Tests are deterministic and event-driven (`wait_for` with deadlines); no
+  sleeps or timing assumptions.
+- Source files are UTF-8 with LF line endings.
 
 ## Practical Notes
+
 - Do not run a whole-file automatic formatter on existing source unless
   explicitly requested; a tree with legacy formatting or mixed line endings
   can produce large unrelated diffs from a narrow intended edit.
 - Preserve the touched file's existing formatting and line endings. Inspect
   the diff before building.
-- Naming and local-pattern guidance is medium confidence and should be
-  re-checked against the files you touch.
-- If formatter output, local file style, and this page disagree, preserve
-  the local subsystem's established pattern unless the user explicitly
-  requested a formatting migration.
+- Naming and local-pattern guidance here is medium confidence; re-check it
+  against the files you touch.
+- If formatter output, local file style, and this page disagree, preserve the
+  local subsystem's established pattern unless the user explicitly requested
+  a formatting migration.
 
 ### Current lint debt and triage
 
-<!-- If the project tracks a lint baseline/ratchet, summarize its current
-state here and point to known-debt.md for the reasoning behind any
-accepted exceptions. -->
-
-<summary of current lint baseline state, or "no lint ratchet configured
-yet">
+No lint ratchet or accepted exceptions: `build.py --check` runs clippy with
+`-D warnings`, so any new warning is a gate failure, not debt.

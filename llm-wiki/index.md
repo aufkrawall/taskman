@@ -1,6 +1,6 @@
 # llm-wiki Index
 
-Last cross-checked: 2026-09-06 (tray thread, module unload outcomes, GPU caption glyph)
+Last cross-checked: 2026-09-08 (catalog entries; agent/template alignment)
 
 Primary sources:
 
@@ -29,8 +29,14 @@ When they disagree, code and observed behavior win.
 - `repo-map.md` — crate/module ownership, high-risk files, and test matrix.
 - `core-service.md` — privileged broker, IPC trust boundary, filesystem ACLs,
   install/upgrade/uninstall lifecycle, and fallback behavior.
+- `module-unload.md` — destructive module-unload contract, identity checks,
+  and force-unload semantics.
 - `build.md` — release driver, packaging, profile and renderer policy.
+- `render-pipeline.md` — egui fork rationale, sub-pixel text, and the native
+  CPU rasterizer.
 - `debug-tools.md` — headless diagnostics and interactive-only tools.
+- `debug-tools-security-audit.md` — security, dump, and binary-analysis tool
+  inventory plus audit rules.
 - `codestyle.md` — coding and tooling conventions.
 - `known-debt.md` — deliberate remaining parity and platform gaps.
 - `log/recent.md` — recent chronology; `log.md` routes to older archives.

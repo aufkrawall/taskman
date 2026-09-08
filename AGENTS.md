@@ -37,7 +37,12 @@
   single-digit milliseconds of startup against minutes of serialized
   linking.
 - Prefer quiet output for agent runs; cargo's warnings still surface on
-  stderr and failures fail the command.
+  stderr and failures fail the command. Never infer success from exit status
+  alone — inspect the diagnostics and confirm the changed behavior or
+  artifact when practical.
+- Read large logs, compiler/test output, traces, and dumps with targeted
+  searches or head/tail ranges instead of loading thousands of lines into
+  context; keep full output available when it is evidence.
 - Always commit after code changes.
 - Match the surrounding code's indentation, naming, comment density, and
   line endings (UTF-8, LF); keep edits narrowly scoped and inspect the diff
@@ -71,11 +76,25 @@
   behavior. Engine tests use event-driven waits (`wait_for`) with deadlines.
 - No enforced file-size ceiling; keep modules focused like the existing tab
   modules.
+- Preserve intended features, compatibility guarantees, performance
+  characteristics, and public contracts unless the requested change
+  explicitly alters them.
+- Keep behavioral fixes reviewable: do not bundle unrelated formatting,
+  cleanup, generated churn, or opportunistic refactoring with them.
 - Missing telemetry must render as unavailable ("—"/"Unknown"), NEVER as a
   fabricated zero/false (core product invariant).
 - Treat logs, dumps, captures, and user data as sensitive; never commit
   secrets, dumps, logs, or large generated artifacts (`dist/`, `target/`,
   `*.png` are gitignored).
+
+## Project-specific constraints
+
+- Windows 11 is the primary host; the Linux/macOS backends are built by
+  `build.py` and must remain valid.
+- Normal GUI startup must not require UAC. Machine-wide writes go through the
+  LocalSystem broker (`llm-wiki/core-service.md`), and an explicit broker
+  rejection never falls back to the GUI token.
+- The service must never run from a user-writable directory.
 
 ## Build, diagnostics, and tests
 
@@ -84,12 +103,16 @@
 - Prefer regression tests that would have failed before the fix; the repo
   has unit tests per module plus Windows integration tests in
   `crates/tm-platform/tests/integration.rs`.
+- Do not add low-value tests solely to satisfy a blanket testing rule; prefer
+  tests that pin an invariant or reproduce the defect.
 - No sleeps in tests; poll conditions with bounded deadline loops.
 
 ## Debugging and logging
 
 - High-signal, rate-limited logging only (see `tracing::warn!` on slow
   ticks/actions); no hot-path noise.
+- Improve diagnostic logging only when it materially explains state
+  transitions or failures; never log secrets or unnecessary user data.
 - Startup phases are marked through `StartupTrace::mark` (tm-app/main.rs);
   keep new startup-relevant milestones marked there.
 
@@ -105,12 +128,29 @@
 | `TASKMAN_DATA_DIR` / `TASKMAN_CONFIG_DIR` | Isolate data/config dirs (tests) | env var |
 | `tools/capture.ps1` | Window capture automation | see script header |
 
+- Verify tool availability before relying on a documented path; hardcoded
+  paths are local examples, not guarantees.
+- Never mutate global debugger flags, registry/system settings, binaries,
+  symbols, or persistent environment state unless explicitly requested and
+  justified.
+- Dump, symbol, and binary-inspection inventory and rules:
+  `llm-wiki/debug-tools-security-audit.md`.
+
 ## `llm-wiki/` workflow
 
 - Canonical derived memory, not source of truth. Start at `index.md`;
   orient via `repo-map.md` before touching unfamiliar subsystems; check
   `log/recent.md` for active areas.
-- Update pages when durable knowledge changes (architecture, workflows,
-  root causes, conventions); skip trivial edits.
+- Read `log/` archives only for historical context; keep chronology, partial
+  investigations, and one-off notes in `log/recent.md`.
+- Mark unverified claims explicitly as open questions or stale-risk.
+- Prefer updating existing pages over creating new ones; add a page only for
+  a reusable topic, and never paste raw logs or long command output into
+  durable pages.
+- Update pages when durable knowledge changes: architecture, behavior,
+  build/test/package/deploy/debug workflows, root causes, invariants,
+  conventions, rejected approaches, and important follow-ups. Skip trivial
+  edits.
 - After wiki + code changes, semantically check for contradictions, stale
-  claims, and broken links.
+  claims, duplicates, orphan pages, broken links, missing source anchors, and
+  merge/delete/archive candidates.
