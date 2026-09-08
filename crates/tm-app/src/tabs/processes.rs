@@ -2108,10 +2108,6 @@ struct Subtree {
 }
 
 impl Subtree {
-    fn values(&self, pid: u32) -> [f64; 4] {
-        self.values.get(&pid).copied().unwrap_or([0.0; 4])
-    }
-
     fn efficiency(&self, pid: u32) -> bool {
         self.efficiency.get(&pid).copied().unwrap_or(false)
     }
