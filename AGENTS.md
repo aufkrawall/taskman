@@ -3,7 +3,7 @@
 ## Critical workflow
 
 - **Platform/toolchain baseline:** Windows 11 dev machine, Git Bash, Rust
-  nightly 1.99 (any 1.85+ works; edition 2024). Cargo lives in
+  nightly 1.99 (any 1.88+ works; edition 2024). Cargo lives in
   `~/.cargo/bin`; when it is not on PATH run
   `export PATH="$HOME/.cargo/bin:$PATH"` first. Python 3.10+ is available
   for `build.py`.

@@ -43,7 +43,7 @@ telemetry an ordinary process cannot get unelevated.
 
 - Windows 11 (developed for and tested on; Linux/macOS platform backends
   exist in the tree but are secondary)
-- Rust 1.85+ (edition 2024)
+- Rust 1.88+ (edition 2024; let-chains and `slice::as_chunks` are used)
 - Python 3.10+ for the `build.py` release driver
 
 ## Building

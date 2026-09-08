@@ -50,9 +50,12 @@ def cargo() -> str:
 def release_rustflags(windows_target: bool) -> dict[str, str] | None:
     """Hardening rustflags for release artifacts (security audit F-11-001).
 
-    * ``--remap-path-prefix`` strips the build machine's home directory from
-      panic location strings, so shipped binaries do not leak the local user
-      name (release profile strips symbols but keeps panic locations).
+    * ``--remap-path-prefix`` strips the build machine's home directory AND
+      the checkout root from panic location strings and generated-binding
+      ``file!()`` text, so shipped binaries do not leak the local user name or
+      the developer's directory layout (release profile strips symbols but
+      keeps panic locations). The root remap must be a longer match than the
+      home one; rustc applies the longest matching prefix.
     * Control Flow Guard is restated here because a set RUSTFLAGS variable
       overrides the ``.cargo/config.toml`` rustflags entirely; without it the
       packaged build would silently lose the CFG instrumentation that plain
@@ -69,6 +72,13 @@ def release_rustflags(windows_target: bool) -> dict[str, str] | None:
             forward = native.replace("\\", "/")
             if forward != native:
                 flags.append(f"--remap-path-prefix={forward}=")
+    root = str(ROOT)
+    if root and root != str(home):
+        flags.append(f"--remap-path-prefix={root}=taskman")
+        if windows_target:
+            forward_root = root.replace("\\", "/")
+            if forward_root != root:
+                flags.append(f"--remap-path-prefix={forward_root}=taskman")
     if windows_target:
         flags.append("-Ccontrol-flow-guard=yes")
     return {"RUSTFLAGS": " ".join(flags)} if flags else None
@@ -84,6 +94,89 @@ def read_version() -> str:
 
 def have(tool: str) -> bool:
     return shutil.which(tool) is not None
+
+
+# Non-host backends the project claims to support (README, AGENTS.md). The
+# host gate cannot type-check cfg-gated platform code, so these are checked
+# separately when their standard library is installed.
+CROSS_CHECK_TARGETS = ["x86_64-unknown-linux-gnu", "aarch64-apple-darwin"]
+
+# Renderer features that must each build on their own. The default build
+# enables all three, so a feature-specific cfg mistake (the software-only
+# eframe inspection fallback was one) stays invisible to it.
+RENDERER_FEATURE_CHECKS = ["software", "wgpu", "glow"]
+
+
+def host_target() -> str:
+    """Best-effort Rust host triple for the current machine."""
+    system = platform.system()
+    machine = platform.machine().lower()
+    arch = {
+        "amd64": "x86_64",
+        "x86_64": "x86_64",
+        "arm64": "aarch64",
+        "aarch64": "aarch64",
+    }.get(machine, machine)
+    if system == "Windows":
+        return f"{arch}-pc-windows-msvc"
+    if system == "Darwin":
+        return f"{arch}-apple-darwin"
+    return f"{arch}-unknown-linux-gnu"
+
+
+def installed_rust_targets() -> set[str]:
+    """Targets whose std is installed, or an empty set without rustup."""
+    rustup = shutil.which("rustup")
+    if rustup is None:
+        return set()
+    proc = subprocess.run(
+        [rustup, "target", "list", "--installed"],
+        capture_output=True,
+        text=True,
+    )
+    if proc.returncode != 0:
+        return set()
+    return {line.strip() for line in proc.stdout.splitlines() if line.strip()}
+
+
+def cross_check() -> bool:
+    """Type-check every non-host backend the project documents as supported.
+
+    `cargo check` never links, so it needs only the target's std -- and it is
+    exactly what catches a cfg-gating mistake that the host build cannot see
+    (the 2026-09 Linux/macOS build breakage). Skipped per target when its std
+    is missing; CI installs both targets so the gate is complete there.
+    """
+    installed = installed_rust_targets()
+    ok = True
+    for target in CROSS_CHECK_TARGETS:
+        if target == host_target():
+            continue  # already covered by clippy/tests
+        if target not in installed:
+            log(f"target {target} not installed - skipping cross check")
+            continue
+        if not run([cargo(), "check", "--workspace", "--target", target]):
+            ok = False
+    return ok
+
+
+def renderer_feature_check() -> bool:
+    """Type-check every renderer feature in isolation (not just all at once)."""
+    ok = True
+    for feature in RENDERER_FEATURE_CHECKS:
+        if not run(
+            [
+                cargo(),
+                "check",
+                "-p",
+                "tm-app",
+                "--no-default-features",
+                "--features",
+                feature,
+            ]
+        ):
+            ok = False
+    return ok
 
 
 def linux_cross_command(profile: str) -> tuple[list[str], str] | None:
@@ -209,6 +302,8 @@ def main() -> int:
             ]
         )
         ok &= run([cargo(), "test", "--workspace", "--all-features"])
+        ok &= cross_check()
+        ok &= renderer_feature_check()
         ok &= check_fork()
         if not ok:
             log("quality gate failed")

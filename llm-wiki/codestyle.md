@@ -19,7 +19,8 @@ when it clearly differs.
 
 ### Rust
 
-- Edition 2024, MSRV 1.85 (workspace package metadata).
+- Edition 2024, MSRV 1.88 (workspace package metadata; let-chains and
+  `slice::as_chunks` require it).
 - `cargo fmt --all -- --check` is enforced by `python build.py --check`.
   There is no `rustfmt.toml`, so rustfmt defaults apply (4-space indent,
   100-column width, standard brace and import layout). Do not add a rustfmt

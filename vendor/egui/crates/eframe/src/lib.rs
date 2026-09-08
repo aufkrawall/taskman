@@ -239,10 +239,18 @@ pub(crate) fn maybe_attach_inspection_plugin(ctx: &egui::Context, label: Option<
 
 /// Fallback for native builds without the `inspection` feature. Logs warning if inspection env
 /// var was set.
+///
+/// TASKMAN-FORK: `software` is included because the CPU renderer is a full
+/// native integration that calls this function; without it, a
+/// software-only build (no glow/wgpu) failed to compile.
 #[cfg(all(
     not(feature = "inspection"),
     not(target_arch = "wasm32"),
-    any(feature = "glow", feature = "wgpu_no_default_features")
+    any(
+        feature = "glow",
+        feature = "wgpu_no_default_features",
+        feature = "software"
+    )
 ))]
 pub(crate) fn maybe_attach_inspection_plugin(_ctx: &egui::Context, _label: Option<String>) {
     if let Ok(value) = std::env::var("EGUI_INSPECTION")

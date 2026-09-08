@@ -8,6 +8,11 @@
     windows_subsystem = "windows"
 )]
 
+// A build with no renderer feature fails deep inside eframe with a confusing
+// "no `run_native` in `eframe`" error; say what is actually wrong instead.
+#[cfg(not(any(feature = "software", feature = "wgpu", feature = "glow")))]
+compile_error!("tm-app requires at least one renderer feature: `software`, `wgpu`, or `glow`");
+
 mod action_executor;
 mod app;
 mod app_ui;
@@ -83,8 +88,8 @@ const DEFAULT_WINDOW_SIZE: [f32; 2] = [1280.0, 800.0];
 #[cfg(target_os = "windows")]
 static PROGRAMMATIC_EXIT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+#[cfg(target_os = "windows")]
 pub(crate) fn request_programmatic_exit() {
-    #[cfg(target_os = "windows")]
     PROGRAMMATIC_EXIT.store(true, std::sync::atomic::Ordering::Release);
 }
 

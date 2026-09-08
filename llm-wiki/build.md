@@ -59,6 +59,11 @@ git config --local lfs.allowincompletepush true
 - `cargo fmt --all -- --check`
 - `cargo clippy --workspace --all-targets --all-features -- -D warnings`
 - `cargo test --workspace --all-features`
+- `cargo check --workspace --target <non-host>` for `x86_64-unknown-linux-gnu`
+  and `aarch64-apple-darwin`, skipping a target whose std is not installed.
+  The host gate cannot see `cfg`-gated platform code, and this is exactly the
+  check that was missing when both non-Windows backends stopped compiling
+  (2026-09-08 audit; CI installs both targets so the gate is complete there).
 - `tools/check-fork.ps1` -- the vendored egui fork's own fmt/clippy/test. **Not
   redundant:** `cargo clippy --workspace -- -D warnings` only passes those flags to the
   packages cargo selected, and `vendor/egui` is a deliberately excluded separate

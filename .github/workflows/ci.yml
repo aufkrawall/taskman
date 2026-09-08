@@ -14,6 +14,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
+          # Non-host backends the project documents as supported; build.py
+          # --check type-checks them when their std is installed.
+          targets: x86_64-unknown-linux-gnu, aarch64-apple-darwin
       - uses: Swatinem/rust-cache@v2
       - uses: actions/setup-python@v5
         with:

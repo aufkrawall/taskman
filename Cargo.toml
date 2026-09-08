@@ -9,7 +9,7 @@ exclude = ["vendor/egui"]
 [workspace.package]
 version = "0.1.1"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.88"
 license = "MIT"
 
 [workspace.dependencies]

@@ -38,6 +38,7 @@ pub struct AffinityDialog {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 pub enum ProcessPropertiesTab {
     General,
     Statistics,

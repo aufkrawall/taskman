@@ -273,7 +273,8 @@ pub struct TaskManApp {
     pub actions: Arc<dyn PlatformActions>,
     /// Elevation status of THIS process; fixed at process creation, so it is
     /// queried exactly once (settings dialog shows it and offers an elevated
-    /// restart).
+    /// restart). Read only by the Windows-only settings section.
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
     pub is_elevated: bool,
     pub shared: SharedState,
     /// Rolling tick history for all Performance-tab charts. MUST stay a
@@ -1740,20 +1741,27 @@ impl TaskManApp {
         if self.title_bar_applied == Some((caption, dark)) {
             return;
         }
-        use raw_window_handle::{HasWindowHandle, RawWindowHandle};
-        let Ok(handle) = frame.window_handle() else {
-            return;
-        };
-        let RawWindowHandle::Win32(win32) = handle.as_raw() else {
-            return;
-        };
-        tm_platform::apply_title_bar(
-            win32.hwnd.get(),
-            caption,
-            [pal.text.r(), pal.text.g(), pal.text.b()],
-            [pal.window_bg.r(), pal.window_bg.g(), pal.window_bg.b()],
-            dark,
-        );
+        #[cfg(target_os = "windows")]
+        {
+            use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+            let Ok(handle) = frame.window_handle() else {
+                return;
+            };
+            let RawWindowHandle::Win32(win32) = handle.as_raw() else {
+                return;
+            };
+            tm_platform::apply_title_bar(
+                win32.hwnd.get(),
+                caption,
+                [pal.text.r(), pal.text.g(), pal.text.b()],
+                [pal.window_bg.r(), pal.window_bg.g(), pal.window_bg.b()],
+                dark,
+            );
+        }
+        // Non-Windows hosts have no DWM caption to repaint; the palette is
+        // still tracked so a future backend can reuse this hook.
+        #[cfg(not(target_os = "windows"))]
+        let _ = frame;
         self.title_bar_applied = Some((caption, dark));
     }
 

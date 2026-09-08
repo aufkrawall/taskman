@@ -20,9 +20,32 @@
 use crate::model::{ProcCategory, Snapshot};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, Sender};
+
+/// Upper bound for the persisted database. It is user-writable, so a corrupt
+/// or hostile file must be ignored rather than read into memory unbounded.
+const MAX_DB_BYTES: usize = 16 * 1024 * 1024;
+
+/// Read the database text, capped at [`MAX_DB_BYTES`]. `None` means the file
+/// is absent, unreadable, oversized, or not UTF-8; callers start fresh, which
+/// is the documented corrupt-file behavior.
+fn read_db_text(path: &std::path::Path) -> Option<String> {
+    let file = std::fs::File::open(path).ok()?;
+    let mut bytes = Vec::with_capacity(64 * 1024);
+    file.take((MAX_DB_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    if bytes.len() > MAX_DB_BYTES {
+        tracing::warn!(
+            path = %path.display(),
+            "app-history db exceeds {MAX_DB_BYTES} bytes; ignoring it"
+        );
+        return None;
+    }
+    String::from_utf8(bytes).ok()
+}
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AppUsage {
@@ -215,7 +238,7 @@ impl AppHistoryDb {
         let mut db = Self::in_memory();
         db.path = Some(path.clone());
         db.attach_writer();
-        if let Ok(text) = std::fs::read_to_string(&path) {
+        if let Some(text) = read_db_text(&path) {
             db.apply_loaded_file(&text, &path);
         }
         db
@@ -237,7 +260,7 @@ impl AppHistoryDb {
         let spawned = std::thread::Builder::new()
             .name("tm-hist-load".into())
             .spawn(move || {
-                let text = std::fs::read_to_string(&path).ok();
+                let text = read_db_text(&path);
                 let _ = tx.send(text);
             });
         if spawned.is_err() {

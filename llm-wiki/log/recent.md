@@ -1,9 +1,32 @@
+- 2026-09-08: Full-repository audit fixes: non-Windows backends compile again (`cargo check --target x86_64-unknown-linux-gnu` / `aarch64-apple-darwin`), and `build.py --check` now runs those cross-target checks (CI installs both targets). MSRV corrected to 1.88 (let-chains/`as_chunks`), release `--remap-path-prefix` also strips the checkout root, config/history reads are capped, and the ETW properties buffer is word-aligned.
 - 2026-09-08: Agent/template alignment: generalized the security-audit tool inventory (removed captureengine-era DX12/hook content), merged missing upstream agent rules into AGENTS.md/CLAUDE.md, filled the codestyle page, and completed the wiki catalog.
 - 2026-09-08: Run dialog focus state now has an explicit Command default, satisfying egui IdTypeMap temporary-state removal requirements while keeping initial keyboard focus semantics centralized.
 - Run-new-task dialog now owns a native-style keyboard focus loop: Tab/Shift+Tab cycle command, elevation checkbox, Cancel, Browse and OK; Enter invokes the focused push button or default OK; Space toggles/activates focused controls; Escape cancels; the command edit is focused only while it is the active stop.
 - 2026-09-08: Details gained optional Network / Network receive / Network send columns. PROCESS_NET demand now follows those visible columns and stays active while Process Properties is open, fixing blank live network statistics there without running the ETW session continuously on Details.
 - 2026-09-08: Process Properties now summarizes mitigations with System Informer-style qualifiers (permanent DEP, high-entropy ASLR, prohibited/disabled wording, CF Guard and stack protection), and module inventory uses the authenticated LocalSystem broker for identity-bound SYSTEM/service inspection with bounded responses.
 # Recent Activity
+
+## 2026-09-08 — Full-repository audit: non-Windows build fix and gate hardening
+
+1. **Both non-Windows backends were broken and invisible to the gate.**
+   `cargo check --target x86_64-unknown-linux-gnu` failed in `tm-app`
+   (`sync_title_bar` used the Windows-only `raw_window_handle` dep;
+   `dispatch_core_service_*` referenced a Windows-only field) and
+   `--target aarch64-apple-darwin` failed in `tm-platform` (missing
+   `kernel_pct` / `per_core_kernel_pct` in the macOS `CpuInfo`). Fixed by
+   gating the Windows-only code and supplying the honest unknown defaults.
+2. **The gate can now see platform code.** `build.py --check` runs
+   `cargo check --workspace --target <non-host>` for both targets when their
+   std is installed, and `.github/workflows/ci.yml` installs both targets.
+3. **MSRV was wrong.** `let`-chains, `slice::as_chunks` and
+   `is_multiple_of` require Rust 1.88, not the declared 1.85; Cargo.toml,
+   README and codestyle now say 1.88.
+4. **Release artifacts leaked the checkout path.** `--remap-path-prefix`
+   stripped `C:\Users\<user>` but left `Programme\build\tmproject\target\...`
+   strings from generated bindings; the checkout root is now remapped too.
+5. **Bounded config/history reads** (`config.ini`, legacy `settings.json`,
+   app-history JSON) and **word-aligned ETW `EVENT_TRACE_PROPERTIES`**
+   (a `Vec<u8>` cast to an 8-byte-aligned struct was technically UB).
 
 ## 2026-09-08 — Agent instructions and audit-tooling template alignment
 

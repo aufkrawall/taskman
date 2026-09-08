@@ -420,6 +420,22 @@ fn render_ini(
 
 // ------------------------------------------------------------- value helpers
 
+/// Read at most `max` bytes from `path`. A larger file is an error rather
+/// than an unbounded allocation: config files are user-writable, so a
+/// corrupt or hostile file must degrade to defaults, not to an OOM.
+fn read_capped(path: &Path, max: usize) -> std::io::Result<Vec<u8>> {
+    let file = std::fs::File::open(path)?;
+    let mut bytes = Vec::with_capacity(16 * 1024);
+    file.take((max + 1) as u64).read_to_end(&mut bytes)?;
+    if bytes.len() > max {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("{} exceeds the {max}-byte limit", path.display()),
+        ));
+    }
+    Ok(bytes)
+}
+
 fn parse_bool(s: &str) -> Option<bool> {
     match s.to_ascii_lowercase().as_str() {
         "1" | "true" | "yes" | "on" => Some(true),
@@ -602,19 +618,7 @@ impl Settings {
     /// Load settings from `path` (or the platform default). A missing file
     /// yields defaults; unparsable values fall back per-key to defaults.
     pub fn load_from(path: &Path) -> Self {
-        let bytes = (|| -> std::io::Result<Vec<u8>> {
-            let file = std::fs::File::open(path)?;
-            let mut bytes = Vec::with_capacity(16 * 1024);
-            file.take((MAX_SETTINGS_BYTES + 1) as u64)
-                .read_to_end(&mut bytes)?;
-            if bytes.len() > MAX_SETTINGS_BYTES {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "settings file exceeds 4 MiB",
-                ));
-            }
-            Ok(bytes)
-        })();
+        let bytes = read_capped(path, MAX_SETTINGS_BYTES);
         match bytes {
             Ok(bytes) => {
                 // Tolerate a UTF-8 BOM (e.g. files edited with PowerShell).
@@ -839,7 +843,11 @@ impl Settings {
         // One-time migration from the legacy JSON settings of older builds.
         let json = taskman_config_dir().join("settings.json");
         if json.exists() {
-            match std::fs::read_to_string(&json) {
+            let legacy = read_capped(&json, MAX_SETTINGS_BYTES).and_then(|bytes| {
+                String::from_utf8(bytes)
+                    .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
+            });
+            match legacy {
                 Ok(text) => match serde_json::from_str::<Settings>(&text) {
                     Ok(mut s) => {
                         // Never inherit a stale autosave flag from JSON-era

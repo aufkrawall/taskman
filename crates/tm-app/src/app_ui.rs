@@ -971,6 +971,7 @@ pub fn settings_dialog(app: &mut TaskManApp, ctx: &egui::Context, _pal: &theme::
                     app.shared.toast(i18n::tr(K::ColWidthsResetToast));
                 }
                 if ui.button(i18n::tr(K::Reset)).clicked() {
+                    #[cfg_attr(not(target_os = "windows"), allow(unused_mut))]
                     let mut defaults = Settings::default();
                     #[cfg(target_os = "windows")]
                     if let Err(error) = app.actions.set_start_with_windows(false, true)
@@ -1395,6 +1396,7 @@ pub fn run_task_dialog(app: &mut TaskManApp, ctx: &egui::Context, _pal: &theme::
 
 /// Dispatch the core-service install/remove change on an action lane. The
 /// inflight flag disables the buttons until the operation completes.
+#[cfg(target_os = "windows")]
 fn dispatch_core_service_change(app: &mut TaskManApp, ctx: &egui::Context, install: bool) {
     let actions = app.actions.clone();
     let inflight = app.core_service_change_inflight.clone();
@@ -1426,6 +1428,7 @@ fn dispatch_core_service_change(app: &mut TaskManApp, ctx: &egui::Context, insta
 /// the running session's image path stays rejected until it switches, so a
 /// bare repair would leave the user in the same "not the installed client"
 /// state they tried to leave.
+#[cfg(target_os = "windows")]
 fn dispatch_core_service_repair_and_switch(app: &mut TaskManApp, ctx: &egui::Context) {
     let actions = app.actions.clone();
     let inflight = app.core_service_change_inflight.clone();
@@ -1454,6 +1457,7 @@ fn dispatch_core_service_repair_and_switch(app: &mut TaskManApp, ctx: &egui::Con
 /// Dispatch the handover to the protected installed GUI. Shutting down
 /// gracefully lets on_exit flush settings and history while the installed
 /// replacement waits on the single-instance handoff.
+#[cfg(target_os = "windows")]
 fn dispatch_core_service_switch(app: &mut TaskManApp, ctx: &egui::Context) {
     let actions = app.actions.clone();
     let inflight = app.core_service_change_inflight.clone();

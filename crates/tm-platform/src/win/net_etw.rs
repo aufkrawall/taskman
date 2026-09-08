@@ -299,13 +299,17 @@ fn session_name(role: TraceRole) -> Vec<u16> {
 
 /// `EVENT_TRACE_PROPERTIES` plus room for the trailing session name, which
 /// the API copies in at `LoggerNameOffset`.
-fn properties_buffer(name: &[u16]) -> Vec<u8> {
+///
+/// Allocated as `u64` words, not `u8`: the struct embeds 64-bit
+/// `LARGE_INTEGER` fields and requires 8-byte alignment, which `Vec<u8>` does
+/// not guarantee. `Wnode.BufferSize` carries the byte length; the allocation
+/// is rounded up to a whole word.
+fn properties_buffer(name: &[u16]) -> Vec<u64> {
     let header = std::mem::size_of::<EVENT_TRACE_PROPERTIES>();
     let total = header + name.len() * 2;
-    let mut buffer = vec![0u8; total];
-    // SAFETY: the buffer is at least one EVENT_TRACE_PROPERTIES long and
-    // correctly aligned (Vec<u8> from the global allocator is 8-aligned, and
-    // the struct's alignment is 8).
+    let mut buffer = vec![0u64; total.div_ceil(std::mem::size_of::<u64>())];
+    // SAFETY: `buffer` is `u64`-aligned and at least `header` bytes long, so
+    // the cast is aligned and in bounds. All writes are inside the struct.
     let properties = buffer.as_mut_ptr().cast::<EVENT_TRACE_PROPERTIES>();
     unsafe {
         (*properties).Wnode.BufferSize = total as u32;
@@ -326,7 +330,7 @@ fn properties_buffer(name: &[u16]) -> Vec<u8> {
 
 /// Start the session, retrying once after clearing a stale session of the
 /// same name (left behind by a crash).
-fn start_session(name: &[u16]) -> Option<(CONTROLTRACE_HANDLE, Vec<u8>)> {
+fn start_session(name: &[u16]) -> Option<(CONTROLTRACE_HANDLE, Vec<u64>)> {
     let mut properties = properties_buffer(name);
     let mut handle = CONTROLTRACE_HANDLE::default();
     let mut status = unsafe {
@@ -364,7 +368,7 @@ fn start_session(name: &[u16]) -> Option<(CONTROLTRACE_HANDLE, Vec<u8>)> {
     Some((handle, properties))
 }
 
-fn stop_session(handle: CONTROLTRACE_HANDLE, name: &[u16], properties: &mut [u8]) {
+fn stop_session(handle: CONTROLTRACE_HANDLE, name: &[u16], properties: &mut [u64]) {
     let status: WIN32_ERROR = unsafe {
         ControlTraceW(
             handle,
@@ -454,14 +458,14 @@ mod tests {
     #[test]
     fn properties_buffer_reserves_room_for_the_session_name() {
         let name = session_name(TraceRole::Service);
+        let total = std::mem::size_of::<EVENT_TRACE_PROPERTIES>() + name.len() * 2;
         let buffer = properties_buffer(&name);
-        assert_eq!(
-            buffer.len(),
-            std::mem::size_of::<EVENT_TRACE_PROPERTIES>() + name.len() * 2
-        );
+        // The allocation is word-rounded, but must cover the requested bytes.
+        assert!(buffer.len() * std::mem::size_of::<u64>() >= total);
+        assert_eq!(buffer.as_ptr().align_offset(8), 0, "8-byte aligned");
         let properties = buffer.as_ptr().cast::<EVENT_TRACE_PROPERTIES>();
         unsafe {
-            assert_eq!((*properties).Wnode.BufferSize as usize, buffer.len());
+            assert_eq!((*properties).Wnode.BufferSize as usize, total);
             assert_eq!(
                 (*properties).LoggerNameOffset as usize,
                 std::mem::size_of::<EVENT_TRACE_PROPERTIES>()

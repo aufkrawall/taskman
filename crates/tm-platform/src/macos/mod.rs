@@ -158,6 +158,10 @@ impl SystemCollector for MacCollector {
                     .iter()
                     .map(|c| c.cpu_usage().clamp(0.0, 100.0))
                     .collect(),
+                // macOS exposes no user/kernel split through sysinfo, so the
+                // kernel overlay stays honestly empty (rendered as "—").
+                per_core_kernel_pct: Vec::new(),
+                kernel_pct: 0.0,
                 freq_mhz: freq,
                 freq_base_mhz: 0.0,
                 logical_count: logical,
