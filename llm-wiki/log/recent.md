@@ -1,5 +1,21 @@
 # Recent Activity
 
+## 2026-09-08 — Process groups use virtual aggregate parents
+
+1. **Group totals are no longer disguised as a real process.** Every expandable
+   Apps/Background/Windows family has a presentation-only parent row whose CPU,
+   memory, disk and network values are the sum of its represented members.
+2. **Expansion reveals every concrete process.** The process that previously
+   doubled as the group header is now the first real child; all real rows show
+   only their own resource values. App descendants retain hierarchy indentation,
+   while flat Background/Windows families remain one level deep.
+3. **Search is unambiguously per-process.** Search results are flat concrete rows
+   and therefore sort/render by each process's own metrics rather than a hidden
+   subtree aggregate.
+4. Regression coverage pins aggregate-vs-root resource values, full expanded
+   membership (including svchost groups), hierarchy depth, resource-sorted block
+   attachment and collapsed End-task membership.
+
 ## 2026-09-08 — Strict topmost and native Task Manager escape hatch
 
 1. **Always-on-top now wins against shell topmost surfaces.** The toolkit's

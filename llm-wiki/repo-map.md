@@ -176,8 +176,11 @@ platform boundary (`tm-core` ← `tm-platform` ← `tm-app` / `tm-service`):
   Windows-process membership is NOT inherited from Session 0 or system ancestry:
   the Windows sampler requires a core system image name or Microsoft metadata plus
   a Windows-owned executable path, so third-party SCM services remain Background.
-  A group's aggregate is
-  `family_values` — the MEMBERS' own values, not the subtree's, because a
+  Expandable application/family rows are virtual presentation parents: the
+  virtual row owns the aggregate, while expansion reveals every concrete member
+  (including the former head/root) as a child with only its own metrics. Flat
+  Background/Windows family aggregates use `family_values` — the MEMBERS' own
+  values, not the subtree's, because a
   foreign descendant left outside the group is rendered as its own row and must
   not be counted twice. Do not collapse this back to a literal PPID tree. Raw `ProcessEntry.ppid` remains OS truth and is exposed by the
   persisted System Informer-style tree on the Details page, which is expanded

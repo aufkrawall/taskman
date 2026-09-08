@@ -18,6 +18,10 @@
 //!   external helpers (no window, >= 1% CPU, different image) are promoted
 //!   to individually visible Background rows; windowed processes are never
 //!   demoted to Background.
+//! * Expandable application/family rows are presentation-only aggregate rows:
+//!   they sum CPU, memory, disk and network for the represented members. Once
+//!   expanded, every concrete process — including the former root/head — is a
+//!   child row with only its own resource values.
 //! * Group header counts never depend on expansion state (P0.4). Apps counts
 //!   top-level app groups like native Task Manager; Background/Windows count
 //!   their unflattened process members.
@@ -71,9 +75,14 @@ pub struct RowData {
     pub name: String,
     pub icon_path: Option<String>,
     pub children: bool,
+    /// Presentation-only application/family summary. It deliberately reuses
+    /// the representative process identity as its stable expansion key, but
+    /// is not itself an OS process. When expanded, the concrete representative
+    /// appears below it as an ordinary row with its own values.
+    pub aggregate: bool,
     /// Exact process identities represented by this visible row for End task.
-    /// A collapsed group contains every hidden member; an expanded group head
-    /// and ordinary rows contain only themselves. Other process actions keep
+    /// An aggregate group contains every represented member; ordinary process
+    /// rows contain only themselves. Other process actions keep
     /// using the normal selection model and are deliberately unaffected.
     termination_targets: Vec<crate::app::ProcessIdentity>,
     /// cpu %, mem bytes, disk bps, net bps (aggregated over the display subtree).
@@ -297,14 +306,23 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
         let candidates = rows
             .iter()
             .filter_map(|row| match row {
-                DisplayRow::Process(row) if !row.synthetic => Some((row.pid, row.name.as_str())),
+                DisplayRow::Process(row)
+                    if row_is_selectable(row, &app.processes_state.expanded) =>
+                {
+                    Some((row.pid, row.name.as_str()))
+                }
                 DisplayRow::GroupHeader(..) => None,
                 DisplayRow::Process(_) => None,
             })
             .collect::<Vec<_>>();
         if let Some(pid) = search::type_ahead_match(candidates, selected, &typed)
             && let Some(row) = rows.iter().find_map(|row| match row {
-                DisplayRow::Process(row) if row.pid == pid => Some(row),
+                DisplayRow::Process(row)
+                    if row.pid == pid
+                        && row_is_selectable(row, &app.processes_state.expanded) =>
+                {
+                    Some(row)
+                }
                 _ => None,
             })
         {
@@ -324,7 +342,7 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
     // currently rendered virtualization window.
     let focus_row = app.processes_state.scroll_to_pid.take().and_then(|pid| {
         rows.iter()
-            .position(|r| matches!(r, DisplayRow::Process(p) if p.pid == pid))
+            .position(|r| matches!(r, DisplayRow::Process(p) if p.pid == pid && row_is_selectable(p, &app.processes_state.expanded)))
     });
 
     let clicked = tablekit::scrolled_rows(
@@ -377,7 +395,11 @@ fn handle_keyboard_navigation(app: &mut TaskManApp, ctx: &egui::Context, rows: &
         .iter()
         .enumerate()
         .filter_map(|(display_idx, row)| match row {
-            DisplayRow::Process(row) if !row.synthetic => Some((display_idx, row)),
+            DisplayRow::Process(row)
+                if row_is_selectable(row, &app.processes_state.expanded) =>
+            {
+                Some((display_idx, row))
+            }
             _ => None,
         })
         .collect();
@@ -427,7 +449,7 @@ fn handle_keyboard_navigation(app: &mut TaskManApp, ctx: &egui::Context, rows: &
     };
     let Some(display_idx) = rows
         .iter()
-        .position(|row| matches!(row, DisplayRow::Process(p) if p.pid == pid))
+        .position(|row| matches!(row, DisplayRow::Process(p) if p.pid == pid && row_is_selectable(p, &app.processes_state.expanded)))
     else {
         return;
     };
@@ -447,10 +469,26 @@ fn handle_keyboard_navigation(app: &mut TaskManApp, ctx: &egui::Context, rows: &
     } else if left {
         if current.children && app.processes_state.expanded.contains(&pid) {
             app.processes_state.toggle_expanded(pid);
-        } else if current.depth > 0
+        } else if current.depth == 1 {
+            // The virtual aggregate is the parent of every first-level real
+            // process. It is deliberately not selectable while expanded; a
+            // Left key collapses it instead of moving selection onto a row
+            // that does not represent an OS process.
+            let group = rows[..display_idx]
+                .iter()
+                .rev()
+                .find(|row| matches!(row, DisplayRow::Process(parent) if parent.depth == 0))
+                .and_then(|row| match row {
+                    DisplayRow::Process(parent) if parent.aggregate => Some(parent.pid),
+                    _ => None,
+                });
+            if let Some(group_pid) = group {
+                app.processes_state.toggle_expanded(group_pid);
+            }
+        } else if current.depth > 1
             && let Some(parent) = rows[..display_idx].iter().rev().find_map(|row| match row {
                 DisplayRow::Process(parent)
-                    if !parent.synthetic && parent.depth < current.depth =>
+                    if !parent.synthetic && !parent.aggregate && parent.depth < current.depth =>
                 {
                     Some(parent)
                 }
@@ -494,6 +532,10 @@ fn identity_of(row: &RowData) -> crate::app::ProcessIdentity {
         pid: row.pid,
         start_epoch_s: row.start_epoch_s,
     }
+}
+
+fn row_is_selectable(row: &RowData, expanded: &HashSet<u32>) -> bool {
+    !row.synthetic && (!row.aggregate || !expanded.contains(&row.pid))
 }
 
 /// Exact identities hidden behind one collapsed Apps-tree row. This walk is
@@ -573,6 +615,9 @@ pub(crate) fn termination_targets_for_selection(
         let DisplayRow::Process(row) = display_row else {
             continue;
         };
+        if row.aggregate && app.processes_state.expanded.contains(&row.pid) {
+            continue;
+        }
         let identity = identity_of(&row);
         if selected.contains(&identity) {
             matched.insert(identity);
@@ -594,9 +639,13 @@ pub(crate) fn termination_targets_for_selection(
 /// Shift-click range is taken in. Group headers and the synthetic
 /// CPU-attribution rows are not selectable and so are not in it.
 fn selectable_identities(rows: &[DisplayRow]) -> Vec<crate::app::ProcessIdentity> {
+    let mut seen = HashSet::new();
     rows.iter()
         .filter_map(|row| match row {
-            DisplayRow::Process(row) if !row.synthetic => Some(identity_of(row)),
+            DisplayRow::Process(row) if !row.synthetic => {
+                let identity = identity_of(row);
+                seen.insert(identity.clone()).then_some(identity)
+            }
             _ => None,
         })
         .collect()
@@ -715,11 +764,17 @@ fn row_ui(
     row: &RowData,
     all_rows: &[DisplayRow],
 ) {
-    let selected = app.selection.contains_pid(row.pid);
-    let (rect, resp) = table.row(ui, pal, selected, (row.pid, row.start_epoch_s));
+    let expanded = app.processes_state.expanded.contains(&row.pid);
+    let selectable = row_is_selectable(row, &app.processes_state.expanded);
+    let selected = selectable && app.selection.contains_pid(row.pid);
+    let (rect, resp) = table.row(
+        ui,
+        pal,
+        selected,
+        (row.pid, row.start_epoch_s, row.aggregate),
+    );
 
     // Chevron + icon + name.
-    let expanded = app.processes_state.expanded.contains(&row.pid);
     let seed = egui::Id::new(("proc-chev", row.pid, row.start_epoch_s.unwrap_or(0)));
     let toggled = row.children && table.chevron(ui, rect, expanded, true, pal, seed);
     if toggled {
@@ -781,7 +836,12 @@ fn row_ui(
             // A pseudo-row owns no process; selecting it would arm the
             // toolbar for a target that cannot be acted on.
             app.selection.clear();
-        } else {
+        } else if row.aggregate && expanded {
+            // Once open, the aggregate is a pure virtual parent. Clicking its
+            // body behaves like its chevron instead of selecting the concrete
+            // root process that is now visible directly below it.
+            app.processes_state.toggle_expanded(row.pid);
+        } else if selectable {
             let kind =
                 crate::selection::ClickKind::from_modifiers(&ui.input(|input| input.modifiers));
             // Materialized here rather than once per frame: a Shift range is
@@ -792,7 +852,7 @@ fn row_ui(
     }
     // A right-click inside an existing multi-selection keeps it, so the menu
     // can act on the whole set; outside it the selection follows the row.
-    if resp.secondary_clicked() && !row.synthetic && !app.selection.contains_pid(row.pid) {
+    if resp.secondary_clicked() && selectable && !app.selection.contains_pid(row.pid) {
         app.selection.select_single(identity_of(row));
     }
     // on_hover_text/context_menu consume the response (builder style). A
@@ -810,6 +870,7 @@ fn row_ui(
         // selection, anchored to its row — the keyboard counterpart of a
         // right click.
         let keyboard_open = menu::keyboard_menu_requested(ui.ctx())
+            && selectable
             && app.selection.primary().is_some_and(|primary| {
                 primary.pid == row.pid && primary.start_epoch_s == row.start_epoch_s
             });
@@ -1138,9 +1199,16 @@ fn build_display_rows(
             .copied()
             .filter(|p| q.matches_process(p))
             .collect();
-        sort_entries(&mut matched, sort_col, ascending, &subtree.values);
+        // Search is a flat process view: concrete process rows must show and
+        // sort by their OWN values, never by hidden descendants. Aggregation
+        // belongs exclusively to the explicit virtual group rows below.
+        let own = matched
+            .iter()
+            .map(|process| (process.pid, own_values(process)))
+            .collect::<HashMap<_, _>>();
+        sort_entries(&mut matched, sort_col, ascending, &own);
         for p in matched {
-            out.push(make_flat_row(p, &subtree));
+            out.push(make_flat_row(p));
         }
         normalize_heat(&mut out);
         return out;
@@ -1354,8 +1422,6 @@ fn emit_flat_with_family_groups(
     let mut family_heads: HashMap<u32, Vec<&ProcessEntry>> = HashMap::new();
     let mut swallowed: HashSet<u32> = HashSet::new();
     for p in members {
-        // A process already inside another family cannot head one of its own,
-        // otherwise a chain would be emitted twice.
         if swallowed.contains(&p.pid) {
             continue;
         }
@@ -1368,9 +1434,6 @@ fn emit_flat_with_family_groups(
         }
     }
 
-    // Repeat runs of one image under one parent, over whatever the family
-    // walk did not already claim. The lowest pid heads the run so the group's
-    // expansion state survives the list re-sorting on every tick.
     let mut runs: HashMap<(u32, String), Vec<&ProcessEntry>> = HashMap::new();
     for p in members {
         if swallowed.contains(&p.pid) || family_heads.contains_key(&p.pid) {
@@ -1392,8 +1455,6 @@ fn emit_flat_with_family_groups(
         family_heads.insert(head, run);
     }
 
-    // Representative values: group heads sort by their family aggregate,
-    // plain rows by their own values.
     let mut repr: HashMap<u32, [f64; 4]> = HashMap::with_capacity(members.len());
     for p in members {
         if let Some(fam) = family_heads.get(&p.pid) {
@@ -1413,7 +1474,7 @@ fn emit_flat_with_family_groups(
         if let Some(fam) = family_heads.get(&p.pid) {
             let net_available = fam
                 .iter()
-                .any(|k| k.net_recv_bps.is_some() || k.net_sent_bps.is_some());
+                .any(|member| member.net_recv_bps.is_some() || member.net_sent_bps.is_some());
             out.push(DisplayRow::Process(RowData {
                 pid: p.pid,
                 start_epoch_s: p.start_epoch_s,
@@ -1422,36 +1483,54 @@ fn emit_flat_with_family_groups(
                 icon_path: p
                     .exe_path
                     .as_ref()
-                    .map(|x| x.to_string_lossy().into_owned()),
+                    .map(|path| path.to_string_lossy().into_owned()),
                 children: true,
-                termination_targets: if expanded.contains(&p.pid) {
-                    vec![process_identity(p)]
-                } else {
-                    fam.iter().map(|member| process_identity(member)).collect()
-                },
+                aggregate: true,
+                termination_targets: fam
+                    .iter()
+                    .filter(|member| !member.synthetic)
+                    .map(|member| process_identity(member))
+                    .collect(),
                 values: repr.get(&p.pid).copied().unwrap_or([0.0; 4]),
                 heat: [0.0; 4],
                 net_available,
-                status: if fam.iter().any(|k| k.status == ProcStatus::NotResponding) {
+                status: if fam
+                    .iter()
+                    .any(|member| member.status == ProcStatus::NotResponding)
+                {
                     ProcStatus::NotResponding
-                } else if fam.iter().any(|k| k.status == ProcStatus::Suspended) {
+                } else if fam
+                    .iter()
+                    .any(|member| member.status == ProcStatus::Suspended)
+                {
                     ProcStatus::Suspended
                 } else {
                     p.status
                 },
-                // The family row stands for every member, so it reports the
-                // family's efficiency state — not just the head's.
-                power_throttled: fam.iter().any(|k| k.power_throttled == Some(true)),
-                synthetic: p.synthetic,
-                tooltip: synthetic_tooltip(p),
+                power_throttled: fam
+                    .iter()
+                    .any(|member| member.power_throttled == Some(true)),
+                synthetic: false,
+                tooltip: None,
             }));
             if expanded.contains(&p.pid) {
-                let mut kids: Vec<&ProcessEntry> = fam.iter().skip(1).copied().collect();
-                let own: HashMap<u32, [f64; 4]> =
-                    kids.iter().map(|k| (k.pid, own_values(k))).collect();
-                sort_entries(&mut kids, sort_col, ascending, &own);
-                for k in kids {
-                    out.push(make_own_row(k, 1));
+                // The virtual row owns the aggregate; every real member,
+                // including the representative/root, is rendered below it
+                // with its own metrics. Keep the representative first, then
+                // sort the remaining members by the active column.
+                out.push(make_own_row(p, 1));
+                let mut rest = fam
+                    .iter()
+                    .copied()
+                    .filter(|member| member.pid != p.pid)
+                    .collect::<Vec<_>>();
+                let own = rest
+                    .iter()
+                    .map(|member| (member.pid, own_values(member)))
+                    .collect::<HashMap<_, _>>();
+                sort_entries(&mut rest, sort_col, ascending, &own);
+                for member in rest {
+                    out.push(make_own_row(member, 1));
                 }
             }
         } else {
@@ -1798,7 +1877,7 @@ fn normalize_heat(rows: &mut [DisplayRow]) {
     }
 }
 
-fn make_flat_row(p: &ProcessEntry, subtree: &Subtree) -> DisplayRow {
+fn make_flat_row(p: &ProcessEntry) -> DisplayRow {
     DisplayRow::Process(RowData {
         pid: p.pid,
         start_epoch_s: p.start_epoch_s,
@@ -1807,10 +1886,11 @@ fn make_flat_row(p: &ProcessEntry, subtree: &Subtree) -> DisplayRow {
         icon_path: p
             .exe_path
             .as_ref()
-            .map(|x| x.to_string_lossy().into_owned()),
+            .map(|path| path.to_string_lossy().into_owned()),
         children: false,
+        aggregate: false,
         termination_targets: vec![process_identity(p)],
-        values: subtree.values(p.pid),
+        values: own_values(p),
         heat: [0.0; 4],
         net_available: p.net_recv_bps.is_some() || p.net_sent_bps.is_some(),
         status: p.status,
@@ -1842,6 +1922,7 @@ fn make_own_row(p: &ProcessEntry, depth: usize) -> DisplayRow {
             .as_ref()
             .map(|x| x.to_string_lossy().into_owned()),
         children: false,
+        aggregate: false,
         termination_targets: vec![process_identity(p)],
         values: own_values(p),
         heat: [0.0; 4],
@@ -1946,59 +2027,98 @@ fn emit_tree<'a>(
 ) {
     let mut sorted_roots: Vec<&ProcessEntry> = roots.to_vec();
     sort_entries(&mut sorted_roots, sort_col, ascending, &subtree.values);
-    let mut stack: Vec<(&ProcessEntry, usize)> =
-        sorted_roots.iter().rev().map(|&r| (r, 0usize)).collect();
-    let mut visited: HashSet<u32> = HashSet::new();
-    let mut sorted_children: HashMap<u32, Vec<&ProcessEntry>> = HashMap::new();
 
-    while let Some((proc, depth)) = stack.pop() {
-        if !visited.insert(proc.pid) {
+    for root in sorted_roots {
+        let members = tree_group_members(root, children);
+        if members.len() <= 1 {
+            out.push(make_own_row(root, 0));
             continue;
         }
-        let kids = sorted_children
-            .entry(proc.pid)
-            .or_insert_with(|| {
-                let mut v = children.get(&proc.pid).cloned().unwrap_or_default();
-                sort_entries(&mut v, sort_col, ascending, &subtree.values);
-                v
-            })
-            .clone();
-        let has_children = !kids.is_empty();
-        let count = subtree.count(proc.pid);
-        let name = if count > 1 {
-            format!("{} [{}]", process_display_name(proc), count)
-        } else {
-            process_display_name(proc)
-        };
+        let net_available = members
+            .iter()
+            .any(|member| member.net_recv_bps.is_some() || member.net_sent_bps.is_some());
         out.push(DisplayRow::Process(RowData {
-            pid: proc.pid,
-            start_epoch_s: proc.start_epoch_s,
-            depth,
-            name,
-            icon_path: proc
+            pid: root.pid,
+            start_epoch_s: root.start_epoch_s,
+            depth: 0,
+            name: format!("{} [{}]", process_display_name(root), members.len()),
+            icon_path: root
                 .exe_path
                 .as_ref()
-                .map(|x| x.to_string_lossy().into_owned()),
-            children: has_children,
-            termination_targets: if has_children && !expanded.contains(&proc.pid) {
-                collapsed_tree_targets(proc, children)
-            } else {
-                vec![process_identity(proc)]
-            },
-            values: subtree.values(proc.pid),
+                .map(|path| path.to_string_lossy().into_owned()),
+            children: true,
+            aggregate: true,
+            termination_targets: members
+                .iter()
+                .filter(|member| !member.synthetic)
+                .map(|member| process_identity(member))
+                .collect(),
+            values: subtree.values(root.pid),
             heat: [0.0; 4],
-            net_available: proc.net_recv_bps.is_some() || proc.net_sent_bps.is_some(),
-            status: subtree.status(proc.pid),
-            // An app row summarizes its whole family (see [`Subtree`]), so a
-            // collapsed browser shows the leaf its renderers earned.
-            power_throttled: subtree.efficiency(proc.pid),
-            synthetic: proc.synthetic,
-            tooltip: synthetic_tooltip(proc),
+            net_available,
+            status: subtree.status(root.pid),
+            power_throttled: subtree.efficiency(root.pid),
+            synthetic: false,
+            tooltip: None,
         }));
-        if has_children && expanded.contains(&proc.pid) {
-            for k in kids.into_iter().rev() {
-                stack.push((k, depth + 1));
-            }
+
+        if expanded.contains(&root.pid) {
+            emit_expanded_tree_members(
+                out, root, children, &members, sort_col, ascending,
+            );
+        }
+    }
+}
+
+fn tree_group_members<'a>(
+    root: &'a ProcessEntry,
+    children: &HashMap<u32, Vec<&'a ProcessEntry>>,
+) -> Vec<&'a ProcessEntry> {
+    let mut members = Vec::new();
+    let mut seen = HashSet::new();
+    let mut stack = vec![root];
+    while let Some(process) = stack.pop() {
+        if !seen.insert(process.pid) {
+            continue;
+        }
+        members.push(process);
+        if let Some(kids) = children.get(&process.pid) {
+            stack.extend(kids.iter().copied());
+        }
+    }
+    members
+}
+
+fn emit_expanded_tree_members<'a>(
+    out: &mut Vec<DisplayRow>,
+    root: &'a ProcessEntry,
+    children: &HashMap<u32, Vec<&'a ProcessEntry>>,
+    members: &[&'a ProcessEntry],
+    sort_col: usize,
+    ascending: bool,
+) {
+    let own = members
+        .iter()
+        .map(|process| (process.pid, own_values(process)))
+        .collect::<HashMap<_, _>>();
+    let member_pids = members.iter().map(|process| process.pid).collect::<HashSet<_>>();
+    let mut seen = HashSet::new();
+    let mut stack = vec![(root, 1usize)];
+    while let Some((process, depth)) = stack.pop() {
+        if !seen.insert(process.pid) {
+            continue;
+        }
+        out.push(make_own_row(process, depth));
+        let mut kids = children
+            .get(&process.pid)
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|child| member_pids.contains(&child.pid))
+            .collect::<Vec<_>>();
+        sort_entries(&mut kids, sort_col, ascending, &own);
+        for child in kids.into_iter().rev() {
+            stack.push((child, depth + 1));
         }
     }
 }
@@ -2341,34 +2461,37 @@ mod tests {
 
         let expanded = HashSet::from([1u32]);
         let rows = build_display_rows(&snap, "", 0, true, &expanded, &[false; 3]);
-        let root = rows
+        let aggregate = rows
             .iter()
             .find_map(|row| match row {
-                DisplayRow::Process(row) if row.pid == 1 => Some(row),
+                DisplayRow::Process(row) if row.pid == 1 && row.aggregate => Some(row),
                 _ => None,
             })
-            .expect("expanded root");
+            .expect("expanded aggregate");
         assert_eq!(
-            root.termination_targets
+            aggregate
+                .termination_targets
                 .iter()
                 .map(|identity| identity.pid)
                 .collect::<Vec<_>>(),
-            [1]
+            [1, 2, 3]
         );
+        let root = rows
+            .iter()
+            .find_map(|row| match row {
+                DisplayRow::Process(row) if row.pid == 1 && !row.aggregate => Some(row),
+                _ => None,
+            })
+            .expect("expanded concrete root");
+        assert_eq!(root.termination_targets.iter().map(|identity| identity.pid).collect::<Vec<_>>(), [1]);
         let child = rows
             .iter()
             .find_map(|row| match row {
-                DisplayRow::Process(row) if row.pid == 2 => Some(row),
+                DisplayRow::Process(row) if row.pid == 2 && !row.aggregate => Some(row),
                 _ => None,
             })
-            .expect("collapsed child");
-        let mut child_targets = child
-            .termination_targets
-            .iter()
-            .map(|identity| identity.pid)
-            .collect::<Vec<_>>();
-        child_targets.sort_unstable();
-        assert_eq!(child_targets, [2, 3]);
+            .expect("expanded child");
+        assert_eq!(child.termination_targets.iter().map(|identity| identity.pid).collect::<Vec<_>>(), [2]);
     }
 
     #[test]
@@ -2523,7 +2646,7 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(depths, vec![0, 1, 2, 3]);
+        assert_eq!(depths, vec![0, 1, 2, 3, 4]);
     }
 
     #[test]
@@ -2564,39 +2687,49 @@ mod tests {
         }
         let snap = snap_of(snap_procs);
         let groups = [false; 3];
-        let mut expanded = HashSet::new();
-        expanded.insert(1u32);
-        let rows = build_display_rows(&snap, "", 0, true, &expanded, &groups);
-        let labels: Vec<&str> = rows
-            .iter()
-            .filter_map(|r| match r {
-                DisplayRow::Process(d) => Some(d.name.as_str()),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(labels[0], "Brave [4]");
         let collapsed = build_display_rows(&snap, "", 0, true, &HashSet::new(), &groups);
-        let collapsed_labels: Vec<&str> = collapsed
-            .iter()
-            .filter_map(|r| match r {
-                DisplayRow::Process(d) => Some(d.name.as_str()),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(collapsed_labels[0], "Brave [4]");
-        let mut e2 = HashSet::new();
-        e2.insert(1u32);
-        e2.insert(2u32);
-        let more = build_display_rows(&snap, "", 0, true, &e2, &groups);
-        let labels2: Vec<&str> = more
-            .iter()
-            .filter_map(|r| match r {
-                DisplayRow::Process(d) => Some(d.name.as_str()),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(labels2[0], "Brave [4]");
-        assert_eq!(labels2[1], "Child [3]");
+        let apps = rows_in_group(&collapsed, 0);
+        assert_eq!(apps.len(), 1);
+        assert_eq!(apps[0].name, "Brave [4]");
+        assert!(apps[0].aggregate);
+
+        let expanded = HashSet::from([1u32]);
+        let open = build_display_rows(&snap, "", 0, true, &expanded, &groups);
+        let apps = rows_in_group(&open, 0);
+        assert_eq!(apps.len(), 5, "virtual group plus all four real processes");
+        assert_eq!(apps[0].name, "Brave [4]");
+        assert!(apps[0].aggregate);
+        assert_eq!((apps[1].pid, apps[1].depth, apps[1].aggregate), (1, 1, false));
+        assert_eq!((apps[2].pid, apps[2].depth), (2, 2));
+        assert_eq!((apps[3].pid, apps[3].depth), (3, 3));
+        assert_eq!((apps[4].pid, apps[4].depth), (4, 4));
+    }
+
+    #[test]
+    fn app_group_aggregate_is_separate_from_the_real_root_values() {
+        let mut root = proc(1, None, "app.exe", ProcCategory::App);
+        root.has_window = true;
+        root.cpu_pct = 1.0;
+        root.mem_bytes = 100;
+        let mut child = proc(2, Some(1), "app.exe", ProcCategory::App);
+        child.cpu_pct = 2.0;
+        child.mem_bytes = 200;
+        let snap = snap_of(vec![root, child]);
+
+        let collapsed = build_display_rows(&snap, "", 0, true, &HashSet::new(), &[false; 3]);
+        let apps = rows_in_group(&collapsed, 0);
+        assert_eq!(apps.len(), 1);
+        assert!(apps[0].aggregate);
+        assert_eq!(apps[0].values[0], 3.0);
+        assert_eq!(apps[0].values[1], 300.0);
+
+        let open = build_display_rows(&snap, "", 0, true, &HashSet::from([1]), &[false; 3]);
+        let apps = rows_in_group(&open, 0);
+        assert_eq!(apps.len(), 3);
+        assert!(apps[0].aggregate);
+        assert_eq!(apps[0].values[0], 3.0);
+        assert_eq!((apps[1].pid, apps[1].values[0], apps[1].values[1]), (1, 1.0, 100.0));
+        assert_eq!((apps[2].pid, apps[2].values[0], apps[2].values[1]), (2, 2.0, 200.0));
     }
 
     #[test]
@@ -2902,9 +3035,11 @@ mod tests {
             &groups,
         );
         let bg_open = rows_in_group(&open, 1);
-        assert_eq!(bg_open.len(), 4, "group row plus members");
+        assert_eq!(bg_open.len(), 5, "virtual group row plus all four real members");
         assert_eq!(bg_open[0].name, "Dropbox.exe [4]");
-        assert!(bg_open[1..].iter().all(|r| r.depth == 1));
+        assert!(bg_open[0].aggregate);
+        assert_eq!(bg_open[1].pid, 1, "the concrete former head is the first child");
+        assert!(bg_open[1..].iter().all(|r| r.depth == 1 && !r.aggregate));
         assert!(bg_open[1..].iter().all(|r| !r.children));
     }
 
@@ -3025,8 +3160,8 @@ mod tests {
         let expanded = HashSet::from([2u32]);
         let rows = build_display_rows(&snap, "", 0, true, &expanded, &[false; 3]);
         let sys = rows_in_group(&rows, 2);
-        assert_eq!(sys.len(), 5, "expanded group exposes every host");
-        assert_eq!(sys.iter().filter(|row| row.depth == 1).count(), 3);
+        assert_eq!(sys.len(), 6, "services.exe + virtual group + every host");
+        assert_eq!(sys.iter().filter(|row| row.depth == 1).count(), 4);
     }
 
     #[test]
@@ -3395,7 +3530,7 @@ mod tests {
         let bg = rows_in_group(&rows, 1);
         assert!(bg.is_empty(), "same-image helpers must not be promoted");
         let apps = rows_in_group(&rows, 0);
-        assert_eq!(apps.len(), 2, "family row plus expandable child");
+        assert_eq!(apps.len(), 3, "virtual family row plus both real processes");
         assert_eq!(apps[0].values[0], 41.0, "family aggregate keeps child");
     }
 
@@ -3542,14 +3677,19 @@ mod tests {
                 _ => None,
             })
             .collect();
-        // fam.exe family aggregates to 30 % → first block; its expanded
-        // worker rides along; other.exe (10 %) follows. Headers are gone
-        // in this view.
-        assert_eq!(pids, vec![1, 2, 3]);
+        // fam.exe family aggregates to 30 % → first block. The virtual
+        // aggregate is followed by BOTH real family members; other.exe
+        // (10 %) follows. Headers are gone in this view.
+        assert_eq!(pids, vec![1, 1, 2, 3]);
         let DisplayRow::Process(head_row) = &rows[0] else {
             panic!("first row must be a process row");
         };
-        assert!(head_row.children, "family head stays expandable");
+        assert!(head_row.children && head_row.aggregate, "first row is the virtual family aggregate");
+        let DisplayRow::Process(real_root) = &rows[1] else {
+            panic!("second row must be the real root");
+        };
+        assert!(!real_root.aggregate);
+        assert_eq!(real_root.values[0], 0.0, "real root keeps only its own CPU");
     }
 
     #[test]

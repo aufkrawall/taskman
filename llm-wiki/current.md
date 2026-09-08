@@ -35,7 +35,10 @@ Ten reported gaps in one pass; `log/recent.md` carries the root causes.
 - **Per-GPU-engine graphs** with a "change graph to" context menu, so NVENC is
   answerable while the 3D engine is pinned (the adapter number is the busiest
   engine, not a sum).
-- **Application grouping on Processes** keeps foreground executables visible unless
+- **Application grouping on Processes** uses explicit virtual aggregate rows: a
+  collapsed group reports the summed CPU/memory/disk/network of all represented
+  processes, while expansion shows every real process — including the former
+  root/head — underneath with only its own values. It keeps foreground executables visible unless
   ownership is positively established (same image, or helper-like + matching
   publisher), treats common game/app launchers as launch surfaces rather than game
   owners, and collapses repeat runs of one image under one parent — including
