@@ -1,3 +1,4 @@
+- 2026-09-08: `python build.py` now always builds the Linux x86_64 release too: glibc via `cross`/`cargo-zigbuild` when present, otherwise a self-contained static musl PIE linked by the bundled `rust-lld` (rustup std only, no zig/Docker). Fixed `crates/tm-app/build.rs` using HOST `cfg`, which attached the Windows `.res` to Linux links. Linux artifact verified by `--selfcheck` under WSL.
 - 2026-09-08: Full-repository audit fixes: non-Windows backends compile again (`cargo check --target x86_64-unknown-linux-gnu` / `aarch64-apple-darwin`), and `build.py --check` now runs those cross-target checks (CI installs both targets). MSRV corrected to 1.88 (let-chains/`as_chunks`), release `--remap-path-prefix` also strips the checkout root, config/history reads are capped, and the ETW properties buffer is word-aligned.
 - 2026-09-08: Agent/template alignment: generalized the security-audit tool inventory (removed captureengine-era DX12/hook content), merged missing upstream agent rules into AGENTS.md/CLAUDE.md, filled the codestyle page, and completed the wiki catalog.
 - 2026-09-08: Run dialog focus state now has an explicit Command default, satisfying egui IdTypeMap temporary-state removal requirements while keeping initial keyboard focus semantics centralized.
@@ -5,6 +6,24 @@
 - 2026-09-08: Details gained optional Network / Network receive / Network send columns. PROCESS_NET demand now follows those visible columns and stays active while Process Properties is open, fixing blank live network statistics there without running the ETW session continuously on Details.
 - 2026-09-08: Process Properties now summarizes mitigations with System Informer-style qualifiers (permanent DEP, high-entropy ASLR, prohibited/disabled wording, CF Guard and stack protection), and module inventory uses the authenticated LocalSystem broker for identity-bound SYSTEM/service inspection with bounded responses.
 # Recent Activity
+
+## 2026-09-08 — Dual-target release build (Windows + Linux) out of the box
+
+1. **`build.py` no longer skips Linux.** Resolution order: `cross`, then
+   `cargo-zigbuild` (glibc, existing behavior), then a self-contained
+   `x86_64-unknown-linux-musl` build linked by the toolchain's `rust-lld`.
+   The fallback needs only the rustup std component (installed on demand) and
+   produces a static PIE; artifact name gains a `-musl` suffix.
+2. **Root cause of the never-working cross link found:**
+   `crates/tm-app/build.rs` gated the Windows `app.res` link argument on the
+   HOST (`cfg!(target_os = "windows")`), so a Windows host always attached it
+   to Linux links. Now keyed on `CARGO_CFG_TARGET_OS` (the real target).
+3. **`libloading` emits `-ldl` on musl**, where dlopen lives in libc;
+   build.py creates an empty `target/cross-stubs/libdl.a` to satisfy the
+   linker lookup without defining symbols.
+4. **Verified:** `python build.py` produces both archives; the Linux binary
+   reports `ok:true` from `--selfcheck` under WSL2 (72 processes, linux
+   backend) and exits cleanly when no display is present.
 
 ## 2026-09-08 — Full-repository audit: non-Windows build fix and gate hardening
 

@@ -21,6 +21,10 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent
 DIST = ROOT / "dist"
 LINUX_TARGET = "x86_64-unknown-linux-gnu"
+# Self-contained fallback: no cross compiler, Docker or zig, only the official
+# rustup std component plus the bundled rust-lld linker.
+LINUX_MUSL_TARGET = "x86_64-unknown-linux-musl"
+MUSL_STUB_DIR = ROOT / "target" / "cross-stubs"
 LINUX_DESKTOP = ROOT / "packaging" / "linux" / "io.github.aufkrawall.Taskman.desktop"
 
 
@@ -44,10 +48,10 @@ def cargo() -> str:
     fallback = Path.home() / ".cargo" / "bin" / exe
     if fallback.exists():
         return str(fallback)
-    raise SystemExit("cargo not found - install Rust 1.85+ or add ~/.cargo/bin to PATH")
+    raise SystemExit("cargo not found - install Rust 1.88+ or add ~/.cargo/bin to PATH")
 
 
-def release_rustflags(windows_target: bool) -> dict[str, str] | None:
+def release_flag_list(windows_target: bool) -> list[str]:
     """Hardening rustflags for release artifacts (security audit F-11-001).
 
     * ``--remap-path-prefix`` strips the build machine's home directory AND
@@ -81,6 +85,11 @@ def release_rustflags(windows_target: bool) -> dict[str, str] | None:
                 flags.append(f"--remap-path-prefix={forward_root}=taskman")
     if windows_target:
         flags.append("-Ccontrol-flow-guard=yes")
+    return flags
+
+
+def release_rustflags(windows_target: bool) -> dict[str, str] | None:
+    flags = release_flag_list(windows_target)
     return {"RUSTFLAGS": " ".join(flags)} if flags else None
 
 
@@ -193,6 +202,70 @@ def linux_cross_command(profile: str) -> tuple[list[str], str] | None:
     return None
 
 
+def ensure_musl_std() -> bool:
+    """Make sure the musl standard library is installed (rustup only)."""
+    if LINUX_MUSL_TARGET in installed_rust_targets():
+        return True
+    rustup = shutil.which("rustup")
+    if rustup is None:
+        return False
+    log(f"installing {LINUX_MUSL_TARGET} standard library via rustup (one-time)")
+    return run([rustup, "target", "add", LINUX_MUSL_TARGET])
+
+
+def prepare_musl_link_stub() -> Path:
+    """Create the empty ``libdl.a`` the self-contained musl link needs.
+
+    musl folds dlopen/dlclose into libc, but ``libloading`` (a wgpu/glow
+    dependency) still emits ``-ldl`` for every Linux target. The linker only
+    needs an archive of that name to exist; an empty ar archive satisfies the
+    lookup without defining or shadowing any symbol.
+    """
+    MUSL_STUB_DIR.mkdir(parents=True, exist_ok=True)
+    stub = MUSL_STUB_DIR / "libdl.a"
+    if not stub.exists():
+        stub.write_bytes(b"!<arch>\n")
+    return MUSL_STUB_DIR
+
+
+def build_linux_musl(profile: str) -> tuple[Path | None, bool]:
+    """Self-contained static musl build using the bundled rust-lld linker.
+
+    This needs no cross compiler, container or zig -- only the official rustup
+    std component -- so `python build.py` can always produce a Linux x86_64
+    artifact. The result is a static PIE that runs on any Linux x86_64.
+    """
+    if not ensure_musl_std():
+        log(
+            f"{LINUX_MUSL_TARGET} not installed and rustup unavailable - "
+            "skipping linux artifact"
+        )
+        return None, False
+    stub = prepare_musl_link_stub()
+    flags = release_flag_list(False) if profile != "dev" else []
+    flags += [
+        "-C link-self-contained=yes",
+        # Relative on purpose: the linker inherits cargo's cwd (the repo root),
+        # so a checkout path with spaces cannot break the flag.
+        f"-C link-arg=-L{stub.relative_to(ROOT).as_posix()}",
+    ]
+    env = {
+        f"CARGO_TARGET_{LINUX_MUSL_TARGET.upper().replace('-', '_')}_LINKER": "rust-lld",
+        f"CARGO_TARGET_{LINUX_MUSL_TARGET.upper().replace('-', '_')}_RUSTFLAGS": " ".join(flags),
+    }
+    if not run(
+        [cargo(), "build", "--profile", profile, "--target", LINUX_MUSL_TARGET],
+        env=env,
+    ):
+        return None, True
+    out_dir = ROOT / "target" / LINUX_MUSL_TARGET / profile
+    exe = out_dir / "taskman"
+    if not exe.exists():
+        log(f"linux musl binary missing after build: {exe}")
+        return None, True
+    return exe, True
+
+
 def build_host(profile: str) -> Path | None:
     exe_name = "taskman.exe" if platform.system() == "Windows" else "taskman"
     out_dir = ROOT / "target" / ("debug" if profile == "dev" else profile)
@@ -206,22 +279,26 @@ def build_host(profile: str) -> Path | None:
     return exe
 
 
-def build_linux(profile: str) -> tuple[Path | None, bool]:
+def build_linux(profile: str) -> tuple[Path | None, bool, str]:
+    """Build the Linux x86_64 artifact, preferring a glibc cross toolchain.
+
+    Returns ``(binary, attempted, flavor)`` where flavor is ``"gnu"`` or
+    ``"musl"``. ``attempted`` is False only when no path exists at all, so the
+    caller can distinguish "skipped for missing tooling" from "build failed".
+    """
     cmd = linux_cross_command(profile)
-    if cmd is None:
-        log(
-            "linux cross toolchain not found (install `cross` or "
-            "`cargo-zigbuild`) - skipping linux artifact"
-        )
-        return None, False
-    command, out_dir = cmd
-    if not run(command, env=release_rustflags(False) if profile != "dev" else None):
-        return None, True
-    exe = Path(out_dir) / "taskman"
-    if not exe.exists():
-        log(f"linux binary missing after build: {exe}")
-        return None, True
-    return exe, True
+    if cmd is not None:
+        command, out_dir = cmd
+        if not run(command, env=release_rustflags(False) if profile != "dev" else None):
+            return None, True, "gnu"
+        exe = Path(out_dir) / "taskman"
+        if not exe.exists():
+            log(f"linux binary missing after build: {exe}")
+            return None, True, "gnu"
+        return exe, True, "gnu"
+    # No glibc cross toolchain: the rust-lld/musl path works with rustup alone.
+    exe, attempted = build_linux_musl(profile)
+    return exe, attempted, "musl"
 
 
 def package_zip(name: str, files: list[tuple[Path, str]]) -> Path:
@@ -336,15 +413,16 @@ def main() -> int:
             artifacts.append((f"taskman-v{version}-{host_tag()}", host_files))
 
     if linux_requested:
-        exe, attempted = build_linux(profile)
+        exe, attempted, flavor = build_linux(profile)
         if exe is not None:
-            log(f"linux binary ready: {exe}")
+            log(f"linux binary ready ({flavor}): {exe}")
             files = [(exe, "taskman")]
             if LINUX_DESKTOP.exists():
                 files.append(
                     (LINUX_DESKTOP, "share/applications/io.github.aufkrawall.Taskman.desktop")
                 )
-            artifacts.append((f"taskman-v{version}-linux-x86_64", files))
+            suffix = "" if flavor == "gnu" else f"-{flavor}"
+            artifacts.append((f"taskman-v{version}-linux-x86_64{suffix}", files))
         elif attempted:
             failures += 1
         elif args.require_all_targets:

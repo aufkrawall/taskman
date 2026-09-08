@@ -15,8 +15,9 @@ jobs:
         with:
           components: rustfmt, clippy
           # Non-host backends the project documents as supported; build.py
-          # --check type-checks them when their std is installed.
-          targets: x86_64-unknown-linux-gnu, aarch64-apple-darwin
+          # --check type-checks them when their std is installed, and the
+          # release phase cross-builds the Linux musl artifact with rust-lld.
+          targets: x86_64-unknown-linux-gnu, aarch64-apple-darwin, x86_64-unknown-linux-musl
       - uses: Swatinem/rust-cache@v2
       - uses: actions/setup-python@v5
         with:

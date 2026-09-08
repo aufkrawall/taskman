@@ -59,7 +59,8 @@ python build.py --check
 # release build of the host binary
 python build.py --host-only
 
-# release packaging into dist/ (adds Linux x86_64 when cross/zigbuild exists)
+# release packaging into dist/ (always adds Linux x86_64; glibc when
+# cross/cargo-zigbuild is installed, otherwise a static musl build via rust-lld)
 python build.py
 ```
 

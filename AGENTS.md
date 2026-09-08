@@ -28,9 +28,11 @@
   `target/debug`; a warm incremental release rebuild is cheap by design
   (thin LTO, parallel codegen).
 - **Release/deployment:** `python build.py` produces host + Linux x86_64
-  release artifacts into `dist/` by default. See `llm-wiki/build.md`. Linux
-  cross-builds need `cross` or `cargo-zigbuild`; without one the step is
-  skipped with a note (use `--require-all-targets` to make that fatal).
+  release artifacts into `dist/` by default. See `llm-wiki/build.md`. The
+  Linux build always runs: `cross` or `cargo-zigbuild` is preferred for a
+  glibc binary, and without either the self-contained `rust-lld` musl path is
+  used (rustup std component only). `--host-only` skips Linux;
+  `--require-all-targets` makes a skipped Linux build fatal.
 - Compile-time policy: profiles are tuned for fast iteration and fast
   releases (thin LTO, parallel codegen units, line-tables-only debuginfo).
   Do NOT reintroduce fat LTO / `codegen-units = 1`; the measured benefit was
