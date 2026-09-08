@@ -63,6 +63,21 @@ contract.
   response; the instance is released when the client's end closes.
 - A protected manifest pins protocol/schema, authorized user SID, exact GUI and
   service paths, and SHA-256 hashes. The service validates it before listening.
+- The installing helper receives `--core-service-user=<sid>` on its elevated
+  command line, so a well-formed SID is not enough: `install` additionally
+  requires `LookupAccountSidW` to classify it as `SidTypeUser`. A group or
+  alias SID (`S-1-5-32-545`, `S-1-1-0`) would widen the pipe ACE to that whole
+  group. The GUI always passes its own token's SID, so the check costs nothing
+  legitimate and closes a crafted-elevated-invocation widening path.
+- File logging is best-effort and never gates the broker:
+  `prepare_service_log_dir` returns `None` when `%ProgramData%\TaskMan\logs`
+  cannot be proven safe (foreign entry, reparse point, hard link, or an ACL
+  that cannot be applied), and the service starts the broker without a file
+  appender. Failing the service instead would let an unelevated user who
+  pre-creates a file under `ProgramData` (writable to Users before the first
+  install) disable the privileged control plane until an administrator removes
+  it. The security property is preserved: no appender is opened at all while
+  the directory is unproven.
 - Two workers, a bounded queue of 16, and a matching 19-instance pipe cap keep
   request load finite. Queue/auth refusals return framed errors instead of
   looking like a missing service; repeated rejection logging is rate-limited.

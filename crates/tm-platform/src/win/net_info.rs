@@ -199,15 +199,14 @@ fn preferred_unicast_addresses(
 }
 
 /// One `GetAdaptersAddresses` call including unicast-address metadata.
-fn adapter_addresses() -> Option<Vec<u64>> {
+fn adapter_addresses() -> Option<super::aligned::AlignedBuf> {
     let flags = GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_SKIP_DNS_SERVER;
     let mut size: u32 = 15 * 1024;
     loop {
-        // The API writes pointer/u64-bearing C structs into this buffer. A
-        // u64 backing allocation provides the required alignment; `Vec<u8>`
-        // would happen to be aligned on today's allocator but cannot promise it.
-        let words = (size as usize).div_ceil(std::mem::size_of::<u64>());
-        let mut buf = vec![0u64; words];
+        // The API writes pointer/u64-bearing C structs into this buffer, so
+        // the allocation must carry the structures' alignment (see
+        // `aligned`): a plain `Vec<u8>` cannot promise it.
+        let mut buf = super::aligned::AlignedBuf::zeroed(size as usize);
         let ret = unsafe {
             GetAdaptersAddresses(
                 AF_UNSPEC.0 as u32,

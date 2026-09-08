@@ -85,6 +85,11 @@ def release_flag_list(windows_target: bool) -> list[str]:
                 flags.append(f"--remap-path-prefix={forward_root}=taskman")
     if windows_target:
         flags.append("-Ccontrol-flow-guard=yes")
+        # Mark the image CET/hardware-enforced-stack-protection compatible.
+        # The OS only enables shadow stacks when every loaded module is
+        # marked, so this is additive: a non-compatible driver simply keeps
+        # the process on the non-CET path. LocalSystem's broker benefits most.
+        flags.append("-Clink-arg=/CETCOMPAT")
     return flags
 
 
@@ -319,6 +324,32 @@ def package_tar(name: str, files: list[tuple[Path, str]]) -> Path:
     return dest
 
 
+def audit_scan() -> bool:
+    """Dependency-advisory and secrets scanning (opt-in `--audit`).
+
+    Advisory mode on purpose: a missing scanner is reported as a coverage gap
+    rather than silently passing, but only an actual finding fails the run.
+    Neither tool is needed for ordinary builds, so this is never part of
+    `--check` (which must stay offline-capable).
+    """
+    ok = True
+    missing: list[str] = []
+    if have("cargo-audit"):
+        ok &= run([cargo(), "audit"])
+    else:
+        missing.append("cargo-audit")
+    if have("gitleaks"):
+        ok &= run(["gitleaks", "detect", "--no-banner", "--redact"])
+    else:
+        missing.append("gitleaks")
+    if missing:
+        log(
+            f"audit: {' and '.join(missing)} not installed - "
+            "dependency/secrets coverage is incomplete"
+        )
+    return ok
+
+
 def check_fork() -> bool:
     """Lint and test the vendored egui fork at vendor/egui.
 
@@ -358,11 +389,20 @@ def main() -> int:
         action="store_true",
         help="run the full quality gate first (fmt, clippy -D warnings, tests)",
     )
+    ap.add_argument(
+        "--audit",
+        action="store_true",
+        help="run dependency-advisory and secrets scanners first (cargo-audit, gitleaks)",
+    )
     args = ap.parse_args()
 
     profile = "dev" if args.debug else "release"
     version = read_version()
     log(f"taskman v{version} - profile={profile}")
+
+    if args.audit and not audit_scan():
+        log("audit failed")
+        return 1
 
     if args.check:
         ok = run([cargo(), "fmt", "--all", "--", "--check"])

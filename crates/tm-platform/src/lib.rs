@@ -1,5 +1,10 @@
 //! tm-platform — OS-specific collectors and actions behind clean traits.
 
+// Windows FFI needs `unsafe`, so it cannot be denied crate-wide; keep every
+// unsafe operation inside an explicit block instead (the edition-2024 default,
+// restated here so it cannot be lost to a future edition/toolchain change).
+#![deny(unsafe_op_in_unsafe_fn)]
+
 pub mod actions;
 
 #[cfg(target_os = "windows")]

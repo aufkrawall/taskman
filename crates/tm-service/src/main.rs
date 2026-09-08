@@ -84,17 +84,21 @@ mod service {
             process_id: None,
         })?;
 
-        let protected_log_directory = tm_platform::win::core_service::prepare_service_log_dir();
-        let _log_guard = protected_log_directory
-            .as_ref()
+        // File logging is a best-effort diagnostic. `prepare_service_log_dir`
+        // returns `None` (never an error) when the directory cannot be proven
+        // safe, because an unprivileged user can plant an entry under
+        // `%ProgramData%\TaskMan\logs` before the first install. That must
+        // disable the file appender only, never the privileged broker.
+        let protected_log_directory = tm_platform::win::core_service::prepare_service_log_dir()
             .ok()
-            .and_then(|log_directory| {
-                tm_core::logging::init_in_dir(
-                    tm_core::logging::LogConfig::default(),
-                    log_directory,
-                    tm_platform::win::core_service::SERVICE_LOG_FILE_PREFIX,
-                )
-            });
+            .flatten();
+        let _log_guard = protected_log_directory.as_ref().and_then(|log_directory| {
+            tm_core::logging::init_in_dir(
+                tm_core::logging::LogConfig::default(),
+                log_directory,
+                tm_platform::win::core_service::SERVICE_LOG_FILE_PREFIX,
+            )
+        });
         // A worker-thread panic must not leave SCM reporting a live broker
         // with half its bounded capacity gone. Crash the service process so
         // the configured 5/15/60-second recovery policy starts a clean image.
@@ -103,26 +107,20 @@ mod service {
             std::process::abort();
         }));
 
-        let result = protected_log_directory.and_then(|_| {
-            tm_platform::win::core_service::run_broker(stop_rx, || {
-                status_handle
-                    .set_service_status(ServiceStatus {
-                        service_type: ServiceType::OWN_PROCESS,
-                        current_state: ServiceState::Running,
-                        controls_accepted: ServiceControlAccept::STOP
-                            | ServiceControlAccept::SHUTDOWN,
-                        exit_code: ServiceExitCode::Win32(0),
-                        checkpoint: 0,
-                        wait_hint: Duration::ZERO,
-                        process_id: None,
-                    })
-                    .map_err(|error| {
-                        tm_core::TmError::platform(
-                            "report core service readiness",
-                            error.to_string(),
-                        )
-                    })
-            })
+        let result = tm_platform::win::core_service::run_broker(stop_rx, || {
+            status_handle
+                .set_service_status(ServiceStatus {
+                    service_type: ServiceType::OWN_PROCESS,
+                    current_state: ServiceState::Running,
+                    controls_accepted: ServiceControlAccept::STOP | ServiceControlAccept::SHUTDOWN,
+                    exit_code: ServiceExitCode::Win32(0),
+                    checkpoint: 0,
+                    wait_hint: Duration::ZERO,
+                    process_id: None,
+                })
+                .map_err(|error| {
+                    tm_core::TmError::platform("report core service readiness", error.to_string())
+                })
         });
         let exit_code = if result.is_ok() {
             ServiceExitCode::Win32(0)

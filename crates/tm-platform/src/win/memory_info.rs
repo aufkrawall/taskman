@@ -317,4 +317,33 @@ mod tests {
         assert_eq!(out.manufacturer, "ACME");
         assert_eq!(out.part_number, "MX-1");
     }
+
+    /// The table is firmware-supplied and therefore untrusted: arbitrary and
+    /// deliberately malformed byte streams must degrade to fewer facts, never
+    /// panic (release builds abort on panic). Deterministic LCG, so a failure
+    /// is reproducible.
+    #[test]
+    fn arbitrary_smbios_tables_never_panic() {
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = move || {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (state >> 33) as u8
+        };
+        for len in 0..768 {
+            let table: Vec<u8> = (0..len).map(|_| next()).collect();
+            let _ = ram_static_from_table(&table);
+        }
+        // A well-formed record stream with one mutated byte per iteration.
+        let mut base = vec![0u8; 0x22];
+        base[0] = 17;
+        base[1] = 0x22;
+        base.extend_from_slice(b"M\0\0");
+        for byte in 0..base.len() {
+            let mut table = base.clone();
+            table[byte] = table[byte].wrapping_add(1);
+            let _ = ram_static_from_table(&table);
+        }
+    }
 }

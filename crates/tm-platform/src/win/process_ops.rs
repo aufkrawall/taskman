@@ -839,13 +839,13 @@ pub fn service_catalog() -> ServiceCatalog {
             PCWSTR::null(),
         );
         if needed > 0 {
-            let mut buf = vec![0u8; needed as usize];
+            let mut buf = super::aligned::AlignedBuf::zeroed(needed as usize);
             let res = scm::EnumServicesStatusExW(
                 mgr,
                 scm::SC_ENUM_PROCESS_INFO,
                 scm::SERVICE_WIN32,
                 scm::SERVICE_ACTIVE,
-                Some(&mut buf),
+                Some(buf.as_mut_slice()),
                 &mut needed,
                 &mut returned,
                 None,
@@ -853,7 +853,7 @@ pub fn service_catalog() -> ServiceCatalog {
             );
             if res.is_ok() && returned > 0 {
                 let items = std::slice::from_raw_parts(
-                    buf.as_ptr() as *const scm::ENUM_SERVICE_STATUS_PROCESSW,
+                    buf.as_slice().as_ptr() as *const scm::ENUM_SERVICE_STATUS_PROCESSW,
                     returned as usize,
                 );
                 for it in items {
@@ -866,7 +866,8 @@ pub fn service_catalog() -> ServiceCatalog {
                         let mut cfg_needed = 0u32;
                         let _ = scm::QueryServiceConfigW(svc, None, 0, &mut cfg_needed);
                         if cfg_needed > 0 {
-                            let mut cfg_buf = vec![0u8; cfg_needed as usize];
+                            let mut cfg_buf =
+                                super::aligned::AlignedBuf::zeroed(cfg_needed as usize);
                             if scm::QueryServiceConfigW(
                                 svc,
                                 Some(cfg_buf.as_mut_ptr() as *mut _),
@@ -875,7 +876,8 @@ pub fn service_catalog() -> ServiceCatalog {
                             )
                             .is_ok()
                             {
-                                let cfg = &*(cfg_buf.as_ptr() as *const scm::QUERY_SERVICE_CONFIGW);
+                                let cfg = &*(cfg_buf.as_slice().as_ptr()
+                                    as *const scm::QUERY_SERVICE_CONFIGW);
                                 let clean = if !cfg.lpBinaryPathName.is_null()
                                     && !cfg.lpBinaryPathName.0.is_null()
                                 {

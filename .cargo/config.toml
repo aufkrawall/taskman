@@ -1,8 +1,10 @@
 # Binary-hardening defaults for Windows targets (security audit F-11-001).
 #
 # Note: setting the RUSTFLAGS environment variable overrides these flags
-# entirely. The release build driver (build.py) restates this flag together
-# with --remap-path-prefix (machine-specific, therefore not committable here)
-# when building release artifacts.
+# entirely. The release build driver (build.py) restates them together with
+# --remap-path-prefix (machine-specific, therefore not committable here) when
+# building release artifacts. `/CETCOMPAT` marks the image compatible with
+# hardware-enforced stack protection; the OS only enables shadow stacks when
+# every loaded module is marked, so the bit is additive and safe.
 [target.'cfg(windows)']
-rustflags = ["-C", "control-flow-guard=yes"]
+rustflags = ["-C", "control-flow-guard=yes", "-C", "link-arg=/CETCOMPAT"]

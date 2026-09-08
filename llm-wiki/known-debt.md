@@ -132,6 +132,18 @@ dropped) is what the user sees; permanently pinned or re-loaded modules stay.
 
 ## Core-service production hardening still outstanding
 
+**Accepted security residual risk (documented in
+`hardening/core-service/hardening.json`, do not re-raise as new):** any code
+running as the authorized user can inject into the installed GUI process (or
+run it under a debugger) and thereby issue broker requests with that GUI's
+identity. The broker's client check is image-path based; the pipe DACL is the
+authorization boundary and it authorizes the user, not the binary. Mitigating
+this needs Authenticode signing plus a code-integrity/process-trust policy
+(and possibly a signed service-side allowlist), not another path check. The
+2026-09-08 security pass additionally requires the authorized SID to be a
+user account (`SidTypeUser`) and decouples file logging from broker startup;
+see `core-service.md`.
+
 The service boundary, ACL installer, bounded protocol, identity checks, and
 recovery policy are implemented. These release-engineering/operational items
 remain follow-up rather than being simulated in headless tests:

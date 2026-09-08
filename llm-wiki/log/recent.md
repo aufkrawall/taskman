@@ -1,3 +1,4 @@
+- 2026-09-08: Security audit pass: the broker's installing SID must resolve to a user account (group/alias SIDs rejected), file-log verification no longer gates broker startup (a planted `ProgramData\TaskMan\logs` entry could disable the privileged control plane), Win32 scratch buffers are pointer-aligned (`aligned.rs`), Windows release binaries are CET-compatible, `build.py --audit` runs cargo-audit/gitleaks, and `tm-core` denies `unsafe_code` while `tm-platform`/`tm-app` deny `unsafe_op_in_unsafe_fn`.
 - 2026-09-08: `python build.py` now always builds the Linux x86_64 release too: glibc via `cross`/`cargo-zigbuild` when present, otherwise a self-contained static musl PIE linked by the bundled `rust-lld` (rustup std only, no zig/Docker). Fixed `crates/tm-app/build.rs` using HOST `cfg`, which attached the Windows `.res` to Linux links. Linux artifact verified by `--selfcheck` under WSL.
 - 2026-09-08: Full-repository audit fixes: non-Windows backends compile again (`cargo check --target x86_64-unknown-linux-gnu` / `aarch64-apple-darwin`), and `build.py --check` now runs those cross-target checks (CI installs both targets). MSRV corrected to 1.88 (let-chains/`as_chunks`), release `--remap-path-prefix` also strips the checkout root, config/history reads are capped, and the ETW properties buffer is word-aligned.
 - 2026-09-08: Agent/template alignment: generalized the security-audit tool inventory (removed captureengine-era DX12/hook content), merged missing upstream agent rules into AGENTS.md/CLAUDE.md, filled the codestyle page, and completed the wiki catalog.
@@ -6,6 +7,42 @@
 - 2026-09-08: Details gained optional Network / Network receive / Network send columns. PROCESS_NET demand now follows those visible columns and stays active while Process Properties is open, fixing blank live network statistics there without running the ETW session continuously on Details.
 - 2026-09-08: Process Properties now summarizes mitigations with System Informer-style qualifiers (permanent DEP, high-entropy ASLR, prohibited/disabled wording, CF Guard and stack protection), and module inventory uses the authenticated LocalSystem broker for identity-bound SYSTEM/service inspection with bounded responses.
 # Recent Activity
+
+## 2026-09-08 — Security audit pass (broker, FFI alignment, hardening gate)
+
+Full-repository security review. Fixed and verified in this pass:
+
+1. **Broker SID authorization (medium).** `--core-service-user=<sid>` accepted
+   any well-formed SID, so a crafted elevated helper invocation could name a
+   group/alias (`S-1-5-32-545`, `S-1-1-0`) and widen the pipe ACE. `install`
+   now requires `LookupAccountSidW` to classify the SID as `SidTypeUser`; the
+   GUI's own token SID is unaffected. Test: `only_user_account_sids_may_be_authorized`.
+2. **Service log-directory DoS (medium).** `prepare_service_log_dir` returned
+   `Err` for any unexpected entry under `%ProgramData%\TaskMan\logs`, and the
+   service refused to run the broker on that error. A standard user can plant
+   such an entry before the first install (ProgramData is Users-writable), so
+   the LocalSystem control plane could be disabled until an admin cleaned it.
+   Verification is now a `None` result that disables file logging only; the
+   broker always starts. Tests: `foreign_log_entries_disable_file_logging_without_failing`.
+3. **Misaligned Win32 scratch buffers (low, UB).** `Vec<u8>` (align 1) was
+   cast to `ENUM_SERVICE_STATUS_PROCESSW`, `QUERY_SERVICE_CONFIGW`,
+   `SERVICE_DESCRIPTIONW`, `SERVICE_STATUS_PROCESS`,
+   `PDH_FMT_COUNTERVALUE_ITEM_W` and `SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX`.
+   New `win/aligned.rs` backs every such buffer; `net_info` already did this
+   with `Vec<u64>` and now uses the shared type.
+4. **Binary hardening.** Windows release builds are now CET-compatible
+   (`/CETCOMPAT`) in addition to CFG/GS/ASLR/NX; verified with `dumpbin`.
+   Linux musl artifact remains static PIE + full RELRO/BIND_NOW + NX stack.
+5. **Gate/tooling.** `python build.py --audit` runs `cargo audit` and
+   `gitleaks detect` (findings fail; missing scanners warn). `tm-core` now
+   denies `unsafe_code`; `tm-platform`/`tm-app` deny `unsafe_op_in_unsafe_fn`.
+   Added deterministic no-panic tests for the broker frame/JSON parser, the
+   SMBIOS walker and the PDH instance parser.
+
+Not changed (documented residual/coverage items): same-user GUI injection can
+borrow broker authority (needs signing + CIG), synchronous broker I/O can be
+stalled by an already-authenticated client, no fuzzing harness, and the
+Windows ARM64 / macOS / Linux ARM64 targets are not built on this host.
 
 ## 2026-09-08 — Dual-target release build (Windows + Linux) out of the box
 

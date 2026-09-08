@@ -29,7 +29,7 @@ Primary sources:
    Linux → `.tar.gz`, named `taskman-v<version>-<platform>`.
 
 Flags: `--host-only`, `--linux-only`, `--debug`, `--no-package`,
-`--require-all-targets`, `--check`.
+`--require-all-targets`, `--check`, `--audit`.
 
 ## Pushing: no git-LFS pointers may enter this repository
 
@@ -78,6 +78,38 @@ git config --local lfs.allowincompletepush true
 
 Nested inside a release artifact build when run as
 `python build.py --host-only --check`.
+
+### Dependency and secrets scanning (`--audit`)
+
+`python build.py --audit` runs the local scanners before any build:
+`cargo audit` (RustSec advisories over `Cargo.lock`) and `gitleaks detect`
+(working tree + Git history, redacted). A finding fails the command; a missing
+scanner is printed as an incomplete-coverage warning rather than silently
+passing. It is deliberately **not** part of `--check`: that gate must stay
+offline-capable and tool-independent. Run `--audit` before a release, and see
+`debug-tools-security-audit.md` for the tool inventory and fallbacks.
+
+## Binary hardening flags
+
+Windows release builds (both `cargo build --release` through
+`.cargo/config.toml` and `build.py`, which restates the flags because a set
+`RUSTFLAGS` overrides the config) carry:
+
+- `-C control-flow-guard=yes` — CFG instrumentation + guard function table.
+- `-C link-arg=/CETCOMPAT` — image is marked CET/hardware-enforced stack
+  protection compatible. The OS only enables shadow stacks when every loaded
+  module is marked, so the bit is additive; a non-compatible driver keeps the
+  process on the non-CET path.
+- `--remap-path-prefix` (build.py only, machine-specific) — strips the build
+  user's home and checkout root from panic locations.
+
+`strip = "symbols"` keeps shipped binaries free of usable symbols; never ship
+an unstripped release. Verify with `dumpbin -headers` / `-loadconfig` (Windows)
+and `llvm-readobj --program-headers --dynamic-table` (Linux). The Linux musl
+artifact is a static PIE with full RELRO/BIND_NOW and a non-executable stack;
+it carries no CET GNU property because musl's own objects are not built with
+IBT/SHSTK, and marking the image without instrumenting the code would be
+wrong.
 
 ## CI
 

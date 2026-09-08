@@ -4,6 +4,10 @@
 //! process classification, formatting helpers, settings persistence and
 //! the app-history database. All OS specifics live in `tm-platform`.
 
+// The platform-agnostic core must stay free of `unsafe`; OS interaction is
+// tm-platform's job. This is an invariant, not a style preference.
+#![deny(unsafe_code)]
+
 pub mod app_history;
 pub mod classify;
 pub mod demand;

@@ -20,12 +20,14 @@ use windows::Win32::Foundation::{
     LocalFree, WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
 use windows::Win32::Security::Authorization::{
-    ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+    ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
+    ConvertStringSidToSidW, SDDL_REVISION_1,
 };
 use windows::Win32::Security::{
-    DACL_SECURITY_INFORMATION, GROUP_SECURITY_INFORMATION, GetTokenInformation,
+    DACL_SECURITY_INFORMATION, GROUP_SECURITY_INFORMATION, GetTokenInformation, LookupAccountSidW,
     OWNER_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR,
-    SECURITY_ATTRIBUTES, SetFileSecurityW, TOKEN_QUERY, TOKEN_USER, TokenUser,
+    SECURITY_ATTRIBUTES, SID_NAME_USE, SetFileSecurityW, SidTypeUser, TOKEN_QUERY, TOKEN_USER,
+    TokenUser,
 };
 use windows::Win32::Storage::FileSystem::{
     BY_HANDLE_FILE_INFORMATION, CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_REPARSE_POINT,
@@ -438,6 +440,56 @@ fn valid_sid_text(value: &str) -> bool {
     parts.next() == Some("1")
         && parts.clone().count() >= 1
         && parts.all(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()))
+}
+
+/// Whether `sid_text` names a real user account rather than a group, alias or
+/// well-known SID.
+///
+/// [`valid_sid_text`] only proves the *shape* of a SID. The pipe ACE is the
+/// authorization boundary, so accepting any well-formed SID would let a
+/// crafted elevated helper invocation (`taskman.exe --core-service=install
+/// --core-service-user=S-1-5-32-545`) authorize every member of that group.
+/// The GUI always passes its own token's SID, so requiring a user account
+/// costs nothing legitimate and closes that widening path. Resolution is
+/// local: the account is logged on and its SID is already known to LSA.
+fn sid_is_user_account(sid_text: &str) -> bool {
+    let encoded = wide(sid_text);
+    let mut sid = windows::Win32::Security::PSID::default();
+    if unsafe { ConvertStringSidToSidW(PCWSTR(encoded.as_ptr()), &mut sid) }.is_err() {
+        return false;
+    }
+    let mut name_len: u32 = 0;
+    let mut domain_len: u32 = 0;
+    let mut kind = SID_NAME_USE(0);
+    // First call only sizes both output buffers; it always fails.
+    let _ = unsafe {
+        LookupAccountSidW(
+            PCWSTR::null(),
+            sid,
+            None,
+            &mut name_len,
+            None,
+            &mut domain_len,
+            &mut kind,
+        )
+    };
+    let mut name = vec![0u16; name_len.max(1) as usize];
+    let mut domain = vec![0u16; domain_len.max(1) as usize];
+    let resolved = unsafe {
+        LookupAccountSidW(
+            PCWSTR::null(),
+            sid,
+            Some(PWSTR(name.as_mut_ptr())),
+            &mut name_len,
+            Some(PWSTR(domain.as_mut_ptr())),
+            &mut domain_len,
+            &mut kind,
+        )
+    };
+    unsafe {
+        let _ = LocalFree(Some(HLOCAL(sid.0)));
+    }
+    resolved.is_ok() && kind == SidTypeUser
 }
 
 fn validate_manifest(manifest: &BrokerManifest) -> Result<()> {
@@ -2174,15 +2226,45 @@ pub fn service_data_dir() -> Result<PathBuf> {
 }
 
 /// Prepare the only directory the LocalSystem service is allowed to write.
-/// Existing entries are accepted only as ordinary files and have their ACLs
-/// re-applied; a reparse point or nested directory disables file logging
-/// instead of turning the logger into an arbitrary privileged writer.
-pub fn prepare_service_log_dir() -> Result<PathBuf> {
+///
+/// Returns `Ok(None)` when file logging must stay off because the directory
+/// cannot be proven safe: an unexpected entry, a reparse point, an external
+/// hard link, or an ACL that cannot be applied. The broker MUST keep running
+/// in that case. Log-file availability is not a security precondition, and
+/// failing the service would let an unelevated user who pre-creates a file
+/// under `%ProgramData%\TaskMan\logs` (writable to Users before the first
+/// install) disable the privileged control plane until an administrator
+/// removes it.
+///
+/// The security property is preserved: when anything about the directory is
+/// unproven, no file appender is opened at all, so a planted path can never
+/// become a privileged write primitive.
+pub fn prepare_service_log_dir() -> Result<Option<PathBuf>> {
     let data = service_data_dir()?;
-    ensure_secure_directory(&data, SERVICE_DATA_SDDL)?;
+    if let Err(error) = ensure_secure_directory(&data, SERVICE_DATA_SDDL) {
+        tracing::warn!(%error, "service data directory cannot be secured; file logging disabled");
+        return Ok(None);
+    }
     let logs = data.join("logs");
-    ensure_secure_directory(&logs, SERVICE_DATA_SDDL)?;
-    for entry in std::fs::read_dir(&logs)? {
+    if let Err(error) = ensure_secure_directory(&logs, SERVICE_DATA_SDDL) {
+        tracing::warn!(%error, "service log directory cannot be secured; file logging disabled");
+        return Ok(None);
+    }
+    if let Err(error) = verify_owned_log_entries(&logs) {
+        tracing::warn!(%error, "service log directory contains unowned entries; file logging disabled");
+        return Ok(None);
+    }
+    Ok(Some(logs))
+}
+
+/// Every existing entry must be an owned, single-link, regular log file whose
+/// DACL can be repaired. Anything else (a planted file, a directory, a
+/// reparse point, or a hard link) disables file logging: the rolling appender
+/// must never be pointed at a directory whose contents an unprivileged user
+/// can influence, because it would then follow that entry when creating a
+/// log file of the same name.
+fn verify_owned_log_entries(logs: &Path) -> Result<()> {
+    for entry in std::fs::read_dir(logs)? {
         let entry = entry?;
         let path = entry.path();
         if !owned_service_log_name(&entry.file_name()) {
@@ -2198,7 +2280,7 @@ pub fn prepare_service_log_dir() -> Result<PathBuf> {
         ensure_single_link(&file, &path, "core service log directory")?;
         set_path_security(&path, SERVICE_DATA_SDDL)?;
     }
-    Ok(logs)
+    Ok(())
 }
 
 fn owned_service_log_name(name: &std::ffi::OsStr) -> bool {
@@ -2623,6 +2705,12 @@ fn install(authorized_user_sid: &str) -> Result<()> {
             "the originating GUI user SID is malformed",
         ));
     }
+    if !sid_is_user_account(authorized_user_sid) {
+        return Err(TmError::platform(
+            "install core service",
+            "the authorized account must be a user account, not a group or alias SID",
+        ));
+    }
     let source_gui = std::env::current_exe()?;
     let migrate_task_manager_replacement = matches!(
         super::task_manager_replacement_state_for(&source_gui),
@@ -3028,6 +3116,76 @@ mod tests {
             "desktop.ini",
         ] {
             assert!(!owned_service_log_name(std::ffi::OsStr::new(name)));
+        }
+    }
+
+    /// The authorized pipe principal must be a real user account. A group or
+    /// alias SID (`Users`, `Everyone`) would widen the ACE far beyond the one
+    /// interactive user the boundary authorizes, and the SID arrives from a
+    /// command-line argument of an elevated helper.
+    #[test]
+    fn only_user_account_sids_may_be_authorized() {
+        // Well-known group/alias SIDs must be rejected.
+        assert!(!sid_is_user_account("S-1-5-32-545"), "Users");
+        assert!(!sid_is_user_account("S-1-5-32-544"), "Administrators");
+        assert!(!sid_is_user_account("S-1-1-0"), "Everyone");
+        assert!(!sid_is_user_account("S-1-5-11"), "Authenticated Users");
+        assert!(!sid_is_user_account("not-a-sid"));
+        // The installing user's own SID always resolves as a user account.
+        let own = current_user_sid().expect("current user SID");
+        assert!(sid_is_user_account(&own), "own SID {own} must be accepted");
+    }
+
+    /// A planted entry under `%ProgramData%\TaskMan\logs` must disable file
+    /// logging, never make the caller fail (the caller is the broker).
+    #[test]
+    fn foreign_log_entries_disable_file_logging_without_failing() {
+        let dir = std::env::temp_dir().join(format!("tm-log-verify-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Empty directory: usable.
+        assert!(verify_owned_log_entries(&dir).is_ok());
+
+        // Foreign file name: rejected before any ACL work.
+        std::fs::write(dir.join("evil.txt"), b"x").unwrap();
+        assert!(verify_owned_log_entries(&dir).is_err());
+        std::fs::remove_file(dir.join("evil.txt")).unwrap();
+
+        // A directory masquerading as a log file is not a regular file.
+        std::fs::create_dir(dir.join("taskman-service.log.2026-01-01")).unwrap();
+        assert!(verify_owned_log_entries(&dir).is_err());
+        std::fs::remove_dir(dir.join("taskman-service.log.2026-01-01")).unwrap();
+
+        // An external hard link to an owned-looking name is rejected too.
+        let target = dir.join("target.bin");
+        let link = dir.join("taskman-service.log.2026-01-02");
+        std::fs::write(&target, b"x").unwrap();
+        std::fs::hard_link(&target, &link).unwrap();
+        assert!(verify_owned_log_entries(&dir).is_err());
+        std::fs::remove_file(&link).unwrap();
+        std::fs::remove_file(&target).unwrap();
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The broker parser is a trust boundary: arbitrary bytes must never
+    /// panic, whatever the header claims.
+    #[test]
+    fn arbitrary_frames_and_requests_never_panic() {
+        let mut state = 0x2545_F491_4F6C_DD1Du64;
+        let mut next = move || {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (state >> 33) as u8
+        };
+        for len in 0..96 {
+            let bytes: Vec<u8> = (0..len).map(|_| next()).collect();
+            let _ = read_frame(&mut bytes.as_slice(), FRAME_REQUEST, MAX_REQUEST_BYTES);
+            let _ = read_frame(&mut bytes.as_slice(), FRAME_RESPONSE, MAX_RESPONSE_BYTES);
+            let _ = serde_json::from_slice::<BrokerRequest>(&bytes);
+            let _ = serde_json::from_slice::<BrokerResponse>(&bytes);
         }
     }
 

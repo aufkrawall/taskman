@@ -29,13 +29,13 @@ pub fn list_services() -> Result<Vec<ServiceInfo>> {
             return Ok(Vec::new());
         }
 
-        let mut buf = vec![0u8; needed as usize];
+        let mut buf = super::aligned::AlignedBuf::zeroed(needed as usize);
         let result = scm::EnumServicesStatusExW(
             mgr,
             scm::SC_ENUM_PROCESS_INFO,
             scm::SERVICE_WIN32,
             scm::SERVICE_STATE_ALL,
-            Some(&mut buf),
+            Some(buf.as_mut_slice()),
             &mut needed,
             &mut returned,
             None,
@@ -45,7 +45,7 @@ pub fn list_services() -> Result<Vec<ServiceInfo>> {
         let mut out = Vec::new();
         if result.is_ok() && returned > 0 {
             let items = std::slice::from_raw_parts(
-                buf.as_ptr() as *const scm::ENUM_SERVICE_STATUS_PROCESSW,
+                buf.as_slice().as_ptr() as *const scm::ENUM_SERVICE_STATUS_PROCESSW,
                 returned as usize,
             );
             for it in items {
@@ -103,7 +103,7 @@ fn enrich(services: &[ServiceInfo]) -> Result<Vec<ServiceInfo>> {
                 let mut needed: u32 = 0;
                 let _ = scm::QueryServiceConfigW(h, None, 0, &mut needed);
                 if needed > 0 {
-                    let mut buf = vec![0u8; needed as usize];
+                    let mut buf = super::aligned::AlignedBuf::zeroed(needed as usize);
                     if scm::QueryServiceConfigW(
                         h,
                         Some(buf.as_mut_ptr() as *mut scm::QUERY_SERVICE_CONFIGW),
@@ -112,7 +112,7 @@ fn enrich(services: &[ServiceInfo]) -> Result<Vec<ServiceInfo>> {
                     )
                     .is_ok()
                     {
-                        let cfg = &*(buf.as_ptr() as *const scm::QUERY_SERVICE_CONFIGW);
+                        let cfg = &*(buf.as_slice().as_ptr() as *const scm::QUERY_SERVICE_CONFIGW);
                         info.startup_type = start_type_label(cfg.dwStartType.0).into();
                         info.group = pwstr_copy(cfg.lpLoadOrderGroup);
                         info.account = pwstr_copy(cfg.lpServiceStartName);
@@ -127,16 +127,16 @@ fn enrich(services: &[ServiceInfo]) -> Result<Vec<ServiceInfo>> {
                     &mut needed,
                 );
                 if needed > 0 {
-                    let mut buf = vec![0u8; needed as usize];
+                    let mut buf = super::aligned::AlignedBuf::zeroed(needed as usize);
                     if scm::QueryServiceConfig2W(
                         h,
                         scm::SERVICE_CONFIG_DESCRIPTION,
-                        Some(&mut buf),
+                        Some(buf.as_mut_slice()),
                         &mut needed,
                     )
                     .is_ok()
                     {
-                        let desc = &*(buf.as_ptr() as *const scm::SERVICE_DESCRIPTIONW);
+                        let desc = &*(buf.as_slice().as_ptr() as *const scm::SERVICE_DESCRIPTIONW);
                         info.description = pwstr_copy(desc.lpDescription);
                     }
                 }
@@ -258,17 +258,19 @@ unsafe fn wait_state(svc: scm::SC_HANDLE, wanted: &[u32], timeout_s: u64) -> Res
     unsafe {
         let deadline = Instant::now() + Duration::from_secs(timeout_s);
         loop {
-            let mut buf = [0u8; std::mem::size_of::<scm::SERVICE_STATUS_PROCESS>()];
+            let mut buf = super::aligned::AlignedBuf::zeroed(std::mem::size_of::<
+                scm::SERVICE_STATUS_PROCESS,
+            >());
             let mut needed: u32 = 0;
             if scm::QueryServiceStatusEx(
                 svc,
                 scm::SC_STATUS_PROCESS_INFO,
-                Some(&mut buf),
+                Some(buf.as_mut_slice()),
                 &mut needed,
             )
             .is_ok()
             {
-                let status = &*(buf.as_ptr() as *const scm::SERVICE_STATUS_PROCESS);
+                let status = &*(buf.as_slice().as_ptr() as *const scm::SERVICE_STATUS_PROCESS);
                 if wanted.contains(&(status.dwCurrentState.0)) {
                     return Ok(());
                 }

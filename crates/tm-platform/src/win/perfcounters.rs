@@ -152,7 +152,7 @@ struct QueryGroup {
     counters: Vec<Counter>,
     collections_done: u32,
     warm: bool,
-    scratch: Vec<u8>,
+    scratch: super::aligned::AlignedBuf,
     last_needed: Instant,
 }
 
@@ -163,7 +163,7 @@ impl QueryGroup {
             counters: Vec::new(),
             collections_done: 0,
             warm: false,
-            scratch: Vec::new(),
+            scratch: super::aligned::AlignedBuf::zeroed(0),
             last_needed: Instant::now(),
         }
     }
@@ -262,8 +262,7 @@ impl QueryGroup {
             if size == 0 {
                 return out;
             }
-            self.scratch.clear();
-            self.scratch.resize(size as usize, 0);
+            self.scratch.resize(size as usize);
             let buf = &mut self.scratch;
             let mut count2: u32 = 0;
             let status = PdhGetFormattedCounterArrayW(
@@ -772,5 +771,32 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(20));
         };
         assert!(pct > 0.0 && pct < 10_000.0, "implausible {pct}%");
+    }
+
+    /// PDH instance strings are produced by arbitrary drivers and can contain
+    /// any UTF-16 content; the parser must never panic or allocate wildly.
+    #[test]
+    fn arbitrary_gpu_instance_strings_never_panic() {
+        let mut state = 0xDEAD_BEEF_CAFE_F00Du64;
+        let mut next = move || {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (state >> 33) as u8
+        };
+        for len in 0..512 {
+            let text: String = (0..len).map(|_| char::from(b' ' + (next() % 95))).collect();
+            let _ = parse_gpu_instance(&text);
+        }
+        for probe in [
+            "pid_",
+            "pid__luid_",
+            "luid_0x_0x_",
+            "engtype_",
+            "pid_4294967295_luid_0xffffffff_0xffffffff",
+            "pid_99999999999999999999999",
+        ] {
+            let _ = parse_gpu_instance(probe);
+        }
     }
 }

@@ -167,7 +167,7 @@ fn collect_topology(out: &mut CpuStatic) {
         if len == 0 {
             return;
         }
-        let mut buf = vec![0u8; len as usize];
+        let mut buf = super::aligned::AlignedBuf::zeroed(len as usize);
         if GetLogicalProcessorInformationEx(RelationAll, Some(buf.as_mut_ptr() as *mut _), &mut len)
             .is_err()
         {

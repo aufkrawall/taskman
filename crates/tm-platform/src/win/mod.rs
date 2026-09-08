@@ -1,5 +1,6 @@
 //! Windows backend.
 
+mod aligned;
 mod autostart;
 pub mod core_service;
 mod cpu_info;

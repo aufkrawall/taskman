@@ -7,6 +7,9 @@
     all(target_os = "windows", not(debug_assertions)),
     windows_subsystem = "windows"
 )]
+// Win32 interop needs `unsafe`; keep every unsafe operation in an explicit
+// block so it stays reviewable.
+#![deny(unsafe_op_in_unsafe_fn)]
 
 // A build with no renderer feature fails deep inside eframe with a confusing
 // "no `run_native` in `eframe`" error; say what is actually wrong instead.
