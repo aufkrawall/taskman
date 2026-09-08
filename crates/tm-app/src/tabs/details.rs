@@ -7,6 +7,7 @@
 use eframe::egui;
 use std::cmp::Ordering as CmpOrdering;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use tm_core::format;
 use tm_core::i18n::{self, K};
@@ -27,6 +28,7 @@ type ProcessSecurityLoadResult =
 #[derive(Debug, Clone)]
 pub struct AffinityDialog {
     pub identity: crate::app::ProcessIdentity,
+    pub targets: Vec<crate::app::ProcessIdentity>,
     pub mask: Option<u64>,
     pub system_mask: Option<u64>,
     pub error: Option<String>,
@@ -101,6 +103,7 @@ pub enum ColumnId {
     SessionId,
     ImagePath,
     PageFaults,
+    IoTotal,
     IoRead,
     IoWrite,
     CommandLine,
@@ -152,6 +155,7 @@ impl ColumnId {
                 b.exe_path.as_ref().and_then(|path| path.to_str()),
             ),
             ColumnId::PageFaults => a.page_faults_per_s.cmp(&b.page_faults_per_s),
+            ColumnId::IoTotal => process_io_total(a).cmp(&process_io_total(b)),
             ColumnId::IoRead => a.disk_read_total.cmp(&b.disk_read_total),
             ColumnId::IoWrite => a.disk_write_total.cmp(&b.disk_write_total),
             ColumnId::CommandLine => {
@@ -285,6 +289,22 @@ fn process_network_rate(process: &ProcessEntry) -> Option<f64> {
     }
 }
 
+/// Total lifetime I/O bytes. Saturation keeps an extreme long-running process
+/// from wrapping to a tiny value if the two monotonic counters ever sum past
+/// `u64::MAX`.
+fn process_io_total(process: &ProcessEntry) -> u64 {
+    process
+        .disk_read_total
+        .saturating_add(process.disk_write_total)
+}
+
+fn io_total_label() -> &'static str {
+    match i18n::lang() {
+        i18n::Lang::De => "E/A gesamt",
+        i18n::Lang::En => "I/O total",
+    }
+}
+
 #[derive(Clone, Copy)]
 struct ColSpec {
     cid: ColumnId,
@@ -328,6 +348,7 @@ impl ColSpec {
             ColumnId::SessionId => i18n::tr(K::ColSessionId),
             ColumnId::ImagePath => i18n::tr(K::ColImagePath),
             ColumnId::PageFaults => i18n::tr(K::ColPageFaults),
+            ColumnId::IoTotal => io_total_label(),
             ColumnId::IoRead => i18n::tr(K::ColIoRead),
             ColumnId::IoWrite => i18n::tr(K::ColIoWrite),
             ColumnId::CommandLine => "Command line",
@@ -474,6 +495,11 @@ const COLUMNS: &[ColSpec] = &[
     ColSpec {
         cid: ColumnId::PageFaults,
         col: || TmColumn::num("pagefaults", i18n::tr(K::ColPageFaults), 120.0),
+        default_visible: false,
+    },
+    ColSpec {
+        cid: ColumnId::IoTotal,
+        col: || TmColumn::num("iototal", io_total_label(), 145.0),
         default_visible: false,
     },
     ColSpec {
@@ -839,6 +865,7 @@ pub struct Row {
     pub session_id_s: String,
     pub image_path_s: String,
     pub page_faults_s: String,
+    pub io_total_s: String,
     pub io_read_s: String,
     pub io_write_s: String,
     pub command_line_s: String,
@@ -875,6 +902,7 @@ impl Row {
             ColumnId::SessionId => &self.session_id_s,
             ColumnId::ImagePath => &self.image_path_s,
             ColumnId::PageFaults => &self.page_faults_s,
+            ColumnId::IoTotal => &self.io_total_s,
             ColumnId::IoRead => &self.io_read_s,
             ColumnId::IoWrite => &self.io_write_s,
             ColumnId::CommandLine => &self.command_line_s,
@@ -1501,6 +1529,7 @@ fn cid_is_numeric(cid: ColumnId) -> bool {
             | ColumnId::ParentPid
             | ColumnId::SessionId
             | ColumnId::PageFaults
+            | ColumnId::IoTotal
             | ColumnId::IoRead
             | ColumnId::IoWrite
     )
@@ -1808,6 +1837,7 @@ fn row_from_process(p: &ProcessEntry, depth: usize, children: bool) -> Row {
             .page_faults_per_s
             .map(|value| format::format_thousands(value.into()))
             .unwrap_or_else(|| "—".into()),
+        io_total_s: format::format_bytes_loc(process_io_total(p)),
         io_read_s: format::format_bytes_loc(p.disk_read_total),
         io_write_s: format::format_bytes_loc(p.disk_write_total),
         command_line_s: p.command_line.clone().unwrap_or_else(|| "—".into()),
@@ -1823,6 +1853,119 @@ fn identity_still_live(app: &TaskManApp, p: &ProcessEntry) -> bool {
         pid: p.pid,
         start_epoch_s: p.start_epoch_s,
     })
+}
+
+fn action_targets(
+    app: &TaskManApp,
+    p: &ProcessEntry,
+    batch: bool,
+) -> Vec<crate::app::ProcessIdentity> {
+    if batch {
+        app.live_selection_targets()
+            .into_iter()
+            .map(|(identity, _)| identity)
+            .collect()
+    } else if identity_still_live(app, p) {
+        vec![crate::app::ProcessIdentity {
+            pid: p.pid,
+            start_epoch_s: p.start_epoch_s,
+        }]
+    } else {
+        Vec::new()
+    }
+}
+
+fn set_priority_for_targets(
+    app: &mut TaskManApp,
+    ctx: &egui::Context,
+    targets: Vec<crate::app::ProcessIdentity>,
+    cls: PriorityClass,
+    key: K,
+) {
+    let total = targets.len();
+    if total == 0 {
+        app.shared.toast(i18n::tr(K::ProcessExited));
+        return;
+    }
+    let actions = app.actions.clone();
+    let completed = Arc::new(AtomicUsize::new(0));
+    let completed_for_msg = completed.clone();
+    let completed_for_job = completed.clone();
+    let msg = move || {
+        let base = i18n::trf(K::PrioritySetMsg, &[i18n::tr(key)]);
+        if total > 1 {
+            format!(
+                "{base} ({}/{total})",
+                completed_for_msg.load(Ordering::Relaxed)
+            )
+        } else {
+            base
+        }
+    };
+    app.run_action_refreshing(ctx, msg, move || {
+        let mut first_error = None;
+        for identity in targets {
+            match actions.set_priority_checked(identity.pid, identity.start_epoch_s, cls) {
+                Ok(()) => {
+                    completed_for_job.fetch_add(1, Ordering::Relaxed);
+                }
+                Err(error) => {
+                    first_error.get_or_insert(error);
+                }
+            }
+        }
+        if completed_for_job.load(Ordering::Relaxed) == 0 {
+            Err(first_error.expect("non-empty priority batch must produce a result"))
+        } else {
+            Ok(())
+        }
+    });
+}
+
+fn set_affinity_for_targets(
+    app: &mut TaskManApp,
+    ctx: &egui::Context,
+    targets: Vec<crate::app::ProcessIdentity>,
+    mask: u64,
+) {
+    let total = targets.len();
+    if total == 0 {
+        app.shared.toast(i18n::tr(K::ProcessExited));
+        return;
+    }
+    let actions = app.actions.clone();
+    let completed = Arc::new(AtomicUsize::new(0));
+    let completed_for_msg = completed.clone();
+    let completed_for_job = completed.clone();
+    let msg = move || {
+        let base = i18n::tr(K::AffinitySet).to_string();
+        if total > 1 {
+            format!(
+                "{base} ({}/{total})",
+                completed_for_msg.load(Ordering::Relaxed)
+            )
+        } else {
+            base
+        }
+    };
+    app.run_action_refreshing(ctx, msg, move || {
+        let mut first_error = None;
+        for identity in targets {
+            match actions.set_affinity_mask_checked(identity.pid, identity.start_epoch_s, mask) {
+                Ok(()) => {
+                    completed_for_job.fetch_add(1, Ordering::Relaxed);
+                }
+                Err(error) => {
+                    first_error.get_or_insert(error);
+                }
+            }
+        }
+        if completed_for_job.load(Ordering::Relaxed) == 0 {
+            Err(first_error.expect("non-empty affinity batch must produce a result"))
+        } else {
+            Ok(())
+        }
+    });
 }
 
 fn scheduling_rule_key(process: &ProcessEntry) -> Option<String> {
@@ -1911,14 +2054,14 @@ pub fn context_menu(app: &mut TaskManApp, ui: &mut egui::Ui, p: &ProcessEntry, h
     // selected them. The label says how many, so it is never a surprise.
     let batch = app.selection.len() > 1 && app.selection.contains_pid(p.pid);
     let selected_count = app.selection.len();
-    let end_label = move |base: &str| {
+    let batch_label = move |base: &str| {
         if batch {
             format!("{base} ({selected_count})")
         } else {
             base.to_string()
         }
     };
-    if menu::item(ui, &end_label(i18n::tr(K::EndTask))).clicked() {
+    if menu::item(ui, &batch_label(i18n::tr(K::EndTask))).clicked() {
         if batch {
             let ctx = ctx.clone();
             app.end_selected(&ctx);
@@ -1928,7 +2071,7 @@ pub fn context_menu(app: &mut TaskManApp, ui: &mut egui::Ui, p: &ProcessEntry, h
         ui.close();
     }
     #[cfg(target_os = "windows")]
-    if menu::item(ui, &end_label(i18n::tr(K::EndTree))).clicked() {
+    if menu::item(ui, &batch_label(i18n::tr(K::EndTree))).clicked() {
         if batch {
             let targets = app.live_selection_targets();
             app.pending_process_end = Some(crate::app::PendingProcessEnd {
@@ -1945,8 +2088,12 @@ pub fn context_menu(app: &mut TaskManApp, ui: &mut egui::Ui, p: &ProcessEntry, h
         let _ = p.name.as_str();
     }
 
-    menu::submenu(ui, i18n::tr(K::Priority), |ui| {
-        let rule_key = scheduling_rule_key(p);
+    let priority_menu_label = batch_label(i18n::tr(K::Priority));
+    menu::submenu(ui, &priority_menu_label, |ui| {
+        // Saved scheduling rules are program-scoped, not selection-scoped.
+        // Hide that control for a batch so changing several processes cannot
+        // silently persist a rule only for the row that opened the menu.
+        let rule_key = if batch { None } else { scheduling_rule_key(p) };
         let mut save_priority = rule_key.as_ref().is_some_and(|key| {
             app.shared
                 .settings
@@ -1964,49 +2111,46 @@ pub fn context_menu(app: &mut TaskManApp, ui: &mut egui::Ui, p: &ProcessEntry, h
         ] {
             let current = p.priority == cls;
             if menu::check(ui, i18n::tr(key), current).clicked() {
-                if !identity_still_live(app, p) {
+                let targets = action_targets(app, p, batch);
+                if targets.is_empty() {
                     app.shared.toast(i18n::tr(K::ProcessExited));
                     ui.close();
                     return;
                 }
-                let actions = app.actions.clone();
-                let pid = p.pid;
-                let start = p.start_epoch_s;
-                let key_copy = key;
-                let msg = move || i18n::trf(K::PrioritySetMsg, &[i18n::tr(key_copy)]);
-                app.run_action_refreshing(&ctx, msg, move || {
-                    actions.set_priority_checked(pid, start, cls)
-                });
+                set_priority_for_targets(app, &ctx, targets, cls, key);
                 if save_priority && let Some(rule_key) = rule_key.as_deref() {
                     update_saved_priority(app, rule_key, Some(cls));
                 }
                 ui.close();
             }
         }
-        menu::separator(ui);
-        let save = menu::toggle_enabled(
-            ui,
-            i18n::tr(K::SavePriorityForProgram),
-            &mut save_priority,
-            rule_key.is_some() && p.priority != PriorityClass::Unknown,
-        )
-        .on_disabled_hover_text(i18n::tr(K::SaveRuleNeedsPath));
-        if save.changed()
-            && let Some(rule_key) = rule_key.as_deref()
-        {
-            update_saved_priority(app, rule_key, save_priority.then_some(p.priority));
+        if !batch {
+            menu::separator(ui);
+            let save = menu::toggle_enabled(
+                ui,
+                i18n::tr(K::SavePriorityForProgram),
+                &mut save_priority,
+                rule_key.is_some() && p.priority != PriorityClass::Unknown,
+            )
+            .on_disabled_hover_text(i18n::tr(K::SaveRuleNeedsPath));
+            if save.changed()
+                && let Some(rule_key) = rule_key.as_deref()
+            {
+                update_saved_priority(app, rule_key, save_priority.then_some(p.priority));
+            }
         }
     });
 
-    if menu::item(ui, i18n::tr(K::SetAffinity)).clicked() {
-        if !identity_still_live(app, p) {
+    if menu::item(ui, &batch_label(i18n::tr(K::SetAffinity))).clicked() {
+        let targets = action_targets(app, p, batch);
+        if targets.is_empty() {
             app.shared.toast(i18n::tr(K::ProcessExited));
         } else {
             let identity = crate::app::ProcessIdentity {
                 pid: p.pid,
                 start_epoch_s: p.start_epoch_s,
             };
-            let rule_key = scheduling_rule_key(p);
+            let rule_key = if batch { None } else { scheduling_rule_key(p) };
             let save_for_program = rule_key.as_ref().is_some_and(|key| {
                 app.shared
                     .settings
@@ -2017,6 +2161,7 @@ pub fn context_menu(app: &mut TaskManApp, ui: &mut egui::Ui, p: &ProcessEntry, h
             let load_result = Arc::new(Mutex::new(None));
             app.affinity_dialog = Some(AffinityDialog {
                 identity: identity.clone(),
+                targets,
                 mask: None,
                 system_mask: None,
                 error: None,
@@ -2066,11 +2211,7 @@ pub fn context_menu(app: &mut TaskManApp, ui: &mut egui::Ui, p: &ProcessEntry, h
     } else {
         i18n::tr(K::SuspendProc)
     };
-    let suspend_text = if batch {
-        format!("{suspend_label} ({selected_count})")
-    } else {
-        suspend_label.to_string()
-    };
+    let suspend_text = batch_label(suspend_label);
     if menu::item(ui, &suspend_text).clicked() {
         let target_suspended = !suspended;
         if batch {
@@ -3296,10 +3437,17 @@ pub fn affinity_dialog(app: &mut TaskManApp, ctx: &egui::Context, pal: &theme::P
         }
     }
     let pid = dialog.identity.pid;
+    let target_count = dialog.targets.len();
+    let title = if target_count > 1 {
+        let selected = i18n::trf(K::SelectedCount, &[&target_count.to_string()]);
+        format!("{} {pid} ({selected})", i18n::tr(K::AffinityTitle))
+    } else {
+        format!("{} {pid}", i18n::tr(K::AffinityTitle))
+    };
     let mut open = true;
     let mut apply = false;
     let mut cancel = false;
-    egui::Window::new(format!("{} {pid}", i18n::tr(K::AffinityTitle)))
+    egui::Window::new(title)
         .open(&mut open)
         .collapsible(false)
         .resizable(false)
@@ -3356,7 +3504,7 @@ pub fn affinity_dialog(app: &mut TaskManApp, ctx: &egui::Context, pal: &theme::P
                     });
                 }
             }
-            if dialog.error.is_none() {
+            if target_count == 1 && dialog.error.is_none() {
                 let save = crate::widgets::controls::checkbox_enabled(
                     ui,
                     &mut dialog.save_for_program,
@@ -3384,13 +3532,8 @@ pub fn affinity_dialog(app: &mut TaskManApp, ctx: &egui::Context, pal: &theme::P
             });
         });
     if apply {
-        let actions = app.actions.clone();
-        let identity = dialog.identity.clone();
         let mask = dialog.mask.expect("apply requires a loaded affinity mask");
-        let toast_msg = || i18n::tr(K::AffinitySet).to_string();
-        app.run_action(ctx, toast_msg, move || {
-            actions.set_affinity_mask_checked(identity.pid, identity.start_epoch_s, mask)
-        });
+        set_affinity_for_targets(app, ctx, dialog.targets.clone(), mask);
         if let Some(rule_key) = dialog.rule_key.as_deref() {
             update_saved_affinity(app, rule_key, dialog.save_for_program.then_some(mask));
         }
@@ -3476,6 +3619,22 @@ mod tests {
         assert_eq!(unknown.field(ColumnId::Network), "—");
         assert_eq!(unknown.field(ColumnId::NetworkReceive), "—");
         assert_eq!(unknown.field(ColumnId::NetworkSend), "—");
+    }
+
+    #[test]
+    fn details_io_total_combines_read_and_write_bytes_without_wrapping() {
+        let mut process = ProcessEntry::new(44, "io.exe");
+        process.disk_read_total = 2_048;
+        process.disk_write_total = 1_024;
+        let row = row_from_process(&process, 0, false);
+        assert_eq!(
+            row.field(ColumnId::IoTotal),
+            format::format_bytes_loc(3_072)
+        );
+
+        process.disk_read_total = u64::MAX;
+        process.disk_write_total = 1;
+        assert_eq!(process_io_total(&process), u64::MAX);
     }
 
     #[test]
@@ -3774,6 +3933,20 @@ mod tests {
                     a.mem_bytes = 100;
                     b.mem_bytes = 200;
                 }
+                ColumnId::Network => {
+                    a.net_recv_bps = Some(1.0);
+                    a.net_sent_bps = Some(1.0);
+                    b.net_recv_bps = Some(2.0);
+                    b.net_sent_bps = Some(2.0);
+                }
+                ColumnId::NetworkReceive => {
+                    a.net_recv_bps = Some(1.0);
+                    b.net_recv_bps = Some(2.0);
+                }
+                ColumnId::NetworkSend => {
+                    a.net_sent_bps = Some(1.0);
+                    b.net_sent_bps = Some(2.0);
+                }
                 ColumnId::Platform => {
                     a.wow64 = Some(false);
                     b.wow64 = Some(true);
@@ -3850,6 +4023,12 @@ mod tests {
                     a.page_faults_per_s = Some(1);
                     b.page_faults_per_s = Some(2);
                 }
+                ColumnId::IoTotal => {
+                    a.disk_read_total = 1;
+                    a.disk_write_total = 1;
+                    b.disk_read_total = 2;
+                    b.disk_write_total = 2;
+                }
                 ColumnId::IoRead => {
                     a.disk_read_total = 1;
                     b.disk_read_total = 2;
@@ -3877,6 +4056,7 @@ mod tests {
         let s = State::default();
         assert!(!s.is_visible(ColumnId::Priority));
         assert!(!s.is_visible(ColumnId::GpuDedicated));
+        assert!(!s.is_visible(ColumnId::IoTotal));
         assert!(s.is_visible(ColumnId::Name));
     }
 
