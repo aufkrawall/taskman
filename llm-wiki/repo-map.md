@@ -79,8 +79,9 @@ platform boundary (`tm-core` ← `tm-platform` ← `tm-app` / `tm-service`):
     (chrome + dialogs incl. scrolling settings and Delete confirmation),
     `tabs/*` (processes/details/modules/users/services/startup/apphistory/
     performance; Processes keeps native grouped presentation, Details can
-    switch between flat and literal raw-PPID tree and owns a bounded,
-    identity-safe Process Properties inspector (General/Statistics/Security);
+    switch between flat and literal raw-PPID tree, offers optional combined/receive/send
+    per-process network-rate columns backed by the same on-demand ETW source as Processes,
+    and owns a bounded, identity-safe Process Properties inspector (General/Statistics/Security);
     its Windows Security page lazily queries PPL/protection, critical state,
     image machine and DEP/ASLR/CFG/CET/Win32k/code-integrity/image-load and
     related mitigation policies instead of adding them to the hot sampler;

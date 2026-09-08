@@ -51,8 +51,8 @@ fn columns() -> Vec<TmColumn> {
         TmColumn::num("cpu", i18n::tr(K::ColCpu), 110.0),
         TmColumn::num("mem", i18n::tr(K::ColMemory), 110.0),
         TmColumn::num("disk", i18n::tr(K::ColDisk), 110.0),
-        // Per-process network is unsupported on Windows; the column renders
-        // an honest "—" instead of a fake zero (implement.md §10/§16.6).
+        // Windows supplies this lazily from the per-process ETW source.
+        // Missing telemetry still renders as an honest "—", never fake zero.
         TmColumn::num("net", i18n::tr(K::ColNetwork), 110.0),
     ]
 }

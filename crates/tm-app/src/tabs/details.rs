@@ -79,6 +79,9 @@ pub enum ColumnId {
     User,
     Cpu,
     Memory,
+    Network,
+    NetworkReceive,
+    NetworkSend,
     Platform,
     Elevated,
     Uac,
@@ -116,6 +119,9 @@ impl ColumnId {
                 .partial_cmp(&b.cpu_pct)
                 .unwrap_or(CmpOrdering::Equal),
             ColumnId::Memory => a.mem_bytes.cmp(&b.mem_bytes),
+            ColumnId::Network => cmp_option_f64(process_network_rate(a), process_network_rate(b)),
+            ColumnId::NetworkReceive => cmp_option_f64(a.net_recv_bps, b.net_recv_bps),
+            ColumnId::NetworkSend => cmp_option_f64(a.net_sent_bps, b.net_sent_bps),
             ColumnId::Platform => a.wow64.cmp(&b.wow64),
             ColumnId::Elevated => a.elevated.cmp(&b.elevated),
             ColumnId::Uac => uac_rank(a.uac_virtualization).cmp(&uac_rank(b.uac_virtualization)),
@@ -270,6 +276,15 @@ fn cmp_option_f64(a: Option<f64>, b: Option<f64>) -> CmpOrdering {
     }
 }
 
+/// Combined current network rate without turning missing telemetry into zero.
+/// A measured zero in either/both directions remains a real measurement.
+fn process_network_rate(process: &ProcessEntry) -> Option<f64> {
+    match (process.net_recv_bps, process.net_sent_bps) {
+        (None, None) => None,
+        (recv, sent) => Some(recv.unwrap_or(0.0) + sent.unwrap_or(0.0)),
+    }
+}
+
 #[derive(Clone, Copy)]
 struct ColSpec {
     cid: ColumnId,
@@ -291,6 +306,9 @@ impl ColSpec {
             ColumnId::User => i18n::tr(K::ColUsername),
             ColumnId::Cpu => i18n::tr(K::ColCpu),
             ColumnId::Memory => i18n::tr(K::ColMemory),
+            ColumnId::Network => i18n::tr(K::ColNetwork),
+            ColumnId::NetworkReceive => i18n::tr(K::PropNetworkReceive),
+            ColumnId::NetworkSend => i18n::tr(K::PropNetworkSend),
             ColumnId::Platform => i18n::tr(K::ColPlatform),
             ColumnId::Elevated => i18n::tr(K::ColElevated),
             ColumnId::Uac => i18n::tr(K::ColUac),
@@ -347,6 +365,21 @@ const COLUMNS: &[ColSpec] = &[
         cid: ColumnId::Memory,
         col: || TmColumn::num("mem", i18n::tr(K::ColMemory), 130.0),
         default_visible: true,
+    },
+    ColSpec {
+        cid: ColumnId::Network,
+        col: || TmColumn::num("net", i18n::tr(K::ColNetwork), 115.0),
+        default_visible: false,
+    },
+    ColSpec {
+        cid: ColumnId::NetworkReceive,
+        col: || TmColumn::num("netrecv", i18n::tr(K::PropNetworkReceive), 140.0),
+        default_visible: false,
+    },
+    ColSpec {
+        cid: ColumnId::NetworkSend,
+        col: || TmColumn::num("netsend", i18n::tr(K::PropNetworkSend), 130.0),
+        default_visible: false,
     },
     ColSpec {
         cid: ColumnId::Platform,
@@ -511,6 +544,17 @@ impl State {
                     | ColumnId::GpuEngine
                     | ColumnId::GpuDedicated
                     | ColumnId::GpuShared
+            )
+        })
+    }
+
+    /// Per-process network ETW is relatively expensive, so Details requests
+    /// it only when a network-rate column is actually visible.
+    pub fn requires_network_telemetry(&self) -> bool {
+        self.visible.iter().any(|cid| {
+            matches!(
+                cid,
+                ColumnId::Network | ColumnId::NetworkReceive | ColumnId::NetworkSend
             )
         })
     }
@@ -773,6 +817,9 @@ pub struct Row {
     pub user: String,
     pub cpu_s: String,
     pub mem_s: String,
+    pub net_s: String,
+    pub net_recv_s: String,
+    pub net_send_s: String,
     pub platform: String,
     pub elevated: String,
     pub uac: String,
@@ -806,6 +853,9 @@ impl Row {
             ColumnId::User => &self.user,
             ColumnId::Cpu => &self.cpu_s,
             ColumnId::Memory => &self.mem_s,
+            ColumnId::Network => &self.net_s,
+            ColumnId::NetworkReceive => &self.net_recv_s,
+            ColumnId::NetworkSend => &self.net_send_s,
             ColumnId::Platform => &self.platform,
             ColumnId::Elevated => &self.elevated,
             ColumnId::Uac => &self.uac,
@@ -1437,6 +1487,9 @@ fn cid_is_numeric(cid: ColumnId) -> bool {
         ColumnId::Pid
             | ColumnId::Cpu
             | ColumnId::Memory
+            | ColumnId::Network
+            | ColumnId::NetworkReceive
+            | ColumnId::NetworkSend
             | ColumnId::GpuUtil
             | ColumnId::Threads
             | ColumnId::Handles
@@ -1709,6 +1762,9 @@ fn row_from_process(p: &ProcessEntry, depth: usize, children: bool) -> Row {
         user: p.user.clone().unwrap_or_else(|| "—".into()),
         cpu_s: format::format_cpu_detail(p.cpu_pct),
         mem_s: format::format_k(p.mem_bytes),
+        net_s: option_rate(process_network_rate(p)),
+        net_recv_s: option_rate(p.net_recv_bps),
+        net_send_s: option_rate(p.net_sent_bps),
         platform,
         elevated,
         uac,
@@ -3398,6 +3454,38 @@ mod tests {
             CmpOrdering::Less,
             "aaa.exe before zzz.exe — the description must not decide it"
         );
+    }
+
+    #[test]
+    fn details_network_columns_render_measurements_and_preserve_unknown() {
+        let mut measured = ProcessEntry::new(42, "browser.exe");
+        measured.net_recv_bps = Some(2_048.0);
+        measured.net_sent_bps = Some(1_024.0);
+        let row = row_from_process(&measured, 0, false);
+        assert_eq!(row.field(ColumnId::Network), format::format_rate(3_072.0));
+        assert_eq!(
+            row.field(ColumnId::NetworkReceive),
+            format::format_rate(2_048.0)
+        );
+        assert_eq!(
+            row.field(ColumnId::NetworkSend),
+            format::format_rate(1_024.0)
+        );
+
+        let unknown = row_from_process(&ProcessEntry::new(43, "unknown.exe"), 0, false);
+        assert_eq!(unknown.field(ColumnId::Network), "—");
+        assert_eq!(unknown.field(ColumnId::NetworkReceive), "—");
+        assert_eq!(unknown.field(ColumnId::NetworkSend), "—");
+    }
+
+    #[test]
+    fn details_network_demand_follows_visible_network_columns() {
+        let mut state = State::default();
+        assert!(!state.requires_network_telemetry());
+        state.set_visible(ColumnId::NetworkReceive, true);
+        assert!(state.requires_network_telemetry());
+        state.set_visible(ColumnId::NetworkReceive, false);
+        assert!(!state.requires_network_telemetry());
     }
 
     /// The dump file name must be sortable and must never collide, which

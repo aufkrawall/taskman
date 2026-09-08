@@ -970,10 +970,16 @@ impl TaskManApp {
     /// changes (implement.md §6.3). Cheap: one atomic command on change.
     fn update_demand(&mut self) {
         let mut d = TelemetryDemand::core(); // core + adapter rates + tokens
-        // The Processes and App History pages both show per-process network,
-        // which is an ETW session on Windows — only keep it running while one
-        // of those pages is actually on screen.
-        if matches!(self.tab, Tab::Processes | Tab::AppHistory) {
+        // Per-process network is an ETW session on Windows. Processes and
+        // App History always show it; Details requests it only for visible
+        // network columns. Process Properties also exposes live send/receive
+        // statistics, so keep the source active while that inspector is open.
+        let details_network =
+            self.tab == Tab::Details && self.details_state.requires_network_telemetry();
+        if matches!(self.tab, Tab::Processes | Tab::AppHistory)
+            || details_network
+            || self.proc_props.is_some()
+        {
             d = d.union(TelemetryDemand::PROCESS_NET);
         }
         match self.tab {
