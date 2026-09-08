@@ -183,7 +183,10 @@ fn system_task_manager_path() -> Result<PathBuf> {
 pub fn launch_native_task_manager() -> Result<()> {
     use std::os::windows::ffi::OsStrExt;
     use windows::Win32::Foundation::CloseHandle;
-    use windows::Win32::System::Diagnostics::Debug::DebugActiveProcessStop;
+    use windows::Win32::System::Diagnostics::Debug::{
+        ContinueDebugEvent, DBG_CONTINUE, DEBUG_EVENT, DebugActiveProcessStop,
+        DebugSetProcessKillOnExit, WaitForDebugEvent,
+    };
     use windows::Win32::System::Threading::{
         CreateProcessW, DEBUG_ONLY_THIS_PROCESS, PROCESS_INFORMATION, STARTUPINFOW,
         TerminateProcess,
@@ -215,10 +218,56 @@ pub fn launch_native_task_manager() -> Result<()> {
     }
     .map_err(|error| TmError::platform("CreateProcessW(Taskmgr.exe)", error.to_string()))?;
 
+    // DEBUG_ONLY_THIS_PROCESS is what bypasses IFEO, but a debug-created
+    // process is stopped at its initial CREATE_PROCESS_DEBUG_EVENT. Detaching
+    // immediately, before acknowledging that event, is not sufficient on all
+    // supported Windows builds (notably current Task Manager can remain stuck
+    // before user code ever runs). Consume and continue the initial event
+    // first, then detach while there is no outstanding debug event.
+    if let Err(error) = unsafe { DebugSetProcessKillOnExit(false) } {
+        unsafe {
+            let _ = TerminateProcess(process.hProcess, 1);
+            let _ = CloseHandle(process.hThread);
+            let _ = CloseHandle(process.hProcess);
+        }
+        return Err(TmError::platform(
+            "DebugSetProcessKillOnExit(Taskmgr.exe)",
+            error.to_string(),
+        ));
+    }
+
+    let mut event = DEBUG_EVENT::default();
+    if let Err(error) = unsafe { WaitForDebugEvent(&mut event, 5_000) } {
+        unsafe {
+            let _ = TerminateProcess(process.hProcess, 1);
+            let _ = CloseHandle(process.hThread);
+            let _ = CloseHandle(process.hProcess);
+        }
+        return Err(TmError::platform(
+            "WaitForDebugEvent(Taskmgr.exe)",
+            error.to_string(),
+        ));
+    }
+
+    if let Err(error) = unsafe {
+        ContinueDebugEvent(event.dwProcessId, event.dwThreadId, DBG_CONTINUE)
+    } {
+        unsafe {
+            let _ = TerminateProcess(process.hProcess, 1);
+            let _ = CloseHandle(process.hThread);
+            let _ = CloseHandle(process.hProcess);
+        }
+        return Err(TmError::platform(
+            "ContinueDebugEvent(Taskmgr.exe)",
+            error.to_string(),
+        ));
+    }
+
     let detached = unsafe { DebugActiveProcessStop(process.dwProcessId) };
     if let Err(error) = detached {
-        // A debug-created process waits for its debugger. Never leave a stuck
-        // Task Manager attached to one of the executor's long-lived workers.
+        // Never leave Task Manager attached to one of the executor's
+        // long-lived worker threads: without a debugger loop it would remain
+        // suspended at the next debug event indefinitely.
         unsafe {
             let _ = TerminateProcess(process.hProcess, 1);
             let _ = CloseHandle(process.hThread);
