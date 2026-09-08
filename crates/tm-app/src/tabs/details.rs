@@ -952,6 +952,10 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
             }
         },
         |app, ui| {
+            // The process tree has no switch of its own: it is the Name
+            // column's third sort state. This entry is the discoverable way
+            // in and out of it, and it names the gesture so the header click
+            // does not have to be guessed.
             let hierarchical = app.details_state.is_tree();
             if menu::check(ui, i18n::tr(K::ProcessTreeView), hierarchical).clicked() {
                 let order = if hierarchical {
@@ -1012,6 +1016,8 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
             );
             if ui
                 .add(
+                    // `×` (U+00D7) rather than `✕`: the dingbat is missing
+                    // from several UI fonts and renders as a tofu box.
                     egui::Button::new(egui::RichText::new("×").size(13.0).color(pal.text_dim))
                         .frame(false),
                 )
@@ -1031,6 +1037,8 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
 
     let visible_cols = app.details_state.ordered_visible();
     let cols_rendered: Vec<TmColumn> = visible_cols.iter().map(|c| (c.col)()).collect();
+    // Native TM packs the Details list; the 32 px app-list row height reads
+    // as broken gaps between entries here.
     let mut table = app
         .make_table("details", cols_rendered)
         .with_row_height(tablekit::ROW_H_DENSE);
@@ -1053,6 +1061,9 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
     }
     let rows = &cache.as_ref().expect("cache").rows;
 
+    // Native-style type navigation follows the current filtered/sorted list,
+    // accumulates fast keystrokes into one word, cycles repeated initials,
+    // and scrolls the virtual row into view.
     if let Some(typed) = search::list_type_ahead(ui.ctx(), "details") {
         let selected = app.selection.primary().map(|p| p.pid);
         let candidates = rows
@@ -1067,17 +1078,25 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
     }
 
     handle_keyboard_navigation(app, ui.ctx(), rows);
+
     prepare_auto_fit_widths(ui, &mut table, &visible_cols, rows);
 
     let avail = tablekit::table_avail(ui);
     let sorted_pos = visible_cols
         .iter()
         .position(|c| c.cid == app.details_state.sort_col);
+
+    // Capture the on-screen header bounds before the table consumes the body.
+    // Secondary-click in this area opens the same visibility dialog as the
+    // overflow command, matching Task Manager's column-header affordance.
     let header_min = ui.cursor().min;
     let header_rect = egui::Rect::from_min_size(
         header_min,
         egui::vec2(avail.min(table.total_width()), tablekit::HEADER_H1),
     );
+
+    // Consume any pending scroll request (type-ahead or cross-tab focus) as
+    // a row index for the table's vertical-only scroll-to-row.
     let focus_row = app
         .scroll_to_pid
         .take()
@@ -1099,6 +1118,8 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
                 let selected = app.selection.contains_pid(row.pid);
                 let (rect, resp) = table.row(ui, &pal, selected, (row.pid, row.start_epoch_s));
 
+                // Name decorations follow the Name column even after it has
+                // been moved away from the first position.
                 for (pos, spec) in visible_cols.iter().enumerate() {
                     let cid = spec.cid;
                     let text = row.field(cid);
@@ -1186,6 +1207,9 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
                     app.selection
                         .click(kind, identity_of(row), &row_identities(rows));
                 }
+                // A right-click INSIDE an existing multi-selection keeps it
+                // (native list-view behavior); outside it, the menu applies
+                // to the row it was opened on, so the selection follows.
                 if resp.secondary_clicked() && !app.selection.contains_pid(row.pid) {
                     app.selection.select_single(identity_of(row));
                 }
@@ -1221,9 +1245,17 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
     }
     app.persist_table(&table);
     app.details_state.cache = cache;
+
     select_columns_dialog(app, &ctx_from(ui), &pal);
 }
 
+/// Name for the Details list: the image name, and nothing else.
+///
+/// Details is the diagnostic page. It shows `svchost.exe`, not "Host Process
+/// for Windows Services" — the description is the ambiguous half (a dozen
+/// processes share one) and it is available as its own optional column for
+/// anyone who wants it. The friendly name belongs on Processes, which is the
+/// app list.
 fn detail_name(p: &ProcessEntry) -> String {
     p.name.clone()
 }
@@ -1235,6 +1267,8 @@ fn identity_of(row: &Row) -> crate::app::ProcessIdentity {
     }
 }
 
+/// Every displayed row as an identity, in display order — the order a
+/// Shift-click range is taken in.
 fn row_identities(rows: &[Row]) -> Vec<crate::app::ProcessIdentity> {
     rows.iter().map(identity_of).collect()
 }
@@ -1244,17 +1278,22 @@ fn select_detail_row(app: &mut TaskManApp, row: &Row) {
     app.scroll_to_pid = Some(row.pid);
 }
 
+/// Keyboard range extension: Shift+arrow grows the selection from the anchor
+/// instead of replacing it, like every native list view.
 fn extend_detail_selection(app: &mut TaskManApp, row: &Row, rows: &[Row]) {
     app.selection
         .select_range(identity_of(row), &row_identities(rows));
     app.scroll_to_pid = Some(row.pid);
 }
 
+/// Native list navigation plus tree-aware Left/Right movement. The flattened
+/// rows remain virtualized, so selection also records a one-shot scroll target.
 fn handle_keyboard_navigation(app: &mut TaskManApp, ctx: &egui::Context, rows: &[Row]) {
     let selected_pos = app
         .selection
         .primary()
         .and_then(|selected| rows.iter().position(|row| row.pid == selected.pid));
+    // Page movement must count the rows this page actually renders.
     let page_rows = (ctx.content_rect().height() / tablekit::ROW_H_DENSE)
         .floor()
         .max(1.0) as usize;
@@ -1343,6 +1382,11 @@ fn ctx_from(ui: &egui::Ui) -> egui::Context {
     ui.ctx().clone()
 }
 
+/// Copy the current details column preferences into the settings snapshot
+/// and queue a debounced autosave — the same path as column widths. The
+/// order is only stored while it differs from the built-in order, and
+/// visibility entries matching the defaults are dropped, so fresh installs
+/// and never-touched tables keep following schema changes.
 fn persist_column_prefs(app: &mut TaskManApp) {
     const TABLE: &str = "details";
     let visibility = app.details_state.saved_visibility();
@@ -1382,6 +1426,8 @@ fn select_columns_dialog(app: &mut TaskManApp, ctx: &egui::Context, pal: &theme:
             egui::ScrollArea::vertical()
                 .max_height(330.0)
                 .show(ui, |ui| {
+                    // Iterate a snapshot because arrow clicks mutate the live
+                    // ordering. The updated order is visible next frame.
                     let order = app.details_state.order.clone();
                     for cid in order {
                         let spec = spec_for(cid);
@@ -1447,6 +1493,11 @@ fn select_columns_dialog(app: &mut TaskManApp, ctx: &egui::Context, pal: &theme:
     }
 }
 
+/// Persist the Details sort.
+///
+/// The strict-hierarchy state is not expressible as an ascending flag, so it
+/// rides in `[general]` beside the tree-view switch rather than corrupting
+/// the `[sort]` line format every other table shares.
 fn persist_sort_pref(app: &mut TaskManApp, cid: ColumnId, order: SortOrder) {
     let hierarchical = order == SortOrder::Hierarchical;
     if app.shared.settings.details_tree_hierarchical != hierarchical {
@@ -1514,6 +1565,8 @@ fn build_rows(
     collapsed: &HashSet<u32>,
 ) -> Vec<Row> {
     let q = search::Query::new(raw_search);
+    // The tree is not a mode: it is exactly the Name column's unsorted
+    // state. Any other order is a plain flat list.
     if order != SortOrder::Hierarchical {
         let mut list: Vec<&ProcessEntry> = snap
             .processes
@@ -1584,6 +1637,9 @@ fn build_rows(
         .copied()
         .filter(|process| !attached.contains(&process.pid))
         .collect();
+    // Malformed/cyclic parent graphs can have no natural root. Pick one
+    // representative per still-uncovered component so every process remains
+    // reachable while the render walk's visited set prevents loops.
     let mut covered = HashSet::new();
     for root in roots.clone() {
         mark_tree_component(root.pid, &children, &mut covered);
@@ -1620,8 +1676,14 @@ fn build_rows(
     rows
 }
 
+/// Horizontal step per tree level, shared by rendering and auto-fit. Matched
+/// to System Informer's compact indentation so deep trees stay on screen.
 const TREE_INDENT: f32 = 18.0;
 
+/// A PID may be recycled the moment its process exits, so a raw parent link
+/// can point at a process that started LATER than its supposed child. System
+/// Informer rejects those links and shows the child as a root; so do we.
+/// Unknown timestamps are never treated as evidence — the link stands.
 fn is_plausible_parent(parent: &ProcessEntry, child: &ProcessEntry) -> bool {
     match (parent.start_epoch_s, child.start_epoch_s) {
         (Some(parent_start), Some(child_start)) => parent_start <= child_start,
@@ -1629,6 +1691,13 @@ fn is_plausible_parent(parent: &ProcessEntry, child: &ProcessEntry) -> bool {
     }
 }
 
+/// Order one sibling list.
+///
+/// [`SortOrder::Hierarchical`] deliberately ignores `sort_col` entirely and
+/// falls back to CREATION order. It cannot fall back to the snapshot's own
+/// order: processes come out of a hash map, so "unsorted" would reshuffle
+/// the whole tree on every tick. Start time plus PID is stable, and it is
+/// the order the OS actually created the children in.
 fn sort_processes(list: &mut [&ProcessEntry], sort_col: ColumnId, order: SortOrder) {
     if order == SortOrder::Hierarchical {
         list.sort_by(|a, b| {
@@ -1773,6 +1842,10 @@ fn row_from_process(p: &ProcessEntry, depth: usize, children: bool) -> Row {
     }
 }
 
+/// Identity gate shared by every destructive context-menu action (audit:
+/// End Task and Efficiency mode had one; priority/suspend/affinity did not).
+/// The rendered row can be stale — especially while sampling is paused — so
+/// re-check the start time against the latest snapshot before dispatching.
 fn identity_still_live(app: &TaskManApp, p: &ProcessEntry) -> bool {
     app.identity_is_live(&crate::app::ProcessIdentity {
         pid: p.pid,
@@ -1934,6 +2007,7 @@ fn update_saved_affinity(app: &mut TaskManApp, key: &str, affinity_mask: Option<
     app.save_settings();
 }
 
+/// Context menu mirroring the Win11 TM Details tab.
 pub fn context_menu(app: &mut TaskManApp, ui: &mut egui::Ui, p: &ProcessEntry, has_children: bool) {
     let ctx = ui.ctx().clone();
     ui.set_min_width(230.0);
@@ -1973,6 +2047,9 @@ pub fn context_menu(app: &mut TaskManApp, ui: &mut egui::Ui, p: &ProcessEntry, h
         crate::tabs::modules::open(app, p, &ctx);
         ui.close();
     }
+    // With several rows selected the menu was opened on one of them, so the
+    // repeatable commands apply to the whole selection — the point of having
+    // selected them. The label says how many, so it is never a surprise.
     let batch = app.selection.len() > 1 && app.selection.contains_pid(p.pid);
     let selected_count = app.selection.len();
     let batch_label = move |base: &str| {
@@ -2011,6 +2088,9 @@ pub fn context_menu(app: &mut TaskManApp, ui: &mut egui::Ui, p: &ProcessEntry, h
 
     let priority_menu_label = batch_label(i18n::tr(K::Priority));
     menu::submenu(ui, &priority_menu_label, |ui| {
+        // Saved scheduling rules are program-scoped, not selection-scoped.
+        // Hide that control for a batch so changing several processes cannot
+        // silently persist a rule only for the row that opened the menu.
         let rule_key = if batch { None } else { scheduling_rule_key(p) };
         let mut save_priority = rule_key.as_ref().is_some_and(|key| {
             app.shared
@@ -2159,6 +2239,9 @@ pub fn context_menu(app: &mut TaskManApp, ui: &mut egui::Ui, p: &ProcessEntry, h
     #[cfg(target_os = "windows")]
     {
         let eco_on = p.power_throttled == Some(true);
+        // A tick on one "Efficiency mode" entry, not two opposite verbs:
+        // the menu shows the process's CURRENT state, the way Task Manager
+        // and every other Windows menu toggle does.
         if menu::check_enabled(
             ui,
             i18n::tr(K::EfficiencyMode),
@@ -2338,12 +2421,20 @@ fn end_process(
     );
 }
 
+/// `YYYYMMDD-HHMMSS` (UTC) for a dump file name.
+///
+/// UTC rather than local time because the only jobs this has are ordering and
+/// uniqueness, and UTC does both without a DST fold. Built from the wall clock
+/// rather than a formatting crate because it must never fail: a dump the user
+/// just waited for cannot be lost to a name.
 fn local_timestamp_for_filename() -> String {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs());
     let days = now / 86_400;
     let seconds = now % 86_400;
+    // Civil-from-days (Howard Hinnant's algorithm), which is exact and has no
+    // table to get wrong.
     let z = days as i64 + 719_468;
     let era = z.div_euclid(146_097);
     let doe = z.rem_euclid(146_097);
@@ -2371,6 +2462,9 @@ pub(crate) fn create_dump(app: &mut TaskManApp, ctx: &egui::Context, p: &Process
         app.shared.toast(i18n::tr(K::DumpAlreadyRunning));
         return;
     }
+    // Name the file after what it is a dump OF. Two dumps of the same program
+    // are the normal case (before and after a hang), and "brave.exe.dmp" twice
+    // means the second one silently replaces the first.
     let default_name = format!(
         "{}_{}_{}.dmp",
         p.name.trim_end_matches(".exe").trim_end_matches(".EXE"),
@@ -2470,6 +2564,10 @@ struct ProcessSecuritySummary {
 }
 
 fn process_properties_body_height(available_height: f32, viewport_height: f32) -> f32 {
+    // Track the USER-RESIZED window height, not the content's desired height.
+    // The viewport-derived upper bound only protects the initial sizing pass
+    // (where egui may report an unbounded available height); it does not impose
+    // an arbitrary 680 px outer-window ceiling.
     let viewport_limit = (viewport_height - 150.0).max(180.0);
     (available_height - 48.0).clamp(180.0, viewport_limit)
 }
@@ -3243,6 +3341,11 @@ pub fn process_properties_dialog(app: &mut TaskManApp, ctx: &egui::Context) {
                 return;
             };
 
+            // Give the content a bounded viewport. The previous non-shrinking
+            // ScrollArea fed its own ever-larger desired height back into the
+            // resizable Window on every frame, so the dialog grew until it hit
+            // the monitor edge. The viewport cap is independent of content;
+            // overflow belongs to the scroll bar, not to the outer window.
             let body_height =
                 process_properties_body_height(ui.available_height(), ctx.content_rect().height());
             let security = process_security_summary(&dialog);
@@ -3467,6 +3570,8 @@ mod tests {
         assert!(process_properties_target(&snapshot, &identity).is_none());
     }
 
+    /// Details shows the image name, never the description. The description
+    /// is available as its own optional column.
     #[test]
     fn the_details_name_is_the_image_name_only() {
         let mut host = ProcessEntry::new(900, "svchost.exe");
@@ -3477,6 +3582,7 @@ mod tests {
         assert_eq!(detail_name(&bare), "mystery.exe");
     }
 
+    /// Sorting has to follow what the column renders.
     #[test]
     fn the_name_column_sorts_by_image_name() {
         let mut zebra_image = ProcessEntry::new(1, "aaa.exe");
@@ -3562,6 +3668,8 @@ mod tests {
         assert!(!state.requires_network_telemetry());
     }
 
+    /// The dump file name must be sortable and must never collide, which
+    /// makes the date arithmetic load-bearing rather than cosmetic.
     #[test]
     fn dump_timestamps_are_well_formed_and_sortable() {
         let stamp = local_timestamp_for_filename();
@@ -3600,6 +3708,9 @@ mod tests {
         }
     }
 
+    /// The tree is expanded by DEFAULT: an empty state must show the whole
+    /// hierarchy, including subtrees whose parents appeared long after the
+    /// page was first opened. Only explicit collapses hide anything.
     #[test]
     fn details_tree_is_fully_expanded_until_the_user_collapses() {
         let snapshot = tree_snapshot(vec![
@@ -3624,6 +3735,8 @@ mod tests {
         assert_eq!(depths(HashSet::from([10])), [(10, 0)]);
     }
 
+    /// A recycled PID can make a process look like its own ancestor's child.
+    /// A parent that started AFTER the child is not a parent.
     #[test]
     fn details_tree_rejects_parents_that_started_after_their_child() {
         let mut child = tree_process(500, Some(900), "orphan.exe");
@@ -3645,6 +3758,7 @@ mod tests {
             "both stay roots; the stale link must not nest them"
         );
 
+        // The same shape with a plausible timeline DOES nest.
         let mut child = tree_process(500, Some(900), "child.exe");
         child.start_epoch_s = Some(400);
         let mut parent = tree_process(900, None, "parent.exe");
@@ -3686,6 +3800,8 @@ mod tests {
 
         let mut a = tree_process(30, Some(31), "a.exe");
         let mut b = tree_process(31, Some(30), "b.exe");
+        // Same start time on both, so neither link is rejected as stale and
+        // only the render walk's visited set can break the cycle.
         a.start_epoch_s = Some(1);
         b.start_epoch_s = Some(1);
         let cyclic = tree_snapshot(vec![a, b]);
@@ -3701,10 +3817,17 @@ mod tests {
         assert_eq!(unique, HashSet::from([30, 31]));
     }
 
+    /// The Name column's third state must be a LITERAL hierarchy: the sort
+    /// column is ignored entirely and siblings appear in creation order. The
+    /// other two states are plain FLAT lists — that is what "clicking a
+    /// column leaves the tree" means, and it is why the same snapshot must
+    /// come out in three visibly different orders.
     #[test]
     fn hierarchical_order_is_a_tree_and_every_other_order_is_flat() {
         let mut root = tree_process(10, None, "root.exe");
         root.start_epoch_s = Some(1);
+        // Children created zulu-then-alpha — the reverse of the alphabet, so
+        // creation order and name order cannot accidentally agree.
         let mut zulu = tree_process(11, Some(10), "zulu.exe");
         zulu.start_epoch_s = Some(2);
         let mut alpha = tree_process(12, Some(10), "alpha.exe");
@@ -3719,23 +3842,31 @@ mod tests {
         };
         assert_eq!(
             rows(ColumnId::Name, SortOrder::Hierarchical),
-            [(10, 0), (11, 1), (12, 1)]
+            [(10, 0), (11, 1), (12, 1)],
+            "hierarchical order must nest and follow creation, not the alphabet"
         );
         assert_eq!(
             rows(ColumnId::Name, SortOrder::Ascending),
-            [(12, 0), (10, 0), (11, 0)]
+            [(12, 0), (10, 0), (11, 0)],
+            "name ascending is a flat alphabetical list"
         );
         assert_eq!(
             rows(ColumnId::Name, SortOrder::Descending),
             [(11, 0), (10, 0), (12, 0)]
         );
+        // Sorting by another column is flat too: the busiest process must be
+        // able to reach the top instead of staying pinned under its parent.
         assert!(
             rows(ColumnId::Pid, SortOrder::Descending)
                 .iter()
-                .all(|(_, depth)| *depth == 0)
+                .all(|(_, depth)| *depth == 0),
+            "a non-Name column must never render a tree"
         );
     }
 
+    /// Clicking Name cycles ascending -> descending -> hierarchy; clicking
+    /// any other column is a plain two-way toggle AND leaves the tree, so the
+    /// ordering is purely by that column.
     #[test]
     fn only_the_name_column_reaches_the_hierarchical_state() {
         let mut s = State::default();
@@ -3746,23 +3877,30 @@ mod tests {
         assert_eq!(s.clicked_column(ColumnId::Name), SortOrder::Ascending);
         assert!(!s.is_tree());
 
+        // Any other column: two-way only, never a tree.
         let mut n = State::default();
         assert_eq!(n.clicked_column(ColumnId::Cpu), SortOrder::Descending);
         assert_eq!(n.clicked_column(ColumnId::Cpu), SortOrder::Ascending);
         assert_eq!(n.clicked_column(ColumnId::Cpu), SortOrder::Descending);
         assert!(!n.is_tree());
 
+        // Leaving the tree by clicking a different column.
         let mut t = State {
             sort_col: ColumnId::Name,
             sort_order: SortOrder::Hierarchical,
             ..State::default()
         };
         assert_eq!(t.clicked_column(ColumnId::Cpu), SortOrder::Descending);
-        assert!(!t.is_tree());
+        assert!(!t.is_tree(), "clicking CPU must leave the tree");
         assert_eq!(t.sort_col, ColumnId::Cpu);
+
+        // No column is sorted in the hierarchical state, so no header arrow.
         assert_eq!(SortOrder::Hierarchical.arrow(), None);
         assert_eq!(SortOrder::Ascending.arrow(), Some(true));
         assert_eq!(SortOrder::Descending.arrow(), Some(false));
+
+        // A persisted hierarchy flag under a column that cannot produce it
+        // (hand-edited config) degrades to a normal direction.
         assert_eq!(
             SortOrder::from_saved(ColumnId::Cpu, false, true),
             SortOrder::Descending
@@ -3946,14 +4084,17 @@ mod tests {
     #[test]
     fn visibility_prefs_roundtrip_through_defaults() {
         let mut s = State::default();
+        // Showing a default-hidden advanced column must persist…
         s.set_visible(ColumnId::Threads, true);
         assert_eq!(s.saved_visibility().get("threads"), Some(&true));
         let mut restored = State::default();
         restored.apply_saved_prefs(Some(&s.saved_visibility()), None);
         assert!(restored.is_visible(ColumnId::Threads));
+        // …and so must hiding a default-visible one.
         s.set_visible(ColumnId::Uac, false);
         let vis = s.saved_visibility();
         assert_eq!(vis.get("uac"), Some(&false));
+        // Unchanged columns produce no entry.
         assert!(!vis.contains_key("name"));
         let mut restored2 = State::default();
         restored2.apply_saved_prefs(Some(&vis), None);
@@ -3986,12 +4127,14 @@ mod tests {
         s.apply_saved_prefs(None, Some(&order));
         assert_eq!(s.ordered_visible()[0].cid, ColumnId::Pid);
         assert_eq!(s.ordered_visible()[1].cid, ColumnId::Name);
+        // Columns missing from the file keep their built-in relative order.
         let rest: Vec<_> = s.order[2..].iter().copied().map(id_of).collect();
         assert_eq!(rest, default_order_ids()[2..]);
     }
 
     #[test]
     fn saved_prefs_never_empties_the_table_or_sorts_by_hidden_column() {
+        // A hand-edited file that hides every column falls back to defaults.
         let all_hidden: BTreeMap<String, bool> = COLUMNS
             .iter()
             .map(|c| (c.id().to_string(), false))
@@ -4000,6 +4143,8 @@ mod tests {
         s.apply_saved_prefs(Some(&all_hidden), None);
         assert!(!s.visible.is_empty(), "defaults survive an empty override");
 
+        // Hiding the current sort column via prefs falls back to a visible
+        // one, same as hiding it through the dialog.
         let mut s2 = State {
             sort_col: ColumnId::Uac,
             ..State::default()
