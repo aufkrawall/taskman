@@ -1,0 +1,1646 @@
+//! UI chrome of the root app: top search bar, navigation rail (hamburger
+//! collapsible), per-tab command header, dialogs, toasts. Fully localized
+//! (DE/EN) via tm-core::i18n.
+
+use eframe::egui::{self, Align2, Color32, CornerRadius, FontId, Pos2, Rect, Sense, Stroke};
+use tm_core::i18n::{self, K};
+use tm_core::settings::{RenderMode, Settings, TextSmoothing, ThemeMode};
+
+use crate::app::TaskManApp;
+use crate::icons;
+use crate::icons::Icon;
+use crate::theme::{self, Palette};
+
+pub fn apply_theme(ctx: &egui::Context, mode: ThemeMode) {
+    ctx.set_theme(match mode {
+        ThemeMode::System => egui::ThemePreference::System,
+        ThemeMode::Light => egui::ThemePreference::Light,
+        ThemeMode::Dark => egui::ThemePreference::Dark,
+    });
+}
+
+pub const SIDEBAR_W: f32 = 212.0;
+pub const SIDEBAR_W_COLLAPSED: f32 = 54.0;
+
+// ---------------------------------------------------------------- top search
+
+/// Centered search field spanning the top of the window. The blank strip on
+/// either side behaves as an additional native titlebar drag region while the
+/// search box remains a normal interactive text control.
+///
+/// This strip fills with `window_bg`, which is also what the native caption
+/// directly above it is painted with (`TaskManApp::sync_title_bar`) — the two
+/// are meant to read as one surface.
+pub fn top_search_panel(app: &mut TaskManApp, ui_root: &mut egui::Ui, pal: &Palette) {
+    egui::Panel::top(egui::Id::new("topsearch"))
+        .resizable(false)
+        .frame(
+            egui::Frame::NONE
+                .fill(pal.window_bg)
+                .inner_margin(egui::Margin::symmetric(0, 6)),
+        )
+        .show(ui_root, |ui| {
+            let box_w = 495.0f32.min(ui.available_width() * 0.7);
+            let x = (ui.available_width() - box_w) / 2.0;
+            let (rect, _) =
+                ui.allocate_exact_size(egui::vec2(ui.available_width(), 34.0), Sense::hover());
+            let box_rect = Rect::from_min_size(
+                Pos2::new(rect.left() + x, rect.top()),
+                egui::vec2(box_w, 34.0),
+            );
+
+            // Register only the blank left/right pieces as drag handles. Do
+            // not put a transparent drag widget over the search box: that
+            // would steal focus, text selection and double-click gestures.
+            let left_drag = Rect::from_min_max(rect.min, Pos2::new(box_rect.left(), rect.bottom()));
+            let right_drag = Rect::from_min_max(Pos2::new(box_rect.right(), rect.top()), rect.max);
+            for (id, drag_rect) in [("top-drag-left", left_drag), ("top-drag-right", right_drag)] {
+                if drag_rect.width() > 0.0 {
+                    titlebar_drag_region(ui, egui::Id::new(id), drag_rect);
+                }
+            }
+
+            ui.painter().rect_filled(box_rect, 16.0, pal.card_bg);
+            ui.painter().rect_stroke(
+                box_rect,
+                16.0,
+                Stroke::new(1.0, pal.stroke),
+                egui::StrokeKind::Inside,
+            );
+            crate::icons::draw_at(
+                ui,
+                Rect::from_center_size(
+                    Pos2::new(box_rect.left() + 18.0, box_rect.center().y),
+                    egui::vec2(15.0, 15.0),
+                ),
+                Icon::Search,
+                pal.text_dim,
+            );
+
+            // The clear button only exists while there is something to clear,
+            // so the field's text never has to end short of the rounded edge
+            // for a control that is not there.
+            let has_text = !app.search.is_empty();
+            let clear_rect = Rect::from_center_size(
+                Pos2::new(box_rect.right() - 18.0, box_rect.center().y),
+                egui::vec2(24.0, 24.0),
+            );
+            let text_right = if has_text {
+                clear_rect.left() - 4.0
+            } else {
+                box_rect.right() - 10.0
+            };
+
+            let edit_rect = Rect::from_min_max(
+                Pos2::new(box_rect.left() + 34.0, box_rect.top() + 3.0),
+                Pos2::new(text_right, box_rect.bottom() - 3.0),
+            );
+            let mut edit_ui = ui.new_child(
+                egui::UiBuilder::new()
+                    .max_rect(edit_rect)
+                    .layout(egui::Layout::left_to_right(egui::Align::Center)),
+            );
+            let edit = edit_ui.add(
+                egui::TextEdit::singleline(&mut app.search)
+                    .hint_text(i18n::tr(K::SearchHint))
+                    .font(FontId::proportional(15.0))
+                    .frame(egui::Frame::NONE)
+                    .desired_width(edit_rect.width())
+                    .id(egui::Id::new("global-search")),
+            );
+
+            if has_text {
+                let resp = ui
+                    .interact(
+                        clear_rect,
+                        egui::Id::new("global-search-clear"),
+                        Sense::click(),
+                    )
+                    .on_hover_text(i18n::tr(K::ClearSearch));
+                if resp.hovered() {
+                    ui.painter()
+                        .circle_filled(clear_rect.center(), 11.0, pal.card_bg_hover);
+                }
+                crate::icons::draw_at(
+                    ui,
+                    Rect::from_center_size(clear_rect.center(), egui::vec2(11.0, 11.0)),
+                    Icon::Close,
+                    if resp.hovered() {
+                        pal.text
+                    } else {
+                        pal.text_dim
+                    },
+                );
+                if resp.clicked() {
+                    app.search.clear();
+                }
+            }
+
+            // Escape clears rather than only unfocusing: with the field empty
+            // it is the same keystroke that leaves it, and a stale filter is
+            // the one thing a user cannot see the cause of.
+            if edit.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                app.search.clear();
+            }
+        });
+}
+
+/// Make `rect` behave like the native title bar: press-and-move drags the
+/// window, double-click maximizes/restores it.
+///
+/// The window move starts on the BUTTON PRESS, not on egui's `drag_started()`.
+/// egui only reports a drag once the pointer has travelled past its drag
+/// threshold, and everything up to that point is movement the window did not
+/// follow — so the window jumped to catch up the moment the drag was
+/// recognized, and dragging here felt worse than dragging the real caption.
+/// `StartDrag` hands the gesture to the window manager, which then owns the
+/// whole move, so issuing it early costs nothing.
+fn titlebar_drag_region(ui: &egui::Ui, id: egui::Id, rect: Rect) {
+    /// Double-click window, in seconds. Windows' own is configurable
+    /// (`SPI_GETDOUBLECLICKTIME`, 500 ms by default); this only decides
+    /// between "maximize" and "move", so the default is close enough.
+    const DOUBLE_CLICK_S: f64 = 0.5;
+
+    let resp = ui.interact(rect, id, Sense::click_and_drag());
+    let (pressed, now, pos) = ui.input(|i| {
+        (
+            i.pointer.primary_pressed(),
+            i.time,
+            i.pointer.interact_pos(),
+        )
+    });
+    if !pressed || !resp.contains_pointer() {
+        return;
+    }
+
+    // Double-click is detected here rather than through `Response`: handing
+    // the gesture to the window manager below ends egui's view of the press,
+    // so its own click/double-click bookkeeping never completes.
+    let previous = ui.ctx().data(|d| d.get_temp::<(f64, Pos2)>(id));
+    let position = pos.unwrap_or(rect.center());
+    ui.ctx().data_mut(|d| d.insert_temp(id, (now, position)));
+    if let Some((last, last_pos)) = previous
+        && now - last <= DOUBLE_CLICK_S
+        && last_pos.distance(position) <= 8.0
+    {
+        let maximized = ui.input(|i| i.viewport().maximized.unwrap_or(false));
+        ui.ctx()
+            .send_viewport_cmd(egui::ViewportCommand::Maximized(!maximized));
+        return;
+    }
+
+    ui.ctx().send_viewport_cmd(egui::ViewportCommand::StartDrag);
+}
+
+// ---------------------------------------------------------------- sidebar
+
+pub fn sidebar(app: &mut TaskManApp, ui_root: &mut egui::Ui, pal: &Palette) {
+    let collapsed = app.shared.settings.sidebar_collapsed;
+    let w = if collapsed {
+        SIDEBAR_W_COLLAPSED
+    } else {
+        SIDEBAR_W
+    };
+    egui::Panel::left(egui::Id::new("nav"))
+        .resizable(false)
+        .min_size(w)
+        .max_size(w)
+        .frame(
+            egui::Frame::NONE
+                .fill(pal.sidebar_bg)
+                .inner_margin(egui::Margin {
+                    left: 8,
+                    right: 8,
+                    top: 4,
+                    bottom: 8,
+                }),
+        )
+        .show(ui_root, |ui| {
+            if icon_button(ui, pal, Icon::Hamburger, 32.0, collapsed) {
+                app.shared.settings.sidebar_collapsed = !collapsed;
+                app.shared.settings.save();
+            }
+            ui.add_space(8.0);
+
+            for tab in crate::app::Tab::ALL {
+                let selected = app.tab == tab;
+                let resp = nav_item(ui, pal, tab.icon(), tab.label(), selected, collapsed);
+                if resp.clicked() {
+                    app.tab = tab;
+                }
+                if collapsed && resp.hovered() {
+                    resp.on_hover_text(tab.label());
+                }
+            }
+
+            ui.add_space(ui.available_height() - 36.0);
+            let resp = nav_item(
+                ui,
+                pal,
+                Icon::Settings,
+                i18n::tr(K::Settings),
+                false,
+                collapsed,
+            );
+            if resp.clicked() {
+                app.show_settings = true;
+            }
+            if collapsed && resp.hovered() {
+                resp.on_hover_text(i18n::tr(K::Settings));
+            }
+        });
+}
+
+fn nav_item(
+    ui: &mut egui::Ui,
+    pal: &Palette,
+    icon: Icon,
+    label: &str,
+    selected: bool,
+    collapsed: bool,
+) -> egui::Response {
+    let h = 38.0;
+    let (rect, resp) = ui.allocate_exact_size(
+        egui::vec2(ui.available_width(), h),
+        Sense::click().union(Sense::hover()),
+    );
+    let painter = ui.painter();
+    if selected {
+        painter.rect_filled(
+            rect,
+            4.0,
+            Color32::from_white_alpha(if pal.sidebar_bg == theme::LIGHT.sidebar_bg {
+                255 - 30
+            } else {
+                26
+            }),
+        );
+        let bar = Rect::from_min_size(
+            Pos2::new(rect.left(), rect.center().y - 9.0),
+            egui::vec2(3.0, 18.0),
+        );
+        painter.rect_filled(bar, 2.0, pal.accent);
+    } else if resp.hovered() {
+        painter.rect_filled(rect, 4.0, Color32::from_white_alpha(10));
+    }
+
+    if collapsed {
+        let icon_rect = Rect::from_center_size(rect.center(), egui::vec2(20.0, 20.0));
+        icons::draw_at(ui, icon_rect, icon, pal.text);
+    } else {
+        let icon_rect = Rect::from_center_size(
+            Pos2::new(rect.left() + 22.0, rect.center().y),
+            egui::vec2(20.0, 20.0),
+        );
+        icons::draw_at(ui, icon_rect, icon, pal.text);
+        painter.text(
+            Pos2::new(rect.left() + 42.0, rect.center().y),
+            Align2::LEFT_CENTER,
+            label,
+            FontId::proportional(15.0),
+            pal.text,
+        );
+    }
+    resp
+}
+
+fn icon_button(ui: &mut egui::Ui, pal: &Palette, icon: Icon, size: f32, center: bool) -> bool {
+    let w = if center {
+        ui.available_width().max(size)
+    } else {
+        size
+    };
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(w, size), Sense::click());
+    if resp.hovered() {
+        let hover = if center {
+            Rect::from_center_size(rect.center(), egui::vec2(size, size))
+        } else {
+            rect
+        };
+        ui.painter()
+            .rect_filled(hover, 4.0, Color32::from_white_alpha(12));
+    }
+    crate::icons::draw_at(
+        ui,
+        Rect::from_center_size(rect.center(), egui::vec2(18.0, 18.0)),
+        icon,
+        pal.text,
+    );
+    resp.clicked()
+}
+
+// ---------------------------------------------------------------- tab header
+
+pub fn tab_header(
+    app: &mut TaskManApp,
+    ui: &mut egui::Ui,
+    pal: &Palette,
+    extra: impl FnOnce(&mut TaskManApp, &mut egui::Ui),
+    menu: impl FnOnce(&mut TaskManApp, &mut egui::Ui),
+) {
+    let title = app.tab.label();
+    // How many rows a multi-select command would act on. The toolbar buttons
+    // are the same size either way, so without this the difference between
+    // ending one process and ending thirty is invisible until the dialog.
+    let selected = matches!(
+        app.tab,
+        crate::app::Tab::Processes | crate::app::Tab::Details
+    )
+    .then(|| app.selection.len())
+    .filter(|count| *count > 1);
+    ui.horizontal(|ui| {
+        ui.add_space(16.0);
+        ui.label(egui::RichText::new(title).size(15.5).strong());
+        if let Some(count) = selected {
+            ui.add_space(10.0);
+            ui.label(
+                egui::RichText::new(i18n::trf(K::SelectedCount, &[&count.to_string()]))
+                    .size(12.5)
+                    .color(pal.text_dim),
+            );
+        }
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            ui.add_space(8.0);
+            ellipsis_menu(app, ui, pal, menu);
+            extra(app, ui);
+            vsep(ui, pal);
+            #[cfg(target_os = "windows")]
+            {
+                if cmd_button(
+                    ui,
+                    pal,
+                    Icon::OpenExternal,
+                    i18n::tr(K::WindowsTaskManager),
+                    true,
+                ) {
+                    let actions = app.actions.clone();
+                    let ctx = ui.ctx().clone();
+                    app.run_action(
+                        &ctx,
+                        || i18n::tr(K::WindowsTaskManagerStarted).to_string(),
+                        move || actions.launch_native_task_manager(),
+                    );
+                }
+                vsep(ui, pal);
+            }
+            if cmd_button(ui, pal, Icon::RunTask, i18n::tr(K::RunNewTask), true) {
+                app.run_dialog_open = true;
+            }
+        });
+        ui.add_space(4.0);
+    });
+    ui.add_space(2.0);
+}
+
+pub fn cmd_button(
+    ui: &mut egui::Ui,
+    pal: &Palette,
+    icon: Icon,
+    label: &str,
+    enabled: bool,
+) -> bool {
+    let text_w = ui
+        .painter()
+        .layout_no_wrap(label.to_owned(), FontId::proportional(13.0), Color32::WHITE)
+        .size()
+        .x;
+    let w = 28.0 + text_w + 6.0;
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(w, 30.0), Sense::click());
+    let mut clicked = false;
+    if enabled {
+        if resp.hovered() {
+            ui.painter().rect_filled(rect, 4.0, pal.card_bg_hover);
+        }
+        if resp.clicked() {
+            clicked = true;
+        }
+    }
+    let color = if enabled {
+        pal.text
+    } else {
+        pal.text_dim.gamma_multiply(0.55)
+    };
+    crate::icons::draw_at(
+        ui,
+        Rect::from_center_size(
+            Pos2::new(rect.left() + 14.0, rect.center().y),
+            egui::vec2(17.0, 17.0),
+        ),
+        icon,
+        color,
+    );
+    ui.painter().text(
+        Pos2::new(rect.left() + 28.0, rect.center().y),
+        Align2::LEFT_CENTER,
+        label,
+        FontId::proportional(13.0),
+        color,
+    );
+    clicked && enabled
+}
+
+pub fn vsep(ui: &mut egui::Ui, pal: &Palette) {
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(9.0, 26.0), Sense::hover());
+    ui.painter().line_segment(
+        [
+            Pos2::new(rect.center().x, rect.top() + 3.0),
+            Pos2::new(rect.center().x, rect.bottom() - 3.0),
+        ],
+        Stroke::new(1.0, pal.stroke),
+    );
+}
+
+pub fn ellipsis_menu(
+    app: &mut TaskManApp,
+    ui: &mut egui::Ui,
+    _pal: &Palette,
+    items: impl FnOnce(&mut TaskManApp, &mut egui::Ui),
+) {
+    crate::widgets::menu::menu_button(
+        ui,
+        egui::Button::new(egui::RichText::new("…").size(16.0)),
+        |ui| {
+            ui.set_min_width(180.0);
+            items(app, ui);
+        },
+    );
+}
+
+// ---------------------------------------------------------------- dialogs
+
+pub fn settings_dialog(app: &mut TaskManApp, ctx: &egui::Context, _pal: &theme::Palette) {
+    let mut open = true;
+    egui::Window::new(i18n::tr(K::Settings))
+        .open(&mut open)
+        .collapsible(false)
+        .resizable(true)
+        .default_size([420.0, 640.0])
+        .min_size([400.0, 360.0])
+        .vscroll(true)
+        .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
+        .show(ctx, |ui| {
+            ui.set_width(380.0);
+
+            ui.heading(i18n::tr(K::DesignHeading));
+            ui.horizontal(|ui| {
+                for (mode, key) in [
+                    (ThemeMode::System, K::ThemeSystem),
+                    (ThemeMode::Light, K::ThemeLight),
+                    (ThemeMode::Dark, K::ThemeDark),
+                ] {
+                    if ui
+                        .selectable_label(app.shared.settings.theme == mode, i18n::tr(key))
+                        .clicked()
+                    {
+                        app.shared.settings.theme = mode;
+                        apply_theme(ctx, mode);
+                        app.shared.settings.save();
+                    }
+                }
+            });
+
+            ui.add_space(10.0);
+            ui.heading(i18n::tr(K::UpdateSpeedHeading));
+            ui.horizontal_wrapped(|ui| {
+                for speed in [
+                    tm_core::settings::UpdateSpeed::High,
+                    tm_core::settings::UpdateSpeed::Normal,
+                    tm_core::settings::UpdateSpeed::Low,
+                    tm_core::settings::UpdateSpeed::Paused,
+                ] {
+                    let key = match speed {
+                        tm_core::settings::UpdateSpeed::High => K::SpdHigh,
+                        tm_core::settings::UpdateSpeed::Normal => K::SpdNormal,
+                        tm_core::settings::UpdateSpeed::Low => K::SpdLow,
+                        tm_core::settings::UpdateSpeed::Paused => K::SpdPaused,
+                    };
+                    if ui
+                        .selectable_label(app.shared.settings.update_speed == speed, i18n::tr(key))
+                        .clicked()
+                    {
+                        app.shared.settings.update_speed = speed;
+                        match speed {
+                            tm_core::settings::UpdateSpeed::Paused => app.engine.pause(),
+                            _ => {
+                                app.engine.resume();
+                                app.engine.set_interval(speed.interval());
+                            }
+                        }
+                        app.shared.settings.save();
+                    }
+                }
+            });
+
+            ui.add_space(10.0);
+            ui.heading(i18n::tr(K::LanguageLabel));
+            ui.horizontal(|ui| {
+                for (choice, label) in [
+                    (tm_core::i18n::LangChoice::System, i18n::tr(K::ThemeSystem)),
+                    (tm_core::i18n::LangChoice::De, "Deutsch"),
+                    (tm_core::i18n::LangChoice::En, "English"),
+                ] {
+                    if ui
+                        .selectable_label(app.shared.settings.language == choice, label)
+                        .clicked()
+                    {
+                        app.shared.settings.language = choice;
+                        i18n::set_lang(choice.resolve());
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Title(
+                            i18n::tr(K::WindowTitle).to_string(),
+                        ));
+                        app.shared.settings.save();
+                    }
+                }
+            });
+
+            ui.add_space(10.0);
+            ui.label(i18n::tr(K::DefaultStartPageLabel));
+            ui.horizontal_wrapped(|ui| {
+                for tab in crate::app::Tab::ALL {
+                    if ui
+                        .selectable_label(
+                            app.shared.settings.default_start_page == tab.key(),
+                            tab.label(),
+                        )
+                        .clicked()
+                    {
+                        app.shared.settings.default_start_page = tab.key().to_string();
+                        app.save_settings();
+                    }
+                }
+            });
+
+            ui.add_space(10.0);
+            ui.label(i18n::tr(K::TextSmoothingLabel));
+            ui.horizontal(|ui| {
+                for (mode, key) in [
+                    (TextSmoothing::Sharp, K::SmoothingSharp),
+                    (TextSmoothing::Standard, K::SmoothingStandard),
+                    (TextSmoothing::Smooth, K::SmoothingSmooth),
+                ] {
+                    if ui
+                        .selectable_label(
+                            app.shared.settings.text_smoothing == mode,
+                            i18n::tr(key),
+                        )
+                        .clicked()
+                    {
+                        app.shared.settings.text_smoothing = mode;
+                        // Two halves have to be re-pushed: the coverage ramp
+                        // lives in the visuals' text options, the grid-fitting
+                        // target in each face's FontTweak.
+                        theme::set_text_smoothing(mode);
+                        theme::refresh_text_rendering(ctx);
+                        crate::fonts::reapply(ctx);
+                        app.save_settings();
+                    }
+                }
+            });
+            ui.label(
+                egui::RichText::new(i18n::tr(K::TextSmoothingHint))
+                    .size(11.0)
+                    .color(_pal.text_dim),
+            );
+
+            ui.add_space(10.0);
+            ui.label(i18n::tr(K::RenderModeLabel));
+            ui.horizontal_wrapped(|ui| {
+                for (mode, key) in [
+                    (RenderMode::Auto, K::RenderAuto),
+                    (RenderMode::Compatibility, K::RenderCompat),
+                    (RenderMode::Software, K::RenderSoftware),
+                ] {
+                    if ui
+                        .selectable_label(app.shared.settings.render_mode == mode, i18n::tr(key))
+                        .clicked()
+                    {
+                        app.shared.settings.render_mode = mode;
+                        app.shared.settings.save();
+                    }
+                }
+            });
+            ui.label(
+                egui::RichText::new(i18n::tr(K::RenderModeHint))
+                    .size(11.0)
+                    .color(_pal.text_dim),
+            );
+            if app.shared.settings.render_mode == RenderMode::Software {
+                // Informational, not a warning: this used to select WARP, a D3D12 driver
+                // emulated on the CPU at ~3 fps. It now selects a native rasterizer, so
+                // the orange caution colour would be actively misleading.
+                ui.label(
+                    egui::RichText::new(i18n::tr(K::RenderSoftwareWarning))
+                        .size(11.0)
+                        .color(_pal.text_dim),
+                );
+            }
+            if app.shared.settings.render_mode != crate::active_render_mode() {
+                ui.label(
+                    egui::RichText::new(i18n::tr(K::RestartRequired))
+                        .size(11.0)
+                        .color(_pal.text_dim),
+                );
+            }
+
+            ui.add_space(10.0);
+            let mut on_top = app.shared.settings.always_on_top;
+            if crate::widgets::controls::checkbox(ui, &mut on_top, i18n::tr(K::AlwaysOnTop), _pal)
+                .changed()
+            {
+                app.shared.settings.always_on_top = on_top;
+                ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(if on_top {
+                    egui::WindowLevel::AlwaysOnTop
+                } else {
+                    egui::WindowLevel::Normal
+                }));
+                app.shared.settings.save();
+            }
+
+            let mut autosave = app.shared.settings.save_config;
+            if crate::widgets::controls::checkbox(
+                ui,
+                &mut autosave,
+                i18n::tr(K::SaveConfigAuto),
+                _pal,
+            )
+            .changed()
+            {
+                app.shared.settings.save_config = autosave;
+                app.save_settings_forced();
+            }
+
+            let mut remember = app.shared.settings.remember_window;
+            if crate::widgets::controls::checkbox(
+                ui,
+                &mut remember,
+                i18n::tr(K::RememberWindow),
+                _pal,
+            )
+            .changed()
+            {
+                app.shared.settings.remember_window = remember;
+                app.shared.settings.save();
+            }
+
+            #[cfg(target_os = "windows")]
+            {
+                let mut close_to_tray = app.shared.settings.close_to_tray;
+                if crate::widgets::controls::checkbox(
+                    ui,
+                    &mut close_to_tray,
+                    i18n::tr(K::CloseToTray),
+                    _pal,
+                )
+                .changed()
+                {
+                    app.shared.settings.close_to_tray = close_to_tray;
+                    app.save_settings();
+                }
+
+                let mut start_with_windows = app.shared.settings.start_with_windows;
+                if crate::widgets::controls::checkbox(
+                    ui,
+                    &mut start_with_windows,
+                    i18n::tr(K::StartWithWindows),
+                    _pal,
+                )
+                .changed()
+                {
+                    match app
+                        .actions
+                        .set_start_with_windows(start_with_windows, true)
+                    {
+                        Ok(()) => {
+                            app.shared.settings.start_with_windows = start_with_windows;
+                            app.save_settings();
+                        }
+                        Err(error) => app.shared.toast(i18n::trf(
+                            K::ErrMsg,
+                            &[&error.to_string()],
+                        )),
+                    }
+                }
+            }
+
+            ui.add_space(10.0);
+            ui.label(i18n::tr(K::GraphWindowLabel));
+            ui.horizontal(|ui| {
+                for secs in [30u32, 60, 120] {
+                    if ui
+                        .selectable_label(
+                            app.shared.settings.graph_seconds == secs,
+                            format!("{secs} s"),
+                        )
+                        .clicked()
+                    {
+                        app.shared.settings.graph_seconds = secs;
+                        app.shared.settings.save();
+                    }
+                }
+            });
+
+            ui.add_space(10.0);
+            ui.label(i18n::tr(K::ScaleLabel));
+            ui.horizontal(|ui| {
+                for (zoom, label) in [
+                    (0.8f32, "80 %"),
+                    (0.9, "90 %"),
+                    (1.0, "100 %"),
+                    (1.1, "110 %"),
+                    (1.25, "125 %"),
+                ] {
+                    if ui
+                        .selectable_label((app.shared.settings.ui_zoom - zoom).abs() < 0.01, label)
+                        .clicked()
+                    {
+                        app.shared.settings.ui_zoom = zoom;
+                        ctx.set_zoom_factor(zoom);
+                        app.shared.settings.save();
+                    }
+                }
+            });
+
+            #[cfg(target_os = "windows")]
+            {
+                use tm_platform::actions::{CoreServiceState, TaskManagerReplacementState};
+                ui.add_space(14.0);
+                ui.heading("Advanced");
+
+                ui.heading(i18n::tr(K::CoreServiceHeading));
+                app.poll_advanced_state(ctx);
+                let core_state = app.core_service_state.clone();
+                let state_text = match core_state.as_ref() {
+                    None => i18n::tr(K::CheckingAdvancedState).into(),
+                    Some(CoreServiceState::Unsupported) => {
+                        i18n::tr(K::CoreServiceNotInstalled).into()
+                    }
+                    Some(CoreServiceState::NotInstalled) => {
+                        i18n::tr(K::CoreServiceNotInstalled).into()
+                    }
+                    Some(CoreServiceState::Stopped) => i18n::tr(K::CoreServiceStopped).into(),
+                    Some(CoreServiceState::Starting) => i18n::tr(K::CoreServiceStarting).into(),
+                    Some(CoreServiceState::Running { version }) => {
+                        i18n::trf(K::CoreServiceRunning, &[version])
+                    }
+                    Some(CoreServiceState::ForeignClient) => {
+                        i18n::tr(K::CoreServiceForeignClient).into()
+                    }
+                    Some(CoreServiceState::Degraded(detail)) => {
+                        i18n::trf(K::CoreServiceDegraded, &[detail])
+                    }
+                };
+                ui.label(
+                    egui::RichText::new(state_text)
+                        .size(11.5)
+                        .color(_pal.text_dim),
+                );
+                let install = matches!(
+                    core_state,
+                    Some(
+                        CoreServiceState::NotInstalled
+                            | CoreServiceState::Stopped
+                            | CoreServiceState::Degraded(_)
+                    )
+                );
+                let supported = core_state
+                    .as_ref()
+                    .is_some_and(|state| {
+                        !matches!(
+                            state,
+                            CoreServiceState::Unsupported | CoreServiceState::Starting
+                        )
+                    })
+                    && !app
+                        .core_service_change_inflight
+                        .load(std::sync::atomic::Ordering::Acquire);
+                let button_key = match core_state.as_ref() {
+                    Some(CoreServiceState::NotInstalled) => K::InstallCoreService,
+                    Some(CoreServiceState::Stopped | CoreServiceState::Degraded(_)) => {
+                        K::RepairCoreService
+                    }
+                    Some(CoreServiceState::ForeignClient) => K::SwitchToInstalledCoreService,
+                    _ => K::RemoveCoreService,
+                };
+                let foreign = matches!(core_state.as_ref(), Some(CoreServiceState::ForeignClient));
+                ui.horizontal(|ui| {
+                    if ui
+                        .add_enabled(supported, egui::Button::new(i18n::tr(button_key)))
+                        .clicked()
+                    {
+                        if foreign {
+                            // No reinstall can make a foreign image pass the
+                            // broker's client authorization; hand the session
+                            // to the installed GUI instead.
+                            dispatch_core_service_switch(app, ctx);
+                        } else {
+                            dispatch_core_service_change(app, ctx, install);
+                        }
+                    }
+                    if foreign {
+                        // Repair stays reachable: it is how a newer
+                        // portable/dev build upgrades the protected generation
+                        // before switching.
+                        if ui
+                            .add_enabled(
+                                supported,
+                                egui::Button::new(i18n::tr(K::RepairCoreService)),
+                            )
+                            .clicked()
+                        {
+                            dispatch_core_service_repair_and_switch(app, ctx);
+                        }
+                    }
+                });
+
+                ui.add_space(10.0);
+                if let Some(state) = app.task_manager_replacement_state.clone() {
+                    let mut replace = matches!(
+                        state,
+                        TaskManagerReplacementState::Enabled
+                            | TaskManagerReplacementState::Stale(_)
+                    );
+                    if crate::widgets::controls::checkbox(
+                        ui,
+                        &mut replace,
+                        "Replace Windows Task Manager",
+                        _pal,
+                    )
+                    .changed()
+                    {
+                        let actions = app.actions.clone();
+                        app.run_action(
+                            ctx,
+                            || "Task Manager integration requested".to_string(),
+                            move || actions.set_task_manager_replacement(replace),
+                        );
+                    }
+                    match state {
+                        TaskManagerReplacementState::Stale(value) => {
+                            // A registered path that no longer exists is not
+                            // a mismatch to live with: Windows cannot launch
+                            // it, so the hotkey opens nothing at all — the
+                            // built-in Task Manager included.
+                            let missing =
+                                tm_platform::win::replacement_target_missing(&value);
+                            ui.label(
+                                egui::RichText::new(if missing {
+                                    "Ctrl+Shift+Esc points at a Taskman that no longer exists and currently opens nothing."
+                                } else {
+                                    "Another Taskman installation is registered for Ctrl+Shift+Esc."
+                                })
+                                .size(11.5)
+                                .color(_pal.text_dim),
+                            );
+                            if ui.button("Repair").clicked() {
+                                let actions = app.actions.clone();
+                                app.run_action(
+                                    ctx,
+                                    || "Task Manager integration requested".to_string(),
+                                    move || actions.set_task_manager_replacement(true),
+                                );
+                            }
+                        }
+                        TaskManagerReplacementState::Conflict(value) => {
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "Another application currently replaces Task Manager: {value}"
+                                ))
+                                .size(11.5)
+                                .color(_pal.text_dim),
+                            );
+                        }
+                        _ => {}
+                    }
+                } else {
+                    ui.label(i18n::tr(K::CheckingAdvancedState));
+                }
+
+                ui.add_space(10.0);
+                ui.heading(i18n::tr(K::ElevatedHeading));
+                ui.label(
+                    egui::RichText::new(if app.is_elevated {
+                        i18n::tr(K::ElevatedRunning)
+                    } else {
+                        i18n::tr(K::ElevatedNotRunning)
+                    })
+                    .size(11.5)
+                    .color(_pal.text_dim),
+                );
+                if !app.is_elevated && ui.button(i18n::tr(K::RestartElevated)).clicked() {
+                    let actions = app.actions.clone();
+                    let close_ctx = ctx.clone();
+                    app.run_action(
+                        ctx,
+                        || i18n::tr(K::RelaunchElevatedToast).to_string(),
+                        move || {
+                            actions.relaunch_elevated()?;
+                            // ShellExecuteExW returns only after UAC consent
+                            // succeeded and the elevated instance is spawning;
+                            // shut this one down gracefully so on_exit flushes
+                            // settings and history. A declined prompt surfaces
+                            // as an error toast instead.
+                            crate::request_programmatic_exit();
+                            close_ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                            Ok(())
+                        },
+                    );
+                }
+                let mut start_elevated = app.shared.settings.start_elevated;
+                if crate::widgets::controls::checkbox(
+                    ui,
+                    &mut start_elevated,
+                    i18n::tr(K::StartElevated),
+                    _pal,
+                )
+                .changed()
+                {
+                    // Policy for FUTURE launches: startup re-execs elevated
+                    // when unelevated (main.rs); the current session is not
+                    // touched — use the restart button above to elevate now.
+                    app.shared.settings.start_elevated = start_elevated;
+                    app.shared.settings.save();
+                }
+            }
+
+            ui.add_space(14.0);
+            ui.separator();
+            ui.horizontal(|ui| {
+                if ui.button(i18n::tr(K::ResetColWidths)).clicked() {
+                    app.shared.settings.col_widths.clear();
+                    app.save_settings();
+                    app.shared.toast(i18n::tr(K::ColWidthsResetToast));
+                }
+                if ui.button(i18n::tr(K::Reset)).clicked() {
+                    #[cfg_attr(not(target_os = "windows"), allow(unused_mut))]
+                    let mut defaults = Settings::default();
+                    #[cfg(target_os = "windows")]
+                    if let Err(error) = app.actions.set_start_with_windows(false, true)
+                    {
+                        // The registry is authoritative for autostart. If it
+                        // could not be cleared, keep the matching setting and
+                        // surface the mismatch instead of claiming a reset.
+                        defaults.start_with_windows = app.shared.settings.start_with_windows;
+                        app.shared
+                            .toast(i18n::trf(K::ErrMsg, &[&error.to_string()]));
+                    }
+                    apply_theme(ctx, defaults.theme);
+                    theme::set_text_smoothing(defaults.text_smoothing);
+                    theme::refresh_text_rendering(ctx);
+                    crate::fonts::reapply(ctx);
+                    ctx.set_zoom_factor(defaults.ui_zoom);
+                    app.engine.resume();
+                    app.engine.set_interval(defaults.update_speed.interval());
+                    i18n::set_lang(defaults.language.resolve());
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Title(
+                        i18n::tr(K::WindowTitle).to_string(),
+                    ));
+                    let keep_autosave = app.shared.settings.save_config;
+                    app.shared.settings = defaults;
+                    app.shared.settings.save_config = keep_autosave;
+                    app.save_settings_forced();
+                }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.button(i18n::tr(K::Close)).clicked() {
+                        app.show_settings = false;
+                        app.save_settings_forced();
+                    }
+                });
+            });
+        });
+    if !open {
+        app.show_settings = false;
+    }
+}
+
+/// Confirmation for the Delete-key shortcut and for any termination that
+/// covers more than one selected row. A single-row toolbar or context-menu
+/// termination retains its native one-click behavior.
+pub fn process_end_dialog(app: &mut TaskManApp, ctx: &egui::Context) {
+    let Some(pending) = app.pending_process_end.clone() else {
+        return;
+    };
+    let mut open = true;
+    let focus_id = egui::Id::new("end_task_dialog_focus_end");
+    let mut end_focused: bool = ctx.data(|d| d.get_temp(focus_id)).unwrap_or(true);
+
+    let mut decision = None;
+    let escape = ctx.input_mut(|input| input.consume_key(Default::default(), egui::Key::Escape));
+    let enter = ctx.input_mut(|input| input.consume_key(Default::default(), egui::Key::Enter));
+    let space = ctx.input_mut(|input| input.consume_key(Default::default(), egui::Key::Space));
+    let shift_tab =
+        ctx.input_mut(|input| input.consume_key(egui::Modifiers::SHIFT, egui::Key::Tab));
+    let tab = ctx.input_mut(|input| input.consume_key(Default::default(), egui::Key::Tab));
+    let left = ctx.input_mut(|input| input.consume_key(Default::default(), egui::Key::ArrowLeft));
+    let right = ctx.input_mut(|input| input.consume_key(Default::default(), egui::Key::ArrowRight));
+
+    end_focused = update_end_task_dialog_focus(end_focused, tab, shift_tab, left, right);
+
+    if escape {
+        decision = Some(false);
+    } else if enter || space {
+        decision = Some(end_focused);
+    }
+
+    egui::Window::new(i18n::tr(K::EndTask))
+        .open(&mut open)
+        .collapsible(false)
+        .resizable(false)
+        .anchor(Align2::CENTER_CENTER, [0.0, -40.0])
+        .show(ctx, |ui| {
+            ui.set_width(400.0);
+            let pal = crate::theme::palette_ctx(ctx);
+            match pending.targets.as_slice() {
+                [(identity, name)] => {
+                    ui.label(i18n::trf(
+                        K::EndProcessConfirm,
+                        &[name, &identity.pid.to_string()],
+                    ));
+                }
+                targets => {
+                    ui.label(i18n::trf(
+                        K::EndProcessesConfirm,
+                        &[&targets.len().to_string()],
+                    ));
+                    ui.add_space(8.0);
+                    let box_stroke = egui::Stroke::new(
+                        1.0,
+                        if ui.visuals().dark_mode {
+                            Color32::from_rgb(0x3e, 0x3e, 0x3e)
+                        } else {
+                            Color32::from_rgb(0xd8, 0xd8, 0xd8)
+                        },
+                    );
+                    let box_bg = if ui.visuals().dark_mode {
+                        Color32::from_rgb(0x1f, 0x1f, 0x1f)
+                    } else {
+                        Color32::from_rgb(0xf5, 0xf5, 0xf5)
+                    };
+                    egui::Frame::NONE
+                        .fill(box_bg)
+                        .stroke(box_stroke)
+                        .corner_radius(CornerRadius::same(4))
+                        .inner_margin(egui::Margin::symmetric(10, 6))
+                        .show(ui, |ui| {
+                            egui::ScrollArea::vertical()
+                                .max_height(168.0)
+                                .auto_shrink([false, true])
+                                .show(ui, |ui| {
+                                    ui.spacing_mut().item_spacing.y = 3.0;
+                                    for (identity, name) in targets {
+                                        ui.horizontal(|ui| {
+                                            ui.label(name);
+                                            ui.with_layout(
+                                                egui::Layout::right_to_left(egui::Align::Center),
+                                                |ui| {
+                                                    ui.label(
+                                                        egui::RichText::new(format!(
+                                                            "PID {}",
+                                                            identity.pid
+                                                        ))
+                                                        .color(pal.text_dim),
+                                                    );
+                                                },
+                                            );
+                                        });
+                                    }
+                                });
+                        });
+                }
+            }
+            ui.add_space(12.0);
+
+            let btn_size = egui::vec2(85.0, 24.0);
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let mut end_btn = egui::Button::new(
+                    egui::RichText::new(i18n::tr(K::EndTask))
+                        .color(pal.accent_text)
+                        .strong(),
+                )
+                .min_size(btn_size)
+                .fill(pal.accent);
+                if end_focused {
+                    end_btn = end_btn.stroke(egui::Stroke::new(2.0, Color32::WHITE));
+                }
+                let end_resp = ui.add(end_btn);
+
+                ui.add_space(8.0);
+
+                let mut cancel_btn = egui::Button::new(i18n::tr(K::Cancel)).min_size(btn_size);
+                if !end_focused {
+                    cancel_btn = cancel_btn.stroke(egui::Stroke::new(2.0, pal.accent));
+                }
+                let cancel_resp = ui.add(cancel_btn);
+
+                // Mouse dragging selection: keeping mouse pressed and moving over buttons changes selection
+                if ctx.input(|i| i.pointer.primary_down()) {
+                    if cancel_resp.hovered() {
+                        end_focused = false;
+                    } else if end_resp.hovered() {
+                        end_focused = true;
+                    }
+                }
+
+                if cancel_resp.clicked() {
+                    decision = Some(false);
+                } else if end_resp.clicked() {
+                    decision = Some(true);
+                }
+
+                if end_focused {
+                    end_resp.request_focus();
+                } else {
+                    cancel_resp.request_focus();
+                }
+            });
+        });
+
+    ctx.data_mut(|d| d.insert_temp(focus_id, end_focused));
+
+    if !open {
+        decision = Some(false);
+    }
+    if let Some(confirm) = decision {
+        ctx.data_mut(|d| d.remove_temp::<bool>(focus_id));
+        app.pending_process_end = None;
+        if confirm {
+            app.end_process_batch(ctx, pending.targets, pending.tree);
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum RunTaskDialogFocus {
+    #[default]
+    Command,
+    Elevated,
+    Cancel,
+    Browse,
+    Ok,
+}
+
+impl RunTaskDialogFocus {
+    fn next(self, backwards: bool) -> Self {
+        use RunTaskDialogFocus::*;
+        const ORDER: [RunTaskDialogFocus; 5] = [Command, Elevated, Cancel, Browse, Ok];
+        let index = ORDER
+            .iter()
+            .position(|candidate| *candidate == self)
+            .expect("known run-dialog focus target");
+        let next = if backwards {
+            (index + ORDER.len() - 1) % ORDER.len()
+        } else {
+            (index + 1) % ORDER.len()
+        };
+        ORDER[next]
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RunTaskDialogAction {
+    Submit,
+    Cancel,
+    Browse,
+    ToggleElevated,
+}
+
+/// Native-dialog keyboard semantics: Enter activates the focused push button,
+/// otherwise it invokes the default OK action. Space toggles the checkbox or
+/// activates a focused push button, but remains ordinary text in the command
+/// field.
+fn run_task_dialog_key_action(
+    focus: RunTaskDialogFocus,
+    enter: bool,
+    space: bool,
+) -> Option<RunTaskDialogAction> {
+    if enter {
+        return Some(match focus {
+            RunTaskDialogFocus::Cancel => RunTaskDialogAction::Cancel,
+            RunTaskDialogFocus::Browse => RunTaskDialogAction::Browse,
+            RunTaskDialogFocus::Command | RunTaskDialogFocus::Elevated | RunTaskDialogFocus::Ok => {
+                RunTaskDialogAction::Submit
+            }
+        });
+    }
+    if space {
+        return match focus {
+            RunTaskDialogFocus::Command => None,
+            RunTaskDialogFocus::Elevated => Some(RunTaskDialogAction::ToggleElevated),
+            RunTaskDialogFocus::Cancel => Some(RunTaskDialogAction::Cancel),
+            RunTaskDialogFocus::Browse => Some(RunTaskDialogAction::Browse),
+            RunTaskDialogFocus::Ok => Some(RunTaskDialogAction::Submit),
+        };
+    }
+    None
+}
+
+pub fn run_task_dialog(app: &mut TaskManApp, ctx: &egui::Context, _pal: &theme::Palette) {
+    let focus_id = egui::Id::new("run-task-dialog-focus");
+    let mut focus = ctx
+        .data(|data| data.get_temp::<RunTaskDialogFocus>(focus_id))
+        .unwrap_or_default();
+
+    // Own the dialog's focus traversal instead of requesting text focus every
+    // frame. The old unconditional `request_focus()` made Tab immediately snap
+    // back into the command field and made Enter depend on `lost_focus()`.
+    let shift_tab =
+        ctx.input_mut(|input| input.consume_key(egui::Modifiers::SHIFT, egui::Key::Tab));
+    let tab = ctx.input_mut(|input| input.consume_key(Default::default(), egui::Key::Tab));
+    if shift_tab || tab {
+        focus = focus.next(shift_tab);
+    }
+
+    let escape = ctx.input_mut(|input| input.consume_key(Default::default(), egui::Key::Escape));
+    let enter = ctx.input_mut(|input| input.consume_key(Default::default(), egui::Key::Enter));
+    // Do not consume Space while editing the command line.
+    let space = focus != RunTaskDialogFocus::Command
+        && ctx.input_mut(|input| input.consume_key(Default::default(), egui::Key::Space));
+    let mut action = if escape {
+        Some(RunTaskDialogAction::Cancel)
+    } else {
+        run_task_dialog_key_action(focus, enter, space)
+    };
+
+    let mut open = true;
+    egui::Window::new(i18n::tr(K::RunDialogTitle))
+        .open(&mut open)
+        .collapsible(false)
+        .resizable(false)
+        .anchor(Align2::CENTER_CENTER, [0.0, -40.0])
+        .show(ctx, |ui| {
+            ui.set_width(420.0);
+            ui.label(i18n::tr(K::RunPrompt));
+            ui.add_space(4.0);
+            let command = ui.add(
+                egui::TextEdit::singleline(&mut app.run_dialog_text)
+                    .hint_text(i18n::tr(K::RunHint))
+                    .desired_width(f32::INFINITY),
+            );
+            if command.clicked() {
+                focus = RunTaskDialogFocus::Command;
+            }
+            if focus == RunTaskDialogFocus::Command {
+                command.request_focus();
+            }
+
+            ui.add_space(4.0);
+            let elevated = crate::widgets::controls::checkbox(
+                ui,
+                &mut app.run_elevated,
+                i18n::tr(K::RunElevated),
+                _pal,
+            );
+            if elevated.clicked() {
+                focus = RunTaskDialogFocus::Elevated;
+            }
+            if focus == RunTaskDialogFocus::Elevated {
+                elevated.request_focus();
+            }
+
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                let mut cancel_button = egui::Button::new(i18n::tr(K::Cancel));
+                if focus == RunTaskDialogFocus::Cancel {
+                    cancel_button = cancel_button.stroke(egui::Stroke::new(1.5, _pal.accent));
+                }
+                let cancel = ui.add(cancel_button);
+                if cancel.clicked() {
+                    focus = RunTaskDialogFocus::Cancel;
+                    action = Some(RunTaskDialogAction::Cancel);
+                }
+                if focus == RunTaskDialogFocus::Cancel {
+                    cancel.request_focus();
+                }
+
+                let mut browse_button = egui::Button::new(i18n::tr(K::Browse));
+                if focus == RunTaskDialogFocus::Browse {
+                    browse_button = browse_button.stroke(egui::Stroke::new(1.5, _pal.accent));
+                }
+                let browse = ui.add(browse_button);
+                if browse.clicked() {
+                    focus = RunTaskDialogFocus::Browse;
+                    action = Some(RunTaskDialogAction::Browse);
+                }
+                if focus == RunTaskDialogFocus::Browse {
+                    browse.request_focus();
+                }
+
+                let can_submit = !app.run_dialog_text.trim().is_empty();
+                let mut ok_button = egui::Button::new(i18n::tr(K::Ok));
+                if focus == RunTaskDialogFocus::Ok {
+                    ok_button = ok_button.stroke(egui::Stroke::new(1.5, _pal.accent));
+                }
+                let ok = ui.add_enabled(can_submit, ok_button);
+                if ok.clicked() {
+                    focus = RunTaskDialogFocus::Ok;
+                    action = Some(RunTaskDialogAction::Submit);
+                }
+                if focus == RunTaskDialogFocus::Ok {
+                    ok.request_focus();
+                }
+            });
+        });
+
+    if !open {
+        action = Some(RunTaskDialogAction::Cancel);
+    }
+
+    match action {
+        Some(RunTaskDialogAction::Cancel) => {
+            app.run_dialog_open = false;
+        }
+        Some(RunTaskDialogAction::Browse) => {
+            if let Some(path) = rfd::FileDialog::new().pick_file() {
+                app.run_dialog_text = path.to_string_lossy().into_owned();
+                // A successful browse has completed the input step; make the
+                // default action the next keyboard stop rather than reopening
+                // the file picker on a second Enter.
+                focus = RunTaskDialogFocus::Ok;
+            }
+        }
+        Some(RunTaskDialogAction::ToggleElevated) => {
+            app.run_elevated = !app.run_elevated;
+        }
+        Some(RunTaskDialogAction::Submit) => {
+            if !app.run_dialog_text.trim().is_empty() {
+                let actions = app.actions.clone();
+                let cmdline = app.run_dialog_text.trim().to_string();
+                let elevated = app.run_elevated;
+                let toasts = app.shared.toasts.clone();
+                let spawned = std::thread::Builder::new()
+                    .name("tm-run".into())
+                    .spawn(move || {
+                        let result = actions.run_new_task_probe(&cmdline, elevated);
+                        let msg = match result {
+                            Ok(()) => i18n::trf(K::StartedMsg, &[&cmdline]),
+                            Err(error) => i18n::trf(K::ErrMsg, &[&error.to_string()]),
+                        };
+                        crate::app::toast_from(&toasts, msg);
+                    });
+                if spawned.is_err() {
+                    app.shared.toast(i18n::tr(K::LaunchFailed));
+                }
+                app.run_dialog_open = false;
+            } else {
+                focus = RunTaskDialogFocus::Command;
+            }
+        }
+        None => {}
+    }
+
+    if app.run_dialog_open {
+        ctx.data_mut(|data| data.insert_temp(focus_id, focus));
+    } else {
+        ctx.data_mut(|data| data.remove_temp::<RunTaskDialogFocus>(focus_id));
+    }
+}
+
+/// Dispatch the core-service install/remove change on an action lane. The
+/// inflight flag disables the buttons until the operation completes.
+#[cfg(target_os = "windows")]
+fn dispatch_core_service_change(app: &mut TaskManApp, ctx: &egui::Context, install: bool) {
+    let actions = app.actions.clone();
+    let inflight = app.core_service_change_inflight.clone();
+    inflight.store(true, std::sync::atomic::Ordering::Release);
+    let completion = inflight.clone();
+    let dispatched = app.run_action(
+        ctx,
+        move || {
+            i18n::tr(if install {
+                K::CoreServiceInstallRequested
+            } else {
+                K::CoreServiceRemoveRequested
+            })
+            .to_string()
+        },
+        move || {
+            let outcome = actions.set_core_service_installed(install);
+            completion.store(false, std::sync::atomic::Ordering::Release);
+            outcome
+        },
+    );
+    if !dispatched {
+        inflight.store(false, std::sync::atomic::Ordering::Release);
+    }
+}
+
+/// Dispatch a repair from a foreign session: install this build as the
+/// protected generation, then hand the session over to the installed copy —
+/// the running session's image path stays rejected until it switches, so a
+/// bare repair would leave the user in the same "not the installed client"
+/// state they tried to leave.
+#[cfg(target_os = "windows")]
+fn dispatch_core_service_repair_and_switch(app: &mut TaskManApp, ctx: &egui::Context) {
+    let actions = app.actions.clone();
+    let inflight = app.core_service_change_inflight.clone();
+    inflight.store(true, std::sync::atomic::Ordering::Release);
+    let completion = inflight.clone();
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let close_ctx = ctx.clone();
+    let dispatched = app.run_action(
+        ctx,
+        || i18n::tr(K::CoreServiceRepairSwitchRequested).to_string(),
+        move || {
+            actions.set_core_service_installed(true)?;
+            if actions.switch_to_installed_gui(&args)? {
+                crate::request_programmatic_exit();
+                close_ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+            completion.store(false, std::sync::atomic::Ordering::Release);
+            Ok(())
+        },
+    );
+    if !dispatched {
+        inflight.store(false, std::sync::atomic::Ordering::Release);
+    }
+}
+
+/// Dispatch the handover to the protected installed GUI. Shutting down
+/// gracefully lets on_exit flush settings and history while the installed
+/// replacement waits on the single-instance handoff.
+#[cfg(target_os = "windows")]
+fn dispatch_core_service_switch(app: &mut TaskManApp, ctx: &egui::Context) {
+    let actions = app.actions.clone();
+    let inflight = app.core_service_change_inflight.clone();
+    inflight.store(true, std::sync::atomic::Ordering::Release);
+    let completion = inflight.clone();
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let close_ctx = ctx.clone();
+    let dispatched = app.run_action(
+        ctx,
+        || i18n::tr(K::CoreServiceSwitchRequested).to_string(),
+        move || {
+            let switched = actions.switch_to_installed_gui(&args)?;
+            completion.store(false, std::sync::atomic::Ordering::Release);
+            if switched {
+                crate::request_programmatic_exit();
+                close_ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+            Ok(())
+        },
+    );
+    if !dispatched {
+        inflight.store(false, std::sync::atomic::Ordering::Release);
+    }
+}
+
+pub fn draw_toasts(app: &TaskManApp, ctx: &egui::Context) {
+    let mut toasts = tm_core::sync::lock(&app.shared.toasts);
+    toasts.retain(|t| t.born.elapsed() < crate::app::TOAST_TTL);
+    let mut y_offset = 0.0f32;
+    for toast in toasts.iter() {
+        let age = toast.born.elapsed().as_secs_f32();
+        let alpha = (((4.0f32 - age) * 255.0).clamp(90.0, 255.0)) as u8;
+        let id = egui::Id::new(("toast", toast.id));
+        egui::Area::new(id)
+            .anchor(Align2::RIGHT_BOTTOM, [-12.0, -12.0 - y_offset])
+            .order(egui::Order::Foreground)
+            .show(ctx, |ui| {
+                egui::Frame::window(ui.style())
+                    .fill(Color32::from_black_alpha(alpha.min(220)))
+                    .stroke(Stroke::new(1.0, theme::LIGHT.stroke))
+                    .inner_margin(egui::Margin::same(8))
+                    .show(ui, |ui| {
+                        ui.set_max_width(380.0);
+                        ui.label(
+                            egui::RichText::new(&toast.msg)
+                                .size(13.0)
+                                .color(Color32::from_white_alpha(alpha)),
+                        );
+                    });
+            });
+        y_offset += 46.0;
+    }
+}
+
+#[inline]
+pub(crate) fn update_end_task_dialog_focus(
+    current: bool,
+    tab: bool,
+    shift_tab: bool,
+    left: bool,
+    right: bool,
+) -> bool {
+    if shift_tab || tab {
+        !current
+    } else if left {
+        false
+    } else if right {
+        true
+    } else {
+        current
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn run_task_dialog_focus_cycles_forward_and_backward() {
+        use RunTaskDialogFocus::*;
+        assert_eq!(RunTaskDialogFocus::default(), Command);
+        let mut focus = Command;
+        for expected in [Elevated, Cancel, Browse, Ok, Command] {
+            focus = focus.next(false);
+            assert_eq!(focus, expected);
+        }
+        for expected in [Ok, Browse, Cancel, Elevated, Command] {
+            focus = focus.next(true);
+            assert_eq!(focus, expected);
+        }
+    }
+
+    #[test]
+    fn run_task_dialog_keyboard_actions_match_native_dialog_semantics() {
+        use RunTaskDialogAction as Action;
+        use RunTaskDialogFocus as Focus;
+        assert_eq!(
+            run_task_dialog_key_action(Focus::Command, true, false),
+            Some(Action::Submit)
+        );
+        assert_eq!(
+            run_task_dialog_key_action(Focus::Elevated, true, false),
+            Some(Action::Submit)
+        );
+        assert_eq!(
+            run_task_dialog_key_action(Focus::Cancel, true, false),
+            Some(Action::Cancel)
+        );
+        assert_eq!(
+            run_task_dialog_key_action(Focus::Browse, true, false),
+            Some(Action::Browse)
+        );
+        assert_eq!(
+            run_task_dialog_key_action(Focus::Ok, true, false),
+            Some(Action::Submit)
+        );
+        assert_eq!(
+            run_task_dialog_key_action(Focus::Elevated, false, true),
+            Some(Action::ToggleElevated)
+        );
+        assert_eq!(
+            run_task_dialog_key_action(Focus::Command, false, true),
+            None
+        );
+    }
+
+    #[test]
+    fn test_end_task_dialog_focus_keyboard_transitions() {
+        // Initially End task is focused (true).
+        let mut focus = true;
+
+        // Pressing Tab toggles focus to Cancel (false).
+        focus = update_end_task_dialog_focus(focus, true, false, false, false);
+        assert!(!focus);
+
+        // Releasing Tab on subsequent frame (no keys) MUST preserve Cancel focus (false).
+        focus = update_end_task_dialog_focus(focus, false, false, false, false);
+        assert!(!focus);
+
+        // Pressing Tab again toggles back to End task (true).
+        focus = update_end_task_dialog_focus(focus, true, false, false, false);
+        assert!(focus);
+
+        // Next frame preserves End task.
+        focus = update_end_task_dialog_focus(focus, false, false, false, false);
+        assert!(focus);
+
+        // Pressing Shift+Tab toggles to Cancel (false).
+        focus = update_end_task_dialog_focus(focus, false, true, false, false);
+        assert!(!focus);
+
+        // Pressing Left arrow explicitly focuses Cancel (left button).
+        focus = update_end_task_dialog_focus(focus, false, false, true, false);
+        assert!(!focus);
+
+        // Pressing Right arrow explicitly focuses End task (right button).
+        focus = update_end_task_dialog_focus(focus, false, false, false, true);
+        assert!(focus);
+    }
+
+    #[test]
+    fn test_end_task_dialog_focus_persistence_in_context() {
+        let ctx = egui::Context::default();
+        let focus_id = egui::Id::new("end_task_dialog_focus_end");
+
+        // Frame 1: Initial dialog opening defaults to End task (true).
+        let mut focus: bool = ctx.data(|d| d.get_temp(focus_id)).unwrap_or(true);
+        assert!(focus);
+
+        // User pressed Tab.
+        focus = update_end_task_dialog_focus(focus, true, false, false, false);
+        ctx.data_mut(|d| d.insert_temp(focus_id, focus));
+        assert!(!focus);
+
+        // Frame 2: Next tick without keys, must stay on Cancel.
+        let mut focus_frame2: bool = ctx.data(|d| d.get_temp(focus_id)).unwrap_or(true);
+        focus_frame2 = update_end_task_dialog_focus(focus_frame2, false, false, false, false);
+        ctx.data_mut(|d| d.insert_temp(focus_id, focus_frame2));
+        assert!(!focus_frame2);
+
+        // Frame 3: Dialog closes -> temp data removed.
+        ctx.data_mut(|d| d.remove_temp::<bool>(focus_id));
+        let reset = ctx.data(|d| d.get_temp::<bool>(focus_id));
+        assert_eq!(reset, None);
+    }
+}
