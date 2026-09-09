@@ -15,11 +15,49 @@ diagnostics; remaining telemetry and accessibility work is itemized precisely
 in `known-debt.md`. Normal GUI startup remains unelevated; privileged controls
 can cross a protected, allowlisted service boundary after one explicit install.
 
+## Recently landed (2026-09-09 — native-aligned classification, service names, user identity)
+
+- **Process classification follows native Task Manager's conservative rule.**
+  System = kernel pseudo-processes, core OS images (`svchost.exe`,
+  `csrss.exe`, `dwm.exe`, `conhost.exe`, ...) or `IsProcessCritical`;
+  everything else is Background unless it owns a visible window. WMI Provider
+  Host, SmartScreen, `fontdrvhost.exe`, `TextInputHost.exe`, `WUDFHost.exe`,
+  the shell brokers (`RuntimeBroker`, `dllhost`, `taskhostw`, `sihost`) and
+  windowless `powershell.exe`/`cmd.exe` are Background again, matching a
+  side-by-side native screenshot. The Microsoft-publisher/Windows-path test
+  survives only as a spoof guard for core image names; the list lives once in
+  `tm_core::classify::is_core_os_image`, which the sampler's tree boundaries
+  and the Processes page share.
+- **Service hosts are named.** The SCM catalog maps PID → hosted service
+  display name(s) and PID → configured account. `svchost.exe` rows read
+  `Service Host: Windows Update`; the Windows section still collapses them
+  into one expandable `Service Host [N]` row (no per-service spam), whose
+  expanded children are individually named and whose tooltip lists every
+  hosted service. `ProcessEntry.service_name` is populated, so search and
+  Process Properties use it too.
+- **User identity is exact.** `process_ops::token_identity` returns the token
+  user SID alongside the account name; well-known accounts get one canonical
+  spelling (`SYSTEM`, `LOCAL SERVICE`, `NETWORK SERVICE`) regardless of OS
+  language, and session-0 hosts whose token cannot be opened take their account
+  from the SCM catalog instead of the old blanket "SYSTEM". Details gained an
+  optional **User SID** column and Process Properties a User SID row, so
+  `S-1-5-18`/`S-1-5-19`/`S-1-5-20` and `NT SERVICE\…` are distinguishable.
+- **UWP/Store apps are attributed to the app.** A visible
+  `ApplicationFrameWindow` is attributed to the process owning its hosted
+  `Windows.UI.Core.CoreWindow`; a cloaked frame with no hosted child (the ghost
+  left by a suspended app) is ignored, while the suspended app's own top-level
+  `CoreWindow` keeps it in Apps with status "Suspended". The shared
+  `ApplicationFrameHost.exe` broker no longer appears as an App row.
+- **Services → Go to details** navigates to the running process (the reverse of
+  the existing Processes → Go to service(s)).
+- Fixed pre-existing rustfmt drift in `app_ui.rs` and `explorer_restart.rs` so
+  the formatting gate is green.
+
 ## Recently landed (2026-09-01 — owners, multi-select, GPU engines, chrome)
 
 Ten reported gaps in one pass; `log/recent.md` carries the root causes.
 
-- **Process owners resolve natively.** `process_ops::token_user` reads
+- **Process owners resolve natively.** `process_ops::token_identity` reads
   `TokenUser` through `PROCESS_QUERY_LIMITED_INFORMATION` (memoized per SID,
   because `LookupAccountSidW` can reach a domain controller) and the kernel
   process table now supplies `session_id` for the protected processes no handle

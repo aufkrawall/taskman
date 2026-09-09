@@ -267,6 +267,20 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
                         ui.close();
                     }
                     menu::separator(ui);
+                    if let Some(pid) = s.pid
+                        && menu::item(ui, i18n::tr(K::GoToDetails)).clicked()
+                    {
+                        let start_epoch_s = app
+                            .latest_snapshot()
+                            .as_ref()
+                            .and_then(|snapshot| snapshot.process(pid))
+                            .and_then(|process| process.start_epoch_s);
+                        app.pending_details_focus = Some(crate::app::PendingDetailsFocus(
+                            crate::app::ProcessIdentity { pid, start_epoch_s },
+                        ));
+                        app.tab = crate::app::Tab::Details;
+                        ui.close();
+                    }
                     if menu::item(ui, i18n::tr(K::OpenServicesApp)).clicked() {
                         let _ = app.actions.run_new_task("services.msc", false);
                         ui.close();

@@ -20,10 +20,11 @@ The 2026 audit (`audit.md`) used six phases, but they are no longer cleanly
 keyboard, Performance visual, network-adapter, dump, and process-diagnostics
 items across Phases 2–6. The following concrete gaps remain:
 
-- **Column surface:** Details has the typed, persisted Select-columns catalog,
-  but Processes and Users still expose fixed column sets rather than every
-  native optional header-menu column. A shared cross-tab column registry is
-  still desirable when the missing telemetry providers below are added.
+- **Column surface:** Details has the typed, persisted Select-columns catalog
+  (now including an optional User SID column), but Processes and Users still
+  expose fixed column sets rather than every native optional header-menu
+  column. A shared cross-tab column registry is still desirable when the
+  missing telemetry providers below are added.
 - **Telemetry fidelity:** native SRUM App History;
   measured Startup Impact; packaged/MSIX startup tasks; full `.lnk` target
   resolution through `IShellLink`/`IPersistFile`; memory-composition
@@ -90,15 +91,6 @@ items across Phases 2–6. The following concrete gaps remain:
   and `with_transparent(true)` plus an alpha-aware clear on the wgpu/glow
   paths. Not attempted; it is a fork-level change that cannot be verified
   headlessly.
-
-- **`ProcessEntry.service_name` is never populated on Windows.** The field and
-  its consumers (search, and the single-service naming a Details/Processes row
-  could use) exist, but no collector fills it, so every `svchost.exe` row reads
-  as the same "Host Process for Windows Services". This is also why the
-  Processes page deliberately does NOT group service hosts into one row: the
-  individual rows are already indistinguishable, and hiding them behind a
-  chevron would remove the only way to reach them. Filling the field from the
-  services enumeration would fix both.
 
 - **Service upgrade over a RUNNING service fails.** `stop_service_for_upgrade`
   opens the live service process with `SYNCHRONIZE` to wait for its exit, and

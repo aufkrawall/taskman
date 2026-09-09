@@ -75,7 +75,8 @@ impl SystemCollector for MacCollector {
                 pid: pid_u,
                 name: &name,
                 has_window: false,
-                system_process: name == "kernel_task" || name == "launchd",
+                critical: None,
+                windows_owned: None,
             });
 
             let du = p.disk_usage();

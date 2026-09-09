@@ -96,12 +96,12 @@ impl SystemCollector for LinuxCollector {
             let name = p.name().to_string_lossy().into_owned();
 
             let has_window = window_owners.contains(&pid_u);
-            let kernel_thread = pid_u == 2 || name.starts_with('[');
             let category = classify::classify(classify::ClassifyInput {
                 pid: pid_u,
                 name: &name,
                 has_window,
-                system_process: kernel_thread,
+                critical: None,
+                windows_owned: None,
             });
 
             let du = p.disk_usage();

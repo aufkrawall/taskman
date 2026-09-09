@@ -80,8 +80,13 @@ struct PidAttrs {
     command_line: Option<String>,
     /// Owning account ("DOMAIN\\user" / "SYSTEM"); immutable after process
     /// start. sysinfo leaves this unset for every process it cannot open,
-    /// which is most of session 0 — see [`process_ops::token_user`].
+    /// which is most of session 0 — see [`process_ops::token_identity`].
     user: Option<String>,
+    /// String form of the token user SID; immutable like `user`.
+    user_sid: Option<String>,
+    /// `IsProcessCritical`; refreshed with the attribute TTL. Unknown is
+    /// never treated as critical by the classifier.
+    critical: Option<bool>,
     /// Process identity guard against PID reuse.
     start_epoch_s: Option<i64>,
     /// When these values were last queried natively.
@@ -253,11 +258,15 @@ impl Sampler {
         // The owning account cannot change while a process lives, so a TTL
         // refresh of the mutable attributes must not pay for the token +
         // account lookup again. Only a different identity forces a re-read.
-        let known_user = self
+        let (known_user, known_sid) = self
             .attrs
             .get(&pid)
             .filter(|a| a.start_epoch_s == start_epoch_s)
-            .and_then(|a| a.user.clone());
+            .map(|a| (a.user.clone(), a.user_sid.clone()))
+            .unwrap_or((None, None));
+        let identity = (known_user.is_none() || known_sid.is_none())
+            .then(|| process_ops::token_identity(pid))
+            .flatten();
         let security = if self.demand.wants(TelemetryDemand::TOKEN_SECURITY) {
             process_ops::token_security(pid)
         } else {
@@ -268,7 +277,9 @@ impl Sampler {
         };
         let fresh = PidAttrs {
             session_id: process_ops::session_id_of(pid),
-            user: known_user.or_else(|| process_ops::token_user(pid)),
+            user: known_user.or_else(|| identity.as_ref().map(|i| i.name.clone())),
+            user_sid: known_sid.or_else(|| identity.as_ref().and_then(|i| i.sid.clone())),
+            critical: process_ops::is_critical(pid),
             wow64: process_ops::is_wow64(pid),
             priority: process_ops::priority_class_of(pid),
             handles: process_ops::handle_count(pid),
@@ -609,6 +620,10 @@ impl Sampler {
             entry.disk_read_total = du.total_read_bytes;
             entry.disk_write_total = du.total_written_bytes;
             entry.has_window = has_window;
+            entry.service_name = service_catalog
+                .names_by_pid
+                .get(&pid_u)
+                .map(|names| names.join(", "));
             entry.exe_path = exe_owned;
             entry.threads = thread_counts
                 .get(&pid_u)
@@ -640,28 +655,8 @@ impl Sampler {
                 .or_else(|| self.cpu_load.handle_count_of(p.pid, p.start_epoch_s));
             let norm = p.name.to_ascii_lowercase();
             let stem = norm.strip_suffix(".exe").unwrap_or(&norm);
-            let is_kernel_or_system = p.pid == 0
-                || p.pid == 4
-                || matches!(
-                    stem,
-                    "[system process]"
-                        | "system"
-                        | "secure system"
-                        | "registry"
-                        | "memory compression"
-                        | "csrss"
-                        | "winlogon"
-                        | "fontdrvhost"
-                        | "dwm"
-                        | "smss"
-                        | "wininit"
-                        | "services"
-                        | "lsass"
-                        | "sihost"
-                        | "taskhostw"
-                        | "gameinputsvc"
-                        | "nvdisplay.container"
-                );
+            let is_kernel_or_system =
+                p.pid == 0 || p.pid == 4 || classify::is_core_os_image(&p.name);
 
             p.wow64 = a.wow64;
             if p.wow64.is_none() {
@@ -685,13 +680,23 @@ impl Sampler {
             p.uac_virtualization = a.uac_virtualization;
             p.power_throttled = a.power_throttled;
             p.command_line = a.command_line;
+            p.critical = a.critical;
+            if p.user_sid.is_none() {
+                p.user_sid = a.user_sid.clone();
+            }
             // The User column is filled from four sources, strongest first:
             // sysinfo's own token read, our narrower token read (which
             // succeeds for the session-0 service hosts sysinfo cannot open),
-            // the service catalog account, and known system/kernel session roles.
-            // Anything else stays unknown; a guessed account is worse than "—".
+            // the per-PID service account from the SCM catalog (the only
+            // source that tells a NETWORK SERVICE host apart from a SYSTEM
+            // one when the token cannot be opened), and known system/kernel
+            // session roles. Anything else stays unknown; a guessed account
+            // is worse than "—".
             if p.user.is_none() {
-                p.user = a.user;
+                p.user = a.user.clone();
+            }
+            if p.user.is_none() {
+                p.user = service_catalog.accounts_by_pid.get(&p.pid).cloned();
             }
             if p.user.is_none() {
                 let session = a
@@ -717,13 +722,18 @@ impl Sampler {
                 ) || session == Some(0)
                 {
                     p.user = Some("SYSTEM".to_string());
-                } else if let Some(acc) = service_catalog
-                    .accounts_by_name
-                    .get(stem)
-                    .or_else(|| service_catalog.accounts_by_name.get(&norm))
-                {
-                    p.user = Some(acc.clone());
                 }
+            }
+            // The SID column stays useful for session-0 hosts whose token
+            // cannot be opened: the three well-known service accounts have
+            // fixed SIDs.
+            if p.user_sid.is_none()
+                && let Some(sid) = p
+                    .user
+                    .as_deref()
+                    .and_then(process_ops::well_known_sid_for_account)
+            {
+                p.user_sid = Some(sid.to_string());
             }
 
             // If token_security could not query elevation (e.g. kernel processes,
@@ -738,6 +748,7 @@ impl Sampler {
                     u.eq_ignore_ascii_case("SYSTEM")
                         || u.eq_ignore_ascii_case("LOCAL SERVICE")
                         || u.eq_ignore_ascii_case("NETWORK SERVICE")
+                        || u.to_ascii_uppercase().starts_with("NT SERVICE\\")
                         || u.to_ascii_uppercase().starts_with("DWM-")
                         || u.to_ascii_uppercase().starts_with("UMFD-")
                 });
@@ -1106,40 +1117,41 @@ fn microsoft_company(company: Option<&str>) -> bool {
     })
 }
 
-/// Positive ownership test for the Processes page's "Windows processes"
-/// section. Merely running in Session 0, as SYSTEM, or below services.exe is
-/// insufficient: third-party services do all three. Windows-owned executable
-/// paths also require Microsoft file-version metadata, so a vendor binary in
-/// System32 does not become a Windows process just because of its location.
-fn is_windows_os_component(p: &ProcessEntry) -> bool {
+/// Evidence that an image is Microsoft-published from a Windows-owned path.
+///
+/// This is the spoof guard for core image names, NOT a classification rule:
+/// native Task Manager keeps Microsoft background machinery (WMI Provider
+/// Host, SmartScreen, shell brokers, windowless user tools) in Background
+/// processes. `None` = the location could not be resolved, so a known core
+/// name is trusted; `Some(false)` = the image is provably not Windows-owned
+/// (vendor publisher, or a user-writable location).
+fn is_windows_owned_image(p: &ProcessEntry) -> Option<bool> {
     let system_root = std::env::var_os("SystemRoot")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|| std::path::PathBuf::from(r"C:\Windows"));
-    is_windows_os_component_under(p.company.as_deref(), p.exe_path.as_deref(), &system_root)
+    windows_owned_evidence(p.company.as_deref(), p.exe_path.as_deref(), &system_root)
 }
 
-fn is_windows_os_component_under(
+fn windows_owned_evidence(
     company: Option<&str>,
     exe_path: Option<&std::path::Path>,
     system_root: &std::path::Path,
-) -> bool {
-    if !microsoft_company(company) {
-        return false;
-    }
-    let Some(exe_path) = exe_path else {
-        return false;
-    };
-    let path = normalize_windows_path(exe_path);
+) -> Option<bool> {
+    let path = normalize_windows_path(exe_path?);
     let root = normalize_windows_path(system_root);
-    if path == root || path.starts_with(&(root + "\\")) {
-        return true;
-    }
-
-    // Defender's engine is intentionally outside %SystemRoot% on current
-    // Windows builds, but it is still first-party Windows infrastructure.
-    path.contains(r"\programdata\microsoft\windows defender\")
+    let in_windows_location = path == root
+        || path.starts_with(&(root + "\\"))
+        // Defender's engine is intentionally outside %SystemRoot% on current
+        // Windows builds, but it is still first-party Windows infrastructure.
+        || path.contains(r"\programdata\microsoft\windows defender\")
         || path.contains(r"\program files\windows defender\")
-        || path.contains(r"\program files (x86)\windows defender\")
+        || path.contains(r"\program files (x86)\windows defender\");
+    if !in_windows_location {
+        return Some(false);
+    }
+    // Location is right; the publisher decides. Missing version metadata
+    // leaves the answer unknown instead of rejecting a protected process.
+    company.map(|company| microsoft_company(Some(company)))
 }
 
 fn decay_pseudo(slot: &mut Option<HeldPseudoRow>) {
@@ -1200,18 +1212,21 @@ fn refine_categories_and_group_apps(processes: &mut [ProcessEntry]) {
         .collect();
 
     // --- refined classification ---------------------------------------------
-    // Session 0 and services.exe ancestry mean "service context", not
-    // "belongs to Windows". Third-party updaters, launchers and helpers run
-    // there too. Only explicit core image names (handled by tm-core) or a
-    // Microsoft-owned executable from a Windows-owned path get System.
+    // Native Task Manager semantics: a visible window makes an App, a
+    // critical process or a core OS image is System, everything else is
+    // Background. "Microsoft-signed under %SystemRoot%" is deliberately NOT
+    // an entry ticket — it mislabelled WMI Provider Host, SmartScreen, the
+    // font driver and the per-session shell brokers as Windows processes.
+    // The ownership test only rejects a spoofed core image name.
     for p in processes.iter_mut() {
-        let system_process = is_windows_os_component(p);
+        let windows_owned = is_windows_owned_image(p);
         let name = p.name.clone();
         p.category = classify::classify(classify::ClassifyInput {
             pid: p.pid,
             name: &name,
             has_window: p.has_window,
-            system_process,
+            critical: p.critical,
+            windows_owned,
         });
     }
 
@@ -1228,28 +1243,12 @@ fn refine_categories_and_group_apps(processes: &mut [ProcessEntry]) {
         }
         m
     };
-    let is_boundary = |name: &str| -> bool {
-        const SYSTEM: [&str; 12] = [
-            "svchost.exe",
-            "services.exe",
-            "csrss.exe",
-            "smss.exe",
-            "wininit.exe",
-            "winlogon.exe",
-            "lsass.exe",
-            "lsaiso.exe",
-            "dwm.exe",
-            "fontdrvhost.exe",
-            "system",
-            "registry",
-        ];
-        SYSTEM.iter().any(|s| name.eq_ignore_ascii_case(s))
-    };
     // App roots: windowed processes walked up to the topmost
-    // non-windowed, non-system ancestor.
+    // non-windowed, non-system ancestor. Core OS images are never app roots
+    // even when they own a window (classic conhost).
     let mut roots: Vec<usize> = Vec::new();
     for (i, p) in processes.iter().enumerate() {
-        if !p.has_window {
+        if !p.has_window || classify::is_core_os_image(&p.name) {
             continue;
         }
         let mut cur = i;
@@ -1261,7 +1260,7 @@ fn refine_categories_and_group_apps(processes: &mut [ProcessEntry]) {
                 Some(pi)
                     if pi != cur
                         && !processes[pi].has_window
-                        && !is_boundary(&processes[pi].name) =>
+                        && !classify::is_core_os_image(&processes[pi].name) =>
                 {
                     cur = pi;
                 }
@@ -1281,10 +1280,19 @@ fn refine_categories_and_group_apps(processes: &mut [ProcessEntry]) {
     let mut stack: Vec<usize> = roots;
     let mut seen: Vec<usize> = stack.clone();
     while let Some(i) = stack.pop() {
+        // A system image keeps its category and is not descended into: its
+        // subtree is OS infrastructure, not part of the app that happens to
+        // sit above it.
+        if processes[i].category == ProcCategory::System {
+            continue;
+        }
         processes[i].category = ProcCategory::App;
         if let Some(kids) = children.get(&i) {
             for &k in kids {
-                if !root_set.contains(&k) && !seen.contains(&k) {
+                if !root_set.contains(&k)
+                    && !seen.contains(&k)
+                    && processes[k].category != ProcCategory::System
+                {
                     seen.push(k);
                     stack.push(k);
                 }
@@ -1373,7 +1381,7 @@ mod tests {
     }
 
     #[test]
-    fn windows_process_group_uses_os_ownership_not_service_ancestry() {
+    fn classification_matches_native_windows_groups() {
         let mut services = ProcessEntry::new(100, "services.exe");
         services.session_id = Some(0);
 
@@ -1403,7 +1411,16 @@ mod tests {
         wmi.company = Some("Microsoft Corporation".into());
         wmi.exe_path = Some(r"C:\Windows\System32\wbem\WmiPrvSE.exe".into());
 
-        let mut processes = vec![services, battle, steam, taskman, wmi];
+        let mut shell = ProcessEntry::new(600, "powershell.exe");
+        shell.ppid = Some(100);
+        shell.session_id = Some(0);
+        shell.company = Some("Microsoft Corporation".into());
+        shell.exe_path = Some(r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe".into());
+
+        let mut critical = ProcessEntry::new(700, "vendor-protector.exe");
+        critical.critical = Some(true);
+
+        let mut processes = vec![services, battle, steam, taskman, wmi, shell, critical];
         refine_categories_and_group_apps(&mut processes);
 
         let category = |pid| processes.iter().find(|p| p.pid == pid).unwrap().category;
@@ -1411,36 +1428,57 @@ mod tests {
         assert_eq!(category(200), ProcCategory::Background);
         assert_eq!(category(300), ProcCategory::Background);
         assert_eq!(category(400), ProcCategory::App);
-        assert_eq!(category(500), ProcCategory::System);
+        // Native Task Manager lists WMI Provider Host and windowless
+        // PowerShell under Background processes, not Windows processes.
+        assert_eq!(category(500), ProcCategory::Background);
+        assert_eq!(category(600), ProcCategory::Background);
+        assert_eq!(category(700), ProcCategory::System);
     }
 
     #[test]
-    fn windows_owned_path_requires_microsoft_metadata() {
+    fn windows_owned_evidence_rejects_spoofed_core_images() {
         let root = std::path::Path::new(r"C:\Windows");
-        assert!(is_windows_os_component_under(
-            Some("Microsoft Corporation"),
-            Some(std::path::Path::new(r"C:\Windows\System32\dllhost.exe")),
-            root,
-        ));
-        assert!(is_windows_os_component_under(
-            Some("Microsoft Corporation"),
-            Some(std::path::Path::new(
-                r"C:\ProgramData\Microsoft\Windows Defender\Platform\MsMpEng.exe"
-            )),
-            root,
-        ));
-        assert!(!is_windows_os_component_under(
-            Some("Valve Corporation"),
-            Some(std::path::Path::new(r"C:\Windows\System32\vendor.exe")),
-            root,
-        ));
-        assert!(!is_windows_os_component_under(
-            Some("Microsoft Corporation"),
-            Some(std::path::Path::new(
-                r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe"
-            )),
-            root,
-        ));
+        assert_eq!(
+            windows_owned_evidence(
+                Some("Microsoft Corporation"),
+                Some(std::path::Path::new(r"C:\Windows\System32\svchost.exe")),
+                root,
+            ),
+            Some(true)
+        );
+        assert_eq!(
+            windows_owned_evidence(
+                Some("Microsoft Corporation"),
+                Some(std::path::Path::new(
+                    r"C:\ProgramData\Microsoft\Windows Defender\Platform\MsMpEng.exe"
+                )),
+                root,
+            ),
+            Some(true)
+        );
+        assert_eq!(
+            windows_owned_evidence(
+                Some("Valve Corporation"),
+                Some(std::path::Path::new(r"C:\Windows\System32\vendor.exe")),
+                root,
+            ),
+            Some(false)
+        );
+        assert_eq!(
+            windows_owned_evidence(
+                Some("Microsoft Corporation"),
+                Some(std::path::Path::new(
+                    r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe"
+                )),
+                root,
+            ),
+            Some(false)
+        );
+        // Unknown location must not reject a known core image.
+        assert_eq!(
+            windows_owned_evidence(Some("Microsoft Corporation"), None, root),
+            None
+        );
     }
 
     #[test]

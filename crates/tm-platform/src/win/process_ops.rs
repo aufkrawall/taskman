@@ -76,6 +76,20 @@ fn refuse_critical_handle(pid: u32, process: HANDLE) -> Result<()> {
     Ok(())
 }
 
+/// Read-only `IsProcessCritical` for the classifier. `None` means the process
+/// could not be opened or the query failed; unknown is never critical.
+/// Protected processes refuse the open, but those are core OS images whose
+/// names already classify them (and their handles could not be acted on).
+pub fn is_critical(pid: u32) -> Option<bool> {
+    unsafe {
+        let handle = open_process(pid, th::PROCESS_QUERY_LIMITED_INFORMATION).ok()?;
+        let mut critical = windows::core::BOOL::default();
+        let ok = th::IsProcessCritical(handle, &mut critical).is_ok();
+        let _ = CloseHandle(handle);
+        ok.then(|| critical.as_bool())
+    }
+}
+
 /// Open and identity-check the exact handle that will perform a destructive
 /// action, then establish critical-process state on that same handle.
 fn open_destructive_process_verified(
@@ -788,7 +802,26 @@ pub fn resolve_candidate_path(name: &str) -> Option<std::path::PathBuf> {
 pub struct ServiceCatalog {
     pub paths_by_pid: std::collections::HashMap<u32, std::path::PathBuf>,
     pub paths_by_name: std::collections::HashMap<String, std::path::PathBuf>,
-    pub accounts_by_name: std::collections::HashMap<String, String>,
+    /// Display name(s) of the service(s) hosted by a PID — Task Manager's
+    /// "Service Host: Windows Update". Empty for a process without services.
+    pub names_by_pid: std::collections::HashMap<u32, Vec<String>>,
+    /// Configured service account per PID. This is the only account source
+    /// that works for the session-0 hosts an unelevated session cannot open
+    /// a token for, and it is keyed by PID (an image-name lookup would
+    /// collapse every `svchost.exe` account into one arbitrary account).
+    pub accounts_by_pid: std::collections::HashMap<u32, String>,
+}
+
+/// Copy a NUL-terminated Windows string; empty when the pointer is null.
+unsafe fn pwstr_to_string(p: windows::core::PWSTR) -> String {
+    if p.0.is_null() {
+        return String::new();
+    }
+    let mut len = 0;
+    while unsafe { *p.0.add(len) } != 0 {
+        len += 1;
+    }
+    String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(p.0, len) })
 }
 
 pub fn normalize_service_account(raw: &str) -> String {
@@ -858,6 +891,18 @@ pub fn service_catalog() -> ServiceCatalog {
                 );
                 for it in items {
                     let pid = it.ServiceStatusProcess.dwProcessId;
+                    // Record the service identity even when the config query
+                    // below fails: the name is what lets a user tell two
+                    // service hosts apart in the Processes list.
+                    let display = pwstr_to_string(it.lpDisplayName);
+                    let short = pwstr_to_string(it.lpServiceName);
+                    let label = if display.is_empty() { short } else { display };
+                    if pid != 0 && !label.is_empty() {
+                        let names = catalog.names_by_pid.entry(pid).or_default();
+                        if !names.iter().any(|name| name.eq_ignore_ascii_case(&label)) {
+                            names.push(label);
+                        }
+                    }
                     if let Ok(svc) = scm::OpenServiceW(
                         mgr,
                         PCWSTR::from_raw(it.lpServiceName.0),
@@ -914,6 +959,15 @@ pub fn service_catalog() -> ServiceCatalog {
                                     None
                                 };
 
+                                if pid != 0
+                                    && let Some(account) = account.as_ref()
+                                {
+                                    catalog
+                                        .accounts_by_pid
+                                        .entry(pid)
+                                        .or_insert_with(|| account.clone());
+                                }
+
                                 if let Some(path) = clean {
                                     if pid != 0 {
                                         catalog
@@ -935,16 +989,6 @@ pub fn service_catalog() -> ServiceCatalog {
                                             .paths_by_name
                                             .entry(stem.clone())
                                             .or_insert_with(|| path.clone());
-                                        if let Some(acc) = account.as_ref() {
-                                            catalog
-                                                .accounts_by_name
-                                                .entry(norm)
-                                                .or_insert_with(|| acc.clone());
-                                            catalog
-                                                .accounts_by_name
-                                                .entry(stem)
-                                                .or_insert_with(|| acc.clone());
-                                        }
                                     }
                                 }
                             }
@@ -1613,6 +1657,16 @@ pub fn token_security(pid: u32) -> TokenSecurity {
     out
 }
 
+/// Token user of a process: the display name plus the string form of the
+/// SID. The SID is what actually distinguishes SYSTEM (S-1-5-18) from
+/// LOCAL SERVICE (S-1-5-19), NETWORK SERVICE (S-1-5-20) and per-service
+/// accounts (S-1-5-80-...), which a bare account name cannot always do.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TokenIdentity {
+    pub name: String,
+    pub sid: Option<String>,
+}
+
 /// Account name that owns `pid`, formatted like Task Manager's User column
 /// ("DOMAIN\user", or a bare well-known name such as "SYSTEM").
 ///
@@ -1625,7 +1679,7 @@ pub fn token_security(pid: u32) -> TokenSecurity {
 ///
 /// Returns `None` when the owner genuinely cannot be determined; callers must
 /// never substitute a guessed account for it.
-pub fn token_user(pid: u32) -> Option<String> {
+pub fn token_identity(pid: u32) -> Option<TokenIdentity> {
     use windows::Win32::Security::{GetTokenInformation, TOKEN_QUERY, TOKEN_USER, TokenUser};
     use windows::Win32::System::Threading::OpenProcessToken;
 
@@ -1657,7 +1711,11 @@ pub fn token_user(pid: u32) -> Option<String> {
             return None;
         }
         let user = &*(buffer.as_ptr() as *const TOKEN_USER);
-        account_name_of_sid(user.User.Sid)
+        let name = account_name_of_sid(user.User.Sid)?;
+        Some(TokenIdentity {
+            name,
+            sid: sid_to_string(user.User.Sid),
+        })
     }
 }
 
@@ -1686,12 +1744,45 @@ unsafe fn sid_to_string(sid: windows::Win32::Security::PSID) -> Option<String> {
     }
 }
 
+/// Canonical English name for a well-known SID. Windows localizes these
+/// accounts ("Lokaler Dienst" on German systems); the User column and the
+/// service catalog must agree on one spelling.
+pub fn well_known_sid_name(sid: &str) -> Option<&'static str> {
+    match sid {
+        "S-1-5-18" => Some("SYSTEM"),
+        "S-1-5-19" => Some("LOCAL SERVICE"),
+        "S-1-5-20" => Some("NETWORK SERVICE"),
+        "S-1-5-6" => Some("SERVICE"),
+        _ => None,
+    }
+}
+
+/// SID behind a canonical well-known account name. Used when the process
+/// token cannot be opened but the service catalog knows the account; these
+/// three SIDs are fixed by Windows, so this is identity, not a guess.
+pub fn well_known_sid_for_account(account: &str) -> Option<&'static str> {
+    let normalized = account.trim().to_ascii_uppercase();
+    match normalized.as_str() {
+        "SYSTEM" | "NT AUTHORITY\\SYSTEM" | "LOCAL SYSTEM" => Some("S-1-5-18"),
+        "LOCAL SERVICE" | "NT AUTHORITY\\LOCAL SERVICE" => Some("S-1-5-19"),
+        "NETWORK SERVICE" | "NT AUTHORITY\\NETWORK SERVICE" => Some("S-1-5-20"),
+        "SERVICE" | "NT AUTHORITY\\SERVICE" => Some("S-1-5-6"),
+        _ => None,
+    }
+}
+
 /// Resolve a SID to "DOMAIN\name", dropping the domain for the well-known
 /// local accounts Task Manager shows bare ("SYSTEM", "LOCAL SERVICE",
 /// "NETWORK SERVICE" all live in the pseudo-domain "NT-AUTORITÄT"/"NT
 /// AUTHORITY", which only adds noise to a narrow column).
 unsafe fn account_name_of_sid(sid: windows::Win32::Security::PSID) -> Option<String> {
     let key = unsafe { sid_to_string(sid) };
+    // Well-known accounts get one canonical, locale-independent spelling so
+    // a German system does not show "Lokaler Dienst" next to the service
+    // catalog's "LOCAL SERVICE".
+    if let Some(name) = key.as_deref().and_then(well_known_sid_name) {
+        return Some(name.to_string());
+    }
     if let Some(key) = key.as_ref()
         && let Ok(cache) = SID_NAMES.lock()
         && let Some(hit) = cache.get(key)
@@ -2248,10 +2339,18 @@ mod tests {
     /// service hosts an unelevated session cannot open with more than
     /// QUERY_LIMITED access — the exact case that used to render "—".
     #[test]
-    fn token_user_resolves_the_owning_account_including_service_hosts() {
-        let own = token_user(std::process::id()).expect("own process has an owner");
-        assert!(!own.is_empty());
-        assert!(!own.contains('\u{0}'), "no embedded NULs: {own}");
+    fn token_identity_resolves_the_owning_account_including_service_hosts() {
+        let own = token_identity(std::process::id()).expect("own process has an owner");
+        assert!(!own.name.is_empty());
+        assert!(
+            !own.name.contains('\u{0}'),
+            "no embedded NULs: {}",
+            own.name
+        );
+        assert!(
+            own.sid.as_deref().is_some_and(|sid| sid.starts_with("S-")),
+            "own SID must be a string SID: {own:?}"
+        );
 
         // svchost.exe instances run as SYSTEM / LOCAL SERVICE / NETWORK
         // SERVICE in session 0. At least one must resolve, otherwise the
@@ -2265,7 +2364,7 @@ mod tests {
             .map(|(pid, _)| pid.as_u32())
             .collect();
         assert!(!hosts.is_empty(), "Windows always runs service hosts");
-        let resolved = hosts.iter().filter_map(|pid| token_user(*pid)).count();
+        let resolved = hosts.iter().filter_map(|pid| token_identity(*pid)).count();
         assert!(
             resolved > 0,
             "no service host owner resolved out of {} candidates",
@@ -2467,6 +2566,24 @@ mod tests {
         assert!(
             !catalog.paths_by_name.is_empty(),
             "Windows always has active services"
+        );
+        assert!(
+            !catalog.names_by_pid.is_empty(),
+            "service hosts must be named for the Processes page"
+        );
+        assert!(
+            catalog
+                .names_by_pid
+                .values()
+                .flatten()
+                .any(|name| !name.is_empty()),
+            "service display names must not be empty"
+        );
+        // Accounts are what tell a NETWORK SERVICE host apart from SYSTEM
+        // when the process token cannot be opened.
+        assert!(
+            !catalog.accounts_by_pid.is_empty(),
+            "service accounts must be catalogued per PID"
         );
     }
 }

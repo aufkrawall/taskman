@@ -90,8 +90,9 @@ pub fn restart(pid: u32, expected_start_epoch_s: Option<i64>) -> Result<()> {
         super::process_ops::refuse_critical_process(pid)?;
         ensure_explorer_image(process)?;
 
-        unsafe { th::TerminateProcess(process, 1) }
-            .map_err(|error| TmError::platform("TerminateProcess(explorer.exe)", error.to_string()))?;
+        unsafe { th::TerminateProcess(process, 1) }.map_err(|error| {
+            TmError::platform("TerminateProcess(explorer.exe)", error.to_string())
+        })?;
 
         // Do not deliberately create two shell generations. Wait until the
         // selected Explorer has actually exited before asking the user-session

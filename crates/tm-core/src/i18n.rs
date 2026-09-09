@@ -196,6 +196,8 @@ keys! {
     PropGpuDedicated => ["Dedizierter GPU-Speicher", "Dedicated GPU memory"],
     PropGpuShared => ["Gemeinsamer GPU-Speicher", "Shared GPU memory"],
     PropService => ["Dienst", "Service"],
+    PropUserSid => ["Benutzer-SID", "User SID"],
+    ServiceHost => ["Diensthost", "Service Host"],
     Security => ["Sicherheit", "Security"],
     NoneWord => ["Keine", "None"],
     Permanent => ["dauerhaft", "permanent"],

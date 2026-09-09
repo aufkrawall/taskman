@@ -80,6 +80,7 @@ pub enum ColumnId {
     Pid,
     Status,
     User,
+    UserSid,
     Cpu,
     Memory,
     Network,
@@ -118,6 +119,7 @@ impl ColumnId {
             ColumnId::Pid => a.pid.cmp(&b.pid),
             ColumnId::Status => status_rank(a.status).cmp(&status_rank(b.status)),
             ColumnId::User => cmp_option_str(a.user.as_deref(), b.user.as_deref()),
+            ColumnId::UserSid => cmp_option_str(a.user_sid.as_deref(), b.user_sid.as_deref()),
             ColumnId::Cpu => a
                 .cpu_pct
                 .partial_cmp(&b.cpu_pct)
@@ -323,6 +325,7 @@ impl ColSpec {
             ColumnId::Pid => i18n::tr(K::ColPid),
             ColumnId::Status => i18n::tr(K::ColStatus),
             ColumnId::User => i18n::tr(K::ColUsername),
+            ColumnId::UserSid => i18n::tr(K::PropUserSid),
             ColumnId::Cpu => i18n::tr(K::ColCpu),
             ColumnId::Memory => i18n::tr(K::ColMemory),
             ColumnId::Network => i18n::tr(K::ColNetwork),
@@ -375,6 +378,11 @@ const COLUMNS: &[ColSpec] = &[
         cid: ColumnId::User,
         col: || TmColumn::text("user", i18n::tr(K::ColUsername), 120.0),
         default_visible: true,
+    },
+    ColSpec {
+        cid: ColumnId::UserSid,
+        col: || TmColumn::text("usersid", i18n::tr(K::PropUserSid), 150.0),
+        default_visible: false,
     },
     ColSpec {
         cid: ColumnId::Cpu,
@@ -840,6 +848,7 @@ pub struct Row {
     pub proc_status: ProcStatus,
     pub power_throttled: bool,
     pub user: String,
+    pub user_sid: String,
     pub cpu_s: String,
     pub mem_s: String,
     pub net_s: String,
@@ -877,6 +886,7 @@ impl Row {
             ColumnId::Pid => &self.pid_s,
             ColumnId::Status => &self.status,
             ColumnId::User => &self.user,
+            ColumnId::UserSid => &self.user_sid,
             ColumnId::Cpu => &self.cpu_s,
             ColumnId::Memory => &self.mem_s,
             ColumnId::Network => &self.net_s,
@@ -1808,6 +1818,7 @@ fn row_from_process(p: &ProcessEntry, depth: usize, children: bool) -> Row {
         proc_status: p.status,
         power_throttled: p.power_throttled == Some(true),
         user: p.user.clone().unwrap_or_else(|| "—".into()),
+        user_sid: p.user_sid.clone().unwrap_or_else(|| "—".into()),
         cpu_s: format::format_cpu_detail(p.cpu_pct),
         mem_s: format::format_k(p.mem_bytes),
         net_s: option_rate(process_network_rate(p)),
@@ -3045,6 +3056,12 @@ fn process_properties_general(
             );
             property_row(
                 ui,
+                i18n::tr(K::PropUserSid),
+                process.user_sid.clone().unwrap_or_else(|| "—".into()),
+                false,
+            );
+            property_row(
+                ui,
                 i18n::tr(K::ColSessionId),
                 process
                     .session_id
@@ -3963,6 +3980,10 @@ mod tests {
                 ColumnId::User => {
                     a.user = Some("alice".into());
                     b.user = Some("bob".into());
+                }
+                ColumnId::UserSid => {
+                    a.user_sid = Some("S-1-5-18".into());
+                    b.user_sid = Some("S-1-5-19".into());
                 }
                 ColumnId::Cpu => {
                     a.cpu_pct = 5.0;

@@ -341,6 +341,11 @@ pub struct ProcessEntry {
     pub category: ProcCategory,
     pub status: ProcStatus,
     pub user: Option<String>,
+    /// String form of the token user SID ("S-1-5-18"). The unqualified
+    /// account name alone cannot distinguish SYSTEM from the service and
+    /// package authorities; the SID can.
+    #[serde(default)]
+    pub user_sid: Option<String>,
     pub session_id: Option<u32>,
 
     /// CPU utilization normalized to whole-system capacity (TM-style, max 100).
@@ -393,8 +398,13 @@ pub struct ProcessEntry {
     pub elevated: Option<bool>,
     /// 32-bit process on a 64-bit OS (Windows WOW64).
     pub wow64: Option<bool>,
-    /// True when the process hosts exactly one service (Windows services host).
+    /// Display name(s) of the Windows service(s) this process hosts,
+    /// comma-separated ("Windows Update" or "Windows Update, BITS").
     pub service_name: Option<String>,
+    /// Windows `IsProcessCritical`. `None` = could not be queried; unknown is
+    /// never treated as critical.
+    #[serde(default)]
+    pub critical: Option<bool>,
     /// Token virtualization state (TokenVirtualizationAllowed/Enabled).
     /// None = could not be queried — never inferred from user name or pid.
     pub uac_virtualization: Option<UacVirtualization>,
@@ -428,6 +438,7 @@ impl ProcessEntry {
             category: ProcCategory::Background,
             status: ProcStatus::Running,
             user: None,
+            user_sid: None,
             session_id: None,
             cpu_pct: 0.0,
             mem_bytes: 0,
@@ -459,6 +470,7 @@ impl ProcessEntry {
             elevated: None,
             wow64: None,
             service_name: None,
+            critical: None,
             uac_virtualization: None,
             power_throttled: None,
             synthetic: false,

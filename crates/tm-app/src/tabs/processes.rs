@@ -535,12 +535,65 @@ fn handle_keyboard_navigation(app: &mut TaskManApp, ctx: &egui::Context, rows: &
 /// Process COUNTS use square brackets (`Microsoft Edge (msedge.exe) [24]`)
 /// precisely so the two cannot be confused.
 fn process_display_name(p: &ProcessEntry) -> String {
+    if let Some(host) = service_host_label(p) {
+        return format!("{}: {host}", i18n::tr(K::ServiceHost));
+    }
     let shown = p.shown_name();
     if shown.eq_ignore_ascii_case(&p.name) {
         p.name.clone()
     } else {
         format!("{shown} ({})", p.name)
     }
+}
+
+/// "Windows Update" / "Windows Update (+2)" for a service-host row.
+///
+/// Only `svchost.exe` gets the "Service Host:" prefix: other service hosts
+/// (WMI, task host, COM+) keep their own description, exactly like native
+/// Task Manager. The full list is available in the properties dialog and as
+/// the row tooltip, so a host with several services is not truncated away.
+fn service_host_label(p: &ProcessEntry) -> Option<String> {
+    if !p.name.eq_ignore_ascii_case("svchost.exe") {
+        return None;
+    }
+    let full = p.service_name.as_deref()?.trim();
+    if full.is_empty() {
+        return None;
+    }
+    let mut parts = full
+        .split(',')
+        .map(str::trim)
+        .filter(|part| !part.is_empty());
+    let first = parts.next()?;
+    let extra = parts.count();
+    Some(if extra > 0 {
+        format!("{first} (+{extra})")
+    } else {
+        first.to_string()
+    })
+}
+
+/// Label for an expandable family row. A service-host family uses the
+/// generic "Service Host" form so the collapsed Windows section never claims
+/// to be one specific service.
+fn family_label(head: &ProcessEntry, members: &[&ProcessEntry]) -> String {
+    if members
+        .iter()
+        .all(|member| member.name.eq_ignore_ascii_case("svchost.exe"))
+    {
+        i18n::tr(K::ServiceHost).to_string()
+    } else {
+        process_display_name(head)
+    }
+}
+
+/// Hover text for an expandable family: the full service list, one per line.
+fn family_tooltip(members: &[&ProcessEntry]) -> Option<String> {
+    let names = members
+        .iter()
+        .filter_map(|member| member.service_name.as_deref())
+        .collect::<Vec<_>>();
+    (!names.is_empty()).then(|| names.join("\n"))
 }
 
 fn process_identity(process: &ProcessEntry) -> crate::app::ProcessIdentity {
@@ -1532,7 +1585,7 @@ fn emit_flat_with_family_groups(
                 pid: p.pid,
                 start_epoch_s: p.start_epoch_s,
                 depth: 0,
-                name: format!("{} [{}]", process_display_name(p), fam.len()),
+                name: format!("{} [{}]", family_label(p, fam), fam.len()),
                 icon_path: p
                     .exe_path
                     .as_ref()
@@ -1564,7 +1617,7 @@ fn emit_flat_with_family_groups(
                     .iter()
                     .any(|member| member.power_throttled == Some(true)),
                 synthetic: false,
-                tooltip: None,
+                tooltip: family_tooltip(fam),
             }));
             if expanded.contains(&p.pid) {
                 // The virtual row owns the aggregate; every real member,
@@ -1888,24 +1941,9 @@ fn is_non_owning_shell(name: &str) -> bool {
 }
 
 fn is_system_boundary(name: &str) -> bool {
-    const SYSTEM: &[&str] = &[
-        "system",
-        "registry",
-        "memory compression",
-        "secure system",
-        "smss.exe",
-        "csrss.exe",
-        "wininit.exe",
-        "services.exe",
-        "lsass.exe",
-        "lsaiso.exe",
-        "svchost.exe",
-        "winlogon.exe",
-        "dwm.exe",
-        "fontdrvhost.exe",
-        "system idle process",
-    ];
-    SYSTEM.iter().any(|n| name.eq_ignore_ascii_case(n))
+    // One shared definition of "core OS image" across the platform
+    // classifier, the sampler's tree boundaries and this page.
+    tm_core::classify::is_core_os_image(name)
 }
 
 fn normalize_heat(rows: &mut [DisplayRow]) {
@@ -3204,6 +3242,7 @@ mod tests {
                 let mut host = proc(pid, Some(1), "svchost.exe", ProcCategory::System);
                 host.cpu_pct = 0.1;
                 host.company = Some("Microsoft Corporation".into());
+                host.service_name = Some(format!("Service {pid}"));
                 host
             })
             .collect();
@@ -3223,7 +3262,7 @@ mod tests {
             .iter()
             .find(|row| row.pid == 2)
             .expect("lowest-pid svchost heads the sibling run");
-        assert_eq!(hosts.name, "svchost.exe [4]");
+        assert_eq!(hosts.name, format!("{} [4]", i18n::tr(K::ServiceHost)));
         assert!(hosts.children);
         assert!((hosts.values[0] - 0.4).abs() < 1e-5);
 
@@ -3232,6 +3271,14 @@ mod tests {
         let sys = rows_in_group(&rows, 2);
         assert_eq!(sys.len(), 6, "services.exe + virtual group + every host");
         assert_eq!(sys.iter().filter(|row| row.depth == 1).count(), 4);
+        // Expanded hosts stay distinguishable by hosted service, which is
+        // the whole point of keeping them collapsed instead of spamming the
+        // Background list with native-style per-service rows.
+        assert!(
+            sys.iter()
+                .any(|row| row.name == format!("{}: Service 3", i18n::tr(K::ServiceHost))),
+            "expanded host must name its service: {sys:?}"
+        );
     }
 
     #[test]

@@ -27,8 +27,10 @@ platform boundary (`tm-core` ← `tm-platform` ← `tm-app` / `tm-service`):
     writer thread with generations), `demand.rs` (TelemetryDemand bitmask),
     `logging.rs` (early ring sink → deferred file attach; elevated installer
     helper remains memory/console-only), `classify.rs`
-    (Apps/Background/System classification), `i18n.rs` (DE/EN keys macro),
-    `format.rs`, `mock.rs`.
+    (conservative Apps/Background/System classification: kernel names + core
+    OS images + `IsProcessCritical`; `is_core_os_image` is the shared
+    core-image list used by the sampler's tree boundaries and the Processes
+    page), `i18n.rs` (DE/EN keys macro), `format.rs`, `mock.rs`.
 - `crates/tm-platform`
   - OS collectors/actions behind traits (`actions.rs`). Windows stack under
     `win/`: `sampler.rs` (sysinfo + NtQuerySystemInformation CPU accountant,
@@ -41,7 +43,10 @@ platform boundary (`tm-core` ← `tm-platform` ← `tm-app` / `tm-service`):
     (PDH split GpuPdh/DiskPdh groups with demand gating + LUID-preserving
     GPU instance parser), `gpu.rs` (DXGI discovery + LUID-keyed merge,
     busiest-engine semantics), `process_ops.rs` (kill/suspend/priority/
-    affinity/EcoQoS/UAC virtualization/token security, identity-safe minidumps, ToolHelp module
+    affinity/EcoQoS/UAC virtualization/token security, `token_identity`
+    (account + string SID) and `IsProcessCritical`, SCM service catalog
+    mapping PID → executable path, hosted service display name(s) and
+    configured account, identity-safe minidumps, ToolHelp module
     enumeration, guarded same-architecture DLL unload, non-blocking launch),
     `startup.rs` (Run keys + Startup folders + StartupApproved incl. the
     folder-subkey fix and best-effort publisher resolution), `services.rs`,
@@ -60,7 +65,10 @@ platform boundary (`tm-core` ← `tm-platform` ← `tm-app` / `tm-service`):
     coordination: mutex + show/acknowledge events + a published pid/HWND
     section, low-integrity-labelled so an unelevated hotkey launch reaches
     an elevated instance; an unacknowledged request starts its own
-    instance), `windows_enum.rs` (one-pass top-window/hung-state inventory),
+    instance), `windows_enum.rs` (one-pass top-window/hung-state inventory;
+    UWP `ApplicationFrameWindow`s are attributed to their hosted
+    `Windows.UI.Core.CoreWindow` process, cloaked suspended-app CoreWindows
+    count as App windows and cloaked ghost frames are ignored),
     `window_chrome.rs` (DWM caption colour / dark mode / backdrop / cloaking,
     plus an event-driven strict-topmost keeper that reasserts the root HWND on
     foreground/show/reorder events so topmost shell surfaces cannot stay above it),
@@ -183,10 +191,14 @@ platform boundary (`tm-core` ← `tm-platform` ← `tm-app` / `tm-service`):
   `joins_family` lets the same image join unconditionally; different images
   require same-publisher + helper-like evidence while windowless, idle and away
   from a system/launch boundary. Repeat runs of one image under one
-  parent group separately (`sibling_run_key`), including `svchost.exe` under `services.exe`.
+  parent group separately (`sibling_run_key`), including `svchost.exe` under `services.exe`,
+  which collapse into one `Service Host [N]` row whose expanded children are
+  named `Service Host: <hosted service>` (tooltip lists them all; no
+  per-service row spam) and whose Process Properties show the full list.
   Windows-process membership is NOT inherited from Session 0 or system ancestry:
-  the Windows sampler requires a core system image name or Microsoft metadata plus
-  a Windows-owned executable path, so third-party SCM services remain Background.
+  it requires a core OS image name or `IsProcessCritical`, so third-party SCM
+  services and Microsoft background machinery (WMI Provider Host, SmartScreen,
+  shell brokers, windowless user tools) remain Background.
   Expandable application/family rows are virtual presentation parents: the
   virtual row owns the aggregate, while expansion reveals every concrete member
   (including the former head/root) as a child with only its own metrics. Flat

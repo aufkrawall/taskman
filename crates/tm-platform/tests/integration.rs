@@ -171,6 +171,57 @@ fn windows_extras() {
             .iter()
             .any(|p| p.category == ProcCategory::System)
     );
+
+    // Native-aligned classification invariants (would have failed under the
+    // old "Microsoft-signed under %SystemRoot% => System" rule):
+    // core OS images are System, while Microsoft background machinery and
+    // user-launchable tools are never System unless the OS marks them
+    // critical.
+    for p in &snap.processes {
+        if ["svchost.exe", "csrss.exe", "winlogon.exe", "services.exe"]
+            .iter()
+            .any(|name| p.name.eq_ignore_ascii_case(name))
+        {
+            assert_eq!(
+                p.category,
+                ProcCategory::System,
+                "{} must be a Windows process",
+                p.name
+            );
+        }
+        if [
+            "WmiPrvSE.exe",
+            "smartscreen.exe",
+            "fontdrvhost.exe",
+            "TextInputHost.exe",
+            "WUDFHost.exe",
+            "RuntimeBroker.exe",
+            "dllhost.exe",
+            "taskhostw.exe",
+            "sihost.exe",
+            "powershell.exe",
+            "cmd.exe",
+        ]
+        .iter()
+        .any(|name| p.name.eq_ignore_ascii_case(name))
+        {
+            assert!(
+                p.category != ProcCategory::System || p.critical == Some(true),
+                "{} must stay Background/App unless critical (got {:?})",
+                p.name,
+                p.category
+            );
+        }
+    }
+    // The service catalog must name running service hosts, otherwise the
+    // Processes page falls back to indistinguishable "svchost.exe" rows.
+    assert!(
+        snap.processes.iter().any(|p| p
+            .service_name
+            .as_deref()
+            .is_some_and(|name| !name.is_empty())),
+        "no process carries a hosted service name"
+    );
 }
 
 #[cfg(target_os = "windows")]

@@ -88,13 +88,7 @@ pub fn tab_header(
             extra(app, ui);
             #[cfg(target_os = "windows")]
             if let Some(target) = restart_target
-                && original::cmd_button(
-                    ui,
-                    pal,
-                    Icon::Restart,
-                    i18n::tr(K::RestartService),
-                    true,
-                )
+                && original::cmd_button(ui, pal, Icon::Restart, i18n::tr(K::RestartService), true)
             {
                 let ctx = ui.ctx().clone();
                 restart_explorer(app, &ctx, target);

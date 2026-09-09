@@ -11,6 +11,63 @@
 - 2026-09-08: Process Properties now summarizes mitigations with System Informer-style qualifiers (permanent DEP, high-entropy ASLR, prohibited/disabled wording, CF Guard and stack protection), and module inventory uses the authenticated LocalSystem broker for identity-bound SYSTEM/service inspection with bounded responses.
 # Recent Activity
 
+## 2026-09-09 — Native-aligned classification, service-host names, exact user identity
+
+A side-by-side comparison with native Windows 11 Task Manager (screenshot)
+showed the classifier was over-broad and several native conveniences were
+missing.
+
+1. **"Microsoft-signed under %SystemRoot%" was the wrong entry ticket.** The
+   2026-09-07 positive-ownership rule fixed third-party services but pushed
+   `WmiPrvSE`, SmartScreen, `fontdrvhost`, `TextInputHost`, `WUDFHost`, the
+   shell brokers and windowless PowerShell/cmd into the Windows group; native
+   keeps all of them in Background. `classify.rs` now mirrors the documented
+   native rule: kernel pseudo-names, core OS images or `IsProcessCritical` →
+   System, visible window → App, else Background. The Microsoft/path test
+   survives only as a spoof guard (`windows_owned_evidence`: wrong location →
+   `Some(false)`, missing metadata → `None` so protected core images are not
+   rejected). The core-image list moved into
+   `tm_core::classify::is_core_os_image`; the sampler's tree boundaries and
+   the Processes page share it, removing three drifting copies. The sampler
+   queries `IsProcessCritical` in the 10 s attribute cache, and the platform
+   no longer marks a System subtree as App during propagation.
+2. **Service hosts are named without spamming the list.** `ServiceCatalog`
+   gained `names_by_pid` (hosted service display names) and `accounts_by_pid`;
+   `ProcessEntry.service_name` is finally populated. `svchost.exe` rows render
+   `Service Host: <service>`, the collapsed run row is `Service Host [N]` with
+   every hosted service in its tooltip, and expanded children stay
+   distinguishable. Search and Process Properties already consumed the field.
+3. **Exact user identity.** `token_identity` returns the string SID with the
+   account name; `well_known_sid_name` canonicalizes S-1-5-18/19/20 to English
+   names on localized systems, and `well_known_sid_for_account` supplies the
+   SID for session-0 hosts whose token cannot be opened. The fallback chain
+   now uses the per-PID service account BEFORE the blanket session-0 →
+   "SYSTEM" guess, so NETWORK SERVICE/LOCAL SERVICE hosts no longer all read
+   "SYSTEM". Details has an optional User SID column and Process Properties a
+   User SID row.
+4. **UWP apps are attributed to the app, not the broker.** A visible
+   `ApplicationFrameWindow` is attributed to the process owning its hosted
+   `Windows.UI.Core.CoreWindow`; a cloaked frame without a hosted child is a
+   ghost of a suspended app and is ignored, while the suspended app's own
+   top-level cloaked CoreWindow keeps it in Apps with status Suspended.
+   `ApplicationFrameHost.exe` no longer shows as an App row.
+5. **Services → Go to details** (reverse of the existing Processes → Go to
+   service(s)).
+6. Fixed pre-existing rustfmt drift in `app_ui.rs`/`explorer_restart.rs` that
+   would have failed `build.py --check`.
+
+Tests: classifier unit tests including the screenshot-derived Background set
+and spoof/critical cases; the sampler classification test now expects WmiPrvSE
+and windowless PowerShell in Background; live integration invariants (core
+images System, Microsoft background machinery never System unless critical, at
+least one service name present); service catalog asserts per-PID names and
+accounts; svchost display-name regression test; Details column sort test
+covers UserSid. Verified live: `svchost` hosts show SYSTEM/LOCAL SERVICE/
+NETWORK SERVICE/user accounts with SIDs, suspended Settings appears as an App
+with status Suspended, and ApplicationFrameHost/RuntimeBroker/taskhostw are
+Background. `python build.py --check` green (fmt, clippy, workspace tests,
+fork gate, release + Linux packaging); `taskman --selfcheck` sane.
+
 ## 2026-09-08 — Linux parity fixes and the first GUI-capable Linux release
 
 Validating the v0.1.2 Linux artifact under WSLg surfaced three issues:
