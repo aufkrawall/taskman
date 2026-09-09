@@ -33,8 +33,20 @@ Primary sources:
 3. Packaging into `dist/`: Windows → `.zip` containing the GUI and service;
    Linux → `.tar.gz`, named `taskman-v<version>-<platform>`.
 
-Flags: `--host-only`, `--linux-only`, `--debug`, `--no-package`,
-`--require-all-targets`, `--check`, `--audit`.
+Flags: `--host-only`, `--linux-only`, `--all-targets`, `--debug`,
+`--no-package`, `--require-all-targets`, `--check`, `--audit`.
+
+`--all-targets` adds two cross-built artifacts:
+
+- **Windows ARM64** (`aarch64-pc-windows-msvc`, Windows host only): needs the
+  Rust target std and the MSVC ARM64 toolset
+  (`Microsoft.VisualStudio.Component.VC.Tools.ARM64`) plus the Windows SDK
+  arm64 libs. `/CETCOMPAT` is x86_64-only (ARM64's linker rejects it with
+  LNK1246), so the ARM64 build gets Control Flow Guard without the CET marker.
+- **Linux ARM64** (`aarch64-unknown-linux-gnu`): same cross/zigbuild
+  resolution as x86_64 (glibc 2.17 floor). There is no rust-lld/musl fallback
+  for ARM64; without `cross`/`cargo-zigbuild` the artifact is skipped (fatal
+  with `--require-all-targets`).
 
 ## Publishing a release
 
@@ -45,9 +57,11 @@ Flags: `--host-only`, `--linux-only`, `--debug`, `--no-package`,
    so `Cargo.lock` follows, and commit as
    `chore(release): bump version to X.Y.Z`. Push `main`; the tag points at
    this commit.
-3. `python build.py` produces
-   `dist/taskman-vX.Y.Z-windows-x86_64.zip` and
-   `dist/taskman-vX.Y.Z-linux-x86_64[-musl].tar.gz`. Write
+3. `python build.py --all-targets` produces
+   `dist/taskman-vX.Y.Z-windows-x86_64.zip`,
+   `dist/taskman-vX.Y.Z-windows-arm64.zip`,
+   `dist/taskman-vX.Y.Z-linux-x86_64[-musl].tar.gz` and
+   `dist/taskman-vX.Y.Z-linux-arm64.tar.gz`. Write
    `<sha256>  <filename>` next to each archive.
 4. Publish with the GitHub CLI:
    `gh release create vX.Y.Z --target <bump-sha> --title 'TaskMan vX.Y.Z'
@@ -128,10 +142,12 @@ Windows release builds (both `cargo build --release` through
 `RUSTFLAGS` overrides the config) carry:
 
 - `-C control-flow-guard=yes` — CFG instrumentation + guard function table.
+  Applied to x86_64 and ARM64 Windows.
 - `-C link-arg=/CETCOMPAT` — image is marked CET/hardware-enforced stack
-  protection compatible. The OS only enables shadow stacks when every loaded
-  module is marked, so the bit is additive; a non-compatible driver keeps the
-  process on the non-CET path.
+  protection compatible. **x86_64 only**; ARM64's linker rejects it
+  (LNK1246) and ARM64 has no CET shadow-stack marker. The OS only enables
+  shadow stacks when every loaded module is marked, so the bit is additive; a
+  non-compatible driver keeps the process on the non-CET path.
 - `--remap-path-prefix` (build.py only, machine-specific) — strips the build
   user's home and checkout root from panic locations.
 

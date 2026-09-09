@@ -5,6 +5,11 @@
 # --remap-path-prefix (machine-specific, therefore not committable here) when
 # building release artifacts. `/CETCOMPAT` marks the image compatible with
 # hardware-enforced stack protection; the OS only enables shadow stacks when
-# every loaded module is marked, so the bit is additive and safe.
-[target.'cfg(windows)']
+# every loaded module is marked, so the bit is additive and safe. It is
+# x86_64-only: ARM64's linker rejects it (LNK1246), and ARM64 has no CET
+# shadow-stack marker. Control Flow Guard applies to both architectures.
+[target.'cfg(all(windows, target_arch = "x86_64"))']
 rustflags = ["-C", "control-flow-guard=yes", "-C", "link-arg=/CETCOMPAT"]
+
+[target.'cfg(all(windows, target_arch = "aarch64"))']
+rustflags = ["-C", "control-flow-guard=yes"]

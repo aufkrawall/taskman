@@ -3,6 +3,7 @@
 
 Default behavior (`python build.py`): build the host and Linux x86_64 release
 (where a cross toolchain is available), then package platform artifacts.
+`--all-targets` additionally builds Windows ARM64 and Linux ARM64.
 """
 
 from __future__ import annotations
@@ -21,6 +22,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent
 DIST = ROOT / "dist"
 LINUX_TARGET = "x86_64-unknown-linux-gnu"
+LINUX_ARM64_TARGET = "aarch64-unknown-linux-gnu"
+WINDOWS_ARM64_TARGET = "aarch64-pc-windows-msvc"
 # Self-contained fallback: no cross compiler, Docker or zig, only the official
 # rustup std component plus the bundled rust-lld linker.
 LINUX_MUSL_TARGET = "x86_64-unknown-linux-musl"
@@ -51,7 +54,7 @@ def cargo() -> str:
     raise SystemExit("cargo not found - install Rust 1.88+ or add ~/.cargo/bin to PATH")
 
 
-def release_flag_list(windows_target: bool) -> list[str]:
+def release_flag_list(windows_target: bool, arm64: bool = False) -> list[str]:
     """Hardening rustflags for release artifacts (security audit F-11-001).
 
     * ``--remap-path-prefix`` strips the build machine's home directory AND
@@ -89,12 +92,16 @@ def release_flag_list(windows_target: bool) -> list[str]:
         # The OS only enables shadow stacks when every loaded module is
         # marked, so this is additive: a non-compatible driver simply keeps
         # the process on the non-CET path. LocalSystem's broker benefits most.
-        flags.append("-Clink-arg=/CETCOMPAT")
+        # x86_64 only: ARM64's linker rejects the flag (LNK1246).
+        if not arm64:
+            flags.append("-Clink-arg=/CETCOMPAT")
     return flags
 
 
-def release_rustflags(windows_target: bool) -> dict[str, str] | None:
-    flags = release_flag_list(windows_target)
+def release_rustflags(
+    windows_target: bool, arm64: bool = False
+) -> dict[str, str] | None:
+    flags = release_flag_list(windows_target, arm64)
     return {"RUSTFLAGS": " ".join(flags)} if flags else None
 
 
@@ -112,8 +119,14 @@ def have(tool: str) -> bool:
 
 # Non-host backends the project claims to support (README, AGENTS.md). The
 # host gate cannot type-check cfg-gated platform code, so these are checked
-# separately when their standard library is installed.
-CROSS_CHECK_TARGETS = ["x86_64-unknown-linux-gnu", "aarch64-apple-darwin"]
+# separately when their standard library is installed. The ARM64 entries
+# mirror the release artifacts built by --all-targets.
+CROSS_CHECK_TARGETS = [
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+    "aarch64-pc-windows-msvc",
+    "aarch64-apple-darwin",
+]
 
 # Renderer features that must each build on their own. The default build
 # enables all three, so a feature-specific cfg mistake (the software-only
@@ -193,11 +206,11 @@ def renderer_feature_check() -> bool:
     return ok
 
 
-def linux_cross_command(profile: str) -> tuple[list[str], str] | None:
+def linux_cross_command(profile: str, target: str = LINUX_TARGET) -> tuple[list[str], str] | None:
     if have("cross"):
         return (
-            ["cross", "build", "--profile", profile, "--target", LINUX_TARGET],
-            str(ROOT / "target" / LINUX_TARGET / profile),
+            ["cross", "build", "--profile", profile, "--target", target],
+            str(ROOT / "target" / target / profile),
         )
     if have("cargo-zigbuild"):
         # Pin the glibc ABI floor. cargo-zigbuild's default tracks the host's
@@ -210,9 +223,9 @@ def linux_cross_command(profile: str) -> tuple[list[str], str] | None:
                 "--profile",
                 profile,
                 "--target",
-                f"{LINUX_TARGET}.2.17",
+                f"{target}.2.17",
             ],
-            str(ROOT / "target" / LINUX_TARGET / profile),
+            str(ROOT / "target" / target / profile),
         )
     return None
 
@@ -287,6 +300,38 @@ def build_linux_musl(profile: str) -> tuple[Path | None, bool]:
     return exe, True
 
 
+def build_windows_arm64(profile: str) -> Path | None:
+    """Cross-build the Windows ARM64 GUI + service (Windows host only)."""
+    if platform.system() != "Windows":
+        log("windows arm64 build requires a Windows host - skipping")
+        return None
+    if platform.machine().lower() in ("arm64", "aarch64"):
+        # The host build already produced the ARM64 binaries.
+        return None
+    if WINDOWS_ARM64_TARGET not in installed_rust_targets():
+        log(f"target {WINDOWS_ARM64_TARGET} not installed - skipping windows arm64")
+        return None
+    env = release_rustflags(True, arm64=True) if profile != "dev" else None
+    if not run(
+        [
+            cargo(),
+            "build",
+            "--profile",
+            profile,
+            "--target",
+            WINDOWS_ARM64_TARGET,
+            "--workspace",
+        ],
+        env=env,
+    ):
+        return None
+    exe = ROOT / "target" / WINDOWS_ARM64_TARGET / profile / "taskman.exe"
+    if not exe.exists():
+        log(f"windows arm64 binary missing after build: {exe}")
+        return None
+    return exe
+
+
 def build_host(profile: str) -> Path | None:
     exe_name = "taskman.exe" if platform.system() == "Windows" else "taskman"
     out_dir = ROOT / "target" / ("debug" if profile == "dev" else profile)
@@ -300,14 +345,15 @@ def build_host(profile: str) -> Path | None:
     return exe
 
 
-def build_linux(profile: str) -> tuple[Path | None, bool, str]:
-    """Build the Linux x86_64 artifact, preferring a glibc cross toolchain.
+def build_linux(profile: str, target: str = LINUX_TARGET) -> tuple[Path | None, bool, str]:
+    """Build one Linux artifact, preferring a glibc cross toolchain.
 
     Returns ``(binary, attempted, flavor)`` where flavor is ``"gnu"`` or
     ``"musl"``. ``attempted`` is False only when no path exists at all, so the
     caller can distinguish "skipped for missing tooling" from "build failed".
+    The self-contained musl fallback exists for x86_64 only.
     """
-    cmd = linux_cross_command(profile)
+    cmd = linux_cross_command(profile, target)
     if cmd is not None:
         command, out_dir = cmd
         if not run(command, env=release_rustflags(False) if profile != "dev" else None):
@@ -317,6 +363,8 @@ def build_linux(profile: str) -> tuple[Path | None, bool, str]:
             log(f"linux binary missing after build: {exe}")
             return None, True, "gnu"
         return exe, True, "gnu"
+    if target != LINUX_TARGET:
+        return None, False, "gnu"
     # No glibc cross toolchain: the rust-lld/musl path works with rustup alone.
     exe, attempted = build_linux_musl(profile)
     return exe, attempted, "musl"
@@ -394,11 +442,16 @@ def main() -> int:
     ap.add_argument("--debug", action="store_true", help="build the dev profile instead of release")
     ap.add_argument("--host-only", action="store_true", help="skip the linux cross build")
     ap.add_argument("--linux-only", action="store_true", help="skip the host build")
+    ap.add_argument(
+        "--all-targets",
+        action="store_true",
+        help="also build Windows ARM64 and Linux ARM64 artifacts",
+    )
     ap.add_argument("--no-package", action="store_true", help="build but skip dist/ packaging")
     ap.add_argument(
         "--require-all-targets",
         action="store_true",
-        help="fail when the linux build has to be skipped for missing tooling",
+        help="fail when a requested target has to be skipped for missing tooling",
     )
     ap.add_argument(
         "--check",
@@ -468,6 +521,29 @@ def main() -> int:
                 )
             artifacts.append((f"taskman-v{version}-{host_tag()}", host_files))
 
+    # Windows ARM64: a Windows x64 host cross-builds it with the MSVC ARM64
+    # toolset. On an ARM64 host the host artifact already IS the ARM64 build.
+    windows_arm64_possible = (
+        platform.system() == "Windows"
+        and platform.machine().lower() not in ("arm64", "aarch64")
+    )
+    if args.all_targets and host_requested and windows_arm64_possible:
+        exe = build_windows_arm64(profile)
+        if exe is None:
+            if args.require_all_targets:
+                log("windows arm64 build required (--require-all-targets)")
+                failures += 1
+        else:
+            log(f"windows arm64 binary ready: {exe}")
+            files = [(exe, "taskman.exe")]
+            service_exe = exe.with_name("taskman-service.exe")
+            if not service_exe.exists():
+                log(f"core service binary missing after build: {service_exe}")
+                failures += 1
+            else:
+                files.append((service_exe, "taskman-service.exe"))
+            artifacts.append((f"taskman-v{version}-windows-arm64", files))
+
     if linux_requested:
         exe, attempted, flavor = build_linux(profile)
         if exe is not None:
@@ -483,6 +559,22 @@ def main() -> int:
             failures += 1
         elif args.require_all_targets:
             log("linux build required (--require-all-targets) but no toolchain")
+            failures += 1
+
+    if linux_requested and args.all_targets:
+        exe, attempted, flavor = build_linux(profile, LINUX_ARM64_TARGET)
+        if exe is not None:
+            log(f"linux arm64 binary ready ({flavor}): {exe}")
+            files = [(exe, "taskman")]
+            if LINUX_DESKTOP.exists():
+                files.append(
+                    (LINUX_DESKTOP, "share/applications/io.github.aufkrawall.Taskman.desktop")
+                )
+            artifacts.append((f"taskman-v{version}-linux-arm64", files))
+        elif attempted:
+            failures += 1
+        elif args.require_all_targets:
+            log("linux arm64 build required (--require-all-targets) but no toolchain")
             failures += 1
 
     if not args.no_package:

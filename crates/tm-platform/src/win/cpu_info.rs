@@ -71,6 +71,8 @@ impl CpuStatic {
 }
 
 /// Parse "@ 3.40GHz" from a brand string as a last-resort base-clock fallback.
+/// x86_64 only: ARM64 has no CPUID brand string.
+#[cfg(target_arch = "x86_64")]
 fn parse_base_from_brand(brand: &str) -> f32 {
     let Some(idx) = brand.to_ascii_lowercase().find("ghz") else {
         return 0.0;
