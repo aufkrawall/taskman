@@ -171,6 +171,15 @@ remain follow-up rather than being simulated in headless tests:
 - **Grouped process labels show whole-subtree counts even when collapsed**
   ("Brave Browser (43)" with children hidden). This now MATCHES native TM;
   noted so it isn't "fixed" back to direct-children counts.
+- **The Windows Start menu/search is always above an always-on-top window**
+  (measured 2026-09-09). Our window and the taskbar are in window band 1
+  (`ZBID_DESKTOP`); the Start menu/search surface is a `Windows.UI.Core.CoreWindow`
+  in band 6 (`ZBID_IMMERSIVE_MOBILE`). `SetWindowBand` to band 2 or 6 from a
+  normal process fails with `ERROR_INVALID_PARAMETER` (87), and even UIAccess
+  (band 2) would still be below 6. This is a Windows shell boundary, not a
+  missing reassert: the strict-topmost keeper still wins against the taskbar
+  and ordinary topmost windows, and TaskMan stays topmost after the menu
+  closes. Do not add polling or shell-fighting workarounds for it.
 
 ## Falsified findings — do not re-raise
 

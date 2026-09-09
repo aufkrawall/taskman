@@ -174,11 +174,15 @@ fn install_strict_topmost_hooks() {
 
 /// Keep TaskMan above the Windows shell as well as ordinary top-level windows.
 ///
-/// The taskbar and Start menu use topmost shell surfaces of their own, so a
-/// one-shot `HWND_TOPMOST` request does not define which topmost window wins
-/// after the shell changes z-order. The WinEvent hooks above reinsert TaskMan
-/// at the front of that band whenever a foreground/window show/reorder event
-/// occurs. `SWP_NOACTIVATE` means this never steals keyboard focus.
+/// The taskbar and ordinary topmost windows live in window band 1
+/// (`ZBID_DESKTOP`), so reinserting at the front of that band keeps TaskMan
+/// above them. The Start menu, search flyout and other immersive shell
+/// surfaces live in band 6 (`ZBID_IMMERSIVE_MOBILE`), which no normal window
+/// can outrank: `SetWindowBand` to a higher band fails with
+/// ERROR_INVALID_PARAMETER (87) from a normal process, and UIAccess (band 2)
+/// is still below 6. That is a Windows shell design boundary, not a missing
+/// reassert — measured 2026-09-09 and recorded in `known-debt.md`. Do not try
+/// to "fix" it with polling or by fighting the shell.
 pub fn set_strict_topmost(hwnd: isize, enabled: bool) {
     use std::sync::atomic::Ordering;
 

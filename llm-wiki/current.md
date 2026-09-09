@@ -91,8 +91,13 @@ Ten reported gaps in one pass; `log/recent.md` carries the root causes.
   mode and the Windows 11 backdrop request. The limits are in `known-debt.md`.
 - **Always on top is strict on Windows.** In addition to the toolkit window
   level, WinEvent foreground/show/reorder notifications reinsert TaskMan at
-  the front of the topmost band without activating it, so taskbar/Start shell
-  surfaces cannot remain above an opted-in TaskMan window.
+  the front of the topmost band without activating it, so the taskbar and
+  ordinary topmost windows cannot remain above an opted-in TaskMan window.
+  The Start menu, search flyout and other immersive shell surfaces live in
+  window band 6 and are always above every normal/UIAccess window by Windows
+  design (measured 2026-09-09: our window and the taskbar are band 1, the
+  Start/search window is band 6, and `SetWindowBand` to a higher band fails
+  with error 87). See `known-debt.md`.
 - **Built-in Task Manager stays reachable.** A top command-bar button launches
   Windows Task Manager even while TaskMan's IFEO replacement is enabled; it
   uses the debugger-create bypass and immediately detaches rather than racing

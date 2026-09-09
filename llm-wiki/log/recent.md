@@ -11,6 +11,26 @@
 - 2026-09-08: Process Properties now summarizes mitigations with System Informer-style qualifiers (permanent DEP, high-entropy ASLR, prohibited/disabled wording, CF Guard and stack protection), and module inventory uses the authenticated LocalSystem broker for identity-bound SYSTEM/service inspection with bounded responses.
 # Recent Activity
 
+## 2026-09-09 — Always-on-top vs the Start menu: a window-band boundary
+
+User report: the Start menu still appears above an always-on-top TaskMan
+window. Measured on this machine with `GetWindowBand`:
+
+- TaskMan (egui/winit `Window Class`): band 1 (`ZBID_DESKTOP`), `WS_EX_TOPMOST`.
+- Taskbar (`Shell_TrayWnd`): band 1, `WS_EX_TOPMOST`.
+- Start menu/search (`Windows.UI.Core.CoreWindow`, "Suche", SearchHost): band 6
+  (`ZBID_IMMERSIVE_MOBILE`), `WS_EX_TOPMOST`.
+- `SetWindowBand(hwnd, HWND_TOPMOST, 2 | 6)` fails with
+  `ERROR_INVALID_PARAMETER` (87).
+
+The strict-topmost keeper works as designed: it wins against the taskbar and
+ordinary topmost windows, and the window is still topmost and active after the
+Start menu closes. No normal or UIAccess window can outrank band 6, so the
+Start menu staying above is a Windows shell boundary, not a missing reassert.
+Corrected the 2026-09-08 claim in `current.md`, recorded the limitation in
+`known-debt.md`, and documented it in `window_chrome.rs` so it is not
+re-attempted with polling or shell fighting.
+
 ## 2026-09-09 — Native-aligned classification, service-host names, exact user identity
 
 A side-by-side comparison with native Windows 11 Task Manager (screenshot)
@@ -266,8 +286,11 @@ see build.md § CI. Commit `c218a97`; CI green after.
    one-shot window level is still set, but Windows also installs out-of-context
    WinEvent hooks for foreground, top-level show and z-order reorder events.
    While enabled and visible, TaskMan reinserts itself at `HWND_TOPMOST` with
-   `SWP_NOACTIVATE`, preventing the taskbar/Start menu from remaining above it
-   without stealing input focus. No polling or timing retry is involved.
+   `SWP_NOACTIVATE`, preventing band-1 shell surfaces (the taskbar) from
+   remaining above it without stealing input focus. No polling or timing retry
+   is involved. Correction (2026-09-09): the Start menu/search lives in window
+   band 6 and is always above every normal window regardless of topmost; see
+   the 2026-09-09 entry.
 2. **The built-in Task Manager remains explicitly reachable.** Every tab's top
    command bar has a Windows Task Manager action. It starts the System32
    `Taskmgr.exe` with `DEBUG_ONLY_THIS_PROCESS`, which deliberately bypasses
