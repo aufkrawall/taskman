@@ -48,12 +48,16 @@ can cross a protected, allowlisted service boundary after one explicit install.
   gained an optional **User SID** column and Process Properties a User SID
   row, so `S-1-5-18`/`S-1-5-19`/`S-1-5-20` and `NT SERVICE\…` are
   distinguishable.
-- **UWP/Store apps are attributed to the app.** A visible
-  `ApplicationFrameWindow` is attributed to the process owning its hosted
-  `Windows.UI.Core.CoreWindow`; a cloaked frame with no hosted child (the ghost
-  left by a suspended app) is ignored, while the suspended app's own top-level
-  `CoreWindow` keeps it in Apps with status "Suspended". The shared
-  `ApplicationFrameHost.exe` broker no longer appears as an App row.
+- **UWP/Store apps are attributed to the app.** An `ApplicationFrameWindow`
+  is attributed to the process owning its hosted `Windows.UI.Core.CoreWindow`;
+  the ghost frame a closed app leaves behind (cloaked, no hosted child) is
+  ignored. While a view is minimized the shell detaches the `CoreWindow` and
+  cloaks it, so the still-uncloaked frame and the parked `CoreWindow` are
+  paired through their application user model id — the app stays in Apps with
+  status "Suspended" without the shared `ApplicationFrameHost.exe` broker ever
+  becoming an App row. A cloaked `CoreWindow` no frame claims is NOT an App:
+  `TextInputHost.exe` and a closed-but-resident `SystemSettings.exe` both keep
+  one alive and belong in Background processes.
 - **Services → Go to details** navigates to the running process (the reverse of
   the existing Processes → Go to service(s)).
 - Fixed pre-existing rustfmt drift in `app_ui.rs` and `explorer_restart.rs` so

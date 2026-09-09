@@ -11,6 +11,35 @@
 - 2026-09-08: Process Properties now summarizes mitigations with System Informer-style qualifiers (permanent DEP, high-entropy ASLR, prohibited/disabled wording, CF Guard and stack protection), and module inventory uses the authenticated LocalSystem broker for identity-bound SYSTEM/service inspection with bounded responses.
 # Recent Activity
 
+## 2026-09-09 — Hidden UWP hosts left Apps for Background
+
+User report: `SystemSettings.exe` with no visible window and
+`TextInputHost.exe` showed under Apps. Root cause in `windows_enum.rs`: both
+UWP window classes were exempt from the `DWMWA_CLOAKED` filter, so ANY visible
+`Windows.UI.Core.CoreWindow` counted as an App window. Measured on this
+machine (`EnumWindows` + `DwmGetWindowAttribute` probes):
+
+| state | frame | app's CoreWindow |
+| --- | --- | --- |
+| open | uncloaked, hosts the CoreWindow as a child | child of the frame |
+| minimized | uncloaked, iconic, no child | top-level, cloaked (2 = shell) |
+| closed but resident | cloaked (2), no child | top-level, cloaked (2) |
+| `TextInputHost.exe` | none | top-level, cloaked (2), permanently |
+
+So a cloaked `CoreWindow` proves nothing on its own, and the minimized case
+cannot be recovered from the frame alone (it belongs to the shared
+`ApplicationFrameHost.exe`, and attributing it there put the broker into Apps).
+Both halves do carry the same application user model id — the frame's through
+`SHGetPropertyStoreForWindow` + `PKEY_AppUserModel_ID` (~43 µs measured), the
+process's through `GetApplicationUserModelId` — so the enumeration now sorts
+each window into a `WindowRole` (unit-tested, no Win32) and pairs detached
+frames with parked CoreWindows by that id. The shell property store needs a COM
+apartment, which the sampling thread now opens once per thread.
+
+Verified live after the change: `TextInputHost.exe` → Background,
+`ApplicationFrameHost.exe` → Background, Settings open or minimized →
+`SystemSettings.exe` in Apps.
+
 ## 2026-09-09 — TaskMan v0.1.4 published
 
 GitHub release `v0.1.4` (tag `906cdd9`) ships Windows x86_64, Windows ARM64,

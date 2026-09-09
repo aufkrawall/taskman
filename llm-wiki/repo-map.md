@@ -67,8 +67,10 @@ platform boundary (`tm-core` ← `tm-platform` ← `tm-app` / `tm-service`):
     an elevated instance; an unacknowledged request starts its own
     instance), `windows_enum.rs` (one-pass top-window/hung-state inventory;
     UWP `ApplicationFrameWindow`s are attributed to their hosted
-    `Windows.UI.Core.CoreWindow` process, cloaked suspended-app CoreWindows
-    count as App windows and cloaked ghost frames are ignored),
+    `Windows.UI.Core.CoreWindow` process, cloaked ghost frames are ignored,
+    and a cloaked top-level `CoreWindow` counts only when an on-screen frame
+    with the same application user model id claims it — the minimized-app
+    case),
     `window_chrome.rs` (DWM caption colour / dark mode / backdrop / cloaking,
     plus an event-driven strict-topmost keeper that reasserts the root HWND on
     foreground/show/reorder events so topmost shell surfaces cannot stay above it),
