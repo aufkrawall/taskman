@@ -836,9 +836,14 @@ fn row_ui(
             app.selection.clear();
         } else if row.aggregate && expanded {
             // Once open, the aggregate is a pure virtual parent. Clicking its
-            // body behaves like its chevron instead of selecting the concrete
-            // root process that is now visible directly below it.
-            app.processes_state.toggle_expanded(row.pid);
+            // body selects every concrete process it represents; expansion
+            // and collapse remain exclusive to the chevron.
+            let represented: HashSet<_> = row.termination_targets.iter().cloned().collect();
+            let order = selectable_identities(all_rows)
+                .into_iter()
+                .filter(|identity| represented.contains(identity))
+                .collect::<Vec<_>>();
+            app.selection.select_all(&order);
         } else if selectable {
             let kind =
                 crate::selection::ClickKind::from_modifiers(&ui.input(|input| input.modifiers));
@@ -3507,7 +3512,7 @@ mod tests {
             0,
             true,
             &HashSet::new(),
-            &groups,
+            &[false; 3],
         );
         let apps = rows_in_group(&rows, 0);
         assert_eq!(apps.iter().map(|r| r.pid).collect::<Vec<_>>(), vec![2]);
