@@ -3512,7 +3512,7 @@ mod tests {
             0,
             true,
             &HashSet::new(),
-            &[false; 3],
+            &groups,
         );
         let apps = rows_in_group(&rows, 0);
         assert_eq!(apps.iter().map(|r| r.pid).collect::<Vec<_>>(), vec![2]);
