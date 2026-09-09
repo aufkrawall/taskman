@@ -16,3 +16,10 @@ tracing = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
 windows-service = { workspace = true }
+
+[lints.rust]
+# Rust 1.97 promotes otherwise harmless Zig/lld stderr (notably the deprecated
+# `-O1` optimization spelling) to a compiler warning during Linux zigbuilds.
+# `unknown_lints` keeps this compatible with the workspace's older MSRV.
+unknown_lints = "allow"
+linker_messages = "allow"
