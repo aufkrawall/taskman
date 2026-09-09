@@ -5,6 +5,7 @@ mod autostart;
 pub mod core_service;
 mod cpu_info;
 pub(crate) mod cpu_load;
+mod explorer_restart;
 mod gpu;
 pub mod icons;
 /// Cross-process coordination between the instances of one session.
@@ -140,6 +141,12 @@ pub fn process_security_info(
     expected_start_epoch_s: Option<i64>,
 ) -> Result<ProcessSecurityInfo> {
     process_ops::process_security_info(pid, expected_start_epoch_s)
+}
+
+/// Restart one exact Windows Explorer shell generation in the interactive
+/// user's session. This deliberately never crosses the LocalSystem broker.
+pub fn restart_explorer(pid: u32, expected_start_epoch_s: Option<i64>) -> Result<()> {
+    explorer_restart::restart(pid, expected_start_epoch_s)
 }
 
 /// Keep the UI/service control plane responsive when ordinary workloads
