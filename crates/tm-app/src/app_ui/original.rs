@@ -1019,6 +1019,12 @@ pub fn process_end_dialog(app: &mut TaskManApp, ctx: &egui::Context) {
     let Some(pending) = app.pending_process_end.clone() else {
         return;
     };
+    const END_TASK_LIST_MAX_HEIGHT: f32 = 168.0;
+    let dialog_height = if pending.targets.len() <= 1 {
+        124.0
+    } else {
+        123.0 + (pending.targets.len() as f32 * 21.0).min(END_TASK_LIST_MAX_HEIGHT)
+    };
     let mut open = true;
     let focus_id = egui::Id::new("end_task_dialog_focus_end");
     let mut end_focused: bool = ctx.data(|d| d.get_temp(focus_id)).unwrap_or(true);
@@ -1042,10 +1048,11 @@ pub fn process_end_dialog(app: &mut TaskManApp, ctx: &egui::Context) {
     }
 
     egui::Window::new(i18n::tr(K::EndTask))
+        .id(egui::Id::new("end-task-dialog"))
         .open(&mut open)
         .collapsible(false)
         .resizable(false)
-        .auto_sized()
+        .fixed_size([420.0, dialog_height])
         .anchor(Align2::CENTER_CENTER, [0.0, -40.0])
         .show(ctx, |ui| {
             ui.set_width(400.0);
@@ -1083,7 +1090,7 @@ pub fn process_end_dialog(app: &mut TaskManApp, ctx: &egui::Context) {
                         .inner_margin(egui::Margin::symmetric(10, 6))
                         .show(ui, |ui| {
                             egui::ScrollArea::vertical()
-                                .max_height(168.0)
+                                .max_height(END_TASK_LIST_MAX_HEIGHT)
                                 .auto_shrink([false, true])
                                 .show(ui, |ui| {
                                     ui.spacing_mut().item_spacing.y = 3.0;
@@ -1263,10 +1270,11 @@ pub fn run_task_dialog(app: &mut TaskManApp, ctx: &egui::Context, _pal: &theme::
 
     let mut open = true;
     egui::Window::new(i18n::tr(K::RunDialogTitle))
+        .id(egui::Id::new("run-task-dialog"))
         .open(&mut open)
         .collapsible(false)
         .resizable(false)
-        .auto_sized()
+        .fixed_size([440.0, 174.0])
         .anchor(Align2::CENTER_CENTER, [0.0, -40.0])
         .show(ctx, |ui| {
             ui.set_width(420.0);
