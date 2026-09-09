@@ -44,7 +44,11 @@ missing.
    now uses the per-PID service account BEFORE the blanket session-0 →
    "SYSTEM" guess, so NETWORK SERVICE/LOCAL SERVICE hosts no longer all read
    "SYSTEM". Details has an optional User SID column and Process Properties a
-   User SID row.
+   User SID row. Protected processes (`csrss`, `dwm`, `winlogon`, NVIDIA's
+   session container) refuse `OpenProcess` and even `WTSEnumerateProcessesEx`
+   returns a null SID for them; `inherit_same_image_service_accounts` fills a
+   windowless same-image child from its catalogued service parent, which is
+   how the session-1 `NVDisplay.Container.exe` now reports SYSTEM/S-1-5-18.
 4. **UWP apps are attributed to the app, not the broker.** A visible
    `ApplicationFrameWindow` is attributed to the process owning its hosted
    `Windows.UI.Core.CoreWindow`; a cloaked frame without a hosted child is a

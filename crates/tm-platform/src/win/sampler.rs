@@ -762,6 +762,12 @@ impl Sampler {
             }
         }
 
+        // A per-session helper of a service often runs under the same
+        // protected account the service does, which no handle query reaches
+        // (NVIDIA's session container). The SCM catalog names the service
+        // account authoritatively, so a same-image child may inherit it.
+        inherit_same_image_service_accounts(&mut processes, &service_catalog);
+
         // ---- classification refinement + App grouping (TM semantics) -------------
         // Every process with a visible window is an app root; windowless
         // ancestors below system boundaries fold in ("Steam (2)" absorbs
@@ -1203,6 +1209,52 @@ fn append_pseudo_rows(
 /// Walk ancestors for each process (bounded hops, zero extra allocations —
 /// names are borrowed from the vec itself), then run the classifier with the
 /// real ancestor chain and fold app subtrees together.
+/// Fill an unknown owner from the SCM catalog when the process is a
+/// windowless, same-image child of a catalogued service process.
+///
+/// Protected per-session helpers (NVIDIA's `NVDisplay.Container.exe`) refuse
+/// `OpenProcess` entirely, and even `WTSEnumerateProcessesEx` returns a null
+/// SID for them, so the service's configured account is the only
+/// authoritative source. The rule is deliberately narrow: same image, no
+/// window, parent known from the service catalog. A service that spawns a
+/// differently-accounted copy of its own image is not a real pattern, while
+/// the common same-image cases (per-session replicas, self-elevated helpers)
+/// keep the same account.
+fn inherit_same_image_service_accounts(
+    processes: &mut [ProcessEntry],
+    catalog: &process_ops::ServiceCatalog,
+) {
+    if catalog.accounts_by_pid.is_empty() {
+        return;
+    }
+    let parents: HashMap<u32, (String, String, Option<String>)> = processes
+        .iter()
+        .filter(|p| catalog.accounts_by_pid.contains_key(&p.pid))
+        .filter_map(|p| {
+            let user = p.user.clone()?;
+            Some((p.pid, (p.name.clone(), user, p.user_sid.clone())))
+        })
+        .collect();
+    if parents.is_empty() {
+        return;
+    }
+    for p in processes.iter_mut() {
+        if p.user.is_some() || p.has_window || p.synthetic {
+            continue;
+        }
+        let Some(parent) = p.ppid.and_then(|ppid| parents.get(&ppid)) else {
+            continue;
+        };
+        if !parent.0.eq_ignore_ascii_case(&p.name) {
+            continue;
+        }
+        p.user = Some(parent.1.clone());
+        if p.user_sid.is_none() {
+            p.user_sid = parent.2.clone();
+        }
+    }
+}
+
 fn refine_categories_and_group_apps(processes: &mut [ProcessEntry]) {
     // pid -> index for O(1) parent lookups.
     let idx_by_pid: HashMap<u32, usize> = processes
@@ -1479,6 +1531,38 @@ mod tests {
             windows_owned_evidence(Some("Microsoft Corporation"), None, root),
             None
         );
+    }
+
+    #[test]
+    fn same_image_service_children_inherit_the_catalogued_account() {
+        let mut catalog = process_ops::ServiceCatalog::default();
+        catalog.accounts_by_pid.insert(2324, "SYSTEM".to_string());
+
+        let mut parent = ProcessEntry::new(2324, "NVDisplay.Container.exe");
+        parent.user = Some("SYSTEM".into());
+        parent.user_sid = Some("S-1-5-18".into());
+
+        // Same image, windowless, unknown owner: NVIDIA's session container.
+        let mut child = ProcessEntry::new(8420, "NVDisplay.Container.exe");
+        child.ppid = Some(2324);
+
+        // Same parent but a different image must NOT inherit.
+        let mut other = ProcessEntry::new(8421, "other.exe");
+        other.ppid = Some(2324);
+
+        // Same image but windowed must NOT inherit.
+        let mut windowed = ProcessEntry::new(8422, "NVDisplay.Container.exe");
+        windowed.ppid = Some(2324);
+        windowed.has_window = true;
+
+        let mut processes = vec![parent, child, other, windowed];
+        inherit_same_image_service_accounts(&mut processes, &catalog);
+
+        let find = |pid| processes.iter().find(|p| p.pid == pid).unwrap();
+        assert_eq!(find(8420).user.as_deref(), Some("SYSTEM"));
+        assert_eq!(find(8420).user_sid.as_deref(), Some("S-1-5-18"));
+        assert_eq!(find(8421).user, None);
+        assert_eq!(find(8422).user, None);
     }
 
     #[test]

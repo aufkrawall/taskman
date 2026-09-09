@@ -39,9 +39,15 @@ can cross a protected, allowlisted service boundary after one explicit install.
   user SID alongside the account name; well-known accounts get one canonical
   spelling (`SYSTEM`, `LOCAL SERVICE`, `NETWORK SERVICE`) regardless of OS
   language, and session-0 hosts whose token cannot be opened take their account
-  from the SCM catalog instead of the old blanket "SYSTEM". Details gained an
-  optional **User SID** column and Process Properties a User SID row, so
-  `S-1-5-18`/`S-1-5-19`/`S-1-5-20` and `NT SERVICE\…` are distinguishable.
+  from the SCM catalog instead of the old blanket "SYSTEM". Protected
+  processes (`csrss`, `dwm`, `winlogon`, NVIDIA's session container) refuse
+  `OpenProcess` entirely and even `WTSEnumerateProcessesEx` returns a null
+  SID for them; a windowless **same-image child of a catalogued service**
+  inherits that service's account (`NVDisplay.Container.exe` session 1 →
+  SYSTEM), which is the only authoritative source for those helpers. Details
+  gained an optional **User SID** column and Process Properties a User SID
+  row, so `S-1-5-18`/`S-1-5-19`/`S-1-5-20` and `NT SERVICE\…` are
+  distinguishable.
 - **UWP/Store apps are attributed to the app.** A visible
   `ApplicationFrameWindow` is attributed to the process owning its hosted
   `Windows.UI.Core.CoreWindow`; a cloaked frame with no hosted child (the ghost
