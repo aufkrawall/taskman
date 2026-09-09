@@ -1,6 +1,9 @@
 //! UI chrome wrapper that adds the Windows Explorer restart command while
 //! keeping the existing chrome implementation intact.
 
+// `tab_header` is intentionally overridden below; keep the original chrome
+// implementation intact without warning about that shadowed function.
+#[allow(dead_code)]
 mod original;
 pub use original::*;
 
