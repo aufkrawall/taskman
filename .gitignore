@@ -5,3 +5,4 @@ bench/dist
 *.log.tmp
 *.png
 CLAUDE.md
+vendor/winit/target

@@ -171,15 +171,17 @@ remain follow-up rather than being simulated in headless tests:
 - **Grouped process labels show whole-subtree counts even when collapsed**
   ("Brave Browser (43)" with children hidden). This now MATCHES native TM;
   noted so it isn't "fixed" back to direct-children counts.
-- **The Windows Start menu/search is always above an always-on-top window**
-  (measured 2026-09-09). Our window and the taskbar are in window band 1
-  (`ZBID_DESKTOP`); the Start menu/search surface is a `Windows.UI.Core.CoreWindow`
-  in band 6 (`ZBID_IMMERSIVE_MOBILE`). `SetWindowBand` to band 2 or 6 from a
-  normal process fails with `ERROR_INVALID_PARAMETER` (87), and even UIAccess
-  (band 2) would still be below 6. This is a Windows shell boundary, not a
-  missing reassert: the strict-topmost keeper still wins against the taskbar
-  and ordinary topmost windows, and TaskMan stays topmost after the menu
-  closes. Do not add polling or shell-fighting workarounds for it.
+- **Always-on-top only reaches the Start menu when enabled at startup**
+  (2026-09-09). Native Task Manager creates its window in window band 16
+  (`CreateWindowInBand`), above the Start menu's band 6. A band-16 window is
+  implicitly `WS_EX_TOPMOST` and cannot be demoted: `SetWindowBand` fails with
+  `ERROR_ACCESS_DENIED`, and both `SetWindowPos(HWND_NOTOPMOST)` and clearing
+  the exstyle leave the window topmost. The band is therefore chosen at window
+  creation from the persisted `always_on_top` setting (vendored `vendor/winit`
+  patch; `TASKMAN_WINDOW_BAND=16`). Toggling the setting at runtime still
+  applies ordinary band-1 topmost, and the settings dialog shows the existing
+  "Takes effect at the next start." hint while the live value differs. Do not
+  add polling or shell-fighting workarounds.
 
 ## Falsified findings — do not re-raise
 

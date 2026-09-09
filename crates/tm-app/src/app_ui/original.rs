@@ -655,6 +655,16 @@ pub fn settings_dialog(app: &mut TaskManApp, ctx: &egui::Context, _pal: &theme::
                 }));
                 app.shared.settings.save();
             }
+            if app.shared.settings.always_on_top != app.startup_always_on_top {
+                // The Start-menu-proof band is chosen when the window is
+                // created (and a band-16 window cannot be demoted), so the
+                // live toggle is only a best effort until the next start.
+                ui.label(
+                    egui::RichText::new(i18n::tr(K::RestartRequired))
+                        .size(11.0)
+                        .color(_pal.text_dim),
+                );
+            }
 
             let mut autosave = app.shared.settings.save_config;
             if crate::widgets::controls::checkbox(

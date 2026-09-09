@@ -4,7 +4,9 @@ members = ["crates/tm-core", "crates/tm-platform", "crates/tm-app", "crates/tm-s
 # `vendor/egui` is our egui fork (see llm-wiki/render-pipeline.md). It carries its own
 # [workspace] and uses `workspace = true` field inheritance plus relative path deps, so it
 # must stay a separate workspace; it is reached only through [patch.crates-io] below.
-exclude = ["vendor/egui"]
+# `vendor/winit` is a single-crate patch (window band 16 for always-on-top, see
+# llm-wiki/render-pipeline.md) reached the same way.
+exclude = ["vendor/egui", "vendor/winit"]
 
 [workspace.package]
 version = "0.1.4"
@@ -80,3 +82,11 @@ egui-winit = { path = "vendor/egui/crates/egui-winit" }
 egui_glow = { path = "vendor/egui/crates/egui_glow" }
 egui-wgpu = { path = "vendor/egui/crates/egui-wgpu" }
 eframe = { path = "vendor/egui/crates/eframe" }
+
+# --- Vendored winit patch -----------------------------------------------------
+#
+# One change: `TASKMAN_WINDOW_BAND=<n>` makes window creation use
+# `CreateWindowInBand` (native Task Manager's band 16, above the Start menu),
+# which `SetWindowBand` cannot do after creation. See
+# vendor/winit/TASKMAN-FORK.md and llm-wiki/render-pipeline.md.
+winit = { path = "vendor/winit" }

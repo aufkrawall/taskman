@@ -260,3 +260,10 @@ divergence #5 in `TASKMAN-FORK.md`).
 `llm-wiki/render-pipeline.md` is the design. The fork has its own quality gate,
 `tools/check-fork.ps1`, because `cargo clippy --workspace` does not reach an excluded
 workspace.
+
+`vendor/winit/` is a single-crate patch of winit 0.30.13: `TASKMAN_WINDOW_BAND`
+makes window creation use `CreateWindowInBand` so an always-on-top TaskMan
+window can be created in native Task Manager's band 16, above the Start menu.
+`vendor/winit/TASKMAN-FORK.md` documents the change and the rebase steps;
+`tools/check-fork.ps1` gates it too (clippy + tests, no fmt — upstream's tree
+is not formatted with this nightly rustfmt).

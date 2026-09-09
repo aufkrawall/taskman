@@ -86,6 +86,27 @@ pub fn set_strict_topmost(hwnd: isize, enabled: bool) {
 #[cfg(not(target_os = "windows"))]
 pub fn set_strict_topmost(_hwnd: isize, _enabled: bool) {}
 
+/// Create the main window in native Task Manager's window band (16), which is
+/// above the Start menu. Must be called before the GUI window exists; the
+/// patched winit reads the band at creation time.
+#[cfg(target_os = "windows")]
+pub fn request_topmost_band() {
+    win::window_chrome::request_topmost_band();
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn request_topmost_band() {}
+
+/// Stop advertising the window band to child processes (call once the window
+/// exists).
+#[cfg(target_os = "windows")]
+pub fn clear_topmost_band() {
+    win::window_chrome::clear_topmost_band();
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn clear_topmost_band() {}
+
 /// Hide or reveal a window at the compositor — see
 /// [`win::window_chrome::set_cloaked`]. Non-Windows hosts ignore it.
 #[cfg(target_os = "windows")]

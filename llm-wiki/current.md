@@ -93,11 +93,12 @@ Ten reported gaps in one pass; `log/recent.md` carries the root causes.
   level, WinEvent foreground/show/reorder notifications reinsert TaskMan at
   the front of the topmost band without activating it, so the taskbar and
   ordinary topmost windows cannot remain above an opted-in TaskMan window.
-  The Start menu, search flyout and other immersive shell surfaces live in
-  window band 6 and are always above every normal/UIAccess window by Windows
-  design (measured 2026-09-09: our window and the taskbar are band 1, the
-  Start/search window is band 6, and `SetWindowBand` to a higher band fails
-  with error 87). See `known-debt.md`.
+  When the setting is enabled at startup the main window is created in native
+  Task Manager's window band 16 (`CreateWindowInBand`, via the vendored
+  `vendor/winit` patch), which is above the Start menu's band 6. A band-16
+  window is permanently topmost and cannot be demoted, so the settings dialog
+  shows "Takes effect at the next start." while the live toggle differs from
+  the startup value; runtime toggling applies ordinary band-1 topmost.
 - **Built-in Task Manager stays reachable.** A top command-bar button launches
   Windows Task Manager even while TaskMan's IFEO replacement is enabled; it
   uses the debugger-create bypass and immediately detaches rather than racing

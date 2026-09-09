@@ -317,6 +317,11 @@ pub struct TaskManApp {
     /// Native Win32 strict-topmost state last applied to the root HWND.
     #[cfg(target_os = "windows")]
     native_topmost_applied: Option<bool>,
+    /// Value of `always_on_top` when the window was created. The Start-menu
+    /// band is chosen at creation and cannot be changed afterwards, so the
+    /// settings dialog shows "takes effect at the next start" while the live
+    /// value differs.
+    pub startup_always_on_top: bool,
 
     // Tab states.
     pub processes_state: crate::tabs::processes::State,
@@ -413,6 +418,7 @@ impl TaskManApp {
                     egui::WindowLevel::AlwaysOnTop,
                 ));
         }
+        let startup_always_on_top = settings.always_on_top;
 
         // Active UI language: resolved from the persisted choice against the
         // OS-detected locale.
@@ -687,6 +693,7 @@ impl TaskManApp {
             title_bar_applied: None,
             #[cfg(target_os = "windows")]
             native_topmost_applied: None,
+            startup_always_on_top,
             selected_user: None,
             pending_session_logoff: None,
             pending_process_end,
@@ -1719,6 +1726,8 @@ impl TaskManApp {
             return;
         };
         tm_platform::set_strict_topmost(win32.hwnd.get(), enabled);
+        // The window exists now; stop advertising the band to child processes.
+        tm_platform::clear_topmost_band();
         self.native_topmost_applied = Some(enabled);
     }
 

@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-    Quality gate for the vendored egui fork at vendor/egui.
+    Quality gate for the vendored forks at vendor/egui and vendor/winit.
 
 .DESCRIPTION
     `cargo clippy --workspace` in the parent repo does NOT deny warnings in an excluded
@@ -11,6 +11,11 @@
     Runs fmt + clippy + tests for the crates taskman actually ships from the fork. It does
     not lint egui's demo, plot, extras or kittest crates -- we never build those, they carry
     upstream's own lint debt, and failing on it would make every rebase a cleanup project.
+
+    `vendor/winit` is a single-crate patch (window band 16, see
+    vendor/winit/TASKMAN-FORK.md). It gets clippy + tests but NOT `cargo fmt`: upstream's
+    tree is not formatted with this nightly rustfmt (1,100+ diffs in untouched files), and
+    reformatting it would turn every rebase into a churn exercise.
 
 .PARAMETER Fix
     Apply `cargo fmt` instead of checking it.
@@ -77,3 +82,21 @@ try {
 }
 
 Write-Host 'fork gate: OK' -ForegroundColor Green
+
+# --- vendor/winit (window-band patch) ------------------------------------------
+$winitRoot = Join-Path $repoRoot 'vendor/winit'
+if (Test-Path (Join-Path $winitRoot 'Cargo.toml')) {
+    Push-Location $winitRoot
+    try {
+        Write-Host '==> cargo clippy -D warnings (winit fork)' -ForegroundColor Cyan
+        cargo clippy --all-targets -- -D warnings
+        if ($LASTEXITCODE -ne 0) { throw "winit fork: cargo clippy failed ($LASTEXITCODE)" }
+
+        Write-Host '==> cargo test (winit fork)' -ForegroundColor Cyan
+        cargo test
+        if ($LASTEXITCODE -ne 0) { throw "winit fork: cargo test failed ($LASTEXITCODE)" }
+    } finally {
+        Pop-Location
+    }
+    Write-Host 'winit fork gate: OK' -ForegroundColor Green
+}

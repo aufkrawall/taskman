@@ -172,6 +172,32 @@ fn install_strict_topmost_hooks() {
     });
 }
 
+/// Ask the patched winit to create the main window in window band 16 — the
+/// band native Task Manager uses, which is above the Start menu (band 6).
+///
+/// The band can only be chosen at window creation (`SetWindowBand` fails with
+/// `ERROR_ACCESS_DENIED` for existing windows), so this must run before the
+/// GUI window exists. Call [`clear_topmost_band`] once it does, so child
+/// processes launched by TaskMan do not inherit the setting.
+pub fn request_topmost_band() {
+    unsafe {
+        let _ = windows::Win32::System::Environment::SetEnvironmentVariableW(
+            windows::core::w!("TASKMAN_WINDOW_BAND"),
+            windows::core::w!("16"),
+        );
+    }
+}
+
+/// Stop advertising the band to processes TaskMan launches.
+pub fn clear_topmost_band() {
+    unsafe {
+        let _ = windows::Win32::System::Environment::SetEnvironmentVariableW(
+            windows::core::w!("TASKMAN_WINDOW_BAND"),
+            windows::core::PCWSTR::null(),
+        );
+    }
+}
+
 /// Keep TaskMan above the Windows shell as well as ordinary top-level windows.
 ///
 /// The taskbar and ordinary topmost windows live in window band 1

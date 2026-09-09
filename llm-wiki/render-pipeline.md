@@ -4,6 +4,7 @@ Last verified: 2026-09-01
 
 Primary sources:
 - `vendor/egui/TASKMAN-FORK.md` (what diverges from upstream egui, and why)
+- `vendor/winit/TASKMAN-FORK.md` (window-band patch for always-on-top)
 - `vendor/egui/crates/egui_software/` (the CPU rasterizer)
 - `vendor/egui/crates/eframe/src/native/software_integration.rs`
 - `crates/tm-platform/src/win/text_rendering.rs`

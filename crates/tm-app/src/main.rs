@@ -404,8 +404,17 @@ fn run_gui(mock: bool, args: &[String]) {
     };
     StartupTrace::mark("run_native_enter");
 
+    // The Start-menu-proof window band is chosen when the window is created,
+    // so it reflects the persisted setting at launch only. A band-16 window
+    // is permanently topmost and cannot be demoted, so this stays conditional.
+    let topmost_band = settings.always_on_top;
     let mut last_err = None;
     for renderer in preferred_renderers(&renderer_pref) {
+        // Every renderer attempt creates a new window; re-request the band in
+        // case a previous attempt cleared it after its first frame.
+        if topmost_band {
+            tm_platform::request_topmost_band();
+        }
         tracing::info!(?renderer, "trying renderer");
         let use_mock = mock;
         let initial_tab = initial_tab_arg.clone();

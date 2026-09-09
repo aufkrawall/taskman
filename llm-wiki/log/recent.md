@@ -11,7 +11,7 @@
 - 2026-09-08: Process Properties now summarizes mitigations with System Informer-style qualifiers (permanent DEP, high-entropy ASLR, prohibited/disabled wording, CF Guard and stack protection), and module inventory uses the authenticated LocalSystem broker for identity-bound SYSTEM/service inspection with bounded responses.
 # Recent Activity
 
-## 2026-09-09 — Always-on-top vs the Start menu: a window-band boundary
+## 2026-09-09 — Always-on-top vs the Start menu: fixed with window band 16
 
 User report: the Start menu still appears above an always-on-top TaskMan
 window. Measured on this machine with `GetWindowBand`:
@@ -20,16 +20,31 @@ window. Measured on this machine with `GetWindowBand`:
 - Taskbar (`Shell_TrayWnd`): band 1, `WS_EX_TOPMOST`.
 - Start menu/search (`Windows.UI.Core.CoreWindow`, "Suche", SearchHost): band 6
   (`ZBID_IMMERSIVE_MOBILE`), `WS_EX_TOPMOST`.
-- `SetWindowBand(hwnd, HWND_TOPMOST, 2 | 6)` fails with
-  `ERROR_INVALID_PARAMETER` (87).
+- Native Task Manager (`TaskManagerWindow`): **band 16**, `WS_EX_TOPMOST`.
 
-The strict-topmost keeper works as designed: it wins against the taskbar and
-ordinary topmost windows, and the window is still topmost and active after the
-Start menu closes. No normal or UIAccess window can outrank band 6, so the
-Start menu staying above is a Windows shell boundary, not a missing reassert.
-Corrected the 2026-09-08 claim in `current.md`, recorded the limitation in
-`known-debt.md`, and documented it in `window_chrome.rs` so it is not
-re-attempted with polling or shell fighting.
+A controlled A/B capture (magenta topmost window, with and without the menu)
+proved the acrylic is above band-1 topmost windows, and that a late
+`SetWindowPos(HWND_TOPMOST)` does not help. The answer is what Task Manager
+does: `Taskmgr.exe` contains the `CreateWindowInBand` string and resolves it
+dynamically (it is not in the user32 import library).
+
+Band behaviour measured by creating windows in each band: bands 0/1 are
+normal, bands 2–14/17/18 are denied (`ERROR_ACCESS_DENIED`), 15/19/20 are
+invalid, and **band 16 is allowed, implicitly `WS_EX_TOPMOST`, and cannot be
+demoted** (`SetWindowBand` fails, `SetWindowPos(HWND_NOTOPMOST)` and clearing
+the exstyle are both ignored). `SetWindowBand` also cannot promote an existing
+window into band 16.
+
+Fix: a one-change vendored winit patch (`vendor/winit`, `TASKMAN_WINDOW_BAND`)
+creates the window with `CreateWindowInBand` when the persisted
+`always_on_top` is enabled at startup. Because band 16 is permanently topmost,
+the band is startup-only; runtime toggling keeps ordinary band-1 topmost and
+the settings dialog shows the existing "Takes effect at the next start." hint.
+Verified live: `always_on_top=on` → band 16 and the app stays above the open
+Start menu (pixel-identical overlap before/after); `always_on_top=off` → band
+1, normal stacking. `tools/check-fork.ps1` now also gates `vendor/winit`
+(clippy + tests; fmt is skipped because upstream's tree is not formatted with
+this nightly rustfmt).
 
 ## 2026-09-09 — Native-aligned classification, service-host names, exact user identity
 
