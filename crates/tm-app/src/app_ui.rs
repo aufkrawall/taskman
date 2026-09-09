@@ -10,7 +10,9 @@ pub use original::*;
 use eframe::egui;
 use tm_core::i18n::{self, K};
 
-use crate::app::{ProcessIdentity, TaskManApp};
+#[cfg(target_os = "windows")]
+use crate::app::ProcessIdentity;
+use crate::app::TaskManApp;
 use crate::icons::Icon;
 use crate::theme::Palette;
 
