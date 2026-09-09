@@ -1045,6 +1045,7 @@ pub fn process_end_dialog(app: &mut TaskManApp, ctx: &egui::Context) {
         .open(&mut open)
         .collapsible(false)
         .resizable(false)
+        .auto_sized()
         .anchor(Align2::CENTER_CENTER, [0.0, -40.0])
         .show(ctx, |ui| {
             ui.set_width(400.0);
@@ -1265,6 +1266,7 @@ pub fn run_task_dialog(app: &mut TaskManApp, ctx: &egui::Context, _pal: &theme::
         .open(&mut open)
         .collapsible(false)
         .resizable(false)
+        .auto_sized()
         .anchor(Align2::CENTER_CENTER, [0.0, -40.0])
         .show(ctx, |ui| {
             ui.set_width(420.0);
