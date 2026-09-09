@@ -11,6 +11,18 @@
 - 2026-09-08: Process Properties now summarizes mitigations with System Informer-style qualifiers (permanent DEP, high-entropy ASLR, prohibited/disabled wording, CF Guard and stack protection), and module inventory uses the authenticated LocalSystem broker for identity-bound SYSTEM/service inspection with bounded responses.
 # Recent Activity
 
+## 2026-09-09 — TaskMan v0.1.4 published
+
+GitHub release `v0.1.4` (tag `906cdd9`) ships Windows x86_64, Windows ARM64,
+Linux x86_64 and Linux ARM64 archives with SHA-256 checksums. Highlights:
+native-aligned process classification and service-host names, exact user
+identity (SID column, protected-service account inheritance), UWP app
+attribution, and always-on-top above the Start menu via window band 16.
+`python build.py --audit` (cargo-audit + gitleaks) was clean before publishing.
+ARM64 artifacts are cross-built and build-verified (PE/ELF machine headers),
+not run on ARM64 hardware here. `--all-targets` builds all four and is
+documented in `build.md`.
+
 ## 2026-09-09 — Always-on-top vs the Start menu: fixed with window band 16
 
 User report: the Start menu still appears above an always-on-top TaskMan
