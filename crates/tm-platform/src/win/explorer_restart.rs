@@ -10,10 +10,6 @@ use windows::Win32::Foundation::{CloseHandle, FILETIME, HANDLE, WAIT_OBJECT_0, W
 use windows::Win32::System::Threading as th;
 use windows::core::PWSTR;
 
-// SYNCHRONIZE is a standard process-object right rather than a member of the
-// PROCESS_* access-right constants exposed by windows-rs.
-const SYNCHRONIZE_ACCESS: u32 = 0x0010_0000;
-
 fn creation_epoch_from_handle(process: HANDLE) -> Option<i64> {
     unsafe {
         let mut create = FILETIME::default();
@@ -71,9 +67,8 @@ pub fn restart(pid: u32, expected_start_epoch_s: Option<i64>) -> Result<()> {
         ));
     }
 
-    let access = th::PROCESS_ACCESS_RIGHTS(
-        th::PROCESS_TERMINATE.0 | th::PROCESS_QUERY_LIMITED_INFORMATION.0 | SYNCHRONIZE_ACCESS,
-    );
+    let access =
+        th::PROCESS_TERMINATE | th::PROCESS_QUERY_LIMITED_INFORMATION | th::PROCESS_SYNCHRONIZE;
     let process = unsafe { th::OpenProcess(access, false, pid) }.map_err(|error| {
         if error.code().0 == 87 {
             TmError::ProcessNotFound { pid }
