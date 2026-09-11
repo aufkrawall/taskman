@@ -448,7 +448,7 @@ fn prepare_auto_fit_widths(
     sessions: &[&UserSession],
     aggs: &HashMap<u32, Agg>,
     snap: &tm_core::model::Snapshot,
-    agg_hdr: &[String; 4],
+    agg_hdr: &[String; 6],
 ) {
     let mut fit: Vec<f32> = table
         .cols

@@ -1004,6 +1004,7 @@ pub struct Aggregates {
     pub mem_pct: f32,
     pub disk_pct: f32,
     pub net_pct: f32,
+    pub gpu_pct: f32,
 }
 
 impl Aggregates {
@@ -1024,15 +1025,29 @@ impl Aggregates {
             mem_pct: snap.memory.used_pct(),
             disk_pct,
             net_pct: net_pct.clamp(0.0, 100.0),
+            // The adapter's own number is already the busiest engine, so the
+            // machine total is the busiest adapter — not a sum across them.
+            gpu_pct: snap.gpus.iter().map(|g| g.util_pct).fold(0.0f32, f32::max),
         }
     }
 
-    pub fn strings(&self) -> [String; 4] {
+    /// Header values in numeric-column order.
+    ///
+    /// The header row states MACHINE totals, not column sums — that is what
+    /// makes a row's percentage readable ("the disks are 43 % busy and this
+    /// process accounts for 100 % of that"). Disk activity therefore repeats
+    /// the disk total deliberately: its column is a share OF that number,
+    /// while the Disk column next to it is a byte rate.
+    ///
+    /// A table with fewer numeric columns simply uses the leading entries.
+    pub fn strings(&self) -> [String; 6] {
         [
             format::format_pct_hdr(self.cpu_pct),
             format::format_pct_hdr(self.mem_pct),
             format::format_pct_hdr(self.disk_pct),
             format::format_pct_hdr(self.net_pct),
+            format::format_pct_hdr(self.disk_pct),
+            format::format_pct_hdr(self.gpu_pct),
         ]
     }
 }

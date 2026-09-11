@@ -44,15 +44,18 @@ use crate::theme;
 use crate::widgets::menu;
 use crate::widgets::tablekit::{self, Aggregates, HeatCell, TmColumn};
 
-/// Numeric value columns: CPU, Memory, Disk, Network, Disk activity. They
-/// start at table column 2 and their order IS the order of [`RowData::values`].
-const VALUE_COLS: usize = 5;
+/// Numeric value columns: CPU, Memory, Disk, Network, Disk activity, GPU.
+/// They start at table column 2 and their order IS the order of
+/// [`RowData::values`].
+const VALUE_COLS: usize = 6;
 
-/// Index of the Network column inside `values` — the one column whose value
+/// Index of the Network column inside `values` — one of the three whose value
 /// can be genuinely unknown per row.
 const NET_VALUE: usize = 3;
 /// Index of the Disk activity column inside `values`; likewise optional.
 const DISK_ACT_VALUE: usize = 4;
+/// Index of the GPU column inside `values`; optional for the same reason.
+const GPU_VALUE: usize = 5;
 
 fn columns() -> Vec<TmColumn> {
     vec![
@@ -68,6 +71,9 @@ fn columns() -> Vec<TmColumn> {
         // next to it counts I/O BYTES the process asked for, cache hits
         // included; this one is its share of the time the disks really spent.
         TmColumn::num("diskact", i18n::tr(K::ColDiskActivity), 150.0),
+        // Busiest-engine utilization, from the same on-demand PDH group the
+        // Performance page uses.
+        TmColumn::num("gpu", i18n::tr(K::ColGpu), 110.0),
     ]
 }
 
@@ -99,8 +105,8 @@ pub struct RowData {
     /// rows contain only themselves. Other process actions keep
     /// using the normal selection model and are deliberately unaffected.
     termination_targets: Vec<crate::app::ProcessIdentity>,
-    /// cpu %, mem bytes, disk bps, net bps, disk-activity % (aggregated over
-    /// the display subtree).
+    /// cpu %, mem bytes, disk bps, net bps, disk-activity %, gpu %
+    /// (aggregated over the display subtree).
     pub values: [f64; VALUE_COLS],
     /// Per-column heat intensity normalized against the WHOLE display model
     /// before virtualization (audit P0.2): exactly 1.0 marks the column's
@@ -110,6 +116,8 @@ pub struct RowData {
     /// False while the per-process disk trace is not running. Rendered "—";
     /// a zero here would claim the process touched no disk.
     pub disk_available: bool,
+    /// False while the per-process GPU counters are not being collected.
+    pub gpu_available: bool,
     pub status: ProcStatus,
     /// True when the OS reports this process as power throttled
     /// (Efficiency mode) — rendered straight from the snapshot, never from
@@ -729,7 +737,7 @@ fn prepare_auto_fit_widths(
     ui: &egui::Ui,
     table: &mut tablekit::TmTable,
     rows: &[DisplayRow],
-    aggs: &[String; 4],
+    aggs: &[String; 6],
 ) {
     let header =
         |i: usize| tablekit::text_width(ui, table.cols[i].label, tablekit::FONT_HDR_LABEL) + 28.0;
@@ -763,6 +771,11 @@ fn prepare_auto_fit_widths(
             },
             if row.disk_available {
                 format::format_pct_cell(row.values[DISK_ACT_VALUE].min(100.0) as f32)
+            } else {
+                "—".to_string()
+            },
+            if row.gpu_available {
+                format::format_pct_cell(row.values[GPU_VALUE].min(100.0) as f32)
             } else {
                 "—".to_string()
             },
@@ -896,6 +909,11 @@ fn row_ui(
         },
         if row.disk_available {
             format::format_pct_cell(row.values[DISK_ACT_VALUE].min(100.0) as f32)
+        } else {
+            "—".to_string()
+        },
+        if row.gpu_available {
+            format::format_pct_cell(row.values[GPU_VALUE].min(100.0) as f32)
         } else {
             "—".to_string()
         },
@@ -1646,6 +1664,7 @@ fn emit_flat_with_family_groups(
                 .iter()
                 .any(|member| member.net_recv_bps.is_some() || member.net_sent_bps.is_some());
             let disk_available = fam.iter().any(|member| disk_known(member));
+            let gpu_available = fam.iter().any(|member| gpu_known(member));
             out.push(DisplayRow::Process(RowData {
                 pid: p.pid,
                 start_epoch_s: p.start_epoch_s,
@@ -1666,6 +1685,7 @@ fn emit_flat_with_family_groups(
                 heat: [0.0; VALUE_COLS],
                 net_available,
                 disk_available,
+                gpu_available,
                 status: if fam
                     .iter()
                     .any(|member| member.status == ProcStatus::NotResponding)
@@ -2018,6 +2038,7 @@ fn value_known(d: &RowData, i: usize) -> bool {
     match i {
         NET_VALUE => d.net_available,
         DISK_ACT_VALUE => d.disk_available,
+        GPU_VALUE => d.gpu_available,
         _ => true,
     }
 }
@@ -2061,6 +2082,7 @@ fn make_flat_row(p: &ProcessEntry) -> DisplayRow {
         heat: [0.0; VALUE_COLS],
         net_available: p.net_recv_bps.is_some() || p.net_sent_bps.is_some(),
         disk_available: disk_known(p),
+        gpu_available: gpu_known(p),
         status: p.status,
         power_throttled: p.power_throttled == Some(true),
         synthetic: p.synthetic,
@@ -2078,12 +2100,18 @@ fn own_values(p: &ProcessEntry) -> [f64; VALUE_COLS] {
         // Shares of one measured total, so summing them over a display subtree
         // is exactly as meaningful as summing the rates above.
         f64::from(p.disk_active_pct.unwrap_or(0.0)),
+        f64::from(p.gpu_util_pct.unwrap_or(0.0)),
     ]
 }
 
 /// Whether the per-process disk trace produced a value for this process.
 fn disk_known(p: &ProcessEntry) -> bool {
     p.disk_active_pct.is_some()
+}
+
+/// Whether the per-process GPU counters produced a value for this process.
+fn gpu_known(p: &ProcessEntry) -> bool {
+    p.gpu_util_pct.is_some()
 }
 
 /// Flat Background/Windows row: plain name, own values, no expand handle.
@@ -2104,6 +2132,7 @@ fn make_own_row(p: &ProcessEntry, depth: usize) -> DisplayRow {
         heat: [0.0; VALUE_COLS],
         net_available: p.net_recv_bps.is_some() || p.net_sent_bps.is_some(),
         disk_available: disk_known(p),
+        gpu_available: gpu_known(p),
         status: p.status,
         power_throttled: p.power_throttled == Some(true),
         synthetic: p.synthetic,
@@ -2215,6 +2244,7 @@ fn emit_tree<'a>(
             .iter()
             .any(|member| member.net_recv_bps.is_some() || member.net_sent_bps.is_some());
         let disk_available = members.iter().any(|member| disk_known(member));
+        let gpu_available = members.iter().any(|member| gpu_known(member));
         out.push(DisplayRow::Process(RowData {
             pid: root.pid,
             start_epoch_s: root.start_epoch_s,
@@ -2235,6 +2265,7 @@ fn emit_tree<'a>(
             heat: [0.0; VALUE_COLS],
             net_available,
             disk_available,
+            gpu_available,
             status: subtree.status(root.pid),
             power_throttled: subtree.efficiency(root.pid),
             synthetic: false,
@@ -3243,6 +3274,55 @@ mod tests {
             })
             .unwrap();
         assert!(d.disk_available, "measured zero must not read as unknown");
+    }
+
+    /// Every numeric column needs a header total, or the newest column shows a
+    /// blank where "6 %" / "43 %" sit next to it. `Aggregates::strings` is
+    /// positional, so a column added without extending it is silently empty.
+    #[test]
+    fn every_numeric_column_has_a_header_total() {
+        let numeric = columns().iter().filter(|c| c.numeric).count();
+        assert_eq!(numeric, VALUE_COLS, "value columns and table columns drift");
+        let snap = snap_of(vec![proc(1, None, "a", ProcCategory::Background)]);
+        let aggs = Aggregates::from_snapshot(&snap).strings();
+        assert!(
+            aggs.len() >= numeric,
+            "{numeric} numeric columns but only {} header totals",
+            aggs.len()
+        );
+        for (i, agg) in aggs.iter().take(numeric).enumerate() {
+            assert!(!agg.is_empty(), "column {i} has no header total");
+        }
+    }
+
+    /// The GPU column is unknown until the PDH group is collecting. Unknown
+    /// renders "—" with no heat; a zero would claim the process used no GPU.
+    #[test]
+    fn missing_gpu_renders_unavailable_not_zero() {
+        let mut unknown = proc(9, None, "no-gpu-counters", ProcCategory::Background);
+        unknown.gpu_util_pct = None;
+        let mut busy = proc(10, None, "renderer", ProcCategory::Background);
+        busy.gpu_util_pct = Some(64.0);
+        let rows = build_display_rows(
+            &snap_of(vec![unknown, busy]),
+            "",
+            0,
+            true,
+            &HashSet::new(),
+            &[false; 3],
+        );
+        let by_pid: HashMap<u32, RowData> = rows
+            .iter()
+            .filter_map(|row| match row {
+                DisplayRow::Process(row) => Some((row.pid, row.clone())),
+                _ => None,
+            })
+            .collect();
+        assert!(!by_pid[&9].gpu_available);
+        assert_eq!(by_pid[&9].heat[GPU_VALUE], 0.0);
+        assert!(by_pid[&10].gpu_available);
+        assert_eq!(by_pid[&10].values[GPU_VALUE], 64.0);
+        assert!(by_pid[&10].heat[GPU_VALUE] > 0.0);
     }
 
     #[test]

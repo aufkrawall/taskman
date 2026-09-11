@@ -990,6 +990,12 @@ impl TaskManApp {
         {
             d = d.union(TelemetryDemand::PROCESS_NET);
         }
+        // The Processes page carries a GPU column, so it needs the PDH GPU
+        // group. That group also enumerates adapters, which is why a page
+        // without a GPU column deliberately never touches it.
+        if self.tab == Tab::Processes {
+            d = d.union(TelemetryDemand::PROCESS_GPU);
+        }
         // Per-process disk service time is a second ETW session. Processes
         // shows its column always; Details only when the column is visible.
         if self.tab == Tab::Processes
