@@ -10,6 +10,7 @@ mod etw;
 mod explorer_restart;
 mod gpu;
 pub mod icons;
+mod image_path;
 /// Cross-process coordination between the instances of one session.
 pub mod instance;
 pub mod locale;

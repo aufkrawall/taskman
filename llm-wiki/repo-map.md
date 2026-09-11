@@ -50,7 +50,10 @@ platform boundary (`tm-core` ← `tm-platform` ← `tm-app` / `tm-service`):
     enumeration, guarded same-architecture DLL unload, non-blocking launch),
     `startup.rs` (Run keys + Startup folders + StartupApproved incl. the
     folder-subkey fix and best-effort publisher resolution), `services.rs`,
-    `users.rs`, `net_info.rs` (cached adapter/link/IP/SSID/signal metadata),
+    `users.rs`, `image_path.rs` (`NtQuerySystemInformation(SystemProcessIdInformation)`:
+    the image path of a process no handle can be opened for, plus NT-device to
+    drive-letter translation; both answers cached because neither changes while
+    a process lives), `net_info.rs` (cached adapter/link/IP/SSID/signal metadata),
     `etw.rs` (shared real-time-session plumbing: fixed per-role session names,
     orphan reclamation, provider enabling, the `ProcessTrace` worker thread and
     the handle-table id sanity check), `net_etw.rs` (per-process network bytes

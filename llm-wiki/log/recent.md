@@ -11,6 +11,31 @@
 - 2026-09-08: Process Properties now summarizes mitigations with System Informer-style qualifiers (permanent DEP, high-entropy ASLR, prohibited/disabled wording, CF Guard and stack protection), and module inventory uses the authenticated LocalSystem broker for identity-bound SYSTEM/service inspection with bounded responses.
 # Recent Activity
 
+## 2026-09-11 — Identity of the processes that will not open
+
+User report: Process Properties showed `Path: —` for `BackgroundDownload.exe`,
+the SYSTEM process they had just identified as the disk hog. Session ID and
+Platform were blank too, while Image type and mitigations were filled in — the
+tell that the broker's identity-bound reads worked and the local ones did not.
+
+Every ordinary path source needs a HANDLE: sysinfo, `QueryFullProcessImageNameW`,
+the PEB. An unelevated session cannot open a SYSTEM or elevated process at all,
+which is roughly half a Windows process list — measured here, only 50 % of
+processes had a path. `NtQuerySystemInformation(SystemProcessIdInformation)`
+(class 88) answers for any PID without a handle; it returns an NT device path,
+translated back to a drive letter via `QueryDosDeviceW`. Coverage went to
+270/273, the remainder being kernel pseudo-processes that genuinely have no
+image. Pinned by two live tests (our own path must match `current_exe`, and
+`wininit.exe`/`services.exe` must resolve) plus an integration threshold that
+catches a regression to the handle-only era.
+
+Session ID had the same shape and a sillier cause: the kernel-table fallback
+`cpu_load::session_id_of` already existed and was only ever used to infer a
+user name, never assigned to `ProcessEntry::session_id`. Platform (`wow64`)
+followed for free once the path resolves, since it reads the PE header.
+
+Command line still requires a handle and stays "—" for those processes.
+
 ## 2026-09-11 — Disk attribution, cursor-anchored graph readout, byte units
 
 User report, five parts: only the CPU core tiles showed a hover value and its

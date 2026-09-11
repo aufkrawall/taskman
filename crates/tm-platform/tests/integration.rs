@@ -117,6 +117,28 @@ fn sample_produces_sane_snapshot() {
         "total memory sane"
     );
     assert!(s2.processes.len() > 20, "expected many processes");
+
+    // Identity of the processes this token cannot OPEN. Roughly half of a
+    // Windows session is SYSTEM or elevated, and every handle-based query
+    // (sysinfo, QueryFullProcessImageNameW, ProcessIdToSessionId) returns
+    // nothing for them — which is how Process Properties came to show "—" for
+    // the path and session of the very process a user was trying to identify.
+    // Both now fall back to the kernel, which names every process.
+    let real: Vec<_> = s2.processes.iter().filter(|p| !p.synthetic).collect();
+    let with_path = real.iter().filter(|p| p.exe_path.is_some()).count();
+    let with_session = real.iter().filter(|p| p.session_id.is_some()).count();
+    // Generous thresholds: a couple of kernel pseudo-processes legitimately
+    // have neither, and the point is to catch a regression back to ~50 %.
+    assert!(
+        with_path * 10 >= real.len() * 8,
+        "only {with_path}/{} processes have an image path",
+        real.len()
+    );
+    assert!(
+        with_session * 10 >= real.len() * 9,
+        "only {with_session}/{} processes have a session id",
+        real.len()
+    );
     assert!(!s2.disks.is_empty());
     for d in &s2.disks {
         assert!(d.total_bytes > 0 || d.media == MediaKind::Unknown);

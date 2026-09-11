@@ -11,8 +11,8 @@
 
 use crate::win::cpu_load::{CpuLoadAccountant, LoadSample};
 use crate::win::{
-    core_service, cpu_info, disk_etw, gpu, memory_info, net_etw, net_info, perfcounters,
-    process_ops, threads_map, version, windows_enum,
+    core_service, cpu_info, disk_etw, gpu, image_path, memory_info, net_etw, net_info,
+    perfcounters, process_ops, threads_map, version, windows_enum,
 };
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
@@ -133,6 +133,9 @@ pub struct Sampler {
     /// recycled PID cannot inherit a dead process's totals.
     prev_proc_net: HashMap<u32, ProcNetSample>,
     disk_source: DiskSource,
+    /// Image paths for the processes no handle can be opened for. Cached
+    /// because the answer cannot change while a process lives.
+    image_paths: image_path::ImagePaths,
 }
 
 /// Where per-process network counters come from.
@@ -210,6 +213,7 @@ impl Sampler {
             pseudo: PseudoRowHold::default(),
             net_source: NetSource::Undecided,
             disk_source: DiskSource::Undecided,
+            image_paths: image_path::ImagePaths::default(),
             prev_proc_net: HashMap::new(),
         }
     }
@@ -618,6 +622,8 @@ impl Sampler {
         if self.tick_no.is_multiple_of(16) {
             let alive: HashSet<u32> = self.sys.processes().keys().map(|p| p.as_u32()).collect();
             self.attrs.retain(|pid, _| alive.contains(pid));
+            // A recycled PID must never inherit the previous process's path.
+            self.image_paths.retain_live(&alive);
         }
 
         // Drop cached attributes for processes WE just changed. Priority,
@@ -749,7 +755,13 @@ impl Sampler {
         // the immutable sysinfo iteration above.
         for p in processes.iter_mut() {
             let a = self.attrs_for(p.pid, p.start_epoch_s);
-            p.session_id = a.session_id;
+            // Same story as the image path: `session_id_of` needs a handle, so
+            // every process this token cannot open reported "—" even though
+            // the kernel process table carries a session for ALL of them. The
+            // fallback existed but was only ever used to infer the user name.
+            p.session_id = a
+                .session_id
+                .or_else(|| self.cpu_load.session_id_of(p.pid, p.start_epoch_s));
             p.priority = a.priority;
             // Protected processes (System, Registry, Secure System, csrss,
             // PPL services) refuse OpenProcess, so GetPriorityClass cannot
@@ -769,6 +781,25 @@ impl Sampler {
             let stem = norm.strip_suffix(".exe").unwrap_or(&norm);
             let is_kernel_or_system =
                 p.pid == 0 || p.pid == 4 || classify::is_core_os_image(&p.name);
+
+            // Last resort for the path: ask the kernel, which names any
+            // process without needing a handle. Everything above this point
+            // goes through `OpenProcess` in one form or another, and an
+            // unelevated session cannot open a SYSTEM or elevated process at
+            // all — which is most of session 0, and exactly the rows whose
+            // identity a user is trying to establish.
+            if p.exe_path.is_none() {
+                p.exe_path = self.image_paths.get(p.pid);
+                if let Some(exe) = p.exe_path.as_ref() {
+                    let ver = version::query(&exe.to_string_lossy());
+                    if p.display == p.name && !ver[0].is_empty() {
+                        p.display = ver[0].clone();
+                    }
+                    if p.company.is_none() && !ver[1].is_empty() {
+                        p.company = Some(ver[1].clone());
+                    }
+                }
+            }
 
             p.wow64 = a.wow64;
             if p.wow64.is_none() {
