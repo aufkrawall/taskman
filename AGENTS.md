@@ -21,6 +21,11 @@
 - The light gate does NOT cover lint or cross-crate breakage.
 - The heavy gate covers formatting, clippy with warnings-as-errors, all
   workspace tests (incl. Windows integration tests), and release packaging.
+- The heavy gate runs clippy under the DEFAULT toolchain (nightly here); CI
+  runs stable, and the two lint sets differ. Before pushing a change that
+  adds or reshapes loops, indexing or matches, also run
+  `cargo +stable clippy --workspace --all-targets --all-features --target-dir target/clippy-stable -- -D warnings`
+  — see `llm-wiki/build.md` § CI.
 - **Always end a code-change session with a release build**
   (`python build.py --host-only`; already covered when the heavy gate ran)
   so `target/release/taskman.exe` — the binary the user actually launches —

@@ -11,6 +11,24 @@
 - 2026-09-08: Process Properties now summarizes mitigations with System Informer-style qualifiers (permanent DEP, high-entropy ASLR, prohibited/disabled wording, CF Guard and stack protection), and module inventory uses the authenticated LocalSystem broker for identity-bound SYSTEM/service inspection with bounded responses.
 # Recent Activity
 
+## 2026-09-11 — CI red again: a lint only the stable toolchain fires
+
+The winit-asset fix cleared the fork gate, and the same run then failed on
+the step before it: `cargo clippy --workspace -- -D warnings` rejected
+`for i in 0..VALUE_COLS` in `normalize_heat` (`tabs/processes.rs`) with
+`needless_range_loop`. `build.py --check` had been green locally, because
+the dev box's nightly 1.99 clippy does not fire that lint there and CI runs
+stable 1.98 — the local gate structurally could not catch it. Recorded in
+build.md § CI along with the `cargo +stable clippy` command that reproduces
+CI, and the stable toolchain is now installed locally so it can be run.
+
+The loop is gone rather than silenced: `d.heat` is built in one
+`std::array::from_fn`, which is what the loop meant (heat is a function of
+the logical column index) and what `tabs/users.rs` already does for its
+per-column arrays. Same expression, same values. Verified both ways under
+stable 1.98.1 — the old code reproduces the error, the new code is clean —
+plus a full `python build.py --host-only --check`.
+
 ## 2026-09-11 — CI red: vendored winit example assets were never committed
 
 `tools/check-fork.ps1` failed on CI with four `couldn't read

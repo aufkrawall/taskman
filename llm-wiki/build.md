@@ -175,6 +175,25 @@ main through that blind spot. Never treat a branch-only CI success as
 green; merge validation happens on the main push. `cargo fmt` output must
 be applied as-is (no rustfmt.toml; defaults, max 100).
 
+**CI clippy is stable, the dev box is nightly, and their lint sets differ
+in both directions.** `dtolnay/rust-toolchain@stable` gave 1.98.0 on
+2026-09-11 while the local default is nightly 1.99; a `for i in 0..N` loop
+in `normalize_heat` (`tabs/processes.rs`) passed nightly clippy and failed
+CI with `needless_range_loop`. `build.py --check` uses whatever the default
+toolchain is, so it cannot see this class of failure. Reproduce CI's clippy
+exactly with
+
+```bash
+cargo +stable clippy --workspace --all-targets --all-features --target-dir target/clippy-stable -- -D warnings
+```
+
+The separate `--target-dir` is what keeps the two toolchains from
+invalidating each other's artifacts on every run (it costs ~800 MB and a
+~90 s warm pass). Converging the toolchains instead is not free: the fork
+gate deliberately skips `cargo fmt` on `vendor/winit` *because* the local
+rustfmt is nightly, so pinning the repo to stable would move that problem
+rather than remove it.
+
 ## Local release binary freshness
 
 `target/release/taskman.exe` is the binary that gets launched locally.
