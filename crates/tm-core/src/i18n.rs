@@ -547,14 +547,18 @@ keys! {
     ],
 
     // ------------------------------------------------ performance tab
-    Utilization60sPct => ["Auslastung in 60 Sekunden (%)", "Utilization for 60 seconds (%)"],
-    MemUsage60s => ["Speicherauslastung in 60 Sekunden", "Memory usage for 60 seconds"],
-    CommittedMem => ["Zugesicherter Speicher", "Committed memory"],
-    TransferRate60s => ["Übertragungsrate in 60 Sekunden (KB/s)", "Transfer rate for 60 seconds (KB/s)"],
-    ActiveTime60s => ["Aktive Zeit in 60 Sekunden", "Active time for 60 seconds"],
+    // Graph captions take the CONFIGURED window ("30 Sekunden", "2 min"), not
+    // a hardcoded minute: the window is a setting, and the old strings claimed
+    // 60 seconds whatever it was set to. The unit belongs to the scale label on
+    // the right, which states the real one.
+    UtilizationWindow => ["Auslastung, {} (%)", "Utilization, {} (%)"],
+    MemUsageWindow => ["Speicherauslastung, {}", "Memory usage, {}"],
+    CommittedWindow => ["Zugesicherter Speicher, {}", "Committed memory, {}"],
+    TransferRateWindow => ["Übertragungsrate, {}", "Transfer rate, {}"],
+    ActiveTimeWindow => ["Aktive Zeit, {}", "Active time, {}"],
     Receive60s => ["Empfangen in 60 Sekunden (KBit/s)", "Receive for 60 seconds (Mbps)"],
     Send60s => ["Senden in 60 Sekunden (KBit/s)", "Send for 60 seconds (Mbps)"],
-    GpuMem60s => ["GPU-Speicher in 60 Sekunden", "GPU memory for 60 seconds"],
+    GpuMemWindow => ["GPU-Speicher, {}", "GPU memory, {}"],
     StatUtilization => ["Auslastung", "Utilization"],
     StatSpeed => ["Geschwindigkeit", "Speed"],
     StatProcesses => ["Prozesse", "Processes"],

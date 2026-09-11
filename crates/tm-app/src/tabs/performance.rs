@@ -1018,13 +1018,9 @@ fn cpu_page(app: &mut TaskManApp, ui: &mut egui::Ui, pal: &Palette) {
     caption(
         ui,
         pal,
-        &format!(
-            "{}, {}",
-            i18n::tr(K::Utilization60sPct)
-                .split(' ')
-                .next()
-                .unwrap_or(""),
-            window_label(app.shared.settings.graph_seconds)
+        &i18n::trf(
+            K::UtilizationWindow,
+            &[&window_label(app.shared.settings.graph_seconds)],
         ),
         "100 %",
     );
@@ -1280,10 +1276,11 @@ fn memory_page(app: &mut TaskManApp, ui: &mut egui::Ui, pal: &Palette) {
             format::format_pct_hdr(snap.memory.used_pct())
         ),
     );
+    let window_text = window_label(app.shared.settings.graph_seconds);
     caption(
         ui,
         pal,
-        i18n::tr(K::MemUsage60s),
+        &i18n::trf(K::MemUsageWindow, &[&window_text]),
         &format::format_bytes_loc(snap.memory.total_bytes),
     );
 
@@ -1308,7 +1305,7 @@ fn memory_page(app: &mut TaskManApp, ui: &mut egui::Ui, pal: &Palette) {
     caption(
         ui,
         pal,
-        i18n::tr(K::CommittedMem),
+        &i18n::trf(K::CommittedWindow, &[&window_text]),
         &format::format_bytes_loc(snap.memory.commit_total_bytes),
     );
     let commit: Vec<f64> = series(win, |h| {
@@ -1453,7 +1450,13 @@ fn disk_page(app: &mut TaskManApp, ui: &mut egui::Ui, pal: &Palette, entry: &Res
         return;
     };
     page_title(ui, pal, &entry.title, &disk_media_label(disk));
-    caption(ui, pal, i18n::tr(K::ActiveTime60s), "100 %");
+    let window_text = window_label(app.shared.settings.graph_seconds);
+    caption(
+        ui,
+        pal,
+        &i18n::trf(K::ActiveTimeWindow, &[&window_text]),
+        "100 %",
+    );
 
     let win = window(app);
     let ts = timestamps(win);
@@ -1477,16 +1480,19 @@ fn disk_page(app: &mut TaskManApp, ui: &mut egui::Ui, pal: &Palette, entry: &Res
     let write = disk_series(win, &entry.key, |d| d.3);
     // The scale caption used to print a bare "1234": the number was in KB/s
     // but nothing on screen said so. Plot bytes per second and label the peak.
-    let peak = read
-        .iter()
-        .chain(write.iter())
-        .cloned()
-        .fold(0.0f64, f64::max)
-        .max(1024.0);
+    // A ROUNDED scale, not the raw peak: with the peak as the y max the top
+    // label and the whole curve rescale on every tick, which makes two
+    // consecutive frames impossible to compare.
+    let peak = format::nice_rate_max(
+        read.iter()
+            .chain(write.iter())
+            .cloned()
+            .fold(0.0f64, f64::max),
+    );
     caption(
         ui,
         pal,
-        i18n::tr(K::TransferRate60s),
+        &i18n::trf(K::TransferRateWindow, &[&window_text]),
         &format::format_rate(peak),
     );
     page_chart(
@@ -1587,17 +1593,17 @@ fn network_page(app: &mut TaskManApp, ui: &mut egui::Ui, pal: &Palette, entry: &
 
     let recv = net_series(win, &entry.key, 1);
     let sent = net_series(win, &entry.key, 2);
-    let peak = recv
-        .iter()
-        .chain(sent.iter())
-        .copied()
-        .fold(0.0f64, f64::max)
-        .max(1024.0);
-    let window = window_label(app.shared.settings.graph_seconds);
+    let peak = format::nice_rate_max(
+        recv.iter()
+            .chain(sent.iter())
+            .copied()
+            .fold(0.0f64, f64::max),
+    );
+    let window_text = window_label(app.shared.settings.graph_seconds);
     caption(
         ui,
         pal,
-        &i18n::trf(K::ThroughputWindow, &[&window]),
+        &i18n::trf(K::ThroughputWindow, &[&window_text]),
         &format::format_rate(peak),
     );
     page_chart(
@@ -1739,11 +1745,7 @@ fn gpu_page(app: &mut TaskManApp, ui: &mut egui::Ui, pal: &Palette, entry: &Reso
                 gpu_series(win, &entry.key, 1),
                 pal.gpu_graph,
             )],
-            i18n::tr(K::Utilization60sPct)
-                .split(' ')
-                .next()
-                .unwrap_or("")
-                .to_string(),
+            i18n::tr(K::StatUtilization).to_string(),
         ),
         engine => (
             vec![MultiSeries::new(
@@ -1780,21 +1782,26 @@ fn gpu_page(app: &mut TaskManApp, ui: &mut egui::Ui, pal: &Palette, entry: &Reso
     caption(
         ui,
         pal,
-        i18n::tr(K::GpuMem60s),
+        &i18n::trf(
+            K::GpuMemWindow,
+            &[&window_label(app.shared.settings.graph_seconds)],
+        ),
         &format::format_bytes_loc(mem_max),
     );
-    let mem_gb: Vec<f64> = mem.iter().map(|v| v / 1024.0 / 1024.0).collect();
-    let max_gb = mem_max as f64 / 1024.0 / 1024.0;
+    // Mebibytes, matching `fmt_mib` — these were called `*_gb` while holding
+    // MiB, which is exactly how a chart ends up mislabelled.
+    let mem_mib: Vec<f64> = mem.iter().map(|v| v / 1024.0 / 1024.0).collect();
+    let max_mib = mem_max as f64 / 1024.0 / 1024.0;
     page_chart(
         ui,
         width,
         150.0,
         &[MultiSeries::new(
             i18n::tr(K::GpuMemStat),
-            mem_gb,
+            mem_mib,
             pal.gpu_graph.gamma_multiply(0.62),
         )],
-        max_gb,
+        max_mib,
         Some(&ts),
         fmt_mib,
     );

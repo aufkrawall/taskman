@@ -293,41 +293,36 @@ pub fn format_freq_mhz(mhz: f32) -> String {
     format!("{} GHz", num_fixed(mhz as f64 / 1000.0, 2))
 }
 
-/// Choose a "nice" y-axis max and step for charts whose data peaks at `peak`.
-/// Returns (nice_max, step). Guarantees nice_max >= peak, step divides range
-/// into 4..=8 steps, and both are round numbers (1/2/2.5/5 × 10^n).
-pub fn nice_scale(peak: f64) -> (f64, f64) {
-    if !(peak.is_finite()) || peak <= 0.0 {
-        return (100.0, 25.0);
+/// A stable, rounded y-axis maximum for a byte-rate chart peaking at `peak`.
+///
+/// Charting the raw peak means the scale — and with it every point of the
+/// curve — moves on every tick, so two consecutive frames cannot be compared
+/// and the top-right label flickers through values like "1.2 MB/s",
+/// "947 KB/s", "2.3 MB/s". Rounding up to 1, 2 or 5 times a power of 1024
+/// keeps the scale still while traffic stays in the same band, and the label
+/// reads as a round number in the same 1024-based units as everything else.
+///
+/// The floor is 1 KB/s: a chart scaled to a handful of bytes turns idle noise
+/// into a dramatic waveform.
+pub fn nice_rate_max(peak: f64) -> f64 {
+    const K: f64 = 1024.0;
+    const FLOOR: f64 = K;
+    if !peak.is_finite() || peak <= FLOOR {
+        return FLOOR;
     }
-    // Grow slightly so the line never touches the top border.
-    let target = peak.max(1e-6) * 1.05;
-    let mag = 10f64.powf(target.log10().floor());
-    let candidates = [1.0, 2.0, 2.5, 5.0, 10.0];
-    let mut nice_max = 10.0 * mag;
-    let mut step = 2.5 * mag;
-    for (i, c) in candidates.iter().enumerate() {
-        let cand = c * mag;
-        if cand >= target {
-            nice_max = cand;
-            step = match i {
-                0 => 0.25 * mag,
-                1 => 0.5 * mag,
-                2 => 0.5 * mag,
-                3 => 1.0 * mag,
-                _ => 2.0 * mag,
-            };
-            break;
+    // The 1024-based unit just below the peak, so the answer lands on a whole
+    // number of KB/s, MB/s or GB/s.
+    let mut unit = FLOOR;
+    while peak >= unit * K && unit < K * K * K * K {
+        unit *= K;
+    }
+    for step in [1.0, 2.0, 5.0, 10.0, 20.0, 50.0, 100.0, 200.0, 500.0] {
+        let candidate = step * unit;
+        if candidate >= peak {
+            return candidate;
         }
     }
-    // Keep at least 4 gridlines but not more than ~8.
-    while nice_max / step > 8.0 {
-        step *= 2.0;
-    }
-    while nice_max / step < 3.0 && step > 1e-9 {
-        step /= 2.0;
-    }
-    (nice_max, step)
+    K * unit
 }
 
 #[cfg(test)]
@@ -447,20 +442,34 @@ mod tests {
         assert_eq!(format_freq_mhz(0.0), "");
     }
 
+    /// The chart scale must cover the data, stay put while traffic wanders
+    /// inside a band, and print as a round number.
     #[test]
-    fn nice_scale_basics() {
-        let (max, step) = nice_scale(34.0);
-        assert!(max >= 34.0);
-        assert!((max / step).fract().abs() < 1e-9);
-        assert!((3.0..=8.0).contains(&(max / step)));
+    fn rate_scale_is_round_stable_and_never_below_the_peak() {
+        const K: f64 = 1024.0;
+        // Idle and nonsense both land on the floor rather than magnifying noise.
+        assert_eq!(nice_rate_max(0.0), K);
+        assert_eq!(nice_rate_max(-5.0), K);
+        assert_eq!(nice_rate_max(f64::NAN), K);
+        assert_eq!(nice_rate_max(12.0), K);
 
-        let (m2, s2) = nice_scale(0.0);
-        assert_eq!((m2, s2), (100.0, 25.0));
+        for peak in [1.5 * K, 3.0 * K, 900.0 * K, 2.2 * K * K, 700.0 * K * K] {
+            let max = nice_rate_max(peak);
+            assert!(max >= peak, "{max} < {peak}");
+            // Round: a whole number of KB/s, MB/s or GB/s...
+            let unit = [K, K * K, K * K * K, K * K * K * K]
+                .into_iter()
+                .rev()
+                .find(|u| max >= *u)
+                .unwrap();
+            assert_eq!((max / unit).fract(), 0.0, "{max} is not a round scale");
+            // ...and not wastefully far above the data.
+            assert!(max <= peak * 2.5, "{max} dwarfs {peak}");
+        }
 
-        let (m3, _) = nice_scale(96.0);
-        assert!(m3 >= 96.0);
-        let (m4, s4) = nice_scale(13.6 * 1024.0 * 1024.0 * 1024.0);
-        assert!(m4 >= 13.6 * 1024.0 * 1024.0 * 1024.0);
-        assert!(s4 > 0.0);
+        // Stability is the point: everything inside one band shares a scale.
+        let band = nice_rate_max(1.1 * K * K);
+        assert_eq!(nice_rate_max(1.9 * K * K), band);
+        assert_eq!(nice_rate_max(1.05 * K * K), band);
     }
 }
