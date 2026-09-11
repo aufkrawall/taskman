@@ -379,6 +379,12 @@ rebase runbook.
   bounded budget is spent); the honest outcome — unmapped, with how many
   references were dropped, or still in use — is reported as data, not
   guessed from an error.
+- The Users page rolls the per-process network rate up into each session row
+  and each app row under it (`tabs/users.rs`), including its heat and its
+  column sort. The cell falls back to "—" only when no process in the session
+  produced a reading — i.e. when the per-process ETW network trace is not
+  running — and then explains itself on hover, exactly like the Processes
+  column.
 - Details adds typed optional columns for description, publisher, parent PID,
   session ID, image path, page faults/sec, and I/O read/write totals. Startup,
   App History, Users, and Services headers now sort; tables draw quiet body

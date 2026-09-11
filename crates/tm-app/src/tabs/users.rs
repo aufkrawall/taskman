@@ -37,9 +37,28 @@ struct Agg {
     cpu: f64,
     mem: f64,
     disk: f64,
+    net: f64,
+    /// At least one process in this session reported network bytes. Without
+    /// one, the sum is not "no traffic" but "not measured", and the cell has
+    /// to say so instead of printing a zero nobody measured.
+    net_known: bool,
     count: usize,
-    apps: HashMap<String, ([f64; 4], usize, Option<String>)>,
+    apps: HashMap<String, AppAgg>,
 }
+
+/// One app name's rollup inside a session.
+struct AppAgg {
+    values: [f64; VALUES],
+    count: usize,
+    exe: Option<String>,
+    net_known: bool,
+}
+
+/// CPU, memory, disk, network - the numeric columns, in table order.
+const VALUES: usize = 4;
+
+/// Index of the network value inside a row's values.
+const NET: usize = 3;
 
 enum URow {
     User(usize),
@@ -47,40 +66,97 @@ enum URow {
         session: u32,
         name: String,
         exe: Option<String>,
-        values: [f64; 4],
+        values: [f64; VALUES],
         count: usize,
+        net_known: bool,
     },
+}
+
+/// Fold one process into its session's rollup and into that session's entry
+/// for the app it belongs to.
+fn accumulate(a: &mut Agg, p: &tm_core::model::ProcessEntry) {
+    let net = p.net_recv_bps.unwrap_or(0.0) + p.net_sent_bps.unwrap_or(0.0);
+    let net_known = p.net_recv_bps.is_some() || p.net_sent_bps.is_some();
+    a.cpu += p.cpu_pct as f64;
+    a.mem += p.mem_bytes as f64;
+    a.disk += p.disk_read_bps + p.disk_write_bps;
+    a.net += net;
+    a.net_known |= net_known;
+    a.count += 1;
+    let e = a.apps.entry(p.shown_name().to_string()).or_insert(AppAgg {
+        values: [0.0; VALUES],
+        count: 0,
+        exe: None,
+        net_known: false,
+    });
+    e.values[0] += p.cpu_pct as f64;
+    e.values[1] += p.mem_bytes as f64;
+    e.values[2] += p.disk_read_bps + p.disk_write_bps;
+    e.values[NET] += net;
+    e.net_known |= net_known;
+    if e.exe.is_none() {
+        e.exe = p
+            .exe_path
+            .as_ref()
+            .map(|x| x.to_string_lossy().into_owned());
+    }
+    e.count += 1;
 }
 
 struct HeatMax {
     cpu: f64,
     mem: f64,
     disk: f64,
+    net: f64,
 }
 
 impl HeatMax {
-    fn intensity(&self, v: &[f64; 4]) -> [f32; 4] {
+    fn intensity(&self, v: &[f64; VALUES], net_known: bool) -> [f32; VALUES] {
         [
             tablekit::norm(v[0], self.cpu),
             tablekit::norm(v[1], self.mem),
             tablekit::norm(v[2], self.disk),
-            0.0,
+            // An unmeasured cell must not colour the heat band, nor pull the
+            // column maximum below.
+            if net_known {
+                tablekit::norm(v[NET], self.net)
+            } else {
+                0.0
+            },
         ]
     }
 
-    fn over(rows: impl Iterator<Item = [f64; 4]>) -> Self {
+    fn over(rows: impl Iterator<Item = ([f64; VALUES], bool)>) -> Self {
         let mut m = Self {
             cpu: 0.0,
             mem: 0.0,
             disk: 0.0,
+            net: 0.0,
         };
-        for v in rows {
+        for (v, net_known) in rows {
             m.cpu = m.cpu.max(v[0]);
             m.mem = m.mem.max(v[1]);
             m.disk = m.disk.max(v[2]);
+            if net_known {
+                m.net = m.net.max(v[NET]);
+            }
         }
         m
     }
+}
+
+/// The numeric cells of one row, with unmeasured network rendered as "—".
+fn value_texts(values: &[f64; VALUES], net_known: bool) -> [String; VALUES] {
+    [
+        format::format_pct_cell(values[0].min(100.0) as f32),
+        format::format_mb(values[1] as u64),
+        format::format_rate_mb(values[2]),
+        if net_known {
+            format::format_process_net_rate(values[NET])
+        } else {
+            "—".to_string()
+        },
+    ]
 }
 
 pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
@@ -207,6 +283,8 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
                 cpu: 0.0,
                 mem: 0.0,
                 disk: 0.0,
+                net: 0.0,
+                net_known: false,
                 count: 0,
                 apps: HashMap::new(),
             },
@@ -227,24 +305,7 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
         let Some(a) = aggs.get_mut(&sid) else {
             continue;
         };
-        a.cpu += p.cpu_pct as f64;
-        a.mem += p.mem_bytes as f64;
-        a.disk += p.disk_read_bps + p.disk_write_bps;
-        a.count += 1;
-        let e = a
-            .apps
-            .entry(p.shown_name().to_string())
-            .or_insert(([0.0; 4], 0, None));
-        e.0[0] += p.cpu_pct as f64;
-        e.0[1] += p.mem_bytes as f64;
-        e.0[2] += p.disk_read_bps + p.disk_write_bps;
-        if e.2.is_none() {
-            e.2 = p
-                .exe_path
-                .as_ref()
-                .map(|x| x.to_string_lossy().into_owned());
-        }
-        e.1 += 1;
+        accumulate(a, p);
     }
 
     let q = search::Query::new(&app.search);
@@ -280,18 +341,18 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
         let a = &aggs[&s.id];
         rows.push(URow::User(i));
         if app.processes_state.expanded_users.contains(&s.id) {
-            type AppEntry = ([f64; 4], usize, Option<String>);
-            let mut apps: Vec<(&String, &AppEntry)> = a.apps.iter().collect();
+            let mut apps: Vec<(&String, &AppAgg)> = a.apps.iter().collect();
             apps.sort_by(|left, right| {
-                compare_user_apps(left.0, &left.1.0, right.0, &right.1.0, sort)
+                compare_user_apps(left.0, &left.1.values, right.0, &right.1.values, sort)
             });
-            for (name, (vals, count, exe)) in apps {
+            for (name, entry) in apps {
                 rows.push(URow::App {
                     session: s.id,
                     name: name.clone(),
-                    exe: exe.clone(),
-                    values: *vals,
-                    count: *count,
+                    exe: entry.exe.clone(),
+                    values: entry.values,
+                    count: entry.count,
+                    net_known: entry.net_known,
                 });
             }
         }
@@ -301,9 +362,11 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
         URow::User(i) => {
             let s = sessions[*i];
             let a = &aggs[&s.id];
-            [a.cpu, a.mem, a.disk, 0.0]
+            ([a.cpu, a.mem, a.disk, a.net], a.net_known)
         }
-        URow::App { values, .. } => *values,
+        URow::App {
+            values, net_known, ..
+        } => (*values, *net_known),
     }));
 
     let agg_hdr = Aggregates::from_snapshot(&snap);
@@ -350,6 +413,7 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
                         exe,
                         values,
                         count,
+                        net_known,
                     }) => {
                         app_row_ui(
                             app,
@@ -361,6 +425,7 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
                             exe.as_deref(),
                             values,
                             *count,
+                            *net_known,
                             &heat_max,
                         );
                     }
@@ -392,20 +457,30 @@ fn compare_users(
     let a_name = display_name(a, hostname).to_ascii_lowercase();
     let b_name = display_name(b, hostname).to_ascii_lowercase();
     let primary = match sort.column {
-        0 | 5 => a_name.cmp(&b_name),
+        0 => a_name.cmp(&b_name),
         1 => session_state_rank(a.state).cmp(&session_state_rank(b.state)),
         2 => aa.cpu.partial_cmp(&ba.cpu).unwrap_or(Ordering::Equal),
         3 => aa.mem.partial_cmp(&ba.mem).unwrap_or(Ordering::Equal),
-        _ => aa.disk.partial_cmp(&ba.disk).unwrap_or(Ordering::Equal),
+        4 => aa.disk.partial_cmp(&ba.disk).unwrap_or(Ordering::Equal),
+        // An unmeasured network sorts below every measured one instead of
+        // tying with a session that genuinely sent nothing.
+        _ => net_key(aa)
+            .partial_cmp(&net_key(ba))
+            .unwrap_or(Ordering::Equal),
     };
     directed(primary, sort.ascending).then_with(|| a_name.cmp(&b_name))
 }
 
+/// Sort key for the network column: `None` where nothing measured it.
+fn net_key(a: &Agg) -> Option<f64> {
+    a.net_known.then_some(a.net)
+}
+
 fn compare_user_apps(
     a_name: &str,
-    a_values: &[f64; 4],
+    a_values: &[f64; VALUES],
     b_name: &str,
-    b_values: &[f64; 4],
+    b_values: &[f64; VALUES],
     sort: tablekit::SortState,
 ) -> Ordering {
     let names = || {
@@ -414,7 +489,7 @@ fn compare_user_apps(
             .cmp(&b_name.to_ascii_lowercase())
     };
     let primary = match sort.column {
-        2..=4 => a_values[sort.column - 2]
+        2..=5 => a_values[sort.column - 2]
             .partial_cmp(&b_values[sort.column - 2])
             .unwrap_or(Ordering::Equal),
         _ => names(),
@@ -456,14 +531,15 @@ fn prepare_auto_fit_widths(
         .map(|c| tablekit::text_width(ui, c.label, tablekit::FONT_HDR_LABEL) + 28.0)
         .collect();
     for row in rows {
-        let (name, status, values, name_extra) = match row {
+        let (name, status, values, net_known, name_extra) = match row {
             URow::User(i) => {
                 let s = sessions[*i];
                 let a = &aggs[&s.id];
                 (
                     format!("{} ({})", display_name(s, &snap.system.hostname), a.count),
                     session_status_label(s),
-                    [a.cpu, a.mem, a.disk, 0.0],
+                    [a.cpu, a.mem, a.disk, a.net],
+                    a.net_known,
                     66.0,
                 )
             }
@@ -471,6 +547,7 @@ fn prepare_auto_fit_widths(
                 name,
                 values,
                 count,
+                net_known,
                 ..
             } => (
                 if *count > 1 {
@@ -480,17 +557,13 @@ fn prepare_auto_fit_widths(
                 },
                 "",
                 *values,
+                *net_known,
                 88.0,
             ),
         };
         fit[0] = fit[0].max(tablekit::text_width(ui, &name, tablekit::FONT_ROW) + name_extra);
         fit[1] = fit[1].max(tablekit::text_width(ui, status, tablekit::FONT_ROW) + 22.0);
-        let texts = [
-            format::format_pct_cell(values[0].min(100.0) as f32),
-            format::format_mb(values[1] as u64),
-            format::format_rate_mb(values[2]),
-            "—".to_string(),
-        ];
+        let texts = value_texts(&values, net_known);
         for (i, text) in texts.iter().enumerate() {
             fit[i + 2] = fit[i + 2].max(tablekit::text_width(ui, text, tablekit::FONT_ROW) + 22.0);
         }
@@ -557,23 +630,28 @@ fn user_row_ui(
 
     table.text_cell(ui, rect, 1, session_status_label(s), pal, false);
 
-    let texts = [
-        format::format_pct_cell(a.cpu.min(100.0) as f32),
-        format::format_mb(a.mem as u64),
-        format::format_rate_mb(a.disk),
-        "—".to_string(),
-    ];
+    let values = [a.cpu, a.mem, a.disk, a.net];
+    let texts = value_texts(&values, a.net_known);
     let cells: Vec<HeatCell> = heat_max
-        .intensity(&[a.cpu, a.mem, a.disk, 0.0])
+        .intensity(&values, a.net_known)
         .iter()
         .zip(texts.iter())
         .map(|(t, txt)| HeatCell::new(*t, txt.clone()))
         .collect();
     table.heat_cells(ui, pal, rect, 2, &cells);
+    let net_tip = (!a.net_known)
+        .then(|| unavailable_network_tip(ui, table, rect))
+        .flatten();
 
     if resp.clicked() {
         app.selected_user = Some(s.id);
     }
+    // on_hover_text consumes the response (builder style), so it has to come
+    // before the context menu is attached to it.
+    let resp = match net_tip {
+        Some(tip) => resp.on_hover_text(tip),
+        None => resp,
+    };
     if can_disconnect {
         let ctx = ui.ctx().clone();
         let keyboard_open = menu::keyboard_menu_requested(&ctx) && app.selected_user == Some(s.id);
@@ -610,13 +688,14 @@ fn app_row_ui(
     session_id: u32,
     name: &str,
     exe: Option<&str>,
-    vals: &[f64; 4],
+    vals: &[f64; VALUES],
     count: usize,
+    net_known: bool,
     heat_max: &HeatMax,
 ) {
     // Same app name can appear under two users, so the key pairs the row
     // with its session.
-    let (rect, _resp) = table.row(ui, pal, false, ("app", session_id, name));
+    let (rect, resp) = table.row(ui, pal, false, ("app", session_id, name));
     let tex = exe.and_then(|p| app.shared.icons.get(ui.ctx(), &app.actions, p, 6));
     table.icon_cell(
         ui,
@@ -637,19 +716,33 @@ fn app_row_ui(
         egui::FontId::proportional(tablekit::FONT_ROW),
         pal.text,
     );
-    let texts = [
-        format::format_pct_cell(vals[0] as f32),
-        format::format_mb(vals[1] as u64),
-        format::format_rate_mb(vals[2]),
-        "—".to_string(),
-    ];
+    let texts = value_texts(vals, net_known);
     let cells: Vec<HeatCell> = heat_max
-        .intensity(vals)
+        .intensity(vals, net_known)
         .iter()
         .zip(texts.iter())
         .map(|(t, txt)| HeatCell::new(*t, txt.clone()))
         .collect();
     table.heat_cells(ui, pal, rect, 2, &cells);
+    if !net_known
+        && let Some(tip) = unavailable_network_tip(ui, table, rect)
+    {
+        resp.on_hover_text(tip);
+    }
+}
+
+/// Explain the "—" in the Network column the way the Processes page does:
+/// per-process bytes come from an ETW session, and without it the honest
+/// answer is "unknown".
+fn unavailable_network_tip(
+    ui: &egui::Ui,
+    table: &tablekit::TmTable,
+    rect: egui::Rect,
+) -> Option<&'static str> {
+    let cell = table.col_rect(2 + NET, rect);
+    let pointer = ui.ctx().pointer_latest_pos()?;
+    cell.contains(pointer)
+        .then_some(i18n::tr(K::NetPerProcessUnavailable))
 }
 
 fn display_name(s: &UserSession, hostname: &str) -> String {
@@ -744,5 +837,83 @@ pub fn session_logoff_dialog(app: &mut TaskManApp, ctx: &egui::Context, _pal: &t
         });
     if !open {
         app.pending_session_logoff = None;
+    }
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tm_core::model::ProcessEntry;
+
+    fn empty_agg() -> Agg {
+        Agg {
+            cpu: 0.0,
+            mem: 0.0,
+            disk: 0.0,
+            net: 0.0,
+            net_known: false,
+            count: 0,
+            apps: HashMap::new(),
+        }
+    }
+
+    fn with_net(name: &str, recv: Option<f64>, sent: Option<f64>) -> ProcessEntry {
+        let mut p = ProcessEntry::new(1, name);
+        p.net_recv_bps = recv;
+        p.net_sent_bps = sent;
+        p
+    }
+
+    /// The session row sums what the per-process trace measured, instead of
+    /// the flat "—" it printed before there was a network rollup at all.
+    #[test]
+    fn a_session_sums_the_network_rates_of_its_processes() {
+        let mut a = empty_agg();
+        accumulate(&mut a, &with_net("a.exe", Some(1024.0), Some(512.0)));
+        accumulate(&mut a, &with_net("b.exe", Some(2048.0), None));
+        assert!(a.net_known);
+        assert_eq!(a.net, 3584.0);
+        // Not an exact string: the decimal separator follows the locale.
+        let text = value_texts(&[0.0, 0.0, 0.0, a.net], a.net_known)[NET].clone();
+        assert!(text.starts_with("3") && text.ends_with(" KB/s"), "{text}");
+    }
+
+    /// Core invariant: telemetry nobody measured renders as unknown, never as
+    /// a zero, and it must not colour the heat band or set its maximum.
+    #[test]
+    fn an_unmeasured_session_network_stays_unknown() {
+        let mut a = empty_agg();
+        accumulate(&mut a, &with_net("a.exe", None, None));
+        assert!(!a.net_known);
+        assert_eq!(value_texts(&[0.0, 0.0, 0.0, a.net], a.net_known)[NET], "\u{2014}");
+
+        let heat = HeatMax::over([([0.0, 0.0, 0.0, 9_000.0], false)].into_iter());
+        assert_eq!(heat.net, 0.0);
+        assert_eq!(heat.intensity(&[0.0, 0.0, 0.0, 9_000.0], false)[NET], 0.0);
+    }
+
+    /// A process that measured zero bytes is a measurement: it prints a rate,
+    /// and only the absence of any reading falls back to unknown.
+    #[test]
+    fn a_measured_zero_is_not_unknown() {
+        let mut a = empty_agg();
+        accumulate(&mut a, &with_net("a.exe", Some(0.0), Some(0.0)));
+        assert!(a.net_known);
+        assert_eq!(
+            value_texts(&[0.0, 0.0, 0.0, a.net], a.net_known)[NET],
+            format::format_process_net_rate(0.0)
+        );
+    }
+
+    /// Unknown sorts below every measured value rather than tying with a
+    /// session that genuinely sent nothing.
+    #[test]
+    fn unknown_network_sorts_below_a_measured_zero() {
+        let mut measured = empty_agg();
+        accumulate(&mut measured, &with_net("a.exe", Some(0.0), None));
+        let mut unknown = empty_agg();
+        accumulate(&mut unknown, &with_net("b.exe", None, None));
+        assert!(net_key(&unknown) < net_key(&measured));
     }
 }
