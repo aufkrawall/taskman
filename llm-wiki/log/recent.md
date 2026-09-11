@@ -2355,4 +2355,4 @@ history recorded yet.
 
 - 2026-09-08: Process Properties vertical sizing now follows the user's actual resizable window height while keeping only the inner scroll body bounded. Windows security inspection moved onto PlatformActions and can use the authenticated LocalSystem core-service broker for SYSTEM/service processes; the broker request remains identity-bound and read-only, with local fallback for absent/older services.
 
-- 2026-09-11: Context-menu subject captions (`menu::title`) are painted as a bordered, recessed chip instead of bare text, and the Set-affinity dialog gained Select all / Deselect all buttons above the CPU grid.
+- 2026-09-11: Context-menu subject captions (`menu::title`) are painted as a flat dimmed band instead of bare text, and the Set-affinity dialog gained Select all / Deselect all buttons above the CPU grid. A first attempt drew the caption as an outlined, recessed chip; rejected on sight — it looked like a text input at the top of the popup.

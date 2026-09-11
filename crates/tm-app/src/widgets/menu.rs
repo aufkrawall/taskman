@@ -41,10 +41,6 @@ const HIGHLIGHT_INSET: f32 = 2.0;
 /// Height of a separator row (the line is centered inside it).
 const SEP_H: f32 = 7.0;
 
-/// Vertical inset of the caption chip inside its row, so the frame does not
-/// touch the popup margin above it or the separator below it.
-const CAPTION_INSET_Y: f32 = 2.0;
-
 /// Style installed on every popup opened through this module.
 ///
 /// Note `item_spacing.y = 0`: menu entries must touch, both so the menu reads
@@ -326,41 +322,40 @@ pub fn separator(ui: &mut Ui) {
 /// A non-interactive caption row naming the subject of the menu (the process
 /// it was opened on).
 ///
-/// Drawn as a bordered, recessed caption chip rather than as bare text: at the
-/// top of a column of identically laid out rows, a plain label reads as the
-/// first entry of the menu and invites a click that does nothing. The frame is
-/// what says "this names the menu, it is not a command".
+/// Painted as a flat, slightly raised band with dimmed text rather than as
+/// bare text: at the top of a column of identically laid out rows, a plain
+/// label reads as the first entry of the menu and invites a click that does
+/// nothing. The band is deliberately borderless and flat — an outlined box at
+/// the top of a popup reads as a text field, which is worse than the problem
+/// it fixes.
 pub fn title(ui: &mut Ui, text: &str) {
     let pal = theme::palette(ui);
+    let popup = ui.visuals().window_fill;
     let want = egui::vec2(desired_width(ui, text, Marks::default()), ITEM_H);
     let (rect, _) = ui.allocate_at_least(want, Sense::hover());
-    let chip = rect.shrink2(egui::vec2(HIGHLIGHT_INSET, CAPTION_INSET_Y));
-    ui.painter()
-        .rect_filled(chip, CornerRadius::same(4), pal.panel_bg);
-    ui.painter().rect_stroke(
-        chip,
+    ui.painter().rect_filled(
+        rect.shrink2(egui::vec2(HIGHLIGHT_INSET, 0.0)),
         CornerRadius::same(4),
-        Stroke::new(1.0, caption_stroke(&pal)),
-        egui::StrokeKind::Inside,
+        caption_fill(popup, pal.text),
     );
     ui.painter().text(
         Pos2::new(rect.left() + GUTTER_W, rect.center().y),
         egui::Align2::LEFT_CENTER,
         text,
         FontId::proportional(FONT_SIZE + 0.5),
-        pal.text,
+        pal.text_dim,
     );
 }
 
-/// Border of the caption chip. `pal.stroke` is tuned for separators on the
-/// window background and all but vanishes against the lighter popup fill, so
-/// the frame steps one notch from it toward the text colour.
-fn caption_stroke(pal: &Palette) -> Color32 {
-    let mix = |a: u8, b: u8| (a as f32 + (b as f32 - a as f32) * 0.22).round() as u8;
+/// Caption band fill: the popup's own surface nudged toward the text colour,
+/// so the band separates from the menu body in both themes without turning
+/// into a second hover highlight.
+fn caption_fill(popup: Color32, text: Color32) -> Color32 {
+    let mix = |a: u8, b: u8| (a as f32 + (b as f32 - a as f32) * 0.07).round() as u8;
     Color32::from_rgb(
-        mix(pal.stroke.r(), pal.text.r()),
-        mix(pal.stroke.g(), pal.text.g()),
-        mix(pal.stroke.b(), pal.text.b()),
+        mix(popup.r(), text.r()),
+        mix(popup.g(), text.g()),
+        mix(popup.b(), text.b()),
     )
 }
 
