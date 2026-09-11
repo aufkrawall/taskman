@@ -81,7 +81,7 @@ pub fn snapshot(seed: u32) -> Snapshot {
             media: MediaKind::SsdNvme,
             total_bytes: 1000 * 1024 * 1024 * 1024,
             free_bytes: 300 * 1024 * 1024 * 1024,
-            active_pct: (s * 7.0) % 100.0,
+            active_pct: Some((s * 7.0) % 100.0),
             read_bps: s as f64 * 1e6,
             write_bps: s as f64 * 2e6,
             avg_resp_ms: 0.3,

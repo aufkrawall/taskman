@@ -1120,7 +1120,11 @@ pub fn caret(painter: egui::Painter, c: Pos2, ascending: bool, color: Color32) {
 pub struct Aggregates {
     pub cpu_pct: f32,
     pub mem_pct: f32,
-    pub disk_pct: f32,
+    /// Busiest disk's active time, or `None` while the platform's disk-time
+    /// counters are not running. Both disk columns hang off this number, so
+    /// a fabricated zero here reads as "nothing is touching a disk" on a page
+    /// whose own rows say otherwise.
+    pub disk_pct: Option<f32>,
     pub net_pct: f32,
     pub gpu_pct: f32,
 }
@@ -1130,8 +1134,8 @@ impl Aggregates {
         let disk_pct = snap
             .disks
             .iter()
-            .map(|d| d.active_pct)
-            .fold(0.0f32, f32::max);
+            .filter_map(|d| d.active_pct)
+            .reduce(f32::max);
         let mut net_pct = 0.0f32;
         for n in &snap.networks {
             if n.link_bps > 0 && (n.recv_bps > 0.0 || n.sent_bps > 0.0) {
@@ -1153,18 +1157,21 @@ impl Aggregates {
     ///
     /// The header row states MACHINE totals, not column sums — that is what
     /// makes a row's percentage readable ("the disks are 43 % busy and this
-    /// process accounts for 100 % of that"). Disk activity therefore repeats
-    /// the disk total deliberately: its column is a share OF that number,
-    /// while the Disk column next to it is a byte rate.
+    /// process accounts for 100 % of that"). Disk active time therefore
+    /// repeats the disk total deliberately: its column is a share OF that
+    /// number, while the Disk I/O column next to it is a byte rate.
     ///
     /// A table with fewer numeric columns simply uses the leading entries.
     pub fn strings(&self) -> [String; 6] {
+        let disk = self
+            .disk_pct
+            .map_or_else(|| "\u{2014}".to_string(), format::format_pct_hdr);
         [
             format::format_pct_hdr(self.cpu_pct),
             format::format_pct_hdr(self.mem_pct),
-            format::format_pct_hdr(self.disk_pct),
+            disk.clone(),
             format::format_pct_hdr(self.net_pct),
-            format::format_pct_hdr(self.disk_pct),
+            disk,
             format::format_pct_hdr(self.gpu_pct),
         ]
     }
@@ -1195,6 +1202,58 @@ mod tests {
             ],
             None,
         )
+    }
+
+    /// The disk headers must never invent a zero.
+    ///
+    /// Regression: the Windows sampler fills `DiskInfo::active_pct` from the
+    /// PhysicalDisk PDH group, and that group only runs while something asks
+    /// for it. It used to collapse "not measured" into `0.0`, so both disk
+    /// totals read a confident "0 %" over rows whose Disk active time column
+    /// showed a process at 51 %.
+    #[test]
+    fn the_disk_totals_read_unavailable_until_a_disk_is_measured() {
+        let unmeasured = tm_core::model::DiskInfo {
+            active_pct: None,
+            ..Default::default()
+        };
+        let mut snap = tm_core::model::Snapshot {
+            disks: vec![unmeasured.clone()],
+            ..Default::default()
+        };
+        let agg = Aggregates::from_snapshot(&snap);
+        assert_eq!(agg.disk_pct, None);
+        let hdr = agg.strings();
+        // Disk I/O (2) and Disk active time (4) both hang off that number.
+        assert_eq!(hdr[2], "\u{2014}", "an unmeasured disk must not read 0 %");
+        assert_eq!(hdr[4], "\u{2014}", "an unmeasured disk must not read 0 %");
+
+        // The busiest measured disk wins, and an unmeasured one beside it
+        // neither drags the total down nor hides it.
+        snap.disks = vec![
+            unmeasured,
+            tm_core::model::DiskInfo {
+                active_pct: Some(43.0),
+                ..Default::default()
+            },
+            tm_core::model::DiskInfo {
+                active_pct: Some(7.0),
+                ..Default::default()
+            },
+        ];
+        let hdr = Aggregates::from_snapshot(&snap).strings();
+        assert_eq!(hdr[2], format::format_pct_hdr(43.0));
+        assert_eq!(hdr[4], hdr[2]);
+
+        // A genuinely idle disk still says so.
+        snap.disks = vec![tm_core::model::DiskInfo {
+            active_pct: Some(0.0),
+            ..Default::default()
+        }];
+        assert_eq!(
+            Aggregates::from_snapshot(&snap).strings()[4],
+            format::format_pct_hdr(0.0)
+        );
     }
 
     /// Aggregates are shared across tables with different column counts, so

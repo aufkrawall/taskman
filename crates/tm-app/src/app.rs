@@ -794,7 +794,17 @@ impl TaskManApp {
                 disks: latest
                     .disks
                     .iter()
-                    .map(|d| (d.mount.clone(), d.active_pct, d.read_bps, d.write_bps))
+                    // An unmeasured tick plots as 0 like an absent mount
+                    // does: the series must stay index-aligned with
+                    // `timestamps`. The readouts say "—" instead of lying.
+                    .map(|d| {
+                        (
+                            d.mount.clone(),
+                            d.active_pct.unwrap_or(0.0),
+                            d.read_bps,
+                            d.write_bps,
+                        )
+                    })
                     .collect(),
                 nets: latest
                     .networks
@@ -990,50 +1000,13 @@ impl TaskManApp {
     /// Derive telemetry demand from the visible surface and ship it when it
     /// changes (implement.md §6.3). Cheap: one atomic command on change.
     fn update_demand(&mut self) {
-        let mut d = TelemetryDemand::core(); // core + adapter rates + tokens
-        // Per-process network is an ETW session on Windows. Processes and
-        // App History always show it; Details requests it only for visible
-        // network columns. Process Properties also exposes live send/receive
-        // statistics, so keep the source active while that inspector is open.
-        // Users rolls the same per-process columns up per session, so it
-        // needs the same sources Processes does — without them its Network,
-        // Disk activity and GPU cells can only say "unknown".
-        let details_network =
-            self.tab == Tab::Details && self.details_state.requires_network_telemetry();
-        if matches!(self.tab, Tab::Processes | Tab::AppHistory | Tab::Users)
-            || details_network
-            || self.proc_props.is_some()
-        {
-            d = d.union(TelemetryDemand::PROCESS_NET);
-        }
-        // The Processes and Users pages carry a GPU column, so they need the
-        // PDH GPU group. That group also enumerates adapters, which is why a
-        // page without a GPU column deliberately never touches it.
-        if matches!(self.tab, Tab::Processes | Tab::Users) {
-            d = d.union(TelemetryDemand::PROCESS_GPU);
-        }
-        // Per-process disk service time is a second ETW session. Processes and
-        // Users show its column always; Details only when it is visible.
-        if matches!(self.tab, Tab::Processes | Tab::Users)
-            || (self.tab == Tab::Details && self.details_state.requires_disk_telemetry())
-        {
-            d = d.union(TelemetryDemand::PROCESS_DISK);
-        }
-        match self.tab {
-            Tab::Performance => {
-                d = d
-                    .union(TelemetryDemand::DISK_RATE)
-                    .union(TelemetryDemand::GPU_ADAPTER)
-                    .union(TelemetryDemand::CPU_SPEED);
-            }
-            Tab::Details if self.details_state.requires_gpu_telemetry() => {
-                d = d
-                    .union(TelemetryDemand::PROCESS_GPU)
-                    .union(TelemetryDemand::PROCESS_GPU_MEMORY)
-                    .union(TelemetryDemand::GPU_ADAPTER);
-            }
-            _ => {}
-        }
+        let d = demand_for(
+            self.tab,
+            self.details_state.requires_network_telemetry(),
+            self.details_state.requires_disk_telemetry(),
+            self.details_state.requires_gpu_telemetry(),
+            self.proc_props.is_some(),
+        );
         if d.bits() != self.last_demand_bits {
             self.last_demand_bits = d.bits();
             self.engine.set_demand(d);
@@ -1129,6 +1102,71 @@ impl TaskManApp {
         // Final synchronous flush so history is not lost at shutdown.
         self.app_history_db.save();
     }
+}
+
+/// Which telemetry the visible surface needs (implement.md §6.3).
+///
+/// Free-standing and pure so the wiring is testable: a page that shows a
+/// column whose provider it forgot to request renders "—" at best and a
+/// measured-looking zero at worst, and neither is visible from the caller.
+/// The `details_*` flags say whether the Details page's VISIBLE columns want
+/// a source; they are ignored while another page is on screen.
+fn demand_for(
+    tab: Tab,
+    details_network: bool,
+    details_disk: bool,
+    details_gpu: bool,
+    proc_props_open: bool,
+) -> TelemetryDemand {
+    let mut d = TelemetryDemand::core(); // core + adapter rates + tokens
+    let details = |wanted: bool| tab == Tab::Details && wanted;
+    // Per-process network is an ETW session on Windows. Processes and
+    // App History always show it; Details requests it only for visible
+    // network columns. Process Properties also exposes live send/receive
+    // statistics, so keep the source active while that inspector is open.
+    // Users rolls the same per-process columns up per session, so it
+    // needs the same sources Processes does — without them its Network,
+    // Disk active time and GPU cells can only say "unknown".
+    if matches!(tab, Tab::Processes | Tab::AppHistory | Tab::Users)
+        || details(details_network)
+        || proc_props_open
+    {
+        d = d.union(TelemetryDemand::PROCESS_NET);
+    }
+    // The Processes and Users pages carry a GPU column, so they need the
+    // PDH GPU group. That group also enumerates adapters, which is why a
+    // page without a GPU column deliberately never touches it.
+    if matches!(tab, Tab::Processes | Tab::Users) {
+        d = d.union(TelemetryDemand::PROCESS_GPU);
+    }
+    // Per-process disk service time is a second ETW session. Processes and
+    // Users show its column always; Details only when it is visible.
+    if matches!(tab, Tab::Processes | Tab::Users) || details(details_disk) {
+        d = d.union(TelemetryDemand::PROCESS_DISK);
+        // ...and the PhysicalDisk counters with it. The header states the
+        // MACHINE's disk active time and the column under it is a share OF
+        // that number, so a page showing it has to keep those counters
+        // running itself. Leaving that to the Performance page meant the
+        // total decayed to a flat, measured-looking "0 %" one PDH keep-alive
+        // after that page was last visited.
+        d = d.union(TelemetryDemand::DISK_RATE);
+    }
+    match tab {
+        Tab::Performance => {
+            d = d
+                .union(TelemetryDemand::DISK_RATE)
+                .union(TelemetryDemand::GPU_ADAPTER)
+                .union(TelemetryDemand::CPU_SPEED);
+        }
+        Tab::Details if details_gpu => {
+            d = d
+                .union(TelemetryDemand::PROCESS_GPU)
+                .union(TelemetryDemand::PROCESS_GPU_MEMORY)
+                .union(TelemetryDemand::GPU_ADAPTER);
+        }
+        _ => {}
+    }
+    d
 }
 
 /// Repair a dangling Task Manager registration where that costs the user
@@ -1931,6 +1969,40 @@ mod tests {
         // Non-divisible windows round UP so the requested span always fits
         // (240 s / 1.5 s = exactly 160 here).
         assert_eq!(history_cap_for(241, 1.5), 161);
+    }
+
+    /// Regression: the Processes and Users pages state the machine's disk
+    /// active time in the header and show each process's share of it, but
+    /// only the Performance page asked for `DISK_RATE`. Half a minute (the
+    /// PDH keep-alive) after leaving that page the counters shut down, every
+    /// disk reported an unmeasured 0 % and both disk headers read a flat
+    /// "0 %" over rows that clearly showed disk work.
+    #[test]
+    fn pages_showing_disk_active_time_ask_for_the_disk_counters() {
+        for tab in [Tab::Processes, Tab::Users] {
+            let d = demand_for(tab, false, false, false, false);
+            assert!(
+                d.wants(TelemetryDemand::PROCESS_DISK),
+                "{tab:?} must request the per-process disk trace"
+            );
+            assert!(
+                d.wants(TelemetryDemand::DISK_RATE),
+                "{tab:?} shows a share OF the machine total, so it must \
+                 request the disk counters that measure it"
+            );
+        }
+        // Details only when its disk column is actually visible.
+        assert!(
+            !demand_for(Tab::Details, false, false, false, false).wants(TelemetryDemand::DISK_RATE)
+        );
+        assert!(
+            demand_for(Tab::Details, false, true, false, false).wants(TelemetryDemand::DISK_RATE)
+        );
+        // A page with no disk column still must not wake the counters.
+        assert!(
+            !demand_for(Tab::Services, false, false, false, false)
+                .wants(TelemetryDemand::DISK_RATE)
+        );
     }
 
     /// Regression ("graphs stop updating"): the history was a `VecDeque`

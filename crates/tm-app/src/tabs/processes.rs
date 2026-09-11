@@ -2487,7 +2487,7 @@ fn sort_entries(
     let sv = |p: &ProcessEntry, i: usize| subtree.get(&p.pid).map_or(0.0, |s| s[i]);
     // `col` is a LOGICAL column, so this arm covers every value column that
     // exists rather than a hand-written list. The hand-written one stopped at
-    // 5, which meant Disk activity and GPU quietly sorted by NAME.
+    // 5, which meant Disk active time and GPU quietly sorted by NAME.
     let value = col
         .checked_sub(FIXED_COLS)
         .filter(|index| *index < VALUE_COLS);
@@ -3200,7 +3200,7 @@ mod tests {
         );
     }
 
-    /// The whole point of the Disk activity column: it must come from the
+    /// The whole point of the Disk active time column: it must come from the
     /// measured share, NOT from the I/O byte counters next to it. A process
     /// reading a cached file all day tops the Disk column while causing no
     /// disk activity at all.
@@ -3335,7 +3335,7 @@ mod tests {
     }
 
     /// Every value column must sort by ITS value. The old hand-written match
-    /// stopped at column 5, so Disk activity and GPU fell through to the
+    /// stopped at column 5, so Disk active time and GPU fell through to the
     /// name comparison and the click looked like it did nothing.
     #[test]
     fn every_value_column_sorts_by_its_own_value() {

@@ -197,7 +197,9 @@ impl SystemCollector for MacCollector {
                     media: MediaKind::Unknown,
                     total_bytes: d.total_space(),
                     free_bytes: d.available_space(),
-                    active_pct: 0.0,
+                    // No per-disk busy-time source is wired up here yet;
+                    // "unknown" is the honest answer, not a flat 0 %.
+                    active_pct: None,
                     read_bps: 0.0,
                     write_bps: 0.0,
                     avg_resp_ms: 0.0,

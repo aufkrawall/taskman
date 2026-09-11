@@ -22,8 +22,8 @@ impl TelemetryDemand {
     pub const TOKEN_SECURITY: Self = Self(1 << 7);
     /// CPU current-speed PDH counter (Performance page only).
     pub const CPU_SPEED: Self = Self(1 << 8);
-    /// ETW per-process disk trace (the Disk activity column on the Processes
-    /// and Details pages).
+    /// ETW per-process disk trace (the Disk active time column on the
+    /// Processes and Details pages).
     pub const PROCESS_DISK: Self = Self(1 << 9);
 
     /// Union.

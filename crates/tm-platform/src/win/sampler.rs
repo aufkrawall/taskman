@@ -1021,7 +1021,9 @@ impl Sampler {
                 media,
                 total_bytes: d.total_space(),
                 free_bytes: d.available_space(),
-                active_pct: perf.map_or(0.0, |x| x.active_pct),
+                // `None` while the PhysicalDisk PDH group is asleep or
+                // still warming: an unmeasured disk is not an idle one.
+                active_pct: perf.map(|x| x.active_pct),
                 read_bps: perf.map_or(0.0, |x| x.read_bps),
                 write_bps: perf.map_or(0.0, |x| x.write_bps),
                 avg_resp_ms: perf.map_or(0.0, |x| x.avg_resp_ms),

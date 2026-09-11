@@ -191,9 +191,9 @@ remain follow-up rather than being simulated in headless tests:
 - "columns can't be resized" (drag delta handling) — root-caused earlier;
   egui `drag_delta()` accumulation onto the LIVE width is correct behavior.
 
-## Per-process disk activity
+## Per-process disk active time
 
-- `Disk activity` is measured, so it is only available where an ETW session
+- `Disk active time` is measured, so it is only available where an ETW session
   can run: through the LocalSystem broker (the normal install) or in an
   elevated GUI. Without either it renders "—", like the Network column.
 - Requests issued by a thread that had already exited when the window was

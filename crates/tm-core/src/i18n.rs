@@ -279,7 +279,7 @@ keys! {
     ColStatus => ["Status", "Status"],
     ColCpu => ["CPU", "CPU"],
     ColMemory => ["Arbeitsspeicher", "Memory"],
-    ColDisk => ["Datenträger", "Disk"],
+    ColDisk => ["Datenträger-E/A", "Disk I/O"],
     ColNetwork => ["Netzwerk", "Network"],
     ColPid => ["PID", "PID"],
     ColUsername => ["Benutzername", "User name"],
@@ -413,14 +413,14 @@ keys! {
         "Per-process network needs administrator rights (ETW session)."
     ],
     DiskPerProcessUnavailable => [
-        "Datenträgeraktivität pro Prozess benötigt Administratorrechte (ETW-Sitzung).",
-        "Per-process disk activity needs administrator rights (ETW session)."
+        "Die aktive Datenträgerzeit pro Prozess benötigt Administratorrechte (ETW-Sitzung).",
+        "Per-process disk active time needs administrator rights (ETW session)."
     ],
     GpuPerProcessUnavailable => [
         "Für diesen Prozess melden die GPU-Leistungsindikatoren keinen Wert.",
         "The GPU performance counters report no value for this process."
     ],
-    ColDiskActivity => ["Datenträgeraktivität", "Disk activity"],
+    ColDiskActivity => ["Aktive Datenträgerzeit", "Disk active time"],
     ColIoOps => ["E/A-Vorgänge/s", "I/O operations/s"],
     ColHardFaults => ["Harte Seitenfehler/s", "Hard faults/s"],
     DiskActivityTooltip => [

@@ -197,7 +197,7 @@ platform boundary (`tm-core` ← `tm-platform` ← `tm-app` / `tm-service`):
   list). Process counts on Processes use SQUARE brackets — `Microsoft Edge
   (msedge.exe) [24]`, `Apps [7]` — because round ones mean an image name.
 - `crates/tm-app/src/tabs/value_columns.rs` — the numeric column catalogue
-  (CPU/Memory/Disk/Network/Disk activity/GPU) shared by the Processes and
+  (CPU/Memory/Disk I/O/Network/Disk active time/GPU) shared by the Processes and
   Users tables: ids and widths, the logical↔display order translation for
   dragged columns and its persistence, one-cell formatting, and the
   explanation each optional column shows when it reads "—". Rows everywhere

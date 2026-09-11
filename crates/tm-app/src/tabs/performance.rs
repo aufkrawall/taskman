@@ -497,7 +497,9 @@ fn build_resource_list(app: &TaskManApp) -> Vec<ResourceEntry> {
             key: d.mount.clone(),
             title: format!("{} {}", i18n::tr(K::DiskTitle), d.id),
             subtitle: disk_media_label(d),
-            value_line: format::format_pct_hdr(d.active_pct),
+            value_line: d
+                .active_pct
+                .map_or_else(|| "\u{2014}".into(), format::format_pct_hdr),
         });
     }
 
@@ -1523,7 +1525,9 @@ fn disk_page(app: &mut TaskManApp, ui: &mut egui::Ui, pal: &Palette, entry: &Res
                     ui,
                     pal,
                     i18n::tr(K::StatActiveTime),
-                    &format::format_pct_hdr(disk.active_pct),
+                    &disk
+                        .active_pct
+                        .map_or_else(|| "\u{2014}".into(), format::format_pct_hdr),
                     w,
                 );
                 big_stat(

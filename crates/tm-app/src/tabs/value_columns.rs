@@ -16,13 +16,14 @@ use tm_core::i18n::{self, K};
 
 use crate::widgets::tablekit::TmColumn;
 
-/// Numeric value columns: CPU, Memory, Disk, Network, Disk activity, GPU.
+/// Numeric value columns: CPU, Memory, Disk I/O, Network, Disk active
+/// time, GPU.
 pub const VALUE_COLS: usize = 6;
 
 /// Index of the Network column inside `values` — one of the three whose value
 /// can be genuinely unknown per row.
 pub const NET: usize = 3;
-/// Index of the Disk activity column inside `values`; likewise optional.
+/// Index of the Disk active time column inside `values`; likewise optional.
 pub const DISK_ACT: usize = 4;
 /// Index of the GPU column inside `values`; optional for the same reason.
 pub const GPU: usize = 5;
@@ -62,7 +63,7 @@ pub const VALUE_COLUMNS: [ValueColumn; VALUE_COLS] = [
         label: || i18n::tr(K::ColNetwork),
         width: 110.0,
     },
-    // Which process is actually keeping the disks busy. The Disk column
+    // Which process is actually keeping the disks busy. The Disk I/O column
     // counts I/O BYTES the process asked for, cache hits included; this one
     // is its share of the time the disks really spent.
     ValueColumn {

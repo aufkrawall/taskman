@@ -68,6 +68,15 @@ pub fn run(mock: bool) -> i32 {
         "memory_total_gb": (snap.memory.total_bytes as f64 / 1024.0 / 1024.0 / 1024.0 * 10.0).round() / 10.0,
         "processes": snap.processes.len(),
         "disks": snap.disks.len(),
+        // The busiest disk's active time — the machine total both disk
+        // columns are read against. `null` means the PhysicalDisk counters
+        // reported nothing, which used to be indistinguishable from an idle
+        // machine because it was published as a flat 0 %.
+        "disk_busiest_active_pct": snap
+            .disks
+            .iter()
+            .filter_map(|d| d.active_pct)
+            .reduce(f32::max),
         "networks": snap.networks.len(),
         "gpus": snap.gpus.iter().map(|g| g.name.clone()).collect::<Vec<_>>(),
         // How many processes carry a per-process network reading. `0` with a

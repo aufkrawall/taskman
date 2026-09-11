@@ -17,12 +17,25 @@ can cross a protected, allowlisted service boundary after one explicit install.
 
 ## Recently landed (2026-09-11 — disk attribution, graph readout, network units)
 
+- **The two disk columns say what they measure, and their header total is
+  real.** `Disk` / `Disk activity` became `Disk I/O` (`Datenträger-E/A`) and
+  `Disk active time` (`Aktive Datenträgerzeit`): the first is the I/O BYTES a
+  process asked for, cache hits included, and the second is its share of the
+  time the disks were really busy — the Performance page's Active time, split
+  per process. Both headers state that machine total, and it was a lie: the
+  Windows sampler published `DiskInfo::active_pct` as `0.0` whenever the
+  `PhysicalDisk` PDH group was not collecting, and only the Performance page
+  ever asked for `DISK_RATE`. One PDH keep-alive (30 s) after leaving that
+  page, both disk totals read a confident "0 %" above rows showing a process
+  at 51 %. `active_pct` is `Option<f32>` now (unknown renders "—" in the
+  header and in the Performance card and Active time stat), and every page
+  that shows the columns requests the counters that measure them.
 - **"Which process is causing the disk activity" is answerable.** The
   Performance page's Active time had no counterpart on Processes/Details: the
   I/O read/write columns are the kernel's `IO_COUNTERS`, which count cache
-  hits, sockets and named pipes and miss paging I/O entirely. A new
-  `Disk activity` column shows each process's share of the disk service time
-  actually spent, measured by `win/disk_etw.rs` from
+  hits, sockets and named pipes and miss paging I/O entirely. The
+  `Disk active time` column shows each process's share of the disk service
+  time actually spent, measured by `win/disk_etw.rs` from
   `Microsoft-Windows-Kernel-Disk` and hosted by the broker (protocol v4) so an
   unelevated GUI gets it. Details additionally offers `I/O operations/s` and
   `Hard faults/s`, which need no session at all — both come from the same
@@ -380,22 +393,23 @@ rebase runbook.
   references were dropped, or still in use — is reported as data, not
   guessed from an error.
 - The Users page shows the SAME six value columns as Processes — CPU,
-  Memory, Disk, Network, Disk activity, GPU — rolled up per session and per
+  Memory, Disk I/O, Network, Disk active time, GPU — rolled up per session and per
   app inside it, with the same draggable column order (persisted under
   `[columns.users].order`), the same heat band and the same header totals.
   The catalogue, the display-order permutation and the cell formatting live
   once in `tabs/value_columns.rs`; both pages index rows in LOGICAL order and
   translate to the user's display order only when painting.
-- Each rollup carries WHICH columns anything measured. Network, Disk activity
-  and GPU come from sources that may not be running, so their sums are marked
+- Each rollup carries WHICH columns anything measured. Network, Disk active
+  time and GPU come from sources that may not be running, so their sums are marked
   unknown until one process reports: an unknown cell reads "—", is left out of
   the heat band and its column maximum, sorts below a measured zero, and
   explains itself on hover (`value_columns::unavailable_tip`).
 - Telemetry demand follows that: the Users tab requests `PROCESS_NET`,
-  `PROCESS_DISK` and `PROCESS_GPU` exactly like Processes. Without that its
-  new columns could only ever say "unknown" — which is what the page did
-  before, when it aggregated CPU/memory/disk and printed a hardcoded dash for
-  network.
+  `PROCESS_DISK`, `DISK_RATE` and `PROCESS_GPU` exactly like Processes.
+  Without that its new columns could only ever say "unknown" — which is what
+  the page did before, when it aggregated CPU/memory/disk and printed a
+  hardcoded dash for network. `app::demand_for` is a pure function precisely
+  so a page's sources can be pinned by a test.
 - Details adds typed optional columns for description, publisher, parent PID,
   session ID, image path, page faults/sec, and I/O read/write totals. Startup,
   App History, Users, and Services headers now sort; tables draw quiet body

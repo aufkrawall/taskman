@@ -160,7 +160,7 @@ impl SystemCollector for LinuxCollector {
                 media,
                 total_bytes: d.total_space(),
                 free_bytes: d.available_space(),
-                active_pct: ds.map(|s| s.active_pct(interval_s)).unwrap_or(0.0),
+                active_pct: ds.map(|s| s.active_pct(interval_s)),
                 read_bps: ds.map(|s| s.read_bps(interval_s)).unwrap_or(0.0),
                 write_bps: ds.map(|s| s.write_bps(interval_s)).unwrap_or(0.0),
                 avg_resp_ms: 0.0,

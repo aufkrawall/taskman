@@ -1,6 +1,6 @@
 # llm-wiki Index
 
-Last cross-checked: 2026-09-11 (disk attribution, chart readout)
+Last cross-checked: 2026-09-11 (disk column names and machine totals)
 
 Primary sources:
 

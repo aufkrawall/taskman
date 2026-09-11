@@ -168,7 +168,9 @@ pub struct DiskInfo {
     pub total_bytes: u64,
     pub free_bytes: u64,
     /// Time spent servicing I/O as fraction of elapsed (0..=100).
-    pub active_pct: f32,
+    /// `None` where the platform's disk-time counters are not running: an
+    /// idle disk and an unmeasured one must never read the same.
+    pub active_pct: Option<f32>,
     pub read_bps: f64,
     pub write_bps: f64,
     /// Average time requests spend being serviced, ms (0 = unknown).
