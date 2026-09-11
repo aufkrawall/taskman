@@ -244,12 +244,13 @@ pub struct ResourceEntry {
 /// and charts all share it so their edges line up.
 const GUTTER: f32 = 16.0;
 
-/// Kernel-time shade: a darker tone of the accent hue — Task Manager draws
-/// the kernel share as a deeper band of the SAME color, not a clashing
-/// second hue (§14.4). `pal`-derived, so it stays readable in both themes
-/// (the old hardcoded dark-theme green washed out in light mode).
+/// Kernel-time color. Task Manager draws the kernel share as a deeper band of
+/// the same accent (§14.4) and we did too — as `cpu_graph.gamma_multiply()`,
+/// which is the same cyan at reduced ALPHA, so on a busy core the band and the
+/// total it sits inside were one blur. `cpu_kernel_graph` is an opaque indigo
+/// instead: still cool, still subordinate, but a hue apart.
 fn kernel_color(pal: &Palette) -> Color32 {
-    pal.cpu_graph.gamma_multiply(0.55)
+    pal.cpu_kernel_graph
 }
 
 pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
@@ -1055,7 +1056,7 @@ fn cpu_page(app: &mut TaskManApp, ui: &mut egui::Ui, pal: &Palette) {
                             ui,
                             egui::vec2(cell_w, cell_h),
                             &core_hist[i],
-                            kernels.then_some(&core_kern[i]),
+                            kernels.then(|| (core_kern[i].as_slice(), kernel_color(pal))),
                             pal.cpu_graph,
                             &format!("CPU {i}"),
                             Some(&ts),
@@ -1330,7 +1331,7 @@ fn memory_page(app: &mut TaskManApp, ui: &mut egui::Ui, pal: &Palette) {
         &[MultiSeries::new(
             i18n::tr(K::StatCommitted),
             commit,
-            pal.memory_graph.gamma_multiply(0.62),
+            theme::toned(pal, pal.memory_graph, 0.62),
         )],
         commit_limit.max(0.1),
         Some(&ts),
@@ -1512,11 +1513,7 @@ fn disk_page(app: &mut TaskManApp, ui: &mut egui::Ui, pal: &Palette, entry: &Res
         160.0,
         &[
             MultiSeries::new(i18n::tr(K::StatRead), read, pal.disk_graph),
-            MultiSeries::new(
-                i18n::tr(K::StatWrite),
-                write,
-                pal.disk_graph.gamma_multiply(0.62),
-            ),
+            MultiSeries::new(i18n::tr(K::StatWrite), write, pal.disk_write_graph),
         ],
         peak,
         Some(&ts),
@@ -1625,11 +1622,7 @@ fn network_page(app: &mut TaskManApp, ui: &mut egui::Ui, pal: &Palette, entry: &
         230.0,
         &[
             MultiSeries::new(i18n::tr(K::StatReceive), recv, pal.network_graph),
-            MultiSeries::new(
-                i18n::tr(K::StatSend),
-                sent,
-                pal.network_graph.gamma_multiply(0.62),
-            ),
+            MultiSeries::new(i18n::tr(K::StatSend), sent, pal.network_send_graph),
         ],
         peak,
         Some(&ts),
@@ -1745,8 +1738,7 @@ fn gpu_page(app: &mut TaskManApp, ui: &mut egui::Ui, pal: &Palette, entry: &Reso
                         // One hue, stepped in brightness: these are shares of
                         // the same adapter, and a second accent colour on this
                         // page would read as a different resource.
-                        pal.gpu_graph
-                            .gamma_multiply(1.0 - 0.13 * (index.min(5) as f32)),
+                        theme::toned(pal, pal.gpu_graph, 1.0 - 0.13 * (index.min(5) as f32)),
                     )
                 })
                 .collect::<Vec<_>>(),
@@ -1812,7 +1804,7 @@ fn gpu_page(app: &mut TaskManApp, ui: &mut egui::Ui, pal: &Palette, entry: &Reso
         &[MultiSeries::new(
             i18n::tr(K::GpuMemStat),
             mem_mib,
-            pal.gpu_graph.gamma_multiply(0.62),
+            theme::toned(pal, pal.gpu_graph, 0.62),
         )],
         max_mib,
         Some(&ts),

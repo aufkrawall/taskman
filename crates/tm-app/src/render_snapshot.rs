@@ -202,7 +202,7 @@ fn build_frame(ctx: &egui::Context) -> egui::FullOutput {
                                         ui,
                                         vec2(88.0, 56.0),
                                         &s,
-                                        Some(&k),
+                                        Some((&k, pal.cpu_kernel_graph)),
                                         pal.cpu_graph,
                                         &format!("CPU {i}"),
                                         None,

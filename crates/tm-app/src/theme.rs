@@ -111,6 +111,18 @@ pub struct Palette {
     pub disk_graph: Color32,
     pub network_graph: Color32,
     pub gpu_graph: Color32,
+    /// Partner colours for the three charts that overlay two series at once.
+    ///
+    /// These used to be `gamma_multiply(0.6)` of the resource colour, which is
+    /// not a shade at all: it scales the ALPHA along with the components, so
+    /// both halves of a pair were the same hue and told apart only by how much
+    /// background showed through — and the chart's own area fill then thinned
+    /// that further. Each partner is now an opaque colour of its own, chosen
+    /// to differ in HUE from its primary, which is what still reads at a
+    /// glance on a 160 px tall graph.
+    pub cpu_kernel_graph: Color32,
+    pub disk_write_graph: Color32,
+    pub network_send_graph: Color32,
     pub stroke: Color32,
     pub chart_grid: Color32,
     /// Floor of the heat gradient: the tint EVERY numeric cell carries, even
@@ -143,6 +155,11 @@ pub const DARK: Palette = Palette {
     disk_graph: Color32::from_rgb(0x6f, 0xc2, 0x68),
     network_graph: Color32::from_rgb(0xdc, 0x72, 0xb8),
     gpu_graph: Color32::from_rgb(0xe0, 0x91, 0x4f),
+    // Indigo under the cyan total, gold against the green read, teal against
+    // the magenta receive.
+    cpu_kernel_graph: Color32::from_rgb(0x3a, 0x63, 0xd9),
+    disk_write_graph: Color32::from_rgb(0xe8, 0xa0, 0x20),
+    network_send_graph: Color32::from_rgb(0x45, 0xc4, 0xb0),
     stroke: Color32::from_rgb(0x2d, 0x2d, 0x2d),
     chart_grid: Color32::from_rgb(0x37, 0x37, 0x37),
     heat_base: Color32::from_rgb(0x14, 0x27, 0x40),
@@ -168,6 +185,11 @@ pub const LIGHT: Palette = Palette {
     disk_graph: Color32::from_rgb(0x2f, 0x82, 0x2f),
     network_graph: Color32::from_rgb(0x9b, 0x3f, 0x82),
     gpu_graph: Color32::from_rgb(0xa8, 0x5a, 0x20),
+    // Same three hue relationships, re-tuned against a white card: the dark
+    // theme's tones would all read as pastel smears on it.
+    cpu_kernel_graph: Color32::from_rgb(0x5a, 0x3e, 0xa8),
+    disk_write_graph: Color32::from_rgb(0xb0, 0x6a, 0x00),
+    network_send_graph: Color32::from_rgb(0x0e, 0x7a, 0x6b),
     stroke: Color32::from_rgb(0xdd, 0xdd, 0xdd),
     chart_grid: Color32::from_rgb(0xe2, 0xe2, 0xe2),
     heat_base: Color32::from_rgb(0xef, 0xf5, 0xfd),
@@ -458,6 +480,19 @@ pub fn heat_blue(pal: &Palette, t: f32) -> Color32 {
     lerp_rgb(pal.heat_base, pal.heat_high, f)
 }
 
+/// A subordinate tone of `color`: mixed `factor` of the way from the card
+/// surface towards the full colour, and OPAQUE.
+///
+/// `Color32::gamma_multiply` looks like it does this but scales the alpha too,
+/// so "a quieter shade" came out as "the same colour at 62 % opacity". That
+/// darkens on the dark theme and washes out on the light one — and since
+/// `widgets::chart` already paints series fills translucent, the two alphas
+/// compounded until a subordinate series barely existed. Mixing towards the
+/// card keeps the intended quietness in both themes without spending alpha.
+pub fn toned(pal: &Palette, color: Color32, factor: f32) -> Color32 {
+    lerp_rgb(pal.card_bg, color, factor.clamp(0.0, 1.0))
+}
+
 fn lerp_rgb(a: Color32, b: Color32, f: f32) -> Color32 {
     let ch = |a: u8, b: u8| {
         (a as f32 + (b as f32 - a as f32) * f)
@@ -505,6 +540,58 @@ mod tests {
                 assert!(toward_high(previous, next), "step {step} regressed");
                 previous = next;
             }
+        }
+    }
+
+    /// Weighted channel distance, the crude stand-in for "tells apart at a
+    /// glance" used by the pairing test below.
+    fn distance(a: Color32, b: Color32) -> i32 {
+        let d = |x: u8, y: u8| (x as i32 - y as i32).abs();
+        (2 * d(a.r(), b.r()) + 5 * d(a.g(), b.g()) + d(a.b(), b.b())) / 8
+    }
+
+    /// Both halves of an overlaid pair must be OPAQUE and far enough apart to
+    /// read as two series.
+    ///
+    /// Opacity is the part that regressed: the partners were
+    /// `gamma_multiply(0.6)` of the primary, and that scales alpha along with
+    /// the components — so "the darker one" was really "the same colour, more
+    /// background showing through", which `widgets::chart` then painted behind
+    /// its own translucent area fill. Disk read/write, network send/receive
+    /// and CPU user/kernel all came out as one smear.
+    #[test]
+    fn paired_series_are_opaque_and_far_apart() {
+        for pal in [DARK, LIGHT] {
+            for (name, primary, partner) in [
+                ("cpu", pal.cpu_graph, pal.cpu_kernel_graph),
+                ("disk", pal.disk_graph, pal.disk_write_graph),
+                ("network", pal.network_graph, pal.network_send_graph),
+            ] {
+                assert_eq!(primary.a(), 255, "{name} primary is translucent");
+                assert_eq!(partner.a(), 255, "{name} partner is translucent");
+                let d = distance(primary, partner);
+                assert!(d >= 50, "{name}: {primary:?} vs {partner:?} is only {d}");
+                // Each half must also stand clear of the card it is drawn on.
+                for c in [primary, partner] {
+                    let d = distance(c, pal.card_bg);
+                    assert!(d >= 40, "{name}: {c:?} is only {d} off the card");
+                }
+            }
+        }
+    }
+
+    /// A subordinate tone stays opaque and moves towards the CARD, not towards
+    /// black — the light theme would otherwise make the quiet series the
+    /// loudest thing on the page.
+    #[test]
+    fn a_subordinate_tone_is_opaque_and_sits_between_card_and_colour() {
+        for pal in [DARK, LIGHT] {
+            let quiet = toned(&pal, pal.memory_graph, 0.62);
+            assert_eq!(quiet.a(), 255);
+            assert!(distance(quiet, pal.card_bg) < distance(pal.memory_graph, pal.card_bg));
+            assert!(distance(quiet, pal.card_bg) >= 30, "faded into the card");
+            assert_eq!(toned(&pal, pal.memory_graph, 1.0), pal.memory_graph);
+            assert_eq!(toned(&pal, pal.memory_graph, 0.0), pal.card_bg);
         }
     }
 

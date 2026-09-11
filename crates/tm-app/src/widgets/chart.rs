@@ -54,16 +54,14 @@ fn area_fill(color: Color32) -> Color32 {
     Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), FILL_ALPHA)
 }
 
-/// Half-brightness variant of a series colour, used for kernel time. Opaque,
-/// so it can also serve as the readout's colour swatch.
-fn kernel_shade(color: Color32) -> Color32 {
-    Color32::from_rgb(color.r() / 2, color.g() / 2, color.b() / 2)
-}
-
-/// Kernel-time band fill: [`kernel_shade`] painted over the user-time fill.
+/// Kernel-time band fill: the caller's kernel colour, near-opaque so it carves
+/// a distinct region out of the user-time fill instead of tinting it.
+///
+/// The colour comes from the caller rather than being derived here (it used to
+/// be `color / 2`), so a core tile and the aggregate CPU chart paint kernel
+/// time in the SAME colour — they were two shades of blue apart.
 fn kernel_fill(color: Color32) -> Color32 {
-    let k = kernel_shade(color);
-    Color32::from_rgba_unmultiplied(k.r(), k.g(), k.b(), KERNEL_ALPHA)
+    Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), KERNEL_ALPHA)
 }
 
 /// Fill the area between an x-monotone polyline and a horizontal baseline.
@@ -451,8 +449,11 @@ pub fn paint_sparkline(
 }
 
 /// Per-logical-processor tile: bordered, faint horizontal grid, filled area.
-/// With `kernels` (same length), the kernel-time share is overlaid darker —
-/// Task Manager's "Show kernel times" (§14.4).
+/// `kernels` carries the kernel-time share (same length) together with the
+/// colour to overlay it in — Task Manager's "Show kernel times" (§14.4). The
+/// colour travels WITH the samples because it is only meaningful when they
+/// are there, and because a tile and the aggregate CPU chart have to paint
+/// kernel time in the same colour.
 ///
 /// `label` names the tile in the hover readout ("CPU 0"); `timestamps_ms`
 /// gives that readout the sample's age, exactly as on the big charts.
@@ -460,7 +461,7 @@ pub fn core_chart(
     ui: &mut egui::Ui,
     size: Vec2,
     samples: &[f64],
-    kernels: Option<&[f64]>,
+    kernels: Option<(&[f64], Color32)>,
     color: Color32,
     label: &str,
     timestamps_ms: Option<&[u64]>,
@@ -489,14 +490,13 @@ pub fn core_chart(
     // Kernel overlay: darker band under the user portion. Painted AFTER the
     // user fill but BEFORE the line, so it darkens the lower region without
     // burying the series line (the old order drew the line first).
-    let kernel_fill = kernel_fill(color);
-    if let Some(k) = kernels {
+    if let Some((k, kernel_color)) = kernels {
         let kpts: Vec<Pos2> = k
             .iter()
             .enumerate()
             .map(|(i, v)| Pos2::new(x(i), y(*v)))
             .collect();
-        fill_area_to_baseline(&painter, &kpts, rect.bottom(), kernel_fill);
+        fill_area_to_baseline(&painter, &kpts, rect.bottom(), kernel_fill(kernel_color));
     }
     painter.add(Shape::line(pts, Stroke::new(1.4, color)));
 
@@ -509,13 +509,13 @@ pub fn core_chart(
             value: fmt_percent(samples[idx]),
         }];
         let mut dots = vec![(y(samples[idx]), color)];
-        if let Some(k) = kernels.and_then(|k| k.get(idx)) {
+        if let Some((kernel_color, k)) = kernels.and_then(|(k, c)| Some((c, *k.get(idx)?))) {
             rows.push(ReadoutRow {
-                color: kernel_shade(color),
+                color: kernel_color,
                 label: i18n::tr(K::ShowKernelTimesShort).to_owned(),
-                value: fmt_percent(*k),
+                value: fmt_percent(k),
             });
-            dots.push((y(*k), kernel_shade(color)));
+            dots.push((y(k), kernel_color));
         }
         paint_marker(&painter, &pal, rect, ppp, x(idx), &dots);
         readout(ui, pos, &sample_age(timestamps_ms, idx), &rows);
@@ -757,17 +757,23 @@ mod tests {
         }
     }
 
-    /// The kernel band is darker than the user-time series it sits inside, and
-    /// its readout swatch is opaque — a translucent swatch on the readout's
-    /// panel fill is barely a smudge.
+    /// The kernel band keeps the caller's kernel colour and stays short of
+    /// fully opaque, so the tile's gridlines still show through it.
     #[test]
-    fn the_kernel_band_is_a_darker_shade_with_an_opaque_swatch() {
-        let color = crate::theme::DARK.cpu_graph;
-        assert_eq!(kernel_shade(color).a(), 255);
-        assert!(luma(kernel_shade(color)) < luma(color));
+    fn the_kernel_band_paints_the_colour_it_was_given() {
+        let pal = crate::theme::DARK;
+        let band = kernel_fill(pal.cpu_kernel_graph);
+        assert!(band.a() < 255, "the grid must still show through");
+        // What lands on screen must still read as the kernel colour rather
+        // than as another tone of the user-time series it sits inside.
+        let opaque = composite(band, pal.card_bg);
+        let d = |a: Color32, b: Color32| {
+            let c = |x: u8, y: u8| (x as i32 - y as i32).abs();
+            (2 * c(a.r(), b.r()) + 5 * c(a.g(), b.g()) + c(a.b(), b.b())) / 8
+        };
         assert!(
-            kernel_fill(color).a() < 255,
-            "the grid must still show through"
+            d(opaque, pal.cpu_kernel_graph) * 3 < d(opaque, pal.cpu_graph),
+            "the band drifted off its own colour: {opaque:?}"
         );
     }
 
