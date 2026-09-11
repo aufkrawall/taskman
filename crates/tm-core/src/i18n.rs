@@ -364,6 +364,7 @@ keys! {
     ResumeProc => ["Fortsetzen", "Resume"],
     AffinityTitle => ["Prozessoraffinität — PID", "Processor affinity — PID"],
     AffinityWarn => ["Mindestens ein Prozessor muss ausgewählt sein.", "At least one processor must be selected."],
+    DeselectAll => ["Alle abwählen", "Deselect all"],
     Apply => ["Übernehmen", "Apply"],
     Cancel => ["Abbrechen", "Cancel"],
     Close => ["Schließen", "Close"],

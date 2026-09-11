@@ -3586,6 +3586,27 @@ pub fn affinity_dialog(app: &mut TaskManApp, ctx: &egui::Context, pal: &theme::P
                     ui.colored_label(pal.heat_high, error);
                 }
                 (Some(mask), Some(system_mask), None) => {
+                    // Above the grid, not below it: the "no processor left"
+                    // warning grows in under the grid, and buttons that move
+                    // when you press them are buttons you press twice.
+                    ui.horizontal(|ui| {
+                        if ui
+                            .add_enabled(
+                                *mask & system_mask != system_mask,
+                                egui::Button::new(i18n::tr(K::SelectAll)),
+                            )
+                            .clicked()
+                        {
+                            *mask = system_mask;
+                        }
+                        if ui
+                            .add_enabled(*mask != 0, egui::Button::new(i18n::tr(K::DeselectAll)))
+                            .clicked()
+                        {
+                            *mask = 0;
+                        }
+                    });
+                    ui.add_space(6.0);
                     egui::Grid::new("affinity")
                         .num_columns(8)
                         .spacing([6.0, 6.0])

@@ -194,7 +194,9 @@ rebase runbook.
 - Context menus are drawn by `widgets/menu.rs`: uniform 28 px full-width rows
   with no gaps, a painted check gutter instead of checkbox widgets, and
   submenus in the same style. Every tab's menus and the `…` overflow menus go
-  through it.
+  through it. The subject caption (`menu::title`, e.g. the process name) is
+  drawn as a bordered, recessed chip, so an inert row is not mistaken for the
+  first command in the list.
 - Scroll bars reserve their lane (`floating_allocated_width`) instead of
   painting over the last ~14 px of content. `tablekit` mirrors the body's
   reservation onto the header so the two stay aligned.
@@ -342,7 +344,9 @@ rebase runbook.
   needs no consent prompt.
 - Details now persists literal process-tree mode, table sort, and per-image
   priority/affinity rules. Its menus show current priority/UAC markers, can
-  safely toggle UAC virtualization, and use background affinity queries.
+  safely toggle UAC virtualization, and use background affinity queries. The
+  affinity dialog offers Select all / Deselect all above the CPU grid (select
+  all covers exactly the system-allowed mask).
   Processes reports suspended, not-responding, and efficiency-mode states.
 - Table sort order persists across sessions on Processes, Details, Modules,
   Startup, Services, Users, and App History. Delete on process tables opens an
