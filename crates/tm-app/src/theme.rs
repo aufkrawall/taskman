@@ -96,6 +96,11 @@ pub struct Palette {
     pub panel_bg: Color32,
     pub card_bg: Color32,
     pub card_bg_hover: Color32,
+    /// Inset surface for a graph cell sitting ON a highlighted card. A
+    /// sparkline that keeps `card_bg` while its card is selected or hovered
+    /// paints the same colour as the card behind it, so the cell dissolves
+    /// into the row exactly when the user is pointing at it.
+    pub card_bg_sunken: Color32,
     pub sidebar_bg: Color32,
     pub text: Color32,
     pub text_dim: Color32,
@@ -127,6 +132,7 @@ pub const DARK: Palette = Palette {
     panel_bg: Color32::from_rgb(0x20, 0x20, 0x20),
     card_bg: Color32::from_rgb(0x2b, 0x2b, 0x2b),
     card_bg_hover: Color32::from_rgb(0x38, 0x38, 0x38),
+    card_bg_sunken: Color32::from_rgb(0x1b, 0x1b, 0x1b),
     sidebar_bg: Color32::from_rgb(0x20, 0x20, 0x20),
     text: Color32::from_rgb(0xff, 0xff, 0xff),
     text_dim: Color32::from_rgb(0x9d, 0x9d, 0x9d),
@@ -151,6 +157,7 @@ pub const LIGHT: Palette = Palette {
     panel_bg: Color32::from_rgb(0xfb, 0xfb, 0xfb),
     card_bg: Color32::from_rgb(0xff, 0xff, 0xff),
     card_bg_hover: Color32::from_rgb(0xf0, 0xf6, 0xfc),
+    card_bg_sunken: Color32::from_rgb(0xed, 0xed, 0xed),
     sidebar_bg: Color32::from_rgb(0xe9, 0xe9, 0xe9),
     text: Color32::from_rgb(0x1a, 0x1a, 0x1a),
     text_dim: Color32::from_rgb(0x5f, 0x5f, 0x5f),

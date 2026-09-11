@@ -250,7 +250,13 @@ fn build_frame(ctx: &egui::Context) -> egui::FullOutput {
                         ui.add_space(8.0);
                         let (rect, _) =
                             ui.allocate_exact_size(vec2(62.0, 40.0), egui::Sense::hover());
-                        chart::paint_sparkline(ui, rect, &series(60, 21, 80.0), pal.disk_graph);
+                        chart::paint_sparkline(
+                            ui,
+                            rect,
+                            &series(60, 21, 80.0),
+                            pal.disk_graph,
+                            pal.card_bg,
+                        );
                         ui.add_space(10.0);
                         ui.painter().text(
                             pos2(ui.cursor().left(), rect.center().y),

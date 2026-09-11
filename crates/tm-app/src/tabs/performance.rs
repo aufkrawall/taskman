@@ -389,6 +389,10 @@ fn card_ui(
 ) {
     let size = egui::vec2(ui.available_width(), 64.0);
     let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::click());
+    // Selected and hovered cards are lifted onto `card_bg`; the mini graph
+    // inside then has to sink to keep a visible cell of its own, or it merges
+    // with the card it sits on.
+    let raised = selected || resp.hovered();
     if selected {
         ui.painter().rect_filled(rect, 3.0, pal.card_bg);
         ui.painter().rect_stroke(
@@ -418,7 +422,12 @@ fn card_ui(
         egui::vec2(62.0, 40.0),
     );
     let color = resource_color(pal, e.kind);
-    crate::widgets::chart::paint_sparkline(ui, chart_rect, samples, color);
+    let cell_bg = if raised {
+        pal.card_bg_sunken
+    } else {
+        pal.card_bg
+    };
+    crate::widgets::chart::paint_sparkline(ui, chart_rect, samples, color, cell_bg);
 
     // Text block: title / subtitle / value. Ellipsized — painter text is
     // drawn unclipped, so long adapter names would bleed past the card.

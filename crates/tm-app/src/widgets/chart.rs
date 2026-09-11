@@ -29,6 +29,43 @@ pub fn fmt_percent(v: f64) -> String {
     format!("{} %", tm_core::format::num_fixed(v, 1))
 }
 
+// ------------------------------------------------------------ series colours
+
+/// Opacity of a series' area fill. Deliberately well under half strength so
+/// the full-brightness polyline always reads as a distinct OUTLINE on top of
+/// its own infill, the way Task Manager's graphs do.
+const FILL_ALPHA: u8 = 72;
+
+/// Opacity of the kernel-time band. Near-opaque: it is a darker region carved
+/// out of the user-time fill, not another translucent wash over it.
+const KERNEL_ALPHA: u8 = 190;
+
+/// Translucent area fill for a series drawn with `color`.
+///
+/// `from_rgba_UNmultiplied` is load-bearing here. These fills used to be built
+/// with `from_rgba_premultiplied(r, g, b, 34)`, which hands egui full-strength
+/// colour components alongside an alpha claiming they had already been scaled
+/// down by it — the blend then ADDS the series colour to the background
+/// instead of mixing towards it. A CPU series over the dark card fill
+/// composited to about `#71e7ff`: the "translucent" area came out brighter
+/// than the `#4cc2ff` line it belonged to, so every graph looked like a solid
+/// slab with no outline at all.
+fn area_fill(color: Color32) -> Color32 {
+    Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), FILL_ALPHA)
+}
+
+/// Half-brightness variant of a series colour, used for kernel time. Opaque,
+/// so it can also serve as the readout's colour swatch.
+fn kernel_shade(color: Color32) -> Color32 {
+    Color32::from_rgb(color.r() / 2, color.g() / 2, color.b() / 2)
+}
+
+/// Kernel-time band fill: [`kernel_shade`] painted over the user-time fill.
+fn kernel_fill(color: Color32) -> Color32 {
+    let k = kernel_shade(color);
+    Color32::from_rgba_unmultiplied(k.r(), k.g(), k.b(), KERNEL_ALPHA)
+}
+
 /// Fill the area between an x-monotone polyline and a horizontal baseline.
 ///
 /// egui tessellates polygon fills as a fan from the first vertex
@@ -365,13 +402,25 @@ fn sparkline_y_max(samples: &[f64]) -> f64 {
 
 /// Sparkline painted into an explicit rect (no allocation) — used inside
 /// hand-laid cards.
-pub fn paint_sparkline(ui: &egui::Ui, rect: egui::Rect, samples: &[f64], color: Color32) {
+///
+/// `cell_bg` is the cell's own surface. Callers that paint a background behind
+/// the whole card when it is selected or hovered must pass a DARKER colour
+/// then (`Palette::card_bg_sunken`); handing back `card_bg` would make the
+/// cell the same colour as the card and dissolve the graph into the row at
+/// exactly the moment the pointer is on it.
+pub fn paint_sparkline(
+    ui: &egui::Ui,
+    rect: egui::Rect,
+    samples: &[f64],
+    color: Color32,
+    cell_bg: Color32,
+) {
     let ppp = ui.ctx().pixels_per_point();
     let rect = snap_rect(rect, ppp);
     let painter = ui.painter_at(rect);
     let pal = crate::theme::palette(ui);
 
-    painter.rect_filled(rect, 2.0, pal.card_bg);
+    painter.rect_filled(rect, 2.0, cell_bg);
     painter.rect_stroke(
         rect,
         2.0,
@@ -397,8 +446,7 @@ pub fn paint_sparkline(ui: &egui::Ui, rect: egui::Rect, samples: &[f64], color: 
         .map(|(i, v)| Pos2::new(x(i), y(*v)))
         .collect();
 
-    let fill = Color32::from_rgba_premultiplied(color.r(), color.g(), color.b(), 34);
-    fill_area_to_baseline(&painter, &pts, rect.bottom(), fill);
+    fill_area_to_baseline(&painter, &pts, rect.bottom(), area_fill(color));
     painter.add(Shape::line(pts, Stroke::new(1.25, color)));
 }
 
@@ -436,14 +484,12 @@ pub fn core_chart(
         .enumerate()
         .map(|(i, v)| Pos2::new(x(i), y(*v)))
         .collect();
-    let fill = Color32::from_rgba_premultiplied(color.r(), color.g(), color.b(), 36);
-    fill_area_to_baseline(&painter, &pts, rect.bottom(), fill);
+    fill_area_to_baseline(&painter, &pts, rect.bottom(), area_fill(color));
 
     // Kernel overlay: darker band under the user portion. Painted AFTER the
     // user fill but BEFORE the line, so it darkens the lower region without
     // burying the series line (the old order drew the line first).
-    let kernel_fill =
-        Color32::from_rgba_premultiplied(color.r() / 2, color.g() / 2, color.b() / 2, 70);
+    let kernel_fill = kernel_fill(color);
     if let Some(k) = kernels {
         let kpts: Vec<Pos2> = k
             .iter()
@@ -465,11 +511,11 @@ pub fn core_chart(
         let mut dots = vec![(y(samples[idx]), color)];
         if let Some(k) = kernels.and_then(|k| k.get(idx)) {
             rows.push(ReadoutRow {
-                color: kernel_fill,
+                color: kernel_shade(color),
                 label: i18n::tr(K::ShowKernelTimesShort).to_owned(),
                 value: fmt_percent(*k),
             });
-            dots.push((y(*k), kernel_fill));
+            dots.push((y(*k), kernel_shade(color)));
         }
         paint_marker(&painter, &pal, rect, ppp, x(idx), &dots);
         readout(ui, pos, &sample_age(timestamps_ms, idx), &rows);
@@ -556,8 +602,7 @@ pub fn chart_multi(
             .enumerate()
             .map(|(i, v)| Pos2::new(x_at(i, n), y(*v)))
             .collect();
-        let fill = Color32::from_rgba_premultiplied(s.color.r(), s.color.g(), s.color.b(), 34);
-        fill_area_to_baseline(&painter, &pts, rect.bottom(), fill);
+        fill_area_to_baseline(&painter, &pts, rect.bottom(), area_fill(s.color));
     }
     // Lines in a SECOND pass: an outer series' translucent fill must never
     // dim an inner series' line (the old single-pass order made overlapping
@@ -661,6 +706,113 @@ mod tests {
         // all — rather than unwinding out of the paint path — is the assertion.
         assert!(paint((0..10).map(|i| f64::from(i) * 7.0).collect()) > 0);
         assert!(paint(vec![1.0, 2.0]) > 0);
+    }
+
+    /// Composite a translucent (premultiplied) colour over an opaque one, the
+    /// way the renderer does.
+    fn composite(fg: Color32, bg: Color32) -> Color32 {
+        let inv = 255 - fg.a() as u32;
+        let ch = |f: u8, b: u8| (f as u32 + b as u32 * inv / 255).min(255) as u8;
+        Color32::from_rgb(ch(fg.r(), bg.r()), ch(fg.g(), bg.g()), ch(fg.b(), bg.b()))
+    }
+
+    fn luma(c: Color32) -> i32 {
+        (2 * c.r() as i32 + 5 * c.g() as i32 + c.b() as i32) / 8
+    }
+
+    /// A series' area fill must stay DARKER than the line that bounds it, so
+    /// the line reads as an outline against its own infill.
+    ///
+    /// The fills were built with `from_rgba_premultiplied` and full-strength
+    /// components, which blends additively: over the dark card fill a CPU
+    /// series composited BRIGHTER than its own line, every graph looked like a
+    /// solid slab, and the outline was invisible.
+    #[test]
+    fn an_area_fill_stays_darker_than_the_line_that_bounds_it() {
+        for pal in [crate::theme::DARK, crate::theme::LIGHT] {
+            for color in [
+                pal.cpu_graph,
+                pal.memory_graph,
+                pal.disk_graph,
+                pal.network_graph,
+                pal.gpu_graph,
+            ] {
+                for bg in [pal.card_bg, pal.card_bg_sunken] {
+                    let filled = composite(area_fill(color), bg);
+                    let contrast = (luma(filled) - luma(color)).abs();
+                    assert!(
+                        contrast >= 24,
+                        "{color:?} on {bg:?}: fill {filled:?} is only {contrast} from the line"
+                    );
+                    // ...and darker specifically: the fill must move TOWARDS
+                    // the background, never past the line away from it.
+                    let toward_bg =
+                        (luma(filled) - luma(bg)).abs() < (luma(color) - luma(bg)).abs();
+                    assert!(
+                        toward_bg,
+                        "{color:?} on {bg:?}: fill {filled:?} overshot the line"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The kernel band is darker than the user-time series it sits inside, and
+    /// its readout swatch is opaque — a translucent swatch on the readout's
+    /// panel fill is barely a smudge.
+    #[test]
+    fn the_kernel_band_is_a_darker_shade_with_an_opaque_swatch() {
+        let color = crate::theme::DARK.cpu_graph;
+        assert_eq!(kernel_shade(color).a(), 255);
+        assert!(luma(kernel_shade(color)) < luma(color));
+        assert!(
+            kernel_fill(color).a() < 255,
+            "the grid must still show through"
+        );
+    }
+
+    /// A sparkline paints the cell background it was handed, so a card that
+    /// lifts onto `card_bg` when selected or hovered can sink its graph cell
+    /// instead of letting it dissolve into the row.
+    #[test]
+    fn a_sparkline_paints_the_cell_background_it_was_given() {
+        let pal = crate::theme::DARK;
+        assert_ne!(pal.card_bg_sunken, pal.card_bg);
+        assert!(luma(pal.card_bg_sunken) < luma(pal.card_bg), "dark theme");
+        assert!(
+            luma(crate::theme::LIGHT.card_bg_sunken) < luma(crate::theme::LIGHT.card_bg),
+            "light theme"
+        );
+
+        let paint = |cell_bg: Color32| {
+            let ctx = egui::Context::default();
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, egui::vec2(200.0, 100.0))),
+                    ..Default::default()
+                },
+                |ui| {
+                    paint_sparkline(
+                        ui,
+                        Rect::from_min_size(Pos2::new(4.0, 4.0), Vec2::new(62.0, 40.0)),
+                        &[10.0, 40.0, 20.0],
+                        pal.cpu_graph,
+                        cell_bg,
+                    );
+                },
+            );
+            output.textures_delta.clear();
+            output
+                .shapes
+                .iter()
+                .find_map(|s| match &s.shape {
+                    Shape::Rect(r) => Some(r.fill),
+                    _ => None,
+                })
+                .expect("sparkline paints a cell")
+        };
+        assert_eq!(paint(pal.card_bg), pal.card_bg);
+        assert_eq!(paint(pal.card_bg_sunken), pal.card_bg_sunken);
     }
 
     #[test]
