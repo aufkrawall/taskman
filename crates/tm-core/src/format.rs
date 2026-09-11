@@ -4,7 +4,7 @@
 //! decimal point elsewhere. Unit words follow the UI language
 //! ([`crate::i18n`]).
 
-use crate::i18n::{self, Lang};
+use crate::i18n;
 use crate::locale::{self, DateOrder, LocaleFmt};
 
 /// Format a float with the active locale's separators and grouping.
@@ -164,13 +164,26 @@ pub fn format_rate_mb(bps: f64) -> String {
     format!("{} MB/s", num_fixed(bps / (1024.0 * 1024.0), 1))
 }
 
-/// Network rate per UI language: "0 MBit/s" (de) / "0 Mbps" (en).
+/// Link speed per UI language: "0 MBit/s" (de) / "0 Mbps" (en).
+///
+/// Only for the NEGOTIATED LINK RATE of an adapter, which the whole industry
+/// quotes in bits ("1 Gbps", "2.5 Gbps"). Measured throughput uses
+/// [`format_rate`] instead: a task manager that prints traffic in kbps makes
+/// every realistic transfer unreadable, which is exactly the complaint that
+/// moved the Ethernet page to byte units.
 pub fn format_mbit(bps: f64) -> String {
     let unit = i18n::unit_mbit_per_s();
     if !bps.is_finite() || bps <= 0.0 {
         return format!("0 {unit}");
     }
     let mbit = bps * 8.0 / (1000.0 * 1000.0);
+    if mbit >= 1000.0 {
+        return format!(
+            "{} {}",
+            num_fixed(mbit / 1000.0, 1),
+            i18n::unit_gbit_per_s()
+        );
+    }
     if mbit >= 100.0 {
         format!("{} {unit}", num_fixed(mbit, 0))
     } else {
@@ -200,39 +213,6 @@ pub fn format_process_net_rate(bps: f64) -> String {
         return format!("<{} KB/s", num_fixed(0.1, 1));
     }
     format!("{} KB/s", num_fixed(kb, 1))
-}
-
-/// Network volume for the Performance sidebar: "48,0 KBit" / "48.0 kbps".
-pub fn format_kbit(bps: f64) -> String {
-    let unit = i18n::unit_kbit();
-    if !bps.is_finite() || bps <= 0.0 {
-        return format!("0 {unit}");
-    }
-    let kbit = match i18n::lang() {
-        Lang::De => bps * 8.0 / 1024.0,
-        Lang::En => bps * 8.0 / 1000.0,
-    };
-    if kbit < 0.05 {
-        return format!("0 {unit}");
-    }
-    let div = if matches!(i18n::lang(), Lang::De) {
-        1024.0
-    } else {
-        1000.0
-    };
-    if kbit >= div {
-        format!(
-            "{} {}",
-            num_fixed(kbit / div, 1),
-            if matches!(i18n::lang(), Lang::De) {
-                "MBit"
-            } else {
-                "Mbps"
-            }
-        )
-    } else {
-        format!("{} {unit}", num_fixed(kbit, 1))
-    }
 }
 
 /// Frequency: "4,24 GHz" / "4.24 GHz"; em dash when unknown.

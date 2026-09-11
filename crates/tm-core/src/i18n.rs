@@ -594,6 +594,13 @@ keys! {
     KvSignal => ["Signalstärke:", "Signal strength:"],
     ThroughputWindow => ["Durchsatz, {}", "Throughput, {}"],
     CardSentRecv => ["Ges.: {}  Empf.: {}", "S: {}  R: {}"],
+
+    // ------------------------------------------------ graph hover readout
+    GraphNow => ["jetzt", "now"],
+    GraphAgoSeconds => ["vor {} s", "{} s ago"],
+    GraphAgoMinutes => ["vor {} min", "{} min ago"],
+    ShowKernelTimesShort => ["Kernelzeit", "Kernel time"],
+    SeriesTotal => ["Gesamt", "Total"],
     GpuTitle => ["GPU", "GPU"],
     GpuMemStat => ["GPU-Speicher", "GPU memory"],
     KvDedicatedMem => ["Dedizierter Speicher:", "Dedicated memory:"],
@@ -655,9 +662,10 @@ pub fn unit_mbit_per_s() -> &'static str {
     }
 }
 
-pub fn unit_kbit() -> &'static str {
+/// Gigabit link speeds ("2,5 GBit/s" / "2.5 Gbps").
+pub fn unit_gbit_per_s() -> &'static str {
     match lang() {
-        Lang::De => "KBit",
-        Lang::En => "kbps",
+        Lang::De => "GBit/s",
+        Lang::En => "Gbps",
     }
 }

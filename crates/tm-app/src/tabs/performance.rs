@@ -9,7 +9,7 @@ use tm_core::i18n::{self, K};
 use crate::app::{HistoryPoint, TaskManApp};
 use crate::search;
 use crate::theme::{self, Palette};
-use crate::widgets::chart::{MultiSeries, chart_multi, core_chart};
+use crate::widgets::chart::{MultiSeries, ValueFmt, chart_multi, core_chart, fmt_percent};
 use crate::widgets::menu;
 
 /// Time-based visible slice: every point whose timestamp lies inside the
@@ -525,8 +525,8 @@ fn build_resource_list(app: &TaskManApp) -> Vec<ResourceEntry> {
             value_line: i18n::trf(
                 K::CardSentRecv,
                 &[
-                    &format::format_kbit(n.sent_bps),
-                    &format::format_kbit(n.recv_bps),
+                    &format::format_rate(n.sent_bps),
+                    &format::format_rate(n.recv_bps),
                 ],
             ),
         });
@@ -603,12 +603,31 @@ fn page_chart(
     series: &[MultiSeries],
     y_max: f64,
     ts: Option<&[u64]>,
+    fmt: ValueFmt,
 ) -> egui::Response {
     ui.horizontal(|ui| {
         ui.add_space(GUTTER);
-        chart_multi(ui, egui::vec2(width, height), series, y_max, ts)
+        chart_multi(ui, egui::vec2(width, height), series, y_max, ts, fmt)
     })
     .inner
+}
+
+/// Hover-readout formatters. Each chart plots in whatever unit its y scale is
+/// expressed in, so the readout has to convert back — a bare number would
+/// leave the reader guessing whether "1,4" means gigabytes or gigabits.
+fn fmt_gib(v: f64) -> String {
+    format::format_bytes_loc((v.max(0.0) * 1024.0 * 1024.0 * 1024.0) as u64)
+}
+
+fn fmt_mib(v: f64) -> String {
+    format::format_bytes_loc((v.max(0.0) * 1024.0 * 1024.0) as u64)
+}
+
+/// Byte rate, for the Ethernet and disk transfer charts. NOT bits: realistic
+/// traffic quoted in kbps reads as noise, which is why the network page moved
+/// to KB/s and MB/s throughout.
+fn fmt_byte_rate(v: f64) -> String {
+    format::format_rate(v)
 }
 
 /// The time-windowed history slice shared by all pages this frame.
@@ -1031,6 +1050,8 @@ fn cpu_page(app: &mut TaskManApp, ui: &mut egui::Ui, pal: &Palette) {
                             &core_hist[i],
                             kernels.then_some(&core_kern[i]),
                             pal.cpu_graph,
+                            &format!("CPU {i}"),
+                            Some(&ts),
                         );
                         cpu_graph_context_menu(app, &response);
                         if (i + 1) % cols == 0 {
@@ -1044,16 +1065,26 @@ fn cpu_page(app: &mut TaskManApp, ui: &mut egui::Ui, pal: &Palette) {
         // Kernel first so the primary total series paints on top.
         let mut chart_series = Vec::with_capacity(2);
         if kernels {
-            chart_series.push(MultiSeries {
-                samples: kernel_series,
-                color: kernel_color(pal),
-            });
+            chart_series.push(MultiSeries::new(
+                i18n::tr(K::ShowKernelTimesShort),
+                kernel_series,
+                kernel_color(pal),
+            ));
         }
-        chart_series.push(MultiSeries {
-            samples: total_series,
-            color: pal.cpu_graph,
-        });
-        let resp = page_chart(ui, width, 180.0, &chart_series, 100.0, Some(&ts));
+        chart_series.push(MultiSeries::new(
+            i18n::tr(K::SeriesTotal),
+            total_series,
+            pal.cpu_graph,
+        ));
+        let resp = page_chart(
+            ui,
+            width,
+            180.0,
+            &chart_series,
+            100.0,
+            Some(&ts),
+            fmt_percent,
+        );
         cpu_graph_context_menu(app, &resp);
     }
 
@@ -1264,12 +1295,14 @@ fn memory_page(app: &mut TaskManApp, ui: &mut egui::Ui, pal: &Palette) {
         ui,
         width,
         180.0,
-        &[MultiSeries {
-            samples: used,
-            color: pal.memory_graph,
-        }],
+        &[MultiSeries::new(
+            i18n::tr(K::StatInUse),
+            used,
+            pal.memory_graph,
+        )],
         total_gb.max(0.1),
         Some(&ts),
+        fmt_gib,
     );
 
     caption(
@@ -1286,12 +1319,14 @@ fn memory_page(app: &mut TaskManApp, ui: &mut egui::Ui, pal: &Palette) {
         ui,
         width,
         120.0,
-        &[MultiSeries {
-            samples: commit,
-            color: pal.memory_graph.gamma_multiply(0.62),
-        }],
+        &[MultiSeries::new(
+            i18n::tr(K::StatCommitted),
+            commit,
+            pal.memory_graph.gamma_multiply(0.62),
+        )],
         commit_limit.max(0.1),
         Some(&ts),
+        fmt_gib,
     );
 
     ui.add_space(10.0);
@@ -1428,43 +1463,47 @@ fn disk_page(app: &mut TaskManApp, ui: &mut egui::Ui, pal: &Palette, entry: &Res
         ui,
         width,
         160.0,
-        &[MultiSeries {
-            samples: active,
-            color: pal.disk_graph,
-        }],
+        &[MultiSeries::new(
+            i18n::tr(K::StatActiveTime),
+            active,
+            pal.disk_graph,
+        )],
         100.0,
         Some(&ts),
+        fmt_percent,
     );
 
-    let read = disk_series(win, &entry.key, |d| d.2 / 1024.0);
-    let write = disk_series(win, &entry.key, |d| d.3 / 1024.0);
+    let read = disk_series(win, &entry.key, |d| d.2);
+    let write = disk_series(win, &entry.key, |d| d.3);
+    // The scale caption used to print a bare "1234": the number was in KB/s
+    // but nothing on screen said so. Plot bytes per second and label the peak.
     let peak = read
         .iter()
         .chain(write.iter())
         .cloned()
-        .fold(0.0f64, f64::max);
+        .fold(0.0f64, f64::max)
+        .max(1024.0);
     caption(
         ui,
         pal,
         i18n::tr(K::TransferRate60s),
-        &format!("{:.0}", peak.max(1.0)),
+        &format::format_rate(peak),
     );
     page_chart(
         ui,
         width,
         160.0,
         &[
-            MultiSeries {
-                samples: read,
-                color: pal.disk_graph,
-            },
-            MultiSeries {
-                samples: write,
-                color: pal.disk_graph.gamma_multiply(0.62),
-            },
+            MultiSeries::new(i18n::tr(K::StatRead), read, pal.disk_graph),
+            MultiSeries::new(
+                i18n::tr(K::StatWrite),
+                write,
+                pal.disk_graph.gamma_multiply(0.62),
+            ),
         ],
-        peak.max(1.0),
+        peak,
         Some(&ts),
+        fmt_byte_rate,
     );
 
     ui.add_space(10.0);
@@ -1553,30 +1592,29 @@ fn network_page(app: &mut TaskManApp, ui: &mut egui::Ui, pal: &Palette, entry: &
         .chain(sent.iter())
         .copied()
         .fold(0.0f64, f64::max)
-        .max(1.0);
+        .max(1024.0);
     let window = window_label(app.shared.settings.graph_seconds);
     caption(
         ui,
         pal,
         &i18n::trf(K::ThroughputWindow, &[&window]),
-        &format::format_mbit(peak),
+        &format::format_rate(peak),
     );
     page_chart(
         ui,
         width,
         230.0,
         &[
-            MultiSeries {
-                samples: recv,
-                color: pal.network_graph,
-            },
-            MultiSeries {
-                samples: sent,
-                color: pal.network_graph.gamma_multiply(0.62),
-            },
+            MultiSeries::new(i18n::tr(K::StatReceive), recv, pal.network_graph),
+            MultiSeries::new(
+                i18n::tr(K::StatSend),
+                sent,
+                pal.network_graph.gamma_multiply(0.62),
+            ),
         ],
         peak,
         Some(&ts),
+        fmt_byte_rate,
     );
 
     ui.add_space(10.0);
@@ -1590,14 +1628,14 @@ fn network_page(app: &mut TaskManApp, ui: &mut egui::Ui, pal: &Palette, entry: &
                     ui,
                     pal,
                     i18n::tr(K::StatReceive),
-                    &format::format_kbit(net.recv_bps),
+                    &format::format_rate(net.recv_bps),
                     w,
                 );
                 big_stat(
                     ui,
                     pal,
                     i18n::tr(K::StatSend),
-                    &format::format_kbit(net.sent_bps),
+                    &format::format_rate(net.sent_bps),
                     w,
                 );
             });
@@ -1681,23 +1719,26 @@ fn gpu_page(app: &mut TaskManApp, ui: &mut egui::Ui, pal: &Palette, entry: &Reso
             engines
                 .iter()
                 .enumerate()
-                .map(|(index, name)| MultiSeries {
-                    samples: gpu_engine_series(win, &entry.key, name),
-                    // One hue, stepped in brightness: these are shares of the
-                    // same adapter, and a second accent colour on this page
-                    // would read as a different resource.
-                    color: pal
-                        .gpu_graph
-                        .gamma_multiply(1.0 - 0.13 * (index.min(5) as f32)),
+                .map(|(index, name)| {
+                    MultiSeries::new(
+                        engine_label(name),
+                        gpu_engine_series(win, &entry.key, name),
+                        // One hue, stepped in brightness: these are shares of
+                        // the same adapter, and a second accent colour on this
+                        // page would read as a different resource.
+                        pal.gpu_graph
+                            .gamma_multiply(1.0 - 0.13 * (index.min(5) as f32)),
+                    )
                 })
                 .collect::<Vec<_>>(),
             i18n::tr(K::GpuAllEngines).to_string(),
         ),
         "overall" => (
-            vec![MultiSeries {
-                samples: gpu_series(win, &entry.key, 1),
-                color: pal.gpu_graph,
-            }],
+            vec![MultiSeries::new(
+                i18n::tr(K::StatUtilization),
+                gpu_series(win, &entry.key, 1),
+                pal.gpu_graph,
+            )],
             i18n::tr(K::Utilization60sPct)
                 .split(' ')
                 .next()
@@ -1705,10 +1746,11 @@ fn gpu_page(app: &mut TaskManApp, ui: &mut egui::Ui, pal: &Palette, entry: &Reso
                 .to_string(),
         ),
         engine => (
-            vec![MultiSeries {
-                samples: gpu_engine_series(win, &entry.key, engine),
-                color: pal.gpu_graph,
-            }],
+            vec![MultiSeries::new(
+                engine_label(engine),
+                gpu_engine_series(win, &entry.key, engine),
+                pal.gpu_graph,
+            )],
             engine_label(engine),
         ),
     };
@@ -1720,7 +1762,15 @@ fn gpu_page(app: &mut TaskManApp, ui: &mut egui::Ui, pal: &Palette, entry: &Reso
     );
     // The menu mutates settings, so it runs once the history borrow that
     // built these series has ended — at the bottom of this function.
-    let chart = page_chart(ui, width, 150.0, &series_list, 100.0, Some(&ts));
+    let chart = page_chart(
+        ui,
+        width,
+        150.0,
+        &series_list,
+        100.0,
+        Some(&ts),
+        fmt_percent,
+    );
 
     let mem = gpu_series(win, &entry.key, 2);
     let mem_max = gpu
@@ -1739,12 +1789,14 @@ fn gpu_page(app: &mut TaskManApp, ui: &mut egui::Ui, pal: &Palette, entry: &Reso
         ui,
         width,
         150.0,
-        &[MultiSeries {
-            samples: mem_gb,
-            color: pal.gpu_graph.gamma_multiply(0.62),
-        }],
+        &[MultiSeries::new(
+            i18n::tr(K::GpuMemStat),
+            mem_gb,
+            pal.gpu_graph.gamma_multiply(0.62),
+        )],
         max_gb,
         Some(&ts),
+        fmt_mib,
     );
 
     ui.add_space(10.0);

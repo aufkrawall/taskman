@@ -184,17 +184,12 @@ fn build_frame(ctx: &egui::Context) -> egui::FullOutput {
                             ui,
                             vec2(420.0, 120.0),
                             &[
-                                MultiSeries {
-                                    samples: series(120, 3, 90.0),
-                                    color: pal.cpu_graph,
-                                },
-                                MultiSeries {
-                                    samples: series(120, 11, 55.0),
-                                    color: pal.memory_graph,
-                                },
+                                MultiSeries::new("CPU", series(120, 3, 90.0), pal.cpu_graph),
+                                MultiSeries::new("Memory", series(120, 11, 55.0), pal.memory_graph),
                             ],
                             100.0,
                             None,
+                            chart::fmt_percent,
                         );
                         ui.add_space(12.0);
                         egui::Grid::new("cores")
@@ -209,6 +204,8 @@ fn build_frame(ctx: &egui::Context) -> egui::FullOutput {
                                         &s,
                                         Some(&k),
                                         pal.cpu_graph,
+                                        &format!("CPU {i}"),
+                                        None,
                                     );
                                     if i % 4 == 3 {
                                         ui.end_row();
