@@ -475,6 +475,13 @@ impl Sampler {
         if window.since_ms < MIN_WINDOW_MS {
             return;
         }
+        // Records arrived and not one of them could be read: the payload does
+        // not look the way the decoder expects. Leaving every process at 0 %
+        // would claim nobody touched the disk while it sits at 100 % — the
+        // fabricated measurement this program must never produce.
+        if !window.decoded() {
+            return;
+        }
         let total = window.total_service_time();
         let seconds = window.since_ms as f64 / 1000.0;
         for process in processes.iter_mut() {
@@ -1251,6 +1258,8 @@ fn disk_sample_to_window(sample: core_service::ProcessDiskSample) -> disk_etw::D
             })
             .collect(),
         since_ms: sample.window_ms,
+        events_seen: sample.events_seen,
+        events_decoded: sample.events_decoded,
     }
 }
 

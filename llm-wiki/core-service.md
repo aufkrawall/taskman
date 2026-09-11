@@ -33,7 +33,7 @@ contract.
 
 ## IPC and authorization
 
-- Protocol v4 uses `\\.\pipe\Taskman.Core.v1` with fixed 12-byte framed JSON.
+- Protocol v5 uses `\\.\pipe\Taskman.Core.v1` with fixed 12-byte framed JSON.
   Requests and responses are independently capped at 64 KiB; unknown request
   fields are rejected.
 - The pipe rejects remote clients and uses first-instance creation to prevent

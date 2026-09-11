@@ -92,6 +92,11 @@ pub fn run(mock: bool) -> i32 {
             .iter()
             .filter_map(|p| p.disk_active_pct)
             .fold(f32::NAN, f32::max),
+        "process_disk_unknown": snap
+            .processes
+            .iter()
+            .filter(|p| !p.synthetic && p.disk_active_pct.is_none())
+            .count(),
         "process_io_ops_readings": snap
             .processes
             .iter()

@@ -21,12 +21,27 @@
 //!
 //! ## Things that are easy to get wrong here
 //!
+//! * **The events come from the KERNEL providers, not the manifest ones.**
+//!   `Microsoft-Windows-Kernel-Disk` looks like the obvious source and is not:
+//!   its `DiskRead`/`DiskWrite` template is `DiskNumber, IrpFlags,
+//!   TransferSize, Reserved, ByteOffset, FileObject, IORequestPacket,
+//!   HighResResponseTime` — no issuing thread, so nothing in it can be
+//!   attributed to a process. (Verified against the `WEVT_TEMPLATE` resource
+//!   of `Microsoft-Windows-System-Events.dll`; this cost one release.) The
+//!   classic kernel `DiskIo` record does carry `IssuingThreadId`, and the way
+//!   to subscribe to it without seizing the single global "NT Kernel Logger"
+//!   is a system-logger session on `SystemIoProviderGuid`.
 //! * **Attribution is by issuing THREAD, not by event header.** Disk events
 //!   complete in whatever context the DPC ran in, so `EventHeader.ProcessId`
 //!   is usually `System`. `IssuingThreadId` from the payload is the truth, and
 //!   it has to be mapped to a process — which is why this session also enables
-//!   the thread events of `Microsoft-Windows-Kernel-Process` and seeds itself
-//!   from a one-shot thread snapshot at start.
+//!   the kernel thread events and seeds itself from a one-shot thread
+//!   snapshot at start.
+//! * **A window in which nothing could be decoded is UNKNOWN, not zero.** The
+//!   decoder rejecting every record looks exactly like an idle disk if you
+//!   only count attributed time, and reporting "0 %" for every process while
+//!   the disk sits at 100 % is precisely the fabricated measurement this
+//!   program must never produce. [`DiskWindow::decoded`] separates the two.
 //! * **A request whose thread cannot be mapped is NOT charged to anyone.** It
 //!   goes into an unattributed remainder. Guessing would put another process's
 //!   disk time on an innocent row, which is worse than an honest gap.
@@ -43,26 +58,24 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use windows::Win32::System::Diagnostics::Etw::EVENT_RECORD;
-use windows::core::GUID;
+use windows::Win32::System::Diagnostics::Etw::{
+    DiskIoGuid, EVENT_RECORD, SYSTEM_IO_KW_DISK, SYSTEM_PROCESS_KW_THREAD, SystemIoProviderGuid,
+    SystemProcessProviderGuid, ThreadGuid,
+};
 
-use super::etw::{self, Provider, Session, TraceContext, TraceRole, plausible_client_id};
+use super::etw::{
+    self, LoggerKind, Provider, Session, TraceContext, TraceRole, plausible_client_id,
+};
 
-/// `Microsoft-Windows-Kernel-Disk`.
-const KERNEL_DISK_GUID: GUID = GUID::from_u128(0xc7bde69a_e1e0_4177_b6ef_283ad1525271);
-/// `Microsoft-Windows-Kernel-Process`, enabled only for its thread events.
-const KERNEL_PROCESS_GUID: GUID = GUID::from_u128(0x22fb2cd6_0e7b_422b_a0c7_2fad1fd0e716);
-/// `WINEVENT_KEYWORD_THREAD` of `Microsoft-Windows-Kernel-Process`: the
-/// ThreadStart/ThreadStop pair and nothing else. Process, image, priority and
-/// job events would be pure overhead here.
-const KEYWORD_THREAD: u64 = 0x20;
-
-/// `Microsoft-Windows-Kernel-Disk` event ids.
-const EVENT_DISK_READ: u16 = 10;
-const EVENT_DISK_WRITE: u16 = 11;
-/// `Microsoft-Windows-Kernel-Process` event ids.
-const EVENT_THREAD_START: u16 = 3;
-const EVENT_THREAD_STOP: u16 = 4;
+/// Classic `DiskIo` opcodes (`DiskIo_TypeGroup1`).
+const OPCODE_DISK_READ: u8 = 10;
+const OPCODE_DISK_WRITE: u8 = 11;
+/// Classic `Thread` opcodes. The DC pair is the rundown the session emits for
+/// threads that already existed when it started.
+const OPCODE_THREAD_START: u8 = 1;
+const OPCODE_THREAD_STOP: u8 = 2;
+const OPCODE_THREAD_DC_START: u8 = 3;
+const OPCODE_THREAD_DC_STOP: u8 = 4;
 
 /// A single request bigger than this did not come from this payload layout.
 /// Windows splits I/O long before a gigabyte, so anything above it is a read
@@ -110,6 +123,12 @@ pub struct DiskWindow {
     /// How long this window covered, in milliseconds. Measured by the producer
     /// because only it knows when the accumulators were last reset.
     pub since_ms: u64,
+    /// Disk read/write records the callback was handed.
+    pub events_seen: u64,
+    /// ...of which the payload decoder accepted. The pair is the difference
+    /// between "the disk was idle" and "we could not read a single record",
+    /// which are indistinguishable from the totals alone.
+    pub events_decoded: u64,
 }
 
 impl DiskWindow {
@@ -121,10 +140,19 @@ impl DiskWindow {
                 acc.saturating_add(p.service_time)
             })
     }
+
+    /// Whether this window is a measurement at all.
+    ///
+    /// No events is a real answer — a live session over an idle disk. Events
+    /// that none of them could be decoded is not: it means the payload does
+    /// not look the way this module expects, and every share derived from it
+    /// would be a fabricated zero.
+    pub fn decoded(&self) -> bool {
+        self.events_seen == 0 || self.events_decoded > 0
+    }
 }
 
-/// Byte offsets into the `DiskRead`/`DiskWrite` payload of
-/// `Microsoft-Windows-Kernel-Disk`.
+/// Byte offsets into the classic `DiskIo_TypeGroup1` payload.
 ///
 /// DiskNumber@0, IrpFlags@4, TransferSize@8, Reserved@12, ByteOffset@16,
 /// FileObject, Irp, HighResResponseTime, IssuingThreadId — the last four
@@ -202,6 +230,11 @@ fn parse_thread_event(payload: &[u8]) -> Option<(u32, u32)> {
 
 #[derive(Default)]
 struct State {
+    events_seen: u64,
+    events_decoded: u64,
+    /// Payload length of the most recent record the decoder rejected, so a
+    /// layout change is diagnosable from a log line instead of a debugger.
+    rejected_payload_len: u32,
     /// Thread id -> owning process id, seeded from a snapshot and kept current
     /// by the Kernel-Process thread events.
     threads: HashMap<u32, u32>,
@@ -224,6 +257,17 @@ impl TraceContext for Shared {
 }
 
 impl Shared {
+    /// A disk record the decoder could not read. Counted, never guessed at.
+    fn record_undecodable(&self, payload_len: u32) {
+        if !self.live.load(Ordering::Relaxed) {
+            return;
+        }
+        if let Ok(mut state) = self.state.lock() {
+            state.events_seen = state.events_seen.saturating_add(1);
+            state.rejected_payload_len = payload_len;
+        }
+    }
+
     fn record_request(&self, request: DiskRequest, write: bool) {
         if !self.live.load(Ordering::Relaxed) {
             return;
@@ -231,6 +275,8 @@ impl Shared {
         let Ok(mut state) = self.state.lock() else {
             return;
         };
+        state.events_seen = state.events_seen.saturating_add(1);
+        state.events_decoded = state.events_decoded.saturating_add(1);
         match state.threads.get(&request.thread_id).copied() {
             Some(pid) => state.totals.entry(pid).or_default().add(
                 write,
@@ -294,14 +340,17 @@ impl DiskUsage {
         });
         let session = Session::start(
             session_name(role),
+            LoggerKind::System,
             &[
                 Provider {
-                    guid: KERNEL_DISK_GUID,
-                    match_any_keyword: 0,
+                    guid: SystemIoProviderGuid,
+                    match_any_keyword: SYSTEM_IO_KW_DISK,
                 },
+                // Thread start/stop plus the rundown of threads that already
+                // existed, which is what makes `IssuingThreadId` resolvable.
                 Provider {
-                    guid: KERNEL_PROCESS_GUID,
-                    match_any_keyword: KEYWORD_THREAD,
+                    guid: SystemProcessProviderGuid,
+                    match_any_keyword: SYSTEM_PROCESS_KW_THREAD,
                 },
             ],
             shared,
@@ -341,11 +390,23 @@ impl DiskUsage {
         };
         let unattributed = std::mem::take(&mut state.unattributed_service_time);
         let mut procs = std::mem::take(&mut state.totals);
+        let events_seen = std::mem::take(&mut state.events_seen);
+        let events_decoded = std::mem::take(&mut state.events_decoded);
+        let rejected_payload_len = state.rejected_payload_len;
         if state.needs_reseed {
             state.threads = super::threads_map::thread_owners();
             state.needs_reseed = false;
         }
         drop(state);
+        if events_seen > 0 && events_decoded == 0 {
+            // Loud on purpose, and only once per window: this is the failure
+            // that silently turns the whole column into zeros.
+            tracing::warn!(
+                events_seen,
+                rejected_payload_len,
+                "disk trace decoded no records - the DiskIo payload layout changed"
+            );
+        }
         let mut unattributed_service_time = unattributed;
         if !live_pids.is_empty() {
             procs.retain(|pid, disk| {
@@ -364,6 +425,8 @@ impl DiskUsage {
             procs,
             unattributed_service_time,
             since_ms,
+            events_seen,
+            events_decoded,
         }
     }
 }
@@ -379,26 +442,29 @@ unsafe extern "system" fn on_event(record: *mut EVENT_RECORD) {
     let Some(payload) = (unsafe { etw::payload_of(record) }) else {
         return;
     };
+    // Classic (MOF) records carry the event class in `ProviderId` and the
+    // event kind in the opcode; there is no event id to match on.
     let provider = record.EventHeader.ProviderId;
-    let id = record.EventHeader.EventDescriptor.Id;
-    if provider == KERNEL_DISK_GUID {
-        let write = match id {
-            EVENT_DISK_READ => false,
-            EVENT_DISK_WRITE => true,
-            // Flush events carry no transfer and no issuing thread.
+    let opcode = record.EventHeader.EventDescriptor.Opcode;
+    if provider == DiskIoGuid {
+        let write = match opcode {
+            OPCODE_DISK_READ => false,
+            OPCODE_DISK_WRITE => true,
+            // Flush and the *Init variants carry no completed transfer.
             _ => return,
         };
-        if let Some(request) = parse_disk_event(payload, pointer_bytes(record)) {
-            shared.record_request(request, write);
+        match parse_disk_event(payload, pointer_bytes(record)) {
+            Some(request) => shared.record_request(request, write),
+            None => shared.record_undecodable(record.UserDataLength.into()),
         }
-    } else if provider == KERNEL_PROCESS_GUID {
-        match id {
-            EVENT_THREAD_START => {
+    } else if provider == ThreadGuid {
+        match opcode {
+            OPCODE_THREAD_START | OPCODE_THREAD_DC_START => {
                 if let Some((pid, tid)) = parse_thread_event(payload) {
                     shared.track_thread(pid, tid);
                 }
             }
-            EVENT_THREAD_STOP => {
+            OPCODE_THREAD_STOP | OPCODE_THREAD_DC_STOP => {
                 if let Some((_, tid)) = parse_thread_event(payload) {
                     shared.forget_thread(tid);
                 }
@@ -606,6 +672,51 @@ mod tests {
     /// The share denominator has to include the time nobody could be charged
     /// with, or a machine where most I/O is unattributable would report a
     /// handful of processes as responsible for all of it.
+    /// A window where nothing could be decoded is not a measurement. Calling
+    /// it one is how the column ended up reporting 0 % for every process while
+    /// the disk was pinned at 100 %.
+    #[test]
+    fn an_undecodable_window_is_not_a_measurement() {
+        let idle = DiskWindow {
+            events_seen: 0,
+            events_decoded: 0,
+            ..DiskWindow::default()
+        };
+        assert!(
+            idle.decoded(),
+            "a live session over an idle disk is a real 0"
+        );
+
+        let broken = DiskWindow {
+            events_seen: 4_000,
+            events_decoded: 0,
+            ..DiskWindow::default()
+        };
+        assert!(!broken.decoded(), "records arrived and none could be read");
+
+        let working = DiskWindow {
+            events_seen: 4_000,
+            events_decoded: 3_998,
+            ..DiskWindow::default()
+        };
+        assert!(working.decoded());
+    }
+
+    /// Undecodable records must be counted, not silently dropped: the count is
+    /// the only signal that separates a broken decoder from an idle disk.
+    #[test]
+    fn undecodable_records_are_counted_but_never_charged() {
+        let shared = shared_with(HashMap::from([(100, 8)]));
+        shared.record_undecodable(48);
+        shared.record_undecodable(48);
+        let state = shared.state.lock().unwrap();
+        assert_eq!(state.events_seen, 2);
+        assert_eq!(state.events_decoded, 0);
+        assert_eq!(state.rejected_payload_len, 48);
+        assert!(state.totals.is_empty());
+        assert_eq!(state.unattributed_service_time, 0);
+    }
+
     #[test]
     fn the_window_total_counts_unattributed_time() {
         let window = DiskWindow {
@@ -627,6 +738,8 @@ mod tests {
             ]),
             unattributed_service_time: 50,
             since_ms: 1_000,
+            events_seen: 3,
+            events_decoded: 3,
         };
         assert_eq!(window.total_service_time(), 100);
     }

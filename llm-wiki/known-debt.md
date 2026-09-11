@@ -207,4 +207,10 @@ remain follow-up rather than being simulated in headless tests:
   against synthetic records and rejects implausible ones; only
   `integration::disk_trace_attributes_real_requests_to_the_issuing_process`
   (ignored, needs elevation) proves them against live kernel events. Run it
-  after any Windows build that changes the provider.
+  after any Windows build that changes the provider. **The system-logger
+  provider switch of 2026-09-11 has not yet been proven on live events.**
+- `Microsoft-Windows-Kernel-Disk` is NOT usable for attribution: its
+  `DiskRead`/`DiskWrite` template ends at `HighResResponseTime` and carries no
+  issuing thread. The events come from `SystemIoProviderGuid` on a
+  system-logger session instead (Windows 10 2004+). On older builds the
+  session cannot start and the column reports "—".

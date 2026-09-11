@@ -53,6 +53,25 @@ the kernel table `cpu_load.rs` already reads every tick, exposed as
 `windows` crate's declared layout AND against a live table
 (`live_kernel_table_yields_plausible_io_counters`).
 
+**Wrong provider, found the same day.** The first cut enabled
+`Microsoft-Windows-Kernel-Disk` and decoded 52-byte records ending in
+`IssuingThreadId`. That field belongs to the CLASSIC kernel `DiskIo` record;
+the manifest provider's template is `DiskNumber, IrpFlags, TransferSize,
+Reserved, ByteOffset, FileObject, IORequestPacket, HighResResponseTime` and
+stops there — confirmed by reading the `WEVT_TEMPLATE` resource out of
+`Microsoft-Windows-System-Events.dll`, since `wevtutil` does not print
+templates. Every record was therefore rejected, nothing was attributed, and
+the column reported 0 % for every process while C: sat at 100 % — a fabricated
+measurement. Two fixes: the events now come from `SystemIoProviderGuid` +
+`SystemProcessProviderGuid` on a SYSTEM-LOGGER session (the documented way to
+reach the kernel providers without seizing the global "NT Kernel Logger"),
+where the classic layout the decoder already implements is the right one; and
+a window with records but zero decodes is reported as UNKNOWN, never as zero,
+with a rate-limited warning naming the rejected payload length. `DiskWindow`
+carries `events_seen`/`events_decoded` through the broker (protocol v5) and
+`--selfcheck` prints them, so this failure mode is diagnosable from one
+headless run instead of a debugger.
+
 Open: the `Kernel-Disk` payload offsets are proven only by
 `integration::disk_trace_attributes_real_requests_to_the_issuing_process`,
 which needs elevation. `--selfcheck` reports `process_disk_readings` and

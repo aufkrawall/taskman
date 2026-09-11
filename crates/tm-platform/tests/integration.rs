@@ -739,8 +739,10 @@ fn disk_trace_attributes_real_requests_to_the_issuing_process() {
     }
     let total = window.total_service_time();
     eprintln!(
-        "window {} ms: {} processes, {} service time ({} unattributed)",
+        "window {} ms: {} records seen, {} decoded, {} processes,          {} service time ({} unattributed)",
         window.since_ms,
+        window.events_seen,
+        window.events_decoded,
         window.procs.len(),
         total,
         window.unattributed_service_time
@@ -751,7 +753,15 @@ fn disk_trace_attributes_real_requests_to_the_issuing_process() {
         .max_by_key(|(_, d)| d.service_time)
         .map(|(pid, d)| (*pid, d.ops, d.read_bytes, d.write_bytes));
     eprintln!("busiest = {busiest:?}");
-    assert!(total > 0, "the trace received no disk events at all");
+    assert!(
+        window.events_seen > 0,
+        "the trace received no disk records at all - wrong provider or keyword"
+    );
+    assert!(
+        window.events_decoded > 0,
+        "records arrived but none decoded - the DiskIo payload layout changed"
+    );
+    assert!(total > 0, "decoded records carried no service time");
     assert!(
         !window.procs.is_empty(),
         "every request went unattributed - the IssuingThreadId offset is wrong"

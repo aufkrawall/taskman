@@ -26,9 +26,9 @@ use windows::Win32::Foundation::{ERROR_ALREADY_EXISTS, ERROR_SUCCESS, WIN32_ERRO
 use windows::Win32::System::Diagnostics::Etw::{
     CONTROLTRACE_HANDLE, CloseTrace, ControlTraceW, EVENT_CONTROL_CODE_ENABLE_PROVIDER,
     EVENT_RECORD, EVENT_TRACE_CONTROL_STOP, EVENT_TRACE_LOGFILEW, EVENT_TRACE_PROPERTIES,
-    EVENT_TRACE_REAL_TIME_MODE, EnableTraceEx2, OpenTraceW, PROCESS_TRACE_MODE_EVENT_RECORD,
-    PROCESS_TRACE_MODE_REAL_TIME, PROCESSTRACE_HANDLE, ProcessTrace, StartTraceW,
-    WNODE_FLAG_TRACED_GUID,
+    EVENT_TRACE_REAL_TIME_MODE, EVENT_TRACE_SYSTEM_LOGGER_MODE, EnableTraceEx2, OpenTraceW,
+    PROCESS_TRACE_MODE_EVENT_RECORD, PROCESS_TRACE_MODE_REAL_TIME, PROCESSTRACE_HANDLE,
+    ProcessTrace, StartTraceW, WNODE_FLAG_TRACED_GUID,
 };
 use windows::core::{GUID, PCWSTR, PWSTR};
 
@@ -61,6 +61,18 @@ pub(crate) struct Provider {
     pub match_any_keyword: u64,
 }
 
+/// Which kind of session to open.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LoggerKind {
+    /// An ordinary session for manifest providers.
+    Manifest,
+    /// A system logger, the only kind that can carry the kernel's own
+    /// providers (`SystemIoProviderGuid` and friends). Their events arrive as
+    /// classic MOF records — identified by the MOF class GUID in
+    /// `EventHeader.ProviderId` and an opcode, not by an event id.
+    System,
+}
+
 /// State shared between an ETW callback thread and the sampler.
 pub(crate) trait TraceContext: Send + Sync + 'static {
     /// Called before the session is torn down so a late callback cannot touch
@@ -72,6 +84,7 @@ pub(crate) trait TraceContext: Send + Sync + 'static {
 /// pumps it.
 pub(crate) struct Session<T: TraceContext> {
     shared: Arc<T>,
+    kind: LoggerKind,
     /// Raw pointer handed to the ETW callback; reclaimed on teardown.
     context: *const T,
     session: CONTROLTRACE_HANDLE,
@@ -92,13 +105,14 @@ impl<T: TraceContext> Session<T> {
     /// the half-built session is torn down first.
     pub(crate) fn start(
         name: &str,
+        kind: LoggerKind,
         providers: &[Provider],
         shared: Arc<T>,
         callback: unsafe extern "system" fn(*mut EVENT_RECORD),
         thread_name: &str,
     ) -> Option<Self> {
         let name: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
-        let (session, mut properties) = start_session(&name)?;
+        let (session, mut properties) = start_session(&name, kind)?;
 
         for provider in providers {
             let enable = unsafe {
@@ -159,6 +173,7 @@ impl<T: TraceContext> Session<T> {
 
         Some(Self {
             shared,
+            kind,
             context,
             session,
             trace,
@@ -177,7 +192,7 @@ impl<T: TraceContext> Drop for Session<T> {
         // Order matters: stop the session so `ProcessTrace` returns, then
         // close the consumer and join before the context is reclaimed.
         self.shared.stop();
-        let mut properties = properties_buffer(&self.name);
+        let mut properties = properties_buffer(&self.name, self.kind);
         stop_session(self.session, &self.name, &mut properties);
         let _ = unsafe { CloseTrace(self.trace) };
         if let Some(worker) = self.worker.take() {
@@ -214,7 +229,7 @@ pub(crate) unsafe fn payload_of(record: &EVENT_RECORD) -> Option<&[u8]> {
 /// `LARGE_INTEGER` fields and requires 8-byte alignment, which `Vec<u8>` does
 /// not guarantee. `Wnode.BufferSize` carries the byte length; the allocation
 /// is rounded up to a whole word.
-fn properties_buffer(name: &[u16]) -> Vec<u64> {
+fn properties_buffer(name: &[u16], kind: LoggerKind) -> Vec<u64> {
     let header = std::mem::size_of::<EVENT_TRACE_PROPERTIES>();
     let total = header + name.len() * 2;
     let mut buffer = vec![0u64; total.div_ceil(std::mem::size_of::<u64>())];
@@ -226,7 +241,13 @@ fn properties_buffer(name: &[u16]) -> Vec<u64> {
         (*properties).Wnode.Flags = WNODE_FLAG_TRACED_GUID;
         // QPC timestamps: cheapest clock, and we only need ordering.
         (*properties).Wnode.ClientContext = 1;
-        (*properties).LogFileMode = EVENT_TRACE_REAL_TIME_MODE;
+        (*properties).LogFileMode = EVENT_TRACE_REAL_TIME_MODE
+            | match kind {
+                LoggerKind::Manifest => 0,
+                // The only way to subscribe to the kernel's own providers
+                // without taking over the single global "NT Kernel Logger".
+                LoggerKind::System => EVENT_TRACE_SYSTEM_LOGGER_MODE,
+            };
         (*properties).LoggerNameOffset = header as u32;
         // A small buffer set with a 1 s flush keeps latency at roughly one
         // sampling tick without reserving much non-paged memory.
@@ -240,8 +261,8 @@ fn properties_buffer(name: &[u16]) -> Vec<u64> {
 
 /// Start the session, retrying once after clearing a stale session of the
 /// same name (left behind by a crash).
-fn start_session(name: &[u16]) -> Option<(CONTROLTRACE_HANDLE, Vec<u64>)> {
-    let mut properties = properties_buffer(name);
+fn start_session(name: &[u16], kind: LoggerKind) -> Option<(CONTROLTRACE_HANDLE, Vec<u64>)> {
+    let mut properties = properties_buffer(name, kind);
     let mut handle = CONTROLTRACE_HANDLE::default();
     let mut status = unsafe {
         StartTraceW(
@@ -251,7 +272,7 @@ fn start_session(name: &[u16]) -> Option<(CONTROLTRACE_HANDLE, Vec<u64>)> {
         )
     };
     if status == ERROR_ALREADY_EXISTS {
-        let mut stale = properties_buffer(name);
+        let mut stale = properties_buffer(name, kind);
         let _ = unsafe {
             ControlTraceW(
                 CONTROLTRACE_HANDLE::default(),
@@ -260,7 +281,7 @@ fn start_session(name: &[u16]) -> Option<(CONTROLTRACE_HANDLE, Vec<u64>)> {
                 EVENT_TRACE_CONTROL_STOP,
             )
         };
-        properties = properties_buffer(name);
+        properties = properties_buffer(name, kind);
         status = unsafe {
             StartTraceW(
                 &mut handle,
@@ -311,7 +332,7 @@ mod tests {
     fn properties_buffer_reserves_room_for_the_session_name() {
         let name: Vec<u16> = "TaskMan-Test\0".encode_utf16().collect();
         let total = std::mem::size_of::<EVENT_TRACE_PROPERTIES>() + name.len() * 2;
-        let buffer = properties_buffer(&name);
+        let buffer = properties_buffer(&name, LoggerKind::Manifest);
         // The allocation is word-rounded, but must cover the requested bytes.
         assert!(buffer.len() * std::mem::size_of::<u64>() >= total);
         assert_eq!(buffer.as_ptr().align_offset(8), 0, "8-byte aligned");
@@ -323,6 +344,21 @@ mod tests {
                 std::mem::size_of::<EVENT_TRACE_PROPERTIES>()
             );
             assert_eq!((*properties).LogFileMode, EVENT_TRACE_REAL_TIME_MODE);
+        }
+    }
+
+    /// A kernel provider is only reachable from a system logger; without the
+    /// mode flag `EnableTraceEx2` accepts the call and then delivers nothing.
+    #[test]
+    fn a_system_logger_asks_for_the_system_logger_mode() {
+        let name: Vec<u16> = "TaskMan-Test\0".encode_utf16().collect();
+        let buffer = properties_buffer(&name, LoggerKind::System);
+        let properties = buffer.as_ptr().cast::<EVENT_TRACE_PROPERTIES>();
+        unsafe {
+            assert_eq!(
+                (*properties).LogFileMode,
+                EVENT_TRACE_REAL_TIME_MODE | EVENT_TRACE_SYSTEM_LOGGER_MODE
+            );
         }
     }
 

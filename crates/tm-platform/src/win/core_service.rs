@@ -61,8 +61,10 @@ pub const SERVICE_LOG_FILE_PREFIX: &str = "taskman-service.log";
 // its authenticated LocalSystem broker; v4 adds `ProcessDiskCounters`, the
 // same read-only shape for disk service time. Version bumps are deliberate: an
 // old service fails the handshake as unavailable, allowing the GUI's safe local
-// fallback instead of misclassifying an unknown request as a rejection.
-pub const PROTOCOL_VERSION: u16 = 4;
+// fallback instead of misclassifying an unknown request as a rejection. v5
+// carries the disk decoder's event counts, which separate an idle disk from a
+// decoder that could not read a single record.
+pub const PROTOCOL_VERSION: u16 = 5;
 
 const PIPE_NAME: &str = r"\\.\pipe\Taskman.Core.v1";
 const FRAME_MAGIC: [u8; 4] = *b"TMB1";
@@ -224,6 +226,11 @@ pub struct ProcessDiskSample {
     /// Service time observed in the window INCLUDING the part that could not
     /// be charged to a live process. The denominator of every share.
     pub total_service_time: u64,
+    /// Disk records the decoder was handed, and how many it could read. A
+    /// window with records but no reads is NOT a measurement: see
+    /// `win::disk_etw::DiskWindow::decoded`.
+    pub events_seen: u64,
+    pub events_decoded: u64,
     pub entries: Vec<ProcessDiskEntry>,
 }
 
@@ -1604,6 +1611,8 @@ fn process_disk_sample() -> ProcessDiskSample {
         active: true,
         window_ms: window.since_ms,
         total_service_time,
+        events_seen: window.events_seen,
+        events_decoded: window.events_decoded,
         entries,
     }
 }

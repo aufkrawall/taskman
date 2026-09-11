@@ -23,7 +23,7 @@ use std::sync::{Arc, Mutex};
 use windows::Win32::System::Diagnostics::Etw::EVENT_RECORD;
 use windows::core::GUID;
 
-use super::etw::{self, Provider, Session, TraceContext};
+use super::etw::{self, LoggerKind, Provider, Session, TraceContext};
 
 pub use super::etw::TraceRole;
 
@@ -114,6 +114,7 @@ impl NetworkUsage {
         });
         let session = Session::start(
             session_name(role),
+            LoggerKind::Manifest,
             &[Provider {
                 guid: KERNEL_NETWORK_GUID,
                 // 0 means "every event of this provider"; `direction_of` does
