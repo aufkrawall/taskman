@@ -8,3 +8,4 @@ pub mod processes;
 pub mod services;
 pub mod startup;
 pub mod users;
+pub mod value_columns;

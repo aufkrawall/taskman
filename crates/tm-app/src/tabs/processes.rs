@@ -33,102 +33,32 @@
 
 use eframe::egui;
 use std::collections::{HashMap, HashSet};
-use tm_core::format;
 use tm_core::i18n::{self, K};
 use tm_core::model::{ProcCategory, ProcStatus, ProcessEntry, Snapshot};
 
 use crate::app::TaskManApp;
 use crate::icons::Icon;
 use crate::search;
+use crate::tabs::value_columns::{
+    self, DISK_ACT as DISK_ACT_VALUE, FIXED_COLS, GPU as GPU_VALUE, NET as NET_VALUE, VALUE_COLS,
+};
 use crate::theme;
 use crate::widgets::menu;
 use crate::widgets::tablekit::{self, Aggregates, HeatCell, TmColumn};
 
-/// Numeric value columns: CPU, Memory, Disk, Network, Disk activity, GPU.
-/// They start at table column 2 and their order IS the order of
-/// [`RowData::values`].
-const VALUE_COLS: usize = 6;
-
-/// Index of the Network column inside `values` — one of the three whose value
-/// can be genuinely unknown per row.
-const NET_VALUE: usize = 3;
-/// Index of the Disk activity column inside `values`; likewise optional.
-const DISK_ACT_VALUE: usize = 4;
-/// Index of the GPU column inside `values`; optional for the same reason.
-const GPU_VALUE: usize = 5;
-
-/// Columns that never move. Name owns the tree chevron and the icon, and the
-/// blue heat band is painted as ONE contiguous span starting after Status —
-/// a value column dragged in front of either would tear it.
-const FIXED_COLS: usize = 2;
-
-/// One numeric column, in the fixed LOGICAL order that [`RowData::values`]
-/// and [`RowData::heat`] are indexed by. The user's display order is a
-/// permutation of these, held in [`State::value_order`]; nothing below the UI
-/// layer ever sees it.
-struct ValueColumn {
-    id: &'static str,
-    label: fn() -> &'static str,
-    width: f32,
-}
-
-const VALUE_COLUMNS: [ValueColumn; VALUE_COLS] = [
-    ValueColumn {
-        id: "cpu",
-        label: || i18n::tr(K::ColCpu),
-        width: 110.0,
-    },
-    ValueColumn {
-        id: "mem",
-        label: || i18n::tr(K::ColMemory),
-        width: 110.0,
-    },
-    ValueColumn {
-        id: "disk",
-        label: || i18n::tr(K::ColDisk),
-        width: 110.0,
-    },
-    // Windows supplies this lazily from the per-process ETW source. Missing
-    // telemetry still renders as an honest "—", never fake zero.
-    ValueColumn {
-        id: "net",
-        label: || i18n::tr(K::ColNetwork),
-        width: 110.0,
-    },
-    // Which process is actually keeping the disks busy. The Disk column
-    // counts I/O BYTES the process asked for, cache hits included; this one
-    // is its share of the time the disks really spent.
-    ValueColumn {
-        id: "diskact",
-        label: || i18n::tr(K::ColDiskActivity),
-        width: 150.0,
-    },
-    // Busiest-engine utilization, from the same on-demand PDH group the
-    // Performance page uses.
-    ValueColumn {
-        id: "gpu",
-        label: || i18n::tr(K::ColGpu),
-        width: 110.0,
-    },
-];
-
 /// Stable ids of every column in LOGICAL order, for sort persistence.
 pub fn column_ids() -> Vec<&'static str> {
-    let mut ids = vec!["name", "status"];
-    ids.extend(VALUE_COLUMNS.iter().map(|c| c.id));
-    ids
+    value_columns::column_ids(["name", "status"])
 }
 
 fn columns(value_order: &[usize]) -> Vec<TmColumn> {
-    let mut cols = vec![
-        TmColumn::text("name", i18n::tr(K::ColName), 340.0),
-        TmColumn::text("status", i18n::tr(K::ColStatus), 190.0),
-    ];
-    for &li in value_order {
-        let c = &VALUE_COLUMNS[li];
-        cols.push(TmColumn::num(c.id, (c.label)(), c.width));
-    }
-    cols
+    value_columns::columns(
+        vec![
+            TmColumn::text("name", i18n::tr(K::ColName), 340.0),
+            TmColumn::text("status", i18n::tr(K::ColStatus), 190.0),
+        ],
+        value_order,
+    )
 }
 
 /// Flattened display row — group headers and process rows share one fixed
@@ -211,75 +141,37 @@ impl State {
     pub fn new() -> Self {
         Self {
             ascending: true,
-            value_order: (0..VALUE_COLS).collect(),
+            value_order: value_columns::default_order(),
             ..Default::default()
         }
     }
 
     /// Display slot -> logical column.
     fn logical_col(&self, display: usize) -> usize {
-        match display.checked_sub(FIXED_COLS) {
-            Some(slot) => FIXED_COLS + self.value_order.get(slot).copied().unwrap_or(slot),
-            None => display,
-        }
+        value_columns::logical_col(&self.value_order, display)
     }
 
     /// Logical column -> display slot.
     fn display_col(&self, logical: usize) -> usize {
-        match logical.checked_sub(FIXED_COLS) {
-            Some(li) => {
-                FIXED_COLS
-                    + self
-                        .value_order
-                        .iter()
-                        .position(|candidate| *candidate == li)
-                        .unwrap_or(li)
-            }
-            None => logical,
-        }
+        value_columns::display_col(&self.value_order, logical)
     }
 
     /// Move the column at display slot `from` so it lands at slot `to`.
     /// Returns false when the gesture would change nothing.
     fn move_column(&mut self, from: usize, to: usize) -> bool {
-        let (Some(from), Some(to)) = (from.checked_sub(FIXED_COLS), to.checked_sub(FIXED_COLS))
-        else {
-            return false;
-        };
-        if from == to || from >= self.value_order.len() || to >= self.value_order.len() {
-            return false;
-        }
-        let moved = self.value_order.remove(from);
-        self.value_order.insert(to, moved);
-        true
+        value_columns::move_column(&mut self.value_order, from, to)
     }
 
     /// Display order as stable ids, for persistence.
     fn saved_order(&self) -> Vec<String> {
-        self.value_order
-            .iter()
-            .map(|&li| VALUE_COLUMNS[li].id.to_string())
-            .collect()
+        value_columns::saved_ids(&self.value_order)
     }
 
     /// Adopt a persisted order, ignoring unknown ids and appending any column
     /// the saved file predates. A settings file from an older build must
     /// never make a column disappear.
     pub fn apply_saved_order(&mut self, ids: &[String]) {
-        let mut next: Vec<usize> = Vec::with_capacity(VALUE_COLS);
-        for id in ids {
-            if let Some(li) = VALUE_COLUMNS.iter().position(|c| c.id == id)
-                && !next.contains(&li)
-            {
-                next.push(li);
-            }
-        }
-        for li in 0..VALUE_COLS {
-            if !next.contains(&li) {
-                next.push(li);
-            }
-        }
-        self.value_order = next;
+        value_columns::apply_saved(&mut self.value_order, ids);
     }
 
     /// Any change that affects the flattened display model bumps this
@@ -491,10 +383,7 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
     let agg = Aggregates::from_snapshot(&snap);
     let logical_aggs = agg.strings();
     // Header totals are produced in logical order and shown in display order.
-    let aggs: Vec<String> = value_order
-        .iter()
-        .map(|&li| logical_aggs[li].clone())
-        .collect();
+    let aggs: Vec<String> = value_columns::in_display_order(&value_order, &logical_aggs);
     prepare_auto_fit_widths(ui, &mut table, rows, &aggs, &value_order);
 
     let avail = tablekit::table_avail(ui);
@@ -1038,14 +927,16 @@ fn row_ui(
         .map(|&li| HeatCell::new(row.heat[li], value_text(row, li)))
         .collect();
     table.heat_cells(ui, pal, rect, FIXED_COLS, &cells);
-    let net_tip = (!row.net_available)
-        .then(|| unavailable_network_tip(ui, table, rect))
-        .flatten()
-        .or_else(|| {
-            (!row.disk_available)
-                .then(|| unavailable_disk_tip(ui, table, rect))
-                .flatten()
-        });
+    let unknown = [
+        (NET_VALUE, row.net_available),
+        (DISK_ACT_VALUE, row.disk_available),
+        (GPU_VALUE, row.gpu_available),
+    ];
+    let net_tip = unknown.iter().find_map(|&(li, available)| {
+        (!available)
+            .then(|| unknown_cell_tip(ui, table, rect, app.processes_state.display_col(2 + li), li))
+            .flatten()
+    });
 
     if resp.clicked() {
         if row.synthetic {
@@ -1099,37 +990,23 @@ fn row_ui(
     }
 }
 
-/// Explain the "—" in the Network column instead of leaving the user to
-/// wonder. Per-process bytes come from an ETW session, which Windows only
-/// grants to administrators; without it the honest answer is "unknown", and
-/// this says why.
-fn unavailable_network_tip(
+/// Explain the "—" under the cursor instead of leaving the user to wonder:
+/// these columns come from telemetry sources that can be absent, and each
+/// says why in its own words. `display` is where that column currently sits
+/// — the numeric block is draggable, so the logical index is not a cell rect.
+fn unknown_cell_tip(
     ui: &egui::Ui,
     table: &tablekit::TmTable,
     rect: egui::Rect,
+    display: usize,
+    logical: usize,
 ) -> Option<&'static str> {
     cell_tip(
         ui,
         table,
         rect,
-        2 + NET_VALUE,
-        i18n::tr(K::NetPerProcessUnavailable),
-    )
-}
-
-/// Why the Disk activity cell reads "—": the same ETW session requirement the
-/// network column has.
-fn unavailable_disk_tip(
-    ui: &egui::Ui,
-    table: &tablekit::TmTable,
-    rect: egui::Rect,
-) -> Option<&'static str> {
-    cell_tip(
-        ui,
-        table,
-        rect,
-        2 + DISK_ACT_VALUE,
-        i18n::tr(K::NetPerProcessUnavailable),
+        display,
+        value_columns::unavailable_tip(logical)?,
     )
 }
 
@@ -1678,7 +1555,7 @@ fn application_family<'a>(
 /// The built-in value-column order, as ids. A layout matching this is not
 /// written to the settings file at all.
 fn default_value_order_ids() -> Vec<String> {
-    VALUE_COLUMNS.iter().map(|c| c.id.to_string()).collect()
+    value_columns::default_ids()
 }
 
 /// Sum of the members' OWN values.
@@ -2161,20 +2038,7 @@ fn is_system_boundary(name: &str) -> bool {
 /// paints — they drifted apart once already, and now that the two iterate a
 /// user-defined order they would drift silently.
 fn value_text(row: &RowData, li: usize) -> String {
-    match li {
-        0 => format::format_pct_cell(row.values[0].min(100.0) as f32),
-        1 => format::format_mb(row.values[1] as u64),
-        2 => format::format_rate_mb(row.values[2]),
-        NET_VALUE if row.net_available => format::format_process_net_rate(row.values[NET_VALUE]),
-        DISK_ACT_VALUE if row.disk_available => {
-            format::format_pct_cell(row.values[DISK_ACT_VALUE].min(100.0) as f32)
-        }
-        GPU_VALUE if row.gpu_available => {
-            format::format_pct_cell(row.values[GPU_VALUE].min(100.0) as f32)
-        }
-        // Unknown telemetry, never a fabricated zero.
-        _ => "\u{2014}".to_string(),
-    }
+    value_columns::value_text(li, row.values[li], value_known(row, li))
 }
 
 /// A cell whose value is unknown must not colour the heat band, and must not
@@ -2670,6 +2534,8 @@ fn cmp_ignore_case(a: &str, b: &str) -> std::cmp::Ordering {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tabs::value_columns::VALUE_COLUMNS;
+    use tm_core::format;
 
     fn proc(pid: u32, ppid: Option<u32>, name: &str, cat: ProcCategory) -> ProcessEntry {
         let mut p = ProcessEntry::new(pid, name);

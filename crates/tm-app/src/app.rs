@@ -332,6 +332,10 @@ pub struct TaskManApp {
     pub startup_sort: crate::widgets::tablekit::SortState,
     pub services_sort: crate::widgets::tablekit::SortState,
     pub users_sort: crate::widgets::tablekit::SortState,
+    /// Display order of the Users page's numeric block, the same drag-and-drop
+    /// the Processes page has. Held per table: the two pages show the same
+    /// columns but the user arranges each for what they are looking at there.
+    pub users_value_order: Vec<usize>,
     pub app_history_sort: crate::widgets::tablekit::SortState,
     /// Selected process by EXACT identity (audit §7): the toolbar's End Task
     /// and Efficiency commands validate start-time identity against the live
@@ -622,12 +626,14 @@ impl TaskManApp {
             &["name", "pid", "desc", "status", "group"],
         )
         .unwrap_or_else(|| crate::widgets::tablekit::SortState::new(0, true));
-        let users_sort = restored_sort(
-            &settings,
-            "users",
-            &["user", "status", "cpu", "mem", "disk", "net"],
-        )
-        .unwrap_or_else(|| crate::widgets::tablekit::SortState::new(0, true));
+        // The id list is the page's own, in LOGICAL order — a hardcoded copy
+        // silently stops persisting the sort of every column added after it.
+        let users_sort = restored_sort(&settings, "users", &crate::tabs::users::column_ids())
+            .unwrap_or_else(|| crate::widgets::tablekit::SortState::new(0, true));
+        let mut users_value_order = crate::tabs::value_columns::default_order();
+        if let Some(order) = settings.col_order.get("users") {
+            crate::tabs::value_columns::apply_saved(&mut users_value_order, order);
+        }
         let app_history_sort =
             restored_sort(&settings, "apphistory", &["name", "cpu", "net", "notif"])
                 .unwrap_or_else(|| crate::widgets::tablekit::SortState::new(1, false));
@@ -693,6 +699,7 @@ impl TaskManApp {
             startup_sort,
             services_sort,
             users_sort,
+            users_value_order,
             app_history_sort,
             selection: crate::selection::Selection::default(),
             select_all_requested: false,
@@ -988,23 +995,26 @@ impl TaskManApp {
         // App History always show it; Details requests it only for visible
         // network columns. Process Properties also exposes live send/receive
         // statistics, so keep the source active while that inspector is open.
+        // Users rolls the same per-process columns up per session, so it
+        // needs the same sources Processes does — without them its Network,
+        // Disk activity and GPU cells can only say "unknown".
         let details_network =
             self.tab == Tab::Details && self.details_state.requires_network_telemetry();
-        if matches!(self.tab, Tab::Processes | Tab::AppHistory)
+        if matches!(self.tab, Tab::Processes | Tab::AppHistory | Tab::Users)
             || details_network
             || self.proc_props.is_some()
         {
             d = d.union(TelemetryDemand::PROCESS_NET);
         }
-        // The Processes page carries a GPU column, so it needs the PDH GPU
-        // group. That group also enumerates adapters, which is why a page
-        // without a GPU column deliberately never touches it.
-        if self.tab == Tab::Processes {
+        // The Processes and Users pages carry a GPU column, so they need the
+        // PDH GPU group. That group also enumerates adapters, which is why a
+        // page without a GPU column deliberately never touches it.
+        if matches!(self.tab, Tab::Processes | Tab::Users) {
             d = d.union(TelemetryDemand::PROCESS_GPU);
         }
-        // Per-process disk service time is a second ETW session. Processes
-        // shows its column always; Details only when the column is visible.
-        if self.tab == Tab::Processes
+        // Per-process disk service time is a second ETW session. Processes and
+        // Users show its column always; Details only when it is visible.
+        if matches!(self.tab, Tab::Processes | Tab::Users)
             || (self.tab == Tab::Details && self.details_state.requires_disk_telemetry())
         {
             d = d.union(TelemetryDemand::PROCESS_DISK);

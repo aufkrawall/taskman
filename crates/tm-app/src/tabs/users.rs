@@ -10,55 +10,102 @@ use eframe::egui;
 use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
-use tm_core::format;
 use tm_core::i18n::{self, K};
 use tm_core::model::UserSession;
 
 use crate::app::TaskManApp;
 use crate::icons::Icon;
 use crate::search;
+use crate::tabs::value_columns::{self, FIXED_COLS, VALUE_COLS};
 use crate::theme;
 use crate::widgets::menu;
 use crate::widgets::tablekit::{self, Aggregates, HeatCell, TmColumn};
 use tm_platform::actions::UserSessionAction;
 
-fn columns() -> Vec<TmColumn> {
-    vec![
-        TmColumn::text("user", i18n::tr(K::TabUsers), 340.0),
-        TmColumn::text("status", i18n::tr(K::ColStatus), 190.0),
-        TmColumn::num("cpu", i18n::tr(K::ColCpu), 110.0),
-        TmColumn::num("mem", i18n::tr(K::ColMemory), 110.0),
-        TmColumn::num("disk", i18n::tr(K::ColDisk), 110.0),
-        TmColumn::num("net", i18n::tr(K::ColNetwork), 110.0),
-    ]
+/// Stable ids of every column in LOGICAL order, for sort persistence.
+pub fn column_ids() -> Vec<&'static str> {
+    value_columns::column_ids(["user", "status"])
+}
+
+fn columns(value_order: &[usize]) -> Vec<TmColumn> {
+    value_columns::columns(
+        vec![
+            TmColumn::text("user", i18n::tr(K::TabUsers), 340.0),
+            TmColumn::text("status", i18n::tr(K::ColStatus), 190.0),
+        ],
+        value_order,
+    )
+}
+
+/// CPU, memory and the disk byte rates come straight off every process, so a
+/// session with no processes at all honestly totals zero. The last three come
+/// from traces that may not be running; until one of them delivers, their sum
+/// is "not measured", not "nothing happened".
+const ALWAYS_KNOWN: [bool; VALUE_COLS] = [true, true, true, false, false, false];
+
+/// What a set of processes adds up to, in the shared LOGICAL column order.
+#[derive(Clone)]
+struct Roll {
+    values: [f64; VALUE_COLS],
+    /// Per column: did ANY process in this rollup produce a reading?
+    known: [bool; VALUE_COLS],
+    count: usize,
+}
+
+impl Roll {
+    fn new() -> Self {
+        Self {
+            values: [0.0; VALUE_COLS],
+            known: ALWAYS_KNOWN,
+            count: 0,
+        }
+    }
+
+    /// Fold one process in. Optional telemetry contributes its value AND the
+    /// fact that it was measured; a process the trace never saw contributes
+    /// neither, so it cannot drag a real rate down to a fake zero.
+    fn add(&mut self, p: &tm_core::model::ProcessEntry) {
+        self.values[0] += p.cpu_pct as f64;
+        self.values[1] += p.mem_bytes as f64;
+        self.values[2] += p.disk_read_bps + p.disk_write_bps;
+        if p.net_recv_bps.is_some() || p.net_sent_bps.is_some() {
+            self.values[value_columns::NET] +=
+                p.net_recv_bps.unwrap_or(0.0) + p.net_sent_bps.unwrap_or(0.0);
+            self.known[value_columns::NET] = true;
+        }
+        if let Some(pct) = p.disk_active_pct {
+            self.values[value_columns::DISK_ACT] += f64::from(pct);
+            self.known[value_columns::DISK_ACT] = true;
+        }
+        if let Some(pct) = p.gpu_util_pct {
+            self.values[value_columns::GPU] += f64::from(pct);
+            self.known[value_columns::GPU] = true;
+        }
+        self.count += 1;
+    }
+
+    /// Sort key for one column: `None` where nothing measured it, which orders
+    /// below every measured value instead of tying with a real zero.
+    fn key(&self, li: usize) -> Option<f64> {
+        self.known[li].then_some(self.values[li])
+    }
+
+    /// The row's cells, in LOGICAL order.
+    fn texts(&self) -> [String; VALUE_COLS] {
+        std::array::from_fn(|li| value_columns::value_text(li, self.values[li], self.known[li]))
+    }
 }
 
 struct Agg {
-    cpu: f64,
-    mem: f64,
-    disk: f64,
-    net: f64,
-    /// At least one process in this session reported network bytes. Without
-    /// one, the sum is not "no traffic" but "not measured", and the cell has
-    /// to say so instead of printing a zero nobody measured.
-    net_known: bool,
-    count: usize,
+    roll: Roll,
     apps: HashMap<String, AppAgg>,
 }
 
 /// One app name's rollup inside a session.
 struct AppAgg {
-    values: [f64; VALUES],
-    count: usize,
+    roll: Roll,
     exe: Option<String>,
-    net_known: bool,
 }
-
-/// CPU, memory, disk, network - the numeric columns, in table order.
-const VALUES: usize = 4;
-
-/// Index of the network value inside a row's values.
-const NET: usize = 3;
 
 enum URow {
     User(usize),
@@ -66,97 +113,86 @@ enum URow {
         session: u32,
         name: String,
         exe: Option<String>,
-        values: [f64; VALUES],
-        count: usize,
-        net_known: bool,
+        roll: Roll,
     },
 }
 
 /// Fold one process into its session's rollup and into that session's entry
 /// for the app it belongs to.
 fn accumulate(a: &mut Agg, p: &tm_core::model::ProcessEntry) {
-    let net = p.net_recv_bps.unwrap_or(0.0) + p.net_sent_bps.unwrap_or(0.0);
-    let net_known = p.net_recv_bps.is_some() || p.net_sent_bps.is_some();
-    a.cpu += p.cpu_pct as f64;
-    a.mem += p.mem_bytes as f64;
-    a.disk += p.disk_read_bps + p.disk_write_bps;
-    a.net += net;
-    a.net_known |= net_known;
-    a.count += 1;
+    a.roll.add(p);
     let e = a.apps.entry(p.shown_name().to_string()).or_insert(AppAgg {
-        values: [0.0; VALUES],
-        count: 0,
+        roll: Roll::new(),
         exe: None,
-        net_known: false,
     });
-    e.values[0] += p.cpu_pct as f64;
-    e.values[1] += p.mem_bytes as f64;
-    e.values[2] += p.disk_read_bps + p.disk_write_bps;
-    e.values[NET] += net;
-    e.net_known |= net_known;
+    e.roll.add(p);
     if e.exe.is_none() {
         e.exe = p
             .exe_path
             .as_ref()
             .map(|x| x.to_string_lossy().into_owned());
     }
-    e.count += 1;
 }
 
+/// Per-column maximum, for the heat band. Unmeasured cells are left out: they
+/// must neither colour the band nor set the scale the measured ones are drawn
+/// against.
 struct HeatMax {
-    cpu: f64,
-    mem: f64,
-    disk: f64,
-    net: f64,
+    max: [f64; VALUE_COLS],
 }
 
 impl HeatMax {
-    fn intensity(&self, v: &[f64; VALUES], net_known: bool) -> [f32; VALUES] {
-        [
-            tablekit::norm(v[0], self.cpu),
-            tablekit::norm(v[1], self.mem),
-            tablekit::norm(v[2], self.disk),
-            // An unmeasured cell must not colour the heat band, nor pull the
-            // column maximum below.
-            if net_known {
-                tablekit::norm(v[NET], self.net)
+    fn intensity(&self, roll: &Roll) -> [f32; VALUE_COLS] {
+        std::array::from_fn(|li| {
+            if roll.known[li] {
+                tablekit::norm(roll.values[li], self.max[li])
             } else {
                 0.0
-            },
-        ]
+            }
+        })
     }
 
-    fn over(rows: impl Iterator<Item = ([f64; VALUES], bool)>) -> Self {
+    fn over<'a>(rolls: impl Iterator<Item = &'a Roll>) -> Self {
         let mut m = Self {
-            cpu: 0.0,
-            mem: 0.0,
-            disk: 0.0,
-            net: 0.0,
+            max: [0.0; VALUE_COLS],
         };
-        for (v, net_known) in rows {
-            m.cpu = m.cpu.max(v[0]);
-            m.mem = m.mem.max(v[1]);
-            m.disk = m.disk.max(v[2]);
-            if net_known {
-                m.net = m.net.max(v[NET]);
+        for roll in rolls {
+            for li in 0..VALUE_COLS {
+                if roll.known[li] {
+                    m.max[li] = m.max[li].max(roll.values[li]);
+                }
             }
         }
         m
     }
 }
 
-/// The numeric cells of one row, with unmeasured network rendered as "—".
-fn value_texts(values: &[f64; VALUES], net_known: bool) -> [String; VALUES] {
-    [
-        format::format_pct_cell(values[0].min(100.0) as f32),
-        format::format_mb(values[1] as u64),
-        format::format_rate_mb(values[2]),
-        if net_known {
-            format::format_process_net_rate(values[NET])
-        } else {
-            "—".to_string()
-        },
-    ]
+/// Paint one row's numeric block in the user's display order, and explain any
+/// cell that reads "—" while the cursor is on it.
+fn heat_row(
+    ui: &egui::Ui,
+    pal: &theme::Palette,
+    table: &tablekit::TmTable,
+    rect: egui::Rect,
+    order: &[usize],
+    roll: &Roll,
+    heat_max: &HeatMax,
+) -> Option<&'static str> {
+    let texts = value_columns::in_display_order(order, &roll.texts());
+    let heat = value_columns::in_display_order(order, &heat_max.intensity(roll));
+    let cells: Vec<HeatCell> = heat
+        .iter()
+        .zip(texts)
+        .map(|(t, text)| HeatCell::new(*t, text))
+        .collect();
+    table.heat_cells(ui, pal, rect, FIXED_COLS, &cells);
+
+    let pointer = ui.ctx().pointer_latest_pos()?;
+    order.iter().enumerate().find_map(|(slot, &li)| {
+        (!roll.known[li] && table.col_rect(FIXED_COLS + slot, rect).contains(pointer))
+            .then(|| value_columns::unavailable_tip(li))
+            .flatten()
+    })
 }
 
 pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
@@ -280,12 +316,7 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
         aggs.insert(
             s.id,
             Agg {
-                cpu: 0.0,
-                mem: 0.0,
-                disk: 0.0,
-                net: 0.0,
-                net_known: false,
-                count: 0,
+                roll: Roll::new(),
                 apps: HashMap::new(),
             },
         );
@@ -308,6 +339,7 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
         accumulate(a, p);
     }
 
+    let order = app.users_value_order.clone();
     let q = search::Query::new(&app.search);
     let mut rows: Vec<URow> = Vec::new();
     let mut visible_sessions = sessions
@@ -343,38 +375,36 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
         if app.processes_state.expanded_users.contains(&s.id) {
             let mut apps: Vec<(&String, &AppAgg)> = a.apps.iter().collect();
             apps.sort_by(|left, right| {
-                compare_user_apps(left.0, &left.1.values, right.0, &right.1.values, sort)
+                compare_user_apps(left.0, &left.1.roll, right.0, &right.1.roll, sort)
             });
             for (name, entry) in apps {
                 rows.push(URow::App {
                     session: s.id,
                     name: name.clone(),
                     exe: entry.exe.clone(),
-                    values: entry.values,
-                    count: entry.count,
-                    net_known: entry.net_known,
+                    roll: entry.roll.clone(),
                 });
             }
         }
     }
 
     let heat_max = HeatMax::over(rows.iter().map(|r| match r {
-        URow::User(i) => {
-            let s = sessions[*i];
-            let a = &aggs[&s.id];
-            ([a.cpu, a.mem, a.disk, a.net], a.net_known)
-        }
-        URow::App {
-            values, net_known, ..
-        } => (*values, *net_known),
+        URow::User(i) => &aggs[&sessions[*i].id].roll,
+        URow::App { roll, .. } => roll,
     }));
 
-    let agg_hdr = Aggregates::from_snapshot(&snap);
-    let aggs_hdr = agg_hdr.strings();
+    // Header totals are machine totals, produced in logical order and shown
+    // in the user's display order.
+    let logical_hdr = Aggregates::from_snapshot(&snap).strings();
+    let aggs_hdr = value_columns::in_display_order(&order, &logical_hdr);
 
-    let mut table = app.make_table("users", columns());
+    let mut table = app
+        .make_table("users", columns(&order))
+        // Only the numeric block is draggable: `heat_cells` paints the blue
+        // band as one contiguous span, and the first cell owns the chevron.
+        .reorderable(FIXED_COLS..FIXED_COLS + VALUE_COLS);
     prepare_auto_fit_widths(
-        ui, app, &mut table, &rows, &sessions, &aggs, &snap, &aggs_hdr,
+        ui, app, &mut table, &rows, &sessions, &aggs, &snap, &aggs_hdr, &order,
     );
     let avail = tablekit::table_avail(ui);
     let clicked = tablekit::scrolled_rows(
@@ -383,7 +413,10 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
         &pal,
         &mut table,
         avail,
-        Some((app.users_sort.column, app.users_sort.ascending)),
+        Some((
+            value_columns::display_col(&order, app.users_sort.column),
+            app.users_sort.ascending,
+        )),
         Some(&aggs_hdr),
         rows.len(),
         None,
@@ -404,6 +437,7 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
                             s,
                             a,
                             &display,
+                            &order,
                             caps.user_disconnect,
                         );
                     }
@@ -411,9 +445,7 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
                         session,
                         name,
                         exe,
-                        values,
-                        count,
-                        net_known,
+                        roll,
                     }) => {
                         app_row_ui(
                             app,
@@ -423,9 +455,8 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
                             *session,
                             name,
                             exe.as_deref(),
-                            values,
-                            *count,
-                            *net_known,
+                            roll,
+                            &order,
                             &heat_max,
                         );
                     }
@@ -435,9 +466,19 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
         },
     );
     if let Some(column) = clicked {
-        app.users_sort.clicked(column, column >= 2);
-        let ids = ["user", "status", "cpu", "mem", "disk", "net"];
-        app.persist_sort("users", ids[column], app.users_sort.ascending);
+        // The sort is held (and persisted) in LOGICAL terms: the display index
+        // it was clicked at means nothing once the columns are dragged around.
+        let logical = value_columns::logical_col(&order, column);
+        app.users_sort.clicked(logical, logical >= FIXED_COLS);
+        app.persist_sort("users", column_ids()[logical], app.users_sort.ascending);
+    }
+    if let Some((from, to)) = table.take_reorder()
+        && value_columns::move_column(&mut app.users_value_order, from, to)
+    {
+        // Widths are stored per column id, so they follow their column; only
+        // the order itself has to be written out.
+        let ids = value_columns::saved_ids(&app.users_value_order);
+        app.persist_column_order("users", ids, &value_columns::default_ids());
     }
     app.persist_table(&table);
 }
@@ -459,28 +500,23 @@ fn compare_users(
     let primary = match sort.column {
         0 => a_name.cmp(&b_name),
         1 => session_state_rank(a.state).cmp(&session_state_rank(b.state)),
-        2 => aa.cpu.partial_cmp(&ba.cpu).unwrap_or(Ordering::Equal),
-        3 => aa.mem.partial_cmp(&ba.mem).unwrap_or(Ordering::Equal),
-        4 => aa.disk.partial_cmp(&ba.disk).unwrap_or(Ordering::Equal),
-        // An unmeasured network sorts below every measured one instead of
-        // tying with a session that genuinely sent nothing.
-        _ => net_key(aa)
-            .partial_cmp(&net_key(ba))
-            .unwrap_or(Ordering::Equal),
+        li => compare_values(&aa.roll, &ba.roll, li),
     };
     directed(primary, sort.ascending).then_with(|| a_name.cmp(&b_name))
 }
 
-/// Sort key for the network column: `None` where nothing measured it.
-fn net_key(a: &Agg) -> Option<f64> {
-    a.net_known.then_some(a.net)
+/// Order two rollups by one LOGICAL value column. An unmeasured cell sorts
+/// below every measured one instead of tying with a real zero.
+fn compare_values(a: &Roll, b: &Roll, logical: usize) -> Ordering {
+    let li = logical - FIXED_COLS;
+    a.key(li).partial_cmp(&b.key(li)).unwrap_or(Ordering::Equal)
 }
 
 fn compare_user_apps(
     a_name: &str,
-    a_values: &[f64; VALUES],
+    a_roll: &Roll,
     b_name: &str,
-    b_values: &[f64; VALUES],
+    b_roll: &Roll,
     sort: tablekit::SortState,
 ) -> Ordering {
     let names = || {
@@ -489,9 +525,7 @@ fn compare_user_apps(
             .cmp(&b_name.to_ascii_lowercase())
     };
     let primary = match sort.column {
-        2..=5 => a_values[sort.column - 2]
-            .partial_cmp(&b_values[sort.column - 2])
-            .unwrap_or(Ordering::Equal),
+        li if li >= FIXED_COLS => compare_values(a_roll, b_roll, li),
         _ => names(),
     };
     directed(primary, sort.ascending).then_with(names)
@@ -524,6 +558,7 @@ fn prepare_auto_fit_widths(
     aggs: &HashMap<u32, Agg>,
     snap: &tm_core::model::Snapshot,
     agg_hdr: &[String],
+    order: &[usize],
 ) {
     let mut fit: Vec<f32> = table
         .cols
@@ -531,41 +566,38 @@ fn prepare_auto_fit_widths(
         .map(|c| tablekit::text_width(ui, c.label, tablekit::FONT_HDR_LABEL) + 28.0)
         .collect();
     for row in rows {
-        let (name, status, values, net_known, name_extra) = match row {
+        let (name, status, roll, name_extra) = match row {
             URow::User(i) => {
                 let s = sessions[*i];
                 let a = &aggs[&s.id];
                 (
-                    format!("{} ({})", display_name(s, &snap.system.hostname), a.count),
+                    format!(
+                        "{} ({})",
+                        display_name(s, &snap.system.hostname),
+                        a.roll.count
+                    ),
                     session_status_label(s),
-                    [a.cpu, a.mem, a.disk, a.net],
-                    a.net_known,
+                    &a.roll,
                     66.0,
                 )
             }
-            URow::App {
-                name,
-                values,
-                count,
-                net_known,
-                ..
-            } => (
-                if *count > 1 {
-                    format!("{name} ({count})")
+            URow::App { name, roll, .. } => (
+                if roll.count > 1 {
+                    format!("{name} ({})", roll.count)
                 } else {
                     name.clone()
                 },
                 "",
-                *values,
-                *net_known,
+                roll,
                 88.0,
             ),
         };
         fit[0] = fit[0].max(tablekit::text_width(ui, &name, tablekit::FONT_ROW) + name_extra);
         fit[1] = fit[1].max(tablekit::text_width(ui, status, tablekit::FONT_ROW) + 22.0);
-        let texts = value_texts(&values, net_known);
-        for (i, text) in texts.iter().enumerate() {
-            fit[i + 2] = fit[i + 2].max(tablekit::text_width(ui, text, tablekit::FONT_ROW) + 22.0);
+        let texts = value_columns::in_display_order(order, &roll.texts());
+        for (slot, text) in texts.iter().enumerate() {
+            fit[FIXED_COLS + slot] = fit[FIXED_COLS + slot]
+                .max(tablekit::text_width(ui, text, tablekit::FONT_ROW) + 22.0);
         }
     }
     // Zip against the table's OWN numeric columns: this list is shared with
@@ -603,6 +635,7 @@ fn user_row_ui(
     s: &UserSession,
     a: &Agg,
     display: &str,
+    order: &[usize],
     can_disconnect: bool,
 ) {
     let selected = app.selected_user == Some(s.id);
@@ -623,32 +656,21 @@ fn user_row_ui(
     ui.painter_at(name_rect).text(
         egui::Pos2::new(name_rect.left() + 56.0, rect.center().y),
         egui::Align2::LEFT_CENTER,
-        format!("{} ({})", display, a.count),
+        format!("{} ({})", display, a.roll.count),
         egui::FontId::proportional(tablekit::FONT_ROW),
         pal.text,
     );
 
     table.text_cell(ui, rect, 1, session_status_label(s), pal, false);
 
-    let values = [a.cpu, a.mem, a.disk, a.net];
-    let texts = value_texts(&values, a.net_known);
-    let cells: Vec<HeatCell> = heat_max
-        .intensity(&values, a.net_known)
-        .iter()
-        .zip(texts.iter())
-        .map(|(t, txt)| HeatCell::new(*t, txt.clone()))
-        .collect();
-    table.heat_cells(ui, pal, rect, 2, &cells);
-    let net_tip = (!a.net_known)
-        .then(|| unavailable_network_tip(ui, table, rect))
-        .flatten();
+    let unknown_tip = heat_row(ui, pal, table, rect, order, &a.roll, heat_max);
 
     if resp.clicked() {
         app.selected_user = Some(s.id);
     }
     // on_hover_text consumes the response (builder style), so it has to come
     // before the context menu is attached to it.
-    let resp = match net_tip {
+    let resp = match unknown_tip {
         Some(tip) => resp.on_hover_text(tip),
         None => resp,
     };
@@ -688,9 +710,8 @@ fn app_row_ui(
     session_id: u32,
     name: &str,
     exe: Option<&str>,
-    vals: &[f64; VALUES],
-    count: usize,
-    net_known: bool,
+    roll: &Roll,
+    order: &[usize],
     heat_max: &HeatMax,
 ) {
     // Same app name can appear under two users, so the key pairs the row
@@ -704,8 +725,8 @@ fn app_row_ui(
         pal.accent,
     );
     let nr = table.col_rect(0, rect);
-    let label = if count > 1 {
-        format!("{name} ({count})")
+    let label = if roll.count > 1 {
+        format!("{name} ({})", roll.count)
     } else {
         name.to_string()
     };
@@ -716,33 +737,9 @@ fn app_row_ui(
         egui::FontId::proportional(tablekit::FONT_ROW),
         pal.text,
     );
-    let texts = value_texts(vals, net_known);
-    let cells: Vec<HeatCell> = heat_max
-        .intensity(vals, net_known)
-        .iter()
-        .zip(texts.iter())
-        .map(|(t, txt)| HeatCell::new(*t, txt.clone()))
-        .collect();
-    table.heat_cells(ui, pal, rect, 2, &cells);
-    if !net_known
-        && let Some(tip) = unavailable_network_tip(ui, table, rect)
-    {
+    if let Some(tip) = heat_row(ui, pal, table, rect, order, roll, heat_max) {
         resp.on_hover_text(tip);
     }
-}
-
-/// Explain the "—" in the Network column the way the Processes page does:
-/// per-process bytes come from an ETW session, and without it the honest
-/// answer is "unknown".
-fn unavailable_network_tip(
-    ui: &egui::Ui,
-    table: &tablekit::TmTable,
-    rect: egui::Rect,
-) -> Option<&'static str> {
-    let cell = table.col_rect(2 + NET, rect);
-    let pointer = ui.ctx().pointer_latest_pos()?;
-    cell.contains(pointer)
-        .then_some(i18n::tr(K::NetPerProcessUnavailable))
 }
 
 fn display_name(s: &UserSession, hostname: &str) -> String {
@@ -840,20 +837,15 @@ pub fn session_logoff_dialog(app: &mut TaskManApp, ctx: &egui::Context, _pal: &t
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use tm_core::model::ProcessEntry;
+    use value_columns::{DISK_ACT, GPU, NET};
 
     fn empty_agg() -> Agg {
         Agg {
-            cpu: 0.0,
-            mem: 0.0,
-            disk: 0.0,
-            net: 0.0,
-            net_known: false,
-            count: 0,
+            roll: Roll::new(),
             apps: HashMap::new(),
         }
     }
@@ -865,55 +857,97 @@ mod tests {
         p
     }
 
-    /// The session row sums what the per-process trace measured, instead of
-    /// the flat "—" it printed before there was a network rollup at all.
+    /// The session row sums what the per-process traces measured, instead of
+    /// the flat "—" it printed before there was a rollup at all.
     #[test]
-    fn a_session_sums_the_network_rates_of_its_processes() {
+    fn a_session_sums_the_optional_telemetry_of_its_processes() {
         let mut a = empty_agg();
-        accumulate(&mut a, &with_net("a.exe", Some(1024.0), Some(512.0)));
+        let mut first = with_net("a.exe", Some(1024.0), Some(512.0));
+        first.disk_active_pct = Some(4.0);
+        first.gpu_util_pct = Some(10.0);
+        accumulate(&mut a, &first);
         accumulate(&mut a, &with_net("b.exe", Some(2048.0), None));
-        assert!(a.net_known);
-        assert_eq!(a.net, 3584.0);
+
+        assert_eq!(a.roll.count, 2);
+        assert!(a.roll.known[NET] && a.roll.known[DISK_ACT] && a.roll.known[GPU]);
+        assert_eq!(a.roll.values[NET], 3584.0);
+        assert_eq!(a.roll.values[DISK_ACT], 4.0);
+        assert_eq!(a.roll.values[GPU], 10.0);
         // Not an exact string: the decimal separator follows the locale.
-        let text = value_texts(&[0.0, 0.0, 0.0, a.net], a.net_known)[NET].clone();
-        assert!(text.starts_with("3") && text.ends_with(" KB/s"), "{text}");
+        let text = a.roll.texts()[NET].clone();
+        assert!(text.starts_with('3') && text.ends_with(" KB/s"), "{text}");
     }
 
     /// Core invariant: telemetry nobody measured renders as unknown, never as
     /// a zero, and it must not colour the heat band or set its maximum.
     #[test]
-    fn an_unmeasured_session_network_stays_unknown() {
+    fn unmeasured_columns_stay_unknown() {
         let mut a = empty_agg();
         accumulate(&mut a, &with_net("a.exe", None, None));
-        assert!(!a.net_known);
-        assert_eq!(value_texts(&[0.0, 0.0, 0.0, a.net], a.net_known)[NET], "\u{2014}");
+        for li in [NET, DISK_ACT, GPU] {
+            assert!(!a.roll.known[li]);
+            assert_eq!(a.roll.texts()[li], "—");
+        }
+        // ...while the columns every process reports stay real numbers.
+        assert!(a.roll.known[0] && a.roll.known[1] && a.roll.known[2]);
 
-        let heat = HeatMax::over([([0.0, 0.0, 0.0, 9_000.0], false)].into_iter());
-        assert_eq!(heat.net, 0.0);
-        assert_eq!(heat.intensity(&[0.0, 0.0, 0.0, 9_000.0], false)[NET], 0.0);
+        let mut loud = Roll::new();
+        loud.values[NET] = 9_000.0;
+        let heat = HeatMax::over([&loud].into_iter());
+        assert_eq!(heat.max[NET], 0.0, "an unknown cell must not set the scale");
+        assert_eq!(heat.intensity(&loud)[NET], 0.0);
     }
 
-    /// A process that measured zero bytes is a measurement: it prints a rate,
-    /// and only the absence of any reading falls back to unknown.
+    /// A process that measured zero is a measurement: it prints a value, and
+    /// only the absence of any reading falls back to unknown.
     #[test]
     fn a_measured_zero_is_not_unknown() {
         let mut a = empty_agg();
-        accumulate(&mut a, &with_net("a.exe", Some(0.0), Some(0.0)));
-        assert!(a.net_known);
-        assert_eq!(
-            value_texts(&[0.0, 0.0, 0.0, a.net], a.net_known)[NET],
-            format::format_process_net_rate(0.0)
-        );
+        let mut p = with_net("a.exe", Some(0.0), Some(0.0));
+        p.gpu_util_pct = Some(0.0);
+        accumulate(&mut a, &p);
+        assert!(a.roll.known[NET] && a.roll.known[GPU]);
+        assert_ne!(a.roll.texts()[NET], "—");
+        assert_ne!(a.roll.texts()[GPU], "—");
     }
 
     /// Unknown sorts below every measured value rather than tying with a
     /// session that genuinely sent nothing.
     #[test]
-    fn unknown_network_sorts_below_a_measured_zero() {
+    fn unknown_sorts_below_a_measured_zero() {
         let mut measured = empty_agg();
         accumulate(&mut measured, &with_net("a.exe", Some(0.0), None));
         let mut unknown = empty_agg();
         accumulate(&mut unknown, &with_net("b.exe", None, None));
-        assert!(net_key(&unknown) < net_key(&measured));
+        assert!(unknown.roll.key(NET) < measured.roll.key(NET));
+        assert_eq!(
+            compare_values(&unknown.roll, &measured.roll, FIXED_COLS + NET),
+            Ordering::Less
+        );
+    }
+
+    /// The page shows the same six measurements as the Processes page, and
+    /// the sort persists by id in LOGICAL order.
+    #[test]
+    fn the_page_mirrors_the_shared_column_catalogue() {
+        let ids = column_ids();
+        assert_eq!(ids.len(), FIXED_COLS + VALUE_COLS);
+        assert_eq!(&ids[..2], &["user", "status"]);
+        assert_eq!(ids[FIXED_COLS + GPU], "gpu");
+
+        // Dragging GPU to the front changes where it is drawn, not what the
+        // sort means.
+        let mut order = value_columns::default_order();
+        assert!(value_columns::move_column(
+            &mut order,
+            FIXED_COLS + GPU,
+            FIXED_COLS
+        ));
+        let cols = columns(&order);
+        assert_eq!(cols[FIXED_COLS].id, "gpu");
+        assert_eq!(
+            value_columns::logical_col(&order, FIXED_COLS),
+            FIXED_COLS + GPU
+        );
     }
 }

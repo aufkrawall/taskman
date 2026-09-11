@@ -412,6 +412,14 @@ keys! {
         "Netzwerk pro Prozess benötigt Administratorrechte (ETW-Sitzung).",
         "Per-process network needs administrator rights (ETW session)."
     ],
+    DiskPerProcessUnavailable => [
+        "Datenträgeraktivität pro Prozess benötigt Administratorrechte (ETW-Sitzung).",
+        "Per-process disk activity needs administrator rights (ETW session)."
+    ],
+    GpuPerProcessUnavailable => [
+        "Für diesen Prozess melden die GPU-Leistungsindikatoren keinen Wert.",
+        "The GPU performance counters report no value for this process."
+    ],
     ColDiskActivity => ["Datenträgeraktivität", "Disk activity"],
     ColIoOps => ["E/A-Vorgänge/s", "I/O operations/s"],
     ColHardFaults => ["Harte Seitenfehler/s", "Hard faults/s"],

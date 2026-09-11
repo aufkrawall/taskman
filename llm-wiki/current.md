@@ -379,12 +379,23 @@ rebase runbook.
   bounded budget is spent); the honest outcome — unmapped, with how many
   references were dropped, or still in use — is reported as data, not
   guessed from an error.
-- The Users page rolls the per-process network rate up into each session row
-  and each app row under it (`tabs/users.rs`), including its heat and its
-  column sort. The cell falls back to "—" only when no process in the session
-  produced a reading — i.e. when the per-process ETW network trace is not
-  running — and then explains itself on hover, exactly like the Processes
-  column.
+- The Users page shows the SAME six value columns as Processes — CPU,
+  Memory, Disk, Network, Disk activity, GPU — rolled up per session and per
+  app inside it, with the same draggable column order (persisted under
+  `[columns.users].order`), the same heat band and the same header totals.
+  The catalogue, the display-order permutation and the cell formatting live
+  once in `tabs/value_columns.rs`; both pages index rows in LOGICAL order and
+  translate to the user's display order only when painting.
+- Each rollup carries WHICH columns anything measured. Network, Disk activity
+  and GPU come from sources that may not be running, so their sums are marked
+  unknown until one process reports: an unknown cell reads "—", is left out of
+  the heat band and its column maximum, sorts below a measured zero, and
+  explains itself on hover (`value_columns::unavailable_tip`).
+- Telemetry demand follows that: the Users tab requests `PROCESS_NET`,
+  `PROCESS_DISK` and `PROCESS_GPU` exactly like Processes. Without that its
+  new columns could only ever say "unknown" — which is what the page did
+  before, when it aggregated CPU/memory/disk and printed a hardcoded dash for
+  network.
 - Details adds typed optional columns for description, publisher, parent PID,
   session ID, image path, page faults/sec, and I/O read/write totals. Startup,
   App History, Users, and Services headers now sort; tables draw quiet body

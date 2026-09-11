@@ -196,6 +196,12 @@ platform boundary (`tm-core` ← `tm-platform` ← `tm-app` / `tm-service`):
   `processes::process_display_name` is `Description (image.exe)` (the app
   list). Process counts on Processes use SQUARE brackets — `Microsoft Edge
   (msedge.exe) [24]`, `Apps [7]` — because round ones mean an image name.
+- `crates/tm-app/src/tabs/value_columns.rs` — the numeric column catalogue
+  (CPU/Memory/Disk/Network/Disk activity/GPU) shared by the Processes and
+  Users tables: ids and widths, the logical↔display order translation for
+  dragged columns and its persistence, one-cell formatting, and the
+  explanation each optional column shows when it reads "—". Rows everywhere
+  index values in LOGICAL order; display order exists only at paint time.
 - `crates/tm-app/src/tabs/processes.rs` — Processes UI intentionally uses a
   presentation-only app tree for Apps (Explorer/common shells, shell-session
   brokers and browsers are launch boundaries; a windowed process folds into
