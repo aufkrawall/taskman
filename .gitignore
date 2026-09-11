@@ -4,7 +4,8 @@ bench/dist
 /dist
 *.log.tmp
 *.png
-# screenshots/captures only -- vendored forks ship upstream image assets in-tree
+# ad-hoc captures only -- vendored forks and docs ship images in-tree
 !vendor/**/*.png
+!docs/**/*.png
 CLAUDE.md
 vendor/winit/target

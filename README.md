@@ -8,6 +8,25 @@ Four-crate workspace built around a strict platform boundary, with an
 optional protected Windows service for privileged operations and for
 telemetry an ordinary process cannot get unelevated.
 
+## Screenshots
+
+**Processes** — Apps / Background / Windows grouping driven by window
+ownership, with CPU, memory, GPU, network, disk I/O and disk active time
+sampled live.
+
+![TaskMan Processes tab](docs/screenshots/processes.png)
+
+**Performance** — overall and per-logical-processor CPU graphs with a
+cursor-anchored readout, alongside memory, per-disk, per-adapter network and
+per-engine GPU views.
+
+![TaskMan Performance tab](docs/screenshots/performance.png)
+
+**Details** — the literal PPID tree over the typed column catalog; the
+User name column is redacted in this capture.
+
+![TaskMan Details tab](docs/screenshots/details.png)
+
 ## Highlights
 
 - **Processes** — native-style grouped presentation (Apps / Background /
