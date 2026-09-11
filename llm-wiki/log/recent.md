@@ -11,6 +11,21 @@
 - 2026-09-08: Process Properties now summarizes mitigations with System Informer-style qualifiers (permanent DEP, high-entropy ASLR, prohibited/disabled wording, CF Guard and stack protection), and module inventory uses the authenticated LocalSystem broker for identity-bound SYSTEM/service inspection with bounded responses.
 # Recent Activity
 
+## 2026-09-11 — CI red: vendored winit example assets were never committed
+
+`tools/check-fork.ps1` failed on CI with four `couldn't read
+examples\data/icon.png` errors from `vendor/winit/examples/window.rs`
+(`include_bytes!`), which stopped the gate before the winit tests ran. The
+files exist locally — the vendored tree was unpacked in place — but the
+repo-wide `*.png` rule in `.gitignore` matched them, so they were never
+tracked and a fresh checkout has none of them.
+
+Scoped the ignore with `!vendor/**/*.png` (it is meant for screenshots and
+capture output, not vendored source) and committed the four assets, 3.5 KB
+total. `vendor/egui`'s equivalents were already tracked, which is why only
+winit broke. Verified on a detached worktree of `HEAD`: clippy
+`--all-targets -D warnings` and `cargo test` both pass on a clean checkout.
+
 ## 2026-09-11 — The Disk column was zero for half the process list
 
 User report: `BackgroundDownload.exe` showed `0 MB/s` in the Disk column while

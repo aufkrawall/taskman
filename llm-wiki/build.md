@@ -121,6 +121,10 @@ git config --local lfs.allowincompletepush true
   redundant:** `cargo clippy --workspace -- -D warnings` only passes those flags to the
   packages cargo selected, and `vendor/egui` is a deliberately excluded separate
   workspace. Without this step the fork's crates sit outside the gate entirely.
+  It lints `--all-targets`, so a vendored fork's examples must build too —
+  including their image assets. The repo-wide `*.png` ignore is scoped with
+  `!vendor/**/*.png` for exactly that reason; an untracked vendored asset is
+  invisible locally and only fails on a fresh CI checkout.
 
 Nested inside a release artifact build when run as
 `python build.py --host-only --check`.
