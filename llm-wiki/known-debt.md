@@ -190,3 +190,21 @@ remain follow-up rather than being simulated in headless tests:
   virtualization (`tablekit::norm`, `normalize_heat`, users' `HeatMax`).
 - "columns can't be resized" (drag delta handling) — root-caused earlier;
   egui `drag_delta()` accumulation onto the LIVE width is correct behavior.
+
+## Per-process disk activity
+
+- `Disk activity` is measured, so it is only available where an ETW session
+  can run: through the LocalSystem broker (the normal install) or in an
+  elevated GUI. Without either it renders "—", like the Network column.
+- Requests issued by a thread that had already exited when the window was
+  drained cannot be attributed and stay in the unattributed remainder, so the
+  per-process shares sum to at most 100 %, not exactly 100 %. Charging them to
+  a guess would be worse than the gap.
+- `Microsoft-Windows-Kernel-Disk` publishes no documented unit for
+  `HighResResponseTime`, so it is never shown as a duration — only as a share
+  of the window's total. `disk_etw.rs` keeps that rule.
+- The payload offsets are hand-written. `disk_etw::tests` pins the decoder
+  against synthetic records and rejects implausible ones; only
+  `integration::disk_trace_attributes_real_requests_to_the_issuing_process`
+  (ignored, needs elevation) proves them against live kernel events. Run it
+  after any Windows build that changes the provider.

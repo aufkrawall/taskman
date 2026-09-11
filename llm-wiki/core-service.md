@@ -33,7 +33,7 @@ contract.
 
 ## IPC and authorization
 
-- Protocol v3 uses `\\.\pipe\Taskman.Core.v1` with fixed 12-byte framed JSON.
+- Protocol v4 uses `\\.\pipe\Taskman.Core.v1` with fixed 12-byte framed JSON.
   Requests and responses are independently capped at 64 KiB; unknown request
   fields are rejected.
 - The pipe rejects remote clients and uses first-instance creation to prevent
@@ -103,7 +103,13 @@ file write, or dump path.
 The broker started with no telemetry endpoints. `ProcessNetworkCounters` was
 added deliberately in protocol v2; protocol v3 additionally carries bounded,
 identity-bound process security and module inspection needed by Process
-Properties. These reads are allowed for the same pinned GUI that already has
+Properties; protocol v4 adds `ProcessDiskCounters`, the same read-only shape
+for per-process disk service time (`win/disk_etw.rs`) for exactly the same
+reason — the disk trace is an ETW session and would otherwise force the whole
+GUI to run elevated to fill one column. Both counter endpoints take no
+parameters, can change nothing, drain or prune server-side against the
+service's own idea of which PIDs are live, are capped per response, and stop
+their trace on an idle watchdog once the GUI stops polling. These reads are allowed for the same pinned GUI that already has
 stronger process-control capabilities, and they remain narrow rather than
 becoming a generic cross-session query interface. The original network decision
 was based on:

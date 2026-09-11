@@ -11,6 +11,74 @@
 - 2026-09-08: Process Properties now summarizes mitigations with System Informer-style qualifiers (permanent DEP, high-entropy ASLR, prohibited/disabled wording, CF Guard and stack protection), and module inventory uses the authenticated LocalSystem broker for identity-bound SYSTEM/service inspection with bounded responses.
 # Recent Activity
 
+## 2026-09-11 — Disk attribution, cursor-anchored graph readout, byte units
+
+User report, five parts: only the CPU core tiles showed a hover value and its
+position was unreliable; the CPU graphs looked blurry; Ethernet was quoted in
+kbps; the Ethernet readout did not say which series was send and which
+receive; and nothing on Processes/Details identified the process behind the
+Performance page's disk Active time.
+
+**Readout.** `Response::on_hover_text` anchors its tooltip to the WIDGET rect,
+so on a 700 px chart it lands near a corner — and at a different corner per
+chart, which is what made it read as "only some graphs have this".
+`chart.rs::readout` paints on the tooltip layer at the pointer instead, with a
+colour swatch + name per series, the hovered sample's age and a vertical
+marker. Pinned headlessly by
+`chart::tests::hovering_paints_a_readout_next_to_the_cursor`, which asserts a
+new shape appears within 40 px of the cursor.
+
+**Blur.** Chart rects come out of egui layout at fractional point
+coordinates — the per-core grid's cell size is `(width - gaps) / columns` — so
+a 1 pt border straddled two device-pixel rows and `painter_at` clipped it at a
+fractional boundary. Frames are now `round_to_pixels`, hairlines
+`round_to_pixel_center`, and every hairline is exactly `1 / pixels_per_point`
+wide.
+
+**Disk attribution.** `IO_COUNTERS` cannot answer it (cache hits, sockets,
+named pipes in; paging I/O out), so `win/disk_etw.rs` enables
+`Microsoft-Windows-Kernel-Disk` and sums `HighResResponseTime` per process.
+Attribution is by `IssuingThreadId`, because disk events complete in whatever
+context the DPC ran in and their header PID is usually System; the session
+therefore also enables `Microsoft-Windows-Kernel-Process` thread events
+(keyword `0x20`, verified with `wevtutil gp`) and seeds a tid->pid map from a
+ToolHelp snapshot. Unmappable requests go to an unattributed remainder that
+stays in the share denominator. The provider's time unit is undocumented, so
+only ratios are ever published. Hosted by the broker at protocol v4, exactly
+like the network trace; `win/etw.rs` now owns the session plumbing both use.
+
+Free alongside it: `IO_COUNTERS` operation counts and `HardFaultCount` from
+the kernel table `cpu_load.rs` already reads every tick, exposed as
+`I/O operations/s` and `Hard faults/s` on Details. Offsets pinned against the
+`windows` crate's declared layout AND against a live table
+(`live_kernel_table_yields_plausible_io_counters`).
+
+Open: the `Kernel-Disk` payload offsets are proven only by
+`integration::disk_trace_attributes_real_requests_to_the_issuing_process`,
+which needs elevation. `--selfcheck` reports `process_disk_readings` and
+`process_disk_busiest_pct` so an elevated headless run shows whether
+attribution worked.
+
+**Hover index.** Drawing a marker on the sample the readout describes exposed
+a second bug: the index came from `t0 as f32 + frac * span as f32`, and
+timestamps are epoch milliseconds (~1.8e12) where one f32 step is ~131 s. The
+query time rounded to a fixed point regardless of the cursor, so the readout
+described a sample far from the pointer and its age just grew as newer samples
+arrived. `nearest_sample` does it in u64/f64 and rounds to the closer
+neighbour; verified on the real window (left edge of a 40 s history "vor 40 s",
+right edge "vor 8 s").
+
+**Link speed was 8x too high.** `NetworkInfo::link_bps` is BITS per second
+(`TransmitLinkSpeed`, Linux `sysfs` `speed`), but `format_mbit` multiplied by
+eight to convert bytes, so a gigabit adapter read "8000 MBit/s".
+`format_link_speed` takes bits.
+
+Also in this pass: Ethernet throughput moved to KB/s / MB/s everywhere except
+the negotiated link speed (now Gbps-aware); byte-rate charts scale to a
+rounded maximum instead of the raw peak, which used to rescale the whole curve
+every tick; and the Performance captions stopped hardcoding "60 seconds" while
+the graph window is a setting.
+
 ## 2026-09-09 — Hidden UWP hosts left Apps for Background
 
 User report: `SystemSettings.exe` with no visible window and

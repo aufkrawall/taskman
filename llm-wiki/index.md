@@ -1,6 +1,6 @@
 # llm-wiki Index
 
-Last cross-checked: 2026-09-08 (catalog entries; agent/template alignment)
+Last cross-checked: 2026-09-11 (disk attribution, chart readout)
 
 Primary sources:
 

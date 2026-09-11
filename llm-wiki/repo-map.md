@@ -1,6 +1,6 @@
 # Repo Map (code map)
 
-Last cross-checked: 2026-09-02
+Last cross-checked: 2026-09-11
 
 Primary sources:
 - workspace tree (verified against working tree)
@@ -51,9 +51,16 @@ platform boundary (`tm-core` ← `tm-platform` ← `tm-app` / `tm-service`):
     `startup.rs` (Run keys + Startup folders + StartupApproved incl. the
     folder-subkey fix and best-effort publisher resolution), `services.rs`,
     `users.rs`, `net_info.rs` (cached adapter/link/IP/SSID/signal metadata),
-    `net_etw.rs` (real-time ETW session for per-process network bytes; the
-    session name MUST stay fixed per role — a pid in it leaks an orphaned
-    session on every kill until the provider stops delivering events),
+    `etw.rs` (shared real-time-session plumbing: fixed per-role session names,
+    orphan reclamation, provider enabling, the `ProcessTrace` worker thread and
+    the handle-table id sanity check), `net_etw.rs` (per-process network bytes
+    from `Microsoft-Windows-Kernel-Network`; the session name MUST stay fixed
+    per role — a pid in it leaks an orphaned session on every kill until the
+    provider stops delivering events), `disk_etw.rs` (per-process DISK service
+    time from `Microsoft-Windows-Kernel-Disk`, attributed by `IssuingThreadId`
+    through a thread map seeded from ToolHelp and maintained by the
+    `Microsoft-Windows-Kernel-Process` thread events; a request whose thread
+    cannot be mapped is never charged to a row),
     `core_service.rs` (versioned authenticated named-pipe broker, including bounded identity-bound process-security/module reads for protected targets, plus secure
     SCM/Program Files/ProgramData install lifecycle, including pinned
     reparse/hard-link-resistant owner/group/DACL repair), `autostart.rs` (owned-command-
@@ -104,7 +111,8 @@ platform boundary (`tm-core` ← `tm-platform` ← `tm-app` / `tm-service`):
     rebuilds), `widgets/menu.rs` (classic full-width Windows-style
     context menus: uniform 28 px gapless rows, painted check gutter,
     submenus), `widgets/chart.rs` (timestamp-aware charts, kernel
-    overlay), `icon_cache.rs` (lazy worker, upload budget, bounded LRU),
+    overlay, pixel-snapped frames and the cursor-anchored hover readout),
+    `icon_cache.rs` (lazy worker, upload budget, bounded LRU),
     `fonts.rs` (async system-font load after first frame),
     `action_executor.rs`.
 - `crates/tm-service`
@@ -137,7 +145,10 @@ platform boundary (`tm-core` ← `tm-platform` ← `tm-app` / `tm-service`):
   per-process network stayed dark. See `log/recent.md` 2026-08-31.
 - `crates/tm-platform/src/win/perfcounters.rs` — PDH group lifecycle +
   GPU instance parsing (unit-tested real-world strings).
-- `crates/tm-platform/src/win/cpu_load.rs` — also the ONLY source of process
+- `crates/tm-platform/src/win/cpu_load.rs` — also the source of per-process
+  I/O operation counts and hard page faults (the same kernel table already
+  carries `IO_COUNTERS` and `HardFaultCount`, so they cost no extra query), and
+  the ONLY source of process
   identity and priority for the ~half of the process list that refuses
   `OpenProcess`: `start_epoch_of` and `base_priority` read the retained raw
   kernel table (never `LoadSample`, which needs two ticks to exist).

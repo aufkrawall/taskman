@@ -1,6 +1,6 @@
 # Current State
 
-Last cross-checked: 2026-09-02
+Last cross-checked: 2026-09-11
 
 ## Summary
 
@@ -14,6 +14,33 @@ correctness, table interaction, Performance visuals, and advanced process
 diagnostics; remaining telemetry and accessibility work is itemized precisely
 in `known-debt.md`. Normal GUI startup remains unelevated; privileged controls
 can cross a protected, allowlisted service boundary after one explicit install.
+
+## Recently landed (2026-09-11 — disk attribution, graph readout, network units)
+
+- **"Which process is causing the disk activity" is answerable.** The
+  Performance page's Active time had no counterpart on Processes/Details: the
+  I/O read/write columns are the kernel's `IO_COUNTERS`, which count cache
+  hits, sockets and named pipes and miss paging I/O entirely. A new
+  `Disk activity` column shows each process's share of the disk service time
+  actually spent, measured by `win/disk_etw.rs` from
+  `Microsoft-Windows-Kernel-Disk` and hosted by the broker (protocol v4) so an
+  unelevated GUI gets it. Details additionally offers `I/O operations/s` and
+  `Hard faults/s`, which need no session at all — both come from the same
+  `NtQuerySystemInformation` table the CPU accountant already reads.
+- **Every Performance graph has a value readout at the cursor.** egui's
+  `on_hover_text` anchors to the widget, so on a full-width chart the box
+  appeared near a corner and moved from graph to graph; `chart.rs` paints its
+  own on the tooltip layer at the pointer, with a colour swatch and name per
+  series, the sample's age, and a marker on the sample being read.
+- **Chart frames are pixel-snapped** (one physical pixel wide, rounded rects,
+  hairlines on pixel centres). The per-core grid was the visible case: its
+  cell size is `(width - gaps) / columns` and therefore always fractional.
+- **Ethernet reads in bytes.** Card, chart scale, readout and Receive/Send
+  stats use KB/s and MB/s; only the negotiated link speed stays in bits, now
+  switching to Gbps above 1000 Mbps. Byte-rate charts also scale to a rounded
+  maximum (`format::nice_rate_max`) so the scale stops moving every tick.
+- **Graph captions carry the configured window** instead of a hardcoded
+  "60 seconds" that was wrong at every other setting.
 
 ## Recently landed (2026-09-09 — native-aligned classification, service names, user identity)
 
