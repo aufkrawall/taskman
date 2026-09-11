@@ -550,6 +550,14 @@ rebase runbook.
   time-based graph windows whose x axis spans the CONFIGURED window
   (`chart::TimeAxis`) rather than the extent of the samples on hand, CPU
   Overall/Logical modes with kernel-times overlay.
+- Graphs reach the left edge of their axis. The axis opens at
+  `newest - window`, but samples land where the sampler ticked, so the
+  oldest sample INSIDE the window can be up to one interval short of that
+  edge — a fixed fraction of the chart, so a visible notch once the window
+  is wide. `visible_slice` therefore carries the one point just BEFORE the
+  window and `chart::x_on_axis` places it, with a SIGNED offset, left of the
+  rect; the painter clips the overhang and the hover readout clamps to
+  `first_on_axis` so it never locks onto it. See `log/recent.md` 2026-09-11.
 - Build: `build.py` release driver (host + Linux by default), profiles
   tuned for compile speed (thin LTO, parallel codegen, line-tables-only
   debuginfo).

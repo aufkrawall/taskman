@@ -15,11 +15,27 @@ use crate::widgets::chart::{
 use crate::widgets::menu;
 
 /// Time-based visible slice: every point whose timestamp lies inside the
-/// configured window (§14.3). Works identically at High/Normal/Low update
-/// speeds and with irregular gaps.
+/// configured window (§14.3), plus the one point just BEFORE it. Works
+/// identically at High/Normal/Low update speeds and with irregular gaps.
+///
+/// That leading point is what lets a chart paint its left edge. The x axis
+/// opens at `newest - window` (see `chart::TimeAxis`), but samples land
+/// wherever the sampler ticked, so the oldest sample INSIDE the window sits
+/// up to one full interval to the right of that edge — and a series that
+/// starts there begins with an unpainted wedge. The wedge is a fixed
+/// FRACTION of the axis, so it scales with the chart: a pixel on a card
+/// sparkline, a visible notch on a maximized Performance page. Carrying the
+/// straddling sample lets the polyline enter the chart at its true slope;
+/// `chart::x_on_axis` places it off the left edge and the painter clips the
+/// overhang.
 pub fn visible_slice(history: &[HistoryPoint], seconds: u32) -> &[HistoryPoint] {
+    &history[window_start(history, seconds).saturating_sub(1)..]
+}
+
+/// Index of the oldest point inside the window (0 when the history is empty).
+fn window_start(history: &[HistoryPoint], seconds: u32) -> usize {
     let Some(last) = history.last() else {
-        return &[];
+        return 0;
     };
     let cutoff = last.t_ms.saturating_sub(seconds as u64 * 1000);
     // Backward scan instead of `partition_point`: history is appended in
@@ -33,7 +49,7 @@ pub fn visible_slice(history: &[HistoryPoint], seconds: u32) -> &[HistoryPoint] 
     while start > 0 && history[start - 1].t_ms >= cutoff {
         start -= 1;
     }
-    &history[start..]
+    start
 }
 
 /// Human label for the graph window ("30 Sekunden"/"30 seconds", "2 min")
@@ -91,8 +107,33 @@ mod tests {
             .map(|t| pt(*t))
             .collect();
         assert_eq!(visible_slice(&irr, 60).len(), 4);
-        // Window of 10 s keeps only the last two.
-        assert_eq!(visible_slice(&irr, 10).len(), 2);
+        // Window of 10 s keeps the last two plus the straddling sample the
+        // charts need to paint their left edge.
+        assert_eq!(visible_slice(&irr, 10).len(), 3);
+    }
+
+    /// Regression: the graphs left an unpainted wedge at their left edge.
+    ///
+    /// The axis opens at `newest - window`, but samples land where the
+    /// sampler ticked; whenever the spacing does not divide the window the
+    /// oldest sample INSIDE it is short of that edge, and with nothing older
+    /// to draw from the series simply started late. The wedge is a fraction
+    /// of the axis, so it is invisible on a card sparkline and several pixels
+    /// wide on a maximized Performance page.
+    #[test]
+    fn the_window_carries_the_sample_before_the_left_edge() {
+        // 1.3 s spacing against a 10 s window: newest at 10 400 ms, so the
+        // axis opens at 400 ms and the oldest in-window sample is at 1 300.
+        let hist: Vec<HistoryPoint> = (0..=8).map(|i| pt(i * 1300)).collect();
+        let axis_start = hist.last().unwrap().t_ms - 10_000;
+        let win = visible_slice(&hist, 10);
+        assert!(
+            win.first().is_some_and(|p| p.t_ms < axis_start),
+            "nothing to paint the edge with: window starts at {:?}, axis at {axis_start}",
+            win.first().map(|p| p.t_ms)
+        );
+        // Exactly one: further points would only add clipped-away geometry.
+        assert_eq!(win.iter().filter(|p| p.t_ms < axis_start).count(), 1);
     }
 
     /// Regression: a wall-clock step BACKWARD (e.g. NTP correction after
@@ -382,6 +423,13 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
 
 // ---------------------------------------------------------------- cards
 
+/// Left inset of a resource card's mini graph.
+const CARD_PAD: f32 = 10.0;
+/// Vertical inset of the mini graph inside the 64 px card.
+const CARD_CHART_INSET: f32 = 8.0;
+/// Mini-graph width, in the same 1.55 aspect the cell has always had.
+const CARD_CHART_W: f32 = 74.0;
+
 fn card_ui(
     app: &mut TaskManApp,
     ui: &mut egui::Ui,
@@ -420,9 +468,15 @@ fn card_ui(
     }
 
     // Mini graph on the left, painted into the card rect.
+    //
+    // Sized against the text block beside it rather than by itself: title
+    // (17 px) over two 13 px lines occupy some 49 px of the 64 px card, and a
+    // 40 px cell next to that reads as a thumbnail of a graph rather than as
+    // the card's subject. The cell keeps its 1.55 aspect, so it grows in both
+    // directions and the curve inside it does not stretch.
     let chart_rect = egui::Rect::from_min_size(
-        Pos2::new(rect.left() + 10.0, rect.top() + 12.0),
-        egui::vec2(62.0, 40.0),
+        Pos2::new(rect.left() + CARD_PAD, rect.top() + CARD_CHART_INSET),
+        egui::vec2(CARD_CHART_W, rect.height() - 2.0 * CARD_CHART_INSET),
     );
     let color = resource_color(pal, e.kind);
     let cell_bg = if raised {
@@ -434,7 +488,7 @@ fn card_ui(
 
     // Text block: title / subtitle / value. Ellipsized — painter text is
     // drawn unclipped, so long adapter names would bleed past the card.
-    let tx = rect.left() + 84.0;
+    let tx = rect.left() + CARD_PAD + CARD_CHART_W + 12.0;
     let max_text_w = rect.right() - 8.0 - tx;
     let title_font = FontId::proportional(17.0);
     let small_font = FontId::proportional(13.0);

@@ -11,6 +11,40 @@
 - 2026-09-08: Process Properties now summarizes mitigations with System Informer-style qualifiers (permanent DEP, high-entropy ASLR, prohibited/disabled wording, CF Guard and stack protection), and module inventory uses the authenticated LocalSystem broker for identity-bound SYSTEM/service inspection with bounded responses.
 # Recent Activity
 
+## 2026-09-11 — Performance graphs did not reach their own left edge
+
+Reported as "resizing the window horizontally beyond some size leaves a gap
+on the left side of some graphs". The gap was always there; it is a fixed
+FRACTION of the axis, so it only becomes a visible notch once the chart is
+wide.
+
+The rolling charts anchor x to the CONFIGURED window (`chart::TimeAxis`):
+the axis opens at `newest - window`. Samples land wherever the sampler
+ticked, so unless the interval divides the window exactly, the oldest sample
+INSIDE the window sits short of that edge — up to one full interval, i.e. up
+to `interval / window` of the chart (~1.7 % at the 1 s / 60 s defaults, ~22
+px on a maximized page). `visible_slice` handed the charts only in-window
+points, so the series had nothing to draw the crossing segment from and
+simply started late. Card sparklines were unaffected (they space samples by
+index), which is why only "some graphs" showed it.
+
+Fix, in two halves that only work together:
+* `visible_slice` now also carries the one point just BEFORE the window.
+* `chart::x_on_axis` computes a SIGNED offset, so that lead-in point plots
+  LEFT of the rect and the segment entering the chart covers the edge at the
+  data's true slope. It used to `saturating_sub` onto the edge, which draws
+  the same picture as having no lead-in at all.
+
+The painter's clip rect trims the overhang. The hover readout must not lock
+onto the off-axis point (its marker would be clipped away, leaving a value
+with no marker), so both charts clamp the picked sample to
+`first_on_axis`, and the readout pin is now released against the axis start
+rather than against the oldest plotted sample.
+
+Same pass: the Performance cards' mini graphs went from 62x40 to 74x48 (same
+1.55 aspect, 8 px inset in the 64 px card) — a 40 px cell read as a
+thumbnail next to a text block of a 17 px title over two 13 px lines.
+
 ## 2026-09-11 — CI red again: a lint only the stable toolchain fires
 
 The winit-asset fix cleared the fork gate, and the same run then failed on

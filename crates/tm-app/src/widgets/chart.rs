@@ -360,6 +360,16 @@ fn paint_marker(
 
 /// x of sample `i` on `axis`, falling back to `fallback` (even spacing) when
 /// the chart has no axis, or the axis is short of that sample.
+///
+/// The offset is SIGNED. The plotted window carries one sample from just
+/// before the axis opens (`performance::visible_slice`), and it only earns
+/// its place if it lands LEFT of the rect: the segment from there to the
+/// first in-window sample is what covers the left edge, at the slope the
+/// data actually has. `saturating_sub` used to pin it onto the edge instead,
+/// which is the same picture as having no lead-in at all — a flat entry, and
+/// before that an unpainted wedge as wide as the first sample's offset. The
+/// painter's clip rect trims the overhang; the low clamp only keeps a
+/// pathological timestamp from tessellating a chart-wide mesh off-screen.
 fn x_on_axis(
     rect: Rect,
     axis: Option<TimeAxis>,
@@ -370,8 +380,23 @@ fn x_on_axis(
     let Some(((t0, span), stamp)) = bounds.zip(axis.and_then(|a| a.stamps.get(i).copied())) else {
         return fallback;
     };
-    let t = stamp.saturating_sub(t0);
-    rect.left() + rect.width() * (t as f32 / span as f32).clamp(0.0, 1.0)
+    // f64 throughout: these are epoch milliseconds (~1.8e12), where f32 cannot
+    // represent whole minutes (see `nearest_sample`).
+    let frac = (stamp as f64 - t0 as f64) / span as f64;
+    rect.left() + rect.width() * frac.clamp(-1.0, 1.0) as f32
+}
+
+/// Index of the first sample that lies ON the axis.
+///
+/// The lead-in sample from before the window (see [`x_on_axis`]) is there to
+/// give the polyline its entry slope, not to be pointed at: a readout locked
+/// onto it would paint its marker outside the chart's clip rect, i.e. report
+/// a value with no marker anywhere on the graph.
+fn first_on_axis(axis: Option<TimeAxis>, bounds: Option<(u64, u64)>) -> usize {
+    let (Some(a), Some((t0, _))) = (axis, bounds) else {
+        return 0;
+    };
+    a.stamps.iter().position(|&t| t >= t0).unwrap_or(0)
 }
 
 /// Index of the sample closest to `frac` of the way through the window.
@@ -448,20 +473,29 @@ fn pin_id(id: egui::Id) -> egui::Id {
 fn pinned_sample(
     ctx: &egui::Context,
     id: egui::Id,
-    timestamps_ms: Option<&[u64]>,
+    axis: Option<TimeAxis>,
+    bounds: Option<(u64, u64)>,
     pointer: Pos2,
     under_pointer: usize,
 ) -> usize {
     // A chart whose timestamp slice is short of its samples is already
     // degrading to even spacing (see `chart_multi`); leave it on that path
     // rather than pinning it to an instant that does not describe it.
-    let Some(ts) = timestamps_ms.filter(|ts| under_pointer < ts.len()) else {
+    let Some((ts, t0)) = axis
+        .map(|a| a.stamps)
+        .filter(|ts| under_pointer < ts.len())
+        .zip(bounds.map(|(t0, _)| t0))
+    else {
         return under_pointer;
     };
     let id = pin_id(id);
+    // Released against the axis rather than against `ts[0]`: the oldest
+    // plotted sample is the lead-in from BEFORE the axis, so holding the lock
+    // until it rolls past that would keep the marker one sample outside the
+    // chart for a tick.
     let held = ctx
         .data(|d| d.get_temp::<Pin>(id))
-        .filter(|pin| pin.pointer.distance(pointer) <= PIN_SLACK && pin.at_ms >= ts[0]);
+        .filter(|pin| pin.pointer.distance(pointer) <= PIN_SLACK && pin.at_ms >= t0);
     match held {
         Some(pin) => nearest_at(ts, pin.at_ms),
         None => {
@@ -635,11 +669,15 @@ pub fn core_chart(
 
     if let Some(pos) = hover_pos(ui, &response, rect) {
         let frac = ((pos.x - rect.left()) / rect.width()).clamp(0.0, 1.0);
+        let first = first_on_axis(axis, bounds);
         let idx = match (bounds, axis) {
             (Some((t0, span)), Some(a)) => nearest_sample(a.stamps, t0, span, frac),
             _ => ((frac * (n - 1) as f32).round() as usize).min(n - 1),
-        };
-        let idx = pinned_sample(ui.ctx(), response.id, axis.map(|a| a.stamps), pos, idx).min(n - 1);
+        }
+        .max(first);
+        let idx = pinned_sample(ui.ctx(), response.id, axis, bounds, pos, idx)
+            .max(first)
+            .min(n - 1);
         let mut rows = vec![ReadoutRow {
             color,
             label: label.to_owned(),
@@ -748,10 +786,11 @@ pub fn chart_multi(
         let frac = ((pos.x - rect.left()) / rect.width()).clamp(0.0, 1.0);
         // Time-proportional x: map the pointer TIME back to the nearest
         // sample — even-spacing math skips across sampling gaps.
+        let first = first_on_axis(axis, bounds);
         let time_idx = bounds
             .zip(axis)
-            .map(|((t0, span), a)| nearest_sample(a.stamps, t0, span, frac))
-            .map(|under| pinned_sample(ui.ctx(), response.id, axis.map(|a| a.stamps), pos, under));
+            .map(|((t0, span), a)| nearest_sample(a.stamps, t0, span, frac).max(first))
+            .map(|under| pinned_sample(ui.ctx(), response.id, axis, bounds, pos, under).max(first));
         let mut rows = Vec::with_capacity(series.len());
         let mut dots = Vec::with_capacity(series.len());
         let mut marker = None;
@@ -787,6 +826,34 @@ pub fn chart_multi(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Regression: a graph must reach the left edge of its own axis.
+    ///
+    /// The axis opens at `newest - window`, but samples land where the
+    /// sampler ticked, so the oldest sample inside the window is short of
+    /// that edge whenever the spacing does not divide the window. The window
+    /// therefore carries the sample just BEFORE it, and that sample has to
+    /// plot off the left edge for the segment entering the chart to cover it
+    /// — it used to saturate onto the edge, leaving the wedge unpainted.
+    #[test]
+    fn the_lead_in_sample_plots_left_of_the_chart() {
+        let rect = Rect::from_min_size(Pos2::new(100.0, 0.0), Vec2::new(600.0, 100.0));
+        // 1.3 s spacing, 10 s window: newest at 10 400 ms, axis opens at 400.
+        let stamps: Vec<u64> = (0..=8).map(|i| i * 1_300).collect();
+        let axis = TimeAxis::new(&stamps, 10);
+        let bounds = axis.bounds();
+        let at = |i: usize| x_on_axis(rect, Some(axis), bounds, i, f32::NAN);
+
+        assert!(at(0) < rect.left(), "lead-in pinned to the edge: {}", at(0));
+        // The lead-in stays ONE sample out, so the entering segment is short
+        // and steep rather than a flat run-up from far off-screen.
+        assert!(at(0) > rect.left() - rect.width() * 0.2);
+        // Everything else keeps its true position, right edge included.
+        assert!(at(1) > rect.left());
+        assert!((at(stamps.len() - 1) - rect.right()).abs() < 0.5);
+        // The hover readout must not lock onto the off-axis lead-in.
+        assert_eq!(first_on_axis(Some(axis), bounds), 1);
+    }
 
     /// A series longer than the shared timestamp slice must still paint.
     ///
@@ -944,6 +1011,17 @@ mod tests {
         assert_eq!(paint(pal.card_bg_sunken), pal.card_bg_sunken);
     }
 
+    /// [`pinned_sample`] against a window whose axis opens exactly on its
+    /// oldest stamp, which is what these tests are written around.
+    fn pin(ctx: &egui::Context, id: egui::Id, ts: &[u64], at: Pos2, under: usize) -> usize {
+        let span_ms = match (ts.first(), ts.last()) {
+            (Some(&first), Some(&last)) => last.saturating_sub(first),
+            _ => 0,
+        };
+        let axis = TimeAxis::new(ts, ((span_ms / 1_000) as u32).max(1));
+        pinned_sample(ctx, id, Some(axis), axis.bounds(), at, under)
+    }
+
     /// A motionless pointer must keep naming the sample it first pointed at,
     /// even as the window rolls that sample towards the left edge.
     ///
@@ -959,22 +1037,22 @@ mod tests {
 
         // Pointing at sample 7 of the first window locks onto t = 8000.
         let first = window(1_000);
-        assert_eq!(pinned_sample(&ctx, id, Some(&first), at, 7), 7);
+        assert_eq!(pin(&ctx, id, &first, at, 7), 7);
 
         // Two ticks later the same screen position sits over sample 9, but
         // t = 8000 has rolled back to index 5 — and that is what the readout
         // must keep reporting.
         let rolled = window(3_000);
-        assert_eq!(pinned_sample(&ctx, id, Some(&rolled), at, 9), 5);
+        assert_eq!(pin(&ctx, id, &rolled, at, 9), 5);
 
         // Moving the pointer re-picks, and locks onto the new sample.
         let moved = Pos2::new(160.0, 40.0);
-        assert_eq!(pinned_sample(&ctx, id, Some(&rolled), moved, 9), 9);
-        assert_eq!(pinned_sample(&ctx, id, Some(&window(5_000)), moved, 9), 7);
+        assert_eq!(pin(&ctx, id, &rolled, moved, 9), 9);
+        assert_eq!(pin(&ctx, id, &window(5_000), moved, 9), 7);
 
         // Sub-pixel jitter is not "moving".
         let jitter = Pos2::new(moved.x + 0.4, moved.y);
-        assert_eq!(pinned_sample(&ctx, id, Some(&window(5_000)), jitter, 9), 7);
+        assert_eq!(pin(&ctx, id, &window(5_000), jitter, 9), 7);
     }
 
     /// A pin whose sample has rolled off the left edge is released, and a
@@ -987,17 +1065,17 @@ mod tests {
         let window = |t0: u64| -> Vec<u64> { (0..10).map(|i| t0 + i * 1_000).collect() };
 
         let first = window(1_000);
-        assert_eq!(pinned_sample(&ctx, id, Some(&first), at, 2), 2); // t = 3000
+        assert_eq!(pin(&ctx, id, &first, at, 2), 2); // t = 3000
         // The window has moved past t = 3000 entirely: fall back to the
         // sample under the pointer instead of clamping to the oldest one.
-        assert_eq!(pinned_sample(&ctx, id, Some(&window(20_000)), at, 6), 6);
+        assert_eq!(pin(&ctx, id, &window(20_000), at, 6), 6);
 
-        assert_eq!(pinned_sample(&ctx, egui::Id::new("no-ts"), None, at, 4), 4);
-        // Fewer timestamps than samples keeps the even-spacing fallback.
         assert_eq!(
-            pinned_sample(&ctx, egui::Id::new("short"), Some(&[1, 2]), at, 7),
-            7
+            pinned_sample(&ctx, egui::Id::new("no-ts"), None, None, at, 4),
+            4
         );
+        // Fewer timestamps than samples keeps the even-spacing fallback.
+        assert_eq!(pin(&ctx, egui::Id::new("short"), &[1, 2], at, 7), 7);
     }
 
     /// Leaving the chart drops the lock, so coming back re-reads the graph
@@ -1008,7 +1086,7 @@ mod tests {
         let id = egui::Id::new("rolling-chart");
         let at = Pos2::new(120.0, 40.0);
         let ts: Vec<u64> = (0..10).map(|i| 1_000 + i * 1_000).collect();
-        assert_eq!(pinned_sample(&ctx, id, Some(&ts), at, 7), 7);
+        assert_eq!(pin(&ctx, id, &ts, at, 7), 7);
         assert!(ctx.data(|d| d.get_temp::<Pin>(pin_id(id))).is_some());
 
         ctx.data_mut(|d| d.remove::<Pin>(pin_id(id)));
