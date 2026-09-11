@@ -111,7 +111,9 @@ platform boundary (`tm-core` ← `tm-platform` ← `tm-app` / `tm-service`):
     `widgets/tablekit.rs` (TM-style
     tables: drag-start-width resize math, O(1) layout, `scrolled_rows`
     virtualization with identity-keyed scroll anchoring across model
-    rebuilds), `widgets/menu.rs` (classic full-width Windows-style
+    rebuilds, opt-in header drag-to-reorder via `reorderable`/`take_reorder`,
+    and `numeric_indices` — the ONLY correct way to lay out the shared
+    aggregate row, which tables of different column counts disagree on), `widgets/menu.rs` (classic full-width Windows-style
     context menus: uniform 28 px gapless rows, painted check gutter,
     submenus), `widgets/chart.rs` (timestamp-aware charts, kernel
     overlay, pixel-snapped frames and the cursor-anchored hover readout),

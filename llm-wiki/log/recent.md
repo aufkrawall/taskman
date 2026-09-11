@@ -11,6 +11,34 @@
 - 2026-09-08: Process Properties now summarizes mitigations with System Informer-style qualifiers (permanent DEP, high-entropy ASLR, prohibited/disabled wording, CF Guard and stack protection), and module inventory uses the authenticated LocalSystem broker for identity-bound SYSTEM/service inspection with bounded responses.
 # Recent Activity
 
+## 2026-09-11 — Draggable Processes columns (and the crash that came with them)
+
+The Processes page's numeric columns can now be dragged into any order in the
+header, persisted under `[columns.processes.order]`. `tablekit` gained an
+opt-in gesture (`TmTable::reorderable(range)` + `take_reorder`) so the page
+owns its ordering; the drag source lives in egui context memory because the
+table is rebuilt every frame while the pointer is down, and the drop slot is
+CLAMPED into the reorderable range rather than rejected, so dragging left past
+Name parks at the first movable slot.
+
+Name and Status are pinned deliberately: `heat_cells` paints the blue band as
+one contiguous span and the Name cell owns the tree chevron.
+
+The important internal rule: `RowData::values`/`heat` stay in a fixed LOGICAL
+order and `State::sort_col` is a logical index. Only the UI layer knows the
+user's permutation (`State::value_order`), so dragging a column never
+re-sorts the table and never disturbs the aggregation, caching or tests.
+
+Two defects surfaced while wiring it:
+
+* `sort_entries` matched columns 1..=5 by hand, so sorting by Disk activity or
+  GPU — added after that match was written — silently fell through to sorting
+  by NAME. Replaced by an arm over every value column.
+* Widening `Aggregates::strings` to six machine totals CRASHED the Users page:
+  its auto-fit loop wrote `fit[i + 2]` per total, and Users has four numeric
+  columns in a six-column table. Both tabs now zip against
+  `TmTable::numeric_indices`, which cannot overrun in either direction.
+
 ## 2026-09-11 — Identity of the processes that will not open
 
 User report: Process Properties showed `Path: —` for `BackgroundDownload.exe`,
