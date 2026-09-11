@@ -22,6 +22,9 @@ impl TelemetryDemand {
     pub const TOKEN_SECURITY: Self = Self(1 << 7);
     /// CPU current-speed PDH counter (Performance page only).
     pub const CPU_SPEED: Self = Self(1 << 8);
+    /// ETW per-process disk trace (the Disk activity column on the Processes
+    /// and Details pages).
+    pub const PROCESS_DISK: Self = Self(1 << 9);
 
     /// Union.
     pub fn union(self, other: Self) -> Self {
@@ -71,6 +74,7 @@ impl TelemetryDemand {
             .union(Self::PROCESS_GPU)
             .union(Self::PROCESS_GPU_MEMORY)
             .union(Self::CPU_SPEED)
+            .union(Self::PROCESS_DISK)
     }
 }
 
@@ -115,11 +119,12 @@ mod tests {
             ("PROCESS_GPU_MEMORY", TelemetryDemand::PROCESS_GPU_MEMORY),
             ("TOKEN_SECURITY", TelemetryDemand::TOKEN_SECURITY),
             ("CPU_SPEED", TelemetryDemand::CPU_SPEED),
+            ("PROCESS_DISK", TelemetryDemand::PROCESS_DISK),
         ] {
             assert!(all.wants(bit), "all() is missing {name}");
         }
         // Every bit and nothing beyond the declared ones.
-        assert_eq!(all.bits().count_ones(), 9);
+        assert_eq!(all.bits().count_ones(), 10);
         assert!(all.any_gpu());
     }
 }

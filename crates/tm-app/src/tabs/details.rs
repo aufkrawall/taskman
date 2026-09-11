@@ -108,6 +108,9 @@ pub enum ColumnId {
     IoTotal,
     IoRead,
     IoWrite,
+    DiskActivity,
+    IoOps,
+    HardFaults,
     CommandLine,
 }
 
@@ -163,6 +166,12 @@ impl ColumnId {
                 .unwrap_or(CmpOrdering::Equal),
             ColumnId::IoRead => a.disk_read_total.cmp(&b.disk_read_total),
             ColumnId::IoWrite => a.disk_write_total.cmp(&b.disk_write_total),
+            ColumnId::DiskActivity => cmp_option_f64(
+                a.disk_active_pct.map(f64::from),
+                b.disk_active_pct.map(f64::from),
+            ),
+            ColumnId::IoOps => cmp_option_f64(a.io_ops_per_s, b.io_ops_per_s),
+            ColumnId::HardFaults => cmp_option_f64(a.hard_faults_per_s, b.hard_faults_per_s),
             ColumnId::CommandLine => {
                 cmp_option_str(a.command_line.as_deref(), b.command_line.as_deref())
             }
@@ -353,6 +362,9 @@ impl ColSpec {
             ColumnId::IoTotal => io_total_label(),
             ColumnId::IoRead => i18n::tr(K::ColIoRead),
             ColumnId::IoWrite => i18n::tr(K::ColIoWrite),
+            ColumnId::DiskActivity => i18n::tr(K::ColDiskActivity),
+            ColumnId::IoOps => i18n::tr(K::ColIoOps),
+            ColumnId::HardFaults => i18n::tr(K::ColHardFaults),
             ColumnId::CommandLine => "Command line",
         }
     }
@@ -520,6 +532,21 @@ const COLUMNS: &[ColSpec] = &[
         default_visible: false,
     },
     ColSpec {
+        cid: ColumnId::DiskActivity,
+        col: || TmColumn::num("diskactivity", i18n::tr(K::ColDiskActivity), 150.0),
+        default_visible: false,
+    },
+    ColSpec {
+        cid: ColumnId::IoOps,
+        col: || TmColumn::num("ioops", i18n::tr(K::ColIoOps), 140.0),
+        default_visible: false,
+    },
+    ColSpec {
+        cid: ColumnId::HardFaults,
+        col: || TmColumn::num("hardfaults", i18n::tr(K::ColHardFaults), 150.0),
+        default_visible: false,
+    },
+    ColSpec {
         cid: ColumnId::CommandLine,
         col: || TmColumn::text("commandline", "Command line", 360.0),
         default_visible: false,
@@ -579,6 +606,12 @@ impl State {
                     | ColumnId::GpuShared
             )
         })
+    }
+
+    /// The per-process disk ETW session is as expensive as the network one,
+    /// so Details asks for it only while the column that needs it is visible.
+    pub fn requires_disk_telemetry(&self) -> bool {
+        self.visible.contains(&ColumnId::DiskActivity)
     }
 
     /// Per-process network ETW is relatively expensive, so Details requests
@@ -876,6 +909,9 @@ pub struct Row {
     pub io_total_s: String,
     pub io_read_s: String,
     pub io_write_s: String,
+    pub disk_activity_s: String,
+    pub io_ops_s: String,
+    pub hard_faults_s: String,
     pub command_line_s: String,
 }
 
@@ -914,6 +950,9 @@ impl Row {
             ColumnId::IoTotal => &self.io_total_s,
             ColumnId::IoRead => &self.io_read_s,
             ColumnId::IoWrite => &self.io_write_s,
+            ColumnId::DiskActivity => &self.disk_activity_s,
+            ColumnId::IoOps => &self.io_ops_s,
+            ColumnId::HardFaults => &self.hard_faults_s,
             ColumnId::CommandLine => &self.command_line_s,
         }
     }
@@ -1561,6 +1600,9 @@ fn cid_is_numeric(cid: ColumnId) -> bool {
             | ColumnId::IoTotal
             | ColumnId::IoRead
             | ColumnId::IoWrite
+            | ColumnId::DiskActivity
+            | ColumnId::IoOps
+            | ColumnId::HardFaults
     )
 }
 
@@ -1586,6 +1628,22 @@ fn priority_label(p: PriorityClass) -> &'static str {
 
 fn opt_u64_bytes(v: Option<u64>) -> String {
     v.map(format::format_k).unwrap_or_else(|| "—".into())
+}
+
+/// A per-second count: grouped integer above one, one decimal below, and an
+/// em dash when the platform could not measure it at all.
+fn opt_per_second(v: Option<f64>) -> String {
+    let Some(v) = v.filter(|v| v.is_finite()) else {
+        return "—".into();
+    };
+    let v = v.max(0.0);
+    if v >= 1.0 {
+        format::format_thousands(v.round() as u64)
+    } else if v > 0.0 {
+        format::num_fixed(v, 1)
+    } else {
+        "0".into()
+    }
 }
 
 fn build_rows(
@@ -1870,6 +1928,12 @@ fn row_from_process(p: &ProcessEntry, depth: usize, children: bool) -> Row {
         io_total_s: format::format_rate(process_io_total_rate(p)),
         io_read_s: format::format_bytes_loc(p.disk_read_total),
         io_write_s: format::format_bytes_loc(p.disk_write_total),
+        disk_activity_s: p
+            .disk_active_pct
+            .map(format::format_pct_cell)
+            .unwrap_or_else(|| "—".into()),
+        io_ops_s: opt_per_second(p.io_ops_per_s),
+        hard_faults_s: opt_per_second(p.hard_faults_per_s),
         command_line_s: p.command_line.clone().unwrap_or_else(|| "—".into()),
     }
 }
@@ -3200,6 +3264,29 @@ fn process_properties_statistics(ui: &mut egui::Ui, process: &ProcessEntry) {
                 format::format_bytes_loc(process.disk_write_total),
                 false,
             );
+            // What the process actually costs the DISKS, next to the byte
+            // counters above that count cache hits too.
+            property_row(
+                ui,
+                i18n::tr(K::ColDiskActivity),
+                process
+                    .disk_active_pct
+                    .map(format::format_pct_cell)
+                    .unwrap_or_else(|| "\u{2014}".into()),
+                false,
+            );
+            property_row(
+                ui,
+                i18n::tr(K::ColIoOps),
+                opt_per_second(process.io_ops_per_s),
+                false,
+            );
+            property_row(
+                ui,
+                i18n::tr(K::ColHardFaults),
+                opt_per_second(process.hard_faults_per_s),
+                false,
+            );
             property_row(
                 ui,
                 i18n::tr(K::PropNetworkReceive),
@@ -3703,6 +3790,56 @@ mod tests {
         assert!(!state.requires_network_telemetry());
     }
 
+    /// Disk-pressure columns must say "unknown" when the platform could not
+    /// measure them. A zero here would read as "this process touched no disk",
+    /// which is the exact failure mode the columns exist to fix.
+    #[test]
+    fn disk_pressure_columns_render_unknown_as_a_dash() {
+        let mut p = ProcessEntry::new(100, "quiet.exe");
+        p.disk_active_pct = None;
+        p.io_ops_per_s = None;
+        p.hard_faults_per_s = None;
+        let row = row_from_process(&p, 0, false);
+        assert_eq!(row.field(ColumnId::DiskActivity), "—");
+        assert_eq!(row.field(ColumnId::IoOps), "—");
+        assert_eq!(row.field(ColumnId::HardFaults), "—");
+
+        // A measured zero is a different answer and prints as one.
+        p.disk_active_pct = Some(0.0);
+        p.io_ops_per_s = Some(0.0);
+        p.hard_faults_per_s = Some(0.0);
+        let row = row_from_process(&p, 0, false);
+        assert_eq!(row.field(ColumnId::DiskActivity), "0 %");
+        assert_eq!(row.field(ColumnId::IoOps), "0");
+        assert_eq!(row.field(ColumnId::HardFaults), "0");
+
+        p.disk_active_pct = Some(42.5);
+        p.io_ops_per_s = Some(1_234.4);
+        p.hard_faults_per_s = Some(0.4);
+        let row = row_from_process(&p, 0, false);
+        assert!(row.field(ColumnId::DiskActivity).ends_with('%'));
+        assert_eq!(row.field(ColumnId::IoOps), format::format_thousands(1_234));
+        assert_eq!(row.field(ColumnId::HardFaults), format::num_fixed(0.4, 1));
+    }
+
+    /// The ETW disk session is only worth running while its column is on
+    /// screen, exactly like the network one.
+    #[test]
+    fn disk_telemetry_is_requested_only_for_its_own_column() {
+        let mut state = State {
+            visible: [ColumnId::Name, ColumnId::Cpu].into_iter().collect(),
+            ..Default::default()
+        };
+        assert!(!state.requires_disk_telemetry());
+        state.set_visible(ColumnId::DiskActivity, true);
+        assert!(state.requires_disk_telemetry());
+        // The two counters that come from the kernel table need no session.
+        state.set_visible(ColumnId::DiskActivity, false);
+        state.set_visible(ColumnId::IoOps, true);
+        state.set_visible(ColumnId::HardFaults, true);
+        assert!(!state.requires_disk_telemetry());
+    }
+
     /// The dump file name must be sortable and must never collide, which
     /// makes the date arithmetic load-bearing rather than cosmetic.
     #[test]
@@ -4096,6 +4233,18 @@ mod tests {
                 ColumnId::IoWrite => {
                     a.disk_write_total = 1;
                     b.disk_write_total = 2;
+                }
+                ColumnId::DiskActivity => {
+                    a.disk_active_pct = Some(1.0);
+                    b.disk_active_pct = Some(2.0);
+                }
+                ColumnId::IoOps => {
+                    a.io_ops_per_s = Some(10.0);
+                    b.io_ops_per_s = Some(20.0);
+                }
+                ColumnId::HardFaults => {
+                    a.hard_faults_per_s = Some(1.0);
+                    b.hard_faults_per_s = Some(2.0);
                 }
                 ColumnId::CommandLine => {
                     a.command_line = Some("a".into());

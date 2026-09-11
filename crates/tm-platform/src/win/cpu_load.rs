@@ -99,15 +99,30 @@ struct ProcRaw {
     /// Image base name from the kernel table (empty when unparseable).
     /// Remembered for processes that exit so their CPU churn can be named.
     name: Box<str>,
+    /// Hard page faults since process start — faults served from DISK.
+    /// `None` when the record was too short to carry the field.
+    hard_faults: Option<u64>,
+    /// Read + write + other I/O operation counts since process start.
+    io_ops: Option<u64>,
 }
 
 /// Per-process load for one sampling window.
+///
+/// CPU plus the two disk-pressure rates, because all three come out of the
+/// SAME kernel table: reading them here costs nothing beyond a few more
+/// offsets, while a separate PDH/`GetProcessIoCounters` path would add a
+/// per-process query per tick and would still miss the protected processes
+/// no handle can be opened for.
 #[derive(Debug, Clone, Copy)]
 pub struct ProcCpu {
     /// Share of total machine capacity in [0, 100].
     pub pct: f32,
     /// Absolute user+kernel time since process start, 100 ns units.
     pub total_time_100ns: u64,
+    /// I/O operations per second over this window (read + write + other).
+    pub io_ops_per_s: Option<f64>,
+    /// Hard page faults per second over this window.
+    pub hard_faults_per_s: Option<f64>,
 }
 
 /// One executable image observed among the processes that terminated
@@ -462,6 +477,9 @@ impl CpuLoadAccountant {
             let peak_working_set = read_usize(buf, pos + off.peak_working_set) as u64;
             let working_set = read_usize(buf, pos + off.working_set) as u64;
             let commit = read_usize(buf, pos + off.commit) as u64;
+            let hard_faults = (pos + off.hard_faults + 4 <= record_end)
+                .then(|| u64::from(read_u32(buf, pos + off.hard_faults)));
+            let io_ops = read_io_operation_count(buf, pos, record_end, &off);
             let buf_base = buf.as_ptr() as usize;
             let name = parse_image_name(buf, buf_base, pos, written, &off);
 
@@ -488,6 +506,8 @@ impl CpuLoadAccountant {
                         peak_working_set,
                         commit,
                         name,
+                        hard_faults,
+                        io_ops,
                     },
                 );
             }
@@ -499,6 +519,28 @@ impl CpuLoadAccountant {
         self.suspended = suspended;
         Some(map)
     }
+}
+
+/// Sum of the three `IO_COUNTERS` operation counts, or `None` when this
+/// record does not reach the block.
+///
+/// Operation counts and not transfer counts: the question these answer is
+/// "how much work did this process hand the storage stack", and a disk's
+/// active time tracks the number of requests far better than their size.
+fn read_io_operation_count(
+    buf: &[u8],
+    pos: usize,
+    record_end: usize,
+    off: &Offsets,
+) -> Option<u64> {
+    let base = pos.checked_add(off.io_counters)?;
+    if base.checked_add(IO_COUNTERS_BYTES)? > record_end {
+        return None;
+    }
+    let read = nonneg(read_i64(buf, base));
+    let write = nonneg(read_i64(buf, base + 8));
+    let other = nonneg(read_i64(buf, base + 16));
+    Some(read.saturating_add(write).saturating_add(other))
 }
 
 const THREAD_STATE_WAITING: u32 = 5;
@@ -550,6 +592,8 @@ fn process_suspended(
 /// export the layout, so it is addressed manually; the field order has been
 /// stable since Vista and matches Process Hacker's definition.
 struct Offsets {
+    /// HardFaultCount, inside the crate's `Reserved1` blob.
+    hard_faults: usize,
     create_time: usize,
     user_time: usize,
     kernel_time: usize,
@@ -564,8 +608,17 @@ struct Offsets {
     peak_working_set: usize,
     working_set: usize,
     commit: usize,
+    /// Start of the trailing `IO_COUNTERS` block (six `LARGE_INTEGER`s:
+    /// read/write/other operation counts, then read/write/other transfer
+    /// counts). Present on every Windows this program supports, but read
+    /// only when the record actually reaches that far — a short record means
+    /// unknown, never zero.
+    io_counters: usize,
     min_size: usize,
 }
+
+/// Size of the `IO_COUNTERS` block at [`Offsets::io_counters`].
+const IO_COUNTERS_BYTES: usize = 48;
 
 impl Offsets {
     const fn get() -> Self {
@@ -576,8 +629,9 @@ impl Offsets {
             // ImageName@56 (UNICODE_STRING, 16 B: Length@56, Buffer@64),
             // BasePriority@72, UniqueProcessId@80, InheritedFrom@88,
             // HandleCount@96, SessionId@100, PeakWorkingSet@136, WorkingSet@144,
-            // PagefileUsage@184.
+            // PagefileUsage@184, PrivatePageCount@200, IO_COUNTERS@208.
             Self {
+                hard_faults: 16,
                 create_time: 32,
                 user_time: 40,
                 kernel_time: 48,
@@ -590,11 +644,13 @@ impl Offsets {
                 peak_working_set: 136,
                 working_set: 144,
                 commit: 184,
+                io_counters: 208,
                 min_size: 192,
             }
         } else {
             // Same order, pointer-sized handles/pointers.
             Self {
+                hard_faults: 16,
                 create_time: 32,
                 user_time: 40,
                 kernel_time: 48,
@@ -607,6 +663,10 @@ impl Offsets {
                 peak_working_set: 100,
                 working_set: 104,
                 commit: 124,
+                // PagefileUsage@124, PeakPagefileUsage@128,
+                // PrivatePageCount@132, then IO_COUNTERS on its 8-byte
+                // alignment.
+                io_counters: 136,
                 min_size: 132,
             }
         }
@@ -664,11 +724,27 @@ fn build_sample(
                 ProcCpu {
                     pct: 0.0,
                     total_time_100ns: 0,
+                    io_ops_per_s: None,
+                    hard_faults_per_s: None,
                 },
             );
             continue;
         }
         let total_now = nonneg(cur.kernel) + nonneg(cur.user);
+        let previous = prev
+            .procs
+            .get(&pid)
+            .filter(|p| p.create_time == cur.create_time);
+        // Rates need a previous sample of the SAME process: the accumulators
+        // run since process start, so charging a newborn's total to one window
+        // would invent a rate no disk ever served. Unknown stays unknown.
+        let rate = |now: Option<u64>, before: fn(&ProcRaw) -> Option<u64>| -> Option<f64> {
+            let now = now?;
+            let before = previous.and_then(before)?;
+            (dt_s > 0.0).then(|| now.saturating_sub(before) as f64 / dt_s)
+        };
+        let io_ops_per_s = rate(cur.io_ops, |p| p.io_ops);
+        let hard_faults_per_s = rate(cur.hard_faults, |p| p.hard_faults);
         let in_window = match prev.procs.get(&pid) {
             // Same identity: the delta since the previous sample.
             Some(p) if p.create_time == cur.create_time => {
@@ -689,6 +765,8 @@ fn build_sample(
             ProcCpu {
                 pct: capacity(in_window),
                 total_time_100ns: total_now,
+                io_ops_per_s,
+                hard_faults_per_s,
             },
         );
     }
@@ -966,6 +1044,46 @@ mod tests {
             offset_of!(SYSTEM_PROCESS_INFORMATION, SessionId)
         );
         assert!(off.min_size >= offset_of!(SYSTEM_PROCESS_INFORMATION, SessionId) + 4);
+        assert_eq!(
+            off.hard_faults,
+            offset_of!(SYSTEM_PROCESS_INFORMATION, Reserved1) + 8,
+            "HardFaultCount sits inside the crate's Reserved1 blob"
+        );
+        // The crate models the trailing IO_COUNTERS block as `Reserved7`.
+        assert_eq!(
+            off.io_counters,
+            offset_of!(SYSTEM_PROCESS_INFORMATION, Reserved7)
+        );
+        assert_eq!(
+            IO_COUNTERS_BYTES,
+            std::mem::size_of_val(&SYSTEM_PROCESS_INFORMATION::default().Reserved7)
+        );
+    }
+
+    /// The I/O and hard-fault counters must be REAL on a live machine: every
+    /// desktop has processes doing I/O, and a wrong offset would either read
+    /// garbage or hand every row the same number. Hard faults are allowed to
+    /// be zero everywhere (a machine with no memory pressure), the operation
+    /// counts are not.
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn live_kernel_table_yields_plausible_io_counters() {
+        let mut acc = CpuLoadAccountant::new();
+        let procs = acc.query_procs().expect("NtQuerySystemInformation");
+        assert!(procs.len() > 10, "implausibly small process table");
+        let with_ops = procs.values().filter(|p| p.io_ops.unwrap_or(0) > 0).count();
+        assert!(
+            with_ops >= 5,
+            "only {with_ops} processes report I/O operations - offset is probably wrong"
+        );
+        // Nothing may report an absurd count: the field is a LARGE_INTEGER and
+        // a misaligned read would produce values far beyond any real workload.
+        for p in procs.values() {
+            let ops = p.io_ops.unwrap_or(0);
+            assert!(ops < 1 << 50, "{} reports {ops} I/O operations", p.name);
+            let faults = p.hard_faults.unwrap_or(0);
+            assert!(faults < 1 << 40, "{} reports {faults} hard faults", p.name);
+        }
     }
 
     /// Session ids come from the same kernel table for the same reason base
@@ -1153,6 +1271,8 @@ mod tests {
             peak_working_set: 0,
             commit: 0,
             name: name.into(),
+            hard_faults: None,
+            io_ops: None,
         }
     }
 

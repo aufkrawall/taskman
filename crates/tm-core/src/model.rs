@@ -362,6 +362,38 @@ pub struct ProcessEntry {
     pub disk_read_total: u64,
     pub disk_write_total: u64,
 
+    /// Share of the machine's measured disk SERVICE TIME this process caused
+    /// in the last window, in percent.
+    ///
+    /// This is the column that answers "who is making Active time 100 %".
+    /// `disk_read_bps`/`disk_write_bps` cannot: they come from the kernel's
+    /// per-process I/O byte counters, which count cache hits, named pipes and
+    /// sockets, and miss paging I/O entirely — a process reading a cached file
+    /// in a loop tops that column while the disk is idle, and a process
+    /// thrashing the page file barely appears. Measured from disk events, so
+    /// it is `None` (rendered "—") wherever those are unavailable.
+    #[serde(default)]
+    pub disk_active_pct: Option<f32>,
+    /// Bytes per second this process actually moved to or from a physical
+    /// disk, as measured at the disk, not at the file API.
+    #[serde(default)]
+    pub disk_phys_read_bps: Option<f64>,
+    #[serde(default)]
+    pub disk_phys_write_bps: Option<f64>,
+
+    /// I/O operations per second (reads + writes + other). Operation COUNT,
+    /// not bytes: a disk's active time is driven by how many requests are
+    /// outstanding, so a process issuing many small I/Os costs far more disk
+    /// time than one streaming the same bytes sequentially.
+    #[serde(default)]
+    pub io_ops_per_s: Option<f64>,
+    /// Hard page faults per second — page faults that had to be served from
+    /// disk. They never appear in the I/O byte counters, and on a
+    /// memory-pressured machine they are the largest single source of disk
+    /// activity.
+    #[serde(default)]
+    pub hard_faults_per_s: Option<f64>,
+
     /// Per-process network rates; None where the platform cannot measure them.
     pub net_recv_bps: Option<f64>,
     pub net_sent_bps: Option<f64>,
@@ -448,6 +480,11 @@ impl ProcessEntry {
             disk_write_bps: 0.0,
             disk_read_total: 0,
             disk_write_total: 0,
+            disk_active_pct: None,
+            disk_phys_read_bps: None,
+            disk_phys_write_bps: None,
+            io_ops_per_s: None,
+            hard_faults_per_s: None,
             net_recv_bps: None,
             net_sent_bps: None,
             net_recv_total: None,

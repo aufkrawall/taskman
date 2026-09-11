@@ -705,3 +705,60 @@ fn module_unload_releases_one_reference_per_explicit_request() {
 
     cleanup(&mut child);
 }
+
+/// Diagnostic (run elevated): proves the hand-written `Microsoft-Windows-
+/// Kernel-Disk` payload offsets against REAL kernel events.
+///
+/// The synthetic unit tests in `win::disk_etw` pin the decoder against a
+/// payload this repository wrote itself; only a live trace can show that the
+/// layout matches what Windows actually emits. The assertion that matters is
+/// that requests get ATTRIBUTED: a wrong `IssuingThreadId` offset still
+/// produces events, it just sends every one of them to the unattributed
+/// remainder.
+#[cfg(target_os = "windows")]
+#[test]
+#[ignore = "needs elevation and live disk traffic"]
+fn disk_trace_attributes_real_requests_to_the_issuing_process() {
+    let Some(usage) = tm_platform::win::disk_etw_test_start() else {
+        eprintln!("could not start a trace (not elevated?)");
+        return;
+    };
+    let live = tm_platform::win::live_pids_for_test();
+    // Read a large, certainly-uncached file: the OS image is the one file
+    // every Windows machine has and nothing else is reading right now.
+    let mut victim = std::path::PathBuf::from(std::env::var_os("SystemRoot").unwrap());
+    victim.push(r"System32\ntoskrnl.exe");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let mut window = usage.take_window(&live);
+    while std::time::Instant::now() < deadline {
+        let _ = std::fs::read(&victim);
+        window = usage.take_window(&live);
+        if !window.procs.is_empty() {
+            break;
+        }
+    }
+    let total = window.total_service_time();
+    eprintln!(
+        "window {} ms: {} processes, {} service time ({} unattributed)",
+        window.since_ms,
+        window.procs.len(),
+        total,
+        window.unattributed_service_time
+    );
+    let busiest = window
+        .procs
+        .iter()
+        .max_by_key(|(_, d)| d.service_time)
+        .map(|(pid, d)| (*pid, d.ops, d.read_bytes, d.write_bytes));
+    eprintln!("busiest = {busiest:?}");
+    assert!(total > 0, "the trace received no disk events at all");
+    assert!(
+        !window.procs.is_empty(),
+        "every request went unattributed - the IssuingThreadId offset is wrong"
+    );
+    let attributed: u64 = window.procs.values().map(|d| d.service_time).sum();
+    assert!(
+        attributed * 2 >= total,
+        "most disk time was unattributable: {attributed} of {total}"
+    );
+}

@@ -44,6 +44,16 @@ use crate::theme;
 use crate::widgets::menu;
 use crate::widgets::tablekit::{self, Aggregates, HeatCell, TmColumn};
 
+/// Numeric value columns: CPU, Memory, Disk, Network, Disk activity. They
+/// start at table column 2 and their order IS the order of [`RowData::values`].
+const VALUE_COLS: usize = 5;
+
+/// Index of the Network column inside `values` — the one column whose value
+/// can be genuinely unknown per row.
+const NET_VALUE: usize = 3;
+/// Index of the Disk activity column inside `values`; likewise optional.
+const DISK_ACT_VALUE: usize = 4;
+
 fn columns() -> Vec<TmColumn> {
     vec![
         TmColumn::text("name", i18n::tr(K::ColName), 340.0),
@@ -54,6 +64,10 @@ fn columns() -> Vec<TmColumn> {
         // Windows supplies this lazily from the per-process ETW source.
         // Missing telemetry still renders as an honest "—", never fake zero.
         TmColumn::num("net", i18n::tr(K::ColNetwork), 110.0),
+        // Which process is actually keeping the disks busy. The Disk column
+        // next to it counts I/O BYTES the process asked for, cache hits
+        // included; this one is its share of the time the disks really spent.
+        TmColumn::num("diskact", i18n::tr(K::ColDiskActivity), 150.0),
     ]
 }
 
@@ -85,13 +99,17 @@ pub struct RowData {
     /// rows contain only themselves. Other process actions keep
     /// using the normal selection model and are deliberately unaffected.
     termination_targets: Vec<crate::app::ProcessIdentity>,
-    /// cpu %, mem bytes, disk bps, net bps (aggregated over the display subtree).
-    pub values: [f64; 4],
+    /// cpu %, mem bytes, disk bps, net bps, disk-activity % (aggregated over
+    /// the display subtree).
+    pub values: [f64; VALUE_COLS],
     /// Per-column heat intensity normalized against the WHOLE display model
     /// before virtualization (audit P0.2): exactly 1.0 marks the column's
     /// top consumer.
-    pub heat: [f32; 4],
+    pub heat: [f32; VALUE_COLS],
     pub net_available: bool,
+    /// False while the per-process disk trace is not running. Rendered "—";
+    /// a zero here would claim the process touched no disk.
+    pub disk_available: bool,
     pub status: ProcStatus,
     /// True when the OS reports this process as power throttled
     /// (Efficiency mode) — rendered straight from the snapshot, never from
@@ -739,7 +757,12 @@ fn prepare_auto_fit_widths(
             format::format_mb(row.values[1] as u64),
             format::format_rate_mb(row.values[2]),
             if row.net_available {
-                format::format_process_net_rate(row.values[3])
+                format::format_process_net_rate(row.values[NET_VALUE])
+            } else {
+                "—".to_string()
+            },
+            if row.disk_available {
+                format::format_pct_cell(row.values[DISK_ACT_VALUE].min(100.0) as f32)
             } else {
                 "—".to_string()
             },
@@ -867,7 +890,12 @@ fn row_ui(
         format::format_mb(row.values[1] as u64),
         format::format_rate_mb(row.values[2]),
         if row.net_available {
-            format::format_process_net_rate(row.values[3])
+            format::format_process_net_rate(row.values[NET_VALUE])
+        } else {
+            "—".to_string()
+        },
+        if row.disk_available {
+            format::format_pct_cell(row.values[DISK_ACT_VALUE].min(100.0) as f32)
         } else {
             "—".to_string()
         },
@@ -880,7 +908,12 @@ fn row_ui(
     table.heat_cells(ui, pal, rect, 2, &cells);
     let net_tip = (!row.net_available)
         .then(|| unavailable_network_tip(ui, table, rect))
-        .flatten();
+        .flatten()
+        .or_else(|| {
+            (!row.disk_available)
+                .then(|| unavailable_disk_tip(ui, table, rect))
+                .flatten()
+        });
 
     if resp.clicked() {
         if row.synthetic {
@@ -943,10 +976,41 @@ fn unavailable_network_tip(
     table: &tablekit::TmTable,
     rect: egui::Rect,
 ) -> Option<&'static str> {
-    let cell = table.col_rect(5, rect);
+    cell_tip(
+        ui,
+        table,
+        rect,
+        2 + NET_VALUE,
+        i18n::tr(K::NetPerProcessUnavailable),
+    )
+}
+
+/// Why the Disk activity cell reads "—": the same ETW session requirement the
+/// network column has.
+fn unavailable_disk_tip(
+    ui: &egui::Ui,
+    table: &tablekit::TmTable,
+    rect: egui::Rect,
+) -> Option<&'static str> {
+    cell_tip(
+        ui,
+        table,
+        rect,
+        2 + DISK_ACT_VALUE,
+        i18n::tr(K::NetPerProcessUnavailable),
+    )
+}
+
+fn cell_tip(
+    ui: &egui::Ui,
+    table: &tablekit::TmTable,
+    rect: egui::Rect,
+    column: usize,
+    text: &'static str,
+) -> Option<&'static str> {
+    let cell = table.col_rect(column, rect);
     let pointer = ui.ctx().pointer_latest_pos()?;
-    cell.contains(pointer)
-        .then_some(i18n::tr(K::NetPerProcessUnavailable))
+    cell.contains(pointer).then_some(text)
 }
 
 /// Width the status glyph strip needs; also the auto-fit contribution when
@@ -1394,7 +1458,7 @@ fn sort_blocks_globally(rows: &mut Vec<DisplayRow>, sort_col: usize, ascending: 
             }
         }
     }
-    let vi = sort_col - 2; // columns cpu/mem/disk/net map onto values[0..=3]
+    let vi = (sort_col - 2).min(VALUE_COLS - 1); // value columns start at table column 2
     blocks.sort_by(|a, b| {
         let (Some(DisplayRow::Process(x)), Some(DisplayRow::Process(y))) = (a.first(), b.first())
         else {
@@ -1481,8 +1545,8 @@ fn application_family<'a>(
 /// Not the subtree aggregate: a family may now leave foreign descendants
 /// outside itself, and those are rendered as their own rows. Counting them in
 /// the group row too would show the same load twice.
-fn family_values(members: &[&ProcessEntry]) -> [f64; 4] {
-    let mut total = [0.0f64; 4];
+fn family_values(members: &[&ProcessEntry]) -> [f64; VALUE_COLS] {
+    let mut total = [0.0f64; VALUE_COLS];
     for member in members {
         for (slot, value) in total.iter_mut().zip(own_values(member)) {
             *slot += value;
@@ -1561,7 +1625,7 @@ fn emit_flat_with_family_groups(
         family_heads.insert(head, run);
     }
 
-    let mut repr: HashMap<u32, [f64; 4]> = HashMap::with_capacity(members.len());
+    let mut repr: HashMap<u32, [f64; VALUE_COLS]> = HashMap::with_capacity(members.len());
     for p in members {
         if let Some(fam) = family_heads.get(&p.pid) {
             repr.insert(p.pid, family_values(fam));
@@ -1581,6 +1645,7 @@ fn emit_flat_with_family_groups(
             let net_available = fam
                 .iter()
                 .any(|member| member.net_recv_bps.is_some() || member.net_sent_bps.is_some());
+            let disk_available = fam.iter().any(|member| disk_known(member));
             out.push(DisplayRow::Process(RowData {
                 pid: p.pid,
                 start_epoch_s: p.start_epoch_s,
@@ -1597,9 +1662,10 @@ fn emit_flat_with_family_groups(
                     .filter(|member| !member.synthetic)
                     .map(|member| process_identity(member))
                     .collect(),
-                values: repr.get(&p.pid).copied().unwrap_or([0.0; 4]),
-                heat: [0.0; 4],
+                values: repr.get(&p.pid).copied().unwrap_or([0.0; VALUE_COLS]),
+                heat: [0.0; VALUE_COLS],
                 net_available,
+                disk_available,
                 status: if fam
                     .iter()
                     .any(|member| member.status == ProcStatus::NotResponding)
@@ -1946,23 +2012,33 @@ fn is_system_boundary(name: &str) -> bool {
     tm_core::classify::is_core_os_image(name)
 }
 
+/// A cell whose value is unknown must not colour the heat band, and must not
+/// pull the column's maximum either.
+fn value_known(d: &RowData, i: usize) -> bool {
+    match i {
+        NET_VALUE => d.net_available,
+        DISK_ACT_VALUE => d.disk_available,
+        _ => true,
+    }
+}
+
 fn normalize_heat(rows: &mut [DisplayRow]) {
-    let mut max = [0.0f64; 4];
+    let mut max = [0.0f64; VALUE_COLS];
     for r in rows.iter() {
         let DisplayRow::Process(d) = r else { continue };
         for (i, v) in d.values.iter().enumerate() {
-            if !(i == 3 && !d.net_available) {
+            if value_known(d, i) {
                 max[i] = max[i].max(*v);
             }
         }
     }
     for r in rows.iter_mut() {
         let DisplayRow::Process(d) = r else { continue };
-        for (i, v) in d.values.iter().enumerate() {
-            d.heat[i] = if i == 3 && !d.net_available {
-                0.0
+        for i in 0..VALUE_COLS {
+            d.heat[i] = if value_known(d, i) {
+                tablekit::norm(d.values[i], max[i])
             } else {
-                tablekit::norm(*v, max[i])
+                0.0
             };
         }
     }
@@ -1982,8 +2058,9 @@ fn make_flat_row(p: &ProcessEntry) -> DisplayRow {
         aggregate: false,
         termination_targets: vec![process_identity(p)],
         values: own_values(p),
-        heat: [0.0; 4],
+        heat: [0.0; VALUE_COLS],
         net_available: p.net_recv_bps.is_some() || p.net_sent_bps.is_some(),
+        disk_available: disk_known(p),
         status: p.status,
         power_throttled: p.power_throttled == Some(true),
         synthetic: p.synthetic,
@@ -1992,13 +2069,21 @@ fn make_flat_row(p: &ProcessEntry) -> DisplayRow {
 }
 
 /// The process's own resource values (no subtree aggregation).
-fn own_values(p: &ProcessEntry) -> [f64; 4] {
+fn own_values(p: &ProcessEntry) -> [f64; VALUE_COLS] {
     [
         p.cpu_pct as f64,
         p.mem_bytes as f64,
         p.disk_read_bps + p.disk_write_bps,
         p.net_recv_bps.unwrap_or(0.0) + p.net_sent_bps.unwrap_or(0.0),
+        // Shares of one measured total, so summing them over a display subtree
+        // is exactly as meaningful as summing the rates above.
+        f64::from(p.disk_active_pct.unwrap_or(0.0)),
     ]
+}
+
+/// Whether the per-process disk trace produced a value for this process.
+fn disk_known(p: &ProcessEntry) -> bool {
+    p.disk_active_pct.is_some()
 }
 
 /// Flat Background/Windows row: plain name, own values, no expand handle.
@@ -2016,8 +2101,9 @@ fn make_own_row(p: &ProcessEntry, depth: usize) -> DisplayRow {
         aggregate: false,
         termination_targets: vec![process_identity(p)],
         values: own_values(p),
-        heat: [0.0; 4],
+        heat: [0.0; VALUE_COLS],
         net_available: p.net_recv_bps.is_some() || p.net_sent_bps.is_some(),
+        disk_available: disk_known(p),
         status: p.status,
         power_throttled: p.power_throttled == Some(true),
         synthetic: p.synthetic,
@@ -2128,6 +2214,7 @@ fn emit_tree<'a>(
         let net_available = members
             .iter()
             .any(|member| member.net_recv_bps.is_some() || member.net_sent_bps.is_some());
+        let disk_available = members.iter().any(|member| disk_known(member));
         out.push(DisplayRow::Process(RowData {
             pid: root.pid,
             start_epoch_s: root.start_epoch_s,
@@ -2145,8 +2232,9 @@ fn emit_tree<'a>(
                 .map(|member| process_identity(member))
                 .collect(),
             values: family_values(&members),
-            heat: [0.0; 4],
+            heat: [0.0; VALUE_COLS],
             net_available,
+            disk_available,
             status: subtree.status(root.pid),
             power_throttled: subtree.efficiency(root.pid),
             synthetic: false,
@@ -2218,7 +2306,7 @@ fn emit_expanded_tree_members<'a>(
 /// Per-pid subtree rollups shared by every Processes row builder.
 struct Subtree {
     /// cpu %, mem bytes, disk bps, net bps summed over the display subtree.
-    values: HashMap<u32, [f64; 4]>,
+    values: HashMap<u32, [f64; VALUE_COLS]>,
     /// True when the process OR any of its display descendants runs in
     /// efficiency mode. A collapsed `Brave Browser (24)` row summarizes its
     /// children's resources, so it must summarize their power state too —
@@ -2246,14 +2334,20 @@ fn subtree_rollups<'a>(
     all: &[&'a ProcessEntry],
     children: &HashMap<u32, Vec<&'a ProcessEntry>>,
 ) -> Subtree {
-    let mut out: HashMap<u32, [f64; 4]> = HashMap::with_capacity(all.len());
+    let mut out: HashMap<u32, [f64; VALUE_COLS]> = HashMap::with_capacity(all.len());
     let mut eco: HashMap<u32, bool> = HashMap::with_capacity(all.len());
     let mut statuses: HashMap<u32, ProcStatus> = HashMap::with_capacity(all.len());
     let by_pid: HashMap<u32, &'a ProcessEntry> = all.iter().map(|p| (p.pid, *p)).collect();
 
     enum Frame<'b> {
         Enter(u32),
-        Combine(u32, Vec<&'b ProcessEntry>, [f64; 4], bool, ProcStatus),
+        Combine(
+            u32,
+            Vec<&'b ProcessEntry>,
+            [f64; VALUE_COLS],
+            bool,
+            ProcStatus,
+        ),
     }
     let mut done: HashSet<u32> = HashSet::with_capacity(all.len());
     let mut in_progress: HashSet<u32> = HashSet::with_capacity(all.len());
@@ -2268,7 +2362,7 @@ fn subtree_rollups<'a>(
                 Frame::Combine(pid, kids, mut acc, mut throttled, mut status) => {
                     for k in &kids {
                         if let Some(v) = out.get(&k.pid) {
-                            for i in 0..4 {
+                            for i in 0..VALUE_COLS {
                                 acc[i] += v[i];
                             }
                             throttled |= eco.get(&k.pid).copied().unwrap_or(false);
@@ -2344,7 +2438,12 @@ fn subtree_rollups<'a>(
     }
 }
 
-fn sort_entries(v: &mut [&ProcessEntry], col: usize, asc: bool, subtree: &HashMap<u32, [f64; 4]>) {
+fn sort_entries(
+    v: &mut [&ProcessEntry],
+    col: usize,
+    asc: bool,
+    subtree: &HashMap<u32, [f64; VALUE_COLS]>,
+) {
     let sv = |p: &ProcessEntry, i: usize| subtree.get(&p.pid).map_or(0.0, |s| s[i]);
     v.sort_by(|a, b| {
         let o = match col {
@@ -2964,7 +3063,7 @@ mod tests {
             &empty,
             &groups,
         );
-        let heat: Vec<[f32; 4]> = rows
+        let heat: Vec<[f32; VALUE_COLS]> = rows
             .iter()
             .filter_map(|r| match r {
                 DisplayRow::Process(d) => Some(d.heat),
@@ -3060,6 +3159,90 @@ mod tests {
             },
             "—"
         );
+    }
+
+    /// The whole point of the Disk activity column: it must come from the
+    /// measured share, NOT from the I/O byte counters next to it. A process
+    /// reading a cached file all day tops the Disk column while causing no
+    /// disk activity at all.
+    #[test]
+    fn disk_activity_is_independent_of_the_io_byte_counters() {
+        let mut cached = proc(11, None, "cache-reader", ProcCategory::Background);
+        cached.disk_read_bps = 500.0 * 1024.0 * 1024.0;
+        cached.disk_active_pct = Some(0.0);
+        let mut pager = proc(12, None, "page-thrasher", ProcCategory::Background);
+        pager.disk_read_bps = 0.0;
+        pager.disk_write_bps = 0.0;
+        pager.disk_active_pct = Some(93.0);
+
+        let rows = build_display_rows(
+            &snap_of(vec![cached, pager]),
+            "",
+            0,
+            true,
+            &HashSet::new(),
+            &[false; 3],
+        );
+        let by_pid: HashMap<u32, RowData> = rows
+            .iter()
+            .filter_map(|row| match row {
+                DisplayRow::Process(row) => Some((row.pid, row.clone())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(by_pid[&11].values[DISK_ACT_VALUE], 0.0);
+        assert_eq!(by_pid[&12].values[DISK_ACT_VALUE], 93.0);
+        // ...and the heat band marks the process that is really busy.
+        assert!(by_pid[&12].heat[DISK_ACT_VALUE] > by_pid[&11].heat[DISK_ACT_VALUE]);
+        assert!(
+            by_pid[&11].heat[2] > by_pid[&12].heat[2],
+            "Disk column unchanged"
+        );
+    }
+
+    /// Without the ETW session the column is unknown, and unknown must render
+    /// as "—" with no heat — never as a zero that reads like a measurement.
+    #[test]
+    fn missing_disk_activity_renders_unavailable_not_zero() {
+        let mut p = proc(9, None, "no-disk-trace", ProcCategory::Background);
+        p.disk_active_pct = None;
+        let mut q = proc(10, None, "busy", ProcCategory::Background);
+        q.disk_active_pct = None;
+        q.disk_read_bps = 1.0;
+        let rows = build_display_rows(
+            &snap_of(vec![p, q]),
+            "",
+            0,
+            true,
+            &HashSet::new(),
+            &[false; 3],
+        );
+        for row in &rows {
+            let DisplayRow::Process(d) = row else {
+                continue;
+            };
+            assert!(!d.disk_available);
+            assert_eq!(d.heat[DISK_ACT_VALUE], 0.0);
+        }
+        // A measured zero is a different answer and stays available.
+        let mut measured = proc(11, None, "idle", ProcCategory::Background);
+        measured.disk_active_pct = Some(0.0);
+        let rows = build_display_rows(
+            &snap_of(vec![measured]),
+            "",
+            0,
+            true,
+            &HashSet::new(),
+            &[false; 3],
+        );
+        let d = rows
+            .iter()
+            .find_map(|row| match row {
+                DisplayRow::Process(row) => Some(row.clone()),
+                _ => None,
+            })
+            .unwrap();
+        assert!(d.disk_available, "measured zero must not read as unknown");
     }
 
     #[test]

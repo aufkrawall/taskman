@@ -78,6 +78,25 @@ pub fn run(mock: bool) -> i32 {
             .iter()
             .filter(|p| p.net_recv_bps.is_some())
             .count(),
+        // Same idea for the disk trace: how many processes carry a measured
+        // share of disk service time, and how much of that share the busiest
+        // one holds. A run with readings but a flat zero everywhere means the
+        // events arrived and none of them could be attributed.
+        "process_disk_readings": snap
+            .processes
+            .iter()
+            .filter(|p| p.disk_active_pct.is_some())
+            .count(),
+        "process_disk_busiest_pct": snap
+            .processes
+            .iter()
+            .filter_map(|p| p.disk_active_pct)
+            .fold(f32::NAN, f32::max),
+        "process_io_ops_readings": snap
+            .processes
+            .iter()
+            .filter(|p| p.io_ops_per_s.is_some())
+            .count(),
         "uptime_s": snap.system.uptime_s,
     });
     println!("{summary}");

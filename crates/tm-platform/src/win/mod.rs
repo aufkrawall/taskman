@@ -5,6 +5,8 @@ mod autostart;
 pub mod core_service;
 mod cpu_info;
 pub(crate) mod cpu_load;
+mod disk_etw;
+mod etw;
 mod explorer_restart;
 mod gpu;
 pub mod icons;
@@ -20,6 +22,14 @@ mod net_info;
 #[doc(hidden)]
 pub fn net_etw_test_start() -> Option<net_etw::NetworkUsage> {
     net_etw::NetworkUsage::start(net_etw::TraceRole::App)
+}
+
+/// Test-only handle into the ETW disk trace, so an integration test can prove
+/// the payload offsets against real kernel events rather than only synthetic
+/// ones.
+#[doc(hidden)]
+pub fn disk_etw_test_start() -> Option<disk_etw::DiskUsage> {
+    disk_etw::DiskUsage::start(etw::TraceRole::App)
 }
 
 #[doc(hidden)]

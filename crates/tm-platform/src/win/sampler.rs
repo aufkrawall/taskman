@@ -11,8 +11,8 @@
 
 use crate::win::cpu_load::{CpuLoadAccountant, LoadSample};
 use crate::win::{
-    core_service, cpu_info, gpu, memory_info, net_etw, net_info, perfcounters, process_ops,
-    threads_map, version, windows_enum,
+    core_service, cpu_info, disk_etw, gpu, memory_info, net_etw, net_info, perfcounters,
+    process_ops, threads_map, version, windows_enum,
 };
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
@@ -132,6 +132,7 @@ pub struct Sampler {
     /// Previous cumulative per-process byte counters, keyed by identity so a
     /// recycled PID cannot inherit a dead process's totals.
     prev_proc_net: HashMap<u32, ProcNetSample>,
+    disk_source: DiskSource,
 }
 
 /// Where per-process network counters come from.
@@ -155,6 +156,17 @@ enum NetSource {
 
 /// How long to wait before re-probing after both sources failed.
 const NET_SOURCE_RETRY: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Where per-process DISK activity comes from. Same three-way choice, and for
+/// the same reason, as [`NetSource`]: the trace needs privileges the GUI
+/// deliberately does not have, so the protected service hosts it and the GUI's
+/// own token is only the fallback for an elevated run without a service.
+enum DiskSource {
+    Undecided,
+    Broker,
+    Local(disk_etw::DiskUsage),
+    Unavailable { since: Instant },
+}
 
 /// One process's cumulative network counters at the previous tick.
 #[derive(Debug, Clone, Copy)]
@@ -197,6 +209,7 @@ impl Sampler {
             last_load: None,
             pseudo: PseudoRowHold::default(),
             net_source: NetSource::Undecided,
+            disk_source: DiskSource::Undecided,
             prev_proc_net: HashMap::new(),
         }
     }
@@ -395,6 +408,92 @@ impl Sampler {
             );
         }
         self.prev_proc_net = next;
+    }
+
+    /// One drained disk window for this tick, or `None` when the answer is
+    /// genuinely unknown.
+    fn disk_window(&mut self, live: &HashSet<u32>) -> Option<disk_etw::DiskWindow> {
+        if !self.demand.wants(TelemetryDemand::PROCESS_DISK) {
+            // Dropping a local session here stops it and joins its consumer.
+            self.disk_source = DiskSource::Undecided;
+            return None;
+        }
+        if let DiskSource::Unavailable { since } = &self.disk_source {
+            if since.elapsed() < NET_SOURCE_RETRY {
+                return None;
+            }
+            self.disk_source = DiskSource::Undecided;
+        }
+        if matches!(self.disk_source, DiskSource::Undecided) {
+            self.disk_source = probe_disk_source();
+        }
+        match &self.disk_source {
+            DiskSource::Broker => match core_service::brokered_process_disk() {
+                core_service::BrokeredDisk::Sample(sample) if sample.active => {
+                    Some(disk_sample_to_window(sample))
+                }
+                // The service is there but its own trace failed: unknown.
+                core_service::BrokeredDisk::Sample(_) => None,
+                other => {
+                    if let core_service::BrokeredDisk::Rejected(detail) = &other {
+                        tracing::warn!(%detail, "broker refused disk counters");
+                    }
+                    self.disk_source = DiskSource::Unavailable {
+                        since: Instant::now(),
+                    };
+                    None
+                }
+            },
+            DiskSource::Local(usage) => Some(usage.take_window(live)),
+            _ => None,
+        }
+    }
+
+    /// Fill per-process disk activity from the drained ETW window.
+    ///
+    /// `disk_active_pct` is the process's share of the disk service time the
+    /// machine actually spent, which is what the Performance page's "Active
+    /// time" is made of. It is deliberately NOT derived from
+    /// `disk_read_bps`/`disk_write_bps`: those are the kernel's per-process
+    /// I/O byte counters, which count cache hits and miss paging I/O, so the
+    /// process at the top of that column is routinely not the one keeping the
+    /// disk busy.
+    ///
+    /// Every live process gets a value while the trace runs — a process that
+    /// issued nothing really did cause zero disk time — and every process
+    /// keeps `None` while it does not.
+    fn apply_process_disk(&mut self, processes: &mut [ProcessEntry]) {
+        let live: HashSet<u32> = processes.iter().map(|p| p.pid).collect();
+        let Some(window) = self.disk_window(&live) else {
+            return;
+        };
+        // The first window after a trace starts covers the microseconds
+        // between starting it and asking, and the probe tick drains one of
+        // those. Shares from it would be a single request and rates from it
+        // would be absurd, so report unknown for that one tick.
+        const MIN_WINDOW_MS: u64 = 100;
+        if window.since_ms < MIN_WINDOW_MS {
+            return;
+        }
+        let total = window.total_service_time();
+        let seconds = window.since_ms as f64 / 1000.0;
+        for process in processes.iter_mut() {
+            if process.synthetic {
+                continue;
+            }
+            let disk = window.procs.get(&process.pid).copied().unwrap_or_default();
+            // A window with no measured disk time at all says "nothing used a
+            // disk", which is a 0 % share for everyone, not a division by zero.
+            process.disk_active_pct = Some(if total == 0 {
+                0.0
+            } else {
+                (disk.service_time as f64 / total as f64 * 100.0).clamp(0.0, 100.0) as f32
+            });
+            if seconds > 0.0 {
+                process.disk_phys_read_bps = Some(disk.read_bytes as f64 / seconds);
+                process.disk_phys_write_bps = Some(disk.write_bytes as f64 / seconds);
+            }
+        }
     }
 }
 
@@ -615,6 +714,12 @@ impl Sampler {
                 .cpu_load
                 .peak_working_set_of(pid_u, entry.start_epoch_s);
             entry.cpu_time_s = pc.map(|c| c.total_time_100ns as f64 / 10_000_000.0);
+            // The honest disk-pressure pair, straight from the same kernel
+            // table as the CPU times: how many requests this process issued,
+            // and how many of its page faults had to come off a disk. The byte
+            // counters below cannot answer either question.
+            entry.io_ops_per_s = pc.and_then(|c| c.io_ops_per_s);
+            entry.hard_faults_per_s = pc.and_then(|c| c.hard_faults_per_s);
             entry.disk_read_bps = du.read_bytes as f64 / interval_s;
             entry.disk_write_bps = du.written_bytes as f64 / interval_s;
             entry.disk_read_total = du.total_read_bytes;
@@ -780,6 +885,7 @@ impl Sampler {
         // Runs after the process list is final so pruning sees exactly the
         // live PIDs, and after categories so synthetic rows can be skipped.
         self.apply_process_network(&mut processes, interval_s);
+        self.apply_process_disk(&mut processes);
 
         // ---- CPU attribution pseudo-rows ------------------------------------------
         // The per-core accumulators see ALL busy time; live processes cannot
@@ -1089,6 +1195,62 @@ fn probe_net_source() -> (NetSource, Option<HashMap<u32, net_etw::PidBytes>>) {
                 None,
             ),
         },
+    }
+}
+
+/// Probe both disk sources once. Unlike the network probe this does not keep
+/// a first sample: the disk answer DRAINS its window, and the very first one
+/// covers the microseconds since the session started.
+fn probe_disk_source() -> DiskSource {
+    match core_service::brokered_process_disk() {
+        core_service::BrokeredDisk::Sample(_) => DiskSource::Broker,
+        // An explicit refusal is a policy decision; do not route around it.
+        core_service::BrokeredDisk::Rejected(detail) => {
+            tracing::warn!(%detail, "broker refused disk counters");
+            DiskSource::Unavailable {
+                since: Instant::now(),
+            }
+        }
+        // No service (or one too old to know the request): fall back to our
+        // own token, which only works when elevated.
+        core_service::BrokeredDisk::Unavailable => {
+            match disk_etw::DiskUsage::start(super::etw::TraceRole::App) {
+                Some(usage) => DiskSource::Local(usage),
+                None => DiskSource::Unavailable {
+                    since: Instant::now(),
+                },
+            }
+        }
+    }
+}
+
+fn disk_sample_to_window(sample: core_service::ProcessDiskSample) -> disk_etw::DiskWindow {
+    let attributed: u64 = sample
+        .entries
+        .iter()
+        .fold(0u64, |acc, entry| acc.saturating_add(entry.service_time));
+    disk_etw::DiskWindow {
+        // The service reports the FULL denominator, including the requests it
+        // could not charge to a live process and any entries its response cap
+        // truncated. Reconstructing it from the entries alone would inflate
+        // every share on a busy machine.
+        unattributed_service_time: sample.total_service_time.saturating_sub(attributed),
+        procs: sample
+            .entries
+            .into_iter()
+            .map(|entry| {
+                (
+                    entry.pid,
+                    disk_etw::PidDisk {
+                        service_time: entry.service_time,
+                        read_bytes: entry.read_bytes,
+                        write_bytes: entry.write_bytes,
+                        ops: entry.ops,
+                    },
+                )
+            })
+            .collect(),
+        since_ms: sample.window_ms,
     }
 }
 

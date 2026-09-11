@@ -411,6 +411,13 @@ keys! {
         "Netzwerk pro Prozess benötigt Administratorrechte (ETW-Sitzung).",
         "Per-process network needs administrator rights (ETW session)."
     ],
+    ColDiskActivity => ["Datenträgeraktivität", "Disk activity"],
+    ColIoOps => ["E/A-Vorgänge/s", "I/O operations/s"],
+    ColHardFaults => ["Harte Seitenfehler/s", "Hard faults/s"],
+    DiskActivityTooltip => [
+        "Anteil dieses Prozesses an der gemessenen Zugriffszeit der Datenträger. Gemessen an den Datenträgerereignissen selbst - nicht an den E/A-Bytes, die auch aus dem Cache bedient werden.",
+        "This process's share of the disks' measured busy time. Measured from the disk events themselves - not from the I/O byte counters, which also count reads the cache served."
+    ],
     RenderModeLabel => ["Grafikausgabe:", "Graphics:"],
     RenderAuto => ["Automatisch", "Automatic"],
     RenderCompat => ["Kompatibilität (OpenGL)", "Compatibility (OpenGL)"],

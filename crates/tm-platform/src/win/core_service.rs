@@ -58,10 +58,11 @@ pub const GUI_EXE_NAME: &str = "taskman.exe";
 pub const SERVICE_LOG_FILE_PREFIX: &str = "taskman-service.log";
 // v2 added `ProcessNetworkCounters`; v3 adds identity-bound module
 // inventory so an unelevated GUI can inspect SYSTEM/service processes through
-// its authenticated LocalSystem broker. Version bumps are deliberate: an old
-// service fails the handshake as unavailable, allowing the GUI's safe local
+// its authenticated LocalSystem broker; v4 adds `ProcessDiskCounters`, the
+// same read-only shape for disk service time. Version bumps are deliberate: an
+// old service fails the handshake as unavailable, allowing the GUI's safe local
 // fallback instead of misclassifying an unknown request as a rejection.
-pub const PROTOCOL_VERSION: u16 = 3;
+pub const PROTOCOL_VERSION: u16 = 4;
 
 const PIPE_NAME: &str = r"\\.\pipe\Taskman.Core.v1";
 const FRAME_MAGIC: [u8; 4] = *b"TMB1";
@@ -177,6 +178,8 @@ enum BrokerRequest {
     },
     /// Read-only per-process network counters (see [`ProcessNetworkSample`]).
     ProcessNetworkCounters,
+    /// Read-only per-process disk activity (see [`ProcessDiskSample`]).
+    ProcessDiskCounters,
 }
 
 /// Cumulative per-process network bytes as answered by the broker.
@@ -203,6 +206,37 @@ pub struct ProcessNetworkEntry {
     pub sent: u64,
 }
 
+/// Per-process disk activity for ONE measurement window, as answered by the
+/// broker. Same shape and the same rules as [`ProcessNetworkSample`]:
+/// * `active` separates "the trace runs, so a missing process touched no disk"
+///   from "no trace, the answer is unknown" — unknown must never render as
+///   zero.
+/// * the window is DRAINED by each answer, so `window_ms` states what the
+///   numbers cover instead of leaving the caller to guess at the boundaries.
+/// * `service_time` is in the disk provider's own units and is only ever used
+///   as a ratio against `total_service_time`; see `win::disk_etw`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProcessDiskSample {
+    pub active: bool,
+    /// Length of the drained window in milliseconds.
+    pub window_ms: u64,
+    /// Service time observed in the window INCLUDING the part that could not
+    /// be charged to a live process. The denominator of every share.
+    pub total_service_time: u64,
+    pub entries: Vec<ProcessDiskEntry>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProcessDiskEntry {
+    pub pid: u32,
+    pub service_time: u64,
+    pub read_bytes: u64,
+    pub write_bytes: u64,
+    pub ops: u64,
+}
+
 fn module_unload_verified_default() -> bool {
     true
 }
@@ -221,6 +255,7 @@ enum BrokerValue {
     AffinityMask(u64),
     TaskManagerReplacementState(TaskManagerReplacementState),
     ProcessNetwork(ProcessNetworkSample),
+    ProcessDisk(ProcessDiskSample),
     ProcessSecurity(super::ProcessSecurityInfo),
     ProcessModules(Vec<ProcessModule>),
     /// Result of `UnloadModule`. `released` is retained only for compatibility
@@ -605,6 +640,24 @@ pub(crate) fn brokered_process_network() -> BrokeredNetwork {
         Ok(_) => BrokeredNetwork::Rejected("unexpected response type".into()),
         Err(BrokerCallError::Unavailable(_)) => BrokeredNetwork::Unavailable,
         Err(BrokerCallError::Rejected(detail)) => BrokeredNetwork::Rejected(detail),
+    }
+}
+
+/// Outcome of asking the broker for per-process disk counters. The three
+/// cases mean exactly what [`BrokeredNetwork`]'s do.
+pub(crate) enum BrokeredDisk {
+    Sample(ProcessDiskSample),
+    Unavailable,
+    Rejected(String),
+}
+
+/// Ask the protected service for per-process disk activity.
+pub(crate) fn brokered_process_disk() -> BrokeredDisk {
+    match BrokerClient.call(BrokerRequest::ProcessDiskCounters) {
+        Ok(BrokerValue::ProcessDisk(sample)) => BrokeredDisk::Sample(sample),
+        Ok(_) => BrokeredDisk::Rejected("unexpected response type".into()),
+        Err(BrokerCallError::Unavailable(_)) => BrokeredDisk::Unavailable,
+        Err(BrokerCallError::Rejected(detail)) => BrokeredDisk::Rejected(detail),
     }
 }
 
@@ -1473,6 +1526,116 @@ fn process_network_sample() -> ProcessNetworkSample {
     }
 }
 
+/// Hard cap on entries in one disk response. A maximal entry encodes to about
+/// 105 bytes, so the same 64 KiB budget as the network answer holds roughly
+/// 620; a desktop produces a few dozen. Pinned by
+/// `a_capped_disk_response_fits_the_frame_limit`.
+const DISK_MAX_ENTRIES: usize = 550;
+
+/// The broker-hosted per-process disk trace, with the same idle watchdog as
+/// the network one.
+struct DiskTrace {
+    usage: super::disk_etw::DiskUsage,
+    last_request: std::time::Instant,
+}
+
+fn disk_trace() -> &'static std::sync::Mutex<Option<DiskTrace>> {
+    static SLOT: std::sync::OnceLock<std::sync::Mutex<Option<DiskTrace>>> =
+        std::sync::OnceLock::new();
+    SLOT.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+/// Answer one `ProcessDiskCounters` request, starting the trace if needed.
+///
+/// The answer DRAINS the window, so the numbers describe exactly the interval
+/// since the previous request. As with the network counters, the service — not
+/// the caller — decides which processes are live.
+fn process_disk_sample() -> ProcessDiskSample {
+    let mut slot = match disk_trace().lock() {
+        Ok(slot) => slot,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    if slot.is_none() {
+        match super::disk_etw::DiskUsage::start(super::etw::TraceRole::Service) {
+            Some(usage) => {
+                *slot = Some(DiskTrace {
+                    usage,
+                    last_request: std::time::Instant::now(),
+                });
+                spawn_disk_trace_watchdog();
+                // The first answer would cover the microseconds since the
+                // session started, which is not a window anyone can divide by.
+                return ProcessDiskSample::default();
+            }
+            None => {
+                // LocalSystem should always be able to start a session; if it
+                // cannot, report unknown rather than a fabricated zero.
+                tracing::warn!("broker could not start the per-process disk trace");
+                return ProcessDiskSample::default();
+            }
+        }
+    }
+    let Some(trace) = slot.as_mut() else {
+        return ProcessDiskSample::default();
+    };
+    trace.last_request = std::time::Instant::now();
+    let live = live_pids();
+    let window = trace.usage.take_window(&live);
+    let total_service_time = window.total_service_time();
+    let mut entries: Vec<ProcessDiskEntry> = window
+        .procs
+        .into_iter()
+        .filter(|(_, disk)| disk.ops != 0)
+        .map(|(pid, disk)| ProcessDiskEntry {
+            pid,
+            service_time: disk.service_time,
+            read_bytes: disk.read_bytes,
+            write_bytes: disk.write_bytes,
+            ops: disk.ops,
+        })
+        .collect();
+    if entries.len() > DISK_MAX_ENTRIES {
+        // Keep the busiest; the truncated tail is all near-zero anyway, and
+        // `total_service_time` still counts it so no share is inflated.
+        entries.sort_unstable_by_key(|entry| std::cmp::Reverse(entry.service_time));
+        entries.truncate(DISK_MAX_ENTRIES);
+    }
+    ProcessDiskSample {
+        active: true,
+        window_ms: window.since_ms,
+        total_service_time,
+        entries,
+    }
+}
+
+/// Stop the disk trace once the GUI stops polling, exactly like the network
+/// one. Its own thread because the two traces idle out independently.
+fn spawn_disk_trace_watchdog() {
+    static STARTED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    if STARTED.set(()).is_err() {
+        return;
+    }
+    let _ = std::thread::Builder::new()
+        .name("tm-disk-idle".into())
+        .spawn(|| {
+            loop {
+                std::thread::sleep(std::time::Duration::from_secs(5));
+                let mut slot = match disk_trace().lock() {
+                    Ok(slot) => slot,
+                    Err(poisoned) => poisoned.into_inner(),
+                };
+                if slot
+                    .as_ref()
+                    .is_some_and(|trace| trace.last_request.elapsed() >= NET_TRACE_IDLE)
+                {
+                    // Dropping stops the session and joins its consumer.
+                    *slot = None;
+                    tracing::info!("per-process disk trace stopped (idle)");
+                }
+            }
+        });
+}
+
 /// Stop the trace once the GUI stops polling. Without this the session would
 /// outlive the last interested window and trace forever.
 fn spawn_net_trace_watchdog() {
@@ -1550,6 +1713,8 @@ fn dispatch(
         BrokerRequest::ProcessNetworkCounters => {
             Ok(BrokerValue::ProcessNetwork(process_network_sample()))
         }
+        // Likewise read-only, target-less and unable to change anything.
+        BrokerRequest::ProcessDiskCounters => Ok(BrokerValue::ProcessDisk(process_disk_sample())),
         BrokerRequest::ProcessSecurityInfo {
             pid,
             expected_start_epoch_s,

@@ -990,6 +990,13 @@ impl TaskManApp {
         {
             d = d.union(TelemetryDemand::PROCESS_NET);
         }
+        // Per-process disk service time is a second ETW session. Processes
+        // shows its column always; Details only when the column is visible.
+        if self.tab == Tab::Processes
+            || (self.tab == Tab::Details && self.details_state.requires_disk_telemetry())
+        {
+            d = d.union(TelemetryDemand::PROCESS_DISK);
+        }
         match self.tab {
             Tab::Performance => {
                 d = d
