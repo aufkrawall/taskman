@@ -332,10 +332,17 @@ fn paint_marker(
 /// cursor — invisible while the tooltip sat in a corner, obvious the moment a
 /// marker was drawn on the sample it had picked.
 fn nearest_sample(ts: &[u64], t0: u64, span: u64, frac: f32) -> usize {
+    nearest_at(
+        ts,
+        t0.saturating_add((f64::from(frac) * span as f64).round() as u64),
+    )
+}
+
+/// Index of the sample closest to the instant `query`.
+fn nearest_at(ts: &[u64], query: u64) -> usize {
     if ts.is_empty() {
         return 0;
     }
-    let query = t0.saturating_add((f64::from(frac) * span as f64).round() as u64);
     let hi = ts.partition_point(|&t| t < query);
     if hi == 0 {
         return 0;
@@ -353,17 +360,87 @@ fn nearest_sample(ts: &[u64], t0: u64, span: u64, frac: f32) -> usize {
     }
 }
 
+// -------------------------------------------------------------- pinned sample
+
+/// The sample a chart's readout has locked onto, remembered between frames.
+#[derive(Clone, Copy)]
+struct Pin {
+    /// Instant of the locked sample — NOT its index. Indices shift every time
+    /// the window rolls; the instant is what the user actually pointed at.
+    at_ms: u64,
+    /// Where the pointer was when the lock was taken. Moving off it re-picks.
+    pointer: Pos2,
+}
+
+/// How far the pointer may drift and still count as standing still. Small
+/// enough that a deliberate nudge re-picks, large enough to absorb sub-pixel
+/// jitter from the input stack.
+const PIN_SLACK: f32 = 1.0;
+
+fn pin_id(id: egui::Id) -> egui::Id {
+    id.with("readout-pin")
+}
+
+/// Sample the readout should report, given the one currently `under_pointer`.
+///
+/// A rolling chart slides a fresh sample under a motionless cursor on every
+/// tick, so a readout that always reports "whatever is here now" changes the
+/// number before it can be read — the whole point of hovering a spike is to
+/// find out what it was. While the pointer holds still the readout stays
+/// locked to the instant it first named, and because the marker is drawn from
+/// the returned INDEX it travels left with that sample instead of standing
+/// still over changing data. The age line ("12 s ago") counts up as it goes,
+/// which is what makes the lock legible rather than mysterious.
+///
+/// The lock is released when the pointer moves, when the pinned sample rolls
+/// out of the window, and when the chart has no timestamps to pin against.
+fn pinned_sample(
+    ctx: &egui::Context,
+    id: egui::Id,
+    timestamps_ms: Option<&[u64]>,
+    pointer: Pos2,
+    under_pointer: usize,
+) -> usize {
+    // A chart whose timestamp slice is short of its samples is already
+    // degrading to even spacing (see `chart_multi`); leave it on that path
+    // rather than pinning it to an instant that does not describe it.
+    let Some(ts) = timestamps_ms.filter(|ts| under_pointer < ts.len()) else {
+        return under_pointer;
+    };
+    let id = pin_id(id);
+    let held = ctx
+        .data(|d| d.get_temp::<Pin>(id))
+        .filter(|pin| pin.pointer.distance(pointer) <= PIN_SLACK && pin.at_ms >= ts[0]);
+    match held {
+        Some(pin) => nearest_at(ts, pin.at_ms),
+        None => {
+            let pin = Pin {
+                at_ms: ts[under_pointer],
+                pointer,
+            };
+            ctx.data_mut(|d| d.insert_temp(id, pin));
+            under_pointer
+        }
+    }
+}
+
 /// Pointer position when this chart is genuinely hovered.
 ///
 /// `Response::hovered` rather than a bare rect test: an open context menu or
 /// a dialog above the chart must suppress the readout, and a rect test alone
 /// would keep painting it through them.
+/// Doubles as the release point for [`pinned_sample`]'s lock: the pin lives
+/// exactly as long as the pointer is on the chart.
 fn hover_pos(ui: &egui::Ui, response: &Response, rect: Rect) -> Option<Pos2> {
-    if !response.hovered() {
-        return None;
+    let pos = response
+        .hovered()
+        .then(|| ui.input(|i| i.pointer.hover_pos()))
+        .flatten()
+        .filter(|pos| rect.contains(*pos));
+    if pos.is_none() {
+        ui.ctx().data_mut(|d| d.remove::<Pin>(pin_id(response.id)));
     }
-    let pos = ui.input(|i| i.pointer.hover_pos())?;
-    rect.contains(pos).then_some(pos)
+    pos
 }
 
 /// Age caption for sample `idx` of `timestamps_ms`, relative to the newest
@@ -503,6 +580,7 @@ pub fn core_chart(
     if let Some(pos) = hover_pos(ui, &response, rect) {
         let frac = ((pos.x - rect.left()) / rect.width()).clamp(0.0, 1.0);
         let idx = ((frac * (n - 1) as f32).round() as usize).min(n - 1);
+        let idx = pinned_sample(ui.ctx(), response.id, timestamps_ms, pos, idx).min(n - 1);
         let mut rows = vec![ReadoutRow {
             color,
             label: label.to_owned(),
@@ -628,7 +706,8 @@ pub fn chart_multi(
         // sample — even-spacing math skips across sampling gaps.
         let time_idx = t_span
             .zip(timestamps_ms)
-            .map(|((t0, span), ts)| nearest_sample(ts, t0, span, frac));
+            .map(|((t0, span), ts)| nearest_sample(ts, t0, span, frac))
+            .map(|under| pinned_sample(ui.ctx(), response.id, timestamps_ms, pos, under));
         let mut rows = Vec::with_capacity(series.len());
         let mut dots = Vec::with_capacity(series.len());
         let mut marker = None;
@@ -819,6 +898,77 @@ mod tests {
         };
         assert_eq!(paint(pal.card_bg), pal.card_bg);
         assert_eq!(paint(pal.card_bg_sunken), pal.card_bg_sunken);
+    }
+
+    /// A motionless pointer must keep naming the sample it first pointed at,
+    /// even as the window rolls that sample towards the left edge.
+    ///
+    /// Without the pin the readout reports whatever has just scrolled under
+    /// the cursor, so the number changes on every tick and the spike the user
+    /// is trying to read is gone before they have read it.
+    #[test]
+    fn a_still_pointer_keeps_naming_the_sample_it_locked_onto() {
+        let ctx = egui::Context::default();
+        let id = egui::Id::new("rolling-chart");
+        let at = Pos2::new(120.0, 40.0);
+        let window = |t0: u64| -> Vec<u64> { (0..10).map(|i| t0 + i * 1_000).collect() };
+
+        // Pointing at sample 7 of the first window locks onto t = 8000.
+        let first = window(1_000);
+        assert_eq!(pinned_sample(&ctx, id, Some(&first), at, 7), 7);
+
+        // Two ticks later the same screen position sits over sample 9, but
+        // t = 8000 has rolled back to index 5 — and that is what the readout
+        // must keep reporting.
+        let rolled = window(3_000);
+        assert_eq!(pinned_sample(&ctx, id, Some(&rolled), at, 9), 5);
+
+        // Moving the pointer re-picks, and locks onto the new sample.
+        let moved = Pos2::new(160.0, 40.0);
+        assert_eq!(pinned_sample(&ctx, id, Some(&rolled), moved, 9), 9);
+        assert_eq!(pinned_sample(&ctx, id, Some(&window(5_000)), moved, 9), 7);
+
+        // Sub-pixel jitter is not "moving".
+        let jitter = Pos2::new(moved.x + 0.4, moved.y);
+        assert_eq!(pinned_sample(&ctx, id, Some(&window(5_000)), jitter, 9), 7);
+    }
+
+    /// A pin whose sample has rolled off the left edge is released, and a
+    /// chart with no timestamps never takes one.
+    #[test]
+    fn a_pin_is_released_once_its_sample_leaves_the_window() {
+        let ctx = egui::Context::default();
+        let id = egui::Id::new("rolling-chart");
+        let at = Pos2::new(120.0, 40.0);
+        let window = |t0: u64| -> Vec<u64> { (0..10).map(|i| t0 + i * 1_000).collect() };
+
+        let first = window(1_000);
+        assert_eq!(pinned_sample(&ctx, id, Some(&first), at, 2), 2); // t = 3000
+        // The window has moved past t = 3000 entirely: fall back to the
+        // sample under the pointer instead of clamping to the oldest one.
+        assert_eq!(pinned_sample(&ctx, id, Some(&window(20_000)), at, 6), 6);
+
+        assert_eq!(pinned_sample(&ctx, egui::Id::new("no-ts"), None, at, 4), 4);
+        // Fewer timestamps than samples keeps the even-spacing fallback.
+        assert_eq!(
+            pinned_sample(&ctx, egui::Id::new("short"), Some(&[1, 2]), at, 7),
+            7
+        );
+    }
+
+    /// Leaving the chart drops the lock, so coming back re-reads the graph
+    /// rather than resurrecting a sample from minutes ago.
+    #[test]
+    fn leaving_the_chart_drops_the_lock() {
+        let ctx = egui::Context::default();
+        let id = egui::Id::new("rolling-chart");
+        let at = Pos2::new(120.0, 40.0);
+        let ts: Vec<u64> = (0..10).map(|i| 1_000 + i * 1_000).collect();
+        assert_eq!(pinned_sample(&ctx, id, Some(&ts), at, 7), 7);
+        assert!(ctx.data(|d| d.get_temp::<Pin>(pin_id(id))).is_some());
+
+        ctx.data_mut(|d| d.remove::<Pin>(pin_id(id)));
+        assert!(ctx.data(|d| d.get_temp::<Pin>(pin_id(id))).is_none());
     }
 
     #[test]
