@@ -448,7 +448,7 @@ fn prepare_auto_fit_widths(
     sessions: &[&UserSession],
     aggs: &HashMap<u32, Agg>,
     snap: &tm_core::model::Snapshot,
-    agg_hdr: &[String; 6],
+    agg_hdr: &[String],
 ) {
     let mut fit: Vec<f32> = table
         .cols
@@ -495,8 +495,14 @@ fn prepare_auto_fit_widths(
             fit[i + 2] = fit[i + 2].max(tablekit::text_width(ui, text, tablekit::FONT_ROW) + 22.0);
         }
     }
-    for (i, agg) in agg_hdr.iter().enumerate() {
-        fit[i + 2] = fit[i + 2].max(tablekit::text_width(ui, agg, tablekit::FONT_AGG) + 36.0);
+    // Zip against the table's OWN numeric columns: this list is shared with
+    // the Processes page, which has more of them.
+    for (col, agg) in table
+        .numeric_indices()
+        .zip(agg_hdr.iter())
+        .collect::<Vec<_>>()
+    {
+        fit[col] = fit[col].max(tablekit::text_width(ui, agg, tablekit::FONT_AGG) + 36.0);
     }
     for (i, width) in fit.into_iter().enumerate() {
         table.set_auto_fit_width(i, width.ceil());

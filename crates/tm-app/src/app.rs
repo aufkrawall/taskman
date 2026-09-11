@@ -599,10 +599,16 @@ impl TaskManApp {
         );
 
         let mut processes_state = crate::tabs::processes::State::new();
+        if let Some(order) = settings.col_order.get("processes") {
+            processes_state.apply_saved_order(order);
+        }
+        // The id list is the page's own, in LOGICAL order: a hardcoded copy
+        // here silently stopped persisting the sort of every column added
+        // after it was written.
         if let Some(sort) = restored_sort(
             &settings,
             "processes",
-            &["name", "status", "cpu", "mem", "disk", "net"],
+            &crate::tabs::processes::column_ids(),
         ) {
             processes_state.sort_col = sort.column;
             processes_state.ascending = sort.ascending;
@@ -1449,6 +1455,21 @@ impl TaskManApp {
                 .insert(table.id.to_string(), table.stored_widths());
             self.save_settings();
         }
+    }
+
+    /// Persist a user-defined column order by stable identifiers. An order
+    /// equal to the built-in one is REMOVED rather than written, so a default
+    /// layout leaves no stale ids in the file for a future build to honour.
+    pub fn persist_column_order(&mut self, table: &str, order: Vec<String>, default: &[String]) {
+        if order == default {
+            self.shared.settings.col_order.remove(table);
+        } else {
+            self.shared
+                .settings
+                .col_order
+                .insert(table.to_string(), order);
+        }
+        self.save_settings();
     }
 
     /// Persist a table sort by stable identifiers (never by display index,

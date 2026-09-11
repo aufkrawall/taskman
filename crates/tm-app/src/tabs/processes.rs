@@ -57,24 +57,78 @@ const DISK_ACT_VALUE: usize = 4;
 /// Index of the GPU column inside `values`; optional for the same reason.
 const GPU_VALUE: usize = 5;
 
-fn columns() -> Vec<TmColumn> {
-    vec![
+/// Columns that never move. Name owns the tree chevron and the icon, and the
+/// blue heat band is painted as ONE contiguous span starting after Status —
+/// a value column dragged in front of either would tear it.
+const FIXED_COLS: usize = 2;
+
+/// One numeric column, in the fixed LOGICAL order that [`RowData::values`]
+/// and [`RowData::heat`] are indexed by. The user's display order is a
+/// permutation of these, held in [`State::value_order`]; nothing below the UI
+/// layer ever sees it.
+struct ValueColumn {
+    id: &'static str,
+    label: fn() -> &'static str,
+    width: f32,
+}
+
+const VALUE_COLUMNS: [ValueColumn; VALUE_COLS] = [
+    ValueColumn {
+        id: "cpu",
+        label: || i18n::tr(K::ColCpu),
+        width: 110.0,
+    },
+    ValueColumn {
+        id: "mem",
+        label: || i18n::tr(K::ColMemory),
+        width: 110.0,
+    },
+    ValueColumn {
+        id: "disk",
+        label: || i18n::tr(K::ColDisk),
+        width: 110.0,
+    },
+    // Windows supplies this lazily from the per-process ETW source. Missing
+    // telemetry still renders as an honest "—", never fake zero.
+    ValueColumn {
+        id: "net",
+        label: || i18n::tr(K::ColNetwork),
+        width: 110.0,
+    },
+    // Which process is actually keeping the disks busy. The Disk column
+    // counts I/O BYTES the process asked for, cache hits included; this one
+    // is its share of the time the disks really spent.
+    ValueColumn {
+        id: "diskact",
+        label: || i18n::tr(K::ColDiskActivity),
+        width: 150.0,
+    },
+    // Busiest-engine utilization, from the same on-demand PDH group the
+    // Performance page uses.
+    ValueColumn {
+        id: "gpu",
+        label: || i18n::tr(K::ColGpu),
+        width: 110.0,
+    },
+];
+
+/// Stable ids of every column in LOGICAL order, for sort persistence.
+pub fn column_ids() -> Vec<&'static str> {
+    let mut ids = vec!["name", "status"];
+    ids.extend(VALUE_COLUMNS.iter().map(|c| c.id));
+    ids
+}
+
+fn columns(value_order: &[usize]) -> Vec<TmColumn> {
+    let mut cols = vec![
         TmColumn::text("name", i18n::tr(K::ColName), 340.0),
         TmColumn::text("status", i18n::tr(K::ColStatus), 190.0),
-        TmColumn::num("cpu", i18n::tr(K::ColCpu), 110.0),
-        TmColumn::num("mem", i18n::tr(K::ColMemory), 110.0),
-        TmColumn::num("disk", i18n::tr(K::ColDisk), 110.0),
-        // Windows supplies this lazily from the per-process ETW source.
-        // Missing telemetry still renders as an honest "—", never fake zero.
-        TmColumn::num("net", i18n::tr(K::ColNetwork), 110.0),
-        // Which process is actually keeping the disks busy. The Disk column
-        // next to it counts I/O BYTES the process asked for, cache hits
-        // included; this one is its share of the time the disks really spent.
-        TmColumn::num("diskact", i18n::tr(K::ColDiskActivity), 150.0),
-        // Busiest-engine utilization, from the same on-demand PDH group the
-        // Performance page uses.
-        TmColumn::num("gpu", i18n::tr(K::ColGpu), 110.0),
-    ]
+    ];
+    for &li in value_order {
+        let c = &VALUE_COLUMNS[li];
+        cols.push(TmColumn::num(c.id, (c.label)(), c.width));
+    }
+    cols
 }
 
 /// Flattened display row — group headers and process rows share one fixed
@@ -132,6 +186,9 @@ pub struct RowData {
 
 #[derive(Default)]
 pub struct State {
+    /// LOGICAL column being sorted by: 0 = Name, 1 = Status, `FIXED_COLS + i`
+    /// = value column `i`. Deliberately not a display index, so dragging a
+    /// column somewhere else never silently re-sorts the table.
     pub sort_col: usize,
     pub ascending: bool,
     /// Expanded parent pids.
@@ -145,15 +202,84 @@ pub struct State {
     scroll_to_pid: Option<u32>,
     cache: Option<Cache>,
     view_generation: u64,
+    /// Logical value-column index per display slot; the user's drag order.
+    value_order: Vec<usize>,
 }
 
 impl State {
-    /// TM default: sorted by name ascending.
+    /// TM default: sorted by name ascending, columns in declaration order.
     pub fn new() -> Self {
         Self {
             ascending: true,
+            value_order: (0..VALUE_COLS).collect(),
             ..Default::default()
         }
+    }
+
+    /// Display slot -> logical column.
+    fn logical_col(&self, display: usize) -> usize {
+        match display.checked_sub(FIXED_COLS) {
+            Some(slot) => FIXED_COLS + self.value_order.get(slot).copied().unwrap_or(slot),
+            None => display,
+        }
+    }
+
+    /// Logical column -> display slot.
+    fn display_col(&self, logical: usize) -> usize {
+        match logical.checked_sub(FIXED_COLS) {
+            Some(li) => {
+                FIXED_COLS
+                    + self
+                        .value_order
+                        .iter()
+                        .position(|candidate| *candidate == li)
+                        .unwrap_or(li)
+            }
+            None => logical,
+        }
+    }
+
+    /// Move the column at display slot `from` so it lands at slot `to`.
+    /// Returns false when the gesture would change nothing.
+    fn move_column(&mut self, from: usize, to: usize) -> bool {
+        let (Some(from), Some(to)) = (from.checked_sub(FIXED_COLS), to.checked_sub(FIXED_COLS))
+        else {
+            return false;
+        };
+        if from == to || from >= self.value_order.len() || to >= self.value_order.len() {
+            return false;
+        }
+        let moved = self.value_order.remove(from);
+        self.value_order.insert(to, moved);
+        true
+    }
+
+    /// Display order as stable ids, for persistence.
+    fn saved_order(&self) -> Vec<String> {
+        self.value_order
+            .iter()
+            .map(|&li| VALUE_COLUMNS[li].id.to_string())
+            .collect()
+    }
+
+    /// Adopt a persisted order, ignoring unknown ids and appending any column
+    /// the saved file predates. A settings file from an older build must
+    /// never make a column disappear.
+    pub fn apply_saved_order(&mut self, ids: &[String]) {
+        let mut next: Vec<usize> = Vec::with_capacity(VALUE_COLS);
+        for id in ids {
+            if let Some(li) = VALUE_COLUMNS.iter().position(|c| c.id == id)
+                && !next.contains(&li)
+            {
+                next.push(li);
+            }
+        }
+        for li in 0..VALUE_COLS {
+            if !next.contains(&li) {
+                next.push(li);
+            }
+        }
+        self.value_order = next;
     }
 
     /// Any change that affects the flattened display model bumps this
@@ -300,7 +426,12 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
         },
     );
 
-    let mut table = app.make_table("processes", columns());
+    let value_order = app.processes_state.value_order.clone();
+    // Only the numeric block is draggable: `heat_cells` paints the blue band
+    // as one contiguous span, and the Name cell owns the tree chevron.
+    let mut table = app
+        .make_table("processes", columns(&value_order))
+        .reorderable(FIXED_COLS..FIXED_COLS + VALUE_COLS);
 
     // Rebuild the flattened model only when snapshot/search/sort/view-state
     // changes — expansion is part of the key (§11.1).
@@ -358,8 +489,13 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
     handle_keyboard_navigation(app, ui.ctx(), rows);
 
     let agg = Aggregates::from_snapshot(&snap);
-    let aggs = agg.strings();
-    prepare_auto_fit_widths(ui, &mut table, rows, &aggs);
+    let logical_aggs = agg.strings();
+    // Header totals are produced in logical order and shown in display order.
+    let aggs: Vec<String> = value_order
+        .iter()
+        .map(|&li| logical_aggs[li].clone())
+        .collect();
+    prepare_auto_fit_widths(ui, &mut table, rows, &aggs, &value_order);
 
     let avail = tablekit::table_avail(ui);
     // Consume any pending scroll request as a flat display-row index so the
@@ -401,7 +537,11 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
         &pal,
         &mut table,
         avail,
-        Some((app.processes_state.sort_col, app.processes_state.ascending)),
+        Some((
+            app.processes_state
+                .display_col(app.processes_state.sort_col),
+            app.processes_state.ascending,
+        )),
         Some(&aggs),
         rows.len(),
         focus_row,
@@ -421,10 +561,11 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
         },
     );
     if let Some(col) = clicked {
-        if app.processes_state.sort_col == col {
+        let logical = app.processes_state.logical_col(col);
+        if app.processes_state.sort_col == logical {
             app.processes_state.ascending = !app.processes_state.ascending;
         } else {
-            app.processes_state.sort_col = col;
+            app.processes_state.sort_col = logical;
             // Numeric columns default descending, name ascending.
             app.processes_state.ascending = col == 0 || !table.cols[col].numeric;
         }
@@ -433,6 +574,15 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
             table.cols[col].id,
             app.processes_state.ascending,
         );
+    }
+    if let Some((from, to)) = table.take_reorder()
+        && app.processes_state.move_column(from, to)
+    {
+        // Widths are stored per column id, so they follow their column; only
+        // the order itself has to be written out.
+        let order = app.processes_state.saved_order();
+        app.persist_column_order("processes", order, &default_value_order_ids());
+        app.processes_state.invalidate();
     }
     app.persist_table(&table);
     app.processes_state.cache = cache;
@@ -737,7 +887,8 @@ fn prepare_auto_fit_widths(
     ui: &egui::Ui,
     table: &mut tablekit::TmTable,
     rows: &[DisplayRow],
-    aggs: &[String; 6],
+    aggs: &[String],
+    value_order: &[usize],
 ) {
     let header =
         |i: usize| tablekit::text_width(ui, table.cols[i].label, tablekit::FONT_HDR_LABEL) + 28.0;
@@ -760,33 +911,14 @@ fn prepare_auto_fit_widths(
             status_w += tablekit::text_width(ui, i18n::tr(K::StNotResponding), tablekit::FONT_ROW);
         }
         widths[1] = widths[1].max(status_w);
-        let values = [
-            format::format_pct_cell(row.values[0].min(100.0) as f32),
-            format::format_mb(row.values[1] as u64),
-            format::format_rate_mb(row.values[2]),
-            if row.net_available {
-                format::format_process_net_rate(row.values[NET_VALUE])
-            } else {
-                "—".to_string()
-            },
-            if row.disk_available {
-                format::format_pct_cell(row.values[DISK_ACT_VALUE].min(100.0) as f32)
-            } else {
-                "—".to_string()
-            },
-            if row.gpu_available {
-                format::format_pct_cell(row.values[GPU_VALUE].min(100.0) as f32)
-            } else {
-                "—".to_string()
-            },
-        ];
+        let values: Vec<String> = value_order.iter().map(|&li| value_text(row, li)).collect();
         for (i, text) in values.iter().enumerate() {
             widths[i + 2] =
                 widths[i + 2].max(tablekit::text_width(ui, text, tablekit::FONT_ROW) + 22.0);
         }
     }
-    for (i, agg) in aggs.iter().enumerate() {
-        widths[i + 2] = widths[i + 2].max(tablekit::text_width(ui, agg, tablekit::FONT_AGG) + 36.0);
+    for (col, agg) in table.numeric_indices().zip(aggs.iter()).collect::<Vec<_>>() {
+        widths[col] = widths[col].max(tablekit::text_width(ui, agg, tablekit::FONT_AGG) + 36.0);
     }
     for (i, width) in widths.into_iter().enumerate() {
         table.set_auto_fit_width(i, width.ceil());
@@ -898,32 +1030,14 @@ fn row_ui(
 
     // Heat cells: intensities were normalized per column across the whole
     // display model during cache build (audit P0.2); here we only paint.
-    let texts = [
-        format::format_pct_cell(row.values[0].min(100.0) as f32),
-        format::format_mb(row.values[1] as u64),
-        format::format_rate_mb(row.values[2]),
-        if row.net_available {
-            format::format_process_net_rate(row.values[NET_VALUE])
-        } else {
-            "—".to_string()
-        },
-        if row.disk_available {
-            format::format_pct_cell(row.values[DISK_ACT_VALUE].min(100.0) as f32)
-        } else {
-            "—".to_string()
-        },
-        if row.gpu_available {
-            format::format_pct_cell(row.values[GPU_VALUE].min(100.0) as f32)
-        } else {
-            "—".to_string()
-        },
-    ];
-    let cells: Vec<HeatCell> = texts
+    // Cells follow the user's column order; `values`/`heat` never do.
+    let cells: Vec<HeatCell> = app
+        .processes_state
+        .value_order
         .iter()
-        .zip(row.heat.iter())
-        .map(|(s, t)| HeatCell::new(*t, s.clone()))
+        .map(|&li| HeatCell::new(row.heat[li], value_text(row, li)))
         .collect();
-    table.heat_cells(ui, pal, rect, 2, &cells);
+    table.heat_cells(ui, pal, rect, FIXED_COLS, &cells);
     let net_tip = (!row.net_available)
         .then(|| unavailable_network_tip(ui, table, rect))
         .flatten()
@@ -1426,7 +1540,7 @@ fn build_display_rows(
         // always the first row no matter which category it belongs to. App
         // families and same-image groups stay collapsible inside that flat
         // list.
-        if sort_col < 2 {
+        if sort_col < FIXED_COLS {
             out.push(DisplayRow::GroupHeader(gi, total));
             if group_collapsed[gi as usize] {
                 continue;
@@ -1447,7 +1561,7 @@ fn build_display_rows(
             );
         }
     }
-    if sort_col >= 2 {
+    if sort_col >= FIXED_COLS {
         sort_blocks_globally(&mut out, sort_col, ascending);
     }
     normalize_heat(&mut out);
@@ -1462,7 +1576,10 @@ fn build_display_rows(
 /// behavior. Group headers are dropped here (they only exist for Name
 /// sorts).
 fn sort_blocks_globally(rows: &mut Vec<DisplayRow>, sort_col: usize, ascending: bool) {
-    debug_assert!((2..=5).contains(&sort_col), "resource column expected");
+    debug_assert!(
+        (FIXED_COLS..FIXED_COLS + VALUE_COLS).contains(&sort_col),
+        "resource column expected"
+    );
     let mut blocks: Vec<Vec<DisplayRow>> = Vec::new();
     for r in rows.drain(..) {
         let DisplayRow::Process(d) = r else { continue };
@@ -1476,7 +1593,7 @@ fn sort_blocks_globally(rows: &mut Vec<DisplayRow>, sort_col: usize, ascending: 
             }
         }
     }
-    let vi = (sort_col - 2).min(VALUE_COLS - 1); // value columns start at table column 2
+    let vi = (sort_col - FIXED_COLS).min(VALUE_COLS - 1);
     blocks.sort_by(|a, b| {
         let (Some(DisplayRow::Process(x)), Some(DisplayRow::Process(y))) = (a.first(), b.first())
         else {
@@ -1556,6 +1673,12 @@ fn application_family<'a>(
         }
     }
     out
+}
+
+/// The built-in value-column order, as ids. A layout matching this is not
+/// written to the settings file at all.
+fn default_value_order_ids() -> Vec<String> {
+    VALUE_COLUMNS.iter().map(|c| c.id.to_string()).collect()
 }
 
 /// Sum of the members' OWN values.
@@ -2032,6 +2155,28 @@ fn is_system_boundary(name: &str) -> bool {
     tm_core::classify::is_core_os_image(name)
 }
 
+/// The text of one numeric cell, by LOGICAL value index.
+///
+/// One place, so the header auto-fit measures exactly the string the row
+/// paints — they drifted apart once already, and now that the two iterate a
+/// user-defined order they would drift silently.
+fn value_text(row: &RowData, li: usize) -> String {
+    match li {
+        0 => format::format_pct_cell(row.values[0].min(100.0) as f32),
+        1 => format::format_mb(row.values[1] as u64),
+        2 => format::format_rate_mb(row.values[2]),
+        NET_VALUE if row.net_available => format::format_process_net_rate(row.values[NET_VALUE]),
+        DISK_ACT_VALUE if row.disk_available => {
+            format::format_pct_cell(row.values[DISK_ACT_VALUE].min(100.0) as f32)
+        }
+        GPU_VALUE if row.gpu_available => {
+            format::format_pct_cell(row.values[GPU_VALUE].min(100.0) as f32)
+        }
+        // Unknown telemetry, never a fabricated zero.
+        _ => "\u{2014}".to_string(),
+    }
+}
+
 /// A cell whose value is unknown must not colour the heat band, and must not
 /// pull the column's maximum either.
 fn value_known(d: &RowData, i: usize) -> bool {
@@ -2476,21 +2621,18 @@ fn sort_entries(
     subtree: &HashMap<u32, [f64; VALUE_COLS]>,
 ) {
     let sv = |p: &ProcessEntry, i: usize| subtree.get(&p.pid).map_or(0.0, |s| s[i]);
+    // `col` is a LOGICAL column, so this arm covers every value column that
+    // exists rather than a hand-written list. The hand-written one stopped at
+    // 5, which meant Disk activity and GPU quietly sorted by NAME.
+    let value = col
+        .checked_sub(FIXED_COLS)
+        .filter(|index| *index < VALUE_COLS);
     v.sort_by(|a, b| {
-        let o = match col {
-            1 => process_status_rank(a).cmp(&process_status_rank(b)),
-            2 => sv(a, 0)
-                .partial_cmp(&sv(b, 0))
+        let o = match (value, col) {
+            (Some(index), _) => sv(a, index)
+                .partial_cmp(&sv(b, index))
                 .unwrap_or(std::cmp::Ordering::Equal),
-            3 => sv(a, 1)
-                .partial_cmp(&sv(b, 1))
-                .unwrap_or(std::cmp::Ordering::Equal),
-            4 => sv(a, 2)
-                .partial_cmp(&sv(b, 2))
-                .unwrap_or(std::cmp::Ordering::Equal),
-            5 => sv(a, 3)
-                .partial_cmp(&sv(b, 3))
-                .unwrap_or(std::cmp::Ordering::Equal),
+            (None, 1) => process_status_rank(a).cmp(&process_status_rank(b)),
             _ => cmp_ignore_case(a.shown_name(), b.shown_name()),
         };
         let o = if asc { o } else { o.reverse() };
@@ -3281,7 +3423,8 @@ mod tests {
     /// positional, so a column added without extending it is silently empty.
     #[test]
     fn every_numeric_column_has_a_header_total() {
-        let numeric = columns().iter().filter(|c| c.numeric).count();
+        let default_order: Vec<usize> = (0..VALUE_COLS).collect();
+        let numeric = columns(&default_order).iter().filter(|c| c.numeric).count();
         assert_eq!(numeric, VALUE_COLS, "value columns and table columns drift");
         let snap = snap_of(vec![proc(1, None, "a", ProcCategory::Background)]);
         let aggs = Aggregates::from_snapshot(&snap).strings();
@@ -3323,6 +3466,129 @@ mod tests {
         assert!(by_pid[&10].gpu_available);
         assert_eq!(by_pid[&10].values[GPU_VALUE], 64.0);
         assert!(by_pid[&10].heat[GPU_VALUE] > 0.0);
+    }
+
+    /// Every value column must sort by ITS value. The old hand-written match
+    /// stopped at column 5, so Disk activity and GPU fell through to the
+    /// name comparison and the click looked like it did nothing.
+    #[test]
+    fn every_value_column_sorts_by_its_own_value() {
+        for li in 0..VALUE_COLS {
+            let mut low = ProcessEntry::new(1, "zzz-low.exe");
+            let mut high = ProcessEntry::new(2, "aaa-high.exe");
+            // Names are deliberately reversed: a column that falls back to
+            // the name comparison produces the opposite order.
+            let mut subtree = HashMap::new();
+            let mut low_values = [0.0f64; VALUE_COLS];
+            let mut high_values = [0.0f64; VALUE_COLS];
+            low_values[li] = 1.0;
+            high_values[li] = 9.0;
+            subtree.insert(low.pid, low_values);
+            subtree.insert(high.pid, high_values);
+            low.cpu_pct = 0.0;
+            high.cpu_pct = 0.0;
+            let mut rows = vec![&low, &high];
+            sort_entries(&mut rows, FIXED_COLS + li, false, &subtree);
+            assert_eq!(
+                rows[0].pid, high.pid,
+                "column {li} ({}) did not sort by its own value",
+                VALUE_COLUMNS[li].id
+            );
+        }
+    }
+
+    /// Dragging a column must not change what the table is sorted by, and the
+    /// cells must follow the new order while `values`/`heat` stay logical.
+    #[test]
+    fn reordering_columns_moves_cells_but_not_the_sort() {
+        let mut state = State::new();
+        state.sort_col = FIXED_COLS + 2; // Disk
+        let disk_display = state.display_col(state.sort_col);
+        assert_eq!(disk_display, FIXED_COLS + 2);
+
+        // Drag GPU (last) to sit directly before Disk.
+        let gpu_display = state.display_col(FIXED_COLS + GPU_VALUE);
+        assert!(state.move_column(gpu_display, FIXED_COLS + 2));
+        assert_eq!(
+            state.value_order,
+            vec![0, 1, GPU_VALUE, 2, NET_VALUE, DISK_ACT_VALUE]
+        );
+
+        // The sort still means Disk, now one slot further right.
+        assert_eq!(state.sort_col, FIXED_COLS + 2, "sort must stay logical");
+        assert_eq!(state.display_col(state.sort_col), FIXED_COLS + 3);
+        // ...and a click on that slot resolves back to Disk.
+        assert_eq!(state.logical_col(FIXED_COLS + 3), FIXED_COLS + 2);
+
+        // Column labels follow the drag.
+        let cols = columns(&state.value_order);
+        assert_eq!(cols[FIXED_COLS + 2].id, "gpu");
+        assert_eq!(cols[FIXED_COLS + 3].id, "disk");
+
+        // Cells are emitted in display order out of logical values.
+        let mut gpu_hog = proc(7, None, "renderer", ProcCategory::Background);
+        gpu_hog.gpu_util_pct = Some(64.0);
+        let rows = build_display_rows(
+            &snap_of(vec![gpu_hog]),
+            "",
+            0,
+            true,
+            &HashSet::new(),
+            &[false; 3],
+        );
+        let row = rows
+            .iter()
+            .find_map(|r| match r {
+                DisplayRow::Process(d) => Some(d.clone()),
+                _ => None,
+            })
+            .unwrap();
+        let texts: Vec<String> = state
+            .value_order
+            .iter()
+            .map(|&li| value_text(&row, li))
+            .collect();
+        assert_eq!(texts[2], format::format_pct_cell(64.0), "GPU moved left");
+    }
+
+    /// A saved order is restored; ids the build no longer knows are dropped,
+    /// and columns the saved file predates are appended rather than lost.
+    #[test]
+    fn a_saved_order_survives_added_and_removed_columns() {
+        let mut state = State::new();
+        state.apply_saved_order(&[
+            "gpu".into(),
+            "nonexistent".into(),
+            "cpu".into(),
+            "gpu".into(),
+        ]);
+        assert_eq!(state.value_order[0], GPU_VALUE);
+        assert_eq!(state.value_order[1], 0);
+        assert_eq!(
+            state.value_order.len(),
+            VALUE_COLS,
+            "every column must still be present"
+        );
+        let mut seen = state.value_order.clone();
+        seen.sort_unstable();
+        assert_eq!(seen, (0..VALUE_COLS).collect::<Vec<_>>());
+
+        // A round trip through the persisted form is stable.
+        let saved = state.saved_order();
+        let mut restored = State::new();
+        restored.apply_saved_order(&saved);
+        assert_eq!(restored.value_order, state.value_order);
+    }
+
+    /// Only the numeric block moves: the heat band is one contiguous span and
+    /// the Name cell owns the chevron.
+    #[test]
+    fn the_pinned_columns_cannot_be_dragged_away() {
+        let mut state = State::new();
+        assert!(!state.move_column(0, FIXED_COLS + 1), "Name is pinned");
+        assert!(!state.move_column(1, FIXED_COLS + 2), "Status is pinned");
+        assert!(!state.move_column(FIXED_COLS, 0), "no value before Name");
+        assert_eq!(state.value_order, (0..VALUE_COLS).collect::<Vec<_>>());
     }
 
     #[test]

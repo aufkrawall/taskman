@@ -507,6 +507,14 @@ pub struct TmTable {
     /// `None` preserves the historical default-width fallback for tables
     /// that have not yet registered an intrinsic measurement.
     auto_widths: Vec<Option<f32>>,
+    /// Display indices the user may drag to reorder. Empty disables the
+    /// gesture, which is the default: most tables here have a fixed layout,
+    /// and a column dragged out of the numeric block would tear the heat
+    /// band, which `heat_cells` paints as one contiguous span.
+    reorderable: std::ops::Range<usize>,
+    /// Set when a drag is released on a new slot; the owning tab consumes it
+    /// with [`TmTable::take_reorder`] and rewrites its own column order.
+    pending_reorder: Option<(usize, usize)>,
 }
 
 impl TmTable {
@@ -516,6 +524,8 @@ impl TmTable {
         saved: Option<&std::collections::BTreeMap<String, f32>>,
     ) -> Self {
         let mut t = Self {
+            reorderable: 0..0,
+            pending_reorder: None,
             id,
             auto_widths: vec![None; cols.len()],
             cols,
@@ -587,6 +597,33 @@ impl TmTable {
         *slot = Some(Layout { cols });
     }
 
+    /// Display indices of the numeric columns, in order.
+    ///
+    /// The header's aggregate row is positional against exactly this
+    /// sequence, so every caller that lays out aggregates must walk it rather
+    /// than assume "the columns after the first two". `Aggregates::strings`
+    /// is shared by tables with different column counts, and indexing by hand
+    /// ran the Users page off the end of its own width array.
+    pub fn numeric_indices(&self) -> impl Iterator<Item = usize> + '_ {
+        self.cols
+            .iter()
+            .enumerate()
+            .filter(|(_, col)| col.numeric)
+            .map(|(i, _)| i)
+    }
+
+    /// Allow the user to drag the columns in `range` into a different order.
+    pub fn reorderable(mut self, range: std::ops::Range<usize>) -> Self {
+        self.reorderable = range;
+        self
+    }
+
+    /// Take a completed reorder gesture: move the column at `.0` so it sits
+    /// at display index `.1`.
+    pub fn take_reorder(&mut self) -> Option<(usize, usize)> {
+        self.pending_reorder.take()
+    }
+
     pub fn col_rect(&self, i: usize, row: Rect) -> Rect {
         self.ensure_layout();
         let l = self.layout.borrow();
@@ -645,17 +682,50 @@ impl TmTable {
             .collect();
         bounds.push(rect.left() + total_w);
 
+        // Column drag-reorder. The source is remembered in context memory
+        // rather than on `self`, because the table is rebuilt from scratch
+        // every frame while the pointer is still down.
+        let drag_id = table_id.with("reorder-from");
+        let dragging_col: Option<usize> = if self.reorderable.is_empty() {
+            None
+        } else {
+            ui.ctx().data(|d| d.get_temp::<usize>(drag_id))
+        };
+        let drop_target = dragging_col.and_then(|from| {
+            let pointer = ui.ctx().pointer_latest_pos()?;
+            Some(self.drop_slot(rect, &bounds, pointer.x).unwrap_or(from))
+        });
+
         for (i, col) in self.cols.iter().enumerate() {
             let w = self.col_width(i);
             let cell =
                 Rect::from_min_max(Pos2::new(x, rect.top()), Pos2::new(x + w, rect.bottom()));
 
-            let resp = ui.interact(cell, table_id.with(("hdr", col.id)), Sense::click());
+            let movable = self.reorderable.contains(&i);
+            let sense = if movable {
+                Sense::click_and_drag()
+            } else {
+                Sense::click()
+            };
+            let resp = ui.interact(cell, table_id.with(("hdr", col.id)), sense);
             if resp.hovered() {
                 painter.rect_filled(cell, 0.0, Color32::from_white_alpha(6));
             }
             if resp.clicked() {
                 clicked = Some(i);
+            }
+            if movable {
+                if resp.drag_started() {
+                    ui.ctx().data_mut(|d| d.insert_temp(drag_id, i));
+                }
+                if resp.dragged() || resp.drag_stopped() {
+                    ui.ctx().set_cursor_icon(CursorIcon::Grabbing);
+                }
+            }
+            if dragging_col == Some(i) {
+                // The column being carried, dimmed so the insertion marker
+                // rather than the cursor reads as the answer.
+                painter.rect_filled(cell, 0.0, pal.accent.gamma_multiply(0.18));
             }
 
             if i > 0 {
@@ -789,6 +859,35 @@ impl TmTable {
             }
         }
 
+        // Where the carried column would land. Drawn after the cells so the
+        // marker is never painted over by the header it sits between.
+        if let (Some(from), Some(to)) = (dragging_col, drop_target)
+            && from != to
+        {
+            let edge = if to > from {
+                bounds[to + 1]
+            } else {
+                bounds[to]
+            };
+            painter.line_segment(
+                [
+                    Pos2::new(edge, rect.top() + 2.0),
+                    Pos2::new(edge, rect.bottom() - 2.0),
+                ],
+                Stroke::new(2.5, pal.accent),
+            );
+        }
+        // The release can land anywhere, including outside the header, so the
+        // gesture ends on the global pointer state rather than on a response.
+        if dragging_col.is_some() && ui.ctx().input(|i| i.pointer.any_released()) {
+            if let (Some(from), Some(to)) = (dragging_col, drop_target)
+                && from != to
+            {
+                self.pending_reorder = Some((from, to));
+            }
+            ui.ctx().data_mut(|d| d.remove::<usize>(drag_id));
+        }
+
         painter.line_segment(
             [
                 Pos2::new(rect.left(), rect.bottom()),
@@ -798,6 +897,25 @@ impl TmTable {
         );
 
         clicked
+    }
+
+    /// Display slot the pointer is over, clamped into the reorderable range.
+    ///
+    /// Clamping rather than rejecting: dragging a column left past a pinned
+    /// one should park it at the first movable slot, not cancel the gesture.
+    fn drop_slot(&self, rect: Rect, bounds: &[f32], pointer_x: f32) -> Option<usize> {
+        if self.reorderable.is_empty() {
+            return None;
+        }
+        let first = self.reorderable.start;
+        let last = self.reorderable.end - 1;
+        if pointer_x < rect.left() {
+            return Some(first);
+        }
+        let slot = (0..self.cols.len())
+            .find(|i| bounds.get(i + 1).is_some_and(|edge| pointer_x < *edge))
+            .unwrap_or(self.cols.len() - 1);
+        Some(slot.clamp(first, last))
     }
 
     /// One body row. `key` must identify the row's OWNER (pid + start time,
@@ -1077,6 +1195,75 @@ mod tests {
             ],
             None,
         )
+    }
+
+    /// Aggregates are shared across tables with different column counts, so
+    /// laying them out must never walk off the end. The Users table is the
+    /// case that crashed: six machine totals, four numeric columns.
+    #[test]
+    fn aggregates_never_index_past_the_columns() {
+        let users = TmTable::new(
+            "u",
+            vec![
+                TmColumn::text("user", "User", 340.0),
+                TmColumn::text("status", "Status", 190.0),
+                TmColumn::num("cpu", "CPU", 110.0),
+                TmColumn::num("mem", "Mem", 110.0),
+                TmColumn::num("disk", "Disk", 110.0),
+                TmColumn::num("net", "Net", 110.0),
+            ],
+            None,
+        );
+        let totals = ["1", "2", "3", "4", "5", "6"];
+        let touched: Vec<usize> = users
+            .numeric_indices()
+            .zip(totals.iter())
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(touched, vec![2, 3, 4, 5]);
+        assert!(
+            touched.iter().all(|i| *i < users.cols.len()),
+            "aggregate layout ran past the columns"
+        );
+        // ...and a table with more numeric columns than totals stops at the
+        // totals instead of reading past them.
+        assert_eq!(users.numeric_indices().zip(["1"].iter()).count(), 1);
+    }
+
+    /// A column dragged past a PINNED one parks at the first movable slot
+    /// instead of cancelling the gesture — and never lands on the pinned
+    /// column, which would tear the contiguous heat band `heat_cells` paints.
+    #[test]
+    fn a_drop_clamps_into_the_reorderable_range() {
+        let t = TmTable::new(
+            "t",
+            vec![
+                TmColumn::text("name", "Name", 100.0),
+                TmColumn::text("status", "Status", 100.0),
+                TmColumn::num("cpu", "CPU", 100.0),
+                TmColumn::num("mem", "Mem", 100.0),
+                TmColumn::num("gpu", "GPU", 100.0),
+            ],
+            None,
+        )
+        .reorderable(2..5);
+        let rect = Rect::from_min_size(Pos2::ZERO, egui::vec2(500.0, 40.0));
+        let bounds: Vec<f32> = (0..=5).map(|i| i as f32 * 100.0).collect();
+
+        // Over each movable column.
+        assert_eq!(t.drop_slot(rect, &bounds, 250.0), Some(2));
+        assert_eq!(t.drop_slot(rect, &bounds, 350.0), Some(3));
+        assert_eq!(t.drop_slot(rect, &bounds, 450.0), Some(4));
+        // Over Name or Status, and off the left edge entirely.
+        assert_eq!(t.drop_slot(rect, &bounds, 50.0), Some(2));
+        assert_eq!(t.drop_slot(rect, &bounds, 150.0), Some(2));
+        assert_eq!(t.drop_slot(rect, &bounds, -80.0), Some(2));
+        // Past the right edge.
+        assert_eq!(t.drop_slot(rect, &bounds, 9_000.0), Some(4));
+
+        // A table that never opted in has no gesture at all.
+        let fixed = table();
+        assert_eq!(fixed.drop_slot(rect, &bounds, 250.0), None);
     }
 
     #[test]
