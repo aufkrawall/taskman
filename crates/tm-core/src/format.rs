@@ -156,12 +156,23 @@ pub fn format_bytes_loc(bytes: u64) -> String {
     }
 }
 
-/// Disk rate, always MB/s with one decimal like TM: "0,1 MB/s".
+/// Disk rate, MB/s with one decimal like TM: "0,1 MB/s".
+///
+/// Real traffic below the smallest printable step says so rather than
+/// rounding to a flat zero, the same way the neighbouring Network column
+/// does: "0,0 MB/s" on a process steadily moving 30 KB/s is indistinguishable
+/// from an idle one, and telling those two apart is the entire job of this
+/// column.
 pub fn format_rate_mb(bps: f64) -> String {
+    const MB: f64 = 1024.0 * 1024.0;
     if !bps.is_finite() || bps <= 0.0 {
         return "0 MB/s".into();
     }
-    format!("{} MB/s", num_fixed(bps / (1024.0 * 1024.0), 1))
+    let mb = bps / MB;
+    if mb < 0.05 {
+        return format!("<{} MB/s", num_fixed(0.1, 1));
+    }
+    format!("{} MB/s", num_fixed(mb, 1))
 }
 
 /// Negotiated adapter link speed, per UI language: "1,0 GBit/s" / "1.0 Gbps".
@@ -441,6 +452,21 @@ mod tests {
             format!("{} GHz", num_fixed(3.40, 2))
         );
         assert_eq!(format_freq_mhz(0.0), "");
+    }
+
+    /// A steady trickle must not render as an idle process. The Disk column
+    /// exists to tell those apart.
+    #[test]
+    fn a_disk_rate_below_the_printable_step_is_not_a_zero() {
+        const MB: f64 = 1024.0 * 1024.0;
+        assert_eq!(format_rate_mb(0.0), "0 MB/s");
+        assert_eq!(format_rate_mb(-1.0), "0 MB/s");
+        assert_eq!(format_rate_mb(f64::NAN), "0 MB/s");
+        // 205 KB/s — the case that started this — prints normally.
+        assert_eq!(format_rate_mb(205.0 * 1024.0), "0.2 MB/s");
+        // 30 KB/s used to print "0.0 MB/s".
+        assert!(format_rate_mb(30.0 * 1024.0).starts_with('<'));
+        assert_eq!(format_rate_mb(2.5 * MB), "2.5 MB/s");
     }
 
     /// A gigabit adapter is a gigabit adapter. The old helper took bytes and

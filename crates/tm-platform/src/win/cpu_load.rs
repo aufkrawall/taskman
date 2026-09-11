@@ -104,6 +104,9 @@ struct ProcRaw {
     hard_faults: Option<u64>,
     /// Read + write + other I/O operation counts since process start.
     io_ops: Option<u64>,
+    /// `ReadTransferCount` / `WriteTransferCount` since process start.
+    io_read_bytes: Option<u64>,
+    io_write_bytes: Option<u64>,
 }
 
 /// Per-process load for one sampling window.
@@ -123,6 +126,12 @@ pub struct ProcCpu {
     pub io_ops_per_s: Option<f64>,
     /// Hard page faults per second over this window.
     pub hard_faults_per_s: Option<f64>,
+    /// I/O bytes per second over this window, read and written.
+    pub io_read_bps: Option<f64>,
+    pub io_write_bps: Option<f64>,
+    /// Cumulative I/O bytes since process start.
+    pub io_read_total: Option<u64>,
+    pub io_write_total: Option<u64>,
 }
 
 /// One executable image observed among the processes that terminated
@@ -480,6 +489,7 @@ impl CpuLoadAccountant {
             let hard_faults = (pos + off.hard_faults + 4 <= record_end)
                 .then(|| u64::from(read_u32(buf, pos + off.hard_faults)));
             let io_ops = read_io_operation_count(buf, pos, record_end, &off);
+            let io_bytes = read_io_transfer_bytes(buf, pos, record_end, &off);
             let buf_base = buf.as_ptr() as usize;
             let name = parse_image_name(buf, buf_base, pos, written, &off);
 
@@ -508,6 +518,8 @@ impl CpuLoadAccountant {
                         name,
                         hard_faults,
                         io_ops,
+                        io_read_bytes: io_bytes.map(|(read, _)| read),
+                        io_write_bytes: io_bytes.map(|(_, write)| write),
                     },
                 );
             }
@@ -533,14 +545,40 @@ fn read_io_operation_count(
     record_end: usize,
     off: &Offsets,
 ) -> Option<u64> {
-    let base = pos.checked_add(off.io_counters)?;
-    if base.checked_add(IO_COUNTERS_BYTES)? > record_end {
-        return None;
-    }
+    let base = io_counters_base(pos, record_end, off)?;
     let read = nonneg(read_i64(buf, base));
     let write = nonneg(read_i64(buf, base + 8));
     let other = nonneg(read_i64(buf, base + 16));
     Some(read.saturating_add(write).saturating_add(other))
+}
+
+/// `ReadTransferCount` and `WriteTransferCount`: the bytes the Disk column
+/// shows.
+///
+/// These come from the kernel table rather than `GetProcessIoCounters`
+/// because that needs a process HANDLE, and an unelevated session cannot open
+/// a SYSTEM or elevated process — so sysinfo reports a flat ZERO for about
+/// half the list. A measured-looking zero on a process moving 200 KB/s is
+/// exactly the fabricated value this program must never print.
+fn read_io_transfer_bytes(
+    buf: &[u8],
+    pos: usize,
+    record_end: usize,
+    off: &Offsets,
+) -> Option<(u64, u64)> {
+    let base = io_counters_base(pos, record_end, off)?;
+    // Deliberately NOT `OtherTransferCount`: it counts ioctl and device
+    // control payloads, which native Task Manager leaves out of its Disk
+    // column too.
+    Some((
+        nonneg(read_i64(buf, base + 24)),
+        nonneg(read_i64(buf, base + 32)),
+    ))
+}
+
+fn io_counters_base(pos: usize, record_end: usize, off: &Offsets) -> Option<usize> {
+    let base = pos.checked_add(off.io_counters)?;
+    (base.checked_add(IO_COUNTERS_BYTES)? <= record_end).then_some(base)
 }
 
 const THREAD_STATE_WAITING: u32 = 5;
@@ -726,6 +764,10 @@ fn build_sample(
                     total_time_100ns: 0,
                     io_ops_per_s: None,
                     hard_faults_per_s: None,
+                    io_read_bps: None,
+                    io_write_bps: None,
+                    io_read_total: None,
+                    io_write_total: None,
                 },
             );
             continue;
@@ -745,6 +787,8 @@ fn build_sample(
         };
         let io_ops_per_s = rate(cur.io_ops, |p| p.io_ops);
         let hard_faults_per_s = rate(cur.hard_faults, |p| p.hard_faults);
+        let io_read_bps = rate(cur.io_read_bytes, |p| p.io_read_bytes);
+        let io_write_bps = rate(cur.io_write_bytes, |p| p.io_write_bytes);
         let in_window = match prev.procs.get(&pid) {
             // Same identity: the delta since the previous sample.
             Some(p) if p.create_time == cur.create_time => {
@@ -767,6 +811,10 @@ fn build_sample(
                 total_time_100ns: total_now,
                 io_ops_per_s,
                 hard_faults_per_s,
+                io_read_bps,
+                io_write_bps,
+                io_read_total: cur.io_read_bytes,
+                io_write_total: cur.io_write_bytes,
             },
         );
     }
@@ -1060,6 +1108,38 @@ mod tests {
         );
     }
 
+    /// The kernel table must name I/O bytes for processes `OpenProcess`
+    /// refuses, because that is the entire reason the Disk column reads them
+    /// from here: sysinfo's handle-based counters report a flat zero for most
+    /// of session 0, and the Disk column printed "0 MB/s" for a process that
+    /// was moving 200 KB/s.
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn live_kernel_table_yields_io_bytes_for_processes_that_will_not_open() {
+        let mut acc = CpuLoadAccountant::new();
+        let procs = acc.query_procs().expect("NtQuerySystemInformation");
+        let with_bytes = procs
+            .values()
+            .filter(|p| p.io_read_bytes.unwrap_or(0) + p.io_write_bytes.unwrap_or(0) > 0)
+            .count();
+        assert!(
+            with_bytes * 2 >= procs.len(),
+            "only {with_bytes}/{} processes report I/O bytes",
+            procs.len()
+        );
+        // Protected system processes are the ones sysinfo cannot see at all.
+        let protected = procs.values().find(|p| {
+            p.name.eq_ignore_ascii_case("services.exe")
+                || p.name.eq_ignore_ascii_case("wininit.exe")
+        });
+        let protected = protected.expect("no protected system process in the table");
+        assert!(
+            protected.io_read_bytes.unwrap_or(0) + protected.io_write_bytes.unwrap_or(0) > 0,
+            "{} reports no I/O bytes at all",
+            protected.name
+        );
+    }
+
     /// The I/O and hard-fault counters must be REAL on a live machine: every
     /// desktop has processes doing I/O, and a wrong offset would either read
     /// garbage or hand every row the same number. Hard faults are allowed to
@@ -1273,6 +1353,8 @@ mod tests {
             name: name.into(),
             hard_faults: None,
             io_ops: None,
+            io_read_bytes: None,
+            io_write_bytes: None,
         }
     }
 

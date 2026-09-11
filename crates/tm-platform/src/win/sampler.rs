@@ -733,10 +733,25 @@ impl Sampler {
             // counters below cannot answer either question.
             entry.io_ops_per_s = pc.and_then(|c| c.io_ops_per_s);
             entry.hard_faults_per_s = pc.and_then(|c| c.hard_faults_per_s);
-            entry.disk_read_bps = du.read_bytes as f64 / interval_s;
-            entry.disk_write_bps = du.written_bytes as f64 / interval_s;
-            entry.disk_read_total = du.total_read_bytes;
-            entry.disk_write_total = du.total_written_bytes;
+            // I/O bytes come from the kernel table first. sysinfo reads them
+            // through `GetProcessIoCounters`, which needs a process HANDLE, so
+            // it reports a flat ZERO for every SYSTEM or elevated process an
+            // unelevated session cannot open — about half the list. That is
+            // how the Disk column showed "0 MB/s" for a downloader moving
+            // 200 KB/s. sysinfo stays as the fallback for the handful of
+            // records the table cannot reach that far into.
+            entry.disk_read_bps = pc
+                .and_then(|c| c.io_read_bps)
+                .unwrap_or_else(|| du.read_bytes as f64 / interval_s);
+            entry.disk_write_bps = pc
+                .and_then(|c| c.io_write_bps)
+                .unwrap_or_else(|| du.written_bytes as f64 / interval_s);
+            entry.disk_read_total = pc
+                .and_then(|c| c.io_read_total)
+                .unwrap_or(du.total_read_bytes);
+            entry.disk_write_total = pc
+                .and_then(|c| c.io_write_total)
+                .unwrap_or(du.total_written_bytes);
             entry.has_window = has_window;
             entry.service_name = service_catalog
                 .names_by_pid

@@ -11,6 +11,33 @@
 - 2026-09-08: Process Properties now summarizes mitigations with System Informer-style qualifiers (permanent DEP, high-entropy ASLR, prohibited/disabled wording, CF Guard and stack protection), and module inventory uses the authenticated LocalSystem broker for identity-bound SYSTEM/service inspection with bounded responses.
 # Recent Activity
 
+## 2026-09-11 — The Disk column was zero for half the process list
+
+User report: `BackgroundDownload.exe` showed `0 MB/s` in the Disk column while
+native Task Manager showed about 200 KB/s for it. Measured with
+`\Prozess(*)\E/A-Datenbytes/s`: 205 KB/s, real.
+
+Same root cause as the image-path bug earlier today. `disk_read_bps` /
+`disk_write_bps` came from sysinfo's `disk_usage()`, which is
+`GetProcessIoCounters` and needs a process HANDLE — so every SYSTEM or
+elevated process reported a flat, measured-looking ZERO. The
+`SYSTEM_PROCESS_INFORMATION` table `cpu_load.rs` already reads every tick
+carries `ReadTransferCount`/`WriteTransferCount` for every process; the Disk
+column now takes them from there and keeps sysinfo only as a fallback.
+Coverage went from roughly half the list to 191/241. `OtherTransferCount` is
+deliberately excluded — native Task Manager leaves ioctl payloads out of its
+Disk column too.
+
+`format_rate_mb` also rounded anything under 51 KB/s to "0,0 MB/s", which is
+indistinguishable from idle — the exact thing the column exists to tell apart.
+It now prints "<0,1 MB/s", the convention the Network column already used.
+
+What the two disk columns mean, for the record: **Disk** is I/O BYTES the
+process requested (cache hits, pipes and sockets included — this is what
+native TM shows), **Disk activity** is its share of the time the disks were
+really busy (ETW). A process can top one and not the other; that is the point
+of having both.
+
 ## 2026-09-11 — Draggable Processes columns (and the crash that came with them)
 
 The Processes page's numeric columns can now be dragged into any order in the

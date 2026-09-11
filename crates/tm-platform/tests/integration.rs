@@ -139,6 +139,24 @@ fn sample_produces_sane_snapshot() {
         "only {with_session}/{} processes have a session id",
         real.len()
     );
+
+    // Same story for the Disk column. sysinfo reads I/O bytes through
+    // `GetProcessIoCounters`, which needs a handle, so it reported a flat zero
+    // for the whole protected half of the list — the Disk column showed
+    // "0 MB/s" for a downloader moving 200 KB/s. The bytes now come from the
+    // kernel process table, which answers for everything.
+    let protected = real
+        .iter()
+        .find(|p| {
+            p.name.eq_ignore_ascii_case("services.exe")
+                || p.name.eq_ignore_ascii_case("wininit.exe")
+        })
+        .expect("no protected system process in the snapshot");
+    assert!(
+        protected.disk_read_total + protected.disk_write_total > 0,
+        "{} reports no I/O bytes; the Disk column is back on handle-based counters",
+        protected.name
+    );
     assert!(!s2.disks.is_empty());
     for d in &s2.disks {
         assert!(d.total_bytes > 0 || d.media == MediaKind::Unknown);

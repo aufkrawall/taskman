@@ -97,6 +97,13 @@ pub fn run(mock: bool) -> i32 {
             .iter()
             .filter(|p| !p.synthetic && p.disk_active_pct.is_none())
             .count(),
+        // How many processes report a non-zero Disk column. sysinfo's
+        // handle-based counters left this at roughly half the list.
+        "process_disk_bytes_readings": snap
+            .processes
+            .iter()
+            .filter(|p| !p.synthetic && p.disk_read_total + p.disk_write_total > 0)
+            .count(),
         "process_io_ops_readings": snap
             .processes
             .iter()
