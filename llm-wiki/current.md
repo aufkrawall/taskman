@@ -194,10 +194,13 @@ rebase runbook.
 - Context menus are drawn by `widgets/menu.rs`: uniform 28 px full-width rows
   with no gaps, a painted check gutter instead of checkbox widgets, and
   submenus in the same style. Every tab's menus and the `…` overflow menus go
-  through it. The subject caption (`menu::title`, e.g. the process name) is a
-  flat, slightly raised band with dimmed text, so an inert row is not mistaken
-  for the first command in the list. It stays borderless on purpose: an
-  outlined box at the top of a popup reads as a text field.
+  through it. The subject caption (`menu::title`, e.g. the process name) is
+  unpainted, full-strength text closed off by a separator: it never lights up
+  under the cursor, which is what marks it inert. Painting it is a rejected
+  approach — an outlined chip read as a text field and a filled band as a
+  selected row, and dimming the text only hurt legibility. Separators derive
+  their hairline from the popup surface (`menu::hairline`), not `pal.stroke`,
+  which is mixed for the window background and vanishes on a popup.
 - Scroll bars reserve their lane (`floating_allocated_width`) instead of
   painting over the last ~14 px of content. `tablekit` mirrors the body's
   reservation onto the header so the two stay aligned.

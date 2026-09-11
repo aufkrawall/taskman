@@ -307,7 +307,7 @@ pub fn submenu(ui: &mut Ui, text: &str, content: impl FnOnce(&mut Ui)) -> Respon
 
 /// A full-width divider between groups of entries.
 pub fn separator(ui: &mut Ui) {
-    let pal = theme::palette(ui);
+    let color = hairline(ui.visuals().window_fill, theme::palette(ui).text);
     let (rect, _) = ui.allocate_at_least(egui::vec2(GUTTER_W, SEP_H), Sense::hover());
     let y = rect.center().y.round() + 0.5;
     ui.painter().line_segment(
@@ -315,48 +315,46 @@ pub fn separator(ui: &mut Ui) {
             Pos2::new(rect.left() + 8.0, y),
             Pos2::new(rect.right() - 8.0, y),
         ],
-        Stroke::new(1.0, pal.stroke),
+        Stroke::new(1.0, color),
     );
 }
 
-/// A non-interactive caption row naming the subject of the menu (the process
-/// it was opened on).
-///
-/// Painted as a flat, slightly raised band with dimmed text rather than as
-/// bare text: at the top of a column of identically laid out rows, a plain
-/// label reads as the first entry of the menu and invites a click that does
-/// nothing. The band is deliberately borderless and flat — an outlined box at
-/// the top of a popup reads as a text field, which is worse than the problem
-/// it fixes.
-pub fn title(ui: &mut Ui, text: &str) {
-    let pal = theme::palette(ui);
-    let popup = ui.visuals().window_fill;
-    let want = egui::vec2(desired_width(ui, text, Marks::default()), ITEM_H);
-    let (rect, _) = ui.allocate_at_least(want, Sense::hover());
-    ui.painter().rect_filled(
-        rect.shrink2(egui::vec2(HIGHLIGHT_INSET, 0.0)),
-        CornerRadius::same(4),
-        caption_fill(popup, pal.text),
-    );
-    ui.painter().text(
-        Pos2::new(rect.left() + GUTTER_W, rect.center().y),
-        egui::Align2::LEFT_CENTER,
-        text,
-        FontId::proportional(FONT_SIZE + 0.5),
-        pal.text_dim,
-    );
-}
-
-/// Caption band fill: the popup's own surface nudged toward the text colour,
-/// so the band separates from the menu body in both themes without turning
-/// into a second hover highlight.
-fn caption_fill(popup: Color32, text: Color32) -> Color32 {
-    let mix = |a: u8, b: u8| (a as f32 + (b as f32 - a as f32) * 0.07).round() as u8;
+/// Hairline colour for rules drawn ON the popup surface. `pal.stroke` is mixed
+/// against the window background, which is several shades darker than the
+/// popup: on dark it lands two values off the fill (0x2d on 0x2b) and the rule
+/// reads as a dead gap. Deriving it from the surface keeps one visible
+/// hairline in both themes.
+fn hairline(popup: Color32, text: Color32) -> Color32 {
+    let mix = |a: u8, b: u8| (a as f32 + (b as f32 - a as f32) * 0.11).round() as u8;
     Color32::from_rgb(
         mix(popup.r(), text.r()),
         mix(popup.g(), text.g()),
         mix(popup.b(), text.b()),
     )
+}
+
+/// A non-interactive caption row naming the subject of the menu (the process
+/// it was opened on).
+///
+/// Full-strength text over the bare popup surface, closed off by the
+/// [`separator`] its callers draw underneath. Every painted shape tried here —
+/// an outlined chip, a filled band — borrowed the look of a control (a text
+/// field, a selected row) and read as more clickable than the plain label it
+/// replaced; dimming the text instead only made the one line the user came to
+/// read the hardest one to read. What marks the row as inert is that it never
+/// lights up under the cursor and that a visible rule separates it from the
+/// commands below.
+pub fn title(ui: &mut Ui, text: &str) {
+    let pal = theme::palette(ui);
+    let want = egui::vec2(desired_width(ui, text, Marks::default()), ITEM_H);
+    let (rect, _) = ui.allocate_at_least(want, Sense::hover());
+    ui.painter().text(
+        Pos2::new(rect.left() + GUTTER_W, rect.center().y),
+        egui::Align2::LEFT_CENTER,
+        text,
+        FontId::proportional(FONT_SIZE + 0.5),
+        pal.text,
+    );
 }
 
 #[cfg(test)]
