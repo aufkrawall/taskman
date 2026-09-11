@@ -9,7 +9,9 @@ use tm_core::i18n::{self, K};
 use crate::app::{HistoryPoint, TaskManApp};
 use crate::search;
 use crate::theme::{self, Palette};
-use crate::widgets::chart::{MultiSeries, ValueFmt, chart_multi, core_chart, fmt_percent};
+use crate::widgets::chart::{
+    MultiSeries, TimeAxis, ValueFmt, chart_multi, core_chart, fmt_percent,
+};
 use crate::widgets::menu;
 
 /// Time-based visible slice: every point whose timestamp lies inside the
@@ -614,12 +616,12 @@ fn page_chart(
     height: f32,
     series: &[MultiSeries],
     y_max: f64,
-    ts: Option<&[u64]>,
+    axis: Option<TimeAxis>,
     fmt: ValueFmt,
 ) -> egui::Response {
     ui.horizontal(|ui| {
         ui.add_space(GUTTER);
-        chart_multi(ui, egui::vec2(width, height), series, y_max, ts, fmt)
+        chart_multi(ui, egui::vec2(width, height), series, y_max, axis, fmt)
     })
     .inner
 }
@@ -1009,6 +1011,7 @@ fn cpu_page(app: &mut TaskManApp, ui: &mut egui::Ui, pal: &Palette) {
     // of `app` up front so interaction callbacks can take &mut freely.
     let win = window(app);
     let ts = timestamps(win);
+    let axis = TimeAxis::new(&ts, app.shared.settings.graph_seconds);
     let total_series = series(win, |h| h.cpu_total as f64);
     let kernel_series = series(win, |h| h.cpu_kernel as f64);
     let cores = snap.cpu.per_core_pct.len();
@@ -1059,7 +1062,7 @@ fn cpu_page(app: &mut TaskManApp, ui: &mut egui::Ui, pal: &Palette) {
                             kernels.then(|| (core_kern[i].as_slice(), kernel_color(pal))),
                             pal.cpu_graph,
                             &format!("CPU {i}"),
-                            Some(&ts),
+                            Some(axis),
                         );
                         cpu_graph_context_menu(app, &response);
                         if (i + 1) % cols == 0 {
@@ -1090,7 +1093,7 @@ fn cpu_page(app: &mut TaskManApp, ui: &mut egui::Ui, pal: &Palette) {
             180.0,
             &chart_series,
             100.0,
-            Some(&ts),
+            Some(axis),
             fmt_percent,
         );
         cpu_graph_context_menu(app, &resp);
@@ -1298,6 +1301,7 @@ fn memory_page(app: &mut TaskManApp, ui: &mut egui::Ui, pal: &Palette) {
 
     let win = window(app);
     let ts = timestamps(win);
+    let axis = TimeAxis::new(&ts, app.shared.settings.graph_seconds);
     let width = content_width(ui);
     let used: Vec<f64> = series(win, |h| h.mem_used_bytes as f64 / 1024.0 / 1024.0 / 1024.0);
     page_chart(
@@ -1310,7 +1314,7 @@ fn memory_page(app: &mut TaskManApp, ui: &mut egui::Ui, pal: &Palette) {
             pal.memory_graph,
         )],
         total_gb.max(0.1),
-        Some(&ts),
+        Some(axis),
         fmt_gib,
     );
 
@@ -1334,7 +1338,7 @@ fn memory_page(app: &mut TaskManApp, ui: &mut egui::Ui, pal: &Palette) {
             theme::toned(pal, pal.memory_graph, 0.62),
         )],
         commit_limit.max(0.1),
-        Some(&ts),
+        Some(axis),
         fmt_gib,
     );
 
@@ -1472,6 +1476,7 @@ fn disk_page(app: &mut TaskManApp, ui: &mut egui::Ui, pal: &Palette, entry: &Res
 
     let win = window(app);
     let ts = timestamps(win);
+    let axis = TimeAxis::new(&ts, app.shared.settings.graph_seconds);
     let width = content_width(ui);
     let active = disk_series(win, &entry.key, |d| d.1 as f64);
     page_chart(
@@ -1484,7 +1489,7 @@ fn disk_page(app: &mut TaskManApp, ui: &mut egui::Ui, pal: &Palette, entry: &Res
             pal.disk_graph,
         )],
         100.0,
-        Some(&ts),
+        Some(axis),
         fmt_percent,
     );
 
@@ -1516,7 +1521,7 @@ fn disk_page(app: &mut TaskManApp, ui: &mut egui::Ui, pal: &Palette, entry: &Res
             MultiSeries::new(i18n::tr(K::StatWrite), write, pal.disk_write_graph),
         ],
         peak,
-        Some(&ts),
+        Some(axis),
         fmt_byte_rate,
     );
 
@@ -1599,6 +1604,7 @@ fn network_page(app: &mut TaskManApp, ui: &mut egui::Ui, pal: &Palette, entry: &
 
     let win = window(app);
     let ts = timestamps(win);
+    let axis = TimeAxis::new(&ts, app.shared.settings.graph_seconds);
     let width = content_width(ui);
 
     let recv = net_series(win, &entry.key, 1);
@@ -1625,7 +1631,7 @@ fn network_page(app: &mut TaskManApp, ui: &mut egui::Ui, pal: &Palette, entry: &
             MultiSeries::new(i18n::tr(K::StatSend), sent, pal.network_send_graph),
         ],
         peak,
-        Some(&ts),
+        Some(axis),
         fmt_byte_rate,
     );
 
@@ -1713,6 +1719,7 @@ fn gpu_page(app: &mut TaskManApp, ui: &mut egui::Ui, pal: &Palette, entry: &Reso
 
     let win = window(app);
     let ts = timestamps(win);
+    let axis = TimeAxis::new(&ts, app.shared.settings.graph_seconds);
     let width = content_width(ui);
 
     // Which engine the top graph shows. An engine this adapter never reported
@@ -1775,7 +1782,7 @@ fn gpu_page(app: &mut TaskManApp, ui: &mut egui::Ui, pal: &Palette, entry: &Reso
         150.0,
         &series_list,
         100.0,
-        Some(&ts),
+        Some(axis),
         fmt_percent,
     );
 
@@ -1807,7 +1814,7 @@ fn gpu_page(app: &mut TaskManApp, ui: &mut egui::Ui, pal: &Palette, entry: &Reso
             theme::toned(pal, pal.gpu_graph, 0.62),
         )],
         max_mib,
-        Some(&ts),
+        Some(axis),
         fmt_mib,
     );
 

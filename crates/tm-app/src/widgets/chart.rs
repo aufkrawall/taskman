@@ -29,6 +29,41 @@ pub fn fmt_percent(v: f64) -> String {
     format!("{} %", tm_core::format::num_fixed(v, 1))
 }
 
+/// The x axis of a rolling chart: when the samples were taken, and how wide
+/// the axis is in time.
+///
+/// `window_ms` is the CONFIGURED window ("60 seconds"), never the extent of
+/// whatever data has arrived so far. Deriving the axis from the samples — as
+/// `last - first` — lets it rescale itself while the history fills: eight
+/// seconds of data stretched across a caption that says sixty, with every new
+/// sample squeezing the older ones a little further left instead of scrolling
+/// them. What that looks like on screen is a graph whose left half is frozen
+/// while only the right edge moves. Anchoring the axis to the window leaves
+/// the part of it that has no data yet empty, and scrolls everything at the
+/// one rate.
+#[derive(Clone, Copy)]
+pub struct TimeAxis<'a> {
+    pub stamps: &'a [u64],
+    pub window_ms: u64,
+}
+
+impl<'a> TimeAxis<'a> {
+    pub fn new(stamps: &'a [u64], window_s: u32) -> Self {
+        Self {
+            stamps,
+            window_ms: u64::from(window_s) * 1_000,
+        }
+    }
+
+    /// `(left edge instant, axis width)`, or `None` for an axis with nothing
+    /// on it yet. The right edge is the newest sample.
+    fn bounds(&self) -> Option<(u64, u64)> {
+        let end = *self.stamps.last()?;
+        let window = self.window_ms.max(1);
+        Some((end.saturating_sub(window), window))
+    }
+}
+
 // ------------------------------------------------------------ series colours
 
 /// Opacity of a series' area fill. Deliberately well under half strength so
@@ -323,6 +358,22 @@ fn paint_marker(
     }
 }
 
+/// x of sample `i` on `axis`, falling back to `fallback` (even spacing) when
+/// the chart has no axis, or the axis is short of that sample.
+fn x_on_axis(
+    rect: Rect,
+    axis: Option<TimeAxis>,
+    bounds: Option<(u64, u64)>,
+    i: usize,
+    fallback: f32,
+) -> f32 {
+    let Some(((t0, span), stamp)) = bounds.zip(axis.and_then(|a| a.stamps.get(i).copied())) else {
+        return fallback;
+    };
+    let t = stamp.saturating_sub(t0);
+    rect.left() + rect.width() * (t as f32 / span as f32).clamp(0.0, 1.0)
+}
+
 /// Index of the sample closest to `frac` of the way through the window.
 ///
 /// The arithmetic is deliberately u64/f64. Timestamps are milliseconds since
@@ -445,8 +496,8 @@ fn hover_pos(ui: &egui::Ui, response: &Response, rect: Rect) -> Option<Pos2> {
 
 /// Age caption for sample `idx` of `timestamps_ms`, relative to the newest
 /// sample in the window. Empty when the caller charted without timestamps.
-fn sample_age(timestamps_ms: Option<&[u64]>, idx: usize) -> String {
-    let Some(ts) = timestamps_ms else {
+fn sample_age(axis: Option<TimeAxis>, idx: usize) -> String {
+    let Some(ts) = axis.map(|a| a.stamps) else {
         return String::new();
     };
     let (Some(&at), Some(&last)) = (ts.get(idx), ts.last()) else {
@@ -541,7 +592,7 @@ pub fn core_chart(
     kernels: Option<(&[f64], Color32)>,
     color: Color32,
     label: &str,
-    timestamps_ms: Option<&[u64]>,
+    axis: Option<TimeAxis>,
 ) -> Response {
     let (alloc, response) = ui.allocate_exact_size(size, egui::Sense::click());
     let pal = crate::theme::palette(ui);
@@ -555,7 +606,12 @@ pub fn core_chart(
         return response;
     }
     let n = samples.len();
-    let x = |i: usize| rect.left() + rect.width() * i as f32 / (n - 1) as f32;
+    // Window-anchored x, exactly as on the big charts (see [`TimeAxis`]): a
+    // tile that spread whatever it had across its full width was compressing
+    // its own history rather than scrolling it.
+    let bounds = axis.and_then(|a| a.bounds());
+    let even = |i: usize| rect.left() + rect.width() * i as f32 / (n - 1) as f32;
+    let x = |i: usize| x_on_axis(rect, axis, bounds, i, even(i));
     let y = |v: f64| rect.bottom() - (v.clamp(0.0, 100.0) / 100.0) as f32 * rect.height();
     let pts: Vec<Pos2> = samples
         .iter()
@@ -579,8 +635,11 @@ pub fn core_chart(
 
     if let Some(pos) = hover_pos(ui, &response, rect) {
         let frac = ((pos.x - rect.left()) / rect.width()).clamp(0.0, 1.0);
-        let idx = ((frac * (n - 1) as f32).round() as usize).min(n - 1);
-        let idx = pinned_sample(ui.ctx(), response.id, timestamps_ms, pos, idx).min(n - 1);
+        let idx = match (bounds, axis) {
+            (Some((t0, span)), Some(a)) => nearest_sample(a.stamps, t0, span, frac),
+            _ => ((frac * (n - 1) as f32).round() as usize).min(n - 1),
+        };
+        let idx = pinned_sample(ui.ctx(), response.id, axis.map(|a| a.stamps), pos, idx).min(n - 1);
         let mut rows = vec![ReadoutRow {
             color,
             label: label.to_owned(),
@@ -596,7 +655,7 @@ pub fn core_chart(
             dots.push((y(k), kernel_color));
         }
         paint_marker(&painter, &pal, rect, ppp, x(idx), &dots);
-        readout(ui, pos, &sample_age(timestamps_ms, idx), &rows);
+        readout(ui, pos, &sample_age(axis, idx), &rows);
     }
     response
 }
@@ -632,7 +691,7 @@ pub fn chart_multi(
     size: Vec2,
     series: &[MultiSeries],
     y_max: f64,
-    timestamps_ms: Option<&[u64]>,
+    axis: Option<TimeAxis>,
     fmt: ValueFmt,
 ) -> Response {
     let (alloc, response) = ui.allocate_exact_size(size, egui::Sense::click());
@@ -644,14 +703,8 @@ pub fn chart_multi(
     paint_frame(&painter, rect, ppp, &pal, 6, 4);
 
     let y = |v: f64| rect.bottom() - (v.clamp(0.0, y_max) / y_max) as f32 * rect.height();
-    // Time-proportional x mapping over the shared window. `saturating_sub`
-    // because a wall-clock step backward can put a future-stamped older
-    // point at the front (then `last - first` would underflow/wrap).
-    let t_span = timestamps_ms.and_then(|ts| {
-        let first = *ts.first()?;
-        let last = *ts.last()?;
-        Some((first, last.saturating_sub(first).max(1)))
-    });
+    // Time-proportional x over the CONFIGURED window — see [`TimeAxis`].
+    let bounds = axis.and_then(|a| a.bounds());
     // Callers must hand over one timestamp per sample (every series extractor
     // maps over the same window). Indexing blind would turn a future
     // desynchronization — a bug class this code has already seen once, see
@@ -659,16 +712,7 @@ pub fn chart_multi(
     // path, i.e. a crashed task manager. A short timestamp slice degrades to
     // even spacing for the samples it cannot place instead.
     let even = |i: usize, n: usize| rect.left() + rect.width() * i as f32 / (n - 1) as f32;
-    let x_at = |i: usize, n: usize| match t_span {
-        Some((t0, span)) => match timestamps_ms.and_then(|ts| ts.get(i)) {
-            Some(stamp) => {
-                let t = stamp.saturating_sub(t0);
-                rect.left() + rect.width() * (t as f32 / span as f32).clamp(0.0, 1.0)
-            }
-            None => even(i, n),
-        },
-        None => even(i, n),
-    };
+    let x_at = |i: usize, n: usize| x_on_axis(rect, axis, bounds, i, even(i, n));
     for s in series {
         let n = s.samples.len();
         if n < 2 {
@@ -704,10 +748,10 @@ pub fn chart_multi(
         let frac = ((pos.x - rect.left()) / rect.width()).clamp(0.0, 1.0);
         // Time-proportional x: map the pointer TIME back to the nearest
         // sample — even-spacing math skips across sampling gaps.
-        let time_idx = t_span
-            .zip(timestamps_ms)
-            .map(|((t0, span), ts)| nearest_sample(ts, t0, span, frac))
-            .map(|under| pinned_sample(ui.ctx(), response.id, timestamps_ms, pos, under));
+        let time_idx = bounds
+            .zip(axis)
+            .map(|((t0, span), a)| nearest_sample(a.stamps, t0, span, frac))
+            .map(|under| pinned_sample(ui.ctx(), response.id, axis.map(|a| a.stamps), pos, under));
         let mut rows = Vec::with_capacity(series.len());
         let mut dots = Vec::with_capacity(series.len());
         let mut marker = None;
@@ -734,7 +778,7 @@ pub fn chart_multi(
         }
         if let Some((x, idx)) = marker {
             paint_marker(&painter, &pal, rect, ppp, x, &dots);
-            readout(ui, pos, &sample_age(timestamps_ms, idx), &rows);
+            readout(ui, pos, &sample_age(axis, idx), &rows);
         }
     }
     response
@@ -771,7 +815,7 @@ mod tests {
                         Vec2::new(320.0, 120.0),
                         &[MultiSeries::new("CPU", samples.clone(), Color32::BLUE)],
                         100.0,
-                        Some(&stamps),
+                        Some(TimeAxis::new(&stamps, 1)),
                         fmt_percent,
                     );
                 },
@@ -971,6 +1015,87 @@ mod tests {
         assert!(ctx.data(|d| d.get_temp::<Pin>(pin_id(id))).is_none());
     }
 
+    /// x positions of the painted polyline, in order.
+    fn painted_xs(width: f32, stamps: &[u64], window_s: u32) -> Vec<f32> {
+        let ctx = egui::Context::default();
+        let samples: Vec<f64> = stamps.iter().map(|t| (t % 97) as f64).collect();
+        let mut output = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(
+                    Pos2::ZERO,
+                    egui::vec2(width + 40.0, 200.0),
+                )),
+                ..Default::default()
+            },
+            |ui| {
+                chart_multi(
+                    ui,
+                    Vec2::new(width, 120.0),
+                    &[MultiSeries::new("s", samples.clone(), Color32::BLUE)],
+                    100.0,
+                    Some(TimeAxis::new(stamps, window_s)),
+                    fmt_percent,
+                );
+            },
+        );
+        output.textures_delta.clear();
+        output
+            .shapes
+            .iter()
+            .find_map(|s| match &s.shape {
+                Shape::Path(path) => Some(path.points.iter().map(|p| p.x).collect()),
+                _ => None,
+            })
+            .expect("the series paints a polyline")
+    }
+
+    /// Every sample must move left at the same rate as the window rolls, and
+    /// a window that is not full yet must leave its unfilled part EMPTY.
+    ///
+    /// The axis used to be derived from the samples (`last - first`), which
+    /// pins the oldest sample to the left edge no matter how little history
+    /// there is: a half-filled window drew 30 s of data across a caption that
+    /// said 60, and each new sample squeezed the older ones a little further
+    /// left instead of scrolling them. On screen that is a graph whose left
+    /// side sits still while only the right edge moves.
+    #[test]
+    fn the_axis_spans_the_configured_window_not_the_samples_it_has() {
+        const W: f32 = 600.0;
+        let t0 = 1_797_000_000_000u64;
+        // Ten seconds of a sixty-second window: the curve occupies the last
+        // sixth of the chart and nothing is drawn over the rest.
+        let filling: Vec<u64> = (0..=10).map(|i| t0 + i * 1_000).collect();
+        let xs = painted_xs(W, &filling, 60);
+        assert!(
+            xs[0] > W * 0.8,
+            "a tenth of the window was stretched across {}% of the chart",
+            (100.0 * (W - xs[0]) / W) as i32
+        );
+        assert!(
+            (xs[xs.len() - 1] - W).abs() < 0.5,
+            "newest sample is not at the right edge"
+        );
+
+        // One tick later every sample has moved left by one second's worth of
+        // width — including the oldest one.
+        let rolled: Vec<u64> = (0..=11).map(|i| t0 + i * 1_000).collect();
+        let next = painted_xs(W, &rolled, 60);
+        let step = W / 60.0;
+        for (before, after) in xs.iter().zip(next.iter()) {
+            assert!(
+                (before - after - step).abs() < 0.5,
+                "sample moved {} px, expected {step}",
+                before - after
+            );
+        }
+
+        // A full window still fills the chart edge to edge.
+        let full: Vec<u64> = (0..=60).map(|i| t0 + i * 1_000).collect();
+        let xs = painted_xs(W, &full, 60);
+        assert!(xs[0].abs() < 0.5, "oldest sample is not at the left edge");
+        assert!((xs[xs.len() - 1] - W).abs() < 0.5);
+    }
+
     #[test]
     fn sparkline_percentage_and_raw_rate_scales_are_distinct() {
         assert_eq!(sparkline_y_max(&[0.0, 25.0, 83.0]), 100.0);
@@ -1086,7 +1211,7 @@ mod tests {
                             Vec2::new(400.0, 150.0),
                             &[MultiSeries::new("Receive", samples.clone(), Color32::BLUE)],
                             100.0,
-                            Some(&stamps),
+                            Some(TimeAxis::new(&stamps, 60)),
                             fmt_percent,
                         );
                     } else {
@@ -1097,7 +1222,7 @@ mod tests {
                             None,
                             Color32::BLUE,
                             "CPU 0",
-                            Some(&stamps),
+                            Some(TimeAxis::new(&stamps, 60)),
                         );
                     }
                 });
@@ -1169,12 +1294,13 @@ mod tests {
     #[test]
     fn sample_age_reports_distance_from_the_newest_sample() {
         let ts: Vec<u64> = (0..=12).map(|i| i * 5_000).collect();
-        assert_eq!(sample_age(Some(&ts), 12), i18n::tr(K::GraphNow));
-        assert!(sample_age(Some(&ts), 10).contains("10"));
+        let axis = TimeAxis::new(&ts, 60);
+        assert_eq!(sample_age(Some(axis), 12), i18n::tr(K::GraphNow));
+        assert!(sample_age(Some(axis), 10).contains("10"));
         // Beyond a minute it switches to m:ss.
-        assert!(sample_age(Some(&ts), 0).contains("1:00"));
+        assert!(sample_age(Some(axis), 0).contains("1:00"));
         assert!(sample_age(None, 0).is_empty());
         // An out-of-range index is a caller slip, not a panic.
-        assert!(sample_age(Some(&ts), 99).is_empty());
+        assert!(sample_age(Some(axis), 99).is_empty());
     }
 }

@@ -547,7 +547,8 @@ rebase runbook.
 - Telemetry: TelemetryDemand gating (GPU/PDH groups warm on demand),
   LUID-aware multi-GPU merge (busiest-engine semantics, dominant engine
   label per process), real token elevation/UAC virtualization/EcoQoS state,
-  time-based graph windows with timestamp-proportional x positions, CPU
+  time-based graph windows whose x axis spans the CONFIGURED window
+  (`chart::TimeAxis`) rather than the extent of the samples on hand, CPU
   Overall/Logical modes with kernel-times overlay.
 - Build: `build.py` release driver (host + Linux by default), profiles
   tuned for compile speed (thin LTO, parallel codegen, line-tables-only
