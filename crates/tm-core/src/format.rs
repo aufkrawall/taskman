@@ -164,19 +164,21 @@ pub fn format_rate_mb(bps: f64) -> String {
     format!("{} MB/s", num_fixed(bps / (1024.0 * 1024.0), 1))
 }
 
-/// Link speed per UI language: "0 MBit/s" (de) / "0 Mbps" (en).
+/// Negotiated adapter link speed, per UI language: "1,0 GBit/s" / "1.0 Gbps".
 ///
-/// Only for the NEGOTIATED LINK RATE of an adapter, which the whole industry
-/// quotes in bits ("1 Gbps", "2.5 Gbps"). Measured throughput uses
-/// [`format_rate`] instead: a task manager that prints traffic in kbps makes
-/// every realistic transfer unreadable, which is exactly the complaint that
-/// moved the Ethernet page to byte units.
-pub fn format_mbit(bps: f64) -> String {
+/// Takes BITS per second, which is what `TransmitLinkSpeed` and Linux's
+/// `sysfs` `speed` both report and what `NetworkInfo::link_bps` documents.
+/// The previous helper took bytes and multiplied by eight, so a 1 Gbit/s
+/// adapter was reported as "8000 MBit/s".
+///
+/// Link speed is the one network number that stays in bits: the whole industry
+/// quotes adapters that way. Measured throughput uses [`format_rate`].
+pub fn format_link_speed(bits_per_s: f64) -> String {
     let unit = i18n::unit_mbit_per_s();
-    if !bps.is_finite() || bps <= 0.0 {
+    if !bits_per_s.is_finite() || bits_per_s <= 0.0 {
         return format!("0 {unit}");
     }
-    let mbit = bps * 8.0 / (1000.0 * 1000.0);
+    let mbit = bits_per_s / (1000.0 * 1000.0);
     if mbit >= 1000.0 {
         return format!(
             "{} {}",
@@ -190,7 +192,6 @@ pub fn format_mbit(bps: f64) -> String {
         format!("{} {unit}", num_fixed(mbit, 1))
     }
 }
-
 /// Per-process network rate for the Processes / App History tables.
 ///
 /// Native Task Manager fixes this column to Mbit/s, where realistic
@@ -440,6 +441,18 @@ mod tests {
             format!("{} GHz", num_fixed(3.40, 2))
         );
         assert_eq!(format_freq_mhz(0.0), "");
+    }
+
+    /// A gigabit adapter is a gigabit adapter. The old helper took bytes and
+    /// multiplied by eight, so the Performance page reported "8000 MBit/s".
+    #[test]
+    fn link_speed_reads_the_negotiated_rate_in_bits() {
+        assert_eq!(format_link_speed(1_000_000_000.0), "1.0 Gbps");
+        assert_eq!(format_link_speed(2_500_000_000.0), "2.5 Gbps");
+        assert_eq!(format_link_speed(100_000_000.0), "100 Mbps");
+        assert_eq!(format_link_speed(54_000_000.0), "54.0 Mbps");
+        assert_eq!(format_link_speed(0.0), "0 Mbps");
+        assert_eq!(format_link_speed(f64::NAN), "0 Mbps");
     }
 
     /// The chart scale must cover the data, stay put while traffic wanders

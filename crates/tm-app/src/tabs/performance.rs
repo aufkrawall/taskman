@@ -1668,7 +1668,7 @@ fn network_page(app: &mut TaskManApp, ui: &mut egui::Ui, pal: &Palette, entry: &
                         ui,
                         pal,
                         i18n::tr(K::KvLinkSpeed),
-                        &format::format_mbit(net.link_bps as f64),
+                        &format::format_link_speed(net.link_bps as f64),
                     );
                 }
                 if let Some(ssid) = &net.ssid {

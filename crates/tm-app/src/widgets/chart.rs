@@ -266,14 +266,55 @@ fn readout(ui: &egui::Ui, at: Pos2, head: &str, rows: &[ReadoutRow]) {
 }
 
 /// Vertical marker at the hovered sample plus a dot on each series.
-fn paint_marker(painter: &egui::Painter, rect: Rect, ppp: f32, x: f32, dots: &[(f32, Color32)]) {
+///
+/// The colour comes from the palette rather than a fixed white alpha: a
+/// translucent white hairline is invisible on the light theme's card fill, and
+/// barely visible on the dark one.
+fn paint_marker(
+    painter: &egui::Painter,
+    pal: &crate::theme::Palette,
+    rect: Rect,
+    ppp: f32,
+    x: f32,
+    dots: &[(f32, Color32)],
+) {
     let x = snap_line(x, ppp);
     painter.line_segment(
         [Pos2::new(x, rect.top()), Pos2::new(x, rect.bottom())],
-        Stroke::new(hairline(ppp), Color32::from_white_alpha(64)),
+        Stroke::new(hairline(ppp).max(1.0), pal.text_dim),
     );
     for (y, color) in dots {
         painter.circle_filled(Pos2::new(x, *y), 2.6, *color);
+    }
+}
+
+/// Index of the sample closest to `frac` of the way through the window.
+///
+/// The arithmetic is deliberately u64/f64. Timestamps are milliseconds since
+/// the UNIX epoch, around 1.8e12, where an f32 cannot even represent whole
+/// minutes: `t0 as f32 + frac * span as f32` rounded the query time to a grid
+/// roughly two minutes wide, so the readout reported a sample far from the
+/// cursor — invisible while the tooltip sat in a corner, obvious the moment a
+/// marker was drawn on the sample it had picked.
+fn nearest_sample(ts: &[u64], t0: u64, span: u64, frac: f32) -> usize {
+    if ts.is_empty() {
+        return 0;
+    }
+    let query = t0.saturating_add((f64::from(frac) * span as f64).round() as u64);
+    let hi = ts.partition_point(|&t| t < query);
+    if hi == 0 {
+        return 0;
+    }
+    if hi >= ts.len() {
+        return ts.len() - 1;
+    }
+    // Round to whichever neighbour the cursor is actually closer to, so the
+    // marker lands on the sample under the pointer instead of the one before.
+    let lo = hi - 1;
+    if query - ts[lo] <= ts[hi] - query {
+        lo
+    } else {
+        hi
     }
 }
 
@@ -430,7 +471,7 @@ pub fn core_chart(
             });
             dots.push((y(*k), kernel_fill));
         }
-        paint_marker(&painter, rect, ppp, x(idx), &dots);
+        paint_marker(&painter, &pal, rect, ppp, x(idx), &dots);
         readout(ui, pos, &sample_age(timestamps_ms, idx), &rows);
     }
     response
@@ -540,10 +581,9 @@ pub fn chart_multi(
         let frac = ((pos.x - rect.left()) / rect.width()).clamp(0.0, 1.0);
         // Time-proportional x: map the pointer TIME back to the nearest
         // sample — even-spacing math skips across sampling gaps.
-        let time_idx = t_span.zip(timestamps_ms).map(|((t0, span), ts)| {
-            let tq = (t0 as f32 + frac * span as f32) as u64;
-            ts.partition_point(|&t| t < tq).saturating_sub(1)
-        });
+        let time_idx = t_span
+            .zip(timestamps_ms)
+            .map(|((t0, span), ts)| nearest_sample(ts, t0, span, frac));
         let mut rows = Vec::with_capacity(series.len());
         let mut dots = Vec::with_capacity(series.len());
         let mut marker = None;
@@ -569,7 +609,7 @@ pub fn chart_multi(
             }
         }
         if let Some((x, idx)) = marker {
-            paint_marker(&painter, rect, ppp, x, &dots);
+            paint_marker(&painter, &pal, rect, ppp, x, &dots);
             readout(ui, pos, &sample_age(timestamps_ms, idx), &rows);
         }
     }
@@ -779,6 +819,41 @@ mod tests {
                 .any(|r| r.distance_to_pos(at) < 40.0);
             assert!(near, "readout is not next to the cursor (multi = {multi})");
         }
+    }
+
+    /// The hovered sample must be the one under the cursor.
+    ///
+    /// Timestamps are epoch milliseconds (~1.8e12). The index used to be
+    /// computed as `t0 as f32 + frac * span as f32`, and an f32 at that
+    /// magnitude steps in ~131 s — so hovering the middle of a 60 s window
+    /// reported whatever sample the rounding happened to land on.
+    #[test]
+    fn the_hovered_sample_is_the_one_under_the_cursor() {
+        // One minute of one-second samples, stamped in epoch milliseconds.
+        let t0 = 1_797_000_000_000u64;
+        let ts: Vec<u64> = (0..=60).map(|i| t0 + i * 1_000).collect();
+        let span = ts.last().unwrap() - t0;
+        for (frac, expected) in [
+            (0.0f32, 0usize),
+            (0.25, 15),
+            (0.42, 25),
+            (0.5, 30),
+            (0.75, 45),
+            (1.0, 60),
+        ] {
+            assert_eq!(nearest_sample(&ts, t0, span, frac), expected, "frac {frac}");
+        }
+        // Irregular spacing still rounds to the closer neighbour.
+        let gapped = [t0, t0 + 1_000, t0 + 40_000, t0 + 41_000];
+        let span = 41_000;
+        assert_eq!(nearest_sample(&gapped, t0, span, 0.0), 0);
+        assert_eq!(nearest_sample(&gapped, t0, span, 0.05), 1);
+        // Exactly halfway between two samples is a tie, resolved to the
+        // earlier one; past the midpoint it snaps across the gap.
+        assert_eq!(nearest_sample(&gapped, t0, span, 0.5), 1);
+        assert_eq!(nearest_sample(&gapped, t0, span, 0.55), 2);
+        assert_eq!(nearest_sample(&gapped, t0, span, 1.0), 3);
+        assert_eq!(nearest_sample(&[], t0, span, 0.5), 0);
     }
 
     /// The readout head names the sample's age, so a reading taken mid-window

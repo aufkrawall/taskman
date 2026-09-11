@@ -3153,7 +3153,7 @@ mod tests {
         assert_eq!(d.heat[3], 0.0);
         assert_eq!(
             if d.net_available {
-                format::format_mbit(d.values[3])
+                format::format_process_net_rate(d.values[NET_VALUE])
             } else {
                 "—".to_string()
             },
