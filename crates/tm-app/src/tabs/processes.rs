@@ -2064,13 +2064,13 @@ fn normalize_heat(rows: &mut [DisplayRow]) {
     }
     for r in rows.iter_mut() {
         let DisplayRow::Process(d) = r else { continue };
-        for i in 0..VALUE_COLS {
-            d.heat[i] = if value_known(d, i) {
+        d.heat = std::array::from_fn(|i| {
+            if value_known(d, i) {
                 tablekit::norm(d.values[i], max[i])
             } else {
                 0.0
-            };
-        }
+            }
+        });
     }
 }
 
