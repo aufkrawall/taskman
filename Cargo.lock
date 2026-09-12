@@ -3498,7 +3498,7 @@ dependencies = [
 
 [[package]]
 name = "tm-app"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "eframe",
  "egui_software",
@@ -3516,7 +3516,7 @@ dependencies = [
 
 [[package]]
 name = "tm-core"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "dirs",
  "serde",
@@ -3529,7 +3529,7 @@ dependencies = [
 
 [[package]]
 name = "tm-platform"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "libc",
  "raw-cpuid",
@@ -3545,7 +3545,7 @@ dependencies = [
 
 [[package]]
 name = "tm-service"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "tm-core",
  "tm-platform",
