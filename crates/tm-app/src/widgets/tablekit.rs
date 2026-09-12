@@ -1155,11 +1155,11 @@ impl Aggregates {
 
     /// Header values in numeric-column order.
     ///
-    /// The header row states MACHINE totals, not column sums — that is what
-    /// makes a row's percentage readable ("the disks are 43 % busy and this
-    /// process accounts for 100 % of that"). Disk active time therefore
-    /// repeats the disk total deliberately: its column is a share OF that
-    /// number, while the Disk I/O column next to it is a byte rate.
+    /// The header row states MACHINE totals, not column sums. Disk active
+    /// time repeats the disk total deliberately: its rows are the same
+    /// quantity — the percentage of wall time the disks were busy for that
+    /// process — so they sum to this header rather than needing it as
+    /// context, while the Disk I/O column next to it is a byte rate.
     ///
     /// A table with fewer numeric columns simply uses the leading entries.
     pub fn strings(&self) -> [String; 6] {

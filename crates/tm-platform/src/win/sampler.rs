@@ -186,6 +186,25 @@ enum DiskSource {
     Unavailable { since: Instant },
 }
 
+/// The Disk active time one process gets from a drained window: its share of
+/// the disk service time the window measured, expressed as a percentage of
+/// WALL TIME by scaling with the machine total the column header states.
+///
+/// The bare share is not presentable on its own. On a nearly idle disk a
+/// single request makes its issuer 100 % of all the disk work that happened,
+/// so rows flapped between 0 % and 100 % underneath a header reading 0 %.
+/// Scaling collapses that noise in proportion to how little the disks did,
+/// and bounds every row by the header.
+fn disk_active_pct(service_time: u64, total_service_time: u64, machine_active_pct: f32) -> f32 {
+    // No measured disk time at all says "nothing used a disk", which is 0 %
+    // for everyone, not a division by zero.
+    if total_service_time == 0 {
+        return 0.0;
+    }
+    (service_time as f64 / total_service_time as f64 * machine_active_pct as f64).clamp(0.0, 100.0)
+        as f32
+}
+
 /// One process's cumulative network counters at the previous tick.
 #[derive(Debug, Clone, Copy)]
 struct ProcNetSample {
@@ -527,18 +546,32 @@ impl Sampler {
 
     /// Fill per-process disk activity from the drained ETW window.
     ///
-    /// `disk_active_pct` is the process's share of the disk service time the
-    /// machine actually spent, which is what the Performance page's "Active
-    /// time" is made of. It is deliberately NOT derived from
+    /// `disk_active_pct` is the percentage of WALL TIME the disks were busy on
+    /// this process's behalf: its share of the window's disk service time,
+    /// scaled by `machine_active_pct` — the same machine total the column
+    /// header states. It is deliberately NOT derived from
     /// `disk_read_bps`/`disk_write_bps`: those are the kernel's per-process
     /// I/O byte counters, which count cache hits and miss paging I/O, so the
     /// process at the top of that column is routinely not the one keeping the
     /// disk busy.
     ///
+    /// The scaling is what makes a row readable on its own. The bare share is
+    /// a share of whatever disk work happened in the window, so on an idle
+    /// disk a single request makes its issuer 100 % of it — a true statement
+    /// about a denominator carrying no information, which showed up as rows
+    /// flapping between 0 % and 100 % under a header reading 0 %. Scaling
+    /// collapses that noise in proportion to how little the disks actually
+    /// did, and makes rows sum to the header instead of needing it as context.
+    ///
     /// Every live process gets a value while the trace runs — a process that
     /// issued nothing really did cause zero disk time — and every process
-    /// keeps `None` while it does not.
-    fn apply_process_disk(&mut self, processes: &mut [ProcessEntry]) {
+    /// keeps `None` while it does not. An unmeasured machine total likewise
+    /// leaves every row unknown: a share of an unknown total is not a number.
+    fn apply_process_disk(
+        &mut self,
+        processes: &mut [ProcessEntry],
+        machine_active_pct: Option<f32>,
+    ) {
         let live: HashSet<u32> = processes.iter().map(|p| p.pid).collect();
         let Some(window) = self.disk_window(&live) else {
             return;
@@ -565,13 +598,10 @@ impl Sampler {
                 continue;
             }
             let disk = window.procs.get(&process.pid).copied().unwrap_or_default();
-            // A window with no measured disk time at all says "nothing used a
-            // disk", which is a 0 % share for everyone, not a division by zero.
-            process.disk_active_pct = Some(if total == 0 {
-                0.0
-            } else {
-                (disk.service_time as f64 / total as f64 * 100.0).clamp(0.0, 100.0) as f32
-            });
+            // An unmeasured machine total leaves the row unknown: a share of
+            // an unknown total is not a number.
+            process.disk_active_pct = machine_active_pct
+                .map(|machine| disk_active_pct(disk.service_time, total, machine));
             if seconds > 0.0 {
                 process.disk_phys_read_bps = Some(disk.read_bytes as f64 / seconds);
                 process.disk_phys_write_bps = Some(disk.write_bytes as f64 / seconds);
@@ -1010,7 +1040,23 @@ impl Sampler {
         // Runs after the process list is final so pruning sees exactly the
         // live PIDs, and after categories so synthetic rows can be skipped.
         self.apply_process_network(&mut processes, interval_s);
-        self.apply_process_disk(&mut processes);
+        // The machine total the Disk active time column is a share OF. Built
+        // from the same perf records that reach `snap.disks` below, and
+        // reduced the same way `Aggregates` reduces them, so a row can never
+        // exceed the header it sits under.
+        let machine_disk_active = self
+            .disks
+            .list()
+            .iter()
+            .filter_map(|d| {
+                let mount = d.mount_point().to_string_lossy().to_string();
+                disk_perf
+                    .iter()
+                    .find(|x| x.matches_mount(&mount))
+                    .map(|x| x.active_pct)
+            })
+            .reduce(f32::max);
+        self.apply_process_disk(&mut processes, machine_disk_active);
 
         // ---- CPU attribution pseudo-rows ------------------------------------------
         // The per-core accumulators see ALL busy time; live processes cannot
@@ -1932,5 +1978,48 @@ mod tests {
         assert_eq!(t.cpu_pct, 40.0);
         assert!(t.display.contains('5'), "count in label: {}", t.display);
         assert_eq!(t.description.as_deref(), Some("rustc.exe ×5"));
+    }
+
+    /// A row in the Disk active time column must be readable on its own, and
+    /// must never exceed the machine total in the header above it.
+    ///
+    /// The numbers here are a real measurement taken from this machine while
+    /// it was idle: the PhysicalDisk counters reported the busiest disk at
+    /// 0.00 % and 2.32 % active, while the ETW window attributed essentially
+    /// all of its (tiny) service time to one process. The bare share reported
+    /// that process at 91 % and 93 %; scaled, it reports what the disks
+    /// actually did on its behalf.
+    #[test]
+    fn disk_active_time_is_wall_time_not_a_share_of_an_idle_disk() {
+        // Idle disk, one process responsible for every request in the window.
+        assert_eq!(disk_active_pct(1_000, 1_000, 0.0), 0.0);
+        assert!(
+            disk_active_pct(9_118, 10_000, 2.32) < 2.33,
+            "a 91 % share of a 2.32 %-busy disk is at most 2.32 % of wall time"
+        );
+
+        // A saturated disk still reads the way it always did.
+        assert_eq!(disk_active_pct(1_000, 1_000, 100.0), 100.0);
+        assert_eq!(disk_active_pct(500, 1_000, 80.0), 40.0);
+
+        // No measured service time is zero for everyone, not a division by
+        // zero and not an inherited machine total.
+        assert_eq!(disk_active_pct(0, 0, 47.0), 0.0);
+
+        // Whatever the split, the rows are bounded by the header and sum to
+        // it — that is what lets the header state a machine total.
+        let machine = 43.0;
+        let parts = [120u64, 3_400, 77, 9_003, 1];
+        let total: u64 = parts.iter().sum();
+        let mut sum = 0.0f32;
+        for part in parts {
+            let row = disk_active_pct(part, total, machine);
+            assert!(row <= machine, "row {row} exceeded header {machine}");
+            sum += row;
+        }
+        assert!(
+            (sum - machine).abs() < 0.01,
+            "rows summed to {sum}, header says {machine}"
+        );
     }
 }

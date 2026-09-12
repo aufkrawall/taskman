@@ -88,9 +88,11 @@ pub fn run(mock: bool) -> i32 {
             .filter(|p| p.net_recv_bps.is_some())
             .count(),
         // Same idea for the disk trace: how many processes carry a measured
-        // share of disk service time, and how much of that share the busiest
-        // one holds. A run with readings but a flat zero everywhere means the
-        // events arrived and none of them could be attributed.
+        // disk active time, and what the busiest one is. That value is a share
+        // of `disk_busiest_active_pct`, so it can never exceed it — a larger
+        // one would mean the scaling regressed. A run with readings but a flat
+        // zero everywhere means the events arrived and none of them could be
+        // attributed.
         "process_disk_readings": snap
             .processes
             .iter()
