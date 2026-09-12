@@ -153,12 +153,18 @@ enum NetSource {
     Broker { misses: u8 },
     /// Our own token runs the trace.
     Local(net_etw::NetworkUsage),
-    /// Neither works; keep reporting unknown, and re-probe occasionally so
-    /// installing the service later starts working without an app restart.
+    /// Neither works; keep reporting unknown. `since` throttles retrying the
+    /// LOCAL trace only - the broker is re-checked every tick, so installing
+    /// the service later starts working without an app restart.
     Unavailable { since: Instant },
 }
 
-/// How long to wait before re-probing after both sources failed.
+/// How long to wait before starting the LOCAL ETW trace again after it failed.
+/// Only the local source is throttled: starting an ETW session is expensive
+/// and an unelevated GUI will keep failing it, while asking an absent broker
+/// costs one `CreateFileW` that fails immediately. Backing both off together
+/// meant a service installed from the GUI's own Advanced settings took up to
+/// this long to start filling the columns.
 const NET_SOURCE_RETRY: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Consecutive unreachable ticks tolerated before a working broker source is
@@ -340,6 +346,20 @@ impl Sampler {
             return None;
         }
         if let NetSource::Unavailable { since } = &self.net_source {
+            let since = *since;
+            // The service may have been installed or restarted since the last
+            // tick. Asking is cheap while it is absent, and the answer is the
+            // one the user is waiting for, so it is not part of the backoff.
+            match core_service::brokered_process_network() {
+                core_service::BrokeredNetwork::Sample(sample) => {
+                    self.net_source = NetSource::Broker { misses: 0 };
+                    return sample.active.then(|| sample_to_map(&sample));
+                }
+                // Already logged when this source was given up; a refusal does
+                // not become permission by being asked again.
+                core_service::BrokeredNetwork::Rejected(_) => return None,
+                core_service::BrokeredNetwork::Unavailable => {}
+            }
             if since.elapsed() < NET_SOURCE_RETRY {
                 return None;
             }
@@ -449,6 +469,17 @@ impl Sampler {
             return None;
         }
         if let DiskSource::Unavailable { since } = &self.disk_source {
+            let since = *since;
+            // Same reasoning as `net_totals`: only the local trace is backed
+            // off, so a service installed mid-session is picked up next tick.
+            match core_service::brokered_process_disk() {
+                core_service::BrokeredDisk::Sample(sample) => {
+                    self.disk_source = DiskSource::Broker { misses: 0 };
+                    return sample.active.then(|| disk_sample_to_window(sample));
+                }
+                core_service::BrokeredDisk::Rejected(_) => return None,
+                core_service::BrokeredDisk::Unavailable => {}
+            }
             if since.elapsed() < NET_SOURCE_RETRY {
                 return None;
             }

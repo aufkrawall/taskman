@@ -249,8 +249,15 @@ capability and would make rollback less reliable.
 - The GUI recovers from a service that starts AFTER it without a restart, and
   this is deliberate: `BrokeredActions` is always the Windows action surface,
   every broker call opens the pipe fresh, Advanced settings re-queries state
-  every 3 s, and the sampler re-probes `NetSource`/`DiskSource` every
-  `NET_SOURCE_RETRY` (30 s). The sampler additionally tolerates
+  every 3 s, and the sampler asks the broker again on EVERY tick while its
+  source is `Unavailable` — `NET_SOURCE_RETRY` (30 s) throttles only the
+  expensive LOCAL ETW start, because an absent broker costs one `CreateFileW`
+  that fails immediately. Backing both off together is what made a service
+  installed from Advanced settings take up to 30 s to start filling the
+  columns. What remains is inherent: a rate needs two cumulative samples, and
+  the first drained disk window is discarded below `MIN_WINDOW_MS` (100 ms),
+  so the columns fill about two ticks after the broker answers. The sampler
+  additionally tolerates
   `BROKER_MISS_TOLERANCE` (3) consecutive unreachable ticks before giving up a
   working broker source for that 30 s window, so one collision or a broker
   restarting under SCM recovery no longer blanks the network and disk columns.
