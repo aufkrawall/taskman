@@ -78,9 +78,38 @@ contract.
   install) disable the privileged control plane until an administrator removes
   it. The security property is preserved: no appender is opened at all while
   the directory is unproven.
-- Two workers, a bounded queue of 16, and a matching 19-instance pipe cap keep
-  request load finite. Queue/auth refusals return framed errors instead of
-  looking like a missing service; repeated rejection logging is rate-limited.
+- Two workers, a bounded queue of 16, and a matching 20-instance pipe cap keep
+  request load finite (the cap covers the queue, both workers, the instance
+  the accept thread is still resolving, and the fresh listener it has already
+  armed). Queue/auth refusals return framed errors instead of looking like a
+  missing service; repeated rejection logging is rate-limited.
+- The accept thread arms the NEXT listening instance immediately after
+  `ConnectNamedPipe` returns and BEFORE it resolves the accepted client's
+  identity. A pipe with no instance in listening state answers every opener
+  with `ERROR_PIPE_BUSY`, and `process_image_path` is slow enough that the old
+  accept-then-re-arm order put a busy window in front of a large share of
+  calls. Measured against the v0.1.7 service, a single-threaded client opening
+  the pipe back to back saw `ERROR_PIPE_BUSY` on roughly half its attempts.
+- No per-connection error may terminate the broker. `connect_pipe` returns
+  `AcceptOutcome`, and `ERROR_NO_DATA` — the client closed its handle before
+  the server accepted it — is `ClientVanished`, an ordinary outcome that
+  simply spends the instance. npfs connects an opener to a listening instance
+  BEFORE the server calls `ConnectNamedPipe`, so every client reaches this
+  state: a call abandoned during identity verification, a GUI shutting down,
+  the stop thread's own synthetic wake. Until v0.1.7 it propagated out of
+  `run_broker` and exited the service with a service-specific error; SCM
+  recovery then restarted it 5 / 15 / 60 s later, and the GUI reported the gap
+  as a service that had randomly stopped being recognised. Any client that
+  could open the pipe could repeat this at will. Accept-path failures that are
+  NOT a vanished client are logged and skipped, and only
+  `MAX_CONSECUTIVE_ACCEPT_FAILURES` (16) in a row returns `Err` so a listener
+  that can never be armed again stays visible instead of spinning forever.
+- The client retries `ERROR_PIPE_BUSY` until `PIPE_BUSY_RETRY` (1 s) instead of
+  once. `WaitNamedPipeW` reports only that AN instance became free, so another
+  client can still take it first; a single retry loses that race often enough
+  to report a healthy service as missing. This is an eventful wait on instance
+  availability, not a timing bandaid. A stopped service still fails instantly
+  (`ERROR_FILE_NOT_FOUND`), so the sampler never stalls on an absent broker.
 
 Every process-changing broker request needs a positive sampled creation time.
 The service rejects PID 0–4, itself, the requesting GUI, and critical Windows
@@ -211,6 +240,22 @@ capability and would make rollback less reliable.
   restart, which the startup redirect handles) before the service is usable;
   repair itself does not fail. Elevated sessions refuse the switch so
   elevation is never silently preserved.
+- `service_state` keeps the two ways a ping can fail apart. A broker that
+  ANSWERS and refuses is `"broker authentication failed"`; a pipe that never
+  answered while SCM reports RUNNING is `"its control pipe did not answer"`.
+  Both stay `Degraded` — a reachable service with a silent control pipe is a
+  real fault — but the old code reported every failure as authentication and
+  sent users to a repair that cannot help.
+- The GUI recovers from a service that starts AFTER it without a restart, and
+  this is deliberate: `BrokeredActions` is always the Windows action surface,
+  every broker call opens the pipe fresh, Advanced settings re-queries state
+  every 3 s, and the sampler re-probes `NetSource`/`DiskSource` every
+  `NET_SOURCE_RETRY` (30 s). The sampler additionally tolerates
+  `BROKER_MISS_TOLERANCE` (3) consecutive unreachable ticks before giving up a
+  working broker source for that 30 s window, so one collision or a broker
+  restarting under SCM recovery no longer blanks the network and disk columns.
+  A REJECTION is still final on the first occurrence: that is a policy
+  decision, not a transient. Missed ticks report unknown ("—"), never zero.
 - GUI actions run in two independent bounded executor lanes (32 each), so one
   wedged OS API cannot stall every action and overload is surfaced explicitly.
   Platform calls are never run inline on the renderer thread if worker startup

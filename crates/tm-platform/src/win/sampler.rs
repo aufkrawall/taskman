@@ -148,8 +148,9 @@ pub struct Sampler {
 enum NetSource {
     /// Not probed yet (also the state after the UI stops asking).
     Undecided,
-    /// The protected service answers.
-    Broker,
+    /// The protected service answers. `misses` counts consecutive ticks the
+    /// broker could not be reached; see [`BROKER_MISS_TOLERANCE`].
+    Broker { misses: u8 },
     /// Our own token runs the trace.
     Local(net_etw::NetworkUsage),
     /// Neither works; keep reporting unknown, and re-probe occasionally so
@@ -160,13 +161,21 @@ enum NetSource {
 /// How long to wait before re-probing after both sources failed.
 const NET_SOURCE_RETRY: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// Consecutive unreachable ticks tolerated before a working broker source is
+/// given up for the whole [`NET_SOURCE_RETRY`] window. One missed call is a
+/// transient - a saturated accept path, a broker restarting under SCM
+/// recovery - and dropping straight to "unknown for 30 s" made a healthy
+/// service look like it had disappeared. The tick still reports unknown while
+/// the misses accumulate; it is never a fabricated zero.
+const BROKER_MISS_TOLERANCE: u8 = 3;
+
 /// Where per-process DISK activity comes from. Same three-way choice, and for
 /// the same reason, as [`NetSource`]: the trace needs privileges the GUI
 /// deliberately does not have, so the protected service hosts it and the GUI's
 /// own token is only the fallback for an elevated run without a service.
 enum DiskSource {
     Undecided,
-    Broker,
+    Broker { misses: u8 },
     Local(disk_etw::DiskUsage),
     Unavailable { since: Instant },
 }
@@ -344,22 +353,39 @@ impl Sampler {
             }
         }
         match &self.net_source {
-            NetSource::Broker => match core_service::brokered_process_network() {
-                core_service::BrokeredNetwork::Sample(sample) if sample.active => {
-                    Some(sample_to_map(&sample))
-                }
-                // The service is there but its own trace failed: unknown.
-                core_service::BrokeredNetwork::Sample(_) => None,
-                other => {
-                    if let core_service::BrokeredNetwork::Rejected(detail) = &other {
-                        tracing::warn!(%detail, "broker refused network counters");
+            NetSource::Broker { misses } => {
+                let misses = *misses;
+                match core_service::brokered_process_network() {
+                    core_service::BrokeredNetwork::Sample(sample) if sample.active => {
+                        self.net_source = NetSource::Broker { misses: 0 };
+                        Some(sample_to_map(&sample))
                     }
-                    self.net_source = NetSource::Unavailable {
-                        since: Instant::now(),
-                    };
-                    None
+                    // The service is there but its own trace failed: unknown.
+                    core_service::BrokeredNetwork::Sample(_) => {
+                        self.net_source = NetSource::Broker { misses: 0 };
+                        None
+                    }
+                    // A refusal is a policy decision and is final; an
+                    // unreachable broker gets a few ticks of grace first.
+                    core_service::BrokeredNetwork::Rejected(detail) => {
+                        tracing::warn!(%detail, "broker refused network counters");
+                        self.net_source = NetSource::Unavailable {
+                            since: Instant::now(),
+                        };
+                        None
+                    }
+                    core_service::BrokeredNetwork::Unavailable => {
+                        self.net_source = if misses + 1 >= BROKER_MISS_TOLERANCE {
+                            NetSource::Unavailable {
+                                since: Instant::now(),
+                            }
+                        } else {
+                            NetSource::Broker { misses: misses + 1 }
+                        };
+                        None
+                    }
                 }
-            },
+            }
             NetSource::Local(usage) => Some(usage.totals_pruned(live)),
             _ => None,
         }
@@ -432,22 +458,37 @@ impl Sampler {
             self.disk_source = probe_disk_source();
         }
         match &self.disk_source {
-            DiskSource::Broker => match core_service::brokered_process_disk() {
-                core_service::BrokeredDisk::Sample(sample) if sample.active => {
-                    Some(disk_sample_to_window(sample))
-                }
-                // The service is there but its own trace failed: unknown.
-                core_service::BrokeredDisk::Sample(_) => None,
-                other => {
-                    if let core_service::BrokeredDisk::Rejected(detail) = &other {
-                        tracing::warn!(%detail, "broker refused disk counters");
+            DiskSource::Broker { misses } => {
+                let misses = *misses;
+                match core_service::brokered_process_disk() {
+                    core_service::BrokeredDisk::Sample(sample) if sample.active => {
+                        self.disk_source = DiskSource::Broker { misses: 0 };
+                        Some(disk_sample_to_window(sample))
                     }
-                    self.disk_source = DiskSource::Unavailable {
-                        since: Instant::now(),
-                    };
-                    None
+                    // The service is there but its own trace failed: unknown.
+                    core_service::BrokeredDisk::Sample(_) => {
+                        self.disk_source = DiskSource::Broker { misses: 0 };
+                        None
+                    }
+                    core_service::BrokeredDisk::Rejected(detail) => {
+                        tracing::warn!(%detail, "broker refused disk counters");
+                        self.disk_source = DiskSource::Unavailable {
+                            since: Instant::now(),
+                        };
+                        None
+                    }
+                    core_service::BrokeredDisk::Unavailable => {
+                        self.disk_source = if misses + 1 >= BROKER_MISS_TOLERANCE {
+                            DiskSource::Unavailable {
+                                since: Instant::now(),
+                            }
+                        } else {
+                            DiskSource::Broker { misses: misses + 1 }
+                        };
+                        None
+                    }
                 }
-            },
+            }
             DiskSource::Local(usage) => Some(usage.take_window(live)),
             _ => None,
         }
@@ -1226,9 +1267,10 @@ impl Sampler {
 /// already produced (so the probe does not cost an extra round trip).
 fn probe_net_source() -> (NetSource, Option<HashMap<u32, net_etw::PidBytes>>) {
     match core_service::brokered_process_network() {
-        core_service::BrokeredNetwork::Sample(sample) if sample.active => {
-            (NetSource::Broker, Some(sample_to_map(&sample)))
-        }
+        core_service::BrokeredNetwork::Sample(sample) if sample.active => (
+            NetSource::Broker { misses: 0 },
+            Some(sample_to_map(&sample)),
+        ),
         // An explicit refusal is a policy decision; do not route around it.
         core_service::BrokeredNetwork::Rejected(detail) => {
             tracing::warn!(%detail, "broker refused network counters");
@@ -1258,7 +1300,7 @@ fn probe_net_source() -> (NetSource, Option<HashMap<u32, net_etw::PidBytes>>) {
 /// covers the microseconds since the session started.
 fn probe_disk_source() -> DiskSource {
     match core_service::brokered_process_disk() {
-        core_service::BrokeredDisk::Sample(_) => DiskSource::Broker,
+        core_service::BrokeredDisk::Sample(_) => DiskSource::Broker { misses: 0 },
         // An explicit refusal is a policy decision; do not route around it.
         core_service::BrokeredDisk::Rejected(detail) => {
             tracing::warn!(%detail, "broker refused disk counters");

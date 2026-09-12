@@ -16,8 +16,8 @@ use sha2::{Digest, Sha256};
 use tm_core::error::{Result, TmError};
 use tm_core::model::PriorityClass;
 use windows::Win32::Foundation::{
-    CloseHandle, ERROR_FILE_NOT_FOUND, ERROR_PIPE_BUSY, ERROR_PIPE_CONNECTED, HANDLE, HLOCAL,
-    LocalFree, WAIT_OBJECT_0, WAIT_TIMEOUT,
+    CloseHandle, ERROR_FILE_NOT_FOUND, ERROR_NO_DATA, ERROR_PIPE_BUSY, ERROR_PIPE_CONNECTED,
+    HANDLE, HLOCAL, LocalFree, WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
 use windows::Win32::Security::Authorization::{
     ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
@@ -80,8 +80,18 @@ const MAX_MODULES_PER_RESPONSE: usize = 1024;
 const PIPE_BUFFER_BYTES: u32 = 64 * 1024;
 const WORKER_COUNT: usize = 2;
 const WORK_QUEUE_CAP: usize = 16;
-// Two active workers + the full queue + one listening/rejection instance.
-const PIPE_INSTANCE_CAP: u32 = (WORKER_COUNT + WORK_QUEUE_CAP + 1) as u32;
+// Two active workers + the full queue + the instance the accept thread is
+// still resolving + the fresh listener it re-arms before doing so.
+const PIPE_INSTANCE_CAP: u32 = (WORKER_COUNT + WORK_QUEUE_CAP + 2) as u32;
+/// Consecutive accept-path failures tolerated before the broker gives up and
+/// lets SCM recovery restart it from a clean image. Individual failures are
+/// per-connection and must not take the control plane down, but a listener
+/// that can never be armed again is a real fault and has to stay visible.
+const MAX_CONSECUTIVE_ACCEPT_FAILURES: u32 = 16;
+/// How long a client keeps retrying a busy pipe before reporting the service
+/// as unavailable, and the per-attempt `WaitNamedPipeW` bound inside that.
+const PIPE_BUSY_RETRY: std::time::Duration = std::time::Duration::from_millis(1000);
+const PIPE_BUSY_WAIT_MS: u32 = 250;
 const MANIFEST_SCHEMA: u32 = 1;
 const CLIENT_REGISTRY_KEY: &str = r"Software\TaskMan";
 const CLIENT_REGISTRY_VALUE: &str = "CoreServiceGui";
@@ -1202,23 +1212,30 @@ fn open_client_pipe() -> std::result::Result<File, BrokerCallError> {
             None,
         )
     };
-    let handle = match open() {
-        Ok(handle) => handle,
-        Err(error) if error.code() == ERROR_PIPE_BUSY.to_hresult() => {
-            let waited = unsafe { WaitNamedPipeW(PCWSTR(name.as_ptr()), 250) };
-            if !waited.as_bool() {
-                return Err(BrokerCallError::Unavailable(
-                    "core service is busy or stopped".into(),
-                ));
-            }
-            open().map_err(|error| BrokerCallError::Unavailable(error.to_string()))?
-        }
-        Err(error) if error.code() == ERROR_FILE_NOT_FOUND.to_hresult() || error.code().0 == 5 => {
+    // The broker accepts on a single thread, so two GUI threads calling at the
+    // same instant routinely collide and one of them sees ERROR_PIPE_BUSY.
+    // WaitNamedPipeW only reports that AN instance became free - another
+    // client can still take it first - so a single retry loses that race often
+    // enough to report a healthy service as missing. Retry until a deadline
+    // instead; this is an eventful wait on instance availability, not a sleep.
+    let deadline = std::time::Instant::now() + PIPE_BUSY_RETRY;
+    loop {
+        let error = match open() {
+            Ok(handle) => return Ok(unsafe { File::from_raw_handle(handle.0) }),
+            Err(error) => error,
+        };
+        if error.code() != ERROR_PIPE_BUSY.to_hresult() {
             return Err(BrokerCallError::Unavailable(error.to_string()));
         }
-        Err(error) => return Err(BrokerCallError::Unavailable(error.to_string())),
-    };
-    Ok(unsafe { File::from_raw_handle(handle.0) })
+        if std::time::Instant::now() >= deadline {
+            return Err(BrokerCallError::Unavailable(
+                "core service is busy or stopped".into(),
+            ));
+        }
+        // A timeout here is not conclusive: the deadline above owns the
+        // decision, and another attempt may still find a free instance.
+        let _ = unsafe { WaitNamedPipeW(PCWSTR(name.as_ptr()), PIPE_BUSY_WAIT_MS) };
+    }
 }
 
 fn server_pid(pipe: &File) -> std::result::Result<u32, BrokerCallError> {
@@ -1308,14 +1325,14 @@ fn client_pid(pipe: &File) -> Result<u32> {
     Ok(pid)
 }
 
-fn create_pipe_instance(sddl: &str, first: bool) -> Result<File> {
+fn create_pipe_instance(pipe_name: &str, sddl: &str, first: bool) -> Result<File> {
     let descriptor = security_descriptor(sddl)?;
     let attributes = SECURITY_ATTRIBUTES {
         nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
         lpSecurityDescriptor: descriptor.0.0,
         bInheritHandle: false.into(),
     };
-    let name = wide(PIPE_NAME);
+    let name = wide(pipe_name);
     let mut open_mode = PIPE_ACCESS_DUPLEX.0;
     if first {
         open_mode |= FILE_FLAG_FIRST_PIPE_INSTANCE.0;
@@ -1341,11 +1358,32 @@ fn create_pipe_instance(sddl: &str, first: bool) -> Result<File> {
     Ok(unsafe { File::from_raw_handle(handle.0) })
 }
 
-fn connect_pipe(pipe: &File) -> Result<()> {
+/// Outcome of waiting for a client on one listening pipe instance.
+enum AcceptOutcome {
+    /// A client is connected on this instance.
+    Connected,
+    /// The client closed its handle before the server accepted it. The
+    /// instance is spent, but nothing failed.
+    ClientVanished,
+    /// The instance itself could not be used.
+    Failed(TmError),
+}
+
+fn connect_pipe(pipe: &File) -> AcceptOutcome {
     match unsafe { ConnectNamedPipe(HANDLE(pipe.as_raw_handle()), None) } {
-        Ok(()) => Ok(()),
-        Err(error) if error.code() == ERROR_PIPE_CONNECTED.to_hresult() => Ok(()),
-        Err(error) => Err(TmError::platform("ConnectNamedPipe", error.to_string())),
+        Ok(()) => AcceptOutcome::Connected,
+        Err(error) if error.code() == ERROR_PIPE_CONNECTED.to_hresult() => AcceptOutcome::Connected,
+        // ERROR_NO_DATA means the client end was already closed when we got
+        // here: npfs connects an opener to a listening instance before the
+        // server calls ConnectNamedPipe, so any client that opens and drops
+        // the handle lands in this state. That is ordinary client behaviour -
+        // a call abandoned during identity verification, a GUI shutting down,
+        // the stop thread's own synthetic wake - and it must never be able to
+        // terminate the privileged control plane.
+        Err(error) if error.code() == ERROR_NO_DATA.to_hresult() => AcceptOutcome::ClientVanished,
+        Err(error) => {
+            AcceptOutcome::Failed(TmError::platform("ConnectNamedPipe", error.to_string()))
+        }
     }
 }
 
@@ -1951,26 +1989,60 @@ pub fn run_broker(
             .map_err(TmError::Io)?;
     }
 
-    let mut first = true;
-    let mut on_ready = Some(on_ready);
+    // Report SERVICE_RUNNING only after the manifest, ACL, workers, and first
+    // listening pipe have all been established.
+    let mut listener = Some(create_pipe_instance(PIPE_NAME, &sddl, true)?);
+    on_ready()?;
+    let mut consecutive_failures = 0u32;
     while !stopped.load(std::sync::atomic::Ordering::Acquire) {
-        let pipe = create_pipe_instance(&sddl, first)?;
-        if let Some(on_ready) = on_ready.take() {
-            // Report SERVICE_RUNNING only after the manifest, ACL, workers,
-            // and first listening pipe have all been established.
-            on_ready()?;
-        }
-        first = false;
+        let pipe = match listener.take() {
+            Some(pipe) => pipe,
+            None => match create_pipe_instance(PIPE_NAME, &sddl, false) {
+                Ok(pipe) => pipe,
+                Err(error) => {
+                    consecutive_failures += 1;
+                    if consecutive_failures >= MAX_CONSECUTIVE_ACCEPT_FAILURES {
+                        return Err(error);
+                    }
+                    if broker_warning_allowed() {
+                        tracing::warn!(%error, "broker could not arm a listening pipe instance");
+                    }
+                    continue;
+                }
+            },
+        };
         {
             let (state, changed) = &*listener_ready;
             *tm_core::sync::lock(state) = true;
             changed.notify_one();
         }
-        let connected = connect_pipe(&pipe);
+        let accepted = connect_pipe(&pipe);
         *tm_core::sync::lock(&listener_ready.0) = false;
-        connected?;
         if stopped.load(std::sync::atomic::Ordering::Acquire) {
             break;
+        }
+        // Re-arm the listener BEFORE resolving this client's identity. A pipe
+        // with no instance in listening state answers every opener with
+        // ERROR_PIPE_BUSY, and resolving a client image is slow enough that
+        // the old accept-then-re-arm order put a busy window in front of most
+        // calls - which the GUI then reported as an unavailable service.
+        listener = create_pipe_instance(PIPE_NAME, &sddl, false).ok();
+        match accepted {
+            AcceptOutcome::Connected => consecutive_failures = 0,
+            AcceptOutcome::ClientVanished => {
+                consecutive_failures = 0;
+                continue;
+            }
+            AcceptOutcome::Failed(error) => {
+                consecutive_failures += 1;
+                if consecutive_failures >= MAX_CONSECUTIVE_ACCEPT_FAILURES {
+                    return Err(error);
+                }
+                if broker_warning_allowed() {
+                    tracing::warn!(%error, "broker could not accept a client");
+                }
+                continue;
+            }
         }
         let pid = match client_pid(&pipe) {
             Ok(pid) => pid,
@@ -2015,6 +2087,14 @@ pub fn run_broker(
             }
         }
     }
+    // The stop thread blocks until a listener exists. Leaving the loop between
+    // accepting a client and arming the next instance would otherwise strand
+    // it on the condvar.
+    {
+        let (state, changed) = &*listener_ready;
+        *tm_core::sync::lock(state) = true;
+        changed.notify_one();
+    }
     drop(work_tx);
     Ok(())
 }
@@ -2056,7 +2136,8 @@ pub fn selfcheck() -> Result<String> {
 }
 
 fn service_state(client: &BrokerClient) -> CoreServiceState {
-    if let Ok(BrokerValue::Pong { version }) = client.call(BrokerRequest::Ping) {
+    let ping = client.call(BrokerRequest::Ping);
+    if let Ok(BrokerValue::Pong { version }) = ping {
         return CoreServiceState::Running { version };
     }
 
@@ -2086,6 +2167,15 @@ fn service_state(client: &BrokerClient) -> CoreServiceState {
                 let installed_gui = expected_installed_gui_path().ok();
                 if foreign_client_session(current_exe.as_deref(), installed_gui.as_deref()) {
                     CoreServiceState::ForeignClient
+                } else if matches!(ping, Err(BrokerCallError::Unavailable(_))) {
+                    // The pipe never answered. That is a different fault from
+                    // the broker answering and refusing us, and naming it
+                    // "authentication failed" sent users to a repair that
+                    // cannot help. Both stay degraded: a reachable service
+                    // whose control pipe is silent is a real problem.
+                    CoreServiceState::Degraded(
+                        "service is running but its control pipe did not answer".into(),
+                    )
                 } else {
                     CoreServiceState::Degraded(
                         "service is running but broker authentication failed".into(),
@@ -3308,6 +3398,44 @@ mod tests {
         // The installing user's own SID always resolves as a user account.
         let own = current_user_sid().expect("current user SID");
         assert!(sid_is_user_account(&own), "own SID {own} must be accepted");
+    }
+
+    /// A client that opens the pipe and drops the handle before the accept
+    /// thread gets to `ConnectNamedPipe` leaves the instance in the
+    /// `ERROR_NO_DATA` state. npfs connects an opener to a listening instance
+    /// before the server accepts, so any ordinary client reaches this: an
+    /// abandoned call, a GUI shutting down, the broker's own stop wake. It
+    /// used to propagate out of the accept loop and terminate the LocalSystem
+    /// broker, which SCM then restarted 5-60 s later; the GUI reported that
+    /// gap as a service it no longer recognised.
+    #[test]
+    fn a_client_that_closes_before_accept_is_not_a_broker_failure() {
+        let sid = current_user_sid().expect("current user SID");
+        let sddl = pipe_sddl(&sid).expect("pipe sddl");
+        let name = format!(r"\\.\pipe\Taskman.Core.test.{}", std::process::id());
+        let pipe = create_pipe_instance(&name, &sddl, true).expect("listening instance");
+
+        // Open and immediately close a client end, exactly as a cancelled
+        // call does.
+        let wide_name = wide(&name);
+        let client = unsafe {
+            CreateFileW(
+                PCWSTR(wide_name.as_ptr()),
+                USER_PIPE_ACCESS,
+                FILE_SHARE_MODE(0),
+                None,
+                OPEN_EXISTING,
+                FILE_ATTRIBUTE_NORMAL,
+                None,
+            )
+        }
+        .expect("client end");
+        unsafe { CloseHandle(client) }.expect("close client end");
+
+        assert!(
+            matches!(connect_pipe(&pipe), AcceptOutcome::ClientVanished),
+            "a vanished client must be reported as spent, never as a failure"
+        );
     }
 
     /// A planted entry under `%ProgramData%\TaskMan\logs` must disable file
