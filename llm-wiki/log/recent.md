@@ -1,3 +1,4 @@
+- 2026-09-12: Scroll anchoring follows the MAJORITY displacement of the previously visible rows instead of one row's, and a viewport parked at the top stays there; sorting Processes by CPU load no longer walks the list downwards as rows re-rank.
 - 2026-09-08: Linux parity + release validation: the collector no longer lists threads as processes (sysinfo 0.39 keeps `tasks` enabled by default) and thread counts include the leader; Linux sub-pixel AA follows fontconfig `rgba` (`rgb`/`bgr` only); `build.py` warns that the static-musl fallback is headless-only; v0.1.3 ships a GUI-capable glibc Linux artifact validated under WSLg.
 - 2026-09-08: Published TaskMan v0.1.2 for Windows x86_64 and Linux x86_64 (static musl PIE); both archives and their SHA-256 checksums are on GitHub. Release publication steps are now in `build.md`.
 - 2026-09-08: Processes/Details scroll stability: `tablekit::scrolled_rows` anchors the viewport to the top visible row identity across model rebuilds (new/removed processes, tree expand/collapse), and Processes ordering is deterministic (creation-order snapshot sort plus pid tie-breaks) so equal-valued or same-named rows no longer reshuffle every sample.
@@ -10,6 +11,40 @@
 - 2026-09-08: Details gained optional Network / Network receive / Network send columns. PROCESS_NET demand now follows those visible columns and stays active while Process Properties is open, fixing blank live network statistics there without running the ETW session continuously on Details.
 - 2026-09-08: Process Properties now summarizes mitigations with System Informer-style qualifiers (permanent DEP, high-entropy ASLR, prohibited/disabled wording, CF Guard and stack protection), and module inventory uses the authenticated LocalSystem broker for identity-bound SYSTEM/service inspection with bounded responses.
 # Recent Activity
+
+## 2026-09-12 — CPU-sorted list walked downwards under the viewport
+
+Reported as "when sorting for cpu load, the list can scroll jump down, so you
+can't track the process with the highest cpu load".
+
+`AnchorState::restored_offset` followed ONE row: the selected row if it was on
+screen, else the topmost surviving one. That is right for an edit (a spawn or
+exit above the viewport moves every row alike) but wrong for a re-rank: with a
+live sort key the tracked row trades places with its neighbours every sample,
+and the viewport was dragged after it a few rows at a time, always away from
+where the user was looking. The screenful-sized `max_shift` guard only caught
+wholesale reorders, not this drift.
+
+The displacement is now read from ALL remembered rows:
+
+1. Match every remembered identity in ONE pass over the model, take each
+   row's shift, and use the longest run of equal shifts — but only when it
+   covers more than half the survivors. An insert/remove moves every
+   remembered row by the same amount (clear majority, followed exactly);
+   re-ranking scatters the shifts around zero (no majority, viewport stays).
+2. `prefer_key` became a GUARD rather than the driver: the shared shift is
+   replaced by the selected row's own only when it would push that row out of
+   the viewport. A selection that moves while staying visible no longer
+   scrolls the list.
+3. A viewport parked at the very top stays at the top. Nothing above it can
+   shift it, and a process taking over rank 1 must be shown rather than
+   scrolled past — which is the whole point of watching a CPU-sorted list
+   from the top.
+
+Tests: `live_sort_churn_does_not_drag_the_viewport`,
+`selection_does_not_drag_the_viewport_while_it_is_visible`,
+`a_viewport_at_the_top_stays_at_the_top` (plus the 2026-09-08 anchoring tests,
+unchanged).
 
 ## 2026-09-11 — Performance graphs did not reach their own left edge
 

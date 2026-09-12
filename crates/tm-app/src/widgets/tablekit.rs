@@ -215,13 +215,18 @@ pub fn stable_key(value: impl std::hash::Hash) -> u64 {
 /// heights, which read as the list jumping while the scroll bar stayed put.
 /// With an anchor the table re-derives the offset from row identities, so the
 /// content under the viewport stays where the user was looking.
+///
+/// Rows merely trading places (a live CPU-load sort reorders them every
+/// sample) is NOT such a shift and must leave the viewport alone; see
+/// [`AnchorState::restored_offset`].
 #[derive(Clone, Copy)]
 pub struct ScrollAnchor<'a> {
     /// True when the caller rebuilt the row model this frame.
     pub model_changed: bool,
-    /// Identity of the primary selected row, if any. While that row is on
-    /// screen it wins over the viewport top: a process spawning above the
-    /// selection must not push the row the user is tracking out of view.
+    /// Identity of the primary selected row, if any. The shared shift never
+    /// pushes it out of view: while that row is on screen, a process
+    /// spawning between the viewport top and the selection moves the
+    /// viewport instead of shoving the row the user is tracking off screen.
     pub prefer_key: Option<u64>,
     /// Stable identity of row `index` in the CURRENT model. Must be unique
     /// among the rows a user can see and must survive while the row exists.
@@ -243,39 +248,102 @@ struct AnchorState {
 }
 
 impl AnchorState {
-    /// Offset that keeps the first remembered row still present at its old
-    /// viewport position, or `None` when every remembered row is gone or has
-    /// moved too far.
+    /// Offset that keeps the remembered rows where the user last saw them, or
+    /// `None` when the model did not move in a way the viewport may follow.
     ///
-    /// `prefer` names the selected row; when it is among the remembered rows
-    /// it is tried before the top-down order. `max_shift` bounds how far a
-    /// remembered row may move. Insertions and removals shift rows by their
-    /// own count; a sort or search reorders the whole model, and following a
-    /// row across that would teleport the viewport instead of keeping it
-    /// stable, so those are left alone.
+    /// The displacement is read from ALL remembered rows, never from a single
+    /// one: an insert or removal above the viewport moves every remembered
+    /// row by the same amount, so that shift holds a clear majority and is
+    /// followed exactly. A live sort key (CPU load) instead makes rows trade
+    /// places, which scatters the displacements around zero; no majority
+    /// forms and the viewport stays put. Following whichever row happened to
+    /// sit on top would walk the list a few rows further down on every
+    /// sample, so the head of the order could not be watched at all.
+    ///
+    /// `prefer` names the selected row: when the majority shift would push it
+    /// out of view its own displacement wins instead. `viewport_h` bounds how
+    /// far the viewport may move — a row that travelled more than a screenful
+    /// was reordered, not shifted by an edit, and following it would teleport
+    /// the view.
     fn restored_offset(
         &self,
         key_of: &dyn Fn(usize) -> u64,
         row_count: usize,
         row_h: f32,
-        max_shift: usize,
+        viewport_h: f32,
         prefer: Option<u64>,
     ) -> Option<f32> {
-        let preferred = prefer.and_then(|key| self.keys.iter().position(|k| *k == key));
-        let order = preferred
-            .into_iter()
-            .chain((0..self.keys.len()).filter(|i| Some(*i) != preferred));
-        for k in order {
-            let key = self.keys[k];
-            if let Some(new_index) = (0..row_count).find(|&i| key_of(i) == key) {
-                if new_index.abs_diff(self.base_index + k) > max_shift {
-                    return None;
-                }
-                let rel = self.base_rel + k as f32 * row_h;
-                return Some(new_index as f32 * row_h - rel);
+        if self.keys.is_empty() {
+            return None;
+        }
+        let prev = self.base_index as f32 * row_h - self.base_rel;
+        // Parked at the very top there is no content above the viewport that
+        // could shift it: the user is watching rank 1, so a row arriving
+        // above the old first row must be shown, not scrolled past.
+        if prev <= 0.5 {
+            return Some(0.0);
+        }
+
+        // One pass over the model resolves every remembered identity.
+        let slots: std::collections::HashMap<u64, usize> = self
+            .keys
+            .iter()
+            .enumerate()
+            .map(|(k, key)| (*key, k))
+            .collect();
+        let mut now: Vec<Option<usize>> = vec![None; self.keys.len()];
+        for i in 0..row_count {
+            if let Some(&k) = slots.get(&key_of(i))
+                && now[k].is_none()
+            {
+                now[k] = Some(i);
             }
         }
-        None
+        let shift_of = |k: usize, index: usize| index as isize - (self.base_index + k) as isize;
+        let mut shifts: Vec<isize> = now
+            .iter()
+            .enumerate()
+            .filter_map(|(k, index)| index.map(|index| shift_of(k, index)))
+            .collect();
+        if shifts.is_empty() {
+            return None;
+        }
+
+        // Majority displacement: the longest run of equal shifts, counted
+        // only when it covers more than half of the surviving rows.
+        shifts.sort_unstable();
+        let (mut common, mut best) = (0isize, 0usize);
+        let mut i = 0;
+        while i < shifts.len() {
+            let end = shifts.partition_point(|s| *s <= shifts[i]);
+            if end - i > best {
+                best = end - i;
+                common = shifts[i];
+            }
+            i = end;
+        }
+        let mut shift = if best * 2 > shifts.len() { common } else { 0 };
+
+        // The selection is the row the user is tracking; the shared shift
+        // must never be what pushes it off screen.
+        if let Some(key) = prefer
+            && let Some(&k) = slots.get(&key)
+            && let Some(index) = now[k]
+        {
+            let top = index as f32 * row_h;
+            let offset = prev + shift as f32 * row_h;
+            if top < offset || top + row_h > offset + viewport_h {
+                shift = shift_of(k, index);
+            }
+        }
+
+        if shift == 0 {
+            return None;
+        }
+        if shift.unsigned_abs() > (viewport_h / row_h).ceil() as usize {
+            return None;
+        }
+        Some(prev + shift as f32 * row_h)
     }
 }
 
@@ -365,14 +433,11 @@ pub fn scrolled_rows(
                 .ctx()
                 .data(|d| d.get_temp::<AnchorState>(anchor_id))
                 .unwrap_or_default();
-            // A row that moved further than the screenful the user can see
-            // was reordered, not shifted by an insert/remove.
-            let max_shift = (viewport_h / row_h).ceil() as usize;
             prev.restored_offset(
                 anchor.key_of,
                 row_count,
                 row_h,
-                max_shift,
+                viewport_h,
                 anchor.prefer_key,
             )
         }
@@ -1889,6 +1954,12 @@ mod tests {
         out.textures_delta.clear();
     }
 
+    /// Model index of the first (partially) visible row at `offset`, which is
+    /// the row the anchor state remembers first.
+    fn base_index(offset: f32) -> usize {
+        (offset / ROW_H).floor() as usize
+    }
+
     fn anchored_offset(ctx: &egui::Context) -> f32 {
         ctx.data(|d| {
             d.get_temp::<f32>(egui::Id::new(("tm-rowsy", "t-anchor")))
@@ -2030,6 +2101,100 @@ mod tests {
             "a reordered row must not drag the viewport: {} -> {}",
             base,
             anchored_offset(&ctx)
+        );
+    }
+
+    #[test]
+    fn live_sort_churn_does_not_drag_the_viewport() {
+        let ctx = egui::Context::default();
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(520.0, 300.0));
+        let mut table = table();
+        let base = anchor_baseline(&ctx, &mut table);
+
+        // Sorting by CPU load re-ranks rows every sample: here the row at the
+        // viewport top drops four places and the four rows under it each move
+        // up one. Following that row (the old behaviour) scrolled the list
+        // four rows further down per sample until the user lost the place
+        // they were watching; the bulk of the content did not move, so the
+        // viewport must not either.
+        let top = base_index(base) as u64 + 1;
+        let churned = move |i: usize| {
+            let key = i as u64 + 1;
+            match key {
+                k if k == top => top + 4,
+                k if k > top && k <= top + 4 => k - 1,
+                k => k,
+            }
+        };
+        anchored_frame(
+            &ctx, screen, 0.016, &mut table, 100, None, true, None, &churned,
+        );
+        assert!(
+            (anchored_offset(&ctx) - base).abs() < 0.51,
+            "re-ranked rows must not scroll the list: {} -> {}",
+            base,
+            anchored_offset(&ctx)
+        );
+    }
+
+    #[test]
+    fn selection_does_not_drag_the_viewport_while_it_is_visible() {
+        let ctx = egui::Context::default();
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(520.0, 300.0));
+        let mut table = table();
+        let base = anchor_baseline(&ctx, &mut table);
+
+        // The selected row (key 27) sits mid-viewport and slides three ranks
+        // down, the three rows it passed moving up one each. It stays fully
+        // visible, so it must not become the anchor: dragging the view after
+        // it would scroll the list on every sample.
+        let moved = |i: usize| match i {
+            26..=28 => i as u64 + 2,
+            29 => 27,
+            _ => i as u64 + 1,
+        };
+        anchored_frame(
+            &ctx,
+            screen,
+            0.016,
+            &mut table,
+            100,
+            None,
+            true,
+            Some(27),
+            &moved,
+        );
+        assert!(
+            (anchored_offset(&ctx) - base).abs() < 0.51,
+            "a still-visible selection must not scroll the list: {} -> {}",
+            base,
+            anchored_offset(&ctx)
+        );
+    }
+
+    #[test]
+    fn a_viewport_at_the_top_stays_at_the_top() {
+        let ctx = egui::Context::default();
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(520.0, 300.0));
+        let mut table = table();
+        let key = |i: usize| i as u64 + 1;
+        anchored_frame(
+            &ctx, screen, 0.000, &mut table, 100, None, false, None, &key,
+        );
+        assert_eq!(anchored_offset(&ctx), 0.0);
+
+        // A new process takes the top rank and pushes every row down one.
+        // Anchoring the old first row would scroll it out of view - but the
+        // whole point of sitting at the top of a CPU-sorted list is seeing
+        // whatever holds rank 1.
+        let inserted = |i: usize| if i == 0 { 999 } else { i as u64 };
+        anchored_frame(
+            &ctx, screen, 0.016, &mut table, 101, None, true, None, &inserted,
+        );
+        assert_eq!(
+            anchored_offset(&ctx),
+            0.0,
+            "a list parked at the top must stay there"
         );
     }
 

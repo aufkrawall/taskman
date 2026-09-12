@@ -171,8 +171,11 @@ platform boundary (`tm-core` ← `tm-platform` ← `tm-app` / `tm-service`):
   `ROW_H_DENSE`) and `scrolled_rows` must virtualize on it, never on `ROW_H`.
   `scrolled_rows` also anchors the vertical offset to the identities of the
   previously visible rows (`ScrollAnchor` + `stable_key`) on model-rebuild
-  frames, preferring the primary selected row while it is visible, so
-  insertions/removals around the viewport cannot shift the content;
+  frames, so insertions/removals around the viewport cannot shift the content.
+  It follows the MAJORITY displacement of those rows, never a single row's:
+  re-ranking under a live sort key (CPU load) must leave the viewport alone,
+  and a viewport parked at the top stays there. `prefer_key` only overrides
+  that shared shift when it would push the selection out of view;
   `model_changed` must only be set when the caller actually rebuilt the model.
   Resize math MUST accumulate
   each frame's `drag_delta()` onto the LIVE width; `drag_delta()` is
