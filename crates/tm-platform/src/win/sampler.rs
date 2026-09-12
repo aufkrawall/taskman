@@ -133,9 +133,23 @@ pub struct Sampler {
     /// recycled PID cannot inherit a dead process's totals.
     prev_proc_net: HashMap<u32, ProcNetSample>,
     disk_source: DiskSource,
+    /// The last disk values a usable window produced, keyed by pid. A window
+    /// too short to measure carries these forward for one tick instead of
+    /// blanking the whole column; see [`Sampler::apply_process_disk`].
+    last_proc_disk: HashMap<u32, ProcDiskSample>,
     /// Image paths for the processes no handle can be opened for. Cached
     /// because the answer cannot change while a process lives.
     image_paths: image_path::ImagePaths,
+}
+
+/// One process's disk values from the last window that was long enough to
+/// measure. Keyed by identity so a recycled PID cannot inherit them.
+#[derive(Debug, Clone, Copy)]
+struct ProcDiskSample {
+    start_epoch_s: Option<i64>,
+    active_pct: f32,
+    read_bps: f64,
+    write_bps: f64,
 }
 
 /// Where per-process network counters come from.
@@ -249,6 +263,7 @@ impl Sampler {
             disk_source: DiskSource::Undecided,
             image_paths: image_path::ImagePaths::default(),
             prev_proc_net: HashMap::new(),
+            last_proc_disk: HashMap::new(),
         }
     }
 
@@ -485,6 +500,9 @@ impl Sampler {
         if !self.demand.wants(TelemetryDemand::PROCESS_DISK) {
             // Dropping a local session here stops it and joins its consumer.
             self.disk_source = DiskSource::Undecided;
+            // Nothing may be carried across a gap of unknown length: the next
+            // reading has to be measured, not inherited from minutes ago.
+            self.last_proc_disk.clear();
             return None;
         }
         if let DiskSource::Unavailable { since } = &self.disk_source {
@@ -505,7 +523,11 @@ impl Sampler {
             self.disk_source = DiskSource::Undecided;
         }
         if matches!(self.disk_source, DiskSource::Undecided) {
-            self.disk_source = probe_disk_source();
+            let (source, first) = probe_disk_source();
+            self.disk_source = source;
+            if let Some(sample) = first.filter(|sample| sample.active) {
+                return Some(disk_sample_to_window(sample));
+            }
         }
         match &self.disk_source {
             DiskSource::Broker { misses } => {
@@ -576,12 +598,17 @@ impl Sampler {
         let Some(window) = self.disk_window(&live) else {
             return;
         };
-        // The first window after a trace starts covers the microseconds
-        // between starting it and asking, and the probe tick drains one of
-        // those. Shares from it would be a single request and rates from it
-        // would be absurd, so report unknown for that one tick.
+        // A window can be too short to measure: the first one after a trace
+        // starts covers the microseconds since it started, and two ticks
+        // landing close together (the sampler thread starved while the window
+        // is restored, say) leave the second one with almost no interval.
+        // Rates from those would be absurd, so they are not measured — but
+        // blanking the whole column is a worse answer than the reading from
+        // one tick ago, which was really measured. Carry it forward; only a
+        // process with nothing to carry stays unknown.
         const MIN_WINDOW_MS: u64 = 100;
         if window.since_ms < MIN_WINDOW_MS {
+            carry_process_disk(&self.last_proc_disk, processes);
             return;
         }
         // Records arrived and not one of them could be read: the payload does
@@ -606,7 +633,52 @@ impl Sampler {
                 process.disk_phys_read_bps = Some(disk.read_bytes as f64 / seconds);
                 process.disk_phys_write_bps = Some(disk.write_bytes as f64 / seconds);
             }
+            if let (Some(active_pct), Some(read_bps), Some(write_bps)) = (
+                process.disk_active_pct,
+                process.disk_phys_read_bps,
+                process.disk_phys_write_bps,
+            ) {
+                self.last_proc_disk.insert(
+                    process.pid,
+                    ProcDiskSample {
+                        start_epoch_s: process.start_epoch_s,
+                        active_pct,
+                        read_bps,
+                        write_bps,
+                    },
+                );
+            }
         }
+        // Keyed by pid, so it has to be pruned to the processes that still
+        // exist or a recycled PID would inherit a dead one's numbers.
+        let live: HashSet<u32> = processes.iter().map(|p| p.pid).collect();
+        self.last_proc_disk.retain(|pid, _| live.contains(pid));
+    }
+}
+
+/// Re-apply the last measured disk values over a window too short to produce
+/// new ones.
+///
+/// The identity check is what keeps this honest: a PID that has been recycled
+/// since the reading was taken is a different process and gets unknown, not
+/// the dead one's numbers.
+fn carry_process_disk(
+    last_proc_disk: &HashMap<u32, ProcDiskSample>,
+    processes: &mut [ProcessEntry],
+) {
+    for process in processes.iter_mut() {
+        if process.synthetic {
+            continue;
+        }
+        let Some(last) = last_proc_disk.get(&process.pid) else {
+            continue;
+        };
+        if last.start_epoch_s != process.start_epoch_s {
+            continue;
+        }
+        process.disk_active_pct = Some(last.active_pct);
+        process.disk_phys_read_bps = Some(last.read_bps);
+        process.disk_phys_write_bps = Some(last.write_bps);
     }
 }
 
@@ -1372,27 +1444,40 @@ fn probe_net_source() -> (NetSource, Option<HashMap<u32, net_etw::PidBytes>>) {
     }
 }
 
-/// Probe both disk sources once. Unlike the network probe this does not keep
-/// a first sample: the disk answer DRAINS its window, and the very first one
-/// covers the microseconds since the session started.
-fn probe_disk_source() -> DiskSource {
+/// Probe both disk sources once, returning the chosen one plus the sample it
+/// already produced.
+///
+/// The disk answer DRAINS its window, so throwing the probe's sample away does
+/// not merely waste a round trip the way it would for network: it leaves the
+/// NEXT drain covering only the microseconds since this one, which
+/// `apply_process_disk` then has to reject as too short. Keeping it means a
+/// probe tick reports real values whenever the trace was already running.
+fn probe_disk_source() -> (DiskSource, Option<core_service::ProcessDiskSample>) {
     match core_service::brokered_process_disk() {
-        core_service::BrokeredDisk::Sample(_) => DiskSource::Broker { misses: 0 },
+        core_service::BrokeredDisk::Sample(sample) => {
+            (DiskSource::Broker { misses: 0 }, Some(sample))
+        }
         // An explicit refusal is a policy decision; do not route around it.
         core_service::BrokeredDisk::Rejected(detail) => {
             tracing::warn!(%detail, "broker refused disk counters");
-            DiskSource::Unavailable {
-                since: Instant::now(),
-            }
+            (
+                DiskSource::Unavailable {
+                    since: Instant::now(),
+                },
+                None,
+            )
         }
         // No service (or one too old to know the request): fall back to our
         // own token, which only works when elevated.
         core_service::BrokeredDisk::Unavailable => {
             match disk_etw::DiskUsage::start(super::etw::TraceRole::App) {
-                Some(usage) => DiskSource::Local(usage),
-                None => DiskSource::Unavailable {
-                    since: Instant::now(),
-                },
+                Some(usage) => (DiskSource::Local(usage), None),
+                None => (
+                    DiskSource::Unavailable {
+                        since: Instant::now(),
+                    },
+                    None,
+                ),
             }
         }
     }
@@ -2020,6 +2105,57 @@ mod tests {
         assert!(
             (sum - machine).abs() < 0.01,
             "rows summed to {sum}, header says {machine}"
+        );
+    }
+
+    /// Restoring a minimized window starves the sampler thread, so the next
+    /// tick can land only milliseconds after the last one. That window is too
+    /// short to measure, and blanking the whole Disk active time column for it
+    /// is what made the column flash "—" on restore. The reading from one tick
+    /// ago was really measured, so it is carried forward — but only for the
+    /// same process, never for a recycled PID.
+    #[test]
+    fn a_window_too_short_to_measure_carries_the_last_reading_forward() {
+        let mut last = HashMap::new();
+        last.insert(
+            7,
+            ProcDiskSample {
+                start_epoch_s: Some(1_000),
+                active_pct: 12.5,
+                read_bps: 2048.0,
+                write_bps: 1024.0,
+            },
+        );
+        // A PID that has since been recycled: same pid, different process.
+        last.insert(
+            8,
+            ProcDiskSample {
+                start_epoch_s: Some(1_000),
+                active_pct: 99.0,
+                read_bps: 1.0,
+                write_bps: 1.0,
+            },
+        );
+
+        let mut same = ProcessEntry::new(7, "same.exe");
+        same.start_epoch_s = Some(1_000);
+        let mut recycled = ProcessEntry::new(8, "recycled.exe");
+        recycled.start_epoch_s = Some(2_000);
+        let never_seen = ProcessEntry::new(9, "new.exe");
+        let mut processes = vec![same, recycled, never_seen];
+
+        carry_process_disk(&last, &mut processes);
+
+        assert_eq!(processes[0].disk_active_pct, Some(12.5));
+        assert_eq!(processes[0].disk_phys_read_bps, Some(2048.0));
+        assert_eq!(processes[0].disk_phys_write_bps, Some(1024.0));
+        assert_eq!(
+            processes[1].disk_active_pct, None,
+            "a recycled PID must not inherit the dead process's disk numbers"
+        );
+        assert_eq!(
+            processes[2].disk_active_pct, None,
+            "a process with nothing measured yet stays unknown"
         );
     }
 }
