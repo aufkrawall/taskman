@@ -60,6 +60,16 @@ pub fn set_direct(enabled: bool) -> Result<()> {
     set_direct_for_exe(enabled, &exe)
 }
 
+/// Whether TaskMan is currently configured as the system Task Manager replacement
+/// in Image File Execution Options (IFEO).
+pub fn is_replacement_enabled() -> bool {
+    if let Ok(exe) = std::env::current_exe() {
+        matches!(state_for_exe(&exe), State::Enabled | State::Stale(_))
+    } else {
+        false
+    }
+}
+
 pub fn set_direct_for_exe(enabled: bool, exe: &Path) -> Result<()> {
     let current = state_for_exe(exe);
     if enabled {
@@ -466,5 +476,12 @@ mod tests {
         assert!(is_owned_command(&own_command_for(Path::new(
             r"C:\Program Files\TaskMan\taskman.exe"
         ))));
+    }
+
+    #[test]
+    fn replacement_enabled_matches_current_exe_state() {
+        let own_exe = std::env::current_exe().expect("test executable");
+        let expected = matches!(state_for_exe(&own_exe), State::Enabled | State::Stale(_));
+        assert_eq!(is_replacement_enabled(), expected);
     }
 }

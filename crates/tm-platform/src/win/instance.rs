@@ -100,6 +100,7 @@ pub struct Primary {
     mapping: HANDLE,
     view: MEMORY_MAPPED_VIEW_ADDRESS,
     listener: Option<std::thread::JoinHandle<()>>,
+    _hotkey_hook: Option<super::hotkey_hook::HotkeyHook>,
     owns_mutex: bool,
 }
 
@@ -108,7 +109,8 @@ pub struct Primary {
 static ACK_EVENT: AtomicIsize = AtomicIsize::new(0);
 /// Mapped view of the published primary info, owned by the primary instance.
 static INFO_VIEW: AtomicIsize = AtomicIsize::new(0);
-/// Show event, published only when the listener thread could not start.
+/// HWND of the published primary instance, stored locally for quick access.
+static PUBLISHED_HWND: AtomicIsize = AtomicIsize::new(0);
 static SHOW_FALLBACK: AtomicIsize = AtomicIsize::new(0);
 static LISTENER_STOP: AtomicBool = AtomicBool::new(false);
 /// Set once a pre-elevation probe has established that the instance holding
@@ -312,12 +314,27 @@ fn read_primary_info(names: &Names) -> Option<PrimaryInfo> {
 /// Publish this process's window handle so later launches can tell a slow
 /// instance from a wedged one. Called once, as soon as the handle exists.
 pub fn publish_window(hwnd: isize) {
+    PUBLISHED_HWND.store(hwnd, Ordering::Release);
     let view = INFO_VIEW.load(Ordering::Acquire);
     if view == 0 {
         return;
     }
     let shared = unsafe { &*(view as *const SharedInfo) };
     shared.hwnd.store(hwnd as u64, Ordering::Relaxed);
+}
+
+/// Retrieve the published window handle for this session's primary instance.
+pub fn published_window() -> isize {
+    let hwnd = PUBLISHED_HWND.load(Ordering::Acquire);
+    if hwnd != 0 {
+        return hwnd;
+    }
+    let view = INFO_VIEW.load(Ordering::Acquire);
+    if view == 0 {
+        return 0;
+    }
+    let shared = unsafe { &*(view as *const SharedInfo) };
+    shared.hwnd.load(Ordering::Relaxed) as isize
 }
 
 /// Acknowledge a show request from the UI thread that actually processed it.
@@ -456,7 +473,7 @@ fn activate_in(names: &Names) -> Activation {
 /// "restart elevated": the outgoing instance queues its close right after
 /// launching it, so this process waits for ownership instead of bouncing off
 /// its own predecessor.
-pub fn acquire(elevation_handoff: bool, on_show: impl Fn() + Send + 'static) -> Role {
+pub fn acquire(elevation_handoff: bool, on_show: impl Fn() + Send + Sync + 'static) -> Role {
     let names = names();
     let security = object_security();
     let mutex = match unsafe {
@@ -540,6 +557,10 @@ pub fn acquire(elevation_handoff: bool, on_show: impl Fn() + Send + 'static) -> 
     }
     ACK_EVENT.store(show_handle_value(ack), Ordering::Release);
 
+    let on_show = std::sync::Arc::new(on_show);
+    let on_show_listener = std::sync::Arc::clone(&on_show);
+    let on_show_hook = std::sync::Arc::clone(&on_show);
+
     LISTENER_STOP.store(false, Ordering::Release);
     let show_raw = show_handle_value(show);
     let listener = match std::thread::Builder::new()
@@ -553,7 +574,7 @@ pub fn acquire(elevation_handoff: bool, on_show: impl Fn() + Send + 'static) -> 
                 if LISTENER_STOP.load(Ordering::Acquire) {
                     break;
                 }
-                on_show();
+                on_show_listener();
             }
         }) {
         Ok(listener) => Some(listener),
@@ -566,6 +587,9 @@ pub fn acquire(elevation_handoff: bool, on_show: impl Fn() + Send + 'static) -> 
             None
         }
     };
+    let hotkey_hook = super::hotkey_hook::HotkeyHook::install(move || {
+        on_show_hook();
+    });
     Role::Primary(Primary {
         mutex,
         show,
@@ -577,6 +601,7 @@ pub fn acquire(elevation_handoff: bool, on_show: impl Fn() + Send + 'static) -> 
             }),
         },
         listener,
+        _hotkey_hook: hotkey_hook,
         owns_mutex,
     })
 }
@@ -603,6 +628,7 @@ pub fn poll_show_request() -> bool {
 
 impl Drop for Primary {
     fn drop(&mut self) {
+        PUBLISHED_HWND.store(0, Ordering::Release);
         SHOW_FALLBACK.store(0, Ordering::Release);
         ACK_EVENT.store(0, Ordering::Release);
         INFO_VIEW.store(0, Ordering::Release);
@@ -741,5 +767,13 @@ mod tests {
     fn a_missing_record_is_not_treated_as_a_dead_owner() {
         let fixture = Fixture::new(&scope("norecord"));
         assert!(read_primary_info(&fixture.names).is_none());
+    }
+
+    #[test]
+    fn published_window_round_trip() {
+        publish_window(0x4321);
+        assert_eq!(published_window(), 0x4321);
+        publish_window(0);
+        assert_eq!(published_window(), 0);
     }
 }

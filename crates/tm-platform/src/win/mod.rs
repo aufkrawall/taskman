@@ -9,6 +9,7 @@ mod disk_etw;
 mod etw;
 mod explorer_restart;
 mod gpu;
+pub(crate) mod hotkey_hook;
 pub mod icons;
 mod image_path;
 /// Cross-process coordination between the instances of one session.

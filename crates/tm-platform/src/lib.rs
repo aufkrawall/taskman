@@ -117,6 +117,15 @@ pub fn set_window_cloaked(hwnd: isize, cloaked: bool) {
 #[cfg(not(target_os = "windows"))]
 pub fn set_window_cloaked(_hwnd: isize, _cloaked: bool) {}
 
+/// Force `hwnd` to the foreground even over fullscreen exclusive/borderless 3D games.
+#[cfg(target_os = "windows")]
+pub fn force_foreground(hwnd: isize) {
+    win::window_chrome::force_foreground(hwnd);
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn force_foreground(_hwnd: isize) {}
+
 /// Build only the platform action surface (process control, services,
 /// startup apps, ...).
 ///

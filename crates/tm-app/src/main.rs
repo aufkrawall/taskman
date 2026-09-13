@@ -1146,6 +1146,10 @@ impl NativeApp {
         // it was.
         ctx.send_viewport_cmd(eframe::egui::ViewportCommand::Minimized(false));
         ctx.send_viewport_cmd(eframe::egui::ViewportCommand::Focus);
+        #[cfg(target_os = "windows")]
+        if let Some(hwnd) = self.hwnd {
+            tm_platform::force_foreground(hwnd);
+        }
         // Tell a waiting launch that the request has been processed by the
         // thread that actually draws: that, and not the request arriving, is
         // what proves this instance is alive enough to keep the request.
@@ -1172,6 +1176,8 @@ impl NativeApp {
         if self.uncloak_in == 0 {
             if let Some(hwnd) = self.hwnd {
                 tm_platform::set_window_cloaked(hwnd, false);
+                #[cfg(target_os = "windows")]
+                tm_platform::force_foreground(hwnd);
             }
         } else {
             // The countdown must not stall on an idle, event-driven UI.

@@ -258,6 +258,101 @@ pub fn set_cloaked(hwnd: isize, cloaked: bool) {
     );
 }
 
+/// Force `hwnd` to the foreground even if an exclusive or borderless fullscreen
+/// 3D application (like a game) currently holds focus.
+///
+/// Under standard Windows foreground lock rules, background processes cannot
+/// steal the foreground. When a game runs in exclusive or borderless fullscreen,
+/// typical `SetForegroundWindow` calls are dropped or result in flashing taskbar
+/// buttons. By temporarily attaching thread input to both the current foreground
+/// window's thread and the target window's thread, and calling `SwitchToThisWindow`,
+/// the OS grants the foreground switch directly over the fullscreen surface.
+pub fn force_foreground(hwnd: isize) {
+    if hwnd == 0 {
+        return;
+    }
+    let target = HWND(hwnd as *mut std::ffi::c_void);
+    unsafe {
+        if !windows::Win32::UI::WindowsAndMessaging::IsWindow(Some(target)).as_bool() {
+            return;
+        }
+
+        let cur_thread = windows::Win32::System::Threading::GetCurrentThreadId();
+        let fg_hwnd = windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow();
+        let fg_thread = if fg_hwnd.0.is_null() {
+            0
+        } else {
+            windows::Win32::UI::WindowsAndMessaging::GetWindowThreadProcessId(fg_hwnd, None)
+        };
+        let target_thread =
+            windows::Win32::UI::WindowsAndMessaging::GetWindowThreadProcessId(target, None);
+
+        let attached_fg = if fg_thread != 0 && fg_thread != cur_thread {
+            windows::Win32::System::Threading::AttachThreadInput(cur_thread, fg_thread, true)
+                .as_bool()
+        } else {
+            false
+        };
+        let attached_target = if target_thread != 0 && target_thread != cur_thread {
+            windows::Win32::System::Threading::AttachThreadInput(cur_thread, target_thread, true)
+                .as_bool()
+        } else {
+            false
+        };
+
+        let is_minimized = IsIconic(target).as_bool();
+        if is_minimized {
+            let _ = windows::Win32::UI::WindowsAndMessaging::ShowWindow(
+                target,
+                windows::Win32::UI::WindowsAndMessaging::SW_RESTORE,
+            );
+        } else {
+            let _ = windows::Win32::UI::WindowsAndMessaging::ShowWindow(
+                target,
+                windows::Win32::UI::WindowsAndMessaging::SW_SHOW,
+            );
+        }
+
+        let _ = SetWindowPos(
+            target,
+            Some(windows::Win32::UI::WindowsAndMessaging::HWND_TOP),
+            0,
+            0,
+            0,
+            0,
+            windows::Win32::UI::WindowsAndMessaging::SWP_NOMOVE
+                | windows::Win32::UI::WindowsAndMessaging::SWP_NOSIZE
+                | windows::Win32::UI::WindowsAndMessaging::SWP_SHOWWINDOW,
+        );
+        let _ = windows::Win32::UI::WindowsAndMessaging::BringWindowToTop(target);
+        let _ = windows::Win32::UI::WindowsAndMessaging::SetForegroundWindow(target);
+
+        if let Ok(user32) =
+            windows::Win32::System::LibraryLoader::GetModuleHandleW(windows::core::w!("user32.dll"))
+            && let Some(proc) = windows::Win32::System::LibraryLoader::GetProcAddress(
+                user32,
+                windows::core::s!("SwitchToThisWindow"),
+            )
+        {
+            type SwitchToThisWindowFn = unsafe extern "system" fn(HWND, windows::core::BOOL);
+            let switch_fn: SwitchToThisWindowFn = std::mem::transmute(proc);
+            switch_fn(target, true.into());
+        }
+
+        if attached_fg {
+            let _ =
+                windows::Win32::System::Threading::AttachThreadInput(cur_thread, fg_thread, false);
+        }
+        if attached_target {
+            let _ = windows::Win32::System::Threading::AttachThreadInput(
+                cur_thread,
+                target_thread,
+                false,
+            );
+        }
+    }
+}
+
 /// Whether the user has Windows' "Transparency effects" turned on.
 ///
 /// Honoring it is not decoration: it is an accessibility and battery setting,
@@ -303,5 +398,12 @@ mod tests {
     #[test]
     fn transparency_preference_is_readable() {
         let _ = transparency_effects_enabled();
+    }
+
+    #[test]
+    fn force_foreground_handles_zero_and_invalid_hwnd() {
+        // Zero or invalid HWND must gracefully return without panicking.
+        force_foreground(0);
+        force_foreground(0x12345);
     }
 }
