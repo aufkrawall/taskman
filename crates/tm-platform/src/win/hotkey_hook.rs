@@ -26,6 +26,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
 static CONSUMED_DOWN: AtomicBool = AtomicBool::new(false);
 static HOOK_CALLBACK: std::sync::Mutex<Option<Arc<dyn Fn() + Send + Sync + 'static>>> =
     std::sync::Mutex::new(None);
+static LAST_DOWN_INSTANT: std::sync::Mutex<Option<std::time::Instant>> =
+    std::sync::Mutex::new(None);
 
 pub struct HotkeyHook {
     thread_id: u32,
@@ -94,6 +96,8 @@ impl HotkeyHook {
 impl Drop for HotkeyHook {
     fn drop(&mut self) {
         *HOOK_CALLBACK.lock().unwrap() = None;
+        *LAST_DOWN_INSTANT.lock().unwrap() = None;
+        CONSUMED_DOWN.store(false, Ordering::SeqCst);
         if self.thread_id != 0 {
             unsafe {
                 let _ = PostThreadMessageW(self.thread_id, WM_QUIT, WPARAM(0), LPARAM(0));
@@ -115,7 +119,21 @@ unsafe extern "system" fn low_level_keyboard_proc(
     }
 
     let kbd = unsafe { &*(lparam.0 as *const KBDLLHOOKSTRUCT) };
+    let msg = wparam.0 as u32;
+
     if kbd.vkCode == VK_ESCAPE.0 as u32 {
+        // If Escape is being released, always clear CONSUMED_DOWN.
+        // If we consumed the keydown, we must also consume the keyup so
+        // the underlying window does not receive an unmatched WM_KEYUP.
+        // Crucially, this must NOT depend on whether Ctrl or Shift is still
+        // pressed, because users frequently release modifier keys before Escape.
+        if msg == WM_KEYUP || msg == WM_SYSKEYUP {
+            *LAST_DOWN_INSTANT.lock().unwrap() = None;
+            if CONSUMED_DOWN.swap(false, Ordering::SeqCst) {
+                return LRESULT(1);
+            }
+        }
+
         let is_ctrl = unsafe { GetAsyncKeyState(VK_CONTROL.0 as i32) } < 0;
         let is_shift = unsafe { GetAsyncKeyState(VK_SHIFT.0 as i32) } < 0;
         let is_alt = unsafe { GetAsyncKeyState(VK_MENU.0 as i32) } < 0;
@@ -124,25 +142,27 @@ unsafe extern "system" fn low_level_keyboard_proc(
 
         if is_ctrl && is_shift && !is_alt && !is_win {
             // Only intercept if TaskMan is configured as the taskmgr replacement.
-            if super::taskmgr_replacement::is_replacement_enabled() {
-                let msg = wparam.0 as u32;
-                if msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN {
-                    if !CONSUMED_DOWN.swap(true, Ordering::SeqCst) {
-                        // First keydown (debounce auto-repeats):
-                        if let Some(cb) = HOOK_CALLBACK.lock().unwrap().as_ref() {
-                            cb();
-                        }
-                        let hwnd = super::instance::published_window();
-                        if hwnd != 0 {
-                            super::window_chrome::force_foreground(hwnd);
-                        }
+            if super::taskmgr_replacement::is_replacement_enabled()
+                && (msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN)
+            {
+                let now = std::time::Instant::now();
+                let mut last = LAST_DOWN_INSTANT.lock().unwrap();
+                let is_stale = last.is_some_and(|prev| {
+                    now.duration_since(prev) > std::time::Duration::from_millis(1000)
+                });
+                *last = Some(now);
+
+                if !CONSUMED_DOWN.swap(true, Ordering::SeqCst) || is_stale {
+                    // First keydown (debounce auto-repeats):
+                    if let Some(cb) = HOOK_CALLBACK.lock().unwrap().as_ref() {
+                        cb();
                     }
-                    return LRESULT(1);
-                } else if (msg == WM_KEYUP || msg == WM_SYSKEYUP)
-                    && CONSUMED_DOWN.swap(false, Ordering::SeqCst)
-                {
-                    return LRESULT(1);
+                    let hwnd = super::instance::published_window();
+                    if hwnd != 0 {
+                        super::window_chrome::force_foreground(hwnd);
+                    }
                 }
+                return LRESULT(1);
             }
         }
     }
@@ -159,5 +179,27 @@ mod tests {
         let hook = HotkeyHook::install(|| {});
         assert!(hook.is_some());
         drop(hook);
+    }
+
+    #[test]
+    fn escape_keyup_clears_consumed_down_without_modifiers() {
+        CONSUMED_DOWN.store(true, Ordering::SeqCst);
+        let kbd = KBDLLHOOKSTRUCT {
+            vkCode: VK_ESCAPE.0 as u32,
+            scanCode: 1,
+            flags: windows::Win32::UI::WindowsAndMessaging::KBDLLHOOKSTRUCT_FLAGS(0),
+            time: 0,
+            dwExtraInfo: 0,
+        };
+        let lparam = LPARAM(&kbd as *const _ as isize);
+        let res =
+            unsafe { low_level_keyboard_proc(HC_ACTION as i32, WPARAM(WM_KEYUP as usize), lparam) };
+        assert_eq!(res, LRESULT(1));
+        assert!(!CONSUMED_DOWN.load(Ordering::SeqCst));
+
+        // Subsequent keyup when CONSUMED_DOWN is already false passes through (returns 0)
+        let res =
+            unsafe { low_level_keyboard_proc(HC_ACTION as i32, WPARAM(WM_KEYUP as usize), lparam) };
+        assert_eq!(res, LRESULT(0));
     }
 }

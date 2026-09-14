@@ -648,6 +648,13 @@ impl NativeApp {
 impl eframe::App for NativeApp {
     fn logic(&mut self, ctx: &eframe::egui::Context, frame: &mut eframe::Frame) {
         #[cfg(target_os = "windows")]
+        if self.hwnd.is_none() {
+            let published = tm_platform::win::instance::published_window();
+            if published != 0 {
+                self.hwnd = Some(published);
+            }
+        }
+        #[cfg(target_os = "windows")]
         poll_show_event_fallback(ctx);
         // Before the tray actions, so a restore requested THIS frame cannot
         // spend one of the frames it is owed on the frame that requested it.
