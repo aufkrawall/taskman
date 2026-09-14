@@ -1,3 +1,4 @@
+- 2026-09-14: Process crash dump creation progress dialog and responsive cancellation: `MINIDUMP_CALLBACK_INFORMATION` with `CancelCallback` periodically checks `DumpProgressTracker::is_cancelled()`, immediately terminating `MiniDumpWriteDump` upon user request. Bytes written are polled via `GetFileSizeEx` on the open dump file, driving an egui progress modal with percentage, estimated completion, MB/s throughput, and elapsed time. On cancel, partial dumps are removed and the `DUMP_TYPE_REDUCED` fallback is skipped.
 - 2026-09-14: Hotkey hook Ctrl+Shift+Esc double press fix: `CONSUMED_DOWN` in `hotkey_hook.rs` debounced auto-repeats on `WM_KEYDOWN` but was only reset on `WM_KEYUP` within the `is_ctrl && is_shift` guard. If a user released Ctrl or Shift before Escape, `CONSUMED_DOWN` was stranded `true`, causing the subsequent hotkey invocation to be debounced and swallowed without showing the window until pressed a second time. Fixed by resetting `CONSUMED_DOWN` and consuming `WM_KEYUP` on Escape release regardless of modifier state, backed by a 1000ms watchdog for stale down states.
 - 2026-09-14: Process dumps now offer Minimal, Limited, Normal, and Full options via a context submenu on Processes and Details matching System Informer / Process Hacker. `DumpType` in `tm-core::model` drives `process_ops::create_dump_file` flags (`DUMP_TYPE_MINIMAL`, `DUMP_TYPE_LIMITED`, `DUMP_TYPE_NORMAL`, and `DUMP_TYPE_FULL`), with fallback to `DUMP_TYPE_REDUCED` on address space access failures.
 - 2026-09-13: Fullscreen 3D game Ctrl+Shift+Esc interception: Windows suppresses shell RegisterHotKey (preventing Explorer from launching taskmgr.exe / IFEO debugger) when exclusive or borderless fullscreen games hold focus. Fixed by installing a dedicated WH_KEYBOARD_LL low-level keyboard hook on thread `tm-hotkey-hook` gated by `is_replacement_enabled()`, combined with `force_foreground` (`AttachThreadInput` + `SwitchToThisWindow`) to bypass fullscreen foreground lock restrictions.
@@ -14,6 +15,31 @@
 - 2026-09-08: Details gained optional Network / Network receive / Network send columns. PROCESS_NET demand now follows those visible columns and stays active while Process Properties is open, fixing blank live network statistics there without running the ETW session continuously on Details.
 - 2026-09-08: Process Properties now summarizes mitigations with System Informer-style qualifiers (permanent DEP, high-entropy ASLR, prohibited/disabled wording, CF Guard and stack protection), and module inventory uses the authenticated LocalSystem broker for identity-bound SYSTEM/service inspection with bounded responses.
 # Recent Activity
+
+## 2026-09-14 — Process crash dump creation progress status and responsive cancellation
+
+Writing process memory dumps (especially Full dumps of multi-gigabyte processes) can take substantial time. Previously, dump generation was an unmonitored background task with no user-visible progress indication, nor any mechanism to cancel an in-progress dump that was consuming disk space or I/O bandwidth.
+
+### Architecture & Implementation
+
+1. **Progress Tracking & Instant Cancellation (`tm-core` & `tm-platform`):**
+   - Introduced `DumpProgressTracker` in `tm-core::model` holding atomic cancellation (`request_cancel`, `is_cancelled`) and byte counter (`bytes_written`, `set_bytes_written`).
+   - Extended `ActionSink` with `create_dump_file_with_progress`.
+   - Configured `MiniDumpWriteDump` with `MINIDUMP_CALLBACK_INFORMATION` using `CancelCallback` (`CallbackType == 6`).
+   - If `tracker.is_cancelled()` is true, the callback sets `Cancel = TRUE`, causing `MiniDumpWriteDump` to abort immediately with `ERROR_CANCELLED` (< 1 ms latency).
+   - Real-time progress is captured by querying `GetFileSizeEx` on the open dump file handle every 32 callbacks (~a few milliseconds interval), updating `tracker.set_bytes_written(...)`.
+   - Clean abortion: On cancellation, `create_dump_file_with_progress` skips any fallback to `DUMP_TYPE_REDUCED`, closes the file handle, deletes the partial dump file from disk, and returns `Err(TmError::Canceled)`.
+
+2. **Progress Modal UI & Repaint Driver (`tm-app`):**
+   - Added `ActiveDump` state to `TaskManApp` storing tracker, target PID, process name, dump type, output path, estimated total bytes (derived from `commit_bytes` or `mem_bytes`), start time, and a status receiver.
+   - When an active dump is running, `logic()` schedules a 50ms repaint timer for smooth progress animation and real-time throughput / elapsed time display.
+   - Rendered modal dialog `dump_progress_dialog` showing:
+     - Target process name, PID, dump type, and destination file path.
+     - Animated `egui::ProgressBar` with percentage (if estimated total is known) or pulsing bar.
+     - Written bytes vs estimated total (e.g. `142.5 MB / 1.20 GB (11%)`).
+     - Write speed (MB/s) and elapsed time formatted as `MM:SS`.
+     - Prominent "Cancel" button, Esc key shortcut, and window close button wired to `tracker.request_cancel()`.
+     - Upon cancel, the dialog indicates "Cancelling..." until the background worker finishes cleanup, then shows completion/cancellation notice with a dismiss button.
 
 ## 2026-09-12 — CPU-sorted list walked downwards under the viewport
 

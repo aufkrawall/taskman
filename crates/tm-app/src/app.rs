@@ -257,6 +257,19 @@ pub struct PendingUacVirtualization {
     pub enabled: bool,
 }
 
+/// Active in-flight process crash dump operation with progress tracking and cooperative cancellation.
+#[derive(Clone)]
+pub struct ActiveDump {
+    pub pid: u32,
+    pub process_name: String,
+    pub dump_type: tm_core::model::DumpType,
+    pub path: std::path::PathBuf,
+    pub tracker: Arc<tm_core::model::DumpProgressTracker>,
+    pub total_bytes_estimate: Option<u64>,
+    pub started_at: std::time::Instant,
+    pub outcome: Arc<Mutex<Option<tm_core::Result<()>>>>,
+}
+
 struct ProcessRuleResult {
     identity: ProcessIdentity,
     error: Option<String>,
@@ -356,6 +369,8 @@ pub struct TaskManApp {
     pub pending_process_end: Option<PendingProcessEnd>,
     /// Details context-menu UAC virtualization change awaiting confirmation.
     pub pending_uac_virtualization: Option<PendingUacVirtualization>,
+    /// Active crash dump creation awaiting completion or cancellation.
+    pub active_dump: Option<ActiveDump>,
     // Services tab.
     pub services_selected_name: Option<String>,
 
@@ -476,13 +491,34 @@ impl TaskManApp {
                     egui::WindowLevel::AlwaysOnTop,
                 ));
         }
-        // Diagnostics: open a dialog right away (TASKMAN_DIALOG=settings|run|end_task)
+        // Diagnostics: open a dialog right away (TASKMAN_DIALOG=settings|run|end_task|dump)
         // or select a Performance resource by key (TASKMAN_PERF=<key>) so UI
         // tests can capture them without input automation.
         let open_dialog = std::env::var("TASKMAN_DIALOG").unwrap_or_default();
-        let (show_settings, run_dialog_open, pending_process_end) = match open_dialog.as_str() {
-            "settings" => (true, false, None),
-            "run" => (false, true, None),
+        let (show_settings, run_dialog_open, pending_process_end, active_dump) = match open_dialog
+            .as_str()
+        {
+            "settings" => (true, false, None, None),
+            "run" => (false, true, None, None),
+            "dump" => {
+                let tracker = Arc::new(tm_core::model::DumpProgressTracker::new());
+                tracker.set_bytes_written(184_000_000);
+                (
+                    false,
+                    false,
+                    None,
+                    Some(ActiveDump {
+                        pid: 14208,
+                        process_name: "chrome.exe".into(),
+                        dump_type: tm_core::model::DumpType::Full,
+                        path: std::path::PathBuf::from(r"C:\Users\User\Documents\chrome_14208.dmp"),
+                        tracker,
+                        total_bytes_estimate: Some(420_000_000),
+                        started_at: std::time::Instant::now(),
+                        outcome: Arc::new(Mutex::new(None)),
+                    }),
+                )
+            }
             "end_task" => (
                 false,
                 false,
@@ -568,8 +604,9 @@ impl TaskManApp {
                     ],
                     tree: false,
                 }),
+                None,
             ),
-            _ => (false, false, None),
+            _ => (false, false, None, None),
         };
         let perf_selected_key = std::env::var("TASKMAN_PERF").unwrap_or_else(|_| "cpu".into());
 
@@ -712,6 +749,7 @@ impl TaskManApp {
             pending_session_logoff: None,
             pending_process_end,
             pending_uac_virtualization: None,
+            active_dump,
             services_selected_name: None,
             pending_details_focus: None,
             scroll_to_pid: None,
@@ -1290,6 +1328,8 @@ impl eframe::App for TaskManApp {
         // events (engine publication, worker completion, input).
         if self.fps_probe {
             ctx.request_repaint_after(std::time::Duration::from_millis(1));
+        } else if self.active_dump.is_some() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(50));
         } else {
             let next_expiry = tm_core::sync::lock(&self.shared.toasts)
                 .iter()
@@ -1356,6 +1396,9 @@ impl eframe::App for TaskManApp {
         if self.module_dialog.is_some() {
             crate::tabs::modules::dialog(self, &ctx, &pal);
         }
+        if self.active_dump.is_some() {
+            crate::tabs::details::dump_progress_dialog(self, &ctx, &pal);
+        }
         crate::app_ui::draw_toasts(self, &ctx);
 
         // Frame-rate diagnostics overlay (TASKMAN_FPS_PROBE=1).
@@ -1381,6 +1424,7 @@ impl eframe::App for TaskManApp {
             || self.startup_props.is_some()
             || self.proc_props.is_some()
             || self.module_dialog.is_some()
+            || self.active_dump.is_some()
             || self.details_state.select_columns_open;
         if !modal_open
             && matches!(self.tab, Tab::Processes | Tab::Details)

@@ -2165,10 +2165,29 @@ pub fn create_dump_file(
     path: &std::path::Path,
     dump_type: tm_core::model::DumpType,
 ) -> Result<()> {
+    create_dump_file_with_progress(pid, expected_start_epoch_s, path, dump_type, None)
+}
+
+/// Write a minidump of `pid` to `path` with progress tracking and cooperative cancellation.
+pub fn create_dump_file_with_progress(
+    pid: u32,
+    expected_start_epoch_s: Option<i64>,
+    path: &std::path::Path,
+    dump_type: tm_core::model::DumpType,
+    progress: Option<std::sync::Arc<tm_core::model::DumpProgressTracker>>,
+) -> Result<()> {
     use windows::Win32::Storage::FileSystem::{
         CREATE_ALWAYS, CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ, FILE_SHARE_WRITE,
+        GetFileSizeEx,
     };
-    use windows::Win32::System::Diagnostics::Debug::{MINIDUMP_TYPE, MiniDumpWriteDump};
+    use windows::Win32::System::Diagnostics::Debug::{
+        CancelCallback, MINIDUMP_CALLBACK_INFORMATION, MINIDUMP_CALLBACK_INPUT,
+        MINIDUMP_CALLBACK_OUTPUT, MINIDUMP_TYPE, MiniDumpWriteDump,
+    };
+
+    if progress.as_ref().is_some_and(|p| p.is_cancelled()) {
+        return Err(TmError::Canceled);
+    }
 
     // A full-memory dump reads the target's whole address space, so
     // PROCESS_VM_READ is not optional and PROCESS_QUERY_INFORMATION (not the
@@ -2202,15 +2221,90 @@ pub fn create_dump_file(
             )
         }
         .map_err(|e| TmError::platform("CreateFileW(dump)", e.to_string()))?;
+
+        struct CallbackContext {
+            hfile: windows::Win32::Foundation::HANDLE,
+            progress: Option<std::sync::Arc<tm_core::model::DumpProgressTracker>>,
+            counter: std::sync::atomic::AtomicU32,
+        }
+
+        let ctx = CallbackContext {
+            hfile,
+            progress: progress.clone(),
+            counter: std::sync::atomic::AtomicU32::new(0),
+        };
+
+        unsafe extern "system" fn dump_callback(
+            callback_param: *mut core::ffi::c_void,
+            callback_input: *const MINIDUMP_CALLBACK_INPUT,
+            callback_output: *mut MINIDUMP_CALLBACK_OUTPUT,
+        ) -> windows::core::BOOL {
+            let ctx = unsafe { &*(callback_param as *const CallbackContext) };
+            let cb_type = unsafe { (*callback_input).CallbackType };
+            if cb_type == CancelCallback.0 as u32 {
+                let cancelled = ctx
+                    .progress
+                    .as_ref()
+                    .map(|p| p.is_cancelled())
+                    .unwrap_or(false);
+                if cancelled {
+                    unsafe {
+                        (*callback_output).Anonymous.Anonymous2.Cancel =
+                            windows::core::BOOL::from(true);
+                    }
+                } else {
+                    unsafe {
+                        (*callback_output).Anonymous.Anonymous2.CheckCancel =
+                            windows::core::BOOL::from(true);
+                        (*callback_output).Anonymous.Anonymous2.Cancel =
+                            windows::core::BOOL::from(false);
+                    }
+                    if let Some(ref tracker) = ctx.progress {
+                        // Sample file size every 32 callbacks to minimize Win32 syscall overhead
+                        // while keeping UI progress updates responsive.
+                        if ctx
+                            .counter
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                            % 32
+                            == 0
+                        {
+                            let mut size = 0i64;
+                            if unsafe { GetFileSizeEx(ctx.hfile, &mut size) }.is_ok() && size > 0 {
+                                tracker.set_bytes_written(size as u64);
+                            }
+                        }
+                    }
+                }
+            }
+            windows::core::BOOL::from(true)
+        }
+
+        let cb_info = MINIDUMP_CALLBACK_INFORMATION {
+            CallbackRoutine: Some(dump_callback),
+            CallbackParam: &ctx as *const CallbackContext as *mut core::ffi::c_void,
+        };
+
         let flags = match dump_type {
             tm_core::model::DumpType::Minimal => DUMP_TYPE_MINIMAL,
             tm_core::model::DumpType::Limited => DUMP_TYPE_LIMITED,
             tm_core::model::DumpType::Normal => DUMP_TYPE_NORMAL,
             tm_core::model::DumpType::Full => DUMP_TYPE_FULL,
         };
-        let mut dump_result =
-            unsafe { MiniDumpWriteDump(hproc, pid, hfile, MINIDUMP_TYPE(flags), None, None, None) };
-        if dump_result.is_err() && dump_type != tm_core::model::DumpType::Minimal {
+        let mut dump_result = unsafe {
+            MiniDumpWriteDump(
+                hproc,
+                pid,
+                hfile,
+                MINIDUMP_TYPE(flags),
+                None,
+                None,
+                Some(&cb_info),
+            )
+        };
+
+        let is_cancelled = progress.as_ref().is_some_and(|p| p.is_cancelled());
+
+        if dump_result.is_err() && !is_cancelled && dump_type != tm_core::model::DumpType::Minimal {
             // Rewind: the failed attempt left a partial file behind, and
             // MiniDumpWriteDump writes from the current position.
             let _ = unsafe {
@@ -2230,14 +2324,30 @@ pub fn create_dump_file(
                     MINIDUMP_TYPE(DUMP_TYPE_REDUCED),
                     None,
                     None,
-                    None,
+                    Some(&cb_info),
                 )
             };
         }
+
+        let mut final_size = 0i64;
+        if unsafe { GetFileSizeEx(hfile, &mut final_size) }.is_ok()
+            && let Some(ref tracker) = progress
+            && final_size > 0
+        {
+            tracker.set_bytes_written(final_size as u64);
+        }
+
         let _ = unsafe { CloseHandle(hfile) };
-        if dump_result.is_err() {
+
+        let was_cancelled = is_cancelled || progress.as_ref().is_some_and(|p| p.is_cancelled());
+        if dump_result.is_err() || was_cancelled {
             let _ = std::fs::remove_file(path);
         }
+
+        if was_cancelled {
+            return Err(TmError::Canceled);
+        }
+
         dump_result.map_err(|e| TmError::platform("MiniDumpWriteDump", e.to_string()))
     })();
     let _ = unsafe { CloseHandle(hproc) };
@@ -2448,6 +2558,88 @@ mod tests {
         assert!(!creation_matches(100, Some(101)));
         assert!(!creation_matches(i64::MIN, Some(i64::MAX)));
         assert!(!creation_matches(100, None));
+    }
+
+    #[test]
+    fn create_dump_file_with_progress_tracks_bytes_written() {
+        let temp_dir = std::env::temp_dir();
+        let dump_path = temp_dir.join(format!("test_dump_progress_{}.dmp", std::process::id()));
+        let tracker = std::sync::Arc::new(tm_core::model::DumpProgressTracker::new());
+
+        let res = create_dump_file_with_progress(
+            std::process::id(),
+            None,
+            &dump_path,
+            tm_core::model::DumpType::Minimal,
+            Some(tracker.clone()),
+        );
+
+        let exists = dump_path.exists();
+        let _ = std::fs::remove_file(&dump_path);
+
+        assert!(res.is_ok(), "dump creation should succeed: {res:?}");
+        assert!(exists, "dump file must exist after successful creation");
+        assert!(
+            tracker.bytes_written() > 0,
+            "tracker must record bytes written"
+        );
+    }
+
+    #[test]
+    fn create_dump_file_with_progress_cancels_before_start() {
+        let temp_dir = std::env::temp_dir();
+        let dump_path = temp_dir.join(format!("test_dump_cancel_pre_{}.dmp", std::process::id()));
+        let tracker = std::sync::Arc::new(tm_core::model::DumpProgressTracker::new());
+        tracker.request_cancel();
+
+        let res = create_dump_file_with_progress(
+            std::process::id(),
+            None,
+            &dump_path,
+            tm_core::model::DumpType::Minimal,
+            Some(tracker),
+        );
+
+        assert!(
+            matches!(res, Err(TmError::Canceled)),
+            "must report Canceled"
+        );
+        assert!(
+            !dump_path.exists(),
+            "canceled dump must not leave a file behind"
+        );
+    }
+
+    #[test]
+    fn create_dump_file_with_progress_cancels_immediately() {
+        let temp_dir = std::env::temp_dir();
+        let dump_path = temp_dir.join(format!("test_dump_cancel_mid_{}.dmp", std::process::id()));
+        let tracker = std::sync::Arc::new(tm_core::model::DumpProgressTracker::new());
+
+        let tracker_bg = tracker.clone();
+        let cancel_thread = std::thread::spawn(move || {
+            // Cancel as soon as dump writing starts or immediately
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            tracker_bg.request_cancel();
+        });
+
+        let res = create_dump_file_with_progress(
+            std::process::id(),
+            None,
+            &dump_path,
+            tm_core::model::DumpType::Full,
+            Some(tracker),
+        );
+
+        let _ = cancel_thread.join();
+        let exists = dump_path.exists();
+        let _ = std::fs::remove_file(&dump_path);
+
+        assert!(
+            matches!(res, Err(TmError::Canceled)),
+            "must return Canceled when aborted: {res:?}"
+        );
+        assert!(!exists, "canceled dump must remove partial file");
     }
 
     /// The sampler caches per-PID attributes behind a multi-second TTL, so a

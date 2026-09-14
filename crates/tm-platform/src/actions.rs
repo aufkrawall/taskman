@@ -317,10 +317,22 @@ pub trait PlatformActions: Send + Sync {
     /// PID-reuse protection contract as [`Self::kill_process`].
     fn create_dump_file(
         &self,
+        pid: u32,
+        expected_start_epoch_s: Option<i64>,
+        path: &std::path::Path,
+        dump_type: tm_core::model::DumpType,
+    ) -> Result<()> {
+        self.create_dump_file_with_progress(pid, expected_start_epoch_s, path, dump_type, None)
+    }
+
+    /// Create a user-mode dump with progress tracking and cooperative cancellation.
+    fn create_dump_file_with_progress(
+        &self,
         _pid: u32,
         _expected_start_epoch_s: Option<i64>,
         _path: &std::path::Path,
         _dump_type: tm_core::model::DumpType,
+        _progress: Option<std::sync::Arc<tm_core::model::DumpProgressTracker>>,
     ) -> Result<()> {
         Err(tm_core::TmError::Unsupported("create dump"))
     }

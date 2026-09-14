@@ -352,6 +352,39 @@ impl DumpType {
     ];
 }
 
+/// Progress and cooperative cancellation tracker for long-running process dump operations.
+#[derive(Default, Debug)]
+pub struct DumpProgressTracker {
+    cancel_requested: std::sync::atomic::AtomicBool,
+    bytes_written: std::sync::atomic::AtomicU64,
+}
+
+impl DumpProgressTracker {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn request_cancel(&self) {
+        self.cancel_requested
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.cancel_requested
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub fn bytes_written(&self) -> u64 {
+        self.bytes_written
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub fn set_bytes_written(&self, bytes: u64) {
+        self.bytes_written
+            .store(bytes, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProcessEntry {
     pub pid: u32,

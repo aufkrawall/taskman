@@ -465,6 +465,22 @@ impl PlatformActions for WinActions {
     ) -> Result<()> {
         process_ops::create_dump_file(pid, expected_start_epoch_s, path, dump_type)
     }
+    fn create_dump_file_with_progress(
+        &self,
+        pid: u32,
+        expected_start_epoch_s: Option<i64>,
+        path: &std::path::Path,
+        dump_type: tm_core::model::DumpType,
+        progress: Option<std::sync::Arc<tm_core::model::DumpProgressTracker>>,
+    ) -> Result<()> {
+        process_ops::create_dump_file_with_progress(
+            pid,
+            expected_start_epoch_s,
+            path,
+            dump_type,
+            progress,
+        )
+    }
     fn open_file_location(&self, path: &str) -> Result<()> {
         process_ops::open_file_location(path)
     }

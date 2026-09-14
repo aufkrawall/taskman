@@ -18,6 +18,7 @@ pub enum TmError {
         pid: u32,
     },
     ServiceNotFound(String),
+    Canceled,
 }
 
 impl std::fmt::Display for TmError {
@@ -34,6 +35,7 @@ impl std::fmt::Display for TmError {
             }
             TmError::ProcessNotFound { pid } => write!(f, "process {pid} not found"),
             TmError::ServiceNotFound(name) => write!(f, "service '{name}' not found"),
+            TmError::Canceled => write!(f, "operation canceled"),
         }
     }
 }

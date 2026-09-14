@@ -2601,20 +2601,223 @@ pub(crate) fn create_dump(
     let toasts = app.shared.toasts.clone();
     let in_flight = app.shared.dump_write.clone();
     let wake = ctx.clone();
+
+    let tracker = Arc::new(tm_core::model::DumpProgressTracker::new());
+    let outcome = Arc::new(Mutex::new(None));
+
+    let total_bytes_estimate = match dump_type {
+        DumpType::Minimal => None,
+        DumpType::Limited | DumpType::Normal | DumpType::Full => {
+            let commit = p.commit_bytes.unwrap_or(0);
+            let mem = p.mem_bytes;
+            let est = commit.max(mem);
+            if est > 0 { Some(est) } else { None }
+        }
+    };
+
+    app.active_dump = Some(crate::app::ActiveDump {
+        pid,
+        process_name: p.name.clone(),
+        dump_type,
+        path: path.clone(),
+        tracker: tracker.clone(),
+        total_bytes_estimate,
+        started_at: std::time::Instant::now(),
+        outcome: outcome.clone(),
+    });
+
+    let tracker_worker = tracker.clone();
     let spawned = std::thread::Builder::new()
         .name("tm-dump".into())
         .spawn(move || {
-            let message = match actions.create_dump_file(pid, start, &path, dump_type) {
-                Ok(()) => i18n::trf(K::DumpWrittenMsg, &[&path_s]),
-                Err(error) => i18n::trf(K::ErrMsg, &[&error.to_string()]),
+            let res = actions.create_dump_file_with_progress(
+                pid,
+                start,
+                &path,
+                dump_type,
+                Some(tracker_worker),
+            );
+            let message = match &res {
+                Ok(()) => Some(i18n::trf(K::DumpWrittenMsg, &[&path_s])),
+                Err(tm_core::TmError::Canceled) => Some(i18n::tr(K::DumpCancelled).to_string()),
+                Err(error) => Some(i18n::trf(K::ErrMsg, &[&error.to_string()])),
             };
-            crate::app::toast_from(&toasts, message);
+            if let Some(msg) = message {
+                crate::app::toast_from(&toasts, msg);
+            }
+            *tm_core::sync::lock(&outcome) = Some(res);
             in_flight.end();
             wake.request_repaint();
         });
     if spawned.is_err() {
+        app.active_dump = None;
         app.shared.dump_write.end();
         app.shared.toast(i18n::tr(K::ActionFailed));
+    }
+}
+
+pub fn dump_progress_dialog(
+    app: &mut TaskManApp,
+    ctx: &egui::Context,
+    pal: &crate::theme::Palette,
+) {
+    let Some(active) = app.active_dump.clone() else {
+        return;
+    };
+    if tm_core::sync::lock(&active.outcome).is_some() {
+        app.active_dump = None;
+        return;
+    }
+
+    let mut open = true;
+    let title = i18n::tr(K::CreateDumpFile);
+    let bytes = active.tracker.bytes_written();
+    let is_cancelling = active.tracker.is_cancelled();
+    let elapsed = active.started_at.elapsed();
+    let secs = elapsed.as_secs_f64();
+    let speed_mb_s = if secs > 0.2 {
+        (bytes as f64 / (1024.0 * 1024.0)) / secs
+    } else {
+        0.0
+    };
+
+    if ctx.input_mut(|i| i.consume_key(Default::default(), egui::Key::Escape)) && !is_cancelling {
+        active.tracker.request_cancel();
+        ctx.request_repaint();
+    }
+
+    egui::Window::new(title)
+        .id(egui::Id::new("dump-progress-dialog"))
+        .open(&mut open)
+        .collapsible(false)
+        .resizable(false)
+        .fixed_size([460.0, 190.0])
+        .anchor(egui::Align2::CENTER_CENTER, [0.0, -40.0])
+        .show(ctx, |ui| {
+            ui.set_width(440.0);
+            ui.add_space(4.0);
+
+            // Target header
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new(&active.process_name)
+                        .strong()
+                        .size(15.0)
+                        .color(pal.text),
+                );
+                ui.label(
+                    egui::RichText::new(format!("(PID {})", active.pid))
+                        .size(13.0)
+                        .color(pal.text_dim),
+                );
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let type_label = match active.dump_type {
+                        DumpType::Minimal => i18n::tr(K::DumpMinimal),
+                        DumpType::Limited => i18n::tr(K::DumpLimited),
+                        DumpType::Normal => i18n::tr(K::DumpNormal),
+                        DumpType::Full => i18n::tr(K::DumpFull),
+                    };
+                    ui.label(
+                        egui::RichText::new(type_label)
+                            .size(12.0)
+                            .color(pal.text_dim),
+                    );
+                });
+            });
+
+            // Path
+            ui.add_space(2.0);
+            let path_str = active.path.to_string_lossy();
+            ui.label(
+                egui::RichText::new(path_str.as_ref())
+                    .size(11.5)
+                    .color(pal.text_dim),
+            )
+            .on_hover_text(path_str.as_ref());
+
+            ui.add_space(8.0);
+
+            // Progress bar & metrics
+            let bytes_str = tm_core::format::format_bytes_loc(bytes);
+            let speed_str = if speed_mb_s >= 0.05 {
+                format!(" · {:.1} MB/s", speed_mb_s)
+            } else {
+                String::new()
+            };
+
+            match active.total_bytes_estimate {
+                Some(est) if est > 0 => {
+                    let pct = (bytes as f32 / est as f32).clamp(0.0, 0.99);
+                    ui.add(
+                        egui::ProgressBar::new(pct)
+                            .show_percentage()
+                            .animate(!is_cancelling),
+                    );
+                    let est_str = tm_core::format::format_bytes_loc(est);
+                    ui.label(
+                        egui::RichText::new(format!("{} / ~{}{}", bytes_str, est_str, speed_str))
+                            .size(12.0)
+                            .color(pal.text_dim),
+                    );
+                }
+                _ => {
+                    ui.add(egui::ProgressBar::new(0.0).animate(!is_cancelling));
+                    ui.label(
+                        egui::RichText::new(format!("{}{}", bytes_str, speed_str))
+                            .size(12.0)
+                            .color(pal.text_dim),
+                    );
+                }
+            }
+
+            ui.add_space(6.0);
+
+            // Status and elapsed time
+            ui.horizontal(|ui| {
+                let status_text = if is_cancelling {
+                    egui::RichText::new(i18n::tr(K::DumpCancelling)).color(pal.warn_orange)
+                } else {
+                    egui::RichText::new(i18n::tr(K::DumpCreating)).color(pal.text_dim)
+                };
+                ui.label(status_text);
+
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let elapsed_secs = elapsed.as_secs();
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "{} {:02}:{:02}",
+                            i18n::tr(K::DumpElapsed),
+                            elapsed_secs / 60,
+                            elapsed_secs % 60
+                        ))
+                        .size(11.5)
+                        .color(pal.text_dim),
+                    );
+                });
+            });
+
+            ui.add_space(10.0);
+
+            // Cancel button
+            ui.horizontal(|ui| {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let cancel_label = if is_cancelling {
+                        i18n::tr(K::DumpCancelling)
+                    } else {
+                        i18n::tr(K::Cancel)
+                    };
+                    let btn = egui::Button::new(cancel_label).min_size(egui::vec2(80.0, 24.0));
+                    if ui.add_enabled(!is_cancelling, btn).clicked() {
+                        active.tracker.request_cancel();
+                        ctx.request_repaint();
+                    }
+                });
+            });
+        });
+
+    if !open && !is_cancelling {
+        active.tracker.request_cancel();
+        ctx.request_repaint();
     }
 }
 
