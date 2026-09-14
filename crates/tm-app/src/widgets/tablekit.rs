@@ -507,6 +507,7 @@ pub struct TmColumn {
     pub width: f32,
     pub default_w: f32,
     pub numeric: bool,
+    pub tooltip: Option<&'static str>,
 }
 
 impl TmColumn {
@@ -517,6 +518,7 @@ impl TmColumn {
             width,
             default_w: width,
             numeric: false,
+            tooltip: None,
         }
     }
     pub const fn num(id: &'static str, label: &'static str, width: f32) -> Self {
@@ -526,7 +528,12 @@ impl TmColumn {
             width,
             default_w: width,
             numeric: true,
+            tooltip: None,
         }
+    }
+    pub const fn with_tooltip(mut self, tooltip: &'static str) -> Self {
+        self.tooltip = Some(tooltip);
+        self
     }
 }
 
@@ -772,7 +779,12 @@ impl TmTable {
             } else {
                 Sense::click()
             };
-            let resp = ui.interact(cell, table_id.with(("hdr", col.id)), sense);
+            let mut resp = ui.interact(cell, table_id.with(("hdr", col.id)), sense);
+            if let Some(tip) = col.tooltip
+                && dragging_col.is_none()
+            {
+                resp = resp.on_hover_text(tip);
+            }
             if resp.hovered() {
                 painter.rect_filled(cell, 0.0, Color32::from_white_alpha(6));
             }

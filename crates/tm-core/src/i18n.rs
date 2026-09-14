@@ -102,7 +102,7 @@ pub fn trf(key: K, args: &[&str]) -> String {
 
 /// Declare every translatable string: `Key => ["deutsch", "english"]`.
 macro_rules! keys {
-    ($( $key:ident => [$de:expr, $en:expr] ),* $(,)?) => {
+    ($( $key:ident => [$de:expr, $en:expr $(,)?] ),* $(,)?) => {
         /// Translation keys.
         #[derive(Debug, Clone, Copy, PartialEq, Eq)]
         #[allow(dead_code)]
@@ -204,6 +204,7 @@ keys! {
     PropStarted => ["Gestartet", "Started"],
     PropPrivateWorkingSet => ["Privater Arbeitssatz", "Private working set"],
     PropWorkingSet => ["Arbeitssatz", "Working set"],
+    PropSharedWorkingSet => ["Gemeinsamer Arbeitssatz", "Shared working set"],
     PropPeakWorkingSet => ["Max. Arbeitssatz", "Peak working set"],
     PropCommitSize => ["Commitgröße", "Commit size"],
     PropDiskRead => ["Datenträger lesen", "Disk read"],
@@ -300,6 +301,26 @@ keys! {
     ColStatus => ["Status", "Status"],
     ColCpu => ["CPU", "CPU"],
     ColMemory => ["Arbeitsspeicher", "Memory"],
+    ColMemoryPrivateWs => [
+        "Arbeitsspeicher (aktiver privater Arbeitssatz)",
+        "Memory (active private working set)",
+    ],
+    ColWorkingSet => [
+        "Arbeitssatz (Speicher)",
+        "Working set (memory)",
+    ],
+    ColPeakWorkingSet => [
+        "Maximaler Arbeitssatz (Speicher)",
+        "Peak working set (memory)",
+    ],
+    ColSharedWorkingSet => [
+        "Gemeinsamer Arbeitssatz",
+        "Memory (shared working set)",
+    ],
+    ColCommitSize => [
+        "Zugesicherter Speicher",
+        "Commit size",
+    ],
     ColDisk => ["Datenträger-E/A", "Disk I/O"],
     ColNetwork => ["Netzwerk", "Network"],
     ColPid => ["PID", "PID"],
@@ -690,6 +711,32 @@ keys! {
         "Too many system actions are queued; please try again"
     ],
     EfficiencyChanged => ["Effizienzmodus geändert", "Efficiency mode changed"],
+
+    // ------------------------------------------------ column tooltips
+    TipProcessesMemory => [
+        "Arbeitsspeicher (aktiver privater Arbeitssatz). Weitere Speichermetriken (Arbeitssatz, Spitzenwert, gemeinsam, zugesichert) können im Reiter Details hinzugefügt werden.",
+        "Memory (active private working set). Additional memory metrics (working set, peak, shared, commit) can be added in Details.",
+    ],
+    TipMemoryWsPrivate => [
+        "Arbeitsspeicher (aktiver privater Arbeitssatz): Vom Prozess exklusiv belegter physischer Speicher.",
+        "Memory (active private working set): physical memory exclusively used by this process.",
+    ],
+    TipWorkingSet => [
+        "Arbeitssatz (Speicher): Derzeit genutzter physischer Gesamtspeicher des Prozesses (privat + gemeinsam).",
+        "Working set (memory): total physical memory currently in use by the process (private + shared).",
+    ],
+    TipPeakWorkingSet => [
+        "Maximaler Arbeitssatz (Speicher): Maximale Menge an physischem Speicher seit Prozessstart.",
+        "Peak working set (memory): maximum physical memory used by the process since startup.",
+    ],
+    TipSharedWorkingSet => [
+        "Gemeinsamer Arbeitssatz: Physischer Speicher, der mit anderen Prozessen geteilt wird.",
+        "Memory (shared working set): physical memory in use by the process that is shared with others.",
+    ],
+    TipCommitSize => [
+        "Zugesicherter Speicher: Vom Betriebssystem für den Prozess reservierter virtueller Speicher.",
+        "Commit size: virtual memory reserved by the operating system for the process.",
+    ],
 
     // ------------------------------------------------ misc words
     Bit32 => ["32 Bit", "32-bit"],

@@ -98,6 +98,7 @@ pub enum ColumnId {
     Commit,
     PeakMemory,
     WorkingSet,
+    SharedWorkingSet,
     GpuDedicated,
     GpuShared,
     Description,
@@ -149,6 +150,9 @@ impl ColumnId {
             ColumnId::Commit => a.commit_bytes.cmp(&b.commit_bytes),
             ColumnId::PeakMemory => a.peak_mem_bytes.cmp(&b.peak_mem_bytes),
             ColumnId::WorkingSet => a.working_set_bytes.cmp(&b.working_set_bytes),
+            ColumnId::SharedWorkingSet => a
+                .shared_working_set_bytes()
+                .cmp(&b.shared_working_set_bytes()),
             ColumnId::GpuDedicated => a.gpu_dedicated_bytes.cmp(&b.gpu_dedicated_bytes),
             ColumnId::GpuShared => a.gpu_shared_bytes.cmp(&b.gpu_shared_bytes),
             ColumnId::Description => cmp_option_str(
@@ -331,45 +335,7 @@ impl ColSpec {
     }
 
     fn label(self) -> &'static str {
-        match self.cid {
-            ColumnId::Name => i18n::tr(K::ColName),
-            ColumnId::Pid => i18n::tr(K::ColPid),
-            ColumnId::Status => i18n::tr(K::ColStatus),
-            ColumnId::User => i18n::tr(K::ColUsername),
-            ColumnId::UserSid => i18n::tr(K::PropUserSid),
-            ColumnId::Cpu => i18n::tr(K::ColCpu),
-            ColumnId::Memory => i18n::tr(K::ColMemory),
-            ColumnId::Network => i18n::tr(K::ColNetwork),
-            ColumnId::NetworkReceive => i18n::tr(K::PropNetworkReceive),
-            ColumnId::NetworkSend => i18n::tr(K::PropNetworkSend),
-            ColumnId::Platform => i18n::tr(K::ColPlatform),
-            ColumnId::Elevated => i18n::tr(K::ColElevated),
-            ColumnId::Uac => i18n::tr(K::ColUac),
-            ColumnId::GpuUtil => i18n::tr(K::ColGpu),
-            ColumnId::GpuEngine => i18n::tr(K::ColGpuEngine),
-            ColumnId::Priority => i18n::tr(K::Priority),
-            ColumnId::Threads => i18n::tr(K::StatThreads),
-            ColumnId::Handles => i18n::tr(K::StatHandles),
-            ColumnId::CpuTime => "CPU time",
-            ColumnId::Commit => "Commit size",
-            ColumnId::PeakMemory => "Peak working set",
-            ColumnId::WorkingSet => i18n::tr(K::PropWorkingSet),
-            ColumnId::GpuDedicated => "Dedicated GPU memory",
-            ColumnId::GpuShared => "Shared GPU memory",
-            ColumnId::Description => i18n::tr(K::ColDescription),
-            ColumnId::Publisher => i18n::tr(K::ColPublisher),
-            ColumnId::ParentPid => i18n::tr(K::ColParentPid),
-            ColumnId::SessionId => i18n::tr(K::ColSessionId),
-            ColumnId::ImagePath => i18n::tr(K::ColImagePath),
-            ColumnId::PageFaults => i18n::tr(K::ColPageFaults),
-            ColumnId::IoTotal => io_total_label(),
-            ColumnId::IoRead => i18n::tr(K::ColIoRead),
-            ColumnId::IoWrite => i18n::tr(K::ColIoWrite),
-            ColumnId::DiskActivity => i18n::tr(K::ColDiskActivity),
-            ColumnId::IoOps => i18n::tr(K::ColIoOps),
-            ColumnId::HardFaults => i18n::tr(K::ColHardFaults),
-            ColumnId::CommandLine => "Command line",
-        }
+        (self.col)().label
     }
 }
 
@@ -406,7 +372,10 @@ const COLUMNS: &[ColSpec] = &[
     },
     ColSpec {
         cid: ColumnId::Memory,
-        col: || TmColumn::num("mem", i18n::tr(K::ColMemory), 130.0),
+        col: || {
+            TmColumn::num("mem", i18n::tr(K::ColMemoryPrivateWs), 160.0)
+                .with_tooltip(i18n::tr(K::TipMemoryWsPrivate))
+        },
         default_visible: true,
     },
     ColSpec {
@@ -466,32 +435,49 @@ const COLUMNS: &[ColSpec] = &[
     },
     ColSpec {
         cid: ColumnId::CpuTime,
-        col: || TmColumn::num("cputime", "CPU time", 110.0),
+        col: || TmColumn::num("cputime", i18n::tr(K::ColCpuTime), 110.0),
         default_visible: false,
     },
     ColSpec {
         cid: ColumnId::Commit,
-        col: || TmColumn::num("commit", "Commit size", 130.0),
+        col: || {
+            TmColumn::num("commit", i18n::tr(K::ColCommitSize), 130.0)
+                .with_tooltip(i18n::tr(K::TipCommitSize))
+        },
         default_visible: false,
     },
     ColSpec {
         cid: ColumnId::PeakMemory,
-        col: || TmColumn::num("peakmem", "Peak working set", 145.0),
+        col: || {
+            TmColumn::num("peakmem", i18n::tr(K::ColPeakWorkingSet), 145.0)
+                .with_tooltip(i18n::tr(K::TipPeakWorkingSet))
+        },
         default_visible: false,
     },
     ColSpec {
         cid: ColumnId::WorkingSet,
-        col: || TmColumn::num("workingset", i18n::tr(K::PropWorkingSet), 130.0),
+        col: || {
+            TmColumn::num("workingset", i18n::tr(K::ColWorkingSet), 130.0)
+                .with_tooltip(i18n::tr(K::TipWorkingSet))
+        },
+        default_visible: false,
+    },
+    ColSpec {
+        cid: ColumnId::SharedWorkingSet,
+        col: || {
+            TmColumn::num("sharedworkingset", i18n::tr(K::ColSharedWorkingSet), 140.0)
+                .with_tooltip(i18n::tr(K::TipSharedWorkingSet))
+        },
         default_visible: false,
     },
     ColSpec {
         cid: ColumnId::GpuDedicated,
-        col: || TmColumn::num("gpudedicated", "Dedicated GPU memory", 165.0),
+        col: || TmColumn::num("gpudedicated", i18n::tr(K::PropGpuDedicated), 165.0),
         default_visible: false,
     },
     ColSpec {
         cid: ColumnId::GpuShared,
-        col: || TmColumn::num("gpushared", "Shared GPU memory", 155.0),
+        col: || TmColumn::num("gpushared", i18n::tr(K::PropGpuShared), 155.0),
         default_visible: false,
     },
     ColSpec {
@@ -556,7 +542,7 @@ const COLUMNS: &[ColSpec] = &[
     },
     ColSpec {
         cid: ColumnId::CommandLine,
-        col: || TmColumn::text("commandline", "Command line", 360.0),
+        col: || TmColumn::text("commandline", i18n::tr(K::PropCommandLine), 360.0),
         default_visible: false,
     },
 ];
@@ -907,6 +893,7 @@ pub struct Row {
     pub commit_s: String,
     pub peak_mem_s: String,
     pub working_set_s: String,
+    pub shared_working_set_s: String,
     pub gpu_dedicated_s: String,
     pub gpu_shared_s: String,
     pub description_s: String,
@@ -949,6 +936,7 @@ impl Row {
             ColumnId::Commit => &self.commit_s,
             ColumnId::PeakMemory => &self.peak_mem_s,
             ColumnId::WorkingSet => &self.working_set_s,
+            ColumnId::SharedWorkingSet => &self.shared_working_set_s,
             ColumnId::GpuDedicated => &self.gpu_dedicated_s,
             ColumnId::GpuShared => &self.gpu_shared_s,
             ColumnId::Description => &self.description_s,
@@ -1603,6 +1591,7 @@ fn cid_is_numeric(cid: ColumnId) -> bool {
             | ColumnId::Commit
             | ColumnId::PeakMemory
             | ColumnId::WorkingSet
+            | ColumnId::SharedWorkingSet
             | ColumnId::GpuDedicated
             | ColumnId::GpuShared
             | ColumnId::ParentPid
@@ -1915,6 +1904,7 @@ fn row_from_process(p: &ProcessEntry, depth: usize, children: bool) -> Row {
         commit_s: opt_u64_bytes(p.commit_bytes),
         peak_mem_s: opt_u64_bytes(p.peak_mem_bytes),
         working_set_s: opt_u64_bytes(p.working_set_bytes),
+        shared_working_set_s: opt_u64_bytes(p.shared_working_set_bytes()),
         gpu_dedicated_s: opt_u64_bytes(p.gpu_dedicated_bytes),
         gpu_shared_s: opt_u64_bytes(p.gpu_shared_bytes),
         description_s: p
@@ -3453,6 +3443,14 @@ fn process_properties_statistics(ui: &mut egui::Ui, process: &ProcessEntry) {
                     false,
                 );
             }
+            if let Some(shared_ws) = process.shared_working_set_bytes() {
+                property_row(
+                    ui,
+                    i18n::tr(K::PropSharedWorkingSet),
+                    format::format_bytes_loc(shared_ws),
+                    false,
+                );
+            }
             property_row(
                 ui,
                 i18n::tr(K::PropPeakWorkingSet),
@@ -4455,6 +4453,12 @@ mod tests {
                 ColumnId::WorkingSet => {
                     a.working_set_bytes = Some(1);
                     b.working_set_bytes = Some(2);
+                }
+                ColumnId::SharedWorkingSet => {
+                    a.working_set_bytes = Some(10);
+                    a.mem_bytes = 9;
+                    b.working_set_bytes = Some(10);
+                    b.mem_bytes = 8;
                 }
                 ColumnId::GpuDedicated => {
                     a.gpu_dedicated_bytes = Some(1);

@@ -37,6 +37,7 @@ pub const FIXED_COLS: usize = 2;
 pub struct ValueColumn {
     pub id: &'static str,
     pub label: fn() -> &'static str,
+    pub tooltip: Option<fn() -> &'static str>,
     pub width: f32,
 }
 
@@ -44,16 +45,19 @@ pub const VALUE_COLUMNS: [ValueColumn; VALUE_COLS] = [
     ValueColumn {
         id: "cpu",
         label: || i18n::tr(K::ColCpu),
+        tooltip: None,
         width: 110.0,
     },
     ValueColumn {
         id: "mem",
         label: || i18n::tr(K::ColMemory),
+        tooltip: Some(|| i18n::tr(K::TipProcessesMemory)),
         width: 110.0,
     },
     ValueColumn {
         id: "disk",
         label: || i18n::tr(K::ColDisk),
+        tooltip: None,
         width: 110.0,
     },
     // Windows supplies this lazily from the per-process ETW source. Missing
@@ -61,6 +65,7 @@ pub const VALUE_COLUMNS: [ValueColumn; VALUE_COLS] = [
     ValueColumn {
         id: "net",
         label: || i18n::tr(K::ColNetwork),
+        tooltip: None,
         width: 110.0,
     },
     // Which process is actually keeping the disks busy. The Disk I/O column
@@ -69,6 +74,7 @@ pub const VALUE_COLUMNS: [ValueColumn; VALUE_COLS] = [
     ValueColumn {
         id: "diskact",
         label: || i18n::tr(K::ColDiskActivity),
+        tooltip: None,
         width: 150.0,
     },
     // Busiest-engine utilization, from the same on-demand PDH group the
@@ -76,6 +82,7 @@ pub const VALUE_COLUMNS: [ValueColumn; VALUE_COLS] = [
     ValueColumn {
         id: "gpu",
         label: || i18n::tr(K::ColGpu),
+        tooltip: None,
         width: 110.0,
     },
 ];
@@ -94,7 +101,11 @@ pub fn columns(fixed: Vec<TmColumn>, order: &[usize]) -> Vec<TmColumn> {
     let mut cols = fixed;
     for &li in order {
         let c = &VALUE_COLUMNS[li];
-        cols.push(TmColumn::num(c.id, (c.label)(), c.width));
+        let mut col = TmColumn::num(c.id, (c.label)(), c.width);
+        if let Some(tip_fn) = c.tooltip {
+            col.tooltip = Some(tip_fn());
+        }
+        cols.push(col);
     }
     cols
 }

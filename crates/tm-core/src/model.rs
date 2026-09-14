@@ -521,6 +521,12 @@ impl ProcessEntry {
         }
     }
 
+    /// Resident memory shared with other processes (Total Working Set minus Private Working Set).
+    pub fn shared_working_set_bytes(&self) -> Option<u64> {
+        self.working_set_bytes
+            .map(|ws| ws.saturating_sub(self.mem_bytes))
+    }
+
     fn default_entry() -> Self {
         Self {
             pid: 0,
@@ -731,4 +737,23 @@ pub struct UserSession {
     pub cpu_pct: f32,
     pub mem_bytes: u64,
     pub process_count: usize,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shared_working_set_computes_difference() {
+        let mut entry = ProcessEntry::new(100, "test.exe");
+        assert_eq!(entry.shared_working_set_bytes(), None);
+
+        entry.working_set_bytes = Some(100 * 1024 * 1024);
+        entry.mem_bytes = 70 * 1024 * 1024;
+        assert_eq!(entry.shared_working_set_bytes(), Some(30 * 1024 * 1024));
+
+        // Saturates at 0 if private WS somehow exceeds total WS (e.g. transient race)
+        entry.mem_bytes = 120 * 1024 * 1024;
+        assert_eq!(entry.shared_working_set_bytes(), Some(0));
+    }
 }
