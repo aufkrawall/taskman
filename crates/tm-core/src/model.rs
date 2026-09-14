@@ -328,6 +328,30 @@ impl UacVirtualization {
     }
 }
 
+/// Type of user-mode process minidump to capture.
+/// Matches the dump levels offered by System Informer / Process Hacker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, Default)]
+pub enum DumpType {
+    /// Minimal dump containing thread info and data segments.
+    Minimal,
+    /// Limited dump containing full memory without handle table or trace metadata.
+    Limited,
+    /// Standard dump containing full memory, handles, threads, and unloaded modules.
+    #[default]
+    Normal,
+    /// Full dump containing all memory pages, thread contexts, tokens, handles, and auxiliary state.
+    Full,
+}
+
+impl DumpType {
+    pub const ALL: [DumpType; 4] = [
+        DumpType::Minimal,
+        DumpType::Limited,
+        DumpType::Normal,
+        DumpType::Full,
+    ];
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProcessEntry {
     pub pid: u32,

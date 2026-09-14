@@ -115,8 +115,14 @@ Ten reported gaps in one pass; `log/recent.md` carries the root causes.
 - **Search covers every field a person would search by** — description, user,
   service name, image path and command line on top of name/publisher/PID —
   cheapest field first. Startup and Services use the same `Query`.
-- **Dumps are full-memory dumps.** `MINIDUMP_TYPE(0)` wrote stacks and module
-  headers; one unreadable region also failed the whole write.
+- **Process dumps offer Minimal, Limited, Normal, and Full levels** via a context
+  submenu on Processes and Details, matching System Informer / Process Hacker.
+  `Normal` writes full memory, handle tables, thread info, memory info, and unloaded
+  modules (standard Task Manager / `procdump -ma` debuggable dump with fallback to
+  reduced memory if target address space walk is refused). `Minimal` captures thread
+  info and data segments for a compact footprint; `Limited` captures full memory
+  without handle tables or trace data; `Full` captures all virtual memory pages,
+  thread contexts, tokens, handles, headers, and auxiliary registers.
 - **Multi-select** on Processes and Details (`selection.rs`): native list-view
   gestures, identities not indexes, fan-out limited to repeatable commands, and
   a confirmation that names every target when there is more than one.

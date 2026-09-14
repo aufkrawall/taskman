@@ -1163,11 +1163,12 @@ impl PlatformActions for BrokeredActions {
         pid: u32,
         expected_start_epoch_s: Option<i64>,
         path: &Path,
+        dump_type: tm_core::model::DumpType,
     ) -> Result<()> {
         // A path must never become a SYSTEM write primitive. The GUI's user
         // token owns this operation until handle transfer is implemented.
         self.local
-            .create_dump_file(pid, expected_start_epoch_s, path)
+            .create_dump_file(pid, expected_start_epoch_s, path, dump_type)
     }
 
     fn open_file_location(&self, path: &str) -> Result<()> {

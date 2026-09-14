@@ -320,6 +320,7 @@ pub trait PlatformActions: Send + Sync {
         _pid: u32,
         _expected_start_epoch_s: Option<i64>,
         _path: &std::path::Path,
+        _dump_type: tm_core::model::DumpType,
     ) -> Result<()> {
         Err(tm_core::TmError::Unsupported("create dump"))
     }

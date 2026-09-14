@@ -461,8 +461,9 @@ impl PlatformActions for WinActions {
         pid: u32,
         expected_start_epoch_s: Option<i64>,
         path: &std::path::Path,
+        dump_type: tm_core::model::DumpType,
     ) -> Result<()> {
-        process_ops::create_dump_file(pid, expected_start_epoch_s, path)
+        process_ops::create_dump_file(pid, expected_start_epoch_s, path, dump_type)
     }
     fn open_file_location(&self, path: &str) -> Result<()> {
         process_ops::open_file_location(path)

@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use tm_core::format;
 use tm_core::i18n::{self, K};
-use tm_core::model::{PriorityClass, ProcStatus, ProcessEntry, UacVirtualization};
+use tm_core::model::{DumpType, PriorityClass, ProcStatus, ProcessEntry, UacVirtualization};
 
 use crate::app::TaskManApp;
 use crate::icons::Icon;
@@ -2404,10 +2404,23 @@ pub fn context_menu(app: &mut TaskManApp, ui: &mut egui::Ui, p: &ProcessEntry, h
             });
             ui.close();
         }
-        if menu::item(ui, i18n::tr(K::CreateDumpFile)).clicked() {
-            create_dump(app, &ctx, p);
-            ui.close();
-        }
+        #[cfg(target_os = "windows")]
+        menu::submenu(ui, i18n::tr(K::CreateDumpFile), |ui| {
+            for (dump_type, key, tip_key) in [
+                (DumpType::Minimal, K::DumpMinimal, K::DumpMinimalTip),
+                (DumpType::Limited, K::DumpLimited, K::DumpLimitedTip),
+                (DumpType::Normal, K::DumpNormal, K::DumpNormalTip),
+                (DumpType::Full, K::DumpFull, K::DumpFullTip),
+            ] {
+                if menu::item(ui, i18n::tr(key))
+                    .on_hover_text(i18n::tr(tip_key))
+                    .clicked()
+                {
+                    create_dump(app, &ctx, p, dump_type);
+                    ui.close();
+                }
+            }
+        });
     }
 
     menu::separator(ui);
@@ -2523,6 +2536,7 @@ fn end_process(
 /// uniqueness, and UTC does both without a DST fold. Built from the wall clock
 /// rather than a formatting crate because it must never fail: a dump the user
 /// just waited for cannot be lost to a name.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 fn local_timestamp_for_filename() -> String {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -2549,7 +2563,13 @@ fn local_timestamp_for_filename() -> String {
     )
 }
 
-pub(crate) fn create_dump(app: &mut TaskManApp, ctx: &egui::Context, p: &ProcessEntry) {
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+pub(crate) fn create_dump(
+    app: &mut TaskManApp,
+    ctx: &egui::Context,
+    p: &ProcessEntry,
+    dump_type: DumpType,
+) {
     if !identity_still_live(app, p) {
         app.shared.toast(i18n::tr(K::ProcessExited));
         return;
@@ -2584,7 +2604,7 @@ pub(crate) fn create_dump(app: &mut TaskManApp, ctx: &egui::Context, p: &Process
     let spawned = std::thread::Builder::new()
         .name("tm-dump".into())
         .spawn(move || {
-            let message = match actions.create_dump_file(pid, start, &path) {
+            let message = match actions.create_dump_file(pid, start, &path, dump_type) {
                 Ok(()) => i18n::trf(K::DumpWrittenMsg, &[&path_s]),
                 Err(error) => i18n::trf(K::ErrMsg, &[&error.to_string()]),
             };

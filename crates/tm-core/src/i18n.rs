@@ -155,6 +155,26 @@ keys! {
     RefreshNow => ["Jetzt aktualisieren (F5)", "Refresh now (F5)"],
     OpenFileLocation => ["Dateispeicherort öffnen", "Open file location"],
     CreateDumpFile => ["Speicherabbild erstellen", "Create dump file"],
+    DumpMinimal => ["Minimal", "Minimal"],
+    DumpMinimalTip => [
+        "Minimales Speicherabbild mit Thread-Informationen und Datensegmenten",
+        "Minimal dump with thread information and data segments"
+    ],
+    DumpLimited => ["Eingeschränkt", "Limited"],
+    DumpLimitedTip => [
+        "Eingeschränktes Speicherabbild mit vollständigem Arbeitsspeicher, ohne Handles oder Traces",
+        "Limited dump with full process memory, without handle table or traces"
+    ],
+    DumpNormal => ["Normal", "Normal"],
+    DumpNormalTip => [
+        "Standard-Speicherabbild mit vollständigem Speicher, Handles, Threads und Modulen (Task-Manager-Standard)",
+        "Standard dump with full memory, handles, threads, and modules (Task Manager standard)"
+    ],
+    DumpFull => ["Vollständig", "Full"],
+    DumpFullTip => [
+        "Vollständiges Speicherabbild mit allen Speicherbereichen, Tokens, Handles, Threads und Registern",
+        "Comprehensive dump with all memory pages, tokens, handles, threads, and registers"
+    ],
     Modules => ["Module", "Modules"],
     ViewModules => ["Module anzeigen", "View modules"],
     UnloadModule => ["Modul entladen", "Unload module"],

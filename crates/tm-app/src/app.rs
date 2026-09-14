@@ -209,6 +209,7 @@ pub struct SharedState {
     pub sessions_fetch: InFlight,
     pub service_control: InFlight,
     /// Guard for the dedicated, lazily spawned long-running dump worker.
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
     pub dump_write: InFlight,
 }
 

@@ -2095,42 +2095,56 @@ pub fn open_url(url: &str) -> Result<()> {
     shell_execute(url, None, false, false)
 }
 
-/// What a debugger needs from a process dump, as flags for `MiniDumpWriteDump`.
+/// Flags for `MINIDUMP_TYPE` matching the tiers offered by System Informer / Process Hacker:
 ///
-/// `MiniDumpNormal` (a bare 0, which is what this used to pass) writes stacks
-/// and module headers and nothing else: WinDbg opens it, then answers almost
-/// every question with "memory access error". A dump worth the filename is a
-/// FULL one, which is also what Task Manager's "Create dump file" writes, so
-/// these flags mirror the set `procdump -ma` uses:
-///
-/// * `WithFullMemory` — the whole address space; without it heaps, globals
-///   and captured objects are simply absent.
-/// * `WithFullMemoryInfo` — the VAD/region metadata that lets a debugger tell
-///   committed memory from reserved and attribute an address to a mapping.
-/// * `WithHandleData` — the handle table, for deadlock and leak analysis.
-/// * `WithThreadInfo` — thread times, TEB pointers, start addresses.
-/// * `WithUnloadedModules` — resolves stacks that return into a freed DLL.
-/// * `IgnoreInaccessibleMemory` — a full-memory dump of a live process WILL
-///   meet regions that cannot be read (guard pages, memory a driver locked).
-///   Without this flag one such region fails the entire dump, which is the
-///   other half of why dumps here were unusable.
-///
-/// Deliberately NOT included: `WithTokenInformation` (SIDs and privileges of
-/// the account, not needed to debug) and `WithProcessThreadData`'s
-/// registry-handle variants. A dump is user data; it should carry what a
-/// debugger needs and nothing extra.
-const DUMP_TYPE_FULL: i32 = 0x0000_0002 // MiniDumpWithFullMemory
-    | 0x0000_0004  // MiniDumpWithHandleData
+/// * Minimal: thread information and data segments (smallest dump).
+/// * Limited: full memory without handle data or IPT trace.
+/// * Normal: full memory, handle data, unloaded modules, memory info, thread info.
+///   This matches standard Task Manager dump output.
+/// * Full: comprehensive dump with all segments, full memory, handles, unloaded modules,
+///   indirect memory, thread data, private memory, memory info, code segs, auxiliary state,
+///   token info, module headers, AVX context, IPT trace.
+pub const DUMP_TYPE_MINIMAL: i32 = 0x0000_0001 // MiniDumpWithDataSegs
+    | 0x0000_0020  // MiniDumpWithUnloadedModules
+    | 0x0000_1000  // MiniDumpWithThreadInfo
+    | 0x0002_0000; // MiniDumpIgnoreInaccessibleMemory
+
+pub const DUMP_TYPE_LIMITED: i32 = 0x0000_0002 // MiniDumpWithFullMemory
     | 0x0000_0020  // MiniDumpWithUnloadedModules
     | 0x0000_0800  // MiniDumpWithFullMemoryInfo
     | 0x0000_1000  // MiniDumpWithThreadInfo
     | 0x0002_0000; // MiniDumpIgnoreInaccessibleMemory
 
+pub const DUMP_TYPE_NORMAL: i32 = 0x0000_0002 // MiniDumpWithFullMemory
+    | 0x0000_0004  // MiniDumpWithHandleData
+    | 0x0000_0020  // MiniDumpWithUnloadedModules
+    | 0x0000_0800  // MiniDumpWithFullMemoryInfo
+    | 0x0000_1000  // MiniDumpWithThreadInfo
+    | 0x0002_0000  // MiniDumpIgnoreInaccessibleMemory
+    | 0x0040_0000; // MiniDumpWithIptTrace
+
+pub const DUMP_TYPE_FULL: i32 = 0x0000_0001 // MiniDumpWithDataSegs
+    | 0x0000_0002  // MiniDumpWithFullMemory
+    | 0x0000_0004  // MiniDumpWithHandleData
+    | 0x0000_0020  // MiniDumpWithUnloadedModules
+    | 0x0000_0040  // MiniDumpWithIndirectlyReferencedMemory
+    | 0x0000_0100  // MiniDumpWithProcessThreadData
+    | 0x0000_0200  // MiniDumpWithPrivateReadWriteMemory
+    | 0x0000_0800  // MiniDumpWithFullMemoryInfo
+    | 0x0000_2000  // MiniDumpWithCodeSegs
+    | 0x0000_8000  // MiniDumpWithFullAuxiliaryState
+    | 0x0001_0000  // MiniDumpWithPrivateWriteCopyMemory
+    | 0x0002_0000  // MiniDumpIgnoreInaccessibleMemory
+    | 0x0004_0000  // MiniDumpWithTokenInformation
+    | 0x0008_0000  // MiniDumpWithModuleHeaders
+    | 0x0020_0000  // MiniDumpWithAvxXStateContext
+    | 0x0040_0000; // MiniDumpWithIptTrace
+
 /// Fallback for the rare process whose address space cannot be captured at
 /// all (a target that is exiting, or one whose working set the kernel refuses
 /// to walk). Keeps everything except full memory, so the result is still a
 /// real crash dump rather than nothing.
-const DUMP_TYPE_REDUCED: i32 = 0x0000_0001 // MiniDumpWithDataSegs
+pub const DUMP_TYPE_REDUCED: i32 = 0x0000_0001 // MiniDumpWithDataSegs
     | 0x0000_0004  // MiniDumpWithHandleData
     | 0x0000_0020  // MiniDumpWithUnloadedModules
     | 0x0000_0100  // MiniDumpWithIndirectlyReferencedMemory
@@ -2142,13 +2156,14 @@ const DUMP_TYPE_REDUCED: i32 = 0x0000_0001 // MiniDumpWithDataSegs
 /// The creation time is verified through the dump handle before any output
 /// file is created, so a recycled pid can never dump an unrelated process.
 ///
-/// The dump is a full-memory one ([`DUMP_TYPE_FULL`]) so it can actually be
-/// debugged; a target that refuses to yield its whole address space is
-/// retried once at [`DUMP_TYPE_REDUCED`] rather than failing outright.
+/// Supports the dump levels matching System Informer ([`DumpType`]).
+/// A target whose address space cannot be captured in full is retried once at
+/// [`DUMP_TYPE_REDUCED`] rather than failing outright (for types requesting full memory).
 pub fn create_dump_file(
     pid: u32,
     expected_start_epoch_s: Option<i64>,
     path: &std::path::Path,
+    dump_type: tm_core::model::DumpType,
 ) -> Result<()> {
     use windows::Win32::Storage::FileSystem::{
         CREATE_ALWAYS, CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ, FILE_SHARE_WRITE,
@@ -2187,18 +2202,15 @@ pub fn create_dump_file(
             )
         }
         .map_err(|e| TmError::platform("CreateFileW(dump)", e.to_string()))?;
-        let mut dump_result = unsafe {
-            MiniDumpWriteDump(
-                hproc,
-                pid,
-                hfile,
-                MINIDUMP_TYPE(DUMP_TYPE_FULL),
-                None,
-                None,
-                None,
-            )
+        let flags = match dump_type {
+            tm_core::model::DumpType::Minimal => DUMP_TYPE_MINIMAL,
+            tm_core::model::DumpType::Limited => DUMP_TYPE_LIMITED,
+            tm_core::model::DumpType::Normal => DUMP_TYPE_NORMAL,
+            tm_core::model::DumpType::Full => DUMP_TYPE_FULL,
         };
-        if dump_result.is_err() {
+        let mut dump_result =
+            unsafe { MiniDumpWriteDump(hproc, pid, hfile, MINIDUMP_TYPE(flags), None, None, None) };
+        if dump_result.is_err() && dump_type != tm_core::model::DumpType::Minimal {
             // Rewind: the failed attempt left a partial file behind, and
             // MiniDumpWriteDump writes from the current position.
             let _ = unsafe {
@@ -2223,6 +2235,9 @@ pub fn create_dump_file(
             };
         }
         let _ = unsafe { CloseHandle(hfile) };
+        if dump_result.is_err() {
+            let _ = std::fs::remove_file(path);
+        }
         dump_result.map_err(|e| TmError::platform("MiniDumpWriteDump", e.to_string()))
     })();
     let _ = unsafe { CloseHandle(hproc) };
@@ -2389,10 +2404,37 @@ mod tests {
     /// old `MiniDumpNormal` output useless, so both are pinned here.
     #[test]
     fn the_dump_flags_describe_a_debuggable_full_dump() {
+        const WITH_DATA_SEGS: i32 = 0x0000_0001;
         const WITH_FULL_MEMORY: i32 = 0x0000_0002;
+        const WITH_HANDLE_DATA: i32 = 0x0000_0004;
+        const WITH_UNLOADED_MODULES: i32 = 0x0000_0020;
+        const WITH_THREAD_INFO: i32 = 0x0000_1000;
         const IGNORE_INACCESSIBLE: i32 = 0x0002_0000;
+        const WITH_TOKEN_INFO: i32 = 0x0004_0000;
+
+        // Minimal dump: thread info and data segments, no full memory.
+        assert_ne!(DUMP_TYPE_MINIMAL & WITH_DATA_SEGS, 0);
+        assert_ne!(DUMP_TYPE_MINIMAL & WITH_UNLOADED_MODULES, 0);
+        assert_ne!(DUMP_TYPE_MINIMAL & WITH_THREAD_INFO, 0);
+        assert_ne!(DUMP_TYPE_MINIMAL & IGNORE_INACCESSIBLE, 0);
+        assert_eq!(DUMP_TYPE_MINIMAL & WITH_FULL_MEMORY, 0);
+
+        // Limited dump: full memory without handle data.
+        assert_ne!(DUMP_TYPE_LIMITED & WITH_FULL_MEMORY, 0);
+        assert_eq!(DUMP_TYPE_LIMITED & WITH_HANDLE_DATA, 0);
+        assert_ne!(DUMP_TYPE_LIMITED & IGNORE_INACCESSIBLE, 0);
+
+        // Normal dump: full memory, handles, threads, unloaded modules.
+        assert_ne!(DUMP_TYPE_NORMAL & WITH_FULL_MEMORY, 0);
+        assert_ne!(DUMP_TYPE_NORMAL & WITH_HANDLE_DATA, 0);
+        assert_ne!(DUMP_TYPE_NORMAL & IGNORE_INACCESSIBLE, 0);
+
+        // Full dump: full memory, handles, data segs, token info, all extended state.
         assert_ne!(DUMP_TYPE_FULL & WITH_FULL_MEMORY, 0);
+        assert_ne!(DUMP_TYPE_FULL & WITH_HANDLE_DATA, 0);
+        assert_ne!(DUMP_TYPE_FULL & WITH_TOKEN_INFO, 0);
         assert_ne!(DUMP_TYPE_FULL & IGNORE_INACCESSIBLE, 0);
+
         // The fallback deliberately drops full memory and nothing else that
         // a debugger needs to resolve a stack.
         assert_eq!(DUMP_TYPE_REDUCED & WITH_FULL_MEMORY, 0);

@@ -34,6 +34,8 @@
 use eframe::egui;
 use std::collections::{HashMap, HashSet};
 use tm_core::i18n::{self, K};
+#[cfg(target_os = "windows")]
+use tm_core::model::DumpType;
 use tm_core::model::{ProcCategory, ProcStatus, ProcessEntry, Snapshot};
 
 use crate::app::TaskManApp;
@@ -1199,19 +1201,31 @@ fn context_menu(app: &mut TaskManApp, ui: &mut egui::Ui, row: &RowData) {
         ui.close();
     }
     #[cfg(target_os = "windows")]
-    if menu::item(ui, i18n::tr(K::CreateDumpFile)).clicked() {
-        let process = app
-            .latest_snapshot()
-            .as_ref()
-            .and_then(|snapshot| snapshot.process(row.pid))
-            .cloned();
-        if let Some(process) = process {
-            crate::tabs::details::create_dump(app, &ctx, &process);
-        } else {
-            app.shared.toast(i18n::tr(K::ProcessExited));
+    menu::submenu(ui, i18n::tr(K::CreateDumpFile), |ui| {
+        for (dump_type, key, tip_key) in [
+            (DumpType::Minimal, K::DumpMinimal, K::DumpMinimalTip),
+            (DumpType::Limited, K::DumpLimited, K::DumpLimitedTip),
+            (DumpType::Normal, K::DumpNormal, K::DumpNormalTip),
+            (DumpType::Full, K::DumpFull, K::DumpFullTip),
+        ] {
+            if menu::item(ui, i18n::tr(key))
+                .on_hover_text(i18n::tr(tip_key))
+                .clicked()
+            {
+                let process = app
+                    .latest_snapshot()
+                    .as_ref()
+                    .and_then(|snapshot| snapshot.process(row.pid))
+                    .cloned();
+                if let Some(process) = process {
+                    crate::tabs::details::create_dump(app, &ctx, &process, dump_type);
+                } else {
+                    app.shared.toast(i18n::tr(K::ProcessExited));
+                }
+                ui.close();
+            }
         }
-        ui.close();
-    }
+    });
     if app.actions.capabilities().process_modules
         && menu::item(ui, i18n::tr(K::ViewModules)).clicked()
     {
