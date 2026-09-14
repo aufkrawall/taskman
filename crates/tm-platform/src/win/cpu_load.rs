@@ -94,6 +94,7 @@ struct ProcRaw {
     handle_count: u32,
     thread_count: u32,
     working_set: u64,
+    working_set_private: u64,
     peak_working_set: u64,
     commit: u64,
     /// Image base name from the kernel table (empty when unparseable).
@@ -259,6 +260,17 @@ impl CpuLoadAccountant {
             return None;
         }
         Some(raw.working_set)
+    }
+
+    /// Process private working set (in bytes) from the newest native process table.
+    pub fn working_set_private_of(&self, pid: u32, start_epoch_s: Option<i64>) -> Option<u64> {
+        let raw = self.prev.as_ref()?.procs.get(&pid)?;
+        if let Some(expected) = start_epoch_s
+            && filetime_to_unix_seconds(raw.create_time) != Some(expected)
+        {
+            return None;
+        }
+        Some(raw.working_set_private)
     }
 
     /// Process peak working set (in bytes) from the newest native process table.
@@ -476,6 +488,7 @@ impl CpuLoadAccountant {
                 break;
             };
             let number_of_threads = read_u32(buf, pos + 4);
+            let working_set_private = nonneg(read_i64(buf, pos + off.working_set_private));
             let create_time = read_i64(buf, pos + off.create_time);
             let user = read_i64(buf, pos + off.user_time);
             let kernel = read_i64(buf, pos + off.kernel_time);
@@ -513,6 +526,7 @@ impl CpuLoadAccountant {
                         handle_count,
                         thread_count: number_of_threads,
                         working_set,
+                        working_set_private,
                         peak_working_set,
                         commit,
                         name,
@@ -630,6 +644,8 @@ fn process_suspended(
 /// export the layout, so it is addressed manually; the field order has been
 /// stable since Vista and matches Process Hacker's definition.
 struct Offsets {
+    /// WorkingSetPrivateSize, inside the crate's `Reserved1` blob.
+    working_set_private: usize,
     /// HardFaultCount, inside the crate's `Reserved1` blob.
     hard_faults: usize,
     create_time: usize,
@@ -669,6 +685,7 @@ impl Offsets {
             // HandleCount@96, SessionId@100, PeakWorkingSet@136, WorkingSet@144,
             // PagefileUsage@184, PrivatePageCount@200, IO_COUNTERS@208.
             Self {
+                working_set_private: 8,
                 hard_faults: 16,
                 create_time: 32,
                 user_time: 40,
@@ -688,6 +705,7 @@ impl Offsets {
         } else {
             // Same order, pointer-sized handles/pointers.
             Self {
+                working_set_private: 8,
                 hard_faults: 16,
                 create_time: 32,
                 user_time: 40,
@@ -1071,6 +1089,11 @@ mod tests {
         use std::mem::offset_of;
         let off = Offsets::get();
         assert_eq!(
+            off.working_set_private,
+            offset_of!(SYSTEM_PROCESS_INFORMATION, Reserved1),
+            "WorkingSetPrivateSize sits at the start of Reserved1"
+        );
+        assert_eq!(
             off.create_time,
             offset_of!(SYSTEM_PROCESS_INFORMATION, Reserved1) + 24,
             "CreateTime sits inside the crate's Reserved1 blob"
@@ -1348,6 +1371,7 @@ mod tests {
             handle_count: 0,
             thread_count: 1,
             working_set: 0,
+            working_set_private: 0,
             peak_working_set: 0,
             commit: 0,
             name: name.into(),
@@ -1500,6 +1524,10 @@ mod tests {
     fn spi_offsets_match_struct_layout() {
         let off = Offsets::get();
         assert_eq!(
+            off.working_set_private,
+            std::mem::offset_of!(SYSTEM_PROCESS_INFORMATION, Reserved1)
+        );
+        assert_eq!(
             off.working_set,
             std::mem::offset_of!(SYSTEM_PROCESS_INFORMATION, WorkingSetSize)
         );
@@ -1516,6 +1544,31 @@ mod tests {
             std::mem::offset_of!(SYSTEM_PROCESS_INFORMATION, HandleCount)
         );
         assert!(off.min_size <= std::mem::size_of::<SYSTEM_PROCESS_INFORMATION>());
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn live_kernel_table_yields_plausible_working_set_private() {
+        let mut acc = CpuLoadAccountant::new();
+        let procs = acc.query_procs().expect("NtQuerySystemInformation");
+        assert!(procs.len() > 10, "implausibly small process table");
+        let with_pws = procs.values().filter(|p| p.working_set_private > 0).count();
+        assert!(
+            with_pws * 2 >= procs.len(),
+            "only {with_pws}/{} processes report private working set",
+            procs.len()
+        );
+        for p in procs.values() {
+            if p.working_set > 0 {
+                assert!(
+                    p.working_set_private <= p.working_set,
+                    "{} reports private ws {} > total ws {}",
+                    p.name,
+                    p.working_set_private,
+                    p.working_set
+                );
+            }
+        }
     }
 
     #[test]

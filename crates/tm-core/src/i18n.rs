@@ -202,6 +202,7 @@ keys! {
     PropCommandLine => ["Befehlszeile", "Command line"],
     PropParentProcess => ["Übergeordneter Prozess", "Parent process"],
     PropStarted => ["Gestartet", "Started"],
+    PropPrivateWorkingSet => ["Privater Arbeitssatz", "Private working set"],
     PropWorkingSet => ["Arbeitssatz", "Working set"],
     PropPeakWorkingSet => ["Max. Arbeitssatz", "Peak working set"],
     PropCommitSize => ["Commitgröße", "Commit size"],

@@ -409,8 +409,11 @@ pub struct ProcessEntry {
 
     /// CPU utilization normalized to whole-system capacity (TM-style, max 100).
     pub cpu_pct: f32,
-    /// Resident memory attributed to the process.
+    /// Resident memory attributed to the process (Private Working Set by default on Windows).
     pub mem_bytes: u64,
+    /// Total working set (resident memory including shared pages) when available.
+    #[serde(default)]
+    pub working_set_bytes: Option<u64>,
     /// Private commit charge when available.
     pub commit_bytes: Option<u64>,
     /// Peak resident memory when available.
@@ -533,6 +536,7 @@ impl ProcessEntry {
             session_id: None,
             cpu_pct: 0.0,
             mem_bytes: 0,
+            working_set_bytes: None,
             commit_bytes: None,
             peak_mem_bytes: None,
             disk_read_bps: 0.0,

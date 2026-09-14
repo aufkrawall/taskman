@@ -883,12 +883,19 @@ impl Sampler {
             // both straight from the kernel's accumulators (cpu_load.rs).
             let pc = load.as_ref().and_then(|l| l.procs.get(&pid_u));
             entry.cpu_pct = pc.map_or(0.0, |c| c.pct);
-            entry.mem_bytes = p.memory();
-            if entry.mem_bytes == 0
-                && let Some(ws) = self.cpu_load.working_set_of(pid_u, entry.start_epoch_s)
-            {
-                entry.mem_bytes = ws;
-            }
+            let ws_total = self
+                .cpu_load
+                .working_set_of(pid_u, entry.start_epoch_s)
+                .or_else(|| {
+                    let m = p.memory();
+                    (m > 0).then_some(m)
+                });
+            entry.working_set_bytes = ws_total;
+
+            let ws_private = self
+                .cpu_load
+                .working_set_private_of(pid_u, entry.start_epoch_s);
+            entry.mem_bytes = ws_private.or(ws_total).unwrap_or(0);
             let virt = p.virtual_memory();
             if virt > 0 {
                 entry.commit_bytes = Some(virt);

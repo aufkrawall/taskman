@@ -97,6 +97,7 @@ pub enum ColumnId {
     CpuTime,
     Commit,
     PeakMemory,
+    WorkingSet,
     GpuDedicated,
     GpuShared,
     Description,
@@ -147,6 +148,7 @@ impl ColumnId {
             ColumnId::CpuTime => cmp_option_f64(a.cpu_time_s, b.cpu_time_s),
             ColumnId::Commit => a.commit_bytes.cmp(&b.commit_bytes),
             ColumnId::PeakMemory => a.peak_mem_bytes.cmp(&b.peak_mem_bytes),
+            ColumnId::WorkingSet => a.working_set_bytes.cmp(&b.working_set_bytes),
             ColumnId::GpuDedicated => a.gpu_dedicated_bytes.cmp(&b.gpu_dedicated_bytes),
             ColumnId::GpuShared => a.gpu_shared_bytes.cmp(&b.gpu_shared_bytes),
             ColumnId::Description => cmp_option_str(
@@ -351,6 +353,7 @@ impl ColSpec {
             ColumnId::CpuTime => "CPU time",
             ColumnId::Commit => "Commit size",
             ColumnId::PeakMemory => "Peak working set",
+            ColumnId::WorkingSet => i18n::tr(K::PropWorkingSet),
             ColumnId::GpuDedicated => "Dedicated GPU memory",
             ColumnId::GpuShared => "Shared GPU memory",
             ColumnId::Description => i18n::tr(K::ColDescription),
@@ -474,6 +477,11 @@ const COLUMNS: &[ColSpec] = &[
     ColSpec {
         cid: ColumnId::PeakMemory,
         col: || TmColumn::num("peakmem", "Peak working set", 145.0),
+        default_visible: false,
+    },
+    ColSpec {
+        cid: ColumnId::WorkingSet,
+        col: || TmColumn::num("workingset", i18n::tr(K::PropWorkingSet), 130.0),
         default_visible: false,
     },
     ColSpec {
@@ -898,6 +906,7 @@ pub struct Row {
     pub cpu_time_s: String,
     pub commit_s: String,
     pub peak_mem_s: String,
+    pub working_set_s: String,
     pub gpu_dedicated_s: String,
     pub gpu_shared_s: String,
     pub description_s: String,
@@ -939,6 +948,7 @@ impl Row {
             ColumnId::CpuTime => &self.cpu_time_s,
             ColumnId::Commit => &self.commit_s,
             ColumnId::PeakMemory => &self.peak_mem_s,
+            ColumnId::WorkingSet => &self.working_set_s,
             ColumnId::GpuDedicated => &self.gpu_dedicated_s,
             ColumnId::GpuShared => &self.gpu_shared_s,
             ColumnId::Description => &self.description_s,
@@ -1592,6 +1602,7 @@ fn cid_is_numeric(cid: ColumnId) -> bool {
             | ColumnId::CpuTime
             | ColumnId::Commit
             | ColumnId::PeakMemory
+            | ColumnId::WorkingSet
             | ColumnId::GpuDedicated
             | ColumnId::GpuShared
             | ColumnId::ParentPid
@@ -1903,6 +1914,7 @@ fn row_from_process(p: &ProcessEntry, depth: usize, children: bool) -> Row {
             .unwrap_or_else(|| "—".into()),
         commit_s: opt_u64_bytes(p.commit_bytes),
         peak_mem_s: opt_u64_bytes(p.peak_mem_bytes),
+        working_set_s: opt_u64_bytes(p.working_set_bytes),
         gpu_dedicated_s: opt_u64_bytes(p.gpu_dedicated_bytes),
         gpu_shared_s: opt_u64_bytes(p.gpu_shared_bytes),
         description_s: p
@@ -3429,10 +3441,18 @@ fn process_properties_statistics(ui: &mut egui::Ui, process: &ProcessEntry) {
             );
             property_row(
                 ui,
-                i18n::tr(K::PropWorkingSet),
+                i18n::tr(K::PropPrivateWorkingSet),
                 format::format_bytes_loc(process.mem_bytes),
                 false,
             );
+            if let Some(ws) = process.working_set_bytes {
+                property_row(
+                    ui,
+                    i18n::tr(K::PropWorkingSet),
+                    format::format_bytes_loc(ws),
+                    false,
+                );
+            }
             property_row(
                 ui,
                 i18n::tr(K::PropPeakWorkingSet),
@@ -4431,6 +4451,10 @@ mod tests {
                 ColumnId::PeakMemory => {
                     a.peak_mem_bytes = Some(1);
                     b.peak_mem_bytes = Some(2);
+                }
+                ColumnId::WorkingSet => {
+                    a.working_set_bytes = Some(1);
+                    b.working_set_bytes = Some(2);
                 }
                 ColumnId::GpuDedicated => {
                     a.gpu_dedicated_bytes = Some(1);

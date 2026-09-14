@@ -111,6 +111,7 @@ impl SystemCollector for LinuxCollector {
             entry.category = category;
             entry.cpu_pct = (p.cpu_usage() / nb_cpus).clamp(0.0, 100.0);
             entry.mem_bytes = p.memory();
+            entry.working_set_bytes = Some(p.memory());
             entry.commit_bytes = Some(p.virtual_memory());
             entry.peak_mem_bytes = proc_status_kb(pid_u, "VmHWM");
             entry.start_epoch_s = Some(p.start_time() as i64);

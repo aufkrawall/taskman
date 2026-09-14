@@ -88,6 +88,7 @@ impl SystemCollector for MacCollector {
             // total machine capacity (TM-style, max 100).
             entry.cpu_pct = (p.cpu_usage() / nb_cpus).clamp(0.0, 100.0);
             entry.mem_bytes = p.memory();
+            entry.working_set_bytes = Some(p.memory());
             entry.commit_bytes = Some(p.virtual_memory());
             entry.start_epoch_s = Some(p.start_time() as i64);
             // macOS accumulated cpu time unit: microseconds in sysinfo? treat ms fallback.
