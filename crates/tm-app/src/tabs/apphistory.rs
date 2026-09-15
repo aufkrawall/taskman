@@ -102,8 +102,9 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
                 )
                 .clicked()
             {
-                app.app_history_db.clear();
-                app.shared.toast(i18n::tr(K::HistoryCleared));
+                // Clearing wipes the whole database; park behind a confirm
+                // like every other destructive command.
+                app.pending_app_history_clear = true;
             }
         });
     });
@@ -213,6 +214,18 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
                     ),
                 ];
                 table.heat_cells(ui, &pal, rect, 1, &cells);
+                // A "—" the user can hover explains itself (same reasons the
+                // Users tab gives); an unexplained dash reads as a bug.
+                let resp = if row.network_available {
+                    resp
+                } else {
+                    match crate::tabs::value_columns::unavailable_tip(
+                        crate::tabs::value_columns::NET,
+                    ) {
+                        Some(tip) => resp.on_hover_text(tip),
+                        None => resp,
+                    }
+                };
                 let _ = resp;
             }
         },
@@ -223,6 +236,59 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
         app.persist_sort("apphistory", ids[column], app.app_history_sort.ascending);
     }
     app.persist_table(&table);
+}
+
+/// Confirmation for "Delete usage history" (`show` parks the click here
+/// instead of wiping the database right away). The safe action owns the
+/// keyboard default.
+pub fn clear_history_dialog(app: &mut TaskManApp, ctx: &egui::Context, pal: &theme::Palette) {
+    if !app.pending_app_history_clear {
+        return;
+    }
+    let focus_id = egui::Id::new("apphistory-clear-focus-primary");
+    let mut open = true;
+    let keys = crate::app_ui::consume_dialog_keys(ctx, true);
+    let mut focused: bool = ctx.data(|d| d.get_temp(focus_id)).unwrap_or(false);
+    focused = crate::app_ui::update_end_task_dialog_focus(
+        focused,
+        keys.tab,
+        keys.shift_tab,
+        keys.left,
+        keys.right,
+    );
+    let key_decision = crate::app_ui::dialog_key_decision(keys, focused, true);
+    let mut clicked = crate::app_ui::DialogButtonClick::None;
+    egui::Window::new(i18n::tr(K::ClearHistoryLink))
+        .open(&mut open)
+        .collapsible(false)
+        .resizable(false)
+        .anchor(egui::Align2::CENTER_CENTER, [0.0, -40.0])
+        .show(ctx, |ui| {
+            ui.set_width(420.0);
+            ui.label(i18n::tr(K::ClearHistoryConfirm));
+            ui.add_space(8.0);
+            clicked = crate::app_ui::dialog_button_row(
+                ui,
+                ctx,
+                pal,
+                i18n::tr(K::Cancel),
+                Some((i18n::tr(K::ClearHistoryLink), true)),
+                &mut focused,
+            );
+        });
+    ctx.data_mut(|d| d.insert_temp(focus_id, focused));
+    let cancel = !open
+        || matches!(key_decision, Some(crate::app_ui::DialogDecision::Safe))
+        || matches!(clicked, crate::app_ui::DialogButtonClick::Safe);
+    let confirm = matches!(key_decision, Some(crate::app_ui::DialogDecision::Primary))
+        || matches!(clicked, crate::app_ui::DialogButtonClick::Primary);
+    if cancel || confirm {
+        app.pending_app_history_clear = false;
+    }
+    if confirm {
+        app.app_history_db.clear();
+        app.shared.toast(i18n::tr(K::HistoryCleared));
+    }
 }
 
 #[cfg(test)]

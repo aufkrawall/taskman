@@ -600,11 +600,19 @@ keys! {
     SessionsUnavailable => ["Sitzungen nicht verfügbar:", "Sessions unavailable:"],
     SessionDisconnected => ["Sitzung getrennt", "Session disconnected"],
     UserSignedOut => ["Benutzer abgemeldet", "User signed out"],
+    UserControlUnavailable => [
+        "Sitzungsverwaltung auf dieser Plattform nicht verfügbar",
+        "Session control is unavailable on this platform"
+    ],
 
     // ------------------------------------------------ app history
     HistorySinceLine => ["Ressourcenauslastung seit", "Resource usage since"],
     HistoryForAccounts => ["für aktuelle Benutzer- und Systemkonten.", "for the current user and system accounts."],
     ClearHistoryLink => ["Auslastungsverlauf löschen", "Delete usage history"],
+    ClearHistoryConfirm => [
+        "Auslastungsverlauf wirklich löschen? Die gespeicherte CPU-Zeit und der Netzwerkverkehr werden zurückgesetzt.",
+        "Really delete usage history? The stored CPU time and network traffic are reset."
+    ],
     HistoryCleared => ["Auslastungsverlauf gelöscht", "Usage history deleted"],
     HistoryLocalNote => [
         "Lokaler Verlauf, der nur während der Ausführung von Taskman erfasst wird; der Windows-SRUM-Verlauf wird nicht importiert.",

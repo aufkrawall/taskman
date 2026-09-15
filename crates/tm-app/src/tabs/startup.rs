@@ -268,20 +268,7 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
                     if menu::item(ui, label).clicked() {
                         let new_enabled = !item.enabled;
                         let id = item.id.clone();
-                        let location = item.location.clone();
-                        let actions = app.actions.clone();
-                        let ok_msg = move || {
-                            if new_enabled {
-                                i18n::tr(K::EnabledWord).to_string()
-                            } else {
-                                i18n::tr(K::DisabledWord).to_string()
-                            }
-                        };
-                        let ctx2 = ctx.clone();
-                        let dispatched = app.run_action(&ctx2, ok_msg, move || {
-                            actions.set_startup_enabled(&id, &location, new_enabled)
-                        });
-                        if dispatched {
+                        if toggle_item(app, &ctx, id, new_enabled) {
                             item.enabled = new_enabled;
                         }
                         ui.close();
@@ -353,6 +340,44 @@ fn impact_rank(impact: StartupImpact) -> u8 {
     }
 }
 
+/// Dispatch one enable/disable write. Returns whether the job was dispatched
+/// (the caller flips the cached row optimistically then). The JOB rolls the
+/// cached row back when the SCM write fails, so the table never shows a state
+/// the error toast calls a failure — the revert runs on the worker thread,
+/// where the UI-side cache lock is not held.
+fn toggle_item(app: &mut TaskManApp, ctx: &egui::Context, id: String, new_enabled: bool) -> bool {
+    let actions = app.actions.clone();
+    let cache = app.shared.startup_cache.clone();
+    let ok_msg = move || {
+        if new_enabled {
+            i18n::tr(K::EnabledWord).to_string()
+        } else {
+            i18n::tr(K::DisabledWord).to_string()
+        }
+    };
+    app.run_action(
+        ctx,
+        ok_msg,
+        move || {
+            let location = tm_core::sync::lock(&cache)
+                .as_ref()
+                .and_then(|(items, _)| items.iter().find(|it| it.id == id))
+                .map(|it| it.location.clone())
+                .unwrap_or_default();
+            let result = actions.set_startup_enabled(&id, &location, new_enabled);
+            if result.is_err() {
+                let mut guard = tm_core::sync::lock(&cache);
+                if let Some((items, _)) = guard.as_mut()
+                    && let Some(item) = items.iter_mut().find(|it| it.id == id)
+                {
+                    item.enabled = !new_enabled;
+                }
+            }
+            result
+        },
+    )
+}
+
 fn toggle_selected(app: &mut TaskManApp, enable: bool, ctx: &egui::Context) {
     let guard = app.shared.startup_cache.clone();
     let mut cache = tm_core::sync::lock(&guard);
@@ -360,20 +385,7 @@ fn toggle_selected(app: &mut TaskManApp, enable: bool, ctx: &egui::Context) {
         && let Some(id) = app.selected_startup_id.clone()
         && let Some(item) = items.iter_mut().find(|it| it.id == id)
     {
-        let actions = app.actions.clone();
-        let item_id = item.id.clone();
-        let location = item.location.clone();
-        let ok_msg = move || {
-            if enable {
-                i18n::tr(K::EnabledWord).to_string()
-            } else {
-                i18n::tr(K::DisabledWord).to_string()
-            }
-        };
-        let dispatched = app.run_action(ctx, ok_msg, move || {
-            actions.set_startup_enabled(&item_id, &location, enable)
-        });
-        if dispatched {
+        if toggle_item(app, ctx, id, enable) {
             item.enabled = enable;
         }
     }

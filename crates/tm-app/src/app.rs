@@ -368,6 +368,8 @@ pub struct TaskManApp {
     /// Pending service Stop/Restart awaiting confirmation (service name +
     /// action). Start never parks here; see `services::control`.
     pub pending_service_control: Option<(String, tm_platform::actions::ServiceAction)>,
+    /// Pending App History wipe awaiting confirmation.
+    pub pending_app_history_clear: bool,
     /// Delete-key termination awaits confirmation here.
     pub pending_process_end: Option<PendingProcessEnd>,
     /// Details context-menu UAC virtualization change awaiting confirmation.
@@ -751,6 +753,7 @@ impl TaskManApp {
             selected_user: None,
             pending_session_logoff: None,
             pending_service_control: None,
+            pending_app_history_clear: false,
             pending_process_end,
             pending_uac_virtualization: None,
             active_dump,
@@ -1388,6 +1391,9 @@ impl eframe::App for TaskManApp {
         if self.pending_service_control.is_some() {
             crate::tabs::services::control_confirm_dialog(self, &ctx, &pal);
         }
+        if self.pending_app_history_clear {
+            crate::tabs::apphistory::clear_history_dialog(self, &ctx, &pal);
+        }
         if self.pending_process_end.is_some() {
             crate::app_ui::process_end_dialog(self, &ctx);
         }
@@ -1427,6 +1433,7 @@ impl eframe::App for TaskManApp {
             || self.affinity_dialog.is_some()
             || self.pending_session_logoff.is_some()
             || self.pending_service_control.is_some()
+            || self.pending_app_history_clear
             || self.pending_process_end.is_some()
             || self.pending_uac_virtualization.is_some()
             || self.startup_props.is_some()

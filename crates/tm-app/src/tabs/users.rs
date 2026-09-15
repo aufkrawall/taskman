@@ -674,31 +674,37 @@ fn user_row_ui(
         Some(tip) => resp.on_hover_text(tip),
         None => resp,
     };
-    if can_disconnect {
-        let ctx = ui.ctx().clone();
-        let keyboard_open = menu::keyboard_menu_requested(&ctx) && app.selected_user == Some(s.id);
-        menu::context_menu_kb(&resp, keyboard_open, |ui| {
-            ui.set_min_width(150.0);
-            if menu::item(ui, i18n::tr(K::DisconnectUser)).clicked() {
-                session_action(
-                    app,
-                    &ctx,
-                    s.id,
-                    tm_platform::actions::UserSessionAction::Disconnect,
-                );
-                ui.close();
-            }
-            if menu::item(ui, i18n::tr(K::SignOut)).clicked() {
-                session_action(
-                    app,
-                    &ctx,
-                    s.id,
-                    tm_platform::actions::UserSessionAction::Logoff,
-                );
-                ui.close();
-            }
-        });
-    }
+    // The menu is always attached: without the capability its actions show
+    // disabled with an explanation instead of right-clicking into silence.
+    let ctx = ui.ctx().clone();
+    let keyboard_open = menu::keyboard_menu_requested(&ctx) && app.selected_user == Some(s.id);
+    menu::context_menu_kb(&resp, keyboard_open, |ui| {
+        ui.set_min_width(150.0);
+        if menu::item_enabled(ui, i18n::tr(K::DisconnectUser), can_disconnect)
+            .on_disabled_hover_text(i18n::tr(K::UserControlUnavailable))
+            .clicked()
+        {
+            session_action(
+                app,
+                &ctx,
+                s.id,
+                tm_platform::actions::UserSessionAction::Disconnect,
+            );
+            ui.close();
+        }
+        if menu::item_enabled(ui, i18n::tr(K::SignOut), can_disconnect)
+            .on_disabled_hover_text(i18n::tr(K::UserControlUnavailable))
+            .clicked()
+        {
+            session_action(
+                app,
+                &ctx,
+                s.id,
+                tm_platform::actions::UserSessionAction::Logoff,
+            );
+            ui.close();
+        }
+    });
 }
 
 #[allow(clippy::too_many_arguments)]
