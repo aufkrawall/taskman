@@ -1037,26 +1037,25 @@ pub fn process_end_dialog(app: &mut TaskManApp, ctx: &egui::Context) {
     };
     let mut open = true;
     let focus_id = egui::Id::new("end_task_dialog_focus_end");
-    let mut end_focused: bool = ctx.data(|d| d.get_temp(focus_id)).unwrap_or(true);
+    // The SAFE action owns the default: focus starts on Cancel, so Enter and
+    // Space confirm nothing until the user deliberately moves focus to the
+    // End task button. The dialog exists to guard accidental kills; its
+    // keyboard default must not undo that guard.
+    let mut end_focused: bool = ctx.data(|d| d.get_temp(focus_id)).unwrap_or(false);
 
-    let mut decision = None;
-    let escape = ctx.input_mut(|input| input.consume_key(Default::default(), egui::Key::Escape));
-    let enter = ctx.input_mut(|input| input.consume_key(Default::default(), egui::Key::Enter));
-    let space = ctx.input_mut(|input| input.consume_key(Default::default(), egui::Key::Space));
-    let shift_tab =
-        ctx.input_mut(|input| input.consume_key(egui::Modifiers::SHIFT, egui::Key::Tab));
-    let tab = ctx.input_mut(|input| input.consume_key(Default::default(), egui::Key::Tab));
-    let left = ctx.input_mut(|input| input.consume_key(Default::default(), egui::Key::ArrowLeft));
-    let right = ctx.input_mut(|input| input.consume_key(Default::default(), egui::Key::ArrowRight));
+    let keys = consume_dialog_keys(ctx, true);
+    end_focused = update_end_task_dialog_focus(
+        end_focused,
+        keys.tab,
+        keys.shift_tab,
+        keys.left,
+        keys.right,
+    );
 
-    end_focused = update_end_task_dialog_focus(end_focused, tab, shift_tab, left, right);
+    let mut decision = dialog_key_decision(keys, end_focused, true)
+        .map(|d| matches!(d, DialogDecision::Primary));
 
-    if escape {
-        decision = Some(false);
-    } else if enter || space {
-        decision = Some(end_focused);
-    }
-
+    let pal = crate::theme::palette_ctx(ctx);
     egui::Window::new(i18n::tr(K::EndTask))
         .id(egui::Id::new("end-task-dialog"))
         .open(&mut open)
@@ -1066,7 +1065,6 @@ pub fn process_end_dialog(app: &mut TaskManApp, ctx: &egui::Context) {
         .anchor(Align2::CENTER_CENTER, [0.0, -40.0])
         .show(ctx, |ui| {
             ui.set_width(400.0);
-            let pal = crate::theme::palette_ctx(ctx);
             match pending.targets.as_slice() {
                 [(identity, name)] => {
                     ui.label(i18n::trf(
@@ -1127,49 +1125,18 @@ pub fn process_end_dialog(app: &mut TaskManApp, ctx: &egui::Context) {
             }
             ui.add_space(12.0);
 
-            let btn_size = egui::vec2(85.0, 24.0);
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let mut end_btn = egui::Button::new(
-                    egui::RichText::new(i18n::tr(K::EndTask))
-                        .color(pal.accent_text)
-                        .strong(),
-                )
-                .min_size(btn_size)
-                .fill(pal.accent);
-                if end_focused {
-                    end_btn = end_btn.stroke(egui::Stroke::new(2.0, Color32::WHITE));
-                }
-                let end_resp = ui.add(end_btn);
-
-                ui.add_space(8.0);
-
-                let mut cancel_btn = egui::Button::new(i18n::tr(K::Cancel)).min_size(btn_size);
-                if !end_focused {
-                    cancel_btn = cancel_btn.stroke(egui::Stroke::new(2.0, pal.accent));
-                }
-                let cancel_resp = ui.add(cancel_btn);
-
-                // Mouse dragging selection: keeping mouse pressed and moving over buttons changes selection
-                if ctx.input(|i| i.pointer.primary_down()) {
-                    if cancel_resp.hovered() {
-                        end_focused = false;
-                    } else if end_resp.hovered() {
-                        end_focused = true;
-                    }
-                }
-
-                if cancel_resp.clicked() {
-                    decision = Some(false);
-                } else if end_resp.clicked() {
-                    decision = Some(true);
-                }
-
-                if end_focused {
-                    end_resp.request_focus();
-                } else {
-                    cancel_resp.request_focus();
-                }
-            });
+            match dialog_button_row(
+                ui,
+                ctx,
+                &pal,
+                i18n::tr(K::Cancel),
+                Some((i18n::tr(K::EndTask), true)),
+                &mut end_focused,
+            ) {
+                DialogButtonClick::Safe => decision = Some(false),
+                DialogButtonClick::Primary => decision = Some(true),
+                DialogButtonClick::None => {}
+            }
         });
 
     ctx.data_mut(|d| d.insert_temp(focus_id, end_focused));
@@ -1532,6 +1499,143 @@ pub fn draw_toasts(app: &TaskManApp, ctx: &egui::Context) {
     }
 }
 
+// ---------------------------------------------------------------- dialogs
+
+/// Keyboard events a confirmation-style dialog owns. Consume these BEFORE
+/// `Window::show`, exactly like `process_end_dialog` does: egui activates a
+/// focused click-sensing button on Enter/Space by itself, so consuming first
+/// is what keeps the manual decision from double-firing.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct DialogKeys {
+    pub escape: bool,
+    pub enter: bool,
+    pub space: bool,
+    pub tab: bool,
+    pub shift_tab: bool,
+    pub left: bool,
+    pub right: bool,
+}
+
+/// Consume the dialog's keys for this frame. `space_is_action == false` keeps
+/// Space as ordinary text (dialogs whose text field can hold focus).
+pub fn consume_dialog_keys(ctx: &egui::Context, space_is_action: bool) -> DialogKeys {
+    DialogKeys {
+        escape: ctx.input_mut(|i| i.consume_key(Default::default(), egui::Key::Escape)),
+        enter: ctx.input_mut(|i| i.consume_key(Default::default(), egui::Key::Enter)),
+        space: space_is_action
+            && ctx.input_mut(|i| i.consume_key(Default::default(), egui::Key::Space)),
+        tab: ctx.input_mut(|i| i.consume_key(Default::default(), egui::Key::Tab)),
+        shift_tab: ctx.input_mut(|i| i.consume_key(egui::Modifiers::SHIFT, egui::Key::Tab)),
+        left: ctx.input_mut(|i| i.consume_key(Default::default(), egui::Key::ArrowLeft)),
+        right: ctx.input_mut(|i| i.consume_key(Default::default(), egui::Key::ArrowRight)),
+    }
+}
+
+/// Which button of a two-button dialog row a key resolved to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DialogDecision {
+    Safe,
+    Primary,
+}
+
+/// Resolve Escape/Enter/Space against a two-button row's focus flag. The SAFE
+/// button (Cancel/Close) is the default: Escape and an unfocused Enter both
+/// resolve to it, and a focused but DISABLED primary falls back to it, so a
+/// keyboard-only user can never confirm a destructive action by accident.
+pub fn dialog_key_decision(
+    keys: DialogKeys,
+    primary_focused: bool,
+    primary_enabled: bool,
+) -> Option<DialogDecision> {
+    if keys.escape {
+        Some(DialogDecision::Safe)
+    } else if keys.enter || keys.space {
+        Some(if primary_focused && primary_enabled {
+            DialogDecision::Primary
+        } else {
+            DialogDecision::Safe
+        })
+    } else {
+        None
+    }
+}
+
+/// Which button the user clicked in [`dialog_button_row`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DialogButtonClick {
+    Safe,
+    Primary,
+    None,
+}
+
+/// The standard dialog button row: primary (accent-filled) rightmost, safe
+/// button left of it, matching the end-task dialog styling. `focused` selects
+/// which button carries the focus ring; pointer-drag hover follow and the
+/// per-frame `request_focus` mirror it too. `primary: None` renders a single
+/// plain safe button (its keys are handled at the `consume_dialog_keys` level).
+pub fn dialog_button_row(
+    ui: &mut egui::Ui,
+    ctx: &egui::Context,
+    pal: &Palette,
+    safe_label: &str,
+    primary: Option<(&str, bool)>,
+    focused: &mut bool,
+) -> DialogButtonClick {
+    let btn_size = egui::vec2(85.0, 24.0);
+    let mut click = DialogButtonClick::None;
+    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+        let primary_resp = primary.map(|(label, enabled)| {
+            let mut button = egui::Button::new(
+                egui::RichText::new(label)
+                    .color(pal.accent_text)
+                    .strong(),
+            )
+            .min_size(btn_size)
+            .fill(pal.accent);
+            if *focused {
+                button = button.stroke(Stroke::new(2.0, Color32::WHITE));
+            }
+            let resp = ui.add_enabled(enabled, button);
+            ui.add_space(8.0);
+            resp
+        });
+
+        let mut safe_button = egui::Button::new(safe_label).min_size(btn_size);
+        if primary_resp.is_some() && !*focused {
+            safe_button = safe_button.stroke(Stroke::new(2.0, pal.accent));
+        }
+        let safe_resp = ui.add(safe_button);
+
+        if let Some(primary_resp) = primary_resp {
+            // Mouse dragging selection: keeping the button pressed and moving
+            // over the row moves the keyboard focus with the pointer.
+            if ctx.input(|i| i.pointer.primary_down()) {
+                if safe_resp.hovered() {
+                    *focused = false;
+                } else if primary_resp.hovered() {
+                    *focused = true;
+                }
+            }
+
+            if safe_resp.clicked() {
+                click = DialogButtonClick::Safe;
+            } else if primary_resp.clicked() {
+                click = DialogButtonClick::Primary;
+            }
+
+            if *focused && primary_resp.enabled() {
+                primary_resp.request_focus();
+            } else {
+                *focused = false;
+                safe_resp.request_focus();
+            }
+        } else if safe_resp.clicked() {
+            click = DialogButtonClick::Safe;
+        }
+    });
+    click
+}
+
 #[inline]
 pub(crate) fn update_end_task_dialog_focus(
     current: bool,
@@ -1606,28 +1710,28 @@ mod tests {
 
     #[test]
     fn test_end_task_dialog_focus_keyboard_transitions() {
-        // Initially End task is focused (true).
-        let mut focus = true;
+        // Initially Cancel is focused (false) — the safe default.
+        let mut focus = false;
 
-        // Pressing Tab toggles focus to Cancel (false).
-        focus = update_end_task_dialog_focus(focus, true, false, false, false);
-        assert!(!focus);
-
-        // Releasing Tab on subsequent frame (no keys) MUST preserve Cancel focus (false).
-        focus = update_end_task_dialog_focus(focus, false, false, false, false);
-        assert!(!focus);
-
-        // Pressing Tab again toggles back to End task (true).
+        // Pressing Tab toggles focus to End task (true).
         focus = update_end_task_dialog_focus(focus, true, false, false, false);
         assert!(focus);
 
-        // Next frame preserves End task.
+        // Releasing Tab on subsequent frame (no keys) MUST preserve End task focus (true).
         focus = update_end_task_dialog_focus(focus, false, false, false, false);
         assert!(focus);
 
-        // Pressing Shift+Tab toggles to Cancel (false).
+        // Pressing Tab again toggles back to Cancel (false).
+        focus = update_end_task_dialog_focus(focus, true, false, false, false);
+        assert!(!focus);
+
+        // Next frame preserves Cancel.
+        focus = update_end_task_dialog_focus(focus, false, false, false, false);
+        assert!(!focus);
+
+        // Pressing Shift+Tab toggles to End task (true).
         focus = update_end_task_dialog_focus(focus, false, true, false, false);
-        assert!(!focus);
+        assert!(focus);
 
         // Pressing Left arrow explicitly focuses Cancel (left button).
         focus = update_end_task_dialog_focus(focus, false, false, true, false);
@@ -1643,24 +1747,73 @@ mod tests {
         let ctx = egui::Context::default();
         let focus_id = egui::Id::new("end_task_dialog_focus_end");
 
-        // Frame 1: Initial dialog opening defaults to End task (true).
-        let mut focus: bool = ctx.data(|d| d.get_temp(focus_id)).unwrap_or(true);
-        assert!(focus);
+        // Frame 1: Initial dialog opening defaults to Cancel (false), the
+        // safe action — Enter must not confirm the kill.
+        let mut focus: bool = ctx.data(|d| d.get_temp(focus_id)).unwrap_or(false);
+        assert!(!focus);
 
         // User pressed Tab.
         focus = update_end_task_dialog_focus(focus, true, false, false, false);
         ctx.data_mut(|d| d.insert_temp(focus_id, focus));
-        assert!(!focus);
+        assert!(focus);
 
-        // Frame 2: Next tick without keys, must stay on Cancel.
-        let mut focus_frame2: bool = ctx.data(|d| d.get_temp(focus_id)).unwrap_or(true);
+        // Frame 2: Next tick without keys, must stay on End task.
+        let mut focus_frame2: bool = ctx.data(|d| d.get_temp(focus_id)).unwrap_or(false);
         focus_frame2 = update_end_task_dialog_focus(focus_frame2, false, false, false, false);
         ctx.data_mut(|d| d.insert_temp(focus_id, focus_frame2));
-        assert!(!focus_frame2);
+        assert!(focus_frame2);
 
         // Frame 3: Dialog closes -> temp data removed.
         ctx.data_mut(|d| d.remove_temp::<bool>(focus_id));
         let reset = ctx.data(|d| d.get_temp::<bool>(focus_id));
         assert_eq!(reset, None);
+    }
+
+    /// The dialog keyboard contract: Escape and an unfocused Enter resolve to
+    /// the SAFE action; only a deliberately focused, enabled primary button
+    /// lets Enter/Space confirm.
+    #[test]
+    fn test_dialog_key_decision_defaults_to_safe() {
+        let none = DialogKeys::default();
+        assert_eq!(dialog_key_decision(none, false, true), None);
+
+        assert_eq!(
+            dialog_key_decision(DialogKeys {
+                escape: true,
+                ..none
+            }, true, true),
+            Some(DialogDecision::Safe)
+        );
+        // Unfocused Enter/Space -> safe.
+        assert_eq!(
+            dialog_key_decision(DialogKeys {
+                enter: true,
+                ..none
+            }, false, true),
+            Some(DialogDecision::Safe)
+        );
+        assert_eq!(
+            dialog_key_decision(DialogKeys {
+                space: true,
+                ..none
+            }, false, true),
+            Some(DialogDecision::Safe)
+        );
+        // Focused primary -> primary.
+        assert_eq!(
+            dialog_key_decision(DialogKeys {
+                enter: true,
+                ..none
+            }, true, true),
+            Some(DialogDecision::Primary)
+        );
+        // Focused but DISABLED primary still falls back to safe.
+        assert_eq!(
+            dialog_key_decision(DialogKeys {
+                enter: true,
+                ..none
+            }, true, false),
+            Some(DialogDecision::Safe)
+        );
     }
 }
