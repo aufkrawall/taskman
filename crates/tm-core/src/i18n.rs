@@ -580,6 +580,20 @@ keys! {
     // ------------------------------------------------ services tab
     ServicesUnavailable => ["Dienste nicht verfügbar:", "Services unavailable:"],
     ServiceDoneToast => ["ausgeführt", "action completed for"],
+    ServiceStopConfirm => [
+        "Dienst \"{}\" wirklich anhalten? Abhängige Dienste und Funktionen können dadurch ausfallen.",
+        "Really stop service \"{}\"? Dependent services and functionality may fail."
+    ],
+    ServiceRestartConfirm => [
+        "Dienst \"{}\" wirklich neu starten?",
+        "Really restart service \"{}\"?"
+    ],
+    ServiceRunning => ["Der Dienst wird ausgeführt", "The service is running"],
+    ServiceNotRunning => ["Der Dienst wird nicht ausgeführt", "The service is not running"],
+    ActionAlreadyRunning => [
+        "Es läuft bereits eine Dienstaktion",
+        "A service action is already running"
+    ],
     ActionFailed => ["Aktion fehlgeschlagen", "Action failed"],
 
     // ------------------------------------------------ users tab

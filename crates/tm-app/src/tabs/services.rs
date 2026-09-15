@@ -190,7 +190,7 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
             s.group.as_str(),
         ];
         fit[0] = fit[0].max(tablekit::text_width(ui, values[0], tablekit::FONT_ROW) + 66.0);
-        let pid = s.pid.map(|p| p.to_string()).unwrap_or_default();
+        let pid = s.pid.map_or_else(|| "—".to_string(), |p| p.to_string());
         fit[1] = fit[1].max(tablekit::text_width(ui, &pid, tablekit::FONT_ROW) + 22.0);
         for i in 2..5 {
             fit[i] = fit[i].max(tablekit::text_width(ui, values[i], tablekit::FONT_ROW) + 22.0);
@@ -235,7 +235,9 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
                 ui.painter_at(pid_cell).text(
                     egui::pos2(pid_cell.right() - 10.0, pid_cell.center().y),
                     egui::Align2::RIGHT_CENTER,
-                    s.pid.map(|pid| pid.to_string()).unwrap_or_default(),
+                    // A stopped service has no PID; say so instead of leaving a
+                    // blank cell that reads like missing data.
+                    s.pid.map_or_else(|| "—".to_string(), |pid| pid.to_string()),
                     egui::FontId::proportional(tablekit::FONT_ROW),
                     pal.text,
                 );
@@ -251,17 +253,39 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
                 menu::context_menu_kb(&resp, keyboard_open, |ui| {
                     ui.set_min_width(170.0);
                     let mctx = ui.ctx().clone();
-                    if menu::item(ui, i18n::tr(K::StartService)).clicked() {
+                    // State-aware like the toolbar: Start on a running service
+                    // (or Stop on a stopped one) is a guaranteed error toast,
+                    // not an action.
+                    let busy = app.shared.service_control_busy();
+                    let running = s.status == ServiceStatus::Running;
+                    let stopped = s.status == ServiceStatus::Stopped;
+                    let state_tip = |tip: K| {
+                        if busy {
+                            i18n::tr(K::ActionAlreadyRunning)
+                        } else {
+                            i18n::tr(tip)
+                        }
+                    };
+                    if menu::item_enabled(ui, i18n::tr(K::StartService), stopped && !busy)
+                        .on_disabled_hover_text(state_tip(K::ServiceNotRunning))
+                        .clicked()
+                    {
                         app.services_selected_name = Some(s.name.clone());
                         control(app, &mctx, tm_platform::actions::ServiceAction::Start);
                         ui.close();
                     }
-                    if menu::item(ui, i18n::tr(K::StopService)).clicked() {
+                    if menu::item_enabled(ui, i18n::tr(K::StopService), running && !busy)
+                        .on_disabled_hover_text(state_tip(K::ServiceRunning))
+                        .clicked()
+                    {
                         app.services_selected_name = Some(s.name.clone());
                         control(app, &mctx, tm_platform::actions::ServiceAction::Stop);
                         ui.close();
                     }
-                    if menu::item(ui, i18n::tr(K::RestartService)).clicked() {
+                    if menu::item_enabled(ui, i18n::tr(K::RestartService), running && !busy)
+                        .on_disabled_hover_text(state_tip(K::ServiceRunning))
+                        .clicked()
+                    {
                         app.services_selected_name = Some(s.name.clone());
                         control(app, &mctx, tm_platform::actions::ServiceAction::Restart);
                         ui.close();
@@ -360,7 +384,29 @@ fn status_label(app: &TaskManApp, st: ServiceStatus) -> &'static str {
     }
 }
 
+/// Entry point for every service control. Stop and restart can take down
+/// functionality the user depends on, so they park behind an explicit
+/// confirmation (`control_confirm_dialog`); Start is harmless and stays
+/// one-click — the same asymmetry the Users page applies to Disconnect vs.
+/// Logoff.
 fn control(app: &mut TaskManApp, ctx: &egui::Context, action: tm_platform::actions::ServiceAction) {
+    if matches!(
+        action,
+        tm_platform::actions::ServiceAction::Stop | tm_platform::actions::ServiceAction::Restart
+    ) {
+        if let Some(name) = app.services_selected_name.clone() {
+            app.pending_service_control = Some((name, action));
+        }
+        return;
+    }
+    dispatch_control(app, ctx, action);
+}
+
+fn dispatch_control(
+    app: &mut TaskManApp,
+    ctx: &egui::Context,
+    action: tm_platform::actions::ServiceAction,
+) {
     if !app.shared.service_control.begin() {
         return;
     }
@@ -396,5 +442,78 @@ fn control(app: &mut TaskManApp, ctx: &egui::Context, action: tm_platform::actio
     if spawned.is_err() {
         app.shared.toast(i18n::tr(K::ActionFailed));
         app.shared.service_control.end();
+    }
+}
+
+/// Confirmation dialog for a parked Stop/Restart (`control` parks instead of
+/// dispatching right away). The safe action owns the keyboard default.
+pub fn control_confirm_dialog(app: &mut TaskManApp, ctx: &egui::Context, pal: &theme::Palette) {
+    let Some((name, action)) = app.pending_service_control.clone() else {
+        return;
+    };
+    let display = {
+        let guard = tm_core::sync::lock(&app.shared.services_cache);
+        guard
+            .as_ref()
+            .and_then(|c| c.items.iter().find(|s| s.name == name))
+            .map(|s| s.display_name.clone())
+            .unwrap_or_else(|| name.clone())
+    };
+    let title = match action {
+        tm_platform::actions::ServiceAction::Stop => i18n::tr(K::StopService),
+        tm_platform::actions::ServiceAction::Restart => i18n::tr(K::RestartService),
+        tm_platform::actions::ServiceAction::Start => i18n::tr(K::StartService),
+    };
+    let body = match action {
+        tm_platform::actions::ServiceAction::Stop => i18n::trf(K::ServiceStopConfirm, &[&display]),
+        tm_platform::actions::ServiceAction::Restart => {
+            i18n::trf(K::ServiceRestartConfirm, &[&display])
+        }
+        tm_platform::actions::ServiceAction::Start => String::new(),
+    };
+
+    let focus_id = egui::Id::new("svc-confirm-focus-primary");
+    let mut open = true;
+    let keys = crate::app_ui::consume_dialog_keys(ctx, true);
+    let mut focused: bool = ctx.data(|d| d.get_temp(focus_id)).unwrap_or(false);
+    focused = crate::app_ui::update_end_task_dialog_focus(
+        focused,
+        keys.tab,
+        keys.shift_tab,
+        keys.left,
+        keys.right,
+    );
+    let key_decision = crate::app_ui::dialog_key_decision(keys, focused, true);
+    let mut clicked = crate::app_ui::DialogButtonClick::None;
+    egui::Window::new(title)
+        .open(&mut open)
+        .collapsible(false)
+        .resizable(false)
+        .anchor(egui::Align2::CENTER_CENTER, [0.0, -40.0])
+        .show(ctx, |ui| {
+            ui.set_width(420.0);
+            ui.label(body);
+            ui.add_space(8.0);
+            clicked = crate::app_ui::dialog_button_row(
+                ui,
+                ctx,
+                pal,
+                i18n::tr(K::Cancel),
+                Some((i18n::tr(K::Ok), true)),
+                &mut focused,
+            );
+        });
+    ctx.data_mut(|d| d.insert_temp(focus_id, focused));
+    let cancel = !open
+        || matches!(key_decision, Some(crate::app_ui::DialogDecision::Safe))
+        || matches!(clicked, crate::app_ui::DialogButtonClick::Safe);
+    let confirm = matches!(key_decision, Some(crate::app_ui::DialogDecision::Primary))
+        || matches!(clicked, crate::app_ui::DialogButtonClick::Primary);
+    if cancel || confirm {
+        app.pending_service_control = None;
+    }
+    if confirm {
+        app.services_selected_name = Some(name);
+        dispatch_control(app, ctx, action);
     }
 }

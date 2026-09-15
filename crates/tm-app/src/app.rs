@@ -365,6 +365,9 @@ pub struct TaskManApp {
     /// Pending sign-out awaiting confirmation (session id + display name).
     /// Logoff is a high-blast-radius action and must never be one-click.
     pub pending_session_logoff: Option<(u32, String)>,
+    /// Pending service Stop/Restart awaiting confirmation (service name +
+    /// action). Start never parks here; see `services::control`.
+    pub pending_service_control: Option<(String, tm_platform::actions::ServiceAction)>,
     /// Delete-key termination awaits confirmation here.
     pub pending_process_end: Option<PendingProcessEnd>,
     /// Details context-menu UAC virtualization change awaiting confirmation.
@@ -747,6 +750,7 @@ impl TaskManApp {
             startup_always_on_top,
             selected_user: None,
             pending_session_logoff: None,
+            pending_service_control: None,
             pending_process_end,
             pending_uac_virtualization: None,
             active_dump,
@@ -1381,6 +1385,9 @@ impl eframe::App for TaskManApp {
         if self.pending_session_logoff.is_some() {
             crate::tabs::users::session_logoff_dialog(self, &ctx, &pal);
         }
+        if self.pending_service_control.is_some() {
+            crate::tabs::services::control_confirm_dialog(self, &ctx, &pal);
+        }
         if self.pending_process_end.is_some() {
             crate::app_ui::process_end_dialog(self, &ctx);
         }
@@ -1419,6 +1426,7 @@ impl eframe::App for TaskManApp {
             || self.run_dialog_open
             || self.affinity_dialog.is_some()
             || self.pending_session_logoff.is_some()
+            || self.pending_service_control.is_some()
             || self.pending_process_end.is_some()
             || self.pending_uac_virtualization.is_some()
             || self.startup_props.is_some()
