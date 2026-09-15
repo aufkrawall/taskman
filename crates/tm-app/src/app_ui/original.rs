@@ -32,6 +32,12 @@ pub const SIDEBAR_W_COLLAPSED: f32 = 54.0;
 /// directly above it is painted with (`TaskManApp::sync_title_bar`) — the two
 /// are meant to read as one surface.
 pub fn top_search_panel(app: &mut TaskManApp, ui_root: &mut egui::Ui, pal: &Palette) {
+    // The Performance page has nothing to search (its cards navigate by
+    // type-ahead), and a permanently visible but dead control reads as a bug.
+    // The strip itself stays on every tab: it keeps the sidebar inset and the
+    // extra native-title-bar drag regions identical, so the chrome does not
+    // jump when switching tabs.
+    let searchable = app.tab != crate::app::Tab::Performance;
     egui::Panel::top(egui::Id::new("topsearch"))
         .resizable(false)
         .frame(
@@ -40,7 +46,11 @@ pub fn top_search_panel(app: &mut TaskManApp, ui_root: &mut egui::Ui, pal: &Pale
                 .inner_margin(egui::Margin::symmetric(0, 6)),
         )
         .show(ui_root, |ui| {
-            let box_w = 495.0f32.min(ui.available_width() * 0.7);
+            let box_w = if searchable {
+                495.0f32.min(ui.available_width() * 0.7)
+            } else {
+                0.0
+            };
             let x = (ui.available_width() - box_w) / 2.0;
             let (rect, _) =
                 ui.allocate_exact_size(egui::vec2(ui.available_width(), 34.0), Sense::hover());
@@ -58,6 +68,10 @@ pub fn top_search_panel(app: &mut TaskManApp, ui_root: &mut egui::Ui, pal: &Pale
                 if drag_rect.width() > 0.0 {
                     titlebar_drag_region(ui, egui::Id::new(id), drag_rect);
                 }
+            }
+
+            if !searchable {
+                return;
             }
 
             ui.painter().rect_filled(box_rect, 16.0, pal.card_bg);
@@ -585,10 +599,7 @@ pub fn settings_dialog(app: &mut TaskManApp, ctx: &egui::Context, _pal: &theme::
                     (TextSmoothing::Smooth, K::SmoothingSmooth),
                 ] {
                     if ui
-                        .selectable_label(
-                            app.shared.settings.text_smoothing == mode,
-                            i18n::tr(key),
-                        )
+                        .selectable_label(app.shared.settings.text_smoothing == mode, i18n::tr(key))
                         .clicked()
                     {
                         app.shared.settings.text_smoothing = mode;
@@ -722,18 +733,14 @@ pub fn settings_dialog(app: &mut TaskManApp, ctx: &egui::Context, _pal: &theme::
                 )
                 .changed()
                 {
-                    match app
-                        .actions
-                        .set_start_with_windows(start_with_windows, true)
-                    {
+                    match app.actions.set_start_with_windows(start_with_windows, true) {
                         Ok(()) => {
                             app.shared.settings.start_with_windows = start_with_windows;
                             app.save_settings();
                         }
-                        Err(error) => app.shared.toast(i18n::trf(
-                            K::ErrMsg,
-                            &[&error.to_string()],
-                        )),
+                        Err(error) => app
+                            .shared
+                            .toast(i18n::trf(K::ErrMsg, &[&error.to_string()])),
                     }
                 }
             }
@@ -780,7 +787,7 @@ pub fn settings_dialog(app: &mut TaskManApp, ctx: &egui::Context, _pal: &theme::
             {
                 use tm_platform::actions::{CoreServiceState, TaskManagerReplacementState};
                 ui.add_space(14.0);
-                ui.heading("Advanced");
+                ui.heading(i18n::tr(K::AdvancedHeading));
 
                 ui.heading(i18n::tr(K::CoreServiceHeading));
                 app.poll_advanced_state(ctx);
@@ -818,17 +825,14 @@ pub fn settings_dialog(app: &mut TaskManApp, ctx: &egui::Context, _pal: &theme::
                             | CoreServiceState::Degraded(_)
                     )
                 );
-                let supported = core_state
-                    .as_ref()
-                    .is_some_and(|state| {
-                        !matches!(
-                            state,
-                            CoreServiceState::Unsupported | CoreServiceState::Starting
-                        )
-                    })
-                    && !app
-                        .core_service_change_inflight
-                        .load(std::sync::atomic::Ordering::Acquire);
+                let supported = core_state.as_ref().is_some_and(|state| {
+                    !matches!(
+                        state,
+                        CoreServiceState::Unsupported | CoreServiceState::Starting
+                    )
+                }) && !app
+                    .core_service_change_inflight
+                    .load(std::sync::atomic::Ordering::Acquire);
                 let button_key = match core_state.as_ref() {
                     Some(CoreServiceState::NotInstalled) => K::InstallCoreService,
                     Some(CoreServiceState::Stopped | CoreServiceState::Degraded(_)) => {
@@ -878,7 +882,7 @@ pub fn settings_dialog(app: &mut TaskManApp, ctx: &egui::Context, _pal: &theme::
                     if crate::widgets::controls::checkbox(
                         ui,
                         &mut replace,
-                        "Replace Windows Task Manager",
+                        i18n::tr(K::ReplaceTaskManager),
                         _pal,
                     )
                     .changed()
@@ -886,7 +890,7 @@ pub fn settings_dialog(app: &mut TaskManApp, ctx: &egui::Context, _pal: &theme::
                         let actions = app.actions.clone();
                         app.run_action(
                             ctx,
-                            || "Task Manager integration requested".to_string(),
+                            || i18n::tr(K::TmIntegrationRequested).to_string(),
                             move || actions.set_task_manager_replacement(replace),
                         );
                     }
@@ -896,33 +900,30 @@ pub fn settings_dialog(app: &mut TaskManApp, ctx: &egui::Context, _pal: &theme::
                             // a mismatch to live with: Windows cannot launch
                             // it, so the hotkey opens nothing at all — the
                             // built-in Task Manager included.
-                            let missing =
-                                tm_platform::win::replacement_target_missing(&value);
+                            let missing = tm_platform::win::replacement_target_missing(&value);
                             ui.label(
                                 egui::RichText::new(if missing {
-                                    "Ctrl+Shift+Esc points at a Taskman that no longer exists and currently opens nothing."
+                                    i18n::tr(K::TmRegistrationMissing)
                                 } else {
-                                    "Another Taskman installation is registered for Ctrl+Shift+Esc."
+                                    i18n::tr(K::TmRegistrationForeign)
                                 })
                                 .size(11.5)
                                 .color(_pal.text_dim),
                             );
-                            if ui.button("Repair").clicked() {
+                            if ui.button(i18n::tr(K::TmRepairButton)).clicked() {
                                 let actions = app.actions.clone();
                                 app.run_action(
                                     ctx,
-                                    || "Task Manager integration requested".to_string(),
+                                    || i18n::tr(K::TmIntegrationRequested).to_string(),
                                     move || actions.set_task_manager_replacement(true),
                                 );
                             }
                         }
                         TaskManagerReplacementState::Conflict(value) => {
                             ui.label(
-                                egui::RichText::new(format!(
-                                    "Another application currently replaces Task Manager: {value}"
-                                ))
-                                .size(11.5)
-                                .color(_pal.text_dim),
+                                egui::RichText::new(i18n::trf(K::TmReplacedByOther, &[&value]))
+                                    .size(11.5)
+                                    .color(_pal.text_dim),
                             );
                         }
                         _ => {}
@@ -990,8 +991,7 @@ pub fn settings_dialog(app: &mut TaskManApp, ctx: &egui::Context, _pal: &theme::
                     #[cfg_attr(not(target_os = "windows"), allow(unused_mut))]
                     let mut defaults = Settings::default();
                     #[cfg(target_os = "windows")]
-                    if let Err(error) = app.actions.set_start_with_windows(false, true)
-                    {
+                    if let Err(error) = app.actions.set_start_with_windows(false, true) {
                         // The registry is authoritative for autostart. If it
                         // could not be cleared, keep the matching setting and
                         // surface the mismatch instead of claiming a reset.
@@ -1053,16 +1053,11 @@ pub fn process_end_dialog(app: &mut TaskManApp, ctx: &egui::Context) {
     let mut end_focused: bool = ctx.data(|d| d.get_temp(focus_id)).unwrap_or(false);
 
     let keys = consume_dialog_keys(ctx, true);
-    end_focused = update_end_task_dialog_focus(
-        end_focused,
-        keys.tab,
-        keys.shift_tab,
-        keys.left,
-        keys.right,
-    );
+    end_focused =
+        update_end_task_dialog_focus(end_focused, keys.tab, keys.shift_tab, keys.left, keys.right);
 
-    let mut decision = dialog_key_decision(keys, end_focused, true)
-        .map(|d| matches!(d, DialogDecision::Primary));
+    let mut decision =
+        dialog_key_decision(keys, end_focused, true).map(|d| matches!(d, DialogDecision::Primary));
 
     let pal = crate::theme::palette_ctx(ctx);
     egui::Window::new(i18n::tr(K::EndTask))
@@ -1608,13 +1603,10 @@ pub fn dialog_button_row(
     let mut click = DialogButtonClick::None;
     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
         let primary_resp = primary.map(|(label, enabled)| {
-            let mut button = egui::Button::new(
-                egui::RichText::new(label)
-                    .color(pal.accent_text)
-                    .strong(),
-            )
-            .min_size(btn_size)
-            .fill(pal.accent);
+            let mut button =
+                egui::Button::new(egui::RichText::new(label).color(pal.accent_text).strong())
+                    .min_size(btn_size)
+                    .fill(pal.accent);
             if *focused {
                 button = button.stroke(Stroke::new(2.0, Color32::WHITE));
             }
@@ -1801,41 +1793,61 @@ mod tests {
         assert_eq!(dialog_key_decision(none, false, true), None);
 
         assert_eq!(
-            dialog_key_decision(DialogKeys {
-                escape: true,
-                ..none
-            }, true, true),
+            dialog_key_decision(
+                DialogKeys {
+                    escape: true,
+                    ..none
+                },
+                true,
+                true
+            ),
             Some(DialogDecision::Safe)
         );
         // Unfocused Enter/Space -> safe.
         assert_eq!(
-            dialog_key_decision(DialogKeys {
-                enter: true,
-                ..none
-            }, false, true),
+            dialog_key_decision(
+                DialogKeys {
+                    enter: true,
+                    ..none
+                },
+                false,
+                true
+            ),
             Some(DialogDecision::Safe)
         );
         assert_eq!(
-            dialog_key_decision(DialogKeys {
-                space: true,
-                ..none
-            }, false, true),
+            dialog_key_decision(
+                DialogKeys {
+                    space: true,
+                    ..none
+                },
+                false,
+                true
+            ),
             Some(DialogDecision::Safe)
         );
         // Focused primary -> primary.
         assert_eq!(
-            dialog_key_decision(DialogKeys {
-                enter: true,
-                ..none
-            }, true, true),
+            dialog_key_decision(
+                DialogKeys {
+                    enter: true,
+                    ..none
+                },
+                true,
+                true
+            ),
             Some(DialogDecision::Primary)
         );
         // Focused but DISABLED primary still falls back to safe.
         assert_eq!(
-            dialog_key_decision(DialogKeys {
-                enter: true,
-                ..none
-            }, true, false),
+            dialog_key_decision(
+                DialogKeys {
+                    enter: true,
+                    ..none
+                },
+                true,
+                false
+            ),
             Some(DialogDecision::Safe)
         );
     }

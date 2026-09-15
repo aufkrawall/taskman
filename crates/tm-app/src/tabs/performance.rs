@@ -1257,9 +1257,9 @@ fn cpu_page(app: &mut TaskManApp, ui: &mut egui::Ui, pal: &Palette) {
                         other => other,
                     },
                 );
-                kv_row(ui, pal, "L1-Cache:", &gb(snap.cpu.l1_kb));
-                kv_row(ui, pal, "L2-Cache:", &gb(snap.cpu.l2_kb));
-                kv_row(ui, pal, "L3-Cache:", &gb(snap.cpu.l3_kb));
+                kv_row(ui, pal, i18n::tr(K::KvL1Cache), &gb(snap.cpu.l1_kb));
+                kv_row(ui, pal, i18n::tr(K::KvL2Cache), &gb(snap.cpu.l2_kb));
+                kv_row(ui, pal, i18n::tr(K::KvL3Cache), &gb(snap.cpu.l3_kb));
             });
         },
     );

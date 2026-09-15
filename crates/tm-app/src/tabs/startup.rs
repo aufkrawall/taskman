@@ -200,6 +200,7 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
         Some((app.startup_sort.column, app.startup_sort.ascending)),
         None,
         visible.len(),
+        (!q.is_empty()).then_some(i18n::tr(K::NoMatches)),
         None,
         None,
         |ui, table, _avail, _content_w, range| {
@@ -223,7 +224,7 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
                     pal.text,
                 );
 
-                table.text_cell(
+                let pub_truncated = table.text_cell(
                     ui,
                     rect,
                     1,
@@ -251,6 +252,14 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
                     &pal,
                     false,
                 );
+
+                // A clipped cell cannot show its content; the full value
+                // becomes the row tooltip (before the context menu attaches).
+                let resp = if pub_truncated && item.publisher.is_some() {
+                    resp.on_hover_text(item.publisher.as_deref().unwrap_or_default())
+                } else {
+                    resp
+                };
 
                 if resp.clicked() {
                     app.selected_startup_id = Some(item.id.clone());
@@ -355,27 +364,23 @@ fn toggle_item(app: &mut TaskManApp, ctx: &egui::Context, id: String, new_enable
             i18n::tr(K::DisabledWord).to_string()
         }
     };
-    app.run_action(
-        ctx,
-        ok_msg,
-        move || {
-            let location = tm_core::sync::lock(&cache)
-                .as_ref()
-                .and_then(|(items, _)| items.iter().find(|it| it.id == id))
-                .map(|it| it.location.clone())
-                .unwrap_or_default();
-            let result = actions.set_startup_enabled(&id, &location, new_enabled);
-            if result.is_err() {
-                let mut guard = tm_core::sync::lock(&cache);
-                if let Some((items, _)) = guard.as_mut()
-                    && let Some(item) = items.iter_mut().find(|it| it.id == id)
-                {
-                    item.enabled = !new_enabled;
-                }
+    app.run_action(ctx, ok_msg, move || {
+        let location = tm_core::sync::lock(&cache)
+            .as_ref()
+            .and_then(|(items, _)| items.iter().find(|it| it.id == id))
+            .map(|it| it.location.clone())
+            .unwrap_or_default();
+        let result = actions.set_startup_enabled(&id, &location, new_enabled);
+        if result.is_err() {
+            let mut guard = tm_core::sync::lock(&cache);
+            if let Some((items, _)) = guard.as_mut()
+                && let Some(item) = items.iter_mut().find(|it| it.id == id)
+            {
+                item.enabled = !new_enabled;
             }
-            result
-        },
-    )
+        }
+        result
+    })
 }
 
 fn toggle_selected(app: &mut TaskManApp, enable: bool, ctx: &egui::Context) {

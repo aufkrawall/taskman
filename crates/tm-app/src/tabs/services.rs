@@ -210,6 +210,7 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
         Some((app.services_sort.column, app.services_sort.ascending)),
         None,
         rows.len(),
+        (!q.is_empty()).then_some(i18n::tr(K::NoMatches)),
         None,
         None,
         |ui, table, _avail, _content_w, range| {
@@ -241,9 +242,19 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
                     egui::FontId::proportional(tablekit::FONT_ROW),
                     pal.text,
                 );
-                table.text_cell(ui, rect, 2, &s.display_name, &pal, false);
+                let display_truncated = table.text_cell(ui, rect, 2, &s.display_name, &pal, false);
                 table.text_cell(ui, rect, 3, status_label(app, s.status), &pal, false);
-                table.text_cell(ui, rect, 4, &s.group, &pal, false);
+                let group_truncated = table.text_cell(ui, rect, 4, &s.group, &pal, false);
+
+                // A clipped cell cannot show its content; the full value
+                // becomes the row tooltip (before the context menu attaches).
+                let resp = if display_truncated {
+                    resp.on_hover_text(s.display_name.as_str())
+                } else if group_truncated {
+                    resp.on_hover_text(s.group.as_str())
+                } else {
+                    resp
+                };
 
                 if resp.clicked() {
                     app.services_selected_name = Some(s.name.clone());
@@ -299,9 +310,9 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
                             .as_ref()
                             .and_then(|snapshot| snapshot.process(pid))
                             .and_then(|process| process.start_epoch_s);
-                        app.pending_details_focus = Some(crate::app::PendingDetailsFocus(
+                        app.pending_details_focus = Some(crate::app::PendingDetailsFocus(vec![
                             crate::app::ProcessIdentity { pid, start_epoch_s },
-                        ));
+                        ]));
                         app.tab = crate::app::Tab::Details;
                         ui.close();
                     }

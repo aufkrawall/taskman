@@ -435,6 +435,7 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
         )),
         Some(&aggs),
         rows.len(),
+        (!app.search.is_empty()).then_some(i18n::tr(K::NoMatches)),
         focus_row,
         Some(anchor),
         |ui, table, _avail, content_w, range| {
@@ -670,6 +671,20 @@ fn process_identity(process: &ProcessEntry) -> crate::app::ProcessIdentity {
     }
 }
 
+/// Processes to land on in Details for this visible row: a concrete process
+/// is itself; a group row carries every member so the whole group arrives
+/// selected there (double-click and "Go to details" share this semantics).
+fn details_focus_targets(row: &RowData) -> Vec<crate::app::ProcessIdentity> {
+    if row.aggregate {
+        row.termination_targets.clone()
+    } else {
+        vec![crate::app::ProcessIdentity {
+            pid: row.pid,
+            start_epoch_s: row.start_epoch_s,
+        }]
+    }
+}
+
 fn identity_of(row: &RowData) -> crate::app::ProcessIdentity {
     crate::app::ProcessIdentity {
         pid: row.pid,
@@ -902,11 +917,13 @@ fn row_ui(
         pal.accent,
     );
     let name_rect = table.col_rect(0, rect);
+    let name_x = name_rect.left() + 56.0 + row.depth as f32 * 22.0;
+    // The name is painted clipped; when the column is too narrow the full
+    // name becomes a fallback row tooltip (lowest precedence below).
+    let name_truncated =
+        tablekit::text_width(ui, &row.name, tablekit::FONT_ROW) + 10.0 > name_rect.right() - name_x;
     ui.painter_at(name_rect).text(
-        egui::Pos2::new(
-            name_rect.left() + 56.0 + row.depth as f32 * 22.0,
-            rect.center().y,
-        ),
+        egui::Pos2::new(name_x, rect.center().y),
         egui::Align2::LEFT_CENTER,
         &row.name,
         egui::FontId::proportional(tablekit::FONT_ROW),
@@ -939,6 +956,9 @@ fn row_ui(
             .then(|| unknown_cell_tip(ui, table, rect, app.processes_state.display_col(2 + li), li))
             .flatten()
     });
+    // Lowest precedence: only when nothing more specific applies does a
+    // truncated name explain itself.
+    let name_tip = name_truncated.then_some(row.name.clone());
 
     if resp.clicked() {
         if row.synthetic {
@@ -969,14 +989,23 @@ fn row_ui(
     if resp.secondary_clicked() && selectable && !app.selection.contains_pid(row.pid) {
         app.selection.select_single(identity_of(row));
     }
+    // Native gesture: double-click opens the row on the Details page. A group
+    // row carries every member, so the whole group lands selected there; the
+    // first click of the gesture merely selected, which is harmless.
+    if resp.double_clicked() && !row.synthetic {
+        app.pending_details_focus =
+            Some(crate::app::PendingDetailsFocus(details_focus_targets(row)));
+        app.tab = crate::app::Tab::Details;
+    }
     // on_hover_text/context_menu consume the response (builder style). A
     // status glyph under the cursor explains itself first; otherwise the
     // row's own explanation (e.g. unattributable CPU) applies.
-    let resp = match (status_tip, net_tip, &row.tooltip) {
-        (Some(tip), _, _) => resp.on_hover_text(tip),
-        (None, Some(tip), _) => resp.on_hover_text(tip),
-        (None, None, Some(tip)) => resp.on_hover_text(tip),
-        (None, None, None) => resp,
+    let resp = match (status_tip, net_tip, row.tooltip.clone(), name_tip) {
+        (Some(tip), _, _, _) => resp.on_hover_text(tip),
+        (None, Some(tip), _, _) => resp.on_hover_text(tip),
+        (None, None, Some(tip), _) => resp.on_hover_text(tip),
+        (None, None, None, Some(tip)) => resp.on_hover_text(tip),
+        (None, None, None, None) => resp,
     };
     // Pseudo-rows carry no killable process — no action menu at all.
     if !row.synthetic {
@@ -1169,12 +1198,8 @@ fn context_menu(app: &mut TaskManApp, ui: &mut egui::Ui, row: &RowData) {
         ui.close();
     }
     if menu::item(ui, i18n::tr(K::GoToDetails)).clicked() {
-        app.pending_details_focus = Some(crate::app::PendingDetailsFocus(
-            crate::app::ProcessIdentity {
-                pid: row.pid,
-                start_epoch_s: row.start_epoch_s,
-            },
-        ));
+        app.pending_details_focus =
+            Some(crate::app::PendingDetailsFocus(details_focus_targets(row)));
         app.tab = crate::app::Tab::Details;
         ui.close();
     }

@@ -232,9 +232,12 @@ impl Drop for SharedState {
     }
 }
 
-/// Cross-tab navigation target: select exactly this process in Details.
+/// Cross-tab navigation target: select these processes in Details. The first
+/// entry is the primary (the row the user pointed at and the scroll target);
+/// a Processes group row carries every member, so opening a group lands with
+/// the whole group selected — native Task Manager's double-click gesture.
 #[derive(Debug, Clone)]
-pub struct PendingDetailsFocus(pub ProcessIdentity);
+pub struct PendingDetailsFocus(pub Vec<ProcessIdentity>);
 
 /// Destructive action parked behind an explicit confirmation.
 ///
@@ -1239,7 +1242,8 @@ fn check_task_manager_replacement(
     let spawned = std::thread::Builder::new()
         .name("tm-taskmgr-check".into())
         .spawn(move || {
-            let TaskManagerReplacementState::Stale(value) = actions.task_manager_replacement_state()
+            let TaskManagerReplacementState::Stale(value) =
+                actions.task_manager_replacement_state()
             else {
                 return;
             };
@@ -1258,10 +1262,7 @@ fn check_task_manager_replacement(
                         registered = %value,
                         "the Task Manager registration names a missing executable"
                     );
-                    toast_from(
-                        &toasts,
-                        "Ctrl+Shift+Esc points at a Taskman that no longer exists. Open Settings to repair it.",
-                    );
+                    toast_from(&toasts, i18n::tr(K::TmStaleRepairToast));
                     ctx.request_repaint();
                 }
                 Err(error) => {
@@ -1452,9 +1453,10 @@ impl eframe::App for TaskManApp {
         // Global search shortcut (audit §5): Alt+F as documented by native
         // Task Manager, plus Ctrl+F as most users expect. egui ignores
         // ctrl-modified characters inside text edits, so this cannot leak
-        // an 'f' into whatever field currently holds focus.
-        let search_focus =
-            ctx.input(|i| i.key_pressed(egui::Key::F) && (i.modifiers.alt || i.modifiers.ctrl));
+        // an 'f' into whatever field currently holds focus. The Performance
+        // page shows no search box, so the shortcut must not target one.
+        let search_focus = self.tab != Tab::Performance
+            && ctx.input(|i| i.key_pressed(egui::Key::F) && (i.modifiers.alt || i.modifiers.ctrl));
         if search_focus {
             let id = egui::Id::new("global-search");
             ctx.memory_mut(|m| m.request_focus(id));

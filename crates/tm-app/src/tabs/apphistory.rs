@@ -178,6 +178,7 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
         Some((app.app_history_sort.column, app.app_history_sort.ascending)),
         None,
         rows.len(),
+        (!q.is_empty()).then_some(i18n::tr(K::NoMatches)),
         None,
         None,
         |ui, table, _avail, _content_w, range| {

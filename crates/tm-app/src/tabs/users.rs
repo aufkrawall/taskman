@@ -419,6 +419,7 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
         )),
         Some(&aggs_hdr),
         rows.len(),
+        (!q.is_empty()).then_some(i18n::tr(K::NoMatches)),
         None,
         None,
         |ui, table, _avail, _content_w, range| {

@@ -488,6 +488,7 @@ pub fn dialog(app: &mut TaskManApp, ctx: &egui::Context, pal: &theme::Palette) {
                         Some((sorted, state.ascending)),
                         None,
                         rows.len(),
+                        (!state.filter.trim().is_empty()).then_some(i18n::tr(K::NoMatches)),
                         focus,
                         None,
                         |ui, table, _avail, _content_width, range| {
@@ -498,7 +499,8 @@ pub fn dialog(app: &mut TaskManApp, ctx: &egui::Context, pal: &theme::Palette) {
                                 let selected = state.selected_base == Some(module.base_address);
                                 let (rect, response) =
                                     table.row(ui, pal, selected, module.base_address);
-                                table.text_cell(ui, rect, 0, &module.name, pal, false);
+                                let name_truncated =
+                                    table.text_cell(ui, rect, 0, &module.name, pal, false);
                                 let base = format!("0x{:016X}", module.base_address);
                                 let base_cell = table.col_rect(1, rect);
                                 ui.painter_at(base_cell).text(
@@ -517,7 +519,18 @@ pub fn dialog(app: &mut TaskManApp, ctx: &egui::Context, pal: &theme::Palette) {
                                     egui::FontId::proportional(tablekit::FONT_ROW),
                                     pal.text,
                                 );
-                                table.text_cell(ui, rect, 3, &module.path, pal, true);
+                                let path_truncated =
+                                    table.text_cell(ui, rect, 3, &module.path, pal, true);
+                                // A clipped cell cannot show its content; the
+                                // full value becomes the row tooltip (before
+                                // the context menu attaches).
+                                let response = if path_truncated {
+                                    response.on_hover_text(module.path.as_str())
+                                } else if name_truncated {
+                                    response.on_hover_text(module.name.as_str())
+                                } else {
+                                    response
+                                };
                                 if response.clicked() || response.secondary_clicked() {
                                     state.selected_base = Some(module.base_address);
                                 }

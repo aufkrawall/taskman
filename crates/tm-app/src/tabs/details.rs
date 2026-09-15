@@ -1077,10 +1077,10 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
     }
 
     if let Some(focus) = app.pending_details_focus.take() {
-        app.selection.select_single(focus.0.clone());
+        app.selection.select_exact(&focus.0);
         app.search.clear();
         app.details_state.filter.clear();
-        app.scroll_to_pid = Some(focus.0.pid);
+        app.scroll_to_pid = focus.0.first().map(|identity| identity.pid);
     }
 
     let visible_cols = app.details_state.ordered_visible();
@@ -1178,6 +1178,8 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
         sorted_pos.and_then(|p| app.details_state.sort_order.arrow().map(|asc| (p, asc))),
         None,
         rows.len(),
+        (!(app.search.is_empty() && app.details_state.filter.is_empty()))
+            .then_some(i18n::tr(K::NoMatches)),
         focus_row,
         Some(anchor),
         |ui, table, _avail, _content_w, range| {
@@ -1185,6 +1187,9 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
                 let Some(row) = rows.get(i) else { continue };
                 let selected = app.selection.contains_pid(row.pid);
                 let (rect, resp) = table.row(ui, &pal, selected, (row.pid, row.start_epoch_s));
+                // A clipped cell cannot show its content; the full value
+                // becomes the row tooltip (only set when something clipped).
+                let mut truncated_tip: Option<String> = None;
 
                 // Name decorations follow the Name column even after it has
                 // been moved away from the first position.
@@ -1211,11 +1216,14 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
                             .as_ref()
                             .and_then(|p| app.shared.icons.get(ui.ctx(), &app.actions, p, 6));
                         table.icon_cell(ui, indented_cell, tex.as_ref(), pal.accent);
+                        let name_x = cell.left() + 56.0 + row.depth as f32 * TREE_INDENT;
+                        if tablekit::text_width(ui, &row.name, tablekit::FONT_ROW) + 10.0
+                            > cell.right() - name_x
+                        {
+                            truncated_tip = Some(row.name.clone());
+                        }
                         ui.painter_at(cell).text(
-                            egui::Pos2::new(
-                                cell.left() + 56.0 + row.depth as f32 * TREE_INDENT,
-                                rect.center().y,
-                            ),
+                            egui::Pos2::new(name_x, rect.center().y),
                             egui::Align2::LEFT_CENTER,
                             &row.name,
                             egui::FontId::proportional(tablekit::FONT_ROW),
@@ -1264,9 +1272,18 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
                             pal.text,
                         );
                     } else {
-                        table.text_cell(ui, rect, pos, text, &pal, false);
+                        if table.text_cell(ui, rect, pos, text, &pal, false) {
+                            truncated_tip = Some(text.to_string());
+                        }
                     }
                 }
+
+                // on_hover_text consumes the response, so the truncation tip
+                // attaches before the context menu does.
+                let resp = match truncated_tip {
+                    Some(tip) => resp.on_hover_text(tip),
+                    None => resp,
+                };
 
                 if resp.clicked() {
                     let kind = crate::selection::ClickKind::from_modifiers(
@@ -1529,7 +1546,7 @@ fn select_columns_dialog(app: &mut TaskManApp, ctx: &egui::Context, pal: &theme:
                                             can_down,
                                             pal,
                                         )
-                                        .on_hover_text("Move column down")
+                                        .on_hover_text(i18n::tr(K::MoveColumnDown))
                                         .clicked()
                                         {
                                             app.details_state.move_visible(cid, 1);
@@ -1541,7 +1558,7 @@ fn select_columns_dialog(app: &mut TaskManApp, ctx: &egui::Context, pal: &theme:
                                             can_up,
                                             pal,
                                         )
-                                        .on_hover_text("Move column up")
+                                        .on_hover_text(i18n::tr(K::MoveColumnUp))
                                         .clicked()
                                         {
                                             app.details_state.move_visible(cid, -1);

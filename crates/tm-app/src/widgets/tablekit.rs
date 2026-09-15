@@ -369,6 +369,7 @@ pub fn scrolled_rows(
     sort: Option<(usize, bool)>,
     aggregates: Option<&[String]>,
     row_count: usize,
+    empty_message: Option<&str>,
     focus_row: Option<usize>,
     anchor: Option<ScrollAnchor<'_>>,
     rows: impl FnOnce(&mut egui::Ui, &TmTable, f32, f32, std::ops::Range<usize>),
@@ -460,9 +461,23 @@ pub fn scrolled_rows(
             Some(y) => area.vertical_scroll_offset(y),
             None => area,
         };
-        area.show_rows(ui, row_h, row_count, |ui, range| {
-            rows(ui, table, avail, avail.max(content_w), range)
-        })
+        // An EMPTY filtered list must not look like an empty system: the
+        // caller says so (only while a search/filter is active) and the
+        // message fills the body below the still-drawn header.
+        if row_count == 0
+            && let Some(message) = empty_message
+        {
+            area.show(ui, |ui| {
+                ui.set_min_height((viewport_h - BODY_PAD_BOTTOM as f32).max(row_h * 3.0));
+                ui.centered_and_justified(|ui| {
+                    ui.label(egui::RichText::new(message).color(pal.text_dim));
+                });
+            })
+        } else {
+            area.show_rows(ui, row_h, row_count, |ui, range| {
+                rows(ui, table, avail, avail.max(content_w), range)
+            })
+        }
     };
 
     store_bar_use(ui, id, body_outer, body.inner_rect);
@@ -1044,6 +1059,9 @@ impl TmTable {
 
     /// Left-aligned text cell. The painter is clipped to this exact cell so
     /// long values can never bleed into the neighbouring column.
+    /// Paint a left-aligned text cell clipped to its column. Returns whether
+    /// the text was clipped by the cell — the caller can turn that into a
+    /// full-value hover tooltip on the row response.
     pub fn text_cell(
         &self,
         ui: &egui::Ui,
@@ -1052,8 +1070,9 @@ impl TmTable {
         text: &str,
         pal: &Palette,
         dim: bool,
-    ) {
+    ) -> bool {
         let cell = self.col_rect(i, row);
+        let truncated = text_width(ui, text, FONT_ROW) + 10.0 > cell.width();
         ui.painter_at(cell).text(
             Pos2::new(cell.left() + 10.0, cell.center().y),
             Align2::LEFT_CENTER,
@@ -1061,6 +1080,7 @@ impl TmTable {
             FontId::proportional(FONT_ROW),
             if dim { pal.text_dim } else { pal.text },
         );
+        truncated
     }
 
     /// Paint the blue value band for the numeric columns starting at `from`.
@@ -1727,6 +1747,7 @@ mod tests {
                             3,
                             None,
                             None,
+                            None,
                             |ui, table, _a, _c, range| {
                                 for i in range {
                                     table.row(ui, &crate::theme::DARK, false, i);
@@ -1801,6 +1822,7 @@ mod tests {
                             400,
                             None,
                             None,
+                            None,
                             |ui, table, _a, _c, range| {
                                 body_right.set(ui.clip_rect().right());
                                 for i in range {
@@ -1871,6 +1893,7 @@ mod tests {
                             None,
                             None,
                             100,
+                            None,
                             focus,
                             None,
                             |ui, table, _a, _c, range| {
@@ -1949,6 +1972,7 @@ mod tests {
                         None,
                         None,
                         row_count,
+                        None,
                         focus,
                         Some(ScrollAnchor {
                             model_changed,

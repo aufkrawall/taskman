@@ -100,6 +100,14 @@ impl Selection {
         self.anchor = Some(identity);
     }
 
+    /// Replace the selection with an explicit set whose FIRST entry is the
+    /// primary — the row the user actually pointed at (cross-tab group jumps).
+    pub fn select_exact(&mut self, identities: &[ProcessIdentity]) {
+        self.items = identities.to_vec();
+        self.primary = identities.first().cloned();
+        self.anchor = identities.first().cloned();
+    }
+
     /// Ctrl+click: add or remove one row without disturbing the rest.
     pub fn toggle(&mut self, identity: ProcessIdentity, order: &[ProcessIdentity]) {
         if let Some(at) = self.items.iter().position(|item| *item == identity) {

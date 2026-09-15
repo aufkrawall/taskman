@@ -132,6 +132,7 @@ keys! {
     ClearSearch => ["Suche löschen", "Clear search"],
     Settings => ["Einstellungen", "Settings"],
     GatheringData => ["Sammle Daten…", "Gathering data…"],
+    NoMatches => ["Keine Treffer für die aktuelle Suche", "No matches for the current search"],
     TrayOpen => ["TaskMan öffnen", "Open TaskMan"],
     TrayExit => ["TaskMan beenden", "Exit TaskMan"],
 
@@ -361,6 +362,8 @@ keys! {
     ],
     SelectColumns => ["Spalten auswählen…", "Select columns…"],
     ColumnRequired => ["Erforderlich", "Required"],
+    MoveColumnUp => ["Spalte nach oben", "Move column up"],
+    MoveColumnDown => ["Spalte nach unten", "Move column down"],
 
     // ------------------------------------------------ statuses
     StRunning => ["Wird ausgeführt", "Running"],
@@ -552,6 +555,32 @@ keys! {
         "Switch to installed copy…"
     ],
     RemoveCoreService => ["Core-Dienst entfernen…", "Remove core service…"],
+    AdvancedHeading => ["Erweitert", "Advanced"],
+    ReplaceTaskManager => [
+        "Windows Task-Manager ersetzen",
+        "Replace Windows Task Manager"
+    ],
+    TmIntegrationRequested => [
+        "Task-Manager-Integration angefordert",
+        "Task Manager integration requested"
+    ],
+    TmRegistrationMissing => [
+        "Strg+Umschalt+Esc zeigt auf einen Taskman, der nicht mehr existiert, und öffnet derzeit gar nichts.",
+        "Ctrl+Shift+Esc points at a Taskman that no longer exists and currently opens nothing."
+    ],
+    TmRegistrationForeign => [
+        "Eine andere Taskman-Installation ist für Strg+Umschalt+Esc registriert.",
+        "Another Taskman installation is registered for Ctrl+Shift+Esc."
+    ],
+    TmStaleRepairToast => [
+        "Strg+Umschalt+Esc zeigt auf einen Taskman, der nicht mehr existiert. In den Einstellungen reparieren.",
+        "Ctrl+Shift+Esc points at a Taskman that no longer exists. Open Settings to repair it."
+    ],
+    TmRepairButton => ["Reparieren", "Repair"],
+    TmReplacedByOther => [
+        "Der Task-Manager wird derzeit von einer anderen Anwendung ersetzt: {}",
+        "Another application currently replaces Task Manager: {}"
+    ],
     CoreServiceInstallRequested => [
         "Dienstinstallation angefordert. TaskMan danach schließen und neu öffnen; der geschützte Start erfolgt automatisch.",
         "Service installation requested. Close and reopen TaskMan afterward; the protected copy starts automatically."
@@ -643,6 +672,9 @@ keys! {
     KvCores => ["Kerne:", "Cores:"],
     KvLogical => ["Logische Prozessoren:", "Logical processors:"],
     KvVirtualization => ["Virtualisierung:", "Virtualization:"],
+    KvL1Cache => ["L1-Cache:", "L1 cache:"],
+    KvL2Cache => ["L2-Cache:", "L2 cache:"],
+    KvL3Cache => ["L3-Cache:", "L3 cache:"],
     VirtEnabled => ["Aktiviert", "Enabled"],
     VirtDisabled => ["Deaktiviert", "Disabled"],
     MemTitle => ["Arbeitsspeicher", "Memory"],
