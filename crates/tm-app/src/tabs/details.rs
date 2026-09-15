@@ -1483,6 +1483,10 @@ fn select_columns_dialog(app: &mut TaskManApp, ctx: &egui::Context, pal: &theme:
         return;
     }
     let mut open = true;
+    // Esc and Enter close, mirroring the Close button. Space stays ordinary
+    // text so focused checkboxes keep toggling via egui.
+    let keys = crate::app_ui::consume_dialog_keys(ctx, false);
+    let close_now = keys.escape || keys.enter;
     egui::Window::new(i18n::tr(K::SelectColumns))
         .open(&mut open)
         .collapsible(false)
@@ -1556,7 +1560,7 @@ fn select_columns_dialog(app: &mut TaskManApp, ctx: &egui::Context, pal: &theme:
                 }
             });
         });
-    if !open {
+    if !open || close_now {
         app.details_state.select_columns_open = false;
     }
 }
@@ -3666,6 +3670,9 @@ pub fn process_properties_dialog(app: &mut TaskManApp, ctx: &egui::Context) {
     );
     let mut open = true;
     let mut close_clicked = false;
+    // Esc and Enter close, mirroring the Close button.
+    let keys = crate::app_ui::consume_dialog_keys(ctx, false);
+    let close_now = keys.escape || keys.enter;
 
     egui::Window::new(title)
         .open(&mut open)
@@ -3792,7 +3799,7 @@ pub fn process_properties_dialog(app: &mut TaskManApp, ctx: &egui::Context) {
             });
         });
 
-    if open && !close_clicked {
+    if open && !close_clicked && !close_now {
         app.proc_props = Some(dialog);
     }
 }
@@ -3824,6 +3831,21 @@ pub fn affinity_dialog(app: &mut TaskManApp, ctx: &egui::Context, pal: &theme::P
     let mut open = true;
     let mut apply = false;
     let mut cancel = false;
+    let apply_enabled = dialog.mask.is_some_and(|mask| mask != 0) && dialog.error.is_none();
+    let focus_id = egui::Id::new("affinity-dialog-focus-primary");
+    // Changing affinity is destructive: the SAFE action owns the keyboard
+    // default, so Escape and an unfocused Enter both cancel. Space stays
+    // ordinary text so focused CPU checkboxes keep toggling via egui.
+    let keys = crate::app_ui::consume_dialog_keys(ctx, false);
+    let mut focused: bool = ctx.data(|d| d.get_temp(focus_id)).unwrap_or(false);
+    focused = crate::app_ui::update_end_task_dialog_focus(
+        focused,
+        keys.tab,
+        keys.shift_tab,
+        keys.left,
+        keys.right,
+    );
+    let key_decision = crate::app_ui::dialog_key_decision(keys, focused, apply_enabled);
     egui::Window::new(title)
         .open(&mut open)
         .collapsible(false)
@@ -3914,21 +3936,25 @@ pub fn affinity_dialog(app: &mut TaskManApp, ctx: &egui::Context, pal: &theme::P
                 let _ = save;
             }
             ui.add_space(8.0);
-            ui.horizontal(|ui| {
-                if ui.button(i18n::tr(K::Cancel)).clicked() {
-                    cancel = true;
-                }
-                if ui
-                    .add_enabled(
-                        dialog.mask.is_some_and(|mask| mask != 0) && dialog.error.is_none(),
-                        egui::Button::new(i18n::tr(K::Apply)),
-                    )
-                    .clicked()
-                {
-                    apply = true;
-                }
-            });
+            match crate::app_ui::dialog_button_row(
+                ui,
+                ctx,
+                pal,
+                i18n::tr(K::Cancel),
+                Some((i18n::tr(K::Apply), apply_enabled)),
+                &mut focused,
+            ) {
+                crate::app_ui::DialogButtonClick::Safe => cancel = true,
+                crate::app_ui::DialogButtonClick::Primary => apply = true,
+                crate::app_ui::DialogButtonClick::None => {}
+            }
         });
+    ctx.data_mut(|d| d.insert_temp(focus_id, focused));
+    match key_decision {
+        Some(crate::app_ui::DialogDecision::Safe) => cancel = true,
+        Some(crate::app_ui::DialogDecision::Primary) => apply = true,
+        None => {}
+    }
     if apply {
         let mask = dialog.mask.expect("apply requires a loaded affinity mask");
         set_affinity_for_targets(app, ctx, dialog.targets.clone(), mask);

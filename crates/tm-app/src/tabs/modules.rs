@@ -359,11 +359,17 @@ pub fn dialog(app: &mut TaskManApp, ctx: &egui::Context, pal: &theme::Palette) {
         _ => None,
     };
 
+    // Esc closes the dialog like the X button does — but only while the
+    // unload confirmation is not up; that window owns the keyboard then.
+    let close_now = state.pending_unload.is_none()
+        && ctx.input_mut(|input| input.consume_key(Default::default(), egui::Key::Escape));
+
     egui::Window::new(title)
         .open(&mut open)
         .default_size([850.0, 520.0])
         .min_size([560.0, 320.0])
         .resizable(true)
+        .collapsible(false)
         .show(ctx, |ui| {
             ui.horizontal(|ui| {
                 ui.add(
@@ -585,7 +591,20 @@ pub fn dialog(app: &mut TaskManApp, ctx: &egui::Context, pal: &theme::Palette) {
 
     let mut confirmed = None;
     if let Some(module) = state.pending_unload.as_ref() {
+        let confirm_focus_id = egui::Id::new("unload-confirm-focus-primary");
         let mut confirm_open = true;
+        // Unloading can crash the target: the SAFE action owns the default,
+        // so Escape and an unfocused Enter both cancel.
+        let keys = crate::app_ui::consume_dialog_keys(ctx, true);
+        let mut focused: bool = ctx.data(|d| d.get_temp(confirm_focus_id)).unwrap_or(false);
+        focused = crate::app_ui::update_end_task_dialog_focus(
+            focused,
+            keys.tab,
+            keys.shift_tab,
+            keys.left,
+            keys.right,
+        );
+        let key_decision = crate::app_ui::dialog_key_decision(keys, focused, true);
         egui::Window::new(i18n::tr(K::UnloadModule))
             .open(&mut confirm_open)
             .collapsible(false)
@@ -600,15 +619,25 @@ pub fn dialog(app: &mut TaskManApp, ctx: &egui::Context, pal: &theme::Palette) {
                 ui.add_space(6.0);
                 ui.colored_label(pal.heat_high, i18n::tr(K::UnloadModuleWarning));
                 ui.add_space(10.0);
-                ui.horizontal(|ui| {
-                    if ui.button(i18n::tr(K::Cancel)).clicked() {
-                        confirmed = Some(false);
-                    }
-                    if ui.button(i18n::tr(K::UnloadModule)).clicked() {
-                        confirmed = Some(true);
-                    }
-                });
+                match crate::app_ui::dialog_button_row(
+                    ui,
+                    ctx,
+                    pal,
+                    i18n::tr(K::Cancel),
+                    Some((i18n::tr(K::UnloadModule), true)),
+                    &mut focused,
+                ) {
+                    crate::app_ui::DialogButtonClick::Safe => confirmed = Some(false),
+                    crate::app_ui::DialogButtonClick::Primary => confirmed = Some(true),
+                    crate::app_ui::DialogButtonClick::None => {}
+                }
             });
+        ctx.data_mut(|d| d.insert_temp(confirm_focus_id, focused));
+        match key_decision {
+            Some(crate::app_ui::DialogDecision::Safe) => confirmed = Some(false),
+            Some(crate::app_ui::DialogDecision::Primary) => confirmed = Some(true),
+            None => {}
+        }
         if !confirm_open {
             confirmed = Some(false);
         }
@@ -620,7 +649,7 @@ pub fn dialog(app: &mut TaskManApp, ctx: &egui::Context, pal: &theme::Palette) {
         }
     }
 
-    if open {
+    if open && !close_now {
         app.module_dialog = Some(state);
     }
 }

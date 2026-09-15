@@ -470,6 +470,12 @@ pub fn ellipsis_menu(
 
 pub fn settings_dialog(app: &mut TaskManApp, ctx: &egui::Context, _pal: &theme::Palette) {
     let mut open = true;
+    // Esc and Enter close, mirroring the Close button (which force-saves).
+    // Keys are consumed before the window so egui's built-in focused-button
+    // activation cannot double-fire; Space stays ordinary text so the
+    // keyboard still toggles focused checkboxes via egui.
+    let keys = consume_dialog_keys(ctx, false);
+    let close_now = keys.escape || keys.enter;
     egui::Window::new(i18n::tr(K::Settings))
         .open(&mut open)
         .collapsible(false)
@@ -1019,6 +1025,9 @@ pub fn settings_dialog(app: &mut TaskManApp, ctx: &egui::Context, _pal: &theme::
         });
     if !open {
         app.show_settings = false;
+    } else if close_now {
+        app.show_settings = false;
+        app.save_settings_forced();
     }
 }
 
@@ -1471,16 +1480,24 @@ fn dispatch_core_service_switch(app: &mut TaskManApp, ctx: &egui::Context) {
 }
 
 pub fn draw_toasts(app: &TaskManApp, ctx: &egui::Context) {
+    /// Gap between stacked toasts.
+    const GAP: f32 = 8.0;
     let mut toasts = tm_core::sync::lock(&app.shared.toasts);
     toasts.retain(|t| t.born.elapsed() < crate::app::TOAST_TTL);
+    // Stack by MEASURED heights, not a fixed step: a wrapped two-line message
+    // must not overlap the toast below it. Toasts are painted oldest-first
+    // from the anchored corner, so each offset is computed from the real
+    // heights painted earlier in THIS frame — no lag, no estimate.
     let mut y_offset = 0.0f32;
+    let mut clicked_toast = None;
     for toast in toasts.iter() {
         let age = toast.born.elapsed().as_secs_f32();
         let alpha = (((4.0f32 - age) * 255.0).clamp(90.0, 255.0)) as u8;
         let id = egui::Id::new(("toast", toast.id));
-        egui::Area::new(id)
+        let response = egui::Area::new(id)
             .anchor(Align2::RIGHT_BOTTOM, [-12.0, -12.0 - y_offset])
             .order(egui::Order::Foreground)
+            .sense(Sense::click())
             .show(ctx, |ui| {
                 egui::Frame::window(ui.style())
                     .fill(Color32::from_black_alpha(alpha.min(220)))
@@ -1495,7 +1512,13 @@ pub fn draw_toasts(app: &TaskManApp, ctx: &egui::Context) {
                         );
                     });
             });
-        y_offset += 46.0;
+        if response.response.clicked() {
+            clicked_toast = Some(toast.id);
+        }
+        y_offset += response.response.rect.height() + GAP;
+    }
+    if let Some(id) = clicked_toast {
+        tm_core::sync::lock(&app.shared.toasts).retain(|t| t.id != id);
     }
 }
 

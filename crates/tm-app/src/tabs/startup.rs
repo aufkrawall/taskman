@@ -401,6 +401,9 @@ fn exe_from_command(cmd: &str) -> Option<String> {
 
 pub fn properties_dialog(app: &mut TaskManApp, ctx: &egui::Context, _pal: &theme::Palette) {
     let mut open = true;
+    // Esc and Enter close, mirroring the Close button.
+    let keys = crate::app_ui::consume_dialog_keys(ctx, false);
+    let close_now = keys.escape || keys.enter;
     egui::Window::new(i18n::tr(K::Properties))
         .open(&mut open)
         .collapsible(false)
@@ -445,7 +448,7 @@ pub fn properties_dialog(app: &mut TaskManApp, ctx: &egui::Context, _pal: &theme
                 });
             });
         });
-    if !open {
+    if !open || close_now {
         app.startup_props = None;
     }
 }

@@ -812,7 +812,22 @@ pub fn session_logoff_dialog(app: &mut TaskManApp, ctx: &egui::Context, _pal: &t
     let Some((id, name)) = app.pending_session_logoff.clone() else {
         return;
     };
+    let focus_id = egui::Id::new("logoff-dialog-focus-primary");
     let mut open = true;
+    // Sign-out is destructive: the SAFE action owns the default, so Enter
+    // cancels until focus deliberately moves to Yes.
+    let keys = crate::app_ui::consume_dialog_keys(ctx, true);
+    let mut focused: bool = ctx.data(|d| d.get_temp(focus_id)).unwrap_or(false);
+    focused = crate::app_ui::update_end_task_dialog_focus(
+        focused,
+        keys.tab,
+        keys.shift_tab,
+        keys.left,
+        keys.right,
+    );
+    let decision = crate::app_ui::dialog_key_decision(keys, focused, true);
+    let pal = crate::theme::palette_ctx(ctx);
+    let mut clicked = crate::app_ui::DialogButtonClick::None;
     Window::new(i18n::tr(K::SignOut))
         .open(&mut open)
         .collapsible(false)
@@ -822,18 +837,26 @@ pub fn session_logoff_dialog(app: &mut TaskManApp, ctx: &egui::Context, _pal: &t
             ui.set_width(420.0);
             ui.label(i18n::trf(K::SignOutConfirm, &[&name]));
             ui.add_space(8.0);
-            ui.horizontal(|ui| {
-                if ui.button(i18n::tr(K::Cancel)).clicked() {
-                    app.pending_session_logoff = None;
-                }
-                if ui.button(i18n::tr(K::Yes)).clicked() {
-                    app.pending_session_logoff = None;
-                    dispatch_session_action(app, ctx, id, UserSessionAction::Logoff);
-                }
-            });
+            clicked = crate::app_ui::dialog_button_row(
+                ui,
+                ctx,
+                &pal,
+                i18n::tr(K::Cancel),
+                Some((i18n::tr(K::Yes), true)),
+                &mut focused,
+            );
         });
-    if !open {
+    ctx.data_mut(|d| d.insert_temp(focus_id, focused));
+    let cancel = !open
+        || matches!(decision, Some(crate::app_ui::DialogDecision::Safe))
+        || matches!(clicked, crate::app_ui::DialogButtonClick::Safe);
+    let confirm = matches!(decision, Some(crate::app_ui::DialogDecision::Primary))
+        || matches!(clicked, crate::app_ui::DialogButtonClick::Primary);
+    if cancel {
         app.pending_session_logoff = None;
+    } else if confirm {
+        app.pending_session_logoff = None;
+        dispatch_session_action(app, ctx, id, UserSessionAction::Logoff);
     }
 }
 
