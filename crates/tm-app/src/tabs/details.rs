@@ -2457,16 +2457,23 @@ pub fn uac_virtualization_dialog(app: &mut TaskManApp, ctx: &egui::Context) {
     let Some(pending) = app.pending_uac_virtualization.clone() else {
         return;
     };
+    let focus_id = egui::Id::new("uac-dialog-focus-primary");
     let mut open = true;
-    let mut decision = ctx.input(|input| {
-        if input.key_pressed(egui::Key::Escape) {
-            Some(false)
-        } else if input.key_pressed(egui::Key::Enter) {
-            Some(true)
-        } else {
-            None
-        }
-    });
+    // Consume before the window so egui's built-in focused-button activation
+    // cannot double-fire, and let the SAFE action own the default: Enter and
+    // Escape both cancel until focus deliberately moves to Apply.
+    let keys = crate::app_ui::consume_dialog_keys(ctx, true);
+    let mut focused: bool = ctx.data(|d| d.get_temp(focus_id)).unwrap_or(false);
+    focused = crate::app_ui::update_end_task_dialog_focus(
+        focused,
+        keys.tab,
+        keys.shift_tab,
+        keys.left,
+        keys.right,
+    );
+    let mut decision = crate::app_ui::dialog_key_decision(keys, focused, true)
+        .map(|d| matches!(d, crate::app_ui::DialogDecision::Primary));
+    let pal = crate::theme::palette_ctx(ctx);
     egui::Window::new(i18n::tr(K::UacVirtualization))
         .open(&mut open)
         .collapsible(false)
@@ -2476,19 +2483,25 @@ pub fn uac_virtualization_dialog(app: &mut TaskManApp, ctx: &egui::Context) {
             ui.set_width(430.0);
             ui.label(i18n::trf(K::UacVirtualizationConfirm, &[&pending.name]));
             ui.add_space(10.0);
-            ui.horizontal(|ui| {
-                if ui.button(i18n::tr(K::Cancel)).clicked() {
-                    decision = Some(false);
-                }
-                if ui.button(i18n::tr(K::Apply)).clicked() {
-                    decision = Some(true);
-                }
-            });
+            match crate::app_ui::dialog_button_row(
+                ui,
+                ctx,
+                &pal,
+                i18n::tr(K::Cancel),
+                Some((i18n::tr(K::Apply), true)),
+                &mut focused,
+            ) {
+                crate::app_ui::DialogButtonClick::Safe => decision = Some(false),
+                crate::app_ui::DialogButtonClick::Primary => decision = Some(true),
+                crate::app_ui::DialogButtonClick::None => {}
+            }
         });
+    ctx.data_mut(|d| d.insert_temp(focus_id, focused));
     if !open {
         decision = Some(false);
     }
     if let Some(confirm) = decision {
+        ctx.data_mut(|d| d.remove_temp::<bool>(focus_id));
         app.pending_uac_virtualization = None;
         if confirm {
             if !app.identity_is_live(&pending.identity) {
