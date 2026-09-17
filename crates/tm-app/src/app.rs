@@ -616,7 +616,14 @@ impl TaskManApp {
             ),
             _ => (false, false, None, None),
         };
-        let perf_selected_key = std::env::var("TASKMAN_PERF").unwrap_or_else(|_| "cpu".into());
+        // The persisted resource key survives restarts; `TASKMAN_PERF` stays a
+        // diagnostic override for UI tests and captures. An unknown key (a
+        // removed adapter, a stale config) falls back to the first card in
+        // `performance::show`.
+        let perf_selected_key = std::env::var("TASKMAN_PERF")
+            .ok()
+            .filter(|key| !key.trim().is_empty())
+            .unwrap_or_else(|| settings.perf_selected_key.clone());
 
         // History capacity sized for the largest configured window at the
         // fastest interval (implement.md §14.3); recomputed on changes.

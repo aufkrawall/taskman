@@ -237,6 +237,10 @@ pub struct Settings {
     pub gpu_graph_mode: String,
     /// Overlay kernel time (darker band) in the CPU graphs.
     pub show_kernel_times: bool,
+    /// Performance page: which resource card was open (a `ResourceEntry` key
+    /// like `cpu`, `mem`, `disk:C:`, `net:...`, `gpu:0`). An unknown key falls
+    /// back to CPU at startup, so a removed adapter cannot break the page.
+    pub perf_selected_key: String,
     /// Details page shows the literal parent/child process tree: the Name
     /// column's third sort state (no column ordering at all). There is no
     /// separate tree switch — this IS the sort state, kept here because
@@ -282,6 +286,7 @@ impl Default for Settings {
             cpu_graph_mode: "overall".into(),
             gpu_graph_mode: "overall".into(),
             show_kernel_times: false,
+            perf_selected_key: "cpu".into(),
             details_tree_hierarchical: false,
             close_to_tray: false,
             start_with_windows: false,
@@ -715,6 +720,12 @@ impl Settings {
             }
         }
         s.show_kernel_times = b("general", "show_kernel_times", s.show_kernel_times);
+        if let Some(v) = get("general", "perf_selected_key") {
+            let key = v.trim();
+            if !key.is_empty() && key.len() <= 64 {
+                s.perf_selected_key = key.to_string();
+            }
+        }
         // `process_tree_view` was briefly shipped for the Processes page.
         // Preserve that preference while moving the literal tree to Details.
         // `details_tree_view` (and before it `process_tree_view`) was a
@@ -899,6 +910,7 @@ impl Settings {
             ("cpu_graph_mode", self.cpu_graph_mode.clone()),
             ("gpu_graph_mode", self.gpu_graph_mode.clone()),
             ("show_kernel_times", self.show_kernel_times.to_string()),
+            ("perf_selected_key", self.perf_selected_key.clone()),
             (
                 "details_tree_hierarchical",
                 self.details_tree_hierarchical.to_string(),
@@ -1129,6 +1141,42 @@ render_mode=compatibility
         assert_eq!(Settings::default().render_mode, RenderMode::Auto);
     }
 
+    /// The Performance page's selected resource card survives a restart; a
+    /// stale or malformed key falls back to the default instead of breaking
+    /// the page (the UI additionally falls back when the key is unknown).
+    #[test]
+    fn perf_selected_key_round_trips_and_rejects_junk() {
+        assert_eq!(Settings::default().perf_selected_key, "cpu");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.ini");
+        let s = Settings {
+            perf_selected_key: "gpu:0".into(),
+            ..Settings::default()
+        };
+        s.save_to(&path).unwrap();
+        assert_eq!(
+            Settings::load_from(&path).perf_selected_key,
+            "gpu:0",
+            "the selected Performance card must survive a save/load round trip"
+        );
+        // Empty and oversized keys are ignored, not stored.
+        for junk in ["", "   "] {
+            let ini = format!(
+                "[general]
+perf_selected_key={junk}
+"
+            );
+            assert_eq!(Settings::from_ini_text(&ini).perf_selected_key, "cpu");
+        }
+        let long = "x".repeat(65);
+        let ini = format!(
+            "[general]
+perf_selected_key={long}
+"
+        );
+        assert_eq!(Settings::from_ini_text(&ini).perf_selected_key, "cpu");
+    }
+
     #[test]
     fn text_smoothing_round_trips_and_defaults_to_sharp() {
         for mode in [
@@ -1175,6 +1223,7 @@ text_smoothing=banana
         s.perf_card_width = 300.5;
         s.cpu_graph_mode = "logical".into();
         s.show_kernel_times = true;
+        s.perf_selected_key = "gpu:0".into();
         s.details_tree_hierarchical = true;
         s.close_to_tray = true;
         s.start_with_windows = true;

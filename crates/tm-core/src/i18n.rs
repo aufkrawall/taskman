@@ -364,6 +364,10 @@ keys! {
     ColumnRequired => ["Erforderlich", "Required"],
     MoveColumnUp => ["Spalte nach oben", "Move column up"],
     MoveColumnDown => ["Spalte nach unten", "Move column down"],
+    NameColumnTreeHint => [
+        "Klicken zum Sortieren — ein dritter Klick zeigt die Prozesshierarchie",
+        "Click to sort — a third click shows the process tree"
+    ],
 
     // ------------------------------------------------ statuses
     StRunning => ["Wird ausgeführt", "Running"],
@@ -686,6 +690,7 @@ keys! {
     KvTotal => ["Gesamt:", "Total:"],
     KvAvailable => ["Verfügbar:", "Available:"],
     KvCommitLimit => ["Commit-Limit:", "Commit limit:"],
+    KvSsid => ["SSID:", "SSID:"],
     KvPagefile => ["Auslagerungsdatei:", "Page file:"],
     KvRamSpeed => ["Geschwindigkeit:", "Speed:"],
     KvSlotsUsed => ["Belegte Steckplätze:", "Slots used:"],

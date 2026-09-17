@@ -339,7 +339,9 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
             .collect::<Vec<_>>();
         if let Some(key) = search::type_ahead_match(candidates, selected, &typed) {
             app.perf_selected_key = key.clone();
-            app.perf_jump_to = Some(key);
+            app.perf_jump_to = Some(key.clone());
+            app.shared.settings.perf_selected_key = key;
+            app.save_settings();
         }
     }
 
@@ -457,6 +459,8 @@ fn card_ui(
     }
     if resp.clicked() {
         app.perf_selected_key = e.key.clone();
+        app.shared.settings.perf_selected_key = app.perf_selected_key.clone();
+        app.save_settings();
     }
 
     // Consume a one-shot type-ahead scroll request for this card. The card
@@ -1266,6 +1270,25 @@ fn cpu_page(app: &mut TaskManApp, ui: &mut egui::Ui, pal: &Palette) {
     ui.add_space(16.0);
 }
 
+/// Right-click menu for the graphs that have no other options (memory, disk,
+/// network): the time window is the one thing they can change, and a native
+/// Task Manager user right-clicks every graph expecting *something*.
+fn time_window_context_menu(app: &mut TaskManApp, resp: &egui::Response) {
+    menu::context_menu(resp, |ui| {
+        ui.set_min_width(170.0);
+        menu::title(ui, i18n::tr(K::GraphWindowLabel));
+        menu::separator(ui);
+        for secs in [30u32, 60, 120] {
+            let current = app.shared.settings.graph_seconds == secs;
+            if menu::check(ui, &format!("{secs} s"), current).clicked() {
+                app.shared.settings.graph_seconds = secs;
+                app.shared.settings.save();
+                ui.close();
+            }
+        }
+    });
+}
+
 /// Right-click menu on the CPU graphs: change graph to overall/logical and
 /// toggle the kernel-times overlay (§14.4).
 fn cpu_graph_context_menu(app: &mut TaskManApp, resp: &egui::Response) {
@@ -1358,7 +1381,7 @@ fn memory_page(app: &mut TaskManApp, ui: &mut egui::Ui, pal: &Palette) {
     let axis = TimeAxis::new(&ts, app.shared.settings.graph_seconds);
     let width = content_width(ui);
     let used: Vec<f64> = series(win, |h| h.mem_used_bytes as f64 / 1024.0 / 1024.0 / 1024.0);
-    page_chart(
+    let in_use_chart = page_chart(
         ui,
         width,
         180.0,
@@ -1371,6 +1394,7 @@ fn memory_page(app: &mut TaskManApp, ui: &mut egui::Ui, pal: &Palette) {
         Some(axis),
         fmt_gib,
     );
+    let mut chart_menus = vec![in_use_chart];
 
     caption(
         ui,
@@ -1382,7 +1406,7 @@ fn memory_page(app: &mut TaskManApp, ui: &mut egui::Ui, pal: &Palette) {
         h.commit_used_bytes as f64 / 1024.0 / 1024.0 / 1024.0
     });
     let commit_limit = snap.memory.commit_total_bytes as f64 / 1024.0 / 1024.0 / 1024.0;
-    page_chart(
+    let committed_chart = page_chart(
         ui,
         width,
         120.0,
@@ -1395,6 +1419,7 @@ fn memory_page(app: &mut TaskManApp, ui: &mut egui::Ui, pal: &Palette) {
         Some(axis),
         fmt_gib,
     );
+    chart_menus.push(committed_chart);
 
     ui.add_space(10.0);
     let m = &snap.memory;
@@ -1507,6 +1532,11 @@ fn memory_page(app: &mut TaskManApp, ui: &mut egui::Ui, pal: &Palette) {
             });
         },
     );
+    // Attached here, not beside the charts: `window(app)` borrows the app's
+    // history for the whole page body.
+    for chart in &chart_menus {
+        time_window_context_menu(app, chart);
+    }
     ui.add_space(16.0);
 }
 
@@ -1533,7 +1563,7 @@ fn disk_page(app: &mut TaskManApp, ui: &mut egui::Ui, pal: &Palette, entry: &Res
     let axis = TimeAxis::new(&ts, app.shared.settings.graph_seconds);
     let width = content_width(ui);
     let active = disk_series(win, &entry.key, |d| d.1 as f64);
-    page_chart(
+    let disk_active_chart = page_chart(
         ui,
         width,
         160.0,
@@ -1546,6 +1576,7 @@ fn disk_page(app: &mut TaskManApp, ui: &mut egui::Ui, pal: &Palette, entry: &Res
         Some(axis),
         fmt_percent,
     );
+    let mut chart_menus = vec![disk_active_chart];
 
     let read = disk_series(win, &entry.key, |d| d.2);
     let write = disk_series(win, &entry.key, |d| d.3);
@@ -1566,7 +1597,7 @@ fn disk_page(app: &mut TaskManApp, ui: &mut egui::Ui, pal: &Palette, entry: &Res
         &i18n::trf(K::TransferRateWindow, &[&window_text]),
         &format::format_rate(peak),
     );
-    page_chart(
+    let disk_transfer_chart = page_chart(
         ui,
         width,
         160.0,
@@ -1578,6 +1609,7 @@ fn disk_page(app: &mut TaskManApp, ui: &mut egui::Ui, pal: &Palette, entry: &Res
         Some(axis),
         fmt_byte_rate,
     );
+    chart_menus.push(disk_transfer_chart);
 
     ui.add_space(10.0);
     stats_block(
@@ -1642,6 +1674,9 @@ fn disk_page(app: &mut TaskManApp, ui: &mut egui::Ui, pal: &Palette, entry: &Res
             });
         },
     );
+    for chart in &chart_menus {
+        time_window_context_menu(app, chart);
+    }
     ui.add_space(16.0);
 }
 
@@ -1676,7 +1711,7 @@ fn network_page(app: &mut TaskManApp, ui: &mut egui::Ui, pal: &Palette, entry: &
         &i18n::trf(K::ThroughputWindow, &[&window_text]),
         &format::format_rate(peak),
     );
-    page_chart(
+    let network_chart = page_chart(
         ui,
         width,
         230.0,
@@ -1688,6 +1723,7 @@ fn network_page(app: &mut TaskManApp, ui: &mut egui::Ui, pal: &Palette, entry: &
         Some(axis),
         fmt_byte_rate,
     );
+    time_window_context_menu(app, &network_chart);
 
     ui.add_space(10.0);
     stats_block(
@@ -1738,7 +1774,7 @@ fn network_page(app: &mut TaskManApp, ui: &mut egui::Ui, pal: &Palette, entry: &
                     );
                 }
                 if let Some(ssid) = &net.ssid {
-                    kv_row(ui, pal, "SSID:", ssid);
+                    kv_row(ui, pal, i18n::tr(K::KvSsid), ssid);
                 }
                 if let Some(signal) = net.signal_quality_pct {
                     kv_row(

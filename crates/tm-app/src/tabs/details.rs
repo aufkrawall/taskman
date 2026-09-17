@@ -342,7 +342,10 @@ impl ColSpec {
 const COLUMNS: &[ColSpec] = &[
     ColSpec {
         cid: ColumnId::Name,
-        col: || TmColumn::text("name", i18n::tr(K::ColName), 340.0),
+        col: || {
+            TmColumn::text("name", i18n::tr(K::ColName), 340.0)
+                .with_tooltip(i18n::tr(K::NameColumnTreeHint))
+        },
         default_visible: true,
     },
     ColSpec {
@@ -909,6 +912,14 @@ pub struct Row {
     pub io_ops_s: String,
     pub hard_faults_s: String,
     pub command_line_s: String,
+    /// True when the per-process network source (an ETW session) produced
+    /// nothing for this row, so its network cells read "—" for lack of a
+    /// source rather than for lack of traffic.
+    pub net_unknown: bool,
+    /// Same for the per-process disk service-time source.
+    pub disk_activity_unknown: bool,
+    /// Same for the GPU utilization/memory sources.
+    pub gpu_unknown: bool,
 }
 
 impl Row {
@@ -1278,11 +1289,15 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
                     }
                 }
 
-                // on_hover_text consumes the response, so the truncation tip
-                // attaches before the context menu does.
-                let resp = match truncated_tip {
-                    Some(tip) => resp.on_hover_text(tip),
-                    None => resp,
+                // A cell whose "—" comes from a stopped source explains itself
+                // under the pointer; then a clipped cell shows its full value.
+                // on_hover_text consumes the response, so both attach before
+                // the context menu does.
+                let unknown_tip = unknown_cell_tip(ui, table, rect, &visible_cols, row);
+                let resp = match (unknown_tip, truncated_tip) {
+                    (Some(tip), _) => resp.on_hover_text(tip),
+                    (None, Some(tip)) => resp.on_hover_text(tip),
+                    (None, None) => resp,
                 };
 
                 if resp.clicked() {
@@ -1319,6 +1334,27 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
     });
     if header_secondary {
         app.details_state.select_columns_open = true;
+    }
+
+    // Hierarchical is a sort state with no direction, so the header shows no
+    // caret — which used to leave the page's tree mode with no indicator at
+    // all. Draw a branch glyph where the caret would sit, in the Name column
+    // (or wherever the user moved it).
+    if app.details_state.sort_order == SortOrder::Hierarchical
+        && let Some(name_pos) = visible_cols
+            .iter()
+            .position(|spec| spec.cid == ColumnId::Name)
+    {
+        let cell = table.col_rect(name_pos, header_rect);
+        crate::icons::draw_at(
+            ui,
+            egui::Rect::from_center_size(
+                egui::Pos2::new(cell.right() - 14.0, cell.center().y),
+                egui::vec2(14.0, 14.0),
+            ),
+            Icon::Hierarchy,
+            pal.text_dim,
+        );
     }
 
     if let Some(display_idx) = clicked
@@ -1958,6 +1994,13 @@ fn row_from_process(p: &ProcessEntry, depth: usize, children: bool) -> Row {
         io_ops_s: opt_per_second(p.io_ops_per_s),
         hard_faults_s: opt_per_second(p.hard_faults_per_s),
         command_line_s: p.command_line.clone().unwrap_or_else(|| "—".into()),
+        // "Unknown" is a property of the SOURCE (all-or-nothing ETW/PDH
+        // sessions), so a row that reports nothing from it can say why.
+        net_unknown: p.net_recv_bps.is_none()
+            && p.net_sent_bps.is_none()
+            && process_network_rate(p).is_none(),
+        disk_activity_unknown: p.disk_active_pct.is_none(),
+        gpu_unknown: p.gpu_util_pct.is_none(),
     }
 }
 
@@ -2897,6 +2940,54 @@ fn option_bytes(value: Option<u64>) -> String {
     value
         .map(format::format_bytes_loc)
         .unwrap_or_else(|| "—".into())
+}
+
+/// Why this column reads "—" on rows whose telemetry source is not running.
+/// `None` means the same dash would be a bug, not a limitation — the same
+/// contract `value_columns::unavailable_tip` documents for the shared
+/// numeric catalogue (this page's typed columns are a separate catalogue).
+fn unavailable_column_tip(cid: ColumnId) -> Option<&'static str> {
+    match cid {
+        ColumnId::Network | ColumnId::NetworkReceive | ColumnId::NetworkSend => {
+            Some(i18n::tr(K::NetPerProcessUnavailable))
+        }
+        ColumnId::DiskActivity => Some(i18n::tr(K::DiskPerProcessUnavailable)),
+        ColumnId::GpuUtil | ColumnId::GpuEngine | ColumnId::GpuDedicated | ColumnId::GpuShared => {
+            Some(i18n::tr(K::GpuPerProcessUnavailable))
+        }
+        _ => None,
+    }
+}
+
+/// Whether this row's cell for `cid` is unknown because its source is down.
+fn column_value_unknown(row: &Row, cid: ColumnId) -> bool {
+    match cid {
+        ColumnId::Network | ColumnId::NetworkReceive | ColumnId::NetworkSend => row.net_unknown,
+        ColumnId::DiskActivity => row.disk_activity_unknown,
+        ColumnId::GpuUtil | ColumnId::GpuEngine | ColumnId::GpuDedicated | ColumnId::GpuShared => {
+            row.gpu_unknown
+        }
+        _ => false,
+    }
+}
+
+/// The hover tip for the cell under the pointer, if it is one whose "—" has
+/// an explanation. Cells are painted, not widgets, so the row response is the
+/// only handle: the pointer is tested against each column's rect, exactly
+/// like the Processes page does.
+fn unknown_cell_tip(
+    ui: &egui::Ui,
+    table: &tablekit::TmTable,
+    rect: egui::Rect,
+    visible_cols: &[ColSpec],
+    row: &Row,
+) -> Option<&'static str> {
+    let pointer = ui.ctx().pointer_latest_pos()?;
+    visible_cols.iter().enumerate().find_map(|(pos, spec)| {
+        (column_value_unknown(row, spec.cid) && table.col_rect(pos, rect).contains(pointer))
+            .then(|| unavailable_column_tip(spec.cid))
+            .flatten()
+    })
 }
 
 fn option_rate(value: Option<f64>) -> String {

@@ -38,6 +38,9 @@ pub enum Icon {
     RunTask,
     OpenExternal,
     Properties,
+    /// Indent/branch mark: the Details Name column is in its process-tree
+    /// state (neither ascending nor descending).
+    Hierarchy,
 }
 
 /// Draw an icon centered in `rect`, stroked with `color`.
@@ -337,6 +340,17 @@ pub fn draw(ui: &egui::Ui, icon: Icon, rect: Rect, color: Color32) {
                 let a2 = c + dir * 8.5 * s / 10.0;
                 painter.line_segment([a1, a2], stroke);
             }
+        }
+        Icon::Hierarchy => {
+            // One root branching to two children: a vertical spine with two
+            // elbows, the shape Windows uses for "indented/tree" views. Read
+            // as "this column is showing a tree", not as a sort direction.
+            line(p(-6.0, -7.0), p(-6.0, 7.0));
+            line(p(-6.0, 0.0), p(2.0, 0.0));
+            line(p(-6.0, -6.0), p(2.0, -6.0));
+            line(p(-6.0, 6.0), p(2.0, 6.0));
+            circle(p(4.0, -6.0), 1.6, true);
+            circle(p(4.0, 6.0), 1.6, true);
         }
     }
 }
