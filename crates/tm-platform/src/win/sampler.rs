@@ -749,6 +749,9 @@ impl Sampler {
         let mem_used = self.sys.used_memory();
         let mem_avail = self.sys.available_memory();
         let win_mem = perfcounters::query_windows_memory();
+        // The page-list breakdown is one extra NT query per tick; it is cheap
+        // and constant-size, unlike the grow-and-retry process table.
+        let page_lists = perfcounters::query_windows_memory_lists();
 
         // ---- PDH: demand-gated groups, one collection per tick -----------------
         // The UI's TelemetryDemand decides which expensive providers stay
@@ -1312,6 +1315,11 @@ impl Sampler {
                 used_bytes: mem_used,
                 available_bytes: mem_avail,
                 cached_bytes: win_mem.cached,
+                // 0 when the kernel refuses the page-list query; the
+                // composition bar is then simply not drawn.
+                modified_bytes: page_lists.map_or(0, |lists| lists.modified_bytes),
+                standby_bytes: page_lists.map_or(0, |lists| lists.standby_bytes),
+                free_bytes: page_lists.map_or(0, |lists| lists.free_bytes),
                 commit_total_bytes: win_mem.commit_limit,
                 commit_used_bytes: win_mem.commit_total,
                 paged_pool_bytes: win_mem.paged_pool,

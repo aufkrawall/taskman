@@ -1013,6 +1013,78 @@ fn content_width(ui: &egui::Ui) -> f32 {
 /// right — or stacked vertically when the detail area is too narrow for
 /// both (otherwise egui squeezes the kv column to zero width and the
 /// details silently vanish).
+/// Native Task Manager's memory composition bar: one horizontal strip whose
+/// segments are the kernel's page lists. Drawn only when the platform
+/// reported them — a bar built from zeros would claim every list is empty.
+fn memory_composition_bar(ui: &mut egui::Ui, pal: &Palette, mem: &tm_core::model::MemoryInfo) {
+    if mem.modified_bytes == 0 && mem.standby_bytes == 0 && mem.free_bytes == 0 {
+        return;
+    }
+    let used = mem
+        .used_bytes
+        .saturating_sub(mem.modified_bytes)
+        .saturating_sub(mem.standby_bytes);
+    let segments = [
+        (used, i18n::tr(K::StatInUse), pal.memory_graph),
+        (
+            mem.modified_bytes,
+            i18n::tr(K::MemModified),
+            pal.disk_write_graph,
+        ),
+        (
+            mem.standby_bytes,
+            i18n::tr(K::MemStandby),
+            theme::toned(pal, pal.memory_graph, 0.62),
+        ),
+        (mem.free_bytes, i18n::tr(K::MemFree), pal.card_bg_hover),
+    ];
+    let total: u64 = segments.iter().map(|(bytes, ..)| *bytes).sum();
+    if total == 0 {
+        return;
+    }
+
+    let width = content_width(ui);
+    let bar_h = 18.0;
+    ui.horizontal(|ui| {
+        ui.add_space(GUTTER);
+        let (rect, _) = ui.allocate_exact_size(egui::vec2(width, bar_h), egui::Sense::hover());
+        let mut x = rect.left();
+        for (bytes, label, color) in segments {
+            if bytes == 0 {
+                continue;
+            }
+            let w = rect.width() * (bytes as f32 / total as f32);
+            let seg =
+                egui::Rect::from_min_size(egui::Pos2::new(x, rect.top()), egui::vec2(w, bar_h));
+            ui.painter().rect_filled(seg, 0.0, color);
+            x += w;
+            let _ = label;
+        }
+        ui.painter().rect_stroke(
+            rect,
+            0.0,
+            egui::Stroke::new(1.0, pal.stroke),
+            egui::StrokeKind::Inside,
+        );
+    });
+
+    // Legend rows carry the numbers: a strip alone cannot say how many bytes a
+    // segment holds, and the segments have no hover targets of their own.
+    ui.horizontal(|ui| {
+        ui.add_space(GUTTER);
+        for (bytes, label, color) in segments {
+            let (dot, _) = ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
+            ui.painter().rect_filled(dot, 2.0, color);
+            ui.label(
+                egui::RichText::new(format!("{label} {}", format::format_bytes_loc(bytes)))
+                    .size(11.5)
+                    .color(pal.text_dim),
+            );
+            ui.add_space(10.0);
+        }
+    });
+}
+
 fn stats_block(
     ui: &mut egui::Ui,
     stats_w: f32,
@@ -1438,6 +1510,8 @@ fn memory_page(app: &mut TaskManApp, ui: &mut egui::Ui, pal: &Palette) {
     chart_menus.push(committed_chart);
 
     ui.add_space(10.0);
+    memory_composition_bar(ui, pal, &snap.memory);
+    ui.add_space(6.0);
     let m = &snap.memory;
     stats_block(
         ui,

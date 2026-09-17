@@ -81,6 +81,14 @@ pub struct MemoryInfo {
     pub available_bytes: u64,
     /// OS file cache standing on top of used memory (Windows standby / Linux cached).
     pub cached_bytes: u64,
+    /// Page-list breakdown for the composition bar (Windows
+    /// `SystemMemoryListInformation`): modified pages awaiting write-back,
+    /// standby pages (the file cache's backing list), and free/zeroed pages.
+    /// All three are 0 when the platform does not report them — the bar is
+    /// simply not drawn, because a fabricated 0 would claim an empty list.
+    pub modified_bytes: u64,
+    pub standby_bytes: u64,
+    pub free_bytes: u64,
     /// Committed (pagefile-backed + RAM-backed) charge.
     pub commit_total_bytes: u64,
     pub commit_used_bytes: u64,

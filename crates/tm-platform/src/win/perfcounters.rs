@@ -685,6 +685,88 @@ pub fn query_windows_memory() -> WinMemory {
     }
 }
 
+/// Page-list breakdown behind the memory composition bar.
+///
+/// `SystemMemoryListInformation` (class 80) is not in the `windows` crate's
+/// enum, so the class constant and the buffer layout are hand-written — the
+/// same approach `image_path.rs` uses for its NT class. The layout is a list
+/// of `SIZE_T` page counts; the priority-indexed lists are summed into single
+/// figures because the bar has one segment per list, not per priority.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct WinMemoryLists {
+    /// Pages written to disk and now free for reuse.
+    pub modified_bytes: u64,
+    /// Standby (cached-but-evictable) pages, all priorities.
+    pub standby_bytes: u64,
+    /// Free and zeroed pages.
+    pub free_bytes: u64,
+}
+
+/// `SystemMemoryListInformation`.
+const SYSTEM_MEMORY_LIST_INFORMATION_CLASS: i32 = 80;
+const STATUS_SUCCESS: i32 = 0;
+const PRIORITY_BUCKETS: usize = 8;
+
+#[repr(C)]
+#[derive(Default, Clone, Copy)]
+struct MemoryListInformation {
+    zero_page_count: usize,
+    free_page_count: usize,
+    modified_page_count: usize,
+    modified_no_write_page_count: usize,
+    bad_page_count: usize,
+    page_count_by_priority: [usize; PRIORITY_BUCKETS],
+    repurposed_count_by_priority: [usize; PRIORITY_BUCKETS],
+    modified_page_count_page_file: usize,
+}
+
+/// Returns `None` when the kernel rejects the query or reports no page size;
+/// the caller then leaves the model fields at 0 and the bar is not drawn —
+/// never a fabricated empty list.
+pub fn query_windows_memory_lists() -> Option<WinMemoryLists> {
+    use windows::Wdk::System::SystemInformation::{
+        NtQuerySystemInformation, SYSTEM_INFORMATION_CLASS,
+    };
+
+    let mut info = MemoryListInformation::default();
+    let status = unsafe {
+        NtQuerySystemInformation(
+            SYSTEM_INFORMATION_CLASS(SYSTEM_MEMORY_LIST_INFORMATION_CLASS),
+            std::ptr::from_mut(&mut info).cast(),
+            std::mem::size_of::<MemoryListInformation>() as u32,
+            std::ptr::null_mut(),
+        )
+    };
+    if status.0 != STATUS_SUCCESS {
+        return None;
+    }
+    let mut perf = PERFORMANCE_INFORMATION::default();
+    let page_size = unsafe {
+        if GetPerformanceInfo(
+            &mut perf,
+            std::mem::size_of::<PERFORMANCE_INFORMATION>() as u32,
+        )
+        .is_err()
+        {
+            return None;
+        }
+        perf.PageSize as u64
+    };
+    if page_size == 0 {
+        return None;
+    }
+    let pages = |count: usize| count as u64 * page_size;
+    let standby = info.page_count_by_priority.iter().copied().sum::<usize>();
+    Some(WinMemoryLists {
+        // Pages on their way to the pagefile still hold data; counting the
+        // no-write variant with them keeps the bar total honest against the
+        // in-use figure next to it.
+        modified_bytes: pages(info.modified_page_count + info.modified_no_write_page_count),
+        standby_bytes: pages(standby),
+        free_bytes: pages(info.free_page_count + info.zero_page_count),
+    })
+}
+
 /// System-wide handle/thread counts from GetPerformanceInfo.
 pub fn global_handle_thread_count() -> (usize, usize) {
     let mut perf = PERFORMANCE_INFORMATION::default();
@@ -704,6 +786,42 @@ pub fn global_handle_thread_count() -> (usize, usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Live kernel check of the hand-written `MEMORY_LIST_INFORMATION`
+    /// layout: the page lists must sum to at most the physical total (they
+    /// overlap `cached`/`used` by construction, so equality is NOT the
+    /// invariant — a layout mistake shows up as a wildly larger sum).
+    ///
+    /// Ignored: it needs a real kernel, not a sandbox, and the counts move
+    /// between the two queries.
+    #[test]
+    #[ignore = "reads live kernel page lists"]
+    fn memory_list_layout_decodes_plausible_page_counts() {
+        let Some(lists) = query_windows_memory_lists() else {
+            eprintln!("kernel refused the page-list query; nothing to verify");
+            return;
+        };
+        let mut perf = PERFORMANCE_INFORMATION::default();
+        let total_bytes = unsafe {
+            assert!(
+                GetPerformanceInfo(
+                    &mut perf,
+                    std::mem::size_of::<PERFORMANCE_INFORMATION>() as u32
+                )
+                .is_ok()
+            );
+            perf.PhysicalTotal as u64 * perf.PageSize as u64
+        };
+        let sum = lists.standby_bytes + lists.free_bytes + lists.modified_bytes;
+        assert!(
+            sum <= total_bytes,
+            "page lists sum to {sum} bytes, more than the {total_bytes} bytes of RAM"
+        );
+        assert!(
+            lists.standby_bytes > 0 || lists.free_bytes > 0,
+            "a running system always has standby or free pages; decoded {lists:?}"
+        );
+    }
 
     #[test]
     fn gpu_pdh_instance_parser_extracts_pid_luid_engine() {
