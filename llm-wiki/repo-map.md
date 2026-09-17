@@ -1,6 +1,6 @@
 # Repo Map (code map)
 
-Last cross-checked: 2026-09-11
+Last cross-checked: 2026-09-17
 
 Primary sources:
 - workspace tree (verified against working tree)
@@ -25,6 +25,10 @@ platform boundary (`tm-core` ← `tm-platform` ← `tm-app` / `tm-service`):
     `[columns.<table>]` / `.visible` / `.order` sections + debounced
     SettingsWriter), `app_history.rs` (per-app usage db, single serialized
     writer thread with generations), `demand.rs` (TelemetryDemand bitmask),
+    `startup_impact.rs` (measured startup cost per image: per-tick CPU-time
+    and I/O deltas folded across the boot window, Microsoft's documented
+    Low/Medium/High thresholds, and the persisted store — see the module doc
+    for why this is measured here rather than read from SRUM),
     `logging.rs` (early ring sink → deferred file attach; elevated installer
     helper remains memory/console-only), `classify.rs`
     (conservative Apps/Background/System classification: kernel names + core
@@ -100,7 +104,10 @@ platform boundary (`tm-core` ← `tm-platform` ← `tm-app` / `tm-service`):
     `PostThreadMessageW` — and the cloak-restore dance), `app.rs`
     (TaskManApp: engine starts AFTER first frame, event-driven repaints,
     action executor, toast ids, demand updates per tab), `app_ui.rs`
-    (chrome + dialogs incl. scrolling settings and Delete confirmation),
+    (chrome + dialogs incl. scrolling settings and Delete confirmation;
+    the shared dialog keyboard contract lives in `app_ui/original.rs`:
+    `consume_dialog_keys` / `dialog_key_decision` / `dialog_button_row` —
+    consume BEFORE `Window::show`, and the SAFE button owns the default),
     `tabs/*` (processes/details/modules/users/services/startup/apphistory/
     performance; Processes keeps native grouped presentation, Details can
     switch between flat and literal raw-PPID tree, offers optional combined/receive/send
@@ -153,7 +160,12 @@ platform boundary (`tm-core` ← `tm-platform` ← `tm-app` / `tm-service`):
   disables that provider for the whole session — this is exactly how
   per-process network stayed dark. See `log/recent.md` 2026-08-31.
 - `crates/tm-platform/src/win/perfcounters.rs` — PDH group lifecycle +
-  GPU instance parsing (unit-tested real-world strings).
+  GPU instance parsing (unit-tested real-world strings), and
+  `query_windows_memory_lists`: the hand-written
+  `SystemMemoryListInformation` class + `MEMORY_LIST_INFORMATION` struct behind
+  the memory composition bar. The layout is pinned by an `#[ignore]` live
+  kernel test (`memory_list_layout_decodes_plausible_page_counts`) — run it
+  after any Windows build that changes the page lists.
 - `crates/tm-platform/src/win/cpu_load.rs` — also the source of per-process
   I/O operation counts and hard page faults (the same kernel table already
   carries `IO_COUNTERS` and `HardFaultCount`, so they cost no extra query), and

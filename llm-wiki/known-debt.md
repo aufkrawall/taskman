@@ -1,6 +1,6 @@
 # Known and Accepted Debt
 
-Last verified: 2026-09-02
+Last verified: 2026-09-17
 
 Primary sources:
 - `AGENTS.md`
@@ -25,11 +25,31 @@ items across Phases 2–6. The following concrete gaps remain:
   expose fixed column sets rather than every native optional header-menu
   column. A shared cross-tab column registry is still desirable when the
   missing telemetry providers below are added.
+  **Header context menu: PARTIAL** (2026-09-17) — Details opens Select-columns
+  from a header right-click; Processes/Users still have no header menu, and
+  `TmTable::header` still does not return its own `Response`, so each tab that
+  wants one repeats the computed-header-rect hit test.
 - **Telemetry fidelity:** native SRUM App History;
-  measured Startup Impact; packaged/MSIX startup tasks; full `.lnk` target
-  resolution through `IShellLink`/`IPersistFile`; memory-composition
-  categories/bar; static GPU details. (Per-GPU-engine histories landed
+  packaged/MSIX startup tasks; full `.lnk` target
+  resolution through `IShellLink`/`IPersistFile`; static GPU details.
+  (Per-GPU-engine histories landed
   2026-09-01 — `HistoryPoint.gpu_engines` plus the "change graph to" menu.)
+  **Measured Startup impact: DONE** (2026-09-17) — measured by this app over
+  the boot window rather than read from Windows, because research established
+  that Task Manager's startup impact is not stored in SRUM (SRUDB.dat carries
+  hourly App History aggregates; Microsoft documents the impact thresholds but
+  not a per-entry store). Remaining limitation, deliberately accepted: a
+  process that starts AND exits between two sampler ticks is not attributed,
+  and a session that starts after the 120 s window leaves the column
+  "Not measured" until the next boot. Do not "fix" that by extrapolating from
+  unrelated uptime.
+- **Memory composition: DONE** (2026-09-17). In use / modified / standby /
+  free come from `NtQuerySystemInformation(SystemMemoryListInformation)`
+  (`win/perfcounters.rs::query_windows_memory_lists`, hand-written NT struct
+  with a live kernel test). `MemoryInfo.modified_bytes/standby_bytes/free_bytes`
+  are 0 when unreported and the bar is then not drawn. Note `MemoryInfo.cached_bytes`
+  is still `GetPerformanceInfo::SystemCache` (file cache), NOT the standby
+  list — standby is its own field now; do not conflate them.
 - **Current 2026 optional columns:** NPU, NPU Engine, NPU Dedicated Memory,
   NPU Shared Memory, and Isolation/AppContainer, plus neural-engine
   Performance entries. These require capability-gated model/collector work;
@@ -107,8 +127,13 @@ items across Phases 2–6. The following concrete gaps remain:
   and an optional Efficiency-mode confirmation preference.
 - **Shell/accessibility:** Settings is a resizable scrolling dialog rather
   than the native navigation page; a full AccessKit/screen-reader semantics
-  pass, high-contrast tokens, text-scaling validation, menu/scrollbar polish,
+  pass, high-contrast tokens, text-scaling validation,
   and multi-monitor-aware position restore remain.
+  **Menu keyboard navigation: DONE** (2026-09-17) — a keyboard-opened menu
+  focuses its first enabled entry; arrows/Enter/Space ride egui's focus
+  system. The focus request is stored against the popup id (a bare flag was
+  eaten by the popup's sizing pass, where no entry is enabled), and a request
+  nothing consumed dies with its menu.
 
 The new Modules inspector is deliberately on-demand and Windows-only. Its
 unload command attempts ANY enumerated module — which module to unload is

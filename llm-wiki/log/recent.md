@@ -19,6 +19,85 @@
 - 2026-09-08: Process Properties now summarizes mitigations with System Informer-style qualifiers (permanent DEP, high-entropy ASLR, prohibited/disabled wording, CF Guard and stack protection), and module inventory uses the authenticated LocalSystem broker for identity-bound SYSTEM/service inspection with bounded responses.
 # Recent Activity
 
+## 2026-09-17 — UX overhaul across dialogs, tabs, Performance and Startup
+
+Planned from a UX audit against native Task Manager conventions; implemented
+and committed as ten reviewable commits (batches 1–7).
+
+- **Dialog keyboard contract.** New `app_ui::consume_dialog_keys` /
+  `dialog_key_decision` / `dialog_button_row` in `app_ui/original.rs`. Every
+  confirmation dialog consumes its keys BEFORE `Window::show` (egui's built-in
+  Enter/Space activation on a focused button would otherwise double-fire) and
+  the SAFE button owns the default: Escape and an unfocused Enter resolve to
+  Cancel/Close, and a focused but DISABLED primary still falls back to safe.
+  `process_end_dialog` therefore now focuses **Cancel** (it used to default to
+  End task, so Enter killed the selected processes); the UAC dialog's
+  non-consuming `key_pressed` (Enter = destructive Apply, and keys leaked to
+  later dialogs) is gone. Applied to Settings, Run task (unchanged), End task,
+  UAC, session logoff, affinity, unload confirm, Startup properties, Select
+  columns, Process properties and the modules dialog.
+- **Toasts** stack by their measured frame heights instead of a fixed 46 px
+  step (a wrapped message used to overlap the toast below it) and are
+  click-dismissible.
+- **Services**: the row menu gates Start/Stop/Restart on the service's actual
+  state (Start on a running service was a guaranteed error toast) with
+  hover explanations, stopped services show "—" in the PID column, and
+  Stop/Restart park behind a confirmation (`pending_service_control`).
+- **Users** row menu is always attached; without the session-control
+  capability its actions render disabled with an explanation instead of
+  right-clicking into silence. **App History** confirms "Delete usage history"
+  and explains its unavailable network cell. **Startup** reverts an optimistic
+  enable/disable flip inside the worker job when the SCM write fails.
+- **Double-click** on a Processes row opens it on Details; a group row carries
+  every member (`PendingDetailsFocus` now holds a target list whose first entry
+  is the primary, consumed by `Selection::select_exact`). "Go to details"
+  shares the semantics.
+- **The top search strip renders drag regions only on Performance** — the box
+  was permanently visible there but dead (the page has no search) — and
+  Alt/Ctrl+F no longer targets it on that tab. Empty filtered tables draw a
+  centered "no matches" message (`scrolled_rows` gained `empty_message`).
+- **i18n**: the Settings "Advanced"/Task-Manager-replacement block, the
+  move-column chevron tips, the L1/L2/L3 labels and "SSID:" are localized
+  (DE/EN) instead of hardcoded English.
+- **Truncation tooltips**: `TmTable::text_cell` reports whether the text was
+  clipped; Details, Services, Startup, Modules and the Processes name column
+  attach the full value to the row tooltip (lowest precedence after the
+  status/unknown-cell tips).
+- **Menu keyboard navigation**: a keyboard-opened menu hands focus to its
+  first enabled entry; arrows/Enter/Space then ride egui's focus system.
+  The request is stored against the POPUP id, because a popup's first frame is
+  a sizing pass where `ui.is_enabled()` is false for every entry — a bare flag
+  was consumed by that pass and never applied.
+- **Details**: unavailable "—" cells (network / disk active time / GPU) explain
+  themselves under the pointer via per-row unknown flags plus the
+  processes-style pointer containment; the Name header documents the 3-state
+  sort and the tree state draws a branch glyph (`Icon::Hierarchy`) where the
+  sort caret would be, since hierarchical is a state with no arrow.
+- **Performance**: Memory/Disk/Network graphs answer right-click with a
+  time-window menu (CPU/GPU keep theirs); the selected resource persists
+  (`perf_selected_key`); GPU memory is two graphs (dedicated scaled to VRAM
+  capacity, shared scaled to peak with a half-of-RAM floor) fed by a named
+  `GpuHistoryPoint`; the stats block labels capacity as capacity.
+- **Memory composition bar** on the Memory page (in use / modified / standby /
+  free + numeric legend) from `NtQuerySystemInformation(SystemMemoryListInformation)`
+  — a hand-written class constant and struct with a live kernel test, filled
+  into the new `MemoryInfo` fields. Omitted entirely when unreported.
+- **Measured Startup impact** replacing the permanent "Not measured":
+  `tm-core::startup_impact` folds per-tick deltas of the kernel's CPU time and
+  IO_COUNTERS bytes into per-image totals across the boot window (120 s),
+  classifies with Microsoft's documented thresholds (Low < 300 ms and
+  292 KB, High > 1 s or 3 MB), persists per image and joins by resolved
+  command target. Research finding that shaped it: startup impact is NOT in
+  SRUM (whose tables carry hourly App History aggregates), so it cannot be
+  read from there; the measurement is ours, and a session that misses the
+  window leaves the column honestly unmeasured.
+- Cross-target break caught by the release gate: the impact join called the
+  Windows-only startup module from shared tab code; resolution is now
+  platform-gated.
+- Gate: `python build.py --check` green (fmt, clippy -D warnings, fork gates,
+  workspace tests incl. the live page-list test, host + Linux release,
+  packaging).
+
 ## 2026-09-14 — Process crash dump creation progress status and responsive cancellation
 
 Writing process memory dumps (especially Full dumps of multi-gigabyte processes) can take substantial time. Previously, dump generation was an unmonitored background task with no user-visible progress indication, nor any mechanism to cancel an in-progress dump that was consuming disk space or I/O bandwidth.

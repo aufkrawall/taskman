@@ -1,6 +1,6 @@
 # Current State
 
-Last cross-checked: 2026-09-11
+Last cross-checked: 2026-09-17
 
 ## Summary
 
@@ -14,6 +14,55 @@ correctness, table interaction, Performance visuals, and advanced process
 diagnostics; remaining telemetry and accessibility work is itemized precisely
 in `known-debt.md`. Normal GUI startup remains unelevated; privileged controls
 can cross a protected, allowlisted service boundary after one explicit install.
+
+## Recently landed (2026-09-17 — UX overhaul: dialogs, discoverability, Startup impact)
+
+An audit pass against native Task Manager conventions, implemented in seven
+batches (see `log/recent.md` 2026-09-17 for the commit-level detail).
+
+- **Every confirmation dialog follows the Windows keyboard contract.** The
+  SAFE button owns the default: Escape and an unfocused Enter resolve to
+  Cancel/Close, and a focused-but-disabled primary falls back to safe too.
+  Keys are consumed before `Window::show` so egui's focused-button activation
+  cannot double-fire. The End-task dialog now focuses Cancel (it used to
+  default to End task, making Enter the kill key), and the UAC dialog's
+  Enter-means-Apply path is gone. Shared helpers:
+  `app_ui::{consume_dialog_keys, dialog_key_decision, dialog_button_row}`.
+- **Startup impact is measured, not a placeholder.** `tm-core::startup_impact`
+  accumulates per-image CPU-time and disk-I/O deltas across the boot window
+  (120 s) from the sampler's kernel counters and classifies with Microsoft's
+  documented thresholds (Low < 300 ms AND < 292 KB; High > 1 s OR > 3 MB).
+  Persisted per image; a session that starts after the window leaves the
+  column honestly "Not measured". Research note: startup impact is NOT in
+  SRUM — SRUDB.dat holds hourly App History aggregates — so it cannot be read
+  from there (see `log/recent.md` 2026-09-17).
+- **Memory composition bar** (in use / modified / standby / free + legend) on
+  the Performance Memory page, from
+  `NtQuerySystemInformation(SystemMemoryListInformation)` — a hand-written NT
+  class and struct in `win/perfcounters.rs`, pinned by a live kernel test.
+  `MemoryInfo` gained `modified_bytes` / `standby_bytes` / `free_bytes`
+  (0 = unreported; the bar is then not drawn).
+- **GPU memory is two graphs.** `HistoryPoint` now carries a named
+  `GpuHistoryPoint` with dedicated and shared usage; the page plots dedicated
+  (scaled to VRAM capacity) and shared (scaled to the observed peak with a
+  half-of-RAM floor, since Windows publishes no shared limit) separately, the
+  way native Task Manager does.
+- **Context menus are keyboard-navigable**: a keyboard-opened menu focuses its
+  first enabled entry and arrows/Enter/Space ride egui's focus system. The
+  focus request is keyed by POPUP id because the popup's first frame is a
+  sizing pass (`ui.is_enabled()` false for every entry).
+- **Gestures and discoverability**: double-click opens a Processes row on
+  Details (a group row lands with all members selected); the searched-out
+  table says "no matches"; Details explains every source-gated "—" on hover
+  and shows a branch glyph while the Name column is in its tree state;
+  Memory/Disk/Network graphs answer right-click with a time-window menu; the
+  selected Performance resource persists; truncated text cells expose their
+  full value as a row tooltip.
+- **Services** gate their actions on the service's real state and confirm
+  Stop/Restart; **Users** explains disabled session actions instead of staying
+  silent; **App History** confirms the history wipe; **Startup** rolls an
+  optimistic toggle back if the SCM write fails; the Settings "Advanced" block
+  and the remaining hardcoded strings are localized.
 
 ## Recently landed (2026-09-11 — disk attribution, graph readout, network units)
 
