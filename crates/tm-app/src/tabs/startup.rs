@@ -412,9 +412,25 @@ fn measured_impact(
     app: &TaskManApp,
     item: &tm_core::model::StartupItem,
 ) -> Option<tm_core::ImpactSample> {
-    let target = tm_platform::win::startup_command_target(&item.command)?;
+    let target = resolve_startup_target(&item.command)?;
     let key = tm_core::settings::process_rule_key(std::path::Path::new(&target));
     app.startup_impact.get(&key).copied()
+}
+
+/// Resolve the image a startup command launches.
+///
+/// Windows resolves quoted paths, environment variables and `.lnk` targets;
+/// the other backends only split off the leading token, which is enough for
+/// their own startup lists.
+fn resolve_startup_target(command: &str) -> Option<String> {
+    #[cfg(target_os = "windows")]
+    {
+        tm_platform::win::startup_command_target(command)
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        exe_from_command(command)
+    }
 }
 
 /// Tooltip under a measured impact: the raw numbers, so the Low/Medium/High
