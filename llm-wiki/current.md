@@ -638,6 +638,6 @@ rebase runbook.
 ## Open Threads
 
 - Analyze wait chain, processor-group-aware affinity (>64 CPUs), packaged/
-  MSIX startup tasks, ETW per-process network, live kernel dump, AccessKit
-  accessibility pass, production code signing, and disposable-VM service ACL/
-  recovery validation — see `known-debt.md` and `core-service.md`.
+  MSIX startup tasks, live kernel dump, AccessKit accessibility pass,
+  production code signing, and disposable-VM service ACL/recovery validation
+  — see `known-debt.md` and `core-service.md`.

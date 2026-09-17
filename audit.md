@@ -45,6 +45,13 @@ NPU/NPU Engine/NPU memory/Isolation columns. Microsoft documents the latter as
 optional current Windows columns; they need new capability-gated telemetry,
 not fabricated zero values.
 
+> Status (2026-09-17): this list is the plan as written, not current state.
+> Measured Startup Impact landed as an in-app measurement (see
+> `llm-wiki/current.md` and `tm-core/src/startup_impact.rs` — it is not read
+> from SRUM), the memory composition bar landed from the kernel page lists,
+> and per-process network plus per-GPU-engine histories landed earlier. Check
+> `llm-wiki/known-debt.md` for what is actually still open.
+
 Validation for this update: the full headless gate passed (format, clippy with
 warnings denied, and 148 tests across `tm-core`, `tm-platform`, `tm-app`, and
 Windows integration), followed by the host release build. The shipped EXE is
