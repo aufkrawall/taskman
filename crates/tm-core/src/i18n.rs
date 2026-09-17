@@ -665,6 +665,8 @@ keys! {
     Receive60s => ["Empfangen in 60 Sekunden (KBit/s)", "Receive for 60 seconds (Mbps)"],
     Send60s => ["Senden in 60 Sekunden (KBit/s)", "Send for 60 seconds (Mbps)"],
     GpuMemWindow => ["GPU-Speicher, {}", "GPU memory, {}"],
+    GpuDedicatedWindow => ["Dedizierter GPU-Speicher, {}", "Dedicated GPU memory, {}"],
+    GpuSharedWindow => ["Gemeinsamer GPU-Speicher, {}", "Shared GPU memory, {}"],
     StatUtilization => ["Auslastung", "Utilization"],
     StatSpeed => ["Geschwindigkeit", "Speed"],
     StatProcesses => ["Prozesse", "Processes"],
@@ -724,6 +726,12 @@ keys! {
     SeriesTotal => ["Gesamt", "Total"],
     GpuTitle => ["GPU", "GPU"],
     GpuMemStat => ["GPU-Speicher", "GPU memory"],
+    GpuDedicatedStat => ["Dedizierter Speicher", "Dedicated memory"],
+    GpuSharedStat => ["Gemeinsamer Speicher", "Shared memory"],
+    KvDedicatedCapacity => [
+        "Dedizierter Speicher (Kapazität):",
+        "Dedicated memory (capacity):"
+    ],
     KvDedicatedMem => ["Dedizierter Speicher:", "Dedicated memory:"],
     KvTemperature => ["Temperatur:", "Temperature:"],
     KvDriverVersion => ["Treiberversion:", "Driver version:"],

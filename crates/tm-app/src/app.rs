@@ -41,7 +41,10 @@ pub struct HistoryPoint {
     pub commit_limit_bytes: u64,
     pub disks: Vec<(String, f32, f64, f64)>, // mount, active%, read bps, write bps
     pub nets: Vec<(String, f64, f64)>,       // name, recv bps, sent bps
-    pub gpus: Vec<(usize, f32, u64)>,        // id, util%, mem used
+    /// Per-adapter GPU history. A named struct (not a tuple) because the
+    /// memory split is what the GPU page plots: `mem_used_bytes` on Windows
+    /// equals the dedicated total, and shared memory is its own series.
+    pub gpus: Vec<GpuHistoryPoint>,
     /// Per-adapter, per-engine utilization: `(gpu id, engine name, util %)`.
     ///
     /// Kept alongside `gpus` rather than inside it because the engine set is
@@ -51,6 +54,17 @@ pub struct HistoryPoint {
     /// alternative is an index into a registry that must then be kept in sync
     /// with a history buffer that outlives any single snapshot.
     pub gpu_engines: Vec<(usize, String, f32)>,
+}
+
+/// One adapter's per-tick values.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct GpuHistoryPoint {
+    pub id: usize,
+    pub util_pct: f32,
+    /// Dedicated (VRAM) bytes in use.
+    pub dedicated_used_bytes: u64,
+    /// Shared (system-memory-backed) bytes in use.
+    pub shared_used_bytes: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -870,7 +884,12 @@ impl TaskManApp {
                 gpus: latest
                     .gpus
                     .iter()
-                    .map(|g| (g.id, g.util_pct, g.mem_used_bytes))
+                    .map(|g| GpuHistoryPoint {
+                        id: g.id,
+                        util_pct: g.util_pct,
+                        dedicated_used_bytes: g.dedicated_used_bytes,
+                        shared_used_bytes: g.shared_used_bytes,
+                    })
                     .collect(),
                 gpu_engines: latest
                     .gpus

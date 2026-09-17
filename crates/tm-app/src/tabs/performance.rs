@@ -193,7 +193,7 @@ mod tests {
         assert_eq!(sent, vec![0.0, 20.0, 0.0]);
         let disk = disk_series(&win, "C:", |d| d.1 as f64);
         assert_eq!(disk, vec![0.0, 50.0, 0.0]);
-        let gpu = gpu_series(&win, "0", 1);
+        let gpu = gpu_series(&win, "0", GpuField::Util);
         assert_eq!(gpu, vec![0.0, 0.0, 0.0]);
     }
 
@@ -203,7 +203,11 @@ mod tests {
     #[test]
     fn a_gpu_engine_series_follows_that_engine_only() {
         let mut busy = pt(500);
-        busy.gpus = vec![(0, 90.0, 0)];
+        busy.gpus = vec![crate::app::GpuHistoryPoint {
+            id: 0,
+            util_pct: 90.0,
+            ..Default::default()
+        }];
         busy.gpu_engines = vec![
             (0, "3D".into(), 90.0),
             (0, "VideoEncode".into(), 12.0),
@@ -365,7 +369,7 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
                             }
                             ResourceKind::Disk => disk_series(win, &e.key, |d| d.1 as f64),
                             ResourceKind::Network => net_series(win, &e.key, 1),
-                            ResourceKind::Gpu => gpu_series(win, &e.key, 1),
+                            ResourceKind::Gpu => gpu_series(win, &e.key, GpuField::Util),
                         })
                         .collect();
                     for (e, samples) in entries.iter().zip(card_series.iter()) {
@@ -819,13 +823,25 @@ fn engine_label(name: &str) -> String {
     }
 }
 
-fn gpu_series(win: &[HistoryPoint], key: &str, idx: usize) -> Vec<f64> {
+/// Selected field of one GPU's history.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GpuField {
+    Util,
+    Dedicated,
+    Shared,
+}
+
+fn gpu_series(win: &[HistoryPoint], key: &str, field: GpuField) -> Vec<f64> {
     win.iter()
         .map(|h| {
             h.gpus
                 .iter()
-                .find(|(id, ..)| id.to_string() == key)
-                .map_or(0.0, |t| if idx == 1 { t.1 as f64 } else { t.2 as f64 })
+                .find(|point| point.id.to_string() == key)
+                .map_or(0.0, |point| match field {
+                    GpuField::Util => point.util_pct as f64,
+                    GpuField::Dedicated => point.dedicated_used_bytes as f64,
+                    GpuField::Shared => point.shared_used_bytes as f64,
+                })
         })
         .collect()
 }
@@ -1844,7 +1860,7 @@ fn gpu_page(app: &mut TaskManApp, ui: &mut egui::Ui, pal: &Palette, entry: &Reso
         "overall" => (
             vec![MultiSeries::new(
                 i18n::tr(K::StatUtilization),
-                gpu_series(win, &entry.key, 1),
+                gpu_series(win, &entry.key, GpuField::Util),
                 pal.gpu_graph,
             )],
             i18n::tr(K::StatUtilization).to_string(),
@@ -1876,34 +1892,68 @@ fn gpu_page(app: &mut TaskManApp, ui: &mut egui::Ui, pal: &Palette, entry: &Reso
         fmt_percent,
     );
 
-    let mem = gpu_series(win, &entry.key, 2);
-    let mem_max = gpu
+    // Dedicated (VRAM) and shared (system-memory-backed) memory are separate
+    // graphs, the way native Task Manager shows them: a GPU whose work spills
+    // into shared memory is exactly what the second graph is for, and their
+    // scales differ by an order of magnitude.
+    let dedicated = gpu_series(win, &entry.key, GpuField::Dedicated);
+    let dedicated_max = gpu
         .mem_total_bytes
-        .max(mem.iter().cloned().fold(0.0f64, f64::max) as u64)
+        .max(dedicated.iter().cloned().fold(0.0f64, f64::max) as u64)
         .max(1);
     caption(
         ui,
         pal,
         &i18n::trf(
-            K::GpuMemWindow,
+            K::GpuDedicatedWindow,
             &[&window_label(app.shared.settings.graph_seconds)],
         ),
-        &format::format_bytes_loc(mem_max),
+        &format::format_bytes_loc(dedicated_max),
     );
     // Mebibytes, matching `fmt_mib` — these were called `*_gb` while holding
     // MiB, which is exactly how a chart ends up mislabelled.
-    let mem_mib: Vec<f64> = mem.iter().map(|v| v / 1024.0 / 1024.0).collect();
-    let max_mib = mem_max as f64 / 1024.0 / 1024.0;
+    let dedicated_mib: Vec<f64> = dedicated.iter().map(|v| v / 1024.0 / 1024.0).collect();
     page_chart(
         ui,
         width,
         150.0,
         &[MultiSeries::new(
-            i18n::tr(K::GpuMemStat),
-            mem_mib,
+            i18n::tr(K::GpuDedicatedStat),
+            dedicated_mib,
             theme::toned(pal, pal.gpu_graph, 0.62),
         )],
-        max_mib,
+        dedicated_max as f64 / 1024.0 / 1024.0,
+        Some(axis),
+        fmt_mib,
+    );
+
+    // Windows does not publish a shared-memory LIMIT (the driver caps it at
+    // roughly half of system RAM), so the scale is the observed peak with a
+    // floor of half the installed RAM — stable, and never a fabricated cap.
+    let shared = gpu_series(win, &entry.key, GpuField::Shared);
+    let shared_peak = shared.iter().cloned().fold(0.0f64, f64::max);
+    let shared_floor = snap.memory.total_bytes as f64 / 2.0;
+    let shared_max = shared_peak.max(shared_floor).max(1.0);
+    caption(
+        ui,
+        pal,
+        &i18n::trf(
+            K::GpuSharedWindow,
+            &[&window_label(app.shared.settings.graph_seconds)],
+        ),
+        &format::format_bytes_loc(shared_max as u64),
+    );
+    let shared_mib: Vec<f64> = shared.iter().map(|v| v / 1024.0 / 1024.0).collect();
+    page_chart(
+        ui,
+        width,
+        150.0,
+        &[MultiSeries::new(
+            i18n::tr(K::GpuSharedStat),
+            shared_mib,
+            theme::toned(pal, pal.gpu_graph, 0.42),
+        )],
+        shared_max / 1024.0 / 1024.0,
         Some(axis),
         fmt_mib,
     );
@@ -1925,8 +1975,8 @@ fn gpu_page(app: &mut TaskManApp, ui: &mut egui::Ui, pal: &Palette, entry: &Reso
                 big_stat(
                     ui,
                     pal,
-                    i18n::tr(K::GpuMemStat),
-                    &format::format_bytes_loc(gpu.mem_used_bytes),
+                    i18n::tr(K::GpuDedicatedStat),
+                    &format::format_bytes_loc(gpu.dedicated_used_bytes),
                     w,
                 );
             });
@@ -1937,8 +1987,16 @@ fn gpu_page(app: &mut TaskManApp, ui: &mut egui::Ui, pal: &Palette, entry: &Reso
                     kv_row(
                         ui,
                         pal,
-                        i18n::tr(K::KvDedicatedMem),
+                        i18n::tr(K::KvDedicatedCapacity),
                         &format::format_bytes_loc(gpu.mem_total_bytes),
+                    );
+                }
+                if gpu.shared_used_bytes > 0 {
+                    kv_row(
+                        ui,
+                        pal,
+                        i18n::tr(K::GpuSharedStat),
+                        &format::format_bytes_loc(gpu.shared_used_bytes),
                     );
                 }
                 if let Some(t) = gpu.temperature_c {
