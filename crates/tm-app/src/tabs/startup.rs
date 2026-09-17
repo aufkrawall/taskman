@@ -244,11 +244,15 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
                     &pal,
                     false,
                 );
+                let measured = item.enabled.then(|| measured_impact(app, item)).flatten();
                 table.text_cell(
                     ui,
                     rect,
                     3,
-                    impact_label(app.lang(), item.impact),
+                    match &measured {
+                        Some(sample) => impact_label(app.lang(), sample.classify()),
+                        None => impact_label(app.lang(), item.impact),
+                    },
                     &pal,
                     false,
                 );
@@ -257,6 +261,8 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
                 // becomes the row tooltip (before the context menu attaches).
                 let resp = if pub_truncated && item.publisher.is_some() {
                     resp.on_hover_text(item.publisher.as_deref().unwrap_or_default())
+                } else if let Some(sample) = &measured {
+                    resp.on_hover_text(impact_tooltip(sample))
                 } else {
                     resp
                 };
@@ -393,6 +399,34 @@ fn toggle_selected(app: &mut TaskManApp, enable: bool, ctx: &egui::Context) {
     {
         item.enabled = enable;
     }
+}
+
+/// Measured impact for a startup item, when this machine has a measurement
+/// for the image its command launches.
+///
+/// The store is keyed by normalized image path (the same key per-image rules
+/// use), so the command has to resolve to a file that exists. A command that
+/// cannot be resolved simply has no measurement — the column then keeps
+/// "Not measured" instead of guessing which process an item launched.
+fn measured_impact(
+    app: &TaskManApp,
+    item: &tm_core::model::StartupItem,
+) -> Option<tm_core::ImpactSample> {
+    let target = tm_platform::win::startup_command_target(&item.command)?;
+    let key = tm_core::settings::process_rule_key(std::path::Path::new(&target));
+    app.startup_impact.get(&key).copied()
+}
+
+/// Tooltip under a measured impact: the raw numbers, so the Low/Medium/High
+/// judgement can be checked rather than trusted.
+fn impact_tooltip(sample: &tm_core::ImpactSample) -> String {
+    i18n::trf(
+        K::ImpactMeasuredTip,
+        &[
+            &format::format_cpu_time(sample.cpu_ms / 1000.0),
+            &format::format_bytes_loc(sample.disk_bytes),
+        ],
+    )
 }
 
 fn impact_label(lang: tm_core::i18n::Lang, impact: StartupImpact) -> &'static str {

@@ -605,6 +605,10 @@ keys! {
     ImpactLow => ["Niedrig", "Low"],
     ImpactMedium => ["Mittel", "Medium"],
     ImpactHigh => ["Hoch", "High"],
+    ImpactMeasuredTip => [
+        "Gemessen beim letzten Systemstart: {} CPU-Zeit, {} Datenträger-E/A",
+        "Measured during the last system start: {} CPU time, {} disk I/O"
+    ],
     ImpactUnknown => ["Nicht gemessen", "Not measured"],
     StartupUnavailable => ["Autostart nicht verfügbar:", "Startup apps unavailable:"],
     PropCommand => ["Befehl:", "Command:"],

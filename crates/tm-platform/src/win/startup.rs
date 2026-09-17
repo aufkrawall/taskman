@@ -330,6 +330,15 @@ fn resolve_publisher(command: &str) -> Option<String> {
 /// quoted paths, argument-bearing commands, environment variables and
 /// `.lnk` shortcuts (resolved through their link target arguments kept
 /// intact). The original command stays untouched for diagnostics.
+/// Executable a startup command launches, if it can be resolved.
+///
+/// Exposed for the Startup tab's measured-impact join: the impact store is
+/// keyed by image path, so the UI needs the same resolution the enumeration
+/// already does for publisher metadata.
+pub fn command_target(command: &str) -> Option<String> {
+    resolve_command_target(command)
+}
+
 fn resolve_command_target(command: &str) -> Option<String> {
     let cmd = command.trim();
     let candidate = if let Some(rest) = cmd.strip_prefix('"') {

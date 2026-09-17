@@ -20,6 +20,7 @@ pub mod logging;
 pub mod mock;
 pub mod model;
 pub mod settings;
+pub mod startup_impact;
 pub mod sync;
 
 pub use app_history::AppHistoryDb;
@@ -27,3 +28,4 @@ pub use demand::TelemetryDemand;
 pub use engine::{CollectorFactory, EngineCmd, EngineHandle, EngineState, NotifyFn};
 pub use error::{Result, TmError};
 pub use model::*;
+pub use startup_impact::{ImpactSample, ImpactStore, StartupImpactTracker};

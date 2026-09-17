@@ -320,6 +320,11 @@ pub struct TaskManApp {
     /// window setting must never silently truncate the visible history.
     pub history_cap: usize,
     pub app_history_db: tm_core::AppHistoryDb,
+    /// Measured startup cost per image, persisted across restarts. Filled by
+    /// [`TaskManApp::startup_impact_tracker`] while the machine is still
+    /// inside its startup window; the Startup tab joins it by image path.
+    pub startup_impact: tm_core::ImpactStore,
+    startup_impact_tracker: Option<tm_core::StartupImpactTracker>,
     pub tab: Tab,
     pub show_settings: bool,
     pub run_dialog_open: bool,
@@ -647,6 +652,9 @@ impl TaskManApp {
         // App history loads on a worker; observations wait for it (ms-scale).
         let history_path = tm_core::settings::taskman_data_dir().join("app-history.json");
         let app_history_db = tm_core::AppHistoryDb::open_deferred(history_path);
+        let startup_impact = tm_core::ImpactStore::open(
+            tm_core::settings::taskman_data_dir().join("startup-impact.json"),
+        );
 
         // Details tab column visibility/order live in the settings file;
         // apply them before the first frame so telemetry demand and the
@@ -746,6 +754,8 @@ impl TaskManApp {
             history: Vec::with_capacity(history_cap + 8),
             history_cap,
             app_history_db,
+            startup_impact,
+            startup_impact_tracker: None,
             tab,
             show_settings,
             run_dialog_open,
@@ -906,6 +916,31 @@ impl TaskManApp {
             // Feed the persistent app-history database.
             let interval_s = self.engine.interval().as_secs_f64().max(0.05);
             self.app_history_db.observe(&latest, interval_s);
+            // Startup impact is measured between the first sample and the end
+            // of the boot window. The tracker is created from the FIRST
+            // snapshot's uptime: an app started long after boot never opens a
+            // window and never fabricates a measurement.
+            let tracker = self.startup_impact_tracker.get_or_insert_with(|| {
+                tm_core::StartupImpactTracker::new(
+                    latest.system.uptime_s,
+                    latest.system.boot_epoch_s,
+                )
+            });
+            if tracker.is_active() {
+                tracker.observe(&latest);
+                if !tracker.is_active() {
+                    // Window closed: fold the measurements into the store and
+                    // drop the per-tick state.
+                    self.startup_impact.merge(tracker.totals());
+                    if !self.startup_impact.is_empty() {
+                        self.startup_impact.save();
+                    }
+                    tracing::info!(
+                        images = tracker.totals().len(),
+                        "startup window closed; startup impact measured"
+                    );
+                }
+            }
             self.apply_saved_process_rules(&latest, ctx);
             // Rows that exited leave the selection with them, so the toolbar
             // never offers to end a process that is already gone and a
@@ -1176,6 +1211,13 @@ impl TaskManApp {
         self.shared.settings_writer.flush();
         // Final synchronous flush so history is not lost at shutdown.
         self.app_history_db.save();
+        // A session that ends inside the startup window still keeps what it
+        // measured: the tracker's totals are folded in before the save.
+        if let Some(tracker) = &self.startup_impact_tracker {
+            let totals = tracker.totals().clone();
+            self.startup_impact.merge(&totals);
+        }
+        self.startup_impact.save();
     }
 }
 

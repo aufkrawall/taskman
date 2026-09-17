@@ -44,6 +44,7 @@ pub use process_ops::{ProcessMachineType, ProcessProtectionLevel, ProcessSecurit
 mod sampler;
 mod services;
 mod startup;
+pub use startup::command_target as startup_command_target;
 mod taskmgr_replacement;
 /// Sub-pixel (ClearType) text-rendering parameters and their validity gates.
 pub mod text_rendering;
