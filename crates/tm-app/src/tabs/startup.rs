@@ -389,10 +389,9 @@ fn toggle_selected(app: &mut TaskManApp, enable: bool, ctx: &egui::Context) {
     if let Some((items, _)) = cache.as_mut()
         && let Some(id) = app.selected_startup_id.clone()
         && let Some(item) = items.iter_mut().find(|it| it.id == id)
+        && toggle_item(app, ctx, id, enable)
     {
-        if toggle_item(app, ctx, id, enable) {
-            item.enabled = enable;
-        }
+        item.enabled = enable;
     }
 }
 

@@ -72,14 +72,28 @@ pub fn keyboard_menu_requested(ctx: &egui::Context) -> bool {
         })
 }
 
+/// Memory key holding the id of the popup whose keyboard-opened menu still
+/// owes first-entry focus. Stored as the POPUP id, not a bare flag: the
+/// popup's first frame is a SIZING PASS in which `ui.is_enabled()` is false
+/// for every entry, so the request cannot be consumed until the next frame —
+/// and binding it to the popup is what keeps a menu that never had an enabled
+/// entry from handing focus to whatever menu opens later.
+const KB_INITIAL_FOCUS: &str = "tm-menu-kb-initial-focus";
+
 /// Context menu that also opens from the keyboard: when `keyboard_open` is
 /// set (the row is the current selection and [`keyboard_menu_requested`]
 /// fired this frame), the same popup is forced open, anchored to the row —
 /// which is where Windows puts a keyboard-invoked menu — instead of waiting
-/// for a secondary click.
+/// for a secondary click. The first enabled entry receives keyboard focus,
+/// and from there egui's own focus system takes over: bare arrow keys move
+/// between entries (disabled ones are skipped) and Enter/Space activate the
+/// focused entry through focused-button activation, which `clicked()` reports.
 pub fn context_menu_kb(resp: &Response, keyboard_open: bool, add: impl FnOnce(&mut Ui)) {
+    let popup_id = egui::Popup::default_response_id(resp);
     let popup = egui::Popup::context_menu(resp);
     let popup = if keyboard_open {
+        resp.ctx
+            .data_mut(|d| d.insert_temp(egui::Id::new(KB_INITIAL_FOCUS), popup_id));
         popup
             .open_memory(egui::containers::SetOpenCommand::Bool(true))
             .at_position(resp.rect.left_bottom())
@@ -87,6 +101,15 @@ pub fn context_menu_kb(resp: &Response, keyboard_open: bool, add: impl FnOnce(&m
         popup
     };
     popup.style(style).show(add);
+    // Once this menu is gone, a request nothing consumed (every entry was
+    // greyed out) must not outlive it.
+    let pending = resp
+        .ctx
+        .data(|d| d.get_temp::<egui::Id>(egui::Id::new(KB_INITIAL_FOCUS)));
+    if pending == Some(popup_id) && !egui::Popup::is_id_open(&resp.ctx, popup_id) {
+        resp.ctx
+            .data_mut(|d| d.remove::<egui::Id>(egui::Id::new(KB_INITIAL_FOCUS)));
+    }
 }
 
 /// A drop-down button in the app chrome that opens a menu in the same style.
@@ -139,11 +162,24 @@ fn entry(ui: &mut Ui, text: &str, marks: Marks) -> Response {
     let (rect, resp) = ui.allocate_at_least(want, Sense::click());
     let enabled = ui.is_enabled();
 
+    // A keyboard-opened menu hands focus to its first enabled entry so the
+    // arrow keys have somewhere to start. The popup's FIRST frame is a sizing
+    // pass where no entry is enabled yet, so the request lives in memory until
+    // the frame it can actually be consumed.
+    if enabled {
+        let key = egui::Id::new(KB_INITIAL_FOCUS);
+        let pending = ui.ctx().data(|d| d.get_temp::<egui::Id>(key));
+        if pending == Some(ui.layer_id().id) {
+            ui.ctx().data_mut(|d| d.remove::<egui::Id>(key));
+            resp.request_focus();
+        }
+    }
+
     let fill = if !enabled {
         None
     } else if resp.is_pointer_button_down_on() {
         Some(pressed_fill(&pal))
-    } else if resp.hovered() || marks.open {
+    } else if resp.hovered() || marks.open || resp.has_focus() {
         Some(pal.card_bg_hover)
     } else {
         None
@@ -512,6 +548,86 @@ mod tests {
         out5.textures_delta.clear();
 
         assert!(!opened_frame_5, "menu should be closed after Escape");
+    }
+
+    #[test]
+    fn keyboard_opened_menu_focuses_and_navigates() {
+        fn paint(ui: &mut Ui, focus: &mut [bool; 3], activated: &mut bool) {
+            let a = item(ui, "Action 1");
+            let b = item(ui, "Action 2");
+            let c = item(ui, "Action 3");
+            focus[0] = a.has_focus();
+            focus[1] = b.has_focus();
+            focus[2] = c.has_focus();
+            if b.clicked() {
+                *activated = true;
+            }
+        }
+        let ctx = egui::Context::default();
+        let screen = Rect::from_min_size(Pos2::ZERO, egui::vec2(800.0, 600.0));
+        // `focused: true` matters: `Response::has_focus` also requires the
+        // WINDOW to have OS focus, which headless input does not claim by
+        // default.
+        let raw = |events: Vec<egui::Event>| egui::RawInput {
+            screen_rect: Some(screen),
+            events,
+            focused: true,
+            ..Default::default()
+        };
+        let key = |key: egui::Key| egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::default(),
+        };
+        let run = |raw: egui::RawInput,
+                   keyboard_open: bool,
+                   f: &mut [bool; 3],
+                   act: &mut bool|
+         -> egui::FullOutput {
+            ctx.run_ui(raw, |ui| {
+                let resp = ui.label("row");
+                context_menu_kb(&resp, keyboard_open, |ui| paint(ui, f, act));
+            })
+        };
+
+        // Frame 1: keyboard-open. Focus applies from the NEXT frame on.
+        let (mut f, mut act) = ([false; 3], false);
+        let mut out = run(raw(vec![]), true, &mut f, &mut act);
+        out.textures_delta.clear();
+        assert!(
+            !f[0] && !f[1] && !f[2],
+            "frame 1 paints before focus applies"
+        );
+
+        // Frame 2: the first entry owns the focus.
+        let mut out = run(raw(vec![]), false, &mut f, &mut act);
+        out.textures_delta.clear();
+        assert!(f[0] && !f[1] && !f[2], "first entry must hold focus: {f:?}");
+
+        // Frame 3: ArrowDown is READ this frame (focus still on entry 1)...
+        let mut out = run(
+            raw(vec![key(egui::Key::ArrowDown)]),
+            false,
+            &mut f,
+            &mut act,
+        );
+        out.textures_delta.clear();
+        assert!(f[0], "focus must not jump mid-frame");
+
+        // Frame 4: ...and the second entry owns it now.
+        let mut out = run(raw(vec![]), false, &mut f, &mut act);
+        out.textures_delta.clear();
+        assert!(
+            f[1] && !f[0] && !f[2],
+            "ArrowDown must move focus down: {f:?}"
+        );
+
+        // Frame 5: Enter activates the focused entry.
+        let mut out = run(raw(vec![key(egui::Key::Enter)]), false, &mut f, &mut act);
+        out.textures_delta.clear();
+        assert!(act, "Enter must activate the focused entry");
     }
 
     #[test]
