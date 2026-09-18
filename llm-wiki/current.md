@@ -569,8 +569,9 @@ rebase runbook.
   attach only for CLI modes; early ring logging with deferred file attach;
   async font + app-history loading.
 - Event-driven UI: engine publications and worker completions request
-  repaint; interval polling removed; toast ids stable; toasts persist without
-  timed auto-close and are dismissed via an 'x' button.
+  repaint; interval polling removed; toast ids stable; a toast is dismissed
+  by its 'x' button (never by a stray click on its body), a stack of them by
+  a 'Clear all' button, and an unattended one expires after `TOAST_TTL`.
 - Correctness fixes: table/splitter resize math accumulates per-frame
   `drag_delta()` onto the live width (drag-start snapshots were wrong —
   `drag_delta()` is NOT cumulative in egui); F5 forces
