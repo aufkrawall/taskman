@@ -4,7 +4,7 @@
 use crate::actions::{MODULE_UNLOAD_SINGLE_RELEASE_MARKER, ModuleUnloadOutcome, ProcessModule};
 use tm_core::error::{Result, TmError};
 use tm_core::model::PriorityClass;
-use windows::Win32::Foundation::{CloseHandle, FILETIME, HANDLE};
+use windows::Win32::Foundation::{CloseHandle, ERROR_ACCESS_DENIED, FILETIME, HANDLE};
 use windows::Win32::System::Threading as th;
 use windows::Win32::UI::Shell::ShellExecuteExW;
 use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
@@ -97,6 +97,7 @@ fn open_destructive_process_verified(
     access: th::PROCESS_ACCESS_RIGHTS,
     expected_start_epoch_s: Option<i64>,
 ) -> Result<HANDLE> {
+    enable_debug_privilege();
     let process = open_process_verified(
         pid,
         access | th::PROCESS_QUERY_LIMITED_INFORMATION,
@@ -1173,8 +1174,33 @@ pub fn terminate_verified(pid: u32, expected_start_epoch_s: Option<i64>) -> Resu
 
 fn terminate_handle(process: HANDLE) -> Result<()> {
     // Exit code 1 mirrors Task Manager behavior.
-    unsafe { th::TerminateProcess(process, 1) }
-        .map_err(|error| TmError::platform("TerminateProcess", error.to_string()))
+    if let Err(error) = unsafe { th::TerminateProcess(process, 1) } {
+        // If the process has already exited or is in the final stages of exiting,
+        // TerminateProcess can fail with ERROR_ACCESS_DENIED (0x80070005) because
+        // the kernel returns STATUS_PROCESS_IS_TERMINATING (0xC000010A), which maps
+        // to Win32 error 5. If GetExitCodeProcess indicates the process is no longer
+        // active, the termination goal is already fulfilled.
+        let mut exit_code = 0u32;
+        const STILL_ACTIVE: u32 = 259;
+        if unsafe { th::GetExitCodeProcess(process, &mut exit_code) }.is_ok()
+            && exit_code != STILL_ACTIVE
+        {
+            return Ok(());
+        }
+
+        let raw_error = error.to_string();
+        let message = if error.code() == ERROR_ACCESS_DENIED.to_hresult() {
+            format!(
+                "{raw_error} (process may be a zombie stuck in kernel/driver teardown, \
+                 contains protected driver threads, or is blocked by security software; \
+                 unkillable from user mode even as SYSTEM)"
+            )
+        } else {
+            raw_error
+        };
+        return Err(TmError::platform("TerminateProcess", message));
+    }
+    Ok(())
 }
 
 /// Terminate `pid` (and, with `tree`, all descendants). When
@@ -2819,5 +2845,19 @@ mod tests {
             !catalog.accounts_by_pid.is_empty(),
             "service accounts must be catalogued per PID"
         );
+    }
+
+    #[test]
+    fn terminate_handle_on_already_exited_process_succeeds() {
+        use std::os::windows::io::AsRawHandle;
+        let mut child = std::process::Command::new("cmd")
+            .args(["/C", "exit", "0"])
+            .spawn()
+            .expect("spawn child");
+        let _ = child.wait();
+        let handle = HANDLE(child.as_raw_handle() as _);
+        // Process is already exited. terminate_handle must succeed cleanly rather
+        // than reporting an error.
+        assert!(terminate_handle(handle).is_ok());
     }
 }

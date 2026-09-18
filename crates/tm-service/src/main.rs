@@ -25,6 +25,7 @@ fn main() -> windows_service::Result<()> {
     }
 
     tm_platform::win::prioritize_control_plane();
+    tm_platform::win::enable_debug_privilege();
     service::run_dispatcher()
 }
 
