@@ -40,14 +40,18 @@ pub fn adapters() -> Vec<AdapterInfo> {
                     || (desc.VendorId == 0x1414 && desc.DeviceId == 0x8c)
                     || name.contains("Microsoft Basic Render Driver")
                     || name.contains("Microsoft Basic Display Adapter");
-                let driver_version =
-                    if let Ok(uversion) = adapter.CheckInterfaceSupport(&IDXGIDevice::IID) {
+                // An adapter with no user-mode driver (software renderers,
+                // and anything that answers 0) has no version to report. An
+                // empty string is what the UI renders as unavailable; a
+                // formatted "0.0.0.0" would be a fabricated one.
+                let driver_version = match adapter.CheckInterfaceSupport(&IDXGIDevice::IID) {
+                    Ok(uversion) if uversion != 0 => {
                         let hi = (uversion >> 32) as u32;
                         let lo = (uversion & 0xffff_ffff) as u32;
                         format!("{}.{}.{}.{}", hi >> 16, hi & 0xffff, lo >> 16, lo & 0xffff)
-                    } else {
-                        String::new()
-                    };
+                    }
+                    _ => String::new(),
+                };
                 out.push(AdapterInfo {
                     name,
                     dedicated_vram: desc.DedicatedVideoMemory as u64,
