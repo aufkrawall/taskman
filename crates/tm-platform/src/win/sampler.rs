@@ -830,6 +830,7 @@ impl Sampler {
             }
         }
 
+        let mut dead_pids: Vec<sysinfo::Pid> = Vec::new();
         for (pid, p) in self.sys.processes() {
             let pid_u = pid.as_u32();
             // Single owned copy of the name per process (reused everywhere).
@@ -875,6 +876,29 @@ impl Sampler {
             } else {
                 self.cpu_load.start_epoch_of(pid_u)
             };
+
+            let threads = thread_counts
+                .get(&pid_u)
+                .copied()
+                .or_else(|| self.cpu_load.thread_count_of(pid_u, entry.start_epoch_s));
+
+            // Evict and drop crashed / terminated zombie processes.
+            // When an application crashes (GPU driver TDR, unhandled exception), its
+            // threads exit and the process object becomes signaled. sysinfo holds an
+            // open PROCESS_VM_READ handle to the process; on Windows NT, the kernel
+            // cannot complete address-space and driver rundown while an external
+            // handle with VM_READ is open, keeping the process listed in Toolhelp
+            // snapshots (a circular handle deadlock). Detecting process termination
+            // allows us to omit the dead process from the snapshot and remove it from
+            // sysinfo, immediately closing the handle and freeing the kernel object.
+            if pid_u > 4
+                && (threads == Some(0)
+                    || (threads.unwrap_or(0) <= 1 && is_process_terminated(pid_u)))
+            {
+                dead_pids.push(*pid);
+                continue;
+            }
+
             entry.status = map_status(p.status());
             if self.cpu_load.is_suspended(pid_u, entry.start_epoch_s) {
                 entry.status = ProcStatus::Suspended;
@@ -942,11 +966,25 @@ impl Sampler {
                 .get(&pid_u)
                 .map(|names| names.join(", "));
             entry.exe_path = exe_owned;
-            entry.threads = thread_counts
-                .get(&pid_u)
-                .copied()
-                .or_else(|| self.cpu_load.thread_count_of(pid_u, entry.start_epoch_s));
+            entry.threads = threads;
             processes.push(entry);
+        }
+
+        // Evict dead processes from sysinfo to close their open handles immediately
+        // (breaking the circular handle reference in the kernel) and purge them from
+        // our attribute caches.
+        if !dead_pids.is_empty() {
+            for dead_pid in &dead_pids {
+                let dead_u = dead_pid.as_u32();
+                self.attrs.remove(&dead_u);
+                self.prev_proc_net.remove(&dead_u);
+                self.last_proc_disk.remove(&dead_u);
+            }
+            // Recreating sysinfo's System drops all its cached process structs and
+            // closes all open handles held by sysinfo (including the PROCESS_VM_READ
+            // handle to the dead/crashed process). This breaks the kernel circular
+            // reference and allows Windows to finish driver/address-space teardown.
+            self.sys = System::new();
         }
 
         // ---- slow-changing native attributes (cached, TTL-based) --------------
@@ -1559,6 +1597,60 @@ fn microsoft_company(company: Option<&str>) -> bool {
         company.eq_ignore_ascii_case("Microsoft Corporation")
             || company.eq_ignore_ascii_case("Microsoft Windows")
     })
+}
+
+/// Tests whether a process has terminated.
+///
+/// Under Windows NT, a process object transitions to the signaled state
+/// (`WAIT_OBJECT_0`) the instant all its threads terminate or the process exits.
+/// Checking `WaitForSingleObject` with `PROCESS_SYNCHRONIZE` rights or verifying
+/// `GetExitCodeProcess != STILL_ACTIVE` (259) provides an infallible kernel
+/// determination of whether the process has exited.
+fn is_process_terminated(pid: u32) -> bool {
+    use windows::Win32::Foundation::{CloseHandle, WAIT_OBJECT_0};
+    use windows::Win32::System::Threading::{
+        GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
+        WaitForSingleObject,
+    };
+
+    if pid <= 4 {
+        return false;
+    }
+
+    unsafe {
+        // Try opening with PROCESS_SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION
+        if let Ok(handle) = OpenProcess(
+            PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE,
+            false,
+            pid,
+        ) {
+            let signaled = WaitForSingleObject(handle, 0) == WAIT_OBJECT_0;
+            let mut exit_code = 0u32;
+            let has_exit_code =
+                GetExitCodeProcess(handle, &mut exit_code).is_ok() && exit_code != 259; // STILL_ACTIVE
+            let _ = CloseHandle(handle);
+            return signaled || has_exit_code;
+        }
+
+        // Fallback: try just PROCESS_QUERY_LIMITED_INFORMATION
+        if let Ok(handle) = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) {
+            let mut exit_code = 0u32;
+            let exited = GetExitCodeProcess(handle, &mut exit_code).is_ok() && exit_code != 259; // STILL_ACTIVE
+            let _ = CloseHandle(handle);
+            return exited;
+        }
+
+        // Fallback: try just PROCESS_SYNCHRONIZE
+        if let Ok(handle) = OpenProcess(PROCESS_SYNCHRONIZE, false, pid) {
+            let signaled = WaitForSingleObject(handle, 0) == WAIT_OBJECT_0;
+            let _ = CloseHandle(handle);
+            return signaled;
+        }
+
+        // ERROR_INVALID_PARAMETER: PID does not exist in kernel process table.
+        let err = windows::Win32::Foundation::GetLastError();
+        err.0 == 87
+    }
 }
 
 /// Evidence that an image is Microsoft-published from a Windows-owned path.

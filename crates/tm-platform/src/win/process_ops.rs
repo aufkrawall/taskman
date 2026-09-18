@@ -2586,19 +2586,40 @@ mod tests {
         assert!(!creation_matches(100, None));
     }
 
+    fn spawn_dump_target() -> (std::process::Child, u32) {
+        use std::io::BufRead;
+        let mut child = std::process::Command::new("cmd")
+            .args(["/C", "echo ready & ping -n 30 127.0.0.1 >nul"])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn dump target child");
+        let pid = child.id();
+        if let Some(stdout) = child.stdout.as_mut() {
+            let mut reader = std::io::BufReader::new(stdout);
+            let mut line = String::new();
+            let _ = reader.read_line(&mut line);
+        }
+        (child, pid)
+    }
+
     #[test]
     fn create_dump_file_with_progress_tracks_bytes_written() {
+        let (mut child, target_pid) = spawn_dump_target();
         let temp_dir = std::env::temp_dir();
-        let dump_path = temp_dir.join(format!("test_dump_progress_{}.dmp", std::process::id()));
+        let dump_path = temp_dir.join(format!("test_dump_progress_{target_pid}.dmp"));
         let tracker = std::sync::Arc::new(tm_core::model::DumpProgressTracker::new());
 
         let res = create_dump_file_with_progress(
-            std::process::id(),
+            target_pid,
             None,
             &dump_path,
             tm_core::model::DumpType::Minimal,
             Some(tracker.clone()),
         );
+
+        let _ = child.kill();
+        let _ = child.wait();
 
         let exists = dump_path.exists();
         let _ = std::fs::remove_file(&dump_path);
@@ -2613,18 +2634,22 @@ mod tests {
 
     #[test]
     fn create_dump_file_with_progress_cancels_before_start() {
+        let (mut child, target_pid) = spawn_dump_target();
         let temp_dir = std::env::temp_dir();
-        let dump_path = temp_dir.join(format!("test_dump_cancel_pre_{}.dmp", std::process::id()));
+        let dump_path = temp_dir.join(format!("test_dump_cancel_pre_{target_pid}.dmp"));
         let tracker = std::sync::Arc::new(tm_core::model::DumpProgressTracker::new());
         tracker.request_cancel();
 
         let res = create_dump_file_with_progress(
-            std::process::id(),
+            target_pid,
             None,
             &dump_path,
             tm_core::model::DumpType::Minimal,
             Some(tracker),
         );
+
+        let _ = child.kill();
+        let _ = child.wait();
 
         assert!(
             matches!(res, Err(TmError::Canceled)),
@@ -2638,8 +2663,9 @@ mod tests {
 
     #[test]
     fn create_dump_file_with_progress_cancels_immediately() {
+        let (mut child, target_pid) = spawn_dump_target();
         let temp_dir = std::env::temp_dir();
-        let dump_path = temp_dir.join(format!("test_dump_cancel_mid_{}.dmp", std::process::id()));
+        let dump_path = temp_dir.join(format!("test_dump_cancel_mid_{target_pid}.dmp"));
         let tracker = std::sync::Arc::new(tm_core::model::DumpProgressTracker::new());
 
         let tracker_bg = tracker.clone();
@@ -2650,7 +2676,7 @@ mod tests {
         });
 
         let res = create_dump_file_with_progress(
-            std::process::id(),
+            target_pid,
             None,
             &dump_path,
             tm_core::model::DumpType::Full,
@@ -2658,6 +2684,9 @@ mod tests {
         );
 
         let _ = cancel_thread.join();
+        let _ = child.kill();
+        let _ = child.wait();
+
         let exists = dump_path.exists();
         let _ = std::fs::remove_file(&dump_path);
 

@@ -294,6 +294,70 @@ fn kill_spawned_child() {
 
 #[cfg(target_os = "windows")]
 #[test]
+fn terminated_process_is_immediately_omitted_and_evicted_from_collector() {
+    let mut collector = tm_platform::create_collector();
+
+    let mut child = std::process::Command::new("cmd")
+        .args(["/C", "ping", "-n", "30", "127.0.0.1"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn child");
+    let pid = child.id();
+
+    // Verify it is sampled while alive
+    let found_alive = poll_for(
+        || {
+            let snap = collector.sample(std::time::Instant::now()).ok()?;
+            snap.processes.iter().any(|p| p.pid == pid).then_some(())
+        },
+        std::time::Duration::from_secs(10),
+    );
+    assert!(found_alive.is_some(), "child {pid} was not sampled alive");
+
+    // Hold an open handle to the child process with PROCESS_VM_READ | PROCESS_QUERY_INFORMATION
+    // (simulating handle retention that keeps the process object alive in kernel)
+    let held_handle = unsafe {
+        windows::Win32::System::Threading::OpenProcess(
+            windows::Win32::System::Threading::PROCESS_QUERY_INFORMATION
+                | windows::Win32::System::Threading::PROCESS_VM_READ,
+            false,
+            pid,
+        )
+        .ok()
+    };
+
+    // Kill the child
+    let _ = child.kill();
+    let _ = child.wait();
+
+    // Sample again: even with external handles holding the EPROCESS executive object,
+    // the sampler must detect that the process terminated, omit it from the snapshot,
+    // and evict it from sysinfo so it never appears as a zombie ghost process.
+    let omitted = poll_for(
+        || {
+            let snap = collector.sample(std::time::Instant::now()).ok()?;
+            if !snap.processes.iter().any(|p| p.pid == pid) {
+                Some(())
+            } else {
+                None
+            }
+        },
+        std::time::Duration::from_secs(5),
+    );
+
+    if let Some(h) = held_handle {
+        let _ = unsafe { windows::Win32::Foundation::CloseHandle(h) };
+    }
+
+    assert!(
+        omitted.is_some(),
+        "terminated process {pid} lingered in snapshot despite exit"
+    );
+}
+
+#[cfg(target_os = "windows")]
+#[test]
 fn suspend_resume_own_child() {
     let actions = tm_platform::create_actions();
     let mut child = std::process::Command::new("cmd")
