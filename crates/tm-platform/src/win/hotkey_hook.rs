@@ -10,6 +10,26 @@
 //! holds focus. By pumping a dedicated message loop on a background thread, the hook
 //! detects the key combo with zero latency, raises TaskMan, and consumes the Escape
 //! key so the underlying application does not interpret it (e.g. opening game menus).
+//!
+//! ## What this costs the rest of the machine
+//!
+//! A `WH_KEYBOARD_LL` hook is not free for anyone else: EVERY keystroke on the
+//! desktop is routed through this process before it reaches the application the
+//! user is typing into, and a callback that blocks delays that keystroke
+//! system-wide until Windows' `LowLevelHooksTimeout` gives up on it. Two rules
+//! follow, and both are load-bearing:
+//!
+//! * **The hook exists only while it is needed.** It is installed when TaskMan
+//!   is the registered Task Manager replacement and taken down again when it is
+//!   not, driven by a registry change notification rather than by polling. A
+//!   user who never turned the replacement on never has their keyboard routed
+//!   through this process at all.
+//! * **The callback does no work.** No allocation, no registry, no lock, no
+//!   syscall beyond the key-state reads: it consults one atomic, signals an
+//!   event and returns. Everything the hotkey actually DOES — raising the
+//!   window, attaching thread input — happens on the worker thread, which
+//!   pumps its own message queue precisely so that attaching to another
+//!   application's input queue cannot stall that application.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, AtomicU64, Ordering};
@@ -17,14 +37,14 @@ use windows::Win32::Foundation::{CloseHandle, HANDLE, LPARAM, LRESULT, WAIT_OBJE
 use windows::Win32::System::SystemInformation::GetTickCount64;
 use windows::Win32::System::Threading::{
     CreateEventW, GetCurrentThread, SetEvent, SetThreadPriority, THREAD_PRIORITY_HIGHEST,
-    WaitForSingleObject,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetAsyncKeyState, VK_CONTROL, VK_ESCAPE, VK_LWIN, VK_MENU, VK_RWIN, VK_SHIFT,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CallNextHookEx, DispatchMessageW, GetMessageW, HC_ACTION, KBDLLHOOKSTRUCT, MSG,
-    PostThreadMessageW, SetWindowsHookExW, TranslateMessage, UnhookWindowsHookEx, WH_KEYBOARD_LL,
+    CallNextHookEx, DispatchMessageW, GetMessageW, HC_ACTION, HHOOK, KBDLLHOOKSTRUCT, MSG,
+    MsgWaitForMultipleObjects, PM_NOREMOVE, PM_REMOVE, PeekMessageW, PostThreadMessageW,
+    QS_ALLINPUT, SetWindowsHookExW, TranslateMessage, UnhookWindowsHookEx, WH_KEYBOARD_LL, WM_APP,
     WM_KEYDOWN, WM_KEYUP, WM_QUIT, WM_SYSKEYDOWN, WM_SYSKEYUP,
 };
 
@@ -32,17 +52,32 @@ static CONSUMED_DOWN: AtomicBool = AtomicBool::new(false);
 static LAST_DOWN_TICK: AtomicU64 = AtomicU64::new(0);
 static TRIGGER_EVENT: AtomicIsize = AtomicIsize::new(0);
 static WORKER_RUNNING: AtomicBool = AtomicBool::new(false);
-static REPLACEMENT_CACHE: AtomicBool = AtomicBool::new(false);
-static REPLACEMENT_CACHE_TICK: AtomicU64 = AtomicU64::new(0);
+/// Whether TaskMan is the registered Task Manager replacement.
+///
+/// The hook callback's only piece of state. It is a plain atomic because the
+/// callback runs on the system's input path: the registry read that answers
+/// this question lives on the worker thread, which re-runs it when the IFEO
+/// key actually changes.
+static REPLACEMENT_ENABLED: AtomicBool = AtomicBool::new(false);
 
 static HOOK_CALLBACK: std::sync::Mutex<Option<Arc<dyn Fn() + Send + Sync + 'static>>> =
     std::sync::Mutex::new(None);
 
+/// Ask the hook thread to install (`wparam == 1`) or remove the keyboard hook.
+/// A thread message, so it carries no window and never reaches a window proc.
+const WM_SET_HOOK: u32 = WM_APP + 1;
+
+/// Backstop wait for a worker whose registry notification could not be armed.
+/// Only ever used on that fallback path; with the watch in place the worker
+/// waits indefinitely and is woken by the change itself.
+const UNWATCHED_POLL_MS: u32 = 5_000;
+
 pub struct HotkeyHook {
-    thread_id: u32,
+    hook_thread_id: u32,
     join: Option<std::thread::JoinHandle<()>>,
     worker_join: Option<std::thread::JoinHandle<()>>,
     event: HANDLE,
+    registry_event: HANDLE,
 }
 
 impl HotkeyHook {
@@ -53,111 +88,253 @@ impl HotkeyHook {
         *HOOK_CALLBACK.lock().unwrap() = Some(Arc::new(on_hotkey));
 
         let event = unsafe { CreateEventW(None, false, false, None) }.ok()?;
+        let registry_event = match unsafe { CreateEventW(None, false, false, None) } {
+            Ok(handle) => handle,
+            Err(_) => {
+                unsafe {
+                    let _ = CloseHandle(event);
+                }
+                return None;
+            }
+        };
         TRIGGER_EVENT.store(event.0 as isize, Ordering::Release);
         WORKER_RUNNING.store(true, Ordering::Release);
 
-        // The raw value, not `TRIGGER_EVENT`: teardown clears the global, and a
-        // worker that had not read it yet would then wait on a null handle and
-        // spin on `WAIT_FAILED` instead of blocking. `HANDLE` is not `Send`, so
-        // the isize crosses the thread boundary and is rebuilt on the far side.
-        let event_raw = event.0 as isize;
-        let worker_join = std::thread::Builder::new()
-            .name("tm-hotkey-worker".into())
-            .spawn(move || {
-                let event = HANDLE(event_raw as *mut core::ffi::c_void);
-                while WORKER_RUNNING.load(Ordering::Acquire) {
-                    let wait_res = unsafe { WaitForSingleObject(event, 500) };
-                    if wait_res == WAIT_OBJECT_0 && WORKER_RUNNING.load(Ordering::Acquire) {
-                        let cb_opt = HOOK_CALLBACK.lock().unwrap().clone();
-                        if let Some(cb) = cb_opt {
-                            cb();
-                        }
-                        let hwnd = super::instance::published_window();
-                        if hwnd != 0 {
-                            super::window_chrome::force_foreground(hwnd);
-                        }
-                    }
-                }
-            });
-        let Ok(worker_join) = worker_join else {
-            // Nothing is installed yet, so no callback can reach the event.
-            stop_worker(None, event);
-            return None;
-        };
-
+        // The hook thread comes up first and parks in its message loop with no
+        // hook installed; the worker decides whether there should be one.
         let thread_id_atomic = Arc::new(AtomicU32::new(0));
         let thread_id_clone = Arc::clone(&thread_id_atomic);
-
         let (ready_tx, ready_rx) = std::sync::mpsc::channel();
 
         let join = std::thread::Builder::new()
             .name("tm-hotkey-hook".into())
-            .spawn(move || {
-                // Elevate hook thread priority so scheduling delays never lag system keyboard input.
-                unsafe {
-                    let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
-                }
-
-                let tid = unsafe { windows::Win32::System::Threading::GetCurrentThreadId() };
-                thread_id_clone.store(tid, Ordering::Release);
-
-                let hook = match unsafe {
-                    SetWindowsHookExW(WH_KEYBOARD_LL, Some(low_level_keyboard_proc), None, 0)
-                } {
-                    Ok(hook) => {
-                        let _ = ready_tx.send(true);
-                        hook
-                    }
-                    Err(err) => {
-                        tracing::warn!(error = %err, "failed to install WH_KEYBOARD_LL hook");
-                        let _ = ready_tx.send(false);
-                        return;
-                    }
-                };
-
-                let mut msg = MSG::default();
-                while unsafe { GetMessageW(&mut msg, None, 0, 0) }.as_bool() {
-                    unsafe {
-                        let _ = TranslateMessage(&msg);
-                        DispatchMessageW(&msg);
-                    }
-                }
-
-                unsafe {
-                    let _ = UnhookWindowsHookEx(hook);
-                }
-            });
-
-        // The worker exists only to serve the hook. Whenever the hook does not
-        // come up — the thread could not be spawned, or the hook itself was
-        // refused — the worker and its event are torn down here rather than
-        // left running against a dangling `TRIGGER_EVENT`.
+            .spawn(move || hook_thread(&thread_id_clone, &ready_tx));
         let Ok(join) = join else {
-            stop_worker(Some(worker_join), event);
+            teardown_events(event, registry_event);
+            return None;
+        };
+        if ready_rx.recv().is_err() {
+            let _ = join.join();
+            teardown_events(event, registry_event);
+            return None;
+        }
+        let hook_thread_id = thread_id_atomic.load(Ordering::Acquire);
+
+        // The raw values, not the globals: teardown clears `TRIGGER_EVENT`, and
+        // a worker that had not read it yet would then wait on a null handle
+        // and spin on `WAIT_FAILED` instead of blocking. `HANDLE` is not
+        // `Send`, so the isizes cross the thread boundary and are rebuilt on
+        // the far side.
+        let event_raw = event.0 as isize;
+        let registry_raw = registry_event.0 as isize;
+        let worker_join = std::thread::Builder::new()
+            .name("tm-hotkey-worker".into())
+            .spawn(move || worker_thread(event_raw, registry_raw, hook_thread_id));
+        let Ok(worker_join) = worker_join else {
+            stop_hook_thread(hook_thread_id, Some(join));
+            teardown_events(event, registry_event);
             return None;
         };
 
-        let success = ready_rx.recv().unwrap_or(false);
-        if !success {
-            let _ = join.join();
-            stop_worker(Some(worker_join), event);
-            return None;
-        }
-
         Some(HotkeyHook {
-            thread_id: thread_id_atomic.load(Ordering::Acquire),
+            hook_thread_id,
             join: Some(join),
             worker_join: Some(worker_join),
             event,
+            registry_event,
         })
     }
 }
 
-/// Stop the worker thread and release the event it waits on.
+/// Owns the `WH_KEYBOARD_LL` registration and the message loop that serves it.
 ///
-/// Only ever called once no hook can signal `TRIGGER_EVENT` any more: the
-/// event handle is closed here, and a stale hook callback that still held its
-/// value would otherwise signal a handle Windows had already recycled.
+/// Installing and removing the hook both happen here because a low-level hook
+/// is bound to the thread that installed it: that thread has to be pumping
+/// messages for Windows to deliver callbacks to it at all.
+fn hook_thread(thread_id: &AtomicU32, ready: &std::sync::mpsc::Sender<()>) {
+    // Elevate hook thread priority so scheduling delays never lag system keyboard input.
+    unsafe {
+        let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
+    }
+
+    let tid = unsafe { windows::Win32::System::Threading::GetCurrentThreadId() };
+    thread_id.store(tid, Ordering::Release);
+    // Force the queue into existence before anyone posts to it: a
+    // `PostThreadMessageW` that arrives before the thread's first message call
+    // is discarded, which would lose the very first install request.
+    let mut msg = MSG::default();
+    unsafe {
+        let _ = PeekMessageW(&mut msg, None, WM_APP, WM_APP, PM_NOREMOVE);
+    }
+    let _ = ready.send(());
+
+    let mut hook: Option<HHOOK> = None;
+    while unsafe { GetMessageW(&mut msg, None, 0, 0) }.as_bool() {
+        if msg.hwnd.0.is_null() && msg.message == WM_SET_HOOK {
+            set_hook(&mut hook, msg.wParam.0 != 0);
+            continue;
+        }
+        unsafe {
+            let _ = TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+    }
+
+    set_hook(&mut hook, false);
+}
+
+/// Install or remove the keyboard hook, idempotently.
+fn set_hook(hook: &mut Option<HHOOK>, wanted: bool) {
+    match (wanted, hook.take()) {
+        (true, Some(existing)) => *hook = Some(existing),
+        (true, None) => {
+            match unsafe {
+                SetWindowsHookExW(WH_KEYBOARD_LL, Some(low_level_keyboard_proc), None, 0)
+            } {
+                Ok(installed) => {
+                    tracing::info!("WH_KEYBOARD_LL hook installed for Ctrl+Shift+Esc");
+                    *hook = Some(installed);
+                }
+                Err(error) => {
+                    tracing::warn!(error = %error, "failed to install WH_KEYBOARD_LL hook")
+                }
+            }
+        }
+        (false, Some(existing)) => {
+            unsafe {
+                let _ = UnhookWindowsHookEx(existing);
+            }
+            // Nothing can consume a keydown any more, so a keyup that arrives
+            // after this must pass through instead of being swallowed.
+            CONSUMED_DOWN.store(false, Ordering::SeqCst);
+            LAST_DOWN_TICK.store(0, Ordering::Relaxed);
+            tracing::info!("WH_KEYBOARD_LL hook removed");
+        }
+        (false, None) => {}
+    }
+}
+
+/// Serves the hook: raises the window when the combo fires, and keeps the
+/// hook's installed state in step with the IFEO registration.
+///
+/// This thread pumps messages. It owns no window and dispatches nothing of its
+/// own, but [`super::window_chrome::force_foreground`] attaches this thread's
+/// input queue to the foreground application's, and a thread that does not
+/// pump while two input queues are merged is exactly how the OTHER application
+/// ends up unable to process input.
+fn worker_thread(event_raw: isize, registry_raw: isize, hook_thread_id: u32) {
+    let event = HANDLE(event_raw as *mut core::ffi::c_void);
+    let registry_event = HANDLE(registry_raw as *mut core::ffi::c_void);
+    let watch = super::taskmgr_replacement::ReplacementWatch::open();
+    let mut armed = watch
+        .as_ref()
+        .is_some_and(|watch| watch.arm(registry_event));
+    let mut installed = false;
+
+    // Apply the current registration before waiting for a change to it.
+    sync_hook_state(hook_thread_id, &mut installed);
+
+    while WORKER_RUNNING.load(Ordering::Acquire) {
+        let timeout = if armed { u32::MAX } else { UNWATCHED_POLL_MS };
+        let waited = unsafe {
+            MsgWaitForMultipleObjects(Some(&[event, registry_event]), false, timeout, QS_ALLINPUT)
+        };
+        if !WORKER_RUNNING.load(Ordering::Acquire) {
+            break;
+        }
+        // Four distinct wake-ups share one wait, so they are separated by
+        // index rather than lumped together: a stray message must not be read
+        // as "the registration changed" and send this thread to the registry.
+        const TRIGGER: u32 = WAIT_OBJECT_0.0;
+        const REGISTRY: u32 = WAIT_OBJECT_0.0 + 1;
+        const MESSAGES: u32 = WAIT_OBJECT_0.0 + 2;
+        const WAIT_TIMEOUT_CODE: u32 = windows::Win32::Foundation::WAIT_TIMEOUT.0;
+        match waited.0 {
+            TRIGGER => {
+                let cb_opt = HOOK_CALLBACK.lock().unwrap().clone();
+                if let Some(cb) = cb_opt {
+                    cb();
+                }
+                let hwnd = super::instance::published_window();
+                if hwnd != 0 {
+                    super::window_chrome::force_foreground(hwnd);
+                }
+            }
+            REGISTRY => {
+                // One-shot: re-arm before reading, so a second change during
+                // the read is still noticed.
+                armed = watch
+                    .as_ref()
+                    .is_some_and(|watch| watch.arm(registry_event));
+                sync_hook_state(hook_thread_id, &mut installed);
+            }
+            // Messages only: nothing to decide, `drain_messages` handles it.
+            MESSAGES => {}
+            // The fallback deadline for a worker that could not arm a watch.
+            WAIT_TIMEOUT_CODE => sync_hook_state(hook_thread_id, &mut installed),
+            // A wait that cannot succeed will not start succeeding, and
+            // re-entering it would spin this thread on the registry. Give the
+            // hotkey up instead: the hook itself stays as it is, and Explorer
+            // still serves Ctrl+Shift+Esc everywhere except fullscreen.
+            other => {
+                tracing::warn!(status = other, "hotkey worker wait failed; giving up");
+                break;
+            }
+        }
+        drain_messages();
+    }
+
+    // Leave nothing hooked behind: the hook thread is torn down next, but the
+    // ordering rules in `Drop` depend on this having already been requested.
+    if installed {
+        request_hook(hook_thread_id, false);
+    }
+}
+
+/// Re-read the registration and tell the hook thread what it should be doing.
+fn sync_hook_state(hook_thread_id: u32, installed: &mut bool) {
+    let enabled = super::taskmgr_replacement::is_replacement_enabled();
+    REPLACEMENT_ENABLED.store(enabled, Ordering::Release);
+    if enabled == *installed {
+        return;
+    }
+    *installed = enabled;
+    request_hook(hook_thread_id, enabled);
+}
+
+fn request_hook(hook_thread_id: u32, install: bool) {
+    if hook_thread_id == 0 {
+        return;
+    }
+    unsafe {
+        let _ = PostThreadMessageW(
+            hook_thread_id,
+            WM_SET_HOOK,
+            WPARAM(usize::from(install)),
+            LPARAM(0),
+        );
+    }
+}
+
+/// Empty this thread's message queue. Nothing here owns a window, so there is
+/// nothing to dispatch to — the point is that the queue does not back up while
+/// another application's input queue is attached to it.
+fn drain_messages() {
+    let mut msg = MSG::default();
+    while unsafe { PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE) }.as_bool() {
+        if msg.message == WM_QUIT {
+            WORKER_RUNNING.store(false, Ordering::Release);
+            return;
+        }
+        unsafe {
+            let _ = TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+    }
+}
+
+/// Stop the worker thread. Only ever called once no hook can signal
+/// `TRIGGER_EVENT` any more.
 fn stop_worker(worker_join: Option<std::thread::JoinHandle<()>>, event: HANDLE) {
     TRIGGER_EVENT.store(0, Ordering::Release);
     WORKER_RUNNING.store(false, Ordering::Release);
@@ -165,42 +342,49 @@ fn stop_worker(worker_join: Option<std::thread::JoinHandle<()>>, event: HANDLE) 
     if let Some(worker) = worker_join {
         let _ = worker.join();
     }
-    let _ = unsafe { CloseHandle(event) };
+}
+
+fn stop_hook_thread(thread_id: u32, join: Option<std::thread::JoinHandle<()>>) {
+    if thread_id != 0 {
+        unsafe {
+            let _ = PostThreadMessageW(thread_id, WM_QUIT, WPARAM(0), LPARAM(0));
+        }
+    }
+    if let Some(join) = join {
+        let _ = join.join();
+    }
+}
+
+fn teardown_events(event: HANDLE, registry_event: HANDLE) {
+    TRIGGER_EVENT.store(0, Ordering::Release);
+    WORKER_RUNNING.store(false, Ordering::Release);
+    unsafe {
+        let _ = CloseHandle(event);
+        let _ = CloseHandle(registry_event);
+    }
 }
 
 impl Drop for HotkeyHook {
     fn drop(&mut self) {
         *HOOK_CALLBACK.lock().unwrap() = None;
+
+        // Stop the WORKER first: it is the only thing that still reads
+        // `TRIGGER_EVENT` and the registry watch, and it is what asks the hook
+        // thread to unhook on its way out.
+        stop_worker(self.worker_join.take(), self.event);
+        // Then the hook thread, which removes the hook as it leaves its loop.
+        stop_hook_thread(self.hook_thread_id, self.join.take());
+
         LAST_DOWN_TICK.store(0, Ordering::Relaxed);
         CONSUMED_DOWN.store(false, Ordering::SeqCst);
+        REPLACEMENT_ENABLED.store(false, Ordering::Release);
 
-        // Uninstall the hook FIRST. `low_level_keyboard_proc` reads
-        // `TRIGGER_EVENT` and signals it; tearing the event down while the
-        // hook can still run leaves a window in which a callback signals a
-        // closed — and by then possibly recycled — handle.
-        if self.thread_id != 0 {
-            unsafe {
-                let _ = PostThreadMessageW(self.thread_id, WM_QUIT, WPARAM(0), LPARAM(0));
-            }
+        // Both threads are joined, so nothing can signal either handle now.
+        unsafe {
+            let _ = CloseHandle(self.event);
+            let _ = CloseHandle(self.registry_event);
         }
-        if let Some(join) = self.join.take() {
-            let _ = join.join();
-        }
-
-        stop_worker(self.worker_join.take(), self.event);
     }
-}
-
-fn cached_is_replacement_enabled() -> bool {
-    let now = unsafe { GetTickCount64() };
-    let last = REPLACEMENT_CACHE_TICK.load(Ordering::Relaxed);
-    if last != 0 && now.saturating_sub(last) < 2000 {
-        return REPLACEMENT_CACHE.load(Ordering::Relaxed);
-    }
-    let enabled = super::taskmgr_replacement::is_replacement_enabled();
-    REPLACEMENT_CACHE.store(enabled, Ordering::Relaxed);
-    REPLACEMENT_CACHE_TICK.store(now, Ordering::Relaxed);
-    enabled
 }
 
 unsafe extern "system" fn low_level_keyboard_proc(
@@ -228,31 +412,37 @@ unsafe extern "system" fn low_level_keyboard_proc(
             }
         }
 
+        // Cheap and first: a machine where the replacement is off must not pay
+        // even the key-state reads. The hook is normally not installed at all
+        // in that state; this still matters for the few events in flight while
+        // the uninstall request is on its way to the hook thread.
+        if !REPLACEMENT_ENABLED.load(Ordering::Acquire) {
+            return unsafe { CallNextHookEx(None, code, wparam, lparam) };
+        }
+
         let is_ctrl = unsafe { GetAsyncKeyState(VK_CONTROL.0 as i32) } < 0;
         let is_shift = unsafe { GetAsyncKeyState(VK_SHIFT.0 as i32) } < 0;
         let is_alt = unsafe { GetAsyncKeyState(VK_MENU.0 as i32) } < 0;
         let is_win = (unsafe { GetAsyncKeyState(VK_LWIN.0 as i32) } < 0)
             || (unsafe { GetAsyncKeyState(VK_RWIN.0 as i32) } < 0);
 
-        if is_ctrl && is_shift && !is_alt && !is_win {
-            // Only intercept if TaskMan is configured as the taskmgr replacement.
-            if cached_is_replacement_enabled() && (msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN) {
-                let now = unsafe { GetTickCount64() };
-                let prev = LAST_DOWN_TICK.load(Ordering::Relaxed);
-                let is_stale = prev == 0 || (now.saturating_sub(prev) > 1000);
-                LAST_DOWN_TICK.store(now, Ordering::Relaxed);
+        if is_ctrl && is_shift && !is_alt && !is_win && (msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN)
+        {
+            let now = unsafe { GetTickCount64() };
+            let prev = LAST_DOWN_TICK.load(Ordering::Relaxed);
+            let is_stale = prev == 0 || (now.saturating_sub(prev) > 1000);
+            LAST_DOWN_TICK.store(now, Ordering::Relaxed);
 
-                if !CONSUMED_DOWN.swap(true, Ordering::SeqCst) || is_stale {
-                    // Signal the async worker thread immediately so window raising
-                    // and AttachThreadInput never block this hook callback or delay
-                    // system-wide keyboard input.
-                    let trigger = TRIGGER_EVENT.load(Ordering::Acquire);
-                    if trigger != 0 {
-                        let _ = unsafe { SetEvent(HANDLE(trigger as *mut core::ffi::c_void)) };
-                    }
+            if !CONSUMED_DOWN.swap(true, Ordering::SeqCst) || is_stale {
+                // Signal the async worker thread immediately so window raising
+                // and AttachThreadInput never block this hook callback or delay
+                // system-wide keyboard input.
+                let trigger = TRIGGER_EVENT.load(Ordering::Acquire);
+                if trigger != 0 {
+                    let _ = unsafe { SetEvent(HANDLE(trigger as *mut core::ffi::c_void)) };
                 }
-                return LRESULT(1);
             }
+            return LRESULT(1);
         }
     }
 
@@ -270,16 +460,20 @@ mod tests {
         drop(hook);
     }
 
-    #[test]
-    fn escape_keyup_clears_consumed_down_without_modifiers() {
-        CONSUMED_DOWN.store(true, Ordering::SeqCst);
-        let kbd = KBDLLHOOKSTRUCT {
+    fn escape_event() -> KBDLLHOOKSTRUCT {
+        KBDLLHOOKSTRUCT {
             vkCode: VK_ESCAPE.0 as u32,
             scanCode: 1,
             flags: windows::Win32::UI::WindowsAndMessaging::KBDLLHOOKSTRUCT_FLAGS(0),
             time: 0,
             dwExtraInfo: 0,
-        };
+        }
+    }
+
+    #[test]
+    fn escape_keyup_clears_consumed_down_without_modifiers() {
+        CONSUMED_DOWN.store(true, Ordering::SeqCst);
+        let kbd = escape_event();
         let lparam = LPARAM(&kbd as *const _ as isize);
         let res =
             unsafe { low_level_keyboard_proc(HC_ACTION as i32, WPARAM(WM_KEYUP as usize), lparam) };
@@ -290,5 +484,22 @@ mod tests {
         let res =
             unsafe { low_level_keyboard_proc(HC_ACTION as i32, WPARAM(WM_KEYUP as usize), lparam) };
         assert_eq!(res, LRESULT(0));
+    }
+
+    /// The callback must never reach the registry, so the answer it uses is an
+    /// atomic the worker maintains. With the replacement off, Escape has to
+    /// pass straight through no matter which modifiers are down — otherwise a
+    /// stale hook would eat the key for every application on the desktop.
+    #[test]
+    fn escape_passes_through_while_the_replacement_is_off() {
+        CONSUMED_DOWN.store(false, Ordering::SeqCst);
+        REPLACEMENT_ENABLED.store(false, Ordering::Release);
+        let kbd = escape_event();
+        let lparam = LPARAM(&kbd as *const _ as isize);
+        let res = unsafe {
+            low_level_keyboard_proc(HC_ACTION as i32, WPARAM(WM_KEYDOWN as usize), lparam)
+        };
+        assert_eq!(res, LRESULT(0), "Escape must not be swallowed");
+        assert!(!CONSUMED_DOWN.load(Ordering::SeqCst));
     }
 }

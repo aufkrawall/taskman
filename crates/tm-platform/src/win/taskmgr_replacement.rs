@@ -4,13 +4,23 @@
 use std::path::{Path, PathBuf};
 use tm_core::error::{Result, TmError};
 use windows::Win32::System::Registry::{
-    HKEY_LOCAL_MACHINE, KEY_READ, KEY_WRITE, REG_OPTION_NON_VOLATILE, REG_SZ, RegCloseKey,
-    RegCreateKeyExW, RegDeleteValueW, RegOpenKeyExW, RegQueryValueExW, RegSetValueExW,
+    HKEY, HKEY_LOCAL_MACHINE, KEY_NOTIFY, KEY_READ, KEY_WRITE, REG_NOTIFY_CHANGE_LAST_SET,
+    REG_NOTIFY_CHANGE_NAME, REG_NOTIFY_THREAD_AGNOSTIC, REG_OPTION_NON_VOLATILE, REG_SZ,
+    RegCloseKey, RegCreateKeyExW, RegDeleteValueW, RegNotifyChangeKeyValue, RegOpenKeyExW,
+    RegQueryValueExW, RegSetValueExW,
 };
 use windows::core::PCWSTR;
 
 const IFEO_TASKMGR: &str =
     r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options\taskmgr.exe";
+/// Parent of [`IFEO_TASKMGR`].
+///
+/// The watch below is armed on this key, not on `taskmgr.exe`: that subkey
+/// only exists while SOME debugger is registered, so a notification armed on
+/// it would be silently lost the moment the registration is removed - which
+/// is exactly the transition that has to be noticed.
+const IFEO_ROOT: &str =
+    r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options";
 const VALUE_DEBUGGER: &str = "Debugger";
 pub const OWNER_MARKER: &str = "--taskmgr-replacement-launch";
 
@@ -67,6 +77,71 @@ pub fn is_replacement_enabled() -> bool {
         matches!(state_for_exe(&exe), State::Enabled | State::Stale(_))
     } else {
         false
+    }
+}
+
+/// A registry-change notification on the IFEO tree.
+///
+/// Exists so the low-level keyboard hook can be installed only while TaskMan
+/// really is the registered Task Manager replacement, without anybody polling
+/// for it: an owner waits on the event this arms and re-reads the state when
+/// it fires. Not `Send`; create and use it on one thread.
+pub(crate) struct ReplacementWatch {
+    key: HKEY,
+}
+
+impl ReplacementWatch {
+    /// Open the IFEO root for change notifications, or `None` when this token
+    /// may not read it. A caller that gets `None` falls back to asking
+    /// periodically; nothing here is load-bearing for correctness.
+    pub(crate) fn open() -> Option<Self> {
+        let path = wstr(IFEO_ROOT);
+        let mut key = HKEY::default();
+        let opened = unsafe {
+            RegOpenKeyExW(
+                HKEY_LOCAL_MACHINE,
+                PCWSTR::from_raw(path.as_ptr()),
+                None,
+                KEY_NOTIFY,
+                &mut key,
+            )
+        };
+        if opened.is_err() {
+            tracing::debug!(error = opened.0, "cannot watch the IFEO key for changes");
+            return None;
+        }
+        Some(Self { key })
+    }
+
+    /// Arm a one-shot notification that signals `event` on the next change
+    /// anywhere under the IFEO key. Must be re-armed after every signal.
+    ///
+    /// `REG_NOTIFY_THREAD_AGNOSTIC` keeps the registration alive independently
+    /// of the thread that made it; without it Windows tears the notification
+    /// down when that thread exits, which turns a later re-arm into a wait
+    /// that never completes.
+    pub(crate) fn arm(&self, event: windows::Win32::Foundation::HANDLE) -> bool {
+        let status = unsafe {
+            RegNotifyChangeKeyValue(
+                self.key,
+                true,
+                REG_NOTIFY_CHANGE_NAME | REG_NOTIFY_CHANGE_LAST_SET | REG_NOTIFY_THREAD_AGNOSTIC,
+                Some(event),
+                true,
+            )
+        };
+        if status.is_err() {
+            tracing::debug!(error = status.0, "cannot arm the IFEO change notification");
+        }
+        status.is_ok()
+    }
+}
+
+impl Drop for ReplacementWatch {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = RegCloseKey(self.key);
+        }
     }
 }
 
