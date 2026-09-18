@@ -86,12 +86,15 @@ platform boundary (`tm-core` ← `tm-platform` ← `tm-app` / `tm-service`):
     with the same application user model id claims it — the minimized-app
     case),
     `window_chrome.rs` (DWM caption colour / dark mode / backdrop / cloaking,
-    `force_foreground` via `AttachThreadInput` + `SwitchToThisWindow` over fullscreen games,
-    plus an event-driven strict-topmost keeper that reasserts the root HWND on
-    foreground/show/reorder events so topmost shell surfaces cannot stay above it),
-    `hotkey_hook.rs` (dedicated `WH_KEYBOARD_LL` thread intercepting Ctrl+Shift+Esc
-    when replacement is enabled, bypassing shell hotkey suppression in exclusive/borderless
-    fullscreen games),
+    `force_foreground` via `AttachThreadInput` + `SwitchToThisWindow` over fullscreen games
+    — never attaching to a foreground window that is already hung, and only ever
+    called from a thread that pumps messages — plus an event-driven strict-topmost
+    keeper that reasserts the root HWND on foreground/show events and UNHOOKS itself
+    when always-on-top is turned off),
+    `hotkey_hook.rs` (dedicated `WH_KEYBOARD_LL` thread intercepting Ctrl+Shift+Esc,
+    installed only while the IFEO replacement is registered and driven by a
+    `RegNotifyChangeKeyValue` watch rather than polling; bypasses shell hotkey
+    suppression in exclusive/borderless fullscreen games),
     `version.rs` (cached PE metadata). Linux/macOS backends exist and are
     built by default (`build.py`).
 - `crates/tm-app`

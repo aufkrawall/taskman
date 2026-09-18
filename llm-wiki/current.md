@@ -1,6 +1,6 @@
 # Current State
 
-Last cross-checked: 2026-09-17
+Last cross-checked: 2026-09-19
 
 ## Summary
 
@@ -14,6 +14,73 @@ correctness, table interaction, Performance visuals, and advanced process
 diagnostics; remaining telemetry and accessibility work is itemized precisely
 in `known-debt.md`. Normal GUI startup remains unelevated; privileged controls
 can cross a protected, allowlisted service boundary after one explicit install.
+
+## Background-cost contract (2026-09-19)
+
+A task manager that starts with Windows and lives in the notification area is
+a background process for most of its life, and this is what it is allowed to
+cost while it is there. Treat every line as a rule, not a description.
+
+- **Nothing machine-wide runs for a surface nobody can see.** `demand_for`
+  (tm-app/app.rs) gates on visibility BEFORE it looks at the tab: a hidden,
+  minimized or occluded window demands `TelemetryDemand::hidden()`
+  (`CORE_PROCESS` alone). The visibility signal is "eframe called `ui` last
+  frame", which covers all three cases without asking the window system.
+- **Why that matters:** `PROCESS_NET` and `PROCESS_DISK` are real-time kernel
+  ETW sessions. With `default_start_page = processes` + `close_to_tray` +
+  `start_with_windows` — an ordinary configuration — the machine used to trace
+  every disk request, every network datagram and every thread start for the
+  whole logon session. Measured 2026-09-19 on the dev box: ~1.25 MB/s of
+  kernel trace buffers produced, flushed and consumed continuously.
+- **Accepted consequence:** App history stops accumulating NETWORK bytes while
+  the window is away. Accumulated CPU time is a counter on the process itself
+  and keeps working. This is deliberate; see `demand::hidden`.
+- **The hidden tick is `HIDDEN_INTERVAL` (5 s), not paused.** Safe because the
+  Performance charts anchor every point on its own `t_ms`
+  (`widgets::chart::x_on_axis`), so a sparser series plots where it belongs
+  instead of being stretched, and `AppHistoryDb::observe` already scales by the
+  engine's current interval. Restoring the window forces one immediate sample.
+- **The sampler yields while hidden.** `SystemCollector::set_background` →
+  `win::set_sampler_background` puts the engine thread into
+  `THREAD_MODE_BACKGROUND_BEGIN` (priority 4, very low I/O and memory
+  priority). The process priority CLASS stays `ABOVE_NORMAL` on purpose: the
+  one moment this program has to work is when the machine is saturated.
+- **System-wide hooks exist only while the feature that needs them does.**
+  - `WH_KEYBOARD_LL` is installed only while TaskMan is the registered Task
+    Manager replacement, and removed when it is not. A `RegNotifyChangeKeyValue`
+    watch on the IFEO root drives the transition — no polling, and no registry
+    read on the input path. The hook callback allocates nothing, locks nothing
+    and reads one atomic; everything else happens on `tm-hotkey-worker`.
+  - The strict-topmost `SetWinEventHook`s are down to `EVENT_SYSTEM_FOREGROUND`
+    and `EVENT_OBJECT_SHOW`, and are unhooked when always-on-top is switched
+    off. `EVENT_OBJECT_REORDER` was removed: it fires for z-order churn inside
+    other processes' windows (lists, trees, tab strips) and every one of them
+    cost a cross-process marshal into this process before the callback could
+    decide it was uninteresting.
+- **`tm-hotkey-worker` pumps its own message queue.** Not cosmetic:
+  `force_foreground` attaches this thread's input queue to the foreground
+  application's, and a thread that does not pump while two queues are merged is
+  how the OTHER application ends up unable to process input.
+- **The broker's trace watchdogs die with their trace.** `spawn_trace_watchdog`
+  (core_service.rs) sleeps straight to the idle deadline and returns once it
+  has stopped the session, instead of polling every 5 s for the service's
+  lifetime.
+
+Measured non-findings, recorded so they are not "fixed" again:
+
+- `DwmGetWindowAttribute(DWMWA_CLOAKED)` is ~20 ns per call (served from a
+  shared section, not an RPC into `dwm.exe`). Calling it per visible top-level
+  window per tick is free; do not add a staleness-prone cache for it.
+- A keyword mask on `Microsoft-Windows-Kernel-Network` changes nothing: all 22
+  of its events carry `KERNEL_NETWORK_KEYWORD_IPV4` (0x10) or `..._IPV6`
+  (0x20), so `match_any_keyword = 0` and `0x30` subscribe to the same set. Only
+  an `EVENT_FILTER_TYPE_EVENT_ID` filter could narrow it to the eight data
+  events; not done, and it has no automated coverage (the per-process network
+  integration tests need elevation and live traffic).
+- PDH is not the sampler's cost: `GPU Engine(*)` over 522 instances collects in
+  0.35 ms, `PhysicalDisk(*)` in 0.06 ms. The per-tick CPU is core process
+  enumeration, which is why the hidden path stretches the interval and lowers
+  the thread's priority rather than only dropping providers.
 
 ## Recently landed (2026-09-17 — UX overhaul: dialogs, discoverability, Startup impact)
 
