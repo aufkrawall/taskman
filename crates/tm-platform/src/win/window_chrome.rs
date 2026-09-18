@@ -15,11 +15,11 @@ use windows::Win32::Graphics::Dwm::{
     DWMWA_BORDER_COLOR, DWMWA_CAPTION_COLOR, DWMWA_CLOAK, DWMWA_SYSTEMBACKDROP_TYPE,
     DWMWA_TEXT_COLOR, DWMWA_USE_IMMERSIVE_DARK_MODE, DWMWINDOWATTRIBUTE, DwmSetWindowAttribute,
 };
-use windows::Win32::UI::Accessibility::{HWINEVENTHOOK, SetWinEventHook};
+use windows::Win32::UI::Accessibility::{HWINEVENTHOOK, SetWinEventHook, UnhookWinEvent};
 use windows::Win32::UI::WindowsAndMessaging::{
-    EVENT_OBJECT_REORDER, EVENT_OBJECT_SHOW, EVENT_SYSTEM_FOREGROUND, HWND_NOTOPMOST, HWND_TOPMOST,
-    IsIconic, IsWindowVisible, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOOWNERZORDER, SWP_NOSENDCHANGING,
-    SWP_NOSIZE, SetWindowPos, WINEVENT_OUTOFCONTEXT, WINEVENT_SKIPOWNPROCESS,
+    EVENT_OBJECT_SHOW, EVENT_SYSTEM_FOREGROUND, HWND_NOTOPMOST, HWND_TOPMOST, IsIconic,
+    IsWindowVisible, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOOWNERZORDER, SWP_NOSENDCHANGING, SWP_NOSIZE,
+    SetWindowPos, WINEVENT_OUTOFCONTEXT, WINEVENT_SKIPOWNPROCESS,
 };
 
 /// What the caption should look like, in the app's own terms.
@@ -109,7 +109,11 @@ pub fn apply(hwnd: isize, look: TitleBar) {
 static STRICT_TOPMOST_HWND: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
 static STRICT_TOPMOST_ENABLED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
-static STRICT_TOPMOST_HOOKS: std::sync::Once = std::sync::Once::new();
+/// The installed hooks, so they can be taken back down again.
+///
+/// Stored as raw pointer values: `HWINEVENTHOOK` is not `Send`, and these are
+/// only ever touched from the UI thread that installed them.
+static STRICT_TOPMOST_HOOKS: std::sync::Mutex<Vec<isize>> = std::sync::Mutex::new(Vec::new());
 
 const OBJID_WINDOW_I32: i32 = 0;
 
@@ -156,20 +160,53 @@ unsafe extern "system" fn strict_topmost_event(
     }
 }
 
-fn install_strict_topmost_hooks() {
-    STRICT_TOPMOST_HOOKS.call_once(|| unsafe {
-        let flags = WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS;
-        for event in [
-            EVENT_SYSTEM_FOREGROUND,
-            EVENT_OBJECT_SHOW,
-            EVENT_OBJECT_REORDER,
-        ] {
-            let hook = SetWinEventHook(event, event, None, Some(strict_topmost_event), 0, 0, flags);
-            if hook.is_invalid() {
-                tracing::warn!(event, "cannot install strict-topmost WinEvent hook");
-            }
+/// Take the strict-topmost hooks back down.
+///
+/// Not merely tidy: these are SYSTEM-WIDE out-of-context hooks, so for as
+/// long as they exist Windows marshals a matching event from EVERY process on
+/// the desktop into this process's message queue. Leaving them installed
+/// after the user turned always-on-top back off means paying that for a
+/// callback that now returns immediately, for the rest of the session.
+fn remove_strict_topmost_hooks() {
+    let mut hooks = match STRICT_TOPMOST_HOOKS.lock() {
+        Ok(hooks) => hooks,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    for raw in hooks.drain(..) {
+        unsafe {
+            let _ = UnhookWinEvent(HWINEVENTHOOK(raw as *mut std::ffi::c_void));
         }
-    });
+    }
+}
+
+/// Install the hooks that keep the window at the front of its band.
+///
+/// Only two events, and the choice is load-bearing. `EVENT_SYSTEM_FOREGROUND`
+/// and `EVENT_OBJECT_SHOW` are the two that can actually put another window
+/// above this one. `EVENT_OBJECT_REORDER` used to be here as well and was the
+/// expensive mistake: it fires for z-order churn *inside* other processes'
+/// windows — every list, tree, tab strip and toolbar in every running app —
+/// and each one costs a cross-process marshal into this process before the
+/// callback can decide it was uninteresting. Reasserting the band on
+/// foreground changes and on newly shown windows covers the real cases.
+fn install_strict_topmost_hooks() {
+    let mut hooks = match STRICT_TOPMOST_HOOKS.lock() {
+        Ok(hooks) => hooks,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    if !hooks.is_empty() {
+        return;
+    }
+    let flags = WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS;
+    for event in [EVENT_SYSTEM_FOREGROUND, EVENT_OBJECT_SHOW] {
+        let hook =
+            unsafe { SetWinEventHook(event, event, None, Some(strict_topmost_event), 0, 0, flags) };
+        if hook.is_invalid() {
+            tracing::warn!(event, "cannot install strict-topmost WinEvent hook");
+        } else {
+            hooks.push(hook.0 as isize);
+        }
+    }
 }
 
 /// Ask the patched winit to create the main window in window band 16 — the
@@ -221,6 +258,7 @@ pub fn set_strict_topmost(hwnd: isize, enabled: bool) {
     } else {
         STRICT_TOPMOST_ENABLED.store(false, Ordering::Release);
         STRICT_TOPMOST_HWND.store(0, Ordering::Release);
+        remove_strict_topmost_hooks();
         unsafe {
             let _ = SetWindowPos(
                 native,
@@ -267,6 +305,21 @@ pub fn set_cloaked(hwnd: isize, cloaked: bool) {
 /// buttons. By temporarily attaching thread input to both the current foreground
 /// window's thread and the target window's thread, and calling `SwitchToThisWindow`,
 /// the OS grants the foreground switch directly over the fullscreen surface.
+///
+/// ## Two rules for the caller
+///
+/// `AttachThreadInput` MERGES two input queues. While they are merged, a
+/// caller that does not pump messages is a caller that can wedge the other
+/// application's input processing, and the activation calls below can
+/// themselves block on the other side's message pump. So:
+///
+/// * the calling thread must pump its own message queue (the hotkey worker
+///   does, for exactly this reason), and
+/// * a foreground window that is ALREADY not pumping is never attached to.
+///   That is the one case where merging queues buys nothing and risks
+///   everything: the window whose thread is stuck is precisely the one whose
+///   queue must not be joined to ours. The activation still runs, it just
+///   runs without the foreground-lock bypass.
 pub fn force_foreground(hwnd: isize) {
     if hwnd == 0 {
         return;
@@ -287,7 +340,11 @@ pub fn force_foreground(hwnd: isize) {
         let target_thread =
             windows::Win32::UI::WindowsAndMessaging::GetWindowThreadProcessId(target, None);
 
-        let attached_fg = if fg_thread != 0 && fg_thread != cur_thread {
+        // A hung foreground window's thread is not pumping; joining our input
+        // queue to it is how a stuck game takes the desktop's input with it.
+        let fg_hung = !fg_hwnd.0.is_null()
+            && windows::Win32::UI::WindowsAndMessaging::IsHungAppWindow(fg_hwnd).as_bool();
+        let attached_fg = if fg_thread != 0 && fg_thread != cur_thread && !fg_hung {
             windows::Win32::System::Threading::AttachThreadInput(cur_thread, fg_thread, true)
                 .as_bool()
         } else {
