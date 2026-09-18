@@ -605,6 +605,17 @@ impl ProcessEntry {
     }
 }
 
+/// Toolhelp reports parent PID as recorded at process creation. After PID reuse, that
+/// can point at a process that started LATER than its supposed child. System
+/// Informer rejects those links and shows the child as a root; so do we.
+/// Unknown timestamps are never treated as evidence — the link stands.
+pub fn is_plausible_parent(parent: &ProcessEntry, child: &ProcessEntry) -> bool {
+    match (parent.start_epoch_s, child.start_epoch_s) {
+        (Some(parent_start), Some(child_start)) => parent_start <= child_start,
+        _ => true,
+    }
+}
+
 // ---------------------------------------------------------------- misc system
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -763,5 +774,27 @@ mod tests {
         // Saturates at 0 if private WS somehow exceeds total WS (e.g. transient race)
         entry.mem_bytes = 120 * 1024 * 1024;
         assert_eq!(entry.shared_working_set_bytes(), Some(0));
+    }
+
+    #[test]
+    fn is_plausible_parent_handles_timestamps() {
+        let mut parent = ProcessEntry::new(100, "parent.exe");
+        let mut child = ProcessEntry::new(200, "child.exe");
+
+        // Both unknown -> stands
+        assert!(is_plausible_parent(&parent, &child));
+
+        // Parent started before child -> plausible
+        parent.start_epoch_s = Some(1000);
+        child.start_epoch_s = Some(1050);
+        assert!(is_plausible_parent(&parent, &child));
+
+        // Simultaneous start -> plausible
+        child.start_epoch_s = Some(1000);
+        assert!(is_plausible_parent(&parent, &child));
+
+        // Parent started AFTER child -> rejected (PID reuse)
+        parent.start_epoch_s = Some(1100);
+        assert!(!is_plausible_parent(&parent, &child));
     }
 }

@@ -11,7 +11,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use tm_core::format;
 use tm_core::i18n::{self, K};
-use tm_core::model::{DumpType, PriorityClass, ProcStatus, ProcessEntry, UacVirtualization};
+use tm_core::model::{
+    DumpType, PriorityClass, ProcStatus, ProcessEntry, UacVirtualization, is_plausible_parent,
+};
 
 use crate::app::TaskManApp;
 use crate::icons::Icon;
@@ -1825,17 +1827,6 @@ fn build_rows(
 /// Horizontal step per tree level, shared by rendering and auto-fit. Matched
 /// to System Informer's compact indentation so deep trees stay on screen.
 const TREE_INDENT: f32 = 18.0;
-
-/// A PID may be recycled the moment its process exits, so a raw parent link
-/// can point at a process that started LATER than its supposed child. System
-/// Informer rejects those links and shows the child as a root; so do we.
-/// Unknown timestamps are never treated as evidence — the link stands.
-fn is_plausible_parent(parent: &ProcessEntry, child: &ProcessEntry) -> bool {
-    match (parent.start_epoch_s, child.start_epoch_s) {
-        (Some(parent_start), Some(child_start)) => parent_start <= child_start,
-        _ => true,
-    }
-}
 
 /// Order one sibling list.
 ///

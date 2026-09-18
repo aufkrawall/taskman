@@ -36,7 +36,7 @@ use std::collections::{HashMap, HashSet};
 use tm_core::i18n::{self, K};
 #[cfg(target_os = "windows")]
 use tm_core::model::DumpType;
-use tm_core::model::{ProcCategory, ProcStatus, ProcessEntry, Snapshot};
+use tm_core::model::{ProcCategory, ProcStatus, ProcessEntry, Snapshot, is_plausible_parent};
 
 use crate::app::TaskManApp;
 use crate::icons::Icon;
@@ -1357,6 +1357,9 @@ fn is_external_family_member(
         let Some(parent) = by_pid.get(&ppid).copied() else {
             break;
         };
+        if !is_plausible_parent(parent, cur) {
+            break;
+        }
         if category.get(&parent.pid) != Some(&ProcCategory::App) {
             break;
         }
@@ -1831,6 +1834,9 @@ fn derive_display_groups(all: &[&ProcessEntry]) -> DisplayGroups {
         if let Some(ppid) = p.ppid
             && ppid != p.pid
             && by_pid.contains_key(&ppid)
+            && by_pid
+                .get(&ppid)
+                .is_some_and(|parent| is_plausible_parent(parent, p))
         {
             raw_children.entry(ppid).or_default().push(*p);
         }
@@ -1851,6 +1857,9 @@ fn derive_display_groups(all: &[&ProcessEntry]) -> DisplayGroups {
             let Some(parent) = by_pid.get(&ppid).copied() else {
                 break;
             };
+            if !is_plausible_parent(parent, cur) {
+                break;
+            }
             if category.get(&parent.pid) == Some(&ProcCategory::System)
                 || is_launch_boundary(&parent.name)
             {

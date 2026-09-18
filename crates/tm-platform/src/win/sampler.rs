@@ -1820,6 +1820,7 @@ fn refine_categories_and_group_apps(processes: &mut [ProcessEntry]) {
             if let Some(ppid) = p.ppid
                 && ppid != p.pid
                 && let Some(&pi) = idx_by_pid.get(&ppid)
+                && is_plausible_parent(&processes[pi], p)
             {
                 m.entry(pi).or_default().push(i);
             }
@@ -1829,12 +1830,18 @@ fn refine_categories_and_group_apps(processes: &mut [ProcessEntry]) {
     // App roots: windowed processes walked up to the topmost
     // non-windowed, non-system ancestor. Core OS images are never app roots
     // even when they own a window (classic conhost).
+    //
+    // PPID graphs on Windows can be cyclic due to PID reuse or parent spoofing;
+    // `seen_in_walk` prevents cycles from spinning indefinitely.
     let mut roots: Vec<usize> = Vec::new();
+    let mut seen_in_walk: HashSet<usize> = HashSet::new();
     for (i, p) in processes.iter().enumerate() {
         if !p.has_window || classify::is_core_os_image(&p.name) {
             continue;
         }
         let mut cur = i;
+        seen_in_walk.clear();
+        seen_in_walk.insert(cur);
         loop {
             let next = processes[cur]
                 .ppid
@@ -1842,9 +1849,12 @@ fn refine_categories_and_group_apps(processes: &mut [ProcessEntry]) {
             match next {
                 Some(pi)
                     if pi != cur
+                        && !seen_in_walk.contains(&pi)
+                        && is_plausible_parent(&processes[pi], &processes[cur])
                         && !processes[pi].has_window
                         && !classify::is_core_os_image(&processes[pi].name) =>
                 {
+                    seen_in_walk.insert(pi);
                     cur = pi;
                 }
                 _ => break,
@@ -2016,6 +2026,30 @@ mod tests {
         assert_eq!(category(500), ProcCategory::Background);
         assert_eq!(category(600), ProcCategory::Background);
         assert_eq!(category(700), ProcCategory::System);
+    }
+
+    #[test]
+    fn refine_categories_and_group_apps_handles_ppid_cycles_without_infinite_loop() {
+        // App with a window pointing to a cyclic background parent graph (PID reuse / spoofing)
+        let mut app = ProcessEntry::new(1000, "game.exe");
+        app.has_window = true;
+        app.ppid = Some(2000);
+
+        let mut bg1 = ProcessEntry::new(2000, "launcher_helper.exe");
+        bg1.has_window = false;
+        bg1.ppid = Some(3000);
+
+        // bg2 points back to bg1, forming a 2-node cycle 2000 <-> 3000
+        let mut bg2 = ProcessEntry::new(3000, "crash_reporter.exe");
+        bg2.has_window = false;
+        bg2.ppid = Some(2000);
+
+        let mut processes = vec![app, bg1, bg2];
+        refine_categories_and_group_apps(&mut processes);
+
+        // Must complete without hanging in an infinite loop.
+        let category = |pid| processes.iter().find(|p| p.pid == pid).unwrap().category;
+        assert_eq!(category(1000), ProcCategory::App);
     }
 
     #[test]
