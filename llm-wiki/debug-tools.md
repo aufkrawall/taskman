@@ -11,7 +11,7 @@ Primary sources:
 ## General rules
 
 - Verify a tool exists and runs before relying on it; prefer discovery
-  (`Get-Command`, `where.exe`, `command -v`) over hardcoded paths.
+  (`tools/discover-debug-tools.ps1`, `debug-tool-manifest.json`, `Get-Command`, `where.exe`, `command -v`) over hardcoded paths.
 - Prefer project-local or repository-pinned tools over global alternatives.
 - Treat dumps, logs, captures, extracted strings, and diagnostic output as
   potentially sensitive.
@@ -25,6 +25,7 @@ Primary sources:
 
 | Tool | Purpose | Invocation |
 | --- | --- | --- |
+| Tool discovery | non-mutating Windows SDK/MSVC/Sysinternals/Rust tool discovery | `powershell -ExecutionPolicy Bypass -File .\tools\discover-debug-tools.ps1` |
 | Core tests | model/settings/history/engine logic | `cargo test -p tm-core` |
 | Platform tests | collectors/actions plus short-lived Windows process integration tests | `cargo test -p tm-platform` |
 | App tests | tables, process topology, sorting, charts, module-dialog model | `cargo test -p tm-app` |

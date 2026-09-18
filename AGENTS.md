@@ -127,6 +127,7 @@
 
 | Tool | Purpose | Invocation |
 | --- | --- | --- |
+| `tools/discover-debug-tools.ps1` | Non-mutating Windows SDK/MSVC/Sysinternals/Rust tool discovery | `powershell -ExecutionPolicy Bypass -File .\tools\discover-debug-tools.ps1` |
 | `--selfcheck` | Headless sampling smoke test, prints JSON summary | `target/release/taskman.exe --selfcheck [--mock]` |
 | `TASKMAN_RENDERER=glow\|wgpu` | Force renderer | env var before launch |
 | `TASKMAN_FPS_PROBE=1` | Continuous repaints + fps overlay vs display Hz | env var |
@@ -135,6 +136,9 @@
 | `TASKMAN_DATA_DIR` / `TASKMAN_CONFIG_DIR` | Isolate data/config dirs (tests) | env var |
 | `tools/capture.ps1` | Window capture automation | see script header |
 
+- When `tools/discover-debug-tools.ps1` and `debug-tool-manifest.json` exist on
+  Windows, use the manifest as machine-specific path evidence instead of
+  duplicating SDK/MSVC discovery logic.
 - Verify tool availability before relying on a documented path; hardcoded
   paths are local examples, not guarantees.
 - Never mutate global debugger flags, registry/system settings, binaries,

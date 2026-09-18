@@ -9,3 +9,9 @@ bench/dist
 !docs/**/*.png
 CLAUDE.md
 vendor/winit/target
+
+# Local tool paths and discovery manifests
+tool-paths.env
+debug-tool-manifest.json
+debug-tool-warnings.txt
+debug-tool-availability.md

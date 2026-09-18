@@ -35,12 +35,15 @@ Primary sources:
 
 Use the first reliable source available:
 
-1. generated `security-audit-tool-manifest.json`
-2. local, uncommitted `tool-paths.env`
-3. repository-local or pinned tool locations
-4. shell discovery such as `Get-Command`, `where.exe`, or `command -v`
-5. documented project-specific known-good paths
-6. safe system defaults/fallbacks
+1. generated `debug-tool-manifest.json` for generic debugger/developer-tool paths
+2. generated `security-audit-tool-manifest.json` for security scanner/install evidence
+3. local, uncommitted `tool-paths.env` (see `tool-paths.example.env`)
+4. repository-local or pinned tool locations
+5. shell discovery such as `Get-Command`, `where.exe`, or `command -v`
+6. documented project-specific known-good paths
+7. safe system defaults/fallbacks
+
+On Windows, generic discovery belongs to `tools/discover-debug-tools.ps1` (output: `%LOCALAPPDATA%\LLMDebugTools\debug-tool-manifest.json`). Security and diagnostic workflows should consume that manifest rather than reimplementing Windows SDK or MSVC path generation.
 
 Example project path variables:
 
@@ -686,9 +689,9 @@ Durable TaskMan facts for security-relevant auditing. Keep incident history in
 
 ### Local known-good tool paths (this machine; verify before use)
 
-The `install-security-audit-tools.ps1`/`.sh` helpers and `tool-paths.env`
-referenced above are not part of this repository; discovery here is `PATH` plus
-the verified local paths below.
+Run `tools/discover-debug-tools.ps1` to produce the local `debug-tool-manifest.json`.
+Override paths via `tool-paths.env` (template: `tool-paths.example.env`).
+The verified local paths below serve as documented machine references:
 
 | Tool | Path |
 | --- | --- |
