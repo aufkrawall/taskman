@@ -911,20 +911,9 @@ fn caption(ui: &mut egui::Ui, pal: &Palette, left: &str, right: &str) -> egui::R
 /// glyph renders as a tofu box in any font that lacks it (Segoe UI Variable
 /// does), and a switchable graph's affordance must never read as a broken
 /// placeholder.
-/// Caption whose left label carries a "this switches" dropdown marker and
-/// then a trailing part (", 1min"). The marker is drawn, not typed: a `▾`
-/// glyph renders as a tofu box in any font that lacks it (Segoe UI Variable
-/// does), and a switchable graph's affordance must never read as a broken
-/// placeholder.
-fn caption_dropdown(
-    ui: &mut egui::Ui,
-    pal: &Palette,
-    title: &str,
-    rest: &str,
-) -> (egui::Response, egui::Response) {
-    let (rect, resp) =
-        ui.allocate_exact_size(egui::vec2(ui.available_width(), 20.0), egui::Sense::click());
-    let resp = resp.on_hover_cursor(CursorIcon::ContextMenu);
+fn caption_dropdown(ui: &mut egui::Ui, pal: &Palette, title: &str, rest: &str) -> egui::Response {
+    let (rect, _) =
+        ui.allocate_exact_size(egui::vec2(ui.available_width(), 20.0), egui::Sense::hover());
     let painter = ui.painter();
     let font = FontId::proportional(11.5);
     let title_width = painter
@@ -974,7 +963,7 @@ fn caption_dropdown(
         font,
         pal.text_dim,
     );
-    (resp, arrow_resp)
+    arrow_resp
 }
 
 /// Big-value stat (label above, large number below).
@@ -2027,7 +2016,7 @@ fn gpu_page(app: &mut TaskManApp, ui: &mut egui::Ui, pal: &Palette, entry: &Reso
             engine_label(engine),
         ),
     };
-    let (cap_resp, arrow_resp) = caption_dropdown(
+    let cap_resp = caption_dropdown(
         ui,
         pal,
         &title,
@@ -2135,10 +2124,8 @@ fn gpu_page(app: &mut TaskManApp, ui: &mut egui::Ui, pal: &Palette, entry: &Reso
             });
         },
     );
-    gpu_graph_dropdown_menu(app, &arrow_resp, &engines);
-    gpu_graph_context_menu(app, &arrow_resp, &engines);
+    gpu_graph_dropdown_menu(app, &cap_resp, &engines);
     gpu_graph_context_menu(app, &chart, &engines);
-    gpu_graph_context_menu(app, &cap_resp, &engines);
     time_window_context_menu(app, &dedicated_chart);
     ui.add_space(16.0);
 }

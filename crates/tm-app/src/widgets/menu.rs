@@ -61,9 +61,18 @@ pub fn context_menu(resp: &Response, add: impl FnOnce(&mut Ui)) {
     egui::Popup::context_menu(resp).style(style).show(add);
 }
 
-/// Open a left-click dropdown menu on `resp` in the classic style.
+/// Open a dropdown menu on `resp` in the classic style:
+/// left-click toggles the menu below `resp`, while right-click opens it at the pointer.
 pub fn dropdown_menu(resp: &Response, add: impl FnOnce(&mut Ui)) {
-    egui::Popup::menu(resp).style(style).show(add);
+    let popup = egui::Popup::menu(resp);
+    let popup = if resp.secondary_clicked() {
+        popup
+            .open_memory(Some(egui::containers::SetOpenCommand::Bool(true)))
+            .at_pointer_fixed()
+    } else {
+        popup
+    };
+    popup.style(style).show(add);
 }
 
 /// True for the one frame on which the user asked for the context menu of
