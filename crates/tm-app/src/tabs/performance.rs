@@ -1043,10 +1043,6 @@ fn content_width(ui: &egui::Ui) -> f32 {
     ui.available_width() - 2.0 * GUTTER
 }
 
-/// Page-bottom layout: big stats on the left, key/value details on the
-/// right — or stacked vertically when the detail area is too narrow for
-/// both (otherwise egui squeezes the kv column to zero width and the
-/// details silently vanish).
 /// Calculates in-use (active) physical memory for the composition bar.
 ///
 /// The kernel's page lists partition RAM into: Active (in use) + Modified +
@@ -1096,7 +1092,7 @@ fn memory_composition_bar(ui: &mut egui::Ui, pal: &Palette, mem: &tm_core::model
         ui.add_space(GUTTER);
         let (rect, _) = ui.allocate_exact_size(egui::vec2(width, bar_h), egui::Sense::hover());
         let mut x = rect.left();
-        for (bytes, label, color) in segments {
+        for (bytes, _, color) in segments {
             if bytes == 0 {
                 continue;
             }
@@ -1105,7 +1101,6 @@ fn memory_composition_bar(ui: &mut egui::Ui, pal: &Palette, mem: &tm_core::model
                 egui::Rect::from_min_size(egui::Pos2::new(x, rect.top()), egui::vec2(w, bar_h));
             ui.painter().rect_filled(seg, 0.0, color);
             x += w;
-            let _ = label;
         }
         ui.painter().rect_stroke(
             rect,
@@ -1132,6 +1127,10 @@ fn memory_composition_bar(ui: &mut egui::Ui, pal: &Palette, mem: &tm_core::model
     });
 }
 
+/// Page-bottom layout: big stats on the left, key/value details on the
+/// right — or stacked vertically when the detail area is too narrow for
+/// both (otherwise egui squeezes the kv column to zero width and the
+/// details silently vanish).
 fn stats_block(
     ui: &mut egui::Ui,
     stats_w: f32,
