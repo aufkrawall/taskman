@@ -830,7 +830,10 @@ impl Sampler {
             }
         }
 
-        let mut dead_pids: Vec<sysinfo::Pid> = Vec::new();
+        let now_s = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
         for (pid, p) in self.sys.processes() {
             let pid_u = pid.as_u32();
             // Single owned copy of the name per process (reused everywhere).
@@ -883,19 +886,34 @@ impl Sampler {
                 .or_else(|| self.cpu_load.thread_count_of(pid_u, entry.start_epoch_s));
 
             // Evict and drop crashed / terminated zombie processes.
-            // When an application crashes (GPU driver TDR, unhandled exception), its
-            // threads exit and the process object becomes signaled. sysinfo holds an
-            // open PROCESS_VM_READ handle to the process; on Windows NT, the kernel
-            // cannot complete address-space and driver rundown while an external
-            // handle with VM_READ is open, keeping the process listed in Toolhelp
-            // snapshots (a circular handle deadlock). Detecting process termination
-            // allows us to omit the dead process from the snapshot and remove it from
-            // sysinfo, immediately closing the handle and freeing the kernel object.
-            if pid_u > 4
-                && (threads == Some(0)
-                    || (threads.unwrap_or(0) <= 1 && is_process_terminated(pid_u)))
-            {
-                dead_pids.push(*pid);
+            // On Windows NT, the kernel process table (`NtQuerySystemInformation(SystemProcessInformation)`)
+            // is the authoritative source for active processes (matching native Windows Task Manager).
+            // When an application crashes or exits (e.g. game closing, GPU driver TDR, unhandled exception),
+            // the kernel removes it from the active process list. However, if external applications
+            // (or sysinfo's open query handle) hold an open process handle, Toolhelp32 snapshots
+            // will continue to enumerate the lingering EPROCESS object as a zombie.
+            //
+            // We omit a process from the snapshot and purge its caches if:
+            // 1. It has 0 threads (`threads == Some(0)`), OR
+            // 2. It is explicitly signaled or has an exit code (`is_process_terminated(pid_u)`), OR
+            // 3. It is absent from the kernel's active process table (`!is_process_live`)
+            //    and was not freshly spawned within the last 2 seconds.
+            let is_dead = if pid_u <= 4 {
+                false
+            } else if threads == Some(0) || is_process_terminated(pid_u) {
+                true
+            } else if !self.cpu_load.is_process_live(pid_u, entry.start_epoch_s) {
+                let is_recent = entry.start_epoch_s.is_some_and(|s| (now_s - s).abs() <= 2);
+                !is_recent
+            } else {
+                false
+            };
+
+            if is_dead {
+                self.attrs.remove(&pid_u);
+                self.image_paths.remove(pid_u);
+                self.prev_proc_net.remove(&pid_u);
+                self.last_proc_disk.remove(&pid_u);
                 continue;
             }
 
@@ -968,23 +986,6 @@ impl Sampler {
             entry.exe_path = exe_owned;
             entry.threads = threads;
             processes.push(entry);
-        }
-
-        // Evict dead processes from sysinfo to close their open handles immediately
-        // (breaking the circular handle reference in the kernel) and purge them from
-        // our attribute caches.
-        if !dead_pids.is_empty() {
-            for dead_pid in &dead_pids {
-                let dead_u = dead_pid.as_u32();
-                self.attrs.remove(&dead_u);
-                self.prev_proc_net.remove(&dead_u);
-                self.last_proc_disk.remove(&dead_u);
-            }
-            // Recreating sysinfo's System drops all its cached process structs and
-            // closes all open handles held by sysinfo (including the PROCESS_VM_READ
-            // handle to the dead/crashed process). This breaks the kernel circular
-            // reference and allows Windows to finish driver/address-space teardown.
-            self.sys = System::new();
         }
 
         // ---- slow-changing native attributes (cached, TTL-based) --------------

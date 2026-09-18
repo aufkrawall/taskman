@@ -201,6 +201,11 @@ impl ImagePaths {
         }
         self.resolved.retain(|pid, _| live.contains(pid));
     }
+
+    /// Drop a single process entry when evicted.
+    pub fn remove(&mut self, pid: u32) {
+        self.resolved.remove(&pid);
+    }
 }
 
 #[cfg(test)]

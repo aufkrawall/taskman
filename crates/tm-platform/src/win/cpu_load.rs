@@ -214,6 +214,28 @@ impl CpuLoadAccountant {
         filetime_to_unix_seconds(raw.create_time)
     }
 
+    /// Whether the newest native process table (from `NtQuerySystemInformation(SystemProcessInformation)`)
+    /// contains this exact process identity.
+    ///
+    /// The NT kernel process table is the authoritative source for live processes on Windows
+    /// (matching Windows Task Manager). If a process is absent from this table, it has
+    /// terminated in the kernel, even if user-mode handle retention (by other apps or
+    /// Toolhelp snapshots) temporarily keeps the `EPROCESS` executive object allocated.
+    pub fn is_process_live(&self, pid: u32, start_epoch_s: Option<i64>) -> bool {
+        let Some(prev) = self.prev.as_ref() else {
+            return true;
+        };
+        let Some(raw) = prev.procs.get(&pid) else {
+            return false;
+        };
+        if let Some(expected) = start_epoch_s
+            && let Some(actual) = filetime_to_unix_seconds(raw.create_time)
+        {
+            return (actual - expected).abs() <= 1;
+        }
+        true
+    }
+
     /// Process base priority from the newest native process table.
     ///
     /// The kernel reports this for EVERY process, including the protected
@@ -1592,5 +1614,57 @@ mod tests {
 
         // None expected start accepts current snapshot's kernel determination
         assert!(load.is_suspended(1234, None));
+    }
+
+    #[test]
+    fn is_process_live_handles_identity_and_skew() {
+        let mut load = CpuLoadAccountant::new();
+        // Warm up with mock process table
+        let mut procs = HashMap::new();
+        procs.insert(
+            1234,
+            ProcRaw {
+                // 1_700_000_000s in 100ns units since 1601
+                create_time: (1_700_000_000 + 11_644_473_600) * 10_000_000,
+                kernel: 0,
+                user: 0,
+                base_priority: 8,
+                session_id: 1,
+                handle_count: 10,
+                thread_count: 4,
+                working_set: 1024,
+                working_set_private: 512,
+                peak_working_set: 2048,
+                commit: 1024,
+                name: "test.exe".into(),
+                hard_faults: None,
+                io_ops: None,
+                io_read_bytes: None,
+                io_write_bytes: None,
+            },
+        );
+        load.prev = Some(PrevSample {
+            at: Instant::now(),
+            cores: vec![],
+            procs,
+        });
+
+        // Unknown PID returns false (terminated / zombie)
+        assert!(!load.is_process_live(9999, Some(1_700_000_000)));
+        assert!(!load.is_process_live(9999, None));
+
+        // Exact match
+        assert!(load.is_process_live(1234, Some(1_700_000_000)));
+
+        // 1-second skew tolerated
+        assert!(load.is_process_live(1234, Some(1_700_000_001)));
+        assert!(load.is_process_live(1234, Some(1_699_999_999)));
+
+        // 2-second difference rejected (recycled PID)
+        assert!(!load.is_process_live(1234, Some(1_700_000_002)));
+        assert!(!load.is_process_live(1234, Some(1_699_999_998)));
+
+        // None expected start accepts presence
+        assert!(load.is_process_live(1234, None));
     }
 }
