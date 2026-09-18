@@ -56,10 +56,15 @@ impl HotkeyHook {
         TRIGGER_EVENT.store(event.0 as isize, Ordering::Release);
         WORKER_RUNNING.store(true, Ordering::Release);
 
+        // The raw value, not `TRIGGER_EVENT`: teardown clears the global, and a
+        // worker that had not read it yet would then wait on a null handle and
+        // spin on `WAIT_FAILED` instead of blocking. `HANDLE` is not `Send`, so
+        // the isize crosses the thread boundary and is rebuilt on the far side.
+        let event_raw = event.0 as isize;
         let worker_join = std::thread::Builder::new()
             .name("tm-hotkey-worker".into())
             .spawn(move || {
-                let event = HANDLE(TRIGGER_EVENT.load(Ordering::Acquire) as *mut core::ffi::c_void);
+                let event = HANDLE(event_raw as *mut core::ffi::c_void);
                 while WORKER_RUNNING.load(Ordering::Acquire) {
                     let wait_res = unsafe { WaitForSingleObject(event, 500) };
                     if wait_res == WAIT_OBJECT_0 && WORKER_RUNNING.load(Ordering::Acquire) {
@@ -73,8 +78,12 @@ impl HotkeyHook {
                         }
                     }
                 }
-            })
-            .ok()?;
+            });
+        let Ok(worker_join) = worker_join else {
+            // Nothing is installed yet, so no callback can reach the event.
+            stop_worker(None, event);
+            return None;
+        };
 
         let thread_id_atomic = Arc::new(AtomicU32::new(0));
         let thread_id_clone = Arc::clone(&thread_id_atomic);
@@ -117,17 +126,21 @@ impl HotkeyHook {
                 unsafe {
                     let _ = UnhookWindowsHookEx(hook);
                 }
-            })
-            .ok()?;
+            });
+
+        // The worker exists only to serve the hook. Whenever the hook does not
+        // come up — the thread could not be spawned, or the hook itself was
+        // refused — the worker and its event are torn down here rather than
+        // left running against a dangling `TRIGGER_EVENT`.
+        let Ok(join) = join else {
+            stop_worker(Some(worker_join), event);
+            return None;
+        };
 
         let success = ready_rx.recv().unwrap_or(false);
         if !success {
             let _ = join.join();
-            WORKER_RUNNING.store(false, Ordering::Release);
-            let _ = unsafe { SetEvent(event) };
-            let _ = worker_join.join();
-            let _ = unsafe { CloseHandle(event) };
-            TRIGGER_EVENT.store(0, Ordering::Release);
+            stop_worker(Some(worker_join), event);
             return None;
         }
 
@@ -140,20 +153,31 @@ impl HotkeyHook {
     }
 }
 
+/// Stop the worker thread and release the event it waits on.
+///
+/// Only ever called once no hook can signal `TRIGGER_EVENT` any more: the
+/// event handle is closed here, and a stale hook callback that still held its
+/// value would otherwise signal a handle Windows had already recycled.
+fn stop_worker(worker_join: Option<std::thread::JoinHandle<()>>, event: HANDLE) {
+    TRIGGER_EVENT.store(0, Ordering::Release);
+    WORKER_RUNNING.store(false, Ordering::Release);
+    let _ = unsafe { SetEvent(event) };
+    if let Some(worker) = worker_join {
+        let _ = worker.join();
+    }
+    let _ = unsafe { CloseHandle(event) };
+}
+
 impl Drop for HotkeyHook {
     fn drop(&mut self) {
         *HOOK_CALLBACK.lock().unwrap() = None;
         LAST_DOWN_TICK.store(0, Ordering::Relaxed);
         CONSUMED_DOWN.store(false, Ordering::SeqCst);
-        TRIGGER_EVENT.store(0, Ordering::Release);
 
-        WORKER_RUNNING.store(false, Ordering::Release);
-        let _ = unsafe { SetEvent(self.event) };
-        if let Some(worker) = self.worker_join.take() {
-            let _ = worker.join();
-        }
-        let _ = unsafe { CloseHandle(self.event) };
-
+        // Uninstall the hook FIRST. `low_level_keyboard_proc` reads
+        // `TRIGGER_EVENT` and signals it; tearing the event down while the
+        // hook can still run leaves a window in which a callback signals a
+        // closed — and by then possibly recycled — handle.
         if self.thread_id != 0 {
             unsafe {
                 let _ = PostThreadMessageW(self.thread_id, WM_QUIT, WPARAM(0), LPARAM(0));
@@ -162,6 +186,8 @@ impl Drop for HotkeyHook {
         if let Some(join) = self.join.take() {
             let _ = join.join();
         }
+
+        stop_worker(self.worker_join.take(), self.event);
     }
 }
 
