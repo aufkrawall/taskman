@@ -1673,60 +1673,74 @@ fn process_disk_sample() -> ProcessDiskSample {
     }
 }
 
+/// Stop a broker-hosted trace once the GUI stops asking for it.
+///
+/// The thread lives exactly as long as the trace does: it is spawned with the
+/// session, sleeps straight to the earliest moment the session COULD be idle,
+/// and returns once it has torn it down. Both earlier watchdogs instead polled
+/// every five seconds for the lifetime of the service — so a machine whose
+/// user had opened the Processes page once at login kept waking a LocalSystem
+/// process twelve times a minute for the rest of the day, long after the last
+/// trace was gone. Nothing observes the timer, so there is nothing to poll
+/// for; the deadline is known exactly.
+///
+/// Both transitions of the slot happen under its lock — the caller starts a
+/// trace and spawns this while holding it, and this clears it while holding it
+/// — so there is exactly one watchdog per live session and never a second one
+/// racing it.
+fn spawn_trace_watchdog<T: Send + 'static>(
+    thread_name: &'static str,
+    slot: &'static std::sync::Mutex<Option<T>>,
+    last_request: fn(&T) -> std::time::Instant,
+    stopped_message: &'static str,
+) {
+    let _ = std::thread::Builder::new()
+        .name(thread_name.into())
+        .spawn(move || {
+            loop {
+                let wait = {
+                    let mut guard = match slot.lock() {
+                        Ok(guard) => guard,
+                        Err(poisoned) => poisoned.into_inner(),
+                    };
+                    let Some(trace) = guard.as_ref() else {
+                        // Somebody else already stopped it; nothing to watch.
+                        return;
+                    };
+                    let idle = last_request(trace).elapsed();
+                    if idle >= NET_TRACE_IDLE {
+                        // Dropping stops the session and joins its consumer.
+                        *guard = None;
+                        tracing::info!("{stopped_message}");
+                        return;
+                    }
+                    NET_TRACE_IDLE - idle
+                };
+                std::thread::sleep(wait);
+            }
+        });
+}
+
 /// Stop the disk trace once the GUI stops polling, exactly like the network
 /// one. Its own thread because the two traces idle out independently.
 fn spawn_disk_trace_watchdog() {
-    static STARTED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
-    if STARTED.set(()).is_err() {
-        return;
-    }
-    let _ = std::thread::Builder::new()
-        .name("tm-disk-idle".into())
-        .spawn(|| {
-            loop {
-                std::thread::sleep(std::time::Duration::from_secs(5));
-                let mut slot = match disk_trace().lock() {
-                    Ok(slot) => slot,
-                    Err(poisoned) => poisoned.into_inner(),
-                };
-                if slot
-                    .as_ref()
-                    .is_some_and(|trace| trace.last_request.elapsed() >= NET_TRACE_IDLE)
-                {
-                    // Dropping stops the session and joins its consumer.
-                    *slot = None;
-                    tracing::info!("per-process disk trace stopped (idle)");
-                }
-            }
-        });
+    spawn_trace_watchdog(
+        "tm-disk-idle",
+        disk_trace(),
+        |trace| trace.last_request,
+        "per-process disk trace stopped (idle)",
+    );
 }
 
 /// Stop the trace once the GUI stops polling. Without this the session would
 /// outlive the last interested window and trace forever.
 fn spawn_net_trace_watchdog() {
-    static STARTED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
-    if STARTED.set(()).is_err() {
-        return;
-    }
-    let _ = std::thread::Builder::new()
-        .name("tm-net-idle".into())
-        .spawn(|| {
-            loop {
-                std::thread::sleep(std::time::Duration::from_secs(5));
-                let mut slot = match net_trace().lock() {
-                    Ok(slot) => slot,
-                    Err(poisoned) => poisoned.into_inner(),
-                };
-                if slot
-                    .as_ref()
-                    .is_some_and(|trace| trace.last_request.elapsed() >= NET_TRACE_IDLE)
-                {
-                    // Dropping stops the session and joins its consumer.
-                    *slot = None;
-                    tracing::info!("per-process network trace stopped (idle)");
-                }
-            }
-        });
+    spawn_trace_watchdog(
+        "tm-net-idle",
+        net_trace(),
+        |trace| trace.last_request,
+        "per-process network trace stopped (idle)",
+    );
 }
 
 /// Test hook for [`live_pids`], so an integration test can check the same
