@@ -62,6 +62,12 @@ use windows::Win32::System::WindowsProgramming::{
 /// granularity), so we resync and keep the previous values instead.
 const MIN_WINDOW_S: f64 = 0.12;
 
+/// How old the cached kernel process table may be before its ABSENCE of a pid
+/// stops being evidence of termination. Comfortably above the sampler's tick
+/// so an ordinary tick always judges from a table queried moments earlier,
+/// and short enough that a genuinely dead process is evicted on the next tick.
+const PROC_TABLE_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// Hard cap for the process-table buffer growth (typical systems need
 /// well under 1 MiB; hundreds of processes ≈ a few hundred KiB).
 const MAX_BUFFER_BYTES: usize = 64 * 1024 * 1024;
@@ -221,10 +227,18 @@ impl CpuLoadAccountant {
     /// (matching Windows Task Manager). If a process is absent from this table, it has
     /// terminated in the kernel, even if user-mode handle retention (by other apps or
     /// Toolhelp snapshots) temporarily keeps the `EPROCESS` executive object allocated.
+    ///
+    /// Absence only proves termination while the table is CURRENT. A failed
+    /// `NtQuerySystemInformation` leaves the previous table in place, and every
+    /// process created after it would be missing from it through no fault of its
+    /// own — so a stale table answers "live" rather than evicting the innocent.
     pub fn is_process_live(&self, pid: u32, start_epoch_s: Option<i64>) -> bool {
         let Some(prev) = self.prev.as_ref() else {
             return true;
         };
+        if prev.at.elapsed() > PROC_TABLE_MAX_AGE {
+            return true;
+        }
         let Some(raw) = prev.procs.get(&pid) else {
             return false;
         };
@@ -1666,5 +1680,15 @@ mod tests {
 
         // None expected start accepts presence
         assert!(load.is_process_live(1234, None));
+
+        // A table older than PROC_TABLE_MAX_AGE proves nothing: a process
+        // created after the last successful query is legitimately missing
+        // from it, and must not be evicted from the snapshot.
+        let stale_at = Instant::now()
+            .checked_sub(PROC_TABLE_MAX_AGE + std::time::Duration::from_secs(1))
+            .expect("instant far enough from the epoch");
+        load.prev.as_mut().expect("warmed up").at = stale_at;
+        assert!(load.is_process_live(9999, Some(1_700_000_000)));
+        assert!(load.is_process_live(1234, Some(1_700_000_002)));
     }
 }
