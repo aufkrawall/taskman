@@ -147,16 +147,13 @@ pub struct ProcessIdentity {
 
 static TOAST_SEQ: AtomicU64 = AtomicU64::new(1);
 
-/// A toast with a stable monotonic id (the old identity derived from elapsed
-/// time changed across frames, breaking egui layout state).
+/// A toast with a stable monotonic id.
 #[derive(Debug, Clone)]
 pub struct Toast {
     pub id: u64,
     pub msg: String,
-    pub born: std::time::Instant,
 }
 
-pub const TOAST_TTL: std::time::Duration = std::time::Duration::from_secs(4);
 const MAX_TOASTS: usize = 6;
 
 pub type ToastQueue = Mutex<Vec<Toast>>;
@@ -167,7 +164,6 @@ pub fn toast_from(queue: &ToastQueue, msg: impl Into<String>) {
     t.push(Toast {
         id: TOAST_SEQ.fetch_add(1, Ordering::Relaxed),
         msg: msg.into(),
-        born: std::time::Instant::now(),
     });
     if t.len() > MAX_TOASTS {
         t.remove(0);
@@ -1407,14 +1403,6 @@ impl eframe::App for TaskManApp {
             ctx.request_repaint_after(std::time::Duration::from_millis(1));
         } else if self.active_dump.is_some() {
             ctx.request_repaint_after(std::time::Duration::from_millis(50));
-        } else {
-            let next_expiry = tm_core::sync::lock(&self.shared.toasts)
-                .iter()
-                .map(|t| TOAST_TTL.saturating_sub(t.born.elapsed()))
-                .min();
-            if let Some(wait) = next_expiry {
-                ctx.request_repaint_after(wait.min(std::time::Duration::from_millis(33)));
-            }
         }
     }
 

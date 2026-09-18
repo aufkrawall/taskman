@@ -1357,6 +1357,7 @@ pub fn run_task_dialog(app: &mut TaskManApp, ctx: &egui::Context, _pal: &theme::
                 let cmdline = app.run_dialog_text.trim().to_string();
                 let elevated = app.run_elevated;
                 let toasts = app.shared.toasts.clone();
+                let wake = ctx.clone();
                 let spawned = std::thread::Builder::new()
                     .name("tm-run".into())
                     .spawn(move || {
@@ -1366,6 +1367,7 @@ pub fn run_task_dialog(app: &mut TaskManApp, ctx: &egui::Context, _pal: &theme::
                             Err(error) => i18n::trf(K::ErrMsg, &[&error.to_string()]),
                         };
                         crate::app::toast_from(&toasts, msg);
+                        wake.request_repaint();
                     });
                 if spawned.is_err() {
                     app.shared.toast(i18n::tr(K::LaunchFailed));
@@ -1475,45 +1477,79 @@ fn dispatch_core_service_switch(app: &mut TaskManApp, ctx: &egui::Context) {
 }
 
 pub fn draw_toasts(app: &TaskManApp, ctx: &egui::Context) {
+    draw_toasts_queue(&app.shared.toasts, ctx);
+}
+
+pub fn draw_toasts_queue(toasts_queue: &crate::app::ToastQueue, ctx: &egui::Context) {
     /// Gap between stacked toasts.
     const GAP: f32 = 8.0;
-    let mut toasts = tm_core::sync::lock(&app.shared.toasts);
-    toasts.retain(|t| t.born.elapsed() < crate::app::TOAST_TTL);
+    let mut toasts = tm_core::sync::lock(toasts_queue);
+    if toasts.is_empty() {
+        return;
+    }
+
     // Stack by MEASURED heights, not a fixed step: a wrapped two-line message
     // must not overlap the toast below it. Toasts are painted oldest-first
     // from the anchored corner, so each offset is computed from the real
     // heights painted earlier in THIS frame — no lag, no estimate.
     let mut y_offset = 0.0f32;
-    let mut clicked_toast = None;
+    let mut closed_toast = None;
     for toast in toasts.iter() {
-        let age = toast.born.elapsed().as_secs_f32();
-        let alpha = (((4.0f32 - age) * 255.0).clamp(90.0, 255.0)) as u8;
         let id = egui::Id::new(("toast", toast.id));
         let response = egui::Area::new(id)
             .anchor(Align2::RIGHT_BOTTOM, [-12.0, -12.0 - y_offset])
             .order(egui::Order::Foreground)
-            .sense(Sense::click())
             .show(ctx, |ui| {
                 egui::Frame::window(ui.style())
-                    .fill(Color32::from_black_alpha(alpha.min(220)))
+                    .fill(Color32::from_black_alpha(220))
                     .stroke(Stroke::new(1.0, theme::LIGHT.stroke))
                     .inner_margin(egui::Margin::same(8))
                     .show(ui, |ui| {
-                        ui.set_max_width(380.0);
-                        ui.label(
-                            egui::RichText::new(&toast.msg)
-                                .size(13.0)
-                                .color(Color32::from_white_alpha(alpha)),
+                        let font = egui::FontId::proportional(13.0);
+                        let close_btn_size = egui::vec2(18.0, 18.0);
+                        let spacing = 8.0;
+                        let max_text_width = 380.0 - close_btn_size.x - spacing;
+                        let galley = ui.painter().layout(
+                            toast.msg.clone(),
+                            font,
+                            Color32::WHITE,
+                            max_text_width,
                         );
+                        let content_w = galley.size().x + spacing + close_btn_size.x;
+                        ui.set_max_width(content_w);
+                        ui.horizontal_top(|ui| {
+                            ui.spacing_mut().item_spacing.x = spacing;
+                            let (text_rect, _) =
+                                ui.allocate_exact_size(galley.size(), Sense::hover());
+                            ui.painter().galley(text_rect.min, galley, Color32::WHITE);
+
+                            let (btn_rect, btn_resp) =
+                                ui.allocate_exact_size(close_btn_size, Sense::click());
+                            let btn_resp = btn_resp.on_hover_text(i18n::tr(K::Close));
+                            if btn_resp.hovered() {
+                                ui.painter().rect_filled(
+                                    btn_rect,
+                                    3.0,
+                                    Color32::from_white_alpha(40),
+                                );
+                            }
+                            let icon_color = if btn_resp.hovered() {
+                                Color32::WHITE
+                            } else {
+                                Color32::from_gray(180)
+                            };
+                            crate::icons::draw(ui, Icon::Close, btn_rect, icon_color);
+                            if btn_resp.clicked() {
+                                closed_toast = Some(toast.id);
+                            }
+                        });
                     });
             });
-        if response.response.clicked() {
-            clicked_toast = Some(toast.id);
-        }
         y_offset += response.response.rect.height() + GAP;
     }
-    if let Some(id) = clicked_toast {
-        tm_core::sync::lock(&app.shared.toasts).retain(|t| t.id != id);
+    if let Some(id) = closed_toast {
+        toasts.retain(|t| t.id != id);
+        ctx.request_repaint();
     }
 }
 
@@ -1849,6 +1885,127 @@ mod tests {
                 false
             ),
             Some(DialogDecision::Safe)
+        );
+    }
+
+    #[test]
+    fn toasts_persist_without_auto_close_and_dismiss_via_x_button() {
+        use std::sync::Mutex;
+        let toasts: crate::app::ToastQueue = Mutex::new(Vec::new());
+        crate::app::toast_from(&toasts, "First action succeeded");
+        crate::app::toast_from(&toasts, "Second action succeeded");
+
+        let ctx = egui::Context::default();
+        let screen_rect = Rect::from_min_size(Pos2::ZERO, egui::vec2(800.0, 600.0));
+
+        // Frame 1: Initial render, no input. Both toasts must exist.
+        let raw1 = egui::RawInput {
+            screen_rect: Some(screen_rect),
+            time: Some(0.0),
+            ..Default::default()
+        };
+        let mut out1 = ctx.run_ui(raw1, |_| {
+            draw_toasts_queue(&toasts, &ctx);
+        });
+        out1.textures_delta.clear();
+        assert_eq!(tm_core::sync::lock(&toasts).len(), 2);
+
+        // Frame 2: Simulate 10 seconds later (previously TOAST_TTL was 4s).
+        // Without user action, toasts must NOT close automatically.
+        let raw2 = egui::RawInput {
+            screen_rect: Some(screen_rect),
+            time: Some(10.0),
+            ..Default::default()
+        };
+        let mut out2 = ctx.run_ui(raw2, |_| {
+            draw_toasts_queue(&toasts, &ctx);
+        });
+        out2.textures_delta.clear();
+        assert_eq!(
+            tm_core::sync::lock(&toasts).len(),
+            2,
+            "toasts must not close automatically over time"
+        );
+    }
+
+    #[test]
+    fn clicking_toast_body_does_not_close_but_x_button_closes() {
+        use std::sync::Mutex;
+        let toasts: crate::app::ToastQueue = Mutex::new(Vec::new());
+        crate::app::toast_from(&toasts, "Action completed");
+
+        let ctx = egui::Context::default();
+        let screen_rect = Rect::from_min_size(Pos2::ZERO, egui::vec2(800.0, 600.0));
+
+        let raw1 = egui::RawInput {
+            screen_rect: Some(screen_rect),
+            time: Some(0.0),
+            ..Default::default()
+        };
+        let mut out1 = ctx.run_ui(raw1, |_| {
+            draw_toasts_queue(&toasts, &ctx);
+        });
+        out1.textures_delta.clear();
+        assert_eq!(tm_core::sync::lock(&toasts).len(), 1);
+
+        // Click on the text area / body of the toast
+        let raw2 = egui::RawInput {
+            screen_rect: Some(screen_rect),
+            time: Some(1.0),
+            events: vec![
+                egui::Event::PointerButton {
+                    pos: egui::pos2(700.0, 570.0),
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::default(),
+                },
+                egui::Event::PointerButton {
+                    pos: egui::pos2(700.0, 570.0),
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::default(),
+                },
+            ],
+            ..Default::default()
+        };
+        let mut out2 = ctx.run_ui(raw2, |_| {
+            draw_toasts_queue(&toasts, &ctx);
+        });
+        out2.textures_delta.clear();
+        assert_eq!(
+            tm_core::sync::lock(&toasts).len(),
+            1,
+            "body click must not close toast"
+        );
+
+        // Click the close button
+        let raw3 = egui::RawInput {
+            screen_rect: Some(screen_rect),
+            time: Some(2.0),
+            events: vec![
+                egui::Event::PointerButton {
+                    pos: egui::pos2(771.0, 571.0),
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::default(),
+                },
+                egui::Event::PointerButton {
+                    pos: egui::pos2(771.0, 571.0),
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::default(),
+                },
+            ],
+            ..Default::default()
+        };
+        let mut out3 = ctx.run_ui(raw3, |_| {
+            draw_toasts_queue(&toasts, &ctx);
+        });
+        out3.textures_delta.clear();
+        assert_eq!(
+            tm_core::sync::lock(&toasts).len(),
+            0,
+            "x button click must close toast"
         );
     }
 }

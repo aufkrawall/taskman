@@ -48,8 +48,9 @@ and committed as ten reviewable commits (batches 1–7).
   UAC, session logoff, affinity, unload confirm, Startup properties, Select
   columns, Process properties and the modules dialog.
 - **Toasts** stack by their measured frame heights instead of a fixed 46 px
-  step (a wrapped message used to overlap the toast below it) and are
-  click-dismissible.
+  step (a wrapped message used to overlap the toast below it), persist until
+  deliberately closed via an 'x' button (no automatic timeout), and do not
+  close when clicking message text.
 - **Services**: the row menu gates Start/Stop/Restart on the service's actual
   state (Start on a running service was a guaranteed error toast) with
   hover explanations, stopped services show "—" in the PID column, and
