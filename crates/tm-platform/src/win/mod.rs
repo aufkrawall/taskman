@@ -168,6 +168,15 @@ pub fn restart_explorer(pid: u32, expected_start_epoch_s: Option<i64>) -> Result
 /// saturate the machine. Above-normal is intentional: HIGH/REALTIME can starve
 /// input and disk-flush threads and would make a Task Manager replacement less
 /// reliable rather than more reliable.
+///
+/// The priority CLASS covers every thread in the process, sampler included,
+/// which is right while the user is looking at the window and wrong the rest
+/// of the time: a copy parked in the notification area would otherwise outrank
+/// the work the user is actually doing, forever. Rather than give up the
+/// class — the whole point of which is that this program still responds when
+/// the machine is saturated — the sampling thread drops into Windows'
+/// background processing mode whenever no surface is on screen; see
+/// [`set_sampler_background`].
 pub fn prioritize_control_plane() {
     use windows::Win32::System::Threading::{
         ABOVE_NORMAL_PRIORITY_CLASS, GetCurrentProcess, GetCurrentThread, SetPriorityClass,
@@ -257,6 +266,54 @@ impl SystemCollector for WinCollector {
 
     fn set_demand(&mut self, demand: tm_core::demand::TelemetryDemand) {
         self.inner.set_demand(demand);
+    }
+
+    fn set_background(&mut self, background: bool) {
+        set_sampler_background(background);
+    }
+}
+
+/// Whether this thread is currently in Windows' background processing mode.
+/// The API is a toggle, not a level: `BEGIN` on a thread already in the mode
+/// fails, and so does `END` on one that is not.
+static SAMPLER_IN_BACKGROUND: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Put the sampling thread into (or out of) background processing mode.
+///
+/// Called on the engine thread, which is the thread that does the sampling.
+/// `THREAD_MODE_BACKGROUND_BEGIN` drops it to scheduling priority 4 *and*
+/// gives it very low I/O and memory priority, which is exactly the contract
+/// wanted while nobody is looking at the window: the work still happens, but
+/// it can no longer take a time slice, a disk queue slot or a page away from
+/// whatever the user is actually doing.
+///
+/// This is deliberately NOT done by lowering the process priority class: the
+/// GUI stays above-normal so it can still be driven when the machine is
+/// saturated, which is the one moment a task manager has to work.
+fn set_sampler_background(background: bool) {
+    use std::sync::atomic::Ordering;
+    use windows::Win32::System::Threading::{
+        GetCurrentThread, SetThreadPriority, THREAD_MODE_BACKGROUND_BEGIN,
+        THREAD_MODE_BACKGROUND_END,
+    };
+
+    if SAMPLER_IN_BACKGROUND.load(Ordering::Relaxed) == background {
+        return;
+    }
+    let mode = if background {
+        THREAD_MODE_BACKGROUND_BEGIN
+    } else {
+        THREAD_MODE_BACKGROUND_END
+    };
+    match unsafe { SetThreadPriority(GetCurrentThread(), mode) } {
+        Ok(()) => {
+            SAMPLER_IN_BACKGROUND.store(background, Ordering::Relaxed);
+            tracing::debug!(background, "sampler thread background mode");
+        }
+        // Not fatal: the sampler keeps running at its normal priority, which
+        // is what it did before this existed.
+        Err(error) => tracing::debug!(%error, background, "sampler background mode refused"),
     }
 }
 

@@ -58,6 +58,26 @@ impl TelemetryDemand {
             .union(Self::TOKEN_SECURITY)
     }
 
+    /// What a window nobody can see is allowed to keep running.
+    ///
+    /// Every provider above [`Self::CORE_PROCESS`] costs the MACHINE, not
+    /// just this process: `PROCESS_NET` and `PROCESS_DISK` are real-time
+    /// kernel ETW sessions that make the kernel emit, buffer and deliver an
+    /// event for every network datagram, every completed disk request and
+    /// every thread start on the box — for every process, not only the ones
+    /// on screen. Keeping those warm for a tray icon is not a cost this
+    /// program is entitled to impose, so a hidden surface drops to the
+    /// kernel process table alone.
+    ///
+    /// The visible consequence is that App history stops accumulating
+    /// NETWORK bytes while the window is away (accumulated CPU time is a
+    /// counter on the process itself and keeps working). That is a real gap,
+    /// and it is the deliberate trade: a background task manager must be
+    /// invisible to the rest of the system.
+    pub fn hidden() -> Self {
+        Self::CORE_PROCESS
+    }
+
     /// Every provider at once.
     ///
     /// Not a UI state — no page wants all of this — but exactly what a
@@ -101,6 +121,28 @@ mod tests {
                 | TelemetryDemand::PROCESS_GPU.bits()
         );
         assert_eq!(TelemetryDemand::from_bits(both.bits()), both);
+    }
+
+    /// A hidden surface must never be able to ask for more than a visible
+    /// one, and must never reach a provider that costs the whole machine.
+    #[test]
+    fn hidden_demand_is_a_subset_of_core() {
+        let hidden = TelemetryDemand::hidden();
+        assert_eq!(hidden.bits() & !TelemetryDemand::core().bits(), 0);
+        for (name, bit) in [
+            ("PROCESS_NET", TelemetryDemand::PROCESS_NET),
+            ("PROCESS_DISK", TelemetryDemand::PROCESS_DISK),
+            ("PROCESS_GPU", TelemetryDemand::PROCESS_GPU),
+            ("PROCESS_GPU_MEMORY", TelemetryDemand::PROCESS_GPU_MEMORY),
+            ("GPU_ADAPTER", TelemetryDemand::GPU_ADAPTER),
+            ("DISK_RATE", TelemetryDemand::DISK_RATE),
+            ("CPU_SPEED", TelemetryDemand::CPU_SPEED),
+        ] {
+            assert!(!hidden.wants(bit), "hidden() must not keep {name} warm");
+        }
+        // ...but it still has to sample processes, or App history and the
+        // Performance graphs would simply stop.
+        assert!(hidden.wants(TelemetryDemand::CORE_PROCESS));
     }
 
     /// `all()` must cover every declared bit. A provider added without being

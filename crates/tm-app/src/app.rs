@@ -419,6 +419,15 @@ pub struct TaskManApp {
     engine_started: bool,
     /// Last demand bitmask shipped to the engine (send only on change).
     last_demand_bits: u64,
+    /// Whether the previous frame actually painted.
+    ///
+    /// eframe runs `logic` on every tick but only runs `ui` for a surface
+    /// that is on screen, so this one flag covers the tray, a minimized
+    /// window and an occluded one alike — without asking the window system
+    /// anything or plumbing platform state down from the shell wrapper.
+    painted_last_frame: bool,
+    /// Last visibility shipped to the engine (act only on a change).
+    surface_visible: bool,
 
     /// Frame-rate diagnostics (TASKMAN_FPS_PROBE=1): forces continuous
     /// repaints, measures achieved fps against the display's refresh rate.
@@ -805,6 +814,11 @@ impl TaskManApp {
             scroll_to_pid: None,
             engine_started: false,
             last_demand_bits: 0,
+            // Assume visible until a frame proves otherwise: a normal launch
+            // paints immediately, and a `--minimized-to-tray` launch settles
+            // onto the hidden path one tick later.
+            painted_last_frame: true,
+            surface_visible: true,
             fps_probe,
             last_frame: None,
             fps_window_start: std::time::Instant::now(),
@@ -1125,11 +1139,45 @@ impl TaskManApp {
             self.details_state.requires_disk_telemetry(),
             self.details_state.requires_gpu_telemetry(),
             self.proc_props.is_some(),
+            self.surface_visible,
         );
         if d.bits() != self.last_demand_bits {
             self.last_demand_bits = d.bits();
             self.engine.set_demand(d);
         }
+    }
+
+    /// React to the surface appearing or disappearing.
+    ///
+    /// A task manager the user parked in the tray is still a background
+    /// process, and a background process may not keep kernel ETW sessions,
+    /// PDH wildcard queries and a one-second tick running against the whole
+    /// machine on the strength of an icon nobody is looking at. On the way
+    /// out this releases every provider that costs the SYSTEM something
+    /// ([`TelemetryDemand::hidden`]), stretches the tick and drops the
+    /// sampling thread into Windows' background scheduling mode; on the way
+    /// back in it restores all three and forces one immediate sample so the
+    /// restored window does not open on data up to [`HIDDEN_INTERVAL`] old.
+    fn sync_surface_visibility(&mut self) {
+        let visible = std::mem::replace(&mut self.painted_last_frame, false);
+        if visible == self.surface_visible {
+            return;
+        }
+        self.surface_visible = visible;
+        self.engine.set_background(!visible);
+        // A paused engine is the user's explicit choice and outranks this:
+        // it must not start ticking again because the window went away.
+        if self.shared.settings.update_speed != tm_core::settings::UpdateSpeed::Paused {
+            self.engine.set_interval(if visible {
+                self.shared.settings.update_speed.interval()
+            } else {
+                HIDDEN_INTERVAL
+            });
+        }
+        if visible {
+            self.engine.request_refresh();
+        }
+        tracing::debug!(visible, "surface visibility changed");
     }
 
     /// Invalidate every tab-local cache and force one fresh sample (F5 /
@@ -1243,7 +1291,14 @@ fn demand_for(
     details_disk: bool,
     details_gpu: bool,
     proc_props_open: bool,
+    surface_visible: bool,
 ) -> TelemetryDemand {
+    // Nothing on screen reads a column, so the tab the window happens to be
+    // parked on must not keep a kernel trace alive. This gate comes FIRST:
+    // every branch below is about what a page shows.
+    if !surface_visible {
+        return TelemetryDemand::hidden();
+    }
     let mut d = TelemetryDemand::core(); // core + adapter rates + tokens
     let details = |wanted: bool| tab == Tab::Details && wanted;
     // Per-process network is an ETW session on Windows. Processes and
@@ -1406,6 +1461,9 @@ impl eframe::App for TaskManApp {
             self.last_app_history_save = std::time::Instant::now();
         }
 
+        // Release/restore the expensive providers as the window comes and
+        // goes. Before `update_demand`, which reads the result.
+        self.sync_surface_visibility();
         // Ship telemetry-demand changes (tab switches etc.).
         self.update_demand();
 
@@ -1435,6 +1493,9 @@ impl eframe::App for TaskManApp {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        // Reaching `ui` at all is the proof that this surface is on screen;
+        // eframe skips it entirely for a hidden, minimized or occluded one.
+        self.painted_last_frame = true;
         let ctx = ui.ctx().clone();
         crate::theme::ensure_visuals(&ctx);
         crate::fonts::poll_async_apply(&ctx);
@@ -1590,6 +1651,15 @@ pub(crate) fn history_min_interval_s() -> f64 {
         .interval()
         .as_secs_f64()
 }
+
+/// Sampling interval while no surface is on screen.
+///
+/// Deliberately not "paused": App history and the Performance history keep
+/// accumulating while the window sits in the tray. The charts anchor every
+/// point on its own timestamp ([`crate::widgets::chart`]), so a sparser
+/// series plots at its real position on the axis instead of being stretched
+/// to fill the window — which is what makes stretching the tick safe here.
+pub(crate) const HIDDEN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Deque capacity for `seconds` of visible history sampled at the fastest
 /// configured speed. Split out for unit testing (audit §10).
@@ -2127,7 +2197,7 @@ mod tests {
     #[test]
     fn pages_showing_disk_active_time_ask_for_the_disk_counters() {
         for tab in [Tab::Processes, Tab::Users] {
-            let d = demand_for(tab, false, false, false, false);
+            let d = demand_for(tab, false, false, false, false, true);
             assert!(
                 d.wants(TelemetryDemand::PROCESS_DISK),
                 "{tab:?} must request the per-process disk trace"
@@ -2140,16 +2210,78 @@ mod tests {
         }
         // Details only when its disk column is actually visible.
         assert!(
-            !demand_for(Tab::Details, false, false, false, false).wants(TelemetryDemand::DISK_RATE)
+            !demand_for(Tab::Details, false, false, false, false, true)
+                .wants(TelemetryDemand::DISK_RATE)
         );
         assert!(
-            demand_for(Tab::Details, false, true, false, false).wants(TelemetryDemand::DISK_RATE)
+            demand_for(Tab::Details, false, true, false, false, true)
+                .wants(TelemetryDemand::DISK_RATE)
         );
         // A page with no disk column still must not wake the counters.
         assert!(
-            !demand_for(Tab::Services, false, false, false, false)
+            !demand_for(Tab::Services, false, false, false, false, true)
                 .wants(TelemetryDemand::DISK_RATE)
         );
+    }
+
+    /// A window in the tray, minimized or fully occluded must not keep a
+    /// single machine-wide provider warm, whatever page it was parked on.
+    /// The Processes page is the default start page AND the one that wants
+    /// both ETW sessions, so "started with Windows, closed to tray" used to
+    /// mean the kernel traced every disk request, every network datagram and
+    /// every thread start on the box for as long as the user was logged in.
+    #[test]
+    fn a_hidden_surface_releases_every_machine_wide_provider() {
+        for tab in [
+            Tab::Processes,
+            Tab::Performance,
+            Tab::AppHistory,
+            Tab::Users,
+            Tab::Details,
+            Tab::Startup,
+            Tab::Services,
+        ] {
+            let hidden = demand_for(tab, true, true, true, true, false);
+            assert_eq!(
+                hidden,
+                TelemetryDemand::hidden(),
+                "{tab:?} must fall back to the hidden demand when nothing is on screen"
+            );
+            for (name, bit) in [
+                ("PROCESS_NET", TelemetryDemand::PROCESS_NET),
+                ("PROCESS_DISK", TelemetryDemand::PROCESS_DISK),
+                ("DISK_RATE", TelemetryDemand::DISK_RATE),
+                ("PROCESS_GPU", TelemetryDemand::PROCESS_GPU),
+                ("GPU_ADAPTER", TelemetryDemand::GPU_ADAPTER),
+                ("CPU_SPEED", TelemetryDemand::CPU_SPEED),
+            ] {
+                assert!(
+                    !hidden.wants(bit),
+                    "hidden {tab:?} must not keep {name} warm"
+                );
+            }
+        }
+        // ...and the same page asks for everything again once it is shown.
+        assert!(
+            demand_for(Tab::Processes, false, false, false, false, true)
+                .wants(TelemetryDemand::PROCESS_NET)
+        );
+    }
+
+    /// The hidden tick has to stay slower than every speed the user can pick,
+    /// or parking the window in the tray would make the app work HARDER.
+    #[test]
+    fn the_hidden_interval_is_slower_than_every_user_speed() {
+        for speed in [
+            tm_core::settings::UpdateSpeed::High,
+            tm_core::settings::UpdateSpeed::Normal,
+            tm_core::settings::UpdateSpeed::Low,
+        ] {
+            assert!(
+                HIDDEN_INTERVAL > speed.interval(),
+                "{speed:?} must tick faster than a hidden window"
+            );
+        }
     }
 
     /// Regression ("graphs stop updating"): the history was a `VecDeque`

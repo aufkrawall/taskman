@@ -30,6 +30,10 @@ pub trait SystemCollector: Send {
     /// Update the telemetry demand bitmask. Default: ignore (mock/simple
     /// collectors sample everything cheap they have anyway).
     fn set_demand(&mut self, _demand: crate::demand::TelemetryDemand) {}
+    /// Tell the collector whether it is sampling for a surface nobody can
+    /// see. Called ON the engine thread, so an implementation may use it to
+    /// change that thread's own scheduling class. Default: ignore.
+    fn set_background(&mut self, _background: bool) {}
 }
 
 /// Builds a collector on the engine thread. Construction can be expensive
@@ -48,6 +52,10 @@ pub enum EngineCmd {
     Start,
     /// Update which expensive telemetry the UI currently needs.
     SetDemand(crate::demand::TelemetryDemand),
+    /// The UI surface became (in)visible. Separate from `SetDemand` because
+    /// it is not about WHICH providers run but about how the sampling thread
+    /// is allowed to compete with the rest of the machine.
+    SetBackground(bool),
     SetInterval(Duration),
     Pause,
     Resume,
@@ -124,6 +132,12 @@ impl EngineHandle {
     /// expensive providers warm up / sleep accordingly.
     pub fn set_demand(&self, demand: crate::demand::TelemetryDemand) {
         let _ = self.cmd_tx.send(EngineCmd::SetDemand(demand));
+    }
+
+    /// Tell the collector whether its work is currently invisible, so it can
+    /// stop competing with whatever the user is actually looking at.
+    pub fn set_background(&self, background: bool) {
+        let _ = self.cmd_tx.send(EngineCmd::SetBackground(background));
     }
 
     pub fn set_interval(&self, interval: Duration) {
@@ -271,6 +285,7 @@ fn run_loop(
     // the session. That is how per-process network stayed dark on the default
     // start page: `PROCESS_NET` was requested exactly once, into the void.
     let mut pending_demand: Option<crate::demand::TelemetryDemand> = None;
+    let mut pending_background: Option<bool> = None;
     let mut collector: Box<dyn SystemCollector> = if start_immediately {
         factory()
     } else {
@@ -278,6 +293,9 @@ fn run_loop(
             match cmd_rx.recv() {
                 Ok(EngineCmd::Start) => break factory(),
                 Ok(EngineCmd::SetDemand(d)) => pending_demand = Some(d),
+                // Same reason demand is remembered: a launch straight into
+                // the tray reports "hidden" before the engine is started.
+                Ok(EngineCmd::SetBackground(b)) => pending_background = Some(b),
                 // The sampling loop reads the interval from shared state, so
                 // applying it now is exactly what the running loop would do.
                 Ok(EngineCmd::SetInterval(i)) => *sync::write(&shared.interval) = i,
@@ -298,6 +316,9 @@ fn run_loop(
     };
     if let Some(demand) = pending_demand.take() {
         collector.set_demand(demand);
+    }
+    if let Some(background) = pending_background.take() {
+        collector.set_background(background);
     }
     *sync::write(&shared.state) = EngineState::Running;
     shared.notify();
@@ -357,6 +378,7 @@ fn run_loop(
                 *sync::write(&shared.interval) = i;
             }
             Ok(EngineCmd::SetDemand(d)) => collector.set_demand(d),
+            Ok(EngineCmd::SetBackground(b)) => collector.set_background(b),
             Ok(EngineCmd::Pause) => {
                 tracing::info!("engine paused");
                 *sync::write(&shared.state) = EngineState::Paused;
