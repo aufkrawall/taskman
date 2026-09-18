@@ -98,6 +98,60 @@ struct PidAttrs {
     power_refreshed_at: Instant,
 }
 
+/// How long a process must stay hung before it is reported as "Not
+/// responding".
+///
+/// `IsHungAppWindow` is an EDGE trigger: it flips to true the moment a window's
+/// thread has not pumped messages for 5 seconds, and back to false the moment
+/// it pumps again. That is not the same question a status column asks. A
+/// backgrounded borderless-windowed game throttled to a few frames per second
+/// pumps once per frame, so every frame longer than 5 s trips the trigger even
+/// though the game is rendering and will answer the next click immediately.
+///
+/// Requiring the hung state to hold CONTINUOUSLY separates the two: a process
+/// that pumps at all clears the hold, so a frame interval below
+/// `NOT_RESPONDING_GRACE + 5 s` can never be reported, while a genuinely
+/// wedged process never clears it and is reported after the grace. The cost is
+/// latency on a true hang, never a missed one.
+const NOT_RESPONDING_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Per-process start of the current uninterrupted hang.
+///
+/// Keyed by pid with the creation time alongside, so a recycled pid starts its
+/// own hold instead of inheriting the dead process's.
+#[derive(Default)]
+struct NotRespondingHold {
+    since: HashMap<u32, (Option<i64>, Instant)>,
+}
+
+impl NotRespondingHold {
+    /// Fold this tick's observation in and answer whether the process has now
+    /// been hung long enough to report.
+    fn observe(
+        &mut self,
+        pid: u32,
+        start_epoch_s: Option<i64>,
+        hung_now: bool,
+        now: Instant,
+    ) -> bool {
+        if !hung_now {
+            self.since.remove(&pid);
+            return false;
+        }
+        let entry = self.since.entry(pid).or_insert((start_epoch_s, now));
+        if entry.0 != start_epoch_s {
+            *entry = (start_epoch_s, now);
+        }
+        now.duration_since(entry.1) >= NOT_RESPONDING_GRACE
+    }
+
+    /// Forget every pid that owns no window this tick: only a window can be
+    /// hung, so nothing else can be holding, and the map stays bounded.
+    fn retain_windowed(&mut self, windowed: &HashSet<u32>) {
+        self.since.retain(|pid, _| windowed.contains(pid));
+    }
+}
+
 /// Shortest interval between two releases of sysinfo's process handles. One
 /// release costs a full re-enumeration on the next tick; a machine that keeps
 /// producing zombies must not pay that on every tick.
@@ -158,6 +212,9 @@ pub struct Sampler {
     zombie_pids: HashSet<u32>,
     /// When sysinfo's handles were last released (see [`SYS_RESET_COOLDOWN`]).
     last_sys_reset: Option<Instant>,
+    /// How long each process has been continuously hung, so a momentary pump
+    /// gap is not reported as "Not responding" (see [`NOT_RESPONDING_GRACE`]).
+    not_responding_hold: NotRespondingHold,
     /// Image paths for the processes no handle can be opened for. Cached
     /// because the answer cannot change while a process lives.
     image_paths: image_path::ImagePaths,
@@ -287,6 +344,7 @@ impl Sampler {
             last_proc_disk: HashMap::new(),
             zombie_pids: HashSet::new(),
             last_sys_reset: None,
+            not_responding_hold: NotRespondingHold::default(),
         }
     }
 
@@ -739,6 +797,8 @@ impl Sampler {
         self.refresh_raw();
 
         let window_owners = windows_enum::window_owners();
+        self.not_responding_hold
+            .retain_windowed(&window_owners.visible);
         let thread_counts = threads_map::thread_counts();
 
         // ---- CPU -----------------------------------------------------------------
@@ -949,9 +1009,19 @@ impl Sampler {
             }
 
             entry.status = map_status(p.status());
+            // The hung observation is folded in for EVERY process, not only the
+            // ones about to be labelled: a process that pumped again this tick
+            // has to clear its hold, or the next hang would inherit the old
+            // one's start and be reported instantly.
+            let hung_long_enough = self.not_responding_hold.observe(
+                pid_u,
+                entry.start_epoch_s,
+                window_owners.not_responding.contains(&pid_u),
+                started,
+            );
             if self.cpu_load.is_suspended(pid_u, entry.start_epoch_s) {
                 entry.status = ProcStatus::Suspended;
-            } else if window_owners.not_responding.contains(&pid_u) {
+            } else if hung_long_enough {
                 entry.status = ProcStatus::NotResponding;
             }
             entry.user = user;
@@ -2074,6 +2144,33 @@ mod tests {
         assert_eq!(category(500), ProcCategory::Background);
         assert_eq!(category(600), ProcCategory::Background);
         assert_eq!(category(700), ProcCategory::System);
+    }
+
+    #[test]
+    fn not_responding_needs_an_uninterrupted_hang() {
+        let mut hold = NotRespondingHold::default();
+        let t0 = Instant::now();
+        let after = |secs: u64| t0 + std::time::Duration::from_secs(secs);
+
+        // A hang shorter than the grace is not reported.
+        assert!(!hold.observe(100, Some(1), true, t0));
+        assert!(!hold.observe(100, Some(1), true, after(9)));
+        // Held continuously past the grace: reported.
+        assert!(hold.observe(100, Some(1), true, after(10)));
+
+        // One pumped tick clears the hold - this is the throttled background
+        // game whose frame straddles the 5 s IsHungAppWindow threshold.
+        assert!(!hold.observe(100, Some(1), false, after(11)));
+        assert!(!hold.observe(100, Some(1), true, after(12)));
+        assert!(!hold.observe(100, Some(1), true, after(21)));
+        assert!(hold.observe(100, Some(1), true, after(22)));
+
+        // A recycled pid starts its own hold instead of inheriting one.
+        assert!(!hold.observe(100, Some(2), true, after(23)));
+
+        // A pid with no window this tick cannot be hung; its hold is dropped.
+        hold.retain_windowed(&HashSet::from([999]));
+        assert!(!hold.observe(100, Some(2), true, after(40)));
     }
 
     #[test]

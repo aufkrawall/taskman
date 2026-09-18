@@ -158,6 +158,12 @@ unsafe fn hosted_app_pid(frame: HWND) -> Option<u32> {
 
 /// Count `pid` as an app owner and carry over the window's hung state.
 ///
+/// `not_responding` is the RAW edge: `IsHungAppWindow` is true as soon as the
+/// window's thread has not pumped for 5 seconds and false again the moment it
+/// does. That flickers for anything with long frame times, so the sampler
+/// requires the state to hold continuously before it labels a process (see
+/// `sampler::NOT_RESPONDING_GRACE`); nothing here should second-guess the API.
+///
 /// SAFETY: `IsHungAppWindow` is a local state query and does not send a
 /// blocking message into the target process.
 unsafe fn record(owners: &mut WindowOwners, pid: u32, hwnd: HWND) {
