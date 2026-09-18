@@ -64,6 +64,7 @@ pub struct GpuHistoryPoint {
     /// Dedicated (VRAM) bytes in use.
     pub dedicated_used_bytes: u64,
     /// Shared (system-memory-backed) bytes in use.
+    #[allow(dead_code)]
     pub shared_used_bytes: u64,
 }
 

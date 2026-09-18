@@ -61,6 +61,11 @@ pub fn context_menu(resp: &Response, add: impl FnOnce(&mut Ui)) {
     egui::Popup::context_menu(resp).style(style).show(add);
 }
 
+/// Open a left-click dropdown menu on `resp` in the classic style.
+pub fn dropdown_menu(resp: &Response, add: impl FnOnce(&mut Ui)) {
+    egui::Popup::menu(resp).style(style).show(add);
+}
+
 /// True for the one frame on which the user asked for the context menu of
 /// the current selection with the keyboard: the Menu/Application key (next
 /// to Right Ctrl), or its standard Shift+F10 accelerator.

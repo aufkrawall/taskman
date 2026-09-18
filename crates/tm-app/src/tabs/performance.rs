@@ -257,6 +257,27 @@ mod tests {
         assert_eq!(engine_label("3D"), "3D");
         assert_eq!(engine_label("Compute"), "Compute");
     }
+
+    #[test]
+    fn memory_composition_used_does_not_zero_out_with_standby_cache() {
+        let mem = tm_core::model::MemoryInfo {
+            total_bytes: 32 * 1024 * 1024 * 1024,
+            used_bytes: 8 * 1024 * 1024 * 1024,
+            available_bytes: 24 * 1024 * 1024 * 1024,
+            cached_bytes: 14 * 1024 * 1024 * 1024,
+            modified_bytes: 100 * 1024 * 1024,
+            standby_bytes: 14 * 1024 * 1024 * 1024,
+            free_bytes: 10 * 1024 * 1024 * 1024,
+            ..Default::default()
+        };
+        let used = memory_composition_used(&mem);
+        // Previously, `used_bytes.saturating_sub(modified).saturating_sub(standby)`
+        // resulted in 8 GB - 0.1 GB - 14 GB = 0 B.
+        assert!(used > 0, "used memory must not be 0 B: got {used}");
+        let expected = (32 * 1024 * 1024 * 1024u64)
+            - (100 * 1024 * 1024 + 14 * 1024 * 1024 * 1024 + 10 * 1024 * 1024 * 1024);
+        assert_eq!(used, expected);
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -828,7 +849,6 @@ fn engine_label(name: &str) -> String {
 enum GpuField {
     Util,
     Dedicated,
-    Shared,
 }
 
 fn gpu_series(win: &[HistoryPoint], key: &str, field: GpuField) -> Vec<f64> {
@@ -840,7 +860,6 @@ fn gpu_series(win: &[HistoryPoint], key: &str, field: GpuField) -> Vec<f64> {
                 .map_or(0.0, |point| match field {
                     GpuField::Util => point.util_pct as f64,
                     GpuField::Dedicated => point.dedicated_used_bytes as f64,
-                    GpuField::Shared => point.shared_used_bytes as f64,
                 })
         })
         .collect()
@@ -892,7 +911,17 @@ fn caption(ui: &mut egui::Ui, pal: &Palette, left: &str, right: &str) -> egui::R
 /// glyph renders as a tofu box in any font that lacks it (Segoe UI Variable
 /// does), and a switchable graph's affordance must never read as a broken
 /// placeholder.
-fn caption_dropdown(ui: &mut egui::Ui, pal: &Palette, title: &str, rest: &str) -> egui::Response {
+/// Caption whose left label carries a "this switches" dropdown marker and
+/// then a trailing part (", 1min"). The marker is drawn, not typed: a `▾`
+/// glyph renders as a tofu box in any font that lacks it (Segoe UI Variable
+/// does), and a switchable graph's affordance must never read as a broken
+/// placeholder.
+fn caption_dropdown(
+    ui: &mut egui::Ui,
+    pal: &Palette,
+    title: &str,
+    rest: &str,
+) -> (egui::Response, egui::Response) {
     let (rect, resp) =
         ui.allocate_exact_size(egui::vec2(ui.available_width(), 20.0), egui::Sense::click());
     let resp = resp.on_hover_cursor(CursorIcon::ContextMenu);
@@ -904,22 +933,38 @@ fn caption_dropdown(ui: &mut egui::Ui, pal: &Palette, title: &str, rest: &str) -
         .x;
     let left = rect.left() + GUTTER;
     let center_y = rect.center().y;
+    let marker_x = left + title_width + 5.0;
+    let s = 3.2f32;
+
+    let dropdown_rect = egui::Rect::from_min_max(
+        Pos2::new(left, rect.top()),
+        Pos2::new(marker_x + s + 6.0, rect.bottom()),
+    );
+    let arrow_resp = ui
+        .interact(
+            dropdown_rect,
+            ui.id().with("gpu_metric_arrow"),
+            egui::Sense::click(),
+        )
+        .on_hover_cursor(CursorIcon::PointingHand);
+
+    let is_hovered = arrow_resp.hovered();
+    let text_color = if is_hovered { pal.text } else { pal.text_dim };
+
     painter.text(
         Pos2::new(left, center_y),
         Align2::LEFT_CENTER,
         title,
         font.clone(),
-        pal.text_dim,
+        text_color,
     );
-    let marker_x = left + title_width + 5.0;
-    let s = 3.2f32;
     painter.add(egui::Shape::convex_polygon(
         vec![
             Pos2::new(marker_x - s, center_y - s * 0.45),
             Pos2::new(marker_x + s, center_y - s * 0.45),
             Pos2::new(marker_x, center_y + s * 0.7),
         ],
-        pal.text_dim,
+        text_color,
         egui::Stroke::NONE,
     ));
     painter.text(
@@ -929,7 +974,7 @@ fn caption_dropdown(ui: &mut egui::Ui, pal: &Palette, title: &str, rest: &str) -
         font,
         pal.text_dim,
     );
-    resp
+    (resp, arrow_resp)
 }
 
 /// Big-value stat (label above, large number below).
@@ -1013,6 +1058,22 @@ fn content_width(ui: &egui::Ui) -> f32 {
 /// right — or stacked vertically when the detail area is too narrow for
 /// both (otherwise egui squeezes the kv column to zero width and the
 /// details silently vanish).
+/// Calculates in-use (active) physical memory for the composition bar.
+///
+/// The kernel's page lists partition RAM into: Active (in use) + Modified +
+/// Standby + Free. `mem.used_bytes` is `total_bytes - available_bytes` (where
+/// available is Standby + Free), so `mem.used_bytes` already represents
+/// active + modified and must NOT subtract standby again.
+fn memory_composition_used(mem: &tm_core::model::MemoryInfo) -> u64 {
+    let non_in_use = mem
+        .modified_bytes
+        .saturating_add(mem.standby_bytes)
+        .saturating_add(mem.free_bytes);
+    mem.total_bytes
+        .saturating_sub(non_in_use)
+        .max(mem.used_bytes.saturating_sub(mem.modified_bytes))
+}
+
 /// Native Task Manager's memory composition bar: one horizontal strip whose
 /// segments are the kernel's page lists. Drawn only when the platform
 /// reported them — a bar built from zeros would claim every list is empty.
@@ -1020,10 +1081,7 @@ fn memory_composition_bar(ui: &mut egui::Ui, pal: &Palette, mem: &tm_core::model
     if mem.modified_bytes == 0 && mem.standby_bytes == 0 && mem.free_bytes == 0 {
         return;
     }
-    let used = mem
-        .used_bytes
-        .saturating_sub(mem.modified_bytes)
-        .saturating_sub(mem.standby_bytes);
+    let used = memory_composition_used(mem);
     let segments = [
         (used, i18n::tr(K::StatInUse), pal.memory_graph),
         (
@@ -1408,29 +1466,50 @@ fn cpu_graph_context_menu(app: &mut TaskManApp, resp: &egui::Response) {
 /// "Overall" and a single engine are answers to different questions —
 /// switching to Video Encode is the only way to see whether NVENC is busy
 /// while the 3D engine is pinned.
+fn gpu_graph_menu_contents(
+    ui: &mut egui::Ui,
+    current: &str,
+    engines: &[String],
+    chosen: &mut Option<String>,
+) {
+    menu::title(ui, i18n::tr(K::ChangeGraphTo));
+    menu::separator(ui);
+    if menu::check(ui, i18n::tr(K::CpuGraphOverall), current == "overall").clicked() {
+        *chosen = Some("overall".to_string());
+        ui.close();
+    }
+    if menu::check(ui, i18n::tr(K::GpuAllEngines), current == "all").clicked() {
+        *chosen = Some("all".to_string());
+        ui.close();
+    }
+    if !engines.is_empty() {
+        menu::separator(ui);
+    }
+    for engine in engines {
+        if menu::check(ui, &engine_label(engine), current == *engine).clicked() {
+            *chosen = Some(engine.clone());
+            ui.close();
+        }
+    }
+}
+
 fn gpu_graph_context_menu(app: &mut TaskManApp, resp: &egui::Response, engines: &[String]) {
     let current = app.shared.settings.gpu_graph_mode.clone();
     let mut chosen = None;
     menu::context_menu(resp, |ui| {
-        menu::title(ui, i18n::tr(K::ChangeGraphTo));
-        menu::separator(ui);
-        if menu::check(ui, i18n::tr(K::CpuGraphOverall), current == "overall").clicked() {
-            chosen = Some("overall".to_string());
-            ui.close();
-        }
-        if menu::check(ui, i18n::tr(K::GpuAllEngines), current == "all").clicked() {
-            chosen = Some("all".to_string());
-            ui.close();
-        }
-        if !engines.is_empty() {
-            menu::separator(ui);
-        }
-        for engine in engines {
-            if menu::check(ui, &engine_label(engine), current == *engine).clicked() {
-                chosen = Some(engine.clone());
-                ui.close();
-            }
-        }
+        gpu_graph_menu_contents(ui, &current, engines, &mut chosen);
+    });
+    if let Some(mode) = chosen {
+        app.shared.settings.gpu_graph_mode = mode;
+        app.save_settings();
+    }
+}
+
+fn gpu_graph_dropdown_menu(app: &mut TaskManApp, resp: &egui::Response, engines: &[String]) {
+    let current = app.shared.settings.gpu_graph_mode.clone();
+    let mut chosen = None;
+    menu::dropdown_menu(resp, |ui| {
+        gpu_graph_menu_contents(ui, &current, engines, &mut chosen);
     });
     if let Some(mode) = chosen {
         app.shared.settings.gpu_graph_mode = mode;
@@ -1948,7 +2027,7 @@ fn gpu_page(app: &mut TaskManApp, ui: &mut egui::Ui, pal: &Palette, entry: &Reso
             engine_label(engine),
         ),
     };
-    let cap_resp = caption_dropdown(
+    let (cap_resp, arrow_resp) = caption_dropdown(
         ui,
         pal,
         &title,
@@ -1966,10 +2045,7 @@ fn gpu_page(app: &mut TaskManApp, ui: &mut egui::Ui, pal: &Palette, entry: &Reso
         fmt_percent,
     );
 
-    // Dedicated (VRAM) and shared (system-memory-backed) memory are separate
-    // graphs, the way native Task Manager shows them: a GPU whose work spills
-    // into shared memory is exactly what the second graph is for, and their
-    // scales differ by an order of magnitude.
+    // Dedicated (VRAM) memory graph.
     let dedicated = gpu_series(win, &entry.key, GpuField::Dedicated);
     let dedicated_max = gpu
         .mem_total_bytes
@@ -1987,7 +2063,7 @@ fn gpu_page(app: &mut TaskManApp, ui: &mut egui::Ui, pal: &Palette, entry: &Reso
     // Mebibytes, matching `fmt_mib` — these were called `*_gb` while holding
     // MiB, which is exactly how a chart ends up mislabelled.
     let dedicated_mib: Vec<f64> = dedicated.iter().map(|v| v / 1024.0 / 1024.0).collect();
-    page_chart(
+    let dedicated_chart = page_chart(
         ui,
         width,
         150.0,
@@ -1997,37 +2073,6 @@ fn gpu_page(app: &mut TaskManApp, ui: &mut egui::Ui, pal: &Palette, entry: &Reso
             theme::toned(pal, pal.gpu_graph, 0.62),
         )],
         dedicated_max as f64 / 1024.0 / 1024.0,
-        Some(axis),
-        fmt_mib,
-    );
-
-    // Windows does not publish a shared-memory LIMIT (the driver caps it at
-    // roughly half of system RAM), so the scale is the observed peak with a
-    // floor of half the installed RAM — stable, and never a fabricated cap.
-    let shared = gpu_series(win, &entry.key, GpuField::Shared);
-    let shared_peak = shared.iter().cloned().fold(0.0f64, f64::max);
-    let shared_floor = snap.memory.total_bytes as f64 / 2.0;
-    let shared_max = shared_peak.max(shared_floor).max(1.0);
-    caption(
-        ui,
-        pal,
-        &i18n::trf(
-            K::GpuSharedWindow,
-            &[&window_label(app.shared.settings.graph_seconds)],
-        ),
-        &format::format_bytes_loc(shared_max as u64),
-    );
-    let shared_mib: Vec<f64> = shared.iter().map(|v| v / 1024.0 / 1024.0).collect();
-    page_chart(
-        ui,
-        width,
-        150.0,
-        &[MultiSeries::new(
-            i18n::tr(K::GpuSharedStat),
-            shared_mib,
-            theme::toned(pal, pal.gpu_graph, 0.42),
-        )],
-        shared_max / 1024.0 / 1024.0,
         Some(axis),
         fmt_mib,
     );
@@ -2090,7 +2135,10 @@ fn gpu_page(app: &mut TaskManApp, ui: &mut egui::Ui, pal: &Palette, entry: &Reso
             });
         },
     );
+    gpu_graph_dropdown_menu(app, &arrow_resp, &engines);
+    gpu_graph_context_menu(app, &arrow_resp, &engines);
     gpu_graph_context_menu(app, &chart, &engines);
     gpu_graph_context_menu(app, &cap_resp, &engines);
+    time_window_context_menu(app, &dedicated_chart);
     ui.add_space(16.0);
 }

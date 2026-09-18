@@ -10,7 +10,10 @@
 //!   the dominant engine is preserved for the "GPU engine" column.
 
 use tm_core::model::{AdapterLuid, GpuEngine, GpuInfo};
-use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory1, IDXGIFactory1};
+use windows::Win32::Graphics::Dxgi::{
+    CreateDXGIFactory1, DXGI_ADAPTER_FLAG_SOFTWARE, IDXGIDevice, IDXGIFactory1,
+};
+use windows::core::Interface;
 
 /// Static adapter info (name, VRAM, LUID).
 #[derive(Debug, Clone)]
@@ -19,6 +22,7 @@ pub struct AdapterInfo {
     pub dedicated_vram: u64,
     pub luid: AdapterLuid,
     pub driver_version: String,
+    pub is_software: bool,
 }
 
 pub fn adapters() -> Vec<AdapterInfo> {
@@ -31,20 +35,43 @@ pub fn adapters() -> Vec<AdapterInfo> {
         let mut idx = 0u32;
         while let Ok(adapter) = factory.EnumAdapters1(idx) {
             if let Ok(desc) = adapter.GetDesc1() {
+                let name = utf16_to_string(&desc.Description);
+                let is_software = (desc.Flags & (DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32) != 0)
+                    || (desc.VendorId == 0x1414 && desc.DeviceId == 0x8c)
+                    || name.contains("Microsoft Basic Render Driver")
+                    || name.contains("Microsoft Basic Display Adapter");
+                let driver_version =
+                    if let Ok(uversion) = adapter.CheckInterfaceSupport(&IDXGIDevice::IID) {
+                        let hi = (uversion >> 32) as u32;
+                        let lo = (uversion & 0xffff_ffff) as u32;
+                        format!("{}.{}.{}.{}", hi >> 16, hi & 0xffff, lo >> 16, lo & 0xffff)
+                    } else {
+                        String::new()
+                    };
                 out.push(AdapterInfo {
-                    name: utf16_to_string(&desc.Description),
+                    name,
                     dedicated_vram: desc.DedicatedVideoMemory as u64,
                     luid: AdapterLuid {
                         high: desc.AdapterLuid.HighPart,
                         low: desc.AdapterLuid.LowPart,
                     },
-                    driver_version: String::new(),
+                    driver_version,
+                    is_software,
                 });
             }
             idx += 1;
         }
     }
-    out
+    filter_adapters(out)
+}
+
+/// Discards software/fallback renderers (like Microsoft Basic Render Driver)
+/// whenever at least one physical/hardware GPU is present.
+pub fn filter_adapters(mut adapters: Vec<AdapterInfo>) -> Vec<AdapterInfo> {
+    if adapters.iter().any(|a| !a.is_software) {
+        adapters.retain(|a| !a.is_software);
+    }
+    adapters
 }
 
 fn utf16_to_string(buf: &[u16]) -> String {
@@ -230,12 +257,14 @@ mod tests {
                 dedicated_vram: 1024,
                 luid: luid(0x1111),
                 driver_version: String::new(),
+                is_software: false,
             },
             AdapterInfo {
                 name: "dGPU".into(),
                 dedicated_vram: 8192,
                 luid: luid(0x2222),
                 driver_version: String::new(),
+                is_software: false,
             },
         ];
         // Only the iGPU has engine load; dGPU must stay at zero even though a
@@ -257,6 +286,7 @@ mod tests {
             dedicated_vram: 4096,
             luid: luid(7),
             driver_version: String::new(),
+            is_software: false,
         }];
         let records = vec![
             eng(7, 1, "3D", 20.0),
@@ -300,5 +330,52 @@ mod tests {
         let p2 = procs.iter().find(|p| p.pid == 2).expect("pid 2 present");
         assert!((p2.util_pct - 95.0).abs() < f32::EPSILON);
         assert_eq!(p2.dominant_engine.as_deref(), Some("GPU 0 - Copy"));
+    }
+
+    #[test]
+    fn filter_adapters_drops_software_when_hardware_present() {
+        let mixed = vec![
+            AdapterInfo {
+                name: "NVIDIA GeForce RTX 5070".into(),
+                dedicated_vram: 12 * 1024 * 1024 * 1024,
+                luid: luid(1),
+                driver_version: "32.0.16.1692".into(),
+                is_software: false,
+            },
+            AdapterInfo {
+                name: "Microsoft Basic Render Driver".into(),
+                dedicated_vram: 0,
+                luid: luid(2),
+                driver_version: String::new(),
+                is_software: true,
+            },
+        ];
+        let filtered = filter_adapters(mixed);
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].name, "NVIDIA GeForce RTX 5070");
+
+        // When only software adapter is present (e.g. headless/VM), it is preserved.
+        let software_only = vec![AdapterInfo {
+            name: "Microsoft Basic Render Driver".into(),
+            dedicated_vram: 0,
+            luid: luid(2),
+            driver_version: String::new(),
+            is_software: true,
+        }];
+        let preserved = filter_adapters(software_only);
+        assert_eq!(preserved.len(), 1);
+        assert_eq!(preserved[0].name, "Microsoft Basic Render Driver");
+    }
+
+    #[test]
+    fn live_adapters_contains_only_hardware_gpu_when_present() {
+        let list = adapters();
+        if list.iter().any(|a| !a.is_software) {
+            assert!(
+                list.iter()
+                    .all(|a| !a.name.contains("Microsoft Basic Render Driver")),
+                "Microsoft Basic Render Driver should not be present when real GPU exists: {list:?}"
+            );
+        }
     }
 }
