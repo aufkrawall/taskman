@@ -283,7 +283,8 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
                     if menu::item(ui, label).clicked() {
                         let new_enabled = !item.enabled;
                         let id = item.id.clone();
-                        if toggle_item(app, &ctx, id, new_enabled) {
+                        let location = item.location.clone();
+                        if toggle_item(app, &ctx, id, location, new_enabled) {
                             item.enabled = new_enabled;
                         }
                         ui.close();
@@ -360,7 +361,18 @@ fn impact_rank(impact: StartupImpact) -> u8 {
 /// cached row back when the SCM write fails, so the table never shows a state
 /// the error toast calls a failure — the revert runs on the worker thread,
 /// where the UI-side cache lock is not held.
-fn toggle_item(app: &mut TaskManApp, ctx: &egui::Context, id: String, new_enabled: bool) -> bool {
+///
+/// `id` and `location` are captured at DISPATCH time. Both callers hold the
+/// startup cache lock for the whole frame, so a job that looked them up itself
+/// would block on that lock — and would silently substitute an empty location
+/// for a row a refresh had meanwhile replaced.
+fn toggle_item(
+    app: &mut TaskManApp,
+    ctx: &egui::Context,
+    id: String,
+    location: String,
+    new_enabled: bool,
+) -> bool {
     let actions = app.actions.clone();
     let cache = app.shared.startup_cache.clone();
     let ok_msg = move || {
@@ -371,11 +383,6 @@ fn toggle_item(app: &mut TaskManApp, ctx: &egui::Context, id: String, new_enable
         }
     };
     app.run_action(ctx, ok_msg, move || {
-        let location = tm_core::sync::lock(&cache)
-            .as_ref()
-            .and_then(|(items, _)| items.iter().find(|it| it.id == id))
-            .map(|it| it.location.clone())
-            .unwrap_or_default();
         let result = actions.set_startup_enabled(&id, &location, new_enabled);
         if result.is_err() {
             let mut guard = tm_core::sync::lock(&cache);
@@ -395,9 +402,11 @@ fn toggle_selected(app: &mut TaskManApp, enable: bool, ctx: &egui::Context) {
     if let Some((items, _)) = cache.as_mut()
         && let Some(id) = app.selected_startup_id.clone()
         && let Some(item) = items.iter_mut().find(|it| it.id == id)
-        && toggle_item(app, ctx, id, enable)
     {
-        item.enabled = enable;
+        let location = item.location.clone();
+        if toggle_item(app, ctx, id, location, enable) {
+            item.enabled = enable;
+        }
     }
 }
 
