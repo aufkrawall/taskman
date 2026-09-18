@@ -1496,6 +1496,13 @@ impl eframe::App for TaskManApp {
         // Reaching `ui` at all is the proof that this surface is on screen;
         // eframe skips it entirely for a hidden, minimized or occluded one.
         self.painted_last_frame = true;
+        if !self.surface_visible {
+            // `logic` runs BEFORE `ui`, so this frame's proof arrives too late
+            // for the pass that reads it: ask for one more frame rather than
+            // leaving a restored window on the hidden cadence until the next
+            // publication a whole `HIDDEN_INTERVAL` away.
+            ui.ctx().request_repaint();
+        }
         let ctx = ui.ctx().clone();
         crate::theme::ensure_visuals(&ctx);
         crate::fonts::poll_async_apply(&ctx);
