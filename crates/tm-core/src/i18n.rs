@@ -417,6 +417,7 @@ keys! {
     Apply => ["Übernehmen", "Apply"],
     Cancel => ["Abbrechen", "Cancel"],
     Close => ["Schließen", "Close"],
+    ClearAllToasts => ["Alle schließen", "Clear all"],
     Ok => ["OK", "OK"],
     Reset => ["Zurücksetzen", "Reset"],
     Browse => ["Durchsuchen…", "Browse…"],

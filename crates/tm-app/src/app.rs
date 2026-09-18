@@ -147,12 +147,23 @@ pub struct ProcessIdentity {
 
 static TOAST_SEQ: AtomicU64 = AtomicU64::new(1);
 
-/// A toast with a stable monotonic id.
+/// A toast with a stable monotonic id (an identity derived from elapsed time
+/// changes across frames and breaks egui's layout state).
 #[derive(Debug, Clone)]
 pub struct Toast {
     pub id: u64,
     pub msg: String,
+    pub born: std::time::Instant,
 }
+
+/// How long an unattended toast stays on screen. Long enough to read a result
+/// the user was not watching for, short enough that ignoring one does not
+/// leave the corner occupied for the rest of the session. The close button
+/// stays the way to dismiss one sooner.
+pub const TOAST_TTL: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// How long a toast fades before it expires, so it does not vanish mid-glance.
+pub const TOAST_FADE: std::time::Duration = std::time::Duration::from_millis(600);
 
 const MAX_TOASTS: usize = 6;
 
@@ -164,6 +175,7 @@ pub fn toast_from(queue: &ToastQueue, msg: impl Into<String>) {
     t.push(Toast {
         id: TOAST_SEQ.fetch_add(1, Ordering::Relaxed),
         msg: msg.into(),
+        born: std::time::Instant::now(),
     });
     if t.len() > MAX_TOASTS {
         t.remove(0);
@@ -1403,6 +1415,22 @@ impl eframe::App for TaskManApp {
             ctx.request_repaint_after(std::time::Duration::from_millis(1));
         } else if self.active_dump.is_some() {
             ctx.request_repaint_after(std::time::Duration::from_millis(50));
+        } else if let Some(next) = tm_core::sync::lock(&self.shared.toasts)
+            .iter()
+            .map(|t| TOAST_TTL.saturating_sub(t.born.elapsed()))
+            .min()
+        {
+            // A toast expires on its own, so the frame that removes it has to
+            // be asked for: nothing else guarantees a repaint while the app
+            // sits idle. Inside the fade the cadence is the fade's, not the
+            // remaining lifetime's.
+            let fade_start = next.saturating_sub(TOAST_FADE);
+            let wait = if fade_start.is_zero() {
+                std::time::Duration::from_millis(33)
+            } else {
+                fade_start
+            };
+            ctx.request_repaint_after(wait);
         }
     }
 

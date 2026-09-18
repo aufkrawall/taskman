@@ -1484,6 +1484,9 @@ pub fn draw_toasts_queue(toasts_queue: &crate::app::ToastQueue, ctx: &egui::Cont
     /// Gap between stacked toasts.
     const GAP: f32 = 8.0;
     let mut toasts = tm_core::sync::lock(toasts_queue);
+    // A toast the user never attended to expires on its own; the close button
+    // and "clear all" are for dismissing one sooner.
+    toasts.retain(|t| t.born.elapsed() < crate::app::TOAST_TTL);
     if toasts.is_empty() {
         return;
     }
@@ -1495,16 +1498,18 @@ pub fn draw_toasts_queue(toasts_queue: &crate::app::ToastQueue, ctx: &egui::Cont
     let mut y_offset = 0.0f32;
     let mut closed_toast = None;
     for toast in toasts.iter() {
+        let alpha = toast_alpha(toast.born.elapsed());
         let id = egui::Id::new(("toast", toast.id));
         let response = egui::Area::new(id)
             .anchor(Align2::RIGHT_BOTTOM, [-12.0, -12.0 - y_offset])
             .order(egui::Order::Foreground)
             .show(ctx, |ui| {
                 egui::Frame::window(ui.style())
-                    .fill(Color32::from_black_alpha(220))
-                    .stroke(Stroke::new(1.0, theme::LIGHT.stroke))
+                    .fill(Color32::from_black_alpha(scale_alpha(220, alpha)))
+                    .stroke(Stroke::new(1.0, theme::LIGHT.stroke.gamma_multiply(alpha)))
                     .inner_margin(egui::Margin::same(8))
                     .show(ui, |ui| {
+                        let text_color = Color32::from_white_alpha(scale_alpha(255, alpha));
                         let font = egui::FontId::proportional(13.0);
                         let close_btn_size = egui::vec2(18.0, 18.0);
                         let spacing = 8.0;
@@ -1512,7 +1517,7 @@ pub fn draw_toasts_queue(toasts_queue: &crate::app::ToastQueue, ctx: &egui::Cont
                         let galley = ui.painter().layout(
                             toast.msg.clone(),
                             font,
-                            Color32::WHITE,
+                            text_color,
                             max_text_width,
                         );
                         let content_w = galley.size().x + spacing + close_btn_size.x;
@@ -1521,7 +1526,7 @@ pub fn draw_toasts_queue(toasts_queue: &crate::app::ToastQueue, ctx: &egui::Cont
                             ui.spacing_mut().item_spacing.x = spacing;
                             let (text_rect, _) =
                                 ui.allocate_exact_size(galley.size(), Sense::hover());
-                            ui.painter().galley(text_rect.min, galley, Color32::WHITE);
+                            ui.painter().galley(text_rect.min, galley, text_color);
 
                             let (btn_rect, btn_resp) =
                                 ui.allocate_exact_size(close_btn_size, Sense::click());
@@ -1530,13 +1535,13 @@ pub fn draw_toasts_queue(toasts_queue: &crate::app::ToastQueue, ctx: &egui::Cont
                                 ui.painter().rect_filled(
                                     btn_rect,
                                     3.0,
-                                    Color32::from_white_alpha(40),
+                                    Color32::from_white_alpha(scale_alpha(40, alpha)),
                                 );
                             }
                             let icon_color = if btn_resp.hovered() {
-                                Color32::WHITE
+                                text_color
                             } else {
-                                Color32::from_gray(180)
+                                Color32::from_gray(180).gamma_multiply(alpha)
                             };
                             crate::icons::draw(ui, Icon::Close, btn_rect, icon_color);
                             if btn_resp.clicked() {
@@ -1547,10 +1552,58 @@ pub fn draw_toasts_queue(toasts_queue: &crate::app::ToastQueue, ctx: &egui::Cont
             });
         y_offset += response.response.rect.height() + GAP;
     }
-    if let Some(id) = closed_toast {
+
+    // Dismissing a stack one toast at a time is busywork, so the stack itself
+    // carries the bulk action - above the newest toast, where it cannot be hit
+    // while aiming for a close button.
+    if toasts.len() > 1 && clear_all_button(ctx, y_offset) {
+        toasts.clear();
+        ctx.request_repaint();
+    } else if let Some(id) = closed_toast {
         toasts.retain(|t| t.id != id);
         ctx.request_repaint();
     }
+}
+
+/// Opacity of a toast at `age`: fully opaque until [`crate::app::TOAST_FADE`]
+/// is left of its lifetime, then down to zero as it expires.
+fn toast_alpha(age: std::time::Duration) -> f32 {
+    let left = crate::app::TOAST_TTL.saturating_sub(age);
+    if left >= crate::app::TOAST_FADE {
+        return 1.0;
+    }
+    (left.as_secs_f32() / crate::app::TOAST_FADE.as_secs_f32()).clamp(0.0, 1.0)
+}
+
+fn scale_alpha(base: u8, alpha: f32) -> u8 {
+    (f32::from(base) * alpha).round().clamp(0.0, 255.0) as u8
+}
+
+/// The "clear all" affordance above the toast stack. True on the frame it is
+/// clicked.
+fn clear_all_button(ctx: &egui::Context, y_offset: f32) -> bool {
+    egui::Area::new(egui::Id::new("toast-clear-all"))
+        .anchor(Align2::RIGHT_BOTTOM, [-12.0, -12.0 - y_offset])
+        .order(egui::Order::Foreground)
+        .show(ctx, |ui| {
+            egui::Frame::window(ui.style())
+                .fill(Color32::from_black_alpha(220))
+                .stroke(Stroke::new(1.0, theme::LIGHT.stroke))
+                .inner_margin(egui::Margin::symmetric(8, 4))
+                .show(ui, |ui| {
+                    ui.add(
+                        egui::Button::new(
+                            egui::RichText::new(i18n::tr(K::ClearAllToasts))
+                                .size(12.0)
+                                .color(Color32::WHITE),
+                        )
+                        .frame(false),
+                    )
+                    .clicked()
+                })
+                .inner
+        })
+        .inner
 }
 
 // ---------------------------------------------------------------- dialogs
@@ -1709,6 +1762,7 @@ pub(crate) fn update_end_task_dialog_focus(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{Duration, Instant};
 
     #[test]
     fn run_task_dialog_focus_cycles_forward_and_backward() {
@@ -1888,44 +1942,105 @@ mod tests {
         );
     }
 
+    /// A toast is fully opaque for almost all of its life and fades only over
+    /// the last stretch, so it never vanishes mid-glance.
     #[test]
-    fn toasts_persist_without_auto_close_and_dismiss_via_x_button() {
+    fn toast_alpha_is_opaque_until_the_fade_and_reaches_zero_at_expiry() {
+        use crate::app::{TOAST_FADE, TOAST_TTL};
+        assert_eq!(toast_alpha(Duration::ZERO), 1.0);
+        assert_eq!(toast_alpha(TOAST_TTL - TOAST_FADE), 1.0);
+        let half = toast_alpha(TOAST_TTL - TOAST_FADE / 2);
+        assert!((half - 0.5).abs() < 0.01, "mid-fade alpha: {half}");
+        assert_eq!(toast_alpha(TOAST_TTL), 0.0);
+        // Past expiry the toast is already gone; alpha must not go negative.
+        assert_eq!(toast_alpha(TOAST_TTL * 2), 0.0);
+    }
+
+    /// The bulk action appears only once there is a stack to clear, and one
+    /// click empties it.
+    #[test]
+    fn clear_all_appears_for_a_stack_and_empties_it() {
+        use std::sync::Mutex;
+        let clear_all_id = egui::Id::new("toast-clear-all");
+        let ctx = egui::Context::default();
+        let screen_rect = Rect::from_min_size(Pos2::ZERO, egui::vec2(800.0, 600.0));
+        let frame = |ctx: &egui::Context, toasts: &crate::app::ToastQueue, events| {
+            let mut out = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(screen_rect),
+                    events,
+                    ..Default::default()
+                },
+                |_| draw_toasts_queue(toasts, ctx),
+            );
+            out.textures_delta.clear();
+        };
+
+        // A single toast has nothing to bulk-dismiss.
+        let toasts: crate::app::ToastQueue = Mutex::new(Vec::new());
+        crate::app::toast_from(&toasts, "Only one");
+        frame(&ctx, &toasts, Vec::new());
+        assert!(
+            ctx.memory(|m| m.area_rect(clear_all_id)).is_none(),
+            "a lone toast must not carry a clear-all button"
+        );
+
+        // A second one brings the button out, above the whole stack. The first
+        // frame of a new Area lays it out before the anchor applies, so its
+        // resting place is only readable from the frame after.
+        crate::app::toast_from(&toasts, "And another");
+        frame(&ctx, &toasts, Vec::new());
+        frame(&ctx, &toasts, Vec::new());
+        let rect = ctx
+            .memory(|m| m.area_rect(clear_all_id))
+            .expect("clear-all must be laid out for a stack");
+
+        let click = |pos: Pos2, pressed| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::default(),
+        };
+        let at = rect.center();
+        // The pointer has to arrive before it presses: egui resolves a click
+        // against the widget under `interact_pos`, and a press alone from the
+        // headless default position lands nowhere.
+        frame(&ctx, &toasts, vec![egui::Event::PointerMoved(at)]);
+        frame(&ctx, &toasts, vec![click(at, true), click(at, false)]);
+        assert!(
+            tm_core::sync::lock(&toasts).is_empty(),
+            "clear all must empty the stack"
+        );
+    }
+
+    /// An unattended toast expires on its own, and a fresh one is untouched by
+    /// the same pass.
+    #[test]
+    fn toasts_expire_after_the_ttl_and_the_young_ones_survive() {
         use std::sync::Mutex;
         let toasts: crate::app::ToastQueue = Mutex::new(Vec::new());
-        crate::app::toast_from(&toasts, "First action succeeded");
-        crate::app::toast_from(&toasts, "Second action succeeded");
+        crate::app::toast_from(&toasts, "Stale action");
+        crate::app::toast_from(&toasts, "Fresh action");
+        // `born` is the only thing that ages a toast; reaching past the TTL is
+        // what the clock would do, without making the test wait for it.
+        tm_core::sync::lock(&toasts)[0].born = Instant::now()
+            .checked_sub(crate::app::TOAST_TTL + Duration::from_secs(1))
+            .expect("instant far enough from the epoch");
 
         let ctx = egui::Context::default();
         let screen_rect = Rect::from_min_size(Pos2::ZERO, egui::vec2(800.0, 600.0));
-
-        // Frame 1: Initial render, no input. Both toasts must exist.
-        let raw1 = egui::RawInput {
-            screen_rect: Some(screen_rect),
-            time: Some(0.0),
-            ..Default::default()
-        };
-        let mut out1 = ctx.run_ui(raw1, |_| {
-            draw_toasts_queue(&toasts, &ctx);
-        });
-        out1.textures_delta.clear();
-        assert_eq!(tm_core::sync::lock(&toasts).len(), 2);
-
-        // Frame 2: Simulate 10 seconds later (previously TOAST_TTL was 4s).
-        // Without user action, toasts must NOT close automatically.
-        let raw2 = egui::RawInput {
-            screen_rect: Some(screen_rect),
-            time: Some(10.0),
-            ..Default::default()
-        };
-        let mut out2 = ctx.run_ui(raw2, |_| {
-            draw_toasts_queue(&toasts, &ctx);
-        });
-        out2.textures_delta.clear();
-        assert_eq!(
-            tm_core::sync::lock(&toasts).len(),
-            2,
-            "toasts must not close automatically over time"
+        let mut out = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(screen_rect),
+                ..Default::default()
+            },
+            |_| draw_toasts_queue(&toasts, &ctx),
         );
+        out.textures_delta.clear();
+
+        let left = tm_core::sync::lock(&toasts);
+        assert_eq!(left.len(), 1, "the expired toast must be gone");
+        assert_eq!(left[0].msg, "Fresh action");
     }
 
     #[test]
