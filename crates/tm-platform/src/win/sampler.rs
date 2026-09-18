@@ -98,6 +98,21 @@ struct PidAttrs {
     power_refreshed_at: Instant,
 }
 
+/// Shortest interval between two releases of sysinfo's process handles. One
+/// release costs a full re-enumeration on the next tick; a machine that keeps
+/// producing zombies must not pay that on every tick.
+const SYS_RESET_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Whether this tick should drop sysinfo's process handles.
+///
+/// Both guards matter. `new_zombie` is false while the SAME zombie is
+/// enumerated tick after tick (something other than us pins it), and the
+/// cooldown bounds the cost when zombies keep appearing — releasing on every
+/// tick is what froze the sampler before.
+fn should_release_handles(new_zombie: bool, last_reset: Option<Instant>) -> bool {
+    new_zombie && last_reset.is_none_or(|at| at.elapsed() >= SYS_RESET_COOLDOWN)
+}
+
 /// Everything that carries state between ticks.
 pub struct Sampler {
     sys: System,
@@ -137,6 +152,12 @@ pub struct Sampler {
     /// too short to measure carries these forward for one tick instead of
     /// blanking the whole column; see [`Sampler::apply_process_disk`].
     last_proc_disk: HashMap<u32, ProcDiskSample>,
+    /// Pids evicted as zombies and still enumerated by Toolhelp. Tracked so a
+    /// zombie that persists tick after tick is recognised as one we already
+    /// answered for, instead of re-triggering the handle release below.
+    zombie_pids: HashSet<u32>,
+    /// When sysinfo's handles were last released (see [`SYS_RESET_COOLDOWN`]).
+    last_sys_reset: Option<Instant>,
     /// Image paths for the processes no handle can be opened for. Cached
     /// because the answer cannot change while a process lives.
     image_paths: image_path::ImagePaths,
@@ -264,6 +285,8 @@ impl Sampler {
             image_paths: image_path::ImagePaths::default(),
             prev_proc_net: HashMap::new(),
             last_proc_disk: HashMap::new(),
+            zombie_pids: HashSet::new(),
+            last_sys_reset: None,
         }
     }
 
@@ -834,6 +857,8 @@ impl Sampler {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs() as i64)
             .unwrap_or(0);
+        let mut evicted_now: HashSet<u32> = HashSet::new();
+        let mut new_zombie = false;
         for (pid, p) in self.sys.processes() {
             let pid_u = pid.as_u32();
             // Single owned copy of the name per process (reused everywhere).
@@ -914,6 +939,12 @@ impl Sampler {
                 self.image_paths.remove(pid_u);
                 self.prev_proc_net.remove(&pid_u);
                 self.last_proc_disk.remove(&pid_u);
+                // First sighting of THIS zombie: a handle release is worth one
+                // re-enumeration (see below). A zombie already known keeps
+                // costing nothing — one that some OTHER process pins is
+                // enumerated forever and must not retrigger the release.
+                new_zombie |= !self.zombie_pids.contains(&pid_u);
+                evicted_now.insert(pid_u);
                 continue;
             }
 
@@ -986,6 +1017,23 @@ impl Sampler {
             entry.exe_path = exe_owned;
             entry.threads = threads;
             processes.push(entry);
+        }
+
+        // Exactly the pids evicted THIS tick: a zombie Toolhelp stopped
+        // enumerating is forgotten, so a recycled pid is judged on its own
+        // evidence and the set stays bounded by the process list.
+        self.zombie_pids = evicted_now;
+
+        // sysinfo keeps open handles (PROCESS_VM_READ among them) per
+        // enumerated process. On Windows NT the kernel cannot finish
+        // address-space and driver rundown while such a handle is open, so OUR
+        // handle is part of what keeps a crashed process's EPROCESS alive —
+        // omitting the row from the snapshot hides the symptom but leaves the
+        // object pinned. Recreating `System` drops every handle sysinfo holds;
+        // `should_release_handles` is what keeps that off the per-tick path.
+        if should_release_handles(new_zombie, self.last_sys_reset) {
+            self.sys = System::new();
+            self.last_sys_reset = Some(Instant::now());
         }
 
         // ---- slow-changing native attributes (cached, TTL-based) --------------
@@ -2026,6 +2074,26 @@ mod tests {
         assert_eq!(category(500), ProcCategory::Background);
         assert_eq!(category(600), ProcCategory::Background);
         assert_eq!(category(700), ProcCategory::System);
+    }
+
+    #[test]
+    fn handle_release_needs_a_new_zombie_and_respects_the_cooldown() {
+        // Nothing evicted: never.
+        assert!(!should_release_handles(false, None));
+        assert!(!should_release_handles(
+            false,
+            Some(Instant::now() - SYS_RESET_COOLDOWN * 2)
+        ));
+        // First zombie of the session releases immediately.
+        assert!(should_release_handles(true, None));
+        // A zombie sighted again inside the cooldown does not: this is the
+        // per-tick release that previously froze the sampler.
+        assert!(!should_release_handles(true, Some(Instant::now())));
+        // Once the cooldown has passed, a NEW zombie may release again.
+        assert!(should_release_handles(
+            true,
+            Some(Instant::now() - SYS_RESET_COOLDOWN - std::time::Duration::from_secs(1))
+        ));
     }
 
     #[test]
