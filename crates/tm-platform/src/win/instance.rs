@@ -117,6 +117,20 @@ static LISTENER_STOP: AtomicBool = AtomicBool::new(false);
 /// the objects does not answer, so [`acquire`] does not wait a second time.
 static PROBE_UNRESPONSIVE: AtomicBool = AtomicBool::new(false);
 
+/// Command line flag forwarded during auto-elevation so the elevated child
+/// does not repeat a 5-second probe against a known unresponsive instance.
+pub const UNRESPONSIVE_ARG: &str = "--instance-unresponsive";
+
+/// Mark that a previous probe against this session's instance timed out.
+pub fn mark_unresponsive() {
+    PROBE_UNRESPONSIVE.store(true, Ordering::Release);
+}
+
+/// Whether a probe has already determined the session's instance does not answer.
+pub fn is_unresponsive_marked() -> bool {
+    PROBE_UNRESPONSIVE.load(Ordering::Acquire)
+}
+
 /// Published position of the primary instance. Written by the primary,
 /// read by every later launch; the magic word is stored last so a reader
 /// either sees a complete record or none.
@@ -381,18 +395,43 @@ fn handshake(names: &Names, show: HANDLE, ack: HANDLE) -> Activation {
     if wait(ack, FIRST_ACK_MS) {
         return Activation::Activated;
     }
-    // Nothing yet. A window that is provably stuck loses its request now; a
-    // merely slow instance — the normal state of the machine one reaches for
-    // a task manager on — keeps it for the extended deadline.
-    if let Some(hwnd) = read_primary_info(names).and_then(|info| info.hwnd)
-        && window_responds(hwnd) == Some(false)
+    // Nothing yet. If the process died during the wait, do not keep waiting.
+    let info = read_primary_info(names);
+    if let Some(info) = info
+        && !process_alive(info.pid)
     {
-        tracing::warn!("the running instance does not pump messages; starting a new one");
+        tracing::warn!(
+            "the running instance exited while waiting for acknowledgment; starting a new one"
+        );
         return Activation::Unresponsive;
+    }
+    // A window that is provably stuck loses its request now; a window that is
+    // provably responsive pumps messages, so bring it to the foreground and
+    // treat the request as handled rather than creating a duplicate instance.
+    if let Some(hwnd) = info.and_then(|info| info.hwnd) {
+        match window_responds(hwnd) {
+            Some(false) => {
+                tracing::warn!("the running instance does not pump messages; starting a new one");
+                return Activation::Unresponsive;
+            }
+            Some(true) => {
+                super::window_chrome::force_foreground(hwnd);
+                return Activation::Activated;
+            }
+            None => {
+                // UIPI blocked SendMessage across integrity levels, or window handle is pending.
+            }
+        }
     }
     if wait(ack, EXTENDED_ACK_MS) {
         Activation::Activated
     } else {
+        if let Some(info) = read_primary_info(names)
+            && !process_alive(info.pid)
+        {
+            tracing::warn!("the running instance exited; starting a new one");
+            return Activation::Unresponsive;
+        }
         tracing::warn!("the running instance never acknowledged; starting a new one");
         Activation::Unresponsive
     }
@@ -775,5 +814,14 @@ mod tests {
         assert_eq!(published_window(), 0x4321);
         publish_window(0);
         assert_eq!(published_window(), 0);
+    }
+
+    #[test]
+    fn unresponsive_marking() {
+        PROBE_UNRESPONSIVE.store(false, Ordering::Release);
+        assert!(!is_unresponsive_marked());
+        mark_unresponsive();
+        assert!(is_unresponsive_marked());
+        PROBE_UNRESPONSIVE.store(false, Ordering::Release);
     }
 }

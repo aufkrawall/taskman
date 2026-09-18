@@ -201,6 +201,32 @@ fn main() {
         std::process::exit(code);
     }
 
+    #[cfg(target_os = "windows")]
+    if args
+        .iter()
+        .any(|argument| argument == tm_platform::win::instance::UNRESPONSIVE_ARG)
+    {
+        tm_platform::win::instance::mark_unresponsive();
+    }
+
+    // Fast path: if this session already runs an instance, hand off to it
+    // immediately. This runs BEFORE redirect_to_installed_gui, settings
+    // loading, or renderer setup to avoid file hashing, SCM queries, and
+    // redundant process spawning for a window that is already open.
+    #[cfg(target_os = "windows")]
+    let elevation_handoff = args
+        .iter()
+        .any(|argument| argument == "--single-instance-handoff");
+    #[cfg(target_os = "windows")]
+    if !elevation_handoff
+        && !tm_platform::win::instance::is_unresponsive_marked()
+        && tm_platform::win::instance::activate_existing()
+            == tm_platform::win::instance::Activation::Activated
+    {
+        tracing::info!("handed this launch to the running instance");
+        return;
+    }
+
     // A service install pins the trusted GUI under Program Files. Future
     // portable/package launches hand off to that copy before creating a
     // renderer or window, preserving the broker's strict image-path policy.
@@ -230,6 +256,7 @@ fn run_gui(mock: bool, args: &[String]) {
         .any(|argument| argument == "--single-instance-handoff");
     #[cfg(target_os = "windows")]
     if !elevation_handoff
+        && !tm_platform::win::instance::is_unresponsive_marked()
         && tm_platform::win::instance::activate_existing()
             == tm_platform::win::instance::Activation::Activated
     {
@@ -260,7 +287,11 @@ fn run_gui(mock: bool, args: &[String]) {
         && std::env::var_os("TASKMAN_CONFIG_DIR").is_none()
         && !tm_platform::win::is_elevated()
     {
-        match tm_platform::win::relaunch_elevated_with_args(args) {
+        let mut forwarded_args = args.to_vec();
+        if tm_platform::win::instance::is_unresponsive_marked() {
+            forwarded_args.push(tm_platform::win::instance::UNRESPONSIVE_ARG.to_string());
+        }
+        match tm_platform::win::relaunch_elevated_with_args(&forwarded_args) {
             Ok(()) => {
                 tracing::info!("start_elevated: re-execing elevated");
                 std::process::exit(0);
