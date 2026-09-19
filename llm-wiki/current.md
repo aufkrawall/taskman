@@ -668,8 +668,9 @@ rebase runbook.
   native Task Manager while Background/Windows keep process counts. Raw PPID
   remains untouched.
 - Telemetry: TelemetryDemand gating (GPU/PDH groups warm on demand),
-  LUID-aware multi-GPU merge (busiest-engine semantics, dominant engine
-  label per process), real token elevation/UAC virtualization/EcoQoS state,
+  LUID-aware multi-GPU merge (busiest-engine semantics, adapter dedicated/shared
+  memory from `\GPU Adapter Memory(*)` rather than process instance sums, dominant
+  engine label per process), real token elevation/UAC virtualization/EcoQoS state,
   time-based graph windows whose x axis spans the CONFIGURED window
   (`chart::TimeAxis`) rather than the extent of the samples on hand, CPU
   Overall/Logical modes with kernel-times overlay.

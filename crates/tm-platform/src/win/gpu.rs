@@ -8,6 +8,12 @@
 //!   on that adapter (max), not a naive sum which would exceed 100 % and
 //!   misattribute multi-engine load. Per-process values use the same rule;
 //!   the dominant engine is preserved for the "GPU engine" column.
+//! * Adapter dedicated and shared memory follow Task Manager semantics: read
+//!   directly from `\GPU Adapter Memory(*)` per LUID, NEVER summed across
+//!   per-process `\GPU Process Memory(*)` instances. Summing per-process
+//!   memory severely overstates actual VRAM usage because Desktop Window
+//!   Manager (DWM) and applications share surfaces and duplicate committed
+//!   allocations.
 
 use tm_core::model::{AdapterLuid, GpuEngine, GpuInfo};
 use windows::Win32::Graphics::Dxgi::{
@@ -131,7 +137,7 @@ fn adapter_engines<'a>(
 pub fn merge(
     adapters: Vec<AdapterInfo>,
     engine_records: &[crate::win::perfcounters::GpuEngineRecord],
-    mem_records: &[crate::win::perfcounters::GpuMemRecord],
+    adapter_mem_records: &[crate::win::perfcounters::GpuAdapterMemRecord],
 ) -> Vec<GpuInfo> {
     adapters
         .into_iter()
@@ -143,16 +149,9 @@ pub fn merge(
                 .iter()
                 .map(|r| r.utilization_pct)
                 .fold(0.0f32, f32::max);
-            let ded_used: u64 = mem_records
-                .iter()
-                .filter(|m| m.luid == Some(a.luid))
-                .map(|m| m.dedicated_bytes)
-                .sum();
-            let shared_used: u64 = mem_records
-                .iter()
-                .filter(|m| m.luid == Some(a.luid))
-                .map(|m| m.shared_bytes)
-                .sum();
+            let mem = adapter_mem_records.iter().find(|m| m.luid == a.luid);
+            let ded_used = mem.map_or(0, |m| m.dedicated_bytes);
+            let shared_used = mem.map_or(0, |m| m.shared_bytes);
             GpuInfo {
                 id,
                 name: if a.name.is_empty() {
@@ -236,7 +235,7 @@ pub fn process_gpu_view(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::win::perfcounters::{GpuEngineRecord, GpuMemRecord};
+    use crate::win::perfcounters::{GpuAdapterMemRecord, GpuEngineRecord, GpuMemRecord};
 
     fn luid(low: u32) -> AdapterLuid {
         AdapterLuid { high: 0, low }
@@ -311,7 +310,19 @@ mod tests {
                 shared_bytes: 0,
             },
         ];
-        let merged = merge(adapters, &records, &mems);
+        let adapter_mems = vec![
+            GpuAdapterMemRecord {
+                luid: luid(7),
+                dedicated_bytes: 10,
+                shared_bytes: 4,
+            },
+            GpuAdapterMemRecord {
+                luid: luid(9),
+                dedicated_bytes: 999,
+                shared_bytes: 0,
+            },
+        ];
+        let merged = merge(adapters, &records, &adapter_mems);
         assert_eq!(merged.len(), 1);
         let g = &merged[0];
         assert!((g.util_pct - 95.0).abs() < f32::EPSILON, "busiest engine");
@@ -334,6 +345,28 @@ mod tests {
         let p2 = procs.iter().find(|p| p.pid == 2).expect("pid 2 present");
         assert!((p2.util_pct - 95.0).abs() < f32::EPSILON);
         assert_eq!(p2.dominant_engine.as_deref(), Some("GPU 0 - Copy"));
+    }
+
+    #[test]
+    fn adapter_memory_comes_from_adapter_records_not_process_sum() {
+        let adapters = vec![AdapterInfo {
+            name: "NVIDIA GeForce RTX 5070".into(),
+            dedicated_vram: 12 * 1024 * 1024 * 1024,
+            luid: luid(42),
+            driver_version: "32.0.16.1692".into(),
+            is_software: false,
+        }];
+        // Real adapter usage: 1.5 GB dedicated, 150 MB shared.
+        let adapter_mems = vec![GpuAdapterMemRecord {
+            luid: luid(42),
+            dedicated_bytes: 1_500_000_000,
+            shared_bytes: 150_000_000,
+        }];
+        let merged = merge(adapters, &[], &adapter_mems);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].dedicated_used_bytes, 1_500_000_000);
+        assert_eq!(merged[0].mem_used_bytes, 1_500_000_000);
+        assert_eq!(merged[0].shared_used_bytes, 150_000_000);
     }
 
     #[test]

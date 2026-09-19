@@ -844,10 +844,18 @@ impl Sampler {
             let guard = self.pdh.get_mut().unwrap_or_else(|e| e.into_inner());
             guard.tick(demand);
         }
-        let (gpu_engine_records, gpu_mem_records, disk_perf, cpu_perf_pct, cpu_pdh_failed) = {
+        let (
+            gpu_engine_records,
+            gpu_adapter_mem_records,
+            gpu_mem_records,
+            disk_perf,
+            cpu_perf_pct,
+            cpu_pdh_failed,
+        ) = {
             let guard = self.pdh.get_mut().unwrap_or_else(|e| e.into_inner());
             (
                 guard.read_gpu_engines().unwrap_or_default(),
+                guard.read_gpu_adapter_memory().unwrap_or_default(),
                 guard.read_gpu_memory().unwrap_or_default(),
                 guard.read_disks(),
                 guard.read_cpu_perf_pct(),
@@ -1316,13 +1324,16 @@ impl Sampler {
         // Static adapter info is probed once; it does not change at runtime.
         // DXGI enumeration is skipped entirely until GPU telemetry is first
         // demanded so a default Processes page cannot wake a dormant dGPU.
-        if (!gpu_engine_records.is_empty() || !gpu_mem_records.is_empty() || self.demand.any_gpu())
+        if (!gpu_engine_records.is_empty()
+            || !gpu_adapter_mem_records.is_empty()
+            || !gpu_mem_records.is_empty()
+            || self.demand.any_gpu())
             && self.gpu_adapters.is_none()
         {
             self.gpu_adapters = Some(gpu::adapters());
         }
         let gpus = match self.gpu_adapters.clone() {
-            Some(adapters) => gpu::merge(adapters, &gpu_engine_records, &gpu_mem_records),
+            Some(adapters) => gpu::merge(adapters, &gpu_engine_records, &gpu_adapter_mem_records),
             None => Vec::new(),
         };
 

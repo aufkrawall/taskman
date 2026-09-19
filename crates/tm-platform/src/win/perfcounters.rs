@@ -106,7 +106,15 @@ pub struct GpuEngineRecord {
     pub utilization_pct: f32,
 }
 
-/// Memory usage of one process on one adapter.
+/// Memory usage of one adapter (from `\GPU Adapter Memory(*)`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GpuAdapterMemRecord {
+    pub luid: RawLuid,
+    pub dedicated_bytes: u64,
+    pub shared_bytes: u64,
+}
+
+/// Memory usage of one process on one adapter (from `\GPU Process Memory(*)`).
 #[derive(Debug, Clone, Copy, Default)]
 pub struct GpuMemRecord {
     pub luid: Option<RawLuid>,
@@ -294,8 +302,10 @@ impl QueryGroup {
 unsafe impl Send for QueryGroup {}
 
 const GPU_ENGINE_PATH: &str = "\\GPU Engine(*)\\Utilization Percentage";
-const GPU_MEM_DEDICATED: &str = "\\GPU Process Memory(*)\\Dedicated Usage";
-const GPU_MEM_SHARED: &str = "\\GPU Process Memory(*)\\Shared Usage";
+const GPU_ADAPTER_MEM_DEDICATED: &str = "\\GPU Adapter Memory(*)\\Dedicated Usage";
+const GPU_ADAPTER_MEM_SHARED: &str = "\\GPU Adapter Memory(*)\\Shared Usage";
+const GPU_PROCESS_MEM_DEDICATED: &str = "\\GPU Process Memory(*)\\Dedicated Usage";
+const GPU_PROCESS_MEM_SHARED: &str = "\\GPU Process Memory(*)\\Shared Usage";
 const DISK_IDLE: &str = "\\PhysicalDisk(*)\\% Idle Time";
 const DISK_READ: &str = "\\PhysicalDisk(*)\\Disk Read Bytes/sec";
 const DISK_WRITE: &str = "\\PhysicalDisk(*)\\Disk Write Bytes/sec";
@@ -352,7 +362,13 @@ impl PdhCounters {
         let want_gpu = demand.any_gpu() && !self.gpu_failed;
         if want_gpu && self.gpu.is_none() {
             let mut g = QueryGroup::new();
-            g.open(&[GPU_ENGINE_PATH, GPU_MEM_DEDICATED, GPU_MEM_SHARED]);
+            g.open(&[
+                GPU_ENGINE_PATH,
+                GPU_ADAPTER_MEM_DEDICATED,
+                GPU_ADAPTER_MEM_SHARED,
+                GPU_PROCESS_MEM_DEDICATED,
+                GPU_PROCESS_MEM_SHARED,
+            ]);
             if !g.is_open() {
                 // Query itself failed → don't retry forever this session.
                 self.gpu_failed = true;
@@ -457,6 +473,44 @@ impl PdhCounters {
         Some(out)
     }
 
+    /// Per-adapter GPU memory records (dedicated/shared per LUID from `\GPU Adapter Memory`).
+    pub fn read_gpu_adapter_memory(&mut self) -> Option<Vec<GpuAdapterMemRecord>> {
+        let g = self.gpu.as_mut()?;
+        if !g.is_open() || !g.warm {
+            return None;
+        }
+        let mut ded: HashMap<RawLuid, u64> = HashMap::new();
+        let mut shared: HashMap<RawLuid, u64> = HashMap::new();
+        let mut luids: Vec<RawLuid> = Vec::new();
+
+        for (handle, path) in Self::counters_snapshot(g) {
+            match path {
+                GPU_ADAPTER_MEM_DEDICATED | GPU_ADAPTER_MEM_SHARED => {}
+                _ => continue,
+            }
+            let dedicated = path == GPU_ADAPTER_MEM_DEDICATED;
+            for (instance, v) in g.read_pairs(handle) {
+                let p = parse_gpu_instance(&instance);
+                let Some(luid) = p.luid else { continue };
+                let slot = if dedicated { &mut ded } else { &mut shared };
+                *slot.entry(luid).or_insert(0) += v.max(0.0) as u64;
+                if !luids.contains(&luid) {
+                    luids.push(luid);
+                }
+            }
+        }
+        let mut out: Vec<GpuAdapterMemRecord> = luids
+            .into_iter()
+            .map(|luid| GpuAdapterMemRecord {
+                luid,
+                dedicated_bytes: ded.get(&luid).copied().unwrap_or(0),
+                shared_bytes: shared.get(&luid).copied().unwrap_or(0),
+            })
+            .collect();
+        out.sort_by_key(|r| (r.luid.high, r.luid.low));
+        Some(out)
+    }
+
     /// Per-process GPU memory records (dedicated/shared per LUID+PID).
     pub fn read_gpu_memory(&mut self) -> Option<Vec<GpuMemRecord>> {
         let g = self.gpu.as_mut()?;
@@ -477,10 +531,10 @@ impl PdhCounters {
 
         for (handle, path) in Self::counters_snapshot(g) {
             match path {
-                GPU_MEM_DEDICATED | GPU_MEM_SHARED => {}
+                GPU_PROCESS_MEM_DEDICATED | GPU_PROCESS_MEM_SHARED => {}
                 _ => continue,
             }
-            let dedicated = path == GPU_MEM_DEDICATED;
+            let dedicated = path == GPU_PROCESS_MEM_DEDICATED;
             for (instance, v) in g.read_pairs(handle) {
                 let p = parse_gpu_instance(&instance);
                 let k = key(p.luid, p.pid);
@@ -863,6 +917,18 @@ mod tests {
         assert_eq!(p4.pid, Some(42));
         assert_eq!(p4.engine_type, None);
         assert_eq!(p4.phys_index, None);
+
+        // Adapter-level instance shape (from \GPU Adapter Memory(*)).
+        let p5 = parse_gpu_instance("luid_0x00000000_0x0000BE0F_phys_0");
+        assert_eq!(p5.pid, None);
+        assert_eq!(
+            p5.luid,
+            Some(RawLuid {
+                high: 0,
+                low: 0xBE0F
+            })
+        );
+        assert_eq!(p5.phys_index, Some(0));
     }
 
     // Live counter: needs two collections before a format succeeds, then
@@ -915,6 +981,29 @@ mod tests {
             "pid_99999999999999999999999",
         ] {
             let _ = parse_gpu_instance(probe);
+        }
+    }
+
+    #[test]
+    fn gpu_adapter_mem_counter_warms_and_reads_plausible_vram() {
+        let mut pdh = PdhCounters::new();
+        let demand = TelemetryDemand::core().union(TelemetryDemand::GPU_ADAPTER);
+        pdh.tick(demand);
+        assert!(pdh.read_gpu_adapter_memory().is_none(), "must be warming");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let mems = loop {
+            pdh.tick(demand);
+            if let Some(mems) = pdh.read_gpu_adapter_memory() {
+                break mems;
+            }
+            if std::time::Instant::now() >= deadline {
+                // In headless VM / CI without GPU counters, return cleanly
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        };
+        for m in mems {
+            assert!(m.dedicated_bytes < 1024 * 1024 * 1024 * 1024);
         }
     }
 }
