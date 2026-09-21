@@ -40,6 +40,83 @@ pub(crate) const TRACE_LEVEL_INFORMATION: u8 = 4;
 /// failure. `PROCESSTRACE_HANDLE` is a plain u64 in the Win32 headers.
 const INVALID_PROCESSTRACE_HANDLE: u64 = u64::MAX;
 
+/// Every session name this program can ever start.
+///
+/// Fixed and exhaustive by design (see the module docs): four names, two
+/// features times two hosting roles. Knowing them all is what lets a crashed
+/// run be cleaned up without a per-process registry.
+pub(crate) const SESSION_NAMES: [&str; 4] = [
+    "TaskMan-Net-Service",
+    "TaskMan-Net-App",
+    "TaskMan-Disk-Service",
+    "TaskMan-Disk-App",
+];
+
+/// Which of [`SESSION_NAMES`] THIS process started and has not stopped.
+///
+/// Lock-free and fixed-size on purpose: it is read from the panic hook, where
+/// taking a lock the panicking thread might already hold would hang the
+/// process instead of aborting it.
+static LIVE_SESSIONS: [std::sync::atomic::AtomicBool; SESSION_NAMES.len()] =
+    [const { std::sync::atomic::AtomicBool::new(false) }; SESSION_NAMES.len()];
+
+fn session_index(name: &[u16]) -> Option<usize> {
+    let name = String::from_utf16_lossy(name);
+    let name = name.trim_end_matches('\0');
+    SESSION_NAMES.iter().position(|known| *known == name)
+}
+
+fn mark_session(name: &[u16], live: bool) {
+    if let Some(index) = session_index(name) {
+        LIVE_SESSIONS[index].store(live, std::sync::atomic::Ordering::Release);
+    }
+}
+
+/// Stop every session this process still owns, by name.
+///
+/// An ETW session is a KERNEL object: it outlives the process that started it
+/// and keeps filling buffers for every disk and network operation on the
+/// machine until something stops it or the user reboots. `Drop` handles the
+/// ordinary exit, but release builds are `panic = "abort"` and a killed
+/// process runs no destructor either, so this is registered as the panic
+/// teardown the first time a session comes up.
+///
+/// Only sessions THIS process started are touched. A crashing GUI must not
+/// stop the service's sessions: that is a different, still-healthy process.
+///
+/// Panic-hook safe: no locks, no allocation past one stack buffer, no
+/// `unwrap`. A session that is already gone just reports an error nobody
+/// reads.
+pub(crate) fn stop_live_sessions() {
+    // `EVENT_TRACE_PROPERTIES` plus the longest name; see `properties_buffer`
+    // for why this is `u64`-aligned.
+    const WORDS: usize = 64;
+    for (index, name) in SESSION_NAMES.iter().enumerate() {
+        if !LIVE_SESSIONS[index].swap(false, std::sync::atomic::Ordering::AcqRel) {
+            continue;
+        }
+        let wide: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
+        let header = std::mem::size_of::<EVENT_TRACE_PROPERTIES>();
+        let total = header + wide.len() * 2;
+        if total > WORDS * std::mem::size_of::<u64>() {
+            continue;
+        }
+        let mut buffer = [0u64; WORDS];
+        let properties = buffer.as_mut_ptr().cast::<EVENT_TRACE_PROPERTIES>();
+        unsafe {
+            (*properties).Wnode.BufferSize = total as u32;
+            (*properties).Wnode.Flags = WNODE_FLAG_TRACED_GUID;
+            (*properties).LoggerNameOffset = header as u32;
+            let _ = ControlTraceW(
+                CONTROLTRACE_HANDLE::default(),
+                PCWSTR(wide.as_ptr()),
+                properties.cast(),
+                EVENT_TRACE_CONTROL_STOP,
+            );
+        }
+    }
+}
+
 /// Which component hosts a trace. Each role owns one fixed session name per
 /// feature so it can reclaim its own orphan without ever stopping the other's
 /// session.
@@ -171,6 +248,10 @@ impl<T: TraceContext> Session<T> {
             return None;
         }
 
+        // A session now exists that the process dying will NOT clean up.
+        tm_core::logging::set_panic_cleanup(stop_live_sessions);
+        mark_session(&name, true);
+
         Some(Self {
             shared,
             kind,
@@ -192,6 +273,7 @@ impl<T: TraceContext> Drop for Session<T> {
         // Order matters: stop the session so `ProcessTrace` returns, then
         // close the consumer and join before the context is reclaimed.
         self.shared.stop();
+        mark_session(&self.name, false);
         let mut properties = properties_buffer(&self.name, self.kind);
         stop_session(self.session, &self.name, &mut properties);
         let _ = unsafe { CloseTrace(self.trace) };

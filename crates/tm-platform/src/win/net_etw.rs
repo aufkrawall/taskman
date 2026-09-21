@@ -263,6 +263,21 @@ mod tests {
 
     /// The two roles must never share a session name, or one host stopping its
     /// orphan would kill the other's live trace.
+    /// The crash teardown stops sessions BY NAME from a fixed list, because a
+    /// process that aborted cannot tell it what it had open. A rename here
+    /// that does not reach that list leaves a kernel trace running on the
+    /// user's machine after every crash, until they reboot.
+    #[test]
+    fn every_session_name_is_known_to_the_crash_teardown() {
+        for role in [TraceRole::Service, TraceRole::App] {
+            let name = session_name(role);
+            assert!(
+                crate::win::etw::SESSION_NAMES.contains(&name),
+                "{name} is missing from etw::SESSION_NAMES"
+            );
+        }
+    }
+
     #[test]
     fn each_role_owns_a_distinct_fixed_session_name() {
         assert_ne!(
