@@ -1,6 +1,6 @@
 # Known and Accepted Debt
 
-Last verified: 2026-09-17
+Last verified: 2026-09-21
 
 Primary sources:
 - `AGENTS.md`
@@ -147,6 +147,41 @@ process identity + module base/path revalidation at action time. The unload repe
 FreeLibrary until the module leaves or the bounded budget is spent, and the
 honest `ModuleUnloadOutcome` (still mapped, with how many references were
 dropped) is what the user sees; permanently pinned or re-loaded modules stay.
+
+## System state this program can leave behind
+
+Found in the 2026-09-21 side-effect audit. Both are understood and accepted;
+neither is a defect to "fix" without weighing the same trade-off again.
+
+- **The IFEO registration outlives a deleted app.** With the Task Manager
+  replacement enabled, `HKLM\...\Image File Execution Options	askmgr.exe`
+  carries a `Debugger` value pointing at taskman. If every copy of the binary
+  is then deleted, Windows keeps launching that command for `taskmgr.exe` and
+  for Ctrl+Shift+Esc, `CreateProcess` fails, and the user is left with NO Task
+  Manager and no in-app way to recover — the app that owns the registration is
+  gone. What IS covered: a moved or renamed copy is detected
+  (`replacement_target_missing`) and repaired to the running exe on the next
+  start, a third party's registration is never overwritten or deleted, and
+  `validate_target` rejects registrations that could not launch. What is not,
+  and cannot be from inside the process: the user deleting the last copy while
+  it is registered. `--core-service=uninstall` deliberately does NOT clear the
+  value either — it removes the privileged broker, and the replacement keeps
+  working without one, so clearing it there would break a working setup for
+  someone who only wanted the service gone. Recovery is manual: delete that
+  `Debugger` value. A standalone signed uninstaller is the only place this
+  could be handled properly, and it does not exist (see the item below).
+- **sysinfo holds a `PROCESS_VM_READ` handle per enumerated process.** That is
+  the dependency's own enumeration, not a call this code makes — the hot
+  sampler path itself only ever asks for `PROCESS_QUERY_LIMITED_INFORMATION`,
+  and the intrusive rights (`PROCESS_CREATE_THREAD | VM_WRITE` for module
+  unload, `VM_READ | DUP_HANDLE` for minidumps) are reached only from an
+  explicitly confirmed user action. The consequences are real but bounded:
+  a long-lived VM_READ handle on a game process is the pattern kernel
+  anti-cheat looks at (a protected process simply refuses the open, which is
+  the common outcome), and the handle is part of what pins a crashed process's
+  `EPROCESS` — already mitigated by `should_release_handles`. Changing it
+  means patching or replacing sysinfo's Windows enumeration, which is a much
+  larger change than the residual risk justifies.
 
 ## Core-service production hardening still outstanding
 

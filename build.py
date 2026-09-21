@@ -437,6 +437,57 @@ def check_fork() -> bool:
     return run([shell, "-NoProfile", "-File", str(script)])
 
 
+def is_elevated() -> bool:
+    if platform.system() != "Windows":
+        return os.geteuid() == 0 if hasattr(os, "geteuid") else False
+    import ctypes
+
+    try:
+        return bool(ctypes.windll.shell32.IsUserAnAdmin())
+    except Exception:
+        return False
+
+
+def live_tests() -> bool:
+    """Run the `#[ignore]`d tests that need a live kernel and elevation.
+
+    These are the ONLY checks that prove the hand-written NT structure
+    offsets and ETW payload decoders against the thing they decode:
+    `SystemMemoryListInformation` behind the memory-composition bar, and the
+    network/disk ETW attribution behind the per-process rate columns. Every
+    other test in the workspace feeds them synthetic records, so a Windows
+    build that moves a field passes the whole gate and ships a column that is
+    quietly wrong.
+
+    They are excluded from `--check` on purpose: they need an elevated token
+    and real traffic, so they cannot run in CI or on a developer machine by
+    default. Run this before cutting a release, and after any Windows feature
+    update that touches the process, memory or storage stacks.
+    """
+    if platform.system() != "Windows":
+        log("live tests are Windows-only - skipping")
+        return True
+    if not is_elevated():
+        log("live tests need an ELEVATED shell (ETW sessions + protected process reads)")
+        log("re-run `python build.py --live-tests` from an administrator prompt")
+        return False
+    log("running live-kernel tests (needs real disk/network traffic to be meaningful)")
+    return run(
+        [
+            cargo(),
+            "test",
+            "-p",
+            "tm-platform",
+            "--all-features",
+            "--",
+            "--ignored",
+            "--nocapture",
+            "--test-threads",
+            "1",
+        ]
+    )
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--debug", action="store_true", help="build the dev profile instead of release")
@@ -463,11 +514,19 @@ def main() -> int:
         action="store_true",
         help="run dependency-advisory and secrets scanners first (cargo-audit, gitleaks)",
     )
+    ap.add_argument(
+        "--live-tests",
+        action="store_true",
+        help="run the #[ignore]d live-kernel/ETW tests (Windows, elevated) and exit",
+    )
     args = ap.parse_args()
 
     profile = "dev" if args.debug else "release"
     version = read_version()
     log(f"taskman v{version} - profile={profile}")
+
+    if args.live_tests:
+        return 0 if live_tests() else 1
 
     if args.audit and not audit_scan():
         log("audit failed")

@@ -1,6 +1,6 @@
 # Repo Map (code map)
 
-Last cross-checked: 2026-09-17
+Last cross-checked: 2026-09-21
 
 Primary sources:
 - workspace tree (verified against working tree)
@@ -29,8 +29,17 @@ platform boundary (`tm-core` ← `tm-platform` ← `tm-app` / `tm-service`):
     and I/O deltas folded across the boot window, Microsoft's documented
     Low/Medium/High thresholds, and the persisted store — see the module doc
     for why this is measured here rather than read from SRUM),
-    `logging.rs` (early ring sink → deferred file attach; elevated installer
-    helper remains memory/console-only), `classify.rs`
+    `logging.rs` (early ring sink → deferred file attach, wired from
+    `app.rs` on the frame that starts the engine; the appender's `WorkerGuard`
+    is owned by a process-lifetime static and returned to NOBODY —
+    `tracing_appender`'s non-blocking writer is lossy and drops every record
+    after the guard falls, which is how each shipped log file came to hold one
+    single line. `shutdown()` is the controlled flush; the panic hook writes a
+    crash record with a backtrace SYNCHRONOUSLY to `<log>.crash` because
+    release builds are `panic = "abort"` and the async worker is never
+    scheduled again, and it runs `set_panic_cleanup` first for resources that
+    outlive the process. Elevated installer helper remains
+    memory/console-only), `classify.rs`
     (conservative Apps/Background/System classification: kernel names + core
     OS images + `IsProcessCritical`; `is_core_os_image` is the shared
     core-image list used by the sampler's tree boundaries and the Processes
@@ -169,6 +178,24 @@ platform boundary (`tm-core` ← `tm-platform` ← `tm-app` / `tm-service`):
   the memory composition bar. The layout is pinned by an `#[ignore]` live
   kernel test (`memory_list_layout_decodes_plausible_page_counts`) — run it
   after any Windows build that changes the page lists.
+- `crates/tm-platform/src/win/sampler.rs` — `sample_inner` is the whole
+  snapshot for one tick. `is_zombie` is the eviction rule split out of it and
+  unit-tested: its `terminated` / `live_in_kernel_table` arguments are
+  CLOSURES, not `bool`s, because `is_process_terminated` opens a process
+  handle — evaluating them eagerly would put one `OpenProcess` per process per
+  tick on the hot path. `collect_gpus` / `collect_disks` / `collect_networks`
+  are the self-contained tail phases; `apply_process_gpu` folds the per-process
+  GPU view in. The process loop itself stays inline: every invariant it
+  carries is commented where it is enforced.
+- `crates/tm-platform/src/win/etw.rs` — `SESSION_NAMES` is exhaustive by
+  design and `stop_live_sessions` is registered as the panic teardown the
+  first time a session starts. An ETW session is a KERNEL object that outlives
+  its host: `Drop` covers the ordinary exit, but `panic = "abort"` and a kill
+  run no destructor, and an orphan keeps tracing every disk and network
+  operation on the machine until the next run reclaims it by name or the user
+  reboots. Only sessions THIS process started are stopped — a crashing GUI
+  must not stop the still-healthy service's. `net_etw`/`disk_etw` each pin
+  their names against that list.
 - `crates/tm-platform/src/win/cpu_load.rs` — also the source of per-process
   I/O operation counts and hard page faults (the same kernel table already
   carries `IO_COUNTERS` and `HardFaultCount`, so they cost no extra query), and

@@ -34,7 +34,8 @@ Primary sources:
    Linux → `.tar.gz`, named `taskman-v<version>-<platform>`.
 
 Flags: `--host-only`, `--linux-only`, `--all-targets`, `--debug`,
-`--no-package`, `--require-all-targets`, `--check`, `--audit`.
+`--no-package`, `--require-all-targets`, `--check`, `--audit`,
+`--live-tests`.
 
 `--all-targets` adds two cross-built artifacts:
 
@@ -128,6 +129,27 @@ git config --local lfs.allowincompletepush true
 
 Nested inside a release artifact build when run as
 `python build.py --host-only --check`.
+
+### Live-kernel tests (`--live-tests`)
+
+`python build.py --live-tests` runs the `#[ignore]`d tests in `tm-platform`
+and exits. Windows only, and it REFUSES to run unelevated rather than
+reporting a pass it did not earn.
+
+These are the only checks that prove the hand-written NT structure offsets and
+ETW payload decoders against the thing they decode — the
+`SystemMemoryListInformation` layout behind the memory-composition bar, and
+the `SystemIoProviderGuid` / `Kernel-Network` attribution behind the
+per-process rate columns. Everything else in the workspace feeds those
+decoders synthetic records, so a Windows build that moves a field passes
+`--check` and ships a column that is quietly wrong.
+
+Deliberately NOT part of `--check`: they need an elevated token, real disk and
+network traffic, and they spawn and kill processes, so they can run neither in
+CI nor on a developer machine by default. Run them before cutting a release
+and after any Windows feature update that touches the process, memory or
+storage stacks. See `known-debt.md` § Per-process disk active time for what is
+still unproven on live events.
 
 ### Dependency and secrets scanning (`--audit`)
 
