@@ -1275,6 +1275,10 @@ impl TaskManApp {
             self.startup_impact.merge(&totals);
         }
         self.startup_impact.save();
+        // Last: flush and stop the log appender. Everything above this line
+        // may still log, and the non-blocking writer drops records once the
+        // guard is gone.
+        tm_core::logging::shutdown();
     }
 }
 
@@ -1635,6 +1639,15 @@ impl eframe::App for TaskManApp {
         // this line in the process lifetime happens after the shell painted.
         if !self.engine_started {
             self.engine_started = true;
+            // Open the log file here, for the same reason the engine starts
+            // here: creating the directory and the rolling appender is disk
+            // I/O that must not sit on the path to the first frame. Until
+            // this call the records live in the bounded ring in
+            // `tm_core::logging`, and it replays them in order.
+            tm_core::logging::attach_file_logging(tm_core::logging::LogConfig {
+                console: false,
+                level: None,
+            });
             self.engine.start();
             tracing::info!("engine started after first frame");
         }

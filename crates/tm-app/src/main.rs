@@ -186,7 +186,12 @@ fn main() {
     }
 
     if selfcheck || verbose {
-        let _log_guard = tm_core::logging::init(tm_core::logging::LogConfig {
+        // The appender guard is owned by `tm_core::logging` for the process
+        // lifetime. It used to be returned here and bound to a `let _log_guard`
+        // inside this block, which dropped it one line later and shut the
+        // writer thread down: every log file this app produced held exactly
+        // one line, the "logging initialized" record emitted before the drop.
+        tm_core::logging::init(tm_core::logging::LogConfig {
             console: true,
             level: verbose.then(|| "debug".parse().expect("static")),
         });

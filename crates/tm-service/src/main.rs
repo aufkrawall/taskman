@@ -93,18 +93,23 @@ mod service {
         let protected_log_directory = tm_platform::win::core_service::prepare_service_log_dir()
             .ok()
             .flatten();
-        let _log_guard = protected_log_directory.as_ref().and_then(|log_directory| {
+        // The guard lives in `tm_core::logging` for the process lifetime.
+        if let Some(log_directory) = protected_log_directory.as_ref() {
             tm_core::logging::init_in_dir(
                 tm_core::logging::LogConfig::default(),
                 log_directory,
                 tm_platform::win::core_service::SERVICE_LOG_FILE_PREFIX,
-            )
-        });
+            );
+        }
         // A worker-thread panic must not leave SCM reporting a live broker
         // with half its bounded capacity gone. Crash the service process so
         // the configured 5/15/60-second recovery policy starts a clean image.
+        // The `tracing::error!` alone never survived: this hook aborts, so the
+        // appender's worker thread is never scheduled to drain it. Write the
+        // record synchronously first, into the protected log directory.
         std::panic::set_hook(Box::new(|info| {
             tracing::error!(panic = %info, "core service panic; aborting for SCM recovery");
+            tm_core::logging::write_crash_record(info);
             std::process::abort();
         }));
 

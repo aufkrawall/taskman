@@ -39,7 +39,12 @@ windows-service = "0.8.0"
 # startup at several minutes of serialized linking. The app's startup floor
 # is the renderer/framework init, not our codegen quality.
 lto = "thin"
-strip = "symbols"
+# `symbols` would strip the symbol table too, and the crash records written by
+# `tm_core::logging::write_crash_record` would then be bare addresses in a
+# stripped image — unresolvable after the fact. `debuginfo` still drops the
+# DWARF/PDB bulk (the size that matters) while leaving the symbol table, so a
+# captured backtrace names functions. Runtime cost: none.
+strip = "debuginfo"
 opt-level = 3
 panic = "abort"
 
