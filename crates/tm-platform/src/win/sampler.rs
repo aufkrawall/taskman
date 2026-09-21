@@ -763,6 +763,85 @@ fn carry_process_disk(
     }
 }
 
+/// Whether a process sysinfo still enumerates has actually gone away.
+///
+/// On Windows NT the kernel process table
+/// (`NtQuerySystemInformation(SystemProcessInformation)`) is the authoritative
+/// source for active processes, matching native Task Manager. When an
+/// application crashes or exits (a game closing, a GPU driver TDR, an
+/// unhandled exception) the kernel removes it from that list — but if any
+/// other process (or sysinfo's own query handle) still holds a handle to it,
+/// ToolHelp32 snapshots keep enumerating the lingering EPROCESS object as a
+/// zombie. Rendering those is the visible bug: rows for programs the user
+/// already closed.
+///
+/// A process is omitted from the snapshot, and its caches purged, when:
+/// 1. it has 0 threads, OR
+/// 2. it is explicitly signaled or carries an exit code, OR
+/// 3. it is absent from the kernel's active process table AND was not
+///    freshly spawned within the last 2 seconds. That grace window exists
+///    because a process created between the kernel-table read and this check
+///    is legitimately missing from the table, and evicting it would make new
+///    processes flicker.
+///
+/// `terminated` and `live_in_kernel_table` are closures, not `bool`s, on
+/// purpose: `is_process_terminated` opens a process handle and the kernel
+/// table lookup is not free, so both must stay behind the cheap checks that
+/// can already decide. Evaluating them eagerly would put one `OpenProcess`
+/// per process per tick on the sampler's hot path.
+///
+/// pids 0 and 4 (`[System Process]`, `System`) are never evicted: they have
+/// no ordinary lifetime and fail several of these probes by construction.
+fn is_zombie(
+    pid: u32,
+    threads: Option<u32>,
+    start_epoch_s: Option<i64>,
+    now_s: i64,
+    terminated: impl FnOnce() -> bool,
+    live_in_kernel_table: impl FnOnce() -> bool,
+) -> bool {
+    if pid <= 4 {
+        return false;
+    }
+    if threads == Some(0) || terminated() {
+        return true;
+    }
+    if !live_in_kernel_table() {
+        let is_recent = start_epoch_s.is_some_and(|s| (now_s - s).abs() <= 2);
+        return !is_recent;
+    }
+    false
+}
+
+/// Fold the per-process GPU view into the rows.
+///
+/// Busiest-engine utilization plus the dominant engine label ("GPU 0 - 3D")
+/// and dedicated/shared memory. A row the view does not mention keeps its
+/// `None`s: an unmeasured process is not an idle one.
+fn apply_process_gpu(
+    processes: &mut [ProcessEntry],
+    engine_records: &[perfcounters::GpuEngineRecord],
+    mem_records: &[perfcounters::GpuMemRecord],
+) {
+    if engine_records.is_empty() && mem_records.is_empty() {
+        return;
+    }
+    let per_pid: HashMap<u32, gpu::ProcessGpuView> =
+        gpu::process_gpu_view(engine_records, mem_records)
+            .into_iter()
+            .map(|v| (v.pid, v))
+            .collect();
+    for e in processes.iter_mut() {
+        if let Some(g) = per_pid.get(&e.pid) {
+            e.gpu_util_pct = Some(g.util_pct);
+            e.gpu_dedicated_bytes = Some(g.dedicated_bytes);
+            e.gpu_shared_bytes = Some(g.shared_bytes);
+            e.gpu_mem_bytes = Some(g.dedicated_bytes);
+            e.gpu_engine_label = g.dominant_engine.clone();
+        }
+    }
+}
+
 impl SystemCollector for Sampler {
     fn backend_name(&self) -> &'static str {
         "windows/sysinfo+pdh+nt-cpu"
@@ -776,6 +855,135 @@ impl SystemCollector for Sampler {
 }
 
 impl Sampler {
+    /// Merged adapter view for the Performance page.
+    ///
+    /// Static adapter info is probed once; it does not change at runtime.
+    /// DXGI enumeration is skipped entirely until GPU telemetry is first
+    /// demanded so a default Processes page cannot wake a dormant dGPU —
+    /// which is why the probe is gated on the demand AND on any of the three
+    /// record sets having produced something.
+    fn collect_gpus(
+        &mut self,
+        engine_records: &[perfcounters::GpuEngineRecord],
+        adapter_mem_records: &[perfcounters::GpuAdapterMemRecord],
+        mem_records: &[perfcounters::GpuMemRecord],
+    ) -> Vec<GpuInfo> {
+        if (!engine_records.is_empty()
+            || !adapter_mem_records.is_empty()
+            || !mem_records.is_empty()
+            || self.demand.any_gpu())
+            && self.gpu_adapters.is_none()
+        {
+            self.gpu_adapters = Some(gpu::adapters());
+        }
+        match self.gpu_adapters.clone() {
+            Some(adapters) => gpu::merge(adapters, engine_records, adapter_mem_records),
+            None => Vec::new(),
+        }
+    }
+
+    /// Per-volume capacity plus the PDH PhysicalDisk rates for its mount.
+    fn collect_disks(&self, disk_perf: &[perfcounters::DiskPerf]) -> Vec<DiskInfo> {
+        let mut disks = Vec::new();
+        for d in self.disks.list() {
+            let mount = d.mount_point().to_string_lossy().to_string();
+            let media = match d.kind() {
+                sysinfo::DiskKind::SSD => {
+                    if d.is_removable() {
+                        MediaKind::Usb
+                    } else {
+                        MediaKind::Ssd
+                    }
+                }
+                sysinfo::DiskKind::HDD => {
+                    if d.is_removable() {
+                        MediaKind::Usb
+                    } else {
+                        MediaKind::Hdd
+                    }
+                }
+                _ => MediaKind::Unknown,
+            };
+            let perf = disk_perf.iter().find(|x| x.matches_mount(&mount));
+            let id = match perf {
+                Some(x) => physical_disk_id(&x.instance, &mount),
+                None => disk_id_for_mount(&mount),
+            };
+            disks.push(DiskInfo {
+                id,
+                mount: mount.clone(),
+                label: String::new(),
+                media,
+                total_bytes: d.total_space(),
+                free_bytes: d.available_space(),
+                // `None` while the PhysicalDisk PDH group is asleep or
+                // still warming: an unmeasured disk is not an idle one.
+                active_pct: perf.map(|x| x.active_pct),
+                read_bps: perf.map_or(0.0, |x| x.read_bps),
+                write_bps: perf.map_or(0.0, |x| x.write_bps),
+                avg_resp_ms: perf.map_or(0.0, |x| x.avg_resp_ms),
+                total_read_bytes: 0,
+                total_written_bytes: 0,
+            });
+        }
+        disks
+    }
+
+    /// Adapter rates for this tick, and the running totals the next tick
+    /// differences against.
+    ///
+    /// Byte-rate counters run on the sampling cadence; the native adapter
+    /// metadata walk (desc/link/SSID) is cached for `NET_META_TTL` so it does
+    /// not run every tick.
+    fn collect_networks(&mut self, interval_s: f64) -> Vec<NetworkInfo> {
+        const NET_META_TTL: std::time::Duration = std::time::Duration::from_secs(5);
+        let adapter_info = match &self.net_meta_cache {
+            Some((at, map)) if at.elapsed() < NET_META_TTL => map.clone(),
+            _ => {
+                let fresh = net_info::adapters();
+                self.net_meta_cache = Some((Instant::now(), fresh.clone()));
+                fresh
+            }
+        };
+        let mut nets = Vec::new();
+        for (name, data) in &self.networks {
+            let recv_total = data.total_received();
+            let sent_total = data.total_transmitted();
+            let (recv_bps, sent_bps) = match (
+                self.prev_net_totals.get(name.as_str()).copied(),
+                self.first_tick_done,
+            ) {
+                (Some((pr, ps)), true) => (
+                    recv_total.saturating_sub(pr) as f64 / interval_s,
+                    sent_total.saturating_sub(ps) as f64 / interval_s,
+                ),
+                _ => (0.0, 0.0),
+            };
+            let ai = adapter_info.get(name.as_str());
+            nets.push(NetworkInfo {
+                name: name.to_string(),
+                desc: ai.map_or_else(String::new, |a| a.desc.clone()),
+                kind: classify_adapter(name),
+                oper_up: ai.is_some_and(|a| a.oper_up),
+                recv_bps,
+                sent_bps,
+                total_recv_bytes: recv_total,
+                total_sent_bytes: sent_total,
+                link_bps: ai.map_or(0, |a| a.link_bps),
+                ssid: ai.and_then(|a| a.ssid.clone()),
+                ipv4: ai.and_then(|a| a.ipv4.clone()),
+                ipv6: ai.and_then(|a| a.ipv6.clone()),
+                signal_quality_pct: ai.and_then(|a| a.signal_quality_pct),
+            });
+        }
+        self.prev_net_totals.clear();
+        for n in &nets {
+            self.prev_net_totals
+                .insert(n.name.clone(), (n.total_recv_bytes, n.total_sent_bytes));
+        }
+        nets
+    }
+
     fn sample_inner(&mut self, started: Instant) -> Result<Snapshot> {
         let interval_s = self
             .last_tick
@@ -978,29 +1186,14 @@ impl Sampler {
                 .copied()
                 .or_else(|| self.cpu_load.thread_count_of(pid_u, entry.start_epoch_s));
 
-            // Evict and drop crashed / terminated zombie processes.
-            // On Windows NT, the kernel process table (`NtQuerySystemInformation(SystemProcessInformation)`)
-            // is the authoritative source for active processes (matching native Windows Task Manager).
-            // When an application crashes or exits (e.g. game closing, GPU driver TDR, unhandled exception),
-            // the kernel removes it from the active process list. However, if external applications
-            // (or sysinfo's open query handle) hold an open process handle, Toolhelp32 snapshots
-            // will continue to enumerate the lingering EPROCESS object as a zombie.
-            //
-            // We omit a process from the snapshot and purge its caches if:
-            // 1. It has 0 threads (`threads == Some(0)`), OR
-            // 2. It is explicitly signaled or has an exit code (`is_process_terminated(pid_u)`), OR
-            // 3. It is absent from the kernel's active process table (`!is_process_live`)
-            //    and was not freshly spawned within the last 2 seconds.
-            let is_dead = if pid_u <= 4 {
-                false
-            } else if threads == Some(0) || is_process_terminated(pid_u) {
-                true
-            } else if !self.cpu_load.is_process_live(pid_u, entry.start_epoch_s) {
-                let is_recent = entry.start_epoch_s.is_some_and(|s| (now_s - s).abs() <= 2);
-                !is_recent
-            } else {
-                false
-            };
+            let is_dead = is_zombie(
+                pid_u,
+                threads,
+                entry.start_epoch_s,
+                now_s,
+                || is_process_terminated(pid_u),
+                || self.cpu_load.is_process_live(pid_u, entry.start_epoch_s),
+            );
 
             if is_dead {
                 self.attrs.remove(&pid_u);
@@ -1321,134 +1514,18 @@ impl Sampler {
         );
 
         // ---- GPU ---------------------------------------------------------------
-        // Static adapter info is probed once; it does not change at runtime.
-        // DXGI enumeration is skipped entirely until GPU telemetry is first
-        // demanded so a default Processes page cannot wake a dormant dGPU.
-        if (!gpu_engine_records.is_empty()
-            || !gpu_adapter_mem_records.is_empty()
-            || !gpu_mem_records.is_empty()
-            || self.demand.any_gpu())
-            && self.gpu_adapters.is_none()
-        {
-            self.gpu_adapters = Some(gpu::adapters());
-        }
-        let gpus = match self.gpu_adapters.clone() {
-            Some(adapters) => gpu::merge(adapters, &gpu_engine_records, &gpu_adapter_mem_records),
-            None => Vec::new(),
-        };
-
-        // Per-process values: busiest-engine utilization plus the dominant
-        // engine label ("GPU 0 - 3D") and dedicated/shared memory.
-        if !gpu_engine_records.is_empty() || !gpu_mem_records.is_empty() {
-            let per_pid: HashMap<u32, gpu::ProcessGpuView> =
-                gpu::process_gpu_view(&gpu_engine_records, &gpu_mem_records)
-                    .into_iter()
-                    .map(|v| (v.pid, v))
-                    .collect();
-            for e in processes.iter_mut() {
-                if let Some(g) = per_pid.get(&e.pid) {
-                    e.gpu_util_pct = Some(g.util_pct);
-                    e.gpu_dedicated_bytes = Some(g.dedicated_bytes);
-                    e.gpu_shared_bytes = Some(g.shared_bytes);
-                    e.gpu_mem_bytes = Some(g.dedicated_bytes);
-                    e.gpu_engine_label = g.dominant_engine.clone();
-                }
-            }
-        }
+        let gpus = self.collect_gpus(
+            &gpu_engine_records,
+            &gpu_adapter_mem_records,
+            &gpu_mem_records,
+        );
+        apply_process_gpu(&mut processes, &gpu_engine_records, &gpu_mem_records);
 
         // ---- disks -----------------------------------------------------------------
-        let mut disks = Vec::new();
-        for d in self.disks.list() {
-            let mount = d.mount_point().to_string_lossy().to_string();
-            let media = match d.kind() {
-                sysinfo::DiskKind::SSD => {
-                    if d.is_removable() {
-                        MediaKind::Usb
-                    } else {
-                        MediaKind::Ssd
-                    }
-                }
-                sysinfo::DiskKind::HDD => {
-                    if d.is_removable() {
-                        MediaKind::Usb
-                    } else {
-                        MediaKind::Hdd
-                    }
-                }
-                _ => MediaKind::Unknown,
-            };
-            let perf = disk_perf.iter().find(|x| x.matches_mount(&mount));
-            let id = match perf {
-                Some(x) => physical_disk_id(&x.instance, &mount),
-                None => disk_id_for_mount(&mount),
-            };
-            disks.push(DiskInfo {
-                id,
-                mount: mount.clone(),
-                label: String::new(),
-                media,
-                total_bytes: d.total_space(),
-                free_bytes: d.available_space(),
-                // `None` while the PhysicalDisk PDH group is asleep or
-                // still warming: an unmeasured disk is not an idle one.
-                active_pct: perf.map(|x| x.active_pct),
-                read_bps: perf.map_or(0.0, |x| x.read_bps),
-                write_bps: perf.map_or(0.0, |x| x.write_bps),
-                avg_resp_ms: perf.map_or(0.0, |x| x.avg_resp_ms),
-                total_read_bytes: 0,
-                total_written_bytes: 0,
-            });
-        }
+        let disks = self.collect_disks(&disk_perf);
 
         // ---- networks -----------------------------------------------------------------
-        // Byte-rate counters run on the sampling cadence; the native adapter
-        // metadata walk (desc/link/SSID) is cached for NET_META_TTL so it does
-        // not run every tick (implement.md §6.5).
-        const NET_META_TTL: std::time::Duration = std::time::Duration::from_secs(5);
-        let adapter_info = match &self.net_meta_cache {
-            Some((at, map)) if at.elapsed() < NET_META_TTL => map.clone(),
-            _ => {
-                let fresh = net_info::adapters();
-                self.net_meta_cache = Some((Instant::now(), fresh.clone()));
-                fresh
-            }
-        };
-        let mut nets = Vec::new();
-        for (name, data) in &self.networks {
-            let recv_total = data.total_received();
-            let sent_total = data.total_transmitted();
-            let (recv_bps, sent_bps) = match (
-                self.prev_net_totals.get(name.as_str()).copied(),
-                self.first_tick_done,
-            ) {
-                (Some((pr, ps)), true) => (
-                    recv_total.saturating_sub(pr) as f64 / interval_s,
-                    sent_total.saturating_sub(ps) as f64 / interval_s,
-                ),
-                _ => (0.0, 0.0),
-            };
-            let ai = adapter_info.get(name.as_str());
-            nets.push(NetworkInfo {
-                name: name.to_string(),
-                desc: ai.map_or_else(String::new, |a| a.desc.clone()),
-                kind: classify_adapter(name),
-                oper_up: ai.is_some_and(|a| a.oper_up),
-                recv_bps,
-                sent_bps,
-                total_recv_bytes: recv_total,
-                total_sent_bytes: sent_total,
-                link_bps: ai.map_or(0, |a| a.link_bps),
-                ssid: ai.and_then(|a| a.ssid.clone()),
-                ipv4: ai.and_then(|a| a.ipv4.clone()),
-                ipv6: ai.and_then(|a| a.ipv6.clone()),
-                signal_quality_pct: ai.and_then(|a| a.signal_quality_pct),
-            });
-        }
-        self.prev_net_totals.clear();
-        for n in &nets {
-            self.prev_net_totals
-                .insert(n.name.clone(), (n.total_recv_bytes, n.total_sent_bytes));
-        }
+        let nets = self.collect_networks(interval_s);
 
         // ---- assemble --------------------------------------------------------------------
         let (handles_global, threads_global) = perfcounters::global_handle_thread_count();
@@ -2475,5 +2552,97 @@ mod tests {
             processes[2].disk_active_pct, None,
             "a process with nothing measured yet stays unknown"
         );
+    }
+
+    // ---------------------------------------------------------- is_zombie
+    //
+    // The eviction rule decides whether a row the user closed keeps being
+    // drawn. Every case below is one way that went wrong before.
+
+    const NOW: i64 = 1_700_000_000;
+
+    fn never() -> bool {
+        panic!("probe must stay behind the cheap checks");
+    }
+
+    #[test]
+    fn zombie_rule_never_evicts_the_system_pseudo_processes() {
+        // pid 0/4 have no ordinary lifetime and fail several probes by
+        // construction; evicting them would empty the top of the tree.
+        for pid in [0, 4] {
+            assert!(
+                !is_zombie(pid, Some(0), None, NOW, never, never),
+                "pid {pid} must never be evicted"
+            );
+        }
+    }
+
+    #[test]
+    fn zombie_rule_evicts_a_threadless_process_without_opening_a_handle() {
+        // `never` asserts the laziness: a threadless process is already
+        // decided, so `is_process_terminated` (an OpenProcess per call) must
+        // not run for it on the sampler's hot path.
+        assert!(is_zombie(1234, Some(0), Some(NOW - 60), NOW, never, never));
+    }
+
+    #[test]
+    fn zombie_rule_evicts_a_signaled_process() {
+        assert!(is_zombie(
+            1234,
+            Some(4),
+            Some(NOW - 60),
+            NOW,
+            || true,
+            never
+        ));
+    }
+
+    #[test]
+    fn zombie_rule_keeps_a_process_the_kernel_table_still_lists() {
+        assert!(!is_zombie(
+            1234,
+            Some(4),
+            Some(NOW - 60),
+            NOW,
+            || false,
+            || true
+        ));
+    }
+
+    #[test]
+    fn zombie_rule_evicts_a_process_the_kernel_table_dropped() {
+        // Handle-pinned zombie: ToolHelp still enumerates it, the kernel
+        // table does not, and it is far too old to be a spawn race.
+        assert!(is_zombie(
+            1234,
+            Some(4),
+            Some(NOW - 60),
+            NOW,
+            || false,
+            || false
+        ));
+    }
+
+    #[test]
+    fn zombie_rule_grants_a_freshly_spawned_process_its_grace_window() {
+        // Created between the kernel-table read and this check: legitimately
+        // absent from the table. Evicting it makes new processes flicker.
+        for age in [0, 1, 2] {
+            assert!(
+                !is_zombie(1234, Some(4), Some(NOW - age), NOW, || false, || false),
+                "a process {age}s old must survive the spawn race"
+            );
+        }
+        assert!(
+            is_zombie(1234, Some(4), Some(NOW - 3), NOW, || false, || false),
+            "past the window the absence is real"
+        );
+    }
+
+    #[test]
+    fn zombie_rule_evicts_when_the_start_time_is_unknown() {
+        // No creation time means no way to prove a spawn race, and the
+        // kernel table has already disowned it.
+        assert!(is_zombie(1234, Some(4), None, NOW, || false, || false));
     }
 }
