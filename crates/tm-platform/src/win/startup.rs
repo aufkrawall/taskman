@@ -53,9 +53,7 @@ pub fn list_startup() -> Vec<StartupItem> {
             &format!(r"{APPROVED_KEY}\{}", loc.approved_subkey),
         );
         for (name, command) in values {
-            let enabled = approved
-                .get(&name)
-                .is_none_or(|data| data.first().is_some_and(|b| b & 1 == 0));
+            let enabled = approval_says_enabled(approved.get(&name).map(Vec::as_slice));
             let publisher = resolve_publisher(&command);
             out.push(StartupItem {
                 id: format!("reg:{}:{}", loc.label, name),
@@ -112,9 +110,7 @@ pub fn list_startup() -> Vec<StartupItem> {
             {
                 continue;
             }
-            let enabled = approved
-                .get(&file_name)
-                .is_none_or(|data| data.first().is_some_and(|b| b & 1 == 0));
+            let enabled = approval_says_enabled(approved.get(&file_name).map(Vec::as_slice));
             // Stable structured identity: scope is encoded explicitly instead
             // of guessed from path substrings like "ProgramData".
             out.push(StartupItem {
@@ -213,11 +209,7 @@ fn set_reg_startup_enabled(rest: &str, enabled: bool) -> Result<()> {
                 return Err(TmError::platform("RegDeleteValueW", format!("{status:?}")));
             }
         } else {
-            // FILETIME of now.
-            let now_ft = systemtime_to_filetime(std::time::SystemTime::now());
-            let mut data: [u8; 12] = [0; 12];
-            data[0] = 0x03;
-            data[4..12].copy_from_slice(&now_ft.to_le_bytes());
+            let data = disabled_approval_blob(std::time::SystemTime::now());
             let status = RegSetValueExW(
                 key,
                 PCWSTR::from_raw(name_w.as_ptr()),
@@ -290,10 +282,7 @@ fn set_folder_startup_enabled(rest: &str, enabled: bool) -> Result<()> {
                 ));
             }
         } else {
-            let now_ft = systemtime_to_filetime(std::time::SystemTime::now());
-            let mut data: [u8; 12] = [0; 12];
-            data[0] = 0x03;
-            data[4..12].copy_from_slice(&now_ft.to_le_bytes());
+            let data = disabled_approval_blob(std::time::SystemTime::now());
             let status = RegSetValueExW(
                 key,
                 PCWSTR::from_raw(name_w.as_ptr()),
@@ -533,9 +522,116 @@ fn read_registry_binary(hive: HKEY, subkey: &str) -> HashMap<String, Vec<u8>> {
     out
 }
 
+/// Read a `StartupApproved` value as "is this item enabled".
+///
+/// Windows stores a 12-byte blob per approved item: a flag byte, three bytes
+/// of padding, then the FILETIME of the last toggle. Bit 0 of the flag byte
+/// is the disabled bit — `0x02`/`0x06` are enabled states, `0x03` is what the
+/// Startup page writes when the user disables an item.
+///
+/// A value that is absent means nobody ever disabled the item, so it is
+/// enabled. A value that is present but EMPTY means the same thing: nothing
+/// in it says "disabled". Reading an empty blob as disabled (which the two
+/// open-coded copies of this rule did) invents a state the registry never
+/// recorded, and the user sees an item greyed out that Windows will happily
+/// run at the next logon.
+fn approval_says_enabled(data: Option<&[u8]>) -> bool {
+    data.is_none_or(|bytes| bytes.first().is_none_or(|flags| flags & 1 == 0))
+}
+
+/// The blob that marks an item disabled, stamped with when it happened.
+fn disabled_approval_blob(at: std::time::SystemTime) -> [u8; 12] {
+    let mut data = [0u8; 12];
+    data[0] = 0x03;
+    data[4..12].copy_from_slice(&systemtime_to_filetime(at).to_le_bytes());
+    data
+}
+
 fn systemtime_to_filetime(t: std::time::SystemTime) -> u64 {
     t.duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_nanos() as u64 / 100)
         // FILETIME epoch offset (1601-01-01)
         + 116_444_736_000_000_000
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn absent_approval_means_enabled() {
+        // Nothing ever disabled it. This is the common case: most Run values
+        // have no StartupApproved counterpart at all.
+        assert!(approval_says_enabled(None));
+    }
+
+    #[test]
+    fn empty_approval_means_enabled() {
+        // Regression: the two open-coded copies of this rule read an empty
+        // blob as DISABLED, because `first()` on an empty slice is `None`.
+        // Nothing in an empty value says "disabled", and Windows will run the
+        // item at the next logon, so showing it greyed out is a fabricated
+        // state — the same class of bug as rendering missing telemetry as 0.
+        assert!(approval_says_enabled(Some(&[])));
+    }
+
+    #[test]
+    fn flag_bit_zero_is_the_disabled_bit() {
+        // 0x02 / 0x06 are the enabled states Windows writes; 0x03 is what the
+        // Startup page writes when the user disables an item.
+        assert!(approval_says_enabled(Some(&[0x02, 0, 0, 0])));
+        assert!(approval_says_enabled(Some(&[0x06, 0, 0, 0])));
+        assert!(!approval_says_enabled(Some(&[0x03, 0, 0, 0])));
+        assert!(!approval_says_enabled(Some(&[0x01, 0, 0, 0])));
+    }
+
+    #[test]
+    fn disabled_blob_has_the_shape_windows_expects() {
+        let at = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+        let blob = disabled_approval_blob(at);
+        assert_eq!(blob.len(), 12, "Windows reads a 12-byte approval value");
+        assert_eq!(blob[0], 0x03, "flag byte must set the disabled bit");
+        assert_eq!(&blob[1..4], &[0, 0, 0], "bytes 1..4 are padding");
+        let stamp = u64::from_le_bytes(blob[4..12].try_into().unwrap());
+        assert_eq!(
+            stamp,
+            systemtime_to_filetime(at),
+            "the tail is a little-endian FILETIME of the toggle"
+        );
+        // And it round-trips through the reader as disabled.
+        assert!(!approval_says_enabled(Some(&blob)));
+    }
+
+    #[test]
+    fn filetime_uses_the_1601_epoch() {
+        assert_eq!(
+            systemtime_to_filetime(std::time::UNIX_EPOCH),
+            116_444_736_000_000_000,
+            "the Unix epoch is exactly the FILETIME offset"
+        );
+        assert_eq!(
+            systemtime_to_filetime(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1)),
+            116_444_736_000_000_000 + 10_000_000,
+            "FILETIME ticks are 100 ns"
+        );
+    }
+
+    #[test]
+    fn env_expansion_leaves_unknown_and_unpaired_percents_alone() {
+        // A command line is shown to the user verbatim when it cannot be
+        // resolved, so a failed expansion must not eat characters.
+        assert_eq!(
+            expand_env_vars(r"%NO_SUCH_VAR_HERE%\app.exe"),
+            r"%NO_SUCH_VAR_HERE%\app.exe"
+        );
+        assert_eq!(expand_env_vars("100% cpu"), "100% cpu");
+        assert_eq!(expand_env_vars("%%"), "%%");
+        assert_eq!(expand_env_vars("plain"), "plain");
+    }
+
+    #[test]
+    fn env_expansion_substitutes_a_known_variable() {
+        let path = std::env::var("PATH").expect("PATH is always set");
+        assert_eq!(expand_env_vars("<%PATH%>"), format!("<{path}>"));
+    }
 }
