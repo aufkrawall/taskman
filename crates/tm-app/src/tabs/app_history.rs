@@ -36,26 +36,15 @@ fn compare_rows(a: &Row, b: &Row, sort: tablekit::SortState) -> Ordering {
         return b.network_available.cmp(&a.network_available);
     }
     let primary = match sort.column {
-        0 => a
-            .name
-            .to_ascii_lowercase()
-            .cmp(&b.name.to_ascii_lowercase()),
+        0 => tablekit::cmp_ignore_case(&a.name, &b.name),
         1 => a
             .cpu_seconds
             .partial_cmp(&b.cpu_seconds)
             .unwrap_or(Ordering::Equal),
         _ => a.network_bytes.cmp(&b.network_bytes),
     };
-    let primary = if sort.ascending {
-        primary
-    } else {
-        primary.reverse()
-    };
-    primary.then_with(|| {
-        a.name
-            .to_ascii_lowercase()
-            .cmp(&b.name.to_ascii_lowercase())
-    })
+    tablekit::directed(primary, sort.ascending)
+        .then_with(|| tablekit::cmp_ignore_case(&a.name, &b.name))
 }
 
 pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
@@ -66,9 +55,9 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
         ui,
         &pal,
         |_app, _ui| {},
-        |_app, ui| {
+        |app, ui| {
             if menu::item(ui, i18n::tr(K::RefreshNow)).clicked() {
-                _app.refresh_all();
+                app.refresh_all();
                 ui.close();
             }
         },
@@ -151,9 +140,7 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
         };
         fit[2] = fit[2].max(tablekit::text_width(ui, &network, tablekit::FONT_ROW) + 22.0);
     }
-    for (i, width) in fit.into_iter().enumerate() {
-        table.set_auto_fit_width(i, width.ceil());
-    }
+    table.apply_auto_fit(fit);
 
     // Per-column maxima over the whole model BEFORE virtualization
     // (audit P0.2) — CPU time and network traffic each highlight their own
@@ -217,17 +204,12 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
                 table.heat_cells(ui, &pal, rect, 1, &cells);
                 // A "—" the user can hover explains itself (same reasons the
                 // Users tab gives); an unexplained dash reads as a bug.
-                let resp = if row.network_available {
-                    resp
-                } else {
-                    match crate::tabs::value_columns::unavailable_tip(
-                        crate::tabs::value_columns::NET,
-                    ) {
-                        Some(tip) => resp.on_hover_text(tip),
-                        None => resp,
-                    }
-                };
-                let _ = resp;
+                if !row.network_available
+                    && let Some(tip) =
+                        crate::tabs::value_columns::unavailable_tip(crate::tabs::value_columns::NET)
+                {
+                    let _ = resp.on_hover_text(tip);
+                }
             }
         },
     );

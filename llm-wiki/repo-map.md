@@ -126,7 +126,7 @@ platform boundary (`tm-core` ← `tm-platform` ← `tm-app` / `tm-service`):
     the shared dialog keyboard contract lives in `app_ui/original.rs`:
     `consume_dialog_keys` / `dialog_key_decision` / `dialog_button_row` —
     consume BEFORE `Window::show`, and the SAFE button owns the default),
-    `tabs/*` (processes/details/modules/users/services/startup/apphistory/
+    `tabs/*` (processes/details/modules/users/services/startup/app_history/
     performance; Processes keeps native grouped presentation, Details can
     switch between flat and literal raw-PPID tree, offers optional combined/receive/send
     per-process network-rate columns backed by the same on-demand ETW source as Processes,

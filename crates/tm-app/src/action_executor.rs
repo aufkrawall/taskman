@@ -183,9 +183,126 @@ pub(crate) fn apply_batch<T>(
     }
 }
 
+// ---------------------------------------------------------------- core service
+// Install/repair/switch orchestration for the Advanced settings block. It
+// lives here (not in the chrome file) because it is action-lane dispatch —
+// inflight bookkeeping plus one executor job — not drawing.
+
+#[cfg(target_os = "windows")]
+use crate::app::TaskManApp;
+#[cfg(target_os = "windows")]
+use eframe::egui;
+
+/// Dispatch the core-service install/remove change on an action lane. The
+/// inflight flag disables the buttons until the operation completes.
+#[cfg(target_os = "windows")]
+pub(crate) fn dispatch_core_service_change(
+    app: &mut TaskManApp,
+    ctx: &egui::Context,
+    install: bool,
+) {
+    let actions = app.actions.clone();
+    let inflight = app.core_service_change_inflight.clone();
+    inflight.store(true, std::sync::atomic::Ordering::Release);
+    let completion = inflight.clone();
+    let dispatched = app.run_action(
+        ctx,
+        move || {
+            i18n::tr(if install {
+                K::CoreServiceInstallRequested
+            } else {
+                K::CoreServiceRemoveRequested
+            })
+            .to_string()
+        },
+        move || {
+            let outcome = actions.set_core_service_installed(install);
+            completion.store(false, std::sync::atomic::Ordering::Release);
+            outcome
+        },
+    );
+    if !dispatched {
+        inflight.store(false, std::sync::atomic::Ordering::Release);
+    }
+}
+
+/// Dispatch a repair from a foreign session: install this build as the
+/// protected generation, then hand the session over to the installed copy —
+/// the running session's image path stays rejected until it switches, so a
+/// bare repair would leave the user in the same "not the installed client"
+/// state they tried to leave.
+#[cfg(target_os = "windows")]
+pub(crate) fn dispatch_core_service_repair_and_switch(app: &mut TaskManApp, ctx: &egui::Context) {
+    let actions = app.actions.clone();
+    let inflight = app.core_service_change_inflight.clone();
+    inflight.store(true, std::sync::atomic::Ordering::Release);
+    let completion = inflight.clone();
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let close_ctx = ctx.clone();
+    let dispatched = app.run_action(
+        ctx,
+        || i18n::tr(K::CoreServiceRepairSwitchRequested).to_string(),
+        move || {
+            actions.set_core_service_installed(true)?;
+            if actions.switch_to_installed_gui(&args)? {
+                crate::request_programmatic_exit();
+                close_ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+            completion.store(false, std::sync::atomic::Ordering::Release);
+            Ok(())
+        },
+    );
+    if !dispatched {
+        inflight.store(false, std::sync::atomic::Ordering::Release);
+    }
+}
+
+/// Dispatch the handover to the protected installed GUI. Shutting down
+/// gracefully lets on_exit flush settings and history while the installed
+/// replacement waits on the single-instance handoff.
+#[cfg(target_os = "windows")]
+pub(crate) fn dispatch_core_service_switch(app: &mut TaskManApp, ctx: &egui::Context) {
+    let actions = app.actions.clone();
+    let inflight = app.core_service_change_inflight.clone();
+    inflight.store(true, std::sync::atomic::Ordering::Release);
+    let completion = inflight.clone();
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let close_ctx = ctx.clone();
+    let dispatched = app.run_action(
+        ctx,
+        || i18n::tr(K::CoreServiceSwitchRequested).to_string(),
+        move || {
+            let switched = actions.switch_to_installed_gui(&args)?;
+            completion.store(false, std::sync::atomic::Ordering::Release);
+            if switched {
+                crate::request_programmatic_exit();
+                close_ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+            Ok(())
+        },
+    );
+    if !dispatched {
+        inflight.store(false, std::sync::atomic::Ordering::Release);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+
+    /// Bounded deadline poll — no fixed sleeps (AGENTS.md).
+    fn wait_for(cond: impl Fn() -> bool, ms: u64) -> bool {
+        let deadline = Instant::now() + Duration::from_millis(ms);
+        while Instant::now() < deadline {
+            if cond() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        cond()
+    }
 
     #[test]
     fn apply_batch_counts_completions_and_succeeds_when_any_target_did() {
@@ -215,5 +332,98 @@ mod tests {
             Err(tm_core::TmError::ProcessNotFound { pid: 10 })
         ));
         assert_eq!(completed.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn run_toasts_success_and_wakes_on_completion() {
+        let executor = ActionExecutor::start().expect("executor starts");
+        let toasts: Toasts = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let woken = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let wake_flag = woken.clone();
+        let ok = executor.run(
+            toasts.clone(),
+            move || wake_flag.store(true, Ordering::Relaxed),
+            || "did it".to_string(),
+            || Ok(()),
+        );
+        assert!(ok);
+        assert!(
+            wait_for(
+                || { woken.load(Ordering::Relaxed) && !toasts.lock().unwrap().is_empty() },
+                5000
+            ),
+            "job completed and toasted"
+        );
+        assert_eq!(toasts.lock().unwrap()[0].msg, "did it");
+    }
+
+    #[test]
+    fn run_reports_failure_when_the_job_errors() {
+        let executor = ActionExecutor::start().expect("executor starts");
+        let toasts: Toasts = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let ok = executor.run(
+            toasts.clone(),
+            || {},
+            || unreachable!("success message must not be built"),
+            || Err(tm_core::TmError::ChannelClosed),
+        );
+        assert!(ok);
+        assert!(
+            wait_for(|| !toasts.lock().unwrap().is_empty(), 5000),
+            "error toast appears"
+        );
+    }
+
+    #[test]
+    fn a_saturated_queue_rejects_new_jobs_with_a_toast() {
+        // Both lanes blocked by a running job, both 32-slot buffers full:
+        // the next submission must be refused, not queued and not silent.
+        let executor = ActionExecutor::start().expect("executor starts");
+        let toasts: Toasts = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (started_tx, started_rx) = mpsc::channel::<()>();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let release_rx = Arc::new(std::sync::Mutex::new(release_rx));
+
+        // Two blockers: one per lane (round-robin assigns them to lanes 0,1
+        // and the workers must have dequeued them so both buffers are empty).
+        for _ in 0..2 {
+            let started = started_tx.clone();
+            let release = release_rx.clone();
+            assert!(executor.run_quiet(
+                || {},
+                move || {
+                    let _ = started.send(());
+                    let _ = release.lock().unwrap().recv();
+                }
+            ));
+        }
+        drop(started_tx);
+        let mut dequeue_confirmed = 0;
+        while started_rx.recv_timeout(Duration::from_millis(100)).is_ok() {
+            dequeue_confirmed += 1;
+        }
+        assert_eq!(dequeue_confirmed, 2, "both workers dequeued their blocker");
+
+        // Fill both lane buffers (32 each, round-robin => 64 jobs).
+        for _ in 0..64 {
+            assert!(executor.run_quiet(|| {}, || {}));
+        }
+        // 65th: both lanes Full.
+        let accepted = executor.run(
+            toasts.clone(),
+            || {},
+            || unreachable!("rejected job must not toast success"),
+            || Ok(()),
+        );
+        assert!(!accepted, "saturated queue refuses the job");
+        assert!(
+            wait_for(|| !toasts.lock().unwrap().is_empty(), 1000),
+            "overload toast is shown"
+        );
+
+        // Unblock the workers so the executor can shut down cleanly.
+        for _ in 0..2 {
+            let _ = release_tx.send(());
+        }
     }
 }

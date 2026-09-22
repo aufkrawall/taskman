@@ -1534,7 +1534,7 @@ impl eframe::App for TaskManApp {
             .show(ui, |ui| match self.tab {
                 Tab::Processes => crate::tabs::processes::show(self, ui),
                 Tab::Performance => crate::tabs::performance::show(self, ui),
-                Tab::AppHistory => crate::tabs::apphistory::show(self, ui),
+                Tab::AppHistory => crate::tabs::app_history::show(self, ui),
                 Tab::Startup => crate::tabs::startup::show(self, ui),
                 Tab::Users => crate::tabs::users::show(self, ui),
                 Tab::Details => crate::tabs::details::show(self, ui),
@@ -1558,7 +1558,7 @@ impl eframe::App for TaskManApp {
             crate::tabs::services::control_confirm_dialog(self, &ctx, &pal);
         }
         if self.pending_app_history_clear {
-            crate::tabs::apphistory::clear_history_dialog(self, &ctx, &pal);
+            crate::tabs::app_history::clear_history_dialog(self, &ctx, &pal);
         }
         if self.pending_process_end.is_some() {
             crate::app_ui::process_end_dialog(self, &ctx);

@@ -284,16 +284,10 @@ fn begin_unload(app: &TaskManApp, state: &mut State, module: ProcessModule, ctx:
 
 fn compare_modules(a: &ProcessModule, b: &ProcessModule, sort: SortColumn) -> Ordering {
     let primary = match sort {
-        SortColumn::Name => a
-            .name
-            .to_ascii_lowercase()
-            .cmp(&b.name.to_ascii_lowercase()),
+        SortColumn::Name => tablekit::cmp_ignore_case(&a.name, &b.name),
         SortColumn::Base => a.base_address.cmp(&b.base_address),
         SortColumn::Size => a.size_bytes.cmp(&b.size_bytes),
-        SortColumn::Path => a
-            .path
-            .to_ascii_lowercase()
-            .cmp(&b.path.to_ascii_lowercase()),
+        SortColumn::Path => tablekit::cmp_ignore_case(&a.path, &b.path),
     };
     primary.then_with(|| a.base_address.cmp(&b.base_address))
 }

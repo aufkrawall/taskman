@@ -62,3 +62,16 @@
   release anywhere on the machine was eaten in its place, leaving that
   application with a key it never saw released. A release is now only
   swallowed when it still matches a recent press.
+
+### Improved
+
+- **Sort comparisons no longer allocate:** every table tab (Processes,
+  Details, Users, Services, Startup, App History, Modules) sorted text columns
+  by lowercasing both strings per comparison — O(n log n) temporary `String`s
+  per sort. The tabs now share one iterator-based `tablekit::cmp_ignore_case`,
+  which also makes sorting consistently case-insensitive for non-ASCII names,
+  plus shared `directed`/`apply_auto_fit` helpers.
+- **`unsafe` justification:** the riskiest unsafe sites (the cross-process
+  `FreeLibrary` transmute, the sampler's termination check, the keyboard
+  hook's struct deref, and the broker's handle/SID ownership transfers) now
+  carry `SAFETY:` comments stating the invariant they rely on.

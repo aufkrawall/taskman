@@ -286,9 +286,9 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
                 let _ = app.actions.run_new_task("ms-settings:otherusers", false);
             }
         },
-        |_app, ui| {
-            if ui.button(i18n::tr(K::RefreshNow)).clicked() {
-                _app.refresh_all();
+        |app, ui| {
+            if menu::item(ui, i18n::tr(K::RefreshNow)).clicked() {
+                app.refresh_all();
                 ui.close();
             }
         },
@@ -404,7 +404,7 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
         // band as one contiguous span, and the first cell owns the chevron.
         .reorderable(FIXED_COLS..FIXED_COLS + VALUE_COLS);
     prepare_auto_fit_widths(
-        ui, app, &mut table, &rows, &sessions, &aggs, &snap, &aggs_hdr, &order,
+        ui, &mut table, &rows, &sessions, &aggs, &snap, &aggs_hdr, &order,
     );
     let avail = tablekit::table_avail(ui);
     let clicked = tablekit::scrolled_rows(
@@ -484,10 +484,6 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
     app.persist_table(&table);
 }
 
-fn directed(order: Ordering, ascending: bool) -> Ordering {
-    if ascending { order } else { order.reverse() }
-}
-
 fn compare_users(
     a: &UserSession,
     aa: &Agg,
@@ -496,14 +492,15 @@ fn compare_users(
     hostname: &str,
     sort: tablekit::SortState,
 ) -> Ordering {
-    let a_name = display_name(a, hostname).to_ascii_lowercase();
-    let b_name = display_name(b, hostname).to_ascii_lowercase();
+    let a_name = display_name(a, hostname);
+    let b_name = display_name(b, hostname);
     let primary = match sort.column {
-        0 => a_name.cmp(&b_name),
+        0 => tablekit::cmp_ignore_case(&a_name, &b_name),
         1 => session_state_rank(a.state).cmp(&session_state_rank(b.state)),
         li => compare_values(&aa.roll, &ba.roll, li),
     };
-    directed(primary, sort.ascending).then_with(|| a_name.cmp(&b_name))
+    tablekit::directed(primary, sort.ascending)
+        .then_with(|| tablekit::cmp_ignore_case(&a_name, &b_name))
 }
 
 /// Order two rollups by one LOGICAL value column. An unmeasured cell sorts
@@ -520,16 +517,12 @@ fn compare_user_apps(
     b_roll: &Roll,
     sort: tablekit::SortState,
 ) -> Ordering {
-    let names = || {
-        a_name
-            .to_ascii_lowercase()
-            .cmp(&b_name.to_ascii_lowercase())
-    };
+    let names = || tablekit::cmp_ignore_case(a_name, b_name);
     let primary = match sort.column {
         li if li >= FIXED_COLS => compare_values(a_roll, b_roll, li),
         _ => names(),
     };
-    directed(primary, sort.ascending).then_with(names)
+    tablekit::directed(primary, sort.ascending).then_with(names)
 }
 
 fn session_state_rank(state: tm_core::model::UserSessionState) -> u8 {
@@ -552,7 +545,6 @@ fn session_state_rank(state: tm_core::model::UserSessionState) -> u8 {
 #[allow(clippy::too_many_arguments)]
 fn prepare_auto_fit_widths(
     ui: &egui::Ui,
-    app: &TaskManApp,
     table: &mut tablekit::TmTable,
     rows: &[URow],
     sessions: &[&UserSession],
@@ -610,10 +602,7 @@ fn prepare_auto_fit_widths(
     {
         fit[col] = fit[col].max(tablekit::text_width(ui, agg, tablekit::FONT_AGG) + 36.0);
     }
-    for (i, width) in fit.into_iter().enumerate() {
-        table.set_auto_fit_width(i, width.ceil());
-    }
-    let _ = app;
+    table.apply_auto_fit(fit);
 }
 
 fn session_status_label(s: &UserSession) -> &'static str {

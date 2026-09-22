@@ -660,6 +660,14 @@ pub fn unload_process_module(
             .and_then(|base| base.checked_add(offset))
             .ok_or_else(|| TmError::platform("unload module", "remote address overflow"))?;
         let start: th::LPTHREAD_START_ROUTINE = Some(unsafe {
+            // SAFETY: `remote_proc` is remote_base + (local_FreeLibrary −
+            // local_base), where both images were proven to be the SAME
+            // loader runtime (name, path AND size) and the offset was bounds-
+            // checked against the remote image above — so the address lands on
+            // the target's FreeLibrary entry point, which has exactly this
+            // system-call signature (`LPTHREAD_START_ROUTINE`). The address is
+            // only ever passed to `CreateRemoteThread` as a start routine; it
+            // is never called locally.
             std::mem::transmute::<usize, unsafe extern "system" fn(*mut core::ffi::c_void) -> u32>(
                 remote_proc,
             )

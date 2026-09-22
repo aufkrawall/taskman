@@ -122,7 +122,7 @@ impl ColumnId {
     pub fn compare(self, a: &ProcessEntry, b: &ProcessEntry) -> CmpOrdering {
         match self {
             // Sorts by what `detail_name` renders: the image name.
-            ColumnId::Name => cmp_ignore_case(&a.name, &b.name),
+            ColumnId::Name => tablekit::cmp_ignore_case(&a.name, &b.name),
             ColumnId::Pid => a.pid.cmp(&b.pid),
             ColumnId::Status => status_rank(a.status).cmp(&status_rank(b.status)),
             ColumnId::User => cmp_option_str(a.user.as_deref(), b.user.as_deref()),
@@ -268,25 +268,9 @@ fn uac_rank(v: Option<UacVirtualization>) -> u8 {
     }
 }
 
-fn cmp_ignore_case(a: &str, b: &str) -> CmpOrdering {
-    let mut ai = a.chars().flat_map(char::to_lowercase);
-    let mut bi = b.chars().flat_map(char::to_lowercase);
-    loop {
-        match (ai.next(), bi.next()) {
-            (Some(x), Some(y)) => match x.cmp(&y) {
-                CmpOrdering::Equal => continue,
-                other => return other,
-            },
-            (None, None) => return CmpOrdering::Equal,
-            (None, Some(_)) => return CmpOrdering::Less,
-            (Some(_), None) => return CmpOrdering::Greater,
-        }
-    }
-}
-
 fn cmp_option_str(a: Option<&str>, b: Option<&str>) -> CmpOrdering {
     match (a, b) {
-        (Some(x), Some(y)) => cmp_ignore_case(x, y),
+        (Some(x), Some(y)) => tablekit::cmp_ignore_case(x, y),
         (Some(_), None) => CmpOrdering::Less,
         (None, Some(_)) => CmpOrdering::Greater,
         (None, None) => CmpOrdering::Equal,
@@ -770,16 +754,12 @@ impl State {
             return false;
         }
         let other = visible[target as usize];
-        let a = self
-            .order
-            .iter()
-            .position(|candidate| *candidate == cid)
-            .unwrap();
-        let b = self
-            .order
-            .iter()
-            .position(|candidate| *candidate == other)
-            .unwrap();
+        let (Some(a), Some(b)) = (
+            self.order.iter().position(|candidate| *candidate == cid),
+            self.order.iter().position(|candidate| *candidate == other),
+        ) else {
+            return false;
+        };
         self.order.swap(a, b);
         self.invalidate();
         true
@@ -1120,7 +1100,10 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
             rows: build_rows(&snap, &key.2, key.3, key.4, &app.details_state.collapsed),
         });
     }
-    let rows = &cache.as_ref().expect("cache").rows;
+    let rows = match cache.as_ref() {
+        Some(cache) => &cache.rows,
+        None => return,
+    };
 
     // Native-style type navigation follows the current filtered/sorted list,
     // accumulates fast keystrokes into one word, cycles repeated initials,
@@ -1482,7 +1465,8 @@ fn prepare_auto_fit_widths(
     visible_cols: &[ColSpec],
     rows: &[Row],
 ) {
-    for (pos, spec) in visible_cols.iter().enumerate() {
+    let mut widths = Vec::with_capacity(visible_cols.len());
+    for spec in visible_cols {
         let mut width = tablekit::text_width(ui, spec.label(), tablekit::FONT_HDR_LABEL) + 28.0;
         for row in rows {
             let extra = if spec.cid == ColumnId::Name {
@@ -1497,8 +1481,9 @@ fn prepare_auto_fit_widths(
             width = width
                 .max(tablekit::text_width(ui, row.field(spec.cid), tablekit::FONT_ROW) + extra);
         }
-        table.set_auto_fit_width(pos, width.ceil());
+        widths.push(width);
     }
+    table.apply_auto_fit(widths);
 }
 
 fn ctx_from(ui: &egui::Ui) -> egui::Context {
@@ -2054,22 +2039,9 @@ fn set_priority_for_targets(
         }
     };
     app.run_action_refreshing(ctx, msg, move || {
-        let mut first_error = None;
-        for identity in targets {
-            match actions.set_priority_checked(identity.pid, identity.start_epoch_s, cls) {
-                Ok(()) => {
-                    completed_for_job.fetch_add(1, Ordering::Relaxed);
-                }
-                Err(error) => {
-                    first_error.get_or_insert(error);
-                }
-            }
-        }
-        if completed_for_job.load(Ordering::Relaxed) == 0 {
-            Err(first_error.expect("non-empty priority batch must produce a result"))
-        } else {
-            Ok(())
-        }
+        crate::action_executor::apply_batch(targets, &completed_for_job, |identity| {
+            actions.set_priority_checked(identity.pid, identity.start_epoch_s, cls)
+        })
     });
 }
 
@@ -2100,22 +2072,9 @@ fn set_affinity_for_targets(
         }
     };
     app.run_action_refreshing(ctx, msg, move || {
-        let mut first_error = None;
-        for identity in targets {
-            match actions.set_affinity_mask_checked(identity.pid, identity.start_epoch_s, mask) {
-                Ok(()) => {
-                    completed_for_job.fetch_add(1, Ordering::Relaxed);
-                }
-                Err(error) => {
-                    first_error.get_or_insert(error);
-                }
-            }
-        }
-        if completed_for_job.load(Ordering::Relaxed) == 0 {
-            Err(first_error.expect("non-empty affinity batch must produce a result"))
-        } else {
-            Ok(())
-        }
+        crate::action_executor::apply_batch(targets, &completed_for_job, |identity| {
+            actions.set_affinity_mask_checked(identity.pid, identity.start_epoch_s, mask)
+        })
     });
 }
 
@@ -4024,7 +3983,7 @@ pub fn affinity_dialog(app: &mut TaskManApp, ctx: &egui::Context, pal: &theme::P
                 }
             }
             if target_count == 1 && dialog.error.is_none() {
-                let save = crate::widgets::controls::checkbox_enabled(
+                let _ = crate::widgets::controls::checkbox_enabled(
                     ui,
                     &mut dialog.save_for_program,
                     i18n::tr(K::SaveAffinityForProgram),
@@ -4032,7 +3991,6 @@ pub fn affinity_dialog(app: &mut TaskManApp, ctx: &egui::Context, pal: &theme::P
                     &controls_pal,
                 )
                 .on_disabled_hover_text(i18n::tr(K::SaveRuleNeedsPath));
-                let _ = save;
             }
             ui.add_space(8.0);
             match crate::app_ui::dialog_button_row(
@@ -4054,8 +4012,7 @@ pub fn affinity_dialog(app: &mut TaskManApp, ctx: &egui::Context, pal: &theme::P
         Some(crate::app_ui::DialogDecision::Primary) => apply = true,
         None => {}
     }
-    if apply {
-        let mask = dialog.mask.expect("apply requires a loaded affinity mask");
+    if apply && let Some(mask) = dialog.mask {
         set_affinity_for_targets(app, ctx, dialog.targets.clone(), mask);
         if let Some(rule_key) = dialog.rule_key.as_deref() {
             update_saved_affinity(app, rule_key, dialog.save_for_program.then_some(mask));

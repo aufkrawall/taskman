@@ -346,7 +346,10 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
             rows: build_display_rows(&snap, &key.2, key.3, key.4, &expanded, &groups),
         });
     }
-    let rows = &cache.as_ref().expect("cache").rows;
+    let rows = match cache.as_ref() {
+        Some(cache) => &cache.rows,
+        None => return,
+    };
 
     // Task-Manager-style type navigation: typed letters accumulate into a
     // word, so "svc" lands on svchost.exe instead of jumping to whatever
@@ -826,9 +829,7 @@ fn prepare_auto_fit_widths(
     for (col, agg) in table.numeric_indices().zip(aggs.iter()).collect::<Vec<_>>() {
         widths[col] = widths[col].max(tablekit::text_width(ui, agg, tablekit::FONT_AGG) + 36.0);
     }
-    for (i, width) in widths.into_iter().enumerate() {
-        table.set_auto_fit_width(i, width.ceil());
-    }
+    table.apply_auto_fit(widths);
 }
 
 /// Collapsible group header ("Apps [5]") at standard row height so the list

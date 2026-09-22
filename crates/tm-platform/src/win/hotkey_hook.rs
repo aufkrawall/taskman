@@ -475,6 +475,9 @@ unsafe extern "system" fn low_level_keyboard_proc(
         return unsafe { CallNextHookEx(None, code, wparam, lparam) };
     }
 
+    // SAFETY: for `HC_ACTION` on `WH_KEYBOARD_LL` the system guarantees
+    // `lparam` points at a `KBDLLHOOKSTRUCT` for the duration of this call.
+    // The reference never escapes the callback, and the struct is POD.
     let kbd = unsafe { &*(lparam.0 as *const KBDLLHOOKSTRUCT) };
     let msg = wparam.0 as u32;
 

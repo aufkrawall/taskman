@@ -1824,6 +1824,12 @@ fn is_process_terminated(pid: u32) -> bool {
         return false;
     }
 
+    // SAFETY: every call below operates on a HANDLE returned by a successful
+    // `OpenProcess` (the `Ok` arms), takes no raw pointers from callers, and
+    // each opened handle is closed on ALL paths before returning — including
+    // the fallback chain, which opens at most one handle per branch. `pid` is
+    // a plain `u32` from the kernel process table. `WaitForSingleObject` uses
+    // a zero timeout, so nothing here can block the sampler tick.
     unsafe {
         // Try opening with PROCESS_SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION
         if let Ok(handle) = OpenProcess(

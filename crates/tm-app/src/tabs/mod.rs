@@ -1,6 +1,6 @@
 //! Tab implementations.
 
-pub mod apphistory;
+pub mod app_history;
 pub mod details;
 pub mod modules;
 pub mod performance;

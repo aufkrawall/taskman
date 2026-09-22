@@ -559,7 +559,6 @@ fn build_resource_list(app: &TaskManApp) -> Vec<ResourceEntry> {
     let Some(snap) = app.latest_snapshot() else {
         return out;
     };
-    let _ = app;
 
     out.push(ResourceEntry {
         kind: ResourceKind::Cpu,

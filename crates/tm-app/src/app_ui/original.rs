@@ -345,67 +345,6 @@ fn icon_button(ui: &mut egui::Ui, pal: &Palette, icon: Icon, size: f32, center: 
 
 // ---------------------------------------------------------------- tab header
 
-pub fn tab_header(
-    app: &mut TaskManApp,
-    ui: &mut egui::Ui,
-    pal: &Palette,
-    extra: impl FnOnce(&mut TaskManApp, &mut egui::Ui),
-    menu: impl FnOnce(&mut TaskManApp, &mut egui::Ui),
-) {
-    let title = app.tab.label();
-    // How many rows a multi-select command would act on. The toolbar buttons
-    // are the same size either way, so without this the difference between
-    // ending one process and ending thirty is invisible until the dialog.
-    let selected = matches!(
-        app.tab,
-        crate::app::Tab::Processes | crate::app::Tab::Details
-    )
-    .then(|| app.selection.len())
-    .filter(|count| *count > 1);
-    ui.horizontal(|ui| {
-        ui.add_space(16.0);
-        ui.label(egui::RichText::new(title).size(15.5).strong());
-        if let Some(count) = selected {
-            ui.add_space(10.0);
-            ui.label(
-                egui::RichText::new(i18n::trf(K::SelectedCount, &[&count.to_string()]))
-                    .size(12.5)
-                    .color(pal.text_dim),
-            );
-        }
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            ui.add_space(8.0);
-            ellipsis_menu(app, ui, pal, menu);
-            extra(app, ui);
-            vsep(ui, pal);
-            #[cfg(target_os = "windows")]
-            {
-                if cmd_button(
-                    ui,
-                    pal,
-                    Icon::OpenExternal,
-                    i18n::tr(K::WindowsTaskManager),
-                    true,
-                ) {
-                    let actions = app.actions.clone();
-                    let ctx = ui.ctx().clone();
-                    app.run_action(
-                        &ctx,
-                        || i18n::tr(K::WindowsTaskManagerStarted).to_string(),
-                        move || actions.launch_native_task_manager(),
-                    );
-                }
-                vsep(ui, pal);
-            }
-            if cmd_button(ui, pal, Icon::RunTask, i18n::tr(K::RunNewTask), true) {
-                app.run_dialog_open = true;
-            }
-        });
-        ui.add_space(4.0);
-    });
-    ui.add_space(2.0);
-}
-
 pub fn cmd_button(
     ui: &mut egui::Ui,
     pal: &Palette,
@@ -851,9 +790,9 @@ pub fn settings_dialog(app: &mut TaskManApp, ctx: &egui::Context, _pal: &theme::
                             // No reinstall can make a foreign image pass the
                             // broker's client authorization; hand the session
                             // to the installed GUI instead.
-                            dispatch_core_service_switch(app, ctx);
+                            crate::action_executor::dispatch_core_service_switch(app, ctx);
                         } else {
-                            dispatch_core_service_change(app, ctx, install);
+                            crate::action_executor::dispatch_core_service_change(app, ctx, install);
                         }
                     }
                     if foreign {
@@ -867,7 +806,9 @@ pub fn settings_dialog(app: &mut TaskManApp, ctx: &egui::Context, _pal: &theme::
                             )
                             .clicked()
                         {
-                            dispatch_core_service_repair_and_switch(app, ctx);
+                            crate::action_executor::dispatch_core_service_repair_and_switch(
+                                app, ctx,
+                            );
                         }
                     }
                 });
@@ -1384,95 +1325,6 @@ pub fn run_task_dialog(app: &mut TaskManApp, ctx: &egui::Context, _pal: &theme::
         ctx.data_mut(|data| data.insert_temp(focus_id, focus));
     } else {
         ctx.data_mut(|data| data.remove_temp::<RunTaskDialogFocus>(focus_id));
-    }
-}
-
-/// Dispatch the core-service install/remove change on an action lane. The
-/// inflight flag disables the buttons until the operation completes.
-#[cfg(target_os = "windows")]
-fn dispatch_core_service_change(app: &mut TaskManApp, ctx: &egui::Context, install: bool) {
-    let actions = app.actions.clone();
-    let inflight = app.core_service_change_inflight.clone();
-    inflight.store(true, std::sync::atomic::Ordering::Release);
-    let completion = inflight.clone();
-    let dispatched = app.run_action(
-        ctx,
-        move || {
-            i18n::tr(if install {
-                K::CoreServiceInstallRequested
-            } else {
-                K::CoreServiceRemoveRequested
-            })
-            .to_string()
-        },
-        move || {
-            let outcome = actions.set_core_service_installed(install);
-            completion.store(false, std::sync::atomic::Ordering::Release);
-            outcome
-        },
-    );
-    if !dispatched {
-        inflight.store(false, std::sync::atomic::Ordering::Release);
-    }
-}
-
-/// Dispatch a repair from a foreign session: install this build as the
-/// protected generation, then hand the session over to the installed copy —
-/// the running session's image path stays rejected until it switches, so a
-/// bare repair would leave the user in the same "not the installed client"
-/// state they tried to leave.
-#[cfg(target_os = "windows")]
-fn dispatch_core_service_repair_and_switch(app: &mut TaskManApp, ctx: &egui::Context) {
-    let actions = app.actions.clone();
-    let inflight = app.core_service_change_inflight.clone();
-    inflight.store(true, std::sync::atomic::Ordering::Release);
-    let completion = inflight.clone();
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    let close_ctx = ctx.clone();
-    let dispatched = app.run_action(
-        ctx,
-        || i18n::tr(K::CoreServiceRepairSwitchRequested).to_string(),
-        move || {
-            actions.set_core_service_installed(true)?;
-            if actions.switch_to_installed_gui(&args)? {
-                crate::request_programmatic_exit();
-                close_ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-            }
-            completion.store(false, std::sync::atomic::Ordering::Release);
-            Ok(())
-        },
-    );
-    if !dispatched {
-        inflight.store(false, std::sync::atomic::Ordering::Release);
-    }
-}
-
-/// Dispatch the handover to the protected installed GUI. Shutting down
-/// gracefully lets on_exit flush settings and history while the installed
-/// replacement waits on the single-instance handoff.
-#[cfg(target_os = "windows")]
-fn dispatch_core_service_switch(app: &mut TaskManApp, ctx: &egui::Context) {
-    let actions = app.actions.clone();
-    let inflight = app.core_service_change_inflight.clone();
-    inflight.store(true, std::sync::atomic::Ordering::Release);
-    let completion = inflight.clone();
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    let close_ctx = ctx.clone();
-    let dispatched = app.run_action(
-        ctx,
-        || i18n::tr(K::CoreServiceSwitchRequested).to_string(),
-        move || {
-            let switched = actions.switch_to_installed_gui(&args)?;
-            completion.store(false, std::sync::atomic::Ordering::Release);
-            if switched {
-                crate::request_programmatic_exit();
-                close_ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-            }
-            Ok(())
-        },
-    );
-    if !dispatched {
-        inflight.store(false, std::sync::atomic::Ordering::Release);
     }
 }
 

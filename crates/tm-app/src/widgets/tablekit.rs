@@ -80,6 +80,34 @@ impl SortState {
     }
 }
 
+/// Case-insensitive text order for sort comparators.
+///
+/// Iterator-based over `char::to_lowercase`, so it allocates NOTHING per
+/// comparison — the tabs used to build two `String`s (`to_ascii_lowercase()`)
+/// for every pair inside `sort_by`, i.e. O(n log n) allocations per sort.
+/// Unicode-aware (matches Details' historical behavior); ASCII input sorts
+/// exactly as before.
+pub fn cmp_ignore_case(a: &str, b: &str) -> std::cmp::Ordering {
+    let mut ai = a.chars().flat_map(char::to_lowercase);
+    let mut bi = b.chars().flat_map(char::to_lowercase);
+    loop {
+        match (ai.next(), bi.next()) {
+            (Some(x), Some(y)) => match x.cmp(&y) {
+                std::cmp::Ordering::Equal => continue,
+                other => return other,
+            },
+            (None, None) => return std::cmp::Ordering::Equal,
+            (None, Some(_)) => return std::cmp::Ordering::Less,
+            (Some(_), None) => return std::cmp::Ordering::Greater,
+        }
+    }
+}
+
+/// Apply a sort direction to a primary comparison result.
+pub fn directed(order: std::cmp::Ordering, ascending: bool) -> std::cmp::Ordering {
+    if ascending { order } else { order.reverse() }
+}
+
 /// Hard limits for user-resized columns.
 const MIN_COL_W: f32 = 40.0;
 const MAX_COL_W: f32 = 1200.0;
@@ -656,6 +684,15 @@ impl TmTable {
     pub fn set_auto_fit_width(&mut self, i: usize, width: f32) {
         if let Some(slot) = self.auto_widths.get_mut(i) {
             *slot = Some(width.clamp(MIN_COL_W, MAX_COL_W));
+        }
+    }
+
+    /// Push every measured intrinsic width (one per visible column, in
+    /// display order) into the auto-fit slots. Shared so each tab does not
+    /// re-implement the enumerate/ceil/set loop.
+    pub fn apply_auto_fit(&mut self, widths: impl IntoIterator<Item = f32>) {
+        for (i, width) in widths.into_iter().enumerate() {
+            self.set_auto_fit_width(i, width.ceil());
         }
     }
 

@@ -207,9 +207,7 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
             fit[i] = fit[i].max(tablekit::text_width(ui, values[i], tablekit::FONT_ROW) + 22.0);
         }
     }
-    for (i, width) in fit.into_iter().enumerate() {
-        table.set_auto_fit_width(i, width.ceil());
-    }
+    table.apply_auto_fit(fit);
 
     let avail = crate::widgets::tablekit::table_avail(ui);
     let clicked = tablekit::scrolled_rows(
@@ -353,31 +351,14 @@ fn compare_services(a: &ServiceInfo, b: &ServiceInfo, sort: tablekit::SortState)
         return b.pid.is_some().cmp(&a.pid.is_some());
     }
     let primary = match sort.column {
-        0 => a
-            .name
-            .to_ascii_lowercase()
-            .cmp(&b.name.to_ascii_lowercase()),
+        0 => tablekit::cmp_ignore_case(&a.name, &b.name),
         1 => a.pid.cmp(&b.pid),
-        2 => a
-            .display_name
-            .to_ascii_lowercase()
-            .cmp(&b.display_name.to_ascii_lowercase()),
+        2 => tablekit::cmp_ignore_case(&a.display_name, &b.display_name),
         3 => service_status_rank(a.status).cmp(&service_status_rank(b.status)),
-        _ => a
-            .group
-            .to_ascii_lowercase()
-            .cmp(&b.group.to_ascii_lowercase()),
+        _ => tablekit::cmp_ignore_case(&a.group, &b.group),
     };
-    let primary = if sort.ascending {
-        primary
-    } else {
-        primary.reverse()
-    };
-    primary.then_with(|| {
-        a.name
-            .to_ascii_lowercase()
-            .cmp(&b.name.to_ascii_lowercase())
-    })
+    tablekit::directed(primary, sort.ascending)
+        .then_with(|| tablekit::cmp_ignore_case(&a.name, &b.name))
 }
 
 fn service_status_rank(status: ServiceStatus) -> u8 {
@@ -537,5 +518,89 @@ pub fn control_confirm_dialog(app: &mut TaskManApp, ctx: &egui::Context, pal: &t
     if confirm {
         app.services_selected_name = Some(name);
         dispatch_control(app, ctx, action);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn svc(name: &str, pid: Option<u32>, status: ServiceStatus) -> ServiceInfo {
+        ServiceInfo {
+            name: name.to_string(),
+            display_name: format!("Display {name}"),
+            description: String::new(),
+            pid,
+            status,
+            group: String::new(),
+            startup_type: String::new(),
+            account: String::new(),
+        }
+    }
+
+    fn sorted(items: &mut [ServiceInfo], column: usize, ascending: bool) {
+        let sort = tablekit::SortState::new(column, ascending);
+        items.sort_by(|a, b| compare_services(a, b, sort));
+    }
+
+    #[test]
+    fn name_sort_is_case_insensitive_and_reverses_with_direction() {
+        let mut items = vec![
+            svc("beta", None, ServiceStatus::Unknown),
+            svc("Alpha", None, ServiceStatus::Unknown),
+            svc("gamma", None, ServiceStatus::Unknown),
+        ];
+        sorted(&mut items, 0, true);
+        let names: Vec<_> = items.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, ["Alpha", "beta", "gamma"]);
+
+        sorted(&mut items, 0, false);
+        let names: Vec<_> = items.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, ["gamma", "beta", "Alpha"]);
+    }
+
+    #[test]
+    fn pidless_services_sort_last_in_either_direction() {
+        // Stopped services have no PID; None must never float above a real
+        // row (matches the Details "unavailable sorts last" rule).
+        let mut items = vec![
+            svc("has-pid-a", Some(100), ServiceStatus::Unknown),
+            svc("no-pid", None, ServiceStatus::Unknown),
+            svc("has-pid-b", Some(50), ServiceStatus::Unknown),
+        ];
+        for ascending in [true, false] {
+            sorted(&mut items, 1, ascending);
+            assert_eq!(
+                items.last().map(|s| s.name.as_str()),
+                Some("no-pid"),
+                "ascending={ascending}"
+            );
+            // Present PIDs keep numeric order independent of the None rule.
+            let pids: Vec<u32> = items[..2].iter().filter_map(|s| s.pid).collect();
+            if ascending {
+                assert_eq!(pids, [50, 100]);
+            } else {
+                assert_eq!(pids, [100, 50]);
+            }
+        }
+    }
+
+    #[test]
+    fn status_sort_follows_native_rank_running_before_stopped() {
+        let mut items = vec![
+            svc("s", None, ServiceStatus::Stopped),
+            svc("r", None, ServiceStatus::Running),
+            svc("p", None, ServiceStatus::Paused),
+        ];
+        sorted(&mut items, 3, true);
+        let statuses: Vec<_> = items.iter().map(|s| s.status).collect();
+        assert_eq!(
+            statuses,
+            [
+                ServiceStatus::Running,
+                ServiceStatus::Paused,
+                ServiceStatus::Stopped
+            ]
+        );
     }
 }

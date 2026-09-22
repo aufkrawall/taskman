@@ -186,9 +186,7 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
             fit[i] = fit[i].max(tablekit::text_width(ui, values[i], tablekit::FONT_ROW) + 22.0);
         }
     }
-    for (i, width) in fit.into_iter().enumerate() {
-        table.set_auto_fit_width(i, width.ceil());
-    }
+    table.apply_auto_fit(fit);
 
     let avail = crate::widgets::tablekit::table_avail(ui);
     let clicked = tablekit::scrolled_rows(
@@ -321,29 +319,16 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
 
 fn compare_items(a: &StartupItem, b: &StartupItem, sort: tablekit::SortState) -> Ordering {
     let primary = match sort.column {
-        0 => a
-            .name
-            .to_ascii_lowercase()
-            .cmp(&b.name.to_ascii_lowercase()),
-        1 => a
-            .publisher
-            .as_deref()
-            .unwrap_or("")
-            .to_ascii_lowercase()
-            .cmp(&b.publisher.as_deref().unwrap_or("").to_ascii_lowercase()),
+        0 => tablekit::cmp_ignore_case(&a.name, &b.name),
+        1 => tablekit::cmp_ignore_case(
+            a.publisher.as_deref().unwrap_or(""),
+            b.publisher.as_deref().unwrap_or(""),
+        ),
         2 => a.enabled.cmp(&b.enabled),
         _ => impact_rank(a.impact).cmp(&impact_rank(b.impact)),
     };
-    let primary = if sort.ascending {
-        primary
-    } else {
-        primary.reverse()
-    };
-    primary.then_with(|| {
-        a.name
-            .to_ascii_lowercase()
-            .cmp(&b.name.to_ascii_lowercase())
-    })
+    tablekit::directed(primary, sort.ascending)
+        .then_with(|| tablekit::cmp_ignore_case(&a.name, &b.name))
 }
 
 fn impact_rank(impact: StartupImpact) -> u8 {

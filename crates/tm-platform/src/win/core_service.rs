@@ -538,6 +538,9 @@ fn sid_is_user_account(sid_text: &str) -> bool {
             &mut kind,
         )
     };
+    // SAFETY: `sid` was allocated by the successful `ConvertStringSidToSidW`
+    // above and is freed on THIS path unconditionally; the buffer handed to
+    // `LookupAccountSidW` is only read while `sid` is alive.
     unsafe {
         let _ = LocalFree(Some(HLOCAL(sid.0)));
     }
@@ -1239,6 +1242,10 @@ fn open_client_pipe() -> std::result::Result<File, BrokerCallError> {
     let deadline = std::time::Instant::now() + PIPE_BUSY_RETRY;
     loop {
         let error = match open() {
+            // SAFETY: `handle` comes from a successful `CreateFileW` on this
+            // same pipe (raw HANDLE, not previously wrapped); transferring it
+            // into `File` gives it exactly one owner, so the retry loop above
+            // never wraps — and thus never closes — the same handle twice.
             Ok(handle) => return Ok(unsafe { File::from_raw_handle(handle.0) }),
             Err(error) => error,
         };
@@ -1373,6 +1380,10 @@ fn create_pipe_instance(pipe_name: &str, sddl: &str, first: bool) -> Result<File
             std::io::Error::last_os_error().to_string(),
         ));
     }
+    // SAFETY: `handle` is the fresh, validity-checked result of
+    // `CreateNamedPipeW` above (the invalid case returned early); wrapping it
+    // once in `File` makes the kernel pipe instance and its ACL subject to
+    // ordinary Rust drop — there is no second owner.
     Ok(unsafe { File::from_raw_handle(handle.0) })
 }
 

@@ -113,6 +113,10 @@ macro_rules! keys {
                 $( K::$key => ($de, $en) ),*
             }
         }
+
+        /// Every declared key, for the parity test below.
+        #[cfg(test)]
+        const ALL_KEYS: &[K] = &[ $( K::$key ),* ];
     };
 }
 
@@ -834,5 +838,27 @@ pub fn unit_gbit_per_s() -> &'static str {
     match lang() {
         Lang::De => "GBit/s",
         Lang::En => "Gbps",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every key must carry BOTH languages, and `trf` substitutes `{}`
+    /// positionally — so a German/English placeholder-count mismatch would
+    /// leave a literal `{}` (or a lost argument) in one language only.
+    #[test]
+    fn every_key_has_both_translations_with_matching_placeholders() {
+        for &key in ALL_KEYS {
+            let (de, en) = lookup(key);
+            assert!(!de.is_empty(), "{key:?} has an empty German string");
+            assert!(!en.is_empty(), "{key:?} has an empty English string");
+            assert_eq!(
+                de.matches("{}").count(),
+                en.matches("{}").count(),
+                "{key:?} placeholder count differs between de/en: {de:?} vs {en:?}"
+            );
+        }
     }
 }
