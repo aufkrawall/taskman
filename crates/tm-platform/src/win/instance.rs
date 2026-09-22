@@ -415,6 +415,14 @@ fn handshake(names: &Names, show: HANDLE, ack: HANDLE) -> Activation {
                 return Activation::Unresponsive;
             }
             Some(true) => {
+                // Deliberately the NON-attaching activation. This runs on a
+                // launcher thread that has no message loop, against a window
+                // owned by a foreign process that has just spent
+                // `FIRST_ACK_MS` not answering — the two conditions that turn
+                // an input-queue merge into a freeze of whatever application
+                // the user is actually typing into. The foreground right was
+                // already handed over with `AllowSetForegroundWindow` above,
+                // so the plain activation is normally enough anyway.
                 super::window_chrome::force_foreground(hwnd);
                 return Activation::Activated;
             }

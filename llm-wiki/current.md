@@ -51,16 +51,55 @@ cost while it is there. Treat every line as a rule, not a description.
     watch on the IFEO root drives the transition — no polling, and no registry
     read on the input path. The hook callback allocates nothing, locks nothing
     and reads one atomic; everything else happens on `tm-hotkey-worker`.
+  - `tm-hotkey-hook` is exempt from EcoQoS
+    (`SetThreadInformation(ThreadPowerThrottling, ControlMask=EXECUTION_SPEED,
+    StateMask=0)`). It is the ONE thread pushed that way, and it is the
+    opposite of what the sampler gets, for the opposite reason: it is not doing
+    TaskMan's work, it is on the path of every keystroke on the desktop.
+    `THREAD_PRIORITY_HIGHEST` does not cover this — priority picks which
+    runnable thread runs, QoS picks how fast the core under it is clocked, and
+    Windows throttles a process it considers background, which is what a tray
+    icon is. Scoped to the thread on purpose; the PROCESS must stay
+    system-managed or `set_sampler_background` is undone.
+  - Nothing blocking runs on `tm-hotkey-hook` while a hook is installed. Between
+    `SetWindowsHookExW` returning and the next `GetMessageW` there is no
+    keyboard input on this machine, so `set_hook` logs BEFORE installing and
+    only after removing.
   - The strict-topmost `SetWinEventHook`s are down to `EVENT_SYSTEM_FOREGROUND`
     and `EVENT_OBJECT_SHOW`, and are unhooked when always-on-top is switched
     off. `EVENT_OBJECT_REORDER` was removed: it fires for z-order churn inside
     other processes' windows (lists, trees, tab strips) and every one of them
     cost a cross-process marshal into this process before the callback could
     decide it was uninteresting.
-- **`tm-hotkey-worker` pumps its own message queue.** Not cosmetic:
-  `force_foreground` attaches this thread's input queue to the foreground
-  application's, and a thread that does not pump while two queues are merged is
-  how the OTHER application ends up unable to process input.
+- **Merging input queues is opt-in, and `tm-hotkey-worker` is the only caller.**
+  `AttachThreadInput` makes two threads stop responding together (MSDN), and the
+  queue being merged with is the FOREGROUND application's — the game or editor
+  the user is typing into. So `window_chrome::force_foreground` does NOT attach;
+  `force_foreground_attached` does, and only the hotkey worker may call it,
+  because it is the only caller that pumps its own queue. Two further
+  conditions are enforced inside: a hung window on EITHER side cancels the
+  merge (the blocking call is against the TARGET, so a target that cannot
+  answer decides how long the foreground stays wedged), and the show/restore/
+  re-stack calls — which wait on the target's thread — run BEFORE the attach,
+  leaving only the two activation calls inside it.
+- **No `ViewportCommand::Focus` on the restore path, ever.** winit's
+  `focus_window` ends in `force_window_active`, which `SendInput`s a synthetic
+  left-Alt press and release into the system input stream. That Alt lands in
+  whatever still holds focus — on this path, by definition another application
+  — and a bare Alt opens the menu bar in Explorer, browsers and most Win32
+  apps, swallowing the user's next keystroke. `force_foreground` does strictly
+  more and injects nothing. The `if !window.has_focus()` guard does not help:
+  `has_focus` is a cached flag updated by window messages and the UI thread has
+  not pumped yet at that point. (Unpatched upstream behaviour in
+  `vendor/winit`; deliberately fixed on our side instead of adding a second
+  fork patch.)
+- **TaskMan refuses to suspend or throttle itself.** `process_ops::refuse_self`
+  rejects Suspend, priority, affinity and Efficiency mode aimed at
+  `std::process::id()`, and `app.rs` skips its own pid when replaying saved
+  per-image rules. Not paternalism: while the replacement is registered those
+  changes stall or throttle the thread every keystroke on the desktop goes
+  through, and the UI that would undo it is the one being stopped. The
+  repairing directions (resume, Efficiency mode off) stay allowed.
 - **The broker's trace watchdogs die with their trace.** `spawn_trace_watchdog`
   (core_service.rs) sleeps straight to the idle deadline and returns once it
   has stopped the session, instead of polling every 5 s for the service's

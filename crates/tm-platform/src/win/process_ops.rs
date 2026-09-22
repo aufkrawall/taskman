@@ -90,6 +90,33 @@ pub fn is_critical(pid: u32) -> Option<bool> {
     }
 }
 
+/// Refuse a scheduling or lifetime change aimed at TaskMan's own process.
+///
+/// Not paternalism about a user shooting their own foot: the blast radius is
+/// the whole desktop. While TaskMan is the registered Task Manager
+/// replacement it owns a `WH_KEYBOARD_LL` hook, and EVERY keystroke on the
+/// machine is routed through the `tm-hotkey-hook` thread before it reaches the
+/// application the user is typing into (see [`crate::win::hotkey_hook`]).
+/// Suspending that process stops the hook thread outright, so every keystroke
+/// stalls until Windows' `LowLevelHooksTimeout` gives up on it — and the UI
+/// that would undo it is the one that was just suspended. Idle priority, a
+/// single-processor affinity mask and EcoQoS do the same thing more quietly
+/// and without ever stopping.
+///
+/// Enforced here rather than in the UI because this is the one place every
+/// entry point passes through: the context menus, the batch paths, and the
+/// saved per-image rules replayed at startup.
+fn refuse_self(action: &'static str, pid: u32) -> Result<()> {
+    if pid != std::process::id() {
+        return Ok(());
+    }
+    Err(TmError::platform(
+        action,
+        "refusing to change TaskMan's own scheduling: it would delay keyboard \
+         input for every application on the desktop",
+    ))
+}
+
 /// Open and identity-check the exact handle that will perform a destructive
 /// action, then establish critical-process state on that same handle.
 fn open_destructive_process_verified(
@@ -1354,6 +1381,11 @@ pub fn suspend_process_checked(
     expected_start_epoch_s: Option<i64>,
     suspend: bool,
 ) -> Result<()> {
+    if suspend {
+        // Only the suspend direction: resuming is the repair, and refusing it
+        // would be refusing to undo somebody else's mistake.
+        refuse_self("suspend", pid)?;
+    }
     let f = ntdll_fn(if suspend {
         "NtSuspendProcess"
     } else {
@@ -1428,6 +1460,7 @@ pub fn set_priority_checked(
     expected_start_epoch_s: Option<i64>,
     priority: PriorityClass,
 ) -> Result<()> {
+    refuse_self("SetPriorityClass", pid)?;
     if priority == PriorityClass::Unknown {
         return Err(TmError::platform(
             "SetPriorityClass",
@@ -1493,6 +1526,7 @@ pub fn set_affinity_checked(
     expected_start_epoch_s: Option<i64>,
     mask: u64,
 ) -> Result<()> {
+    refuse_self("SetProcessAffinityMask", pid)?;
     let native_mask = usize::try_from(mask)
         .map_err(|_| TmError::platform("SetProcessAffinityMask", "mask is out of range"))?;
     if native_mask == 0 {
@@ -1525,6 +1559,11 @@ pub fn set_efficiency_mode_checked(
     expected_start_epoch_s: Option<i64>,
     on: bool,
 ) -> Result<()> {
+    if on {
+        // Only the enabling direction, for the same reason as suspend: turning
+        // it back off is the repair.
+        refuse_self("SetProcessInformation(EcoQoS)", pid)?;
+    }
     use windows::Win32::System::Threading::{
         PROCESS_POWER_THROTTLING_CURRENT_VERSION, PROCESS_POWER_THROTTLING_EXECUTION_SPEED,
         PROCESS_POWER_THROTTLING_STATE, ProcessPowerThrottling, SetProcessInformation,
@@ -2483,6 +2522,35 @@ fn split_command(cmd: &str) -> (String, Option<String>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every scheduling change that can stall the `WH_KEYBOARD_LL` hook
+    /// thread must refuse this process, because the cost is paid by every
+    /// application on the desktop and not by TaskMan. The repairing direction
+    /// of the two reversible ones stays available.
+    #[test]
+    fn scheduling_changes_aimed_at_this_process_are_refused() {
+        let me = std::process::id();
+
+        assert!(suspend_process_checked(me, None, true).is_err(), "suspend");
+        assert!(
+            set_priority_checked(me, None, PriorityClass::Low).is_err(),
+            "priority"
+        );
+        assert!(set_affinity_checked(me, None, 1).is_err(), "affinity");
+        assert!(
+            set_efficiency_mode_checked(me, None, true).is_err(),
+            "efficiency mode"
+        );
+
+        // The way back out is not a scheduling change that can strand the
+        // hook thread, so it is not refused. Both are no-ops on a process
+        // that is neither suspended nor throttled.
+        assert!(suspend_process_checked(me, None, false).is_ok(), "resume");
+        assert!(
+            set_efficiency_mode_checked(me, None, false).is_ok(),
+            "efficiency mode off"
+        );
+    }
 
     /// The User column was empty for most of the process list because the
     /// only source was sysinfo's token read. This asserts the native path

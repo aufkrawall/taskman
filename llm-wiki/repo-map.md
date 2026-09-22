@@ -56,7 +56,8 @@ platform boundary (`tm-core` ← `tm-platform` ← `tm-app` / `tm-service`):
     (PDH split GpuPdh/DiskPdh groups with demand gating + LUID-preserving
     GPU instance parser), `gpu.rs` (DXGI discovery + LUID-keyed merge,
     busiest-engine semantics), `process_ops.rs` (kill/suspend/priority/
-    affinity/EcoQoS/UAC virtualization/token security, `token_identity`
+    affinity/EcoQoS/UAC virtualization/token security, with `refuse_self`
+    rejecting the scheduling changes that would stall the keyboard hook thread, `token_identity`
     (account + string SID) and `IsProcessCritical`, SCM service catalog
     mapping PID → executable path, hosted service display name(s) and
     configured account, identity-safe minidumps, ToolHelp module
@@ -95,15 +96,20 @@ platform boundary (`tm-core` ← `tm-platform` ← `tm-app` / `tm-service`):
     with the same application user model id claims it — the minimized-app
     case),
     `window_chrome.rs` (DWM caption colour / dark mode / backdrop / cloaking,
-    `force_foreground` via `AttachThreadInput` + `SwitchToThisWindow` over fullscreen games
-    — never attaching to a foreground window that is already hung, and only ever
-    called from a thread that pumps messages — plus an event-driven strict-topmost
+    `force_foreground` (never merges input queues; safe from any thread) and
+    `force_foreground_attached` (`AttachThreadInput` + `SwitchToThisWindow` over
+    fullscreen games, hotkey worker only because it is the only caller that
+    pumps its own queue; refused when EITHER window is hung, and the blocking
+    show/restore/re-stack calls run outside the merge) — plus an event-driven strict-topmost
     keeper that reasserts the root HWND on foreground/show events and UNHOOKS itself
     when always-on-top is turned off),
     `hotkey_hook.rs` (dedicated `WH_KEYBOARD_LL` thread intercepting Ctrl+Shift+Esc,
     installed only while the IFEO replacement is registered and driven by a
     `RegNotifyChangeKeyValue` watch rather than polling; bypasses shell hotkey
-    suppression in exclusive/borderless fullscreen games),
+    suppression in exclusive/borderless fullscreen games. The hook thread is
+    exempted from EcoQoS — it carries every keystroke on the desktop, and a tray
+    icon is exactly what Windows throttles — and nothing blocking, `tracing`
+    included, runs on it while a hook is installed),
     `version.rs` (cached PE metadata). Linux/macOS backends exist and are
     built by default (`build.py`).
 - `crates/tm-app`

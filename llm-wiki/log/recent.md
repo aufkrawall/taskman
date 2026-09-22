@@ -1,3 +1,64 @@
+
+- 2026-09-22: System-wide keyboard-latency audit of everything TaskMan puts on
+  the desktop's input path, and six fixes. The `WH_KEYBOARD_LL` callback itself
+  was already clean; every finding was around it. Verified on the dev box that
+  the IFEO registration was live, so the hook WAS installed and
+  `GetProcessInformation(ProcessPowerThrottling)` on the running GUI returned
+  `ControlMask=0` — system-managed, i.e. throttleable.
+  - **The hook thread was subject to EcoQoS.** Windows throttles a process it
+    considers background; a task manager in the tray is exactly that, and
+    `THREAD_PRIORITY_HIGHEST` is a scheduling knob, not a QoS one. The thread
+    carrying every keystroke on the machine was therefore parked on an
+    efficiency core at reduced clock whenever the app was idle — its designed
+    resting state. Now opted out per-THREAD; opting out the process would undo
+    `set_sampler_background`.
+  - **Nothing stopped TaskMan suspending or throttling itself.** Only `unload
+    module` and tree-kill descendants guarded `std::process::id()`; Suspend,
+    priority, affinity and EcoQoS did not, and `open_destructive_process_verified`
+    only refuses `IsProcessCritical` targets. Suspending the running copy
+    freezes the hook thread, so every keystroke on the desktop stalls for
+    `LowLevelHooksTimeout` until Windows silently drops the hook — and the
+    window that would undo it is the suspended one. Worse, priority and affinity
+    persist through "Save for this program" and `apply_process_rules` had no
+    self-exclusion, so the setting came back on every launch. `refuse_self` sits
+    in `process_ops` because that is the one place all entry points cross.
+    Repairing directions stay allowed.
+  - **`force_foreground` violated its own documented contract at three call
+    sites.** The worst was `instance.rs` handshake: a launcher thread with no
+    message loop, reached only AFTER `FIRST_ACK_MS` proved the primary's UI
+    thread slow, merging its input queue with the foreground GAME's and then
+    blocking in cross-thread `ShowWindow`/`SetWindowPos`/`SetForegroundWindow`
+    against that slow thread. The `fg_hung` guard did not help: it watches the
+    wrong side (the block is on the target) and `IsHungAppWindow` needs ~5 s.
+    Split into `force_foreground` (never attaches, safe anywhere) and
+    `force_foreground_attached` (hotkey worker only); blocking window ops moved
+    out of the merge; a hung window on either side now cancels it.
+  - **Raising the window injected a real Alt keypress into the foreground app.**
+    `ViewportCommand::Focus` → egui-winit → winit `force_window_active`, which
+    `SendInput`s left-Alt down/up to beat the foreground lock. Fires exactly in
+    the exclusive-fullscreen case the hotkey exists for, and a bare Alt opens
+    the menu bar in most Win32 apps, eating the next keystroke. Command removed;
+    `force_foreground` already did more. `vendor/winit` deliberately NOT patched
+    a second time — see `TASKMAN-FORK.md`, the fork is one change.
+  - **A swallowed Escape press whose release landed elsewhere ate a stranger's
+    release.** `CONSUMED_DOWN` was spent by the next Escape key-up anywhere once
+    the matching one was delivered on the UAC secure desktop / lock screen /
+    another session. That application then saw Escape pressed and never
+    released. The key-up is now only swallowed while it still matches a press
+    inside `CONSUMED_DOWN_TTL_MS` (1 s, the same window auto-repeat already
+    refreshes).
+  - **`tracing` ran on the hook thread with a hook installed.** `set_hook` logged
+    AFTER `SetWindowsHookExW` succeeded, and between that and the next
+    `GetMessageW` no keystroke on the machine can be delivered. Logging moved
+    ahead of the install; the removal path already unhooks first.
+  - Checked and cleared, so it is not re-investigated: raw input (winit defaults
+    to `DeviceEvents::WhenFocused`, so `RIDEV_DEVNOTIFY` without `INPUTSINK`);
+    the ETW sessions (64 KB x 4-16 buffers, 1 s flush, demand-gated); the tray
+    thread's `TrackPopupMenuEx` (already isolated); `SystemParametersInfoW`
+    (read-only, no `SPIF_SENDCHANGE`); the per-image affinity rule engine (exact
+    exe path, once per process identity); and the callback's non-Escape fast
+    path.
+
 - 2026-09-22: Completed default integration from `aufkrawall/llm-prompt-templates`: added root `CHANGELOG.md`, `llm-wiki/changelog-guidelines.md`, and `llm-wiki/secret-leak-prevention.md`; added `tools/tests/test-debug-tool-discovery.ps1` for discovery regression testing; updated `llm-wiki/index.md` catalog; and merged mandatory secret-leak check and changelog commit gates into `AGENTS.md`.
 - 2026-09-21: Diagnostics pass. The app had a complete logging subsystem that produced exactly one line per run, and no crash record at all; both are fixed, plus four smaller findings from the same review.
   - **Every log file on disk held one line.** Two independent defects. (1) `tm-app/main.rs` bound the appender guard to a `let _log_guard` INSIDE the `if selfcheck || verbose` block, so it dropped one line later; `tracing_appender`'s non-blocking writer is lossy, so every record after that was silently discarded — including `tracing::info!("taskman starting")` on the next line. The `_` prefix is why no unused warning ever fired. (2) `attach_file_logging` had ZERO callers, so a normal GUI launch (`init_early(false)`) wrote nothing at all: ring sink, no console, no file. Verified against the real logs in `%LOCALAPPDATA%	askman\logs`, every one of which contained only "logging initialized". The guard now lives in a process-lifetime static in `tm-core::logging` and is returned to nobody; `init`/`init_in_dir`/`attach_file_logging` return `bool`, `shutdown()` is the controlled flush (called from `TaskManApp::shutdown` last, after everything that might still log), and `app.rs` attaches the file sink on the frame that starts the engine — same reason the engine starts there, the directory and appender are disk I/O that must not sit on the path to the first frame. Regression test `logging_keeps_recording_after_init_returns` fails against the old behavior (verified by reintroducing the early drop).

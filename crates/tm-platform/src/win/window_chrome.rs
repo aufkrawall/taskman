@@ -296,31 +296,71 @@ pub fn set_cloaked(hwnd: isize, cloaked: bool) {
     );
 }
 
-/// Force `hwnd` to the foreground even if an exclusive or borderless fullscreen
-/// 3D application (like a game) currently holds focus.
+/// Whether an activation may merge input queues to beat the foreground lock.
 ///
 /// Under standard Windows foreground lock rules, background processes cannot
 /// steal the foreground. When a game runs in exclusive or borderless fullscreen,
 /// typical `SetForegroundWindow` calls are dropped or result in flashing taskbar
-/// buttons. By temporarily attaching thread input to both the current foreground
-/// window's thread and the target window's thread, and calling `SwitchToThisWindow`,
-/// the OS grants the foreground switch directly over the fullscreen surface.
+/// buttons. Temporarily attaching thread input to both the current foreground
+/// window's thread and the target window's thread, and then calling
+/// `SwitchToThisWindow`, makes the OS grant the switch directly over the
+/// fullscreen surface — which is the whole reason the Ctrl+Shift+Esc hook
+/// exists.
 ///
-/// ## Two rules for the caller
+/// ## Why it is opt-in
 ///
-/// `AttachThreadInput` MERGES two input queues. While they are merged, a
-/// caller that does not pump messages is a caller that can wedge the other
-/// application's input processing, and the activation calls below can
-/// themselves block on the other side's message pump. So:
+/// `AttachThreadInput` MERGES two input queues, and MSDN is blunt about what
+/// that costs: threads that share an input queue stop responding together. The
+/// queue this merges with is the FOREGROUND application's — the game or editor
+/// the user is typing into — so every instruction executed between the attach
+/// and the detach is time that application cannot process a keystroke.
 ///
-/// * the calling thread must pump its own message queue (the hotkey worker
-///   does, for exactly this reason), and
-/// * a foreground window that is ALREADY not pumping is never attached to.
-///   That is the one case where merging queues buys nothing and risks
-///   everything: the window whose thread is stuck is precisely the one whose
-///   queue must not be joined to ours. The activation still runs, it just
-///   runs without the foreground-lock bypass.
+/// That is affordable only under all three of these, which is why the merge is
+/// [`InputAttach::Allowed`] at exactly one call site and not a default:
+///
+/// * **The calling thread pumps its own message queue.** The hotkey worker
+///   does; the launcher's startup thread and the UI thread inside `update()`
+///   do not.
+/// * **Neither side is already stuck.** A hung window's thread is not pumping,
+///   and joining our queue to it is how one stuck application takes the
+///   desktop's input with it. Both the foreground AND the target are checked:
+///   the call this function blocks in is against the TARGET, so a target that
+///   cannot answer is the one that decides how long the foreground stays
+///   wedged.
+/// * **Nothing that can block on another thread runs while merged.** Showing,
+///   restoring and re-stacking the window all send messages to the target's
+///   thread and wait for them, so they run BEFORE the attach. Only the two
+///   activation calls — the ones that actually need the merged queues to
+///   bypass the foreground lock — run inside it.
+///
+/// Callers that cannot meet the first condition use [`force_foreground`],
+/// which does everything except the merge. It still shows, restores, re-stacks
+/// and activates; it just cannot override the foreground lock, so over an
+/// exclusive-fullscreen window it may flash the taskbar button instead of
+/// switching. That is the correct trade for a thread that would otherwise
+/// freeze the foreground application's keyboard.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum InputAttach {
+    /// The calling thread pumps its own message queue and may merge input
+    /// queues to bypass the foreground lock.
+    Allowed,
+    /// The calling thread does not pump. Never merge input queues.
+    Forbidden,
+}
+
+/// Activate `hwnd` without merging input queues. Safe from any thread.
 pub fn force_foreground(hwnd: isize) {
+    activate(hwnd, InputAttach::Forbidden);
+}
+
+/// Activate `hwnd`, merging input queues to bypass the foreground lock.
+///
+/// Only from a thread that pumps its own message queue — see [`InputAttach`].
+pub fn force_foreground_attached(hwnd: isize) {
+    activate(hwnd, InputAttach::Allowed);
+}
+
+fn activate(hwnd: isize, attach: InputAttach) {
     if hwnd == 0 {
         return;
     }
@@ -330,33 +370,9 @@ pub fn force_foreground(hwnd: isize) {
             return;
         }
 
-        let cur_thread = windows::Win32::System::Threading::GetCurrentThreadId();
-        let fg_hwnd = windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow();
-        let fg_thread = if fg_hwnd.0.is_null() {
-            0
-        } else {
-            windows::Win32::UI::WindowsAndMessaging::GetWindowThreadProcessId(fg_hwnd, None)
-        };
-        let target_thread =
-            windows::Win32::UI::WindowsAndMessaging::GetWindowThreadProcessId(target, None);
-
-        // A hung foreground window's thread is not pumping; joining our input
-        // queue to it is how a stuck game takes the desktop's input with it.
-        let fg_hung = !fg_hwnd.0.is_null()
-            && windows::Win32::UI::WindowsAndMessaging::IsHungAppWindow(fg_hwnd).as_bool();
-        let attached_fg = if fg_thread != 0 && fg_thread != cur_thread && !fg_hung {
-            windows::Win32::System::Threading::AttachThreadInput(cur_thread, fg_thread, true)
-                .as_bool()
-        } else {
-            false
-        };
-        let attached_target = if target_thread != 0 && target_thread != cur_thread {
-            windows::Win32::System::Threading::AttachThreadInput(cur_thread, target_thread, true)
-                .as_bool()
-        } else {
-            false
-        };
-
+        // Everything up to here can send messages to the target's thread and
+        // block until that thread answers, so it all happens BEFORE any queue
+        // is merged. None of it needs the foreground grant.
         let is_minimized = IsIconic(target).as_bool();
         if is_minimized {
             let _ = windows::Win32::UI::WindowsAndMessaging::ShowWindow(
@@ -382,6 +398,23 @@ pub fn force_foreground(hwnd: isize) {
                 | windows::Win32::UI::WindowsAndMessaging::SWP_SHOWWINDOW,
         );
         let _ = windows::Win32::UI::WindowsAndMessaging::BringWindowToTop(target);
+
+        let (cur_thread, fg_thread, target_thread) = if attach == InputAttach::Allowed {
+            attachable_threads(target)
+        } else {
+            (0, 0, 0)
+        };
+        let attached_fg = fg_thread != 0
+            && windows::Win32::System::Threading::AttachThreadInput(cur_thread, fg_thread, true)
+                .as_bool();
+        let attached_target = target_thread != 0
+            && windows::Win32::System::Threading::AttachThreadInput(
+                cur_thread,
+                target_thread,
+                true,
+            )
+            .as_bool();
+
         let _ = windows::Win32::UI::WindowsAndMessaging::SetForegroundWindow(target);
 
         if let Ok(user32) =
@@ -407,6 +440,52 @@ pub fn force_foreground(hwnd: isize) {
                 false,
             );
         }
+    }
+}
+
+/// The threads this activation may merge its input queue with: `(current,
+/// foreground, target)`, where a zero means "do not attach to that one".
+///
+/// A thread is refused when it is this one (merging a queue with itself is a
+/// no-op the detach would then have to guess about) or when its window is
+/// hung, because the point of the merge is that both sides keep pumping.
+unsafe fn attachable_threads(target: HWND) -> (u32, u32, u32) {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GetForegroundWindow, GetWindowThreadProcessId, IsHungAppWindow,
+    };
+
+    unsafe {
+        let cur_thread = windows::Win32::System::Threading::GetCurrentThreadId();
+
+        // A hung TARGET disqualifies the whole merge, not just its own
+        // attachment: the activation calls run against the target, so a target
+        // that cannot answer them is what would hold the foreground
+        // application's queue merged with ours for the duration.
+        if IsHungAppWindow(target).as_bool() {
+            return (cur_thread, 0, 0);
+        }
+        let target_thread = GetWindowThreadProcessId(target, None);
+
+        let fg_hwnd = GetForegroundWindow();
+        let fg_thread = if fg_hwnd.0.is_null() || IsHungAppWindow(fg_hwnd).as_bool() {
+            0
+        } else {
+            GetWindowThreadProcessId(fg_hwnd, None)
+        };
+
+        (
+            cur_thread,
+            if fg_thread == cur_thread {
+                0
+            } else {
+                fg_thread
+            },
+            if target_thread == cur_thread {
+                0
+            } else {
+                target_thread
+            },
+        )
     }
 }
 

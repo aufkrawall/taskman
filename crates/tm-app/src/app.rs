@@ -1042,6 +1042,14 @@ impl TaskManApp {
 
         let mut pending = Vec::new();
         for process in &snapshot.processes {
+            // A rule saved against taskman.exe would otherwise be replayed
+            // against THIS copy on every launch. The platform layer refuses
+            // it (it would throttle the thread that carries every keystroke
+            // on the desktop), so without this the only effect is three
+            // failed attempts and a toast, every single start.
+            if process.pid == std::process::id() {
+                continue;
+            }
             let (Some(start_epoch_s), Some(path)) = (process.start_epoch_s, &process.exe_path)
             else {
                 continue;

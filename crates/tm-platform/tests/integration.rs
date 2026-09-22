@@ -424,23 +424,64 @@ fn efficiency_mode_state_is_known_for_own_process() {
         "own process must report a KNOWN, not-throttled efficiency state"
     );
 
-    // Toggling it on must be observable. A FRESH collector is used because
-    // the sampler caches per-pid attributes for ATTR_REFRESH_TTL; the test
-    // asserts the query, not the cache.
+    // Toggling it on must be observable. On a CHILD, not on this process:
+    // `process_ops::refuse_self` rejects throttling the running copy, because
+    // in the shipped binary that is the process carrying the
+    // `WH_KEYBOARD_LL` hook for the whole desktop. A child also exercises the
+    // cross-process path the UI actually takes. A FRESH collector is used
+    // because the sampler caches per-pid attributes for ATTR_REFRESH_TTL; the
+    // test asserts the query, not the cache.
     let actions = tm_platform::create_actions();
+    let mut child = std::process::Command::new("cmd")
+        .args(["/C", "ping", "-n", "30", "127.0.0.1"])
+        .stdout(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn");
+    let child_pid = child.id();
+    wait_until_visible(child_pid);
+
     actions
-        .set_efficiency_mode(me, true)
+        .set_efficiency_mode(child_pid, true)
         .expect("enable EcoQoS");
     let mut collector = tm_platform::create_collector();
     let snap = collector.sample(std::time::Instant::now()).expect("tick 2");
     let observed = snap
         .processes
         .iter()
-        .find(|p| p.pid == me)
-        .expect("own")
+        .find(|p| p.pid == child_pid)
+        .expect("child")
         .power_throttled;
-    actions.set_efficiency_mode(me, false).expect("disable");
+    actions
+        .set_efficiency_mode(child_pid, false)
+        .expect("disable");
+    let _ = actions.kill_single(child_pid);
+    let _ = child.wait();
     assert_eq!(observed, Some(true), "enabled EcoQoS must be read back");
+}
+
+/// The shipped binary routes every keystroke on the desktop through its
+/// `tm-hotkey-hook` thread whenever it is the registered Task Manager
+/// replacement, so the scheduling changes that could stall or throttle that
+/// thread must refuse this process through the public action surface too —
+/// not only through `process_ops`.
+#[cfg(target_os = "windows")]
+#[test]
+fn scheduling_actions_aimed_at_the_running_copy_are_refused() {
+    let actions = tm_platform::create_actions();
+    let me = std::process::id();
+
+    assert!(actions.suspend_process(me, true).is_err(), "suspend");
+    assert!(
+        actions
+            .set_priority(me, tm_core::model::PriorityClass::Low)
+            .is_err(),
+        "priority"
+    );
+    assert!(actions.set_affinity_mask(me, 1).is_err(), "affinity");
+    assert!(
+        actions.set_efficiency_mode(me, true).is_err(),
+        "efficiency mode"
+    );
 }
 
 #[cfg(target_os = "windows")]

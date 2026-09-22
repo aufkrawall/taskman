@@ -1183,14 +1183,30 @@ impl NativeApp {
             self.uncloak_in = 2;
         }
         ctx.send_viewport_cmd(eframe::egui::ViewportCommand::Visible(true));
-        // Un-minimize BEFORE asking for focus. Focus is a no-op on a
-        // minimized window (winit checks that explicitly), which is why a
-        // hotkey press used to leave a minimized task manager exactly where
-        // it was.
+        // Un-minimize before activating. Activation is a no-op on a minimized
+        // window (winit checks that explicitly), which is why a hotkey press
+        // used to leave a minimized task manager exactly where it was.
         ctx.send_viewport_cmd(eframe::egui::ViewportCommand::Minimized(false));
-        ctx.send_viewport_cmd(eframe::egui::ViewportCommand::Focus);
+        // NO `ViewportCommand::Focus` here, and it must not come back.
+        // winit's `focus_window` ends in `force_window_active`, which SYNTHESIZES
+        // a left-Alt press and release into the system input stream with
+        // `SendInput` to shake off the foreground lock. That Alt is delivered to
+        // whichever application still holds focus — and on this path that is by
+        // definition another one, usually the fullscreen game the user just hit
+        // Ctrl+Shift+Esc in. A bare Alt opens the menu bar in Explorer, in
+        // browsers and in most Win32 apps, which then swallows the user's next
+        // keystroke. `force_foreground` below does strictly more than winit's
+        // `SetForegroundWindow` and injects nothing, so the command bought
+        // nothing but that side effect. (The guard `if !window.has_focus()`
+        // does not save it: `has_focus` is a cached flag updated by window
+        // messages, and this thread has not pumped since `force_foreground`
+        // ran, so it still reads false.)
         #[cfg(target_os = "windows")]
         if let Some(hwnd) = self.hwnd {
+            // The non-attaching activation: this is the UI thread inside
+            // `update()`, which does not pump its message queue until the
+            // frame ends. The hotkey worker does the attaching one, and it is
+            // the only caller that may.
             tm_platform::force_foreground(hwnd);
         }
         // Tell a waiting launch that the request has been processed by the

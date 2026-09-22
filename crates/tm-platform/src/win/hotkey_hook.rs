@@ -29,14 +29,31 @@
 //!   event and returns. Everything the hotkey actually DOES — raising the
 //!   window, attaching thread input — happens on the worker thread, which
 //!   pumps its own message queue precisely so that attaching to another
-//!   application's input queue cannot stall that application.
+//!   application's input queue cannot stall that application. It is the only
+//!   caller in the codebase allowed to use
+//!   [`super::window_chrome::force_foreground_attached`].
+//!
+//! Two smaller rules fall out of the same reasoning and are easy to undo by
+//! accident, so they are written down here as well:
+//!
+//! * **Nothing blocking runs on the hook THREAD while a hook is installed.**
+//!   Between `SetWindowsHookExW` returning and the thread's next
+//!   `GetMessageW` there is no keyboard input on this machine, so the one
+//!   call in `set_hook` that takes locks and can reach a file — `tracing` —
+//!   is issued before the hook exists, never after.
+//! * **The thread is opted out of EcoQoS.** Windows throttles a process it
+//!   considers background, which is the resting state of a task manager in
+//!   the notification area, and `THREAD_PRIORITY_HIGHEST` does not cover
+//!   that; see [`opt_out_of_power_throttling`].
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, AtomicU64, Ordering};
 use windows::Win32::Foundation::{CloseHandle, HANDLE, LPARAM, LRESULT, WAIT_OBJECT_0, WPARAM};
 use windows::Win32::System::SystemInformation::GetTickCount64;
 use windows::Win32::System::Threading::{
-    CreateEventW, GetCurrentThread, SetEvent, SetThreadPriority, THREAD_PRIORITY_HIGHEST,
+    CreateEventW, GetCurrentThread, SetEvent, SetThreadInformation, SetThreadPriority,
+    THREAD_POWER_THROTTLING_CURRENT_VERSION, THREAD_POWER_THROTTLING_EXECUTION_SPEED,
+    THREAD_POWER_THROTTLING_STATE, THREAD_PRIORITY_HIGHEST, ThreadPowerThrottling,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetAsyncKeyState, VK_CONTROL, VK_ESCAPE, VK_LWIN, VK_MENU, VK_RWIN, VK_SHIFT,
@@ -71,6 +88,12 @@ const WM_SET_HOOK: u32 = WM_APP + 1;
 /// Only ever used on that fallback path; with the watch in place the worker
 /// waits indefinitely and is woken by the change itself.
 const UNWATCHED_POLL_MS: u32 = 5_000;
+
+/// How long a swallowed Escape press stays eligible to have its release
+/// swallowed too. Auto-repeat refreshes [`LAST_DOWN_TICK`] roughly every 30 ms
+/// while the combo is held, so a genuine press-and-hold never ages out; only a
+/// press whose release was delivered somewhere this hook cannot see does.
+const CONSUMED_DOWN_TTL_MS: u64 = 1_000;
 
 pub struct HotkeyHook {
     hook_thread_id: u32,
@@ -156,6 +179,7 @@ fn hook_thread(thread_id: &AtomicU32, ready: &std::sync::mpsc::Sender<()>) {
     unsafe {
         let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
     }
+    opt_out_of_power_throttling();
 
     let tid = unsafe { windows::Win32::System::Threading::GetCurrentThreadId() };
     thread_id.store(tid, Ordering::Release);
@@ -183,19 +207,68 @@ fn hook_thread(thread_id: &AtomicU32, ready: &std::sync::mpsc::Sender<()>) {
     set_hook(&mut hook, false);
 }
 
+/// Take this thread out of Windows' managed power throttling (EcoQoS).
+///
+/// Priority and quality of service are different knobs, and only one of them
+/// was being set. Windows applies EcoQoS to a process it considers entirely
+/// background — which is exactly what a task manager parked in the
+/// notification area is — and a throttled thread is scheduled on an
+/// efficiency core at reduced frequency. `THREAD_PRIORITY_HIGHEST` does not
+/// change that: it decides WHICH runnable thread runs, not how fast the core
+/// underneath it is clocked.
+///
+/// For any other thread that would be the correct trade: the sampler is
+/// deliberately pushed the other way (see `win::set_sampler_background`).
+/// This one thread is different because it is not doing TaskMan's work — it
+/// is on the path of every keystroke on the desktop, and throttling it
+/// delays other applications' input, not ours. Scoped to the thread on
+/// purpose: opting the whole PROCESS out would undo the sampler's background
+/// mode and hand a tray icon full-speed cores again.
+fn opt_out_of_power_throttling() {
+    let state = THREAD_POWER_THROTTLING_STATE {
+        Version: THREAD_POWER_THROTTLING_CURRENT_VERSION,
+        // Take explicit control of execution speed, and set it to "not
+        // throttled": a zero StateMask under a set ControlMask is the
+        // documented opt-out, as opposed to a zero ControlMask, which means
+        // "let Windows decide" and is what this thread had before.
+        ControlMask: THREAD_POWER_THROTTLING_EXECUTION_SPEED,
+        StateMask: 0,
+    };
+    let result = unsafe {
+        SetThreadInformation(
+            GetCurrentThread(),
+            ThreadPowerThrottling,
+            std::ptr::from_ref(&state).cast(),
+            std::mem::size_of::<THREAD_POWER_THROTTLING_STATE>() as u32,
+        )
+    };
+    if let Err(error) = result {
+        // Not fatal, and not worth a warning: on a machine with no throttling
+        // policy to opt out of there is nothing lost.
+        tracing::debug!(%error, "hook thread could not opt out of power throttling");
+    }
+}
+
 /// Install or remove the keyboard hook, idempotently.
 fn set_hook(hook: &mut Option<HHOOK>, wanted: bool) {
     match (wanted, hook.take()) {
         (true, Some(existing)) => *hook = Some(existing),
         (true, None) => {
+            // Logged BEFORE the hook exists, never after. Everything this
+            // thread does between `SetWindowsHookExW` succeeding and its next
+            // `GetMessageW` is time no keystroke on the desktop can be
+            // delivered in, and `tracing` is the one call here that takes
+            // locks and can reach a file. The success case therefore says
+            // nothing more; this line and the warning below are an
+            // unambiguous pair.
+            tracing::info!("installing WH_KEYBOARD_LL hook for Ctrl+Shift+Esc");
             match unsafe {
                 SetWindowsHookExW(WH_KEYBOARD_LL, Some(low_level_keyboard_proc), None, 0)
             } {
-                Ok(installed) => {
-                    tracing::info!("WH_KEYBOARD_LL hook installed for Ctrl+Shift+Esc");
-                    *hook = Some(installed);
-                }
+                Ok(installed) => *hook = Some(installed),
                 Err(error) => {
+                    // Safe to log: no hook was installed, so this thread is
+                    // not on anybody's input path while it runs.
                     tracing::warn!(error = %error, "failed to install WH_KEYBOARD_LL hook")
                 }
             }
@@ -208,6 +281,8 @@ fn set_hook(hook: &mut Option<HHOOK>, wanted: bool) {
             // after this must pass through instead of being swallowed.
             CONSUMED_DOWN.store(false, Ordering::SeqCst);
             LAST_DOWN_TICK.store(0, Ordering::Relaxed);
+            // Safe to log here: the hook is already gone, so this thread is
+            // off the input path before `tracing` can take a lock.
             tracing::info!("WH_KEYBOARD_LL hook removed");
         }
         (false, None) => {}
@@ -257,7 +332,11 @@ fn worker_thread(event_raw: isize, registry_raw: isize, hook_thread_id: u32) {
                 }
                 let hwnd = super::instance::published_window();
                 if hwnd != 0 {
-                    super::window_chrome::force_foreground(hwnd);
+                    // The attaching variant: this is the fullscreen-game case
+                    // the hook exists for, and this thread pumps its own
+                    // queue, which is what makes merging input queues safe
+                    // here and nowhere else.
+                    super::window_chrome::force_foreground_attached(hwnd);
                 }
             }
             REGISTRY => {
@@ -406,8 +485,19 @@ unsafe extern "system" fn low_level_keyboard_proc(
         // Crucially, this must NOT depend on whether Ctrl or Shift is still
         // pressed, because users frequently release modifier keys before Escape.
         if msg == WM_KEYUP || msg == WM_SYSKEYUP {
-            LAST_DOWN_TICK.store(0, Ordering::Relaxed);
-            if CONSUMED_DOWN.swap(false, Ordering::SeqCst) {
+            let down_tick = LAST_DOWN_TICK.swap(0, Ordering::Relaxed);
+            let consumed = CONSUMED_DOWN.swap(false, Ordering::SeqCst);
+            // ...but it MUST depend on the release still belonging to a press
+            // this hook actually swallowed. A press consumed on this desktop
+            // whose release lands on another one — the UAC secure desktop
+            // after the hotkey elevates, the lock screen, a session switch —
+            // never reaches this callback, and the flag would then be spent
+            // on the next unrelated Escape release anywhere on the machine.
+            // The application under that one sees Escape pressed and never
+            // released. A release with no recent press is not ours.
+            let matches_recent_press = down_tick != 0
+                && unsafe { GetTickCount64() }.saturating_sub(down_tick) <= CONSUMED_DOWN_TTL_MS;
+            if consumed && matches_recent_press {
                 return LRESULT(1);
             }
         }
@@ -430,7 +520,7 @@ unsafe extern "system" fn low_level_keyboard_proc(
         {
             let now = unsafe { GetTickCount64() };
             let prev = LAST_DOWN_TICK.load(Ordering::Relaxed);
-            let is_stale = prev == 0 || (now.saturating_sub(prev) > 1000);
+            let is_stale = prev == 0 || (now.saturating_sub(prev) > CONSUMED_DOWN_TTL_MS);
             LAST_DOWN_TICK.store(now, Ordering::Relaxed);
 
             if !CONSUMED_DOWN.swap(true, Ordering::SeqCst) || is_stale {
@@ -453,6 +543,15 @@ unsafe extern "system" fn low_level_keyboard_proc(
 mod tests {
     use super::*;
 
+    /// The callback's state is process-global by design — it is read on the
+    /// system's input path, where a lock would be a liability. Tests that
+    /// drive it directly take this so they cannot interleave with each other.
+    static HOOK_STATE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn serialize() -> std::sync::MutexGuard<'static, ()> {
+        HOOK_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     #[test]
     fn hotkey_hook_installs_and_uninstalls_cleanly() {
         let hook = HotkeyHook::install(|| {});
@@ -472,7 +571,9 @@ mod tests {
 
     #[test]
     fn escape_keyup_clears_consumed_down_without_modifiers() {
+        let _serial = serialize();
         CONSUMED_DOWN.store(true, Ordering::SeqCst);
+        LAST_DOWN_TICK.store(unsafe { GetTickCount64() }, Ordering::Relaxed);
         let kbd = escape_event();
         let lparam = LPARAM(&kbd as *const _ as isize);
         let res =
@@ -486,12 +587,43 @@ mod tests {
         assert_eq!(res, LRESULT(0));
     }
 
+    /// The press this flag belongs to happened on a desktop whose release
+    /// this hook never sees — an elevation prompt, the lock screen, a session
+    /// switch. The flag must not then be spent on somebody else's Escape:
+    /// that application would see the key pressed and never released.
+    #[test]
+    fn escape_keyup_is_not_swallowed_for_a_press_whose_release_was_lost() {
+        let _serial = serialize();
+        CONSUMED_DOWN.store(true, Ordering::SeqCst);
+        // Older than the hold window, which is only reachable when the
+        // matching release was delivered somewhere else: auto-repeat would
+        // otherwise have refreshed this while the combo was held.
+        LAST_DOWN_TICK.store(
+            unsafe { GetTickCount64() }.saturating_sub(CONSUMED_DOWN_TTL_MS + 1),
+            Ordering::Relaxed,
+        );
+        let kbd = escape_event();
+        let lparam = LPARAM(&kbd as *const _ as isize);
+        let res =
+            unsafe { low_level_keyboard_proc(HC_ACTION as i32, WPARAM(WM_KEYUP as usize), lparam) };
+        assert_eq!(
+            res,
+            LRESULT(0),
+            "an unrelated Escape release must pass through"
+        );
+        assert!(
+            !CONSUMED_DOWN.load(Ordering::SeqCst),
+            "the stale flag must be cleared, not left to eat the next release too"
+        );
+    }
+
     /// The callback must never reach the registry, so the answer it uses is an
     /// atomic the worker maintains. With the replacement off, Escape has to
     /// pass straight through no matter which modifiers are down — otherwise a
     /// stale hook would eat the key for every application on the desktop.
     #[test]
     fn escape_passes_through_while_the_replacement_is_off() {
+        let _serial = serialize();
         CONSUMED_DOWN.store(false, Ordering::SeqCst);
         REPLACEMENT_ENABLED.store(false, Ordering::Release);
         let kbd = escape_event();
