@@ -76,12 +76,25 @@ cost while it is there. Treat every line as a rule, not a description.
   queue being merged with is the FOREGROUND application's — the game or editor
   the user is typing into. So `window_chrome::force_foreground` does NOT attach;
   `force_foreground_attached` does, and only the hotkey worker may call it,
-  because it is the only caller that pumps its own queue. Two further
-  conditions are enforced inside: a hung window on EITHER side cancels the
-  merge (the blocking call is against the TARGET, so a target that cannot
-  answer decides how long the foreground stays wedged), and the show/restore/
-  re-stack calls — which wait on the target's thread — run BEFORE the attach,
-  leaving only the two activation calls inside it.
+  because it is the only caller that pumps its own queue. Inside it: the merge
+  is with the FOREGROUND thread only (attachments chain, so also attaching the
+  target's thread put the game in one queue with TaskMan's UI thread —
+  `merge_partner` pins this), only `SetForegroundWindow` runs while merged, a
+  hung target cancels everything and a hung foreground cancels the merge. It
+  does NOT show/restore/raise: the UI thread answers the same hotkey through
+  its show request and does that itself (behind the anti-flash cloak).
+- **Nothing waits on another thread's window without a way out.**
+  `force_foreground` is synchronous only on the window's own thread; from any
+  other thread it uses `ShowWindowAsync`/`SWP_ASYNCWINDOWPOS` and skips a
+  target `IsHungAppWindow` reports. A cross-thread `ShowWindow`/`SetWindowPos`
+  waits with no timeout, and the target is TaskMan's own UI thread — the one
+  thing that may be wedged when a task manager is wanted.
+- **Ctrl+Shift+Esc is only swallowed when something will answer it.** The hook
+  passes the combo through to Explorer until the main window is published
+  (`hotkey_hook::set_target_window`, fed by `instance::publish_window`) and
+  while `WORKER_BUSY` says the previous press is still being served. Explorer
+  then starts the IFEO launcher, whose handshake finds a wedged instance
+  unresponsive and opens a fresh one.
 - **No `ViewportCommand::Focus` on the restore path, ever.** winit's
   `focus_window` ends in `force_window_active`, which `SendInput`s a synthetic
   left-Alt press and release into the system input stream. That Alt lands in

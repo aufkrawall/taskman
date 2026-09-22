@@ -327,8 +327,11 @@ fn read_primary_info(names: &Names) -> Option<PrimaryInfo> {
 
 /// Publish this process's window handle so later launches can tell a slow
 /// instance from a wedged one. Called once, as soon as the handle exists.
+/// It is also what arms the Ctrl+Shift+Esc hook: before this there is no UI
+/// to answer the combo, so the hook lets it through to Explorer.
 pub fn publish_window(hwnd: isize) {
     PUBLISHED_HWND.store(hwnd, Ordering::Release);
+    super::hotkey_hook::set_target_window(hwnd);
     let view = INFO_VIEW.load(Ordering::Acquire);
     if view == 0 {
         return;
@@ -676,6 +679,7 @@ pub fn poll_show_request() -> bool {
 impl Drop for Primary {
     fn drop(&mut self) {
         PUBLISHED_HWND.store(0, Ordering::Release);
+        super::hotkey_hook::set_target_window(0);
         SHOW_FALLBACK.store(0, Ordering::Release);
         ACK_EVENT.store(0, Ordering::Release);
         INFO_VIEW.store(0, Ordering::Release);

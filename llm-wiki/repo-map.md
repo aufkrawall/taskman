@@ -97,10 +97,10 @@ platform boundary (`tm-core` ← `tm-platform` ← `tm-app` / `tm-service`):
     case),
     `window_chrome.rs` (DWM caption colour / dark mode / backdrop / cloaking,
     `force_foreground` (never merges input queues; safe from any thread) and
-    `force_foreground_attached` (`AttachThreadInput` + `SwitchToThisWindow` over
-    fullscreen games, hotkey worker only because it is the only caller that
-    pumps its own queue; refused when EITHER window is hung, and the blocking
-    show/restore/re-stack calls run outside the merge) — plus an event-driven strict-topmost
+    `force_foreground_attached` (`AttachThreadInput` with the foreground thread
+    only + `SetForegroundWindow` over fullscreen games; activation only, hotkey
+    worker only because it is the only caller that pumps its own queue; refused
+    for a hung target) — plus an event-driven strict-topmost
     keeper that reasserts the root HWND on foreground/show events and UNHOOKS itself
     when always-on-top is turned off),
     `hotkey_hook.rs` (dedicated `WH_KEYBOARD_LL` thread intercepting Ctrl+Shift+Esc,

@@ -118,7 +118,8 @@ pub fn set_window_cloaked(hwnd: isize, cloaked: bool) {
 pub fn set_window_cloaked(_hwnd: isize, _cloaked: bool) {}
 
 /// Show, restore and activate `hwnd` without touching anyone else's input
-/// queue. Safe to call from any thread.
+/// queue. Safe to call from any thread; from a thread that does not own the
+/// window every request is posted, never waited on.
 #[cfg(target_os = "windows")]
 pub fn force_foreground(hwnd: isize) {
     win::window_chrome::force_foreground(hwnd);
@@ -127,12 +128,13 @@ pub fn force_foreground(hwnd: isize) {
 #[cfg(not(target_os = "windows"))]
 pub fn force_foreground(_hwnd: isize) {}
 
-/// As [`force_foreground`], but also merges input queues so the activation
-/// wins over fullscreen exclusive/borderless 3D games.
+/// Take the foreground for `hwnd` over fullscreen exclusive/borderless 3D
+/// games by briefly merging input queues with the foreground thread. Only
+/// activates: showing and restoring stay with the window's own thread.
 ///
 /// **Only from a thread that pumps its own message queue.** While the queues
 /// are merged the foreground application cannot process input either; see
-/// `win::window_chrome::InputAttach` for the full contract.
+/// `win::window_chrome::force_foreground_attached` for the full contract.
 #[cfg(target_os = "windows")]
 pub fn force_foreground_attached(hwnd: isize) {
     win::window_chrome::force_foreground_attached(hwnd);

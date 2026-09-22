@@ -4,6 +4,26 @@
 
 ### Fixed
 
+- **Ctrl+Shift+Esc dead while TaskMan was unresponsive:** if TaskMan's window
+  stopped responding, the next Ctrl+Shift+Esc left the thread that handles
+  the hotkey waiting on it indefinitely. From then on every press was
+  swallowed without effect — Explorer never got to start a fresh task
+  manager — and turning the Task Manager replacement off no longer removed
+  the keyboard hook. The hotkey thread no longer waits on the window, and the
+  combo now passes through to Windows whenever TaskMan cannot answer it
+  (still starting up, or still busy with the previous press), so a new
+  instance opens instead.
+- **Game input stalled while TaskMan took the foreground:** raising TaskMan
+  over a fullscreen game briefly shared the game's input queue with
+  TaskMan's own UI thread, so a slow TaskMan frame delayed the game's input
+  until the switch completed. Only the foreground thread is shared now, and
+  only for the single activation call.
+- **Escape stuck after releasing Ctrl+Shift first:** holding Escape after
+  letting go of Ctrl+Shift sent auto-repeat Escape presses to the focused app
+  but still swallowed the release, leaving Escape held down there.
+- **White flash when Ctrl+Shift+Esc restored TaskMan from the tray:** the
+  hotkey path showed the window before it had painted, bypassing the cloak
+  the tray restore uses; the window is now shown only by its own UI thread.
 - **Efficiency mode reporting success when nothing changed:** toggling
   Efficiency mode on a multi-selection discarded every per-process failure and
   toasted "changed for N processes" even when all of them were refused (target

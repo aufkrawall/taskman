@@ -1,4 +1,30 @@
 
+- 2026-09-23: Follow-up review of the Ctrl+Shift+Esc path (keyboard-latency
+  angle). Four fixes, all around the hook rather than in its callback:
+  - **The hotkey worker could block forever on TaskMan's own UI thread.**
+    `activate()` ran `ShowWindow`/`SetWindowPos`/`BringWindowToTop` against
+    the UI thread's window from the worker before its hung check; cross-thread
+    those wait with no timeout. A wedged UI therefore parked the worker for
+    good: the hook kept eating every Ctrl+Shift+Esc (so Explorer never started
+    a fresh task manager) and the IFEO watch went unserviced (so turning the
+    replacement off left the keyboard hook installed). The attached path now
+    only activates; the UI shows its own window. `force_foreground` posts
+    (`ShowWindowAsync`, `SWP_ASYNCWINDOWPOS`) from foreign threads.
+  - **The merge chained the game onto the UI thread.** It attached both the
+    foreground AND the target thread, so all three shared a queue and a slow
+    TaskMan frame stood between the game and its input until the detach
+    (`IsHungAppWindow` needs ~5 s to trip). Foreground thread only now.
+  - **The combo was swallowed when nothing could answer it** (before the
+    window existed, or while the worker was stuck). Now passed through to
+    Explorer in those states (`TARGET_WINDOW`, `WORKER_BUSY`).
+  - **Escape could stick after releasing Ctrl+Shift first.** Auto-repeat
+    presses reached the app but the release was still swallowed; any
+    delivered Escape press now clears the swallow.
+  - Side effect: the worker no longer shows a tray-hidden window, which had
+    shown it UNcloaked before the UI could cloak it (white flash, then a
+    two-frame blink when the UI cloaked the already-visible window).
+  - Unverifiable headlessly: foreground takeover over a real exclusive-
+    fullscreen game with the foreground-only merge — needs a manual check.
 - 2026-09-22: System-wide keyboard-latency audit of everything TaskMan puts on
   the desktop's input path, and six fixes. The `WH_KEYBOARD_LL` callback itself
   was already clean; every finding was around it. Verified on the dev box that

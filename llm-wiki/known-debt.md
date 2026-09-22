@@ -242,6 +242,14 @@ remain follow-up rather than being simulated in headless tests:
   applies ordinary band-1 topmost, and the settings dialog shows the existing
   "Takes effect at the next start." hint while the live value differs. Do not
   add polling or shell-fighting workarounds.
+- **Windows can drop the Ctrl+Shift+Esc hook without telling anyone**
+  (2026-09-23). A `WH_KEYBOARD_LL` callback that misses `LowLevelHooksTimeout`
+  even once is silently removed (Windows 7+), and there is no API to detect
+  it. The hook thread is kept off every blocking path so that should not
+  happen, but a machine thrashing hard enough to stall a HIGHEST-priority,
+  non-throttled thread can still cause it; the replacement then keeps working
+  everywhere except over fullscreen games until TaskMan restarts. Periodic
+  re-installation was rejected as polling on the input path.
 
 ## Falsified findings — do not re-raise
 

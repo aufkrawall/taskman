@@ -25,13 +25,20 @@
 //!   user who never turned the replacement on never has their keyboard routed
 //!   through this process at all.
 //! * **The callback does no work.** No allocation, no registry, no lock, no
-//!   syscall beyond the key-state reads: it consults one atomic, signals an
-//!   event and returns. Everything the hotkey actually DOES — raising the
-//!   window, attaching thread input — happens on the worker thread, which
-//!   pumps its own message queue precisely so that attaching to another
-//!   application's input queue cannot stall that application. It is the only
-//!   caller in the codebase allowed to use
+//!   syscall beyond the key-state reads: it consults a few atomics, signals an
+//!   event and returns. Everything the hotkey actually DOES — waking the UI,
+//!   taking the foreground over a fullscreen game — happens on the worker
+//!   thread, which pumps its own message queue precisely so that attaching to
+//!   another application's input queue cannot stall that application. It is
+//!   the only caller in the codebase allowed to use
 //!   [`super::window_chrome::force_foreground_attached`].
+//! * **The combo is only swallowed when something will answer it.** Before
+//!   the window exists, and while the worker is still busy with the previous
+//!   press (stuck behind a wedged UI thread, say), the press passes through
+//!   to Explorer instead: the IFEO registration then starts a launcher, which
+//!   finds this instance unresponsive and opens a fresh one. Eating the combo
+//!   in those states would leave the user with no task manager at all, at
+//!   exactly the moment one is needed.
 //!
 //! Two smaller rules fall out of the same reasoning and are easy to undo by
 //! accident, so they are written down here as well:
@@ -76,6 +83,15 @@ static WORKER_RUNNING: AtomicBool = AtomicBool::new(false);
 /// this question lives on the worker thread, which re-runs it when the IFEO
 /// key actually changes.
 static REPLACEMENT_ENABLED: AtomicBool = AtomicBool::new(false);
+/// TaskMan's main window once it exists, 0 before and after.
+///
+/// Published through [`set_target_window`]. The callback reads it as "is
+/// there anything to raise yet", the worker as the window to raise.
+static TARGET_WINDOW: AtomicIsize = AtomicIsize::new(0);
+/// Set by the callback when it hands a press to the worker, cleared by the
+/// worker once that press has been served. While it is set a NEW press is
+/// not swallowed; see the module docs.
+static WORKER_BUSY: AtomicBool = AtomicBool::new(false);
 
 static HOOK_CALLBACK: std::sync::Mutex<Option<Arc<dyn Fn() + Send + Sync + 'static>>> =
     std::sync::Mutex::new(None);
@@ -120,6 +136,7 @@ impl HotkeyHook {
                 return None;
             }
         };
+        WORKER_BUSY.store(false, Ordering::Release);
         TRIGGER_EVENT.store(event.0 as isize, Ordering::Release);
         WORKER_RUNNING.store(true, Ordering::Release);
 
@@ -289,14 +306,22 @@ fn set_hook(hook: &mut Option<HHOOK>, wanted: bool) {
     }
 }
 
+/// Tell the hook which window the hotkey raises; 0 when there is none.
+///
+/// Until this names a window, Ctrl+Shift+Esc passes through to Explorer: the
+/// UI that would answer the press does not exist yet.
+pub(crate) fn set_target_window(hwnd: isize) {
+    TARGET_WINDOW.store(hwnd, Ordering::Release);
+}
+
 /// Serves the hook: raises the window when the combo fires, and keeps the
 /// hook's installed state in step with the IFEO registration.
 ///
 /// This thread pumps messages. It owns no window and dispatches nothing of its
-/// own, but [`super::window_chrome::force_foreground`] attaches this thread's
-/// input queue to the foreground application's, and a thread that does not
-/// pump while two input queues are merged is exactly how the OTHER application
-/// ends up unable to process input.
+/// own, but [`super::window_chrome::force_foreground_attached`] attaches this
+/// thread's input queue to the foreground application's, and a thread that
+/// does not pump while two input queues are merged is exactly how the OTHER
+/// application ends up unable to process input.
 fn worker_thread(event_raw: isize, registry_raw: isize, hook_thread_id: u32) {
     let event = HANDLE(event_raw as *mut core::ffi::c_void);
     let registry_event = HANDLE(registry_raw as *mut core::ffi::c_void);
@@ -326,11 +351,14 @@ fn worker_thread(event_raw: isize, registry_raw: isize, hook_thread_id: u32) {
         const WAIT_TIMEOUT_CODE: u32 = windows::Win32::Foundation::WAIT_TIMEOUT.0;
         match waited.0 {
             TRIGGER => {
+                // The callback wakes the UI thread, which shows, restores and
+                // raises its own window; this thread only takes the foreground
+                // for it, the one part the UI cannot do over a fullscreen game.
                 let cb_opt = tm_core::sync::lock(&HOOK_CALLBACK).clone();
                 if let Some(cb) = cb_opt {
                     cb();
                 }
-                let hwnd = super::instance::published_window();
+                let hwnd = TARGET_WINDOW.load(Ordering::Acquire);
                 if hwnd != 0 {
                     // The attaching variant: this is the fullscreen-game case
                     // the hook exists for, and this thread pumps its own
@@ -338,6 +366,8 @@ fn worker_thread(event_raw: isize, registry_raw: isize, hook_thread_id: u32) {
                     // here and nowhere else.
                     super::window_chrome::force_foreground_attached(hwnd);
                 }
+                // Served: the next press may be swallowed again.
+                WORKER_BUSY.store(false, Ordering::Release);
             }
             REGISTRY => {
                 // One-shot: re-arm before reading, so a second change during
@@ -421,6 +451,7 @@ fn stop_worker(worker_join: Option<std::thread::JoinHandle<()>>, event: HANDLE) 
     if let Some(worker) = worker_join {
         let _ = worker.join();
     }
+    WORKER_BUSY.store(false, Ordering::Release);
 }
 
 fn stop_hook_thread(thread_id: u32, join: Option<std::thread::JoinHandle<()>>) {
@@ -437,6 +468,7 @@ fn stop_hook_thread(thread_id: u32, join: Option<std::thread::JoinHandle<()>>) {
 fn teardown_events(event: HANDLE, registry_event: HANDLE) {
     TRIGGER_EVENT.store(0, Ordering::Release);
     WORKER_RUNNING.store(false, Ordering::Release);
+    WORKER_BUSY.store(false, Ordering::Release);
     unsafe {
         let _ = CloseHandle(event);
         let _ = CloseHandle(registry_event);
@@ -482,12 +514,12 @@ unsafe extern "system" fn low_level_keyboard_proc(
     let msg = wparam.0 as u32;
 
     if kbd.vkCode == VK_ESCAPE.0 as u32 {
-        // If Escape is being released, always clear CONSUMED_DOWN.
-        // If we consumed the keydown, we must also consume the keyup so
-        // the underlying window does not receive an unmatched WM_KEYUP.
-        // Crucially, this must NOT depend on whether Ctrl or Shift is still
-        // pressed, because users frequently release modifier keys before Escape.
         if msg == WM_KEYUP || msg == WM_SYSKEYUP {
+            // If Escape is being released, always clear CONSUMED_DOWN.
+            // If we consumed the keydown, we must also consume the keyup so
+            // the underlying window does not receive an unmatched WM_KEYUP.
+            // Crucially, this must NOT depend on whether Ctrl or Shift is still
+            // pressed, because users frequently release modifier keys before Escape.
             let down_tick = LAST_DOWN_TICK.swap(0, Ordering::Relaxed);
             let consumed = CONSUMED_DOWN.swap(false, Ordering::SeqCst);
             // ...but it MUST depend on the release still belonging to a press
@@ -503,43 +535,91 @@ unsafe extern "system" fn low_level_keyboard_proc(
             if consumed && matches_recent_press {
                 return LRESULT(1);
             }
-        }
-
-        // Cheap and first: a machine where the replacement is off must not pay
-        // even the key-state reads. The hook is normally not installed at all
-        // in that state; this still matters for the few events in flight while
-        // the uninstall request is on its way to the hook thread.
-        if !REPLACEMENT_ENABLED.load(Ordering::Acquire) {
-            return unsafe { CallNextHookEx(None, code, wparam, lparam) };
-        }
-
-        let is_ctrl = unsafe { GetAsyncKeyState(VK_CONTROL.0 as i32) } < 0;
-        let is_shift = unsafe { GetAsyncKeyState(VK_SHIFT.0 as i32) } < 0;
-        let is_alt = unsafe { GetAsyncKeyState(VK_MENU.0 as i32) } < 0;
-        let is_win = (unsafe { GetAsyncKeyState(VK_LWIN.0 as i32) } < 0)
-            || (unsafe { GetAsyncKeyState(VK_RWIN.0 as i32) } < 0);
-
-        if is_ctrl && is_shift && !is_alt && !is_win && (msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN)
-        {
-            let now = unsafe { GetTickCount64() };
-            let prev = LAST_DOWN_TICK.load(Ordering::Relaxed);
-            let is_stale = prev == 0 || (now.saturating_sub(prev) > CONSUMED_DOWN_TTL_MS);
-            LAST_DOWN_TICK.store(now, Ordering::Relaxed);
-
-            if !CONSUMED_DOWN.swap(true, Ordering::SeqCst) || is_stale {
-                // Signal the async worker thread immediately so window raising
-                // and AttachThreadInput never block this hook callback or delay
-                // system-wide keyboard input.
-                let trigger = TRIGGER_EVENT.load(Ordering::Acquire);
-                if trigger != 0 {
-                    let _ = unsafe { SetEvent(HANDLE(trigger as *mut core::ffi::c_void)) };
-                }
+        } else if msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN {
+            if swallow_escape_press() {
+                return LRESULT(1);
             }
-            return LRESULT(1);
+            // This press reaches the application, so its release must too.
+            // Without this, letting go of Ctrl+Shift while still holding
+            // Escape delivers the auto-repeat presses and then eats the
+            // release, leaving Escape stuck down wherever focus now is.
+            CONSUMED_DOWN.store(false, Ordering::SeqCst);
+            LAST_DOWN_TICK.store(0, Ordering::Relaxed);
         }
     }
 
     unsafe { CallNextHookEx(None, code, wparam, lparam) }
+}
+
+/// Decide an Escape press: `true` swallows it (and, for a new press, has
+/// already handed it to the worker).
+///
+/// Runs on the system's input path; see the module docs for what it may do.
+fn swallow_escape_press() -> bool {
+    // Cheap and first: a machine where the replacement is off must not pay
+    // even the key-state reads. The hook is normally not installed at all in
+    // that state; this still matters for the few events in flight while the
+    // uninstall request is on its way to the hook thread.
+    if !REPLACEMENT_ENABLED.load(Ordering::Acquire) {
+        return false;
+    }
+
+    let is_ctrl = unsafe { GetAsyncKeyState(VK_CONTROL.0 as i32) } < 0;
+    let is_shift = unsafe { GetAsyncKeyState(VK_SHIFT.0 as i32) } < 0;
+    let is_alt = unsafe { GetAsyncKeyState(VK_MENU.0 as i32) } < 0;
+    let is_win = (unsafe { GetAsyncKeyState(VK_LWIN.0 as i32) } < 0)
+        || (unsafe { GetAsyncKeyState(VK_RWIN.0 as i32) } < 0);
+    if !(is_ctrl && is_shift && !is_alt && !is_win) {
+        return false;
+    }
+
+    let now = unsafe { GetTickCount64() };
+    if is_repeat_of_swallowed_press(
+        CONSUMED_DOWN.load(Ordering::SeqCst),
+        LAST_DOWN_TICK.load(Ordering::Relaxed),
+        now,
+    ) {
+        // Auto-repeat of the press already being served: keep swallowing it
+        // and keep it fresh, but do not raise the window again.
+        LAST_DOWN_TICK.store(now, Ordering::Relaxed);
+        return true;
+    }
+    if !claim_worker(TARGET_WINDOW.load(Ordering::Acquire) != 0) {
+        return false;
+    }
+    LAST_DOWN_TICK.store(now, Ordering::Relaxed);
+    CONSUMED_DOWN.store(true, Ordering::SeqCst);
+    true
+}
+
+/// Whether a Ctrl+Shift+Esc press continues the one this hook last
+/// swallowed. Auto-repeat refreshes the tick while the combo is held, so only
+/// a press whose release this hook never saw goes stale.
+fn is_repeat_of_swallowed_press(consumed_down: bool, last_down_tick: u64, now: u64) -> bool {
+    consumed_down
+        && last_down_tick != 0
+        && now.saturating_sub(last_down_tick) <= CONSUMED_DOWN_TTL_MS
+}
+
+/// Hand a new press to the worker, if there is anything to hand it to.
+///
+/// `false` means "let the press through": there is no window to raise yet,
+/// the hook is being torn down, or the worker has not finished the previous
+/// press. Only a `true` signals the worker, so window raising and
+/// `AttachThreadInput` never run on — or block — this callback.
+fn claim_worker(target_published: bool) -> bool {
+    let trigger = TRIGGER_EVENT.load(Ordering::Acquire);
+    if trigger == 0 || !target_published {
+        return false;
+    }
+    if WORKER_BUSY.swap(true, Ordering::AcqRel) {
+        return false;
+    }
+    if unsafe { SetEvent(HANDLE(trigger as *mut core::ffi::c_void)) }.is_err() {
+        WORKER_BUSY.store(false, Ordering::Release);
+        return false;
+    }
+    true
 }
 
 #[cfg(test)]
@@ -557,6 +637,7 @@ mod tests {
 
     #[test]
     fn hotkey_hook_installs_and_uninstalls_cleanly() {
+        let _serial = serialize();
         let hook = HotkeyHook::install(|| {});
         assert!(hook.is_some());
         drop(hook);
@@ -618,6 +699,84 @@ mod tests {
             !CONSUMED_DOWN.load(Ordering::SeqCst),
             "the stale flag must be cleared, not left to eat the next release too"
         );
+    }
+
+    /// Letting go of Ctrl+Shift while still holding Escape turns the rest of
+    /// the hold into plain Escape presses that DO reach the application. The
+    /// release then belongs to them and must reach it too, or Escape stays
+    /// stuck down there.
+    #[test]
+    fn escape_press_that_passes_through_releases_the_swallow() {
+        let _serial = serialize();
+        CONSUMED_DOWN.store(true, Ordering::SeqCst);
+        LAST_DOWN_TICK.store(unsafe { GetTickCount64() }, Ordering::Relaxed);
+        let kbd = escape_event();
+        let lparam = LPARAM(&kbd as *const _ as isize);
+        // No modifiers are held on the test machine, so this press is
+        // delivered, not swallowed.
+        let res = unsafe {
+            low_level_keyboard_proc(HC_ACTION as i32, WPARAM(WM_KEYDOWN as usize), lparam)
+        };
+        assert_eq!(res, LRESULT(0));
+        assert!(!CONSUMED_DOWN.load(Ordering::SeqCst));
+        let res =
+            unsafe { low_level_keyboard_proc(HC_ACTION as i32, WPARAM(WM_KEYUP as usize), lparam) };
+        assert_eq!(
+            res,
+            LRESULT(0),
+            "the release of a delivered press must be delivered"
+        );
+    }
+
+    #[test]
+    fn repeat_detection_follows_the_swallowed_press() {
+        let now = 10_000;
+        assert!(is_repeat_of_swallowed_press(true, now - 30, now));
+        assert!(is_repeat_of_swallowed_press(
+            true,
+            now - CONSUMED_DOWN_TTL_MS,
+            now
+        ));
+        assert!(!is_repeat_of_swallowed_press(
+            true,
+            now - CONSUMED_DOWN_TTL_MS - 1,
+            now
+        ));
+        assert!(!is_repeat_of_swallowed_press(false, now - 30, now));
+        assert!(!is_repeat_of_swallowed_press(true, 0, now));
+    }
+
+    /// A press is only swallowed when the worker will serve it. With no
+    /// window yet, or the worker still stuck on the previous press, the combo
+    /// must reach Explorer so the user still gets a task manager.
+    #[test]
+    fn combo_passes_through_when_nothing_can_answer_it() {
+        let _serial = serialize();
+        let event = unsafe { CreateEventW(None, false, false, None) }.expect("event");
+        TRIGGER_EVENT.store(event.0 as isize, Ordering::Release);
+        WORKER_BUSY.store(false, Ordering::Release);
+
+        assert!(!claim_worker(false), "no window to raise yet");
+        assert!(!WORKER_BUSY.load(Ordering::Acquire));
+
+        assert!(claim_worker(true));
+        assert!(WORKER_BUSY.load(Ordering::Acquire));
+        assert_eq!(
+            unsafe { windows::Win32::System::Threading::WaitForSingleObject(event, 0) },
+            WAIT_OBJECT_0,
+            "a claimed press must signal the worker"
+        );
+        assert!(
+            !claim_worker(true),
+            "a worker still serving the last press must not be handed another"
+        );
+
+        WORKER_BUSY.store(false, Ordering::Release);
+        TRIGGER_EVENT.store(0, Ordering::Release);
+        assert!(!claim_worker(true), "a torn-down hook claims nothing");
+        unsafe {
+            let _ = CloseHandle(event);
+        }
     }
 
     /// The callback must never reach the registry, so the answer it uses is an
