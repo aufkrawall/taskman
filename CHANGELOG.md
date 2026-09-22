@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.1.14 - 2026-09-23
+
 ### Fixed
 
 - **Ctrl+Shift+Esc dead while TaskMan was unresponsive:** if TaskMan's window
@@ -82,6 +84,21 @@
   release anywhere on the machine was eaten in its place, leaving that
   application with a key it never saw released. A release is now only
   swallowed when it still matches a recent press.
+- **Empty StartupApproved registry value rendered as disabled:** `list_startup`
+  treated an empty `StartupApproved` value as disabled because `data.first()`
+  was `None`, even though Windows considers an empty entry enabled and runs it
+  at logon. Empty entries now correctly report enabled.
+- **Kernel ETW sessions outliving an application crash:** ETW disk and network
+  trace sessions are kernel objects that survived application aborts
+  (`panic = "abort"`) because cleanup was `Drop`-only. An unhandled abort now
+  runs emergency teardown (`stop_live_sessions`) before the process exits so
+  orphaned kernel traces do not continue tracing machine-wide I/O.
+- **Log files truncated to a single line and crash diagnostics lost:** the
+  file logging `WorkerGuard` was dropped immediately after startup check in
+  `main.rs`, silently discarding subsequent logs, and normal GUI launches did
+  not attach file logging. The logging worker guard now lives for the process
+  lifetime, file logging is attached on the engine frame, and fatal panics
+  synchronously flush a `.crash` log with thread backtraces.
 
 ### Improved
 
@@ -95,3 +112,6 @@
   `FreeLibrary` transmute, the sampler's termination check, the keyboard
   hook's struct deref, and the broker's handle/SID ownership transfers) now
   carry `SAFETY:` comments stating the invariant they rely on.
+- **Live-kernel verification tool:** added `python build.py --live-tests` to
+  validate elevated NT kernel structure offsets and ETW payload decoders
+  against live events.
