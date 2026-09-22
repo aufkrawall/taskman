@@ -37,6 +37,10 @@ When they disagree, code and observed behavior win.
 - `debug-tools.md` — headless diagnostics and interactive-only tools.
 - `debug-tools-security-audit.md` — security, dump, and binary-analysis tool
   inventory plus audit rules.
+- `changelog-guidelines.md` — changelog and release-note maintenance,
+  bold-anchor format, and unreleased section policy.
+- `secret-leak-prevention.md` — mandatory pre-commit and post-commit secret-leak
+  gates, scanner fallbacks, and remediation.
 - `codestyle.md` — coding and tooling conventions.
 - `known-debt.md` — deliberate remaining parity and platform gaps.
 - `log/recent.md` — recent chronology; `log.md` routes to older archives.

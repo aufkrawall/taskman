@@ -26,6 +26,7 @@ Primary sources:
 | Tool | Purpose | Invocation |
 | --- | --- | --- |
 | Tool discovery | non-mutating Windows SDK/MSVC/Sysinternals/Rust tool discovery | `powershell -ExecutionPolicy Bypass -File .\tools\discover-debug-tools.ps1` |
+| Discovery regression test | regression test for generic debug-tool discovery | `powershell -ExecutionPolicy Bypass -File .\tools\tests\test-debug-tool-discovery.ps1` |
 | Core tests | model/settings/history/engine logic | `cargo test -p tm-core` |
 | Platform tests | collectors/actions plus short-lived Windows process integration tests | `cargo test -p tm-platform` |
 | App tests | tables, process topology, sorting, charts, module-dialog model | `cargo test -p tm-app` |

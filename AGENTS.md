@@ -59,6 +59,12 @@
   `git add -- <paths>`, `git commit -m "..."`). Broad `git add` only after
   verifying every worktree change is task-owned.
 - Do not push to a remote unless explicitly requested.
+- Every agent-created commit must pass the mandatory pre-commit and post-commit
+  secret-leak checks in `llm-wiki/secret-leak-prevention.md`; never push a commit
+  that has not passed the post-commit check.
+- Maintain root `CHANGELOG.md` using `llm-wiki/changelog-guidelines.md`: record
+  changelog-worthy task-owned changes in the current unreleased section before
+  committing.
 - Always consult `llm-wiki/` for non-trivial work in an unfamiliar area; for
   trivial localized work, read only the directly relevant page(s).
 - Keep `llm-wiki/` current when durable project knowledge changes.
@@ -94,6 +100,36 @@
   secrets, dumps, logs, or large generated artifacts (`dist/`, `target/`,
   `*.png` are gitignored).
 
+## Changelog and release notes
+
+- Maintain root `CHANGELOG.md` using `llm-wiki/changelog-guidelines.md`.
+- Describe the observable issue, behavior change, compatibility effect, or
+  capability first; keep internal implementation detail secondary.
+- Prefer concise bold lead-in anchors (`- **<Anchor>:** <details>`) and standard
+  Keep a Changelog categories (`New`, `Improved`, `Fixed`, `Changed`, `Security`)
+  so entries remain highly scannable.
+- Record changelog-worthy task-owned changes in the current unreleased section
+  before committing; keep release notes aligned with the changelog.
+
+## Secret leak prevention
+
+- Treat secret safety as a commit gate, not an optional security-audit task.
+- Every agent-created commit must pass the mandatory pre-commit and post-commit
+  secret-leak checks in `llm-wiki/secret-leak-prevention.md`; never push a commit
+  that has not passed the post-commit check.
+- Before committing, inspect staged/untracked task-owned files, the staged patch
+  (`git diff --staged`), and the planned commit message; run repository-provided
+  (`python build.py --audit` / `gitleaks detect`) or available local scanning.
+- After committing, inspect the exact created commit (`git show --stat --patch HEAD`),
+  and run commit/history secret scanning when available.
+- If scanners are unavailable, perform the documented manual fallback; scanner
+  absence never means the check may be skipped.
+- Stop before push on any suspected leak. Remove/redact it, rewrite affected local
+  commits as appropriate, and rotate/revoke real credentials according to project
+  policy.
+- Never reproduce full discovered secrets in logs, reports, changelogs, issues,
+  PRs, or commit messages.
+
 ## Project-specific constraints
 
 - Windows 11 is the primary host; the Linux/macOS backends are built by
@@ -107,11 +143,18 @@
 
 - Fix newly introduced errors/warnings plus pre-existing issues in touched
   files; no unrelated repo-wide cleanup.
-- Prefer regression tests that would have failed before the fix; the repo
-  has unit tests per module plus Windows integration tests in
-  `crates/tm-platform/tests/integration.rs`.
+- Regression coverage and diagnosability are first-class deliverables, not
+  optional polish. For bug fixes or behavioral corrections, explicitly assess
+  both regression coverage and diagnostics even when existing tests pass;
+  strongly prefer a focused automated regression test that fails before the fix
+  and passes after it. The repo has unit tests per module plus Windows
+  integration tests in `crates/tm-platform/tests/integration.rs`.
+- For features, cover the new contract and important edge cases when suitable
+  test infrastructure exists.
 - Do not add low-value tests solely to satisfy a blanket testing rule; prefer
   tests that pin an invariant or reproduce the defect.
+- If additional regression coverage or diagnostics are deliberately not added
+  for a non-trivial behavioral change, state the reason.
 - No sleeps in tests; poll conditions with bounded deadline loops.
 
 ## Debugging and logging
@@ -128,6 +171,7 @@
 | Tool | Purpose | Invocation |
 | --- | --- | --- |
 | `tools/discover-debug-tools.ps1` | Non-mutating Windows SDK/MSVC/Sysinternals/Rust tool discovery | `powershell -ExecutionPolicy Bypass -File .\tools\discover-debug-tools.ps1` |
+| Discovery regression test | Regression test for generic debug-tool discovery | `powershell -ExecutionPolicy Bypass -File .\tools\tests\test-debug-tool-discovery.ps1` |
 | `--selfcheck` | Headless sampling smoke test, prints JSON summary | `target/release/taskman.exe --selfcheck [--mock]` |
 | `TASKMAN_RENDERER=glow\|wgpu` | Force renderer | env var before launch |
 | `TASKMAN_FPS_PROBE=1` | Continuous repaints + fps overlay vs display Hz | env var |
