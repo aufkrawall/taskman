@@ -1416,7 +1416,7 @@ fn time_window_context_menu(app: &mut TaskManApp, resp: &egui::Response) {
             let current = app.shared.settings.graph_seconds == secs;
             if menu::check(ui, &format!("{secs} s"), current).clicked() {
                 app.shared.settings.graph_seconds = secs;
-                app.shared.settings.save();
+                app.save_settings();
                 ui.close();
             }
         }

@@ -17,7 +17,7 @@ use crate::app_ui::apply_theme;
 use crate::widgets::tablekit::{TmColumn, TmTable};
 use eframe::egui;
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use tm_core::demand::TelemetryDemand;
 use tm_core::engine::EngineHandle;
@@ -1961,20 +1961,23 @@ impl TaskManApp {
             return;
         }
         let actions = self.actions.clone();
-        self.run_action_refreshing(
-            ctx,
-            move || i18n::trf(K::EfficiencyChangedCount, &[&total.to_string()]),
-            move || {
-                for identity in targets {
-                    let _ = actions.set_efficiency_mode_checked(
-                        identity.pid,
-                        identity.start_epoch_s,
-                        on,
-                    );
-                }
-                Ok(())
-            },
-        );
+        let completed = Arc::new(AtomicUsize::new(0));
+        let completed_for_msg = completed.clone();
+        let completed_for_job = completed.clone();
+        let msg = move || {
+            let done = completed_for_msg.load(Ordering::Relaxed);
+            let base = i18n::trf(K::EfficiencyChangedCount, &[&done.to_string()]);
+            if done < total {
+                format!("{base} ({done}/{total})")
+            } else {
+                base
+            }
+        };
+        self.run_action_refreshing(ctx, msg, move || {
+            crate::action_executor::apply_batch(targets, &completed_for_job, |identity| {
+                actions.set_efficiency_mode_checked(identity.pid, identity.start_epoch_s, on)
+            })
+        });
     }
 
     /// Whether the primary selected row currently has efficiency mode on.

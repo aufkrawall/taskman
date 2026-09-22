@@ -24,10 +24,12 @@
 //! Rules:
 //! * Unknown sections/keys and invalid values are ignored, so the file stays
 //!   forward-compatible and safe to hand-edit.
-//! * [`Settings::save`] is the automatic-save entry point; it is gated by
-//!   `save_config` (**enabled by default**). `save_to`/`save_forced` always
-//!   write — toggling the autosave switch itself persists immediately so the
-//!   choice survives restart (implement.md §17.2).
+//! * Persistence goes through [`SettingsWriter`] (a coalescing thread); UI
+//!   code must never write synchronously. The `save_config` gate
+//!   (**enabled by default**) is applied at the CALL SITE
+//!   (`TaskManApp::save_settings`); `save_to`/`save_forced` always write —
+//!   toggling the autosave switch itself persists immediately so the choice
+//!   survives restart (implement.md §17.2).
 //! * A legacy `settings.json` from older builds is migrated once when no
 //!   config.ini exists yet.
 //! * Column preferences are keyed by **stable column id** (`[columns.<table>]`
@@ -952,20 +954,6 @@ impl Settings {
         Some(taskman_config_dir().join("config.ini"))
     }
 
-    /// Automatic-save entry point used by the UI. Honors the user's
-    /// `save_config` choice (default: on).
-    pub fn save(&self) {
-        if !self.save_config {
-            tracing::trace!("config autosave disabled; skipping");
-            return;
-        }
-        if let Some(p) = Self::default_path()
-            && let Err(e) = self.save_to(&p)
-        {
-            tracing::warn!(error = %e, "failed to save settings");
-        }
-    }
-
     /// Unconditional save that bypasses the autosave gate. Used when the
     /// user turns autosave OFF (so that choice itself persists), presses
     /// Reset, or explicitly closes the settings dialog.
@@ -989,7 +977,8 @@ fn test_path_override() -> Option<std::sync::MutexGuard<'static, Option<PathBuf>
     TEST_PATH_OVERRIDE.lock().ok()
 }
 
-/// Redirect [`Settings::save`] / [`save_forced`] for the whole process.
+/// Redirect [`Settings::save_forced`] / [`Settings::save_to`] for the whole
+/// process.
 /// Test isolation only — production code must not call this.
 #[doc(hidden)]
 pub fn set_default_path_override_for_tests(dir: Option<PathBuf>) {
@@ -1430,13 +1419,13 @@ rule.1=["c:\\\\ok.exe",{"priority":"High","affinity_mask":3}]
     }
 
     #[test]
-    fn autosave_gate_controls_save_but_not_save_to() {
+    fn save_to_writes_regardless_of_the_autosave_gate() {
+        // The gate lives at the CALL SITE now (`TaskManApp::save_settings`
+        // checks `save_config` before enqueueing on the writer thread), so
+        // every tm-core write primitive must ignore it — including the
+        // "autosave off" choice persisting itself through save_forced.
         let dir = tempfile::tempdir().unwrap();
 
-        // Off: the automatic entry point must not touch the disk.
-        // (default_path() is environment-dependent, so we assert on the
-        // observable contract instead: save() is a no-op while save_to
-        // still writes.)
         let off = Settings {
             save_config: false,
             ..Settings::default()

@@ -232,7 +232,7 @@ pub fn sidebar(app: &mut TaskManApp, ui_root: &mut egui::Ui, pal: &Palette) {
         .show(ui_root, |ui| {
             if icon_button(ui, pal, Icon::Hamburger, 32.0, collapsed) {
                 app.shared.settings.sidebar_collapsed = !collapsed;
-                app.shared.settings.save();
+                app.save_settings();
             }
             ui.add_space(8.0);
 
@@ -514,7 +514,7 @@ pub fn settings_dialog(app: &mut TaskManApp, ctx: &egui::Context, _pal: &theme::
                     {
                         app.shared.settings.theme = mode;
                         apply_theme(ctx, mode);
-                        app.shared.settings.save();
+                        app.save_settings();
                     }
                 }
             });
@@ -546,7 +546,7 @@ pub fn settings_dialog(app: &mut TaskManApp, ctx: &egui::Context, _pal: &theme::
                                 app.engine.set_interval(speed.interval());
                             }
                         }
-                        app.shared.settings.save();
+                        app.save_settings();
                     }
                 }
             });
@@ -568,7 +568,7 @@ pub fn settings_dialog(app: &mut TaskManApp, ctx: &egui::Context, _pal: &theme::
                         ctx.send_viewport_cmd(egui::ViewportCommand::Title(
                             i18n::tr(K::WindowTitle).to_string(),
                         ));
-                        app.shared.settings.save();
+                        app.save_settings();
                     }
                 }
             });
@@ -632,7 +632,7 @@ pub fn settings_dialog(app: &mut TaskManApp, ctx: &egui::Context, _pal: &theme::
                         .clicked()
                     {
                         app.shared.settings.render_mode = mode;
-                        app.shared.settings.save();
+                        app.save_settings();
                     }
                 }
             });
@@ -670,7 +670,7 @@ pub fn settings_dialog(app: &mut TaskManApp, ctx: &egui::Context, _pal: &theme::
                 } else {
                     egui::WindowLevel::Normal
                 }));
-                app.shared.settings.save();
+                app.save_settings();
             }
             if app.shared.settings.always_on_top != app.startup_always_on_top {
                 // The Start-menu-proof band is chosen when the window is
@@ -706,7 +706,7 @@ pub fn settings_dialog(app: &mut TaskManApp, ctx: &egui::Context, _pal: &theme::
             .changed()
             {
                 app.shared.settings.remember_window = remember;
-                app.shared.settings.save();
+                app.save_settings();
             }
 
             #[cfg(target_os = "windows")]
@@ -757,7 +757,7 @@ pub fn settings_dialog(app: &mut TaskManApp, ctx: &egui::Context, _pal: &theme::
                         .clicked()
                     {
                         app.shared.settings.graph_seconds = secs;
-                        app.shared.settings.save();
+                        app.save_settings();
                     }
                 }
             });
@@ -778,7 +778,7 @@ pub fn settings_dialog(app: &mut TaskManApp, ctx: &egui::Context, _pal: &theme::
                     {
                         app.shared.settings.ui_zoom = zoom;
                         ctx.set_zoom_factor(zoom);
-                        app.shared.settings.save();
+                        app.save_settings();
                     }
                 }
             });
@@ -975,7 +975,7 @@ pub fn settings_dialog(app: &mut TaskManApp, ctx: &egui::Context, _pal: &theme::
                     // when unelevated (main.rs); the current session is not
                     // touched — use the restart button above to elevate now.
                     app.shared.settings.start_elevated = start_elevated;
-                    app.shared.settings.save();
+                    app.save_settings();
                 }
             }
 

@@ -152,3 +152,68 @@ impl ActionExecutor {
         }
     }
 }
+
+/// Apply `attempt` once per target inside a batch action job.
+///
+/// Counts successes into `completed` (read afterwards by the job's toast
+/// message) and fails only when NOTHING succeeded, carrying the first error —
+/// a partially refused batch still refreshes and reports its real count,
+/// while an all-failed batch must never toast success. `targets` must be
+/// non-empty; callers filter empty selections before submitting.
+pub(crate) fn apply_batch<T>(
+    targets: Vec<T>,
+    completed: &AtomicUsize,
+    mut attempt: impl FnMut(T) -> Result<(), tm_core::TmError>,
+) -> Result<(), tm_core::TmError> {
+    let mut first_error = None;
+    for target in targets {
+        match attempt(target) {
+            Ok(()) => {
+                completed.fetch_add(1, Ordering::Relaxed);
+            }
+            Err(error) => {
+                first_error.get_or_insert(error);
+            }
+        }
+    }
+    if completed.load(Ordering::Relaxed) == 0 {
+        Err(first_error.expect("non-empty batch must produce a result"))
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn apply_batch_counts_completions_and_succeeds_when_any_target_did() {
+        let completed = AtomicUsize::new(0);
+        let result = apply_batch(vec![1, 2, 3, 4], &completed, |n| {
+            if n % 2 == 0 {
+                Ok(())
+            } else {
+                Err(tm_core::TmError::Unsupported("odd"))
+            }
+        });
+        assert!(result.is_ok());
+        assert_eq!(completed.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn apply_batch_fails_with_the_first_error_when_everything_failed() {
+        // Regression: the efficiency-mode batch used to return Ok(())
+        // unconditionally and toast a success for a batch where every call
+        // was refused (targets already exited, access denied, ...).
+        let completed = AtomicUsize::new(0);
+        let result: Result<(), _> = apply_batch(vec![10, 20], &completed, |pid| {
+            Err(tm_core::TmError::ProcessNotFound { pid })
+        });
+        assert!(matches!(
+            result,
+            Err(tm_core::TmError::ProcessNotFound { pid: 10 })
+        ));
+        assert_eq!(completed.load(Ordering::Relaxed), 0);
+    }
+}

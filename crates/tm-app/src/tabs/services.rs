@@ -45,24 +45,35 @@ fn ensure_fresh(app: &TaskManApp, ctx: &egui::Context) {
             let c = ctx.clone();
             move || c.request_repaint()
         };
-        let _ = std::thread::Builder::new()
-            .name("tm-svc-fetch".into())
-            .spawn(move || {
-                let items = actions.list_services();
-                let fetched = Instant::now();
-                if let Err(e) = &items {
-                    crate::app::toast_from(
-                        &toasts,
-                        i18n::trf(K::ServicesUnavailable, &[&e.to_string()]),
-                    );
-                }
-                *tm_core::sync::lock(&cache) = Some(Cache {
-                    items: items.unwrap_or_default(),
-                    fetched,
-                });
-                done.store(false, std::sync::atomic::Ordering::Relaxed);
-                wake();
+        let job = move || {
+            let items = actions.list_services();
+            let fetched = Instant::now();
+            if let Err(e) = &items {
+                crate::app::toast_from(
+                    &toasts,
+                    i18n::trf(K::ServicesUnavailable, &[&e.to_string()]),
+                );
+            }
+            *tm_core::sync::lock(&cache) = Some(Cache {
+                items: items.unwrap_or_default(),
+                fetched,
             });
+            done.store(false, std::sync::atomic::Ordering::Relaxed);
+            wake();
+        };
+        match &app.shared.executor {
+            Some(executor) => {
+                if !executor.run_quiet(|| {}, job) {
+                    app.shared.services_fetch.end();
+                    app.shared.toast(i18n::tr(K::ActionQueueFull));
+                }
+            }
+            None => {
+                drop(job);
+                app.shared.services_fetch.end();
+                app.shared.toast(i18n::tr(K::ActionFailed));
+            }
+        }
     }
 }
 

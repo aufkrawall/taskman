@@ -4,6 +4,28 @@
 
 ### Fixed
 
+- **Efficiency mode reporting success when nothing changed:** toggling
+  Efficiency mode on a multi-selection discarded every per-process failure and
+  toasted "changed for N processes" even when all of them were refused (target
+  already exited, access denied). The batch now fails with the real error when
+  nothing succeeded and reports `(done/total)` on a partial batch, matching
+  what priority and affinity changes already did.
+- **Services tab stuck on "Gathering data":** the Services list was the only
+  tab that spawned a raw thread instead of using the action executor; if that
+  spawn failed, the in-flight flag never cleared and no later refresh could
+  start. It now runs through the same bounded executor as Startup and Users,
+  with the queue-full/failed fallbacks those tabs already had.
+- **Settings writes on the UI thread:** eleven call sites saved `config.ini`
+  synchronously inside a frame, so a slow or synced (OneDrive) config file
+  stalled rendering. All settings persistence now goes through the existing
+  coalescing writer thread; the now-unused synchronous `Settings::save` entry
+  point is removed so the blocking path cannot be reintroduced.
+- **Keyboard-hook callback could panic on a poisoned lock:** the hotkey
+  worker's callback registry now uses the poisoning-recovery lock helper the
+  rest of the codebase uses; with `panic = "abort"`, a poisoned mutex here
+  would have taken down the process that carries every keystroke on the
+  desktop.
+
 - **System-wide keyboard lag from the Ctrl+Shift+Esc hook:** the thread that
   carries every keystroke on the desktop while TaskMan is the registered Task
   Manager replacement is now exempt from Windows' managed power throttling

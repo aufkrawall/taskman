@@ -108,7 +108,7 @@ impl HotkeyHook {
     where
         F: Fn() + Send + Sync + 'static,
     {
-        *HOOK_CALLBACK.lock().unwrap() = Some(Arc::new(on_hotkey));
+        *tm_core::sync::lock(&HOOK_CALLBACK) = Some(Arc::new(on_hotkey));
 
         let event = unsafe { CreateEventW(None, false, false, None) }.ok()?;
         let registry_event = match unsafe { CreateEventW(None, false, false, None) } {
@@ -326,7 +326,7 @@ fn worker_thread(event_raw: isize, registry_raw: isize, hook_thread_id: u32) {
         const WAIT_TIMEOUT_CODE: u32 = windows::Win32::Foundation::WAIT_TIMEOUT.0;
         match waited.0 {
             TRIGGER => {
-                let cb_opt = HOOK_CALLBACK.lock().unwrap().clone();
+                let cb_opt = tm_core::sync::lock(&HOOK_CALLBACK).clone();
                 if let Some(cb) = cb_opt {
                     cb();
                 }
@@ -445,7 +445,7 @@ fn teardown_events(event: HANDLE, registry_event: HANDLE) {
 
 impl Drop for HotkeyHook {
     fn drop(&mut self) {
-        *HOOK_CALLBACK.lock().unwrap() = None;
+        *tm_core::sync::lock(&HOOK_CALLBACK) = None;
 
         // Stop the WORKER first: it is the only thing that still reads
         // `TRIGGER_EVENT` and the registry watch, and it is what asks the hook
