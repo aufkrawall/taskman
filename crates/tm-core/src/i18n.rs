@@ -821,6 +821,52 @@ keys! {
     Bit32 => ["32 Bit", "32-bit"],
     Bit64 => ["64 Bit", "64-bit"],
 
+    // ------------------------------------------------ keyboard help (F1)
+    // Key names follow the labels printed on German/English keyboards so a
+    // shortcut reads the way the user would say it out loud.
+    HelpTitle => ["Tastaturkürzel", "Keyboard shortcuts"],
+    KeyCtrl => ["Strg", "Ctrl"],
+    KeyShift => ["Umschalt", "Shift"],
+    KeyAlt => ["Alt", "Alt"],
+    KeyMenuKey => ["Menütaste", "Menu key"],
+    KeyDel => ["Entf", "Del"],
+    KeyTabKey => ["Tabulator", "Tab"],
+    KeyEsc => ["Esc", "Esc"],
+    KeyEnter => ["Eingabetaste", "Enter"],
+    KeySpace => ["Leertaste", "Space"],
+    KeyArrows => ["Pfeiltasten", "Arrow keys"],
+    HelpRefresh => ["Daten aktualisieren", "Refresh data"],
+    HelpSearch => ["Prozesssuche fokussieren", "Focus the process search"],
+    HelpNextPage => ["Nächste Seite", "Next page"],
+    HelpPrevPage => ["Vorige Seite", "Previous page"],
+    HelpJumpPage => ["Direkt zu Seite 1–9 springen", "Jump directly to page 1–9"],
+    HelpEndTask => [
+        "Markierte Prozesse beenden (mit Bestätigung)",
+        "End selected processes (with confirmation)",
+    ],
+    HelpContextMenu => [
+        "Kontextmenü der Auswahl öffnen",
+        "Open the context menu of the selection",
+    ],
+    HelpMoveSelection => ["Tabellenauswahl bewegen", "Move the table selection"],
+    HelpRowAction => [
+        "Zeilenaktion ausführen / Suche übernehmen",
+        "Run the row action / commit the search",
+    ],
+    HelpToggleSelect => [
+        "Zeile in die Auswahl aufnehmen oder entfernen",
+        "Add or remove the row from the selection",
+    ],
+    HelpTabGeneral => [
+        "Zwischen Steuerelementen wechseln",
+        "Move between controls",
+    ],
+    HelpEscGeneral => [
+        "Dialog schließen / Suche löschen",
+        "Close a dialog / clear the search",
+    ],
+    HelpToggleHelp => ["Diese Hilfe ein- oder ausblenden", "Show or hide this help"],
+
     // ------------------------------------------------ window title
     WindowTitle => ["Task-Manager", "Task Manager"],
 }

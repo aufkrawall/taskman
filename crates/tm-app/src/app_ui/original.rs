@@ -123,6 +123,42 @@ pub fn top_search_panel(app: &mut TaskManApp, ui_root: &mut egui::Ui, pal: &Pale
                     .id(egui::Id::new("global-search")),
             );
 
+            // Keyboard-focus ring for the frame-less text edit: egui paints
+            // no focus outline of its own here, so the accent stroke goes
+            // over the card's neutral one while the field owns the keyboard.
+            // Painting only — no layout, no hover change.
+            if edit.has_focus() {
+                focus_ring(ui, box_rect, 16.0, pal);
+            }
+
+            // Enter commits the search: the page's selection lands on the
+            // match (kept as-is when it already is one), and the field gives
+            // the keyboard back — egui's singleline text edit surrenders
+            // focus on Enter by itself — so the next Arrow key moves the
+            // table selection instead of the caret.
+            if edit.lost_focus()
+                && ui.input(|i| i.key_pressed(egui::Key::Enter))
+                && !app.modal_open()
+            {
+                app.commit_search_selection();
+            }
+
+            // A click anywhere outside the field hands the keyboard back:
+            // the user taps a row and the next Arrow key must move the
+            // selection, not the caret. egui already surrenders focus on
+            // clicks over other widgets (`InputOptions::surrender_focus_on`
+            // defaults to `Clicks`); this catches the remaining dead-space
+            // clicks where no widget is interacted at all.
+            let outside_click = ui.input(|i| {
+                i.pointer
+                    .any_click()
+                    .then(|| i.pointer.interact_pos())
+                    .flatten()
+            });
+            if click_surrenders_search(edit.has_focus(), box_rect, outside_click) {
+                edit.surrender_focus();
+            }
+
             if has_text {
                 let resp = ui
                     .interact(
@@ -147,13 +183,28 @@ pub fn top_search_panel(app: &mut TaskManApp, ui_root: &mut egui::Ui, pal: &Pale
                 );
                 if resp.clicked() {
                     app.search.clear();
+                    // A cleared field has nothing left to edit; never strand
+                    // the keyboard on the (about to disappear) button.
+                    resp.ctx
+                        .memory_mut(|mem| mem.surrender_focus(egui::Id::new("global-search")));
+                }
+                if resp.has_focus() {
+                    focus_ring(ui, clear_rect, 12.0, pal);
                 }
             }
 
-            // Escape clears rather than only unfocusing: with the field empty
-            // it is the same keystroke that leaves it, and a stale filter is
-            // the one thing a user cannot see the cause of.
-            if edit.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+            // Escape clears the search instead of only unfocusing it: a
+            // stale filter is the one thing a user cannot see the cause of.
+            // egui core drops widget focus on Escape before the widgets of a
+            // frame run, so this fires with the field already unfocused; the
+            // gates keep the keystroke owned by dialogs, menus and the F1
+            // help overlay, which all handle Escape themselves.
+            if ui.input(|i| i.key_pressed(egui::Key::Escape))
+                && !app.modal_open()
+                && !app.show_help
+                && !egui::Popup::is_any_open(ui.ctx())
+                && !app.search.is_empty()
+            {
                 app.search.clear();
             }
         });
@@ -175,7 +226,11 @@ fn titlebar_drag_region(ui: &egui::Ui, id: egui::Id, rect: Rect) {
     /// between "maximize" and "move", so the default is close enough.
     const DOUBLE_CLICK_S: f64 = 0.5;
 
-    let resp = ui.interact(rect, id, Sense::click_and_drag());
+    // Click+drag WITHOUT the focusable bit: `Sense::click_and_drag()` also
+    // sets `FOCUSABLE`, which put invisible dead Tab stops on the empty
+    // titlebar strips. The raw CLICK|DRAG union senses the same pointer
+    // gestures (press-to-move, double-click maximize) but is never focused.
+    let resp = ui.interact(rect, id, Sense::CLICK | Sense::DRAG);
     let (pressed, now, pos) = ui.input(|i| {
         (
             i.pointer.primary_pressed(),
@@ -204,6 +259,29 @@ fn titlebar_drag_region(ui: &egui::Ui, id: egui::Id, rect: Rect) {
     }
 
     ui.ctx().send_viewport_cmd(egui::ViewportCommand::StartDrag);
+}
+
+/// Keyboard-focus ring for the custom shell widgets (nav entries, command
+/// buttons, the search box and its clear button, the toast close button).
+/// egui only paints focus for its own styled widgets; these allocate raw
+/// responses, so the ring is painted by hand — the same accent stroke the
+/// dialogs use on their focused buttons. Painting only: no layout, and the
+/// selected/hovered visuals stay untouched.
+fn focus_ring(ui: &egui::Ui, rect: Rect, corner_radius: f32, pal: &Palette) {
+    ui.painter().rect_stroke(
+        rect,
+        corner_radius,
+        Stroke::new(1.5, pal.accent),
+        egui::StrokeKind::Inside,
+    );
+}
+
+/// Whether a pointer click should take the keyboard focus away from the
+/// global search field: any click that did not land inside the field box
+/// (the clear button sits inside it and handles itself). Pure decision, so
+/// the focus contract is testable without a window.
+fn click_surrenders_search(field_has_focus: bool, field_rect: Rect, click: Option<Pos2>) -> bool {
+    field_has_focus && click.is_some_and(|pos| !field_rect.contains(pos))
 }
 
 // ---------------------------------------------------------------- sidebar
@@ -315,6 +393,10 @@ fn nav_item(
             pal.text,
         );
     }
+    // Keyboard-focus ring, painted last so it sits on top of the fill.
+    if resp.has_focus() {
+        focus_ring(ui, rect, 4.0, pal);
+    }
     resp
 }
 
@@ -325,14 +407,19 @@ fn icon_button(ui: &mut egui::Ui, pal: &Palette, icon: Icon, size: f32, center: 
         size
     };
     let (rect, resp) = ui.allocate_exact_size(egui::vec2(w, size), Sense::click());
+    // The hover highlight (and the focus ring) wrap the icon square when the
+    // hamburger button spans the collapsed sidebar's full width.
+    let badge_rect = if center {
+        Rect::from_center_size(rect.center(), egui::vec2(size, size))
+    } else {
+        rect
+    };
     if resp.hovered() {
-        let hover = if center {
-            Rect::from_center_size(rect.center(), egui::vec2(size, size))
-        } else {
-            rect
-        };
         ui.painter()
-            .rect_filled(hover, 4.0, Color32::from_white_alpha(12));
+            .rect_filled(badge_rect, 4.0, Color32::from_white_alpha(12));
+    }
+    if resp.has_focus() {
+        focus_ring(ui, badge_rect, 4.0, pal);
     }
     crate::icons::draw_at(
         ui,
@@ -358,7 +445,16 @@ pub fn cmd_button(
         .size()
         .x;
     let w = 28.0 + text_w + 6.0;
-    let (rect, resp) = ui.allocate_exact_size(egui::vec2(w, 30.0), Sense::click());
+    // Disabled buttons leave the Tab order entirely: with the click sense
+    // they would be focusable dead stops the keyboard has to walk around on
+    // every table header. Hover-only sensing keeps the pointer behavior; the
+    // disabled look is painted below either way.
+    let sense = if enabled {
+        Sense::click()
+    } else {
+        Sense::hover()
+    };
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(w, 30.0), sense);
     let mut clicked = false;
     if enabled {
         if resp.hovered() {
@@ -389,6 +485,9 @@ pub fn cmd_button(
         FontId::proportional(13.0),
         color,
     );
+    if resp.has_focus() {
+        focus_ring(ui, rect, 4.0, pal);
+    }
     clicked && enabled
 }
 
@@ -1454,6 +1553,18 @@ pub fn draw_toasts_queue(toasts_queue: &crate::app::ToastQueue, ctx: &egui::Cont
                                     Color32::from_white_alpha(scale_alpha(40, alpha)),
                                 );
                             }
+                            // Keyboard-focus ring. Toasts do not run through
+                            // the theme palette (see the stroke below), so
+                            // the ring uses the accent that reads on both
+                            // themes over the black toast card.
+                            if btn_resp.has_focus() {
+                                ui.painter().rect_stroke(
+                                    btn_rect,
+                                    3.0,
+                                    Stroke::new(1.5, theme::LIGHT.accent),
+                                    egui::StrokeKind::Inside,
+                                );
+                            }
                             let icon_color = if btn_resp.hovered() {
                                 text_color
                             } else {
@@ -1520,6 +1631,79 @@ fn clear_all_button(ctx: &egui::Context, y_offset: f32) -> bool {
                 .inner
         })
         .inner
+}
+
+// ---------------------------------------------------------------- F1 help
+
+/// The F1 shortcut help overlay. A foreground area with nothing focusable
+/// inside: the keyboard stays where it is (Tab passes straight through) and
+/// Esc closes the overlay from the global shortcut block in `app.rs`.
+pub fn help_overlay(ctx: &egui::Context, pal: &Palette) {
+    egui::Area::new(egui::Id::new("shortcut-help"))
+        .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
+        .order(egui::Order::Foreground)
+        .show(ctx, |ui| {
+            egui::Frame::window(ui.style())
+                .fill(pal.card_bg)
+                .stroke(Stroke::new(1.0, pal.accent))
+                .inner_margin(egui::Margin::same(16))
+                .show(ui, |ui| {
+                    ui.set_max_width(430.0);
+                    ui.label(
+                        egui::RichText::new(i18n::tr(K::HelpTitle))
+                            .size(16.0)
+                            .strong(),
+                    );
+                    ui.add_space(8.0);
+                    egui::Grid::new("shortcut-help-grid")
+                        .num_columns(2)
+                        .spacing([18.0, 5.0])
+                        .show(ui, |ui| {
+                            for (combo, description) in shortcut_rows(i18n::lang()) {
+                                ui.label(
+                                    egui::RichText::new(combo)
+                                        .size(13.0)
+                                        .strong()
+                                        .color(pal.accent),
+                                );
+                                ui.label(egui::RichText::new(description).size(13.0));
+                                ui.end_row();
+                            }
+                        });
+                });
+        });
+}
+
+/// One row of the F1 overlay: the key combination as the user would say it
+/// (key names follow the UI language, e.g. "Strg+F" in German) and what it
+/// does. Takes the language explicitly so it stays testable without touching
+/// the process-global language. The table/row gestures (arrows, Enter, Space,
+/// Menu key) word what the tables implement.
+fn shortcut_rows(lang: i18n::Lang) -> Vec<(String, &'static str)> {
+    let tr = |key: K| i18n::tr_in(lang, key);
+    let ctrl = tr(K::KeyCtrl);
+    let shift = tr(K::KeyShift);
+    vec![
+        ("F5".to_owned(), tr(K::HelpRefresh)),
+        (format!("{ctrl}+F / {}+F", tr(K::KeyAlt)), tr(K::HelpSearch)),
+        (format!("{ctrl}+{}", tr(K::KeyTabKey)), tr(K::HelpNextPage)),
+        (
+            format!("{ctrl}+{shift}+{}", tr(K::KeyTabKey)),
+            tr(K::HelpPrevPage),
+        ),
+        (format!("{ctrl}+1…9"), tr(K::HelpJumpPage)),
+        (tr(K::KeyDel).to_owned(), tr(K::HelpEndTask)),
+        (
+            format!("{} / {shift}+F10", tr(K::KeyMenuKey)),
+            tr(K::HelpContextMenu),
+        ),
+        (tr(K::KeyArrows).to_owned(), tr(K::HelpMoveSelection)),
+        (tr(K::KeyEnter).to_owned(), tr(K::HelpRowAction)),
+        (tr(K::KeySpace).to_owned(), tr(K::HelpToggleSelect)),
+        (tr(K::KeyTabKey).to_owned(), tr(K::HelpTabGeneral)),
+        (tr(K::KeyEsc).to_owned(), tr(K::HelpEscGeneral)),
+        ("F1".to_owned(), tr(K::HelpToggleHelp)),
+    ]
 }
 
 // ---------------------------------------------------------------- dialogs
@@ -1785,6 +1969,64 @@ pub(crate) fn update_end_task_dialog_focus(
 mod tests {
     use super::*;
     use std::time::{Duration, Instant};
+
+    /// The search field gives the keyboard back exactly when a click lands
+    /// outside its box: a click on a row (or on dead window space) must let
+    /// the next Arrow key move the table selection, while a click inside the
+    /// box — including on its clear button — and frames without clicks keep
+    /// the focus where it is.
+    #[test]
+    fn search_focus_leaves_on_outside_click_only() {
+        let field = Rect::from_min_size(Pos2::new(100.0, 0.0), egui::vec2(495.0, 34.0));
+        // Click on a row somewhere left of the centered field.
+        assert!(click_surrenders_search(
+            true,
+            field,
+            Some(Pos2::new(50.0, 17.0))
+        ));
+        // Click inside the field, or on its clear button, keeps it.
+        assert!(!click_surrenders_search(true, field, Some(field.center())));
+        assert!(!click_surrenders_search(
+            true,
+            field,
+            Some(Pos2::new(field.right() - 18.0, field.center().y))
+        ));
+        // No click this frame, or a field that does not own focus: nothing.
+        assert!(!click_surrenders_search(true, field, None));
+        assert!(!click_surrenders_search(false, field, Some(Pos2::ZERO)));
+    }
+
+    /// Every F1 row exists in BOTH languages, with the key names the user's
+    /// keyboard actually prints ("Strg" on German layouts) and stable anchor
+    /// rows for the entries that read the same everywhere.
+    #[test]
+    fn help_overlay_rows_are_complete_and_localized() {
+        for lang in [i18n::Lang::De, i18n::Lang::En] {
+            let rows = shortcut_rows(lang);
+            assert_eq!(rows.len(), 13, "{lang:?}: every documented shortcut");
+            assert!(
+                rows.iter()
+                    .all(|(combo, text)| !combo.trim().is_empty() && !text.trim().is_empty()),
+                "{lang:?}: no empty combo or description"
+            );
+            assert_eq!(rows[0].0, "F5");
+            assert_eq!(rows[12].0, "F1");
+            let expected_ctrl = i18n::tr_in(lang, K::KeyCtrl);
+            assert_eq!(
+                rows[1].0,
+                format!("{expected_ctrl}+F / {}+F", i18n::tr_in(lang, K::KeyAlt))
+            );
+            assert_eq!(
+                rows[5].0,
+                i18n::tr_in(lang, K::KeyDel),
+                "Delete is a single localized key name"
+            );
+        }
+        // The German and English key names differ where it matters, so this
+        // really pins localization rather than two copies of one string.
+        assert_eq!(i18n::tr_in(i18n::Lang::De, K::KeyCtrl), "Strg");
+        assert_eq!(i18n::tr_in(i18n::Lang::En, K::KeyCtrl), "Ctrl");
+    }
 
     #[test]
     fn run_task_dialog_focus_cycles_forward_and_backward() {

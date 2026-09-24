@@ -336,6 +336,9 @@ pub struct TaskManApp {
     startup_impact_tracker: Option<tm_core::StartupImpactTracker>,
     pub tab: Tab,
     pub show_settings: bool,
+    /// F1 shortcut help overlay. Never persisted: it is a transient lookup,
+    /// not a state the app should restore into.
+    pub show_help: bool,
     pub run_dialog_open: bool,
     pub run_dialog_text: String,
     pub run_elevated: bool,
@@ -776,6 +779,7 @@ impl TaskManApp {
             startup_impact_tracker: None,
             tab,
             show_settings,
+            show_help: false,
             run_dialog_open,
             run_dialog_text: String::new(),
             run_elevated: false,
@@ -1419,6 +1423,77 @@ fn check_task_manager_replacement(
     }
 }
 
+/// Page-switch target for the global keyboard shortcuts, or `None` when the
+/// frame's keys name no page. `ctrl_tab` cycles forward over [`Tab::ALL`],
+/// `ctrl_shift_tab` cycles backward (both wrapping), and `ctrl_digit` — the
+/// 1-based digit as typed, 1..=9 — jumps directly, clamped to the page count.
+/// Pure so the shortcut contract is testable without a window.
+pub(crate) fn page_switch_target(
+    current: Tab,
+    ctrl_tab: bool,
+    ctrl_shift_tab: bool,
+    ctrl_digit: Option<usize>,
+) -> Option<Tab> {
+    let all = &Tab::ALL;
+    let len = all.len();
+    let position = |tab: Tab| {
+        all.iter()
+            .position(|candidate| *candidate == tab)
+            .unwrap_or(0)
+    };
+    if ctrl_tab {
+        return Some(all[(position(current) + 1) % len]);
+    }
+    if ctrl_shift_tab {
+        return Some(all[(position(current) + len - 1) % len]);
+    }
+    let digit = ctrl_digit?;
+    Some(all[(digit - 1).min(len - 1)])
+}
+
+/// The first process matching the global search, in the order the user reads
+/// the list: display name ascending (the tables' default sort), ties by pid.
+/// Synthetic pseudo-rows ("System Interrupts") are never search targets.
+pub(crate) fn first_search_match(
+    processes: &[tm_core::model::ProcessEntry],
+    q: &crate::search::Query,
+) -> Option<ProcessIdentity> {
+    processes
+        .iter()
+        .filter(|p| !p.synthetic && q.matches_process(p))
+        .min_by_key(|p| (p.shown_name().to_lowercase(), p.pid))
+        .map(|p| ProcessIdentity {
+            pid: p.pid,
+            start_epoch_s: p.start_epoch_s,
+        })
+}
+
+/// The candidate fields the Services page filters by — mirrors the filter in
+/// `tabs/services.rs` (`search::Query` over name, display name, description,
+/// group and pid). Keep the two in sync; the page owns its row model, so the
+/// commit cannot reuse it directly.
+fn service_matches_search(q: &crate::search::Query, s: &tm_core::model::ServiceInfo) -> bool {
+    let pid = s.pid.map(|pid| pid.to_string()).unwrap_or_default();
+    q.matches_any([
+        s.name.as_str(),
+        s.display_name.as_str(),
+        s.description.as_str(),
+        s.group.as_str(),
+        pid.as_str(),
+    ])
+}
+
+/// The candidate fields the Startup page filters by — mirrors the filter in
+/// `tabs/startup.rs`. Keep the two in sync.
+fn startup_matches_search(q: &crate::search::Query, item: &tm_core::model::StartupItem) -> bool {
+    q.matches_any([
+        item.name.as_str(),
+        item.publisher.as_deref().unwrap_or(""),
+        item.command.as_str(),
+        item.location.as_str(),
+    ])
+}
+
 /// Parse a `--tab=` value (accepts both English and German aliases).
 fn tab_from_cli(name: &str) -> Option<Tab> {
     match name.to_ascii_lowercase().as_str() {
@@ -1580,6 +1655,12 @@ impl eframe::App for TaskManApp {
         }
         crate::app_ui::draw_toasts(self, &ctx);
 
+        // F1 shortcut help. Contains nothing focusable, so Tab passes
+        // straight through it; Esc closes (handled with the shortcuts below).
+        if self.show_help {
+            crate::app_ui::help_overlay(&ctx, &pal);
+        }
+
         // Frame-rate diagnostics overlay (TASKMAN_FPS_PROBE=1).
         if self.fps_probe {
             self.update_fps_probe(&ctx);
@@ -1594,25 +1675,46 @@ impl eframe::App for TaskManApp {
         // Native shortcut: Delete on Processes/Details requests process
         // termination. It is confirmation-only and never steals Delete from
         // a text editor or from another modal operation.
-        let modal_open = self.show_settings
-            || self.run_dialog_open
-            || self.affinity_dialog.is_some()
-            || self.pending_session_logoff.is_some()
-            || self.pending_service_control.is_some()
-            || self.pending_app_history_clear
-            || self.pending_process_end.is_some()
-            || self.pending_uac_virtualization.is_some()
-            || self.startup_props.is_some()
-            || self.proc_props.is_some()
-            || self.module_dialog.is_some()
-            || self.active_dump.is_some()
-            || self.details_state.select_columns_open;
+        let modal_open = self.modal_open();
         if !modal_open
             && matches!(self.tab, Tab::Processes | Tab::Details)
             && !ctx.egui_wants_keyboard_input()
             && ctx.input(|i| i.key_pressed(egui::Key::Delete))
         {
             self.confirm_selected_process_end();
+        }
+
+        // Global page switching: Ctrl+Tab / Ctrl+Shift+Tab cycle the pages in
+        // `Tab::ALL` order, Ctrl+1..9 jumps directly. Open dialogs keep
+        // keyboard ownership (same gate as Delete); inside a text edit the
+        // Ctrl-modified keys insert nothing (see the search shortcut below),
+        // so switching pages from a focused search field is safe — exactly
+        // what native Task Manager does with Ctrl+Tab.
+        if !modal_open {
+            let page_keys = [
+                egui::Key::Num1,
+                egui::Key::Num2,
+                egui::Key::Num3,
+                egui::Key::Num4,
+                egui::Key::Num5,
+                egui::Key::Num6,
+                egui::Key::Num7,
+                egui::Key::Num8,
+                egui::Key::Num9,
+            ];
+            let (next, prev, digit) = ctx.input(|i| {
+                (
+                    i.modifiers.ctrl && !i.modifiers.shift && i.key_pressed(egui::Key::Tab),
+                    i.modifiers.ctrl && i.modifiers.shift && i.key_pressed(egui::Key::Tab),
+                    page_keys
+                        .iter()
+                        .position(|key| i.key_pressed(*key) && i.modifiers.ctrl)
+                        .map(|index| index + 1),
+                )
+            });
+            if let Some(target) = page_switch_target(self.tab, next, prev, digit) {
+                self.tab = target;
+            }
         }
 
         // Global search shortcut (audit §5): Alt+F as documented by native
@@ -1625,6 +1727,21 @@ impl eframe::App for TaskManApp {
         if search_focus {
             let id = egui::Id::new("global-search");
             ctx.memory_mut(|m| m.request_focus(id));
+        }
+
+        // F1 shortcut help: a lookup, toggled — never persisted, never opened
+        // on top of a dialog or a menu (they own the keyboard while up). Esc
+        // closes it; the search panel holds its own Esc clear while the
+        // overlay is up so one keystroke does only one thing.
+        if !modal_open && ctx.input(|i| i.key_pressed(egui::Key::F1)) {
+            self.show_help = !self.show_help;
+        }
+        if self.show_help
+            && !modal_open
+            && !egui::Popup::is_any_open(&ctx)
+            && ctx.input(|i| i.key_pressed(egui::Key::Escape))
+        {
+            self.show_help = false;
         }
 
         // Track window size for persistence (only while remembering). A
@@ -1709,6 +1826,119 @@ pub(crate) fn push_history_point(history: &mut Vec<HistoryPoint>, cap: usize, pt
 impl TaskManApp {
     pub fn latest_snapshot(&self) -> Option<Arc<Snapshot>> {
         self.engine.latest()
+    }
+
+    /// Is any confirmation or modal dialog open? While one is up it owns the
+    /// keyboard: global shortcuts (Delete, page switching, F1) and the search
+    /// panel's Escape-to-clear must all stand down. The shell parts of the UI
+    /// (search panel) evaluate this before the dialogs of a frame run, so it
+    /// deliberately reflects the dialogs of the PREVIOUS frame plus any opened
+    /// earlier in this one — a single keystroke cannot both open a dialog and
+    /// race past the gate in the same frame.
+    pub fn modal_open(&self) -> bool {
+        self.show_settings
+            || self.run_dialog_open
+            || self.affinity_dialog.is_some()
+            || self.pending_session_logoff.is_some()
+            || self.pending_service_control.is_some()
+            || self.pending_app_history_clear
+            || self.pending_process_end.is_some()
+            || self.pending_uac_virtualization.is_some()
+            || self.startup_props.is_some()
+            || self.proc_props.is_some()
+            || self.module_dialog.is_some()
+            || self.active_dump.is_some()
+            || self.details_state.select_columns_open
+    }
+
+    /// Enter in the global search box commits the search: the current page's
+    /// selection lands on a match, so the arrow keys — which the field stops
+    /// owning when egui surrenders its focus on Enter — walk the filtered list
+    /// from there. A selection that is itself a match is kept (it IS the
+    /// committed result); anything else is replaced by the first match.
+    /// Returns whether a selection is in place after the commit. Pages whose
+    /// row models live behind their own modules (Users, App history) or that
+    /// have no search box (Performance) keep their selection untouched —
+    /// Enter still surrenders the field's focus, so navigation works there.
+    pub fn commit_search_selection(&mut self) -> bool {
+        if self.search.trim().is_empty() {
+            return false;
+        }
+        let q = crate::search::Query::new(&self.search);
+        match self.tab {
+            Tab::Performance => false,
+            Tab::Processes | Tab::Details => {
+                let Some(snapshot) = self.latest_snapshot() else {
+                    return false;
+                };
+                let selected_matches = self.selection.primary().is_some_and(|identity| {
+                    snapshot.process(identity.pid).is_some_and(|p| {
+                        p.start_epoch_s == identity.start_epoch_s && q.matches_process(p)
+                    })
+                });
+                if selected_matches {
+                    return true;
+                }
+                let Some(identity) = first_search_match(&snapshot.processes, &q) else {
+                    return false;
+                };
+                self.selection.select_single(identity);
+                true
+            }
+            Tab::Services => {
+                let guard = tm_core::sync::lock(&self.shared.services_cache);
+                let Some(cache) = guard.as_ref() else {
+                    return false;
+                };
+                let selected_matches = self.services_selected_name.as_deref().is_some_and(|name| {
+                    cache
+                        .items
+                        .iter()
+                        .any(|s| s.name == name && service_matches_search(&q, s))
+                });
+                if selected_matches {
+                    return true;
+                }
+                let Some(service) = cache
+                    .items
+                    .iter()
+                    .filter(|s| service_matches_search(&q, s))
+                    .min_by_key(|s| s.name.to_lowercase())
+                else {
+                    return false;
+                };
+                self.services_selected_name = Some(service.name.clone());
+                true
+            }
+            Tab::Startup => {
+                let mut guard = tm_core::sync::lock(&self.shared.startup_cache);
+                let Some((items, _)) = guard.as_mut() else {
+                    return false;
+                };
+                let selected_matches = self.selected_startup_id.as_deref().is_some_and(|id| {
+                    items
+                        .iter()
+                        .any(|item| item.id == id && startup_matches_search(&q, item))
+                });
+                if selected_matches {
+                    return true;
+                }
+                let Some(item) = items
+                    .iter()
+                    .filter(|item| startup_matches_search(&q, item))
+                    .min_by_key(|item| item.name.to_lowercase())
+                else {
+                    return false;
+                };
+                self.selected_startup_id = Some(item.id.clone());
+                true
+            }
+            // The Users page matches sessions by display name and per-user
+            // app aggregates, App history by app display name; neither page
+            // exposes a selection model reachable from here. Enter simply
+            // surrenders the field's focus (arrow keys then work).
+            Tab::Users | Tab::AppHistory => false,
+        }
     }
 
     /// Whether a stored process identity still matches the live snapshot
@@ -2343,5 +2573,132 @@ mod tests {
                 "newest point lost at tick {t}"
             );
         }
+    }
+
+    fn proc(pid: u32, name: &str, display: &str) -> tm_core::model::ProcessEntry {
+        let mut p = tm_core::model::ProcessEntry::new(pid, name);
+        p.display = display.to_string();
+        p
+    }
+
+    /// Ctrl+Tab / Ctrl+Shift+Tab walk the pages in `Tab::ALL` order and wrap;
+    /// Ctrl+1..9 jumps directly and clamps past the last page. No keys, no
+    /// switch — the shortcut block must stay quiet on an ordinary frame.
+    #[test]
+    fn page_switch_cycles_wraps_and_clamps() {
+        let all = Tab::ALL;
+        let last = all[all.len() - 1];
+
+        // Forward and backward cycling with wraparound.
+        assert_eq!(page_switch_target(all[0], true, false, None), Some(all[1]));
+        assert_eq!(page_switch_target(last, true, false, None), Some(all[0]));
+        assert_eq!(
+            page_switch_target(all[0], false, true, None),
+            Some(last),
+            "backward from the first page wraps to the last"
+        );
+        assert_eq!(page_switch_target(all[2], false, true, None), Some(all[1]));
+
+        // Direct jumps, 1-based, clamped to the page count (7 pages here).
+        assert_eq!(
+            page_switch_target(all[3], false, false, Some(1)),
+            Some(all[0])
+        );
+        assert_eq!(
+            page_switch_target(all[0], false, false, Some(all.len())),
+            Some(last)
+        );
+        assert_eq!(
+            page_switch_target(all[0], false, false, Some(9)),
+            Some(last),
+            "Ctrl+9 on a 7-page app lands on the last page"
+        );
+
+        // No page-switch key: nothing happens.
+        assert_eq!(page_switch_target(all[0], false, false, None), None);
+    }
+
+    /// Enter in the search box commits to the first match the way the list
+    /// reads: display name ascending, ties by pid — and never on a synthetic
+    /// pseudo-row.
+    #[test]
+    fn first_search_match_follows_display_order_and_skips_synthetic() {
+        let q = crate::search::Query::new("svc");
+        let rows = vec![
+            proc(30, "alpha.exe", "Alpha svc"), // matches by display name
+            proc(20, "svchost.exe", "svchost"), // tie by name, higher pid
+            proc(10, "svchost.exe", "svchost"), // tie by name, lower pid
+            proc(40, "other.exe", "unrelated"),
+            {
+                let mut synthetic = proc(5, "svchost.exe", "svchost");
+                synthetic.synthetic = true;
+                synthetic
+            },
+        ];
+        // Display-name ascending: "Alpha svc" sorts ahead of "svchost".
+        assert_eq!(first_search_match(&rows, &q).map(|p| p.pid), Some(30));
+        // The svchost tie resolves by pid, and the synthetic pseudo-row (which
+        // would win on both name and pid) is never a search target.
+        assert_eq!(
+            first_search_match(&rows, &crate::search::Query::new("svchost")).map(|p| p.pid),
+            Some(10)
+        );
+
+        assert!(first_search_match(&rows, &crate::search::Query::new("nothing-here")).is_none());
+    }
+
+    /// The Services and Startup commit paths must filter by the SAME fields
+    /// their tables do, so a query that shows a row can also land on it.
+    #[test]
+    fn service_and_startup_commit_matches_mirror_their_tables() {
+        let service = tm_core::model::ServiceInfo {
+            name: "Dnscache".into(),
+            display_name: "DNS Client".into(),
+            description: "Resolves DNS names".into(),
+            pid: Some(1234),
+            group: "Network".into(),
+            ..Default::default()
+        };
+        assert!(service_matches_search(
+            &crate::search::Query::new("dns"),
+            &service
+        ));
+        assert!(service_matches_search(
+            &crate::search::Query::new("1234"),
+            &service
+        ));
+        assert!(service_matches_search(
+            &crate::search::Query::new("network"),
+            &service
+        ));
+        assert!(!service_matches_search(
+            &crate::search::Query::new("spooler"),
+            &service
+        ));
+
+        let item = tm_core::model::StartupItem {
+            id: "one-drive".into(),
+            name: "OneDrive".into(),
+            command: r"C:\Program Files\OneDrive.exe /background".into(),
+            location: r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run".into(),
+            publisher: Some("Microsoft".into()),
+            ..Default::default()
+        };
+        assert!(startup_matches_search(
+            &crate::search::Query::new("onedrive"),
+            &item
+        ));
+        assert!(startup_matches_search(
+            &crate::search::Query::new("microsoft"),
+            &item
+        ));
+        assert!(startup_matches_search(
+            &crate::search::Query::new("currentversion"),
+            &item
+        ));
+        assert!(!startup_matches_search(
+            &crate::search::Query::new("steam"),
+            &item
+        ));
     }
 }

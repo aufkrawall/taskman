@@ -58,6 +58,30 @@ User name column is redacted in this capture.
   optional Task Manager replacement (IFEO), German/English localization,
   and light/dark themes.
 
+## Keyboard shortcuts
+
+The full, localized list is always one keystroke away: press <kbd>F1</kbd>
+for the in-app help.
+
+| Keys | Action |
+| --- | --- |
+| <kbd>F5</kbd> | Refresh data (also refreshes tab-local caches while paused) |
+| <kbd>Ctrl</kbd>+<kbd>F</kbd> / <kbd>Alt</kbd>+<kbd>F</kbd> | Focus the process search |
+| <kbd>Ctrl</kbd>+<kbd>Tab</kbd> | Next page |
+| <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>Tab</kbd> | Previous page |
+| <kbd>Ctrl</kbd>+<kbd>1</kbd>…<kbd>9</kbd> | Jump directly to page 1–9 |
+| <kbd>Del</kbd> | End the selected processes (asks for confirmation; Processes/Details) |
+| <kbd>Menu</kbd> / <kbd>Shift</kbd>+<kbd>F10</kbd> | Open the context menu of the selection |
+| <kbd>↑</kbd> <kbd>↓</kbd> | Move the table selection |
+| <kbd>Enter</kbd> | Run the row action / commit the search |
+| <kbd>Space</kbd> | Add or remove the row from the selection |
+| <kbd>Tab</kbd> / <kbd>Shift</kbd>+<kbd>Tab</kbd> | Move between controls |
+| <kbd>Esc</kbd> | Close a dialog / clear the search |
+| <kbd>F1</kbd> | Show or hide this help |
+
+Open dialogs keep keyboard ownership while they are up: the global
+shortcuts above stand down until the dialog is closed.
+
 ## Requirements
 
 - Windows 11 (developed for and tested on; Linux/macOS platform backends
