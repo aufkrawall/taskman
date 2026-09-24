@@ -17,7 +17,7 @@ use tm_core::error::{Result, TmError};
 use tm_core::model::PriorityClass;
 use windows::Win32::Foundation::{
     CloseHandle, ERROR_FILE_NOT_FOUND, ERROR_NO_DATA, ERROR_PIPE_BUSY, ERROR_PIPE_CONNECTED,
-    HANDLE, HLOCAL, LocalFree, WAIT_OBJECT_0, WAIT_TIMEOUT,
+    HANDLE, HLOCAL, LocalFree,
 };
 use windows::Win32::Security::Authorization::{
     ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
@@ -41,8 +41,8 @@ use windows::Win32::System::Pipes::{
     PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE, PIPE_WAIT, WaitNamedPipeW,
 };
 use windows::Win32::System::Threading::{
-    GetCurrentProcess, OpenProcess, OpenProcessToken, PROCESS_ACCESS_RIGHTS,
-    PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW, WaitForSingleObject,
+    GetCurrentProcess, OpenProcess, OpenProcessToken, PROCESS_QUERY_LIMITED_INFORMATION,
+    QueryFullProcessImageNameW,
 };
 use windows::core::{PCWSTR, PWSTR};
 
@@ -196,13 +196,13 @@ enum BrokerRequest {
 
 /// Cumulative per-process network bytes as answered by the broker.
 ///
-/// This is the protocol's only telemetry response, and it is deliberately
+/// This is the protocol's network telemetry response, and it is deliberately
 /// shaped to stay small and unambiguous:
 /// * `active` distinguishes "the trace is running, so a process missing from
 ///   `entries` moved zero bytes" from "no trace, the answer is unknown". The
 ///   product invariant is that unknown must never render as zero.
 /// * only processes with non-zero counters are listed; on a normal desktop
-///   that is a few dozen entries, far inside the 64 KiB response cap.
+///   that is a few dozen entries, far inside the 512 KiB response cap.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProcessNetworkSample {
@@ -641,6 +641,94 @@ impl BrokerClient {
     }
 }
 
+/// One bounded lane for sampler telemetry. A service that accepted a pipe but
+/// stopped answering must not park the sampling engine forever. A timed-out
+/// call may leave this one worker blocked, but no new workers or requests are
+/// created until it completes.
+type TelemetryReply = std::result::Result<BrokerValue, BrokerCallError>;
+type TelemetryJob = (BrokerRequest, std::sync::mpsc::Sender<TelemetryReply>);
+
+struct TelemetryBroker {
+    tx: std::sync::mpsc::SyncSender<TelemetryJob>,
+    busy: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl TelemetryBroker {
+    fn start_with(
+        handler: impl Fn(BrokerRequest) -> std::result::Result<BrokerValue, BrokerCallError>
+        + Send
+        + 'static,
+    ) -> Option<Self> {
+        use std::sync::atomic::Ordering;
+        let (tx, rx) = std::sync::mpsc::sync_channel::<TelemetryJob>(1);
+        let busy = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let worker_busy = busy.clone();
+        std::thread::Builder::new()
+            .name("tm-broker-telemetry".into())
+            .spawn(move || {
+                while let Ok((request, reply)) = rx.recv() {
+                    let result = handler(request);
+                    worker_busy.store(false, Ordering::Release);
+                    let _ = reply.send(result);
+                }
+            })
+            .ok()?;
+        Some(Self { tx, busy })
+    }
+
+    fn call_with_timeout(
+        &self,
+        request: BrokerRequest,
+        timeout: std::time::Duration,
+    ) -> std::result::Result<BrokerValue, BrokerCallError> {
+        use std::sync::atomic::Ordering;
+        if self
+            .busy
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return Err(BrokerCallError::Unavailable(
+                "telemetry request still in flight".into(),
+            ));
+        }
+        let (reply, response) = std::sync::mpsc::channel();
+        if self.tx.try_send((request, reply)).is_err() {
+            self.busy.store(false, Ordering::Release);
+            return Err(BrokerCallError::Unavailable(
+                "telemetry worker stopped".into(),
+            ));
+        }
+        match response.recv_timeout(timeout) {
+            Ok(result) => result,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                if broker_warning_allowed() {
+                    tracing::warn!("core-service telemetry response timed out");
+                }
+                Err(BrokerCallError::Unavailable(
+                    "telemetry response timed out".into(),
+                ))
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Err(
+                BrokerCallError::Unavailable("telemetry worker stopped".into()),
+            ),
+        }
+    }
+}
+
+fn telemetry_broker_call(
+    request: BrokerRequest,
+) -> std::result::Result<BrokerValue, BrokerCallError> {
+    static WORKER: std::sync::OnceLock<Option<TelemetryBroker>> = std::sync::OnceLock::new();
+    let Some(worker) =
+        WORKER.get_or_init(|| TelemetryBroker::start_with(|request| BrokerClient.call(request)))
+    else {
+        return Err(BrokerCallError::Unavailable(
+            "telemetry worker could not start".into(),
+        ));
+    };
+    worker.call_with_timeout(request, std::time::Duration::from_secs(2))
+}
+
 /// Outcome of asking the broker for per-process network counters.
 ///
 /// `Unavailable` and `Rejected` are kept apart on purpose: the first means
@@ -655,7 +743,7 @@ pub(crate) enum BrokeredNetwork {
 
 /// Ask the protected service for per-process network counters.
 pub(crate) fn brokered_process_network() -> BrokeredNetwork {
-    match BrokerClient.call(BrokerRequest::ProcessNetworkCounters) {
+    match telemetry_broker_call(BrokerRequest::ProcessNetworkCounters) {
         Ok(BrokerValue::ProcessNetwork(sample)) => BrokeredNetwork::Sample(sample),
         Ok(_) => BrokeredNetwork::Rejected("unexpected response type".into()),
         Err(BrokerCallError::Unavailable(_)) => BrokeredNetwork::Unavailable,
@@ -673,7 +761,7 @@ pub(crate) enum BrokeredDisk {
 
 /// Ask the protected service for per-process disk activity.
 pub(crate) fn brokered_process_disk() -> BrokeredDisk {
-    match BrokerClient.call(BrokerRequest::ProcessDiskCounters) {
+    match telemetry_broker_call(BrokerRequest::ProcessDiskCounters) {
         Ok(BrokerValue::ProcessDisk(sample)) => BrokeredDisk::Sample(sample),
         Ok(_) => BrokeredDisk::Rejected("unexpected response type".into()),
         Err(BrokerCallError::Unavailable(_)) => BrokeredDisk::Unavailable,
@@ -1523,13 +1611,11 @@ fn valid_service_name(name: &str) -> bool {
 const NET_TRACE_IDLE: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Hard cap on entries in one response, sized so even worst-case counters fit
-/// `MAX_RESPONSE_BYTES`: a maximal entry encodes to ~79 bytes
-/// (`{"pid":4294967295,"received":<u64>,"sent":<u64>},`), so 64 KiB holds
-/// roughly 820. A desktop produces a few dozen entries, so this only exists so
-/// a pathological machine cannot push the frame past the cap and turn the
-/// feature into a hard error. Pinned by
+/// `MAX_RESPONSE_BYTES`. A desktop produces a few dozen entries. Above the
+/// cap the entire answer is unknown; omitting active processes and rendering
+/// them as measured zero would violate the telemetry contract. Pinned by
 /// `a_capped_network_response_fits_the_frame_limit`.
-const NET_MAX_ENTRIES: usize = 700;
+const NET_MAX_ENTRIES: usize = 5_000;
 
 /// The broker-hosted ETW trace. Started on the first request and stopped by a
 /// watchdog once the GUI stops asking, so the service is not tracing whenever
@@ -1578,7 +1664,7 @@ fn process_network_sample() -> ProcessNetworkSample {
     trace.last_request = std::time::Instant::now();
     let live = live_pids();
     let totals = trace.usage.totals_pruned(&live);
-    let mut entries: Vec<ProcessNetworkEntry> = totals
+    let entries: Vec<ProcessNetworkEntry> = totals
         .into_iter()
         .filter(|(_, bytes)| bytes.received != 0 || bytes.sent != 0)
         .map(|(pid, bytes)| ProcessNetworkEntry {
@@ -1588,11 +1674,13 @@ fn process_network_sample() -> ProcessNetworkSample {
         })
         .collect();
     if entries.len() > NET_MAX_ENTRIES {
-        // Keep the busiest; a truncated tail is all near-zero anyway.
-        entries.sort_unstable_by_key(|entry| {
-            std::cmp::Reverse(entry.received.saturating_add(entry.sent))
-        });
-        entries.truncate(NET_MAX_ENTRIES);
+        if broker_warning_allowed() {
+            tracing::warn!(
+                count = entries.len(),
+                "network response exceeds the frame budget"
+            );
+        }
+        return ProcessNetworkSample::default();
     }
     ProcessNetworkSample {
         active: true,
@@ -1600,11 +1688,11 @@ fn process_network_sample() -> ProcessNetworkSample {
     }
 }
 
-/// Hard cap on entries in one disk response. A maximal entry encodes to about
-/// 105 bytes, so the same 64 KiB budget as the network answer holds roughly
-/// 620; a desktop produces a few dozen. Pinned by
+/// Hard cap on entries in one disk response. Worst-case JSON stays below the
+/// 512 KiB response frame. Overflow is unavailable rather than a false zero
+/// on omitted processes. Pinned by
 /// `a_capped_disk_response_fits_the_frame_limit`.
-const DISK_MAX_ENTRIES: usize = 550;
+const DISK_MAX_ENTRIES: usize = 3_400;
 
 /// The broker-hosted per-process disk trace, with the same idle watchdog as
 /// the network one.
@@ -1656,7 +1744,7 @@ fn process_disk_sample() -> ProcessDiskSample {
     let live = live_pids();
     let window = trace.usage.take_window(&live);
     let total_service_time = window.total_service_time();
-    let mut entries: Vec<ProcessDiskEntry> = window
+    let entries: Vec<ProcessDiskEntry> = window
         .procs
         .into_iter()
         .filter(|(_, disk)| disk.ops != 0)
@@ -1669,10 +1757,13 @@ fn process_disk_sample() -> ProcessDiskSample {
         })
         .collect();
     if entries.len() > DISK_MAX_ENTRIES {
-        // Keep the busiest; the truncated tail is all near-zero anyway, and
-        // `total_service_time` still counts it so no share is inflated.
-        entries.sort_unstable_by_key(|entry| std::cmp::Reverse(entry.service_time));
-        entries.truncate(DISK_MAX_ENTRIES);
+        if broker_warning_allowed() {
+            tracing::warn!(
+                count = entries.len(),
+                "disk response exceeds the frame budget"
+            );
+        }
+        return ProcessDiskSample::default();
     }
     ProcessDiskSample {
         active: true,
@@ -2937,43 +3028,32 @@ fn stop_service_for_upgrade(
             ),
         ));
     }
-    let pid = status.process_id.ok_or_else(|| {
-        TmError::platform("upgrade core service", "running service has no process id")
-    })?;
-    let process = unsafe { OpenProcess(PROCESS_ACCESS_RIGHTS(0x0010_0000), false, pid) }
-        .map_err(|error| TmError::platform("open core service process", error.to_string()))?;
-
-    let stop_result = if status.current_state == ServiceState::Running {
-        service
-            .stop()
-            .map(|_| ())
-            .map_err(|error| TmError::platform("stop core service for upgrade", error.to_string()))
-    } else {
-        Ok(())
-    };
-    if let Err(error) = stop_result {
-        unsafe {
-            let _ = CloseHandle(process);
+    if status.current_state == ServiceState::Running {
+        service.stop().map_err(|error| {
+            TmError::platform("stop core service for upgrade", error.to_string())
+        })?;
+    }
+    // The elevated installer can control the SCM service yet be denied
+    // SYNCHRONIZE on its LocalSystem process. SCM status is the
+    // authority for whether its executable is still in use.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    loop {
+        let current = service
+            .query_status()
+            .map_err(|error| TmError::platform("query stopping core service", error.to_string()))?;
+        if current.current_state == ServiceState::Stopped {
+            return Ok(());
         }
-        return Err(error);
-    }
-
-    let wait = unsafe { WaitForSingleObject(process, 20_000) };
-    unsafe {
-        let _ = CloseHandle(process);
-    }
-    if wait == WAIT_OBJECT_0 {
-        Ok(())
-    } else if wait == WAIT_TIMEOUT {
-        Err(TmError::platform(
-            "upgrade core service",
-            "timed out waiting for the old service process to exit",
-        ))
-    } else {
-        Err(TmError::platform(
-            "upgrade core service",
-            std::io::Error::last_os_error().to_string(),
-        ))
+        if std::time::Instant::now() >= deadline {
+            return Err(TmError::platform(
+                "upgrade core service",
+                format!(
+                    "timed out waiting for service to stop (state {:?})",
+                    current.current_state
+                ),
+            ));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
     }
 }
 
@@ -3299,6 +3379,84 @@ mod tests {
             encoded.len() <= MAX_RESPONSE_BYTES,
             "worst-case response {} exceeds the {MAX_RESPONSE_BYTES}-byte cap",
             encoded.len()
+        );
+    }
+
+    #[test]
+    fn a_capped_disk_response_fits_the_frame_limit() {
+        let sample = ProcessDiskSample {
+            active: true,
+            window_ms: u64::MAX,
+            total_service_time: u64::MAX,
+            events_seen: u64::MAX,
+            events_decoded: u64::MAX,
+            entries: (0..DISK_MAX_ENTRIES as u32)
+                .map(|i| ProcessDiskEntry {
+                    pid: 100_000 + i,
+                    service_time: u64::MAX,
+                    read_bytes: u64::MAX,
+                    write_bytes: u64::MAX,
+                    ops: u64::MAX,
+                })
+                .collect(),
+        };
+        let response = BrokerResponse {
+            protocol_version: PROTOCOL_VERSION,
+            value: Ok(BrokerValue::ProcessDisk(sample)),
+        };
+        let encoded = serde_json::to_vec(&response).unwrap();
+        assert!(
+            encoded.len() <= MAX_RESPONSE_BYTES,
+            "{} > {MAX_RESPONSE_BYTES}",
+            encoded.len()
+        );
+    }
+
+    #[test]
+    fn stalled_telemetry_worker_has_a_deadline_and_recovers() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let (release, held) = std::sync::mpsc::channel();
+        let calls = std::sync::Arc::new(AtomicUsize::new(0));
+        let seen = calls.clone();
+        let worker = TelemetryBroker::start_with(move |_| {
+            if seen.fetch_add(1, Ordering::SeqCst) == 0 {
+                let _ = held.recv();
+            }
+            Ok(BrokerValue::ProcessNetwork(ProcessNetworkSample::default()))
+        })
+        .expect("worker starts");
+        assert!(matches!(
+            worker.call_with_timeout(
+                BrokerRequest::ProcessNetworkCounters,
+                std::time::Duration::from_millis(20)
+            ),
+            Err(BrokerCallError::Unavailable(_))
+        ));
+        assert!(matches!(
+            worker.call_with_timeout(
+                BrokerRequest::ProcessNetworkCounters,
+                std::time::Duration::from_millis(20)
+            ),
+            Err(BrokerCallError::Unavailable(_))
+        ));
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "one stalled request owns the lane"
+        );
+        release.send(()).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        while worker.busy.load(Ordering::Acquire) && std::time::Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        assert!(!worker.busy.load(Ordering::Acquire));
+        assert!(
+            worker
+                .call_with_timeout(
+                    BrokerRequest::ProcessNetworkCounters,
+                    std::time::Duration::from_secs(1)
+                )
+                .is_ok()
         );
     }
 

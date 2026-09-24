@@ -815,29 +815,9 @@ pub fn extract_executable_path(cmd: &str) -> Option<std::path::PathBuf> {
     if p.is_file() { Some(p) } else { None }
 }
 
-/// Search known system paths for a binary by process/image name.
-pub fn resolve_candidate_path(name: &str) -> Option<std::path::PathBuf> {
-    let norm = name.to_ascii_lowercase();
-    let stem = norm.strip_suffix(".exe").unwrap_or(&norm);
-    let exe_name = format!("{stem}.exe");
-
-    let candidates = [
-        std::path::PathBuf::from(r"C:\Windows\System32").join(&exe_name),
-        std::path::PathBuf::from(r"C:\Windows\System32\wbem").join(&exe_name),
-        std::path::PathBuf::from(r"C:\Windows\SysWOW64").join(&exe_name),
-        std::path::PathBuf::from(r"C:\Windows").join(&exe_name),
-        std::path::PathBuf::from(r"C:\Program Files (x86)\Microsoft\EdgeUpdate").join(&exe_name),
-        std::path::PathBuf::from(r"C:\Program Files\Microsoft GameInput\x64").join(&exe_name),
-        std::path::PathBuf::from(r"C:\Program Files\NVIDIA Corporation\Display.NvContainer")
-            .join(&exe_name),
-    ];
-    candidates.into_iter().find(|c| c.is_file())
-}
-
 #[derive(Debug, Clone, Default)]
 pub struct ServiceCatalog {
     pub paths_by_pid: std::collections::HashMap<u32, std::path::PathBuf>,
-    pub paths_by_name: std::collections::HashMap<String, std::path::PathBuf>,
     /// Display name(s) of the service(s) hosted by a PID — Task Manager's
     /// "Service Host: Windows Update". Empty for a process without services.
     pub names_by_pid: std::collections::HashMap<u32, Vec<String>>,
@@ -1004,28 +984,10 @@ pub fn service_catalog() -> ServiceCatalog {
                                         .or_insert_with(|| account.clone());
                                 }
 
-                                if let Some(path) = clean {
-                                    if pid != 0 {
-                                        catalog
-                                            .paths_by_pid
-                                            .entry(pid)
-                                            .or_insert_with(|| path.clone());
-                                    }
-                                    if let Some(file_name) =
-                                        path.file_name().and_then(|f| f.to_str())
-                                    {
-                                        let norm = file_name.to_ascii_lowercase();
-                                        let stem =
-                                            norm.strip_suffix(".exe").unwrap_or(&norm).to_string();
-                                        catalog
-                                            .paths_by_name
-                                            .entry(norm.clone())
-                                            .or_insert_with(|| path.clone());
-                                        catalog
-                                            .paths_by_name
-                                            .entry(stem.clone())
-                                            .or_insert_with(|| path.clone());
-                                    }
+                                if pid != 0
+                                    && let Some(path) = clean
+                                {
+                                    catalog.paths_by_pid.entry(pid).or_insert(path);
                                 }
                             }
                         }
@@ -2560,13 +2522,11 @@ mod tests {
         );
     }
 
-    /// The User column was empty for most of the process list because the
-    /// only source was sysinfo's token read. This asserts the native path
-    /// answers for THIS process (an ordinary user token) and for the session-0
-    /// service hosts an unelevated session cannot open with more than
-    /// QUERY_LIMITED access — the exact case that used to render "—".
+    /// The token path must resolve an ordinary user process. Windows can
+    /// deny TOKEN_QUERY for every protected service host to an unelevated
+    /// caller; the separate service-catalog test covers their account source.
     #[test]
-    fn token_identity_resolves_the_owning_account_including_service_hosts() {
+    fn token_identity_resolves_the_owning_account() {
         let own = token_identity(std::process::id()).expect("own process has an owner");
         assert!(!own.name.is_empty());
         assert!(
@@ -2577,25 +2537,6 @@ mod tests {
         assert!(
             own.sid.as_deref().is_some_and(|sid| sid.starts_with("S-")),
             "own SID must be a string SID: {own:?}"
-        );
-
-        // svchost.exe instances run as SYSTEM / LOCAL SERVICE / NETWORK
-        // SERVICE in session 0. At least one must resolve, otherwise the
-        // column is back to being blank for every system process.
-        let mut system = sysinfo::System::new();
-        system.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
-        let hosts: Vec<u32> = system
-            .processes()
-            .iter()
-            .filter(|(_, p)| p.name().eq_ignore_ascii_case("svchost.exe"))
-            .map(|(pid, _)| pid.as_u32())
-            .collect();
-        assert!(!hosts.is_empty(), "Windows always runs service hosts");
-        let resolved = hosts.iter().filter_map(|pid| token_identity(*pid)).count();
-        assert!(
-            resolved > 0,
-            "no service host owner resolved out of {} candidates",
-            hosts.len()
         );
     }
 
@@ -2929,7 +2870,7 @@ mod tests {
     fn service_catalog_discovers_active_services() {
         let catalog = service_catalog();
         assert!(
-            !catalog.paths_by_name.is_empty(),
+            !catalog.paths_by_pid.is_empty(),
             "Windows always has active services"
         );
         assert!(

@@ -1,6 +1,6 @@
 # Current State
 
-Last cross-checked: 2026-09-19
+Last cross-checked: 2026-09-24
 
 ## Summary
 
@@ -14,6 +14,27 @@ correctness, table interaction, Performance visuals, and advanced process
 diagnostics; remaining telemetry and accessibility work is itemized precisely
 in `known-debt.md`. Normal GUI startup remains unelevated; privileged controls
 can cross a protected, allowlisted service boundary after one explicit install.
+
+## 2026-09-24 correctness pass
+
+- Installed core-service upgrades stop and wait through SCM status rather than
+  opening the LocalSystem service process for `SYNCHRONIZE`. The GUI's repair
+  and switch controls clear their in-flight state on an error. Live upgrade
+  and rollback still need disposable-VM validation.
+- Windows process `exe_path` comes only from PID-bound handle, SCM, or kernel
+  lookups. A same-name file elsewhere on the machine is not an identity and
+  cannot select a saved priority or affinity rule. Session 0 or a familiar
+  process name alone also does not prove that a process runs as SYSTEM or has
+  the SYSTEM SID.
+- App History keeps a late deferred-load result and merges CPU/network deltas
+  collected while it was loading. Autosave cannot overwrite the previous file
+  before that merge. First-sighting rate estimates do not add usage when
+  cumulative counters already exist. On Linux/macOS, non-system processes are
+  tracked because those backends cannot establish visible-window ownership.
+- The GUI's broker telemetry calls use one worker and a two-second response
+  deadline. A silent service can make disk/network data unavailable but cannot
+  block the whole sampling engine indefinitely. Responses over the bounded
+  entry cap are unavailable rather than partial data read as measured zero.
 
 ## Background-cost contract (2026-09-19)
 

@@ -212,7 +212,7 @@ def linux_cross_command(profile: str, target: str = LINUX_TARGET) -> tuple[list[
             ["cross", "build", "--profile", profile, "--target", target],
             str(ROOT / "target" / target / profile),
         )
-    if have("cargo-zigbuild"):
+    if have("cargo-zigbuild") and have("zig"):
         # Pin the glibc ABI floor. cargo-zigbuild's default tracks the host's
         # glibc (2.30+ here), which excludes older LTS distros; 2.17 is the
         # oldest glibc zig ships stubs for and what Rust's own gnu std targets.

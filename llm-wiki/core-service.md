@@ -1,6 +1,6 @@
 # Protected Core Service
 
-Last cross-checked: 2026-08-31
+Last cross-checked: 2026-09-24
 
 Primary sources:
 
@@ -18,9 +18,9 @@ TaskMan uses a split-process design on Windows:
   settings, rendering, dialogs, tray state, user-selected output paths, and
   module inventory.
 - `taskman-service.exe` is a delayed-auto SCM service running as LocalSystem.
-  It owns only a small allowlist of privileged control operations. It does not
-  render, parse arbitrary command lines, collect cross-user telemetry, choose
-  output paths, or create dumps.
+  It owns a small allowlist of privileged controls and on-demand per-process
+  disk/network ETW counters. It does not render, parse arbitrary command lines,
+  choose output paths, or create dumps.
 - If the service is absent or genuinely unavailable, the GUI tries the same
   identity-checked operation under its own token. An explicit broker rejection
   never falls back, because that would turn a safety decision into permission.
@@ -34,7 +34,7 @@ contract.
 ## IPC and authorization
 
 - Protocol v5 uses `\\.\pipe\Taskman.Core.v1` with fixed 12-byte framed JSON.
-  Requests and responses are independently capped at 64 KiB; unknown request
+  Requests are capped at 64 KiB and responses at 512 KiB; unknown request
   fields are rejected.
 - The pipe rejects remote clients and uses first-instance creation to prevent
   pre-creation/squatting. Its protected DACL denies Network, grants full access
@@ -162,10 +162,14 @@ Constraints that keep it honest:
   "measured zero" only when `active` is true; otherwise the answer is unknown
   and the UI must render "—". Fabricating a zero is a product invariant
   violation, not a cosmetic one.
-- Only non-zero entries are sent, capped at `NET_MAX_ENTRIES` (700). A
-  worst-case entry encodes to ~79 bytes, so the cap keeps the frame inside
-  `MAX_RESPONSE_BYTES`; `a_capped_network_response_fits_the_frame_limit` pins
-  that arithmetic.
+- Only non-zero entries are sent, capped at `NET_MAX_ENTRIES` (5,000); disk
+  entries are capped at 3,400. Worst-case serialization tests pin both below
+  `MAX_RESPONSE_BYTES`. If either cap is exceeded, `active` is false for that
+  answer so omitted active processes cannot appear as measured zeros.
+- The GUI sends telemetry requests through one worker with a two-second
+  response deadline. A service that accepts a request but never replies can
+  occupy that worker, but the sampler continues with unavailable telemetry;
+  no additional worker threads are created while it is stuck.
 - The service owns the trace lifecycle: started on the first request, stopped
   by a watchdog after `NET_TRACE_IDLE` (30 s) without one, so it is not
   tracing when no window is showing the column.
@@ -310,8 +314,8 @@ self-check. The packaged service is 1,378,816 bytes.
   `Authenticated Users` pipe ACE.
 - Pipe workers use bounded synchronous I/O. An authenticated client can occupy
   both workers by connecting and stalling, although it cannot create unbounded
-  threads, buffers, or queues. Overlapped I/O with per-request deadlines is a
-  candidate after installed-service fault injection establishes safe timeout
-  values for slow control operations.
+  threads, buffers, or queues. The GUI's telemetry deadline limits its own
+  sampling freeze, but service workers and action requests still need
+  installed-service fault injection before per-request cancellation is added.
 - Processor-group-aware affinity (>64 logical CPUs) needs a versioned protocol
   extension; the current `u64` mask must not silently truncate.

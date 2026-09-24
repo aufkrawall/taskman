@@ -2,6 +2,33 @@
 
 ## Unreleased
 
+### Fixed
+
+- **Core-service upgrades:** replacing a running service now waits for SCM to
+  report it stopped without requiring access to the LocalSystem process
+  handle. A failed repair or switch also re-enables its Settings control.
+- **Wrong executable identity:** unreadable Windows processes no longer borrow
+  another same-named process's path, publisher, or saved scheduling rules;
+  their path stays unknown unless a PID-bound source resolves it.
+- **App History loss and overcounting:** a slow database load can no longer be
+  overwritten by autosave; new observations merge after it completes. The
+  first sighting of a busy process no longer adds an invented interval of CPU
+  or network usage.
+- **Misidentified service helpers:** Session 0 or a familiar process name
+  alone no longer labels an unreadable process as SYSTEM or assigns it
+  SYSTEM's SID.
+- **Stalled or crowded telemetry:** a core-service telemetry request has a
+  bounded wait, so a silent broker cannot freeze the sampling engine. A
+  response with more active processes than its frame can hold reports
+  unavailable rather than false zero readings.
+- **Linux release fallback:** an installed `cargo-zigbuild` without the `zig`
+  executable now selects the available self-contained musl build.
+
+### Improved
+
+- **App History on Linux and macOS:** non-system processes now accumulate
+  local usage history even where window ownership cannot be determined.
+
 ## 0.1.14 - 2026-09-23
 
 ### Fixed

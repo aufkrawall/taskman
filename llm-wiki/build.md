@@ -1,6 +1,6 @@
 # Build System
 
-Last verified: 2026-09-01
+Last verified: 2026-09-24
 
 Primary sources:
 - `build.py`
@@ -15,8 +15,9 @@ Primary sources:
    Windows this must produce both `taskman.exe` and `taskman-service.exe`.
 2. Linux x86_64 release build **by default** — the workspace ships a
    real Linux collector (`crates/tm-platform/src/linux/`). Toolchain
-   resolution: `cross` first, then `cargo-zigbuild` (both produce a glibc
-   binary, artifact `taskman-v<version>-linux-x86_64`; the zigbuild path is
+   resolution: `cross` first, then `cargo-zigbuild` when `zig` is also
+   available (both produce a glibc binary, artifact
+   `taskman-v<version>-linux-x86_64`; the zigbuild path is
    pinned to a glibc 2.17 ABI floor for old-LTS compatibility). Without either, the
    self-contained path is used: `x86_64-unknown-linux-musl` std (installed
    through rustup on demand) linked by the bundled `rust-lld` into a static

@@ -1,6 +1,6 @@
 # Known and Accepted Debt
 
-Last verified: 2026-09-21
+Last verified: 2026-09-24
 
 Primary sources:
 - `AGENTS.md`
@@ -112,12 +112,6 @@ items across Phases 2–6. The following concrete gaps remain:
   paths. Not attempted; it is a fork-level change that cannot be verified
   headlessly.
 
-- **Service upgrade over a RUNNING service fails.** `stop_service_for_upgrade`
-  opens the live service process with `SYNCHRONIZE` to wait for its exit, and
-  that `OpenProcess` returns access denied even from an elevated installer, so
-  `--core-service=install` aborts with "open core service process: Zugriff
-  verweigert". Workaround: `sc stop TaskmanCore` before installing. Not
-  investigated further; it predates the v2 work and only affects upgrades.
 - **CPU compatibility:** current `cpu_load.rs` intentionally matches the
   standardized time-based CPU metric. The legacy frequency-weighted
   **CPU Utility** provider/column/switcher still does not exist; do not mutate
@@ -209,14 +203,18 @@ remain follow-up rather than being simulated in headless tests:
   attacks, ACL readback, SCM failure recovery, multi-session denial, and no-service fallback in a
   disposable Windows VM. The automated gate intentionally does not mutate the
   developer machine's Program Files, ProgramData, registry, or SCM.
+- The 2026-09-24 upgrade change removes the denied LocalSystem process-handle
+  prerequisite and waits for SCM `Stopped`. It still needs a live running-
+  service upgrade and injected mid-copy failure test in that VM; source and
+  unit tests alone cannot establish rollback behavior.
 - The pipe authorizes exactly one installing user SID. Multi-user support must
   add explicit per-user enrollment/revocation and auditability; broadening the
   DACL to `Authenticated Users` is not acceptable.
-- Two workers, queue depth 16, 64 KiB frames, and 19 pipe instances bound
-  broker resource growth, but I/O is synchronous. An already authenticated
-  client can stall both workers. Validate slow legitimate operations under
-  load, then use overlapped I/O with explicit per-request deadlines if the VM
-  fault-injection matrix confirms safe timeout values.
+- Two workers, queue depth 16, 64 KiB requests / 512 KiB responses, and 20
+  pipe instances bound broker resource growth, but service-side I/O is
+  synchronous. An authenticated client can stall both workers. The GUI's
+  telemetry worker has a bounded response wait; slow control operations and
+  server-side cancellation still require VM fault injection.
 - Uninstall removes the service registration and user redirect but leaves the
   protected binaries/data. A signed standalone uninstaller could schedule
   cleanup after the GUI exits; in-place recursive deletion is intentionally not

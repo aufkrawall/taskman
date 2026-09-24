@@ -69,6 +69,13 @@ fn entry_key(p: &crate::model::ProcessEntry) -> String {
     p.name.to_ascii_lowercase()
 }
 
+fn history_eligible(category: ProcCategory, windows: bool) -> bool {
+    // Windows has a real visible-window App classification. The Unix
+    // collectors cannot establish that boundary (in particular on Wayland),
+    // so keep non-system process history useful instead of leaving it empty.
+    category == ProcCategory::App || (!windows && category == ProcCategory::Background)
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct DbFile {
     /// Epoch seconds when tracking started.
@@ -94,6 +101,7 @@ struct PrevTick {
 struct LoadState {
     loading: bool,
     since: std::time::Instant,
+    observing: bool,
 }
 
 impl Default for LoadState {
@@ -101,6 +109,7 @@ impl Default for LoadState {
         Self {
             loading: false,
             since: std::time::Instant::now(),
+            observing: false,
         }
     }
 }
@@ -117,6 +126,7 @@ pub struct AppHistoryDb {
     generation: u64,
     writer: Option<HistoryWriter>,
     load_rx: Option<std::sync::mpsc::Receiver<Option<String>>>,
+    save_after_load: bool,
 }
 
 /// Single serialized writer thread owning the `.tmp` path.
@@ -254,6 +264,7 @@ impl AppHistoryDb {
         db.state = LoadState {
             loading: true,
             since: std::time::Instant::now(),
+            observing: false,
         };
         db.attach_writer();
         let (tx, rx) = std::sync::mpsc::channel::<Option<String>>();
@@ -281,6 +292,19 @@ impl AppHistoryDb {
                     usage.network_available |= usage.network_bytes > 0;
                 }
                 self.since_epoch_s = dbf.since_epoch_s;
+                if self.state.observing {
+                    // A slow load may have allowed new observations. Those
+                    // counters cover time after startup, so add them to the
+                    // persisted baseline instead of replacing either side.
+                    for (key, current) in std::mem::take(&mut self.entries) {
+                        let loaded = dbf.entries.entry(key).or_default();
+                        loaded.cpu_seconds += current.cpu_seconds;
+                        loaded.network_bytes =
+                            loaded.network_bytes.saturating_add(current.network_bytes);
+                        loaded.network_available |= current.network_available;
+                    }
+                    dbf.names.extend(std::mem::take(&mut self.names));
+                }
                 self.entries = dbf.entries;
                 self.names = dbf.names;
             }
@@ -302,6 +326,7 @@ impl AppHistoryDb {
             generation: 0,
             writer: None,
             load_rx: None,
+            save_after_load: false,
         }
     }
 
@@ -318,6 +343,11 @@ impl AppHistoryDb {
     /// Wipe all accumulated usage ("Auslastungsverlauf löschen").
     /// Mutates state and enqueues one save; no synchronous disk I/O here.
     pub fn clear(&mut self) {
+        // A deliberate wipe outranks an unfinished disk read. Otherwise the
+        // late loader could restore the entries the user just deleted.
+        self.state.loading = false;
+        self.load_rx = None;
+        self.save_after_load = false;
         self.entries.clear();
         self.names.clear();
         self.prev.clear();
@@ -339,8 +369,9 @@ impl AppHistoryDb {
     }
 
     /// Adopt asynchronously loaded file contents once ready. Returns true
-    /// when this call completed the load. A hung/slow loader (>2 s) gives up
-    /// so observation resumes rather than staying blocked forever.
+    /// when this call completed the load or resumed observation. After two
+    /// seconds observation may resume, but the late file is still adopted
+    /// before any save can replace it.
     pub fn poll_load(&mut self) -> bool {
         if !self.state.loading {
             return false;
@@ -363,9 +394,14 @@ impl AppHistoryDb {
             }
             Err(std::sync::mpsc::TryRecvError::Empty) => {
                 if timed_out {
-                    tracing::warn!("app history load timed out; continuing without saved data");
-                    self.finish_load();
-                    true
+                    let resumed = !self.state.observing;
+                    if resumed {
+                        tracing::warn!(
+                            "app history load is slow; observing while preserving saved data"
+                        );
+                    }
+                    self.state.observing = true;
+                    resumed
                 } else {
                     false
                 }
@@ -380,6 +416,9 @@ impl AppHistoryDb {
     fn finish_load(&mut self) {
         self.state.loading = false;
         self.load_rx = None;
+        if std::mem::take(&mut self.save_after_load) {
+            self.enqueue_save();
+        }
     }
 
     fn snapshot_file(&self) -> DbFile {
@@ -398,6 +437,10 @@ impl AppHistoryDb {
     }
 
     fn enqueue_save(&mut self) {
+        if self.state.loading {
+            self.save_after_load = true;
+            return;
+        }
         self.generation += 1;
         if let Some(w) = &self.writer {
             let generation = self.generation;
@@ -408,26 +451,27 @@ impl AppHistoryDb {
     /// Blocking synchronous save+flush (exit path / tests).
     pub fn save(&mut self) {
         self.enqueue_save();
+        if self.state.loading {
+            return;
+        }
         if let Some(w) = &self.writer {
             w.flush();
         }
     }
 
-    /// Fold one snapshot into the running totals. Only processes classified as
-    /// apps are tracked (matching the TM tab semantics).
+    /// Fold one snapshot into the running totals. Windows tracks visible Apps;
+    /// Unix tracks non-system processes because window ownership is unavailable.
     ///
-    /// While the deferred load is still in flight, observation is skipped:
-    /// merging deltas into a not-yet-loaded baseline could double count or
-    /// lose data. Loading takes milliseconds and finishes long before the
-    /// first sampling tick publishes.
+    /// Observation waits briefly for a deferred load, then accumulates
+    /// separately until the saved baseline arrives and is merged.
     pub fn observe(&mut self, snap: &Snapshot, interval_s: f64) {
-        if self.state.loading {
+        if self.state.loading && !self.state.observing {
             return;
         }
         let mut next_prev = std::collections::HashMap::with_capacity(self.prev.len());
 
         for p in &snap.processes {
-            if p.category != ProcCategory::App {
+            if !history_eligible(p.category, cfg!(target_os = "windows")) {
                 continue;
             }
             let cpu_time = p.cpu_time_s.unwrap_or({
@@ -464,12 +508,15 @@ impl AppHistoryDb {
                 _ => 0,
             };
 
-            let d_cpu = if d_cpu > 0.0 || p.cpu_pct <= 0.0 {
+            let d_cpu = if p.cpu_time_s.is_some() || !same_process || p.cpu_pct <= 0.0 {
                 d_cpu
             } else {
                 (p.cpu_pct as f64 / 100.0) * interval_s.max(0.0)
             };
-            let d_net = if d_net > 0 || (p.net_recv_bps.is_none() && p.net_sent_bps.is_none()) {
+            let d_net = if net_total.is_some()
+                || !same_process
+                || (p.net_recv_bps.is_none() && p.net_sent_bps.is_none())
+            {
                 d_net
             } else {
                 ((p.net_recv_bps.unwrap_or(0.0) + p.net_sent_bps.unwrap_or(0.0))
@@ -560,6 +607,67 @@ mod tests {
         assert_eq!(e.cpu_seconds, 0.0);
         assert_eq!(e.network_bytes, 0);
         assert!(e.network_available, "a real measured zero stays available");
+    }
+
+    #[test]
+    fn first_sighting_with_a_positive_rate_still_contributes_nothing() {
+        let mut db = AppHistoryDb::in_memory();
+        let mut snap = snap_with(3, "app.exe", ProcCategory::App, 500.0, 1 << 20);
+        snap.processes[0].cpu_pct = 45.0;
+        snap.processes[0].net_recv_bps = Some(1000.0);
+        db.observe(&snap, 5.0);
+        assert_eq!(db.entries()["app.exe"].cpu_seconds, 0.0);
+        assert_eq!(db.entries()["app.exe"].network_bytes, 0);
+    }
+
+    #[test]
+    fn unix_history_includes_background_processes_but_excludes_system_processes() {
+        assert!(history_eligible(ProcCategory::Background, false));
+        assert!(history_eligible(ProcCategory::App, false));
+        assert!(!history_eligible(ProcCategory::System, false));
+        assert!(!history_eligible(ProcCategory::Background, true));
+    }
+
+    #[test]
+    fn a_slow_load_merges_new_observations_before_saving() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("history.json");
+        let old = DbFile {
+            since_epoch_s: 100,
+            entries: BTreeMap::from([(
+                "app.exe".into(),
+                AppUsage {
+                    cpu_seconds: 10.0,
+                    network_bytes: 100,
+                    network_available: true,
+                },
+            )]),
+            ..Default::default()
+        };
+        write_atomic(&path, &old);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut db = AppHistoryDb::in_memory();
+        db.path = Some(path.clone());
+        db.attach_writer();
+        db.load_rx = Some(rx);
+        db.state.loading = true;
+        db.state.since = std::time::Instant::now() - std::time::Duration::from_secs(3);
+        assert!(db.poll_load(), "observation resumes after a slow load");
+        db.observe(&snap_with(3, "app.exe", ProcCategory::App, 1.0, 100), 1.0);
+        db.observe(&snap_with(3, "app.exe", ProcCategory::App, 3.0, 150), 1.0);
+        db.save_async();
+        assert_eq!(
+            read_db_text(&path).unwrap(),
+            serde_json::to_string(&old).unwrap()
+        );
+
+        tx.send(Some(serde_json::to_string(&old).unwrap())).unwrap();
+        assert!(db.poll_load());
+        db.save();
+        let merged: DbFile = serde_json::from_str(&read_db_text(&path).unwrap()).unwrap();
+        assert_eq!(merged.since_epoch_s, 100);
+        assert_eq!(merged.entries["app.exe"].cpu_seconds, 12.0);
+        assert_eq!(merged.entries["app.exe"].network_bytes, 150);
     }
 
     #[test]

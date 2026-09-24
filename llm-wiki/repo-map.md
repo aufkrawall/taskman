@@ -1,6 +1,6 @@
 # Repo Map (code map)
 
-Last cross-checked: 2026-09-21
+Last cross-checked: 2026-09-24
 
 Primary sources:
 - workspace tree (verified against working tree)
@@ -24,7 +24,9 @@ platform boundary (`tm-core` ← `tm-platform` ← `tm-app` / `tm-service`):
     ID-keyed column prefs: widths, visibility overrides and user order under
     `[columns.<table>]` / `.visible` / `.order` sections + debounced
     SettingsWriter), `app_history.rs` (per-app usage db, single serialized
-    writer thread with generations), `demand.rs` (TelemetryDemand bitmask),
+    writer thread with generations, late-load merge, Unix non-system
+    eligibility),
+    `demand.rs` (TelemetryDemand bitmask),
     `startup_impact.rs` (measured startup cost per image: per-tick CPU-time
     and I/O deltas folded across the boot window, Microsoft's documented
     Low/Medium/High thresholds, and the persisted store — see the module doc

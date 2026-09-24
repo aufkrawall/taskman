@@ -193,6 +193,16 @@ use crate::app::TaskManApp;
 #[cfg(target_os = "windows")]
 use eframe::egui;
 
+#[cfg(target_os = "windows")]
+fn finish_core_service_change<T>(
+    inflight: &std::sync::atomic::AtomicBool,
+    action: impl FnOnce() -> Result<T, tm_core::TmError>,
+) -> Result<T, tm_core::TmError> {
+    let outcome = action();
+    inflight.store(false, std::sync::atomic::Ordering::Release);
+    outcome
+}
+
 /// Dispatch the core-service install/remove change on an action lane. The
 /// inflight flag disables the buttons until the operation completes.
 #[cfg(target_os = "windows")]
@@ -216,9 +226,7 @@ pub(crate) fn dispatch_core_service_change(
             .to_string()
         },
         move || {
-            let outcome = actions.set_core_service_installed(install);
-            completion.store(false, std::sync::atomic::Ordering::Release);
-            outcome
+            finish_core_service_change(&completion, || actions.set_core_service_installed(install))
         },
     );
     if !dispatched {
@@ -243,13 +251,14 @@ pub(crate) fn dispatch_core_service_repair_and_switch(app: &mut TaskManApp, ctx:
         ctx,
         || i18n::tr(K::CoreServiceRepairSwitchRequested).to_string(),
         move || {
-            actions.set_core_service_installed(true)?;
-            if actions.switch_to_installed_gui(&args)? {
-                crate::request_programmatic_exit();
-                close_ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-            }
-            completion.store(false, std::sync::atomic::Ordering::Release);
-            Ok(())
+            finish_core_service_change(&completion, || {
+                actions.set_core_service_installed(true)?;
+                if actions.switch_to_installed_gui(&args)? {
+                    crate::request_programmatic_exit();
+                    close_ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+                Ok(())
+            })
         },
     );
     if !dispatched {
@@ -272,9 +281,9 @@ pub(crate) fn dispatch_core_service_switch(app: &mut TaskManApp, ctx: &egui::Con
         ctx,
         || i18n::tr(K::CoreServiceSwitchRequested).to_string(),
         move || {
-            let switched = actions.switch_to_installed_gui(&args)?;
-            completion.store(false, std::sync::atomic::Ordering::Release);
-            if switched {
+            let outcome =
+                finish_core_service_change(&completion, || actions.switch_to_installed_gui(&args));
+            if outcome? {
                 crate::request_programmatic_exit();
                 close_ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             }
@@ -291,6 +300,17 @@ mod tests {
     use super::*;
     use std::sync::mpsc;
     use std::time::{Duration, Instant};
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn failed_core_service_change_reenables_controls() {
+        let inflight = std::sync::atomic::AtomicBool::new(true);
+        let result: Result<(), _> = finish_core_service_change(&inflight, || {
+            Err(tm_core::TmError::Unsupported("injected failure"))
+        });
+        assert!(result.is_err());
+        assert!(!inflight.load(Ordering::Acquire));
+    }
 
     /// Bounded deadline poll — no fixed sleeps (AGENTS.md).
     fn wait_for(cond: impl Fn() -> bool, ms: u64) -> bool {

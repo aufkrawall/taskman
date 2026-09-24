@@ -297,6 +297,37 @@ fn disk_active_pct(service_time: u64, total_service_time: u64, machine_active_pc
         as f32
 }
 
+fn fallback_user_for_known_role(
+    stem: &str,
+    session: Option<u32>,
+    verified_windows_image: bool,
+) -> Option<String> {
+    if !verified_windows_image {
+        return None;
+    }
+    if stem == "dwm" {
+        return Some(format!("DWM-{}", session.unwrap_or(1)));
+    }
+    if stem == "fontdrvhost" {
+        return Some(format!("UMFD-{}", session.unwrap_or(0)));
+    }
+    matches!(
+        stem,
+        "[system process]"
+            | "system"
+            | "secure system"
+            | "registry"
+            | "memory compression"
+            | "smss"
+            | "csrss"
+            | "wininit"
+            | "services"
+            | "lsass"
+            | "winlogon"
+    )
+    .then(|| "SYSTEM".to_string())
+}
+
 /// One process's cumulative network counters at the previous tick.
 #[derive(Debug, Clone, Copy)]
 struct ProcNetSample {
@@ -1113,21 +1144,6 @@ impl Sampler {
 
         let mut processes: Vec<ProcessEntry> = Vec::with_capacity(n_procs);
         let service_catalog = process_ops::service_catalog();
-        let mut known_paths_by_name = service_catalog.paths_by_name.clone();
-        for proc in self.sys.processes().values() {
-            if let Some(exe) = proc.exe()
-                && let Some(fname) = exe.file_name().and_then(|f| f.to_str())
-            {
-                let norm = fname.to_ascii_lowercase();
-                let stem = norm.strip_suffix(".exe").unwrap_or(&norm).to_string();
-                known_paths_by_name
-                    .entry(norm)
-                    .or_insert_with(|| exe.to_path_buf());
-                known_paths_by_name
-                    .entry(stem)
-                    .or_insert_with(|| exe.to_path_buf());
-            }
-        }
 
         let now_s = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -1139,15 +1155,10 @@ impl Sampler {
             let pid_u = pid.as_u32();
             // Single owned copy of the name per process (reused everywhere).
             let name = p.name().to_string_lossy().into_owned();
-            let norm_name = name.to_ascii_lowercase();
-            let stem_name = norm_name.strip_suffix(".exe").unwrap_or(&norm_name);
             let exe_owned = p
                 .exe()
                 .map(|e| e.to_path_buf())
-                .or_else(|| service_catalog.paths_by_pid.get(&pid_u).cloned())
-                .or_else(|| known_paths_by_name.get(&norm_name).cloned())
-                .or_else(|| known_paths_by_name.get(stem_name).cloned())
-                .or_else(|| process_ops::resolve_candidate_path(&name));
+                .or_else(|| service_catalog.paths_by_pid.get(&pid_u).cloned());
             let has_window = window_owners.visible.contains(&pid_u);
 
             let user = p
@@ -1336,15 +1347,10 @@ impl Sampler {
                 .or_else(|| self.cpu_load.handle_count_of(p.pid, p.start_epoch_s));
             let norm = p.name.to_ascii_lowercase();
             let stem = norm.strip_suffix(".exe").unwrap_or(&norm);
-            let is_kernel_or_system =
-                p.pid == 0 || p.pid == 4 || classify::is_core_os_image(&p.name);
-
-            // Last resort for the path: ask the kernel, which names any
-            // process without needing a handle. Everything above this point
-            // goes through `OpenProcess` in one form or another, and an
-            // unelevated session cannot open a SYSTEM or elevated process at
-            // all — which is most of session 0, and exactly the rows whose
-            // identity a user is trying to establish.
+            // Ask the kernel when handle/SCM lookups failed. A path guessed
+            // from another process with the same image name is not identity:
+            // it could replay that executable's saved scheduling rules onto
+            // this unrelated process.
             if p.exe_path.is_none() {
                 p.exe_path = self.image_paths.get(p.pid);
                 if let Some(exe) = p.exe_path.as_ref() {
@@ -1358,20 +1364,15 @@ impl Sampler {
                 }
             }
 
+            let verified_windows_image = is_windows_owned_image(p) == Some(true);
+            let is_kernel_or_system = p.pid == 0
+                || p.pid == 4
+                || (classify::is_core_os_image(&p.name) && verified_windows_image);
+
             p.wow64 = a.wow64;
             if p.wow64.is_none() {
                 if let Some(exe_path) = &p.exe_path {
                     p.wow64 = process_ops::pe_is_wow64(exe_path);
-                } else if let Some(cand) = known_paths_by_name
-                    .get(&norm)
-                    .cloned()
-                    .or_else(|| known_paths_by_name.get(stem).cloned())
-                    .or_else(|| process_ops::resolve_candidate_path(&p.name))
-                {
-                    p.wow64 = process_ops::pe_is_wow64(&cand);
-                    if p.exe_path.is_none() {
-                        p.exe_path = Some(cand);
-                    }
                 } else if is_kernel_or_system {
                     p.wow64 = Some(false);
                 }
@@ -1402,27 +1403,11 @@ impl Sampler {
                 let session = a
                     .session_id
                     .or_else(|| self.cpu_load.session_id_of(p.pid, p.start_epoch_s));
-                if stem == "dwm" {
-                    p.user = Some(format!("DWM-{}", session.unwrap_or(1)));
-                } else if stem == "fontdrvhost" {
-                    p.user = Some(format!("UMFD-{}", session.unwrap_or(0)));
-                } else if matches!(
-                    stem,
-                    "[system process]"
-                        | "system"
-                        | "secure system"
-                        | "registry"
-                        | "memory compression"
-                        | "smss"
-                        | "csrss"
-                        | "wininit"
-                        | "services"
-                        | "lsass"
-                        | "winlogon"
-                ) || session == Some(0)
-                {
-                    p.user = Some("SYSTEM".to_string());
-                }
+                p.user = if p.pid == 0 || p.pid == 4 {
+                    Some("SYSTEM".to_string())
+                } else {
+                    fallback_user_for_known_role(stem, session, verified_windows_image)
+                };
             }
             // The SID column stays useful for session-0 hosts whose token
             // cannot be opened: the three well-known service accounts have
@@ -1438,12 +1423,9 @@ impl Sampler {
 
             // If token_security could not query elevation (e.g. kernel processes,
             // protected processes or session 0 services), infer it from identity:
-            // Kernel pseudo-processes and Session 0 / SYSTEM services always run
-            // with full system elevation and no UAC virtualization.
+            // Kernel pseudo-processes, verified core OS images and known
+            // service accounts run without UAC virtualization.
             if p.elevated.is_none() {
-                let session = a
-                    .session_id
-                    .or_else(|| self.cpu_load.session_id_of(p.pid, p.start_epoch_s));
                 let is_service_account = p.user.as_deref().is_some_and(|u| {
                     u.eq_ignore_ascii_case("SYSTEM")
                         || u.eq_ignore_ascii_case("LOCAL SERVICE")
@@ -1453,7 +1435,7 @@ impl Sampler {
                         || u.to_ascii_uppercase().starts_with("UMFD-")
                 });
 
-                if is_kernel_or_system || session == Some(0) || is_service_account {
+                if is_kernel_or_system || is_service_account {
                     p.elevated = Some(true);
                     if p.uac_virtualization.is_none() {
                         p.uac_virtualization = Some(tm_core::model::UacVirtualization::NotAllowed);
@@ -2164,6 +2146,22 @@ fn now_ms() -> u64 {
 mod tests {
     use super::*;
     use crate::win::cpu_load::ExitedImage;
+
+    #[test]
+    fn session_zero_alone_does_not_assert_system_account() {
+        assert_eq!(
+            fallback_user_for_known_role("thirdparty", Some(0), true),
+            None
+        );
+        assert_eq!(
+            fallback_user_for_known_role("services", Some(0), false),
+            None
+        );
+        assert_eq!(
+            fallback_user_for_known_role("services", Some(0), true).as_deref(),
+            Some("SYSTEM")
+        );
+    }
 
     fn sample(unattributed_pct: f32, exited: u32) -> LoadSample {
         LoadSample {
