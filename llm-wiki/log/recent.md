@@ -1,4 +1,84 @@
 
+- 2026-09-25: Keyboard-only accessibility pass. Implemented as three stacked
+  branches — feat/kb-dialogs (5751d2b) → feat/kb-shell (33fca3d) →
+  feat/kb-tables (1e7f8e6) — reviewed and fast-forwarded onto main in that
+  order, then finished by a small integration pass. `current.md` § Keyboard
+  interaction model is the durable summary; the accepted residuals are in
+  `known-debt.md`.
+  - **Dialogs** (5751d2b): `consume_dialog_keys_tab_through` — the shared
+    dialog contract minus Tab/Shift+Tab (egui's focus system cycles the
+    controls), Enter/Space consumed only while NO widget holds focus so a
+    focused control keeps its native activation. Settings switched to it:
+    initial focus anchored on the first control, freshly focused controls
+    scroll into view in the vscroll dialog. `dialog_button_row_mirror`
+    follows REAL egui focus instead of pinning it;
+    `capture_focus`/`restore_focus` hand focus back to the invoking widget
+    when the settings, end-task, run and module dialogs close. Menus: Tab
+    closes an open popup instead of stranding it, ArrowRight/ArrowLeft
+    open/close submenus, and the Menu/Application key triggers while any
+    non-text widget holds focus (gate relaxed from
+    `egui_wants_keyboard_input` to `text_edit_focused`). Module filter
+    takes initial focus.
+  - **Shell** (33fca3d): Ctrl+Tab / Ctrl+Shift+Tab page cycling and
+    Ctrl+1..9 direct jumps (`page_switch_target`, pure and unit-tested,
+    gated on `TaskManApp::modal_open` like Delete); F1 toggles a localized
+    DE/EN shortcut help overlay (nothing focusable inside, Esc closes; the
+    README gained a matching "Keyboard shortcuts" section); hand-painted
+    focus rings on the custom shell widgets (sidebar entries, command
+    buttons, search box + clear button, toast close); disabled command
+    buttons leave the Tab order; titlebar drag regions drop the focusable
+    bit (`Sense::CLICK | DRAG`) so the startup strips are no longer
+    invisible dead Tab stops; search focus hygiene — Enter commits
+    `commit_search_selection` and surrenders the field, a click outside
+    releases it, Esc clears globally behind the dialog/popup/help gate.
+  - **Tables** (1e7f8e6): tablekit rows become click-sensing WITHOUT the
+    focusable bit — `Sense::click()` is ALSO focusable, which is what let
+    one focused row kill the app's model-index arrow navigation and hand
+    every keypress to invisible spatial focus; the visible selection IS the
+    keyboard focus now, native-TM style. `list_nav` reports Shift (range
+    extension) and Ctrl (plain movement) instead of swallowing them,
+    re-arming the previously dead Shift+arrow range-select;
+    `row_action_gate` keeps Enter/Space row bindings dead while anything
+    holds focus (Space toggles the primary row, Enter = Go to details /
+    Process Properties); PgUp/PgDn page by the visible span
+    (`body_viewport_h`/`page_rows`); focused header cells ring and sort,
+    ContextMenu/Shift+F10 opens the Details column chooser from a header
+    cell, focused resize handles step 8 px / Shift 32 px
+    (`header_has_focus` keeps the page layers from double-firing with
+    egui's spatial header movement); Services/Startup/Users/App history and
+    the Performance cards gain arrow/Home/End/Page selection movement with
+    one-shot owner-keyed scroll (`request_row_scroll`); select-columns and
+    process-properties go tab-through with initial focus parked past egui's
+    invisible sizing pass.
+  - **Integration pass** (5641d9a, post-merge, user-invisible refinements
+    folded into the changelog entries): the affinity dialog moves from the
+    old pinned `dialog_button_row` (it carried a merger note at merge time)
+    onto `dialog_button_row_mirror`, making its CPU checkboxes
+    Tab-reachable; the search-commit path consumes Enter so committing
+    cannot also fire the row action on the same keypress, commits the first
+    match under each tab's LIVE display order (the same filtered/sorted
+    model the type-ahead walk uses — the interim display-name mirror
+    helpers were deleted) and parks the one-shot scroll target so the
+    committed row always scrolls into view; table
+    arrows/type-ahead/Enter/Space and the row context-menu key stand down
+    while any dialog is open (threaded only through PAGE-level call sites —
+    dialog-internal gates stay focus-based, which is what keeps
+    Select-columns/Properties Enter-close and the module inspector's own
+    list nav alive); focus capture/restore extended to the remaining
+    details.rs dialogs and the services/users/app-history/startup confirms
+    (plus the modules inspector X-path temp cleanup); disabled affinity
+    checkboxes leave the Tab order, Select-columns chevrons and checkboxes
+    gained rings; page switching and F1 also stand down while a popup is
+    open; four new help-overlay rows (Shift+arrows, Ctrl+A, PgUp/PgDn,
+    column resize); performance cards made non-focusable (selection is the
+    indicator, no spatial drift); App history highlights a clicked row
+    same-frame.
+  - Regression tests: page switching (wrap/clamp), search-commit ordering
+    and synthetic-row exclusion, tab-through consumption set, mirror-row
+    focus following, capture/restore round trip, rows non-focusable,
+    `header_has_focus`, keyboard resize steps, list_nav modifier reporting,
+    app-history selection walk incl. one-shot scroll identity, services
+    selection walk.
 - 2026-09-23: Released v0.1.14 (tag on `8c1c8ae`, the bump commit). Followed `build.md` §Publishing path: `--check` + `--audit` green, stable clippy green, bump pushed on main, `build.py --all-targets` for all four archives (Windows x86_64/ARM64, Linux x86_64/ARM64), `sha256` beside each, `gh release create --latest` with the full sha as `--target`. Release covers: unblockable Ctrl+Shift+Esc hotkey handling with desktop input queue isolation, power throttling (EcoQoS) exemption for low-level keyboard interception, self-targeting process operation safeguards, non-blocking UI settings persistence, reliable process-lifetime file logging and crash records, orphan-free kernel ETW trace session teardown on abnormal abort, accurate StartupApproved empty state handling, and allocation-free case-insensitive table sorting. Verified packaged archives: `taskman.exe` and `taskman-service.exe` in Windows zip pass `--selfcheck` (`--mock`), and Linux archives include desktop metadata.
 - 2026-09-23: Follow-up review of the Ctrl+Shift+Esc path (keyboard-latency
   angle). Four fixes, all around the hook rather than in its callback:

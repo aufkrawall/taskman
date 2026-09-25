@@ -2,6 +2,54 @@
 
 ## Unreleased
 
+### New
+
+- **Keyboard page switching:** Ctrl+Tab and Ctrl+Shift+Tab cycle through the
+  pages (wrapping around), Ctrl+1 through Ctrl+9 jump directly to a page.
+  While a dialog is open it keeps keyboard ownership, so the shortcuts stand
+  down — the same gate the Delete shortcut uses.
+- **F1 shortcut help:** F1 toggles a German/English overlay listing every
+  keyboard shortcut; Esc closes it. The same list is documented in a new
+  "Keyboard shortcuts" section in the README.
+- **Keyboard navigation for the remaining lists:** the Services, Startup,
+  Users and App history rows and the Performance resource cards follow the
+  arrow keys plus Home/End/PageUp/PageDown to move the selection. Enter
+  opens the row menu on Services, Startup and Users, and the Menu key or
+  Shift+F10 opens the selection's context menu. App history gains a visible
+  row selection.
+
+### Improved
+
+- **Tables follow the native Task Manager model:** table rows are no longer
+  Tab stops, so the arrow keys move the visible selection from anywhere on
+  the page instead of dead-ending on a focused row. Shift+arrows extend the
+  multi-selection (previously unreachable), Ctrl+arrows move it without
+  changing it, Space toggles the primary row in and out of the selection,
+  Enter runs the primary row action (Processes: Go to details; Details:
+  Process Properties), and PgUp/PgDn page by the visible table span.
+- **Visible keyboard focus:** sidebar entries, header and command buttons,
+  the search box with its clear button, table header cells and the toast
+  close buttons paint a focus ring while focused. Disabled command buttons
+  leave the Tab order entirely, and the titlebar drag regions no longer sit
+  in it as invisible stops.
+- **Keyboard column control:** a focused header cell sorts with Enter or
+  Space, and the Menu key opens its column menu — the Details column chooser
+  is reachable without the mouse. A focused column resize handle adjusts the
+  width with Left/Right (Shift for larger steps).
+- **Dialog keyboard model:** Settings tabs through its controls with an
+  anchored initial focus and scrolls freshly focused controls into view, and
+  Enter closes a dialog only while no activatable control is focused.
+  Closing a dialog returns focus to the widget that opened it. The affinity
+  dialog's CPU checkboxes become keyboard-reachable (its button row follows
+  real focus instead of pinning it), the destructive confirms keep their
+  safe-button Tab trap, and with a dialog open the pages' table navigation
+  (arrows, type-ahead, Enter/Space, context-menu key) stands down.
+- **Context menus from the keyboard:** Tab closes an open menu instead of
+  stranding it, ArrowRight/ArrowLeft open and close submenus, and the Menu
+  key now works while any non-text widget holds focus.
+- **App History on Linux and macOS:** non-system processes now accumulate
+  local usage history even where window ownership cannot be determined.
+
 ### Fixed
 
 - **Core-service upgrades:** replacing a running service now waits for SCM to
@@ -23,11 +71,12 @@
   unavailable rather than false zero readings.
 - **Linux release fallback:** an installed `cargo-zigbuild` without the `zig`
   executable now selects the available self-contained musl build.
-
-### Improved
-
-- **App History on Linux and macOS:** non-system processes now accumulate
-  local usage history even where window ownership cannot be determined.
+- **Search bar held focus hostage:** committing a search with Enter left the
+  field focused, so the arrow keys could not move the row selection it had
+  just set up. Enter now commits the jump to the first match and releases
+  the field (without also firing the row action on the same keypress), a
+  click outside the field releases it, and Esc clears the search globally
+  whenever no dialog or menu is open — not only while the field is focused.
 
 ## 0.1.14 - 2026-09-23
 

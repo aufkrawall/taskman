@@ -1,6 +1,6 @@
 # Repo Map (code map)
 
-Last cross-checked: 2026-09-24
+Last cross-checked: 2026-09-25
 
 Primary sources:
 - workspace tree (verified against working tree)
@@ -123,11 +123,30 @@ platform boundary (`tm-core` ← `tm-platform` ← `tm-app` / `tm-service`):
     UI thread's egui/winit dispatch; the UI side is atomics +
     `PostThreadMessageW` — and the cloak-restore dance), `app.rs`
     (TaskManApp: engine starts AFTER first frame, event-driven repaints,
-    action executor, toast ids, demand updates per tab), `app_ui.rs`
+    action executor, toast ids, demand updates per tab; the global keyboard
+    layer lives here — Ctrl+Tab/Ctrl+1..9 page switching via
+    `page_switch_target`, the F1 shortcut overlay, `modal_open` gating and
+    the search-commit `commit_search_selection`), `app_ui.rs`
     (chrome + dialogs incl. scrolling settings and Delete confirmation;
     the shared dialog keyboard contract lives in `app_ui/original.rs`:
     `consume_dialog_keys` / `dialog_key_decision` / `dialog_button_row` —
-    consume BEFORE `Window::show`, and the SAFE button owns the default),
+    consume BEFORE `Window::show`, and the SAFE button owns the default.
+    The 2026-09-25 keyboard pass added the variants: tab-through dialogs
+    (`consume_dialog_keys_tab_through`, Tab left to egui's focus system,
+    Enter/Space consumed only while nothing is focused — Settings, Select
+    columns, Process properties), `dialog_button_row_mirror` (the row's
+    focus flag follows REAL egui focus, so the affinity checkboxes stay
+    Tab-reachable), `capture_focus`/`restore_focus` (hand focus back to the
+    invoking widget on close), the F1 help overlay, and hand-painted focus
+    rings for the custom shell widgets),
+    `search.rs` (list-navigation primitives shared by every page:
+    `nav_gate` — arrows/type-ahead only while no text edit, popup or dialog
+    owns the input; `row_action_gate` — Enter/Space row bindings dead while
+    anything holds focus, a popup is open, or a dialog owns the input
+    (page-level call sites thread `TaskManApp::modal_open()`); `list_nav`
+    reports Shift
+    (range extension) and Ctrl (plain movement) instead of swallowing them,
+    plus the 1 s accumulated type-ahead),
     `tabs/*` (processes/details/modules/users/services/startup/app_history/
     performance; Processes keeps native grouped presentation, Details can
     switch between flat and literal raw-PPID tree, offers optional combined/receive/send
@@ -144,9 +163,22 @@ platform boundary (`tm-core` ← `tm-platform` ← `tm-app` / `tm-service`):
     virtualization with identity-keyed scroll anchoring across model
     rebuilds, opt-in header drag-to-reorder via `reorderable`/`take_reorder`,
     and `numeric_indices` — the ONLY correct way to lay out the shared
-    aggregate row, which tables of different column counts disagree on), `widgets/menu.rs` (classic full-width Windows-style
+    aggregate row, which tables of different column counts disagree on.
+    Rows are click-sensing WITHOUT the focusable bit (`Sense::CLICK |
+    hover`, chevrons likewise): the visible selection IS the keyboard
+    focus, native-TM style — a focusable row hands every keypress to
+    invisible spatial focus. Page keyboard layers use the one-shot
+    owner-keyed `request_row_scroll`, `header_has_focus` (so page-level
+    arrow handlers never double-fire with egui's spatial header movement),
+    keyboard resize steps on a focused handle (8 px, Shift 32 px) and
+    `body_viewport_h`/`page_rows` for the PgUp/PgDn span),
+    `widgets/menu.rs` (classic full-width Windows-style
     context menus: uniform 28 px gapless rows, painted check gutter,
-    submenus), `widgets/chart.rs` (timestamp-aware charts, kernel
+    submenus; keyboard contract: Tab closes an open menu,
+    ArrowRight/ArrowLeft open and close submenus, and the Menu/Application
+    key triggers while any non-text widget holds focus — gate is
+    `text_edit_focused`, not `egui_wants_keyboard_input`),
+    `widgets/chart.rs` (timestamp-aware charts, kernel
     overlay, pixel-snapped frames and the cursor-anchored hover readout),
     `icon_cache.rs` (lazy worker, upload budget, bounded LRU),
     `fonts.rs` (async system-font load after first frame),

@@ -1,6 +1,6 @@
 # Known and Accepted Debt
 
-Last verified: 2026-09-24
+Last verified: 2026-09-25
 
 Primary sources:
 - `AGENTS.md`
@@ -123,6 +123,10 @@ items across Phases 2–6. The following concrete gaps remain:
   than the native navigation page; a full AccessKit/screen-reader semantics
   pass, high-contrast tokens, text-scaling validation,
   and multi-monitor-aware position restore remain.
+  **Keyboard-only interaction: LANDED** (2026-09-25) — page switching, the
+  native-TM table selection model, dialog tab-through, focus rings and
+  shortcut help; the deliberately accepted residuals are in § Keyboard
+  accessibility accepted limitations below. The screen-reader pass remains.
   **Menu keyboard navigation: DONE** (2026-09-17) — a keyboard-opened menu
   focuses its first enabled entry; arrows/Enter/Space ride egui's focus
   system. The focus request is stored against the popup id (a bare flag was
@@ -141,6 +145,36 @@ process identity + module base/path revalidation at action time. The unload repe
 FreeLibrary until the module leaves or the bounded budget is spent, and the
 honest `ModuleUnloadOutcome` (still mapped, with how many references were
 dropped) is what the user sees; permanently pinned or re-loaded modules stay.
+
+## Keyboard accessibility accepted limitations (2026-09-25)
+
+Recorded so the next accessibility pass does not re-derive them; the
+interaction model itself is in `current.md`.
+
+- **Dialogs are non-modal egui `Window`s.** Tab can leave a tab-through
+  dialog (Settings, Select columns, Process properties) into the background
+  chrome, because nothing traps Tab at the window boundary; the destructive
+  confirms are hard-trapped by their own key contract instead. The fork's
+  unused `egui::Modal` container (`vendor/egui`) is the candidate fix if
+  this becomes a real problem.
+- **The chart hover readout is pointer-only.** Keyboard scrubbing of the
+  Performance graphs was deliberately skipped; the arrow keys already drive
+  the resource-card selection, and a keyboard scrub would need its own
+  focus model per chart.
+- **Users-table column drag-reorder is mouse-only.** Details solves the
+  same need with keyboard-reachable move-up/down chevrons in its
+  Select-columns dialog; Users still exposes only the header drag gesture.
+  A keyboard path would be a Users select-columns-style dialog — small,
+  self-contained follow-up, not a reachability breaker (every other
+  affordance has a keyboard route).
+- **A mouse click lights the clicked row one frame late in five of the
+  seven tables.** Only App history re-reads the selection inside the row
+  closure (plus `repaint_row_selected`) so a click highlights same-frame;
+  the other pages paint the new highlight on the next frame. Cosmetic
+  latency, no keyboard impact.
+- **Performance cards: the selection highlight is the only keyboard
+  indicator.** The selected card gets no separate focus ring — selection IS
+  focus, the same rule as the tables (cards are non-focusable like rows).
 
 ## System state this program can leave behind
 

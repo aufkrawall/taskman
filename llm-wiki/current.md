@@ -1,6 +1,6 @@
 # Current State
 
-Last cross-checked: 2026-09-24
+Last cross-checked: 2026-09-25
 
 ## Summary
 
@@ -14,6 +14,58 @@ correctness, table interaction, Performance visuals, and advanced process
 diagnostics; remaining telemetry and accessibility work is itemized precisely
 in `known-debt.md`. Normal GUI startup remains unelevated; privileged controls
 can cross a protected, allowlisted service boundary after one explicit install.
+
+## Keyboard interaction model (2026-09-25)
+
+The visible selection IS the keyboard focus, the way native Task Manager
+behaves: table rows are click-sensing but never Tab-focusable (`tablekit`
+allocates them with `Sense::CLICK | hover`), arrows/Home/End/PageUp/PageDown
+move the visible selection from anywhere on the page, and chrome (header
+cells, cards, buttons) keeps Tab. Every list keyboard layer shares the
+gates in `search.rs`:
+
+- `nav_gate` (arrows and accumulated type-ahead) yields to a focused text
+  edit, an open popup, and an open dialog.
+- `row_action_gate` (Enter/Space row bindings) requires that NOTHING holds
+  focus plus no popup, and page-level call sites also stand it down while a
+  dialog is open — egui turns Enter/Space into a click for whatever holds
+  focus, so a focused widget must activate itself, never the row.
+
+Global layer in `app.rs`: Ctrl+Tab / Ctrl+Shift+Tab / Ctrl+1..9 page
+switching and the F1 shortcut overlay stand down while a dialog or a popup
+is open (`TaskManApp::modal_open` — the same gate as Delete — plus
+`Popup::is_any_open`). Enter in the search box commits the page's selection
+to the first match under the page's LIVE display order — the same
+filtered/sorted model the type-ahead walk uses — and scrolls it into view
+(`commit_search_selection`); the field surrenders focus so the arrows take
+over; Esc clears globally behind the dialog/popup/help gate.
+
+Dialog contracts (shared helpers in `app_ui/original.rs`, keys always
+consumed BEFORE `Window::show`):
+
+- **Hard-trap destructive confirms** (`consume_dialog_keys` +
+  `dialog_button_row`): Tab is consumed and mirrored onto the two-button
+  row, and the SAFE button owns the default (Escape and an
+  unfocused/disabled Enter resolve to it) — End task, UAC, logoff, unload,
+  service control.
+- **Tab-through forms** (`consume_dialog_keys_tab_through`): Tab is left to
+  egui's focus system, Enter/Space are consumed only while nothing is
+  focused, initial focus is anchored on the first control and freshly
+  focused controls scroll into view — Settings, Select columns, Process
+  properties, the module filter.
+- **Mirror button row** (`dialog_button_row_mirror`): the app-side focus
+  flag follows REAL egui focus instead of pinning it, so Tab can reach the
+  affinity dialog's CPU checkboxes.
+- **Focus capture/restore** (`capture_focus`/`restore_focus`): a dialog
+  remembers the invoking widget on its first frame and hands focus back on
+  close.
+
+Context menus (`widgets/menu.rs`): Tab closes an open menu,
+ArrowRight/ArrowLeft open and close submenus, and the Menu/Application key
+triggers while any non-text widget holds focus (gate is
+`text_edit_focused`, not `egui_wants_keyboard_input`). Accepted residuals
+of this model (non-modal dialogs, pointer-only chart readout, search-commit
+ordering, performance-card indicator) are in `known-debt.md`.
 
 ## 2026-09-24 correctness pass
 
