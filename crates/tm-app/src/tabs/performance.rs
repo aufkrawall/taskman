@@ -370,6 +370,25 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
         }
     }
 
+    // Arrow/Home/End/Page movement through the cards, in the same
+    // build_resource_list order the type-ahead walks. The card list is not
+    // virtualized, so the one-shot `perf_jump_to` + `scroll_to_me` route is
+    // the safe scroll path here.
+    if let Some(nav) = search::list_nav(ui.ctx()) {
+        let current = entries.iter().position(|e| e.key == app.perf_selected_key);
+        // A page is the card column's visible span: 64 px cards plus the
+        // item spacing between them.
+        let page_rows = (ui.available_height() / (CARD_H + 8.0)).max(1.0) as usize;
+        if let Some(next) = search::moved_index(entries.len(), current, nav, page_rows)
+            && let Some(entry) = entries.get(next)
+        {
+            app.perf_selected_key = entry.key.clone();
+            app.perf_jump_to = Some(entry.key.clone());
+            app.shared.settings.perf_selected_key = entry.key.clone();
+            app.save_settings();
+        }
+    }
+
     ui.horizontal_top(|ui| {
         // ---------------- left column of cards (user-resizable) -------------
         let mut card_w = app.shared.settings.perf_card_width.clamp(180.0, 520.0);
@@ -452,10 +471,12 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
 
 /// Left inset of a resource card's mini graph.
 const CARD_PAD: f32 = 10.0;
-/// Vertical inset of the mini graph inside the 64 px card.
+/// Vertical inset of the mini graph inside the card.
 const CARD_CHART_INSET: f32 = 8.0;
 /// Mini-graph width, in the same 1.55 aspect the cell has always had.
 const CARD_CHART_W: f32 = 74.0;
+/// Card height (also the unit of the PageUp/PageDown card-span estimate).
+const CARD_H: f32 = 64.0;
 
 fn card_ui(
     app: &mut TaskManApp,
@@ -465,7 +486,7 @@ fn card_ui(
     selected: bool,
     samples: &[f64],
 ) {
-    let size = egui::vec2(ui.available_width(), 64.0);
+    let size = egui::vec2(ui.available_width(), CARD_H);
     let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::click());
     // Selected and hovered cards are lifted onto `card_bg`; the mini graph
     // inside then has to sink to keep a visible cell of its own, or it merges

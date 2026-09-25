@@ -393,6 +393,49 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
         URow::App { roll, .. } => roll,
     }));
 
+    // Arrow/Home/End/Page selection movement over the USER rows. Expanded
+    // per-user app rows are presentation children without a selection or a
+    // menu of their own, so they are skipped exactly like the synthetic
+    // accounting rows on the Processes page. The session id is the row-owner
+    // key: the one-shot scroll request parks under that identity.
+    if search::nav_gate(ui.ctx()) {
+        let page_rows =
+            tablekit::page_rows(ui.ctx(), "users", tablekit::ROW_H).unwrap_or_else(|| {
+                (ui.ctx().content_rect().height() / tablekit::ROW_H)
+                    .floor()
+                    .max(1.0) as usize
+            });
+        let user_positions: Vec<usize> = rows
+            .iter()
+            .enumerate()
+            .filter(|(_, row)| matches!(row, URow::User(_)))
+            .map(|(i, _)| i)
+            .collect();
+        let current = app.selected_user.and_then(|id| {
+            user_positions
+                .iter()
+                .position(|&row_index| match rows[row_index] {
+                    URow::User(i) => sessions[i].id == id,
+                    URow::App { .. } => false,
+                })
+        });
+        if let Some(nav) =
+            search::list_nav(ui.ctx()).filter(|_| !tablekit::header_has_focus(ui.ctx(), "users"))
+            && let Some(next) = search::moved_index(user_positions.len(), current, nav, page_rows)
+            && let Some(&row_index) = user_positions.get(next)
+            && let URow::User(i) = rows[row_index]
+        {
+            app.selected_user = Some(sessions[i].id);
+            tablekit::request_row_scroll(ui.ctx(), "users", tablekit::stable_key(sessions[i].id));
+        }
+    }
+    let focus_row = tablekit::take_row_scroll(ui.ctx(), "users").and_then(|key| {
+        rows.iter().position(|row| match row {
+            URow::User(i) => tablekit::stable_key(sessions[*i].id) == key,
+            URow::App { .. } => false,
+        })
+    });
+
     // Header totals are machine totals, produced in logical order and shown
     // in the user's display order.
     let logical_hdr = Aggregates::from_snapshot(&snap).strings();
@@ -420,7 +463,7 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
         Some(&aggs_hdr),
         rows.len(),
         (!q.is_empty()).then_some(i18n::tr(K::NoMatches)),
-        None,
+        focus_row,
         None,
         |ui, table, _avail, _content_w, range| {
             for ri in range {
@@ -666,8 +709,16 @@ fn user_row_ui(
     };
     // The menu is always attached: without the capability its actions show
     // disabled with an explanation instead of right-clicking into silence.
+    // Enter (with nothing else holding focus) opens it like the Menu key —
+    // Disconnect/Sign-out are the only actions a session row offers.
     let ctx = ui.ctx().clone();
-    let keyboard_open = menu::keyboard_menu_requested(&ctx) && app.selected_user == Some(s.id);
+    let selected_row = app.selected_user == Some(s.id);
+    let enter_open = search::row_action_gate(&ctx)
+        && ctx.input(|i| i.key_pressed(egui::Key::Enter))
+        && selected_row;
+    let keyboard_open = (enter_open
+        || (!ctx.any_popup_open() && menu::keyboard_menu_requested(&ctx)))
+        && selected_row;
     menu::context_menu_kb(&resp, keyboard_open, |ui| {
         ui.set_min_width(150.0);
         if menu::item_enabled(ui, i18n::tr(K::DisconnectUser), can_disconnect)

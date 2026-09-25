@@ -112,6 +112,11 @@ pub fn directed(order: std::cmp::Ordering, ascending: bool) -> std::cmp::Orderin
 const MIN_COL_W: f32 = 40.0;
 const MAX_COL_W: f32 = 1200.0;
 
+/// Width step of one Left/Right press on a keyboard-focused resize handle.
+const KB_RESIZE_STEP: f32 = 8.0;
+/// The same with Shift held.
+const KB_RESIZE_STEP_LARGE: f32 = 32.0;
+
 /// Breathing room kept clear on the RIGHT of the table content, between the
 /// last column and the vertical scroll bar's own (reserved) lane. It also
 /// keeps the last resize handle grabbable: without any trailing content the
@@ -435,6 +440,10 @@ pub fn scrolled_rows(
     // The horizontal bar's reserved lane is not viewport: counting it would
     // scroll a bottom row that far short of actually being visible.
     let viewport_h = (ui.available_height() - bar_use.y).max(row_h);
+    // What the page-level keyboard layer needs for PageUp/PageDown: the row
+    // span this table actually shows (see [`page_rows`]).
+    ui.ctx()
+        .data_mut(|d| d.insert_temp(egui::Id::new(("tm-rowsvh", id)), viewport_h));
     let focus_offset = focus_row.map(|row| {
         let row_top = row as f32 * row_h;
         let row_bottom = row_top + row_h;
@@ -797,6 +806,7 @@ impl TmTable {
         let (rect, _) = ui.allocate_exact_size(egui::vec2(total_w, h), Sense::hover());
         let painter = ui.painter_at(rect.expand(2.0));
         let mut clicked = None;
+        let mut header_focused = false;
         self.dirty = false;
         let mut x = rect.left();
         let mut agg_idx = 0usize;
@@ -839,6 +849,18 @@ impl TmTable {
             }
             if resp.hovered() {
                 painter.rect_filled(cell, 0.0, Color32::from_white_alpha(6));
+            }
+            // Keyboard reachability: header cells stay Tab-focusable (they are
+            // chrome, unlike rows), Enter/Space sort through egui's focused-
+            // click activation, and the ring mirrors the hover tint.
+            if resp.has_focus() {
+                header_focused = true;
+                painter.rect_stroke(
+                    cell,
+                    0.0,
+                    Stroke::new(1.5, pal.accent),
+                    egui::StrokeKind::Inside,
+                );
             }
             if resp.clicked() {
                 clicked = Some(i);
@@ -951,6 +973,46 @@ impl TmTable {
             if rresp.hovered() || rresp.dragged() {
                 ui.ctx().set_cursor_icon(CursorIcon::ResizeHorizontal);
             }
+            if rresp.has_focus() {
+                header_focused = true;
+                // A focused handle owns the horizontal arrows: the focus-lock
+                // filter (the same mechanism sliders use) keeps egui's spatial
+                // navigation from walking to a neighbouring header cell, and
+                // each press nudges the width the way a tiny drag would —
+                // accumulated onto the LIVE width and clamped exactly like
+                // the pointer gesture. Shift takes the large step.
+                ui.memory_mut(|m| {
+                    m.set_focus_lock_filter(
+                        rresp.id,
+                        egui::EventFilter {
+                            horizontal_arrows: true,
+                            ..Default::default()
+                        },
+                    );
+                });
+                let step = if ui.input(|i| i.modifiers.shift) {
+                    KB_RESIZE_STEP_LARGE
+                } else {
+                    KB_RESIZE_STEP
+                };
+                let dx = ui.input(|i| {
+                    (i.key_pressed(egui::Key::ArrowRight) as i32
+                        - i.key_pressed(egui::Key::ArrowLeft) as i32) as f32
+                        * step
+                });
+                painter.rect_stroke(
+                    handle,
+                    0.0,
+                    Stroke::new(1.5, pal.accent),
+                    egui::StrokeKind::Inside,
+                );
+                if dx != 0.0 {
+                    let current = self.col_width(i - 1);
+                    self.cols[i - 1].width = (current + dx).clamp(MIN_COL_W, MAX_COL_W);
+                    self.layout.borrow_mut().take();
+                    self.dirty = true;
+                }
+            }
             if rresp.hovered() && !rresp.dragged() {
                 painter.line_segment(
                     [
@@ -1025,6 +1087,9 @@ impl TmTable {
             Stroke::new(1.0, pal.stroke),
         );
 
+        ui.ctx()
+            .data_mut(|d| d.insert_temp(egui::Id::new(("tm-hdrfocus", self.id)), header_focused));
+
         clicked
     }
 
@@ -1052,6 +1117,15 @@ impl TmTable {
     /// response id is what egui keys a row's open context-menu popup to, and
     /// a live list re-sorts underneath an open menu — an index-derived id
     /// would hand the menu to whatever next lands in the slot.
+    ///
+    /// Rows sense clicks WITHOUT being keyboard-focusable. A `Sense::click()`
+    /// row is also FOCUSABLE, and once a row took focus every arrow key moved
+    /// invisible spatial focus instead of the visible selection — and the
+    /// app's own model-index navigation died with it. Rows are therefore
+    /// reached the way native Task Manager reaches them: the selection IS the
+    /// keyboard focus (`crate::search::list_nav`), Tab stays free for the
+    /// chrome around the table, and Enter/Space only belong to the row layer
+    /// while nothing else holds focus (`crate::search::row_action_gate`).
     pub fn row(
         &self,
         ui: &mut egui::Ui,
@@ -1064,7 +1138,7 @@ impl TmTable {
         let resp = ui.interact(
             rect,
             egui::Id::new(self.id).with(key),
-            Sense::click().union(Sense::hover()),
+            Sense::CLICK.union(Sense::hover()),
         );
         let painter = ui.painter_at(rect.expand(2.0));
         // Remember the fill so [`TmTable::heat_cells`] can restore it ON TOP
@@ -1177,7 +1251,9 @@ impl TmTable {
     ) -> bool {
         let c = Pos2::new(row.left() + 16.0, row.center().y);
         let hit = Rect::from_center_size(c, egui::vec2(24.0, self.row_h));
-        let resp = ui.interact(hit, seed.with("chev"), Sense::click());
+        // Non-focusable like its row: expansion lives on the tree's
+        // Left/Right keys, not on a focus ring per row (see [`TmTable::row`]).
+        let resp = ui.interact(hit, seed.with("chev"), Sense::CLICK);
         if enabled {
             let icon = if expanded {
                 icons::Icon::ChevronDown
@@ -1218,6 +1294,51 @@ impl TmTable {
             None => icons::draw_app_window(ui, r, tint),
         }
     }
+}
+
+/// Whether any keyboard-focusable header widget of table `id` (a header cell
+/// or a column resize handle) held keyboard focus on the previous frame. The
+/// tab-level arrow handlers suppress their own movement then: egui's spatial
+/// focus navigation already moves between header widgets, and both firing
+/// would double every keypress.
+pub fn header_has_focus(ctx: &egui::Context, id: &'static str) -> bool {
+    ctx.data(|d| d.get_temp::<bool>(egui::Id::new(("tm-hdrfocus", id))))
+        .unwrap_or(false)
+}
+
+/// Park a one-shot vertical scroll request for table `id`, keyed by the row's
+/// OWNER identity (hash whatever [`TmTable::row`] was given). The keyboard
+/// layer cannot address virtualized rows by index — the model re-sorts under
+/// the selection — so it stores the identity and the table resolves it to a
+/// flat row index per frame.
+pub fn request_row_scroll(ctx: &egui::Context, table: &'static str, key: u64) {
+    ctx.data_mut(|d| d.insert_temp(egui::Id::new(("tm-rowscrollreq", table)), key));
+}
+
+/// Take the pending one-shot scroll request stored by [`request_row_scroll`],
+/// if any.
+pub fn take_row_scroll(ctx: &egui::Context, table: &'static str) -> Option<u64> {
+    let key = egui::Id::new(("tm-rowscrollreq", table));
+    let value = ctx.data(|d| d.get_temp::<u64>(key));
+    if value.is_some() {
+        ctx.data_mut(|d| d.remove::<u64>(key));
+    }
+    value
+}
+
+/// Height of table `id`'s body viewport on the previous frame, or `None`
+/// before the table has ever been laid out. PageUp/PageDown row counts must
+/// be derived from this — the rows the page actually shows — not from the
+/// window content height, which adds the header, the toolbar and a page of
+/// overshoot.
+pub fn body_viewport_h(ctx: &egui::Context, id: &'static str) -> Option<f32> {
+    ctx.data(|d| d.get_temp::<f32>(egui::Id::new(("tm-rowsvh", id))))
+        .filter(|h| *h > 0.0)
+}
+
+/// Visible-row span of table `id`'s body for PageUp/PageDown movement.
+pub fn page_rows(ctx: &egui::Context, id: &'static str, row_h: f32) -> Option<usize> {
+    body_viewport_h(ctx, id).map(|h| ((h / row_h).floor() as usize).max(1))
 }
 
 /// Hover tint for a table row. Light mode needs a dark wash: a white one
@@ -2287,6 +2408,140 @@ mod tests {
             "with no surviving row there is nothing to anchor to: {} -> {}",
             base,
             anchored_offset(&ctx)
+        );
+    }
+
+    /// Regression (keyboard model): a `Sense::click()` row is ALSO focusable,
+    /// and one focused row made every arrow key move invisible spatial focus
+    /// instead of the visible selection — and killed the app's own
+    /// model-index navigation with it. Rows must sense clicks WITHOUT taking
+    /// keyboard focus, so Tab over a pure table body has nothing to land on.
+    #[test]
+    fn rows_sense_clicks_without_taking_keyboard_focus() {
+        let ctx = egui::Context::default();
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1600.0, 900.0));
+        let sense = std::cell::Cell::new(None::<Sense>);
+        let tab = egui::Event::Key {
+            key: egui::Key::Tab,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: Default::default(),
+        };
+        for (t, events) in [(0.000, vec![]), (0.016, vec![tab])] {
+            let raw = egui::RawInput {
+                screen_rect: Some(screen),
+                time: Some(t),
+                predicted_dt: 1.0 / 60.0,
+                events,
+                ..Default::default()
+            };
+            let table = table();
+            let mut out = ctx.run_ui(raw, |root| {
+                egui::CentralPanel::default()
+                    .frame(egui::Frame::NONE)
+                    .show(root, |ui| {
+                        ui.spacing_mut().item_spacing.y = 0.0;
+                        for i in 0..3 {
+                            let (_, resp) = table.row(ui, &crate::theme::DARK, false, i);
+                            if i == 0 {
+                                sense.set(Some(resp.sense));
+                            }
+                        }
+                    });
+            });
+            out.textures_delta.clear();
+        }
+        let sense = sense.get().expect("row response");
+        assert!(sense.senses_click(), "rows still answer clicks");
+        assert!(!sense.is_focusable(), "rows must not be Tab-focusable");
+        assert!(
+            ctx.memory(|m| m.focused()).is_none(),
+            "Tab over a pure table body must not focus a row"
+        );
+    }
+
+    /// A keyboard-focused header cell is reported via
+    /// [`header_has_focus`] so the tab-level arrow handlers can stay out of
+    /// egui's spatial header navigation.
+    #[test]
+    fn a_focused_header_cell_is_reported_to_the_tab_gate() {
+        let ctx = egui::Context::default();
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1600.0, 900.0));
+        let mut t = table();
+        header_frame(&ctx, &mut t, screen, 0.000, vec![]);
+        assert!(!header_has_focus(&ctx, "t"));
+
+        let cell_id = egui::Id::new(("tmtable", "t")).with(("hdr", "name"));
+        ctx.memory_mut(|m| m.request_focus(cell_id));
+        header_frame(&ctx, &mut t, screen, 0.016, vec![]);
+        assert!(header_has_focus(&ctx, "t"));
+    }
+
+    /// Left/Right on a keyboard-focused resize handle adjust the column width
+    /// in live-accumulated steps (never a frozen drag-start width), Shift
+    /// takes the large step, and the focus-lock filter keeps egui's spatial
+    /// navigation from walking the focus away after the first press.
+    #[test]
+    fn focused_resize_handle_adjusts_width_with_arrow_keys() {
+        let ctx = egui::Context::default();
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1600.0, 900.0));
+        let mut t = table();
+        header_frame(&ctx, &mut t, screen, 0.000, vec![]);
+
+        let handle_id = egui::Id::new(("tmtable", "t")).with(("resize", "a"));
+        ctx.memory_mut(|m| m.request_focus(handle_id));
+        // Focus lands; the frame after it also installs the focus-lock
+        // filter, so from here on the arrows belong to the handle.
+        header_frame(&ctx, &mut t, screen, 0.016, vec![]);
+        let key = |k: egui::Key, shift: bool| {
+            let modifiers = if shift {
+                egui::Modifiers::SHIFT
+            } else {
+                egui::Modifiers::NONE
+            };
+            // egui reads modifiers only from the dedicated event, which the
+            // winit backend delivers ahead of the key itself (and on release).
+            vec![
+                egui::Event::ModifiersChanged(modifiers),
+                egui::Event::Key {
+                    key: k,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers,
+                },
+            ]
+        };
+        header_frame(
+            &ctx,
+            &mut t,
+            screen,
+            0.032,
+            key(egui::Key::ArrowRight, false),
+        );
+        assert_eq!(t.col_width(1), 208.0, "one small step right");
+        header_frame(
+            &ctx,
+            &mut t,
+            screen,
+            0.048,
+            key(egui::Key::ArrowRight, true),
+        );
+        assert_eq!(t.col_width(1), 240.0, "Shift takes the large step");
+        header_frame(
+            &ctx,
+            &mut t,
+            screen,
+            0.064,
+            key(egui::Key::ArrowLeft, false),
+        );
+        assert_eq!(t.col_width(1), 232.0);
+        assert_eq!(t.col_width(0), 340.0, "neighbour column untouched");
+        assert_eq!(
+            ctx.memory(|m| m.focused()),
+            Some(handle_id),
+            "the focus-lock filter must keep focus on the handle"
         );
     }
 }

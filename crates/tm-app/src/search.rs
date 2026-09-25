@@ -91,12 +91,41 @@ fn type_ahead_char(c: char) -> bool {
     c.is_alphanumeric() || matches!(c, '.' | '-' | '_')
 }
 
-/// Collect every plain character typed this frame while no text editor owns
-/// keyboard focus. Text events (not key codes) keep keyboard layouts and
-/// non-ASCII letters natural; modified input is ignored so application
-/// shortcuts never become list-navigation keystrokes.
+/// The custom list-navigation gate, shared by every keyboard-driven list.
+///
+/// Table rows are NOT keyboard-focusable (see [`crate::widgets::tablekit`]):
+/// arrows, type-ahead and the row action keys move the VISIBLE selection from
+/// anywhere, like native Task Manager. The gate therefore only yields to
+/// widgets that mean text input and to anything floating above the list:
+///
+/// * a text edit holds focus (the search box, a filter field, a dialog's
+///   input) — its cursor keys and letters must stay its own;
+/// * a popup or context menu is open — its own arrow handling must not be
+///   fought by the list underneath.
+///
+/// Plain chrome (toolbar buttons, header cells, cards) holding focus does NOT
+/// block the gate: egui's spatial focus movement and the list selection then
+/// both respond, which is the same "arrows always drive the list" contract
+/// native Task Manager uses.
+pub fn nav_gate(ctx: &egui::Context) -> bool {
+    !ctx.text_edit_focused() && !ctx.any_popup_open()
+}
+
+/// True when the custom row action keys (Enter/Space) may fire. A focused
+/// click-sensing widget would activate itself on the same keypress (egui
+/// turns Enter/Space into a click for whatever holds focus), so the bindings
+/// stay dead while ANY widget holds keyboard focus — and while a popup is
+/// open, whose focused entries live on that same mechanism.
+pub fn row_action_gate(ctx: &egui::Context) -> bool {
+    !ctx.egui_wants_keyboard_input() && !ctx.any_popup_open()
+}
+
+/// Collect every plain character typed this frame while the
+/// [`nav_gate`] allows list navigation. Text events (not key codes) keep
+/// keyboard layouts and non-ASCII letters natural; modified input is ignored
+/// so application shortcuts never become list-navigation keystrokes.
 fn typed_chars(ctx: &egui::Context) -> Vec<char> {
-    if ctx.egui_wants_keyboard_input() {
+    if !nav_gate(ctx) {
         return Vec::new();
     }
     ctx.input(|i| {
@@ -165,15 +194,20 @@ pub enum ListNav {
     PageDown,
 }
 
-/// Return one unmodified list-navigation key while no text editor owns
-/// keyboard focus. This keeps arrows/Delete available to the search box and
-/// dialogs whenever they are actually editing text.
+/// Return one list-navigation keypress while the [`nav_gate`] allows it and
+/// the modifiers are list-navigation compatible.
+///
+/// `Shift` and `Ctrl` are REPORTED, not swallowed: Shift+arrow extends a
+/// range and Ctrl+arrow moves without extending — both native list-view
+/// gestures, so the caller reads the modifiers off the same frame's input and
+/// decides. `Alt` and the macOS `Command` shortcut stay reserved for the
+/// application.
 pub fn list_nav(ctx: &egui::Context) -> Option<ListNav> {
-    if ctx.egui_wants_keyboard_input() {
+    if !nav_gate(ctx) {
         return None;
     }
     ctx.input(|i| {
-        if i.modifiers.alt || i.modifiers.ctrl || i.modifiers.command || i.modifiers.shift {
+        if i.modifiers.alt || i.modifiers.command {
             return None;
         }
         [
@@ -416,6 +450,88 @@ mod tests {
             |_| {},
         );
         out.textures_delta.clear();
+    }
+
+    /// One frame with a single pressed key held with `modifiers`. The
+    /// modifiers event comes first, the way the winit backend reports a
+    /// real keypress — egui only reads modifiers from that dedicated event.
+    fn key_ctx(ctx: &egui::Context, key: egui::Key, modifiers: egui::Modifiers) {
+        let events = if modifiers.is_none() {
+            vec![key_event(key, modifiers)]
+        } else {
+            vec![
+                egui::Event::ModifiersChanged(modifiers),
+                key_event(key, modifiers),
+            ]
+        };
+        let mut out = ctx.run_ui(
+            egui::RawInput {
+                events,
+                ..Default::default()
+            },
+            |_| {},
+        );
+        out.textures_delta.clear();
+    }
+
+    fn key_event(key: egui::Key, modifiers: egui::Modifiers) -> egui::Event {
+        egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers,
+        }
+    }
+
+    /// Shift+arrow is a native range-extension gesture: list_nav must REPORT
+    /// it so the caller can read the modifier and extend. Regression: the old
+    /// list_nav rejected Shift outright, which left the written
+    /// Shift+arrow range-select branches dead code.
+    #[test]
+    fn shift_arrows_are_reported_for_range_extension() {
+        let ctx = egui::Context::default();
+        key_ctx(&ctx, egui::Key::ArrowDown, egui::Modifiers::SHIFT);
+        assert_eq!(list_nav(&ctx), Some(ListNav::Next));
+    }
+
+    /// Ctrl+arrows move the selection without extending it; Ctrl must not
+    /// swallow the keypress, only Shift may turn it into a range gesture.
+    #[test]
+    fn ctrl_arrows_are_reported_as_plain_movement() {
+        let ctx = egui::Context::default();
+        key_ctx(&ctx, egui::Key::ArrowDown, egui::Modifiers::CTRL);
+        assert_eq!(list_nav(&ctx), Some(ListNav::Next));
+        key_ctx(
+            &ctx,
+            egui::Key::PageUp,
+            egui::Modifiers::CTRL | egui::Modifiers::SHIFT,
+        );
+        assert_eq!(list_nav(&ctx), Some(ListNav::PageUp));
+    }
+
+    /// Alt and Command stay reserved for application shortcuts.
+    #[test]
+    fn alt_and_command_arrows_are_never_list_navigation() {
+        let ctx = egui::Context::default();
+        key_ctx(&ctx, egui::Key::ArrowDown, egui::Modifiers::ALT);
+        assert_eq!(list_nav(&ctx), None);
+        key_ctx(&ctx, egui::Key::ArrowDown, egui::Modifiers::COMMAND);
+        assert_eq!(list_nav(&ctx), None);
+    }
+
+    /// The other movement keys survive the gate unchanged.
+    #[test]
+    fn unmodified_movement_keys_map_to_nav_directions() {
+        let ctx = egui::Context::default();
+        for (key, nav) in [
+            (egui::Key::ArrowUp, ListNav::Previous),
+            (egui::Key::Home, ListNav::First),
+            (egui::Key::End, ListNav::Last),
+        ] {
+            key_ctx(&ctx, key, egui::Modifiers::NONE);
+            assert_eq!(list_nav(&ctx), Some(nav));
+        }
     }
 
     /// The regression from the report: typing "svc" fast must not leave the

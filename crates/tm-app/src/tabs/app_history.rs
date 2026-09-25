@@ -7,6 +7,7 @@ use tm_core::format;
 use tm_core::i18n::{self, K};
 
 use crate::app::TaskManApp;
+use crate::search;
 use crate::theme;
 use crate::widgets::menu;
 use crate::widgets::tablekit::{self, TmColumn};
@@ -45,6 +46,46 @@ fn compare_rows(a: &Row, b: &Row, sort: tablekit::SortState) -> Ordering {
     };
     tablekit::directed(primary, sort.ascending)
         .then_with(|| tablekit::cmp_ignore_case(&a.name, &b.name))
+}
+
+/// egui temp-data key of the keyboard selection: the row OWNER (the display
+/// name, the same identity `TmTable::row` receives). The page has no other
+/// selection state, and the entry is touched every frame the page is shown.
+const SELECTION_KEY: &str = "tm-apphistory-selection";
+
+fn selected_name(ctx: &egui::Context) -> Option<String> {
+    ctx.data(|d| d.get_temp::<Option<String>>(egui::Id::new(SELECTION_KEY)))
+        .unwrap_or(None)
+}
+
+fn set_selected_name(ctx: &egui::Context, name: Option<String>) {
+    ctx.data_mut(|d| d.insert_temp(egui::Id::new(SELECTION_KEY), name));
+}
+
+/// Arrow/Home/End/Page selection movement over the displayed rows. The
+/// selection is returned for the caller to store; `None` means "no keyboard
+/// movement this frame" and leaves the current selection alone.
+fn keyboard_selection(ctx: &egui::Context, rows: &[Row], selected: Option<&str>) -> Option<String> {
+    if !search::nav_gate(ctx) {
+        return None;
+    }
+    let page_rows = tablekit::page_rows(ctx, "apphistory", tablekit::ROW_H).unwrap_or_else(|| {
+        (ctx.content_rect().height() / tablekit::ROW_H)
+            .floor()
+            .max(1.0) as usize
+    });
+    let current = selected.and_then(|name| rows.iter().position(|r| r.name == name));
+    if let Some(nav) =
+        search::list_nav(ctx).filter(|_| !tablekit::header_has_focus(ctx, "apphistory"))
+        && let Some(next) = search::moved_index(rows.len(), current, nav, page_rows)
+        && let Some(row) = rows.get(next)
+    {
+        // One-shot scroll parked under the row-owner identity, resolved to a
+        // flat row index per frame by the table call below.
+        tablekit::request_row_scroll(ctx, "apphistory", tablekit::stable_key(row.name.as_str()));
+        return Some(row.name.clone());
+    }
+    None
 }
 
 pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
@@ -156,6 +197,16 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
         .fold(0.0f64, f64::max);
 
     let avail = crate::widgets::tablekit::table_avail(ui);
+    // Arrow/Home/End/Page movement of the visible selection, stored per
+    // frame in the page's temp-data key.
+    if let Some(name) = keyboard_selection(ui.ctx(), &rows, selected_name(ui.ctx()).as_deref()) {
+        set_selected_name(ui.ctx(), Some(name));
+    }
+    let selected = selected_name(ui.ctx());
+    let focus_row = tablekit::take_row_scroll(ui.ctx(), "apphistory").and_then(|key| {
+        rows.iter()
+            .position(|r| tablekit::stable_key(r.name.as_str()) == key)
+    });
     let clicked = crate::widgets::tablekit::scrolled_rows(
         "apphistory",
         ui,
@@ -166,14 +217,18 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
         None,
         rows.len(),
         (!q.is_empty()).then_some(i18n::tr(K::NoMatches)),
-        None,
+        focus_row,
         None,
         |ui, table, _avail, _content_w, range| {
             for ri in range {
                 let Some(row) = rows.get(ri) else {
                     continue;
                 };
-                let (rect, resp) = table.row(ui, &pal, false, row.name.as_str());
+                let is_selected = selected.as_deref() == Some(row.name.as_str());
+                let (rect, resp) = table.row(ui, &pal, is_selected, row.name.as_str());
+                if resp.clicked() {
+                    set_selected_name(ui.ctx(), Some(row.name.clone()));
+                }
                 table.icon_cell(ui, rect, None, pal.accent);
                 let name_rect = table.col_rect(0, rect);
                 ui.painter_at(name_rect).text(
@@ -298,5 +353,91 @@ mod tests {
                 Ordering::Less
             );
         }
+    }
+
+    fn nav_rows() -> Vec<Row> {
+        ["a", "b", "c"]
+            .into_iter()
+            .map(|name| Row {
+                name: name.to_owned(),
+                cpu_seconds: 1.0,
+                network_bytes: 0,
+                network_available: false,
+            })
+            .collect()
+    }
+
+    /// One frame carrying a single pressed key.
+    fn key_ctx(ctx: &egui::Context, key: egui::Key) {
+        let event = egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: Default::default(),
+        };
+        let mut out = ctx.run_ui(
+            egui::RawInput {
+                events: vec![event],
+                ..Default::default()
+            },
+            |_| {},
+        );
+        out.textures_delta.clear();
+    }
+
+    /// One frame with no events (egui keeps the previous frame's input until
+    /// a new frame begins).
+    fn blank_ctx(ctx: &egui::Context) {
+        let mut out = ctx.run_ui(egui::RawInput::default(), |_| {});
+        out.textures_delta.clear();
+    }
+
+    /// The page's keyboard selection walks the displayed rows by the name
+    /// owner key, starts at the first row without a selection, and parks a
+    /// one-shot scroll request under the identity it moved to.
+    #[test]
+    fn keyboard_selection_walks_rows_and_parks_a_scroll_request() {
+        let ctx = egui::Context::default();
+        let rows = nav_rows();
+        // No key: no movement, and the existing selection is left alone.
+        assert_eq!(keyboard_selection(&ctx, &rows, None), None);
+
+        // From nothing, ArrowDown starts at the first row.
+        key_ctx(&ctx, egui::Key::ArrowDown);
+        assert_eq!(keyboard_selection(&ctx, &rows, None).as_deref(), Some("a"));
+        set_selected_name(&ctx, Some("a".to_owned()));
+
+        // From "a", ArrowDown moves to "b" and parks the scroll under it.
+        key_ctx(&ctx, egui::Key::ArrowDown);
+        assert_eq!(
+            keyboard_selection(&ctx, &rows, Some("a")).as_deref(),
+            Some("b")
+        );
+        assert_eq!(
+            tablekit::take_row_scroll(&ctx, "apphistory"),
+            Some(tablekit::stable_key("b")),
+            "the scroll request must carry the row-owner identity"
+        );
+        // The request is one-shot: taking it consumes it.
+        assert_eq!(tablekit::take_row_scroll(&ctx, "apphistory"), None);
+
+        // The first row stays put on ArrowUp; End jumps to the last.
+        blank_ctx(&ctx);
+        assert_eq!(
+            keyboard_selection(&ctx, &rows, Some("a")).as_deref(),
+            None,
+            "no keypress this frame means no movement"
+        );
+        key_ctx(&ctx, egui::Key::End);
+        assert_eq!(
+            keyboard_selection(&ctx, &rows, Some("a")).as_deref(),
+            Some("c")
+        );
+        key_ctx(&ctx, egui::Key::ArrowUp);
+        assert_eq!(
+            keyboard_selection(&ctx, &rows, Some("c")).as_deref(),
+            Some("b")
+        );
     }
 }

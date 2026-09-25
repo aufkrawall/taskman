@@ -9,6 +9,7 @@ use tm_core::model::{ServiceInfo, ServiceStatus};
 
 use crate::app::TaskManApp;
 use crate::icons::Icon;
+use crate::search;
 use crate::theme;
 use crate::widgets::menu;
 use crate::widgets::tablekit::{self, TmColumn};
@@ -184,6 +185,31 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
     let sort = app.services_sort;
     rows.sort_by(|a, b| compare_services(a, b, sort));
 
+    // Arrow/Home/End/Page selection movement over the displayed services.
+    // The service NAME is the row-owner key: the one-shot scroll request is
+    // parked under that identity and resolved to a row index per frame, so a
+    // re-sorted list can never hand the scroll to the wrong row.
+    if search::nav_gate(&frame_ctx) {
+        let page_rows = tablekit::page_rows(&frame_ctx, "services", tablekit::ROW_H_DENSE)
+            .unwrap_or_else(|| {
+                (frame_ctx.content_rect().height() / tablekit::ROW_H_DENSE)
+                    .floor()
+                    .max(1.0) as usize
+            });
+        if let Some(nav) = search::list_nav(&frame_ctx)
+            .filter(|_| !tablekit::header_has_focus(&frame_ctx, "services"))
+            && let Some(next) =
+                next_selected_name(&rows, app.services_selected_name.as_deref(), nav, page_rows)
+        {
+            app.services_selected_name = Some(next.to_owned());
+            tablekit::request_row_scroll(&frame_ctx, "services", tablekit::stable_key(next));
+        }
+    }
+    let focus_row = tablekit::take_row_scroll(&frame_ctx, "services").and_then(|key| {
+        rows.iter()
+            .position(|s| tablekit::stable_key(s.name.as_str()) == key)
+    });
+
     let mut table = app
         .make_table("services", columns())
         .with_row_height(tablekit::ROW_H_DENSE);
@@ -220,7 +246,7 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
         None,
         rows.len(),
         (!q.is_empty()).then_some(i18n::tr(K::NoMatches)),
-        None,
+        focus_row,
         None,
         |ui, table, _avail, _content_w, range| {
             for ri in range {
@@ -268,8 +294,16 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
                 if resp.clicked() {
                     app.services_selected_name = Some(s.name.clone());
                 }
-                let keyboard_open = menu::keyboard_menu_requested(ui.ctx())
-                    && app.services_selected_name.as_deref() == Some(s.name.as_str());
+                // Enter (with nothing else holding focus) opens the same menu
+                // as the Menu key — there is no clearer primary action on a
+                // service row than its Start/Stop/Restart command list.
+                let selected_row = app.services_selected_name.as_deref() == Some(s.name.as_str());
+                let enter_open = crate::search::row_action_gate(ui.ctx())
+                    && ui.ctx().input(|i| i.key_pressed(egui::Key::Enter))
+                    && selected_row;
+                let keyboard_open = (enter_open
+                    || (!ui.ctx().any_popup_open() && menu::keyboard_menu_requested(ui.ctx())))
+                    && selected_row;
                 menu::context_menu_kb(&resp, keyboard_open, |ui| {
                     ui.set_min_width(170.0);
                     let mctx = ui.ctx().clone();
@@ -344,6 +378,21 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
         app.persist_sort("services", ids[column], app.services_sort.ascending);
     }
     app.persist_table(&table);
+}
+
+/// Next service selection for one keyboard movement, keyed by the row OWNER
+/// (the service name — also the row response id). `None` selection starts at
+/// the nearest edge for the direction; the result is clamped to a valid row.
+fn next_selected_name<'a>(
+    rows: &[&'a ServiceInfo],
+    selected: Option<&str>,
+    nav: crate::search::ListNav,
+    page_rows: usize,
+) -> Option<&'a str> {
+    let current = selected.and_then(|name| rows.iter().position(|s| s.name == name));
+    search::moved_index(rows.len(), current, nav, page_rows)
+        .and_then(|index| rows.get(index))
+        .map(|s| s.name.as_str())
 }
 
 fn compare_services(a: &ServiceInfo, b: &ServiceInfo, sort: tablekit::SortState) -> Ordering {
@@ -602,5 +651,63 @@ mod tests {
                 ServiceStatus::Stopped
             ]
         );
+    }
+
+    fn nav_rows() -> Vec<ServiceInfo> {
+        vec![
+            svc("alpha", None, ServiceStatus::Running),
+            svc("beta", Some(1), ServiceStatus::Stopped),
+            svc("gamma", None, ServiceStatus::Running),
+        ]
+    }
+
+    fn by_name(rows: &[ServiceInfo]) -> Vec<&ServiceInfo> {
+        rows.iter().collect()
+    }
+
+    /// Keyboard selection walks the DISPLAYED rows by the service-name owner
+    /// key, starts at the nearest edge without a selection, clamps at both
+    /// ends and pages by the table's visible-row span.
+    #[test]
+    fn keyboard_selection_walks_displayed_services_by_name() {
+        let items = nav_rows();
+        let rows = by_name(&items);
+        let next = search::ListNav::Next;
+        let prev = search::ListNav::Previous;
+
+        assert_eq!(next_selected_name(&rows, None, next, 2), Some("alpha"));
+        assert_eq!(
+            next_selected_name(&rows, Some("alpha"), next, 2),
+            Some("beta")
+        );
+        assert_eq!(
+            next_selected_name(&rows, Some("gamma"), next, 2),
+            Some("gamma"),
+            "the last row stays put"
+        );
+        assert_eq!(
+            next_selected_name(&rows, Some("beta"), prev, 2),
+            Some("alpha")
+        );
+        assert_eq!(
+            next_selected_name(&rows, Some("alpha"), prev, 2),
+            Some("alpha"),
+            "the first row stays put"
+        );
+        assert_eq!(
+            next_selected_name(&rows, Some("alpha"), search::ListNav::PageDown, 2),
+            Some("gamma")
+        );
+        assert_eq!(
+            next_selected_name(&rows, Some("beta"), search::ListNav::Last, 2),
+            Some("gamma")
+        );
+        // An exited/filtered-out selection starts from the top again.
+        assert_eq!(
+            next_selected_name(&rows, Some("vanished"), next, 2),
+            Some("alpha")
+        );
+        // An empty list has nothing to select.
+        assert_eq!(next_selected_name(&[], Some("alpha"), next, 2), None);
     }
 }

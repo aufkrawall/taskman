@@ -11,6 +11,7 @@ use tm_core::model::{StartupImpact, StartupItem};
 
 use crate::app::TaskManApp;
 use crate::icons::Icon;
+use crate::search;
 use crate::theme;
 use crate::widgets::menu;
 use crate::widgets::tablekit::{self, TmColumn};
@@ -163,6 +164,39 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
     let sort = app.startup_sort;
     visible.sort_by(|a, b| compare_items(&items[*a], &items[*b], sort));
 
+    // Arrow/Home/End/Page selection movement over the displayed startup
+    // items. The item id is the row-owner key: the one-shot scroll request
+    // parks under that identity and resolves to a row index per frame.
+    if search::nav_gate(&frame_ctx) {
+        let page_rows =
+            tablekit::page_rows(&frame_ctx, "startup", tablekit::ROW_H).unwrap_or_else(|| {
+                (frame_ctx.content_rect().height() / tablekit::ROW_H)
+                    .floor()
+                    .max(1.0) as usize
+            });
+        let current = app
+            .selected_startup_id
+            .as_ref()
+            .and_then(|id| visible.iter().position(|&i| items[i].id == *id));
+        if let Some(nav) = search::list_nav(&frame_ctx)
+            .filter(|_| !tablekit::header_has_focus(&frame_ctx, "startup"))
+            && let Some(next) = search::moved_index(visible.len(), current, nav, page_rows)
+            && let Some(&i) = visible.get(next)
+        {
+            app.selected_startup_id = Some(items[i].id.clone());
+            tablekit::request_row_scroll(
+                &frame_ctx,
+                "startup",
+                tablekit::stable_key(items[i].id.as_str()),
+            );
+        }
+    }
+    let focus_row = tablekit::take_row_scroll(&frame_ctx, "startup").and_then(|key| {
+        visible
+            .iter()
+            .position(|&i| tablekit::stable_key(items[i].id.as_str()) == key)
+    });
+
     let mut fit: Vec<f32> = table
         .cols
         .iter()
@@ -199,7 +233,7 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
         None,
         visible.len(),
         (!q.is_empty()).then_some(i18n::tr(K::NoMatches)),
-        None,
+        focus_row,
         None,
         |ui, table, _avail, _content_w, range| {
             for vi in range {
@@ -268,8 +302,16 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
                 if resp.clicked() {
                     app.selected_startup_id = Some(item.id.clone());
                 }
-                let keyboard_open = menu::keyboard_menu_requested(ui.ctx())
-                    && app.selected_startup_id.as_deref() == Some(item.id.as_str());
+                // Enter (with nothing else holding focus) opens the same menu
+                // as the Menu key: enable/disable is the closest thing to a
+                // primary action a startup entry has.
+                let selected_row = app.selected_startup_id.as_deref() == Some(item.id.as_str());
+                let enter_open = search::row_action_gate(ui.ctx())
+                    && ui.ctx().input(|i| i.key_pressed(egui::Key::Enter))
+                    && selected_row;
+                let keyboard_open = (enter_open
+                    || (!ui.ctx().any_popup_open() && menu::keyboard_menu_requested(ui.ctx())))
+                    && selected_row;
                 menu::context_menu_kb(&resp, keyboard_open, |ui| {
                     ui.set_min_width(180.0);
                     let ctx = ui.ctx().clone();

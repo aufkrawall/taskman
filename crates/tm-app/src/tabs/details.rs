@@ -1107,21 +1107,24 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
 
     // Native-style type navigation follows the current filtered/sorted list,
     // accumulates fast keystrokes into one word, cycles repeated initials,
-    // and scrolls the virtual row into view.
-    if let Some(typed) = search::list_type_ahead(ui.ctx(), "details") {
-        let selected = app.selection.primary().map(|p| p.pid);
-        let candidates = rows
-            .iter()
-            .map(|row| (row.pid, row.name.as_str()))
-            .collect::<Vec<_>>();
-        if let Some(pid) = search::type_ahead_match(candidates, selected, &typed)
-            && let Some(row) = rows.iter().find(|row| row.pid == pid)
-        {
-            select_detail_row(app, row);
+    // and scrolls the virtual row into view. Parked while the select-columns
+    // dialog owns the page: its keys must not move the list underneath it.
+    if !app.details_state.select_columns_open {
+        if let Some(typed) = search::list_type_ahead(ui.ctx(), "details") {
+            let selected = app.selection.primary().map(|p| p.pid);
+            let candidates = rows
+                .iter()
+                .map(|row| (row.pid, row.name.as_str()))
+                .collect::<Vec<_>>();
+            if let Some(pid) = search::type_ahead_match(candidates, selected, &typed)
+                && let Some(row) = rows.iter().find(|row| row.pid == pid)
+            {
+                select_detail_row(app, row);
+            }
         }
-    }
 
-    handle_keyboard_navigation(app, ui.ctx(), rows);
+        handle_keyboard_navigation(app, ui.ctx(), rows);
+    }
 
     prepare_auto_fit_widths(ui, &mut table, &visible_cols, rows);
 
@@ -1298,7 +1301,10 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
                 if resp.secondary_clicked() && !app.selection.contains_pid(row.pid) {
                     app.selection.select_single(identity_of(row));
                 }
-                let keyboard_open = menu::keyboard_menu_requested(ui.ctx())
+                // Skipped while a popup is already open: re-arming underneath
+                // it would only fight the open menu.
+                let keyboard_open = !ui.ctx().any_popup_open()
+                    && menu::keyboard_menu_requested(ui.ctx())
                     && app.selection.primary().is_some_and(|primary| {
                         primary.pid == row.pid && primary.start_epoch_s == row.start_epoch_s
                     });
@@ -1317,7 +1323,16 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
                 .interact_pos()
                 .is_some_and(|p| header_rect.contains(p))
     });
-    if header_secondary {
+    // The keyboard route to the same affordance: the Menu/Application key (or
+    // Shift+F10) on a focused header cell opens the column chooser. Enter on
+    // a focused cell already sorts through egui's focused-click activation.
+    let header_menu_key = !ui.ctx().any_popup_open()
+        && ui.ctx().input(|i| {
+            i.key_pressed(egui::Key::ContextMenu)
+                || (i.key_pressed(egui::Key::F10) && i.modifiers.shift)
+        })
+        && tablekit::header_has_focus(ui.ctx(), "details");
+    if header_secondary || header_menu_key {
         app.details_state.select_columns_open = true;
     }
 
@@ -1399,17 +1414,25 @@ fn handle_keyboard_navigation(app: &mut TaskManApp, ctx: &egui::Context, rows: &
         .selection
         .primary()
         .and_then(|selected| rows.iter().position(|row| row.pid == selected.pid));
-    // Page movement must count the rows this page actually renders.
-    let page_rows = (ctx.content_rect().height() / tablekit::ROW_H_DENSE)
-        .floor()
-        .max(1.0) as usize;
+    // Page movement must count the rows this page actually renders. The
+    // table's own viewport measurement is one frame stale but stable; the
+    // content-rect fallback covers the very first frame.
+    let page_rows =
+        tablekit::page_rows(ctx, "details", tablekit::ROW_H_DENSE).unwrap_or_else(|| {
+            (ctx.content_rect().height() / tablekit::ROW_H_DENSE)
+                .floor()
+                .max(1.0) as usize
+        });
     let select_all = std::mem::take(&mut app.select_all_requested)
         || (!ctx.egui_wants_keyboard_input()
             && ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::A)));
     if select_all {
         app.selection.select_all(&row_identities(rows));
     }
-    if let Some(nav) = search::list_nav(ctx)
+    // While a header cell or resize handle owns the arrows, egui's spatial
+    // navigation moves between header widgets; the selection must not also
+    // move (see `tablekit::header_has_focus`).
+    if let Some(nav) = search::list_nav(ctx).filter(|_| !tablekit::header_has_focus(ctx, "details"))
         && let Some(index) = search::moved_index(rows.len(), selected_pos, nav, page_rows)
         && let Some(row) = rows.get(index)
     {
@@ -1420,7 +1443,34 @@ fn handle_keyboard_navigation(app: &mut TaskManApp, ctx: &egui::Context, rows: &
         }
     }
 
-    if !app.details_state.is_tree() || ctx.egui_wants_keyboard_input() {
+    // Enter/Space belong to the row layer only while nothing else can claim
+    // them (a focused widget would activate itself on the same keypress).
+    if search::row_action_gate(ctx) {
+        let (space, enter) = ctx.input(|i| {
+            (
+                i.key_pressed(egui::Key::Space),
+                i.key_pressed(egui::Key::Enter),
+            )
+        });
+        let primary = app.selection.primary().cloned().and_then(|primary| {
+            rows.iter()
+                .find(|row| row.pid == primary.pid)
+                .map(identity_of)
+        });
+        if let Some(identity) = primary {
+            if space {
+                // The focused row of a multi-select list toggles in and out.
+                app.selection.toggle(identity, &row_identities(rows));
+            } else if enter {
+                open_process_properties(app, identity);
+            }
+        }
+    }
+
+    if !app.details_state.is_tree()
+        || !search::nav_gate(ctx)
+        || tablekit::header_has_focus(ctx, "details")
+    {
         return;
     }
     let (left, right) = ctx.input(|input| {
@@ -1518,15 +1568,51 @@ fn persist_column_prefs(app: &mut TaskManApp) {
     app.save_settings();
 }
 
+/// Park the initial-focus request of a dialog that opens on `id`. A dialog's
+/// first frame is egui's invisible sizing pass, where every widget is
+/// disabled and a `request_focus` would be dropped — the request is parked
+/// and fired on the first ENABLED frame instead (the pattern the keyboard-
+/// opened menus in `widgets/menu.rs` use). Returns whether a request is
+/// already parked.
+fn arm_dialog_initial_focus(ctx: &egui::Context, id: &str) -> bool {
+    let key = egui::Id::new(("tm-dialog-initial-focus", id));
+    if ctx.data(|d| d.get_temp::<bool>(key)).unwrap_or(false) {
+        return true;
+    }
+    ctx.data_mut(|d| d.insert_temp(key, true));
+    false
+}
+
+/// Fire and clear a parked initial-focus request on an enabled widget.
+fn fire_dialog_initial_focus(ctx: &egui::Context, id: &str, target: Option<&egui::Response>) {
+    let key = egui::Id::new(("tm-dialog-initial-focus", id));
+    if ctx.data(|d| d.get_temp::<bool>(key)).unwrap_or(false)
+        && let Some(target) = target
+    {
+        target.request_focus();
+        ctx.data_mut(|d| d.remove::<bool>(key));
+    }
+}
+
+fn disarm_dialog_initial_focus(ctx: &egui::Context, id: &str) {
+    ctx.data_mut(|d| d.remove::<bool>(egui::Id::new(("tm-dialog-initial-focus", id))));
+}
+
 fn select_columns_dialog(app: &mut TaskManApp, ctx: &egui::Context, pal: &theme::Palette) {
     if !app.details_state.select_columns_open {
         return;
     }
     let mut open = true;
-    // Esc and Enter close, mirroring the Close button. Space stays ordinary
-    // text so focused checkboxes keep toggling via egui.
-    let keys = crate::app_ui::consume_dialog_keys(ctx, false);
-    let close_now = keys.escape || keys.enter;
+    // Tab is NOT consumed: checkboxes, reorder buttons and Close are reached
+    // with egui's own focus traversal. Esc closes as before; Enter closes
+    // only while nothing activatable holds focus — egui turns Enter into a
+    // click for whatever holds focus, and a focused checkbox must toggle,
+    // never close the dialog out from under it.
+    let escape = ctx.input_mut(|i| i.consume_key(Default::default(), egui::Key::Escape));
+    let enter_closes =
+        search::row_action_gate(ctx) && ctx.input(|i| i.key_pressed(egui::Key::Enter));
+    let close_now = escape || enter_closes;
+    arm_dialog_initial_focus(ctx, "select-columns");
     egui::Window::new(i18n::tr(K::SelectColumns))
         .open(&mut open)
         .collapsible(false)
@@ -1535,21 +1621,30 @@ fn select_columns_dialog(app: &mut TaskManApp, ctx: &egui::Context, pal: &theme:
         .show(ctx, |ui| {
             ui.set_min_width(330.0);
             ui.spacing_mut().item_spacing.y = 2.0;
+            let mut first_checkbox: Option<egui::Response> = None;
             egui::ScrollArea::vertical()
                 .max_height(330.0)
                 .show(ui, |ui| {
                     // Iterate a snapshot because arrow clicks mutate the live
                     // ordering. The updated order is visible next frame.
                     let order = app.details_state.order.clone();
-                    for cid in order {
+                    for (index, cid) in order.into_iter().enumerate() {
                         let spec = spec_for(cid);
                         let mut on = app.details_state.is_visible(cid);
                         let rank = app.details_state.visible_rank(cid);
                         let count = app.details_state.visible_count();
                         ui.horizontal(|ui| {
-                            if crate::widgets::controls::checkbox(ui, &mut on, spec.label(), pal)
-                                .changed()
-                            {
+                            let checkbox =
+                                crate::widgets::controls::checkbox(ui, &mut on, spec.label(), pal);
+                            if index == 0 {
+                                first_checkbox = Some(checkbox.clone());
+                            }
+                            // Keyboard focus inside the scrolling list must
+                            // bring its row into view.
+                            if checkbox.gained_focus() {
+                                checkbox.scroll_to_me(None);
+                            }
+                            if checkbox.changed() {
                                 app.details_state.set_visible(cid, on);
                                 persist_column_prefs(app);
                                 let sort_col = app.details_state.sort_col;
@@ -1563,27 +1658,31 @@ fn select_columns_dialog(app: &mut TaskManApp, ctx: &egui::Context, pal: &theme:
                                         let can_down = rank.is_some_and(|r| r + 1 < count);
                                         let can_up = rank.is_some_and(|r| r > 0);
                                         ui.add_space(4.0);
-                                        if crate::widgets::controls::icon_button(
+                                        let down = crate::widgets::controls::icon_button(
                                             ui,
                                             crate::icons::Icon::ChevronDown,
                                             can_down,
                                             pal,
                                         )
-                                        .on_hover_text(i18n::tr(K::MoveColumnDown))
-                                        .clicked()
-                                        {
+                                        .on_hover_text(i18n::tr(K::MoveColumnDown));
+                                        if down.gained_focus() {
+                                            down.scroll_to_me(None);
+                                        }
+                                        if down.clicked() {
                                             app.details_state.move_visible(cid, 1);
                                             persist_column_prefs(app);
                                         }
-                                        if crate::widgets::controls::icon_button(
+                                        let up = crate::widgets::controls::icon_button(
                                             ui,
                                             crate::icons::Icon::ChevronUp,
                                             can_up,
                                             pal,
                                         )
-                                        .on_hover_text(i18n::tr(K::MoveColumnUp))
-                                        .clicked()
-                                        {
+                                        .on_hover_text(i18n::tr(K::MoveColumnUp));
+                                        if up.gained_focus() {
+                                            up.scroll_to_me(None);
+                                        }
+                                        if up.clicked() {
                                             app.details_state.move_visible(cid, -1);
                                             persist_column_prefs(app);
                                         }
@@ -1593,6 +1692,7 @@ fn select_columns_dialog(app: &mut TaskManApp, ctx: &egui::Context, pal: &theme:
                         });
                     }
                 });
+            fire_dialog_initial_focus(ctx, "select-columns", first_checkbox.as_ref());
             ui.separator();
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui.button(i18n::tr(K::Close)).clicked() {
@@ -1601,6 +1701,7 @@ fn select_columns_dialog(app: &mut TaskManApp, ctx: &egui::Context, pal: &theme:
             });
         });
     if !open || close_now {
+        disarm_dialog_initial_focus(ctx, "select-columns");
         app.details_state.select_columns_open = false;
     }
 }
@@ -3728,9 +3829,19 @@ pub fn process_properties_dialog(app: &mut TaskManApp, ctx: &egui::Context) {
     );
     let mut open = true;
     let mut close_clicked = false;
-    // Esc and Enter close, mirroring the Close button.
-    let keys = crate::app_ui::consume_dialog_keys(ctx, false);
-    let close_now = keys.escape || keys.enter;
+    // Tab is NOT consumed: the tab strip, the footer buttons and the Close
+    // button are reached with egui's own focus traversal. Esc closes as
+    // before; Enter closes only while nothing activatable holds focus — egui
+    // turns Enter into a click for whatever holds focus, and closing a
+    // properties inspector out from under a focused button is a surprise.
+    let escape = ctx.input_mut(|i| i.consume_key(Default::default(), egui::Key::Escape));
+    let enter_closes =
+        search::row_action_gate(ctx) && ctx.input(|i| i.key_pressed(egui::Key::Enter));
+    let close_now = escape || enter_closes;
+    // The dialog opens on the General tab, focused: the request is parked
+    // until egui's invisible sizing pass is over (see
+    // [`arm_dialog_initial_focus`]).
+    arm_dialog_initial_focus(ctx, "process-properties");
 
     egui::Window::new(title)
         .open(&mut open)
@@ -3740,16 +3851,16 @@ pub fn process_properties_dialog(app: &mut TaskManApp, ctx: &egui::Context) {
         .min_size([640.0, 420.0])
         .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
         .show(ctx, |ui| {
+            let mut general_tab: Option<egui::Response> = None;
             ui.horizontal(|ui| {
-                if ui
-                    .selectable_label(
-                        dialog.tab == ProcessPropertiesTab::General,
-                        i18n::tr(K::General),
-                    )
-                    .clicked()
-                {
+                let general = ui.selectable_label(
+                    dialog.tab == ProcessPropertiesTab::General,
+                    i18n::tr(K::General),
+                );
+                if general.clicked() {
                     dialog.tab = ProcessPropertiesTab::General;
                 }
+                general_tab = Some(general);
                 if ui
                     .selectable_label(
                         dialog.tab == ProcessPropertiesTab::Statistics,
@@ -3770,6 +3881,7 @@ pub fn process_properties_dialog(app: &mut TaskManApp, ctx: &egui::Context) {
                     dialog.tab = ProcessPropertiesTab::Security;
                 }
             });
+            fire_dialog_initial_focus(ctx, "process-properties", general_tab.as_ref());
             ui.separator();
 
             let Some(process) = process.as_ref() else {
@@ -3859,6 +3971,8 @@ pub fn process_properties_dialog(app: &mut TaskManApp, ctx: &egui::Context) {
 
     if open && !close_clicked && !close_now {
         app.proc_props = Some(dialog);
+    } else {
+        disarm_dialog_initial_focus(ctx, "process-properties");
     }
 }
 
@@ -3894,6 +4008,14 @@ pub fn affinity_dialog(app: &mut TaskManApp, ctx: &egui::Context, pal: &theme::P
     // Changing affinity is destructive: the SAFE action owns the keyboard
     // default, so Escape and an unfocused Enter both cancel. Space stays
     // ordinary text so focused CPU checkboxes keep toggling via egui.
+    //
+    // MERGER NOTE: this dialog keeps the OLD `dialog_button_row` contract —
+    // Tab is consumed here and mirrored onto the button row by hand, so its
+    // Tab traversal is dead until the shared dialog contract (being built in
+    // `app_ui/original.rs`) changes this caller. `select_columns_dialog` and
+    // `process_properties_dialog` in this file already use the new
+    // Tab-through style with local helpers; unify all of them on one
+    // contract when merging.
     let keys = crate::app_ui::consume_dialog_keys(ctx, false);
     let mut focused: bool = ctx.data(|d| d.get_temp(focus_id)).unwrap_or(false);
     focused = crate::app_ui::update_end_task_dialog_focus(

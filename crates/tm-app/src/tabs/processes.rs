@@ -500,9 +500,6 @@ fn handle_keyboard_navigation(app: &mut TaskManApp, ctx: &egui::Context, rows: &
     let selected_pid = app.selection.primary().map(|p| p.pid);
     let selected_pos =
         selected_pid.and_then(|pid| process_rows.iter().position(|(_, row)| row.pid == pid));
-    let page_rows = (ctx.content_rect().height() / tablekit::ROW_H)
-        .floor()
-        .max(1.0) as usize;
     // The display order is only materialized for the two gestures that need
     // it. This runs every frame over the whole process list.
     let order = || -> Vec<crate::app::ProcessIdentity> {
@@ -517,7 +514,19 @@ fn handle_keyboard_navigation(app: &mut TaskManApp, ctx: &egui::Context, rows: &
     if select_all {
         app.selection.select_all(&order());
     }
-    if let Some(nav) = search::list_nav(ctx)
+    // Page movement spans the rows the table actually shows — not the whole
+    // window content height, which counts the header and toolbar and used to
+    // overshoot by half a page.
+    let page_rows = tablekit::page_rows(ctx, "processes", tablekit::ROW_H).unwrap_or_else(|| {
+        (ctx.content_rect().height() / tablekit::ROW_H)
+            .floor()
+            .max(1.0) as usize
+    });
+    // While a header cell or resize handle owns the arrows, egui's spatial
+    // navigation moves between header widgets; the selection must not also
+    // move (see `tablekit::header_has_focus`).
+    if let Some(nav) =
+        search::list_nav(ctx).filter(|_| !tablekit::header_has_focus(ctx, "processes"))
         && let Some(next) = search::moved_index(process_rows.len(), selected_pos, nav, page_rows)
         && let Some((_, row)) = process_rows.get(next)
     {
@@ -529,7 +538,35 @@ fn handle_keyboard_navigation(app: &mut TaskManApp, ctx: &egui::Context, rows: &
         }
     }
 
-    if ctx.egui_wants_keyboard_input() {
+    // Enter/Space belong to the row layer only while nothing else can claim
+    // them (a focused widget would activate itself on the same keypress).
+    if search::row_action_gate(ctx) {
+        let (space, enter) = ctx.input(|i| {
+            (
+                i.key_pressed(egui::Key::Space),
+                i.key_pressed(egui::Key::Enter),
+            )
+        });
+        let primary = app
+            .selection
+            .primary()
+            .cloned()
+            .and_then(|primary| process_rows.iter().find(|(_, row)| row.pid == primary.pid));
+        if let Some((_, row)) = primary {
+            if space {
+                // The focused row of a multi-select list toggles in and out.
+                app.selection.toggle(identity_of(row), &order());
+            } else if enter {
+                // Same as double-click: the row (a group head carries every
+                // member) lands selected on the Details page.
+                app.pending_details_focus =
+                    Some(crate::app::PendingDetailsFocus(details_focus_targets(row)));
+                app.tab = crate::app::Tab::Details;
+            }
+        }
+    }
+
+    if !search::nav_gate(ctx) || tablekit::header_has_focus(ctx, "processes") {
         return;
     }
     let (left, right) = ctx.input(|i| {
@@ -853,8 +890,10 @@ fn group_header(
     };
     // Exactly the table's content width — matching the rows keeps the
     // horizontal scroll extents (and thus header/body alignment) identical.
+    // Non-focusable like every row (see `TmTable::row`): the group is
+    // collapsed/expanded through its own click or the tree's Left/Right keys.
     let (rect, resp) =
-        ui.allocate_exact_size(egui::vec2(width, tablekit::ROW_H), egui::Sense::click());
+        ui.allocate_exact_size(egui::vec2(width, tablekit::ROW_H), egui::Sense::CLICK);
     // TM group headers sit directly on the window background — no fill band
     // (the old subtle tint read as a misplaced stripe).
     let cx = rect.left() + 14.0;
@@ -1012,8 +1051,10 @@ fn row_ui(
     if !row.synthetic {
         // The Menu key (or Shift+F10) opens the menu of the current
         // selection, anchored to its row — the keyboard counterpart of a
-        // right click.
-        let keyboard_open = menu::keyboard_menu_requested(ui.ctx())
+        // right click. Skipped while a popup is already open: re-arming
+        // underneath it would only fight the open menu.
+        let keyboard_open = !ui.ctx().any_popup_open()
+            && menu::keyboard_menu_requested(ui.ctx())
             && selectable
             && app.selection.primary().is_some_and(|primary| {
                 primary.pid == row.pid && primary.start_epoch_s == row.start_epoch_s
