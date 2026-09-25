@@ -78,8 +78,13 @@ pub fn dropdown_menu(resp: &Response, add: impl FnOnce(&mut Ui)) {
 /// True for the one frame on which the user asked for the context menu of
 /// the current selection with the keyboard: the Menu/Application key (next
 /// to Right Ctrl), or its standard Shift+F10 accelerator.
+///
+/// The gate only excludes a focused TEXT EDIT: while the user is typing,
+/// the Menu key belongs to the field. Any other focused widget (a table row
+/// after Tab navigation, a button) must not swallow the key — that is exactly
+/// how a keyboard user opens the menu for the selection.
 pub fn keyboard_menu_requested(ctx: &egui::Context) -> bool {
-    !ctx.egui_wants_keyboard_input()
+    !ctx.text_edit_focused()
         && ctx.input(|input| {
             input.key_pressed(egui::Key::ContextMenu)
                 || (input.key_pressed(egui::Key::F10) && input.modifiers.shift)
@@ -187,6 +192,34 @@ fn entry(ui: &mut Ui, text: &str, marks: Marks) -> Response {
             ui.ctx().data_mut(|d| d.remove::<egui::Id>(key));
             resp.request_focus();
         }
+    }
+
+    // Inside a menu popup, Tab belongs to the UI behind the menu: close the
+    // popup and let egui's focus traversal proceed (popups are not modal, and
+    // a Tab that silently strands an open menu reads as a dead key). Shift+Tab
+    // closes too — `key_pressed` ignores modifiers.
+    if egui::containers::menu::is_in_menu(ui) && ui.input(|input| input.key_pressed(egui::Key::Tab))
+    {
+        ui.close();
+    }
+
+    // Own the horizontal arrows inside menus: egui's spatial navigation would
+    // otherwise jump OUT of the popup at whatever widget happens to lie to the
+    // side. `submenu` turns ArrowRight into "open this submenu" and ArrowLeft
+    // into "close it again"; this filter makes egui's focus system ignore bare
+    // horizontal arrows while a menu entry is focused. It must be installed
+    // while the widget already holds focus, so it takes effect the frame after
+    // focus lands.
+    if enabled && resp.has_focus() {
+        ui.ctx().memory_mut(|mem| {
+            mem.set_focus_lock_filter(
+                resp.id,
+                egui::EventFilter {
+                    horizontal_arrows: true,
+                    ..Default::default()
+                },
+            );
+        });
     }
 
     let fill = if !enabled {
@@ -351,6 +384,42 @@ pub fn submenu(ui: &mut Ui, text: &str, content: impl FnOnce(&mut Ui)) -> Respon
             ..Default::default()
         },
     );
+    // Keyboard: ArrowRight on the focused parent opens the submenu and hands
+    // focus to its first enabled entry (the KB_INITIAL_FOCUS handoff consumed
+    // by `entry`); ArrowLeft inside the open submenu — or on the parent —
+    // closes it again and refocuses this entry. egui's spatial navigation
+    // stays out of the way because `entry` locks horizontal arrows while a
+    // menu entry is focused.
+    let sub_id = egui::containers::menu::SubMenu::id_from_widget_id(resp.id);
+    if ui.is_enabled() {
+        if resp.has_focus() && !open && ui.input(|input| input.key_pressed(egui::Key::ArrowRight)) {
+            egui::containers::menu::MenuState::from_ui(ui, |state, _| {
+                state.open_item = Some(sub_id);
+            });
+            // `MenuState::from_id` self-heals an open item away when its
+            // submenu has never rendered (no fresh MenuState of its own), so
+            // the state just set would be wiped before `SubMenu::show` reads
+            // it. Mark the submenu shown to carry the entry over to the
+            // popup that renders this very frame.
+            egui::containers::menu::MenuState::mark_shown(ui.ctx(), sub_id);
+            ui.ctx()
+                .data_mut(|d| d.insert_temp(egui::Id::new(KB_INITIAL_FOCUS), sub_id));
+        }
+        if ui.input(|input| input.key_pressed(egui::Key::ArrowLeft)) {
+            let focused_inside = open
+                && ui.ctx().memory(|mem| mem.focused()).is_some_and(|id| {
+                    ui.ctx()
+                        .read_response(id)
+                        .is_some_and(|focused| focused.layer_id.id == sub_id)
+                });
+            if focused_inside || resp.has_focus() {
+                egui::containers::menu::MenuState::from_ui(ui, |state, _| {
+                    state.open_item = None;
+                });
+                resp.request_focus();
+            }
+        }
+    }
     egui::containers::menu::SubMenu::new().show(ui, &resp, content);
     resp
 }
@@ -713,5 +782,189 @@ mod tests {
         });
         out.textures_delta.clear();
         assert!(!triggered, "Plain F10 should not trigger keyboard menu");
+    }
+
+    /// The Menu key must keep working while a non-text widget holds focus
+    /// (that is how a keyboard user opens the selection's menu after Tab
+    /// navigation); only a focused text edit keeps it for the field.
+    #[test]
+    fn keyboard_menu_requested_gate_only_blocks_text_edits() {
+        let ctx = egui::Context::default();
+        let screen = Rect::from_min_size(Pos2::ZERO, egui::vec2(800.0, 600.0));
+        let raw = |events: Vec<egui::Event>| egui::RawInput {
+            screen_rect: Some(screen),
+            events,
+            focused: true,
+            ..Default::default()
+        };
+        let menu_key = || {
+            vec![egui::Event::Key {
+                key: egui::Key::ContextMenu,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::default(),
+            }]
+        };
+
+        // A focused button (e.g. a table row reached with Tab).
+        let mut out = ctx.run_ui(raw(vec![]), |ui| {
+            ui.button("Toolbar").request_focus();
+        });
+        out.textures_delta.clear();
+        let mut triggered = false;
+        let mut out = ctx.run_ui(raw(menu_key()), |ui| {
+            triggered = keyboard_menu_requested(ui.ctx());
+            let _ = ui.button("Toolbar");
+        });
+        out.textures_delta.clear();
+        assert!(
+            triggered,
+            "the Menu key must work while a button holds focus"
+        );
+
+        // While a text edit owns the keyboard, the key belongs to the field.
+        let mut text = String::new();
+        let mut out = ctx.run_ui(raw(vec![]), |ui| {
+            ui.text_edit_singleline(&mut text).request_focus();
+        });
+        out.textures_delta.clear();
+        let mut triggered = false;
+        let mut out = ctx.run_ui(raw(menu_key()), |ui| {
+            triggered = keyboard_menu_requested(ui.ctx());
+            ui.text_edit_singleline(&mut text);
+        });
+        out.textures_delta.clear();
+        assert!(!triggered, "a focused text edit must keep the Menu key");
+    }
+
+    /// Tab while a menu popup is open closes the menu instead of stranding an
+    /// orphaned popup; egui's own focus traversal proceeds untouched.
+    #[test]
+    fn tab_closes_an_open_menu() {
+        let ctx = egui::Context::default();
+        let screen = Rect::from_min_size(Pos2::ZERO, egui::vec2(800.0, 600.0));
+        let raw = |events: Vec<egui::Event>| egui::RawInput {
+            screen_rect: Some(screen),
+            events,
+            focused: true,
+            ..Default::default()
+        };
+        let key = |key: egui::Key| egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::default(),
+        };
+
+        let frame = |keyboard_open: bool, events: Vec<egui::Event>, menu_open: &mut bool| {
+            *menu_open = false;
+            let mut out = ctx.run_ui(raw(events), |ui| {
+                let resp = ui.label("row");
+                context_menu_kb(&resp, keyboard_open, |ui| {
+                    *menu_open = true;
+                    item(ui, "Action 1");
+                });
+            });
+            out.textures_delta.clear();
+        };
+
+        let mut menu_open = false;
+        // Keyboard-open the menu and let focus settle on the entry.
+        frame(true, vec![], &mut menu_open);
+        assert!(menu_open, "keyboard-open must open the menu");
+        frame(false, vec![], &mut menu_open);
+        assert!(menu_open);
+
+        // The frame Tab is pressed still paints the closing menu...
+        frame(false, vec![key(egui::Key::Tab)], &mut menu_open);
+        assert!(menu_open, "the closing frame still runs the menu content");
+        // ...and the menu is gone afterwards.
+        frame(false, vec![], &mut menu_open);
+        assert!(!menu_open, "Tab must close the menu");
+    }
+
+    /// ArrowRight on a focused submenu parent opens the submenu and focuses
+    /// its first entry; ArrowLeft inside the submenu closes it again, keeps
+    /// the parent menu open and refocuses the parent entry.
+    #[test]
+    fn arrow_right_opens_submenu_and_arrow_left_returns_to_the_parent() {
+        let ctx = egui::Context::default();
+        let screen = Rect::from_min_size(Pos2::ZERO, egui::vec2(800.0, 600.0));
+        let raw = |events: Vec<egui::Event>| egui::RawInput {
+            screen_rect: Some(screen),
+            events,
+            focused: true,
+            ..Default::default()
+        };
+        let key = |key: egui::Key| egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::default(),
+        };
+
+        struct Frame {
+            root_open: bool,
+            sub_open: bool,
+            parent_focused: bool,
+            sub_focused: bool,
+        }
+        let frame = |keyboard_open: bool, events: Vec<egui::Event>| {
+            let mut f = Frame {
+                root_open: false,
+                sub_open: false,
+                parent_focused: false,
+                sub_focused: false,
+            };
+            let mut out = ctx.run_ui(raw(events), |ui| {
+                let resp = ui.label("row");
+                context_menu_kb(&resp, keyboard_open, |ui| {
+                    f.root_open = true;
+                    let parent = submenu(ui, "Priority", |ui| {
+                        f.sub_open = true;
+                        let high = item(ui, "High");
+                        item(ui, "Low");
+                        f.sub_focused = high.has_focus();
+                    });
+                    f.parent_focused = parent.has_focus();
+                });
+            });
+            out.textures_delta.clear();
+            f
+        };
+
+        // Frame 1: keyboard-open; the popup's first frame is a sizing pass.
+        let f = frame(true, vec![]);
+        assert!(f.root_open && !f.sub_open && !f.parent_focused && !f.sub_focused);
+
+        // Frame 2: the first entry — the submenu parent — owns the focus.
+        let f = frame(false, vec![]);
+        assert!(f.parent_focused && !f.sub_focused, "parent must be focused");
+
+        // Frame 3: ArrowRight opens the submenu in the same frame.
+        let f = frame(false, vec![key(egui::Key::ArrowRight)]);
+        assert!(f.sub_open, "ArrowRight must open the submenu");
+        assert!(f.parent_focused, "focus has not moved yet");
+
+        // Frame 4: the submenu's first entry owns the focus.
+        let f = frame(false, vec![]);
+        assert!(f.sub_open && f.sub_focused && !f.parent_focused);
+
+        // Frame 5: ArrowLeft closes the submenu in the same frame and hands
+        // focus back to the parent entry.
+        let f = frame(false, vec![key(egui::Key::ArrowLeft)]);
+        assert!(!f.sub_open, "ArrowLeft must close the submenu");
+        assert!(
+            f.root_open,
+            "the parent menu must survive the submenu closing"
+        );
+        assert!(f.parent_focused, "the parent entry must be refocused");
+
+        // Frame 6: the state sticks — submenu closed, root menu still up.
+        let f = frame(false, vec![]);
+        assert!(f.root_open && !f.sub_open && f.parent_focused && !f.sub_focused);
     }
 }

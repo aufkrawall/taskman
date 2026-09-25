@@ -358,6 +358,19 @@ pub fn dialog(app: &mut TaskManApp, ctx: &egui::Context, pal: &theme::Palette) {
     let close_now = state.pending_unload.is_none()
         && ctx.input_mut(|input| input.consume_key(Default::default(), egui::Key::Escape));
 
+    // Tab is never consumed here, so egui's focus system moves between the
+    // filter field, the toolbar buttons and (where the platform keeps rows
+    // focusable) the table. The first frame anchors focus on the filter and
+    // remembers what held focus before, so closing hands it back.
+    let restore_id = egui::Id::new("module-dialog-restore-focus");
+    let first_frame = ctx
+        .data(|d| d.get_temp::<Option<egui::Id>>(restore_id))
+        .is_none();
+    if first_frame {
+        let captured = crate::app_ui::capture_focus(ctx);
+        ctx.data_mut(|d| d.insert_temp(restore_id, captured));
+    }
+
     egui::Window::new(title)
         .open(&mut open)
         .default_size([850.0, 520.0])
@@ -366,11 +379,16 @@ pub fn dialog(app: &mut TaskManApp, ctx: &egui::Context, pal: &theme::Palette) {
         .collapsible(false)
         .show(ctx, |ui| {
             ui.horizontal(|ui| {
-                ui.add(
+                let filter_resp = ui.add(
                     egui::TextEdit::singleline(&mut state.filter)
                         .hint_text(i18n::tr(K::SearchHint))
                         .desired_width(300.0),
                 );
+                // The inspector opens ready to type: the filter narrows the
+                // list immediately, and Tab moves on through the toolbar.
+                if first_frame {
+                    filter_resp.request_focus();
+                }
                 if ui
                     .add_enabled(
                         !state.fetch.busy() && !state.unload.busy(),
@@ -597,12 +615,24 @@ pub fn dialog(app: &mut TaskManApp, ctx: &egui::Context, pal: &theme::Palette) {
     }
 
     let mut confirmed = None;
+    let confirm_restore_id = egui::Id::new("unload-confirm-restore-focus");
     if let Some(module) = state.pending_unload.as_ref() {
         let confirm_focus_id = egui::Id::new("unload-confirm-focus-primary");
         let mut confirm_open = true;
         // Unloading can crash the target: the SAFE action owns the default,
-        // so Escape and an unfocused Enter both cancel.
+        // so Escape and an unfocused Enter both cancel. This two-button
+        // destructive confirm stays a hard keyboard trap (Tab toggles its two
+        // buttons via the app-side focus flag).
         let keys = crate::app_ui::consume_dialog_keys(ctx, true);
+        // First frame of the confirmation: remember what held focus in the
+        // inspector behind, so dismissing hands it back.
+        if ctx
+            .data(|d| d.get_temp::<Option<egui::Id>>(confirm_restore_id))
+            .is_none()
+        {
+            let captured = crate::app_ui::capture_focus(ctx);
+            ctx.data_mut(|d| d.insert_temp(confirm_restore_id, captured));
+        }
         let mut focused: bool = ctx.data(|d| d.get_temp(confirm_focus_id)).unwrap_or(false);
         focused = crate::app_ui::update_end_task_dialog_focus(
             focused,
@@ -650,6 +680,11 @@ pub fn dialog(app: &mut TaskManApp, ctx: &egui::Context, pal: &theme::Palette) {
         }
     }
     if let Some(confirm) = confirmed {
+        let saved = ctx
+            .data(|d| d.get_temp::<Option<egui::Id>>(confirm_restore_id))
+            .flatten();
+        crate::app_ui::restore_focus(ctx, saved);
+        ctx.data_mut(|d| d.remove_temp::<Option<egui::Id>>(confirm_restore_id));
         let module = state.pending_unload.take();
         if confirm && let Some(module) = module {
             begin_unload(app, &mut state, module, ctx);
@@ -658,6 +693,12 @@ pub fn dialog(app: &mut TaskManApp, ctx: &egui::Context, pal: &theme::Palette) {
 
     if open && !close_now {
         app.module_dialog = Some(state);
+    } else {
+        let saved = ctx
+            .data(|d| d.get_temp::<Option<egui::Id>>(restore_id))
+            .flatten();
+        crate::app_ui::restore_focus(ctx, saved);
+        ctx.data_mut(|d| d.remove_temp::<Option<egui::Id>>(restore_id));
     }
 }
 

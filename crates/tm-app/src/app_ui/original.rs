@@ -423,12 +423,25 @@ pub fn ellipsis_menu(
 
 pub fn settings_dialog(app: &mut TaskManApp, ctx: &egui::Context, _pal: &theme::Palette) {
     let mut open = true;
-    // Esc and Enter close, mirroring the Close button (which force-saves).
-    // Keys are consumed before the window so egui's built-in focused-button
-    // activation cannot double-fire; Space stays ordinary text so the
-    // keyboard still toggles focused checkboxes via egui.
-    let keys = consume_dialog_keys(ctx, false);
+    // A tab-through dialog: the controls must stay keyboard-reachable, so Tab
+    // is left to egui's focus system and Enter only closes while no control
+    // holds focus (a focused control activates natively instead). Esc always
+    // closes. Keys are consumed before the window so egui's built-in
+    // focused-button activation cannot double-fire; Space stays ordinary text
+    // so the keyboard still toggles focused checkboxes via egui.
+    let restore_id = egui::Id::new("settings-dialog-restore-focus");
+    let first_frame = ctx
+        .data(|d| d.get_temp::<Option<egui::Id>>(restore_id))
+        .is_none();
+    if first_frame {
+        // Remember what held focus before the dialog took over, so closing
+        // can hand it back.
+        let captured = capture_focus(ctx);
+        ctx.data_mut(|d| d.insert_temp(restore_id, captured));
+    }
+    let keys = consume_dialog_keys_tab_through(ctx, false);
     let close_now = keys.escape || keys.enter;
+    let mut close_clicked = false;
     egui::Window::new(i18n::tr(K::Settings))
         .open(&mut open)
         .collapsible(false)
@@ -441,22 +454,31 @@ pub fn settings_dialog(app: &mut TaskManApp, ctx: &egui::Context, _pal: &theme::
             ui.set_width(380.0);
 
             ui.heading(i18n::tr(K::DesignHeading));
+            let mut anchor: Option<egui::Response> = None;
             ui.horizontal(|ui| {
                 for (mode, key) in [
                     (ThemeMode::System, K::ThemeSystem),
                     (ThemeMode::Light, K::ThemeLight),
                     (ThemeMode::Dark, K::ThemeDark),
                 ] {
-                    if ui
-                        .selectable_label(app.shared.settings.theme == mode, i18n::tr(key))
-                        .clicked()
-                    {
+                    let choice =
+                        ui.selectable_label(app.shared.settings.theme == mode, i18n::tr(key));
+                    if anchor.is_none() {
+                        anchor = Some(choice.clone());
+                    }
+                    if choice.clicked() {
                         app.shared.settings.theme = mode;
                         apply_theme(ctx, mode);
                         app.save_settings();
                     }
                 }
             });
+            // The first interactive control is the keyboard anchor of the
+            // dialog: requested once on the opening frame, from where egui's
+            // own Tab traversal takes over.
+            if first_frame && let Some(anchor) = anchor.filter(|resp| resp.enabled()) {
+                anchor.request_focus();
+            }
 
             ui.add_space(10.0);
             ui.heading(i18n::tr(K::UpdateSpeedHeading));
@@ -958,17 +980,32 @@ pub fn settings_dialog(app: &mut TaskManApp, ctx: &egui::Context, _pal: &theme::
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui.button(i18n::tr(K::Close)).clicked() {
-                        app.show_settings = false;
-                        app.save_settings_forced();
+                        close_clicked = true;
                     }
                 });
             });
+
+            // Keyboard focus just landed on a control: bring it into view.
+            // One read at the end of the content pass covers every control
+            // above, and the scroll target is consumed by the vertical scroll
+            // area that wraps this content.
+            if let Some(id) = ctx.memory(|mem| mem.focused())
+                && let Some(focus_resp) = ctx.read_response(id)
+                && focus_resp.gained_focus()
+            {
+                focus_resp.scroll_to_me(None);
+            }
         });
-    if !open {
+    if !open || close_now || close_clicked {
+        let saved = ctx
+            .data(|d| d.get_temp::<Option<egui::Id>>(restore_id))
+            .flatten();
+        restore_focus(ctx, saved);
+        ctx.data_mut(|d| d.remove_temp::<Option<egui::Id>>(restore_id));
         app.show_settings = false;
-    } else if close_now {
-        app.show_settings = false;
-        app.save_settings_forced();
+        if close_now || close_clicked {
+            app.save_settings_forced();
+        }
     }
 }
 
@@ -987,11 +1024,18 @@ pub fn process_end_dialog(app: &mut TaskManApp, ctx: &egui::Context) {
     };
     let mut open = true;
     let focus_id = egui::Id::new("end_task_dialog_focus_end");
+    let restore_id = egui::Id::new("end-task-dialog-restore-focus");
     // The SAFE action owns the default: focus starts on Cancel, so Enter and
     // Space confirm nothing until the user deliberately moves focus to the
     // End task button. The dialog exists to guard accidental kills; its
     // keyboard default must not undo that guard.
     let mut end_focused: bool = ctx.data(|d| d.get_temp(focus_id)).unwrap_or(false);
+    // First frame of this dialog session (the focus flag above only exists
+    // while it stays open): remember what held focus before the dialog.
+    if ctx.data(|d| d.get_temp::<bool>(focus_id)).is_none() {
+        let captured = capture_focus(ctx);
+        ctx.data_mut(|d| d.insert_temp(restore_id, captured));
+    }
 
     let keys = consume_dialog_keys(ctx, true);
     end_focused =
@@ -1090,6 +1134,11 @@ pub fn process_end_dialog(app: &mut TaskManApp, ctx: &egui::Context) {
         decision = Some(false);
     }
     if let Some(confirm) = decision {
+        let saved = ctx
+            .data(|d| d.get_temp::<Option<egui::Id>>(restore_id))
+            .flatten();
+        restore_focus(ctx, saved);
+        ctx.data_mut(|d| d.remove_temp::<Option<egui::Id>>(restore_id));
         ctx.data_mut(|d| d.remove_temp::<bool>(focus_id));
         app.pending_process_end = None;
         if confirm {
@@ -1165,9 +1214,19 @@ fn run_task_dialog_key_action(
 
 pub fn run_task_dialog(app: &mut TaskManApp, ctx: &egui::Context, _pal: &theme::Palette) {
     let focus_id = egui::Id::new("run-task-dialog-focus");
+    let restore_id = egui::Id::new("run-task-dialog-restore-focus");
     let mut focus = ctx
         .data(|data| data.get_temp::<RunTaskDialogFocus>(focus_id))
         .unwrap_or_default();
+    // First frame of this dialog session: remember what held focus before
+    // the dialog took over, so closing can hand it back.
+    if ctx
+        .data(|data| data.get_temp::<RunTaskDialogFocus>(focus_id))
+        .is_none()
+    {
+        let captured = capture_focus(ctx);
+        ctx.data_mut(|data| data.insert_temp(restore_id, captured));
+    }
 
     // Own the dialog's focus traversal instead of requesting text focus every
     // frame. The old unconditional `request_focus()` made Tab immediately snap
@@ -1324,6 +1383,11 @@ pub fn run_task_dialog(app: &mut TaskManApp, ctx: &egui::Context, _pal: &theme::
     if app.run_dialog_open {
         ctx.data_mut(|data| data.insert_temp(focus_id, focus));
     } else {
+        let saved = ctx
+            .data(|data| data.get_temp::<Option<egui::Id>>(restore_id))
+            .flatten();
+        restore_focus(ctx, saved);
+        ctx.data_mut(|data| data.remove_temp::<Option<egui::Id>>(restore_id));
         ctx.data_mut(|data| data.remove_temp::<RunTaskDialogFocus>(focus_id));
     }
 }
@@ -1490,6 +1554,31 @@ pub fn consume_dialog_keys(ctx: &egui::Context, space_is_action: bool) -> Dialog
     }
 }
 
+/// Same contract as [`consume_dialog_keys`], for dialogs whose controls must
+/// stay reachable with Tab (settings, inspector toolbars): Tab/Shift+Tab are
+/// left for egui's focus system, which cycles the dialog's widgets on its own.
+///
+/// Enter and Space are only consumed while NO widget holds keyboard focus, so
+/// a focused control keeps its native Enter/Space activation
+/// (`FAKE_PRIMARY_CLICKED`) instead of the dialog acting on the key; Escape and
+/// the arrows are consumed unconditionally, exactly like
+/// [`consume_dialog_keys`]. The returned `tab`/`shift_tab` are always false.
+pub fn consume_dialog_keys_tab_through(ctx: &egui::Context, space_is_action: bool) -> DialogKeys {
+    let control_focused = ctx.memory(|mem| mem.focused().is_some());
+    DialogKeys {
+        escape: ctx.input_mut(|i| i.consume_key(Default::default(), egui::Key::Escape)),
+        enter: !control_focused
+            && ctx.input_mut(|i| i.consume_key(Default::default(), egui::Key::Enter)),
+        space: space_is_action
+            && !control_focused
+            && ctx.input_mut(|i| i.consume_key(Default::default(), egui::Key::Space)),
+        tab: false,
+        shift_tab: false,
+        left: ctx.input_mut(|i| i.consume_key(Default::default(), egui::Key::ArrowLeft)),
+        right: ctx.input_mut(|i| i.consume_key(Default::default(), egui::Key::ArrowRight)),
+    }
+}
+
 /// Which button of a two-button dialog row a key resolved to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DialogDecision {
@@ -1516,6 +1605,22 @@ pub fn dialog_key_decision(
         })
     } else {
         None
+    }
+}
+
+/// The widget that held keyboard focus, captured before a dialog takes it
+/// (call on the dialog's FIRST frame, before `Window::show`). `None` when
+/// nothing held focus.
+pub fn capture_focus(ctx: &egui::Context) -> Option<egui::Id> {
+    ctx.memory(|mem| mem.focused())
+}
+
+/// Give keyboard focus back to a widget saved by [`capture_focus`]. A saved
+/// widget that no longer exists is dropped by egui's focus dead-man switch,
+/// so restoring is always safe.
+pub fn restore_focus(ctx: &egui::Context, saved: Option<egui::Id>) {
+    if let Some(id) = saved {
+        ctx.memory_mut(|mem| mem.request_focus(id));
     }
 }
 
@@ -1585,6 +1690,71 @@ pub fn dialog_button_row(
                 *focused = false;
                 safe_resp.request_focus();
             }
+        } else if safe_resp.clicked() {
+            click = DialogButtonClick::Safe;
+        }
+    });
+    click
+}
+
+/// The two-button row for dialogs whose whole control set is keyboard-reachable
+/// (tab-through dialogs with checkboxes above the row): unlike
+/// [`dialog_button_row`] it never pins focus, so Tab keeps cycling through the
+/// dialog's other controls, and the app-side `focused` flag is synced FROM the
+/// real egui focus of the primary button each frame. The safe button claims
+/// focus only while nothing at all holds it (the dialog's opening frame) —
+/// if another widget may hold focus when the dialog opens, anchor focus in the
+/// dialog body instead. [`dialog_key_decision`] keeps resolving Escape and an
+/// unfocused/disabled Enter to the safe action.
+// Wired up by the details-tab dialogs (e.g. the affinity confirmation) in the
+// dialogs-area merge; the two-button destructive confirms deliberately keep
+// the pinned [`dialog_button_row`] until then.
+#[allow(dead_code)]
+pub fn dialog_button_row_mirror(
+    ui: &mut egui::Ui,
+    ctx: &egui::Context,
+    pal: &Palette,
+    safe_label: &str,
+    primary: Option<(&str, bool)>,
+    focused: &mut bool,
+) -> DialogButtonClick {
+    let btn_size = egui::vec2(85.0, 24.0);
+    let mut click = DialogButtonClick::None;
+    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+        let primary_resp = primary.map(|(label, enabled)| {
+            let mut button =
+                egui::Button::new(egui::RichText::new(label).color(pal.accent_text).strong())
+                    .min_size(btn_size)
+                    .fill(pal.accent);
+            if *focused {
+                button = button.stroke(Stroke::new(2.0, Color32::WHITE));
+            }
+            let resp = ui.add_enabled(enabled, button);
+            ui.add_space(8.0);
+            resp
+        });
+
+        let mut safe_button = egui::Button::new(safe_label).min_size(btn_size);
+        if primary_resp.is_some() && !*focused {
+            safe_button = safe_button.stroke(Stroke::new(2.0, pal.accent));
+        }
+        let safe_resp = ui.add(safe_button);
+
+        if let Some(primary_resp) = primary_resp {
+            if safe_resp.clicked() {
+                click = DialogButtonClick::Safe;
+            } else if primary_resp.clicked() {
+                click = DialogButtonClick::Primary;
+            }
+
+            // Real focus is the source of truth; the flag only mirrors it for
+            // the focus ring and `dialog_key_decision`. With neither button
+            // focused (the opening frame, or after focus was dropped) the
+            // safe default reclaims focus — once, not per frame.
+            if ctx.memory(|mem| mem.focused().is_none()) {
+                safe_resp.request_focus();
+            }
+            *focused = primary_resp.has_focus();
         } else if safe_resp.clicked() {
             click = DialogButtonClick::Safe;
         }
@@ -1724,6 +1894,267 @@ mod tests {
         ctx.data_mut(|d| d.remove_temp::<bool>(focus_id));
         let reset = ctx.data(|d| d.get_temp::<bool>(focus_id));
         assert_eq!(reset, None);
+    }
+
+    /// The tab-through contract leaves Tab/Shift+Tab to egui's focus system
+    /// and leaves Enter with a focused control (native activation must still
+    /// fire), while Escape and the arrows stay consumed dialog keys.
+    #[test]
+    fn tab_through_variant_consumption_set() {
+        let ctx = egui::Context::default();
+        let screen = Rect::from_min_size(Pos2::ZERO, egui::vec2(800.0, 600.0));
+        let raw = |events: Vec<egui::Event>| egui::RawInput {
+            screen_rect: Some(screen),
+            events,
+            focused: true,
+            ..Default::default()
+        };
+        let key = |key: egui::Key, modifiers: egui::Modifiers| egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers,
+        };
+        let none = egui::Modifiers::default();
+
+        // Frame 1: a control gains focus inside the dialog.
+        let mut out = ctx.run_ui(raw(vec![]), |ui| {
+            ui.button("Checkbox stand-in").request_focus();
+        });
+        out.textures_delta.clear();
+
+        // Frame 2: Enter arrives while a control holds focus. The contract
+        // must leave it with the control, whose native keyboard activation
+        // then fires (the button is painted AFTER the consume call, exactly
+        // like a real dialog body).
+        let mut keys = DialogKeys::default();
+        let mut activated = false;
+        let mut out = ctx.run_ui(raw(vec![key(egui::Key::Enter, none)]), |ui| {
+            keys = consume_dialog_keys_tab_through(ui.ctx(), false);
+            activated = ui.button("Ok").clicked();
+        });
+        out.textures_delta.clear();
+        assert!(!keys.enter, "Enter belongs to the focused control");
+        assert!(activated, "the focused control must activate natively");
+        assert!(!keys.escape && !keys.left && !keys.right);
+
+        // Frame 3: Tab/Shift+Tab are never consumed by this contract — egui's
+        // focus system cycles the dialog's controls with them.
+        let mut keys = DialogKeys::default();
+        let mut out = ctx.run_ui(
+            raw(vec![
+                key(egui::Key::Tab, none),
+                key(egui::Key::Tab, egui::Modifiers::SHIFT),
+            ]),
+            |ui| {
+                keys = consume_dialog_keys_tab_through(ui.ctx(), false);
+                let _ = ui.button("Ok");
+            },
+        );
+        out.textures_delta.clear();
+        assert!(!keys.tab && !keys.shift_tab, "Tab stays with egui");
+
+        // Nothing focused (fresh dialog session): Enter, Escape and the
+        // arrows are the dialog's keys again, and nothing activates.
+        let fresh = egui::Context::default();
+        let mut keys = DialogKeys::default();
+        let mut activated = false;
+        let mut out = fresh.run_ui(
+            raw(vec![
+                key(egui::Key::Escape, none),
+                key(egui::Key::ArrowLeft, none),
+                key(egui::Key::Enter, none),
+            ]),
+            |ui| {
+                keys = consume_dialog_keys_tab_through(ui.ctx(), false);
+                activated = ui.button("Ok").clicked();
+            },
+        );
+        out.textures_delta.clear();
+        assert!(keys.escape && keys.left && keys.enter);
+        assert!(!activated, "nothing is focused, so nothing activates");
+
+        // The hard-trap contract is unchanged: it still consumes Tab so the
+        // app-side two-button toggle keeps working.
+        let trapped = egui::Context::default();
+        let mut tab_keys = DialogKeys::default();
+        let mut out = trapped.run_ui(raw(vec![key(egui::Key::Tab, none)]), |ui| {
+            tab_keys = consume_dialog_keys(ui.ctx(), true);
+        });
+        out.textures_delta.clear();
+        assert!(
+            tab_keys.tab,
+            "the hard-trap contract still consumes Tab (Shift+Tab is folded into it by the pre-existing matches_logically ordering, which both toggle buttons identically)"
+        );
+    }
+
+    /// The mirror row follows REAL egui focus instead of pinning it: the
+    /// opening frame puts focus on the safe button, focus moved elsewhere is
+    /// not stolen back, and the app-side flag mirrors the primary button.
+    #[test]
+    fn dialog_button_row_mirror_follows_real_focus() {
+        let ctx = egui::Context::default();
+        let screen = Rect::from_min_size(Pos2::ZERO, egui::vec2(800.0, 600.0));
+        let raw = |events: Vec<egui::Event>| egui::RawInput {
+            screen_rect: Some(screen),
+            events,
+            focused: true,
+            ..Default::default()
+        };
+        let pal = crate::theme::palette_ctx(&ctx);
+        let key = |key: egui::Key| egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::default(),
+        };
+
+        // Opening frame with nothing focused: the safe default claims focus.
+        let mut app_focused = false;
+        let mut focused_after = None;
+        let mut out = ctx.run_ui(raw(vec![]), |ui| {
+            dialog_button_row_mirror(
+                ui,
+                &ctx,
+                &pal,
+                "Cancel",
+                Some(("Confirm", true)),
+                &mut app_focused,
+            );
+            focused_after = ctx.memory(|mem| mem.focused());
+        });
+        out.textures_delta.clear();
+        assert!(!app_focused, "the safe button owns the opening frame");
+        assert!(focused_after.is_some(), "the safe button claimed focus");
+        let safe_id = focused_after;
+
+        // Focus moved to a widget outside the row: the mirror must not steal
+        // it back, and the flag mirrors the (unfocused) primary.
+        let mut stray_id = None;
+        let mut out = ctx.run_ui(raw(vec![]), |ui| {
+            dialog_button_row_mirror(
+                ui,
+                &ctx,
+                &pal,
+                "Cancel",
+                Some(("Confirm", true)),
+                &mut app_focused,
+            );
+            let stray = ui.button("Outside");
+            if ctx.memory(|mem| mem.focused()) == safe_id {
+                stray.request_focus();
+                stray_id = Some(stray.id);
+            }
+        });
+        out.textures_delta.clear();
+        assert!(!app_focused);
+        let stray_id = stray_id.expect("the stray widget took focus");
+        assert_eq!(ctx.memory(|mem| mem.focused()), Some(stray_id));
+
+        // Still on the stray widget: the safe button stays unclaimed.
+        let mut out = ctx.run_ui(raw(vec![]), |ui| {
+            dialog_button_row_mirror(
+                ui,
+                &ctx,
+                &pal,
+                "Cancel",
+                Some(("Confirm", true)),
+                &mut app_focused,
+            );
+            let _ = ui.button("Outside");
+        });
+        out.textures_delta.clear();
+        assert!(!app_focused, "the unfocused primary mirrors to false");
+        assert_eq!(
+            ctx.memory(|mem| mem.focused()),
+            Some(stray_id),
+            "the mirror must not re-pin the safe button"
+        );
+
+        // Tab navigation reaches the primary button (egui cycles focus; the
+        // mirror follows), and `dialog_key_decision` then confirms.
+        let mut out = ctx.run_ui(raw(vec![key(egui::Key::Tab)]), |ui| {
+            dialog_button_row_mirror(
+                ui,
+                &ctx,
+                &pal,
+                "Cancel",
+                Some(("Confirm", true)),
+                &mut app_focused,
+            );
+            let _ = ui.button("Outside");
+        });
+        out.textures_delta.clear();
+        let mut out = ctx.run_ui(raw(vec![]), |ui| {
+            dialog_button_row_mirror(
+                ui,
+                &ctx,
+                &pal,
+                "Cancel",
+                Some(("Confirm", true)),
+                &mut app_focused,
+            );
+            let _ = ui.button("Outside");
+        });
+        out.textures_delta.clear();
+        assert!(app_focused, "real focus on the primary must sync the flag");
+        assert_eq!(
+            dialog_key_decision(
+                DialogKeys {
+                    enter: true,
+                    ..DialogKeys::default()
+                },
+                app_focused,
+                true
+            ),
+            Some(DialogDecision::Primary),
+        );
+    }
+
+    /// Focus capture/restore: restoring a live widget sticks, restoring a
+    /// vanished one is dropped by egui's dead-man switch, and `None` is a
+    /// no-op.
+    #[test]
+    fn capture_and_restore_focus_round_trip() {
+        let ctx = egui::Context::default();
+        let screen = Rect::from_min_size(Pos2::ZERO, egui::vec2(800.0, 600.0));
+        let raw = egui::RawInput {
+            screen_rect: Some(screen),
+            focused: true,
+            ..Default::default()
+        };
+
+        assert_eq!(capture_focus(&ctx), None, "nothing focused yet");
+
+        let mut out = ctx.run_ui(raw.clone(), |ui| {
+            ui.button("Target").request_focus();
+        });
+        out.textures_delta.clear();
+        let saved = capture_focus(&ctx);
+        assert!(saved.is_some());
+
+        // The widget still exists: the restore sticks.
+        restore_focus(&ctx, saved);
+        let mut has_focus = false;
+        let mut out = ctx.run_ui(raw.clone(), |ui| {
+            has_focus = ui.button("Target").has_focus();
+        });
+        out.textures_delta.clear();
+        assert!(has_focus, "restored focus must stick on a live widget");
+
+        // The widget is gone: the dead-man switch drops the restore.
+        restore_focus(&ctx, Some(egui::Id::new("vanished-widget")));
+        let mut has_focus = false;
+        let mut out = ctx.run_ui(raw.clone(), |ui| {
+            has_focus = ui.button("Target").has_focus();
+        });
+        out.textures_delta.clear();
+        assert!(!has_focus, "a vanished widget must not keep focus");
+
+        // `None` restores nothing and must not panic.
+        restore_focus(&ctx, None);
     }
 
     /// The dialog keyboard contract: Escape and an unfocused Enter resolve to
