@@ -1452,12 +1452,25 @@ pub(crate) fn page_switch_target(
 }
 
 /// Target widget ID when pressing Tab from a table list with no chrome focused:
-/// prefers the first enabled toolbar command button, and falls back to the
-/// table's first column header cell, or to the first sidebar item.
+/// prefers the active sidebar navigation tab (so Tab immediately reaches the
+/// navigation pane to switch pages/tabs), and falls back to the first sidebar
+/// tab, hamburger icon, toolbar command buttons, or column header cells.
 fn list_nav_tab_target(tab: Tab, ctx: &egui::Context) -> Option<egui::Id> {
     ctx.data(|d| {
-        d.get_temp::<Option<egui::Id>>(egui::Id::new("tm-first-toolbar-button"))
+        d.get_temp::<Option<egui::Id>>(egui::Id::new("tm-selected-sidebar-tab"))
             .flatten()
+            .or_else(|| {
+                d.get_temp::<Option<egui::Id>>(egui::Id::new("tm-first-sidebar-tab"))
+                    .flatten()
+            })
+            .or_else(|| {
+                d.get_temp::<Option<egui::Id>>(egui::Id::new("tm-first-sidebar-item"))
+                    .flatten()
+            })
+            .or_else(|| {
+                d.get_temp::<Option<egui::Id>>(egui::Id::new("tm-first-toolbar-button"))
+                    .flatten()
+            })
     })
     .or_else(|| {
         let table_name = match tab {
@@ -1474,12 +1487,6 @@ fn list_nav_tab_target(tab: Tab, ctx: &egui::Context) -> Option<egui::Id> {
                 d.get_temp::<Option<egui::Id>>(egui::Id::new(("tm-first-hdr-cell", t)))
                     .flatten()
             })
-        })
-    })
-    .or_else(|| {
-        ctx.data(|d| {
-            d.get_temp::<Option<egui::Id>>(egui::Id::new("tm-first-sidebar-item"))
-                .flatten()
         })
     })
 }
@@ -1585,19 +1592,14 @@ impl eframe::App for TaskManApp {
         crate::fonts::poll_async_apply(&ctx);
 
         let pal = crate::theme::palette_ctx(&ctx);
-        ctx.data_mut(|d| {
-            d.remove_temp::<Option<egui::Id>>(egui::Id::new("tm-first-toolbar-button"));
-            d.remove_temp::<Option<egui::Id>>(egui::Id::new("tm-first-sidebar-item"));
-        });
         #[cfg(target_os = "windows")]
         self.sync_native_topmost(_frame);
         self.sync_title_bar(&ctx, &pal, _frame);
 
         // When navigating the list with no widget holding keyboard focus,
         // Shift+Tab jumps directly back to the search bar, and Tab moves
-        // forward into the tab's command buttons / column headers / sidebar.
-        // Intercepting Tab BEFORE top panels run prevents egui's default Tab
-        // navigation from inadvertently claiming focus on the sidebar.
+        // forward into the active sidebar navigation tab (reaching the
+        // navigation pane to switch pages/tabs without mouse input).
         let modal_open = self.modal_open();
         if !modal_open
             && !ctx.egui_wants_keyboard_input()
@@ -1616,7 +1618,7 @@ impl eframe::App for TaskManApp {
                     && !i.modifiers.ctrl
                     && !i.modifiers.alt
             });
-            if shift_tab && self.tab != Tab::Performance {
+            if shift_tab {
                 let id = egui::Id::new("global-search");
                 ctx.memory_mut(|m| m.request_focus(id));
                 ctx.input_mut(|i| i.consume_key(Default::default(), egui::Key::Tab));
@@ -1625,6 +1627,9 @@ impl eframe::App for TaskManApp {
                 ctx.input_mut(|i| i.consume_key(Default::default(), egui::Key::Tab));
             }
         }
+        ctx.data_mut(|d| {
+            d.remove_temp::<Option<egui::Id>>(egui::Id::new("tm-first-toolbar-button"));
+        });
 
         // ------------------------------------------------ top-level panels
         crate::app_ui::top_search_panel(self, ui, &pal);
@@ -2692,11 +2697,14 @@ mod tests {
     }
 
     /// When navigating a table with Tab and no widget focused, Tab walks forward
-    /// into the toolbar first (e.g. End Task button), falling back to the first
-    /// column header cell if no toolbar button is present/enabled.
+    /// into the active sidebar tab first, falling back to the first sidebar tab,
+    /// hamburger icon, toolbar button, or column header cell.
     #[test]
-    fn list_nav_tab_target_prioritizes_toolbar_then_header() {
+    fn list_nav_tab_target_prioritizes_sidebar_then_toolbar_then_header() {
         let ctx = egui::Context::default();
+        let selected_id = egui::Id::new("test-selected-sidebar-tab");
+        let first_tab_id = egui::Id::new("test-first-sidebar-tab");
+        let sidebar_item_id = egui::Id::new("test-sidebar-item");
         let btn_id = egui::Id::new("test-toolbar-btn");
         let hdr_id = egui::Id::new("test-hdr-cell");
 
@@ -2718,20 +2726,37 @@ mod tests {
         });
         assert_eq!(list_nav_tab_target(Tab::Processes, &ctx), Some(btn_id));
 
-        // 4. Performance tab has no table header, falls back to None if toolbar and sidebar unset
+        // 4. Hamburger item registered -> prioritizes hamburger over toolbar
         ctx.data_mut(|d| {
-            d.remove_temp::<Option<egui::Id>>(egui::Id::new("tm-first-toolbar-button"));
-        });
-        assert_eq!(list_nav_tab_target(Tab::Performance, &ctx), None);
-
-        // 5. Sidebar item registered -> falls back to sidebar item when neither toolbar nor header is available
-        let sidebar_id = egui::Id::new("test-sidebar-item");
-        ctx.data_mut(|d| {
-            d.insert_temp(egui::Id::new("tm-first-sidebar-item"), Some(sidebar_id));
+            d.insert_temp(
+                egui::Id::new("tm-first-sidebar-item"),
+                Some(sidebar_item_id),
+            );
         });
         assert_eq!(
+            list_nav_tab_target(Tab::Processes, &ctx),
+            Some(sidebar_item_id)
+        );
+
+        // 5. First sidebar tab registered -> prioritizes first sidebar tab over hamburger
+        ctx.data_mut(|d| {
+            d.insert_temp(egui::Id::new("tm-first-sidebar-tab"), Some(first_tab_id));
+        });
+        assert_eq!(
+            list_nav_tab_target(Tab::Processes, &ctx),
+            Some(first_tab_id)
+        );
+
+        // 6. Selected sidebar tab registered -> prioritizes selected sidebar tab over first tab
+        ctx.data_mut(|d| {
+            d.insert_temp(egui::Id::new("tm-selected-sidebar-tab"), Some(selected_id));
+        });
+        assert_eq!(list_nav_tab_target(Tab::Processes, &ctx), Some(selected_id));
+
+        // 7. Works equally on Performance tab (which has no table headers)
+        assert_eq!(
             list_nav_tab_target(Tab::Performance, &ctx),
-            Some(sidebar_id)
+            Some(selected_id)
         );
     }
 }

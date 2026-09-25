@@ -60,6 +60,15 @@
 
 ### Fixed
 
+- **Tab navigation to sidebar tabs and tab switching on focus:** Pressing Tab from
+  an active list or table now reliably navigates into the sidebar navigation pane,
+  focusing the active page tab directly. Navigating through the sidebar tabs via
+  Tab, Shift+Tab, or ArrowUp/ArrowDown automatically activates and switches to that
+  page, and pressing Enter, ArrowRight, or Escape surrenders focus into the active
+  page content. When the search field has no text, Tab flows forward into the sidebar
+  tabs instead of getting trapped in the list, while non-empty search queries continue
+  to commit and jump directly to the matching row on Tab or Down Arrow. Shift+Tab from
+  the list now returns to the search bar across all tabs including Performance.
 - **Concurrent sidebar and list input conflict:** Keystrokes such as Tab or
   ArrowDown/ArrowUp no longer register simultaneously in the sidebar and the
   process/details table list. List navigation gates strictly stand down when

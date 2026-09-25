@@ -6,7 +6,7 @@ use eframe::egui::{self, Align2, Color32, CornerRadius, FontId, Pos2, Rect, Sens
 use tm_core::i18n::{self, K};
 use tm_core::settings::{RenderMode, Settings, TextSmoothing, ThemeMode};
 
-use crate::app::TaskManApp;
+use crate::app::{Tab, TaskManApp};
 use crate::icons;
 use crate::icons::Icon;
 use crate::theme::{self, Palette};
@@ -120,9 +120,25 @@ pub fn top_search_panel(app: &mut TaskManApp, ui_root: &mut egui::Ui, pal: &Pale
             // Intercepting BEFORE edit_ui.add prevents TextEdit from triggering
             // egui's Tab traversal to the sidebar.
             let search_id = egui::Id::new("global-search");
-            commit_search_on_tab_or_down(ui.ctx(), search_id, app.modal_open(), || {
-                app.commit_search_selection(ui.ctx());
-            });
+            let has_search_query = !app.search.trim().is_empty()
+                && matches!(
+                    app.tab,
+                    Tab::Processes
+                        | Tab::Details
+                        | Tab::Services
+                        | Tab::Startup
+                        | Tab::Users
+                        | Tab::AppHistory
+                );
+            commit_search_on_tab_or_down(
+                ui.ctx(),
+                search_id,
+                has_search_query,
+                app.modal_open(),
+                || {
+                    app.commit_search_selection(ui.ctx());
+                },
+            );
             let edit = edit_ui.add(
                 egui::TextEdit::singleline(&mut app.search)
                     .hint_text(i18n::tr(K::SearchHint))
@@ -317,11 +333,29 @@ pub fn sidebar(app: &mut TaskManApp, ui_root: &mut egui::Ui, pal: &Palette) {
             }
             ui.add_space(8.0);
 
-            for tab in crate::app::Tab::ALL {
+            for (idx, &tab) in crate::app::Tab::ALL.iter().enumerate() {
                 let selected = app.tab == tab;
                 let resp = nav_item(ui, pal, tab.icon(), tab.label(), selected, collapsed);
-                if resp.clicked() {
+                if resp.clicked() || resp.gained_focus() {
                     app.tab = tab;
+                }
+                if resp.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                    resp.surrender_focus();
+                    ui.ctx().memory_mut(|m| {
+                        m.surrender_focus(resp.id);
+                        m.move_focus(egui::FocusDirection::None);
+                    });
+                    ui.input_mut(|i| i.consume_key(Default::default(), egui::Key::Enter));
+                }
+                if selected {
+                    ui.ctx().data_mut(|d| {
+                        d.insert_temp(egui::Id::new("tm-selected-sidebar-tab"), Some(resp.id));
+                    });
+                }
+                if idx == 0 {
+                    ui.ctx().data_mut(|d| {
+                        d.insert_temp(egui::Id::new("tm-first-sidebar-tab"), Some(resp.id));
+                    });
                 }
                 if collapsed && resp.hovered() {
                     resp.on_hover_text(tab.label());
@@ -355,10 +389,9 @@ fn nav_item(
     collapsed: bool,
 ) -> egui::Response {
     let h = 38.0;
-    let (rect, resp) = ui.allocate_exact_size(
-        egui::vec2(ui.available_width(), h),
-        Sense::click().union(Sense::hover()),
-    );
+    let id = ui.id().with(("nav-item", label));
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), h), Sense::hover());
+    let resp = ui.interact(rect, id, Sense::click().union(Sense::hover()));
     let painter = ui.painter();
     if selected {
         painter.rect_filled(
@@ -460,15 +493,8 @@ fn icon_button(ui: &mut egui::Ui, pal: &Palette, icon: Icon, size: f32, center: 
     }
     if icon == Icon::Hamburger {
         let first_id_key = egui::Id::new("tm-first-sidebar-item");
-        if ui
-            .ctx()
-            .data(|d| d.get_temp::<Option<egui::Id>>(first_id_key))
-            .flatten()
-            .is_none()
-        {
-            ui.ctx()
-                .data_mut(|d| d.insert_temp(first_id_key, Some(resp.id)));
-        }
+        ui.ctx()
+            .data_mut(|d| d.insert_temp(first_id_key, Some(resp.id)));
     }
     crate::icons::draw_at(
         ui,
@@ -623,10 +649,14 @@ fn commit_search_on_enter(
 /// Tab or Down Arrow while the search field is focused (or just lost focus)
 /// surrenders keyboard focus from chrome, drops directly into table rows,
 /// and commits the search selection.
+/// When the search field has no query text, Tab passes through so focus flows
+/// naturally into the sidebar tabs instead of jumping to the table list.
+/// Down Arrow always drops down into the list below.
 /// Split out from the search panel so the contract is testable headlessly.
 fn commit_search_on_tab_or_down(
     ctx: &egui::Context,
     search_id: egui::Id,
+    has_search_query: bool,
     dialog_open: bool,
     commit: impl FnOnce(),
 ) -> bool {
@@ -643,13 +673,16 @@ fn commit_search_on_tab_or_down(
             && !i.modifiers.ctrl
             && !i.modifiers.alt
     });
-    if !(tab || down) {
+    let should_commit = down || (tab && has_search_query);
+    if !should_commit {
         return false;
     }
-    ctx.input_mut(|i| {
-        i.consume_key(Default::default(), egui::Key::Tab);
-        i.consume_key(Default::default(), egui::Key::ArrowDown);
-    });
+    if tab {
+        ctx.input_mut(|i| i.consume_key(Default::default(), egui::Key::Tab));
+    }
+    if down {
+        ctx.input_mut(|i| i.consume_key(Default::default(), egui::Key::ArrowDown));
+    }
     ctx.memory_mut(|mem| {
         mem.surrender_focus(egui::Id::new("global-search"));
         mem.move_focus(egui::FocusDirection::None);
@@ -2239,9 +2272,16 @@ mod tests {
             let mut committed = false;
             let mut out = ctx.run_ui(raw, |ui| {
                 let edit_id = egui::Id::new("test-search-id");
-                let ran = commit_search_on_tab_or_down(ui.ctx(), edit_id, dialog_open, || {
-                    committed = true;
-                });
+                let has_search_query = !text.trim().is_empty();
+                let ran = commit_search_on_tab_or_down(
+                    ui.ctx(),
+                    edit_id,
+                    has_search_query,
+                    dialog_open,
+                    || {
+                        committed = true;
+                    },
+                );
                 let _edit = ui.add(egui::TextEdit::singleline(text).id(edit_id));
                 assert_eq!(ran, committed);
             });
@@ -2307,6 +2347,31 @@ mod tests {
         // Frame 5: when a dialog is open, Tab belongs to the dialog, no commit.
         let committed = tab_frame(&ctx, egui::Key::Tab, false, true, &mut text);
         assert!(!committed, "modal dialog keeps Tab key");
+
+        // Frame 6: when search field has no text, Tab does not commit and passes through.
+        let mut empty_text = String::new();
+        let mut out = ctx.run_ui(raw.clone(), |ui| {
+            ui.add(egui::TextEdit::singleline(&mut empty_text).id(egui::Id::new("test-search-id")))
+                .request_focus();
+        });
+        out.textures_delta.clear();
+        let committed = tab_frame(&ctx, egui::Key::Tab, false, false, &mut empty_text);
+        assert!(
+            !committed,
+            "empty search field lets Tab pass through to sidebar"
+        );
+
+        // Frame 7: when search field has no text, Down Arrow still drops into content.
+        let mut out = ctx.run_ui(raw.clone(), |ui| {
+            ui.add(egui::TextEdit::singleline(&mut empty_text).id(egui::Id::new("test-search-id")))
+                .request_focus();
+        });
+        out.textures_delta.clear();
+        let committed = tab_frame(&ctx, egui::Key::ArrowDown, false, false, &mut empty_text);
+        assert!(
+            committed,
+            "Down Arrow on empty search field drops down into content"
+        );
     }
 
     /// The clear button in the search field must not take keyboard focus via Tab
@@ -3093,5 +3158,108 @@ mod tests {
                 assert!(!ctx.input(|i| i.key_pressed(key)), "{key:?} was consumed");
             }
         }
+    }
+
+    /// When a sidebar nav item gains keyboard focus (via Tab, Shift+Tab, or Arrow keys),
+    /// the active tab switches to that page immediately.
+    #[test]
+    fn sidebar_nav_item_switches_tab_on_focus() {
+        let pal = theme::DARK;
+        let ctx = egui::Context::default();
+        let screen = Rect::from_min_size(Pos2::ZERO, egui::vec2(800.0, 600.0));
+        let mut current_tab = Tab::Processes;
+
+        // Frame 1: render nav item, not focused.
+        let raw1 = egui::RawInput {
+            screen_rect: Some(screen),
+            focused: true,
+            ..Default::default()
+        };
+        let mut perf_id = egui::Id::NULL;
+        let mut out1 = ctx.run_ui(raw1, |ui| {
+            let resp = nav_item(ui, &pal, Icon::Performance, "Performance", false, false);
+            perf_id = resp.id;
+            if resp.clicked() || resp.gained_focus() {
+                current_tab = Tab::Performance;
+            }
+        });
+        out1.textures_delta.clear();
+        assert_eq!(current_tab, Tab::Processes);
+
+        // Frame 2: request focus and render nav item; gaining focus switches active tab.
+        let raw2 = egui::RawInput {
+            screen_rect: Some(screen),
+            focused: true,
+            ..Default::default()
+        };
+        let mut out2 = ctx.run_ui(raw2, |ui| {
+            ui.ctx().memory_mut(|m| m.request_focus(perf_id));
+            let resp = nav_item(ui, &pal, Icon::Performance, "Performance", false, false);
+            if resp.clicked() || resp.gained_focus() {
+                current_tab = Tab::Performance;
+            }
+        });
+        out2.textures_delta.clear();
+        assert_eq!(
+            current_tab,
+            Tab::Performance,
+            "gaining focus on nav item switches active tab"
+        );
+    }
+
+    /// Pressing Enter on a focused sidebar nav item surrenders keyboard focus
+    /// directly to the active page content and consumes Enter so it does not
+    /// accidentally trigger a row action.
+    #[test]
+    fn sidebar_nav_item_surrenders_focus_on_enter() {
+        let pal = theme::DARK;
+        let ctx = egui::Context::default();
+        let screen = Rect::from_min_size(Pos2::ZERO, egui::vec2(800.0, 600.0));
+        // Frame 1: request focus on nav item.
+        let raw1 = egui::RawInput {
+            screen_rect: Some(screen),
+            focused: true,
+            ..Default::default()
+        };
+        let mut out1 = ctx.run_ui(raw1, |ui| {
+            let resp = nav_item(ui, &pal, Icon::Processes, "Processes", true, false);
+            resp.request_focus();
+        });
+        out1.textures_delta.clear();
+        assert!(ctx.memory(|m| m.focused()).is_some());
+
+        // Frame 2: Enter surrenders focus and consumes key.
+        let raw2 = egui::RawInput {
+            screen_rect: Some(screen),
+            events: vec![egui::Event::Key {
+                key: egui::Key::Enter,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: Default::default(),
+            }],
+            focused: true,
+            ..Default::default()
+        };
+        let mut out2 = ctx.run_ui(raw2, |ui| {
+            let resp = nav_item(ui, &pal, Icon::Processes, "Processes", true, false);
+            if resp.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                resp.surrender_focus();
+                ui.ctx().memory_mut(|m| {
+                    m.surrender_focus(resp.id);
+                    m.move_focus(egui::FocusDirection::None);
+                });
+                ui.input_mut(|i| i.consume_key(Default::default(), egui::Key::Enter));
+            }
+        });
+        out2.textures_delta.clear();
+        assert!(
+            ctx.memory(|m| m.focused()).is_none(),
+            "Enter surrenders focus to content"
+        );
+        assert!(
+            !ctx.input(|i| i.key_pressed(egui::Key::Enter)),
+            "Enter was consumed"
+        );
     }
 }
