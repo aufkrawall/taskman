@@ -8,6 +8,10 @@
   pages (wrapping around), Ctrl+1 through Ctrl+9 jump directly to a page.
   While a dialog is open it keeps keyboard ownership, so the shortcuts stand
   down — the same gate the Delete shortcut uses.
+- **Run new task and Settings shortcuts:** Ctrl+N opens the "Run new task"
+  dialog and Ctrl+, opens the Settings dialog from anywhere in the application,
+  matching native Windows 11 Task Manager shortcuts. Both are documented in
+  the F1 shortcut help overlay.
 - **F1 shortcut help:** F1 toggles a German/English overlay listing every
   keyboard shortcut; Esc closes it. The same list is documented in a new
   "Keyboard shortcuts" section in the README.
@@ -27,6 +31,10 @@
   changing it, Space toggles the primary row in and out of the selection,
   Enter runs the primary row action (Processes: Go to details; Details:
   Process Properties), and PgUp/PgDn page by the visible table span.
+- **Cyclic keyboard navigation:** Pressing Tab from an active list navigates
+  forward into enabled toolbar buttons and table column headers, while
+  Shift+Tab returns directly to the search bar. In the Performance tab,
+  Shift+F10 and the Menu key open graph context menus from the keyboard.
 - **Visible keyboard focus:** sidebar entries, header and command buttons,
   the search box with its clear button, table header cells and the toast
   close buttons paint a focus ring while focused. Disabled command buttons
@@ -52,6 +60,14 @@
 
 ### Fixed
 
+- **Search bar Tab jump to list:** Pressing Tab or Down Arrow from the search
+  field commits the search match and immediately hands keyboard focus to the
+  table rows, parking the selection into view. The clear ('X') button is
+  excluded from the Tab cycle so keyboard navigation never gets stranded in
+  the search box chrome.
+- **Table header focus escape:** Pressing Down Arrow or Escape on a focused
+  table column header or resize handle surrenders focus back to table rows,
+  preventing keyboard navigation from getting locked in the header.
 - **Core-service upgrades:** replacing a running service now waits for SCM to
   report it stopped without requiring access to the LocalSystem process
   handle. A failed repair or switch also re-enables its Settings control.

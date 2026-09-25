@@ -57,8 +57,9 @@ pub fn style(style: &mut egui::Style) {
 }
 
 /// Open a right-click menu on `resp` in the classic style.
+#[allow(dead_code)]
 pub fn context_menu(resp: &Response, add: impl FnOnce(&mut Ui)) {
-    egui::Popup::context_menu(resp).style(style).show(add);
+    context_menu_kb(resp, false, add);
 }
 
 /// Open a dropdown menu on `resp` in the classic style:

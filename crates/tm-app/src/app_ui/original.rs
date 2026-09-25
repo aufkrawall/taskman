@@ -131,6 +131,24 @@ pub fn top_search_panel(app: &mut TaskManApp, ui_root: &mut egui::Ui, pal: &Pale
                 focus_ring(ui, box_rect, 16.0, pal);
             }
 
+            // Tab or Down Arrow jumps directly to the process / table list:
+            // commits the search match, surrenders keyboard focus from the
+            // chrome, and leaves the table row selection active and visible.
+            let had_focus_last_frame = ui
+                .ctx()
+                .memory(|m| m.had_focus_last_frame(egui::Id::new("global-search")));
+            commit_search_on_tab_or_down(
+                ui.ctx(),
+                edit.has_focus(),
+                edit.lost_focus(),
+                had_focus_last_frame,
+                app.modal_open(),
+                || {
+                    edit.surrender_focus();
+                    app.commit_search_selection(ui.ctx());
+                },
+            );
+
             // Enter commits the search: the page's selection lands on the
             // match (kept as-is when it already is one), and the field gives
             // the keyboard back — egui's singleline text edit surrenders
@@ -161,7 +179,7 @@ pub fn top_search_panel(app: &mut TaskManApp, ui_root: &mut egui::Ui, pal: &Pale
                     .interact(
                         clear_rect,
                         egui::Id::new("global-search-clear"),
-                        Sense::click(),
+                        Sense::CLICK,
                     )
                     .on_hover_text(i18n::tr(K::ClearSearch));
                 if resp.hovered() {
@@ -184,9 +202,6 @@ pub fn top_search_panel(app: &mut TaskManApp, ui_root: &mut egui::Ui, pal: &Pale
                     // the keyboard on the (about to disappear) button.
                     resp.ctx
                         .memory_mut(|mem| mem.surrender_focus(egui::Id::new("global-search")));
-                }
-                if resp.has_focus() {
-                    focus_ring(ui, clear_rect, 12.0, pal);
                 }
             }
 
@@ -451,7 +466,20 @@ pub fn cmd_button(
     } else {
         Sense::hover()
     };
-    let (rect, resp) = ui.allocate_exact_size(egui::vec2(w, 30.0), sense);
+    let id = ui.id().with(("cmd-button", label));
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(w, 30.0), Sense::hover());
+    let resp = ui.interact(rect, id, sense);
+    if enabled {
+        let first_id_key = egui::Id::new("tm-first-toolbar-button");
+        if ui
+            .ctx()
+            .data(|d| d.get_temp::<Option<egui::Id>>(first_id_key))
+            .flatten()
+            .is_none()
+        {
+            ui.ctx().data_mut(|d| d.insert_temp(first_id_key, Some(id)));
+        }
+    }
     let mut clicked = false;
     if enabled {
         if resp.hovered() {
@@ -535,6 +563,52 @@ fn commit_search_on_enter(
     }
     commit();
     ctx.input_mut(|i| i.consume_key(Default::default(), egui::Key::Enter));
+    true
+}
+
+/// Tab or Down Arrow while the search field is focused (or just lost focus)
+/// surrenders keyboard focus from chrome, drops directly into table rows,
+/// and commits the search selection.
+/// Split out from the search panel so the contract is testable headlessly.
+fn commit_search_on_tab_or_down(
+    ctx: &egui::Context,
+    edit_has_focus: bool,
+    edit_lost_focus: bool,
+    had_focus_last_frame: bool,
+    dialog_open: bool,
+    commit: impl FnOnce(),
+) -> bool {
+    if dialog_open {
+        return false;
+    }
+    let is_focused = edit_has_focus || (edit_lost_focus && had_focus_last_frame);
+    if !is_focused {
+        return false;
+    }
+    let tab = ctx.input(|i| {
+        i.key_pressed(egui::Key::Tab) && !i.modifiers.shift && !i.modifiers.ctrl && !i.modifiers.alt
+    });
+    let down = ctx.input(|i| {
+        i.key_pressed(egui::Key::ArrowDown)
+            && !i.modifiers.shift
+            && !i.modifiers.ctrl
+            && !i.modifiers.alt
+    });
+    if !(tab || down) {
+        return false;
+    }
+    commit();
+    ctx.memory_mut(|mem| {
+        mem.surrender_focus(egui::Id::new("global-search"));
+        mem.move_focus(egui::FocusDirection::None);
+    });
+    if let Some(held) = ctx.memory(|m| m.focused()) {
+        ctx.memory_mut(|m| m.surrender_focus(held));
+    }
+    ctx.input_mut(|i| {
+        i.consume_key(Default::default(), egui::Key::Tab);
+        i.consume_key(Default::default(), egui::Key::ArrowDown);
+    });
     true
 }
 
@@ -1712,6 +1786,8 @@ fn shortcut_rows(lang: i18n::Lang) -> Vec<(String, &'static str)> {
             tr(K::HelpPrevPage),
         ),
         (format!("{ctrl}+1…9"), tr(K::HelpJumpPage)),
+        (format!("{ctrl}+,"), tr(K::Settings)),
+        (format!("{ctrl}+N"), tr(K::RunNewTask)),
         (tr(K::KeyDel).to_owned(), tr(K::HelpEndTask)),
         (
             format!("{} / {shift}+F10", tr(K::KeyMenuKey)),
@@ -2081,6 +2157,121 @@ mod tests {
         );
     }
 
+    /// Tab or Down Arrow on the focused search field commits the search and
+    /// surrenders keyboard focus so table rows immediately take navigation.
+    #[test]
+    fn committing_the_search_on_tab_or_down_consumes_keystroke_and_clears_focus() {
+        let ctx = egui::Context::default();
+        let screen = Rect::from_min_size(Pos2::ZERO, egui::vec2(800.0, 600.0));
+        let tab_frame = |ctx: &egui::Context,
+                         key: egui::Key,
+                         shift: bool,
+                         dialog_open: bool,
+                         text: &mut String| {
+            let modifiers = if shift {
+                egui::Modifiers::SHIFT
+            } else {
+                egui::Modifiers::NONE
+            };
+            let mut events = vec![egui::Event::ModifiersChanged(modifiers)];
+            events.push(egui::Event::Key {
+                key,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers,
+            });
+            let raw = egui::RawInput {
+                screen_rect: Some(screen),
+                events,
+                focused: true,
+                ..Default::default()
+            };
+            let mut committed = false;
+            let mut out = ctx.run_ui(raw, |ui| {
+                let edit = ui.text_edit_singleline(text);
+                let had_focus_last_frame = ui.ctx().memory(|m| m.had_focus_last_frame(edit.id));
+                let ran = commit_search_on_tab_or_down(
+                    ui.ctx(),
+                    edit.has_focus(),
+                    edit.lost_focus(),
+                    had_focus_last_frame,
+                    dialog_open,
+                    || {
+                        committed = true;
+                    },
+                );
+                assert_eq!(ran, committed);
+            });
+            out.textures_delta.clear();
+            committed
+        };
+
+        // Frame 1: request focus on the search field.
+        let mut text = String::from("svc");
+        let raw = egui::RawInput {
+            screen_rect: Some(screen),
+            focused: true,
+            ..Default::default()
+        };
+        let mut out = ctx.run_ui(raw.clone(), |ui| {
+            ui.text_edit_singleline(&mut text).request_focus();
+        });
+        out.textures_delta.clear();
+
+        // Frame 2: pressing Tab commits and clears focus.
+        let committed = tab_frame(&ctx, egui::Key::Tab, false, false, &mut text);
+        assert!(committed, "Tab on focused search field commits to table");
+        assert!(
+            ctx.memory(|m| m.focused()).is_none(),
+            "focus surrendered from chrome"
+        );
+        assert!(
+            !ctx.input(|i| i.key_pressed(egui::Key::Tab)),
+            "Tab keystroke consumed"
+        );
+
+        // Park focus again.
+        let mut out = ctx.run_ui(raw.clone(), |ui| {
+            ui.text_edit_singleline(&mut text).request_focus();
+        });
+        out.textures_delta.clear();
+
+        // Frame 3: pressing Down Arrow also commits and clears focus.
+        let committed = tab_frame(&ctx, egui::Key::ArrowDown, false, false, &mut text);
+        assert!(
+            committed,
+            "Down Arrow on focused search field commits to table"
+        );
+        assert!(ctx.memory(|m| m.focused()).is_none());
+        assert!(
+            !ctx.input(|i| i.key_pressed(egui::Key::ArrowDown)),
+            "Down Arrow consumed"
+        );
+
+        // Park focus again.
+        let mut out = ctx.run_ui(raw.clone(), |ui| {
+            ui.text_edit_singleline(&mut text).request_focus();
+        });
+        out.textures_delta.clear();
+
+        // Frame 4: Shift+Tab does not trigger list jump (reserved for reverse navigation).
+        let committed = tab_frame(&ctx, egui::Key::Tab, true, false, &mut text);
+        assert!(!committed, "Shift+Tab must not trigger list jump");
+
+        // Frame 5: when a dialog is open, Tab belongs to the dialog, no commit.
+        let committed = tab_frame(&ctx, egui::Key::Tab, false, true, &mut text);
+        assert!(!committed, "modal dialog keeps Tab key");
+    }
+
+    /// The clear button in the search field must not take keyboard focus via Tab
+    /// (Sense::CLICK has no focusable bit, unlike Sense::click()).
+    #[test]
+    fn search_clear_button_sense_is_not_tab_focusable() {
+        assert!(Sense::click().is_focusable());
+        assert!(!Sense::CLICK.is_focusable());
+    }
+
     /// The search field gives the keyboard back exactly when a click lands
     /// outside its box: a click on a row (or on dead window space) must let
     /// the next Arrow key move the table selection, while a click inside the
@@ -2114,21 +2305,21 @@ mod tests {
     fn help_overlay_rows_are_complete_and_localized() {
         for lang in [i18n::Lang::De, i18n::Lang::En] {
             let rows = shortcut_rows(lang);
-            assert_eq!(rows.len(), 17, "{lang:?}: every documented shortcut");
+            assert_eq!(rows.len(), 19, "{lang:?}: every documented shortcut");
             assert!(
                 rows.iter()
                     .all(|(combo, text)| !combo.trim().is_empty() && !text.trim().is_empty()),
                 "{lang:?}: no empty combo or description"
             );
             assert_eq!(rows[0].0, "F5");
-            assert_eq!(rows[16].0, "F1");
+            assert_eq!(rows[18].0, "F1");
             let expected_ctrl = i18n::tr_in(lang, K::KeyCtrl);
             assert_eq!(
                 rows[1].0,
                 format!("{expected_ctrl}+F / {}+F", i18n::tr_in(lang, K::KeyAlt))
             );
             assert_eq!(
-                rows[5].0,
+                rows[7].0,
                 i18n::tr_in(lang, K::KeyDel),
                 "Delete is a single localized key name"
             );

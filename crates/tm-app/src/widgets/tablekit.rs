@@ -816,6 +816,16 @@ impl TmTable {
             .collect();
         bounds.push(rect.left() + total_w);
 
+        if let Some(col) = self.cols.first() {
+            let first_cell_id = table_id.with(("hdr", col.id));
+            ui.ctx().data_mut(|d| {
+                d.insert_temp(
+                    egui::Id::new(("tm-first-hdr-cell", self.id)),
+                    Some(first_cell_id),
+                )
+            });
+        }
+
         // Column drag-reorder. The source is remembered in context memory
         // rather than on `self`, because the table is rebuilt from scratch
         // every frame while the pointer is still down.
@@ -854,13 +864,30 @@ impl TmTable {
             // chrome, unlike rows), Enter/Space sort through egui's focused-
             // click activation, and the ring mirrors the hover tint.
             if resp.has_focus() {
-                header_focused = true;
-                painter.rect_stroke(
-                    cell,
-                    0.0,
-                    Stroke::new(1.5, pal.accent),
-                    egui::StrokeKind::Inside,
-                );
+                let down = ui.input(|i| i.key_pressed(egui::Key::ArrowDown));
+                let esc = ui.input(|i| i.key_pressed(egui::Key::Escape));
+                if down || esc {
+                    resp.surrender_focus();
+                    ui.ctx().memory_mut(|mem| {
+                        mem.surrender_focus(resp.id);
+                        mem.move_focus(egui::FocusDirection::None);
+                    });
+                    if down {
+                        ui.ctx()
+                            .input_mut(|i| i.consume_key(Default::default(), egui::Key::ArrowDown));
+                    } else {
+                        ui.ctx()
+                            .input_mut(|i| i.consume_key(Default::default(), egui::Key::Escape));
+                    }
+                } else {
+                    header_focused = true;
+                    painter.rect_stroke(
+                        cell,
+                        0.0,
+                        Stroke::new(1.5, pal.accent),
+                        egui::StrokeKind::Inside,
+                    );
+                }
             }
             if resp.clicked() {
                 clicked = Some(i);
@@ -974,43 +1001,61 @@ impl TmTable {
                 ui.ctx().set_cursor_icon(CursorIcon::ResizeHorizontal);
             }
             if rresp.has_focus() {
-                header_focused = true;
-                // A focused handle owns the horizontal arrows: the focus-lock
-                // filter (the same mechanism sliders use) keeps egui's spatial
-                // navigation from walking to a neighbouring header cell, and
-                // each press nudges the width the way a tiny drag would —
-                // accumulated onto the LIVE width and clamped exactly like
-                // the pointer gesture. Shift takes the large step.
-                ui.memory_mut(|m| {
-                    m.set_focus_lock_filter(
-                        rresp.id,
-                        egui::EventFilter {
-                            horizontal_arrows: true,
-                            ..Default::default()
-                        },
-                    );
-                });
-                let step = if ui.input(|i| i.modifiers.shift) {
-                    KB_RESIZE_STEP_LARGE
+                let down = ui.input(|i| i.key_pressed(egui::Key::ArrowDown));
+                let esc = ui.input(|i| i.key_pressed(egui::Key::Escape));
+                if down || esc {
+                    rresp.surrender_focus();
+                    ui.ctx().memory_mut(|mem| {
+                        mem.surrender_focus(rresp.id);
+                        mem.move_focus(egui::FocusDirection::None);
+                    });
+                    if down {
+                        ui.ctx()
+                            .input_mut(|i| i.consume_key(Default::default(), egui::Key::ArrowDown));
+                    } else {
+                        ui.ctx()
+                            .input_mut(|i| i.consume_key(Default::default(), egui::Key::Escape));
+                    }
                 } else {
-                    KB_RESIZE_STEP
-                };
-                let dx = ui.input(|i| {
-                    (i.key_pressed(egui::Key::ArrowRight) as i32
-                        - i.key_pressed(egui::Key::ArrowLeft) as i32) as f32
-                        * step
-                });
-                painter.rect_stroke(
-                    handle,
-                    0.0,
-                    Stroke::new(1.5, pal.accent),
-                    egui::StrokeKind::Inside,
-                );
-                if dx != 0.0 {
-                    let current = self.col_width(i - 1);
-                    self.cols[i - 1].width = (current + dx).clamp(MIN_COL_W, MAX_COL_W);
-                    self.layout.borrow_mut().take();
-                    self.dirty = true;
+                    header_focused = true;
+                    // A focused handle owns the horizontal arrows: the focus-lock
+                    // filter (the same mechanism sliders use) keeps egui's spatial
+                    // navigation from walking to a neighbouring header cell, and
+                    // each press nudges the width the way a tiny drag would —
+                    // accumulated onto the LIVE width and clamped exactly like
+                    // the pointer gesture. Shift takes the large step.
+                    ui.memory_mut(|m| {
+                        m.set_focus_lock_filter(
+                            rresp.id,
+                            egui::EventFilter {
+                                horizontal_arrows: true,
+                                ..Default::default()
+                            },
+                        );
+                    });
+                    let step = if ui.input(|i| i.modifiers.shift) {
+                        KB_RESIZE_STEP_LARGE
+                    } else {
+                        KB_RESIZE_STEP
+                    };
+                    let dx = ui.input(|i| {
+                        (i.key_pressed(egui::Key::ArrowRight) as i32
+                            - i.key_pressed(egui::Key::ArrowLeft) as i32)
+                            as f32
+                            * step
+                    });
+                    painter.rect_stroke(
+                        handle,
+                        0.0,
+                        Stroke::new(1.5, pal.accent),
+                        egui::StrokeKind::Inside,
+                    );
+                    if dx != 0.0 {
+                        let current = self.col_width(i - 1);
+                        self.cols[i - 1].width = (current + dx).clamp(MIN_COL_W, MAX_COL_W);
+                        self.layout.borrow_mut().take();
+                        self.dirty = true;
+                    }
                 }
             }
             if rresp.hovered() && !rresp.dragged() {
@@ -2555,5 +2600,84 @@ mod tests {
             Some(handle_id),
             "the focus-lock filter must keep focus on the handle"
         );
+    }
+
+    #[test]
+    fn focused_header_cell_surrenders_focus_on_down_arrow_and_escape() {
+        let ctx = egui::Context::default();
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1600.0, 900.0));
+        let mut t = table();
+        header_frame(&ctx, &mut t, screen, 0.000, vec![]);
+
+        let cell_id = egui::Id::new(("tmtable", "t")).with(("hdr", "name"));
+        let first_hdr = ctx
+            .data(|d| d.get_temp::<Option<egui::Id>>(egui::Id::new(("tm-first-hdr-cell", "t"))))
+            .flatten();
+        assert_eq!(
+            first_hdr,
+            Some(cell_id),
+            "first header cell ID is published"
+        );
+
+        ctx.memory_mut(|m| m.request_focus(cell_id));
+        header_frame(&ctx, &mut t, screen, 0.016, vec![]);
+        assert!(header_has_focus(&ctx, "t"));
+
+        let down_event = egui::Event::Key {
+            key: egui::Key::ArrowDown,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: Default::default(),
+        };
+        header_frame(&ctx, &mut t, screen, 0.032, vec![down_event]);
+        assert!(
+            !header_has_focus(&ctx, "t"),
+            "Down Arrow must clear header focus so rows can take keyboard nav"
+        );
+        assert!(
+            ctx.memory(|m| m.focused()).is_none(),
+            "focus must be surrendered"
+        );
+
+        // Test Escape as well
+        ctx.memory_mut(|m| m.request_focus(cell_id));
+        header_frame(&ctx, &mut t, screen, 0.048, vec![]);
+        assert!(header_has_focus(&ctx, "t"));
+
+        let esc_event = egui::Event::Key {
+            key: egui::Key::Escape,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: Default::default(),
+        };
+        header_frame(&ctx, &mut t, screen, 0.064, vec![esc_event]);
+        assert!(!header_has_focus(&ctx, "t"));
+        assert!(ctx.memory(|m| m.focused()).is_none());
+    }
+
+    #[test]
+    fn focused_resize_handle_surrenders_focus_on_down_arrow() {
+        let ctx = egui::Context::default();
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1600.0, 900.0));
+        let mut t = table();
+        header_frame(&ctx, &mut t, screen, 0.000, vec![]);
+
+        let handle_id = egui::Id::new(("tmtable", "t")).with(("resize", "a"));
+        ctx.memory_mut(|m| m.request_focus(handle_id));
+        header_frame(&ctx, &mut t, screen, 0.016, vec![]);
+        assert!(header_has_focus(&ctx, "t"));
+
+        let down_event = egui::Event::Key {
+            key: egui::Key::ArrowDown,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: Default::default(),
+        };
+        header_frame(&ctx, &mut t, screen, 0.032, vec![down_event]);
+        assert!(!header_has_focus(&ctx, "t"));
+        assert!(ctx.memory(|m| m.focused()).is_none());
     }
 }

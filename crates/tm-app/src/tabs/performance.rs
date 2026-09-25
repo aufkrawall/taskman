@@ -1432,11 +1432,13 @@ fn cpu_page(app: &mut TaskManApp, ui: &mut egui::Ui, pal: &Palette) {
     ui.add_space(16.0);
 }
 
-/// Right-click menu for the graphs that have no other options (memory, disk,
+/// Right-click or Menu-key context menu for the graphs that have no other options (memory, disk,
 /// network): the time window is the one thing they can change, and a native
 /// Task Manager user right-clicks every graph expecting *something*.
 fn time_window_context_menu(app: &mut TaskManApp, resp: &egui::Response) {
-    menu::context_menu(resp, |ui| {
+    let kb_open =
+        !app.modal_open() && !resp.ctx.any_popup_open() && menu::keyboard_menu_requested(&resp.ctx);
+    menu::context_menu_kb(resp, kb_open, |ui| {
         ui.set_min_width(170.0);
         menu::title(ui, i18n::tr(K::GraphWindowLabel));
         menu::separator(ui);
@@ -1451,10 +1453,12 @@ fn time_window_context_menu(app: &mut TaskManApp, resp: &egui::Response) {
     });
 }
 
-/// Right-click menu on the CPU graphs: change graph to overall/logical and
+/// Context menu on the CPU graphs: change graph to overall/logical and
 /// toggle the kernel-times overlay (§14.4).
 fn cpu_graph_context_menu(app: &mut TaskManApp, resp: &egui::Response) {
-    menu::context_menu(resp, |ui| {
+    let kb_open =
+        !app.modal_open() && !resp.ctx.any_popup_open() && menu::keyboard_menu_requested(&resp.ctx);
+    menu::context_menu_kb(resp, kb_open, |ui| {
         for (mode, key) in [
             ("overall", K::CpuGraphOverall),
             ("logical", K::CpuGraphLogical),
@@ -1512,7 +1516,9 @@ fn gpu_graph_menu_contents(
 fn gpu_graph_context_menu(app: &mut TaskManApp, resp: &egui::Response, engines: &[String]) {
     let current = app.shared.settings.gpu_graph_mode.clone();
     let mut chosen = None;
-    menu::context_menu(resp, |ui| {
+    let kb_open =
+        !app.modal_open() && !resp.ctx.any_popup_open() && menu::keyboard_menu_requested(&resp.ctx);
+    menu::context_menu_kb(resp, kb_open, |ui| {
         gpu_graph_menu_contents(ui, &current, engines, &mut chosen);
     });
     if let Some(mode) = chosen {

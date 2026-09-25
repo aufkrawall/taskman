@@ -70,6 +70,8 @@ for the in-app help.
 | <kbd>Ctrl</kbd>+<kbd>Tab</kbd> | Next page |
 | <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>Tab</kbd> | Previous page |
 | <kbd>Ctrl</kbd>+<kbd>1</kbd>…<kbd>9</kbd> | Jump directly to page 1–9 |
+| <kbd>Ctrl</kbd>+<kbd>,</kbd> | Settings |
+| <kbd>Ctrl</kbd>+<kbd>N</kbd> | Run new task |
 | <kbd>Del</kbd> | End the selected processes (asks for confirmation; Processes/Details) |
 | <kbd>Menu</kbd> / <kbd>Shift</kbd>+<kbd>F10</kbd> | Open the context menu of the selection |
 | <kbd>↑</kbd> <kbd>↓</kbd> | Move the table selection |

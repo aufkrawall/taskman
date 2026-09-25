@@ -1451,6 +1451,33 @@ pub(crate) fn page_switch_target(
     Some(all[(digit - 1).min(len - 1)])
 }
 
+/// Target widget ID when pressing Tab from a table list with no chrome focused:
+/// prefers the first enabled toolbar command button, and falls back to the
+/// table's first column header cell.
+fn list_nav_tab_target(tab: Tab, ctx: &egui::Context) -> Option<egui::Id> {
+    ctx.data(|d| {
+        d.get_temp::<Option<egui::Id>>(egui::Id::new("tm-first-toolbar-button"))
+            .flatten()
+    })
+    .or_else(|| {
+        let table_name = match tab {
+            Tab::Processes => Some("processes"),
+            Tab::Details => Some("details"),
+            Tab::Services => Some("services"),
+            Tab::Startup => Some("startup"),
+            Tab::Users => Some("users"),
+            Tab::AppHistory => Some("apphistory"),
+            Tab::Performance => None,
+        };
+        table_name.and_then(|t| {
+            ctx.data(|d| {
+                d.get_temp::<Option<egui::Id>>(egui::Id::new(("tm-first-hdr-cell", t)))
+                    .flatten()
+            })
+        })
+    })
+}
+
 /// Parse a `--tab=` value (accepts both English and German aliases).
 fn tab_from_cli(name: &str) -> Option<Tab> {
     match name.to_ascii_lowercase().as_str() {
@@ -1552,6 +1579,9 @@ impl eframe::App for TaskManApp {
         crate::fonts::poll_async_apply(&ctx);
 
         let pal = crate::theme::palette_ctx(&ctx);
+        ctx.data_mut(|d| {
+            d.remove_temp::<Option<egui::Id>>(egui::Id::new("tm-first-toolbar-button"))
+        });
         #[cfg(target_os = "windows")]
         self.sync_native_topmost(_frame);
         self.sync_title_bar(&ctx, &pal, _frame);
@@ -1639,6 +1669,52 @@ impl eframe::App for TaskManApp {
             && ctx.input(|i| i.key_pressed(egui::Key::Delete))
         {
             self.confirm_selected_process_end();
+        }
+
+        // Run new task: Ctrl+N (keyboard-only accessibility).
+        if !modal_open
+            && !ctx.text_edit_focused()
+            && ctx.input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::N))
+        {
+            self.run_dialog_open = true;
+        }
+
+        // Settings dialog: Ctrl+, (standard Windows 11 Task Manager shortcut).
+        if !modal_open
+            && !ctx.text_edit_focused()
+            && ctx.input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::Comma))
+        {
+            self.show_settings = true;
+        }
+
+        // When navigating the list with no widget holding keyboard focus,
+        // Shift+Tab jumps directly back to the search bar, and Tab moves
+        // forward into the tab's command buttons / column headers.
+        if !modal_open
+            && !ctx.egui_wants_keyboard_input()
+            && !ctx.text_edit_focused()
+            && ctx.memory(|m| m.focused()).is_none()
+        {
+            let shift_tab = ctx.input(|i| {
+                i.key_pressed(egui::Key::Tab)
+                    && i.modifiers.shift
+                    && !i.modifiers.ctrl
+                    && !i.modifiers.alt
+            });
+            let tab = ctx.input(|i| {
+                i.key_pressed(egui::Key::Tab)
+                    && !i.modifiers.shift
+                    && !i.modifiers.ctrl
+                    && !i.modifiers.alt
+            });
+            if shift_tab && self.tab != Tab::Performance {
+                let id = egui::Id::new("global-search");
+                ctx.memory_mut(|m| m.request_focus(id));
+                ctx.input_mut(|i| i.consume_key(Default::default(), egui::Key::Tab));
+            } else if tab && let Some(target) = list_nav_tab_target(self.tab, &ctx) {
+                ctx.memory_mut(|m| m.request_focus(target));
+                ctx.input_mut(|i| i.consume_key(Default::default(), egui::Key::Tab));
+            }
         }
 
         // Global page switching: Ctrl+Tab / Ctrl+Shift+Tab cycle the pages in
@@ -1824,9 +1900,6 @@ impl TaskManApp {
     /// (Performance) keep their selection untouched — Enter still surrenders
     /// the field's focus, so navigation works there.
     pub fn commit_search_selection(&mut self, ctx: &egui::Context) {
-        if self.search.trim().is_empty() {
-            return;
-        }
         let q = crate::search::Query::new(&self.search);
         match self.tab {
             Tab::Performance => {}
@@ -2606,5 +2679,39 @@ mod tests {
 
         // No page-switch key: nothing happens.
         assert_eq!(page_switch_target(all[0], false, false, None), None);
+    }
+
+    /// When navigating a table with Tab and no widget focused, Tab walks forward
+    /// into the toolbar first (e.g. End Task button), falling back to the first
+    /// column header cell if no toolbar button is present/enabled.
+    #[test]
+    fn list_nav_tab_target_prioritizes_toolbar_then_header() {
+        let ctx = egui::Context::default();
+        let btn_id = egui::Id::new("test-toolbar-btn");
+        let hdr_id = egui::Id::new("test-hdr-cell");
+
+        // 1. Neither registered -> None
+        assert_eq!(list_nav_tab_target(Tab::Processes, &ctx), None);
+
+        // 2. Only header registered -> returns header ID
+        ctx.data_mut(|d| {
+            d.insert_temp(
+                egui::Id::new(("tm-first-hdr-cell", "processes")),
+                Some(hdr_id),
+            );
+        });
+        assert_eq!(list_nav_tab_target(Tab::Processes, &ctx), Some(hdr_id));
+
+        // 3. Toolbar button registered -> prioritizes toolbar button over header
+        ctx.data_mut(|d| {
+            d.insert_temp(egui::Id::new("tm-first-toolbar-button"), Some(btn_id));
+        });
+        assert_eq!(list_nav_tab_target(Tab::Processes, &ctx), Some(btn_id));
+
+        // 4. Performance tab has no table header, falls back to None if toolbar unset
+        ctx.data_mut(|d| {
+            d.remove_temp::<Option<egui::Id>>(egui::Id::new("tm-first-toolbar-button"));
+        });
+        assert_eq!(list_nav_tab_target(Tab::Performance, &ctx), None);
     }
 }
