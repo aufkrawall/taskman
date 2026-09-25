@@ -927,12 +927,17 @@ impl Memory {
         let focus = self.focus_mut();
         if focus.focused() == Some(id) {
             focus.focused_widget = None;
+            focus.give_to_next = false;
         }
     }
 
     /// Move keyboard focus in a specific direction.
     pub fn move_focus(&mut self, direction: FocusDirection) {
-        self.focus_mut().focus_direction = direction;
+        let focus = self.focus_mut();
+        focus.focus_direction = direction;
+        if direction == FocusDirection::None {
+            focus.give_to_next = false;
+        }
     }
 
     /// Returns true if

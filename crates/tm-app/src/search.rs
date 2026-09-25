@@ -103,17 +103,13 @@ fn type_ahead_char(c: char) -> bool {
 /// * a popup or context menu is open — its own arrow handling must not be
 ///   fought by the list underneath.
 ///
-/// Plain chrome (toolbar buttons, header cells, cards) holding focus does NOT
-/// block the gate: egui's spatial focus movement and the list selection then
-/// both respond, which is the same "arrows always drive the list" contract
-/// native Task Manager uses.
-///
-/// `dialog_open` is [`crate::app::TaskManApp::modal_open`], the authoritative
-/// "a dialog is up" flag: while one is up it owns the keyboard, so the list
-/// behind it stands down entirely — old-contract dialogs never hold widget
-/// focus, which would otherwise leave the gate open above the page.
+/// The list navigation gate requires that no chrome widget holds keyboard
+/// focus (`!ctx.egui_wants_keyboard_input()`), no popup is open, and no modal
+/// dialog is displayed. This ensures that when the sidebar, toolbar buttons,
+/// or search bar hold focus, arrow keys belong exclusively to that chrome
+/// widget and never simultaneously move the list selection in the background.
 pub fn nav_gate(ctx: &egui::Context, dialog_open: bool) -> bool {
-    !dialog_open && !ctx.text_edit_focused() && !ctx.any_popup_open()
+    !dialog_open && !ctx.egui_wants_keyboard_input() && !ctx.any_popup_open()
 }
 
 /// True when the custom row action keys (Enter/Space) may fire. A focused
@@ -573,6 +569,50 @@ mod tests {
         );
         // …and the gates are usable again the moment the dialog is gone.
         assert!(nav_gate(&ctx, false));
+    }
+
+    /// When a chrome widget (such as a sidebar navigation item or toolbar button)
+    /// holds keyboard focus, list navigation must stand down so arrow keys belong
+    /// exclusively to the focused widget and do not simultaneously move the list.
+    #[test]
+    fn chrome_widget_focus_stands_down_list_navigation() {
+        let ctx = egui::Context::default();
+        let raw = |events: Vec<egui::Event>| egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(800.0, 600.0),
+            )),
+            events,
+            focused: true,
+            ..Default::default()
+        };
+        // Frame 1: focus a chrome button (e.g. sidebar item or toolbar button).
+        let mut out = ctx.run_ui(raw(vec![]), |ui| {
+            ui.button("Sidebar item").request_focus();
+        });
+        out.textures_delta.clear();
+
+        // Frame 2: with the button focused, Down Arrow must not trigger list navigation.
+        let down = egui::Event::Key {
+            key: egui::Key::ArrowDown,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: Default::default(),
+        };
+        let mut nav = None;
+        let mut gate = false;
+        let mut out = ctx.run_ui(raw(vec![down]), |ui| {
+            let _ = ui.button("Sidebar item");
+            gate = nav_gate(ui.ctx(), false);
+            nav = list_nav(ui.ctx(), false);
+        });
+        out.textures_delta.clear();
+        assert!(!gate, "nav_gate must stand down when chrome has focus");
+        assert_eq!(
+            nav, None,
+            "list_nav must not fire while a chrome widget has focus"
+        );
     }
 
     /// The regression from the report: typing "svc" fast must not leave the

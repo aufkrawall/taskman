@@ -1453,7 +1453,7 @@ pub(crate) fn page_switch_target(
 
 /// Target widget ID when pressing Tab from a table list with no chrome focused:
 /// prefers the first enabled toolbar command button, and falls back to the
-/// table's first column header cell.
+/// table's first column header cell, or to the first sidebar item.
 fn list_nav_tab_target(tab: Tab, ctx: &egui::Context) -> Option<egui::Id> {
     ctx.data(|d| {
         d.get_temp::<Option<egui::Id>>(egui::Id::new("tm-first-toolbar-button"))
@@ -1474,6 +1474,12 @@ fn list_nav_tab_target(tab: Tab, ctx: &egui::Context) -> Option<egui::Id> {
                 d.get_temp::<Option<egui::Id>>(egui::Id::new(("tm-first-hdr-cell", t)))
                     .flatten()
             })
+        })
+    })
+    .or_else(|| {
+        ctx.data(|d| {
+            d.get_temp::<Option<egui::Id>>(egui::Id::new("tm-first-sidebar-item"))
+                .flatten()
         })
     })
 }
@@ -1580,11 +1586,45 @@ impl eframe::App for TaskManApp {
 
         let pal = crate::theme::palette_ctx(&ctx);
         ctx.data_mut(|d| {
-            d.remove_temp::<Option<egui::Id>>(egui::Id::new("tm-first-toolbar-button"))
+            d.remove_temp::<Option<egui::Id>>(egui::Id::new("tm-first-toolbar-button"));
+            d.remove_temp::<Option<egui::Id>>(egui::Id::new("tm-first-sidebar-item"));
         });
         #[cfg(target_os = "windows")]
         self.sync_native_topmost(_frame);
         self.sync_title_bar(&ctx, &pal, _frame);
+
+        // When navigating the list with no widget holding keyboard focus,
+        // Shift+Tab jumps directly back to the search bar, and Tab moves
+        // forward into the tab's command buttons / column headers / sidebar.
+        // Intercepting Tab BEFORE top panels run prevents egui's default Tab
+        // navigation from inadvertently claiming focus on the sidebar.
+        let modal_open = self.modal_open();
+        if !modal_open
+            && !ctx.egui_wants_keyboard_input()
+            && !ctx.text_edit_focused()
+            && ctx.memory(|m| m.focused()).is_none()
+        {
+            let shift_tab = ctx.input(|i| {
+                i.key_pressed(egui::Key::Tab)
+                    && i.modifiers.shift
+                    && !i.modifiers.ctrl
+                    && !i.modifiers.alt
+            });
+            let tab = ctx.input(|i| {
+                i.key_pressed(egui::Key::Tab)
+                    && !i.modifiers.shift
+                    && !i.modifiers.ctrl
+                    && !i.modifiers.alt
+            });
+            if shift_tab && self.tab != Tab::Performance {
+                let id = egui::Id::new("global-search");
+                ctx.memory_mut(|m| m.request_focus(id));
+                ctx.input_mut(|i| i.consume_key(Default::default(), egui::Key::Tab));
+            } else if tab && let Some(target) = list_nav_tab_target(self.tab, &ctx) {
+                ctx.memory_mut(|m| m.request_focus(target));
+                ctx.input_mut(|i| i.consume_key(Default::default(), egui::Key::Tab));
+            }
+        }
 
         // ------------------------------------------------ top-level panels
         crate::app_ui::top_search_panel(self, ui, &pal);
@@ -1685,36 +1725,6 @@ impl eframe::App for TaskManApp {
             && ctx.input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::Comma))
         {
             self.show_settings = true;
-        }
-
-        // When navigating the list with no widget holding keyboard focus,
-        // Shift+Tab jumps directly back to the search bar, and Tab moves
-        // forward into the tab's command buttons / column headers.
-        if !modal_open
-            && !ctx.egui_wants_keyboard_input()
-            && !ctx.text_edit_focused()
-            && ctx.memory(|m| m.focused()).is_none()
-        {
-            let shift_tab = ctx.input(|i| {
-                i.key_pressed(egui::Key::Tab)
-                    && i.modifiers.shift
-                    && !i.modifiers.ctrl
-                    && !i.modifiers.alt
-            });
-            let tab = ctx.input(|i| {
-                i.key_pressed(egui::Key::Tab)
-                    && !i.modifiers.shift
-                    && !i.modifiers.ctrl
-                    && !i.modifiers.alt
-            });
-            if shift_tab && self.tab != Tab::Performance {
-                let id = egui::Id::new("global-search");
-                ctx.memory_mut(|m| m.request_focus(id));
-                ctx.input_mut(|i| i.consume_key(Default::default(), egui::Key::Tab));
-            } else if tab && let Some(target) = list_nav_tab_target(self.tab, &ctx) {
-                ctx.memory_mut(|m| m.request_focus(target));
-                ctx.input_mut(|i| i.consume_key(Default::default(), egui::Key::Tab));
-            }
         }
 
         // Global page switching: Ctrl+Tab / Ctrl+Shift+Tab cycle the pages in
@@ -2708,10 +2718,20 @@ mod tests {
         });
         assert_eq!(list_nav_tab_target(Tab::Processes, &ctx), Some(btn_id));
 
-        // 4. Performance tab has no table header, falls back to None if toolbar unset
+        // 4. Performance tab has no table header, falls back to None if toolbar and sidebar unset
         ctx.data_mut(|d| {
             d.remove_temp::<Option<egui::Id>>(egui::Id::new("tm-first-toolbar-button"));
         });
         assert_eq!(list_nav_tab_target(Tab::Performance, &ctx), None);
+
+        // 5. Sidebar item registered -> falls back to sidebar item when neither toolbar nor header is available
+        let sidebar_id = egui::Id::new("test-sidebar-item");
+        ctx.data_mut(|d| {
+            d.insert_temp(egui::Id::new("tm-first-sidebar-item"), Some(sidebar_id));
+        });
+        assert_eq!(
+            list_nav_tab_target(Tab::Performance, &ctx),
+            Some(sidebar_id)
+        );
     }
 }

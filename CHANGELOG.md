@@ -60,6 +60,15 @@
 
 ### Fixed
 
+- **Concurrent sidebar and list input conflict:** Keystrokes such as Tab or
+  ArrowDown/ArrowUp no longer register simultaneously in the sidebar and the
+  process/details table list. List navigation gates strictly stand down when
+  any chrome widget (sidebar item, hamburger button, toolbar button, search
+  input) holds keyboard focus. Committing search with Tab or Down Arrow
+  intercepts the key before text edit focus traversal, preventing egui from
+  leaking focus to the sidebar hamburger button. Sidebar items and toolbar
+  buttons now reliably surrender focus directly to the table rows upon
+  pressing ArrowRight, ArrowDown, or Escape.
 - **Search bar Tab jump to list:** Pressing Tab or Down Arrow from the search
   field commits the search match and immediately hands keyboard focus to the
   table rows, parking the selection into view. The clear ('X') button is
