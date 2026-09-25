@@ -393,12 +393,15 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
         URow::App { roll, .. } => roll,
     }));
 
+    // While a dialog is up it owns the keyboard: the page's nav, row keys and
+    // menu key all stand down (`TaskManApp::modal_open`).
+    let dialog_open = app.modal_open();
     // Arrow/Home/End/Page selection movement over the USER rows. Expanded
     // per-user app rows are presentation children without a selection or a
     // menu of their own, so they are skipped exactly like the synthetic
     // accounting rows on the Processes page. The session id is the row-owner
     // key: the one-shot scroll request parks under that identity.
-    if search::nav_gate(ui.ctx()) {
+    if search::nav_gate(ui.ctx(), dialog_open) {
         let page_rows =
             tablekit::page_rows(ui.ctx(), "users", tablekit::ROW_H).unwrap_or_else(|| {
                 (ui.ctx().content_rect().height() / tablekit::ROW_H)
@@ -419,8 +422,8 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
                     URow::App { .. } => false,
                 })
         });
-        if let Some(nav) =
-            search::list_nav(ui.ctx()).filter(|_| !tablekit::header_has_focus(ui.ctx(), "users"))
+        if let Some(nav) = search::list_nav(ui.ctx(), dialog_open)
+            .filter(|_| !tablekit::header_has_focus(ui.ctx(), "users"))
             && let Some(next) = search::moved_index(user_positions.len(), current, nav, page_rows)
             && let Some(&row_index) = user_positions.get(next)
             && let URow::User(i) = rows[row_index]
@@ -710,14 +713,17 @@ fn user_row_ui(
     // The menu is always attached: without the capability its actions show
     // disabled with an explanation instead of right-clicking into silence.
     // Enter (with nothing else holding focus) opens it like the Menu key —
-    // Disconnect/Sign-out are the only actions a session row offers.
+    // Disconnect/Sign-out are the only actions a session row offers. Both
+    // stand down while a dialog is up: a menu opened over a dialog would
+    // strand there once the dialog contract consumes Escape.
     let ctx = ui.ctx().clone();
     let selected_row = app.selected_user == Some(s.id);
-    let enter_open = search::row_action_gate(&ctx)
+    let enter_open = search::row_action_gate(&ctx, app.modal_open())
         && ctx.input(|i| i.key_pressed(egui::Key::Enter))
         && selected_row;
     let keyboard_open = (enter_open
         || (!ctx.any_popup_open() && menu::keyboard_menu_requested(&ctx)))
+        && !app.modal_open()
         && selected_row;
     menu::context_menu_kb(&resp, keyboard_open, |ui| {
         ui.set_min_width(150.0);
@@ -860,6 +866,17 @@ pub fn session_logoff_dialog(app: &mut TaskManApp, ctx: &egui::Context, _pal: &t
         return;
     };
     let focus_id = egui::Id::new("logoff-dialog-focus-primary");
+    let restore_id = egui::Id::new("logoff-dialog-restore-focus");
+    let first_frame = ctx
+        .data(|d| d.get_temp::<Option<egui::Id>>(restore_id))
+        .is_none();
+    if first_frame {
+        // Remember what held keyboard focus before the dialog took it, so
+        // closing can hand it back.
+        let captured = crate::app_ui::capture_focus(ctx);
+        ctx.data_mut(|d| d.insert_temp(restore_id, captured));
+    }
+
     let mut open = true;
     // Sign-out is destructive: the SAFE action owns the default, so Enter
     // cancels until focus deliberately moves to Yes.
@@ -899,10 +916,18 @@ pub fn session_logoff_dialog(app: &mut TaskManApp, ctx: &egui::Context, _pal: &t
         || matches!(clicked, crate::app_ui::DialogButtonClick::Safe);
     let confirm = matches!(decision, Some(crate::app_ui::DialogDecision::Primary))
         || matches!(clicked, crate::app_ui::DialogButtonClick::Primary);
-    if cancel {
+    if cancel || confirm {
+        // Whichever way it resolved, hand keyboard focus back to what held
+        // it before the dialog took it.
+        let saved = ctx
+            .data(|d| d.get_temp::<Option<egui::Id>>(restore_id))
+            .flatten();
+        crate::app_ui::restore_focus(ctx, saved);
+        ctx.data_mut(|d| d.remove_temp::<Option<egui::Id>>(restore_id));
+        ctx.data_mut(|d| d.remove_temp::<bool>(focus_id));
         app.pending_session_logoff = None;
-    } else if confirm {
-        app.pending_session_logoff = None;
+    }
+    if confirm {
         dispatch_session_action(app, ctx, id, UserSessionAction::Logoff);
     }
 }

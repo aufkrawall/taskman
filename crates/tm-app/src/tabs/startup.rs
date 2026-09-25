@@ -25,6 +25,40 @@ fn columns() -> Vec<TmColumn> {
     ]
 }
 
+/// The candidate fields the Startup page matches the global search against —
+/// name, publisher, command and location. The ONE predicate the visible table
+/// and the search commit both use, so Enter can never land on a row the table
+/// would not show.
+pub(crate) fn matches_search(q: &search::Query, item: &StartupItem) -> bool {
+    q.matches_any([
+        item.name.as_str(),
+        item.publisher.as_deref().unwrap_or(""),
+        item.command.as_str(),
+        item.location.as_str(),
+    ])
+}
+
+/// The startup entry the global search commits to: the FIRST row of the
+/// table's current model — filtered by `q`, sorted by the live `sort` — i.e.
+/// exactly the row the user sees at the top of the matches. Returns the item
+/// id (the row-owner key the page selects by). Split out so the commit in
+/// `app.rs` reuses this module's row model instead of keeping a sort-order
+/// mirror of it in sync.
+pub(crate) fn first_search_match_in_display_order(
+    items: &[StartupItem],
+    q: &search::Query,
+    sort: tablekit::SortState,
+) -> Option<String> {
+    let mut visible: Vec<usize> = items
+        .iter()
+        .enumerate()
+        .filter(|(_, item)| matches_search(q, item))
+        .map(|(i, _)| i)
+        .collect();
+    visible.sort_by(|a, b| compare_items(&items[*a], &items[*b], sort));
+    visible.first().map(|&i| items[i].id.clone())
+}
+
 pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
     let pal = theme::palette(ui);
     let frame_ctx = ui.ctx().clone();
@@ -151,23 +185,19 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
     let mut visible: Vec<usize> = items
         .iter()
         .enumerate()
-        .filter(|(_, it)| {
-            q.matches_any([
-                it.name.as_str(),
-                it.publisher.as_deref().unwrap_or(""),
-                it.command.as_str(),
-                it.location.as_str(),
-            ])
-        })
+        .filter(|(_, it)| matches_search(&q, it))
         .map(|(i, _)| i)
         .collect();
     let sort = app.startup_sort;
     visible.sort_by(|a, b| compare_items(&items[*a], &items[*b], sort));
 
+    // While a dialog is up it owns the keyboard: the page's nav, row keys and
+    // menu key all stand down (`TaskManApp::modal_open`).
+    let dialog_open = app.modal_open();
     // Arrow/Home/End/Page selection movement over the displayed startup
     // items. The item id is the row-owner key: the one-shot scroll request
     // parks under that identity and resolves to a row index per frame.
-    if search::nav_gate(&frame_ctx) {
+    if search::nav_gate(&frame_ctx, dialog_open) {
         let page_rows =
             tablekit::page_rows(&frame_ctx, "startup", tablekit::ROW_H).unwrap_or_else(|| {
                 (frame_ctx.content_rect().height() / tablekit::ROW_H)
@@ -178,7 +208,7 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
             .selected_startup_id
             .as_ref()
             .and_then(|id| visible.iter().position(|&i| items[i].id == *id));
-        if let Some(nav) = search::list_nav(&frame_ctx)
+        if let Some(nav) = search::list_nav(&frame_ctx, dialog_open)
             .filter(|_| !tablekit::header_has_focus(&frame_ctx, "startup"))
             && let Some(next) = search::moved_index(visible.len(), current, nav, page_rows)
             && let Some(&i) = visible.get(next)
@@ -304,13 +334,16 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
                 }
                 // Enter (with nothing else holding focus) opens the same menu
                 // as the Menu key: enable/disable is the closest thing to a
-                // primary action a startup entry has.
+                // primary action a startup entry has. Both stand down while a
+                // dialog is up — a menu opened over a dialog would strand
+                // there once the dialog contract consumes Escape.
                 let selected_row = app.selected_startup_id.as_deref() == Some(item.id.as_str());
-                let enter_open = search::row_action_gate(ui.ctx())
+                let enter_open = search::row_action_gate(ui.ctx(), app.modal_open())
                     && ui.ctx().input(|i| i.key_pressed(egui::Key::Enter))
                     && selected_row;
                 let keyboard_open = (enter_open
                     || (!ui.ctx().any_popup_open() && menu::keyboard_menu_requested(ui.ctx())))
+                    && !app.modal_open()
                     && selected_row;
                 menu::context_menu_kb(&resp, keyboard_open, |ui| {
                     ui.set_min_width(180.0);
@@ -502,6 +535,16 @@ fn exe_from_command(cmd: &str) -> Option<String> {
 }
 
 pub fn properties_dialog(app: &mut TaskManApp, ctx: &egui::Context, _pal: &theme::Palette) {
+    let restore_id = egui::Id::new("startup-props-restore-focus");
+    let first_frame = ctx
+        .data(|d| d.get_temp::<Option<egui::Id>>(restore_id))
+        .is_none();
+    if first_frame {
+        // Remember what held keyboard focus before the dialog took it, so
+        // closing can hand it back.
+        let captured = crate::app_ui::capture_focus(ctx);
+        ctx.data_mut(|d| d.insert_temp(restore_id, captured));
+    }
     let mut open = true;
     // Esc and Enter close, mirroring the Close button.
     let keys = crate::app_ui::consume_dialog_keys(ctx, false);
@@ -551,6 +594,61 @@ pub fn properties_dialog(app: &mut TaskManApp, ctx: &egui::Context, _pal: &theme
             });
         });
     if !open || close_now {
+        // Hand keyboard focus back to what held it before the dialog took it.
+        let saved = ctx
+            .data(|d| d.get_temp::<Option<egui::Id>>(restore_id))
+            .flatten();
+        crate::app_ui::restore_focus(ctx, saved);
+        ctx.data_mut(|d| d.remove_temp::<Option<egui::Id>>(restore_id));
         app.startup_props = None;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The global search commit must mirror the VISIBLE startup table: same
+    /// filter fields, same live sort — name ascending and descending lead to
+    /// different first rows for one and the same query.
+    #[test]
+    fn search_commit_follows_the_live_sort() {
+        let items = vec![
+            StartupItem {
+                id: "alpha".into(),
+                name: "Alpha".into(),
+                ..Default::default()
+            },
+            StartupItem {
+                id: "beta".into(),
+                name: "Beta".into(),
+                ..Default::default()
+            },
+        ];
+        let q = crate::search::Query::new("a");
+        assert!(matches_search(&q, &items[0]));
+        assert!(
+            matches_search(&q, &items[1]),
+            "Beta matches via its name too"
+        );
+        assert_eq!(
+            first_search_match_in_display_order(&items, &q, tablekit::SortState::new(0, true))
+                .as_deref(),
+            Some("alpha")
+        );
+        assert_eq!(
+            first_search_match_in_display_order(&items, &q, tablekit::SortState::new(0, false))
+                .as_deref(),
+            Some("beta")
+        );
+        assert_eq!(
+            first_search_match_in_display_order(
+                &items,
+                &crate::search::Query::new("zzz"),
+                tablekit::SortState::new(0, true)
+            ),
+            None,
+            "no match, no commit"
+        );
     }
 }

@@ -107,25 +107,32 @@ fn type_ahead_char(c: char) -> bool {
 /// block the gate: egui's spatial focus movement and the list selection then
 /// both respond, which is the same "arrows always drive the list" contract
 /// native Task Manager uses.
-pub fn nav_gate(ctx: &egui::Context) -> bool {
-    !ctx.text_edit_focused() && !ctx.any_popup_open()
+///
+/// `dialog_open` is [`crate::app::TaskManApp::modal_open`], the authoritative
+/// "a dialog is up" flag: while one is up it owns the keyboard, so the list
+/// behind it stands down entirely — old-contract dialogs never hold widget
+/// focus, which would otherwise leave the gate open above the page.
+pub fn nav_gate(ctx: &egui::Context, dialog_open: bool) -> bool {
+    !dialog_open && !ctx.text_edit_focused() && !ctx.any_popup_open()
 }
 
 /// True when the custom row action keys (Enter/Space) may fire. A focused
 /// click-sensing widget would activate itself on the same keypress (egui
 /// turns Enter/Space into a click for whatever holds focus), so the bindings
 /// stay dead while ANY widget holds keyboard focus — and while a popup is
-/// open, whose focused entries live on that same mechanism.
-pub fn row_action_gate(ctx: &egui::Context) -> bool {
-    !ctx.egui_wants_keyboard_input() && !ctx.any_popup_open()
+/// open, whose focused entries live on that same mechanism. `dialog_open`
+/// (see [`nav_gate`]) keeps the keys off the list behind a dialog; the
+/// dialogs' own key handling is driven by their contract, not this gate.
+pub fn row_action_gate(ctx: &egui::Context, dialog_open: bool) -> bool {
+    !dialog_open && !ctx.egui_wants_keyboard_input() && !ctx.any_popup_open()
 }
 
 /// Collect every plain character typed this frame while the
 /// [`nav_gate`] allows list navigation. Text events (not key codes) keep
 /// keyboard layouts and non-ASCII letters natural; modified input is ignored
 /// so application shortcuts never become list-navigation keystrokes.
-fn typed_chars(ctx: &egui::Context) -> Vec<char> {
-    if !nav_gate(ctx) {
+fn typed_chars(ctx: &egui::Context, dialog_open: bool) -> Vec<char> {
+    if !nav_gate(ctx, dialog_open) {
         return Vec::new();
     }
     ctx.input(|i| {
@@ -153,8 +160,12 @@ fn typed_chars(ctx: &egui::Context) -> Vec<char> {
 /// so all of them are appended in order; only the buffer decides what to
 /// match. Anything typed after [`TYPE_AHEAD_TIMEOUT_S`] of silence starts a
 /// new word.
-pub fn list_type_ahead(ctx: &egui::Context, id: &'static str) -> Option<TypeAhead> {
-    let typed = typed_chars(ctx);
+pub fn list_type_ahead(
+    ctx: &egui::Context,
+    id: &'static str,
+    dialog_open: bool,
+) -> Option<TypeAhead> {
+    let typed = typed_chars(ctx, dialog_open);
     if typed.is_empty() {
         return None;
     }
@@ -202,8 +213,8 @@ pub enum ListNav {
 /// gestures, so the caller reads the modifiers off the same frame's input and
 /// decides. `Alt` and the macOS `Command` shortcut stay reserved for the
 /// application.
-pub fn list_nav(ctx: &egui::Context) -> Option<ListNav> {
-    if !nav_gate(ctx) {
+pub fn list_nav(ctx: &egui::Context, dialog_open: bool) -> Option<ListNav> {
+    if !nav_gate(ctx, dialog_open) {
         return None;
     }
     ctx.input(|i| {
@@ -492,7 +503,7 @@ mod tests {
     fn shift_arrows_are_reported_for_range_extension() {
         let ctx = egui::Context::default();
         key_ctx(&ctx, egui::Key::ArrowDown, egui::Modifiers::SHIFT);
-        assert_eq!(list_nav(&ctx), Some(ListNav::Next));
+        assert_eq!(list_nav(&ctx, false), Some(ListNav::Next));
     }
 
     /// Ctrl+arrows move the selection without extending it; Ctrl must not
@@ -501,13 +512,13 @@ mod tests {
     fn ctrl_arrows_are_reported_as_plain_movement() {
         let ctx = egui::Context::default();
         key_ctx(&ctx, egui::Key::ArrowDown, egui::Modifiers::CTRL);
-        assert_eq!(list_nav(&ctx), Some(ListNav::Next));
+        assert_eq!(list_nav(&ctx, false), Some(ListNav::Next));
         key_ctx(
             &ctx,
             egui::Key::PageUp,
             egui::Modifiers::CTRL | egui::Modifiers::SHIFT,
         );
-        assert_eq!(list_nav(&ctx), Some(ListNav::PageUp));
+        assert_eq!(list_nav(&ctx, false), Some(ListNav::PageUp));
     }
 
     /// Alt and Command stay reserved for application shortcuts.
@@ -515,9 +526,9 @@ mod tests {
     fn alt_and_command_arrows_are_never_list_navigation() {
         let ctx = egui::Context::default();
         key_ctx(&ctx, egui::Key::ArrowDown, egui::Modifiers::ALT);
-        assert_eq!(list_nav(&ctx), None);
+        assert_eq!(list_nav(&ctx, false), None);
         key_ctx(&ctx, egui::Key::ArrowDown, egui::Modifiers::COMMAND);
-        assert_eq!(list_nav(&ctx), None);
+        assert_eq!(list_nav(&ctx, false), None);
     }
 
     /// The other movement keys survive the gate unchanged.
@@ -530,8 +541,38 @@ mod tests {
             (egui::Key::End, ListNav::Last),
         ] {
             key_ctx(&ctx, key, egui::Modifiers::NONE);
-            assert_eq!(list_nav(&ctx), Some(nav));
+            assert_eq!(list_nav(&ctx, false), Some(nav));
         }
+    }
+
+    /// While a dialog is up (`TaskManApp::modal_open`) the whole page-level
+    /// keyboard layer stands down even though NOTHING holds widget focus —
+    /// old-contract dialogs never take focus, which would otherwise leave the
+    /// gates open above the page they cover. Regression for the dialogs-area
+    /// seam: arrows/type-ahead/Enter must not reach the table behind a dialog.
+    #[test]
+    fn a_dialog_open_stands_down_every_page_level_binding() {
+        let ctx = egui::Context::default();
+        // No text edit, no popup: without the flag the gates would be open.
+        assert!(nav_gate(&ctx, false));
+        assert!(row_action_gate(&ctx, false));
+        // With a dialog up everything stands down.
+        key_ctx(&ctx, egui::Key::ArrowDown, egui::Modifiers::NONE);
+        assert!(!nav_gate(&ctx, true));
+        assert!(!row_action_gate(&ctx, true), "Enter/Space behind a dialog");
+        assert_eq!(
+            list_nav(&ctx, true),
+            None,
+            "arrows behind a dialog stay dead"
+        );
+        typed_ctx(&ctx, &['s'], 0.0);
+        assert_eq!(
+            list_type_ahead(&ctx, "t", true),
+            None,
+            "type-ahead behind a dialog stays dead"
+        );
+        // …and the gates are usable again the moment the dialog is gone.
+        assert!(nav_gate(&ctx, false));
     }
 
     /// The regression from the report: typing "svc" fast must not leave the
@@ -541,18 +582,18 @@ mod tests {
         let ctx = egui::Context::default();
         typed_ctx(&ctx, &['s'], 0.0);
         assert_eq!(
-            list_type_ahead(&ctx, "t"),
+            list_type_ahead(&ctx, "t", false),
             Some(TypeAhead::Cycle('s')),
             "a single letter still cycles like a native list"
         );
         typed_ctx(&ctx, &['v'], 0.05);
         assert_eq!(
-            list_type_ahead(&ctx, "t"),
+            list_type_ahead(&ctx, "t", false),
             Some(TypeAhead::Prefix("sv".into()))
         );
         typed_ctx(&ctx, &['c'], 0.10);
         assert_eq!(
-            list_type_ahead(&ctx, "t"),
+            list_type_ahead(&ctx, "t", false),
             Some(TypeAhead::Prefix("svc".into()))
         );
     }
@@ -564,7 +605,7 @@ mod tests {
         let ctx = egui::Context::default();
         typed_ctx(&ctx, &['s', 'v', 'c'], 0.0);
         assert_eq!(
-            list_type_ahead(&ctx, "t"),
+            list_type_ahead(&ctx, "t", false),
             Some(TypeAhead::Prefix("svc".into()))
         );
     }
@@ -573,10 +614,13 @@ mod tests {
     fn a_pause_starts_a_new_word() {
         let ctx = egui::Context::default();
         typed_ctx(&ctx, &['s'], 0.0);
-        assert_eq!(list_type_ahead(&ctx, "t"), Some(TypeAhead::Cycle('s')));
+        assert_eq!(
+            list_type_ahead(&ctx, "t", false),
+            Some(TypeAhead::Cycle('s'))
+        );
         typed_ctx(&ctx, &['v'], 0.0 + TYPE_AHEAD_TIMEOUT_S + 0.5);
         assert_eq!(
-            list_type_ahead(&ctx, "t"),
+            list_type_ahead(&ctx, "t", false),
             Some(TypeAhead::Cycle('v')),
             "after the timeout the buffer restarts"
         );
@@ -586,11 +630,20 @@ mod tests {
     fn repeating_one_letter_keeps_cycling() {
         let ctx = egui::Context::default();
         typed_ctx(&ctx, &['s'], 0.0);
-        assert_eq!(list_type_ahead(&ctx, "t"), Some(TypeAhead::Cycle('s')));
+        assert_eq!(
+            list_type_ahead(&ctx, "t", false),
+            Some(TypeAhead::Cycle('s'))
+        );
         typed_ctx(&ctx, &['s'], 0.05);
-        assert_eq!(list_type_ahead(&ctx, "t"), Some(TypeAhead::Cycle('s')));
+        assert_eq!(
+            list_type_ahead(&ctx, "t", false),
+            Some(TypeAhead::Cycle('s'))
+        );
         typed_ctx(&ctx, &['S'], 0.10);
-        assert_eq!(list_type_ahead(&ctx, "t"), Some(TypeAhead::Cycle('s')));
+        assert_eq!(
+            list_type_ahead(&ctx, "t", false),
+            Some(TypeAhead::Cycle('s'))
+        );
     }
 
     #[test]
@@ -598,11 +651,11 @@ mod tests {
         let ctx = egui::Context::default();
         typed_ctx(&ctx, &['s'], 0.0);
         assert_eq!(
-            list_type_ahead(&ctx, "processes"),
+            list_type_ahead(&ctx, "processes", false),
             Some(TypeAhead::Cycle('s'))
         );
         assert_eq!(
-            list_type_ahead(&ctx, "details"),
+            list_type_ahead(&ctx, "details", false),
             Some(TypeAhead::Cycle('s')),
             "a second list starts its own word from the same keystroke"
         );

@@ -64,9 +64,16 @@ fn set_selected_name(ctx: &egui::Context, name: Option<String>) {
 
 /// Arrow/Home/End/Page selection movement over the displayed rows. The
 /// selection is returned for the caller to store; `None` means "no keyboard
-/// movement this frame" and leaves the current selection alone.
-fn keyboard_selection(ctx: &egui::Context, rows: &[Row], selected: Option<&str>) -> Option<String> {
-    if !search::nav_gate(ctx) {
+/// movement this frame" and leaves the current selection alone. `dialog_open`
+/// (see `TaskManApp::modal_open`) stands the page layer down while a dialog
+/// owns the keyboard.
+fn keyboard_selection(
+    ctx: &egui::Context,
+    rows: &[Row],
+    selected: Option<&str>,
+    dialog_open: bool,
+) -> Option<String> {
+    if !search::nav_gate(ctx, dialog_open) {
         return None;
     }
     let page_rows = tablekit::page_rows(ctx, "apphistory", tablekit::ROW_H).unwrap_or_else(|| {
@@ -75,8 +82,8 @@ fn keyboard_selection(ctx: &egui::Context, rows: &[Row], selected: Option<&str>)
             .max(1.0) as usize
     });
     let current = selected.and_then(|name| rows.iter().position(|r| r.name == name));
-    if let Some(nav) =
-        search::list_nav(ctx).filter(|_| !tablekit::header_has_focus(ctx, "apphistory"))
+    if let Some(nav) = search::list_nav(ctx, dialog_open)
+        .filter(|_| !tablekit::header_has_focus(ctx, "apphistory"))
         && let Some(next) = search::moved_index(rows.len(), current, nav, page_rows)
         && let Some(row) = rows.get(next)
     {
@@ -199,10 +206,14 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
     let avail = crate::widgets::tablekit::table_avail(ui);
     // Arrow/Home/End/Page movement of the visible selection, stored per
     // frame in the page's temp-data key.
-    if let Some(name) = keyboard_selection(ui.ctx(), &rows, selected_name(ui.ctx()).as_deref()) {
+    if let Some(name) = keyboard_selection(
+        ui.ctx(),
+        &rows,
+        selected_name(ui.ctx()).as_deref(),
+        app.modal_open(),
+    ) {
         set_selected_name(ui.ctx(), Some(name));
     }
-    let selected = selected_name(ui.ctx());
     let focus_row = tablekit::take_row_scroll(ui.ctx(), "apphistory").and_then(|key| {
         rows.iter()
             .position(|r| tablekit::stable_key(r.name.as_str()) == key)
@@ -224,10 +235,19 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
                 let Some(row) = rows.get(ri) else {
                     continue;
                 };
-                let is_selected = selected.as_deref() == Some(row.name.as_str());
+                // Read the selection HERE, not from a snapshot taken before
+                // the table ran: the row closure itself stores a click, so
+                // only a live read keeps every already-painted row of this
+                // frame consistent with it.
+                let is_selected = selected_name(ui.ctx()).as_deref() == Some(row.name.as_str());
                 let (rect, resp) = table.row(ui, &pal, is_selected, row.name.as_str());
                 if resp.clicked() {
                     set_selected_name(ui.ctx(), Some(row.name.clone()));
+                    // The row painted its fill BEFORE this frame's click was
+                    // known, so the clicked row would light up one frame late.
+                    // Repaint it now and re-arm the overlay so the heat band
+                    // (painted later in this same row pass) re-applies it.
+                    table.repaint_row_selected(ui, &pal, rect);
                 }
                 table.icon_cell(ui, rect, None, pal.accent);
                 let name_rect = table.col_rect(0, rect);
@@ -283,6 +303,16 @@ pub fn clear_history_dialog(app: &mut TaskManApp, ctx: &egui::Context, pal: &the
     if !app.pending_app_history_clear {
         return;
     }
+    let restore_id = egui::Id::new("apphistory-clear-restore-focus");
+    let first_frame = ctx
+        .data(|d| d.get_temp::<Option<egui::Id>>(restore_id))
+        .is_none();
+    if first_frame {
+        // Remember what held keyboard focus before the dialog took it, so
+        // closing can hand it back.
+        let captured = crate::app_ui::capture_focus(ctx);
+        ctx.data_mut(|d| d.insert_temp(restore_id, captured));
+    }
     let focus_id = egui::Id::new("apphistory-clear-focus-primary");
     let mut open = true;
     let keys = crate::app_ui::consume_dialog_keys(ctx, true);
@@ -321,6 +351,14 @@ pub fn clear_history_dialog(app: &mut TaskManApp, ctx: &egui::Context, pal: &the
     let confirm = matches!(key_decision, Some(crate::app_ui::DialogDecision::Primary))
         || matches!(clicked, crate::app_ui::DialogButtonClick::Primary);
     if cancel || confirm {
+        // Whichever way it resolved, hand keyboard focus back to what held
+        // it before the dialog took it.
+        let saved = ctx
+            .data(|d| d.get_temp::<Option<egui::Id>>(restore_id))
+            .flatten();
+        crate::app_ui::restore_focus(ctx, saved);
+        ctx.data_mut(|d| d.remove_temp::<Option<egui::Id>>(restore_id));
+        ctx.data_mut(|d| d.remove_temp::<bool>(focus_id));
         app.pending_app_history_clear = false;
     }
     if confirm {
@@ -401,17 +439,20 @@ mod tests {
         let ctx = egui::Context::default();
         let rows = nav_rows();
         // No key: no movement, and the existing selection is left alone.
-        assert_eq!(keyboard_selection(&ctx, &rows, None), None);
+        assert_eq!(keyboard_selection(&ctx, &rows, None, false), None);
 
         // From nothing, ArrowDown starts at the first row.
         key_ctx(&ctx, egui::Key::ArrowDown);
-        assert_eq!(keyboard_selection(&ctx, &rows, None).as_deref(), Some("a"));
+        assert_eq!(
+            keyboard_selection(&ctx, &rows, None, false).as_deref(),
+            Some("a")
+        );
         set_selected_name(&ctx, Some("a".to_owned()));
 
         // From "a", ArrowDown moves to "b" and parks the scroll under it.
         key_ctx(&ctx, egui::Key::ArrowDown);
         assert_eq!(
-            keyboard_selection(&ctx, &rows, Some("a")).as_deref(),
+            keyboard_selection(&ctx, &rows, Some("a"), false).as_deref(),
             Some("b")
         );
         assert_eq!(
@@ -425,18 +466,18 @@ mod tests {
         // The first row stays put on ArrowUp; End jumps to the last.
         blank_ctx(&ctx);
         assert_eq!(
-            keyboard_selection(&ctx, &rows, Some("a")).as_deref(),
+            keyboard_selection(&ctx, &rows, Some("a"), false).as_deref(),
             None,
             "no keypress this frame means no movement"
         );
         key_ctx(&ctx, egui::Key::End);
         assert_eq!(
-            keyboard_selection(&ctx, &rows, Some("a")).as_deref(),
+            keyboard_selection(&ctx, &rows, Some("a"), false).as_deref(),
             Some("c")
         );
         key_ctx(&ctx, egui::Key::ArrowUp);
         assert_eq!(
-            keyboard_selection(&ctx, &rows, Some("c")).as_deref(),
+            keyboard_selection(&ctx, &rows, Some("c"), false).as_deref(),
             Some("b")
         );
     }

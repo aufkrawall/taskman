@@ -139,6 +139,13 @@ pub struct State {
 }
 
 impl State {
+    /// Park the one-shot vertical scroll target for `pid` (resolved to a row
+    /// index per frame by the table call). Also the route the global search
+    /// commit uses from `app.rs`, which cannot reach the private field.
+    pub(crate) fn park_scroll_to_pid(&mut self, pid: u32) {
+        self.scroll_to_pid = Some(pid);
+    }
+
     /// TM default: sorted by name ascending, columns in declaration order.
     pub fn new() -> Self {
         Self {
@@ -355,7 +362,10 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
     // word, so "svc" lands on svchost.exe instead of jumping to whatever
     // starts with "c". One letter (or the same letter repeated) still cycles
     // and wraps in the exact flattened/sorted order shown on screen.
-    if let Some(typed) = search::list_type_ahead(ui.ctx(), "processes") {
+    // While a dialog is up it owns the keyboard: the page's nav, type-ahead,
+    // row keys and menu key all stand down (`TaskManApp::modal_open`).
+    let dialog_open = app.modal_open();
+    if let Some(typed) = search::list_type_ahead(ui.ctx(), "processes", dialog_open) {
         let selected = app.selection.primary().map(|p| p.pid);
         let candidates = rows
             .iter()
@@ -383,7 +393,7 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
         }
     }
 
-    handle_keyboard_navigation(app, ui.ctx(), rows);
+    handle_keyboard_navigation(app, ui.ctx(), rows, dialog_open);
 
     let agg = Aggregates::from_snapshot(&snap);
     let logical_aggs = agg.strings();
@@ -486,7 +496,12 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
 /// Arrow/Home/End/Page navigation for the virtualized process model, plus
 /// tree-aware Left/Right behavior. Selection is always an exact identity;
 /// synthetic accounting rows are deliberately skipped.
-fn handle_keyboard_navigation(app: &mut TaskManApp, ctx: &egui::Context, rows: &[DisplayRow]) {
+fn handle_keyboard_navigation(
+    app: &mut TaskManApp,
+    ctx: &egui::Context,
+    rows: &[DisplayRow],
+    dialog_open: bool,
+) {
     let process_rows: Vec<(usize, &RowData)> = rows
         .iter()
         .enumerate()
@@ -526,7 +541,7 @@ fn handle_keyboard_navigation(app: &mut TaskManApp, ctx: &egui::Context, rows: &
     // navigation moves between header widgets; the selection must not also
     // move (see `tablekit::header_has_focus`).
     if let Some(nav) =
-        search::list_nav(ctx).filter(|_| !tablekit::header_has_focus(ctx, "processes"))
+        search::list_nav(ctx, dialog_open).filter(|_| !tablekit::header_has_focus(ctx, "processes"))
         && let Some(next) = search::moved_index(process_rows.len(), selected_pos, nav, page_rows)
         && let Some((_, row)) = process_rows.get(next)
     {
@@ -540,7 +555,7 @@ fn handle_keyboard_navigation(app: &mut TaskManApp, ctx: &egui::Context, rows: &
 
     // Enter/Space belong to the row layer only while nothing else can claim
     // them (a focused widget would activate itself on the same keypress).
-    if search::row_action_gate(ctx) {
+    if search::row_action_gate(ctx, dialog_open) {
         let (space, enter) = ctx.input(|i| {
             (
                 i.key_pressed(egui::Key::Space),
@@ -566,7 +581,7 @@ fn handle_keyboard_navigation(app: &mut TaskManApp, ctx: &egui::Context, rows: &
         }
     }
 
-    if !search::nav_gate(ctx) || tablekit::header_has_focus(ctx, "processes") {
+    if !search::nav_gate(ctx, dialog_open) || tablekit::header_has_focus(ctx, "processes") {
         return;
     }
     let (left, right) = ctx.input(|i| {
@@ -803,6 +818,34 @@ pub(crate) fn termination_targets_for_selection(
             .filter(|identity| !matched.contains(identity)),
     );
     resolve_termination_targets(app, represented)
+}
+
+/// The process the global search commits to: the FIRST selectable row of the
+/// table's current display model — the same filtered, flattened, sorted order
+/// the type-ahead walk uses — so Enter lands on exactly the row type-ahead's
+/// first match would be, whatever the live sort. The display model is rebuilt
+/// here (`build_display_rows` already applies the search query), which is what
+/// keeps this helper the single source of truth alongside the table. Pure over
+/// snapshot + state so it is testable without a window.
+pub(crate) fn first_search_match_in_display_order(
+    snap: &Snapshot,
+    raw_search: &str,
+    state: &State,
+) -> Option<crate::app::ProcessIdentity> {
+    let rows = build_display_rows(
+        snap,
+        raw_search,
+        state.sort_col,
+        state.ascending,
+        &state.expanded,
+        &state.group_collapsed,
+    );
+    rows.iter().find_map(|row| match row {
+        DisplayRow::Process(row) if row_is_selectable(row, &state.expanded) => {
+            Some(identity_of(row))
+        }
+        _ => None,
+    })
 }
 
 /// Every selectable row as an identity, in display order — the order a
@@ -1051,9 +1094,12 @@ fn row_ui(
     if !row.synthetic {
         // The Menu key (or Shift+F10) opens the menu of the current
         // selection, anchored to its row — the keyboard counterpart of a
-        // right click. Skipped while a popup is already open: re-arming
-        // underneath it would only fight the open menu.
-        let keyboard_open = !ui.ctx().any_popup_open()
+        // right click. Skipped while a popup is already open (re-arming
+        // underneath it would only fight the open menu) and while any dialog
+        // is up (a menu opening over a dialog would strand there once the
+        // dialog contract consumes Escape).
+        let keyboard_open = !app.modal_open()
+            && !ui.ctx().any_popup_open()
             && menu::keyboard_menu_requested(ui.ctx())
             && selectable
             && app.selection.primary().is_some_and(|primary| {
@@ -2619,6 +2665,58 @@ fn cmp_ignore_case(a: &str, b: &str) -> std::cmp::Ordering {
             (Some(_), None) => return std::cmp::Ordering::Greater,
         }
     }
+}
+
+/// The global search commit must land on the FIRST row of the CURRENT
+/// display model — the same order the type-ahead walk uses — not on a
+/// display-name mirror that ignores the user's live sort.
+#[test]
+fn search_commit_picks_the_first_display_order_match() {
+    let mut rows = Vec::new();
+    for (pid, name) in [
+        (30u32, "alpha.exe"),
+        (10, "aaa-svc.exe"),
+        (20, "zzz-svc.exe"),
+    ] {
+        let mut p = ProcessEntry::new(pid, name);
+        p.start_epoch_s = Some(1000 + i64::from(pid));
+        p.synthetic = false;
+        rows.push(p);
+    }
+    let synthetic = {
+        let mut p = ProcessEntry::new(5, "zzz-svc.exe");
+        p.synthetic = true;
+        p
+    };
+    rows.push(synthetic);
+    let snap = tm_core::model::Snapshot {
+        processes: rows,
+        ..Default::default()
+    };
+
+    // Name ascending: aaa-svc.exe heads the table.
+    let state = State::new();
+    let hit = first_search_match_in_display_order(&snap, "svc", &state);
+    assert_eq!(hit.map(|p| p.pid), Some(10));
+
+    // Same query, live sort flipped: zzz-svc.exe now heads the table, and
+    // the commit must follow the table, not a name-order mirror of it.
+    let state = State {
+        sort_col: 0,
+        ascending: false,
+        ..State::new()
+    };
+    let hit = first_search_match_in_display_order(&snap, "svc", &state);
+    assert_eq!(
+        hit.map(|p| p.pid),
+        Some(20),
+        "descending name: the zzz row leads the table"
+    );
+    // The synthetic pseudo-row is never a target in either direction.
+    assert_ne!(
+        first_search_match_in_display_order(&snap, "svc", &State::new()).map(|p| p.pid),
+        Some(5)
+    );
 }
 
 #[cfg(test)]

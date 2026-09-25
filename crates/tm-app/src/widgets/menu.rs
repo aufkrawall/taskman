@@ -73,6 +73,8 @@ pub fn dropdown_menu(resp: &Response, add: impl FnOnce(&mut Ui)) {
         popup
     };
     popup.style(style).show(add);
+    // Same stale-handoff hygiene as the row context menus.
+    drop_stale_kb_handoff(&resp.ctx);
 }
 
 /// True for the one frame on which the user asked for the context menu of
@@ -99,6 +101,36 @@ pub fn keyboard_menu_requested(ctx: &egui::Context) -> bool {
 /// entry from handing focus to whatever menu opens later.
 const KB_INITIAL_FOCUS: &str = "tm-menu-kb-initial-focus";
 
+/// The temp-data key of a pending first-entry focus handoff (see
+/// [`KB_INITIAL_FOCUS`]).
+fn kb_initial_focus_key() -> egui::Id {
+    egui::Id::new(KB_INITIAL_FOCUS)
+}
+
+/// Drop a pending handoff whose owning popup is gone. Both root menus
+/// (`context_menu_kb`/`dropdown_menu`/`menu_button`) and keyboard-opened
+/// submenus (`submenu`) park a POPUP id there; the root cleanup originally
+/// compared against its own popup id only, so a submenu opened from the
+/// keyboard whose entries were all disabled left a pending handoff behind —
+/// and a later purely-mouse open of that submenu auto-focused its first
+/// entry. Checking `is_id_open` on the PENDING id itself covers both levels
+/// and runs even on frames where the menus no longer render their content.
+fn drop_stale_kb_handoff(ctx: &egui::Context) {
+    let key = kb_initial_focus_key();
+    if ctx.data(|d| d.get_temp::<egui::Id>(key)).is_none() {
+        return;
+    }
+    // egui tracks ONE open popup per viewport — the ROOT of the menu tree —
+    // so a pending SUBMENU id is never the popup `is_id_open` would report,
+    // and a root-only check would drop a live submenu handoff the very next
+    // frame. A handoff is stale exactly when NO menu is open any more: while
+    // the tree is up its own entries consume the pending id, and once the
+    // tree is gone nothing can ever claim it again.
+    if !ctx.any_popup_open() {
+        ctx.data_mut(|d| d.remove::<egui::Id>(key));
+    }
+}
+
 /// Context menu that also opens from the keyboard: when `keyboard_open` is
 /// set (the row is the current selection and [`keyboard_menu_requested`]
 /// fired this frame), the same popup is forced open, anchored to the row —
@@ -120,15 +152,9 @@ pub fn context_menu_kb(resp: &Response, keyboard_open: bool, add: impl FnOnce(&m
         popup
     };
     popup.style(style).show(add);
-    // Once this menu is gone, a request nothing consumed (every entry was
-    // greyed out) must not outlive it.
-    let pending = resp
-        .ctx
-        .data(|d| d.get_temp::<egui::Id>(egui::Id::new(KB_INITIAL_FOCUS)));
-    if pending == Some(popup_id) && !egui::Popup::is_id_open(&resp.ctx, popup_id) {
-        resp.ctx
-            .data_mut(|d| d.remove::<egui::Id>(egui::Id::new(KB_INITIAL_FOCUS)));
-    }
+    // Once this menu is gone, a handoff nothing consumed (every entry was
+    // greyed out — root OR submenu) must not outlive it.
+    drop_stale_kb_handoff(&resp.ctx);
 }
 
 /// A drop-down button in the app chrome that opens a menu in the same style.
@@ -137,10 +163,13 @@ pub fn menu_button(
     button: egui::Button<'_>,
     content: impl FnOnce(&mut Ui),
 ) -> Response {
-    egui::containers::menu::MenuButton::from_button(button)
+    let response = egui::containers::menu::MenuButton::from_button(button)
         .config(egui::containers::menu::MenuConfig::new().style(style))
         .ui(ui, content)
-        .0
+        .0;
+    // Same stale-handoff hygiene as the row context menus.
+    drop_stale_kb_handoff(ui.ctx());
+    response
 }
 
 /// What an entry draws besides its label.
@@ -186,7 +215,7 @@ fn entry(ui: &mut Ui, text: &str, marks: Marks) -> Response {
     // pass where no entry is enabled yet, so the request lives in memory until
     // the frame it can actually be consumed.
     if enabled {
-        let key = egui::Id::new(KB_INITIAL_FOCUS);
+        let key = kb_initial_focus_key();
         let pending = ui.ctx().data(|d| d.get_temp::<egui::Id>(key));
         if pending == Some(ui.layer_id().id) {
             ui.ctx().data_mut(|d| d.remove::<egui::Id>(key));
@@ -194,9 +223,12 @@ fn entry(ui: &mut Ui, text: &str, marks: Marks) -> Response {
         }
     }
 
-    // Inside a menu popup, Tab belongs to the UI behind the menu: close the
-    // popup and let egui's focus traversal proceed (popups are not modal, and
-    // a Tab that silently strands an open menu reads as a dead key). Shift+Tab
+    // Inside a menu popup, Tab closes the popup instead of stranding an open
+    // menu behind the focus. Focus itself lands NOWHERE: the focused entry
+    // disappears with the popup, so egui's dead-man switch (`Memory::
+    // end_pass` drops a focused widget that was not painted) clears it, and
+    // Tab traversal restarts from the top on the NEXT Tab press — which is
+    // exactly the behavior when Tab is pressed in a native menu. Shift+Tab
     // closes too — `key_pressed` ignores modifiers.
     if egui::containers::menu::is_in_menu(ui) && ui.input(|input| input.key_pressed(egui::Key::Tab))
     {
@@ -207,9 +239,12 @@ fn entry(ui: &mut Ui, text: &str, marks: Marks) -> Response {
     // otherwise jump OUT of the popup at whatever widget happens to lie to the
     // side. `submenu` turns ArrowRight into "open this submenu" and ArrowLeft
     // into "close it again"; this filter makes egui's focus system ignore bare
-    // horizontal arrows while a menu entry is focused. It must be installed
-    // while the widget already holds focus, so it takes effect the frame after
-    // focus lands.
+    // horizontal arrows while a menu entry is focused. The vendor's
+    // `Memory::set_focus_lock_filter` only STICKS when the widget held focus
+    // LAST frame too (`had_focus_last_frame`), so this call is a no-op on the
+    // very frame the handoff lands focus and the filter takes effect from the
+    // frame AFTER focus landed — one frame of spatial-arrow gap, which is
+    // what the "focus applies from the next frame" tests above pin.
     if enabled && resp.has_focus() {
         ui.ctx().memory_mut(|mem| {
             mem.set_focus_lock_filter(
@@ -403,7 +438,7 @@ pub fn submenu(ui: &mut Ui, text: &str, content: impl FnOnce(&mut Ui)) -> Respon
             // popup that renders this very frame.
             egui::containers::menu::MenuState::mark_shown(ui.ctx(), sub_id);
             ui.ctx()
-                .data_mut(|d| d.insert_temp(egui::Id::new(KB_INITIAL_FOCUS), sub_id));
+                .data_mut(|d| d.insert_temp(kb_initial_focus_key(), sub_id));
         }
         if ui.input(|input| input.key_pressed(egui::Key::ArrowLeft)) {
             let focused_inside = open
@@ -421,6 +456,10 @@ pub fn submenu(ui: &mut Ui, text: &str, content: impl FnOnce(&mut Ui)) -> Respon
         }
     }
     egui::containers::menu::SubMenu::new().show(ui, &resp, content);
+    // Mirror the root-level cleanup for the submenu's own handoff: when the
+    // submenu (or the whole menu tree) closed, a pending id nothing consumed
+    // must not survive it.
+    drop_stale_kb_handoff(ui.ctx());
     resp
 }
 

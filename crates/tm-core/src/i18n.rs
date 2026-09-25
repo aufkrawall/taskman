@@ -857,6 +857,20 @@ keys! {
         "Zeile in die Auswahl aufnehmen oder entfernen",
         "Add or remove the row from the selection",
     ],
+    HelpExtendSelection => [
+        "Markierung bis zur Zeile erweitern",
+        "Extend the selection to the row",
+    ],
+    HelpSelectAll => ["Alle Prozesse auswählen", "Select all processes"],
+    HelpPageSelection => [
+        "Auswahl seitenweise bewegen",
+        "Move the selection by a page",
+    ],
+    KeyPageKeys => ["Bild auf / Bild ab", "PgUp / PgDn"],
+    HelpResizeColumn => [
+        "Fokussierte Spaltengrenze verschieben (Umschalt: 32 px statt 8 px)",
+        "Resize a focused column (Shift: 32 px instead of 8 px)",
+    ],
     HelpTabGeneral => [
         "Zwischen Steuerelementen wechseln",
         "Move between controls",

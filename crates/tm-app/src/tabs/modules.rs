@@ -443,7 +443,14 @@ pub fn dialog(app: &mut TaskManApp, ctx: &egui::Context, pal: &theme::Palette) {
                 }
                 LoadState::Ready(modules) => {
                     let rows = visible_modules(&state, modules);
-                    let typed = search::list_type_ahead(ctx, "modules");
+                    // The inspector IS the dialog here: `app.modal_open()` runs
+                    // while `module_dialog` is taken, so it stays false for the
+                    // inspector itself — this list nav and type-ahead are the
+                    // dialog's own keyboard layer. The only thing to stand
+                    // down for is the unload confirmation, a separate modal
+                    // on top.
+                    let dialog_open = app.modal_open() || state.pending_unload.is_some();
+                    let typed = search::list_type_ahead(ctx, "modules", dialog_open);
                     if let Some(typed) = typed
                         && let Some(base) = search::type_ahead_match(
                             rows.iter()
@@ -456,7 +463,7 @@ pub fn dialog(app: &mut TaskManApp, ctx: &egui::Context, pal: &theme::Palette) {
                         state.selected_base = Some(base);
                         state.scroll_to_base = Some(base);
                     }
-                    if let Some(nav) = search::list_nav(ctx) {
+                    if let Some(nav) = search::list_nav(ctx, dialog_open) {
                         let current = state.selected_base.and_then(|base| {
                             rows.iter().position(|module| module.base_address == base)
                         });
@@ -546,7 +553,11 @@ pub fn dialog(app: &mut TaskManApp, ctx: &egui::Context, pal: &theme::Palette) {
                                 if response.clicked() || response.secondary_clicked() {
                                     state.selected_base = Some(module.base_address);
                                 }
-                                let keyboard_open = menu::keyboard_menu_requested(ui.ctx())
+                                // While the unload confirmation is up, a row
+                                // menu opened by the Menu key would strand
+                                // over it; right-click keeps working.
+                                let keyboard_open = !dialog_open
+                                    && menu::keyboard_menu_requested(ui.ctx())
                                     && state.selected_base == Some(module.base_address);
                                 menu::context_menu_kb(&response, keyboard_open, |ui| {
                                     if menu::item(ui, i18n::tr(K::CopyPath)).clicked() {
@@ -699,6 +710,11 @@ pub fn dialog(app: &mut TaskManApp, ctx: &egui::Context, pal: &theme::Palette) {
             .flatten();
         crate::app_ui::restore_focus(ctx, saved);
         ctx.data_mut(|d| d.remove_temp::<Option<egui::Id>>(restore_id));
+        // An X on the inspector closes it while the unload confirmation may
+        // still be parked without a decision; its restore temp must not
+        // outlive the dialog, or the next confirmation would restore a stale
+        // widget instead of capturing its own opener.
+        ctx.data_mut(|d| d.remove_temp::<Option<egui::Id>>(confirm_restore_id));
     }
 }
 

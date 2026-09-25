@@ -136,12 +136,9 @@ pub fn top_search_panel(app: &mut TaskManApp, ui_root: &mut egui::Ui, pal: &Pale
             // the keyboard back — egui's singleline text edit surrenders
             // focus on Enter by itself — so the next Arrow key moves the
             // table selection instead of the caret.
-            if edit.lost_focus()
-                && ui.input(|i| i.key_pressed(egui::Key::Enter))
-                && !app.modal_open()
-            {
-                app.commit_search_selection();
-            }
+            commit_search_on_enter(ui.ctx(), edit.lost_focus(), app.modal_open(), || {
+                app.commit_search_selection(ui.ctx());
+            });
 
             // A click anywhere outside the field hands the keyboard back:
             // the user taps a row and the next Arrow key must move the
@@ -516,6 +513,29 @@ pub fn ellipsis_menu(
             items(app, ui);
         },
     );
+}
+
+/// Commit the global search on Enter and CONSUME the keystroke: exactly one
+/// handler may win the frame. The singleline text edit surrenders focus
+/// during its own pass, so later in the SAME frame the tables' row-action
+/// gate — which yields to nothing focused and no popup — sees the same Enter
+/// still queued and would fire the row action (e.g. Processes
+/// "Go to details") on top of the commit. Consuming here is what keeps the
+/// commit keystroke single-purpose. While a dialog is up the commit stands
+/// down and the keystroke stays queued for the dialog's own contract.
+/// Split out from the search panel so the contract is testable headlessly.
+fn commit_search_on_enter(
+    ctx: &egui::Context,
+    edit_lost_focus: bool,
+    dialog_open: bool,
+    commit: impl FnOnce(),
+) -> bool {
+    if !(edit_lost_focus && ctx.input(|i| i.key_pressed(egui::Key::Enter)) && !dialog_open) {
+        return false;
+    }
+    commit();
+    ctx.input_mut(|i| i.consume_key(Default::default(), egui::Key::Enter));
+    true
 }
 
 // ---------------------------------------------------------------- dialogs
@@ -1698,6 +1718,13 @@ fn shortcut_rows(lang: i18n::Lang) -> Vec<(String, &'static str)> {
             tr(K::HelpContextMenu),
         ),
         (tr(K::KeyArrows).to_owned(), tr(K::HelpMoveSelection)),
+        (
+            format!("{shift}+{}", tr(K::KeyArrows)),
+            tr(K::HelpExtendSelection),
+        ),
+        (format!("{ctrl}+A"), tr(K::HelpSelectAll)),
+        (tr(K::KeyPageKeys).to_owned(), tr(K::HelpPageSelection)),
+        (tr(K::KeyArrows).to_owned(), tr(K::HelpResizeColumn)),
         (tr(K::KeyEnter).to_owned(), tr(K::HelpRowAction)),
         (tr(K::KeySpace).to_owned(), tr(K::HelpToggleSelect)),
         (tr(K::KeyTabKey).to_owned(), tr(K::HelpTabGeneral)),
@@ -1890,10 +1917,9 @@ pub fn dialog_button_row(
 /// if another widget may hold focus when the dialog opens, anchor focus in the
 /// dialog body instead. [`dialog_key_decision`] keeps resolving Escape and an
 /// unfocused/disabled Enter to the safe action.
-// Wired up by the details-tab dialogs (e.g. the affinity confirmation) in the
-// dialogs-area merge; the two-button destructive confirms deliberately keep
-// the pinned [`dialog_button_row`] until then.
-#[allow(dead_code)]
+// Wired up by the details-tab dialogs (the affinity confirmation is on this
+// contract); the two-button destructive confirms deliberately keep the pinned
+// [`dialog_button_row`], whose app-side focus flag is the keyboard trap.
 pub fn dialog_button_row_mirror(
     ui: &mut egui::Ui,
     ctx: &egui::Context,
@@ -1970,6 +1996,91 @@ mod tests {
     use super::*;
     use std::time::{Duration, Instant};
 
+    /// Regression (search-commit seam): the Enter that commits the global
+    /// search must be CONSUMED. The singleline edit surrenders focus during
+    /// its own pass, so the tables' row-action gate — which only yields to
+    /// focused widgets and popups — sees the same Enter later in the frame
+    /// and would fire the row action (e.g. Processes "Go to details") on top
+    /// of the commit. While a dialog is up the commit stands down instead and
+    /// leaves the keystroke for the dialog's own contract.
+    #[test]
+    fn committing_the_search_consumes_the_enter_keystroke() {
+        let ctx = egui::Context::default();
+        let screen = Rect::from_min_size(Pos2::ZERO, egui::vec2(800.0, 600.0));
+        let enter_frame = |ctx: &egui::Context, dialog_open: bool, text: &mut String| {
+            let enter = egui::Event::Key {
+                key: egui::Key::Enter,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            };
+            let raw = egui::RawInput {
+                screen_rect: Some(screen),
+                events: vec![enter],
+                focused: true,
+                ..Default::default()
+            };
+            let mut committed = false;
+            let mut row_layer_saw_enter = false;
+            let mut out = ctx.run_ui(raw, |ui| {
+                let edit = ui.text_edit_singleline(text);
+                let ran = commit_search_on_enter(ui.ctx(), edit.lost_focus(), dialog_open, || {
+                    committed = true
+                });
+                // The same-frame row-action layer, exactly what the tables do.
+                row_layer_saw_enter = crate::search::row_action_gate(ui.ctx(), false)
+                    && ui.ctx().input(|i| i.key_pressed(egui::Key::Enter));
+                assert_eq!(
+                    ran, committed,
+                    "the helper's verdict must match the commit it ran"
+                );
+            });
+            out.textures_delta.clear();
+            (committed, row_layer_saw_enter)
+        };
+
+        // Frame 1: the search field holds keyboard focus.
+        let mut text = String::new();
+        let raw = egui::RawInput {
+            screen_rect: Some(screen),
+            focused: true,
+            ..Default::default()
+        };
+        let mut out = ctx.run_ui(raw, |ui| {
+            ui.text_edit_singleline(&mut text).request_focus();
+        });
+        out.textures_delta.clear();
+
+        // Frame 2: Enter commits — and must not leak to the row layer.
+        let (committed, row_layer_saw_enter) = enter_frame(&ctx, false, &mut text);
+        assert!(committed, "Enter on the focused search field commits");
+        assert!(
+            !row_layer_saw_enter,
+            "the commit keystroke must not reach the row-action layer"
+        );
+
+        // Frame 3: while a dialog is up, the commit stands down and the
+        // keystroke stays queued for the dialog's contract. The field does
+        // not hold focus anymore, so the helper reports nothing either way —
+        // park focus first to keep the premise of the probe intact.
+        let raw = egui::RawInput {
+            screen_rect: Some(screen),
+            focused: true,
+            ..Default::default()
+        };
+        let mut out = ctx.run_ui(raw, |ui| {
+            ui.text_edit_singleline(&mut text).request_focus();
+        });
+        out.textures_delta.clear();
+        let (committed, row_layer_saw_enter) = enter_frame(&ctx, true, &mut text);
+        assert!(!committed, "a dialog owns the keyboard: no commit");
+        assert!(
+            row_layer_saw_enter,
+            "the unconsumed keystroke stays with the dialog contract"
+        );
+    }
+
     /// The search field gives the keyboard back exactly when a click lands
     /// outside its box: a click on a row (or on dead window space) must let
     /// the next Arrow key move the table selection, while a click inside the
@@ -2003,14 +2114,14 @@ mod tests {
     fn help_overlay_rows_are_complete_and_localized() {
         for lang in [i18n::Lang::De, i18n::Lang::En] {
             let rows = shortcut_rows(lang);
-            assert_eq!(rows.len(), 13, "{lang:?}: every documented shortcut");
+            assert_eq!(rows.len(), 17, "{lang:?}: every documented shortcut");
             assert!(
                 rows.iter()
                     .all(|(combo, text)| !combo.trim().is_empty() && !text.trim().is_empty()),
                 "{lang:?}: no empty combo or description"
             );
             assert_eq!(rows[0].0, "F5");
-            assert_eq!(rows[12].0, "F1");
+            assert_eq!(rows[16].0, "F1");
             let expected_ctrl = i18n::tr_in(lang, K::KeyCtrl);
             assert_eq!(
                 rows[1].0,

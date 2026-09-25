@@ -353,10 +353,13 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
             .map_or_else(|| "cpu".into(), |e| e.key.clone());
     }
 
+    // While a dialog is up it owns the keyboard: card selection, type-ahead
+    // and arrow keys all stand down (`TaskManApp::modal_open`).
+    let dialog_open = app.modal_open();
     // Task-Manager-style type navigation over the resource cards: a plain
     // letter selects the next card whose title begins with it, and the card
     // column scrolls vertically to keep it in view.
-    if let Some(typed) = search::list_type_ahead(ui.ctx(), "performance") {
+    if let Some(typed) = search::list_type_ahead(ui.ctx(), "performance", dialog_open) {
         let selected = Some(app.perf_selected_key.clone());
         let candidates = entries
             .iter()
@@ -374,7 +377,7 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
     // build_resource_list order the type-ahead walks. The card list is not
     // virtualized, so the one-shot `perf_jump_to` + `scroll_to_me` route is
     // the safe scroll path here.
-    if let Some(nav) = search::list_nav(ui.ctx()) {
+    if let Some(nav) = search::list_nav(ui.ctx(), dialog_open) {
         let current = entries.iter().position(|e| e.key == app.perf_selected_key);
         // A page is the card column's visible span: 64 px cards plus the
         // item spacing between them.
@@ -487,7 +490,12 @@ fn card_ui(
     samples: &[f64],
 ) {
     let size = egui::vec2(ui.available_width(), CARD_H);
-    let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::click());
+    // Click-sense WITHOUT the focusable bit (same model as the tablekit
+    // rows): the visible selection is the only indicator, and egui's spatial
+    // navigation must not drift keyboard focus onto the card column — a
+    // focused card would eat the app's arrow navigation and show a dead
+    // surface with no ring of its own. Tooltips and clicks are unchanged.
+    let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::CLICK);
     // Selected and hovered cards are lifted onto `card_bg`; the mini graph
     // inside then has to sink to keep a visible cell of its own, or it merges
     // with the card it sits on.

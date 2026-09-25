@@ -1168,6 +1168,18 @@ impl TmTable {
         (rect, resp)
     }
 
+    /// Re-apply the SELECTED fill for the row that was just painted. A click's
+    /// response arrives only AFTER [`Self::row`] chose the fill from the
+    /// pre-click selection, so the freshly clicked row would otherwise light
+    /// up one frame late. Paints the selection fill over the row again and
+    /// re-arms the overlay so [`Self::heat_cells`] re-applies it over the
+    /// numeric band it paints later in the same row pass.
+    pub fn repaint_row_selected(&self, ui: &egui::Ui, pal: &Palette, rect: Rect) {
+        let fill = pal.accent.gamma_multiply(0.22);
+        ui.painter_at(rect.expand(2.0)).rect_filled(rect, 0.0, fill);
+        self.row_overlay.set(Some(fill));
+    }
+
     /// Left-aligned text cell. The painter is clipped to this exact cell so
     /// long values can never bleed into the neighbouring column.
     /// Paint a left-aligned text cell clipped to its column. Returns whether

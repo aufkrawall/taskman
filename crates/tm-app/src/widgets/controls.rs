@@ -50,7 +50,18 @@ pub fn checkbox_enabled(
         BOX + spacing + text_w
     };
     let h = BOX.max(ui.spacing().interact_size.y);
-    let (rect, mut resp) = ui.allocate_exact_size(Vec2::new(w, h), Sense::click());
+    // A DISABLED checkbox must not stay in the Tab order as a dead stop: it
+    // keeps the hover sense only (same precedent as `icon_button`), while an
+    // enabled one stays click-sensed and keyboard-focusable so Tab reaches it
+    // and Space toggles it.
+    let (rect, mut resp) = ui.allocate_exact_size(
+        Vec2::new(w, h),
+        if enabled {
+            Sense::click()
+        } else {
+            Sense::hover()
+        },
+    );
 
     let box_rect = Rect::from_center_size(
         Pos2::new(rect.left() + BOX / 2.0, rect.center().y),
@@ -173,6 +184,17 @@ pub fn icon_button(
     if active {
         ui.painter()
             .rect_filled(rect, 3.0, Color32::from_white_alpha(12));
+    }
+    // Keyboard focus needs a visible ring like every other hand-painted
+    // control: egui paints none for a raw allocation, so a focused chevron
+    // would be an invisible Tab stop.
+    if enabled && resp.has_focus() {
+        ui.painter().rect_stroke(
+            rect.expand(2.0),
+            6.0,
+            Stroke::new(1.5, pal.accent),
+            egui::StrokeKind::Outside,
+        );
     }
     let color = if !enabled {
         pal.text_dim.gamma_multiply(0.45)

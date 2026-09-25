@@ -24,6 +24,37 @@ fn columns() -> Vec<TmColumn> {
     ]
 }
 
+/// The candidate fields the Services page matches the global search against —
+/// name, display name, description, group and pid. The ONE predicate the
+/// visible table and the search commit both use, so Enter can never land on
+/// a row the table would not show.
+pub(crate) fn matches_search(q: &search::Query, s: &ServiceInfo) -> bool {
+    let pid = s.pid.map(|pid| pid.to_string()).unwrap_or_default();
+    q.matches_any([
+        s.name.as_str(),
+        s.display_name.as_str(),
+        s.description.as_str(),
+        s.group.as_str(),
+        pid.as_str(),
+    ])
+}
+
+/// The service the global search commits to: the FIRST row of the table's
+/// current model — filtered by `q`, sorted by the live `sort` — i.e. exactly
+/// the row the user sees at the top of the matches. Returns the service NAME
+/// (the row-owner key the page selects by). Split out so the commit in
+/// `app.rs` reuses this module's row model instead of keeping a sort-order
+/// mirror of it in sync.
+pub(crate) fn first_search_match_in_display_order(
+    items: &[ServiceInfo],
+    q: &search::Query,
+    sort: tablekit::SortState,
+) -> Option<String> {
+    let mut rows: Vec<&ServiceInfo> = items.iter().filter(|s| matches_search(q, s)).collect();
+    rows.sort_by(|a, b| compare_services(a, b, sort));
+    rows.first().map(|s| s.name.clone())
+}
+
 pub struct Cache {
     pub items: Vec<ServiceInfo>,
     pub fetched: Instant,
@@ -168,35 +199,25 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
     };
 
     let q = crate::search::Query::new(&app.search);
-    let mut rows: Vec<&ServiceInfo> = c
-        .items
-        .iter()
-        .filter(|s| {
-            let pid = s.pid.map(|pid| pid.to_string()).unwrap_or_default();
-            q.matches_any([
-                s.name.as_str(),
-                s.display_name.as_str(),
-                s.description.as_str(),
-                s.group.as_str(),
-                pid.as_str(),
-            ])
-        })
-        .collect();
+    let mut rows: Vec<&ServiceInfo> = c.items.iter().filter(|s| matches_search(&q, s)).collect();
     let sort = app.services_sort;
     rows.sort_by(|a, b| compare_services(a, b, sort));
 
+    // While a dialog is up it owns the keyboard: the page's nav, row keys and
+    // menu key all stand down (`TaskManApp::modal_open`).
+    let dialog_open = app.modal_open();
     // Arrow/Home/End/Page selection movement over the displayed services.
     // The service NAME is the row-owner key: the one-shot scroll request is
     // parked under that identity and resolved to a row index per frame, so a
     // re-sorted list can never hand the scroll to the wrong row.
-    if search::nav_gate(&frame_ctx) {
+    if search::nav_gate(&frame_ctx, dialog_open) {
         let page_rows = tablekit::page_rows(&frame_ctx, "services", tablekit::ROW_H_DENSE)
             .unwrap_or_else(|| {
                 (frame_ctx.content_rect().height() / tablekit::ROW_H_DENSE)
                     .floor()
                     .max(1.0) as usize
             });
-        if let Some(nav) = search::list_nav(&frame_ctx)
+        if let Some(nav) = search::list_nav(&frame_ctx, dialog_open)
             .filter(|_| !tablekit::header_has_focus(&frame_ctx, "services"))
             && let Some(next) =
                 next_selected_name(&rows, app.services_selected_name.as_deref(), nav, page_rows)
@@ -296,13 +317,16 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
                 }
                 // Enter (with nothing else holding focus) opens the same menu
                 // as the Menu key — there is no clearer primary action on a
-                // service row than its Start/Stop/Restart command list.
+                // service row than its Start/Stop/Restart command list. Both
+                // stay dead while a dialog is up: a menu opened over a dialog
+                // would strand there once the dialog contract consumes Escape.
                 let selected_row = app.services_selected_name.as_deref() == Some(s.name.as_str());
-                let enter_open = crate::search::row_action_gate(ui.ctx())
+                let enter_open = crate::search::row_action_gate(ui.ctx(), app.modal_open())
                     && ui.ctx().input(|i| i.key_pressed(egui::Key::Enter))
                     && selected_row;
                 let keyboard_open = (enter_open
                     || (!ui.ctx().any_popup_open() && menu::keyboard_menu_requested(ui.ctx())))
+                    && !app.modal_open()
                     && selected_row;
                 menu::context_menu_kb(&resp, keyboard_open, |ui| {
                     ui.set_min_width(170.0);
@@ -524,6 +548,16 @@ pub fn control_confirm_dialog(app: &mut TaskManApp, ctx: &egui::Context, pal: &t
         tm_platform::actions::ServiceAction::Start => String::new(),
     };
 
+    let restore_id = egui::Id::new("svc-confirm-restore-focus");
+    let first_frame = ctx
+        .data(|d| d.get_temp::<Option<egui::Id>>(restore_id))
+        .is_none();
+    if first_frame {
+        // Remember what held keyboard focus before the dialog took it, so
+        // closing can hand it back.
+        let captured = crate::app_ui::capture_focus(ctx);
+        ctx.data_mut(|d| d.insert_temp(restore_id, captured));
+    }
     let focus_id = egui::Id::new("svc-confirm-focus-primary");
     let mut open = true;
     let keys = crate::app_ui::consume_dialog_keys(ctx, true);
@@ -562,12 +596,65 @@ pub fn control_confirm_dialog(app: &mut TaskManApp, ctx: &egui::Context, pal: &t
     let confirm = matches!(key_decision, Some(crate::app_ui::DialogDecision::Primary))
         || matches!(clicked, crate::app_ui::DialogButtonClick::Primary);
     if cancel || confirm {
+        // Whichever way it resolved, hand keyboard focus back to what held
+        // it before the dialog took it.
+        let saved = ctx
+            .data(|d| d.get_temp::<Option<egui::Id>>(restore_id))
+            .flatten();
+        crate::app_ui::restore_focus(ctx, saved);
+        ctx.data_mut(|d| d.remove_temp::<Option<egui::Id>>(restore_id));
+        ctx.data_mut(|d| d.remove_temp::<bool>(focus_id));
         app.pending_service_control = None;
     }
     if confirm {
         app.services_selected_name = Some(name);
         dispatch_control(app, ctx, action);
     }
+}
+
+/// The commit must mirror the VISIBLE table: same filter fields, same live
+/// sort — the old app-side mirror filtered identically but sorted by name
+/// alone, so a user-chosen sort made Enter land somewhere the user was not
+/// looking.
+#[test]
+fn search_commit_follows_the_live_sort() {
+    let items = vec![
+        ServiceInfo {
+            name: "DnsCache".into(),
+            pid: Some(10),
+            ..Default::default()
+        },
+        ServiceInfo {
+            name: "Bfe".into(),
+            pid: Some(9),
+            ..Default::default()
+        },
+    ];
+    let q = crate::search::Query::new("e");
+    assert!(matches_search(&q, &items[0]), "matches the name");
+    assert!(matches_search(&q, &items[1]));
+
+    // Name ascending: Bfe sorts ahead of DnsCache.
+    assert_eq!(
+        first_search_match_in_display_order(&items, &q, tablekit::SortState::new(0, true))
+            .as_deref(),
+        Some("Bfe")
+    );
+    // Same query, name descending: DnsCache now sits in the first visible row.
+    assert_eq!(
+        first_search_match_in_display_order(&items, &q, tablekit::SortState::new(0, false))
+            .as_deref(),
+        Some("DnsCache")
+    );
+    assert_eq!(
+        first_search_match_in_display_order(
+            &items,
+            &crate::search::Query::new("none"),
+            tablekit::SortState::new(0, true)
+        ),
+        None,
+        "no match, no commit"
+    );
 }
 
 #[cfg(test)]

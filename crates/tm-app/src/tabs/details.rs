@@ -1107,10 +1107,13 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
 
     // Native-style type navigation follows the current filtered/sorted list,
     // accumulates fast keystrokes into one word, cycles repeated initials,
-    // and scrolls the virtual row into view. Parked while the select-columns
-    // dialog owns the page: its keys must not move the list underneath it.
-    if !app.details_state.select_columns_open {
-        if let Some(typed) = search::list_type_ahead(ui.ctx(), "details") {
+    // and scrolls the virtual row into view. While a dialog is up it owns
+    // the keyboard: the page's nav, type-ahead, row keys and menu key all
+    // stand down (`TaskManApp::modal_open`, which also parks the local
+    // select-columns dialog).
+    let dialog_open = app.modal_open();
+    if !dialog_open {
+        if let Some(typed) = search::list_type_ahead(ui.ctx(), "details", dialog_open) {
             let selected = app.selection.primary().map(|p| p.pid);
             let candidates = rows
                 .iter()
@@ -1123,7 +1126,7 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
             }
         }
 
-        handle_keyboard_navigation(app, ui.ctx(), rows);
+        handle_keyboard_navigation(app, ui.ctx(), rows, dialog_open);
     }
 
     prepare_auto_fit_widths(ui, &mut table, &visible_cols, rows);
@@ -1301,9 +1304,12 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
                 if resp.secondary_clicked() && !app.selection.contains_pid(row.pid) {
                     app.selection.select_single(identity_of(row));
                 }
-                // Skipped while a popup is already open: re-arming underneath
-                // it would only fight the open menu.
-                let keyboard_open = !ui.ctx().any_popup_open()
+                // Skipped while a popup is already open (re-arming underneath
+                // it would only fight the open menu) and while a dialog is up
+                // (a menu opened over a dialog would strand there once the
+                // dialog contract consumes Escape).
+                let keyboard_open = !dialog_open
+                    && !ui.ctx().any_popup_open()
                     && menu::keyboard_menu_requested(ui.ctx())
                     && app.selection.primary().is_some_and(|primary| {
                         primary.pid == row.pid && primary.start_epoch_s == row.start_epoch_s
@@ -1326,7 +1332,9 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
     // The keyboard route to the same affordance: the Menu/Application key (or
     // Shift+F10) on a focused header cell opens the column chooser. Enter on
     // a focused cell already sorts through egui's focused-click activation.
-    let header_menu_key = !ui.ctx().any_popup_open()
+    // Stands down while a dialog is up, like the rest of the page layer.
+    let header_menu_key = !dialog_open
+        && !ui.ctx().any_popup_open()
         && ui.ctx().input(|i| {
             i.key_pressed(egui::Key::ContextMenu)
                 || (i.key_pressed(egui::Key::F10) && i.modifiers.shift)
@@ -1409,7 +1417,12 @@ fn extend_detail_selection(app: &mut TaskManApp, row: &Row, rows: &[Row]) {
 
 /// Native list navigation plus tree-aware Left/Right movement. The flattened
 /// rows remain virtualized, so selection also records a one-shot scroll target.
-fn handle_keyboard_navigation(app: &mut TaskManApp, ctx: &egui::Context, rows: &[Row]) {
+fn handle_keyboard_navigation(
+    app: &mut TaskManApp,
+    ctx: &egui::Context,
+    rows: &[Row],
+    dialog_open: bool,
+) {
     let selected_pos = app
         .selection
         .primary()
@@ -1432,7 +1445,8 @@ fn handle_keyboard_navigation(app: &mut TaskManApp, ctx: &egui::Context, rows: &
     // While a header cell or resize handle owns the arrows, egui's spatial
     // navigation moves between header widgets; the selection must not also
     // move (see `tablekit::header_has_focus`).
-    if let Some(nav) = search::list_nav(ctx).filter(|_| !tablekit::header_has_focus(ctx, "details"))
+    if let Some(nav) =
+        search::list_nav(ctx, dialog_open).filter(|_| !tablekit::header_has_focus(ctx, "details"))
         && let Some(index) = search::moved_index(rows.len(), selected_pos, nav, page_rows)
         && let Some(row) = rows.get(index)
     {
@@ -1445,7 +1459,7 @@ fn handle_keyboard_navigation(app: &mut TaskManApp, ctx: &egui::Context, rows: &
 
     // Enter/Space belong to the row layer only while nothing else can claim
     // them (a focused widget would activate itself on the same keypress).
-    if search::row_action_gate(ctx) {
+    if search::row_action_gate(ctx, dialog_open) {
         let (space, enter) = ctx.input(|i| {
             (
                 i.key_pressed(egui::Key::Space),
@@ -1468,7 +1482,7 @@ fn handle_keyboard_navigation(app: &mut TaskManApp, ctx: &egui::Context, rows: &
     }
 
     if !app.details_state.is_tree()
-        || !search::nav_gate(ctx)
+        || !search::nav_gate(ctx, dialog_open)
         || tablekit::header_has_focus(ctx, "details")
     {
         return;
@@ -1568,51 +1582,30 @@ fn persist_column_prefs(app: &mut TaskManApp) {
     app.save_settings();
 }
 
-/// Park the initial-focus request of a dialog that opens on `id`. A dialog's
-/// first frame is egui's invisible sizing pass, where every widget is
-/// disabled and a `request_focus` would be dropped — the request is parked
-/// and fired on the first ENABLED frame instead (the pattern the keyboard-
-/// opened menus in `widgets/menu.rs` use). Returns whether a request is
-/// already parked.
-fn arm_dialog_initial_focus(ctx: &egui::Context, id: &str) -> bool {
-    let key = egui::Id::new(("tm-dialog-initial-focus", id));
-    if ctx.data(|d| d.get_temp::<bool>(key)).unwrap_or(false) {
-        return true;
-    }
-    ctx.data_mut(|d| d.insert_temp(key, true));
-    false
-}
-
-/// Fire and clear a parked initial-focus request on an enabled widget.
-fn fire_dialog_initial_focus(ctx: &egui::Context, id: &str, target: Option<&egui::Response>) {
-    let key = egui::Id::new(("tm-dialog-initial-focus", id));
-    if ctx.data(|d| d.get_temp::<bool>(key)).unwrap_or(false)
-        && let Some(target) = target
-    {
-        target.request_focus();
-        ctx.data_mut(|d| d.remove::<bool>(key));
-    }
-}
-
-fn disarm_dialog_initial_focus(ctx: &egui::Context, id: &str) {
-    ctx.data_mut(|d| d.remove::<bool>(egui::Id::new(("tm-dialog-initial-focus", id))));
-}
-
 fn select_columns_dialog(app: &mut TaskManApp, ctx: &egui::Context, pal: &theme::Palette) {
     if !app.details_state.select_columns_open {
         return;
     }
     let mut open = true;
-    // Tab is NOT consumed: checkboxes, reorder buttons and Close are reached
-    // with egui's own focus traversal. Esc closes as before; Enter closes
-    // only while nothing activatable holds focus — egui turns Enter into a
-    // click for whatever holds focus, and a focused checkbox must toggle,
-    // never close the dialog out from under it.
-    let escape = ctx.input_mut(|i| i.consume_key(Default::default(), egui::Key::Escape));
-    let enter_closes =
-        search::row_action_gate(ctx) && ctx.input(|i| i.key_pressed(egui::Key::Enter));
-    let close_now = escape || enter_closes;
-    arm_dialog_initial_focus(ctx, "select-columns");
+    // A tab-through dialog (same contract as the settings dialog): Tab is NOT
+    // consumed, so checkboxes, reorder buttons and Close are reached with
+    // egui's own focus traversal; Enter closes only while nothing activatable
+    // holds focus — egui turns Enter into a click for whatever holds focus,
+    // and a focused checkbox must toggle, never close the dialog out from
+    // under itself. Esc closes as before, and the arrows are consumed so they
+    // cannot walk the table behind the dialog through egui's spatial focus.
+    let restore_id = egui::Id::new("select-columns-restore-focus");
+    let first_frame = ctx
+        .data(|d| d.get_temp::<Option<egui::Id>>(restore_id))
+        .is_none();
+    if first_frame {
+        // Remember what held focus before the dialog took over, so closing
+        // can hand it back.
+        let captured = crate::app_ui::capture_focus(ctx);
+        ctx.data_mut(|d| d.insert_temp(restore_id, captured));
+    }
+    let keys = crate::app_ui::consume_dialog_keys_tab_through(ctx, false);
+    let close_now = keys.escape || keys.enter;
     egui::Window::new(i18n::tr(K::SelectColumns))
         .open(&mut open)
         .collapsible(false)
@@ -1692,7 +1685,15 @@ fn select_columns_dialog(app: &mut TaskManApp, ctx: &egui::Context, pal: &theme:
                         });
                     }
                 });
-            fire_dialog_initial_focus(ctx, "select-columns", first_checkbox.as_ref());
+            // The keyboard anchor of the dialog: the first checkbox, focused
+            // once on the opening frame (an egui Window runs its content once
+            // per frame — there is no separate sizing pass to wait out), from
+            // where egui's own Tab traversal takes over.
+            if first_frame
+                && let Some(checkbox) = first_checkbox.as_ref().filter(|resp| resp.enabled())
+            {
+                checkbox.request_focus();
+            }
             ui.separator();
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui.button(i18n::tr(K::Close)).clicked() {
@@ -1701,7 +1702,11 @@ fn select_columns_dialog(app: &mut TaskManApp, ctx: &egui::Context, pal: &theme:
             });
         });
     if !open || close_now {
-        disarm_dialog_initial_focus(ctx, "select-columns");
+        let saved = ctx
+            .data(|d| d.get_temp::<Option<egui::Id>>(restore_id))
+            .flatten();
+        crate::app_ui::restore_focus(ctx, saved);
+        ctx.data_mut(|d| d.remove_temp::<Option<egui::Id>>(restore_id));
         app.details_state.select_columns_open = false;
     }
 }
@@ -1751,12 +1756,35 @@ fn cid_is_numeric(cid: ColumnId) -> bool {
     )
 }
 
-fn effective_search(app: &TaskManApp) -> String {
+pub(crate) fn effective_search(app: &TaskManApp) -> String {
     if !app.details_state.filter.is_empty() {
         app.details_state.filter.clone()
     } else {
         app.search.clone()
     }
+}
+
+/// The process the global search commits to on the Details page: the FIRST
+/// row of the table's current model — filtered by the effective query (the
+/// page's own filter wins over the global box, exactly like the visible
+/// table), sorted by the live sort, the tree's collapsed state honored — i.e.
+/// exactly what type-ahead's first match would be. All rows `build_rows`
+/// yields are concrete processes, so the first one is selectable. Pure over
+/// snapshot + state so it stays testable without a window.
+pub(crate) fn first_search_match_in_display_order(
+    snap: &tm_core::model::Snapshot,
+    raw_search: &str,
+    state: &State,
+) -> Option<crate::app::ProcessIdentity> {
+    build_rows(
+        snap,
+        raw_search,
+        state.sort_col,
+        state.sort_order,
+        &state.collapsed,
+    )
+    .first()
+    .map(identity_of)
 }
 
 fn priority_label(p: PriorityClass) -> &'static str {
@@ -2573,6 +2601,16 @@ pub fn uac_virtualization_dialog(app: &mut TaskManApp, ctx: &egui::Context) {
         return;
     };
     let focus_id = egui::Id::new("uac-dialog-focus-primary");
+    let restore_id = egui::Id::new("uac-dialog-restore-focus");
+    let first_frame = ctx
+        .data(|d| d.get_temp::<Option<egui::Id>>(restore_id))
+        .is_none();
+    if first_frame {
+        // Remember what held focus before the dialog took over, so closing
+        // can hand it back.
+        let captured = crate::app_ui::capture_focus(ctx);
+        ctx.data_mut(|d| d.insert_temp(restore_id, captured));
+    }
     let mut open = true;
     // Consume before the window so egui's built-in focused-button activation
     // cannot double-fire, and let the SAFE action own the default: Enter and
@@ -2616,6 +2654,13 @@ pub fn uac_virtualization_dialog(app: &mut TaskManApp, ctx: &egui::Context) {
         decision = Some(false);
     }
     if let Some(confirm) = decision {
+        // The dialog is done whichever way it resolved; hand keyboard focus
+        // back to what held it before the dialog took it.
+        let saved = ctx
+            .data(|d| d.get_temp::<Option<egui::Id>>(restore_id))
+            .flatten();
+        crate::app_ui::restore_focus(ctx, saved);
+        ctx.data_mut(|d| d.remove_temp::<Option<egui::Id>>(restore_id));
         ctx.data_mut(|d| d.remove_temp::<bool>(focus_id));
         app.pending_uac_virtualization = None;
         if confirm {
@@ -2794,9 +2839,28 @@ pub fn dump_progress_dialog(
     let Some(active) = app.active_dump.clone() else {
         return;
     };
+    // The only close path: the dump finished (or aborted) and the outcome
+    // arrived. Hand keyboard focus back to what held it before the dialog
+    // took it, then close.
     if tm_core::sync::lock(&active.outcome).is_some() {
+        let restore_id = egui::Id::new("dump-progress-restore-focus");
+        let saved = ctx
+            .data(|d| d.get_temp::<Option<egui::Id>>(restore_id))
+            .flatten();
+        crate::app_ui::restore_focus(ctx, saved);
+        ctx.data_mut(|d| d.remove_temp::<Option<egui::Id>>(restore_id));
         app.active_dump = None;
         return;
+    }
+    // First frame pre-show: remember what held focus before the progress
+    // dialog took it over.
+    let restore_id = egui::Id::new("dump-progress-restore-focus");
+    if ctx
+        .data(|d| d.get_temp::<Option<egui::Id>>(restore_id))
+        .is_none()
+    {
+        let captured = crate::app_ui::capture_focus(ctx);
+        ctx.data_mut(|d| d.insert_temp(restore_id, captured));
     }
 
     let mut open = true;
@@ -3829,19 +3893,25 @@ pub fn process_properties_dialog(app: &mut TaskManApp, ctx: &egui::Context) {
     );
     let mut open = true;
     let mut close_clicked = false;
-    // Tab is NOT consumed: the tab strip, the footer buttons and the Close
-    // button are reached with egui's own focus traversal. Esc closes as
-    // before; Enter closes only while nothing activatable holds focus — egui
-    // turns Enter into a click for whatever holds focus, and closing a
-    // properties inspector out from under a focused button is a surprise.
-    let escape = ctx.input_mut(|i| i.consume_key(Default::default(), egui::Key::Escape));
-    let enter_closes =
-        search::row_action_gate(ctx) && ctx.input(|i| i.key_pressed(egui::Key::Enter));
-    let close_now = escape || enter_closes;
-    // The dialog opens on the General tab, focused: the request is parked
-    // until egui's invisible sizing pass is over (see
-    // [`arm_dialog_initial_focus`]).
-    arm_dialog_initial_focus(ctx, "process-properties");
+    // A tab-through dialog (same contract as the settings dialog): Tab is NOT
+    // consumed, so the tab strip, the footer buttons and the Close button are
+    // reached with egui's own focus traversal. Esc closes as before; Enter
+    // closes only while nothing activatable holds focus — egui turns Enter
+    // into a click for whatever holds focus, and closing a properties
+    // inspector out from under a focused button is a surprise. The arrows are
+    // consumed so they cannot walk the table behind the dialog.
+    let restore_id = egui::Id::new("process-properties-restore-focus");
+    let first_frame = ctx
+        .data(|d| d.get_temp::<Option<egui::Id>>(restore_id))
+        .is_none();
+    if first_frame {
+        // Remember what held focus before the dialog took over, so closing
+        // can hand it back.
+        let captured = crate::app_ui::capture_focus(ctx);
+        ctx.data_mut(|d| d.insert_temp(restore_id, captured));
+    }
+    let keys = crate::app_ui::consume_dialog_keys_tab_through(ctx, false);
+    let close_now = keys.escape || keys.enter;
 
     egui::Window::new(title)
         .open(&mut open)
@@ -3881,7 +3951,13 @@ pub fn process_properties_dialog(app: &mut TaskManApp, ctx: &egui::Context) {
                     dialog.tab = ProcessPropertiesTab::Security;
                 }
             });
-            fire_dialog_initial_focus(ctx, "process-properties", general_tab.as_ref());
+            // The dialog opens on the General tab, focused: requested once on
+            // the opening frame (an egui Window runs its content once per
+            // frame — there is no separate sizing pass to wait out), from
+            // where egui's own Tab traversal takes over.
+            if first_frame && let Some(general) = general_tab.as_ref().filter(|r| r.enabled()) {
+                general.request_focus();
+            }
             ui.separator();
 
             let Some(process) = process.as_ref() else {
@@ -3972,7 +4048,11 @@ pub fn process_properties_dialog(app: &mut TaskManApp, ctx: &egui::Context) {
     if open && !close_clicked && !close_now {
         app.proc_props = Some(dialog);
     } else {
-        disarm_dialog_initial_focus(ctx, "process-properties");
+        let saved = ctx
+            .data(|d| d.get_temp::<Option<egui::Id>>(restore_id))
+            .flatten();
+        crate::app_ui::restore_focus(ctx, saved);
+        ctx.data_mut(|d| d.remove_temp::<Option<egui::Id>>(restore_id));
     }
 }
 
@@ -4005,26 +4085,30 @@ pub fn affinity_dialog(app: &mut TaskManApp, ctx: &egui::Context, pal: &theme::P
     let mut cancel = false;
     let apply_enabled = dialog.mask.is_some_and(|mask| mask != 0) && dialog.error.is_none();
     let focus_id = egui::Id::new("affinity-dialog-focus-primary");
-    // Changing affinity is destructive: the SAFE action owns the keyboard
-    // default, so Escape and an unfocused Enter both cancel. Space stays
-    // ordinary text so focused CPU checkboxes keep toggling via egui.
-    //
-    // MERGER NOTE: this dialog keeps the OLD `dialog_button_row` contract —
-    // Tab is consumed here and mirrored onto the button row by hand, so its
-    // Tab traversal is dead until the shared dialog contract (being built in
-    // `app_ui/original.rs`) changes this caller. `select_columns_dialog` and
-    // `process_properties_dialog` in this file already use the new
-    // Tab-through style with local helpers; unify all of them on one
-    // contract when merging.
-    let keys = crate::app_ui::consume_dialog_keys(ctx, false);
+    let restore_id = egui::Id::new("affinity-dialog-restore-focus");
+    let first_frame = ctx
+        .data(|d| d.get_temp::<Option<egui::Id>>(restore_id))
+        .is_none();
+    if first_frame {
+        // Remember what held focus before the dialog took over (the toolbar
+        // button that opened it, say), so closing can hand it back.
+        let captured = crate::app_ui::capture_focus(ctx);
+        ctx.data_mut(|d| d.insert_temp(restore_id, captured));
+        // The safe button owns the opening frame: drop whatever focus leaked
+        // in with the opener, and the mirror row below reclaims it for the
+        // safe button the same frame.
+        if let Some(held) = ctx.memory(|mem| mem.focused()) {
+            ctx.memory_mut(|mem| mem.surrender_focus(held));
+        }
+    }
+    // Changing affinity is destructive, but every control of the dialog (the
+    // CPU grid, the save rule) is keyboard-reachable, so the tab-through
+    // contract applies: Tab cycles egui's focus, Escape and an unfocused
+    // Enter/Space resolve to the SAFE action, and a focused checkbox keeps
+    // its native Space toggle (the key is only consumed while nothing holds
+    // focus).
+    let keys = crate::app_ui::consume_dialog_keys_tab_through(ctx, true);
     let mut focused: bool = ctx.data(|d| d.get_temp(focus_id)).unwrap_or(false);
-    focused = crate::app_ui::update_end_task_dialog_focus(
-        focused,
-        keys.tab,
-        keys.shift_tab,
-        keys.left,
-        keys.right,
-    );
     let key_decision = crate::app_ui::dialog_key_decision(keys, focused, apply_enabled);
     egui::Window::new(title)
         .open(&mut open)
@@ -4115,7 +4199,7 @@ pub fn affinity_dialog(app: &mut TaskManApp, ctx: &egui::Context, pal: &theme::P
                 .on_disabled_hover_text(i18n::tr(K::SaveRuleNeedsPath));
             }
             ui.add_space(8.0);
-            match crate::app_ui::dialog_button_row(
+            match crate::app_ui::dialog_button_row_mirror(
                 ui,
                 ctx,
                 pal,
@@ -4128,7 +4212,6 @@ pub fn affinity_dialog(app: &mut TaskManApp, ctx: &egui::Context, pal: &theme::P
                 crate::app_ui::DialogButtonClick::None => {}
             }
         });
-    ctx.data_mut(|d| d.insert_temp(focus_id, focused));
     match key_decision {
         Some(crate::app_ui::DialogDecision::Safe) => cancel = true,
         Some(crate::app_ui::DialogDecision::Primary) => apply = true,
@@ -4140,8 +4223,55 @@ pub fn affinity_dialog(app: &mut TaskManApp, ctx: &egui::Context, pal: &theme::P
             update_saved_affinity(app, rule_key, dialog.save_for_program.then_some(mask));
         }
     } else if open && !cancel {
+        // Still up: persist the mirrored focus flag for the next frame.
         app.affinity_dialog = Some(dialog);
+        ctx.data_mut(|d| d.insert_temp(focus_id, focused));
+    } else {
+        // Every close path — applied, canceled, Escape or the window X —
+        // hands keyboard focus back to whatever held it before the dialog
+        // took it.
+        let saved = ctx
+            .data(|d| d.get_temp::<Option<egui::Id>>(restore_id))
+            .flatten();
+        crate::app_ui::restore_focus(ctx, saved);
+        ctx.data_mut(|d| d.remove_temp::<Option<egui::Id>>(restore_id));
+        ctx.data_mut(|d| d.remove_temp::<bool>(focus_id));
     }
+}
+
+/// The global search commit on Details must follow the visible table — the
+/// first row of `build_rows` under the live sort — with synthetic rows never
+/// reachable.
+#[test]
+fn search_commit_picks_the_first_display_order_match() {
+    let mut rows = Vec::new();
+    for (pid, name) in [
+        (30u32, "alpha.exe"),
+        (20, "svchost.exe"),
+        (10, "svchost.exe"),
+    ] {
+        let mut p = ProcessEntry::new(pid, name);
+        p.start_epoch_s = Some(1000 + i64::from(pid));
+        rows.push(p);
+    }
+    let mut synthetic = ProcessEntry::new(5, "svchost.exe");
+    synthetic.synthetic = true;
+    rows.push(synthetic);
+    let snap = tm_core::model::Snapshot {
+        processes: rows,
+        ..Default::default()
+    };
+    let state = State::default();
+    assert_eq!(
+        first_search_match_in_display_order(&snap, "svchost", &state).map(|p| p.pid),
+        Some(10),
+        "name ascending, ties by pid (the column comparator's own tie-break)"
+    );
+    assert!(first_search_match_in_display_order(&snap, "alpha", &state).is_some());
+    assert!(
+        first_search_match_in_display_order(&snap, "missing", &state).is_none(),
+        "no match, no commit"
+    );
 }
 
 #[cfg(test)]
