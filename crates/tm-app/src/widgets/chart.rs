@@ -530,7 +530,7 @@ fn hover_pos(ui: &egui::Ui, response: &Response, rect: Rect) -> Option<Pos2> {
 
 /// Age caption for sample `idx` of `timestamps_ms`, relative to the newest
 /// sample in the window. Empty when the caller charted without timestamps.
-fn sample_age(axis: Option<TimeAxis>, idx: usize) -> String {
+pub(crate) fn sample_age(axis: Option<TimeAxis>, idx: usize) -> String {
     let Some(ts) = axis.map(|a| a.stamps) else {
         return String::new();
     };
@@ -538,6 +538,79 @@ fn sample_age(axis: Option<TimeAxis>, idx: usize) -> String {
         return String::new();
     };
     age_label(last.saturating_sub(at))
+}
+
+/// Keep a chart's keyboard cursor on a sample timestamp as the rolling
+/// history moves. A live refresh only changes the readout after a key gesture.
+pub(crate) fn keyboard_sample(
+    ui: &mut egui::Ui,
+    response: &Response,
+    axis: Option<TimeAxis>,
+    len: usize,
+) -> Option<(usize, bool)> {
+    if !response.has_focus() || !ui.is_enabled() || len == 0 {
+        return None;
+    }
+    ui.memory_mut(|memory| {
+        memory.set_focus_lock_filter(
+            response.id,
+            egui::EventFilter {
+                horizontal_arrows: true,
+                vertical_arrows: true,
+                ..Default::default()
+            },
+        );
+    });
+    let cursor_id = response.id.with("keyboard-sample");
+    let old = ui.ctx().data(|data| data.get_temp::<u64>(cursor_id));
+    let old_index = old.and_then(|at| {
+        axis.and_then(|axis| axis.stamps.iter().position(|stamp| *stamp == at))
+            .or_else(|| (at < len as u64).then_some(at as usize))
+    });
+    let mut index = old_index.unwrap_or(len - 1).min(len - 1);
+    let key = ui.input(|input| {
+        [
+            egui::Key::ArrowLeft,
+            egui::Key::ArrowRight,
+            egui::Key::Home,
+            egui::Key::End,
+        ]
+        .into_iter()
+        .find(|key| input.key_pressed(*key) && !input.modifiers.any())
+    });
+    if let Some(key) = key {
+        index = match key {
+            egui::Key::ArrowLeft => index.saturating_sub(1),
+            egui::Key::ArrowRight => (index + 1).min(len - 1),
+            egui::Key::Home => 0,
+            _ => len - 1,
+        };
+        ui.input_mut(|input| {
+            input.consume_key(Default::default(), key);
+        });
+        ui.memory_mut(|memory| memory.move_focus(egui::FocusDirection::None));
+    }
+    let at = axis
+        .and_then(|axis| axis.stamps.get(index).copied())
+        .unwrap_or(index as u64);
+    ui.ctx().data_mut(|data| data.insert_temp(cursor_id, at));
+    Some((index, key.is_some()))
+}
+
+pub(crate) fn chart_accessible_value(
+    ui: &egui::Ui,
+    response: &Response,
+    value: String,
+    changed: bool,
+) {
+    let id = response.id.with("spoken-sample");
+    if changed || response.gained_focus() {
+        ui.ctx().data_mut(|data| data.insert_temp(id, value));
+    }
+    if let Some(value) = ui.ctx().data(|data| data.get_temp::<String>(id)) {
+        ui.ctx()
+            .accesskit_node_builder(response.id, |node| node.set_value(value));
+    }
 }
 
 /// Scale used by Performance-card sparklines.
@@ -619,7 +692,8 @@ pub fn paint_sparkline(
 ///
 /// `label` names the tile in the hover readout ("CPU 0"); `timestamps_ms`
 /// gives that readout the sample's age, exactly as on the big charts.
-pub fn core_chart(
+#[allow(clippy::too_many_arguments)]
+fn core_chart_impl(
     ui: &mut egui::Ui,
     size: Vec2,
     samples: &[f64],
@@ -627,14 +701,41 @@ pub fn core_chart(
     color: Color32,
     label: &str,
     axis: Option<TimeAxis>,
+    grouped: bool,
+    grouped_sample: Option<usize>,
 ) -> Response {
-    let (alloc, response) = ui.allocate_exact_size(size, egui::Sense::click());
+    let sense = if grouped {
+        egui::Sense::CLICK
+    } else {
+        egui::Sense::click()
+    };
+    let (alloc, response) = ui.allocate_exact_size(size, sense);
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Other, true, label));
+    ui.ctx().accesskit_node_builder(response.id, |node| {
+        node.set_role(egui::accesskit::Role::Image);
+        node.set_label(label);
+    });
     let pal = crate::theme::palette(ui);
     let ppp = ui.ctx().pixels_per_point();
     let rect = snap_rect(alloc, ppp);
     let painter = ui.painter_at(rect).with_clip_rect(rect);
 
     paint_frame(&painter, rect, ppp, &pal, 4, 4);
+
+    if response.has_focus() {
+        painter.rect_stroke(
+            rect.shrink(1.0),
+            4.0,
+            Stroke::new(2.0, pal.accent),
+            egui::StrokeKind::Inside,
+        );
+    }
+
+    let keyboard = if grouped {
+        grouped_sample.map(|index| (index, false))
+    } else {
+        keyboard_sample(ui, &response, axis, samples.len())
+    };
 
     if samples.len() < 2 {
         return response;
@@ -667,7 +768,14 @@ pub fn core_chart(
     }
     painter.add(Shape::line(pts, Stroke::new(1.4, color)));
 
-    if let Some(pos) = hover_pos(ui, &response, rect) {
+    let hover = if keyboard.is_some() {
+        None
+    } else {
+        hover_pos(ui, &response, rect)
+    };
+    if let Some(pos) =
+        hover.or_else(|| keyboard.map(|(idx, _)| Pos2::new(x(idx), rect.top() + 20.0)))
+    {
         let frac = ((pos.x - rect.left()) / rect.width()).clamp(0.0, 1.0);
         let first = first_on_axis(axis, bounds);
         let idx = match (bounds, axis) {
@@ -675,7 +783,11 @@ pub fn core_chart(
             _ => ((frac * (n - 1) as f32).round() as usize).min(n - 1),
         }
         .max(first);
-        let idx = pinned_sample(ui.ctx(), response.id, axis, bounds, pos, idx)
+        let idx = keyboard
+            .map_or_else(
+                || pinned_sample(ui.ctx(), response.id, axis, bounds, pos, idx),
+                |(index, _)| index,
+            )
             .max(first)
             .min(n - 1);
         let mut rows = vec![ReadoutRow {
@@ -694,8 +806,43 @@ pub fn core_chart(
         }
         paint_marker(&painter, &pal, rect, ppp, x(idx), &dots);
         readout(ui, pos, &sample_age(axis, idx), &rows);
+        if let Some((_, changed)) = keyboard.filter(|_| !grouped) {
+            chart_accessible_value(
+                ui,
+                &response,
+                format!("{}: {}", sample_age(axis, idx), fmt_percent(samples[idx])),
+                changed,
+            );
+        }
     }
     response
+}
+
+#[allow(dead_code)] // used by render snapshots and chart regression tests
+pub fn core_chart(
+    ui: &mut egui::Ui,
+    size: Vec2,
+    samples: &[f64],
+    kernels: Option<(&[f64], Color32)>,
+    color: Color32,
+    label: &str,
+    axis: Option<TimeAxis>,
+) -> Response {
+    core_chart_impl(ui, size, samples, kernels, color, label, axis, false, None)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn core_chart_grouped(
+    ui: &mut egui::Ui,
+    size: Vec2,
+    samples: &[f64],
+    kernels: Option<(&[f64], Color32)>,
+    color: Color32,
+    label: &str,
+    axis: Option<TimeAxis>,
+    sample: Option<usize>,
+) -> Response {
+    core_chart_impl(ui, size, samples, kernels, color, label, axis, true, sample)
 }
 
 /// One owned series for [`chart_multi`].
@@ -733,12 +880,64 @@ pub fn chart_multi(
     fmt: ValueFmt,
 ) -> Response {
     let (alloc, response) = ui.allocate_exact_size(size, egui::Sense::click());
+    let label = series
+        .iter()
+        .map(|item| item.label.as_str())
+        .find(|label| !label.is_empty())
+        .unwrap_or("Chart");
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Other, true, label));
+    ui.ctx().accesskit_node_builder(response.id, |node| {
+        node.set_role(egui::accesskit::Role::Image);
+        node.set_label(label);
+    });
     let pal = crate::theme::palette(ui);
     let ppp = ui.ctx().pixels_per_point();
     let rect = snap_rect(alloc, ppp);
     let painter = ui.painter_at(rect).with_clip_rect(rect);
 
     paint_frame(&painter, rect, ppp, &pal, 6, 4);
+    if response.has_focus() {
+        painter.rect_stroke(
+            rect.shrink(1.0),
+            4.0,
+            Stroke::new(2.0, pal.accent),
+            egui::StrokeKind::Inside,
+        );
+    }
+    let max_len = series
+        .iter()
+        .map(|item| item.samples.len())
+        .max()
+        .unwrap_or(0);
+    let keyboard = keyboard_sample(ui, &response, axis, max_len);
+    let series_id = response.id.with("keyboard-series");
+    let mut active_series = ui
+        .ctx()
+        .data(|data| data.get_temp::<usize>(series_id))
+        .unwrap_or(0);
+    active_series = active_series.min(series.len().saturating_sub(1));
+    let series_key = if response.has_focus() && keyboard.is_some_and(|(_, changed)| !changed) {
+        ui.input(|input| {
+            [egui::Key::ArrowUp, egui::Key::ArrowDown]
+                .into_iter()
+                .find(|key| input.key_pressed(*key) && !input.modifiers.any())
+        })
+    } else {
+        None
+    };
+    if let Some(key) = series_key {
+        active_series = if key == egui::Key::ArrowDown {
+            (active_series + 1).min(series.len().saturating_sub(1))
+        } else {
+            active_series.saturating_sub(1)
+        };
+        ui.ctx()
+            .data_mut(|data| data.insert_temp(series_id, active_series));
+        ui.input_mut(|input| {
+            input.consume_key(Default::default(), key);
+        });
+        ui.memory_mut(|memory| memory.move_focus(egui::FocusDirection::None));
+    }
 
     let y = |v: f64| rect.bottom() - (v.clamp(0.0, y_max) / y_max) as f32 * rect.height();
     // Time-proportional x over the CONFIGURED window — see [`TimeAxis`].
@@ -782,15 +981,26 @@ pub fn chart_multi(
     }
 
     // Hover: every series' value at the pointer, in a box AT the pointer.
-    if let Some(pos) = hover_pos(ui, &response, rect) {
+    let hover = if keyboard.is_some() {
+        None
+    } else {
+        hover_pos(ui, &response, rect)
+    };
+    if let Some(pos) = hover.or_else(|| {
+        keyboard.map(|(idx, _)| Pos2::new(x_at(idx, max_len.max(2)), rect.top() + 20.0))
+    }) {
         let frac = ((pos.x - rect.left()) / rect.width()).clamp(0.0, 1.0);
         // Time-proportional x: map the pointer TIME back to the nearest
         // sample — even-spacing math skips across sampling gaps.
         let first = first_on_axis(axis, bounds);
-        let time_idx = bounds
-            .zip(axis)
-            .map(|((t0, span), a)| nearest_sample(a.stamps, t0, span, frac).max(first))
-            .map(|under| pinned_sample(ui.ctx(), response.id, axis, bounds, pos, under).max(first));
+        let time_idx = keyboard.map(|(idx, _)| idx).or_else(|| {
+            bounds
+                .zip(axis)
+                .map(|((t0, span), a)| nearest_sample(a.stamps, t0, span, frac).max(first))
+                .map(|under| {
+                    pinned_sample(ui.ctx(), response.id, axis, bounds, pos, under).max(first)
+                })
+        });
         let mut rows = Vec::with_capacity(series.len());
         let mut dots = Vec::with_capacity(series.len());
         let mut marker = None;
@@ -818,6 +1028,16 @@ pub fn chart_multi(
         if let Some((x, idx)) = marker {
             paint_marker(&painter, &pal, rect, ppp, x, &dots);
             readout(ui, pos, &sample_age(axis, idx), &rows);
+            if let Some((_, changed)) = keyboard
+                && let Some(row) = rows.get(active_series)
+            {
+                chart_accessible_value(
+                    ui,
+                    &response,
+                    format!("{}: {} {}", sample_age(axis, idx), row.label, row.value),
+                    changed || series_key.is_some(),
+                );
+            }
         }
     }
     response
@@ -826,6 +1046,86 @@ pub fn chart_multi(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn keyboard_scrub_exposes_a_stable_sample_to_accesskit() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(800.0, 500.0));
+        let chart_id = std::cell::Cell::new(None);
+        let render = |events: Vec<egui::Event>, stamps: &[u64], values: Vec<f64>| {
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(screen),
+                    focused: true,
+                    events,
+                    ..Default::default()
+                },
+                |root| {
+                    egui::CentralPanel::default().show(root, |ui| {
+                        chart_id.set(Some(
+                            ui.push_id("test-chart", |ui| {
+                                chart_multi(
+                                    ui,
+                                    Vec2::new(400.0, 120.0),
+                                    &[MultiSeries::new("CPU", values.clone(), Color32::LIGHT_BLUE)],
+                                    100.0,
+                                    Some(TimeAxis {
+                                        stamps,
+                                        window_ms: 60_000,
+                                    }),
+                                    fmt_percent,
+                                )
+                            })
+                            .inner
+                            .id,
+                        ));
+                    });
+                },
+            );
+            output.textures_delta.clear();
+            output
+                .platform_output
+                .accesskit_update
+                .expect("chart accessibility tree")
+        };
+        render(vec![], &[1_000, 2_000, 3_000], vec![1.0, 2.0, 3.0]);
+        let id = chart_id.get().expect("chart target");
+        ctx.memory_mut(|memory| memory.request_focus(id));
+        let key = egui::Event::Key {
+            key: egui::Key::ArrowLeft,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: Default::default(),
+        };
+        let tree = render(vec![key], &[1_000, 2_000, 3_000], vec![1.0, 2.0, 3.0]);
+        let value = tree
+            .nodes
+            .iter()
+            .find(|(node_id, _)| *node_id == id.accesskit_id())
+            .map(|(_, node)| {
+                assert_eq!(node.role(), egui::accesskit::Role::Image);
+                node.value().expect("spoken sample").to_owned()
+            })
+            .expect("chart node");
+        assert!(value.contains(&fmt_percent(2.0)));
+        let tree = render(
+            vec![],
+            &[1_000, 2_000, 3_000, 4_000],
+            vec![1.0, 2.0, 3.0, 4.0],
+        );
+        let after = tree
+            .nodes
+            .iter()
+            .find(|(node_id, _)| *node_id == id.accesskit_id())
+            .and_then(|(_, node)| node.value());
+        assert_eq!(
+            after,
+            Some(value.as_str()),
+            "new telemetry keeps the chosen historical sample"
+        );
+    }
 
     /// Regression: a graph must reach the left edge of its own axis.
     ///

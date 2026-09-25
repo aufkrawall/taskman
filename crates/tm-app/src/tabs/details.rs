@@ -1189,6 +1189,7 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
                 let Some(row) = rows.get(i) else { continue };
                 let selected = app.selection.contains_pid(row.pid);
                 let (rect, resp) = table.row(ui, &pal, selected, (row.pid, row.start_epoch_s));
+                table.describe_row(ui, &resp, &row.name, i);
                 // A clipped cell cannot show its content; the full value
                 // becomes the row tooltip (only set when something clipped).
                 let mut truncated_tip: Option<String> = None;
@@ -1310,6 +1311,7 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
                 // dialog contract consumes Escape).
                 let keyboard_open = !dialog_open
                     && !ui.ctx().any_popup_open()
+                    && crate::search::content_has_focus(ui.ctx())
                     && menu::keyboard_menu_requested(ui.ctx())
                     && app.selection.primary().is_some_and(|primary| {
                         primary.pid == row.pid && primary.start_epoch_s == row.start_epoch_s
@@ -1607,6 +1609,7 @@ fn select_columns_dialog(app: &mut TaskManApp, ctx: &egui::Context, pal: &theme:
     let keys = crate::app_ui::consume_dialog_keys_tab_through(ctx, false);
     let close_now = keys.escape || keys.enter;
     egui::Window::new(i18n::tr(K::SelectColumns))
+        .modal(true)
         .open(&mut open)
         .collapsible(false)
         .resizable(false)
@@ -1653,7 +1656,9 @@ fn select_columns_dialog(app: &mut TaskManApp, ctx: &egui::Context, pal: &theme:
                                         ui.add_space(4.0);
                                         let down = crate::widgets::controls::icon_button(
                                             ui,
+                                            egui::Id::new(("detail-column-move", cid, "down")),
                                             crate::icons::Icon::ChevronDown,
+                                            i18n::tr(K::MoveColumnDown),
                                             can_down,
                                             pal,
                                         )
@@ -1667,7 +1672,9 @@ fn select_columns_dialog(app: &mut TaskManApp, ctx: &egui::Context, pal: &theme:
                                         }
                                         let up = crate::widgets::controls::icon_button(
                                             ui,
+                                            egui::Id::new(("detail-column-move", cid, "up")),
                                             crate::icons::Icon::ChevronUp,
+                                            i18n::tr(K::MoveColumnUp),
                                             can_up,
                                             pal,
                                         )
@@ -2628,6 +2635,7 @@ pub fn uac_virtualization_dialog(app: &mut TaskManApp, ctx: &egui::Context) {
         .map(|d| matches!(d, crate::app_ui::DialogDecision::Primary));
     let pal = crate::theme::palette_ctx(ctx);
     egui::Window::new(i18n::tr(K::UacVirtualization))
+        .modal(true)
         .open(&mut open)
         .collapsible(false)
         .resizable(false)
@@ -2881,6 +2889,7 @@ pub fn dump_progress_dialog(
     }
 
     egui::Window::new(title)
+        .modal(true)
         .id(egui::Id::new("dump-progress-dialog"))
         .open(&mut open)
         .collapsible(false)
@@ -3914,6 +3923,7 @@ pub fn process_properties_dialog(app: &mut TaskManApp, ctx: &egui::Context) {
     let close_now = keys.escape || keys.enter;
 
     egui::Window::new(title)
+        .modal(true)
         .open(&mut open)
         .collapsible(false)
         .resizable(true)
@@ -4111,6 +4121,7 @@ pub fn affinity_dialog(app: &mut TaskManApp, ctx: &egui::Context, pal: &theme::P
     let mut focused: bool = ctx.data(|d| d.get_temp(focus_id)).unwrap_or(false);
     let key_decision = crate::app_ui::dialog_key_decision(keys, focused, apply_enabled);
     egui::Window::new(title)
+        .modal(true)
         .open(&mut open)
         .collapsible(false)
         .resizable(false)

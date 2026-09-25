@@ -458,7 +458,7 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
                         group_header(app, ui, &pal, *gi, *total, content_w);
                     }
                     Some(DisplayRow::Process(row)) => {
-                        row_ui(app, ui, &pal, table, row, rows);
+                        row_ui(app, ui, &pal, table, row, rows, i);
                     }
                     None => {}
                 }
@@ -971,6 +971,7 @@ fn row_ui(
     table: &tablekit::TmTable,
     row: &RowData,
     all_rows: &[DisplayRow],
+    index: usize,
 ) {
     let expanded = app.processes_state.expanded.contains(&row.pid);
     let selectable = row_is_selectable(row, &app.processes_state.expanded);
@@ -981,6 +982,7 @@ fn row_ui(
         selected,
         (row.pid, row.start_epoch_s, row.aggregate),
     );
+    table.describe_row(ui, &resp, &row.name, index);
 
     // Chevron + icon + name.
     let seed = egui::Id::new(("proc-chev", row.pid, row.start_epoch_s.unwrap_or(0)));
@@ -1100,6 +1102,7 @@ fn row_ui(
         // dialog contract consumes Escape).
         let keyboard_open = !app.modal_open()
             && !ui.ctx().any_popup_open()
+            && crate::search::content_has_focus(ui.ctx())
             && menu::keyboard_menu_requested(ui.ctx())
             && selectable
             && app.selection.primary().is_some_and(|primary| {

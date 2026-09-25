@@ -93,6 +93,7 @@ pub struct Window<'a> {
     fade_out: bool,
     auto_sized: bool,
     drag_area: WindowDrag,
+    modal: bool,
 }
 
 impl<'a> Window<'a> {
@@ -119,6 +120,7 @@ impl<'a> Window<'a> {
             fade_out: true,
             auto_sized: false,
             drag_area: WindowDrag::default(),
+            modal: false,
         }
     }
 
@@ -172,6 +174,14 @@ impl<'a> Window<'a> {
     #[inline]
     pub fn open(mut self, open: &'a mut bool) -> Self {
         self.open = Some(open);
+        self
+    }
+
+    /// Keep keyboard focus and pointer interaction inside this window while
+    /// it is open. The application may still choose its own backdrop style.
+    #[inline(always)]
+    pub fn modal(mut self, modal: bool) -> Self {
+        self.modal = modal;
         self
     }
 
@@ -567,7 +577,14 @@ impl Window<'_> {
             fade_out,
             auto_sized,
             drag_area: drag_area_setting,
+            modal,
         } = self;
+
+        let area = if modal {
+            area.order(Order::Foreground)
+        } else {
+            area
+        };
 
         // `Window::movable(false)` (and `Area::movable(false)`) and
         // `WindowDrag::Off` both mean "this window cannot be moved by
@@ -647,6 +664,9 @@ impl Window<'_> {
 
         let area_id = area.id;
         let area_layer_id = area.layer();
+        if modal {
+            ctx.memory_mut(|memory| memory.set_modal_layer(area_layer_id));
+        }
         let resize_id = area_id.with("resize");
         let mut collapsing =
             CollapsingState::load_with_default_open(ctx, area_id.with("collapsing"), default_open);

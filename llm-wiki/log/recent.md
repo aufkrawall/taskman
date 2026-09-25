@@ -1,4 +1,53 @@
 
+- 2026-09-25: Second keyboard/screen-reader pass, on top of the one above. The
+  model changed shape: a page is now exactly FOUR egui focus targets cycled
+  with F6/Shift+F6 (search, sidebar, command buttons, content), and the content
+  target is ONE `content_focus_id(tab.key())` surface wrapping the whole table
+  or card list instead of a stop per row. `search::nav_gate` /
+  `row_action_gate` consequently stopped asking "does nothing hold focus?" and
+  now ask "does THIS page's content hold focus?" (`content_has_focus` against
+  the `tm-active-content` temp key) — which is what let the previous pass's
+  "rows are not focusable" rule stop being a source of dead keys.
+  - **Dialogs became real modals.** New fork addition `Window::modal(true)`
+    (see `TASKMAN-FORK.md` § 6): raises the area to `Order::Foreground` and
+    sets the modal layer, and `Focus` gained `modal_interested` — the
+    focusable ids met on that layer, in Tab order — which `end_pass` uses to
+    redirect a pending focus request into the dialog and clamp Tab to its
+    members. This is what actually closes the residual recorded in
+    `known-debt.md` ("Tab can leave a tab-through dialog into the background
+    chrome"); the app-side key contracts stay and still own per-dialog Tab
+    behaviour. The fork also had to expose `Context::register_accesskit_parent`
+    and repair the parent link when it changes after the node exists, because
+    the non-focusable rows/cards attach their accesskit nodes by hand.
+  - **Charts became keyboard-scrubbable** (`chart::keyboard_sample`): the
+    cursor is pinned to a sample TIMESTAMP, not an index, so live telemetry
+    appending samples cannot slide the selection out from under the user, and
+    the accessible value only changes on an actual key gesture. Left/Right
+    step, Home/End jump, Up/Down switches series on `chart_multi` and the core
+    in the per-core CPU grid. The grid drives ONE group focus target and only
+    the selected core's chart gets a readout, so the siblings stay click-only.
+    The big graphs' context menus switched from "not modal" to
+    `resp.has_focus()` gating, which is what makes Shift+F10 reach them.
+  - **Header cells reorder** with Alt+Left/Right inside the table's
+    `reorderable` range (this closes the Users mouse-only-drag residual), the
+    Performance card-column splitter is a focusable `Role::Splitter` that
+    reports its width and resizes with Left/Right (Shift = 32 px), and menus
+    record their owner so `restore_closed_menu_focus` returns focus on close.
+  - **Accesskit tree** for tables, the card list, the charts and the
+    dialog-adjacent chrome: list/list-item with `position_in_set` /
+    `size_of_set` / `selected` / `set_active_descendant`, splitter with its
+    value, chart publishing the selected sample as its `value`. Six new
+    i18n keys back the new F1 help rows.
+  - Regression tests: chart scrub exposes a stable sample and survives a
+    growing series; toolbar focus/region helpers; the gates' new
+    content-focus requirement. The five gates that existed for the previous
+    pass were updated for the new gate semantics, not deleted.
+  - Housekeeping found while finishing: the fork edits were never
+    `cargo fmt`-ed and the main crate had drifted, and clippy had 8 new
+    lints (3 collapsible-if, 5 too-many-arguments) — all fixed, the
+    too-many-arguments ones with the `#[allow]` the repo already uses in
+    `tablekit.rs`/`users.rs`. `build.py --check` and the stable-clippy
+    cross-check are green.
 - 2026-09-25: Keyboard-only accessibility pass. Implemented as three stacked
   branches — feat/kb-dialogs (5751d2b) → feat/kb-shell (33fca3d) →
   feat/kb-tables (1e7f8e6) — reviewed and fast-forwarded onto main in that

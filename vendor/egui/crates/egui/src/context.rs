@@ -3686,10 +3686,31 @@ impl Context {
         self.write(|ctx| ctx.accesskit_node_builder(id).map(writer))
     }
 
-    pub(crate) fn register_accesskit_parent(&self, id: Id, parent_id: Id) {
+    /// Attach a custom-painted accessible node to its semantic parent.
+    /// Register the relationship before creating the child node.
+    pub fn register_accesskit_parent(&self, id: Id, parent_id: Id) {
         self.write(|ctx| {
             if let Some(state) = ctx.viewport().this_pass.accesskit_state.as_mut() {
-                state.parent_map.insert(id, parent_id);
+                let old = state.parent_map.insert(id, parent_id);
+                if old != Some(parent_id) && state.nodes.contains_key(&id) {
+                    let child = id.accesskit_id();
+                    if let Some((_, previous)) = state
+                        .nodes
+                        .iter_mut()
+                        .find(|(_, node)| node.children().contains(&child))
+                    {
+                        let children: Vec<_> = previous
+                            .children()
+                            .iter()
+                            .copied()
+                            .filter(|candidate| *candidate != child)
+                            .collect();
+                        previous.set_children(children);
+                    }
+                    if let Some(parent) = state.nodes.get_mut(&parent_id) {
+                        parent.push_child(child);
+                    }
+                }
             }
         });
     }

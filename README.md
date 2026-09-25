@@ -66,6 +66,7 @@ for the in-app help.
 | Keys | Action |
 | --- | --- |
 | <kbd>F5</kbd> | Refresh data (also refreshes tab-local caches while paused) |
+| <kbd>F6</kbd> / <kbd>Shift</kbd>+<kbd>F6</kbd> | Move between the search box, the sidebar, the command buttons and the page content |
 | <kbd>Ctrl</kbd>+<kbd>F</kbd> / <kbd>Alt</kbd>+<kbd>F</kbd> | Focus the process search |
 | <kbd>Ctrl</kbd>+<kbd>Tab</kbd> | Next page |
 | <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>Tab</kbd> | Previous page |
@@ -74,8 +75,11 @@ for the in-app help.
 | <kbd>Ctrl</kbd>+<kbd>N</kbd> | Run new task |
 | <kbd>Del</kbd> | End the selected processes (asks for confirmation; Processes/Details) |
 | <kbd>Menu</kbd> / <kbd>Shift</kbd>+<kbd>F10</kbd> | Open the context menu of the selection |
-| <kbd>↑</kbd> <kbd>↓</kbd> | Move the table selection |
-| <kbd>Enter</kbd> | Run the row action / commit the search |
+| <kbd>↑</kbd> <kbd>↓</kbd> <kbd>Home</kbd> <kbd>End</kbd> <kbd>PgUp</kbd> <kbd>PgDn</kbd> | Move the selection |
+| <kbd>←</kbd> <kbd>→</kbd> | Move between column headers; scrub a focused chart; resize a focused column splitter |
+| <kbd>Ctrl</kbd>+<kbd>←</kbd> <kbd>→</kbd> | Resize the focused column (<kbd>Shift</kbd> for larger steps) |
+| <kbd>Alt</kbd>+<kbd>←</kbd> <kbd>→</kbd> | Move the focused column one position |
+| <kbd>Enter</kbd> | Run the row action / commit the search / sort the focused column |
 | <kbd>Space</kbd> | Add or remove the row from the selection |
 | <kbd>Tab</kbd> / <kbd>Shift</kbd>+<kbd>Tab</kbd> | Move between controls |
 | <kbd>Esc</kbd> | Close a dialog / clear the search |

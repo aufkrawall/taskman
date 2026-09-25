@@ -486,6 +486,7 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
                             &display,
                             &order,
                             caps.user_disconnect,
+                            ri,
                         );
                     }
                     Some(URow::App {
@@ -505,6 +506,7 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
                             roll,
                             &order,
                             &heat_max,
+                            ri,
                         );
                     }
                     None => {}
@@ -673,9 +675,11 @@ fn user_row_ui(
     display: &str,
     order: &[usize],
     can_disconnect: bool,
+    index: usize,
 ) {
     let selected = app.selected_user == Some(s.id);
     let (rect, resp) = table.row(ui, pal, selected, ("user", s.id));
+    table.describe_row(ui, &resp, display, index);
 
     let expanded = app.processes_state.expanded_users.contains(&s.id);
     let seed = egui::Id::new(("user-chev", s.id));
@@ -712,7 +716,7 @@ fn user_row_ui(
     };
     // The menu is always attached: without the capability its actions show
     // disabled with an explanation instead of right-clicking into silence.
-    // Enter (with nothing else holding focus) opens it like the Menu key —
+    // Enter while the Users table has focus opens it like the Menu key —
     // Disconnect/Sign-out are the only actions a session row offers. Both
     // stand down while a dialog is up: a menu opened over a dialog would
     // strand there once the dialog contract consumes Escape.
@@ -723,6 +727,7 @@ fn user_row_ui(
         && selected_row;
     let keyboard_open = (enter_open
         || (!ctx.any_popup_open() && menu::keyboard_menu_requested(&ctx)))
+        && crate::search::content_has_focus(&ctx)
         && !app.modal_open()
         && selected_row;
     menu::context_menu_kb(&resp, keyboard_open, |ui| {
@@ -766,10 +771,12 @@ fn app_row_ui(
     roll: &Roll,
     order: &[usize],
     heat_max: &HeatMax,
+    index: usize,
 ) {
     // Same app name can appear under two users, so the key pairs the row
     // with its session.
     let (rect, resp) = table.row(ui, pal, false, ("app", session_id, name));
+    table.describe_row(ui, &resp, name, index);
     let tex = exe.and_then(|p| app.shared.icons.get(ui.ctx(), &app.actions, p, 6));
     table.icon_cell(
         ui,
@@ -893,6 +900,7 @@ pub fn session_logoff_dialog(app: &mut TaskManApp, ctx: &egui::Context, _pal: &t
     let pal = crate::theme::palette_ctx(ctx);
     let mut clicked = crate::app_ui::DialogButtonClick::None;
     Window::new(i18n::tr(K::SignOut))
+        .modal(true)
         .open(&mut open)
         .collapsible(false)
         .resizable(false)

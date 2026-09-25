@@ -170,7 +170,9 @@ pub fn checkbox_enabled(
 /// glyph and swallows clicks; hover gets a faint highlight.
 pub fn icon_button(
     ui: &mut egui::Ui,
+    id: egui::Id,
     icon: crate::icons::Icon,
+    label: &str,
     enabled: bool,
     pal: &Palette,
 ) -> egui::Response {
@@ -179,7 +181,9 @@ pub fn icon_button(
     } else {
         Sense::hover()
     };
-    let (rect, resp) = ui.allocate_exact_size(egui::vec2(22.0, 20.0), sense);
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(22.0, 20.0), Sense::hover());
+    let resp = ui.interact(rect, id, sense);
+    resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, enabled, label));
     let active = enabled && resp.hovered();
     if active {
         ui.painter()

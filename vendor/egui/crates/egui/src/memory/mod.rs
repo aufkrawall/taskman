@@ -534,6 +534,9 @@ pub(crate) struct Focus {
     /// The top-most modal layer from the current frame.
     top_modal_layer_current_frame: Option<LayerId>,
 
+    /// Focusable widgets encountered on the current top modal layer, in Tab order.
+    modal_interested: Vec<Id>,
+
     /// A cache of widget IDs that are interested in focus with their corresponding rectangles.
     focus_widgets_cache: IdMap<Rect>,
 }
@@ -568,6 +571,7 @@ impl Focus {
     }
 
     fn begin_pass(&mut self, new_input: &crate::data::input::RawInput) {
+        self.modal_interested.clear();
         self.id_two_frames_ago = self.id_previous_frame;
         self.id_previous_frame = self.focused();
         if let Some(id) = self.id_next_frame.take() {
@@ -621,6 +625,18 @@ impl Focus {
     }
 
     pub(crate) fn end_pass(&mut self, used_ids: &IdMap<Rect>) {
+        if self.top_modal_layer_current_frame.is_some() {
+            if self.give_to_next {
+                self.focused_widget = self.modal_interested.first().copied().map(FocusWidget::new);
+                self.give_to_next = false;
+            }
+            if self
+                .id_next_frame
+                .is_some_and(|id| !self.modal_interested.contains(&id))
+            {
+                self.id_next_frame = self.modal_interested.last().copied();
+            }
+        }
         if self.focus_direction.is_cardinal()
             && let Some(found_widget) = self.find_widget_in_direction(used_ids)
         {
@@ -978,7 +994,11 @@ impl Memory {
         if !self.allows_interaction(layer_id) {
             return;
         }
-        self.focus_mut().interested_in_focus(id);
+        let focus = self.focus_mut();
+        if focus.top_modal_layer_current_frame == Some(layer_id) {
+            focus.modal_interested.push(id);
+        }
+        focus.interested_in_focus(id);
     }
 
     /// Limit focus to widgets on the given layer and above.

@@ -116,5 +116,8 @@ pub fn tab_header(
         });
         ui.add_space(4.0);
     });
+    if ui.is_enabled() {
+        original::finish_toolbar_focus(ui.ctx(), app.tab);
+    }
     ui.add_space(2.0);
 }

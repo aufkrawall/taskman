@@ -65,6 +65,11 @@ pub fn context_menu(resp: &Response, add: impl FnOnce(&mut Ui)) {
 /// Open a dropdown menu on `resp` in the classic style:
 /// left-click toggles the menu below `resp`, while right-click opens it at the pointer.
 pub fn dropdown_menu(resp: &Response, add: impl FnOnce(&mut Ui)) {
+    if resp.clicked() || resp.secondary_clicked() {
+        let owner = resp.ctx.memory(|memory| memory.focused()).or(Some(resp.id));
+        resp.ctx
+            .data_mut(|data| data.insert_temp(egui::Id::new(MENU_RETURN_FOCUS), owner));
+    }
     let popup = egui::Popup::menu(resp);
     let popup = if resp.secondary_clicked() {
         popup
@@ -101,6 +106,18 @@ pub fn keyboard_menu_requested(ctx: &egui::Context) -> bool {
 /// and binding it to the popup is what keeps a menu that never had an enabled
 /// entry from handing focus to whatever menu opens later.
 const KB_INITIAL_FOCUS: &str = "tm-menu-kb-initial-focus";
+const MENU_RETURN_FOCUS: &str = "tm-menu-return-focus";
+
+pub fn restore_closed_menu_focus(ctx: &egui::Context, dialog_open: bool) {
+    if egui::Popup::is_any_open(ctx) {
+        return;
+    }
+    let owner =
+        ctx.data_mut(|data| data.remove_temp::<Option<egui::Id>>(egui::Id::new(MENU_RETURN_FOCUS)));
+    if !dialog_open && let Some(Some(owner)) = owner {
+        ctx.memory_mut(|memory| memory.request_focus(owner));
+    }
+}
 
 /// The temp-data key of a pending first-entry focus handoff (see
 /// [`KB_INITIAL_FOCUS`]).
@@ -143,6 +160,11 @@ fn drop_stale_kb_handoff(ctx: &egui::Context) {
 pub fn context_menu_kb(resp: &Response, keyboard_open: bool, add: impl FnOnce(&mut Ui)) {
     let popup_id = egui::Popup::default_response_id(resp);
     let popup = egui::Popup::context_menu(resp);
+    if keyboard_open || resp.secondary_clicked() {
+        let owner = resp.ctx.memory(|memory| memory.focused());
+        resp.ctx
+            .data_mut(|data| data.insert_temp(egui::Id::new(MENU_RETURN_FOCUS), owner));
+    }
     let popup = if keyboard_open {
         resp.ctx
             .data_mut(|d| d.insert_temp(egui::Id::new(KB_INITIAL_FOCUS), popup_id));
@@ -168,6 +190,14 @@ pub fn menu_button(
         .config(egui::containers::menu::MenuConfig::new().style(style))
         .ui(ui, content)
         .0;
+    if response.clicked() {
+        let owner = ui
+            .ctx()
+            .memory(|memory| memory.focused())
+            .or(Some(response.id));
+        ui.ctx()
+            .data_mut(|data| data.insert_temp(egui::Id::new(MENU_RETURN_FOCUS), owner));
+    }
     // Same stale-handoff hygiene as the row context menus.
     drop_stale_kb_handoff(ui.ctx());
     response
@@ -209,6 +239,18 @@ fn entry(ui: &mut Ui, text: &str, marks: Marks) -> Response {
     // re-aligns the desired size back inside the justified frame, which would
     // leave every row only as wide as its own label.
     let (rect, resp) = ui.allocate_at_least(want, Sense::click());
+    if ui.ctx().any_popup_open()
+        && ui.memory(|memory| memory.had_focus_last_frame(resp.id))
+        && ui.input(|input| {
+            input.key_pressed(egui::Key::Tab) && !input.modifiers.ctrl && !input.modifiers.alt
+        })
+    {
+        ui.input_mut(|input| {
+            input.consume_key(Default::default(), egui::Key::Tab);
+            input.consume_key(egui::Modifiers::SHIFT, egui::Key::Tab);
+        });
+        ui.close();
+    }
     let enabled = ui.is_enabled();
 
     // A keyboard-opened menu hands focus to its first enabled entry so the

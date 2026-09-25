@@ -7,7 +7,7 @@ This tree is a vendored copy of [emilk/egui](https://github.com/emilk/egui) at t
 git subtree add --prefix=vendor/egui https://github.com/emilk/egui 0.36.1 --squash
 ```
 
-It exists because two things taskman needs are not reachable from stock egui:
+It started for two rendering things taskman needs that are not reachable from stock egui:
 
 1. **Sub-pixel (ClearType) text.** Per-channel glyph coverage needs per-channel alpha
    blending. On a GPU that means dual-source blending, which egui's backends do not have
@@ -15,7 +15,10 @@ It exists because two things taskman needs are not reachable from stock egui:
 2. **A native CPU renderer.** eframe offers only glow and wgpu; `RenderMode::Software`
    used to mean WARP, a D3D12 driver emulated on the CPU at ~14 cores and 2.9 fps.
 
-Both are served by one new backend, so they are one change.
+Both are served by one new backend, so they are one change. The inventory below also
+carries two later, unrelated additions: the keyboard Menu/Application key (#5) and modal
+windows plus public accesskit reparenting (#6), both of which the keyboard and
+screen-reader model in `llm-wiki/current.md` depends on.
 
 The full design, the blend math, and the verification plan live in
 `llm-wiki/render-pipeline.md` in the parent repo. This file is only the *inventory* of what
@@ -168,6 +171,28 @@ underlying virtualized list while keeping intentional outer scroll requests inta
 Droppable when upstream adds the key; the key-specific pieces sit with the command keys, so
 a rebase conflict there is a prompt to check this table. Keep the popup scroll isolation
 until upstream provides equivalent popup/scroll-area separation.
+
+### 6. `egui`: real modal windows, and public accesskit reparenting
+
+Upstream ships an `egui::Modal` container that taskman never used: it is a
+separate widget, and it does not give a plain `egui::Window` the modality taskman needs
+(a dialog must also BLOCK the page behind it, not just paint over it). Two small changes
+instead:
+
+| File | Change | Why |
+| --- | --- | --- |
+| `crates/egui/src/containers/window.rs` | `Window::modal(bool)`; raises the area to `Order::Foreground` and calls `memory.set_modal_layer(area_layer_id)` | Every taskman dialog is a `Window`; modality has to be an option on it, and the app keeps choosing its own backdrop style. |
+| `crates/egui/src/memory/mod.rs` | `Focus::modal_interested` collects the focusable ids met on the top modal layer in Tab order; `end_pass` redirects a pending focus request into the dialog and clamps Tab to its members | Without this, a focus request for a widget BEHIND an open dialog (e.g. the app handing focus back to a table row) lands behind it, and Tab walks out of the dialog into background chrome. |
+| `crates/egui/src/context.rs` | `register_accesskit_parent` made `pub`, and it repairs the parent link when it changes after the node was already built | taskman's rows/cards are deliberately NOT egui focus targets, so their accesskit nodes are attached to the collection by hand. The old `pub(crate)` signature plus insert-before-create ordering silently lost those nodes. |
+
+The `end_pass` clamp is deliberately minimal: it only acts when a top modal layer exists
+this frame, and it only redirects `id_next_frame` / `give_to_next`. Spatial focus movement
+is untouched, so a taskman app-side key contract still owns what a given dialog does with
+Tab — see `llm-wiki/current.md` § Keyboard interaction model.
+
+Not droppable while taskman relies on it. A rebase that touches `Focus::end_pass` or
+`Memory::interested_in_focus` is a prompt to check this table: both are hot paths where
+upstream refactors freely.
 
 ## Rebase runbook
 

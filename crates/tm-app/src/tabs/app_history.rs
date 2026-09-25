@@ -241,6 +241,7 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
                 // frame consistent with it.
                 let is_selected = selected_name(ui.ctx()).as_deref() == Some(row.name.as_str());
                 let (rect, resp) = table.row(ui, &pal, is_selected, row.name.as_str());
+                table.describe_row(ui, &resp, &row.name, ri);
                 if resp.clicked() {
                     set_selected_name(ui.ctx(), Some(row.name.clone()));
                     // The row painted its fill BEFORE this frame's click was
@@ -327,6 +328,7 @@ pub fn clear_history_dialog(app: &mut TaskManApp, ctx: &egui::Context, pal: &the
     let key_decision = crate::app_ui::dialog_key_decision(keys, focused, true);
     let mut clicked = crate::app_ui::DialogButtonClick::None;
     egui::Window::new(i18n::tr(K::ClearHistoryLink))
+        .modal(true)
         .open(&mut open)
         .collapsible(false)
         .resizable(false)
@@ -419,7 +421,17 @@ mod tests {
                 events: vec![event],
                 ..Default::default()
             },
-            |_| {},
+            |ui| {
+                search::set_active_content(ui.ctx(), "apphistory");
+                ui.ctx().memory_mut(|memory| {
+                    memory.request_focus(search::content_focus_id("apphistory"))
+                });
+                ui.interact(
+                    egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(100.0, 20.0)),
+                    search::content_focus_id("apphistory"),
+                    egui::Sense::focusable_noninteractive(),
+                );
+            },
         );
         out.textures_delta.clear();
     }

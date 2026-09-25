@@ -1451,44 +1451,175 @@ pub(crate) fn page_switch_target(
     Some(all[(digit - 1).min(len - 1)])
 }
 
-/// Target widget ID when pressing Tab from a table list with no chrome focused:
-/// prefers the active sidebar navigation tab (so Tab immediately reaches the
-/// navigation pane to switch pages/tabs), and falls back to the first sidebar
-/// tab, hamburger icon, toolbar command buttons, or column header cells.
-fn list_nav_tab_target(tab: Tab, ctx: &egui::Context) -> Option<egui::Id> {
-    ctx.data(|d| {
-        d.get_temp::<Option<egui::Id>>(egui::Id::new("tm-selected-sidebar-tab"))
-            .flatten()
-            .or_else(|| {
-                d.get_temp::<Option<egui::Id>>(egui::Id::new("tm-first-sidebar-tab"))
-                    .flatten()
-            })
-            .or_else(|| {
-                d.get_temp::<Option<egui::Id>>(egui::Id::new("tm-first-sidebar-item"))
-                    .flatten()
-            })
-            .or_else(|| {
-                d.get_temp::<Option<egui::Id>>(egui::Id::new("tm-first-toolbar-button"))
-                    .flatten()
-            })
-    })
-    .or_else(|| {
-        let table_name = match tab {
-            Tab::Processes => Some("processes"),
-            Tab::Details => Some("details"),
-            Tab::Services => Some("services"),
-            Tab::Startup => Some("startup"),
-            Tab::Users => Some("users"),
-            Tab::AppHistory => Some("apphistory"),
-            Tab::Performance => None,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FocusRegion {
+    Search,
+    Sidebar,
+    Commands,
+    Content,
+}
+
+fn region_target(ctx: &egui::Context, tab: Tab, region: FocusRegion) -> Option<egui::Id> {
+    match region {
+        FocusRegion::Search => (tab != Tab::Performance).then(|| egui::Id::new("global-search")),
+        FocusRegion::Sidebar => Some(egui::Id::new(("tm-sidebar-tab", tab.key()))),
+        FocusRegion::Commands => ctx.data(|data| {
+            (data.get_temp::<&'static str>(egui::Id::new("tm-toolbar-owner")) == Some(tab.key()))
+                .then(|| {
+                    data.get_temp::<Option<egui::Id>>(egui::Id::new("tm-first-toolbar-button"))
+                        .flatten()
+                })
+                .flatten()
+        }),
+        FocusRegion::Content => Some(crate::search::content_focus_id(tab.key())),
+    }
+}
+
+fn current_region(ctx: &egui::Context, tab: Tab) -> Option<FocusRegion> {
+    let focused = ctx.memory(|memory| memory.focused())?;
+    if ctx.data(|data| {
+        data.get_temp::<Vec<(egui::Id, f32)>>(egui::Id::new("tm-toolbar-focus-items"))
+            .is_some_and(|items| items.iter().any(|item| item.0 == focused))
+    }) {
+        return Some(FocusRegion::Commands);
+    }
+    [
+        FocusRegion::Search,
+        FocusRegion::Sidebar,
+        FocusRegion::Commands,
+        FocusRegion::Content,
+    ]
+    .into_iter()
+    .find(|region| region_target(ctx, tab, *region) == Some(focused))
+}
+
+fn next_region(ctx: &egui::Context, tab: Tab, reverse: bool) -> egui::Id {
+    let regions = [
+        FocusRegion::Search,
+        FocusRegion::Sidebar,
+        FocusRegion::Commands,
+        FocusRegion::Content,
+    ];
+    let current = current_region(ctx, tab)
+        .and_then(|region| regions.iter().position(|candidate| *candidate == region))
+        .unwrap_or(if reverse { 0 } else { regions.len() - 1 });
+    for offset in 1..=regions.len() {
+        let index = if reverse {
+            (current + regions.len() - offset) % regions.len()
+        } else {
+            (current + offset) % regions.len()
         };
-        table_name.and_then(|t| {
-            ctx.data(|d| {
-                d.get_temp::<Option<egui::Id>>(egui::Id::new(("tm-first-hdr-cell", t)))
-                    .flatten()
-            })
-        })
-    })
+        if let Some(id) = region_target(ctx, tab, regions[index]) {
+            return id;
+        }
+    }
+    crate::search::content_focus_id(tab.key())
+}
+
+/// Run before any page builds its controls. Consuming the winning key here
+/// prevents the same physical press from activating a row or button later in
+/// the frame, including the frame on which a modal opens.
+fn route_global_keyboard(app: &mut TaskManApp, ctx: &egui::Context) {
+    let pressed = |key| ctx.input(|input| input.key_pressed(key));
+    let modifiers = ctx.input(|input| input.modifiers);
+    let consume = |key| {
+        ctx.input_mut(|input| {
+            input.consume_key(modifiers, key);
+        });
+    };
+    if app.show_help && pressed(egui::Key::F1) {
+        consume(egui::Key::F1);
+        app.show_help = false;
+        ctx.data_mut(|data| data.remove_temp::<bool>(egui::Id::new("tm-help-focus-init")));
+        if let Some(Some(id)) = ctx.data_mut(|data| {
+            data.remove_temp::<Option<egui::Id>>(egui::Id::new("tm-help-return-focus"))
+        }) {
+            ctx.memory_mut(|memory| memory.request_focus(id));
+        }
+        return;
+    }
+    if app.modal_open() || ctx.any_popup_open() {
+        return;
+    }
+    let page_keys = [
+        egui::Key::Num1,
+        egui::Key::Num2,
+        egui::Key::Num3,
+        egui::Key::Num4,
+        egui::Key::Num5,
+        egui::Key::Num6,
+        egui::Key::Num7,
+        egui::Key::Num8,
+        egui::Key::Num9,
+    ];
+    let digit = modifiers
+        .ctrl
+        .then(|| page_keys.iter().position(|key| pressed(*key)))
+        .flatten()
+        .map(|index| index + 1);
+    let next = modifiers.ctrl && !modifiers.shift && pressed(egui::Key::Tab);
+    let previous = modifiers.ctrl && modifiers.shift && pressed(egui::Key::Tab);
+    if let Some(target) = page_switch_target(app.tab, next, previous, digit) {
+        let old_region = current_region(ctx, app.tab).unwrap_or(FocusRegion::Content);
+        let key = digit
+            .map(|index| page_keys[index - 1])
+            .unwrap_or(egui::Key::Tab);
+        consume(key);
+        app.tab = target;
+        if old_region == FocusRegion::Commands {
+            ctx.data_mut(|data| {
+                data.insert_temp(egui::Id::new("tm-pending-toolbar-focus"), target.key())
+            });
+        }
+        let focus = if old_region == FocusRegion::Commands {
+            crate::search::content_focus_id(target.key())
+        } else {
+            region_target(ctx, target, old_region)
+                .unwrap_or_else(|| crate::search::content_focus_id(target.key()))
+        };
+        ctx.memory_mut(|memory| memory.request_focus(focus));
+        return;
+    }
+    if pressed(egui::Key::F6) {
+        consume(egui::Key::F6);
+        let target = next_region(ctx, app.tab, modifiers.shift);
+        ctx.memory_mut(|memory| memory.request_focus(target));
+        return;
+    }
+    if pressed(egui::Key::F5) {
+        consume(egui::Key::F5);
+        app.refresh_all();
+        return;
+    }
+    if modifiers.ctrl && pressed(egui::Key::N) {
+        consume(egui::Key::N);
+        app.run_dialog_open = true;
+        return;
+    }
+    if modifiers.ctrl && pressed(egui::Key::Comma) {
+        consume(egui::Key::Comma);
+        app.show_settings = true;
+        return;
+    }
+    if app.tab != Tab::Performance && (modifiers.ctrl || modifiers.alt) && pressed(egui::Key::F) {
+        consume(egui::Key::F);
+        ctx.memory_mut(|memory| memory.request_focus(egui::Id::new("global-search")));
+        return;
+    }
+    if pressed(egui::Key::F1) {
+        consume(egui::Key::F1);
+        let return_focus = ctx.memory(|memory| memory.focused());
+        ctx.data_mut(|data| data.insert_temp(egui::Id::new("tm-help-return-focus"), return_focus));
+        app.show_help = true;
+        return;
+    }
+    if matches!(app.tab, Tab::Processes | Tab::Details)
+        && crate::search::content_has_focus(ctx)
+        && pressed(egui::Key::Delete)
+    {
+        consume(egui::Key::Delete);
+        app.confirm_selected_process_end();
+    }
 }
 
 /// Parse a `--tab=` value (accepts both English and German aliases).
@@ -1596,39 +1727,27 @@ impl eframe::App for TaskManApp {
         self.sync_native_topmost(_frame);
         self.sync_title_bar(&ctx, &pal, _frame);
 
-        // When navigating the list with no widget holding keyboard focus,
-        // Shift+Tab jumps directly back to the search bar, and Tab moves
-        // forward into the active sidebar navigation tab (reaching the
-        // navigation pane to switch pages/tabs without mouse input).
+        crate::search::set_active_content(&ctx, self.tab.key());
+        ctx.data_mut(|data| data.remove_temp::<&'static str>(egui::Id::new("tm-content-present")));
+        let first_keyboard_frame = ctx.data(|data| {
+            data.get_temp::<bool>(egui::Id::new("tm-keyboard-initialized")) != Some(true)
+        });
+        if first_keyboard_frame {
+            ctx.memory_mut(|memory| {
+                memory.request_focus(crate::search::content_focus_id(self.tab.key()))
+            });
+            ctx.data_mut(|data| data.insert_temp(egui::Id::new("tm-keyboard-initialized"), true));
+        }
+
+        route_global_keyboard(self, &ctx);
+        crate::search::set_active_content(&ctx, self.tab.key());
         let modal_open = self.modal_open();
-        if !modal_open
-            && !ctx.egui_wants_keyboard_input()
-            && !ctx.text_edit_focused()
-            && ctx.memory(|m| m.focused()).is_none()
-        {
-            let shift_tab = ctx.input(|i| {
-                i.key_pressed(egui::Key::Tab)
-                    && i.modifiers.shift
-                    && !i.modifiers.ctrl
-                    && !i.modifiers.alt
-            });
-            let tab = ctx.input(|i| {
-                i.key_pressed(egui::Key::Tab)
-                    && !i.modifiers.shift
-                    && !i.modifiers.ctrl
-                    && !i.modifiers.alt
-            });
-            if shift_tab {
-                let id = egui::Id::new("global-search");
-                ctx.memory_mut(|m| m.request_focus(id));
-                ctx.input_mut(|i| i.consume_key(Default::default(), egui::Key::Tab));
-            } else if tab && let Some(target) = list_nav_tab_target(self.tab, &ctx) {
-                ctx.memory_mut(|m| m.request_focus(target));
-                ctx.input_mut(|i| i.consume_key(Default::default(), egui::Key::Tab));
-            }
+        if modal_open {
+            ui.disable();
         }
         ctx.data_mut(|d| {
             d.remove_temp::<Option<egui::Id>>(egui::Id::new("tm-first-toolbar-button"));
+            d.remove_temp::<Vec<(egui::Id, f32)>>(egui::Id::new("tm-toolbar-focus-items"));
         });
 
         // ------------------------------------------------ top-level panels
@@ -1638,14 +1757,31 @@ impl eframe::App for TaskManApp {
         // ------------------------------------------------ main content
         egui::CentralPanel::default()
             .frame(egui::Frame::NONE.fill(pal.window_bg))
-            .show(ui, |ui| match self.tab {
-                Tab::Processes => crate::tabs::processes::show(self, ui),
-                Tab::Performance => crate::tabs::performance::show(self, ui),
-                Tab::AppHistory => crate::tabs::app_history::show(self, ui),
-                Tab::Startup => crate::tabs::startup::show(self, ui),
-                Tab::Users => crate::tabs::users::show(self, ui),
-                Tab::Details => crate::tabs::details::show(self, ui),
-                Tab::Services => crate::tabs::services::show(self, ui),
+            .show(ui, |ui| {
+                match self.tab {
+                    Tab::Processes => crate::tabs::processes::show(self, ui),
+                    Tab::Performance => crate::tabs::performance::show(self, ui),
+                    Tab::AppHistory => crate::tabs::app_history::show(self, ui),
+                    Tab::Startup => crate::tabs::startup::show(self, ui),
+                    Tab::Users => crate::tabs::users::show(self, ui),
+                    Tab::Details => crate::tabs::details::show(self, ui),
+                    Tab::Services => crate::tabs::services::show(self, ui),
+                }
+                // Keep the content target alive while the first sample loads
+                // or a page has no rows yet.
+                if ctx.data(|data| {
+                    data.get_temp::<&'static str>(egui::Id::new("tm-content-present"))
+                        != Some(self.tab.key())
+                }) {
+                    let response = ui.interact(
+                        ui.max_rect(),
+                        crate::search::content_focus_id(self.tab.key()),
+                        egui::Sense::focusable_noninteractive(),
+                    );
+                    response.widget_info(|| {
+                        egui::WidgetInfo::labeled(egui::WidgetType::Panel, true, self.tab.label())
+                    });
+                }
             });
 
         // ------------------------------------------------ dialogs & toasts
@@ -1687,114 +1823,31 @@ impl eframe::App for TaskManApp {
         }
         crate::app_ui::draw_toasts(self, &ctx);
 
-        // F1 shortcut help. Contains nothing focusable, so Tab passes
-        // straight through it; Esc closes (handled with the shortcuts below).
-        if self.show_help {
-            crate::app_ui::help_overlay(&ctx, &pal);
+        // F1 help is a modal window with its own focus and close button.
+        if self.show_help && crate::app_ui::help_overlay(&ctx, &pal) {
+            self.show_help = false;
+            ctx.data_mut(|data| data.remove_temp::<bool>(egui::Id::new("tm-help-focus-init")));
+            if let Some(Some(id)) = ctx.data_mut(|data| {
+                data.remove_temp::<Option<egui::Id>>(egui::Id::new("tm-help-return-focus"))
+            }) {
+                ctx.memory_mut(|memory| memory.request_focus(id));
+            }
         }
+        crate::widgets::menu::restore_closed_menu_focus(&ctx, self.modal_open());
 
         // Frame-rate diagnostics overlay (TASKMAN_FPS_PROBE=1).
         if self.fps_probe {
             self.update_fps_probe(&ctx);
         }
 
-        // Global shortcuts: F5 refreshes data AND tab-local caches even when
-        // sampling is paused (the engine forces exactly one sample).
-        if ctx.input(|i| i.key_pressed(egui::Key::F5)) {
-            self.refresh_all();
-        }
-
-        // Native shortcut: Delete on Processes/Details requests process
-        // termination. It is confirmation-only and never steals Delete from
-        // a text editor or from another modal operation.
-        let modal_open = self.modal_open();
-        if !modal_open
-            && matches!(self.tab, Tab::Processes | Tab::Details)
-            && !ctx.egui_wants_keyboard_input()
-            && ctx.input(|i| i.key_pressed(egui::Key::Delete))
+        if !self.modal_open()
+            && !ctx.any_popup_open()
+            && ctx.input(|input| input.key_pressed(egui::Key::Escape))
+            && ctx.memory(|memory| memory.focused()).is_none()
         {
-            self.confirm_selected_process_end();
-        }
-
-        // Run new task: Ctrl+N (keyboard-only accessibility).
-        if !modal_open
-            && !ctx.text_edit_focused()
-            && ctx.input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::N))
-        {
-            self.run_dialog_open = true;
-        }
-
-        // Settings dialog: Ctrl+, (standard Windows 11 Task Manager shortcut).
-        if !modal_open
-            && !ctx.text_edit_focused()
-            && ctx.input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::Comma))
-        {
-            self.show_settings = true;
-        }
-
-        // Global page switching: Ctrl+Tab / Ctrl+Shift+Tab cycle the pages in
-        // `Tab::ALL` order, Ctrl+1..9 jumps directly. Open dialogs keep
-        // keyboard ownership (same gate as Delete), and an open popup (a row
-        // context menu) does too — cycling the page behind it would strand
-        // the menu on a table that is no longer there. Inside a text edit the
-        // Ctrl-modified keys insert nothing (see the search shortcut below),
-        // so switching pages from a focused search field is safe — exactly
-        // what native Task Manager does with Ctrl+Tab.
-        if !modal_open && !egui::Popup::is_any_open(&ctx) {
-            let page_keys = [
-                egui::Key::Num1,
-                egui::Key::Num2,
-                egui::Key::Num3,
-                egui::Key::Num4,
-                egui::Key::Num5,
-                egui::Key::Num6,
-                egui::Key::Num7,
-                egui::Key::Num8,
-                egui::Key::Num9,
-            ];
-            let (next, prev, digit) = ctx.input(|i| {
-                (
-                    i.modifiers.ctrl && !i.modifiers.shift && i.key_pressed(egui::Key::Tab),
-                    i.modifiers.ctrl && i.modifiers.shift && i.key_pressed(egui::Key::Tab),
-                    page_keys
-                        .iter()
-                        .position(|key| i.key_pressed(*key) && i.modifiers.ctrl)
-                        .map(|index| index + 1),
-                )
+            ctx.memory_mut(|memory| {
+                memory.request_focus(crate::search::content_focus_id(self.tab.key()))
             });
-            if let Some(target) = page_switch_target(self.tab, next, prev, digit) {
-                self.tab = target;
-            }
-        }
-
-        // Global search shortcut (audit §5): Alt+F as documented by native
-        // Task Manager, plus Ctrl+F as most users expect. egui ignores
-        // ctrl-modified characters inside text edits, so this cannot leak
-        // an 'f' into whatever field currently holds focus. The Performance
-        // page shows no search box, so the shortcut must not target one.
-        let search_focus = self.tab != Tab::Performance
-            && ctx.input(|i| i.key_pressed(egui::Key::F) && (i.modifiers.alt || i.modifiers.ctrl));
-        if search_focus {
-            let id = egui::Id::new("global-search");
-            ctx.memory_mut(|m| m.request_focus(id));
-        }
-
-        // F1 shortcut help: a lookup, toggled — never persisted, never opened
-        // on top of a dialog or a menu (they own the keyboard while up). Esc
-        // closes it; the search panel holds its own Esc clear while the
-        // overlay is up so one keystroke does only one thing.
-        if !modal_open
-            && !egui::Popup::is_any_open(&ctx)
-            && ctx.input(|i| i.key_pressed(egui::Key::F1))
-        {
-            self.show_help = !self.show_help;
-        }
-        if self.show_help
-            && !modal_open
-            && !egui::Popup::is_any_open(&ctx)
-            && ctx.input(|i| i.key_pressed(egui::Key::Escape))
-        {
-            self.show_help = false;
         }
 
         // Track window size for persistence (only while remembering). A
@@ -1889,7 +1942,8 @@ impl TaskManApp {
     /// earlier in this one — a single keystroke cannot both open a dialog and
     /// race past the gate in the same frame.
     pub fn modal_open(&self) -> bool {
-        self.show_settings
+        self.show_help
+            || self.show_settings
             || self.run_dialog_open
             || self.affinity_dialog.is_some()
             || self.pending_session_logoff.is_some()
@@ -2696,67 +2750,19 @@ mod tests {
         assert_eq!(page_switch_target(all[0], false, false, None), None);
     }
 
-    /// When navigating a table with Tab and no widget focused, Tab walks forward
-    /// into the active sidebar tab first, falling back to the first sidebar tab,
-    /// hamburger icon, toolbar button, or column header cell.
     #[test]
-    fn list_nav_tab_target_prioritizes_sidebar_then_toolbar_then_header() {
+    fn f6_skips_unavailable_search_and_commands() {
         let ctx = egui::Context::default();
-        let selected_id = egui::Id::new("test-selected-sidebar-tab");
-        let first_tab_id = egui::Id::new("test-first-sidebar-tab");
-        let sidebar_item_id = egui::Id::new("test-sidebar-item");
-        let btn_id = egui::Id::new("test-toolbar-btn");
-        let hdr_id = egui::Id::new("test-hdr-cell");
-
-        // 1. Neither registered -> None
-        assert_eq!(list_nav_tab_target(Tab::Processes, &ctx), None);
-
-        // 2. Only header registered -> returns header ID
-        ctx.data_mut(|d| {
-            d.insert_temp(
-                egui::Id::new(("tm-first-hdr-cell", "processes")),
-                Some(hdr_id),
-            );
-        });
-        assert_eq!(list_nav_tab_target(Tab::Processes, &ctx), Some(hdr_id));
-
-        // 3. Toolbar button registered -> prioritizes toolbar button over header
-        ctx.data_mut(|d| {
-            d.insert_temp(egui::Id::new("tm-first-toolbar-button"), Some(btn_id));
-        });
-        assert_eq!(list_nav_tab_target(Tab::Processes, &ctx), Some(btn_id));
-
-        // 4. Hamburger item registered -> prioritizes hamburger over toolbar
-        ctx.data_mut(|d| {
-            d.insert_temp(
-                egui::Id::new("tm-first-sidebar-item"),
-                Some(sidebar_item_id),
-            );
+        ctx.memory_mut(|memory| {
+            memory.request_focus(crate::search::content_focus_id("performance"))
         });
         assert_eq!(
-            list_nav_tab_target(Tab::Processes, &ctx),
-            Some(sidebar_item_id)
+            next_region(&ctx, Tab::Performance, false),
+            egui::Id::new(("tm-sidebar-tab", "performance"))
         );
-
-        // 5. First sidebar tab registered -> prioritizes first sidebar tab over hamburger
-        ctx.data_mut(|d| {
-            d.insert_temp(egui::Id::new("tm-first-sidebar-tab"), Some(first_tab_id));
-        });
         assert_eq!(
-            list_nav_tab_target(Tab::Processes, &ctx),
-            Some(first_tab_id)
-        );
-
-        // 6. Selected sidebar tab registered -> prioritizes selected sidebar tab over first tab
-        ctx.data_mut(|d| {
-            d.insert_temp(egui::Id::new("tm-selected-sidebar-tab"), Some(selected_id));
-        });
-        assert_eq!(list_nav_tab_target(Tab::Processes, &ctx), Some(selected_id));
-
-        // 7. Works equally on Performance tab (which has no table headers)
-        assert_eq!(
-            list_nav_tab_target(Tab::Performance, &ctx),
-            Some(selected_id)
+            next_region(&ctx, Tab::Performance, true),
+            egui::Id::new(("tm-sidebar-tab", "performance"))
         );
     }
 }

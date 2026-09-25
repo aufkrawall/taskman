@@ -274,6 +274,7 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
                 let s = rows[ri];
                 let selected = app.services_selected_name.as_deref() == Some(s.name.as_str());
                 let (rect, resp) = table.row(ui, &pal, selected, s.name.as_str());
+                table.describe_row(ui, &resp, &s.display_name, ri);
 
                 let icon_rect = egui::Rect::from_center_size(
                     egui::Pos2::new(rect.left() + 38.0, rect.center().y),
@@ -315,7 +316,7 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
                 if resp.clicked() {
                     app.services_selected_name = Some(s.name.clone());
                 }
-                // Enter (with nothing else holding focus) opens the same menu
+                // Enter while the service table has focus opens the same menu
                 // as the Menu key — there is no clearer primary action on a
                 // service row than its Start/Stop/Restart command list. Both
                 // stay dead while a dialog is up: a menu opened over a dialog
@@ -326,6 +327,7 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
                     && selected_row;
                 let keyboard_open = (enter_open
                     || (!ui.ctx().any_popup_open() && menu::keyboard_menu_requested(ui.ctx())))
+                    && crate::search::content_has_focus(ui.ctx())
                     && !app.modal_open()
                     && selected_row;
                 menu::context_menu_kb(&resp, keyboard_open, |ui| {
@@ -572,6 +574,7 @@ pub fn control_confirm_dialog(app: &mut TaskManApp, ctx: &egui::Context, pal: &t
     let key_decision = crate::app_ui::dialog_key_decision(keys, focused, true);
     let mut clicked = crate::app_ui::DialogButtonClick::None;
     egui::Window::new(title)
+        .modal(true)
         .open(&mut open)
         .collapsible(false)
         .resizable(false)

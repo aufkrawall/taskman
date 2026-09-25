@@ -17,19 +17,30 @@ can cross a protected, allowlisted service boundary after one explicit install.
 
 ## Keyboard interaction model (2026-09-25)
 
-The visible selection IS the keyboard focus, the way native Task Manager
-behaves: table rows are click-sensing but never Tab-focusable (`tablekit`
-allocates them with `Sense::CLICK | hover`), arrows/Home/End/PageUp/PageDown
-move the visible selection from anywhere on the page, and chrome (header
-cells, cards, buttons) keeps Tab. Every list keyboard layer shares the
-gates in `search.rs`:
+**Focus regions.** A page is exactly FOUR egui focus targets, cycled with
+F6 / Shift+F6 (`FocusRegion` in `app.rs`): search box, sidebar, the page's
+command buttons (`finish_toolbar_focus` publishes the current page's button
+list in Tab order), and the page CONTENT. The Performance tab has no search
+box and is skipped. `search::content_focus_id(tab.key())` is that content
+target — for a table or the Performance card list it is a single
+`Sense::focusable_noninteractive` surface wrapping the whole collection, not
+one stop per row, and the active page's key is published under
+`tm-active-content`.
 
-- `nav_gate` (arrows and accumulated type-ahead) yields to a focused text
-  edit, an open popup, and an open dialog.
-- `row_action_gate` (Enter/Space row bindings) requires that NOTHING holds
-  focus plus no popup, and page-level call sites also stand it down while a
-  dialog is open — egui turns Enter/Space into a click for whatever holds
-  focus, so a focused widget must activate itself, never the row.
+**Selection is the focus.** The visible selection IS the keyboard focus, the
+way native Task Manager behaves: table rows and Performance cards are
+click-sensing but never Tab-focusable (`tablekit` allocates them with
+`Sense::CLICK | hover`), arrows/Home/End/PageUp/PageDown move the visible
+selection from anywhere on the page, and chrome (header cells, splitters,
+buttons, charts) keeps Tab. Every list keyboard layer shares the gates in
+`search.rs`:
+
+- `nav_gate` (arrows and accumulated type-ahead) requires the page's content
+  region to hold focus, plus no open popup and no open dialog.
+- `row_action_gate` (Enter/Space row bindings) is `nav_gate` — egui turns
+  Enter/Space into a click for whatever holds focus, so a focused widget must
+  activate itself, never the row. Page-level call sites additionally stand
+  these down while a dialog is open.
 
 Global layer in `app.rs`: Ctrl+Tab / Ctrl+Shift+Tab / Ctrl+1..9 page
 switching and the F1 shortcut overlay stand down while a dialog or a popup
@@ -39,6 +50,21 @@ to the first match under the page's LIVE display order — the same
 filtered/sorted model the type-ahead walk uses — and scrolls it into view
 (`commit_search_selection`); the field surrenders focus so the arrows take
 over; Esc clears globally behind the dialog/popup/help gate.
+
+**Charts are focusable and keyboard-scrubbable** (`widgets/chart.rs`).
+`keyboard_sample` pins the cursor to a SAMPLE TIMESTAMP rather than an index,
+so a live refresh appending samples never slides the selection; it returns
+`(index, moved_this_keypress)` and the readout only changes the accessible
+value on an actual key gesture. Left/Right step, Home/End jump to the ends.
+`chart_multi` spends Up/Down on the series, the CPU logical-core grid spends
+it on the core, and only the actively selected member gets a `grouped_sample`
+readout — the siblings stay click-only so one focus target drives the grid.
+The context menus on the big graphs are gated on `resp.has_focus()`, so a
+keyboard-opened one is reachable (Shift+F10 / Menu key).
+
+**Header cells** sort on Enter/Space, open their column menu on the Menu
+key, resize with Ctrl+Left/Right (Shift = 32 px instead of 8) and REORDER
+with Alt+Left/Right inside the table's `reorderable` range.
 
 Dialog contracts (shared helpers in `app_ui/original.rs`, keys always
 consumed BEFORE `Window::show`):
@@ -60,12 +86,32 @@ consumed BEFORE `Window::show`):
   remembers the invoking widget on its first frame and hands focus back on
   close.
 
+**Dialogs are genuinely modal.** Every dialog opens with `Window::modal(true)`
+— a fork addition (see below) that raises the window to `Order::Foreground`
+and calls `memory.set_modal_layer`. The fork's `Focus` now records the
+focusable ids it meets ON that top modal layer (`modal_interested`, in Tab
+order) and, at `end_pass`, redirects a pending focus request into the dialog
+and clamps Tab to its members. This replaced the app-side Tab contracts'
+need to guard the background: a focus request for a widget behind an open
+dialog lands inside it instead of behind it.
+
+**Screen-reader semantics.** Tables, the card list, the charts, the
+Performance splitter and the dropdown arrows build an accesskit tree through
+`ui.ctx().accesskit_node_builder` — list/list-item with `position_in_set` /
+`size_of_set` / `selected`, the splitter reporting its width, the chart
+publishing the selected sample as its `value`. Because the rows and cards are
+NOT egui focus targets, their nodes are attached to the collection through
+`Context::register_accesskit_parent`; the fork makes that public and repairs
+the parent link when it changes after the node was already built (the pointer
+used to be recorded before the node existed and silently lost).
+
 Context menus (`widgets/menu.rs`): Tab closes an open menu,
 ArrowRight/ArrowLeft open and close submenus, and the Menu/Application key
 triggers while any non-text widget holds focus (gate is
-`text_edit_focused`, not `egui_wants_keyboard_input`). Accepted residuals
-of this model (non-modal dialogs, pointer-only chart readout, search-commit
-ordering, performance-card indicator) are in `known-debt.md`.
+`text_edit_focused`, not `egui_wants_keyboard_input`). A menu records the
+widget that opened it and `restore_closed_menu_focus` hands focus back once
+the popup is gone. Accepted residuals of this model are in
+`known-debt.md`.
 
 ## 2026-09-24 correctness pass
 

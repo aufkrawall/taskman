@@ -271,6 +271,7 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
                 let item = &mut items[i];
                 let selected = app.selected_startup_id.as_deref() == Some(item.id.as_str());
                 let (rect, resp) = table.row(ui, &pal, selected, item.id.as_str());
+                table.describe_row(ui, &resp, &item.name, vi);
 
                 let exe = exe_from_command(&item.command);
                 let tex = exe
@@ -332,7 +333,7 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
                 if resp.clicked() {
                     app.selected_startup_id = Some(item.id.clone());
                 }
-                // Enter (with nothing else holding focus) opens the same menu
+                // Enter while the Startup table has focus opens the same menu
                 // as the Menu key: enable/disable is the closest thing to a
                 // primary action a startup entry has. Both stand down while a
                 // dialog is up — a menu opened over a dialog would strand
@@ -343,6 +344,7 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
                     && selected_row;
                 let keyboard_open = (enter_open
                     || (!ui.ctx().any_popup_open() && menu::keyboard_menu_requested(ui.ctx())))
+                    && crate::search::content_has_focus(ui.ctx())
                     && !app.modal_open()
                     && selected_row;
                 menu::context_menu_kb(&resp, keyboard_open, |ui| {
@@ -550,6 +552,7 @@ pub fn properties_dialog(app: &mut TaskManApp, ctx: &egui::Context, _pal: &theme
     let keys = crate::app_ui::consume_dialog_keys(ctx, false);
     let close_now = keys.escape || keys.enter;
     egui::Window::new(i18n::tr(K::Properties))
+        .modal(true)
         .open(&mut open)
         .collapsible(false)
         .resizable(false)

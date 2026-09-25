@@ -10,7 +10,7 @@ use crate::app::{HistoryPoint, TaskManApp};
 use crate::search;
 use crate::theme::{self, Palette};
 use crate::widgets::chart::{
-    MultiSeries, TimeAxis, ValueFmt, chart_multi, core_chart, fmt_percent,
+    MultiSeries, TimeAxis, ValueFmt, chart_multi, core_chart_grouped, fmt_percent,
 };
 use crate::widgets::menu;
 
@@ -395,6 +395,25 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
     ui.horizontal_top(|ui| {
         // ---------------- left column of cards (user-resizable) -------------
         let mut card_w = app.shared.settings.perf_card_width.clamp(180.0, 520.0);
+        let card_rect = egui::Rect::from_min_size(
+            ui.available_rect_before_wrap().min,
+            egui::vec2(card_w, ui.available_height()),
+        );
+        let cards_focus = ui.interact(
+            card_rect,
+            search::content_focus_id("performance"),
+            egui::Sense::focusable_noninteractive(),
+        );
+        ui.ctx()
+            .data_mut(|data| data.insert_temp(egui::Id::new("tm-content-present"), "performance"));
+        cards_focus.widget_info(|| {
+            egui::WidgetInfo::labeled(egui::WidgetType::Other, true, app.tab.label())
+        });
+        ui.ctx().accesskit_node_builder(cards_focus.id, |node| {
+            node.set_role(egui::accesskit::Role::List);
+            node.set_label(app.tab.label());
+            node.set_size_of_set(entries.len());
+        });
         egui::ScrollArea::vertical()
             .id_salt("perf-cards")
             .show(ui, |ui| {
@@ -415,13 +434,23 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
                             ResourceKind::Gpu => gpu_series(win, &e.key, GpuField::Util),
                         })
                         .collect();
-                    for (e, samples) in entries.iter().zip(card_series.iter()) {
+                    for (index, (e, samples)) in entries.iter().zip(card_series.iter()).enumerate()
+                    {
                         let selected = e.key == app.perf_selected_key;
-                        card_ui(app, ui, &pal, e, selected, samples);
+                        card_ui(app, ui, &pal, e, selected, samples, index, entries.len());
                     }
                     ui.add_space(8.0);
                 });
             });
+
+        if cards_focus.has_focus() {
+            ui.painter().rect_stroke(
+                card_rect.shrink(1.0),
+                3.0,
+                egui::Stroke::new(2.0, pal.accent),
+                egui::StrokeKind::Inside,
+            );
+        }
 
         // Drag splitter between the card column and the detail area.
         // egui's `drag_delta()` is movement since LAST FRAME, so it must
@@ -430,7 +459,20 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
         // value every frame, so the splitter never followed the cursor
         // (the same root cause as the table column resize bug).
         let split_h = ui.available_height();
-        let (srect, sresp) = ui.allocate_exact_size(egui::vec2(10.0, split_h), egui::Sense::drag());
+        let (srect, _) = ui.allocate_exact_size(egui::vec2(10.0, split_h), egui::Sense::hover());
+        let sresp = ui.interact(
+            srect,
+            egui::Id::new("performance-card-splitter"),
+            egui::Sense::click_and_drag(),
+        );
+        sresp.widget_info(|| {
+            egui::WidgetInfo::labeled(egui::WidgetType::Other, true, i18n::tr(K::PerfCardsWidth))
+        });
+        ui.ctx().accesskit_node_builder(sresp.id, |node| {
+            node.set_role(egui::accesskit::Role::Splitter);
+            node.set_label(i18n::tr(K::PerfCardsWidth));
+            node.set_value(format!("{} px", card_w.round()));
+        });
         if sresp.hovered() || sresp.dragged() {
             ui.ctx().set_cursor_icon(CursorIcon::ResizeHorizontal);
         }
@@ -444,6 +486,44 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
                 ],
                 egui::Stroke::new(2.0, pal.accent),
             );
+        }
+        if sresp.has_focus() {
+            ui.painter().rect_stroke(
+                srect.shrink(1.0),
+                2.0,
+                egui::Stroke::new(2.0, pal.accent),
+                egui::StrokeKind::Inside,
+            );
+            ui.memory_mut(|memory| {
+                memory.set_focus_lock_filter(
+                    sresp.id,
+                    egui::EventFilter {
+                        horizontal_arrows: true,
+                        ..Default::default()
+                    },
+                )
+            });
+            let key = ui.input(|input| {
+                [egui::Key::ArrowLeft, egui::Key::ArrowRight]
+                    .into_iter()
+                    .find(|key| input.key_pressed(*key) && !input.modifiers.alt)
+                    .map(|key| (key, input.modifiers))
+            });
+            if let Some((key, modifiers)) = key {
+                let delta = if modifiers.shift { 32.0 } else { 8.0 };
+                let direction = if key == egui::Key::ArrowRight {
+                    1.0
+                } else {
+                    -1.0
+                };
+                card_w = (card_w + delta * direction).clamp(180.0, 520.0);
+                app.shared.settings.perf_card_width = card_w;
+                app.save_settings();
+                ui.input_mut(|input| {
+                    input.consume_key(modifiers, key);
+                });
+                ui.memory_mut(|memory| memory.move_focus(egui::FocusDirection::None));
+            }
         }
 
         ui.add_space(6.0);
@@ -481,6 +561,7 @@ const CARD_CHART_W: f32 = 74.0;
 /// Card height (also the unit of the PageUp/PageDown card-span estimate).
 const CARD_H: f32 = 64.0;
 
+#[allow(clippy::too_many_arguments)]
 fn card_ui(
     app: &mut TaskManApp,
     ui: &mut egui::Ui,
@@ -488,6 +569,8 @@ fn card_ui(
     e: &ResourceEntry,
     selected: bool,
     samples: &[f64],
+    index: usize,
+    total: usize,
 ) {
     let size = egui::vec2(ui.available_width(), CARD_H);
     // Click-sense WITHOUT the focusable bit (same model as the tablekit
@@ -495,7 +578,27 @@ fn card_ui(
     // navigation must not drift keyboard focus onto the card column — a
     // focused card would eat the app's arrow navigation and show a dead
     // surface with no ring of its own. Tooltips and clicks are unchanged.
-    let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::CLICK);
+    let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
+    let resp = ui.interact(
+        rect,
+        egui::Id::new(("performance-card", e.kind as u8, e.key.as_str())),
+        egui::Sense::CLICK,
+    );
+    let list_id = search::content_focus_id("performance");
+    ui.ctx().register_accesskit_parent(resp.id, list_id);
+    ui.ctx().accesskit_node_builder(resp.id, |node| {
+        node.set_role(egui::accesskit::Role::ListItem);
+        node.set_label(e.title.as_str());
+        node.set_value(e.value_line.as_str());
+        node.set_selected(selected);
+        node.set_position_in_set(index + 1);
+        node.set_size_of_set(total);
+    });
+    if selected {
+        ui.ctx().accesskit_node_builder(list_id, |node| {
+            node.set_active_descendant(resp.id.accesskit_id());
+        });
+    }
     // Selected and hovered cards are lifted onto `card_bg`; the mini graph
     // inside then has to sink to keep a visible cell of its own, or it merges
     // with the card it sits on.
@@ -512,6 +615,8 @@ fn card_ui(
         ui.painter().rect_filled(rect, 3.0, pal.card_bg);
     }
     if resp.clicked() {
+        ui.ctx()
+            .memory_mut(|memory| memory.request_focus(search::content_focus_id("performance")));
         app.perf_selected_key = e.key.clone();
         app.shared.settings.perf_selected_key = app.perf_selected_key.clone();
         app.save_settings();
@@ -721,8 +826,11 @@ fn ellipsize(ui: &egui::Ui, s: &str, font: &FontId, max_w: f32) -> String {
 /// Chart block inset by the page gutter so chart edges align with the
 /// caption text above (the old code drew charts flush-left at avail−64 —
 /// misaligned on BOTH sides).
+#[allow(clippy::too_many_arguments)]
 fn page_chart(
     ui: &mut egui::Ui,
+    id: &'static str,
+    label: &str,
     width: f32,
     height: f32,
     series: &[MultiSeries],
@@ -730,11 +838,19 @@ fn page_chart(
     axis: Option<TimeAxis>,
     fmt: ValueFmt,
 ) -> egui::Response {
-    ui.horizontal(|ui| {
-        ui.add_space(GUTTER);
-        chart_multi(ui, egui::vec2(width, height), series, y_max, axis, fmt)
-    })
-    .inner
+    let response = ui
+        .push_id(id, |ui| {
+            ui.horizontal(|ui| {
+                ui.add_space(GUTTER);
+                chart_multi(ui, egui::vec2(width, height), series, y_max, axis, fmt)
+            })
+            .inner
+        })
+        .inner;
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Other, true, label));
+    ui.ctx()
+        .accesskit_node_builder(response.id, |node| node.set_label(label));
+    response
 }
 
 /// Hover-readout formatters. Each chart plots in whatever unit its y scale is
@@ -916,7 +1032,7 @@ fn page_title(ui: &mut egui::Ui, pal: &Palette, title: &str, right: &str) {
 /// Caption row: dim caption left, scale max right.
 fn caption(ui: &mut egui::Ui, pal: &Palette, left: &str, right: &str) -> egui::Response {
     let (rect, resp) =
-        ui.allocate_exact_size(egui::vec2(ui.available_width(), 20.0), egui::Sense::click());
+        ui.allocate_exact_size(egui::vec2(ui.available_width(), 20.0), egui::Sense::hover());
     ui.painter().text(
         Pos2::new(rect.left() + GUTTER, rect.center().y),
         Align2::LEFT_CENTER,
@@ -964,6 +1080,15 @@ fn caption_dropdown(ui: &mut egui::Ui, pal: &Palette, title: &str, rest: &str) -
             egui::Sense::click(),
         )
         .on_hover_cursor(CursorIcon::PointingHand);
+    arrow_resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, title));
+    if arrow_resp.has_focus() {
+        painter.rect_stroke(
+            dropdown_rect,
+            2.0,
+            egui::Stroke::new(2.0, pal.accent),
+            egui::StrokeKind::Inside,
+        );
+    }
 
     let is_hovered = arrow_resp.hovered();
     let text_color = if is_hovered { pal.text } else { pal.text_dim };
@@ -1270,12 +1395,76 @@ fn cpu_page(app: &mut TaskManApp, ui: &mut egui::Ui, pal: &Palette) {
         let gap = 8.0;
         ui.horizontal_top(|ui| {
             ui.add_space(GUTTER);
+            let grid_h = cores.div_ceil(cols) as f32 * (cell_h + gap) - gap;
+            let grid_rect = egui::Rect::from_min_size(
+                ui.available_rect_before_wrap().min,
+                egui::vec2(width, grid_h),
+            );
+            let group = ui.interact(
+                grid_rect,
+                egui::Id::new("cpu-logical-chart-group"),
+                egui::Sense::focusable_noninteractive(),
+            );
+            group.widget_info(|| {
+                egui::WidgetInfo::labeled(
+                    egui::WidgetType::Other,
+                    true,
+                    i18n::tr(K::CpuGraphLogical),
+                )
+            });
+            ui.ctx().accesskit_node_builder(group.id, |node| {
+                node.set_role(egui::accesskit::Role::Group);
+                node.set_label(i18n::tr(K::CpuGraphLogical));
+            });
+            let core_id = group.id.with("selected-core");
+            let mut selected_core = ui
+                .ctx()
+                .data(|data| data.get_temp::<usize>(core_id))
+                .unwrap_or(0)
+                .min(cores - 1);
+            let sample = crate::widgets::chart::keyboard_sample(ui, &group, Some(axis), ts.len());
+            let core_key = if group.has_focus() && sample.is_some_and(|(_, changed)| !changed) {
+                ui.input(|input| {
+                    [egui::Key::ArrowUp, egui::Key::ArrowDown]
+                        .into_iter()
+                        .find(|key| input.key_pressed(*key) && !input.modifiers.any())
+                })
+            } else {
+                None
+            };
+            if let Some(key) = core_key {
+                selected_core = if key == egui::Key::ArrowDown {
+                    (selected_core + 1).min(cores - 1)
+                } else {
+                    selected_core.saturating_sub(1)
+                };
+                ui.ctx()
+                    .data_mut(|data| data.insert_temp(core_id, selected_core));
+                ui.input_mut(|input| {
+                    input.consume_key(Default::default(), key);
+                });
+                ui.memory_mut(|memory| memory.move_focus(egui::FocusDirection::None));
+            }
+            if let Some((sample_index, changed)) = sample
+                && let Some(value) = core_hist[selected_core].get(sample_index)
+            {
+                crate::widgets::chart::chart_accessible_value(
+                    ui,
+                    &group,
+                    format!(
+                        "CPU {selected_core}, {}: {}",
+                        crate::widgets::chart::sample_age(Some(axis), sample_index),
+                        fmt_percent(*value)
+                    ),
+                    changed || core_key.is_some(),
+                );
+            }
             egui::Grid::new("core-grid")
                 .spacing([gap, gap])
                 .start_row(0)
                 .show(ui, |ui| {
                     for i in 0..cores {
-                        let response = core_chart(
+                        let response = core_chart_grouped(
                             ui,
                             egui::vec2(cell_w, cell_h),
                             &core_hist[i],
@@ -1283,6 +1472,9 @@ fn cpu_page(app: &mut TaskManApp, ui: &mut egui::Ui, pal: &Palette) {
                             pal.cpu_graph,
                             &format!("CPU {i}"),
                             Some(axis),
+                            sample
+                                .filter(|_| i == selected_core)
+                                .map(|(index, _)| index),
                         );
                         cpu_graph_context_menu(app, &response);
                         if (i + 1) % cols == 0 {
@@ -1290,6 +1482,15 @@ fn cpu_page(app: &mut TaskManApp, ui: &mut egui::Ui, pal: &Palette) {
                         }
                     }
                 });
+            if group.has_focus() {
+                ui.painter().rect_stroke(
+                    grid_rect.shrink(1.0),
+                    3.0,
+                    egui::Stroke::new(2.0, pal.accent),
+                    egui::StrokeKind::Inside,
+                );
+            }
+            cpu_graph_context_menu(app, &group);
         });
     } else {
         // Overall utilization: one aggregate series (+ kernel overlay).
@@ -1309,6 +1510,8 @@ fn cpu_page(app: &mut TaskManApp, ui: &mut egui::Ui, pal: &Palette) {
         ));
         let resp = page_chart(
             ui,
+            "cpu-overall-chart",
+            "CPU",
             width,
             180.0,
             &chart_series,
@@ -1436,8 +1639,10 @@ fn cpu_page(app: &mut TaskManApp, ui: &mut egui::Ui, pal: &Palette) {
 /// network): the time window is the one thing they can change, and a native
 /// Task Manager user right-clicks every graph expecting *something*.
 fn time_window_context_menu(app: &mut TaskManApp, resp: &egui::Response) {
-    let kb_open =
-        !app.modal_open() && !resp.ctx.any_popup_open() && menu::keyboard_menu_requested(&resp.ctx);
+    let kb_open = resp.has_focus()
+        && !app.modal_open()
+        && !resp.ctx.any_popup_open()
+        && menu::keyboard_menu_requested(&resp.ctx);
     menu::context_menu_kb(resp, kb_open, |ui| {
         ui.set_min_width(170.0);
         menu::title(ui, i18n::tr(K::GraphWindowLabel));
@@ -1456,8 +1661,10 @@ fn time_window_context_menu(app: &mut TaskManApp, resp: &egui::Response) {
 /// Context menu on the CPU graphs: change graph to overall/logical and
 /// toggle the kernel-times overlay (§14.4).
 fn cpu_graph_context_menu(app: &mut TaskManApp, resp: &egui::Response) {
-    let kb_open =
-        !app.modal_open() && !resp.ctx.any_popup_open() && menu::keyboard_menu_requested(&resp.ctx);
+    let kb_open = resp.has_focus()
+        && !app.modal_open()
+        && !resp.ctx.any_popup_open()
+        && menu::keyboard_menu_requested(&resp.ctx);
     menu::context_menu_kb(resp, kb_open, |ui| {
         for (mode, key) in [
             ("overall", K::CpuGraphOverall),
@@ -1516,8 +1723,10 @@ fn gpu_graph_menu_contents(
 fn gpu_graph_context_menu(app: &mut TaskManApp, resp: &egui::Response, engines: &[String]) {
     let current = app.shared.settings.gpu_graph_mode.clone();
     let mut chosen = None;
-    let kb_open =
-        !app.modal_open() && !resp.ctx.any_popup_open() && menu::keyboard_menu_requested(&resp.ctx);
+    let kb_open = resp.has_focus()
+        && !app.modal_open()
+        && !resp.ctx.any_popup_open()
+        && menu::keyboard_menu_requested(&resp.ctx);
     menu::context_menu_kb(resp, kb_open, |ui| {
         gpu_graph_menu_contents(ui, &current, engines, &mut chosen);
     });
@@ -1572,6 +1781,8 @@ fn memory_page(app: &mut TaskManApp, ui: &mut egui::Ui, pal: &Palette) {
     let used: Vec<f64> = series(win, |h| h.mem_used_bytes as f64 / 1024.0 / 1024.0 / 1024.0);
     let in_use_chart = page_chart(
         ui,
+        "memory-in-use-chart",
+        i18n::tr(K::StatInUse),
         width,
         180.0,
         &[MultiSeries::new(
@@ -1597,6 +1808,8 @@ fn memory_page(app: &mut TaskManApp, ui: &mut egui::Ui, pal: &Palette) {
     let commit_limit = snap.memory.commit_total_bytes as f64 / 1024.0 / 1024.0 / 1024.0;
     let committed_chart = page_chart(
         ui,
+        "memory-committed-chart",
+        i18n::tr(K::StatCommitted),
         width,
         120.0,
         &[MultiSeries::new(
@@ -1756,6 +1969,8 @@ fn disk_page(app: &mut TaskManApp, ui: &mut egui::Ui, pal: &Palette, entry: &Res
     let active = disk_series(win, &entry.key, |d| d.1 as f64);
     let disk_active_chart = page_chart(
         ui,
+        "disk-active-chart",
+        i18n::tr(K::StatActiveTime),
         width,
         160.0,
         &[MultiSeries::new(
@@ -1790,6 +2005,8 @@ fn disk_page(app: &mut TaskManApp, ui: &mut egui::Ui, pal: &Palette, entry: &Res
     );
     let disk_transfer_chart = page_chart(
         ui,
+        "disk-transfer-chart",
+        i18n::tr(K::StatRead),
         width,
         160.0,
         &[
@@ -1904,6 +2121,8 @@ fn network_page(app: &mut TaskManApp, ui: &mut egui::Ui, pal: &Palette, entry: &
     );
     let network_chart = page_chart(
         ui,
+        "network-throughput-chart",
+        i18n::tr(K::StatReceive),
         width,
         230.0,
         &[
@@ -2059,6 +2278,8 @@ fn gpu_page(app: &mut TaskManApp, ui: &mut egui::Ui, pal: &Palette, entry: &Reso
     // built these series has ended — at the bottom of this function.
     let chart = page_chart(
         ui,
+        "gpu-utilization-chart",
+        i18n::tr(K::GpuTitle),
         width,
         150.0,
         &series_list,
@@ -2087,6 +2308,8 @@ fn gpu_page(app: &mut TaskManApp, ui: &mut egui::Ui, pal: &Palette, entry: &Reso
     let dedicated_mib: Vec<f64> = dedicated.iter().map(|v| v / 1024.0 / 1024.0).collect();
     let dedicated_chart = page_chart(
         ui,
+        "gpu-dedicated-chart",
+        i18n::tr(K::GpuDedicatedStat),
         width,
         150.0,
         &[MultiSeries::new(

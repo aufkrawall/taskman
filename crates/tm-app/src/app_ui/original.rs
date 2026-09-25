@@ -6,7 +6,9 @@ use eframe::egui::{self, Align2, Color32, CornerRadius, FontId, Pos2, Rect, Sens
 use tm_core::i18n::{self, K};
 use tm_core::settings::{RenderMode, Settings, TextSmoothing, ThemeMode};
 
-use crate::app::{Tab, TaskManApp};
+#[cfg(test)]
+use crate::app::Tab;
+use crate::app::TaskManApp;
 use crate::icons;
 use crate::icons::Icon;
 use crate::theme::{self, Palette};
@@ -114,31 +116,12 @@ pub fn top_search_panel(app: &mut TaskManApp, ui_root: &mut egui::Ui, pal: &Pale
                     .max_rect(edit_rect)
                     .layout(egui::Layout::left_to_right(egui::Align::Center)),
             );
-            // Tab or Down Arrow jumps directly to the process / table list:
-            // commits the search match, surrenders keyboard focus from the
-            // chrome, and leaves the table row selection active and visible.
-            // Intercepting BEFORE edit_ui.add prevents TextEdit from triggering
-            // egui's Tab traversal to the sidebar.
+            // Down Arrow enters the result list. Tab follows the ordinary
+            // control order regardless of whether a query is present.
             let search_id = egui::Id::new("global-search");
-            let has_search_query = !app.search.trim().is_empty()
-                && matches!(
-                    app.tab,
-                    Tab::Processes
-                        | Tab::Details
-                        | Tab::Services
-                        | Tab::Startup
-                        | Tab::Users
-                        | Tab::AppHistory
-                );
-            commit_search_on_tab_or_down(
-                ui.ctx(),
-                search_id,
-                has_search_query,
-                app.modal_open(),
-                || {
-                    app.commit_search_selection(ui.ctx());
-                },
-            );
+            commit_search_on_down(ui.ctx(), search_id, app.modal_open(), || {
+                app.commit_search_selection(ui.ctx());
+            });
             let edit = edit_ui.add(
                 egui::TextEdit::singleline(&mut app.search)
                     .hint_text(i18n::tr(K::SearchHint))
@@ -186,9 +169,16 @@ pub fn top_search_panel(app: &mut TaskManApp, ui_root: &mut egui::Ui, pal: &Pale
                     .interact(
                         clear_rect,
                         egui::Id::new("global-search-clear"),
-                        Sense::CLICK,
+                        Sense::click(),
                     )
                     .on_hover_text(i18n::tr(K::ClearSearch));
+                resp.widget_info(|| {
+                    egui::WidgetInfo::labeled(
+                        egui::WidgetType::Button,
+                        true,
+                        i18n::tr(K::ClearSearch),
+                    )
+                });
                 if resp.hovered() {
                     ui.painter()
                         .circle_filled(clear_rect.center(), 11.0, pal.card_bg_hover);
@@ -203,12 +193,13 @@ pub fn top_search_panel(app: &mut TaskManApp, ui_root: &mut egui::Ui, pal: &Pale
                         pal.text_dim
                     },
                 );
+                if resp.has_focus() {
+                    focus_ring(ui, clear_rect, 12.0, pal);
+                }
                 if resp.clicked() {
                     app.search.clear();
-                    // A cleared field has nothing left to edit; never strand
-                    // the keyboard on the (about to disappear) button.
                     resp.ctx
-                        .memory_mut(|mem| mem.surrender_focus(egui::Id::new("global-search")));
+                        .memory_mut(|mem| mem.request_focus(egui::Id::new("global-search")));
                 }
             }
 
@@ -303,6 +294,86 @@ fn click_surrenders_search(field_has_focus: bool, field_rect: Rect, click: Optio
     field_has_focus && click.is_some_and(|pos| !field_rect.contains(pos))
 }
 
+const TOOLBAR_FOCUS_ITEMS: &str = "tm-toolbar-focus-items";
+
+fn register_toolbar_item(ui: &egui::Ui, response: &egui::Response) {
+    if !response.enabled() {
+        return;
+    }
+    ui.ctx().data_mut(|data| {
+        let key = egui::Id::new(TOOLBAR_FOCUS_ITEMS);
+        let mut items = data
+            .get_temp::<Vec<(egui::Id, f32)>>(key)
+            .unwrap_or_default();
+        items.push((response.id, response.rect.center().x));
+        data.insert_temp(key, items);
+    });
+}
+
+pub fn finish_toolbar_focus(ctx: &egui::Context, tab: crate::app::Tab) {
+    let mut items = ctx.data(|data| {
+        data.get_temp::<Vec<(egui::Id, f32)>>(egui::Id::new(TOOLBAR_FOCUS_ITEMS))
+            .unwrap_or_default()
+    });
+    items.sort_by(|left, right| left.1.total_cmp(&right.1));
+    ctx.data_mut(|data| {
+        data.insert_temp(egui::Id::new("tm-toolbar-owner"), tab.key());
+        data.insert_temp(
+            egui::Id::new("tm-first-toolbar-button"),
+            items.first().map(|item| item.0),
+        )
+    });
+    if let Some(pending) = ctx.data_mut(|data| {
+        data.remove_temp::<&'static str>(egui::Id::new("tm-pending-toolbar-focus"))
+    }) && pending == tab.key()
+        && let Some((id, _)) = items.first()
+    {
+        ctx.memory_mut(|memory| memory.request_focus(*id));
+    }
+    let tab_pressed = ctx.input(|input| {
+        input.key_pressed(egui::Key::Tab) && !input.modifiers.ctrl && !input.modifiers.alt
+    });
+    if !tab_pressed || ctx.any_popup_open() {
+        return;
+    }
+    let reverse = ctx.input(|input| input.modifiers.shift);
+    let from = items
+        .iter()
+        .position(|(id, _)| ctx.memory(|memory| memory.had_focus_last_frame(*id)));
+    let target = if let Some(index) = from {
+        if reverse {
+            index
+                .checked_sub(1)
+                .and_then(|index| items.get(index).map(|item| item.0))
+                .or(Some(egui::Id::new("tm-sidebar-settings")))
+        } else {
+            items
+                .get(index + 1)
+                .map(|item| item.0)
+                .or(Some(egui::Id::new(("tm-header-focus", tab.key()))))
+        }
+    } else if ctx.memory(|memory| memory.had_focus_last_frame(egui::Id::new("tm-sidebar-settings")))
+        && !reverse
+    {
+        items.first().map(|item| item.0)
+    } else if reverse
+        && ctx.memory(|memory| {
+            memory.had_focus_last_frame(egui::Id::new(("tm-header-focus", tab.key())))
+        })
+    {
+        items.last().map(|item| item.0)
+    } else {
+        None
+    };
+    if let Some(target) = target {
+        ctx.memory_mut(|memory| memory.request_focus(target));
+        ctx.input_mut(|input| {
+            input.consume_key(Default::default(), egui::Key::Tab);
+            input.consume_key(egui::Modifiers::SHIFT, egui::Key::Tab);
+        });
+    }
+}
+
 // ---------------------------------------------------------------- sidebar
 
 pub fn sidebar(app: &mut TaskManApp, ui_root: &mut egui::Ui, pal: &Palette) {
@@ -327,6 +398,39 @@ pub fn sidebar(app: &mut TaskManApp, ui_root: &mut egui::Ui, pal: &Palette) {
                 }),
         )
         .show(ui_root, |ui| {
+            if let Some(focused) = crate::app::Tab::ALL.iter().copied().find(|tab| {
+                ui.ctx()
+                    .memory(|memory| memory.has_focus(egui::Id::new(("tm-sidebar-tab", tab.key()))))
+            }) {
+                let direction = ui.input(|input| {
+                    if input.modifiers.any() {
+                        0
+                    } else if input.key_pressed(egui::Key::ArrowDown) {
+                        1
+                    } else if input.key_pressed(egui::Key::ArrowUp) {
+                        -1
+                    } else {
+                        0
+                    }
+                });
+                if direction != 0 {
+                    let current = crate::app::Tab::ALL
+                        .iter()
+                        .position(|tab| *tab == focused)
+                        .unwrap_or(0) as isize;
+                    let next = (current + direction)
+                        .clamp(0, crate::app::Tab::ALL.len() as isize - 1)
+                        as usize;
+                    app.tab = crate::app::Tab::ALL[next];
+                    ui.ctx().memory_mut(|memory| {
+                        memory.request_focus(egui::Id::new(("tm-sidebar-tab", app.tab.key())))
+                    });
+                    ui.input_mut(|input| {
+                        input.consume_key(Default::default(), egui::Key::ArrowDown);
+                        input.consume_key(Default::default(), egui::Key::ArrowUp);
+                    });
+                }
+            }
             if icon_button(ui, pal, Icon::Hamburger, 32.0, collapsed) {
                 app.shared.settings.sidebar_collapsed = !collapsed;
                 app.save_settings();
@@ -335,15 +439,22 @@ pub fn sidebar(app: &mut TaskManApp, ui_root: &mut egui::Ui, pal: &Palette) {
 
             for (idx, &tab) in crate::app::Tab::ALL.iter().enumerate() {
                 let selected = app.tab == tab;
-                let resp = nav_item(ui, pal, tab.icon(), tab.label(), selected, collapsed);
-                if resp.clicked() || resp.gained_focus() {
+                let resp = nav_item(
+                    ui,
+                    pal,
+                    egui::Id::new(("tm-sidebar-tab", tab.key())),
+                    tab.icon(),
+                    tab.label(),
+                    selected,
+                    collapsed,
+                    selected,
+                );
+                if resp.clicked() {
                     app.tab = tab;
                 }
                 if resp.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                    resp.surrender_focus();
-                    ui.ctx().memory_mut(|m| {
-                        m.surrender_focus(resp.id);
-                        m.move_focus(egui::FocusDirection::None);
+                    ui.ctx().memory_mut(|memory| {
+                        memory.request_focus(crate::search::content_focus_id(tab.key()))
                     });
                     ui.input_mut(|i| i.consume_key(Default::default(), egui::Key::Enter));
                 }
@@ -366,10 +477,12 @@ pub fn sidebar(app: &mut TaskManApp, ui_root: &mut egui::Ui, pal: &Palette) {
             let resp = nav_item(
                 ui,
                 pal,
+                egui::Id::new("tm-sidebar-settings"),
                 Icon::Settings,
                 i18n::tr(K::Settings),
                 false,
                 collapsed,
+                true,
             );
             if resp.clicked() {
                 app.show_settings = true;
@@ -380,18 +493,37 @@ pub fn sidebar(app: &mut TaskManApp, ui_root: &mut egui::Ui, pal: &Palette) {
         });
 }
 
+#[allow(clippy::too_many_arguments)]
 fn nav_item(
     ui: &mut egui::Ui,
     pal: &Palette,
+    id: egui::Id,
     icon: Icon,
     label: &str,
     selected: bool,
     collapsed: bool,
+    focusable: bool,
 ) -> egui::Response {
     let h = 38.0;
-    let id = ui.id().with(("nav-item", label));
     let (rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), h), Sense::hover());
-    let resp = ui.interact(rect, id, Sense::click().union(Sense::hover()));
+    let sense = if focusable {
+        Sense::click()
+    } else {
+        Sense::CLICK
+    };
+    let resp = ui.interact(rect, id, sense);
+    resp.widget_info(|| {
+        egui::WidgetInfo::selected(egui::WidgetType::SelectableLabel, true, selected, label)
+    });
+    ui.ctx().accesskit_node_builder(resp.id, |node| {
+        node.set_role(if id == egui::Id::new("tm-sidebar-settings") {
+            egui::accesskit::Role::Button
+        } else {
+            egui::accesskit::Role::Tab
+        });
+        node.set_label(label);
+        node.set_selected(selected);
+    });
     let painter = ui.painter();
     if selected {
         painter.rect_filled(
@@ -439,11 +571,15 @@ fn nav_item(
                 && !i.modifiers.alt
         });
         if drop_to_content {
-            resp.surrender_focus();
-            ui.ctx().memory_mut(|m| {
-                m.surrender_focus(resp.id);
-                m.move_focus(egui::FocusDirection::None);
-            });
+            if let Some(active) = ui
+                .ctx()
+                .data(|data| data.get_temp::<&'static str>(egui::Id::new("tm-active-content")))
+            {
+                ui.ctx().memory_mut(|memory| {
+                    memory.request_focus(crate::search::content_focus_id(active));
+                    memory.move_focus(egui::FocusDirection::None);
+                });
+            }
             ui.input_mut(|i| {
                 i.consume_key(Default::default(), egui::Key::ArrowRight);
                 i.consume_key(Default::default(), egui::Key::Escape);
@@ -459,7 +595,14 @@ fn icon_button(ui: &mut egui::Ui, pal: &Palette, icon: Icon, size: f32, center: 
     } else {
         size
     };
-    let (rect, resp) = ui.allocate_exact_size(egui::vec2(w, size), Sense::click());
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(w, size), Sense::hover());
+    let resp = ui.interact(rect, egui::Id::new("tm-sidebar-toggle"), Sense::click());
+    let label = i18n::tr(if center { K::Expand } else { K::Collapse });
+    resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, label));
+    ui.ctx().accesskit_node_builder(resp.id, |node| {
+        node.set_role(egui::accesskit::Role::Button);
+        node.set_label(label);
+    });
     // The hover highlight (and the focus ring) wrap the icon square when the
     // hamburger button spans the collapsed sidebar's full width.
     let badge_rect = if center {
@@ -480,11 +623,15 @@ fn icon_button(ui: &mut egui::Ui, pal: &Palette, icon: Icon, size: f32, center: 
                 && !i.modifiers.alt
         });
         if drop_to_content {
-            resp.surrender_focus();
-            ui.ctx().memory_mut(|m| {
-                m.surrender_focus(resp.id);
-                m.move_focus(egui::FocusDirection::None);
-            });
+            if let Some(active) = ui
+                .ctx()
+                .data(|data| data.get_temp::<&'static str>(egui::Id::new("tm-active-content")))
+            {
+                ui.ctx().memory_mut(|memory| {
+                    memory.request_focus(crate::search::content_focus_id(active));
+                    memory.move_focus(egui::FocusDirection::None);
+                });
+            }
             ui.input_mut(|i| {
                 i.consume_key(Default::default(), egui::Key::ArrowRight);
                 i.consume_key(Default::default(), egui::Key::Escape);
@@ -529,9 +676,11 @@ pub fn cmd_button(
     } else {
         Sense::hover()
     };
-    let id = ui.id().with(("cmd-button", label));
+    let id = ui.id().with(("cmd-button", icon as u32));
     let (rect, _) = ui.allocate_exact_size(egui::vec2(w, 30.0), Sense::hover());
     let resp = ui.interact(rect, id, sense);
+    register_toolbar_item(ui, &resp);
+    resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, enabled, label));
     if enabled {
         let first_id_key = egui::Id::new("tm-first-toolbar-button");
         if ui
@@ -582,11 +731,15 @@ pub fn cmd_button(
                 && !i.modifiers.alt
         });
         if drop_down {
-            resp.surrender_focus();
-            ui.ctx().memory_mut(|m| {
-                m.surrender_focus(resp.id);
-                m.move_focus(egui::FocusDirection::None);
-            });
+            if let Some(active) = ui
+                .ctx()
+                .data(|data| data.get_temp::<&'static str>(egui::Id::new("tm-active-content")))
+            {
+                ui.ctx().memory_mut(|memory| {
+                    memory.request_focus(crate::search::content_focus_id(active));
+                    memory.move_focus(egui::FocusDirection::None);
+                });
+            }
             ui.input_mut(|i| {
                 i.consume_key(Default::default(), egui::Key::ArrowDown);
                 i.consume_key(Default::default(), egui::Key::Escape);
@@ -613,7 +766,7 @@ pub fn ellipsis_menu(
     _pal: &Palette,
     items: impl FnOnce(&mut TaskManApp, &mut egui::Ui),
 ) {
-    crate::widgets::menu::menu_button(
+    let response = crate::widgets::menu::menu_button(
         ui,
         egui::Button::new(egui::RichText::new("…").size(16.0)),
         |ui| {
@@ -621,16 +774,13 @@ pub fn ellipsis_menu(
             items(app, ui);
         },
     );
+    register_toolbar_item(ui, &response);
 }
 
 /// Commit the global search on Enter and CONSUME the keystroke: exactly one
 /// handler may win the frame. The singleline text edit surrenders focus
-/// during its own pass, so later in the SAME frame the tables' row-action
-/// gate — which yields to nothing focused and no popup — sees the same Enter
-/// still queued and would fire the row action (e.g. Processes
-/// "Go to details") on top of the commit. Consuming here is what keeps the
-/// commit keystroke single-purpose. While a dialog is up the commit stands
-/// down and the keystroke stays queued for the dialog's own contract.
+/// during its own pass, so consuming Enter also guards against another
+/// control acting on the same press. A dialog owns its own Enter behavior.
 /// Split out from the search panel so the contract is testable headlessly.
 fn commit_search_on_enter(
     ctx: &egui::Context,
@@ -642,21 +792,21 @@ fn commit_search_on_enter(
         return false;
     }
     commit();
+    if let Some(active) =
+        ctx.data(|data| data.get_temp::<&'static str>(egui::Id::new("tm-active-content")))
+    {
+        ctx.memory_mut(|memory| memory.request_focus(crate::search::content_focus_id(active)));
+    }
     ctx.input_mut(|i| i.consume_key(Default::default(), egui::Key::Enter));
     true
 }
 
-/// Tab or Down Arrow while the search field is focused (or just lost focus)
-/// surrenders keyboard focus from chrome, drops directly into table rows,
-/// and commits the search selection.
-/// When the search field has no query text, Tab passes through so focus flows
-/// naturally into the sidebar tabs instead of jumping to the table list.
-/// Down Arrow always drops down into the list below.
+/// Down Arrow while search is focused commits the match and moves focus to
+/// the current content list. Tab retains the normal control traversal.
 /// Split out from the search panel so the contract is testable headlessly.
-fn commit_search_on_tab_or_down(
+fn commit_search_on_down(
     ctx: &egui::Context,
     search_id: egui::Id,
-    has_search_query: bool,
     dialog_open: bool,
     commit: impl FnOnce(),
 ) -> bool {
@@ -664,33 +814,22 @@ fn commit_search_on_tab_or_down(
     if dialog_open || !is_focused {
         return false;
     }
-    let tab = ctx.input(|i| {
-        i.key_pressed(egui::Key::Tab) && !i.modifiers.shift && !i.modifiers.ctrl && !i.modifiers.alt
-    });
     let down = ctx.input(|i| {
         i.key_pressed(egui::Key::ArrowDown)
             && !i.modifiers.shift
             && !i.modifiers.ctrl
             && !i.modifiers.alt
     });
-    let should_commit = down || (tab && has_search_query);
-    if !should_commit {
+    if !down {
         return false;
     }
-    if tab {
-        ctx.input_mut(|i| i.consume_key(Default::default(), egui::Key::Tab));
-    }
-    if down {
-        ctx.input_mut(|i| i.consume_key(Default::default(), egui::Key::ArrowDown));
-    }
-    ctx.memory_mut(|mem| {
-        mem.surrender_focus(egui::Id::new("global-search"));
-        mem.move_focus(egui::FocusDirection::None);
-    });
-    if let Some(held) = ctx.memory(|m| m.focused()) {
-        ctx.memory_mut(|m| m.surrender_focus(held));
-    }
+    ctx.input_mut(|i| i.consume_key(Default::default(), egui::Key::ArrowDown));
     commit();
+    if let Some(active) =
+        ctx.data(|data| data.get_temp::<&'static str>(egui::Id::new("tm-active-content")))
+    {
+        ctx.memory_mut(|memory| memory.request_focus(crate::search::content_focus_id(active)));
+    }
     true
 }
 
@@ -718,6 +857,7 @@ pub fn settings_dialog(app: &mut TaskManApp, ctx: &egui::Context, _pal: &theme::
     let close_now = keys.escape || keys.enter;
     let mut close_clicked = false;
     egui::Window::new(i18n::tr(K::Settings))
+        .modal(true)
         .open(&mut open)
         .collapsible(false)
         .resizable(true)
@@ -1321,6 +1461,7 @@ pub fn process_end_dialog(app: &mut TaskManApp, ctx: &egui::Context) {
 
     let pal = crate::theme::palette_ctx(ctx);
     egui::Window::new(i18n::tr(K::EndTask))
+        .modal(true)
         .id(egui::Id::new("end-task-dialog"))
         .open(&mut open)
         .collapsible(false)
@@ -1526,6 +1667,7 @@ pub fn run_task_dialog(app: &mut TaskManApp, ctx: &egui::Context, _pal: &theme::
 
     let mut open = true;
     egui::Window::new(i18n::tr(K::RunDialogTitle))
+        .modal(true)
         .id(egui::Id::new("run-task-dialog"))
         .open(&mut open)
         .collapsible(false)
@@ -1811,43 +1953,46 @@ fn clear_all_button(ctx: &egui::Context, y_offset: f32) -> bool {
 
 // ---------------------------------------------------------------- F1 help
 
-/// The F1 shortcut help overlay. A foreground area with nothing focusable
-/// inside: the keyboard stays where it is (Tab passes straight through) and
-/// Esc closes the overlay from the global shortcut block in `app.rs`.
-pub fn help_overlay(ctx: &egui::Context, pal: &Palette) {
-    egui::Area::new(egui::Id::new("shortcut-help"))
-        .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
-        .order(egui::Order::Foreground)
-        .show(ctx, |ui| {
-            egui::Frame::window(ui.style())
+/// A modal, keyboard-readable shortcut reference.
+pub fn help_overlay(ctx: &egui::Context, pal: &Palette) -> bool {
+    let mut close_clicked = false;
+    let response = egui::Modal::new(egui::Id::new("shortcut-help"))
+        .frame(
+            egui::Frame::window(&ctx.global_style())
                 .fill(pal.card_bg)
                 .stroke(Stroke::new(1.0, pal.accent))
-                .inner_margin(egui::Margin::same(16))
+                .inner_margin(egui::Margin::same(16)),
+        )
+        .show(ctx, |ui| {
+            ui.set_max_width(430.0);
+            ui.heading(i18n::tr(K::HelpTitle));
+            ui.add_space(8.0);
+            egui::Grid::new("shortcut-help-grid")
+                .num_columns(2)
+                .spacing([18.0, 5.0])
                 .show(ui, |ui| {
-                    ui.set_max_width(430.0);
-                    ui.label(
-                        egui::RichText::new(i18n::tr(K::HelpTitle))
-                            .size(16.0)
-                            .strong(),
-                    );
-                    ui.add_space(8.0);
-                    egui::Grid::new("shortcut-help-grid")
-                        .num_columns(2)
-                        .spacing([18.0, 5.0])
-                        .show(ui, |ui| {
-                            for (combo, description) in shortcut_rows(i18n::lang()) {
-                                ui.label(
-                                    egui::RichText::new(combo)
-                                        .size(13.0)
-                                        .strong()
-                                        .color(pal.accent),
-                                );
-                                ui.label(egui::RichText::new(description).size(13.0));
-                                ui.end_row();
-                            }
-                        });
+                    for (combo, description) in shortcut_rows(i18n::lang()) {
+                        ui.label(
+                            egui::RichText::new(combo)
+                                .size(13.0)
+                                .strong()
+                                .color(pal.accent),
+                        );
+                        ui.label(egui::RichText::new(description).size(13.0));
+                        ui.end_row();
+                    }
                 });
+            let close = ui.button(i18n::tr(K::Close));
+            let first = ctx.data(|data| {
+                data.get_temp::<bool>(egui::Id::new("tm-help-focus-init")) != Some(true)
+            });
+            if first {
+                close.request_focus();
+                ctx.data_mut(|data| data.insert_temp(egui::Id::new("tm-help-focus-init"), true));
+            }
+            close_clicked = close.clicked();
         });
+    close_clicked || response.should_close()
 }
 
 /// One row of the F1 overlay: the key combination as the user would say it
@@ -1882,7 +2027,12 @@ fn shortcut_rows(lang: i18n::Lang) -> Vec<(String, &'static str)> {
         ),
         (format!("{ctrl}+A"), tr(K::HelpSelectAll)),
         (tr(K::KeyPageKeys).to_owned(), tr(K::HelpPageSelection)),
-        (tr(K::KeyArrows).to_owned(), tr(K::HelpResizeColumn)),
+        ("F6 / Shift+F6".to_owned(), tr(K::HelpFocusRegions)),
+        ("← / →".to_owned(), tr(K::HelpHeaderColumns)),
+        (format!("{ctrl}+← / →"), tr(K::HelpResizeColumn)),
+        (format!("{}+← / →", tr(K::KeyAlt)), tr(K::HelpReorderColumn)),
+        ("← / → / Home / End".to_owned(), tr(K::HelpChartScrub)),
+        ("← / → (Performance)".to_owned(), tr(K::HelpPerfSplitter)),
         (tr(K::KeyEnter).to_owned(), tr(K::HelpRowAction)),
         (tr(K::KeySpace).to_owned(), tr(K::HelpToggleSelect)),
         (tr(K::KeyTabKey).to_owned(), tr(K::HelpTabGeneral)),
@@ -2186,9 +2336,7 @@ mod tests {
                 let ran = commit_search_on_enter(ui.ctx(), edit.lost_focus(), dialog_open, || {
                     committed = true
                 });
-                // The same-frame row-action layer, exactly what the tables do.
-                row_layer_saw_enter = crate::search::row_action_gate(ui.ctx(), false)
-                    && ui.ctx().input(|i| i.key_pressed(egui::Key::Enter));
+                row_layer_saw_enter = ui.ctx().input(|i| i.key_pressed(egui::Key::Enter));
                 assert_eq!(
                     ran, committed,
                     "the helper's verdict must match the commit it ran"
@@ -2239,8 +2387,7 @@ mod tests {
         );
     }
 
-    /// Tab or Down Arrow on the focused search field commits the search and
-    /// surrenders keyboard focus so table rows immediately take navigation.
+    /// Tab traverses normally; Down Arrow commits into the focused list.
     #[test]
     fn committing_the_search_on_tab_or_down_consumes_keystroke_and_clears_focus() {
         let ctx = egui::Context::default();
@@ -2272,16 +2419,10 @@ mod tests {
             let mut committed = false;
             let mut out = ctx.run_ui(raw, |ui| {
                 let edit_id = egui::Id::new("test-search-id");
-                let has_search_query = !text.trim().is_empty();
-                let ran = commit_search_on_tab_or_down(
-                    ui.ctx(),
-                    edit_id,
-                    has_search_query,
-                    dialog_open,
-                    || {
-                        committed = true;
-                    },
-                );
+                crate::search::set_active_content(ui.ctx(), "processes");
+                let ran = commit_search_on_down(ui.ctx(), edit_id, dialog_open, || {
+                    committed = true;
+                });
                 let _edit = ui.add(egui::TextEdit::singleline(text).id(edit_id));
                 assert_eq!(ran, committed);
             });
@@ -2302,17 +2443,9 @@ mod tests {
         });
         out.textures_delta.clear();
 
-        // Frame 2: pressing Tab commits and clears focus.
+        // Frame 2: Tab remains ordinary focus traversal, even with a query.
         let committed = tab_frame(&ctx, egui::Key::Tab, false, false, &mut text);
-        assert!(committed, "Tab on focused search field commits to table");
-        assert!(
-            ctx.memory(|m| m.focused()).is_none(),
-            "focus surrendered from chrome"
-        );
-        assert!(
-            !ctx.input(|i| i.key_pressed(egui::Key::Tab)),
-            "Tab keystroke consumed"
-        );
+        assert!(!committed, "Tab must not commit the search");
 
         // Park focus again.
         let mut out = ctx.run_ui(raw.clone(), |ui| {
@@ -2321,13 +2454,16 @@ mod tests {
         });
         out.textures_delta.clear();
 
-        // Frame 3: pressing Down Arrow also commits and clears focus.
+        // Frame 3: Down Arrow commits and focuses the list.
         let committed = tab_frame(&ctx, egui::Key::ArrowDown, false, false, &mut text);
         assert!(
             committed,
             "Down Arrow on focused search field commits to table"
         );
-        assert!(ctx.memory(|m| m.focused()).is_none());
+        assert_eq!(
+            ctx.memory(|memory| memory.focused()),
+            Some(crate::search::content_focus_id("processes"))
+        );
         assert!(
             !ctx.input(|i| i.key_pressed(egui::Key::ArrowDown)),
             "Down Arrow consumed"
@@ -2415,14 +2551,14 @@ mod tests {
     fn help_overlay_rows_are_complete_and_localized() {
         for lang in [i18n::Lang::De, i18n::Lang::En] {
             let rows = shortcut_rows(lang);
-            assert_eq!(rows.len(), 19, "{lang:?}: every documented shortcut");
+            assert_eq!(rows.len(), 24, "{lang:?}: every documented shortcut");
             assert!(
                 rows.iter()
                     .all(|(combo, text)| !combo.trim().is_empty() && !text.trim().is_empty()),
                 "{lang:?}: no empty combo or description"
             );
             assert_eq!(rows[0].0, "F5");
-            assert_eq!(rows[18].0, "F1");
+            assert_eq!(rows[23].0, "F1");
             let expected_ctrl = i18n::tr_in(lang, K::KeyCtrl);
             assert_eq!(
                 rows[1].0,
@@ -2438,6 +2574,63 @@ mod tests {
         // really pins localization rather than two copies of one string.
         assert_eq!(i18n::tr_in(i18n::Lang::De, K::KeyCtrl), "Strg");
         assert_eq!(i18n::tr_in(i18n::Lang::En, K::KeyCtrl), "Ctrl");
+    }
+
+    #[test]
+    fn modal_tab_wraps_without_reaching_background() {
+        let ctx = egui::Context::default();
+        let screen = Rect::from_min_size(Pos2::ZERO, egui::vec2(800.0, 600.0));
+        let mut controls = None;
+        let frame = |events: Vec<egui::Event>, controls: &mut Option<(egui::Id, egui::Id)>| {
+            let mut out = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(screen),
+                    focused: true,
+                    events,
+                    ..Default::default()
+                },
+                |root| {
+                    root.disable();
+                    let _ = root.button("Background");
+                    egui::Window::new("Dialog")
+                        .modal(true)
+                        .title_bar(false)
+                        .resizable(false)
+                        .show(root.ctx(), |ui| {
+                            let first = ui.button("First");
+                            let last = ui.button("Last");
+                            *controls = Some((first.id, last.id));
+                        });
+                },
+            );
+            out.textures_delta.clear();
+        };
+        frame(vec![], &mut controls);
+        let (first, last) = controls.expect("modal controls");
+        ctx.memory_mut(|memory| memory.request_focus(last));
+        frame(
+            vec![egui::Event::Key {
+                key: egui::Key::Tab,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: Default::default(),
+            }],
+            &mut controls,
+        );
+        assert_eq!(ctx.memory(|memory| memory.focused()), Some(first));
+        frame(
+            vec![egui::Event::Key {
+                key: egui::Key::Tab,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::SHIFT,
+            }],
+            &mut controls,
+        );
+        frame(vec![], &mut controls);
+        assert_eq!(ctx.memory(|memory| memory.focused()), Some(last));
     }
 
     #[test]
@@ -3066,6 +3259,7 @@ mod tests {
         let pal = theme::DARK;
         for key in [egui::Key::ArrowRight, egui::Key::Escape] {
             let ctx = egui::Context::default();
+            crate::search::set_active_content(&ctx, "processes");
             let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0));
             // Frame 1: draw nav item and request focus.
             let raw1 = egui::RawInput {
@@ -3074,7 +3268,16 @@ mod tests {
                 ..Default::default()
             };
             let mut out1 = ctx.run_ui(raw1, |ui| {
-                let resp = nav_item(ui, &pal, Icon::Processes, "Processes", true, false);
+                let resp = nav_item(
+                    ui,
+                    &pal,
+                    egui::Id::new("test-processes"),
+                    Icon::Processes,
+                    "Processes",
+                    true,
+                    false,
+                    true,
+                );
                 resp.request_focus();
             });
             out1.textures_delta.clear();
@@ -3097,13 +3300,21 @@ mod tests {
                 ..Default::default()
             };
             let mut out2 = ctx.run_ui(raw2, |ui| {
-                let _resp = nav_item(ui, &pal, Icon::Processes, "Processes", true, false);
+                let _resp = nav_item(
+                    ui,
+                    &pal,
+                    egui::Id::new("test-processes"),
+                    Icon::Processes,
+                    "Processes",
+                    true,
+                    false,
+                    true,
+                );
             });
             out2.textures_delta.clear();
-            assert!(
-                ctx.memory(|m| m.focused()).is_none(),
-                "focus surrendered to table rows on {key:?}"
-            );
+            let expected =
+                (key != egui::Key::Escape).then(|| crate::search::content_focus_id("processes"));
+            assert_eq!(ctx.memory(|m| m.focused()), expected);
             if key != egui::Key::Escape {
                 assert!(!ctx.input(|i| i.key_pressed(key)), "{key:?} was consumed");
             }
@@ -3115,6 +3326,7 @@ mod tests {
         let pal = theme::DARK;
         for key in [egui::Key::ArrowDown, egui::Key::Escape] {
             let ctx = egui::Context::default();
+            crate::search::set_active_content(&ctx, "processes");
             let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0));
             // Frame 1: draw cmd_button and request focus.
             let raw1 = egui::RawInput {
@@ -3123,7 +3335,7 @@ mod tests {
                 ..Default::default()
             };
             let mut out1 = ctx.run_ui(raw1, |ui| {
-                let id = ui.id().with(("cmd-button", "End task"));
+                let id = ui.id().with(("cmd-button", Icon::Close as u32));
                 ui.ctx().memory_mut(|m| m.request_focus(id));
                 let _ = cmd_button(ui, &pal, Icon::Close, "End task", true);
             });
@@ -3150,20 +3362,18 @@ mod tests {
                 let _ = cmd_button(ui, &pal, Icon::Close, "End task", true);
             });
             out2.textures_delta.clear();
-            assert!(
-                ctx.memory(|m| m.focused()).is_none(),
-                "focus surrendered to table rows on {key:?}"
-            );
+            let expected =
+                (key != egui::Key::Escape).then(|| crate::search::content_focus_id("processes"));
+            assert_eq!(ctx.memory(|m| m.focused()), expected);
             if key != egui::Key::Escape {
                 assert!(!ctx.input(|i| i.key_pressed(key)), "{key:?} was consumed");
             }
         }
     }
 
-    /// When a sidebar nav item gains keyboard focus (via Tab, Shift+Tab, or Arrow keys),
-    /// the active tab switches to that page immediately.
+    /// Merely tabbing to a sidebar item must not change the page.
     #[test]
-    fn sidebar_nav_item_switches_tab_on_focus() {
+    fn sidebar_nav_item_does_not_switch_tab_on_focus() {
         let pal = theme::DARK;
         let ctx = egui::Context::default();
         let screen = Rect::from_min_size(Pos2::ZERO, egui::vec2(800.0, 600.0));
@@ -3177,16 +3387,25 @@ mod tests {
         };
         let mut perf_id = egui::Id::NULL;
         let mut out1 = ctx.run_ui(raw1, |ui| {
-            let resp = nav_item(ui, &pal, Icon::Performance, "Performance", false, false);
+            let resp = nav_item(
+                ui,
+                &pal,
+                egui::Id::new("test-performance"),
+                Icon::Performance,
+                "Performance",
+                false,
+                false,
+                true,
+            );
             perf_id = resp.id;
-            if resp.clicked() || resp.gained_focus() {
+            if resp.clicked() {
                 current_tab = Tab::Performance;
             }
         });
         out1.textures_delta.clear();
         assert_eq!(current_tab, Tab::Processes);
 
-        // Frame 2: request focus and render nav item; gaining focus switches active tab.
+        // Frame 2: focus alone leaves the active page unchanged.
         let raw2 = egui::RawInput {
             screen_rect: Some(screen),
             focused: true,
@@ -3194,16 +3413,25 @@ mod tests {
         };
         let mut out2 = ctx.run_ui(raw2, |ui| {
             ui.ctx().memory_mut(|m| m.request_focus(perf_id));
-            let resp = nav_item(ui, &pal, Icon::Performance, "Performance", false, false);
-            if resp.clicked() || resp.gained_focus() {
+            let resp = nav_item(
+                ui,
+                &pal,
+                egui::Id::new("test-performance"),
+                Icon::Performance,
+                "Performance",
+                false,
+                false,
+                true,
+            );
+            if resp.clicked() {
                 current_tab = Tab::Performance;
             }
         });
         out2.textures_delta.clear();
         assert_eq!(
             current_tab,
-            Tab::Performance,
-            "gaining focus on nav item switches active tab"
+            Tab::Processes,
+            "gaining focus must not switch the page"
         );
     }
 
@@ -3222,13 +3450,22 @@ mod tests {
             ..Default::default()
         };
         let mut out1 = ctx.run_ui(raw1, |ui| {
-            let resp = nav_item(ui, &pal, Icon::Processes, "Processes", true, false);
+            let resp = nav_item(
+                ui,
+                &pal,
+                egui::Id::new("test-processes"),
+                Icon::Processes,
+                "Processes",
+                true,
+                false,
+                true,
+            );
             resp.request_focus();
         });
         out1.textures_delta.clear();
         assert!(ctx.memory(|m| m.focused()).is_some());
 
-        // Frame 2: Enter surrenders focus and consumes key.
+        // Frame 2: Enter focuses the content and consumes the key.
         let raw2 = egui::RawInput {
             screen_rect: Some(screen),
             events: vec![egui::Event::Key {
@@ -3242,20 +3479,27 @@ mod tests {
             ..Default::default()
         };
         let mut out2 = ctx.run_ui(raw2, |ui| {
-            let resp = nav_item(ui, &pal, Icon::Processes, "Processes", true, false);
+            let resp = nav_item(
+                ui,
+                &pal,
+                egui::Id::new("test-processes"),
+                Icon::Processes,
+                "Processes",
+                true,
+                false,
+                true,
+            );
             if resp.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                resp.surrender_focus();
-                ui.ctx().memory_mut(|m| {
-                    m.surrender_focus(resp.id);
-                    m.move_focus(egui::FocusDirection::None);
+                ui.ctx().memory_mut(|memory| {
+                    memory.request_focus(crate::search::content_focus_id("processes"))
                 });
                 ui.input_mut(|i| i.consume_key(Default::default(), egui::Key::Enter));
             }
         });
         out2.textures_delta.clear();
         assert!(
-            ctx.memory(|m| m.focused()).is_none(),
-            "Enter surrenders focus to content"
+            ctx.memory(|m| m.focused()) == Some(crate::search::content_focus_id("processes")),
+            "Enter focuses content"
         );
         assert!(
             !ctx.input(|i| i.key_pressed(egui::Key::Enter)),

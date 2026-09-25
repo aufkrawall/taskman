@@ -21,6 +21,26 @@
   opens the row menu on Services, Startup and Users, and the Menu key or
   Shift+F10 opens the selection's context menu. App history gains a visible
   row selection.
+- **F6 focus regions:** F6 and Shift+F6 step through the search box, the
+  sidebar, the current page's command buttons and the page content, so the
+  whole window is reachable without hunting for the next Tab stop. The
+  Performance tab has no search box and is skipped.
+- **Keyboard-scrubbable charts:** a focused Performance graph walks its
+  samples with Left/Right and jumps to the oldest or newest with Home/End.
+  Up/Down moves between the series of a multi-series graph, and between the
+  logical processor charts in the per-core CPU grid. The focused chart paints
+  a focus ring and shows the same hover readout the mouse produces, pinned to
+  the selected sample.
+- **Reorderable columns from the keyboard:** Alt+Left/Alt+Right on a focused
+  column header moves a movable column one position, matching the mouse drag.
+- **Resizable Performance card column from the keyboard:** the splitter
+  between the resource cards and the detail area is a focusable stop that
+  takes Left/Right in 8 px steps (Shift for 32 px), reported to assistive
+  technology with its current width.
+- **Screen reader support:** tables, the Performance card list, the charts and
+  the dialogs expose a structured accessibility tree — list/list-item roles
+  with set position and size, labelled buttons and splitters, and the
+  keyboard-selected chart sample published as the chart's value.
 
 ### Improved
 
@@ -54,7 +74,11 @@
   (arrows, type-ahead, Enter/Space, context-menu key) stands down.
 - **Context menus from the keyboard:** Tab closes an open menu instead of
   stranding it, ArrowRight/ArrowLeft open and close submenus, and the Menu
-  key now works while any non-text widget holds focus.
+  key now works while any non-text widget holds focus. Closing a menu returns
+  focus to the control that opened it.
+- **Dialogs keep focus inside:** an open dialog holds keyboard focus and
+  pointer interaction for itself — Tab cycles only its own controls and the
+  page behind it no longer reacts to clicks or stray keys while it is up.
 - **App History on Linux and macOS:** non-system processes now accumulate
   local usage history even where window ownership cannot be determined.
 

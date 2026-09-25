@@ -12,6 +12,21 @@
 use eframe::egui;
 use tm_core::model::ProcessEntry;
 
+/// One stable keyboard stop for a table body or the Performance card list.
+/// Rows stay pointer targets; the collection owns keyboard focus.
+pub fn content_focus_id(id: &'static str) -> egui::Id {
+    egui::Id::new(("tm-content-focus", id))
+}
+
+pub fn set_active_content(ctx: &egui::Context, id: &'static str) {
+    ctx.data_mut(|data| data.insert_temp(egui::Id::new("tm-active-content"), id));
+}
+
+pub fn content_has_focus(ctx: &egui::Context) -> bool {
+    let active = ctx.data(|data| data.get_temp::<&'static str>(egui::Id::new("tm-active-content")));
+    active.is_some_and(|id| ctx.memory(|memory| memory.has_focus(content_focus_id(id))))
+}
+
 /// A normalized global search query.
 #[derive(Debug, Clone, Default)]
 pub struct Query {
@@ -109,7 +124,7 @@ fn type_ahead_char(c: char) -> bool {
 /// or search bar hold focus, arrow keys belong exclusively to that chrome
 /// widget and never simultaneously move the list selection in the background.
 pub fn nav_gate(ctx: &egui::Context, dialog_open: bool) -> bool {
-    !dialog_open && !ctx.egui_wants_keyboard_input() && !ctx.any_popup_open()
+    !dialog_open && !ctx.any_popup_open() && content_has_focus(ctx)
 }
 
 /// True when the custom row action keys (Enter/Space) may fire. A focused
@@ -120,7 +135,7 @@ pub fn nav_gate(ctx: &egui::Context, dialog_open: bool) -> bool {
 /// (see [`nav_gate`]) keeps the keys off the list behind a dialog; the
 /// dialogs' own key handling is driven by their contract, not this gate.
 pub fn row_action_gate(ctx: &egui::Context, dialog_open: bool) -> bool {
-    !dialog_open && !ctx.egui_wants_keyboard_input() && !ctx.any_popup_open()
+    nav_gate(ctx, dialog_open)
 }
 
 /// Collect every plain character typed this frame while the
@@ -454,7 +469,16 @@ mod tests {
                 events,
                 ..Default::default()
             },
-            |_| {},
+            |ui| {
+                set_active_content(ui.ctx(), "test");
+                ui.ctx()
+                    .memory_mut(|memory| memory.request_focus(content_focus_id("test")));
+                ui.interact(
+                    egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(100.0, 20.0)),
+                    content_focus_id("test"),
+                    egui::Sense::focusable_noninteractive(),
+                );
+            },
         );
         out.textures_delta.clear();
     }
@@ -476,7 +500,16 @@ mod tests {
                 events,
                 ..Default::default()
             },
-            |_| {},
+            |ui| {
+                set_active_content(ui.ctx(), "test");
+                ui.ctx()
+                    .memory_mut(|memory| memory.request_focus(content_focus_id("test")));
+                ui.interact(
+                    egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(100.0, 20.0)),
+                    content_focus_id("test"),
+                    egui::Sense::focusable_noninteractive(),
+                );
+            },
         );
         out.textures_delta.clear();
     }
@@ -549,6 +582,8 @@ mod tests {
     #[test]
     fn a_dialog_open_stands_down_every_page_level_binding() {
         let ctx = egui::Context::default();
+        set_active_content(&ctx, "test");
+        ctx.memory_mut(|memory| memory.request_focus(content_focus_id("test")));
         // No text edit, no popup: without the flag the gates would be open.
         assert!(nav_gate(&ctx, false));
         assert!(row_action_gate(&ctx, false));

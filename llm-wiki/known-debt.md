@@ -120,13 +120,19 @@ items across Phases 2–6. The following concrete gaps remain:
   analyze-wait-chain, processor-group-aware affinity above 64 logical CPUs,
   and an optional Efficiency-mode confirmation preference.
 - **Shell/accessibility:** Settings is a resizable scrolling dialog rather
-  than the native navigation page; a full AccessKit/screen-reader semantics
-  pass, high-contrast tokens, text-scaling validation,
-  and multi-monitor-aware position restore remain.
+  than the native navigation page; high-contrast tokens, text-scaling
+  validation, and multi-monitor-aware position restore remain.
   **Keyboard-only interaction: LANDED** (2026-09-25) — page switching, the
-  native-TM table selection model, dialog tab-through, focus rings and
-  shortcut help; the deliberately accepted residuals are in § Keyboard
-  accessibility accepted limitations below. The screen-reader pass remains.
+  native-TM table selection model, dialog tab-through and modality, focus
+  rings and shortcut help; the deliberately accepted residuals are in
+  § Keyboard accessibility accepted limitations below.
+  **Screen-reader semantics: PARTIAL** (2026-09-25) — tables, the
+  Performance card list, the charts, the splitters and the buttons now build
+  a structured accesskit tree (list/list-item with set position and size,
+  splitter with its value, the keyboard-selected chart sample as the chart's
+  value). Not done: the Process Explorer-style hierarchy, and full
+  announcement of live-updating values. The menu/dialog key contracts above
+  (first-entry focus, stale-handoff death) are unchanged by this.
   **Menu keyboard navigation: DONE** (2026-09-17) — a keyboard-opened menu
   focuses its first enabled entry; arrows/Enter/Space ride egui's focus
   system. The focus request is stored against the popup id (a bare flag was
@@ -151,30 +157,23 @@ dropped) is what the user sees; permanently pinned or re-loaded modules stay.
 Recorded so the next accessibility pass does not re-derive them; the
 interaction model itself is in `current.md`.
 
-- **Dialogs are non-modal egui `Window`s.** Tab can leave a tab-through
-  dialog (Settings, Select columns, Process properties) into the background
-  chrome, because nothing traps Tab at the window boundary; the destructive
-  confirms are hard-trapped by their own key contract instead. The fork's
-  unused `egui::Modal` container (`vendor/egui`) is the candidate fix if
-  this becomes a real problem.
-- **The chart hover readout is pointer-only.** Keyboard scrubbing of the
-  Performance graphs was deliberately skipped; the arrow keys already drive
-  the resource-card selection, and a keyboard scrub would need its own
-  focus model per chart.
-- **Users-table column drag-reorder is mouse-only.** Details solves the
-  same need with keyboard-reachable move-up/down chevrons in its
-  Select-columns dialog; Users still exposes only the header drag gesture.
-  A keyboard path would be a Users select-columns-style dialog — small,
-  self-contained follow-up, not a reachability breaker (every other
-  affordance has a keyboard route).
+Resolved later the same day and moved to `current.md`: dialogs are now real
+modals (the fork grew `Window::modal`, see `vendor/egui/TASKMAN-FORK.md`), the
+chart hover readout is no longer pointer-only, and the Users column
+drag-reorder has a keyboard route like every other reorderable table.
+
 - **A mouse click lights the clicked row one frame late in five of the
   seven tables.** Only App history re-reads the selection inside the row
   closure (plus `repaint_row_selected`) so a click highlights same-frame;
   the other pages paint the new highlight on the next frame. Cosmetic
   latency, no keyboard impact.
-- **Performance cards: the selection highlight is the only keyboard
-  indicator.** The selected card gets no separate focus ring — selection IS
-  focus, the same rule as the tables (cards are non-focusable like rows).
+- **Performance cards: the card itself is not a focus stop.** Selection is
+  still the indicator and the cards stay non-focusable like table rows, so
+  the whole list is ONE egui focus target that paints a ring around the card
+  column. Screen readers get the position/size through the accesskit list
+  node and `set_active_descendant`, but there is no per-card ring, so a
+  sighted keyboard user sees the column, not which card inside it is
+  selected beyond its own highlight.
 
 ## System state this program can leave behind
 

@@ -372,6 +372,7 @@ pub fn dialog(app: &mut TaskManApp, ctx: &egui::Context, pal: &theme::Palette) {
     }
 
     egui::Window::new(title)
+        .modal(true)
         .open(&mut open)
         .default_size([850.0, 520.0])
         .min_size([560.0, 320.0])
@@ -450,6 +451,7 @@ pub fn dialog(app: &mut TaskManApp, ctx: &egui::Context, pal: &theme::Palette) {
                     // down for is the unload confirmation, a separate modal
                     // on top.
                     let dialog_open = app.modal_open() || state.pending_unload.is_some();
+                    search::set_active_content(ctx, "modules");
                     let typed = search::list_type_ahead(ctx, "modules", dialog_open);
                     if let Some(typed) = typed
                         && let Some(base) = search::type_ahead_match(
@@ -518,6 +520,7 @@ pub fn dialog(app: &mut TaskManApp, ctx: &egui::Context, pal: &theme::Palette) {
                                 let selected = state.selected_base == Some(module.base_address);
                                 let (rect, response) =
                                     table.row(ui, pal, selected, module.base_address);
+                                table.describe_row(ui, &response, &module.name, index);
                                 let name_truncated =
                                     table.text_cell(ui, rect, 0, &module.name, pal, false);
                                 let base = format!("0x{:016X}", module.base_address);
@@ -557,6 +560,7 @@ pub fn dialog(app: &mut TaskManApp, ctx: &egui::Context, pal: &theme::Palette) {
                                 // menu opened by the Menu key would strand
                                 // over it; right-click keeps working.
                                 let keyboard_open = !dialog_open
+                                    && crate::search::content_has_focus(ui.ctx())
                                     && menu::keyboard_menu_requested(ui.ctx())
                                     && state.selected_base == Some(module.base_address);
                                 menu::context_menu_kb(&response, keyboard_open, |ui| {
@@ -654,6 +658,7 @@ pub fn dialog(app: &mut TaskManApp, ctx: &egui::Context, pal: &theme::Palette) {
         );
         let key_decision = crate::app_ui::dialog_key_decision(keys, focused, true);
         egui::Window::new(i18n::tr(K::UnloadModule))
+            .modal(true)
             .open(&mut confirm_open)
             .collapsible(false)
             .resizable(false)

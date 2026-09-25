@@ -139,14 +139,16 @@ platform boundary (`tm-core` ← `tm-platform` ← `tm-app` / `tm-service`):
     Tab-reachable), `capture_focus`/`restore_focus` (hand focus back to the
     invoking widget on close), the F1 help overlay, and hand-painted focus
     rings for the custom shell widgets),
-    `search.rs` (list-navigation primitives shared by every page:
-    `nav_gate` — arrows/type-ahead only while no text edit, popup or dialog
-    owns the input; `row_action_gate` — Enter/Space row bindings dead while
-    anything holds focus, a popup is open, or a dialog owns the input
-    (page-level call sites thread `TaskManApp::modal_open()`); `list_nav`
-    reports Shift
-    (range extension) and Ctrl (plain movement) instead of swallowing them,
-    plus the 1 s accumulated type-ahead),
+     `search.rs` (list-navigation primitives shared by every page:
+     `content_focus_id` — the ONE focus target a page's content region owns,
+     with `set_active_content`/`content_has_focus` publishing which page is
+     active; `nav_gate` — arrows/type-ahead only while THAT content region
+     holds focus and no popup or dialog owns the input; `row_action_gate` —
+     the same gate for the Enter/Space row bindings (page-level call sites
+     additionally thread `TaskManApp::modal_open()`); `list_nav`
+     reports Shift
+     (range extension) and Ctrl (plain movement) instead of swallowing them,
+     plus the 1 s accumulated type-ahead),
     `tabs/*` (processes/details/modules/users/services/startup/app_history/
     performance; Processes keeps native grouped presentation, Details can
     switch between flat and literal raw-PPID tree, offers optional combined/receive/send
@@ -164,22 +166,28 @@ platform boundary (`tm-core` ← `tm-platform` ← `tm-app` / `tm-service`):
     rebuilds, opt-in header drag-to-reorder via `reorderable`/`take_reorder`,
     and `numeric_indices` — the ONLY correct way to lay out the shared
     aggregate row, which tables of different column counts disagree on.
-    Rows are click-sensing WITHOUT the focusable bit (`Sense::CLICK |
-    hover`, chevrons likewise): the visible selection IS the keyboard
-    focus, native-TM style — a focusable row hands every keypress to
-    invisible spatial focus. Page keyboard layers use the one-shot
-    owner-keyed `request_row_scroll`, `header_has_focus` (so page-level
-    arrow handlers never double-fire with egui's spatial header movement),
-    keyboard resize steps on a focused handle (8 px, Shift 32 px) and
-    `body_viewport_h`/`page_rows` for the PgUp/PgDn span),
+     Rows are click-sensing WITHOUT the focusable bit (`Sense::CLICK |
+     hover`, chevrons likewise): the visible selection IS the keyboard
+     focus, native-TM style — a focusable row hands every keypress to
+     invisible spatial focus. Page keyboard layers use the one-shot
+     owner-keyed `request_row_scroll`, `header_has_focus` (so page-level
+     arrow handlers never double-fire with egui's spatial header movement),
+     keyboard resize steps on a focused handle (8 px, Shift 32 px),
+     Alt+Left/Right column reorder inside `reorderable`, and
+     `body_viewport_h`/`page_rows` for the PgUp/PgDn span. Rows, cards and
+     the table body itself build accesskit nodes, the non-focusable ones
+     reparented onto the collection via `Context::register_accesskit_parent`),
     `widgets/menu.rs` (classic full-width Windows-style
     context menus: uniform 28 px gapless rows, painted check gutter,
     submenus; keyboard contract: Tab closes an open menu,
     ArrowRight/ArrowLeft open and close submenus, and the Menu/Application
     key triggers while any non-text widget holds focus — gate is
     `text_edit_focused`, not `egui_wants_keyboard_input`),
-    `widgets/chart.rs` (timestamp-aware charts, kernel
-    overlay, pixel-snapped frames and the cursor-anchored hover readout),
+     `widgets/chart.rs` (timestamp-aware charts, kernel
+     overlay, pixel-snapped frames and the cursor-anchored hover readout,
+     plus `keyboard_sample`/`chart_accessible_value` — a keyboard cursor
+     pinned to a sample TIMESTAMP so live telemetry cannot slide it, and the
+     selected sample published as the chart's accesskit value),
     `icon_cache.rs` (lazy worker, upload budget, bounded LRU),
     `fonts.rs` (async system-font load after first frame),
     `action_executor.rs`.
@@ -367,8 +375,9 @@ platform boundary (`tm-core` ← `tm-platform` ← `tm-app` / `tm-service`):
 
 `vendor/egui/` is a vendored fork of egui (subtree, tag 0.36.1). It exists for a
 few things that stock egui cannot do: sub-pixel (ClearType) text, a native CPU
-renderer, and the keyboard Menu/Application key (`Key::ContextMenu`, fork
-divergence #5 in `TASKMAN-FORK.md`).
+renderer, the keyboard Menu/Application key (`Key::ContextMenu`, fork
+divergence #5), and genuinely modal `Window`s plus public accesskit
+reparenting (divergence #6 — the keyboard/screen-reader model depends on both).
 `vendor/egui/TASKMAN-FORK.md` is the divergence inventory and rebase runbook;
 `llm-wiki/render-pipeline.md` is the design. The fork has its own quality gate,
 `tools/check-fork.ps1`, because `cargo clippy --workspace` does not reach an excluded

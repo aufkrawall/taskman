@@ -868,9 +868,15 @@ keys! {
     ],
     KeyPageKeys => ["Bild auf / Bild ab", "PgUp / PgDn"],
     HelpResizeColumn => [
-        "Fokussierte Spaltengrenze verschieben (Umschalt: 32 px statt 8 px)",
-        "Resize a focused column (Shift: 32 px instead of 8 px)",
+        "Fokussierte Spalte um 8 px ändern (Umschalt: 32 px)",
+        "Resize the focused column by 8 px (Shift: 32 px)",
     ],
+    HelpFocusRegions => ["Zwischen Suchfeld, Seitenleiste, Befehlen und Inhalt wechseln", "Move between search, sidebar, commands, and content"],
+    HelpHeaderColumns => ["Spalte wählen; Eingabetaste sortiert", "Choose a column; Enter sorts"],
+    HelpReorderColumn => ["Verschiebbare Spalte umordnen", "Reorder a movable column"],
+    HelpChartScrub => ["Diagrammwerte nach Zeit durchgehen", "Explore chart samples over time"],
+    HelpPerfSplitter => ["Breite der Leistungskarten ändern", "Resize the Performance card column"],
+    PerfCardsWidth => ["Breite der Leistungskarten", "Performance card width"],
     HelpTabGeneral => [
         "Zwischen Steuerelementen wechseln",
         "Move between controls",

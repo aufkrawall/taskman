@@ -407,6 +407,15 @@ pub fn scrolled_rows(
     anchor: Option<ScrollAnchor<'_>>,
     rows: impl FnOnce(&mut egui::Ui, &TmTable, f32, f32, std::ops::Range<usize>),
 ) -> Option<usize> {
+    // The header is painted before the body response. Create its semantic
+    // parent now so both headers and rows belong to the same table.
+    ui.ctx()
+        .accesskit_node_builder(crate::search::content_focus_id(id), |node| {
+            node.set_role(egui::accesskit::Role::Table);
+            node.set_label(id);
+            node.set_row_count(row_count);
+            node.set_column_count(table.cols.len());
+        });
     let content_w = table.total_width();
     let hdr_id = egui::Id::new(("tm-hdrscroll", id));
     let rows_prev_x = ui
@@ -482,7 +491,23 @@ pub fn scrolled_rows(
         _ => None,
     };
 
-    let body_outer = ui.available_size_before_wrap();
+    let body_rect = ui.available_rect_before_wrap();
+    let body_outer = body_rect.size();
+    let body_focus = ui.interact(
+        body_rect,
+        crate::search::content_focus_id(id),
+        Sense::focusable_noninteractive(),
+    );
+    ui.ctx().data_mut(|data| {
+        data.insert_temp(egui::Id::new("tm-content-present"), id);
+    });
+    body_focus.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Other, true, id));
+    ui.ctx().accesskit_node_builder(body_focus.id, |node| {
+        node.set_role(egui::accesskit::Role::Table);
+        node.set_label(id);
+        node.set_row_count(row_count);
+        node.set_column_count(table.cols.len());
+    });
     let body = {
         let area = egui::ScrollArea::both()
             .id_salt(egui::Id::new(("tm-rowscroll", id)))
@@ -518,6 +543,14 @@ pub fn scrolled_rows(
     };
 
     store_bar_use(ui, id, body_outer, body.inner_rect);
+    if body_focus.has_focus() {
+        ui.painter().rect_stroke(
+            body.inner_rect.shrink(1.0),
+            2.0,
+            egui::Stroke::new(2.0, pal.accent),
+            egui::StrokeKind::Inside,
+        );
+    }
     ui.ctx()
         .data_mut(|d| d.insert_temp(egui::Id::new(("tm-rowsx", id)), body.state.offset.x));
     ui.ctx()
@@ -625,6 +658,8 @@ pub struct TmTable {
     /// that paint an OPAQUE background (the heat band) can restore it on top
     /// of themselves instead of swallowing the highlight.
     row_overlay: std::cell::Cell<Option<Color32>>,
+    /// Last painted row, used to attach painted cell values to its accessible node.
+    current_row: std::cell::Cell<Option<egui::Id>>,
     layout: std::cell::RefCell<Option<Layout>>,
     dirty: bool,
     /// Full-model intrinsic widths supplied by the tab before `header()`.
@@ -650,6 +685,7 @@ impl TmTable {
         let mut t = Self {
             reorderable: 0..0,
             pending_reorder: None,
+            current_row: std::cell::Cell::new(None),
             id,
             auto_widths: vec![None; cols.len()],
             cols,
@@ -804,10 +840,99 @@ impl TmTable {
         let table_id = egui::Id::new(("tmtable", self.id));
         let total_w = self.total_width();
         let (rect, _) = ui.allocate_exact_size(egui::vec2(total_w, h), Sense::hover());
+        let header_id = egui::Id::new(("tm-header-focus", self.id));
+        ui.ctx()
+            .register_accesskit_parent(header_id, crate::search::content_focus_id(self.id));
+        let header_resp = ui.interact(rect, header_id, Sense::focusable_noninteractive());
+        ui.ctx()
+            .register_accesskit_parent(header_resp.id, crate::search::content_focus_id(self.id));
         let painter = ui.painter_at(rect.expand(2.0));
         let mut clicked = None;
-        let mut header_focused = false;
         self.dirty = false;
+        let header_focused = header_resp.has_focus();
+        let active_key = egui::Id::new(("tm-header-active", self.id));
+        let previous = ui
+            .ctx()
+            .data(|data| data.get_temp::<&'static str>(active_key));
+        let mut active = previous
+            .and_then(|key| self.cols.iter().position(|column| column.id == key))
+            .unwrap_or(0);
+        if header_focused {
+            ui.memory_mut(|memory| {
+                memory.set_focus_lock_filter(
+                    header_resp.id,
+                    egui::EventFilter {
+                        horizontal_arrows: true,
+                        vertical_arrows: true,
+                        ..Default::default()
+                    },
+                );
+            });
+            let (left, right, down, enter, space, modifiers) = ui.input(|input| {
+                (
+                    input.key_pressed(egui::Key::ArrowLeft),
+                    input.key_pressed(egui::Key::ArrowRight),
+                    input.key_pressed(egui::Key::ArrowDown),
+                    input.key_pressed(egui::Key::Enter),
+                    input.key_pressed(egui::Key::Space),
+                    input.modifiers,
+                )
+            });
+            if down && !modifiers.any() {
+                ui.memory_mut(|memory| {
+                    memory.request_focus(crate::search::content_focus_id(self.id));
+                    memory.move_focus(egui::FocusDirection::None);
+                });
+                ui.input_mut(|input| input.consume_key(Default::default(), egui::Key::ArrowDown));
+            } else if left || right {
+                let step = if right { 1isize } else { -1 };
+                if modifiers.ctrl {
+                    let amount = if modifiers.shift {
+                        KB_RESIZE_STEP_LARGE
+                    } else {
+                        KB_RESIZE_STEP
+                    };
+                    if let Some(column) = self.cols.get_mut(active) {
+                        column.width =
+                            (column.width + amount * step as f32).clamp(MIN_COL_W, MAX_COL_W);
+                        self.layout.borrow_mut().take();
+                        self.dirty = true;
+                    }
+                } else if modifiers.alt {
+                    let to = active.saturating_add_signed(step);
+                    if self.reorderable.contains(&active) && self.reorderable.contains(&to) {
+                        self.pending_reorder = Some((active, to));
+                    }
+                } else if !modifiers.any() {
+                    active = active
+                        .saturating_add_signed(step)
+                        .min(self.cols.len().saturating_sub(1));
+                }
+                ui.memory_mut(|memory| memory.move_focus(egui::FocusDirection::None));
+                ui.input_mut(|input| {
+                    input.consume_key(modifiers, egui::Key::ArrowLeft);
+                    input.consume_key(modifiers, egui::Key::ArrowRight);
+                });
+            } else if enter || space {
+                clicked = Some(active);
+                ui.input_mut(|input| {
+                    input.consume_key(Default::default(), egui::Key::Enter);
+                    input.consume_key(Default::default(), egui::Key::Space);
+                });
+            }
+        }
+        if let Some(column) = self.cols.get(active) {
+            ui.ctx()
+                .data_mut(|data| data.insert_temp(active_key, column.id));
+            header_resp.widget_info(|| {
+                egui::WidgetInfo::labeled(egui::WidgetType::Other, true, column.label)
+            });
+            ui.ctx().accesskit_node_builder(header_resp.id, |node| {
+                node.set_role(egui::accesskit::Role::ColumnHeader);
+                node.set_label(column.label);
+                node.set_column_index(active);
+            });
+        }
         let mut x = rect.left();
         let mut agg_idx = 0usize;
 
@@ -815,16 +940,6 @@ impl TmTable {
             .map(|i| self.boundary_x(rect, i))
             .collect();
         bounds.push(rect.left() + total_w);
-
-        if let Some(col) = self.cols.first() {
-            let first_cell_id = table_id.with(("hdr", col.id));
-            ui.ctx().data_mut(|d| {
-                d.insert_temp(
-                    egui::Id::new(("tm-first-hdr-cell", self.id)),
-                    Some(first_cell_id),
-                )
-            });
-        }
 
         // Column drag-reorder. The source is remembered in context memory
         // rather than on `self`, because the table is rebuilt from scratch
@@ -847,9 +962,9 @@ impl TmTable {
 
             let movable = self.reorderable.contains(&i);
             let sense = if movable {
-                Sense::click_and_drag()
+                Sense::CLICK | Sense::DRAG
             } else {
-                Sense::click()
+                Sense::CLICK
             };
             let mut resp = ui.interact(cell, table_id.with(("hdr", col.id)), sense);
             if let Some(tip) = col.tooltip
@@ -860,37 +975,21 @@ impl TmTable {
             if resp.hovered() {
                 painter.rect_filled(cell, 0.0, Color32::from_white_alpha(6));
             }
-            // Keyboard reachability: header cells stay Tab-focusable (they are
-            // chrome, unlike rows), Enter/Space sort through egui's focused-
-            // click activation, and the ring mirrors the hover tint.
-            if resp.has_focus() {
-                let down = ui.input(|i| i.key_pressed(egui::Key::ArrowDown));
-                let esc = ui.input(|i| i.key_pressed(egui::Key::Escape));
-                if down || esc {
-                    resp.surrender_focus();
-                    ui.ctx().memory_mut(|mem| {
-                        mem.surrender_focus(resp.id);
-                        mem.move_focus(egui::FocusDirection::None);
-                    });
-                    if down {
-                        ui.ctx()
-                            .input_mut(|i| i.consume_key(Default::default(), egui::Key::ArrowDown));
-                    } else {
-                        ui.ctx()
-                            .input_mut(|i| i.consume_key(Default::default(), egui::Key::Escape));
-                    }
-                } else {
-                    header_focused = true;
-                    painter.rect_stroke(
-                        cell,
-                        0.0,
-                        Stroke::new(1.5, pal.accent),
-                        egui::StrokeKind::Inside,
-                    );
-                }
+            // The active column within the header's single roving Tab stop.
+            if header_focused && active == i {
+                painter.rect_stroke(
+                    cell,
+                    0.0,
+                    Stroke::new(1.5, pal.accent),
+                    egui::StrokeKind::Inside,
+                );
             }
             if resp.clicked() {
                 clicked = Some(i);
+                active = i;
+                ui.ctx()
+                    .data_mut(|data| data.insert_temp(active_key, col.id));
+                ui.memory_mut(|memory| memory.request_focus(header_resp.id));
             }
             if movable {
                 if resp.drag_started() {
@@ -995,68 +1094,10 @@ impl TmTable {
             let rresp = ui.interact(
                 handle,
                 table_id.with(("resize", self.cols[i - 1].id)),
-                Sense::drag(),
+                Sense::DRAG,
             );
             if rresp.hovered() || rresp.dragged() {
                 ui.ctx().set_cursor_icon(CursorIcon::ResizeHorizontal);
-            }
-            if rresp.has_focus() {
-                let down = ui.input(|i| i.key_pressed(egui::Key::ArrowDown));
-                let esc = ui.input(|i| i.key_pressed(egui::Key::Escape));
-                if down || esc {
-                    rresp.surrender_focus();
-                    ui.ctx().memory_mut(|mem| {
-                        mem.surrender_focus(rresp.id);
-                        mem.move_focus(egui::FocusDirection::None);
-                    });
-                    if down {
-                        ui.ctx()
-                            .input_mut(|i| i.consume_key(Default::default(), egui::Key::ArrowDown));
-                    } else {
-                        ui.ctx()
-                            .input_mut(|i| i.consume_key(Default::default(), egui::Key::Escape));
-                    }
-                } else {
-                    header_focused = true;
-                    // A focused handle owns the horizontal arrows: the focus-lock
-                    // filter (the same mechanism sliders use) keeps egui's spatial
-                    // navigation from walking to a neighbouring header cell, and
-                    // each press nudges the width the way a tiny drag would —
-                    // accumulated onto the LIVE width and clamped exactly like
-                    // the pointer gesture. Shift takes the large step.
-                    ui.memory_mut(|m| {
-                        m.set_focus_lock_filter(
-                            rresp.id,
-                            egui::EventFilter {
-                                horizontal_arrows: true,
-                                ..Default::default()
-                            },
-                        );
-                    });
-                    let step = if ui.input(|i| i.modifiers.shift) {
-                        KB_RESIZE_STEP_LARGE
-                    } else {
-                        KB_RESIZE_STEP
-                    };
-                    let dx = ui.input(|i| {
-                        (i.key_pressed(egui::Key::ArrowRight) as i32
-                            - i.key_pressed(egui::Key::ArrowLeft) as i32)
-                            as f32
-                            * step
-                    });
-                    painter.rect_stroke(
-                        handle,
-                        0.0,
-                        Stroke::new(1.5, pal.accent),
-                        egui::StrokeKind::Inside,
-                    );
-                    if dx != 0.0 {
-                        let current = self.col_width(i - 1);
-                        self.cols[i - 1].width = (current + dx).clamp(MIN_COL_W, MAX_COL_W);
-                        self.layout.borrow_mut().take();
-                        self.dirty = true;
-                    }
-                }
             }
             if rresp.hovered() && !rresp.dragged() {
                 painter.line_segment(
@@ -1132,8 +1173,9 @@ impl TmTable {
             Stroke::new(1.0, pal.stroke),
         );
 
+        let focused_now = ui.memory(|memory| memory.has_focus(header_resp.id));
         ui.ctx()
-            .data_mut(|d| d.insert_temp(egui::Id::new(("tm-hdrfocus", self.id)), header_focused));
+            .data_mut(|d| d.insert_temp(egui::Id::new(("tm-hdrfocus", self.id)), focused_now));
 
         clicked
     }
@@ -1163,14 +1205,8 @@ impl TmTable {
     /// a live list re-sorts underneath an open menu — an index-derived id
     /// would hand the menu to whatever next lands in the slot.
     ///
-    /// Rows sense clicks WITHOUT being keyboard-focusable. A `Sense::click()`
-    /// row is also FOCUSABLE, and once a row took focus every arrow key moved
-    /// invisible spatial focus instead of the visible selection — and the
-    /// app's own model-index navigation died with it. Rows are therefore
-    /// reached the way native Task Manager reaches them: the selection IS the
-    /// keyboard focus (`crate::search::list_nav`), Tab stays free for the
-    /// chrome around the table, and Enter/Space only belong to the row layer
-    /// while nothing else holds focus (`crate::search::row_action_gate`).
+    /// Rows are children of the table's single keyboard stop. Selection is
+    /// exposed through AccessKit, while the table body owns keyboard focus.
     pub fn row(
         &self,
         ui: &mut egui::Ui,
@@ -1185,6 +1221,24 @@ impl TmTable {
             egui::Id::new(self.id).with(key),
             Sense::CLICK.union(Sense::hover()),
         );
+        ui.ctx()
+            .register_accesskit_parent(resp.id, crate::search::content_focus_id(self.id));
+        self.current_row.set(Some(resp.id));
+        ui.ctx().accesskit_node_builder(resp.id, |node| {
+            node.set_role(egui::accesskit::Role::Row);
+            node.set_selected(selected);
+        });
+        if selected {
+            ui.ctx()
+                .accesskit_node_builder(crate::search::content_focus_id(self.id), |node| {
+                    node.set_active_descendant(resp.id.accesskit_id());
+                });
+        }
+        if resp.clicked() {
+            ui.ctx().memory_mut(|memory| {
+                memory.request_focus(crate::search::content_focus_id(self.id))
+            });
+        }
         let painter = ui.painter_at(rect.expand(2.0));
         // Remember the fill so [`TmTable::heat_cells`] can restore it ON TOP
         // of its opaque blue band; without that the highlight stopped dead at
@@ -1213,6 +1267,45 @@ impl TmTable {
         (rect, resp)
     }
 
+    /// Name and one-based position of a visible row. The row key is deliberately
+    /// separate: it identifies ownership, while this label is what a reader says.
+    pub fn describe_row(&self, ui: &egui::Ui, response: &egui::Response, name: &str, index: usize) {
+        response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Other, true, name));
+        ui.ctx().accesskit_node_builder(response.id, |node| {
+            node.set_role(egui::accesskit::Role::Row);
+            node.set_label(name);
+            node.set_row_index(index);
+        });
+    }
+
+    fn describe_cell(&self, ui: &egui::Ui, column: usize, value: &str) {
+        let Some(id) = self.current_row.get() else {
+            return;
+        };
+        let Some(spec) = self.cols.get(column) else {
+            return;
+        };
+        let label = spec.label;
+        let cell_id = id.with(("cell", spec.id));
+        ui.ctx().register_accesskit_parent(cell_id, id);
+        ui.ctx().accesskit_node_builder(cell_id, |node| {
+            node.set_role(egui::accesskit::Role::Cell);
+            node.set_label(label);
+            node.set_value(value);
+            node.set_column_index(column);
+        });
+        ui.ctx().accesskit_node_builder(id, |node| {
+            let mut description = node.description().unwrap_or_default().to_owned();
+            if !description.is_empty() {
+                description.push_str(", ");
+            }
+            description.push_str(label);
+            description.push_str(": ");
+            description.push_str(value);
+            node.set_description(description);
+        });
+    }
+
     /// Re-apply the SELECTED fill for the row that was just painted. A click's
     /// response arrives only AFTER [`Self::row`] chose the fill from the
     /// pre-click selection, so the freshly clicked row would otherwise light
@@ -1239,6 +1332,7 @@ impl TmTable {
         pal: &Palette,
         dim: bool,
     ) -> bool {
+        self.describe_cell(ui, i, text);
         let cell = self.col_rect(i, row);
         let truncated = text_width(ui, text, FONT_ROW) + 10.0 > cell.width();
         ui.painter_at(cell).text(
@@ -1267,6 +1361,7 @@ impl TmTable {
     ) {
         let painter = ui.painter_at(row.expand(2.0));
         for (k, cell_data) in cells.iter().enumerate() {
+            self.describe_cell(ui, from + k, &cell_data.text);
             let cell = self.col_rect(from + k, row);
             painter.rect_filled(cell, 0.0, crate::theme::heat_blue(pal, cell_data.intensity));
             painter.line_segment(
@@ -1492,6 +1587,94 @@ impl Aggregates {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn accessible_table_exposes_headers_rows_cells_and_active_selection() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        let mut table = table();
+        let screen = Rect::from_min_size(Pos2::ZERO, egui::vec2(900.0, 500.0));
+        let mut out = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(screen),
+                ..Default::default()
+            },
+            |root| {
+                egui::CentralPanel::default().show(root, |ui| {
+                    scrolled_rows(
+                        "t",
+                        ui,
+                        &crate::theme::DARK,
+                        &mut table,
+                        800.0,
+                        None,
+                        None,
+                        2,
+                        None,
+                        None,
+                        None,
+                        |ui, table, _, _, range| {
+                            for index in range {
+                                let selected = index == 1;
+                                let (rect, response) =
+                                    table.row(ui, &crate::theme::DARK, selected, index);
+                                table.describe_row(
+                                    ui,
+                                    &response,
+                                    if selected { "Beta" } else { "Alpha" },
+                                    index,
+                                );
+                                table.text_cell(
+                                    ui,
+                                    rect,
+                                    0,
+                                    if selected { "Beta" } else { "Alpha" },
+                                    &crate::theme::DARK,
+                                    false,
+                                );
+                                table.text_cell(ui, rect, 1, "Running", &crate::theme::DARK, false);
+                            }
+                        },
+                    );
+                });
+            },
+        );
+        out.textures_delta.clear();
+        let tree = out
+            .platform_output
+            .accesskit_update
+            .expect("accessibility tree");
+        let get = |id: egui::Id| {
+            tree.nodes
+                .iter()
+                .find(|(node_id, _)| *node_id == id.accesskit_id())
+                .map(|(_, node)| node)
+                .expect("accessible node")
+        };
+        let body = get(crate::search::content_focus_id("t"));
+        let selected_id = egui::Id::new("t").with(1usize);
+        assert_eq!(body.role(), egui::accesskit::Role::Table);
+        assert_eq!(body.active_descendant(), Some(selected_id.accesskit_id()));
+        assert!(body.children().contains(&selected_id.accesskit_id()));
+        assert!(
+            body.children()
+                .contains(&egui::Id::new(("tm-header-focus", "t")).accesskit_id())
+        );
+        let selected = get(selected_id);
+        assert_eq!(selected.role(), egui::accesskit::Role::Row);
+        assert_eq!(selected.label(), Some("Beta"));
+        assert_eq!(selected.is_selected(), Some(true));
+        assert_eq!(selected.row_index(), Some(1));
+        let cell = get(selected_id.with(("cell", "a")));
+        assert_eq!(cell.role(), egui::accesskit::Role::Cell);
+        assert_eq!(cell.label(), Some("A"));
+        assert_eq!(cell.value(), Some("Running"));
+        assert!(
+            selected
+                .children()
+                .contains(&selected_id.with(("cell", "a")).accesskit_id())
+        );
+    }
 
     #[test]
     fn sort_state_uses_natural_first_direction_then_toggles() {
@@ -2529,7 +2712,7 @@ mod tests {
         header_frame(&ctx, &mut t, screen, 0.000, vec![]);
         assert!(!header_has_focus(&ctx, "t"));
 
-        let cell_id = egui::Id::new(("tmtable", "t")).with(("hdr", "name"));
+        let cell_id = egui::Id::new(("tm-header-focus", "t"));
         ctx.memory_mut(|m| m.request_focus(cell_id));
         header_frame(&ctx, &mut t, screen, 0.016, vec![]);
         assert!(header_has_focus(&ctx, "t"));
@@ -2546,16 +2729,17 @@ mod tests {
         let mut t = table();
         header_frame(&ctx, &mut t, screen, 0.000, vec![]);
 
-        let handle_id = egui::Id::new(("tmtable", "t")).with(("resize", "a"));
+        let handle_id = egui::Id::new(("tm-header-focus", "t"));
+        ctx.data_mut(|data| data.insert_temp(egui::Id::new(("tm-header-active", "t")), "a"));
         ctx.memory_mut(|m| m.request_focus(handle_id));
         // Focus lands; the frame after it also installs the focus-lock
         // filter, so from here on the arrows belong to the handle.
         header_frame(&ctx, &mut t, screen, 0.016, vec![]);
         let key = |k: egui::Key, shift: bool| {
             let modifiers = if shift {
-                egui::Modifiers::SHIFT
+                egui::Modifiers::CTRL | egui::Modifiers::SHIFT
             } else {
-                egui::Modifiers::NONE
+                egui::Modifiers::CTRL
             };
             // egui reads modifiers only from the dedicated event, which the
             // winit backend delivers ahead of the key itself (and on release).
@@ -2609,15 +2793,7 @@ mod tests {
         let mut t = table();
         header_frame(&ctx, &mut t, screen, 0.000, vec![]);
 
-        let cell_id = egui::Id::new(("tmtable", "t")).with(("hdr", "name"));
-        let first_hdr = ctx
-            .data(|d| d.get_temp::<Option<egui::Id>>(egui::Id::new(("tm-first-hdr-cell", "t"))))
-            .flatten();
-        assert_eq!(
-            first_hdr,
-            Some(cell_id),
-            "first header cell ID is published"
-        );
+        let cell_id = egui::Id::new(("tm-header-focus", "t"));
 
         ctx.memory_mut(|m| m.request_focus(cell_id));
         header_frame(&ctx, &mut t, screen, 0.016, vec![]);
@@ -2636,8 +2812,8 @@ mod tests {
             "Down Arrow must clear header focus so rows can take keyboard nav"
         );
         assert!(
-            ctx.memory(|m| m.focused()).is_none(),
-            "focus must be surrendered"
+            ctx.memory(|m| m.focused()) == Some(crate::search::content_focus_id("t")),
+            "focus must move to the body"
         );
 
         // Test Escape as well
@@ -2664,7 +2840,7 @@ mod tests {
         let mut t = table();
         header_frame(&ctx, &mut t, screen, 0.000, vec![]);
 
-        let handle_id = egui::Id::new(("tmtable", "t")).with(("resize", "a"));
+        let handle_id = egui::Id::new(("tm-header-focus", "t"));
         ctx.memory_mut(|m| m.request_focus(handle_id));
         header_frame(&ctx, &mut t, screen, 0.016, vec![]);
         assert!(header_has_focus(&ctx, "t"));
@@ -2678,6 +2854,9 @@ mod tests {
         };
         header_frame(&ctx, &mut t, screen, 0.032, vec![down_event]);
         assert!(!header_has_focus(&ctx, "t"));
-        assert!(ctx.memory(|m| m.focused()).is_none());
+        assert_eq!(
+            ctx.memory(|m| m.focused()),
+            Some(crate::search::content_focus_id("t"))
+        );
     }
 }
