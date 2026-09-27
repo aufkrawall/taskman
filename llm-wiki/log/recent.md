@@ -1,4 +1,9 @@
 
+- 2026-09-27: Removed the whole-section accent focus frame from table bodies
+  (`tablekit::scrolled_rows`) and the Performance card column. Keyboard focus
+  and selection are now indicated solely by the clicked/focused row or card,
+  restoring native Task Manager aesthetics.
+
 - 2026-09-25: Second keyboard/screen-reader pass, on top of the one above. The
   model changed shape: a page is now exactly FOUR egui focus targets cycled
   with F6/Shift+F6 (search, sidebar, command buttons, content), and the content

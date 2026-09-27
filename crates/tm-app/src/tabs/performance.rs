@@ -443,15 +443,6 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
                 });
             });
 
-        if cards_focus.has_focus() {
-            ui.painter().rect_stroke(
-                card_rect.shrink(1.0),
-                3.0,
-                egui::Stroke::new(2.0, pal.accent),
-                egui::StrokeKind::Inside,
-            );
-        }
-
         // Drag splitter between the card column and the detail area.
         // egui's `drag_delta()` is movement since LAST FRAME, so it must
         // accumulate onto the LIVE width each frame. A frozen drag-start
@@ -604,11 +595,13 @@ fn card_ui(
     // with the card it sits on.
     let raised = selected || resp.hovered();
     if selected {
+        let focused = ui.memory(|m| m.has_focus(list_id));
+        let stroke_color = if focused { pal.accent } else { pal.text_dim };
         ui.painter().rect_filled(rect, 3.0, pal.card_bg);
         ui.painter().rect_stroke(
             rect,
             3.0,
-            egui::Stroke::new(1.2, pal.text_dim),
+            egui::Stroke::new(1.2, stroke_color),
             egui::StrokeKind::Inside,
         );
     } else if resp.hovered() {

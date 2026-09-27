@@ -543,14 +543,6 @@ pub fn scrolled_rows(
     };
 
     store_bar_use(ui, id, body_outer, body.inner_rect);
-    if body_focus.has_focus() {
-        ui.painter().rect_stroke(
-            body.inner_rect.shrink(1.0),
-            2.0,
-            egui::Stroke::new(2.0, pal.accent),
-            egui::StrokeKind::Inside,
-        );
-    }
     ui.ctx()
         .data_mut(|d| d.insert_temp(egui::Id::new(("tm-rowsx", id)), body.state.offset.x));
     ui.ctx()
@@ -2858,5 +2850,65 @@ mod tests {
             ctx.memory(|m| m.focused()),
             Some(crate::search::content_focus_id("t"))
         );
+    }
+
+    #[test]
+    fn focused_table_body_does_not_paint_outer_focus_frame() {
+        let ctx = egui::Context::default();
+        let mut table = table();
+        let screen = Rect::from_min_size(Pos2::ZERO, egui::vec2(900.0, 500.0));
+        let body_id = crate::search::content_focus_id("t");
+        ctx.memory_mut(|m| m.request_focus(body_id));
+
+        let mut out = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(screen),
+                ..Default::default()
+            },
+            |root| {
+                egui::CentralPanel::default().show(root, |ui| {
+                    scrolled_rows(
+                        "t",
+                        ui,
+                        &crate::theme::DARK,
+                        &mut table,
+                        800.0,
+                        None,
+                        None,
+                        2,
+                        None,
+                        None,
+                        None,
+                        |ui, table, _, _, range| {
+                            for index in range {
+                                let (rect, response) =
+                                    table.row(ui, &crate::theme::DARK, index == 0, index);
+                                table.describe_row(ui, &response, "Row", index);
+                                table.text_cell(ui, rect, 0, "Row", &crate::theme::DARK, false);
+                            }
+                        },
+                    );
+                });
+            },
+        );
+        out.textures_delta.clear();
+
+        assert_eq!(ctx.memory(|m| m.focused()), Some(body_id));
+
+        // The outer section must NOT paint a full-table bounding frame with pal.accent:
+        // Selection is indicated solely on the row itself.
+        for clipped in &out.shapes {
+            if let egui::epaint::Shape::Rect(rect_shape) = &clipped.shape {
+                if rect_shape.stroke.color == crate::theme::DARK.accent
+                    && rect_shape.stroke.width >= 2.0
+                {
+                    assert!(
+                        rect_shape.rect.height() < 100.0,
+                        "table body must not paint an outer focus frame around the entire section: {:?}",
+                        rect_shape.rect
+                    );
+                }
+            }
+        }
     }
 }

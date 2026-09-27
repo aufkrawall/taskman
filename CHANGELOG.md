@@ -84,6 +84,12 @@
 
 ### Fixed
 
+- **Selection focus indicators:** Removed the whole-section accent border that
+  framed the entire table viewport (Processes, Details, Services, etc.) or card
+  column (Performance) when focused. Focus and selection are now indicated
+  solely by the clicked/focused row or resource card itself, matching native
+  Task Manager behavior.
+
 - **Tab navigation to sidebar tabs and tab switching on focus:** Pressing Tab from
   an active list or table now reliably navigates into the sidebar navigation pane,
   focusing the active page tab directly. Navigating through the sidebar tabs via
