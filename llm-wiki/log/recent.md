@@ -1,4 +1,20 @@
 
+- 2026-09-27: Fixed 1-frame visual selection/focus anomalies during keyboard navigation.
+  - Fork fix in `vendor/egui/crates/egui/src/memory/mod.rs`: `set_focus_lock_filter` previously
+    checked `self.had_focus_last_frame(id) && self.has_focus(id)`. When focus shifted mid-frame,
+    `had_focus_last_frame` was false, which rejected filter installation on the landing frame.
+    On the subsequent frame, egui's default traversal moved focus away before the widget could
+    lock it. Removed the `had_focus_last_frame` precondition so widgets gaining focus immediately
+    lock Tab and arrow keys on their landing frame.
+  - Sidebar Settings navigation timing: In `sidebar()`, Settings handled `ArrowUp` to the last tab
+    *after* the tabs loop had already rendered with the old `app.tab`, painting the old tab for 1 frame
+    before switching. Moved Settings keyboard handling before the tabs loop so `app.tab` updates prior
+    to tab rendering.
+  - Command Toolbar & Chrome Filters: Installed `EventFilter { tab: true, vertical_arrows: true, horizontal_arrows: true }`
+    on `cmd_button` and `ellipsis_menu`, and `tab: true` on `global-search`, table headers, and performance cards.
+    In egui's right-to-left layout, this prevents default traversal from briefly focusing the first widget in
+    layout before custom toolbar/header navigation handlers run.
+
 - 2026-09-27: Comprehensive keyboard navigation audit and refinement pass.
   - Sidebar arrow navigation jumping: Fixed unexpected overshooting and double jumps
     when using ArrowUp/ArrowDown in the sidebar. Installed strict `EventFilter` directional

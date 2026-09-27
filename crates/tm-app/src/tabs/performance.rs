@@ -409,9 +409,9 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
                 memory.set_focus_lock_filter(
                     cards_focus.id,
                     egui::EventFilter {
+                        tab: true,
                         vertical_arrows: true,
                         horizontal_arrows: true,
-                        escape: true,
                         ..Default::default()
                     },
                 );
@@ -419,12 +419,31 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
             let tab_pressed = ui.input(|input| {
                 input.key_pressed(egui::Key::Tab) && !input.modifiers.ctrl && !input.modifiers.alt
             });
-            if tab_pressed && !ui.input(|input| input.modifiers.shift) {
-                ui.ctx().memory_mut(|memory| {
-                    memory.request_focus(egui::Id::new("tm-sidebar-toggle"));
-                    memory.move_focus(egui::FocusDirection::None);
-                });
-                ui.input_mut(|input| input.consume_key(Default::default(), egui::Key::Tab));
+            let reverse = ui.input(|input| input.modifiers.shift);
+            if tab_pressed {
+                if reverse {
+                    let last_toolbar = ui.ctx().data(|d| {
+                        d.get_temp::<Vec<(egui::Id, f32)>>(egui::Id::new("tm-toolbar-focus-items"))
+                            .and_then(|items| {
+                                let mut sorted = items;
+                                sorted.sort_by(|l, r| l.1.total_cmp(&r.1));
+                                sorted.last().map(|item| item.0)
+                            })
+                    });
+                    let target =
+                        last_toolbar.unwrap_or_else(|| egui::Id::new("tm-sidebar-settings"));
+                    ui.ctx().memory_mut(|memory| {
+                        memory.request_focus(target);
+                        memory.move_focus(egui::FocusDirection::None);
+                    });
+                    ui.input_mut(|input| input.consume_key(egui::Modifiers::SHIFT, egui::Key::Tab));
+                } else {
+                    ui.ctx().memory_mut(|memory| {
+                        memory.request_focus(egui::Id::new("tm-sidebar-toggle"));
+                        memory.move_focus(egui::FocusDirection::None);
+                    });
+                    ui.input_mut(|input| input.consume_key(Default::default(), egui::Key::Tab));
+                }
             }
         }
         ui.ctx()

@@ -183,6 +183,7 @@ instead:
 | --- | --- | --- |
 | `crates/egui/src/containers/window.rs` | `Window::modal(bool)`; raises the area to `Order::Foreground` and calls `memory.set_modal_layer(area_layer_id)` | Every taskman dialog is a `Window`; modality has to be an option on it, and the app keeps choosing its own backdrop style. |
 | `crates/egui/src/memory/mod.rs` | `Focus::modal_interested` collects the focusable ids met on the top modal layer in Tab order; `end_pass` redirects a pending focus request into the dialog and clamps Tab to its members | Without this, a focus request for a widget BEHIND an open dialog (e.g. the app handing focus back to a table row) lands behind it, and Tab walks out of the dialog into background chrome. |
+| `crates/egui/src/memory/mod.rs` | `Memory::set_focus_lock_filter` allows setting filter when `has_focus(id)` without requiring `had_focus_last_frame(id)` | Widgets gaining focus mid-frame can immediately lock Tab and arrow keys on their landing frame, eliminating 1-frame spatial-arrow and Tab leakage. |
 | `crates/egui/src/context.rs` | `register_accesskit_parent` made `pub`, and it repairs the parent link when it changes after the node was already built | taskman's rows/cards are deliberately NOT egui focus targets, so their accesskit nodes are attached to the collection by hand. The old `pub(crate)` signature plus insert-before-create ordering silently lost those nodes. |
 
 The `end_pass` clamp is deliberately minimal: it only acts when a top modal layer exists

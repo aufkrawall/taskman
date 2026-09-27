@@ -503,9 +503,9 @@ pub fn scrolled_rows(
             memory.set_focus_lock_filter(
                 body_focus.id,
                 egui::EventFilter {
+                    tab: true,
                     vertical_arrows: true,
                     horizontal_arrows: true,
-                    escape: true,
                     ..Default::default()
                 },
             );
@@ -886,6 +886,7 @@ impl TmTable {
                 memory.set_focus_lock_filter(
                     header_resp.id,
                     egui::EventFilter {
+                        tab: true,
                         horizontal_arrows: true,
                         vertical_arrows: true,
                         ..Default::default()
@@ -912,6 +913,21 @@ impl TmTable {
                     memory.move_focus(egui::FocusDirection::None);
                 });
                 ui.input_mut(|input| input.consume_key(Default::default(), egui::Key::Tab));
+            } else if tab_pressed && reverse {
+                let last_toolbar = ui.ctx().data(|d| {
+                    d.get_temp::<Vec<(egui::Id, f32)>>(egui::Id::new("tm-toolbar-focus-items"))
+                        .and_then(|items| {
+                            let mut sorted = items;
+                            sorted.sort_by(|l, r| l.1.total_cmp(&r.1));
+                            sorted.last().map(|item| item.0)
+                        })
+                });
+                let target = last_toolbar.unwrap_or_else(|| egui::Id::new("tm-sidebar-settings"));
+                ui.memory_mut(|memory| {
+                    memory.request_focus(target);
+                    memory.move_focus(egui::FocusDirection::None);
+                });
+                ui.input_mut(|input| input.consume_key(egui::Modifiers::SHIFT, egui::Key::Tab));
             } else if down && !modifiers.any() {
                 ui.memory_mut(|memory| {
                     memory.request_focus(crate::search::content_focus_id(self.id));
@@ -3033,6 +3049,55 @@ mod tests {
         assert!(
             !found_unfocused_pill,
             "unfocused row must not paint active accent pill"
+        );
+    }
+
+    #[test]
+    fn header_shift_tab_targets_last_toolbar_item() {
+        let ctx = egui::Context::default();
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1600.0, 900.0));
+        let mut t = table();
+        header_frame(&ctx, &mut t, screen, 0.000, vec![]);
+
+        let toolbar_id = egui::Id::new("mock-toolbar-button");
+        ctx.data_mut(|d| {
+            d.insert_temp(
+                egui::Id::new("tm-toolbar-focus-items"),
+                vec![(toolbar_id, 100.0f32)],
+            );
+        });
+
+        let header_id = egui::Id::new(("tm-header-focus", "t"));
+        ctx.memory_mut(|m| m.request_focus(header_id));
+        header_frame(&ctx, &mut t, screen, 0.016, vec![]);
+        assert!(header_has_focus(&ctx, "t"));
+
+        let raw = egui::RawInput {
+            screen_rect: Some(screen),
+            time: Some(0.032),
+            events: vec![
+                egui::Event::ModifiersChanged(egui::Modifiers::SHIFT),
+                egui::Event::Key {
+                    key: egui::Key::Tab,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::SHIFT,
+                },
+            ],
+            focused: true,
+            ..Default::default()
+        };
+        let mut out = ctx.run_ui(raw, |root| {
+            egui::CentralPanel::default().show(root, |ui| {
+                t.header(ui, &crate::theme::DARK, None, None);
+            });
+        });
+        out.textures_delta.clear();
+        assert_eq!(
+            ctx.memory(|m| m.focused()),
+            Some(toolbar_id),
+            "Shift+Tab on table header must immediately focus the last toolbar button"
         );
     }
 }

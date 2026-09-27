@@ -98,6 +98,13 @@
 
 ### Fixed
 
+- **Keyboard navigation visual selection flicker:** Eliminated 1-frame visual
+  anomalies where unintended UI elements briefly flashed as focused or selected
+  before focus/selection moved to the intended element. Patched `set_focus_lock_filter`
+  in egui so mid-frame focus handoffs immediately install event filters without
+  requiring prior-frame history, processed sidebar Settings navigation keys before
+  the tabs loop renders, and installed directional/tab event filters on command
+  toolbar buttons, table headers, and the global search box.
 - **Sidebar arrow navigation jumping:** Resolved unexpected jumping and overshooting
   when pressing ArrowUp or ArrowDown in the sidebar. Installed strict directional focus
   locks (`EventFilter`) and explicit focus direction clearing on all sidebar items

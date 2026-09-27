@@ -156,6 +156,15 @@ pub fn top_search_panel(app: &mut TaskManApp, ui_root: &mut egui::Ui, pal: &Pale
             // over the card's neutral one while the field owns the keyboard.
             // Painting only — no layout, no hover change.
             if edit.has_focus() {
+                ui.ctx().memory_mut(|mem| {
+                    mem.set_focus_lock_filter(
+                        search_id,
+                        egui::EventFilter {
+                            tab: true,
+                            ..Default::default()
+                        },
+                    );
+                });
                 focus_ring(ui, box_rect, 16.0, pal);
             }
 
@@ -325,7 +334,11 @@ fn register_toolbar_item(ui: &egui::Ui, response: &egui::Response) {
         let mut items = data
             .get_temp::<Vec<(egui::Id, f32)>>(key)
             .unwrap_or_default();
-        items.push((response.id, response.rect.center().x));
+        if let Some(existing) = items.iter_mut().find(|(id, _)| *id == response.id) {
+            existing.1 = response.rect.center().x;
+        } else {
+            items.push((response.id, response.rect.center().x));
+        }
         data.insert_temp(key, items);
     });
 }
@@ -336,6 +349,7 @@ pub fn finish_toolbar_focus(ctx: &egui::Context, tab: crate::app::Tab) {
             .unwrap_or_default()
     });
     items.sort_by(|left, right| left.1.total_cmp(&right.1));
+    items.dedup_by(|a, b| a.0 == b.0);
     ctx.data_mut(|data| {
         data.insert_temp(egui::Id::new("tm-toolbar-owner"), tab.key());
         data.insert_temp(
@@ -350,6 +364,36 @@ pub fn finish_toolbar_focus(ctx: &egui::Context, tab: crate::app::Tab) {
     {
         ctx.memory_mut(|memory| memory.request_focus(*id));
     }
+    let (left_pressed, right_pressed) = ctx.input(|input| {
+        (
+            input.key_pressed(egui::Key::ArrowLeft) && !input.modifiers.any(),
+            input.key_pressed(egui::Key::ArrowRight) && !input.modifiers.any(),
+        )
+    });
+    let from = items.iter().position(|(id, _)| {
+        ctx.memory(|memory| memory.has_focus(*id) || memory.had_focus_last_frame(*id))
+    });
+    if (left_pressed || right_pressed) && !ctx.any_popup_open() {
+        let Some(index) = from else {
+            return;
+        };
+        let next_index = if right_pressed {
+            (index + 1).min(items.len().saturating_sub(1))
+        } else {
+            index.saturating_sub(1)
+        };
+        if let Some((target, _)) = items.get(next_index) {
+            ctx.memory_mut(|memory| {
+                memory.request_focus(*target);
+                memory.move_focus(egui::FocusDirection::None);
+            });
+            ctx.input_mut(|input| {
+                input.consume_key(Default::default(), egui::Key::ArrowLeft);
+                input.consume_key(Default::default(), egui::Key::ArrowRight);
+            });
+        }
+        return;
+    }
     let tab_pressed = ctx.input(|input| {
         input.key_pressed(egui::Key::Tab) && !input.modifiers.ctrl && !input.modifiers.alt
     });
@@ -357,9 +401,6 @@ pub fn finish_toolbar_focus(ctx: &egui::Context, tab: crate::app::Tab) {
         return;
     }
     let reverse = ctx.input(|input| input.modifiers.shift);
-    let from = items
-        .iter()
-        .position(|(id, _)| ctx.memory(|memory| memory.had_focus_last_frame(*id)));
     let target = if let Some(index) = from {
         if reverse {
             index
@@ -375,7 +416,8 @@ pub fn finish_toolbar_focus(ctx: &egui::Context, tab: crate::app::Tab) {
                 }
             })
         }
-    } else if ctx.memory(|memory| memory.had_focus_last_frame(egui::Id::new("tm-sidebar-settings")))
+    } else if (ctx.memory(|memory| memory.has_focus(egui::Id::new("tm-sidebar-settings")))
+        || ctx.memory(|memory| memory.had_focus_last_frame(egui::Id::new("tm-sidebar-settings"))))
         && !reverse
     {
         items.first().map(|item| item.0).or_else(|| {
@@ -386,9 +428,10 @@ pub fn finish_toolbar_focus(ctx: &egui::Context, tab: crate::app::Tab) {
             }
         })
     } else if reverse
-        && ctx.memory(|memory| {
-            memory.had_focus_last_frame(egui::Id::new(("tm-header-focus", tab.key())))
-        })
+        && (ctx.memory(|memory| memory.has_focus(egui::Id::new(("tm-header-focus", tab.key()))))
+            || ctx.memory(|memory| {
+                memory.had_focus_last_frame(egui::Id::new(("tm-header-focus", tab.key())))
+            }))
     {
         items
             .last()
@@ -396,9 +439,10 @@ pub fn finish_toolbar_focus(ctx: &egui::Context, tab: crate::app::Tab) {
             .or(Some(egui::Id::new("tm-sidebar-settings")))
     } else if reverse
         && tab == crate::app::Tab::Performance
-        && ctx.memory(|memory| {
-            memory.had_focus_last_frame(crate::search::content_focus_id(tab.key()))
-        })
+        && (ctx.memory(|memory| memory.has_focus(crate::search::content_focus_id(tab.key())))
+            || ctx.memory(|memory| {
+                memory.had_focus_last_frame(crate::search::content_focus_id(tab.key()))
+            }))
     {
         items
             .last()
@@ -523,6 +567,70 @@ pub fn sidebar(app: &mut TaskManApp, ui_root: &mut egui::Ui, pal: &Palette) {
             }
             ui.add_space(8.0);
 
+            let settings_id = egui::Id::new("tm-sidebar-settings");
+            if ui.ctx().memory(|m| m.has_focus(settings_id)) {
+                let up = ui
+                    .input(|input| input.key_pressed(egui::Key::ArrowUp) && !input.modifiers.any());
+                if up {
+                    let last_tab = crate::app::Tab::ALL[crate::app::Tab::ALL.len() - 1];
+                    app.tab = last_tab;
+                    ui.ctx().memory_mut(|memory| {
+                        memory.request_focus(egui::Id::new(("tm-sidebar-tab", last_tab.key())));
+                        memory.move_focus(egui::FocusDirection::None);
+                    });
+                    ui.input_mut(|input| input.consume_key(Default::default(), egui::Key::ArrowUp));
+                }
+                let down = ui.input(|input| {
+                    input.key_pressed(egui::Key::ArrowDown) && !input.modifiers.any()
+                });
+                if down {
+                    ui.ctx()
+                        .memory_mut(|memory| memory.move_focus(egui::FocusDirection::None));
+                    ui.input_mut(|input| {
+                        input.consume_key(Default::default(), egui::Key::ArrowDown)
+                    });
+                }
+                let shift_tab = ui.input(|input| {
+                    input.key_pressed(egui::Key::Tab)
+                        && input.modifiers.shift
+                        && !input.modifiers.ctrl
+                        && !input.modifiers.alt
+                });
+                if shift_tab {
+                    ui.ctx().memory_mut(|memory| {
+                        memory.request_focus(egui::Id::new(("tm-sidebar-tab", app.tab.key())));
+                        memory.move_focus(egui::FocusDirection::None);
+                    });
+                    ui.input_mut(|input| input.consume_key(egui::Modifiers::SHIFT, egui::Key::Tab));
+                }
+                let tab_forward = ui.input(|input| {
+                    input.key_pressed(egui::Key::Tab)
+                        && !input.modifiers.shift
+                        && !input.modifiers.ctrl
+                        && !input.modifiers.alt
+                });
+                if tab_forward {
+                    let first_toolbar = ui.ctx().data(|d| {
+                        d.get_temp::<Option<egui::Id>>(egui::Id::new("tm-first-toolbar-button"))
+                            .flatten()
+                    });
+                    let target = first_toolbar.or_else(|| {
+                        if app.tab == crate::app::Tab::Performance {
+                            Some(crate::search::content_focus_id(app.tab.key()))
+                        } else {
+                            Some(egui::Id::new(("tm-header-focus", app.tab.key())))
+                        }
+                    });
+                    if let Some(target) = target {
+                        ui.ctx().memory_mut(|memory| {
+                            memory.request_focus(target);
+                            memory.move_focus(egui::FocusDirection::None);
+                        });
+                        ui.input_mut(|input| input.consume_key(Default::default(), egui::Key::Tab));
+                    }
+                }
+            }
+
             for (idx, &tab) in crate::app::Tab::ALL.iter().enumerate() {
                 let selected = app.tab == tab;
                 let resp = nav_item(
@@ -576,47 +684,13 @@ pub fn sidebar(app: &mut TaskManApp, ui_root: &mut egui::Ui, pal: &Palette) {
                     memory.set_focus_lock_filter(
                         resp.id,
                         egui::EventFilter {
+                            tab: true,
                             vertical_arrows: true,
                             horizontal_arrows: true,
-                            escape: true,
                             ..Default::default()
                         },
                     );
                 });
-                let up = ui
-                    .input(|input| input.key_pressed(egui::Key::ArrowUp) && !input.modifiers.any());
-                if up {
-                    let last_tab = crate::app::Tab::ALL[crate::app::Tab::ALL.len() - 1];
-                    app.tab = last_tab;
-                    ui.ctx().memory_mut(|memory| {
-                        memory.request_focus(egui::Id::new(("tm-sidebar-tab", last_tab.key())));
-                        memory.move_focus(egui::FocusDirection::None);
-                    });
-                    ui.input_mut(|input| input.consume_key(Default::default(), egui::Key::ArrowUp));
-                }
-                let down = ui.input(|input| {
-                    input.key_pressed(egui::Key::ArrowDown) && !input.modifiers.any()
-                });
-                if down {
-                    ui.ctx()
-                        .memory_mut(|memory| memory.move_focus(egui::FocusDirection::None));
-                    ui.input_mut(|input| {
-                        input.consume_key(Default::default(), egui::Key::ArrowDown)
-                    });
-                }
-                let shift_tab = ui.input(|input| {
-                    input.key_pressed(egui::Key::Tab)
-                        && input.modifiers.shift
-                        && !input.modifiers.ctrl
-                        && !input.modifiers.alt
-                });
-                if shift_tab {
-                    ui.ctx().memory_mut(|memory| {
-                        memory.request_focus(egui::Id::new(("tm-sidebar-tab", app.tab.key())));
-                        memory.move_focus(egui::FocusDirection::None);
-                    });
-                    ui.input_mut(|input| input.consume_key(egui::Modifiers::SHIFT, egui::Key::Tab));
-                }
             }
             let open_settings = resp.clicked()
                 || (resp.has_focus()
@@ -715,16 +789,16 @@ fn nav_item(
             memory.set_focus_lock_filter(
                 resp.id,
                 egui::EventFilter {
+                    tab: true,
                     vertical_arrows: true,
                     horizontal_arrows: true,
-                    escape: true,
                     ..Default::default()
                 },
             );
         });
         focus_ring(ui, rect, 4.0, pal);
         let drop_to_content = ui.input(|i| {
-            (i.key_pressed(egui::Key::ArrowRight) || i.key_pressed(egui::Key::Escape))
+            i.key_pressed(egui::Key::ArrowRight)
                 && !i.modifiers.shift
                 && !i.modifiers.ctrl
                 && !i.modifiers.alt
@@ -741,7 +815,6 @@ fn nav_item(
             }
             ui.input_mut(|i| {
                 i.consume_key(Default::default(), egui::Key::ArrowRight);
-                i.consume_key(Default::default(), egui::Key::Escape);
             });
         }
     }
@@ -786,9 +859,9 @@ fn icon_button(
             memory.set_focus_lock_filter(
                 resp.id,
                 egui::EventFilter {
+                    tab: true,
                     vertical_arrows: true,
                     horizontal_arrows: true,
-                    escape: true,
                     ..Default::default()
                 },
             );
@@ -958,9 +1031,20 @@ pub fn cmd_button(
         color,
     );
     if resp.has_focus() {
+        ui.ctx().memory_mut(|memory| {
+            memory.set_focus_lock_filter(
+                resp.id,
+                egui::EventFilter {
+                    tab: true,
+                    vertical_arrows: true,
+                    horizontal_arrows: true,
+                    ..Default::default()
+                },
+            );
+        });
         focus_ring(ui, rect, 4.0, pal);
         let drop_down = ui.input(|i| {
-            (i.key_pressed(egui::Key::ArrowDown) || i.key_pressed(egui::Key::Escape))
+            i.key_pressed(egui::Key::ArrowDown)
                 && !i.modifiers.shift
                 && !i.modifiers.ctrl
                 && !i.modifiers.alt
@@ -977,7 +1061,6 @@ pub fn cmd_button(
             }
             ui.input_mut(|i| {
                 i.consume_key(Default::default(), egui::Key::ArrowDown);
-                i.consume_key(Default::default(), egui::Key::Escape);
             });
         }
     }
@@ -1009,6 +1092,19 @@ pub fn ellipsis_menu(
             items(app, ui);
         },
     );
+    if response.has_focus() {
+        ui.ctx().memory_mut(|memory| {
+            memory.set_focus_lock_filter(
+                response.id,
+                egui::EventFilter {
+                    tab: true,
+                    vertical_arrows: true,
+                    horizontal_arrows: true,
+                    ..Default::default()
+                },
+            );
+        });
+    }
     register_toolbar_item(ui, &response);
 }
 
@@ -3970,5 +4066,170 @@ mod tests {
                 assert_eq!(prev, i - 1);
             }
         }
+    }
+
+    #[test]
+    fn set_focus_lock_filter_sticks_on_first_focused_frame() {
+        let ctx = egui::Context::default();
+        let screen = Rect::from_min_size(Pos2::ZERO, egui::vec2(800.0, 600.0));
+        let id1 = egui::Id::new("first-frame-filter");
+
+        // Frame 1: Widget requests focus AND sets filter in the same frame.
+        let raw1 = egui::RawInput {
+            screen_rect: Some(screen),
+            focused: true,
+            ..Default::default()
+        };
+        let mut out1 = ctx.run_ui(raw1, |ui| {
+            ui.memory_mut(|m| {
+                m.request_focus(id1);
+                m.set_focus_lock_filter(
+                    id1,
+                    egui::EventFilter {
+                        tab: true,
+                        horizontal_arrows: true,
+                        vertical_arrows: true,
+                        ..Default::default()
+                    },
+                );
+            });
+        });
+        out1.textures_delta.clear();
+        assert_eq!(ctx.memory(|m| m.focused()), Some(id1));
+
+        // Frame 2: User presses Tab. The filter was stored on Frame 1 despite having no
+        // previous frame history, so egui's begin_pass does NOT move focus away.
+        let raw2 = egui::RawInput {
+            screen_rect: Some(screen),
+            events: vec![egui::Event::Key {
+                key: egui::Key::Tab,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: Default::default(),
+            }],
+            focused: true,
+            ..Default::default()
+        };
+        let mut out2 = ctx.run_ui(raw2, |ui| {
+            ui.interact(
+                Rect::from_min_size(Pos2::ZERO, egui::vec2(10.0, 10.0)),
+                id1,
+                Sense::click(),
+            );
+        });
+        out2.textures_delta.clear();
+        assert_eq!(
+            ctx.memory(|m| m.focused()),
+            Some(id1),
+            "tab filter installed on first frame must prevent focus movement on second frame"
+        );
+    }
+
+    #[test]
+    fn toolbar_navigation_with_arrows_and_tab() {
+        let pal = theme::DARK;
+        let ctx = egui::Context::default();
+        let screen = Rect::from_min_size(Pos2::ZERO, egui::vec2(800.0, 600.0));
+
+        let run_frame = |ctx: &egui::Context, events: Vec<egui::Event>| {
+            let raw = egui::RawInput {
+                screen_rect: Some(screen),
+                events,
+                focused: true,
+                ..Default::default()
+            };
+            let mut out = ctx.run_ui(raw, |ui| {
+                ui.horizontal(|ui| {
+                    let _b1 = cmd_button(ui, &pal, Icon::RunTask, "Run", true);
+                    let _b2 = cmd_button(ui, &pal, Icon::OpenExternal, "Open", true);
+                });
+                finish_toolbar_focus(ui.ctx(), crate::app::Tab::Processes);
+            });
+            out.textures_delta.clear();
+        };
+
+        // Frame 1: initial render, focus first toolbar button
+        run_frame(&ctx, vec![]);
+        let first_id = ctx.data(|d| {
+            d.get_temp::<Option<egui::Id>>(egui::Id::new("tm-first-toolbar-button"))
+                .flatten()
+        });
+        assert!(first_id.is_some(), "first toolbar button registered");
+        let btn1 = first_id.unwrap();
+        ctx.memory_mut(|m| m.request_focus(btn1));
+
+        // Frame 2: verify focused and press ArrowRight
+        run_frame(
+            &ctx,
+            vec![egui::Event::Key {
+                key: egui::Key::ArrowRight,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: Default::default(),
+            }],
+        );
+        let current = ctx.memory(|m| m.focused());
+        assert_ne!(
+            current,
+            Some(btn1),
+            "ArrowRight moves focus away from button 1"
+        );
+        let btn2 = current.expect("focus moved to button 2");
+
+        // Frame 3: press ArrowLeft to return to button 1
+        run_frame(
+            &ctx,
+            vec![egui::Event::Key {
+                key: egui::Key::ArrowLeft,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: Default::default(),
+            }],
+        );
+        assert_eq!(
+            ctx.memory(|m| m.focused()),
+            Some(btn1),
+            "ArrowLeft moves focus back to button 1"
+        );
+
+        // Frame 4: press Tab to advance to button 2
+        run_frame(
+            &ctx,
+            vec![egui::Event::Key {
+                key: egui::Key::Tab,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: Default::default(),
+            }],
+        );
+        assert_eq!(
+            ctx.memory(|m| m.focused()),
+            Some(btn2),
+            "Tab moves focus to button 2"
+        );
+
+        // Frame 5: press Shift+Tab to return to button 1
+        run_frame(
+            &ctx,
+            vec![
+                egui::Event::ModifiersChanged(egui::Modifiers::SHIFT),
+                egui::Event::Key {
+                    key: egui::Key::Tab,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::SHIFT,
+                },
+            ],
+        );
+        assert_eq!(
+            ctx.memory(|m| m.focused()),
+            Some(btn1),
+            "Shift+Tab moves focus back to button 1"
+        );
     }
 }
