@@ -1113,6 +1113,9 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
     // select-columns dialog).
     let dialog_open = app.modal_open();
     if !dialog_open {
+        if search::content_has_focus(ui.ctx()) && app.selection.is_empty() && !rows.is_empty() {
+            select_detail_row(app, &rows[0]);
+        }
         if let Some(typed) = search::list_type_ahead(ui.ctx(), "details", dialog_open) {
             let selected = app.selection.primary().map(|p| p.pid);
             let candidates = rows

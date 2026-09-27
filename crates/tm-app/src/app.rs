@@ -1740,6 +1740,11 @@ impl eframe::App for TaskManApp {
         }
 
         route_global_keyboard(self, &ctx);
+        let last_tab = ctx.data(|d| d.get_temp::<Tab>(egui::Id::new("tm-last-active-tab")));
+        if last_tab != Some(self.tab) {
+            ctx.data_mut(|d| d.insert_temp(egui::Id::new("tm-last-active-tab"), self.tab));
+            self.scroll_to_current_selection(&ctx);
+        }
         crate::search::set_active_content(&ctx, self.tab.key());
         let modal_open = self.modal_open();
         if modal_open {
@@ -1958,6 +1963,65 @@ impl TaskManApp {
             || self.details_state.select_columns_open
     }
 
+    /// Request vertical scroll to bring the current tab's active selection into view.
+    pub fn scroll_to_current_selection(&mut self, ctx: &egui::Context) {
+        match self.tab {
+            Tab::Processes => {
+                if let Some(primary) = self.selection.primary() {
+                    self.processes_state.park_scroll_to_pid(primary.pid);
+                }
+            }
+            Tab::Details => {
+                if let Some(primary) = self.selection.primary() {
+                    self.scroll_to_pid = Some(primary.pid);
+                }
+            }
+            Tab::Services => {
+                if let Some(name) = &self.services_selected_name {
+                    crate::widgets::tablekit::request_row_scroll(
+                        ctx,
+                        "services",
+                        crate::widgets::tablekit::stable_key(name),
+                    );
+                }
+            }
+            Tab::Startup => {
+                if let Some(id) = &self.selected_startup_id {
+                    crate::widgets::tablekit::request_row_scroll(
+                        ctx,
+                        "startup",
+                        crate::widgets::tablekit::stable_key(id),
+                    );
+                }
+            }
+            Tab::Users => {
+                if let Some(id) = self.selected_user {
+                    crate::widgets::tablekit::request_row_scroll(
+                        ctx,
+                        "users",
+                        crate::widgets::tablekit::stable_key(id),
+                    );
+                }
+            }
+            Tab::AppHistory => {
+                if let Some(name) = crate::tabs::app_history::selected_name(ctx) {
+                    crate::widgets::tablekit::request_row_scroll(
+                        ctx,
+                        "apphistory",
+                        crate::widgets::tablekit::stable_key(&name),
+                    );
+                }
+            }
+            Tab::Performance => {
+                crate::widgets::tablekit::request_row_scroll(
+                    ctx,
+                    "performance",
+                    crate::widgets::tablekit::stable_key(&self.perf_selected_key),
+                );
+            }
+        }
+    }
+
     /// Enter in the global search box commits the search: the current page's
     /// selection lands on the first match the VISIBLE table would show — the
     /// first row of the page's own display model (the same live filter and
@@ -2071,11 +2135,30 @@ impl TaskManApp {
                 );
                 self.selected_startup_id = Some(id);
             }
-            // The Users page matches sessions by display name and per-user
-            // app aggregates, App history by app display name; neither page
-            // exposes a selection model reachable from here. Enter simply
-            // surrenders the field's focus (arrow keys then work).
-            Tab::Users | Tab::AppHistory => {}
+            Tab::Users => {
+                let id = crate::tabs::users::first_search_match_session_id(self, &q);
+                let Some(id) = id else {
+                    return;
+                };
+                self.selected_user = Some(id);
+                crate::widgets::tablekit::request_row_scroll(
+                    ctx,
+                    "users",
+                    crate::widgets::tablekit::stable_key(id),
+                );
+            }
+            Tab::AppHistory => {
+                let name = crate::tabs::app_history::first_search_match_name(self, &q);
+                let Some(name) = name else {
+                    return;
+                };
+                crate::tabs::app_history::set_selected_name(ctx, Some(name.clone()));
+                crate::widgets::tablekit::request_row_scroll(
+                    ctx,
+                    "apphistory",
+                    crate::widgets::tablekit::stable_key(&name),
+                );
+            }
         }
     }
 

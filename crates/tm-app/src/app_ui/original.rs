@@ -131,6 +131,26 @@ pub fn top_search_panel(app: &mut TaskManApp, ui_root: &mut egui::Ui, pal: &Pale
                     .id(search_id),
             );
 
+            let tab_pressed = ui
+                .input(|i| i.key_pressed(egui::Key::Tab) && !i.modifiers.ctrl && !i.modifiers.alt);
+            let shift_tab = ui.input(|i| i.modifiers.shift);
+            if edit.has_focus() && tab_pressed {
+                if shift_tab {
+                    let target = crate::search::content_focus_id(app.tab.key());
+                    ui.ctx().memory_mut(|mem| {
+                        mem.request_focus(target);
+                        mem.move_focus(egui::FocusDirection::None);
+                    });
+                    ui.input_mut(|i| i.consume_key(egui::Modifiers::SHIFT, egui::Key::Tab));
+                } else {
+                    ui.ctx().memory_mut(|mem| {
+                        mem.request_focus(egui::Id::new("tm-sidebar-toggle"));
+                        mem.move_focus(egui::FocusDirection::None);
+                    });
+                    ui.input_mut(|i| i.consume_key(Default::default(), egui::Key::Tab));
+                }
+            }
+
             // Keyboard-focus ring for the frame-less text edit: egui paints
             // no focus outline of its own here, so the accent stroke goes
             // over the card's neutral one while the field owns the keyboard.
@@ -169,7 +189,7 @@ pub fn top_search_panel(app: &mut TaskManApp, ui_root: &mut egui::Ui, pal: &Pale
                     .interact(
                         clear_rect,
                         egui::Id::new("global-search-clear"),
-                        Sense::click(),
+                        Sense::CLICK,
                     )
                     .on_hover_text(i18n::tr(K::ClearSearch));
                 resp.widget_info(|| {
@@ -347,26 +367,51 @@ pub fn finish_toolbar_focus(ctx: &egui::Context, tab: crate::app::Tab) {
                 .and_then(|index| items.get(index).map(|item| item.0))
                 .or(Some(egui::Id::new("tm-sidebar-settings")))
         } else {
-            items
-                .get(index + 1)
-                .map(|item| item.0)
-                .or(Some(egui::Id::new(("tm-header-focus", tab.key()))))
+            items.get(index + 1).map(|item| item.0).or_else(|| {
+                if tab == crate::app::Tab::Performance {
+                    Some(crate::search::content_focus_id(tab.key()))
+                } else {
+                    Some(egui::Id::new(("tm-header-focus", tab.key())))
+                }
+            })
         }
     } else if ctx.memory(|memory| memory.had_focus_last_frame(egui::Id::new("tm-sidebar-settings")))
         && !reverse
     {
-        items.first().map(|item| item.0)
+        items.first().map(|item| item.0).or_else(|| {
+            if tab == crate::app::Tab::Performance {
+                Some(crate::search::content_focus_id(tab.key()))
+            } else {
+                Some(egui::Id::new(("tm-header-focus", tab.key())))
+            }
+        })
     } else if reverse
         && ctx.memory(|memory| {
             memory.had_focus_last_frame(egui::Id::new(("tm-header-focus", tab.key())))
         })
     {
-        items.last().map(|item| item.0)
+        items
+            .last()
+            .map(|item| item.0)
+            .or(Some(egui::Id::new("tm-sidebar-settings")))
+    } else if reverse
+        && tab == crate::app::Tab::Performance
+        && ctx.memory(|memory| {
+            memory.had_focus_last_frame(crate::search::content_focus_id(tab.key()))
+        })
+    {
+        items
+            .last()
+            .map(|item| item.0)
+            .or(Some(egui::Id::new("tm-sidebar-settings")))
     } else {
         None
     };
     if let Some(target) = target {
-        ctx.memory_mut(|memory| memory.request_focus(target));
+        ctx.memory_mut(|memory| {
+            memory.request_focus(target);
+            memory.move_focus(egui::FocusDirection::None);
+        });
         ctx.input_mut(|input| {
             input.consume_key(Default::default(), egui::Key::Tab);
             input.consume_key(egui::Modifiers::SHIFT, egui::Key::Tab);
@@ -418,20 +463,61 @@ pub fn sidebar(app: &mut TaskManApp, ui_root: &mut egui::Ui, pal: &Palette) {
                         .iter()
                         .position(|tab| *tab == focused)
                         .unwrap_or(0) as isize;
-                    let next = (current + direction)
-                        .clamp(0, crate::app::Tab::ALL.len() as isize - 1)
-                        as usize;
-                    app.tab = crate::app::Tab::ALL[next];
-                    ui.ctx().memory_mut(|memory| {
-                        memory.request_focus(egui::Id::new(("tm-sidebar-tab", app.tab.key())))
-                    });
-                    ui.input_mut(|input| {
-                        input.consume_key(Default::default(), egui::Key::ArrowDown);
-                        input.consume_key(Default::default(), egui::Key::ArrowUp);
-                    });
+                    let target = current + direction;
+                    if target < 0 {
+                        ui.ctx().memory_mut(|memory| {
+                            memory.request_focus(egui::Id::new("tm-sidebar-toggle"));
+                            memory.move_focus(egui::FocusDirection::None);
+                        });
+                        ui.input_mut(|input| {
+                            input.consume_key(Default::default(), egui::Key::ArrowUp);
+                        });
+                    } else if target >= crate::app::Tab::ALL.len() as isize {
+                        ui.ctx().memory_mut(|memory| {
+                            memory.request_focus(egui::Id::new("tm-sidebar-settings"));
+                            memory.move_focus(egui::FocusDirection::None);
+                        });
+                        ui.input_mut(|input| {
+                            input.consume_key(Default::default(), egui::Key::ArrowDown);
+                        });
+                    } else {
+                        let next = target as usize;
+                        app.tab = crate::app::Tab::ALL[next];
+                        ui.ctx().memory_mut(|memory| {
+                            memory.request_focus(egui::Id::new(("tm-sidebar-tab", app.tab.key())));
+                            memory.move_focus(egui::FocusDirection::None);
+                        });
+                        ui.input_mut(|input| {
+                            input.consume_key(Default::default(), egui::Key::ArrowDown);
+                            input.consume_key(Default::default(), egui::Key::ArrowUp);
+                        });
+                    }
+                }
+                let tab_pressed = ui.input(|input| {
+                    input.key_pressed(egui::Key::Tab)
+                        && !input.modifiers.ctrl
+                        && !input.modifiers.alt
+                });
+                let reverse = ui.input(|input| input.modifiers.shift);
+                if tab_pressed {
+                    if reverse {
+                        ui.ctx().memory_mut(|memory| {
+                            memory.request_focus(egui::Id::new("tm-sidebar-toggle"));
+                            memory.move_focus(egui::FocusDirection::None);
+                        });
+                        ui.input_mut(|input| {
+                            input.consume_key(egui::Modifiers::SHIFT, egui::Key::Tab)
+                        });
+                    } else {
+                        ui.ctx().memory_mut(|memory| {
+                            memory.request_focus(egui::Id::new("tm-sidebar-settings"));
+                            memory.move_focus(egui::FocusDirection::None);
+                        });
+                        ui.input_mut(|input| input.consume_key(Default::default(), egui::Key::Tab));
+                    }
                 }
             }
-            if icon_button(ui, pal, Icon::Hamburger, 32.0, collapsed) {
+            if icon_button(ui, pal, Icon::Hamburger, 32.0, collapsed, app) {
                 app.shared.settings.sidebar_collapsed = !collapsed;
                 app.save_settings();
             }
@@ -454,7 +540,8 @@ pub fn sidebar(app: &mut TaskManApp, ui_root: &mut egui::Ui, pal: &Palette) {
                 }
                 if resp.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
                     ui.ctx().memory_mut(|memory| {
-                        memory.request_focus(crate::search::content_focus_id(tab.key()))
+                        memory.request_focus(crate::search::content_focus_id(tab.key()));
+                        memory.move_focus(egui::FocusDirection::None);
                     });
                     ui.input_mut(|i| i.consume_key(Default::default(), egui::Key::Enter));
                 }
@@ -484,8 +571,69 @@ pub fn sidebar(app: &mut TaskManApp, ui_root: &mut egui::Ui, pal: &Palette) {
                 collapsed,
                 true,
             );
-            if resp.clicked() {
+            if resp.has_focus() {
+                ui.ctx().memory_mut(|memory| {
+                    memory.set_focus_lock_filter(
+                        resp.id,
+                        egui::EventFilter {
+                            vertical_arrows: true,
+                            horizontal_arrows: true,
+                            escape: true,
+                            ..Default::default()
+                        },
+                    );
+                });
+                let up = ui
+                    .input(|input| input.key_pressed(egui::Key::ArrowUp) && !input.modifiers.any());
+                if up {
+                    let last_tab = crate::app::Tab::ALL[crate::app::Tab::ALL.len() - 1];
+                    app.tab = last_tab;
+                    ui.ctx().memory_mut(|memory| {
+                        memory.request_focus(egui::Id::new(("tm-sidebar-tab", last_tab.key())));
+                        memory.move_focus(egui::FocusDirection::None);
+                    });
+                    ui.input_mut(|input| input.consume_key(Default::default(), egui::Key::ArrowUp));
+                }
+                let down = ui.input(|input| {
+                    input.key_pressed(egui::Key::ArrowDown) && !input.modifiers.any()
+                });
+                if down {
+                    ui.ctx()
+                        .memory_mut(|memory| memory.move_focus(egui::FocusDirection::None));
+                    ui.input_mut(|input| {
+                        input.consume_key(Default::default(), egui::Key::ArrowDown)
+                    });
+                }
+                let shift_tab = ui.input(|input| {
+                    input.key_pressed(egui::Key::Tab)
+                        && input.modifiers.shift
+                        && !input.modifiers.ctrl
+                        && !input.modifiers.alt
+                });
+                if shift_tab {
+                    ui.ctx().memory_mut(|memory| {
+                        memory.request_focus(egui::Id::new(("tm-sidebar-tab", app.tab.key())));
+                        memory.move_focus(egui::FocusDirection::None);
+                    });
+                    ui.input_mut(|input| input.consume_key(egui::Modifiers::SHIFT, egui::Key::Tab));
+                }
+            }
+            let open_settings = resp.clicked()
+                || (resp.has_focus()
+                    && ui.input(|i| {
+                        (i.key_pressed(egui::Key::Enter) || i.key_pressed(egui::Key::Space))
+                            && !i.modifiers.shift
+                            && !i.modifiers.ctrl
+                            && !i.modifiers.alt
+                    }));
+            if open_settings {
                 app.show_settings = true;
+                ui.ctx()
+                    .memory_mut(|memory| memory.move_focus(egui::FocusDirection::None));
+                ui.input_mut(|i| {
+                    i.consume_key(Default::default(), egui::Key::Enter);
+                    i.consume_key(Default::default(), egui::Key::Space);
+                });
             }
             if collapsed && resp.hovered() {
                 resp.on_hover_text(i18n::tr(K::Settings));
@@ -563,6 +711,17 @@ fn nav_item(
     }
     // Keyboard-focus ring, painted last so it sits on top of the fill.
     if resp.has_focus() {
+        ui.ctx().memory_mut(|memory| {
+            memory.set_focus_lock_filter(
+                resp.id,
+                egui::EventFilter {
+                    vertical_arrows: true,
+                    horizontal_arrows: true,
+                    escape: true,
+                    ..Default::default()
+                },
+            );
+        });
         focus_ring(ui, rect, 4.0, pal);
         let drop_to_content = ui.input(|i| {
             (i.key_pressed(egui::Key::ArrowRight) || i.key_pressed(egui::Key::Escape))
@@ -589,7 +748,14 @@ fn nav_item(
     resp
 }
 
-fn icon_button(ui: &mut egui::Ui, pal: &Palette, icon: Icon, size: f32, center: bool) -> bool {
+fn icon_button(
+    ui: &mut egui::Ui,
+    pal: &Palette,
+    icon: Icon,
+    size: f32,
+    center: bool,
+    app: &mut TaskManApp,
+) -> bool {
     let w = if center {
         ui.available_width().max(size)
     } else {
@@ -614,8 +780,82 @@ fn icon_button(ui: &mut egui::Ui, pal: &Palette, icon: Icon, size: f32, center: 
         ui.painter()
             .rect_filled(badge_rect, 4.0, Color32::from_white_alpha(12));
     }
+    let mut activate = resp.clicked();
     if resp.has_focus() {
+        ui.ctx().memory_mut(|memory| {
+            memory.set_focus_lock_filter(
+                resp.id,
+                egui::EventFilter {
+                    vertical_arrows: true,
+                    horizontal_arrows: true,
+                    escape: true,
+                    ..Default::default()
+                },
+            );
+        });
         focus_ring(ui, badge_rect, 4.0, pal);
+        if icon == Icon::Hamburger {
+            let down = ui.input(|i| i.key_pressed(egui::Key::ArrowDown) && !i.modifiers.any());
+            if down {
+                let first_tab = crate::app::Tab::ALL[0];
+                app.tab = first_tab;
+                ui.ctx().memory_mut(|memory| {
+                    memory.request_focus(egui::Id::new(("tm-sidebar-tab", first_tab.key())));
+                    memory.move_focus(egui::FocusDirection::None);
+                });
+                ui.input_mut(|i| i.consume_key(Default::default(), egui::Key::ArrowDown));
+            }
+            let up = ui.input(|i| i.key_pressed(egui::Key::ArrowUp) && !i.modifiers.any());
+            if up {
+                ui.ctx()
+                    .memory_mut(|memory| memory.move_focus(egui::FocusDirection::None));
+                ui.input_mut(|i| i.consume_key(Default::default(), egui::Key::ArrowUp));
+            }
+            let shift_tab = ui.input(|i| {
+                i.key_pressed(egui::Key::Tab)
+                    && i.modifiers.shift
+                    && !i.modifiers.ctrl
+                    && !i.modifiers.alt
+            });
+            if shift_tab {
+                let target = if app.tab == crate::app::Tab::Performance {
+                    crate::search::content_focus_id("performance")
+                } else {
+                    egui::Id::new("global-search")
+                };
+                ui.ctx().memory_mut(|memory| {
+                    memory.request_focus(target);
+                    memory.move_focus(egui::FocusDirection::None);
+                });
+                ui.input_mut(|i| i.consume_key(egui::Modifiers::SHIFT, egui::Key::Tab));
+            }
+            let tab_forward = ui.input(|i| {
+                i.key_pressed(egui::Key::Tab)
+                    && !i.modifiers.shift
+                    && !i.modifiers.ctrl
+                    && !i.modifiers.alt
+            });
+            if tab_forward {
+                ui.ctx().memory_mut(|memory| {
+                    memory.request_focus(egui::Id::new(("tm-sidebar-tab", app.tab.key())));
+                    memory.move_focus(egui::FocusDirection::None);
+                });
+                ui.input_mut(|i| i.consume_key(Default::default(), egui::Key::Tab));
+            }
+            let space_or_enter = ui.input(|i| {
+                (i.key_pressed(egui::Key::Enter) || i.key_pressed(egui::Key::Space))
+                    && !i.modifiers.any()
+            });
+            if space_or_enter {
+                activate = true;
+                ui.ctx()
+                    .memory_mut(|memory| memory.move_focus(egui::FocusDirection::None));
+                ui.input_mut(|i| {
+                    i.consume_key(Default::default(), egui::Key::Enter);
+                    i.consume_key(Default::default(), egui::Key::Space);
+                });
+            }
+        }
         let drop_to_content = ui.input(|i| {
             (i.key_pressed(egui::Key::ArrowRight) || i.key_pressed(egui::Key::Escape))
                 && !i.modifiers.shift
@@ -623,15 +863,10 @@ fn icon_button(ui: &mut egui::Ui, pal: &Palette, icon: Icon, size: f32, center: 
                 && !i.modifiers.alt
         });
         if drop_to_content {
-            if let Some(active) = ui
-                .ctx()
-                .data(|data| data.get_temp::<&'static str>(egui::Id::new("tm-active-content")))
-            {
-                ui.ctx().memory_mut(|memory| {
-                    memory.request_focus(crate::search::content_focus_id(active));
-                    memory.move_focus(egui::FocusDirection::None);
-                });
-            }
+            ui.ctx().memory_mut(|memory| {
+                memory.request_focus(crate::search::content_focus_id(app.tab.key()));
+                memory.move_focus(egui::FocusDirection::None);
+            });
             ui.input_mut(|i| {
                 i.consume_key(Default::default(), egui::Key::ArrowRight);
                 i.consume_key(Default::default(), egui::Key::Escape);
@@ -649,7 +884,7 @@ fn icon_button(ui: &mut egui::Ui, pal: &Palette, icon: Icon, size: f32, center: 
         icon,
         pal.text,
     );
-    resp.clicked()
+    activate
 }
 
 // ---------------------------------------------------------------- tab header
@@ -3505,5 +3740,235 @@ mod tests {
             !ctx.input(|i| i.key_pressed(egui::Key::Enter)),
             "Enter was consumed"
         );
+    }
+
+    #[test]
+    fn toolbar_focus_falls_through_when_empty() {
+        let ctx = egui::Context::default();
+        let screen = Rect::from_min_size(Pos2::ZERO, egui::vec2(800.0, 600.0));
+
+        // 1. Forward Tab from tm-sidebar-settings with no toolbar buttons:
+        // On Processes tab, lands on tm-header-focus
+        let raw1 = egui::RawInput {
+            screen_rect: Some(screen),
+            events: vec![egui::Event::Key {
+                key: egui::Key::Tab,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: Default::default(),
+            }],
+            focused: true,
+            ..Default::default()
+        };
+        ctx.memory_mut(|m| m.request_focus(egui::Id::new("tm-sidebar-settings")));
+        let mut out1 = ctx.run_ui(raw1, |ui| {
+            finish_toolbar_focus(ui.ctx(), crate::app::Tab::Processes);
+        });
+        out1.textures_delta.clear();
+        assert_eq!(
+            ctx.memory(|m| m.focused()),
+            Some(egui::Id::new(("tm-header-focus", "processes")))
+        );
+
+        // 2. Forward Tab from tm-sidebar-settings on Performance tab (no table header):
+        // Lands on content_focus_id("performance")
+        let raw2 = egui::RawInput {
+            screen_rect: Some(screen),
+            events: vec![egui::Event::Key {
+                key: egui::Key::Tab,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: Default::default(),
+            }],
+            focused: true,
+            ..Default::default()
+        };
+        ctx.memory_mut(|m| m.request_focus(egui::Id::new("tm-sidebar-settings")));
+        let mut out2 = ctx.run_ui(raw2, |ui| {
+            finish_toolbar_focus(ui.ctx(), crate::app::Tab::Performance);
+        });
+        out2.textures_delta.clear();
+        assert_eq!(
+            ctx.memory(|m| m.focused()),
+            Some(crate::search::content_focus_id("performance"))
+        );
+
+        // 3. Reverse Shift+Tab from tm-header-focus with no toolbar buttons:
+        // Lands on tm-sidebar-settings
+        let raw3 = egui::RawInput {
+            screen_rect: Some(screen),
+            events: vec![
+                egui::Event::ModifiersChanged(egui::Modifiers::SHIFT),
+                egui::Event::Key {
+                    key: egui::Key::Tab,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::SHIFT,
+                },
+            ],
+            focused: true,
+            ..Default::default()
+        };
+        ctx.memory_mut(|m| m.request_focus(egui::Id::new(("tm-header-focus", "processes"))));
+        let mut out3 = ctx.run_ui(raw3, |ui| {
+            finish_toolbar_focus(ui.ctx(), crate::app::Tab::Processes);
+        });
+        out3.textures_delta.clear();
+        assert_eq!(
+            ctx.memory(|m| m.focused()),
+            Some(egui::Id::new("tm-sidebar-settings"))
+        );
+
+        // 4. Reverse Shift+Tab from Performance content with no toolbar buttons:
+        // Lands on tm-sidebar-settings
+        let raw4 = egui::RawInput {
+            screen_rect: Some(screen),
+            events: vec![
+                egui::Event::ModifiersChanged(egui::Modifiers::SHIFT),
+                egui::Event::Key {
+                    key: egui::Key::Tab,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::SHIFT,
+                },
+            ],
+            focused: true,
+            ..Default::default()
+        };
+        ctx.memory_mut(|m| m.request_focus(crate::search::content_focus_id("performance")));
+        let mut out4 = ctx.run_ui(raw4, |ui| {
+            finish_toolbar_focus(ui.ctx(), crate::app::Tab::Performance);
+        });
+        out4.textures_delta.clear();
+        assert_eq!(
+            ctx.memory(|m| m.focused()),
+            Some(egui::Id::new("tm-sidebar-settings"))
+        );
+    }
+
+    #[test]
+    fn sidebar_nav_item_sets_focus_lock_filter() {
+        let pal = theme::DARK;
+        let ctx = egui::Context::default();
+        let screen = Rect::from_min_size(Pos2::ZERO, egui::vec2(800.0, 600.0));
+        let id1 = egui::Id::new("test-item-1");
+        let id2 = egui::Id::new("test-item-2");
+
+        // Frame 1: render id1 with focus and set focus lock filter
+        let raw1 = egui::RawInput {
+            screen_rect: Some(screen),
+            focused: true,
+            ..Default::default()
+        };
+        ctx.memory_mut(|m| m.request_focus(id1));
+        let mut out1 = ctx.run_ui(raw1, |ui| {
+            let _ = nav_item(
+                ui,
+                &pal,
+                id1,
+                Icon::Processes,
+                "Processes",
+                true,
+                false,
+                true,
+            );
+            let _ = nav_item(
+                ui,
+                &pal,
+                id2,
+                Icon::Performance,
+                "Performance",
+                false,
+                false,
+                true,
+            );
+        });
+        out1.textures_delta.clear();
+        assert_eq!(ctx.memory(|m| m.focused()), Some(id1));
+
+        // Frame 2: ArrowDown is pressed. Because EventFilter locks vertical arrows,
+        // egui's default spatial navigation does NOT move focus to id2.
+        let raw2 = egui::RawInput {
+            screen_rect: Some(screen),
+            events: vec![egui::Event::Key {
+                key: egui::Key::ArrowDown,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: Default::default(),
+            }],
+            focused: true,
+            ..Default::default()
+        };
+        let mut out2 = ctx.run_ui(raw2, |ui| {
+            let _ = nav_item(
+                ui,
+                &pal,
+                id1,
+                Icon::Processes,
+                "Processes",
+                true,
+                false,
+                true,
+            );
+            let _ = nav_item(
+                ui,
+                &pal,
+                id2,
+                Icon::Performance,
+                "Performance",
+                false,
+                false,
+                true,
+            );
+        });
+        out2.textures_delta.clear();
+        assert_eq!(
+            ctx.memory(|m| m.focused()),
+            Some(id1),
+            "vertical arrows filter prevents egui from moving focus spatially"
+        );
+    }
+
+    #[test]
+    fn sidebar_sequential_vertical_navigation_order() {
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        enum Item {
+            Hamburger,
+            Tab(crate::app::Tab),
+            Settings,
+        }
+
+        let mut items = vec![Item::Hamburger];
+        for tab in crate::app::Tab::ALL {
+            items.push(Item::Tab(tab));
+        }
+        items.push(Item::Settings);
+
+        assert_eq!(items.len(), 9);
+
+        // ArrowDown steps strictly forward by 1 until Settings boundary
+        for i in 0..items.len() {
+            let next = (i + 1).min(items.len() - 1);
+            if i == items.len() - 1 {
+                assert_eq!(next, i, "Settings is bottom boundary for ArrowDown");
+            } else {
+                assert_eq!(next, i + 1);
+            }
+        }
+
+        // ArrowUp steps strictly backward by 1 until Hamburger boundary
+        for i in (0..items.len()).rev() {
+            let prev = i.saturating_sub(1);
+            if i == 0 {
+                assert_eq!(prev, 0, "Hamburger is top boundary for ArrowUp");
+            } else {
+                assert_eq!(prev, i - 1);
+            }
+        }
     }
 }

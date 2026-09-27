@@ -197,6 +197,25 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
     // Arrow/Home/End/Page selection movement over the displayed startup
     // items. The item id is the row-owner key: the one-shot scroll request
     // parks under that identity and resolves to a row index per frame.
+    if search::content_has_focus(&frame_ctx)
+        && app.selected_startup_id.is_none()
+        && !visible.is_empty()
+    {
+        let first_id = items[visible[0]].id.clone();
+        app.selected_startup_id = Some(first_id.clone());
+        tablekit::request_row_scroll(&frame_ctx, "startup", tablekit::stable_key(&first_id));
+    }
+    if let Some(typed) = search::list_type_ahead(&frame_ctx, "startup", dialog_open) {
+        let selected = app.selected_startup_id.clone();
+        let candidates = visible
+            .iter()
+            .map(|&i| (items[i].id.clone(), items[i].name.as_str()))
+            .collect::<Vec<_>>();
+        if let Some(id) = search::type_ahead_match(candidates, selected, &typed) {
+            tablekit::request_row_scroll(&frame_ctx, "startup", tablekit::stable_key(&id));
+            app.selected_startup_id = Some(id);
+        }
+    }
     if search::nav_gate(&frame_ctx, dialog_open) {
         let page_rows =
             tablekit::page_rows(&frame_ctx, "startup", tablekit::ROW_H).unwrap_or_else(|| {

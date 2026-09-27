@@ -512,6 +512,9 @@ fn handle_keyboard_navigation(
             _ => None,
         })
         .collect();
+    if search::content_has_focus(ctx) && app.selection.is_empty() && !process_rows.is_empty() {
+        select_row(app, process_rows[0].1);
+    }
     let selected_pid = app.selection.primary().map(|p| p.pid);
     let selected_pos =
         selected_pid.and_then(|pid| process_rows.iter().position(|(_, row)| row.pid == pid));
@@ -615,33 +618,28 @@ fn handle_keyboard_navigation(
     } else if left {
         if current.children && app.processes_state.expanded.contains(&pid) {
             app.processes_state.toggle_expanded(pid);
-        } else if current.depth == 1 {
-            // The virtual aggregate is the parent of every first-level real
-            // process. It is deliberately not selectable while expanded; a
-            // Left key collapses it instead of moving selection onto a row
-            // that does not represent an OS process.
-            let group = rows[..display_idx]
-                .iter()
-                .rev()
-                .find(|row| matches!(row, DisplayRow::Process(parent) if parent.depth == 0))
-                .and_then(|row| match row {
-                    DisplayRow::Process(parent) if parent.aggregate => Some(parent.pid),
-                    _ => None,
-                });
-            if let Some(group_pid) = group {
-                app.processes_state.toggle_expanded(group_pid);
-            }
-        } else if current.depth > 1
-            && let Some(parent) = rows[..display_idx].iter().rev().find_map(|row| match row {
+        } else if current.depth > 0 {
+            // Move selection up to the nearest parent row.
+            // If the parent is an aggregate group head at depth 0,
+            // collapsing it must transfer selection to that parent so the selection
+            // does not stay trapped on a hidden child.
+            let parent_row = rows[..display_idx].iter().rev().find_map(|row| match row {
                 DisplayRow::Process(parent)
-                    if !parent.synthetic && !parent.aggregate && parent.depth < current.depth =>
+                    if !parent.synthetic && parent.depth < current.depth =>
                 {
                     Some(parent)
                 }
                 _ => None,
-            })
-        {
-            select_row(app, parent);
+            });
+            if let Some(parent) = parent_row {
+                if parent.aggregate {
+                    app.processes_state.toggle_expanded(parent.pid);
+                    app.selection.select_single(identity_of(parent));
+                    app.processes_state.scroll_to_pid = Some(parent.pid);
+                } else {
+                    select_row(app, parent);
+                }
+            }
         }
     }
 }
@@ -4519,5 +4517,59 @@ mod tests {
         assert_eq!(keys.len(), 2, "aggregate head + concrete representative");
         assert!(keys[0].0 && !keys[1].0, "aggregate row comes first");
         assert_ne!(keys[0].1, keys[1].1, "anchor keys must be unique");
+    }
+
+    #[test]
+    fn aggregate_row_selectability_and_parent_resolution_on_collapse() {
+        let mut root = proc(7, None, "app.exe", ProcCategory::App);
+        root.start_epoch_s = Some(1000);
+        let mut child = proc(8, Some(7), "app.exe", ProcCategory::App);
+        child.start_epoch_s = Some(1001);
+        let snap = snap_of(vec![root, child]);
+
+        // When expanded, the aggregate row is rendered at depth 0, and the child at depth 1.
+        let mut expanded = HashSet::from([7u32]);
+        let rows_expanded = build_display_rows(&snap, "", 0, true, &expanded, &[false; 3]);
+
+        // Find child row in expanded view.
+        let child_idx = rows_expanded
+            .iter()
+            .position(|r| matches!(r, DisplayRow::Process(p) if p.pid == 8))
+            .expect("child row present");
+        let DisplayRow::Process(child_row) = &rows_expanded[child_idx] else {
+            panic!("expected process row");
+        };
+        assert_eq!(child_row.depth, 2);
+
+        // Resolving parent from child row finds the parent at lower depth:
+        let parent = rows_expanded[..child_idx]
+            .iter()
+            .rev()
+            .find_map(|row| match row {
+                DisplayRow::Process(parent)
+                    if !parent.synthetic && parent.depth < child_row.depth =>
+                {
+                    Some(parent)
+                }
+                _ => None,
+            });
+        assert!(parent.is_some(), "parent must be found");
+        let parent = parent.unwrap();
+        assert_eq!(parent.pid, 7);
+
+        // When collapsed, the aggregate row is selectable.
+        expanded.remove(&7);
+        let rows_collapsed = build_display_rows(&snap, "", 0, true, &expanded, &[false; 3]);
+        let agg_row = rows_collapsed
+            .iter()
+            .find_map(|r| match r {
+                DisplayRow::Process(p) if p.pid == 7 => Some(p),
+                _ => None,
+            })
+            .expect("aggregate row present in collapsed view");
+        assert!(
+            row_is_selectable(agg_row, &expanded),
+            "collapsed aggregate must be selectable"
+        );
     }
 }

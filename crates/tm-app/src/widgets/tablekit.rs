@@ -498,6 +498,38 @@ pub fn scrolled_rows(
         crate::search::content_focus_id(id),
         Sense::focusable_noninteractive(),
     );
+    if body_focus.has_focus() {
+        ui.ctx().memory_mut(|memory| {
+            memory.set_focus_lock_filter(
+                body_focus.id,
+                egui::EventFilter {
+                    vertical_arrows: true,
+                    horizontal_arrows: true,
+                    escape: true,
+                    ..Default::default()
+                },
+            );
+        });
+        let tab_pressed = ui.input(|input| {
+            input.key_pressed(egui::Key::Tab) && !input.modifiers.ctrl && !input.modifiers.alt
+        });
+        let reverse = ui.input(|input| input.modifiers.shift);
+        if tab_pressed {
+            if reverse {
+                ui.ctx().memory_mut(|memory| {
+                    memory.request_focus(egui::Id::new(("tm-header-focus", id)));
+                    memory.move_focus(egui::FocusDirection::None);
+                });
+                ui.input_mut(|input| input.consume_key(egui::Modifiers::SHIFT, egui::Key::Tab));
+            } else {
+                ui.ctx().memory_mut(|memory| {
+                    memory.request_focus(egui::Id::new("global-search"));
+                    memory.move_focus(egui::FocusDirection::None);
+                });
+                ui.input_mut(|input| input.consume_key(Default::default(), egui::Key::Tab));
+            }
+        }
+    }
     ui.ctx().data_mut(|data| {
         data.insert_temp(egui::Id::new("tm-content-present"), id);
     });
@@ -870,7 +902,17 @@ impl TmTable {
                     input.modifiers,
                 )
             });
-            if down && !modifiers.any() {
+            let tab_pressed = ui.input(|input| {
+                input.key_pressed(egui::Key::Tab) && !input.modifiers.ctrl && !input.modifiers.alt
+            });
+            let reverse = ui.input(|input| input.modifiers.shift);
+            if tab_pressed && !reverse {
+                ui.memory_mut(|memory| {
+                    memory.request_focus(crate::search::content_focus_id(self.id));
+                    memory.move_focus(egui::FocusDirection::None);
+                });
+                ui.input_mut(|input| input.consume_key(Default::default(), egui::Key::Tab));
+            } else if down && !modifiers.any() {
                 ui.memory_mut(|memory| {
                     memory.request_focus(crate::search::content_focus_id(self.id));
                     memory.move_focus(egui::FocusDirection::None);
@@ -1232,11 +1274,16 @@ impl TmTable {
             });
         }
         let painter = ui.painter_at(rect.expand(2.0));
+        let table_has_focus = ui.memory(|m| m.has_focus(crate::search::content_focus_id(self.id)));
         // Remember the fill so [`TmTable::heat_cells`] can restore it ON TOP
         // of its opaque blue band; without that the highlight stopped dead at
         // the first value column and only the name area lit up on hover.
         let overlay = if selected {
-            Some(pal.accent.gamma_multiply(0.22))
+            if table_has_focus {
+                Some(pal.accent.gamma_multiply(0.24))
+            } else {
+                Some(pal.accent.gamma_multiply(0.10))
+            }
         } else if resp.hovered() {
             Some(row_hover_fill(pal))
         } else {
@@ -1245,6 +1292,14 @@ impl TmTable {
         self.row_overlay.set(overlay);
         if let Some(fill) = overlay {
             painter.rect_filled(rect, 0.0, fill);
+        }
+        if selected && table_has_focus {
+            let pill_h = (rect.height() - 8.0).max(4.0);
+            let pill = Rect::from_min_size(
+                Pos2::new(rect.left(), rect.center().y - pill_h * 0.5),
+                egui::vec2(3.0, pill_h),
+            );
+            painter.rect_filled(pill, 1.5, pal.accent);
         }
         // Carry the header's column boundaries through the body. Native
         // Task Manager keeps these guides very quiet, but without them wide
@@ -2898,17 +2953,86 @@ mod tests {
         // The outer section must NOT paint a full-table bounding frame with pal.accent:
         // Selection is indicated solely on the row itself.
         for clipped in &out.shapes {
-            if let egui::epaint::Shape::Rect(rect_shape) = &clipped.shape {
-                if rect_shape.stroke.color == crate::theme::DARK.accent
-                    && rect_shape.stroke.width >= 2.0
-                {
-                    assert!(
-                        rect_shape.rect.height() < 100.0,
-                        "table body must not paint an outer focus frame around the entire section: {:?}",
-                        rect_shape.rect
-                    );
-                }
+            if let egui::epaint::Shape::Rect(rect_shape) = &clipped.shape
+                && rect_shape.stroke.color == crate::theme::DARK.accent
+                && rect_shape.stroke.width >= 2.0
+            {
+                assert!(
+                    rect_shape.rect.height() < 100.0,
+                    "table body must not paint an outer focus frame around the entire section: {:?}",
+                    rect_shape.rect
+                );
             }
         }
+    }
+
+    #[test]
+    fn active_and_inactive_row_selection_visuals() {
+        let ctx = egui::Context::default();
+        let screen = Rect::from_min_size(Pos2::ZERO, egui::vec2(900.0, 500.0));
+        let body_id = crate::search::content_focus_id("t");
+        let pal = crate::theme::DARK;
+
+        // Frame 1: table body HAS focus.
+        ctx.memory_mut(|m| m.request_focus(body_id));
+        let t1 = table();
+        let mut out_focused = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(screen),
+                ..Default::default()
+            },
+            |root| {
+                egui::CentralPanel::default().show(root, |ui| {
+                    t1.row(ui, &pal, true, 0);
+                });
+            },
+        );
+        out_focused.textures_delta.clear();
+
+        // When focused, the left accent pill must be painted.
+        let mut found_accent_pill = false;
+        for clipped in &out_focused.shapes {
+            if let egui::epaint::Shape::Rect(rect_shape) = &clipped.shape
+                && rect_shape.fill == pal.accent
+                && rect_shape.rect.width() <= 4.0
+            {
+                found_accent_pill = true;
+            }
+        }
+        assert!(
+            found_accent_pill,
+            "focused row must paint active accent pill"
+        );
+
+        // Frame 2: table body DOES NOT have focus.
+        ctx.memory_mut(|m| m.surrender_focus(body_id));
+        let t2 = table();
+        let mut out_unfocused = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(screen),
+                ..Default::default()
+            },
+            |root| {
+                egui::CentralPanel::default().show(root, |ui| {
+                    t2.row(ui, &pal, true, 0);
+                });
+            },
+        );
+        out_unfocused.textures_delta.clear();
+
+        // When unfocused, the accent pill must NOT be painted.
+        let mut found_unfocused_pill = false;
+        for clipped in &out_unfocused.shapes {
+            if let egui::epaint::Shape::Rect(rect_shape) = &clipped.shape
+                && rect_shape.fill == pal.accent
+                && rect_shape.rect.width() <= 4.0
+            {
+                found_unfocused_pill = true;
+            }
+        }
+        assert!(
+            !found_unfocused_pill,
+            "unfocused row must not paint active accent pill"
+        );
     }
 }

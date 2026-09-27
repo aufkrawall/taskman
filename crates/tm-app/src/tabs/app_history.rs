@@ -53,13 +53,48 @@ fn compare_rows(a: &Row, b: &Row, sort: tablekit::SortState) -> Ordering {
 /// selection state, and the entry is touched every frame the page is shown.
 const SELECTION_KEY: &str = "tm-apphistory-selection";
 
-fn selected_name(ctx: &egui::Context) -> Option<String> {
+pub(crate) fn selected_name(ctx: &egui::Context) -> Option<String> {
     ctx.data(|d| d.get_temp::<Option<String>>(egui::Id::new(SELECTION_KEY)))
         .unwrap_or(None)
 }
 
-fn set_selected_name(ctx: &egui::Context, name: Option<String>) {
+pub(crate) fn set_selected_name(ctx: &egui::Context, name: Option<String>) {
     ctx.data_mut(|d| d.insert_temp(egui::Id::new(SELECTION_KEY), name));
+}
+
+fn first_search_match_in_rows(
+    rows: &[Row],
+    q: &crate::search::Query,
+    sort: tablekit::SortState,
+) -> Option<String> {
+    let mut matches: Vec<&Row> = rows
+        .iter()
+        .filter(|row| q.matches_any([row.name.as_str()]))
+        .collect();
+    matches.sort_by(|a, b| compare_rows(a, b, sort));
+    matches.first().map(|r| r.name.clone())
+}
+
+pub(crate) fn first_search_match_name(
+    app: &TaskManApp,
+    q: &crate::search::Query,
+) -> Option<String> {
+    let db_names = app.app_history_db.display_name_map();
+    let rows: Vec<Row> = app
+        .app_history_db
+        .entries()
+        .iter()
+        .map(|(k, v)| {
+            let shown = db_names.get(k).cloned().unwrap_or_else(|| k.clone());
+            Row {
+                name: shown,
+                cpu_seconds: v.cpu_seconds,
+                network_bytes: v.network_bytes,
+                network_available: v.network_available,
+            }
+        })
+        .collect();
+    first_search_match_in_rows(&rows, q, app.app_history_sort)
 }
 
 /// Arrow/Home/End/Page selection movement over the displayed rows. The
@@ -204,6 +239,30 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
         .fold(0.0f64, f64::max);
 
     let avail = crate::widgets::tablekit::table_avail(ui);
+    if search::content_has_focus(ui.ctx()) && selected_name(ui.ctx()).is_none() && !rows.is_empty()
+    {
+        set_selected_name(ui.ctx(), Some(rows[0].name.clone()));
+        tablekit::request_row_scroll(
+            ui.ctx(),
+            "apphistory",
+            tablekit::stable_key(rows[0].name.as_str()),
+        );
+    }
+    if let Some(typed) = search::list_type_ahead(ui.ctx(), "apphistory", app.modal_open()) {
+        let selected = selected_name(ui.ctx());
+        let candidates = rows
+            .iter()
+            .map(|r| (r.name.clone(), r.name.as_str()))
+            .collect::<Vec<_>>();
+        if let Some(name) = search::type_ahead_match(candidates, selected, &typed) {
+            tablekit::request_row_scroll(
+                ui.ctx(),
+                "apphistory",
+                tablekit::stable_key(name.as_str()),
+            );
+            set_selected_name(ui.ctx(), Some(name));
+        }
+    }
     // Arrow/Home/End/Page movement of the visible selection, stored per
     // frame in the page's temp-data key.
     if let Some(name) = keyboard_selection(
@@ -491,6 +550,39 @@ mod tests {
         assert_eq!(
             keyboard_selection(&ctx, &rows, Some("c"), false).as_deref(),
             Some("b")
+        );
+    }
+
+    #[test]
+    fn search_commit_follows_the_live_sort() {
+        let rows = vec![
+            Row {
+                name: "Calculator.exe".into(),
+                cpu_seconds: 10.0,
+                network_bytes: 100,
+                network_available: true,
+            },
+            Row {
+                name: "Browser.exe".into(),
+                cpu_seconds: 20.0,
+                network_bytes: 200,
+                network_available: true,
+            },
+        ];
+
+        let q = crate::search::Query::new(".exe");
+        // Ascending by name: Browser comes before Calculator
+        let sort_asc = tablekit::SortState::new(0, true);
+        assert_eq!(
+            first_search_match_in_rows(&rows, &q, sort_asc).as_deref(),
+            Some("Browser.exe")
+        );
+
+        // Descending by name: Calculator comes first
+        let sort_desc = tablekit::SortState::new(0, false);
+        assert_eq!(
+            first_search_match_in_rows(&rows, &q, sort_desc).as_deref(),
+            Some("Calculator.exe")
         );
     }
 }

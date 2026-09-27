@@ -1,4 +1,30 @@
 
+- 2026-09-27: Comprehensive keyboard navigation audit and refinement pass.
+  - Sidebar arrow navigation jumping: Fixed unexpected overshooting and double jumps
+    when using ArrowUp/ArrowDown in the sidebar. Installed strict `EventFilter` directional
+    locks (`vertical_arrows: true, horizontal_arrows: true`) and explicit focus direction
+    clearing (`move_focus(FocusDirection::None)`) across Hamburger, all tabs, and Settings
+    so egui's default cardinal navigation never runs or jumps past unselected tabs. Arrow
+    keys navigate strictly one item at a time with clean top (Hamburger) and bottom
+    (Settings) boundaries, while Tab/Shift+Tab preserves the currently active tab.
+  - Seamless Tab cycling across chrome regions: Tab/Shift+Tab cycle deterministically
+    across Search, Sidebar (Hamburger, active tab, Settings), Command Toolbar,
+    Table Header, and Table Content without dead ends when toolbar items are empty
+    or disabled.
+  - Active vs. inactive row selection: Active selection renders vibrant accent
+    tint with native Windows 11 left vertical accent pill indicator; inactive
+    selection renders dimmed accent tint without pill.
+  - Fixed tree collapse selection warp: Left Arrow on an aggregate child row
+    collapses the parent and directly transfers selection to the parent, preventing
+    an orphaned selection on a hidden row from warping selection to row 0 on the
+    next keystroke.
+  - List navigation clamping: Clamped `current` to `last` on list shrinkage and
+    fixed `PageUp` from `None` to start at `last - page`.
+  - Type-ahead and search commit on all tabs: Wired type-ahead on Services,
+    Startup, Users, and App History. Committing search on Users or App History
+    selects the first matching item in live display order and requests scroll.
+    Tab switching automatically requests vertical scroll to the active selection.
+
 - 2026-09-27: Removed the whole-section accent focus frame from table bodies
   (`tablekit::scrolled_rows`) and the Performance card column. Keyboard focus
   and selection are now indicated solely by the clicked/focused row or card,

@@ -210,6 +210,24 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
     // The service NAME is the row-owner key: the one-shot scroll request is
     // parked under that identity and resolved to a row index per frame, so a
     // re-sorted list can never hand the scroll to the wrong row.
+    if search::content_has_focus(&frame_ctx)
+        && app.services_selected_name.is_none()
+        && !rows.is_empty()
+    {
+        app.services_selected_name = Some(rows[0].name.clone());
+        tablekit::request_row_scroll(&frame_ctx, "services", tablekit::stable_key(&rows[0].name));
+    }
+    if let Some(typed) = search::list_type_ahead(&frame_ctx, "services", dialog_open) {
+        let selected = app.services_selected_name.clone();
+        let candidates = rows
+            .iter()
+            .map(|s| (s.name.clone(), s.name.as_str()))
+            .collect::<Vec<_>>();
+        if let Some(name) = search::type_ahead_match(candidates, selected, &typed) {
+            tablekit::request_row_scroll(&frame_ctx, "services", tablekit::stable_key(&name));
+            app.services_selected_name = Some(name);
+        }
+    }
     if search::nav_gate(&frame_ctx, dialog_open) {
         let page_rows = tablekit::page_rows(&frame_ctx, "services", tablekit::ROW_H_DENSE)
             .unwrap_or_else(|| {

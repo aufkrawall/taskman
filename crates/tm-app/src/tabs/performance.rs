@@ -404,6 +404,29 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
             search::content_focus_id("performance"),
             egui::Sense::focusable_noninteractive(),
         );
+        if cards_focus.has_focus() {
+            ui.ctx().memory_mut(|memory| {
+                memory.set_focus_lock_filter(
+                    cards_focus.id,
+                    egui::EventFilter {
+                        vertical_arrows: true,
+                        horizontal_arrows: true,
+                        escape: true,
+                        ..Default::default()
+                    },
+                );
+            });
+            let tab_pressed = ui.input(|input| {
+                input.key_pressed(egui::Key::Tab) && !input.modifiers.ctrl && !input.modifiers.alt
+            });
+            if tab_pressed && !ui.input(|input| input.modifiers.shift) {
+                ui.ctx().memory_mut(|memory| {
+                    memory.request_focus(egui::Id::new("tm-sidebar-toggle"));
+                    memory.move_focus(egui::FocusDirection::None);
+                });
+                ui.input_mut(|input| input.consume_key(Default::default(), egui::Key::Tab));
+            }
+        }
         ui.ctx()
             .data_mut(|data| data.insert_temp(egui::Id::new("tm-content-present"), "performance"));
         cards_focus.widget_info(|| {

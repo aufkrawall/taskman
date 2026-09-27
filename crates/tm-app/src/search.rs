@@ -259,13 +259,26 @@ pub fn moved_index(
     }
     let last = len - 1;
     let page = page_rows.max(1);
+    let cur = current.map(|i| i.min(last));
     Some(match nav {
-        ListNav::Previous => current.unwrap_or(0).saturating_sub(1),
-        ListNav::Next => current.map_or(0, |i| (i + 1).min(last)),
+        ListNav::Previous => match cur {
+            Some(i) => i.saturating_sub(1),
+            None => last,
+        },
+        ListNav::Next => match cur {
+            Some(i) => (i + 1).min(last),
+            None => 0,
+        },
         ListNav::First => 0,
         ListNav::Last => last,
-        ListNav::PageUp => current.unwrap_or(0).saturating_sub(page),
-        ListNav::PageDown => current.map_or(0, |i| (i + page).min(last)),
+        ListNav::PageUp => match cur {
+            Some(i) => i.saturating_sub(page),
+            None => last.saturating_sub(page),
+        },
+        ListNav::PageDown => match cur {
+            Some(i) => (i + page).min(last),
+            None => page.min(last),
+        },
     })
 }
 
@@ -451,11 +464,18 @@ mod tests {
     fn list_navigation_clamps_and_pages() {
         assert_eq!(moved_index(0, None, ListNav::Next, 10), None);
         assert_eq!(moved_index(20, None, ListNav::Next, 10), Some(0));
+        assert_eq!(moved_index(20, None, ListNav::Previous, 10), Some(19));
+        assert_eq!(moved_index(20, None, ListNav::PageUp, 10), Some(9));
+        assert_eq!(moved_index(20, None, ListNav::PageDown, 10), Some(10));
         assert_eq!(moved_index(20, Some(0), ListNav::Previous, 10), Some(0));
         assert_eq!(moved_index(20, Some(7), ListNav::PageDown, 10), Some(17));
         assert_eq!(moved_index(20, Some(17), ListNav::PageDown, 10), Some(19));
         assert_eq!(moved_index(20, Some(17), ListNav::First, 10), Some(0));
         assert_eq!(moved_index(20, Some(1), ListNav::Last, 10), Some(19));
+        // Out-of-bounds current index (list shrank under selection):
+        assert_eq!(moved_index(20, Some(50), ListNav::Previous, 10), Some(18));
+        assert_eq!(moved_index(20, Some(50), ListNav::PageUp, 10), Some(9));
+        assert_eq!(moved_index(20, Some(50), ListNav::Next, 10), Some(19));
     }
 
     fn typed_ctx(ctx: &egui::Context, chars: &[char], time: f64) {

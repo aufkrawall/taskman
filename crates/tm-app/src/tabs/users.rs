@@ -37,6 +37,76 @@ fn columns(value_order: &[usize]) -> Vec<TmColumn> {
     )
 }
 
+pub(crate) fn first_search_match_session_id(app: &TaskManApp, q: &search::Query) -> Option<u32> {
+    let sessions_arc = app.shared.sessions_cache.clone();
+    let guard = tm_core::sync::lock(&sessions_arc);
+    let (sessions_all, _) = guard.as_ref()?;
+    let snap = app.latest_snapshot()?;
+
+    let sessions: Vec<&UserSession> = sessions_all
+        .iter()
+        .filter(|s| {
+            s.id != 0 && !s.user.is_empty() && !s.user.to_lowercase().starts_with("session")
+        })
+        .collect();
+
+    let mut aggs: HashMap<u32, Agg> = HashMap::with_capacity(sessions.len());
+    for s in &sessions {
+        aggs.insert(
+            s.id,
+            Agg {
+                roll: Roll::new(),
+                apps: HashMap::new(),
+            },
+        );
+    }
+    for p in &snap.processes {
+        let sid = p.session_id.or_else(|| {
+            sessions
+                .iter()
+                .find(|s| {
+                    p.user
+                        .as_deref()
+                        .is_some_and(|u| u.eq_ignore_ascii_case(&s.user))
+                })
+                .map(|s| s.id)
+        });
+        let Some(sid) = sid else { continue };
+        let Some(a) = aggs.get_mut(&sid) else {
+            continue;
+        };
+        accumulate(a, p);
+    }
+
+    let mut visible_sessions = sessions
+        .iter()
+        .enumerate()
+        .filter_map(|(index, session)| {
+            let display = display_name(session, &snap.system.hostname);
+            let agg = &aggs[&session.id];
+            (q.is_empty()
+                || q.matches_any(
+                    std::iter::once(display.as_str()).chain(agg.apps.keys().map(String::as_str)),
+                ))
+            .then_some(index)
+        })
+        .collect::<Vec<_>>();
+    let sort = app.users_sort;
+    visible_sessions.sort_by(|left, right| {
+        let a = sessions[*left];
+        let b = sessions[*right];
+        compare_users(
+            a,
+            &aggs[&a.id],
+            b,
+            &aggs[&b.id],
+            &snap.system.hostname,
+            sort,
+        )
+    });
+    visible_sessions.first().map(|&i| sessions[i].id)
+}
+
 /// CPU, memory and the disk byte rates come straight off every process, so a
 /// session with no processes at all honestly totals zero. The last three come
 /// from traces that may not be running; until one of them delivers, their sum
@@ -414,6 +484,28 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
             .filter(|(_, row)| matches!(row, URow::User(_)))
             .map(|(i, _)| i)
             .collect();
+        if search::content_has_focus(ui.ctx())
+            && app.selected_user.is_none()
+            && !user_positions.is_empty()
+            && let URow::User(i) = rows[user_positions[0]]
+        {
+            app.selected_user = Some(sessions[i].id);
+            tablekit::request_row_scroll(ui.ctx(), "users", tablekit::stable_key(sessions[i].id));
+        }
+        if let Some(typed) = search::list_type_ahead(ui.ctx(), "users", dialog_open) {
+            let selected = app.selected_user;
+            let candidates = user_positions
+                .iter()
+                .filter_map(|&pos| match rows[pos] {
+                    URow::User(i) => Some((sessions[i].id, sessions[i].user.as_str())),
+                    URow::App { .. } => None,
+                })
+                .collect::<Vec<_>>();
+            if let Some(id) = search::type_ahead_match(candidates, selected, &typed) {
+                tablekit::request_row_scroll(ui.ctx(), "users", tablekit::stable_key(id));
+                app.selected_user = Some(id);
+            }
+        }
         let current = app.selected_user.and_then(|id| {
             user_positions
                 .iter()
@@ -1051,6 +1143,47 @@ mod tests {
         assert_eq!(
             value_columns::logical_col(&order, FIXED_COLS),
             FIXED_COLS + GPU
+        );
+    }
+
+    #[test]
+    fn search_match_and_sort_orders_sessions() {
+        let s1 = UserSession {
+            id: 1,
+            user: "Alice".into(),
+            ..Default::default()
+        };
+        let s2 = UserSession {
+            id: 2,
+            user: "Bob".into(),
+            ..Default::default()
+        };
+        let agg1 = empty_agg();
+        let agg2 = empty_agg();
+
+        // Name ascending: Alice before Bob
+        assert_eq!(
+            compare_users(
+                &s1,
+                &agg1,
+                &s2,
+                &agg2,
+                "host",
+                tablekit::SortState::new(0, true)
+            ),
+            Ordering::Less
+        );
+        // Name descending: Bob before Alice
+        assert_eq!(
+            compare_users(
+                &s1,
+                &agg1,
+                &s2,
+                &agg2,
+                "host",
+                tablekit::SortState::new(0, false)
+            ),
+            Ordering::Greater
         );
     }
 }

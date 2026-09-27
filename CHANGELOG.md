@@ -55,6 +55,20 @@
   forward into enabled toolbar buttons and table column headers, while
   Shift+Tab returns directly to the search bar. In the Performance tab,
   Shift+F10 and the Menu key open graph context menus from the keyboard.
+- **Keyboard navigation flow and focus continuity:** Audited and perfected
+  keyboard-only navigation across the shell and tables. Tab and Shift+Tab form
+  an unbroken cycle across the search bar, sidebar, command toolbar, table
+  headers, and table content with no focus traps or dead ends when toolbar
+  buttons are empty or disabled. Active vs. inactive row selections match
+  Windows 11 Task Manager visuals (vibrant accent fill with vertical accent
+  indicator pill when table content holds focus, dimmed fill without pill when
+  unfocused).
+- **List navigation and type-ahead:** Clamped navigation indices when lists
+  shrink to prevent out-of-bounds selection jumps; PageUp without an active
+  selection navigates from the bottom of the list. Switching tabs or committing
+  search on Users and App History tabs automatically selects the first matching
+  row in live display order and scrolls it into view. Added type-ahead search
+  support across Services, Startup, Users, and App History.
 - **Visible keyboard focus:** sidebar entries, header and command buttons,
   the search box with its clear button, table header cells and the toast
   close buttons paint a focus ring while focused. Disabled command buttons
@@ -84,11 +98,31 @@
 
 ### Fixed
 
+- **Sidebar arrow navigation jumping:** Resolved unexpected jumping and overshooting
+  when pressing ArrowUp or ArrowDown in the sidebar. Installed strict directional focus
+  locks (`EventFilter`) and explicit focus direction clearing on all sidebar items
+  (hamburger toggle, tabs, and settings) so egui's default spatial navigation never
+  interferes or causes double jumps. ArrowDown and ArrowUp now navigate sequentially
+  one item at a time across the entire column with clean boundary stops at Hamburger
+  and Settings, while Tab and Shift+Tab smoothly cycle into and out of the sidebar
+  preserving the currently active tab.
 - **Selection focus indicators:** Removed the whole-section accent border that
   framed the entire table viewport (Processes, Details, Services, etc.) or card
   column (Performance) when focused. Focus and selection are now indicated
   solely by the clicked/focused row or resource card itself, matching native
   Task Manager behavior.
+- **Process tree collapse selection warp:** Fixed a defect where pressing
+  Left Arrow on an aggregate child row collapsed the parent without moving the
+  stored selection identity, leaving an orphaned selection on a hidden child.
+  On the subsequent keystroke, the table failed to resolve the selected row and
+  warped selection to row 0. Left Arrow on a child row now transfers selection
+  directly to the parent.
+- **Sidebar and toolbar Tab dead ends:** Fixed focus traps where tabbing from
+  Settings or shifting tab from table headers stranded focus when no toolbar
+  command buttons were active or enabled. Focus now smoothly falls through to
+  headers or content.
+- **Search clear button Tab stop:** Changed the clear search button sense to
+  prevent it from capturing a redundant Tab stop inside the search box.
 
 - **Tab navigation to sidebar tabs and tab switching on focus:** Pressing Tab from
   an active list or table now reliably navigates into the sidebar navigation pane,
