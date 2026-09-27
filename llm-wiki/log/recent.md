@@ -1,4 +1,6 @@
 
+- 2026-09-27: Released v0.1.15 (tag on `b4f2b3d`, the bump commit). Followed `build.md` §Publishing path: `--check` + `--audit` green, stable clippy green, bump pushed on main, `build.py --all-targets` for archives (Windows x86_64, Windows ARM64, Linux x86_64 musl), `.sha256` generated beside each, `gh release create --latest` with target `b4f2b3d649615352becaee20c8a449d4af3087d6`. Release covers: full keyboard controllability across all tabs and lists, native Task Manager table multi-selection and paging, context menu keyboard focus and trapped arrow navigation, cyclic Tab and F6 landmark navigation, keyboard-scrubbable Performance charts, modal dialog focus containment, screen reader / AccessKit support, and elimination of mid-frame visual selection flicker.
+
 - 2026-09-27: Context menu keyboard focus acquisition and arrow navigation.
   - Premature focus cleanup: `drop_stale_kb_handoff` previously checked `!ctx.any_popup_open()`.
     `Context::any_popup_open` only checks the active pass's layers and is empty before any popup
