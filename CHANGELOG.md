@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.1.15 - 2026-09-27
+
 ### New
 
 - **Keyboard page switching:** Ctrl+Tab and Ctrl+Shift+Tab cycle through the
