@@ -344,8 +344,11 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
                     && ui.ctx().input(|i| i.key_pressed(egui::Key::Enter))
                     && selected_row;
                 let keyboard_open = (enter_open
-                    || (!ui.ctx().any_popup_open() && menu::keyboard_menu_requested(ui.ctx())))
-                    && crate::search::content_has_focus(ui.ctx())
+                    || (!egui::Popup::is_any_open(ui.ctx())
+                        && !ui.ctx().any_popup_open()
+                        && menu::keyboard_menu_requested(ui.ctx())))
+                    && (crate::search::content_has_focus(ui.ctx())
+                        || ui.ctx().memory(|m| m.focused().is_none()))
                     && !app.modal_open()
                     && selected_row;
                 menu::context_menu_kb(&resp, keyboard_open, |ui| {

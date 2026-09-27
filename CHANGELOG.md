@@ -98,6 +98,11 @@
 
 ### Fixed
 
+- **Context menu keyboard focus and arrow navigation:** Fixed context menus opened via the
+  keyboard Menu key or Shift+F10 failing to receive keyboard focus or respond to arrow keys.
+  The first enabled item now receives focus immediately upon opening, ArrowUp/ArrowDown wrap
+  circularly skipping disabled items, Home/End jump to the start/end, and directional keys are
+  locked within the popup to prevent focus from escaping into background table headers or rows.
 - **Keyboard navigation visual selection flicker:** Eliminated 1-frame visual
   anomalies where unintended UI elements briefly flashed as focused or selected
   before focus/selection moved to the intended element. Patched `set_focus_lock_filter`

@@ -1284,7 +1284,7 @@ impl TmTable {
                     node.set_active_descendant(resp.id.accesskit_id());
                 });
         }
-        if resp.clicked() {
+        if resp.clicked() || resp.secondary_clicked() {
             ui.ctx().memory_mut(|memory| {
                 memory.request_focus(crate::search::content_focus_id(self.id))
             });
@@ -3098,6 +3098,137 @@ mod tests {
             ctx.memory(|m| m.focused()),
             Some(toolbar_id),
             "Shift+Tab on table header must immediately focus the last toolbar button"
+        );
+    }
+
+    #[test]
+    fn context_menu_kb_in_scrolled_rows() {
+        let ctx = egui::Context::default();
+        let screen = Rect::from_min_size(Pos2::ZERO, egui::vec2(900.0, 500.0));
+        let body_id = crate::search::content_focus_id("t");
+        ctx.memory_mut(|m| m.request_focus(body_id));
+
+        let run_frame = |ctx: &egui::Context, events: Vec<egui::Event>| {
+            let mut table = table();
+            let raw = egui::RawInput {
+                screen_rect: Some(screen),
+                events,
+                focused: true,
+                ..Default::default()
+            };
+            let mut out = ctx.run_ui(raw, |root| {
+                egui::CentralPanel::default().show(root, |ui| {
+                    scrolled_rows(
+                        "t",
+                        ui,
+                        &crate::theme::DARK,
+                        &mut table,
+                        800.0,
+                        None,
+                        None,
+                        2,
+                        None,
+                        None,
+                        None,
+                        |ui, table, _, _, range| {
+                            for index in range {
+                                let (_rect, response) =
+                                    table.row(ui, &crate::theme::DARK, index == 1, index);
+                                let kb_open = index == 1
+                                    && crate::widgets::menu::keyboard_menu_requested(ui.ctx());
+                                crate::widgets::menu::context_menu_kb(&response, kb_open, |ui| {
+                                    crate::widgets::menu::item(ui, "End task");
+                                    crate::widgets::menu::separator(ui);
+                                    crate::widgets::menu::check(ui, "Efficiency mode", false);
+                                    crate::widgets::menu::separator(ui);
+                                    crate::widgets::menu::item(ui, "Go to details");
+                                    crate::widgets::menu::submenu(ui, "Create dump file", |ui| {
+                                        crate::widgets::menu::item(ui, "Full dump");
+                                    });
+                                    crate::widgets::menu::item(ui, "Properties");
+                                });
+                            }
+                        },
+                    );
+                });
+            });
+            out.textures_delta.clear();
+        };
+
+        // Frame 1: Focus body, press ContextMenu on row 1 (row 0 rendered before it)
+        run_frame(
+            &ctx,
+            vec![egui::Event::Key {
+                key: egui::Key::ContextMenu,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: Default::default(),
+            }],
+        );
+
+        // Frame 2: Menu should be open, item 1 should have requested focus
+        run_frame(&ctx, vec![]);
+        let item1 = ctx.memory(|m| m.focused()).expect("item 1 must have focus");
+        assert_ne!(item1, body_id, "focus must have transferred to menu");
+
+        // Frame 3: Press ArrowUp on first entry -> wraps to last entry
+        run_frame(
+            &ctx,
+            vec![egui::Event::Key {
+                key: egui::Key::ArrowUp,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: Default::default(),
+            }],
+        );
+        let item_last = ctx
+            .memory(|m| m.focused())
+            .expect("last item must have focus");
+        assert_ne!(item_last, item1, "focus moved away from item 1");
+        assert_ne!(item_last, body_id, "focus must not escape to table body");
+        assert_ne!(
+            item_last,
+            egui::Id::new(("tm-header-focus", "t")),
+            "focus must not escape to table header"
+        );
+
+        // Frame 4: Press ArrowDown on last entry -> wraps back to first entry
+        run_frame(
+            &ctx,
+            vec![egui::Event::Key {
+                key: egui::Key::ArrowDown,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: Default::default(),
+            }],
+        );
+        let item_first = ctx
+            .memory(|m| m.focused())
+            .expect("first item must have focus");
+        assert_eq!(
+            item_first, item1,
+            "ArrowDown on bottom wraps back to item 1"
+        );
+
+        // Frame 5: Press Escape -> closes popup and restores focus to table body
+        run_frame(
+            &ctx,
+            vec![egui::Event::Key {
+                key: egui::Key::Escape,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: Default::default(),
+            }],
+        );
+        crate::widgets::menu::restore_closed_menu_focus(&ctx, false);
+        assert_eq!(
+            ctx.memory(|m| m.focused()),
+            Some(body_id),
+            "Escape restores focus to table body"
         );
     }
 }

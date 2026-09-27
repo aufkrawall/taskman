@@ -1099,8 +1099,10 @@ fn row_ui(
         // is up (a menu opening over a dialog would strand there once the
         // dialog contract consumes Escape).
         let keyboard_open = !app.modal_open()
+            && !egui::Popup::is_any_open(ui.ctx())
             && !ui.ctx().any_popup_open()
-            && crate::search::content_has_focus(ui.ctx())
+            && (crate::search::content_has_focus(ui.ctx())
+                || ui.ctx().memory(|m| m.focused().is_none()))
             && menu::keyboard_menu_requested(ui.ctx())
             && selectable
             && app.selection.primary().is_some_and(|primary| {

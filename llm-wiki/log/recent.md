@@ -1,4 +1,20 @@
 
+- 2026-09-27: Context menu keyboard focus acquisition and arrow navigation.
+  - Premature focus cleanup: `drop_stale_kb_handoff` previously checked `!ctx.any_popup_open()`.
+    `Context::any_popup_open` only checks the active pass's layers and is empty before any popup
+    calls `show()`, so rows rendered prior to the selected row's popup saw `!ctx.any_popup_open() == true`
+    and cleared `KB_INITIAL_FOCUS` on frame 2. Switched to `!egui::Popup::is_any_open(ctx)` which tracks
+    popups open in `Memory` across frames.
+  - Spatial navigation escaping popup: egui's default cardinal spatial navigation searched across all
+    layers, causing ArrowUp on the first entry to jump to the table header, and ArrowDown on the last
+    entry to escape into background rows. Added `handle_menu_layer_navigation` in `menu.rs` and installed
+    `EventFilter { tab: true, horizontal_arrows: true, vertical_arrows: true, .. }` on all enabled menu
+    items. Handled wrapping ArrowUp/ArrowDown, skipping disabled entries, and Home/End jumps natively
+    at the start of popup content closures, eliminating any frame lag.
+  - Table row focus & secondary click: In `tablekit::row()`, secondary clicks now also request focus
+    on `content_focus_id`. Updated the keyboard menu open gate across all tabs (`processes`, `details`,
+    `services`, `startup`) to check `!egui::Popup::is_any_open(ui.ctx()) && (content_has_focus || focused().is_none())`.
+
 - 2026-09-27: Fixed 1-frame visual selection/focus anomalies during keyboard navigation.
   - Fork fix in `vendor/egui/crates/egui/src/memory/mod.rs`: `set_focus_lock_filter` previously
     checked `self.had_focus_last_frame(id) && self.has_focus(id)`. When focus shifted mid-frame,

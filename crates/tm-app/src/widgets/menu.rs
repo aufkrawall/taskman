@@ -78,7 +78,10 @@ pub fn dropdown_menu(resp: &Response, add: impl FnOnce(&mut Ui)) {
     } else {
         popup
     };
-    popup.style(style).show(add);
+    popup.style(style).show(|ui| {
+        handle_menu_layer_navigation(ui);
+        add(ui);
+    });
     // Same stale-handoff hygiene as the row context menus.
     drop_stale_kb_handoff(&resp.ctx);
 }
@@ -125,6 +128,81 @@ fn kb_initial_focus_key() -> egui::Id {
     egui::Id::new(KB_INITIAL_FOCUS)
 }
 
+#[derive(Clone, Default)]
+struct MenuEntries {
+    pass_nr: u64,
+    items: Vec<egui::Id>,
+}
+
+fn handle_menu_layer_navigation(ui: &mut Ui) {
+    let layer_id = ui.layer_id().id;
+    let entries_key = egui::Id::new("tm-menu-layer-entries").with(layer_id);
+    let items = ui.ctx().data(|d| {
+        d.get_temp::<MenuEntries>(entries_key)
+            .map(|s| s.items)
+            .unwrap_or_default()
+    });
+    if items.is_empty() {
+        return;
+    }
+
+    let (up, down, home, end) = ui.input(|i| {
+        (
+            i.key_pressed(egui::Key::ArrowUp) && !i.modifiers.any(),
+            i.key_pressed(egui::Key::ArrowDown) && !i.modifiers.any(),
+            i.key_pressed(egui::Key::Home) && !i.modifiers.any(),
+            i.key_pressed(egui::Key::End) && !i.modifiers.any(),
+        )
+    });
+
+    if !up && !down && !home && !end {
+        return;
+    }
+
+    let focused_id = ui.ctx().memory(|m| m.focused());
+    let current_idx = focused_id.and_then(|id| items.iter().position(|&item_id| item_id == id));
+
+    if focused_id.is_some() && current_idx.is_none() {
+        return;
+    }
+
+    let target_id = if let Some(idx) = current_idx {
+        if down {
+            let next = (idx + 1) % items.len();
+            Some(items[next])
+        } else if up {
+            let prev = if idx == 0 { items.len() - 1 } else { idx - 1 };
+            Some(items[prev])
+        } else if home {
+            Some(items[0])
+        } else if end {
+            Some(items[items.len() - 1])
+        } else {
+            None
+        }
+    } else if down || home {
+        Some(items[0])
+    } else if up || end {
+        Some(items[items.len() - 1])
+    } else {
+        None
+    };
+
+    if let Some(target) = target_id {
+        ui.ctx().memory_mut(|m| {
+            m.request_focus(target);
+            m.move_focus(egui::FocusDirection::None);
+        });
+        ui.ctx().request_repaint();
+        ui.input_mut(|i| {
+            i.consume_key(Default::default(), egui::Key::ArrowUp);
+            i.consume_key(Default::default(), egui::Key::ArrowDown);
+            i.consume_key(Default::default(), egui::Key::Home);
+            i.consume_key(Default::default(), egui::Key::End);
+        });
+    }
+}
+
 /// Drop a pending handoff whose owning popup is gone. Both root menus
 /// (`context_menu_kb`/`dropdown_menu`/`menu_button`) and keyboard-opened
 /// submenus (`submenu`) park a POPUP id there; the root cleanup originally
@@ -144,7 +222,7 @@ fn drop_stale_kb_handoff(ctx: &egui::Context) {
     // frame. A handoff is stale exactly when NO menu is open any more: while
     // the tree is up its own entries consume the pending id, and once the
     // tree is gone nothing can ever claim it again.
-    if !ctx.any_popup_open() {
+    if !egui::Popup::is_any_open(ctx) {
         ctx.data_mut(|d| d.remove::<egui::Id>(key));
     }
 }
@@ -161,7 +239,7 @@ pub fn context_menu_kb(resp: &Response, keyboard_open: bool, add: impl FnOnce(&m
     let popup_id = egui::Popup::default_response_id(resp);
     let popup = egui::Popup::context_menu(resp);
     if keyboard_open || resp.secondary_clicked() {
-        let owner = resp.ctx.memory(|memory| memory.focused());
+        let owner = resp.ctx.memory(|memory| memory.focused()).or(Some(resp.id));
         resp.ctx
             .data_mut(|data| data.insert_temp(egui::Id::new(MENU_RETURN_FOCUS), owner));
     }
@@ -174,7 +252,10 @@ pub fn context_menu_kb(resp: &Response, keyboard_open: bool, add: impl FnOnce(&m
     } else {
         popup
     };
-    popup.style(style).show(add);
+    popup.style(style).show(|ui| {
+        handle_menu_layer_navigation(ui);
+        add(ui);
+    });
     // Once this menu is gone, a handoff nothing consumed (every entry was
     // greyed out — root OR submenu) must not outlive it.
     drop_stale_kb_handoff(&resp.ctx);
@@ -188,7 +269,10 @@ pub fn menu_button(
 ) -> Response {
     let response = egui::containers::menu::MenuButton::from_button(button)
         .config(egui::containers::menu::MenuConfig::new().style(style))
-        .ui(ui, content)
+        .ui(ui, |ui| {
+            handle_menu_layer_navigation(ui);
+            content(ui);
+        })
         .0;
     if response.clicked() {
         let owner = ui
@@ -263,7 +347,23 @@ fn entry(ui: &mut Ui, text: &str, marks: Marks) -> Response {
         if pending == Some(ui.layer_id().id) {
             ui.ctx().data_mut(|d| d.remove::<egui::Id>(key));
             resp.request_focus();
+            ui.ctx().request_repaint();
         }
+
+        let layer_id = ui.layer_id().id;
+        let entries_key = egui::Id::new("tm-menu-layer-entries").with(layer_id);
+        let pass_nr = ui.ctx().cumulative_pass_nr();
+        ui.ctx().data_mut(|d| {
+            let mut state = d.get_temp::<MenuEntries>(entries_key).unwrap_or_default();
+            if state.pass_nr != pass_nr {
+                state.pass_nr = pass_nr;
+                state.items.clear();
+            }
+            if !state.items.contains(&resp.id) {
+                state.items.push(resp.id);
+            }
+            d.insert_temp(entries_key, state);
+        });
     }
 
     // Inside a menu popup, Tab closes the popup instead of stranding an open
@@ -278,22 +378,16 @@ fn entry(ui: &mut Ui, text: &str, marks: Marks) -> Response {
         ui.close();
     }
 
-    // Own the horizontal arrows inside menus: egui's spatial navigation would
-    // otherwise jump OUT of the popup at whatever widget happens to lie to the
-    // side. `submenu` turns ArrowRight into "open this submenu" and ArrowLeft
-    // into "close it again"; this filter makes egui's focus system ignore bare
-    // horizontal arrows while a menu entry is focused. The vendor's
-    // `Memory::set_focus_lock_filter` only STICKS when the widget held focus
-    // LAST frame too (`had_focus_last_frame`), so this call is a no-op on the
-    // very frame the handoff lands focus and the filter takes effect from the
-    // frame AFTER focus landed — one frame of spatial-arrow gap, which is
-    // what the "focus applies from the next frame" tests above pin.
+    // Own all arrow keys inside menus so egui's spatial navigation cannot jump
+    // out of the popup at arbitrary background widgets.
     if enabled && resp.has_focus() {
         ui.ctx().memory_mut(|mem| {
             mem.set_focus_lock_filter(
                 resp.id,
                 egui::EventFilter {
+                    tab: true,
                     horizontal_arrows: true,
+                    vertical_arrows: true,
                     ..Default::default()
                 },
             );
@@ -482,6 +576,8 @@ pub fn submenu(ui: &mut Ui, text: &str, content: impl FnOnce(&mut Ui)) -> Respon
             egui::containers::menu::MenuState::mark_shown(ui.ctx(), sub_id);
             ui.ctx()
                 .data_mut(|d| d.insert_temp(kb_initial_focus_key(), sub_id));
+            ui.ctx().request_repaint();
+            ui.input_mut(|i| i.consume_key(Default::default(), egui::Key::ArrowRight));
         }
         if ui.input(|input| input.key_pressed(egui::Key::ArrowLeft)) {
             let focused_inside = open
@@ -495,10 +591,15 @@ pub fn submenu(ui: &mut Ui, text: &str, content: impl FnOnce(&mut Ui)) -> Respon
                     state.open_item = None;
                 });
                 resp.request_focus();
+                ui.ctx().request_repaint();
+                ui.input_mut(|i| i.consume_key(Default::default(), egui::Key::ArrowLeft));
             }
         }
     }
-    egui::containers::menu::SubMenu::new().show(ui, &resp, content);
+    egui::containers::menu::SubMenu::new().show(ui, &resp, |ui| {
+        handle_menu_layer_navigation(ui);
+        content(ui);
+    });
     // Mirror the root-level cleanup for the submenu's own handoff: when the
     // submenu (or the whole menu tree) closed, a pending id nothing consumed
     // must not survive it.
@@ -771,7 +872,7 @@ mod tests {
         out.textures_delta.clear();
         assert!(f[0] && !f[1] && !f[2], "first entry must hold focus: {f:?}");
 
-        // Frame 3: ArrowDown is READ this frame (focus still on entry 1)...
+        // Frame 3: ArrowDown immediately moves focus to entry 2.
         let mut out = run(
             raw(vec![key(egui::Key::ArrowDown)]),
             false,
@@ -779,17 +880,12 @@ mod tests {
             &mut act,
         );
         out.textures_delta.clear();
-        assert!(f[0], "focus must not jump mid-frame");
-
-        // Frame 4: ...and the second entry owns it now.
-        let mut out = run(raw(vec![]), false, &mut f, &mut act);
-        out.textures_delta.clear();
         assert!(
             f[1] && !f[0] && !f[2],
             "ArrowDown must move focus down: {f:?}"
         );
 
-        // Frame 5: Enter activates the focused entry.
+        // Frame 4: Enter activates the focused entry.
         let mut out = run(raw(vec![key(egui::Key::Enter)]), false, &mut f, &mut act);
         out.textures_delta.clear();
         assert!(act, "Enter must activate the focused entry");
@@ -1048,5 +1144,97 @@ mod tests {
         // Frame 6: the state sticks — submenu closed, root menu still up.
         let f = frame(false, vec![]);
         assert!(f.root_open && !f.sub_open && f.parent_focused && !f.sub_focused);
+    }
+
+    #[test]
+    fn menu_wrap_around_and_disabled_skip() {
+        let ctx = egui::Context::default();
+        let screen = Rect::from_min_size(Pos2::ZERO, egui::vec2(800.0, 600.0));
+        let raw = |events: Vec<egui::Event>| egui::RawInput {
+            screen_rect: Some(screen),
+            events,
+            focused: true,
+            ..Default::default()
+        };
+        let key = |key: egui::Key| egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::default(),
+        };
+
+        struct State {
+            focus: [bool; 3],
+        }
+
+        let run = |ctx: &egui::Context, raw: egui::RawInput, kb_open: bool| -> State {
+            let mut state = State { focus: [false; 3] };
+            let mut out = ctx.run_ui(raw, |ui| {
+                let resp = ui.label("row");
+                context_menu_kb(&resp, kb_open, |ui| {
+                    let a = item(ui, "Item 1");
+                    let b = item_enabled(ui, "Item 2 (Disabled)", false);
+                    let c = item(ui, "Item 3");
+                    state.focus[0] = a.has_focus();
+                    state.focus[1] = b.has_focus();
+                    state.focus[2] = c.has_focus();
+                });
+            });
+            out.textures_delta.clear();
+            state
+        };
+
+        // Frame 1: Open menu via keyboard
+        let s = run(&ctx, raw(vec![]), true);
+        assert!(!s.focus[0] && !s.focus[1] && !s.focus[2], "sizing pass");
+
+        // Frame 2: First enabled entry (Item 1) receives focus
+        let s = run(&ctx, raw(vec![]), false);
+        assert!(
+            s.focus[0] && !s.focus[1] && !s.focus[2],
+            "Item 1 must be focused on frame 2: {:?}",
+            s.focus
+        );
+
+        // Frame 3: Press ArrowUp on first entry -> wraps around to last entry (Item 3)
+        let s = run(&ctx, raw(vec![key(egui::Key::ArrowUp)]), false);
+        assert!(
+            s.focus[2] && !s.focus[0] && !s.focus[1],
+            "ArrowUp on top entry wraps to bottom: {:?}",
+            s.focus
+        );
+
+        // Frame 4: Press ArrowDown on last entry -> wraps around to first entry (Item 1)
+        let s = run(&ctx, raw(vec![key(egui::Key::ArrowDown)]), false);
+        assert!(
+            s.focus[0] && !s.focus[1] && !s.focus[2],
+            "ArrowDown on bottom entry wraps to top: {:?}",
+            s.focus
+        );
+
+        // Frame 5: Press ArrowDown on Item 1 -> skips disabled Item 2 and lands on Item 3
+        let s = run(&ctx, raw(vec![key(egui::Key::ArrowDown)]), false);
+        assert!(
+            s.focus[2] && !s.focus[0] && !s.focus[1],
+            "ArrowDown skips disabled entry: {:?}",
+            s.focus
+        );
+
+        // Frame 6: Press Home -> jumps to first enabled entry (Item 1)
+        let s = run(&ctx, raw(vec![key(egui::Key::Home)]), false);
+        assert!(
+            s.focus[0] && !s.focus[1] && !s.focus[2],
+            "Home jumps to first entry: {:?}",
+            s.focus
+        );
+
+        // Frame 7: Press End -> jumps to last enabled entry (Item 3)
+        let s = run(&ctx, raw(vec![key(egui::Key::End)]), false);
+        assert!(
+            s.focus[2] && !s.focus[0] && !s.focus[1],
+            "End jumps to last entry: {:?}",
+            s.focus
+        );
     }
 }

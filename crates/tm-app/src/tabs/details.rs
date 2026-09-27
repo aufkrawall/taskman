@@ -1313,8 +1313,10 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
                 // (a menu opened over a dialog would strand there once the
                 // dialog contract consumes Escape).
                 let keyboard_open = !dialog_open
+                    && !egui::Popup::is_any_open(ui.ctx())
                     && !ui.ctx().any_popup_open()
-                    && crate::search::content_has_focus(ui.ctx())
+                    && (crate::search::content_has_focus(ui.ctx())
+                        || ui.ctx().memory(|m| m.focused().is_none()))
                     && menu::keyboard_menu_requested(ui.ctx())
                     && app.selection.primary().is_some_and(|primary| {
                         primary.pid == row.pid && primary.start_epoch_s == row.start_epoch_s
