@@ -14,7 +14,10 @@
   and upgrades existing installations in place while preserving settings.
   The wizard mirrors the app's Windows 11 dark and light theming (shared
   `tm-ui` theme, product icon, header/footer bands) and reviews the MIT
-  license before installing. Unattended
+  license before installing. Running a bare `taskman-setup` build output
+  (no embedded payload) is refused up front with guidance to the packaged
+  installer, and packaging verifies the produced artifact's embedded payload
+  before it reaches `dist/`. Unattended
   use: `/S`, `--uninstall`, `--no-start-menu`, `--desktop`, `--launch`,
   `--no-service`, `--dry-run`. The install directory is fixed (`/D=` is
   rejected with an explanation) because the service is pinned to the

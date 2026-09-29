@@ -46,7 +46,7 @@ pub fn run(opts: Options) -> tm_core::error::Result<()> {
     eframe::run_native(
         &title,
         native,
-        Box::new(|cc| Ok(Box::new(SetupApp::new(cc, opts)))),
+        Box::new(|cc| Ok(Box::new(SetupApp::new(&cc.egui_ctx, opts)))),
     )
     .map_err(|error| tm_core::error::TmError::platform("setup window", error.to_string()))
 }
@@ -84,14 +84,14 @@ struct SetupApp {
 }
 
 impl SetupApp {
-    fn new(cc: &eframe::CreationContext<'_>, opts: Options) -> Self {
+    fn new(ctx: &egui::Context, opts: Options) -> Self {
         // Match the app's text rendering: the software renderer blends per
         // channel, so ClearType-style rasterization is enabled exactly as the
         // app enables it.
         theme::set_subpixel_capable(true, tm_platform::text_rendering::query(None));
-        theme::apply_startup(&cc.egui_ctx);
-        fonts::install_async(cc.egui_ctx.clone());
-        let icon = cc.egui_ctx.load_texture(
+        theme::apply_startup(ctx);
+        fonts::install_async(ctx.clone());
+        let icon = ctx.load_texture(
             "setup-product-icon",
             egui::ColorImage::from_rgba_unmultiplied([64, 64], ICON_RAW),
             egui::TextureOptions::LINEAR,
@@ -101,6 +101,28 @@ impl SetupApp {
             Mode::Install => Page::Welcome,
             Mode::Uninstall => Page::Options,
         };
+        // Fail fast when this is a bare build output (no embedded payload):
+        // walking through the wizard just to die at the first install step is
+        // a bad experience, and the pre-check keeps the machine untouched.
+        // Uninstall needs no payload and is exempt.
+        let preflight_error = if opts.mode == Mode::Install {
+            match std::env::current_exe()
+                .map_err(|error| error.to_string())
+                .and_then(|exe| {
+                    crate::payload::Archive::open(&exe)
+                        .map(|_| ())
+                        .map_err(|error| error.to_string())
+                }) {
+                Ok(()) => None,
+                Err(message) => Some(format!("Setup cannot install: {message}")),
+            }
+        } else {
+            None
+        };
+        let (page, finished) = match preflight_error {
+            Some(message) => (Page::Done, Some(Err(message))),
+            None => (page, None),
+        };
         let steps = plan_steps(&opts);
         SetupApp {
             page,
@@ -109,9 +131,9 @@ impl SetupApp {
             license_accepted: false,
             icon,
             steps,
-            finished: None,
+            finished,
             worker: None,
-            ctx: cc.egui_ctx.clone(),
+            ctx: ctx.clone(),
         }
     }
 
@@ -171,8 +193,23 @@ fn plan_steps(opts: &Options) -> Vec<(String, StepState, String)> {
         .collect()
 }
 
+/// One footer button as laid out: `(label, rect, enabled)`.
+///
+/// The wizard once pushed its whole button row out of the window (the content
+/// `ScrollArea` ate the panel), so "the buttons are inside the viewport" is
+/// pinned by a regression test instead of by eyeballing.
+type FooterButton = (&'static str, egui::Rect, bool);
+
 impl eframe::App for SetupApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        let _ = self.draw(ui);
+    }
+}
+
+impl SetupApp {
+    /// One wizard frame. Returns the footer buttons' layout records; the
+    /// regression tests assert on them, the app ignores them.
+    fn draw(&mut self, ui: &mut egui::Ui) -> Vec<FooterButton> {
         let ctx = ui.ctx().clone();
         theme::ensure_visuals(&ctx);
         fonts::poll_async_apply(&ctx);
@@ -180,7 +217,7 @@ impl eframe::App for SetupApp {
         let pal = theme::palette_ctx(&ctx);
 
         header_band(ui, &pal, self);
-        footer_band(ui, &pal, self);
+        let footer = footer_band(ui, &pal, self);
         egui::CentralPanel::default()
             .frame(egui::Frame::NONE.fill(pal.window_bg))
             .show(ui, |ui| {
@@ -197,6 +234,7 @@ impl eframe::App for SetupApp {
                         ui.add_space(16.0);
                     });
             });
+        footer
     }
 }
 
@@ -236,7 +274,21 @@ fn header_band(ui: &mut egui::Ui, pal: &theme::Palette, app: &SetupApp) {
 }
 
 /// Chrome band on the bottom: the wizard button row.
-fn footer_band(ui: &mut egui::Ui, pal: &theme::Palette, app: &mut SetupApp) {
+///
+/// Returns every button's layout record so the regression tests can assert
+/// the row actually lands inside the window.
+fn footer_band(ui: &mut egui::Ui, pal: &theme::Palette, app: &mut SetupApp) -> Vec<FooterButton> {
+    let mut records: Vec<FooterButton> = Vec::new();
+    // A footer button with the row's standard size. Disabled buttons keep the
+    // same footprint, so the row never reflows between pages.
+    let mut btn = |ui: &mut egui::Ui, label: &'static str, enabled: bool| {
+        let response = ui.add_enabled(
+            enabled,
+            egui::Button::new(label).min_size(egui::vec2(116.0, 28.0)),
+        );
+        records.push((label, response.rect, response.enabled()));
+        response
+    };
     egui::Panel::bottom(egui::Id::new("setup-footer"))
         .resizable(false)
         .frame(
@@ -249,7 +301,7 @@ fn footer_band(ui: &mut egui::Ui, pal: &theme::Palette, app: &mut SetupApp) {
                 // Left side: the secondary "already installed" affordance.
                 if app.page == Page::Welcome
                     && app.existing.is_some()
-                    && ui.button("Uninstall...").clicked()
+                    && btn(ui, "Uninstall...", true).clicked()
                 {
                     app.opts.mode = Mode::Uninstall;
                     app.steps = plan_steps(&app.opts);
@@ -261,16 +313,16 @@ fn footer_band(ui: &mut egui::Ui, pal: &theme::Palette, app: &mut SetupApp) {
                     // button, matching the green-curve setup row.
                     match app.page {
                         Page::Welcome => {
-                            if button(ui, "Cancel", true).clicked() {
+                            if btn(ui, "Cancel", true).clicked() {
                                 ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
                             }
-                            if button(ui, "Next >", app.license_accepted).clicked() {
+                            if btn(ui, "Next >", app.license_accepted).clicked() {
                                 app.page = Page::Options;
                             }
-                            button(ui, "Back", false);
+                            btn(ui, "Back", false);
                         }
                         Page::Options => {
-                            if button(ui, "Cancel", true).clicked() {
+                            if btn(ui, "Cancel", true).clicked() {
                                 ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
                             }
                             let label = if app.opts.mode == Mode::Uninstall {
@@ -278,28 +330,28 @@ fn footer_band(ui: &mut egui::Ui, pal: &theme::Palette, app: &mut SetupApp) {
                             } else {
                                 "Install"
                             };
-                            if button(ui, label, true).clicked() {
+                            if btn(ui, label, true).clicked() {
                                 app.start_work();
                                 app.page = Page::Working;
                             }
                             let can_go_back = app.opts.mode == Mode::Install;
-                            if button(ui, "Back", can_go_back).clicked() {
+                            if btn(ui, "Back", can_go_back).clicked() {
                                 app.page = Page::Welcome;
                             }
                         }
                         Page::Working => {
                             // No cancel once files move: a half-applied
                             // install is worse than a finished one.
-                            button(ui, "Working...", false);
+                            btn(ui, "Working...", false);
                         }
                         Page::Done => {
-                            if button(ui, "Close", true).clicked() {
+                            if btn(ui, "Close", true).clicked() {
                                 ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
                             }
                             let success = matches!(&app.finished, Some(Ok(())));
                             if success
                                 && app.opts.mode == Mode::Install
-                                && button(ui, "Launch Task Manager", true).clicked()
+                                && btn(ui, "Launch Task Manager", true).clicked()
                             {
                                 if let Some(dir) = install::install_dir_for_display() {
                                     let _ = crate::win::launch(&dir.join("taskman.exe"));
@@ -311,15 +363,7 @@ fn footer_band(ui: &mut egui::Ui, pal: &theme::Palette, app: &mut SetupApp) {
                 });
             });
         });
-}
-
-/// A footer button with the row's standard size. Disabled buttons keep the
-/// same footprint, so the row never reflows between pages.
-fn button(ui: &mut egui::Ui, label: &str, enabled: bool) -> egui::Response {
-    ui.add_enabled(
-        enabled,
-        egui::Button::new(label).min_size(egui::vec2(116.0, 28.0)),
-    )
+    records
 }
 
 fn welcome_page(ui: &mut egui::Ui, pal: &theme::Palette, app: &mut SetupApp) {
@@ -516,5 +560,121 @@ fn done_page(ui: &mut egui::Ui, pal: &theme::Palette, app: &SetupApp) {
             ui.label(egui::RichText::new(error).size(13.0).color(pal.text));
         }
         None => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const W: f32 = 640.0;
+    const H: f32 = 560.0;
+
+    /// Render the wizard in a windowless context and return the footer
+    /// buttons' layout records. Two passes: egui resolves layout from the
+    /// previous frame, so the first is warm-up.
+    fn footer_buttons(ctx: &egui::Context, app: &mut SetupApp) -> Vec<FooterButton> {
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(W, H),
+            )),
+            ..Default::default()
+        };
+        let mut buttons = Vec::new();
+        for _ in 0..2 {
+            let mut slot = Vec::new();
+            let mut output = ctx.run_ui(input.clone(), |root| slot = app.draw(root));
+            // Layout only: nothing paints here, so the glyph/icon texture
+            // upload deltas are discarded explicitly (epaint insists).
+            output.textures_delta.clear();
+            buttons = slot;
+        }
+        buttons
+    }
+
+    fn harness() -> (egui::Context, SetupApp) {
+        let ctx = egui::Context::default();
+        theme::install_visuals(&ctx);
+        ctx.set_theme(egui::ThemePreference::Dark);
+        let app = SetupApp::new(&ctx, Options::default());
+        (ctx, app)
+    }
+
+    fn enabled(buttons: &[FooterButton], label: &str) -> bool {
+        buttons
+            .iter()
+            .find(|(l, _, _)| *l == label)
+            .map(|(_, _, enabled)| *enabled)
+            .unwrap_or(false)
+    }
+
+    /// Regression: the first wizard version stacked the footer under a
+    /// full-height content ScrollArea and the button row ended up OUTSIDE the
+    /// window (invisible buttons). Every footer button must be laid out fully
+    /// inside the viewport, on every page that has buttons.
+    #[test]
+    fn every_footer_button_is_inside_the_window() {
+        let (ctx, mut app) = harness();
+        for page in [Page::Welcome, Page::Options, Page::Done] {
+            app.page = page;
+            let buttons = footer_buttons(&ctx, &mut app);
+            assert!(!buttons.is_empty(), "{page:?} has no footer buttons");
+            for (label, rect, _) in &buttons {
+                assert!(
+                    rect.min.x >= 0.0 && rect.max.x <= W && rect.min.y >= 0.0 && rect.max.y <= H,
+                    "{page:?}: {label} at {rect:?} falls outside the {W}x{H} window"
+                );
+            }
+        }
+        // And the row must sit at the bottom edge of the window, not float.
+        app.page = Page::Options;
+        let buttons = footer_buttons(&ctx, &mut app);
+        let bottom = buttons
+            .iter()
+            .map(|(_, rect, _)| rect.max.y)
+            .fold(0.0f32, f32::max);
+        assert!(
+            bottom > H - 60.0 && bottom <= H,
+            "footer row bottom {bottom} is not at the window bottom {H}"
+        );
+    }
+
+    /// The license gate: Next must start disabled and become clickable only
+    /// after the terms are accepted.
+    #[test]
+    fn next_is_disabled_until_the_license_is_accepted() {
+        let (ctx, mut app) = harness();
+        // The harness preflight fails on the test binary (no payload), so
+        // select the Welcome page explicitly - its Next button is the gate.
+        app.page = Page::Welcome;
+        app.finished = None;
+        let buttons = footer_buttons(&ctx, &mut app);
+        assert!(
+            !enabled(&buttons, "Next >"),
+            "Next must be disabled before the license is accepted"
+        );
+        app.license_accepted = true;
+        let buttons = footer_buttons(&ctx, &mut app);
+        assert!(
+            enabled(&buttons, "Next >"),
+            "accepting the license must enable Next"
+        );
+    }
+
+    /// A bare build output must be refused up front - before the wizard lets
+    /// the user walk into a failing install.
+    #[test]
+    fn a_payloadless_setup_is_refused_before_the_wizard_runs() {
+        // The test harness runs from the test binary, which has no payload,
+        // exactly like the bare taskman-setup build output. Preflight must
+        // open on the Done page with the explanation, not on Welcome.
+        let (_ctx, app) = harness();
+        assert_eq!(app.page, Page::Done);
+        assert!(
+            matches!(&app.finished, Some(Err(message)) if message.contains("no embedded payload")),
+            "preflight must explain the missing payload, got {:?}",
+            app.finished
+        );
     }
 }

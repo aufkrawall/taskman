@@ -40,10 +40,16 @@ eframe for the wizard).
 
 Steps (visible in the wizard and in `--dry-run`):
 
-1. Stop running `taskman.exe` instances whose image path is the installed
+1. Extract + verify the payload to a private temp directory. This is FIRST,
+   before anything on the machine is touched: a bare build output (no
+   embedded payload) or a corrupt artifact must fail here, not after the
+   running app has been stopped. The wizard additionally preflights this at
+   startup, so a payload-less `taskman-setup.exe` opens straight on the
+   failure page with guidance to the packaged installer (uninstall is exempt:
+   it needs no payload).
+2. Stop running `taskman.exe` instances whose image path is the installed
    GUI (WM_CLOSE first, bounded handle wait, terminate as fallback). Portable
    copies elsewhere are left alone.
-2. Extract + verify the payload to a private temp directory.
 3. Program files + service: run the app's own elevated helper
    `taskman.exe --core-service=install --core-service-user=<sid>`. That helper
    owns the pinned copy, ACLs, broker manifest and SCM registration; the
@@ -111,13 +117,24 @@ the footer out of the clip rect (invisible buttons).
 ## Testing and verification
 
 - `cargo test -p tm-installer`: payload round trip, corruption/traversal
-  rejection, `embed`/`Archive::open` filesystem round trip, CLI parsing,
-  step-plan shape (including "service install is in the default plan").
+  rejection, `embed`/`Archive::open`/`verify_all` filesystem round trips, CLI
+  parsing, step-plan shape (including "service install is in the default
+  plan" and "payload verification precedes touching the machine").
+- Wizard layout regression tests drive the real `draw()` through a windowless
+  `egui::Context::run_ui` and assert: every footer button lies fully inside
+  the viewport on every page (the first wizard version pushed the row out of
+  the window), Next is disabled until the license is accepted, and a
+  payload-less exe is refused up front. `eframe::App::ui` is a thin wrapper
+  around `draw()` exactly so the tests exercise the shipped layout.
+- `taskman-payload verify <setup.exe>` re-parses a finished artifact and
+  hash-checks every embedded entry; `build.py` runs it after packaging, so a
+  broken artifact never reaches `dist/`.
 - `taskman-setup.exe` cannot run as an unelevated test harness (the manifest
   makes Windows return os error 740), so the bin target is `test = false`;
   the behavior beyond the unit tests is exercised via `--dry-run` and a real
   install/uninstall pass on a Windows machine.
-- GUI appearance cannot be verified headlessly; confirm dark/light manually.
+- GUI appearance cannot be verified headlessly beyond the layout invariants
+  above; confirm dark/light manually.
 
 ## Open questions / accepted limits
 

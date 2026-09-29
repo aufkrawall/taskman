@@ -426,6 +426,12 @@ def package_setup(
         command.append(f"LICENSE={license_file}")
     if not run(command):
         return None
+    # Packaging is not done until the produced artifact re-parses and every
+    # embedded entry hash-checks. This is the same check `taskman-setup` runs
+    # at install time, run here so a broken artifact never reaches dist/.
+    if not run([str(payload_tool), "verify", str(dest)]):
+        log(f"setup payload verification failed: {dest}")
+        return None
     return dest
 
 

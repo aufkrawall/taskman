@@ -40,6 +40,19 @@
     product icon in title bar and header (shared `app.res`/`icon_64.raw`),
     an MIT license review that gates Next, the Back/Next/Cancel button row,
     and the version in the window title.
+  - User report "Setup failed: no embedded payload (bad footer magic)" turned
+    out to be the bare `target\release\taskman-setup.exe` build output (no
+    appended payload) being run instead of the packaged `dist\...-setup.exe`
+    (footer magic verified intact on the dist artifact). Root-cause fixes
+    beyond the diagnosis: the wizard preflights the payload and opens on the
+    failure page with guidance to the packaged installer (uninstall exempt),
+    the payload is extracted+verified BEFORE the running app is stopped (the
+    old order stopped Task Manager before failing), the error text names the
+    packaged artifact instead of build tooling, and `taskman-payload verify`
+    runs after packaging in build.py so an unverifiable artifact never lands
+    in `dist/`. Regression tests pin: footer buttons inside the viewport
+    (layout via `Context::run_ui`), the license gate, the bare-output
+    preflight, and payload-check-before-machine-touch.
 
 - 2026-09-27: Released v0.1.15 (tag on `b4f2b3d`, the bump commit). Followed `build.md` §Publishing path: `--check` + `--audit` green, stable clippy green, bump pushed on main, `build.py --all-targets` for archives (Windows x86_64, Windows ARM64, Linux x86_64 musl), `.sha256` generated beside each, `gh release create --latest` with target `b4f2b3d649615352becaee20c8a449d4af3087d6`. Release covers: full keyboard controllability across all tabs and lists, native Task Manager table multi-selection and paging, context menu keyboard focus and trapped arrow navigation, cyclic Tab and F6 landmark navigation, keyboard-scrubbable Performance charts, modal dialog focus containment, screen reader / AccessKit support, and elimination of mid-frame visual selection flicker.
 

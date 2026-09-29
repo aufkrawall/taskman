@@ -63,8 +63,12 @@ fn fail(context: &'static str, detail: impl Into<String>) -> TmError {
 /// The steps `install` will run for these options, in order.
 pub fn install_steps(opts: &Options) -> Vec<&'static str> {
     let mut steps = vec![
-        "Stop running Task Manager",
+        // The payload is extracted and SHA-256 verified FIRST, before
+        // anything on the machine is touched: a bare build output (no
+        // embedded payload) or a corrupt artifact must fail here, not after
+        // the running app has been stopped.
         "Extract installer payload",
+        "Stop running Task Manager",
         // With the service on, files and SCM registration are one elevated
         // helper transaction; splitting it into two "steps" would report one
         // of them twice.
@@ -135,7 +139,24 @@ pub fn install(opts: &Options, emit: Sink<'_>) -> Result<()> {
             emit(Event::Step(index, state, detail));
         };
 
-        // 1. A running GUI holds its own image open; close it before files
+        // 1. The payload is extracted to a private temp directory and every
+        //    entry is SHA-256 verified BEFORE anything on the machine is
+        //    touched. A bare build output (no embedded payload) or a corrupt
+        //    artifact must fail here - not after the running app has been
+        //    stopped.
+        step(at, StepState::Running, "verifying embedded payload".into());
+        let archive = Archive::open(&setup_exe)?;
+        archive.entry(APP_EXE)?;
+        archive.entry(SERVICE_EXE)?;
+        let extracted = archive.extract_to(&staging)?;
+        step(
+            at,
+            StepState::Done,
+            format!("{} files verified", extracted.len()),
+        );
+        at += 1;
+
+        // 2. A running GUI holds its own image open; close it before files
         //    move under it. Portable copies elsewhere are left alone - they
         //    are not part of this install.
         step(
@@ -152,20 +173,6 @@ pub fn install(opts: &Options, emit: Sink<'_>) -> Result<()> {
             } else {
                 format!("stopped {stopped} running instance(s)")
             },
-        );
-        at += 1;
-
-        // 2. The payload is extracted to a private temp directory and every
-        //    entry is SHA-256 verified BEFORE any of it is written.
-        step(at, StepState::Running, "verifying embedded payload".into());
-        let archive = Archive::open(&setup_exe)?;
-        archive.entry(APP_EXE)?;
-        archive.entry(SERVICE_EXE)?;
-        let extracted = archive.extract_to(&staging)?;
-        step(
-            at,
-            StepState::Done,
-            format!("{} files verified", extracted.len()),
         );
         at += 1;
 
@@ -410,8 +417,8 @@ mod tests {
         assert_eq!(
             steps,
             [
-                "Stop running Task Manager",
                 "Extract installer payload",
+                "Stop running Task Manager",
                 "Install program files and register service",
                 "Create shortcuts",
                 "Register uninstaller in Settings",
@@ -425,13 +432,30 @@ mod tests {
         assert_eq!(
             steps,
             [
-                "Stop running Task Manager",
                 "Extract installer payload",
+                "Stop running Task Manager",
                 "Install program files",
                 "Register uninstaller in Settings",
                 "Launch Task Manager",
             ],
             "no service step and no shortcut step when disabled"
+        );
+    }
+
+    /// The payload must be proven good before ANYTHING on the machine is
+    /// disturbed: a bare build output or corrupt artifact may not stop the
+    /// user's running app first (that ordering cost a real debugging detour).
+    #[test]
+    fn payload_verification_precedes_touching_the_machine() {
+        let steps = install_steps(&Options::default());
+        assert_eq!(
+            steps[0], "Extract installer payload",
+            "payload check must be the first step: {steps:?}"
+        );
+        assert!(
+            steps.iter().position(|s| *s == "Stop running Task Manager")
+                > steps.iter().position(|s| *s == "Extract installer payload"),
+            "stopping the app may not come before the payload check: {steps:?}"
         );
     }
 

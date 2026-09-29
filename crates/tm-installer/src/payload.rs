@@ -194,8 +194,10 @@ impl Archive {
         if magic != MAGIC {
             return Err(err(
                 "payload",
-                "no embedded payload found (bad footer magic); \
-                 was this exe produced by the payload tool?",
+                "no embedded payload found (bad footer magic): this is a bare \
+                 taskman-setup build output, not the packaged installer - run \
+                 taskman-v<version>-windows-<arch>-setup.exe from dist/ (or \
+                 append the payload with taskman-payload)",
             ));
         }
         if manifest_len < 2 || manifest_len > footer_at {
@@ -312,6 +314,18 @@ impl Archive {
         Ok(out)
     }
 
+    /// Inflate and hash-verify every entry without writing anything to disk.
+    ///
+    /// This is what `taskman-payload verify` runs against a finished setup
+    /// artifact: packaging is not "done" until the produced file re-parses
+    /// and every embedded entry verifies.
+    pub fn verify_all(&self) -> Result<usize> {
+        for entry in &self.manifest.entries {
+            self.read_entry(entry)?;
+        }
+        Ok(self.manifest.entries.len())
+    }
+
     /// Extract every entry into `dir`, returning the written paths.
     ///
     /// All entries are inflated and verified in memory first; a corrupt
@@ -390,7 +404,12 @@ mod tests {
     #[test]
     fn missing_payload_is_reported_not_guessed() {
         let error = Archive::parse(b"MZ plain exe with no payload".to_vec()).unwrap_err();
-        assert!(error.to_string().contains("no embedded payload"), "{error}");
+        let message = error.to_string();
+        assert!(message.contains("no embedded payload"), "{error}");
+        // The message must route a human to the packaged installer instead of
+        // asking about build tooling.
+        assert!(message.contains("bare"), "{error}");
+        assert!(message.contains("dist/"), "{error}");
     }
 
     #[test]
@@ -435,6 +454,25 @@ mod tests {
         // JSON itself is garbage - either way it must error).
         exe[footer_at..footer_at + 8].copy_from_slice(&((payload.len() as u64) * 2).to_le_bytes());
         assert!(Archive::parse(exe).is_err());
+    }
+
+    /// `verify` (used by build.py after packaging) proves a finished setup
+    /// artifact re-parses and every entry hash-checks, without writing files.
+    #[test]
+    fn verify_all_checks_every_entry_without_writing() {
+        let payload = build_payload(&files()).unwrap();
+        let archive = Archive::parse(fake_setup(&payload)).unwrap();
+        assert_eq!(archive.verify_all().unwrap(), 3);
+    }
+
+    #[test]
+    fn verify_all_rejects_a_tampered_entry() {
+        let payload = build_payload(&files()).unwrap();
+        let mut exe = fake_setup(&payload);
+        let blob_index = exe.len() - payload.len() + 8;
+        exe[blob_index] ^= 0xff;
+        let archive = Archive::parse(exe).unwrap();
+        assert!(archive.verify_all().is_err());
     }
 
     /// The build path used by `taskman-payload`: append a payload to a real
