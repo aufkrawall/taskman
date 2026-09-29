@@ -198,7 +198,8 @@ platform boundary (`tm-core` ← `tm-platform` ← `tm-app` / `tm-service`), and
     palette, widget visuals, text-weight and sub-pixel tuning) and `fonts.rs`
     (async OS-native font load). egui-only; it never depends on eframe.
 - `crates/tm-service`
-  - Windows service executable. Starts under SCM as delayed-auto LocalSystem,
+  - Windows service executable. Starts under SCM as plain auto-start
+    LocalSystem,
     raises only the control plane to above-normal priority, attaches protected
     ProgramData logging, reports `RUNNING` only after the broker is ready, and
     owns no telemetry/UI state. Non-Windows builds are an explicit stub.

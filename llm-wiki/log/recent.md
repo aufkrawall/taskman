@@ -1,4 +1,36 @@
 
+- 2026-09-29: Core service now installs as plain `Automatic` instead of
+  "Automatic (Delayed Start)" (`core_service.rs::install`). Trigger: a
+  post-reboot "the service did not start automatically" report turned out to
+  be the delayed-start grace period — the service was up 03:08:27, ~2 min
+  after the 03:06:18 boot, exactly on schedule. Plain auto-start is still the
+  right call for this product: the privileged broker should be ready as soon
+  as the desktop is, because privileged actions are exactly what a user needs
+  right after boot (TaskMan as Task-Manager replacement), and the 2-minute
+  "Stopped" window invites false-alarm reports. The delayed flag lives
+  outside `dwStartType`, so `set_delayed_auto_start(false)` must be called
+  explicitly: `change_config` never clears it and an existing install stays
+  delayed forever otherwise. Takes effect on a machine at the next
+  install/repair.
+  - Open question found while investigating: System log shows a crash loop
+    26.09 18:22 → 27.09 08:47 — 853 × (event 7024 "service-specific error 1"
+    + 7031 recovery restart, once per minute) — ending only with the 27.09
+    08:48 service reinstall. The signature is `run_broker` returning `Err` →
+    `ServiceExitCode::ServiceSpecific(1)`, our catch-all, which is why the
+    System log reads "Unzulässige Funktion" (error code 1 as text) and the
+    real reason exists only in `%ProgramData%\TaskMan\logs`. Candidates: the
+    2026-09-12 accept-loop kill (`f72a2aa`; an installed binary predating it
+    keeps the bug — that entry's note says the fix only takes effect after
+    the service binary is replaced) vs. manifest validation at startup (e.g.
+    "installed binary hash mismatch") vs. 16 consecutive accept failures in
+    the fixed broker. Weak evidence for the accept-loop candidate: the
+    service created 25.09 18:30 should have been built from a tree already
+    containing `f72a2aa`. NOT verified — needs an elevated read of the
+    service logs (26.09/27.09 dailies are within the 14-file retention).
+    Follow-up worth considering: distinct `ServiceSpecific` exit codes (or a
+    persistent last-error record) so SCM events distinguish startup
+    validation failures from accept-loop failures.
+
 - 2026-09-29: Added the self-contained Windows setup installer
   (`taskman-setup.exe`, `crates/tm-installer`) and moved the theme into shared
   `crates/tm-ui`.

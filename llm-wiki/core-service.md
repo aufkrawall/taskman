@@ -17,7 +17,10 @@ TaskMan uses a split-process design on Windows:
 - `taskman.exe` remains an ordinary interactive process. It owns sampling,
   settings, rendering, dialogs, tray state, user-selected output paths, and
   module inventory.
-- `taskman-service.exe` is a delayed-auto SCM service running as LocalSystem.
+- `taskman-service.exe` is an auto-start SCM service running as LocalSystem
+  (plain `Automatic`, not delayed: the broker must be ready as soon as the
+  desktop is, because privileged actions are exactly what a user needs right
+  after boot).
   It owns a small allowlist of privileged controls and on-demand per-process
   disk/network ETW counters. It does not render, parse arbitrary command lines,
   choose output paths, or create dumps.
@@ -206,7 +209,9 @@ UAC credentials).
   retained logs or replacing binaries, so the old appender cannot conflict
   with security repair. The manifest is replaced atomically only after both
   protected binaries are ready.
-- SCM configuration is own-process, automatic delayed start, LocalSystem,
+- SCM configuration is own-process, plain automatic start (the delayed flag is
+  explicitly cleared on install because service-config updates never touch it),
+  LocalSystem,
   unrestricted service SID, required privilege list limited to
   `SeDebugPrivilege`, and restart failure actions at 5/15/60 seconds.
 - The service reports `RUNNING` only after manifest validation, ACL creation,

@@ -648,7 +648,7 @@ Durable TaskMan facts for security-relevant auditing. Keep incident history in
 
 - `target/release/taskman.exe` — unelevated interactive GUI (sampling, settings,
   rendering, dialogs, user-selected dumps).
-- `target/release/taskman-service.exe` — delayed-auto LocalSystem broker; the
+- `target/release/taskman-service.exe` — auto-start LocalSystem broker; the
   privileged trust boundary.
 - `dist/` — packaged host and Linux x86_64 release artifacts.
 - Release profiles use `strip = "symbols"`, `panic = "abort"`, and thin LTO;

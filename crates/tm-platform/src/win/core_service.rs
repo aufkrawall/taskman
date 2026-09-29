@@ -3194,8 +3194,13 @@ fn install(authorized_user_sid: &str) -> Result<()> {
             "Provides authenticated, allowlisted privileged process controls for TaskMan.",
         )
         .map_err(|error| TmError::platform("service description", error.to_string()))?;
+    // Plain auto-start, not delayed: the broker must be ready as soon as the
+    // desktop is, because privileged actions are exactly what a user needs
+    // right after boot. The delayed flag lives outside `dwStartType`, so it
+    // must be cleared explicitly here; `change_config` never touches it and
+    // would leave an existing install delayed.
     service
-        .set_delayed_auto_start(true)
+        .set_delayed_auto_start(false)
         .map_err(|error| TmError::platform("service delayed start", error.to_string()))?;
     service
         .set_config_service_sid_info(ServiceSidType::Unrestricted)

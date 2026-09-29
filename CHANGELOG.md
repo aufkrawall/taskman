@@ -29,6 +29,15 @@
   installer renders from the same theme source as the app. `tm-app` re-exports
   both modules unchanged.
 
+### Changed
+
+- **Core service start type:** the TaskMan Core Service now installs as plain
+  "Automatic" instead of "Automatic (Delayed Start)", so the privileged broker
+  is ready as soon as the desktop is up and privileged actions work right
+  after boot instead of after the delayed-start grace period. Existing
+  installations pick this up on the next install/repair: the delayed flag is
+  cleared explicitly because updating a service's config never touches it.
+
 ## 0.1.15 - 2026-09-27
 
 ### New
