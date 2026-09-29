@@ -1508,6 +1508,9 @@ pub fn settings_dialog(app: &mut TaskManApp, ctx: &egui::Context, _pal: &theme::
                         i18n::tr(K::CoreServiceNotInstalled).into()
                     }
                     Some(CoreServiceState::Stopped) => i18n::tr(K::CoreServiceStopped).into(),
+                    Some(CoreServiceState::InstallIntegrityFailed) => {
+                        i18n::tr(K::CoreServiceIntegrityFailed).into()
+                    }
                     Some(CoreServiceState::Starting) => i18n::tr(K::CoreServiceStarting).into(),
                     Some(CoreServiceState::Running { version }) => {
                         i18n::trf(K::CoreServiceRunning, &[version])
@@ -1529,6 +1532,7 @@ pub fn settings_dialog(app: &mut TaskManApp, ctx: &egui::Context, _pal: &theme::
                     Some(
                         CoreServiceState::NotInstalled
                             | CoreServiceState::Stopped
+                            | CoreServiceState::InstallIntegrityFailed
                             | CoreServiceState::Degraded(_)
                     )
                 );
@@ -1542,9 +1546,11 @@ pub fn settings_dialog(app: &mut TaskManApp, ctx: &egui::Context, _pal: &theme::
                     .load(std::sync::atomic::Ordering::Acquire);
                 let button_key = match core_state.as_ref() {
                     Some(CoreServiceState::NotInstalled) => K::InstallCoreService,
-                    Some(CoreServiceState::Stopped | CoreServiceState::Degraded(_)) => {
-                        K::RepairCoreService
-                    }
+                    Some(
+                        CoreServiceState::Stopped
+                        | CoreServiceState::InstallIntegrityFailed
+                        | CoreServiceState::Degraded(_),
+                    ) => K::RepairCoreService,
                     Some(CoreServiceState::ForeignClient) => K::SwitchToInstalledCoreService,
                     _ => K::RemoveCoreService,
                 };

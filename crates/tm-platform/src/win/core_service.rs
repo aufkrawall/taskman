@@ -547,20 +547,78 @@ fn sid_is_user_account(sid_text: &str) -> bool {
     resolved.is_ok() && kind == SidTypeUser
 }
 
+/// Context shared by every error that means "the installed generation does
+/// not match its pinned manifest". The whole class maps to the dedicated SCM
+/// exit code [`SERVICE_EXIT_INSTALL_INTEGRITY`] so the GUI can tell "broken
+/// install, run Repair" apart from an ordinary broker fault.
+const MANIFEST_CONTEXT: &str = "broker manifest";
+
+/// Broker exit code for an ordinary runtime failure (the historical
+/// catch-all). Windows renders service-specific codes in event 7024 as
+/// meaningless Win32 error text, so these numbers are a machine-readable
+/// channel the GUI reads back through SCM — not something to expect a
+/// readable rendering of in the event log.
+pub const SERVICE_EXIT_FAILURE: u32 = 1;
+
+/// Broker exit code for install-integrity failures: the installation does not
+/// match `manifest.json`, so no restart can help — only Repair/Install
+/// rewrites manifest and binaries.
+pub const SERVICE_EXIT_INSTALL_INTEGRITY: u32 = 2;
+
+/// True when the broker refused to run over an install-integrity problem.
+pub fn is_install_integrity_failure(error: &TmError) -> bool {
+    matches!(error, TmError::Platform { context, .. } if *context == MANIFEST_CONTEXT)
+}
+
+/// The service-specific exit code the broker reports to SCM for `error`.
+pub fn service_exit_code(error: &TmError) -> u32 {
+    if is_install_integrity_failure(error) {
+        SERVICE_EXIT_INSTALL_INTEGRITY
+    } else {
+        SERVICE_EXIT_FAILURE
+    }
+}
+
+/// First 12 hex chars of a hash: enough for an operator to compare two
+/// values by eye without flooding the log line.
+fn hash_fingerprint(hash: &str) -> &str {
+    hash.get(..12).unwrap_or(hash)
+}
+
+/// Compares one installed binary against its manifest pin. A mismatch is an
+/// install-integrity failure, and its detail names the drifted binary plus
+/// both fingerprints — the 2026-09-26 crash loop hid exactly this behind 853
+/// opaque "service-specific error 1" events. Hashes of the installed binaries
+/// are not secrets; they are pins the manifest already stores.
+fn verify_pinned_hash(label: &str, expected: &str, actual: &str) -> Result<()> {
+    if actual.eq_ignore_ascii_case(expected) {
+        return Ok(());
+    }
+    Err(TmError::platform(
+        MANIFEST_CONTEXT,
+        format!(
+            "installed {label} binary does not match the manifest \
+             (expected sha256 {}…, found {}…); Repair/Install reinstalls the pinned generation",
+            hash_fingerprint(expected),
+            hash_fingerprint(actual),
+        ),
+    ))
+}
+
 fn validate_manifest(manifest: &BrokerManifest) -> Result<()> {
     if manifest.schema_version != MANIFEST_SCHEMA
         || manifest.protocol_version != PROTOCOL_VERSION
         || !valid_sid_text(&manifest.authorized_user_sid)
     {
         return Err(TmError::platform(
-            "broker manifest",
+            MANIFEST_CONTEXT,
             "unsupported schema/protocol or invalid SID",
         ));
     }
     let own_exe = std::env::current_exe()?;
     if !paths_match(&own_exe, &manifest.service_path) {
         return Err(TmError::platform(
-            "broker manifest",
+            MANIFEST_CONTEXT,
             "service is not running from its protected installed path",
         ));
     }
@@ -568,20 +626,14 @@ fn validate_manifest(manifest: &BrokerManifest) -> Result<()> {
         || !paths_match(&expected_installed_service_path()?, &manifest.service_path)
     {
         return Err(TmError::platform(
-            "broker manifest",
+            MANIFEST_CONTEXT,
             "binary paths do not match the protected install location",
         ));
     }
     let service_hash = sha256_file(&manifest.service_path)?;
+    verify_pinned_hash("service", &manifest.service_sha256, &service_hash)?;
     let gui_hash = sha256_file(&manifest.gui_path)?;
-    if !service_hash.eq_ignore_ascii_case(&manifest.service_sha256)
-        || !gui_hash.eq_ignore_ascii_case(&manifest.gui_sha256)
-    {
-        return Err(TmError::platform(
-            "broker manifest",
-            "installed binary hash mismatch",
-        ));
-    }
+    verify_pinned_hash("GUI", &manifest.gui_sha256, &gui_hash)?;
     Ok(())
 }
 
@@ -590,14 +642,15 @@ fn load_manifest() -> Result<BrokerManifest> {
     let mut file = pinned_source(&path)?;
     let length = file.metadata()?.len();
     if length > 64 * 1024 {
-        return Err(TmError::platform(
-            "broker manifest",
-            "manifest is too large",
-        ));
+        return Err(TmError::platform(MANIFEST_CONTEXT, "manifest is too large"));
     }
     let mut bytes = Vec::with_capacity(length as usize);
     file.read_to_end(&mut bytes)?;
-    let manifest: BrokerManifest = serde_json::from_slice(&bytes)?;
+    // A corrupt manifest is an install-integrity problem like a hash
+    // mismatch: Repair is the remedy, so it belongs to the same class.
+    let manifest: BrokerManifest = serde_json::from_slice(&bytes).map_err(|error| {
+        TmError::platform(MANIFEST_CONTEXT, format!("manifest is unreadable: {error}"))
+    })?;
     validate_manifest(&manifest)?;
     Ok(manifest)
 }
@@ -2319,9 +2372,25 @@ fn service_state(client: &BrokerClient) -> CoreServiceState {
             ServiceState::StartPending | ServiceState::ContinuePending => {
                 CoreServiceState::Starting
             }
-            _ => CoreServiceState::Stopped,
+            _ => classify_stopped_state(&status.exit_code),
         },
         Err(error) => CoreServiceState::Degraded(error.to_string()),
+    }
+}
+
+/// Maps a stopped service's last reported exit code onto the state surface.
+/// The broker reports install-integrity failures under their own code, and
+/// the GUI must name that condition instead of showing a bare "stopped": no
+/// restart fixes it, Repair does.
+fn classify_stopped_state(
+    exit_code: &windows_service::service::ServiceExitCode,
+) -> CoreServiceState {
+    use windows_service::service::ServiceExitCode;
+    match exit_code {
+        ServiceExitCode::ServiceSpecific(SERVICE_EXIT_INSTALL_INTEGRITY) => {
+            CoreServiceState::InstallIntegrityFailed
+        }
+        _ => CoreServiceState::Stopped,
     }
 }
 
@@ -3714,5 +3783,54 @@ mod tests {
         // Unresolvable paths keep the honest degraded classification.
         assert!(!foreign_client_session(None, Some(&installed)));
         assert!(!foreign_client_session(Some(&installed), None));
+    }
+
+    /// A hash mismatch must be reported under the install-integrity exit code
+    /// (so `service_state` can name it) and its detail must name the drifted
+    /// binary plus both fingerprints. The 2026-09-26 crash loop hid exactly
+    /// this failure behind 853 opaque "service-specific error 1" events.
+    #[test]
+    fn a_pinned_hash_mismatch_is_an_install_integrity_failure() {
+        let error = verify_pinned_hash("service", "0123456789abcdef0123", "fedcba9876543210fedc")
+            .expect_err("mismatched hashes must fail");
+        assert!(is_install_integrity_failure(&error));
+        assert_eq!(service_exit_code(&error), SERVICE_EXIT_INSTALL_INTEGRITY);
+        let detail = error.to_string();
+        assert!(detail.contains("service"), "must name the binary: {detail}");
+        assert!(
+            detail.contains("0123456789ab"),
+            "must carry the expected fingerprint: {detail}"
+        );
+        assert!(
+            detail.contains("fedcba987654"),
+            "must carry the actual fingerprint: {detail}"
+        );
+        // The pin comparison is case-insensitive hex coming from two
+        // different code paths.
+        verify_pinned_hash("GUI", "0123456789ABCDEF", "0123456789abcdef").unwrap();
+    }
+
+    /// Everything else keeps the historical generic code, and only the
+    /// integrity code changes what the GUI shows for a stopped service.
+    #[test]
+    fn ordinary_broker_failures_keep_the_generic_exit_code() {
+        use windows_service::service::ServiceExitCode;
+        let error = TmError::platform("broker pipe", "accept failed");
+        assert!(!is_install_integrity_failure(&error));
+        assert_eq!(service_exit_code(&error), SERVICE_EXIT_FAILURE);
+        assert_eq!(
+            classify_stopped_state(&ServiceExitCode::ServiceSpecific(
+                SERVICE_EXIT_INSTALL_INTEGRITY
+            )),
+            CoreServiceState::InstallIntegrityFailed
+        );
+        assert_eq!(
+            classify_stopped_state(&ServiceExitCode::ServiceSpecific(SERVICE_EXIT_FAILURE)),
+            CoreServiceState::Stopped
+        );
+        assert_eq!(
+            classify_stopped_state(&ServiceExitCode::Win32(1)),
+            CoreServiceState::Stopped
+        );
     }
 }

@@ -128,10 +128,15 @@ mod service {
                     tm_core::TmError::platform("report core service readiness", error.to_string())
                 })
         });
-        let exit_code = if result.is_ok() {
-            ServiceExitCode::Win32(0)
-        } else {
-            ServiceExitCode::ServiceSpecific(1)
+        let exit_code = match &result {
+            Ok(()) => ServiceExitCode::Win32(0),
+            // Distinct codes per failure class: the GUI reads this back
+            // through SCM to tell "broken install, run Repair" from an
+            // ordinary broker fault. Event 7024 renders both as meaningless
+            // Win32 error text, so the code is a machine-readable channel.
+            Err(error) => ServiceExitCode::ServiceSpecific(
+                tm_platform::win::core_service::service_exit_code(error),
+            ),
         };
         if let Err(error) = result {
             tracing::error!(%error, "core service stopped with an error");

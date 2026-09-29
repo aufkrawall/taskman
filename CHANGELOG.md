@@ -38,6 +38,19 @@
   installations pick this up on the next install/repair: the delayed flag is
   cleared explicitly because updating a service's config never touches it.
 
+### Improved
+
+- **Core service failure visibility:** when the installed TaskMan binaries no
+  longer match the pinned broker manifest, the service now reports that under
+  its own SCM exit code and logs which binary drifted together with the
+  expected/actual hash fingerprints, and Settings › Advanced shows
+  "integrity check failed" with the Repair action instead of a bare
+  "stopped". Previously this permanent, repairable condition shared one
+  generic exit code with every other broker fault — the System event log only
+  showed an opaque "service-specific error 1", the real reason sat in an
+  admin-only log, and SCM kept restarting the service once per minute
+  indefinitely. Ordinary broker failures are unchanged.
+
 ## 0.1.15 - 2026-09-27
 
 ### New

@@ -12,24 +12,34 @@
   explicitly: `change_config` never clears it and an existing install stays
   delayed forever otherwise. Takes effect on a machine at the next
   install/repair.
-  - Open question found while investigating: System log shows a crash loop
-    26.09 18:22 → 27.09 08:47 — 853 × (event 7024 "service-specific error 1"
-    + 7031 recovery restart, once per minute) — ending only with the 27.09
-    08:48 service reinstall. The signature is `run_broker` returning `Err` →
-    `ServiceExitCode::ServiceSpecific(1)`, our catch-all, which is why the
-    System log reads "Unzulässige Funktion" (error code 1 as text) and the
-    real reason exists only in `%ProgramData%\TaskMan\logs`. Candidates: the
-    2026-09-12 accept-loop kill (`f72a2aa`; an installed binary predating it
-    keeps the bug — that entry's note says the fix only takes effect after
-    the service binary is replaced) vs. manifest validation at startup (e.g.
-    "installed binary hash mismatch") vs. 16 consecutive accept failures in
-    the fixed broker. Weak evidence for the accept-loop candidate: the
-    service created 25.09 18:30 should have been built from a tree already
-    containing `f72a2aa`. NOT verified — needs an elevated read of the
-    service logs (26.09/27.09 dailies are within the 14-file retention).
-    Follow-up worth considering: distinct `ServiceSpecific` exit codes (or a
-    persistent last-error record) so SCM events distinguish startup
-    validation failures from accept-loop failures.
+  - Root cause (verified from the service's own logs): every one of the 853
+    failures was `broker manifest: installed binary hash mismatch` — the
+    fail-closed startup validation in `validate_manifest` refusing to run
+    because an installed binary no longer matched `manifest.json`. Timeline:
+    the service validated and ran fine from the 25.09 18:30 install through
+    26.09 09:08 (ETW traces), then every start from the 26.09 18:22 boot on
+    failed validation until the 27.09 08:48 reinstall rewrote manifest and
+    binaries. The desync happened out-of-band in the 25.09 18:30 → 26.09
+    18:22 window: no product code path writes installed binaries outside
+    `install()` (which always rewrites the manifest in the same run), there
+    is no 7045 and no GUI-log install/repair activity in the window, and the
+    manually created `C:\Program Files\TaskMan\bak` folder (holding 14.09
+    binaries, copied 17.09 — nothing in the repo writes `bak`) shows manual
+    binary copies into the install dir happen on this dev machine.
+  - Fail-closed on a hash mismatch is correct and must stay. The gap is
+    diagnosability/operability: 853 silent one-per-minute SCM restarts over
+    14.5 h behind a completely opaque System-log signature
+    (`ServiceSpecific(1)` renders as "Unzulässige Funktion", and every
+    distinct `run_broker` failure shares that one code), with the real reason
+    only in an admin-only log. Closed in the same session: distinct
+    `ServiceSpecific` codes for install-integrity vs runtime failures
+    (`SERVICE_EXIT_INSTALL_INTEGRITY` = 2), error text naming the mismatching
+    binary with expected/actual hash fingerprints, corrupt manifests join the
+    same class, and the GUI maps the code through `classify_stopped_state` so
+    Settings › Advanced shows "integrity check failed" with the Repair action
+    (`CoreServiceState::InstallIntegrityFailed`) instead of a bare
+    "stopped". Pinned by `a_pinned_hash_mismatch_is_an_install_integrity_failure`
+    and `ordinary_broker_failures_keep_the_generic_exit_code`.
 
 - 2026-09-29: Added the self-contained Windows setup installer
   (`taskman-setup.exe`, `crates/tm-installer`) and moved the theme into shared

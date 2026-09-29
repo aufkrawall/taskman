@@ -539,6 +539,10 @@ keys! {
         "Not installed. Protected actions continue to use the user token or UAC when needed."
     ],
     CoreServiceStopped => ["Installiert, aber beendet.", "Installed but stopped."],
+    CoreServiceIntegrityFailed => [
+        "Installiert, aber die Integritätsprüfung ist fehlgeschlagen: Die installierten Dateien passen nicht mehr zur Manifest-Datei des Diensts. 'Reparieren' stellt die gepinnte Installation wieder her.",
+        "Installed, but the integrity check failed: the installed files no longer match the service manifest. 'Repair' restores the pinned installation."
+    ],
     CoreServiceStarting => ["Wird gestartet…", "Starting…"],
     CoreServiceRunning => [
         "Aktiv (Version {}). Die Oberfläche kann ohne Administratorrechte bleiben.",

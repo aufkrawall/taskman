@@ -46,6 +46,11 @@ pub enum CoreServiceState {
         version: String,
     },
     Degraded(String),
+    /// The service is installed but refuses to run: the installed binaries do
+    /// not match the pinned broker manifest (or the manifest is unreadable).
+    /// No restart can help; only Repair/Install rewrites the pinned
+    /// generation.
+    InstallIntegrityFailed,
     /// The service is installed and healthy, but this session's executable
     /// sits outside the protected install location, so the broker's
     /// image-path authorization will keep rejecting it. "Repair" cannot fix
