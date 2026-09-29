@@ -3508,6 +3508,7 @@ dependencies = [
  "serde_json",
  "tm-core",
  "tm-platform",
+ "tm-ui",
  "tracing",
  "tray-icon",
  "wgpu",
@@ -3525,6 +3526,24 @@ dependencies = [
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "tm-installer"
+version = "0.1.15"
+dependencies = [
+ "eframe",
+ "egui",
+ "flate2",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "tm-core",
+ "tm-platform",
+ "tm-ui",
+ "windows",
+ "windows-service",
 ]
 
 [[package]]
@@ -3551,6 +3570,16 @@ dependencies = [
  "tm-platform",
  "tracing",
  "windows-service",
+]
+
+[[package]]
+name = "tm-ui"
+version = "0.1.15"
+dependencies = [
+ "egui",
+ "tm-core",
+ "tm-platform",
+ "tracing",
 ]
 
 [[package]]

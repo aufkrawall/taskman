@@ -117,14 +117,35 @@ The binaries land in `target/release/taskman.exe` and
 `target/release/taskman-service.exe`. `taskman.exe --selfcheck` runs a
 headless sampling smoke test and prints a JSON summary.
 
+## Installing on Windows
+
+Release packaging produces two ways to install:
+
+- **Setup installer (recommended):** run
+  `taskman-v<version>-windows-<arch>-setup.exe`. It installs to
+  `%ProgramFiles%\TaskMan`, registers and starts the background service (so
+  the app works without UAC prompts afterwards), creates Start menu and
+  optional desktop shortcuts, and adds an uninstall entry to Settings > Apps.
+  The wizard follows the Windows 11 dark/light theme. Unattended installs use
+  `/S`; see `taskman-setup.exe --help` for `--uninstall`, `--no-start-menu`,
+  `--desktop`, `--launch` and `--no-service`. The install directory is fixed
+  at `%ProgramFiles%\TaskMan` because the service must live in a protected
+  directory.
+- **Portable archive:** extract `taskman-v<version>-windows-<arch>.zip` into
+  an administrator-protected folder and register the service from an elevated
+  prompt with `taskman.exe --core-service=install --core-service-user=<sid>`
+  (or skip the service; protected actions then ask for elevation).
+
 ## Repository layout
 
 | Path | What it is |
 | --- | --- |
 | `crates/tm-core` | Platform-agnostic model, engine, settings, app history, i18n |
 | `crates/tm-platform` | OS collectors and actions behind traits (Windows stack under `win/`) |
+| `crates/tm-ui` | Shared Windows-11 theme palette and font setup (app + installer) |
 | `crates/tm-app` | The eframe GUI |
 | `crates/tm-service` | The optional Windows service executable |
+| `crates/tm-installer` | The self-contained Windows setup (`taskman-setup.exe`) |
 | `vendor/egui` | Vendored egui fork (sub-pixel text + CPU renderer) |
 | `audit.md`, `hardening/`, `llm-wiki/` | Parity audit, security-analysis artifacts, and maintainer documentation |
 

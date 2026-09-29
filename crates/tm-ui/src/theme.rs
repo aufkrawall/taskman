@@ -3,7 +3,7 @@
 
 use std::sync::atomic::{AtomicU8, Ordering};
 
-use eframe::egui::{self, Color32, CornerRadius, FontId, Visuals};
+use egui::{self, Color32, CornerRadius, FontId, Visuals};
 use tm_core::settings::TextSmoothing;
 
 /// Whether the active renderer can display sub-pixel (`ClearType`) text.

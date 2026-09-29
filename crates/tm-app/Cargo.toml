@@ -20,6 +20,10 @@ glow = ["eframe/glow"]
 [dependencies]
 tm-core = { workspace = true }
 tm-platform = { workspace = true }
+# Theme palette + font setup, shared with the setup installer so both render
+# the exact same Windows 11 look. tm-app re-exports it as `crate::theme` /
+# `crate::fonts`.
+tm-ui = { workspace = true }
 eframe = { version = "=0.36.1", default-features = false, features = [
   "accesskit",
   "default_fonts",

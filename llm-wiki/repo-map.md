@@ -9,8 +9,9 @@ Primary sources:
 
 ## Core Tree
 
-Rust workspace with four crates. The GUI and Windows service both reuse the
-platform boundary (`tm-core` ← `tm-platform` ← `tm-app` / `tm-service`):
+Rust workspace with six crates. The GUI and Windows service both reuse the
+platform boundary (`tm-core` ← `tm-platform` ← `tm-app` / `tm-service`), and
+`tm-ui` (theme/fonts) is shared between `tm-app` and `tm-installer`:
 
 - `crates/tm-core`
   - Platform-agnostic heart. `model.rs` (Snapshot data model — CPU, memory,
@@ -189,13 +190,26 @@ platform boundary (`tm-core` ← `tm-platform` ← `tm-app` / `tm-service`):
      pinned to a sample TIMESTAMP so live telemetry cannot slide it, and the
      selected sample published as the chart's accesskit value),
     `icon_cache.rs` (lazy worker, upload budget, bounded LRU),
-    `fonts.rs` (async system-font load after first frame),
-    `action_executor.rs`.
+    `action_executor.rs`. Theme and font setup moved to `crates/tm-ui`;
+    `tm-app` re-exports them as `crate::theme` / `crate::fonts`.
+- `crates/tm-ui`
+  - Shared UI foundation used by the GUI and the Windows setup installer so
+    both render the exact same Windows 11 look: `theme.rs` (dark/light
+    palette, widget visuals, text-weight and sub-pixel tuning) and `fonts.rs`
+    (async OS-native font load). egui-only; it never depends on eframe.
 - `crates/tm-service`
   - Windows service executable. Starts under SCM as delayed-auto LocalSystem,
     raises only the control plane to above-normal priority, attaches protected
     ProgramData logging, reports `RUNNING` only after the broker is ready, and
     owns no telemetry/UI state. Non-Windows builds are an explicit stub.
+- `crates/tm-installer`
+  - The self-contained Windows setup installer (`taskman-setup.exe`) plus the
+    build-time payload embedder (`taskman-payload`): self-extracting payload
+    archive (`payload.rs`), CLI (`options.rs`), install/uninstall plan
+    (`install.rs`), Win32 plumbing (`win.rs`), themed eframe wizard (`ui.rs`).
+    Service install/uninstall runs through the app's elevated
+    `--core-service` helper and is not reimplemented here — see
+    `installer.md`.
 
 ## Important Support and Output Paths
 
@@ -333,7 +347,7 @@ platform boundary (`tm-core` ← `tm-platform` ← `tm-app` / `tm-service`):
   states (`details::SortOrder`), not two, and the tree is not a mode: it IS
   the Name column's third state. Clicking any OTHER column must leave it and
   sort purely by that column.
-- `crates/tm-app/src/theme.rs` — `ScrollStyle.fade.strength` must stay 0:
+- `crates/tm-ui/src/theme.rs` — `ScrollStyle.fade.strength` must stay 0:
   egui's edge fades read as a shadow lying on a dense table rather than as
   depth. `ScrollStyle.floating` must stay TRUE. egui
   decides whether a bar is needed against the OUTER rect for floating bars
@@ -358,6 +372,10 @@ platform boundary (`tm-core` ← `tm-platform` ← `tm-app` / `tm-service`):
   `BrokerValue::ModuleUnload` — never as an error string. Keep it off the
   sampler and UI thread, and never weaken the second confirmation in
   `tabs/modules.rs`.
+- `crates/tm-installer/src/win.rs` — `install_dir()` must stay identical to
+  `core_service.rs`'s protected install path, and install/uninstall must keep
+  running service registration through the elevated `--core-service` helper
+  rather than reimplementing it. See `installer.md`.
 
 ## Test Matrix
 
@@ -365,6 +383,9 @@ platform boundary (`tm-core` ← `tm-platform` ← `tm-app` / `tm-service`):
 - `cargo test -p tm-platform` — pure logic (GPU parsing, merges) + Windows
   integration tests (spawn/kill children, live sample sanity).
 - `cargo test -p tm-app` — table/process/performance/detail logic tests.
+- `cargo test -p tm-ui` — palette/gradient invariants.
+- `cargo test -p tm-installer` — payload archive round trip + corruption and
+  traversal rejection, setup CLI parsing, install step plans.
 - `cargo test -p tm-service` — service entry/build surface (broker unit tests
   live in `tm-platform`).
 - Headless smoke: `taskman --selfcheck [--mock]`.

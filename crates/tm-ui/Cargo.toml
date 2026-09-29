@@ -1,0 +1,15 @@
+[package]
+name = "tm-ui"
+description = "Shared Windows-11-Task-Manager theme palette and font setup"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+tm-core = { workspace = true }
+tm-platform = { workspace = true }
+tracing = { workspace = true }
+# egui only, never eframe: the theme and font layers are renderer-agnostic.
+# The GUI and the installer bring their own eframe renderer features; egui
+# itself is the vendored fork (see the workspace `[patch.crates-io]`).
+egui = { version = "=0.36.1" }

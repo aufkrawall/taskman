@@ -1,0 +1,68 @@
+[package]
+name = "tm-installer"
+description = "Self-contained Windows setup installer for Task Man (100% Rust)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "taskman-setup"
+path = "src/bin/taskman-setup.rs"
+# The setup manifest is `requireAdministrator`, so Windows refuses to launch
+# this binary as an unelevated test harness (os error 740). Its tests live in
+# the library; the bin itself is covered by the release build + --dry-run.
+test = false
+bench = false
+
+# Build-time helper: appends the payload archive to `taskman-setup.exe` to
+# produce the self-contained setup artifact. Runs on the build host, which may
+# differ from the setup target (Windows x64 host building ARM64).
+[[bin]]
+name = "taskman-payload"
+path = "src/bin/taskman-payload.rs"
+
+[dependencies]
+tm-core = { workspace = true }
+tm-platform = { workspace = true }
+tm-ui = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+# Pure-Rust deflate (miniz_oxide) for the embedded payload archive.
+flate2 = { workspace = true }
+egui = { version = "=0.36.1" }
+# The setup wizard renders through the same egui stack as the app so it can
+# mirror the app's theming exactly. Software (CPU) rendering only: the wizard
+# is a short-lived window, and this backend supports sub-pixel text.
+eframe = { version = "=0.36.1", default-features = false, features = [
+  "software",
+  "default_fonts",
+] }
+
+[target.'cfg(windows)'.dependencies]
+windows = { workspace = true, features = [
+  "Win32_Foundation",
+  "Win32_Security",
+  "Win32_Security_Authorization",
+  "Win32_System_Com",
+  "Win32_System_Com_StructuredStorage",
+  "Win32_System_Console",
+  "Win32_System_Diagnostics_ToolHelp",
+  "Win32_System_Registry",
+  "Win32_System_Threading",
+  "Win32_Storage_FileSystem",
+  "Win32_UI_Shell",
+  "Win32_UI_WindowsAndMessaging",
+] }
+# Fallback SCM delete for the broken-install case where `taskman.exe` is
+# already gone and the helper cannot run.
+windows-service = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints.rust]
+# Same as tm-app: harmless Zig/lld stderr becomes a warning under newer rustc
+# during Linux cross builds of this workspace member.
+unknown_lints = "allow"
+linker_messages = "allow"

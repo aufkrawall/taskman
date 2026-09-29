@@ -1,0 +1,127 @@
+# Windows Setup Installer
+
+## Sources
+
+- `crates/tm-installer/` — `taskman-setup` (wizard + silent installer) and
+  `taskman-payload` (build-time embedder), sharing `payload.rs` (archive
+  format), `options.rs` (CLI), `install.rs` (plan/orchestration), `win.rs`
+  (Win32 plumbing), `ui.rs` (eframe wizard).
+- `crates/tm-ui/` — the shared theme (see `repo-map.md`).
+- `build.py` `package_setup()` — artifact production.
+- Contract it reuses: `tm-platform/src/win/core_service.rs`
+  (`--core-service=install|uninstall` elevated helper; see `core-service.md`).
+
+Modeled on the green-curve setup installer: a single self-contained
+`taskman-setup.exe` per architecture, custom-drawn UI that mirrors the host
+application's theming, no NSIS/WiX/Inno and no native helper libraries
+("100% Rust": `flate2`/miniz_oxide for compression, `windows` crate for Win32,
+eframe for the wizard).
+
+## Shape of the artifact
+
+`taskman-setup.exe` = linked wizard + appended payload:
+
+```text
+[ setup executable ][ deflate blob region ][ manifest JSON ]
+[ manifest_len: u64 LE ][ MAGIC: u64 LE ("TMSUPAYL") ]
+```
+
+- Entry names are flat (`taskman.exe`, `taskman-service.exe`, `LICENSE`);
+  the parser rejects separators, drive markers, dot-dot and dotfiles.
+- The reader validates the footer magic, manifest shape, offset/length pairs
+  and non-overlap, inflates every entry in memory, and verifies each SHA-256
+  BEFORE extracting anything: a corrupt payload never leaves a half-written
+  install directory.
+- `taskman-payload <setup.exe> <out.exe> <name>=<file>...` appends the
+  archive. It runs on the build HOST, so an x64 host can package the ARM64
+  installer. Writer and reader live in one crate, so the format cannot drift.
+
+## What install does (and does not) do
+
+Steps (visible in the wizard and in `--dry-run`):
+
+1. Stop running `taskman.exe` instances whose image path is the installed
+   GUI (WM_CLOSE first, bounded handle wait, terminate as fallback). Portable
+   copies elsewhere are left alone.
+2. Extract + verify the payload to a private temp directory.
+3. Program files + service: run the app's own elevated helper
+   `taskman.exe --core-service=install --core-service-user=<sid>`. That helper
+   owns the pinned copy, ACLs, broker manifest and SCM registration; the
+   installer does NOT reimplement any of it. `--no-service` instead copies the
+   two binaries into `%ProgramFiles%\TaskMan` directly (the app can register
+   the service later from Settings, with UAC).
+4. Shortcuts (per-user Start menu by default, desktop opt-in) and the
+   Add/Remove Programs entry (whose `UninstallString` points at the
+   `taskman-setup.exe` copy placed into the install directory).
+5. Optional launch.
+
+Deliberate constraints:
+
+- **Elevation:** `taskman-setup` carries a `requireAdministrator` manifest
+  (attached per-bin in `build.rs`, so `taskman-payload` stays unelevated).
+  One UAC prompt at start; the wizard runs elevated the whole time. A launch
+  from a non-elevated console fails with os error 740
+  (`ERROR_ELEVATION_REQUIRED`) instead of prompting — silent/automated
+  installs must therefore run from an already elevated context (which is what
+  deployment systems do anyway). `taskman-setup.exe` is `test = false` for the
+  same reason.
+- **Install directory is fixed** at `%ProgramFiles%\TaskMan` and `/D=` is
+  rejected with an explanation: the broker pins the installed GUI/service
+  path (see `core-service.md`), so a custom directory would break the service
+  contract. `install_dir()` in `win.rs` must stay identical to the helper's.
+- **Uninstall** removes the SCM service through the installed helper
+  (`--core-service=uninstall`; a `windows-service`-based delete is the
+  fallback when `taskman.exe` is already gone), then shortcuts, the ARP key,
+  `%ProgramData%\TaskMan` (best-effort) and the install tree. Per-user
+  settings are preserved (they live in the user profile). Because the ARP
+  entry runs the uninstaller FROM the install tree, a running image cannot
+  delete itself: the uninstaller renames itself out of the tree first (a
+  running image can be renamed, not deleted) and schedules its own removal at
+  reboot.
+- **Upgrade** is just install again: the helper stops the old service
+  generation before replacing files; settings survive because they never live
+  in the install tree.
+- **Silent/CLI:** `/S`, `--uninstall`, `--no-start-menu`, `--desktop`,
+  `--launch`, `--no-service`, `--dry-run`, `--help`. Unknown flags fail
+  loudly. Progress is written to `%ProgramData%\TaskMan\logs\setup.log`
+  (fallback `%TEMP%\taskman-setup.log`), best-effort like the service log.
+
+## Theming and wizard structure
+
+The wizard uses `tm-ui` (moved out of `tm-app/src/theme.rs` + `fonts.rs`), so
+palette, text-weight tuning and fonts are literally the app's: proper
+Windows 11 dark and light mode via `theme::apply_startup`
+(`ThemePreference::System`). Renderer: eframe `software` only — short-lived
+window, no GPU dependency, and the only backend that does sub-pixel text.
+The product icon is shared with the app (`app.res` is linked into
+`taskman-setup.exe`, `icon_64.raw` paints the header logo and the window
+icon).
+
+Layout mirrors the green-curve setup: header band (product icon + name +
+accent-colored version), content area (`pal.window_bg`), footer button row
+(Back / Next / Cancel, right-aligned). The license review page shows the
+repository `LICENSE` and gates Next behind "I accept the terms of the MIT
+license".
+
+The header and footer MUST stay `Panel::top` / `Panel::bottom` chrome: the
+first version stacked them vertically with a content `ScrollArea
+::auto_shrink(false)`, which consumes the entire remaining height and pushed
+the footer out of the clip rect (invisible buttons).
+
+## Testing and verification
+
+- `cargo test -p tm-installer`: payload round trip, corruption/traversal
+  rejection, `embed`/`Archive::open` filesystem round trip, CLI parsing,
+  step-plan shape (including "service install is in the default plan").
+- `taskman-setup.exe` cannot run as an unelevated test harness (the manifest
+  makes Windows return os error 740), so the bin target is `test = false`;
+  the behavior beyond the unit tests is exercised via `--dry-run` and a real
+  install/uninstall pass on a Windows machine.
+- GUI appearance cannot be verified headlessly; confirm dark/light manually.
+
+## Open questions / accepted limits
+
+- Wizard strings are English-only for now; the app itself is DE/EN
+  (i18n follow-up candidate).
+- No custom install directory (`/D=`), by the security constraint above.
+- No code signing; same posture as the rest of the release artifacts.

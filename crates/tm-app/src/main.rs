@@ -19,7 +19,6 @@ compile_error!("tm-app requires at least one renderer feature: `software`, `wgpu
 mod action_executor;
 mod app;
 mod app_ui;
-mod fonts;
 mod icon_cache;
 mod icons;
 /// Headless CPU rendering of the real widgets; see the module docs.
@@ -32,9 +31,14 @@ mod tabs;
 /// Side-by-side comparison of the text-smoothing profiles; see the module docs.
 #[cfg(test)]
 mod text_compare;
-mod theme;
 mod ui_state;
 mod widgets;
+
+// Theme palette and font setup live in `tm-ui` so the setup installer renders
+// the exact same Windows 11 look; re-exported here so the existing
+// `crate::theme` / `crate::fonts` paths keep working unchanged.
+pub use tm_ui::fonts;
+pub use tm_ui::theme;
 
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::Instant;

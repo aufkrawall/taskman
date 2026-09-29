@@ -15,8 +15,8 @@
 //! a stem fully inside one pixel column. [`hinting_target`] turns that back on
 //! for the sharp profile.
 
-use eframe::egui::epaint::text::{FontTweak, HintingTarget, SmoothHinting, VariationCoords};
-use eframe::egui::{self, FontData, FontDefinitions};
+use egui::epaint::text::{FontTweak, HintingTarget, SmoothHinting, VariationCoords};
+use egui::{self, FontData, FontDefinitions};
 use std::sync::Arc;
 use tm_core::settings::TextSmoothing;
 

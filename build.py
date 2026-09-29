@@ -4,6 +4,11 @@
 Default behavior (`python build.py`): build the host and Linux x86_64 release
 (where a cross toolchain is available), then package platform artifacts.
 `--all-targets` additionally builds Windows ARM64 and Linux ARM64.
+
+Windows builds also produce the self-contained setup installer
+(`dist/taskman-v<version>-windows-<arch>-setup.exe`): a single 100%-Rust
+`taskman-setup.exe` with the application payload embedded and SHA-256
+verified at install time.
 """
 
 from __future__ import annotations
@@ -388,6 +393,42 @@ def package_tar(name: str, files: list[tuple[Path, str]]) -> Path:
     return dest
 
 
+def package_setup(
+    profile: str, gui_exe: Path, service_exe: Path, label: str, version: str
+) -> Path | None:
+    """Build one self-contained setup installer (Windows only).
+
+    `taskman-setup.exe` (linked for gui_exe's target) gets the payload archive
+    appended by the HOST `taskman-payload` tool, so an x64 host can package an
+    ARM64 installer. Archive writer and reader live in one Rust crate
+    (`crates/tm-installer`), so the format cannot drift between the two.
+    """
+    setup_exe = gui_exe.with_name("taskman-setup.exe")
+    if not setup_exe.exists():
+        log(f"setup binary missing after build: {setup_exe}")
+        return None
+    out_dir = ROOT / "target" / ("debug" if profile == "dev" else profile)
+    payload_tool = out_dir / "taskman-payload.exe"
+    if not payload_tool.exists():
+        log(f"payload tool missing after build: {payload_tool}")
+        return None
+    DIST.mkdir(exist_ok=True)
+    dest = DIST / f"taskman-v{version}-{label}-setup.exe"
+    command = [
+        str(payload_tool),
+        str(setup_exe),
+        str(dest),
+        f"taskman.exe={gui_exe}",
+        f"taskman-service.exe={service_exe}",
+    ]
+    license_file = ROOT / "LICENSE"
+    if license_file.exists():
+        command.append(f"LICENSE={license_file}")
+    if not run(command):
+        return None
+    return dest
+
+
 def audit_scan() -> bool:
     """Dependency-advisory and secrets scanning (opt-in `--audit`).
 
@@ -567,6 +608,7 @@ def main() -> int:
             log(f"host binary ready: {exe}")
             arc = "taskman.exe" if exe.suffix == ".exe" else "taskman"
             host_files = [(exe, arc)]
+            windows_service_exe: Path | None = None
             if platform.system() == "Windows":
                 service_exe = exe.with_name("taskman-service.exe")
                 if not service_exe.exists():
@@ -574,11 +616,20 @@ def main() -> int:
                     failures += 1
                 else:
                     host_files.append((service_exe, "taskman-service.exe"))
+                    windows_service_exe = service_exe
             if platform.system() == "Linux" and LINUX_DESKTOP.exists():
                 host_files.append(
                     (LINUX_DESKTOP, "share/applications/io.github.aufkrawall.Taskman.desktop")
                 )
             artifacts.append((f"taskman-v{version}-{host_tag()}", host_files))
+            if windows_service_exe is not None and not args.no_package:
+                setup = package_setup(
+                    profile, exe, windows_service_exe, host_tag(), version
+                )
+                if setup is None:
+                    failures += 1
+                else:
+                    log(f"setup installer ready: {setup}")
 
     # Windows ARM64: a Windows x64 host cross-builds it with the MSVC ARM64
     # toolset. On an ARM64 host the host artifact already IS the ARM64 build.
@@ -602,6 +653,12 @@ def main() -> int:
             else:
                 files.append((service_exe, "taskman-service.exe"))
             artifacts.append((f"taskman-v{version}-windows-arm64", files))
+            if service_exe.exists() and not args.no_package:
+                setup = package_setup(profile, exe, service_exe, "windows-arm64", version)
+                if setup is None:
+                    failures += 1
+                else:
+                    log(f"setup installer ready: {setup}")
 
     if linux_requested:
         exe, attempted, flavor = build_linux(profile)

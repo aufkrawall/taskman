@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/tm-core", "crates/tm-platform", "crates/tm-app", "crates/tm-service"]
+members = ["crates/tm-core", "crates/tm-platform", "crates/tm-ui", "crates/tm-app", "crates/tm-service", "crates/tm-installer"]
 # `vendor/egui` is our egui fork (see llm-wiki/render-pipeline.md). It carries its own
 # [workspace] and uses `workspace = true` field inheritance plus relative path deps, so it
 # must stay a separate workspace; it is reached only through [patch.crates-io] below.
@@ -17,10 +17,14 @@ license = "MIT"
 [workspace.dependencies]
 tm-core = { path = "crates/tm-core" }
 tm-platform = { path = "crates/tm-platform" }
+tm-ui = { path = "crates/tm-ui" }
 
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
+# Pure-Rust deflate (miniz_oxide backend): the installer payload archive must
+# stay free of native compression libraries ("100% Rust" installer).
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 dirs = "6"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "local-time"] }

@@ -31,8 +31,13 @@ Primary sources:
    because `libloading` emits `-ldl`, which musl folds into libc. The Linux
    step is skipped only when neither path is available (or with
    `--host-only`); `--require-all-targets` makes a skip fatal.
-3. Packaging into `dist/`: Windows → `.zip` containing the GUI and service;
-   Linux → `.tar.gz`, named `taskman-v<version>-<platform>`.
+3. Packaging into `dist/`: Windows → `.zip` containing the GUI and service
+   plus the self-contained setup installer
+   `taskman-v<version>-<platform>-setup.exe` (see `installer.md`); Linux →
+   `.tar.gz`, named `taskman-v<version>-<platform>`. The setup artifact is
+   built by the same workspace build (`taskman-setup.exe` is linked for the
+   artifact's target) and gets its payload appended by the HOST
+   `taskman-payload` tool, so `--no-package` also skips it.
 
 Flags: `--host-only`, `--linux-only`, `--all-targets`, `--debug`,
 `--no-package`, `--require-all-targets`, `--check`, `--audit`,
@@ -63,8 +68,10 @@ Flags: `--host-only`, `--linux-only`, `--all-targets`, `--debug`,
    `dist/taskman-vX.Y.Z-windows-x86_64.zip`,
    `dist/taskman-vX.Y.Z-windows-arm64.zip`,
    `dist/taskman-vX.Y.Z-linux-x86_64[-musl].tar.gz` and
-   `dist/taskman-vX.Y.Z-linux-arm64.tar.gz`. Write
-   `<sha256>  <filename>` next to each archive.
+   `dist/taskman-vX.Y.Z-linux-arm64.tar.gz`, plus the Windows setup
+   installers `dist/taskman-vX.Y.Z-windows-x86_64-setup.exe` and
+   `dist/taskman-vX.Y.Z-windows-arm64-setup.exe`. Write
+   `<sha256>  <filename>` next to each archive and installer.
 4. Publish with the GitHub CLI:
    `gh release create vX.Y.Z --target <bump-sha> --title 'TaskMan vX.Y.Z'
    --notes-file <notes> --latest <archives + .sha256 files>`. This creates

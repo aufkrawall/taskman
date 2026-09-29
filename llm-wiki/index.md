@@ -1,12 +1,13 @@
 # llm-wiki Index
 
-Last cross-checked: 2026-09-11 (disk column names and machine totals)
+Last cross-checked: 2026-09-29 (installer + tm-ui crate addition)
 
 Primary sources:
 
 - `AGENTS.md`
 - `Cargo.toml`, `build.py`
-- `crates/tm-core`, `crates/tm-platform`, `crates/tm-app`, `crates/tm-service`
+- `crates/tm-core`, `crates/tm-platform`, `crates/tm-ui`, `crates/tm-app`,
+  `crates/tm-service`, `crates/tm-installer`
 - tests beside each subsystem
 
 ## Purpose and trust model
@@ -29,6 +30,9 @@ When they disagree, code and observed behavior win.
 - `repo-map.md` — crate/module ownership, high-risk files, and test matrix.
 - `core-service.md` — privileged broker, IPC trust boundary, filesystem ACLs,
   install/upgrade/uninstall lifecycle, and fallback behavior.
+- `installer.md` — the self-contained Windows setup (`taskman-setup.exe`):
+  payload format, service-helper contract reuse, elevation model, uninstall
+  self-relocation, and silent flags.
 - `module-unload.md` — destructive module-unload contract, identity checks,
   and force-unload semantics.
 - `build.md` — release driver, packaging, profile and renderer policy.

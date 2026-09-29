@@ -2,6 +2,30 @@
 
 ## Unreleased
 
+### New
+
+- **Windows setup installer (`taskman-setup.exe`):** releases now ship a
+  self-contained, 100%-Rust setup executable (modeled on the green-curve
+  installer) as `dist/taskman-v<version>-windows-<arch>-setup.exe`. It
+  installs Task Manager to the protected `%ProgramFiles%\TaskMan` location,
+  optionally registers and starts the background service so the first GUI
+  start reaches the broker without a UAC prompt, creates Start menu and
+  opt-in desktop shortcuts, registers an uninstall entry in Settings > Apps,
+  and upgrades existing installations in place while preserving settings.
+  The wizard mirrors the app's Windows 11 dark and light theming (shared
+  `tm-ui` theme, product icon, header/footer bands) and reviews the MIT
+  license before installing. Unattended
+  use: `/S`, `--uninstall`, `--no-start-menu`, `--desktop`, `--launch`,
+  `--no-service`, `--dry-run`. The install directory is fixed (`/D=` is
+  rejected with an explanation) because the service is pinned to the
+  protected location. The embedded payload is deflate-compressed and SHA-256
+  verified before any file is written; uninstall moves the running uninstaller
+  out of the install tree instead of leaving files behind.
+- **Shared theme crate (`tm-ui`):** the Windows-11-Task-Manager palette and
+  OS-native font setup moved out of `tm-app` into a shared crate so the setup
+  installer renders from the same theme source as the app. `tm-app` re-exports
+  both modules unchanged.
+
 ## 0.1.15 - 2026-09-27
 
 ### New

@@ -1,4 +1,46 @@
 
+- 2026-09-29: Added the self-contained Windows setup installer
+  (`taskman-setup.exe`, `crates/tm-installer`) and moved the theme into shared
+  `crates/tm-ui`.
+  - Green-curve-style custom installer, 100% Rust: eframe wizard (software
+    renderer only) rendering with the app's own theme and fonts via `tm-ui`,
+    embedded deflate payload (miniz_oxide) with per-entry SHA-256 verification
+    before anything is written, silent `/S` + `--uninstall` + shortcut/launch
+    flags, ARP uninstall entry, in-place upgrade.
+  - Service registration is intentionally NOT reimplemented: install runs the
+    app's elevated `--core-service=install --core-service-user=<sid>` helper
+    (pinned copy, ACLs, broker manifest, SCM start), so the hardened service
+    lifecycle keeps one owner. `--no-service` copies the two binaries directly
+    (the app can register later from Settings with UAC). The default install
+    includes the service, so the first GUI start needs no UAC prompt.
+  - Install dir is fixed at `%ProgramFiles%\TaskMan` and `/D=` is refused with
+    an explanation: the broker pins the installed GUI/service path (the
+    `install_dir` twin in `tm-installer/src/win.rs` must not drift). Uninstall
+    renames the running uninstaller out of the install tree (a running image
+    can be renamed, not deleted) and schedules its own deletion at reboot;
+    per-user settings survive uninstall.
+  - `taskman-setup` gets a requireAdministrator manifest via per-bin
+    `cargo:rustc-link-arg-bin` in build.rs, so `taskman-payload` (build.py's
+    host-side embedder) stays unelevated. The setup bin target is
+    `test = false`: Windows refuses to launch its test harness unelevated
+    (os error 740), which is itself the proof the manifest works.
+  - `build.py package_setup()` produces
+    `dist/taskman-v<version>-windows-<arch>-setup.exe` for x64 and ARM64 (the
+    embedder runs on the host, so an x64 host packages ARM64). Archive writer
+    and reader live in one crate (`payload.rs` + `taskman-payload`), so the
+    format cannot drift.
+  - Verified headlessly: payload round trip incl. filesystem `embed`/`open`,
+    tamper/traversal/truncation rejection, CLI parsing, install step plans,
+    and a real embed smoke on debug exes. GUI appearance (dark/light) and a
+    real install/uninstall pass need user confirmation.
+  - Visual rework after the first GUI review (compared against the
+    green-curve installer): header/footer bands as `Panel::top`/`Panel::bottom`
+    chrome — the stacked footer had been pushed out of the clip rect by the
+    content `ScrollArea::auto_shrink(false)` (invisible buttons) — plus the
+    product icon in title bar and header (shared `app.res`/`icon_64.raw`),
+    an MIT license review that gates Next, the Back/Next/Cancel button row,
+    and the version in the window title.
+
 - 2026-09-27: Released v0.1.15 (tag on `b4f2b3d`, the bump commit). Followed `build.md` §Publishing path: `--check` + `--audit` green, stable clippy green, bump pushed on main, `build.py --all-targets` for archives (Windows x86_64, Windows ARM64, Linux x86_64 musl), `.sha256` generated beside each, `gh release create --latest` with target `b4f2b3d649615352becaee20c8a449d4af3087d6`. Release covers: full keyboard controllability across all tabs and lists, native Task Manager table multi-selection and paging, context menu keyboard focus and trapped arrow navigation, cyclic Tab and F6 landmark navigation, keyboard-scrubbable Performance charts, modal dialog focus containment, screen reader / AccessKit support, and elimination of mid-frame visual selection flicker.
 
 - 2026-09-27: Context menu keyboard focus acquisition and arrow navigation.
