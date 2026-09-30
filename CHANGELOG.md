@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.1.16 - 2026-09-30
+
 ### New
 
 - **Windows setup installer (`taskman-setup.exe`):** releases now ship a
