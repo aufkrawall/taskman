@@ -50,6 +50,14 @@
   showed an opaque "service-specific error 1", the real reason sat in an
   admin-only log, and SCM kept restarting the service once per minute
   indefinitely. Ordinary broker failures are unchanged.
+- **Setup wizard spacing:** the installer's body content is now inset to match
+  the header/footer bands and each option's description is indented under its
+  checkbox, so no text hugs the window's rounded edge or reads as truncated /
+  overlapping against the surrounding labels.
+- **Single launch prompt:** "run Task Manager when setup completes" is now
+  offered once, as the Options checkbox. The completion page no longer repeats
+  it with a separate "Launch Task Manager" button — the checkbox already starts
+  the app at the end of the install.
 
 ## 0.1.15 - 2026-09-27
 

@@ -219,7 +219,14 @@ impl SetupApp {
         header_band(ui, &pal, self);
         let footer = footer_band(ui, &pal, self);
         egui::CentralPanel::default()
-            .frame(egui::Frame::NONE.fill(pal.window_bg))
+            .frame(
+                // Match the header/footer bands' 18px horizontal inset so body
+                // content lines up with the chrome instead of hugging the
+                // window's rounded edge (where it read as slightly truncated).
+                egui::Frame::NONE
+                    .fill(pal.window_bg)
+                    .inner_margin(egui::Margin::symmetric(18, 0)),
+            )
             .show(ui, |ui| {
                 egui::ScrollArea::vertical()
                     .auto_shrink(false)
@@ -345,17 +352,11 @@ fn footer_band(ui: &mut egui::Ui, pal: &theme::Palette, app: &mut SetupApp) -> V
                             btn(ui, "Working...", false);
                         }
                         Page::Done => {
+                            // Only "Close" here: "Launch Task Manager when setup
+                            // completes" on the Options page already starts the
+                            // app at the end of the install (see `install.rs`), so
+                            // offering a second launch button would ask twice.
                             if btn(ui, "Close", true).clicked() {
-                                ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
-                            }
-                            let success = matches!(&app.finished, Some(Ok(())));
-                            if success
-                                && app.opts.mode == Mode::Install
-                                && btn(ui, "Launch Task Manager", true).clicked()
-                            {
-                                if let Some(dir) = install::install_dir_for_display() {
-                                    let _ = crate::win::launch(&dir.join("taskman.exe"));
-                                }
                                 ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
                             }
                         }
@@ -453,14 +454,26 @@ fn options_page(ui: &mut egui::Ui, pal: &theme::Palette, app: &mut SetupApp) {
         &mut app.opts.service,
         egui::RichText::new("Install background service (recommended)").size(13.0),
     ));
-    ui.label(
-        egui::RichText::new(
-            "Registers the TaskManCore service so Task Manager can control \
-             processes without UAC prompts.",
-        )
-        .size(11.0)
-        .color(pal.text_dim),
-    );
+    // Indent the note to sit under the checkbox's label (not at the margin) so
+    // it reads as a subordinate detail of the option above it. The 18px inset
+    // matches the checkbox label offset (`Spacing::indent`).
+    egui::Frame::NONE
+        .inner_margin(egui::Margin {
+            left: 18,
+            right: 0,
+            top: 0,
+            bottom: 0,
+        })
+        .show(ui, |ui| {
+            ui.label(
+                egui::RichText::new(
+                    "Registers the TaskManCore service so Task Manager can control \
+                     processes without UAC prompts.",
+                )
+                .size(11.0)
+                .color(pal.text_dim),
+            );
+        });
     ui.add_space(6.0);
     ui.add(egui::Checkbox::new(
         &mut app.opts.start_menu,
@@ -660,6 +673,132 @@ mod tests {
             enabled(&buttons, "Next >"),
             "accepting the license must enable Next"
         );
+    }
+
+    /// Collect the `(text, rect)` of every text the frame painted, by walking
+    /// the paint shapes. Used to pin spacing/alignment invariants that are hard
+    /// to express through widget responses alone.
+    fn collect_texts(shape: &egui::Shape, out: &mut Vec<(String, egui::Rect)>) {
+        match shape {
+            egui::Shape::Text(ts) => {
+                let rect = ts.galley.rect.translate(ts.pos.to_vec2());
+                let text: String = ts
+                    .galley
+                    .rows
+                    .iter()
+                    .map(|r| r.text())
+                    .collect::<Vec<_>>()
+                    .join("");
+                out.push((text, rect));
+            }
+            egui::Shape::Vec(v) => {
+                for s in v {
+                    collect_texts(s, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Render `app` in a windowless context and return the text it painted.
+    /// Two passes: egui resolves layout from the previous frame, so the first
+    /// is warm-up.
+    fn painted_texts(ctx: &egui::Context, app: &mut SetupApp) -> Vec<(String, egui::Rect)> {
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(W, H),
+            )),
+            ..Default::default()
+        };
+        let mut texts = Vec::new();
+        for _ in 0..2 {
+            let mut out = ctx.run_ui(input.clone(), |root| {
+                let _ = app.draw(root);
+            });
+            // Layout only: nothing paints here, so the glyph/icon texture
+            // upload deltas are discarded explicitly (epaint insists).
+            out.textures_delta.clear();
+            texts.clear();
+            for cs in &out.shapes {
+                collect_texts(&cs.shape, &mut texts);
+            }
+        }
+        texts
+    }
+
+    /// The rectangle of the first painted text that starts with `prefix`.
+    fn text_rect<'a>(texts: &'a [(String, egui::Rect)], prefix: &str) -> &'a egui::Rect {
+        &texts
+            .iter()
+            .find(|(t, _)| t.starts_with(prefix))
+            .unwrap_or_else(|| panic!("no painted text starting with {prefix:?}"))
+            .1
+    }
+
+    /// Regression: the content panel used to have zero inner margin, so body
+    /// text hugged the window's rounded edge (reading as truncated/overlapping)
+    /// and sat misaligned with the 18px-inset header and footer bands. Every
+    /// body line must be inset from both window edges like the chrome is.
+    #[test]
+    fn body_content_is_inset_from_the_window_edges() {
+        let (ctx, mut app) = harness();
+        for page in [Page::Welcome, Page::Options, Page::Working, Page::Done] {
+            app.page = page;
+            app.finished = Some(Ok(()));
+            app.license_accepted = true;
+            let texts = painted_texts(&ctx, &mut app);
+            for (text, rect) in &texts {
+                assert!(
+                    rect.min.x >= 12.0 && rect.max.x <= W - 12.0,
+                    "{page:?}: {text:?} spans x {}..{} and touches the window edge",
+                    rect.min.x,
+                    rect.max.x
+                );
+            }
+        }
+    }
+
+    /// Regression: the option's description is a subordinate detail of its
+    /// checkbox and must be indented under the label, not sit at the margin.
+    #[test]
+    fn option_description_is_indented_under_its_checkbox_label() {
+        let (ctx, mut app) = harness();
+        app.page = Page::Options;
+        app.finished = Some(Ok(()));
+        let texts = painted_texts(&ctx, &mut app);
+        let label_x = text_rect(&texts, "Install background service").min.x;
+        let desc_x = text_rect(&texts, "Registers the TaskManCore").min.x;
+        assert!(
+            desc_x > label_x - 1.0 && desc_x < label_x + 1.0,
+            "description starts at x={desc_x} but its checkbox label starts at x={label_x}; \
+             the description must align under the label"
+        );
+    }
+
+    /// Regression: "run Task Manager after install" is offered exactly once -
+    /// as the Options checkbox. The Done page must not ask a second time with a
+    /// launch button; it only needs "Close".
+    #[test]
+    fn done_page_does_not_ask_a_second_time_to_launch() {
+        let (ctx, mut app) = harness();
+        app.page = Page::Done;
+        app.finished = Some(Ok(()));
+        let buttons = footer_buttons(&ctx, &mut app);
+        let labels: Vec<&str> = buttons.iter().map(|(label, _, _)| *label).collect();
+        assert!(
+            !labels.contains(&"Launch Task Manager"),
+            "Done page must not repeat the launch option the checkbox covers; got {labels:?}"
+        );
+        assert_eq!(
+            labels,
+            ["Close"],
+            "a successful install only needs a Close button"
+        );
+        // The checkbox that actually drives the post-install launch stays.
+        app.page = Page::Options;
+        let texts = painted_texts(&ctx, &mut app);
+        text_rect(&texts, "Launch Task Manager when setup completes");
     }
 
     /// A bare build output must be refused up front - before the wizard lets
