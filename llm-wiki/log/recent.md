@@ -1,3 +1,15 @@
+- 2026-09-30: Released v0.1.16 (tag on `b669477`, the bump commit). Followed
+  `build.md` §Publishing path: `--check` + `--audit` green, stable clippy
+  green, bump pushed on main, `build.py --all-targets` for archives (Windows
+  x86_64/ARM64, Linux x86_64 musl) and setup installers (`taskman-v0.1.16-windows-x86_64-setup.exe`,
+  `taskman-v0.1.16-windows-arm64-setup.exe`), `.sha256` generated beside each,
+  `gh release create --latest` with target `b6694776a42f29a0933c2ca3c940275809c939c8`.
+  Release covers: new self-contained Windows setup installer (`taskman-setup.exe`),
+  shared theme crate (`tm-ui`), core service plain Automatic start type, distinct
+  install-integrity SCM exit codes and GUI diagnostics, and setup wizard layout
+  and spacing polish. Verified packaged archives and setup installers: `taskman.exe`
+  and `taskman-service.exe` in Windows zip pass `--selfcheck` (`--mock`), setup
+  installers pass `taskman-payload verify`.
 
 - 2026-09-29: Core service now installs as plain `Automatic` instead of
   "Automatic (Delayed Start)" (`core_service.rs::install`). Trigger: a
