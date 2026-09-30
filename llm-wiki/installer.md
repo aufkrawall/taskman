@@ -125,7 +125,14 @@ the footer out of the clip rect (invisible buttons).
   the viewport on every page (the first wizard version pushed the row out of
   the window), Next is disabled until the license is accepted, and a
   payload-less exe is refused up front. `eframe::App::ui` is a thin wrapper
-  around `draw()` exactly so the tests exercise the shipped layout.
+  around `draw()` exactly so the tests exercise the shipped layout. They also
+  walk the painted `Shape::Text` galleys (`painted_texts`/`collect_texts`) to
+  pin spacing that widget responses can't express: body content stays inset
+  from both window edges (the content panel's `Frame` inner margin must match
+  the header/footer bands' 18px), each option's description is indented under
+  its checkbox label, and the Done page offers only "Close" — the "run Task
+  Manager when setup completes" Options checkbox is the single launch prompt
+  (it drives `install.rs`'s post-install launch), never a second button.
 - `taskman-payload verify <setup.exe>` re-parses a finished artifact and
   hash-checks every embedded entry; `build.py` runs it after packaging, so a
   broken artifact never reaches `dist/`.
