@@ -22,6 +22,7 @@ import subprocess
 import sys
 import tarfile
 import zipfile
+from functools import cache
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
@@ -139,8 +140,26 @@ CROSS_CHECK_TARGETS = [
 RENDERER_FEATURE_CHECKS = ["software", "wgpu", "glow"]
 
 
+@cache
 def host_target() -> str:
-    """Best-effort Rust host triple for the current machine."""
+    """Use the active Rust compiler, including under a restricted environment."""
+    rustc = shutil.which("rustc")
+    if rustc is None:
+        exe = "rustc.exe" if platform.system() == "Windows" else "rustc"
+        fallback = Path.home() / ".cargo" / "bin" / exe
+        if fallback.is_file():
+            rustc = str(fallback)
+    if rustc:
+        try:
+            proc = subprocess.run([rustc, "-vV"], capture_output=True, text=True, cwd=ROOT)
+        except OSError:
+            proc = None
+        if proc is not None and proc.returncode == 0:
+            for line in proc.stdout.splitlines():
+                if line.startswith("host: "):
+                    target = line.removeprefix("host: ").strip()
+                    if re.fullmatch(r"[a-zA-Z0-9_]+(?:-[a-zA-Z0-9_]+)+", target):
+                        return target
     system = platform.system()
     machine = platform.machine().lower()
     arch = {
@@ -149,6 +168,8 @@ def host_target() -> str:
         "arm64": "aarch64",
         "aarch64": "aarch64",
     }.get(machine, machine)
+    if not arch:
+        raise SystemExit("cannot determine the Rust host architecture; check rustc -vV")
     if system == "Windows":
         return f"{arch}-pc-windows-msvc"
     if system == "Darwin":
@@ -310,7 +331,7 @@ def build_windows_arm64(profile: str) -> Path | None:
     if platform.system() != "Windows":
         log("windows arm64 build requires a Windows host - skipping")
         return None
-    if platform.machine().lower() in ("arm64", "aarch64"):
+    if host_target().startswith("aarch64-"):
         # The host build already produced the ARM64 binaries.
         return None
     if WINDOWS_ARM64_TARGET not in installed_rust_targets():
@@ -340,7 +361,13 @@ def build_windows_arm64(profile: str) -> Path | None:
 def build_host(profile: str) -> Path | None:
     exe_name = "taskman.exe" if platform.system() == "Windows" else "taskman"
     out_dir = ROOT / "target" / ("debug" if profile == "dev" else profile)
-    env = release_rustflags(platform.system() == "Windows") if profile != "dev" else None
+    env = (
+        release_rustflags(
+            platform.system() == "Windows", arm64=host_target().startswith("aarch64-")
+        )
+        if profile != "dev"
+        else None
+    )
     if not run([cargo(), "build", "--profile", profile, "--workspace"], env=env):
         return None
     exe = out_dir / exe_name
@@ -580,7 +607,8 @@ def main() -> int:
         return 1
 
     if args.check:
-        ok = run([cargo(), "fmt", "--all", "--", "--check"])
+        ok = run([sys.executable, str(ROOT / "tools" / "tests" / "test_build_host.py")])
+        ok &= run([cargo(), "fmt", "--all", "--", "--check"])
         ok &= run(
             [
                 cargo(),
@@ -641,7 +669,7 @@ def main() -> int:
     # toolset. On an ARM64 host the host artifact already IS the ARM64 build.
     windows_arm64_possible = (
         platform.system() == "Windows"
-        and platform.machine().lower() not in ("arm64", "aarch64")
+        and not host_target().startswith("aarch64-")
     )
     if args.all_targets and host_requested and windows_arm64_possible:
         exe = build_windows_arm64(profile)
@@ -716,13 +744,7 @@ def main() -> int:
 
 def host_tag() -> str:
     system = platform.system().lower()
-    machine = platform.machine().lower()
-    arch = {
-        "amd64": "x86_64",
-        "x86_64": "x86_64",
-        "arm64": "aarch64",
-        "aarch64": "aarch64",
-    }.get(machine, machine)
+    arch = host_target().split("-", 1)[0]
     return f"{system}-{arch}"
 
 

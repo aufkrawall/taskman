@@ -4,7 +4,7 @@ Last cross-checked: 2026-09-25
 
 ## Summary
 
-Windows Task Manager-style desktop app (Rust, eframe/egui), four-crate
+Windows Task Manager-style desktop app (Rust, eframe/egui), six-crate
 workspace with a separate optional Windows core-service executable. The large
 audit/implementation plan that used to live in `implement.md` (deleted in
 `fc4ecb7c`; see `repo-map.md`) was implemented to the extent verifiable without

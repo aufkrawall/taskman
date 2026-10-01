@@ -641,10 +641,22 @@ fn sparkline_y_max(samples: &[f64]) -> f64 {
 /// then (`Palette::card_bg_sunken`); handing back `card_bg` would make the
 /// cell the same colour as the card and dissolve the graph into the row at
 /// exactly the moment the pointer is on it.
+#[cfg(test)]
 pub fn paint_sparkline(
     ui: &egui::Ui,
     rect: egui::Rect,
     samples: &[f64],
+    color: Color32,
+    cell_bg: Color32,
+) {
+    let measured: Vec<_> = samples.iter().copied().map(Some).collect();
+    paint_sparkline_with_gaps(ui, rect, &measured, color, cell_bg);
+}
+
+pub fn paint_sparkline_with_gaps(
+    ui: &egui::Ui,
+    rect: egui::Rect,
+    samples: &[Option<f64>],
     color: Color32,
     cell_bg: Color32,
 ) {
@@ -666,21 +678,26 @@ pub fn paint_sparkline(
     }
 
     let n = samples.len();
-    let y_max = sparkline_y_max(samples);
+    let values: Vec<_> = samples.iter().filter_map(|value| *value).collect();
+    let y_max = sparkline_y_max(&values);
     let x = |i: usize| rect.left() + rect.width() * i as f32 / (n - 1) as f32;
     let y = |v: f64| {
         let v = if v.is_finite() { v.max(0.0) } else { 0.0 };
         rect.bottom() - (v.min(y_max) / y_max) as f32 * rect.height()
     };
 
-    let pts: Vec<Pos2> = samples
-        .iter()
-        .enumerate()
-        .map(|(i, v)| Pos2::new(x(i), y(*v)))
-        .collect();
-
-    fill_area_to_baseline(&painter, &pts, rect.bottom(), area_fill(color));
-    painter.add(Shape::line(pts, Stroke::new(1.25, color)));
+    for run in measured_runs(samples) {
+        let pts: Vec<_> = run
+            .into_iter()
+            .map(|(i, v)| Pos2::new(x(i), y(v)))
+            .collect();
+        if pts.len() == 1 {
+            painter.circle_filled(pts[0], 1.25, color);
+        } else {
+            fill_area_to_baseline(&painter, &pts, rect.bottom(), area_fill(color));
+            painter.add(Shape::line(pts, Stroke::new(1.25, color)));
+        }
+    }
 }
 
 /// Per-logical-processor tile: bordered, faint horizontal grid, filled area.
@@ -847,7 +864,7 @@ pub fn core_chart_grouped(
 
 /// One owned series for [`chart_multi`].
 pub struct MultiSeries {
-    pub samples: Vec<f64>,
+    pub samples: Vec<Option<f64>>,
     pub color: Color32,
     /// Name shown in the hover readout. Empty for a chart whose single series
     /// needs no naming beyond its caption.
@@ -856,12 +873,33 @@ pub struct MultiSeries {
 
 impl MultiSeries {
     pub fn new(label: impl Into<String>, samples: Vec<f64>, color: Color32) -> Self {
+        Self::with_gaps(label, samples.into_iter().map(Some).collect(), color)
+    }
+
+    pub fn with_gaps(label: impl Into<String>, samples: Vec<Option<f64>>, color: Color32) -> Self {
         Self {
             samples,
             color,
             label: label.into(),
         }
     }
+}
+
+/// Separate measured runs so neither the line nor its fill bridges missing data.
+fn measured_runs(samples: &[Option<f64>]) -> Vec<Vec<(usize, f64)>> {
+    let mut runs = Vec::new();
+    let mut run = Vec::new();
+    for (index, value) in samples.iter().enumerate() {
+        if let Some(value) = value.filter(|value| value.is_finite()) {
+            run.push((index, value));
+        } else if !run.is_empty() {
+            runs.push(std::mem::take(&mut run));
+        }
+    }
+    if !run.is_empty() {
+        runs.push(run);
+    }
+    runs
 }
 
 /// Bordered chart with several filled series sharing one y scale
@@ -955,13 +993,15 @@ pub fn chart_multi(
         if n < 2 {
             continue;
         }
-        let pts: Vec<Pos2> = s
-            .samples
-            .iter()
-            .enumerate()
-            .map(|(i, v)| Pos2::new(x_at(i, n), y(*v)))
-            .collect();
-        fill_area_to_baseline(&painter, &pts, rect.bottom(), area_fill(s.color));
+        for run in measured_runs(&s.samples) {
+            if run.len() >= 2 {
+                let pts: Vec<Pos2> = run
+                    .into_iter()
+                    .map(|(i, v)| Pos2::new(x_at(i, n), y(v)))
+                    .collect();
+                fill_area_to_baseline(&painter, &pts, rect.bottom(), area_fill(s.color));
+            }
+        }
     }
     // Lines in a SECOND pass: an outer series' translucent fill must never
     // dim an inner series' line (the old single-pass order made overlapping
@@ -971,13 +1011,17 @@ pub fn chart_multi(
         if n < 2 {
             continue;
         }
-        let pts: Vec<Pos2> = s
-            .samples
-            .iter()
-            .enumerate()
-            .map(|(i, v)| Pos2::new(x_at(i, n), y(*v)))
-            .collect();
-        painter.add(Shape::line(pts, Stroke::new(1.25, s.color)));
+        for run in measured_runs(&s.samples) {
+            let pts: Vec<Pos2> = run
+                .into_iter()
+                .map(|(i, v)| Pos2::new(x_at(i, n), y(v)))
+                .collect();
+            if pts.len() == 1 {
+                painter.circle_filled(pts[0], 1.25, s.color);
+            } else {
+                painter.add(Shape::line(pts, Stroke::new(1.25, s.color)));
+            }
+        }
     }
 
     // Hover: every series' value at the pointer, in a box AT the pointer.
@@ -1019,9 +1063,11 @@ pub fn chart_multi(
                 rows.push(ReadoutRow {
                     color: s.color,
                     label: s.label.clone(),
-                    value: fmt(*v),
+                    value: v.filter(|v| v.is_finite()).map_or_else(|| "—".into(), fmt),
                 });
-                dots.push((y(*v), s.color));
+                if let Some(v) = v.filter(|v| v.is_finite()) {
+                    dots.push((y(v), s.color));
+                }
                 marker.get_or_insert((x_at(idx, n), idx));
             }
         }
@@ -1048,12 +1094,21 @@ mod tests {
     use super::*;
 
     #[test]
+    fn missing_samples_split_lines_and_preserve_real_zeroes() {
+        assert_eq!(
+            measured_runs(&[Some(0.0), Some(2.0), None, Some(4.0), Some(f64::NAN)]),
+            vec![vec![(0, 0.0), (1, 2.0)], vec![(3, 4.0)]]
+        );
+        assert!(measured_runs(&[None, None]).is_empty());
+    }
+
+    #[test]
     fn keyboard_scrub_exposes_a_stable_sample_to_accesskit() {
         let ctx = egui::Context::default();
         ctx.enable_accesskit();
         let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(800.0, 500.0));
         let chart_id = std::cell::Cell::new(None);
-        let render = |events: Vec<egui::Event>, stamps: &[u64], values: Vec<f64>| {
+        let render = |events: Vec<egui::Event>, stamps: &[u64], values: Vec<Option<f64>>| {
             let mut output = ctx.run_ui(
                 egui::RawInput {
                     screen_rect: Some(screen),
@@ -1068,7 +1123,11 @@ mod tests {
                                 chart_multi(
                                     ui,
                                     Vec2::new(400.0, 120.0),
-                                    &[MultiSeries::new("CPU", values.clone(), Color32::LIGHT_BLUE)],
+                                    &[MultiSeries::with_gaps(
+                                        "CPU",
+                                        values.clone(),
+                                        Color32::LIGHT_BLUE,
+                                    )],
                                     100.0,
                                     Some(TimeAxis {
                                         stamps,
@@ -1089,7 +1148,11 @@ mod tests {
                 .accesskit_update
                 .expect("chart accessibility tree")
         };
-        render(vec![], &[1_000, 2_000, 3_000], vec![1.0, 2.0, 3.0]);
+        render(
+            vec![],
+            &[1_000, 2_000, 3_000],
+            vec![Some(1.0), Some(2.0), Some(3.0)],
+        );
         let id = chart_id.get().expect("chart target");
         ctx.memory_mut(|memory| memory.request_focus(id));
         let key = egui::Event::Key {
@@ -1099,7 +1162,11 @@ mod tests {
             repeat: false,
             modifiers: Default::default(),
         };
-        let tree = render(vec![key], &[1_000, 2_000, 3_000], vec![1.0, 2.0, 3.0]);
+        let tree = render(
+            vec![key.clone()],
+            &[1_000, 2_000, 3_000],
+            vec![Some(1.0), Some(2.0), Some(3.0)],
+        );
         let value = tree
             .nodes
             .iter()
@@ -1113,7 +1180,7 @@ mod tests {
         let tree = render(
             vec![],
             &[1_000, 2_000, 3_000, 4_000],
-            vec![1.0, 2.0, 3.0, 4.0],
+            vec![Some(1.0), Some(2.0), Some(3.0), Some(4.0)],
         );
         let after = tree
             .nodes
@@ -1124,6 +1191,21 @@ mod tests {
             after,
             Some(value.as_str()),
             "new telemetry keeps the chosen historical sample"
+        );
+        let tree = render(
+            vec![key],
+            &[1_000, 2_000, 3_000, 4_000],
+            vec![None, Some(2.0), Some(3.0), Some(4.0)],
+        );
+        let missing = tree
+            .nodes
+            .iter()
+            .find(|(node_id, _)| *node_id == id.accesskit_id())
+            .and_then(|(_, node)| node.value())
+            .unwrap();
+        assert!(
+            missing.contains('—'),
+            "unavailable sample must be spoken as unavailable: {missing}"
         );
     }
 

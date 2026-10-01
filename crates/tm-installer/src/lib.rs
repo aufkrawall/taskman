@@ -15,6 +15,10 @@ pub mod install;
 pub mod options;
 pub mod payload;
 #[cfg(windows)]
+mod staging;
+#[cfg(windows)]
 pub mod ui;
+#[cfg(windows)]
+mod user;
 #[cfg(windows)]
 pub mod win;

@@ -36,7 +36,7 @@ pub fn run(opts: Options) -> tm_core::error::Result<()> {
             .with_title(title.clone())
             .with_inner_size([640.0, 560.0])
             .with_min_inner_size([640.0, 560.0])
-            .with_resizable(false)
+            .with_resizable(true)
             .with_icon(icon_data()),
         // Only the CPU renderer is compiled into the installer: the wizard is
         // a short-lived window and this backend does sub-pixel text.
@@ -145,17 +145,37 @@ impl SetupApp {
         self.worker = Some(rx);
         let opts = self.opts.clone();
         let ctx = self.ctx.clone();
-        std::thread::spawn(move || {
-            let mut emit = |event: Event| {
-                let _ = tx.send(event);
-                ctx.request_repaint();
-            };
-            let result = match opts.mode {
-                Mode::Install => install::install(&opts, &mut emit),
-                Mode::Uninstall => install::uninstall(&opts, &mut emit),
-            };
-            emit(Event::Finished(result.map_err(|error| error.to_string())));
-        });
+        let spawned = std::thread::Builder::new()
+            .name("tm-setup".into())
+            .spawn(move || {
+                let mut emit = |event: Event| {
+                    match &event {
+                        Event::Step(index, state, detail) => crate::win::append_setup_log(
+                            &format!("step {}: {state:?} {detail}", index + 1),
+                        ),
+                        Event::Finished(Err(error)) => {
+                            crate::win::append_setup_log(&format!("setup failed: {error}"))
+                        }
+                        Event::Finished(Ok(())) => {
+                            crate::win::append_setup_log("setup finished successfully")
+                        }
+                        Event::Log(line) => crate::win::append_setup_log(line),
+                    }
+                    let _ = tx.send(event);
+                    ctx.request_repaint();
+                };
+                let result = match opts.mode {
+                    Mode::Install => install::install(&opts, &mut emit),
+                    Mode::Uninstall => install::uninstall(&opts, &mut emit),
+                };
+                emit(Event::Finished(result.map_err(|error| error.to_string())));
+            });
+        if let Err(error) = spawned {
+            self.worker = None;
+            let message = format!("Cannot start setup worker: {error}");
+            crate::win::append_setup_log(&message);
+            self.finished = Some(Err(message));
+        }
     }
 
     fn pump_events(&mut self) {
@@ -175,8 +195,20 @@ impl SetupApp {
             }
         }
         if let Some(result) = finished {
+            if let Err(error) = &result
+                && let Some(step) = self
+                    .steps
+                    .iter_mut()
+                    .find(|step| step.1 == StepState::Running)
+            {
+                step.1 = StepState::Failed;
+                step.2 = error.clone();
+            }
             self.worker = None;
             self.finished = Some(result);
+            self.page = Page::Done;
+        }
+        if self.finished.is_some() && self.worker.is_none() && self.page == Page::Working {
             self.page = Page::Done;
         }
     }
@@ -214,6 +246,9 @@ impl SetupApp {
         theme::ensure_visuals(&ctx);
         fonts::poll_async_apply(&ctx);
         self.pump_events();
+        if self.page == Page::Working && ctx.input(|input| input.viewport().close_requested()) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+        }
         let pal = theme::palette_ctx(&ctx);
 
         header_band(ui, &pal, self);
@@ -467,8 +502,8 @@ fn options_page(ui: &mut egui::Ui, pal: &theme::Palette, app: &mut SetupApp) {
         .show(ui, |ui| {
             ui.label(
                 egui::RichText::new(
-                    "Registers the TaskManCore service so Task Manager can control \
-                     processes without UAC prompts.",
+                    "Enables process controls without UAC prompts. Unchecking this \
+                     removes an existing background service during upgrade.",
                 )
                 .size(11.0)
                 .color(pal.text_dim),
@@ -502,6 +537,10 @@ fn options_page(ui: &mut egui::Ui, pal: &theme::Palette, app: &mut SetupApp) {
 }
 
 fn working_page(ui: &mut egui::Ui, pal: &theme::Palette, app: &SetupApp) {
+    ui.label(
+        egui::RichText::new("Please keep setup open until this operation finishes.")
+            .color(pal.text_dim),
+    );
     ui.label(
         egui::RichText::new(if app.opts.mode == Mode::Uninstall {
             "Removing Task Manager..."
@@ -570,6 +609,9 @@ fn done_page(ui: &mut egui::Ui, pal: &theme::Palette, app: &SetupApp) {
             }
         }
         Some(Err(error)) => {
+            if let Some((label, _, _)) = app.steps.iter().find(|step| step.1 == StepState::Failed) {
+                ui.label(egui::RichText::new(format!("Failed step: {label}")).color(pal.text_dim));
+            }
             ui.label(egui::RichText::new(error).size(13.0).color(pal.text));
         }
         None => {}
@@ -579,6 +621,46 @@ fn done_page(ui: &mut egui::Ui, pal: &theme::Palette, app: &SetupApp) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_close_is_blocked_only_while_working() {
+        let (ctx, mut app) = harness();
+        app.finished = None;
+        for page in [Page::Working, Page::Options, Page::Done] {
+            app.page = page;
+            let mut input = egui::RawInput::default();
+            input
+                .viewports
+                .get_mut(&egui::ViewportId::ROOT)
+                .unwrap()
+                .events
+                .push(egui::ViewportEvent::Close);
+            let mut output = ctx.run_ui(input, |root| {
+                app.draw(root);
+            });
+            output.textures_delta.clear();
+            let blocked = output.viewport_output[&egui::ViewportId::ROOT]
+                .commands
+                .contains(&egui::ViewportCommand::CancelClose);
+            assert_eq!(blocked, page == Page::Working);
+        }
+    }
+
+    #[test]
+    fn failed_worker_marks_the_running_step_failed_and_finishes() {
+        let (_, mut app) = harness();
+        app.page = Page::Working;
+        app.finished = None;
+        app.steps[0].1 = StepState::Running;
+        let (tx, rx) = mpsc::channel();
+        app.worker = Some(rx);
+        tx.send(Event::Finished(Err("copy refused".into())))
+            .unwrap();
+        app.pump_events();
+        assert_eq!(app.page, Page::Done);
+        assert_eq!(app.steps[0].1, StepState::Failed);
+        assert_eq!(app.steps[0].2, "copy refused");
+    }
 
     const W: f32 = 640.0;
     const H: f32 = 560.0;
@@ -768,7 +850,7 @@ mod tests {
         app.finished = Some(Ok(()));
         let texts = painted_texts(&ctx, &mut app);
         let label_x = text_rect(&texts, "Install background service").min.x;
-        let desc_x = text_rect(&texts, "Registers the TaskManCore").min.x;
+        let desc_x = text_rect(&texts, "Enables process controls").min.x;
         assert!(
             desc_x > label_x - 1.0 && desc_x < label_x + 1.0,
             "description starts at x={desc_x} but its checkbox label starts at x={label_x}; \

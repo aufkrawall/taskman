@@ -52,10 +52,17 @@ fn normalize(path: &Path) -> String {
 // ---------------------------------------------------------------------------
 
 fn known_folder(folder: &windows::core::GUID) -> Result<PathBuf> {
+    known_folder_for_user(folder, None)
+}
+
+pub(crate) fn known_folder_for_user(
+    folder: &windows::core::GUID,
+    token: Option<HANDLE>,
+) -> Result<PathBuf> {
     use windows::Win32::System::Com::CoTaskMemFree;
     use windows::Win32::UI::Shell::{KNOWN_FOLDER_FLAG, SHGetKnownFolderPath};
     unsafe {
-        let raw = SHGetKnownFolderPath(folder, KNOWN_FOLDER_FLAG(0), None)
+        let raw = SHGetKnownFolderPath(folder, KNOWN_FOLDER_FLAG(0), token)
             .map_err(|error| err("known folder", error.to_string()))?;
         let text = raw.to_string().unwrap_or_default();
         CoTaskMemFree(Some(raw.0.cast()));
@@ -96,21 +103,13 @@ pub fn is_elevated() -> bool {
     tm_platform::win::is_elevated()
 }
 
-/// The SID of the account running setup. This is the account the broker will
-/// authorize (`--core-service-user=`): UAC elevation keeps the same user, so
-/// the elevated setup token's user IS the administrator who double-clicked.
-pub fn current_user_sid() -> Result<String> {
+pub(crate) fn sid_for_token(token: HANDLE) -> Result<String> {
     use windows::Win32::Security::Authorization::ConvertSidToStringSidW;
-    use windows::Win32::Security::{GetTokenInformation, TOKEN_QUERY, TOKEN_USER, TokenUser};
-    use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+    use windows::Win32::Security::{GetTokenInformation, TOKEN_USER, TokenUser};
     unsafe {
-        let mut token = HANDLE::default();
-        OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token)
-            .map_err(|error| err("open process token", error.to_string()))?;
         let mut size = 0u32;
         let _ = GetTokenInformation(token, TokenUser, None, 0, &mut size);
         if size == 0 {
-            let _ = CloseHandle(token);
             return Err(err("token user", "cannot size the token user buffer"));
         }
         let mut buffer = vec![0u8; size as usize];
@@ -121,7 +120,6 @@ pub fn current_user_sid() -> Result<String> {
             size,
             &mut size,
         );
-        let _ = CloseHandle(token);
         filled.map_err(|error| err("token user", error.to_string()))?;
         let user = &*buffer.as_ptr().cast::<TOKEN_USER>();
         let mut text = PWSTR::null();
@@ -580,14 +578,6 @@ pub fn dir_size_kb(dir: &Path) -> u32 {
             .sum()
     }
     (walk(dir) / 1024).min(u32::MAX as u64) as u32
-}
-
-/// Start the installed Task Manager after a successful install.
-pub fn launch(detached_exe: &Path) -> Result<()> {
-    std::process::Command::new(detached_exe)
-        .spawn()
-        .map_err(|error| err("launch Task Manager", error.to_string()))?;
-    Ok(())
 }
 
 /// Attach to the parent console so `--help`/`--dry-run` output is visible even

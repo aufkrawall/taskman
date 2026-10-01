@@ -248,10 +248,12 @@ remain follow-up rather than being simulated in headless tests:
   synchronous. An authenticated client can stall both workers. The GUI's
   telemetry worker has a bounded response wait; slow control operations and
   server-side cancellation still require VM fault injection.
-- Uninstall removes the service registration and user redirect but leaves the
-  protected binaries/data. A signed standalone uninstaller could schedule
-  cleanup after the GUI exits; in-place recursive deletion is intentionally not
-  attempted by the running app.
+- Service-only removal (`--core-service=uninstall`) removes the service
+  registration but deliberately keeps binaries/data and the Task Manager
+  replacement. Full setup uninstall restores an owned replacement pointing at
+  the installed GUI, stops the service, removes program files and shortcuts,
+  then removes the ARP entry. See `installer.md` for self-relocation and failure
+  behavior; personal settings survive.
 
 ## Deliberate deviations / session-limited fixes
 

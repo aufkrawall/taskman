@@ -39,8 +39,8 @@ pub struct HistoryPoint {
     pub commit_used_bytes: u64,
     #[allow(dead_code)] // kept for future committed-limit charts
     pub commit_limit_bytes: u64,
-    pub disks: Vec<(String, f32, f64, f64)>, // mount, active%, read bps, write bps
-    pub nets: Vec<(String, f64, f64)>,       // name, recv bps, sent bps
+    pub disks: Vec<(String, Option<f32>, f64, f64)>, // mount, active%, read bps, write bps
+    pub nets: Vec<(String, f64, f64)>,               // name, recv bps, sent bps
     /// Per-adapter GPU history. A named struct (not a tuple) because the
     /// memory split is what the GPU page plots: `mem_used_bytes` on Windows
     /// equals the dedicated total, and shared memory is its own series.
@@ -901,17 +901,8 @@ impl TaskManApp {
                 disks: latest
                     .disks
                     .iter()
-                    // An unmeasured tick plots as 0 like an absent mount
-                    // does: the series must stay index-aligned with
-                    // `timestamps`. The readouts say "—" instead of lying.
-                    .map(|d| {
-                        (
-                            d.mount.clone(),
-                            d.active_pct.unwrap_or(0.0),
-                            d.read_bps,
-                            d.write_bps,
-                        )
-                    })
+                    // Preserve unavailable activity as a gap in the chart.
+                    .map(|d| (d.mount.clone(), d.active_pct, d.read_bps, d.write_bps))
                     .collect(),
                 nets: latest
                     .networks
@@ -2362,15 +2353,18 @@ impl TaskManApp {
             self.end_process_identity(ctx, identity, tree, name);
             return;
         }
+        if targets.is_empty() {
+            return;
+        }
         let total = targets.len();
         let actions = self.actions.clone();
-        let ended = Arc::new(AtomicU64::new(0));
+        let ended = Arc::new(AtomicUsize::new(0));
         let counter = ended.clone();
         self.run_action_refreshing(
             ctx,
             move || {
                 // Evaluated on the worker AFTER the job, so the count is final.
-                let ok = ended.load(Ordering::Relaxed) as usize;
+                let ok = ended.load(Ordering::Relaxed);
                 if ok == total {
                     i18n::trf(K::ProcessesEndedToast, &[&total.to_string()])
                 } else {
@@ -2381,15 +2375,9 @@ impl TaskManApp {
                 }
             },
             move || {
-                for (identity, _) in targets {
-                    if actions
-                        .kill_process(identity.pid, identity.start_epoch_s, tree)
-                        .is_ok()
-                    {
-                        counter.fetch_add(1, Ordering::Relaxed);
-                    }
-                }
-                Ok(())
+                crate::action_executor::apply_batch(targets, &counter, |(identity, _)| {
+                    actions.kill_process(identity.pid, identity.start_epoch_s, tree)
+                })
             },
         );
     }

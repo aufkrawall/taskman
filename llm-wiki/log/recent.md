@@ -1,3 +1,18 @@
+- 2026-10-01: UX review fixes: full setup removal selectively restores native
+  Task Manager, service opt-out removes the old broker before protected binary
+  copies, service removal waits for SCM Stopped, desktop identity is separated
+  from UAC administrator identity, and optional launch uses a non-elevated
+  desktop token/environment. Setup staging now uses an atomic protected DACL
+  under Program Files with failure cleanup. Native close is blocked during
+  work; failed steps are logged; ARP cleanup happens after file removal.
+  Disk history preserves unavailable samples through chart gaps and “—”
+  readouts; batched controls preserve partial/all-failed error reasons. See
+  `installer.md` for regression coverage and remaining disposable-VM checks.
+  Packaging also exposed empty host-architecture suffixes in a restricted
+  environment; `build.py` now uses the compiler host triple for naming,
+  ARM64 hardening and cross-build selection. Python host-detection regressions
+  run in `--check`.
+
 - 2026-09-30: Released v0.1.16 (tag on `b669477`, the bump commit). Followed
   `build.md` §Publishing path: `--check` + `--audit` green, stable clippy
   green, bump pushed on main, `build.py --all-targets` for archives (Windows

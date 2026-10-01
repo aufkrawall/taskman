@@ -9,6 +9,11 @@ Primary sources:
 
 ## build.py — release driver
 
+Host architecture is read once from the active `rustc -vV` host triple, with
+the platform machine name as fallback. Empty architecture detection fails
+instead of emitting `windows--setup.exe`; Windows ARM64 hardening and cross-build
+selection use the same host target. Regression: `python tools/tests/test_build_host.py`.
+
 `python build.py` (default) does, in order:
 
 1. Host release build (`cargo build --profile release --workspace`). On

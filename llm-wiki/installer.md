@@ -40,7 +40,9 @@ eframe for the wizard).
 
 Steps (visible in the wizard and in `--dry-run`):
 
-1. Extract + verify the payload to a private temp directory. This is FIRST,
+1. Verify the payload and extract to freshly created administrator/System-only
+   staging under Program Files (`staging.rs` creates an inheritable protected
+   DACL atomically). Its RAII guard cleans up on success and failure. This is FIRST,
    before anything on the machine is touched: a bare build output (no
    embedded payload) or a corrupt artifact must fail here, not after the
    running app has been stopped. The wizard additionally preflights this at
@@ -53,13 +55,17 @@ Steps (visible in the wizard and in `--dry-run`):
 3. Program files + service: run the app's own elevated helper
    `taskman.exe --core-service=install --core-service-user=<sid>`. That helper
    owns the pinned copy, ACLs, broker manifest and SCM registration; the
-   installer does NOT reimplement any of it. `--no-service` instead copies the
-   two binaries into `%ProgramFiles%\TaskMan` directly (the app can register
-   the service later from Settings, with UAC).
+   installer does NOT reimplement any of it. `--no-service` first runs the
+   new payload helper's uninstall operation, waiting for an existing service
+   to stop, then calls `core_service::install_program_files_without_service`
+   for the same protected-directory and pinned-copy rules. This removes an
+   existing service during upgrade; later enrollment is available in Settings.
 4. Shortcuts (per-user Start menu by default, desktop opt-in) and the
    Add/Remove Programs entry (whose `UninstallString` points at the
    `taskman-setup.exe` copy placed into the install directory).
-5. Optional launch.
+5. Optional launch with the desktop user's unelevated token and environment
+   (`CreateProcessWithTokenW`); no elevated fallback. Token elevation is checked
+   before touching the installation when launch is requested.
 
 Deliberate constraints:
 
@@ -71,19 +77,31 @@ Deliberate constraints:
   installs must therefore run from an already elevated context (which is what
   deployment systems do anyway). `taskman-setup.exe` is `test = false` for the
   same reason.
+- **Desktop identity:** `user.rs` captures the shell token for broker SID,
+  per-user shortcut folders, and optional launch. Credential-based UAC must not
+  enroll the administrator instead of the desktop user. Only setup's existing
+  debug privilege is enabled to open another account's shell token; no global
+  debugger settings change. Without a shell, the calling account owns enrollment
+  and shortcuts, and elevated post-install launch is refused. A launch failure
+  after installation reports the failure without rolling back installed files.
 - **Install directory is fixed** at `%ProgramFiles%\TaskMan` and `/D=` is
   rejected with an explanation: the broker pins the installed GUI/service
   path (see `core-service.md`), so a custom directory would break the service
   contract. `install_dir()` in `win.rs` must stay identical to the helper's.
-- **Uninstall** removes the SCM service through the installed helper
+- **Uninstall** first clears only an owned IFEO replacement naming the installed
+  GUI. Other products and portable TaskMan registrations remain; unreadable or
+  malformed registrations fail before deletion. It waits for SCM Stopped even
+  before using an older helper, then removes the service through the installed helper
   (`--core-service=uninstall`; a `windows-service`-based delete is the
-  fallback when `taskman.exe` is already gone), then shortcuts, the ARP key,
+  fallback when `taskman.exe` is already gone), then shortcuts,
   `%ProgramData%\TaskMan` (best-effort) and the install tree. Per-user
   settings are preserved (they live in the user profile). Because the ARP
   entry runs the uninstaller FROM the install tree, a running image cannot
   delete itself: the uninstaller renames itself out of the tree first (a
   running image can be renamed, not deleted) and schedules its own removal at
-  reboot.
+  reboot. The ARP key is removed last. File-removal failure attempts to restore
+  the relocated uninstaller so the retained ARP command can retry; restoration
+  and cleanup-scheduling failures are reported rather than silently discarded.
 - **Upgrade** is just install again: the helper stops the old service
   generation before replacing files; settings survive because they never live
   in the install tree.
@@ -113,6 +131,10 @@ The header and footer MUST stay `Panel::top` / `Panel::bottom` chrome: the
 first version stacked them vertically with a content `ScrollArea
 ::auto_shrink(false)`, which consumes the entire remaining height and pushed
 the footer out of the clip rect (invisible buttons).
+
+The wizard is resizable. X/Alt+F4 receive `CancelClose` while work runs, matching
+the disabled Cancel button. Worker-start errors and failed running steps are
+surfaced; wizard and silent progress both reach the setup log.
 
 ## Testing and verification
 
@@ -144,6 +166,17 @@ the footer out of the clip rect (invisible buttons).
   above; confirm dark/light manually.
 
 ## Open questions / accepted limits
+
+- Regression tests cover service opt-out stop/remove-before-copy and failure
+  short-circuiting, helper ownership of service installs, selective IFEO cleanup,
+  native-close rejection during work, failed-step propagation, and refusal of
+  elevated launch tokens. A read-only token/folder smoke runs when a shell
+  exists; it does not establish credential-based UAC behavior.
+- Disposable-VM checks remain: a standard user supplying another account's UAC
+  credentials, launched process token/environment, no-service upgrade with a
+  running/stopped broker, full uninstall with IFEO enabled, locked-file retry,
+  staging ACL readback, and forced-close handling. Automated tests do not mutate
+  the developer machine's installation, registry or SCM.
 
 - Wizard strings are English-only for now; the app itself is DE/EN
   (i18n follow-up candidate).

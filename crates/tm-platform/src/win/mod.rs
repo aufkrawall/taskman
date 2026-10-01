@@ -121,6 +121,11 @@ pub fn set_task_manager_replacement_direct(enabled: bool) -> Result<()> {
     taskmgr_replacement::set_direct(enabled)
 }
 
+/// Elevated full-uninstall cleanup; service-only removal keeps replacement.
+pub fn remove_task_manager_replacement_for_deleted_exe(exe: &std::path::Path) -> Result<bool> {
+    taskmgr_replacement::remove_for_deleted_exe(exe)
+}
+
 /// Entry point used only by the short-lived elevated helper that opens the
 /// built-in Task Manager while preserving TaskMan's IFEO replacement.
 pub fn launch_native_task_manager_direct() -> Result<()> {

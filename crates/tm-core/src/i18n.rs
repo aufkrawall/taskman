@@ -275,6 +275,10 @@ keys! {
     ],
     SelectedCount => ["{} ausgewählt", "{} selected"],
     ProcessesEndedToast => ["{} Prozesse beendet", "Ended {} processes"],
+    BatchPartialFailure => [
+        "{} von {} Aktionen abgeschlossen; erster Fehler: {}",
+        "Completed {} of {} actions; first failure: {}"
+    ],
     ProcessesEndedPartial => [
         "{} von {} Prozessen beendet",
         "Ended {} of {} processes"

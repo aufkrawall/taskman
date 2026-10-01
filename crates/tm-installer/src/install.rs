@@ -75,7 +75,7 @@ pub fn install_steps(opts: &Options) -> Vec<&'static str> {
         if opts.service {
             "Install program files and register service"
         } else {
-            "Install program files"
+            "Install program files without background service"
         },
     ];
     if opts.start_menu || opts.desktop {
@@ -91,11 +91,12 @@ pub fn install_steps(opts: &Options) -> Vec<&'static str> {
 /// The steps `uninstall` will run, in order.
 pub fn uninstall_steps() -> Vec<&'static str> {
     vec![
+        "Restore Windows Task Manager",
         "Stop running Task Manager",
         "Remove background service",
         "Remove shortcuts",
-        "Remove uninstaller from Settings",
         "Remove program files",
+        "Remove uninstaller from Settings",
     ]
 }
 
@@ -110,6 +111,20 @@ pub fn describe(opts: &Options) -> Vec<String> {
         .enumerate()
         .map(|(index, label)| format!("{}. {label}", index + 1))
         .collect()
+}
+
+#[cfg(any(windows, test))]
+fn install_program_files(
+    service: bool,
+    mut helper: impl FnMut(&str) -> Result<()>,
+    copy_files: impl FnOnce() -> Result<()>,
+) -> Result<()> {
+    if service {
+        helper("install")
+    } else {
+        helper("uninstall")?;
+        copy_files()
+    }
 }
 
 /// Install (or upgrade) Task Manager. Safe to run over an existing install:
@@ -128,18 +143,20 @@ pub fn install(opts: &Options, emit: Sink<'_>) -> Result<()> {
                 "administrator rights are required to install Task Manager",
             ));
         }
-        let sid = win::current_user_sid()?;
+        let user = crate::user::InstallUser::resolve()?;
+        let sid = user.sid()?;
+        if opts.launch {
+            user.ensure_launchable()?;
+        }
         let install_dir = win::install_dir()?;
         let setup_exe = std::env::current_exe()?;
-        let staging =
-            std::env::temp_dir().join(format!("taskman-setup-payload-{}", std::process::id()));
 
         let mut at = 0usize;
         let mut step = |index: usize, state: StepState, detail: String| {
             emit(Event::Step(index, state, detail));
         };
 
-        // 1. The payload is extracted to a private temp directory and every
+        // 1. The payload is extracted to protected staging and every
         //    entry is SHA-256 verified BEFORE anything on the machine is
         //    touched. A bare build output (no embedded payload) or a corrupt
         //    artifact must fail here - not after the running app has been
@@ -148,7 +165,10 @@ pub fn install(opts: &Options, emit: Sink<'_>) -> Result<()> {
         let archive = Archive::open(&setup_exe)?;
         archive.entry(APP_EXE)?;
         archive.entry(SERVICE_EXE)?;
-        let extracted = archive.extract_to(&staging)?;
+        archive.verify_all()?;
+        let staging_guard = crate::staging::Staging::create()?;
+        let staging = staging_guard.path();
+        let extracted = archive.extract_to(staging)?;
         step(
             at,
             StepState::Done,
@@ -180,18 +200,22 @@ pub fn install(opts: &Options, emit: Sink<'_>) -> Result<()> {
         //    elevated helper transaction (files + ACLs + broker manifest +
         //    SCM registration + service start).
         step(at, StepState::Running, install_dir.display().to_string());
+        install_program_files(
+            opts.service,
+            |operation| win::run_core_service_helper(&staging.join(APP_EXE), operation, &sid),
+            || {
+                tm_platform::win::core_service::install_program_files_without_service(
+                    &staging.join(APP_EXE),
+                )
+            },
+        )?;
         if opts.service {
-            win::run_core_service_helper(&staging.join(APP_EXE), "install", &sid)?;
             step(
                 at,
                 StepState::Done,
                 "service TaskmanCore registered and started".into(),
             );
         } else {
-            std::fs::create_dir_all(&install_dir)?;
-            for name in [APP_EXE, SERVICE_EXE] {
-                std::fs::copy(staging.join(name), install_dir.join(name))?;
-            }
             step(at, StepState::Done, install_dir.display().to_string());
         }
         // LICENSE and friends are outside the helper's scope.
@@ -203,16 +227,16 @@ pub fn install(opts: &Options, emit: Sink<'_>) -> Result<()> {
         }
         at += 1;
 
-        // 4. Shortcuts (per-user: the setup runs as the installing admin).
+        // 4. Shortcuts belong to the desktop user, not the UAC administrator.
         if opts.start_menu || opts.desktop {
             step(at, StepState::Running, "writing shortcuts".into());
             let gui = install_dir.join(APP_EXE);
             if opts.start_menu {
-                let lnk = win::start_menu_dir()?.join(SHORTCUT_NAME);
+                let lnk = user.start_menu_dir()?.join(SHORTCUT_NAME);
                 win::create_shortcut(&lnk, &gui, &install_dir, &gui, "Task Manager")?;
             }
             if opts.desktop {
-                let lnk = win::desktop_dir()?.join(SHORTCUT_NAME);
+                let lnk = user.desktop_dir()?.join(SHORTCUT_NAME);
                 win::create_shortcut(&lnk, &gui, &install_dir, &gui, "Task Manager")?;
             }
             step(at, StepState::Done, "shortcuts created".into());
@@ -238,11 +262,10 @@ pub fn install(opts: &Options, emit: Sink<'_>) -> Result<()> {
         // 6. Optional launch.
         if opts.launch {
             step(at, StepState::Running, "starting Task Manager".into());
-            win::launch(&install_dir.join(APP_EXE))?;
+            user.launch(&install_dir.join(APP_EXE))?;
             step(at, StepState::Done, "started".into());
         }
 
-        let _ = std::fs::remove_dir_all(&staging);
         Ok(())
     }
 }
@@ -266,13 +289,34 @@ pub fn uninstall(opts: &Options, emit: Sink<'_>) -> Result<()> {
                 "administrator rights are required to uninstall Task Manager",
             ));
         }
-        let sid = win::current_user_sid()?;
+        let user = crate::user::InstallUser::resolve()?;
+        let sid = user.sid()?;
         let install_dir = win::install_dir()?;
 
         let mut at = 0usize;
         let mut step = |index: usize, state: StepState, detail: String| {
             emit(Event::Step(index, state, detail));
         };
+
+        step(
+            at,
+            StepState::Running,
+            "checking Task Manager replacement".into(),
+        );
+        let restored = tm_platform::win::remove_task_manager_replacement_for_deleted_exe(
+            &install_dir.join(APP_EXE),
+        )?;
+        step(
+            at,
+            StepState::Done,
+            if restored {
+                "restored Windows Task Manager"
+            } else {
+                "no matching replacement"
+            }
+            .into(),
+        );
+        at += 1;
 
         step(
             at,
@@ -299,6 +343,7 @@ pub fn uninstall(opts: &Options, emit: Sink<'_>) -> Result<()> {
             "removing service TaskmanCore".into(),
         );
         let installed_gui = install_dir.join(APP_EXE);
+        tm_platform::win::core_service::stop_existing_service_before_copy()?;
         if installed_gui.is_file() {
             win::run_core_service_helper(&installed_gui, "uninstall", &sid)?;
             step(at, StepState::Done, "service removed".into());
@@ -314,7 +359,7 @@ pub fn uninstall(opts: &Options, emit: Sink<'_>) -> Result<()> {
 
         step(at, StepState::Running, "removing shortcuts".into());
         let mut removed = 0usize;
-        for dir in [win::start_menu_dir(), win::desktop_dir()]
+        for dir in [user.start_menu_dir(), user.desktop_dir()]
             .into_iter()
             .flatten()
         {
@@ -330,16 +375,7 @@ pub fn uninstall(opts: &Options, emit: Sink<'_>) -> Result<()> {
         );
         at += 1;
 
-        step(
-            at,
-            StepState::Running,
-            "removing uninstall registry key".into(),
-        );
-        win::remove_arp()?;
-        step(at, StepState::Done, "removed".into());
-        at += 1;
-
-        // Files last. The running setup exe may live INSIDE the tree (the ARP
+        // Files before ARP cleanup. Setup may live INSIDE the tree (the ARP
         // UninstallString points there), so it is renamed out first - a
         // running image can be renamed but not deleted - and scheduled for
         // deletion at the next reboot afterwards.
@@ -347,12 +383,21 @@ pub fn uninstall(opts: &Options, emit: Sink<'_>) -> Result<()> {
         let orphan = win::relocate_self_out_of(&install_dir)?;
         let mut detail = Vec::new();
         if install_dir.is_dir() {
-            std::fs::remove_dir_all(&install_dir).map_err(|error| {
-                fail(
+            if let Err(error) = std::fs::remove_dir_all(&install_dir) {
+                // Keep the ARP command usable when removal fails halfway.
+                let rollback = orphan
+                    .as_ref()
+                    .map(|path| std::fs::rename(path, install_dir.join(SETUP_EXE)));
+                return Err(fail(
                     "remove program files",
-                    format!("{}: {error}", install_dir.display()),
-                )
-            })?;
+                    match rollback {
+                        Some(Err(rollback)) => {
+                            format!("{error}; could not restore uninstaller: {rollback}")
+                        }
+                        _ => error.to_string(),
+                    },
+                ));
+            }
             detail.push("program files removed".to_string());
         } else {
             detail.push("program files were already gone".to_string());
@@ -366,10 +411,20 @@ pub fn uninstall(opts: &Options, emit: Sink<'_>) -> Result<()> {
             _ => {}
         }
         if let Some(orphan) = orphan {
-            let _ = win::schedule_delete_at_reboot(&orphan);
-            detail.push("setup cleanup scheduled".to_string());
+            match win::schedule_delete_at_reboot(&orphan) {
+                Ok(()) => detail.push("setup cleanup scheduled".to_string()),
+                Err(error) => detail.push(format!("setup cleanup could not be scheduled: {error}")),
+            }
         }
         step(at, StepState::Done, detail.join("; "));
+        at += 1;
+        step(
+            at,
+            StepState::Running,
+            "removing uninstall registry key".into(),
+        );
+        win::remove_arp()?;
+        step(at, StepState::Done, "removed".into());
 
         Ok(())
     }
@@ -408,6 +463,60 @@ mod tests {
     use crate::options::Mode;
 
     #[test]
+    fn service_opt_out_stops_and_removes_the_old_broker_before_copying() {
+        let order = std::cell::RefCell::new(Vec::new());
+        install_program_files(
+            false,
+            |op| {
+                order.borrow_mut().push(op.to_string());
+                Ok(())
+            },
+            || {
+                order.borrow_mut().push("copy".into());
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(*order.borrow(), ["uninstall", "copy"]);
+        let copied = std::cell::Cell::new(false);
+        assert!(
+            install_program_files(
+                false,
+                |_| Err(TmError::Unsupported("stop failed")),
+                || {
+                    copied.set(true);
+                    Ok(())
+                }
+            )
+            .is_err()
+        );
+        assert!(
+            !copied.get(),
+            "failed service removal must leave pinned binaries intact"
+        );
+    }
+
+    #[test]
+    fn service_install_keeps_binary_copy_owned_by_the_helper() {
+        install_program_files(
+            true,
+            |op| {
+                assert_eq!(op, "install");
+                Ok(())
+            },
+            || panic!("never copy pinned service binaries outside the helper"),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn uninstall_restores_task_manager_before_deleting_files_and_removes_arp_last() {
+        let steps = uninstall_steps();
+        assert_eq!(steps[0], "Restore Windows Task Manager");
+        assert_eq!(steps.last(), Some(&"Remove uninstaller from Settings"));
+    }
+
+    #[test]
     fn install_steps_follow_the_chosen_options() {
         let mut opts = Options {
             mode: Mode::Install,
@@ -434,7 +543,7 @@ mod tests {
             [
                 "Extract installer payload",
                 "Stop running Task Manager",
-                "Install program files",
+                "Install program files without background service",
                 "Register uninstaller in Settings",
                 "Launch Task Manager",
             ],

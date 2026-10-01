@@ -184,17 +184,29 @@ mod tests {
     fn series_extractors_stay_aligned_with_window() {
         let mut hit = pt(500);
         hit.nets = vec![("eth".into(), 10.0, 20.0)];
-        hit.disks = vec![("C:".into(), 50.0, 1.0, 2.0)];
+        hit.disks = vec![("C:".into(), Some(50.0), 1.0, 2.0)];
         let win = vec![pt(0), hit, pt(1000)];
 
         let net = net_series(&win, "eth", 1);
         assert_eq!(net, vec![0.0, 10.0, 0.0], "len must equal window len");
         let sent = net_series(&win, "eth", 2);
         assert_eq!(sent, vec![0.0, 20.0, 0.0]);
-        let disk = disk_series(&win, "C:", |d| d.1 as f64);
-        assert_eq!(disk, vec![0.0, 50.0, 0.0]);
+        let disk = disk_activity_series(&win, "C:");
+        assert_eq!(disk, vec![None, Some(50.0), None]);
         let gpu = gpu_series(&win, "0", GpuField::Util);
         assert_eq!(gpu, vec![0.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn disk_activity_history_distinguishes_missing_from_measured_idle() {
+        let mut missing = pt(1_000);
+        missing.disks = vec![("C:".into(), None, 0.0, 0.0)];
+        let mut idle = pt(2_000);
+        idle.disks = vec![("C:".into(), Some(0.0), 0.0, 0.0)];
+        assert_eq!(
+            disk_activity_series(&[pt(0), missing, idle], "C:"),
+            vec![None, None, Some(0.0)]
+        );
     }
 
     /// The adapter's own utilization is the BUSIEST engine, so charting one
@@ -464,16 +476,22 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
                     // Sparkline data is extracted in one immutable pass so
                     // the mutable UI pass below never fights the borrow.
                     let win = window(app);
-                    let card_series: Vec<Vec<f64>> = entries
+                    let card_series: Vec<Vec<Option<f64>>> = entries
                         .iter()
-                        .map(|e| match e.kind {
-                            ResourceKind::Cpu => series(win, |h| h.cpu_total as f64),
-                            ResourceKind::Memory => {
-                                series(win, |h| pct_of(h.mem_used_bytes, h.mem_total_bytes))
+                        .map(|e| {
+                            if e.kind == ResourceKind::Disk {
+                                return disk_activity_series(win, &e.key);
                             }
-                            ResourceKind::Disk => disk_series(win, &e.key, |d| d.1 as f64),
-                            ResourceKind::Network => net_series(win, &e.key, 1),
-                            ResourceKind::Gpu => gpu_series(win, &e.key, GpuField::Util),
+                            let values = match e.kind {
+                                ResourceKind::Cpu => series(win, |h| h.cpu_total as f64),
+                                ResourceKind::Memory => {
+                                    series(win, |h| pct_of(h.mem_used_bytes, h.mem_total_bytes))
+                                }
+                                ResourceKind::Disk => unreachable!("handled above"),
+                                ResourceKind::Network => net_series(win, &e.key, 1),
+                                ResourceKind::Gpu => gpu_series(win, &e.key, GpuField::Util),
+                            };
+                            values.into_iter().map(Some).collect()
                         })
                         .collect();
                     for (index, (e, samples)) in entries.iter().zip(card_series.iter()).enumerate()
@@ -601,7 +619,7 @@ fn card_ui(
     pal: &Palette,
     e: &ResourceEntry,
     selected: bool,
-    samples: &[f64],
+    samples: &[Option<f64>],
     index: usize,
     total: usize,
 ) {
@@ -682,7 +700,7 @@ fn card_ui(
     } else {
         pal.card_bg
     };
-    crate::widgets::chart::paint_sparkline(ui, chart_rect, samples, color, cell_bg);
+    crate::widgets::chart::paint_sparkline_with_gaps(ui, chart_rect, samples, color, cell_bg);
 
     // Text block: title / subtitle / value. Ellipsized — painter text is
     // drawn unclipped, so long adapter names would bleed past the card.
@@ -922,13 +940,25 @@ fn timestamps(win: &[HistoryPoint]) -> Vec<u64> {
 fn disk_series(
     win: &[HistoryPoint],
     key: &str,
-    pick: impl Fn(&(String, f32, f64, f64)) -> f64,
+    pick: impl Fn(&(String, Option<f32>, f64, f64)) -> f64,
 ) -> Vec<f64> {
     // One value PER window point (0.0 when absent): series indices must stay
     // aligned with the shared timestamps, otherwise samples plot at wrong
     // x positions (cliffs and shifted curves).
     win.iter()
         .map(|h| h.disks.iter().find(|(m, ..)| m == key).map_or(0.0, &pick))
+        .collect()
+}
+
+fn disk_activity_series(win: &[HistoryPoint], key: &str) -> Vec<Option<f64>> {
+    win.iter()
+        .map(|h| {
+            h.disks
+                .iter()
+                .find(|(mount, ..)| mount == key)
+                .and_then(|d| d.1)
+                .map(f64::from)
+        })
         .collect()
 }
 
@@ -2001,14 +2031,14 @@ fn disk_page(app: &mut TaskManApp, ui: &mut egui::Ui, pal: &Palette, entry: &Res
     let ts = timestamps(win);
     let axis = TimeAxis::new(&ts, app.shared.settings.graph_seconds);
     let width = content_width(ui);
-    let active = disk_series(win, &entry.key, |d| d.1 as f64);
+    let active = disk_activity_series(win, &entry.key);
     let disk_active_chart = page_chart(
         ui,
         "disk-active-chart",
         i18n::tr(K::StatActiveTime),
         width,
         160.0,
-        &[MultiSeries::new(
+        &[MultiSeries::with_gaps(
             i18n::tr(K::StatActiveTime),
             active,
             pal.disk_graph,

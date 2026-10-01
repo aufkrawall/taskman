@@ -168,6 +168,29 @@ pub fn set_direct_for_exe(enabled: bool, exe: &Path) -> Result<()> {
     }
 }
 
+/// Full program removal must restore the built-in Task Manager before the
+/// registered image is deleted. Other products and portable copies survive.
+pub fn remove_for_deleted_exe(exe: &Path) -> Result<bool> {
+    match read_debugger() {
+        DebuggerValue::Text(value) if names_deleted_exe(&value, exe) => {
+            delete_debugger()?;
+            Ok(true)
+        }
+        DebuggerValue::Invalid => Err(TmError::platform(
+            "Task Manager replacement cleanup",
+            "cannot verify the IFEO registration; program files were not removed",
+        )),
+        _ => Ok(false),
+    }
+}
+
+fn names_deleted_exe(value: &str, exe: &Path) -> bool {
+    is_owned_command(value)
+        && owned_path(value).is_some_and(|path| {
+            normalize_command(path) == normalize_command(&exe.to_string_lossy())
+        })
+}
+
 /// Reject registrations that would break the hotkey instead of serving it.
 ///
 /// Every rejection here is a state in which pressing Ctrl+Shift+Esc does
@@ -497,6 +520,21 @@ fn wstr(s: &str) -> Vec<u16> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn removal_only_clears_the_owned_registration_for_the_deleted_image() {
+        let exe = Path::new(r"C:\Program Files\TaskMan\taskman.exe");
+        assert!(names_deleted_exe(&own_command_for(exe), exe));
+        assert!(names_deleted_exe(
+            &own_command_for(Path::new(r"c:\program files\taskman\TASKMAN.EXE")),
+            exe
+        ));
+        assert!(!names_deleted_exe(
+            &own_command_for(Path::new(r"C:\Portable\taskman.exe")),
+            exe
+        ));
+        assert!(!names_deleted_exe(r"C:\Other\debugger.exe", exe));
+    }
 
     #[test]
     fn owner_marker_survives_paths_with_spaces() {

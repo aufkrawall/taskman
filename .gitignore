@@ -2,6 +2,7 @@
 bench/*/target
 bench/dist
 /dist
+__pycache__/
 *.log.tmp
 *.png
 # ad-hoc captures only -- vendored forks and docs ship images in-tree

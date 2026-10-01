@@ -3126,7 +3126,10 @@ fn stop_service_for_upgrade(
     }
 }
 
-fn stop_existing_service_before_copy() -> Result<()> {
+/// Elevated setup also uses this wait before removing files with an older
+/// installed helper, whose uninstall may only request an asynchronous stop.
+pub fn stop_existing_service_before_copy() -> Result<()> {
+    ensure_elevated("stop installed core service")?;
     use windows_service::service::ServiceAccess;
     use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
 
@@ -3151,6 +3154,20 @@ fn stop_existing_service_before_copy() -> Result<()> {
         .query_status()
         .map_err(|error| TmError::platform("query existing core service", error.to_string()))?;
     stop_service_for_upgrade(&service, &status)
+}
+
+/// Setup's service opt-out uses the same hardened directory and pinned-copy
+/// rules as broker installation, rather than copying through existing links.
+/// The caller must remove the old service before calling this entry point.
+pub fn install_program_files_without_service(source_gui: &Path) -> Result<()> {
+    ensure_elevated("install program files without service")?;
+    ensure_secure_directory(&install_dir()?, INSTALL_SDDL)?;
+    replace_file_from_pinned_source(source_gui, &expected_installed_gui_path()?, INSTALL_SDDL)?;
+    replace_file_from_pinned_source(
+        &source_gui.with_file_name(SERVICE_EXE_NAME),
+        &expected_installed_service_path()?,
+        INSTALL_SDDL,
+    )
 }
 
 fn install(authorized_user_sid: &str) -> Result<()> {
@@ -3312,7 +3329,7 @@ fn install(authorized_user_sid: &str) -> Result<()> {
 
 fn uninstall() -> Result<()> {
     ensure_elevated("uninstall core service")?;
-    use windows_service::service::{ServiceAccess, ServiceState};
+    use windows_service::service::ServiceAccess;
     use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
 
     let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)
@@ -3327,16 +3344,10 @@ fn uninstall() -> Result<()> {
             return Err(TmError::platform("open core service", error.to_string()));
         }
     };
-    if let Ok(status) = service.query_status()
-        && !matches!(
-            status.current_state,
-            ServiceState::Stopped | ServiceState::StopPending
-        )
-    {
-        service
-            .stop()
-            .map_err(|error| TmError::platform("stop core service", error.to_string()))?;
-    }
+    let status = service.query_status().map_err(|error| {
+        TmError::platform("query core service before removal", error.to_string())
+    })?;
+    stop_service_for_upgrade(&service, &status)?;
     service
         .delete()
         .map_err(|error| TmError::platform("delete core service", error.to_string()))?;

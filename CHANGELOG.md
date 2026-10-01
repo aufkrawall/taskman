@@ -2,6 +2,37 @@
 
 ## Unreleased
 
+### Fixed
+
+- **Release artifact names:** host architecture follows the active Rust
+  compiler even when the environment omits machine information, preventing
+  archives and setup installers with an empty architecture suffix.
+- **Windows uninstall:** restores the built-in Task Manager before deleting
+  an installed replacement, preserves unrelated and portable replacements,
+  waits for the background service to stop, and keeps the uninstall entry
+  until program files have been removed.
+- **Service-free upgrades:** opting out removes an existing broker before
+  updating its binaries, avoiding locked-file failures and an invalid broker
+  manifest. Program files use the same protected-copy rules as service installs.
+- **Setup user and launch:** broker enrollment and shortcuts use the desktop
+  user even when UAC credentials belong to another administrator. Post-install
+  launch uses the desktop user's unelevated token and environment; an unavailable
+  unelevated token is reported before installation begins.
+- **Setup interruption and errors:** window close is blocked while work runs;
+  failed steps and worker-start failures are shown and logged. The wizard can
+  be resized for longer messages.
+- **Disk graphs:** unavailable activity leaves gaps in the graph and resource
+  sparkline; hover and keyboard readouts show “—”. Measured idle remains zero.
+- **Batch action errors:** bulk End task, efficiency, priority and affinity
+  actions preserve failure reasons; partial success reports the completed count
+  and first failure instead of success alone.
+
+### Security
+
+- **Installer staging:** elevated helpers are extracted into freshly created,
+  administrator/System-only staging under Program Files instead of a predictable
+  user temporary directory. Staging is cleaned on both success and failure.
+
 ## 0.1.16 - 2026-09-30
 
 ### New

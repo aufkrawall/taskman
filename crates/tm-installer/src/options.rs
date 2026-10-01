@@ -20,7 +20,8 @@ OPTIONS:
   --desktop             Create a desktop shortcut (off by default)
   --launch              Start Task Manager when the install completes
   --no-service          Do not register the background service now
-                        (the app can register it later from Settings, with UAC)
+                        (removes an existing service during upgrade;
+                         the app can register it later from Settings, with UAC)
   --dry-run             Print the planned steps without changing anything
   --help                Show this help
 
@@ -52,7 +53,7 @@ impl Default for Options {
             mode: Mode::Install,
             silent: false,
             // Start menu on, desktop off: the install is machine-wide, the
-            // shortcuts are for the administrator who ran the setup.
+            // shortcuts are for the desktop user who initiated setup.
             start_menu: true,
             desktop: false,
             launch: false,

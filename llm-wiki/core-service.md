@@ -205,7 +205,7 @@ UAC credentials).
   fully secured before their hash is trusted. Replacement uses synchronized/
   write-through staging files, protected security, atomic move, and a final
   destination hash check.
-- Upgrade stops the old service and waits on its process handle before pinning
+- Upgrade stops the old service and waits for SCM `Stopped` before pinning
   retained logs or replacing binaries, so the old appender cannot conflict
   with security repair. The manifest is replaced atomically only after both
   protected binaries are ready.
@@ -233,10 +233,16 @@ already elevated launch does not redirect, so elevation is never silently
 preserved. Existing autostart and owned Task Manager-replacement registrations
 are retargeted to the protected GUI during migration.
 
-Uninstall stops and deletes the SCM registration; the original interactive GUI
+Service-only uninstall waits for SCM `Stopped` and deletes the registration;
+the original interactive GUI
 then clears its own per-user marker. Protected binaries/data intentionally remain: deleting a running GUI
 or security-sensitive tree in place is not required to remove privileged
 capability and would make rollback less reliable.
+
+Full program removal is owned by `tm-installer`, which additionally restores
+an owned Task Manager replacement naming the installed GUI, removes the files,
+and removes the ARP entry last. Service opt-out during setup upgrade removes
+the old service before calling the shared protected-copy routine. See `installer.md`.
 
 ## Operational behavior
 
