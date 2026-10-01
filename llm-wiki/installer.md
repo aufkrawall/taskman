@@ -66,6 +66,11 @@ Steps (visible in the wizard and in `--dry-run`):
 5. Optional launch with the desktop user's unelevated token and environment
    (`CreateProcessWithTokenW`); no elevated fallback. Token elevation is checked
    before touching the installation when launch is requested.
+   The duplicated primary token needs `TOKEN_ADJUST_DEFAULT` and
+   `TOKEN_ADJUST_SESSIONID` in addition to query/duplicate/assign-primary rights:
+   the Secondary Logon launch path otherwise returns access denied (`0x80070005`).
+   Reproduced with a suspended `cmd.exe` child independently of any running GUI;
+   adjustment rights fix it while preserving desktop SID and unelevated status.
 
 Deliberate constraints:
 
@@ -158,6 +163,11 @@ surfaced; wizard and silent progress both reach the setup log.
 - `taskman-payload verify <setup.exe>` re-parses a finished artifact and
   hash-checks every embedded entry; `build.py` runs it after packaging, so a
   broken artifact never reaches `dist/`.
+- The ignored `user::tests::desktop_launch_creates_an_unelevated_process_for_the_shell_user`
+  regression requires an elevated test harness and an interactive shell. It uses
+  the production launch path to create a suspended system `cmd.exe`, never runs
+  commands, terminates it, and checks its token's SID and elevation. It reproduced
+  the launch access-denied error before the token-rights fix and passed afterward.
 - `taskman-setup.exe` cannot run as an unelevated test harness (the manifest
   makes Windows return os error 740), so the bin target is `test = false`;
   the behavior beyond the unit tests is exercised via `--dry-run` and a real

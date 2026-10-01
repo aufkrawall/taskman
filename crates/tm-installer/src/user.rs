@@ -5,8 +5,9 @@ use std::path::{Path, PathBuf};
 use tm_core::error::{Result, TmError};
 use windows::Win32::Foundation::{CloseHandle, HANDLE};
 use windows::Win32::Security::{
-    DuplicateTokenEx, GetTokenInformation, SecurityImpersonation, TOKEN_ASSIGN_PRIMARY,
-    TOKEN_DUPLICATE, TOKEN_ELEVATION, TOKEN_IMPERSONATE, TOKEN_QUERY, TokenElevation, TokenPrimary,
+    DuplicateTokenEx, GetTokenInformation, SecurityImpersonation, TOKEN_ADJUST_DEFAULT,
+    TOKEN_ADJUST_SESSIONID, TOKEN_ASSIGN_PRIMARY, TOKEN_DUPLICATE, TOKEN_ELEVATION,
+    TOKEN_IMPERSONATE, TOKEN_QUERY, TokenElevation, TokenPrimary,
 };
 use windows::Win32::System::Threading::{
     CREATE_UNICODE_ENVIRONMENT, CreateProcessWithTokenW, GetCurrentProcess, LOGON_WITH_PROFILE,
@@ -17,6 +18,17 @@ use windows::Win32::UI::WindowsAndMessaging::{GetShellWindow, GetWindowThreadPro
 use windows::core::{PCWSTR, PWSTR};
 
 struct Token(HANDLE);
+
+struct Process(PROCESS_INFORMATION);
+
+impl Drop for Process {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = CloseHandle(self.0.hThread);
+            let _ = CloseHandle(self.0.hProcess);
+        }
+    }
+}
 
 impl Drop for Token {
     fn drop(&mut self) {
@@ -101,6 +113,15 @@ impl InstallUser {
     /// Launch with the desktop token and its environment, never with setup's
     /// administrator token or administrator profile environment.
     pub fn launch(&self, exe: &Path) -> Result<()> {
+        self.launch_process(exe, CREATE_UNICODE_ENVIRONMENT)?;
+        Ok(())
+    }
+
+    fn launch_process(
+        &self,
+        exe: &Path,
+        flags: windows::Win32::System::Threading::PROCESS_CREATION_FLAGS,
+    ) -> Result<Process> {
         use std::os::windows::ffi::OsStrExt;
         use windows::Win32::System::Environment::{
             CreateEnvironmentBlock, DestroyEnvironmentBlock,
@@ -123,7 +144,14 @@ impl InstallUser {
             let mut primary = HANDLE::default();
             DuplicateTokenEx(
                 self.token.0,
-                TOKEN_QUERY | TOKEN_DUPLICATE | TOKEN_ASSIGN_PRIMARY,
+                // Secondary Logon also adjusts the duplicated token's defaults
+                // and session. Omitting either right causes access denied on
+                // desktop launch even when the process-creation rights exist.
+                TOKEN_QUERY
+                    | TOKEN_DUPLICATE
+                    | TOKEN_ASSIGN_PRIMARY
+                    | TOKEN_ADJUST_DEFAULT
+                    | TOKEN_ADJUST_SESSIONID,
                 None,
                 SecurityImpersonation,
                 TokenPrimary,
@@ -145,7 +173,7 @@ impl InstallUser {
                 LOGON_WITH_PROFILE,
                 PCWSTR(path.as_ptr()),
                 Some(PWSTR(command.as_mut_ptr())),
-                CREATE_UNICODE_ENVIRONMENT,
+                flags,
                 Some(environment.cast_const()),
                 PCWSTR(work.as_ptr()),
                 &startup,
@@ -153,10 +181,8 @@ impl InstallUser {
             );
             let _ = DestroyEnvironmentBlock(environment);
             result.map_err(|e| error("launch Task Manager as desktop user", e))?;
-            let _ = CloseHandle(process.hThread);
-            let _ = CloseHandle(process.hProcess);
+            Ok(Process(process))
         }
-        Ok(())
     }
 }
 
@@ -174,6 +200,37 @@ fn require_unelevated(elevated: u32) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "requires elevated setup privileges and an interactive desktop"]
+    fn desktop_launch_creates_an_unelevated_process_for_the_shell_user() {
+        use windows::Win32::Foundation::WAIT_OBJECT_0;
+        use windows::Win32::System::Threading::{
+            CREATE_SUSPENDED, TerminateProcess, WaitForSingleObject,
+        };
+
+        assert!(crate::win::is_elevated(), "run this test elevated");
+        assert!(!unsafe { GetShellWindow() }.0.is_null());
+        let user = InstallUser::resolve().unwrap();
+        let exe = PathBuf::from(std::env::var_os("SystemRoot").unwrap()).join("System32\\cmd.exe");
+        let process = user
+            .launch_process(&exe, CREATE_UNICODE_ENVIRONMENT | CREATE_SUSPENDED)
+            .unwrap();
+        // Never execute cmd: inspect the child token, then stop the suspended
+        // process before asserting so a failed assertion cannot orphan it.
+        let mut token = HANDLE::default();
+        let opened = unsafe { OpenProcessToken(process.0.hProcess, TOKEN_QUERY, &mut token) };
+        let terminated = unsafe { TerminateProcess(process.0.hProcess, 0) };
+        let waited = unsafe { WaitForSingleObject(process.0.hProcess, 5000) };
+        terminated.unwrap();
+        assert_eq!(waited, WAIT_OBJECT_0);
+        opened.unwrap();
+        let child = InstallUser {
+            token: Token(token),
+        };
+        child.ensure_launchable().unwrap();
+        assert_eq!(child.sid().unwrap(), user.sid().unwrap());
+    }
 
     #[test]
     fn post_install_launch_refuses_an_elevated_or_desktopless_admin_token() {

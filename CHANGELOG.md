@@ -4,6 +4,9 @@
 
 ### Fixed
 
+- **Setup launch access denied:** fixed post-install desktop launch failing with
+  `0x80070005` after program files had already been installed. TaskMan still
+  launches as the unelevated desktop user.
 - **Release artifact names:** host architecture follows the active Rust
   compiler even when the environment omits machine information, preventing
   archives and setup installers with an empty architecture suffix.
