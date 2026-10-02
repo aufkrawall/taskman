@@ -4,6 +4,8 @@
 
 use eframe::egui;
 use std::cmp::Ordering;
+use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tm_core::format;
 use tm_core::i18n::{self, K};
@@ -15,6 +17,53 @@ use crate::search;
 use crate::theme;
 use crate::widgets::menu;
 use crate::widgets::tablekit::{self, TmColumn};
+
+/// What the page derives from each fetched startup list OFF the UI thread.
+///
+/// Resolving the image a command launches touches the file system
+/// (`Path::exists`, possibly on an unreachable network share) and the BIOS
+/// time is a registry read. Both used to run for every visible row on every
+/// frame — every mouse move — so they are computed by the fetch job instead.
+#[derive(Default)]
+pub struct Derived {
+    /// Item id -> impact-store key of the image the item launches.
+    rule_keys: HashMap<String, String>,
+    last_bios_ms: Option<u64>,
+}
+
+impl Derived {
+    fn compute(items: &[StartupItem], last_bios_ms: Option<u64>) -> Self {
+        let rule_keys = items
+            .iter()
+            .filter_map(|item| {
+                let target = resolve_startup_target(&item.command)?;
+                Some((
+                    item.id.clone(),
+                    tm_core::settings::process_rule_key(std::path::Path::new(&target)),
+                ))
+            })
+            .collect();
+        Self {
+            rule_keys,
+            last_bios_ms,
+        }
+    }
+
+    /// The measured startup cost of an ENABLED item, when one was recorded.
+    fn measured(&self, app: &TaskManApp, item: &StartupItem) -> Option<tm_core::ImpactSample> {
+        if !item.enabled {
+            return None;
+        }
+        let key = self.rule_keys.get(&item.id)?;
+        app.startup_impact.get(key).copied()
+    }
+
+    /// The impact the Impact column shows — and therefore sorts by.
+    pub(crate) fn shown_impact(&self, app: &TaskManApp, item: &StartupItem) -> StartupImpact {
+        self.measured(app, item)
+            .map_or(item.impact, |sample| sample.classify())
+    }
+}
 
 fn columns() -> Vec<TmColumn> {
     vec![
@@ -48,6 +97,7 @@ pub(crate) fn first_search_match_in_display_order(
     items: &[StartupItem],
     q: &search::Query,
     sort: tablekit::SortState,
+    impact: &dyn Fn(&StartupItem) -> StartupImpact,
 ) -> Option<String> {
     let mut visible: Vec<usize> = items
         .iter()
@@ -55,7 +105,7 @@ pub(crate) fn first_search_match_in_display_order(
         .filter(|(_, item)| matches_search(q, item))
         .map(|(i, _)| i)
         .collect();
-    visible.sort_by(|a, b| compare_items(&items[*a], &items[*b], sort));
+    visible.sort_by(|a, b| compare_items(&items[*a], &items[*b], sort, impact));
     visible.first().map(|&i| items[i].id.clone())
 }
 
@@ -73,6 +123,7 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
         };
         if stale && app.shared.startup_fetch.begin() {
             let cache = app.shared.startup_cache.clone();
+            let derived = app.shared.startup_derived.clone();
             let toasts = app.shared.toasts.clone();
             let done = app.shared.startup_fetch.flag();
             let actions = app.actions.clone();
@@ -88,7 +139,12 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
                         i18n::trf(K::StartupUnavailable, &[&e.to_string()]),
                     );
                 }
-                *tm_core::sync::lock(&cache) = Some((items.unwrap_or_default(), Instant::now()));
+                let items = items.unwrap_or_default();
+                // Published before the list so a frame that sees the new list
+                // never pairs it with the previous list's targets.
+                *tm_core::sync::lock(&derived) =
+                    Arc::new(Derived::compute(&items, actions.last_bios_time_ms()));
+                *tm_core::sync::lock(&cache) = Some((items, Instant::now()));
                 done.store(false, std::sync::atomic::Ordering::Relaxed);
                 wake();
             };
@@ -155,7 +211,8 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
         },
     );
 
-    if let Some(ms) = app.actions.last_bios_time_ms() {
+    let derived = tm_core::sync::lock(&app.shared.startup_derived).clone();
+    if let Some(ms) = derived.last_bios_ms {
         let (rect, _) =
             ui.allocate_exact_size(egui::vec2(ui.available_width(), 22.0), egui::Sense::hover());
         let text = format!(
@@ -189,7 +246,8 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
         .map(|(i, _)| i)
         .collect();
     let sort = app.startup_sort;
-    visible.sort_by(|a, b| compare_items(&items[*a], &items[*b], sort));
+    let impact = |item: &StartupItem| derived.shown_impact(app, item);
+    visible.sort_by(|a, b| compare_items(&items[*a], &items[*b], sort, &impact));
 
     // While a dialog is up it owns the keyboard: the page's nav, row keys and
     // menu key all stand down (`TaskManApp::modal_open`).
@@ -262,7 +320,7 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
             item.name.as_str(),
             item.publisher.as_deref().unwrap_or(""),
             status,
-            impact_label(app.lang(), item.impact),
+            impact_label(app.lang(), derived.shown_impact(app, item)),
         ];
         fit[0] = fit[0].max(tablekit::text_width(ui, values[0], tablekit::FONT_ROW) + 66.0);
         for i in 1..4 {
@@ -326,15 +384,12 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
                     &pal,
                     false,
                 );
-                let measured = item.enabled.then(|| measured_impact(app, item)).flatten();
+                let measured = derived.measured(app, item);
                 table.text_cell(
                     ui,
                     rect,
                     3,
-                    match &measured {
-                        Some(sample) => impact_label(app.lang(), sample.classify()),
-                        None => impact_label(app.lang(), item.impact),
-                    },
+                    impact_label(app.lang(), derived.shown_impact(app, item)),
                     &pal,
                     false,
                 );
@@ -416,7 +471,12 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
     app.persist_table(&table);
 }
 
-fn compare_items(a: &StartupItem, b: &StartupItem, sort: tablekit::SortState) -> Ordering {
+fn compare_items(
+    a: &StartupItem,
+    b: &StartupItem,
+    sort: tablekit::SortState,
+    impact: &dyn Fn(&StartupItem) -> StartupImpact,
+) -> Ordering {
     let primary = match sort.column {
         0 => tablekit::cmp_ignore_case(&a.name, &b.name),
         1 => tablekit::cmp_ignore_case(
@@ -424,7 +484,10 @@ fn compare_items(a: &StartupItem, b: &StartupItem, sort: tablekit::SortState) ->
             b.publisher.as_deref().unwrap_or(""),
         ),
         2 => a.enabled.cmp(&b.enabled),
-        _ => impact_rank(a.impact).cmp(&impact_rank(b.impact)),
+        // The displayed (measured) impact, not the enumerator's placeholder:
+        // sorting by `item.impact` left every enabled row "Unknown" and the
+        // column in name order.
+        _ => impact_rank(impact(a)).cmp(&impact_rank(impact(b))),
     };
     tablekit::directed(primary, sort.ascending)
         .then_with(|| tablekit::cmp_ignore_case(&a.name, &b.name))
@@ -501,15 +564,6 @@ fn toggle_selected(app: &mut TaskManApp, enable: bool, ctx: &egui::Context) {
 /// use), so the command has to resolve to a file that exists. A command that
 /// cannot be resolved simply has no measurement — the column then keeps
 /// "Not measured" instead of guessing which process an item launched.
-fn measured_impact(
-    app: &TaskManApp,
-    item: &tm_core::model::StartupItem,
-) -> Option<tm_core::ImpactSample> {
-    let target = resolve_startup_target(&item.command)?;
-    let key = tm_core::settings::process_rule_key(std::path::Path::new(&target));
-    app.startup_impact.get(&key).copied()
-}
-
 /// Resolve the image a startup command launches.
 ///
 /// Windows resolves quoted paths, environment variables and `.lnk` targets;
@@ -636,6 +690,33 @@ mod tests {
     /// The global search commit must mirror the VISIBLE startup table: same
     /// filter fields, same live sort — name ascending and descending lead to
     /// different first rows for one and the same query.
+    fn placeholder(item: &StartupItem) -> StartupImpact {
+        item.impact
+    }
+
+    /// The Impact column sorts by the impact it SHOWS. The enumerator's
+    /// placeholder is "Unknown" for every enabled entry, so sorting by it
+    /// left the column in name order with High, Low and Medium interleaved.
+    #[test]
+    fn impact_sort_follows_the_displayed_measurement() {
+        let item = |id: &str| StartupItem {
+            id: id.into(),
+            name: id.into(),
+            enabled: true,
+            impact: StartupImpact::Unknown,
+            ..Default::default()
+        };
+        let mut items = [item("a"), item("b"), item("c")];
+        let measured = |item: &StartupItem| match item.id.as_str() {
+            "a" => StartupImpact::Medium,
+            "b" => StartupImpact::High,
+            _ => StartupImpact::Low,
+        };
+        items.sort_by(|x, y| compare_items(x, y, tablekit::SortState::new(3, false), &measured));
+        let ids: Vec<&str> = items.iter().map(|item| item.id.as_str()).collect();
+        assert_eq!(ids, ["b", "a", "c"]);
+    }
+
     #[test]
     fn search_commit_follows_the_live_sort() {
         let items = vec![
@@ -657,20 +738,31 @@ mod tests {
             "Beta matches via its name too"
         );
         assert_eq!(
-            first_search_match_in_display_order(&items, &q, tablekit::SortState::new(0, true))
-                .as_deref(),
+            first_search_match_in_display_order(
+                &items,
+                &q,
+                tablekit::SortState::new(0, true),
+                &placeholder
+            )
+            .as_deref(),
             Some("alpha")
         );
         assert_eq!(
-            first_search_match_in_display_order(&items, &q, tablekit::SortState::new(0, false))
-                .as_deref(),
+            first_search_match_in_display_order(
+                &items,
+                &q,
+                tablekit::SortState::new(0, false),
+                &placeholder
+            )
+            .as_deref(),
             Some("beta")
         );
         assert_eq!(
             first_search_match_in_display_order(
                 &items,
                 &crate::search::Query::new("zzz"),
-                tablekit::SortState::new(0, true)
+                tablekit::SortState::new(0, true),
+                &placeholder
             ),
             None,
             "no match, no commit"

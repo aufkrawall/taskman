@@ -374,12 +374,19 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
         return;
     };
 
-    let sessions: Vec<&UserSession> = sessions_all
+    // Copied out so the cache lock is released before any row UI runs: the
+    // row menu's "Sign out" goes through `session_action`, which locks this
+    // same cache, and a std Mutex is not re-entrant — holding the guard for
+    // the whole page froze the UI thread on that click.
+    let owned_sessions: Vec<UserSession> = sessions_all
         .iter()
         .filter(|s| {
             s.id != 0 && !s.user.is_empty() && !s.user.to_lowercase().starts_with("session")
         })
+        .cloned()
         .collect();
+    drop(guard);
+    let sessions: Vec<&UserSession> = owned_sessions.iter().collect();
 
     let mut aggs: HashMap<u32, Agg> = HashMap::with_capacity(sessions.len());
     for s in &sessions {

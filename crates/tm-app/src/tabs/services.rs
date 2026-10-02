@@ -3,6 +3,7 @@
 
 use eframe::egui;
 use std::cmp::Ordering;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tm_core::i18n::{self, K};
 use tm_core::model::{ServiceInfo, ServiceStatus};
@@ -56,7 +57,9 @@ pub(crate) fn first_search_match_in_display_order(
 }
 
 pub struct Cache {
-    pub items: Vec<ServiceInfo>,
+    /// Shared so a frame can take its own handle and release the lock (see
+    /// `show`).
+    pub items: Arc<[ServiceInfo]>,
     pub fetched: Instant,
 }
 
@@ -87,7 +90,7 @@ fn ensure_fresh(app: &TaskManApp, ctx: &egui::Context) {
                 );
             }
             *tm_core::sync::lock(&cache) = Some(Cache {
-                items: items.unwrap_or_default(),
+                items: items.unwrap_or_default().into(),
                 fetched,
             });
             done.store(false, std::sync::atomic::Ordering::Relaxed);
@@ -191,15 +194,20 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
         },
     );
 
-    let cache_arc = app.shared.services_cache.clone();
-    let guard = tm_core::sync::lock(&cache_arc);
-    let Some(ref c) = *guard else {
+    // A handle to the list, not the lock guard: the row menu's "Start"
+    // dispatches through `dispatch_control`, which clears this same cache,
+    // and a std Mutex is not re-entrant — holding the guard for the whole
+    // table froze the UI thread on that click.
+    let items = tm_core::sync::lock(&app.shared.services_cache)
+        .as_ref()
+        .map(|c| c.items.clone());
+    let Some(items) = items else {
         ui.centered_and_justified(|ui| ui.label(i18n::tr(K::GatheringData)));
         return;
     };
 
     let q = crate::search::Query::new(&app.search);
-    let mut rows: Vec<&ServiceInfo> = c.items.iter().filter(|s| matches_search(&q, s)).collect();
+    let mut rows: Vec<&ServiceInfo> = items.iter().filter(|s| matches_search(&q, s)).collect();
     let sort = app.services_sort;
     rows.sort_by(|a, b| compare_services(a, b, sort));
 

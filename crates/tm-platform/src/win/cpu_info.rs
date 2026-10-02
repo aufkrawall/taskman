@@ -52,9 +52,8 @@ impl CpuStatic {
             out.base_mhz = smbios_base_mhz();
         }
 
-        if out.sockets == 0 {
-            out.sockets = 1;
-        }
+        // A failed topology walk leaves `sockets` at 0, the model's
+        // "unknown"; it used to be patched to 1 next to an unknown core count.
         out
     }
 }

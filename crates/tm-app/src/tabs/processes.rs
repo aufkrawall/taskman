@@ -1263,6 +1263,16 @@ fn context_menu(app: &mut TaskManApp, ui: &mut egui::Ui, row: &RowData) {
                 .map(|(identity, _)| identity)
                 .collect();
             app.set_efficiency_mode_batch(&ctx, targets, on);
+        } else if row.aggregate {
+            // A collapsed group ticks when ANY member is throttled, so the
+            // click must move every member to the opposite of that tick.
+            // Toggling only the head from its own state turned efficiency
+            // mode ON for a browser whose tick the user was clearing.
+            app.set_efficiency_mode_batch(
+                &ctx,
+                row.termination_targets.clone(),
+                !row.power_throttled,
+            );
         } else {
             toggle_efficiency_mode(app, &ctx, &identity_of(row));
         }
@@ -1284,7 +1294,10 @@ fn context_menu(app: &mut TaskManApp, ui: &mut egui::Ui, row: &RowData) {
                 .collect();
             app.set_suspended_batch(&ctx, targets, target_suspended);
         } else {
-            app.set_suspended_batch(&ctx, vec![identity_of(row)], target_suspended);
+            // Same rule as efficiency mode: a group labelled "Resume" because
+            // one member is suspended must resume that member, not just the
+            // head.
+            app.set_suspended_batch(&ctx, details_focus_targets(row), target_suspended);
         }
         ui.close();
     }

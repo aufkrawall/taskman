@@ -1663,17 +1663,21 @@ fn cpu_page(app: &mut TaskManApp, ui: &mut egui::Ui, pal: &Palette) {
                         "\u{2014}".into()
                     },
                 );
-                kv_row(
-                    ui,
-                    pal,
-                    i18n::tr(K::KvSockets),
-                    &snap.cpu.sockets.to_string(),
-                );
+                // 0 is the model's "unknown" for both counts (macOS reports no
+                // core topology), so it renders like the unknown base speed.
+                let count = |n: usize| {
+                    if n == 0 {
+                        "\u{2014}".to_string()
+                    } else {
+                        n.to_string()
+                    }
+                };
+                kv_row(ui, pal, i18n::tr(K::KvSockets), &count(snap.cpu.sockets));
                 kv_row(
                     ui,
                     pal,
                     i18n::tr(K::KvCores),
-                    &snap.cpu.physical_cores.to_string(),
+                    &count(snap.cpu.physical_cores),
                 );
                 kv_row(
                     ui,

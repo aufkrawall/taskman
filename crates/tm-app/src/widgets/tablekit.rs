@@ -1596,7 +1596,10 @@ pub struct Aggregates {
     /// whose own rows say otherwise.
     pub disk_pct: Option<f32>,
     pub net_pct: f32,
-    pub gpu_pct: f32,
+    /// Busiest adapter, or `None` while no row has GPU telemetry (no
+    /// adapters, counters warming up or asleep): the header must not read
+    /// "0 %" above a column of "—".
+    pub gpu_pct: Option<f32>,
 }
 
 impl Aggregates {
@@ -1619,7 +1622,12 @@ impl Aggregates {
             net_pct: net_pct.clamp(0.0, 100.0),
             // The adapter's own number is already the busiest engine, so the
             // machine total is the busiest adapter — not a sum across them.
-            gpu_pct: snap.gpus.iter().map(|g| g.util_pct).fold(0.0f32, f32::max),
+            gpu_pct: snap
+                .processes
+                .iter()
+                .any(|p| p.gpu_util_pct.is_some())
+                .then(|| snap.gpus.iter().map(|g| g.util_pct).reduce(f32::max))
+                .flatten(),
         }
     }
 
@@ -1642,7 +1650,8 @@ impl Aggregates {
             disk.clone(),
             format::format_pct_hdr(self.net_pct),
             disk,
-            format::format_pct_hdr(self.gpu_pct),
+            self.gpu_pct
+                .map_or_else(|| "\u{2014}".to_string(), format::format_pct_hdr),
         ]
     }
 }
@@ -1811,6 +1820,34 @@ mod tests {
         assert_eq!(
             Aggregates::from_snapshot(&snap).strings()[4],
             format::format_pct_hdr(0.0)
+        );
+    }
+
+    /// Same rule for the GPU header: without per-process GPU telemetry every
+    /// row reads "—", and so must the total above them.
+    #[test]
+    fn the_gpu_total_reads_unavailable_without_gpu_telemetry() {
+        let mut snap = tm_core::model::Snapshot {
+            processes: vec![tm_core::model::ProcessEntry::new(42, "app.exe")],
+            ..Default::default()
+        };
+        assert_eq!(Aggregates::from_snapshot(&snap).strings()[5], "\u{2014}");
+
+        snap.gpus = vec![tm_core::model::GpuInfo {
+            util_pct: 0.0,
+            ..Default::default()
+        }];
+        assert_eq!(
+            Aggregates::from_snapshot(&snap).strings()[5],
+            "\u{2014}",
+            "an adapter whose engines are not measured is not an idle one"
+        );
+
+        snap.processes[0].gpu_util_pct = Some(12.0);
+        snap.gpus[0].util_pct = 37.0;
+        assert_eq!(
+            Aggregates::from_snapshot(&snap).strings()[5],
+            format::format_pct_hdr(37.0)
         );
     }
 

@@ -217,6 +217,9 @@ pub struct SharedState {
     /// Cached service/startup/user lists refreshed lazily in the background.
     pub services_cache: Arc<Mutex<Option<crate::tabs::services::Cache>>>,
     pub startup_cache: CachedVec<tm_core::model::StartupItem>,
+    /// Per-list facts the Startup page needs every frame, computed by the
+    /// fetch job (see `tabs::startup::Derived`).
+    pub startup_derived: Arc<Mutex<Arc<crate::tabs::startup::Derived>>>,
     pub sessions_cache: CachedVec<tm_core::model::UserSession>,
     /// Shell icon textures keyed by executable path (lazy worker inside).
     pub icons: crate::icon_cache::IconCache,
@@ -762,6 +765,7 @@ impl TaskManApp {
                 settings,
                 services_cache: Arc::new(Mutex::new(None)),
                 startup_cache: Arc::new(Mutex::new(None)),
+                startup_derived: Arc::default(),
                 sessions_cache: Arc::new(Mutex::new(None)),
                 icons: crate::icon_cache::IconCache::default(),
                 toasts,
@@ -2110,10 +2114,12 @@ impl TaskManApp {
                 let id = if selected_matches {
                     self.selected_startup_id.clone()
                 } else {
+                    let derived = tm_core::sync::lock(&self.shared.startup_derived).clone();
                     crate::tabs::startup::first_search_match_in_display_order(
                         items,
                         &q,
                         self.startup_sort,
+                        &|item| derived.shown_impact(self, item),
                     )
                 };
                 let Some(id) = id else {
@@ -2458,12 +2464,14 @@ impl TaskManApp {
                 i18n::trf(K::ProcessesResumedToast, &[&total.to_string()])
             }
         };
+        // A refused or vanished target must not be toasted as suspended:
+        // `apply_batch` turns any failure into the error toast (with the
+        // completed count when only some targets failed).
+        let completed = AtomicUsize::new(0);
         self.run_action_refreshing(ctx, msg, move || {
-            for identity in targets {
-                let _ =
-                    actions.suspend_process_checked(identity.pid, identity.start_epoch_s, suspend);
-            }
-            Ok(())
+            crate::action_executor::apply_batch(targets, &completed, |identity| {
+                actions.suspend_process_checked(identity.pid, identity.start_epoch_s, suspend)
+            })
         });
     }
 

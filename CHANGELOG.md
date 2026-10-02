@@ -56,6 +56,24 @@
   speed or zero out network utilization.
 - **Legacy icons on scaled displays:** icons without an alpha channel whose
   width is an odd multiple of 16 px no longer get a sheared transparency mask.
+- **Users page "Sign out" froze the window:** choosing Sign out from a user
+  row's context menu (or Enter on a row) deadlocked the UI thread.
+- **Services page "Start" froze the window:** starting a service from a row's
+  context menu deadlocked the UI thread.
+- **Suspend/Resume reported success on failure:** suspending or resuming a
+  process that refused it (access denied, already exited) now shows the error,
+  with the completed count when only part of a selection failed.
+- **Efficiency mode and Resume on grouped rows:** on a collapsed group such as
+  a browser, the checkmark and "Resume" reflect any member, but the click only
+  acted on the group's head process — clearing the checkmark could turn
+  efficiency mode ON. The action now applies to every member of the group.
+- **Startup impact sorting:** sorting by Startup impact now orders by the
+  measured impact the column shows instead of leaving enabled entries in name
+  order.
+- **Unknown values shown as zero:** the GPU total above the Processes and
+  Users tables reads "—" instead of "0 %" while no process has GPU telemetry,
+  and an unknown socket or core count on the CPU page reads "—" instead of
+  "0" (or a guessed "1").
 
 ### Improved
 
@@ -68,6 +86,10 @@
 - **Lower sampling cost:** per-process thread counts are read from the kernel
   process table the sampler already queries, instead of a Toolhelp thread
   snapshot that cost about 30 ms of CPU on every tick on a typical desktop.
+- **Startup page responsiveness:** resolving each entry's executable and
+  reading the last BIOS time now happen when the list is fetched, not for
+  every row on every repaint; an entry pointing at an unreachable network path
+  no longer stalls the window on mouse movement.
 
 ### Changed
 
