@@ -1,3 +1,17 @@
+- 2026-10-02: Released v0.1.17 (tag on `a891b6d`, the bump commit). Followed
+  `build.md` §Publishing path: `--check` + `--audit` green, stable clippy
+  green, bump pushed on main, `build.py --all-targets` for archives (Windows
+  x86_64/ARM64, Linux x86_64 musl) and setup installers (`taskman-v0.1.17-windows-x86_64-setup.exe`,
+  `taskman-v0.1.17-windows-arm64-setup.exe`), `.sha256` generated beside each,
+  `gh release create --latest` with target `a891b6d03e510fff4b0abb6e5b8e2746b77f00bc`.
+  Release covers: post-install desktop launch token adjustment rights, elevated/desktopless
+  admin launch refusal, interactive desktop user folder resolution in elevated CI sessions,
+  Windows Task Manager uninstallation restoration, service-free upgrades, protected
+  installer staging under Program Files, telemetry gap preservation on disk graphs,
+  and batch action error visibility. Verified packaged archives and setup installers:
+  `taskman.exe` and `taskman-service.exe` in Windows zip pass `--selfcheck` (`--mock`),
+  setup installers pass `taskman-payload verify`.
+
 - 2026-10-01: UX review fixes: full setup removal selectively restores native
   Task Manager, service opt-out removes the old broker before protected binary
   copies, service removal waits for SCM Stopped, desktop identity is separated
