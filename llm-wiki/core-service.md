@@ -36,7 +36,7 @@ contract.
 
 ## IPC and authorization
 
-- Protocol v5 uses `\\.\pipe\Taskman.Core.v1` with fixed 12-byte framed JSON.
+- Protocol v6 uses `\\.\pipe\Taskman.Core.v1` with fixed 12-byte framed JSON.
   Requests are capped at 64 KiB and responses at 512 KiB; unknown request
   fields are rejected.
 - The pipe rejects remote clients and uses first-instance creation to prevent
@@ -123,12 +123,15 @@ identity could not be captured; it never falls back to an unverified child PID.
 Allowlisted operations are process/tree termination, suspend/resume, priority,
 affinity, efficiency mode, UAC virtualization, guarded module unload, service
 control, user-session control, Task Manager replacement integration, and narrow
-read-only queries for network counters, process hardening state, and exact
-PID+creation-time-bound module inventory. Module inventory exists specifically
-so the pinned GUI can inspect SYSTEM/service processes without elevating the
-whole UI; it is capped by module count, aggregate text bytes, and the 512 KiB
-response frame. There is deliberately no generic Win32 call, shell command,
-file write, or dump path.
+read-only queries for network counters, process hardening state, token
+identity, and exact PID+creation-time-bound module inventory. Module inventory
+exists specifically so the pinned GUI can inspect SYSTEM/service processes
+without elevating the whole UI; it is capped by module count, aggregate text
+bytes, and the 512 KiB response frame. The token identity read serves the same
+goal for the User name / Elevated columns: it answers one bounded payload
+(account name, SID, elevation, UAC virtualization) for one PID bound to its
+sampled creation time. There is deliberately no generic Win32 call, shell
+command, file write, or dump path.
 
 ### Read-only diagnostics endpoints
 
@@ -138,7 +141,11 @@ identity-bound process security and module inspection needed by Process
 Properties; protocol v4 adds `ProcessDiskCounters`, the same read-only shape
 for per-process disk service time (`win/disk_etw.rs`) for exactly the same
 reason — the disk trace is an ETW session and would otherwise force the whole
-GUI to run elevated to fill one column. Both counter endpoints take no
+GUI to run elevated to fill one column. Protocol v6 adds `ProcessIdentity`, the
+same identity-bound read-only shape for one process's token identity, because
+an interactive token cannot open the tokens of SYSTEM/service processes at
+all and the User name / Elevated columns of those rows would otherwise stay
+blank. Both counter endpoints take no
 parameters, can change nothing, drain or prune server-side against the
 service's own idea of which PIDs are live, are capped per response, and stop
 their trace on an idle watchdog once the GUI stops polling. These reads are allowed for the same pinned GUI that already has

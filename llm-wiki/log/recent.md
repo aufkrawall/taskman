@@ -1,3 +1,47 @@
+- 2026-10-02: Details showed "—" / "Unknown" in the User name and Elevated
+  columns for ~23 protected processes (user screenshot: Registry, smss,
+  csrss ×2, wininit, winlogon, services, lsass, dwm, Memory Compression,
+  WUDFHost, dasHost ×2, WmiPrvSE, SearchFilterHost ×5, SearchProtocolHost,
+  MicrosoftEdgeUpdate, audiodg — the user pre-selected exactly those rows).
+  Three defects behind it:
+  - `version.rs` only queried the English `StringFileInfo` blocks
+    (040904b0/040904e4). On a German Windows the MUI-locked core binaries
+    carry ONLY 040704b0 (verified: `GetFileVersionInfo` translation tables),
+    so FileDescription/CompanyName came back empty → `windows_owned_evidence`
+    was unknown → `fallback_user_for_known_role` refused → User "—", Elevated
+    "Unknown", and the friendly process names were lost on the Processes tab
+    for the same images. Now the file's own `\VarFileInfo\Translation` table
+    drives the lookup (UI language preferred, legacy English blocks kept as
+    fallback for table-less files).
+  - The role fallback list already contained "registry"/"memory compression",
+    but its gate (`windows_owned_evidence`) can never hold for a process with
+    no image file — a dead branch. Kernel pseudo-processes now have their own
+    evidence (`kernel_pseudo_role`: the kernel's own bare pseudo-name with no
+    directory/extension via `SystemProcessIdInformation`; a spoofed image
+    always resolves to a full device path) and also fill Platform ("64-bit")
+    and elevated.
+  - Row set B (WUDFHost/dasHost/WmiPrvSE/Search*/MicrosoftEdgeUpdate/audiodg)
+    has no readable token for ANY interactive caller — verified on the box:
+    `OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION)` denied,
+    `WTSEnumerateProcessesExW` reports nothing for session 0 / null SIDs for
+    session 1, WMI `GetOwner` returns 2. LocalSystem opens them (same
+    capability the brokered module inventory already relies on), so
+    `core_service` gained an identity-bound `ProcessIdentity` read (protocol
+    v6) wired into the sampler's attr cache with a 60 s per-process retry
+    (`IDENTITY_BROKER_RETRY`); unanswered stays "—". Needs the matching
+    service upgrade to take effect; end-to-end confirmation is user-side.
+  - Also: the elevation inference re-runs after
+    `inherit_same_image_service_accounts`, so a same-image child of a service
+    host no longer shows "SYSTEM" + Elevated "Unknown".
+  Coverage: `candidate_codepages` unit tests +
+  `a_windows_core_binary_resolves_its_version_metadata` (live; fails before on
+  localized systems), `a_system_role_needs_identity_evidence` +
+  `kernel_pseudo_evidence_rejects_real_image_paths` +
+  `a_known_privileged_account_implies_elevation`,
+  `windows_core_processes_report_their_owning_account` (live sampler pin),
+  broker `the_identity_read_*` tests and
+  `process_identity_checked_is_bound_to_the_exact_process`.
+
 - 2026-10-02: Released v0.1.17 (tag on `a891b6d`, the bump commit). Followed
   `build.md` §Publishing path: `--check` + `--audit` green, stable clippy
   green, bump pushed on main, `build.py --all-targets` for archives (Windows

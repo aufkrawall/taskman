@@ -102,6 +102,67 @@ fn unopenable_processes_still_report_an_identity_and_a_priority() {
     );
 }
 
+/// Windows core processes must never lose their User name / Elevated values.
+///
+/// Their tokens refuse every interactive caller (protected processes and
+/// kernel pseudo-processes do not have a readable one at all), so the answer
+/// comes from identity evidence — a verified Windows image, or the kernel's
+/// own bare pseudo-name — instead of from a token read. The regression this
+/// pins: version metadata read from the wrong string table left the evidence
+/// empty on localized Windows, which blanked the User name and Elevated
+/// columns of every protected process.
+#[cfg(target_os = "windows")]
+#[test]
+fn windows_core_processes_report_their_owning_account() {
+    let mut collector = tm_platform::create_collector();
+    let snapshot = collector.sample(std::time::Instant::now()).expect("tick");
+
+    let system_owned = ["smss", "csrss", "wininit", "winlogon", "services", "lsass"];
+    let mut checked = 0usize;
+    for p in snapshot
+        .processes
+        .iter()
+        .filter(|p| !p.synthetic && p.pid > 4)
+    {
+        let stem = p.name.to_ascii_lowercase();
+        let stem = stem.strip_suffix(".exe").unwrap_or(&stem);
+        let expect_system =
+            system_owned.contains(&stem) || stem == "registry" || stem == "memory compression";
+        let expect_dwm = stem == "dwm";
+        if !expect_system && !expect_dwm {
+            continue;
+        }
+        checked += 1;
+        let user = p
+            .user
+            .as_deref()
+            .unwrap_or_else(|| panic!("{} ({}) has no user name", p.name, p.pid));
+        if expect_system {
+            assert_eq!(
+                user, "SYSTEM",
+                "{} ({}) must run under SYSTEM",
+                p.name, p.pid
+            );
+        } else {
+            assert!(
+                user.contains("DWM"),
+                "dwm.exe ({}) runs the DWM session account, not {user:?}",
+                p.pid
+            );
+        }
+        assert!(
+            p.elevated.is_some(),
+            "{} ({}) must know its elevation",
+            p.name,
+            p.pid
+        );
+    }
+    assert!(
+        checked >= 4,
+        "only {checked} core processes were present; the assertion proved nothing"
+    );
+}
+
 #[test]
 fn sample_produces_sane_snapshot() {
     let mut collector = tm_platform::create_collector();

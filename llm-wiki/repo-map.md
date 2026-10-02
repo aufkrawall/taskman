@@ -50,7 +50,11 @@ platform boundary (`tm-core` ← `tm-platform` ← `tm-app` / `tm-service`), and
 - `crates/tm-platform`
   - OS collectors/actions behind traits (`actions.rs`). Windows stack under
     `win/`: `sampler.rs` (sysinfo + NtQuerySystemInformation CPU accountant,
-    time-based attr TTL cache with token security + command-line queries,
+    time-based attr TTL cache with token security + command-line queries and a
+    brokered token-identity fallback (bounded retry per process) for the
+    SYSTEM/service processes no local token read reaches, plus role fallbacks
+    with explicit identity evidence — verified Windows image or the kernel's
+    own bare pseudo-process name — never a name match),
     measured CPU speed from PDH `% Processor Performance`, interrupt-time
     counter, synthetic CPU pseudo-rows "System Interrupts"/"Terminated
     processes"), `cpu_load.rs`
@@ -81,7 +85,7 @@ platform boundary (`tm-core` ← `tm-platform` ← `tm-app` / `tm-service`), and
     through a thread map seeded from ToolHelp and maintained by the
     `Microsoft-Windows-Kernel-Process` thread events; a request whose thread
     cannot be mapped is never charged to a row),
-    `core_service.rs` (versioned authenticated named-pipe broker, including bounded identity-bound process-security/module reads for protected targets, plus secure
+    `core_service.rs` (versioned authenticated named-pipe broker, including bounded identity-bound process-security/token-identity/module reads for protected targets, plus secure
     SCM/Program Files/ProgramData install lifecycle, including pinned
     reparse/hard-link-resistant owner/group/DACL repair), `autostart.rs` (owned-command-
     only HKCU startup migration), `taskmgr_replacement.rs` (owned IFEO
@@ -113,7 +117,10 @@ platform boundary (`tm-core` ← `tm-platform` ← `tm-app` / `tm-service`), and
     exempted from EcoQoS — it carries every keystroke on the desktop, and a tray
     icon is exactly what Windows throttles — and nothing blocking, `tracing`
     included, runs on it while a hook is installed),
-    `version.rs` (cached PE metadata). Linux/macOS backends exist and are
+    `version.rs` (cached PE metadata, read through each file's own
+    `\VarFileInfo\Translation` table with a UI-language preference — hardcoded
+    English codepages silently blanked every binary shipping only a localized
+    table). Linux/macOS backends exist and are
     built by default (`build.py`).
 - `crates/tm-app`
   - eframe GUI. `main.rs` (startup sequence: args → console only for CLI →

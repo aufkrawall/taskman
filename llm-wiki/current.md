@@ -1,6 +1,6 @@
 # Current State
 
-Last cross-checked: 2026-09-25
+Last cross-checked: 2026-10-02
 
 ## Summary
 
@@ -14,6 +14,40 @@ correctness, table interaction, Performance visuals, and advanced process
 diagnostics; remaining telemetry and accessibility work is itemized precisely
 in `known-debt.md`. Normal GUI startup remains unelevated; privileged controls
 can cross a protected, allowlisted service boundary after one explicit install.
+
+## Process identity for protected processes (2026-10-02)
+
+Every Details row that HAS an owner now resolves its user name, SID, elevation
+and UAC virtualization. Sources in order (`win/sampler.rs`): the local token
+read, the LocalSystem broker's identity-bound `ProcessIdentity` read (protocol
+v6 — one bounded payload per PID, bound to the sampled creation time; see
+`core-service.md`), the SCM service account, and finally fixed system roles
+under EXPLICIT identity evidence (`sampler.rs::RoleEvidence`):
+
+- `VerifiedWindowsImage` — image under `%SystemRoot%` (or Defender's
+  directories) with a Microsoft publisher. Gates the boot-critical roles:
+  smss/csrss/wininit/winlogon/services/lsass → "SYSTEM", dwm →
+  "DWM-\<session\>", fontdrvhost → "UMFD-\<session\>".
+- `KernelPseudoProcess` — the kernel's own BARE pseudo-name
+  (Registry/MemCompression/Secure System) from
+  `NtQuerySystemInformation(SystemProcessIdInformation)`. Those have no image
+  file and no token; a real image always resolves to a full device path, so
+  the bare name (no directory, no extension) is kernel-produced evidence a
+  spoofed image name cannot fake. They report "SYSTEM" and never WOW64.
+
+Nothing else is inferred: an owner no source can prove renders "—". Same rule
+for the brokered read — an unanswered identity is retried on a bounded horizon
+(`IDENTITY_BROKER_RETRY`) and never guessed.
+
+`win/version.rs` reads FileDescription/CompanyName through each file's own
+`\VarFileInfo\Translation` table (UI language first; the English blocks stay as
+fallback). Hardcoded English codepages used to blank every binary that ships
+only a localized table — on a German Windows that is csrss/smss/wininit/
+winlogon/services/dwm/audiodg — which in turn disabled the verified-image
+evidence above and blanked exactly those rows' User name/Elevated columns.
+Pinned by `windows_core_processes_report_their_owning_account` (live, fails
+before on localized systems), `a_windows_core_binary_resolves_its_version_metadata`,
+and the `candidate_codepages` unit tests.
 
 ## Keyboard interaction model (2026-09-25)
 

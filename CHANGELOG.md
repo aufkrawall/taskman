@@ -2,6 +2,43 @@
 
 ## Unreleased
 
+### Fixed
+
+- **User name / Elevated for protected processes:** the Details rows of
+  boot-critical Windows processes (smss, csrss, wininit, winlogon, services,
+  lsass, dwm), kernel pseudo-processes (Registry, Memory Compression, Secure
+  System) and the font/session hosts again resolve their owning account
+  ("SYSTEM", "DWM-\<session\>", "UMFD-\<session\>") with their SID and
+  elevation instead of showing "—" / "Unknown". A spoofed image name still
+  earns nothing: only a verified Windows image or the kernel's own
+  pseudo-process name is accepted as evidence.
+- **Version metadata on localized Windows:** FileDescription / CompanyName are
+  read from each file's own version-resource translation table instead of the
+  English blocks only. Binaries that ship only a localized table (csrss and
+  friends on a German Windows) used to lose their friendly name and company,
+  which also disabled the Windows-image evidence behind the system-role
+  fallbacks above.
+- **Elevated after account inheritance:** a process that inherits a service
+  account from a same-image service parent now reports the matching elevation
+  and UAC virtualization instead of "Unknown".
+
+### Improved
+
+- **Per-process identity for unopenable processes:** the LocalSystem service
+  answers a bounded, PID+creation-time-bound token identity read (account,
+  SID, elevation, UAC virtualization) for the SYSTEM/service processes the
+  interactive GUI's own token cannot open at all — the rows that used to be
+  the last ones with a blank User name. An unanswered read still renders "—"
+  and is retried on a bounded horizon; nothing is ever guessed.
+
+### Changed
+
+- **Core service protocol v6:** the identity read above is a wire addition, so
+  GUI and service must be upgraded together (setup does exactly that). Against
+  an older service, privileged broker calls are refused with "action state is
+  unknown" instead of being misapplied, and identity reads answer nothing —
+  the affected rows keep "—" until the service is upgraded.
+
 ## 0.1.17 - 2026-10-02
 
 ### Fixed

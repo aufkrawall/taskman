@@ -1626,68 +1626,92 @@ pub struct TokenSecurity {
 }
 
 pub fn token_security(pid: u32) -> TokenSecurity {
-    use windows::Win32::Security::{
-        GetTokenInformation, TOKEN_ELEVATION, TOKEN_QUERY, TokenElevation,
-        TokenVirtualizationAllowed, TokenVirtualizationEnabled,
+    let empty = TokenSecurity {
+        elevated: None,
+        virtualization: None,
     };
+    unsafe {
+        let Ok(h) = open_process(pid, th::PROCESS_QUERY_LIMITED_INFORMATION) else {
+            return empty;
+        };
+        let security = match open_query_token(h) {
+            Some(token) => {
+                let out = token_security_of(token);
+                let _ = CloseHandle(token);
+                out
+            }
+            None => empty,
+        };
+        let _ = CloseHandle(h);
+        security
+    }
+}
+
+/// Open the token of an already-open process handle for a plain query.
+/// `TOKEN_QUERY` is all an identity/elevation read needs, and the process
+/// handle must carry `PROCESS_QUERY_LIMITED_INFORMATION`.
+unsafe fn open_query_token(process: HANDLE) -> Option<HANDLE> {
+    use windows::Win32::Security::TOKEN_QUERY;
     use windows::Win32::System::Threading::OpenProcessToken;
+
+    let mut token = HANDLE::default();
+    unsafe { OpenProcessToken(process, TOKEN_QUERY, &mut token) }.ok()?;
+    Some(token)
+}
+
+/// [`token_security`] for a token that is already open.
+unsafe fn token_security_of(token: HANDLE) -> TokenSecurity {
+    use windows::Win32::Security::{
+        GetTokenInformation, TOKEN_ELEVATION, TokenElevation, TokenVirtualizationAllowed,
+        TokenVirtualizationEnabled,
+    };
 
     let mut out = TokenSecurity {
         elevated: None,
         virtualization: None,
     };
     unsafe {
-        let Ok(h) = open_process(pid, th::PROCESS_QUERY_LIMITED_INFORMATION) else {
-            return out;
-        };
-        let mut token = HANDLE::default();
-        if OpenProcessToken(h, TOKEN_QUERY, &mut token).is_ok() {
-            // --- elevation ---
-            let mut elev = TOKEN_ELEVATION::default();
+        // --- elevation ---
+        let mut elev = TOKEN_ELEVATION::default();
+        let mut ret: u32 = 0;
+        if GetTokenInformation(
+            token,
+            TokenElevation,
+            Some(&mut elev as *mut _ as *mut _),
+            std::mem::size_of::<TOKEN_ELEVATION>() as u32,
+            &mut ret,
+        )
+        .is_ok()
+        {
+            out.elevated = Some(elev.TokenIsElevated != 0);
+        }
+
+        // --- UAC virtualization ---
+        let query_dword = |cls: windows::Win32::Security::TOKEN_INFORMATION_CLASS| -> Option<u32> {
+            let mut val: u32 = 0;
             let mut ret: u32 = 0;
-            if GetTokenInformation(
+            GetTokenInformation(
                 token,
-                TokenElevation,
-                Some(&mut elev as *mut _ as *mut _),
-                std::mem::size_of::<TOKEN_ELEVATION>() as u32,
+                cls,
+                Some(&mut val as *mut u32 as *mut _),
+                std::mem::size_of::<u32>() as u32,
                 &mut ret,
             )
-            .is_ok()
-            {
-                out.elevated = Some(elev.TokenIsElevated != 0);
-            }
-
-            // --- UAC virtualization ---
-            let query_dword =
-                |cls: windows::Win32::Security::TOKEN_INFORMATION_CLASS| -> Option<u32> {
-                    let mut val: u32 = 0;
-                    let mut ret: u32 = 0;
-                    GetTokenInformation(
-                        token,
-                        cls,
-                        Some(&mut val as *mut u32 as *mut _),
-                        std::mem::size_of::<u32>() as u32,
-                        &mut ret,
-                    )
-                    .ok()?;
-                    Some(val)
-                };
-            let allowed = query_dword(TokenVirtualizationAllowed);
-            let enabled = query_dword(TokenVirtualizationEnabled);
-            out.virtualization = match (allowed, enabled) {
-                (Some(a), Some(e)) => Some(if a == 0 {
-                    tm_core::model::UacVirtualization::NotAllowed
-                } else if e != 0 {
-                    tm_core::model::UacVirtualization::Enabled
-                } else {
-                    tm_core::model::UacVirtualization::Disabled
-                }),
-                _ => None,
-            };
-
-            let _ = CloseHandle(token);
-        }
-        let _ = CloseHandle(h);
+            .ok()?;
+            Some(val)
+        };
+        let allowed = query_dword(TokenVirtualizationAllowed);
+        let enabled = query_dword(TokenVirtualizationEnabled);
+        out.virtualization = match (allowed, enabled) {
+            (Some(a), Some(e)) => Some(if a == 0 {
+                tm_core::model::UacVirtualization::NotAllowed
+            } else if e != 0 {
+                tm_core::model::UacVirtualization::Enabled
+            } else {
+                tm_core::model::UacVirtualization::Disabled
+            }),
+            _ => None,
+        };
     }
     out
 }
@@ -1715,16 +1739,26 @@ pub struct TokenIdentity {
 /// Returns `None` when the owner genuinely cannot be determined; callers must
 /// never substitute a guessed account for it.
 pub fn token_identity(pid: u32) -> Option<TokenIdentity> {
-    use windows::Win32::Security::{GetTokenInformation, TOKEN_QUERY, TOKEN_USER, TokenUser};
-    use windows::Win32::System::Threading::OpenProcessToken;
-
     unsafe {
         let h = open_process(pid, th::PROCESS_QUERY_LIMITED_INFORMATION).ok()?;
-        let mut token = HANDLE::default();
-        if OpenProcessToken(h, TOKEN_QUERY, &mut token).is_err() {
-            let _ = CloseHandle(h);
-            return None;
-        }
+        let identity = match open_query_token(h) {
+            Some(token) => {
+                let out = token_user_of(token);
+                let _ = CloseHandle(token);
+                out
+            }
+            None => None,
+        };
+        let _ = CloseHandle(h);
+        identity
+    }
+}
+
+/// [`token_identity`] for a token that is already open.
+unsafe fn token_user_of(token: HANDLE) -> Option<TokenIdentity> {
+    use windows::Win32::Security::{GetTokenInformation, TOKEN_USER, TokenUser};
+
+    unsafe {
         // TOKEN_USER is a fixed header pointing at a variable-length SID that
         // the kernel appends behind it, so the buffer must be sized by the
         // first (deliberately failing) call rather than by the struct.
@@ -1740,8 +1774,6 @@ pub fn token_identity(pid: u32) -> Option<TokenIdentity> {
             &mut needed,
         )
         .is_ok();
-        let _ = CloseHandle(token);
-        let _ = CloseHandle(h);
         if !ok {
             return None;
         }
@@ -1752,6 +1784,60 @@ pub fn token_identity(pid: u32) -> Option<TokenIdentity> {
             sid: sid_to_string(user.User.Sid),
         })
     }
+}
+
+/// Token identity of one process as the LocalSystem broker answers it: the
+/// account name and SID plus the elevation and UAC-virtualization facts, all
+/// read from ONE open token. A bounded, read-only payload — this exists so
+/// the User/Elevated columns of SYSTEM and service processes do not stay
+/// blank in an unelevated GUI, not as a generic token query interface.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProcessTokenIdentity {
+    pub name: String,
+    pub sid: Option<String>,
+    pub elevated: Option<bool>,
+    pub virtualization: Option<tm_core::model::UacVirtualization>,
+}
+
+/// Token identity of the EXACT live process `expected_start_epoch_s` names.
+/// The identity check happens on the same handle the token is read from, so a
+/// recycled PID can never hand over another process's account.
+pub fn process_identity_checked(
+    pid: u32,
+    expected_start_epoch_s: Option<i64>,
+) -> Result<ProcessTokenIdentity> {
+    enable_debug_privilege();
+    let process = open_process_verified(
+        pid,
+        th::PROCESS_QUERY_LIMITED_INFORMATION,
+        expected_start_epoch_s,
+    )?;
+    let result = unsafe {
+        match open_query_token(process) {
+            Some(token) => {
+                let identity = token_user_of(token);
+                let security = token_security_of(token);
+                let _ = CloseHandle(token);
+                identity
+                    .map(|identity| ProcessTokenIdentity {
+                        name: identity.name,
+                        sid: identity.sid,
+                        elevated: security.elevated,
+                        virtualization: security.virtualization,
+                    })
+                    .ok_or_else(|| {
+                        TmError::platform("GetTokenInformation", "the token user cannot be read")
+                    })
+            }
+            None => Err(TmError::platform(
+                "OpenProcessToken",
+                "the process token cannot be queried",
+            )),
+        }
+    };
+    let _ = unsafe { CloseHandle(process) };
+    result
 }
 
 /// Memo for SID → account name. `LookupAccountSidW` can reach out to a domain
@@ -2538,6 +2624,23 @@ mod tests {
             own.sid.as_deref().is_some_and(|sid| sid.starts_with("S-")),
             "own SID must be a string SID: {own:?}"
         );
+    }
+
+    /// The brokered identity read answers the same account for the exact
+    /// process the caller named, plus the elevation fact from the same token.
+    /// A wrong creation time must refuse instead of handing over another
+    /// process's identity.
+    #[test]
+    fn process_identity_checked_is_bound_to_the_exact_process() {
+        let me = std::process::id();
+        let identity = process_identity_checked(me, None).expect("own token identity");
+        assert_eq!(identity.name, token_identity(me).expect("own owner").name);
+        assert!(!identity.name.is_empty());
+        assert_eq!(identity.elevated, Some(is_elevated()));
+
+        // The identity binding is exactly what a borrowed pid needs to fail.
+        let stale = process_identity_checked(me, Some(1));
+        assert!(stale.is_err(), "a mismatched creation time must refuse");
     }
 
     /// The NT AUTHORITY pseudo-domain is localized, so recognizing only the

@@ -63,8 +63,10 @@ pub const SERVICE_LOG_FILE_PREFIX: &str = "taskman-service.log";
 // old service fails the handshake as unavailable, allowing the GUI's safe local
 // fallback instead of misclassifying an unknown request as a rejection. v5
 // carries the disk decoder's event counts, which separate an idle disk from a
-// decoder that could not read a single record.
-pub const PROTOCOL_VERSION: u16 = 5;
+// decoder that could not read a single record. v6 adds `ProcessIdentity`, the
+// identity-bound token read that fills the User/Elevated columns of the
+// SYSTEM/service processes an unelevated GUI cannot open at all.
+pub const PROTOCOL_VERSION: u16 = 6;
 
 const PIPE_NAME: &str = r"\\.\pipe\Taskman.Core.v1";
 const FRAME_MAGIC: [u8; 4] = *b"TMB1";
@@ -161,6 +163,14 @@ enum BrokerRequest {
     },
     /// Read-only, identity-bound hardening metadata used by Process Properties.
     ProcessSecurityInfo {
+        pid: u32,
+        expected_start_epoch_s: Option<i64>,
+    },
+    /// Read-only, identity-bound token identity (account, SID, elevation, UAC
+    /// virtualization). Brokered because the interactive GUI's own token
+    /// cannot open the token of SYSTEM/service processes — exactly the rows
+    /// whose User/Elevated columns would otherwise stay blank.
+    ProcessIdentity {
         pid: u32,
         expected_start_epoch_s: Option<i64>,
     },
@@ -274,6 +284,7 @@ enum BrokerValue {
     ProcessNetwork(ProcessNetworkSample),
     ProcessDisk(ProcessDiskSample),
     ProcessSecurity(super::ProcessSecurityInfo),
+    ProcessIdentity(super::process_ops::ProcessTokenIdentity),
     ProcessModules(Vec<ProcessModule>),
     /// Result of `UnloadModule`. `released` is retained only for compatibility
     /// with the earlier v2 wire shape; it now means successful remote
@@ -819,6 +830,36 @@ pub(crate) fn brokered_process_disk() -> BrokeredDisk {
         Ok(_) => BrokeredDisk::Rejected("unexpected response type".into()),
         Err(BrokerCallError::Unavailable(_)) => BrokeredDisk::Unavailable,
         Err(BrokerCallError::Rejected(detail)) => BrokeredDisk::Rejected(detail),
+    }
+}
+
+/// Outcome of asking the broker for one process's token identity. The three
+/// cases mean exactly what [`BrokeredNetwork`]'s do.
+pub(crate) enum BrokeredIdentity {
+    Token(super::process_ops::ProcessTokenIdentity),
+    Unavailable,
+    Rejected(String),
+}
+
+/// Ask the protected service for the token identity of one exact process.
+///
+/// This is the only way an unelevated GUI learns who owns the SYSTEM and
+/// service processes: their processes and tokens both refuse our own token,
+/// while LocalSystem opens the unprotected ones. Routed through the bounded
+/// telemetry lane like the counter queries so a wedged service can stall one
+/// worker for its deadline, never the sampling engine.
+pub(crate) fn brokered_process_identity(
+    pid: u32,
+    expected_start_epoch_s: Option<i64>,
+) -> BrokeredIdentity {
+    match telemetry_broker_call(BrokerRequest::ProcessIdentity {
+        pid,
+        expected_start_epoch_s,
+    }) {
+        Ok(BrokerValue::ProcessIdentity(identity)) => BrokeredIdentity::Token(identity),
+        Ok(_) => BrokeredIdentity::Rejected("unexpected response type".into()),
+        Err(BrokerCallError::Unavailable(_)) => BrokeredIdentity::Unavailable,
+        Err(BrokerCallError::Rejected(detail)) => BrokeredIdentity::Rejected(detail),
     }
 }
 
@@ -1961,6 +2002,20 @@ fn dispatch(
             };
             Ok(BrokerValue::ProcessSecurity(
                 super::process_ops::process_security_info(pid, Some(start_epoch_s))?,
+            ))
+        }
+        BrokerRequest::ProcessIdentity {
+            pid,
+            expected_start_epoch_s,
+        } => {
+            let Some(start_epoch_s) = expected_start_epoch_s.filter(|value| *value > 0) else {
+                return Err(TmError::platform(
+                    "broker process identity",
+                    "a valid sampled process creation time is required",
+                ));
+            };
+            Ok(BrokerValue::ProcessIdentity(
+                super::process_ops::process_identity_checked(pid, Some(start_epoch_s))?,
             ))
         }
         BrokerRequest::ProcessModules {
@@ -3599,6 +3654,71 @@ mod tests {
             "unexpected":true
         }"#;
         assert!(serde_json::from_slice::<BrokerRequest>(payload).is_err());
+    }
+
+    /// The identity read is a bound, read-only query: no positive sampled
+    /// creation time means no answer, exactly like the security/module reads.
+    #[test]
+    fn the_identity_read_requires_an_exact_process_identity() {
+        let probe = |expected_start_epoch_s| {
+            dispatch(
+                &crate::win::WinActions,
+                BrokerRequest::ProcessIdentity {
+                    pid: 101,
+                    expected_start_epoch_s,
+                },
+                500,
+            )
+        };
+        assert!(probe(None).is_err(), "pid-only reads are refused");
+        assert!(
+            probe(Some(0)).is_err(),
+            "an implausible creation time is refused"
+        );
+    }
+
+    /// Wire shape: a bounded identity payload that neither side can grow
+    /// silently, and unknown fields stay rejected on the request.
+    #[test]
+    fn the_identity_read_round_trips_as_a_bounded_payload() {
+        let request = BrokerRequest::ProcessIdentity {
+            pid: 101,
+            expected_start_epoch_s: Some(202),
+        };
+        let encoded = serde_json::to_string(&request).unwrap();
+        assert_eq!(
+            encoded,
+            r#"{"operation":"process_identity","pid":101,"expected_start_epoch_s":202}"#
+        );
+        assert!(matches!(
+            serde_json::from_str::<BrokerRequest>(&encoded).unwrap(),
+            BrokerRequest::ProcessIdentity {
+                pid: 101,
+                expected_start_epoch_s: Some(202),
+            }
+        ));
+        let grown = encoded.replace('}', r#","extra":true}"#);
+        assert!(serde_json::from_str::<BrokerRequest>(&grown).is_err());
+
+        let response = BrokerResponse {
+            protocol_version: PROTOCOL_VERSION,
+            value: Ok(BrokerValue::ProcessIdentity(
+                crate::win::process_ops::ProcessTokenIdentity {
+                    name: "SYSTEM".into(),
+                    sid: Some("S-1-5-18".into()),
+                    elevated: Some(true),
+                    virtualization: Some(tm_core::model::UacVirtualization::NotAllowed),
+                },
+            )),
+        };
+        let decoded: BrokerResponse =
+            serde_json::from_slice(&serde_json::to_vec(&response).unwrap()).unwrap();
+        let Ok(BrokerValue::ProcessIdentity(identity)) = decoded.value else {
+            panic!("identity response did not round trip");
+        };
+        assert_eq!(identity.name, "SYSTEM");
+        assert_eq!(identity.sid.as_deref(), Some("S-1-5-18"));
+        assert_eq!(identity.elevated, Some(true));
     }
 
     #[test]

@@ -32,6 +32,10 @@ use tm_core::model::*;
 /// (not tick-count based) so behavior stays identical at High/Normal/Low
 /// update speeds; entries also invalidate when the process identity changes.
 const ATTR_REFRESH_TTL: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Retry horizon for a broker identity read that produced no answer. See
+/// [`PidAttrs::identity_retry_at`].
+const IDENTITY_BROKER_RETRY: std::time::Duration = std::time::Duration::from_secs(60);
 /// Efficiency mode (EcoQoS) is a live status column, not a slow-changing
 /// attribute: browsers toggle it as tabs go background. Refresh it on its own
 /// short TTL so the leaf is not up to [`ATTR_REFRESH_TTL`] stale.
@@ -91,6 +95,12 @@ struct PidAttrs {
     start_epoch_s: Option<i64>,
     /// When these values were last queried natively.
     refreshed_at: Instant,
+    /// Earliest time the LocalSystem broker may be asked for this process's
+    /// identity again after it had no answer. Identity cannot change while a
+    /// process lives, so a successful answer never repeats; a failed one is
+    /// retried only after [`IDENTITY_BROKER_RETRY`] (a service may appear or
+    /// be upgraded later, and a busy telemetry lane can also miss once).
+    identity_retry_at: Option<Instant>,
     /// Efficiency mode flips whenever a browser backgrounds a tab, so it
     /// gets its own short TTL — a single cheap
     /// OpenProcess/GetProcessInformation pair, unlike the PEB and token
@@ -218,6 +228,9 @@ pub struct Sampler {
     /// Image paths for the processes no handle can be opened for. Cached
     /// because the answer cannot change while a process lives.
     image_paths: image_path::ImagePaths,
+    /// Whether the one-time "broker refused identity reads" line was written.
+    /// One refusal explains the state; one per process does not.
+    identity_rejection_logged: bool,
 }
 
 /// One process's disk values from the last window that was long enough to
@@ -297,35 +310,64 @@ fn disk_active_pct(service_time: u64, total_service_time: u64, machine_active_pc
         as f32
 }
 
+/// What identifies a process as one of the fixed Windows system roles whose
+/// account cannot be read from a token.
+///
+/// These processes refuse `OpenProcess`/`OpenProcessToken` to everything short
+/// of a higher protection level (and several of them have no token at all), so
+/// no query anywhere can produce their owner. The account is only asserted on
+/// positive identity evidence — a name alone is trivially spoofable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RoleEvidence {
+    /// The image resolved under `%SystemRoot%` (or Defender's directories)
+    /// with a Microsoft publisher: a spoofed `csrss.exe` from a user folder
+    /// never qualifies.
+    VerifiedWindowsImage,
+    /// The KERNEL named the process itself as a pseudo-process (see
+    /// [`kernel_pseudo_role`]): there is no image file behind the entry at all.
+    KernelPseudoProcess,
+    /// Nothing stood in for the unreadable token. The answer stays unknown.
+    None,
+}
+
 fn fallback_user_for_known_role(
     stem: &str,
     session: Option<u32>,
-    verified_windows_image: bool,
+    evidence: RoleEvidence,
 ) -> Option<String> {
-    if !verified_windows_image {
-        return None;
+    match evidence {
+        RoleEvidence::VerifiedWindowsImage => {
+            if stem == "dwm" {
+                return Some(format!("DWM-{}", session.unwrap_or(1)));
+            }
+            if stem == "fontdrvhost" {
+                return Some(format!("UMFD-{}", session.unwrap_or(0)));
+            }
+            matches!(
+                stem,
+                "[system process]"
+                    | "system"
+                    | "secure system"
+                    | "registry"
+                    | "memory compression"
+                    | "smss"
+                    | "csrss"
+                    | "wininit"
+                    | "services"
+                    | "lsass"
+                    | "winlogon"
+            )
+            .then(|| "SYSTEM".to_string())
+        }
+        // Kernel pseudo-processes run in kernel context and never carry a
+        // user token; Windows' own tools attribute them to SYSTEM.
+        RoleEvidence::KernelPseudoProcess => matches!(
+            stem,
+            "registry" | "memory compression" | "secure system" | "memcompression"
+        )
+        .then(|| "SYSTEM".to_string()),
+        RoleEvidence::None => None,
     }
-    if stem == "dwm" {
-        return Some(format!("DWM-{}", session.unwrap_or(1)));
-    }
-    if stem == "fontdrvhost" {
-        return Some(format!("UMFD-{}", session.unwrap_or(0)));
-    }
-    matches!(
-        stem,
-        "[system process]"
-            | "system"
-            | "secure system"
-            | "registry"
-            | "memory compression"
-            | "smss"
-            | "csrss"
-            | "wininit"
-            | "services"
-            | "lsass"
-            | "winlogon"
-    )
-    .then(|| "SYSTEM".to_string())
 }
 
 /// One process's cumulative network counters at the previous tick.
@@ -375,6 +417,7 @@ impl Sampler {
             last_proc_disk: HashMap::new(),
             zombie_pids: HashSet::new(),
             last_sys_reset: None,
+            identity_rejection_logged: false,
             not_responding_hold: NotRespondingHold::default(),
         }
     }
@@ -436,16 +479,17 @@ impl Sampler {
         // The owning account cannot change while a process lives, so a TTL
         // refresh of the mutable attributes must not pay for the token +
         // account lookup again. Only a different identity forces a re-read.
-        let (known_user, known_sid) = self
+        let (known_user, known_sid, known_retry_at) = self
             .attrs
             .get(&pid)
             .filter(|a| a.start_epoch_s == start_epoch_s)
-            .map(|a| (a.user.clone(), a.user_sid.clone()))
-            .unwrap_or((None, None));
-        let identity = (known_user.is_none() || known_sid.is_none())
+            .map(|a| (a.user.clone(), a.user_sid.clone(), a.identity_retry_at))
+            .unwrap_or((None, None, None));
+        let identity_missing = known_user.is_none() || known_sid.is_none();
+        let mut identity = identity_missing
             .then(|| process_ops::token_identity(pid))
             .flatten();
-        let security = if self.demand.wants(TelemetryDemand::TOKEN_SECURITY) {
+        let mut security = if self.demand.wants(TelemetryDemand::TOKEN_SECURITY) {
             process_ops::token_security(pid)
         } else {
             process_ops::TokenSecurity {
@@ -453,6 +497,53 @@ impl Sampler {
                 virtualization: None,
             }
         };
+        // Local token reads fail for exactly the rows that need the answer
+        // most: processes and tokens owned by SYSTEM or a service account
+        // deny an interactive user everything. The LocalSystem broker opens
+        // the unprotected ones, so it is asked instead — bounded per process
+        // by the retry horizon and routed through the shared telemetry lane.
+        let wants_identity = identity_missing && identity.is_none();
+        let wants_security = self.demand.wants(TelemetryDemand::TOKEN_SECURITY)
+            && security.elevated.is_none()
+            && security.virtualization.is_none();
+        let mut identity_retry_at = known_retry_at;
+        if (wants_identity || wants_security)
+            && start_epoch_s.is_some()
+            && identity_retry_at.is_none_or(|at| at.elapsed() >= IDENTITY_BROKER_RETRY)
+        {
+            match core_service::brokered_process_identity(pid, start_epoch_s) {
+                core_service::BrokeredIdentity::Token(token) => {
+                    identity_retry_at = None;
+                    if wants_identity {
+                        identity = Some(process_ops::TokenIdentity {
+                            name: token.name.clone(),
+                            sid: token.sid.clone(),
+                        });
+                    }
+                    if security.elevated.is_none() {
+                        security.elevated = token.elevated;
+                    }
+                    if security.virtualization.is_none() {
+                        security.virtualization = token.virtualization;
+                    }
+                }
+                // No service, a foreign client, a busy telemetry lane or a
+                // policy refusal: the account stays unknown ("—", never a
+                // guess), and the ask is retried after the horizon. Only the
+                // first refusal is worth a line — it is a state explanation,
+                // not per-process news.
+                core_service::BrokeredIdentity::Unavailable => {
+                    identity_retry_at = Some(Instant::now());
+                }
+                core_service::BrokeredIdentity::Rejected(detail) => {
+                    if !self.identity_rejection_logged {
+                        self.identity_rejection_logged = true;
+                        tracing::debug!(%detail, "broker refused a process identity read");
+                    }
+                    identity_retry_at = Some(Instant::now());
+                }
+            }
+        }
         let fresh = PidAttrs {
             session_id: process_ops::session_id_of(pid),
             user: known_user.or_else(|| identity.as_ref().map(|i| i.name.clone())),
@@ -468,6 +559,7 @@ impl Sampler {
             start_epoch_s,
             refreshed_at: Instant::now(),
             power_refreshed_at: Instant::now(),
+            identity_retry_at,
         };
         self.attrs.insert(pid, fresh.clone());
         fresh
@@ -1365,13 +1457,22 @@ impl Sampler {
             }
 
             let verified_windows_image = is_windows_owned_image(p) == Some(true);
+            // The kernel names pseudo-processes itself (bare pseudo-name,
+            // never a path), which is the only identity evidence they have:
+            // there is no image file to verify and no token to read.
+            let kernel_pseudo = kernel_pseudo_role(p.exe_path.as_deref()).is_some();
             let is_kernel_or_system = p.pid == 0
                 || p.pid == 4
+                || kernel_pseudo
                 || (classify::is_core_os_image(&p.name) && verified_windows_image);
 
             p.wow64 = a.wow64;
             if p.wow64.is_none() {
-                if let Some(exe_path) = &p.exe_path {
+                if kernel_pseudo {
+                    // No image file exists to inspect, and kernel context is
+                    // never a WOW64 process.
+                    p.wow64 = Some(false);
+                } else if let Some(exe_path) = &p.exe_path {
                     p.wow64 = process_ops::pe_is_wow64(exe_path);
                 } else if is_kernel_or_system {
                     p.wow64 = Some(false);
@@ -1406,7 +1507,14 @@ impl Sampler {
                 p.user = if p.pid == 0 || p.pid == 4 {
                     Some("SYSTEM".to_string())
                 } else {
-                    fallback_user_for_known_role(stem, session, verified_windows_image)
+                    let evidence = if verified_windows_image {
+                        RoleEvidence::VerifiedWindowsImage
+                    } else if kernel_pseudo {
+                        RoleEvidence::KernelPseudoProcess
+                    } else {
+                        RoleEvidence::None
+                    };
+                    fallback_user_for_known_role(stem, session, evidence)
                 };
             }
             // The SID column stays useful for session-0 hosts whose token
@@ -1423,25 +1531,15 @@ impl Sampler {
 
             // If token_security could not query elevation (e.g. kernel processes,
             // protected processes or session 0 services), infer it from identity:
-            // Kernel pseudo-processes, verified core OS images and known
-            // service accounts run without UAC virtualization.
-            if p.elevated.is_none() {
-                let is_service_account = p.user.as_deref().is_some_and(|u| {
-                    u.eq_ignore_ascii_case("SYSTEM")
-                        || u.eq_ignore_ascii_case("LOCAL SERVICE")
-                        || u.eq_ignore_ascii_case("NETWORK SERVICE")
-                        || u.to_ascii_uppercase().starts_with("NT SERVICE\\")
-                        || u.to_ascii_uppercase().starts_with("DWM-")
-                        || u.to_ascii_uppercase().starts_with("UMFD-")
-                });
-
-                if is_kernel_or_system || is_service_account {
-                    p.elevated = Some(true);
-                    if p.uac_virtualization.is_none() {
-                        p.uac_virtualization = Some(tm_core::model::UacVirtualization::NotAllowed);
-                    }
+            // kernel pseudo-processes, verified core OS images and known
+            // privileged accounts run without UAC virtualization.
+            if p.elevated.is_none() && is_kernel_or_system {
+                p.elevated = Some(true);
+                if p.uac_virtualization.is_none() {
+                    p.uac_virtualization = Some(tm_core::model::UacVirtualization::NotAllowed);
                 }
             }
+            infer_elevation_from_account(p);
         }
 
         // A per-session helper of a service often runs under the same
@@ -1449,6 +1547,14 @@ impl Sampler {
         // (NVIDIA's session container). The SCM catalog names the service
         // account authoritatively, so a same-image child may inherit it.
         inherit_same_image_service_accounts(&mut processes, &service_catalog);
+        // Inheritance above can hand a privileged account to a row AFTER its
+        // elevation inference already ran (a same-image child of a service
+        // host shows "SYSTEM" with "Unknown" elevation otherwise). The same
+        // account means the same UAC state, so infer again for the rows that
+        // gained one.
+        for p in processes.iter_mut() {
+            infer_elevation_from_account(p);
+        }
 
         // ---- classification refinement + App grouping (TM semantics) -------------
         // Every process with a visible window is an app root; windowless
@@ -1786,6 +1892,53 @@ fn microsoft_company(company: Option<&str>) -> bool {
         company.eq_ignore_ascii_case("Microsoft Corporation")
             || company.eq_ignore_ascii_case("Microsoft Windows")
     })
+}
+
+/// Kernel pseudo-processes ("Registry", "Memory Compression", "Secure
+/// System") have no image file and no user token; every handle-based API
+/// refuses them. `NtQuerySystemInformation(SystemProcessIdInformation)` —
+/// the kernel's own answer, see [`crate::win::image_path`] — names them as a
+/// BARE name: no NT device prefix, no directory, no extension. Every real
+/// image resolves to a full device path instead (even one named `Registry`),
+/// so this is positive kernel evidence, not a spoofable name match.
+fn kernel_pseudo_role(exe_path: Option<&std::path::Path>) -> Option<&str> {
+    let text = exe_path?.to_str()?;
+    if text.contains(['\\', '/']) || text.contains('.') {
+        return None;
+    }
+    let lower = text.to_ascii_lowercase();
+    matches!(
+        lower.as_str(),
+        "registry" | "memcompression" | "secure system" | "[system process]"
+    )
+    .then_some(text)
+}
+
+/// Infer elevation/UAC state from a KNOWN privileged account when the token
+/// itself cannot be queried. SYSTEM, the three service accounts, `NT SERVICE\`
+/// hosts and the DWM/UMFD session accounts all run full tokens without UAC
+/// virtualization, which is exactly what the Elevated column reports for
+/// them. Unknown accounts stay unknown.
+fn infer_elevation_from_account(p: &mut ProcessEntry) {
+    if p.elevated.is_some() {
+        return;
+    }
+    let Some(user) = p.user.as_deref() else {
+        return;
+    };
+    let upper = user.to_ascii_uppercase();
+    let is_service_account = user.eq_ignore_ascii_case("SYSTEM")
+        || user.eq_ignore_ascii_case("LOCAL SERVICE")
+        || user.eq_ignore_ascii_case("NETWORK SERVICE")
+        || upper.starts_with("NT SERVICE\\")
+        || upper.starts_with("DWM-")
+        || upper.starts_with("UMFD-");
+    if is_service_account {
+        p.elevated = Some(true);
+        if p.uac_virtualization.is_none() {
+            p.uac_virtualization = Some(tm_core::model::UacVirtualization::NotAllowed);
+        }
+    }
 }
 
 /// Tests whether a process has terminated.
@@ -2150,17 +2303,91 @@ mod tests {
     #[test]
     fn session_zero_alone_does_not_assert_system_account() {
         assert_eq!(
-            fallback_user_for_known_role("thirdparty", Some(0), true),
+            fallback_user_for_known_role("thirdparty", Some(0), RoleEvidence::VerifiedWindowsImage),
             None
         );
         assert_eq!(
-            fallback_user_for_known_role("services", Some(0), false),
+            fallback_user_for_known_role("services", Some(0), RoleEvidence::None),
             None
         );
         assert_eq!(
-            fallback_user_for_known_role("services", Some(0), true).as_deref(),
+            fallback_user_for_known_role("services", Some(0), RoleEvidence::VerifiedWindowsImage)
+                .as_deref(),
             Some("SYSTEM")
         );
+    }
+
+    /// A spoofed image name must never earn a system role: only the kernel's
+    /// own bare pseudo-name (or a verified Windows image) is evidence.
+    #[test]
+    fn a_system_role_needs_identity_evidence() {
+        for stem in ["registry", "memory compression", "csrss", "lsass"] {
+            assert_eq!(
+                fallback_user_for_known_role(stem, Some(0), RoleEvidence::None),
+                None,
+                "{stem} without evidence"
+            );
+        }
+        // The kernel named these itself; they have no image and no token.
+        for stem in ["registry", "memory compression", "secure system"] {
+            assert_eq!(
+                fallback_user_for_known_role(stem, Some(0), RoleEvidence::KernelPseudoProcess)
+                    .as_deref(),
+                Some("SYSTEM"),
+                "{stem} as a kernel pseudo-process"
+            );
+        }
+        // A verified Windows image with a core name is the other accepted
+        // form of evidence (csrss.exe and friends).
+        assert_eq!(
+            fallback_user_for_known_role("csrss", Some(0), RoleEvidence::VerifiedWindowsImage)
+                .as_deref(),
+            Some("SYSTEM")
+        );
+    }
+
+    /// The pseudo-process evidence is a kernel-answered BARE name; anything
+    /// with a directory or an extension is a real image file, whatever it is
+    /// called.
+    #[test]
+    fn kernel_pseudo_evidence_rejects_real_image_paths() {
+        use std::path::Path;
+        assert!(kernel_pseudo_role(Some(Path::new("Registry"))).is_some());
+        assert!(kernel_pseudo_role(Some(Path::new("MemCompression"))).is_some());
+        assert!(kernel_pseudo_role(Some(Path::new("Secure System"))).is_some());
+        assert!(kernel_pseudo_role(None).is_none());
+        assert!(kernel_pseudo_role(Some(Path::new(r"\Device\HarddiskVolume3\Registry"))).is_none());
+        assert!(kernel_pseudo_role(Some(Path::new(r"C:\Users\dev\Registry"))).is_none());
+        assert!(kernel_pseudo_role(Some(Path::new(r"C:\Tools\Registry.exe"))).is_none());
+        assert!(kernel_pseudo_role(Some(Path::new("svchost.exe"))).is_none());
+    }
+
+    /// Elevation falls out of a known privileged account when the token
+    /// cannot be queried — including for rows that inherited the account from
+    /// a same-image service parent AFTER the per-row inference ran.
+    #[test]
+    fn a_known_privileged_account_implies_elevation() {
+        let mut system = ProcessEntry::new(1, "child.exe");
+        system.user = Some("SYSTEM".into());
+        infer_elevation_from_account(&mut system);
+        assert_eq!(system.elevated, Some(true));
+        assert_eq!(
+            system.uac_virtualization,
+            Some(tm_core::model::UacVirtualization::NotAllowed)
+        );
+
+        let mut user = ProcessEntry::new(2, "app.exe");
+        user.user = Some("alice".into());
+        infer_elevation_from_account(&mut user);
+        assert_eq!(user.elevated, None, "a plain account proves nothing");
+        assert_eq!(user.uac_virtualization, None);
+
+        // A token-sourced answer is authoritative and never overwritten.
+        let mut known = ProcessEntry::new(3, "app.exe");
+        known.user = Some("SYSTEM".into());
+        known.elevated = Some(false);
+        infer_elevation_from_account(&mut known);
+        assert_eq!(known.elevated, Some(false));
     }
 
     fn sample(unattributed_pct: f32, exited: u32) -> LoadSample {
