@@ -253,6 +253,12 @@ mod tests {
         assert!(user.sid().unwrap().starts_with("S-1-"));
         assert!(user.start_menu_dir().unwrap().is_absolute());
         assert!(user.desktop_dir().unwrap().is_absolute());
-        user.ensure_launchable().unwrap();
+        // An interactive desktop may be unelevated (standard interactive session)
+        // or elevated (CI runneradmin / UAC disabled). If elevated, launch must
+        // be refused rather than failing unexpectedly.
+        match user.ensure_launchable() {
+            Ok(()) => {}
+            Err(err) => assert!(err.to_string().contains("disable post-install launch")),
+        }
     }
 }
