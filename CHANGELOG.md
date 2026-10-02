@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.1.17 - 2026-10-02
+
 ### Fixed
 
 - **Setup launch access denied:** fixed post-install desktop launch failing with
