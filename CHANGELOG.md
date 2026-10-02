@@ -21,6 +21,19 @@
 - **Elevated after account inheritance:** a process that inherits a service
   account from a same-image service parent now reports the matching elevation
   and UAC virtualization instead of "Unknown".
+- **End process tree killed unrelated processes:** a process whose original
+  parent had exited was treated as a child of whatever process later received
+  that recycled PID, so ending that process's tree could also end Explorer or
+  any other long-running program. Descendants now come from one kernel
+  snapshot of PIDs, parent links and creation times, and a "child" older than
+  its parent is no longer part of the tree.
+- **End process tree reported spurious failures:** children that exited on
+  their own while the tree was being ended no longer turn a complete success
+  into an error, and a failure to end the selected process itself is now the
+  error shown instead of a child's.
+- **"Process not found" errors:** actions on a process that has already exited
+  report that it no longer exists instead of a raw "The parameter is
+  incorrect" platform error.
 
 ### Improved
 

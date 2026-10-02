@@ -6,7 +6,9 @@
 //! routing it through the LocalSystem core-service broker.
 
 use tm_core::error::{Result, TmError};
-use windows::Win32::Foundation::{CloseHandle, FILETIME, HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT};
+use windows::Win32::Foundation::{
+    CloseHandle, ERROR_INVALID_PARAMETER, FILETIME, HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT,
+};
 use windows::Win32::System::Threading as th;
 use windows::core::PWSTR;
 
@@ -70,7 +72,7 @@ pub fn restart(pid: u32, expected_start_epoch_s: Option<i64>) -> Result<()> {
     let access =
         th::PROCESS_TERMINATE | th::PROCESS_QUERY_LIMITED_INFORMATION | th::PROCESS_SYNCHRONIZE;
     let process = unsafe { th::OpenProcess(access, false, pid) }.map_err(|error| {
-        if error.code().0 == 87 {
+        if error.code() == ERROR_INVALID_PARAMETER.to_hresult() {
             TmError::ProcessNotFound { pid }
         } else {
             TmError::platform("OpenProcess(restart Explorer)", error.to_string())

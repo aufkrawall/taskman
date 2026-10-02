@@ -693,6 +693,8 @@ struct Offsets {
     /// Field holding the name offset, relative to the record start.
     image_name_buffer: usize,
     base_priority: usize,
+    /// InheritedFromUniqueProcessId: the parent PID recorded at creation.
+    inherited_from: usize,
     session_id: usize,
     handle_count: usize,
     peak_working_set: usize,
@@ -730,6 +732,7 @@ impl Offsets {
                 image_name_buffer: 64,
                 base_priority: 72,
                 pid: 80,
+                inherited_from: 88,
                 handle_count: 96,
                 session_id: 100,
                 peak_working_set: 136,
@@ -750,6 +753,7 @@ impl Offsets {
                 image_name_buffer: 60,
                 base_priority: 64,
                 pid: 68,
+                inherited_from: 72,
                 handle_count: 76,
                 session_id: 80,
                 peak_working_set: 100,
@@ -762,6 +766,53 @@ impl Offsets {
                 min_size: 132,
             }
         }
+    }
+}
+
+/// One process's link in the creation tree, as a single kernel snapshot
+/// reports it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TreeLink {
+    pub pid: u32,
+    /// Parent PID recorded when the process was created. That parent may
+    /// have exited since and its PID been recycled by an unrelated process.
+    pub parent_pid: u32,
+    /// Creation time as a raw FILETIME (100 ns since 1601) — the same value
+    /// `GetProcessTimes` returns through a handle.
+    pub create_time: u64,
+}
+
+/// Every process's PID, recorded parent PID and creation time, all from ONE
+/// `SystemProcessInformation` snapshot. `None` when the kernel refused or the
+/// table did not parse: callers acting destructively must fail closed.
+///
+/// Parent links are only meaningful together with creation times from the
+/// same instant — a child is never older than its parent, and a "child" that
+/// is older than the process now holding its parent's PID belongs to a
+/// recycled PID, not to this tree.
+pub(crate) fn process_tree_snapshot() -> Option<Vec<TreeLink>> {
+    let mut buf = vec![0u8; 512 * 1024];
+    let written = CpuLoadAccountant::nt_query(&mut buf, SystemProcessInformation)?;
+    let off = Offsets::get();
+    let mut out = Vec::with_capacity(256);
+    let mut pos = 0usize;
+    loop {
+        if pos.checked_add(off.min_size)? > written {
+            return None;
+        }
+        out.push(TreeLink {
+            pid: read_usize(&buf, pos + off.pid) as u32,
+            parent_pid: read_usize(&buf, pos + off.inherited_from) as u32,
+            create_time: u64::try_from(read_i64(&buf, pos + off.create_time)).unwrap_or(0),
+        });
+        let next = read_u32(&buf, pos) as usize;
+        if next == 0 {
+            return Some(out);
+        }
+        if next < off.min_size {
+            return None;
+        }
+        pos = pos.checked_add(next)?;
     }
 }
 
@@ -1145,6 +1196,11 @@ mod tests {
         assert_eq!(
             off.pid,
             offset_of!(SYSTEM_PROCESS_INFORMATION, UniqueProcessId)
+        );
+        // The crate models InheritedFromUniqueProcessId as `Reserved2`.
+        assert_eq!(
+            off.inherited_from,
+            offset_of!(SYSTEM_PROCESS_INFORMATION, Reserved2)
         );
         assert_eq!(
             off.session_id,

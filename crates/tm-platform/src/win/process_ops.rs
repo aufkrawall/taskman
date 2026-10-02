@@ -4,7 +4,9 @@
 use crate::actions::{MODULE_UNLOAD_SINGLE_RELEASE_MARKER, ModuleUnloadOutcome, ProcessModule};
 use tm_core::error::{Result, TmError};
 use tm_core::model::PriorityClass;
-use windows::Win32::Foundation::{CloseHandle, ERROR_ACCESS_DENIED, FILETIME, HANDLE};
+use windows::Win32::Foundation::{
+    CloseHandle, ERROR_ACCESS_DENIED, ERROR_INVALID_PARAMETER, FILETIME, HANDLE,
+};
 use windows::Win32::System::Threading as th;
 use windows::Win32::UI::Shell::ShellExecuteExW;
 use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
@@ -13,7 +15,9 @@ use windows::core::PCWSTR;
 fn open_process(pid: u32, access: th::PROCESS_ACCESS_RIGHTS) -> Result<HANDLE> {
     unsafe {
         let h = th::OpenProcess(access, false, pid).map_err(|e| {
-            if e.code().0 == 87 {
+            // windows-rs reports the Win32 error as an HRESULT (0x80070057),
+            // never as the bare 87 a raw comparison would expect.
+            if e.code() == ERROR_INVALID_PARAMETER.to_hresult() {
                 TmError::ProcessNotFound { pid }
             } else {
                 TmError::platform("OpenProcess", e.to_string())
@@ -40,7 +44,11 @@ fn creation_filetime_from_handle(h: HANDLE) -> Option<u64> {
 /// Creation time in Unix seconds for matching sampler identities. It is read
 /// through an already-open handle, so PID recycling cannot change the answer.
 fn creation_epoch_from_handle(h: HANDLE) -> Option<i64> {
-    let raw = creation_filetime_from_handle(h)?;
+    filetime_to_epoch(creation_filetime_from_handle(h)?)
+}
+
+/// Raw FILETIME -> the Unix seconds every identity check compares.
+fn filetime_to_epoch(raw: u64) -> Option<i64> {
     i64::try_from(raw.saturating_sub(116_444_736_000_000_000) / 10_000_000).ok()
 }
 
@@ -1224,13 +1232,20 @@ pub(crate) fn kill_process_excluding(
     let root =
         open_destructive_process_verified(pid, th::PROCESS_TERMINATE, expected_start_epoch_s)?;
     let root_creation = creation_filetime_from_handle(root);
-    // Descendants: capture each child's creation time right at enumeration;
-    // terminate_verified re-checks it through the handle before firing.
-    let children = collect_children_with_births(pid);
+    // Descendants, with creation times from the same kernel snapshot as their
+    // parent links; terminate_verified re-checks each through its handle.
+    let children = root_creation.and_then(|birth| collect_children_with_births(pid, birth));
     if let Err(error) = verify_pid_still_refers_to(pid, root_creation) {
         let _ = unsafe { CloseHandle(root) };
         return Err(error);
     }
+    let Some(children) = children else {
+        let _ = unsafe { CloseHandle(root) };
+        return Err(TmError::platform(
+            "terminate process tree",
+            "could not enumerate the process tree",
+        ));
+    };
     // Kill descendants depth-first (deepest last in BFS order → reverse).
     let mut err: Option<TmError> = None;
     for (c, birth) in children.iter().rev() {
@@ -1244,73 +1259,70 @@ pub(crate) fn kill_process_excluding(
                 format!("could not establish the creation time of child process {c}"),
             )),
         };
-        if let Err(e) = result {
-            tracing::debug!(child = c, error = %e, "tree-kill child failed");
-            err.get_or_insert(e);
+        match result {
+            // A child that exited on its own since the snapshot (or whose PID
+            // already belongs to someone else) is gone — the goal of the
+            // action, not a failure of it.
+            Ok(()) | Err(TmError::ProcessNotFound { .. }) => {}
+            Err(e) => {
+                tracing::debug!(child = c, error = %e, "tree-kill child failed");
+                err.get_or_insert(e);
+            }
         }
     }
     let root_result = terminate_handle(root);
     let _ = unsafe { CloseHandle(root) };
-    match root_result {
-        Ok(()) => err.map_or(Ok(()), Err),
-        Err(e) => Err(err.unwrap_or(e)),
-    }
+    // The root is what the user selected: its own failure is the headline.
+    root_result.and(err.map_or(Ok(()), Err))
 }
 
-/// BFS all descendant pids of `pid` via a full process snapshot, capturing
-/// each child's creation time as observed AT ENUMERATION TIME. The later
-/// handle-bound re-check compares against these values, so a child that
-/// exits and whose pid is recycled before termination is refused.
-fn collect_children_with_births(root: u32) -> Vec<(u32, Option<i64>)> {
-    use windows::Win32::System::Diagnostics::ToolHelp::{
-        CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW,
-        TH32CS_SNAPPROCESS,
-    };
+/// Every descendant of `root` (created at FILETIME `root_birth`) with its
+/// creation time in Unix seconds, in BFS order. `None` when the kernel
+/// process table could not be read — the caller must not guess a tree.
+///
+/// PIDs, parent links and creation times all come from ONE kernel snapshot.
+/// The previous Toolhelp walk matched on recorded parent PID alone and read
+/// each creation time afterwards through a fresh handle, so it took two
+/// kinds of strangers for children: a process whose long-dead parent's PID
+/// the root had since inherited (explorer.exe's recorded parent is userinit,
+/// which exits at logon), and a process that recycled a child's PID between
+/// the walk and the handle open.
+fn collect_children_with_births(root: u32, root_birth: u64) -> Option<Vec<(u32, Option<i64>)>> {
+    let table = super::cpu_load::process_tree_snapshot()?;
+    Some(
+        descendants(root, root_birth, &table)
+            .into_iter()
+            .map(|link| (link.pid, filetime_to_epoch(link.create_time)))
+            .collect(),
+    )
+}
 
-    let mut parent_map: std::collections::HashMap<u32, Vec<u32>> = Default::default();
-    unsafe {
-        let Ok(snap) = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) else {
-            return Vec::new();
-        };
-        let mut entry = PROCESSENTRY32W {
-            dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
-            ..Default::default()
-        };
-        if Process32FirstW(snap, &mut entry).is_ok() {
-            loop {
-                parent_map
-                    .entry(entry.th32ParentProcessID)
-                    .or_default()
-                    .push(entry.th32ProcessID);
-                if Process32NextW(snap, &mut entry).is_err() {
-                    break;
-                }
-            }
+/// BFS over `table` from `root`. A process is only a child of its recorded
+/// parent when it was created no earlier than that parent: an older "child"
+/// names a parent PID that has since been recycled.
+fn descendants(
+    root: u32,
+    root_birth: u64,
+    table: &[super::cpu_load::TreeLink],
+) -> Vec<super::cpu_load::TreeLink> {
+    let mut children_of: std::collections::HashMap<u32, Vec<&super::cpu_load::TreeLink>> =
+        Default::default();
+    for link in table {
+        // Idle (PID 0) names itself as its parent.
+        if link.pid != link.parent_pid {
+            children_of.entry(link.parent_pid).or_default().push(link);
         }
-        let _ = CloseHandle(snap);
     }
-
     let mut out = Vec::new();
-    let mut queue = std::collections::VecDeque::from([root]);
+    let mut queue = std::collections::VecDeque::from([(root, root_birth)]);
     let mut seen: std::collections::HashSet<u32> = std::collections::HashSet::from([root]);
-    while let Some(p) = queue.pop_front() {
-        if let Some(kids) = parent_map.get(&p) {
-            for k in kids.clone() {
-                if seen.insert(k) {
-                    // Birth captured now, verified again via the handle later.
-                    let birth = open_process(k, th::PROCESS_QUERY_LIMITED_INFORMATION)
-                        .ok()
-                        .and_then(|h| {
-                            let t = creation_epoch_from_handle(h);
-                            unsafe {
-                                let _ = CloseHandle(h);
-                            }
-                            t
-                        });
-                    out.push((k, birth));
-                    queue.push_back(k);
-                }
+    while let Some((parent, parent_birth)) = queue.pop_front() {
+        for link in children_of.get(&parent).into_iter().flatten() {
+            if link.create_time < parent_birth || !seen.insert(link.pid) {
+                continue;
             }
+            out.push(**link);
+            queue.push_back((link.pid, link.create_time));
         }
     }
     out
@@ -2578,6 +2590,82 @@ fn split_command(cmd: &str) -> (String, Option<String>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn link(pid: u32, parent_pid: u32, create_time: u64) -> super::super::cpu_load::TreeLink {
+        super::super::cpu_load::TreeLink {
+            pid,
+            parent_pid,
+            create_time,
+        }
+    }
+
+    /// A recorded parent PID is only evidence of parenthood when the child is
+    /// not older than the process now holding that PID. explorer.exe records
+    /// userinit as its parent; once userinit has exited and a new process
+    /// inherits the PID, ending that new process's tree must not take the
+    /// shell down with it.
+    #[test]
+    fn tree_walk_rejects_children_older_than_a_recycled_parent_pid() {
+        let table = [
+            link(100, 4, 1_000),   // the selected root
+            link(200, 100, 500),   // explorer: recorded parent 100, but older
+            link(201, 200, 600),   // explorer's own child
+            link(300, 100, 1_500), // a genuine child
+            link(400, 300, 1_600), // a genuine grandchild
+            link(500, 300, 1_200), // older than 300: 300's PID was recycled
+            link(0, 0, 0),         // Idle names itself as its parent
+        ];
+        let pids: Vec<u32> = descendants(100, 1_000, &table)
+            .iter()
+            .map(|link| link.pid)
+            .collect();
+        assert_eq!(pids, [300, 400]);
+    }
+
+    /// A child created in the same 100 ns tick as its parent is still its
+    /// child, and a parent-link cycle (two recycled PIDs naming each other)
+    /// cannot loop the walk.
+    #[test]
+    fn tree_walk_accepts_simultaneous_births_and_survives_cycles() {
+        let table = [link(10, 11, 50), link(11, 10, 50), link(12, 10, 50)];
+        let mut pids: Vec<u32> = descendants(10, 50, &table)
+            .iter()
+            .map(|link| link.pid)
+            .collect();
+        pids.sort_unstable();
+        assert_eq!(pids, [11, 12]);
+    }
+
+    /// Live: the kernel snapshot links this test process to its parent with
+    /// a creation time identical to the one its own handle reports, which is
+    /// what lets terminate_verified re-check each child exactly.
+    #[test]
+    fn kernel_tree_snapshot_matches_handle_creation_time() {
+        let me = std::process::id();
+        let table = super::super::cpu_load::process_tree_snapshot().expect("kernel process table");
+        let own = table
+            .iter()
+            .find(|link| link.pid == me)
+            .expect("own process is in the table");
+        let handle = open_process(me, th::PROCESS_QUERY_LIMITED_INFORMATION).expect("open self");
+        let birth = creation_filetime_from_handle(handle);
+        let _ = unsafe { CloseHandle(handle) };
+        assert_eq!(Some(own.create_time), birth);
+        assert_ne!(own.parent_pid, me);
+    }
+
+    /// A vanished PID must surface as "not found", the variant the tree kill
+    /// treats as already done. windows-rs reports ERROR_INVALID_PARAMETER as
+    /// an HRESULT, which a bare `== 87` never matched.
+    #[test]
+    fn opening_a_missing_pid_reports_process_not_found() {
+        // PIDs are multiples of 4; this one can never be issued.
+        let missing = 0xFFFF_FFF1;
+        assert!(matches!(
+            open_process(missing, th::PROCESS_QUERY_LIMITED_INFORMATION),
+            Err(TmError::ProcessNotFound { pid }) if pid == missing
+        ));
+    }
 
     /// Every scheduling change that can stall the `WH_KEYBOARD_LL` hook
     /// thread must refuse this process, because the cost is paid by every
