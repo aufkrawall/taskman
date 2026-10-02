@@ -1,13 +1,12 @@
 //! Static CPU facts: sockets, physical cores, caches, virtualization, base clock.
 //! Sources: GetLogicalProcessorInformationEx (topology/caches), CPUID and SMBIOS.
 
-use std::collections::HashSet;
-
 #[derive(Debug, Clone, Default)]
 pub struct CpuStatic {
     pub sockets: usize,
     pub physical_cores: usize,
-    /// Total distinct L1 cache across the package, KB.
+    /// Total L1 cache (data + instruction) summed over every distinct
+    /// cache instance on the machine, KB — what Task Manager labels L1.
     pub l1_kb_total: u64,
     pub l2_kb_total: u64,
     pub l3_kb_total: u64,
@@ -22,22 +21,12 @@ impl CpuStatic {
         // ---- topology + caches via GLPI ------------------------------------
         collect_topology(&mut out);
 
+        out.virtualization = virtualization_state().into();
+
         // ---- cpuid extras ---------------------------------------------------
         #[cfg(target_arch = "x86_64")]
         {
             let cpuid = raw_cpuid::CpuId::new();
-            if let Some(fi) = cpuid.get_feature_info() {
-                let hypervisor = fi.has_hypervisor();
-                let has_vmx = fi.has_vmx();
-                let has_svm = cpuid
-                    .get_extended_processor_and_feature_identifiers()
-                    .is_some_and(|x| x.has_svm());
-                out.virtualization = if has_vmx || has_svm || hypervisor {
-                    "Enabled".into()
-                } else {
-                    "Disabled".into()
-                };
-            }
             if let Some(freq) = cpuid.get_processor_frequency_info() {
                 out.base_mhz = freq.processor_base_frequency() as f32;
             }
@@ -67,6 +56,31 @@ impl CpuStatic {
             out.sockets = 1;
         }
         out
+    }
+}
+
+/// Task Manager's "Virtualization" row: whether hardware virtualization is
+/// usable, not merely whether the CPU implements it.
+///
+/// CPUID's VMX/SVM bits describe the silicon and stay set when the firmware
+/// has the feature switched off, so they reported "Enabled" on exactly the
+/// machines where it is not. `PF_VIRT_FIRMWARE_ENABLED` is the OS's answer to
+/// the firmware question. A running hypervisor (Hyper-V, VBS) also counts:
+/// the root partition then sees virtualized CPUID, but the feature is in use.
+fn virtualization_state() -> &'static str {
+    use windows::Win32::System::Threading::{IsProcessorFeaturePresent, PF_VIRT_FIRMWARE_ENABLED};
+
+    let firmware_enabled = unsafe { IsProcessorFeaturePresent(PF_VIRT_FIRMWARE_ENABLED) }.as_bool();
+    #[cfg(target_arch = "x86_64")]
+    let hypervisor = raw_cpuid::CpuId::new()
+        .get_feature_info()
+        .is_some_and(|fi| fi.has_hypervisor());
+    #[cfg(not(target_arch = "x86_64"))]
+    let hypervisor = false;
+    if firmware_enabled || hypervisor {
+        "Enabled"
+    } else {
+        "Disabled"
     }
 }
 
@@ -178,7 +192,6 @@ fn collect_topology(out: &mut CpuStatic) {
 
         // Walk the variable-length entries.
         let mut offset = 0usize;
-        let mut seen_l1: HashSet<u64> = HashSet::new(); // dedupe by mask+size
         while offset + std::mem::size_of::<SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX>() <= buf.len() {
             let entry =
                 &*(buf.as_ptr().add(offset) as *const SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX);
@@ -191,17 +204,7 @@ fn collect_topology(out: &mut CpuStatic) {
                 r if r == rel_core => out.physical_cores += 1,
                 r if r == rel_cache => {
                     let cache = &entry.Anonymous.Cache;
-                    // Sharers across processor groups (usually one group).
-                    let sharers = cache.Anonymous.GroupMask.Mask.count_ones().max(1) as u64;
-                    let size_bytes = cache.CacheSize as u64;
-                    let level = cache.Level;
-                    match level {
-                        1 => out.l1_kb_total += size_bytes / sharers / 1024,
-                        2 => out.l2_kb_total += size_bytes / sharers / 1024,
-                        3 => out.l3_kb_total += size_bytes / sharers / 1024,
-                        _ => {}
-                    }
-                    let _ = &mut seen_l1;
+                    add_cache(out, cache.Level, u64::from(cache.CacheSize));
                 }
                 _ => {}
             }
@@ -213,9 +216,53 @@ fn collect_topology(out: &mut CpuStatic) {
     }
 }
 
+/// Fold one `RelationCache` record into the per-level totals.
+///
+/// Every record is one physical cache instance; its processor mask only says
+/// which logical processors share it. The size is therefore counted once, in
+/// full — dividing it by the sharers reported a 32 MB L3 shared by 16
+/// threads as 2 MB, and halved every SMT core's L1/L2.
+fn add_cache(out: &mut CpuStatic, level: u8, size_bytes: u64) {
+    let kb = size_bytes / 1024;
+    match level {
+        1 => out.l1_kb_total += kb,
+        2 => out.l2_kb_total += kb,
+        3 => out.l3_kb_total += kb,
+        _ => {}
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Ryzen 7 5700X: 8 SMT cores, each with 32 KB L1d + 32 KB L1i + 512 KB
+    /// L2 shared by its two threads, and one 32 MB L3 shared by all 16.
+    /// Task Manager shows 512 KB / 4.0 MB / 32.0 MB.
+    #[test]
+    fn shared_caches_count_once_at_full_size() {
+        let mut out = CpuStatic::default();
+        for _core in 0..8 {
+            add_cache(&mut out, 1, 32 * 1024);
+            add_cache(&mut out, 1, 32 * 1024);
+            add_cache(&mut out, 2, 512 * 1024);
+        }
+        add_cache(&mut out, 3, 32 * 1024 * 1024);
+        assert_eq!(out.l1_kb_total, 512);
+        assert_eq!(out.l2_kb_total, 4096);
+        assert_eq!(out.l3_kb_total, 32 * 1024);
+    }
+
+    /// Live: the kernel topology walk yields caches, and the virtualization
+    /// row is always one of the two states the UI translates.
+    #[test]
+    fn live_topology_reports_caches_and_a_virtualization_state() {
+        let mut out = CpuStatic::default();
+        collect_topology(&mut out);
+        assert!(out.physical_cores > 0);
+        assert!(out.l1_kb_total > 0 && out.l2_kb_total > 0);
+        assert!(matches!(virtualization_state(), "Enabled" | "Disabled"));
+    }
 
     #[test]
     fn smbios_type4_current_speed_is_preferred() {

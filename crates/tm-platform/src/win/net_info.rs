@@ -65,12 +65,7 @@ pub fn adapters() -> HashMap<String, AdapterInfo> {
         };
         let desc = unsafe { adapter.Description.to_string() }.unwrap_or_default();
         let oper_up = adapter.OperStatus == IfOperStatusUp;
-        // Prefer the transmit speed; fall back to receive for odd drivers.
-        let link_bps = if adapter.TransmitLinkSpeed > 0 {
-            adapter.TransmitLinkSpeed
-        } else {
-            adapter.ReceiveLinkSpeed
-        };
+        let link_bps = link_speed_bps(adapter.TransmitLinkSpeed, adapter.ReceiveLinkSpeed);
         let wifi = ssids.get(&format!("{:?}", adapter.NetworkGuid).to_lowercase());
         let (ipv4, ipv6) = preferred_unicast_addresses(adapter.FirstUnicastAddress);
         out.insert(
@@ -87,6 +82,23 @@ pub fn adapters() -> HashMap<String, AdapterInfo> {
         );
     }
     out
+}
+
+/// NDIS reports an unknown link speed as all-ones (`NDIS_LINK_SPEED_UNKNOWN`).
+/// Virtual adapters that are up but have no physical link (Wi-Fi Direct,
+/// some VPN miniports) report exactly that.
+const LINK_SPEED_UNKNOWN: u64 = u64::MAX;
+
+/// Negotiated link speed in bits/s, 0 when unknown.
+///
+/// Prefers the transmit speed and falls back to receive for odd drivers. The
+/// all-ones sentinel must not pass as a measurement: it rendered as an
+/// 18-million-Tbit/s link and divided every utilization figure to zero.
+fn link_speed_bps(transmit: u64, receive: u64) -> u64 {
+    [transmit, receive]
+        .into_iter()
+        .find(|speed| *speed != 0 && *speed != LINK_SPEED_UNKNOWN)
+        .unwrap_or(0)
 }
 
 /// SSID per wireless interface, keyed by the lowercase debug form of the
@@ -223,5 +235,19 @@ fn adapter_addresses() -> Option<super::aligned::AlignedBuf> {
             return None;
         }
         // Buffer too small: loop retries with the size reported above.
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unknown_link_speed_is_not_a_measurement() {
+        assert_eq!(link_speed_bps(LINK_SPEED_UNKNOWN, LINK_SPEED_UNKNOWN), 0);
+        assert_eq!(link_speed_bps(0, 0), 0);
+        assert_eq!(link_speed_bps(LINK_SPEED_UNKNOWN, 100_000_000), 100_000_000);
+        assert_eq!(link_speed_bps(1_000_000_000, 100_000_000), 1_000_000_000);
+        assert_eq!(link_speed_bps(0, 300_000_000), 300_000_000);
     }
 }

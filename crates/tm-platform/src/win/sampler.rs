@@ -12,7 +12,7 @@
 use crate::win::cpu_load::{CpuLoadAccountant, LoadSample};
 use crate::win::{
     core_service, cpu_info, disk_etw, gpu, image_path, memory_info, net_etw, net_info,
-    perfcounters, process_ops, threads_map, version, windows_enum,
+    perfcounters, process_ops, version, windows_enum,
 };
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
@@ -1130,7 +1130,6 @@ impl Sampler {
         let window_owners = windows_enum::window_owners();
         self.not_responding_hold
             .retain_windowed(&window_owners.visible);
-        let thread_counts = threads_map::thread_counts();
 
         // ---- CPU -----------------------------------------------------------------
         // Static identity/frequency from sysinfo; load numbers exclusively
@@ -1284,10 +1283,12 @@ impl Sampler {
                 self.cpu_load.start_epoch_of(pid_u)
             };
 
-            let threads = thread_counts
-                .get(&pid_u)
-                .copied()
-                .or_else(|| self.cpu_load.thread_count_of(pid_u, entry.start_epoch_s));
+            // From the kernel process table `cpu_load` refreshed at the top
+            // of this tick. A Toolhelp thread snapshot used to lead here; it
+            // walks every thread in the system one mapped-section call at a
+            // time (~30 ms per tick on a 5,000-thread desktop) to count what
+            // `SYSTEM_PROCESS_INFORMATION::NumberOfThreads` already states.
+            let threads = self.cpu_load.thread_count_of(pid_u, entry.start_epoch_s);
 
             let is_dead = is_zombie(
                 pid_u,
@@ -1444,7 +1445,7 @@ impl Sampler {
             // it could replay that executable's saved scheduling rules onto
             // this unrelated process.
             if p.exe_path.is_none() {
-                p.exe_path = self.image_paths.get(p.pid);
+                p.exe_path = self.image_paths.get(p.pid, p.start_epoch_s);
                 if let Some(exe) = p.exe_path.as_ref() {
                     let ver = version::query(&exe.to_string_lossy());
                     if p.display == p.name && !ver[0].is_empty() {

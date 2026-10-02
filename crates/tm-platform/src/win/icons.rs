@@ -3,6 +3,7 @@
 //! Manager shows in its process lists.
 
 use windows::Win32::Graphics::Gdi::BI_RGB;
+use windows::Win32::Graphics::Gdi::BITMAP;
 use windows::Win32::Graphics::Gdi::BITMAPINFO;
 use windows::Win32::Graphics::Gdi::BITMAPINFOHEADER;
 use windows::Win32::Graphics::Gdi::CreateCompatibleDC;
@@ -11,6 +12,7 @@ use windows::Win32::Graphics::Gdi::DeleteDC;
 use windows::Win32::Graphics::Gdi::DeleteObject;
 use windows::Win32::Graphics::Gdi::GetBitmapBits;
 use windows::Win32::Graphics::Gdi::GetDIBits;
+use windows::Win32::Graphics::Gdi::GetObjectW;
 use windows::Win32::Graphics::Gdi::SelectObject;
 use windows::Win32::UI::Shell::SHFILEINFOW;
 use windows::Win32::UI::Shell::SHGFI_ICON;
@@ -145,8 +147,12 @@ unsafe fn bitmap_to_rgba(
 
         // Read the mask bitmap (1 bpp) for the fallback path.
         let mut mask_bits: Vec<u8> = Vec::new();
-        let mask_stride = (w.div_ceil(32) * 4) as usize;
-        if !has_alpha && !mask.is_invalid() {
+        let mut mask_stride = 0usize;
+        if !has_alpha
+            && !mask.is_invalid()
+            && let Some(stride) = ddb_row_bytes(mask, w, h)
+        {
+            mask_stride = stride;
             let mdc = CreateCompatibleDC(None);
             let mold = SelectObject(mdc, mask.into());
             mask_bits = vec![0u8; mask_stride * h as usize];
@@ -190,5 +196,52 @@ unsafe fn bitmap_to_rgba(
             height: h,
             rgba,
         })
+    }
+}
+
+/// Scan-line length in bytes of a device-dependent `bitmap`, as
+/// `GetBitmapBits` lays it out, when the bitmap covers `w`x`h` pixels.
+///
+/// DDB scan lines are WORD-aligned (`BITMAP::bmWidthBytes` is only promised
+/// to be even), unlike the DWORD-aligned rows of a DIB. Assuming DWORD rows
+/// sheared the transparency mask of every legacy (alpha-less) icon whose
+/// width is an odd multiple of 16, such as 16 or 48 px.
+unsafe fn ddb_row_bytes(
+    bitmap: windows::Win32::Graphics::Gdi::HBITMAP,
+    w: u32,
+    h: u32,
+) -> Option<usize> {
+    let mut bm = BITMAP::default();
+    let got = unsafe {
+        GetObjectW(
+            bitmap.into(),
+            std::mem::size_of::<BITMAP>() as i32,
+            Some((&raw mut bm).cast()),
+        )
+    };
+    let row = usize::try_from(bm.bmWidthBytes).ok()?;
+    (got != 0
+        && bm.bmBitsPixel == 1
+        && row >= w.div_ceil(8) as usize
+        && bm.bmHeight.unsigned_abs() >= h)
+        .then_some(row)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use windows::Win32::Graphics::Gdi::CreateBitmap;
+
+    /// Pins the layout fact the mask decoder depends on: a monochrome DDB
+    /// pads rows to 16 bits, not 32 (48 px -> 6 bytes, not 8).
+    #[test]
+    fn monochrome_ddb_rows_are_word_aligned() {
+        for (w, expected) in [(16u32, 2usize), (32, 4), (48, 6), (20, 4)] {
+            let bitmap = unsafe { CreateBitmap(w as i32, w as i32, 1, 1, None) };
+            assert!(!bitmap.is_invalid());
+            let row = unsafe { ddb_row_bytes(bitmap, w, w) };
+            let _ = unsafe { DeleteObject(bitmap.into()) };
+            assert_eq!(row, Some(expected), "{w} px mask row");
+        }
     }
 }

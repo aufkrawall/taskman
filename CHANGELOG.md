@@ -34,6 +34,28 @@
 - **"Process not found" errors:** actions on a process that has already exited
   report that it no longer exists instead of a raw "The parameter is
   incorrect" platform error.
+- **CPU cache sizes:** the Performance CPU page divided every cache by the
+  number of threads sharing it, so a Ryzen 7 5700X showed L1 256 KB, L2 2 MB
+  and L3 2 MB instead of 512 KB, 4.0 MB and 32.0 MB. Each cache instance now
+  counts once at its full size, as in Task Manager.
+- **Virtualization row:** reports whether virtualization is enabled in the
+  firmware (or a hypervisor is running) instead of whether the CPU merely
+  supports it, which showed "Enabled" on machines where it is switched off.
+- **GPU, disk and CPU-speed telemetry after hiding the window:** once the
+  window had been hidden to the tray (or the consuming page left) for 30 s,
+  these counters never came back for the rest of the session and showed "—".
+  They now resume when they are needed again.
+- **Disk counters for C: on a shared disk:** a volume that shared its physical
+  disk with a later drive letter (C: and D: on one SSD) got no active time or
+  transfer rates.
+- **Process path after PID reuse:** a process whose PID previously belonged to
+  an exited process no longer inherits that process's path, description,
+  company or saved scheduling rules.
+- **Network link speed:** adapters that report an unknown link speed (Wi-Fi
+  Direct and some VPN adapters) no longer show an absurd multi-million Tbit/s
+  speed or zero out network utilization.
+- **Legacy icons on scaled displays:** icons without an alpha channel whose
+  width is an odd multiple of 16 px no longer get a sheared transparency mask.
 
 ### Improved
 
@@ -43,6 +65,9 @@
   interactive GUI's own token cannot open at all — the rows that used to be
   the last ones with a blank User name. An unanswered read still renders "—"
   and is retried on a bounded horizon; nothing is ever guessed.
+- **Lower sampling cost:** per-process thread counts are read from the kernel
+  process table the sampler already queries, instead of a Toolhelp thread
+  snapshot that cost about 30 ms of CPU on every tick on a typical desktop.
 
 ### Changed
 

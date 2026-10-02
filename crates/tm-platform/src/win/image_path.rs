@@ -164,16 +164,25 @@ fn device_map() -> Vec<(String, String)> {
 /// of a live process never changes, and the drive-letter map costs 26
 /// `QueryDosDeviceW` calls — trivial once, and 7000 calls on the first tick if
 /// rebuilt per process.
+///
+/// Entries are keyed by PID AND creation time. A PID-only key let a recycled
+/// PID inherit the previous process's path (and with it its description,
+/// company, Windows-image evidence and saved scheduling rules), because the
+/// periodic purge keeps any PID that is alive again.
 #[derive(Default)]
 pub struct ImagePaths {
-    resolved: HashMap<u32, Option<PathBuf>>,
+    resolved: HashMap<(u32, i64), Option<PathBuf>>,
     devices: Vec<(String, String)>,
 }
 
 impl ImagePaths {
-    /// Path of `pid`, asking the kernel at most once per process.
-    pub fn get(&mut self, pid: u32) -> Option<PathBuf> {
-        if let Some(known) = self.resolved.get(&pid) {
+    /// Path of `pid`, asking the kernel at most once per process. Without a
+    /// creation time the process has no identity to cache under, so the
+    /// answer is not remembered.
+    pub fn get(&mut self, pid: u32, start_epoch_s: Option<i64>) -> Option<PathBuf> {
+        if let Some(start) = start_epoch_s
+            && let Some(known) = self.resolved.get(&(pid, start))
+        {
             return known.clone();
         }
         let resolved = nt_path_of_pid(pid).map(|nt_path| {
@@ -190,7 +199,9 @@ impl ImagePaths {
             }
             PathBuf::from(dos)
         });
-        self.resolved.insert(pid, resolved.clone());
+        if let Some(start) = start_epoch_s {
+            self.resolved.insert((pid, start), resolved.clone());
+        }
         resolved
     }
 
@@ -199,18 +210,33 @@ impl ImagePaths {
         if live.is_empty() {
             return;
         }
-        self.resolved.retain(|pid, _| live.contains(pid));
+        self.resolved.retain(|(pid, _), _| live.contains(pid));
     }
 
     /// Drop a single process entry when evicted.
     pub fn remove(&mut self, pid: u32) {
-        self.resolved.remove(&pid);
+        self.resolved.retain(|(cached, _), _| *cached != pid);
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A recycled PID is a different process: the cached path of the dead
+    /// one must not answer for it, while the original identity still hits
+    /// the cache.
+    #[test]
+    fn a_recycled_pid_does_not_inherit_the_cached_path() {
+        let me = std::process::id();
+        let stale = PathBuf::from(r"C:\dead\previous.exe");
+        let mut paths = ImagePaths::default();
+        paths.resolved.insert((me, 1), Some(stale.clone()));
+        assert_ne!(paths.get(me, Some(2)), Some(stale.clone()));
+        assert_eq!(paths.get(me, Some(1)), Some(stale));
+        paths.remove(me);
+        assert!(paths.resolved.is_empty());
+    }
 
     #[test]
     fn device_prefixes_match_whole_names_only() {
@@ -256,10 +282,10 @@ mod tests {
     #[test]
     fn the_volume_map_is_built_once_per_cache() {
         let mut cache = ImagePaths::default();
-        let _ = cache.get(std::process::id());
+        let _ = cache.get(std::process::id(), Some(1));
         let after_first = cache.devices.len();
         assert!(after_first > 0, "no volumes mapped");
-        let _ = cache.get(std::process::id());
+        let _ = cache.get(std::process::id(), Some(1));
         assert_eq!(cache.devices.len(), after_first);
         // ...and a repeat lookup does not re-ask the kernel at all.
         assert_eq!(cache.resolved.len(), 1);

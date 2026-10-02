@@ -138,12 +138,17 @@ pub struct DiskPerf {
 
 impl DiskPerf {
     pub fn matches_mount(&self, mount: &str) -> bool {
-        let m = mount.trim_end_matches(['\\', '/']).to_uppercase();
+        let m = mount.trim_end_matches(['\\', '/']);
         if m.is_empty() {
             return false;
         }
-        // instance "0 C:" ends with the drive letter
-        self.instance.to_uppercase().ends_with(&m)
+        // The instance is the disk number followed by EVERY volume on it:
+        // "0 C:" or "0 C: D:". Matching only the tail left C: without
+        // counters whenever a second partition shared its disk.
+        self.instance
+            .split_whitespace()
+            .skip(1)
+            .any(|volume| volume.eq_ignore_ascii_case(m))
     }
 }
 
@@ -319,6 +324,31 @@ const CPU_PERF_PCT: &str = "\\Processor Information(_Total)\\% Processor Perform
 /// process pages (native TM shows it as the "System interrupts" row).
 const CPU_INTERRUPT_PCT: &str = "\\Processor Information(_Total)\\% Interrupt Time";
 
+/// Open a wanted group, or re-open one that went to sleep.
+///
+/// A sleeping group stays in its slot (closed) so its failure state and
+/// scratch buffer survive; checking the slot for `None` therefore never
+/// woke it again, and GPU, disk and CPU-speed telemetry stayed "—" for the
+/// rest of the session after one 30 s spell without demand (window hidden to
+/// the tray, or another page shown). A group whose query cannot be opened at
+/// all — or, with `require_counters`, opens without any counter — is marked
+/// failed so it is not retried every tick.
+fn wake(
+    slot: &mut Option<QueryGroup>,
+    failed: &mut bool,
+    paths: &[&'static str],
+    require_counters: bool,
+) {
+    let group = slot.get_or_insert_with(QueryGroup::new);
+    if group.is_open() {
+        return;
+    }
+    group.open(paths);
+    if !group.is_open() || (require_counters && group.counters.is_empty()) {
+        *failed = true;
+    }
+}
+
 /// Split PDH state: each expensive provider warms up only on demand.
 pub struct PdhCounters {
     gpu: Option<QueryGroup>,
@@ -360,20 +390,19 @@ impl PdhCounters {
     pub fn tick(&mut self, demand: TelemetryDemand) {
         // --- GPU group ---
         let want_gpu = demand.any_gpu() && !self.gpu_failed;
-        if want_gpu && self.gpu.is_none() {
-            let mut g = QueryGroup::new();
-            g.open(&[
-                GPU_ENGINE_PATH,
-                GPU_ADAPTER_MEM_DEDICATED,
-                GPU_ADAPTER_MEM_SHARED,
-                GPU_PROCESS_MEM_DEDICATED,
-                GPU_PROCESS_MEM_SHARED,
-            ]);
-            if !g.is_open() {
-                // Query itself failed → don't retry forever this session.
-                self.gpu_failed = true;
-            }
-            self.gpu = Some(g);
+        if want_gpu {
+            wake(
+                &mut self.gpu,
+                &mut self.gpu_failed,
+                &[
+                    GPU_ENGINE_PATH,
+                    GPU_ADAPTER_MEM_DEDICATED,
+                    GPU_ADAPTER_MEM_SHARED,
+                    GPU_PROCESS_MEM_DEDICATED,
+                    GPU_PROCESS_MEM_SHARED,
+                ],
+                false,
+            );
         }
         if let Some(g) = &mut self.gpu {
             if g.is_open() {
@@ -384,13 +413,13 @@ impl PdhCounters {
 
         // --- Disk group ---
         let want_disk = demand.wants(TelemetryDemand::DISK_RATE) && !self.disk_failed;
-        if want_disk && self.disk.is_none() {
-            let mut d = QueryGroup::new();
-            d.open(&[DISK_IDLE, DISK_READ, DISK_WRITE, DISK_SEC]);
-            if !d.is_open() {
-                self.disk_failed = true;
-            }
-            self.disk = Some(d);
+        if want_disk {
+            wake(
+                &mut self.disk,
+                &mut self.disk_failed,
+                &[DISK_IDLE, DISK_READ, DISK_WRITE, DISK_SEC],
+                false,
+            );
         }
         if let Some(d) = &mut self.disk {
             if d.is_open() {
@@ -401,16 +430,11 @@ impl PdhCounters {
 
         // --- CPU speed group ---
         let want_cpu = demand.wants(TelemetryDemand::CPU_SPEED) && !self.cpu_failed;
-        if want_cpu && self.cpu.is_none() {
-            let mut c = QueryGroup::new();
-            c.open(&[CPU_PERF_PCT]);
-            if !c.is_open() || c.counters.is_empty() {
-                // Query itself failed OR the counter path does not exist on
-                // this system → fall back to the nominal frequency instead
-                // of rendering "—" forever.
-                self.cpu_failed = true;
-            }
-            self.cpu = Some(c);
+        if want_cpu {
+            // A missing counter path (not just a failed query) also counts as
+            // failure here → fall back to the nominal frequency instead of
+            // rendering "—" forever.
+            wake(&mut self.cpu, &mut self.cpu_failed, &[CPU_PERF_PCT], true);
         }
         if let Some(c) = &mut self.cpu {
             if c.is_open() {
@@ -422,13 +446,13 @@ impl PdhCounters {
         // --- Interrupt time group (core demand: needed to explain the CPU
         // residual on the Processes page, not only the Performance page) ---
         let want_interrupt = demand.wants(TelemetryDemand::CORE_PROCESS) && !self.interrupt_failed;
-        if want_interrupt && self.interrupt.is_none() {
-            let mut g = QueryGroup::new();
-            g.open(&[CPU_INTERRUPT_PCT]);
-            if !g.is_open() || g.counters.is_empty() {
-                self.interrupt_failed = true;
-            }
-            self.interrupt = Some(g);
+        if want_interrupt {
+            wake(
+                &mut self.interrupt,
+                &mut self.interrupt_failed,
+                &[CPU_INTERRUPT_PCT],
+                true,
+            );
         }
         if let Some(g) = &mut self.interrupt {
             if g.is_open() {
@@ -874,6 +898,45 @@ mod tests {
         assert!(
             lists.standby_bytes > 0 || lists.free_bytes > 0,
             "a running system always has standby or free pages; decoded {lists:?}"
+        );
+    }
+
+    #[test]
+    fn disk_instance_matches_every_volume_on_the_disk() {
+        let perf = DiskPerf {
+            instance: "0 C: D:".into(),
+            ..DiskPerf::default()
+        };
+        assert!(perf.matches_mount("C:\\"));
+        assert!(perf.matches_mount("d:"));
+        assert!(!perf.matches_mount("E:\\"));
+        // The disk number is not a volume.
+        assert!(!perf.matches_mount("0"));
+        let total = DiskPerf {
+            instance: "_Total".into(),
+            ..DiskPerf::default()
+        };
+        assert!(!total.matches_mount("C:\\"));
+    }
+
+    /// Regression: a group that slept after its keep-alive must open again
+    /// once demand returns. Driven through `tick` with a real PDH query; the
+    /// sleep itself is forced because the keep-alive is 30 s.
+    #[test]
+    fn a_sleeping_group_reopens_when_demand_returns() {
+        let mut pdh = PdhCounters::new();
+        pdh.tick(TelemetryDemand::CPU_SPEED);
+        if pdh.cpu_failed {
+            eprintln!("no Processor Information counters here; nothing to verify");
+            return;
+        }
+        let cpu = pdh.cpu.as_mut().expect("group created on demand");
+        assert!(cpu.is_open());
+        cpu.close();
+        pdh.tick(TelemetryDemand::CPU_SPEED);
+        assert!(
+            pdh.cpu.as_ref().is_some_and(QueryGroup::is_open),
+            "a slept group must wake on renewed demand"
         );
     }
 
