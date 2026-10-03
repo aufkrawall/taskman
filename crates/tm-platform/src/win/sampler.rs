@@ -647,7 +647,15 @@ impl Sampler {
                     }
                 }
             }
-            NetSource::Local(usage) => Some(usage.totals_pruned(live)),
+            NetSource::Local(usage) if usage.is_running() => Some(usage.totals_pruned(live)),
+            NetSource::Local(_) => {
+                // Stopped underneath us: frozen totals would read as idle.
+                tracing::warn!("per-process network trace ended unexpectedly; reporting unknown");
+                self.net_source = NetSource::Unavailable {
+                    since: Instant::now(),
+                };
+                None
+            }
             _ => None,
         }
     }
@@ -768,7 +776,15 @@ impl Sampler {
                     }
                 }
             }
-            DiskSource::Local(usage) => Some(usage.take_window(live)),
+            DiskSource::Local(usage) if usage.is_running() => Some(usage.take_window(live)),
+            DiskSource::Local(_) => {
+                // Stopped underneath us: an empty window would read as idle.
+                tracing::warn!("per-process disk trace ended unexpectedly; reporting unknown");
+                self.disk_source = DiskSource::Unavailable {
+                    since: Instant::now(),
+                };
+                None
+            }
             _ => None,
         }
     }

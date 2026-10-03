@@ -1748,6 +1748,19 @@ fn process_network_sample() -> ProcessNetworkSample {
         Ok(slot) => slot,
         Err(poisoned) => poisoned.into_inner(),
     };
+    if slot.as_ref().is_some_and(|trace| !trace.usage.is_running()) {
+        // Stopped underneath the broker: its totals are frozen. Replace the
+        // session in place so the slot's one watchdog keeps covering it.
+        tracing::warn!("broker network trace ended unexpectedly; restarting it");
+        match super::net_etw::NetworkUsage::start(super::net_etw::TraceRole::Service) {
+            Some(usage) => {
+                if let Some(trace) = slot.as_mut() {
+                    trace.usage = usage;
+                }
+            }
+            None => return ProcessNetworkSample::default(),
+        }
+    }
     if slot.is_none() {
         match super::net_etw::NetworkUsage::start(super::net_etw::TraceRole::Service) {
             Some(usage) => {
@@ -1824,6 +1837,17 @@ fn process_disk_sample() -> ProcessDiskSample {
         Ok(slot) => slot,
         Err(poisoned) => poisoned.into_inner(),
     };
+    if slot.as_ref().is_some_and(|trace| !trace.usage.is_running()) {
+        // Same as the network trace; the fresh session's first window is too
+        // short to divide by, so this tick stays unknown either way.
+        tracing::warn!("broker disk trace ended unexpectedly; restarting it");
+        if let Some(usage) = super::disk_etw::DiskUsage::start(super::etw::TraceRole::Service)
+            && let Some(trace) = slot.as_mut()
+        {
+            trace.usage = usage;
+        }
+        return ProcessDiskSample::default();
+    }
     if slot.is_none() {
         match super::disk_etw::DiskUsage::start(super::etw::TraceRole::Service) {
             Some(usage) => {

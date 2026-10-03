@@ -168,6 +168,11 @@ pub(crate) struct Session<T: TraceContext> {
     trace: PROCESSTRACE_HANDLE,
     name: Vec<u16>,
     worker: Option<std::thread::JoinHandle<()>>,
+    /// Set by the consumer thread when `ProcessTrace` returns. Before `Drop`
+    /// that means the session was stopped underneath us — by `logman`, or by
+    /// another instance reclaiming the fixed session name — and the counters
+    /// have frozen while still looking live.
+    ended: Arc<std::sync::atomic::AtomicBool>,
 }
 
 // The raw context pointer is only dereferenced by the ETW callback, which is
@@ -233,12 +238,15 @@ impl<T: TraceContext> Session<T> {
             return None;
         }
 
+        let ended = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let ended_by_consumer = Arc::clone(&ended);
         let worker = std::thread::Builder::new()
             .name(thread_name.to_owned())
             .spawn(move || {
                 // Blocks until the session is stopped; the return code is not
                 // actionable (a stopped session reports "cancelled").
                 let _ = unsafe { ProcessTrace(&[trace], None, None) };
+                ended_by_consumer.store(true, std::sync::atomic::Ordering::Release);
             })
             .ok();
         if worker.is_none() {
@@ -260,11 +268,18 @@ impl<T: TraceContext> Session<T> {
             trace,
             name,
             worker,
+            ended,
         })
     }
 
     pub(crate) fn shared(&self) -> &Arc<T> {
         &self.shared
+    }
+
+    /// Whether the consumer is still receiving events. Callers must treat a
+    /// session that is no longer running as unknown, never as idle.
+    pub(crate) fn is_running(&self) -> bool {
+        !self.ended.load(std::sync::atomic::Ordering::Acquire)
     }
 }
 
@@ -272,10 +287,18 @@ impl<T: TraceContext> Drop for Session<T> {
     fn drop(&mut self) {
         // Order matters: stop the session so `ProcessTrace` returns, then
         // close the consumer and join before the context is reclaimed.
+        // A consumer that already ended means the session was stopped by
+        // someone else, and the fixed name (possibly even the logger handle)
+        // may by now belong to a session another process started; stopping
+        // it would tear THAT one down. A leftover of ours is reclaimed by
+        // name on the next start anyway.
+        let ended_underneath = !self.is_running();
         self.shared.stop();
         mark_session(&self.name, false);
-        let mut properties = properties_buffer(&self.name, self.kind);
-        stop_session(self.session, &self.name, &mut properties);
+        if !ended_underneath {
+            let mut properties = properties_buffer(&self.name, self.kind);
+            stop_session(self.session, &self.name, &mut properties);
+        }
         let _ = unsafe { CloseTrace(self.trace) };
         if let Some(worker) = self.worker.take() {
             let _ = worker.join();

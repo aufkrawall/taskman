@@ -129,6 +129,11 @@ impl NetworkUsage {
         Some(Self { session })
     }
 
+    /// Whether events are still arriving; see [`Session::is_running`].
+    pub fn is_running(&self) -> bool {
+        self.session.is_running()
+    }
+
     /// Current cumulative byte counters, exactly as observed.
     pub fn totals(&self) -> HashMap<u32, PidBytes> {
         match self.session.shared().totals.lock() {

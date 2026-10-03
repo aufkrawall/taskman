@@ -138,6 +138,12 @@
   100 %.
 - **Services list after a service was installed:** a service registered while
   the list was being read no longer produces an empty Services page.
+- **Per-process network and disk frozen at zero:** when the event trace
+  behind the Network and Disk activity columns was stopped from outside (by
+  another TaskMan instance reclaiming it, or by `logman`), every process kept
+  showing 0 as if idle. TaskMan now detects the stopped trace, shows "—", and
+  restarts it (immediately in the background service, after a short back-off
+  in the app).
 
 ### Improved
 

@@ -324,6 +324,11 @@ pub struct DiskUsage {
 }
 
 impl DiskUsage {
+    /// Whether events are still arriving; see [`Session::is_running`].
+    pub fn is_running(&self) -> bool {
+        self.session.is_running()
+    }
+
     /// Start a real-time session for `role`. Returns `None` when ETW is
     /// unavailable to this token (the common unelevated case), which keeps
     /// per-process disk activity reported as unknown rather than zero.
