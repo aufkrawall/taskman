@@ -99,7 +99,8 @@ impl SystemCollector for MacCollector {
             entry.disk_write_total = du.total_written_bytes;
             entry.exe_path = p.exe().map(|e| e.to_path_buf());
             entry.user = None;
-            entry.status = ProcStatus::Running;
+            entry.status = bsd_run_state(pid_u)
+                .map_or_else(|| status_from_sysinfo(p.status()), status_from_bsd);
             processes.push(entry);
         }
 
@@ -191,21 +192,34 @@ impl SystemCollector for MacCollector {
                 .disks
                 .list()
                 .iter()
-                .map(|d| DiskInfo {
-                    id: d.name().to_string_lossy().to_string(),
-                    mount: d.mount_point().to_string_lossy().to_string(),
-                    label: String::new(),
-                    media: MediaKind::Unknown,
-                    total_bytes: d.total_space(),
-                    free_bytes: d.available_space(),
-                    // No per-disk busy-time source is wired up here yet;
-                    // "unknown" is the honest answer, not a flat 0 %.
-                    active_pct: None,
-                    read_bps: 0.0,
-                    write_bps: 0.0,
-                    avg_resp_ms: 0.0,
-                    total_read_bytes: 0,
-                    total_written_bytes: 0,
+                .map(|d| {
+                    // IOBlockStorageDriver byte counters of the backing disk.
+                    // A first sample has no measured interval, and the model
+                    // has no "unknown" rate, so it reads 0 B/s.
+                    let io = d.usage();
+                    let rate = |bytes: u64| {
+                        if self.first_tick_done {
+                            bytes as f64 / interval_s
+                        } else {
+                            0.0
+                        }
+                    };
+                    DiskInfo {
+                        id: d.name().to_string_lossy().to_string(),
+                        mount: d.mount_point().to_string_lossy().to_string(),
+                        label: String::new(),
+                        media: MediaKind::Unknown,
+                        total_bytes: d.total_space(),
+                        free_bytes: d.available_space(),
+                        // No per-disk busy-time source is wired up here yet;
+                        // "unknown" is the honest answer, not a flat 0 %.
+                        active_pct: None,
+                        read_bps: rate(io.read_bytes),
+                        write_bps: rate(io.written_bytes),
+                        avg_resp_ms: 0.0,
+                        total_read_bytes: io.total_read_bytes,
+                        total_written_bytes: io.total_written_bytes,
+                    }
                 })
                 .collect(),
             networks: nets,
@@ -220,7 +234,7 @@ impl SystemCollector for MacCollector {
                 boot_epoch_s: System::boot_time() as i64,
                 process_count: n_procs,
                 thread_count: threads_total(&self.sys),
-                handle_count: 0,
+                handle_count: open_file_count(),
             },
         };
         self.first_tick_done = true;
@@ -229,7 +243,69 @@ impl SystemCollector for MacCollector {
 }
 
 fn hostname() -> String {
-    std::env::var("HOSTNAME").unwrap_or_else(|_| "Mac".into())
+    System::host_name().unwrap_or_default()
+}
+
+/// BSD run state (`p_stat`), which SIGSTOP/SIGCONT flip. sysinfo samples
+/// `pbi_status` only when it first sees a process and afterwards derives
+/// the status from the first thread's Mach run state, so a process
+/// suspended after first sight need not read as stopped and would never
+/// offer Resume. `None` when the kernel refuses the query; the caller then
+/// falls back to sysinfo's status.
+fn bsd_run_state(pid: u32) -> Option<u32> {
+    // SAFETY: proc_bsdshortinfo is plain integer data; all-zero is valid.
+    let mut info: libc::proc_bsdshortinfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<libc::proc_bsdshortinfo>() as libc::c_int;
+    // SAFETY: `info` is writable and exactly `size` bytes long.
+    let written = unsafe {
+        libc::proc_pidinfo(
+            pid as libc::c_int,
+            libc::PROC_PIDT_SHORTBSDINFO,
+            0,
+            (&raw mut info).cast(),
+            size,
+        )
+    };
+    (written == size).then_some(info.pbsi_status)
+}
+
+fn status_from_bsd(p_stat: u32) -> ProcStatus {
+    if p_stat == libc::SSTOP {
+        ProcStatus::Suspended
+    } else {
+        ProcStatus::Running
+    }
+}
+
+fn status_from_sysinfo(status: sysinfo::ProcessStatus) -> ProcStatus {
+    match status {
+        sysinfo::ProcessStatus::Stop => ProcStatus::Suspended,
+        _ => ProcStatus::Running,
+    }
+}
+
+/// System-wide open files (`kern.num_files`, XNU's `nfiles`), the macOS
+/// analog of the Windows handle total. The model has no "unknown" for this
+/// counter, so a failed sysctl still yields 0.
+fn open_file_count() -> usize {
+    let mut value: libc::c_int = 0;
+    let mut len = std::mem::size_of::<libc::c_int>();
+    // SAFETY: the name is NUL-terminated, `value`/`len` describe a writable
+    // c_int, and no new value is passed.
+    let rc = unsafe {
+        libc::sysctlbyname(
+            c"kern.num_files".as_ptr(),
+            (&raw mut value).cast(),
+            &mut len,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if rc == 0 && len == std::mem::size_of::<libc::c_int>() {
+        usize::try_from(value).unwrap_or(0)
+    } else {
+        0
+    }
 }
 
 fn now_ms() -> u64 {
@@ -355,4 +431,31 @@ pub fn create_collector() -> MacCollector {
 
 pub fn create_actions() -> MacActions {
     MacActions
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stopped_process_reads_as_suspended() {
+        assert_eq!(status_from_bsd(libc::SSTOP), ProcStatus::Suspended);
+        assert_eq!(status_from_bsd(libc::SRUN), ProcStatus::Running);
+        assert_eq!(
+            status_from_sysinfo(sysinfo::ProcessStatus::Stop),
+            ProcStatus::Suspended
+        );
+        assert_eq!(
+            status_from_sysinfo(sysinfo::ProcessStatus::Sleep),
+            ProcStatus::Running
+        );
+    }
+
+    #[test]
+    fn own_process_run_state_is_readable() {
+        assert_eq!(
+            bsd_run_state(std::process::id()).map(status_from_bsd),
+            Some(ProcStatus::Running)
+        );
+    }
 }

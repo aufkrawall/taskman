@@ -98,6 +98,27 @@
   kept their connection open after being refused), the service gave up within
   microseconds and exited until Windows restarted it 5–60 s later. It now
   waits for a slot to free up.
+- **Linux priority read back wrong:** a process set to High showed as Above
+  normal (so a saved per-program priority stored the wrong class), and
+  priority and affinity changes only reached a process's main thread. Both now
+  apply to every thread and read back as the class that was set.
+- **Linux CPU caches undercounted:** L1 and L2 showed one core's caches (and
+  dropped the instruction cache); every distinct cache on every CPU is now
+  counted.
+- **Linux disks on LVM/LUKS:** volumes mounted through `/dev/mapper` now get
+  transfer rates and active time, and the first sample shows active time as
+  unknown instead of 0 %.
+- **Linux GPUs without telemetry:** cards whose driver publishes no
+  utilization (Intel, Nouveau, NVIDIA, simpledrm) are no longer shown as an
+  idle GPU at 0 % with 0 B memory.
+- **Linux services without systemd:** a system where `systemctl` is unavailable
+  reports the error instead of an empty service list, and service
+  descriptions are no longer cut short when a unit name contains its state.
+- **Linux fonts:** a system font that is not TrueType/OpenType (PCF, Type 1) no
+  longer crashes the app at startup; the next candidate is used.
+- **macOS suspended processes:** a suspended process now shows as Suspended
+  and offers Resume. macOS also reports disk transfer rates, the open file
+  handle count, the real host name and each startup item's enabled state.
 
 ### Improved
 

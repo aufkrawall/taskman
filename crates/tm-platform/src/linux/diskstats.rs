@@ -25,22 +25,29 @@ pub struct Prev {
     write_sectors: u64,
 }
 
+/// Rates need two samples: on first sight of a device there is no previous
+/// counter, so every rate is `None` (unmeasured), never an idle 0.
 impl DiskStat {
-    pub fn active_pct(&self, interval_s: f64) -> f32 {
-        let Some(prev) = self.prev else { return 0.0 };
+    pub fn active_pct(&self, interval_s: f64) -> Option<f32> {
+        let prev = self.prev?;
         let d = self.io_ticks_ms.saturating_sub(prev.io_ticks_ms);
-        ((d as f64 / 1000.0 / interval_s.max(0.001)) * 100.0).clamp(0.0, 100.0) as f32
+        Some(((d as f64 / 1000.0 / interval_s.max(0.001)) * 100.0).clamp(0.0, 100.0) as f32)
     }
 
-    pub fn read_bps(&self, interval_s: f64) -> f64 {
-        let Some(prev) = self.prev else { return 0.0 };
-        (self.read_sectors.saturating_sub(prev.read_sectors)) as f64 * 512.0 / interval_s.max(0.001)
+    pub fn read_bps(&self, interval_s: f64) -> Option<f64> {
+        let prev = self.prev?;
+        Some(
+            (self.read_sectors.saturating_sub(prev.read_sectors)) as f64 * 512.0
+                / interval_s.max(0.001),
+        )
     }
 
-    pub fn write_bps(&self, interval_s: f64) -> f64 {
-        let Some(prev) = self.prev else { return 0.0 };
-        (self.write_sectors.saturating_sub(prev.write_sectors)) as f64 * 512.0
-            / interval_s.max(0.001)
+    pub fn write_bps(&self, interval_s: f64) -> Option<f64> {
+        let prev = self.prev?;
+        Some(
+            (self.write_sectors.saturating_sub(prev.write_sectors)) as f64 * 512.0
+                / interval_s.max(0.001),
+        )
     }
 }
 
@@ -116,7 +123,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn deltas_zero_on_first_sight() {
+    fn deltas_unknown_on_first_sight() {
         let mut s = DiskStat {
             device: "nvme0n1".into(),
             reads_completed: 10,
@@ -126,8 +133,9 @@ mod tests {
             io_ticks_ms: 50,
             prev: None,
         };
-        assert_eq!(s.active_pct(1.0), 0.0);
-        assert_eq!(s.read_bps(1.0), 0.0);
+        assert_eq!(s.active_pct(1.0), None);
+        assert_eq!(s.read_bps(1.0), None);
+        assert_eq!(s.write_bps(1.0), None);
 
         // Simulate second tick.
         s.prev = Some(Prev {
@@ -135,8 +143,8 @@ mod tests {
             read_sectors: 60,
             write_sectors: 120,
         });
-        assert_eq!(s.active_pct(1.0), 1.0); // 10ms of IO in 1s
-        assert_eq!(s.read_bps(1.0), (100 - 60) as f64 * 512.0);
-        assert_eq!(s.write_bps(1.0), (200 - 120) as f64 * 512.0);
+        assert_eq!(s.active_pct(1.0), Some(1.0)); // 10ms of IO in 1s
+        assert_eq!(s.read_bps(1.0), Some((100 - 60) as f64 * 512.0));
+        assert_eq!(s.write_bps(1.0), Some((200 - 120) as f64 * 512.0));
     }
 }

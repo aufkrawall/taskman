@@ -10,6 +10,8 @@ use tm_core::model::*;
 /// load — the very load a task manager is opened for. A fixed sleep bets on
 /// that number; this waits for the condition instead (AGENTS.md: no sleeps in
 /// tests, poll with bounded deadlines).
+// Only the Windows tests spawn children to wait for.
+#[cfg(target_os = "windows")]
 fn poll_for<T>(mut probe: impl FnMut() -> Option<T>, timeout: std::time::Duration) -> Option<T> {
     let deadline = std::time::Instant::now() + timeout;
     loop {
@@ -24,6 +26,8 @@ fn poll_for<T>(mut probe: impl FnMut() -> Option<T>, timeout: std::time::Duratio
 }
 
 /// Wait until `pid` appears in a fresh process snapshot.
+// Only the Windows tests spawn children to wait for.
+#[cfg(target_os = "windows")]
 fn wait_until_visible(pid: u32) {
     let found = poll_for(
         || {

@@ -247,9 +247,92 @@ fn fontconfig_match(pattern: &str) -> Option<String> {
 
 fn load_first(paths: &[String]) -> Option<FontData> {
     for path in paths {
-        if let Ok(bytes) = std::fs::read(path) {
+        let Ok(bytes) = std::fs::read(path) else {
+            continue;
+        };
+        // epaint panics on a face it cannot parse, and Fontconfig can answer
+        // with PCF, Type 1 or other non-sfnt files; try the next candidate.
+        if is_loadable_font(&bytes) {
             return Some(FontData::from_owned(bytes));
         }
+        tracing::warn!(path = %path, "skipping font that is not TrueType/OpenType");
     }
     None
+}
+
+/// Whether `bytes` pass the header check epaint's parser (skrifa) starts
+/// with: an sfnt table directory (TrueType or CFF-flavoured OpenType), or a
+/// TrueType collection whose first face, the index epaint loads, is one.
+fn is_loadable_font(bytes: &[u8]) -> bool {
+    match bytes.get(..4) {
+        Some(b"ttcf") => bytes
+            .get(12..16)
+            .and_then(|offset| usize::try_from(u32::from_be_bytes(offset.try_into().ok()?)).ok())
+            .is_some_and(|offset| is_sfnt_face(bytes, offset)),
+        _ => is_sfnt_face(bytes, 0),
+    }
+}
+
+fn is_sfnt_face(bytes: &[u8], at: usize) -> bool {
+    let Some(header) = at.checked_add(12).and_then(|end| bytes.get(at..end)) else {
+        return false;
+    };
+    let version_ok = matches!(&header[..4], b"\0\x01\0\0" | b"true" | b"OTTO");
+    let tables = usize::from(u16::from_be_bytes([header[4], header[5]]));
+    version_ok
+        && tables > 0
+        && (at + 12)
+            .checked_add(tables * 16)
+            .is_some_and(|end| end <= bytes.len())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A minimal sfnt header with `tables` directory records.
+    fn sfnt(version: &[u8; 4], tables: u16) -> Vec<u8> {
+        let mut out = version.to_vec();
+        out.extend(tables.to_be_bytes());
+        out.extend([0; 6]);
+        out.extend(vec![0; usize::from(tables) * 16]);
+        out
+    }
+
+    #[test]
+    fn truetype_and_opentype_faces_are_loadable() {
+        assert!(is_loadable_font(&sfnt(b"\0\x01\0\0", 3)));
+        assert!(is_loadable_font(&sfnt(b"OTTO", 1)));
+        assert!(is_loadable_font(&sfnt(b"true", 1)));
+    }
+
+    #[test]
+    fn non_sfnt_and_truncated_files_are_rejected() {
+        // PCF bitmap, Type 1 (PFB and PFA), WOFF2, empty file.
+        assert!(!is_loadable_font(b"\x01fcp\x0f\0\0\0"));
+        assert!(!is_loadable_font(b"\x80\x01\x10\x07\0\0%!PS-AdobeFont-1.0"));
+        assert!(!is_loadable_font(b"%!PS-AdobeFont-1.0: Utopia"));
+        assert!(!is_loadable_font(&sfnt(b"wOF2", 1)));
+        assert!(!is_loadable_font(b""));
+        // Table directory claims more records than the file holds.
+        let mut short = sfnt(b"\0\x01\0\0", 2);
+        short.truncate(short.len() - 1);
+        assert!(!is_loadable_font(&short));
+        assert!(!is_loadable_font(&sfnt(b"\0\x01\0\0", 0)));
+    }
+
+    #[test]
+    fn collection_is_judged_by_its_first_face() {
+        let collection = |first_face: &[u8]| {
+            let mut out = b"ttcf\0\x01\0\0\0\0\0\x01".to_vec();
+            out.extend(16u32.to_be_bytes());
+            out.extend(first_face);
+            out
+        };
+        assert!(is_loadable_font(&collection(&sfnt(b"\0\x01\0\0", 1))));
+        assert!(!is_loadable_font(&collection(b"\x01fcp")));
+        assert!(!is_loadable_font(
+            b"ttcf\0\x01\0\0\0\0\0\x01\xff\xff\xff\xff"
+        ));
+    }
 }

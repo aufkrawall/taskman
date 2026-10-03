@@ -25,6 +25,9 @@ pub struct LinuxCollector {
     prev_net_totals: HashMap<String, (u64, u64)>,
     last_tick: Option<Instant>,
     first_tick_done: bool,
+    /// L1/L2/L3 totals in KB; cache geometry is static, so the sysfs walk
+    /// over every CPU runs once instead of every tick.
+    cache_kb: [u64; 3],
 }
 
 impl SystemCollector for LinuxCollector {
@@ -161,9 +164,12 @@ impl SystemCollector for LinuxCollector {
                 media,
                 total_bytes: d.total_space(),
                 free_bytes: d.available_space(),
-                active_pct: ds.map(|s| s.active_pct(interval_s)),
-                read_bps: ds.map(|s| s.read_bps(interval_s)).unwrap_or(0.0),
-                write_bps: ds.map(|s| s.write_bps(interval_s)).unwrap_or(0.0),
+                active_pct: ds.and_then(|s| s.active_pct(interval_s)),
+                // The model has no "unknown" byte rate; an unmatched device
+                // or a first sample is reported as 0 B/s (active time above
+                // stays None, so the page still shows it as unmeasured).
+                read_bps: ds.and_then(|s| s.read_bps(interval_s)).unwrap_or(0.0),
+                write_bps: ds.and_then(|s| s.write_bps(interval_s)).unwrap_or(0.0),
                 avg_resp_ms: 0.0,
                 total_read_bytes: ds.map(|s| s.read_sectors * 512).unwrap_or(0),
                 total_written_bytes: ds.map(|s| s.write_sectors * 512).unwrap_or(0),
@@ -231,9 +237,9 @@ impl SystemCollector for LinuxCollector {
                 logical_count: logical,
                 physical_cores,
                 sockets,
-                l1_kb: cache_total_kb(1),
-                l2_kb: cache_total_kb(2),
-                l3_kb: cache_total_kb(3),
+                l1_kb: self.cache_kb[0],
+                l2_kb: self.cache_kb[1],
+                l3_kb: self.cache_kb[2],
                 virtualization: "Unknown".into(),
             },
             memory: MemoryInfo {
@@ -263,7 +269,7 @@ impl SystemCollector for LinuxCollector {
                 boot_epoch_s: System::boot_time() as i64,
                 process_count: n_procs,
                 thread_count: threads_total(&self.sys),
-                handle_count: 0,
+                handle_count: open_file_handles(),
             },
         };
         self.first_tick_done = true;
@@ -343,13 +349,103 @@ fn proc_priority(pid: u32) -> PriorityClass {
     let Some(nice) = fields.get(16).and_then(|s| s.parse::<i32>().ok()) else {
         return PriorityClass::Unknown;
     };
-    match nice {
-        i32::MIN..=-10 => PriorityClass::High,
-        -9..=-1 => PriorityClass::AboveNormal,
-        0 => PriorityClass::Normal,
-        1..=9 => PriorityClass::BelowNormal,
-        _ => PriorityClass::Low,
+    priority_for_nice(nice)
+}
+
+/// The nice value `set_priority` writes for each class, and the anchors
+/// `priority_for_nice` reads back against: one table, so a class that was
+/// set always reads back as itself.
+const NICE_TABLE: [(PriorityClass, i32); 5] = [
+    (PriorityClass::High, -5),
+    (PriorityClass::AboveNormal, -2),
+    (PriorityClass::Normal, 0),
+    (PriorityClass::BelowNormal, 5),
+    (PriorityClass::Low, 10),
+];
+
+/// Nice value for a requested class. Nice has no realtime level, so Realtime
+/// lands on High, the same silent downgrade Windows applies to callers that
+/// lack the increase-base-priority privilege. `Unknown` is not a target.
+fn nice_for_priority(priority: PriorityClass) -> Option<i32> {
+    let class = match priority {
+        PriorityClass::Realtime => PriorityClass::High,
+        other => other,
+    };
+    NICE_TABLE
+        .iter()
+        .find(|(c, _)| *c == class)
+        .map(|&(_, nice)| nice)
+}
+
+/// Class for an observed nice value: the most extreme table entry on the
+/// same side of 0 that the value reaches. Values short of every entry on
+/// their side (e.g. -1) still read as that side's mildest class, so a
+/// raised or lowered process never reads as Normal.
+fn priority_for_nice(nice: i32) -> PriorityClass {
+    if nice == 0 {
+        return PriorityClass::Normal;
     }
+    let same_side = || {
+        NICE_TABLE
+            .iter()
+            .filter(move |(_, v)| v.signum() == nice.signum())
+    };
+    same_side()
+        .filter(|(_, v)| v.abs() <= nice.abs())
+        .max_by_key(|(_, v)| v.abs())
+        .or_else(|| same_side().min_by_key(|(_, v)| v.abs()))
+        .map_or(PriorityClass::Unknown, |&(class, _)| class)
+}
+
+/// Thread ids of `pid`, leader first. Despite their names,
+/// `setpriority(PRIO_PROCESS)` and `sched_setaffinity` act on the single
+/// thread whose id they are given on Linux, so a process-wide change has to
+/// visit every task. Falls back to the leader alone when the task list
+/// cannot be read.
+fn process_tids(pid: u32) -> Vec<u32> {
+    let tids = std::fs::read_dir(format!("/proc/{pid}/task"))
+        .map(|dir| {
+            dir.flatten()
+                .filter_map(|e| e.file_name().to_str()?.parse::<u32>().ok())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    leader_first(pid, tids)
+}
+
+fn leader_first(pid: u32, tids: impl IntoIterator<Item = u32>) -> Vec<u32> {
+    let mut out = vec![pid];
+    out.extend(tids.into_iter().filter(|&tid| tid != pid));
+    out
+}
+
+/// Applies a per-thread call to every thread in `tids` (leader first). The
+/// leader's failure is the process's failure and leaves the other threads
+/// untouched; the rest are best effort, and a thread that exited between
+/// listing and the call (ESRCH) is not a miss.
+fn apply_to_threads(
+    op: &'static str,
+    tids: &[u32],
+    mut apply: impl FnMut(u32) -> std::io::Result<()>,
+) -> Result<()> {
+    let Some((&leader, rest)) = tids.split_first() else {
+        return Err(tm_core::TmError::platform(op, "no thread to update"));
+    };
+    apply(leader).map_err(|e| tm_core::TmError::platform(op, e.to_string()))?;
+    let missed = rest
+        .iter()
+        .filter(|&&tid| apply(tid).is_err_and(|e| e.raw_os_error() != Some(libc::ESRCH)))
+        .count();
+    if missed > 0 {
+        tracing::warn!(
+            pid = leader,
+            op,
+            missed,
+            threads = tids.len(),
+            "process-wide change did not reach every thread"
+        );
+    }
+    Ok(())
 }
 
 fn cpu_topology() -> (usize, usize) {
@@ -378,39 +474,90 @@ fn read_u32(path: impl AsRef<Path>) -> Option<u32> {
     std::fs::read_to_string(path).ok()?.trim().parse().ok()
 }
 
-fn cache_total_kb(level: u8) -> u64 {
-    // CPU0 lists every cache level. Deduplicate shared caches by their
-    // shared_cpu_list; sum distinct entries of the requested level.
-    let Ok(entries) = std::fs::read_dir("/sys/devices/system/cpu/cpu0/cache") else {
-        return 0;
-    };
-    let mut seen = HashSet::new();
-    let mut total = 0u64;
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if read_u32(path.join("level")) != Some(level as u32) {
-            continue;
-        }
-        let shared = std::fs::read_to_string(path.join("shared_cpu_list"))
-            .unwrap_or_else(|_| entry.file_name().to_string_lossy().into_owned());
-        if !seen.insert(shared) {
-            continue;
-        }
-        if let Ok(size) = std::fs::read_to_string(path.join("size")) {
-            total = total.saturating_add(parse_cache_size(&size));
-        }
-    }
-    total
+/// One `/sys/devices/system/cpu/cpuN/cache/indexM` entry. Unreadable fields
+/// stay `None` so the level's total reads as unknown rather than silently
+/// undercounting.
+struct CacheIndex {
+    level: u32,
+    /// "Data", "Instruction" or "Unified".
+    kind: Option<String>,
+    shared_cpu_list: Option<String>,
+    size_kb: Option<u64>,
 }
 
-fn parse_cache_size(text: &str) -> u64 {
+fn read_cache_indexes() -> Vec<CacheIndex> {
+    let Ok(cpus) = std::fs::read_dir("/sys/devices/system/cpu") else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for cpu in cpus.flatten() {
+        let name = cpu.file_name().to_string_lossy().to_string();
+        if !name.starts_with("cpu") || !name[3..].chars().all(|c| c.is_ascii_digit()) {
+            continue;
+        }
+        let Ok(indexes) = std::fs::read_dir(cpu.path().join("cache")) else {
+            continue;
+        };
+        for index in indexes.flatten() {
+            if !index.file_name().to_string_lossy().starts_with("index") {
+                continue;
+            }
+            let path = index.path();
+            let Some(level) = read_u32(path.join("level")) else {
+                continue;
+            };
+            let read = |file: &str| {
+                std::fs::read_to_string(path.join(file))
+                    .ok()
+                    .map(|s| s.trim().to_string())
+            };
+            out.push(CacheIndex {
+                level,
+                kind: read("type"),
+                shared_cpu_list: read("shared_cpu_list"),
+                size_kb: read("size").and_then(|s| parse_cache_size(&s)),
+            });
+        }
+    }
+    out
+}
+
+/// L1/L2/L3 totals in KB, summing every distinct cache instance the way the
+/// Windows collector totals each cache it enumerates. sysfs lists a cache
+/// once per logical CPU that shares it, so an instance is identified by
+/// (level, type, shared_cpu_list): SMT siblings collapse onto one core cache
+/// while L1d and L1i, which share a CPU list, stay separate. A level with an
+/// unreadable instance reports 0 (unknown).
+fn cache_totals_kb(indexes: &[CacheIndex]) -> [u64; 3] {
+    let mut seen = HashSet::new();
+    let mut totals = [Some(0u64); 3];
+    for index in indexes {
+        let Some(total) = (index.level as usize)
+            .checked_sub(1)
+            .and_then(|i| totals.get_mut(i))
+        else {
+            continue;
+        };
+        match (&index.kind, &index.shared_cpu_list, index.size_kb) {
+            (Some(kind), Some(shared), Some(size)) => {
+                if seen.insert((index.level, kind.as_str(), shared.as_str())) {
+                    *total = total.map(|t| t.saturating_add(size));
+                }
+            }
+            _ => *total = None,
+        }
+    }
+    totals.map(|t| t.unwrap_or(0))
+}
+
+fn parse_cache_size(text: &str) -> Option<u64> {
     let t = text.trim().to_ascii_lowercase();
     if let Some(num) = t.strip_suffix('k') {
-        num.trim().parse().unwrap_or(0)
+        num.trim().parse().ok()
     } else if let Some(num) = t.strip_suffix('m') {
-        num.trim().parse::<u64>().map(|n| n * 1024).unwrap_or(0)
+        num.trim().parse::<u64>().ok().map(|n| n * 1024)
     } else {
-        0
+        None
     }
 }
 
@@ -479,8 +626,14 @@ fn net_meta(name: &str) -> NetMeta {
     }
 }
 
+/// Kernel block device name for a mount source, as /proc/diskstats lists
+/// it. LVM/LUKS volumes mount as `/dev/mapper/<name>` symlinks to
+/// `/dev/dm-N`, and diskstats only knows `dm-N`, so resolve links first.
 fn block_device_name(dev: &str) -> String {
-    Path::new(dev)
+    let resolved = std::fs::canonicalize(dev).ok();
+    resolved
+        .as_deref()
+        .unwrap_or(Path::new(dev))
         .file_name()
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| dev.to_string())
@@ -519,6 +672,22 @@ fn threads_total(sys: &System) -> usize {
         .sum()
 }
 
+/// System-wide open file handles: allocated `struct file`s (every fd,
+/// socket and pipe) from /proc/sys/fs/file-nr, the Linux analog of the
+/// Windows handle total. The model has no "unknown" for this counter, so an
+/// unreadable file still yields 0.
+fn open_file_handles() -> usize {
+    std::fs::read_to_string("/proc/sys/fs/file-nr")
+        .ok()
+        .and_then(|text| parse_file_nr(&text))
+        .unwrap_or(0)
+}
+
+/// First field of file-nr ("allocated  free  max").
+fn parse_file_nr(text: &str) -> Option<usize> {
+    text.split_whitespace().next()?.parse().ok()
+}
+
 fn drm_gpus() -> Vec<GpuInfo> {
     let mut out = Vec::new();
     if let Ok(entries) = std::fs::read_dir("/sys/class/drm") {
@@ -530,39 +699,56 @@ fn drm_gpus() -> Vec<GpuInfo> {
             })
             .collect();
         cards.sort_by_key(|e| e.file_name());
-        for (i, card) in cards.into_iter().enumerate() {
-            let base = card.path();
-            let busy = std::fs::read_to_string(base.join("device/gpu_busy_percent"))
-                .ok()
-                .and_then(|t| t.trim().parse::<f32>().ok())
-                .unwrap_or(0.0);
-            let vram_used = std::fs::read_to_string(base.join("device/mem_info_vram_used"))
-                .ok()
-                .and_then(|t| t.trim().parse::<u64>().ok())
-                .unwrap_or(0);
-            let vram_total = std::fs::read_to_string(base.join("device/mem_info_vram_total"))
-                .ok()
-                .and_then(|t| t.trim().parse::<u64>().ok())
-                .unwrap_or(0);
-            out.push(GpuInfo {
-                id: i,
-                name: format!("GPU {i}"),
-                driver_version: String::new(),
-                util_pct: busy,
-                mem_used_bytes: vram_used,
-                mem_total_bytes: vram_total,
-                dedicated_used_bytes: vram_used,
-                shared_used_bytes: 0,
-                temperature_c: None,
-                luid: None,
-                engines: vec![GpuEngine {
-                    name: "3D".into(),
-                    util_pct: busy,
-                }],
-            });
+        for card in cards {
+            let device = card.path().join("device");
+            let read = |file: &str| {
+                std::fs::read_to_string(device.join(file))
+                    .ok()
+                    .map(|t| t.trim().to_string())
+            };
+            let gpu = drm_card_gpu(
+                out.len(),
+                read("gpu_busy_percent").and_then(|t| t.parse().ok()),
+                read("mem_info_vram_used").and_then(|t| t.parse().ok()),
+                read("mem_info_vram_total").and_then(|t| t.parse().ok()),
+            );
+            out.extend(gpu);
         }
     }
     out
+}
+
+/// One DRM card's adapter entry, or `None` when the driver exposes no
+/// utilization or VRAM-usage source. Only amdgpu publishes
+/// `gpu_busy_percent`/`mem_info_vram_*`; i915, xe, nouveau, nvidia and
+/// simpledrm publish neither, and the model has no "unknown" for
+/// utilization or dedicated memory, so such a card is left out rather than
+/// shown as an idle, empty GPU. A missing VRAM total stays 0, which the
+/// page already treats as unknown.
+fn drm_card_gpu(
+    id: usize,
+    busy_pct: Option<f32>,
+    vram_used: Option<u64>,
+    vram_total: Option<u64>,
+) -> Option<GpuInfo> {
+    let busy = busy_pct?;
+    let vram_used = vram_used?;
+    Some(GpuInfo {
+        id,
+        name: format!("GPU {id}"),
+        driver_version: String::new(),
+        util_pct: busy,
+        mem_used_bytes: vram_used,
+        mem_total_bytes: vram_total.unwrap_or(0),
+        dedicated_used_bytes: vram_used,
+        shared_used_bytes: 0,
+        temperature_c: None,
+        luid: None,
+        engines: vec![GpuEngine {
+            name: "3D".into(),
+            util_pct: busy,
+        }],
+    })
 }
 
 // ------------------------------------------------------------------ actions
@@ -617,22 +803,20 @@ impl PlatformActions for LinuxActions {
         )
     }
     fn set_priority(&self, pid: u32, priority: PriorityClass) -> Result<()> {
-        let nice: i32 = match priority {
-            PriorityClass::Realtime | PriorityClass::High => -5,
-            PriorityClass::AboveNormal => -2,
-            PriorityClass::Normal => 0,
-            PriorityClass::BelowNormal => 5,
-            PriorityClass::Low | PriorityClass::Unknown => 10,
-        };
-        let rc = unsafe { libc::setpriority(libc::PRIO_PROCESS, pid, nice) };
-        if rc == 0 {
-            Ok(())
-        } else {
-            Err(tm_core::TmError::platform(
+        let Some(nice) = nice_for_priority(priority) else {
+            return Err(tm_core::TmError::platform(
                 "setpriority",
-                "permission denied",
-            ))
-        }
+                "an explicit priority class is required",
+            ));
+        };
+        apply_to_threads("setpriority", &process_tids(pid), |tid| {
+            let rc = unsafe { libc::setpriority(libc::PRIO_PROCESS, tid, nice) };
+            if rc == 0 {
+                Ok(())
+            } else {
+                Err(std::io::Error::last_os_error())
+            }
+        })
     }
     fn get_affinity_mask(&self, pid: u32) -> Result<u64> {
         unsafe {
@@ -655,7 +839,7 @@ impl PlatformActions for LinuxActions {
         self.get_affinity_mask(std::process::id())
     }
     fn set_affinity_mask(&self, pid: u32, mask: u64) -> Result<()> {
-        unsafe {
+        let set = unsafe {
             let mut set: libc::cpu_set_t = std::mem::zeroed();
             libc::CPU_ZERO(&mut set);
             for cpu in 0usize..64 {
@@ -663,13 +847,22 @@ impl PlatformActions for LinuxActions {
                     libc::CPU_SET(cpu, &mut set);
                 }
             }
-            if libc::sched_setaffinity(pid as i32, std::mem::size_of::<libc::cpu_set_t>(), &set)
-                != 0
-            {
-                return Err(tm_core::TmError::platform("sched_setaffinity", "failed"));
+            set
+        };
+        apply_to_threads("sched_setaffinity", &process_tids(pid), |tid| {
+            let rc = unsafe {
+                libc::sched_setaffinity(
+                    tid as libc::pid_t,
+                    std::mem::size_of::<libc::cpu_set_t>(),
+                    &set,
+                )
+            };
+            if rc == 0 {
+                Ok(())
+            } else {
+                Err(std::io::Error::last_os_error())
             }
-            Ok(())
-        }
+        })
     }
 
     fn run_new_task(&self, command_line: &str, elevate: bool) -> Result<()> {
@@ -715,6 +908,7 @@ pub fn create_collector() -> LinuxCollector {
         prev_net_totals: HashMap::new(),
         last_tick: None,
         first_tick_done: false,
+        cache_kb: cache_totals_kb(&read_cache_indexes()),
     }
 }
 
@@ -727,20 +921,137 @@ mod tests {
     use super::*;
 
     #[test]
-    fn proc_stat_priority_parser_mapping_is_stable() {
-        // Mapping itself is deliberately coarse but matches set_priority().
-        assert_eq!(map_nice(-5), PriorityClass::AboveNormal);
-        assert_eq!(map_nice(0), PriorityClass::Normal);
-        assert_eq!(map_nice(10), PriorityClass::Low);
+    fn every_settable_priority_reads_back_as_itself() {
+        for class in [
+            PriorityClass::High,
+            PriorityClass::AboveNormal,
+            PriorityClass::Normal,
+            PriorityClass::BelowNormal,
+            PriorityClass::Low,
+        ] {
+            let nice = nice_for_priority(class).expect("settable class");
+            assert_eq!(priority_for_nice(nice), class, "nice {nice}");
+        }
+        // Realtime has no nice level: it is written as High and reads so.
+        assert_eq!(
+            nice_for_priority(PriorityClass::Realtime),
+            nice_for_priority(PriorityClass::High)
+        );
+        assert_eq!(nice_for_priority(PriorityClass::Unknown), None);
     }
 
-    fn map_nice(nice: i32) -> PriorityClass {
-        match nice {
-            i32::MIN..=-10 => PriorityClass::High,
-            -9..=-1 => PriorityClass::AboveNormal,
-            0 => PriorityClass::Normal,
-            1..=9 => PriorityClass::BelowNormal,
-            _ => PriorityClass::Low,
+    #[test]
+    fn nice_between_anchors_rounds_toward_normal_but_never_to_it() {
+        assert_eq!(priority_for_nice(-20), PriorityClass::High);
+        assert_eq!(priority_for_nice(-4), PriorityClass::AboveNormal);
+        assert_eq!(priority_for_nice(-1), PriorityClass::AboveNormal);
+        assert_eq!(priority_for_nice(1), PriorityClass::BelowNormal);
+        assert_eq!(priority_for_nice(9), PriorityClass::BelowNormal);
+        assert_eq!(priority_for_nice(19), PriorityClass::Low);
+    }
+
+    #[test]
+    fn process_wide_change_visits_every_thread_leader_first() {
+        let tids = leader_first(100, [102, 100, 101]);
+        assert_eq!(tids, [100, 102, 101]);
+
+        let mut visited = Vec::new();
+        let gone = |tid| (tid == 102).then(|| std::io::Error::from_raw_os_error(libc::ESRCH));
+        apply_to_threads("test", &tids, |tid| {
+            visited.push(tid);
+            gone(tid).map_or(Ok(()), Err)
+        })
+        .expect("a thread that exited mid-change is not a failure");
+        assert_eq!(visited, [100, 102, 101]);
+    }
+
+    #[test]
+    fn leader_failure_fails_the_change_and_spares_other_threads() {
+        let mut visited = Vec::new();
+        let result = apply_to_threads("test", &[100, 101], |tid| {
+            visited.push(tid);
+            Err(std::io::Error::from_raw_os_error(libc::EPERM))
+        });
+        assert!(result.is_err());
+        assert_eq!(visited, [100]);
+    }
+
+    fn cache(level: u32, kind: &str, shared: &str, size_kb: u64) -> CacheIndex {
+        CacheIndex {
+            level,
+            kind: Some(kind.into()),
+            shared_cpu_list: Some(shared.into()),
+            size_kb: Some(size_kb),
         }
+    }
+
+    /// 8 SMT cores (16 logical CPUs): per-core 32K L1d + 32K L1i and 512K
+    /// L2, one 32M L3; each listed under every logical CPU, as sysfs does.
+    fn smt_8_core_caches() -> Vec<CacheIndex> {
+        let mut out = Vec::new();
+        for cpu in 0..16 {
+            let core = cpu % 8;
+            let siblings = format!("{core},{}", core + 8);
+            out.push(cache(1, "Data", &siblings, 32));
+            out.push(cache(1, "Instruction", &siblings, 32));
+            out.push(cache(2, "Unified", &siblings, 512));
+            out.push(cache(3, "Unified", "0-15", 32 * 1024));
+        }
+        out
+    }
+
+    #[test]
+    fn cache_totals_sum_every_distinct_instance() {
+        assert_eq!(cache_totals_kb(&smt_8_core_caches()), [512, 4096, 32768]);
+    }
+
+    #[test]
+    fn cache_level_with_unreadable_instance_is_unknown() {
+        let mut caches = smt_8_core_caches();
+        caches[2].size_kb = None; // one L2 instance
+        assert_eq!(cache_totals_kb(&caches), [512, 0, 32768]);
+    }
+
+    #[test]
+    fn cache_size_parses_sysfs_units() {
+        assert_eq!(parse_cache_size("48K\n"), Some(48));
+        assert_eq!(parse_cache_size("32M"), Some(32 * 1024));
+        assert_eq!(parse_cache_size("garbage"), None);
+    }
+
+    #[test]
+    fn mapper_mount_resolves_to_kernel_dm_name() {
+        let dir = std::env::temp_dir().join(format!("tm-blockdev-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("mapper")).unwrap();
+        std::fs::write(dir.join("dm-3"), b"").unwrap();
+        let link = dir.join("mapper/vg-root");
+        std::os::unix::fs::symlink("../dm-3", &link).unwrap();
+        let name = block_device_name(&link.to_string_lossy());
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(name, "dm-3");
+        assert_eq!(block_device_name("/nonexistent/sda1"), "sda1");
+    }
+
+    #[test]
+    fn gpu_without_utilization_or_vram_source_is_not_reported() {
+        assert!(drm_card_gpu(0, None, None, None).is_none());
+        assert!(drm_card_gpu(0, None, Some(1), Some(2)).is_none());
+        assert!(drm_card_gpu(0, Some(5.0), None, Some(2)).is_none());
+
+        let gpu = drm_card_gpu(1, Some(37.0), Some(512 << 20), None).expect("amdgpu-like card");
+        assert_eq!(gpu.id, 1);
+        assert_eq!(gpu.util_pct, 37.0);
+        assert_eq!(gpu.dedicated_used_bytes, 512 << 20);
+        assert_eq!(gpu.mem_total_bytes, 0);
+    }
+
+    #[test]
+    fn file_nr_first_field_is_the_open_handle_count() {
+        assert_eq!(
+            parse_file_nr("12345\t0\t9223372036854775807\n"),
+            Some(12345)
+        );
+        assert_eq!(parse_file_nr(""), None);
     }
 }

@@ -39,43 +39,68 @@ pub fn list_plists() -> Vec<StartupItem> {
                     .unwrap_or_else(|| path.to_string_lossy().to_string()),
                 location: format!("{label} ({})", dir.display()),
                 publisher: None,
-                enabled: true,
+                enabled: !parsed.disabled,
                 impact: StartupImpact::Unknown,
             });
         }
     }
-    items.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+    items.sort_by_key(|item| item.name.to_lowercase());
     items
 }
 
+#[derive(Debug, Default)]
 struct ParseOut_ {
     program: Option<String>,
+    /// The job's own `Disabled` key. Overrides recorded by `launchctl
+    /// disable` or the Login Items settings live outside the plist and are
+    /// not read here.
+    disabled: bool,
 }
 
 fn parse_plist(path: &Path) -> ParseOut_ {
-    // Minimal XML plist scan for <key>Program</key><string>…</string>
-    parse(path)
+    std::fs::read_to_string(path)
+        .map(|text| parse(&text))
+        .unwrap_or_default()
 }
 
-fn parse(path: &Path) -> ParseOut_ {
+fn parse(text: &str) -> ParseOut_ {
     // Minimal XML plist scan for <key>Program</key><string>…</string>
-    let mut out = ParseOut_ { program: None };
-    if let Ok(text) = std::fs::read_to_string(path) {
-        if let Some(idx) = text.find("<key>Program</key>") {
-            let rest = &text[idx..];
-            if let Some(start) = rest.find("<string>") {
-                if let Some(end) = rest[start + 8..].find("</string>") {
-                    out.program = Some(rest[start + 8..start + 8 + end].to_string());
-                }
-            }
-        } else if let Some(idx) = text.find("<key>ProgramArguments</key>") {
-            let rest = &text[idx..];
-            if let Some(start) = rest.find("<string>") {
-                if let Some(end) = rest[start + 8..].find("</string>") {
-                    out.program = Some(rest[start + 8..start + 8 + end].to_string());
-                }
-            }
-        }
+    let key = if text.contains("<key>Program</key>") {
+        "<key>Program</key>"
+    } else {
+        "<key>ProgramArguments</key>"
+    };
+    let program = text.find(key).and_then(|idx| {
+        let rest = &text[idx..];
+        let start = rest.find("<string>")? + 8;
+        let end = rest[start..].find("</string>")?;
+        Some(rest[start..start + end].to_string())
+    });
+    let disabled = text.find("<key>Disabled</key>").is_some_and(|idx| {
+        text[idx + "<key>Disabled</key>".len()..]
+            .trim_start()
+            .starts_with("<true/>")
+    });
+    ParseOut_ { program, disabled }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn disabled_key_marks_the_job_disabled() {
+        let plist = "<dict>\n\t<key>Disabled</key>\n\t<true/>\n\t<key>Program</key>\n\t<string>/usr/local/bin/agent</string>\n</dict>";
+        let parsed = parse(plist);
+        assert!(parsed.disabled);
+        assert_eq!(parsed.program.as_deref(), Some("/usr/local/bin/agent"));
+
+        let parsed = parse(
+            "<key>Disabled</key><false/><key>ProgramArguments</key><array><string>/bin/agent</string><string>-x</string></array>",
+        );
+        assert!(!parsed.disabled);
+        assert_eq!(parsed.program.as_deref(), Some("/bin/agent"));
+
+        assert!(!parse("<key>Label</key><string>x</string>").disabled);
     }
-    out
 }
