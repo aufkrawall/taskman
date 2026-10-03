@@ -255,6 +255,30 @@ remain follow-up rather than being simulated in headless tests:
   then removes the ARP entry. See `installer.md` for self-relocation and failure
   behavior; personal settings survive.
 
+- **Open from the 2026-10-03 audit (verified, not yet fixed; need a VM or a
+  design decision rather than a local patch):**
+  - `%ProgramData%\TaskMan` / `broker.json`: an existing directory is reused
+    after a share-mode pin and a DACL rewrite, but a handle opened earlier with
+    `WRITE_DAC`/`WRITE_OWNER` keeps those rights, and `load_manifest` does not
+    check the manifest's owner/DACL. Fix direction: refuse or move aside a
+    pre-existing directory not owned by SYSTEM/Administrators, verify owner
+    and DACL through the open handle, and compare the client token's SID with
+    `authorized_user_sid` (`ImpersonateNamedPipeClient`).
+  - `instance.rs`: all launches share the auto-reset Show/Shown events, so two
+    quick launches against an elevated primary can merge acknowledgements and
+    one of them starts a second, unregistered instance after its ~5.5 s wait.
+    Needs a per-request sequence in the shared `Primary` section.
+  - `instance.rs` labels the coordination objects low integrity
+    (`S:(ML;;NW;;;LW)`); a medium label (`ME`) would still serve medium
+    launches into an elevated primary while keeping sandboxed low-IL
+    processes out. Unverified against the hotkey/IFEO launch path — test
+    before changing.
+  - When the broker has to wait for a pipe instance (`PIPE_REARM_BACKOFF`),
+    the pipe can briefly have no instance at all once every client lets go;
+    a squatter could create the name in that window. Re-creating with
+    `FILE_FLAG_FIRST_PIPE_INSTANCE` whenever the broker knows it holds no
+    instance would close it; instance ownership is not tracked today.
+
 ## Deliberate deviations / session-limited fixes
 
 - **Efficiency-mode UI latency** (2026-08-26): after a toggle the UI waits
@@ -283,6 +307,20 @@ remain follow-up rather than being simulated in headless tests:
   non-throttled thread can still cause it; the replacement then keeps working
   everywhere except over fullscreen games until TaskMan restarts. Periodic
   re-installation was rejected as polling on the input path.
+
+- **Small accepted residuals from the 2026-10-03 audit:**
+  - `format::format_date` renders a UTC calendar date (App history "since",
+    Details process start). tm-core cannot query the time zone; shifting it
+    needs a platform-provided offset. Documented on the function.
+  - `logging.rs` drains the early ring before the file writer is switched on,
+    so a line logged by another thread inside that window can be lost.
+  - Machines with more than 64 logical CPUs: per-core counters cover the
+    current processor group while per-process times span all groups.
+  - `gpu::process_gpu_view` rescans every GPU record per process
+    (processes x records per tick); fine at desktop scale.
+  - macOS has no system thread-count source without Mach FFI, so its
+    Performance page still shows 0 threads; Linux/macOS disk byte rates read
+    0 B/s on the first sample (the model has no unknown rate).
 
 ## Falsified findings — do not re-raise
 

@@ -28,6 +28,10 @@ platform boundary (`tm-core` ← `tm-platform` ← `tm-app` / `tm-service`), and
     writer thread with generations, late-load merge, Unix non-system
     eligibility),
     `demand.rs` (TelemetryDemand bitmask),
+    `persist.rs` (crate-private: synced temp-file-then-rename replacement
+    for every persisted file, and `set_aside` — an existing file that cannot
+    be used is renamed to `<name>.bad` instead of being overwritten by
+    defaults),
     `startup_impact.rs` (measured startup cost per image: per-tick CPU-time
     and I/O deltas folded across the boot window, Microsoft's documented
     Low/Medium/High thresholds, and the persisted store — see the module doc
@@ -250,10 +254,13 @@ platform boundary (`tm-core` ← `tm-platform` ← `tm-app` / `tm-service`), and
   after any Windows build that changes the page lists.
 - `crates/tm-platform/src/win/sampler.rs` — `sample_inner` is the whole
   snapshot for one tick. `is_zombie` is the eviction rule split out of it and
-  unit-tested: its `terminated` / `live_in_kernel_table` arguments are
-  CLOSURES, not `bool`s, because `is_process_terminated` opens a process
-  handle — evaluating them eagerly would put one `OpenProcess` per process per
-  tick on the hot path. `collect_gpus` / `collect_disks` / `collect_networks`
+  unit-tested: a process the kernel table lists with running threads is
+  alive without any probe; only an unlisted one reaches the `terminated` /
+  `live_in_kernel_table` CLOSURES, because `is_process_terminated` opens up to
+  three handles. Per-process thread counts come from the `cpu_load` kernel
+  table (a Toolhelp thread snapshot cost ~30 ms per tick), and the service
+  catalog caches each service's configuration for 60 s (the SCM round trips
+  cost ~36 ms per tick). `collect_gpus` / `collect_disks` / `collect_networks`
   are the self-contained tail phases; `apply_process_gpu` folds the per-process
   GPU view in. The process loop itself stays inline: every invariant it
   carries is commented where it is enforced.

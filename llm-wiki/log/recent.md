@@ -1,3 +1,43 @@
+- 2026-10-03: Whole-program audit (five parallel reviewers: tm-core, Windows
+  telemetry, broker/actions, GUI, installer + Linux/macOS + build.py), every
+  finding re-verified before fixing; ~45 fixes across 11 commits on `main`.
+  Highlights, with the root causes worth remembering:
+  - End process tree matched Toolhelp parent PIDs only, so the tree of a
+    process that inherited a dead parent's PID took unrelated processes with
+    it (explorer.exe's recorded parent is userinit). Now one
+    `SystemProcessInformation` snapshot (`cpu_load::process_tree_snapshot`)
+    with child-not-older-than-parent. `OpenProcess` errors were compared with
+    a bare 87 although windows-rs reports the HRESULT 0x80070057, so
+    `ProcessNotFound` never fired anywhere.
+  - CPU cache totals divided every cache by its sharers (5700X: L3 2 MB
+    instead of 32 MB); Linux only read cpu0 and deduped L1i away.
+  - PDH groups never reopened after their 30 s sleep (slot stayed `Some`):
+    GPU/disk/CPU-speed went dark for the session after one tray stint.
+    PhysicalDisk instances "0 C: D:" only matched the last letter.
+  - GUI deadlocks: Users and Services held their cache lock across row
+    menus whose actions lock the same std Mutex (Sign out, Start).
+  - Engine sampled at the top of every loop iteration, so every command
+    forced a sample and Refresh sampled twice; Pause sent before Start was
+    dropped (saved "Paused" never applied). Now a deadline cadence.
+  - App history differenced cumulative counters against 0 after a gap
+    (per-process network is only collected on some pages), re-crediting
+    lifetime totals on every tab round trip.
+  - Broker exited when all 20 pipe instances were held (ERROR_PIPE_BUSY
+    counted as an accept failure). ETW consumers stopped underneath us left
+    frozen totals reported as live.
+  - Per-tick cost: Toolhelp thread snapshot ~30 ms and SCM config walk
+    ~36 ms per tick removed; liveness probes no longer open handles for
+    listed processes; tables no longer measure every cell for auto-fit on
+    every frame.
+  - Installer: delay-loaded non-KnownDLL imports + per-binary hybrid CRT +
+    System32-only DLL search, pinned running image, admin-only log folder
+    (the old `setup.log` in the service log folder silently disabled service
+    file logging), handle-based uninstall relocation, ARP registration right
+    after the service step.
+  Open items moved to `known-debt.md` (ProgramData pre-creation/manifest
+  owner check, instance handshake race, integrity label, pipe re-creation
+  window, UTC dates, >64 CPUs).
+
 - 2026-10-02: Details showed "—" / "Unknown" in the User name and Elevated
   columns for ~23 protected processes (user screenshot: Registry, smss,
   csrss ×2, wininit, winlogon, services, lsass, dwm, Memory Compression,

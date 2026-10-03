@@ -107,6 +107,21 @@ contract.
   NOT a vanished client are logged and skipped, and only
   `MAX_CONSECUTIVE_ACCEPT_FAILURES` (16) in a row returns `Err` so a listener
   that can never be armed again stays visible instead of spinning forever.
+- A full pipe is back-pressure, not a fault (2026-10-03). When every one of
+  the `PIPE_INSTANCE_CAP` instances is held (queued/working clients, or
+  rejected clients that have not closed their end — their instance is only
+  released then), `CreateNamedPipeW` fails with `ERROR_PIPE_BUSY`;
+  `create_pipe_instance` keeps that as the raw OS error and the accept loop
+  waits `PIPE_REARM_BACKOFF` (50 ms; npfs offers no release event) without
+  counting it toward `MAX_CONSECUTIVE_ACCEPT_FAILURES`. Counting it let ~20
+  lingering client handles exhaust the limit in microseconds and exit the
+  service. Pinned by `a_full_pipe_reports_busy_not_failure`.
+- A broker-hosted ETW trace whose consumer ended underneath it (session
+  stopped by `logman` or a name collision) is replaced in place on the next
+  request, so the slot's single watchdog keeps covering it; that tick is
+  unknown. `etw::Session` skips its by-name stop in `Drop` once the consumer
+  has ended, because the name may belong to another process's session by
+  then.
 - The client retries `ERROR_PIPE_BUSY` until `PIPE_BUSY_RETRY` (1 s) instead of
   once. `WaitNamedPipeW` reports only that AN instance became free, so another
   client can still take it first; a single retry loses that race often enough
@@ -119,6 +134,10 @@ The service rejects PID 0–4, itself, the requesting GUI, and critical Windows
 processes. The action handle rechecks the exact PID+creation-time identity and
 critical state before use. Tree termination refuses descendants whose creation
 identity could not be captured; it never falls back to an unverified child PID.
+Descendants, parent links and creation times come from ONE
+`SystemProcessInformation` snapshot, and a "child" created before its
+recorded parent is not part of the tree (its parent's PID was recycled by the
+selected root); children that exit on their own mid-operation count as done.
 
 Allowlisted operations are process/tree termination, suspend/resume, priority,
 affinity, efficiency mode, UAC virtualization, guarded module unload, service
