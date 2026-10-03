@@ -3498,7 +3498,7 @@ dependencies = [
 
 [[package]]
 name = "tm-app"
-version = "0.1.17"
+version = "0.1.18"
 dependencies = [
  "eframe",
  "egui_software",
@@ -3517,7 +3517,7 @@ dependencies = [
 
 [[package]]
 name = "tm-core"
-version = "0.1.17"
+version = "0.1.18"
 dependencies = [
  "dirs",
  "serde",
@@ -3530,7 +3530,7 @@ dependencies = [
 
 [[package]]
 name = "tm-installer"
-version = "0.1.17"
+version = "0.1.18"
 dependencies = [
  "eframe",
  "egui",
@@ -3548,7 +3548,7 @@ dependencies = [
 
 [[package]]
 name = "tm-platform"
-version = "0.1.17"
+version = "0.1.18"
 dependencies = [
  "libc",
  "raw-cpuid",
@@ -3564,7 +3564,7 @@ dependencies = [
 
 [[package]]
 name = "tm-service"
-version = "0.1.17"
+version = "0.1.18"
 dependencies = [
  "tm-core",
  "tm-platform",
@@ -3574,7 +3574,7 @@ dependencies = [
 
 [[package]]
 name = "tm-ui"
-version = "0.1.17"
+version = "0.1.18"
 dependencies = [
  "egui",
  "tm-core",

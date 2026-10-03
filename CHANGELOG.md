@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.1.18 - 2026-10-03
+
 ### Fixed
 
 - **User name / Elevated for protected processes:** the Details rows of
