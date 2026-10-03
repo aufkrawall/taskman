@@ -74,6 +74,25 @@
   Users tables reads "—" instead of "0 %" while no process has GPU telemetry,
   and an unknown socket or core count on the CPU page reads "—" instead of
   "0" (or a guessed "1").
+- **App history inflated by tab switches:** after a tick without per-process
+  network or CPU counters (another page shown, or the background service
+  missing a tick), the next reading was counted from zero, so every return to
+  Processes, Users or App history credited a program's entire traffic and CPU
+  time since it started again — and saved it.
+- **"Paused" update speed ignored at startup:** with Update speed set to
+  Paused, the app came up sampling anyway while the menu said Paused. It now
+  starts paused with one initial snapshot.
+- **Extra and duplicate samples:** switching pages, hiding or restoring the
+  window and similar changes each forced an off-schedule sample, and Refresh
+  (F5) sampled twice. Rates from those near-zero windows showed as one-tick
+  spikes and dips in graphs and columns.
+- **Startup impact undercounted:** an app that started after boot is now
+  charged everything it did since it started, not only what happened after
+  TaskMan first saw it, so a launcher that does its work in its first second
+  is no longer "Low" or "Not measured".
+- **Saved GPU graph engine reset on restart:** an engine name containing
+  spaces (e.g. "High Priority Compute") is kept instead of reverting to the
+  overall graph.
 
 ### Improved
 
@@ -90,6 +109,11 @@
   reading the last BIOS time now happen when the list is fetched, not for
   every row on every repaint; an entry pointing at an unreachable network path
   no longer stalls the window on mouse movement.
+- **Safer settings and history files:** settings, app history and startup
+  impact data are flushed to disk before they replace the previous file, so a
+  power loss cannot leave an empty file behind. A file that exists but cannot
+  be used (corrupt, oversized, unreadable) is kept as `<name>.bad` instead of
+  being overwritten by defaults on the next save.
 
 ### Changed
 

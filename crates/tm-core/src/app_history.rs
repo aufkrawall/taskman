@@ -20,7 +20,7 @@
 use crate::model::{ProcCategory, Snapshot};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
-use std::io::{Read, Write};
+use std::io::Read;
 use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, Sender};
 
@@ -32,19 +32,30 @@ const MAX_DB_BYTES: usize = 16 * 1024 * 1024;
 /// is absent, unreadable, oversized, or not UTF-8; callers start fresh, which
 /// is the documented corrupt-file behavior.
 fn read_db_text(path: &std::path::Path) -> Option<String> {
-    let file = std::fs::File::open(path).ok()?;
+    let file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(error) => {
+            tracing::warn!(path = %path.display(), %error, "app-history db unreadable");
+            crate::persist::set_aside(path, "app-history db");
+            return None;
+        }
+    };
     let mut bytes = Vec::with_capacity(64 * 1024);
-    file.take((MAX_DB_BYTES + 1) as u64)
-        .read_to_end(&mut bytes)
-        .ok()?;
-    if bytes.len() > MAX_DB_BYTES {
+    let read = file.take((MAX_DB_BYTES + 1) as u64).read_to_end(&mut bytes);
+    if read.is_err() || bytes.len() > MAX_DB_BYTES {
         tracing::warn!(
             path = %path.display(),
-            "app-history db exceeds {MAX_DB_BYTES} bytes; ignoring it"
+            "app-history db unreadable or larger than {MAX_DB_BYTES} bytes"
         );
+        crate::persist::set_aside(path, "app-history db");
         return None;
     }
-    String::from_utf8(bytes).ok()
+    let text = String::from_utf8(bytes).ok();
+    if text.is_none() {
+        crate::persist::set_aside(path, "app-history db");
+    }
+    text
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -93,7 +104,9 @@ struct PrevTick {
     /// ProcessIdentity guard: start epoch of the observed process.
     start_epoch_s: Option<i64>,
     app_identity: String,
-    cpu_time_s: f64,
+    /// `None` when the platform did not report the counter that tick: a
+    /// later reading has nothing to be differenced against.
+    cpu_time_s: Option<f64>,
     net_total_bytes: Option<u64>,
 }
 
@@ -224,20 +237,10 @@ fn history_writer_loop(path: PathBuf, rx: Receiver<WriteCmd>) {
 }
 
 fn write_atomic(path: &std::path::Path, file: &DbFile) {
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    let tmp = path.with_extension("json.tmp");
-    match std::fs::File::create(&tmp).and_then(|mut f| {
-        serde_json::to_writer(&mut f, file)?;
-        f.flush()
+    if let Err(e) = crate::persist::replace_file(path, "json.tmp", |out| {
+        serde_json::to_writer(out, file).map_err(std::io::Error::from)
     }) {
-        Ok(()) => {
-            if let Err(e) = std::fs::rename(&tmp, path) {
-                tracing::warn!(error = %e, "failed to rotate app-history db");
-            }
-        }
-        Err(e) => tracing::warn!(error = %e, "failed to write app-history db"),
+        tracing::warn!(error = %e, "failed to write app-history db");
     }
 }
 
@@ -309,7 +312,8 @@ impl AppHistoryDb {
                 self.names = dbf.names;
             }
             Err(e) => {
-                tracing::warn!(error = %e, path = %path.display(), "app-history db corrupt; starting fresh");
+                tracing::warn!(error = %e, path = %path.display(), "app-history db corrupt");
+                crate::persist::set_aside(path, "app-history db");
             }
         }
     }
@@ -474,12 +478,6 @@ impl AppHistoryDb {
             if !history_eligible(p.category, cfg!(target_os = "windows")) {
                 continue;
             }
-            let cpu_time = p.cpu_time_s.unwrap_or({
-                // Fallback: estimate from rate * elapsed when the platform
-                // cannot report accumulated CPU time.
-                0.0
-            });
-
             // Network totals only when the platform provides real numbers.
             let net_total = match (p.net_recv_total, p.net_sent_total) {
                 (Some(r), Some(s)) => Some(r + s),
@@ -497,30 +495,29 @@ impl AppHistoryDb {
                 prev.app_identity == key && prev.start_epoch_s == p.start_epoch_s
             });
 
-            let d_cpu = match (same_process, prev) {
-                (true, Some(prev)) => (cpu_time - prev.cpu_time_s).max(0.0),
-                _ => 0.0, // first sighting of this identity contributes nothing
+            // Cumulative counters are differenced only against a reading of
+            // the SAME counter on the previous tick. A gap (per-process
+            // network is collected only while a page shows it; the broker can
+            // miss a tick) used to difference against zero and credit the
+            // process's whole lifetime total again on every return. Without a
+            // pair, the rate covers this window; a first sighting of this
+            // identity contributes nothing either way.
+            let prev_cpu = prev.and_then(|prev| prev.cpu_time_s);
+            let prev_net = prev.and_then(|prev| prev.net_total_bytes);
+            let d_cpu = match (prev_cpu, p.cpu_time_s) {
+                _ if !same_process => 0.0,
+                (Some(before), Some(now)) => (now - before).max(0.0),
+                _ if p.cpu_pct > 0.0 => (p.cpu_pct as f64 / 100.0) * interval_s.max(0.0),
+                _ => 0.0,
             };
-            let d_net: u64 = match (same_process.then_some(()), prev, net_total) {
-                (Some(()), Some(prev), Some(total)) => {
-                    total.saturating_sub(prev.net_total_bytes.unwrap_or(0))
+            let d_net: u64 = match (prev_net, net_total) {
+                _ if !same_process => 0,
+                (Some(before), Some(now)) => now.saturating_sub(before),
+                _ if p.net_recv_bps.is_some() || p.net_sent_bps.is_some() => {
+                    ((p.net_recv_bps.unwrap_or(0.0) + p.net_sent_bps.unwrap_or(0.0))
+                        * interval_s.max(0.0)) as u64
                 }
                 _ => 0,
-            };
-
-            let d_cpu = if p.cpu_time_s.is_some() || !same_process || p.cpu_pct <= 0.0 {
-                d_cpu
-            } else {
-                (p.cpu_pct as f64 / 100.0) * interval_s.max(0.0)
-            };
-            let d_net = if net_total.is_some()
-                || !same_process
-                || (p.net_recv_bps.is_none() && p.net_sent_bps.is_none())
-            {
-                d_net
-            } else {
-                ((p.net_recv_bps.unwrap_or(0.0) + p.net_sent_bps.unwrap_or(0.0))
-                    * interval_s.max(0.0)) as u64
             };
 
             let e = self.entries.entry(key.clone()).or_default();
@@ -542,7 +539,7 @@ impl AppHistoryDb {
                 PrevTick {
                     start_epoch_s: p.start_epoch_s,
                     app_identity: key,
-                    cpu_time_s: cpu_time,
+                    cpu_time_s: p.cpu_time_s,
                     net_total_bytes: net_total,
                 },
             );
@@ -689,6 +686,42 @@ mod tests {
         db.observe(&snap, 1.0);
         assert!(db.entries()["app.exe"].network_available);
         assert_eq!(db.entries()["app.exe"].network_bytes, 0);
+    }
+
+    /// A tick without a cumulative counter (the page that wants network
+    /// telemetry was left, or the broker missed a tick) must not make the
+    /// next reading count from zero: that credited the process's whole
+    /// lifetime traffic and CPU time again on every round trip.
+    #[test]
+    fn a_counter_gap_does_not_recredit_the_lifetime_total() {
+        let mut db = AppHistoryDb::in_memory();
+        db.observe(
+            &snap_with(3, "app.exe", ProcCategory::App, 100.0, 50_000),
+            1.0,
+        );
+
+        let mut gap = snap_with(3, "app.exe", ProcCategory::App, 101.0, 0);
+        gap.processes[0].cpu_time_s = None;
+        gap.processes[0].net_recv_total = None;
+        gap.processes[0].net_sent_total = None;
+        db.observe(&gap, 1.0);
+
+        db.observe(
+            &snap_with(3, "app.exe", ProcCategory::App, 102.0, 60_000),
+            1.0,
+        );
+        let entry = &db.entries()["app.exe"];
+        assert_eq!(entry.network_bytes, 0, "no pair of totals, no delta");
+        assert!(entry.cpu_seconds < 1e-6, "{}", entry.cpu_seconds);
+
+        // Once both ends are real again, ordinary deltas resume.
+        db.observe(
+            &snap_with(3, "app.exe", ProcCategory::App, 103.5, 61_000),
+            1.0,
+        );
+        let entry = &db.entries()["app.exe"];
+        assert_eq!(entry.network_bytes, 1_000);
+        assert!((entry.cpu_seconds - 1.5).abs() < 1e-6);
     }
 
     /// A recycled PID whose new counters are HIGHER than the old process'

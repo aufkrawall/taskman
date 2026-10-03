@@ -269,6 +269,57 @@ fn sample_and_publish(
     Ok(arc)
 }
 
+/// Failure bookkeeping shared by cadence ticks, refreshes and `SampleNow`.
+#[derive(Default)]
+struct TickHealth {
+    failures: u64,
+    last_report: Option<Instant>,
+}
+
+impl TickHealth {
+    /// Sample and publish; `None` when the collector failed.
+    ///
+    /// A collector that keeps failing must not do so silently: the UI would
+    /// just keep showing the last good snapshot with no clue why it froze.
+    /// Reports are rate-limited so a persistently failing provider cannot
+    /// flood the log. A collector without support for this platform parks
+    /// the engine instead.
+    fn sample(
+        &mut self,
+        collector: &mut Box<dyn SystemCollector>,
+        shared: &Shared,
+    ) -> Option<Arc<Snapshot>> {
+        match sample_and_publish(collector, shared) {
+            Ok(arc) => {
+                self.failures = 0;
+                self.last_report = None;
+                Some(arc)
+            }
+            Err(e @ TmError::Unsupported(_)) => {
+                tracing::error!(error = %e, "collector unsupported; pausing engine");
+                *sync::write(&shared.state) = EngineState::Paused;
+                shared.notify();
+                None
+            }
+            Err(error) => {
+                self.failures += 1;
+                let due = self
+                    .last_report
+                    .is_none_or(|at| at.elapsed() >= Duration::from_secs(30));
+                if due {
+                    self.last_report = Some(Instant::now());
+                    tracing::warn!(
+                        %error,
+                        failures = self.failures,
+                        "sampling tick failed; keeping the previous snapshot"
+                    );
+                }
+                None
+            }
+        }
+    }
+}
+
 fn run_loop(
     factory: CollectorFactory,
     start_immediately: bool,
@@ -286,6 +337,10 @@ fn run_loop(
     // start page: `PROCESS_NET` was requested exactly once, into the void.
     let mut pending_demand: Option<crate::demand::TelemetryDemand> = None;
     let mut pending_background: Option<bool> = None;
+    // Same for Pause: the UI restores a saved "Paused" update speed before it
+    // starts the engine. Dropping it left the engine Running behind a menu
+    // that said Paused.
+    let mut pending_paused = false;
     let mut collector: Box<dyn SystemCollector> = if start_immediately {
         factory()
     } else {
@@ -304,8 +359,10 @@ fn run_loop(
                     shared.notify();
                     return;
                 }
-                // Pause/Resume/Refresh are transitions of a running engine;
-                // Start is what brings it up, so they stay meaningless here.
+                Ok(EngineCmd::Pause) => pending_paused = true,
+                Ok(EngineCmd::Resume) => pending_paused = false,
+                // Refresh/SampleNow ask for a sample; the first one Start
+                // takes answers them.
                 Ok(_) => {}
                 Err(std::sync::mpsc::RecvError) => {
                     *sync::write(&shared.state) = EngineState::Stopped;
@@ -324,48 +381,37 @@ fn run_loop(
     shared.notify();
     tracing::info!(backend = collector.backend_name(), "engine running");
 
-    // A collector that keeps failing must not do so silently: the UI would
-    // just keep showing the last good snapshot with no clue why it froze.
-    // Rate-limited so a persistently failing provider cannot flood the log.
-    let mut failures: u64 = 0;
-    let mut last_report: Option<Instant> = None;
-    let report_failure = |error: &TmError, failures: u64, last: &mut Option<Instant>| {
-        let due = last.is_none_or(|at| at.elapsed() >= Duration::from_secs(30));
-        if due {
-            *last = Some(Instant::now());
-            tracing::warn!(%error, failures, "sampling tick failed; keeping the previous snapshot");
-        }
-    };
+    let mut health = TickHealth::default();
+    if pending_paused {
+        // Paused before the collector existed: publish one snapshot so the
+        // window has something to show, then honour the pause.
+        health.sample(&mut collector, shared);
+        tracing::info!("engine paused");
+        *sync::write(&shared.state) = EngineState::Paused;
+        shared.notify();
+    }
 
+    // The cadence is kept as a deadline. Commands are answered WITHOUT
+    // sampling unless they ask for one: the loop used to sample at the top
+    // of every iteration, so each demand/background/interval change forced
+    // an off-schedule sample (a window restore queued four of them back to
+    // back) and Refresh sampled twice. Rates from those near-zero windows
+    // showed up as one-tick dips and spikes in the graphs.
+    let mut last_tick = Instant::now();
+    let mut next_due = last_tick;
     loop {
-        let started = Instant::now();
-
-        // Take the sample unless paused.
-        if *sync::read(&shared.state) == EngineState::Running {
-            match sample_and_publish(&mut collector, shared) {
-                Ok(_) => {
-                    failures = 0;
-                    last_report = None;
-                }
-                Err(e @ TmError::Unsupported(_)) => {
-                    // Collector lacks this platform's support entirely; park.
-                    tracing::error!(error = %e, "collector unsupported; pausing engine");
-                    *sync::write(&shared.state) = EngineState::Paused;
-                    shared.notify();
-                }
-                Err(e) => {
-                    failures += 1;
-                    report_failure(&e, failures, &mut last_report);
-                }
-            }
+        if *sync::read(&shared.state) == EngineState::Running && Instant::now() >= next_due {
+            last_tick = Instant::now();
+            health.sample(&mut collector, shared);
+            // Anchored at the tick's start: the interval is a cadence, not a
+            // gap after the work.
+            next_due = last_tick + *sync::read(&shared.interval);
         }
 
-        // Wait out the rest of the interval while staying responsive to cmds.
-        let elapsed = started.elapsed();
-        let interval = *sync::read(&shared.interval);
+        // Wait for the next tick while staying responsive to commands.
         let wait = if *sync::read(&shared.state) == EngineState::Running {
-            interval
-                .saturating_sub(elapsed)
+            next_due
+                .saturating_duration_since(Instant::now())
                 .max(Duration::from_millis(5))
         } else {
             // Paused: park until a command arrives (no busy polling).
@@ -376,6 +422,7 @@ fn run_loop(
             Ok(EngineCmd::SetInterval(i)) => {
                 tracing::info!(interval_ms = i.as_millis() as u64, "interval changed");
                 *sync::write(&shared.interval) = i;
+                next_due = last_tick + i;
             }
             Ok(EngineCmd::SetDemand(d)) => collector.set_demand(d),
             Ok(EngineCmd::SetBackground(b)) => collector.set_background(b),
@@ -385,38 +432,32 @@ fn run_loop(
                 shared.notify();
             }
             Ok(EngineCmd::Resume) => {
-                tracing::info!("engine resumed");
-                *sync::write(&shared.state) = EngineState::Running;
-                shared.notify();
+                let mut state = sync::write(&shared.state);
+                if *state != EngineState::Running {
+                    tracing::info!("engine resumed");
+                    *state = EngineState::Running;
+                    drop(state);
+                    // Leaving a pause shows fresh data right away.
+                    next_due = Instant::now();
+                    shared.notify();
+                }
             }
             Ok(EngineCmd::Start) => {} // already running; idempotent
             Ok(EngineCmd::Refresh) => {
-                // Force exactly one sample regardless of paused state; the
+                // Exactly one sample regardless of paused state; the
                 // pause/running mode itself must not change (F5 semantics).
-                match sample_and_publish(&mut collector, shared) {
-                    Ok(_) => {
-                        failures = 0;
-                        last_report = None;
-                    }
-                    Err(e @ TmError::Unsupported(_)) => {
-                        tracing::error!(error = %e, "refresh failed; pausing engine");
-                        *sync::write(&shared.state) = EngineState::Paused;
-                        shared.notify();
-                    }
-                    Err(e) => {
-                        failures += 1;
-                        report_failure(&e, failures, &mut last_report);
-                    }
-                }
+                // The cadence restarts from it.
+                last_tick = Instant::now();
+                health.sample(&mut collector, shared);
+                next_due = last_tick + *sync::read(&shared.interval);
             }
-            Ok(EngineCmd::SampleNow(reply)) => match sample_and_publish(&mut collector, shared) {
-                Ok(arc) => {
+            Ok(EngineCmd::SampleNow(reply)) => {
+                last_tick = Instant::now();
+                if let Some(arc) = health.sample(&mut collector, shared) {
                     let _ = reply.send(arc);
                 }
-                Err(e) => {
-                    tracing::error!(error = %e, "sample_now failed");
-                }
-            },
+                next_due = last_tick + *sync::read(&shared.interval);
+            }
             Ok(EngineCmd::Shutdown) => break,
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => break,
@@ -648,6 +689,47 @@ mod tests {
             "paused engine must not keep ticking"
         );
 
+        h.shutdown();
+        join.join().unwrap();
+    }
+
+    /// Commands that do not ask for a sample must not cause one, and Refresh
+    /// samples exactly once. Commands are handled in order, so when
+    /// `sample_now` answers, everything sent before it has been processed.
+    #[test]
+    fn only_sampling_commands_sample() {
+        let (h, join) = spawn(Box::new(TinyCollector), Duration::from_secs(3600)).unwrap();
+        assert!(wait_for(|| h.tick_count() == 1, 5000));
+        for _ in 0..3 {
+            h.set_demand(crate::demand::TelemetryDemand::core());
+            h.set_background(false);
+        }
+        h.set_interval(Duration::from_secs(3600));
+        h.request_refresh();
+        h.sample_now().expect("sample_now answers");
+        assert_eq!(h.tick_count(), 3, "first tick + one refresh + sample_now");
+        h.shutdown();
+        join.join().unwrap();
+    }
+
+    /// A saved "Paused" update speed is applied before the engine starts: the
+    /// engine must come up paused, with exactly one snapshot to show.
+    #[test]
+    fn pause_sent_before_start_is_honored() {
+        let (h, join) = spawn_lazy(
+            Box::new(|| Box::new(TinyCollector)),
+            Duration::from_millis(15),
+            None,
+        )
+        .unwrap();
+        h.pause();
+        h.start();
+        assert!(wait_for(|| h.state() == EngineState::Paused, 5000));
+        assert!(h.latest().is_some(), "a paused start still shows data");
+        h.set_demand(crate::demand::TelemetryDemand::core());
+        h.sample_now().expect("sample_now answers while paused");
+        assert_eq!(h.tick_count(), 2, "first snapshot + sample_now, no cadence");
+        assert_eq!(h.state(), EngineState::Paused);
         h.shutdown();
         join.join().unwrap();
     }

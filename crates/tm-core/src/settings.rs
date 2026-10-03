@@ -635,8 +635,15 @@ impl Settings {
                 tracing::debug!(path = %path.display(), "settings loaded");
                 s
             }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                tracing::debug!(path = %path.display(), "no settings file; using defaults");
+                Self::default()
+            }
             Err(error) => {
-                tracing::debug!(path = %path.display(), %error, "settings unavailable; using defaults");
+                // Present but unusable (oversized, unreadable): keep it so the
+                // first autosave cannot overwrite the user's real settings.
+                tracing::warn!(path = %path.display(), %error, "settings file unusable");
+                crate::persist::set_aside(path, "settings file");
                 Self::default()
             }
         }
@@ -712,11 +719,15 @@ impl Settings {
         if let Some(v) = get("general", "gpu_graph_mode") {
             // Engine names come from PDH, so there is no closed set to
             // validate against; bound the length and reject anything with
-            // structure instead.
+            // structure instead. Inner spaces are names, not structure: some
+            // drivers report engine types such as "High Priority Compute",
+            // which used to be reset to "overall" on every restart.
             let mode = v.trim();
             if !mode.is_empty()
                 && mode.len() <= 32
-                && mode.chars().all(|c| c.is_alphanumeric() || c == '_')
+                && mode
+                    .chars()
+                    .all(|c| c.is_alphanumeric() || c == '_' || c == ' ')
             {
                 s.gpu_graph_mode = mode.to_string();
             }
@@ -888,14 +899,9 @@ impl Settings {
     /// Write settings to `path` as INI. Always writes, regardless of the
     /// `save_config` switch (used by tests and explicit exports).
     ///
-    /// Durable atomic write (implement.md §17.3): same-dir temp file,
-    /// write+flush, rename over the destination. Rust's `std::fs::rename`
-    /// replaces an existing destination on Windows, so no extra workaround
-    /// is needed.
+    /// Durable atomic write (implement.md §17.3): same-dir temp file synced
+    /// to disk, then renamed over the destination (`crate::persist`).
     pub fn save_to(&self, path: &Path) -> std::io::Result<()> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
         let g = &[
             ("save_config", self.save_config.to_string()),
             ("language", self.language.as_cfg().to_string()),
@@ -927,20 +933,17 @@ impl Settings {
         for (k, v) in g {
             body.push_str(&format!("{k}={}\n", escape_ini(v)));
         }
-        let tmp = path.with_extension("ini.tmp");
-        std::fs::write(
-            &tmp,
-            render_ini(
-                body,
-                &self.col_widths,
-                &self.col_visible,
-                &self.col_order,
-                &self.table_sort,
-                &self.process_rules,
-            ),
-        )?;
-        // Atomic-ish replace so a crash mid-write never corrupts settings.
-        std::fs::rename(&tmp, path)?;
+        let text = render_ini(
+            body,
+            &self.col_widths,
+            &self.col_visible,
+            &self.col_order,
+            &self.table_sort,
+            &self.process_rules,
+        );
+        crate::persist::replace_file(path, "ini.tmp", |out| {
+            std::io::Write::write_all(out, text.as_bytes())
+        })?;
         tracing::debug!(path = %path.display(), "settings saved");
         Ok(())
     }
@@ -1264,6 +1267,15 @@ text_smoothing=banana
         let path = dir.path().join("config.ini");
         std::fs::write(&path, vec![b'x'; MAX_SETTINGS_BYTES + 1]).unwrap();
         assert_eq!(Settings::load_from(&path), Settings::default());
+        // ...and the unusable file is kept aside, so the first autosave of
+        // those defaults cannot destroy what it held.
+        assert!(!path.exists());
+        assert_eq!(
+            std::fs::metadata(dir.path().join("config.ini.bad"))
+                .unwrap()
+                .len(),
+            (MAX_SETTINGS_BYTES + 1) as u64
+        );
     }
 
     #[test]

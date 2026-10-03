@@ -19,6 +19,7 @@ pub mod locale;
 pub mod logging;
 pub mod mock;
 pub mod model;
+mod persist;
 pub mod settings;
 pub mod startup_impact;
 pub mod sync;

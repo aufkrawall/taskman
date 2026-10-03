@@ -151,9 +151,25 @@ impl StartupImpactTracker {
             let previous = self.prev.get(&process.pid).filter(|prev| {
                 process.start_epoch_s.is_none() || prev.start_epoch_s == process.start_epoch_s
             });
-            if let Some(prev) = previous {
-                let cpu_delta_ms = (cpu_s - prev.cpu_s).max(0.0) * 1000.0;
-                let io_delta = io_bytes.saturating_sub(prev.io_bytes);
+            // A process first seen here that STARTED after boot spent its
+            // whole life inside the window, so its counters are charged from
+            // zero. Recording only a baseline lost everything it did before
+            // this tracker first saw it — the burst of an app that launches,
+            // reads its files and goes idle within one tick, and the whole
+            // startup of anything that started before TaskMan did. A process
+            // older than boot (or of unknown age) only contributes deltas.
+            let started_after_boot = matches!(
+                (process.start_epoch_s, self.boot_epoch_s),
+                (Some(start), Some(boot)) if start >= boot
+            );
+            let baseline = match previous {
+                Some(prev) => Some((prev.cpu_s, prev.io_bytes)),
+                None if started_after_boot => Some((0.0, 0)),
+                None => None,
+            };
+            if let Some((base_cpu_s, base_io_bytes)) = baseline {
+                let cpu_delta_ms = (cpu_s - base_cpu_s).max(0.0) * 1000.0;
+                let io_delta = io_bytes.saturating_sub(base_io_bytes);
                 if cpu_delta_ms > 0.0 || io_delta > 0 {
                     let entry = self.totals.entry(key).or_insert(ImpactSample {
                         boot_epoch_s: self.boot_epoch_s.unwrap_or(0),
@@ -164,9 +180,6 @@ impl StartupImpactTracker {
                     changed = true;
                 }
             }
-            // A process first seen INSIDE the window started during startup:
-            // its first delta (measured against this baseline) carries its
-            // cost, so nothing special is needed beyond recording the baseline.
             live.insert(
                 process.pid,
                 PrevCounters {
@@ -206,12 +219,22 @@ pub struct ImpactStore {
 impl ImpactStore {
     /// Load from `path`; a missing or corrupt file yields an empty store
     /// rather than an error — losing measurements must never block startup.
+    /// A corrupt one is kept aside rather than overwritten.
     pub fn open(path: PathBuf) -> Self {
-        let entries = std::fs::read_to_string(&path)
-            .ok()
-            .and_then(|text| serde_json::from_str::<StoreFile>(&text).ok())
-            .map(|file| file.entries)
-            .unwrap_or_default();
+        let entries = match std::fs::read_to_string(&path) {
+            Ok(text) => match serde_json::from_str::<StoreFile>(&text) {
+                Ok(file) => file.entries,
+                Err(_) => {
+                    crate::persist::set_aside(&path, "startup-impact store");
+                    BTreeMap::new()
+                }
+            },
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => BTreeMap::new(),
+            Err(_) => {
+                crate::persist::set_aside(&path, "startup-impact store");
+                BTreeMap::new()
+            }
+        };
         Self {
             entries,
             path: Some(path),
@@ -275,25 +298,11 @@ impl ImpactStore {
 }
 
 fn write_atomic(path: &Path, file: &StoreFile) -> bool {
-    if let Some(parent) = path.parent()
-        && std::fs::create_dir_all(parent).is_err()
-    {
-        return false;
-    }
-    let tmp = path.with_extension("json.tmp");
-    let written = std::fs::File::create(&tmp).and_then(|mut handle| {
-        use std::io::Write as _;
-        serde_json::to_writer(&mut handle, file)?;
-        handle.flush()
+    let written = crate::persist::replace_file(path, "json.tmp", |out| {
+        serde_json::to_writer(out, file).map_err(std::io::Error::from)
     });
     match written {
-        Ok(()) => match std::fs::rename(&tmp, path) {
-            Ok(()) => true,
-            Err(error) => {
-                tracing::warn!(%error, "failed to rotate startup-impact store");
-                false
-            }
-        },
+        Ok(()) => true,
         Err(error) => {
             tracing::warn!(%error, "failed to write startup-impact store");
             false
@@ -348,6 +357,28 @@ mod tests {
         assert!(!tracker.is_active());
         assert!(!tracker.observe(&snapshot_with(20.0, 9_900_000, STARTUP_WINDOW_S + 60)));
         assert!((tracker.totals().get(&key).unwrap().cpu_ms - 250.0).abs() < 0.001);
+    }
+
+    /// An app that started after boot is charged everything it did, not only
+    /// what happened after TaskMan first saw it: a launcher that reads 5 MB
+    /// in its first second and then idles is a High-impact startup item.
+    #[test]
+    fn a_process_started_after_boot_is_charged_from_its_start() {
+        let key = crate::settings::process_rule_key(Path::new(r"C:\Apps\Launcher.EXE"));
+        let mut first = snapshot_with(0.8, 5 * 1024 * 1024, 30);
+        first.processes[0].start_epoch_s = Some(1_020);
+        let mut tracker = StartupImpactTracker::new(first.system.uptime_s, 1_000);
+        assert!(tracker.observe(&first));
+        let sample = tracker.totals().get(&key).copied().expect("measured");
+        assert!((sample.cpu_ms - 800.0).abs() < 0.001, "{sample:?}");
+        assert_eq!(sample.disk_bytes, 5 * 1024 * 1024);
+        assert_eq!(sample.classify(), StartupImpact::High);
+
+        // Later ticks add only the deltas.
+        let mut second = snapshot_with(0.9, 5 * 1024 * 1024, 31);
+        second.processes[0].start_epoch_s = Some(1_020);
+        assert!(tracker.observe(&second));
+        assert!((tracker.totals()[&key].cpu_ms - 900.0).abs() < 0.001);
     }
 
     #[test]

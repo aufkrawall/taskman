@@ -250,9 +250,10 @@ pub fn format_cpu_detail(pct: f32) -> String {
     }
 }
 
-/// Epoch seconds as a local date in the locale's layout
+/// Epoch seconds as a UTC calendar date in the locale's layout
 /// ("25.07.2026", "7/25/2026", "2026-07-25"). No chrono dependency —
-/// UTC-based civil-date math.
+/// UTC-based civil-date math; the date is NOT shifted into the local time
+/// zone, so near midnight it can name the neighbouring day.
 pub fn format_date(epoch_s: i64) -> String {
     format_date_in(epoch_s, locale::get())
 }
