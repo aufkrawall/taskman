@@ -1,3 +1,16 @@
+- 2026-10-03: Released v0.1.18 (tag on `ec33b82`, the bump commit). Followed
+  `build.md` §Publishing path: `--check` + `--audit` green, stable clippy
+  green, bump pushed on main, `build.py --all-targets` for archives (Windows
+  x86_64/ARM64, Linux x86_64 musl) and setup installers (`taskman-v0.1.18-windows-x86_64-setup.exe`,
+  `taskman-v0.1.18-windows-arm64-setup.exe`), `.sha256` generated beside each,
+  `gh release create --latest` with target `ec33b8205372884d70cf062679ade6e109310b47`.
+  Release covers: protected and boot-critical process token identity resolution via
+  LocalSystem broker protocol v6, tree termination safety against PID reuse, CPU cache
+  calculation fixes, PDH telemetry recovery on unhiding, sampling and repaint performance
+  optimizations, and installer DLL planting / image substitution hardening. Verified
+  packaged archives and setup installers: `taskman.exe` and `taskman-service.exe` in
+  Windows zip pass `--selfcheck` (`--mock`), setup installers pass `taskman-payload verify`.
+
 - 2026-10-03: Whole-program audit (five parallel reviewers: tm-core, Windows
   telemetry, broker/actions, GUI, installer + Linux/macOS + build.py), every
   finding re-verified before fixing; ~45 fixes across 11 commits on `main`.
