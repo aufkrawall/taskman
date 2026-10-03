@@ -172,6 +172,10 @@
   of every running Windows service (~36 ms on a typical desktop) and probed
   every process with up to three `OpenProcess` calls. Service configuration
   is now cached and only processes the kernel no longer lists are probed.
+- **Lighter repaints on every table page:** Processes, Details, Users,
+  Services, Startup and App history measured the text width of every cell of
+  the whole list on each repaint, only to support double-clicking a column
+  separator. That measurement now runs only on the double-click itself.
 
 ### Changed
 

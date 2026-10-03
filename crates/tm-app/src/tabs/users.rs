@@ -700,6 +700,9 @@ fn prepare_auto_fit_widths(
     agg_hdr: &[String],
     order: &[usize],
 ) {
+    if !tablekit::auto_fit_wanted(ui) {
+        return;
+    }
     let mut fit: Vec<f32> = table
         .cols
         .iter()

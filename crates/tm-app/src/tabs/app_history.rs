@@ -202,28 +202,30 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
     rows.sort_by(|a, b| compare_rows(a, b, app.app_history_sort));
 
     let mut table = app.make_table("apphistory", columns());
-    let mut fit = [
-        tablekit::text_width(ui, table.cols[0].label, tablekit::FONT_HDR_LABEL) + 28.0,
-        tablekit::text_width(ui, table.cols[1].label, tablekit::FONT_HDR_LABEL) + 28.0,
-        tablekit::text_width(ui, table.cols[2].label, tablekit::FONT_HDR_LABEL) + 28.0,
-    ];
-    for row in &rows {
-        fit[0] = fit[0].max(tablekit::text_width(ui, &row.name, tablekit::FONT_ROW) + 66.0);
-        fit[1] = fit[1].max(
-            tablekit::text_width(
-                ui,
-                &format::format_cpu_time(row.cpu_seconds),
-                tablekit::FONT_ROW,
-            ) + 22.0,
-        );
-        let network = if row.network_available {
-            format::format_bytes_loc(row.network_bytes)
-        } else {
-            "—".into()
-        };
-        fit[2] = fit[2].max(tablekit::text_width(ui, &network, tablekit::FONT_ROW) + 22.0);
+    if tablekit::auto_fit_wanted(ui) {
+        let mut fit = [
+            tablekit::text_width(ui, table.cols[0].label, tablekit::FONT_HDR_LABEL) + 28.0,
+            tablekit::text_width(ui, table.cols[1].label, tablekit::FONT_HDR_LABEL) + 28.0,
+            tablekit::text_width(ui, table.cols[2].label, tablekit::FONT_HDR_LABEL) + 28.0,
+        ];
+        for row in &rows {
+            fit[0] = fit[0].max(tablekit::text_width(ui, &row.name, tablekit::FONT_ROW) + 66.0);
+            fit[1] = fit[1].max(
+                tablekit::text_width(
+                    ui,
+                    &format::format_cpu_time(row.cpu_seconds),
+                    tablekit::FONT_ROW,
+                ) + 22.0,
+            );
+            let network = if row.network_available {
+                format::format_bytes_loc(row.network_bytes)
+            } else {
+                "—".into()
+            };
+            fit[2] = fit[2].max(tablekit::text_width(ui, &network, tablekit::FONT_ROW) + 22.0);
+        }
+        table.apply_auto_fit(fit);
     }
-    table.apply_auto_fit(fit);
 
     // Per-column maxima over the whole model BEFORE virtualization
     // (audit P0.2) — CPU time and network traffic each highlight their own

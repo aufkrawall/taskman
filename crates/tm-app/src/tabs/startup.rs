@@ -304,30 +304,32 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
             .position(|&i| tablekit::stable_key(items[i].id.as_str()) == key)
     });
 
-    let mut fit: Vec<f32> = table
-        .cols
-        .iter()
-        .map(|c| tablekit::text_width(ui, c.label, tablekit::FONT_HDR_LABEL) + 28.0)
-        .collect();
-    for &i in &visible {
-        let item = &items[i];
-        let status = if item.enabled {
-            i18n::tr(K::EnabledWord)
-        } else {
-            i18n::tr(K::DisabledWord)
-        };
-        let values = [
-            item.name.as_str(),
-            item.publisher.as_deref().unwrap_or(""),
-            status,
-            impact_label(app.lang(), derived.shown_impact(app, item)),
-        ];
-        fit[0] = fit[0].max(tablekit::text_width(ui, values[0], tablekit::FONT_ROW) + 66.0);
-        for i in 1..4 {
-            fit[i] = fit[i].max(tablekit::text_width(ui, values[i], tablekit::FONT_ROW) + 22.0);
+    if tablekit::auto_fit_wanted(ui) {
+        let mut fit: Vec<f32> = table
+            .cols
+            .iter()
+            .map(|c| tablekit::text_width(ui, c.label, tablekit::FONT_HDR_LABEL) + 28.0)
+            .collect();
+        for &i in &visible {
+            let item = &items[i];
+            let status = if item.enabled {
+                i18n::tr(K::EnabledWord)
+            } else {
+                i18n::tr(K::DisabledWord)
+            };
+            let values = [
+                item.name.as_str(),
+                item.publisher.as_deref().unwrap_or(""),
+                status,
+                impact_label(app.lang(), derived.shown_impact(app, item)),
+            ];
+            fit[0] = fit[0].max(tablekit::text_width(ui, values[0], tablekit::FONT_ROW) + 66.0);
+            for i in 1..4 {
+                fit[i] = fit[i].max(tablekit::text_width(ui, values[i], tablekit::FONT_ROW) + 22.0);
+            }
         }
+        table.apply_auto_fit(fit);
     }
-    table.apply_auto_fit(fit);
 
     let avail = crate::widgets::tablekit::table_avail(ui);
     let clicked = tablekit::scrolled_rows(

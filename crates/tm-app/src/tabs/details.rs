@@ -1536,6 +1536,9 @@ fn prepare_auto_fit_widths(
     visible_cols: &[ColSpec],
     rows: &[Row],
 ) {
+    if !tablekit::auto_fit_wanted(ui) {
+        return;
+    }
     let mut widths = Vec::with_capacity(visible_cols.len());
     for spec in visible_cols {
         let mut width = tablekit::text_width(ui, spec.label(), tablekit::FONT_HDR_LABEL) + 28.0;

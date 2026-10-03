@@ -757,7 +757,8 @@ impl TmTable {
     }
 
     /// Push every measured intrinsic width (one per visible column, in
-    /// display order) into the auto-fit slots. Shared so each tab does not
+    /// display order) into the auto-fit slots. Only worth measuring when
+    /// [`auto_fit_wanted`] says this frame can consume them. Shared so each tab does not
     /// re-implement the enumerate/ceil/set loop.
     pub fn apply_auto_fit(&mut self, widths: impl IntoIterator<Item = f32>) {
         for (i, width) in widths.into_iter().enumerate() {
@@ -1566,6 +1567,18 @@ pub fn row_hover_fill(pal: &Palette) -> Color32 {
     }
 }
 
+/// Whether this frame can use auto-fit widths.
+///
+/// They are read in exactly one place: the header's column-separator
+/// double-click, on the frame egui reports it. Measuring them means one
+/// text layout per cell of the WHOLE model (300 processes x 11 Details
+/// columns is ~3,300 per frame), so tabs skip the measurement on every
+/// other frame — which is practically all of them.
+pub fn auto_fit_wanted(ui: &egui::Ui) -> bool {
+    ui.ctx()
+        .input(|i| i.pointer.button_double_clicked(PointerButton::Primary))
+}
+
 pub fn caret(painter: egui::Painter, c: Pos2, ascending: bool, color: Color32) {
     let (a, b, t) = if ascending {
         (
@@ -2205,6 +2218,32 @@ mod tests {
             vec![ptr_button(bx, 20.0, false)],
         );
         assert_eq!(t.cols[1].width, 267.0);
+    }
+
+    /// Tabs measure their whole model for auto-fit only on the frame that can
+    /// consume it — the one egui reports the double-click on (the second
+    /// release), exactly as the header's separator check sees it.
+    #[test]
+    fn auto_fit_is_wanted_only_on_the_double_click_frame() {
+        let ctx = egui::Context::default();
+        let frame = |t: f64, events: Vec<egui::Event>| {
+            let mut wanted = false;
+            let raw = egui::RawInput {
+                time: Some(t),
+                predicted_dt: 1.0 / 60.0,
+                events,
+                ..Default::default()
+            };
+            let mut out = ctx.run_ui(raw, |ui| wanted = auto_fit_wanted(ui));
+            out.textures_delta.clear();
+            wanted
+        };
+        assert!(!frame(0.000, vec![ptr_moved(10.0, 10.0)]));
+        assert!(!frame(0.016, vec![ptr_button(10.0, 10.0, true)]));
+        assert!(!frame(0.032, vec![ptr_button(10.0, 10.0, false)]));
+        assert!(!frame(0.048, vec![ptr_button(10.0, 10.0, true)]));
+        assert!(frame(0.064, vec![ptr_button(10.0, 10.0, false)]));
+        assert!(!frame(0.500, vec![ptr_moved(12.0, 10.0)]));
     }
 
     /// Regression: when the table content is wider than the viewport, the

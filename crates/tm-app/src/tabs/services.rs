@@ -260,27 +260,29 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
     let mut table = app
         .make_table("services", columns())
         .with_row_height(tablekit::ROW_H_DENSE);
-    let mut fit: Vec<f32> = table
-        .cols
-        .iter()
-        .map(|c| tablekit::text_width(ui, c.label, tablekit::FONT_HDR_LABEL) + 28.0)
-        .collect();
-    for s in &rows {
-        let values = [
-            s.name.as_str(),
-            "",
-            s.display_name.as_str(),
-            status_label(app, s.status),
-            s.group.as_str(),
-        ];
-        fit[0] = fit[0].max(tablekit::text_width(ui, values[0], tablekit::FONT_ROW) + 66.0);
-        let pid = s.pid.map_or_else(|| "—".to_string(), |p| p.to_string());
-        fit[1] = fit[1].max(tablekit::text_width(ui, &pid, tablekit::FONT_ROW) + 22.0);
-        for i in 2..5 {
-            fit[i] = fit[i].max(tablekit::text_width(ui, values[i], tablekit::FONT_ROW) + 22.0);
+    if tablekit::auto_fit_wanted(ui) {
+        let mut fit: Vec<f32> = table
+            .cols
+            .iter()
+            .map(|c| tablekit::text_width(ui, c.label, tablekit::FONT_HDR_LABEL) + 28.0)
+            .collect();
+        for s in &rows {
+            let values = [
+                s.name.as_str(),
+                "",
+                s.display_name.as_str(),
+                status_label(app, s.status),
+                s.group.as_str(),
+            ];
+            fit[0] = fit[0].max(tablekit::text_width(ui, values[0], tablekit::FONT_ROW) + 66.0);
+            let pid = s.pid.map_or_else(|| "—".to_string(), |p| p.to_string());
+            fit[1] = fit[1].max(tablekit::text_width(ui, &pid, tablekit::FONT_ROW) + 22.0);
+            for i in 2..5 {
+                fit[i] = fit[i].max(tablekit::text_width(ui, values[i], tablekit::FONT_ROW) + 22.0);
+            }
         }
+        table.apply_auto_fit(fit);
     }
-    table.apply_auto_fit(fit);
 
     let avail = crate::widgets::tablekit::table_avail(ui);
     let clicked = tablekit::scrolled_rows(

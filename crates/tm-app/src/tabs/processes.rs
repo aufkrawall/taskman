@@ -877,6 +877,9 @@ fn prepare_auto_fit_widths(
     aggs: &[String],
     value_order: &[usize],
 ) {
+    if !tablekit::auto_fit_wanted(ui) {
+        return;
+    }
     let header =
         |i: usize| tablekit::text_width(ui, table.cols[i].label, tablekit::FONT_HDR_LABEL) + 28.0;
     let mut widths = (0..table.cols.len()).map(header).collect::<Vec<_>>();
