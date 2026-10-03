@@ -90,6 +90,11 @@ const PIPE_INSTANCE_CAP: u32 = (WORKER_COUNT + WORK_QUEUE_CAP + 2) as u32;
 /// per-connection and must not take the control plane down, but a listener
 /// that can never be armed again is a real fault and has to stay visible.
 const MAX_CONSECUTIVE_ACCEPT_FAILURES: u32 = 16;
+/// How long the accept thread waits before trying again to arm a listener
+/// while every pipe instance is in use. npfs gives the server no event for an
+/// instance being released (a rejected client frees its instance only when
+/// it closes its own end), so this is a bounded poll on that resource.
+const PIPE_REARM_BACKOFF: std::time::Duration = std::time::Duration::from_millis(50);
 /// How long a client keeps retrying a busy pipe before reporting the service
 /// as unavailable, and the per-attempt `WaitNamedPipeW` bound inside that.
 const PIPE_BUSY_RETRY: std::time::Duration = std::time::Duration::from_millis(1000);
@@ -1557,16 +1562,24 @@ fn create_pipe_instance(pipe_name: &str, sddl: &str, first: bool) -> Result<File
         )
     };
     if handle.is_invalid() {
-        return Err(TmError::platform(
-            "CreateNamedPipeW",
-            std::io::Error::last_os_error().to_string(),
-        ));
+        let error = std::io::Error::last_os_error();
+        // Kept as the raw OS error so the accept loop can tell back-pressure
+        // (`is_pipe_busy`) from a real fault.
+        if error.raw_os_error() == Some(ERROR_PIPE_BUSY.0 as i32) {
+            return Err(TmError::Io(error));
+        }
+        return Err(TmError::platform("CreateNamedPipeW", error.to_string()));
     }
     // SAFETY: `handle` is the fresh, validity-checked result of
     // `CreateNamedPipeW` above (the invalid case returned early); wrapping it
     // once in `File` makes the kernel pipe instance and its ACL subject to
     // ordinary Rust drop — there is no second owner.
     Ok(unsafe { File::from_raw_handle(handle.0) })
+}
+
+/// Every one of the pipe's `PIPE_INSTANCE_CAP` instances is in use.
+fn is_pipe_busy(error: &TmError) -> bool {
+    matches!(error, TmError::Io(io) if io.raw_os_error() == Some(ERROR_PIPE_BUSY.0 as i32))
 }
 
 /// Outcome of waiting for a client on one listening pipe instance.
@@ -2241,6 +2254,20 @@ pub fn run_broker(
             Some(pipe) => pipe,
             None => match create_pipe_instance(PIPE_NAME, &sddl, false) {
                 Ok(pipe) => pipe,
+                // Every instance is held — by queued and working clients, or
+                // by rejected clients that have not closed their end yet.
+                // That is back-pressure, not a fault: counting it toward the
+                // failure limit let ~20 lingering client handles exhaust the
+                // limit within microseconds and shut the broker down (SCM
+                // then restarted it 5-60 s later). Wait for an instance to be
+                // released, staying responsive to stop.
+                Err(error) if is_pipe_busy(&error) => {
+                    if broker_warning_allowed() {
+                        tracing::warn!("every broker pipe instance is in use; waiting for one");
+                    }
+                    std::thread::sleep(PIPE_REARM_BACKOFF);
+                    continue;
+                }
                 Err(error) => {
                     consecutive_failures += 1;
                     if consecutive_failures >= MAX_CONSECUTIVE_ACCEPT_FAILURES {
@@ -3814,6 +3841,26 @@ mod tests {
     /// used to propagate out of the accept loop and terminate the LocalSystem
     /// broker, which SCM then restarted 5-60 s later; the GUI reported that
     /// gap as a service it no longer recognised.
+    /// A full pipe must be recognisable as back-pressure: the accept loop
+    /// waits on it instead of counting it as a broker failure.
+    #[test]
+    fn a_full_pipe_reports_busy_not_failure() {
+        // The production ACL keeps FILE_CREATE_PIPE_INSTANCE for SYSTEM and
+        // administrators; this test runs as the user, who therefore owns its
+        // private test pipe outright.
+        let sid = current_user_sid().expect("current user SID");
+        let sddl = format!("D:P(A;;GA;;;{sid})");
+        let name = format!(r"\\.\pipe\Taskman.Core.busytest.{}", std::process::id());
+        let mut held = vec![create_pipe_instance(&name, &sddl, true).expect("first instance")];
+        for _ in 1..PIPE_INSTANCE_CAP {
+            held.push(create_pipe_instance(&name, &sddl, false).expect("instance under the cap"));
+        }
+        let error = create_pipe_instance(&name, &sddl, false).expect_err("cap reached");
+        assert!(is_pipe_busy(&error), "{error}");
+        drop(held.pop());
+        assert!(create_pipe_instance(&name, &sddl, false).is_ok());
+    }
+
     #[test]
     fn a_client_that_closes_before_accept_is_not_a_broker_failure() {
         let sid = current_user_sid().expect("current user SID");

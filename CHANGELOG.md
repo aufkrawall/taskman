@@ -93,6 +93,11 @@
 - **Saved GPU graph engine reset on restart:** an engine name containing
   spaces (e.g. "High Priority Compute") is kept instead of reverting to the
   overall graph.
+- **Background service stopped under load:** when every connection slot of
+  the service's control pipe was in use (a burst of actions, or clients that
+  kept their connection open after being refused), the service gave up within
+  microseconds and exited until Windows restarted it 5–60 s later. It now
+  waits for a slot to free up.
 
 ### Improved
 
@@ -114,6 +119,9 @@
   power loss cannot leave an empty file behind. A file that exists but cannot
   be used (corrupt, oversized, unreadable) is kept as `<name>.bad` instead of
   being overwritten by defaults on the next save.
+- **Faster Run and native Task Manager launch:** launching a task from the
+  Run dialog, and the "open Windows Task Manager" escape hatch, no longer wait
+  an extra half second after the program has started.
 
 ### Changed
 

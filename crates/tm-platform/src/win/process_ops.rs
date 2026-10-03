@@ -1776,13 +1776,15 @@ unsafe fn token_user_of(token: HANDLE) -> Option<TokenIdentity> {
         // first (deliberately failing) call rather than by the struct.
         let mut needed: u32 = 0;
         let _ = GetTokenInformation(token, TokenUser, None, 0, &mut needed);
-        let mut buffer =
-            vec![0u8; needed.clamp(std::mem::size_of::<TOKEN_USER>() as u32, 4096) as usize];
+        // `usize` words, not bytes: the buffer is read back as a TOKEN_USER,
+        // which needs pointer alignment that a `Vec<u8>` does not promise.
+        let bytes = needed.clamp(std::mem::size_of::<TOKEN_USER>() as u32, 4096) as usize;
+        let mut buffer = vec![0usize; bytes.div_ceil(std::mem::size_of::<usize>())];
         let ok = GetTokenInformation(
             token,
             TokenUser,
             Some(buffer.as_mut_ptr().cast()),
-            buffer.len() as u32,
+            (buffer.len() * std::mem::size_of::<usize>()) as u32,
             &mut needed,
         )
         .is_ok();
@@ -2073,17 +2075,22 @@ pub fn run_new_task(command_line: &str, elevate: bool) -> Result<()> {
     // as "services.msc" / "ms-settings:" jumps for up to half a second
     // (implement.md §18.1). Failure probing is opt-in via
     // [`run_new_task_probe`] and belongs on worker threads only.
-    shell_execute(&file, params.as_deref(), elevate, false)
+    shell_execute(&file, params.as_deref(), elevate)
 }
 
-/// Like [`run_new_task`] but waits up to 500 ms to surface immediate
-/// launch failures. Must be called off the UI thread.
+/// Like [`run_new_task`], for callers that report the launch outcome (the
+/// Run dialog, the native-Task-Manager escape hatch). Must be called off the
+/// UI thread.
+///
+/// The outcome is `ShellExecuteExW`'s: by the time it returns the process
+/// exists (or creation failed and is reported). This used to wait another
+/// 500 ms on the new process and then ignore the result, which delayed every
+/// report and kept Task Manager's IFEO interception lifted for half a second
+/// longer without detecting anything. An early non-zero exit is not treated
+/// as failure either: launchers such as `explorer.exe <folder>` hand off and
+/// exit with 1 by design.
 pub fn run_new_task_probe(command_line: &str, elevate: bool) -> Result<()> {
-    let (file, params) = split_command(command_line);
-    if file.is_empty() {
-        return Err(TmError::platform("run_new_task", "empty command"));
-    }
-    shell_execute(&file, params.as_deref(), elevate, true)
+    run_new_task(command_line, elevate)
 }
 
 /// Launch a helper and wait off the UI thread for its real exit status.
@@ -2167,7 +2174,6 @@ pub fn relaunch_elevated() -> Result<()> {
         &exe.to_string_lossy(),
         Some("--single-instance-handoff"),
         true,
-        false,
     )
 }
 
@@ -2189,12 +2195,7 @@ pub fn open_file_location(path: &str) -> Result<()> {
             "path contains a quote and cannot be passed to Explorer",
         ));
     }
-    shell_execute(
-        "explorer.exe",
-        Some(&format!("/select,\"{path}\"")),
-        false,
-        false,
-    )
+    shell_execute("explorer.exe", Some(&format!("/select,\"{path}\"")), false)
 }
 
 /// Open the Explorer Properties dialog for `path` (SEE_MASK_INVOKEIDLIST
@@ -2225,7 +2226,7 @@ pub fn open_properties(path: &str) -> Result<()> {
 
 /// Open a URL / document with the default handler.
 pub fn open_url(url: &str) -> Result<()> {
-    shell_execute(url, None, false, false)
+    shell_execute(url, None, false)
 }
 
 /// Flags for `MINIDUMP_TYPE` matching the tiers offered by System Informer / Process Hacker:
@@ -2527,7 +2528,7 @@ pub fn enable_debug_privilege() {
     }
 }
 
-fn shell_execute(file: &str, params: Option<&str>, elevate: bool, wait: bool) -> Result<()> {
+fn shell_execute(file: &str, params: Option<&str>, elevate: bool) -> Result<()> {
     use windows::Win32::UI::Shell::{
         SEE_MASK_FLAG_NO_UI, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW,
     };
@@ -2555,16 +2556,11 @@ fn shell_execute(file: &str, params: Option<&str>, elevate: bool, wait: bool) ->
             TmError::platform("ShellExecuteExW", format!("{e} (elevation denied?)"))
         })?;
         // SEE_MASK_NOCLOSEPROCESS makes the caller the owner of the returned
-        // process handle, so it must be closed on EVERY path — not only the
-        // waiting one. Leaking it keeps the launched process's kernel object
-        // alive after it exits (an unreapable entry whose pid cannot be
-        // reused) for as long as this long-running app lives, once per "Run
-        // new task", "Open file location" and opened URL.
+        // process handle, so it must be closed. Leaking it keeps the launched
+        // process's kernel object alive after it exits (an unreapable entry
+        // whose pid cannot be reused) for as long as this long-running app
+        // lives, once per "Run new task", "Open file location" and opened URL.
         if !info.hProcess.is_invalid() {
-            if wait {
-                // Brief wait so failures surface quickly; don't block forever.
-                let _ = th::WaitForSingleObject(info.hProcess, 500);
-            }
             let _ = CloseHandle(info.hProcess);
         }
     }
