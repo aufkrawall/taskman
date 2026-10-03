@@ -11,14 +11,29 @@
 //!   so the pinned-copy, ACL and SCM logic keeps a single owner.
 //! * Every wait is an event-driven handle wait with a deadline - never a
 //!   sleep-and-poll bandaid.
+//! * Setup runs elevated but usually starts from a user-writable folder, so
+//!   nothing here trusts a path an unelevated user could reshape: DLL loads
+//!   are confined to System32, the running image is read and moved through
+//!   one pinned handle ([`SetupImage`]), and the log lives in an
+//!   administrator-only folder.
 
+use std::fs::File;
 use std::os::windows::ffi::OsStrExt;
+use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+use std::os::windows::io::AsRawHandle;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 use tm_core::error::{Result, TmError};
 use windows::Win32::Foundation::{CloseHandle, HANDLE, HLOCAL, LocalFree, WAIT_OBJECT_0};
+use windows::Win32::Storage::FileSystem::{
+    DELETE, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_OPEN_REPARSE_POINT, FILE_NAME_NORMALIZED,
+    FILE_NAME_OPENED, FILE_READ_ATTRIBUTES, FILE_READ_DATA, FILE_SHARE_DELETE, FILE_SHARE_READ,
+    FILE_SHARE_WRITE, GETFINALPATHNAMEBYHANDLE_FLAGS, SYNCHRONIZE, VOLUME_NAME_DOS, VOLUME_NAME_NT,
+};
 use windows::Win32::UI::Shell::{
     FOLDERID_Desktop, FOLDERID_ProgramData, FOLDERID_ProgramFiles, FOLDERID_Programs,
+    FOLDERID_Windows,
 };
 use windows::core::{PCWSTR, PWSTR};
 
@@ -93,6 +108,280 @@ pub fn start_menu_dir() -> Result<PathBuf> {
 /// Per-user Desktop folder for the optional shortcut.
 pub fn desktop_dir() -> Result<PathBuf> {
     known_folder(&FOLDERID_Desktop)
+}
+
+// ---------------------------------------------------------------------------
+// DLL search order
+// ---------------------------------------------------------------------------
+
+/// Restrict every later DLL load of this process to System32.
+///
+/// Setup runs elevated from a user-writable folder (Downloads), where a
+/// planted `uxtheme.dll` or `dwmapi.dll` would otherwise be found before the
+/// system copy. `build.rs` limits static imports to KnownDLLs and
+/// delay-loads the rest; those resolve only after this call, which is why it
+/// must be the first thing `main` does. It also confines DLLs that system
+/// components load dynamically on setup's behalf.
+pub fn restrict_dll_search_to_system32() -> Result<()> {
+    use windows::Win32::System::LibraryLoader::{
+        LOAD_LIBRARY_SEARCH_SYSTEM32, SetDefaultDllDirectories,
+    };
+    unsafe { SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_SYSTEM32) }
+        .map_err(|error| err("restrict DLL search path", error.to_string()))
+}
+
+// ---------------------------------------------------------------------------
+// The running setup image
+// ---------------------------------------------------------------------------
+
+/// The running `taskman-setup.exe`, pinned once at startup.
+///
+/// A running image can be renamed, and setup typically starts from a folder
+/// its unelevated user controls. Reading the payload or the uninstaller copy
+/// by path would let that user rename the image after the UAC prompt and put
+/// a different file at its path. Everything is read through this handle
+/// instead: it denies write and delete sharing, so while setup runs the file
+/// can be neither modified, renamed nor deleted, and it carries `DELETE`
+/// access so the uninstaller can move itself out of the install tree by
+/// handle.
+pub struct SetupImage {
+    file: File,
+}
+
+static SETUP_IMAGE: OnceLock<std::result::Result<SetupImage, String>> = OnceLock::new();
+
+/// Pin the running image as early as possible (called from `main`). A
+/// failure is kept and reported by [`setup_image`] when the image is
+/// actually needed, so `--help` does not depend on it.
+pub fn pin_setup_image() {
+    setup_image_slot();
+}
+
+/// The pinned running image, or why it could not be pinned.
+pub fn setup_image() -> Result<&'static SetupImage> {
+    setup_image_slot()
+        .as_ref()
+        .map_err(|detail| err("setup image", detail.clone()))
+}
+
+fn setup_image_slot() -> &'static std::result::Result<SetupImage, String> {
+    SETUP_IMAGE.get_or_init(|| {
+        use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+        let module = unsafe { GetModuleHandleW(PCWSTR::null()) }
+            .map_err(|error| format!("cannot locate the setup image: {error}"))?;
+        SetupImage::pin_mapped(module.0.cast_const()).map_err(|error| error.to_string())
+    })
+}
+
+impl SetupImage {
+    /// Open the file backing the image mapped at `base` and prove that the
+    /// handle refers to exactly that file.
+    ///
+    /// The file is opened by the name the mapping reports, which follows
+    /// renames, and the name is compared again once the handle is pinned: a
+    /// rename or substitution racing the open shows up as a mismatch, and
+    /// after the pin neither is possible.
+    fn pin_mapped(base: *const core::ffi::c_void) -> Result<SetupImage> {
+        use std::os::windows::ffi::OsStringExt;
+        let mapped = mapped_image_name(base)?;
+        let mut path: Vec<u16> = r"\\?\GLOBALROOT".encode_utf16().collect();
+        path.extend_from_slice(&mapped);
+        let file = std::fs::OpenOptions::new()
+            .access_mode((FILE_READ_DATA | FILE_READ_ATTRIBUTES | SYNCHRONIZE | DELETE).0)
+            .share_mode(FILE_SHARE_READ.0)
+            .open(std::ffi::OsString::from_wide(&path))
+            .map_err(|error| {
+                let mapped = String::from_utf16_lossy(&mapped);
+                err("pin setup image", format!("{mapped}: {error}"))
+            })?;
+        verify_mapped_image(&file, base)?;
+        Ok(SetupImage { file })
+    }
+
+    /// Every byte of the image (setup executable plus appended payload),
+    /// read through the pinned handle.
+    pub fn read_all(&self) -> Result<Vec<u8>> {
+        use std::os::windows::fs::FileExt;
+        let len = usize::try_from(self.file.metadata()?.len())
+            .map_err(|_| err("read setup image", "image is too large"))?;
+        let mut data = vec![0u8; len];
+        let mut at = 0usize;
+        while at < len {
+            // Positional reads: the UI preflight and the install worker may
+            // share this handle, so no shared file pointer is involved.
+            let read = self.file.seek_read(&mut data[at..], at as u64)?;
+            if read == 0 {
+                return Err(err("read setup image", "unexpected end of file"));
+            }
+            at += read;
+        }
+        Ok(data)
+    }
+
+    /// Write the image to `dest`, unless `dest` already IS this file (setup
+    /// started from the install directory: copying a file onto itself fails).
+    /// Returns whether anything was written.
+    pub fn copy_to(&self, dest: &Path) -> Result<bool> {
+        if self.is_same_file(dest)? {
+            return Ok(false);
+        }
+        std::fs::write(dest, self.read_all()?)?;
+        Ok(true)
+    }
+
+    fn is_same_file(&self, other: &Path) -> Result<bool> {
+        let other = match std::fs::OpenOptions::new()
+            .access_mode(FILE_READ_ATTRIBUTES.0)
+            .share_mode((FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE).0)
+            .open(other)
+        {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error.into()),
+        };
+        Ok(file_id(&self.file)? == file_id(&other)?)
+    }
+
+    /// Where the image lives now (normalized, drive-letter form).
+    pub fn current_path(&self) -> Result<PathBuf> {
+        normalized_path(&self.file)
+    }
+
+    /// Rename the image by handle. Only this exact file can move, whatever
+    /// else appears at either path in the meantime; an existing `dest` is
+    /// never replaced.
+    pub fn rename_to(&self, dest: &Path) -> Result<()> {
+        use windows::Win32::Storage::FileSystem::{
+            FILE_RENAME_INFO, FileRenameInfo, SetFileInformationByHandle,
+        };
+        let name: Vec<u16> = dest.as_os_str().encode_wide().collect();
+        let name_bytes = name.len() * std::mem::size_of::<u16>();
+        // The struct already holds one UTF-16 unit, which stays zero as the
+        // terminator. A u64 buffer keeps the HANDLE field aligned.
+        let size = std::mem::size_of::<FILE_RENAME_INFO>() + name_bytes;
+        let mut buffer = vec![0u64; size.div_ceil(8)];
+        let info = buffer.as_mut_ptr().cast::<FILE_RENAME_INFO>();
+        // SAFETY: `buffer` is zeroed (ReplaceIfExists = false, no root
+        // directory), 8-byte aligned and large enough for the header plus
+        // `name` and its terminator; the file name is written inside it.
+        unsafe {
+            (*info).FileNameLength = name_bytes as u32;
+            std::ptr::copy_nonoverlapping(
+                name.as_ptr(),
+                (&raw mut (*info).FileName).cast::<u16>(),
+                name.len(),
+            );
+            SetFileInformationByHandle(
+                HANDLE(self.file.as_raw_handle()),
+                FileRenameInfo,
+                info.cast_const().cast(),
+                size as u32,
+            )
+        }
+        .map_err(|error| {
+            err(
+                "move setup executable",
+                format!("{}: {error}", dest.display()),
+            )
+        })
+    }
+}
+
+/// Fail unless `file` is the file backing the image mapped at `base`.
+///
+/// Both names are the NT names of open file objects, so for the same file
+/// they are the same string; the mapping's name follows renames, so a file
+/// that merely sits at the image's launch path does not match.
+fn verify_mapped_image(file: &File, base: *const core::ffi::c_void) -> Result<()> {
+    let opened = final_path(file, OPENED_NT_PATH)?;
+    let mapped = mapped_image_name(base)?;
+    if opened == mapped {
+        Ok(())
+    } else {
+        Err(err(
+            "verify setup image",
+            format!(
+                "{} is not the running setup image ({}); it was renamed or replaced after launch",
+                String::from_utf16_lossy(&opened),
+                String::from_utf16_lossy(&mapped)
+            ),
+        ))
+    }
+}
+
+/// NT name (`\Device\HarddiskVolumeN\...`) of the file mapped at `base`.
+fn mapped_image_name(base: *const core::ffi::c_void) -> Result<Vec<u16>> {
+    use windows::Win32::System::ProcessStatus::K32GetMappedFileNameW;
+    use windows::Win32::System::Threading::GetCurrentProcess;
+    let mut buffer = vec![0u16; 32_768];
+    let len = unsafe { K32GetMappedFileNameW(GetCurrentProcess(), base, &mut buffer) } as usize;
+    if len == 0 || len >= buffer.len() {
+        return Err(err(
+            "setup image name",
+            std::io::Error::last_os_error().to_string(),
+        ));
+    }
+    buffer.truncate(len);
+    Ok(buffer)
+}
+
+/// The NT name a handle was opened with (`\Device\...`), same form as
+/// [`mapped_image_name`].
+const OPENED_NT_PATH: GETFINALPATHNAMEBYHANDLE_FLAGS =
+    GETFINALPATHNAMEBYHANDLE_FLAGS(FILE_NAME_OPENED.0 | VOLUME_NAME_NT.0);
+
+/// Where an open file actually is: links and junctions resolved, long names,
+/// drive-letter form.
+fn normalized_path(file: &File) -> Result<PathBuf> {
+    let flags = GETFINALPATHNAMEBYHANDLE_FLAGS(FILE_NAME_NORMALIZED.0 | VOLUME_NAME_DOS.0);
+    let raw = final_path(file, flags)?;
+    Ok(PathBuf::from(strip_verbatim(&String::from_utf16_lossy(
+        &raw,
+    ))))
+}
+
+fn final_path(file: &File, flags: GETFINALPATHNAMEBYHANDLE_FLAGS) -> Result<Vec<u16>> {
+    use windows::Win32::Storage::FileSystem::GetFinalPathNameByHandleW;
+    let mut buffer = vec![0u16; 32_768];
+    let len = unsafe { GetFinalPathNameByHandleW(HANDLE(file.as_raw_handle()), &mut buffer, flags) }
+        as usize;
+    if len == 0 || len >= buffer.len() {
+        return Err(err(
+            "file path",
+            std::io::Error::last_os_error().to_string(),
+        ));
+    }
+    buffer.truncate(len);
+    Ok(buffer)
+}
+
+/// Volume serial number + 128-bit file ID: identity independent of names.
+fn file_id(file: &File) -> Result<(u64, [u8; 16])> {
+    use windows::Win32::Storage::FileSystem::{
+        FILE_ID_INFO, FileIdInfo, GetFileInformationByHandleEx,
+    };
+    let mut info = FILE_ID_INFO::default();
+    unsafe {
+        GetFileInformationByHandleEx(
+            HANDLE(file.as_raw_handle()),
+            FileIdInfo,
+            (&raw mut info).cast(),
+            std::mem::size_of::<FILE_ID_INFO>() as u32,
+        )
+    }
+    .map_err(|error| err("file identity", error.to_string()))?;
+    Ok((info.VolumeSerialNumber, info.FileId.Identifier))
+}
+
+/// `\\?\C:\x` -> `C:\x`, `\\?\UNC\srv\share` -> `\\srv\share`.
+fn strip_verbatim(path: &str) -> String {
+    if let Some(rest) = path.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{rest}")
+    } else if let Some(rest) = path.strip_prefix(r"\\?\") {
+        rest.to_string()
+    } else {
+        path.to_string()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -512,37 +801,49 @@ pub fn delete_service_fallback() -> Result<()> {
 // Filesystem endgame for uninstall
 // ---------------------------------------------------------------------------
 
+/// Whether `path` is `tree` or lies below it, compared by whole path
+/// components and case-insensitively: a plain string prefix would put
+/// `C:\Program Files\TaskManX` inside `C:\Program Files\TaskMan`.
 fn is_within(path: &Path, tree: &Path) -> bool {
-    normalize(path).starts_with(&normalize(tree))
+    let mut path = path.components();
+    tree.components().all(|part| {
+        path.next()
+            .is_some_and(|candidate| normalize(candidate.as_ref()) == normalize(part.as_ref()))
+    })
 }
 
-/// Move a file that would otherwise block deletion of `tree`.
+/// Move the running setup out of `tree` when it lives inside it.
 ///
 /// A running executable can be renamed but not deleted, so the uninstaller
 /// moves itself out of the install tree first and schedules its own removal
-/// at the next reboot afterwards.
+/// at the next reboot afterwards. The destination is a GUID-named file next
+/// to the tree (Program Files: administrator-only and the same volume), and
+/// the move is done by handle, so [`restore_setup_image`] can only ever move
+/// this same file back.
 pub fn relocate_self_out_of(tree: &Path) -> Result<Option<PathBuf>> {
-    let current = std::env::current_exe()
-        .map_err(|error| err("locate setup executable", error.to_string()))?;
-    if !is_within(&current, tree) {
+    use windows::Win32::System::Com::CoCreateGuid;
+    let image = setup_image()?;
+    if !is_within(&image.current_path()?, tree) {
         return Ok(None);
     }
-    let name = format!("taskman-setup-orphan-{}.exe", std::process::id());
-    // Prefer %TEMP%; if that is another volume the rename fails and the
-    // same-volume sibling is used instead.
-    let mut candidates = vec![std::env::temp_dir().join(&name)];
-    if let Some(parent) = tree.parent() {
-        candidates.push(parent.join(&name));
-    }
-    for dest in candidates {
-        if std::fs::rename(&current, &dest).is_ok() {
-            return Ok(Some(dest));
-        }
-    }
-    Err(err(
-        "relocate setup executable",
-        "cannot move the running setup out of the install directory",
-    ))
+    let parent = tree.parent().ok_or_else(|| {
+        err(
+            "relocate setup executable",
+            "install directory has no parent",
+        )
+    })?;
+    let guid = unsafe { CoCreateGuid() }
+        .map_err(|error| err("relocate setup executable", error.to_string()))?;
+    let dest = parent.join(format!(".TaskMan-setup-orphan-{guid:?}.exe"));
+    image.rename_to(&dest)?;
+    Ok(Some(dest))
+}
+
+/// Move the relocated uninstaller back to `to` (uninstall rollback). The move
+/// goes through the pinned handle: whatever may have appeared at the
+/// relocated path is never touched.
+pub fn restore_setup_image(to: &Path) -> Result<()> {
+    setup_image()?.rename_to(to)
 }
 
 /// Schedule `path` for deletion at reboot (best-effort cleanup of the
@@ -589,34 +890,412 @@ pub fn attach_parent_console() {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Protected directories and the setup log
+// ---------------------------------------------------------------------------
+
+/// Create `path` as a new directory whose protected DACL grants only SYSTEM
+/// and Administrators. Atomic: the directory never exists with a weaker
+/// DACL. Fails if anything already exists at `path`.
+pub(crate) fn create_protected_dir(path: &Path) -> Result<()> {
+    use windows::Win32::Security::Authorization::{
+        ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+    };
+    use windows::Win32::Security::{PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES};
+    use windows::Win32::Storage::FileSystem::CreateDirectoryW;
+
+    let path_w = wide(path);
+    let acl = wide("D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)");
+    unsafe {
+        let mut descriptor = PSECURITY_DESCRIPTOR::default();
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            PCWSTR(acl.as_ptr()),
+            SDDL_REVISION_1,
+            &mut descriptor,
+            None,
+        )
+        .map_err(|e| err("protected directory ACL", e.to_string()))?;
+        let attributes = SECURITY_ATTRIBUTES {
+            nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+            lpSecurityDescriptor: descriptor.0,
+            bInheritHandle: false.into(),
+        };
+        let result = CreateDirectoryW(PCWSTR(path_w.as_ptr()), Some(&attributes));
+        let _ = LocalFree(Some(HLOCAL(descriptor.0)));
+        result.map_err(|e| {
+            err(
+                "create protected directory",
+                format!("{}: {e}", path.display()),
+            )
+        })
+    }
+}
+
+const SETUP_LOG_NAME: &str = "setup.log";
+
+/// `%SystemRoot%\Logs\TaskMan`, the setup log's folder.
+///
+/// Setup is elevated, so its log must live where an unelevated user cannot
+/// plant a junction or link that turns an elevated append into a write
+/// primitive. That rules out `%TEMP%` (the user's own for consent
+/// elevation) and `%ProgramData%` (users may create folders there before the
+/// first install). The service's `%ProgramData%\TaskMan\logs` is also off
+/// limits for a second reason: it may hold only the service's own daily
+/// logs, and a foreign `setup.log` there makes the service disable its file
+/// logging. `%SystemRoot%\Logs` is writable only by administrators and
+/// SYSTEM, and uninstall never removes it, so the uninstall's final log line
+/// recreates nothing that uninstall just deleted.
+fn setup_log_dir() -> Result<PathBuf> {
+    Ok(known_folder(&FOLDERID_Windows)?
+        .join("Logs")
+        .join("TaskMan"))
+}
+
 /// Append one line to the setup log. Diagnostics only - like the service's
 /// file logging, this must never gate the install.
-///
-/// Prefers `%ProgramData%\TaskMan\logs\setup.log` (the service's log
-/// directory); falls back to `%TEMP%\taskman-setup.log`.
 pub fn append_setup_log(line: &str) {
+    if let Ok(dir) = setup_log_dir() {
+        let _ = append_log_line(&dir, line);
+    }
+}
+
+fn append_log_line(dir: &Path, line: &str) -> Result<()> {
     use std::io::Write;
     let stamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    let candidates = [
-        service_data_dir()
-            .ok()
-            .map(|dir| dir.join("logs").join("setup.log")),
-        Some(std::env::temp_dir().join("taskman-setup.log")),
-    ];
-    for path in candidates.into_iter().flatten() {
-        if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
+    let mut file = open_log_file(dir)?;
+    writeln!(file, "[{stamp}] {line}")?;
+    Ok(())
+}
+
+/// Open `dir\setup.log` for appending. The folder is created protected when
+/// missing; an existing folder or log file that is a reparse point is
+/// refused rather than followed.
+fn open_log_file(dir: &Path) -> Result<File> {
+    if create_protected_dir(dir).is_err() {
+        // Usually an earlier run's folder. Whatever it is, it must be a
+        // plain directory and not a link to somewhere else.
+        let meta = std::fs::symlink_metadata(dir)?;
+        if !meta.is_dir() || meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT.0 != 0 {
+            return Err(err(
+                "setup log",
+                format!("{} is not a plain directory", dir.display()),
+            ));
         }
-        if let Ok(mut file) = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)
+    }
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT.0)
+        .open(dir.join(SETUP_LOG_NAME))?;
+    let meta = file.metadata()?;
+    if !meta.is_file() || meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT.0 != 0 {
+        return Err(err(
+            "setup log",
+            format!(
+                "{} is not a regular file",
+                dir.join(SETUP_LOG_NAME).display()
+            ),
+        ));
+    }
+    Ok(file)
+}
+
+/// Remove the `setup.log` that earlier setup versions appended to inside the
+/// service's log directory. Its name is not an owned service-log name, so
+/// while it exists the service refuses the directory and runs without file
+/// logging. Returns whether a file was removed.
+///
+/// Runs before the service (re)starts, when that directory may not be
+/// secured yet: the file is opened without following a reparse point and
+/// deleted by handle only if it resolves to exactly the expected path, so a
+/// junction planted on the way cannot redirect the delete.
+pub fn remove_legacy_setup_log() -> Result<bool> {
+    remove_file_at_exact_path(&service_data_dir()?.join("logs").join(SETUP_LOG_NAME))
+}
+
+fn remove_file_at_exact_path(path: &Path) -> Result<bool> {
+    use windows::Win32::Storage::FileSystem::{
+        FILE_DISPOSITION_INFO, FileDispositionInfo, SetFileInformationByHandle,
+    };
+    let file = match std::fs::OpenOptions::new()
+        .access_mode((DELETE | FILE_READ_ATTRIBUTES | SYNCHRONIZE).0)
+        .share_mode((FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE).0)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT.0)
+        .open(path)
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error.into()),
+    };
+    let meta = file.metadata()?;
+    if !meta.is_file() || meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT.0 != 0 {
+        return Err(err(
+            "remove legacy setup log",
+            format!("{} is not a regular file; left alone", path.display()),
+        ));
+    }
+    let resolved = normalized_path(&file)?;
+    if normalize(&resolved) != normalize(path) {
+        return Err(err(
+            "remove legacy setup log",
+            format!(
+                "{} resolves to {}; left alone",
+                path.display(),
+                resolved.display()
+            ),
+        ));
+    }
+    let info = FILE_DISPOSITION_INFO { DeleteFile: true };
+    unsafe {
+        SetFileInformationByHandle(
+            HANDLE(file.as_raw_handle()),
+            FileDispositionInfo,
+            (&raw const info).cast(),
+            std::mem::size_of::<FILE_DISPOSITION_INFO>() as u32,
+        )
+    }
+    .map_err(|error| err("remove legacy setup log", error.to_string()))?;
+    Ok(true)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use windows::Win32::Foundation::HMODULE;
+
+    /// A private copy of a system DLL mapped as an image (resource-only: no
+    /// code runs), standing in for the running setup image so renames and
+    /// substitutions can be staged without touching the test binary.
+    struct MappedCopy {
+        module: HMODULE,
+        path: PathBuf,
+        _dir: tempfile::TempDir,
+    }
+
+    impl MappedCopy {
+        fn new() -> Self {
+            use windows::Win32::System::LibraryLoader::{
+                LOAD_LIBRARY_AS_IMAGE_RESOURCE, LoadLibraryExW,
+            };
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("probe.dll");
+            let system = known_folder(&windows::Win32::UI::Shell::FOLDERID_System).unwrap();
+            std::fs::copy(system.join("version.dll"), &path).unwrap();
+            let path_w = wide(&path);
+            let module = unsafe {
+                LoadLibraryExW(
+                    PCWSTR(path_w.as_ptr()),
+                    None,
+                    LOAD_LIBRARY_AS_IMAGE_RESOURCE,
+                )
+            }
+            .unwrap();
+            MappedCopy {
+                module,
+                path,
+                _dir: dir,
+            }
+        }
+
+        /// Image-resource handles carry tag bits; the mapping starts below.
+        fn base(&self) -> *const core::ffi::c_void {
+            (self.module.0 as usize & !3) as *const core::ffi::c_void
+        }
+    }
+
+    impl Drop for MappedCopy {
+        fn drop(&mut self) {
+            unsafe {
+                let _ = windows::Win32::Foundation::FreeLibrary(self.module);
+            }
+        }
+    }
+
+    /// `tempfile` may hand out 8.3 short paths (CI profiles); the exact-path
+    /// checks compare against resolved long names.
+    fn long_temp_dir() -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let long = std::fs::canonicalize(dir.path()).unwrap();
+        let long = PathBuf::from(strip_verbatim(&long.to_string_lossy()));
+        (dir, long)
+    }
+
+    fn junction(link: &Path, target: &Path) {
+        let status = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(link)
+            .arg(target)
+            .stdout(std::process::Stdio::null())
+            .status()
+            .unwrap();
+        assert!(status.success(), "mklink /J failed");
+    }
+
+    /// Regression: `is_within` was a string prefix check, so the uninstaller
+    /// treated `C:\Program Files\TaskManX` as part of the install tree.
+    #[test]
+    fn is_within_matches_whole_path_components() {
+        let tree = Path::new(r"C:\Program Files\TaskMan");
+        assert!(is_within(
+            Path::new(r"C:\Program Files\TaskMan\taskman-setup.exe"),
+            tree
+        ));
+        assert!(is_within(
+            Path::new(r"c:\program files\taskman\sub\x.exe"),
+            tree
+        ));
+        assert!(is_within(Path::new(r"C:\Program Files\TaskMan\"), tree));
+        for outside in [
+            r"C:\Program Files\TaskManX\taskman-setup.exe",
+            r"C:\Program Files\TaskMan.old\taskman-setup.exe",
+            r"C:\Program Files",
+            r"D:\Program Files\TaskMan\taskman-setup.exe",
+        ] {
+            assert!(!is_within(Path::new(outside), tree), "{outside}");
+        }
+    }
+
+    #[test]
+    fn verbatim_prefixes_are_stripped() {
+        assert_eq!(strip_verbatim(r"\\?\C:\a\b.exe"), r"C:\a\b.exe");
+        assert_eq!(
+            strip_verbatim(r"\\?\UNC\srv\share\b.exe"),
+            r"\\srv\share\b.exe"
+        );
+        assert_eq!(strip_verbatim(r"C:\a"), r"C:\a");
+    }
+
+    /// The running test binary is a real process image: pinning it must
+    /// succeed and read the executable's bytes.
+    #[test]
+    fn the_running_image_can_be_pinned_and_read() {
+        let image = setup_image().unwrap();
+        assert!(image.read_all().unwrap().starts_with(b"MZ"));
+        let exe = std::env::current_exe().unwrap();
+        assert_eq!(image.current_path().unwrap().file_name(), exe.file_name());
+    }
+
+    /// A launch path that no longer holds the running image must not be
+    /// trusted: renaming the image away and putting another file at its path
+    /// used to substitute what setup read as its payload.
+    #[test]
+    fn a_file_substituted_at_the_launch_path_is_not_the_image() {
+        let copy = MappedCopy::new();
+        let original = std::fs::read(&copy.path).unwrap();
         {
-            let _ = writeln!(file, "[{stamp}] {line}");
-            return;
+            let image = SetupImage::pin_mapped(copy.base()).unwrap();
+            assert_eq!(image.read_all().unwrap(), original);
+            // While pinned, the file cannot be renamed, deleted or rewritten.
+            assert!(std::fs::rename(&copy.path, copy.path.with_file_name("x.dll")).is_err());
+            assert!(std::fs::remove_file(&copy.path).is_err());
+            assert!(
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(&copy.path)
+                    .is_err()
+            );
         }
+        // Unpinned (the window before setup pins itself), the image is
+        // renamed and an impostor appears at its launch path.
+        let moved = copy.path.with_file_name("moved.dll");
+        std::fs::rename(&copy.path, &moved).unwrap();
+        std::fs::write(&copy.path, b"MZ impostor").unwrap();
+        let impostor = File::open(&copy.path).unwrap();
+        let error = verify_mapped_image(&impostor, copy.base()).unwrap_err();
+        assert!(error.to_string().contains("renamed or replaced"), "{error}");
+        // Pinning follows the mapping to the real image, never the impostor.
+        let image = SetupImage::pin_mapped(copy.base()).unwrap();
+        assert_eq!(image.read_all().unwrap(), original);
+        assert_eq!(image.current_path().unwrap().file_name(), moved.file_name());
+    }
+
+    /// Regression: the uninstaller rollback renamed whatever sat at the
+    /// predictable relocation path back into Program Files. Moves now go
+    /// through the pinned handle, so only the image itself ever moves, the
+    /// relocated file cannot be swapped while pinned, and an existing
+    /// destination is never overwritten.
+    #[test]
+    fn relocation_moves_only_the_pinned_image() {
+        let copy = MappedCopy::new();
+        let original = std::fs::read(&copy.path).unwrap();
+        let image = SetupImage::pin_mapped(copy.base()).unwrap();
+        let away = copy.path.with_file_name(".orphan.exe");
+        image.rename_to(&away).unwrap();
+        assert!(!copy.path.exists());
+        assert_eq!(image.current_path().unwrap().file_name(), away.file_name());
+        // Nobody else can move the relocated image to make room for a swap.
+        assert!(std::fs::rename(&away, copy.path.with_file_name("swap.dll")).is_err());
+        // A file planted at the restore target is not replaced.
+        std::fs::write(&copy.path, b"planted").unwrap();
+        assert!(image.rename_to(&copy.path).is_err());
+        assert_eq!(std::fs::read(&copy.path).unwrap(), b"planted");
+        std::fs::remove_file(&copy.path).unwrap();
+        image.rename_to(&copy.path).unwrap();
+        assert_eq!(std::fs::read(&copy.path).unwrap(), original);
+    }
+
+    /// Regression: running setup from the install directory copied the
+    /// image onto itself, which fails. Identity, not path spelling, decides.
+    #[test]
+    fn copying_the_image_onto_itself_is_skipped() {
+        let copy = MappedCopy::new();
+        let original = std::fs::read(&copy.path).unwrap();
+        let image = SetupImage::pin_mapped(copy.base()).unwrap();
+        assert!(!image.copy_to(&copy.path).unwrap());
+        let respelled = PathBuf::from(copy.path.to_string_lossy().to_uppercase());
+        assert!(!image.copy_to(&respelled).unwrap());
+        let other = copy.path.with_file_name("taskman-setup.exe");
+        std::fs::write(&other, b"older uninstaller").unwrap();
+        assert!(image.copy_to(&other).unwrap());
+        assert_eq!(std::fs::read(&other).unwrap(), original);
+    }
+
+    /// The setup log appends into an existing plain folder but refuses a
+    /// folder that is a junction: an elevated append must not be redirected.
+    #[test]
+    fn setup_log_never_follows_a_junction() {
+        let (_dir, base) = long_temp_dir();
+        let logs = base.join("logs");
+        // An earlier run's folder (creating one here would apply the
+        // administrator-only DACL and lock this unelevated test out).
+        std::fs::create_dir(&logs).unwrap();
+        append_log_line(&logs, "first").unwrap();
+        append_log_line(&logs, "second").unwrap();
+        let text = std::fs::read_to_string(logs.join(SETUP_LOG_NAME)).unwrap();
+        assert!(
+            text.contains("] first\n") && text.contains("] second\n"),
+            "{text}"
+        );
+
+        let elsewhere = base.join("elsewhere");
+        std::fs::create_dir(&elsewhere).unwrap();
+        let linked = base.join("linked-logs");
+        junction(&linked, &elsewhere);
+        assert!(append_log_line(&linked, "redirected").is_err());
+        assert!(!elsewhere.join(SETUP_LOG_NAME).exists());
+    }
+
+    /// The legacy `setup.log` in the service's log folder is deleted only
+    /// at exactly that path: a junction on the way must not redirect the
+    /// elevated delete.
+    #[test]
+    fn legacy_setup_log_is_removed_only_at_its_exact_path() {
+        let (_dir, base) = long_temp_dir();
+        let real = base.join("real");
+        std::fs::create_dir(&real).unwrap();
+        std::fs::write(real.join(SETUP_LOG_NAME), b"old").unwrap();
+        let linked = base.join("logs");
+        junction(&linked, &real);
+
+        let error = remove_file_at_exact_path(&linked.join(SETUP_LOG_NAME)).unwrap_err();
+        assert!(error.to_string().contains("left alone"), "{error}");
+        assert!(real.join(SETUP_LOG_NAME).exists());
+
+        assert!(remove_file_at_exact_path(&real.join(SETUP_LOG_NAME)).unwrap());
+        assert!(!real.join(SETUP_LOG_NAME).exists());
+        assert!(!remove_file_at_exact_path(&real.join(SETUP_LOG_NAME)).unwrap());
     }
 }

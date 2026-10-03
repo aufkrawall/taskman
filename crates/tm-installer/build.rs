@@ -32,6 +32,50 @@ fn main() {
         println!(
             "cargo:rustc-link-arg-bin=taskman-setup=/MANIFESTUAC:level='requireAdministrator' uiAccess='false'"
         );
+        // DLL planting: setup runs elevated from a user-writable folder
+        // (Downloads), and the loader resolves static imports that are not
+        // KnownDLLs from the executable's own folder before System32. Those
+        // imports are delay-loaded instead, so nothing is resolved before
+        // `main` restricts the search path to System32
+        // (`win::restrict_dll_search_to_system32`). A listed DLL that a given
+        // feature set does not import only produces a linker note (LNK4199).
+        // `tests/import_table.rs` fails when a new non-KnownDLL import
+        // appears, so this list cannot silently go stale.
+        for dll in DELAY_LOADED {
+            println!("cargo:rustc-link-arg-bin=taskman-setup=/DELAYLOAD:{dll}");
+        }
+        println!("cargo:rustc-link-arg-bin=taskman-setup=delayimp.lib");
+        // VCRUNTIME140.dll cannot be delay-loaded (the CRT startup runs on
+        // it), so this binary alone uses the hybrid CRT: VC runtime and
+        // startup code linked statically, the Universal CRT still dynamic
+        // through `ucrtbase.dll`, which is itself a KnownDLL. rustc requests
+        // the dynamic CRT as `/defaultlib:msvcrt`, so the swap is per-binary;
+        // the rest of the workspace keeps the default CRT.
+        for arg in [
+            "/NODEFAULTLIB:msvcrt.lib",
+            "/NODEFAULTLIB:vcruntime.lib",
+            "/NODEFAULTLIB:libucrt.lib",
+            "/DEFAULTLIB:libcmt.lib",
+            "/DEFAULTLIB:libvcruntime.lib",
+            "/DEFAULTLIB:ucrt.lib",
+        ] {
+            println!("cargo:rustc-link-arg-bin=taskman-setup={arg}");
+        }
     }
     println!("cargo:rerun-if-changed=build.rs");
 }
+
+/// Non-KnownDLL imports of `taskman-setup` (across the per-package and the
+/// whole-workspace feature sets), plus `bcryptprimitives.dll`, which is only
+/// a KnownDLL transitively on current Windows builds rather than by registry
+/// entry.
+const DELAY_LOADED: &[&str] = &[
+    "bcryptprimitives.dll",
+    "dwmapi.dll",
+    "dwrite.dll",
+    "dxgi.dll",
+    "opengl32.dll",
+    "uiautomationcore.dll",
+    "userenv.dll",
+    "uxtheme.dll",
+];

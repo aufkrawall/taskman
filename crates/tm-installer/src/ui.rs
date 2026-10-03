@@ -106,13 +106,11 @@ impl SetupApp {
         // a bad experience, and the pre-check keeps the machine untouched.
         // Uninstall needs no payload and is exempt.
         let preflight_error = if opts.mode == Mode::Install {
-            match std::env::current_exe()
+            match crate::win::setup_image()
+                .and_then(|image| crate::payload::Archive::parse(image.read_all()?))
+                .map(|_| ())
                 .map_err(|error| error.to_string())
-                .and_then(|exe| {
-                    crate::payload::Archive::open(&exe)
-                        .map(|_| ())
-                        .map_err(|error| error.to_string())
-                }) {
+            {
                 Ok(()) => None,
                 Err(message) => Some(format!("Setup cannot install: {message}")),
             }

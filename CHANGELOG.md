@@ -144,6 +144,18 @@
   showing 0 as if idle. TaskMan now detects the stopped trace, shows "—", and
   restarts it (immediately in the background service, after a short back-off
   in the app).
+- **Background service file logging after setup:** every install made by the
+  setup left a `setup.log` in the service's log folder, which made the service
+  refuse that folder and silently run without its log file. Setup now logs
+  elsewhere and removes the old file.
+- **Interrupted installs left no uninstall entry:** setup registers itself in
+  Settings > Apps right after installing the background service, so a later
+  failure (such as a shortcut that cannot be created) no longer leaves a
+  service behind with no way to uninstall it. Running setup from the install
+  folder itself also works now.
+- **Stale setup artifacts:** a packaging run whose setup embedding or
+  verification fails no longer leaves a broken or older `*-setup.exe` in
+  `dist/`.
 
 ### Improved
 
@@ -184,6 +196,28 @@
   an older service, privileged broker calls are refused with "action state is
   unknown" instead of being misapplied, and identity reads answer nothing —
   the affected rows keep "—" until the service is upgraded.
+
+### Security
+
+- **Setup DLL planting:** the elevated setup no longer loads system DLLs (and
+  no longer needs the VC++ runtime DLL) from the folder it was started from.
+  A DLL planted next to `taskman-setup.exe` in Downloads would previously run
+  with administrator rights before the wizard appeared.
+- **Setup payload substitution:** setup reads its embedded payload and the
+  uninstaller copy through one handle to its own running image, opened and
+  verified at startup and locked against changes. Renaming the running setup
+  and putting another file at its path after the UAC prompt no longer changes
+  what gets installed.
+- **Setup log location:** the elevated setup log moved to an
+  administrator-only folder (`%SystemRoot%\Logs\TaskMan\setup.log`) and is never
+  written through a junction or symbolic link, instead of a folder ordinary
+  users can prepare before the first install.
+- **Uninstall rollback:** a failed uninstall can only move the uninstaller
+  itself back into Program Files; whatever else appears at its temporary
+  location is never moved in.
+- **Oversized setup payloads:** a manipulated payload entry is rejected as
+  soon as it inflates past its declared size instead of being decompressed in
+  full first.
 
 ## 0.1.17 - 2026-10-02
 

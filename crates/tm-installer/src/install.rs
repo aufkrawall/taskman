@@ -77,11 +77,13 @@ pub fn install_steps(opts: &Options) -> Vec<&'static str> {
         } else {
             "Install program files without background service"
         },
+        // Right after the service: once a LocalSystem service exists, the
+        // install must be removable even if a later, cosmetic step fails.
+        "Register uninstaller in Settings",
     ];
     if opts.start_menu || opts.desktop {
         steps.push("Create shortcuts");
     }
-    steps.push("Register uninstaller in Settings");
     if opts.launch {
         steps.push("Launch Task Manager");
     }
@@ -149,7 +151,9 @@ pub fn install(opts: &Options, emit: Sink<'_>) -> Result<()> {
             user.ensure_launchable()?;
         }
         let install_dir = win::install_dir()?;
-        let setup_exe = std::env::current_exe()?;
+        // The payload and the uninstaller copy come from the image pinned at
+        // startup, never from re-opening the launch path.
+        let setup_image = win::setup_image()?;
 
         let mut at = 0usize;
         let mut step = |index: usize, state: StepState, detail: String| {
@@ -162,7 +166,7 @@ pub fn install(opts: &Options, emit: Sink<'_>) -> Result<()> {
         //    artifact must fail here - not after the running app has been
         //    stopped.
         step(at, StepState::Running, "verifying embedded payload".into());
-        let archive = Archive::open(&setup_exe)?;
+        let archive = Archive::parse(setup_image.read_all()?)?;
         archive.entry(APP_EXE)?;
         archive.entry(SERVICE_EXE)?;
         archive.verify_all()?;
@@ -200,6 +204,13 @@ pub fn install(opts: &Options, emit: Sink<'_>) -> Result<()> {
         //    elevated helper transaction (files + ACLs + broker manifest +
         //    SCM registration + service start).
         step(at, StepState::Running, install_dir.display().to_string());
+        // Before the service (re)starts and checks its log directory: a
+        // setup.log left there by older setups disables its file logging.
+        let legacy_log = match win::remove_legacy_setup_log() {
+            Ok(true) => "; removed legacy setup log from the service log directory".to_string(),
+            Ok(false) => String::new(),
+            Err(error) => format!("; legacy setup log kept: {error}"),
+        };
         install_program_files(
             opts.service,
             |operation| win::run_core_service_helper(&staging.join(APP_EXE), operation, &sid),
@@ -213,10 +224,14 @@ pub fn install(opts: &Options, emit: Sink<'_>) -> Result<()> {
             step(
                 at,
                 StepState::Done,
-                "service TaskmanCore registered and started".into(),
+                format!("service TaskmanCore registered and started{legacy_log}"),
             );
         } else {
-            step(at, StepState::Done, install_dir.display().to_string());
+            step(
+                at,
+                StepState::Done,
+                format!("{}{legacy_log}", install_dir.display()),
+            );
         }
         // LICENSE and friends are outside the helper's scope.
         for name in EXTRA_ENTRIES {
@@ -227,7 +242,34 @@ pub fn install(opts: &Options, emit: Sink<'_>) -> Result<()> {
         }
         at += 1;
 
-        // 4. Shortcuts belong to the desktop user, not the UAC administrator.
+        // 4. Add/Remove Programs entry, immediately after the service step:
+        //    from here on a failing later step still leaves an install that
+        //    Settings > Apps can remove. Its UninstallString points at the
+        //    setup copy placed in the install directory; when setup already
+        //    runs from there, that copy is the running image itself.
+        step(
+            at,
+            StepState::Running,
+            "writing uninstall registry key".into(),
+        );
+        let copied = setup_image.copy_to(&install_dir.join(SETUP_EXE))?;
+        win::write_arp(
+            &install_dir,
+            env!("CARGO_PKG_VERSION"),
+            win::dir_size_kb(&install_dir),
+        )?;
+        step(
+            at,
+            StepState::Done,
+            if copied {
+                "registered in Settings > Apps".into()
+            } else {
+                "registered in Settings > Apps (uninstaller already in place)".into()
+            },
+        );
+        at += 1;
+
+        // 5. Shortcuts belong to the desktop user, not the UAC administrator.
         if opts.start_menu || opts.desktop {
             step(at, StepState::Running, "writing shortcuts".into());
             let gui = install_dir.join(APP_EXE);
@@ -242,22 +284,6 @@ pub fn install(opts: &Options, emit: Sink<'_>) -> Result<()> {
             step(at, StepState::Done, "shortcuts created".into());
             at += 1;
         }
-
-        // 5. Add/Remove Programs entry. Its UninstallString points at the
-        //    setup copy we place in the install directory.
-        step(
-            at,
-            StepState::Running,
-            "writing uninstall registry key".into(),
-        );
-        std::fs::copy(&setup_exe, install_dir.join(SETUP_EXE))?;
-        win::write_arp(
-            &install_dir,
-            env!("CARGO_PKG_VERSION"),
-            win::dir_size_kb(&install_dir),
-        )?;
-        step(at, StepState::Done, "registered in Settings > Apps".into());
-        at += 1;
 
         // 6. Optional launch.
         if opts.launch {
@@ -292,6 +318,10 @@ pub fn uninstall(opts: &Options, emit: Sink<'_>) -> Result<()> {
         let user = crate::user::InstallUser::resolve()?;
         let sid = user.sid()?;
         let install_dir = win::install_dir()?;
+        // Moving the uninstaller out of the tree (and back on failure) goes
+        // through the pinned image; prove it is available before anything
+        // is removed rather than halfway through.
+        win::setup_image()?;
 
         let mut at = 0usize;
         let mut step = |index: usize, state: StepState, detail: String| {
@@ -384,10 +414,12 @@ pub fn uninstall(opts: &Options, emit: Sink<'_>) -> Result<()> {
         let mut detail = Vec::new();
         if install_dir.is_dir() {
             if let Err(error) = std::fs::remove_dir_all(&install_dir) {
-                // Keep the ARP command usable when removal fails halfway.
+                // Keep the ARP command usable when removal fails halfway. The
+                // move back goes through the pinned image handle, so only the
+                // relocated uninstaller itself can return to the install tree.
                 let rollback = orphan
                     .as_ref()
-                    .map(|path| std::fs::rename(path, install_dir.join(SETUP_EXE)));
+                    .map(|_| win::restore_setup_image(&install_dir.join(SETUP_EXE)));
                 return Err(fail(
                     "remove program files",
                     match rollback {
@@ -529,8 +561,8 @@ mod tests {
                 "Extract installer payload",
                 "Stop running Task Manager",
                 "Install program files and register service",
-                "Create shortcuts",
                 "Register uninstaller in Settings",
+                "Create shortcuts",
             ]
         );
 
@@ -566,6 +598,37 @@ mod tests {
                 > steps.iter().position(|s| *s == "Extract installer payload"),
             "stopping the app may not come before the payload check: {steps:?}"
         );
+    }
+
+    /// Regression: shortcuts used to be created between the service step and
+    /// the Add/Remove Programs registration, so a shortcut failure left a
+    /// LocalSystem service behind with no uninstall entry. The uninstaller
+    /// must be registered directly after the program files/service step,
+    /// before any other step that can fail.
+    #[test]
+    fn uninstaller_is_registered_right_after_the_service_step() {
+        for service in [true, false] {
+            let opts = Options {
+                service,
+                desktop: true,
+                launch: true,
+                ..Options::default()
+            };
+            let steps = install_steps(&opts);
+            let program_files = steps
+                .iter()
+                .position(|s| s.starts_with("Install program files"))
+                .unwrap();
+            assert_eq!(
+                steps[program_files + 1],
+                "Register uninstaller in Settings",
+                "{steps:?}"
+            );
+            assert!(
+                steps.iter().position(|s| *s == "Create shortcuts") > Some(program_files + 1),
+                "{steps:?}"
+            );
+        }
     }
 
     /// The default options must install the service: first GUI start has to

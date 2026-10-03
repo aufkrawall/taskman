@@ -429,22 +429,38 @@ def package_setup(
     appended by the HOST `taskman-payload` tool, so an x64 host can package an
     ARM64 installer. Archive writer and reader live in one Rust crate
     (`crates/tm-installer`), so the format cannot drift between the two.
+
+    The artifact is embedded into a temporary file under `target/`, verified
+    there, and only then moved into `dist/` with one atomic replace. Any
+    failure removes the temporary file AND an existing `dist/` setup of the
+    same name: a failed packaging run must not leave a broken artifact, or a
+    stale one that looks like the output of this run, behind.
     """
+    dest = DIST / f"taskman-v{version}-{label}-setup.exe"
+    out_dir = ROOT / "target" / ("debug" if profile == "dev" else profile)
+    staged = out_dir / f"{dest.name}.partial"
+
+    def discard(reason: str) -> None:
+        log(reason)
+        for path in (staged, dest):
+            try:
+                path.unlink(missing_ok=True)
+            except OSError as error:
+                log(f"cannot remove {path}: {error}")
+
     setup_exe = gui_exe.with_name("taskman-setup.exe")
     if not setup_exe.exists():
-        log(f"setup binary missing after build: {setup_exe}")
+        discard(f"setup binary missing after build: {setup_exe}")
         return None
-    out_dir = ROOT / "target" / ("debug" if profile == "dev" else profile)
     payload_tool = out_dir / "taskman-payload.exe"
     if not payload_tool.exists():
-        log(f"payload tool missing after build: {payload_tool}")
+        discard(f"payload tool missing after build: {payload_tool}")
         return None
-    DIST.mkdir(exist_ok=True)
-    dest = DIST / f"taskman-v{version}-{label}-setup.exe"
+    staged.unlink(missing_ok=True)
     command = [
         str(payload_tool),
         str(setup_exe),
-        str(dest),
+        str(staged),
         f"taskman.exe={gui_exe}",
         f"taskman-service.exe={service_exe}",
     ]
@@ -452,12 +468,19 @@ def package_setup(
     if license_file.exists():
         command.append(f"LICENSE={license_file}")
     if not run(command):
+        discard(f"setup payload embedding failed: {staged}")
         return None
     # Packaging is not done until the produced artifact re-parses and every
     # embedded entry hash-checks. This is the same check `taskman-setup` runs
     # at install time, run here so a broken artifact never reaches dist/.
-    if not run([str(payload_tool), "verify", str(dest)]):
-        log(f"setup payload verification failed: {dest}")
+    if not run([str(payload_tool), "verify", str(staged)]):
+        discard(f"setup payload verification failed: {staged}")
+        return None
+    try:
+        DIST.mkdir(exist_ok=True)
+        os.replace(staged, dest)
+    except OSError as error:
+        discard(f"cannot move verified setup into {dest}: {error}")
         return None
     return dest
 
@@ -607,7 +630,9 @@ def main() -> int:
         return 1
 
     if args.check:
-        ok = run([sys.executable, str(ROOT / "tools" / "tests" / "test_build_host.py")])
+        ok = True
+        for test in sorted((ROOT / "tools" / "tests").glob("test_*.py")):
+            ok &= run([sys.executable, str(test)])
         ok &= run([cargo(), "fmt", "--all", "--", "--check"])
         ok &= run(
             [

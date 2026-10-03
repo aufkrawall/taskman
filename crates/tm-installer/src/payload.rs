@@ -91,6 +91,31 @@ pub fn validate_name(name: &str) -> Result<()> {
     Ok(())
 }
 
+/// Inflate one entry, never producing more than `declared + 1` bytes.
+///
+/// The manifest is untrusted: a small deflate stream can expand to gigabytes,
+/// so the declared size has to bound the inflation itself, not just be
+/// compared afterwards. Reading one byte past it is what proves an oversized
+/// stream without inflating the rest.
+fn inflate_bounded(decoder: impl Read, name: &str, declared: u64) -> Result<Vec<u8>> {
+    let mut out = Vec::with_capacity(declared.min(64 * 1024 * 1024) as usize);
+    decoder
+        .take(declared.saturating_add(1))
+        .read_to_end(&mut out)?;
+    if out.len() as u64 != declared {
+        let actual = if out.len() as u64 > declared {
+            format!("more than {declared}")
+        } else {
+            out.len().to_string()
+        };
+        return Err(err(
+            "payload",
+            format!("entry {name} inflates to {actual} bytes, manifest says {declared}"),
+        ));
+    }
+    Ok(out)
+}
+
 fn hex_sha256(data: &[u8]) -> String {
     let digest = Sha256::digest(data);
     let mut out = String::with_capacity(64);
@@ -291,20 +316,11 @@ impl Archive {
             .blobs
             .get(start..end)
             .ok_or_else(|| err("payload", format!("entry {} out of range", entry.name)))?;
-        let mut decoder = flate2::read::DeflateDecoder::new(slice);
-        let mut out = Vec::with_capacity(entry.uncompressed.min(64 * 1024 * 1024) as usize);
-        decoder.read_to_end(&mut out)?;
-        if out.len() as u64 != entry.uncompressed {
-            return Err(err(
-                "payload",
-                format!(
-                    "entry {} inflates to {} bytes, manifest says {}",
-                    entry.name,
-                    out.len(),
-                    entry.uncompressed
-                ),
-            ));
-        }
+        let out = inflate_bounded(
+            flate2::read::DeflateDecoder::new(slice),
+            &entry.name,
+            entry.uncompressed,
+        )?;
         if hex_sha256(&out) != entry.sha256 {
             return Err(err(
                 "payload",
@@ -463,6 +479,43 @@ mod tests {
         let payload = build_payload(&files()).unwrap();
         let archive = Archive::parse(fake_setup(&payload)).unwrap();
         assert_eq!(archive.verify_all().unwrap(), 3);
+    }
+
+    /// The declared size bounds inflation itself. Before the bound, an endless
+    /// (or bomb-sized) stream was read to completion and only then compared
+    /// with the manifest, so this test would never return.
+    #[test]
+    fn inflation_stops_one_byte_past_the_declared_size() {
+        let error = inflate_bounded(std::io::repeat(0), "endless", 16).unwrap_err();
+        assert!(error.to_string().contains("more than 16 bytes"), "{error}");
+        let exact = inflate_bounded(&b"0123456789abcdef"[..], "exact", 16).unwrap();
+        assert_eq!(exact.len(), 16);
+        let short = inflate_bounded(&b"0123"[..], "short", 16).unwrap_err();
+        assert!(short.to_string().contains("inflates to 4 bytes"), "{short}");
+    }
+
+    /// An entry whose manifest understates its size (a decompression bomb
+    /// behind a tiny declared length) is rejected through the real reader.
+    #[test]
+    fn understated_entry_size_is_rejected() {
+        let bomb = vec![0u8; 4 * 1024 * 1024];
+        let payload = build_payload(&[("taskman.exe".to_string(), bomb)]).unwrap();
+        let exe = fake_setup(&payload);
+        let footer_at = exe.len() - FOOTER_LEN as usize;
+        let manifest_len =
+            u64::from_le_bytes(exe[footer_at..footer_at + 8].try_into().unwrap()) as usize;
+        let manifest_start = footer_at - manifest_len;
+        let mut manifest: Manifest =
+            serde_json::from_slice(&exe[manifest_start..footer_at]).unwrap();
+        manifest.entries[0].uncompressed = 1;
+        let manifest_json = serde_json::to_vec(&manifest).unwrap();
+        let mut rebuilt = exe[..manifest_start].to_vec();
+        rebuilt.extend_from_slice(&manifest_json);
+        rebuilt.extend_from_slice(&(manifest_json.len() as u64).to_le_bytes());
+        rebuilt.extend_from_slice(&MAGIC.to_le_bytes());
+        let archive = Archive::parse(rebuilt).unwrap();
+        let error = archive.verify_all().unwrap_err();
+        assert!(error.to_string().contains("more than 1 bytes"), "{error}");
     }
 
     #[test]

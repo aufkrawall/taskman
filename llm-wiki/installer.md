@@ -32,6 +32,9 @@ eframe for the wizard).
   and non-overlap, inflates every entry in memory, and verifies each SHA-256
   BEFORE extracting anything: a corrupt payload never leaves a half-written
   install directory.
+- Inflation is bounded by the manifest's declared size (`inflate_bounded`
+  reads at most `declared + 1` bytes): the manifest is untrusted, and a small
+  deflate stream can expand without limit.
 - `taskman-payload <setup.exe> <out.exe> <name>=<file>...` appends the
   archive. It runs on the build HOST, so an x64 host can package the ARM64
   installer. Writer and reader live in one crate, so the format cannot drift.
@@ -60,10 +63,13 @@ Steps (visible in the wizard and in `--dry-run`):
    to stop, then calls `core_service::install_program_files_without_service`
    for the same protected-directory and pinned-copy rules. This removes an
    existing service during upgrade; later enrollment is available in Settings.
-4. Shortcuts (per-user Start menu by default, desktop opt-in) and the
-   Add/Remove Programs entry (whose `UninstallString` points at the
-   `taskman-setup.exe` copy placed into the install directory).
-5. Optional launch with the desktop user's unelevated token and environment
+4. Add/Remove Programs entry (whose `UninstallString` points at the
+   `taskman-setup.exe` copy placed into the install directory) — directly
+   after step 3, so once a LocalSystem service exists the install is always
+   removable even if a later step fails. The copy is skipped when setup
+   already runs from that file (file identity, not path text).
+5. Shortcuts (per-user Start menu by default, desktop opt-in).
+6. Optional launch with the desktop user's unelevated token and environment
    (`CreateProcessWithTokenW`); no elevated fallback. Token elevation is checked
    before touching the installation when launch is requested.
    The duplicated primary token needs `TOKEN_ADJUST_DEFAULT` and
@@ -74,6 +80,27 @@ Steps (visible in the wizard and in `--dry-run`):
 
 Deliberate constraints:
 
+- **Running elevated from Downloads (2026-10-03):** setup starts elevated
+  from a folder its unelevated user controls, so nothing trusts that folder:
+  - DLL planting: every static import outside the KnownDLLs is delay-loaded
+    (`build.rs` `DELAY_LOADED` + `delayimp.lib`), the VC runtime is linked
+    statically for this binary only (hybrid CRT: `libvcruntime`/`libcmt`
+    static, UCRT through the KnownDLL `ucrtbase.dll`), and `main` calls
+    `SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_SYSTEM32)` before anything
+    can trigger a delay-load. `tests/import_table.rs` fails when a new
+    non-KnownDLL static import appears.
+  - The running image is pinned once at startup (`win::SetupImage`): opened
+    through the name the image mapping reports (which follows renames),
+    re-verified against it, and held with write/delete sharing denied. The
+    payload, the uninstaller copy and the wizard preflight read through that
+    handle, so renaming the running exe after UAC and planting another file
+    at its path changes nothing. On non-NTFS volumes a name mismatch makes
+    setup refuse.
+  - Uninstall moves itself out of the tree by handle to a GUID-named file in
+    `%ProgramFiles%` (admin-only, same volume) and rolls back the same way,
+    so only that exact file can ever return into the install tree.
+    `is_within` compares whole path components (`TaskManX` is not inside
+    `TaskMan`).
 - **Elevation:** `taskman-setup` carries a `requireAdministrator` manifest
   (attached per-bin in `build.rs`, so `taskman-payload` stays unelevated).
   One UAC prompt at start; the wizard runs elevated the whole time. A launch
@@ -112,8 +139,17 @@ Deliberate constraints:
   in the install tree.
 - **Silent/CLI:** `/S`, `--uninstall`, `--no-start-menu`, `--desktop`,
   `--launch`, `--no-service`, `--dry-run`, `--help`. Unknown flags fail
-  loudly. Progress is written to `%ProgramData%\TaskMan\logs\setup.log`
-  (fallback `%TEMP%\taskman-setup.log`), best-effort like the service log.
+  loudly. Progress is written to `%SystemRoot%\Logs\TaskMan\setup.log`,
+  best-effort like the service log. That folder is created with an
+  admin-only DACL, and a reparse-point folder or log file is refused rather
+  than followed. Deliberately NOT `%TEMP%` (the user's own for consent
+  elevation) or `%ProgramData%\TaskMan\logs`: Users can pre-create folders
+  in ProgramData before the first install (a junction there turns the
+  elevated append into a write primitive), and a foreign `setup.log` in the
+  service's log folder makes the service disable its own file logging
+  (`verify_owned_log_entries`). Install deletes that legacy file — by handle,
+  only at its exact resolved path — before the service starts. Unelevated
+  `--help`/`--dry-run` runs need `__COMPAT_LAYER=RunAsInvoker`.
 
 ## Theming and wizard structure
 
@@ -161,8 +197,18 @@ surfaced; wizard and silent progress both reach the setup log.
   Manager when setup completes" Options checkbox is the single launch prompt
   (it drives `install.rs`'s post-install launch), never a second button.
 - `taskman-payload verify <setup.exe>` re-parses a finished artifact and
-  hash-checks every embedded entry; `build.py` runs it after packaging, so a
-  broken artifact never reaches `dist/`.
+  hash-checks every embedded entry. `build.py` embeds into
+  `target/<profile>/<name>.partial`, verifies that, and only then moves it
+  into `dist/` with one `os.replace`; any failure removes the partial file
+  AND an existing `dist/` setup of the same name, so neither a broken nor a
+  stale artifact can pass as this run's output
+  (`tools/tests/test_build_setup.py`; `--check` runs every
+  `tools/tests/test_*.py`).
+- `win.rs` tests stage renames and substitutions against a private mapped
+  copy of a system DLL: a file substituted at the launch path is not the
+  image, relocation moves only the pinned image and never overwrites, setup
+  log appends never follow a junction, and the legacy log is deleted only at
+  its exact path.
 - The ignored `user::tests::desktop_launch_creates_an_unelevated_process_for_the_shell_user`
   regression requires an elevated test harness and an interactive shell. It uses
   the production launch path to create a suspended system `cmd.exe`, never runs

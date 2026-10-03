@@ -10,6 +10,20 @@
 use tm_installer::options::{self, Mode, Options};
 
 fn main() {
+    // Setup runs elevated from a user-writable folder. Before anything can
+    // trigger a delay-loaded import, confine DLL loading to System32; then
+    // pin the running image so later reads cannot be redirected by renaming
+    // it (see `tm_installer::win`).
+    #[cfg(windows)]
+    {
+        if let Err(error) = tm_installer::win::restrict_dll_search_to_system32() {
+            attach_console();
+            eprintln!("taskman-setup: {error}");
+            std::process::exit(1);
+        }
+        tm_installer::win::pin_setup_image();
+    }
+
     let args: Vec<String> = std::env::args().skip(1).collect();
     let opts = match options::parse(args) {
         Ok(opts) => opts,
