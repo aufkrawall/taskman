@@ -576,6 +576,9 @@ pub struct State {
     /// exceptions instead of the expansions is what keeps it that way.
     pub collapsed: HashSet<u32>,
     view_generation: u64,
+    /// Where the selection sat last frame (see the Processes page's field of
+    /// the same name).
+    last_selected_pos: Option<usize>,
 }
 
 impl State {
@@ -839,6 +842,7 @@ impl Default for State {
             select_columns_open: false,
             collapsed: HashSet::new(),
             view_generation: 0,
+            last_selected_pos: None,
         }
     }
 }
@@ -1114,8 +1118,15 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
     let dialog_open = app.modal_open();
     if !dialog_open {
         if search::content_has_focus(ui.ctx()) && app.selection.is_empty() && !rows.is_empty() {
-            select_detail_row(app, &rows[0]);
+            let at = crate::tabs::processes::selection_fallback_index(
+                app.details_state.last_selected_pos,
+                rows.len(),
+            );
+            select_detail_row(app, &rows[at]);
         }
+        let primary = app.selection.primary().map(|p| p.pid);
+        app.details_state.last_selected_pos =
+            primary.and_then(|pid| rows.iter().position(|row| row.pid == pid));
         if let Some(typed) = search::list_type_ahead(ui.ctx(), "details", dialog_open) {
             let selected = app.selection.primary().map(|p| p.pid);
             let candidates = rows

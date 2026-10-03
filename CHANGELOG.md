@@ -156,6 +156,10 @@
 - **Stale setup artifacts:** a packaging run whose setup embedding or
   verification fails no longer leaves a broken or older `*-setup.exe` in
   `dist/`.
+- **Selection jumped to the top after End task:** when the selected process
+  exited (End task, or on its own) while the Processes or Details table had
+  focus, the selection and the view snapped to the first row. The row that
+  takes its place is selected instead, like in Task Manager.
 
 ### Improved
 

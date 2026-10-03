@@ -136,6 +136,9 @@ pub struct State {
     view_generation: u64,
     /// Logical value-column index per display slot; the user's drag order.
     value_order: Vec<usize>,
+    /// Where the selection sat among the selectable rows last frame, so a
+    /// selection emptied by its process exiting lands on the neighbour.
+    last_selected_pos: Option<usize>,
 }
 
 impl State {
@@ -513,11 +516,17 @@ fn handle_keyboard_navigation(
         })
         .collect();
     if search::content_has_focus(ctx) && app.selection.is_empty() && !process_rows.is_empty() {
-        select_row(app, process_rows[0].1);
+        // Re-select at the position the vanished selection occupied (End
+        // task, or the process exiting on its own) instead of jumping the
+        // view to the top of the list.
+        let at =
+            selection_fallback_index(app.processes_state.last_selected_pos, process_rows.len());
+        select_row(app, process_rows[at].1);
     }
     let selected_pid = app.selection.primary().map(|p| p.pid);
     let selected_pos =
         selected_pid.and_then(|pid| process_rows.iter().position(|(_, row)| row.pid == pid));
+    app.processes_state.last_selected_pos = selected_pos;
     // The display order is only materialized for the two gestures that need
     // it. This runs every frame over the whole process list.
     let order = || -> Vec<crate::app::ProcessIdentity> {
@@ -860,6 +869,13 @@ fn selectable_identities(rows: &[DisplayRow]) -> Vec<crate::app::ProcessIdentity
             _ => None,
         })
         .collect()
+}
+
+/// Row to select when the table has focus but nothing is selected: the
+/// position the previous selection held (its successor slid into it), clamped
+/// to the list, or the top when there was none.
+pub(crate) fn selection_fallback_index(last: Option<usize>, len: usize) -> usize {
+    last.unwrap_or(0).min(len.saturating_sub(1))
 }
 
 fn select_row(app: &mut TaskManApp, row: &RowData) {
@@ -2741,6 +2757,17 @@ fn search_commit_picks_the_first_display_order_match() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// End task on a row deep in the list used to snap the selection (and
+    /// the view) to the first row; the neighbour now takes its place.
+    #[test]
+    fn a_vanished_selection_falls_back_to_its_position() {
+        assert_eq!(selection_fallback_index(Some(41), 120), 41);
+        // The last row exited: its predecessor is the new last row.
+        assert_eq!(selection_fallback_index(Some(120), 120), 119);
+        assert_eq!(selection_fallback_index(None, 120), 0);
+        assert_eq!(selection_fallback_index(Some(3), 0), 0);
+    }
     use crate::tabs::value_columns::VALUE_COLUMNS;
     use tm_core::format;
 
