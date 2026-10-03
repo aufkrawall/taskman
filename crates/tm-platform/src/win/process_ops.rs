@@ -869,11 +869,86 @@ pub fn normalize_service_account(raw: &str) -> String {
     }
 }
 
+/// A service's configured image and account. Static for the life of the
+/// service registration, unlike the PID it runs under.
+#[derive(Clone, Default)]
+struct ServiceConfig {
+    path: Option<std::path::PathBuf>,
+    account: Option<String>,
+}
+
+/// How long a cached service configuration is trusted. A reconfigured
+/// service (new binary path or account) is picked up within this window.
+const SERVICE_CONFIG_TTL: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Service name -> configuration, with the instant the cache was started.
+///
+/// The catalog runs on every sampler tick. Querying each running service's
+/// configuration means an `OpenServiceW` and two `QueryServiceConfigW` round
+/// trips to services.exe per service — about 36 ms per tick for ~100 service
+/// hosts — to re-read values that practically never change. Only the
+/// enumeration (which carries the PIDs) has to be fresh.
+static SERVICE_CONFIGS: std::sync::Mutex<
+    Option<(
+        std::time::Instant,
+        std::collections::HashMap<String, ServiceConfig>,
+    )>,
+> = std::sync::Mutex::new(None);
+
+/// Read one service's configuration through an open SCM handle. Failures
+/// leave the fields `None` (and are cached as such until the TTL expires).
+unsafe fn query_service_config(
+    mgr: windows::Win32::System::Services::SC_HANDLE,
+    name: windows::core::PCWSTR,
+) -> ServiceConfig {
+    use windows::Win32::System::Services as scm;
+    let mut config = ServiceConfig::default();
+    unsafe {
+        let Ok(svc) = scm::OpenServiceW(mgr, name, scm::SERVICE_QUERY_CONFIG) else {
+            return config;
+        };
+        let mut cfg_needed = 0u32;
+        let _ = scm::QueryServiceConfigW(svc, None, 0, &mut cfg_needed);
+        if cfg_needed > 0 {
+            let mut cfg_buf = super::aligned::AlignedBuf::zeroed(cfg_needed as usize);
+            if scm::QueryServiceConfigW(
+                svc,
+                Some(cfg_buf.as_mut_ptr() as *mut _),
+                cfg_needed,
+                &mut cfg_needed,
+            )
+            .is_ok()
+            {
+                let cfg = &*(cfg_buf.as_slice().as_ptr() as *const scm::QUERY_SERVICE_CONFIGW);
+                if !cfg.lpBinaryPathName.is_null() && !cfg.lpBinaryPathName.0.is_null() {
+                    config.path = extract_executable_path(&pwstr_to_string(cfg.lpBinaryPathName));
+                }
+                if !cfg.lpServiceStartName.is_null() && !cfg.lpServiceStartName.0.is_null() {
+                    let raw_account = pwstr_to_string(cfg.lpServiceStartName);
+                    if !raw_account.is_empty() {
+                        config.account = Some(normalize_service_account(&raw_account));
+                    }
+                }
+            }
+        }
+        let _ = scm::CloseServiceHandle(svc);
+    }
+    config
+}
+
 /// Catalog running Windows services: their executable paths and service accounts.
 pub fn service_catalog() -> ServiceCatalog {
     use windows::Win32::System::Services as scm;
     use windows::core::PCWSTR;
     let mut catalog = ServiceCatalog::default();
+    let mut cache = tm_core::sync::lock(&SERVICE_CONFIGS);
+    if cache
+        .as_ref()
+        .is_none_or(|(since, _)| since.elapsed() > SERVICE_CONFIG_TTL)
+    {
+        *cache = Some((std::time::Instant::now(), std::collections::HashMap::new()));
+    }
+    let configs = &mut cache.as_mut().expect("initialized above").1;
     unsafe {
         let Ok(mgr) = scm::OpenSCManagerW(
             PCWSTR::null(),
@@ -882,125 +957,48 @@ pub fn service_catalog() -> ServiceCatalog {
         ) else {
             return catalog;
         };
-        let mut needed = 0u32;
-        let mut returned = 0u32;
-        let _ = scm::EnumServicesStatusExW(
-            mgr,
-            scm::SC_ENUM_PROCESS_INFO,
-            scm::SERVICE_WIN32,
-            scm::SERVICE_ACTIVE,
-            None,
-            &mut needed,
-            &mut returned,
-            None,
-            PCWSTR::null(),
-        );
-        if needed > 0 {
-            let mut buf = super::aligned::AlignedBuf::zeroed(needed as usize);
-            let res = scm::EnumServicesStatusExW(
-                mgr,
-                scm::SC_ENUM_PROCESS_INFO,
-                scm::SERVICE_WIN32,
-                scm::SERVICE_ACTIVE,
-                Some(buf.as_mut_slice()),
-                &mut needed,
-                &mut returned,
-                None,
-                PCWSTR::null(),
+        // A failed enumeration leaves the catalog empty for this tick (rows
+        // fall back to their own evidence); it is no longer a silent result
+        // of a service registered mid-call (see `services::enum_services`).
+        let listed = super::services::enum_services(mgr, scm::SERVICE_ACTIVE);
+        if let Ok((buf, returned)) = listed {
+            let items = std::slice::from_raw_parts(
+                buf.as_slice().as_ptr() as *const scm::ENUM_SERVICE_STATUS_PROCESSW,
+                returned as usize,
             );
-            if res.is_ok() && returned > 0 {
-                let items = std::slice::from_raw_parts(
-                    buf.as_slice().as_ptr() as *const scm::ENUM_SERVICE_STATUS_PROCESSW,
-                    returned as usize,
-                );
-                for it in items {
-                    let pid = it.ServiceStatusProcess.dwProcessId;
-                    // Record the service identity even when the config query
-                    // below fails: the name is what lets a user tell two
-                    // service hosts apart in the Processes list.
-                    let display = pwstr_to_string(it.lpDisplayName);
-                    let short = pwstr_to_string(it.lpServiceName);
-                    let label = if display.is_empty() { short } else { display };
-                    if pid != 0 && !label.is_empty() {
-                        let names = catalog.names_by_pid.entry(pid).or_default();
-                        if !names.iter().any(|name| name.eq_ignore_ascii_case(&label)) {
-                            names.push(label);
-                        }
+            for it in items {
+                let pid = it.ServiceStatusProcess.dwProcessId;
+                // Record the service identity even when the config query
+                // below fails: the name is what lets a user tell two
+                // service hosts apart in the Processes list.
+                let display = pwstr_to_string(it.lpDisplayName);
+                let short = pwstr_to_string(it.lpServiceName);
+                let label = if display.is_empty() { short } else { display };
+                if pid != 0 && !label.is_empty() {
+                    let names = catalog.names_by_pid.entry(pid).or_default();
+                    if !names.iter().any(|name| name.eq_ignore_ascii_case(&label)) {
+                        names.push(label);
                     }
-                    if let Ok(svc) = scm::OpenServiceW(
-                        mgr,
-                        PCWSTR::from_raw(it.lpServiceName.0),
-                        scm::SERVICE_QUERY_CONFIG,
-                    ) {
-                        let mut cfg_needed = 0u32;
-                        let _ = scm::QueryServiceConfigW(svc, None, 0, &mut cfg_needed);
-                        if cfg_needed > 0 {
-                            let mut cfg_buf =
-                                super::aligned::AlignedBuf::zeroed(cfg_needed as usize);
-                            if scm::QueryServiceConfigW(
-                                svc,
-                                Some(cfg_buf.as_mut_ptr() as *mut _),
-                                cfg_needed,
-                                &mut cfg_needed,
-                            )
-                            .is_ok()
-                            {
-                                let cfg = &*(cfg_buf.as_slice().as_ptr()
-                                    as *const scm::QUERY_SERVICE_CONFIGW);
-                                let clean = if !cfg.lpBinaryPathName.is_null()
-                                    && !cfg.lpBinaryPathName.0.is_null()
-                                {
-                                    let mut len = 0;
-                                    while *cfg.lpBinaryPathName.0.add(len) != 0 {
-                                        len += 1;
-                                    }
-                                    let raw_path = String::from_utf16_lossy(
-                                        std::slice::from_raw_parts(cfg.lpBinaryPathName.0, len),
-                                    );
-                                    extract_executable_path(&raw_path)
-                                } else {
-                                    None
-                                };
-
-                                let account = if !cfg.lpServiceStartName.is_null()
-                                    && !cfg.lpServiceStartName.0.is_null()
-                                {
-                                    let mut len = 0;
-                                    while *cfg.lpServiceStartName.0.add(len) != 0 {
-                                        len += 1;
-                                    }
-                                    if len > 0 {
-                                        let raw_account =
-                                            String::from_utf16_lossy(std::slice::from_raw_parts(
-                                                cfg.lpServiceStartName.0,
-                                                len,
-                                            ));
-                                        Some(normalize_service_account(&raw_account))
-                                    } else {
-                                        None
-                                    }
-                                } else {
-                                    None
-                                };
-
-                                if pid != 0
-                                    && let Some(account) = account.as_ref()
-                                {
-                                    catalog
-                                        .accounts_by_pid
-                                        .entry(pid)
-                                        .or_insert_with(|| account.clone());
-                                }
-
-                                if pid != 0
-                                    && let Some(path) = clean
-                                {
-                                    catalog.paths_by_pid.entry(pid).or_insert(path);
-                                }
-                            }
-                        }
-                        let _ = scm::CloseServiceHandle(svc);
-                    }
+                }
+                if pid == 0 {
+                    continue;
+                }
+                let config = configs
+                    .entry(pwstr_to_string(it.lpServiceName))
+                    .or_insert_with(|| {
+                        query_service_config(mgr, PCWSTR::from_raw(it.lpServiceName.0))
+                    });
+                if let Some(account) = &config.account {
+                    catalog
+                        .accounts_by_pid
+                        .entry(pid)
+                        .or_insert_with(|| account.clone());
+                }
+                if let Some(path) = &config.path {
+                    catalog
+                        .paths_by_pid
+                        .entry(pid)
+                        .or_insert_with(|| path.clone());
                 }
             }
         }

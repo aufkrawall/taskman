@@ -3599,6 +3599,13 @@ mod tests {
             ),
             Err(BrokerCallError::Unavailable(_))
         ));
+        // The 20 ms deadline can expire before the worker thread has even
+        // picked the request up on a loaded machine; the property under test
+        // is what happens once it has, so wait for that (bounded) first.
+        let pickup_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while calls.load(Ordering::SeqCst) == 0 && std::time::Instant::now() < pickup_deadline {
+            std::thread::yield_now();
+        }
         assert!(matches!(
             worker.call_with_timeout(
                 BrokerRequest::ProcessNetworkCounters,

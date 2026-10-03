@@ -119,6 +119,25 @@
 - **macOS suspended processes:** a suspended process now shows as Suspended
   and offers Resume. macOS also reports disk transfer rates, the open file
   handle count, the real host name and each startup item's enabled state.
+- **Installed memory with 32 GB modules:** each 32 GB (or larger) RAM module
+  was counted as 32 MB, which made "Hardware reserved" read a fabricated 0.
+- **Wi-Fi name and signal:** the Performance page's Wi-Fi SSID and signal
+  strength never appeared because adapters were matched to WLAN interfaces by
+  the wrong GUID.
+- **Startup entries stored as expandable strings:** Run entries such as
+  Windows Security's showed "N bytes" instead of their command, publisher and
+  impact.
+- **Commit size of unreadable processes:** shows "—" instead of a fabricated
+  "0 K" when no source reports it.
+- **GPU after a driver update:** a GPU that got a new adapter identity (driver
+  update, device restart, external GPU) is picked up again instead of showing
+  0 % until TaskMan restarts.
+- **Per-core CPU layout:** on systems where interrupt time is at least DPC
+  time, per-core CPU records could be decoded with the wrong layout, and a
+  counter running backwards could show a "Terminated processes" row near
+  100 %.
+- **Services list after a service was installed:** a service registered while
+  the list was being read no longer produces an empty Services page.
 
 ### Improved
 
@@ -143,6 +162,10 @@
 - **Faster Run and native Task Manager launch:** launching a task from the
   Run dialog, and the "open Windows Task Manager" escape hatch, no longer wait
   an extra half second after the program has started.
+- **Much lower sampling cost:** each sampling tick re-read the configuration
+  of every running Windows service (~36 ms on a typical desktop) and probed
+  every process with up to three `OpenProcess` calls. Service configuration
+  is now cached and only processes the kernel no longer lists are probed.
 
 ### Changed
 

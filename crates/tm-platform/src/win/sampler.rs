@@ -191,6 +191,8 @@ pub struct Sampler {
     tick_no: u64,
     attrs: HashMap<u32, PidAttrs>,
     gpu_adapters: Option<Vec<gpu::AdapterInfo>>,
+    /// When `gpu_adapters` was last probed (re-probes are rate-limited).
+    gpu_probed_at: Option<Instant>,
     /// Static RAM hardware facts (SMBIOS), probed once.
     ram_static: Option<memory_info::RamStatic>,
     pdh: Mutex<perfcounters::PdhCounters>,
@@ -403,6 +405,7 @@ impl Sampler {
             tick_no: 0,
             attrs: HashMap::new(),
             gpu_adapters: None,
+            gpu_probed_at: None,
             ram_static: None,
             pdh: Mutex::new(perfcounters::PdhCounters::new()),
             demand: TelemetryDemand::core(),
@@ -898,20 +901,25 @@ fn carry_process_disk(
 /// zombie. Rendering those is the visible bug: rows for programs the user
 /// already closed.
 ///
-/// A process is omitted from the snapshot, and its caches purged, when:
+/// `threads` is the count the kernel table reports for this exact process
+/// identity (`None` when the table does not list it). A process is omitted
+/// from the snapshot, and its caches purged, when:
 /// 1. it has 0 threads, OR
-/// 2. it is explicitly signaled or carries an exit code, OR
+/// 2. (only when the table did not list it) it is explicitly signaled or
+///    carries an exit code, OR
 /// 3. it is absent from the kernel's active process table AND was not
 ///    freshly spawned within the last 2 seconds. That grace window exists
 ///    because a process created between the kernel-table read and this check
 ///    is legitimately missing from the table, and evicting it would make new
 ///    processes flicker.
 ///
-/// `terminated` and `live_in_kernel_table` are closures, not `bool`s, on
-/// purpose: `is_process_terminated` opens a process handle and the kernel
-/// table lookup is not free, so both must stay behind the cheap checks that
-/// can already decide. Evaluating them eagerly would put one `OpenProcess`
-/// per process per tick on the sampler's hot path.
+/// A process the table lists with running threads has not exited, which
+/// decides practically every row without a probe. `terminated` and
+/// `live_in_kernel_table` are closures, not `bool`s, so they stay behind
+/// that check: `is_process_terminated` opens up to three handles, and asking
+/// it for every live process put that many `OpenProcess` calls per process
+/// per tick on the sampler's hot path (three failing ones for each process
+/// an unelevated session cannot open).
 ///
 /// pids 0 and 4 (`[System Process]`, `System`) are never evicted: they have
 /// no ordinary lifetime and fail several of these probes by construction.
@@ -926,7 +934,12 @@ fn is_zombie(
     if pid <= 4 {
         return false;
     }
-    if threads == Some(0) || terminated() {
+    match threads {
+        Some(0) => return true,
+        Some(_) => return false,
+        None => {}
+    }
+    if terminated() {
         return true;
     }
     if !live_in_kernel_table() {
@@ -980,7 +993,12 @@ impl SystemCollector for Sampler {
 impl Sampler {
     /// Merged adapter view for the Performance page.
     ///
-    /// Static adapter info is probed once; it does not change at runtime.
+    /// Static adapter info is probed once, and again only when the counters
+    /// name an adapter the cached list does not know: a driver update or PnP
+    /// restart gives the GPU a new LUID, and an eGPU can arrive later. Never
+    /// re-probing left every record unmatched and the Performance GPU card
+    /// at a fabricated 0 % until restart. Re-probes are rate-limited because
+    /// PDH can also report LUIDs DXGI never enumerates.
     /// DXGI enumeration is skipped entirely until GPU telemetry is first
     /// demanded so a default Processes page cannot wake a dormant dGPU —
     /// which is why the probe is gated on the demand AND on any of the three
@@ -991,13 +1009,24 @@ impl Sampler {
         adapter_mem_records: &[perfcounters::GpuAdapterMemRecord],
         mem_records: &[perfcounters::GpuMemRecord],
     ) -> Vec<GpuInfo> {
-        if (!engine_records.is_empty()
+        const GPU_REPROBE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+        let wanted = !engine_records.is_empty()
             || !adapter_mem_records.is_empty()
             || !mem_records.is_empty()
-            || self.demand.any_gpu())
-            && self.gpu_adapters.is_none()
-        {
+            || self.demand.any_gpu();
+        let unknown_adapter = self.gpu_adapters.as_ref().is_some_and(|known| {
+            engine_records
+                .iter()
+                .map(|r| r.luid)
+                .chain(adapter_mem_records.iter().map(|r| r.luid))
+                .any(|luid| !known.iter().any(|a| luid == a.luid))
+        });
+        let reprobe_due = self
+            .gpu_probed_at
+            .is_none_or(|at| at.elapsed() >= GPU_REPROBE_INTERVAL);
+        if (wanted && self.gpu_adapters.is_none()) || (unknown_adapter && reprobe_due) {
             self.gpu_adapters = Some(gpu::adapters());
+            self.gpu_probed_at = Some(Instant::now());
         }
         match self.gpu_adapters.clone() {
             Some(adapters) => gpu::merge(adapters, engine_records, adapter_mem_records),
@@ -1347,14 +1376,14 @@ impl Sampler {
                 .cpu_load
                 .working_set_private_of(pid_u, entry.start_epoch_s);
             entry.mem_bytes = ws_private.or(ws_total).unwrap_or(0);
+            // Neither source answering means unknown: "0 K" would claim a
+            // measurement nobody made.
             let virt = p.virtual_memory();
-            if virt > 0 {
-                entry.commit_bytes = Some(virt);
-            } else if let Some(commit) = self.cpu_load.commit_of(pid_u, entry.start_epoch_s) {
-                entry.commit_bytes = Some(commit);
+            entry.commit_bytes = if virt > 0 {
+                Some(virt)
             } else {
-                entry.commit_bytes = Some(0);
-            }
+                self.cpu_load.commit_of(pid_u, entry.start_epoch_s)
+            };
             entry.peak_mem_bytes = self
                 .cpu_load
                 .peak_working_set_of(pid_u, entry.start_epoch_s);
@@ -2818,22 +2847,22 @@ mod tests {
     }
 
     #[test]
+    fn zombie_rule_keeps_a_process_with_running_threads_without_probing() {
+        // The kernel table lists this identity with live threads: it has not
+        // exited, and deciding that must not open a single handle.
+        assert!(!is_zombie(1234, Some(4), Some(NOW - 60), NOW, never, never));
+    }
+
+    #[test]
     fn zombie_rule_evicts_a_signaled_process() {
-        assert!(is_zombie(
-            1234,
-            Some(4),
-            Some(NOW - 60),
-            NOW,
-            || true,
-            never
-        ));
+        assert!(is_zombie(1234, None, Some(NOW - 60), NOW, || true, never));
     }
 
     #[test]
     fn zombie_rule_keeps_a_process_the_kernel_table_still_lists() {
         assert!(!is_zombie(
             1234,
-            Some(4),
+            None,
             Some(NOW - 60),
             NOW,
             || false,
@@ -2847,7 +2876,7 @@ mod tests {
         // table does not, and it is far too old to be a spawn race.
         assert!(is_zombie(
             1234,
-            Some(4),
+            None,
             Some(NOW - 60),
             NOW,
             || false,
@@ -2861,12 +2890,12 @@ mod tests {
         // absent from the table. Evicting it makes new processes flicker.
         for age in [0, 1, 2] {
             assert!(
-                !is_zombie(1234, Some(4), Some(NOW - age), NOW, || false, || false),
+                !is_zombie(1234, None, Some(NOW - age), NOW, || false, || false),
                 "a process {age}s old must survive the spawn race"
             );
         }
         assert!(
-            is_zombie(1234, Some(4), Some(NOW - 3), NOW, || false, || false),
+            is_zombie(1234, None, Some(NOW - 3), NOW, || false, || false),
             "past the window the absence is real"
         );
     }
@@ -2875,6 +2904,6 @@ mod tests {
     fn zombie_rule_evicts_when_the_start_time_is_unknown() {
         // No creation time means no way to prove a spawn race, and the
         // kernel table has already disowned it.
-        assert!(is_zombie(1234, Some(4), None, NOW, || false, || false));
+        assert!(is_zombie(1234, None, None, NOW, || false, || false));
     }
 }

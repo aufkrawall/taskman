@@ -66,7 +66,13 @@ pub fn adapters() -> HashMap<String, AdapterInfo> {
         let desc = unsafe { adapter.Description.to_string() }.unwrap_or_default();
         let oper_up = adapter.OperStatus == IfOperStatusUp;
         let link_bps = link_speed_bps(adapter.TransmitLinkSpeed, adapter.ReceiveLinkSpeed);
-        let wifi = ssids.get(&format!("{:?}", adapter.NetworkGuid).to_lowercase());
+        // `AdapterName` is the interface GUID ("{...}"), the identity WLAN
+        // reports as `InterfaceGuid`. `NetworkGuid` names the connected
+        // network profile instead, so joining on it never matched and the
+        // SSID and signal rows never appeared.
+        let wifi = unsafe { adapter.AdapterName.to_string() }
+            .ok()
+            .and_then(|guid| ssids.get(&interface_guid_key(&guid)));
         let (ipv4, ipv6) = preferred_unicast_addresses(adapter.FirstUnicastAddress);
         out.insert(
             name,
@@ -101,8 +107,14 @@ fn link_speed_bps(transmit: u64, receive: u64) -> u64 {
         .unwrap_or(0)
 }
 
-/// SSID per wireless interface, keyed by the lowercase debug form of the
-/// interface GUID (matches `IP_ADAPTER_ADDRESSES_LH::NetworkGuid`).
+/// Join key for an interface GUID: lowercase, without braces. Accepts both
+/// the `AdapterName` form ("{6B29FC40-...}") and the debug form of a `GUID`.
+fn interface_guid_key(guid: &str) -> String {
+    guid.trim_matches(['{', '}']).to_ascii_lowercase()
+}
+
+/// SSID per wireless interface, keyed by [`interface_guid_key`] of the
+/// interface GUID (the adapter's `AdapterName`).
 fn wifi_ssids_by_guid() -> HashMap<String, WifiInfo> {
     unsafe {
         let mut handle = Default::default();
@@ -137,7 +149,7 @@ fn wifi_ssids_by_guid() -> HashMap<String, WifiInfo> {
                         if ssid.uSSIDLength > 0 {
                             let bytes = &ssid.ucSSID[..(ssid.uSSIDLength as usize).min(32)];
                             out.insert(
-                                format!("{:?}", item.InterfaceGuid).to_lowercase(),
+                                interface_guid_key(&format!("{:?}", item.InterfaceGuid)),
                                 WifiInfo {
                                     ssid: String::from_utf8_lossy(bytes).into_owned(),
                                     signal_quality_pct: attrs
@@ -241,6 +253,17 @@ fn adapter_addresses() -> Option<super::aligned::AlignedBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The WLAN interface GUID and the adapter's `AdapterName` must meet on
+    /// one key, whatever braces and case either side uses.
+    #[test]
+    fn wlan_and_adapter_guids_share_a_key() {
+        let guid = windows::core::GUID::from_u128(0x6b29fc40_ca47_1067_b31d_00dd010662da);
+        assert_eq!(
+            interface_guid_key(&format!("{guid:?}")),
+            interface_guid_key("{6B29FC40-CA47-1067-B31D-00DD010662DA}")
+        );
+    }
 
     #[test]
     fn unknown_link_speed_is_not_a_measurement() {

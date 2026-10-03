@@ -5,45 +5,87 @@ use tm_core::model::*;
 use windows::Win32::System::Services as scm;
 use windows::core::PCWSTR;
 
+/// Every Win32 service in `state`, as `EnumServicesStatusExW` lays out
+/// `ENUM_SERVICE_STATUS_PROCESSW` records: the buffer and the record count.
+///
+/// The size probe and the read are two calls, and a service registered in
+/// between makes the read fail with `ERROR_MORE_DATA`. That used to be
+/// indistinguishable from "no services" (an empty Services page, or a tick
+/// without service names); it is retried with the newly reported size, and
+/// any other failure is an error.
+pub(super) unsafe fn enum_services(
+    mgr: scm::SC_HANDLE,
+    state: scm::ENUM_SERVICE_STATE,
+) -> Result<(super::aligned::AlignedBuf, u32)> {
+    use windows::Win32::Foundation::ERROR_MORE_DATA;
+    let mut needed: u32 = 0;
+    let mut returned: u32 = 0;
+    // Size probe; it "fails" with ERROR_MORE_DATA by design.
+    let _ = unsafe {
+        scm::EnumServicesStatusExW(
+            mgr,
+            scm::SC_ENUM_PROCESS_INFO,
+            scm::SERVICE_WIN32,
+            state,
+            None,
+            &mut needed,
+            &mut returned,
+            None,
+            PCWSTR::null(),
+        )
+    };
+    for _ in 0..4 {
+        if needed == 0 {
+            return Ok((super::aligned::AlignedBuf::zeroed(0), 0));
+        }
+        // Headroom for services that appear before the read.
+        let mut buf = super::aligned::AlignedBuf::zeroed(needed as usize + 4096);
+        returned = 0;
+        let result = unsafe {
+            scm::EnumServicesStatusExW(
+                mgr,
+                scm::SC_ENUM_PROCESS_INFO,
+                scm::SERVICE_WIN32,
+                state,
+                Some(buf.as_mut_slice()),
+                &mut needed,
+                &mut returned,
+                None,
+                PCWSTR::null(),
+            )
+        };
+        match result {
+            Ok(()) => return Ok((buf, returned)),
+            Err(error) if error.code() == ERROR_MORE_DATA.to_hresult() => continue,
+            Err(error) => {
+                return Err(TmError::platform(
+                    "EnumServicesStatusExW",
+                    error.to_string(),
+                ));
+            }
+        }
+    }
+    Err(TmError::platform(
+        "EnumServicesStatusExW",
+        "the service list kept growing during enumeration",
+    ))
+}
+
 pub fn list_services() -> Result<Vec<ServiceInfo>> {
     let started = std::time::Instant::now();
     unsafe {
         let mgr = open_mgr()?;
-
-        // Size probe.
-        let mut needed: u32 = 0;
-        let mut returned: u32 = 0;
-        let _ = scm::EnumServicesStatusExW(
-            mgr,
-            scm::SC_ENUM_PROCESS_INFO,
-            scm::SERVICE_WIN32,
-            scm::SERVICE_STATE_ALL,
-            None,
-            &mut needed,
-            &mut returned,
-            None,
-            PCWSTR::null(),
-        );
-        if needed == 0 {
-            let _ = scm::CloseServiceHandle(mgr);
-            return Ok(Vec::new());
-        }
-
-        let mut buf = super::aligned::AlignedBuf::zeroed(needed as usize);
-        let result = scm::EnumServicesStatusExW(
-            mgr,
-            scm::SC_ENUM_PROCESS_INFO,
-            scm::SERVICE_WIN32,
-            scm::SERVICE_STATE_ALL,
-            Some(buf.as_mut_slice()),
-            &mut needed,
-            &mut returned,
-            None,
-            PCWSTR::null(),
-        );
+        let listed = enum_services(mgr, scm::SERVICE_STATE_ALL);
+        let (buf, returned) = match listed {
+            Ok(listed) => listed,
+            Err(error) => {
+                let _ = scm::CloseServiceHandle(mgr);
+                return Err(error);
+            }
+        };
 
         let mut out = Vec::new();
-        if result.is_ok() && returned > 0 {
+        if returned > 0 {
             let items = std::slice::from_raw_parts(
                 buf.as_slice().as_ptr() as *const scm::ENUM_SERVICE_STATUS_PROCESSW,
                 returned as usize,

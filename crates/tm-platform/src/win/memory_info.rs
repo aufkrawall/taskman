@@ -143,16 +143,15 @@ fn valid_speed(v: u16) -> u32 {
 /// word Size (0Ch). Per SMBIOS 3.1+ bit 15 selects MB vs KB — but some
 /// vendors report MB without the flag, so sub-128 MB "KB" values (no real
 /// module that small has shipped in decades) are re-read as MB.
+///
+/// Extended Size has no unit bit: bits 30:0 are megabytes and bit 31 is
+/// reserved. Reading bit 30 as a unit flag counted a 32 GB module as 32 MB,
+/// so two of them made "Hardware reserved" a fabricated 0.
 fn module_size_bytes(d: &[u8]) -> u64 {
     if d.len() >= 0x20 {
-        let ext = u32_from(d, 0x1C);
+        let ext = u32_from(d, 0x1C) & 0x7FFF_FFFF;
         if ext != 0 {
-            // Bit 30 = units (set → MB), bits 29:0 = value.
-            return if ext & 0x4000_0000 != 0 {
-                (ext & 0x3FFF_FFFF) as u64 * 1024 * 1024
-            } else {
-                ext as u64 * 1024
-            };
+            return ext as u64 * 1024 * 1024;
         }
     }
     let raw = u16_from(d, 0x0C);
@@ -265,6 +264,19 @@ mod tests {
     /// long. The old code guarded with `< 0x15` and then read offsets up to
     /// 0x1A — an out-of-bounds panic (release builds abort the whole app).
     /// Short records must now contribute what they contain, never panic.
+    /// 32 GB modules are the first size that needs Extended Size (Size reads
+    /// 0x7FFF); its value is plain megabytes.
+    #[test]
+    fn extended_size_is_megabytes() {
+        let mut rec = vec![0u8; 0x22];
+        rec[0x0C..0x0E].copy_from_slice(&0x7FFFu16.to_le_bytes());
+        rec[0x1C..0x20].copy_from_slice(&32_768u32.to_le_bytes());
+        assert_eq!(module_size_bytes(&rec), 32 * 1024 * 1024 * 1024);
+        // Reserved bit 31 does not change the size.
+        rec[0x1C..0x20].copy_from_slice(&(0x8000_0000u32 | 65_536).to_le_bytes());
+        assert_eq!(module_size_bytes(&rec), 64 * 1024 * 1024 * 1024);
+    }
+
     #[test]
     fn short_smbios_type17_record_does_not_panic() {
         // 0x15 formatted bytes (header incl. Size@0Ch, FormFactor@0Eh) +

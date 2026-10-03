@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use tm_core::error::{Result, TmError};
 use tm_core::model::{StartupImpact, StartupItem};
 use windows::Win32::System::Registry::{
-    HKEY, HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, KEY_READ, KEY_WRITE, REG_BINARY,
+    HKEY, HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, KEY_READ, KEY_WRITE, REG_BINARY, REG_EXPAND_SZ,
     REG_OPTION_NON_VOLATILE, REG_SZ, RegCloseKey, RegCreateKeyExW, RegDeleteValueW, RegEnumValueW,
     RegOpenKeyExW, RegQueryValueExW, RegSetValueExW,
 };
@@ -434,7 +434,11 @@ fn read_registry_values(hive: HKEY, subkey: &str) -> Vec<(String, String)> {
                 Some(&mut actual),
             )
             .is_ok();
-            let value = if ok && kind == REG_SZ.0 {
+            // REG_EXPAND_SZ is still text; its %VARS% are expanded where
+            // the command is resolved. Shipping Windows entries use it
+            // (SecurityHealth's `%windir%\...`), and they rendered as
+            // "N bytes" with no publisher or impact.
+            let value = if ok && (kind == REG_SZ.0 || kind == REG_EXPAND_SZ.0) {
                 let wide: Vec<u16> = data[..(actual as usize).min(data.len())]
                     .as_chunks::<2>()
                     .0

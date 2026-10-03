@@ -963,10 +963,14 @@ fn build_sample(
         .iter()
         .zip(prev.cores.iter())
         .map(|(c, p)| {
-            let d_kernel = c.kernel.saturating_sub(p.kernel) as u64;
-            let d_user = c.user.saturating_sub(p.user) as u64;
-            let d_idle = c.idle.saturating_sub(p.idle) as u64;
-            (d_kernel + d_user).saturating_sub(d_idle)
+            // Clamped like `core_busy_pct`: a counter that went backwards
+            // cast straight to u64 wrapped to ~1.8e19, which overflowed the
+            // sum (a panic in debug builds) and reported a "Terminated
+            // processes" row near 100 %.
+            let d_kernel = nonneg(c.kernel.saturating_sub(p.kernel));
+            let d_user = nonneg(c.user.saturating_sub(p.user));
+            let d_idle = nonneg(c.idle.saturating_sub(p.idle));
+            d_kernel.saturating_add(d_user).saturating_sub(d_idle)
         })
         .sum();
     let unattributed_100ns = busy_100ns.saturating_sub(accounted_100ns);
@@ -1127,8 +1131,13 @@ fn parse_cores(buf: &[u8], written: usize, nb_cpu: usize) -> Option<Vec<CoreRaw>
             .count()
     };
 
+    // A tie goes to the strided reading. The kernel named this size for
+    // exactly `nb_cpu` records, and when the record is wider than 24 B the
+    // packed reading interleaves each CPU's DPC/interrupt fields as if they
+    // were the next CPU — which passes the sanity check whenever interrupt
+    // time is at least DPC time, so a strict `>` picked garbage on a tie.
     let strided_sane = strided.as_ref().map(|sc| sane(sc)).unwrap_or(0);
-    if strided_sane > sane(&packed) {
+    if strided.is_some() && strided_sane >= sane(&packed) {
         return strided;
     }
     if !packed.is_empty() {
@@ -1164,6 +1173,26 @@ mod tests {
 
     fn core(idle: i64, kernel: i64, user: i64) -> CoreRaw {
         CoreRaw { idle, kernel, user }
+    }
+
+    /// Modern 48 B records (idle, kernel, user, DPC, interrupt, count) whose
+    /// interrupt time is at least their DPC time: the packed 24 B reading is
+    /// just as "sane", and the tie must go to the real layout.
+    #[test]
+    fn a_sanity_tie_prefers_the_kernel_named_stride() {
+        let records = [[100i64, 400, 50, 3, 7, 9], [200, 900, 80, 4, 4, 2]];
+        let mut buf = Vec::new();
+        for record in records {
+            for field in record {
+                buf.extend_from_slice(&field.to_ne_bytes());
+            }
+        }
+        let cores = parse_cores(&buf, buf.len(), 2).expect("parsed");
+        assert_eq!(cores.len(), 2);
+        assert_eq!(
+            (cores[1].idle, cores[1].kernel, cores[1].user),
+            (200, 900, 80)
+        );
     }
 
     /// The hand-written offsets must agree with the layout the `windows`
