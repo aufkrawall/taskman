@@ -469,6 +469,37 @@ fn sampled_snapshot_carries_command_lines() {
 
 #[cfg(target_os = "windows")]
 #[test]
+fn sampled_snapshot_carries_svchost_command_lines() {
+    let mut collector = tm_platform::create_collector();
+    let snap = collector.sample(std::time::Instant::now()).expect("sample");
+    let svchosts: Vec<_> = snap
+        .processes
+        .iter()
+        .filter(|p| p.name.eq_ignore_ascii_case("svchost.exe"))
+        .collect();
+    assert!(
+        !svchosts.is_empty(),
+        "Windows always has running svchost processes"
+    );
+    let with_cmdline = svchosts
+        .iter()
+        .filter(|p| {
+            p.command_line
+                .as_deref()
+                .is_some_and(|cmd| cmd.to_ascii_lowercase().contains("svchost.exe"))
+        })
+        .count();
+    // Virtually every svchost process is a running service; at least 90% must
+    // have their command line resolved even in an unelevated session.
+    assert!(
+        with_cmdline >= svchosts.len() * 9 / 10,
+        "expected most svchosts to have command lines, got {with_cmdline}/{}",
+        svchosts.len()
+    );
+}
+
+#[cfg(target_os = "windows")]
+#[test]
 fn efficiency_mode_state_is_known_for_own_process() {
     // Regression: `GetProcessInformation(ProcessPowerThrottling)` needs
     // `Version` set on INPUT. With a zeroed struct it failed with

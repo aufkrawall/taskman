@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+### Fixed
+
+- **Command line arguments for svchost and Windows services:** `svchost.exe` and
+  other Windows background services running in Session 0 (SYSTEM, LocalService,
+  NetworkService) frequently showed "—" in the Details Command Line column when
+  TaskMan was run unelevated, because interactive processes cannot open those
+  service hosts with `PROCESS_QUERY_LIMITED_INFORMATION` to query their process
+  parameters. TaskMan now queries the Service Control Manager catalog for
+  configured service binary command lines, properly showing arguments (e.g.
+  `-k <group> -p -s <service>`) for svchost instances and services across the
+  entire system. Search matching on command lines now works for services as well.
+
 ### Changed
 
 - **Wi-Fi details are opt-in — no more Windows location prompts:** the SSID

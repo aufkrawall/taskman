@@ -41,7 +41,8 @@ pub fn live_pids_for_test() -> std::collections::HashSet<u32> {
 mod perfcounters;
 mod process_ops;
 pub use process_ops::{
-    ProcessMachineType, ProcessProtectionLevel, ProcessSecurityInfo, enable_debug_privilege,
+    ProcessMachineType, ProcessProtectionLevel, ProcessSecurityInfo, command_line_of,
+    enable_debug_privilege,
 };
 mod sampler;
 mod services;

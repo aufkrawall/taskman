@@ -518,15 +518,23 @@ impl Sampler {
             }
             return a.clone();
         }
-        // The owning account cannot change while a process lives, so a TTL
-        // refresh of the mutable attributes must not pay for the token +
-        // account lookup again. Only a different identity forces a re-read.
-        let (known_user, known_sid, known_retry_at) = self
+        // The owning account and command line cannot change while a process
+        // lives, so a TTL refresh of the mutable attributes must not pay for
+        // the token + account lookup or PEB query again. Only a different
+        // identity forces a re-read.
+        let (known_user, known_sid, known_cmd, known_retry_at) = self
             .attrs
             .get(&pid)
             .filter(|a| a.start_epoch_s == start_epoch_s)
-            .map(|a| (a.user.clone(), a.user_sid.clone(), a.identity_retry_at))
-            .unwrap_or((None, None, None));
+            .map(|a| {
+                (
+                    a.user.clone(),
+                    a.user_sid.clone(),
+                    a.command_line.clone(),
+                    a.identity_retry_at,
+                )
+            })
+            .unwrap_or((None, None, None, None));
         let identity_missing = known_user.is_none() || known_sid.is_none();
         let mut identity = identity_missing
             .then(|| process_ops::token_identity(pid))
@@ -597,7 +605,7 @@ impl Sampler {
             elevated: security.elevated,
             uac_virtualization: security.virtualization,
             power_throttled: process_ops::efficiency_mode_state(pid),
-            command_line: process_ops::command_line_of(pid),
+            command_line: known_cmd.or_else(|| process_ops::command_line_from_handle(pid)),
             start_epoch_s,
             refreshed_at: Instant::now(),
             power_refreshed_at: Instant::now(),
@@ -1609,6 +1617,14 @@ impl Sampler {
             p.uac_virtualization = a.uac_virtualization;
             p.power_throttled = a.power_throttled;
             p.command_line = a.command_line;
+            if p.command_line.is_none() {
+                p.command_line = service_catalog.command_lines_by_pid.get(&p.pid).cloned();
+                if p.command_line.is_some()
+                    && let Some(entry) = self.attrs.get_mut(&p.pid)
+                {
+                    entry.command_line = p.command_line.clone();
+                }
+            }
             p.critical = a.critical;
             if p.user_sid.is_none() {
                 p.user_sid = a.user_sid.clone();

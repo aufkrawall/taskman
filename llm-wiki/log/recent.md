@@ -1,3 +1,27 @@
+- 2026-10-06: Command line arguments for svchost.exe and Windows services (user
+  report: "it seems we can't properly show command line arguments for running
+  svchost.exe (and potentially also other processes?)"). Root cause:
+  `process_ops::command_line_of(pid)` relied exclusively on
+  `OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION)` and
+  `NtQueryInformationProcess(ProcessCommandLineInformation)`. When running unelevated
+  (TaskMan's standard execution model without UAC prompt), interactive user tokens
+  are denied access (ERROR_ACCESS_DENIED / 0x80070005) when opening processes
+  running under SYSTEM, LOCAL SERVICE, or NETWORK SERVICE in Session 0. Out of
+  ~80 svchost processes on a typical machine, only per-user services (~6) succeeded,
+  while ~74 svchosts and dozens of background services showed "—". Fix:
+  `ServiceCatalog` already enumerates active services via SCM on every tick and
+  caches `QUERY_SERVICE_CONFIGW` with a 60 s TTL in `process_ops.rs`, but previously
+  discarded `cfg.lpBinaryPathName` after extracting the bare exe path. SCM stores
+  the exact binary launch path with arguments (e.g. `svchost.exe -k <group> -p -s <svc>`)
+  in `lpBinaryPathName` which is readable by any unelevated token. Added
+  `command_lines_by_pid` to `ServiceCatalog`, mapped each running service PID to its
+  configured command line, preserved `known_cmd` across TTL refreshes in `PidAttrs`
+  to avoid redundant PEB queries, and added fallback in `Sampler` and
+  `command_line_of`. Also added `enable_debug_privilege()` before handle opens.
+  Regression coverage: `sampled_snapshot_carries_svchost_command_lines` in
+  `tests/integration.rs` (asserts >=90% of svchosts resolve command lines) and
+  `service_catalog_discovers_active_services` in `process_ops.rs`.
+
 - 2026-10-06: Windows location-permission spam (user report: "we shouldn't
   request permission for location checking at all", plus "never while running
   in tray"). Root cause: `net_info::adapters()` called

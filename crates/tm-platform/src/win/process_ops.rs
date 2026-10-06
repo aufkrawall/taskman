@@ -834,6 +834,12 @@ pub struct ServiceCatalog {
     /// a token for, and it is keyed by PID (an image-name lookup would
     /// collapse every `svchost.exe` account into one arbitrary account).
     pub accounts_by_pid: std::collections::HashMap<u32, String>,
+    /// Configured service command line per PID. For session-0 service hosts
+    /// (e.g. `svchost.exe -k ...`), an unelevated caller cannot open the
+    /// process with PROCESS_QUERY_LIMITED_INFORMATION, so NtQueryInformationProcess
+    /// fails. SCM records the exact command line arguments used to launch the
+    /// host process.
+    pub command_lines_by_pid: std::collections::HashMap<u32, String>,
 }
 
 /// Copy a NUL-terminated Windows string; empty when the pointer is null.
@@ -875,6 +881,17 @@ pub fn normalize_service_account(raw: &str) -> String {
 struct ServiceConfig {
     path: Option<std::path::PathBuf>,
     account: Option<String>,
+    command_line: Option<String>,
+}
+
+/// Normalize a service binary command line string from SCM.
+fn normalize_service_command_line(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let clean = trimmed.strip_prefix(r"\??\").unwrap_or(trimmed);
+    Some(clean.to_string())
 }
 
 /// How long a cached service configuration is trusted. A reconfigured
@@ -921,7 +938,9 @@ unsafe fn query_service_config(
             {
                 let cfg = &*(cfg_buf.as_slice().as_ptr() as *const scm::QUERY_SERVICE_CONFIGW);
                 if !cfg.lpBinaryPathName.is_null() && !cfg.lpBinaryPathName.0.is_null() {
-                    config.path = extract_executable_path(&pwstr_to_string(cfg.lpBinaryPathName));
+                    let raw = pwstr_to_string(cfg.lpBinaryPathName);
+                    config.command_line = normalize_service_command_line(&raw);
+                    config.path = extract_executable_path(&raw);
                 }
                 if !cfg.lpServiceStartName.is_null() && !cfg.lpServiceStartName.0.is_null() {
                     let raw_account = pwstr_to_string(cfg.lpServiceStartName);
@@ -1000,6 +1019,17 @@ pub fn service_catalog() -> ServiceCatalog {
                         .entry(pid)
                         .or_insert_with(|| path.clone());
                 }
+                if let Some(cmd) = &config.command_line {
+                    catalog
+                        .command_lines_by_pid
+                        .entry(pid)
+                        .and_modify(|existing| {
+                            if !existing.contains(' ') && cmd.contains(' ') {
+                                *existing = cmd.clone();
+                            }
+                        })
+                        .or_insert_with(|| cmd.clone());
+                }
             }
         }
         let _ = scm::CloseServiceHandle(mgr);
@@ -1050,14 +1080,14 @@ pub fn priority_class_from_base(base_priority: i32) -> PriorityClass {
     }
 }
 
-/// Full command line via ntdll!NtQueryInformationProcess with
-/// ProcessCommandLineInformation (windows-rs PROCESSINFOCLASS = 60, verified
+/// Query the command line from an open process handle via ntdll!NtQueryInformationProcess
+/// with ProcessCommandLineInformation (windows-rs PROCESSINFOCLASS = 60, verified
 /// against this machine's ntdll — older references claiming class 92 do not
 /// match current Windows builds). Works with only
 /// PROCESS_QUERY_LIMITED_INFORMATION because the kernel serves the string
-/// from its cached process parameters; elevated/protected processes simply
-/// fail to open and yield None (Details renders "—").
-pub fn command_line_of(pid: u32) -> Option<String> {
+/// from its cached process parameters; elevated/protected processes fail to open
+/// without SeDebugPrivilege and yield None.
+pub fn command_line_from_handle(pid: u32) -> Option<String> {
     use windows::Wdk::System::Threading::{
         NtQueryInformationProcess, ProcessCommandLineInformation,
     };
@@ -1125,6 +1155,23 @@ pub fn command_line_of(pid: u32) -> Option<String> {
         let _ = CloseHandle(h);
         out
     }
+}
+
+/// Full command line for a process. Tries NtQueryInformationProcess with
+/// ProcessCommandLineInformation first (works for processes in the same session,
+/// or all processes when elevated with SeDebugPrivilege). If that fails (e.g. for
+/// session-0 Windows services like svchost.exe when running unelevated), falls
+/// back to the Service Control Manager catalog which records the exact command line
+/// arguments configured for the service host.
+pub fn command_line_of(pid: u32) -> Option<String> {
+    enable_debug_privilege();
+    command_line_from_handle(pid).or_else(|| service_command_line_of(pid))
+}
+
+/// Command line of a running Windows service from the SCM catalog.
+#[allow(dead_code)]
+pub fn service_command_line_of(pid: u32) -> Option<String> {
+    service_catalog().command_lines_by_pid.get(&pid).cloned()
 }
 
 fn map_priority(class: u32) -> PriorityClass {
@@ -3075,6 +3122,24 @@ mod tests {
         assert!(
             !catalog.accounts_by_pid.is_empty(),
             "service accounts must be catalogued per PID"
+        );
+        assert!(
+            !catalog.command_lines_by_pid.is_empty(),
+            "service command lines must be catalogued per PID"
+        );
+        let svchost_cmd = catalog
+            .command_lines_by_pid
+            .iter()
+            .find(|(_, cmd)| cmd.to_ascii_lowercase().contains("svchost.exe"));
+        assert!(
+            svchost_cmd.is_some(),
+            "svchost command lines must be discovered from services"
+        );
+        let (svchost_pid, cmdline) = svchost_cmd.unwrap();
+        let resolved = command_line_of(*svchost_pid).expect("svchost command line retrievable");
+        assert!(
+            resolved.eq_ignore_ascii_case(cmdline),
+            "command line must match: {resolved:?} vs {cmdline:?}"
         );
     }
 
