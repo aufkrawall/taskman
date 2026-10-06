@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+### Fixed
+
+- **App icons on App History tab:** the App History ("App-Verlauf") page was
+  the only table drawing the generic placeholder window icon instead of
+  loading real application icons. The table now queries the icon cache using
+  the recorded executable path or active process identity, matching the
+  Processes, Details, Startup, and Users pages.
+
 ## 0.1.19 - 2026-10-06
 
 ### Fixed

@@ -96,6 +96,9 @@ struct DbFile {
     /// Friendliest display name seen for each key.
     #[serde(default)]
     names: BTreeMap<String, String>,
+    /// Executable/icon path for each key when known.
+    #[serde(default)]
+    icon_paths: BTreeMap<String, String>,
 }
 
 /// Previous tick's counters keyed by pid, guarded by process identity.
@@ -132,6 +135,7 @@ pub struct AppHistoryDb {
     since_epoch_s: i64,
     entries: BTreeMap<String, AppUsage>,
     names: BTreeMap<String, String>,
+    icon_paths: BTreeMap<String, String>,
     /// Previous tick's accumulated cpu-time/net-totals keyed by pid.
     prev: std::collections::HashMap<u32, PrevTick>,
     state: LoadState,
@@ -294,6 +298,15 @@ impl AppHistoryDb {
                 for usage in dbf.entries.values_mut() {
                     usage.network_available |= usage.network_bytes > 0;
                 }
+                // For files from older versions lacking `icon_paths`, any key
+                // that is already an absolute path can serve as its icon path.
+                for key in dbf.entries.keys() {
+                    if std::path::Path::new(key).is_absolute() {
+                        dbf.icon_paths
+                            .entry(key.clone())
+                            .or_insert_with(|| key.clone());
+                    }
+                }
                 self.since_epoch_s = dbf.since_epoch_s;
                 if self.state.observing {
                     // A slow load may have allowed new observations. Those
@@ -307,9 +320,11 @@ impl AppHistoryDb {
                         loaded.network_available |= current.network_available;
                     }
                     dbf.names.extend(std::mem::take(&mut self.names));
+                    dbf.icon_paths.extend(std::mem::take(&mut self.icon_paths));
                 }
                 self.entries = dbf.entries;
                 self.names = dbf.names;
+                self.icon_paths = dbf.icon_paths;
             }
             Err(e) => {
                 tracing::warn!(error = %e, path = %path.display(), "app-history db corrupt");
@@ -325,6 +340,7 @@ impl AppHistoryDb {
             since_epoch_s: unix_now(),
             entries: Default::default(),
             names: Default::default(),
+            icon_paths: Default::default(),
             prev: Default::default(),
             state: LoadState::default(),
             generation: 0,
@@ -354,6 +370,7 @@ impl AppHistoryDb {
         self.save_after_load = false;
         self.entries.clear();
         self.names.clear();
+        self.icon_paths.clear();
         self.prev.clear();
         self.since_epoch_s = unix_now();
         self.enqueue_save();
@@ -370,6 +387,15 @@ impl AppHistoryDb {
     /// Clone of the identity → display-name map for UI rendering.
     pub fn display_name_map(&self) -> BTreeMap<String, String> {
         self.names.clone()
+    }
+
+    pub fn icon_path(&self, key: &str) -> Option<&str> {
+        self.icon_paths.get(key).map(String::as_str)
+    }
+
+    /// Clone of the identity → icon-path map for UI rendering.
+    pub fn icon_path_map(&self) -> BTreeMap<String, String> {
+        self.icon_paths.clone()
     }
 
     /// Adopt asynchronously loaded file contents once ready. Returns true
@@ -430,6 +456,7 @@ impl AppHistoryDb {
             since_epoch_s: self.since_epoch_s,
             entries: self.entries.clone(),
             names: self.names.clone(),
+            icon_paths: self.icon_paths.clone(),
         }
     }
 
@@ -533,6 +560,15 @@ impl AppHistoryDb {
             self.names
                 .entry(key.clone())
                 .or_insert_with(|| p.shown_name().to_string());
+            if let Some(exe) = &p.exe_path {
+                self.icon_paths
+                    .entry(key.clone())
+                    .or_insert_with(|| exe.to_string_lossy().into_owned());
+            } else if std::path::Path::new(&key).is_absolute() {
+                self.icon_paths
+                    .entry(key.clone())
+                    .or_insert_with(|| key.clone());
+            }
 
             next_prev.insert(
                 p.pid,
@@ -813,5 +849,55 @@ mod tests {
         let e = reloaded.entries().get("gen.exe").unwrap();
         assert!((e.cpu_seconds - 4.0).abs() < 1e-6);
         assert_eq!(e.network_bytes, 512);
+    }
+
+    #[test]
+    fn app_history_preserves_and_roundtrips_icon_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("history.json");
+        let mut db = AppHistoryDb::open(path.clone());
+
+        let mut p = ProcessEntry::new(10, "app.exe");
+        p.category = ProcCategory::App;
+        p.exe_path = Some(std::path::PathBuf::from(r"C:\Tools\app.exe"));
+        p.cpu_time_s = Some(1.0);
+        let snap = Snapshot {
+            timestamp_ms: 1000,
+            processes: vec![p],
+            ..Default::default()
+        };
+        db.observe(&snap, 1.0);
+        let key = r"c:\tools\app.exe";
+        assert_eq!(db.icon_path(key), Some(r"C:\Tools\app.exe"));
+        db.save();
+
+        // Roundtrip reload
+        let db2 = AppHistoryDb::open(path.clone());
+        assert_eq!(db2.icon_path(key), Some(r"C:\Tools\app.exe"));
+        assert_eq!(
+            db2.icon_path_map().get(key),
+            Some(&r"C:\Tools\app.exe".to_string())
+        );
+
+        // Also verify legacy DB without `icon_paths` field seeds from absolute path key
+        let legacy_json = serde_json::json!({
+            "since_epoch_s": 12345,
+            "entries": {
+                r"c:\program files\test.exe": {
+                    "cpu_seconds": 5.0,
+                    "network_bytes": 100,
+                    "network_available": true
+                }
+            },
+            "names": {
+                r"c:\program files\test.exe": "Test Application"
+            }
+        });
+        std::fs::write(&path, legacy_json.to_string()).unwrap();
+        let db3 = AppHistoryDb::open(path);
+        assert_eq!(
+            db3.icon_path(r"c:\program files\test.exe"),
+            Some(r"c:\program files\test.exe")
+        );
     }
 }

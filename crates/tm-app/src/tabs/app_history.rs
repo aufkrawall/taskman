@@ -26,6 +26,7 @@ fn columns() -> Vec<TmColumn> {
 #[derive(Debug, Clone)]
 struct Row {
     name: String,
+    icon_path: Option<String>,
     cpu_seconds: f64,
     network_bytes: u64,
     network_available: bool,
@@ -88,6 +89,7 @@ pub(crate) fn first_search_match_name(
             let shown = db_names.get(k).cloned().unwrap_or_else(|| k.clone());
             Row {
                 name: shown,
+                icon_path: None,
                 cpu_seconds: v.cpu_seconds,
                 network_bytes: v.network_bytes,
                 network_available: v.network_available,
@@ -184,14 +186,34 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
 
     let q = crate::search::Query::new(&app.search);
     let db_names = app.app_history_db.display_name_map();
+    let db_icons = app.app_history_db.icon_path_map();
+    let latest_snap = app.latest_snapshot();
     let mut rows: Vec<Row> = app
         .app_history_db
         .entries()
         .iter()
         .map(|(k, v)| {
             let shown = db_names.get(k).cloned().unwrap_or_else(|| k.clone());
+            let icon_path = db_icons.get(k).cloned().or_else(|| {
+                if std::path::Path::new(k).is_absolute() {
+                    Some(k.clone())
+                } else {
+                    latest_snap.as_deref().and_then(|snap| {
+                        snap.processes.iter().find_map(|p| {
+                            if p.name.eq_ignore_ascii_case(k) || p.shown_name() == shown {
+                                p.exe_path
+                                    .as_ref()
+                                    .map(|path| path.to_string_lossy().into_owned())
+                            } else {
+                                None
+                            }
+                        })
+                    })
+                }
+            });
             Row {
                 name: shown,
+                icon_path,
                 cpu_seconds: v.cpu_seconds,
                 network_bytes: v.network_bytes,
                 network_available: v.network_available,
@@ -311,7 +333,11 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
                     // (painted later in this same row pass) re-applies it.
                     table.repaint_row_selected(ui, &pal, rect);
                 }
-                table.icon_cell(ui, rect, None, pal.accent);
+                let tex = row
+                    .icon_path
+                    .as_deref()
+                    .and_then(|p| app.shared.icons.get(ui.ctx(), &app.actions, p, 6));
+                table.icon_cell(ui, rect, tex.as_ref(), pal.accent);
                 let name_rect = table.col_rect(0, rect);
                 ui.painter_at(name_rect).text(
                     egui::Pos2::new(name_rect.left() + 56.0, rect.center().y),
@@ -438,12 +464,14 @@ mod tests {
     fn unavailable_network_sorts_last_in_both_directions() {
         let available = Row {
             name: "available".into(),
+            icon_path: None,
             cpu_seconds: 0.0,
             network_bytes: 0,
             network_available: true,
         };
         let missing = Row {
             name: "missing".into(),
+            icon_path: None,
             cpu_seconds: 0.0,
             network_bytes: 0,
             network_available: false,
@@ -461,6 +489,7 @@ mod tests {
             .into_iter()
             .map(|name| Row {
                 name: name.to_owned(),
+                icon_path: None,
                 cpu_seconds: 1.0,
                 network_bytes: 0,
                 network_available: false,
@@ -560,12 +589,14 @@ mod tests {
         let rows = vec![
             Row {
                 name: "Calculator.exe".into(),
+                icon_path: None,
                 cpu_seconds: 10.0,
                 network_bytes: 100,
                 network_available: true,
             },
             Row {
                 name: "Browser.exe".into(),
+                icon_path: None,
                 cpu_seconds: 20.0,
                 network_bytes: 200,
                 network_available: true,
@@ -586,5 +617,17 @@ mod tests {
             first_search_match_in_rows(&rows, &q, sort_desc).as_deref(),
             Some("Calculator.exe")
         );
+    }
+
+    #[test]
+    fn row_carries_icon_path() {
+        let row = Row {
+            name: "Test App".into(),
+            icon_path: Some(r"C:\Tools\test.exe".into()),
+            cpu_seconds: 1.0,
+            network_bytes: 50,
+            network_available: true,
+        };
+        assert_eq!(row.icon_path.as_deref(), Some(r"C:\Tools\test.exe"));
     }
 }
