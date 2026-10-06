@@ -1,3 +1,31 @@
+- 2026-10-06: Released v0.1.20 (tag on `6e8e472`, the bump commit). Followed
+  `build.md` §Publishing path: `--check` + `--audit` green, stable clippy
+  green, bump pushed on main, `build.py --all-targets` for archives (Windows
+  x86_64/ARM64, Linux x86_64 musl) and setup installers (`taskman-v0.1.20-windows-x86_64-setup.exe`,
+  `taskman-v0.1.20-windows-arm64-setup.exe`), `.sha256` generated beside each,
+  `gh release create --latest` with target `6e8e472f6c15c9c3f43aa25460e65a431f5e2a2a`.
+  Release covers: loading real application executable icons on the App History
+  tab instead of a placeholder window icon, and persisting executable path metadata
+  in `app-history.json`.
+
+- 2026-10-06: Missing application icons on App History page (user report: "bug: we don't
+  load app icons on app history page (the only affected place?)").
+  Audited all tabs/dialogs: App History was indeed the only affected place (Processes,
+  Details, Startup, and Users all resolve icons via `shared.icons.get(...)`, Services
+  uses `Icon::Properties`, and Modules has no icon column).
+  Root cause: `crates/tm-app/src/tabs/app_history.rs` hardcoded `None` in
+  `table.icon_cell(ui, rect, None, pal.accent);`, falling back to `icons::draw_app_window`.
+  Furthermore, `crates/tm-core/src/app_history.rs` only stored process keys without recording
+  exe paths across sessions.
+  Fix: Added `icon_paths: HashMap<String, String>` to `DbFile` and `AppHistoryDb` in `tm-core`.
+  During sampling observation, `p.exe_path` is recorded for each entry. When loading existing
+  DB files, keys starting with drive letters (`:\`) are automatically seeded as exe paths.
+  Added `icon_path` and `icon_path_map` methods. In `tm-app`, added `icon_path: Option<String>`
+  to `Row`, resolved from DB or live process snapshot, and wired
+  `app.shared.icons.get(ui.ctx(), &app.actions, path, 6)` in the icon cell.
+  Regression coverage: `app_history_preserves_and_roundtrips_icon_paths` in `tm-core` and
+  `row_carries_icon_path` in `tm-app`.
+
 - 2026-10-06: Released v0.1.19 (tag on `771d845`, the bump commit). Followed
   `build.md` §Publishing path: `--check` + `--audit` green, stable clippy
   green, bump pushed on main, `build.py --all-targets` for archives (Windows
