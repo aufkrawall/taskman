@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.1.20 - 2026-10-06
+
 ### Fixed
 
 - **App icons on App History tab:** the App History ("App-Verlauf") page was
