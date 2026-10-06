@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.1.19 - 2026-10-06
+
 ### Fixed
 
 - **Command line arguments for svchost and Windows services:** `svchost.exe` and
