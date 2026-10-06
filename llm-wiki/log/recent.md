@@ -1,3 +1,15 @@
+- 2026-10-06: Released v0.1.19 (tag on `771d845`, the bump commit). Followed
+  `build.md` §Publishing path: `--check` + `--audit` green, stable clippy
+  green, bump pushed on main, `build.py --all-targets` for archives (Windows
+  x86_64/ARM64, Linux x86_64 musl) and setup installers (`taskman-v0.1.19-windows-x86_64-setup.exe`,
+  `taskman-v0.1.19-windows-arm64-setup.exe`), `.sha256` generated beside each,
+  `gh release create --latest` with target `771d8451bc8ff195e80839b03fded64a28e6de0f`.
+  Release covers: SCM catalog fallback for resolving svchost and Windows service
+  command line arguments unelevated, and making Wi-Fi network details opt-in to eliminate
+  Windows 11 location-permission prompts. Verified packaged archives and setup installers:
+  `taskman.exe` and `taskman-service.exe` in Windows zip pass `--selfcheck` (`--mock`),
+  setup installers pass `taskman-payload verify`.
+
 - 2026-10-06: Command line arguments for svchost.exe and Windows services (user
   report: "it seems we can't properly show command line arguments for running
   svchost.exe (and potentially also other processes?)"). Root cause:
