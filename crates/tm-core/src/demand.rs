@@ -25,6 +25,19 @@ impl TelemetryDemand {
     /// ETW per-process disk trace (the Disk active time column on the
     /// Processes and Details pages).
     pub const PROCESS_DISK: Self = Self(1 << 9);
+    /// Wi-Fi connection details (SSID, signal strength) on the Performance
+    /// network card.
+    ///
+    /// PRIVACY: the underlying `WlanQueryInterface(current_connection)` is
+    /// gated by Windows behind PRECISE-LOCATION CONSENT. Calling it without
+    /// consent triggers the one-time system location permission prompt, and
+    /// every call shows up in the "location in use" tray activity — a task
+    /// manager has no business asking for the user's location. This bit is
+    /// therefore demanded ONLY after the user explicitly opted in
+    /// (`Settings.wifi_details`) AND while those rows are on screen; a
+    /// hidden surface (tray) never sets it. Deliberately NOT part of
+    /// [`Self::all()`]: a diagnostic run must not trigger a privacy prompt.
+    pub const WIFI_DETAILS: Self = Self(1 << 10);
 
     /// Union.
     pub fn union(self, other: Self) -> Self {
@@ -78,7 +91,7 @@ impl TelemetryDemand {
         Self::CORE_PROCESS
     }
 
-    /// Every provider at once.
+    /// Every provider at once — except the consent-gated ones.
     ///
     /// Not a UI state — no page wants all of this — but exactly what a
     /// diagnostic run must ask for. `--selfcheck` used to sample at
@@ -86,6 +99,10 @@ impl TelemetryDemand {
     /// machine has no GPU" when it actually means "the GPU providers were
     /// never switched on". Keep this in sync when a bit is added; the unit
     /// test below pins that.
+    ///
+    /// [`Self::WIFI_DETAILS`] is the one documented exemption: its provider
+    /// is gated by Windows behind precise-location consent, so a diagnostic
+    /// run demanding it would surface the location permission prompt.
     pub fn all() -> Self {
         Self::core()
             .union(Self::DISK_RATE)
@@ -137,6 +154,7 @@ mod tests {
             ("GPU_ADAPTER", TelemetryDemand::GPU_ADAPTER),
             ("DISK_RATE", TelemetryDemand::DISK_RATE),
             ("CPU_SPEED", TelemetryDemand::CPU_SPEED),
+            ("WIFI_DETAILS", TelemetryDemand::WIFI_DETAILS),
         ] {
             assert!(!hidden.wants(bit), "hidden() must not keep {name} warm");
         }
@@ -148,6 +166,13 @@ mod tests {
     /// `all()` must cover every declared bit. A provider added without being
     /// listed there silently drops out of `--selfcheck`, which is exactly how
     /// the GPU providers went unexercised by the headless smoke test.
+    ///
+    /// The one documented exemption is `WIFI_DETAILS`, and the reason is a
+    /// privacy contract: its provider is `WlanQueryInterface`, which Windows
+    /// gates behind precise-location consent. A diagnostic run must never
+    /// surface the location permission prompt, so the bit is opt-in-only and
+    /// must stay out of `all()` (and out of `core()`/`hidden()` — a baseline
+    /// or tray demand may not reach it either).
     #[test]
     fn all_contains_every_declared_bit() {
         let all = TelemetryDemand::all();
@@ -165,8 +190,19 @@ mod tests {
         ] {
             assert!(all.wants(bit), "all() is missing {name}");
         }
-        // Every bit and nothing beyond the declared ones.
+        // Every exercised bit and nothing beyond the declared ones (the
+        // 11th declared bit is the consent-gated WIFI_DETAILS below).
         assert_eq!(all.bits().count_ones(), 10);
         assert!(all.any_gpu());
+        let wifi = TelemetryDemand::WIFI_DETAILS;
+        assert!(
+            !all.wants(wifi),
+            "a diagnostic run must not trigger the location prompt"
+        );
+        assert!(!TelemetryDemand::core().wants(wifi));
+        assert!(!TelemetryDemand::hidden().wants(wifi));
+        // The bit is real and independent of every other one.
+        assert_eq!(wifi.bits().count_ones(), 1);
+        assert_eq!(wifi.union(TelemetryDemand::core()).bits().count_ones(), 4);
     }
 }

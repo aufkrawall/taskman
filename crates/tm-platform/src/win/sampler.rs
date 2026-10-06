@@ -199,8 +199,19 @@ pub struct Sampler {
     /// Current telemetry demand from the UI (drives expensive providers).
     demand: TelemetryDemand,
     /// Cached native network adapter metadata with a wall-clock TTL so the
-    /// SSID/description walk does not run every sampling tick.
+    /// description/address walk does not run every sampling tick.
     net_meta_cache: Option<(Instant, HashMap<String, net_info::AdapterInfo>)>,
+    /// Cached Wi-Fi connection details (SSID/signal), collected separately
+    /// from [`Self::net_meta_cache`] because `net_info::wifi_details` is the
+    /// one location-gated call in the program: it runs only while
+    /// `TelemetryDemand::WIFI_DETAILS` is set (explicit user opt-in, rows on
+    /// screen) and at most once per [`WIFI_META_TTL`]. `None` whenever the
+    /// demand is off — the collected SSID is forgotten, not just stale.
+    wifi_cache: Option<(Instant, net_info::WifiDetails)>,
+    /// The location-gated query was refused once; log that once, not per
+    /// retry (the refusal is sticky until the user changes Location
+    /// settings, and it is what a support conversation needs to see).
+    wifi_denied_logged: bool,
     /// Time-based CPU accountant (see [`cpu_load`]); replaces sysinfo/PDH
     /// CPU usage which was noisy and mis-normalized.
     cpu_load: CpuLoadAccountant,
@@ -281,6 +292,32 @@ const NET_SOURCE_RETRY: std::time::Duration = std::time::Duration::from_secs(30)
 /// service look like it had disappeared. The tick still reports unknown while
 /// the misses accumulate; it is never a fabricated zero.
 const BROKER_MISS_TOLERANCE: u8 = 3;
+
+/// Minimum gap between two collections of the location-gated Wi-Fi details.
+///
+/// Every `WlanQueryInterface(current_connection)` call shows up in the
+/// Windows "location in use" tray activity (and the first unconsented one
+/// triggers the one-time location permission prompt), so this is
+/// deliberately much slower than [`NET_META_TTL`]-style refreshes: SSID and
+/// signal quality change rarely, and a consented user should not watch the
+/// location icon blink every few seconds — the exact "permission spam" the
+/// opt-in design exists to prevent.
+const WIFI_META_TTL: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Whether THIS tick may touch the location-gated WLAN query at all.
+///
+/// Two gates, and the first one is a privacy contract: without
+/// [`TelemetryDemand::WIFI_DETAILS`] demanded, the query is never due —
+/// whatever the clock says. The bit is derived from the user's explicit
+/// opt-in (`Settings.wifi_details`) plus the SSID rows being on screen, and
+/// a hidden surface (tray) never sets it, so the default product never asks
+/// Windows for location data. The second gate throttles consented use to
+/// one collection per [`WIFI_META_TTL`]. Pure so the contract is pinnable;
+/// the regression test below is the pin.
+fn wifi_collection_due(demand: TelemetryDemand, last: Option<Instant>, now: Instant) -> bool {
+    demand.wants(TelemetryDemand::WIFI_DETAILS)
+        && last.is_none_or(|at| now.saturating_duration_since(at) >= WIFI_META_TTL)
+}
 
 /// Where per-process DISK activity comes from. Same three-way choice, and for
 /// the same reason, as [`NetSource`]: the trace needs privileges the GUI
@@ -410,6 +447,8 @@ impl Sampler {
             pdh: Mutex::new(perfcounters::PdhCounters::new()),
             demand: TelemetryDemand::core(),
             net_meta_cache: None,
+            wifi_cache: None,
+            wifi_denied_logged: false,
             cpu_load: CpuLoadAccountant::new(),
             last_load: None,
             pseudo: PseudoRowHold::default(),
@@ -1101,8 +1140,9 @@ impl Sampler {
     /// differences against.
     ///
     /// Byte-rate counters run on the sampling cadence; the native adapter
-    /// metadata walk (desc/link/SSID) is cached for `NET_META_TTL` so it does
-    /// not run every tick.
+    /// metadata walk (desc/link/IP) is cached for `NET_META_TTL` so it does
+    /// not run every tick. The Wi-Fi connection details are NOT part of that
+    /// walk — see [`Self::collect_wifi`].
     fn collect_networks(&mut self, interval_s: f64) -> Vec<NetworkInfo> {
         const NET_META_TTL: std::time::Duration = std::time::Duration::from_secs(5);
         let adapter_info = match &self.net_meta_cache {
@@ -1113,6 +1153,7 @@ impl Sampler {
                 fresh
             }
         };
+        let wifi = self.collect_wifi(Instant::now());
         let mut nets = Vec::new();
         for (name, data) in &self.networks {
             let recv_total = data.total_received();
@@ -1128,6 +1169,8 @@ impl Sampler {
                 _ => (0.0, 0.0),
             };
             let ai = adapter_info.get(name.as_str());
+            let wifi_info =
+                ai.and_then(|a| wifi.as_ref().and_then(|w| w.by_guid.get(&a.interface_guid)));
             nets.push(NetworkInfo {
                 name: name.to_string(),
                 desc: ai.map_or_else(String::new, |a| a.desc.clone()),
@@ -1138,10 +1181,11 @@ impl Sampler {
                 total_recv_bytes: recv_total,
                 total_sent_bytes: sent_total,
                 link_bps: ai.map_or(0, |a| a.link_bps),
-                ssid: ai.and_then(|a| a.ssid.clone()),
+                ssid: wifi_info.map(|w| w.ssid.clone()),
                 ipv4: ai.and_then(|a| a.ipv4.clone()),
                 ipv6: ai.and_then(|a| a.ipv6.clone()),
-                signal_quality_pct: ai.and_then(|a| a.signal_quality_pct),
+                signal_quality_pct: wifi_info.map(|w| w.signal_quality_pct),
+                wifi_access_denied: wifi.as_ref().is_some_and(|w| w.access_denied),
             });
         }
         self.prev_net_totals.clear();
@@ -1150,6 +1194,43 @@ impl Sampler {
                 .insert(n.name.clone(), (n.total_recv_bytes, n.total_sent_bytes));
         }
         nets
+    }
+
+    /// Wi-Fi connection facts (SSID, signal) — the one location-gated call
+    /// in the program, see [`net_info::wifi_details`].
+    ///
+    /// Two gates, both mandatory:
+    ///
+    /// 1. `TelemetryDemand::WIFI_DETAILS` must be set. The UI derives it
+    ///    from the user's explicit opt-in (`Settings.wifi_details`) AND the
+    ///    rows being on screen; a hidden window (tray) demands only
+    ///    [`TelemetryDemand::hidden`], which never contains the bit. No
+    ///    demand means the gated API is never called: no location permission
+    ///    prompt, no "location in use" tray activity.
+    /// 2. At most one collection per [`WIFI_META_TTL`], so consented use
+    ///    does not re-surface the location activity every tick.
+    ///
+    /// With the demand off the cache is dropped, not kept: turning the
+    /// opt-in off must stop DISPLAYING the SSID, not merely stop refreshing
+    /// it.
+    fn collect_wifi(&mut self, now: Instant) -> Option<net_info::WifiDetails> {
+        let last = self.wifi_cache.as_ref().map(|(at, _)| *at);
+        if !wifi_collection_due(self.demand, last, now) {
+            if !self.demand.wants(TelemetryDemand::WIFI_DETAILS) {
+                self.wifi_cache = None;
+            }
+            return self.wifi_cache.as_ref().map(|(_, w)| w.clone());
+        }
+        let fresh = net_info::wifi_details();
+        if fresh.access_denied && !self.wifi_denied_logged {
+            self.wifi_denied_logged = true;
+            tracing::warn!(
+                "Wi-Fi details unavailable: Windows denied the location-gated WLAN query \
+                 (precise-location consent missing or declined)"
+            );
+        }
+        self.wifi_cache = Some((now, fresh.clone()));
+        Some(fresh)
     }
 
     fn sample_inner(&mut self, started: Instant) -> Result<Snapshot> {
@@ -2345,6 +2426,49 @@ fn now_ms() -> u64 {
 mod tests {
     use super::*;
     use crate::win::cpu_load::ExitedImage;
+
+    /// Regression pin for the Windows location-permission spam: the SSID/
+    /// signal query (`WlanQueryInterface(current_connection)`) is gated by
+    /// Windows behind precise-location consent — an unconsented call pops
+    /// the one-time location permission prompt and every call registers in
+    /// the "location in use" tray activity. It used to run on every 5 s
+    /// metadata refresh regardless of settings or what was on screen. The
+    /// contract now: WITHOUT the opt-in demand the gated query is never due,
+    /// whatever the clock says; with it, it is throttled to one collection
+    /// per [`WIFI_META_TTL`] (due immediately the first time, so the consent
+    /// prompt appears at the user's opt-in action, not a minute later).
+    #[test]
+    fn the_location_gated_wifi_query_never_runs_without_the_opt_in() {
+        let now = Instant::now();
+        let long_ago = Some(now - WIFI_META_TTL * 10);
+        let opted_in = TelemetryDemand::core().union(TelemetryDemand::WIFI_DETAILS);
+        for (name, demand) in [
+            ("core", TelemetryDemand::core()),
+            ("hidden (tray)", TelemetryDemand::hidden()),
+            ("all (selfcheck)", TelemetryDemand::all()),
+        ] {
+            assert!(
+                !wifi_collection_due(demand, long_ago, now),
+                "{name} demand must never reach the location-gated query"
+            );
+            assert!(
+                !wifi_collection_due(demand, None, now),
+                "{name} demand must never reach the location-gated query"
+            );
+        }
+        // Opted in: due at once (the first collection is the user action
+        // aligned to the consent prompt), then throttled.
+        assert!(wifi_collection_due(opted_in, None, now));
+        assert!(
+            !wifi_collection_due(opted_in, Some(now - WIFI_META_TTL / 2), now),
+            "consented collection must stay throttled to one per WIFI_META_TTL"
+        );
+        assert!(wifi_collection_due(
+            opted_in,
+            Some(now - WIFI_META_TTL),
+            now
+        ));
+    }
 
     #[test]
     fn session_zero_alone_does_not_assert_system_account() {

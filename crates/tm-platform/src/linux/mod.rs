@@ -205,6 +205,7 @@ impl SystemCollector for LinuxCollector {
                 ipv4: None,
                 ipv6: None,
                 signal_quality_pct: None,
+                wifi_access_denied: false,
             });
         }
         self.prev_net_totals = nets

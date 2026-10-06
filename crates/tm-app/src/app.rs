@@ -434,6 +434,14 @@ pub struct TaskManApp {
     painted_last_frame: bool,
     /// Last visibility shipped to the engine (act only on a change).
     surface_visible: bool,
+    /// Whether the frame just completed painted the Performance NETWORK
+    /// card — the only surface that shows the Wi-Fi details (SSID, signal).
+    /// Same `logic`-before-`ui` handshake as [`Self::painted_last_frame`],
+    /// consumed by [`TaskManApp::update_demand`]: together with the user's
+    /// opt-in it is the gate on `TelemetryDemand::WIFI_DETAILS`, and thus on
+    /// the one location-gated API TaskMan touches. Nothing is collected for
+    /// a page that is not open — least of all for a window in the tray.
+    perf_net_card_painted: bool,
 
     /// Frame-rate diagnostics (TASKMAN_FPS_PROBE=1): forces continuous
     /// repaints, measures achieved fps against the display's refresh rate.
@@ -826,6 +834,7 @@ impl TaskManApp {
             // paints immediately, and a `--minimized-to-tray` launch settles
             // onto the hidden path one tick later.
             painted_last_frame: true,
+            perf_net_card_painted: false,
             surface_visible: true,
             fps_probe,
             last_frame: None,
@@ -1137,9 +1146,23 @@ impl TaskManApp {
         }
     }
 
+    /// Called by the Performance tab while it paints the network card — the
+    /// demand model's proof that the Wi-Fi details rows are on screen. Kept
+    /// private behind this setter so only that surface can produce it.
+    pub fn mark_perf_net_card_painted(&mut self) {
+        self.perf_net_card_painted = true;
+    }
+
     /// Derive telemetry demand from the visible surface and ship it when it
     /// changes (implement.md §6.3). Cheap: one atomic command on change.
     fn update_demand(&mut self) {
+        // Wi-Fi connection details come from the one location-gated API
+        // TaskMan touches. Demanded only when the user opted in AND the rows
+        // are literally on screen (`perf_net_card_painted`, the frame just
+        // completed). A hidden surface is covered further down: `demand_for`
+        // returns `hidden()` first, which never contains WIFI_DETAILS.
+        let net_card_painted = std::mem::replace(&mut self.perf_net_card_painted, false);
+        let wifi_details = net_card_painted && self.shared.settings.wifi_details;
         let d = demand_for(
             self.tab,
             self.details_state.requires_network_telemetry(),
@@ -1147,6 +1170,7 @@ impl TaskManApp {
             self.details_state.requires_gpu_telemetry(),
             self.proc_props.is_some(),
             self.surface_visible,
+            wifi_details,
         );
         if d.bits() != self.last_demand_bits {
             self.last_demand_bits = d.bits();
@@ -1295,7 +1319,10 @@ impl TaskManApp {
 /// column whose provider it forgot to request renders "—" at best and a
 /// measured-looking zero at worst, and neither is visible from the caller.
 /// The `details_*` flags say whether the Details page's VISIBLE columns want
-/// a source; they are ignored while another page is on screen.
+/// a source; they are ignored while another page is on screen. Likewise
+/// `wifi_details` says the Performance network card's SSID/signal rows are
+/// on screen AND the user opted into that collection — the one demand bit
+/// backed by a Windows location-gated API, so it is never assumed.
 fn demand_for(
     tab: Tab,
     details_network: bool,
@@ -1303,6 +1330,7 @@ fn demand_for(
     details_gpu: bool,
     proc_props_open: bool,
     surface_visible: bool,
+    wifi_details: bool,
 ) -> TelemetryDemand {
     // Nothing on screen reads a column, so the tab the window happens to be
     // parked on must not keep a kernel trace alive. This gate comes FIRST:
@@ -1349,6 +1377,13 @@ fn demand_for(
                 .union(TelemetryDemand::DISK_RATE)
                 .union(TelemetryDemand::GPU_ADAPTER)
                 .union(TelemetryDemand::CPU_SPEED);
+            // SSID/signal strength — the one demand bit whose provider is
+            // gated by Windows behind precise-location consent. Only the
+            // opted-in network card asks for it, and only while it is on
+            // screen: no opt-in, no bit, no location prompt.
+            if wifi_details {
+                d = d.union(TelemetryDemand::WIFI_DETAILS);
+            }
         }
         Tab::Details if details_gpu => {
             d = d
@@ -2675,7 +2710,7 @@ mod tests {
     #[test]
     fn pages_showing_disk_active_time_ask_for_the_disk_counters() {
         for tab in [Tab::Processes, Tab::Users] {
-            let d = demand_for(tab, false, false, false, false, true);
+            let d = demand_for(tab, false, false, false, false, true, false);
             assert!(
                 d.wants(TelemetryDemand::PROCESS_DISK),
                 "{tab:?} must request the per-process disk trace"
@@ -2688,16 +2723,16 @@ mod tests {
         }
         // Details only when its disk column is actually visible.
         assert!(
-            !demand_for(Tab::Details, false, false, false, false, true)
+            !demand_for(Tab::Details, false, false, false, false, true, false)
                 .wants(TelemetryDemand::DISK_RATE)
         );
         assert!(
-            demand_for(Tab::Details, false, true, false, false, true)
+            demand_for(Tab::Details, false, true, false, false, true, false)
                 .wants(TelemetryDemand::DISK_RATE)
         );
         // A page with no disk column still must not wake the counters.
         assert!(
-            !demand_for(Tab::Services, false, false, false, false, true)
+            !demand_for(Tab::Services, false, false, false, false, true, false)
                 .wants(TelemetryDemand::DISK_RATE)
         );
     }
@@ -2719,7 +2754,10 @@ mod tests {
             Tab::Startup,
             Tab::Services,
         ] {
-            let hidden = demand_for(tab, true, true, true, true, false);
+            // `wifi_details` even TRUE: an opted-in network card must lose
+            // the location-gated demand with everything else when the
+            // window goes to the tray.
+            let hidden = demand_for(tab, true, true, true, true, false, true);
             assert_eq!(
                 hidden,
                 TelemetryDemand::hidden(),
@@ -2732,6 +2770,7 @@ mod tests {
                 ("PROCESS_GPU", TelemetryDemand::PROCESS_GPU),
                 ("GPU_ADAPTER", TelemetryDemand::GPU_ADAPTER),
                 ("CPU_SPEED", TelemetryDemand::CPU_SPEED),
+                ("WIFI_DETAILS", TelemetryDemand::WIFI_DETAILS),
             ] {
                 assert!(
                     !hidden.wants(bit),
@@ -2741,9 +2780,70 @@ mod tests {
         }
         // ...and the same page asks for everything again once it is shown.
         assert!(
-            demand_for(Tab::Processes, false, false, false, false, true)
+            demand_for(Tab::Processes, false, false, false, false, true, false)
                 .wants(TelemetryDemand::PROCESS_NET)
         );
+    }
+
+    /// Regression pin for the Windows location-permission spam. The SSID and
+    /// signal rows read `WlanQueryInterface(current_connection)`, which
+    /// Windows gates behind precise-location consent: an unconsented call
+    /// triggers the one-time system location permission prompt, and every
+    /// call surfaces the "location in use" tray activity. The sampler used
+    /// to fire it every 5 s regardless of settings and pages. The chain that
+    /// must hold: no explicit opt-in -> no `WIFI_DETAILS` demand -> no
+    /// location-gated call ever; opted in -> demanded only while the network
+    /// card is on screen; and a hidden window (tray) never, ever demands it.
+    #[test]
+    fn wifi_details_are_opt_in_screen_bound_and_tray_silent() {
+        use Tab::*;
+        // Not opted in (`wifi_details == false`): no page may reach the
+        // location-gated provider, whatever else it shows.
+        for tab in [
+            Processes,
+            Performance,
+            AppHistory,
+            Users,
+            Details,
+            Startup,
+            Services,
+        ] {
+            assert!(
+                !demand_for(tab, true, true, true, true, true, false)
+                    .wants(TelemetryDemand::WIFI_DETAILS),
+                "{tab:?} without the opt-in must not demand WIFI_DETAILS"
+            );
+        }
+        // Opted in, rows on screen: the one combination that may — and only
+        // on the Performance page that renders those rows.
+        assert!(
+            demand_for(Performance, false, false, false, false, true, true)
+                .wants(TelemetryDemand::WIFI_DETAILS)
+        );
+        for tab in [Processes, AppHistory, Users, Details, Startup, Services] {
+            assert!(
+                !demand_for(tab, true, true, true, true, true, true)
+                    .wants(TelemetryDemand::WIFI_DETAILS),
+                "{tab:?} shows no Wi-Fi rows, so it must not demand them"
+            );
+        }
+        // Opted in but hidden (tray/minimized/occluded): never — the hidden
+        // branch returns before any page demand is considered.
+        for tab in [
+            Processes,
+            Performance,
+            AppHistory,
+            Users,
+            Details,
+            Startup,
+            Services,
+        ] {
+            assert_eq!(
+                demand_for(tab, true, true, true, true, false, true),
+                TelemetryDemand::hidden(),
+                "{tab:?} hidden must release the location-gated provider"
+            );
+        }
     }
 
     /// The hidden tick has to stay slower than every speed the user can pick,

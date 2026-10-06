@@ -239,6 +239,15 @@ pub struct Settings {
     pub gpu_graph_mode: String,
     /// Overlay kernel time (darker band) in the CPU graphs.
     pub show_kernel_times: bool,
+    /// Show Wi-Fi connection details (SSID, signal strength) on the
+    /// Performance network card.
+    ///
+    /// PRIVACY: Windows treats SSID and signal as precise-location data and
+    /// gates the query behind a one-time location consent prompt, so this is
+    /// opt-in and OFF by default. OFF means the location-gated API is never
+    /// touched, not merely hidden; turning this ON is the explicit user
+    /// action at which Windows may show its location permission prompt.
+    pub wifi_details: bool,
     /// Performance page: which resource card was open (a `ResourceEntry` key
     /// like `cpu`, `mem`, `disk:C:`, `net:...`, `gpu:0`). An unknown key falls
     /// back to CPU at startup, so a removed adapter cannot break the page.
@@ -288,6 +297,7 @@ impl Default for Settings {
             cpu_graph_mode: "overall".into(),
             gpu_graph_mode: "overall".into(),
             show_kernel_times: false,
+            wifi_details: false,
             perf_selected_key: "cpu".into(),
             details_tree_hierarchical: false,
             close_to_tray: false,
@@ -733,6 +743,7 @@ impl Settings {
             }
         }
         s.show_kernel_times = b("general", "show_kernel_times", s.show_kernel_times);
+        s.wifi_details = b("general", "wifi_details", s.wifi_details);
         if let Some(v) = get("general", "perf_selected_key") {
             let key = v.trim();
             if !key.is_empty() && key.len() <= 64 {
@@ -918,6 +929,7 @@ impl Settings {
             ("cpu_graph_mode", self.cpu_graph_mode.clone()),
             ("gpu_graph_mode", self.gpu_graph_mode.clone()),
             ("show_kernel_times", self.show_kernel_times.to_string()),
+            ("wifi_details", self.wifi_details.to_string()),
             ("perf_selected_key", self.perf_selected_key.clone()),
             (
                 "details_tree_hierarchical",
@@ -1215,6 +1227,7 @@ text_smoothing=banana
         s.perf_card_width = 300.5;
         s.cpu_graph_mode = "logical".into();
         s.show_kernel_times = true;
+        s.wifi_details = true;
         s.perf_selected_key = "gpu:0".into();
         s.details_tree_hierarchical = true;
         s.close_to_tray = true;
@@ -1259,6 +1272,19 @@ text_smoothing=banana
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("nope.ini");
         assert_eq!(Settings::load_from(&path), Settings::default());
+    }
+
+    /// Privacy default: the SSID/signal collection is the one place TaskMan
+    /// touches a Windows location-gated API, so it must start OFF — OFF
+    /// meaning "never query", not "query but hide". A config file that never
+    /// mentions the key keeps it off too.
+    #[test]
+    fn wifi_details_is_opt_in_and_defaults_off() {
+        assert!(!Settings::default().wifi_details);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.ini");
+        std::fs::write(&path, "[general]\nshow_kernel_times=true\n").unwrap();
+        assert!(!Settings::load_from(&path).wifi_details);
     }
 
     #[test]

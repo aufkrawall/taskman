@@ -1,3 +1,38 @@
+- 2026-10-06: Windows location-permission spam (user report: "we shouldn't
+  request permission for location checking at all", plus "never while running
+  in tray"). Root cause: `net_info::adapters()` called
+  `WlanQueryInterface(wlan_intf_opcode_current_connection)` (SSID + signal)
+  from the routine metadata walk, and the sampler refreshed that walk every
+  5 s (`NET_META_TTL`) regardless of settings or visible page. Since the
+  Windows 11 Wi-Fi/location privacy changes ("Changes to API behavior for
+  Wi-Fi access and location", learn.microsoft.com/windows/win32/nativewifi/
+  wi-fi-access-location-changes) that API is gated behind precise-location
+  consent: the first unconsented call pops the one-time location permission
+  prompt (per executable identity — dev builds, release builds and the
+  installed copy each prompt again) and every call registers in the
+  "location in use" tray activity. There is NO consent-free source for
+  SSID/signal — even WinRT `GetConnectedSsid`/`GetSignalBars` return
+  null/denied without location (MS Q&A), so "get SSID silently" is not
+  achievable. Design chosen (user picked explicit-opt-in over dropping the
+  feature): `Settings.wifi_details` (default OFF — OFF means the gated API
+  is never called, not merely hidden), a new `TelemetryDemand::WIFI_DETAILS`
+  bit demanded only while the Performance network card is painted
+  (`TaskManApp::perf_net_card_painted`, the same logic-before-ui handshake
+  as `painted_last_frame`) AND the setting is on; tray/hidden always
+  `hidden()` first, which never contains the bit (the user's second ask is
+  structural). Sampler gates on the bit in one pure fn
+  (`wifi_collection_due`) and throttles consented collection to one per
+  30 s (`WIFI_META_TTL`) so the location icon does not blink constantly;
+  dropping the demand also drops the cached SSID (stop DISPLAYING, not just
+  stop refreshing). `ERROR_ACCESS_DENIED` is surfaced (one warn + a card
+  hint with a `ms-settings:privacy-location` link) instead of silently
+  losing the rows. Deliberate: `WIFI_DETAILS` is excluded from
+  `TelemetryDemand::all()` (a `--selfcheck` must never trigger a privacy
+  prompt) — the documented exemption in `all_contains_every_declared_bit`.
+  Regression pins: `the_location_gated_wifi_query_never_runs_without_the_opt_in`
+  (sampler gate), `wifi_details_are_opt_in_screen_bound_and_tray_silent`
+  (demand derivation), `wifi_details_is_opt_in_and_defaults_off` (settings).
+
 - 2026-10-03: Released v0.1.18 (tag on `ec33b82`, the bump commit). Followed
   `build.md` §Publishing path: `--check` + `--audit` green, stable clippy
   green, bump pushed on main, `build.py --all-targets` for archives (Windows

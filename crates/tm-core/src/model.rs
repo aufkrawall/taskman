@@ -224,6 +224,12 @@ pub struct NetworkInfo {
     /// Native WLAN signal quality in percent (0–100).
     #[serde(default)]
     pub signal_quality_pct: Option<u32>,
+    /// Windows refused the location-gated Wi-Fi query (precise-location
+    /// consent missing or declined): the SSID/signal fields above are absent
+    /// because the OS withheld them, not because there is no connection.
+    /// Never inferred — only reported when the query was actually refused.
+    #[serde(default)]
+    pub wifi_access_denied: bool,
 }
 
 // ---------------------------------------------------------------- GPU

@@ -1,27 +1,29 @@
 //! Per-adapter network facts the sampler can't get from sysinfo: hardware
-//! description, negotiated link speed, oper status, unicast addresses and
-//! Wi-Fi connection details.
+//! description, negotiated link speed, oper status and unicast addresses.
 //!
-//! Sources: `GetAdaptersAddresses` (description/link/oper status, keyed by
-//! the adapter's friendly name — the same name sysinfo exposes) and
-//! `WlanQueryInterface` (SSID of the active wireless connection, joined via
-//! the adapter GUID).
+//! Source: `GetAdaptersAddresses` (description/link/oper status, keyed by
+//! the adapter's friendly name — the same name sysinfo exposes). None of it
+//! is consent-gated.
+//!
+//! Wi-Fi connection details (SSID, signal strength) live in [`wifi_details`]
+//! instead of this walk. Since the Windows 11 Wi-Fi/location privacy
+//! changes they are precise-location data obtained through
+//! `WlanQueryInterface`, which Windows gates behind a one-time location
+//! consent prompt. Keeping that call out of the routine metadata walk is
+//! what makes "never touch location without an explicit opt-in" auditable
+//! at a glance: [`wifi_details`] is the only caller of the gated API.
 
 use std::{
     collections::HashMap,
     net::{Ipv4Addr, Ipv6Addr},
 };
 
-use windows::Win32::Foundation::{ERROR_BUFFER_OVERFLOW, ERROR_SUCCESS};
+use windows::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_BUFFER_OVERFLOW, ERROR_SUCCESS};
 use windows::Win32::NetworkManagement::IpHelper::{
     GAA_FLAG_SKIP_ANYCAST, GAA_FLAG_SKIP_DNS_SERVER, GAA_FLAG_SKIP_MULTICAST, GetAdaptersAddresses,
     IP_ADAPTER_ADDRESSES_LH, IP_ADAPTER_UNICAST_ADDRESS_LH,
 };
 use windows::Win32::NetworkManagement::Ndis::IfOperStatusUp;
-use windows::Win32::NetworkManagement::WiFi::{
-    WLAN_CONNECTION_ATTRIBUTES, WLAN_INTERFACE_INFO_LIST, WlanCloseHandle, WlanEnumInterfaces,
-    WlanFreeMemory, WlanOpenHandle, WlanQueryInterface, wlan_intf_opcode_current_connection,
-};
 use windows::Win32::Networking::WinSock::{
     AF_INET, AF_INET6, AF_UNSPEC, SOCKADDR_IN, SOCKADDR_IN6,
 };
@@ -33,27 +35,39 @@ pub struct AdapterInfo {
     /// Negotiated link speed in bits/s (0 = unknown/down).
     pub link_bps: u64,
     pub oper_up: bool,
-    /// SSID of the active wireless connection, when this is Wi-Fi.
-    pub ssid: Option<String>,
+    /// Join key for [`WifiDetails::by_guid`]: the WLAN interface GUID in
+    /// [`interface_guid_key`] form (lowercase, without braces).
+    pub interface_guid: String,
     pub ipv4: Option<String>,
     pub ipv6: Option<String>,
-    pub signal_quality_pct: Option<u32>,
 }
 
+/// Connection facts of one wireless interface.
 #[derive(Debug, Clone)]
-struct WifiInfo {
-    ssid: String,
-    signal_quality_pct: u32,
+pub struct WifiInfo {
+    pub ssid: String,
+    pub signal_quality_pct: u32,
 }
 
-/// FriendlyName → adapter facts. One `GetAdaptersAddresses` call plus (when a
-/// wireless adapter exists) one WLAN enumeration. The sampler caches this
-/// metadata because address and WLAN discovery do not belong on every tick.
+/// Result of one [`wifi_details`] collection.
+#[derive(Debug, Clone, Default)]
+pub struct WifiDetails {
+    /// Per-interface facts keyed by [`AdapterInfo::interface_guid`].
+    pub by_guid: HashMap<String, WifiInfo>,
+    /// True when Windows refused the query with `ERROR_ACCESS_DENIED`:
+    /// precise-location consent is missing or was declined. The FIRST
+    /// refusal is what makes Windows show its one-time location permission
+    /// prompt, so callers must never retry this eagerly.
+    pub access_denied: bool,
+}
+
+/// FriendlyName → adapter facts. One `GetAdaptersAddresses` call. The
+/// sampler caches this metadata because address discovery does not belong
+/// on every tick.
 pub fn adapters() -> HashMap<String, AdapterInfo> {
     let Some(buf) = adapter_addresses() else {
         return HashMap::new();
     };
-    let ssids = wifi_ssids_by_guid();
 
     let mut out = HashMap::new();
     let mut cursor = buf.as_ptr() as *const IP_ADAPTER_ADDRESSES_LH;
@@ -67,12 +81,13 @@ pub fn adapters() -> HashMap<String, AdapterInfo> {
         let oper_up = adapter.OperStatus == IfOperStatusUp;
         let link_bps = link_speed_bps(adapter.TransmitLinkSpeed, adapter.ReceiveLinkSpeed);
         // `AdapterName` is the interface GUID ("{...}"), the identity WLAN
-        // reports as `InterfaceGuid`. `NetworkGuid` names the connected
-        // network profile instead, so joining on it never matched and the
-        // SSID and signal rows never appeared.
-        let wifi = unsafe { adapter.AdapterName.to_string() }
-            .ok()
-            .and_then(|guid| ssids.get(&interface_guid_key(&guid)));
+        // reports as `InterfaceGuid`; it is the join key for `wifi_details`.
+        // (`NetworkGuid` names the connected network profile instead, so
+        // joining on it never matched and the SSID and signal rows never
+        // appeared.)
+        let interface_guid = unsafe { adapter.AdapterName.to_string() }
+            .map(|guid| interface_guid_key(&guid))
+            .unwrap_or_default();
         let (ipv4, ipv6) = preferred_unicast_addresses(adapter.FirstUnicastAddress);
         out.insert(
             name,
@@ -80,10 +95,9 @@ pub fn adapters() -> HashMap<String, AdapterInfo> {
                 desc,
                 link_bps,
                 oper_up,
-                ssid: wifi.map(|info| info.ssid.clone()),
+                interface_guid,
                 ipv4,
                 ipv6,
-                signal_quality_pct: wifi.map(|info| info.signal_quality_pct),
             },
         );
     }
@@ -113,16 +127,34 @@ fn interface_guid_key(guid: &str) -> String {
     guid.trim_matches(['{', '}']).to_ascii_lowercase()
 }
 
-/// SSID per wireless interface, keyed by [`interface_guid_key`] of the
-/// interface GUID (the adapter's `AdapterName`).
-fn wifi_ssids_by_guid() -> HashMap<String, WifiInfo> {
+/// SSID and signal quality per wireless interface, keyed by
+/// [`AdapterInfo::interface_guid`].
+///
+/// PRIVACY — this is the ONLY function in the program that touches a
+/// Windows location-gated API. Since the Windows 11 Wi-Fi/location privacy
+/// changes, `WlanQueryInterface(wlan_intf_opcode_current_connection)`
+/// requires precise-location consent: the first unconsented call triggers
+/// the one-time system location permission prompt, and every call registers
+/// in the "location in use" tray activity and recent-activity list. Callers
+/// MUST gate this behind the user's explicit opt-in
+/// (`TelemetryDemand::WIFI_DETAILS`, derived from `Settings.wifi_details`)
+/// and throttle it — see `sampler::collect_wifi`. There is no consent-free
+/// alternative: Windows withholds SSID and signal from every API, including
+/// the WinRT `GetConnectedSsid`/`GetSignalBars` routes, without location
+/// consent.
+pub fn wifi_details() -> WifiDetails {
+    use windows::Win32::NetworkManagement::WiFi::{
+        WLAN_CONNECTION_ATTRIBUTES, WLAN_INTERFACE_INFO_LIST, WlanCloseHandle, WlanEnumInterfaces,
+        WlanFreeMemory, WlanOpenHandle, WlanQueryInterface, wlan_intf_opcode_current_connection,
+    };
+
     unsafe {
         let mut handle = Default::default();
         let mut negotiated = 0u32;
         if WlanOpenHandle(2, None, &mut negotiated, &mut handle) != 0 {
-            return HashMap::new();
+            return WifiDetails::default();
         }
-        let mut out = HashMap::new();
+        let mut out = WifiDetails::default();
         let mut list: *mut WLAN_INTERFACE_INFO_LIST = std::ptr::null_mut();
         if WlanEnumInterfaces(handle, None, &mut list) == 0 && !list.is_null() {
             let l = &*list;
@@ -131,7 +163,7 @@ fn wifi_ssids_by_guid() -> HashMap<String, WifiInfo> {
             for item in items {
                 let mut size = 0u32;
                 let mut data: *mut core::ffi::c_void = std::ptr::null_mut();
-                if WlanQueryInterface(
+                let ret = WlanQueryInterface(
                     handle,
                     &item.InterfaceGuid,
                     wlan_intf_opcode_current_connection,
@@ -139,16 +171,15 @@ fn wifi_ssids_by_guid() -> HashMap<String, WifiInfo> {
                     &mut size,
                     &mut data,
                     None,
-                ) == 0
-                    && !data.is_null()
-                {
+                );
+                if ret == 0 && !data.is_null() {
                     let attrs = &*(data as *const WLAN_CONNECTION_ATTRIBUTES);
                     // wlan_interface_state_connected == 1
                     if attrs.isState.0 == 1 {
                         let ssid = &attrs.wlanAssociationAttributes.dot11Ssid;
                         if ssid.uSSIDLength > 0 {
                             let bytes = &ssid.ucSSID[..(ssid.uSSIDLength as usize).min(32)];
-                            out.insert(
+                            out.by_guid.insert(
                                 interface_guid_key(&format!("{:?}", item.InterfaceGuid)),
                                 WifiInfo {
                                     ssid: String::from_utf8_lossy(bytes).into_owned(),
@@ -161,6 +192,8 @@ fn wifi_ssids_by_guid() -> HashMap<String, WifiInfo> {
                         }
                     }
                     WlanFreeMemory(data);
+                } else if ret == ERROR_ACCESS_DENIED.0 {
+                    out.access_denied = true;
                 }
             }
             WlanFreeMemory(list as *const _ as *mut _);

@@ -744,7 +744,9 @@ rebase runbook.
 - Performance uses lighter chart treatment and resource-specific colors. CPU
   graph controls live in graph context menus, logical CPU tiles adapt to core
   count and width, and Network combines receive/send while showing cached
-  native IPv4, IPv6, SSID, signal, link speed, and adapter description.
+  native IPv4, IPv6, link speed, and adapter description. SSID and signal
+  are opt-in (`Settings.wifi_details`) because Windows gates them behind
+  precise-location consent; see `log/recent.md` for the location-prompt fix.
 - Windows WGPU is explicitly D3D12-only, with FIFO/one-frame surface latency
   and low-power adapter preference; Vulkan is not compiled into the Windows
   WGPU backend. Linux remains Vulkan, macOS Metal, and Glow remains a fallback.

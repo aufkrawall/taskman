@@ -105,6 +105,7 @@ pub fn snapshot(seed: u32) -> Snapshot {
             ipv4: Some("192.0.2.10".into()),
             ipv6: Some("2001:db8::10".into()),
             signal_quality_pct: None,
+            wifi_access_denied: false,
         }],
         gpus: vec![GpuInfo {
             shared_used_bytes: 0,

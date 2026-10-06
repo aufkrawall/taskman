@@ -1450,6 +1450,31 @@ pub fn settings_dialog(app: &mut TaskManApp, ctx: &egui::Context, _pal: &theme::
                             .toast(i18n::trf(K::ErrMsg, &[&error.to_string()])),
                     }
                 }
+
+                // Opt-in for the SSID/signal rows. OFF means the
+                // location-gated WLAN query is never called at all — no
+                // Windows location permission prompt, no "location in use"
+                // tray activity. Flipping this ON is the explicit user
+                // action at which Windows may show its one-time consent
+                // prompt; collection then only happens while the network
+                // card is actually on screen (see `update_demand`).
+                let mut wifi_details = app.shared.settings.wifi_details;
+                if crate::widgets::controls::checkbox(
+                    ui,
+                    &mut wifi_details,
+                    i18n::tr(K::WifiDetailsToggle),
+                    _pal,
+                )
+                .changed()
+                {
+                    app.shared.settings.wifi_details = wifi_details;
+                    app.save_settings();
+                }
+                ui.label(
+                    egui::RichText::new(i18n::tr(K::WifiDetailsHint))
+                        .size(11.0)
+                        .color(_pal.text_dim),
+                );
             }
 
             ui.add_space(10.0);

@@ -15,7 +15,8 @@ platform boundary (`tm-core` ← `tm-platform` ← `tm-app` / `tm-service`), and
 
 - `crates/tm-core`
   - Platform-agnostic heart. `model.rs` (Snapshot data model — CPU, memory,
-    disks, networks incl. optional IP/signal metadata, GPU incl.
+    disks, networks incl. optional IP metadata (SSID/signal only behind the
+    opt-in `wifi_details` setting), GPU incl.
     `AdapterLuid`, processes incl.
     elevation/UAC/power-throttle fields), `engine.rs` (sampling engine:
     lazy start via collector factory, event notifier, Refresh-while-paused),
@@ -78,7 +79,9 @@ platform boundary (`tm-core` ← `tm-platform` ← `tm-app` / `tm-service`), and
     `users.rs`, `image_path.rs` (`NtQuerySystemInformation(SystemProcessIdInformation)`:
     the image path of a process no handle can be opened for, plus NT-device to
     drive-letter translation; both answers cached because neither changes while
-    a process lives), `net_info.rs` (cached adapter/link/IP/SSID/signal metadata),
+    a process lives), `net_info.rs` (cached adapter/link/IP metadata plus
+    `wifi_details()`, the ONLY location-gated call — SSID/signal, opt-in via
+    `Settings.wifi_details`),
     `etw.rs` (shared real-time-session plumbing: fixed per-role session names,
     orphan reclamation, provider enabling, the `ProcessTrace` worker thread and
     the handle-table id sanity check), `net_etw.rs` (per-process network bytes

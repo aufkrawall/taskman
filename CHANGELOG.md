@@ -2,6 +2,22 @@
 
 ## Unreleased
 
+### Changed
+
+- **Wi-Fi details are opt-in — no more Windows location prompts:** the SSID
+  and signal-strength rows on the Performance network card were read through
+  `WlanQueryInterface`, which Windows treats as precise-location data. On
+  current Windows 11 that made TaskMan pop the one-time location permission
+  prompt (once per build/executable identity) and re-surface in the
+  "location in use" tray activity every few seconds, without consent ever
+  yielding data. TaskMan now never touches location-gated APIs by default:
+  the rows are collected only after enabling "Show Wi-Fi details" in
+  Settings (the explicit action at which Windows may show its one-time
+  consent prompt), only while the network card is actually on screen — never
+  from the tray or another page — and at most once per 30 s. When Windows
+  refuses the query, the card says so and links to the Location settings
+  instead of silently dropping the rows.
+
 ## 0.1.18 - 2026-10-03
 
 ### Fixed

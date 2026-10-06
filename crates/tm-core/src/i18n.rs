@@ -735,6 +735,22 @@ keys! {
     KvIpv4 => ["IPv4-Adresse:", "IPv4 address:"],
     KvIpv6 => ["IPv6-Adresse:", "IPv6 address:"],
     KvSignal => ["Signalstärke:", "Signal strength:"],
+    WifiDetailsToggle => [
+        "WLAN-Details anzeigen (SSID, Signalstärke)",
+        "Show Wi-Fi details (SSID, signal strength)"
+    ],
+    WifiDetailsHint => [
+        "Windows wertet SSID und Signalstärke als Standortdaten. Beim ersten Anzeigen der Netzwerkkarte kann eine einmalige Standortfreigabe angefragt werden; abgefragt wird nur, solange diese Karte sichtbar ist.",
+        "Windows treats SSID and signal strength as location data. The first time the network card is shown a one-time location permission prompt may appear; TaskMan queries only while that card is visible."
+    ],
+    WifiDeniedHint => [
+        "WLAN-Details gesperrt: Windows verlangt eine Standortfreigabe.",
+        "Wi-Fi details blocked: Windows requires location permission."
+    ],
+    OpenLocationSettings => [
+        "Standorteinstellungen öffnen",
+        "Open Location settings"
+    ],
     ThroughputWindow => ["Durchsatz, {}", "Throughput, {}"],
     CardSentRecv => ["Ges.: {}  Empf.: {}", "S: {}  R: {}"],
 

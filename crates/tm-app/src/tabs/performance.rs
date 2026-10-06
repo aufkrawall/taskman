@@ -2160,6 +2160,10 @@ fn disk_page(app: &mut TaskManApp, ui: &mut egui::Ui, pal: &Palette, entry: &Res
 // ---------------------------------------------------------------- Network page
 
 fn network_page(app: &mut TaskManApp, ui: &mut egui::Ui, pal: &Palette, entry: &ResourceEntry) {
+    // Proof for the demand model: this is the only surface that shows the
+    // Wi-Fi details rows, so painting it is what may unlock the opt-in,
+    // location-gated collection (`update_demand` consumes the flag).
+    app.mark_perf_net_card_painted();
     let Some(snap) = app.latest_snapshot() else {
         return;
     };
@@ -2262,6 +2266,24 @@ fn network_page(app: &mut TaskManApp, ui: &mut egui::Ui, pal: &Palette, entry: &
                         i18n::tr(K::KvSignal),
                         &format!("{} %", signal.min(100)),
                     );
+                }
+                if net.wifi_access_denied {
+                    // Windows refused the location-gated query — say so
+                    // instead of silently dropping the rows, and offer the
+                    // one place where that can be changed.
+                    ui.label(
+                        egui::RichText::new(i18n::tr(K::WifiDeniedHint))
+                            .size(11.0)
+                            .color(pal.text_dim),
+                    );
+                    if ui
+                        .add(egui::Button::new(i18n::tr(K::OpenLocationSettings)).small())
+                        .clicked()
+                        && let Err(error) = app.actions.open_url("ms-settings:privacy-location")
+                    {
+                        app.shared
+                            .toast(i18n::trf(K::ErrMsg, &[&error.to_string()]));
+                    }
                 }
                 if let Some(ipv4) = &net.ipv4 {
                     kv_row(ui, pal, i18n::tr(K::KvIpv4), ipv4);
