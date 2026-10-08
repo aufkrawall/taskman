@@ -27,6 +27,16 @@ User name column is redacted in this capture.
 
 ![TaskMan Details tab](docs/screenshots/details.png)
 
+## Support
+
+[![GitHub Sponsors](https://img.shields.io/badge/Sponsor%20on%20GitHub-%23EA4AAA?style=for-the-badge&logo=githubsponsors&logoColor=white)](https://github.com/sponsors/aufkrawall)
+[![Buy Me a Coffee](https://img.shields.io/badge/Buy%20Me%20a%20Coffee-%23FFDD00?style=for-the-badge&logo=buymeacoffee&logoColor=black)](https://buymeacoffee.com/aufkrawall)
+
+Support through GitHub Sponsors or Buy Me a Coffee helps with development time,
+hardware, and tooling. My other open-source projects would also profit from
+donations; they are listed in [Other projects](#other-projects) at the bottom of
+this page.
+
 ## Highlights
 
 - **Processes** — native-style grouped presentation (Apps / Background /
@@ -164,6 +174,19 @@ Release packaging produces two ways to install:
 Substantially at parity for daily use. The precise remaining gaps (SRUM-backed
 app history, startup-impact telemetry, memory composition, accessibility, and
 more) are itemized in `audit.md` and `llm-wiki/known-debt.md`.
+
+## Other projects
+
+- [capture-engine](https://github.com/aufkrawall/capture-engine) — game capture,
+  recording, overlays, graphics overrides, and frame pacing for Windows
+- [green-curve](https://github.com/aufkrawall/green-curve) — open-source GPU curve undervolting and overclocking
+- [testsmem4u](https://github.com/aufkrawall/testsmem4u) — cross-platform RAM testing tool using proven patterns
+- [Shader-Stress](https://github.com/aufkrawall/Shader-Stress) — CPU stress test with shader-compilation-like
+  workloads
+- [obs-indicator](https://github.com/aufkrawall/obs-indicator) — a low-overhead OBS recording-status indicator
+
+More projects are available on [my GitHub profile](https://github.com/aufkrawall?tab=repositories). All of these
+projects would also profit from donations — see [Support](#support) at the top of this page.
 
 ## License
 
