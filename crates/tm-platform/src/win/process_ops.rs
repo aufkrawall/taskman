@@ -3127,19 +3127,60 @@ mod tests {
             !catalog.command_lines_by_pid.is_empty(),
             "service command lines must be catalogued per PID"
         );
-        let svchost_cmd = catalog
+        let svchost_entries: Vec<_> = catalog
             .command_lines_by_pid
             .iter()
-            .find(|(_, cmd)| cmd.to_ascii_lowercase().contains("svchost.exe"));
+            .filter(|(_, cmd)| cmd.to_ascii_lowercase().contains("svchost.exe"))
+            .collect();
         assert!(
-            svchost_cmd.is_some(),
+            !svchost_entries.is_empty(),
             "svchost command lines must be discovered from services"
         );
-        let (svchost_pid, cmdline) = svchost_cmd.unwrap();
-        let resolved = command_line_of(*svchost_pid).expect("svchost command line retrievable");
+
+        let normalize_cmd = |cmd: &str| -> String {
+            let s = cmd.trim();
+            if let Some(rest) = s.strip_prefix('"')
+                && let Some(end) = rest.find('"')
+            {
+                let exe = &rest[..end];
+                let tail = rest[end + 1..].trim_start();
+                return if tail.is_empty() {
+                    exe.to_string()
+                } else {
+                    format!("{exe} {tail}")
+                };
+            }
+            s.to_string()
+        };
+
+        // When queried through the process handle (e.g. in elevated test runs),
+        // the kernel serves the live command line from the PEB. For per-user
+        // service hosts (e.g. UdkUserSvc, cbdhsvc), the OS appends `-s <service>`
+        // at launch time which SCM's static ImagePath does not contain. The
+        // resolved command line therefore either matches the SCM catalog exactly
+        // or extends it with additional runtime arguments.
+        let mut verified = 0;
+        for (svchost_pid, cmdline) in &svchost_entries {
+            assert!(
+                service_command_line_of(**svchost_pid).is_some(),
+                "service command line must be retrievable from SCM catalog"
+            );
+            if let Some(resolved) = command_line_of(**svchost_pid) {
+                let norm_cmd = normalize_cmd(cmdline).to_ascii_lowercase();
+                let norm_res = normalize_cmd(&resolved).to_ascii_lowercase();
+                let matches_exact = norm_res == norm_cmd;
+                let matches_prefix = norm_res.starts_with(&format!("{norm_cmd} "))
+                    || norm_cmd.starts_with(&format!("{norm_res} "));
+                assert!(
+                    matches_exact || matches_prefix,
+                    "command line must match or extend configured service command line: {resolved:?} vs {cmdline:?}"
+                );
+                verified += 1;
+            }
+        }
         assert!(
-            resolved.eq_ignore_ascii_case(cmdline),
-            "command line must match: {resolved:?} vs {cmdline:?}"
+            verified > 0,
+            "at least one svchost command line must be verified"
         );
     }
 

@@ -1,3 +1,20 @@
+- 2026-10-21: CI quality gate failure in `service_catalog_discovers_active_services`.
+  Root cause: `process_ops::tests::service_catalog_discovers_active_services`
+  asserted exact equality (`resolved.eq_ignore_ascii_case(cmdline)`) between the
+  unified command line `command_line_of(pid)` and SCM's `catalog.command_lines_by_pid`.
+  In elevated test environments (such as GitHub Actions CI runners),
+  `command_line_of` queries the live PEB via `NtQueryInformationProcess`. For
+  per-user svchost services (e.g. `UdkUserSvc`, `cbdhsvc`), Windows dynamically
+  appends `-s <service>` at process spawn time, whereas SCM's static `lpBinaryPathName`
+  only specifies `svchost.exe -k <group>`. Because `catalog.command_lines_by_pid` is
+  a `HashMap`, test runs randomly picked different svchosts, causing intermittent CI
+  failures whenever a per-user svchost was chosen first. Fix: updated the test to
+  check all active svchosts, verifying that each resolves via SCM and that the live
+  command line either matches or extends the base service command line (handling
+  unquoted and quoted executables). Falsified the earlier "timing-sensitive" assumption
+  in `known-debt.md`. Verified full quality gate (`python build.py --check`) and
+  stable clippy cleanly pass.
+
 - 2026-10-21: Released v0.1.21 (tag on `b1ccbc6`, the bump commit). Followed
   `build.md` §Publishing path: `--check` + `--audit` green, stable clippy
   green, bump pushed on main, `build.py --all-targets` for archives (Windows

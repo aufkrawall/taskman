@@ -377,12 +377,15 @@ Found by the 2026-10-21 row-vs-total audit and deliberately not changed:
 - **Loopback:** only 127.0.0.0/8, ::1 and ::ffff:127/104 are excluded from
   per-process network; traffic to the machine's own adapter address also
   stays inside the stack but is still counted.
-- `process_ops::tests::service_catalog_discovers_active_services` is
-  timing-sensitive on a live system (a svchost can change between the SCM
-  catalog and the command-line read); seen failing once, passing on rerun.
-
 ## Falsified findings — do not re-raise
 
+- "`process_ops::tests::service_catalog_discovers_active_services` is timing-sensitive"
+  — falsified and fixed 2026-10-21. Intermittent failure was not timing but
+  HashMap iteration non-determinism selecting per-user svchost services (e.g.
+  `UdkUserSvc`, `cbdhsvc`) where the PEB command line has dynamic `-s <service>`
+  appended by Windows while SCM's static `lpBinaryPathName` configured only
+  `svchost.exe -k <group>`. The test now properly checks that the live command line
+  matches or extends the configured service command line across all active svchosts.
 - "heat_cells discovers maxima from one row" — fixed 2026-08-26 (P0.2);
   intensities are normalized per column over the full display model before
   virtualization (`tablekit::norm`, `normalize_heat`, users' `HeatMax`).
