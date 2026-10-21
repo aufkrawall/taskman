@@ -1,33 +1,53 @@
-//! Process Properties → Services: the services one process hosts, from one
-//! service-manager query when the page is first shown (Refresh repeats it).
+//! Process Properties → Services: the services one process hosts, refreshed
+//! while the page is shown at the app's update speed (frozen while paused;
+//! F5 refreshes on demand).
 
 use eframe::egui;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tm_core::i18n::{self, K};
 use tm_core::model::ServiceInfo;
 
 use crate::app::{ProcessIdentity, TaskManApp};
 use crate::search;
-use crate::tabs::inspector::Poll;
+use crate::tabs::inspector::{self, Poll};
 use crate::theme;
 use crate::widgets::menu;
 use crate::widgets::tablekit::{self, TmColumn};
 
 const TABLE_ID: &str = "proc_services";
+/// Fastest refresh: one service-manager enumeration costs tens of
+/// milliseconds, and a hosted service's state rarely changes faster.
+const REFRESH_FLOOR: Duration = Duration::from_secs(5);
 
 #[derive(Default)]
 pub struct State {
     poll: Poll<Vec<ServiceInfo>>,
     rows: Option<Result<Vec<ServiceInfo>, String>>,
+    /// Why the newest refresh failed while older rows are still shown.
+    stale: Option<String>,
     selected: Option<String>,
+}
+
+impl State {
+    /// F5: query again now, whatever the update speed.
+    pub fn request_refresh(&mut self) {
+        self.poll.request();
+    }
 }
 
 pub fn tick(state: &mut State, app: &TaskManApp, ctx: &egui::Context, identity: &ProcessIdentity) {
     if let Some(result) = state.poll.take() {
-        state.rows = Some(result);
+        inspector::merge(&mut state.rows, &mut state.stale, result);
     }
-    if app.actions.capabilities().services_list && state.poll.due(Instant::now(), None) {
+    if !app.actions.capabilities().services_list {
+        return;
+    }
+    let every = inspector::page_interval(app.shared.settings.update_speed, REFRESH_FLOOR);
+    if state.poll.due(Instant::now(), every) {
         start(state, app, ctx, identity);
+    }
+    if let Some(every) = every {
+        ctx.request_repaint_after(every);
     }
 }
 
@@ -51,26 +71,10 @@ pub fn show(
     app: &mut TaskManApp,
     ui: &mut egui::Ui,
     state: &mut State,
-    identity: &ProcessIdentity,
     pal: &theme::Palette,
 ) -> Option<String> {
     let ctx = ui.ctx().clone();
     let mut jump = None;
-    ui.horizontal(|ui| {
-        if ui
-            .add_enabled(
-                !state.poll.busy(),
-                egui::Button::new(i18n::tr(K::RefreshNow)),
-            )
-            .clicked()
-        {
-            start(state, app, &ctx, identity);
-        }
-        if state.poll.busy() {
-            ui.spinner();
-        }
-    });
-    ui.add_space(4.0);
     let rows = match &state.rows {
         None => {
             ui.horizontal(|ui| {
@@ -85,6 +89,9 @@ pub fn show(
         }
         Some(Ok(rows)) => rows,
     };
+    if let Some(error) = state.stale.as_deref() {
+        ui.label(egui::RichText::new(error).small().color(pal.heat_high));
+    }
 
     let dialog_open = app.modal_open();
     search::set_active_content(&ctx, TABLE_ID);

@@ -3912,6 +3912,31 @@ pub fn process_properties_dialog(app: &mut TaskManApp, ctx: &egui::Context) {
     let Some(mut dialog) = app.proc_props.take() else {
         return;
     };
+    // F5 refreshes the page on screen: the dialog's counterpart of the main
+    // window's "Refresh now", and the only refresh while updates are paused.
+    // Handled first so this frame's queries already see the request. The
+    // unload confirmation owns the keyboard while it is up.
+    if !dialog.modules.confirming()
+        && ctx.input_mut(|input| input.consume_key(Default::default(), egui::Key::F5))
+    {
+        // A fresh sample for General/Statistics, whatever the page.
+        app.refresh_all();
+        match dialog.tab {
+            ProcessPropertiesTab::Threads | ProcessPropertiesTab::Modules => {
+                dialog.threads.request_refresh();
+                dialog.modules.request_refresh();
+            }
+            ProcessPropertiesTab::Network => dialog.network.request_refresh(),
+            ProcessPropertiesTab::Services => dialog.services.request_refresh(),
+            #[cfg(target_os = "windows")]
+            ProcessPropertiesTab::Security => {
+                dialog.security = None;
+                dialog.security_error = None;
+                dialog.security_started = false;
+            }
+            _ => {}
+        }
+    }
     #[cfg(target_os = "windows")]
     {
         if dialog.security.is_none()
@@ -3959,7 +3984,7 @@ pub fn process_properties_dialog(app: &mut TaskManApp, ctx: &egui::Context) {
     match dialog.tab {
         ProcessPropertiesTab::Threads | ProcessPropertiesTab::Modules => {
             crate::tabs::threads::tick(&mut dialog.threads, app, ctx, &identity);
-            crate::tabs::modules::ensure_loaded(app, &mut dialog.modules, ctx);
+            crate::tabs::modules::tick(app, &mut dialog.modules, ctx);
         }
         ProcessPropertiesTab::Network => {
             crate::tabs::connections::tick(&mut dialog.network, app, ctx, &identity)
@@ -4148,7 +4173,6 @@ pub fn process_properties_dialog(app: &mut TaskManApp, ctx: &egui::Context) {
                                         app,
                                         ui,
                                         &mut dialog.services,
-                                        &identity,
                                         &pal,
                                     )
                                 }

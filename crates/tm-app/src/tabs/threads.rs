@@ -26,7 +26,8 @@ use crate::widgets::tablekit::{self, TmColumn};
 /// How long a thread must be watched without any sign of running before it
 /// is called dormant.
 pub const DORMANT_AFTER: Duration = Duration::from_secs(5);
-const REFRESH_EVERY: Duration = Duration::from_secs(1);
+/// Fastest refresh; slower update speeds slow it down, Paused stops it.
+const REFRESH_FLOOR: Duration = Duration::from_secs(1);
 const TABLE_ID: &str = "proc_threads";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -218,6 +219,8 @@ pub struct State {
     sort: SortColumn,
     ascending: bool,
     hide_dormant: bool,
+    /// A new snapshot replaced the rows since the table last drew them.
+    fresh: bool,
 }
 
 impl State {
@@ -238,7 +241,13 @@ impl State {
             sort,
             ascending: saved.is_none_or(|saved| saved.ascending),
             hide_dormant: false,
+            fresh: false,
         }
+    }
+
+    /// F5: query again now, whatever the update speed.
+    pub fn request_refresh(&mut self) {
+        self.poll.request();
     }
 
     /// The newest rows, for the Modules page's per-module activity.
@@ -260,6 +269,7 @@ pub fn tick(state: &mut State, app: &TaskManApp, ctx: &egui::Context, identity: 
                 state.process_base_priority = Some(snapshot.process_base_priority);
                 state.rows = state.tracker.apply(snapshot.threads, taken, cpus);
                 state.error = None;
+                state.fresh = true;
             }
             Err(error) => state.error = Some(error),
         }
@@ -268,7 +278,8 @@ pub fn tick(state: &mut State, app: &TaskManApp, ctx: &egui::Context, identity: 
     if !app.actions.capabilities().process_threads {
         return;
     }
-    if state.poll.due(Instant::now(), Some(REFRESH_EVERY)) {
+    let every = inspector::page_interval(app.shared.settings.update_speed, REFRESH_FLOOR);
+    if state.poll.due(Instant::now(), every) {
         let actions = app.actions.clone();
         let identity = identity.clone();
         state.poll.start(ctx, "tm-threads", move || {
@@ -278,7 +289,9 @@ pub fn tick(state: &mut State, app: &TaskManApp, ctx: &egui::Context, identity: 
                 .map_err(|error| error.to_string())
         });
     }
-    ctx.request_repaint_after(REFRESH_EVERY);
+    if let Some(every) = every {
+        ctx.request_repaint_after(every);
+    }
 }
 
 /// `module.dll+0x1A2B` when the address lies inside a mapped module,
@@ -479,6 +492,18 @@ pub fn show(
         .scroll_to
         .take()
         .and_then(|tid| views.iter().position(|view| view.row.thread.tid == tid));
+    // Threads come and go every refresh; keep the rows on screen where they
+    // are, preferring the selected one.
+    let key_of = |index: usize| {
+        views
+            .get(index)
+            .map_or(u64::MAX, |view| tablekit::stable_key(view.row.thread.tid))
+    };
+    let anchor = tablekit::ScrollAnchor {
+        model_changed: std::mem::take(&mut state.fresh),
+        prefer_key: state.selected.map(tablekit::stable_key),
+        key_of: &key_of,
+    };
     let avail = tablekit::table_avail(ui);
     let mut clicked_tid = None;
     let clicked = tablekit::scrolled_rows(
@@ -492,7 +517,7 @@ pub fn show(
         views.len(),
         state.hide_dormant.then_some(i18n::tr(K::NoMatches)),
         focus,
-        None,
+        Some(anchor),
         |ui, table, _avail, _content_width, range| {
             for index in range {
                 let Some(view) = views.get(index) else {

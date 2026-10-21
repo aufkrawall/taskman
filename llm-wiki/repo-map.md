@@ -182,9 +182,11 @@ platform boundary (`tm-core` ← `tm-platform` ← `tm-app` / `tm-service`), and
     The list pages live in their own modules — `threads.rs` (thread list +
     the evidence-based dormancy `Tracker`), `modules.rs` (module list with
     guarded unload, per-module thread attribution), `connections.rs`,
-    `hosted_services.rs` — and query through `inspector::Poll` ONLY while
-    their page is on screen; Threads and Modules keep each other's list
-    current because each needs the other),
+    `hosted_services.rs` — and query through `inspector::Poll`/`Pace` ONLY
+    while their page is on screen, at `page_interval` (the update speed,
+    floored per page; Paused = frozen) plus F5 inside the dialog; a failed
+    refresh never blanks a shown list (`inspector::merge`). Threads and
+    Modules keep each other's list current because each needs the other),
     `selection.rs` (multi-row process selection shared by Processes and
     Details: native click gestures, identity-keyed, primary vs. full set),
     `widgets/tablekit.rs` (TM-style

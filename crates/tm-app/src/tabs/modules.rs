@@ -1,6 +1,8 @@
 //! Process Properties → Modules: the on-demand module list of one process.
 //!
-//! Enumeration and unloading never run on the UI thread. Unload is an
+//! Enumeration and unloading never run on the UI thread. The list refreshes
+//! itself while the Modules or Threads page is shown, at the app's update
+//! speed (frozen while paused; F5 refreshes on demand). Unload is an
 //! intentionally advanced action with a second confirmation; the platform
 //! layer revalidates both process identity and the exact module base/path.
 //!
@@ -11,20 +13,24 @@
 
 use eframe::egui;
 use std::cmp::Ordering;
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use tm_core::format;
 use tm_core::i18n::{self, K};
 use tm_platform::actions::{MODULE_UNLOAD_SINGLE_RELEASE_MARKER, PlatformActions, ProcessModule};
 
 use crate::app::{InFlight, ProcessIdentity, TaskManApp};
 use crate::search;
-use crate::tabs::inspector;
+use crate::tabs::inspector::{self, Pace};
 use crate::tabs::threads::{Activity, ThreadRow};
 use crate::theme;
 use crate::widgets::menu;
 use crate::widgets::tablekit::{self, TmColumn};
 
 const MAX_FORCE_UNLOAD_RELEASES: u32 = 64;
+/// Fastest refresh; slower update speeds slow it down, Paused stops it.
+const REFRESH_FLOOR: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Clone)]
 enum LoadState {
@@ -169,11 +175,20 @@ pub struct State {
     selected_base: Option<u64>,
     scroll_to_base: Option<u64>,
     load: Arc<Mutex<LoadState>>,
+    /// Why the newest background refresh failed while an older list is still
+    /// shown. The list stays: a transient enumeration failure must not blank
+    /// a page the user is reading.
+    stale: Arc<Mutex<Option<String>>>,
+    /// Bumped by every successful enumeration; the table anchors its scroll
+    /// position when it changes.
+    generation: Arc<AtomicU64>,
+    drawn_generation: u64,
     fetch: InFlight,
+    pace: Pace,
     unload: InFlight,
     pending_unload: Option<ProcessModule>,
-    /// Whether the first enumeration was started.
-    started: bool,
+    /// Confirmed while a refresh was running; starts when it finishes.
+    queued_unload: Option<ProcessModule>,
 }
 
 impl State {
@@ -203,11 +218,25 @@ impl State {
             selected_base: None,
             scroll_to_base: None,
             load: Arc::new(Mutex::new(LoadState::Loading)),
+            stale: Arc::new(Mutex::new(None)),
+            generation: Arc::new(AtomicU64::new(0)),
+            drawn_generation: 0,
             fetch: InFlight::default(),
+            pace: Pace::default(),
             unload: InFlight::default(),
             pending_unload: None,
-            started: false,
+            queued_unload: None,
         }
+    }
+
+    /// F5: enumerate again now, whatever the update speed.
+    pub fn request_refresh(&mut self) {
+        self.pace.request();
+    }
+
+    /// An unload is running or waiting for a refresh to finish.
+    fn unloading(&self) -> bool {
+        self.unload.busy() || self.queued_unload.is_some()
     }
 
     /// The loaded module list, for the Threads page's start addresses.
@@ -224,42 +253,98 @@ impl State {
     }
 }
 
-/// Start the first enumeration the first time a page needs the list.
-pub fn ensure_loaded(app: &TaskManApp, state: &mut State, ctx: &egui::Context) {
-    if !state.started && app.actions.capabilities().process_modules {
-        state.started = true;
+/// Keep the list current while a page that reads it is on screen.
+pub fn tick(app: &TaskManApp, state: &mut State, ctx: &egui::Context) {
+    if !app.actions.capabilities().process_modules {
+        return;
+    }
+    if !state.fetch.busy()
+        && let Some(module) = state.queued_unload.take()
+    {
+        begin_unload(app, state, module, ctx);
+    }
+    let every = inspector::page_interval(app.shared.settings.update_speed, REFRESH_FLOOR);
+    // An unload refreshes the list itself between its releases.
+    if !state.unloading() && state.pace.due(Instant::now(), every) {
         begin_fetch(state, app.actions.clone(), ctx);
+    }
+    if let Some(every) = every {
+        ctx.request_repaint_after(every);
+    }
+}
+
+/// Fold one enumeration into the page. A failure replaces only a list that
+/// is not there yet; over a shown list it is returned as the stale notice.
+fn merge_fetch(load: &mut LoadState, result: Result<Vec<ProcessModule>, String>) -> Option<String> {
+    match result {
+        Ok(mut modules) => {
+            modules.sort_by(|a, b| compare_modules(a, b, SortColumn::Name));
+            *load = LoadState::Ready(modules);
+            None
+        }
+        Err(error) if matches!(load, LoadState::Ready(_)) => Some(error),
+        Err(error) => {
+            *load = LoadState::Error(error);
+            None
+        }
     }
 }
 
 fn begin_fetch(state: &mut State, actions: Arc<dyn PlatformActions>, ctx: &egui::Context) {
-    // The load Arc is shared by both workers. Never let a manual refresh race
-    // an unload's mandatory post-action refresh and overwrite newer state.
-    if state.unload.busy() || !state.fetch.begin() {
+    // The load Arc is shared by both workers. Never let a refresh race an
+    // unload's mandatory post-action refresh and overwrite newer state.
+    if state.unloading() || !state.fetch.begin() {
         return;
     }
-    *tm_core::sync::lock(&state.load) = LoadState::Loading;
+    state.pace.mark_started(Instant::now());
     let load = state.load.clone();
+    let stale = state.stale.clone();
+    let generation = state.generation.clone();
     let identity = state.identity.clone();
     let in_flight = state.fetch.clone();
     let wake = ctx.clone();
     let spawned = std::thread::Builder::new()
         .name("tm-modules".into())
         .spawn(move || {
-            let result = actions.list_process_modules(identity.pid, identity.start_epoch_s);
-            *tm_core::sync::lock(&load) = match result {
-                Ok(mut modules) => {
-                    modules.sort_by(|a, b| compare_modules(a, b, SortColumn::Name));
-                    LoadState::Ready(modules)
-                }
-                Err(error) => LoadState::Error(error.to_string()),
-            };
+            let result = actions
+                .list_process_modules(identity.pid, identity.start_epoch_s)
+                .map_err(|error| error.to_string());
+            let ok = result.is_ok();
+            let notice = merge_fetch(&mut tm_core::sync::lock(&load), result);
+            *tm_core::sync::lock(&stale) = notice;
+            if ok {
+                generation.fetch_add(1, AtomicOrdering::Relaxed);
+            }
             in_flight.end();
             wake.request_repaint();
         });
     if let Err(error) = spawned {
         state.fetch.end();
-        *tm_core::sync::lock(&state.load) = LoadState::Error(error.to_string());
+        let notice = merge_fetch(
+            &mut tm_core::sync::lock(&state.load),
+            Err(error.to_string()),
+        );
+        *tm_core::sync::lock(&state.stale) = notice;
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum UnloadGate {
+    Start,
+    /// A background refresh is running; start right after it.
+    Queue,
+    Busy,
+}
+
+/// Inventory and mutation are serialized. A routine background refresh is
+/// never a reason to refuse a confirmed unload — it only delays it.
+fn unload_gate(fetch_busy: bool, unloading: bool) -> UnloadGate {
+    if unloading {
+        UnloadGate::Busy
+    } else if fetch_busy {
+        UnloadGate::Queue
+    } else {
+        UnloadGate::Start
     }
 }
 
@@ -292,7 +377,18 @@ fn begin_unload(app: &TaskManApp, state: &mut State, module: ProcessModule, ctx:
     }
     // Serialize module inventory and mutation. Besides avoiding stale UI, this
     // prevents a refresh from racing the action-time base/path revalidation.
-    if state.fetch.busy() || !state.unload.begin() {
+    match unload_gate(state.fetch.busy(), state.unloading()) {
+        UnloadGate::Busy => {
+            app.shared.toast(i18n::tr(K::ModuleBusy));
+            return;
+        }
+        UnloadGate::Queue => {
+            state.queued_unload = Some(module);
+            return;
+        }
+        UnloadGate::Start => {}
+    }
+    if !state.unload.begin() {
         app.shared.toast(i18n::tr(K::ModuleBusy));
         return;
     }
@@ -475,7 +571,6 @@ pub fn show(
     pal: &theme::Palette,
 ) {
     let ctx = ui.ctx().clone();
-    let mut request_refresh = false;
     let mut request_unload = None;
     let can_unload = app.actions.capabilities().unload_module;
     let snapshot = tm_core::sync::lock(&state.load).clone();
@@ -509,25 +604,13 @@ pub fn show(
                 .hint_text(i18n::tr(K::SearchHint))
                 .desired_width(300.0),
         );
-        if ui
-            .add_enabled(
-                !state.fetch.busy() && !state.unload.busy(),
-                egui::Button::new(i18n::tr(K::RefreshNow)),
-            )
-            .clicked()
-        {
-            request_refresh = true;
-        }
         // Which module to unload is the user's call; every selected
         // module can be attempted. Only the capability (module
-        // unload unavailable on this platform) and a running module
-        // inventory/action grey the button out.
+        // unload unavailable on this platform) and a running unload grey
+        // the button out — the routine refresh does not.
         let unload = ui
             .add_enabled(
-                can_unload
-                    && selected_module.is_some()
-                    && !state.unload.busy()
-                    && !state.fetch.busy(),
+                can_unload && selected_module.is_some() && !state.unloading(),
                 egui::Button::new(i18n::tr(K::UnloadModule)),
             )
             .on_disabled_hover_text(if selected_module.is_none() {
@@ -538,7 +621,7 @@ pub fn show(
         if unload.clicked() {
             request_unload = selected_module.clone();
         }
-        if state.fetch.busy() || state.unload.busy() {
+        if state.unloading() {
             ui.spinner();
         }
     });
@@ -560,6 +643,9 @@ pub fn show(
             ui.colored_label(pal.heat_high, error);
         }
         LoadState::Ready(modules) => {
+            if let Some(error) = tm_core::sync::lock(&state.stale).as_deref() {
+                ui.label(egui::RichText::new(error).small().color(pal.heat_high));
+            }
             let rows = visible_modules(state, modules, threads);
             // `app.modal_open()` runs while the properties dialog is taken,
             // so it stays false for the dialog itself — this list nav and
@@ -614,6 +700,26 @@ pub fn show(
                 .scroll_to_base
                 .take()
                 .and_then(|base| rows.iter().position(|row| row.module.base_address == base));
+            // DLLs load and unload between refreshes; keep the rows on
+            // screen where they are, preferring the selected one.
+            let generation = state.generation.load(AtomicOrdering::Relaxed);
+            let model_changed = generation != state.drawn_generation;
+            state.drawn_generation = generation;
+            let key_of = |index: usize| {
+                rows.get(index).map_or(u64::MAX, |row| {
+                    tablekit::stable_key((row.module.base_address, row.module.path.as_str()))
+                })
+            };
+            let prefer_key = state.selected_base.and_then(|base| {
+                rows.iter()
+                    .find(|row| row.module.base_address == base)
+                    .map(|row| tablekit::stable_key((base, row.module.path.as_str())))
+            });
+            let anchor = tablekit::ScrollAnchor {
+                model_changed,
+                prefer_key,
+                key_of: &key_of,
+            };
             let avail = tablekit::table_avail(ui);
             let clicked = tablekit::scrolled_rows(
                 "modules",
@@ -626,7 +732,7 @@ pub fn show(
                 rows.len(),
                 (!state.filter.trim().is_empty()).then_some(i18n::tr(K::NoMatches)),
                 focus,
-                None,
+                Some(anchor),
                 |ui, table, _avail, _content_width, range| {
                     for index in range {
                         let Some(row) = rows.get(index) else {
@@ -707,7 +813,7 @@ pub fn show(
                             let unload = menu::item_enabled(
                                 ui,
                                 i18n::tr(K::UnloadModule),
-                                can_unload && !state.unload.busy() && !state.fetch.busy(),
+                                can_unload && !state.unloading(),
                             )
                             .on_disabled_hover_text(i18n::tr(K::ModuleBusy));
                             if unload.clicked() {
@@ -734,9 +840,6 @@ pub fn show(
         }
     }
 
-    if request_refresh {
-        begin_fetch(state, app.actions.clone(), &ctx);
-    }
     if let Some(module) = request_unload {
         state.pending_unload = Some(module);
     }
@@ -901,6 +1004,36 @@ mod tests {
             cycles_delta: None,
             activity,
         }
+    }
+
+    #[test]
+    fn a_failed_refresh_keeps_the_shown_list() {
+        let mut load = LoadState::Ready(vec![module("a.dll", 1, 1)]);
+        assert_eq!(
+            merge_fetch(&mut load, Err("busy".into())).as_deref(),
+            Some("busy")
+        );
+        assert!(matches!(&load, LoadState::Ready(list) if list.len() == 1));
+        assert_eq!(
+            merge_fetch(
+                &mut load,
+                Ok(vec![module("b.dll", 2, 1), module("a.dll", 1, 1)])
+            ),
+            None
+        );
+        assert!(matches!(&load, LoadState::Ready(list) if list[0].name == "a.dll"));
+        // Without a list to keep, the failure is the page's content.
+        let mut load = LoadState::Loading;
+        assert_eq!(merge_fetch(&mut load, Err("denied".into())), None);
+        assert!(matches!(&load, LoadState::Error(error) if error == "denied"));
+    }
+
+    #[test]
+    fn a_routine_refresh_delays_an_unload_instead_of_refusing_it() {
+        assert_eq!(unload_gate(false, false), UnloadGate::Start);
+        assert_eq!(unload_gate(true, false), UnloadGate::Queue);
+        assert_eq!(unload_gate(false, true), UnloadGate::Busy);
+        assert_eq!(unload_gate(true, true), UnloadGate::Busy);
     }
 
     const DORMANT: Activity = Activity::Dormant {

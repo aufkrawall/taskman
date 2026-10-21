@@ -20,7 +20,8 @@ use crate::tabs::inspector::{self, Poll};
 use crate::theme;
 use crate::widgets::tablekit::{self, TmColumn};
 
-const REFRESH_EVERY: Duration = Duration::from_secs(2);
+/// Fastest refresh; slower update speeds slow it down, Paused stops it.
+const REFRESH_FLOOR: Duration = Duration::from_secs(2);
 const TABLE_ID: &str = "proc_network";
 
 type Key = (
@@ -32,6 +33,10 @@ type Key = (
 pub struct State {
     poll: Poll<Vec<ProcessConnection>>,
     rows: Option<Result<Vec<ProcessConnection>, String>>,
+    /// Why the newest refresh failed while older rows are still shown.
+    stale: Option<String>,
+    /// New rows arrived since the table last drew them.
+    fresh: bool,
     selected: Option<Key>,
     sort: usize,
     ascending: bool,
@@ -42,10 +47,19 @@ impl Default for State {
         Self {
             poll: Poll::default(),
             rows: None,
+            stale: None,
+            fresh: false,
             selected: None,
             sort: 0,
             ascending: true,
         }
+    }
+}
+
+impl State {
+    /// F5: query again now, whatever the update speed.
+    pub fn request_refresh(&mut self) {
+        self.poll.request();
     }
 }
 
@@ -56,16 +70,19 @@ fn key_of(connection: &ProcessConnection) -> Key {
 pub fn tick(state: &mut State, app: &TaskManApp, ctx: &egui::Context, identity: &ProcessIdentity) {
     if let Some(result) = state.poll.take() {
         // Stale by the time it arrived: the PID may now name another process.
-        state.rows = Some(if app.identity_is_live(identity) {
+        let result = if app.identity_is_live(identity) {
             result
         } else {
             Err(i18n::tr(K::ProcessExited).to_string())
-        });
+        };
+        state.fresh = true;
+        inspector::merge(&mut state.rows, &mut state.stale, result);
     }
     if !app.actions.capabilities().process_connections || !app.identity_is_live(identity) {
         return;
     }
-    if state.poll.due(Instant::now(), Some(REFRESH_EVERY)) {
+    let every = inspector::page_interval(app.shared.settings.update_speed, REFRESH_FLOOR);
+    if state.poll.due(Instant::now(), every) {
         let actions = app.actions.clone();
         let pid = identity.pid;
         state.poll.start(ctx, "tm-connections", move || {
@@ -74,7 +91,9 @@ pub fn tick(state: &mut State, app: &TaskManApp, ctx: &egui::Context, identity: 
                 .map_err(|error| error.to_string())
         });
     }
-    ctx.request_repaint_after(REFRESH_EVERY);
+    if let Some(every) = every {
+        ctx.request_repaint_after(every);
+    }
 }
 
 fn protocol_label(protocol: ConnectionProtocol) -> &'static str {
@@ -159,6 +178,9 @@ pub fn show(
         }
         Some(Ok(rows)) => rows,
     };
+    if let Some(error) = state.stale.as_deref() {
+        ui.label(egui::RichText::new(error).small().color(pal.heat_high));
+    }
     let mut rows: Vec<&ProcessConnection> = rows.iter().collect();
     rows.sort_by(|a, b| tablekit::directed(compare(a, b, state.sort), state.ascending));
 
@@ -185,6 +207,17 @@ pub fn show(
     let mut table = app
         .make_table(TABLE_ID, cols)
         .with_row_height(tablekit::ROW_H_DENSE);
+    // Connections open and close between refreshes; keep the rows on screen
+    // where they are, preferring the selected one.
+    let key_of_row = |index: usize| {
+        rows.get(index)
+            .map_or(u64::MAX, |row| tablekit::stable_key(key_of(row)))
+    };
+    let anchor = tablekit::ScrollAnchor {
+        model_changed: std::mem::take(&mut state.fresh),
+        prefer_key: state.selected.map(tablekit::stable_key),
+        key_of: &key_of_row,
+    };
     let avail = tablekit::table_avail(ui);
     let mut clicked_key = None;
     let clicked = tablekit::scrolled_rows(
@@ -198,7 +231,7 @@ pub fn show(
         rows.len(),
         Some(i18n::tr(K::NoConnections)),
         None,
-        None,
+        Some(anchor),
         |ui, table, _avail, _content_width, range| {
             for index in range {
                 let Some(row) = rows.get(index) else {

@@ -11,7 +11,9 @@
   rates, and the services it hosts (double-click or "Go to service(s)" jumps
   to the Services page). The thread list also works for service and SYSTEM
   processes without administrator rights; their start addresses and cycle
-  counts need thread access and read "—" where Windows denies it.
+  counts need thread access and read "—" where Windows denies it. All list
+  pages refresh themselves while shown, at the update speed (frozen while
+  paused), and F5 refreshes the open page.
 - **Dormant threads and modules are marked:** a thread that went at least
   5 s without being scheduled once, and without using CPU time or cycles, is
   labelled *Dormant* and dimmed ("Hide dormant" filters them). On the Modules
@@ -28,8 +30,10 @@
 
 - **Modules moved into Process Properties:** the module list, including
   unload, is now the Modules page of the properties dialog and gains Threads
-  and Activity columns. The separate "View modules" context-menu entry and
-  button are gone.
+  and Activity columns. It now updates itself — DLLs loaded later appear
+  without a manual refresh — so its Refresh button is gone, as are the
+  separate "View modules" context-menu entry and button. An unload confirmed
+  during a refresh waits for it instead of failing.
 
 - **One Performance card per physical disk:** disks are listed like Task
   Manager — "Disk 0 (C: D:)" — instead of one card per drive letter, which

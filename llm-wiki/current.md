@@ -781,7 +781,12 @@ rebase runbook.
   module is dormant only when every thread STARTED in it is; a module that
   starts no thread is never judged, and an unknown start address anywhere
   blocks the dormant verdict. Modules is no longer a separate dialog or
-  context-menu entry.
+  context-menu entry. The pages have no Refresh buttons: they re-query at the
+  update speed (floors: Threads 1 s, Modules/Network 2 s, Services 5 s),
+  freeze while Paused, and F5 inside the dialog refreshes the open page plus
+  the engine sample (the global F5 is gated off while any dialog is up). A
+  module unload confirmed during a background refresh is queued behind it
+  (`unload_gate`), never refused.
 - The on-demand Modules page enumerates DLL name/path/base/size outside the
   hot sampling path. Unload is an explicitly dangerous, confirmation-gated
   action the user aims at ANY enumerated module (no protected-module concept);

@@ -1,3 +1,10 @@
+- 2026-10-21 (live properties pages): user asked why the module list
+  needed a Refresh button — it loaded once. Modules and Services now refresh
+  at the update speed like Threads/Network, Paused freezes them, and F5 works
+  inside Process Properties (it was dead there: `route_global_keyboard`
+  returns while a modal is open). Main-page "Refresh now (F5)" menu entries
+  stay: native TM parity and the only sample while Paused. Scroll anchoring
+  added to all four live tables.
 - 2026-10-21 (dialog buttons): user report — the primary button of every
   two-button confirmation was accent-FILLED with a white focus ring (leftover
   theming). `dialog_button_row` and `_mirror` now share `dialog_row_button`:
