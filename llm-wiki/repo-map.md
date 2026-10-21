@@ -89,7 +89,7 @@ platform boundary (`tm-core` ← `tm-platform` ← `tm-app` / `tm-service`), and
     from `Microsoft-Windows-Kernel-Network`; the session name MUST stay fixed
     per role — a pid in it leaks an orphaned session on every kill until the
     provider stops delivering events), `disk_etw.rs` (per-process DISK service
-    time from `Microsoft-Windows-Kernel-Disk`, attributed by `IssuingThreadId`
+    time per physical disk (`DiskNumber`) from `Microsoft-Windows-Kernel-Disk`, attributed by `IssuingThreadId`
     through a thread map seeded from ToolHelp and maintained by the
     `Microsoft-Windows-Kernel-Process` thread events; a request whose thread
     cannot be mapped is never charged to a row),

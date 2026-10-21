@@ -28,7 +28,14 @@
   `session_gpu_is_the_busiest_engine_not_the_sum`,
   `arrows_keep_focus_in_the_search_field`,
   `search_caret_shows_as_soon_as_the_field_gets_the_keyboard`.
-  Follow-ups from a read-only row-vs-total audit (open):
+  Follow-ups from a read-only row-vs-total audit — status after the same
+  day's follow-up pass (`43c5212`, `c86b7a2`): DONE — per-disk Disk active
+  time + carried shares + one card per physical disk (protocol v7); DPC+ISR
+  from the core records; held pseudo-rows show current values; network
+  header = busiest adapter/direction; loopback excluded; mock CPU total.
+  Deliberately left (see `known-debt.md` § Row/total audit leftovers): >64-LP
+  processor groups, startup impact attribution, Disk I/O column semantics.
+  Original list:
   - Verified: per-process disk active time is a share of service time summed
     over ALL disks scaled by the BUSIEST disk's active % (`disk_active_pct`,
     `DiskNumber` never decoded), so a process saturating a slow disk can read

@@ -322,6 +322,36 @@ remain follow-up rather than being simulated in headless tests:
     Performance page still shows 0 threads; Linux/macOS disk byte rates read
     0 B/s on the first sample (the model has no unknown rate).
 
+## Row/total audit leftovers (2026-10-21)
+
+Found by the 2026-10-21 row-vs-total audit and deliberately not changed:
+
+- **CPU on >64 logical processors:** `cpu_load::query_cores` uses
+  `NtQuerySystemInformation(SystemProcessorPerformanceInformation)` and
+  `GetSystemInfo`, both limited to the calling thread's processor group,
+  while process CPU times span all groups. On such machines per-process % is
+  measured against group 0's capacity (inflated) and the header covers group
+  0 only. Fix: `GetActiveProcessorCount(ALL_PROCESSOR_GROUPS)` and one
+  `NtQuerySystemInformationEx` call per group (needs an ntdll FFI
+  declaration; the `windows` crate lacks it), keeping per-core indices in
+  sync with sysinfo's CPU list. Not done because no >64-LP machine was
+  available to validate it.
+- **Startup impact is keyed by image path** and uses `IO_COUNTERS` bytes, so a
+  shared image (`powershell.exe`, `rundll32.exe`, a browser) is charged for
+  every instance in the boot window, including network/pipe bytes.
+  Restricting it to the processes a startup entry launched needs launch-tree
+  heuristics; the module docs state the current rule.
+- **Disk I/O column vs its header:** rows are `IO_COUNTERS` bytes/s (cache
+  hits, pipes, sockets), the header is the busiest disk's active %. This is
+  the documented 2026-09-11 design (`Disk I/O` = bytes a process asked for;
+  `Disk active time` = what reached a disk), not an oversight.
+- **Loopback:** only 127.0.0.0/8, ::1 and ::ffff:127/104 are excluded from
+  per-process network; traffic to the machine's own adapter address also
+  stays inside the stack but is still counted.
+- `process_ops::tests::service_catalog_discovers_active_services` is
+  timing-sensitive on a live system (a svchost can change between the SCM
+  catalog and the command-line read); seen failing once, passing on rerun.
+
 ## Falsified findings — do not re-raise
 
 - "heat_cells discovers maxima from one row" — fixed 2026-08-26 (P0.2);
@@ -332,6 +362,9 @@ remain follow-up rather than being simulated in headless tests:
 
 ## Per-process disk active time
 
+- Shares are per physical disk (`DiskNumber` of the `DiskIo` record = the
+  `PhysicalDrive<n>` number of the PDH `PhysicalDisk` instance). The
+  number match is asserted only in the ignored elevated integration test.
 - `Disk active time` is measured, so it is only available where an ETW session
   can run: through the LocalSystem broker (the normal install) or in an
   elevated GUI. Without either it renders "—", like the Network column.

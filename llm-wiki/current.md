@@ -1,6 +1,6 @@
 # Current State
 
-Last cross-checked: 2026-10-02
+Last cross-checked: 2026-10-21
 
 ## Summary
 
@@ -14,6 +14,29 @@ correctness, table interaction, Performance visuals, and advanced process
 diagnostics; remaining telemetry and accessibility work is itemized precisely
 in `known-debt.md`. Normal GUI startup remains unelevated; privileged controls
 can cross a protected, allowlisted service boundary after one explicit install.
+
+## Row/total consistency (2026-10-21)
+
+Invariant: a row — a process, an app family, a Users session/app rollup —
+can never exceed the header total it is shown under, because both are built
+from the same device set with the same "busiest device" rule:
+
+- **GPU:** an engine's load is the SUM of every process's share of it; the
+  adapter is its busiest engine, the header the busiest adapter. Per-process
+  values cover only the adapters `gpu::merge` produced (the software Basic
+  Render Driver is hidden when real hardware exists). Groups aggregate per
+  engine through `GpuGroupLoad` (`ProcessEntry::gpu_engines`).
+- **Disk active time:** per physical disk — a process's share of THAT disk's
+  service time times THAT disk's PDH active %; the row is its busiest disk,
+  groups go through `DiskGroupLoad` (`ProcessEntry::disk_active_by_disk`).
+  `snap.disks` is one entry per physical disk (`DiskInfo::number`), including
+  disks without a drive letter, so header and rows cover the same disks.
+- **Network header:** busiest adapter in its busiest direction (full
+  duplex); loopback traffic is excluded from per-process bytes.
+- **CPU:** "System interrupts" = DPC + ISR time from the same per-core
+  records/window as the unattributed residual it is split from.
+- **Sorting:** App roots sort by the values their rows display, not by a
+  separate subtree sum.
 
 ## Process identity for protected processes (2026-10-02)
 
