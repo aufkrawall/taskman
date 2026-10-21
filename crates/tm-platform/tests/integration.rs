@@ -1012,4 +1012,17 @@ fn disk_trace_attributes_real_requests_to_the_issuing_process() {
         attributed * 2 >= total,
         "most disk time was unattributable: {attributed} of {total}"
     );
+    // Per-disk bookkeeping: `DiskNumber` is the `PhysicalDrive<n>` number the
+    // PhysicalDisk counters key on, so a misread shows up as a garbage disk.
+    eprintln!("disk totals = {:?}", window.disk_totals);
+    let per_disk: u64 = window.disk_totals.iter().map(|t| t.service_time).sum();
+    assert_eq!(per_disk, total, "per-disk totals must cover every request");
+    assert!(
+        window.disk_totals.iter().all(|t| t.disk < 1024),
+        "implausible disk number - the DiskNumber offset is wrong"
+    );
+    for disk in window.procs.values() {
+        let split: u64 = disk.per_disk.iter().map(|t| t.service_time).sum();
+        assert_eq!(split, disk.service_time);
+    }
 }

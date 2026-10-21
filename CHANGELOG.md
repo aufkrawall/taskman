@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+### Changed
+
+- **One Performance card per physical disk:** disks are listed like Task
+  Manager — "Disk 0 (C: D:)" — instead of one card per drive letter, which
+  showed two volumes of one disk as two cards each claiming the whole disk's
+  activity. Disks without a drive letter now get a card too (capacity rows
+  are omitted for them). The core service protocol moves to v7, so the
+  service must be updated together with the app.
+
 ### Fixed
 
 - **GPU rows above the GPU total:** a process rendering on the software
@@ -44,6 +53,15 @@
   127.0.0.0/8 or ::1 (a local database or dev server) was counted as network
   traffic although it never reaches an adapter; it is now excluded, also from
   the Users and App history network totals.
+- **Disk active time attributed across the wrong disk:** a process's Disk
+  active time was its share of the service time summed over every disk,
+  scaled by the busiest disk, so a process saturating a slow disk could read
+  a few percent next to a busy fast disk, and two processes each saturating
+  their own disk read 50 % apiece. Each process now gets its share of the
+  disk that served it, scaled by that disk's own active time, and shows its
+  busiest disk; app families and Users rows show their busiest disk instead
+  of a sum. A reading carried over a very short refresh window now follows
+  the disks' current activity instead of keeping its old percentage.
 - **GPU engine column named the wrong GPU:** the Details "GPU engine" label
   used the adapter's internal node index, so every GPU read "GPU 0"; it now
   uses the GPU number shown on the Performance page.

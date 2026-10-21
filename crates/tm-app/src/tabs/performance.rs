@@ -2130,24 +2130,28 @@ fn disk_page(app: &mut TaskManApp, ui: &mut egui::Ui, pal: &Palette, entry: &Res
                         &format!("{:.1} ms", disk.avg_resp_ms),
                     );
                 }
-                kv_row(
-                    ui,
-                    pal,
-                    i18n::tr(K::KvCapacity),
-                    &format::format_bytes_loc(disk.total_bytes),
-                );
-                kv_row(
-                    ui,
-                    pal,
-                    i18n::tr(K::KvUsedSpace),
-                    &format::format_bytes_loc(disk.total_bytes - disk.free_bytes),
-                );
-                kv_row(
-                    ui,
-                    pal,
-                    i18n::tr(K::KvFreeSpace),
-                    &format::format_bytes_loc(disk.free_bytes),
-                );
+                // A disk without a mounted volume has no formatted capacity
+                // to report; "0 B" would be a fabricated measurement.
+                if disk.total_bytes > 0 {
+                    kv_row(
+                        ui,
+                        pal,
+                        i18n::tr(K::KvCapacity),
+                        &format::format_bytes_loc(disk.total_bytes),
+                    );
+                    kv_row(
+                        ui,
+                        pal,
+                        i18n::tr(K::KvUsedSpace),
+                        &format::format_bytes_loc(disk.total_bytes - disk.free_bytes),
+                    );
+                    kv_row(
+                        ui,
+                        pal,
+                        i18n::tr(K::KvFreeSpace),
+                        &format::format_bytes_loc(disk.free_bytes),
+                    );
+                }
             });
         },
     );

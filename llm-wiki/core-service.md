@@ -36,7 +36,7 @@ contract.
 
 ## IPC and authorization
 
-- Protocol v6 uses `\\.\pipe\Taskman.Core.v1` with fixed 12-byte framed JSON.
+- Protocol v7 uses `\\.\pipe\Taskman.Core.v1` with fixed 12-byte framed JSON.
   Requests are capped at 64 KiB and responses at 512 KiB; unknown request
   fields are rejected.
 - The pipe rejects remote clients and uses first-instance creation to prevent
@@ -164,7 +164,10 @@ GUI to run elevated to fill one column. Protocol v6 adds `ProcessIdentity`, the
 same identity-bound read-only shape for one process's token identity, because
 an interactive token cannot open the tokens of SYSTEM/service processes at
 all and the User name / Elevated columns of those rows would otherwise stay
-blank. Both counter endpoints take no
+blank. Protocol v7 splits the disk service time by physical disk (`disks` per
+entry, `disk_totals` per window) because Disk active time is now a per-disk
+share; its frame budget is two caps (`DISK_MAX_ENTRIES`,
+`DISK_MAX_DISK_TIMES`), pinned by `a_capped_disk_response_fits_the_frame_limit`. Both counter endpoints take no
 parameters, can change nothing, drain or prune server-side against the
 service's own idea of which PIDs are live, are capped per response, and stop
 their trace on an idle watchdog once the GUI stops polling. These reads are allowed for the same pinned GUI that already has

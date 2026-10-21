@@ -32,6 +32,12 @@ pub fn snapshot(seed: u32) -> Snapshot {
     let mut p3 = ProcessEntry::new(4, "System");
     p3.category = ProcCategory::System;
 
+    // The machine total covers the rows plus some load nobody owns, and the
+    // per-core values average to it — a mock whose header sat below its own
+    // rows taught nothing about the header/row invariant.
+    let busy = (p1.cpu_pct + p2.cpu_pct + (s * 2.9) % 20.0).min(100.0);
+    let swing = busy.min(100.0 - busy).min(5.0);
+
     Snapshot {
         timestamp_ms: now,
         sample_duration_ms: 1,
@@ -41,8 +47,16 @@ pub fn snapshot(seed: u32) -> Snapshot {
             brand: "Mock CPU 8-Core".into(),
             vendor: "MockVendor".into(),
             architecture: "x86_64".into(),
-            utilization_pct: ((s * 11.0) % 100.0),
-            per_core_pct: (0..8).map(|i| (s * (i as f32 + 1.0)) % 100.0).collect(),
+            utilization_pct: busy,
+            per_core_pct: (0..8)
+                .map(|i| {
+                    if i % 2 == 0 {
+                        busy + swing
+                    } else {
+                        busy - swing
+                    }
+                })
+                .collect(),
             freq_mhz: 3400.0,
             freq_base_mhz: 3200.0,
             logical_count: 8,
@@ -79,6 +93,7 @@ pub fn snapshot(seed: u32) -> Snapshot {
         },
         disks: vec![DiskInfo {
             id: "0 (C:)".into(),
+            number: Some(0),
             mount: "C:\\".into(),
             label: "System".into(),
             media: MediaKind::SsdNvme,
@@ -175,6 +190,23 @@ pub fn sleep_ms(ms: u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The mock keeps the invariant the real collectors keep: the CPU total
+    /// covers its rows and is the mean of its cores.
+    #[test]
+    fn mock_cpu_total_covers_rows_and_matches_cores() {
+        for seed in 0..64 {
+            let snap = snapshot(seed);
+            let rows: f32 = snap.processes.iter().map(|p| p.cpu_pct).sum();
+            assert!(rows <= snap.cpu.utilization_pct + 1e-3, "seed {seed}");
+            let mean =
+                snap.cpu.per_core_pct.iter().sum::<f32>() / snap.cpu.per_core_pct.len() as f32;
+            assert!(
+                (mean - snap.cpu.utilization_pct).abs() < 1e-3,
+                "seed {seed}"
+            );
+        }
+    }
 
     #[test]
     fn mock_snapshot_is_deterministic_per_seed() {

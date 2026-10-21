@@ -166,9 +166,14 @@ impl MediaKind {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct DiskInfo {
-    /// Stable per-boot identifier, e.g. Windows "0 (C:)", Linux "nvme0n1", macOS "disk0".
+    /// Stable per-boot identifier, e.g. Windows "0 (C: D:)", Linux "nvme0n1", macOS "disk0".
     pub id: String,
-    /// Primary mount point / volume letter path.
+    /// Physical disk number where the platform reports one (Windows
+    /// `PhysicalDrive<n>`); the key per-process disk shares refer to.
+    #[serde(default)]
+    pub number: Option<u32>,
+    /// Primary mount point / volume letter path; a disk without a mounted
+    /// volume carries its device path instead, so this stays a unique key.
     pub mount: String,
     /// Volume label if any.
     pub label: String,
@@ -195,6 +200,14 @@ impl DiskInfo {
             (self.total_bytes - self.free_bytes) as f32 / self.total_bytes as f32 * 100.0
         }
     }
+}
+
+/// One physical disk's active time spent on one process.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct DiskActiveShare {
+    /// Physical disk number (`DiskInfo::number`).
+    pub disk: u32,
+    pub active_pct: f32,
 }
 
 // ---------------------------------------------------------------- network
@@ -256,6 +269,55 @@ pub struct GpuEngineShare {
     pub util_pct: f32,
 }
 
+/// Load of a GROUP of processes on resources that are shared by time
+/// slicing: shares of ONE resource (a GPU engine, a disk) add up across the
+/// members, different resources do not, and the busiest resource wins — the
+/// same rule the machine total applies, so a group can never exceed it.
+#[derive(Debug, Clone)]
+struct BusiestShare<K> {
+    per_resource: std::collections::HashMap<K, f32>,
+    /// Load of members whose backend reports no per-resource breakdown.
+    /// Nothing says they shared a resource, so they keep the plain sum.
+    unattributed: f32,
+    known: bool,
+}
+
+impl<K> Default for BusiestShare<K> {
+    fn default() -> Self {
+        Self {
+            per_resource: std::collections::HashMap::new(),
+            unattributed: 0.0,
+            known: false,
+        }
+    }
+}
+
+impl<K: std::hash::Hash + Eq> BusiestShare<K> {
+    fn add(&mut self, own: Option<f32>, shares: impl ExactSizeIterator<Item = (K, f32)>) {
+        let Some(own) = own else { return };
+        self.known = true;
+        if shares.len() == 0 {
+            self.unattributed += own;
+            return;
+        }
+        for (resource, pct) in shares {
+            *self.per_resource.entry(resource).or_insert(0.0) += pct;
+        }
+    }
+
+    /// `None` when no member was measured — an unmeasured group is not an
+    /// idle one.
+    fn pct(&self) -> Option<f32> {
+        self.known.then(|| {
+            self.per_resource
+                .values()
+                .copied()
+                .fold(self.unattributed, f32::max)
+                .clamp(0.0, 100.0)
+        })
+    }
+}
+
 /// GPU utilization of a GROUP of processes (an app family, a user), with the
 /// same busiest-engine semantics as one process and one adapter.
 ///
@@ -264,40 +326,43 @@ pub struct GpuEngineShare {
 /// leave no engine above 80 %, yet the sum reads 130 % under a machine total
 /// of 80 %. Shares of the same engine add up; the busiest engine wins.
 #[derive(Debug, Clone, Default)]
-pub struct GpuGroupLoad {
-    per_engine: std::collections::HashMap<(usize, u32), f32>,
-    /// Utilization of members whose backend reports no engine breakdown.
-    /// Nothing says they shared an engine, so they keep the plain sum.
-    unattributed: f32,
-    known: bool,
-}
+pub struct GpuGroupLoad(BusiestShare<(usize, u32)>);
 
 impl GpuGroupLoad {
     pub fn add(&mut self, p: &ProcessEntry) {
-        let Some(own) = p.gpu_util_pct else { return };
-        self.known = true;
-        if p.gpu_engines.is_empty() {
-            self.unattributed += own;
-            return;
-        }
-        for share in &p.gpu_engines {
-            *self
-                .per_engine
-                .entry((share.adapter, share.engine))
-                .or_insert(0.0) += share.util_pct;
-        }
+        self.0.add(
+            p.gpu_util_pct,
+            p.gpu_engines
+                .iter()
+                .map(|share| ((share.adapter, share.engine), share.util_pct)),
+        );
     }
 
-    /// `None` when no member was measured — an unmeasured group is not an
-    /// idle one.
+    /// `None` when no member was measured.
     pub fn util_pct(&self) -> Option<f32> {
-        self.known.then(|| {
-            self.per_engine
-                .values()
-                .copied()
-                .fold(self.unattributed, f32::max)
-                .clamp(0.0, 100.0)
-        })
+        self.0.pct()
+    }
+}
+
+/// Disk active time of a GROUP of processes, with the same busiest-disk
+/// semantics as one process and the machine total: two members each keeping
+/// their own disk 60 % busy leave no disk above 60 %, not 120 %.
+#[derive(Debug, Clone, Default)]
+pub struct DiskGroupLoad(BusiestShare<u32>);
+
+impl DiskGroupLoad {
+    pub fn add(&mut self, p: &ProcessEntry) {
+        self.0.add(
+            p.disk_active_pct,
+            p.disk_active_by_disk
+                .iter()
+                .map(|share| (share.disk, share.active_pct)),
+        );
+    }
+
+    /// `None` when no member was measured.
+    pub fn active_pct(&self) -> Option<f32> {
+        self.0.pct()
     }
 }
 
@@ -508,8 +573,16 @@ pub struct ProcessEntry {
     /// in a loop tops that column while the disk is idle, and a process
     /// thrashing the page file barely appears. Measured from disk events, so
     /// it is `None` (rendered "—") wherever those are unavailable.
+    ///
+    /// Per DISK: the share of that disk's service time this process caused,
+    /// times that disk's own active time; the row is its busiest disk, like
+    /// the header is the busiest disk.
     #[serde(default)]
     pub disk_active_pct: Option<f32>,
+    /// The disks this process kept busy (non-zero values only); what group
+    /// rows aggregate through [`DiskGroupLoad`].
+    #[serde(default)]
+    pub disk_active_by_disk: Vec<DiskActiveShare>,
     /// Bytes per second this process actually moved to or from a physical
     /// disk, as measured at the disk, not at the file API.
     #[serde(default)]
@@ -628,6 +701,7 @@ impl ProcessEntry {
             disk_read_total: 0,
             disk_write_total: 0,
             disk_active_pct: None,
+            disk_active_by_disk: Vec::new(),
             disk_phys_read_bps: None,
             disk_phys_write_bps: None,
             io_ops_per_s: None,
@@ -910,6 +984,35 @@ mod tests {
         load.add(&a);
         load.add(&b);
         assert_eq!(load.util_pct(), Some(25.0));
+    }
+
+    /// A group's disk active time is its busiest disk: shares of one disk
+    /// add up, different disks do not.
+    #[test]
+    fn disk_group_load_sums_per_disk_and_takes_the_busiest() {
+        let on = |pid, shares: &[(u32, f32)]| {
+            let mut p = ProcessEntry::new(pid, "io.exe");
+            p.disk_active_by_disk = shares
+                .iter()
+                .map(|&(disk, active_pct)| DiskActiveShare { disk, active_pct })
+                .collect();
+            p.disk_active_pct = Some(shares.iter().map(|s| s.1).fold(0.0, f32::max));
+            p
+        };
+        let mut load = DiskGroupLoad::default();
+        load.add(&on(1, &[(0, 60.0)]));
+        load.add(&on(2, &[(1, 60.0)]));
+        assert_eq!(load.active_pct(), Some(60.0), "two disks, not 120 %");
+        load.add(&on(3, &[(0, 15.0), (1, 5.0)]));
+        assert_eq!(load.active_pct(), Some(75.0));
+
+        let mut unknown = DiskGroupLoad::default();
+        unknown.add(&ProcessEntry::new(4, "plain.exe"));
+        assert_eq!(unknown.active_pct(), None);
+        let mut idle = ProcessEntry::new(5, "idle.exe");
+        idle.disk_active_pct = Some(0.0);
+        unknown.add(&idle);
+        assert_eq!(unknown.active_pct(), Some(0.0));
     }
 
     #[test]

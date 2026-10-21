@@ -11,7 +11,7 @@ use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 use tm_core::i18n::{self, K};
-use tm_core::model::{GpuGroupLoad, UserSession};
+use tm_core::model::{DiskGroupLoad, GpuGroupLoad, UserSession};
 
 use crate::app::TaskManApp;
 use crate::icons::Icon;
@@ -120,7 +120,9 @@ struct Roll {
     /// Per column: did ANY process in this rollup produce a reading?
     known: [bool; VALUE_COLS],
     count: usize,
-    /// GPU is the busiest engine across the members, not their sum.
+    /// Disk active time and GPU are the busiest disk / engine across the
+    /// members, not their sum.
+    disk: DiskGroupLoad,
     gpu: GpuGroupLoad,
 }
 
@@ -130,6 +132,7 @@ impl Roll {
             values: [0.0; VALUE_COLS],
             known: ALWAYS_KNOWN,
             count: 0,
+            disk: DiskGroupLoad::default(),
             gpu: GpuGroupLoad::default(),
         }
     }
@@ -146,8 +149,9 @@ impl Roll {
                 p.net_recv_bps.unwrap_or(0.0) + p.net_sent_bps.unwrap_or(0.0);
             self.known[value_columns::NET] = true;
         }
-        if let Some(pct) = p.disk_active_pct {
-            self.values[value_columns::DISK_ACT] += f64::from(pct);
+        self.disk.add(p);
+        if let Some(pct) = self.disk.active_pct() {
+            self.values[value_columns::DISK_ACT] = f64::from(pct);
             self.known[value_columns::DISK_ACT] = true;
         }
         self.gpu.add(p);
@@ -187,7 +191,8 @@ enum URow {
         session: u32,
         name: String,
         exe: Option<String>,
-        roll: Roll,
+        /// Boxed: the rollup carries its per-disk/per-engine accumulators.
+        roll: Box<Roll>,
     },
 }
 
@@ -463,7 +468,7 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
                     session: s.id,
                     name: name.clone(),
                     exe: entry.exe.clone(),
-                    roll: entry.roll.clone(),
+                    roll: Box::new(entry.roll.clone()),
                 });
             }
         }
@@ -471,7 +476,7 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
 
     let heat_max = HeatMax::over(rows.iter().map(|r| match r {
         URow::User(i) => &aggs[&sessions[*i].id].roll,
-        URow::App { roll, .. } => roll,
+        URow::App { roll, .. } => &**roll,
     }));
 
     // While a dialog is up it owns the keyboard: the page's nav, row keys and
@@ -735,7 +740,7 @@ fn prepare_auto_fit_widths(
                     name.clone()
                 },
                 "",
-                roll,
+                &**roll,
                 88.0,
             ),
         };

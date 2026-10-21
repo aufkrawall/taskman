@@ -207,6 +207,7 @@ impl SystemCollector for MacCollector {
                     };
                     DiskInfo {
                         id: d.name().to_string_lossy().to_string(),
+                        number: None,
                         mount: d.mount_point().to_string_lossy().to_string(),
                         label: String::new(),
                         media: MediaKind::Unknown,

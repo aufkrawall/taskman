@@ -37,7 +37,8 @@ use tm_core::i18n::{self, K};
 #[cfg(target_os = "windows")]
 use tm_core::model::DumpType;
 use tm_core::model::{
-    GpuGroupLoad, ProcCategory, ProcStatus, ProcessEntry, Snapshot, is_plausible_parent,
+    DiskGroupLoad, GpuGroupLoad, ProcCategory, ProcStatus, ProcessEntry, Snapshot,
+    is_plausible_parent,
 };
 
 use crate::app::TaskManApp;
@@ -1725,22 +1726,26 @@ fn default_value_order_ids() -> Vec<String> {
     value_columns::default_ids()
 }
 
-/// Sum of the members' OWN values — except GPU, which is the busiest engine
-/// across the members like the machine total, not the sum of each member's
-/// busiest engine (see [`GpuGroupLoad`]).
+/// Sum of the members' OWN values — except Disk active time and GPU, which
+/// are the busiest disk / engine across the members like the machine totals,
+/// not the sum of each member's busiest one (see [`DiskGroupLoad`] and
+/// [`GpuGroupLoad`]).
 ///
 /// Not the subtree aggregate: a family may now leave foreign descendants
 /// outside itself, and those are rendered as their own rows. Counting them in
 /// the group row too would show the same load twice.
 fn family_values(members: &[&ProcessEntry]) -> [f64; VALUE_COLS] {
     let mut total = [0.0f64; VALUE_COLS];
+    let mut disk = DiskGroupLoad::default();
     let mut gpu = GpuGroupLoad::default();
     for member in members {
         for (slot, value) in total.iter_mut().zip(own_values(member)) {
             *slot += value;
         }
+        disk.add(member);
         gpu.add(member);
     }
+    total[DISK_ACT_VALUE] = f64::from(disk.active_pct().unwrap_or(0.0));
     total[GPU_VALUE] = f64::from(gpu.util_pct().unwrap_or(0.0));
     total
 }
@@ -3218,6 +3223,30 @@ mod tests {
     /// the values they show. Summing put a family whose members kept two
     /// different engines busy above the machine total, and the sort used a
     /// separate sum over the whole display subtree.
+    /// A family's Disk active time is its busiest disk across the members,
+    /// like the header: two members each keeping their own disk 60 % busy
+    /// read 120 % summed.
+    #[test]
+    fn family_disk_active_is_the_busiest_disk() {
+        use tm_core::model::DiskActiveShare;
+        let on = |pid, ppid, disk, active_pct| {
+            let mut p = proc(pid, ppid, "backup.exe", ProcCategory::App);
+            p.disk_active_pct = Some(active_pct);
+            p.disk_active_by_disk = vec![DiskActiveShare { disk, active_pct }];
+            p
+        };
+        let snap = snap_of(vec![
+            on(1, None, 0, 60.0),
+            on(2, Some(1), 1, 60.0),
+            on(3, Some(1), 0, 10.0),
+        ]);
+        let rows = build_display_rows(&snap, "", 0, true, &HashSet::new(), &[false; 3]);
+        let apps = rows_in_group(&rows, 0);
+        assert_eq!(apps.len(), 1);
+        assert!(apps[0].aggregate);
+        assert_eq!(apps[0].values[DISK_ACT_VALUE], 70.0);
+    }
+
     #[test]
     fn family_gpu_is_the_busiest_engine_and_sorts_as_shown() {
         use tm_core::model::GpuEngineShare;

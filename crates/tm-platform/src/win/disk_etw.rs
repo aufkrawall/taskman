@@ -31,6 +31,12 @@
 //!   classic kernel `DiskIo` record does carry `IssuingThreadId`, and the way
 //!   to subscribe to it without seizing the single global "NT Kernel Logger"
 //!   is a system-logger session on `SystemIoProviderGuid`.
+//! * **Shares are per DISK.** Each record names its `DiskNumber` (the
+//!   `PhysicalDrive<n>` number PDH's `PhysicalDisk` instances start with).
+//!   One share of the service time summed over every disk, scaled by the
+//!   busiest disk's active time, made a process saturating a slow disk read
+//!   a few percent next to a busy fast one. Windows therefore keep service
+//!   time per process AND disk, plus every disk's own total.
 //! * **Attribution is by issuing THREAD, not by event header.** Disk events
 //!   complete in whatever context the DPC ran in, so `EventHeader.ProcessId`
 //!   is usually `System`. `IssuingThreadId` from the payload is the truth, and
@@ -87,12 +93,31 @@ const MAX_PLAUSIBLE_TRANSFER: u32 = 1 << 30;
 /// from a fresh snapshot rather than growing without limit.
 const MAX_TRACKED_THREADS: usize = 250_000;
 
-/// What one process did to the disks during a window.
+/// Service time on one physical disk.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DiskTime {
+    /// Physical disk number (`DiskNumber` of the record).
+    pub disk: u32,
+    /// In the provider's own units; meaningful only as a ratio.
+    pub service_time: u64,
+}
+
+/// Add `service_time` to `disk`'s entry of a small per-disk list.
+pub fn add_disk_time(list: &mut Vec<DiskTime>, disk: u32, service_time: u64) {
+    match list.iter_mut().find(|entry| entry.disk == disk) {
+        Some(entry) => entry.service_time = entry.service_time.saturating_add(service_time),
+        None => list.push(DiskTime { disk, service_time }),
+    }
+}
+
+/// What one process did to the disks during a window.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PidDisk {
     /// Summed service time of this process's completed requests, in the
     /// provider's own units. Meaningful only as a ratio — see the module docs.
     pub service_time: u64,
+    /// The same service time split by the disk that served it.
+    pub per_disk: Vec<DiskTime>,
     /// Bytes that actually reached a disk.
     pub read_bytes: u64,
     pub write_bytes: u64,
@@ -101,13 +126,14 @@ pub struct PidDisk {
 }
 
 impl PidDisk {
-    fn add(&mut self, write: bool, size: u32, service_time: u64) {
+    fn add(&mut self, write: bool, size: u32, service_time: u64, disk: u32) {
         if write {
             self.write_bytes = self.write_bytes.saturating_add(u64::from(size));
         } else {
             self.read_bytes = self.read_bytes.saturating_add(u64::from(size));
         }
         self.service_time = self.service_time.saturating_add(service_time);
+        add_disk_time(&mut self.per_disk, disk, service_time);
         self.ops = self.ops.saturating_add(1);
     }
 }
@@ -120,6 +146,9 @@ pub struct DiskWindow {
     /// live process. Kept so the shares stay honest: it is part of the
     /// denominator, it is simply not charged to a row.
     pub unattributed_service_time: u64,
+    /// Every disk's total service time in the window, attributed or not: the
+    /// denominator of each per-disk share.
+    pub disk_totals: Vec<DiskTime>,
     /// How long this window covered, in milliseconds. Measured by the producer
     /// because only it knows when the accumulators were last reset.
     pub since_ms: u64,
@@ -139,6 +168,14 @@ impl DiskWindow {
             .fold(self.unattributed_service_time, |acc, p| {
                 acc.saturating_add(p.service_time)
             })
+    }
+
+    /// Total service time of one disk in the window, attributed or not.
+    pub fn disk_total(&self, disk: u32) -> u64 {
+        self.disk_totals
+            .iter()
+            .find(|entry| entry.disk == disk)
+            .map_or(0, |entry| entry.service_time)
     }
 
     /// Whether this window is a measurement at all.
@@ -178,6 +215,7 @@ impl DiskLayout {
 /// One disk request, as far as this module cares.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct DiskRequest {
+    disk: u32,
     thread_id: u32,
     transfer_size: u32,
     service_time: u64,
@@ -194,6 +232,7 @@ fn parse_disk_event(payload: &[u8], pointer_bytes: usize) -> Option<DiskRequest>
     if payload.len() < layout.min_len {
         return None;
     }
+    let disk = u32::from_le_bytes(payload[0..4].try_into().ok()?);
     let transfer_size = u32::from_le_bytes(payload[8..12].try_into().ok()?);
     if transfer_size > MAX_PLAUSIBLE_TRANSFER {
         return None;
@@ -212,6 +251,7 @@ fn parse_disk_event(payload: &[u8], pointer_bytes: usize) -> Option<DiskRequest>
         return None;
     }
     Some(DiskRequest {
+        disk,
         thread_id,
         transfer_size,
         service_time,
@@ -240,6 +280,8 @@ struct State {
     threads: HashMap<u32, u32>,
     totals: HashMap<u32, PidDisk>,
     unattributed_service_time: u64,
+    /// Per-disk totals of every decoded request, charged or not.
+    disk_totals: Vec<DiskTime>,
     /// Set when the thread map had to be dropped; the next collection reseeds
     /// it from a fresh snapshot.
     needs_reseed: bool,
@@ -277,11 +319,13 @@ impl Shared {
         };
         state.events_seen = state.events_seen.saturating_add(1);
         state.events_decoded = state.events_decoded.saturating_add(1);
+        add_disk_time(&mut state.disk_totals, request.disk, request.service_time);
         match state.threads.get(&request.thread_id).copied() {
             Some(pid) => state.totals.entry(pid).or_default().add(
                 write,
                 request.transfer_size,
                 request.service_time,
+                request.disk,
             ),
             None => {
                 state.unattributed_service_time = state
@@ -394,6 +438,7 @@ impl DiskUsage {
             Err(poisoned) => poisoned.into_inner(),
         };
         let unattributed = std::mem::take(&mut state.unattributed_service_time);
+        let disk_totals = std::mem::take(&mut state.disk_totals);
         let mut procs = std::mem::take(&mut state.totals);
         let events_seen = std::mem::take(&mut state.events_seen);
         let events_decoded = std::mem::take(&mut state.events_decoded);
@@ -429,6 +474,7 @@ impl DiskUsage {
         DiskWindow {
             procs,
             unattributed_service_time,
+            disk_totals,
             since_ms,
             events_seen,
             events_decoded,
@@ -511,7 +557,7 @@ mod tests {
         thread_id: u32,
     ) -> Vec<u8> {
         let mut payload = Vec::new();
-        payload.extend_from_slice(&0u32.to_le_bytes()); // DiskNumber
+        payload.extend_from_slice(&3u32.to_le_bytes()); // DiskNumber
         payload.extend_from_slice(&0u32.to_le_bytes()); // IrpFlags
         payload.extend_from_slice(&transfer_size.to_le_bytes());
         payload.extend_from_slice(&0u32.to_le_bytes()); // Reserved
@@ -530,6 +576,7 @@ mod tests {
             assert_eq!(
                 parse_disk_event(&payload, pointer_bytes),
                 Some(DiskRequest {
+                    disk: 3,
                     thread_id: 4_660,
                     transfer_size: 65_536,
                     service_time: 1_234,
@@ -592,6 +639,7 @@ mod tests {
         let shared = shared_with(HashMap::from([(100, 8), (200, 12)]));
         shared.record_request(
             DiskRequest {
+                disk: 0,
                 thread_id: 100,
                 transfer_size: 4_096,
                 service_time: 50,
@@ -600,6 +648,7 @@ mod tests {
         );
         shared.record_request(
             DiskRequest {
+                disk: 0,
                 thread_id: 100,
                 transfer_size: 8_192,
                 service_time: 70,
@@ -608,6 +657,7 @@ mod tests {
         );
         shared.record_request(
             DiskRequest {
+                disk: 0,
                 thread_id: 200,
                 transfer_size: 512,
                 service_time: 30,
@@ -619,6 +669,10 @@ mod tests {
             state.totals[&8],
             PidDisk {
                 service_time: 120,
+                per_disk: vec![DiskTime {
+                    disk: 0,
+                    service_time: 120,
+                }],
                 read_bytes: 4_096,
                 write_bytes: 8_192,
                 ops: 2,
@@ -628,12 +682,53 @@ mod tests {
         assert_eq!(state.unattributed_service_time, 0);
     }
 
+    /// Service time is kept per disk for every process AND as each disk's
+    /// own total (charged or not): the per-disk share's numerator and
+    /// denominator.
+    #[test]
+    fn service_time_is_kept_per_disk() {
+        let shared = shared_with(HashMap::from([(100, 8)]));
+        let request = |disk, thread_id, service_time| DiskRequest {
+            disk,
+            thread_id,
+            transfer_size: 4_096,
+            service_time,
+        };
+        shared.record_request(request(0, 100, 10), false);
+        shared.record_request(request(2, 100, 30), true);
+        shared.record_request(request(2, 100, 5), false);
+        shared.record_request(request(2, 400, 65), false); // unknown thread
+        let state = shared.state.lock().unwrap();
+        assert_eq!(
+            state.totals[&8].per_disk,
+            vec![
+                DiskTime {
+                    disk: 0,
+                    service_time: 10
+                },
+                DiskTime {
+                    disk: 2,
+                    service_time: 35
+                },
+            ]
+        );
+        assert_eq!(state.totals[&8].service_time, 45);
+        let window = DiskWindow {
+            disk_totals: state.disk_totals.clone(),
+            ..DiskWindow::default()
+        };
+        assert_eq!(window.disk_total(0), 10);
+        assert_eq!(window.disk_total(2), 100, "includes the unattributed 65");
+        assert_eq!(window.disk_total(7), 0);
+    }
+
     /// An unmappable thread must never have its disk time guessed onto a row.
     #[test]
     fn an_unknown_thread_becomes_an_unattributed_remainder() {
         let shared = shared_with(HashMap::new());
         shared.record_request(
             DiskRequest {
+                disk: 0,
                 thread_id: 100,
                 transfer_size: 4_096,
                 service_time: 90,
@@ -652,6 +747,7 @@ mod tests {
         shared.live.store(false, Ordering::Relaxed);
         shared.record_request(
             DiskRequest {
+                disk: 0,
                 thread_id: 100,
                 transfer_size: 4_096,
                 service_time: 90,
@@ -742,6 +838,7 @@ mod tests {
                 ),
             ]),
             unattributed_service_time: 50,
+            disk_totals: Vec::new(),
             since_ms: 1_000,
             events_seen: 3,
             events_decoded: 3,

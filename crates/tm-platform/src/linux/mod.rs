@@ -159,6 +159,7 @@ impl SystemCollector for LinuxCollector {
                 .find(|s| s.device == block || parent.as_deref() == Some(s.device.as_str()));
             disks.push(DiskInfo {
                 id: dev.clone(),
+                number: None,
                 mount,
                 label: String::new(),
                 media,

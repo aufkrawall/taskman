@@ -250,10 +250,13 @@ pub struct Sampler {
 
 /// One process's disk values from the last window that was long enough to
 /// measure. Keyed by identity so a recycled PID cannot inherit them.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct ProcDiskSample {
     start_epoch_s: Option<i64>,
-    active_pct: f32,
+    /// Share (0..=1) of each disk's service time, not the resulting %: a
+    /// carried reading is rescaled by the disks' CURRENT active time, so it
+    /// can never sit above a header that has dropped since.
+    shares: Vec<(u32, f64)>,
     read_bps: f64,
     write_bps: f64,
 }
@@ -332,23 +335,77 @@ enum DiskSource {
     Unavailable { since: Instant },
 }
 
-/// The Disk active time one process gets from a drained window: its share of
-/// the disk service time the window measured, expressed as a percentage of
-/// WALL TIME by scaling with the machine total the column header states.
+/// One process's share (0..=1) of each disk's service time in a window.
+///
+/// Per DISK: a share of the service time summed over every disk made a
+/// process saturating a slow disk read a few percent next to a busy fast
+/// one, and two processes each saturating their own disk read 50 % apiece.
+/// A disk with no measured time has no share to give.
+fn disk_shares(disk: &disk_etw::PidDisk, window: &disk_etw::DiskWindow) -> Vec<(u32, f64)> {
+    disk.per_disk
+        .iter()
+        .filter_map(|time| {
+            let total = window.disk_total(time.disk);
+            (total > 0).then(|| (time.disk, time.service_time as f64 / total as f64))
+        })
+        .collect()
+}
+
+/// The Disk active time one process gets on each disk: its share of THAT
+/// disk's service time, expressed as a percentage of WALL TIME by scaling
+/// with that disk's own active time. Disks without an active time (not in
+/// the PhysicalDisk counters, so not in the header either) are left out;
+/// zero values are dropped.
 ///
 /// The bare share is not presentable on its own. On a nearly idle disk a
 /// single request makes its issuer 100 % of all the disk work that happened,
 /// so rows flapped between 0 % and 100 % underneath a header reading 0 %.
-/// Scaling collapses that noise in proportion to how little the disks did,
-/// and bounds every row by the header.
-fn disk_active_pct(service_time: u64, total_service_time: u64, machine_active_pct: f32) -> f32 {
-    // No measured disk time at all says "nothing used a disk", which is 0 %
-    // for everyone, not a division by zero.
-    if total_service_time == 0 {
-        return 0.0;
-    }
-    (service_time as f64 / total_service_time as f64 * machine_active_pct as f64).clamp(0.0, 100.0)
-        as f32
+/// Scaling collapses that noise in proportion to how little the disk did,
+/// and bounds every row by its disk — and so by the header, the busiest one.
+fn disk_active_by_disk(
+    shares: &[(u32, f64)],
+    disk_active: &HashMap<u32, f32>,
+) -> Vec<DiskActiveShare> {
+    shares
+        .iter()
+        .filter_map(|&(disk, share)| {
+            let active = *disk_active.get(&disk)?;
+            let active_pct = (share * f64::from(active)).clamp(0.0, 100.0) as f32;
+            (active_pct > 0.0).then_some(DiskActiveShare { disk, active_pct })
+        })
+        .collect()
+}
+
+/// Fill a process's Disk active time from its per-disk shares: the busiest
+/// disk, like the header. A process that caused no disk time on a measured
+/// machine really is at 0 %.
+fn set_disk_active(
+    process: &mut ProcessEntry,
+    shares: &[(u32, f64)],
+    disk_active: &HashMap<u32, f32>,
+) {
+    let by_disk = disk_active_by_disk(shares, disk_active);
+    process.disk_active_pct = Some(
+        by_disk
+            .iter()
+            .map(|share| share.active_pct)
+            .fold(0.0, f32::max),
+    );
+    process.disk_active_by_disk = by_disk;
+}
+
+/// Physical disk number of a `PhysicalDisk` PDH instance ("0 C:", "2"), or
+/// `None` for `_Total` and anything else that is not one disk.
+fn physical_disk_number(instance: &str) -> Option<u32> {
+    instance.split_whitespace().next()?.parse().ok()
+}
+
+/// Every physical disk's active time, keyed by disk number.
+fn physical_disk_active(disk_perf: &[perfcounters::DiskPerf]) -> HashMap<u32, f32> {
+    disk_perf
+        .iter()
+        .filter_map(|perf| Some((physical_disk_number(&perf.instance)?, perf.active_pct)))
+        .collect()
 }
 
 /// What identifies a process as one of the fixed Windows system roles whose
@@ -840,10 +897,10 @@ impl Sampler {
 
     /// Fill per-process disk activity from the drained ETW window.
     ///
-    /// `disk_active_pct` is the percentage of WALL TIME the disks were busy on
-    /// this process's behalf: its share of the window's disk service time,
-    /// scaled by `machine_active_pct` — the same machine total the column
-    /// header states. It is deliberately NOT derived from
+    /// `disk_active_pct` is the percentage of WALL TIME the busiest disk it
+    /// used was busy on this process's behalf: per disk, its share of that
+    /// disk's service time scaled by that disk's active time from
+    /// `disk_active` — the same records the header's busiest disk comes from. It is deliberately NOT derived from
     /// `disk_read_bps`/`disk_write_bps`: those are the kernel's per-process
     /// I/O byte counters, which count cache hits and miss paging I/O, so the
     /// process at the top of that column is routinely not the one keeping the
@@ -859,12 +916,12 @@ impl Sampler {
     ///
     /// Every live process gets a value while the trace runs — a process that
     /// issued nothing really did cause zero disk time — and every process
-    /// keeps `None` while it does not. An unmeasured machine total likewise
-    /// leaves every row unknown: a share of an unknown total is not a number.
+    /// keeps `None` while it does not. Unmeasured disks likewise leave every
+    /// row unknown: a share of an unknown total is not a number.
     fn apply_process_disk(
         &mut self,
         processes: &mut [ProcessEntry],
-        machine_active_pct: Option<f32>,
+        disk_active: &HashMap<u32, f32>,
     ) {
         let live: HashSet<u32> = processes.iter().map(|p| p.pid).collect();
         let Some(window) = self.disk_window(&live) else {
@@ -880,7 +937,7 @@ impl Sampler {
         // process with nothing to carry stays unknown.
         const MIN_WINDOW_MS: u64 = 100;
         if window.since_ms < MIN_WINDOW_MS {
-            carry_process_disk(&self.last_proc_disk, processes);
+            carry_process_disk(&self.last_proc_disk, disk_active, processes);
             return;
         }
         // Records arrived and not one of them could be read: the payload does
@@ -890,22 +947,24 @@ impl Sampler {
         if !window.decoded() {
             return;
         }
-        let total = window.total_service_time();
         let seconds = window.since_ms as f64 / 1000.0;
+        let idle = disk_etw::PidDisk::default();
         for process in processes.iter_mut() {
             if process.synthetic {
                 continue;
             }
-            let disk = window.procs.get(&process.pid).copied().unwrap_or_default();
-            // An unmeasured machine total leaves the row unknown: a share of
-            // an unknown total is not a number.
-            process.disk_active_pct = machine_active_pct
-                .map(|machine| disk_active_pct(disk.service_time, total, machine));
+            let disk = window.procs.get(&process.pid).unwrap_or(&idle);
+            let shares = disk_shares(disk, &window);
+            // Unmeasured disks leave the row unknown: a share of an unknown
+            // total is not a number.
+            if !disk_active.is_empty() {
+                set_disk_active(process, &shares, disk_active);
+            }
             if seconds > 0.0 {
                 process.disk_phys_read_bps = Some(disk.read_bytes as f64 / seconds);
                 process.disk_phys_write_bps = Some(disk.write_bytes as f64 / seconds);
             }
-            if let (Some(active_pct), Some(read_bps), Some(write_bps)) = (
+            if let (Some(_), Some(read_bps), Some(write_bps)) = (
                 process.disk_active_pct,
                 process.disk_phys_read_bps,
                 process.disk_phys_write_bps,
@@ -914,7 +973,7 @@ impl Sampler {
                     process.pid,
                     ProcDiskSample {
                         start_epoch_s: process.start_epoch_s,
-                        active_pct,
+                        shares,
                         read_bps,
                         write_bps,
                     },
@@ -934,8 +993,13 @@ impl Sampler {
 /// The identity check is what keeps this honest: a PID that has been recycled
 /// since the reading was taken is a different process and gets unknown, not
 /// the dead one's numbers.
+///
+/// What is carried is each process's SHARE of each disk; the percentage is
+/// rebuilt from the disks' current active time. Carrying the old percentage
+/// left a row at 100 % under a header that had dropped to 0 %.
 fn carry_process_disk(
     last_proc_disk: &HashMap<u32, ProcDiskSample>,
+    disk_active: &HashMap<u32, f32>,
     processes: &mut [ProcessEntry],
 ) {
     for process in processes.iter_mut() {
@@ -948,7 +1012,9 @@ fn carry_process_disk(
         if last.start_epoch_s != process.start_epoch_s {
             continue;
         }
-        process.disk_active_pct = Some(last.active_pct);
+        if !disk_active.is_empty() {
+            set_disk_active(process, &last.shares, disk_active);
+        }
         process.disk_phys_read_bps = Some(last.read_bps);
         process.disk_phys_write_bps = Some(last.write_bps);
     }
@@ -1107,46 +1173,100 @@ impl Sampler {
         }
     }
 
-    /// Per-volume capacity plus the PDH PhysicalDisk rates for its mount.
+    /// One entry per physical disk ("Disk 0 (C: D:)", like Task Manager), with
+    /// the PDH PhysicalDisk rates and the capacity of the volumes on it.
+    ///
+    /// Per physical disk, not per volume: two volumes on one disk were two
+    /// cards each claiming the whole disk's active time and throughput, and a
+    /// disk without a drive letter had no card — while the per-process Disk
+    /// active time column is per physical disk. A volume no counter instance
+    /// claims (the counters are asleep or still warming) keeps a card of its
+    /// own with unknown activity.
     fn collect_disks(&self, disk_perf: &[perfcounters::DiskPerf]) -> Vec<DiskInfo> {
+        let volumes: Vec<(String, MediaKind, u64, u64)> = self
+            .disks
+            .list()
+            .iter()
+            .map(|d| {
+                let media = match d.kind() {
+                    sysinfo::DiskKind::SSD | sysinfo::DiskKind::HDD if d.is_removable() => {
+                        MediaKind::Usb
+                    }
+                    sysinfo::DiskKind::SSD => MediaKind::Ssd,
+                    sysinfo::DiskKind::HDD => MediaKind::Hdd,
+                    _ => MediaKind::Unknown,
+                };
+                (
+                    d.mount_point().to_string_lossy().to_string(),
+                    media,
+                    d.total_space(),
+                    d.available_space(),
+                )
+            })
+            .collect();
+        let mut physical: Vec<(u32, &perfcounters::DiskPerf)> = disk_perf
+            .iter()
+            .filter_map(|perf| Some((physical_disk_number(&perf.instance)?, perf)))
+            .collect();
+        physical.sort_by_key(|(number, _)| *number);
+        let mut claimed = vec![false; volumes.len()];
         let mut disks = Vec::new();
-        for d in self.disks.list() {
-            let mount = d.mount_point().to_string_lossy().to_string();
-            let media = match d.kind() {
-                sysinfo::DiskKind::SSD => {
-                    if d.is_removable() {
-                        MediaKind::Usb
-                    } else {
-                        MediaKind::Ssd
-                    }
-                }
-                sysinfo::DiskKind::HDD => {
-                    if d.is_removable() {
-                        MediaKind::Usb
-                    } else {
-                        MediaKind::Hdd
-                    }
-                }
-                _ => MediaKind::Unknown,
-            };
-            let perf = disk_perf.iter().find(|x| x.matches_mount(&mount));
-            let id = match perf {
-                Some(x) => physical_disk_id(&x.instance, &mount),
-                None => disk_id_for_mount(&mount),
-            };
+        for (number, perf) in physical {
+            let members: Vec<usize> = (0..volumes.len())
+                .filter(|&i| perf.matches_mount(&volumes[i].0))
+                .collect();
+            for &i in &members {
+                claimed[i] = true;
+            }
+            let letters: Vec<String> = members
+                .iter()
+                .map(|&i| disk_id_for_mount(&volumes[i].0))
+                .collect();
+            let first = members.first().map(|&i| &volumes[i]);
             disks.push(DiskInfo {
-                id,
-                mount: mount.clone(),
+                id: if letters.is_empty() {
+                    number.to_string()
+                } else {
+                    format!("{number} ({})", letters.join(" "))
+                },
+                number: Some(number),
+                // A disk without a mounted volume still needs a unique key.
+                mount: first.map_or_else(
+                    || format!(r"\\.\PhysicalDrive{number}"),
+                    |volume| volume.0.clone(),
+                ),
+                label: String::new(),
+                media: first.map_or(MediaKind::Unknown, |volume| volume.1),
+                // Formatted capacity of its volumes; 0 (rendered as unknown)
+                // for a disk none of them sit on.
+                total_bytes: members.iter().map(|&i| volumes[i].2).sum(),
+                free_bytes: members.iter().map(|&i| volumes[i].3).sum(),
+                active_pct: Some(perf.active_pct),
+                read_bps: perf.read_bps,
+                write_bps: perf.write_bps,
+                avg_resp_ms: perf.avg_resp_ms,
+                total_read_bytes: 0,
+                total_written_bytes: 0,
+            });
+        }
+        for (i, (mount, media, total_bytes, free_bytes)) in volumes.into_iter().enumerate() {
+            if claimed[i] {
+                continue;
+            }
+            disks.push(DiskInfo {
+                id: disk_id_for_mount(&mount),
+                number: None,
+                mount,
                 label: String::new(),
                 media,
-                total_bytes: d.total_space(),
-                free_bytes: d.available_space(),
+                total_bytes,
+                free_bytes,
                 // `None` while the PhysicalDisk PDH group is asleep or
                 // still warming: an unmeasured disk is not an idle one.
-                active_pct: perf.map(|x| x.active_pct),
-                read_bps: perf.map_or(0.0, |x| x.read_bps),
-                write_bps: perf.map_or(0.0, |x| x.write_bps),
-                avg_resp_ms: perf.map_or(0.0, |x| x.avg_resp_ms),
+                active_pct: None,
+                read_bps: 0.0,
+                write_bps: 0.0,
+                avg_resp_ms: 0.0,
                 total_read_bytes: 0,
                 total_written_bytes: 0,
             });
@@ -1721,23 +1841,12 @@ impl Sampler {
         // Runs after the process list is final so pruning sees exactly the
         // live PIDs, and after categories so synthetic rows can be skipped.
         self.apply_process_network(&mut processes, interval_s);
-        // The machine total the Disk active time column is a share OF. Built
-        // from the same perf records that reach `snap.disks` below, and
-        // reduced the same way `Aggregates` reduces them, so a row can never
-        // exceed the header it sits under.
-        let machine_disk_active = self
-            .disks
-            .list()
-            .iter()
-            .filter_map(|d| {
-                let mount = d.mount_point().to_string_lossy().to_string();
-                disk_perf
-                    .iter()
-                    .find(|x| x.matches_mount(&mount))
-                    .map(|x| x.active_pct)
-            })
-            .reduce(f32::max);
-        self.apply_process_disk(&mut processes, machine_disk_active);
+        // The per-disk totals the Disk active time column is a share OF. Built
+        // from the same perf records `collect_disks` turns into `snap.disks`
+        // (one per physical disk), so no row can exceed its disk's active
+        // time, nor the header — the busiest disk.
+        let disk_active = physical_disk_active(&disk_perf);
+        self.apply_process_disk(&mut processes, &disk_active);
 
         // ---- CPU attribution pseudo-rows ------------------------------------------
         // The per-core accumulators see ALL busy time; live processes cannot
@@ -2007,6 +2116,14 @@ fn disk_sample_to_window(sample: core_service::ProcessDiskSample) -> disk_etw::D
         // truncated. Reconstructing it from the entries alone would inflate
         // every share on a busy machine.
         unattributed_service_time: sample.total_service_time.saturating_sub(attributed),
+        disk_totals: sample
+            .disk_totals
+            .iter()
+            .map(|time| disk_etw::DiskTime {
+                disk: time.disk,
+                service_time: time.service_time,
+            })
+            .collect(),
         procs: sample
             .entries
             .into_iter()
@@ -2015,6 +2132,14 @@ fn disk_sample_to_window(sample: core_service::ProcessDiskSample) -> disk_etw::D
                     entry.pid,
                     disk_etw::PidDisk {
                         service_time: entry.service_time,
+                        per_disk: entry
+                            .disks
+                            .iter()
+                            .map(|time| disk_etw::DiskTime {
+                                disk: time.disk,
+                                service_time: time.service_time,
+                            })
+                            .collect(),
                         read_bytes: entry.read_bytes,
                         write_bytes: entry.write_bytes,
                         ops: entry.ops,
@@ -2424,15 +2549,6 @@ fn map_status(s: sysinfo::ProcessStatus) -> ProcStatus {
 
 fn disk_id_for_mount(mount: &str) -> String {
     mount.trim_end_matches(['\\', '/']).to_uppercase()
-}
-
-/// TM-style disk id "0 (C:)" from the PDH instance "0 C:".
-fn physical_disk_id(instance: &str, mount: &str) -> String {
-    let num = instance.split_whitespace().next().unwrap_or("0");
-    let letter = mount
-        .trim_end_matches([char::from_u32(92).unwrap(), '/'])
-        .to_uppercase();
-    format!("{num} ({letter})")
 }
 
 fn classify_adapter(internal: &str) -> String {
@@ -2912,6 +3028,36 @@ mod tests {
         assert_eq!(t.description.as_deref(), Some("rustc.exe ×5"));
     }
 
+    fn window_with(
+        procs: &[(u32, &[(u32, u64)])],
+        unattributed: &[(u32, u64)],
+    ) -> disk_etw::DiskWindow {
+        let mut window = disk_etw::DiskWindow::default();
+        for &(pid, times) in procs {
+            let mut disk = disk_etw::PidDisk::default();
+            for &(number, service_time) in times {
+                disk.service_time += service_time;
+                disk_etw::add_disk_time(&mut disk.per_disk, number, service_time);
+                disk_etw::add_disk_time(&mut window.disk_totals, number, service_time);
+            }
+            window.procs.insert(pid, disk);
+        }
+        for &(number, service_time) in unattributed {
+            disk_etw::add_disk_time(&mut window.disk_totals, number, service_time);
+        }
+        window
+    }
+
+    fn active_of(window: &disk_etw::DiskWindow, pid: u32, disk_active: &HashMap<u32, f32>) -> f32 {
+        let mut process = ProcessEntry::new(pid, "io.exe");
+        set_disk_active(
+            &mut process,
+            &disk_shares(&window.procs[&pid], window),
+            disk_active,
+        );
+        process.disk_active_pct.expect("measured")
+    }
+
     /// A row in the Disk active time column must be readable on its own, and
     /// must never exceed the machine total in the header above it.
     ///
@@ -2924,28 +3070,39 @@ mod tests {
     #[test]
     fn disk_active_time_is_wall_time_not_a_share_of_an_idle_disk() {
         // Idle disk, one process responsible for every request in the window.
-        assert_eq!(disk_active_pct(1_000, 1_000, 0.0), 0.0);
+        let window = window_with(&[(1, &[(0, 1_000)])], &[]);
+        assert_eq!(active_of(&window, 1, &HashMap::from([(0, 0.0)])), 0.0);
+        let window = window_with(&[(1, &[(0, 9_118)])], &[(0, 882)]);
         assert!(
-            disk_active_pct(9_118, 10_000, 2.32) < 2.33,
+            active_of(&window, 1, &HashMap::from([(0, 2.32)])) < 2.33,
             "a 91 % share of a 2.32 %-busy disk is at most 2.32 % of wall time"
         );
 
         // A saturated disk still reads the way it always did.
-        assert_eq!(disk_active_pct(1_000, 1_000, 100.0), 100.0);
-        assert_eq!(disk_active_pct(500, 1_000, 80.0), 40.0);
+        let window = window_with(&[(1, &[(0, 500)]), (2, &[(0, 500)])], &[]);
+        assert_eq!(active_of(&window, 1, &HashMap::from([(0, 80.0)])), 40.0);
 
         // No measured service time is zero for everyone, not a division by
         // zero and not an inherited machine total.
-        assert_eq!(disk_active_pct(0, 0, 47.0), 0.0);
+        let window = window_with(&[(1, &[])], &[]);
+        assert_eq!(active_of(&window, 1, &HashMap::from([(0, 47.0)])), 0.0);
 
-        // Whatever the split, the rows are bounded by the header and sum to
-        // it — that is what lets the header state a machine total.
+        // Whatever the split, the rows on one disk are bounded by it and sum
+        // to it — that is what lets the header state a machine total.
         let machine = 43.0;
         let parts = [120u64, 3_400, 77, 9_003, 1];
-        let total: u64 = parts.iter().sum();
+        let procs: Vec<(u32, Vec<(u32, u64)>)> = parts
+            .iter()
+            .enumerate()
+            .map(|(i, &part)| (i as u32 + 10, vec![(0, part)]))
+            .collect();
+        let refs: Vec<(u32, &[(u32, u64)])> =
+            procs.iter().map(|(p, t)| (*p, t.as_slice())).collect();
+        let window = window_with(&refs, &[]);
+        let disk_active = HashMap::from([(0, machine)]);
         let mut sum = 0.0f32;
-        for part in parts {
-            let row = disk_active_pct(part, total, machine);
+        for (pid, _) in &procs {
+            let row = active_of(&window, *pid, &disk_active);
             assert!(row <= machine, "row {row} exceeded header {machine}");
             sum += row;
         }
@@ -2955,12 +3112,73 @@ mod tests {
         );
     }
 
+    /// Shares are per DISK. Summed over every disk and scaled by the busiest,
+    /// a process alone on a saturated slow disk read ~3 % next to a fast disk
+    /// serving 32 s of request time per second, and two processes each
+    /// saturating their own disk read 50 % apiece.
+    #[test]
+    fn disk_active_time_is_a_share_of_the_disk_that_served_it() {
+        // Disk 0: an HDD at queue depth 1 (1 s of service time per second);
+        // disk 1: NVMe at depth 32. Both 100 % active.
+        let window = window_with(&[(1, &[(0, 1_000)]), (2, &[(1, 32_000)])], &[]);
+        let disk_active = HashMap::from([(0, 100.0), (1, 100.0)]);
+        assert_eq!(active_of(&window, 1, &disk_active), 100.0);
+        assert_eq!(active_of(&window, 2, &disk_active), 100.0);
+
+        // A process on both disks is its busiest one, and keeps both shares
+        // for group rows.
+        let window = window_with(
+            &[(3, &[(0, 250), (1, 3_000)]), (4, &[(0, 750)])],
+            &[(1, 1_000)],
+        );
+        let disk_active = HashMap::from([(0, 80.0), (1, 40.0)]);
+        let mut both = ProcessEntry::new(3, "both.exe");
+        set_disk_active(
+            &mut both,
+            &disk_shares(&window.procs[&3], &window),
+            &disk_active,
+        );
+        assert_eq!(both.disk_active_pct, Some(30.0));
+        assert_eq!(
+            both.disk_active_by_disk,
+            vec![
+                DiskActiveShare {
+                    disk: 0,
+                    active_pct: 20.0
+                },
+                DiskActiveShare {
+                    disk: 1,
+                    active_pct: 30.0
+                },
+            ]
+        );
+        // A disk the counters do not list is in no header and in no row.
+        let only_zero = HashMap::from([(0, 80.0)]);
+        set_disk_active(
+            &mut both,
+            &disk_shares(&window.procs[&3], &window),
+            &only_zero,
+        );
+        assert_eq!(both.disk_active_pct, Some(20.0));
+    }
+
+    #[test]
+    fn physical_disk_numbers_come_from_the_instance_name() {
+        assert_eq!(physical_disk_number("0 C:"), Some(0));
+        assert_eq!(physical_disk_number("12 D: E:"), Some(12));
+        assert_eq!(physical_disk_number("3"), Some(3));
+        assert_eq!(physical_disk_number("_Total"), None);
+        assert_eq!(physical_disk_number(""), None);
+    }
+
     /// Restoring a minimized window starves the sampler thread, so the next
     /// tick can land only milliseconds after the last one. That window is too
     /// short to measure, and blanking the whole Disk active time column for it
     /// is what made the column flash "—" on restore. The reading from one tick
     /// ago was really measured, so it is carried forward — but only for the
-    /// same process, never for a recycled PID.
+    /// same process, never for a recycled PID, and as a SHARE of the disks'
+    /// current activity: a carried 100 % sat under a header that had dropped
+    /// to 0 %.
     #[test]
     fn a_window_too_short_to_measure_carries_the_last_reading_forward() {
         let mut last = HashMap::new();
@@ -2968,7 +3186,7 @@ mod tests {
             7,
             ProcDiskSample {
                 start_epoch_s: Some(1_000),
-                active_pct: 12.5,
+                shares: vec![(0, 0.25)],
                 read_bps: 2048.0,
                 write_bps: 1024.0,
             },
@@ -2978,7 +3196,7 @@ mod tests {
             8,
             ProcDiskSample {
                 start_epoch_s: Some(1_000),
-                active_pct: 99.0,
+                shares: vec![(0, 0.99)],
                 read_bps: 1.0,
                 write_bps: 1.0,
             },
@@ -2991,7 +3209,7 @@ mod tests {
         let never_seen = ProcessEntry::new(9, "new.exe");
         let mut processes = vec![same, recycled, never_seen];
 
-        carry_process_disk(&last, &mut processes);
+        carry_process_disk(&last, &HashMap::from([(0, 50.0)]), &mut processes);
 
         assert_eq!(processes[0].disk_active_pct, Some(12.5));
         assert_eq!(processes[0].disk_phys_read_bps, Some(2048.0));
@@ -3004,6 +3222,12 @@ mod tests {
             processes[2].disk_active_pct, None,
             "a process with nothing measured yet stays unknown"
         );
+
+        // The disk went quiet since: the carried share follows it down.
+        let mut again = vec![ProcessEntry::new(7, "same.exe")];
+        again[0].start_epoch_s = Some(1_000);
+        carry_process_disk(&last, &HashMap::from([(0, 0.0)]), &mut again);
+        assert_eq!(again[0].disk_active_pct, Some(0.0));
     }
 
     // ---------------------------------------------------------- is_zombie

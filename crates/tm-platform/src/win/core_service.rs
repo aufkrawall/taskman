@@ -65,8 +65,10 @@ pub const SERVICE_LOG_FILE_PREFIX: &str = "taskman-service.log";
 // carries the disk decoder's event counts, which separate an idle disk from a
 // decoder that could not read a single record. v6 adds `ProcessIdentity`, the
 // identity-bound token read that fills the User/Elevated columns of the
-// SYSTEM/service processes an unelevated GUI cannot open at all.
-pub const PROTOCOL_VERSION: u16 = 6;
+// SYSTEM/service processes an unelevated GUI cannot open at all. v7 splits
+// the disk service time by physical disk (per entry and per-disk totals), so
+// each process's share is taken of the disk that served it.
+pub const PROTOCOL_VERSION: u16 = 7;
 
 const PIPE_NAME: &str = r"\\.\pipe\Taskman.Core.v1";
 const FRAME_MAGIC: [u8; 4] = *b"TMB1";
@@ -256,17 +258,30 @@ pub struct ProcessDiskSample {
     /// `win::disk_etw::DiskWindow::decoded`.
     pub events_seen: u64,
     pub events_decoded: u64,
+    /// Every disk's service time in the window, charged or not: the
+    /// denominator of the per-disk shares.
+    pub disk_totals: Vec<ProcessDiskTime>,
     pub entries: Vec<ProcessDiskEntry>,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProcessDiskEntry {
     pub pid: u32,
     pub service_time: u64,
+    /// `service_time` split by the physical disk that served it.
+    pub disks: Vec<ProcessDiskTime>,
     pub read_bytes: u64,
     pub write_bytes: u64,
     pub ops: u64,
+}
+
+/// Service time on one physical disk (`PhysicalDrive<disk>`).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProcessDiskTime {
+    pub disk: u32,
+    pub service_time: u64,
 }
 
 fn module_unload_verified_default() -> bool {
@@ -1808,11 +1823,12 @@ fn process_network_sample() -> ProcessNetworkSample {
     }
 }
 
-/// Hard cap on entries in one disk response. Worst-case JSON stays below the
-/// 512 KiB response frame. Overflow is unavailable rather than a false zero
-/// on omitted processes. Pinned by
-/// `a_capped_disk_response_fits_the_frame_limit`.
-const DISK_MAX_ENTRIES: usize = 3_400;
+/// Hard caps on one disk response: entries, and per-disk items across the
+/// entries and the totals. Worst-case JSON stays below the 512 KiB response
+/// frame. Overflow is unavailable rather than a false zero on omitted
+/// processes. Pinned by `a_capped_disk_response_fits_the_frame_limit`.
+const DISK_MAX_ENTRIES: usize = 1_800;
+const DISK_MAX_DISK_TIMES: usize = 3_600;
 
 /// The broker-hosted per-process disk trace, with the same idle watchdog as
 /// the network one.
@@ -1875,6 +1891,16 @@ fn process_disk_sample() -> ProcessDiskSample {
     let live = live_pids();
     let window = trace.usage.take_window(&live);
     let total_service_time = window.total_service_time();
+    let to_wire = |times: &[super::disk_etw::DiskTime]| -> Vec<ProcessDiskTime> {
+        times
+            .iter()
+            .map(|time| ProcessDiskTime {
+                disk: time.disk,
+                service_time: time.service_time,
+            })
+            .collect()
+    };
+    let disk_totals = to_wire(&window.disk_totals);
     let entries: Vec<ProcessDiskEntry> = window
         .procs
         .into_iter()
@@ -1882,12 +1908,15 @@ fn process_disk_sample() -> ProcessDiskSample {
         .map(|(pid, disk)| ProcessDiskEntry {
             pid,
             service_time: disk.service_time,
+            disks: to_wire(&disk.per_disk),
             read_bytes: disk.read_bytes,
             write_bytes: disk.write_bytes,
             ops: disk.ops,
         })
         .collect();
-    if entries.len() > DISK_MAX_ENTRIES {
+    let disk_times =
+        disk_totals.len() + entries.iter().map(|entry| entry.disks.len()).sum::<usize>();
+    if entries.len() > DISK_MAX_ENTRIES || disk_times > DISK_MAX_DISK_TIMES {
         if broker_warning_allowed() {
             tracing::warn!(
                 count = entries.len(),
@@ -1902,6 +1931,7 @@ fn process_disk_sample() -> ProcessDiskSample {
         total_service_time,
         events_seen: window.events_seen,
         events_decoded: window.events_decoded,
+        disk_totals,
         entries,
     }
 }
@@ -3575,16 +3605,27 @@ mod tests {
 
     #[test]
     fn a_capped_disk_response_fits_the_frame_limit() {
+        let time = |disk: u32| ProcessDiskTime {
+            disk,
+            service_time: u64::MAX,
+        };
+        // Spend the item budget on the entries, one disk each, then the rest
+        // on the totals: the worst case for either cap.
+        let per_entry = DISK_MAX_DISK_TIMES / DISK_MAX_ENTRIES;
         let sample = ProcessDiskSample {
             active: true,
             window_ms: u64::MAX,
             total_service_time: u64::MAX,
             events_seen: u64::MAX,
             events_decoded: u64::MAX,
+            disk_totals: (0..(DISK_MAX_DISK_TIMES - per_entry * DISK_MAX_ENTRIES) as u32)
+                .map(|i| time(u32::MAX - i))
+                .collect(),
             entries: (0..DISK_MAX_ENTRIES as u32)
                 .map(|i| ProcessDiskEntry {
                     pid: 100_000 + i,
                     service_time: u64::MAX,
+                    disks: (0..per_entry as u32).map(|d| time(u32::MAX - d)).collect(),
                     read_bytes: u64::MAX,
                     write_bytes: u64::MAX,
                     ops: u64::MAX,
