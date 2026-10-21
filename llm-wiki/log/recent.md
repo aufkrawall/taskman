@@ -15,7 +15,8 @@
   `closing_a_modal_dialog_gives_the_list_its_focus_back` fails on each half
   of the old behavior; `capture_and_restore_focus_round_trip` rewritten for
   the parked contract (it had pinned the immediate semantics). Lesson: the
-  earlier test only checked the captured id, not focus after close.
+  earlier test only checked the captured id, not focus after close. User
+  confirmed on the installed build: Delete works right after closing.
 - 2026-10-21 (focus after menu dialogs): user report — after closing
   Process Properties, Delete did nothing until the row was clicked. Root
   cause (pre-existing, every dialog opened from a context menu): clicking
@@ -52,8 +53,8 @@
   start addresses now come from a per-thread handle. Dormancy evidence is
   context switches + CPU time + cycles + on-CPU state (a spinning thread can
   keep its processor without a context switch). GUI not verified by the
-  agent (a debug launch hands off to the running instance); awaiting the
-  user's visual check.
+  agent (a debug launch hands off to the running instance); the user
+  confirmed the pages visually the same day.
 - 2026-10-21 (follow-up): hotkey over DOOM worked with TaskMan in the tray
   but not with its window minimized. The log showed every press answered by
   the hook within 0-110 ms, so delivery was fine; the window is band 16 and
