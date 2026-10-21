@@ -480,7 +480,7 @@ fn service_status_rank(status: ServiceStatus) -> u8 {
     }
 }
 
-fn status_label(app: &TaskManApp, st: ServiceStatus) -> &'static str {
+pub(crate) fn status_label(app: &TaskManApp, st: ServiceStatus) -> &'static str {
     match st {
         ServiceStatus::Running => i18n::tr_in(app.lang(), K::StRunning),
         ServiceStatus::Stopped => i18n::tr_in(app.lang(), K::StStopped),

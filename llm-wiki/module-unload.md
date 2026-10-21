@@ -24,7 +24,7 @@ The selected module is revalidated by exact base address plus case-insensitive p
 
 `SeDebugPrivilege` is enabled best-effort when the current token already holds it. This grants no new privilege to an ordinary token, but makes elevated/local and LocalSystem execution reliable when process VM/thread rights require debug privilege.
 
-A remote-thread timeout is an unknown-state result, not a clean failure: closing the thread handle does not stop a remote call that may still finish. The Modules dialog therefore re-enumerates after every attempt, including errors and timeouts. Manual refresh and unload are serialized so an older refresh cannot overwrite the unload's post-action inventory.
+A remote-thread timeout is an unknown-state result, not a clean failure: closing the thread handle does not stop a remote call that may still finish. The Modules page therefore re-enumerates after every attempt, including errors and timeouts. Manual refresh and unload are serialized so an older refresh cannot overwrite the unload's post-action inventory.
 
 TaskMan deliberately does not use `NtUnmapViewOfSection` as a fallback for normal DLL modules. Raw unmapping would bypass the loader's dependency graph, TLS cleanup and detach notifications and can leave loader bookkeeping pointing at unmapped memory. Force mode remains loader-mediated: repeated, revalidated `FreeLibrary` requests only.
 

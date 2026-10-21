@@ -1,8 +1,13 @@
-//! On-demand per-process module inspector.
+//! Process Properties → Modules: the on-demand module list of one process.
 //!
 //! Enumeration and unloading never run on the UI thread. Unload is an
 //! intentionally advanced action with a second confirmation; the platform
 //! layer revalidates both process identity and the exact module base/path.
+//!
+//! Each module also shows the threads that START in it and whether those are
+//! dormant (see `tabs::threads`). A module's code mostly runs on other
+//! modules' threads, so a module that starts no thread is never called
+//! dormant — there is no evidence either way.
 
 use eframe::egui;
 use std::cmp::Ordering;
@@ -13,6 +18,8 @@ use tm_platform::actions::{MODULE_UNLOAD_SINGLE_RELEASE_MARKER, PlatformActions,
 
 use crate::app::{InFlight, ProcessIdentity, TaskManApp};
 use crate::search;
+use crate::tabs::inspector;
+use crate::tabs::threads::{Activity, ThreadRow};
 use crate::theme;
 use crate::widgets::menu;
 use crate::widgets::tablekit::{self, TmColumn};
@@ -31,28 +38,126 @@ enum SortColumn {
     Name,
     Base,
     Size,
+    Threads,
+    Activity,
     Path,
 }
 
 impl SortColumn {
+    /// Display order of the columns.
+    const ALL: [Self; 6] = [
+        Self::Name,
+        Self::Base,
+        Self::Size,
+        Self::Threads,
+        Self::Activity,
+        Self::Path,
+    ];
+
     fn id(self) -> &'static str {
         match self {
             Self::Name => "name",
             Self::Base => "base",
             Self::Size => "size",
+            Self::Threads => "threads",
+            Self::Activity => "activity",
             Self::Path => "path",
         }
     }
 
     fn from_id(id: &str) -> Option<Self> {
-        match id {
-            "name" => Some(Self::Name),
-            "base" => Some(Self::Base),
-            "size" => Some(Self::Size),
-            "path" => Some(Self::Path),
-            _ => None,
+        Self::ALL.into_iter().find(|column| column.id() == id)
+    }
+}
+
+/// What the thread list proves about one module.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ModuleActivity {
+    /// The thread list, or some thread's start address, is unavailable.
+    Unknown,
+    /// No thread starts here, and every start address is known.
+    NoThreads,
+    /// Its threads have not been watched long enough.
+    Observing,
+    /// At least one thread that started here ran recently.
+    Active,
+    /// Every thread that started here is dormant.
+    Dormant,
+}
+
+impl ModuleActivity {
+    fn rank(self) -> u8 {
+        match self {
+            Self::Active => 0,
+            Self::Observing => 1,
+            Self::Dormant => 2,
+            Self::NoThreads => 3,
+            Self::Unknown => 4,
         }
     }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Unknown | Self::Observing => "—",
+            Self::NoThreads => "",
+            Self::Active => crate::tabs::threads::activity_label(Activity::Active),
+            Self::Dormant => crate::tabs::threads::activity_label(Activity::Dormant {
+                idle: crate::tabs::threads::DORMANT_AFTER,
+            }),
+        }
+    }
+
+    fn tip(self) -> &'static str {
+        match self {
+            Self::Unknown => i18n::tr(K::ThreadsNoAccessTip),
+            Self::NoThreads => i18n::tr(K::ModuleNoThreadsTip),
+            Self::Observing | Self::Active | Self::Dormant => i18n::tr(K::ModuleActivityTip),
+        }
+    }
+}
+
+/// Threads started in `module` (a lower bound when some start address is
+/// unknown, flagged by the bool) and what they prove about it.
+fn module_activity(
+    module: &ProcessModule,
+    threads: Option<&[ThreadRow]>,
+) -> (Option<(usize, bool)>, ModuleActivity) {
+    let Some(threads) = threads else {
+        return (None, ModuleActivity::Unknown);
+    };
+    let unknown_starts = threads.iter().any(|row| row.thread.start_address.is_none());
+    let started: Vec<&ThreadRow> = threads
+        .iter()
+        .filter(|row| {
+            row.thread.start_address.is_some_and(|address| {
+                address >= module.base_address && address - module.base_address < module.size_bytes
+            })
+        })
+        .collect();
+    if started.is_empty() {
+        return if unknown_starts {
+            (None, ModuleActivity::Unknown)
+        } else {
+            (Some((0, false)), ModuleActivity::NoThreads)
+        };
+    }
+    let count = Some((started.len(), unknown_starts));
+    let activity = if started.iter().any(|row| row.activity == Activity::Active) {
+        ModuleActivity::Active
+    } else if started
+        .iter()
+        .all(|row| matches!(row.activity, Activity::Dormant { .. }))
+    {
+        // A thread whose start is unknown might belong here and be running.
+        if unknown_starts {
+            ModuleActivity::Unknown
+        } else {
+            ModuleActivity::Dormant
+        }
+    } else {
+        ModuleActivity::Observing
+    };
+    (count, activity)
 }
 
 pub struct State {
@@ -67,9 +172,22 @@ pub struct State {
     fetch: InFlight,
     unload: InFlight,
     pending_unload: Option<ProcessModule>,
+    /// Whether the first enumeration was started.
+    started: bool,
 }
 
 impl State {
+    /// The page of `identity`. Nothing is enumerated until a page that needs
+    /// the list is first shown ([`ensure_loaded`]).
+    pub fn for_process(app: &TaskManApp, identity: ProcessIdentity, process_name: String) -> Self {
+        let saved_sort = app.shared.settings.table_sort.get("modules");
+        let sort = saved_sort
+            .and_then(|saved| SortColumn::from_id(&saved.column))
+            .unwrap_or(SortColumn::Name);
+        let ascending = saved_sort.is_none_or(|saved| saved.ascending);
+        Self::new(identity, process_name, sort, ascending)
+    }
+
     fn new(
         identity: ProcessIdentity,
         process_name: String,
@@ -88,27 +206,30 @@ impl State {
             fetch: InFlight::default(),
             unload: InFlight::default(),
             pending_unload: None,
+            started: false,
         }
+    }
+
+    /// The loaded module list, for the Threads page's start addresses.
+    pub fn modules(&self) -> Option<Vec<ProcessModule>> {
+        match &*tm_core::sync::lock(&self.load) {
+            LoadState::Ready(modules) => Some(modules.clone()),
+            _ => None,
+        }
+    }
+
+    /// The unload confirmation is up and owns the keyboard.
+    pub fn confirming(&self) -> bool {
+        self.pending_unload.is_some()
     }
 }
 
-pub fn open(app: &mut TaskManApp, process: &tm_core::model::ProcessEntry, ctx: &egui::Context) {
-    let identity = ProcessIdentity {
-        pid: process.pid,
-        start_epoch_s: process.start_epoch_s,
-    };
-    if !app.identity_is_live(&identity) {
-        app.shared.toast(i18n::tr(K::ProcessExited));
-        return;
+/// Start the first enumeration the first time a page needs the list.
+pub fn ensure_loaded(app: &TaskManApp, state: &mut State, ctx: &egui::Context) {
+    if !state.started && app.actions.capabilities().process_modules {
+        state.started = true;
+        begin_fetch(state, app.actions.clone(), ctx);
     }
-    let saved_sort = app.shared.settings.table_sort.get("modules");
-    let sort = saved_sort
-        .and_then(|saved| SortColumn::from_id(&saved.column))
-        .unwrap_or(SortColumn::Name);
-    let ascending = saved_sort.is_none_or(|saved| saved.ascending);
-    let mut state = State::new(identity, process.shown_name().to_string(), sort, ascending);
-    begin_fetch(&mut state, app.actions.clone(), ctx);
-    app.module_dialog = Some(state);
 }
 
 fn begin_fetch(state: &mut State, actions: Arc<dyn PlatformActions>, ctx: &egui::Context) {
@@ -288,25 +409,53 @@ fn compare_modules(a: &ProcessModule, b: &ProcessModule, sort: SortColumn) -> Or
         SortColumn::Base => a.base_address.cmp(&b.base_address),
         SortColumn::Size => a.size_bytes.cmp(&b.size_bytes),
         SortColumn::Path => tablekit::cmp_ignore_case(&a.path, &b.path),
+        // Thread-derived columns are ordered by `compare_rows`.
+        SortColumn::Threads | SortColumn::Activity => Ordering::Equal,
     };
     primary.then_with(|| a.base_address.cmp(&b.base_address))
 }
 
-fn visible_modules(state: &State, modules: &[ProcessModule]) -> Vec<ProcessModule> {
+struct Row {
+    module: ProcessModule,
+    threads: Option<(usize, bool)>,
+    activity: ModuleActivity,
+}
+
+fn compare_rows(a: &Row, b: &Row, sort: SortColumn) -> Ordering {
+    match sort {
+        SortColumn::Threads => a
+            .threads
+            .map(|(count, _)| count)
+            .cmp(&b.threads.map(|(count, _)| count))
+            .then_with(|| compare_modules(&a.module, &b.module, SortColumn::Name)),
+        SortColumn::Activity => a
+            .activity
+            .rank()
+            .cmp(&b.activity.rank())
+            .then_with(|| compare_modules(&a.module, &b.module, SortColumn::Name)),
+        _ => compare_modules(&a.module, &b.module, sort),
+    }
+}
+
+fn visible_modules(
+    state: &State,
+    modules: &[ProcessModule],
+    threads: Option<&[ThreadRow]>,
+) -> Vec<Row> {
     let needle = state.filter.trim().to_ascii_lowercase();
     let mut rows = modules
         .iter()
         .filter(|module| module_matches_filter(module, &needle))
-        .cloned()
+        .map(|module| {
+            let (threads, activity) = module_activity(module, threads);
+            Row {
+                module: module.clone(),
+                threads,
+                activity,
+            }
+        })
         .collect::<Vec<_>>();
-    rows.sort_by(|a, b| {
-        let order = compare_modules(a, b, state.sort);
-        if state.ascending {
-            order
-        } else {
-            order.reverse()
-        }
-    });
+    rows.sort_by(|a, b| tablekit::directed(compare_rows(a, b, state.sort), state.ascending));
     rows
 }
 
@@ -316,17 +465,16 @@ fn module_matches_filter(module: &ProcessModule, needle: &str) -> bool {
         || module.path.to_ascii_lowercase().contains(needle)
 }
 
-pub fn dialog(app: &mut TaskManApp, ctx: &egui::Context, pal: &theme::Palette) {
-    let Some(mut state) = app.module_dialog.take() else {
-        return;
-    };
-    let title = format!(
-        "{} — {} ({})",
-        i18n::tr(K::Modules),
-        state.process_name,
-        state.identity.pid
-    );
-    let mut open = true;
+/// The Modules page of Process Properties. `threads` is the Threads page's
+/// newest list (the dialog keeps it current while this page is shown).
+pub fn show(
+    app: &mut TaskManApp,
+    ui: &mut egui::Ui,
+    state: &mut State,
+    threads: Option<&[ThreadRow]>,
+    pal: &theme::Palette,
+) {
+    let ctx = ui.ctx().clone();
     let mut request_refresh = false;
     let mut request_unload = None;
     let can_unload = app.actions.capabilities().unload_module;
@@ -353,282 +501,256 @@ pub fn dialog(app: &mut TaskManApp, ctx: &egui::Context, pal: &theme::Palette) {
         _ => None,
     };
 
-    // Esc closes the dialog like the X button does — but only while the
-    // unload confirmation is not up; that window owns the keyboard then.
-    let close_now = state.pending_unload.is_none()
-        && ctx.input_mut(|input| input.consume_key(Default::default(), egui::Key::Escape));
-
     // Tab is never consumed here, so egui's focus system moves between the
-    // filter field, the toolbar buttons and (where the platform keeps rows
-    // focusable) the table. The first frame anchors focus on the filter and
-    // remembers what held focus before, so closing hands it back.
-    let restore_id = egui::Id::new("module-dialog-restore-focus");
-    let first_frame = ctx
-        .data(|d| d.get_temp::<Option<egui::Id>>(restore_id))
-        .is_none();
-    if first_frame {
-        let captured = crate::app_ui::capture_focus(ctx);
-        ctx.data_mut(|d| d.insert_temp(restore_id, captured));
-    }
-
-    egui::Window::new(title)
-        .modal(true)
-        .open(&mut open)
-        .default_size([850.0, 520.0])
-        .min_size([560.0, 320.0])
-        .resizable(true)
-        .collapsible(false)
-        .show(ctx, |ui| {
-            ui.horizontal(|ui| {
-                let filter_resp = ui.add(
-                    egui::TextEdit::singleline(&mut state.filter)
-                        .hint_text(i18n::tr(K::SearchHint))
-                        .desired_width(300.0),
-                );
-                // The inspector opens ready to type: the filter narrows the
-                // list immediately, and Tab moves on through the toolbar.
-                if first_frame {
-                    filter_resp.request_focus();
-                }
-                if ui
-                    .add_enabled(
-                        !state.fetch.busy() && !state.unload.busy(),
-                        egui::Button::new(i18n::tr(K::RefreshNow)),
-                    )
-                    .clicked()
-                {
-                    request_refresh = true;
-                }
-                // Which module to unload is the user's call; every selected
-                // module can be attempted. Only the capability (module
-                // unload unavailable on this platform) and a running module
-                // inventory/action grey the button out.
-                let unload = ui
-                    .add_enabled(
-                        can_unload
-                            && selected_module.is_some()
-                            && !state.unload.busy()
-                            && !state.fetch.busy(),
-                        egui::Button::new(i18n::tr(K::UnloadModule)),
-                    )
-                    .on_disabled_hover_text(if selected_module.is_none() {
-                        i18n::tr(K::SelectModuleFirst)
-                    } else {
-                        i18n::tr(K::ModuleBusy)
-                    });
-                if unload.clicked() {
-                    request_unload = selected_module.clone();
-                }
-                if state.fetch.busy() || state.unload.busy() {
-                    ui.spinner();
-                }
+    // filter field, the toolbar buttons and the table.
+    ui.horizontal(|ui| {
+        ui.add(
+            egui::TextEdit::singleline(&mut state.filter)
+                .hint_text(i18n::tr(K::SearchHint))
+                .desired_width(300.0),
+        );
+        if ui
+            .add_enabled(
+                !state.fetch.busy() && !state.unload.busy(),
+                egui::Button::new(i18n::tr(K::RefreshNow)),
+            )
+            .clicked()
+        {
+            request_refresh = true;
+        }
+        // Which module to unload is the user's call; every selected
+        // module can be attempted. Only the capability (module
+        // unload unavailable on this platform) and a running module
+        // inventory/action grey the button out.
+        let unload = ui
+            .add_enabled(
+                can_unload
+                    && selected_module.is_some()
+                    && !state.unload.busy()
+                    && !state.fetch.busy(),
+                egui::Button::new(i18n::tr(K::UnloadModule)),
+            )
+            .on_disabled_hover_text(if selected_module.is_none() {
+                i18n::tr(K::SelectModuleFirst)
+            } else {
+                i18n::tr(K::ModuleBusy)
             });
-            ui.label(
-                egui::RichText::new(i18n::tr(K::UnloadModuleWarning))
-                    .small()
-                    .color(pal.text_dim),
-            );
-            ui.add_space(4.0);
+        if unload.clicked() {
+            request_unload = selected_module.clone();
+        }
+        if state.fetch.busy() || state.unload.busy() {
+            ui.spinner();
+        }
+    });
+    ui.label(
+        egui::RichText::new(i18n::tr(K::UnloadModuleWarning))
+            .small()
+            .color(pal.text_dim),
+    );
+    ui.add_space(4.0);
 
-            match &snapshot {
-                LoadState::Loading => {
-                    ui.centered_and_justified(|ui| {
-                        ui.horizontal(|ui| {
-                            ui.spinner();
-                            ui.label(i18n::tr(K::GatheringData));
-                        });
-                    });
-                }
-                LoadState::Error(error) => {
-                    ui.colored_label(pal.heat_high, error);
-                }
-                LoadState::Ready(modules) => {
-                    let rows = visible_modules(&state, modules);
-                    // The inspector IS the dialog here: `app.modal_open()` runs
-                    // while `module_dialog` is taken, so it stays false for the
-                    // inspector itself — this list nav and type-ahead are the
-                    // dialog's own keyboard layer. The only thing to stand
-                    // down for is the unload confirmation, a separate modal
-                    // on top.
-                    let dialog_open = app.modal_open() || state.pending_unload.is_some();
-                    search::set_active_content(ctx, "modules");
-                    let typed = search::list_type_ahead(ctx, "modules", dialog_open);
-                    if let Some(typed) = typed
-                        && let Some(base) = search::type_ahead_match(
-                            rows.iter()
-                                .map(|module| (module.base_address, module.name.as_str()))
-                                .collect::<Vec<_>>(),
-                            state.selected_base,
-                            &typed,
-                        )
-                    {
-                        state.selected_base = Some(base);
-                        state.scroll_to_base = Some(base);
-                    }
-                    if let Some(nav) = search::list_nav(ctx, dialog_open) {
-                        let current = state.selected_base.and_then(|base| {
-                            rows.iter().position(|module| module.base_address == base)
-                        });
-                        let page_rows = (ui.available_height() / tablekit::ROW_H_DENSE)
-                            .floor()
-                            .max(1.0) as usize;
-                        if let Some(index) =
-                            search::moved_index(rows.len(), current, nav, page_rows)
-                            && let Some(module) = rows.get(index)
-                        {
-                            state.selected_base = Some(module.base_address);
-                            state.scroll_to_base = Some(module.base_address);
-                        }
-                    }
-
-                    let cols = vec![
-                        TmColumn::text("name", i18n::tr(K::ColName), 180.0),
-                        TmColumn::num("base", i18n::tr(K::ColBaseAddress), 150.0),
-                        TmColumn::num("size", i18n::tr(K::ColSize), 110.0),
-                        TmColumn::text("path", i18n::tr(K::ColPath), 390.0),
-                    ];
-                    let mut table = app
-                        .make_table("modules", cols)
-                        .with_row_height(tablekit::ROW_H_DENSE);
-                    let sorted = match state.sort {
-                        SortColumn::Name => 0,
-                        SortColumn::Base => 1,
-                        SortColumn::Size => 2,
-                        SortColumn::Path => 3,
-                    };
-                    let focus = state.scroll_to_base.take().and_then(|base| {
-                        rows.iter().position(|module| module.base_address == base)
-                    });
-                    let avail = tablekit::table_avail(ui);
-                    let clicked = tablekit::scrolled_rows(
-                        "modules",
-                        ui,
-                        pal,
-                        &mut table,
-                        avail,
-                        Some((sorted, state.ascending)),
-                        None,
-                        rows.len(),
-                        (!state.filter.trim().is_empty()).then_some(i18n::tr(K::NoMatches)),
-                        focus,
-                        None,
-                        |ui, table, _avail, _content_width, range| {
-                            for index in range {
-                                let Some(module) = rows.get(index) else {
-                                    continue;
-                                };
-                                let selected = state.selected_base == Some(module.base_address);
-                                let (rect, response) =
-                                    table.row(ui, pal, selected, module.base_address);
-                                table.describe_row(ui, &response, &module.name, index);
-                                let name_truncated =
-                                    table.text_cell(ui, rect, 0, &module.name, pal, false);
-                                let base = format!("0x{:016X}", module.base_address);
-                                let base_cell = table.col_rect(1, rect);
-                                ui.painter_at(base_cell).text(
-                                    egui::pos2(base_cell.right() - 10.0, base_cell.center().y),
-                                    egui::Align2::RIGHT_CENTER,
-                                    base,
-                                    egui::FontId::monospace(tablekit::FONT_ROW),
-                                    pal.text,
-                                );
-                                let size = format::format_bytes_loc(module.size_bytes);
-                                let size_cell = table.col_rect(2, rect);
-                                ui.painter_at(size_cell).text(
-                                    egui::pos2(size_cell.right() - 10.0, size_cell.center().y),
-                                    egui::Align2::RIGHT_CENTER,
-                                    size,
-                                    egui::FontId::proportional(tablekit::FONT_ROW),
-                                    pal.text,
-                                );
-                                let path_truncated =
-                                    table.text_cell(ui, rect, 3, &module.path, pal, true);
-                                // A clipped cell cannot show its content; the
-                                // full value becomes the row tooltip (before
-                                // the context menu attaches).
-                                let response = if path_truncated {
-                                    response.on_hover_text(module.path.as_str())
-                                } else if name_truncated {
-                                    response.on_hover_text(module.name.as_str())
-                                } else {
-                                    response
-                                };
-                                if response.clicked() || response.secondary_clicked() {
-                                    state.selected_base = Some(module.base_address);
-                                }
-                                // While the unload confirmation is up, a row
-                                // menu opened by the Menu key would strand
-                                // over it; right-click keeps working.
-                                let keyboard_open = !dialog_open
-                                    && crate::search::content_has_focus(ui.ctx())
-                                    && menu::keyboard_menu_requested(ui.ctx())
-                                    && state.selected_base == Some(module.base_address);
-                                menu::context_menu_kb(&response, keyboard_open, |ui| {
-                                    if menu::item(ui, i18n::tr(K::CopyPath)).clicked() {
-                                        ui.ctx().copy_text(module.path.clone());
-                                        app.shared.toast(i18n::tr(K::Copied));
-                                        ui.close();
-                                    }
-                                    if menu::item(ui, i18n::tr(K::OpenFileLocation)).clicked() {
-                                        if let Err(error) =
-                                            app.actions.open_file_location(&module.path)
-                                        {
-                                            app.shared
-                                                .toast(i18n::trf(K::ErrMsg, &[&error.to_string()]));
-                                        }
-                                        ui.close();
-                                    }
-                                    if menu::item(ui, i18n::tr(K::Properties)).clicked() {
-                                        if let Err(error) =
-                                            app.actions.open_properties(&module.path)
-                                        {
-                                            app.shared
-                                                .toast(i18n::trf(K::ErrMsg, &[&error.to_string()]));
-                                        }
-                                        ui.close();
-                                    }
-                                    menu::separator(ui);
-                                    let unload = menu::item_enabled(
-                                        ui,
-                                        i18n::tr(K::UnloadModule),
-                                        can_unload && !state.unload.busy() && !state.fetch.busy(),
-                                    )
-                                    .on_disabled_hover_text(i18n::tr(K::ModuleBusy));
-                                    if unload.clicked() {
-                                        request_unload = Some(module.clone());
-                                        ui.close();
-                                    }
-                                });
-                            }
-                        },
-                    );
-                    if let Some(column) = clicked {
-                        let next = match column {
-                            0 => SortColumn::Name,
-                            1 => SortColumn::Base,
-                            2 => SortColumn::Size,
-                            _ => SortColumn::Path,
-                        };
-                        if state.sort == next {
-                            state.ascending = !state.ascending;
-                        } else {
-                            state.sort = next;
-                            state.ascending = !matches!(next, SortColumn::Base | SortColumn::Size);
-                        }
-                        app.persist_sort("modules", state.sort.id(), state.ascending);
-                    }
-                    app.persist_table(&table);
+    match &snapshot {
+        LoadState::Loading => {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label(i18n::tr(K::GatheringData));
+            });
+        }
+        LoadState::Error(error) => {
+            ui.colored_label(pal.heat_high, error);
+        }
+        LoadState::Ready(modules) => {
+            let rows = visible_modules(state, modules, threads);
+            // `app.modal_open()` runs while the properties dialog is taken,
+            // so it stays false for the dialog itself — this list nav and
+            // type-ahead are the page's own keyboard layer. The only thing
+            // to stand down for is the unload confirmation, a separate
+            // modal on top.
+            let dialog_open = app.modal_open() || state.pending_unload.is_some();
+            search::set_active_content(&ctx, "modules");
+            let typed = search::list_type_ahead(&ctx, "modules", dialog_open);
+            if let Some(typed) = typed
+                && let Some(base) = search::type_ahead_match(
+                    rows.iter()
+                        .map(|row| (row.module.base_address, row.module.name.as_str()))
+                        .collect::<Vec<_>>(),
+                    state.selected_base,
+                    &typed,
+                )
+            {
+                state.selected_base = Some(base);
+                state.scroll_to_base = Some(base);
+            }
+            if let Some(nav) = search::list_nav(&ctx, dialog_open) {
+                let current = state
+                    .selected_base
+                    .and_then(|base| rows.iter().position(|row| row.module.base_address == base));
+                let page_rows =
+                    tablekit::page_rows(&ctx, "modules", tablekit::ROW_H_DENSE).unwrap_or(10);
+                if let Some(index) = search::moved_index(rows.len(), current, nav, page_rows)
+                    && let Some(row) = rows.get(index)
+                {
+                    state.selected_base = Some(row.module.base_address);
+                    state.scroll_to_base = Some(row.module.base_address);
                 }
             }
-        });
+
+            let cols = vec![
+                TmColumn::text("name", i18n::tr(K::ColName), 180.0),
+                TmColumn::num("base", i18n::tr(K::ColBaseAddress), 150.0),
+                TmColumn::num("size", i18n::tr(K::ColSize), 100.0),
+                TmColumn::num("threads", i18n::tr(K::ColThreadCount), 80.0),
+                TmColumn::text("activity", i18n::tr(K::ColActivity), 100.0),
+                TmColumn::text("path", i18n::tr(K::ColPath), 360.0),
+            ];
+            let mut table = app
+                .make_table("modules", cols)
+                .with_row_height(tablekit::ROW_H_DENSE);
+            let sorted = SortColumn::ALL
+                .iter()
+                .position(|column| *column == state.sort)
+                .unwrap_or(0);
+            let focus = state
+                .scroll_to_base
+                .take()
+                .and_then(|base| rows.iter().position(|row| row.module.base_address == base));
+            let avail = tablekit::table_avail(ui);
+            let clicked = tablekit::scrolled_rows(
+                "modules",
+                ui,
+                pal,
+                &mut table,
+                avail,
+                Some((sorted, state.ascending)),
+                None,
+                rows.len(),
+                (!state.filter.trim().is_empty()).then_some(i18n::tr(K::NoMatches)),
+                focus,
+                None,
+                |ui, table, _avail, _content_width, range| {
+                    for index in range {
+                        let Some(row) = rows.get(index) else {
+                            continue;
+                        };
+                        let module = &row.module;
+                        let dim = row.activity == ModuleActivity::Dormant;
+                        let selected = state.selected_base == Some(module.base_address);
+                        let (rect, response) = table.row(ui, pal, selected, module.base_address);
+                        table.describe_row(ui, &response, &module.name, index);
+                        let name_truncated = table.text_cell(ui, rect, 0, &module.name, pal, dim);
+                        let base_cell = table.col_rect(1, rect);
+                        ui.painter_at(base_cell).text(
+                            egui::pos2(base_cell.right() - 10.0, base_cell.center().y),
+                            egui::Align2::RIGHT_CENTER,
+                            format!("0x{:016X}", module.base_address),
+                            egui::FontId::monospace(tablekit::FONT_ROW),
+                            if dim { pal.text_dim } else { pal.text },
+                        );
+                        let size = format::format_bytes_loc(module.size_bytes);
+                        inspector::num_cell(ui, table, rect, 2, &size, pal, dim);
+                        let count = match row.threads {
+                            Some((count, false)) => count.to_string(),
+                            Some((count, true)) => format!("{count}+"),
+                            None => "—".to_string(),
+                        };
+                        inspector::num_cell(ui, table, rect, 3, &count, pal, dim);
+                        table.text_cell(ui, rect, 4, row.activity.label(), pal, dim);
+                        let path_truncated = table.text_cell(ui, rect, 5, &module.path, pal, dim);
+                        // A clipped cell cannot show its content; the full
+                        // value becomes the row tooltip (before the context
+                        // menu attaches). The thread-derived cells explain
+                        // themselves.
+                        let pointer = ui.ctx().pointer_latest_pos();
+                        let over = |column: usize| {
+                            pointer.is_some_and(|p| table.col_rect(column, rect).contains(p))
+                        };
+                        let response = if over(3) || over(4) {
+                            response.on_hover_text(row.activity.tip())
+                        } else if path_truncated {
+                            response.on_hover_text(module.path.as_str())
+                        } else if name_truncated {
+                            response.on_hover_text(module.name.as_str())
+                        } else {
+                            response
+                        };
+                        if response.clicked() || response.secondary_clicked() {
+                            state.selected_base = Some(module.base_address);
+                        }
+                        // While the unload confirmation is up, a row
+                        // menu opened by the Menu key would strand
+                        // over it; right-click keeps working.
+                        let keyboard_open = !dialog_open
+                            && crate::search::content_has_focus(ui.ctx())
+                            && menu::keyboard_menu_requested(ui.ctx())
+                            && state.selected_base == Some(module.base_address);
+                        menu::context_menu_kb(&response, keyboard_open, |ui| {
+                            if menu::item(ui, i18n::tr(K::CopyPath)).clicked() {
+                                ui.ctx().copy_text(module.path.clone());
+                                app.shared.toast(i18n::tr(K::Copied));
+                                ui.close();
+                            }
+                            if menu::item(ui, i18n::tr(K::OpenFileLocation)).clicked() {
+                                if let Err(error) = app.actions.open_file_location(&module.path) {
+                                    app.shared
+                                        .toast(i18n::trf(K::ErrMsg, &[&error.to_string()]));
+                                }
+                                ui.close();
+                            }
+                            if menu::item(ui, i18n::tr(K::Properties)).clicked() {
+                                if let Err(error) = app.actions.open_properties(&module.path) {
+                                    app.shared
+                                        .toast(i18n::trf(K::ErrMsg, &[&error.to_string()]));
+                                }
+                                ui.close();
+                            }
+                            menu::separator(ui);
+                            let unload = menu::item_enabled(
+                                ui,
+                                i18n::tr(K::UnloadModule),
+                                can_unload && !state.unload.busy() && !state.fetch.busy(),
+                            )
+                            .on_disabled_hover_text(i18n::tr(K::ModuleBusy));
+                            if unload.clicked() {
+                                request_unload = Some(module.clone());
+                                ui.close();
+                            }
+                        });
+                    }
+                },
+            );
+            if let Some(column) = clicked.and_then(|index| SortColumn::ALL.get(index).copied()) {
+                if state.sort == column {
+                    state.ascending = !state.ascending;
+                } else {
+                    state.sort = column;
+                    state.ascending = !matches!(
+                        column,
+                        SortColumn::Base | SortColumn::Size | SortColumn::Threads
+                    );
+                }
+                app.persist_sort("modules", state.sort.id(), state.ascending);
+            }
+            app.persist_table(&table);
+        }
+    }
 
     if request_refresh {
-        begin_fetch(&mut state, app.actions.clone(), ctx);
+        begin_fetch(state, app.actions.clone(), &ctx);
     }
     if let Some(module) = request_unload {
         state.pending_unload = Some(module);
     }
+}
 
+/// The second confirmation of an unload, drawn on top of the properties
+/// dialog after it. Owns the keyboard while it is up (see
+/// [`State::confirming`]).
+pub fn unload_confirmation(
+    app: &mut TaskManApp,
+    ctx: &egui::Context,
+    state: &mut State,
+    pal: &theme::Palette,
+) {
     let mut confirmed = None;
     let confirm_restore_id = egui::Id::new("unload-confirm-restore-focus");
     if let Some(module) = state.pending_unload.as_ref() {
@@ -640,7 +762,7 @@ pub fn dialog(app: &mut TaskManApp, ctx: &egui::Context, pal: &theme::Palette) {
         // buttons via the app-side focus flag).
         let keys = crate::app_ui::consume_dialog_keys(ctx, true);
         // First frame of the confirmation: remember what held focus in the
-        // inspector behind, so dismissing hands it back.
+        // page behind, so dismissing hands it back.
         if ctx
             .data(|d| d.get_temp::<Option<egui::Id>>(confirm_restore_id))
             .is_none()
@@ -703,24 +825,18 @@ pub fn dialog(app: &mut TaskManApp, ctx: &egui::Context, pal: &theme::Palette) {
         ctx.data_mut(|d| d.remove_temp::<Option<egui::Id>>(confirm_restore_id));
         let module = state.pending_unload.take();
         if confirm && let Some(module) = module {
-            begin_unload(app, &mut state, module, ctx);
+            begin_unload(app, state, module, ctx);
         }
     }
+}
 
-    if open && !close_now {
-        app.module_dialog = Some(state);
-    } else {
-        let saved = ctx
-            .data(|d| d.get_temp::<Option<egui::Id>>(restore_id))
-            .flatten();
-        crate::app_ui::restore_focus(ctx, saved);
-        ctx.data_mut(|d| d.remove_temp::<Option<egui::Id>>(restore_id));
-        // An X on the inspector closes it while the unload confirmation may
-        // still be parked without a decision; its restore temp must not
-        // outlive the dialog, or the next confirmation would restore a stale
-        // widget instead of capturing its own opener.
-        ctx.data_mut(|d| d.remove_temp::<Option<egui::Id>>(confirm_restore_id));
-    }
+/// The properties dialog closed: a confirmation parked without a decision
+/// must not leave its restore temp behind, or the next confirmation would
+/// restore a stale widget instead of capturing its own opener.
+pub fn forget_confirmation(ctx: &egui::Context) {
+    ctx.data_mut(|d| {
+        d.remove_temp::<Option<egui::Id>>(egui::Id::new("unload-confirm-restore-focus"))
+    });
 }
 
 #[cfg(test)]
@@ -758,8 +874,86 @@ mod tests {
         );
         let modules = vec![module("alpha.dll", 1, 1), module("beta.dll", 2, 2)];
         state.filter = "alpha".into();
-        assert_eq!(visible_modules(&state, &modules).len(), 1);
+        assert_eq!(visible_modules(&state, &modules, None).len(), 1);
         state.filter = "test\\beta".into();
-        assert_eq!(visible_modules(&state, &modules)[0].name, "beta.dll");
+        assert_eq!(
+            visible_modules(&state, &modules, None)[0].module.name,
+            "beta.dll"
+        );
+    }
+
+    fn thread_row(tid: u32, start: Option<u64>, activity: Activity) -> ThreadRow {
+        ThreadRow {
+            thread: tm_platform::actions::ProcessThread {
+                tid,
+                start_address: start,
+                priority: 8,
+                base_priority: 8,
+                context_switches: 0,
+                kernel_time_100ns: 0,
+                user_time_100ns: 0,
+                created_epoch_s: Some(1),
+                state: tm_platform::actions::ThreadState::Waiting,
+                wait_reason: 6,
+                cycles: None,
+            },
+            cpu_pct: None,
+            cycles_delta: None,
+            activity,
+        }
+    }
+
+    const DORMANT: Activity = Activity::Dormant {
+        idle: crate::tabs::threads::DORMANT_AFTER,
+    };
+
+    #[test]
+    fn a_module_is_dormant_only_when_every_thread_it_started_is() {
+        let dll = module("worker.dll", 0x1000, 0x1000);
+        let threads = [
+            thread_row(1, Some(0x1100), DORMANT),
+            thread_row(2, Some(0x1200), DORMANT),
+            thread_row(3, Some(0x9000), Activity::Active),
+        ];
+        assert_eq!(
+            module_activity(&dll, Some(&threads)),
+            (Some((2, false)), ModuleActivity::Dormant)
+        );
+        let threads = [
+            thread_row(1, Some(0x1100), DORMANT),
+            thread_row(2, Some(0x1200), Activity::Active),
+        ];
+        assert_eq!(
+            module_activity(&dll, Some(&threads)).1,
+            ModuleActivity::Active
+        );
+        let threads = [
+            thread_row(1, Some(0x1100), DORMANT),
+            thread_row(2, Some(0x1200), Activity::Observing),
+        ];
+        assert_eq!(
+            module_activity(&dll, Some(&threads)).1,
+            ModuleActivity::Observing
+        );
+    }
+
+    #[test]
+    fn a_module_without_threads_or_evidence_is_never_called_dormant() {
+        let dll = module("helper.dll", 0x1000, 0x1000);
+        let elsewhere = [thread_row(1, Some(0x9000), DORMANT)];
+        assert_eq!(
+            module_activity(&dll, Some(&elsewhere)),
+            (Some((0, false)), ModuleActivity::NoThreads)
+        );
+        // An unreadable start address could belong to this module.
+        let unknown = [
+            thread_row(1, Some(0x1100), DORMANT),
+            thread_row(2, None, DORMANT),
+        ];
+        assert_eq!(
+            module_activity(&dll, Some(&unknown)),
+            (Some((1, true)), ModuleActivity::Unknown)
+        );
+        assert_eq!(module_activity(&dll, None), (None, ModuleActivity::Unknown));
     }
 }

@@ -2,7 +2,34 @@
 
 ## Unreleased
 
+### New
+
+- **Threads, Network and Services pages in Process Properties:** like System
+  Informer, the properties dialog now lists a process's threads (TID, CPU,
+  cycles delta, start address as `module+offset`, symbolic priority, state
+  with wait reason), its TCP/UDP endpoints next to its live receive/send
+  rates, and the services it hosts (double-click or "Go to service(s)" jumps
+  to the Services page). The thread list also works for service and SYSTEM
+  processes without administrator rights; their start addresses and cycle
+  counts need thread access and read "—" where Windows denies it.
+- **Dormant threads and modules are marked:** a thread that went at least
+  5 s without being scheduled once, and without using CPU time or cycles, is
+  labelled *Dormant* and dimmed ("Hide dormant" filters them). On the Modules
+  page, a module whose own threads are all dormant is marked the same way;
+  a module that starts no thread of its own is never called dormant, because
+  its code runs on other modules' threads.
+- **Priority and affinity on the Processes page:** the context menu gains
+  the Priority submenu and "Set affinity…" from Details. On a group row they
+  apply to every member; a priority is ticked only when all members share it,
+  and "Save priority for this program" is offered only when every member is
+  the same program.
+
 ### Changed
+
+- **Modules moved into Process Properties:** the module list, including
+  unload, is now the Modules page of the properties dialog and gains Threads
+  and Activity columns. The separate "View modules" context-menu entry and
+  button are gone.
 
 - **One Performance card per physical disk:** disks are listed like Task
   Manager — "Disk 0 (C: D:)" — instead of one card per drive letter, which

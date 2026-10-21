@@ -181,7 +181,73 @@ keys! {
         "Comprehensive dump with all memory pages, tokens, handles, threads, and registers"
     ],
     Modules => ["Module", "Modules"],
-    ViewModules => ["Module anzeigen", "View modules"],
+    Threads => ["Threads", "Threads"],
+    ColTid => ["TID", "TID"],
+    ColCyclesDelta => ["Zyklen-Delta", "Cycles delta"],
+    ColStartAddress => ["Startadresse", "Start address"],
+    ColThreadState => ["Zustand", "State"],
+    ColActivity => ["Aktivität", "Activity"],
+    ColThreadCount => ["Threads", "Threads"],
+    ThreadStateInitialized => ["Initialisiert", "Initialized"],
+    ThreadStateReady => ["Bereit", "Ready"],
+    ThreadStateRunning => ["Läuft", "Running"],
+    ThreadStateStandby => ["Standby", "Standby"],
+    ThreadStateTerminated => ["Beendet", "Terminated"],
+    ThreadStateWaiting => ["Wartet", "Waiting"],
+    ThreadStateTransition => ["Übergang", "Transition"],
+    ThreadStateDeferredReady => ["Verzögert bereit", "Deferred ready"],
+    ThreadPrioIdle => ["Leerlauf", "Idle"],
+    ThreadPrioLowest => ["Niedrigste", "Lowest"],
+    ThreadPrioHighest => ["Höchste", "Highest"],
+    ThreadPrioTimeCritical => ["Zeitkritisch", "Time critical"],
+    ActivityActive => ["Aktiv", "Active"],
+    ActivityDormant => ["Ruhend", "Dormant"],
+    ThreadDormantTip => [
+        "Seit mindestens {} s weder geplant noch CPU-Zeit oder Zyklen verbraucht",
+        "Not scheduled, and no CPU time or cycles used, for at least {} s"
+    ],
+    ThreadActiveTip => [
+        "Lief in den letzten {} s",
+        "Ran within the last {} s"
+    ],
+    ActivityObservingTip => [
+        "Aktivität wird noch beobachtet — die Einstufung braucht {} s",
+        "Activity is still being observed — judging it takes {} s"
+    ],
+    ThreadsSummary => [
+        "{} Threads · {} ruhend",
+        "{} threads · {} dormant"
+    ],
+    HideDormant => ["Ruhende ausblenden", "Hide dormant"],
+    ThreadsNoAccessTip => [
+        "Startadresse und Zyklen brauchen Zugriff auf den Thread; für Prozesse anderer Benutzer ist dieser ohne Administratorrechte verweigert",
+        "Start address and cycles need access to the thread, which is denied for other users' processes without administrator rights"
+    ],
+    ModuleActivityTip => [
+        "Ruhend: Jeder Thread, der in diesem Modul gestartet wurde, ist ruhend. Aktiv: mindestens einer davon lief zuletzt.",
+        "Dormant: every thread that started in this module is dormant. Active: at least one of them ran recently."
+    ],
+    ModuleNoThreadsTip => [
+        "In diesem Modul startet kein Thread — sein Code läuft auf Threads anderer Module, daher lässt sich Ruhe nicht nachweisen",
+        "No thread starts in this module — its code runs on other modules' threads, so dormancy cannot be proven"
+    ],
+    ColProtocol => ["Protokoll", "Protocol"],
+    ColLocalAddress => ["Lokale Adresse", "Local address"],
+    ColRemoteAddress => ["Remoteadresse", "Remote address"],
+    ColPort => ["Port", "Port"],
+    ColConnState => ["Status", "State"],
+    NoConnections => [
+        "Dieser Prozess hat keine TCP- oder UDP-Endpunkte",
+        "This process has no TCP or UDP endpoints"
+    ],
+    NoHostedServices => [
+        "Dieser Prozess hostet keine Dienste",
+        "This process hosts no services"
+    ],
+    ConnectionsPidTip => [
+        "Die Verbindungstabellen kennen nur die PID; die Identität des Prozesses wird vor jeder Anzeige erneut geprüft",
+        "The connection tables only know the PID; the process identity is re-checked before every update"
+    ],
     UnloadModule => ["Modul entladen", "Unload module"],
     UnloadModuleConfirm => [
         "\"{}\" wirklich aus \"{}\" entladen?",

@@ -152,6 +152,23 @@ FreeLibrary until the module leaves or the bounded budget is spent, and the
 honest `ModuleUnloadOutcome` (still mapped, with how many references were
 dropped) is what the user sees; permanently pinned or re-loaded modules stay.
 
+## Process Properties list pages (2026-10-21)
+
+- Thread start addresses are `module+offset`, never symbol names: no PDB or
+  symbol-server lookup (privacy, latency), and nearest-export names would
+  mislabel the non-exported routines most threads start in.
+- Start address and cycles of another user's (service/SYSTEM) threads need a
+  thread handle an unelevated GUI does not get; they read "—". There is no
+  broker request for them — the thread list, states and dormancy evidence
+  are handle-free and complete without it.
+- The connection tables carry only a PID. The identity is re-checked
+  against the newest snapshot before each query and before showing it; a
+  PID recycled inside that sub-second window is accepted.
+- Module dormancy is attributed through thread START addresses only.
+  Knowing which modules are on a thread's stack would need stack walks of
+  the target (invasive, needs VM-read access), so modules that start no
+  thread show no verdict.
+
 ## Keyboard accessibility accepted limitations (2026-09-25)
 
 Recorded so the next accessibility pass does not re-derive them; the

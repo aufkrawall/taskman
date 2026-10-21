@@ -44,13 +44,22 @@ pub struct AffinityDialog {
 pub enum ProcessPropertiesTab {
     General,
     Statistics,
+    Threads,
+    Modules,
+    Network,
+    Services,
     Security,
 }
 
-#[derive(Debug, Clone)]
 pub struct ProcessPropertiesDialog {
     pub identity: crate::app::ProcessIdentity,
     tab: ProcessPropertiesTab,
+    // The list pages query only while they are shown; their state lives as
+    // long as the dialog so switching pages keeps selection and history.
+    threads: crate::tabs::threads::State,
+    modules: crate::tabs::modules::State,
+    network: crate::tabs::connections::State,
+    services: crate::tabs::hosted_services::State,
     #[cfg(target_os = "windows")]
     security: Option<tm_platform::win::ProcessSecurityInfo>,
     #[cfg(target_os = "windows")]
@@ -62,9 +71,22 @@ pub struct ProcessPropertiesDialog {
 }
 
 pub fn open_process_properties(app: &mut TaskManApp, identity: crate::app::ProcessIdentity) {
+    let process_name = app
+        .latest_snapshot()
+        .and_then(|snapshot| {
+            process_properties_target(&snapshot, &identity)
+                .map(|process| process.shown_name().to_string())
+        })
+        .unwrap_or_else(|| identity.pid.to_string());
+    let threads = crate::tabs::threads::State::new(app);
+    let modules = crate::tabs::modules::State::for_process(app, identity.clone(), process_name);
     app.proc_props = Some(ProcessPropertiesDialog {
         identity,
         tab: ProcessPropertiesTab::General,
+        threads,
+        modules,
+        network: Default::default(),
+        services: Default::default(),
         #[cfg(target_os = "windows")]
         security: None,
         #[cfg(target_os = "windows")]
@@ -2233,7 +2255,7 @@ fn set_affinity_for_targets(
     });
 }
 
-fn scheduling_rule_key(process: &ProcessEntry) -> Option<String> {
+pub(crate) fn scheduling_rule_key(process: &ProcessEntry) -> Option<String> {
     process
         .exe_path
         .as_deref()
@@ -2274,6 +2296,138 @@ fn update_saved_affinity(app: &mut TaskManApp, key: &str, affinity_mask: Option<
     app.save_settings();
 }
 
+/// The Priority submenu shared by the Details and Processes context menus.
+///
+/// `current` ticks the class every target has (`None` when they differ).
+/// `save_rule` is `None` for a batch, which offers no saved rule at all, and
+/// `Some(None)` for a single target whose program cannot be keyed (no path).
+/// Targets are resolved at click time, so a process that died while the menu
+/// was open is never acted on.
+pub(crate) fn priority_submenu(
+    app: &mut TaskManApp,
+    ui: &mut egui::Ui,
+    ctx: &egui::Context,
+    label: &str,
+    current: Option<PriorityClass>,
+    save_rule: Option<Option<String>>,
+    targets: &dyn Fn(&TaskManApp) -> Vec<crate::app::ProcessIdentity>,
+) {
+    menu::submenu(ui, label, |ui| {
+        let rule_key = save_rule.clone().flatten();
+        let mut save_priority = rule_key.as_ref().is_some_and(|key| {
+            app.shared
+                .settings
+                .process_rules
+                .get(key)
+                .is_some_and(|rule| rule.priority.is_some())
+        });
+        for (cls, key) in [
+            (PriorityClass::Realtime, K::PrioRealtime),
+            (PriorityClass::High, K::PrioHigh),
+            (PriorityClass::AboveNormal, K::PrioAboveNormal),
+            (PriorityClass::Normal, K::PrioNormal),
+            (PriorityClass::BelowNormal, K::PrioBelowNormal),
+            (PriorityClass::Low, K::PrioLow),
+        ] {
+            if menu::check(ui, i18n::tr(key), current == Some(cls)).clicked() {
+                let targets = targets(app);
+                if targets.is_empty() {
+                    app.shared.toast(i18n::tr(K::ProcessExited));
+                    ui.close();
+                    return;
+                }
+                set_priority_for_targets(app, ctx, targets, cls, key);
+                if save_priority && let Some(rule_key) = rule_key.as_deref() {
+                    update_saved_priority(app, rule_key, Some(cls));
+                }
+                ui.close();
+            }
+        }
+        if save_rule.is_some() {
+            menu::separator(ui);
+            let known = current.filter(|class| *class != PriorityClass::Unknown);
+            let save = menu::toggle_enabled(
+                ui,
+                i18n::tr(K::SavePriorityForProgram),
+                &mut save_priority,
+                rule_key.is_some() && known.is_some(),
+            )
+            .on_disabled_hover_text(i18n::tr(K::SaveRuleNeedsPath));
+            if save.changed()
+                && let Some(rule_key) = rule_key.as_deref()
+            {
+                update_saved_priority(app, rule_key, save_priority.then_some(known).flatten());
+            }
+        }
+    });
+}
+
+/// Open the affinity dialog for `targets`, pre-loaded from `identity`'s
+/// current mask. `rule_key` offers the saved per-program rule (single
+/// targets only).
+pub(crate) fn open_affinity_dialog(
+    app: &mut TaskManApp,
+    ctx: &egui::Context,
+    identity: crate::app::ProcessIdentity,
+    targets: Vec<crate::app::ProcessIdentity>,
+    rule_key: Option<String>,
+) {
+    if targets.is_empty() {
+        app.shared.toast(i18n::tr(K::ProcessExited));
+        return;
+    }
+    let rule_key = if targets.len() == 1 { rule_key } else { None };
+    let save_for_program = rule_key.as_ref().is_some_and(|key| {
+        app.shared
+            .settings
+            .process_rules
+            .get(key)
+            .is_some_and(|rule| rule.affinity_mask.is_some())
+    });
+    let load_result = Arc::new(Mutex::new(None));
+    app.affinity_dialog = Some(AffinityDialog {
+        identity: identity.clone(),
+        targets,
+        mask: None,
+        system_mask: None,
+        error: None,
+        load_result: load_result.clone(),
+        save_for_program,
+        rule_key,
+    });
+    let actions = app.actions.clone();
+    let worker_result = load_result.clone();
+    let job = move || {
+        let result = actions
+            .get_affinity_mask_checked(identity.pid, identity.start_epoch_s)
+            .and_then(|mask| {
+                actions
+                    .system_affinity_mask()
+                    .map(|system_mask| (mask, system_mask))
+            })
+            .map_err(|error| error.to_string());
+        *tm_core::sync::lock(&worker_result) = Some(result);
+    };
+    let wake = {
+        let ctx = ctx.clone();
+        move || ctx.request_repaint()
+    };
+    match &app.shared.executor {
+        Some(executor) => {
+            if !executor.run_quiet(wake, job) {
+                *tm_core::sync::lock(&load_result) =
+                    Some(Err(i18n::tr(K::ActionQueueFull).to_string()));
+                ctx.request_repaint();
+            }
+        }
+        None => {
+            drop(job);
+            *tm_core::sync::lock(&load_result) = Some(Err(i18n::tr(K::ActionFailed).to_string()));
+            ctx.request_repaint();
+        }
+    }
+}
+
 /// Context menu mirroring the Win11 TM Details tab.
 pub fn context_menu(app: &mut TaskManApp, ui: &mut egui::Ui, p: &ProcessEntry, has_children: bool) {
     let ctx = ui.ctx().clone();
@@ -2306,12 +2460,6 @@ pub fn context_menu(app: &mut TaskManApp, ui: &mut egui::Ui, p: &ProcessEntry, h
             app.shared
                 .toast(i18n::trf(K::ErrMsg, &[&error.to_string()]));
         }
-        ui.close();
-    }
-    if app.actions.capabilities().process_modules
-        && menu::item(ui, i18n::tr(K::ViewModules)).clicked()
-    {
-        crate::tabs::modules::open(app, p, &ctx);
         ui.close();
     }
     // With several rows selected the menu was opened on one of them, so the
@@ -2353,120 +2501,27 @@ pub fn context_menu(app: &mut TaskManApp, ui: &mut egui::Ui, p: &ProcessEntry, h
         let _ = p.name.as_str();
     }
 
-    let priority_menu_label = batch_label(i18n::tr(K::Priority));
-    menu::submenu(ui, &priority_menu_label, |ui| {
-        // Saved scheduling rules are program-scoped, not selection-scoped.
-        // Hide that control for a batch so changing several processes cannot
-        // silently persist a rule only for the row that opened the menu.
-        let rule_key = if batch { None } else { scheduling_rule_key(p) };
-        let mut save_priority = rule_key.as_ref().is_some_and(|key| {
-            app.shared
-                .settings
-                .process_rules
-                .get(key)
-                .is_some_and(|rule| rule.priority.is_some())
-        });
-        for (cls, key) in [
-            (PriorityClass::Realtime, K::PrioRealtime),
-            (PriorityClass::High, K::PrioHigh),
-            (PriorityClass::AboveNormal, K::PrioAboveNormal),
-            (PriorityClass::Normal, K::PrioNormal),
-            (PriorityClass::BelowNormal, K::PrioBelowNormal),
-            (PriorityClass::Low, K::PrioLow),
-        ] {
-            let current = p.priority == cls;
-            if menu::check(ui, i18n::tr(key), current).clicked() {
-                let targets = action_targets(app, p, batch);
-                if targets.is_empty() {
-                    app.shared.toast(i18n::tr(K::ProcessExited));
-                    ui.close();
-                    return;
-                }
-                set_priority_for_targets(app, &ctx, targets, cls, key);
-                if save_priority && let Some(rule_key) = rule_key.as_deref() {
-                    update_saved_priority(app, rule_key, Some(cls));
-                }
-                ui.close();
-            }
-        }
-        if !batch {
-            menu::separator(ui);
-            let save = menu::toggle_enabled(
-                ui,
-                i18n::tr(K::SavePriorityForProgram),
-                &mut save_priority,
-                rule_key.is_some() && p.priority != PriorityClass::Unknown,
-            )
-            .on_disabled_hover_text(i18n::tr(K::SaveRuleNeedsPath));
-            if save.changed()
-                && let Some(rule_key) = rule_key.as_deref()
-            {
-                update_saved_priority(app, rule_key, save_priority.then_some(p.priority));
-            }
-        }
-    });
-
+    // Saved scheduling rules are program-scoped, not selection-scoped. Hide
+    // that control for a batch so changing several processes cannot silently
+    // persist a rule only for the row that opened the menu.
+    let rule_key = if batch { None } else { scheduling_rule_key(p) };
+    let targets = |app: &TaskManApp| action_targets(app, p, batch);
+    priority_submenu(
+        app,
+        ui,
+        &ctx,
+        &batch_label(i18n::tr(K::Priority)),
+        Some(p.priority),
+        (!batch).then_some(rule_key.clone()),
+        &targets,
+    );
     if menu::item(ui, &batch_label(i18n::tr(K::SetAffinity))).clicked() {
-        let targets = action_targets(app, p, batch);
-        if targets.is_empty() {
-            app.shared.toast(i18n::tr(K::ProcessExited));
-        } else {
-            let identity = crate::app::ProcessIdentity {
-                pid: p.pid,
-                start_epoch_s: p.start_epoch_s,
-            };
-            let rule_key = if batch { None } else { scheduling_rule_key(p) };
-            let save_for_program = rule_key.as_ref().is_some_and(|key| {
-                app.shared
-                    .settings
-                    .process_rules
-                    .get(key)
-                    .is_some_and(|rule| rule.affinity_mask.is_some())
-            });
-            let load_result = Arc::new(Mutex::new(None));
-            app.affinity_dialog = Some(AffinityDialog {
-                identity: identity.clone(),
-                targets,
-                mask: None,
-                system_mask: None,
-                error: None,
-                load_result: load_result.clone(),
-                save_for_program,
-                rule_key,
-            });
-            let actions = app.actions.clone();
-            let worker_result = load_result.clone();
-            let job = move || {
-                let result = actions
-                    .get_affinity_mask_checked(identity.pid, identity.start_epoch_s)
-                    .and_then(|mask| {
-                        actions
-                            .system_affinity_mask()
-                            .map(|system_mask| (mask, system_mask))
-                    })
-                    .map_err(|error| error.to_string());
-                *tm_core::sync::lock(&worker_result) = Some(result);
-            };
-            let wake = {
-                let ctx = ctx.clone();
-                move || ctx.request_repaint()
-            };
-            match &app.shared.executor {
-                Some(executor) => {
-                    if !executor.run_quiet(wake, job) {
-                        *tm_core::sync::lock(&load_result) =
-                            Some(Err(i18n::tr(K::ActionQueueFull).to_string()));
-                        ctx.request_repaint();
-                    }
-                }
-                None => {
-                    drop(job);
-                    *tm_core::sync::lock(&load_result) =
-                        Some(Err(i18n::tr(K::ActionFailed).to_string()));
-                    ctx.request_repaint();
-                }
-            }
-        }
+        let targets = targets(app);
+        let identity = crate::app::ProcessIdentity {
+            pid: p.pid,
+            start_epoch_s: p.start_epoch_s,
+        };
+        open_affinity_dialog(app, &ctx, identity, targets, rule_key);
         ui.close();
     }
 
@@ -3897,6 +3952,24 @@ pub fn process_properties_dialog(app: &mut TaskManApp, ctx: &egui::Context) {
             }
         }
     }
+    // Only the page on screen queries. The Modules page judges dormancy from
+    // the thread list, and the Threads page names start addresses from the
+    // module list, so those two pages keep both current.
+    let identity = dialog.identity.clone();
+    match dialog.tab {
+        ProcessPropertiesTab::Threads | ProcessPropertiesTab::Modules => {
+            crate::tabs::threads::tick(&mut dialog.threads, app, ctx, &identity);
+            crate::tabs::modules::ensure_loaded(app, &mut dialog.modules, ctx);
+        }
+        ProcessPropertiesTab::Network => {
+            crate::tabs::connections::tick(&mut dialog.network, app, ctx, &identity)
+        }
+        ProcessPropertiesTab::Services => {
+            crate::tabs::hosted_services::tick(&mut dialog.services, app, ctx, &identity)
+        }
+        _ => {}
+    }
+    let pal = theme::palette_ctx(ctx);
     let snapshot = app.latest_snapshot();
     let process = snapshot
         .as_deref()
@@ -3921,6 +3994,7 @@ pub fn process_properties_dialog(app: &mut TaskManApp, ctx: &egui::Context) {
     );
     let mut open = true;
     let mut close_clicked = false;
+    let mut service_jump = None;
     // A tab-through dialog (same contract as the settings dialog): Tab is NOT
     // consumed, so the tab strip, the footer buttons and the Close button are
     // reached with egui's own focus traversal. Esc closes as before; Enter
@@ -3938,46 +4012,65 @@ pub fn process_properties_dialog(app: &mut TaskManApp, ctx: &egui::Context) {
         let captured = crate::app_ui::capture_focus(ctx);
         ctx.data_mut(|d| d.insert_temp(restore_id, captured));
     }
-    let keys = crate::app_ui::consume_dialog_keys_tab_through(ctx, false);
-    let close_now = keys.escape || keys.enter;
+    // While the module-unload confirmation is up it owns Escape and Enter;
+    // consuming them here would close this dialog behind it instead.
+    let close_now = !dialog.modules.confirming() && {
+        let keys = crate::app_ui::consume_dialog_keys_tab_through(ctx, false);
+        keys.escape || keys.enter
+    };
+    let capabilities = app.actions.capabilities();
 
     egui::Window::new(title)
         .modal(true)
         .open(&mut open)
         .collapsible(false)
         .resizable(true)
-        .default_size([760.0, 560.0])
-        .min_size([640.0, 420.0])
+        .default_size([900.0, 600.0])
+        .min_size([680.0, 420.0])
         .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
         .show(ctx, |ui| {
             let mut general_tab: Option<egui::Response> = None;
-            ui.horizontal(|ui| {
-                let general = ui.selectable_label(
-                    dialog.tab == ProcessPropertiesTab::General,
-                    i18n::tr(K::General),
-                );
-                if general.clicked() {
-                    dialog.tab = ProcessPropertiesTab::General;
-                }
-                general_tab = Some(general);
-                if ui
-                    .selectable_label(
-                        dialog.tab == ProcessPropertiesTab::Statistics,
-                        i18n::tr(K::Statistics),
-                    )
-                    .clicked()
-                {
-                    dialog.tab = ProcessPropertiesTab::Statistics;
-                }
-                #[cfg(target_os = "windows")]
-                if ui
-                    .selectable_label(
-                        dialog.tab == ProcessPropertiesTab::Security,
-                        i18n::tr(K::Security),
-                    )
-                    .clicked()
-                {
-                    dialog.tab = ProcessPropertiesTab::Security;
+            let pages = [
+                (ProcessPropertiesTab::General, K::General, true),
+                (ProcessPropertiesTab::Statistics, K::Statistics, true),
+                (
+                    ProcessPropertiesTab::Threads,
+                    K::Threads,
+                    capabilities.process_threads,
+                ),
+                (
+                    ProcessPropertiesTab::Modules,
+                    K::Modules,
+                    capabilities.process_modules,
+                ),
+                (
+                    ProcessPropertiesTab::Network,
+                    K::ColNetwork,
+                    capabilities.process_connections,
+                ),
+                (
+                    ProcessPropertiesTab::Services,
+                    K::TabServices,
+                    capabilities.services_list,
+                ),
+                (
+                    ProcessPropertiesTab::Security,
+                    K::Security,
+                    cfg!(target_os = "windows"),
+                ),
+            ];
+            ui.horizontal_wrapped(|ui| {
+                for (page, key, available) in pages {
+                    if !available {
+                        continue;
+                    }
+                    let label = ui.selectable_label(dialog.tab == page, i18n::tr(key));
+                    if label.clicked() {
+                        dialog.tab = page;
+                    }
+                    if page == ProcessPropertiesTab::General {
+                        general_tab = Some(label);
+                    }
                 }
             });
             // The dialog opens on the General tab, focused: requested once on
@@ -4010,25 +4103,81 @@ pub fn process_properties_dialog(app: &mut TaskManApp, ctx: &egui::Context) {
             let body_height =
                 process_properties_body_height(ui.available_height(), ctx.content_rect().height());
             let security = process_security_summary(&dialog);
-            egui::ScrollArea::vertical()
-                .max_height(body_height)
-                .auto_shrink([false, true])
-                .show(ui, |ui| match dialog.tab {
-                    ProcessPropertiesTab::General => {
-                        process_properties_general(ui, snapshot, process, &security)
-                    }
-                    ProcessPropertiesTab::Statistics => process_properties_statistics(ui, process),
-                    ProcessPropertiesTab::Security => {
-                        #[cfg(target_os = "windows")]
-                        process_properties_security(
-                            ui,
-                            dialog.security.as_ref(),
-                            dialog.security_error.as_deref(),
-                        );
-                        #[cfg(not(target_os = "windows"))]
-                        ui.label("—");
-                    }
-                });
+            match dialog.tab {
+                // The list pages bring their own virtualized scrolling; they
+                // get a fixed-height region instead of a scroll area, sized
+                // from the same window-driven height so the dialog cannot
+                // grow with its content.
+                ProcessPropertiesTab::Threads
+                | ProcessPropertiesTab::Modules
+                | ProcessPropertiesTab::Network
+                | ProcessPropertiesTab::Services => {
+                    let size = egui::vec2(ui.available_width(), body_height);
+                    ui.allocate_ui_with_layout(
+                        size,
+                        egui::Layout::top_down(egui::Align::Min),
+                        |ui| {
+                            ui.set_min_size(size);
+                            match dialog.tab {
+                                ProcessPropertiesTab::Threads => {
+                                    let modules = dialog.modules.modules();
+                                    crate::tabs::threads::show(
+                                        app,
+                                        ui,
+                                        &mut dialog.threads,
+                                        modules.as_deref(),
+                                        &pal,
+                                    );
+                                }
+                                ProcessPropertiesTab::Modules => crate::tabs::modules::show(
+                                    app,
+                                    ui,
+                                    &mut dialog.modules,
+                                    dialog.threads.rows(),
+                                    &pal,
+                                ),
+                                ProcessPropertiesTab::Network => crate::tabs::connections::show(
+                                    app,
+                                    ui,
+                                    &mut dialog.network,
+                                    process,
+                                    &pal,
+                                ),
+                                _ => {
+                                    service_jump = crate::tabs::hosted_services::show(
+                                        app,
+                                        ui,
+                                        &mut dialog.services,
+                                        &identity,
+                                        &pal,
+                                    )
+                                }
+                            }
+                        },
+                    );
+                }
+                _ => {
+                    egui::ScrollArea::vertical()
+                        .max_height(body_height)
+                        .auto_shrink([false, true])
+                        .show(ui, |ui| match dialog.tab {
+                            ProcessPropertiesTab::Statistics => {
+                                process_properties_statistics(ui, process)
+                            }
+                            ProcessPropertiesTab::Security => {
+                                #[cfg(target_os = "windows")]
+                                process_properties_security(
+                                    ui,
+                                    dialog.security.as_ref(),
+                                    dialog.security_error.as_deref(),
+                                );
+                                #[cfg(not(target_os = "windows"))]
+                                ui.label("—");
+                            }
+                            _ => process_properties_general(ui, snapshot, process, &security),
+                        });
+                }
+            }
 
             ui.separator();
             let path = process
@@ -4061,11 +4210,6 @@ pub fn process_properties_dialog(app: &mut TaskManApp, ctx: &egui::Context) {
                     app.shared
                         .toast(i18n::trf(K::ErrMsg, &[&error.to_string()]));
                 }
-                if app.actions.capabilities().process_modules
-                    && ui.button(i18n::tr(K::ViewModules)).clicked()
-                {
-                    crate::tabs::modules::open(app, process, ctx);
-                }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui.button(i18n::tr(K::Close)).clicked() {
                         close_clicked = true;
@@ -4074,7 +4218,16 @@ pub fn process_properties_dialog(app: &mut TaskManApp, ctx: &egui::Context) {
             });
         });
 
-    if open && !close_clicked && !close_now {
+    // Drawn after the dialog so it sits on top of it.
+    if dialog.modules.confirming() {
+        crate::tabs::modules::unload_confirmation(app, ctx, &mut dialog.modules, &pal);
+    }
+    if let Some(name) = service_jump.as_ref() {
+        *tm_core::sync::lock(&app.svc_jump) = Some(name.clone());
+        app.tab = crate::app::Tab::Services;
+    }
+
+    if open && !close_clicked && !close_now && service_jump.is_none() {
         app.proc_props = Some(dialog);
     } else {
         let saved = ctx
@@ -4082,6 +4235,7 @@ pub fn process_properties_dialog(app: &mut TaskManApp, ctx: &egui::Context) {
             .flatten();
         crate::app_ui::restore_focus(ctx, saved);
         ctx.data_mut(|d| d.remove_temp::<Option<egui::Id>>(restore_id));
+        crate::tabs::modules::forget_confirmation(ctx);
     }
 }
 

@@ -430,7 +430,7 @@ impl CpuLoadAccountant {
         Some(Arc::new(out))
     }
 
-    fn nt_query(
+    pub(crate) fn nt_query(
         buf: &mut Vec<u8>,
         class: windows::Wdk::System::SystemInformation::SYSTEM_INFORMATION_CLASS,
     ) -> Option<usize> {
@@ -643,7 +643,7 @@ const THREAD_STATE_WAITING: u32 = 5;
 const WAIT_REASON_SUSPENDED: u32 = 5;
 const WINDOWS_TO_UNIX_EPOCH_100NS: i64 = 116_444_736_000_000_000;
 
-fn filetime_to_unix_seconds(create_time: i64) -> Option<i64> {
+pub(crate) fn filetime_to_unix_seconds(create_time: i64) -> Option<i64> {
     create_time
         .checked_sub(WINDOWS_TO_UNIX_EPOCH_100NS)
         .filter(|value| *value >= 0)
@@ -687,20 +687,20 @@ fn process_suspended(
 /// Byte offsets into `SYSTEM_PROCESS_INFORMATION`. The kernel does not
 /// export the layout, so it is addressed manually; the field order has been
 /// stable since Vista and matches Process Hacker's definition.
-struct Offsets {
+pub(crate) struct Offsets {
     /// WorkingSetPrivateSize, inside the crate's `Reserved1` blob.
     working_set_private: usize,
     /// HardFaultCount, inside the crate's `Reserved1` blob.
     hard_faults: usize,
-    create_time: usize,
+    pub(crate) create_time: usize,
     user_time: usize,
     kernel_time: usize,
-    pid: usize,
+    pub(crate) pid: usize,
     /// UNICODE_STRING ImageName (Length @ +0, Buffer pointer field follows).
     image_name: usize,
     /// Field holding the name offset, relative to the record start.
     image_name_buffer: usize,
-    base_priority: usize,
+    pub(crate) base_priority: usize,
     /// InheritedFromUniqueProcessId: the parent PID recorded at creation.
     inherited_from: usize,
     session_id: usize,
@@ -714,14 +714,14 @@ struct Offsets {
     /// only when the record actually reaches that far — a short record means
     /// unknown, never zero.
     io_counters: usize,
-    min_size: usize,
+    pub(crate) min_size: usize,
 }
 
 /// Size of the `IO_COUNTERS` block at [`Offsets::io_counters`].
 const IO_COUNTERS_BYTES: usize = 48;
 
 impl Offsets {
-    const fn get() -> Self {
+    pub(crate) const fn get() -> Self {
         if cfg!(target_pointer_width = "64") {
             // NextEntryOffset@0, NumberOfThreads@4, WorkingSetPrivateSize@8,
             // HardFaultCount@16, HighWatermark@20, CycleTime@24,
@@ -1171,19 +1171,19 @@ fn parse_cores(buf: &[u8], written: usize, nb_cpu: usize) -> Option<Vec<CoreRaw>
 
 // ---- little-endian-safe unchecked-free readers -----------------------------
 
-fn read_u32(b: &[u8], o: usize) -> u32 {
+pub(crate) fn read_u32(b: &[u8], o: usize) -> u32 {
     let mut s = [0u8; 4];
     s.copy_from_slice(&b[o..o + 4]);
     u32::from_ne_bytes(s)
 }
 
-fn read_i64(b: &[u8], o: usize) -> i64 {
+pub(crate) fn read_i64(b: &[u8], o: usize) -> i64 {
     let mut s = [0u8; 8];
     s.copy_from_slice(&b[o..o + 8]);
     i64::from_ne_bytes(s)
 }
 
-fn read_usize(b: &[u8], o: usize) -> usize {
+pub(crate) fn read_usize(b: &[u8], o: usize) -> usize {
     let n = std::mem::size_of::<usize>();
     let mut s = [0u8; 8];
     s[..n].copy_from_slice(&b[o..o + n]);

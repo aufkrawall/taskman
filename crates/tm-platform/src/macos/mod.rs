@@ -343,6 +343,8 @@ impl PlatformActions for MacActions {
             run_new_task: true,
             per_process_network: false,
             process_modules: false,
+            process_threads: false,
+            process_connections: false,
             unload_module: false,
             start_with_windows: false,
         }

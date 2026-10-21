@@ -1323,6 +1323,7 @@ fn context_menu(app: &mut TaskManApp, ui: &mut egui::Ui, row: &RowData) {
         }
         ui.close();
     }
+    scheduling_menu_items(app, ui, &ctx, row, batch, &batch_label);
     if menu::item(ui, i18n::tr(K::GoToDetails)).clicked() {
         app.pending_details_focus =
             Some(crate::app::PendingDetailsFocus(details_focus_targets(row)));
@@ -1377,21 +1378,6 @@ fn context_menu(app: &mut TaskManApp, ui: &mut egui::Ui, row: &RowData) {
             }
         }
     });
-    if app.actions.capabilities().process_modules
-        && menu::item(ui, i18n::tr(K::ViewModules)).clicked()
-    {
-        let process = app
-            .latest_snapshot()
-            .as_ref()
-            .and_then(|snapshot| snapshot.process(row.pid))
-            .cloned();
-        if let Some(process) = process {
-            crate::tabs::modules::open(app, &process, &ctx);
-        } else {
-            app.shared.toast(i18n::tr(K::ProcessExited));
-        }
-        ui.close();
-    }
     if menu::item(ui, i18n::tr(K::OnlineSearch)).clicked() {
         let url = search::online_search_url(&row.name);
         if let Err(error) = app.actions.open_url(&url) {
@@ -1423,6 +1409,79 @@ fn context_menu(app: &mut TaskManApp, ui: &mut egui::Ui, row: &RowData) {
                 pid: row.pid,
                 start_epoch_s: row.start_epoch_s,
             },
+        );
+        ui.close();
+    }
+}
+
+/// Priority and affinity for what the row stands for: the whole selection in
+/// a batch, every member of a collapsed group, or the one process. A group
+/// row ticks a priority only when all its members share it, and offers the
+/// saved per-program rule only when all of them are the same program.
+fn scheduling_menu_items(
+    app: &mut TaskManApp,
+    ui: &mut egui::Ui,
+    ctx: &egui::Context,
+    row: &RowData,
+    batch: bool,
+    batch_label: &dyn Fn(&str) -> String,
+) {
+    let scope = |app: &TaskManApp| -> Vec<crate::app::ProcessIdentity> {
+        let targets = if batch {
+            termination_targets_for_selection(app)
+        } else {
+            resolve_termination_targets(app, details_focus_targets(row))
+        };
+        targets.into_iter().map(|(identity, _)| identity).collect()
+    };
+    let members: Vec<tm_core::model::ProcessEntry> = {
+        let identities = scope(app);
+        app.latest_snapshot()
+            .map(|snapshot| {
+                identities
+                    .iter()
+                    .filter_map(|identity| snapshot.process(identity.pid).cloned())
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let current = members
+        .first()
+        .map(|first| first.priority)
+        .filter(|priority| members.iter().all(|member| member.priority == *priority));
+    let save_rule = if batch {
+        None
+    } else {
+        let keys: HashSet<Option<String>> = members
+            .iter()
+            .map(crate::tabs::details::scheduling_rule_key)
+            .collect();
+        match keys.len() {
+            // One program (or one process without a path: offered, but
+            // disabled with the reason).
+            1 => keys.into_iter().next(),
+            // Different programs: a rule for one of them is not what the
+            // row stands for.
+            _ => None,
+        }
+    };
+    crate::tabs::details::priority_submenu(
+        app,
+        ui,
+        ctx,
+        &batch_label(i18n::tr(K::Priority)),
+        current,
+        save_rule.clone(),
+        &scope,
+    );
+    if menu::item(ui, &batch_label(i18n::tr(K::SetAffinity))).clicked() {
+        let targets = scope(app);
+        crate::tabs::details::open_affinity_dialog(
+            app,
+            ctx,
+            identity_of(row),
+            targets,
+            save_rule.flatten(),
         );
         ui.close();
     }

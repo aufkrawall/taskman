@@ -39,7 +39,9 @@ pub fn live_pids_for_test() -> std::collections::HashSet<u32> {
     core_service::live_pids_for_test()
 }
 mod perfcounters;
+mod process_connections;
 mod process_ops;
+mod process_threads;
 pub use process_ops::{
     ProcessMachineType, ProcessProtectionLevel, ProcessSecurityInfo, command_line_of,
     enable_debug_privilege,
@@ -342,6 +344,8 @@ impl PlatformActions for WinActions {
             run_new_task: true,
             per_process_network: false,
             process_modules: true,
+            process_threads: true,
+            process_connections: true,
             unload_module: true,
             start_with_windows: true,
         }
@@ -454,6 +458,16 @@ impl PlatformActions for WinActions {
         expected_start_epoch_s: Option<i64>,
     ) -> Result<Vec<ProcessModule>> {
         process_ops::list_process_modules(pid, expected_start_epoch_s)
+    }
+    fn list_process_threads(
+        &self,
+        pid: u32,
+        expected_start_epoch_s: Option<i64>,
+    ) -> Result<ProcessThreads> {
+        process_threads::list_process_threads(pid, expected_start_epoch_s)
+    }
+    fn list_process_connections(&self, pid: u32) -> Result<Vec<ProcessConnection>> {
+        process_connections::list_process_connections(pid)
     }
     fn unload_process_module(
         &self,

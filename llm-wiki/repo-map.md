@@ -75,6 +75,11 @@ platform boundary (`tm-core` ← `tm-platform` ← `tm-app` / `tm-service`), and
     mapping PID → executable path, hosted service display name(s) and
     configured account, identity-safe minidumps, ToolHelp module
     enumeration, guarded same-architecture DLL unload, non-blocking launch),
+    `process_threads.rs` (one process's threads from ONE handle-free
+    `SystemExtendedProcessInformation` snapshot, identity-checked against that
+    record; start address + cycles through a per-thread handle proven by
+    owning PID + creation time), `process_connections.rs` (IP Helper
+    owner-PID TCP/UDP tables, v4 + v6),
     `startup.rs` (Run keys + Startup folders + StartupApproved incl. the
     folder-subkey fix and best-effort publisher resolution), `services.rs`,
     `users.rs`, `image_path.rs` (`NtQuerySystemInformation(SystemProcessIdInformation)`:
@@ -169,11 +174,17 @@ platform boundary (`tm-core` ← `tm-platform` ← `tm-app` / `tm-service`), and
     performance; Processes keeps native grouped presentation, Details can
     switch between flat and literal raw-PPID tree, offers optional combined/receive/send
     per-process network-rate columns backed by the same on-demand ETW source as Processes,
-    and owns a bounded, identity-safe Process Properties inspector (General/Statistics/Security);
+    and owns a bounded, identity-safe Process Properties inspector
+    (General/Statistics/Threads/Modules/Network/Services/Security);
     its Windows Security page lazily queries PPL/protection, critical state,
     image machine and DEP/ASLR/CFG/CET/Win32k/code-integrity/image-load and
-    related mitigation policies instead of adding them to the hot sampler;
-    Modules is an async on-demand inspector with guarded unload),
+    related mitigation policies instead of adding them to the hot sampler.
+    The list pages live in their own modules — `threads.rs` (thread list +
+    the evidence-based dormancy `Tracker`), `modules.rs` (module list with
+    guarded unload, per-module thread attribution), `connections.rs`,
+    `hosted_services.rs` — and query through `inspector::Poll` ONLY while
+    their page is on screen; Threads and Modules keep each other's list
+    current because each needs the other),
     `selection.rs` (multi-row process selection shared by Processes and
     Details: native click gestures, identity-keyed, primary vs. full set),
     `widgets/tablekit.rs` (TM-style

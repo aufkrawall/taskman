@@ -1240,6 +1240,20 @@ impl PlatformActions for BrokeredActions {
         }
     }
 
+    // Both are handle-free kernel/IP Helper reads that already see every
+    // process from the user's token; they never cross the broker.
+    fn list_process_threads(
+        &self,
+        pid: u32,
+        expected_start_epoch_s: Option<i64>,
+    ) -> Result<crate::actions::ProcessThreads> {
+        self.local.list_process_threads(pid, expected_start_epoch_s)
+    }
+
+    fn list_process_connections(&self, pid: u32) -> Result<Vec<crate::actions::ProcessConnection>> {
+        self.local.list_process_connections(pid)
+    }
+
     fn unload_process_module(
         &self,
         pid: u32,

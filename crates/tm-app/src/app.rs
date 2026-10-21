@@ -352,8 +352,6 @@ pub struct TaskManApp {
     pub selected_startup_id: Option<String>,
     /// Process-properties dialog bound to an exact process identity.
     pub proc_props: Option<crate::tabs::details::ProcessPropertiesDialog>,
-    /// On-demand System Informer-style loaded-module inspector.
-    pub module_dialog: Option<crate::tabs::modules::State>,
     /// Cross-tab jump: services tab should select this service name.
     pub svc_jump: Arc<Mutex<Option<String>>>,
 
@@ -800,7 +798,6 @@ impl TaskManApp {
             startup_props: None,
             selected_startup_id: None,
             proc_props: None,
-            module_dialog: None,
             svc_jump: Arc::new(Mutex::new(None)),
             search: String::new(),
             processes_state,
@@ -1850,9 +1847,6 @@ impl eframe::App for TaskManApp {
         if self.proc_props.is_some() {
             crate::tabs::details::process_properties_dialog(self, &ctx);
         }
-        if self.module_dialog.is_some() {
-            crate::tabs::modules::dialog(self, &ctx, &pal);
-        }
         if self.active_dump.is_some() {
             crate::tabs::details::dump_progress_dialog(self, &ctx, &pal);
         }
@@ -1988,7 +1982,6 @@ impl TaskManApp {
             || self.pending_uac_virtualization.is_some()
             || self.startup_props.is_some()
             || self.proc_props.is_some()
-            || self.module_dialog.is_some()
             || self.active_dump.is_some()
             || self.details_state.select_columns_open
     }

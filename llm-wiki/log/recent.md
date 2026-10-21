@@ -1,3 +1,17 @@
+- 2026-10-21 (Process Properties pages): Processes context menu gained
+  Priority/Set affinity (shared `details::priority_submenu` /
+  `open_affinity_dialog`; group rows act on all members). Modules moved from
+  its own dialog into Process Properties; new Threads, Network and Services
+  pages. Finding: on build 26300 an unelevated
+  `SystemExtendedProcessInformation` query returns every thread with
+  `StartAddress`, `StackBase`, `StackLimit` and `Win32StartAddress` = 0 (only
+  `TebBase` survives) — caught by the live test
+  `live_table_lists_this_process_threads_and_parked_threads_stay_still`;
+  start addresses now come from a per-thread handle. Dormancy evidence is
+  context switches + CPU time + cycles + on-CPU state (a spinning thread can
+  keep its processor without a context switch). GUI not verified by the
+  agent (a debug launch hands off to the running instance); awaiting the
+  user's visual check.
 - 2026-10-21 (follow-up): hotkey over DOOM worked with TaskMan in the tray
   but not with its window minimized. The log showed every press answered by
   the hook within 0-110 ms, so delivery was fine; the window is band 16 and

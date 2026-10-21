@@ -22,6 +22,8 @@ pub struct Capabilities {
     pub run_new_task: bool,
     pub per_process_network: bool,
     pub process_modules: bool,
+    pub process_threads: bool,
+    pub process_connections: bool,
     pub unload_module: bool,
     pub start_with_windows: bool,
 }
@@ -95,6 +97,178 @@ pub struct ProcessModule {
     pub path: String,
     pub base_address: u64,
     pub size_bytes: u64,
+}
+
+/// Scheduler state of one thread, as the kernel's process table reports it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ThreadState {
+    Initialized,
+    Ready,
+    Running,
+    Standby,
+    Terminated,
+    Waiting,
+    Transition,
+    DeferredReady,
+    Other(u32),
+}
+
+impl ThreadState {
+    /// `KTHREAD_STATE` as `SYSTEM_THREAD_INFORMATION.ThreadState` carries it.
+    pub fn from_raw(raw: u32) -> Self {
+        match raw {
+            0 => Self::Initialized,
+            1 => Self::Ready,
+            2 => Self::Running,
+            3 => Self::Standby,
+            4 => Self::Terminated,
+            5 => Self::Waiting,
+            6 => Self::Transition,
+            7 => Self::DeferredReady,
+            other => Self::Other(other),
+        }
+    }
+}
+
+/// `KWAIT_REASON` name, the way System Informer and WinDbg print it. These
+/// are kernel identifiers, not prose, so they are deliberately not localized.
+pub fn wait_reason_name(raw: u32) -> Option<&'static str> {
+    const NAMES: [&str; 43] = [
+        "Executive",
+        "FreePage",
+        "PageIn",
+        "PoolAllocation",
+        "DelayExecution",
+        "Suspended",
+        "UserRequest",
+        "WrExecutive",
+        "WrFreePage",
+        "WrPageIn",
+        "WrPoolAllocation",
+        "WrDelayExecution",
+        "WrSuspended",
+        "WrUserRequest",
+        "WrEventPair",
+        "WrQueue",
+        "WrLpcReceive",
+        "WrLpcReply",
+        "WrVirtualMemory",
+        "WrPageOut",
+        "WrRendezvous",
+        "WrKeyedEvent",
+        "WrTerminated",
+        "WrProcessInSwap",
+        "WrCpuRateControl",
+        "WrCalloutStack",
+        "WrKernel",
+        "WrResource",
+        "WrPushLock",
+        "WrMutex",
+        "WrQuantumEnd",
+        "WrDispatchInt",
+        "WrPreempted",
+        "WrYieldExecution",
+        "WrFastMutex",
+        "WrGuardedMutex",
+        "WrRundown",
+        "WrAlertByThreadId",
+        "WrDeferredPreempt",
+        "WrPhysicalFault",
+        "WrIoRing",
+        "WrMdlCache",
+        "WrRcu",
+    ];
+    NAMES.get(raw as usize).copied()
+}
+
+/// One thread of a process. Fetched on demand while Process Properties shows
+/// its Threads page — never part of the 1 Hz snapshot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProcessThread {
+    pub tid: u32,
+    /// The routine the thread was created to run (`Win32StartAddress`),
+    /// `None` when the kernel reported none.
+    pub start_address: Option<u64>,
+    pub priority: i32,
+    pub base_priority: i32,
+    /// Monotonic count of times the scheduler switched this thread onto a
+    /// processor. An unchanged count between two queries proves the thread
+    /// never ran in between — the evidence behind the "dormant" mark.
+    pub context_switches: u32,
+    pub kernel_time_100ns: u64,
+    pub user_time_100ns: u64,
+    pub created_epoch_s: Option<i64>,
+    pub state: ThreadState,
+    /// Only meaningful while `state` is `Waiting`.
+    pub wait_reason: u32,
+    /// Cumulative CPU cycles. `None` when the thread could not be opened
+    /// (another user's or a protected process) — never a fabricated zero.
+    pub cycles: Option<u64>,
+}
+
+/// Every thread of one exact process, from one kernel snapshot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProcessThreads {
+    /// The process's base priority, which the threads' symbolic priority
+    /// ("Normal", "Highest", ...) is relative to.
+    pub process_base_priority: i32,
+    pub threads: Vec<ProcessThread>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ConnectionProtocol {
+    Tcp,
+    Tcp6,
+    Udp,
+    Udp6,
+}
+
+/// `MIB_TCP_STATE`. UDP endpoints have no state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TcpState {
+    Closed,
+    Listen,
+    SynSent,
+    SynReceived,
+    Established,
+    FinWait1,
+    FinWait2,
+    CloseWait,
+    Closing,
+    LastAck,
+    TimeWait,
+    DeleteTcb,
+    Other(u32),
+}
+
+impl TcpState {
+    pub fn from_raw(raw: u32) -> Self {
+        match raw {
+            1 => Self::Closed,
+            2 => Self::Listen,
+            3 => Self::SynSent,
+            4 => Self::SynReceived,
+            5 => Self::Established,
+            6 => Self::FinWait1,
+            7 => Self::FinWait2,
+            8 => Self::CloseWait,
+            9 => Self::Closing,
+            10 => Self::LastAck,
+            11 => Self::TimeWait,
+            12 => Self::DeleteTcb,
+            other => Self::Other(other),
+        }
+    }
+}
+
+/// One TCP connection/listener or UDP endpoint owned by a process.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProcessConnection {
+    pub protocol: ConnectionProtocol,
+    pub local: std::net::SocketAddr,
+    /// `None` for listeners and UDP endpoints.
+    pub remote: Option<std::net::SocketAddr>,
+    pub state: Option<TcpState>,
 }
 
 /// Wire/request capability marker appended to module paths by current GUIs.
@@ -252,6 +426,22 @@ pub trait PlatformActions: Send + Sync {
         _expected_start_epoch_s: Option<i64>,
     ) -> Result<Vec<ProcessModule>> {
         Err(tm_core::TmError::Unsupported("process modules"))
+    }
+    /// Every thread of one exact process. `expected_start_epoch_s` is checked
+    /// against the SAME kernel snapshot the threads come from, so a recycled
+    /// PID can never hand back another process's threads.
+    fn list_process_threads(
+        &self,
+        _pid: u32,
+        _expected_start_epoch_s: Option<i64>,
+    ) -> Result<ProcessThreads> {
+        Err(tm_core::TmError::Unsupported("process threads"))
+    }
+    /// TCP connections/listeners and UDP endpoints the system attributes to
+    /// `pid`. The connection tables carry no process creation time; callers
+    /// re-check the identity against a fresh snapshot.
+    fn list_process_connections(&self, _pid: u32) -> Result<Vec<ProcessConnection>> {
+        Err(tm_core::TmError::Unsupported("process connections"))
     }
     /// Ask the target process to perform one `FreeLibrary` call for one exact
     /// mapped module. This is a diagnostic escape hatch: callers must

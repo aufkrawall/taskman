@@ -767,7 +767,22 @@ rebase runbook.
 - Processes and Details gained arrow/Home/End/Page navigation; Delete requests
   process termination through an explicit dialog. Context menus now include
   consistent copy/search/location/properties/dump/module actions as applicable.
-- The on-demand Modules inspector enumerates DLL name/path/base/size outside the
+- Process Properties (2026-10-21) is the System Informer-style inspector:
+  General, Statistics, Threads, Modules, Network, Services, Security. The
+  list pages query only while shown. Threads come from one
+  `SystemExtendedProcessInformation` snapshot (no handle needed, so SYSTEM
+  and service processes work unelevated); Windows 11 build 26300 ZEROES that
+  record's `Win32StartAddress`/`StartAddress`/stack bounds for callers
+  without SeDebugPrivilege, so the start address is read per thread with
+  `NtQueryInformationThread(ThreadQuerySetWin32StartAddress)` and shows
+  `module+offset` (no symbols). A thread is *dormant* only on evidence: not
+  on a processor and no change in context switches, CPU time or cycles for
+  `DORMANT_AFTER` (5 s) of observation; "never observed" is not dormant. A
+  module is dormant only when every thread STARTED in it is; a module that
+  starts no thread is never judged, and an unknown start address anywhere
+  blocks the dormant verdict. Modules is no longer a separate dialog or
+  context-menu entry.
+- The on-demand Modules page enumerates DLL name/path/base/size outside the
   hot sampling path. Unload is an explicitly dangerous, confirmation-gated
   action the user aims at ANY enumerated module (no protected-module concept);
   same-architecture targets only, and process creation time plus exact module
