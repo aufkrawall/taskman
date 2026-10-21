@@ -1,3 +1,17 @@
+- 2026-10-21: Released v0.1.21 (tag on `b1ccbc6`, the bump commit). Followed
+  `build.md` §Publishing path: `--check` + `--audit` green, stable clippy
+  green, bump pushed on main, `build.py --all-targets` for archives (Windows
+  x86_64/ARM64, Linux x86_64 musl) and setup installers (`taskman-v0.1.21-windows-x86_64-setup.exe`,
+  `taskman-v0.1.21-windows-arm64-setup.exe`), `.sha256` generated beside each,
+  `gh release create --latest` with target `b1ccbc6fae29921303bbc9b746bd3b2666241d14`.
+  Release covers: Process Properties pages (Threads, Network endpoints, Services,
+  and integrated Modules view), dormant thread/module indicators, priority/affinity
+  context actions on Processes tab, physical disk grouping in Performance cards (core
+  service protocol v7), and extensive hotkey, keyboard focus, and telemetry accuracy fixes.
+  Verified packaged archives: Windows zip binaries pass `--selfcheck` (`taskman.exe`
+  with `--mock`, `taskman-service.exe` reporting protocol v7), setup payloads verify
+  cleanly, and the Linux musl binary passes real `--selfcheck` under WSL.
+
 - 2026-10-21 (focus after ANY dialog — real root cause): the menu-owner
   fix below was necessary but not sufficient; the user still saw no focus
   after Process Properties, and the same after End process via Delete. Two
