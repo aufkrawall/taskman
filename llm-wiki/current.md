@@ -83,7 +83,9 @@ is open (`TaskManApp::modal_open` — the same gate as Delete — plus
 to the first match under the page's LIVE display order — the same
 filtered/sorted model the type-ahead walk uses — and scrolls it into view
 (`commit_search_selection`); the field surrenders focus so the arrows take
-over; Esc clears globally behind the dialog/popup/help gate.
+over; Esc clears globally behind the dialog/popup/help gate. While the field
+has focus its lock filter (`SEARCH_FOCUS_FILTER`) keeps Tab AND the arrows —
+a Tab-only filter let Left/Right move egui's spatial focus out of the field.
 
 **Charts are focusable and keyboard-scrubbable** (`widgets/chart.rs`).
 `keyboard_sample` pins the cursor to a SAMPLE TIMESTAMP rather than an index,

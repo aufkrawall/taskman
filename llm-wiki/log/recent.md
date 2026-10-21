@@ -1,3 +1,47 @@
+- 2026-10-21: GPU row/total mismatch + search-box focus visuals (user report:
+  a process at 100 % GPU under a 1 % Processes header; search box sometimes
+  without blue frame/caret while selected).
+  GPU root cause: PDH publishes engine instances for the software Microsoft
+  Basic Render Driver (17 lowercase `3d` engines on its own LUID); a WARP/
+  headless test runner pinned them at 100 % while `filter_adapters` keeps that
+  adapter out of `snap.gpus` (header, Performance page). `process_gpu_view`
+  counted every LUID. Fix (`gpu.rs`, `sampler.rs`): per-process view covers
+  only the merged adapters; engine load = SUM of per-process shares per
+  physical engine (verified live: several pids share one engine instance),
+  adapter = busiest engine; `ProcessEntry::gpu_engines` + `GpuGroupLoad`
+  (tm-core) aggregate family/user rows per engine; App roots sort by their
+  displayed values (the old sort used a subtree sum incl. foreign-category
+  descendants); the DXGI cache keeps software adapters so their LUID no longer
+  forces a 30 s re-enumeration; engine label uses `GpuInfo::id`.
+  Search root causes: (A) the panel replaced the TextEdit's focus-lock filter
+  with Tab-only (since 96cd777), so Left/Right fell through to egui's spatial
+  focus move — now `SEARCH_FOCUS_FILTER` keeps the arrows; (C) the caret blink
+  restarted only on click/edit, so keyboard focus or window activation could
+  hide it up to 0.5 s — egui fork #7 restarts it when the caret starts
+  showing. Not changed (no evidence): a winit/OS window-focus desync would also
+  hide ring and caret (`Response::has_focus` needs `RawInput::focused`); if the
+  report persists with typing working, add change-only focus logging first.
+  Regression tests: `engine_load_is_the_sum_of_every_process_share`,
+  `process_view_covers_only_the_merged_adapters`,
+  `process_view_labels_by_adapter_and_shares_engine_ids`, `gpu_group_load_*`,
+  `family_gpu_is_the_busiest_engine_and_sorts_as_shown`,
+  `session_gpu_is_the_busiest_engine_not_the_sum`,
+  `arrows_keep_focus_in_the_search_field`,
+  `search_caret_shows_as_soon_as_the_field_gets_the_keyboard`.
+  Follow-ups from a read-only row-vs-total audit (open):
+  - Verified: per-process disk active time is a share of service time summed
+    over ALL disks scaled by the BUSIEST disk's active % (`disk_active_pct`,
+    `DiskNumber` never decoded), so a process saturating a slow disk can read
+    a few percent; carried-forward rows (`carry_process_disk`, window < 100 ms)
+    keep an absolute % instead of a share of the current total.
+  - Reported, not yet verified: DPC time lands in "Terminated processes"
+    (only `% Interrupt Time` is subtracted); pseudo-rows keep a stale % during
+    their 4-tick decay hold; CPU capacity covers processor group 0 only on
+    >64-LP machines; network header sums adapters and recv+sent against a
+    one-way link speed; per-process network includes loopback; Performance
+    disk cards are per volume, not per physical disk; startup impact charges
+    every instance of a shared image.
+
 - 2026-10-06: Released v0.1.20 (tag on `6e8e472`, the bump commit). Followed
   `build.md` §Publishing path: `--check` + `--audit` green, stable clippy
   green, bump pushed on main, `build.py --all-targets` for archives (Windows

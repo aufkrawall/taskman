@@ -855,6 +855,7 @@ impl TextEdit<'_> {
 
         let should_paint_ime_visuals_the_legacy_way = ui.visuals().ime_composition.legacy_visuals;
 
+        let mut cursor_showing = false;
         if ui.is_rect_visible(inner_rect) {
             let has_focus = ui.memory(|mem| mem.has_focus(id));
 
@@ -893,6 +894,15 @@ impl TextEdit<'_> {
                     // * Don't repaint the ui because of a blinking cursor in an app that is not in focus
                     let viewport_has_focus = ui.input(|i| i.focused);
                     if viewport_has_focus {
+                        // TASKMAN-FORK: the blink phase only restarted on a click or
+                        // an edit. Focus arriving by keyboard or by the window being
+                        // activated landed in an arbitrary phase, hiding the cursor
+                        // for up to `off_duration`: a focused field that looked
+                        // unfocused. Restart it whenever the cursor starts showing.
+                        if !state.cursor_showing {
+                            state.last_interaction_time = now;
+                        }
+                        cursor_showing = true;
                         let time_since_last_interaction = now - state.last_interaction_time;
                         let cursor_purpose = if should_paint_ime_visuals_the_legacy_way {
                             &TextEditCursorPurpose::Selection
@@ -948,6 +958,7 @@ impl TextEdit<'_> {
             }
         }
 
+        state.cursor_showing = cursor_showing;
         state.clone().store(ui.ctx(), id);
 
         if response.changed() {

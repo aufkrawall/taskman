@@ -56,6 +56,11 @@ pub struct TextEditState {
     /// Used to pause the cursor animation when typing.
     #[cfg_attr(feature = "serde", serde(skip))]
     pub(crate) last_interaction_time: f64,
+
+    /// TASKMAN-FORK: whether the cursor was being painted the last time this
+    /// `TextEdit` ran, so the blink restarts "on" when it starts again.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub(crate) cursor_showing: bool,
 }
 
 impl TextEditState {

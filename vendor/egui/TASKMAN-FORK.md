@@ -16,9 +16,10 @@ It started for two rendering things taskman needs that are not reachable from st
    used to mean WARP, a D3D12 driver emulated on the CPU at ~14 cores and 2.9 fps.
 
 Both are served by one new backend, so they are one change. The inventory below also
-carries two later, unrelated additions: the keyboard Menu/Application key (#5) and modal
+carries later, unrelated additions: the keyboard Menu/Application key (#5) and modal
 windows plus public accesskit reparenting (#6), both of which the keyboard and
-screen-reader model in `llm-wiki/current.md` depends on.
+screen-reader model in `llm-wiki/current.md` depends on, and a text-cursor blink restart
+(#7).
 
 The full design, the blend math, and the verification plan live in
 `llm-wiki/render-pipeline.md` in the parent repo. This file is only the *inventory* of what
@@ -194,6 +195,15 @@ Tab — see `llm-wiki/current.md` § Keyboard interaction model.
 Not droppable while taskman relies on it. A rebase that touches `Focus::end_pass` or
 `Memory::interested_in_focus` is a prompt to check this table: both are hot paths where
 upstream refactors freely.
+
+### 7. `egui`: the text cursor blink restarts when the cursor appears
+
+| File | Change | Why |
+| --- | --- | --- |
+| `crates/egui/src/widgets/text_edit/state.rs` | `TextEditState::cursor_showing` (serde-skipped) | Remembers whether the cursor was painted on the previous run of that `TextEdit`. |
+| `crates/egui/src/widgets/text_edit/builder.rs` | resets `last_interaction_time` on the first run that paints the cursor again | Upstream restarts the blink only on a click or an edit. Keyboard focus (taskman's Ctrl+F, F6, Tab hand-offs, focus restored after a dialog) and window activation landed in an arbitrary phase, so the focused search box showed no cursor for up to `off_duration`. |
+
+Behaviour-only and tiny; droppable once upstream restarts the blink on focus gain.
 
 ## Rebase runbook
 

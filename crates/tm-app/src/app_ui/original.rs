@@ -156,15 +156,8 @@ pub fn top_search_panel(app: &mut TaskManApp, ui_root: &mut egui::Ui, pal: &Pale
             // over the card's neutral one while the field owns the keyboard.
             // Painting only — no layout, no hover change.
             if edit.has_focus() {
-                ui.ctx().memory_mut(|mem| {
-                    mem.set_focus_lock_filter(
-                        search_id,
-                        egui::EventFilter {
-                            tab: true,
-                            ..Default::default()
-                        },
-                    );
-                });
+                ui.ctx()
+                    .memory_mut(|mem| mem.set_focus_lock_filter(search_id, SEARCH_FOCUS_FILTER));
                 focus_ring(ui, box_rect, 16.0, pal);
             }
 
@@ -1131,6 +1124,22 @@ fn commit_search_on_enter(
     ctx.input_mut(|i| i.consume_key(Default::default(), egui::Key::Enter));
     true
 }
+
+/// Keys the focused search field keeps from egui's focus traversal.
+///
+/// This REPLACES the text edit's own filter, which keeps the arrows: a
+/// Tab-only filter let Left/Right fall through to egui's spatial focus move,
+/// so moving the caret jumped focus to the sidebar or the toolbar and the
+/// field lost its ring and caret while still showing the text being edited.
+/// Tab is routed by the panel; Down is consumed by
+/// [`commit_search_on_down`] first; Escape is left to egui, which drops focus
+/// before the panel's Escape-clears-the-search handling runs.
+const SEARCH_FOCUS_FILTER: egui::EventFilter = egui::EventFilter {
+    tab: true,
+    horizontal_arrows: true,
+    vertical_arrows: true,
+    escape: false,
+};
 
 /// Down Arrow while search is focused commits the match and moves focus to
 /// the current content list. Tab retains the normal control traversal.
@@ -4155,6 +4164,121 @@ mod tests {
             Some(id1),
             "tab filter installed on first frame must prevent focus movement on second frame"
         );
+    }
+
+    /// Regression: the search field's focus filter dropped the arrows, so
+    /// Left/Right moved egui's focus to the nearest widget in that direction
+    /// (a sidebar tab, a toolbar button) and the field lost its ring and
+    /// caret mid-edit. The caret must move; focus must stay.
+    #[test]
+    fn arrows_keep_focus_in_the_search_field() {
+        let ctx = egui::Context::default();
+        let screen = Rect::from_min_size(Pos2::ZERO, egui::vec2(800.0, 600.0));
+        let search_id = egui::Id::new("global-search");
+        let mut text = String::from("fg_flow");
+        let key = |key| egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: Default::default(),
+        };
+        let frame = |events: Vec<egui::Event>, text: &mut String| {
+            let mut out = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(screen),
+                    events,
+                    focused: true,
+                    ..Default::default()
+                },
+                |ui| {
+                    // Focusable neighbours on every side, like the sidebar
+                    // (left/below) and the toolbar (right/below).
+                    for (name, at) in [
+                        ("left", Pos2::new(20.0, 120.0)),
+                        ("right", Pos2::new(700.0, 120.0)),
+                        ("above", Pos2::new(300.0, 0.0)),
+                    ] {
+                        ui.interact(
+                            Rect::from_min_size(at, egui::vec2(40.0, 20.0)),
+                            egui::Id::new(name),
+                            Sense::click(),
+                        );
+                    }
+                    let mut edit_ui = ui.new_child(egui::UiBuilder::new().max_rect(
+                        Rect::from_min_size(Pos2::new(250.0, 40.0), egui::vec2(300.0, 28.0)),
+                    ));
+                    let edit = edit_ui.add(egui::TextEdit::singleline(text).id(search_id));
+                    if edit.has_focus() {
+                        ui.memory_mut(|m| m.set_focus_lock_filter(search_id, SEARCH_FOCUS_FILTER));
+                    }
+                },
+            );
+            out.textures_delta.clear();
+        };
+        ctx.memory_mut(|m| m.request_focus(search_id));
+        frame(Vec::new(), &mut text);
+        frame(Vec::new(), &mut text);
+        let caret = || {
+            egui::TextEdit::load_state(&ctx, search_id)
+                .and_then(|state| state.cursor.char_range())
+                .map(|range| range.primary.index.0)
+        };
+        for (arrow, at) in [
+            (egui::Key::ArrowLeft, 6),
+            (egui::Key::ArrowLeft, 5),
+            (egui::Key::ArrowRight, 6),
+        ] {
+            frame(vec![key(arrow)], &mut text);
+            assert_eq!(
+                ctx.memory(|m| m.focused()),
+                Some(search_id),
+                "{arrow:?} moved focus out of the search field"
+            );
+            assert_eq!(caret(), Some(at), "{arrow:?} must move the caret");
+        }
+        frame(vec![key(egui::Key::ArrowUp)], &mut text);
+        assert_eq!(ctx.memory(|m| m.focused()), Some(search_id));
+        assert_eq!(text, "fg_flow");
+    }
+
+    /// The caret shows the moment the field gets the keyboard. The blink only
+    /// restarted on a click or an edit, so focus by keyboard (Ctrl+F, F6, Tab)
+    /// or by activating the window landed in an arbitrary phase and hid the
+    /// caret for up to half a second (egui fork, TASKMAN-FORK.md #7).
+    #[test]
+    fn search_caret_shows_as_soon_as_the_field_gets_the_keyboard() {
+        let ctx = egui::Context::default();
+        let screen = Rect::from_min_size(Pos2::ZERO, egui::vec2(800.0, 600.0));
+        let search_id = egui::Id::new("global-search");
+        let mut text = String::from("abc");
+        let caret_painted = |time: f64, window_focused: bool, text: &mut String| {
+            let mut out = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(screen),
+                    time: Some(time),
+                    focused: window_focused,
+                    ..Default::default()
+                },
+                |ui| {
+                    ui.add(egui::TextEdit::singleline(text).id(search_id));
+                },
+            );
+            out.textures_delta.clear();
+            out.shapes
+                .iter()
+                .any(|clipped| matches!(clipped.shape, egui::Shape::LineSegment { .. }))
+        };
+        assert!(!caret_painted(0.0, true, &mut text), "no focus, no caret");
+        // Keyboard focus 0.7 s later: the old phase (0.7 into a 0.5 on /
+        // 0.5 off cycle) was "off".
+        ctx.memory_mut(|m| m.request_focus(search_id));
+        assert!(caret_painted(0.7, true, &mut text));
+        // Another window takes the foreground: no caret, focus kept.
+        assert!(!caret_painted(0.8, false, &mut text));
+        assert_eq!(ctx.memory(|m| m.focused()), Some(search_id));
+        // Back to this window at an "off" phase of the old clock.
+        assert!(caret_painted(1.65, true, &mut text));
     }
 
     #[test]

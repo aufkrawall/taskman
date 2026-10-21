@@ -20,6 +20,13 @@
   values, so a game on the 3D engine plus a video on the decoder could read
   130 %. Groups now report their busiest engine like the total does, and
   sorting by a resource column orders app rows by the values they show.
+- **Search box lost focus on Left/Right:** moving the caret with the arrow
+  keys jumped keyboard focus to the sidebar or a toolbar button, so the box
+  dropped its blue frame and caret while still showing the text being
+  edited (regression from 2026-09-27). The arrows now move the caret.
+- **Search caret missing after keyboard focus:** focusing the search box
+  with Ctrl+F, F6 or Tab, or switching back to the window, could leave the
+  caret hidden for up to half a second; it now appears immediately.
 - **GPU engine column named the wrong GPU:** the Details "GPU engine" label
   used the adapter's internal node index, so every GPU read "GPU 0"; it now
   uses the GPU number shown on the Performance page.
