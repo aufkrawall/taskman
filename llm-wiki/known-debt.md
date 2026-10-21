@@ -305,8 +305,20 @@ remain follow-up rather than being simulated in headless tests:
   it. The hook thread is kept off every blocking path so that should not
   happen, but a machine thrashing hard enough to stall a HIGHEST-priority,
   non-throttled thread can still cause it; the replacement then keeps working
-  everywhere except over fullscreen games until TaskMan restarts. Periodic
+  everywhere except over fullscreen games. Since 2026-10-21 any launch that
+  hands off to the running instance (Start menu, taskbar, Ctrl+Alt+Del screen,
+  Explorer's hotkey) re-installs the hook, so the gap lasts only until the
+  next such launch rather than until TaskMan restarts. Periodic
   re-installation was rejected as polling on the input path.
+- **Hotkey cases the hook cannot cover** (2026-10-21):
+  - An ELEVATED foreground window while TaskMan runs unelevated: low-level
+    hooks are expected not to see input aimed at higher-integrity windows
+    (UIPI; not verified here). Explorer's path still works there, except
+    over fullscreen apps. "Always start elevated" covers it.
+  - An application that swallows Ctrl or Shift itself: the system never
+    sees the modifier, so there is no combo to match.
+  - A newer hook that re-installs itself on every keystroke between the
+    chord and Escape would still win; nothing known does this.
 
 - **Small accepted residuals from the 2026-10-03 audit:**
   - `format::format_date` renders a UTC calendar date (App history "since",

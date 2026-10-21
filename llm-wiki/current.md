@@ -269,10 +269,34 @@ cost while it is there. Treat every line as a rule, not a description.
   thing that may be wedged when a task manager is wanted.
 - **Ctrl+Shift+Esc is only swallowed when something will answer it.** The hook
   passes the combo through to Explorer until the main window is published
-  (`hotkey_hook::set_target_window`, fed by `instance::publish_window`) and
-  while `WORKER_BUSY` says the previous press is still being served. Explorer
-  then starts the IFEO launcher, whose handshake finds a wedged instance
-  unresponsive and opens a fresh one.
+  (`hotkey_hook::set_target_window`, fed by `instance::publish_window`), while
+  `WORKER_BUSY` says the previous press is still being served, and while
+  `UI_STALLED` says the UI did not answer the last one. Explorer then starts
+  the IFEO launcher, whose handshake finds a wedged instance unresponsive and
+  opens a fresh one. The worker serves a swallowed press until the UI
+  confirms it (`instance::acknowledge_show` → `hotkey_hook::notify_shown`),
+  with the launch handshake's stages and deadlines (`FIRST_ACK_MS`, WM_NULL
+  probe, `EXTENDED_ACK_MS`); a UI that provably does not pump gets
+  `UI_STALLED` plus a fresh `--instance-unresponsive` instance, so a swallowed
+  press is never a black hole. Each served press logs one line
+  (`Ctrl+Shift+Esc answered by the hook`, `waited_ms`, `moves_to_front`).
+- **The hook keeps itself at the head of the `WH_KEYBOARD_LL` chain.** Windows
+  calls the newest low-level hook first, and one that returns non-zero
+  without `CallNextHookEx` hides the key from every older hook and from shell
+  hotkeys. TaskMan's hook dates from logon, so games using the "disable
+  shortcut keys" pattern starve it (DOOM Eternal: `win_notaskkeys` hook eats
+  Escape whenever Ctrl is held — verified by disassembly 2026-10-21). On the
+  keydown that completes a fresh Ctrl+Shift chord (`completes_chord`; prior
+  async state, so repeats and the other side of a held modifier do not count)
+  the callback installs a fresh copy (`begin_move_to_front`) and posts
+  `WM_RETIRE_HOOK` so the loop removes the old copy; the Escape that follows
+  therefore reaches TaskMan first, race-free. Never two copies beyond that
+  one message; failure to post undoes the move. A launch handing off to the
+  instance (`instance` show listener → `request_move_to_front`) re-installs
+  too, which also restores a hook Windows silently dropped after a
+  `LowLevelHooksTimeout` miss. Consequence: tools that deliberately grab
+  Ctrl+Shift+Esc with a newer hook (remappers, kiosk/exam lockdown) no longer
+  get it while the replacement is enabled.
 - **No `ViewportCommand::Focus` on the restore path, ever.** winit's
   `focus_window` ends in `force_window_active`, which `SendInput`s a synthetic
   left-Alt press and release into the system input stream. That Alt lands in

@@ -58,8 +58,8 @@ const INFO_MAGIC: u32 = 0x544D_5031;
 /// it still pumps messages: an instance that is merely slow (a saturated
 /// machine is the normal reason to reach for a task manager) must not be
 /// duplicated, while a wedged one must not delay the user for long.
-const FIRST_ACK_MS: u32 = 1_500;
-const EXTENDED_ACK_MS: u32 = 4_000;
+pub(crate) const FIRST_ACK_MS: u32 = 1_500;
+pub(crate) const EXTENDED_ACK_MS: u32 = 4_000;
 /// Deadline for the "does this window still pump messages" probe. This is the
 /// same question the shell's "not responding" decoration answers.
 const HUNG_PROBE_MS: u32 = 500;
@@ -246,7 +246,7 @@ fn process_alive(pid: u32) -> bool {
 /// an unelevated launch probes an elevated instance, because UIPI refuses
 /// the message across integrity levels; only an explicit timeout proves a
 /// wedged message loop, and only that may cost the instance its request.
-fn window_responds(hwnd: isize) -> Option<bool> {
+pub(crate) fn window_responds(hwnd: isize) -> Option<bool> {
     let window = HWND(hwnd as *mut core::ffi::c_void);
     if !unsafe { IsWindow(Some(window)) }.as_bool() {
         return None;
@@ -356,8 +356,9 @@ pub fn published_window() -> isize {
 
 /// Acknowledge a show request from the UI thread that actually processed it.
 /// The acknowledgement therefore proves the UI is alive, which is what the
-/// waiting launch needs to know.
+/// waiting launch — or the hotkey worker — needs to know.
 pub fn acknowledge_show() {
+    super::hotkey_hook::notify_shown();
     let ack = ACK_EVENT.load(Ordering::Acquire);
     if ack == 0 {
         return;
@@ -624,6 +625,12 @@ pub fn acquire(elevation_handoff: bool, on_show: impl Fn() + Send + Sync + 'stat
                 if LISTENER_STOP.load(Ordering::Acquire) {
                     break;
                 }
+                // A launch reached this instance, so a Task Manager entry
+                // point went through the shell rather than the keyboard
+                // hook: put the hook back at the head of the chain (and back
+                // at all, if Windows dropped it). Human-rate, so logged.
+                tracing::info!("show request from another launch");
+                super::hotkey_hook::request_move_to_front();
                 on_show_listener();
             }
         }) {

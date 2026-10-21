@@ -13,6 +13,22 @@
 
 ### Fixed
 
+- **Ctrl+Shift+Esc did nothing in some games:** a game or tool with its own
+  low-level keyboard hook could swallow the combo before TaskMan saw it —
+  DOOM Eternal blocks Escape whenever Ctrl is held — so neither TaskMan nor
+  Windows opened anything. TaskMan's hook now moves itself ahead of such
+  hooks the moment Ctrl+Shift is pressed; all other keys still reach them
+  unchanged. While TaskMan is the Task Manager replacement, tools that
+  deliberately capture Ctrl+Shift+Esc (key remappers, kiosk software) no
+  longer receive it.
+- **Hotkey lost while TaskMan's window was frozen:** a press caught by the
+  hook vanished when the window could not answer it. TaskMan now waits for
+  the window to confirm, starts a fresh task manager when it provably hangs,
+  and lets further presses reach Windows until the window responds again.
+- **Hotkey dead until restart after Windows dropped the hook:** Windows
+  silently removes a keyboard hook that answers too slowly even once. Any
+  other way of opening the Task Manager (Start menu, taskbar,
+  Ctrl+Alt+Del screen) now restores it.
 - **GPU rows above the GPU total:** a process rendering on the software
   "Microsoft Basic Render Driver" (WARP/headless renderers, test runners)
   showed up to 100 % GPU while the column header read 1 %. The header and the

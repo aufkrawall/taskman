@@ -1,3 +1,35 @@
+- 2026-10-21: Ctrl+Shift+Esc dead in DOOM Eternal (user report: the hotkey
+  did nothing, no window even in the background), then generalized to hotkey
+  reliability. Root cause, verified by disassembling `DOOMEternalx64vk.exe`
+  (read-only, imports + the hook callback): the cvar `win_notaskkeys`
+  ("disable windows task keys") installs a `WH_KEYBOARD_LL` hook once at
+  startup, with no focus check, that returns 1 without `CallNextHookEx` for
+  Escape while Ctrl is held (meant for Ctrl+Esc), Alt+Esc, Alt+Tab and both
+  Win keys. Newest hook runs first, TaskMan's dates from logon, so Escape
+  never reached it — nor Explorer. (The same toggle can also write
+  `HKCU\...\Policies\System\DisableTaskMgr`, but its only caller passes 0;
+  value absent on this machine.) Ctrl+Alt+Del is unaffected (SAS cannot be
+  hooked). Fixes in `hotkey_hook.rs`: (1) on the keydown completing a fresh
+  Ctrl+Shift chord the callback re-installs the hook at the head of the
+  chain and the loop retires the old copy (`begin_move_to_front` /
+  `WM_RETIRE_HOOK`) — race-free because the modifiers are earlier events;
+  (2) every launch hand-off re-installs (`request_move_to_front` from the
+  show listener), healing a silently dropped hook; (3) the worker now waits
+  for the UI's confirmation (`notify_shown`) in the handshake's stages —
+  since 2026-09-23 it cleared `WORKER_BUSY` right after raising, so a wedged
+  UI made every press vanish despite the module docs promising
+  pass-through. A provable stall sets `UI_STALLED` (combo passes to
+  Explorer until the UI shows a window) and starts `--instance-unresponsive`.
+  New diagnostics: one info line per served press, one per launch hand-off
+  (the launcher's own log never reaches the file: file logging attaches
+  after the first frame, which a handed-off launch never draws). Tests:
+  `only_a_fresh_ctrl_shift_chord_moves_the_hook`,
+  `moving_to_the_head_leaves_exactly_one_hook` (real hook, no injected input;
+  mutation-checked: fails when the superseded copy is not removed),
+  `an_unanswered_press_lets_the_combo_through_until_the_ui_answers`,
+  `a_confirmed_show_or_a_stop_ends_the_wait_at_once`. Not verifiable
+  headlessly: the chain order itself and the raise over DOOM — needs a
+  manual check in-game.
 - 2026-10-21: GPU row/total mismatch + search-box focus visuals (user report:
   a process at 100 % GPU under a 1 % Processes header; search box sometimes
   without blue frame/caret while selected).
