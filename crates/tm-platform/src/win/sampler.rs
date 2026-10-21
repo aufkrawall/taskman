@@ -190,6 +190,8 @@ pub struct Sampler {
     initialized: bool,
     tick_no: u64,
     attrs: HashMap<u32, PidAttrs>,
+    /// Every DXGI adapter, software renderers included: the LUIDs PDH may
+    /// name. `collect_gpus` filters the displayed set from it each tick.
     gpu_adapters: Option<Vec<gpu::AdapterInfo>>,
     /// When `gpu_adapters` was last probed (re-probes are rate-limited).
     gpu_probed_at: Option<Instant>,
@@ -1014,29 +1016,33 @@ fn is_zombie(
 
 /// Fold the per-process GPU view into the rows.
 ///
-/// Busiest-engine utilization plus the dominant engine label ("GPU 0 - 3D")
-/// and dedicated/shared memory. A row the view does not mention keeps its
-/// `None`s: an unmeasured process is not an idle one.
+/// Busiest-engine utilization plus the dominant engine label ("GPU 0 - 3D"),
+/// the per-engine shares group rows aggregate, and dedicated/shared memory —
+/// all over `gpus`, the adapters the machine totals come from. A row the
+/// view does not mention keeps its `None`s: an unmeasured process is not an
+/// idle one.
 fn apply_process_gpu(
     processes: &mut [ProcessEntry],
+    gpus: &[GpuInfo],
     engine_records: &[perfcounters::GpuEngineRecord],
     mem_records: &[perfcounters::GpuMemRecord],
 ) {
     if engine_records.is_empty() && mem_records.is_empty() {
         return;
     }
-    let per_pid: HashMap<u32, gpu::ProcessGpuView> =
-        gpu::process_gpu_view(engine_records, mem_records)
+    let mut per_pid: HashMap<u32, gpu::ProcessGpuView> =
+        gpu::process_gpu_view(gpus, engine_records, mem_records)
             .into_iter()
             .map(|v| (v.pid, v))
             .collect();
     for e in processes.iter_mut() {
-        if let Some(g) = per_pid.get(&e.pid) {
+        if let Some(g) = per_pid.remove(&e.pid) {
             e.gpu_util_pct = Some(g.util_pct);
             e.gpu_dedicated_bytes = Some(g.dedicated_bytes);
             e.gpu_shared_bytes = Some(g.shared_bytes);
             e.gpu_mem_bytes = Some(g.dedicated_bytes);
-            e.gpu_engine_label = g.dominant_engine.clone();
+            e.gpu_engine_label = g.dominant_engine;
+            e.gpu_engines = g.engines;
         }
     }
 }
@@ -1092,7 +1098,11 @@ impl Sampler {
             self.gpu_probed_at = Some(Instant::now());
         }
         match self.gpu_adapters.clone() {
-            Some(adapters) => gpu::merge(adapters, engine_records, adapter_mem_records),
+            Some(adapters) => gpu::merge(
+                gpu::filter_adapters(adapters),
+                engine_records,
+                adapter_mem_records,
+            ),
             None => Vec::new(),
         }
     }
@@ -1750,7 +1760,7 @@ impl Sampler {
             &gpu_adapter_mem_records,
             &gpu_mem_records,
         );
-        apply_process_gpu(&mut processes, &gpu_engine_records, &gpu_mem_records);
+        apply_process_gpu(&mut processes, &gpus, &gpu_engine_records, &gpu_mem_records);
 
         // ---- disks -----------------------------------------------------------------
         let disks = self.collect_disks(&disk_perf);

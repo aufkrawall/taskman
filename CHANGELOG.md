@@ -2,6 +2,28 @@
 
 ## Unreleased
 
+### Fixed
+
+- **GPU rows above the GPU total:** a process rendering on the software
+  "Microsoft Basic Render Driver" (WARP/headless renderers, test runners)
+  showed up to 100 % GPU while the column header read 1 %. The header and the
+  Performance page leave that adapter out when a real GPU is present, but the
+  per-process values still counted it. Per-process GPU utilization, engine
+  label and GPU memory now cover exactly the adapters the totals come from.
+- **GPU total understated under shared load:** an adapter's utilization was
+  the busiest single process instead of the busiest engine, so two programs
+  sharing the 3D engine at 60 % and 30 % read 60 % instead of 90 %. Engine
+  load is now the sum of every process's share of it, matching Windows Task
+  Manager; the per-engine graphs on the Performance page follow.
+- **Group GPU above the machine total:** app families on the Processes page
+  and session/app rollups on the Users page added up their members' GPU
+  values, so a game on the 3D engine plus a video on the decoder could read
+  130 %. Groups now report their busiest engine like the total does, and
+  sorting by a resource column orders app rows by the values they show.
+- **GPU engine column named the wrong GPU:** the Details "GPU engine" label
+  used the adapter's internal node index, so every GPU read "GPU 0"; it now
+  uses the GPU number shown on the Performance page.
+
 ## 0.1.20 - 2026-10-06
 
 ### Fixed

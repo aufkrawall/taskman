@@ -11,7 +11,7 @@ use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 use tm_core::i18n::{self, K};
-use tm_core::model::UserSession;
+use tm_core::model::{GpuGroupLoad, UserSession};
 
 use crate::app::TaskManApp;
 use crate::icons::Icon;
@@ -120,6 +120,8 @@ struct Roll {
     /// Per column: did ANY process in this rollup produce a reading?
     known: [bool; VALUE_COLS],
     count: usize,
+    /// GPU is the busiest engine across the members, not their sum.
+    gpu: GpuGroupLoad,
 }
 
 impl Roll {
@@ -128,6 +130,7 @@ impl Roll {
             values: [0.0; VALUE_COLS],
             known: ALWAYS_KNOWN,
             count: 0,
+            gpu: GpuGroupLoad::default(),
         }
     }
 
@@ -147,8 +150,9 @@ impl Roll {
             self.values[value_columns::DISK_ACT] += f64::from(pct);
             self.known[value_columns::DISK_ACT] = true;
         }
-        if let Some(pct) = p.gpu_util_pct {
-            self.values[value_columns::GPU] += f64::from(pct);
+        self.gpu.add(p);
+        if let Some(pct) = self.gpu.util_pct() {
+            self.values[value_columns::GPU] = f64::from(pct);
             self.known[value_columns::GPU] = true;
         }
         self.count += 1;
@@ -1081,6 +1085,34 @@ mod tests {
         // Not an exact string: the decimal separator follows the locale.
         let text = a.roll.texts()[NET].clone();
         assert!(text.starts_with('3') && text.ends_with(" KB/s"), "{text}");
+    }
+
+    /// A session's GPU is its busiest engine, like the machine total above
+    /// it. Summing the processes' own values put a user at 130 % — a game on
+    /// 3D plus a video on the decoder — under a header of 80 %.
+    #[test]
+    fn session_gpu_is_the_busiest_engine_not_the_sum() {
+        use tm_core::model::GpuEngineShare;
+        let share = |engine, util_pct| GpuEngineShare {
+            adapter: 0,
+            engine,
+            util_pct,
+        };
+        let mut game = with_net("game.exe", None, None);
+        game.gpu_util_pct = Some(80.0);
+        game.gpu_engines = vec![share(0, 80.0)];
+        let mut video = with_net("video.exe", None, None);
+        video.gpu_util_pct = Some(50.0);
+        video.gpu_engines = vec![share(1, 50.0)];
+        let mut overlay = with_net("overlay.exe", None, None);
+        overlay.gpu_util_pct = Some(5.0);
+        overlay.gpu_engines = vec![share(0, 5.0)];
+
+        let mut a = empty_agg();
+        for p in [&game, &video, &overlay] {
+            accumulate(&mut a, p);
+        }
+        assert_eq!(a.roll.values[GPU], 85.0);
     }
 
     /// Core invariant: telemetry nobody measured renders as unknown, never as

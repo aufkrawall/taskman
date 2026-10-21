@@ -241,6 +241,66 @@ pub struct GpuEngine {
     pub util_pct: f32,
 }
 
+/// One physical GPU engine's time spent on one process.
+///
+/// Processes time-slice a physical engine, so the shares of every process on
+/// one engine add up to that engine's load — which is how the adapter's own
+/// utilization is built. A process's `gpu_util_pct` is its busiest share.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct GpuEngineShare {
+    /// `GpuInfo::id` of the adapter the engine belongs to.
+    pub adapter: usize,
+    /// Identifies the physical engine on that adapter. Opaque, and only
+    /// comparable within ONE snapshot.
+    pub engine: u32,
+    pub util_pct: f32,
+}
+
+/// GPU utilization of a GROUP of processes (an app family, a user), with the
+/// same busiest-engine semantics as one process and one adapter.
+///
+/// Summing the members' own `gpu_util_pct` is wrong whenever they keep
+/// DIFFERENT engines busy: a game at 80 % 3D and a video at 50 % decode
+/// leave no engine above 80 %, yet the sum reads 130 % under a machine total
+/// of 80 %. Shares of the same engine add up; the busiest engine wins.
+#[derive(Debug, Clone, Default)]
+pub struct GpuGroupLoad {
+    per_engine: std::collections::HashMap<(usize, u32), f32>,
+    /// Utilization of members whose backend reports no engine breakdown.
+    /// Nothing says they shared an engine, so they keep the plain sum.
+    unattributed: f32,
+    known: bool,
+}
+
+impl GpuGroupLoad {
+    pub fn add(&mut self, p: &ProcessEntry) {
+        let Some(own) = p.gpu_util_pct else { return };
+        self.known = true;
+        if p.gpu_engines.is_empty() {
+            self.unattributed += own;
+            return;
+        }
+        for share in &p.gpu_engines {
+            *self
+                .per_engine
+                .entry((share.adapter, share.engine))
+                .or_insert(0.0) += share.util_pct;
+        }
+    }
+
+    /// `None` when no member was measured — an unmeasured group is not an
+    /// idle one.
+    pub fn util_pct(&self) -> Option<f32> {
+        self.known.then(|| {
+            self.per_engine
+                .values()
+                .copied()
+                .fold(self.unattributed, f32::max)
+                .clamp(0.0, 100.0)
+        })
+    }
+}
+
 /// Adapter LUID as exposed by DXGI/PDH — the join key between static adapter
 /// discovery and per-engine counter instances.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -484,6 +544,10 @@ pub struct ProcessEntry {
     pub gpu_shared_bytes: Option<u64>,
     /// Dominant GPU engine label, e.g. "GPU 0 - 3D" (never a percentage).
     pub gpu_engine_label: Option<String>,
+    /// The engines this process kept busy (non-zero shares only); what
+    /// group rows aggregate through [`GpuGroupLoad`].
+    #[serde(default)]
+    pub gpu_engines: Vec<GpuEngineShare>,
 
     pub handles: Option<u32>,
     pub threads: Option<u32>,
@@ -577,6 +641,7 @@ impl ProcessEntry {
             gpu_dedicated_bytes: None,
             gpu_shared_bytes: None,
             gpu_engine_label: None,
+            gpu_engines: Vec::new(),
             handles: None,
             threads: None,
             page_faults_per_s: None,
@@ -780,6 +845,71 @@ mod tests {
         // Saturates at 0 if private WS somehow exceeds total WS (e.g. transient race)
         entry.mem_bytes = 120 * 1024 * 1024;
         assert_eq!(entry.shared_working_set_bytes(), Some(0));
+    }
+
+    fn gpu_proc(pid: u32, shares: &[(usize, u32, f32)]) -> ProcessEntry {
+        let mut p = ProcessEntry::new(pid, "gpu.exe");
+        p.gpu_engines = shares
+            .iter()
+            .map(|&(adapter, engine, util_pct)| GpuEngineShare {
+                adapter,
+                engine,
+                util_pct,
+            })
+            .collect();
+        p.gpu_util_pct = Some(shares.iter().map(|s| s.2).fold(0.0, f32::max));
+        p
+    }
+
+    /// A group's GPU load is its busiest ENGINE: shares of one engine add up,
+    /// different engines do not. Summing the members' own values put a user
+    /// row at 130 % under a machine total of 80 %.
+    #[test]
+    fn gpu_group_load_sums_per_engine_and_takes_the_busiest() {
+        let game = gpu_proc(1, &[(0, 0, 80.0)]);
+        let video = gpu_proc(2, &[(0, 1, 50.0)]);
+        let overlay = gpu_proc(3, &[(0, 0, 5.0), (0, 1, 2.0)]);
+        // Same engine index on ANOTHER adapter is another engine.
+        let igpu = gpu_proc(4, &[(1, 0, 70.0)]);
+        let mut load = GpuGroupLoad::default();
+        for p in [&game, &video, &overlay, &igpu] {
+            load.add(p);
+        }
+        assert_eq!(load.util_pct(), Some(85.0));
+
+        // One member alone reproduces that member's own value.
+        let mut single = GpuGroupLoad::default();
+        single.add(&overlay);
+        assert_eq!(single.util_pct(), overlay.gpu_util_pct);
+
+        // Clamped: rounding in the counters can push one engine past 100 %.
+        let mut busy = GpuGroupLoad::default();
+        busy.add(&gpu_proc(5, &[(0, 0, 60.0)]));
+        busy.add(&gpu_proc(6, &[(0, 0, 45.0)]));
+        assert_eq!(busy.util_pct(), Some(100.0));
+    }
+
+    /// Unmeasured members contribute nothing, an all-unmeasured group stays
+    /// unknown, and a measured-idle member makes the group a real zero.
+    #[test]
+    fn gpu_group_load_keeps_unknown_apart_from_idle() {
+        let mut load = GpuGroupLoad::default();
+        load.add(&ProcessEntry::new(1, "plain.exe"));
+        assert_eq!(load.util_pct(), None);
+
+        let mut idle = ProcessEntry::new(2, "idle.exe");
+        idle.gpu_util_pct = Some(0.0);
+        load.add(&idle);
+        assert_eq!(load.util_pct(), Some(0.0));
+
+        // A backend without an engine breakdown keeps the plain sum.
+        let mut a = ProcessEntry::new(3, "a.exe");
+        a.gpu_util_pct = Some(10.0);
+        let mut b = ProcessEntry::new(4, "b.exe");
+        b.gpu_util_pct = Some(15.0);
+        load.add(&a);
+        load.add(&b);
+        assert_eq!(load.util_pct(), Some(25.0));
     }
 
     #[test]

@@ -67,7 +67,8 @@ platform boundary (`tm-core` ← `tm-platform` ← `tm-app` / `tm-service`), and
     unattributed-residual + exited-image attribution), `perfcounters.rs`
     (PDH split GpuPdh/DiskPdh groups with demand gating + LUID-preserving
     GPU instance parser), `gpu.rs` (DXGI discovery + LUID-keyed merge,
-    busiest-engine semantics), `process_ops.rs` (kill/suspend/priority/
+    busiest-engine semantics with per-engine sums across processes; the
+    per-process view is restricted to the merged adapter set), `process_ops.rs` (kill/suspend/priority/
     affinity/EcoQoS/UAC virtualization/token security, with `refuse_self`
     rejecting the scheduling changes that would stall the keyboard hook thread, `token_identity`
     (account + string SID) and `IsProcessCritical`, SCM service catalog

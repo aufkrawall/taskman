@@ -36,7 +36,9 @@ use std::collections::{HashMap, HashSet};
 use tm_core::i18n::{self, K};
 #[cfg(target_os = "windows")]
 use tm_core::model::DumpType;
-use tm_core::model::{ProcCategory, ProcStatus, ProcessEntry, Snapshot, is_plausible_parent};
+use tm_core::model::{
+    GpuGroupLoad, ProcCategory, ProcStatus, ProcessEntry, Snapshot, is_plausible_parent,
+};
 
 use crate::app::TaskManApp;
 use crate::icons::Icon;
@@ -1723,18 +1725,23 @@ fn default_value_order_ids() -> Vec<String> {
     value_columns::default_ids()
 }
 
-/// Sum of the members' OWN values.
+/// Sum of the members' OWN values — except GPU, which is the busiest engine
+/// across the members like the machine total, not the sum of each member's
+/// busiest engine (see [`GpuGroupLoad`]).
 ///
 /// Not the subtree aggregate: a family may now leave foreign descendants
 /// outside itself, and those are rendered as their own rows. Counting them in
 /// the group row too would show the same load twice.
 fn family_values(members: &[&ProcessEntry]) -> [f64; VALUE_COLS] {
     let mut total = [0.0f64; VALUE_COLS];
+    let mut gpu = GpuGroupLoad::default();
     for member in members {
         for (slot, value) in total.iter_mut().zip(own_values(member)) {
             *slot += value;
         }
+        gpu.add(member);
     }
+    total[GPU_VALUE] = f64::from(gpu.util_pct().unwrap_or(0.0));
     total
 }
 
@@ -2411,11 +2418,28 @@ fn emit_tree<'a>(
     ascending: bool,
     expanded: &HashSet<u32>,
 ) {
+    // Sort by the values the rows SHOW. A sum over the whole display subtree
+    // also counted descendants of other categories, which are rows of their
+    // own, and a sum of GPU values is not what a group row shows.
+    let mut groups: HashMap<u32, Vec<&ProcessEntry>> = HashMap::with_capacity(roots.len());
+    let mut shown: HashMap<u32, [f64; VALUE_COLS]> = HashMap::with_capacity(roots.len());
+    for root in roots {
+        let members = tree_group_members(root, children);
+        let values = if members.len() <= 1 {
+            own_values(root)
+        } else {
+            family_values(&members)
+        };
+        shown.insert(root.pid, values);
+        groups.insert(root.pid, members);
+    }
     let mut sorted_roots: Vec<&ProcessEntry> = roots.to_vec();
-    sort_entries(&mut sorted_roots, sort_col, ascending, &subtree.values);
+    sort_entries(&mut sorted_roots, sort_col, ascending, &shown);
 
     for root in sorted_roots {
-        let members = tree_group_members(root, children);
+        let Some(members) = groups.remove(&root.pid) else {
+            continue;
+        };
         if members.len() <= 1 {
             out.push(make_own_row(root, 0));
             continue;
@@ -2441,7 +2465,7 @@ fn emit_tree<'a>(
                 .filter(|member| !member.synthetic)
                 .map(|member| process_identity(member))
                 .collect(),
-            values: family_values(&members),
+            values: shown[&root.pid],
             heat: [0.0; VALUE_COLS],
             net_available,
             disk_available,
@@ -2516,8 +2540,6 @@ fn emit_expanded_tree_members<'a>(
 
 /// Per-pid subtree rollups shared by every Processes row builder.
 struct Subtree {
-    /// cpu %, mem bytes, disk bps, net bps summed over the display subtree.
-    values: HashMap<u32, [f64; VALUE_COLS]>,
     /// True when the process OR any of its display descendants runs in
     /// efficiency mode. A collapsed `Brave Browser (24)` row summarizes its
     /// children's resources, so it must summarize their power state too —
@@ -2545,20 +2567,13 @@ fn subtree_rollups<'a>(
     all: &[&'a ProcessEntry],
     children: &HashMap<u32, Vec<&'a ProcessEntry>>,
 ) -> Subtree {
-    let mut out: HashMap<u32, [f64; VALUE_COLS]> = HashMap::with_capacity(all.len());
     let mut eco: HashMap<u32, bool> = HashMap::with_capacity(all.len());
     let mut statuses: HashMap<u32, ProcStatus> = HashMap::with_capacity(all.len());
     let by_pid: HashMap<u32, &'a ProcessEntry> = all.iter().map(|p| (p.pid, *p)).collect();
 
     enum Frame<'b> {
         Enter(u32),
-        Combine(
-            u32,
-            Vec<&'b ProcessEntry>,
-            [f64; VALUE_COLS],
-            bool,
-            ProcStatus,
-        ),
+        Combine(u32, Vec<&'b ProcessEntry>, bool, ProcStatus),
     }
     let mut done: HashSet<u32> = HashSet::with_capacity(all.len());
     let mut in_progress: HashSet<u32> = HashSet::with_capacity(all.len());
@@ -2570,12 +2585,9 @@ fn subtree_rollups<'a>(
         let mut stack: Vec<Frame> = vec![Frame::Enter(root.pid)];
         while let Some(frame) = stack.pop() {
             match frame {
-                Frame::Combine(pid, kids, mut acc, mut throttled, mut status) => {
+                Frame::Combine(pid, kids, mut throttled, mut status) => {
                     for k in &kids {
-                        if let Some(v) = out.get(&k.pid) {
-                            for i in 0..VALUE_COLS {
-                                acc[i] += v[i];
-                            }
+                        if done.contains(&k.pid) {
                             throttled |= eco.get(&k.pid).copied().unwrap_or(false);
                             if let Some(&child_status) = statuses.get(&k.pid) {
                                 if child_status == ProcStatus::NotResponding {
@@ -2588,7 +2600,6 @@ fn subtree_rollups<'a>(
                             }
                         }
                     }
-                    out.insert(pid, acc);
                     eco.insert(pid, throttled);
                     statuses.insert(pid, status);
                     done.insert(pid);
@@ -2615,7 +2626,6 @@ fn subtree_rollups<'a>(
                         })
                         .collect();
                     if kids.is_empty() {
-                        out.insert(pid, own_values(p));
                         eco.insert(pid, p.power_throttled == Some(true));
                         statuses.insert(pid, p.status);
                         done.insert(pid);
@@ -2624,7 +2634,6 @@ fn subtree_rollups<'a>(
                         stack.push(Frame::Combine(
                             pid,
                             kids,
-                            own_values(p),
                             p.power_throttled == Some(true),
                             p.status,
                         ));
@@ -2637,13 +2646,11 @@ fn subtree_rollups<'a>(
         }
     }
     for p in all {
-        out.entry(p.pid).or_insert_with(|| own_values(p));
         eco.entry(p.pid)
             .or_insert_with(|| p.power_throttled == Some(true));
         statuses.entry(p.pid).or_insert(p.status);
     }
     Subtree {
-        values: out,
         efficiency: eco,
         status: statuses,
     }
@@ -3206,21 +3213,50 @@ mod tests {
         );
     }
 
+    /// A family row's GPU is its busiest engine across every member down the
+    /// tree, like the machine total, and a GPU sort orders rows by exactly
+    /// the values they show. Summing put a family whose members kept two
+    /// different engines busy above the machine total, and the sort used a
+    /// separate sum over the whole display subtree.
     #[test]
-    fn subtree_aggregation_counts_all_descendants() {
-        let snap = snap_of(vec![
-            proc(1, None, "root", ProcCategory::Background),
-            proc(2, Some(1), "mid", ProcCategory::Background),
-            proc(3, Some(2), "leaf", ProcCategory::Background),
-        ]);
-        let all: Vec<&ProcessEntry> = snap.processes.iter().collect();
-        let grouping = derive_display_groups(&all);
-        let children = display_children_map(&all, &grouping.category, &grouping.app_roots);
-        let st = subtree_rollups(&all, &children);
-        assert_eq!(st.values[&1][0], 6.0);
-        assert_eq!(st.values[&1][1], 6000.0);
-        assert_eq!(st.values[&2][0], 5.0);
-        assert_eq!(st.values[&3][0], 3.0);
+    fn family_gpu_is_the_busiest_engine_and_sorts_as_shown() {
+        use tm_core::model::GpuEngineShare;
+        let share = |engine, util_pct| GpuEngineShare {
+            adapter: 0,
+            engine,
+            util_pct,
+        };
+        let mut game = proc(1, None, "game.exe", ProcCategory::App);
+        game.gpu_util_pct = Some(80.0);
+        game.gpu_engines = vec![share(0, 80.0)];
+        let mut helper = proc(2, Some(1), "game.exe", ProcCategory::App);
+        helper.gpu_util_pct = Some(50.0);
+        helper.gpu_engines = vec![share(1, 50.0)];
+        let mut grandchild = proc(3, Some(2), "game.exe", ProcCategory::App);
+        grandchild.gpu_util_pct = Some(5.0);
+        grandchild.gpu_engines = vec![share(0, 5.0)];
+        let mut player = proc(4, None, "player.exe", ProcCategory::App);
+        player.gpu_util_pct = Some(90.0);
+        player.gpu_engines = vec![share(2, 90.0)];
+        let snap = snap_of(vec![game, helper, grandchild, player]);
+
+        let rows = build_display_rows(
+            &snap,
+            "",
+            FIXED_COLS + GPU_VALUE,
+            false,
+            &HashSet::new(),
+            &[false; 3],
+        );
+        let shown: Vec<(u32, f64, f64)> = rows
+            .iter()
+            .filter_map(|row| match row {
+                DisplayRow::Process(row) => Some((row.pid, row.values[GPU_VALUE], row.values[0])),
+                _ => None,
+            })
+            .collect();
+        // CPU still sums: 1 + 2 + 3 %.
+        assert_eq!(shown, vec![(4, 90.0, 4.0), (1, 85.0, 6.0)]);
     }
 
     /// A collapsed family row stands for its members, so one efficiency-mode
