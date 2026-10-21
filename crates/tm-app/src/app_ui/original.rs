@@ -2522,11 +2522,24 @@ pub enum DialogButtonClick {
     None,
 }
 
-/// The standard dialog button row: primary (accent-filled) rightmost, safe
-/// button left of it, matching the end-task dialog styling. `focused` selects
-/// which button carries the focus ring; pointer-drag hover follow and the
-/// per-frame `request_focus` mirror it too. `primary: None` renders a single
-/// plain safe button (its keys are handled at the `consume_dialog_keys` level).
+/// One button of a dialog button row. Both buttons are ordinary buttons —
+/// the primary one is NOT accent-filled: a filled action button read as a
+/// second, louder kind of control and drew the eye to the destructive choice.
+/// The button that Enter would press carries the accent outline instead.
+fn dialog_row_button<'a>(label: &'a str, outlined: bool, pal: &Palette) -> egui::Button<'a> {
+    let button = egui::Button::new(label).min_size(egui::vec2(85.0, 24.0));
+    if outlined {
+        button.stroke(Stroke::new(2.0, pal.accent))
+    } else {
+        button
+    }
+}
+
+/// The standard dialog button row: primary rightmost, safe button left of
+/// it, both styled alike. `focused` selects which button carries the accent
+/// outline; pointer-drag hover follow and the per-frame `request_focus`
+/// mirror it too. `primary: None` renders a single plain safe button (its
+/// keys are handled at the `consume_dialog_keys` level).
 pub fn dialog_button_row(
     ui: &mut egui::Ui,
     ctx: &egui::Context,
@@ -2535,27 +2548,19 @@ pub fn dialog_button_row(
     primary: Option<(&str, bool)>,
     focused: &mut bool,
 ) -> DialogButtonClick {
-    let btn_size = egui::vec2(85.0, 24.0);
     let mut click = DialogButtonClick::None;
     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
         let primary_resp = primary.map(|(label, enabled)| {
-            let mut button =
-                egui::Button::new(egui::RichText::new(label).color(pal.accent_text).strong())
-                    .min_size(btn_size)
-                    .fill(pal.accent);
-            if *focused {
-                button = button.stroke(Stroke::new(2.0, Color32::WHITE));
-            }
-            let resp = ui.add_enabled(enabled, button);
+            let resp = ui.add_enabled(enabled, dialog_row_button(label, *focused, pal));
             ui.add_space(8.0);
             resp
         });
 
-        let mut safe_button = egui::Button::new(safe_label).min_size(btn_size);
-        if primary_resp.is_some() && !*focused {
-            safe_button = safe_button.stroke(Stroke::new(2.0, pal.accent));
-        }
-        let safe_resp = ui.add(safe_button);
+        let safe_resp = ui.add(dialog_row_button(
+            safe_label,
+            primary_resp.is_some() && !*focused,
+            pal,
+        ));
 
         if let Some(primary_resp) = primary_resp {
             // Mouse dragging selection: keeping the button pressed and moving
@@ -2607,27 +2612,19 @@ pub fn dialog_button_row_mirror(
     primary: Option<(&str, bool)>,
     focused: &mut bool,
 ) -> DialogButtonClick {
-    let btn_size = egui::vec2(85.0, 24.0);
     let mut click = DialogButtonClick::None;
     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
         let primary_resp = primary.map(|(label, enabled)| {
-            let mut button =
-                egui::Button::new(egui::RichText::new(label).color(pal.accent_text).strong())
-                    .min_size(btn_size)
-                    .fill(pal.accent);
-            if *focused {
-                button = button.stroke(Stroke::new(2.0, Color32::WHITE));
-            }
-            let resp = ui.add_enabled(enabled, button);
+            let resp = ui.add_enabled(enabled, dialog_row_button(label, *focused, pal));
             ui.add_space(8.0);
             resp
         });
 
-        let mut safe_button = egui::Button::new(safe_label).min_size(btn_size);
-        if primary_resp.is_some() && !*focused {
-            safe_button = safe_button.stroke(Stroke::new(2.0, pal.accent));
-        }
-        let safe_resp = ui.add(safe_button);
+        let safe_resp = ui.add(dialog_row_button(
+            safe_label,
+            primary_resp.is_some() && !*focused,
+            pal,
+        ));
 
         if let Some(primary_resp) = primary_resp {
             if safe_resp.clicked() {
@@ -2674,6 +2671,69 @@ pub(crate) fn update_end_task_dialog_focus(
 mod tests {
     use super::*;
     use std::time::{Duration, Instant};
+
+    /// Every shape a frame painted, flattened.
+    fn painted_rects(shapes: &[egui::epaint::ClippedShape]) -> Vec<egui::epaint::RectShape> {
+        fn walk(shape: &egui::Shape, out: &mut Vec<egui::epaint::RectShape>) {
+            match shape {
+                egui::Shape::Rect(rect) => out.push(rect.clone()),
+                egui::Shape::Vec(shapes) => shapes.iter().for_each(|s| walk(s, out)),
+                _ => {}
+            }
+        }
+        let mut out = Vec::new();
+        for clipped in shapes {
+            walk(&clipped.shape, &mut out);
+        }
+        out
+    }
+
+    /// Regression: the primary button of a confirmation row (End process,
+    /// Unload module, Apply affinity, ...) was painted accent-FILLED with a
+    /// white ring — a leftover theming attempt. Both buttons must look like
+    /// ordinary buttons, and only the one Enter would press carries the
+    /// accent outline.
+    #[test]
+    fn dialog_rows_outline_the_default_and_never_fill_it() {
+        let pal = theme::DARK;
+        for mirror in [false, true] {
+            for primary_focused in [false, true] {
+                let ctx = egui::Context::default();
+                let raw = egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, egui::vec2(400.0, 200.0))),
+                    ..Default::default()
+                };
+                let mut out = ctx.run_ui(raw, |ui| {
+                    let ctx = ui.ctx().clone();
+                    let mut focused = primary_focused;
+                    let row = if mirror {
+                        dialog_button_row_mirror
+                    } else {
+                        dialog_button_row
+                    };
+                    row(
+                        ui,
+                        &ctx,
+                        &pal,
+                        "Cancel",
+                        Some(("End process", true)),
+                        &mut focused,
+                    );
+                });
+                out.textures_delta.clear();
+                let rects = painted_rects(&out.shapes);
+                assert!(
+                    rects.iter().all(|rect| rect.fill != pal.accent),
+                    "an accent-filled button was painted (mirror={mirror})"
+                );
+                let outlined = rects
+                    .iter()
+                    .filter(|rect| rect.stroke.color == pal.accent && rect.stroke.width >= 2.0)
+                    .count();
+                assert_eq!(outlined, 1, "exactly one button carries the outline");
+            }
+        }
+    }
 
     /// Regression (search-commit seam): the Enter that commits the global
     /// search must be CONSUMED. The singleline edit surrenders focus during

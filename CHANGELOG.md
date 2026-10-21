@@ -40,6 +40,11 @@
 
 ### Fixed
 
+- **Blue-filled confirmation buttons:** the action button of confirmation
+  dialogs (End process, Unload module, service Stop/Restart, Apply affinity
+  and the other two-button dialogs) was painted solid blue with a white ring,
+  left over from an earlier theming attempt. It now looks exactly like the
+  Cancel button; whichever button Enter would press carries a blue outline.
 - **Ctrl+Shift+Esc did nothing in some games:** a game or tool with its own
   low-level keyboard hook could swallow the combo before TaskMan saw it —
   DOOM Eternal blocks Escape whenever Ctrl is held — so neither TaskMan nor

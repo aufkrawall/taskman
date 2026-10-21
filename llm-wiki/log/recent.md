@@ -1,3 +1,10 @@
+- 2026-10-21 (dialog buttons): user report — the primary button of every
+  two-button confirmation was accent-FILLED with a white focus ring (leftover
+  theming). `dialog_button_row` and `_mirror` now share `dialog_row_button`:
+  both buttons plain, the Enter default outlined in accent. These two rows
+  were the only accent-filled buttons in the tree (checked by grep). Pinned
+  by `dialog_rows_outline_the_default_and_never_fill_it` (inspects the
+  painted shapes; fails on the old fill).
 - 2026-10-21 (Process Properties pages): Processes context menu gained
   Priority/Set affinity (shared `details::priority_submenu` /
   `open_affinity_dialog`; group rows act on all members). Modules moved from
