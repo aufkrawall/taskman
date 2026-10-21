@@ -447,18 +447,26 @@ unsafe fn activate_foreign(target: HWND) {
 /// * **A hung target cancels everything**, and a hung foreground window
 ///   cancels the merge: joining a queue that is not being pumped is how one
 ///   stuck application takes the desktop's input with it.
-pub fn force_foreground_attached(hwnd: isize) {
+/// * **A minimized target is refused.** Activating it hands it the foreground
+///   without showing it — Windows does not restore a window it activates —
+///   and the call that restores it afterwards is the UI's own, which has no
+///   right to take the foreground back from a fullscreen game. The caller
+///   activates once the UI has restored the window (as winit's own
+///   `focus_window` also refuses minimized windows).
+///
+/// Returns whether `SetForegroundWindow` reported success.
+pub fn force_foreground_attached(hwnd: isize) -> bool {
     use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
     use windows::Win32::UI::WindowsAndMessaging::{
         GetForegroundWindow, GetWindowThreadProcessId, IsHungAppWindow, SetForegroundWindow,
     };
 
     let Some(target) = live_window(hwnd) else {
-        return;
+        return false;
     };
     unsafe {
-        if IsHungAppWindow(target).as_bool() {
-            return;
+        if IsHungAppWindow(target).as_bool() || IsIconic(target).as_bool() {
+            return false;
         }
         let current = GetCurrentThreadId();
         let target_thread = GetWindowThreadProcessId(target, None);
@@ -470,10 +478,11 @@ pub fn force_foreground_attached(hwnd: isize) {
         };
         let partner = merge_partner(current, target_thread, foreground_thread);
         let attached = partner != 0 && AttachThreadInput(current, partner, true).as_bool();
-        let _ = SetForegroundWindow(target);
+        let activated = SetForegroundWindow(target).as_bool();
         if attached {
             let _ = AttachThreadInput(current, partner, false);
         }
+        activated
     }
 }
 
@@ -537,6 +546,44 @@ mod tests {
     #[test]
     fn transparency_preference_is_readable() {
         let _ = transparency_effects_enabled();
+    }
+
+    /// A minimized window must not be activated: Windows would hand it the
+    /// foreground without showing it, and the UI's restore afterwards has no
+    /// right to take the foreground back from a fullscreen game — the hotkey
+    /// then left a minimized TaskMan behind the game. The window is never
+    /// shown, so nothing appears on the desktop while this runs.
+    #[test]
+    fn a_minimized_window_is_never_activated() {
+        use windows::Win32::UI::WindowsAndMessaging::{
+            CreateWindowExW, DestroyWindow, GetForegroundWindow, WINDOW_EX_STYLE, WS_MINIMIZE,
+            WS_POPUP,
+        };
+
+        let hwnd = unsafe {
+            CreateWindowExW(
+                WINDOW_EX_STYLE(0),
+                windows::core::w!("STATIC"),
+                windows::core::w!(""),
+                WS_POPUP | WS_MINIMIZE,
+                0,
+                0,
+                16,
+                16,
+                None,
+                None,
+                None,
+                None,
+            )
+        }
+        .expect("test window");
+        assert!(unsafe { IsIconic(hwnd) }.as_bool());
+        let before = unsafe { GetForegroundWindow() };
+        assert!(!force_foreground_attached(hwnd.0 as isize));
+        assert_eq!(unsafe { GetForegroundWindow() }, before);
+        unsafe {
+            let _ = DestroyWindow(hwnd);
+        }
     }
 
     #[test]

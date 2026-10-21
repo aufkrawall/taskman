@@ -1,3 +1,19 @@
+- 2026-10-21 (follow-up): hotkey over DOOM worked with TaskMan in the tray
+  but not with its window minimized. The log showed every press answered by
+  the hook within 0-110 ms, so delivery was fine; the window is band 16 and
+  topmost (probed live), so z-order was not it either. Root cause: the
+  worker's attached (privileged) `SetForegroundWindow` ran right after waking
+  the UI, i.e. on the still-minimized window, which Windows activates without
+  restoring; the UI's `SW_RESTORE` + activation afterwards is unprivileged and
+  cannot take the foreground back over a fullscreen game. Fix:
+  `force_foreground_attached` refuses iconic targets (returns bool now) and
+  `serve_press` activates again after the UI's confirmation, when the window
+  is restored; the per-press log gains `activated`, `in_front`, `minimized`.
+  Also fixed a flaky `moving_to_the_head_leaves_exactly_one_hook`: it read
+  the hook bookkeeping from another thread mid-step; steps are now published
+  only when complete (40/40 runs). Regression test
+  `a_minimized_window_is_never_activated` (invisible WS_MINIMIZE window;
+  fails without the check). Awaiting the user's in-game confirmation.
 - 2026-10-21: Ctrl+Shift+Esc dead in DOOM Eternal (user report: the hotkey
   did nothing, no window even in the background), then generalized to hotkey
   reliability. Root cause, verified by disassembling `DOOMEternalx64vk.exe`

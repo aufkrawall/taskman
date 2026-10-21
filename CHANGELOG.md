@@ -21,6 +21,10 @@
   unchanged. While TaskMan is the Task Manager replacement, tools that
   deliberately capture Ctrl+Shift+Esc (key remappers, kiosk software) no
   longer receive it.
+- **Minimized TaskMan stayed behind fullscreen games:** with TaskMan's
+  window minimized (rather than closed to the tray), Ctrl+Shift+Esc in a
+  fullscreen game left it hidden behind the game. The window is now restored
+  first and brought to the front afterwards.
 - **Hotkey lost while TaskMan's window was frozen:** a press caught by the
   hook vanished when the window could not answer it. TaskMan now waits for
   the window to confirm, starts a fresh task manager when it provably hangs,

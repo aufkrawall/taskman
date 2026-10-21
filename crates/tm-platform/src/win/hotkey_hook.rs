@@ -90,7 +90,9 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, AtomicU64, Ordering};
-use windows::Win32::Foundation::{CloseHandle, HANDLE, LPARAM, LRESULT, WAIT_OBJECT_0, WPARAM};
+use windows::Win32::Foundation::{
+    CloseHandle, HANDLE, HWND, LPARAM, LRESULT, WAIT_OBJECT_0, WPARAM,
+};
 use windows::Win32::System::SystemInformation::GetTickCount64;
 use windows::Win32::System::Threading::{
     CreateEventW, GetCurrentThread, GetCurrentThreadId, ResetEvent, SetEvent, SetThreadInformation,
@@ -103,10 +105,11 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     VK_RCONTROL, VK_RSHIFT, VK_RWIN, VK_SHIFT,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    AllowSetForegroundWindow, CallNextHookEx, DispatchMessageW, GetMessageW, HC_ACTION, HHOOK,
-    KBDLLHOOKSTRUCT, MSG, MsgWaitForMultipleObjects, PM_NOREMOVE, PM_REMOVE, PeekMessageW,
-    PostThreadMessageW, QS_ALLINPUT, SetWindowsHookExW, TranslateMessage, UnhookWindowsHookEx,
-    WH_KEYBOARD_LL, WM_APP, WM_KEYDOWN, WM_KEYUP, WM_QUIT, WM_SYSKEYDOWN, WM_SYSKEYUP,
+    AllowSetForegroundWindow, CallNextHookEx, DispatchMessageW, GetForegroundWindow, GetMessageW,
+    HC_ACTION, HHOOK, IsIconic, KBDLLHOOKSTRUCT, MSG, MsgWaitForMultipleObjects, PM_NOREMOVE,
+    PM_REMOVE, PeekMessageW, PostThreadMessageW, QS_ALLINPUT, SetWindowsHookExW, TranslateMessage,
+    UnhookWindowsHookEx, WH_KEYBOARD_LL, WM_APP, WM_KEYDOWN, WM_KEYUP, WM_QUIT, WM_SYSKEYDOWN,
+    WM_SYSKEYUP,
 };
 
 static CONSUMED_DOWN: AtomicBool = AtomicBool::new(false);
@@ -121,8 +124,10 @@ static WORKER_RUNNING: AtomicBool = AtomicBool::new(false);
 static REPLACEMENT_ENABLED: AtomicBool = AtomicBool::new(false);
 /// The hook `tm-hotkey-hook` installed most recently, 0 while there is none.
 ///
-/// Only ever touched on that thread — the callback runs there too — so the
-/// atomics here are what a `static` needs, not a synchronization protocol.
+/// Only ever written on that thread — the callback runs there too. Each step
+/// is published only once it is complete (a hook is removed before its handle
+/// is cleared, the copy to retire is recorded before the fresh one), so an
+/// observer on another thread — the tests — never sees a step half done.
 static CURRENT_HOOK: AtomicIsize = AtomicIsize::new(0);
 /// A copy of the hook superseded by a newer one at the head of the chain,
 /// waiting for the message loop to remove it. While it is set no further move
@@ -384,7 +389,7 @@ fn opt_out_of_power_throttling() {
 
 /// Install or remove the keyboard hook, idempotently.
 fn set_hook(wanted: bool) {
-    match (wanted, CURRENT_HOOK.load(Ordering::Relaxed) != 0) {
+    match (wanted, CURRENT_HOOK.load(Ordering::Acquire) != 0) {
         (true, true) | (false, false) => {}
         (true, false) => {
             // Logged BEFORE the hook exists, never after. Everything this
@@ -396,7 +401,7 @@ fn set_hook(wanted: bool) {
             // unambiguous pair.
             tracing::info!("installing WH_KEYBOARD_LL hook for Ctrl+Shift+Esc");
             match install_hook() {
-                Ok(installed) => CURRENT_HOOK.store(installed.0 as isize, Ordering::Relaxed),
+                Ok(installed) => CURRENT_HOOK.store(installed.0 as isize, Ordering::Release),
                 Err(error) => {
                     // Safe to log: no hook was installed, so this thread is
                     // not on anybody's input path while it runs.
@@ -408,7 +413,8 @@ fn set_hook(wanted: bool) {
             // A copy superseded at the head of the chain may still be waiting
             // for its removal message; it goes too.
             finish_move_to_front();
-            unhook(CURRENT_HOOK.swap(0, Ordering::Relaxed));
+            unhook(CURRENT_HOOK.load(Ordering::Acquire));
+            CURRENT_HOOK.store(0, Ordering::Release);
             // Nothing can consume a keydown any more, so a keyup that arrives
             // after this must pass through instead of being swallowed.
             CONSUMED_DOWN.store(false, Ordering::SeqCst);
@@ -442,24 +448,24 @@ fn unhook(raw: isize) {
 /// the callback that asks for the move is that old copy's own invocation.
 /// Logs nothing — a hook is installed throughout (see the module docs).
 fn begin_move_to_front() {
-    let current = CURRENT_HOOK.load(Ordering::Relaxed);
-    if current == 0 || RETIRING_HOOK.load(Ordering::Relaxed) != 0 {
+    let current = CURRENT_HOOK.load(Ordering::Acquire);
+    if current == 0 || RETIRING_HOOK.load(Ordering::Acquire) != 0 {
         return;
     }
     let Ok(fresh) = install_hook() else {
         // The old copy keeps serving; it is merely not first.
         return;
     };
-    CURRENT_HOOK.store(fresh.0 as isize, Ordering::Relaxed);
-    RETIRING_HOOK.store(current, Ordering::Relaxed);
+    RETIRING_HOOK.store(current, Ordering::Release);
+    CURRENT_HOOK.store(fresh.0 as isize, Ordering::Release);
     let posted =
         unsafe { PostThreadMessageW(GetCurrentThreadId(), WM_RETIRE_HOOK, WPARAM(0), LPARAM(0)) };
     if posted.is_err() {
         // Nothing would ever remove the old copy, and two copies would see
         // every key twice for the rest of the session. Undo instead.
-        CURRENT_HOOK.store(current, Ordering::Relaxed);
-        RETIRING_HOOK.store(0, Ordering::Relaxed);
         unhook(fresh.0 as isize);
+        CURRENT_HOOK.store(current, Ordering::Release);
+        RETIRING_HOOK.store(0, Ordering::Release);
         return;
     }
     MOVES_TO_FRONT.fetch_add(1, Ordering::Relaxed);
@@ -467,7 +473,8 @@ fn begin_move_to_front() {
 
 /// Remove the copy [`begin_move_to_front`] superseded, if one is waiting.
 fn finish_move_to_front() {
-    unhook(RETIRING_HOOK.swap(0, Ordering::Relaxed));
+    unhook(RETIRING_HOOK.load(Ordering::Acquire));
+    RETIRING_HOOK.store(0, Ordering::Release);
 }
 
 /// Ask the hook thread to move the hook to the head of the chain.
@@ -600,13 +607,22 @@ enum ShowOutcome {
 ///
 /// The UI thread shows, restores and raises its own window; this thread only
 /// takes the foreground for it, the one part the UI cannot do over a
-/// fullscreen game. The wait afterwards is what keeps a swallowed press from
-/// vanishing: the press never reached Explorer, so if the UI cannot answer it
-/// nobody else will. While the wait runs [`WORKER_BUSY`] stays set and further
-/// presses pass through to Explorer; a UI that turns out to be wedged gets a
-/// fresh task manager started in its place, and the combo keeps passing
-/// through until the UI shows a window again.
+/// fullscreen game. It does so once the UI has confirmed the window is shown
+/// and restored: a minimized window cannot usefully be activated (see
+/// `force_foreground_attached`), and the UI's own activation after restoring
+/// it carries no right to the foreground. A window hidden in the tray is
+/// activated up front as well, as it always was; for it the second call finds
+/// TaskMan already in front and merges nothing.
+///
+/// The wait is also what keeps a swallowed press from vanishing: the press
+/// never reached Explorer, so if the UI cannot answer it nobody else will.
+/// While the wait runs [`WORKER_BUSY`] stays set and further presses pass
+/// through to Explorer; a UI that turns out to be wedged gets a fresh task
+/// manager started in its place, and the combo keeps passing through until
+/// the UI shows a window again.
 fn serve_press(trigger: HANDLE, shown: HANDLE) {
+    use super::window_chrome::force_foreground_attached;
+
     let started = unsafe { GetTickCount64() };
     // Drop a confirmation left over from a show nobody waited for (a tray
     // click, a launch) before asking for this one.
@@ -621,23 +637,39 @@ fn serve_press(trigger: HANDLE, shown: HANDLE) {
     if hwnd != 0 {
         // The attaching variant: this is the fullscreen-game case the hook
         // exists for, and this thread pumps its own queue, which is what
-        // makes merging input queues safe here and nowhere else.
-        super::window_chrome::force_foreground_attached(hwnd);
+        // makes merging input queues safe here and nowhere else. Refused for
+        // a minimized window; that one is activated after the restore below.
+        force_foreground_attached(hwnd);
     }
     let outcome = await_shown(hwnd, trigger, shown);
+    let activated = matches!(outcome, ShowOutcome::Shown | ShowOutcome::Busy)
+        && hwnd != 0
+        && TARGET_WINDOW.load(Ordering::Acquire) == hwnd
+        && force_foreground_attached(hwnd);
     let waited_ms = unsafe { GetTickCount64() }.saturating_sub(started);
     let moves_to_front = MOVES_TO_FRONT.load(Ordering::Relaxed);
+    // What the user actually got, for the one case that cannot be checked
+    // headlessly: a window in front, or one Windows kept behind the game.
+    let window = HWND(hwnd as *mut core::ffi::c_void);
+    let in_front = hwnd != 0 && unsafe { GetForegroundWindow() } == window;
+    let minimized = hwnd != 0 && unsafe { IsIconic(window) }.as_bool();
     match outcome {
         ShowOutcome::Shown => {
             tracing::info!(
                 waited_ms,
                 moves_to_front,
+                activated,
+                in_front,
+                minimized,
                 "Ctrl+Shift+Esc answered by the hook"
             );
         }
         ShowOutcome::Busy => tracing::info!(
             waited_ms,
             moves_to_front,
+            activated,
+            in_front,
+            minimized,
             "Ctrl+Shift+Esc answered by the hook; the UI is busy and shows the window late"
         ),
         ShowOutcome::Stalled => {
@@ -1342,25 +1374,25 @@ mod tests {
         let thread_id = thread_id.load(Ordering::Acquire);
 
         request_hook(thread_id, true);
-        wait_until("install", &|| CURRENT_HOOK.load(Ordering::Relaxed) != 0);
-        let first = CURRENT_HOOK.load(Ordering::Relaxed);
+        wait_until("install", &|| CURRENT_HOOK.load(Ordering::Acquire) != 0);
+        let first = CURRENT_HOOK.load(Ordering::Acquire);
 
         unsafe {
             PostThreadMessageW(thread_id, WM_MOVE_TO_FRONT, WPARAM(0), LPARAM(0))
                 .expect("post move");
         }
         wait_until("move", &|| {
-            let current = CURRENT_HOOK.load(Ordering::Relaxed);
-            current != 0 && current != first && RETIRING_HOOK.load(Ordering::Relaxed) == 0
+            let current = CURRENT_HOOK.load(Ordering::Acquire);
+            current != 0 && current != first && RETIRING_HOOK.load(Ordering::Acquire) == 0
         });
-        let second = CURRENT_HOOK.load(Ordering::Relaxed);
+        let second = CURRENT_HOOK.load(Ordering::Acquire);
         assert!(
             !still_installed(first),
             "the superseded copy must be removed"
         );
 
         request_hook(thread_id, false);
-        wait_until("removal", &|| CURRENT_HOOK.load(Ordering::Relaxed) == 0);
+        wait_until("removal", &|| CURRENT_HOOK.load(Ordering::Acquire) == 0);
         assert!(
             !still_installed(second),
             "removal must leave no copy behind"

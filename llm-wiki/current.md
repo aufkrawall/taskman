@@ -278,8 +278,16 @@ cost while it is there. Treat every line as a rule, not a description.
   with the launch handshake's stages and deadlines (`FIRST_ACK_MS`, WM_NULL
   probe, `EXTENDED_ACK_MS`); a UI that provably does not pump gets
   `UI_STALLED` plus a fresh `--instance-unresponsive` instance, so a swallowed
-  press is never a black hole. Each served press logs one line
-  (`Ctrl+Shift+Esc answered by the hook`, `waited_ms`, `moves_to_front`).
+  press is never a black hole. The attached activation runs AFTER that
+  confirmation, when the UI has restored the window: `force_foreground_attached`
+  refuses a minimized target, because Windows hands an activated minimized
+  window the foreground without restoring it, and the UI's restore that
+  follows has no foreground right over a fullscreen game (2026-10-21: a
+  minimized TaskMan stayed behind DOOM; `a_minimized_window_is_never_activated`
+  shows `SetForegroundWindow` succeeding on an iconic window without the
+  check). A tray-hidden window is still activated up front too. Each served
+  press logs one line (`Ctrl+Shift+Esc answered by the hook`, `waited_ms`,
+  `moves_to_front`, `activated`, `in_front`, `minimized`).
 - **The hook keeps itself at the head of the `WH_KEYBOARD_LL` chain.** Windows
   calls the newest low-level hook first, and one that returns non-zero
   without `CallNextHookEx` hides the key from every older hook and from shell
