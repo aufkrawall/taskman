@@ -27,6 +27,23 @@
 - **Search caret missing after keyboard focus:** focusing the search box
   with Ctrl+F, F6 or Tab, or switching back to the window, could leave the
   caret hidden for up to half a second; it now appears immediately.
+- **DPC time counted as "Terminated processes":** the "System interrupts"
+  row only subtracted interrupt time, so driver DPC load (network, audio,
+  storage) showed up as CPU of terminated processes, often with an empty
+  exit list. Interrupt and DPC time now come from the same per-processor
+  records and window as the CPU residual they are split from.
+- **Stale "Terminated processes" value:** a row held visible through quiet
+  ticks kept showing the share that armed it (e.g. 35 % for ~4 s after a
+  build ended under a 2 % CPU total); it now shows the current share.
+- **Network total read too high:** the Processes/Users network header added
+  receive + send across all adapters, so a full-duplex link at 60 % each way
+  read 100 % and a virtual adapter (Hyper-V vEthernet, VPN) counted its
+  physical adapter's traffic twice. It is now the busiest adapter in its
+  busiest direction, and reads "—" when no adapter reports a link speed.
+- **Loopback traffic in the per-process Network column:** local traffic to
+  127.0.0.0/8 or ::1 (a local database or dev server) was counted as network
+  traffic although it never reaches an adapter; it is now excluded, also from
+  the Users and App history network totals.
 - **GPU engine column named the wrong GPU:** the Details "GPU engine" label
   used the adapter's internal node index, so every GPU read "GPU 0"; it now
   uses the GPU number shown on the Performance page.

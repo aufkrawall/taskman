@@ -319,10 +319,13 @@ const DISK_SEC: &str = "\\PhysicalDisk(*)\\Avg. Disk sec/Transfer";
 /// sysinfo's frequency (CallNtPowerInformation CurrentMhz) reports the fixed
 /// nominal clock on modern Windows, so it cannot show real-time speed.
 const CPU_PERF_PCT: &str = "\\Processor Information(_Total)\\% Processor Performance";
-/// Interrupt/DPC servicing share. Not chargeable to any process, so without
-/// it heavy driver work would look like unexplained "ghost" CPU on the
-/// process pages (native TM shows it as the "System interrupts" row).
+/// Interrupt and DPC servicing shares. Not chargeable to any process, so
+/// without them heavy driver work would look like unexplained "ghost" CPU on
+/// the process pages (native TM shows their sum as the "System interrupts"
+/// row). Only the fallback for core records without the servicing fields —
+/// see `cpu_load::LoadSample::interrupt_pct`.
 const CPU_INTERRUPT_PCT: &str = "\\Processor Information(_Total)\\% Interrupt Time";
+const CPU_DPC_PCT: &str = "\\Processor Information(_Total)\\% DPC Time";
 
 /// Open a wanted group, or re-open one that went to sleep.
 ///
@@ -450,7 +453,7 @@ impl PdhCounters {
             wake(
                 &mut self.interrupt,
                 &mut self.interrupt_failed,
-                &[CPU_INTERRUPT_PCT],
+                &[CPU_INTERRUPT_PCT, CPU_DPC_PCT],
                 true,
             );
         }
@@ -617,33 +620,36 @@ impl PdhCounters {
         self.cpu_failed
     }
 
-    /// Interrupt/DPC servicing share (percent of total capacity) from data
-    /// already collected this tick. None while unavailable or warming up;
-    /// callers must treat that as unknown and never as zero.
+    /// Interrupt + DPC servicing share (percent of total capacity) from data
+    /// already collected this tick. None while unavailable or warming up, or
+    /// when either counter is missing — interrupt time alone left every DPC
+    /// in "Terminated processes". Callers must treat None as unknown, never
+    /// as zero.
     pub fn read_interrupt_pct(&mut self) -> Option<f32> {
         let g = self.interrupt.as_mut()?;
         if !g.is_open() || !g.warm {
             return None;
         }
-        for (handle, path) in Self::counters_snapshot(g) {
-            if path != CPU_INTERRUPT_PCT {
-                continue;
+        let mut read = |wanted: &str| -> Option<f64> {
+            for (handle, path) in Self::counters_snapshot(g) {
+                if path != wanted {
+                    continue;
+                }
+                let usable: Vec<f64> = g
+                    .read_pairs(handle)
+                    .into_iter()
+                    .map(|(_, v)| v)
+                    .filter(|v| *v >= 0.0)
+                    .collect();
+                if !usable.is_empty() {
+                    return Some(usable.iter().sum::<f64>() / usable.len() as f64);
+                }
             }
-            let pairs = g.read_pairs(handle);
-            if pairs.is_empty() {
-                continue;
-            }
-            let usable: Vec<f64> = pairs
-                .into_iter()
-                .map(|(_, v)| v)
-                .filter(|v| *v >= 0.0)
-                .collect();
-            if !usable.is_empty() {
-                let avg = usable.iter().sum::<f64>() / usable.len() as f64;
-                return Some((avg as f32).clamp(0.0, 100.0));
-            }
-        }
-        None
+            None
+        };
+        let interrupts = read(CPU_INTERRUPT_PCT)?;
+        let dpcs = read(CPU_DPC_PCT)?;
+        Some(((interrupts + dpcs) as f32).clamp(0.0, 100.0))
     }
 
     /// Disk performance samples from data already collected this tick.

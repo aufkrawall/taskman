@@ -1608,7 +1608,9 @@ pub struct Aggregates {
     /// a fabricated zero here reads as "nothing is touching a disk" on a page
     /// whose own rows say otherwise.
     pub disk_pct: Option<f32>,
-    pub net_pct: f32,
+    /// Busiest adapter in its busiest direction, or `None` while no adapter
+    /// reports a link speed to measure against.
+    pub net_pct: Option<f32>,
     /// Busiest adapter, or `None` while no row has GPU telemetry (no
     /// adapters, counters warming up or asleep): the header must not read
     /// "0 %" above a column of "—".
@@ -1622,17 +1624,24 @@ impl Aggregates {
             .iter()
             .filter_map(|d| d.active_pct)
             .reduce(f32::max);
-        let mut net_pct = 0.0f32;
-        for n in &snap.networks {
-            if n.link_bps > 0 && (n.recv_bps > 0.0 || n.sent_bps > 0.0) {
-                net_pct += ((n.recv_bps + n.sent_bps) * 8.0 / n.link_bps as f64) as f32 * 100.0;
-            }
-        }
+        // Like disk and GPU, the busiest device — not a sum. Summing adapters
+        // counted the same bytes twice wherever a virtual adapter (Hyper-V's
+        // vEthernet, a VPN TAP) carries a physical one's traffic. And links
+        // are full duplex: receive and send each have the whole link speed,
+        // so adding them read a link at 600 Mbit/s each way on 1 Gbit/s as
+        // saturated.
+        let net_pct = snap
+            .networks
+            .iter()
+            .filter(|n| n.link_bps > 0 && n.kind != "Loopback")
+            .map(|n| (n.recv_bps.max(n.sent_bps) * 8.0 / n.link_bps as f64 * 100.0) as f32)
+            .reduce(f32::max)
+            .map(|pct| pct.clamp(0.0, 100.0));
         Self {
             cpu_pct: snap.cpu.utilization_pct,
             mem_pct: snap.memory.used_pct(),
             disk_pct,
-            net_pct: net_pct.clamp(0.0, 100.0),
+            net_pct,
             // The adapter's own number is already the busiest engine, so the
             // machine total is the busiest adapter — not a sum across them.
             gpu_pct: snap
@@ -1648,9 +1657,10 @@ impl Aggregates {
     ///
     /// The header row states MACHINE totals, not column sums. Disk active
     /// time repeats the disk total deliberately: its rows are the same
-    /// quantity — the percentage of wall time the disks were busy for that
-    /// process — so they sum to this header rather than needing it as
-    /// context, while the Disk I/O column next to it is a byte rate.
+    /// quantity — the percentage of wall time the busiest disk they used was
+    /// busy for that process — so no row can exceed this header, and on a
+    /// single busy disk the rows sum to it; the Disk I/O column next to it is
+    /// a byte rate.
     ///
     /// A table with fewer numeric columns simply uses the leading entries.
     pub fn strings(&self) -> [String; 6] {
@@ -1661,7 +1671,8 @@ impl Aggregates {
             format::format_pct_hdr(self.cpu_pct),
             format::format_pct_hdr(self.mem_pct),
             disk.clone(),
-            format::format_pct_hdr(self.net_pct),
+            self.net_pct
+                .map_or_else(|| "\u{2014}".to_string(), format::format_pct_hdr),
             disk,
             self.gpu_pct
                 .map_or_else(|| "\u{2014}".to_string(), format::format_pct_hdr),
@@ -1834,6 +1845,52 @@ mod tests {
             Aggregates::from_snapshot(&snap).strings()[4],
             format::format_pct_hdr(0.0)
         );
+    }
+
+    /// The network total is the busiest adapter in its busiest direction.
+    /// It summed receive + send across every adapter: a full-duplex link at
+    /// 60 % each way read 100 %, and a virtual adapter on top of a physical
+    /// one counted the same traffic twice.
+    #[test]
+    fn the_network_total_is_the_busiest_adapter_in_its_busiest_direction() {
+        let net = |name: &str, kind: &str, recv_bps: f64, sent_bps: f64, link_bps: u64| {
+            tm_core::model::NetworkInfo {
+                name: name.into(),
+                kind: kind.into(),
+                recv_bps,
+                sent_bps,
+                link_bps,
+                ..Default::default()
+            }
+        };
+        let gbit = 1_000_000_000;
+        let mut snap = tm_core::model::Snapshot {
+            networks: vec![
+                // 600 Mbit/s each way on a 1 Gbit/s link: 60 %, not 120 %.
+                net("Ethernet", "Ethernet", 75e6, 75e6, gbit),
+                // The same traffic seen again through the virtual switch.
+                net(
+                    "vEthernet (Default Switch)",
+                    "Ethernet",
+                    75e6,
+                    75e6,
+                    10 * gbit,
+                ),
+                net("Wi-Fi", "Wi-Fi", 1e6, 0.0, gbit),
+            ],
+            ..Default::default()
+        };
+        assert_eq!(
+            Aggregates::from_snapshot(&snap).strings()[3],
+            format::format_pct_hdr(60.0)
+        );
+
+        // No adapter with a known link speed: unknown, not an idle 0 %.
+        snap.networks = vec![
+            net("Ethernet", "Ethernet", 1e6, 1e6, 0),
+            net("Loopback", "Loopback", 9e9, 9e9, 0),
+        ];
+        assert_eq!(Aggregates::from_snapshot(&snap).strings()[3], "\u{2014}");
     }
 
     /// Same rule for the GPU header: without per-process GPU telemetry every

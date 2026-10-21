@@ -1858,18 +1858,24 @@ impl Sampler {
     /// Refresh the hold-decay slots of the CPU pseudo-rows and return the
     /// rows to display this tick.
     ///
+    /// The interrupt share (DPC + ISR) comes from the load sample's own
+    /// per-core records when they carry it, so it is split against the
+    /// residual of the SAME window; `pdh_interrupts` is only the fallback.
     /// A measured interrupt value is authoritative (low → row hides
     /// immediately); only an UNKNOWN measurement (`None`, e.g. counter
     /// warming up or unavailable) keeps the held value decaying. The
     /// terminated-processes share is the unattributed CPU residual minus
     /// the measured interrupt share, so the same busy time is never shown
     /// twice; when interrupts are unknown the residual is shown whole
-    /// rather than being silently dropped.
+    /// rather than being silently dropped. A terminated row held through
+    /// quiet ticks shows the CURRENT share, not the one that armed the hold:
+    /// a stale 35 % under a 2 % CPU total made the rows outgrow the header.
     fn update_pseudo_rows(
         &mut self,
         load: Option<&LoadSample>,
-        interrupt_meas: Option<f32>,
+        pdh_interrupts: Option<f32>,
     ) -> (Option<HeldPseudoRow>, Option<HeldPseudoRow>) {
+        let interrupt_meas = load.and_then(|l| l.interrupt_pct).or(pdh_interrupts);
         match interrupt_meas {
             Some(v) if v >= PSEUDO_ROW_MIN_PCT => {
                 self.pseudo.interrupts = Some(HeldPseudoRow {
@@ -1886,21 +1892,27 @@ impl Sampler {
         match load {
             Some(l) => {
                 let terminated = (l.unattributed_pct - interrupt_meas.unwrap_or(0.0)).max(0.0);
-                if terminated >= PSEUDO_ROW_MIN_PCT {
-                    let detail = l
+                let current = HeldPseudoRow {
+                    pct: terminated,
+                    detail: l
                         .exited_images
                         .iter()
                         .map(|e| format!("{} ×{}", e.name, e.count))
                         .collect::<Vec<_>>()
-                        .join(", ");
-                    self.pseudo.terminated = Some(HeldPseudoRow {
-                        pct: terminated,
-                        detail,
-                        count: l.exited_count,
-                        ticks_left: PSEUDO_ROW_HOLD_TICKS,
-                    });
+                        .join(", "),
+                    count: l.exited_count,
+                    ticks_left: PSEUDO_ROW_HOLD_TICKS,
+                };
+                if terminated >= PSEUDO_ROW_MIN_PCT {
+                    self.pseudo.terminated = Some(current);
                 } else {
                     decay_pseudo(&mut self.pseudo.terminated);
+                    // Still held: keep the row, but with what was measured.
+                    if let Some(held) = &mut self.pseudo.terminated {
+                        held.pct = current.pct;
+                        held.detail = current.detail;
+                        held.count = current.count;
+                    }
                 }
             }
             None => decay_pseudo(&mut self.pseudo.terminated),
@@ -2594,6 +2606,7 @@ mod tests {
             global_kernel_pct: 0.0,
             procs: HashMap::new(),
             unattributed_pct,
+            interrupt_pct: None,
             exited_count: exited,
             exited_images: if exited > 0 {
                 vec![ExitedImage {
@@ -2834,6 +2847,14 @@ mod tests {
         // residual stays visible instead of being silently dropped.
         let (_, term) = s.update_pseudo_rows(Some(&sample(12.0, 3)), None);
         assert_eq!(term.unwrap().pct, 12.0);
+
+        // The load sample's own DPC + ISR share (same window) wins over the
+        // PDH fallback.
+        let mut own = sample(12.0, 3);
+        own.interrupt_pct = Some(5.0);
+        let (irq, term) = s.update_pseudo_rows(Some(&own), Some(1.0));
+        assert_eq!(irq.unwrap().pct, 5.0);
+        assert!((term.unwrap().pct - 7.0).abs() < 1e-4);
     }
 
     #[test]
@@ -2843,10 +2864,14 @@ mod tests {
         assert!(irq.is_none(), "below threshold");
         assert_eq!(term.as_ref().unwrap().pct, 9.0);
 
-        // Quiet ticks keep the rows visible while the hold lasts…
+        // Quiet ticks keep the rows visible while the hold lasts, showing
+        // what is measured NOW — a held 9 % over an idle machine made the
+        // rows add up to more than the CPU header.
         for _ in 1..PSEUDO_ROW_HOLD_TICKS {
-            let (_, term) = s.update_pseudo_rows(Some(&sample(0.0, 0)), None);
-            assert!(term.is_some(), "row must not flicker off");
+            let (_, term) = s.update_pseudo_rows(Some(&sample(0.2, 0)), None);
+            let term = term.expect("row must not flicker off");
+            assert!((term.pct - 0.2).abs() < 1e-6, "stale {}", term.pct);
+            assert_eq!(term.count, 0);
         }
         // …and disappear once the hold expires.
         for _ in 0..2 {

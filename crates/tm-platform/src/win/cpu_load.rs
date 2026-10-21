@@ -81,6 +81,9 @@ struct CoreRaw {
     idle: i64,
     kernel: i64,
     user: i64,
+    /// DPC + interrupt servicing time (also inside `kernel`), from the 48 B
+    /// record's `DpcTime`/`InterruptTime`; `None` for the 24 B layout.
+    servicing: Option<i64>,
 }
 
 /// Per-process raw time accumulators in 100 ns units.
@@ -167,6 +170,11 @@ pub struct LoadSample {
     /// process (terminated processes, DPC/ISR servicing, accounting
     /// residue), as share of total capacity in [0, 100].
     pub unattributed_pct: f32,
+    /// DPC + interrupt servicing — Task Manager's "System interrupts" — as
+    /// share of total capacity, from the SAME per-core records and window as
+    /// `unattributed_pct`, so the split between the two never mixes windows.
+    /// `None` when the records do not carry the servicing fields.
+    pub interrupt_pct: Option<f32>,
     /// Number of processes that terminated during the window.
     pub exited_count: u32,
     /// Most frequently exited images (deduped, highest count first).
@@ -974,6 +982,13 @@ fn build_sample(
         })
         .sum();
     let unattributed_100ns = busy_100ns.saturating_sub(accounted_100ns);
+    // Servicing time is part of kernel time, so it can never exceed what was
+    // busy; a counter glitch must not produce more interrupts than load.
+    let servicing_100ns: Option<u64> = cores
+        .iter()
+        .zip(prev.cores.iter())
+        .map(|(c, p)| Some(nonneg(c.servicing?.saturating_sub(p.servicing?))))
+        .sum();
 
     LoadSample {
         global_pct,
@@ -982,6 +997,7 @@ fn build_sample(
         global_kernel_pct,
         procs: out,
         unattributed_pct: capacity(unattributed_100ns),
+        interrupt_pct: servicing_100ns.map(|t| capacity(t.min(busy_100ns))),
         exited_count,
         exited_images,
     }
@@ -1098,6 +1114,7 @@ fn parse_cores(buf: &[u8], written: usize, nb_cpu: usize) -> Option<Vec<CoreRaw>
             idle: read_i64(buf, r * 24),
             kernel: read_i64(buf, r * 24 + 8),
             user: read_i64(buf, r * 24 + 16),
+            servicing: None,
         })
         .collect();
 
@@ -1116,6 +1133,12 @@ fn parse_cores(buf: &[u8], written: usize, nb_cpu: usize) -> Option<Vec<CoreRaw>
                         idle: read_i64(buf, base),
                         kernel: read_i64(buf, base + 8),
                         user: read_i64(buf, base + 16),
+                        // DpcTime@24 + InterruptTime@32, both inside kernel.
+                        servicing: (stride >= 40).then(|| {
+                            nonneg(read_i64(buf, base + 24))
+                                .saturating_add(nonneg(read_i64(buf, base + 32)))
+                                .min(i64::MAX as u64) as i64
+                        }),
                     })
                 })
                 .collect(),
@@ -1172,7 +1195,12 @@ mod tests {
     use super::*;
 
     fn core(idle: i64, kernel: i64, user: i64) -> CoreRaw {
-        CoreRaw { idle, kernel, user }
+        CoreRaw {
+            idle,
+            kernel,
+            user,
+            servicing: None,
+        }
     }
 
     /// Modern 48 B records (idle, kernel, user, DPC, interrupt, count) whose
@@ -1193,6 +1221,66 @@ mod tests {
             (cores[1].idle, cores[1].kernel, cores[1].user),
             (200, 900, 80)
         );
+        // DPC + interrupt time ride along from the same record.
+        assert_eq!(cores[0].servicing, Some(10));
+        assert_eq!(cores[1].servicing, Some(8));
+    }
+
+    /// "System interrupts" is DPC AND interrupt time, taken from the same
+    /// per-core window as the unattributed residual. Only `% Interrupt Time`
+    /// was subtracted before, so every DPC landed in "Terminated processes".
+    #[test]
+    fn interrupt_share_counts_dpc_time_from_the_same_window() {
+        let at = |idle, kernel, user, servicing| CoreRaw {
+            idle,
+            kernel,
+            user,
+            servicing: Some(servicing),
+        };
+        let prev = PrevSample {
+            at: Instant::now(),
+            cores: vec![at(0, 0, 0, 0), at(0, 0, 0, 0)],
+            procs: HashMap::new(),
+        };
+        // 1 s on two cores = 2e7 capacity. Core 0: 6e6 busy kernel time of
+        // which 2e6 DPC+ISR; core 1: 1e6 busy, all of it servicing.
+        let cores = [
+            at(4_000_000, 10_000_000, 0, 2_000_000),
+            at(9_000_000, 10_000_000, 0, 1_000_000),
+        ];
+        let s = build_sample(&prev, &cores, &HashMap::new(), 1.0);
+        assert!(
+            (s.unattributed_pct - 35.0).abs() < 1e-3,
+            "{}",
+            s.unattributed_pct
+        );
+        assert!((s.interrupt_pct.unwrap() - 15.0).abs() < 1e-3);
+
+        // A layout without the fields leaves the share unknown, not zero.
+        let mut old = cores;
+        old[1].servicing = None;
+        assert_eq!(
+            build_sample(&prev, &old, &HashMap::new(), 1.0).interrupt_pct,
+            None
+        );
+    }
+
+    /// Live kernel answer: the servicing fields are present on this build and
+    /// obey their invariant (DPC + interrupt time is part of busy kernel time).
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn live_core_records_carry_servicing_time_inside_kernel_time() {
+        let mut acc = CpuLoadAccountant::default();
+        let cores = acc.query_cores().expect("core records");
+        assert!(!cores.is_empty());
+        for (i, c) in cores.iter().enumerate() {
+            let servicing = c.servicing.expect("48 B records on this build");
+            assert!(
+                servicing >= 0 && servicing <= c.kernel - c.idle,
+                "core {i}: servicing {servicing} outside busy kernel {}",
+                c.kernel - c.idle
+            );
+        }
     }
 
     /// The hand-written offsets must agree with the layout the `windows`
