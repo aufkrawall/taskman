@@ -2508,15 +2508,69 @@ pub fn dialog_key_decision(
 /// elsewhere), and a keyboard-chosen entry holds focus itself, a widget that
 /// is gone once the menu closes. Either way the list ended up unfocused and
 /// Delete/arrows did nothing until it was clicked again.
+///
+/// Otherwise it is what held focus when the frame began: while a dialog is
+/// up the page is drawn disabled, and egui drops focus from disabled widgets
+/// — so by the time the dialog's first frame runs, the list that opened it
+/// (Delete → End process) no longer holds focus. A hand-back still waiting to
+/// happen (see [`restore_focus`]) is where focus logically is, so it is taken
+/// over rather than left to fire under the new dialog.
 pub fn capture_focus(ctx: &egui::Context) -> Option<egui::Id> {
-    crate::widgets::menu::pending_return_focus(ctx).or_else(|| ctx.memory(|mem| mem.focused()))
+    let pending = ctx
+        .data_mut(|d| d.remove_temp::<Option<egui::Id>>(egui::Id::new(PENDING_FOCUS_RESTORE)))
+        .flatten();
+    let at_frame_start = ctx
+        .data(|d| d.get_temp::<Option<egui::Id>>(egui::Id::new(FOCUS_AT_FRAME_START)))
+        .flatten();
+    crate::widgets::menu::pending_return_focus(ctx)
+        .or(pending)
+        .or(at_frame_start)
+        .or_else(|| ctx.memory(|mem| mem.focused()))
 }
 
-/// Give keyboard focus back to a widget saved by [`capture_focus`]. A saved
-/// widget that no longer exists is dropped by egui's focus dead-man switch,
-/// so restoring is always safe.
+const PENDING_FOCUS_RESTORE: &str = "tm-pending-focus-restore";
+const FOCUS_AT_FRAME_START: &str = "tm-focus-at-frame-start";
+
+/// Give keyboard focus back to a widget saved by [`capture_focus`] once the
+/// dialog that took it is really gone.
+///
+/// Not immediately: egui judges whether a widget may hold focus by the
+/// PREVIOUS frame's top modal layer, so for one frame after a modal dialog
+/// closes everything beneath it still counts as blocked — and egui actively
+/// surrenders focus for blocked widgets (`Context::create_widget`). An
+/// immediate request was thrown away exactly then, which left the process
+/// list unfocused after every dialog (Delete did nothing until a click). The
+/// request is parked and [`begin_frame_focus`] performs it at the start of
+/// the first frame in which the target may take focus.
 pub fn restore_focus(ctx: &egui::Context, saved: Option<egui::Id>) {
     if let Some(id) = saved {
+        ctx.data_mut(|d| d.insert_temp(egui::Id::new(PENDING_FOCUS_RESTORE), Some(id)));
+    }
+}
+
+/// Focus bookkeeping at the start of every frame, before anything is drawn:
+/// perform a parked [`restore_focus`] as soon as its target may take focus
+/// (so the target registers its interest in focus in this same frame), then
+/// note what holds focus for [`capture_focus`].
+pub fn begin_frame_focus(ctx: &egui::Context) {
+    apply_pending_focus_restore(ctx);
+    let focused = ctx.memory(|mem| mem.focused());
+    ctx.data_mut(|d| d.insert_temp(egui::Id::new(FOCUS_AT_FRAME_START), focused));
+}
+
+fn apply_pending_focus_restore(ctx: &egui::Context) {
+    let key = egui::Id::new(PENDING_FOCUS_RESTORE);
+    let Some(id) = ctx.data(|d| d.get_temp::<Option<egui::Id>>(key)).flatten() else {
+        return;
+    };
+    // The target's layer as of the last frame; a target that is gone (the
+    // page changed underneath the dialog) has nothing left to restore.
+    let Some(layer) = ctx.read_response(id).map(|response| response.layer_id) else {
+        ctx.data_mut(|d| d.remove_temp::<Option<egui::Id>>(key));
+        return;
+    };
+    if ctx.memory(|mem| mem.allows_interaction(layer)) {
+        ctx.data_mut(|d| d.remove_temp::<Option<egui::Id>>(key));
         ctx.memory_mut(|mem| mem.request_focus(id));
     }
 }
@@ -2763,6 +2817,72 @@ mod tests {
             Some(Some(body_id)),
             "the dialog must hand focus back to the list it was opened on"
         );
+    }
+
+    /// Regression: closing ANY modal dialog (End process, Process
+    /// Properties, ...) left the list unfocused — still selected, but Delete
+    /// and the arrows did nothing until it was clicked. egui keeps the closed
+    /// dialog's modal layer for one more frame and surrenders focus for the
+    /// widgets it blocks, so an immediate hand-back was thrown away.
+    #[test]
+    fn closing_a_modal_dialog_gives_the_list_its_focus_back() {
+        let ctx = egui::Context::default();
+        let screen = Rect::from_min_size(Pos2::ZERO, egui::vec2(800.0, 600.0));
+        let body_id = egui::Id::new("test-list-body");
+        // `dialog`: None = no dialog, Some(false) = shown, Some(true) =
+        // shown for the last time (its Close was pressed this frame).
+        let frame = |dialog: Option<bool>, saved: &mut Option<Option<egui::Id>>| {
+            let mut out = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(screen),
+                    ..Default::default()
+                },
+                |ui| {
+                    begin_frame_focus(ui.ctx());
+                    // The page, disabled while a dialog is up (as app.rs does).
+                    ui.scope(|ui| {
+                        if dialog.is_some() {
+                            ui.disable();
+                        }
+                        ui.interact(
+                            Rect::from_min_size(Pos2::ZERO, egui::vec2(400.0, 400.0)),
+                            body_id,
+                            Sense::focusable_noninteractive(),
+                        );
+                    });
+                    if let Some(closing) = dialog {
+                        if saved.is_none() {
+                            *saved = Some(capture_focus(ui.ctx()));
+                        }
+                        egui::Window::new("End process")
+                            .modal(true)
+                            .show(ui.ctx(), |ui| ui.button("Cancel").request_focus());
+                        if closing {
+                            restore_focus(ui.ctx(), saved.flatten());
+                        }
+                    }
+                },
+            );
+            out.textures_delta.clear();
+        };
+
+        let mut saved = None;
+        ctx.memory_mut(|m| m.request_focus(body_id));
+        frame(None, &mut saved);
+        assert!(ctx.memory(|m| m.has_focus(body_id)));
+        frame(Some(false), &mut saved);
+        frame(Some(false), &mut saved);
+        assert_eq!(saved, Some(Some(body_id)));
+        frame(Some(true), &mut saved);
+        for after in 1..=3 {
+            frame(None, &mut saved);
+            if after >= 2 {
+                assert!(
+                    ctx.memory(|m| m.has_focus(body_id)),
+                    "the list must hold focus {after} frames after the dialog closed"
+                );
+            }
+        }
     }
 
     /// Every shape a frame painted, flattened.
@@ -3484,9 +3604,9 @@ mod tests {
         );
     }
 
-    /// Focus capture/restore: restoring a live widget sticks, restoring a
-    /// vanished one is dropped by egui's dead-man switch, and `None` is a
-    /// no-op.
+    /// Focus capture/restore: a restore lands through `begin_frame_focus` on
+    /// a live widget, a vanished target is dropped without taking focus from
+    /// anything, and `None` is a no-op.
     #[test]
     fn capture_and_restore_focus_round_trip() {
         let ctx = egui::Context::default();
@@ -3496,36 +3616,46 @@ mod tests {
             focused: true,
             ..Default::default()
         };
+        // Draws "Target" and "Other"; returns their ids and which has focus.
+        let frame = |focus_target: bool| {
+            let mut ids = (egui::Id::NULL, egui::Id::NULL);
+            let mut out = ctx.run_ui(raw.clone(), |ui| {
+                begin_frame_focus(ui.ctx());
+                let target = ui.button("Target");
+                if focus_target {
+                    target.request_focus();
+                }
+                ids = (target.id, ui.button("Other").id);
+            });
+            out.textures_delta.clear();
+            ids
+        };
 
         assert_eq!(capture_focus(&ctx), None, "nothing focused yet");
-
-        let mut out = ctx.run_ui(raw.clone(), |ui| {
-            ui.button("Target").request_focus();
-        });
-        out.textures_delta.clear();
+        let (target, other) = frame(true);
         let saved = capture_focus(&ctx);
-        assert!(saved.is_some());
+        assert_eq!(saved, Some(target));
 
-        // The widget still exists: the restore sticks.
+        // Focus moved elsewhere (a dialog's button); the restore brings it back.
+        ctx.memory_mut(|m| m.request_focus(other));
+        frame(false);
         restore_focus(&ctx, saved);
-        let mut has_focus = false;
-        let mut out = ctx.run_ui(raw.clone(), |ui| {
-            has_focus = ui.button("Target").has_focus();
-        });
-        out.textures_delta.clear();
-        assert!(has_focus, "restored focus must stick on a live widget");
+        frame(false);
+        assert!(
+            ctx.memory(|m| m.has_focus(target)),
+            "restored focus must land on a live widget"
+        );
 
-        // The widget is gone: the dead-man switch drops the restore.
+        // A vanished target is dropped and takes focus from nobody.
         restore_focus(&ctx, Some(egui::Id::new("vanished-widget")));
-        let mut has_focus = false;
-        let mut out = ctx.run_ui(raw.clone(), |ui| {
-            has_focus = ui.button("Target").has_focus();
-        });
-        out.textures_delta.clear();
-        assert!(!has_focus, "a vanished widget must not keep focus");
+        frame(false);
+        frame(false);
+        assert!(ctx.memory(|m| m.has_focus(target)));
 
         // `None` restores nothing and must not panic.
         restore_focus(&ctx, None);
+        frame(false);
+        assert!(ctx.memory(|m| m.has_focus(target)));
     }
 
     /// The dialog keyboard contract: Escape and an unfocused Enter resolve to

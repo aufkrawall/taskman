@@ -159,7 +159,13 @@ platform boundary (`tm-core` ← `tm-platform` ← `tm-app` / `tm-service`), and
     focus flag follows REAL egui focus, so the affinity checkboxes stay
     Tab-reachable), `capture_focus`/`restore_focus` (hand focus back to the
     invoking widget on close — for a dialog opened from a context menu, the
-    menu's recorded owner, never the clicked entry), the F1 help overlay, and hand-painted focus
+    menu's recorded owner, never the clicked entry; otherwise focus as of
+    FRAME START, because the page is drawn disabled under a dialog and egui
+    drops focus from disabled widgets. The hand-back is PARKED and
+    `begin_frame_focus` (top of `TaskManApp::ui`) applies it once the
+    target's layer may interact: egui judges that by the previous frame's
+    modal layer and surrenders focus from blocked widgets, so an immediate
+    request after a modal closed was always thrown away), the F1 help overlay, and hand-painted focus
     rings for the custom shell widgets),
      `search.rs` (list-navigation primitives shared by every page:
      `content_focus_id` — the ONE focus target a page's content region owns,

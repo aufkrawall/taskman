@@ -1,3 +1,21 @@
+- 2026-10-21 (focus after ANY dialog — real root cause): the menu-owner
+  fix below was necessary but not sufficient; the user still saw no focus
+  after Process Properties, and the same after End process via Delete. Two
+  egui behaviors, both read in `vendor/egui` (context.rs `create_widget`,
+  memory `Focus::end_pass`): (1) `allows_interaction` uses the PREVIOUS
+  frame's top modal layer, and `create_widget` surrenders focus for any
+  widget not allowed to interact — so the immediate `request_focus` on close
+  was dropped the very next frame, for every modal dialog; (2) the page is
+  drawn `ui.disable()`d in the frame a dialog opens, BEFORE the dialog's
+  first-frame `capture_focus`, so the list had already lost focus (capture
+  = None). Fix: `restore_focus` parks the target, `begin_frame_focus` at the
+  top of `TaskManApp::ui` applies it when `allows_interaction(target
+  layer)`, and records frame-start focus for `capture_focus`. The F1 help
+  overlay's own hand-back now uses `restore_focus` too. Test
+  `closing_a_modal_dialog_gives_the_list_its_focus_back` fails on each half
+  of the old behavior; `capture_and_restore_focus_round_trip` rewritten for
+  the parked contract (it had pinned the immediate semantics). Lesson: the
+  earlier test only checked the captured id, not focus after close.
 - 2026-10-21 (focus after menu dialogs): user report — after closing
   Process Properties, Delete did nothing until the row was clicked. Root
   cause (pre-existing, every dialog opened from a context menu): clicking

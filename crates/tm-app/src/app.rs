@@ -1558,10 +1558,10 @@ fn route_global_keyboard(app: &mut TaskManApp, ctx: &egui::Context) {
         consume(egui::Key::F1);
         app.show_help = false;
         ctx.data_mut(|data| data.remove_temp::<bool>(egui::Id::new("tm-help-focus-init")));
-        if let Some(Some(id)) = ctx.data_mut(|data| {
+        if let Some(saved) = ctx.data_mut(|data| {
             data.remove_temp::<Option<egui::Id>>(egui::Id::new("tm-help-return-focus"))
         }) {
-            ctx.memory_mut(|memory| memory.request_focus(id));
+            crate::app_ui::restore_focus(ctx, saved);
         }
         return;
     }
@@ -1755,6 +1755,10 @@ impl eframe::App for TaskManApp {
         self.sync_title_bar(&ctx, &pal, _frame);
 
         crate::search::set_active_content(&ctx, self.tab.key());
+        // Before anything is drawn: a dialog's focus hand-back lands here, and
+        // dialogs opening this frame record focus as it was before the page
+        // was drawn disabled (see `app_ui::restore_focus` / `capture_focus`).
+        crate::app_ui::begin_frame_focus(&ctx);
         ctx.data_mut(|data| data.remove_temp::<&'static str>(egui::Id::new("tm-content-present")));
         let first_keyboard_frame = ctx.data(|data| {
             data.get_temp::<bool>(egui::Id::new("tm-keyboard-initialized")) != Some(true)
@@ -1856,10 +1860,10 @@ impl eframe::App for TaskManApp {
         if self.show_help && crate::app_ui::help_overlay(&ctx, &pal) {
             self.show_help = false;
             ctx.data_mut(|data| data.remove_temp::<bool>(egui::Id::new("tm-help-focus-init")));
-            if let Some(Some(id)) = ctx.data_mut(|data| {
+            if let Some(saved) = ctx.data_mut(|data| {
                 data.remove_temp::<Option<egui::Id>>(egui::Id::new("tm-help-return-focus"))
             }) {
-                ctx.memory_mut(|memory| memory.request_focus(id));
+                crate::app_ui::restore_focus(&ctx, saved);
             }
         }
         crate::widgets::menu::restore_closed_menu_focus(&ctx, self.modal_open());

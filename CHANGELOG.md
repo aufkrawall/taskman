@@ -44,10 +44,11 @@
 
 ### Fixed
 
-- **List lost keyboard focus after a dialog from its context menu:** after
-  closing Process Properties (or any dialog opened from a row's right-click
-  menu), Delete and the arrow keys did nothing until the row was clicked
-  again. Focus now returns to the list the menu was opened on.
+- **List lost keyboard focus after any dialog:** after closing the End
+  process confirmation, Process Properties or any other dialog, the row
+  stayed selected but Delete and the arrow keys did nothing until it was
+  clicked again. Focus now returns to the list (or whatever held it) when a
+  dialog closes, including dialogs opened from a right-click menu.
 - **Blue-filled confirmation buttons:** the action button of confirmation
   dialogs (End process, Unload module, service Stop/Restart, Apply affinity
   and the other two-button dialogs) was painted solid blue with a white ring,
