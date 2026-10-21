@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.1.21 - 2026-10-21
+
 ### New
 
 - **Threads, Network and Services pages in Process Properties:** like System
