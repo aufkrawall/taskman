@@ -111,6 +111,14 @@ pub fn keyboard_menu_requested(ctx: &egui::Context) -> bool {
 const KB_INITIAL_FOCUS: &str = "tm-menu-kb-initial-focus";
 const MENU_RETURN_FOCUS: &str = "tm-menu-return-focus";
 
+/// The widget an open context menu (or one closing this frame) hands focus
+/// back to: the owner recorded when it opened. A dialog opened from the menu
+/// returns focus there too (see `app_ui::capture_focus`).
+pub fn pending_return_focus(ctx: &egui::Context) -> Option<egui::Id> {
+    ctx.data(|data| data.get_temp::<Option<egui::Id>>(egui::Id::new(MENU_RETURN_FOCUS)))
+        .flatten()
+}
+
 pub fn restore_closed_menu_focus(ctx: &egui::Context, dialog_open: bool) {
     if egui::Popup::is_any_open(ctx) {
         return;

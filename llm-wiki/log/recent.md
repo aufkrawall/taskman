@@ -1,3 +1,13 @@
+- 2026-10-21 (focus after menu dialogs): user report — after closing
+  Process Properties, Delete did nothing until the row was clicked. Root
+  cause (pre-existing, every dialog opened from a context menu): clicking
+  the menu entry makes the focused table body surrender focus (egui drops
+  focus on a click outside the widget), so the dialog's first-frame
+  `capture_focus` saw `None`; a keyboard-chosen entry was captured instead
+  and is dead once the menu closes. `capture_focus` now prefers
+  `menu::pending_return_focus` (the owner the menu recorded on open).
+  Pinned by `a_dialog_opened_from_a_context_menu_returns_focus_to_the_list`
+  (real pointer events; fails with `Some(None)` on the old capture).
 - 2026-10-21 (live properties pages): user asked why the module list
   needed a Refresh button — it loaded once. Modules and Services now refresh
   at the update speed like Threads/Network, Paused freezes them, and F5 works

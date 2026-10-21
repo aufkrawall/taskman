@@ -2498,11 +2498,18 @@ pub fn dialog_key_decision(
     }
 }
 
-/// The widget that held keyboard focus, captured before a dialog takes it
-/// (call on the dialog's FIRST frame, before `Window::show`). `None` when
-/// nothing held focus.
+/// The widget to hand keyboard focus back to when a dialog closes, captured
+/// before the dialog takes it (call on the dialog's FIRST frame, before
+/// `Window::show`). `None` when nothing held focus.
+///
+/// A dialog opened from a context menu returns focus to the menu's owner —
+/// the list it was opened on — not to what is focused right now: clicking the
+/// entry made the list surrender focus (egui drops focus on a click
+/// elsewhere), and a keyboard-chosen entry holds focus itself, a widget that
+/// is gone once the menu closes. Either way the list ended up unfocused and
+/// Delete/arrows did nothing until it was clicked again.
 pub fn capture_focus(ctx: &egui::Context) -> Option<egui::Id> {
-    ctx.memory(|mem| mem.focused())
+    crate::widgets::menu::pending_return_focus(ctx).or_else(|| ctx.memory(|mem| mem.focused()))
 }
 
 /// Give keyboard focus back to a widget saved by [`capture_focus`]. A saved
@@ -2671,6 +2678,92 @@ pub(crate) fn update_end_task_dialog_focus(
 mod tests {
     use super::*;
     use std::time::{Duration, Instant};
+
+    /// Regression: Process Properties (or any dialog) opened from a row's
+    /// context menu handed focus back to nothing, so Delete did nothing until
+    /// the row was clicked again. Drives the real pointer path: right-click a
+    /// row of a focused list, click the menu entry, capture as a dialog does.
+    #[test]
+    fn a_dialog_opened_from_a_context_menu_returns_focus_to_the_list() {
+        let ctx = egui::Context::default();
+        let screen = Rect::from_min_size(Pos2::ZERO, egui::vec2(800.0, 600.0));
+        let body_id = egui::Id::new("test-list-body");
+        let row_rect = Rect::from_min_size(egui::pos2(20.0, 40.0), egui::vec2(300.0, 20.0));
+        let entry_rect_key = egui::Id::new("test-entry-rect");
+        let frame = |events: Vec<egui::Event>| -> Option<Option<egui::Id>> {
+            let mut captured = None;
+            let mut out = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(screen),
+                    events,
+                    ..Default::default()
+                },
+                |ui| {
+                    // The table body is the list's one keyboard stop; rows
+                    // hand it focus when clicked (as `TmTable::row` does).
+                    ui.interact(
+                        Rect::from_min_size(Pos2::ZERO, egui::vec2(400.0, 400.0)),
+                        body_id,
+                        Sense::focusable_noninteractive(),
+                    );
+                    let row = ui.interact(
+                        row_rect,
+                        egui::Id::new("test-row"),
+                        Sense::CLICK.union(Sense::hover()),
+                    );
+                    if row.secondary_clicked() {
+                        ui.ctx().memory_mut(|m| m.request_focus(body_id));
+                    }
+                    crate::widgets::menu::context_menu_kb(&row, false, |ui| {
+                        let entry = crate::widgets::menu::item(ui, "Process properties");
+                        if entry.enabled() {
+                            ui.ctx()
+                                .data_mut(|d| d.insert_temp(entry_rect_key, entry.rect));
+                        }
+                        if entry.clicked() {
+                            captured = Some(capture_focus(ui.ctx()));
+                            ui.close();
+                        }
+                    });
+                    crate::widgets::menu::restore_closed_menu_focus(ui.ctx(), captured.is_some());
+                },
+            );
+            out.textures_delta.clear();
+            captured
+        };
+        let button = |pos: Pos2, button, pressed| egui::Event::PointerButton {
+            pos,
+            button,
+            pressed,
+            modifiers: egui::Modifiers::default(),
+        };
+
+        ctx.memory_mut(|m| m.request_focus(body_id));
+        frame(Vec::new());
+        let at = row_rect.center();
+        frame(vec![egui::Event::PointerMoved(at)]);
+        frame(vec![
+            button(at, egui::PointerButton::Secondary, true),
+            button(at, egui::PointerButton::Secondary, false),
+        ]);
+        // The menu's first frame is a sizing pass with disabled entries.
+        for _ in 0..3 {
+            frame(Vec::new());
+        }
+        let entry = ctx
+            .data(|d| d.get_temp::<Rect>(entry_rect_key))
+            .expect("the menu entry must be laid out");
+        frame(vec![egui::Event::PointerMoved(entry.center())]);
+        let captured = frame(vec![
+            button(entry.center(), egui::PointerButton::Primary, true),
+            button(entry.center(), egui::PointerButton::Primary, false),
+        ]);
+        assert_eq!(
+            captured,
+            Some(Some(body_id)),
+            "the dialog must hand focus back to the list it was opened on"
+        );
+    }
 
     /// Every shape a frame painted, flattened.
     fn painted_rects(shapes: &[egui::epaint::ClippedShape]) -> Vec<egui::epaint::RectShape> {

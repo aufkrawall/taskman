@@ -158,7 +158,8 @@ platform boundary (`tm-core` ← `tm-platform` ← `tm-app` / `tm-service`), and
     columns, Process properties), `dialog_button_row_mirror` (the row's
     focus flag follows REAL egui focus, so the affinity checkboxes stay
     Tab-reachable), `capture_focus`/`restore_focus` (hand focus back to the
-    invoking widget on close), the F1 help overlay, and hand-painted focus
+    invoking widget on close — for a dialog opened from a context menu, the
+    menu's recorded owner, never the clicked entry), the F1 help overlay, and hand-painted focus
     rings for the custom shell widgets),
      `search.rs` (list-navigation primitives shared by every page:
      `content_focus_id` — the ONE focus target a page's content region owns,
