@@ -1942,12 +1942,34 @@ pub fn well_known_sid_name(sid: &str) -> Option<&'static str> {
 /// three SIDs are fixed by Windows, so this is identity, not a guess.
 pub fn well_known_sid_for_account(account: &str) -> Option<&'static str> {
     let normalized = account.trim().to_ascii_uppercase();
+    if normalized.ends_with('$') {
+        return Some("S-1-5-18");
+    }
     match normalized.as_str() {
         "SYSTEM" | "NT AUTHORITY\\SYSTEM" | "LOCAL SYSTEM" => Some("S-1-5-18"),
         "LOCAL SERVICE" | "NT AUTHORITY\\LOCAL SERVICE" => Some("S-1-5-19"),
         "NETWORK SERVICE" | "NT AUTHORITY\\NETWORK SERVICE" => Some("S-1-5-20"),
         "SERVICE" | "NT AUTHORITY\\SERVICE" => Some("S-1-5-6"),
         _ => None,
+    }
+}
+
+/// Resolve a SID string ("S-1-5-18") to a canonical account name.
+pub fn account_name_of_sid_string(sid_str: &str) -> Option<String> {
+    if let Some(name) = well_known_sid_name(sid_str) {
+        return Some(name.to_string());
+    }
+    use windows::Win32::Foundation::{HLOCAL, LocalFree};
+    use windows::Win32::Security::Authorization::ConvertStringSidToSidW;
+    use windows::core::PCWSTR;
+
+    let wide: Vec<u16> = sid_str.encode_utf16().chain(std::iter::once(0)).collect();
+    let mut psid = windows::Win32::Security::PSID::default();
+    unsafe {
+        ConvertStringSidToSidW(PCWSTR::from_raw(wide.as_ptr()), &mut psid).ok()?;
+        let name = account_name_of_sid(psid);
+        let _ = LocalFree(Some(HLOCAL(psid.0.cast())));
+        name
     }
 }
 
@@ -3196,5 +3218,30 @@ mod tests {
         // Process is already exited. terminate_handle must succeed cleanly rather
         // than reporting an error.
         assert!(terminate_handle(handle).is_ok());
+    }
+
+    #[test]
+    fn well_known_sid_and_machine_account_resolution() {
+        assert_eq!(
+            account_name_of_sid_string("S-1-5-18").as_deref(),
+            Some("SYSTEM")
+        );
+        assert_eq!(
+            account_name_of_sid_string("S-1-5-19").as_deref(),
+            Some("LOCAL SERVICE")
+        );
+        assert_eq!(
+            account_name_of_sid_string("S-1-5-20").as_deref(),
+            Some("NETWORK SERVICE")
+        );
+        assert_eq!(
+            account_name_of_sid_string("S-1-5-6").as_deref(),
+            Some("SERVICE")
+        );
+        assert_eq!(
+            well_known_sid_for_account("runnervmuzpk7$"),
+            Some("S-1-5-18")
+        );
+        assert_eq!(well_known_sid_for_account("SYSTEM"), Some("S-1-5-18"));
     }
 }

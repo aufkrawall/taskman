@@ -1,3 +1,22 @@
+- 2026-10-22: CI quality gate failure in `windows_core_processes_report_their_owning_account`.
+  Root cause: `windows_core_processes_report_their_owning_account` failed in CI on
+  `csrss.exe` with `left: "runnervmuzpk7$"` vs `right: "SYSTEM"`. In elevated test
+  environments (such as GitHub Actions runners on Windows Server 2025), `sysinfo`'s
+  `Users::new_with_refreshed_list()` enumerates LSA logon sessions via
+  `LsaEnumerateLogonSessions` and `LsaGetLogonSessionData`. Because sysinfo's internal
+  `Sid::account_name()` calls `LookupAccountSidW` with a null domain buffer, it fails
+  with `ERROR_INSUFFICIENT_BUFFER` whenever the account has a referenced domain (`NT AUTHORITY`),
+  falling back to `data.UserName` from the logon session. For the LocalSystem session (`S-1-5-18`),
+  the logon session user name is the machine account (`<COMPUTERNAME>$`). In TaskMan's
+  `Sampler`, `build_user_map` previously accepted the raw username from `sysinfo::Users`,
+  populating `user_names` with `S-1-5-18 => "<COMPUTERNAME>$"`, which bypassed TaskMan's
+  internal well-known SID canonicalization. Fix: updated `build_user_map` to pre-seed
+  well-known accounts (`S-1-5-18` -> `SYSTEM`, `S-1-5-19` -> `LOCAL SERVICE`, etc.),
+  canonicalize accounts by SID using `process_ops::well_known_sid_name` / `account_name_of_sid_string`,
+  map any machine accounts ending with `$` to `SYSTEM`, and populate `entry.user_sid` directly.
+  Added regression coverage in `sampler::tests` and `process_ops::tests`. Verified full
+  gate (`python build.py --check`) and stable clippy.
+
 - 2026-10-21: CI quality gate failure in `service_catalog_discovers_active_services`.
   Root cause: `process_ops::tests::service_catalog_discovers_active_services`
   asserted exact equality (`resolved.eq_ignore_ascii_case(cmdline)`) between the

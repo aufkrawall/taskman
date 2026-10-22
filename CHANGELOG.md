@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+### Fixed
+
+- **System and service process account names in CI / domain environments:**
+  `sysinfo`'s user enumeration falls back to the LSA logon session user name
+  when its internal `LookupAccountSidW` query fails to allocate a domain buffer.
+  In elevated Windows Server/Azure runner environments, this reported the computer
+  account (e.g. `runnerxyz$`) rather than `SYSTEM`. The sampler now canonicalizes
+  well-known SIDs and computer account names from user enumeration to canonical
+  account names (`SYSTEM`, `LOCAL SERVICE`, etc.) and pre-seeds well-known accounts.
+
 ## 0.1.21 - 2026-10-21
 
 ### New

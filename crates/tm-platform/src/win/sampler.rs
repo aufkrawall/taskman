@@ -177,12 +177,18 @@ fn should_release_handles(new_zombie: bool, last_reset: Option<Instant>) -> bool
     new_zombie && last_reset.is_none_or(|at| at.elapsed() >= SYS_RESET_COOLDOWN)
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct CachedUser {
+    pub name: String,
+    pub sid: String,
+}
+
 /// Everything that carries state between ticks.
 pub struct Sampler {
     sys: System,
     disks: Disks,
     networks: Networks,
-    user_names: HashMap<sysinfo::Uid, String>,
+    user_names: HashMap<sysinfo::Uid, CachedUser>,
     cpu_static: Option<cpu_info::CpuStatic>,
     prev_net_totals: HashMap<String, (u64, u64)>,
     last_tick: Option<Instant>,
@@ -1516,9 +1522,15 @@ impl Sampler {
                 .or_else(|| service_catalog.paths_by_pid.get(&pid_u).cloned());
             let has_window = window_owners.visible.contains(&pid_u);
 
-            let user = p
-                .user_id()
-                .and_then(|uid| self.user_names.get(uid).cloned());
+            let cached_user = p.user_id().and_then(|uid| self.user_names.get(uid));
+            let mut user = cached_user.map(|u| u.name.clone());
+            let mut user_sid = cached_user.map(|u| u.sid.clone());
+            if let Some(u) = user.as_deref()
+                && u.ends_with('$')
+            {
+                user = Some("SYSTEM".to_string());
+                user_sid = Some("S-1-5-18".to_string());
+            }
             let du = p.disk_usage();
 
             let mut entry = ProcessEntry::new(pid_u, name.clone());
@@ -1594,6 +1606,7 @@ impl Sampler {
                 entry.status = ProcStatus::NotResponding;
             }
             entry.user = user;
+            entry.user_sid = user_sid;
             // Time-based share of total machine capacity + absolute CPU time,
             // both straight from the kernel's accumulators (cpu_load.rs).
             let pc = load.as_ref().and_then(|l| l.procs.get(&pid_u));
@@ -1789,6 +1802,12 @@ impl Sampler {
                     };
                     fallback_user_for_known_role(stem, session, evidence)
                 };
+            }
+            if let Some(u) = p.user.as_deref()
+                && u.ends_with('$')
+            {
+                p.user = Some("SYSTEM".to_string());
+                p.user_sid = Some("S-1-5-18".to_string());
             }
             // The SID column stays useful for session-0 hosts whose token
             // cannot be opened: the three well-known service accounts have
@@ -2222,7 +2241,8 @@ fn infer_elevation_from_account(p: &mut ProcessEntry) {
         || user.eq_ignore_ascii_case("NETWORK SERVICE")
         || upper.starts_with("NT SERVICE\\")
         || upper.starts_with("DWM-")
-        || upper.starts_with("UMFD-");
+        || upper.starts_with("UMFD-")
+        || upper.ends_with('$');
     if is_service_account {
         p.elevated = Some(true);
         if p.uac_virtualization.is_none() {
@@ -2531,12 +2551,50 @@ fn refine_categories_and_group_apps(processes: &mut [ProcessEntry]) {
     }
 }
 
-fn build_user_map(users: &Users) -> HashMap<sysinfo::Uid, String> {
+fn build_user_map(users: &Users) -> HashMap<sysinfo::Uid, CachedUser> {
     let mut m = HashMap::new();
+
+    // Pre-seed canonical well-known service accounts so that processes running
+    // under these accounts resolve immediately even if sysinfo's initial user
+    // enumeration missed them or produced localized / machine-account names.
+    for (sid, name) in [
+        ("S-1-5-18", "SYSTEM"),
+        ("S-1-5-19", "LOCAL SERVICE"),
+        ("S-1-5-20", "NETWORK SERVICE"),
+        ("S-1-5-6", "SERVICE"),
+    ] {
+        if let Ok(uid) = std::str::FromStr::from_str(sid) {
+            m.insert(
+                uid,
+                CachedUser {
+                    name: name.to_string(),
+                    sid: sid.to_string(),
+                },
+            );
+        }
+    }
+
     for u in users.list() {
-        m.insert(u.id().clone(), u.name().to_string());
+        let sid_str = format!("{}", **u.id());
+        let raw_name = u.name();
+        let name = canonical_account_name(&sid_str, raw_name);
+        m.insert(u.id().clone(), CachedUser { name, sid: sid_str });
     }
     m
+}
+
+pub(crate) fn canonical_account_name(sid_str: &str, raw_name: &str) -> String {
+    if let Some(canonical) = process_ops::well_known_sid_name(sid_str) {
+        canonical.to_string()
+    } else if raw_name.ends_with('$') {
+        if sid_str == "S-1-5-18" {
+            "SYSTEM".to_string()
+        } else {
+            process_ops::account_name_of_sid_string(sid_str).unwrap_or_else(|| "SYSTEM".to_string())
+        }
+    } else {
+        process_ops::account_name_of_sid_string(sid_str).unwrap_or_else(|| raw_name.to_string())
+    }
 }
 
 fn map_status(s: sysinfo::ProcessStatus) -> ProcStatus {
@@ -3320,5 +3378,42 @@ mod tests {
         // No creation time means no way to prove a spawn race, and the
         // kernel table has already disowned it.
         assert!(is_zombie(1234, None, None, NOW, || false, || false));
+    }
+
+    #[test]
+    fn machine_account_from_sysinfo_is_canonicalized_to_system() {
+        // CI failure simulation: In GitHub Actions Windows runners, sysinfo
+        // enumerates LSA logon sessions and returns machine accounts like
+        // "runnervmuzpk7$" for SID S-1-5-18.
+        let name = canonical_account_name("S-1-5-18", "runnervmuzpk7$");
+        assert_eq!(name, "SYSTEM");
+
+        // Localized account names for well-known SIDs are also canonicalized.
+        assert_eq!(
+            canonical_account_name("S-1-5-19", "Lokaler Dienst"),
+            "LOCAL SERVICE"
+        );
+        assert_eq!(
+            canonical_account_name("S-1-5-20", "Netzwerkdienst"),
+            "NETWORK SERVICE"
+        );
+
+        // A process entry with a machine account username is canonicalized to SYSTEM.
+        let mut p = ProcessEntry::new(6200, "csrss.exe");
+        p.user = Some("runnervmuzpk7$".to_string());
+        if let Some(u) = p.user.as_deref()
+            && u.ends_with('$')
+        {
+            p.user = Some("SYSTEM".to_string());
+            p.user_sid = Some("S-1-5-18".to_string());
+        }
+        infer_elevation_from_account(&mut p);
+        assert_eq!(p.user.as_deref(), Some("SYSTEM"));
+        assert_eq!(p.user_sid.as_deref(), Some("S-1-5-18"));
+        assert_eq!(p.elevated, Some(true));
+        assert_eq!(
+            p.uac_virtualization,
+            Some(tm_core::model::UacVirtualization::NotAllowed)
+        );
     }
 }
