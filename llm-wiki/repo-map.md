@@ -313,6 +313,11 @@ platform boundary (`tm-core` ← `tm-platform` ← `tm-app` / `tm-service`), and
   process started are stopped — a crashing GUI must not stop the still-healthy
   service's. `net_etw`/`disk_etw`/`profile_etw`/`module_etw` pin their names
   against that list.
+- The GUI's `--selfcheck-code-samples` diagnostic runs the installed-path
+  client through the real broker, workload, system-profile provider, and
+  page-to-module attribution. It is the end-to-end coverage that a unit test
+  or a dev-tree client cannot provide because the broker rejects foreign
+  images.
 - `crates/tm-platform/src/win/cpu_load.rs` — also the source of per-process
   I/O operation counts and hard page faults (the same kernel table already
   carries `IO_COUNTERS` and `HardFaultCount`, so they cost no extra query), and

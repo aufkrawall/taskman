@@ -134,3 +134,138 @@ pub fn run(mock: bool) -> i32 {
     }
     0
 }
+
+/// Exercise the installed GUI → LocalSystem broker → system-profile ETW path.
+///
+/// This intentionally targets the GUI's own process: the broker must accept
+/// the installed client image, start a profile trace as LocalSystem, decode
+/// sampled instruction pointers, and attribute at least one page to a module.
+pub fn run_code_samples() -> i32 {
+    let mut collector = tm_platform::create_collector();
+    let Ok(snapshot) = collector.sample(Instant::now()) else {
+        tracing::error!("code-sample selfcheck: process snapshot failed");
+        eprintln!(
+            "{}",
+            serde_json::json!({"ok": false, "error": "process snapshot failed"})
+        );
+        return 1;
+    };
+    let pid = std::process::id();
+    let Some(start_epoch_s) = snapshot
+        .processes
+        .iter()
+        .find(|process| process.pid == pid)
+        .and_then(|process| process.start_epoch_s)
+        .filter(|start| *start > 0)
+    else {
+        tracing::error!(
+            pid,
+            "code-sample selfcheck: own process identity unavailable"
+        );
+        eprintln!(
+            "{}",
+            serde_json::json!({"ok": false, "error": "own process identity is unavailable"})
+        );
+        return 1;
+    };
+
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stop_worker = stop.clone();
+    let worker = std::thread::Builder::new()
+        .name("tm-code-sample-selfcheck".into())
+        .spawn(move || {
+            let mut value = 0u64;
+            while !stop_worker.load(std::sync::atomic::Ordering::Relaxed) {
+                for _ in 0..100_000 {
+                    value = value.wrapping_mul(6364136223846793005).wrapping_add(1);
+                }
+                std::hint::black_box(value);
+            }
+        });
+    let Ok(worker) = worker else {
+        tracing::error!("code-sample selfcheck: workload thread failed");
+        eprintln!(
+            "{}",
+            serde_json::json!({"ok": false, "error": "workload thread failed"})
+        );
+        return 1;
+    };
+
+    let actions = tm_platform::create_actions();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut best = None;
+    let mut last_error = None;
+    while Instant::now() < deadline {
+        match actions.process_module_code_samples(pid, Some(start_epoch_s)) {
+            Ok(Some(window)) => {
+                let complete = window.events_decoded > 0
+                    && window.target_samples > 0
+                    && window.attributed_samples > 0;
+                best = Some(window);
+                if complete {
+                    break;
+                }
+            }
+            Ok(None) => {
+                tracing::error!("code-sample selfcheck: sampled-profile session unavailable");
+                last_error = Some("sampled-profile session unavailable".to_string());
+                break;
+            }
+            Err(error) => {
+                last_error = Some(error.to_string());
+            }
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    let _ = worker.join();
+
+    let Some(window) = best else {
+        tracing::error!(
+            error = last_error.as_deref().unwrap_or("no sample window returned"),
+            "code-sample selfcheck failed"
+        );
+        let summary = serde_json::json!({
+            "ok": false,
+            "error": last_error.unwrap_or_else(|| "no sample window returned".to_string()),
+        });
+        println!("{summary}");
+        return 1;
+    };
+    let ok =
+        window.events_decoded > 0 && window.target_samples > 0 && window.attributed_samples > 0;
+    let summary = serde_json::json!({
+        "ok": ok,
+        "pid": pid,
+        "window_ms": window.window_ms,
+        "events_seen": window.events_seen,
+        "events_decoded": window.events_decoded,
+        "events_lost": window.events_lost,
+        "target_samples": window.target_samples,
+        "attributed_samples": window.attributed_samples,
+        "tracked_threads": window.tracked_threads,
+        "modules": window.modules.len(),
+        "error": if ok { None } else { last_error },
+    });
+    if ok {
+        tracing::info!(
+            pid,
+            window_ms = window.window_ms,
+            events_decoded = window.events_decoded,
+            target_samples = window.target_samples,
+            attributed_samples = window.attributed_samples,
+            "code-sample selfcheck passed"
+        );
+    } else {
+        tracing::error!(
+            pid,
+            window_ms = window.window_ms,
+            events_decoded = window.events_decoded,
+            target_samples = window.target_samples,
+            attributed_samples = window.attributed_samples,
+            "code-sample selfcheck produced no attributed sample"
+        );
+    }
+    println!("{summary}");
+    if ok { 0 } else { 1 }
+}

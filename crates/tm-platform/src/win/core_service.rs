@@ -3433,12 +3433,25 @@ fn write_manifest(manifest: &BrokerManifest) -> Result<()> {
     set_path_security(&destination, SERVICE_DATA_SDDL)
 }
 
+const REQUIRED_SERVICE_PRIVILEGES: [&str; 2] = ["SeDebugPrivilege", "SeSystemProfilePrivilege"];
+
+fn required_service_privileges() -> Vec<u16> {
+    let mut privileges = Vec::new();
+    for privilege in REQUIRED_SERVICE_PRIVILEGES {
+        privileges.extend(privilege.encode_utf16());
+        privileges.push(0);
+    }
+    // SERVICE_CONFIG_REQUIRED_PRIVILEGES_INFO uses a REG_MULTI_SZ.
+    privileges.push(0);
+    privileges
+}
+
 fn set_required_service_privileges(service: &windows_service::service::Service) -> Result<()> {
     use windows::Win32::System::Services::{
         ChangeServiceConfig2W, SC_HANDLE, SERVICE_CONFIG_REQUIRED_PRIVILEGES_INFO,
         SERVICE_REQUIRED_PRIVILEGES_INFOW,
     };
-    let mut privileges: Vec<u16> = "SeDebugPrivilege".encode_utf16().chain([0, 0]).collect();
+    let mut privileges = required_service_privileges();
     let info = SERVICE_REQUIRED_PRIVILEGES_INFOW {
         pmszRequiredPrivileges: PWSTR(privileges.as_mut_ptr()),
     };
@@ -3736,6 +3749,15 @@ fn uninstall() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn service_required_privileges_include_system_profile_as_multi_sz() {
+        let actual = required_service_privileges();
+        let expected: Vec<u16> = "SeDebugPrivilege\0SeSystemProfilePrivilege\0\0"
+            .encode_utf16()
+            .collect();
+        assert_eq!(actual, expected);
+    }
 
     /// The telemetry response must survive a round trip through the wire
     /// format, and `active` must be part of it: without that flag the client

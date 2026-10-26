@@ -266,9 +266,9 @@ UAC credentials).
   protected binaries are ready.
 - SCM configuration is own-process, plain automatic start (the delayed flag is
   explicitly cleared on install because service-config updates never touch it),
-  LocalSystem,
-  unrestricted service SID, required privilege list limited to
-  `SeDebugPrivilege`, and restart failure actions at 5/15/60 seconds.
+  LocalSystem, unrestricted service SID, required privilege list limited to
+  `SeDebugPrivilege` and `SeSystemProfilePrivilege`, and restart failure
+  actions at 5/15/60 seconds.
 - Broker exit codes are machine-readable failure classes: `1` generic broker
   failure, `2` install-integrity failure (the installation does not match its
   pinned manifest — only Repair/Install helps). Windows renders

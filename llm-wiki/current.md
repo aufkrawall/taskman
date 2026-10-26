@@ -58,11 +58,13 @@ from the same device set with the same "busiest device" rule:
   sample header naming the exact target PID can recover a missed thread start.
   The session explicitly enables `SeSystemProfilePrivilege` before
   `StartTrace` and enabling `SystemProfileProviderGuid`; otherwise Windows
-  returns
-  `ERROR_PRIVILEGE_NOT_HELD` even when an elevated token holds the privilege
-  disabled. Event loss or an unqueryable loss count makes counts lower bounds;
-  no decoded stream, no known target thread, or page-budget overflow is
-  unavailable, never a fabricated zero.
+  returns `ERROR_PRIVILEGE_NOT_HELD` even when an elevated token holds the
+  privilege disabled. The service's SCM required-privilege whitelist must
+  include both `SeDebugPrivilege` and `SeSystemProfilePrivilege`; whitelisting
+  only the former strips the latter from LocalSystem's service token. Event
+  loss or an unqueryable loss count makes counts lower bounds; no decoded
+  stream, no known target thread, or page-budget overflow is unavailable,
+  never a fabricated zero.
 - **Protected module inventory falls back to kernel loader events.** ToolHelp
   module enumeration is still the ordinary path. If access is denied,
   `module_etw.rs` starts a fixed per-role system-logger session with

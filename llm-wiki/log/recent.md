@@ -36,9 +36,20 @@
 - Profile and protected-module sessions have fixed crash-recoverable names,
   idle watchdogs, frame/entry bounds, and explicit normal-shutdown teardown.
   The live ETW probes are compiled and run as ignored diagnostics. The medium
-  shell proves the privilege boundary and the elevated App-role probes pass;
-  the LocalSystem service role remains to be exercised after the installed v9
-  service is updated.
+  shell proves the privilege boundary; both the elevated App-role probes and
+  the installed LocalSystem service-role code-sample probe pass.
+
+- 2026-10-26 (user report — Code samples unavailable for every process):
+  the live broker request failed deterministically with
+  `StartTrace → ERROR_PRIVILEGE_NOT_HELD (1314)`. The service token is
+  LocalSystem, but its SCM `RequiredPrivileges` whitelist contained only
+  `SeDebugPrivilege`; a whitelist strips every unspecified privilege, so
+  `SeSystemProfilePrivilege` was absent and could not be enabled at runtime.
+  Added `SeSystemProfilePrivilege` to the installed service contract and
+  preserved exact ETW startup failures through the broker/UI instead of
+  collapsing them to generic `None`. The new installed-path
+  `--selfcheck-code-samples` probe then decoded 13,446 real profile records,
+  attributed 979 samples to its workload process, and matched 971 to modules.
 
 - 2026-10-26 (user report — RTSS overlay module has zero threads): the user
   observed `rtsshooks64.dll` loaded into `csrt8x8.exe` with an active D3D11

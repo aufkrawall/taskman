@@ -23,7 +23,7 @@
 use std::sync::Arc;
 
 use windows::Win32::Foundation::{
-    CloseHandle, ERROR_ALREADY_EXISTS, ERROR_SUCCESS, HANDLE, WIN32_ERROR,
+    CloseHandle, ERROR_ALREADY_EXISTS, ERROR_SUCCESS, GetLastError, HANDLE, WIN32_ERROR,
 };
 use windows::Win32::System::Diagnostics::Etw::{
     CONTROLTRACE_HANDLE, CloseTrace, ControlTraceW, EVENT_CONTROL_CODE_ENABLE_PROVIDER,
@@ -210,11 +210,32 @@ impl<T: TraceContext> Session<T> {
         callback: unsafe extern "system" fn(*mut EVENT_RECORD),
         thread_name: &str,
     ) -> Option<Self> {
+        match Self::try_start(name, kind, providers, shared, callback, thread_name) {
+            Ok(session) => Some(session),
+            Err(error) => {
+                tracing::debug!(%error, thread_name, "real-time ETW session unavailable");
+                None
+            }
+        }
+    }
+
+    /// Start a session while preserving the exact Win32/OS failure for a
+    /// diagnostic caller. Ordinary callers use [`Self::start`] and render
+    /// unavailability as unknown.
+    pub(crate) fn try_start(
+        name: &str,
+        kind: LoggerKind,
+        providers: &[Provider],
+        shared: Arc<T>,
+        callback: unsafe extern "system" fn(*mut EVENT_RECORD),
+        thread_name: &str,
+    ) -> std::result::Result<Self, String> {
         let name: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
         if kind == LoggerKind::SystemProfile {
             enable_system_profile_privilege();
         }
-        let (session, mut properties) = start_session(&name, kind)?;
+        let (session, mut properties) = start_session(&name, kind)
+            .map_err(|error| format!("StartTrace failed (Win32 {})", error.0))?;
 
         for provider in providers {
             let enable = unsafe {
@@ -230,9 +251,11 @@ impl<T: TraceContext> Session<T> {
                 )
             };
             if enable != ERROR_SUCCESS {
-                tracing::debug!(error = enable.0, "ETW provider not enabled");
                 stop_session(session, &name, &mut properties);
-                return None;
+                return Err(format!(
+                    "EnableTraceEx2 failed for {:?} (Win32 {})",
+                    provider.guid, enable.0
+                ));
             }
         }
 
@@ -251,43 +274,44 @@ impl<T: TraceContext> Session<T> {
         };
         let trace = unsafe { OpenTraceW(&mut logfile) };
         if trace.Value == INVALID_PROCESSTRACE_HANDLE {
-            tracing::debug!("OpenTraceW failed for a real-time session");
+            let error = unsafe { GetLastError() };
             stop_session(session, &name, &mut properties);
             // Reclaim the reference the callback would have owned.
             drop(unsafe { Arc::from_raw(context) });
-            return None;
+            return Err(format!("OpenTraceW failed (Win32 {})", error.0));
         }
 
         let ended = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let ended_by_consumer = Arc::clone(&ended);
-        let worker = std::thread::Builder::new()
+        let worker = match std::thread::Builder::new()
             .name(thread_name.to_owned())
             .spawn(move || {
                 // Blocks until the session is stopped; the return code is not
                 // actionable (a stopped session reports "cancelled").
                 let _ = unsafe { ProcessTrace(&[trace], None, None) };
                 ended_by_consumer.store(true, std::sync::atomic::Ordering::Release);
-            })
-            .ok();
-        if worker.is_none() {
-            stop_session(session, &name, &mut properties);
-            let _ = unsafe { CloseTrace(trace) };
-            drop(unsafe { Arc::from_raw(context) });
-            return None;
-        }
+            }) {
+            Ok(worker) => worker,
+            Err(error) => {
+                stop_session(session, &name, &mut properties);
+                let _ = unsafe { CloseTrace(trace) };
+                drop(unsafe { Arc::from_raw(context) });
+                return Err(format!("ProcessTrace worker spawn failed: {error}"));
+            }
+        };
 
         // A session now exists that the process dying will NOT clean up.
         tm_core::logging::set_panic_cleanup(stop_live_sessions);
         mark_session(&name, true);
 
-        Some(Self {
+        Ok(Self {
             shared,
             kind,
             context,
             session,
             trace,
             name,
-            worker,
+            worker: Some(worker),
             ended,
         })
     }
@@ -463,7 +487,10 @@ fn properties_buffer(name: &[u16], kind: LoggerKind) -> Vec<u64> {
 
 /// Start the session, retrying once after clearing a stale session of the
 /// same name (left behind by a crash).
-fn start_session(name: &[u16], kind: LoggerKind) -> Option<(CONTROLTRACE_HANDLE, Vec<u64>)> {
+fn start_session(
+    name: &[u16],
+    kind: LoggerKind,
+) -> std::result::Result<(CONTROLTRACE_HANDLE, Vec<u64>), WIN32_ERROR> {
     let mut properties = properties_buffer(name, kind);
     let mut handle = CONTROLTRACE_HANDLE::default();
     let mut status = unsafe {
@@ -493,12 +520,9 @@ fn start_session(name: &[u16], kind: LoggerKind) -> Option<(CONTROLTRACE_HANDLE,
         };
     }
     if status != ERROR_SUCCESS {
-        // Access denied without administrator rights is the normal case, not
-        // an error worth shouting about.
-        tracing::debug!(error = status.0, "real-time ETW session unavailable");
-        return None;
+        return Err(status);
     }
-    Some((handle, properties))
+    Ok((handle, properties))
 }
 
 fn stop_session(handle: CONTROLTRACE_HANDLE, name: &[u16], properties: &mut [u64]) {

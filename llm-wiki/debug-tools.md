@@ -33,6 +33,7 @@ Primary sources:
 | Full gate | fmt, clippy `-D warnings`, workspace tests | `python build.py --check` |
 | Release | refresh the user-launched host artifact | `python build.py --host-only` |
 | Self-check | headless collector JSON smoke test; starts the binary but not its GUI | `target/release/taskman.exe --selfcheck [--mock]` |
+| Code-sample end-to-end check | installed GUI → LocalSystem broker → system-profile ETW → module attribution | `"C:\Program Files\TaskMan\taskman.exe" --selfcheck-code-samples` |
 | Service self-check | headless broker framing/ACL/path summary; does not install/start SCM service | `target/release/taskman-service.exe --selfcheck` |
 
 Cargo tests and `build.py` do not open TaskMan windows. The capture helper and
@@ -58,6 +59,14 @@ real `SampledProfile` records with zero reported loss. The profile provider
 initially failed with `ERROR_PRIVILEGE_NOT_HELD` (1314) until the session
 enabled the token's `SeSystemProfilePrivilege` before `StartTrace`; this is
 required even for an elevated token.
+
+Run `--selfcheck-code-samples` from the installed GUI path in the desktop
+user's context. It targets its own process, forces a short busy workload, polls
+the exact-identity broker request, and passes only after sampled instruction
+pointers are attributed to a module. This is the end-to-end regression for the
+UI error path; a development-tree executable is correctly rejected by the
+broker as a foreign client. The success/failure detail is also written to the
+normal GUI log.
 
 ## Renderer diagnostics
 

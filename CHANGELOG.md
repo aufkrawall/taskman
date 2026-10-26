@@ -34,6 +34,10 @@
   the rundown and the next refresh exposes the completed list; target decode,
   loss, or completeness failures remain unavailable instead of showing a
   partial list.
+- **Core-service profile privilege:** the LocalSystem broker now whitelists
+  `SeSystemProfilePrivilege` alongside `SeDebugPrivilege`. Without it, Windows
+  denied every profile `StartTrace` with `ERROR_PRIVILEGE_NOT_HELD`, leaving
+  Code samples unavailable for every process.
 - **Injected overlay module semantics:** The Modules page now labels its count
   as threads started in the module and explains that a loaded hook or overlay
   DLL, such as RTSS's `rtsshooks64.dll`, can correctly show zero. Those DLLs

@@ -264,7 +264,7 @@ struct ProcessModuleTrace {
 }
 
 impl ProcessModuleTrace {
-    fn start(role: TraceRole, pid: u32) -> Option<Self> {
+    fn start(role: TraceRole, pid: u32) -> std::result::Result<Self, String> {
         let target_threads = super::threads_map::thread_owners()
             .into_iter()
             .filter_map(|(tid, owner)| (owner == pid).then_some(tid))
@@ -273,7 +273,7 @@ impl ProcessModuleTrace {
             state: Mutex::new(State::new(pid, target_threads)),
             live: AtomicBool::new(true),
         });
-        let session = Session::start(
+        let session = Session::try_start(
             session_name(role),
             LoggerKind::SystemProfile,
             &[
@@ -293,7 +293,7 @@ impl ProcessModuleTrace {
             "tm-profile-etw",
         )?;
         tracing::info!(pid, "per-process module code-sample trace started");
-        Some(Self {
+        Ok(Self {
             session,
             window_start: Instant::now(),
             previous_events_lost: None,
@@ -470,9 +470,8 @@ pub(crate) fn sample_process_module_code(
     // that ended underneath us: replace the trace. Drop stops the old fixed
     // session before the new one tries to claim it.
     *slot = None;
-    let Some(trace) = ProcessModuleTrace::start(role, pid) else {
-        return Ok(None);
-    };
+    let trace = ProcessModuleTrace::start(role, pid)
+        .map_err(|reason| TmError::platform("module code samples", reason))?;
     let generation = TRACE_GENERATION.fetch_add(1, Ordering::Relaxed);
     let mut active = ActiveTrace {
         trace,
