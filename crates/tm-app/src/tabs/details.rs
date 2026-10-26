@@ -4158,7 +4158,7 @@ pub fn process_properties_dialog(app: &mut TaskManApp, ctx: &egui::Context) {
                                     app,
                                     ui,
                                     &mut dialog.modules,
-                                    dialog.threads.rows(),
+                                    dialog.threads.evidence(),
                                     &pal,
                                 ),
                                 ProcessPropertiesTab::Network => crate::tabs::connections::show(

@@ -1,6 +1,6 @@
 # Repo Map (code map)
 
-Last cross-checked: 2026-09-25
+Last cross-checked: 2026-10-26
 
 Primary sources:
 - workspace tree (verified against working tree)
@@ -187,8 +187,9 @@ platform boundary (`tm-core` ← `tm-platform` ← `tm-app` / `tm-service`), and
     image machine and DEP/ASLR/CFG/CET/Win32k/code-integrity/image-load and
     related mitigation policies instead of adding them to the hot sampler.
     The list pages live in their own modules — `threads.rs` (thread list +
-    the evidence-based dormancy `Tracker`), `modules.rs` (module list with
-    guarded unload, per-module thread attribution), `connections.rs`,
+    the gap-aware activity `Tracker`), `modules.rs` (module list with guarded
+    unload and explicitly origin-thread-only activity attribution),
+    `connections.rs`,
     `hosted_services.rs` — and query through `inspector::Poll`/`Pace` ONLY
     while their page is on screen, at `page_interval` (the update speed,
     floored per page; Paused = frozen) plus F5 inside the dialog; a failed

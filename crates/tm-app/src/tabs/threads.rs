@@ -1,13 +1,18 @@
-//! Process Properties → Threads: the live thread list of one process, with a
-//! "dormant" mark that rests on evidence rather than a guess.
+//! Process Properties → Threads: the live thread list of one process, with
+//! activity statuses that rest on evidence rather than a guess.
 //!
-//! A thread is dormant when, for at least [`DORMANT_AFTER`], it was not on a
-//! processor and neither its context-switch count, its CPU time nor its cycle
-//! counter advanced between two kernel snapshots. Every scheduling of a thread
-//! increments its context-switch count, so an unchanged count proves it never
-//! got a processor; the CPU-time and cycle checks cover a thread that kept one
-//! processor without ever being switched out. Until a thread has been watched
-//! that long its activity reads "—": never observed is not dormant.
+//! A thread is idle when, for at least [`DORMANT_AFTER`], it was not in the
+//! kernel's Running state and neither its context-switch count, its CPU time
+//! nor its cycle counter advanced between two kernel snapshots. Every
+//! scheduling of a thread increments its context-switch count, so an unchanged
+//! count proves it never got a processor; the CPU-time and cycle checks cover a
+//! thread that kept one processor without ever being switched out. Ready and
+//! Standby are runnable states, not proof that a thread executed.
+//!
+//! Activity evidence is continuous only inside a bounded observation window.
+//! If counters advanced across a long sampling gap (Paused, another properties
+//! tab, sleep or a slow query), the exact last run is unknown and the thread is
+//! re-observed instead of being called recent.
 
 use eframe::egui;
 use std::cmp::Ordering;
@@ -24,28 +29,40 @@ use crate::theme;
 use crate::widgets::tablekit::{self, TmColumn};
 
 /// How long a thread must be watched without any sign of running before it
-/// is called dormant.
+/// is called idle.
 pub const DORMANT_AFTER: Duration = Duration::from_secs(5);
 /// Fastest refresh; slower update speeds slow it down, Paused stops it.
-const REFRESH_FLOOR: Duration = Duration::from_secs(1);
+pub(crate) const REFRESH_FLOOR: Duration = Duration::from_secs(1);
 const TABLE_ID: &str = "proc_threads";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ObservingReason {
+    FirstObservation,
+    AfterGap,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Activity {
-    /// Not watched long enough to judge.
-    Observing,
-    /// Ran within the last [`DORMANT_AFTER`].
-    Active,
-    /// Provably did not run for at least `idle`.
-    Dormant { idle: Duration },
+    /// The kernel reported this thread as using a processor in this sample.
+    Running,
+    /// Execution was observed inside a continuous recent sampling window.
+    Recent,
+    /// Evidence is still being collected.
+    Observing {
+        elapsed: Duration,
+        reason: ObservingReason,
+    },
+    /// No execution was observed for at least `idle`.
+    Idle { idle: Duration },
 }
 
 impl Activity {
     fn rank(self) -> u8 {
         match self {
-            Self::Active => 0,
-            Self::Observing => 1,
-            Self::Dormant { .. } => 2,
+            Self::Running => 0,
+            Self::Recent => 1,
+            Self::Observing { .. } => 2,
+            Self::Idle { .. } => 3,
         }
     }
 }
@@ -56,6 +73,9 @@ pub struct ThreadRow {
     /// Share of the machine's total CPU capacity since the previous
     /// snapshot — Task Manager's semantics. `None` on a thread's first sight.
     pub cpu_pct: Option<f32>,
+    /// Average share of machine CPU capacity across the whole observation
+    /// window. `None` on a thread's first sight.
+    pub avg_cpu_pct: Option<f32>,
     pub cycles_delta: Option<u64>,
     pub activity: Activity,
 }
@@ -67,11 +87,12 @@ struct Track {
     cycles: Option<u64>,
     sampled: Instant,
     first_seen: Instant,
+    first_cpu_100ns: u64,
     last_active: Option<Instant>,
+    observing: Option<(Instant, ObservingReason)>,
 }
 
-/// Per-thread history between snapshots: the deltas and the dormancy
-/// evidence.
+/// Per-thread history between snapshots: the deltas and activity evidence.
 #[derive(Default)]
 struct Tracker {
     tracks: HashMap<u32, Track>,
@@ -97,14 +118,16 @@ impl Tracker {
                     .tracks
                     .remove(&thread.tid)
                     .filter(|track| track.created_epoch_s == thread.created_epoch_s);
-                let on_cpu = matches!(
-                    thread.state,
-                    ThreadState::Running
-                        | ThreadState::Ready
-                        | ThreadState::Standby
-                        | ThreadState::DeferredReady
-                );
-                let (first_seen, mut last_active, cpu_pct, cycles_delta) = match &previous {
+                let running = thread.state == ThreadState::Running;
+                let (
+                    first_seen,
+                    first_cpu_100ns,
+                    mut last_active,
+                    mut observing,
+                    cpu_pct,
+                    avg_cpu_pct,
+                    cycles_delta,
+                ) = match &previous {
                     Some(prev) => {
                         let advanced = thread.context_switches != prev.context_switches
                             || cpu_100ns != prev.cpu_100ns
@@ -117,31 +140,80 @@ impl Tracker {
                             let busy = cpu_100ns.saturating_sub(prev.cpu_100ns) as f64 / 1e7;
                             (busy / (wall * logical_cpus as f64) * 100.0).min(100.0) as f32
                         });
+                        let observed_wall = taken
+                            .saturating_duration_since(prev.first_seen)
+                            .as_secs_f64();
+                        let avg_cpu_pct = (observed_wall > 0.0 && logical_cpus > 0).then(|| {
+                            let busy = cpu_100ns.saturating_sub(prev.first_cpu_100ns) as f64 / 1e7;
+                            (busy / (observed_wall * logical_cpus as f64) * 100.0).clamp(0.0, 100.0)
+                                as f32
+                        });
                         let cycles_delta = match (thread.cycles, prev.cycles) {
                             (Some(now), Some(before)) => Some(now.saturating_sub(before)),
                             _ => None,
                         };
-                        let last_active = if advanced {
-                            Some(taken)
-                        } else {
-                            prev.last_active
-                        };
-                        (prev.first_seen, last_active, cpu_pct, cycles_delta)
+                        let mut last_active = prev.last_active;
+                        let mut observing = prev.observing;
+                        let sampling_gap =
+                            taken.saturating_duration_since(prev.sampled) > DORMANT_AFTER;
+                        if advanced {
+                            last_active = Some(taken);
+                            if sampling_gap {
+                                observing = Some((taken, ObservingReason::AfterGap));
+                            } else {
+                                observing = None;
+                            }
+                        }
+                        (
+                            prev.first_seen,
+                            prev.first_cpu_100ns,
+                            last_active,
+                            observing,
+                            cpu_pct,
+                            avg_cpu_pct,
+                            cycles_delta,
+                        )
                     }
-                    None => (taken, None, None, None),
+                    None => (
+                        taken,
+                        cpu_100ns,
+                        None,
+                        Some((taken, ObservingReason::FirstObservation)),
+                        None,
+                        None,
+                        None,
+                    ),
                 };
-                if on_cpu {
+                if running {
                     last_active = Some(taken);
+                    observing = None;
                 }
                 let idle = taken.saturating_duration_since(last_active.unwrap_or(first_seen));
-                let activity = if last_active == Some(taken) {
-                    Activity::Active
+                let activity = if running {
+                    Activity::Running
+                } else if let Some((started, reason)) = observing {
+                    let elapsed = taken.saturating_duration_since(started);
+                    if elapsed < DORMANT_AFTER {
+                        Activity::Observing { elapsed, reason }
+                    } else if idle >= DORMANT_AFTER {
+                        Activity::Idle { idle }
+                    } else {
+                        Activity::Recent
+                    }
                 } else if idle >= DORMANT_AFTER {
-                    Activity::Dormant { idle }
+                    Activity::Idle { idle }
                 } else if last_active.is_some() {
-                    Activity::Active
+                    Activity::Recent
                 } else {
-                    Activity::Observing
+                    Activity::Observing {
+                        elapsed: Duration::ZERO,
+                        reason: ObservingReason::FirstObservation,
+                    }
+                };
+                let observing = if matches!(activity, Activity::Observing { .. }) {
+                    observing
+                } else {
+                    None
                 };
                 next.insert(
                     thread.tid,
@@ -152,12 +224,15 @@ impl Tracker {
                         cycles: thread.cycles,
                         sampled: taken,
                         first_seen,
+                        first_cpu_100ns,
                         last_active,
+                        observing,
                     },
                 );
                 ThreadRow {
                     thread,
                     cpu_pct,
+                    avg_cpu_pct,
                     cycles_delta,
                     activity,
                 }
@@ -172,7 +247,7 @@ impl Tracker {
 enum SortColumn {
     Tid,
     Cpu,
-    Cycles,
+    CpuTime,
     Start,
     Priority,
     State,
@@ -183,7 +258,7 @@ impl SortColumn {
     const ALL: [Self; 7] = [
         Self::Tid,
         Self::Cpu,
-        Self::Cycles,
+        Self::CpuTime,
         Self::Start,
         Self::Priority,
         Self::State,
@@ -194,7 +269,7 @@ impl SortColumn {
         match self {
             Self::Tid => "tid",
             Self::Cpu => "cpu",
-            Self::Cycles => "cycles",
+            Self::CpuTime => "cputime",
             Self::Start => "start",
             Self::Priority => "priority",
             Self::State => "state",
@@ -203,7 +278,7 @@ impl SortColumn {
     }
 
     fn numeric(self) -> bool {
-        matches!(self, Self::Tid | Self::Cpu | Self::Cycles)
+        matches!(self, Self::Tid | Self::Cpu | Self::CpuTime)
     }
 }
 
@@ -213,12 +288,13 @@ pub struct State {
     rows: Vec<ThreadRow>,
     process_base_priority: Option<i32>,
     error: Option<String>,
+    last_sample: Option<Instant>,
     loaded: bool,
     selected: Option<u32>,
     scroll_to: Option<u32>,
     sort: SortColumn,
     ascending: bool,
-    hide_dormant: bool,
+    hide_idle: bool,
     /// A new snapshot replaced the rows since the table last drew them.
     fresh: bool,
 }
@@ -235,12 +311,13 @@ impl State {
             rows: Vec::new(),
             process_base_priority: None,
             error: None,
+            last_sample: None,
             loaded: false,
             selected: None,
             scroll_to: None,
             sort,
             ascending: saved.is_none_or(|saved| saved.ascending),
-            hide_dormant: false,
+            hide_idle: false,
             fresh: false,
         }
     }
@@ -250,10 +327,39 @@ impl State {
         self.poll.request();
     }
 
-    /// The newest rows, for the Modules page's per-module activity.
-    pub fn rows(&self) -> Option<&[ThreadRow]> {
-        (self.loaded && self.error.is_none()).then_some(self.rows.as_slice())
+    /// The newest evidence, for the Modules page's per-module activity.
+    pub fn evidence(&self) -> ThreadEvidence<'_> {
+        if !self.loaded {
+            return ThreadEvidence::Loading;
+        }
+        if let Some(error) = self.error.as_deref() {
+            return ThreadEvidence::Unavailable {
+                error,
+                sampled_at: self.last_sample,
+            };
+        }
+        match self.last_sample {
+            Some(sampled_at) => ThreadEvidence::Ready {
+                rows: &self.rows,
+                sampled_at,
+            },
+            None => ThreadEvidence::Loading,
+        }
     }
+}
+
+/// What the Modules page can use as thread-origin evidence.
+#[derive(Debug, Clone, Copy)]
+pub enum ThreadEvidence<'a> {
+    Loading,
+    Unavailable {
+        error: &'a str,
+        sampled_at: Option<Instant>,
+    },
+    Ready {
+        rows: &'a [ThreadRow],
+        sampled_at: Instant,
+    },
 }
 
 /// Keep the list current while a page that reads it is on screen.
@@ -269,6 +375,7 @@ pub fn tick(state: &mut State, app: &TaskManApp, ctx: &egui::Context, identity: 
                 state.process_base_priority = Some(snapshot.process_base_priority);
                 state.rows = state.tracker.apply(snapshot.threads, taken, cpus);
                 state.error = None;
+                state.last_sample = Some(taken);
                 state.fresh = true;
             }
             Err(error) => state.error = Some(error),
@@ -283,9 +390,10 @@ pub fn tick(state: &mut State, app: &TaskManApp, ctx: &egui::Context, identity: 
         let actions = app.actions.clone();
         let identity = identity.clone();
         state.poll.start(ctx, "tm-threads", move || {
+            let sampled_at = Instant::now();
             actions
                 .list_process_threads(identity.pid, identity.start_epoch_s)
-                .map(|threads| (threads, Instant::now()))
+                .map(|threads| (threads, sampled_at))
                 .map_err(|error| error.to_string())
         });
     }
@@ -352,25 +460,81 @@ fn state_label(thread: &ProcessThread) -> String {
     i18n::tr(key).to_string()
 }
 
-pub fn activity_label(activity: Activity) -> &'static str {
+fn cpu_100ns(thread: &ProcessThread) -> u64 {
+    thread
+        .kernel_time_100ns
+        .saturating_add(thread.user_time_100ns)
+}
+
+fn cpu_time_secs(thread: &ProcessThread) -> f64 {
+    cpu_100ns(thread) as f64 / 1e7
+}
+
+pub fn activity_label(activity: Activity) -> String {
     match activity {
-        Activity::Observing => "—",
-        Activity::Active => i18n::tr(K::ActivityActive),
-        Activity::Dormant { .. } => i18n::tr(K::ActivityDormant),
+        Activity::Running => i18n::tr(K::ActivityRunning).to_string(),
+        Activity::Recent => i18n::tr(K::ActivityRecent).to_string(),
+        Activity::Observing { elapsed, .. } => {
+            i18n::trf(K::ActivityObservingFor, &[&elapsed.as_secs().to_string()])
+        }
+        Activity::Idle { idle } => i18n::trf(K::ActivityIdleFor, &[&idle.as_secs().to_string()]),
     }
 }
 
 fn activity_tip(activity: Activity) -> String {
     match activity {
-        Activity::Observing => i18n::trf(
+        Activity::Running => i18n::tr(K::ThreadRunningTip).to_string(),
+        Activity::Recent => i18n::trf(K::ThreadRecentTip, &[&DORMANT_AFTER.as_secs().to_string()]),
+        Activity::Observing {
+            elapsed,
+            reason: ObservingReason::FirstObservation,
+        } => i18n::trf(
             K::ActivityObservingTip,
-            &[&DORMANT_AFTER.as_secs().to_string()],
+            &[
+                &elapsed.as_secs().to_string(),
+                &DORMANT_AFTER.as_secs().to_string(),
+            ],
         ),
-        Activity::Active => i18n::trf(K::ThreadActiveTip, &[&DORMANT_AFTER.as_secs().to_string()]),
-        Activity::Dormant { idle } => {
-            i18n::trf(K::ThreadDormantTip, &[&idle.as_secs().to_string()])
-        }
+        Activity::Observing {
+            reason: ObservingReason::AfterGap,
+            ..
+        } => i18n::tr(K::ActivityObservingGapTip).to_string(),
+        Activity::Idle { idle } => i18n::trf(K::ThreadIdleTip, &[&idle.as_secs().to_string()]),
     }
+}
+
+fn cpu_time_tip(row: &ThreadRow) -> String {
+    let thread = &row.thread;
+    let cycles = thread
+        .cycles
+        .map(format::format_thousands)
+        .unwrap_or_else(|| "—".into());
+    let cycles_delta = row
+        .cycles_delta
+        .map(format::format_thousands)
+        .unwrap_or_else(|| "—".into());
+    i18n::trf(
+        K::ThreadCpuTimeTip,
+        &[
+            &format::format_cpu_time(cpu_time_secs(thread)),
+            &format::format_cpu_time(thread.kernel_time_100ns as f64 / 1e7),
+            &format::format_cpu_time(thread.user_time_100ns as f64 / 1e7),
+            &cycles,
+            &cycles_delta,
+        ],
+    )
+}
+
+fn cpu_pct_tip(row: &ThreadRow) -> String {
+    let current = row
+        .cpu_pct
+        .map(format::format_pct_cell)
+        .unwrap_or_else(|| "—".into());
+    let average = row
+        .avg_cpu_pct
+        .map(format::format_pct_cell)
+        .unwrap_or_else(|| "—".into());
+    i18n::trf(K::ThreadCpuPercentTip, &[&current, &average])
 }
 
 struct View<'a> {
@@ -388,7 +552,7 @@ fn compare(a: &View<'_>, b: &View<'_>, sort: SortColumn) -> Ordering {
             .cpu_pct
             .unwrap_or(-1.0)
             .total_cmp(&b.row.cpu_pct.unwrap_or(-1.0)),
-        SortColumn::Cycles => a.row.cycles_delta.cmp(&b.row.cycles_delta),
+        SortColumn::CpuTime => cpu_100ns(&a.row.thread).cmp(&cpu_100ns(&b.row.thread)),
         SortColumn::Start => tablekit::cmp_ignore_case(&a.start, &b.start),
         SortColumn::Priority => a.row.thread.base_priority.cmp(&b.row.thread.base_priority),
         SortColumn::State => tablekit::cmp_ignore_case(&a.state, &b.state),
@@ -405,22 +569,56 @@ pub fn show(
     pal: &theme::Palette,
 ) {
     let ctx = ui.ctx().clone();
-    let dormant = state
-        .rows
-        .iter()
-        .filter(|row| matches!(row.activity, Activity::Dormant { .. }))
-        .count();
-    ui.horizontal(|ui| {
+    let mut running = 0usize;
+    let mut recent = 0usize;
+    let mut idle = 0usize;
+    let mut observing = 0usize;
+    for row in &state.rows {
+        match row.activity {
+            Activity::Running => running += 1,
+            Activity::Recent => recent += 1,
+            Activity::Idle { .. } => idle += 1,
+            Activity::Observing { .. } => observing += 1,
+        }
+    }
+    let now = Instant::now();
+    let sample_age = state.last_sample.map(|sampled| {
+        let age = now.saturating_duration_since(sampled);
+        let paused = app.shared.settings.update_speed == tm_core::settings::UpdateSpeed::Paused;
+        let expected = inspector::page_interval(app.shared.settings.update_speed, REFRESH_FLOOR)
+            .map_or(DORMANT_AFTER, |interval| interval.saturating_mul(2));
+        let text = if paused {
+            i18n::trf(
+                K::SamplePausedAge,
+                &[&format::format_seconds(age.as_secs_f64())],
+            )
+        } else {
+            i18n::trf(K::SampleAge, &[&format::format_seconds(age.as_secs_f64())])
+        };
+        (text, !paused && age > expected)
+    });
+    ui.horizontal_wrapped(|ui| {
         ui.label(i18n::trf(
             K::ThreadsSummary,
-            &[&state.rows.len().to_string(), &dormant.to_string()],
+            &[
+                &state.rows.len().to_string(),
+                &running.to_string(),
+                &recent.to_string(),
+                &idle.to_string(),
+                &observing.to_string(),
+            ],
         ));
-        ui.add_space(12.0);
+        if let Some((text, stale)) = &sample_age {
+            ui.separator();
+            let color = if *stale { pal.heat_high } else { pal.text_dim };
+            ui.label(egui::RichText::new(text).small().color(color));
+        }
+        ui.add_space(8.0);
         let controls_pal = theme::palette_ctx(&ctx);
         let _ = crate::widgets::controls::checkbox_enabled(
             ui,
-            &mut state.hide_dormant,
-            i18n::tr(K::HideDormant),
+            &mut state.hide_idle,
+            i18n::tr(K::HideIdle),
             true,
             &controls_pal,
         );
@@ -444,7 +642,7 @@ pub fn show(
     let mut views: Vec<View<'_>> = state
         .rows
         .iter()
-        .filter(|row| !state.hide_dormant || !matches!(row.activity, Activity::Dormant { .. }))
+        .filter(|row| !state.hide_idle || !matches!(row.activity, Activity::Idle { .. }))
         .map(|row| View {
             row,
             start: row
@@ -475,11 +673,11 @@ pub fn show(
     let cols = vec![
         TmColumn::num("tid", i18n::tr(K::ColTid), 80.0),
         TmColumn::num("cpu", i18n::tr(K::ColCpu), 70.0),
-        TmColumn::num("cycles", i18n::tr(K::ColCyclesDelta), 120.0),
+        TmColumn::num("cputime", i18n::tr(K::ColCpuTime), 110.0),
         TmColumn::text("start", i18n::tr(K::ColStartAddress), 260.0),
         TmColumn::text("priority", i18n::tr(K::Priority), 140.0),
         TmColumn::text("state", i18n::tr(K::ColThreadState), 200.0),
-        TmColumn::text("activity", i18n::tr(K::ColActivity), 100.0),
+        TmColumn::text("activity", i18n::tr(K::ColActivity), 150.0),
     ];
     let mut table = app
         .make_table(TABLE_ID, cols)
@@ -515,7 +713,7 @@ pub fn show(
         Some((sorted, state.ascending)),
         None,
         views.len(),
-        state.hide_dormant.then_some(i18n::tr(K::NoMatches)),
+        state.hide_idle.then_some(i18n::tr(K::NoMatches)),
         focus,
         Some(anchor),
         |ui, table, _avail, _content_width, range| {
@@ -524,7 +722,7 @@ pub fn show(
                     continue;
                 };
                 let thread = &view.row.thread;
-                let dim = matches!(view.row.activity, Activity::Dormant { .. });
+                let dim = matches!(view.row.activity, Activity::Idle { .. });
                 let selected = state.selected == Some(thread.tid);
                 let (rect, response) = table.row(ui, pal, selected, ("thread", thread.tid));
                 table.describe_row(ui, &response, &thread.tid.to_string(), index);
@@ -534,25 +732,26 @@ pub fn show(
                     .cpu_pct
                     .map_or_else(|| "—".to_string(), format::format_pct_cell);
                 inspector::num_cell(ui, table, rect, 1, &cpu, pal, dim);
-                let cycles = view
-                    .row
-                    .cycles_delta
-                    .map_or_else(|| "—".to_string(), format::format_thousands);
-                inspector::num_cell(ui, table, rect, 2, &cycles, pal, dim);
+                let cpu_time = format::format_cpu_time(cpu_time_secs(thread));
+                inspector::num_cell(ui, table, rect, 2, &cpu_time, pal, dim);
                 let start_truncated = table.text_cell(ui, rect, 3, &view.start, pal, dim);
                 table.text_cell(ui, rect, 4, &view.priority, pal, dim);
                 let state_truncated = table.text_cell(ui, rect, 5, &view.state, pal, dim);
-                table.text_cell(ui, rect, 6, activity_label(view.row.activity), pal, dim);
+                let activity = activity_label(view.row.activity);
+                table.text_cell(ui, rect, 6, &activity, pal, dim);
 
                 let pointer = ui.ctx().pointer_latest_pos();
                 let over = |column: usize| {
                     pointer.is_some_and(|p| table.col_rect(column, rect).contains(p))
                 };
-                let unreadable = thread.start_address.is_none() || thread.cycles.is_none();
                 let tip = if over(6) {
                     Some(activity_tip(view.row.activity))
-                } else if unreadable && (over(2) || over(3)) {
-                    Some(i18n::tr(K::ThreadsNoAccessTip).to_string())
+                } else if over(2) {
+                    Some(cpu_time_tip(view.row))
+                } else if over(1) {
+                    Some(cpu_pct_tip(view.row))
+                } else if thread.start_address.is_none() && over(3) {
+                    Some(i18n::tr(K::ThreadStartAddressTip).to_string())
                 } else if start_truncated && over(3) {
                     Some(view.start.clone())
                 } else if state_truncated && over(5) {
@@ -609,30 +808,43 @@ mod tests {
     const WAITING: ThreadState = ThreadState::Waiting;
 
     #[test]
-    fn a_thread_is_dormant_only_after_being_watched_long_enough() {
+    fn a_thread_is_idle_only_after_being_watched_long_enough() {
         let mut tracker = Tracker::default();
         let t0 = Instant::now();
         let rows = tracker.apply(vec![thread(1, 5, 0, WAITING)], t0, 4);
-        assert_eq!(rows[0].activity, Activity::Observing);
+        assert_eq!(
+            rows[0].activity,
+            Activity::Observing {
+                elapsed: Duration::ZERO,
+                reason: ObservingReason::FirstObservation,
+            }
+        );
         assert_eq!(rows[0].cpu_pct, None);
+        assert_eq!(rows[0].avg_cpu_pct, None);
         let rows = tracker.apply(
             vec![thread(1, 5, 0, WAITING)],
             t0 + Duration::from_secs(2),
             4,
         );
-        assert_eq!(rows[0].activity, Activity::Observing);
+        assert_eq!(
+            rows[0].activity,
+            Activity::Observing {
+                elapsed: Duration::from_secs(2),
+                reason: ObservingReason::FirstObservation,
+            }
+        );
         assert_eq!(rows[0].cycles_delta, Some(0));
         let rows = tracker.apply(vec![thread(1, 5, 0, WAITING)], t0 + DORMANT_AFTER, 4);
         assert_eq!(
             rows[0].activity,
-            Activity::Dormant {
+            Activity::Idle {
                 idle: DORMANT_AFTER
             }
         );
     }
 
     #[test]
-    fn any_sign_of_running_makes_a_thread_active_again() {
+    fn execution_evidence_makes_a_thread_recent_or_running() {
         let mut tracker = Tracker::default();
         let t0 = Instant::now();
         tracker.apply(vec![thread(1, 5, 0, WAITING)], t0, 4);
@@ -640,25 +852,107 @@ mod tests {
         // A context switch.
         let at = t0 + DORMANT_AFTER + Duration::from_secs(1);
         let rows = tracker.apply(vec![thread(1, 6, 0, WAITING)], at, 4);
-        assert_eq!(rows[0].activity, Activity::Active);
-        // Still within the window after it ran: active, not observing.
+        assert_eq!(rows[0].activity, Activity::Recent);
+        // Still within the window after it ran: recent, not observing.
         let rows = tracker.apply(
             vec![thread(1, 6, 0, WAITING)],
             at + Duration::from_secs(1),
             4,
         );
-        assert_eq!(rows[0].activity, Activity::Active);
+        assert_eq!(rows[0].activity, Activity::Recent);
         // CPU time alone (no switch: it kept its processor).
         let mut busy = thread(2, 1, 0, WAITING);
         tracker.apply(vec![busy.clone()], t0, 4);
         busy.kernel_time_100ns = 10_000_000;
         let rows = tracker.apply(vec![busy], t0 + Duration::from_secs(1), 4);
-        assert_eq!(rows[0].activity, Activity::Active);
+        assert_eq!(rows[0].activity, Activity::Recent);
         // 1 s of CPU over 1 s on 4 processors = 25 % of the machine.
         assert_eq!(rows[0].cpu_pct, Some(25.0));
-        // Being on a processor right now is active on first sight.
+        assert_eq!(rows[0].avg_cpu_pct, Some(25.0));
+        // Running is execution evidence on first sight.
         let rows = tracker.apply(vec![thread(3, 1, 0, ThreadState::Running)], t0, 4);
-        assert_eq!(rows[0].activity, Activity::Active);
+        assert_eq!(rows[0].activity, Activity::Running);
+    }
+
+    #[test]
+    fn runnable_states_are_not_execution_evidence() {
+        for state in [
+            ThreadState::Ready,
+            ThreadState::Standby,
+            ThreadState::DeferredReady,
+        ] {
+            let mut tracker = Tracker::default();
+            let t0 = Instant::now();
+            let rows = tracker.apply(vec![thread(1, 5, 0, state)], t0, 4);
+            assert!(matches!(rows[0].activity, Activity::Observing { .. }));
+            let rows = tracker.apply(vec![thread(1, 5, 0, state)], t0 + Duration::from_secs(1), 4);
+            assert!(matches!(rows[0].activity, Activity::Observing { .. }));
+            let rows = tracker.apply(vec![thread(1, 5, 0, state)], t0 + DORMANT_AFTER, 4);
+            assert!(matches!(rows[0].activity, Activity::Idle { .. }));
+        }
+
+        let mut tracker = Tracker::default();
+        let t0 = Instant::now();
+        tracker.apply(vec![thread(1, 5, 0, ThreadState::Ready)], t0, 4);
+        let rows = tracker.apply(
+            vec![thread(1, 6, 0, ThreadState::Ready)],
+            t0 + Duration::from_secs(1),
+            4,
+        );
+        assert_eq!(rows[0].activity, Activity::Recent);
+    }
+
+    #[test]
+    fn activity_after_a_sampling_gap_is_reobserved() {
+        let mut tracker = Tracker::default();
+        let t0 = Instant::now();
+        tracker.apply(vec![thread(1, 5, 0, WAITING)], t0, 4);
+        let after_gap = t0 + Duration::from_secs(30);
+        let rows = tracker.apply(vec![thread(1, 6, 0, WAITING)], after_gap, 4);
+        assert_eq!(
+            rows[0].activity,
+            Activity::Observing {
+                elapsed: Duration::ZERO,
+                reason: ObservingReason::AfterGap,
+            }
+        );
+        let rows = tracker.apply(
+            vec![thread(1, 6, 0, WAITING)],
+            after_gap + Duration::from_secs(1),
+            4,
+        );
+        assert!(matches!(
+            rows[0].activity,
+            Activity::Observing {
+                reason: ObservingReason::AfterGap,
+                ..
+            }
+        ));
+        let rows = tracker.apply(vec![thread(1, 6, 0, WAITING)], after_gap + DORMANT_AFTER, 4);
+        assert_eq!(
+            rows[0].activity,
+            Activity::Idle {
+                idle: DORMANT_AFTER
+            }
+        );
+    }
+
+    #[test]
+    fn unchanged_counters_across_a_gap_keep_idle_evidence() {
+        let mut tracker = Tracker::default();
+        let t0 = Instant::now();
+        tracker.apply(vec![thread(1, 5, 0, WAITING)], t0, 4);
+        let rows = tracker.apply(
+            vec![thread(1, 5, 0, WAITING)],
+            t0 + Duration::from_secs(30),
+            4,
+        );
+        assert_eq!(
+            rows[0].activity,
+            Activity::Idle {
+                idle: Duration::from_secs(30)
+            }
+        );
     }
 
     #[test]
@@ -669,8 +963,21 @@ mod tests {
         let mut reborn = thread(1, 5, 0, WAITING);
         reborn.created_epoch_s = Some(200);
         let rows = tracker.apply(vec![reborn], t0 + DORMANT_AFTER, 4);
-        assert_eq!(rows[0].activity, Activity::Observing);
+        assert_eq!(
+            rows[0].activity,
+            Activity::Observing {
+                elapsed: Duration::ZERO,
+                reason: ObservingReason::FirstObservation,
+            }
+        );
         assert_eq!(rows[0].cycles_delta, None);
+    }
+
+    #[test]
+    fn thread_cpu_time_is_kernel_plus_user_time() {
+        let mut sample = thread(1, 1, 7_500_000, WAITING);
+        sample.user_time_100ns = 2_500_000;
+        assert_eq!(format::format_cpu_time(cpu_time_secs(&sample)), "0:00:01");
     }
 
     #[test]

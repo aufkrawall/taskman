@@ -1,6 +1,6 @@
 # Current State
 
-Last cross-checked: 2026-10-21
+Last cross-checked: 2026-10-26
 
 ## Summary
 
@@ -775,12 +775,21 @@ rebase runbook.
   record's `Win32StartAddress`/`StartAddress`/stack bounds for callers
   without SeDebugPrivilege, so the start address is read per thread with
   `NtQueryInformationThread(ThreadQuerySetWin32StartAddress)` and shows
-  `module+offset` (no symbols). A thread is *dormant* only on evidence: not
-  on a processor and no change in context switches, CPU time or cycles for
-  `DORMANT_AFTER` (5 s) of observation; "never observed" is not dormant. A
-  module is dormant only when every thread STARTED in it is; a module that
-  starts no thread is never judged, and an unknown start address anywhere
-  blocks the dormant verdict. Modules is no longer a separate dialog or
+  `module+offset` (no symbols). Thread activity distinguishes `Running`
+  (kernel state is Running), `Recent` (a counter advanced inside a continuous
+  sampling window), `Idle ≥ 5 s` (no execution observed for at least
+  `DORMANT_AFTER`), and `Observing` (the initial window or a reset after a
+  sampling gap). Ready/Standby/DeferredReady do not count as execution, and
+  counter changes across Paused, hidden-page, sleep, or slow-query gaps reset
+  to `Observing`; unchanged counters across such a gap remain idle evidence.
+  The Threads page shows cumulative CPU time and current/average CPU; its
+  tooltip also carries kernel/user CPU and cycle details. The Modules page
+  reports **origin-thread activity** only: threads whose START address lies
+  in that module. It explicitly distinguishes Running/Recent/Idle/Observing,
+  zero own threads, missing start-address evidence, a loading thread list and
+  an unavailable thread list. It never claims that all module code is idle or
+  active, and module/thread sample ages are displayed separately. The Modules
+  page is no longer a separate dialog or
   context-menu entry. The pages have no Refresh buttons: they re-query at the
   update speed (floors: Threads 1 s, Modules/Network 2 s, Services 5 s),
   freeze while Paused, and F5 inside the dialog refreshes the open page plus

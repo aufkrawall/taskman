@@ -1,6 +1,6 @@
 # Known and Accepted Debt
 
-Last verified: 2026-09-25
+Last verified: 2026-10-26
 
 Primary sources:
 - `AGENTS.md`
@@ -159,15 +159,18 @@ dropped) is what the user sees; permanently pinned or re-loaded modules stay.
   mislabel the non-exported routines most threads start in.
 - Start address and cycles of another user's (service/SYSTEM) threads need a
   thread handle an unelevated GUI does not get; they read "—". There is no
-  broker request for them — the thread list, states and dormancy evidence
+  broker request for them — the thread list, states and activity evidence
   are handle-free and complete without it.
 - The connection tables carry only a PID. The identity is re-checked
   against the newest snapshot before each query and before showing it; a
   PID recycled inside that sub-second window is accepted.
-- Module dormancy is attributed through thread START addresses only.
-  Knowing which modules are on a thread's stack would need stack walks of
-  the target (invasive, needs VM-read access), so modules that start no
-  thread show no verdict.
+- Module activity is deliberately scoped to threads whose START address lies
+  in the module. It is not module-code CPU: a thread can execute code from
+  many modules, runtime/JIT threads may not map to the application DLL, and a
+  module that starts no thread shows “No own threads.” True module execution
+  or CPU attribution would require sampled instruction pointers/stacks (for
+  example an elevated ETW profiling session), remains unavailable for some
+  protected targets, and would be a sampled estimate rather than a total.
 
 ## Keyboard accessibility accepted limitations (2026-09-25)
 

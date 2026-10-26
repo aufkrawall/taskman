@@ -1,3 +1,19 @@
+- 2026-10-26 (Process Properties activity audit): two false-positive paths in
+  thread activity were removed. `Ready`, `Standby`, and `DeferredReady` were
+  treated as if the thread had run, and any counter advance after a long
+  sampling gap was labelled as a run “now.” The tracker now uses only
+  `Running` as current-execution evidence; counter deltas produce `Recent`
+  inside a continuous window; a gap with activity restarts `Observing`; and
+  unchanged counters across a gap retain valid idle evidence. The Threads
+  page now shows cumulative CPU time, current/average CPU, sample freshness,
+  and separate running/recent/idle/observing counts. The Modules page was
+  renamed to **origin-thread activity** and distinguishes no own threads,
+  missing start addresses, loading, and unavailable thread evidence instead
+  of presenting a module-wide dormant/active claim. Module and thread sample
+  ages are shown separately. Deterministic regression tests cover runnable
+  states, long-gap activity, long-gap inactivity, cumulative CPU, and the
+  module evidence reasons.
+
 - 2026-10-22: CI quality gate failure in `windows_core_processes_report_their_owning_account`.
   Root cause: `windows_core_processes_report_their_owning_account` failed in CI on
   `csrss.exe` with `left: "runnervmuzpk7$"` vs `right: "SYSTEM"`. In elevated test

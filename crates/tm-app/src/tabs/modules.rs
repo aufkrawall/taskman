@@ -6,10 +6,10 @@
 //! intentionally advanced action with a second confirmation; the platform
 //! layer revalidates both process identity and the exact module base/path.
 //!
-//! Each module also shows the threads that START in it and whether those are
-//! dormant (see `tabs::threads`). A module's code mostly runs on other
-//! modules' threads, so a module that starts no thread is never called
-//! dormant — there is no evidence either way.
+//! Each module also shows activity for the threads that START in it (see
+//! `tabs::threads`). A module's code mostly runs on other modules' threads,
+//! so this is deliberately labelled origin-thread activity; a module that
+//! starts no thread is reported as having no own threads, not as idle.
 
 use eframe::egui;
 use std::cmp::Ordering;
@@ -23,7 +23,7 @@ use tm_platform::actions::{MODULE_UNLOAD_SINGLE_RELEASE_MARKER, PlatformActions,
 use crate::app::{InFlight, ProcessIdentity, TaskManApp};
 use crate::search;
 use crate::tabs::inspector::{self, Pace};
-use crate::tabs::threads::{Activity, ThreadRow};
+use crate::tabs::threads::{Activity, ThreadEvidence, ThreadRow};
 use crate::theme;
 use crate::widgets::menu;
 use crate::widgets::tablekit::{self, TmColumn};
@@ -79,45 +79,72 @@ impl SortColumn {
 /// What the thread list proves about one module.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ModuleActivity {
-    /// The thread list, or some thread's start address, is unavailable.
-    Unknown,
+    Unknown(UnknownReason),
     /// No thread starts here, and every start address is known.
     NoThreads,
     /// Its threads have not been watched long enough.
     Observing,
+    /// At least one thread that started here is using a processor now.
+    Running,
     /// At least one thread that started here ran recently.
-    Active,
-    /// Every thread that started here is dormant.
-    Dormant,
+    Recent,
+    /// Every thread that started here is idle.
+    Idle {
+        idle: Duration,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UnknownReason {
+    Loading,
+    Unavailable,
+    StartsUnavailable,
 }
 
 impl ModuleActivity {
     fn rank(self) -> u8 {
         match self {
-            Self::Active => 0,
-            Self::Observing => 1,
-            Self::Dormant => 2,
-            Self::NoThreads => 3,
-            Self::Unknown => 4,
+            Self::Running => 0,
+            Self::Recent => 1,
+            Self::Observing => 2,
+            Self::Idle { .. } => 3,
+            Self::NoThreads => 4,
+            Self::Unknown(_) => 5,
         }
     }
 
-    fn label(self) -> &'static str {
+    fn label(self) -> String {
         match self {
-            Self::Unknown | Self::Observing => "—",
-            Self::NoThreads => "",
-            Self::Active => crate::tabs::threads::activity_label(Activity::Active),
-            Self::Dormant => crate::tabs::threads::activity_label(Activity::Dormant {
-                idle: crate::tabs::threads::DORMANT_AFTER,
-            }),
+            Self::Unknown(UnknownReason::Loading) => i18n::tr(K::ModuleThreadsLoading).to_string(),
+            Self::Unknown(UnknownReason::Unavailable) => {
+                i18n::tr(K::ModuleThreadsUnavailable).to_string()
+            }
+            Self::Unknown(UnknownReason::StartsUnavailable) => {
+                i18n::tr(K::ModuleActivityUnknown).to_string()
+            }
+            Self::NoThreads => i18n::tr(K::ModuleNoOwnThreads).to_string(),
+            Self::Observing => i18n::tr(K::ActivityObserving).to_string(),
+            Self::Running => crate::tabs::threads::activity_label(Activity::Running),
+            Self::Recent => crate::tabs::threads::activity_label(Activity::Recent),
+            Self::Idle { idle } => crate::tabs::threads::activity_label(Activity::Idle { idle }),
         }
     }
 
-    fn tip(self) -> &'static str {
+    fn tip(self) -> String {
         match self {
-            Self::Unknown => i18n::tr(K::ThreadsNoAccessTip),
-            Self::NoThreads => i18n::tr(K::ModuleNoThreadsTip),
-            Self::Observing | Self::Active | Self::Dormant => i18n::tr(K::ModuleActivityTip),
+            Self::Unknown(UnknownReason::Loading) => {
+                i18n::tr(K::ModuleThreadsLoadingTip).to_string()
+            }
+            Self::Unknown(UnknownReason::Unavailable) => {
+                i18n::tr(K::ModuleThreadsUnavailableTip).to_string()
+            }
+            Self::Unknown(UnknownReason::StartsUnavailable) => {
+                i18n::tr(K::ModuleUnknownStartsTip).to_string()
+            }
+            Self::NoThreads => i18n::tr(K::ModuleNoThreadsTip).to_string(),
+            Self::Observing => i18n::tr(K::ModuleObservingTip).to_string(),
+            Self::Idle { .. } => i18n::tr(K::ModuleIdleTip).to_string(),
+            Self::Running | Self::Recent => i18n::tr(K::ModuleActivityTip).to_string(),
         }
     }
 }
@@ -126,10 +153,16 @@ impl ModuleActivity {
 /// unknown, flagged by the bool) and what they prove about it.
 fn module_activity(
     module: &ProcessModule,
-    threads: Option<&[ThreadRow]>,
+    evidence: ThreadEvidence<'_>,
 ) -> (Option<(usize, bool)>, ModuleActivity) {
-    let Some(threads) = threads else {
-        return (None, ModuleActivity::Unknown);
+    let threads = match evidence {
+        ThreadEvidence::Loading => {
+            return (None, ModuleActivity::Unknown(UnknownReason::Loading));
+        }
+        ThreadEvidence::Unavailable { .. } => {
+            return (None, ModuleActivity::Unknown(UnknownReason::Unavailable));
+        }
+        ThreadEvidence::Ready { rows, .. } => rows,
     };
     let unknown_starts = threads.iter().any(|row| row.thread.start_address.is_none());
     let started: Vec<&ThreadRow> = threads
@@ -142,26 +175,39 @@ fn module_activity(
         .collect();
     if started.is_empty() {
         return if unknown_starts {
-            (None, ModuleActivity::Unknown)
+            (
+                Some((0, true)),
+                ModuleActivity::Unknown(UnknownReason::StartsUnavailable),
+            )
         } else {
             (Some((0, false)), ModuleActivity::NoThreads)
         };
     }
     let count = Some((started.len(), unknown_starts));
-    let activity = if started.iter().any(|row| row.activity == Activity::Active) {
-        ModuleActivity::Active
+    let activity = if started.iter().any(|row| row.activity == Activity::Running) {
+        ModuleActivity::Running
+    } else if started.iter().any(|row| row.activity == Activity::Recent) {
+        ModuleActivity::Recent
     } else if started
         .iter()
-        .all(|row| matches!(row.activity, Activity::Dormant { .. }))
+        .any(|row| matches!(row.activity, Activity::Observing { .. }))
     {
+        ModuleActivity::Observing
+    } else {
         // A thread whose start is unknown might belong here and be running.
         if unknown_starts {
-            ModuleActivity::Unknown
+            ModuleActivity::Unknown(UnknownReason::StartsUnavailable)
         } else {
-            ModuleActivity::Dormant
+            let idle = started
+                .iter()
+                .filter_map(|row| match row.activity {
+                    Activity::Idle { idle } => Some(idle),
+                    _ => None,
+                })
+                .min()
+                .unwrap_or(Duration::ZERO);
+            ModuleActivity::Idle { idle }
         }
-    } else {
-        ModuleActivity::Observing
     };
     (count, activity)
 }
@@ -182,6 +228,7 @@ pub struct State {
     /// Bumped by every successful enumeration; the table anchors its scroll
     /// position when it changes.
     generation: Arc<AtomicU64>,
+    sampled_at: Arc<Mutex<Option<Instant>>>,
     drawn_generation: u64,
     fetch: InFlight,
     pace: Pace,
@@ -220,6 +267,7 @@ impl State {
             load: Arc::new(Mutex::new(LoadState::Loading)),
             stale: Arc::new(Mutex::new(None)),
             generation: Arc::new(AtomicU64::new(0)),
+            sampled_at: Arc::new(Mutex::new(None)),
             drawn_generation: 0,
             fetch: InFlight::default(),
             pace: Pace::default(),
@@ -250,6 +298,11 @@ impl State {
     /// The unload confirmation is up and owns the keyboard.
     pub fn confirming(&self) -> bool {
         self.pending_unload.is_some()
+    }
+
+    /// Start of the newest successful module enumeration.
+    pub fn sampled_at(&self) -> Option<Instant> {
+        *tm_core::sync::lock(&self.sampled_at)
     }
 }
 
@@ -300,12 +353,14 @@ fn begin_fetch(state: &mut State, actions: Arc<dyn PlatformActions>, ctx: &egui:
     let load = state.load.clone();
     let stale = state.stale.clone();
     let generation = state.generation.clone();
+    let sampled_at = state.sampled_at.clone();
     let identity = state.identity.clone();
     let in_flight = state.fetch.clone();
     let wake = ctx.clone();
     let spawned = std::thread::Builder::new()
         .name("tm-modules".into())
         .spawn(move || {
+            let sampled = Instant::now();
             let result = actions
                 .list_process_modules(identity.pid, identity.start_epoch_s)
                 .map_err(|error| error.to_string());
@@ -313,6 +368,7 @@ fn begin_fetch(state: &mut State, actions: Arc<dyn PlatformActions>, ctx: &egui:
             let notice = merge_fetch(&mut tm_core::sync::lock(&load), result);
             *tm_core::sync::lock(&stale) = notice;
             if ok {
+                *tm_core::sync::lock(&sampled_at) = Some(sampled);
                 generation.fetch_add(1, AtomicOrdering::Relaxed);
             }
             in_flight.end();
@@ -536,7 +592,7 @@ fn compare_rows(a: &Row, b: &Row, sort: SortColumn) -> Ordering {
 fn visible_modules(
     state: &State,
     modules: &[ProcessModule],
-    threads: Option<&[ThreadRow]>,
+    threads: ThreadEvidence<'_>,
 ) -> Vec<Row> {
     let needle = state.filter.trim().to_ascii_lowercase();
     let mut rows = modules
@@ -561,13 +617,31 @@ fn module_matches_filter(module: &ProcessModule, needle: &str) -> bool {
         || module.path.to_ascii_lowercase().contains(needle)
 }
 
+fn sample_age(app: &TaskManApp, sampled_at: Instant, floor: Duration) -> (String, bool) {
+    let age = Instant::now().saturating_duration_since(sampled_at);
+    let paused = app.shared.settings.update_speed == tm_core::settings::UpdateSpeed::Paused;
+    let expected = inspector::page_interval(app.shared.settings.update_speed, floor)
+        .map_or(crate::tabs::threads::DORMANT_AFTER, |interval| {
+            interval.saturating_mul(2)
+        });
+    let text = if paused {
+        i18n::trf(
+            K::SamplePausedAge,
+            &[&format::format_seconds(age.as_secs_f64())],
+        )
+    } else {
+        i18n::trf(K::SampleAge, &[&format::format_seconds(age.as_secs_f64())])
+    };
+    (text, !paused && age > expected)
+}
+
 /// The Modules page of Process Properties. `threads` is the Threads page's
-/// newest list (the dialog keeps it current while this page is shown).
+/// newest evidence (the dialog keeps it current while this page is shown).
 pub fn show(
     app: &mut TaskManApp,
     ui: &mut egui::Ui,
     state: &mut State,
-    threads: Option<&[ThreadRow]>,
+    threads: ThreadEvidence<'_>,
     pal: &theme::Palette,
 ) {
     let ctx = ui.ctx().clone();
@@ -630,6 +704,38 @@ pub fn show(
             .small()
             .color(pal.text_dim),
     );
+    ui.label(
+        egui::RichText::new(i18n::tr(K::OriginThreadActivityHelp))
+            .small()
+            .color(pal.text_dim),
+    );
+    match threads {
+        ThreadEvidence::Loading => {
+            ui.label(
+                egui::RichText::new(i18n::tr(K::ModuleThreadsLoading))
+                    .small()
+                    .color(pal.text_dim),
+            );
+        }
+        ThreadEvidence::Unavailable { error, sampled_at } => {
+            ui.label(
+                egui::RichText::new(i18n::trf(K::ThreadActivityUnavailable, &[error]))
+                    .small()
+                    .color(pal.heat_high),
+            );
+            if let Some(sampled_at) = sampled_at {
+                let (text, stale) =
+                    sample_age(app, sampled_at, crate::tabs::threads::REFRESH_FLOOR);
+                let color = if stale { pal.heat_high } else { pal.text_dim };
+                ui.label(
+                    egui::RichText::new(format!("{}: {text}", i18n::tr(K::Threads)))
+                        .small()
+                        .color(color),
+                );
+            }
+        }
+        ThreadEvidence::Ready { .. } => {}
+    }
     ui.add_space(4.0);
 
     match &snapshot {
@@ -646,6 +752,28 @@ pub fn show(
             if let Some(error) = tm_core::sync::lock(&state.stale).as_deref() {
                 ui.label(egui::RichText::new(error).small().color(pal.heat_high));
             }
+            ui.horizontal_wrapped(|ui| {
+                if let Some(sampled_at) = state.sampled_at() {
+                    let (text, stale) = sample_age(app, sampled_at, REFRESH_FLOOR);
+                    let color = if stale { pal.heat_high } else { pal.text_dim };
+                    ui.label(
+                        egui::RichText::new(format!("{}: {text}", i18n::tr(K::Modules)))
+                            .small()
+                            .color(color),
+                    );
+                }
+                if let ThreadEvidence::Ready { sampled_at, .. } = threads {
+                    ui.separator();
+                    let (text, stale) =
+                        sample_age(app, sampled_at, crate::tabs::threads::REFRESH_FLOOR);
+                    let color = if stale { pal.heat_high } else { pal.text_dim };
+                    ui.label(
+                        egui::RichText::new(format!("{}: {text}", i18n::tr(K::Threads)))
+                            .small()
+                            .color(color),
+                    );
+                }
+            });
             let rows = visible_modules(state, modules, threads);
             // `app.modal_open()` runs while the properties dialog is taken,
             // so it stays false for the dialog itself — this list nav and
@@ -685,8 +813,8 @@ pub fn show(
                 TmColumn::text("name", i18n::tr(K::ColName), 180.0),
                 TmColumn::num("base", i18n::tr(K::ColBaseAddress), 150.0),
                 TmColumn::num("size", i18n::tr(K::ColSize), 100.0),
-                TmColumn::num("threads", i18n::tr(K::ColThreadCount), 80.0),
-                TmColumn::text("activity", i18n::tr(K::ColActivity), 100.0),
+                TmColumn::num("threads", i18n::tr(K::ColOriginThreadCount), 110.0),
+                TmColumn::text("activity", i18n::tr(K::ColOriginThreadActivity), 160.0),
                 TmColumn::text("path", i18n::tr(K::ColPath), 360.0),
             ];
             let mut table = app
@@ -739,7 +867,7 @@ pub fn show(
                             continue;
                         };
                         let module = &row.module;
-                        let dim = row.activity == ModuleActivity::Dormant;
+                        let dim = matches!(row.activity, ModuleActivity::Idle { .. });
                         let selected = state.selected_base == Some(module.base_address);
                         let (rect, response) = table.row(ui, pal, selected, module.base_address);
                         table.describe_row(ui, &response, &module.name, index);
@@ -760,7 +888,8 @@ pub fn show(
                             None => "—".to_string(),
                         };
                         inspector::num_cell(ui, table, rect, 3, &count, pal, dim);
-                        table.text_cell(ui, rect, 4, row.activity.label(), pal, dim);
+                        let activity = row.activity.label();
+                        table.text_cell(ui, rect, 4, &activity, pal, dim);
                         let path_truncated = table.text_cell(ui, rect, 5, &module.path, pal, dim);
                         // A clipped cell cannot show its content; the full
                         // value becomes the row tooltip (before the context
@@ -770,7 +899,11 @@ pub fn show(
                         let over = |column: usize| {
                             pointer.is_some_and(|p| table.col_rect(column, rect).contains(p))
                         };
-                        let response = if over(3) || over(4) {
+                        let response = if over(4) {
+                            response.on_hover_text(row.activity.tip())
+                        } else if over(3) && matches!(row.threads, Some((_, true))) {
+                            response.on_hover_text(i18n::tr(K::ModuleThreadCountLowerBound))
+                        } else if over(3) {
                             response.on_hover_text(row.activity.tip())
                         } else if path_truncated {
                             response.on_hover_text(module.path.as_str())
@@ -977,10 +1110,23 @@ mod tests {
         );
         let modules = vec![module("alpha.dll", 1, 1), module("beta.dll", 2, 2)];
         state.filter = "alpha".into();
-        assert_eq!(visible_modules(&state, &modules, None).len(), 1);
+        assert_eq!(
+            visible_modules(
+                &state,
+                &modules,
+                ThreadEvidence::Ready {
+                    rows: &[],
+                    sampled_at: Instant::now(),
+                },
+            )
+            .len(),
+            1
+        );
         state.filter = "test\\beta".into();
         assert_eq!(
-            visible_modules(&state, &modules, None)[0].module.name,
+            visible_modules(&state, &modules, ThreadEvidence::Loading,)[0]
+                .module
+                .name,
             "beta.dll"
         );
     }
@@ -1001,6 +1147,7 @@ mod tests {
                 cycles: None,
             },
             cpu_pct: None,
+            avg_cpu_pct: None,
             cycles_delta: None,
             activity,
         }
@@ -1036,57 +1183,102 @@ mod tests {
         assert_eq!(unload_gate(true, true), UnloadGate::Busy);
     }
 
-    const DORMANT: Activity = Activity::Dormant {
+    const IDLE: Activity = Activity::Idle {
         idle: crate::tabs::threads::DORMANT_AFTER,
     };
+    const OBSERVING: Activity = Activity::Observing {
+        elapsed: Duration::ZERO,
+        reason: crate::tabs::threads::ObservingReason::FirstObservation,
+    };
+
+    fn ready(rows: &[ThreadRow]) -> ThreadEvidence<'_> {
+        ThreadEvidence::Ready {
+            rows,
+            sampled_at: Instant::now(),
+        }
+    }
 
     #[test]
-    fn a_module_is_dormant_only_when_every_thread_it_started_is() {
+    fn module_activity_reflects_only_threads_started_in_it() {
         let dll = module("worker.dll", 0x1000, 0x1000);
         let threads = [
-            thread_row(1, Some(0x1100), DORMANT),
-            thread_row(2, Some(0x1200), DORMANT),
-            thread_row(3, Some(0x9000), Activity::Active),
+            thread_row(1, Some(0x1100), IDLE),
+            thread_row(2, Some(0x1200), IDLE),
+            thread_row(3, Some(0x9000), Activity::Running),
         ];
         assert_eq!(
-            module_activity(&dll, Some(&threads)),
-            (Some((2, false)), ModuleActivity::Dormant)
+            module_activity(&dll, ready(&threads)),
+            (
+                Some((2, false)),
+                ModuleActivity::Idle {
+                    idle: crate::tabs::threads::DORMANT_AFTER
+                }
+            )
         );
         let threads = [
-            thread_row(1, Some(0x1100), DORMANT),
-            thread_row(2, Some(0x1200), Activity::Active),
+            thread_row(1, Some(0x1100), IDLE),
+            thread_row(2, Some(0x1200), Activity::Running),
         ];
         assert_eq!(
-            module_activity(&dll, Some(&threads)).1,
-            ModuleActivity::Active
+            module_activity(&dll, ready(&threads)).1,
+            ModuleActivity::Running
         );
         let threads = [
-            thread_row(1, Some(0x1100), DORMANT),
-            thread_row(2, Some(0x1200), Activity::Observing),
+            thread_row(1, Some(0x1100), IDLE),
+            thread_row(2, Some(0x1200), OBSERVING),
         ];
         assert_eq!(
-            module_activity(&dll, Some(&threads)).1,
+            module_activity(&dll, ready(&threads)).1,
             ModuleActivity::Observing
+        );
+        let threads = [
+            thread_row(1, Some(0x1100), IDLE),
+            thread_row(2, Some(0x1200), Activity::Recent),
+        ];
+        assert_eq!(
+            module_activity(&dll, ready(&threads)).1,
+            ModuleActivity::Recent
         );
     }
 
     #[test]
-    fn a_module_without_threads_or_evidence_is_never_called_dormant() {
+    fn unusable_thread_evidence_has_distinct_reasons() {
         let dll = module("helper.dll", 0x1000, 0x1000);
-        let elsewhere = [thread_row(1, Some(0x9000), DORMANT)];
+        let elsewhere = [thread_row(1, Some(0x9000), IDLE)];
         assert_eq!(
-            module_activity(&dll, Some(&elsewhere)),
+            module_activity(&dll, ready(&elsewhere)),
             (Some((0, false)), ModuleActivity::NoThreads)
         );
         // An unreadable start address could belong to this module.
-        let unknown = [
-            thread_row(1, Some(0x1100), DORMANT),
-            thread_row(2, None, DORMANT),
-        ];
+        let unknown = [thread_row(1, Some(0x1100), IDLE), thread_row(2, None, IDLE)];
         assert_eq!(
-            module_activity(&dll, Some(&unknown)),
-            (Some((1, true)), ModuleActivity::Unknown)
+            module_activity(&dll, ready(&unknown)),
+            (
+                Some((1, true)),
+                ModuleActivity::Unknown(UnknownReason::StartsUnavailable)
+            )
         );
-        assert_eq!(module_activity(&dll, None), (None, ModuleActivity::Unknown));
+        let only_unknown = [thread_row(2, None, IDLE)];
+        assert_eq!(
+            module_activity(&dll, ready(&only_unknown)),
+            (
+                Some((0, true)),
+                ModuleActivity::Unknown(UnknownReason::StartsUnavailable)
+            )
+        );
+        assert_eq!(
+            module_activity(&dll, ThreadEvidence::Loading),
+            (None, ModuleActivity::Unknown(UnknownReason::Loading))
+        );
+        assert_eq!(
+            module_activity(
+                &dll,
+                ThreadEvidence::Unavailable {
+                    error: "denied",
+                    sampled_at: None,
+                },
+            ),
+            (None, ModuleActivity::Unknown(UnknownReason::Unavailable))
+        );
     }
 }

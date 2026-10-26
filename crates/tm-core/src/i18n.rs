@@ -187,6 +187,11 @@ keys! {
     ColStartAddress => ["Startadresse", "Start address"],
     ColThreadState => ["Zustand", "State"],
     ColActivity => ["Aktivität", "Activity"],
+    ColOriginThreadActivity => [
+        "Aktivität der Start-Threads",
+        "Origin-thread activity"
+    ],
+    ColOriginThreadCount => ["Eigene Threads", "Own threads"],
     ColThreadCount => ["Threads", "Threads"],
     ThreadStateInitialized => ["Initialisiert", "Initialized"],
     ThreadStateReady => ["Bereit", "Ready"],
@@ -200,36 +205,96 @@ keys! {
     ThreadPrioLowest => ["Niedrigste", "Lowest"],
     ThreadPrioHighest => ["Höchste", "Highest"],
     ThreadPrioTimeCritical => ["Zeitkritisch", "Time critical"],
-    ActivityActive => ["Aktiv", "Active"],
-    ActivityDormant => ["Ruhend", "Dormant"],
-    ThreadDormantTip => [
-        "Seit mindestens {} s weder geplant noch CPU-Zeit oder Zyklen verbraucht",
-        "Not scheduled, and no CPU time or cycles used, for at least {} s"
+    ActivityRunning => ["Läuft", "Running"],
+    ActivityRecent => ["Kürzlich", "Recent"],
+    ActivityObserving => ["Beobachtung", "Observing"],
+    ActivityObservingFor => ["Beobachtung {} s", "Observing {} s"],
+    ActivityIdleFor => ["Ruht ≥ {} s", "Idle ≥ {} s"],
+    ThreadRunningTip => [
+        "Der Thread nutzte zum Zeitpunkt der letzten Messung einen Prozessor",
+        "The thread was using a processor at the latest sample"
     ],
-    ThreadActiveTip => [
-        "Lief in den letzten {} s",
-        "Ran within the last {} s"
+    ThreadRecentTip => [
+        "Ausführung wurde zwischen den letzten Messungen beobachtet (innerhalb von {} s). Das bedeutet nicht, dass der Thread jetzt läuft",
+        "Execution was observed between recent samples (within {} s). This does not mean the thread is running now"
     ],
     ActivityObservingTip => [
-        "Aktivität wird noch beobachtet — die Einstufung braucht {} s",
-        "Activity is still being observed — judging it takes {} s"
+        "Zusammenhängende Aktivitätsdaten werden gesammelt: {} von {} s. Vor Abschluss des Zeitfensters wird kein Status abgeleitet",
+        "Collecting contiguous activity evidence: {} of {} s. No status is inferred before the window is complete"
+    ],
+    ActivityObservingGapTip => [
+        "Die Zähler haben sich über eine Messlücke hinweg verändert. Der genaue Zeitpunkt der letzten Ausführung ist unbekannt; die Beobachtung beginnt erneut",
+        "Counters advanced across a sampling gap. The exact last run time is unknown, so activity observation restarted"
+    ],
+    ThreadIdleTip => [
+        "Mindestens {} s lang wurde keine Ausführung beobachtet. Das ist kein Hinweis darauf, dass der Thread hängt",
+        "No execution was observed for at least {} s. This is not evidence that the thread is hung"
     ],
     ThreadsSummary => [
-        "{} Threads · {} ruhend",
-        "{} threads · {} dormant"
+        "{} Threads · {} laufend · {} kürzlich · {} ruhend · {} beobachtet",
+        "{} threads · {} running · {} recent · {} idle · {} observing"
     ],
-    HideDormant => ["Ruhende ausblenden", "Hide dormant"],
-    ThreadsNoAccessTip => [
-        "Startadresse und Zyklen brauchen Zugriff auf den Thread; für Prozesse anderer Benutzer ist dieser ohne Administratorrechte verweigert",
-        "Start address and cycles need access to the thread, which is denied for other users' processes without administrator rights"
+    HideIdle => ["Ruhende ausblenden", "Hide idle"],
+    ThreadStartAddressTip => [
+        "Die Startadresse benötigt Zugriff auf den Thread; für Prozesse anderer Benutzer ist dieser ohne Administratorrechte verweigert",
+        "The start address needs access to the thread, which is denied for other users' processes without administrator rights"
+    ],
+    ThreadCpuPercentTip => [
+        "Anteil an allen logischen Prozessoren.\nAktuelle Messung: {}\nDurchschnitt seit Öffnen der Seite: {}",
+        "Share of all logical processors.\nCurrent sample: {}\nAverage since the page opened: {}"
+    ],
+    ThreadCpuTimeTip => [
+        "CPU-Zeit seit Erstellung des Threads: {}\nKernel: {}\nBenutzer: {}\nZyklen insgesamt: {}\nZyklen-Delta: {}",
+        "CPU time since thread creation: {}\nKernel: {}\nUser: {}\nCycles total: {}\nCycles delta: {}"
+    ],
+    SampleAge => ["Vor {} s gemessen", "Sampled {} s ago"],
+    SamplePausedAge => [
+        "Angehalten · vor {} s gemessen",
+        "Paused · sampled {} s ago"
     ],
     ModuleActivityTip => [
-        "Ruhend: Jeder Thread, der in diesem Modul gestartet wurde, ist ruhend. Aktiv: mindestens einer davon lief zuletzt.",
-        "Dormant: every thread that started in this module is dormant. Active: at least one of them ran recently."
+        "Dies beschreibt Threads, deren Startadresse in diesem Modul liegt. Es beweist nicht, dass der Modulcode derzeit ausgeführt wird",
+        "This describes threads whose start address lies in this module. It does not prove that the module's code is executing"
+    ],
+    OriginThreadActivityHelp => [
+        "Die Aktivität bezieht sich nur auf Threads, die in diesem Modul gestartet wurden; Modulcode kann auf Threads anderer Module laufen",
+        "Activity covers only threads started in this module; module code may execute on other modules' threads"
+    ],
+    ModuleThreadsLoading => ["Wird geladen", "Loading"],
+    ModuleThreadsUnavailable => ["Nicht verfügbar", "Unavailable"],
+    ModuleActivityUnknown => ["Unbekannt", "Unknown"],
+    ModuleNoOwnThreads => ["Keine eigenen Threads", "No own threads"],
+    ModuleThreadsLoadingTip => [
+        "Die Threadliste wird noch geladen; daher ist noch keine Modulzuordnung möglich",
+        "The thread list is still loading, so module attribution is not available yet"
+    ],
+    ModuleThreadsUnavailableTip => [
+        "Die neueste Threadliste konnte nicht geladen werden; eine aktuelle Modulzuordnung ist nicht möglich",
+        "The newest thread list could not be loaded, so current module attribution is unavailable"
+    ],
+    ModuleUnknownStartsTip => [
+        "Mindestens eine Thread-Startadresse ist nicht lesbar. Der Thread könnte in diesem Modul gestartet sein",
+        "At least one thread start address is unavailable. The thread could have started in this module"
+    ],
+    ModuleThreadCountLowerBound => [
+        "Mindestens diese Anzahl; weitere Thread-Startadressen sind nicht lesbar",
+        "At least this many; more thread start addresses are unavailable"
+    ],
+    ModuleObservingTip => [
+        "Mindestens ein in diesem Modul gestarteter Thread wird noch beobachtet; vor Abschluss des Zeitfensters lässt sich keine Aktivität ableiten",
+        "At least one thread started in this module is still being observed, so no activity verdict is inferred before its window completes"
+    ],
+    ModuleIdleTip => [
+        "Für jeden bekannten Thread, der in diesem Modul gestartet wurde, wurde mindestens im angezeigten Zeitraum keine Ausführung beobachtet. Code des Moduls auf anderen Threads ist nicht abgedeckt",
+        "No execution was observed for every known thread started in this module during at least the displayed interval. Module code running on other threads is not covered"
     ],
     ModuleNoThreadsTip => [
-        "In diesem Modul startet kein Thread — sein Code läuft auf Threads anderer Module, daher lässt sich Ruhe nicht nachweisen",
-        "No thread starts in this module — its code runs on other modules' threads, so dormancy cannot be proven"
+        "In diesem Modul startet kein Thread; die Aktivität eigener Threads ist daher nicht anwendbar. Modulcode kann auf Threads anderer Module laufen",
+        "No thread starts in this module, so own-thread activity does not apply. Module code may run on other modules' threads"
+    ],
+    ThreadActivityUnavailable => [
+        "Threadaktivität nicht verfügbar: {}",
+        "Thread activity unavailable: {}"
     ],
     ColProtocol => ["Protokoll", "Protocol"],
     ColLocalAddress => ["Lokale Adresse", "Local address"],

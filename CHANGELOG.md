@@ -2,8 +2,23 @@
 
 ## Unreleased
 
+### Improved
+
+- **Thread and module activity reporting:** Process Properties now distinguishes
+  threads that are currently running, ran recently, are provably idle, or are
+  still being observed. The Threads page shows cumulative CPU time plus
+  current and observed-window average CPU, kernel/user time, cycle details,
+  sample age, and elapsed idle time. The Modules page labels its verdict as
+  origin-thread activity and explicitly distinguishes own threads from no own
+  threads, loading, unavailable data, and unknown start addresses.
+
 ### Fixed
 
+- **False thread and module activity:** Ready, Standby, and DeferredReady
+  threads no longer count as having executed. Activity observed across Paused
+  mode, another properties tab, sleep, or another long sampling gap is now
+  re-observed instead of being reported as recent; unchanged counters across
+  such a gap remain valid idle evidence.
 - **System and service process account names in CI / domain environments:**
   `sysinfo`'s user enumeration falls back to the LSA logon session user name
   when its internal `LookupAccountSidW` query fails to allocate a domain buffer.
