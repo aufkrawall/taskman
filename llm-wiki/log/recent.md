@@ -1,3 +1,20 @@
+- 2026-10-26 (user report — blank Task Manager thread start addresses): the
+  installed, unelevated GUI showed every `taskmgr.exe` thread with "—" in
+  Start address even though TaskmanCore was running. Root cause: the page got
+  its handle-free thread snapshot locally, but attempted the handle-derived
+  start address and cycle counter only with the GUI token; opening an elevated
+  process's threads was denied, and the active broker was never asked. Added
+  protocol-v8 `ProcessThreadDetails`, a bounded read-only request that retries
+  the per-thread handles as LocalSystem and returns only TID, thread creation
+  time, start address, and cycles. The GUI fills only evidence whose TID and
+  thread creation time match its snapshot, so TID reuse cannot cross values.
+  The ordinary local fields remain the fallback when the service is absent or
+  older. Also enabled SeDebugPrivilege best-effort in the thread collector,
+  switched Start-address sorting to numeric address order, and made remaining
+  partial records explicit above the table. Regression tests cover exact
+  process identity, wire shape, the 512 KiB bound, creation-matched merge,
+  numeric sort, and the existing live local thread collector.
+
 - 2026-10-26 (Process Properties activity audit): two false-positive paths in
   thread activity were removed. `Ready`, `Standby`, and `DeferredReady` were
   treated as if the thread had run, and any counter advance after a long

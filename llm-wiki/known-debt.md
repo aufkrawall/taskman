@@ -158,9 +158,11 @@ dropped) is what the user sees; permanently pinned or re-loaded modules stay.
   symbol-server lookup (privacy, latency), and nearest-export names would
   mislabel the non-exported routines most threads start in.
 - Start address and cycles of another user's (service/SYSTEM) threads need a
-  thread handle an unelevated GUI does not get; they read "—". There is no
-  broker request for them — the thread list, states and activity evidence
-  are handle-free and complete without it.
+  thread handle an unelevated GUI does not get. The exact-identity-bound
+  protocol-v8 broker request supplies them as LocalSystem when Windows allows
+  the target's thread handles to be opened. Protected-process threads can
+  still refuse even that token; they remain "—" and the page states how many
+  records are partial rather than fabricating values.
 - The connection tables carry only a PID. The identity is re-checked
   against the newest snapshot before each query and before showing it; a
   PID recycled inside that sub-second window is accepted.

@@ -67,8 +67,10 @@ pub const SERVICE_LOG_FILE_PREFIX: &str = "taskman-service.log";
 // identity-bound token read that fills the User/Elevated columns of the
 // SYSTEM/service processes an unelevated GUI cannot open at all. v7 splits
 // the disk service time by physical disk (per entry and per-disk totals), so
-// each process's share is taken of the disk that served it.
-pub const PROTOCOL_VERSION: u16 = 7;
+// each process's share is taken of the disk that served it. v8 adds bounded,
+// identity-bound thread start-address and cycle evidence so an unelevated GUI
+// can fill those fields for elevated targets such as Windows Task Manager.
+pub const PROTOCOL_VERSION: u16 = 8;
 
 const PIPE_NAME: &str = r"\\.\pipe\Taskman.Core.v1";
 const FRAME_MAGIC: [u8; 4] = *b"TMB1";
@@ -81,6 +83,7 @@ const MAX_REQUEST_BYTES: usize = 64 * 1024;
 // room for normal large processes without silently truncating it.
 const MAX_RESPONSE_BYTES: usize = 512 * 1024;
 const MAX_MODULES_PER_RESPONSE: usize = 1024;
+const MAX_THREAD_DETAILS_PER_RESPONSE: usize = 4096;
 const PIPE_BUFFER_BYTES: u32 = 64 * 1024;
 const WORKER_COUNT: usize = 2;
 const WORK_QUEUE_CAP: usize = 16;
@@ -184,6 +187,13 @@ enum BrokerRequest {
     /// Read-only, identity-bound module inventory. This is brokered because
     /// ordinary GUI tokens cannot snapshot many SYSTEM/service processes.
     ProcessModules {
+        pid: u32,
+        expected_start_epoch_s: Option<i64>,
+    },
+    /// Read-only thread evidence the interactive GUI cannot obtain from its
+    /// own token. Bound to the exact process creation time and to each
+    /// thread's creation time before any value is returned.
+    ProcessThreadDetails {
         pid: u32,
         expected_start_epoch_s: Option<i64>,
     },
@@ -292,6 +302,17 @@ fn module_unload_legacy_call_default() -> u32 {
     1
 }
 
+/// The two per-thread values that require a thread handle. The rest of the
+/// thread list comes from the handle-free kernel snapshot in the GUI.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProcessThreadDetail {
+    tid: u32,
+    created_epoch_s: Option<i64>,
+    start_address: Option<u64>,
+    cycles: Option<u64>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "result", content = "value", rename_all = "snake_case")]
 enum BrokerValue {
@@ -306,6 +327,7 @@ enum BrokerValue {
     ProcessSecurity(super::ProcessSecurityInfo),
     ProcessIdentity(super::process_ops::ProcessTokenIdentity),
     ProcessModules(Vec<ProcessModule>),
+    ProcessThreadDetails(Vec<ProcessThreadDetail>),
     /// Result of `UnloadModule`. `released` is retained only for compatibility
     /// with the earlier v2 wire shape; it now means successful remote
     /// FreeLibrary calls, not an observable loader-reference count. `verified`
@@ -949,6 +971,40 @@ impl BrokeredActions {
     }
 }
 
+/// Fill only privileged per-thread evidence. A TID is mergeable only when the
+/// local list and the broker read agree on the thread creation time; a recycled
+/// TID must never inherit another thread's start address or cycles.
+fn merge_process_thread_details(
+    threads: &mut crate::actions::ProcessThreads,
+    details: &[ProcessThreadDetail],
+) -> usize {
+    let mut filled = 0usize;
+    for thread in &mut threads.threads {
+        if thread.start_address.is_some() && thread.cycles.is_some() {
+            continue;
+        }
+        let Some(created_epoch_s) = thread.created_epoch_s else {
+            continue;
+        };
+        let Some(detail) = details.iter().find(|detail| {
+            detail.tid == thread.tid && detail.created_epoch_s == Some(created_epoch_s)
+        }) else {
+            continue;
+        };
+        let before = (thread.start_address, thread.cycles);
+        if thread.start_address.is_none() {
+            thread.start_address = detail.start_address;
+        }
+        if thread.cycles.is_none() {
+            thread.cycles = detail.cycles;
+        }
+        if (thread.start_address, thread.cycles) != before {
+            filled += 1;
+        }
+    }
+    filled
+}
+
 impl PlatformActions for BrokeredActions {
     fn capabilities(&self) -> Capabilities {
         self.local.capabilities()
@@ -1240,16 +1296,53 @@ impl PlatformActions for BrokeredActions {
         }
     }
 
-    // Both are handle-free kernel/IP Helper reads that already see every
-    // process from the user's token; they never cross the broker.
     fn list_process_threads(
         &self,
         pid: u32,
         expected_start_epoch_s: Option<i64>,
     ) -> Result<crate::actions::ProcessThreads> {
-        self.local.list_process_threads(pid, expected_start_epoch_s)
+        let mut threads = self
+            .local
+            .list_process_threads(pid, expected_start_epoch_s)?;
+        let missing = threads
+            .threads
+            .iter()
+            .filter(|thread| thread.start_address.is_none() || thread.cycles.is_none())
+            .count();
+        if missing == 0 {
+            return Ok(threads);
+        }
+        let Some(start_epoch_s) = expected_start_epoch_s.filter(|value| *value > 0) else {
+            return Ok(threads);
+        };
+        match self.client.call(BrokerRequest::ProcessThreadDetails {
+            pid,
+            expected_start_epoch_s: Some(start_epoch_s),
+        }) {
+            Ok(BrokerValue::ProcessThreadDetails(details)) => {
+                merge_process_thread_details(&mut threads, &details);
+                Ok(threads)
+            }
+            Ok(_) => Err(TmError::platform(
+                "core service",
+                "unexpected thread-details response type",
+            )),
+            // The handle-free list remains trustworthy without privileged
+            // evidence. Keep showing it with honest "—" values when the
+            // service is old, absent, or refuses the read.
+            Err(BrokerCallError::Unavailable(detail)) => {
+                tracing::debug!(pid, missing, %detail, "broker thread details unavailable");
+                Ok(threads)
+            }
+            Err(BrokerCallError::Rejected(detail)) => {
+                tracing::debug!(pid, missing, %detail, "broker refused thread details");
+                Ok(threads)
+            }
+        }
     }
 
+    // This is a handle-free IP Helper read that already sees every process
+    // from the user's token; it never crosses the broker.
     fn list_process_connections(&self, pid: u32) -> Result<Vec<crate::actions::ProcessConnection>> {
         self.local.list_process_connections(pid)
     }
@@ -2126,6 +2219,45 @@ fn dispatch(
                 ));
             }
             Ok(BrokerValue::ProcessModules(modules))
+        }
+        BrokerRequest::ProcessThreadDetails {
+            pid,
+            expected_start_epoch_s,
+        } => {
+            let Some(start_epoch_s) = expected_start_epoch_s.filter(|value| *value > 0) else {
+                return Err(TmError::platform(
+                    "broker thread details",
+                    "a valid sampled process creation time is required",
+                ));
+            };
+            let threads = super::process_threads::list_process_threads(pid, Some(start_epoch_s))?;
+            let details: Vec<ProcessThreadDetail> = threads
+                .threads
+                .into_iter()
+                .filter(|thread| thread.start_address.is_some() || thread.cycles.is_some())
+                .map(|thread| ProcessThreadDetail {
+                    tid: thread.tid,
+                    created_epoch_s: thread.created_epoch_s,
+                    start_address: thread.start_address,
+                    cycles: thread.cycles,
+                })
+                .collect();
+            if details.len() > MAX_THREAD_DETAILS_PER_RESPONSE {
+                return Err(TmError::platform(
+                    "broker thread details",
+                    "thread evidence exceeds the bounded broker entry limit",
+                ));
+            }
+            let encoded_len = serde_json::to_vec(&details)
+                .map_err(|error| TmError::platform("broker thread details", error.to_string()))?
+                .len();
+            if encoded_len > MAX_RESPONSE_BYTES.saturating_sub(1024) {
+                return Err(TmError::platform(
+                    "broker thread details",
+                    "thread evidence exceeds the bounded broker response limit",
+                ));
+            }
+            Ok(BrokerValue::ProcessThreadDetails(details))
         }
         BrokerRequest::KillProcess {
             pid,
@@ -3832,6 +3964,134 @@ mod tests {
         assert_eq!(identity.name, "SYSTEM");
         assert_eq!(identity.sid.as_deref(), Some("S-1-5-18"));
         assert_eq!(identity.elevated, Some(true));
+    }
+
+    /// Thread evidence is another read-only, exact-identity query. PID alone
+    /// and an implausible creation time must be refused before any thread is
+    /// opened.
+    #[test]
+    fn the_thread_evidence_read_requires_an_exact_process_identity() {
+        let probe = |expected_start_epoch_s| {
+            dispatch(
+                &crate::win::WinActions,
+                BrokerRequest::ProcessThreadDetails {
+                    pid: 101,
+                    expected_start_epoch_s,
+                },
+                500,
+            )
+        };
+        assert!(probe(None).is_err(), "pid-only reads are refused");
+        assert!(
+            probe(Some(0)).is_err(),
+            "an implausible creation time is refused"
+        );
+    }
+
+    #[test]
+    fn thread_evidence_round_trips_and_rejects_untargeted_or_grown_payloads() {
+        let request = BrokerRequest::ProcessThreadDetails {
+            pid: 101,
+            expected_start_epoch_s: Some(202),
+        };
+        let encoded = serde_json::to_string(&request).unwrap();
+        assert_eq!(
+            encoded,
+            r#"{"operation":"process_thread_details","pid":101,"expected_start_epoch_s":202}"#
+        );
+        let grown = encoded.replace('}', r#","extra":true}"#);
+        assert!(serde_json::from_str::<BrokerRequest>(&grown).is_err());
+
+        let response = BrokerResponse {
+            protocol_version: PROTOCOL_VERSION,
+            value: Ok(BrokerValue::ProcessThreadDetails(vec![
+                ProcessThreadDetail {
+                    tid: 7,
+                    created_epoch_s: Some(100),
+                    start_address: Some(0x7FF0_0000_1234),
+                    cycles: Some(99),
+                },
+            ])),
+        };
+        let decoded: BrokerResponse =
+            serde_json::from_slice(&serde_json::to_vec(&response).unwrap()).unwrap();
+        let Ok(BrokerValue::ProcessThreadDetails(details)) = decoded.value else {
+            panic!("thread-details response did not round trip");
+        };
+        assert_eq!(details.len(), 1);
+        assert_eq!(details[0].tid, 7);
+        assert_eq!(details[0].start_address, Some(0x7FF0_0000_1234));
+        assert_eq!(details[0].cycles, Some(99));
+    }
+
+    #[test]
+    fn thread_evidence_merges_only_an_identity_matched_tid() {
+        use crate::actions::{ProcessThread, ProcessThreads, ThreadState};
+
+        let thread = |tid, created_epoch_s, start_address, cycles| ProcessThread {
+            tid,
+            start_address,
+            priority: 8,
+            base_priority: 8,
+            context_switches: 1,
+            kernel_time_100ns: 2,
+            user_time_100ns: 3,
+            created_epoch_s,
+            state: ThreadState::Waiting,
+            wait_reason: 6,
+            cycles,
+        };
+        let mut threads = ProcessThreads {
+            process_base_priority: 8,
+            threads: vec![
+                thread(7, Some(100), None, None),
+                thread(8, Some(200), Some(0x1000), Some(10)),
+            ],
+        };
+        let details = [
+            ProcessThreadDetail {
+                tid: 7,
+                created_epoch_s: Some(100),
+                start_address: Some(0x7000),
+                cycles: Some(20),
+            },
+            // Same TID, different incarnation: must not be merged into local
+            // thread 8, which already has readable values.
+            ProcessThreadDetail {
+                tid: 8,
+                created_epoch_s: Some(999),
+                start_address: Some(0x8000),
+                cycles: Some(30),
+            },
+        ];
+
+        assert_eq!(merge_process_thread_details(&mut threads, &details), 1);
+        assert_eq!(threads.threads[0].start_address, Some(0x7000));
+        assert_eq!(threads.threads[0].cycles, Some(20));
+        assert_eq!(threads.threads[1].start_address, Some(0x1000));
+        assert_eq!(threads.threads[1].cycles, Some(10));
+    }
+
+    #[test]
+    fn a_capped_thread_evidence_response_fits_the_frame_limit() {
+        let details: Vec<ProcessThreadDetail> = (0..MAX_THREAD_DETAILS_PER_RESPONSE)
+            .map(|index| ProcessThreadDetail {
+                tid: u32::MAX - index as u32,
+                created_epoch_s: Some(i64::MAX - index as i64),
+                start_address: Some(u64::MAX - index as u64),
+                cycles: Some(u64::MAX - index as u64),
+            })
+            .collect();
+        let response = BrokerResponse {
+            protocol_version: PROTOCOL_VERSION,
+            value: Ok(BrokerValue::ProcessThreadDetails(details)),
+        };
+        let encoded = serde_json::to_vec(&response).unwrap();
+        assert!(
+            encoded.len() <= MAX_RESPONSE_BYTES,
+            "worst-case thread response {} exceeds the {MAX_RESPONSE_BYTES}-byte cap",
+            encoded.len()
+        );
     }
 
     #[test]

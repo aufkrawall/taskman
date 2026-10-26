@@ -4,6 +4,16 @@
 
 ### Improved
 
+- **Thread start addresses for elevated processes:** Process Properties now
+  asks the authenticated LocalSystem core service for thread start addresses
+  and cycle counters that the unelevated GUI cannot read itself. This fills
+  the previously blank fields for targets such as Windows Task Manager while
+  preserving honest "—" values when Windows still refuses access. The page
+  reports how many thread records remain partial, sorts Start address by the
+  numeric address instead of the displayed module name, and keeps the
+  handle-free local read as a fallback when the service is unavailable. The
+  core service protocol moves to v8, so the service and app must be updated
+  together.
 - **Thread and module activity reporting:** Process Properties now distinguishes
   threads that are currently running, ran recently, are provably idle, or are
   still being observed. The Threads page shows cumulative CPU time plus

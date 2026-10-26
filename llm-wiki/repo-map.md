@@ -78,7 +78,9 @@ platform boundary (`tm-core` ← `tm-platform` ← `tm-app` / `tm-service`), and
     `process_threads.rs` (one process's threads from ONE handle-free
     `SystemExtendedProcessInformation` snapshot, identity-checked against that
     record; start address + cycles through a per-thread handle proven by
-    owning PID + creation time), `process_connections.rs` (IP Helper
+    owning PID + creation time; the broker retries missing handle evidence as
+    LocalSystem for an exact process and merges only creation-matched TIDs),
+    `process_connections.rs` (IP Helper
     owner-PID TCP/UDP tables, v4 + v6),
     `startup.rs` (Run keys + Startup folders + StartupApproved incl. the
     folder-subkey fix and best-effort publisher resolution), `services.rs`,
@@ -98,7 +100,9 @@ platform boundary (`tm-core` ← `tm-platform` ← `tm-app` / `tm-service`), and
     through a thread map seeded from ToolHelp and maintained by the
     `Microsoft-Windows-Kernel-Process` thread events; a request whose thread
     cannot be mapped is never charged to a row),
-    `core_service.rs` (versioned authenticated named-pipe broker, including bounded identity-bound process-security/token-identity/module reads for protected targets, plus secure
+    `core_service.rs` (versioned authenticated named-pipe broker, including
+    bounded identity-bound process-security/token-identity/module/thread-evidence
+    reads for protected targets, plus secure
     SCM/Program Files/ProgramData install lifecycle, including pinned
     reparse/hard-link-resistant owner/group/DACL repair), `autostart.rs` (owned-command-
     only HKCU startup migration), `taskmgr_replacement.rs` (owned IFEO

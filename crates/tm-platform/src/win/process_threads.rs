@@ -11,7 +11,9 @@
 //! record does carry `Win32StartAddress`, but current Windows 11 builds zero
 //! it (together with `StartAddress` and the stack bounds) for callers without
 //! SeDebugPrivilege — observed on 26300 — so it is only a fallback for an
-//! elevated session whose thread opens fail.
+//! elevated session whose thread opens fail. The action wrapper retries
+//! missing handle-derived evidence through the LocalSystem broker and merges
+//! it only when the process and thread creation identities match.
 
 use crate::actions::{ProcessThread, ProcessThreads, ThreadState};
 use crate::win::cpu_load::{
@@ -89,6 +91,10 @@ pub fn list_process_threads(
     pid: u32,
     expected_start_epoch_s: Option<i64>,
 ) -> Result<ProcessThreads> {
+    // Opening another user's or an elevated process's threads needs the
+    // caller's SeDebugPrivilege to be enabled even when the token owns it.
+    // This is best-effort for the ordinary GUI and effective in the broker.
+    super::process_ops::enable_debug_privilege();
     let mut buf = vec![0u8; 1024 * 1024];
     let written = CpuLoadAccountant::nt_query(&mut buf, SYSTEM_EXTENDED_PROCESS_INFORMATION)
         .ok_or_else(|| {

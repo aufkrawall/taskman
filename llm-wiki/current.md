@@ -775,7 +775,14 @@ rebase runbook.
   record's `Win32StartAddress`/`StartAddress`/stack bounds for callers
   without SeDebugPrivilege, so the start address is read per thread with
   `NtQueryInformationThread(ThreadQuerySetWin32StartAddress)` and shows
-  `module+offset` (no symbols). Thread activity distinguishes `Running`
+  `module+offset` (no symbols). The GUI first tries its own token; when a
+  start address or cycle counter is missing, the exact PID+creation-time-bound
+  protocol-v8 `ProcessThreadDetails` broker request retries the per-thread
+  handles as LocalSystem and merges evidence only when TID and thread creation
+  time match. This fills elevated targets such as Windows Task Manager while
+  protected threads may still remain unreadable. Start-address sorting uses
+  the numeric address, not the module+offset text, and the page counts partial
+  thread evidence above the table. Thread activity distinguishes `Running`
   (kernel state is Running), `Recent` (a counter advanced inside a continuous
   sampling window), `Idle ≥ 5 s` (no execution observed for at least
   `DORMANT_AFTER`), and `Observing` (the initial window or a reset after a

@@ -1,6 +1,6 @@
 # Protected Core Service
 
-Last cross-checked: 2026-09-24
+Last cross-checked: 2026-10-26
 
 Primary sources:
 
@@ -21,9 +21,10 @@ TaskMan uses a split-process design on Windows:
   (plain `Automatic`, not delayed: the broker must be ready as soon as the
   desktop is, because privileged actions are exactly what a user needs right
   after boot).
-  It owns a small allowlist of privileged controls and on-demand per-process
-  disk/network ETW counters. It does not render, parse arbitrary command lines,
-  choose output paths, or create dumps.
+  It owns a small allowlist of privileged controls, bounded read-only process
+  evidence (token, hardening, modules, and thread handles), and on-demand
+  per-process disk/network ETW counters. It does not render, parse arbitrary
+  command lines, choose output paths, or create dumps.
 - If the service is absent or genuinely unavailable, the GUI tries the same
   identity-checked operation under its own token. An explicit broker rejection
   never falls back, because that would turn a safety decision into permission.
@@ -36,7 +37,7 @@ contract.
 
 ## IPC and authorization
 
-- Protocol v7 uses `\\.\pipe\Taskman.Core.v1` with fixed 12-byte framed JSON.
+- Protocol v8 uses `\\.\pipe\Taskman.Core.v1` with fixed 12-byte framed JSON.
   Requests are capped at 64 KiB and responses at 512 KiB; unknown request
   fields are rejected.
 - The pipe rejects remote clients and uses first-instance creation to prevent
@@ -143,14 +144,18 @@ Allowlisted operations are process/tree termination, suspend/resume, priority,
 affinity, efficiency mode, UAC virtualization, guarded module unload, service
 control, user-session control, Task Manager replacement integration, and narrow
 read-only queries for network counters, process hardening state, token
-identity, and exact PID+creation-time-bound module inventory. Module inventory
-exists specifically so the pinned GUI can inspect SYSTEM/service processes
-without elevating the whole UI; it is capped by module count, aggregate text
-bytes, and the 512 KiB response frame. The token identity read serves the same
-goal for the User name / Elevated columns: it answers one bounded payload
-(account name, SID, elevation, UAC virtualization) for one PID bound to its
-sampled creation time. There is deliberately no generic Win32 call, shell
-command, file write, or dump path.
+identity, exact PID+creation-time-bound module inventory, and exact
+PID+creation-time-bound thread evidence. Module inventory exists specifically
+so the pinned GUI can inspect SYSTEM/service processes without elevating the
+whole UI; it is capped by module count, aggregate text bytes, and the 512 KiB
+response frame. The token identity read serves the same goal for the User name
+/ Elevated columns: it answers one bounded payload (account name, SID,
+elevation, UAC virtualization) for one PID bound to its sampled creation time.
+The thread-evidence read returns only TID, thread creation time, start address,
+and cycle counter for threads where at least one of those handle-derived values
+is readable. The GUI merges it only when both process and thread identities
+match its handle-free snapshot. There is deliberately no generic Win32 call,
+shell command, file write, or dump path.
 
 ### Read-only diagnostics endpoints
 
@@ -167,10 +172,17 @@ all and the User name / Elevated columns of those rows would otherwise stay
 blank. Protocol v7 splits the disk service time by physical disk (`disks` per
 entry, `disk_totals` per window) because Disk active time is now a per-disk
 share; its frame budget is two caps (`DISK_MAX_ENTRIES`,
-`DISK_MAX_DISK_TIMES`), pinned by `a_capped_disk_response_fits_the_frame_limit`. Both counter endpoints take no
+`DISK_MAX_DISK_TIMES`), pinned by `a_capped_disk_response_fits_the_frame_limit`.
+Protocol v8 adds `ProcessThreadDetails`, a read-only request for the
+handle-derived start address and cycle counter of each thread in one exact
+process. It is bounded to 4096 returned records and the normal 512 KiB frame,
+and it exists because an unelevated GUI cannot open elevated targets such as
+Windows Task Manager. Protected-process threads may still refuse even
+LocalSystem; missing values remain absent. The counter endpoints take no
 parameters, can change nothing, drain or prune server-side against the
 service's own idea of which PIDs are live, are capped per response, and stop
-their trace on an idle watchdog once the GUI stops polling. These reads are allowed for the same pinned GUI that already has
+their trace on an idle watchdog once the GUI stops polling. These reads are
+allowed for the same pinned GUI that already has
 stronger process-control capabilities, and they remain narrow rather than
 becoming a generic cross-session query interface. The original network decision
 was based on:

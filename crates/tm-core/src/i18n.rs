@@ -234,10 +234,14 @@ keys! {
         "{} Threads · {} laufend · {} kürzlich · {} ruhend · {} beobachtet",
         "{} threads · {} running · {} recent · {} idle · {} observing"
     ],
+    ThreadEvidencePartial => [
+        "Startadresse oder Zyklen für {} von {} Threads nicht verfügbar",
+        "Start address or cycles unavailable for {} of {} threads"
+    ],
     HideIdle => ["Ruhende ausblenden", "Hide idle"],
     ThreadStartAddressTip => [
-        "Die Startadresse benötigt Zugriff auf den Thread; für Prozesse anderer Benutzer ist dieser ohne Administratorrechte verweigert",
-        "The start address needs access to the thread, which is denied for other users' processes without administrator rights"
+        "Windows hat den Zugriff auf diesen Thread verweigert. TaskMan fragt den Core-Dienst, sofern verfügbar; geschützte Threads können weiterhin nicht lesbar sein",
+        "Windows denied access to this thread. TaskMan asks the core service when available; protected threads may remain unreadable"
     ],
     ThreadCpuPercentTip => [
         "Anteil an allen logischen Prozessoren.\nAktuelle Messung: {}\nDurchschnitt seit Öffnen der Seite: {}",

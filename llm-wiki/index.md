@@ -1,6 +1,6 @@
 # llm-wiki Index
 
-Last cross-checked: 2026-09-29 (installer + tm-ui crate addition)
+Last cross-checked: 2026-10-26 (thread evidence via core service)
 
 Primary sources:
 

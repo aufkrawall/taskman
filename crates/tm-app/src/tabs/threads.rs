@@ -553,7 +553,10 @@ fn compare(a: &View<'_>, b: &View<'_>, sort: SortColumn) -> Ordering {
             .unwrap_or(-1.0)
             .total_cmp(&b.row.cpu_pct.unwrap_or(-1.0)),
         SortColumn::CpuTime => cpu_100ns(&a.row.thread).cmp(&cpu_100ns(&b.row.thread)),
-        SortColumn::Start => tablekit::cmp_ignore_case(&a.start, &b.start),
+        // Sort the address itself, not the module+offset presentation. Names
+        // differ in length and alphabetic order bears no relation to address
+        // order once addresses span multiple modules.
+        SortColumn::Start => a.row.thread.start_address.cmp(&b.row.thread.start_address),
         SortColumn::Priority => a.row.thread.base_priority.cmp(&b.row.thread.base_priority),
         SortColumn::State => tablekit::cmp_ignore_case(&a.state, &b.state),
         SortColumn::Activity => a.row.activity.rank().cmp(&b.row.activity.rank()),
@@ -573,7 +576,11 @@ pub fn show(
     let mut recent = 0usize;
     let mut idle = 0usize;
     let mut observing = 0usize;
+    let mut unavailable_details = 0usize;
     for row in &state.rows {
+        if row.thread.start_address.is_none() || row.thread.cycles.is_none() {
+            unavailable_details += 1;
+        }
         match row.activity {
             Activity::Running => running += 1,
             Activity::Recent => recent += 1,
@@ -628,6 +635,20 @@ pub fn show(
     });
     if let Some(error) = state.error.as_deref() {
         ui.colored_label(pal.heat_high, error);
+    }
+    if state.loaded && unavailable_details > 0 {
+        ui.label(
+            egui::RichText::new(i18n::trf(
+                K::ThreadEvidencePartial,
+                &[
+                    &unavailable_details.to_string(),
+                    &state.rows.len().to_string(),
+                ],
+            ))
+            .small()
+            .color(pal.text_dim),
+        )
+        .on_hover_text(i18n::tr(K::ThreadStartAddressTip));
     }
     if !state.loaded {
         ui.horizontal(|ui| {
@@ -990,6 +1011,38 @@ mod tests {
         }];
         assert_eq!(symbolize(0x7FF8_0000_2C4D, &modules), "ntdll.dll+0x2C4D");
         assert_eq!(symbolize(0x7FF8_0020_0000, &modules), "0x7FF800200000");
+    }
+
+    #[test]
+    fn start_address_sort_uses_the_numeric_address_not_the_module_name() {
+        let mut numeric_low = thread(2, 1, 0, WAITING);
+        numeric_low.start_address = Some(0x2_000);
+        let mut numeric_high = thread(1, 1, 0, WAITING);
+        numeric_high.start_address = Some(0x10_000);
+        let row = |thread| ThreadRow {
+            thread,
+            cpu_pct: None,
+            avg_cpu_pct: None,
+            cycles_delta: None,
+            activity: Activity::Idle {
+                idle: DORMANT_AFTER,
+            },
+        };
+        let low = row(numeric_low);
+        let high = row(numeric_high);
+        fn view<'a>(row: &'a ThreadRow, start: &str) -> View<'a> {
+            View {
+                row,
+                start: start.to_string(),
+                priority: String::new(),
+                state: String::new(),
+            }
+        }
+        // The alphabetic presentation strings deliberately disagree with
+        // the numeric order.
+        let low = view(&low, "z.dll+0x0");
+        let high = view(&high, "a.dll+0x0");
+        assert_eq!(compare(&low, &high, SortColumn::Start), Ordering::Less);
     }
 
     #[test]
