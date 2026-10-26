@@ -1106,10 +1106,10 @@ fn row_ui(
     // status glyph under the cursor explains itself first; otherwise the
     // row's own explanation (e.g. unattributable CPU) applies.
     let resp = match (status_tip, net_tip, row.tooltip.clone(), name_tip) {
-        (Some(tip), _, _, _) => resp.on_hover_text(tip),
-        (None, Some(tip), _, _) => resp.on_hover_text(tip),
-        (None, None, Some(tip), _) => resp.on_hover_text(tip),
-        (None, None, None, Some(tip)) => resp.on_hover_text(tip),
+        (Some(tip), _, _, _) => resp.on_hover_text_at_pointer(tip),
+        (None, Some(tip), _, _) => resp.on_hover_text_at_pointer(tip),
+        (None, None, Some(tip), _) => resp.on_hover_text_at_pointer(tip),
+        (None, None, None, Some(tip)) => resp.on_hover_text_at_pointer(tip),
         (None, None, None, None) => resp,
     };
     // Pseudo-rows carry no killable process — no action menu at all.

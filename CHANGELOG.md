@@ -54,6 +54,9 @@
 
 ### Fixed
 
+- **Process row tooltips:** hover information on Processes and Details now
+  appears near the pointer instead of at the left edge of the row.
+
 - **False thread and module activity:** Ready, Standby, and DeferredReady
   threads no longer count as having executed. Activity observed across Paused
   mode, another properties tab, sleep, or another long sampling gap is now

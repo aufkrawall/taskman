@@ -1323,8 +1323,8 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
                 // the context menu does.
                 let unknown_tip = unknown_cell_tip(ui, table, rect, &visible_cols, row);
                 let resp = match (unknown_tip, truncated_tip) {
-                    (Some(tip), _) => resp.on_hover_text(tip),
-                    (None, Some(tip)) => resp.on_hover_text(tip),
+                    (Some(tip), _) => resp.on_hover_text_at_pointer(tip),
+                    (None, Some(tip)) => resp.on_hover_text_at_pointer(tip),
                     (None, None) => resp,
                 };
 
