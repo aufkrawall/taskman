@@ -793,10 +793,12 @@ rebase runbook.
   tooltip also carries kernel/user CPU and cycle details. The Modules page
   reports **origin-thread activity** only: threads whose START address lies
   in that module. It explicitly distinguishes Running/Recent/Idle/Observing,
-  zero own threads, missing start-address evidence, a loading thread list and
+  no origin threads, missing start-address evidence, a loading thread list and
   an unavailable thread list. It never claims that all module code is idle or
-  active, and module/thread sample ages are displayed separately. The Modules
-  page is no longer a separate dialog or
+  active, and module/thread sample ages are displayed separately. The count
+  is labelled "threads started here": an injected hook/overlay DLL can
+  correctly show zero while its code runs on existing game or render threads.
+  The Modules page is no longer a separate dialog or
   context-menu entry. The pages have no Refresh buttons: they re-query at the
   update speed (floors: Threads 1 s, Modules/Network 2 s, Services 5 s),
   freeze while Paused, and F5 inside the dialog refreshes the open page plus

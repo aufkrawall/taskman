@@ -169,10 +169,14 @@ dropped) is what the user sees; permanently pinned or re-loaded modules stay.
 - Module activity is deliberately scoped to threads whose START address lies
   in the module. It is not module-code CPU: a thread can execute code from
   many modules, runtime/JIT threads may not map to the application DLL, and a
-  module that starts no thread shows “No own threads.” True module execution
+  module that starts no thread shows “None started here.” True module execution
   or CPU attribution would require sampled instruction pointers/stacks (for
   example an elevated ETW profiling session), remains unavailable for some
   protected targets, and would be a sampled estimate rather than a total.
+  Injected hooks are the common case: RTSS's `rtsshooks64.dll` can be loaded
+  and executing on D3D render threads while legitimately showing zero threads
+  started inside it. The UI now says "Threads started here" and explains this
+  distinction rather than implying that the module has no threads using it.
 
 ## Keyboard accessibility accepted limitations (2026-09-25)
 

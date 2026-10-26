@@ -188,10 +188,10 @@ keys! {
     ColThreadState => ["Zustand", "State"],
     ColActivity => ["Aktivität", "Activity"],
     ColOriginThreadActivity => [
-        "Aktivität der Start-Threads",
-        "Origin-thread activity"
+        "Aktivität hier gestarteter Threads",
+        "Started-thread activity"
     ],
-    ColOriginThreadCount => ["Eigene Threads", "Own threads"],
+    ColOriginThreadCount => ["Hier gestartete Threads", "Threads started here"],
     ColThreadCount => ["Threads", "Threads"],
     ThreadStateInitialized => ["Initialisiert", "Initialized"],
     ThreadStateReady => ["Bereit", "Ready"],
@@ -257,17 +257,17 @@ keys! {
         "Paused · sampled {} s ago"
     ],
     ModuleActivityTip => [
-        "Dies beschreibt Threads, deren Startadresse in diesem Modul liegt. Es beweist nicht, dass der Modulcode derzeit ausgeführt wird",
-        "This describes threads whose start address lies in this module. It does not prove that the module's code is executing"
+        "Dies beschreibt nur Threads, die in diesem Modul erzeugt wurden. Ein geladenes Hook- oder Overlay-Modul kann 0 Start-Threads haben, während sein Code auf Spiel- oder Render-Threads läuft",
+        "This covers only threads created in this module. A loaded hook or overlay DLL can show 0 threads started here while its code runs on game or render threads"
     ],
     OriginThreadActivityHelp => [
-        "Die Aktivität bezieht sich nur auf Threads, die in diesem Modul gestartet wurden; Modulcode kann auf Threads anderer Module laufen",
-        "Activity covers only threads started in this module; module code may execute on other modules' threads"
+        "Gezählt werden nur Threads, die in diesem Modul gestartet wurden. Injizierte Hooks und Overlays laufen typischerweise auf vorhandenen Spiel- oder Render-Threads",
+        "Only threads started in this module are counted. Injected hooks and overlays typically execute on existing game or render threads"
     ],
     ModuleThreadsLoading => ["Wird geladen", "Loading"],
     ModuleThreadsUnavailable => ["Nicht verfügbar", "Unavailable"],
     ModuleActivityUnknown => ["Unbekannt", "Unknown"],
-    ModuleNoOwnThreads => ["Keine eigenen Threads", "No own threads"],
+    ModuleNoOwnThreads => ["Keiner hier gestartet", "None started here"],
     ModuleThreadsLoadingTip => [
         "Die Threadliste wird noch geladen; daher ist noch keine Modulzuordnung möglich",
         "The thread list is still loading, so module attribution is not available yet"
@@ -293,8 +293,8 @@ keys! {
         "No execution was observed for every known thread started in this module during at least the displayed interval. Module code running on other threads is not covered"
     ],
     ModuleNoThreadsTip => [
-        "In diesem Modul startet kein Thread; die Aktivität eigener Threads ist daher nicht anwendbar. Modulcode kann auf Threads anderer Module laufen",
-        "No thread starts in this module, so own-thread activity does not apply. Module code may run on other modules' threads"
+        "Dieses Modul ist geladen, aber in ihm wurde kein Thread gestartet. Das ist bei injizierten Hooks und Overlays normal; ihr Code läuft auf vorhandenen Threads",
+        "This module is loaded, but no thread was started in it. This is normal for injected hooks and overlays; their code runs on existing threads"
     ],
     ThreadActivityUnavailable => [
         "Threadaktivität nicht verfügbar: {}",

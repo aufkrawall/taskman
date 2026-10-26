@@ -1,3 +1,17 @@
+- 2026-10-26 (user report — RTSS overlay module has zero threads): the user
+  observed `rtsshooks64.dll` loaded into `csrt8x8.exe` with an active D3D11
+  overlay but a zero module thread count. This is correct under the Modules
+  page's contract, not missing collection: it counts threads whose START
+  address lies inside the module. RTSS hooks execute on existing game/render
+  threads, and injection helper threads start in loader routines rather than
+  the injected DLL. The UI wording had invited the wrong interpretation, so
+  the columns now read "Threads started here" and "Started-thread activity";
+  the no-origin-thread state says "None started here" and the page/tooltips
+  explicitly explain injected hooks and overlays. A named regression test
+  keeps a running render thread from being mistaken for an origin thread of
+  the hook DLL. True "module code is executing/using CPU" attribution still
+  requires sampled instruction pointers/stacks and remains documented debt.
+
 - 2026-10-26 (user report — blank Task Manager thread start addresses): the
   installed, unelevated GUI showed every `taskmgr.exe` thread with "—" in
   Start address even though TaskmanCore was running. Root cause: the page got

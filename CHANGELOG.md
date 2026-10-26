@@ -14,6 +14,11 @@
   handle-free local read as a fallback when the service is unavailable. The
   core service protocol moves to v8, so the service and app must be updated
   together.
+- **Injected overlay module semantics:** The Modules page now labels its count
+  as threads started in the module and explains that a loaded hook or overlay
+  DLL, such as RTSS's `rtsshooks64.dll`, can correctly show zero. Those DLLs
+  execute on existing game/render threads rather than creating threads that
+  start inside the injected module.
 - **Thread and module activity reporting:** Process Properties now distinguishes
   threads that are currently running, ran recently, are provably idle, or are
   still being observed. The Threads page shows cumulative CPU time plus

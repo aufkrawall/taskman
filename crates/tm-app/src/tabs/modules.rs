@@ -9,7 +9,9 @@
 //! Each module also shows activity for the threads that START in it (see
 //! `tabs::threads`). A module's code mostly runs on other modules' threads,
 //! so this is deliberately labelled origin-thread activity; a module that
-//! starts no thread is reported as having no own threads, not as idle.
+//! starts no thread is reported as having no origin threads, not as idle.
+//! This is normal for injected hook/overlay DLLs, which execute on existing
+//! game or render threads.
 
 use eframe::egui;
 use std::cmp::Ordering;
@@ -813,8 +815,8 @@ pub fn show(
                 TmColumn::text("name", i18n::tr(K::ColName), 180.0),
                 TmColumn::num("base", i18n::tr(K::ColBaseAddress), 150.0),
                 TmColumn::num("size", i18n::tr(K::ColSize), 100.0),
-                TmColumn::num("threads", i18n::tr(K::ColOriginThreadCount), 110.0),
-                TmColumn::text("activity", i18n::tr(K::ColOriginThreadActivity), 160.0),
+                TmColumn::num("threads", i18n::tr(K::ColOriginThreadCount), 170.0),
+                TmColumn::text("activity", i18n::tr(K::ColOriginThreadActivity), 190.0),
                 TmColumn::text("path", i18n::tr(K::ColPath), 360.0),
             ];
             let mut table = app
@@ -1238,6 +1240,18 @@ mod tests {
         assert_eq!(
             module_activity(&dll, ready(&threads)).1,
             ModuleActivity::Recent
+        );
+    }
+
+    #[test]
+    fn injected_hook_without_origin_threads_is_loaded_not_idle_or_active() {
+        // RTSS and similar overlays hook existing render threads. The DLL is
+        // loaded, but no thread was created with a start address inside it.
+        let hooks = module("rtsshooks64.dll", 0x1000, 0x1000);
+        let render_thread = [thread_row(1, Some(0x9000), Activity::Running)];
+        assert_eq!(
+            module_activity(&hooks, ready(&render_thread)),
+            (Some((0, false)), ModuleActivity::NoThreads)
         );
     }
 
