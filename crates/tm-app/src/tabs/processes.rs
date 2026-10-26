@@ -69,6 +69,7 @@ fn columns(value_order: &[usize]) -> Vec<TmColumn> {
 /// Flattened display row — group headers and process rows share one fixed
 /// height so `show_rows` can virtualize the whole list.
 #[derive(Debug, Clone)]
+#[allow(clippy::large_enum_variant)]
 pub enum DisplayRow {
     /// Group index (0=Apps 1=Background 2=Windows) + the native-style group
     /// count, computed before flattening so expansion state cannot change it.
