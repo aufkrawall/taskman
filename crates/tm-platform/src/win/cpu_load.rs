@@ -591,6 +591,19 @@ impl CpuLoadAccountant {
     }
 }
 
+/// Creation time of one exact PID from a fresh native process-table query.
+///
+/// The protected-process module fallback cannot use `OpenProcess` for its
+/// identity check. `NtQuerySystemInformation(SystemProcessInformation)` still
+/// names every process and carries its creation FILETIME, so this is the
+/// handle-free identity authority used before returning cached ETW modules.
+pub(crate) fn current_creation_epoch(pid: u32) -> Option<i64> {
+    let mut accountant = CpuLoadAccountant::new();
+    let procs = accountant.query_procs()?;
+    let raw = procs.get(&pid)?;
+    filetime_to_unix_seconds(raw.create_time)
+}
+
 /// Sum of the three `IO_COUNTERS` operation counts, or `None` when this
 /// record does not reach the block.
 ///
@@ -1482,6 +1495,24 @@ mod tests {
                 p.name
             );
         }
+    }
+
+    /// The protected-process module fallback needs an identity check before
+    /// any CPU delta window exists. Reusing `sample()` here returned `None` on
+    /// its first call forever, so every protected module request was rejected.
+    #[test]
+    fn fresh_creation_identity_does_not_require_a_cpu_delta_window() {
+        let pid = std::process::id();
+        let mut acc = CpuLoadAccountant::new();
+        let procs = acc.query_procs().expect("NtQuerySystemInformation");
+        let expected = filetime_to_unix_seconds(
+            procs
+                .get(&pid)
+                .expect("own process in kernel table")
+                .create_time,
+        )
+        .expect("own creation time");
+        assert_eq!(current_creation_epoch(pid), Some(expected));
     }
 
     #[test]

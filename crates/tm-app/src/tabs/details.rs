@@ -3984,7 +3984,12 @@ pub fn process_properties_dialog(app: &mut TaskManApp, ctx: &egui::Context) {
     match dialog.tab {
         ProcessPropertiesTab::Threads | ProcessPropertiesTab::Modules => {
             crate::tabs::threads::tick(&mut dialog.threads, app, ctx, &identity);
-            crate::tabs::modules::tick(app, &mut dialog.modules, ctx);
+            crate::tabs::modules::tick(
+                app,
+                &mut dialog.modules,
+                dialog.tab == ProcessPropertiesTab::Modules,
+                ctx,
+            );
         }
         ProcessPropertiesTab::Network => {
             crate::tabs::connections::tick(&mut dialog.network, app, ctx, &identity)

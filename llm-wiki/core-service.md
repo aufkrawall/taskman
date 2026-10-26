@@ -22,8 +22,9 @@ TaskMan uses a split-process design on Windows:
   desktop is, because privileged actions are exactly what a user needs right
   after boot).
   It owns a small allowlist of privileged controls, bounded read-only process
-  evidence (token, hardening, modules, and thread handles), and on-demand
-  per-process disk/network ETW counters. It does not render, parse arbitrary
+  evidence (token, hardening, modules, sampled module execution, and thread
+  handles), protected loader rundown, and on-demand per-process
+  disk/network/profile ETW counters. It does not render, parse arbitrary
   command lines, choose output paths, or create dumps.
 - If the service is absent or genuinely unavailable, the GUI tries the same
   identity-checked operation under its own token. An explicit broker rejection
@@ -37,7 +38,7 @@ contract.
 
 ## IPC and authorization
 
-- Protocol v8 uses `\\.\pipe\Taskman.Core.v1` with fixed 12-byte framed JSON.
+- Protocol v9 uses `\\.\pipe\Taskman.Core.v1` with fixed 12-byte framed JSON.
   Requests are capped at 64 KiB and responses at 512 KiB; unknown request
   fields are rejected.
 - The pipe rejects remote clients and uses first-instance creation to prevent
@@ -144,11 +145,14 @@ Allowlisted operations are process/tree termination, suspend/resume, priority,
 affinity, efficiency mode, UAC virtualization, guarded module unload, service
 control, user-session control, Task Manager replacement integration, and narrow
 read-only queries for network counters, process hardening state, token
-identity, exact PID+creation-time-bound module inventory, and exact
-PID+creation-time-bound thread evidence. Module inventory exists specifically
-so the pinned GUI can inspect SYSTEM/service processes without elevating the
-whole UI; it is capped by module count, aggregate text bytes, and the 512 KiB
-response frame. The token identity read serves the same goal for the User name
+identity, exact PID+creation-time-bound module inventory and sampled module
+execution, and exact PID+creation-time-bound thread evidence. Module inventory
+exists specifically so the pinned GUI can inspect SYSTEM/service and protected
+processes without elevating the whole UI; it is capped by module count,
+aggregate text bytes, and the 512 KiB response frame. The sampled-module read
+returns only module bases plus bounded counts and completeness fields after
+an exact identity check; it carries no instruction pointers or stacks. The
+token identity read serves the same goal for the User name
 / Elevated columns: it answers one bounded payload (account name, SID,
 elevation, UAC virtualization) for one PID bound to its sampled creation time.
 The thread-evidence read returns only TID, thread creation time, start address,
@@ -173,19 +177,28 @@ blank. Protocol v7 splits the disk service time by physical disk (`disks` per
 entry, `disk_totals` per window) because Disk active time is now a per-disk
 share; its frame budget is two caps (`DISK_MAX_ENTRIES`,
 `DISK_MAX_DISK_TIMES`), pinned by `a_capped_disk_response_fits_the_frame_limit`.
-Protocol v8 adds `ProcessThreadDetails`, a read-only request for the
+Protocol v8 introduced `ProcessThreadDetails`, a read-only request for the
 handle-derived start address and cycle counter of each thread in one exact
 process. It is bounded to 4096 returned records and the normal 512 KiB frame,
 and it exists because an unelevated GUI cannot open elevated targets such as
 Windows Task Manager. Protected-process threads may still refuse even
-LocalSystem; missing values remain absent. The counter endpoints take no
-parameters, can change nothing, drain or prune server-side against the
-service's own idea of which PIDs are live, are capped per response, and stop
-their trace on an idle watchdog once the GUI stops polling. These reads are
-allowed for the same pinned GUI that already has
-stronger process-control capabilities, and they remain narrow rather than
-becoming a generic cross-session query interface. The original network decision
-was based on:
+LocalSystem; missing values remain absent. Protocol v9 adds
+`ProcessModuleCodeSamples`, a read-only drain of one privileged
+system-profile window for one exact PID + creation time. It returns sample
+counts only for current module ranges, plus decoded/lost/tracked-thread
+completeness evidence; it never returns instruction pointers, stacks, or path
+contents. The same v9 service path also serves protected module inventory
+through kernel loader events when ToolHelp is denied. It decodes known
+Image_Load versions 1–3 plus the load-only version-0 layout, and rejects ETW
+loss or a target-record decode failure that could make the rundown partial.
+Unknown future versions stay unavailable. The counter
+endpoints take no parameters, can change nothing, drain or prune server-side
+against the service's own idea of which PIDs are live, are capped per
+response, and stop their trace on an idle watchdog once the GUI stops polling.
+These reads are allowed for the same pinned GUI that already has stronger
+process-control capabilities, and they remain narrow rather than becoming a
+generic cross-session query interface. The original network decision was
+based on:
 
 - Per-process network bytes come from an ETW session, which Windows grants only
   to administrators. Keeping it GUI-side meant the whole GUI had to run
@@ -196,9 +209,10 @@ was based on:
   re-affinitize and unload modules from arbitrary processes including other
   users'. Reading a byte counter for those processes is strictly less powerful
   than killing them.
-- The response is a bounded aggregate: a pid and two counters, no paths, no
-  content, no command lines. It is the only request that can change nothing,
-  and so the only one that skips `checked_target`.
+- The network response is a bounded aggregate: a pid and two counters, no
+  paths, content, or command lines. Read-only endpoints can change nothing;
+  each still has its own exact-identity and bounded-payload contract rather
+  than becoming a generic cross-session query.
 
 Constraints that keep it honest:
 

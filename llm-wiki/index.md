@@ -1,6 +1,6 @@
 # llm-wiki Index
 
-Last cross-checked: 2026-10-26 (thread evidence + overlay module semantics)
+Last cross-checked: 2026-10-26 (thread/module evidence, protected rundown)
 
 Primary sources:
 

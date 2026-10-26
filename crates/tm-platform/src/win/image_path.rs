@@ -158,6 +158,18 @@ fn device_map() -> Vec<(String, String)> {
     out
 }
 
+/// Translate an NT image path reported by ETW into the same DOS form the
+/// process/module UI uses.
+///
+/// The volume map is process-global for this path: ETW can report thousands
+/// of image events, and querying 26 DOS devices for each one would turn the
+/// loader stream into its own performance problem. A newly mounted volume that
+/// is not in the map remains a readable NT path, never a dropped module.
+pub(crate) fn etw_dos_path(nt_path: &str) -> String {
+    static DEVICES: std::sync::OnceLock<Vec<(String, String)>> = std::sync::OnceLock::new();
+    dos_path(nt_path, DEVICES.get_or_init(device_map).as_slice())
+}
+
 /// Cached image paths for the processes no handle can be opened for.
 ///
 /// Two caches, because both answers are expensive in different ways: the path

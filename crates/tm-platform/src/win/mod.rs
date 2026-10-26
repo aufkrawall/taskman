@@ -16,6 +16,7 @@ mod image_path;
 pub mod instance;
 pub mod locale;
 pub mod memory_info;
+mod module_etw;
 mod net_etw;
 mod net_info;
 
@@ -38,10 +39,24 @@ pub fn disk_etw_test_start() -> Option<disk_etw::DiskUsage> {
 pub fn live_pids_for_test() -> std::collections::HashSet<u32> {
     core_service::live_pids_for_test()
 }
+
+/// Stop every ETW session this process owns. Panic cleanup and the normal GUI
+/// and service shutdown paths call this because ETW sessions are kernel
+/// objects and process termination does not run static destructors.
+#[doc(hidden)]
+pub fn stop_live_etw_sessions() {
+    etw::stop_live_sessions();
+}
+
+#[doc(hidden)]
+pub fn module_etw_test_running() -> bool {
+    module_etw::trace_is_running()
+}
 mod perfcounters;
 mod process_connections;
 mod process_ops;
 mod process_threads;
+mod profile_etw;
 pub use process_ops::{
     ProcessMachineType, ProcessProtectionLevel, ProcessSecurityInfo, command_line_of,
     enable_debug_privilege,
@@ -328,6 +343,35 @@ fn set_sampler_background(background: bool) {
 #[derive(Default)]
 pub struct WinActions;
 
+/// Prefer the loader's direct module snapshot; when a protected process
+/// refuses it, use the privileged kernel image rundown. The original access
+/// error is returned until that rundown has a complete snapshot, never an
+/// empty module list.
+fn list_process_modules_with_fallback(
+    role: etw::TraceRole,
+    pid: u32,
+    expected_start_epoch_s: Option<i64>,
+) -> Result<Vec<ProcessModule>> {
+    let original = process_ops::list_process_modules(pid, expected_start_epoch_s);
+    match original {
+        Ok(modules) => Ok(modules),
+        Err(original_error) => {
+            let Some(start_epoch_s) = expected_start_epoch_s.filter(|value| *value > 0) else {
+                return Err(original_error);
+            };
+            match module_etw::protected_process_modules(role, pid, start_epoch_s) {
+                Ok(module_etw::ModuleRundown::Ready(modules)) => Ok(modules),
+                Ok(module_etw::ModuleRundown::Pending) => Err(tm_core::TmError::platform(
+                    "process modules",
+                    "direct access is protected; collecting a privileged loader rundown",
+                )),
+                Ok(module_etw::ModuleRundown::Unavailable) => Err(original_error),
+                Err(identity_error) => Err(identity_error),
+            }
+        }
+    }
+}
+
 impl PlatformActions for WinActions {
     fn capabilities(&self) -> Capabilities {
         Capabilities {
@@ -457,7 +501,22 @@ impl PlatformActions for WinActions {
         pid: u32,
         expected_start_epoch_s: Option<i64>,
     ) -> Result<Vec<ProcessModule>> {
-        process_ops::list_process_modules(pid, expected_start_epoch_s)
+        list_process_modules_with_fallback(etw::TraceRole::App, pid, expected_start_epoch_s)
+    }
+    fn process_module_code_samples(
+        &self,
+        pid: u32,
+        expected_start_epoch_s: Option<i64>,
+    ) -> Result<Option<ProcessModuleCodeWindow>> {
+        let Some(start_epoch_s) = expected_start_epoch_s.filter(|value| *value > 0) else {
+            return Err(tm_core::TmError::platform(
+                "module code samples",
+                "a valid sampled process creation time is required",
+            ));
+        };
+        let modules =
+            list_process_modules_with_fallback(etw::TraceRole::App, pid, Some(start_epoch_s))?;
+        profile_etw::sample_process_module_code(etw::TraceRole::App, pid, start_epoch_s, &modules)
     }
     fn list_process_threads(
         &self,

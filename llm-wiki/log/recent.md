@@ -1,3 +1,45 @@
+## 2026-10-26 — sampled module execution, protected modules, thread search
+
+- The Modules page gained on-demand sampled instruction-pointer attribution
+  (`profile_etw.rs`, protocol v9 `ProcessModuleCodeSamples`) so injected hooks
+  such as RTSS can show executing code independently of origin threads.
+  Samples are page-bucketed against exact process module ranges; ETW loss,
+  unknown loss, missing target threads, decode failure, and page-budget
+  overflow remain explicit unavailable/lower-bound states. The sampled-profile
+  MOF type is read from `EVENT_DESCRIPTOR.Opcode` (46), not the manifest-only
+  `Id`, and a regression test pins that routing. The first elevated live probe
+  failed to enable `SystemProfileProviderGuid` with
+  `ERROR_PRIVILEGE_NOT_HELD` (1314); the session now explicitly enables
+  `SeSystemProfilePrivilege` before `StartTrace` and provider enablement. A
+  rerun decoded 448 real profile records with zero reported loss and
+  attributed samples to the target process.
+- Protected module inventory now falls back to a LocalSystem
+  `SYSTEM_PROCESS_KW_LOADER` session (`module_etw.rs`) when ToolHelp/PEB access
+  is denied, covering targets such as `csrss.exe`. The decoder accepts the
+  load-only v0 layout (using its event-header PID) and the compact v1/full
+  v2/v3 layouts used on current Windows; unknown versions fail closed.
+  Non-target records are filtered before path decoding, because decoding every
+  system-wide path delayed the rundown. Records are converted from NT device
+  paths and exposed only after the initial rundown settles with no target
+  decode failure and a queryable zero ETW loss count. A fresh
+  handle-free creation-time query fixes the first fallback request: it had
+  incorrectly reused the CPU accountant's first `sample()` call, which always
+  returns `None` before a delta window exists. The demand-only loader session
+  now uses the larger system-provider buffer set because its initial
+  system-wide `DCStart` burst can exceed the sparse session ceiling. An
+  elevated live probe returned the complete 23-module `csrss.exe` list,
+  including `ntdll.dll`.
+- The Threads page now has the Modules-style live filter, matching decimal/hex
+  TIDs, hex start addresses, module name/path, `module+offset`, priority, state,
+  activity, CPU percentage, and CPU time. The filter test builds its text
+  through the production `view_for` path rather than duplicating that string.
+- Profile and protected-module sessions have fixed crash-recoverable names,
+  idle watchdogs, frame/entry bounds, and explicit normal-shutdown teardown.
+  The live ETW probes are compiled and run as ignored diagnostics. The medium
+  shell proves the privilege boundary and the elevated App-role probes pass;
+  the LocalSystem service role remains to be exercised after the installed v9
+  service is updated.
+
 - 2026-10-26 (user report — RTSS overlay module has zero threads): the user
   observed `rtsshooks64.dll` loaded into `csrt8x8.exe` with an active D3D11
   overlay but a zero module thread count. This is correct under the Modules
@@ -9,8 +51,8 @@
   the no-origin-thread state says "None started here" and the page/tooltips
   explicitly explain injected hooks and overlays. A named regression test
   keeps a running render thread from being mistaken for an origin thread of
-  the hook DLL. True "module code is executing/using CPU" attribution still
-  requires sampled instruction pointers/stacks and remains documented debt.
+  the hook DLL. The gap for sampled executing-module evidence is closed by
+  the profile/v9 work above; exact CPU-time attribution remains out of scope.
 
 - 2026-10-26 (user report — blank Task Manager thread start addresses): the
   installed, unelevated GUI showed every `taskmgr.exe` thread with "—" in

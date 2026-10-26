@@ -20,7 +20,9 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tm_core::format;
 use tm_core::i18n::{self, K};
-use tm_platform::actions::{MODULE_UNLOAD_SINGLE_RELEASE_MARKER, PlatformActions, ProcessModule};
+use tm_platform::actions::{
+    MODULE_UNLOAD_SINGLE_RELEASE_MARKER, PlatformActions, ProcessModule, ProcessModuleCodeWindow,
+};
 
 use crate::app::{InFlight, ProcessIdentity, TaskManApp};
 use crate::search;
@@ -41,6 +43,62 @@ enum LoadState {
     Error(String),
 }
 
+#[derive(Debug, Clone)]
+enum CodeSamplesState {
+    Loading,
+    Ready(ProcessModuleCodeWindow),
+    Unavailable(Option<String>),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct CodeSampleCell {
+    samples: u64,
+    approximate: bool,
+    share_pct: Option<f32>,
+}
+
+impl CodeSamplesState {
+    fn sample_stream_ready(&self) -> bool {
+        matches!(
+            self,
+            Self::Ready(window)
+                if window.events_seen > 0
+                    && window.events_decoded > 0
+                    && window.tracked_threads > 0
+        )
+    }
+
+    fn cell(&self, module_base: u64) -> Option<CodeSampleCell> {
+        let Self::Ready(window) = self else {
+            return None;
+        };
+        if !self.sample_stream_ready() {
+            return None;
+        }
+        let samples = window
+            .modules
+            .iter()
+            .find(|entry| entry.base_address == module_base)
+            .map_or(0, |entry| entry.samples);
+        let approximate = window.events_lost != Some(0);
+        // With unknown sampling completeness, zero is not evidence of a
+        // measured idle window; a positive count remains a valid lower bound.
+        if approximate && samples == 0 {
+            return None;
+        }
+        let share_pct = if window.target_samples == 0 {
+            Some(0.0)
+        } else {
+            Some((samples as f64 * 100.0 / window.target_samples as f64) as f32)
+        };
+        Some(CodeSampleCell {
+            samples,
+            approximate,
+            share_pct,
+        })
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SortColumn {
     Name,
@@ -48,17 +106,21 @@ enum SortColumn {
     Size,
     Threads,
     Activity,
+    Samples,
+    SampleShare,
     Path,
 }
 
 impl SortColumn {
     /// Display order of the columns.
-    const ALL: [Self; 6] = [
+    const ALL: [Self; 8] = [
         Self::Name,
         Self::Base,
         Self::Size,
         Self::Threads,
         Self::Activity,
+        Self::Samples,
+        Self::SampleShare,
         Self::Path,
     ];
 
@@ -69,6 +131,8 @@ impl SortColumn {
             Self::Size => "size",
             Self::Threads => "threads",
             Self::Activity => "activity",
+            Self::Samples => "code_samples",
+            Self::SampleShare => "sample_share",
             Self::Path => "path",
         }
     }
@@ -223,6 +287,7 @@ pub struct State {
     selected_base: Option<u64>,
     scroll_to_base: Option<u64>,
     load: Arc<Mutex<LoadState>>,
+    code_samples: Arc<Mutex<CodeSamplesState>>,
     /// Why the newest background refresh failed while an older list is still
     /// shown. The list stays: a transient enumeration failure must not blank
     /// a page the user is reading.
@@ -231,6 +296,7 @@ pub struct State {
     /// position when it changes.
     generation: Arc<AtomicU64>,
     sampled_at: Arc<Mutex<Option<Instant>>>,
+    code_sampled_at: Arc<Mutex<Option<Instant>>>,
     drawn_generation: u64,
     fetch: InFlight,
     pace: Pace,
@@ -267,9 +333,11 @@ impl State {
             selected_base: None,
             scroll_to_base: None,
             load: Arc::new(Mutex::new(LoadState::Loading)),
+            code_samples: Arc::new(Mutex::new(CodeSamplesState::Loading)),
             stale: Arc::new(Mutex::new(None)),
             generation: Arc::new(AtomicU64::new(0)),
             sampled_at: Arc::new(Mutex::new(None)),
+            code_sampled_at: Arc::new(Mutex::new(None)),
             drawn_generation: 0,
             fetch: InFlight::default(),
             pace: Pace::default(),
@@ -306,10 +374,18 @@ impl State {
     pub fn sampled_at(&self) -> Option<Instant> {
         *tm_core::sync::lock(&self.sampled_at)
     }
+
+    fn code_samples(&self) -> CodeSamplesState {
+        tm_core::sync::lock(&self.code_samples).clone()
+    }
+
+    fn code_sampled_at(&self) -> Option<Instant> {
+        *tm_core::sync::lock(&self.code_sampled_at)
+    }
 }
 
 /// Keep the list current while a page that reads it is on screen.
-pub fn tick(app: &TaskManApp, state: &mut State, ctx: &egui::Context) {
+pub fn tick(app: &TaskManApp, state: &mut State, profile_visible: bool, ctx: &egui::Context) {
     if !app.actions.capabilities().process_modules {
         return;
     }
@@ -321,7 +397,7 @@ pub fn tick(app: &TaskManApp, state: &mut State, ctx: &egui::Context) {
     let every = inspector::page_interval(app.shared.settings.update_speed, REFRESH_FLOOR);
     // An unload refreshes the list itself between its releases.
     if !state.unloading() && state.pace.due(Instant::now(), every) {
-        begin_fetch(state, app.actions.clone(), ctx);
+        begin_fetch(state, app.actions.clone(), profile_visible, ctx);
     }
     if let Some(every) = every {
         ctx.request_repaint_after(every);
@@ -345,7 +421,12 @@ fn merge_fetch(load: &mut LoadState, result: Result<Vec<ProcessModule>, String>)
     }
 }
 
-fn begin_fetch(state: &mut State, actions: Arc<dyn PlatformActions>, ctx: &egui::Context) {
+fn begin_fetch(
+    state: &mut State,
+    actions: Arc<dyn PlatformActions>,
+    profile_visible: bool,
+    ctx: &egui::Context,
+) {
     // The load Arc is shared by both workers. Never let a refresh race an
     // unload's mandatory post-action refresh and overwrite newer state.
     if state.unloading() || !state.fetch.begin() {
@@ -353,9 +434,11 @@ fn begin_fetch(state: &mut State, actions: Arc<dyn PlatformActions>, ctx: &egui:
     }
     state.pace.mark_started(Instant::now());
     let load = state.load.clone();
+    let code_samples = state.code_samples.clone();
     let stale = state.stale.clone();
     let generation = state.generation.clone();
     let sampled_at = state.sampled_at.clone();
+    let code_sampled_at = state.code_sampled_at.clone();
     let identity = state.identity.clone();
     let in_flight = state.fetch.clone();
     let wake = ctx.clone();
@@ -367,11 +450,36 @@ fn begin_fetch(state: &mut State, actions: Arc<dyn PlatformActions>, ctx: &egui:
                 .list_process_modules(identity.pid, identity.start_epoch_s)
                 .map_err(|error| error.to_string());
             let ok = result.is_ok();
+            // The sample request performs its own identity-bound module read.
+            // Do not issue a second broker query while the inventory is still
+            // pending or unavailable (notably the first csrss rundown).
+            let code_result = (profile_visible && ok).then(|| {
+                actions
+                    .process_module_code_samples(identity.pid, identity.start_epoch_s)
+                    .map_err(|error| error.to_string())
+            });
             let notice = merge_fetch(&mut tm_core::sync::lock(&load), result);
             *tm_core::sync::lock(&stale) = notice;
             if ok {
                 *tm_core::sync::lock(&sampled_at) = Some(sampled);
                 generation.fetch_add(1, AtomicOrdering::Relaxed);
+            }
+            if let Some(code_result) = code_result {
+                match code_result {
+                    Ok(Some(window)) => {
+                        *tm_core::sync::lock(&code_samples) = CodeSamplesState::Ready(window);
+                        *tm_core::sync::lock(&code_sampled_at) = Some(Instant::now());
+                    }
+                    Ok(None) => {
+                        *tm_core::sync::lock(&code_samples) = CodeSamplesState::Unavailable(None);
+                        *tm_core::sync::lock(&code_sampled_at) = None;
+                    }
+                    Err(error) => {
+                        *tm_core::sync::lock(&code_samples) =
+                            CodeSamplesState::Unavailable(Some(error));
+                        *tm_core::sync::lock(&code_sampled_at) = None;
+                    }
+                }
             }
             in_flight.end();
             wake.request_repaint();
@@ -383,6 +491,11 @@ fn begin_fetch(state: &mut State, actions: Arc<dyn PlatformActions>, ctx: &egui:
             Err(error.to_string()),
         );
         *tm_core::sync::lock(&state.stale) = notice;
+        if profile_visible {
+            *tm_core::sync::lock(&state.code_samples) =
+                CodeSamplesState::Unavailable(Some(error.to_string()));
+            *tm_core::sync::lock(&state.code_sampled_at) = None;
+        }
     }
 }
 
@@ -563,8 +676,11 @@ fn compare_modules(a: &ProcessModule, b: &ProcessModule, sort: SortColumn) -> Or
         SortColumn::Base => a.base_address.cmp(&b.base_address),
         SortColumn::Size => a.size_bytes.cmp(&b.size_bytes),
         SortColumn::Path => tablekit::cmp_ignore_case(&a.path, &b.path),
-        // Thread-derived columns are ordered by `compare_rows`.
-        SortColumn::Threads | SortColumn::Activity => Ordering::Equal,
+        // Evidence-derived columns are ordered by `compare_rows`.
+        SortColumn::Threads
+        | SortColumn::Activity
+        | SortColumn::Samples
+        | SortColumn::SampleShare => Ordering::Equal,
     };
     primary.then_with(|| a.base_address.cmp(&b.base_address))
 }
@@ -573,6 +689,7 @@ struct Row {
     module: ProcessModule,
     threads: Option<(usize, bool)>,
     activity: ModuleActivity,
+    code_samples: Option<CodeSampleCell>,
 }
 
 fn compare_rows(a: &Row, b: &Row, sort: SortColumn) -> Ordering {
@@ -587,6 +704,11 @@ fn compare_rows(a: &Row, b: &Row, sort: SortColumn) -> Ordering {
             .rank()
             .cmp(&b.activity.rank())
             .then_with(|| compare_modules(&a.module, &b.module, SortColumn::Name)),
+        SortColumn::Samples | SortColumn::SampleShare => a
+            .code_samples
+            .map(|cell| cell.samples)
+            .cmp(&b.code_samples.map(|cell| cell.samples))
+            .then_with(|| compare_modules(&a.module, &b.module, SortColumn::Name)),
         _ => compare_modules(&a.module, &b.module, sort),
     }
 }
@@ -595,6 +717,7 @@ fn visible_modules(
     state: &State,
     modules: &[ProcessModule],
     threads: ThreadEvidence<'_>,
+    code_samples: &CodeSamplesState,
 ) -> Vec<Row> {
     let needle = state.filter.trim().to_ascii_lowercase();
     let mut rows = modules
@@ -606,6 +729,7 @@ fn visible_modules(
                 module: module.clone(),
                 threads,
                 activity,
+                code_samples: code_samples.cell(module.base_address),
             }
         })
         .collect::<Vec<_>>();
@@ -637,6 +761,53 @@ fn sample_age(app: &TaskManApp, sampled_at: Instant, floor: Duration) -> (String
     (text, !paused && age > expected)
 }
 
+fn code_sample_status(state: &CodeSamplesState) -> (String, bool) {
+    match state {
+        CodeSamplesState::Loading => (i18n::tr(K::CodeSamplesLoading).to_string(), false),
+        CodeSamplesState::Unavailable(Some(error)) => {
+            (i18n::trf(K::CodeSamplesUnavailable, &[error]), true)
+        }
+        CodeSamplesState::Unavailable(None) => (
+            i18n::tr(K::CodeSamplesUnavailableNoDetail).to_string(),
+            true,
+        ),
+        CodeSamplesState::Ready(window) if window.tracked_threads == 0 => {
+            (i18n::tr(K::CodeSamplesNoThreads).to_string(), true)
+        }
+        CodeSamplesState::Ready(window) if window.events_seen == 0 => {
+            (i18n::tr(K::CodeSamplesMeasuring).to_string(), false)
+        }
+        CodeSamplesState::Ready(window) if window.events_decoded == 0 => {
+            (i18n::tr(K::CodeSamplesDecodeFailed).to_string(), true)
+        }
+        CodeSamplesState::Ready(window) => {
+            let unattributed = window
+                .target_samples
+                .saturating_sub(window.attributed_samples);
+            let seconds = format::num_fixed(window.window_ms as f64 / 1000.0, 1);
+            let samples = format::format_thousands(window.target_samples);
+            let unattributed = format::format_thousands(unattributed);
+            let text = match window.events_lost {
+                Some(0) => i18n::trf(K::CodeSamplesSummary, &[&samples, &seconds, &unattributed]),
+                Some(lost) => i18n::trf(
+                    K::CodeSamplesSummaryLost,
+                    &[
+                        &samples,
+                        &seconds,
+                        &unattributed,
+                        &format::format_thousands(lost),
+                    ],
+                ),
+                None => i18n::trf(
+                    K::CodeSamplesSummaryLossUnknown,
+                    &[&samples, &seconds, &unattributed],
+                ),
+            };
+            (text, false)
+        }
+    }
+}
+
 /// The Modules page of Process Properties. `threads` is the Threads page's
 /// newest evidence (the dialog keeps it current while this page is shown).
 pub fn show(
@@ -650,6 +821,7 @@ pub fn show(
     let mut request_unload = None;
     let can_unload = app.actions.capabilities().unload_module;
     let snapshot = tm_core::sync::lock(&state.load).clone();
+    let code_samples = state.code_samples();
     let selected_module = match &snapshot {
         LoadState::Ready(modules) => {
             // Initial preselect, and a fallback when the selection died with
@@ -711,6 +883,11 @@ pub fn show(
             .small()
             .color(pal.text_dim),
     );
+    ui.label(
+        egui::RichText::new(i18n::tr(K::CodeSampleActivityHelp))
+            .small()
+            .color(pal.text_dim),
+    );
     match threads {
         ThreadEvidence::Loading => {
             ui.label(
@@ -738,6 +915,16 @@ pub fn show(
         }
         ThreadEvidence::Ready { .. } => {}
     }
+    let (sample_text, sample_error) = code_sample_status(&code_samples);
+    ui.label(
+        egui::RichText::new(sample_text)
+            .small()
+            .color(if sample_error {
+                pal.heat_high
+            } else {
+                pal.text_dim
+            }),
+    );
     ui.add_space(4.0);
 
     match &snapshot {
@@ -775,8 +962,18 @@ pub fn show(
                             .color(color),
                     );
                 }
+                if let Some(sampled_at) = state.code_sampled_at() {
+                    ui.separator();
+                    let (text, stale) = sample_age(app, sampled_at, REFRESH_FLOOR);
+                    let color = if stale { pal.heat_high } else { pal.text_dim };
+                    ui.label(
+                        egui::RichText::new(format!("{}: {text}", i18n::tr(K::ColCodeSamples)))
+                            .small()
+                            .color(color),
+                    );
+                }
             });
-            let rows = visible_modules(state, modules, threads);
+            let rows = visible_modules(state, modules, threads, &code_samples);
             // `app.modal_open()` runs while the properties dialog is taken,
             // so it stays false for the dialog itself — this list nav and
             // type-ahead are the page's own keyboard layer. The only thing
@@ -817,6 +1014,8 @@ pub fn show(
                 TmColumn::num("size", i18n::tr(K::ColSize), 100.0),
                 TmColumn::num("threads", i18n::tr(K::ColOriginThreadCount), 170.0),
                 TmColumn::text("activity", i18n::tr(K::ColOriginThreadActivity), 190.0),
+                TmColumn::num("code_samples", i18n::tr(K::ColCodeSamples), 110.0),
+                TmColumn::num("sample_share", i18n::tr(K::ColSampleShare), 115.0),
                 TmColumn::text("path", i18n::tr(K::ColPath), 360.0),
             ];
             let mut table = app
@@ -869,30 +1068,56 @@ pub fn show(
                             continue;
                         };
                         let module = &row.module;
-                        let dim = matches!(row.activity, ModuleActivity::Idle { .. });
+                        let origin_dim = matches!(row.activity, ModuleActivity::Idle { .. });
                         let selected = state.selected_base == Some(module.base_address);
                         let (rect, response) = table.row(ui, pal, selected, module.base_address);
                         table.describe_row(ui, &response, &module.name, index);
-                        let name_truncated = table.text_cell(ui, rect, 0, &module.name, pal, dim);
+                        let name_truncated = table.text_cell(ui, rect, 0, &module.name, pal, false);
                         let base_cell = table.col_rect(1, rect);
                         ui.painter_at(base_cell).text(
                             egui::pos2(base_cell.right() - 10.0, base_cell.center().y),
                             egui::Align2::RIGHT_CENTER,
                             format!("0x{:016X}", module.base_address),
                             egui::FontId::monospace(tablekit::FONT_ROW),
-                            if dim { pal.text_dim } else { pal.text },
+                            pal.text,
                         );
                         let size = format::format_bytes_loc(module.size_bytes);
-                        inspector::num_cell(ui, table, rect, 2, &size, pal, dim);
+                        inspector::num_cell(ui, table, rect, 2, &size, pal, false);
                         let count = match row.threads {
                             Some((count, false)) => count.to_string(),
                             Some((count, true)) => format!("{count}+"),
                             None => "—".to_string(),
                         };
-                        inspector::num_cell(ui, table, rect, 3, &count, pal, dim);
+                        inspector::num_cell(ui, table, rect, 3, &count, pal, origin_dim);
                         let activity = row.activity.label();
-                        table.text_cell(ui, rect, 4, &activity, pal, dim);
-                        let path_truncated = table.text_cell(ui, rect, 5, &module.path, pal, dim);
+                        table.text_cell(ui, rect, 4, &activity, pal, origin_dim);
+                        let samples = row
+                            .code_samples
+                            .map(|cell| {
+                                let count = format::format_thousands(cell.samples);
+                                if cell.approximate {
+                                    format!("≥{count}")
+                                } else {
+                                    count
+                                }
+                            })
+                            .unwrap_or_else(|| "—".to_string());
+                        inspector::num_cell(ui, table, rect, 5, &samples, pal, false);
+                        let share = row
+                            .code_samples
+                            .and_then(|cell| {
+                                cell.share_pct.map(|share| {
+                                    let share = format::format_pct_cell(share);
+                                    if cell.approximate {
+                                        format!("≈{share}")
+                                    } else {
+                                        share
+                                    }
+                                })
+                            })
+                            .unwrap_or_else(|| "—".to_string());
+                        inspector::num_cell(ui, table, rect, 6, &share, pal, false);
+                        let path_truncated = table.text_cell(ui, rect, 7, &module.path, pal, false);
                         // A clipped cell cannot show its content; the full
                         // value becomes the row tooltip (before the context
                         // menu attaches). The thread-derived cells explain
@@ -907,6 +1132,34 @@ pub fn show(
                             response.on_hover_text(i18n::tr(K::ModuleThreadCountLowerBound))
                         } else if over(3) {
                             response.on_hover_text(row.activity.tip())
+                        } else if over(5) {
+                            match row.code_samples {
+                                Some(cell) if cell.approximate => {
+                                    response.on_hover_text(i18n::tr(K::CodeSamplesApproximateTip))
+                                }
+                                Some(cell) if cell.samples == 0 => {
+                                    response.on_hover_text(i18n::tr(K::CodeSamplesZeroTip))
+                                }
+                                Some(_) => {
+                                    response.on_hover_text(i18n::tr(K::CodeSamplesColumnTip))
+                                }
+                                None if code_samples.sample_stream_ready()
+                                    && matches!(
+                                        &code_samples,
+                                        CodeSamplesState::Ready(window)
+                                            if window.events_lost != Some(0)
+                                    ) =>
+                                {
+                                    response.on_hover_text(i18n::tr(K::CodeSamplesApproximateTip))
+                                }
+                                None => response.on_hover_text(code_sample_status(&code_samples).0),
+                            }
+                        } else if over(6) {
+                            if row.code_samples.is_some_and(|cell| cell.approximate) {
+                                response.on_hover_text(i18n::tr(K::CodeSamplesApproximateTip))
+                            } else {
+                                response.on_hover_text(i18n::tr(K::SampleShareTip))
+                            }
                         } else if path_truncated {
                             response.on_hover_text(module.path.as_str())
                         } else if name_truncated {
@@ -966,7 +1219,11 @@ pub fn show(
                     state.sort = column;
                     state.ascending = !matches!(
                         column,
-                        SortColumn::Base | SortColumn::Size | SortColumn::Threads
+                        SortColumn::Base
+                            | SortColumn::Size
+                            | SortColumn::Threads
+                            | SortColumn::Samples
+                            | SortColumn::SampleShare
                     );
                 }
                 app.persist_sort("modules", state.sort.id(), state.ascending);
@@ -1120,15 +1377,21 @@ mod tests {
                     rows: &[],
                     sampled_at: Instant::now(),
                 },
+                &CodeSamplesState::Loading,
             )
             .len(),
             1
         );
         state.filter = "test\\beta".into();
         assert_eq!(
-            visible_modules(&state, &modules, ThreadEvidence::Loading,)[0]
-                .module
-                .name,
+            visible_modules(
+                &state,
+                &modules,
+                ThreadEvidence::Loading,
+                &CodeSamplesState::Loading,
+            )[0]
+            .module
+            .name,
             "beta.dll"
         );
     }
@@ -1252,6 +1515,108 @@ mod tests {
         assert_eq!(
             module_activity(&hooks, ready(&render_thread)),
             (Some((0, false)), ModuleActivity::NoThreads)
+        );
+    }
+
+    fn code_window(
+        events_seen: u64,
+        events_lost: Option<u64>,
+        tracked_threads: u32,
+        target_samples: u64,
+        entries: &[(u64, u64)],
+    ) -> ProcessModuleCodeWindow {
+        ProcessModuleCodeWindow {
+            window_ms: 2_000,
+            events_seen,
+            events_decoded: events_seen,
+            events_lost,
+            target_samples,
+            attributed_samples: entries.iter().map(|(_, samples)| samples).sum(),
+            tracked_threads,
+            modules: entries
+                .iter()
+                .map(
+                    |(base_address, samples)| tm_platform::actions::ProcessModuleCodeSamples {
+                        base_address: *base_address,
+                        samples: *samples,
+                    },
+                )
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn injected_hook_code_samples_are_independent_of_thread_origin() {
+        let hooks = module("rtsshooks64.dll", 0x1000, 0x1000);
+        let threads = [thread_row(1, Some(0x9000), Activity::Running)];
+        let samples = CodeSamplesState::Ready(code_window(
+            9_000,
+            Some(0),
+            8,
+            32,
+            &[(hooks.base_address, 12)],
+        ));
+        let rows = visible_modules(
+            &State::new(
+                ProcessIdentity {
+                    pid: 1,
+                    start_epoch_s: Some(2),
+                },
+                "game.exe".into(),
+                SortColumn::Name,
+                true,
+            ),
+            std::slice::from_ref(&hooks),
+            ready(&threads),
+            &samples,
+        );
+        assert_eq!(rows[0].threads, Some((0, false)));
+        assert_eq!(
+            rows[0].code_samples,
+            Some(CodeSampleCell {
+                samples: 12,
+                approximate: false,
+                share_pct: Some(37.5),
+            })
+        );
+    }
+
+    #[test]
+    fn code_sample_unknown_is_not_rendered_as_a_measured_zero() {
+        let base = 0x1000;
+        // No sampled-profile records yet: the first window is still being
+        // collected, so an absent row sample is unknown.
+        assert_eq!(
+            CodeSamplesState::Ready(code_window(0, Some(0), 8, 0, &[])).cell(base),
+            None
+        );
+        // A usable stream with no ETW loss and a known target thread count is
+        // a real measured zero.
+        assert_eq!(
+            CodeSamplesState::Ready(code_window(9_000, Some(0), 8, 0, &[])).cell(base),
+            Some(CodeSampleCell {
+                samples: 0,
+                approximate: false,
+                share_pct: Some(0.0),
+            })
+        );
+        // With lost or unknown loss counts, zero is not evidence of idleness.
+        assert_eq!(
+            CodeSamplesState::Ready(code_window(9_000, Some(1), 8, 0, &[])).cell(base),
+            None
+        );
+        assert_eq!(
+            CodeSamplesState::Ready(code_window(9_000, None, 8, 0, &[])).cell(base),
+            None
+        );
+        // A positive count remains useful as an explicit lower bound.
+        assert_eq!(
+            CodeSamplesState::Ready(code_window(9_000, Some(1), 8, 8, &[(base, 5)])).cell(base),
+            Some(CodeSampleCell {
+                samples: 5,
+                approximate: true,
+                share_pct: Some(62.5),
+            })
         );
     }
 

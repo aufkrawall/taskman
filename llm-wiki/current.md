@@ -38,6 +38,52 @@ from the same device set with the same "busiest device" rule:
 - **Sorting:** App roots sort by the values their rows display, not by a
   separate subtree sum.
 
+## Sampled module execution and protected inventory (2026-10-26)
+
+- **Modules has two independent evidence axes.** “Threads started here” and
+  “Started-thread activity” remain origin-thread evidence. The separate
+  **Code samples** and **Sample share** columns use the system-profile ETW
+  provider (`SampledProfile`, MOF event type 46 in
+  `EVENT_DESCRIPTOR.Opcode`) and attribute the sampled instruction pointer's
+  page to the exact process's current module ranges. This is how injected
+  hooks such as `rtsshooks64.dll` can show execution on a game/render thread
+  despite having zero origin threads. It is sampled execution/share evidence,
+  never exact CPU time or symbol-level attribution.
+- **Sampling is demand-only and identity-bound.** It runs only while the
+  Modules page is visible, uses fixed per-role sessions
+  (`TaskMan-Profile-Service|App`), stops after 30 s idle, and is drained
+  through protocol v9's exact PID + creation-time
+  `ProcessModuleCodeSamples` request. Long-lived target threads are seeded
+  from ToolHelp and maintained by kernel thread start/stop/rundown events; a
+  sample header naming the exact target PID can recover a missed thread start.
+  The session explicitly enables `SeSystemProfilePrivilege` before
+  `StartTrace` and enabling `SystemProfileProviderGuid`; otherwise Windows
+  returns
+  `ERROR_PRIVILEGE_NOT_HELD` even when an elevated token holds the privilege
+  disabled. Event loss or an unqueryable loss count makes counts lower bounds;
+  no decoded stream, no known target thread, or page-budget overflow is
+  unavailable, never a fabricated zero.
+- **Protected module inventory falls back to kernel loader events.** ToolHelp
+  module enumeration is still the ordinary path. If access is denied,
+  `module_etw.rs` starts a fixed per-role system-logger session with
+  `SYSTEM_PROCESS_KW_LOADER`, decodes the version-0 load, compact version-1,
+  and full version-2/version-3 Image_Load layouts for the exact PID, applies
+  load/unload/DCStart/DCEnd state, and exposes the map only after its initial
+  rundown settles with a zero, queryable ETW loss count. The demand-only
+  session gets the larger loader buffer set because the system-wide `DCStart`
+  burst can exceed the sparse disk/thread session's original buffer ceiling.
+  Version 0 has no payload PID, so its load-only record uses the event-header
+  PID; unknown versions fail closed. Only target-process paths are decoded;
+  decoding every system-wide path made the consumer itself delay the initial
+  rundown. This is what lets the service inspect `csrss.exe` modules without
+  opening or reading the protected process. The first call returns a collecting
+  error; a later Modules refresh returns the complete map, while
+  decode/overflow/incomplete states stay unavailable.
+- **Normal shutdown releases every ETW session.** The profile and protected
+  module owners live in process-static slots, so the GUI and service shutdown
+  paths explicitly call `stop_live_etw_sessions`; ETW sessions are kernel
+  objects and static destructors do not run at process exit.
+
 ## Process identity for protected processes (2026-10-02)
 
 Every Details row that HAS an owner now resolves its user name, SID, elevation
@@ -777,7 +823,7 @@ rebase runbook.
   `NtQueryInformationThread(ThreadQuerySetWin32StartAddress)` and shows
   `module+offset` (no symbols). The GUI first tries its own token; when a
   start address or cycle counter is missing, the exact PID+creation-time-bound
-  protocol-v8 `ProcessThreadDetails` broker request retries the per-thread
+  `ProcessThreadDetails` broker request (introduced in v8) retries the per-thread
   handles as LocalSystem and merges evidence only when TID and thread creation
   time match. This fills elevated targets such as Windows Task Manager while
   protected threads may still remain unreadable. Start-address sorting uses
@@ -790,14 +836,20 @@ rebase runbook.
   counter changes across Paused, hidden-page, sleep, or slow-query gaps reset
   to `Observing`; unchanged counters across such a gap remain idle evidence.
   The Threads page shows cumulative CPU time and current/average CPU; its
-  tooltip also carries kernel/user CPU and cycle details. The Modules page
-  reports **origin-thread activity** only: threads whose START address lies
-  in that module. It explicitly distinguishes Running/Recent/Idle/Observing,
+  tooltip also carries kernel/user CPU and cycle details. Its live filter
+  matches decimal/hex TIDs, hex start addresses, `module+offset`, the module
+  path, priority, state, activity, CPU percentage, and CPU time. The Modules
+  page reports **origin-thread activity** separately from sampled
+  executing-module evidence: origin activity covers only threads whose START
+  address lies in that module, while Code samples show where sampled code was
+  executing. It explicitly distinguishes Running/Recent/Idle/Observing,
   no origin threads, missing start-address evidence, a loading thread list and
   an unavailable thread list. It never claims that all module code is idle or
   active, and module/thread sample ages are displayed separately. The count
   is labelled "threads started here": an injected hook/overlay DLL can
-  correctly show zero while its code runs on existing game or render threads.
+  correctly show zero while its code runs on existing game or render threads;
+  the sample columns then show that execution when the system-profile trace
+  is available.
   The Modules page is no longer a separate dialog or
   context-menu entry. The pages have no Refresh buttons: they re-query at the
   update speed (floors: Threads 1 s, Modules/Network 2 s, Services 5 s),
@@ -806,14 +858,15 @@ rebase runbook.
   module unload confirmed during a background refresh is queued behind it
   (`unload_gate`), never refused.
 - The on-demand Modules page enumerates DLL name/path/base/size outside the
-  hot sampling path. Unload is an explicitly dangerous, confirmation-gated
-  action the user aims at ANY enumerated module (no protected-module concept);
-  same-architecture targets only, and process creation time plus exact module
-  base/path are revalidated immediately before the remote `FreeLibrary`
-  request. FreeLibrary is repeated until the module actually leaves (or the
-  bounded budget is spent); the honest outcome — unmapped, with how many
-  references were dropped, or still in use — is reported as data, not
-  guessed from an error.
+  hot sampling path, using a LocalSystem kernel-loader rundown when a
+  protected target refuses ToolHelp. Unload is an explicitly dangerous,
+  confirmation-gated action the user aims at ANY enumerated module (no
+  protected-module concept); same-architecture targets only, and process
+  creation time plus exact module base/path are revalidated immediately before
+  the remote `FreeLibrary` request. FreeLibrary is repeated until the module
+  actually leaves (or the bounded budget is spent); the honest outcome —
+  unmapped, with how many references were dropped, or still in use — is
+  reported as data, not guessed from an error.
 - The Users page shows the SAME six value columns as Processes — CPU,
   Memory, Disk I/O, Network, Disk active time, GPU — rolled up per session and per
   app inside it, with the same draggable column order (persisted under

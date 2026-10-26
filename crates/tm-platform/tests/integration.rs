@@ -25,6 +25,14 @@ fn poll_for<T>(mut probe: impl FnMut() -> Option<T>, timeout: std::time::Duratio
     }
 }
 
+#[cfg(target_os = "windows")]
+fn live_etw_is_required() -> bool {
+    matches!(
+        std::env::var("TASKMAN_ETW_LIVE_REQUIRED").as_deref(),
+        Ok("1")
+    )
+}
+
 /// Wait until `pid` appears in a fresh process snapshot.
 // Only the Windows tests spawn children to wait for.
 #[cfg(target_os = "windows")]
@@ -1025,4 +1033,189 @@ fn disk_trace_attributes_real_requests_to_the_issuing_process() {
         let split: u64 = disk.per_disk.iter().map(|t| t.service_time).sum();
         assert_eq!(split, disk.service_time);
     }
+}
+
+/// Diagnostic (run with elevation or Performance Log Users): proves that the
+/// privileged loader rundown can enumerate a protected process that ToolHelp
+/// cannot open. Synthetic payload tests cannot show whether Windows emits the
+/// supported image-record layouts to this session or whether `csrss` is
+/// included.
+#[cfg(target_os = "windows")]
+#[test]
+#[ignore = "needs elevation or Performance Log Users and live loader events"]
+fn protected_process_modules_include_csrss_images() {
+    use tm_platform::actions::PlatformActions;
+
+    let mut collector = tm_platform::create_collector();
+    let snapshot = collector
+        .sample(std::time::Instant::now())
+        .expect("live process snapshot");
+    let (pid, start_epoch_s) = snapshot
+        .processes
+        .iter()
+        .find_map(|process| {
+            process
+                .name
+                .eq_ignore_ascii_case("csrss.exe")
+                .then_some(process.start_epoch_s.map(|start| (process.pid, start)))
+                .flatten()
+        })
+        .expect("csrss.exe must have a kernel-reported start time");
+
+    let actions = tm_platform::win::WinActions;
+    let first = actions.list_process_modules(pid, Some(start_epoch_s));
+    eprintln!("first csrss module request: {first:?}");
+    if !tm_platform::win::module_etw_test_running() {
+        assert!(
+            !live_etw_is_required(),
+            "required loader trace could not start"
+        );
+        eprintln!("could not start the loader trace (not elevated or Performance Log Users?)");
+        tm_platform::win::stop_live_etw_sessions();
+        return;
+    }
+    let modules = poll_for(
+        || actions.list_process_modules(pid, Some(start_epoch_s)).ok(),
+        std::time::Duration::from_secs(10),
+    );
+    tm_platform::win::stop_live_etw_sessions();
+
+    let modules = modules.expect("privileged loader rundown never completed");
+    eprintln!(
+        "csrss pid={pid} modules={} first={:?}",
+        modules.len(),
+        modules.first()
+    );
+    assert!(
+        modules
+            .iter()
+            .any(|module| module.name.eq_ignore_ascii_case("csrss.exe")),
+        "the rundown omitted the csrss executable"
+    );
+    assert!(
+        modules
+            .iter()
+            .any(|module| module.name.eq_ignore_ascii_case("ntdll.dll")),
+        "the rundown omitted ntdll"
+    );
+    assert!(
+        modules.iter().all(|module| {
+            module.base_address != 0 && module.size_bytes != 0 && !module.path.is_empty()
+        }),
+        "the loader rundown produced an incomplete module record"
+    );
+}
+
+/// Diagnostic (run with elevation or Performance Log Users): proves the
+/// sampled-profile payload layout, thread ownership seeding, and module
+/// attribution against REAL Windows events rather than a synthetic buffer.
+#[cfg(target_os = "windows")]
+#[test]
+#[ignore = "needs elevation or Performance Log Users and live profile events"]
+fn sampled_profile_attributes_code_to_this_process() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use tm_platform::actions::PlatformActions;
+
+    let mut collector = tm_platform::create_collector();
+    let snapshot = collector
+        .sample(std::time::Instant::now())
+        .expect("live process snapshot");
+    let pid = std::process::id();
+    let start_epoch_s = snapshot
+        .processes
+        .iter()
+        .find(|process| process.pid == pid)
+        .and_then(|process| process.start_epoch_s)
+        .expect("the test process must have a kernel-reported start time");
+
+    let stop = std::sync::Arc::new(AtomicBool::new(false));
+    let stop_worker = stop.clone();
+    let worker = std::thread::Builder::new()
+        .name("tm-profile-probe".into())
+        .spawn(move || {
+            let mut value = 0u64;
+            while !stop_worker.load(Ordering::Relaxed) {
+                for _ in 0..100_000 {
+                    value = value.wrapping_mul(6364136223846793005).wrapping_add(1);
+                }
+                std::hint::black_box(value);
+            }
+        })
+        .expect("start profile workload");
+
+    let actions = tm_platform::win::WinActions;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let mut last = None;
+    let mut last_error = None;
+    while std::time::Instant::now() < deadline {
+        match actions.process_module_code_samples(pid, Some(start_epoch_s)) {
+            Ok(Some(window)) => {
+                let done = window.events_decoded > 0 && window.target_samples > 0;
+                last = Some(window);
+                if done {
+                    break;
+                }
+            }
+            Ok(None) => {
+                last_error = Some("sampled-profile session was unavailable".to_string());
+                assert!(
+                    !live_etw_is_required(),
+                    "required sampled-profile session was unavailable"
+                );
+                break;
+            }
+            Err(error) => {
+                last_error = Some(error.to_string());
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+
+    stop.store(true, Ordering::Relaxed);
+    let _ = worker.join();
+    tm_platform::win::stop_live_etw_sessions();
+
+    let Some(window) = last else {
+        assert!(
+            !live_etw_is_required(),
+            "required sampled-profile probe failed"
+        );
+        eprintln!(
+            "the sampled-profile trace produced no window: {}",
+            last_error.as_deref().unwrap_or("no attempt completed")
+        );
+        return;
+    };
+    eprintln!(
+        "window={} ms seen={} decoded={} lost={:?} target={} attributed={} threads={} modules={}",
+        window.window_ms,
+        window.events_seen,
+        window.events_decoded,
+        window.events_lost,
+        window.target_samples,
+        window.attributed_samples,
+        window.tracked_threads,
+        window.modules.len()
+    );
+    assert!(
+        window.events_seen > 0,
+        "the session received no SampledProfile records - wrong provider, keyword, or system-logger mode"
+    );
+    assert!(
+        window.events_decoded > 0,
+        "SampledProfile records arrived but none decoded - payload layout changed"
+    );
+    assert!(
+        window.tracked_threads > 0,
+        "no target thread was known despite the trace starting after the workload"
+    );
+    assert!(
+        window.target_samples > 0,
+        "no sampled instruction pointer was attributed to this process"
+    );
+    assert!(
+        window.attributed_samples > 0,
+        "target samples did not match any current module"
+    );
 }

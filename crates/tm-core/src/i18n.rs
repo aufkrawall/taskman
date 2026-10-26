@@ -192,6 +192,8 @@ keys! {
         "Started-thread activity"
     ],
     ColOriginThreadCount => ["Hier gestartete Threads", "Threads started here"],
+    ColCodeSamples => ["Code-Stichproben", "Code samples"],
+    ColSampleShare => ["Stichprobenanteil", "Sample share"],
     ColThreadCount => ["Threads", "Threads"],
     ThreadStateInitialized => ["Initialisiert", "Initialized"],
     ThreadStateReady => ["Bereit", "Ready"],
@@ -263,6 +265,59 @@ keys! {
     OriginThreadActivityHelp => [
         "Gezählt werden nur Threads, die in diesem Modul gestartet wurden. Injizierte Hooks und Overlays laufen typischerweise auf vorhandenen Spiel- oder Render-Threads",
         "Only threads started in this module are counted. Injected hooks and overlays typically execute on existing game or render threads"
+    ],
+    CodeSampleActivityHelp => [
+        "Code-Stichproben zeigen, in welchem geladenen Modul der Prozessor ausgeführt wurde – unabhängig davon, wo ein Thread gestartet wurde. Sie sind eine Schätzung, keine exakte CPU-Zeit",
+        "Code samples estimate which loaded module was executing, independently of where a thread started. They are sampled evidence, not exact CPU time"
+    ],
+    CodeSamplesLoading => ["Code-Stichproben werden geladen", "Loading code samples"],
+    CodeSamplesMeasuring => [
+        "Code-Stichproben werden gesammelt; das erste Messfenster ist noch nicht vollständig",
+        "Collecting code samples; the first measurement window is not complete yet"
+    ],
+    CodeSamplesUnavailable => [
+        "Code-Stichproben nicht verfügbar: {}",
+        "Code samples unavailable: {}"
+    ],
+    CodeSamplesUnavailableNoDetail => [
+        "Code-Stichproben nicht verfügbar",
+        "Code samples unavailable"
+    ],
+    CodeSamplesDecodeFailed => [
+        "Code-Stichproben erhalten, aber das Ereignisformat konnte nicht gelesen werden",
+        "Code-sample records arrived, but their event format could not be decoded"
+    ],
+    CodeSamplesNoThreads => [
+        "Code-Stichproben konnten keinem bekannten Ziel-Thread zugeordnet werden",
+        "Code samples could not be attributed to a known target thread"
+    ],
+    CodeSamplesSummary => [
+        "Code-Stichproben: {} Prozess-Stichproben in {} s · {} ohne bekannte Modulzuordnung",
+        "Code samples: {} process samples in {} s · {} outside known modules"
+    ],
+    CodeSamplesSummaryLost => [
+        "Code-Stichproben: mindestens {} Prozess-Stichproben in {} s · {} ohne bekannte Modulzuordnung · ETW meldet {} verlorene Ereignisse",
+        "Code samples: at least {} process samples in {} s · {} outside known modules · ETW reported {} lost events"
+    ],
+    CodeSamplesSummaryLossUnknown => [
+        "Code-Stichproben: mindestens {} Prozess-Stichproben in {} s · {} ohne bekannte Modulzuordnung · ETW-Verluste unbekannt",
+        "Code samples: at least {} process samples in {} s · {} outside known modules · ETW loss unknown"
+    ],
+    CodeSamplesColumnTip => [
+        "Anzahl der Windows-Ausführungsstichproben, deren Befehlszeiger in diesem Modul lag. Ein Messwert von 0 bedeutet nicht, dass das Modul dauerhaft inaktiv ist",
+        "Number of Windows execution samples whose instruction pointer fell in this module. A measured 0 does not mean the module stays inactive"
+    ],
+    CodeSamplesApproximateTip => [
+        "ETW hat Ereignisse verworfen oder die Verlustzahl ist unbekannt. Angezeigte Stichprobenzahlen sind daher Untergrenzen; Anteile sind Näherungswerte",
+        "ETW dropped events or the loss count is unknown, so displayed sample counts are lower bounds and shares are approximate"
+    ],
+    CodeSamplesZeroTip => [
+        "In diesem Messfenster traf keine Stichprobe dieses Modul. Wegen der Stichprobenfrequenz kann seltener Code zwischen den Messpunkten liegen",
+        "No sample landed in this module during the measurement window. Sampling can miss infrequent code between samples"
+    ],
+    SampleShareTip => [
+        "Anteil der dem Prozess zugeordneten Ausführungsstichproben, die in diesem Modul lagen",
+        "Share of execution samples attributed to this process that fell in this module"
     ],
     ModuleThreadsLoading => ["Wird geladen", "Loading"],
     ModuleThreadsUnavailable => ["Nicht verfügbar", "Unavailable"],

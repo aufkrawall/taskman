@@ -48,7 +48,7 @@ use windows::core::{PCWSTR, PWSTR};
 
 use crate::actions::{
     Capabilities, CoreServiceState, ModuleUnloadOutcome, PlatformActions, ProcessModule,
-    ServiceAction, TaskManagerReplacementState, UserSessionAction,
+    ProcessModuleCodeWindow, ServiceAction, TaskManagerReplacementState, UserSessionAction,
 };
 
 pub const SERVICE_NAME: &str = "TaskmanCore";
@@ -69,8 +69,10 @@ pub const SERVICE_LOG_FILE_PREFIX: &str = "taskman-service.log";
 // the disk service time by physical disk (per entry and per-disk totals), so
 // each process's share is taken of the disk that served it. v8 adds bounded,
 // identity-bound thread start-address and cycle evidence so an unelevated GUI
-// can fill those fields for elevated targets such as Windows Task Manager.
-pub const PROTOCOL_VERSION: u16 = 8;
+// can fill those fields for elevated targets such as Windows Task Manager. v9
+// adds drained, identity-bound sampled instruction-pointer attribution for
+// the Modules page.
+pub const PROTOCOL_VERSION: u16 = 9;
 
 const PIPE_NAME: &str = r"\\.\pipe\Taskman.Core.v1";
 const FRAME_MAGIC: [u8; 4] = *b"TMB1";
@@ -187,6 +189,12 @@ enum BrokerRequest {
     /// Read-only, identity-bound module inventory. This is brokered because
     /// ordinary GUI tokens cannot snapshot many SYSTEM/service processes.
     ProcessModules {
+        pid: u32,
+        expected_start_epoch_s: Option<i64>,
+    },
+    /// Drain one sampled-code window for the exact process whose Modules page
+    /// is visible. The service owns the privileged system-profile session.
+    ProcessModuleCodeSamples {
         pid: u32,
         expected_start_epoch_s: Option<i64>,
     },
@@ -327,6 +335,7 @@ enum BrokerValue {
     ProcessSecurity(super::ProcessSecurityInfo),
     ProcessIdentity(super::process_ops::ProcessTokenIdentity),
     ProcessModules(Vec<ProcessModule>),
+    ProcessModuleCodeSamples(Option<ProcessModuleCodeWindow>),
     ProcessThreadDetails(Vec<ProcessThreadDetail>),
     /// Result of `UnloadModule`. `released` is retained only for compatibility
     /// with the earlier v2 wire shape; it now means successful remote
@@ -1296,6 +1305,37 @@ impl PlatformActions for BrokeredActions {
         }
     }
 
+    fn process_module_code_samples(
+        &self,
+        pid: u32,
+        expected_start_epoch_s: Option<i64>,
+    ) -> Result<Option<ProcessModuleCodeWindow>> {
+        let Some(start_epoch_s) = expected_start_epoch_s.filter(|value| *value > 0) else {
+            return Err(TmError::platform(
+                "core service",
+                "a valid sampled process creation time is required",
+            ));
+        };
+        let local = || {
+            self.local
+                .process_module_code_samples(pid, Some(start_epoch_s))
+        };
+        match self.client.call(BrokerRequest::ProcessModuleCodeSamples {
+            pid,
+            expected_start_epoch_s: Some(start_epoch_s),
+        }) {
+            Ok(BrokerValue::ProcessModuleCodeSamples(window)) => Ok(window),
+            Ok(_) => Err(TmError::platform(
+                "core service",
+                "unexpected module code-sample response type",
+            )),
+            Err(BrokerCallError::Unavailable(_)) => local(),
+            Err(BrokerCallError::Rejected(detail)) => {
+                Err(TmError::platform("core service", detail))
+            }
+        }
+    }
+
     fn list_process_threads(
         &self,
         pid: u32,
@@ -2202,7 +2242,11 @@ fn dispatch(
                     "a valid sampled process creation time is required",
                 ));
             };
-            let modules = super::process_ops::list_process_modules(pid, Some(start_epoch_s))?;
+            let modules = super::list_process_modules_with_fallback(
+                super::etw::TraceRole::Service,
+                pid,
+                Some(start_epoch_s),
+            )?;
             if modules.len() > MAX_MODULES_PER_RESPONSE {
                 return Err(TmError::platform(
                     "broker process modules",
@@ -2219,6 +2263,47 @@ fn dispatch(
                 ));
             }
             Ok(BrokerValue::ProcessModules(modules))
+        }
+        BrokerRequest::ProcessModuleCodeSamples {
+            pid,
+            expected_start_epoch_s,
+        } => {
+            let Some(start_epoch_s) = expected_start_epoch_s.filter(|value| *value > 0) else {
+                return Err(TmError::platform(
+                    "broker module code samples",
+                    "a valid sampled process creation time is required",
+                ));
+            };
+            // This read validates the exact process identity and supplies the
+            // current module ranges used at drain time. In particular a
+            // recycled PID is rejected before stale trace data can be exposed.
+            let modules = super::list_process_modules_with_fallback(
+                super::etw::TraceRole::Service,
+                pid,
+                Some(start_epoch_s),
+            )?;
+            if modules.len() > MAX_MODULES_PER_RESPONSE {
+                return Err(TmError::platform(
+                    "broker module code samples",
+                    "module inventory exceeds the bounded broker entry limit",
+                ));
+            }
+            let window = super::profile_etw::sample_process_module_code(
+                super::etw::TraceRole::Service,
+                pid,
+                start_epoch_s,
+                &modules,
+            )?;
+            if window
+                .as_ref()
+                .is_some_and(|window| window.modules.len() > MAX_MODULES_PER_RESPONSE)
+            {
+                return Err(TmError::platform(
+                    "broker module code samples",
+                    "module sample entries exceed the bounded broker entry limit",
+                ));
+            }
+            Ok(BrokerValue::ProcessModuleCodeSamples(window))
         }
         BrokerRequest::ProcessThreadDetails {
             pid,
@@ -2396,6 +2481,15 @@ pub fn run_broker(
     stop_rx: std::sync::mpsc::Receiver<()>,
     on_ready: impl FnOnce() -> Result<()>,
 ) -> Result<()> {
+    struct TraceCleanup;
+
+    impl Drop for TraceCleanup {
+        fn drop(&mut self) {
+            super::etw::stop_live_sessions();
+        }
+    }
+
+    let _trace_cleanup = TraceCleanup;
     let manifest = Arc::new(load_manifest()?);
     let sddl = pipe_sddl(&manifest.authorized_user_sid)?;
     let stopped = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -3791,6 +3885,35 @@ mod tests {
     }
 
     #[test]
+    fn a_capped_module_code_response_fits_the_frame_limit() {
+        let window = ProcessModuleCodeWindow {
+            window_ms: u64::MAX,
+            events_seen: u64::MAX,
+            events_decoded: u64::MAX,
+            events_lost: Some(u64::MAX),
+            target_samples: u64::MAX,
+            attributed_samples: u64::MAX,
+            tracked_threads: u32::MAX,
+            modules: (0..MAX_MODULES_PER_RESPONSE as u64)
+                .map(|base| crate::actions::ProcessModuleCodeSamples {
+                    base_address: u64::MAX - base,
+                    samples: u64::MAX,
+                })
+                .collect(),
+        };
+        let response = BrokerResponse {
+            protocol_version: PROTOCOL_VERSION,
+            value: Ok(BrokerValue::ProcessModuleCodeSamples(Some(window))),
+        };
+        let encoded = serde_json::to_vec(&response).unwrap();
+        assert!(
+            encoded.len() <= MAX_RESPONSE_BYTES,
+            "{} > {MAX_RESPONSE_BYTES}",
+            encoded.len()
+        );
+    }
+
+    #[test]
     fn stalled_telemetry_worker_has_a_deadline_and_recovers() {
         use std::sync::atomic::{AtomicUsize, Ordering};
         let (release, held) = std::sync::mpsc::channel();
@@ -3964,6 +4087,71 @@ mod tests {
         assert_eq!(identity.name, "SYSTEM");
         assert_eq!(identity.sid.as_deref(), Some("S-1-5-18"));
         assert_eq!(identity.elevated, Some(true));
+    }
+
+    /// Sampled code is another read-only, exact-identity query. A PID alone or
+    /// a fabricated creation time must be refused before the service can bind
+    /// a profiler session to a recycled process id.
+    #[test]
+    fn the_module_code_sample_read_requires_an_exact_process_identity() {
+        let probe = |expected_start_epoch_s| {
+            dispatch(
+                &crate::win::WinActions,
+                BrokerRequest::ProcessModuleCodeSamples {
+                    pid: 101,
+                    expected_start_epoch_s,
+                },
+                500,
+            )
+        };
+        assert!(probe(None).is_err(), "pid-only reads are refused");
+        assert!(
+            probe(Some(0)).is_err(),
+            "an implausible creation time is refused"
+        );
+    }
+
+    #[test]
+    fn module_code_samples_round_trip_and_reject_grown_payloads() {
+        let request = BrokerRequest::ProcessModuleCodeSamples {
+            pid: 101,
+            expected_start_epoch_s: Some(202),
+        };
+        let encoded = serde_json::to_string(&request).unwrap();
+        assert_eq!(
+            encoded,
+            r#"{"operation":"process_module_code_samples","pid":101,"expected_start_epoch_s":202}"#
+        );
+        let grown = encoded.replace('}', r#","extra":true}"#);
+        assert!(serde_json::from_str::<BrokerRequest>(&grown).is_err());
+
+        let response = BrokerResponse {
+            protocol_version: PROTOCOL_VERSION,
+            value: Ok(BrokerValue::ProcessModuleCodeSamples(Some(
+                ProcessModuleCodeWindow {
+                    window_ms: 2_000,
+                    events_seen: 9_000,
+                    events_decoded: 9_000,
+                    events_lost: Some(0),
+                    target_samples: 42,
+                    attributed_samples: 40,
+                    tracked_threads: 12,
+                    modules: vec![crate::actions::ProcessModuleCodeSamples {
+                        base_address: 0x7FF0_0000_0000,
+                        samples: 40,
+                    }],
+                },
+            ))),
+        };
+        let decoded: BrokerResponse =
+            serde_json::from_slice(&serde_json::to_vec(&response).unwrap()).unwrap();
+        let Ok(BrokerValue::ProcessModuleCodeSamples(Some(window))) = decoded.value else {
+            panic!("module code-sample response did not round trip");
+        };
+        assert_eq!(window.target_samples, 42);
+        assert_eq!(window.attributed_samples, 40);
+        assert_eq!(window.events_lost, Some(0));
+        assert_eq!(window.modules[0].samples, 40);
     }
 
     /// Thread evidence is another read-only, exact-identity query. PID alone

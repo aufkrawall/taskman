@@ -295,6 +295,7 @@ pub struct State {
     sort: SortColumn,
     ascending: bool,
     hide_idle: bool,
+    filter: String,
     /// A new snapshot replaced the rows since the table last drew them.
     fresh: bool,
 }
@@ -318,6 +319,7 @@ impl State {
             sort,
             ascending: saved.is_none_or(|saved| saved.ascending),
             hide_idle: false,
+            filter: String::new(),
             fresh: false,
         }
     }
@@ -405,16 +407,17 @@ pub fn tick(state: &mut State, app: &TaskManApp, ctx: &egui::Context, identity: 
 /// `module.dll+0x1A2B` when the address lies inside a mapped module,
 /// otherwise the bare address. No symbol files are consulted: export names
 /// would mislabel the non-exported routines most threads start in.
+fn module_at(address: u64, modules: &[ProcessModule]) -> Option<&ProcessModule> {
+    modules.iter().find(|module| {
+        address >= module.base_address && address - module.base_address < module.size_bytes
+    })
+}
+
 pub fn symbolize(address: u64, modules: &[ProcessModule]) -> String {
-    modules
-        .iter()
-        .find(|module| {
-            address >= module.base_address && address - module.base_address < module.size_bytes
-        })
-        .map_or_else(
-            || format!("0x{address:X}"),
-            |module| format!("{}+0x{:X}", module.name, address - module.base_address),
-        )
+    module_at(address, modules).map_or_else(
+        || format!("0x{address:X}"),
+        |module| format!("{}+0x{:X}", module.name, address - module.base_address),
+    )
 }
 
 /// Windows' symbolic thread priority: the thread's base priority relative to
@@ -542,6 +545,64 @@ struct View<'a> {
     start: String,
     priority: String,
     state: String,
+    activity: String,
+    cpu: String,
+    cpu_time: String,
+    filter_text: String,
+}
+
+impl View<'_> {
+    fn matches_filter(&self, needle: &str) -> bool {
+        self.filter_text.contains(needle)
+    }
+}
+
+fn view_for<'a>(
+    row: &'a ThreadRow,
+    modules: &[ProcessModule],
+    process_base_priority: Option<i32>,
+) -> View<'a> {
+    let start = row
+        .thread
+        .start_address
+        .map_or_else(|| "—".to_string(), |address| symbolize(address, modules));
+    let priority = priority_label(row.thread.base_priority, process_base_priority);
+    let state = state_label(&row.thread);
+    let activity = activity_label(row.activity);
+    let cpu = row
+        .cpu_pct
+        .map_or_else(|| "—".to_string(), format::format_pct_cell);
+    let cpu_time = format::format_cpu_time(cpu_time_secs(&row.thread));
+    let start_hex = row
+        .thread
+        .start_address
+        .map(|address| format!("{address:x}"))
+        .unwrap_or_default();
+    let start_hex_prefixed = row
+        .thread
+        .start_address
+        .map(|address| format!("0x{address:x}"))
+        .unwrap_or_default();
+    let module_path = row
+        .thread
+        .start_address
+        .and_then(|address| module_at(address, modules))
+        .map_or("", |module| module.path.as_str());
+    let filter_text = format!(
+        "{} {:x} 0x{:x} {start_hex} {start_hex_prefixed} {start} {module_path} {priority} {state} {activity} {cpu} {cpu_time}",
+        row.thread.tid, row.thread.tid, row.thread.tid
+    )
+    .to_ascii_lowercase();
+    View {
+        row,
+        start,
+        priority,
+        state,
+        activity,
+        cpu,
+        cpu_time,
+        filter_text,
+    }
 }
 
 fn compare(a: &View<'_>, b: &View<'_>, sort: SortColumn) -> Ordering {
@@ -604,6 +665,13 @@ pub fn show(
         };
         (text, !paused && age > expected)
     });
+    ui.horizontal(|ui| {
+        ui.add(
+            egui::TextEdit::singleline(&mut state.filter)
+                .hint_text(i18n::tr(K::SearchHint))
+                .desired_width(300.0),
+        );
+    });
     ui.horizontal_wrapped(|ui| {
         ui.label(i18n::trf(
             K::ThreadsSummary,
@@ -660,19 +728,13 @@ pub fn show(
 
     let no_modules: &[ProcessModule] = &[];
     let modules = modules.unwrap_or(no_modules);
+    let filter = state.filter.trim().to_ascii_lowercase();
     let mut views: Vec<View<'_>> = state
         .rows
         .iter()
         .filter(|row| !state.hide_idle || !matches!(row.activity, Activity::Idle { .. }))
-        .map(|row| View {
-            row,
-            start: row
-                .thread
-                .start_address
-                .map_or_else(|| "—".to_string(), |address| symbolize(address, modules)),
-            priority: priority_label(row.thread.base_priority, state.process_base_priority),
-            state: state_label(&row.thread),
-        })
+        .map(|row| view_for(row, modules, state.process_base_priority))
+        .filter(|view| filter.is_empty() || view.matches_filter(&filter))
         .collect();
     views.sort_by(|a, b| tablekit::directed(compare(a, b, state.sort), state.ascending));
 
@@ -734,7 +796,7 @@ pub fn show(
         Some((sorted, state.ascending)),
         None,
         views.len(),
-        state.hide_idle.then_some(i18n::tr(K::NoMatches)),
+        (!filter.is_empty() || state.hide_idle).then_some(i18n::tr(K::NoMatches)),
         focus,
         Some(anchor),
         |ui, table, _avail, _content_width, range| {
@@ -748,18 +810,12 @@ pub fn show(
                 let (rect, response) = table.row(ui, pal, selected, ("thread", thread.tid));
                 table.describe_row(ui, &response, &thread.tid.to_string(), index);
                 inspector::num_cell(ui, table, rect, 0, &thread.tid.to_string(), pal, dim);
-                let cpu = view
-                    .row
-                    .cpu_pct
-                    .map_or_else(|| "—".to_string(), format::format_pct_cell);
-                inspector::num_cell(ui, table, rect, 1, &cpu, pal, dim);
-                let cpu_time = format::format_cpu_time(cpu_time_secs(thread));
-                inspector::num_cell(ui, table, rect, 2, &cpu_time, pal, dim);
+                inspector::num_cell(ui, table, rect, 1, &view.cpu, pal, dim);
+                inspector::num_cell(ui, table, rect, 2, &view.cpu_time, pal, dim);
                 let start_truncated = table.text_cell(ui, rect, 3, &view.start, pal, dim);
                 table.text_cell(ui, rect, 4, &view.priority, pal, dim);
                 let state_truncated = table.text_cell(ui, rect, 5, &view.state, pal, dim);
-                let activity = activity_label(view.row.activity);
-                table.text_cell(ui, rect, 6, &activity, pal, dim);
+                table.text_cell(ui, rect, 6, &view.activity, pal, dim);
 
                 let pointer = ui.ctx().pointer_latest_pos();
                 let over = |column: usize| {
@@ -1036,6 +1092,10 @@ mod tests {
                 start: start.to_string(),
                 priority: String::new(),
                 state: String::new(),
+                activity: String::new(),
+                cpu: String::new(),
+                cpu_time: String::new(),
+                filter_text: String::new(),
             }
         }
         // The alphabetic presentation strings deliberately disagree with
@@ -1057,5 +1117,41 @@ mod tests {
             format!("{} (15)", i18n::tr(K::ThreadPrioTimeCritical))
         );
         assert_eq!(priority_label(12, None), "12");
+    }
+
+    #[test]
+    fn thread_filter_matches_identity_state_activity_module_and_cpu_text() {
+        let row = ThreadRow {
+            thread: thread(4_660, 3, 0, ThreadState::Running),
+            cpu_pct: Some(2.5),
+            avg_cpu_pct: Some(1.25),
+            cycles_delta: Some(100),
+            activity: Activity::Recent,
+        };
+        let modules = [ProcessModule {
+            name: "rtsshooks64.dll".into(),
+            path: r"C:\Program Files\RTSS\Plugins\rtsshooks64.dll".into(),
+            base_address: 0x1000,
+            size_bytes: 0x5000,
+        }];
+        let view = view_for(&row, &modules, Some(8));
+        assert_eq!(view.start, "rtsshooks64.dll+0x0");
+        for needle in [
+            "4660",
+            "1234",
+            "0x1234",
+            "1000",
+            "0x1000",
+            "rtsshooks",
+            "program files\\rtss\\plugins",
+            &view.priority.to_ascii_lowercase(),
+            &view.state.to_ascii_lowercase(),
+            &view.activity.to_ascii_lowercase(),
+            &view.cpu.to_ascii_lowercase(),
+            &view.cpu_time.to_ascii_lowercase(),
+        ] {
+            assert!(view.matches_filter(needle), "{needle} should match");
+        }
+        assert!(!view.matches_filter("idle"));
     }
 }

@@ -99,6 +99,43 @@ pub struct ProcessModule {
     pub size_bytes: u64,
 }
 
+/// Sampled instructions whose instruction pointer landed in one mapped module
+/// during the displayed measurement window.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(target_os = "windows", derive(serde::Serialize, serde::Deserialize))]
+pub struct ProcessModuleCodeSamples {
+    pub base_address: u64,
+    pub samples: u64,
+}
+
+/// One drained sampled-code window for a single exact process.
+///
+/// This is execution evidence, not thread-origin evidence: a DLL hooked into
+/// an existing render thread can have no threads of its own and still appear
+/// here. `events_seen == 0` or `events_decoded == 0` means the trace has not
+/// produced a usable measurement yet; consumers must render that as unknown,
+/// never as a measured zero. ETW loss makes every count a lower bound.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(target_os = "windows", derive(serde::Serialize, serde::Deserialize))]
+pub struct ProcessModuleCodeWindow {
+    pub window_ms: u64,
+    /// Sample-profile records handed to the decoder, across all processes.
+    pub events_seen: u64,
+    /// ...of which the payload decoder accepted.
+    pub events_decoded: u64,
+    /// Events ETW reported lost over this window. `None` means this could not
+    /// be queried; it must not be interpreted as zero loss.
+    pub events_lost: Option<u64>,
+    /// Samples attributed to the target process during the window.
+    pub target_samples: u64,
+    /// Target samples that matched a loaded module at drain time.
+    pub attributed_samples: u64,
+    /// Target threads known to the trace. Without at least one, a zero cannot
+    /// be asserted as measured, because samples may have been unattributable.
+    pub tracked_threads: u32,
+    pub modules: Vec<ProcessModuleCodeSamples>,
+}
+
 /// Scheduler state of one thread, as the kernel's process table reports it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ThreadState {
@@ -426,6 +463,16 @@ pub trait PlatformActions: Send + Sync {
         _expected_start_epoch_s: Option<i64>,
     ) -> Result<Vec<ProcessModule>> {
         Err(tm_core::TmError::Unsupported("process modules"))
+    }
+    /// Drain one sampled-code window for the exact process shown by a Modules
+    /// page. `None` means privileged sampling is unavailable; an explicit
+    /// trace rejection remains an error.
+    fn process_module_code_samples(
+        &self,
+        _pid: u32,
+        _expected_start_epoch_s: Option<i64>,
+    ) -> Result<Option<ProcessModuleCodeWindow>> {
+        Ok(None)
     }
     /// Every thread of one exact process. `expected_start_epoch_s` is checked
     /// against the SAME kernel snapshot the threads come from, so a recycled

@@ -1303,6 +1303,11 @@ impl TaskManApp {
             self.startup_impact.merge(&totals);
         }
         self.startup_impact.save();
+        // ETW sessions are kernel objects, and the static trace owners do not
+        // run destructors during process teardown. Release every session this
+        // GUI owns before the process disappears.
+        #[cfg(target_os = "windows")]
+        tm_platform::win::stop_live_etw_sessions();
         // Last: flush and stop the log appender. Everything above this line
         // may still log, and the non-blocking writer drops records once the
         // guard is gone.

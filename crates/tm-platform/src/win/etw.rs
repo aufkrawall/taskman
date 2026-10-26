@@ -22,13 +22,17 @@
 
 use std::sync::Arc;
 
-use windows::Win32::Foundation::{ERROR_ALREADY_EXISTS, ERROR_SUCCESS, WIN32_ERROR};
+use windows::Win32::Foundation::{
+    CloseHandle, ERROR_ALREADY_EXISTS, ERROR_SUCCESS, HANDLE, WIN32_ERROR,
+};
 use windows::Win32::System::Diagnostics::Etw::{
     CONTROLTRACE_HANDLE, CloseTrace, ControlTraceW, EVENT_CONTROL_CODE_ENABLE_PROVIDER,
-    EVENT_RECORD, EVENT_TRACE_CONTROL_STOP, EVENT_TRACE_LOGFILEW, EVENT_TRACE_PROPERTIES,
-    EVENT_TRACE_REAL_TIME_MODE, EVENT_TRACE_SYSTEM_LOGGER_MODE, EnableTraceEx2, OpenTraceW,
-    PROCESS_TRACE_MODE_EVENT_RECORD, PROCESS_TRACE_MODE_REAL_TIME, PROCESSTRACE_HANDLE,
-    ProcessTrace, StartTraceW, WNODE_FLAG_TRACED_GUID,
+    EVENT_RECORD, EVENT_TRACE_CONTROL_QUERY, EVENT_TRACE_CONTROL_STOP, EVENT_TRACE_FLAG,
+    EVENT_TRACE_FLAG_IMAGE_LOAD, EVENT_TRACE_FLAG_PROFILE, EVENT_TRACE_FLAG_THREAD,
+    EVENT_TRACE_LOGFILEW, EVENT_TRACE_PROPERTIES, EVENT_TRACE_REAL_TIME_MODE,
+    EVENT_TRACE_SYSTEM_LOGGER_MODE, EnableTraceEx2, OpenTraceW, PROCESS_TRACE_MODE_EVENT_RECORD,
+    PROCESS_TRACE_MODE_REAL_TIME, PROCESSTRACE_HANDLE, ProcessTrace, StartTraceW,
+    WNODE_FLAG_TRACED_GUID,
 };
 use windows::core::{GUID, PCWSTR, PWSTR};
 
@@ -42,14 +46,18 @@ const INVALID_PROCESSTRACE_HANDLE: u64 = u64::MAX;
 
 /// Every session name this program can ever start.
 ///
-/// Fixed and exhaustive by design (see the module docs): four names, two
+/// Fixed and exhaustive by design (see the module docs): eight names, four
 /// features times two hosting roles. Knowing them all is what lets a crashed
 /// run be cleaned up without a per-process registry.
-pub(crate) const SESSION_NAMES: [&str; 4] = [
+pub(crate) const SESSION_NAMES: [&str; 8] = [
     "TaskMan-Net-Service",
     "TaskMan-Net-App",
     "TaskMan-Disk-Service",
     "TaskMan-Disk-App",
+    "TaskMan-Profile-Service",
+    "TaskMan-Profile-App",
+    "TaskMan-Modules-Service",
+    "TaskMan-Modules-App",
 ];
 
 /// Which of [`SESSION_NAMES`] THIS process started and has not stopped.
@@ -148,6 +156,15 @@ pub(crate) enum LoggerKind {
     /// classic MOF records — identified by the MOF class GUID in
     /// `EventHeader.ProviderId` and an opcode, not by an event id.
     System,
+    /// A system logger used for a one-shot image rundown. The initial
+    /// `DCStart` sequence covers every loaded image on the machine and can
+    /// arrive as a large burst, so it gets the same larger buffers as the
+    /// sampled-profile session.
+    SystemLoader,
+    /// The system logger shape used by sampled CPU profiling. The provider
+    /// can emit around one sample per logical processor per millisecond, so
+    /// it gets larger buffers than the sparse disk/thread session.
+    SystemProfile,
 }
 
 /// State shared between an ETW callback thread and the sampler.
@@ -194,6 +211,9 @@ impl<T: TraceContext> Session<T> {
         thread_name: &str,
     ) -> Option<Self> {
         let name: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
+        if kind == LoggerKind::SystemProfile {
+            enable_system_profile_privilege();
+        }
         let (session, mut properties) = start_session(&name, kind)?;
 
         for provider in providers {
@@ -281,6 +301,66 @@ impl<T: TraceContext> Session<T> {
     pub(crate) fn is_running(&self) -> bool {
         !self.ended.load(std::sync::atomic::Ordering::Acquire)
     }
+
+    /// Cumulative events ETW reported lost for this session, or `None` when
+    /// the live logger properties could not be queried.
+    pub(crate) fn events_lost(&self) -> Option<u64> {
+        let mut properties = properties_buffer(&self.name, self.kind);
+        let status = unsafe {
+            ControlTraceW(
+                self.session,
+                PCWSTR(self.name.as_ptr()),
+                properties.as_mut_ptr().cast(),
+                EVENT_TRACE_CONTROL_QUERY,
+            )
+        };
+        if status != ERROR_SUCCESS {
+            return None;
+        }
+        let properties = properties.as_ptr().cast::<EVENT_TRACE_PROPERTIES>();
+        Some(unsafe { (*properties).EventsLost.into() })
+    }
+}
+
+/// Enable `SeSystemProfilePrivilege` before the profile provider is enabled.
+///
+/// `StartTrace` succeeds without it, but `EnableTraceEx2` for
+/// `SystemProfileProviderGuid` returns `ERROR_PRIVILEGE_NOT_HELD` when the
+/// token merely holds the privilege disabled. Elevated administrators and
+/// members of Performance Log Users commonly start with it disabled.
+fn enable_system_profile_privilege() {
+    use windows::Win32::Security::{
+        AdjustTokenPrivileges, LUID_AND_ATTRIBUTES, LookupPrivilegeValueW, SE_PRIVILEGE_ENABLED,
+        TOKEN_ADJUST_PRIVILEGES, TOKEN_PRIVILEGES, TOKEN_QUERY,
+    };
+    use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+    use windows::core::w;
+
+    unsafe {
+        let mut token = HANDLE::default();
+        if OpenProcessToken(
+            GetCurrentProcess(),
+            TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY,
+            &mut token,
+        )
+        .is_err()
+        {
+            return;
+        }
+        let mut luid = Default::default();
+        if LookupPrivilegeValueW(PCWSTR::null(), w!("SeSystemProfilePrivilege"), &mut luid).is_ok()
+        {
+            let privileges = TOKEN_PRIVILEGES {
+                PrivilegeCount: 1,
+                Privileges: [LUID_AND_ATTRIBUTES {
+                    Luid: luid,
+                    Attributes: SE_PRIVILEGE_ENABLED,
+                }],
+            };
+            let _ = AdjustTokenPrivileges(token, false, Some(&privileges), 0, None, None);
+        }
+        let _ = CloseHandle(token);
+    }
 }
 
 impl<T: TraceContext> Drop for Session<T> {
@@ -351,14 +431,31 @@ fn properties_buffer(name: &[u16], kind: LoggerKind) -> Vec<u64> {
                 LoggerKind::Manifest => 0,
                 // The only way to subscribe to the kernel's own providers
                 // without taking over the single global "NT Kernel Logger".
-                LoggerKind::System => EVENT_TRACE_SYSTEM_LOGGER_MODE,
+                LoggerKind::System | LoggerKind::SystemLoader | LoggerKind::SystemProfile => {
+                    EVENT_TRACE_SYSTEM_LOGGER_MODE
+                }
             };
+        // EnableTraceEx2 can enable these providers after the session starts,
+        // but the initial DCStart rundown is emitted while StartTrace creates
+        // the logger. Request the corresponding legacy flags up front so a
+        // loader/sample session reliably receives that initial state.
+        (*properties).EnableFlags = match kind {
+            LoggerKind::Manifest | LoggerKind::System => EVENT_TRACE_FLAG::default(),
+            LoggerKind::SystemLoader => EVENT_TRACE_FLAG_IMAGE_LOAD,
+            LoggerKind::SystemProfile => EVENT_TRACE_FLAG_PROFILE | EVENT_TRACE_FLAG_THREAD,
+        };
         (*properties).LoggerNameOffset = header as u32;
         // A small buffer set with a 1 s flush keeps latency at roughly one
-        // sampling tick without reserving much non-paged memory.
-        (*properties).BufferSize = 64;
-        (*properties).MinimumBuffers = 4;
-        (*properties).MaximumBuffers = 16;
+        // sampling tick without reserving much non-paged memory. The profile
+        // stream and the initial loader rundown have much higher event rates,
+        // so they ask for a larger set.
+        let (buffer_kb, minimum, maximum) = match kind {
+            LoggerKind::Manifest | LoggerKind::System => (64, 4, 16),
+            LoggerKind::SystemLoader | LoggerKind::SystemProfile => (256, 8, 32),
+        };
+        (*properties).BufferSize = buffer_kb;
+        (*properties).MinimumBuffers = minimum;
+        (*properties).MaximumBuffers = maximum;
         (*properties).FlushTimer = 1;
     }
     buffer
@@ -464,6 +561,29 @@ mod tests {
                 (*properties).LogFileMode,
                 EVENT_TRACE_REAL_TIME_MODE | EVENT_TRACE_SYSTEM_LOGGER_MODE
             );
+        }
+    }
+
+    #[test]
+    fn profile_logger_has_the_system_mode_and_a_larger_buffer_set() {
+        for kind in [LoggerKind::SystemLoader, LoggerKind::SystemProfile] {
+            let name: Vec<u16> = "TaskMan-Test\0".encode_utf16().collect();
+            let buffer = properties_buffer(&name, kind);
+            let properties = buffer.as_ptr().cast::<EVENT_TRACE_PROPERTIES>();
+            unsafe {
+                assert_eq!(
+                    (*properties).LogFileMode,
+                    EVENT_TRACE_REAL_TIME_MODE | EVENT_TRACE_SYSTEM_LOGGER_MODE
+                );
+                assert_eq!((*properties).BufferSize, 256);
+                assert!((*properties).MaximumBuffers >= 32);
+                let expected_flags = match kind {
+                    LoggerKind::SystemLoader => EVENT_TRACE_FLAG_IMAGE_LOAD,
+                    LoggerKind::SystemProfile => EVENT_TRACE_FLAG_PROFILE | EVENT_TRACE_FLAG_THREAD,
+                    _ => unreachable!(),
+                };
+                assert_eq!((*properties).EnableFlags, expected_flags);
+            }
         }
     }
 

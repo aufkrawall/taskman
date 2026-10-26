@@ -1,6 +1,6 @@
 # Debug Tools
 
-Last cross-checked: 2026-09-08
+Last cross-checked: 2026-10-26
 
 Primary sources:
 - `AGENTS.md`
@@ -40,6 +40,24 @@ plain `taskman.exe` do; do not use those while the desktop must remain
 undisturbed. Windows integration tests may spawn short-lived helper processes.
 The service self-check is non-mutating: it does not write Program Files,
 ProgramData, registry, or SCM state.
+
+Three ignored ETW diagnostics validate real Windows payloads rather than only
+synthetic records: `disk_trace_attributes_real_requests_to_the_issuing_process`,
+`protected_process_modules_include_csrss_images`, and
+`sampled_profile_attributes_code_to_this_process`. Run each with
+`cargo test -p tm-platform --test integration <name> -- --ignored --nocapture`
+from an elevated token or an account with the required performance-trace
+rights. The protected-module and profile probes print an explicit privilege
+boundary skip when the system-logger session cannot start. Set
+`TASKMAN_ETW_LIVE_REQUIRED=1` in a privileged diagnostic run to turn that skip
+into a failure, so an unavailable profile/session cannot masquerade as a pass.
+
+On 2026-10-26 the elevated protected-module probe decoded a 23-module
+`csrss.exe` rundown including `ntdll.dll`; the elevated profile probe decoded
+real `SampledProfile` records with zero reported loss. The profile provider
+initially failed with `ERROR_PRIVILEGE_NOT_HELD` (1314) until the session
+enabled the token's `SeSystemProfilePrivilege` before `StartTrace`; this is
+required even for an elevated token.
 
 ## Renderer diagnostics
 

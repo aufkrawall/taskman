@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+### New
+
+- **Thread search:** Process Properties now has the same live filter-style
+  search box on Threads that Modules already offered. It matches decimal and
+  hexadecimal thread IDs, hexadecimal start addresses, `module+offset`, the
+  module path, priority, state, activity, CPU percentage, and CPU time.
+
 ### Improved
 
 - **Thread start addresses for elevated processes:** Process Properties now
@@ -11,14 +18,28 @@
   preserving honest "—" values when Windows still refuses access. The page
   reports how many thread records remain partial, sorts Start address by the
   numeric address instead of the displayed module name, and keeps the
-  handle-free local read as a fallback when the service is unavailable. The
-  core service protocol moves to v8, so the service and app must be updated
-  together.
+  handle-free local read as a fallback when the service is unavailable.
+- **Executing-module evidence:** Modules now shows Code samples and Sample
+  share from an on-demand privileged system-profile ETW window. Samples are
+  attributed to the module ranges of the exact process, so an injected hook or
+  overlay such as RTSS's `rtsshooks64.dll` can show execution evidence even
+  when it starts no threads of its own. These are sampled execution/share
+  evidence, not exact CPU-time attribution; lost or unknown ETW loss renders
+  counts as lower bounds and never turns missing evidence into a zero.
+- **Protected-process module inventory:** when ToolHelp cannot open a target's
+  module list, the LocalSystem service reconstructs it from kernel loader
+  load/unload and rundown events, including the legacy load-only, compact, and
+  current full Image_Load layouts. This covers protected targets such as
+  `csrss.exe`, which deny direct module enumeration. The first request starts
+  the rundown and the next refresh exposes the completed list; target decode,
+  loss, or completeness failures remain unavailable instead of showing a
+  partial list.
 - **Injected overlay module semantics:** The Modules page now labels its count
   as threads started in the module and explains that a loaded hook or overlay
   DLL, such as RTSS's `rtsshooks64.dll`, can correctly show zero. Those DLLs
   execute on existing game/render threads rather than creating threads that
-  start inside the injected module.
+  start inside the injected module; the new code-sample columns provide the
+  complementary execution evidence.
 - **Thread and module activity reporting:** Process Properties now distinguishes
   threads that are currently running, ran recently, are provably idle, or are
   still being observed. The Threads page shows cumulative CPU time plus
@@ -41,6 +62,13 @@
   account (e.g. `runnerxyz$`) rather than `SYSTEM`. The sampler now canonicalizes
   well-known SIDs and computer account names from user enumeration to canonical
   account names (`SYSTEM`, `LOCAL SERVICE`, etc.) and pre-seeds well-known accounts.
+
+### Changed
+
+- **Core service protocol v9:** the service gains an identity-bound
+  `ProcessModuleCodeSamples` request for sampled module execution and now uses
+  the protected loader rundown for module inventory when direct access is
+  denied. The app and service must be updated together.
 
 ## 0.1.21 - 2026-10-21
 

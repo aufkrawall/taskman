@@ -159,24 +159,36 @@ dropped) is what the user sees; permanently pinned or re-loaded modules stay.
   mislabel the non-exported routines most threads start in.
 - Start address and cycles of another user's (service/SYSTEM) threads need a
   thread handle an unelevated GUI does not get. The exact-identity-bound
-  protocol-v8 broker request supplies them as LocalSystem when Windows allows
-  the target's thread handles to be opened. Protected-process threads can
-  still refuse even that token; they remain "—" and the page states how many
-  records are partial rather than fabricating values.
+  `ProcessThreadDetails` request (introduced in v8) supplies them as
+  LocalSystem when Windows allows the target's thread handles to be opened.
+  Protected-process threads can still refuse even that token; they remain "—"
+  and the page states how many records are partial rather than fabricating
+  values.
 - The connection tables carry only a PID. The identity is re-checked
   against the newest snapshot before each query and before showing it; a
   PID recycled inside that sub-second window is accepted.
-- Module activity is deliberately scoped to threads whose START address lies
-  in the module. It is not module-code CPU: a thread can execute code from
-  many modules, runtime/JIT threads may not map to the application DLL, and a
-  module that starts no thread shows “None started here.” True module execution
-  or CPU attribution would require sampled instruction pointers/stacks (for
-  example an elevated ETW profiling session), remains unavailable for some
-  protected targets, and would be a sampled estimate rather than a total.
-  Injected hooks are the common case: RTSS's `rtsshooks64.dll` can be loaded
-  and executing on D3D render threads while legitimately showing zero threads
-  started inside it. The UI now says "Threads started here" and explains this
-  distinction rather than implying that the module has no threads using it.
+- Origin-thread activity is deliberately scoped to threads whose START address
+  lies in the module. It is not module-code CPU: a thread can execute code
+  from many modules, runtime/JIT threads may not map to the application DLL,
+  and a module that starts no thread shows “None started here.” Injected hooks
+  are the common case: RTSS's `rtsshooks64.dll` can be loaded and executing on
+  D3D render threads while legitimately showing zero threads started inside
+  it.
+- Sampled code columns close the execution-evidence gap without claiming
+  exact CPU attribution. They collect no call stacks and do not symbolize;
+  code in JIT or other memory outside the current image ranges is counted as
+  unattributed, and ETW loss makes counts lower bounds. Sampling is available
+  only while Modules is visible and depends on the installed LocalSystem
+  service (or an elevated GUI fallback with `SeSystemProfilePrivilege`). These
+  are accepted properties of a low-overhead sampled measurement, not a hidden
+  exact-total claim.
+- Protected system and security processes can refuse every user-mode module
+  read; the protocol-v9 service therefore reconstructs their inventory from
+  kernel loader events. Known Image_Load versions 1–3 are decoded, and the
+  load-only version-0 layout uses the event-header PID. Unknown versions fail
+  closed. If the session cannot start, a target record cannot be decoded, or
+  ETW reports unknown/non-zero loss, the page reports unavailable rather than
+  substituting a partial list.
 
 ## Keyboard accessibility accepted limitations (2026-09-25)
 

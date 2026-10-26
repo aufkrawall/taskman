@@ -92,7 +92,8 @@ platform boundary (`tm-core` ← `tm-platform` ← `tm-app` / `tm-service`), and
     `Settings.wifi_details`),
     `etw.rs` (shared real-time-session plumbing: fixed per-role session names,
     orphan reclamation, provider enabling, the `ProcessTrace` worker thread and
-    the handle-table id sanity check), `net_etw.rs` (per-process network bytes
+    the handle-table id sanity check, plus normal/panic session teardown),
+    `net_etw.rs` (per-process network bytes
     from `Microsoft-Windows-Kernel-Network`; the session name MUST stay fixed
     per role — a pid in it leaks an orphaned session on every kill until the
     provider stops delivering events), `disk_etw.rs` (per-process DISK service
@@ -100,9 +101,17 @@ platform boundary (`tm-core` ← `tm-platform` ← `tm-app` / `tm-service`), and
     through a thread map seeded from ToolHelp and maintained by the
     `Microsoft-Windows-Kernel-Process` thread events; a request whose thread
     cannot be mapped is never charged to a row),
+    `profile_etw.rs` (demand-only system-profile sampling for one exact
+    process; MOF sample type 46, profile-privilege enablement, thread
+    ownership, page aggregation, module attribution, ETW-loss/lower-bound
+    evidence, and fixed profile sessions),
+    `module_etw.rs` (protected-process fallback: known compact/full kernel
+    image load/unload/DCStart/DCEnd versions, strict PID filtering, ETW-loss
+    rejection, exact creation-time revalidation, and a
+    settled-complete-or-unavailable contract),
     `core_service.rs` (versioned authenticated named-pipe broker, including
-    bounded identity-bound process-security/token-identity/module/thread-evidence
-    reads for protected targets, plus secure
+    bounded identity-bound process-security/token-identity/module/sample/thread
+    evidence reads for protected targets, plus secure
     SCM/Program Files/ProgramData install lifecycle, including pinned
     reparse/hard-link-resistant owner/group/DACL repair), `autostart.rs` (owned-command-
     only HKCU startup migration), `taskmgr_replacement.rs` (owned IFEO
@@ -191,8 +200,9 @@ platform boundary (`tm-core` ← `tm-platform` ← `tm-app` / `tm-service`), and
     image machine and DEP/ASLR/CFG/CET/Win32k/code-integrity/image-load and
     related mitigation policies instead of adding them to the hot sampler.
     The list pages live in their own modules — `threads.rs` (thread list +
-    the gap-aware activity `Tracker`), `modules.rs` (module list with guarded
-    unload and explicitly origin-thread-only activity attribution),
+    the gap-aware activity `Tracker` and live TID/address/module/state filter),
+    `modules.rs` (module list with guarded unload, origin-thread activity, and
+    sampled executing-module evidence),
     `connections.rs`,
     `hosted_services.rs` — and query through `inspector::Poll`/`Pace` ONLY
     while their page is on screen, at `page_interval` (the update speed,
@@ -296,12 +306,13 @@ platform boundary (`tm-core` ← `tm-platform` ← `tm-app` / `tm-service`), and
 - `crates/tm-platform/src/win/etw.rs` — `SESSION_NAMES` is exhaustive by
   design and `stop_live_sessions` is registered as the panic teardown the
   first time a session starts. An ETW session is a KERNEL object that outlives
-  its host: `Drop` covers the ordinary exit, but `panic = "abort"` and a kill
-  run no destructor, and an orphan keeps tracing every disk and network
-  operation on the machine until the next run reclaims it by name or the user
-  reboots. Only sessions THIS process started are stopped — a crashing GUI
-  must not stop the still-healthy service's. `net_etw`/`disk_etw` each pin
-  their names against that list.
+  its host: `Drop` covers ordinary owned handles and the GUI/service shutdown
+  paths explicitly call teardown for process-static trace owners;
+  `panic = "abort"` and a kill run no destructor, so an orphan remains until
+  the next run reclaims it by name or the user reboots. Only sessions THIS
+  process started are stopped — a crashing GUI must not stop the still-healthy
+  service's. `net_etw`/`disk_etw`/`profile_etw`/`module_etw` pin their names
+  against that list.
 - `crates/tm-platform/src/win/cpu_load.rs` — also the source of per-process
   I/O operation counts and hard page faults (the same kernel table already
   carries `IO_COUNTERS` and `HardFaultCount`, so they cost no extra query), and
@@ -309,6 +320,9 @@ platform boundary (`tm-core` ← `tm-platform` ← `tm-app` / `tm-service`), and
   identity and priority for the ~half of the process list that refuses
   `OpenProcess`: `start_epoch_of` and `base_priority` read the retained raw
   kernel table (never `LoadSample`, which needs two ticks to exist).
+  `current_creation_epoch` performs a fresh handle-free table query for the
+  protected-module fallback and deliberately does not reuse first-tick
+  `sample()`, which has no delta window and returns `None`.
   sysinfo's `start_time()` is 0 for those processes and must never be stored
   as `Some(0)` — no handle check can ever match it. Hand-rolled NT structure
   offsets; verify against Process Hacker definitions before "fixing" — but
