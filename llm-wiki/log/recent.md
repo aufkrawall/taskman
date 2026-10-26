@@ -1,5 +1,20 @@
 ## 2026-10-26 — sampled module execution, protected modules, thread search
 
+- 2026-10-26: Released v0.1.22 (tag on `efc366f`, the bump commit). Followed
+  `build.md` §Publishing path: `--check` + `--audit` green, stable clippy
+  green, bump pushed on main, `build.py --all-targets` for archives (Windows
+  x86_64/ARM64, Linux x86_64 musl) and setup installers (`taskman-v0.1.22-windows-x86_64-setup.exe`,
+  `taskman-v0.1.22-windows-arm64-setup.exe`), `.sha256` generated beside each,
+  `gh release create --latest` with target `efc366f0f2a6f09c6d5de1ece0c7a084d3c5f8f1`.
+  Release covers: thread live search in Process Properties, code-sample execution
+  evidence and protected-process module inventory in Modules, privileged thread
+  start addresses via LocalSystem core service (protocol v9), process command-line
+  tooltips on hover, thread and module activity reporting enhancements, and fixes for
+  false activity, tooltip positioning, and CI runner account canonicalization.
+  Verified packaged archives: Windows zip binaries pass `--selfcheck` (`taskman.exe`
+  with `--mock`, `taskman-service.exe` reporting protocol v9), setup payloads verify
+  cleanly, and the Linux musl binary passes real `--selfcheck` under WSL.
+
 - The Modules page gained on-demand sampled instruction-pointer attribution
   (`profile_etw.rs`, protocol v9 `ProcessModuleCodeSamples`) so injected hooks
   such as RTSS can show executing code independently of origin threads.
