@@ -577,7 +577,14 @@ mod tests {
     #[test]
     fn logging_keeps_recording_after_init_returns() {
         let dir = tempfile::tempdir().unwrap();
-        let attached = init_in_dir(LogConfig::default(), dir.path(), "taskman-test.log");
+        // A developer shell may export RUST_LOG=warn. This regression must
+        // actually emit its info records, not pass or fail based on the
+        // ambient filter.
+        let cfg = LogConfig {
+            level: Some(tracing::level_filters::LevelFilter::INFO),
+            ..LogConfig::default()
+        };
+        let attached = init_in_dir(cfg, dir.path(), "taskman-test.log");
         assert!(attached, "file sink must come up in a writable temp dir");
 
         for i in 0..8 {
