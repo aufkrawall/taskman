@@ -1227,8 +1227,9 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
                 let (rect, resp) = table.row(ui, &pal, selected, (row.pid, row.start_epoch_s));
                 table.describe_row(ui, &resp, &row.name, i);
                 // A clipped cell cannot show its content; the full value
-                // becomes the row tooltip (only set when something clipped).
+                // becomes the row tooltip when that cell is under the pointer.
                 let mut truncated_tip: Option<String> = None;
+                let pointer = ui.input(|input| input.pointer.hover_pos());
 
                 // Name decorations follow the Name column even after it has
                 // been moved away from the first position.
@@ -1256,8 +1257,9 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
                             .and_then(|p| app.shared.icons.get(ui.ctx(), &app.actions, p, 6));
                         table.icon_cell(ui, indented_cell, tex.as_ref(), pal.accent);
                         let name_x = cell.left() + 56.0 + row.depth as f32 * TREE_INDENT;
-                        if tablekit::text_width(ui, &row.name, tablekit::FONT_ROW) + 10.0
-                            > cell.right() - name_x
+                        if pointer.is_some_and(|pos| cell.contains(pos))
+                            && tablekit::text_width(ui, &row.name, tablekit::FONT_ROW) + 10.0
+                                > cell.right() - name_x
                         {
                             truncated_tip = Some(row.name.clone());
                         }
@@ -1311,7 +1313,10 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
                             pal.text,
                         );
                     } else {
-                        if table.text_cell(ui, rect, pos, text, &pal, false) {
+                        if table.text_cell(ui, rect, pos, text, &pal, false)
+                            && pointer
+                                .is_some_and(|pointer| table.col_rect(pos, rect).contains(pointer))
+                        {
                             truncated_tip = Some(text.to_string());
                         }
                     }
@@ -1322,7 +1327,9 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
                 // on_hover_text consumes the response, so both attach before
                 // the context menu does.
                 let unknown_tip = unknown_cell_tip(ui, table, rect, &visible_cols, row);
-                let resp = match (unknown_tip, truncated_tip) {
+                let fallback_tip =
+                    truncated_tip.or_else(|| command_line_tip(row).map(str::to_owned));
+                let resp = match (unknown_tip, fallback_tip) {
                     (Some(tip), _) => resp.on_hover_text_at_pointer(tip),
                     (None, Some(tip)) => resp.on_hover_text_at_pointer(tip),
                     (None, None) => resp,
@@ -1427,6 +1434,11 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
 /// app list.
 fn detail_name(p: &ProcessEntry) -> String {
     p.name.clone()
+}
+
+fn command_line_tip(row: &Row) -> Option<&str> {
+    let value = row.command_line_s.as_str();
+    (!value.trim().is_empty() && value != "—").then_some(value)
 }
 
 fn identity_of(row: &Row) -> crate::app::ProcessIdentity {
@@ -5210,6 +5222,20 @@ mod tests {
         a.gpu_util_pct = Some(80.0);
         b.gpu_util_pct = Some(10.0);
         assert_eq!(ColumnId::GpuUtil.compare(&a, &b), CmpOrdering::Greater);
+    }
+
+    #[test]
+    fn command_line_hover_requires_available_content() {
+        let mut p = mk_proc(10, "svchost.exe");
+        assert!(command_line_tip(&row_from_process(&p, 0, false)).is_none());
+        p.command_line = Some(" ".into());
+        assert!(command_line_tip(&row_from_process(&p, 0, false)).is_none());
+        let command = r"C:\WINDOWS\system32\svchost.exe -k LocalServiceNetworkRestricted -p";
+        p.command_line = Some(command.into());
+        assert_eq!(
+            command_line_tip(&row_from_process(&p, 0, false)),
+            Some(command)
+        );
     }
 
     #[test]

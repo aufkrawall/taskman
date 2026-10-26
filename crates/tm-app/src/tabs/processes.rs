@@ -115,6 +115,8 @@ pub struct RowData {
     /// Pseudo-row ("System interrupts", "Terminated processes"): no OS
     /// process behind it — destructive actions are withheld.
     pub synthetic: bool,
+    /// Command line for a concrete process, when available.
+    pub command_line: Option<String>,
     /// Localized hover explanation (why CPU is unattributable), if any.
     pub tooltip: Option<String>,
 }
@@ -1063,7 +1065,14 @@ fn row_ui(
     });
     // Lowest precedence: only when nothing more specific applies does a
     // truncated name explain itself.
-    let name_tip = name_truncated.then_some(row.name.clone());
+    let name_tip = (name_truncated
+        && ui.input(|input| {
+            input
+                .pointer
+                .hover_pos()
+                .is_some_and(|pos| name_rect.contains(pos))
+        }))
+    .then_some(row.name.clone());
 
     if resp.clicked() {
         if row.synthetic {
@@ -1105,7 +1114,8 @@ fn row_ui(
     // on_hover_text/context_menu consume the response (builder style). A
     // status glyph under the cursor explains itself first; otherwise the
     // row's own explanation (e.g. unattributable CPU) applies.
-    let resp = match (status_tip, net_tip, row.tooltip.clone(), name_tip) {
+    let fallback_tip = name_tip.or_else(|| row.command_line.clone());
+    let resp = match (status_tip, net_tip, row.tooltip.clone(), fallback_tip) {
         (Some(tip), _, _, _) => resp.on_hover_text_at_pointer(tip),
         (None, Some(tip), _, _) => resp.on_hover_text_at_pointer(tip),
         (None, None, Some(tip), _) => resp.on_hover_text_at_pointer(tip),
@@ -1939,6 +1949,7 @@ fn emit_flat_with_family_groups(
                     .iter()
                     .any(|member| member.power_throttled == Some(true)),
                 synthetic: false,
+                command_line: None,
                 tooltip: family_tooltip(fam),
             }));
             if expanded.contains(&p.pid) {
@@ -2337,6 +2348,7 @@ fn make_flat_row(p: &ProcessEntry) -> DisplayRow {
         status: p.status,
         power_throttled: p.power_throttled == Some(true),
         synthetic: p.synthetic,
+        command_line: process_command_line(p),
         tooltip: synthetic_tooltip(p),
     })
 }
@@ -2387,8 +2399,17 @@ fn make_own_row(p: &ProcessEntry, depth: usize) -> DisplayRow {
         status: p.status,
         power_throttled: p.power_throttled == Some(true),
         synthetic: p.synthetic,
+        command_line: process_command_line(p),
         tooltip: synthetic_tooltip(p),
     })
+}
+
+fn process_command_line(p: &ProcessEntry) -> Option<String> {
+    (!p.synthetic)
+        .then_some(p.command_line.as_deref())
+        .flatten()
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_owned)
 }
 
 /// Localized hover text for the CPU pseudo-rows explaining WHICH programs
@@ -2537,6 +2558,7 @@ fn emit_tree<'a>(
             status: subtree.status(root.pid),
             power_throttled: subtree.efficiency(root.pid),
             synthetic: false,
+            command_line: None,
             tooltip: None,
         }));
 
@@ -4563,6 +4585,24 @@ mod tests {
         };
         assert!(!real_root.aggregate);
         assert_eq!(real_root.values[0], 0.0, "real root keeps only its own CPU");
+    }
+
+    #[test]
+    fn concrete_rows_keep_available_command_lines_for_hover() {
+        let mut p = proc(9, None, "svchost.exe", ProcCategory::Background);
+        let command = r"C:\WINDOWS\system32\svchost.exe -k LocalServiceNetworkRestricted -p";
+        p.command_line = Some(command.into());
+        for row in [make_own_row(&p, 0), make_flat_row(&p)] {
+            let DisplayRow::Process(row) = row else {
+                panic!("process row")
+            };
+            assert_eq!(row.command_line.as_deref(), Some(command));
+        }
+        p.synthetic = true;
+        assert!(process_command_line(&p).is_none());
+        p.synthetic = false;
+        p.command_line = Some(" ".into());
+        assert!(process_command_line(&p).is_none());
     }
 
     #[test]

@@ -11,6 +11,8 @@
 
 ### Improved
 
+- **Process command-line hover:** Processes and Details show an available
+  command line when hovering a process, even when its text is not clipped.
 - **Thread start addresses for elevated processes:** Process Properties now
   asks the authenticated LocalSystem core service for thread start addresses
   and cycle counters that the unelevated GUI cannot read itself. This fills
