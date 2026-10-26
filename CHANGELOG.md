@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.1.22 - 2026-10-26
+
 ### New
 
 - **Thread search:** Process Properties now has the same live filter-style
