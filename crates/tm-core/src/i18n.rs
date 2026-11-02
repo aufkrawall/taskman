@@ -992,6 +992,22 @@ keys! {
     DumpCancelling => ["Wird abgebrochen...", "Canceling..."],
     DumpCreating => ["Speicherabbild wird erstellt...", "Creating dump file..."],
     DumpElapsed => ["Verstrichene Zeit:", "Elapsed:"],
+    SelectDumpFolder => [
+        "Zielordner für Speicherabbilder auswählen",
+        "Select folder for dump files"
+    ],
+    DumpBatchWrittenMsg => [
+        "{} Speicherabbilder gespeichert in {}",
+        "{} dump files written to {}"
+    ],
+    DumpBatchPartialMsg => [
+        "{} von {} Speicherabbildern gespeichert; {} Fehler",
+        "{} of {} dump files written; {} failed"
+    ],
+    DumpBatchProgress => [
+        "Speicherabbild {} von {} wird erstellt...",
+        "Creating dump file {} of {}..."
+    ],
     ErrorPrefix => ["Fehler:", "Error:"],
     PrioritySet => ["Priorität:", "Priority:"],
     AffinitySet => ["Affinität gesetzt", "Affinity updated"],

@@ -1371,7 +1371,7 @@ fn context_menu(app: &mut TaskManApp, ui: &mut egui::Ui, row: &RowData) {
         ui.close();
     }
     #[cfg(target_os = "windows")]
-    menu::submenu(ui, i18n::tr(K::CreateDumpFile), |ui| {
+    menu::submenu(ui, &batch_label(i18n::tr(K::CreateDumpFile)), |ui| {
         for (dump_type, key, tip_key) in [
             (DumpType::Minimal, K::DumpMinimal, K::DumpMinimalTip),
             (DumpType::Limited, K::DumpLimited, K::DumpLimitedTip),
@@ -1382,15 +1382,48 @@ fn context_menu(app: &mut TaskManApp, ui: &mut egui::Ui, row: &RowData) {
                 .on_hover_text(i18n::tr(tip_key))
                 .clicked()
             {
-                let process = app
-                    .latest_snapshot()
-                    .as_ref()
-                    .and_then(|snapshot| snapshot.process(row.pid))
-                    .cloned();
-                if let Some(process) = process {
-                    crate::tabs::details::create_dump(app, &ctx, &process, dump_type);
+                if batch {
+                    let targets: Vec<ProcessEntry> = app
+                        .latest_snapshot()
+                        .map(|snap| {
+                            app.selection
+                                .all()
+                                .iter()
+                                .filter_map(|id| snap.process(id.pid).cloned())
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    if targets.is_empty() {
+                        app.shared.toast(i18n::tr(K::ProcessExited));
+                    } else {
+                        crate::tabs::details::create_dumps(app, &ctx, targets, dump_type);
+                    }
+                } else if row.aggregate {
+                    let targets: Vec<ProcessEntry> = app
+                        .latest_snapshot()
+                        .map(|snap| {
+                            row.termination_targets
+                                .iter()
+                                .filter_map(|id| snap.process(id.pid).cloned())
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    if targets.is_empty() {
+                        app.shared.toast(i18n::tr(K::ProcessExited));
+                    } else {
+                        crate::tabs::details::create_dumps(app, &ctx, targets, dump_type);
+                    }
                 } else {
-                    app.shared.toast(i18n::tr(K::ProcessExited));
+                    let process = app
+                        .latest_snapshot()
+                        .as_ref()
+                        .and_then(|snapshot| snapshot.process(row.pid))
+                        .cloned();
+                    if let Some(process) = process {
+                        crate::tabs::details::create_dumps(app, &ctx, vec![process], dump_type);
+                    } else {
+                        app.shared.toast(i18n::tr(K::ProcessExited));
+                    }
                 }
                 ui.close();
             }

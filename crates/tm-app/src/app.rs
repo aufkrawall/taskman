@@ -289,14 +289,27 @@ pub struct PendingUacVirtualization {
 /// Active in-flight process crash dump operation with progress tracking and cooperative cancellation.
 #[derive(Clone)]
 pub struct ActiveDump {
+    pub dump_type: tm_core::model::DumpType,
+    pub tracker: Arc<tm_core::model::DumpProgressTracker>,
+    pub started_at: std::time::Instant,
+    pub current: Arc<Mutex<ActiveDumpTargetInfo>>,
+    pub outcome: Arc<Mutex<Option<tm_core::Result<()>>>>,
+}
+
+#[derive(Clone, Debug)]
+pub struct ActiveDumpTargetInfo {
+    pub index: usize,
+    pub total: usize,
     pub pid: u32,
     pub process_name: String,
-    pub dump_type: tm_core::model::DumpType,
     pub path: std::path::PathBuf,
-    pub tracker: Arc<tm_core::model::DumpProgressTracker>,
     pub total_bytes_estimate: Option<u64>,
-    pub started_at: std::time::Instant,
-    pub outcome: Arc<Mutex<Option<tm_core::Result<()>>>>,
+}
+
+impl ActiveDump {
+    pub fn current_info(&self) -> ActiveDumpTargetInfo {
+        tm_core::sync::lock(&self.current).clone()
+    }
 }
 
 struct ProcessRuleResult {
@@ -552,119 +565,124 @@ impl TaskManApp {
         // or select a Performance resource by key (TASKMAN_PERF=<key>) so UI
         // tests can capture them without input automation.
         let open_dialog = std::env::var("TASKMAN_DIALOG").unwrap_or_default();
-        let (show_settings, run_dialog_open, pending_process_end, active_dump) = match open_dialog
-            .as_str()
-        {
-            "settings" => (true, false, None, None),
-            "run" => (false, true, None, None),
-            "dump" => {
-                let tracker = Arc::new(tm_core::model::DumpProgressTracker::new());
-                tracker.set_bytes_written(184_000_000);
-                (
+        let (show_settings, run_dialog_open, pending_process_end, active_dump) =
+            match open_dialog.as_str() {
+                "settings" => (true, false, None, None),
+                "run" => (false, true, None, None),
+                "dump" => {
+                    let tracker = Arc::new(tm_core::model::DumpProgressTracker::new());
+                    tracker.set_bytes_written(184_000_000);
+                    (
+                        false,
+                        false,
+                        None,
+                        Some(ActiveDump {
+                            dump_type: tm_core::model::DumpType::Full,
+                            tracker,
+                            started_at: std::time::Instant::now(),
+                            current: Arc::new(Mutex::new(ActiveDumpTargetInfo {
+                                index: 1,
+                                total: 1,
+                                pid: 14208,
+                                process_name: "chrome.exe".into(),
+                                path: std::path::PathBuf::from(
+                                    r"C:\Users\User\Documents\chrome_14208.dmp",
+                                ),
+                                total_bytes_estimate: Some(420_000_000),
+                            })),
+                            outcome: Arc::new(Mutex::new(None)),
+                        }),
+                    )
+                }
+                "end_task" => (
                     false,
                     false,
-                    None,
-                    Some(ActiveDump {
-                        pid: 14208,
-                        process_name: "chrome.exe".into(),
-                        dump_type: tm_core::model::DumpType::Full,
-                        path: std::path::PathBuf::from(r"C:\Users\User\Documents\chrome_14208.dmp"),
-                        tracker,
-                        total_bytes_estimate: Some(420_000_000),
-                        started_at: std::time::Instant::now(),
-                        outcome: Arc::new(Mutex::new(None)),
+                    Some(PendingProcessEnd {
+                        targets: vec![
+                            (
+                                ProcessIdentity {
+                                    pid: 18412,
+                                    start_epoch_s: None,
+                                },
+                                "Claude".into(),
+                            ),
+                            (
+                                ProcessIdentity {
+                                    pid: 13940,
+                                    start_epoch_s: None,
+                                },
+                                "Claude".into(),
+                            ),
+                            (
+                                ProcessIdentity {
+                                    pid: 21860,
+                                    start_epoch_s: None,
+                                },
+                                "Claude".into(),
+                            ),
+                            (
+                                ProcessIdentity {
+                                    pid: 22164,
+                                    start_epoch_s: None,
+                                },
+                                "Claude".into(),
+                            ),
+                            (
+                                ProcessIdentity {
+                                    pid: 3552,
+                                    start_epoch_s: None,
+                                },
+                                "Claude".into(),
+                            ),
+                            (
+                                ProcessIdentity {
+                                    pid: 7316,
+                                    start_epoch_s: None,
+                                },
+                                "Claude".into(),
+                            ),
+                            (
+                                ProcessIdentity {
+                                    pid: 8800,
+                                    start_epoch_s: None,
+                                },
+                                "Claude".into(),
+                            ),
+                            (
+                                ProcessIdentity {
+                                    pid: 9120,
+                                    start_epoch_s: None,
+                                },
+                                "Claude".into(),
+                            ),
+                            (
+                                ProcessIdentity {
+                                    pid: 10452,
+                                    start_epoch_s: None,
+                                },
+                                "Claude".into(),
+                            ),
+                            (
+                                ProcessIdentity {
+                                    pid: 11200,
+                                    start_epoch_s: None,
+                                },
+                                "Claude".into(),
+                            ),
+                            (
+                                ProcessIdentity {
+                                    pid: 12500,
+                                    start_epoch_s: None,
+                                },
+                                "Claude".into(),
+                            ),
+                        ],
+                        tree: false,
                     }),
-                )
-            }
-            "end_task" => (
-                false,
-                false,
-                Some(PendingProcessEnd {
-                    targets: vec![
-                        (
-                            ProcessIdentity {
-                                pid: 18412,
-                                start_epoch_s: None,
-                            },
-                            "Claude".into(),
-                        ),
-                        (
-                            ProcessIdentity {
-                                pid: 13940,
-                                start_epoch_s: None,
-                            },
-                            "Claude".into(),
-                        ),
-                        (
-                            ProcessIdentity {
-                                pid: 21860,
-                                start_epoch_s: None,
-                            },
-                            "Claude".into(),
-                        ),
-                        (
-                            ProcessIdentity {
-                                pid: 22164,
-                                start_epoch_s: None,
-                            },
-                            "Claude".into(),
-                        ),
-                        (
-                            ProcessIdentity {
-                                pid: 3552,
-                                start_epoch_s: None,
-                            },
-                            "Claude".into(),
-                        ),
-                        (
-                            ProcessIdentity {
-                                pid: 7316,
-                                start_epoch_s: None,
-                            },
-                            "Claude".into(),
-                        ),
-                        (
-                            ProcessIdentity {
-                                pid: 8800,
-                                start_epoch_s: None,
-                            },
-                            "Claude".into(),
-                        ),
-                        (
-                            ProcessIdentity {
-                                pid: 9120,
-                                start_epoch_s: None,
-                            },
-                            "Claude".into(),
-                        ),
-                        (
-                            ProcessIdentity {
-                                pid: 10452,
-                                start_epoch_s: None,
-                            },
-                            "Claude".into(),
-                        ),
-                        (
-                            ProcessIdentity {
-                                pid: 11200,
-                                start_epoch_s: None,
-                            },
-                            "Claude".into(),
-                        ),
-                        (
-                            ProcessIdentity {
-                                pid: 12500,
-                                start_epoch_s: None,
-                            },
-                            "Claude".into(),
-                        ),
-                    ],
-                    tree: false,
-                }),
-                None,
-            ),
-            _ => (false, false, None, None),
-        };
+                    None,
+                ),
+                _ => (false, false, None, None),
+            };
         // The persisted resource key survives restarts; `TASKMAN_PERF` stays a
         // diagnostic override for UI tests and captures. An unknown key (a
         // removed adapter, a stale config) falls back to the first card in

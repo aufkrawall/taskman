@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+### New
+
+- **Batch process dump creation for multi-selections:** When multiple processes
+  are selected in either the Details or Processes tabs (or when right-clicking an
+  aggregate process group), the "Create dump file (N)" command prompts for a target
+  directory via a folder picker and creates memory dumps sequentially for all
+  selected processes (`<name>_<pid>_<timestamp>.dmp`). A live progress modal
+  shows current file progress, overall completion (`[i/N]`), transfer rate, and
+  responsive cooperative cancellation.
+
 ### Fixed
 
 - **TCP listener state and remote peer on Windows 11:** Listening sockets

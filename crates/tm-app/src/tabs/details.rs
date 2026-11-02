@@ -2642,33 +2642,51 @@ pub fn context_menu(app: &mut TaskManApp, ui: &mut egui::Ui, p: &ProcessEntry, h
         .exe_path
         .as_ref()
         .map(|path| path.to_string_lossy().into_owned());
-    if let Some(path) = image_path.as_deref() {
-        if menu::item(ui, i18n::tr(K::OpenFileLocation)).clicked() {
-            let actions = app.actions.clone();
-            let path2 = path.to_string();
-            app.run_action(&ctx, String::new, move || {
-                actions.open_file_location(&path2)
-            });
-            ui.close();
-        }
-        #[cfg(target_os = "windows")]
-        menu::submenu(ui, i18n::tr(K::CreateDumpFile), |ui| {
-            for (dump_type, key, tip_key) in [
-                (DumpType::Minimal, K::DumpMinimal, K::DumpMinimalTip),
-                (DumpType::Limited, K::DumpLimited, K::DumpLimitedTip),
-                (DumpType::Normal, K::DumpNormal, K::DumpNormalTip),
-                (DumpType::Full, K::DumpFull, K::DumpFullTip),
-            ] {
-                if menu::item(ui, i18n::tr(key))
-                    .on_hover_text(i18n::tr(tip_key))
-                    .clicked()
-                {
-                    create_dump(app, &ctx, p, dump_type);
-                    ui.close();
-                }
-            }
+    if let Some(path) = image_path.as_deref()
+        && menu::item(ui, i18n::tr(K::OpenFileLocation)).clicked()
+    {
+        let actions = app.actions.clone();
+        let path2 = path.to_string();
+        app.run_action(&ctx, String::new, move || {
+            actions.open_file_location(&path2)
         });
+        ui.close();
     }
+    #[cfg(target_os = "windows")]
+    menu::submenu(ui, &batch_label(i18n::tr(K::CreateDumpFile)), |ui| {
+        for (dump_type, key, tip_key) in [
+            (DumpType::Minimal, K::DumpMinimal, K::DumpMinimalTip),
+            (DumpType::Limited, K::DumpLimited, K::DumpLimitedTip),
+            (DumpType::Normal, K::DumpNormal, K::DumpNormalTip),
+            (DumpType::Full, K::DumpFull, K::DumpFullTip),
+        ] {
+            if menu::item(ui, i18n::tr(key))
+                .on_hover_text(i18n::tr(tip_key))
+                .clicked()
+            {
+                if batch {
+                    let targets: Vec<ProcessEntry> = app
+                        .latest_snapshot()
+                        .map(|snap| {
+                            app.selection
+                                .all()
+                                .iter()
+                                .filter_map(|id| snap.process(id.pid).cloned())
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    if targets.is_empty() {
+                        app.shared.toast(i18n::tr(K::ProcessExited));
+                    } else {
+                        create_dumps(app, &ctx, targets, dump_type);
+                    }
+                } else {
+                    create_dumps(app, &ctx, vec![p.clone()], dump_type);
+                }
+                ui.close();
+            }
+        }
+    });
 
     menu::separator(ui);
     #[cfg(target_os = "windows")]
@@ -2842,48 +2860,8 @@ fn local_timestamp_for_filename() -> String {
 }
 
 #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
-pub(crate) fn create_dump(
-    app: &mut TaskManApp,
-    ctx: &egui::Context,
-    p: &ProcessEntry,
-    dump_type: DumpType,
-) {
-    if !identity_still_live(app, p) {
-        app.shared.toast(i18n::tr(K::ProcessExited));
-        return;
-    }
-    if !app.shared.dump_write.begin() {
-        app.shared.toast(i18n::tr(K::DumpAlreadyRunning));
-        return;
-    }
-    // Name the file after what it is a dump OF. Two dumps of the same program
-    // are the normal case (before and after a hang), and "brave.exe.dmp" twice
-    // means the second one silently replaces the first.
-    let default_name = format!(
-        "{}_{}_{}.dmp",
-        p.name.trim_end_matches(".exe").trim_end_matches(".EXE"),
-        p.pid,
-        local_timestamp_for_filename()
-    );
-    let Some(path) = rfd::FileDialog::new()
-        .set_file_name(&default_name)
-        .save_file()
-    else {
-        app.shared.dump_write.end();
-        return;
-    };
-    let actions = app.actions.clone();
-    let pid = p.pid;
-    let start = p.start_epoch_s;
-    let path_s = path.to_string_lossy().into_owned();
-    let toasts = app.shared.toasts.clone();
-    let in_flight = app.shared.dump_write.clone();
-    let wake = ctx.clone();
-
-    let tracker = Arc::new(tm_core::model::DumpProgressTracker::new());
-    let outcome = Arc::new(Mutex::new(None));
-
-    let total_bytes_estimate = match dump_type {
+pub(crate) fn estimate_dump_bytes(p: &ProcessEntry, dump_type: DumpType) -> Option<u64> {
+    match dump_type {
         DumpType::Minimal => None,
         DumpType::Limited | DumpType::Normal | DumpType::Full => {
             let commit = p.commit_bytes.unwrap_or(0);
@@ -2891,39 +2869,224 @@ pub(crate) fn create_dump(
             let est = commit.max(mem);
             if est > 0 { Some(est) } else { None }
         }
+    }
+}
+
+pub(crate) fn dump_filename_for_process(p: &ProcessEntry, timestamp: &str) -> String {
+    let raw_stem = p.name.trim_end_matches(".exe").trim_end_matches(".EXE");
+    let stem: String = raw_stem
+        .chars()
+        .map(|c| match c {
+            '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*' => '_',
+            c => c,
+        })
+        .collect();
+    let stem = if stem.is_empty() { "process" } else { &stem };
+    format!("{stem}_{}_{timestamp}.dmp", p.pid)
+}
+
+#[allow(dead_code)]
+pub(crate) fn create_dump(
+    app: &mut TaskManApp,
+    ctx: &egui::Context,
+    p: &ProcessEntry,
+    dump_type: DumpType,
+) {
+    create_dumps(app, ctx, vec![p.clone()], dump_type);
+}
+
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+pub(crate) fn create_dumps(
+    app: &mut TaskManApp,
+    ctx: &egui::Context,
+    processes: Vec<ProcessEntry>,
+    dump_type: DumpType,
+) {
+    let live_processes: Vec<ProcessEntry> = processes
+        .into_iter()
+        .filter(|p| identity_still_live(app, p))
+        .collect();
+    if live_processes.is_empty() {
+        app.shared.toast(i18n::tr(K::ProcessExited));
+        return;
+    }
+    if !app.shared.dump_write.begin() {
+        app.shared.toast(i18n::tr(K::DumpAlreadyRunning));
+        return;
+    }
+
+    let timestamp = local_timestamp_for_filename();
+    let targets: Vec<(ProcessEntry, std::path::PathBuf)> = if live_processes.len() == 1 {
+        let p = &live_processes[0];
+        let default_name = dump_filename_for_process(p, &timestamp);
+        let Some(path) = rfd::FileDialog::new()
+            .set_file_name(&default_name)
+            .save_file()
+        else {
+            app.shared.dump_write.end();
+            return;
+        };
+        vec![(p.clone(), path)]
+    } else {
+        let Some(folder) = rfd::FileDialog::new()
+            .set_title(i18n::tr(K::SelectDumpFolder))
+            .pick_folder()
+        else {
+            app.shared.dump_write.end();
+            return;
+        };
+        live_processes
+            .into_iter()
+            .map(|p| {
+                let name = dump_filename_for_process(&p, &timestamp);
+                let path = folder.join(name);
+                (p, path)
+            })
+            .collect()
     };
 
+    let count = targets.len();
+    if count == 0 {
+        app.shared.dump_write.end();
+        return;
+    }
+
+    let first = &targets[0];
+    let first_path_s = first.1.to_string_lossy().into_owned();
+    let folder_s = if count > 1 {
+        first
+            .1
+            .parent()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
+
+    let actions = app.actions.clone();
+    let toasts = app.shared.toasts.clone();
+    let in_flight = app.shared.dump_write.clone();
+    let wake = ctx.clone();
+
+    let tracker = Arc::new(tm_core::model::DumpProgressTracker::new());
+    let outcome = Arc::new(Mutex::new(None));
+
+    let first_est = estimate_dump_bytes(&first.0, dump_type);
+    let current = Arc::new(Mutex::new(crate::app::ActiveDumpTargetInfo {
+        index: 1,
+        total: count,
+        pid: first.0.pid,
+        process_name: first.0.name.clone(),
+        path: first.1.clone(),
+        total_bytes_estimate: first_est,
+    }));
+
     app.active_dump = Some(crate::app::ActiveDump {
-        pid,
-        process_name: p.name.clone(),
         dump_type,
-        path: path.clone(),
         tracker: tracker.clone(),
-        total_bytes_estimate,
         started_at: std::time::Instant::now(),
+        current: current.clone(),
         outcome: outcome.clone(),
     });
 
     let tracker_worker = tracker.clone();
+    let current_worker = current.clone();
     let spawned = std::thread::Builder::new()
         .name("tm-dump".into())
         .spawn(move || {
-            let res = actions.create_dump_file_with_progress(
-                pid,
-                start,
-                &path,
-                dump_type,
-                Some(tracker_worker),
-            );
-            let message = match &res {
-                Ok(()) => Some(i18n::trf(K::DumpWrittenMsg, &[&path_s])),
-                Err(tm_core::TmError::Canceled) => Some(i18n::tr(K::DumpCancelled).to_string()),
-                Err(error) => Some(i18n::trf(K::ErrMsg, &[&error.to_string()])),
-            };
-            if let Some(msg) = message {
-                crate::app::toast_from(&toasts, msg);
+            let mut succeeded: usize = 0;
+            let mut failed: usize = 0;
+            let mut last_err: Option<tm_core::TmError> = None;
+            let mut cancelled = false;
+
+            for (idx, (p, path)) in targets.into_iter().enumerate() {
+                if tracker_worker.is_cancelled() {
+                    cancelled = true;
+                    break;
+                }
+
+                let est = estimate_dump_bytes(&p, dump_type);
+                {
+                    let mut cur = tm_core::sync::lock(&current_worker);
+                    cur.index = idx + 1;
+                    cur.pid = p.pid;
+                    cur.process_name = p.name.clone();
+                    cur.path = path.clone();
+                    cur.total_bytes_estimate = est;
+                }
+                tracker_worker.set_bytes_written(0);
+                wake.request_repaint();
+
+                let res = actions.create_dump_file_with_progress(
+                    p.pid,
+                    p.start_epoch_s,
+                    &path,
+                    dump_type,
+                    Some(tracker_worker.clone()),
+                );
+
+                match res {
+                    Ok(()) => {
+                        succeeded += 1;
+                    }
+                    Err(tm_core::TmError::Canceled) => {
+                        cancelled = true;
+                        break;
+                    }
+                    Err(err) => {
+                        failed += 1;
+                        last_err = Some(err);
+                    }
+                }
             }
-            *tm_core::sync::lock(&outcome) = Some(res);
+
+            let fallback_err = || tm_core::TmError::Platform {
+                context: "create_dump",
+                detail: "dump creation failed".into(),
+            };
+            let final_res = if cancelled {
+                crate::app::toast_from(&toasts, i18n::tr(K::DumpCancelled));
+                Err(tm_core::TmError::Canceled)
+            } else if count == 1 {
+                if succeeded == 1 {
+                    crate::app::toast_from(&toasts, i18n::trf(K::DumpWrittenMsg, &[&first_path_s]));
+                    Ok(())
+                } else {
+                    let err = last_err.unwrap_or_else(fallback_err);
+                    crate::app::toast_from(&toasts, i18n::trf(K::ErrMsg, &[&err.to_string()]));
+                    Err(err)
+                }
+            } else {
+                if failed == 0 {
+                    crate::app::toast_from(
+                        &toasts,
+                        i18n::trf(K::DumpBatchWrittenMsg, &[&succeeded.to_string(), &folder_s]),
+                    );
+                    Ok(())
+                } else if succeeded > 0 {
+                    crate::app::toast_from(
+                        &toasts,
+                        i18n::trf(
+                            K::DumpBatchPartialMsg,
+                            &[
+                                &succeeded.to_string(),
+                                &count.to_string(),
+                                &failed.to_string(),
+                            ],
+                        ),
+                    );
+                    Ok(())
+                } else {
+                    let err_msg = last_err
+                        .as_ref()
+                        .map(|e| e.to_string())
+                        .unwrap_or_else(|| i18n::tr(K::ActionFailed).to_string());
+                    crate::app::toast_from(&toasts, i18n::trf(K::ErrMsg, &[&err_msg]));
+                    Err(last_err.unwrap_or_else(fallback_err))
+                }
+            };
+
+            *tm_core::sync::lock(&outcome) = Some(final_res);
             in_flight.end();
             wake.request_repaint();
         });
@@ -2966,8 +3129,18 @@ pub fn dump_progress_dialog(
         ctx.data_mut(|d| d.insert_temp(restore_id, captured));
     }
 
+    let current = active.current_info();
     let mut open = true;
-    let title = i18n::tr(K::CreateDumpFile);
+    let title = if current.total > 1 {
+        format!(
+            "{} ({}/{})",
+            i18n::tr(K::CreateDumpFile),
+            current.index,
+            current.total
+        )
+    } else {
+        i18n::tr(K::CreateDumpFile).to_string()
+    };
     let bytes = active.tracker.bytes_written();
     let is_cancelling = active.tracker.is_cancelled();
     let elapsed = active.started_at.elapsed();
@@ -2998,16 +3171,23 @@ pub fn dump_progress_dialog(
             // Target header
             ui.horizontal(|ui| {
                 ui.label(
-                    egui::RichText::new(&active.process_name)
+                    egui::RichText::new(&current.process_name)
                         .strong()
                         .size(15.0)
                         .color(pal.text),
                 );
                 ui.label(
-                    egui::RichText::new(format!("(PID {})", active.pid))
+                    egui::RichText::new(format!("(PID {})", current.pid))
                         .size(13.0)
                         .color(pal.text_dim),
                 );
+                if current.total > 1 {
+                    ui.label(
+                        egui::RichText::new(format!("[{}/{}]", current.index, current.total))
+                            .size(13.0)
+                            .color(pal.accent),
+                    );
+                }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     let type_label = match active.dump_type {
                         DumpType::Minimal => i18n::tr(K::DumpMinimal),
@@ -3025,7 +3205,7 @@ pub fn dump_progress_dialog(
 
             // Path
             ui.add_space(2.0);
-            let path_str = active.path.to_string_lossy();
+            let path_str = current.path.to_string_lossy();
             ui.label(
                 egui::RichText::new(path_str.as_ref())
                     .size(11.5)
@@ -3043,7 +3223,7 @@ pub fn dump_progress_dialog(
                 String::new()
             };
 
-            match active.total_bytes_estimate {
+            match current.total_bytes_estimate {
                 Some(est) if est > 0 => {
                     let pct = (bytes as f32 / est as f32).clamp(0.0, 0.99);
                     ui.add(
@@ -3074,6 +3254,12 @@ pub fn dump_progress_dialog(
             ui.horizontal(|ui| {
                 let status_text = if is_cancelling {
                     egui::RichText::new(i18n::tr(K::DumpCancelling)).color(pal.warn_orange)
+                } else if current.total > 1 {
+                    egui::RichText::new(i18n::trf(
+                        K::DumpBatchProgress,
+                        &[&current.index.to_string(), &current.total.to_string()],
+                    ))
+                    .color(pal.text_dim)
                 } else {
                     egui::RichText::new(i18n::tr(K::DumpCreating)).color(pal.text_dim)
                 };
@@ -4511,6 +4697,89 @@ fn search_commit_picks_the_first_display_order_match() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dump_filename_for_process_formats_and_sanitizes() {
+        let p1 = ProcessEntry::new(1234, "notepad.exe");
+        assert_eq!(
+            dump_filename_for_process(&p1, "20261102-153000"),
+            "notepad_1234_20261102-153000.dmp"
+        );
+
+        let p2 = ProcessEntry::new(5678, "CHROME.EXE");
+        assert_eq!(
+            dump_filename_for_process(&p2, "20261102-153000"),
+            "CHROME_5678_20261102-153000.dmp"
+        );
+
+        // Tests invalid characters in filename
+        let p3 = ProcessEntry::new(999, "bad:name*<test>?/\\.exe");
+        assert_eq!(
+            dump_filename_for_process(&p3, "20261102-153000"),
+            "bad_name__test_____999_20261102-153000.dmp"
+        );
+
+        // Tests empty stem fallback
+        let p4 = ProcessEntry::new(1, ".exe");
+        assert_eq!(
+            dump_filename_for_process(&p4, "20261102-153000"),
+            "process_1_20261102-153000.dmp"
+        );
+    }
+
+    #[test]
+    fn estimate_dump_bytes_respects_dump_types() {
+        let mut p = ProcessEntry::new(100, "test.exe");
+        p.mem_bytes = 10_000_000;
+        p.commit_bytes = Some(20_000_000);
+
+        assert_eq!(estimate_dump_bytes(&p, DumpType::Minimal), None);
+        assert_eq!(estimate_dump_bytes(&p, DumpType::Full), Some(20_000_000));
+        assert_eq!(estimate_dump_bytes(&p, DumpType::Limited), Some(20_000_000));
+
+        p.mem_bytes = 30_000_000;
+        assert_eq!(estimate_dump_bytes(&p, DumpType::Full), Some(30_000_000));
+    }
+
+    #[test]
+    fn active_dump_tracks_batch_target_info() {
+        let tracker = Arc::new(tm_core::model::DumpProgressTracker::new());
+        let current = Arc::new(Mutex::new(crate::app::ActiveDumpTargetInfo {
+            index: 1,
+            total: 3,
+            pid: 100,
+            process_name: "proc1.exe".into(),
+            path: std::path::PathBuf::from(r"C:\dumps\proc1.dmp"),
+            total_bytes_estimate: Some(1_000_000),
+        }));
+        let active = crate::app::ActiveDump {
+            dump_type: DumpType::Full,
+            tracker,
+            started_at: std::time::Instant::now(),
+            current: current.clone(),
+            outcome: Arc::new(Mutex::new(None)),
+        };
+
+        let info = active.current_info();
+        assert_eq!(info.index, 1);
+        assert_eq!(info.total, 3);
+        assert_eq!(info.pid, 100);
+        assert_eq!(info.process_name, "proc1.exe");
+
+        // Mutate current
+        {
+            let mut cur = tm_core::sync::lock(&current);
+            cur.index = 2;
+            cur.pid = 200;
+            cur.process_name = "proc2.exe".into();
+        }
+
+        let info2 = active.current_info();
+        assert_eq!(info2.index, 2);
+        assert_eq!(info2.total, 3);
+        assert_eq!(info2.pid, 200);
+        assert_eq!(info2.process_name, "proc2.exe");
+    }
 
     #[test]
     fn process_properties_rejects_a_recycled_pid() {

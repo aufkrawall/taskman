@@ -1,3 +1,18 @@
+## 2026-11-02 — multi-process crash dump creation and batch folder export
+
+- Implemented multi-process dump generation when multiple rows are selected:
+  Context menus in both Processes and Details tabs now dynamic-label `Create dump file (N)`
+  for multi-selection. Single-target continues to use standard `rfd::FileDialog::save_file()`;
+  multi-target selection (and aggregate group rows with multiple member processes) prompts
+  for a destination directory using `rfd::FileDialog::pick_folder()`.
+- Sequential execution and batch progress tracking: Process dumps are processed sequentially
+  to prevent heavy disk I/O thrashing and memory pressure. `ActiveDumpTargetInfo` tracks
+  current item index (`1..N`), target PID, process name, destination path, and memory estimate.
+- Progress dialog shows overall progress (`Create dump file (i/N)`, header badge `[i/N]`),
+  per-file throughput (MB/s) and byte counts, status indicator, and cooperative cancellation
+  that halts the entire batch immediately and cleans up partial dumps.
+- Added localized strings for folder picking, batch progress, and batch completion summaries.
+
 ## 2026-11-02 — bug fixes: Win11 TCP listener states, row tooltip scoping, kernel timestamp tolerance, app history core scaling
 
 - Fixed Windows 11 TCP listener state reporting and remote peer placeholder handling:
