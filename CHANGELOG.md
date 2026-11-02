@@ -14,6 +14,8 @@
 
 ### Fixed
 
+- **Battle.net name rendering and Unicode dot leaders:** The friendly process description for Battle.net (`Battle.net.exe`) previously rendered a missing glyph tofu box placeholder (`▢`) instead of a period because Blizzard's PE `FileDescription` metadata uses the Unicode ONE DOT LEADER (`\u{2024}`) rather than an ASCII period, and Windows' `Segoe UI Variable` lacks that glyph. Version string extraction now normalizes Unicode dot leaders (`\u{2024}`) to ASCII periods for reliable rendering, search filtering, online searches, and clipboard copying; in addition, `Segoe UI Symbol` (`seguisym.ttf`) has been added as a system fallback font in `tm-ui` so arbitrary punctuation and mathematical symbols in process names and telemetry render properly.
+- **Process properties text selection and context menu:** Selecting text with the left mouse button across labels and property rows in the Process Properties dialog was previously discarded immediately upon right-clicking because pointer interaction unconditionally collapsed the selection. Right-clicking now preserves the active selection and opens a context menu offering "Copy" (copying the marked text, or the row's full value if nothing is selected) and "Select all" (selecting all text in that property row).
 - **Foreground and input focus over fullscreen 3D games when restored from minimized:** When TaskMan
   was evoked via Ctrl+Shift+Esc while minimized to the taskbar and a borderless or exclusive
   fullscreen 3D game (such as DOOM Eternal) held focus, the window would visually render on top

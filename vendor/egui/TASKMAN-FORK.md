@@ -205,6 +205,13 @@ upstream refactors freely.
 
 Behaviour-only and tiny; droppable once upstream restarts the blink on focus gain.
 
+### 8. `egui`: text selection preservation on secondary click and queryable label selection
+
+| File | Change | Why |
+| --- | --- | --- |
+| `crates/egui/src/text_selection/text_cursor_state.rs` | `PointerButton::Primary` instead of `any_pressed()` for drag/click start | Secondary (right) click must not collapse existing text selection to a point. Right click is used for context menus (Copy / Select all). |
+| `crates/egui/src/text_selection/label_text_selection.rs` | Primary-only dragging, deselect only on primary click outside and when no popup is open, tracking `selected_text`, `active_selection()`, and `select_all_in_widget()` | Allows context menus to preserve and inspect selected text, copy it, or programmatically select all text in a label widget. |
+
 ## Rebase runbook
 
 ```

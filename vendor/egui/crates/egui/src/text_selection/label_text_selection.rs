@@ -111,6 +111,13 @@ struct ViewportLabelSelectionState {
     text_to_copy: String,
     last_copied_galley_rect: Option<Rect>,
 
+    /// Accumulated text currently selected this frame.
+    accumulated_selected_text: String,
+    last_selected_galley_rect: Option<Rect>,
+
+    /// Full selected text from the last completed pass.
+    selected_text: String,
+
     /// Painted selections this frame.
     ///
     /// Kept so we can undo a bad selection visualization if we don't see both ends of the selection this frame.
@@ -129,6 +136,9 @@ impl Default for ViewportLabelSelectionState {
             has_reached_secondary: Default::default(),
             text_to_copy: Default::default(),
             last_copied_galley_rect: Default::default(),
+            accumulated_selected_text: Default::default(),
+            last_selected_galley_rect: Default::default(),
+            selected_text: Default::default(),
             painted_selections: Default::default(),
         }
     }
@@ -167,6 +177,39 @@ impl LabelSelectionState {
     /// Clear all label text selections in all viewports.
     pub fn clear_selection(&mut self) {
         self.states.clear();
+    }
+
+    /// Returns the currently selected label text in the current viewport, if any.
+    pub fn active_selection(ctx: &Context) -> Option<String> {
+        let plugin = ctx.plugin::<Self>();
+        let state = plugin.lock();
+        let viewport_state = state.states.get(&ctx.viewport_id())?;
+        if viewport_state.selection.is_some() && !viewport_state.selected_text.is_empty() {
+            Some(viewport_state.selected_text.clone())
+        } else {
+            None
+        }
+    }
+
+    /// Select all text in a specific label widget.
+    pub fn select_all_in_widget(ctx: &Context, layer_id: LayerId, widget_id: Id) {
+        let plugin = ctx.plugin::<Self>();
+        let mut state = plugin.lock();
+        let viewport_state = state.states.entry(ctx.viewport_id()).or_default();
+        viewport_state.selection = Some(CurrentSelection {
+            layer_id,
+            primary: WidgetTextCursor {
+                widget_id,
+                ccursor: CCursor::new(0),
+                pos: Pos2::ZERO,
+            },
+            secondary: WidgetTextCursor {
+                widget_id,
+                ccursor: CCursor::new(usize::MAX),
+                pos: Pos2::ZERO,
+            },
+        });
+        ctx.request_repaint();
     }
 
     /// Handle text selection state for a label or similar widget.
@@ -211,6 +254,8 @@ impl ViewportLabelSelectionState {
         self.has_reached_secondary = false;
         self.text_to_copy.clear();
         self.last_copied_galley_rect = None;
+        self.accumulated_selected_text.clear();
+        self.last_selected_galley_rect = None;
         self.painted_selections.clear();
     }
 
@@ -260,7 +305,13 @@ impl ViewportLabelSelectionState {
         }
 
         let pressed_escape = ui.input(|i| i.key_pressed(crate::Key::Escape));
-        let clicked_something_else = ui.input(|i| i.pointer.any_pressed()) && !self.any_hovered;
+        // TASKMAN-FORK: Only a primary click outside hovered labels (and outside any open
+        // context menu / popup) deselects text. Right clicking or clicking inside a popup
+        // must not clear the selection.
+        let clicked_something_else = ui
+            .input(|i| i.pointer.button_pressed(crate::PointerButton::Primary))
+            && !self.any_hovered
+            && !ui.ctx().any_popup_open();
         let delected_everything = pressed_escape || clicked_something_else;
 
         if delected_everything {
@@ -270,6 +321,8 @@ impl ViewportLabelSelectionState {
         if ui.input(|i| i.pointer.any_released()) {
             self.is_dragging = false;
         }
+
+        self.selected_text = std::mem::take(&mut self.accumulated_selected_text);
 
         let text_to_copy = std::mem::take(&mut self.text_to_copy);
         if !text_to_copy.is_empty() {
@@ -329,6 +382,58 @@ impl ViewportLabelSelectionState {
 
         self.text_to_copy.push_str(&new_text);
         self.last_copied_galley_rect = Some(new_galley_rect);
+    }
+
+    fn accumulate_selected_text(
+        &mut self,
+        new_galley_rect: Rect,
+        galley: &Galley,
+        cursor_range: &CCursorRange,
+    ) {
+        let new_text = selected_text(galley, cursor_range);
+        if new_text.is_empty() {
+            return;
+        }
+
+        if self.accumulated_selected_text.is_empty() {
+            self.accumulated_selected_text = new_text;
+            self.last_selected_galley_rect = Some(new_galley_rect);
+            return;
+        }
+
+        let Some(last_selected_galley_rect) = self.last_selected_galley_rect else {
+            self.accumulated_selected_text.push('\n');
+            self.accumulated_selected_text.push_str(&new_text);
+            self.last_selected_galley_rect = Some(new_galley_rect);
+            return;
+        };
+
+        if last_selected_galley_rect.bottom() <= new_galley_rect.top() {
+            self.accumulated_selected_text.push('\n');
+            let vertical_distance = new_galley_rect.top() - last_selected_galley_rect.bottom();
+            if estimate_row_height(galley) * 0.5 < vertical_distance {
+                self.accumulated_selected_text.push('\n');
+            }
+        } else {
+            let existing_ends_with_space = self
+                .accumulated_selected_text
+                .chars()
+                .last()
+                .map(|c| c.is_whitespace());
+
+            let new_text_starts_with_space_or_punctuation = new_text
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_whitespace() || c.is_ascii_punctuation());
+
+            if existing_ends_with_space == Some(false) && !new_text_starts_with_space_or_punctuation
+            {
+                self.accumulated_selected_text.push(' ');
+            }
+        }
+
+        self.accumulated_selected_text.push_str(&new_text);
+        self.last_selected_galley_rect = Some(new_galley_rect);
     }
 
     fn cursor_for(
@@ -410,7 +515,8 @@ impl ViewportLabelSelectionState {
                     WidgetTextCursor::new(response.id, new_primary, global_from_galley, galley);
 
                 // We don't want the latency of `drag_started`.
-                let drag_started = ui.input(|i| i.pointer.any_pressed());
+                let drag_started =
+                    ui.input(|i| i.pointer.button_pressed(crate::PointerButton::Primary));
                 if drag_started {
                     if selection.layer_id == response.layer_id {
                         if ui.input(|i| i.modifiers.shift) {
@@ -542,7 +648,8 @@ impl ViewportLabelSelectionState {
         }
 
         self.any_hovered |= response.hovered();
-        self.is_dragging |= response.is_pointer_button_down_on(); // we don't want the initial latency of drag vs click decision
+        self.is_dragging |=
+            response.is_pointer_button_down_on() && ui.input(|i| i.pointer.primary_down()); // we don't want the initial latency of drag vs click decision
 
         let old_selection = self.selection;
 
@@ -570,6 +677,10 @@ impl ViewportLabelSelectionState {
                 && selection.primary.widget_id == response.id
             {
                 process_selection_key_events(ui.ctx(), galley, response.id, &mut cursor_range);
+            }
+
+            if !cursor_range.is_empty() {
+                self.accumulate_selected_text(galley_rect, galley, &cursor_range);
             }
 
             if got_copy_event(ui.ctx()) {
@@ -790,5 +901,55 @@ mod tests {
             "the selection must be cleared when its labels disappear from the same viewport"
         );
         output.drop_without_applying_deltas();
+    }
+
+    #[test]
+    fn select_all_in_widget_and_active_selection_extracts_text() {
+        let ctx = Context::default();
+        let text = "Hello world";
+        let mut widget_id = Id::NULL;
+
+        // First pass: render the label and capture its widget_id
+        let output = ctx.run_ui(RawInput::default(), |ui| {
+            let resp = ui.label(text);
+            widget_id = resp.id;
+        });
+        output.drop_without_applying_deltas();
+
+        // Trigger select all on the widget
+        LabelSelectionState::select_all_in_widget(&ctx, LayerId::background(), widget_id);
+
+        // Second pass: the label processes the selection and accumulates selected text
+        let output = ctx.run_ui(RawInput::default(), |ui| {
+            ui.label(text);
+        });
+        output.drop_without_applying_deltas();
+
+        assert_eq!(
+            LabelSelectionState::active_selection(&ctx),
+            Some(text.to_owned()),
+            "active_selection must contain the label text after select_all_in_widget"
+        );
+
+        // Secondary click must NOT clear the selection
+        let mut secondary_click_input = RawInput::default();
+        secondary_click_input
+            .events
+            .push(crate::Event::PointerButton {
+                pos: Pos2::new(10.0, 10.0),
+                button: crate::PointerButton::Secondary,
+                pressed: true,
+                modifiers: Default::default(),
+            });
+        let output = ctx.run_ui(secondary_click_input, |ui| {
+            ui.label(text);
+        });
+        output.drop_without_applying_deltas();
+
+        assert_eq!(
+            LabelSelectionState::active_selection(&ctx),
+            Some(text.to_owned()),
+            "secondary click must not clear label selection"
+        );
     }
 }

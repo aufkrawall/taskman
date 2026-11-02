@@ -3329,15 +3329,44 @@ fn process_properties_started(start_epoch_s: Option<i64>) -> String {
     )
 }
 
+fn selectable_text_context_menu(resp: &egui::Response, fallback_text: &str) {
+    menu::context_menu(resp, |ui| {
+        let active_sel = egui::text_selection::LabelSelectionState::active_selection(ui.ctx());
+        if menu::item(ui, i18n::tr(K::Copy)).clicked() {
+            if let Some(sel) = active_sel {
+                ui.ctx().copy_text(sel);
+            } else {
+                ui.ctx().copy_text(fallback_text.to_owned());
+            }
+            if let Some(queue) = ui.ctx().data(|d| {
+                d.get_temp::<Arc<crate::app::ToastQueue>>(egui::Id::new("app-toast-queue"))
+            }) {
+                crate::app::toast_from(&queue, i18n::tr(K::Copied));
+            }
+            ui.close();
+        }
+        if menu::item(ui, i18n::tr(K::SelectAll)).clicked() {
+            egui::text_selection::LabelSelectionState::select_all_in_widget(
+                ui.ctx(),
+                resp.layer_id,
+                resp.id,
+            );
+            ui.close();
+        }
+    });
+}
+
 fn property_row(ui: &mut egui::Ui, label: &str, value: impl Into<String>, monospace: bool) {
-    ui.weak(format!("{label}:"));
+    let lbl_resp = ui.weak(format!("{label}:"));
+    selectable_text_context_menu(&lbl_resp, label);
     let value = value.into();
     let text = if monospace {
-        egui::RichText::new(value).size(12.5).monospace()
+        egui::RichText::new(&value).size(12.5).monospace()
     } else {
-        egui::RichText::new(value).size(13.0)
+        egui::RichText::new(&value).size(13.0)
     };
-    ui.add(egui::Label::new(text).wrap());
+    let val_resp = ui.add(egui::Label::new(text).wrap());
+    selectable_text_context_menu(&val_resp, &value);
     ui.end_row();
 }
 
@@ -3794,20 +3823,23 @@ fn process_properties_general(
     process: &ProcessEntry,
     security: &ProcessSecuritySummary,
 ) {
-    ui.heading(process.shown_name());
+    let head_resp = ui.heading(process.shown_name());
+    selectable_text_context_menu(&head_resp, process.shown_name());
     if let Some(description) = process
         .description
         .as_deref()
         .filter(|value| !value.trim().is_empty() && *value != process.shown_name())
     {
-        ui.label(egui::RichText::new(description).size(13.0));
+        let desc_resp = ui.label(egui::RichText::new(description).size(13.0));
+        selectable_text_context_menu(&desc_resp, description);
     }
     if let Some(company) = process
         .company
         .as_deref()
         .filter(|value| !value.trim().is_empty())
     {
-        ui.weak(company);
+        let comp_resp = ui.weak(company);
+        selectable_text_context_menu(&comp_resp, company);
     }
     ui.add_space(10.0);
 
@@ -4119,6 +4151,9 @@ pub fn process_properties_dialog(app: &mut TaskManApp, ctx: &egui::Context) {
     let Some(mut dialog) = app.proc_props.take() else {
         return;
     };
+    ctx.data_mut(|d| {
+        d.insert_temp(egui::Id::new("app-toast-queue"), app.shared.toasts.clone());
+    });
     // F5 refreshes the page on screen: the dialog's counterpart of the main
     // window's "Refresh now", and the only refresh while updates are paused.
     // Handled first so this frame's queries already see the request. The
@@ -4466,6 +4501,11 @@ pub fn process_properties_dialog(app: &mut TaskManApp, ctx: &egui::Context) {
     if open && !close_clicked && !close_now && service_jump.is_none() {
         app.proc_props = Some(dialog);
     } else {
+        ctx.data_mut(|d| {
+            d.remove_temp::<std::sync::Arc<crate::app::ToastQueue>>(egui::Id::new(
+                "app-toast-queue",
+            ))
+        });
         let saved = ctx
             .data(|d| d.get_temp::<Option<egui::Id>>(restore_id))
             .flatten();
@@ -5526,6 +5566,69 @@ mod tests {
         assert!(row.power_throttled);
         assert!(row.status.contains(i18n::tr(K::StSuspended)));
         assert!(row.status.contains(i18n::tr(K::StEfficiencyMode)));
+    }
+
+    #[test]
+    fn process_properties_property_row_context_menu() {
+        let ctx = egui::Context::default();
+        let toasts: std::sync::Arc<crate::app::ToastQueue> = Default::default();
+        ctx.data_mut(|d| {
+            d.insert_temp(egui::Id::new("app-toast-queue"), toasts.clone());
+        });
+
+        let val_rect = std::cell::Cell::new(egui::Rect::NOTHING);
+        let frame = |events: Vec<egui::Event>| {
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(800.0, 600.0),
+                )),
+                events,
+                ..Default::default()
+            };
+            let output = ctx.run_ui(input, |ui| {
+                egui::Grid::new("test-grid").show(ui, |ui| {
+                    ui.weak("Path:");
+                    let text = egui::RichText::new("C:\\Test\\App.exe").size(13.0);
+                    let resp = ui.add(egui::Label::new(text).wrap());
+                    val_rect.set(resp.rect);
+                    selectable_text_context_menu(&resp, "C:\\Test\\App.exe");
+                    ui.end_row();
+                });
+            });
+            output.drop_without_applying_deltas();
+        };
+
+        // Frame 1: layout
+        frame(Vec::new());
+
+        // Frame 2: move pointer over label
+        let at = val_rect.get().center();
+        frame(vec![egui::Event::PointerMoved(at)]);
+
+        // Frame 3: right click
+        frame(vec![
+            egui::Event::PointerButton {
+                pos: at,
+                button: egui::PointerButton::Secondary,
+                pressed: true,
+                modifiers: Default::default(),
+            },
+            egui::Event::PointerButton {
+                pos: at,
+                button: egui::PointerButton::Secondary,
+                pressed: false,
+                modifiers: Default::default(),
+            },
+        ]);
+
+        // Frame 4: popup sizing pass
+        frame(Vec::new());
+
+        assert!(
+            ctx.any_popup_open(),
+            "right clicking property row opens context menu"
+        );
     }
 
     fn mk_proc(pid: u32, name: &str) -> ProcessEntry {

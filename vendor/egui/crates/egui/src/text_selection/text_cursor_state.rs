@@ -76,7 +76,13 @@ impl TextCursorState {
             self.set_char_range(Some(ccursor_range));
             true
         } else if response.sense.senses_drag() {
-            if response.hovered() && ui.input(|i| i.pointer.any_pressed()) {
+            // TASKMAN-FORK: Only the primary button (left click) starts a drag-to-select
+            // or repositions the cursor. Right click (secondary button) must preserve the
+            // existing selection for context menus (e.g. copy / select all) rather than
+            // collapsing it.
+            if response.hovered()
+                && ui.input(|i| i.pointer.button_pressed(crate::PointerButton::Primary))
+            {
                 // The start of a drag (or a click).
                 if ui.input(|i| i.modifiers.shift) {
                     if let Some(mut cursor_range) = self.range(galley) {

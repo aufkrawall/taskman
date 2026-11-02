@@ -148,12 +148,20 @@ unsafe fn query_string(data: &[u8], key: &str, codepages: &[String]) -> Option<S
             let words = std::slice::from_raw_parts(ptr.cast::<u16>(), len as usize);
             let end = words.iter().position(|&w| w == 0).unwrap_or(words.len());
             let text = String::from_utf16_lossy(&words[..end]);
-            if !text.is_empty() {
-                return Some(text);
+            let cleaned = clean_version_string(text);
+            if !cleaned.is_empty() {
+                return Some(cleaned);
             }
         }
     }
     None
+}
+
+fn clean_version_string(s: String) -> String {
+    // Replace typographic dot leaders like U+2024 (ONE DOT LEADER) with standard ASCII period.
+    // Blizzard's Battle.net binary uses "Battle\u{2024}net" in its FileDescription to mimic
+    // a dot without being treated as a domain or URL by old chat parsers.
+    s.replace('\u{2024}', ".")
 }
 
 #[cfg(test)]
@@ -220,5 +228,11 @@ mod tests {
         let [description, company] = query(&path.to_string_lossy());
         assert_eq!(company, "Microsoft Corporation", "csrss.exe company");
         assert!(!description.is_empty(), "csrss.exe FileDescription");
+    }
+
+    #[test]
+    fn cleans_one_dot_leader_in_version_strings() {
+        let raw = "Battle\u{2024}net";
+        assert_eq!(clean_version_string(raw.to_string()), "Battle.net");
     }
 }

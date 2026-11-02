@@ -388,6 +388,7 @@ keys! {
     ],
     ModuleBusy => ["Eine Modulaktion läuft bereits", "A module action is already running"],
     SelectModuleFirst => ["Zuerst ein Modul auswählen", "Select a module first"],
+    Copy => ["Kopieren", "Copy"],
     CopyPath => ["Pfad kopieren", "Copy path"],
     Properties => ["Eigenschaften", "Properties"],
     FileProperties => ["Dateieigenschaften", "File properties"],

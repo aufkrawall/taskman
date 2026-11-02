@@ -1,3 +1,30 @@
+## 2026-11-02 — Battle.net dot rendering / symbol font fallback & process properties text selection context menu
+
+- Fixed Battle.net name rendering (`Battle.net` showing placeholder box `▢`):
+  Blizzard's `Battle.net.exe` PE `FileDescription` metadata uses Unicode ONE DOT LEADER (`\u{2024}`)
+  rather than an ASCII period (`.`), mimicking a dot while avoiding chat/url auto-linking in legacy
+  protocols. Windows 11's `Segoe UI Variable` lacks U+2024 (and many symbols/punctuation glyphs).
+  Fix:
+  1. `crates/tm-platform/src/win/version.rs`: `clean_version_string` maps U+2024 to standard `.` so
+     process display names render, search (via keyboard `.`), Bing online search, and clipboard copies work.
+  2. `crates/tm-ui/src/fonts.rs`: loaded `C:\Windows\Fonts\seguisym.ttf` (Segoe UI Symbol) and Noto Sans
+     Symbols as fallback fonts in `FontFamily::Proportional` and `FontFamily::Monospace`, matching
+     Windows' DirectWrite system linking and ensuring missing symbols/math/punctuation render properly.
+- Fixed process properties text selection discard and added context menu (Copy / Select all):
+  When selecting text across labels and property rows in the Process Properties dialog with the left mouse
+  button, right-clicking previously collapsed the selection because egui's `text_cursor_state.rs` checked
+  `any_pressed()`.
+  Fix:
+  1. `vendor/egui`: `text_cursor_state.rs` and `label_text_selection.rs` only allow primary button presses
+     to start drags or reposition the cursor. Secondary (right) clicks preserve the active selection.
+     Deselection only occurs on primary clicks outside labels and when no context menu popup is open.
+     Added `LabelSelectionState::active_selection(ctx)` and `select_all_in_widget(ctx, layer, id)`.
+     Documented in `vendor/egui/TASKMAN-FORK.md` § 8.
+  2. `crates/tm-app/src/tabs/details.rs`: added `selectable_text_context_menu` to `property_row` and header
+     labels in the Process Properties dialog. Offers "Copy" (copying the active selection if present, or
+     the full property value as fallback with toast feedback) and "Select all" (selecting all text in that
+     property row). Added `K::Copy` ("Kopieren" / "Copy") to `i18n.rs`.
+
 ## 2026-11-02 — hotkey foreground activation and cursor unclip over fullscreen 3D games
 
 - Fixed input and mouse confinement over fullscreen/borderless games when restoring from minimized:

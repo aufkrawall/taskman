@@ -181,6 +181,42 @@ fn build_definitions() -> FontDefinitions {
         }
     }
 
+    // Symbol fallback: on Windows, Segoe UI relies on Segoe UI Symbol for
+    // math, symbols, and punctuation (like one-dot leader U+2024). Egui
+    // searches FontFamily::Proportional in order; putting the symbol font as
+    // a fallback ensures standard text still renders via Segoe UI Variable
+    // while missing glyphs fall back cleanly instead of rendering as tofu boxes.
+    let symbol_candidates: &[(&str, Vec<String>)] = &[
+        (
+            "SegoeUISymbol",
+            vec![r"C:\Windows\Fonts\seguisym.ttf".into()],
+        ),
+        (
+            "NotoSansSymbols",
+            vec![
+                "/usr/share/fonts/truetype/noto/NotoSansSymbols-Regular.ttf".into(),
+                "/usr/share/fonts/truetype/noto/NotoSansSymbols2-Regular.ttf".into(),
+            ],
+        ),
+    ];
+    for (name, paths) in symbol_candidates {
+        if let Some(data) = load_first(paths) {
+            let data = data.tweak(tweak(smoothing, VariationCoords::default()));
+            fonts.font_data.insert(name.to_string(), Arc::new(data));
+            fonts
+                .families
+                .entry(egui::FontFamily::Proportional)
+                .or_default()
+                .push(name.to_string());
+            fonts
+                .families
+                .entry(egui::FontFamily::Monospace)
+                .or_default()
+                .push(name.to_string());
+            break;
+        }
+    }
+
     let mut mono_candidates: Vec<(&str, Vec<String>)> = Vec::new();
     #[cfg(target_os = "linux")]
     if let Some(path) = fontconfig_match("monospace") {
