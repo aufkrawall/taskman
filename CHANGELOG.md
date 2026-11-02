@@ -14,6 +14,14 @@
 
 ### Fixed
 
+- **Foreground and input focus over fullscreen 3D games when restored from minimized:** When TaskMan
+  was evoked via Ctrl+Shift+Esc while minimized to the taskbar and a borderless or exclusive
+  fullscreen 3D game (such as DOOM Eternal) held focus, the window would visually render on top
+  but input and mouse clicks were still captured by the game because Windows denied foreground
+  transfer to a target thread without merged input rights and cursor clipping remained active.
+  `force_foreground_attached` now merges both the worker and target threads with the foreground
+  queue for the activation, waits for the asynchronous transition to complete before detaching,
+  and releases Win32 cursor clipping (`ClipCursor(None)`).
 - **Search bar focus indication on window restore/activation:** Fixed an issue
   where the search bar intermittently lacked its blue focus ring and blinking text
   caret despite accepting keyboard input when the window was activated or restored

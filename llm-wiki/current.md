@@ -302,11 +302,14 @@ cost while it is there. Treat every line as a rule, not a description.
   queue being merged with is the FOREGROUND application's — the game or editor
   the user is typing into. So `window_chrome::force_foreground` does NOT attach;
   `force_foreground_attached` does, and only the hotkey worker may call it,
-  because it is the only caller that pumps its own queue. Inside it: the merge
-  is with the FOREGROUND thread only (attachments chain, so also attaching the
-  target's thread put the game in one queue with TaskMan's UI thread —
-  `merge_partner` pins this), only `SetForegroundWindow` runs while merged, a
-  hung target cancels everything and a hung foreground cancels the merge. It
+  because it is the only caller that pumps its own queue. Inside it: both the worker
+  and target UI threads are attached to the foreground thread during activation (Windows
+  restricts `SetForegroundWindow` so that the target window's thread itself must have
+  foreground rights), the worker pumps messages while polling `GetForegroundWindow() == target`
+  up to a bounded 60ms deadline, and immediately detaches both queues. 3D games confine
+  the mouse cursor with `ClipCursor`, so `force_foreground_attached`, `sync_foreground_focus`,
+  and `activate_owned` also call `ClipCursor(None)` to unclip mouse input.
+  A hung target cancels everything and a hung foreground cancels the merge. It
   does NOT show/restore/raise: the UI thread answers the same hotkey through
   its show request and does that itself (behind the anti-flash cloak).
 - **Nothing waits on another thread's window without a way out.**

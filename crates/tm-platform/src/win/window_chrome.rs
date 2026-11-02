@@ -353,7 +353,7 @@ pub fn force_foreground(hwnd: isize) {
 /// active, unminimized foreground window.
 pub fn sync_foreground_focus(hwnd: isize) -> bool {
     use windows::Win32::UI::Input::KeyboardAndMouse::{GetFocus, SetFocus};
-    use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, IsIconic};
+    use windows::Win32::UI::WindowsAndMessaging::{ClipCursor, GetForegroundWindow, IsIconic};
 
     let Some(target) = live_window(hwnd) else {
         return false;
@@ -364,6 +364,7 @@ pub fn sync_foreground_focus(hwnd: isize) -> bool {
             if GetFocus() != target {
                 let _ = SetFocus(Some(target));
             }
+            let _ = ClipCursor(None);
             true
         } else {
             false
@@ -376,8 +377,8 @@ pub fn sync_foreground_focus(hwnd: isize) -> bool {
 unsafe fn activate_owned(target: HWND) {
     use windows::Win32::UI::Input::KeyboardAndMouse::SetFocus;
     use windows::Win32::UI::WindowsAndMessaging::{
-        BringWindowToTop, HWND_TOP, SW_RESTORE, SW_SHOW, SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW,
-        SetForegroundWindow, ShowWindow,
+        BringWindowToTop, ClipCursor, HWND_TOP, SW_RESTORE, SW_SHOW, SWP_NOMOVE, SWP_NOSIZE,
+        SWP_SHOWWINDOW, SetForegroundWindow, ShowWindow,
     };
 
     unsafe {
@@ -401,6 +402,7 @@ unsafe fn activate_owned(target: HWND) {
         let _ = BringWindowToTop(target);
         let _ = SetForegroundWindow(target);
         let _ = SetFocus(Some(target));
+        let _ = ClipCursor(None);
 
         if let Ok(user32) =
             windows::Win32::System::LibraryLoader::GetModuleHandleW(windows::core::w!("user32.dll"))
@@ -413,6 +415,7 @@ unsafe fn activate_owned(target: HWND) {
             let switch_fn: SwitchToThisWindowFn = std::mem::transmute(proc);
             switch_fn(target, true.into());
         }
+        let _ = ClipCursor(None);
     }
 }
 
@@ -423,8 +426,8 @@ unsafe fn activate_owned(target: HWND) {
 /// and everything it adds (restoring, raising) is already queued here.
 unsafe fn activate_foreign(target: HWND) {
     use windows::Win32::UI::WindowsAndMessaging::{
-        HWND_TOP, SW_RESTORE, SW_SHOW, SWP_ASYNCWINDOWPOS, SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW,
-        SetForegroundWindow, ShowWindowAsync,
+        ClipCursor, HWND_TOP, SW_RESTORE, SW_SHOW, SWP_ASYNCWINDOWPOS, SWP_NOMOVE, SWP_NOSIZE,
+        SWP_SHOWWINDOW, SetForegroundWindow, ShowWindowAsync,
     };
 
     unsafe {
@@ -448,53 +451,55 @@ unsafe fn activate_foreign(target: HWND) {
         // Activating a window of another input queue queues the activation
         // to that queue; it does not wait for the owner to process it.
         let _ = SetForegroundWindow(target);
+        let _ = ClipCursor(None);
     }
 }
 
 /// Take the foreground for `hwnd` over a fullscreen application by merging
-/// this thread's input queue with the foreground thread's for one call.
+/// input queues with the foreground thread for activation.
 ///
 /// Under standard foreground-lock rules a background process cannot steal the
 /// foreground, and over an exclusive or borderless fullscreen game a plain
-/// `SetForegroundWindow` is dropped or only flashes the taskbar button. A
-/// thread that shares the FOREGROUND thread's input queue is exempt, which is
-/// the whole reason the Ctrl+Shift+Esc hook exists.
+/// `SetForegroundWindow` is dropped or only flashes the taskbar button.
+/// Attaching to the FOREGROUND thread bypasses this restriction, allowing
+/// the hotkey worker to raise TaskMan over a fullscreen game.
 ///
-/// ## Why the merge is kept this small
+/// ## Input queue merge rules
 ///
-/// `AttachThreadInput` MERGES input queues, and MSDN is blunt about what that
-/// costs: threads that share an input queue stop responding together. The
-/// queue merged with is the game or editor the user is typing into, so the
-/// merge is held to exactly one call, under these rules:
+/// `AttachThreadInput` merges input queues, and threads that share an input
+/// queue stop responding together. The merge is held to the minimum duration
+/// needed for activation under these rules:
 ///
 /// * **Only from a thread that pumps its own message queue.** The hotkey
 ///   worker does and is the only caller; the launcher's startup thread and
 ///   the UI thread inside `update()` do not.
-/// * **Only the foreground thread is attached, never the target's.**
-///   Attachments chain: attaching the target as well — as this once did —
-///   puts the game in one queue with TaskMan's UI thread, whose frame then
-///   stands between the game and its own input until the detach. The lock
-///   exemption only needs the foreground queue. See [`merge_partner`].
-/// * **Only the activation runs inside it.** Showing, restoring and raising
-///   are the window's owner's job — the UI thread answers the same hotkey
-///   through its show request — and from this thread each would be a call
-///   that waits on another thread. Activating a window of another queue is
-///   queued to that queue rather than waited on.
+/// * **The foreground thread is merged with both the worker and target threads.**
+///   Windows requires the thread that owns `target` to have foreground rights
+///   when `SetForegroundWindow(target)` is called. Both are attached for the
+///   activation, and detached immediately once the foreground transition
+///   completes (or after a bounded deadline).
+/// * **The worker pumps its messages while waiting for the foreground transition.**
+///   Windows delivers `WM_ACTIVATE` asynchronously; the worker polls
+///   `GetForegroundWindow() == target` with `MsgWaitForMultipleObjects` and
+///   pumps so no messages stall.
 /// * **A hung target cancels everything**, and a hung foreground window
 ///   cancels the merge: joining a queue that is not being pumped is how one
 ///   stuck application takes the desktop's input with it.
 /// * **A minimized target is refused.** Activating it hands it the foreground
 ///   without showing it — Windows does not restore a window it activates —
-///   and the call that restores it afterwards is the UI's own, which has no
-///   right to take the foreground back from a fullscreen game. The caller
-///   activates once the UI has restored the window (as winit's own
-///   `focus_window` also refuses minimized windows).
+///   and the call that restores it afterwards is the UI's own. The caller
+///   activates once the UI has restored the window.
+/// * **Cursor clipping is cleared.** 3D fullscreen games confine the cursor
+///   via `ClipCursor`; activating TaskMan unclips the cursor so mouse clicks
+///   and movement are unconfined.
 ///
-/// Returns whether `SetForegroundWindow` reported success.
+/// Returns whether `SetForegroundWindow` reported success or `target` became foreground.
 pub fn force_foreground_attached(hwnd: isize) -> bool {
     use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
     use windows::Win32::UI::WindowsAndMessaging::{
-        GetForegroundWindow, GetWindowThreadProcessId, IsHungAppWindow, SetForegroundWindow,
+        ClipCursor, DispatchMessageW, GetForegroundWindow, GetWindowThreadProcessId,
+        IsHungAppWindow, IsIconic, MSG, MsgWaitForMultipleObjects, PM_REMOVE, PeekMessageW,
+        QS_ALLINPUT, SetForegroundWindow, TranslateMessage,
     };
 
     let Some(target) = live_window(hwnd) else {
@@ -510,15 +515,47 @@ pub fn force_foreground_attached(hwnd: isize) -> bool {
         let foreground_thread = if foreground.0.is_null() || IsHungAppWindow(foreground).as_bool() {
             None
         } else {
-            Some(GetWindowThreadProcessId(foreground, None))
+            let tid = GetWindowThreadProcessId(foreground, None);
+            if tid == 0 { None } else { Some(tid) }
         };
         let partner = merge_partner(current, target_thread, foreground_thread);
-        let attached = partner != 0 && AttachThreadInput(current, partner, true).as_bool();
-        let activated = SetForegroundWindow(target).as_bool();
-        if attached {
-            let _ = AttachThreadInput(current, partner, false);
+        let mut attached_worker = false;
+        let mut attached_target = false;
+        if partner != 0 {
+            attached_worker = AttachThreadInput(current, partner, true).as_bool();
+            if target_thread != 0 && target_thread != partner {
+                attached_target = AttachThreadInput(target_thread, partner, true).as_bool();
+            }
         }
-        activated
+        let activated = SetForegroundWindow(target).as_bool();
+        let _ = ClipCursor(None);
+
+        if attached_worker || attached_target {
+            let deadline = windows::Win32::System::SystemInformation::GetTickCount64() + 60;
+            while windows::Win32::System::SystemInformation::GetTickCount64() < deadline {
+                if GetForegroundWindow() == target {
+                    break;
+                }
+                let remaining = deadline
+                    .saturating_sub(windows::Win32::System::SystemInformation::GetTickCount64());
+                let timeout = u32::try_from(remaining).unwrap_or(5).min(5);
+                let _ = MsgWaitForMultipleObjects(None, false, timeout, QS_ALLINPUT);
+                let mut msg = MSG::default();
+                while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
+                    let _ = TranslateMessage(&msg);
+                    DispatchMessageW(&msg);
+                }
+            }
+            if attached_target {
+                let _ = AttachThreadInput(target_thread, partner, false);
+            }
+            if attached_worker {
+                let _ = AttachThreadInput(current, partner, false);
+            }
+        }
+        let _ = ClipCursor(None);
+
+        activated || GetForegroundWindow() == target
     }
 }
 
@@ -528,8 +565,7 @@ pub fn force_foreground_attached(hwnd: isize) -> bool {
 /// window" and "foreground window hung"), and never this thread — merging a
 /// queue with itself is a no-op the detach would then have to guess about —
 /// nor the target's: when the target's thread already holds the foreground
-/// there is no lock to get past, and attaching it would chain the merge onto
-/// TaskMan's UI thread.
+/// there is no lock to get past.
 fn merge_partner(current: u32, target: u32, foreground: Option<u32>) -> u32 {
     match foreground {
         Some(thread) if thread != 0 && thread != current && thread != target => thread,
@@ -663,9 +699,58 @@ mod tests {
         }
     }
 
-    /// The merge is with the foreground thread and nothing else. Attaching
-    /// the target's thread too chained the game's input queue onto TaskMan's
-    /// UI thread, so a slow frame there stalled the game's keyboard.
+    /// Fullscreen games often confine the mouse cursor with `ClipCursor`.
+    /// Activating TaskMan must release the clip so the mouse can reach the entire window.
+    #[test]
+    fn force_foreground_clears_cursor_clipping() {
+        use windows::Win32::Foundation::RECT;
+        use windows::Win32::UI::WindowsAndMessaging::{
+            ClipCursor, CreateWindowExW, DestroyWindow, GetClipCursor, WINDOW_EX_STYLE, WS_POPUP,
+        };
+
+        let hwnd = unsafe {
+            CreateWindowExW(
+                WINDOW_EX_STYLE(0),
+                windows::core::w!("STATIC"),
+                windows::core::w!(""),
+                WS_POPUP,
+                0,
+                0,
+                16,
+                16,
+                None,
+                None,
+                None,
+                None,
+            )
+        }
+        .expect("test window");
+
+        let small = RECT {
+            left: 10,
+            top: 10,
+            right: 50,
+            bottom: 50,
+        };
+        unsafe {
+            let _ = ClipCursor(Some(&small));
+            let mut clipped = RECT::default();
+            let _ = GetClipCursor(&mut clipped);
+            assert_eq!(clipped, small);
+
+            force_foreground(hwnd.0 as isize);
+
+            let mut after = RECT::default();
+            let _ = GetClipCursor(&mut after);
+            assert_ne!(after, small);
+
+            let _ = DestroyWindow(hwnd);
+            let _ = ClipCursor(None);
+        }
+    }
+
+    /// The merge partner is only ever a live foreign foreground thread.
+    /// When the target already owns the foreground, no merge is needed.
     #[test]
     fn merge_partner_is_only_ever_a_live_foreign_foreground_thread() {
         const CURRENT: u32 = 10;

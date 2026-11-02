@@ -1,3 +1,20 @@
+## 2026-11-02 — hotkey foreground activation and cursor unclip over fullscreen 3D games
+
+- Fixed input and mouse confinement over fullscreen/borderless games when restoring from minimized:
+  When TaskMan was evoked via Ctrl+Shift+Esc while minimized to the taskbar and a game (such as DOOM Eternal)
+  held focus, TaskMan's window restored visually on top, but mouse clicks and keyboard input went directly
+  to the underlying game and the mouse cursor was trapped inside the game window.
+  Root cause: (1) Windows restricts `SetForegroundWindow` so that the calling thread alone having attached
+  input queues is not sufficient if the target window belongs to a separate thread; the target window's UI
+  thread must also share input rights with the foreground thread during activation; (2) `AttachThreadInput`
+  detached immediately before Windows completed the asynchronous `WM_ACTIVATE` transfer; (3) 3D games
+  confine the cursor with `ClipCursor`, which Windows does not automatically reset when a background window
+  is brought forward.
+  Fix in `window_chrome.rs`: `force_foreground_attached` now attaches both the worker and target threads to
+  the foreground thread, calls `SetForegroundWindow`, polls `GetForegroundWindow() == target` with bounded
+  timeout (60ms max) while pumping worker messages, detaches both queues, and calls `ClipCursor(None)`.
+  `sync_foreground_focus`, `activate_owned`, and `activate_foreign` also ensure cursor clipping is cleared.
+
 ## 2026-11-02 — multi-process crash dump creation and batch folder export
 
 - Implemented multi-process dump generation when multiple rows are selected:
