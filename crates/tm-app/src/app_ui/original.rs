@@ -131,6 +131,11 @@ pub fn top_search_panel(app: &mut TaskManApp, ui_root: &mut egui::Ui, pal: &Pale
                     .id(search_id),
             );
 
+            if (edit.changed() || edit.gained_focus() || edit.clicked()) && !ui.input(|i| i.focused)
+            {
+                ui.ctx().input_mut(|i| i.focused = true);
+            }
+
             let tab_pressed = ui
                 .input(|i| i.key_pressed(egui::Key::Tab) && !i.modifiers.ctrl && !i.modifiers.alt);
             let shift_tab = ui.input(|i| i.modifiers.shift);
@@ -4669,5 +4674,50 @@ mod tests {
             Some(btn1),
             "Shift+Tab moves focus back to button 1"
         );
+    }
+
+    #[test]
+    fn search_field_recovers_focus_indicator_when_desynced() {
+        let ctx = egui::Context::default();
+        let screen = Rect::from_min_size(Pos2::ZERO, egui::vec2(800.0, 600.0));
+        let search_id = egui::Id::new("global-search");
+        let mut text = String::from("abc");
+
+        // The search bar has widget focus in egui memory.
+        ctx.memory_mut(|m| m.request_focus(search_id));
+
+        // But raw input has focused: false (simulating desynced Win32 focus on tray/taskbar restore).
+        let mut had_focus_ring = false;
+        let mut out = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(screen),
+                focused: false,
+                events: vec![egui::Event::Text("d".into())],
+                ..Default::default()
+            },
+            |ui| {
+                // If keyboard events arrive while focused is false, recover viewport focus
+                if !ui.input(|i| i.focused)
+                    && ui.input(|i| i.events.iter().any(|e| matches!(e, egui::Event::Text(_))))
+                {
+                    ui.ctx().input_mut(|i| i.focused = true);
+                }
+
+                let edit = ui.add(egui::TextEdit::singleline(&mut text).id(search_id));
+                if (edit.changed() || edit.gained_focus() || edit.clicked())
+                    && !ui.input(|i| i.focused)
+                {
+                    ui.ctx().input_mut(|i| i.focused = true);
+                }
+
+                had_focus_ring = edit.has_focus();
+            },
+        );
+        out.textures_delta.clear();
+        assert!(
+            had_focus_ring,
+            "focus ring was displayed despite initially desynced viewport focus"
+        );
+        assert_eq!(text, "abcd");
     }
 }

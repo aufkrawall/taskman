@@ -1769,6 +1769,21 @@ impl eframe::App for TaskManApp {
             ui.ctx().request_repaint();
         }
         let ctx = ui.ctx().clone();
+        if !ctx.input(|i| i.focused)
+            && ctx.input(|i| {
+                i.events.iter().any(|e| {
+                    matches!(
+                        e,
+                        egui::Event::Key { .. }
+                            | egui::Event::Text(_)
+                            | egui::Event::Paste(_)
+                            | egui::Event::Ime(_)
+                    )
+                })
+            })
+        {
+            ctx.input_mut(|i| i.focused = true);
+        }
         crate::theme::ensure_visuals(&ctx);
         crate::fonts::poll_async_apply(&ctx);
 

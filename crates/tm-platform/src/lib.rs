@@ -143,6 +143,22 @@ pub fn force_foreground_attached(hwnd: isize) {
 #[cfg(not(target_os = "windows"))]
 pub fn force_foreground_attached(_hwnd: isize) {}
 
+/// Ensure `hwnd` owns keyboard focus when it is the system foreground window.
+///
+/// On Windows, activating a window from the tray, taskbar, or caption click does
+/// not always dispatch `WM_SETFOCUS`, which can leave egui's viewport focus flag
+/// (`i.focused`) false even while keystrokes arrive. Calling this when in foreground
+/// synchronizes Win32 focus and returns whether the window is currently foreground.
+#[cfg(target_os = "windows")]
+pub fn sync_foreground_focus(hwnd: isize) -> bool {
+    win::window_chrome::sync_foreground_focus(hwnd)
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn sync_foreground_focus(_hwnd: isize) -> bool {
+    false
+}
+
 /// Build only the platform action surface (process control, services,
 /// startup apps, ...).
 ///

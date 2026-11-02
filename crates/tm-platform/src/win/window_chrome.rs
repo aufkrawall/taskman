@@ -337,9 +337,44 @@ pub fn force_foreground(hwnd: isize) {
     }
 }
 
+/// Ensure `hwnd` owns the keyboard focus when it is the system foreground window.
+///
+/// On Windows, activating a window from the notification-area tray, via the taskbar,
+/// or by clicking the native titlebar/drag area does not always dispatch `WM_SETFOCUS`
+/// (e.g. restoring a minimized window causes `DefWindowProc(WM_ACTIVATE)` to skip `SetFocus`
+/// because the window is still iconic at activation time). Without keyboard focus on the
+/// Win32 window, winit's internal `is_focused` flag stays `false`, causing egui to report
+/// `i.focused == false`. This leaves the focused text edit (the search bar) without its
+/// accent focus ring and blinking caret even though keystrokes still reach it.
+///
+/// If our window is currently the foreground window, is visible/unminimized, and does
+/// not hold Win32 focus on this thread, claiming focus dispatches `WM_SETFOCUS` and
+/// synchronizes winit and egui focus state. Returns whether the window is currently the
+/// active, unminimized foreground window.
+pub fn sync_foreground_focus(hwnd: isize) -> bool {
+    use windows::Win32::UI::Input::KeyboardAndMouse::{GetFocus, SetFocus};
+    use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, IsIconic};
+
+    let Some(target) = live_window(hwnd) else {
+        return false;
+    };
+    unsafe {
+        let is_foreground = GetForegroundWindow() == target;
+        if is_foreground && !IsIconic(target).as_bool() {
+            if GetFocus() != target {
+                let _ = SetFocus(Some(target));
+            }
+            true
+        } else {
+            false
+        }
+    }
+}
+
 /// [`force_foreground`] on the window's own thread: nothing here can wait on
 /// anybody else.
 unsafe fn activate_owned(target: HWND) {
+    use windows::Win32::UI::Input::KeyboardAndMouse::SetFocus;
     use windows::Win32::UI::WindowsAndMessaging::{
         BringWindowToTop, HWND_TOP, SW_RESTORE, SW_SHOW, SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW,
         SetForegroundWindow, ShowWindow,
@@ -365,6 +400,7 @@ unsafe fn activate_owned(target: HWND) {
         );
         let _ = BringWindowToTop(target);
         let _ = SetForegroundWindow(target);
+        let _ = SetFocus(Some(target));
 
         if let Ok(user32) =
             windows::Win32::System::LibraryLoader::GetModuleHandleW(windows::core::w!("user32.dll"))
@@ -593,6 +629,38 @@ mod tests {
         force_foreground(0x12345);
         force_foreground_attached(0);
         force_foreground_attached(0x12345);
+    }
+
+    #[test]
+    fn sync_foreground_focus_handles_zero_invalid_and_minimized_hwnd() {
+        use windows::Win32::UI::WindowsAndMessaging::{
+            CreateWindowExW, DestroyWindow, WINDOW_EX_STYLE, WS_MINIMIZE, WS_POPUP,
+        };
+
+        assert!(!sync_foreground_focus(0));
+        assert!(!sync_foreground_focus(0x12345));
+
+        let hwnd = unsafe {
+            CreateWindowExW(
+                WINDOW_EX_STYLE(0),
+                windows::core::w!("STATIC"),
+                windows::core::w!(""),
+                WS_POPUP | WS_MINIMIZE,
+                0,
+                0,
+                16,
+                16,
+                None,
+                None,
+                None,
+                None,
+            )
+        }
+        .expect("test window");
+        assert!(!sync_foreground_focus(hwnd.0 as isize));
+        unsafe {
+            let _ = DestroyWindow(hwnd);
+        }
     }
 
     /// The merge is with the foreground thread and nothing else. Attaching

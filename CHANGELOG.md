@@ -14,6 +14,12 @@
 
 ### Fixed
 
+- **Search bar focus indication on window restore/activation:** Fixed an issue
+  where the search bar intermittently lacked its blue focus ring and blinking text
+  caret despite accepting keyboard input when the window was activated or restored
+  from the system tray, taskbar, or title bar. Synchronizing Win32 focus on the
+  foreground window ensures viewport focus state and caret animation reflect
+  active keyboard focus immediately.
 - **TCP listener state and remote peer on Windows 11:** Listening sockets
   on modern Windows 11 builds, which report `dwState = 0` via `GetExtendedTcpTable`,
   are now properly recognized as `Listen` rather than raw state `0`, and placeholder

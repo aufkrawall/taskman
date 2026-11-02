@@ -699,7 +699,22 @@ impl eframe::App for NativeApp {
             let published = tm_platform::win::instance::published_window();
             if published != 0 {
                 self.hwnd = Some(published);
+            } else {
+                use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+                if let Ok(handle) = frame.window_handle()
+                    && let RawWindowHandle::Win32(win32) = handle.as_raw()
+                {
+                    let hwnd = win32.hwnd.get();
+                    self.hwnd = Some(hwnd);
+                    tm_platform::win::instance::publish_window(hwnd);
+                }
             }
+        }
+        #[cfg(target_os = "windows")]
+        if let Some(hwnd) = self.hwnd
+            && tm_platform::sync_foreground_focus(hwnd)
+        {
+            ctx.input_mut(|i| i.focused = true);
         }
         #[cfg(target_os = "windows")]
         poll_show_event_fallback(ctx);
@@ -739,6 +754,12 @@ impl eframe::App for NativeApp {
                 // wedged one.
                 tm_platform::win::instance::publish_window(win32.hwnd.get());
             }
+        }
+        #[cfg(target_os = "windows")]
+        if let Some(hwnd) = self.hwnd
+            && tm_platform::sync_foreground_focus(hwnd)
+        {
+            ui.ctx().input_mut(|i| i.focused = true);
         }
         <app::TaskManApp as eframe::App>::ui(&mut self.inner, ui, frame);
         #[cfg(target_os = "windows")]
