@@ -1064,16 +1064,23 @@ fn row_ui(
             .then(|| unknown_cell_tip(ui, table, rect, app.processes_state.display_col(2 + li), li))
             .flatten()
     });
-    // Lowest precedence: only when nothing more specific applies does a
-    // truncated name explain itself.
-    let name_tip = (name_truncated
-        && ui.input(|input| {
-            input
-                .pointer
-                .hover_pos()
-                .is_some_and(|pos| name_rect.contains(pos))
-        }))
-    .then_some(row.name.clone());
+    // Lowest precedence: only when hovering the name column does the truncated
+    // name or command line explain the process under the pointer.
+    let hovering_name = ui.input(|input| {
+        input
+            .pointer
+            .hover_pos()
+            .is_some_and(|pos| name_rect.contains(pos))
+    });
+    let name_tip = hovering_name
+        .then(|| {
+            if name_truncated {
+                Some(row.name.clone())
+            } else {
+                row.command_line.clone()
+            }
+        })
+        .flatten();
 
     if resp.clicked() {
         if row.synthetic {
@@ -1115,7 +1122,7 @@ fn row_ui(
     // on_hover_text/context_menu consume the response (builder style). A
     // status glyph under the cursor explains itself first; otherwise the
     // row's own explanation (e.g. unattributable CPU) applies.
-    let fallback_tip = name_tip.or_else(|| row.command_line.clone());
+    let fallback_tip = name_tip;
     let resp = match (status_tip, net_tip, row.tooltip.clone(), fallback_tip) {
         (Some(tip), _, _, _) => resp.on_hover_text_at_pointer(tip),
         (None, Some(tip), _, _) => resp.on_hover_text_at_pointer(tip),

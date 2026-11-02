@@ -1327,8 +1327,17 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
                 // on_hover_text consumes the response, so both attach before
                 // the context menu does.
                 let unknown_tip = unknown_cell_tip(ui, table, rect, &visible_cols, row);
-                let fallback_tip =
-                    truncated_tip.or_else(|| command_line_tip(row).map(str::to_owned));
+                let hovering_cmd_target = pointer.is_some_and(|pt| {
+                    visible_cols.iter().enumerate().any(|(pos, col)| {
+                        matches!(col.cid, ColumnId::Name | ColumnId::CommandLine)
+                            && table.col_rect(pos, rect).contains(pt)
+                    })
+                });
+                let fallback_tip = truncated_tip.or_else(|| {
+                    hovering_cmd_target
+                        .then(|| command_line_tip(row).map(str::to_owned))
+                        .flatten()
+                });
                 let resp = match (unknown_tip, fallback_tip) {
                     (Some(tip), _) => resp.on_hover_text_at_pointer(tip),
                     (None, Some(tip)) => resp.on_hover_text_at_pointer(tip),

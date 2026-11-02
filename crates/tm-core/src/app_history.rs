@@ -531,10 +531,11 @@ impl AppHistoryDb {
             // identity contributes nothing either way.
             let prev_cpu = prev.and_then(|prev| prev.cpu_time_s);
             let prev_net = prev.and_then(|prev| prev.net_total_bytes);
+            let cores = snap.cpu.logical_count.max(1) as f64;
             let d_cpu = match (prev_cpu, p.cpu_time_s) {
                 _ if !same_process => 0.0,
                 (Some(before), Some(now)) => (now - before).max(0.0),
-                _ if p.cpu_pct > 0.0 => (p.cpu_pct as f64 / 100.0) * interval_s.max(0.0),
+                _ if p.cpu_pct > 0.0 => (p.cpu_pct as f64 / 100.0) * interval_s.max(0.0) * cores,
                 _ => 0.0,
             };
             let d_net: u64 = match (prev_net, net_total) {
@@ -899,5 +900,30 @@ mod tests {
             db3.icon_path(r"c:\program files\test.exe"),
             Some(r"c:\program files\test.exe")
         );
+    }
+
+    #[test]
+    fn fallback_cpu_pct_scales_by_logical_core_count() {
+        let mut db = AppHistoryDb::in_memory();
+        let mut p = ProcessEntry::new(10, "multicore.exe");
+        p.category = ProcCategory::App;
+        p.cpu_pct = 25.0;
+        p.cpu_time_s = None;
+
+        let mut snap = Snapshot {
+            timestamp_ms: 1000,
+            processes: vec![p],
+            ..Default::default()
+        };
+        snap.cpu.logical_count = 4;
+
+        // First observation registers baseline
+        db.observe(&snap, 1.0);
+        assert_eq!(db.entries().get("multicore.exe").unwrap().cpu_seconds, 0.0);
+
+        // Second observation accumulates delta for 1 second: 25% * 1s * 4 cores = 1.0 core-second
+        db.observe(&snap, 1.0);
+        let e = db.entries().get("multicore.exe").unwrap();
+        assert!((e.cpu_seconds - 1.0).abs() < 1e-6);
     }
 }

@@ -250,12 +250,7 @@ impl CpuLoadAccountant {
         let Some(raw) = prev.procs.get(&pid) else {
             return false;
         };
-        if let Some(expected) = start_epoch_s
-            && let Some(actual) = filetime_to_unix_seconds(raw.create_time)
-        {
-            return (actual - expected).abs() <= 1;
-        }
-        true
+        matches_start_epoch(start_epoch_s, raw.create_time)
     }
 
     /// Process base priority from the newest native process table.
@@ -268,12 +263,11 @@ impl CpuLoadAccountant {
     /// on the FIRST snapshot the UI ever shows.
     ///
     /// Identity-guarded like [`Self::is_suspended`]: a recycled PID must not
-    /// inherit the dead process's priority.
+    /// inherit the dead process's priority. Skew of up to 1 second is tolerated
+    /// to accommodate rounding differences between sysinfo and the kernel table.
     pub fn base_priority(&self, pid: u32, start_epoch_s: Option<i64>) -> Option<i32> {
         let raw = self.prev.as_ref()?.procs.get(&pid)?;
-        if let Some(expected) = start_epoch_s
-            && filetime_to_unix_seconds(raw.create_time) != Some(expected)
-        {
+        if !matches_start_epoch(start_epoch_s, raw.create_time) {
             return None;
         }
         Some(raw.base_priority)
@@ -287,9 +281,7 @@ impl CpuLoadAccountant {
     /// to a system account. Identity-guarded like [`Self::base_priority`].
     pub fn session_id_of(&self, pid: u32, start_epoch_s: Option<i64>) -> Option<u32> {
         let raw = self.prev.as_ref()?.procs.get(&pid)?;
-        if let Some(expected) = start_epoch_s
-            && filetime_to_unix_seconds(raw.create_time) != Some(expected)
-        {
+        if !matches_start_epoch(start_epoch_s, raw.create_time) {
             return None;
         }
         Some(raw.session_id)
@@ -298,9 +290,7 @@ impl CpuLoadAccountant {
     /// Process working set (in bytes) from the newest native process table.
     pub fn working_set_of(&self, pid: u32, start_epoch_s: Option<i64>) -> Option<u64> {
         let raw = self.prev.as_ref()?.procs.get(&pid)?;
-        if let Some(expected) = start_epoch_s
-            && filetime_to_unix_seconds(raw.create_time) != Some(expected)
-        {
+        if !matches_start_epoch(start_epoch_s, raw.create_time) {
             return None;
         }
         Some(raw.working_set)
@@ -309,9 +299,7 @@ impl CpuLoadAccountant {
     /// Process private working set (in bytes) from the newest native process table.
     pub fn working_set_private_of(&self, pid: u32, start_epoch_s: Option<i64>) -> Option<u64> {
         let raw = self.prev.as_ref()?.procs.get(&pid)?;
-        if let Some(expected) = start_epoch_s
-            && filetime_to_unix_seconds(raw.create_time) != Some(expected)
-        {
+        if !matches_start_epoch(start_epoch_s, raw.create_time) {
             return None;
         }
         Some(raw.working_set_private)
@@ -320,9 +308,7 @@ impl CpuLoadAccountant {
     /// Process peak working set (in bytes) from the newest native process table.
     pub fn peak_working_set_of(&self, pid: u32, start_epoch_s: Option<i64>) -> Option<u64> {
         let raw = self.prev.as_ref()?.procs.get(&pid)?;
-        if let Some(expected) = start_epoch_s
-            && filetime_to_unix_seconds(raw.create_time) != Some(expected)
-        {
+        if !matches_start_epoch(start_epoch_s, raw.create_time) {
             return None;
         }
         Some(raw.peak_working_set)
@@ -331,9 +317,7 @@ impl CpuLoadAccountant {
     /// Process commit size (PagefileUsage / private bytes) from the newest native process table.
     pub fn commit_of(&self, pid: u32, start_epoch_s: Option<i64>) -> Option<u64> {
         let raw = self.prev.as_ref()?.procs.get(&pid)?;
-        if let Some(expected) = start_epoch_s
-            && filetime_to_unix_seconds(raw.create_time) != Some(expected)
-        {
+        if !matches_start_epoch(start_epoch_s, raw.create_time) {
             return None;
         }
         Some(raw.commit)
@@ -342,9 +326,7 @@ impl CpuLoadAccountant {
     /// Process handle count from the newest native process table.
     pub fn handle_count_of(&self, pid: u32, start_epoch_s: Option<i64>) -> Option<u32> {
         let raw = self.prev.as_ref()?.procs.get(&pid)?;
-        if let Some(expected) = start_epoch_s
-            && filetime_to_unix_seconds(raw.create_time) != Some(expected)
-        {
+        if !matches_start_epoch(start_epoch_s, raw.create_time) {
             return None;
         }
         Some(raw.handle_count)
@@ -353,9 +335,7 @@ impl CpuLoadAccountant {
     /// Process thread count from the newest native process table.
     pub fn thread_count_of(&self, pid: u32, start_epoch_s: Option<i64>) -> Option<u32> {
         let raw = self.prev.as_ref()?.procs.get(&pid)?;
-        if let Some(expected) = start_epoch_s
-            && filetime_to_unix_seconds(raw.create_time) != Some(expected)
-        {
+        if !matches_start_epoch(start_epoch_s, raw.create_time) {
             return None;
         }
         Some(raw.thread_count)
@@ -661,6 +641,16 @@ pub(crate) fn filetime_to_unix_seconds(create_time: i64) -> Option<i64> {
         .checked_sub(WINDOWS_TO_UNIX_EPOCH_100NS)
         .filter(|value| *value >= 0)
         .map(|value| value / 10_000_000)
+}
+
+fn matches_start_epoch(expected: Option<i64>, actual_filetime: i64) -> bool {
+    let Some(expected) = expected else {
+        return true;
+    };
+    let Some(actual) = filetime_to_unix_seconds(actual_filetime) else {
+        return false;
+    };
+    (actual - expected).abs() <= 1
 }
 
 /// `SYSTEM_PROCESS_INFORMATION` is immediately followed by its thread array.
@@ -1877,10 +1867,21 @@ mod tests {
         // 1-second skew tolerated
         assert!(load.is_process_live(1234, Some(1_700_000_001)));
         assert!(load.is_process_live(1234, Some(1_699_999_999)));
+        assert_eq!(load.base_priority(1234, Some(1_700_000_001)), Some(8));
+        assert_eq!(load.base_priority(1234, Some(1_699_999_999)), Some(8));
+        assert_eq!(load.session_id_of(1234, Some(1_700_000_001)), Some(1));
+        assert_eq!(load.working_set_of(1234, Some(1_700_000_001)), Some(1024));
+        assert_eq!(load.handle_count_of(1234, Some(1_700_000_001)), Some(10));
+        assert_eq!(load.thread_count_of(1234, Some(1_700_000_001)), Some(4));
 
         // 2-second difference rejected (recycled PID)
         assert!(!load.is_process_live(1234, Some(1_700_000_002)));
         assert!(!load.is_process_live(1234, Some(1_699_999_998)));
+        assert_eq!(load.base_priority(1234, Some(1_700_000_002)), None);
+        assert_eq!(load.session_id_of(1234, Some(1_700_000_002)), None);
+        assert_eq!(load.working_set_of(1234, Some(1_700_000_002)), None);
+        assert_eq!(load.handle_count_of(1234, Some(1_700_000_002)), None);
+        assert_eq!(load.thread_count_of(1234, Some(1_700_000_002)), None);
 
         // None expected start accepts presence
         assert!(load.is_process_live(1234, None));

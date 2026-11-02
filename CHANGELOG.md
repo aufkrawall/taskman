@@ -2,6 +2,24 @@
 
 ## Unreleased
 
+### Fixed
+
+- **TCP listener state and remote peer on Windows 11:** Listening sockets
+  on modern Windows 11 builds, which report `dwState = 0` via `GetExtendedTcpTable`,
+  are now properly recognized as `Listen` rather than raw state `0`, and placeholder
+  endpoints (`0.0.0.0:0` or `[::]:0`) are no longer exposed as active remote peers.
+- **Table hover tooltips:** Hovering over metric columns (such as CPU, Memory, Disk,
+  or Network) in the Processes and Details tabs no longer displays the process command-line
+  tooltip over the entire row, restricting command-line tooltips to the Name and Command Line
+  columns.
+- **Process metadata consistency across timestamp skew:** Base priority, session ID,
+  working set, handle count, and thread count in `CpuLoadAccountant` now tolerate the same
+  1-second rounding discrepancy between `sysinfo` process creation times and native kernel
+  process tables as process lifetime checks, preventing intermittent telemetry drops.
+- **App history multi-core scaling:** Fallback CPU usage accumulation when cumulative
+  process CPU time is unavailable now scales system-normalized CPU percentages by the
+  machine's logical core count, avoiding core-count-factor under-reporting.
+
 ## 0.1.22 - 2026-10-26
 
 ### New

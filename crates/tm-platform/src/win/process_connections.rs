@@ -67,8 +67,10 @@ pub fn list_process_connections(pid: u32) -> Result<Vec<ProcessConnection>> {
 }
 
 /// A listener's "remote" is the all-zero placeholder, not a peer.
+/// Any endpoint with port 0 or an unspecified IP is also a placeholder.
 fn remote_of(state: TcpState, remote: SocketAddr) -> Option<SocketAddr> {
-    (state != TcpState::Listen).then_some(remote)
+    (state != TcpState::Listen && remote.port() != 0 && !remote.ip().is_unspecified())
+        .then_some(remote)
 }
 
 /// Ports are stored in network byte order in the low 16 bits.
@@ -196,8 +198,11 @@ mod tests {
     #[test]
     fn listeners_have_no_remote_peer() {
         let zero = v4(0, 0);
+        let peer: SocketAddr = "192.168.1.1:80".parse().unwrap();
         assert_eq!(remote_of(TcpState::Listen, zero), None);
-        assert_eq!(remote_of(TcpState::Established, zero), Some(zero));
+        assert_eq!(remote_of(TcpState::Listen, peer), None);
+        assert_eq!(remote_of(TcpState::Established, zero), None);
+        assert_eq!(remote_of(TcpState::Established, peer), Some(peer));
     }
 
     /// Live: a listener this test owns must be attributed to this process

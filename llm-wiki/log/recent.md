@@ -1,3 +1,25 @@
+## 2026-11-02 — bug fixes: Win11 TCP listener states, row tooltip scoping, kernel timestamp tolerance, app history core scaling
+
+- Fixed Windows 11 TCP listener state reporting and remote peer placeholder handling:
+  On modern Windows 11 builds (build 26100+), `GetExtendedTcpTable` with `TCP_TABLE_OWNER_PID_ALL`
+  returns `dwState = 0` for TCP listening sockets. `actions.rs` now maps `0 | 2 => TcpState::Listen`.
+  In `win/process_connections.rs`, `remote_of` additionally filters out zero remote ports and
+  unspecified IP placeholders (`0.0.0.0:0`, `[::]:0`) so listeners never present dummy remote
+  endpoints as active peers.
+- Fixed process and details row tooltip hijacking: `processes.rs` and `details.rs` previously
+  attached fallback command-line hover tooltips across the entire row response, causing hover
+  over metric cells (CPU, Memory, Disk, Network) to pop up huge command-line strings that obscured
+  the values. The tooltip is now strictly scoped to hover over the Name and Command Line columns.
+- Harmonized 1-second process creation timestamp tolerance across `CpuLoadAccountant`:
+  `is_process_live` and `is_suspended` already tolerated 1s skew between `sysinfo` process creation
+  times and native `NtQuerySystemInformation` kernel tables, but `base_priority`, `session_id_of`,
+  `working_set_of`, `working_set_private_of`, `peak_working_set_of`, `commit_of`, `handle_count_of`,
+  and `thread_count_of` demanded strict equality (`!= Some(expected)`), causing intermittent telemetry
+  drops on sub-second boundary differences. Replaced with `matches_start_epoch`.
+- Fixed App History fallback CPU time accumulation: when `cpu_time_s` is absent and `app_history.rs`
+  falls back to computing CPU seconds from `p.cpu_pct`, it now multiplies by `snap.cpu.logical_count`,
+  restoring correct core execution seconds from the system-normalized percentage.
+
 ## 2026-10-26 — sampled module execution, protected modules, thread search
 
 - 2026-10-26: Released v0.1.22 (tag on `efc366f`, the bump commit). Followed

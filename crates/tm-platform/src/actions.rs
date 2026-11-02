@@ -281,8 +281,10 @@ pub enum TcpState {
 impl TcpState {
     pub fn from_raw(raw: u32) -> Self {
         match raw {
+            // Windows 11 returns dwState = 0 for TCP listener sockets in
+            // GetExtendedTcpTable (TCP_TABLE_OWNER_PID_ALL).
+            0 | 2 => Self::Listen,
             1 => Self::Closed,
-            2 => Self::Listen,
             3 => Self::SynSent,
             4 => Self::SynReceived,
             5 => Self::Established,
