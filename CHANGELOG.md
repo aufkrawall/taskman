@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.1.23 - 2026-11-03
+
 ### New
 
 - **Batch process dump creation for multi-selections:** When multiple processes

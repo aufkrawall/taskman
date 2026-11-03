@@ -1,3 +1,8 @@
+## 2026-11-03 — process command-line hover, batch dumps, v0.1.23 release
+
+- 2026-11-03: Released v0.1.23. Followed `build.md` §Publishing path: `--check` + `--audit` green, stable clippy green, bump pushed on main, `build.py --all-targets` for archives (Windows x86_64/ARM64, Linux x86_64 musl) and setup installers (`taskman-v0.1.23-windows-x86_64-setup.exe`, `taskman-v0.1.23-windows-arm64-setup.exe`), `.sha256` generated beside each, `gh release create --latest`.
+  Release covers: batch memory dump creation for multi-selections with progress modal and cancellation, reliable command-line tooltips for all concrete processes on Processes and Details tabs with fallback to executable path/name, Unicode dot leader normalization and Segoe UI Symbol system fallback font for Battle.net, right-click text selection preservation and Copy/Select all context menus in Process Properties, hotkey restoration and cursor unclip over fullscreen 3D games, search bar focus synchronization on restore/activation, Win11 TCP listener state handling, and metric-column tooltip containment.
+
 ## 2026-11-02 — Battle.net dot rendering / symbol font fallback & process properties text selection context menu
 
 - Fixed Battle.net name rendering (`Battle.net` showing placeholder box `▢`):
