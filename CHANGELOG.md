@@ -12,6 +12,10 @@
   shows current file progress, overall completion (`[i/N]`), transfer rate, and
   responsive cooperative cancellation.
 
+### Improved
+
+- **Process command-line hover for all processes:** Hovering over the Name or Command Line columns on the Processes and Details tabs now reliably spawns a tooltip for every concrete process, falling back to the executable path or image name if an explicit command line was not recorded or restricted, while keeping uncollapsed process groups quiet and preventing truncated names from suppressing command-line visibility.
+
 ### Fixed
 
 - **Battle.net name rendering and Unicode dot leaders:** The friendly process description for Battle.net (`Battle.net.exe`) previously rendered a missing glyph tofu box placeholder (`▢`) instead of a period because Blizzard's PE `FileDescription` metadata uses the Unicode ONE DOT LEADER (`\u{2024}`) rather than an ASCII period, and Windows' `Segoe UI Variable` lacks that glyph. Version string extraction now normalizes Unicode dot leaders (`\u{2024}`) to ASCII periods for reliable rendering, search filtering, online searches, and clipboard copying; in addition, `Segoe UI Symbol` (`seguisym.ttf`) has been added as a system fallback font in `tm-ui` so arbitrary punctuation and mathematical symbols in process names and telemetry render properly.

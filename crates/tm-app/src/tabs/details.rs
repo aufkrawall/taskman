@@ -1333,11 +1333,15 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
                             && table.col_rect(pos, rect).contains(pt)
                     })
                 });
-                let fallback_tip = truncated_tip.or_else(|| {
-                    hovering_cmd_target
-                        .then(|| command_line_tip(row).map(str::to_owned))
-                        .flatten()
-                });
+                let fallback_tip = match (
+                    truncated_tip,
+                    hovering_cmd_target.then(|| command_line_tip(row)).flatten(),
+                ) {
+                    (Some(trunc), Some(cmd)) if trunc != cmd => Some(format!("{trunc}\n{cmd}")),
+                    (Some(trunc), _) => Some(trunc),
+                    (None, Some(cmd)) => Some(cmd.to_string()),
+                    (None, None) => None,
+                };
                 let resp = match (unknown_tip, fallback_tip) {
                     (Some(tip), _) => resp.on_hover_text_at_pointer(tip),
                     (None, Some(tip)) => resp.on_hover_text_at_pointer(tip),
@@ -1447,7 +1451,18 @@ fn detail_name(p: &ProcessEntry) -> String {
 
 fn command_line_tip(row: &Row) -> Option<&str> {
     let value = row.command_line_s.as_str();
-    (!value.trim().is_empty() && value != "—").then_some(value)
+    if !value.trim().is_empty() && value != "—" {
+        return Some(value);
+    }
+    let image = row.image_path_s.as_str();
+    if !image.trim().is_empty() && image != "—" {
+        return Some(image);
+    }
+    let name = row.name.as_str();
+    if !name.trim().is_empty() {
+        return Some(name);
+    }
+    None
 }
 
 fn identity_of(row: &Row) -> crate::app::ProcessIdentity {
@@ -5545,9 +5560,15 @@ mod tests {
     #[test]
     fn command_line_hover_requires_available_content() {
         let mut p = mk_proc(10, "svchost.exe");
-        assert!(command_line_tip(&row_from_process(&p, 0, false)).is_none());
-        p.command_line = Some(" ".into());
-        assert!(command_line_tip(&row_from_process(&p, 0, false)).is_none());
+        assert_eq!(
+            command_line_tip(&row_from_process(&p, 0, false)),
+            Some("svchost.exe")
+        );
+        p.exe_path = Some(std::path::PathBuf::from(r"C:\WINDOWS\system32\svchost.exe"));
+        assert_eq!(
+            command_line_tip(&row_from_process(&p, 0, false)),
+            Some(r"C:\WINDOWS\system32\svchost.exe")
+        );
         let command = r"C:\WINDOWS\system32\svchost.exe -k LocalServiceNetworkRestricted -p";
         p.command_line = Some(command.into());
         assert_eq!(

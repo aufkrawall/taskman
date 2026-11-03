@@ -1073,12 +1073,11 @@ fn row_ui(
             .is_some_and(|pos| name_rect.contains(pos))
     });
     let name_tip = hovering_name
-        .then(|| {
-            if name_truncated {
-                Some(row.name.clone())
-            } else {
-                row.command_line.clone()
-            }
+        .then(|| match (&row.command_line, name_truncated) {
+            (Some(cmd), true) if cmd != &row.name => Some(format!("{}\n{cmd}", row.name)),
+            (Some(cmd), _) => Some(cmd.clone()),
+            (None, true) => Some(row.name.clone()),
+            (None, false) => None,
         })
         .flatten();
 
@@ -2446,11 +2445,20 @@ fn make_own_row(p: &ProcessEntry, depth: usize) -> DisplayRow {
 }
 
 fn process_command_line(p: &ProcessEntry) -> Option<String> {
-    (!p.synthetic)
-        .then_some(p.command_line.as_deref())
-        .flatten()
-        .filter(|value| !value.trim().is_empty())
+    if p.synthetic {
+        return None;
+    }
+    p.command_line
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
         .map(str::to_owned)
+        .or_else(|| {
+            p.exe_path
+                .as_ref()
+                .map(|path| path.to_string_lossy().into_owned())
+        })
+        .or_else(|| Some(p.name.clone()))
 }
 
 /// Localized hover text for the CPU pseudo-rows explaining WHICH programs
@@ -4643,7 +4651,12 @@ mod tests {
         assert!(process_command_line(&p).is_none());
         p.synthetic = false;
         p.command_line = Some(" ".into());
-        assert!(process_command_line(&p).is_none());
+        assert_eq!(process_command_line(&p).as_deref(), Some("svchost.exe"));
+        p.exe_path = Some(std::path::PathBuf::from(r"C:\WINDOWS\system32\svchost.exe"));
+        assert_eq!(
+            process_command_line(&p).as_deref(),
+            Some(r"C:\WINDOWS\system32\svchost.exe")
+        );
     }
 
     #[test]
