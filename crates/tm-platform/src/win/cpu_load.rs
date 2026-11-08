@@ -114,9 +114,13 @@ struct ProcRaw {
     hard_faults: Option<u64>,
     /// Read + write + other I/O operation counts since process start.
     io_ops: Option<u64>,
-    /// `ReadTransferCount` / `WriteTransferCount` since process start.
+    /// `ReadTransferCount` / `WriteTransferCount` / `OtherTransferCount` since process start.
     io_read_bytes: Option<u64>,
     io_write_bytes: Option<u64>,
+    io_other_bytes: Option<u64>,
+    io_read_ops: Option<u64>,
+    io_write_ops: Option<u64>,
+    io_other_ops: Option<u64>,
 }
 
 /// Per-process load for one sampling window.
@@ -142,6 +146,18 @@ pub struct ProcCpu {
     /// Cumulative I/O bytes since process start.
     pub io_read_total: Option<u64>,
     pub io_write_total: Option<u64>,
+    /// Inter-process/other I/O rate and total (ioctl, device control, named pipes, ALPC).
+    pub io_other_bps: Option<f64>,
+    pub io_other_total: Option<u64>,
+    pub io_read_ops: Option<u64>,
+    pub io_write_ops: Option<u64>,
+    pub io_other_ops: Option<u64>,
+    pub io_read_bytes_delta: Option<u64>,
+    pub io_write_bytes_delta: Option<u64>,
+    pub io_other_bytes_delta: Option<u64>,
+    pub io_read_ops_delta: Option<u64>,
+    pub io_write_ops_delta: Option<u64>,
+    pub io_other_ops_delta: Option<u64>,
 }
 
 /// One executable image observed among the processes that terminated
@@ -525,8 +541,12 @@ impl CpuLoadAccountant {
             let commit = read_usize(buf, pos + off.commit) as u64;
             let hard_faults = (pos + off.hard_faults + 4 <= record_end)
                 .then(|| u64::from(read_u32(buf, pos + off.hard_faults)));
-            let io_ops = read_io_operation_count(buf, pos, record_end, &off);
-            let io_bytes = read_io_transfer_bytes(buf, pos, record_end, &off);
+            let raw_io = read_raw_io_counters(buf, pos, record_end, &off);
+            let io_ops = raw_io.map(|io| {
+                io.read_ops
+                    .saturating_add(io.write_ops)
+                    .saturating_add(io.other_ops)
+            });
             let buf_base = buf.as_ptr() as usize;
             let name = parse_image_name(buf, buf_base, pos, written, &off);
 
@@ -556,8 +576,12 @@ impl CpuLoadAccountant {
                         name,
                         hard_faults,
                         io_ops,
-                        io_read_bytes: io_bytes.map(|(read, _)| read),
-                        io_write_bytes: io_bytes.map(|(_, write)| write),
+                        io_read_bytes: raw_io.map(|io| io.read_bytes),
+                        io_write_bytes: raw_io.map(|io| io.write_bytes),
+                        io_other_bytes: raw_io.map(|io| io.other_bytes),
+                        io_read_ops: raw_io.map(|io| io.read_ops),
+                        io_write_ops: raw_io.map(|io| io.write_ops),
+                        io_other_ops: raw_io.map(|io| io.other_ops),
                     },
                 );
             }
@@ -584,47 +608,34 @@ pub(crate) fn current_creation_epoch(pid: u32) -> Option<i64> {
     filetime_to_unix_seconds(raw.create_time)
 }
 
-/// Sum of the three `IO_COUNTERS` operation counts, or `None` when this
-/// record does not reach the block.
-///
-/// Operation counts and not transfer counts: the question these answer is
-/// "how much work did this process hand the storage stack", and a disk's
-/// active time tracks the number of requests far better than their size.
-fn read_io_operation_count(
-    buf: &[u8],
-    pos: usize,
-    record_end: usize,
-    off: &Offsets,
-) -> Option<u64> {
-    let base = io_counters_base(pos, record_end, off)?;
-    let read = nonneg(read_i64(buf, base));
-    let write = nonneg(read_i64(buf, base + 8));
-    let other = nonneg(read_i64(buf, base + 16));
-    Some(read.saturating_add(write).saturating_add(other))
+/// Raw `IO_COUNTERS` read directly from the kernel process table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct RawIoCounters {
+    read_ops: u64,
+    write_ops: u64,
+    other_ops: u64,
+    read_bytes: u64,
+    write_bytes: u64,
+    other_bytes: u64,
 }
 
-/// `ReadTransferCount` and `WriteTransferCount`: the bytes the Disk column
-/// shows.
-///
-/// These come from the kernel table rather than `GetProcessIoCounters`
-/// because that needs a process HANDLE, and an unelevated session cannot open
-/// a SYSTEM or elevated process — so sysinfo reports a flat ZERO for about
-/// half the list. A measured-looking zero on a process moving 200 KB/s is
-/// exactly the fabricated value this program must never print.
-fn read_io_transfer_bytes(
+/// The six `IO_COUNTERS` 64-bit integers: read/write/other operation counts,
+/// followed by read/write/other transfer counts.
+fn read_raw_io_counters(
     buf: &[u8],
     pos: usize,
     record_end: usize,
     off: &Offsets,
-) -> Option<(u64, u64)> {
+) -> Option<RawIoCounters> {
     let base = io_counters_base(pos, record_end, off)?;
-    // Deliberately NOT `OtherTransferCount`: it counts ioctl and device
-    // control payloads, which native Task Manager leaves out of its Disk
-    // column too.
-    Some((
-        nonneg(read_i64(buf, base + 24)),
-        nonneg(read_i64(buf, base + 32)),
-    ))
+    Some(RawIoCounters {
+        read_ops: nonneg(read_i64(buf, base)),
+        write_ops: nonneg(read_i64(buf, base + 8)),
+        other_ops: nonneg(read_i64(buf, base + 16)),
+        read_bytes: nonneg(read_i64(buf, base + 24)),
+        write_bytes: nonneg(read_i64(buf, base + 32)),
+        other_bytes: nonneg(read_i64(buf, base + 40)),
+    })
 }
 
 fn io_counters_base(pos: usize, record_end: usize, off: &Offsets) -> Option<usize> {
@@ -884,6 +895,17 @@ fn build_sample(
                     io_write_bps: None,
                     io_read_total: None,
                     io_write_total: None,
+                    io_other_bps: None,
+                    io_other_total: None,
+                    io_read_ops: None,
+                    io_write_ops: None,
+                    io_other_ops: None,
+                    io_read_bytes_delta: None,
+                    io_write_bytes_delta: None,
+                    io_other_bytes_delta: None,
+                    io_read_ops_delta: None,
+                    io_write_ops_delta: None,
+                    io_other_ops_delta: None,
                 },
             );
             continue;
@@ -901,10 +923,22 @@ fn build_sample(
             let before = previous.and_then(before)?;
             (dt_s > 0.0).then(|| now.saturating_sub(before) as f64 / dt_s)
         };
+        let delta = |now: Option<u64>, before: fn(&ProcRaw) -> Option<u64>| -> Option<u64> {
+            let now = now?;
+            let before = previous.and_then(before)?;
+            Some(now.saturating_sub(before))
+        };
         let io_ops_per_s = rate(cur.io_ops, |p| p.io_ops);
         let hard_faults_per_s = rate(cur.hard_faults, |p| p.hard_faults);
         let io_read_bps = rate(cur.io_read_bytes, |p| p.io_read_bytes);
         let io_write_bps = rate(cur.io_write_bytes, |p| p.io_write_bytes);
+        let io_other_bps = rate(cur.io_other_bytes, |p| p.io_other_bytes);
+        let io_read_bytes_delta = delta(cur.io_read_bytes, |p| p.io_read_bytes);
+        let io_write_bytes_delta = delta(cur.io_write_bytes, |p| p.io_write_bytes);
+        let io_other_bytes_delta = delta(cur.io_other_bytes, |p| p.io_other_bytes);
+        let io_read_ops_delta = delta(cur.io_read_ops, |p| p.io_read_ops);
+        let io_write_ops_delta = delta(cur.io_write_ops, |p| p.io_write_ops);
+        let io_other_ops_delta = delta(cur.io_other_ops, |p| p.io_other_ops);
         let in_window = match prev.procs.get(&pid) {
             // Same identity: the delta since the previous sample.
             Some(p) if p.create_time == cur.create_time => {
@@ -931,6 +965,17 @@ fn build_sample(
                 io_write_bps,
                 io_read_total: cur.io_read_bytes,
                 io_write_total: cur.io_write_bytes,
+                io_other_bps,
+                io_other_total: cur.io_other_bytes,
+                io_read_ops: cur.io_read_ops,
+                io_write_ops: cur.io_write_ops,
+                io_other_ops: cur.io_other_ops,
+                io_read_bytes_delta,
+                io_write_bytes_delta,
+                io_other_bytes_delta,
+                io_read_ops_delta,
+                io_write_ops_delta,
+                io_other_ops_delta,
             },
         );
     }
@@ -1609,6 +1654,10 @@ mod tests {
             io_ops: None,
             io_read_bytes: None,
             io_write_bytes: None,
+            io_other_bytes: None,
+            io_read_ops: None,
+            io_write_ops: None,
+            io_other_ops: None,
         }
     }
 
@@ -1648,6 +1697,64 @@ mod tests {
         assert_eq!(out.exited_count, 1);
         assert_eq!(out.exited_images.len(), 1);
         assert_eq!(out.exited_images[0].name, "old.exe");
+    }
+
+    #[test]
+    fn build_sample_computes_io_rates_and_deltas_including_other_ipc() {
+        let mut prev_proc = proc_raw(111, 1e7 as i64, 1e7 as i64, "io.exe");
+        prev_proc.io_ops = Some(50);
+        prev_proc.io_read_ops = Some(20);
+        prev_proc.io_write_ops = Some(10);
+        prev_proc.io_other_ops = Some(20);
+        prev_proc.io_read_bytes = Some(1_000);
+        prev_proc.io_write_bytes = Some(500);
+        prev_proc.io_other_bytes = Some(2_000);
+
+        let mut cur_proc = proc_raw(111, 2e7 as i64, 2e7 as i64, "io.exe");
+        cur_proc.io_ops = Some(80);
+        cur_proc.io_read_ops = Some(35);
+        cur_proc.io_write_ops = Some(15);
+        cur_proc.io_other_ops = Some(30);
+        cur_proc.io_read_bytes = Some(3_000);
+        cur_proc.io_write_bytes = Some(1_500);
+        cur_proc.io_other_bytes = Some(4_000);
+
+        let prev = PrevSample {
+            at: Instant::now(),
+            cores: vec![core(0, 0, 0)],
+            procs: HashMap::from([(100, prev_proc)]),
+        };
+        let cores = vec![core(0, 2e7 as i64, 0)];
+        let out = build_sample(
+            &prev,
+            &cores,
+            &HashMap::from([(100, cur_proc)]),
+            2.0, /* s */
+        );
+
+        let p100 = out.procs.get(&100).expect("process 100 present");
+        // Δread = 2000 B / 2.0 s = 1000 B/s
+        assert_eq!(p100.io_read_bps, Some(1000.0));
+        assert_eq!(p100.io_read_bytes_delta, Some(2000));
+        assert_eq!(p100.io_read_ops_delta, Some(15));
+
+        // Δwrite = 1000 B / 2.0 s = 500 B/s
+        assert_eq!(p100.io_write_bps, Some(500.0));
+        assert_eq!(p100.io_write_bytes_delta, Some(1000));
+        assert_eq!(p100.io_write_ops_delta, Some(5));
+
+        // Δother (IPC) = 2000 B / 2.0 s = 1000 B/s
+        assert_eq!(p100.io_other_bps, Some(1000.0));
+        assert_eq!(p100.io_other_bytes_delta, Some(2000));
+        assert_eq!(p100.io_other_ops_delta, Some(10));
+
+        // Totals
+        assert_eq!(p100.io_read_total, Some(3_000));
+        assert_eq!(p100.io_write_total, Some(1_500));
+        assert_eq!(p100.io_other_total, Some(4_000));
+        assert_eq!(p100.io_read_ops, Some(35));
+        assert_eq!(p100.io_write_ops, Some(15));
+        assert_eq!(p100.io_other_ops, Some(30));
     }
 
     #[test]
@@ -1849,6 +1956,10 @@ mod tests {
                 io_ops: None,
                 io_read_bytes: None,
                 io_write_bytes: None,
+                io_other_bytes: None,
+                io_read_ops: None,
+                io_write_ops: None,
+                io_other_ops: None,
             },
         );
         load.prev = Some(PrevSample {

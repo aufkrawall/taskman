@@ -48,6 +48,7 @@ pub enum ProcessPropertiesTab {
     Modules,
     Network,
     Services,
+    Io,
     Security,
 }
 
@@ -60,6 +61,7 @@ pub struct ProcessPropertiesDialog {
     modules: crate::tabs::modules::State,
     network: crate::tabs::connections::State,
     services: crate::tabs::hosted_services::State,
+    io: crate::tabs::process_io::State,
     #[cfg(target_os = "windows")]
     security: Option<tm_platform::win::ProcessSecurityInfo>,
     #[cfg(target_os = "windows")]
@@ -87,6 +89,7 @@ pub fn open_process_properties(app: &mut TaskManApp, identity: crate::app::Proce
         modules,
         network: Default::default(),
         services: Default::default(),
+        io: Default::default(),
         #[cfg(target_os = "windows")]
         security: None,
         #[cfg(target_os = "windows")]
@@ -3320,7 +3323,7 @@ pub fn dump_progress_dialog(
     }
 }
 
-fn process_properties_target<'a>(
+pub(crate) fn process_properties_target<'a>(
     snapshot: &'a tm_core::model::Snapshot,
     identity: &crate::app::ProcessIdentity,
 ) -> Option<&'a ProcessEntry> {
@@ -3448,6 +3451,10 @@ fn option_count(value: Option<u32>) -> String {
         || "—".into(),
         |value| format::format_thousands(value.into()),
     )
+}
+
+fn option_count_u64(value: Option<u64>) -> String {
+    value.map_or_else(|| "—".into(), format::format_thousands)
 }
 
 #[derive(Default)]
@@ -4082,6 +4089,18 @@ fn process_properties_statistics(ui: &mut egui::Ui, process: &ProcessEntry) {
                 format::format_bytes_loc(process.disk_write_total),
                 false,
             );
+            property_row(
+                ui,
+                i18n::tr(K::PropIoOtherBytes),
+                option_bytes(process.io_other_total),
+                false,
+            );
+            property_row(
+                ui,
+                i18n::tr(K::PropIoOther),
+                option_count_u64(process.io_other_ops),
+                false,
+            );
             // What the process actually costs the DISKS, next to the byte
             // counters above that count cache hits too.
             property_row(
@@ -4185,6 +4204,7 @@ pub fn process_properties_dialog(app: &mut TaskManApp, ctx: &egui::Context) {
             }
             ProcessPropertiesTab::Network => dialog.network.request_refresh(),
             ProcessPropertiesTab::Services => dialog.services.request_refresh(),
+            ProcessPropertiesTab::Io => dialog.io.request_refresh(),
             #[cfg(target_os = "windows")]
             ProcessPropertiesTab::Security => {
                 dialog.security = None;
@@ -4256,6 +4276,7 @@ pub fn process_properties_dialog(app: &mut TaskManApp, ctx: &egui::Context) {
         }
         _ => {}
     }
+    dialog.io.tick(app, ctx, &identity);
     let pal = theme::palette_ctx(ctx);
     let snapshot = app.latest_snapshot();
     let process = snapshot
@@ -4340,6 +4361,7 @@ pub fn process_properties_dialog(app: &mut TaskManApp, ctx: &egui::Context) {
                     K::TabServices,
                     capabilities.services_list,
                 ),
+                (ProcessPropertiesTab::Io, K::TabIo, true),
                 (
                     ProcessPropertiesTab::Security,
                     K::Security,
@@ -4449,6 +4471,15 @@ pub fn process_properties_dialog(app: &mut TaskManApp, ctx: &egui::Context) {
                         .show(ui, |ui| match dialog.tab {
                             ProcessPropertiesTab::Statistics => {
                                 process_properties_statistics(ui, process)
+                            }
+                            ProcessPropertiesTab::Io => {
+                                crate::tabs::process_io::show(
+                                    app,
+                                    ui,
+                                    &mut dialog.io,
+                                    process,
+                                    &pal,
+                                );
                             }
                             ProcessPropertiesTab::Security => {
                                 #[cfg(target_os = "windows")]
@@ -4860,6 +4891,33 @@ mod tests {
             ..Default::default()
         };
         assert!(process_properties_target(&snapshot, &identity).is_none());
+    }
+
+    #[test]
+    fn process_properties_io_tab_initializes_and_tracks_samples() {
+        let mut p = ProcessEntry::new(100, "sample.exe");
+        p.start_epoch_s = Some(50);
+        p.disk_read_bps = 100_000.0;
+        p.disk_write_bps = 50_000.0;
+        p.io_other_bps = Some(25_000.0);
+        p.io_read_bytes_delta = Some(10_000);
+        p.io_write_bytes_delta = Some(5_000);
+        p.io_other_bytes_delta = Some(2_500);
+
+        let snapshot = tm_core::model::Snapshot {
+            timestamp_ms: 1000,
+            processes: vec![p],
+            ..Default::default()
+        };
+        let identity = crate::app::ProcessIdentity {
+            pid: 100,
+            start_epoch_s: Some(50),
+        };
+        assert!(process_properties_target(&snapshot, &identity).is_some());
+
+        let io_state = crate::tabs::process_io::State::default();
+        assert!(io_state.show_other_graph);
+        assert!(io_state.unit_is_rate);
     }
 
     /// Details shows the image name, never the description. The description

@@ -603,6 +603,31 @@ pub struct ProcessEntry {
     #[serde(default)]
     pub hard_faults_per_s: Option<f64>,
 
+    /// Inter-process and control I/O (operations that do not target physical disks,
+    /// e.g. named pipes, ALPC, device controls/IOCTLs, sockets).
+    #[serde(default)]
+    pub io_other_bps: Option<f64>,
+    #[serde(default)]
+    pub io_other_total: Option<u64>,
+    #[serde(default)]
+    pub io_read_ops: Option<u64>,
+    #[serde(default)]
+    pub io_write_ops: Option<u64>,
+    #[serde(default)]
+    pub io_other_ops: Option<u64>,
+    #[serde(default)]
+    pub io_read_bytes_delta: Option<u64>,
+    #[serde(default)]
+    pub io_write_bytes_delta: Option<u64>,
+    #[serde(default)]
+    pub io_other_bytes_delta: Option<u64>,
+    #[serde(default)]
+    pub io_read_ops_delta: Option<u64>,
+    #[serde(default)]
+    pub io_write_ops_delta: Option<u64>,
+    #[serde(default)]
+    pub io_other_ops_delta: Option<u64>,
+
     /// Per-process network rates; None where the platform cannot measure them.
     pub net_recv_bps: Option<f64>,
     pub net_sent_bps: Option<f64>,
@@ -706,6 +731,17 @@ impl ProcessEntry {
             disk_phys_write_bps: None,
             io_ops_per_s: None,
             hard_faults_per_s: None,
+            io_other_bps: None,
+            io_other_total: None,
+            io_read_ops: None,
+            io_write_ops: None,
+            io_other_ops: None,
+            io_read_bytes_delta: None,
+            io_write_bytes_delta: None,
+            io_other_bytes_delta: None,
+            io_read_ops_delta: None,
+            io_write_ops_delta: None,
+            io_other_ops_delta: None,
             net_recv_bps: None,
             net_sent_bps: None,
             net_recv_total: None,

@@ -1661,6 +1661,17 @@ impl Sampler {
             entry.disk_write_total = pc
                 .and_then(|c| c.io_write_total)
                 .unwrap_or(du.total_written_bytes);
+            entry.io_other_bps = pc.and_then(|c| c.io_other_bps);
+            entry.io_other_total = pc.and_then(|c| c.io_other_total);
+            entry.io_read_ops = pc.and_then(|c| c.io_read_ops);
+            entry.io_write_ops = pc.and_then(|c| c.io_write_ops);
+            entry.io_other_ops = pc.and_then(|c| c.io_other_ops);
+            entry.io_read_bytes_delta = pc.and_then(|c| c.io_read_bytes_delta);
+            entry.io_write_bytes_delta = pc.and_then(|c| c.io_write_bytes_delta);
+            entry.io_other_bytes_delta = pc.and_then(|c| c.io_other_bytes_delta);
+            entry.io_read_ops_delta = pc.and_then(|c| c.io_read_ops_delta);
+            entry.io_write_ops_delta = pc.and_then(|c| c.io_write_ops_delta);
+            entry.io_other_ops_delta = pc.and_then(|c| c.io_other_ops_delta);
             entry.has_window = has_window;
             entry.service_name = service_catalog
                 .names_by_pid

@@ -1,3 +1,14 @@
+## 2026-11-08 — Process Properties I/O page with inter-process (IPC) telemetry
+
+- Added Process Hacker / System Informer style I/O tab to Process Properties dialog:
+  - Rolling history graphs for Read (yellow trace), Write (purple trace), and Inter-Process (IPC / Other, cyan trace) I/O.
+  - Pixel-snapped hairlines, dark canvas background (`#000700`), fine green gridlines (`#003000`), live rate/delta overlays (`R: 0`, `W: 0`, `O: 0` in bright green `#00ff00`), and cursor hover tooltips showing sample age and formatted byte values.
+  - Comprehensive "Disk & Inter-Process I/O" table breaking down cumulative operation counts (Reads, Writes, Other), cumulative transfer bytes, interval deltas, and current transfer rates.
+  - Inter-process I/O extraction: `read_raw_io_counters` in `crates/tm-platform/src/win/cpu_load.rs` reads all six 64-bit integers from the kernel table's `IO_COUNTERS` block (`ReadOperationCount`, `WriteOperationCount`, `OtherOperationCount`, `ReadTransferCount`, `WriteTransferCount`, `OtherTransferCount`), reporting non-disk I/O (named pipes, ALPC, device controls/IOCTLs, and sockets) across all processes (including protected and elevated system processes).
+  - Populated `ProcessEntry` fields: `io_other_bps`, `io_other_total`, `io_read_ops`, `io_write_ops`, `io_other_ops`, `io_read_bytes_delta`, `io_write_bytes_delta`, `io_other_bytes_delta`, `io_read_ops_delta`, `io_write_ops_delta`, `io_other_ops_delta`.
+  - Added localized strings for I/O page components (`TabIo`, `PropIo*`).
+  - Added Options menu with graph customization (toggle IPC graph, switch between rate and delta units, clear history) and process protection status display.
+
 ## 2026-11-03 — process command-line hover, batch dumps, v0.1.23 release
 
 - 2026-11-03: Released v0.1.23. Followed `build.md` §Publishing path: `--check` + `--audit` green, stable clippy green, bump pushed on main, `build.py --all-targets` for archives (Windows x86_64/ARM64, Linux x86_64 musl) and setup installers (`taskman-v0.1.23-windows-x86_64-setup.exe`, `taskman-v0.1.23-windows-arm64-setup.exe`), `.sha256` generated beside each, `gh release create --latest`.

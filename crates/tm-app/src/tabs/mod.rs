@@ -7,6 +7,7 @@ pub mod hosted_services;
 pub mod inspector;
 pub mod modules;
 pub mod performance;
+pub mod process_io;
 pub mod processes;
 pub mod services;
 pub mod startup;

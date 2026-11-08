@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+### New
+
+- **Process Properties I/O page with inter-process (IPC) telemetry:** Added a dedicated "I/O" tab to the Process Properties dialog featuring Process Hacker / System Informer style rolling history graphs for Read (yellow), Write (purple), and Inter-Process / Other (cyan) I/O, along with a "Disk & Inter-Process I/O" table breaking down cumulative operation counts (Reads, Writes, Other), cumulative transfer bytes, interval deltas, and current transfer rates. Inter-process I/O captures operations not involving physical disks (such as named pipes, ALPC, device controls/IOCTLs, and socket communications) read directly from the Windows kernel process table's `IO_COUNTERS` block without requiring elevated process handles.
+
+
 ## 0.1.23 - 2026-11-03
 
 ### New

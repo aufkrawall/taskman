@@ -819,8 +819,17 @@ rebase runbook.
   process termination through an explicit dialog. Context menus now include
   consistent copy/search/location/properties/dump/module actions as applicable.
 - Process Properties (2026-10-21) is the System Informer-style inspector:
-  General, Statistics, Threads, Modules, Network, Services, Security. The
-  list pages query only while shown. Threads come from one
+  General, Statistics, Threads, Modules, Network, Services, I/O, Security. The
+  list pages query only while shown.
+  The I/O page (2026-11-08) provides System Informer-style rolling graphs for
+  Read, Write, and Inter-Process (Other / IPC) I/O with auto-scaling y-axes,
+  fine green gridlines, live rate / delta overlays, and cursor hover inspection.
+  Below the graphs, the Disk & Inter-Process I/O table breaks down cumulative
+  operation counts (Reads, Writes, Other), cumulative transfer bytes, interval
+  byte deltas, and current transfer rates. Inter-process I/O captures operations
+  not involving physical disks (named pipes, ALPC, device controls/IOCTLs, and
+  socket communication) directly from the kernel process table's `IO_COUNTERS`.
+  Threads come from one
   `SystemExtendedProcessInformation` snapshot (no handle needed, so SYSTEM
   and service processes work unelevated); Windows 11 build 26300 ZEROES that
   record's `Win32StartAddress`/`StartAddress`/stack bounds for callers

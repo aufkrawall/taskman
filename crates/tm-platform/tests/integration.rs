@@ -230,6 +230,11 @@ fn sample_produces_sane_snapshot() {
         "{} reports no I/O bytes; the Disk column is back on handle-based counters",
         protected.name
     );
+    assert!(
+        protected.io_other_total.unwrap_or(0) > 0,
+        "{} reports no other (IPC) I/O bytes; kernel table counters missed",
+        protected.name
+    );
     assert!(!s2.disks.is_empty());
     for d in &s2.disks {
         assert!(d.total_bytes > 0 || d.media == MediaKind::Unknown);
