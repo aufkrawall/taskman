@@ -4464,22 +4464,38 @@ pub fn process_properties_dialog(app: &mut TaskManApp, ctx: &egui::Context) {
                         },
                     );
                 }
+                ProcessPropertiesTab::Io => {
+                    let size = egui::vec2(ui.available_width(), body_height);
+                    ui.allocate_ui_with_layout(
+                        size,
+                        egui::Layout::top_down(egui::Align::Min),
+                        |ui| {
+                            ui.set_min_size(size);
+                            egui::ScrollArea::vertical()
+                                .max_height(body_height)
+                                .max_width(size.x)
+                                .auto_shrink([false, false])
+                                .show(ui, |ui| {
+                                    crate::tabs::process_io::show(
+                                        app,
+                                        ui,
+                                        &mut dialog.io,
+                                        process,
+                                        &pal,
+                                    );
+                                });
+                        },
+                    );
+                }
                 _ => {
+                    let body_width = ui.available_width();
                     egui::ScrollArea::vertical()
                         .max_height(body_height)
+                        .max_width(body_width)
                         .auto_shrink([false, true])
                         .show(ui, |ui| match dialog.tab {
                             ProcessPropertiesTab::Statistics => {
                                 process_properties_statistics(ui, process)
-                            }
-                            ProcessPropertiesTab::Io => {
-                                crate::tabs::process_io::show(
-                                    app,
-                                    ui,
-                                    &mut dialog.io,
-                                    process,
-                                    &pal,
-                                );
                             }
                             ProcessPropertiesTab::Security => {
                                 #[cfg(target_os = "windows")]

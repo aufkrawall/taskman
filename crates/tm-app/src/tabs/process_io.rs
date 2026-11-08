@@ -109,13 +109,17 @@ fn paint_group_box(
     let title_font = egui::FontId::proportional(12.0);
     let title_galley = painter.layout_no_wrap(title.to_owned(), title_font, pal.text);
     let title_w = title_galley.size().x;
+    let half = (hair * 0.5).max(0.5);
+    let left = rect.left() + half;
+    let right = rect.right() - half;
+    let bottom = rect.bottom() - half;
     let box_top = rect.top() + 7.0;
     let label_x = rect.left() + 10.0;
 
     // Border segments
     painter.line_segment(
         [
-            egui::pos2(rect.left(), box_top),
+            egui::pos2(left, box_top),
             egui::pos2(label_x - 4.0, box_top),
         ],
         Stroke::new(hair, pal.stroke),
@@ -123,29 +127,20 @@ fn paint_group_box(
     painter.line_segment(
         [
             egui::pos2(label_x + title_w + 4.0, box_top),
-            egui::pos2(rect.right(), box_top),
+            egui::pos2(right, box_top),
         ],
         Stroke::new(hair, pal.stroke),
     );
     painter.line_segment(
-        [
-            egui::pos2(rect.right(), box_top),
-            egui::pos2(rect.right(), rect.bottom()),
-        ],
+        [egui::pos2(right, box_top), egui::pos2(right, bottom)],
         Stroke::new(hair, pal.stroke),
     );
     painter.line_segment(
-        [
-            egui::pos2(rect.left(), rect.bottom()),
-            egui::pos2(rect.right(), rect.bottom()),
-        ],
+        [egui::pos2(left, bottom), egui::pos2(right, bottom)],
         Stroke::new(hair, pal.stroke),
     );
     painter.line_segment(
-        [
-            egui::pos2(rect.left(), box_top),
-            egui::pos2(rect.left(), rect.bottom()),
-        ],
+        [egui::pos2(left, box_top), egui::pos2(left, bottom)],
         Stroke::new(hair, pal.stroke),
     );
 
@@ -442,15 +437,12 @@ pub fn show(
     // 4. Statistics Box: "Disk & Inter-Process I/O"
     let ppp = ui.ctx().pixels_per_point();
     let hair = if ppp > 0.0 { 1.0 / ppp } else { 1.0 };
-    let avail_w = ui.available_width().max(200.0);
-
     // Frame for stats box
     egui::Frame::group(ui.style())
         .fill(pal.card_bg)
         .stroke(Stroke::new(hair, pal.stroke))
         .inner_margin(egui::Margin::same(10))
         .show(ui, |ui| {
-            ui.set_width(avail_w - 20.0);
             ui.horizontal(|ui| {
                 ui.strong(i18n::tr(K::PropIoSectionDisk));
                 ui.add_space(8.0);
