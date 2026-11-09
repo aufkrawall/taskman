@@ -167,9 +167,10 @@ fn paint_frame(
     pal: &crate::theme::Palette,
     cols: usize,
     rows: usize,
+    bg: Color32,
 ) {
     let hair = hairline(ppp);
-    painter.rect_filled(rect, 4.0, pal.card_bg);
+    painter.rect_filled(rect, 4.0, bg);
     for k in 1..rows {
         let y = snap_line(rect.top() + rect.height() * k as f32 / rows as f32, ppp);
         painter.line_segment(
@@ -737,7 +738,7 @@ fn core_chart_impl(
     let rect = snap_rect(alloc, ppp);
     let painter = ui.painter_at(rect).with_clip_rect(rect);
 
-    paint_frame(&painter, rect, ppp, &pal, 4, 4);
+    paint_frame(&painter, rect, ppp, &pal, 4, 4, pal.card_bg);
 
     if response.has_focus() {
         painter.rect_stroke(
@@ -917,6 +918,22 @@ pub fn chart_multi(
     axis: Option<TimeAxis>,
     fmt: ValueFmt,
 ) -> Response {
+    let pal = crate::theme::palette(ui);
+    chart_multi_with_bg(ui, size, series, y_max, axis, fmt, pal.card_bg)
+}
+
+/// A multi-series rolling line chart with a caller-selected background surface
+/// (such as `pal.card_bg_sunken` for charts embedded within modal dialogs whose
+/// windows already use `card_bg`).
+pub fn chart_multi_with_bg(
+    ui: &mut egui::Ui,
+    size: Vec2,
+    series: &[MultiSeries],
+    y_max: f64,
+    axis: Option<TimeAxis>,
+    fmt: ValueFmt,
+    bg: Color32,
+) -> Response {
     let (alloc, response) = ui.allocate_exact_size(size, egui::Sense::click());
     let label = series
         .iter()
@@ -933,7 +950,7 @@ pub fn chart_multi(
     let rect = snap_rect(alloc, ppp);
     let painter = ui.painter_at(rect).with_clip_rect(rect);
 
-    paint_frame(&painter, rect, ppp, &pal, 6, 4);
+    paint_frame(&painter, rect, ppp, &pal, 6, 4, bg);
     if response.has_focus() {
         painter.rect_stroke(
             rect.shrink(1.0),

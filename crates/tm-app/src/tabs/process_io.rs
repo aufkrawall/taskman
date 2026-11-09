@@ -172,7 +172,15 @@ fn paint_io_graph_section(
         };
 
         ui.push_id(id, |ui| {
-            chart::chart_multi(ui, egui::vec2(chart_w, chart_h), &series, peak, axis, fmt);
+            chart::chart_multi_with_bg(
+                ui,
+                egui::vec2(chart_w, chart_h),
+                &series,
+                peak,
+                axis,
+                fmt,
+                pal.card_bg_sunken,
+            );
         });
     });
 }
