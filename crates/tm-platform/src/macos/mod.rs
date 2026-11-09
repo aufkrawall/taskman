@@ -345,6 +345,7 @@ impl PlatformActions for MacActions {
             process_modules: false,
             process_threads: false,
             process_connections: false,
+            process_file_io: false,
             unload_module: false,
             start_with_windows: false,
         }

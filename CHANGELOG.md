@@ -4,6 +4,7 @@
 
 ### New
 
+- **Per-file read and written byte tracking in Process Properties I/O dialog:** Added a sortable file activity table below the I/O graphs and summary counters in the Process Properties dialog. The table enumerates open and active files for the inspected process, displaying exact amounts read and written, total transfer size, and on-disk file size. Users can interactively sort by written most, read from most, total transfer, file size, or filename (toggling ascending/descending order with indicators), filter files with a live search box, and access context-menu actions to open the file location in Explorer, copy the path, or open file properties.
 - **Process Properties I/O page with inter-process (IPC) telemetry:** Added a dedicated "I/O" tab to the Process Properties dialog featuring Process Hacker / System Informer style rolling history graphs for Read (yellow), Write (purple), and Inter-Process / Other (cyan) I/O, along with a "Disk & Inter-Process I/O" table breaking down cumulative operation counts (Reads, Writes, Other), cumulative transfer bytes, interval deltas, and current transfer rates. Inter-process I/O captures operations not involving physical disks (such as named pipes, ALPC, device controls/IOCTLs, and socket communications) read directly from the Windows kernel process table's `IO_COUNTERS` block without requiring elevated process handles.
 
 ### Improved

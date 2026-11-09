@@ -44,7 +44,7 @@ pub fn page_interval(speed: UpdateSpeed, floor: Duration) -> Option<Duration> {
 
 /// When a page queries: once when first shown, then every interval, and
 /// whenever the user asks (F5).
-#[derive(Default)]
+#[derive(Default, Debug)]
 pub struct Pace {
     started: Option<Instant>,
     requested: bool,
@@ -90,6 +90,7 @@ pub fn merge<T>(
 }
 
 /// One background query owned by a Process Properties page.
+#[derive(Debug)]
 pub struct Poll<T> {
     slot: Arc<Mutex<Option<Result<T, String>>>>,
     in_flight: InFlight,

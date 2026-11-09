@@ -54,6 +54,7 @@ pub fn module_etw_test_running() -> bool {
 }
 mod perfcounters;
 mod process_connections;
+pub(crate) mod process_file_io;
 mod process_ops;
 mod process_threads;
 mod profile_etw;
@@ -390,6 +391,7 @@ impl PlatformActions for WinActions {
             process_modules: true,
             process_threads: true,
             process_connections: true,
+            process_file_io: true,
             unload_module: true,
             start_with_windows: true,
         }
@@ -527,6 +529,13 @@ impl PlatformActions for WinActions {
     }
     fn list_process_connections(&self, pid: u32) -> Result<Vec<ProcessConnection>> {
         process_connections::list_process_connections(pid)
+    }
+    fn list_process_file_io(
+        &self,
+        pid: u32,
+        expected_start_epoch_s: Option<i64>,
+    ) -> Result<Vec<ProcessFileIo>> {
+        process_file_io::list_process_file_io(pid, expected_start_epoch_s)
     }
     fn unload_process_module(
         &self,

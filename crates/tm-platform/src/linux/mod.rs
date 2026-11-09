@@ -775,6 +775,7 @@ impl PlatformActions for LinuxActions {
             process_modules: false,
             process_threads: false,
             process_connections: false,
+            process_file_io: true,
             unload_module: false,
             start_with_windows: false,
         }
@@ -889,6 +890,77 @@ impl PlatformActions for LinuxActions {
     fn backend_name(&self) -> &'static str {
         "linux"
     }
+
+    fn list_process_file_io(
+        &self,
+        pid: u32,
+        _expected_start_epoch_s: Option<i64>,
+    ) -> Result<Vec<crate::actions::ProcessFileIo>> {
+        list_linux_process_file_io(pid)
+    }
+}
+
+fn list_linux_process_file_io(pid: u32) -> Result<Vec<crate::actions::ProcessFileIo>> {
+    let fd_dir = format!("/proc/{pid}/fd");
+    let entries = std::fs::read_dir(&fd_dir)
+        .map_err(|e| tm_core::TmError::platform("read /proc/pid/fd", e.to_string()))?;
+    let mut map: HashMap<String, crate::actions::ProcessFileIo> = HashMap::new();
+    for entry in entries.flatten() {
+        let fd_name = entry.file_name();
+        let link_target = match std::fs::read_link(entry.path()) {
+            Ok(target) => target,
+            Err(_) => continue,
+        };
+        let path_str = link_target.to_string_lossy().into_owned();
+        if !path_str.starts_with('/') {
+            continue;
+        }
+        let fdinfo_path = format!("/proc/{pid}/fdinfo/{}", fd_name.to_string_lossy());
+        let mut pos = 0u64;
+        let mut flags = 0u32;
+        if let Ok(info_content) = std::fs::read_to_string(&fdinfo_path) {
+            for line in info_content.lines() {
+                if let Some(rest) = line.strip_prefix("pos:\t") {
+                    pos = rest.trim().parse().unwrap_or(0);
+                } else if let Some(rest) = line.strip_prefix("flags:\t") {
+                    flags = u32::from_str_radix(rest.trim(), 8).unwrap_or(0);
+                }
+            }
+        }
+        let access_mode = flags & 3;
+        let is_read = access_mode == 0 || access_mode == 2;
+        let is_write = access_mode == 1 || access_mode == 2;
+        let file_size = std::fs::metadata(&path_str).map(|m| m.len()).ok();
+        let (handle_read, handle_write) = if is_write && !is_read {
+            (0, pos.max(file_size.unwrap_or(0)))
+        } else if is_read && !is_write {
+            (pos, 0)
+        } else {
+            (pos, pos)
+        };
+        let item = map
+            .entry(path_str.clone())
+            .or_insert_with(|| crate::actions::ProcessFileIo {
+                path: path_str,
+                read_bytes: 0,
+                write_bytes: 0,
+                total_bytes: 0,
+                file_size,
+                is_read: false,
+                is_write: false,
+                open_handles: 0,
+            });
+        item.open_handles = item.open_handles.saturating_add(1);
+        item.is_read |= is_read;
+        item.is_write |= is_write;
+        item.read_bytes = item.read_bytes.max(handle_read);
+        item.write_bytes = item.write_bytes.max(handle_write);
+        item.total_bytes = item.read_bytes.saturating_add(item.write_bytes);
+        if let Some(sz) = file_size {
+            item.file_size = Some(item.file_size.map_or(sz, |prev| prev.max(sz)));
+        }
+    }
+    Ok(map.into_values().collect())
 }
 
 fn send_signal(pid: u32, sig: i32) -> Result<()> {

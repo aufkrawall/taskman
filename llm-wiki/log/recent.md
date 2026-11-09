@@ -1,3 +1,22 @@
+## 2026-11-09 — Process Properties I/O per-file read/written tracking and sorting
+
+- Added per-file read and written byte tracking and interactive sorting to Process Properties I/O dialog:
+  - Enumerates open handles for the inspected process via `NtQueryInformationProcess(51)` (`ProcessHandleInformation`).
+  - Safely filters disk files (`GetFileType == FILE_TYPE_DISK`), strictly avoiding named pipes, sockets, and character devices that could block.
+  - Queries normalized file paths (`GetFinalPathNameByHandleW` with verbatim prefix stripping), current file positions (`SetFilePointerEx`), file sizes (`GetFileInformationByHandleEx(FileStandardInfo)`), and granted read/write access rights.
+  - Groups handles by path, tracking exact read and written byte positions and accumulating delta movements while the dialog is open. Files whose handles are subsequently closed retain their recorded read and written byte totals with `(closed)` annotation.
+  - Table located directly below the I/O graphs and summary counters in the vertical scroll view.
+  - Interactive clickable column headers to sort by:
+    - Written most (`write_bytes` descending/ascending)
+    - Read from most (`read_bytes` descending/ascending)
+    - Total I/O (`total_bytes` descending/ascending)
+    - File size (`file_size` descending/ascending)
+    - File name (alphabetical ascending/descending)
+    Active sort column is indicated with `▲` / `▼` sort direction glyphs.
+  - Filter search box with instant clear (`✖`) button to search across file names and paths.
+  - Context menu on file rows: "Open file location" (`open_file_location`), "Copy path", and "File properties".
+  - Cross-platform trait support via `PlatformActions::list_process_file_io` with Linux `/proc/<pid>/fd` & `/proc/<pid>/fdinfo` implementation.
+
 ## 2026-11-09 — Process Properties I/O page theming and pinned hover tooltip
 
 - Aligned Process Properties I/O graphs with the Performance page disk theming:

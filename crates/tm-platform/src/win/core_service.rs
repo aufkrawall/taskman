@@ -1387,6 +1387,14 @@ impl PlatformActions for BrokeredActions {
         self.local.list_process_connections(pid)
     }
 
+    fn list_process_file_io(
+        &self,
+        pid: u32,
+        expected_start_epoch_s: Option<i64>,
+    ) -> Result<Vec<crate::actions::ProcessFileIo>> {
+        self.local.list_process_file_io(pid, expected_start_epoch_s)
+    }
+
     fn unload_process_module(
         &self,
         pid: u32,

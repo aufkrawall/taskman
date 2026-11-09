@@ -188,7 +188,7 @@ type CachedVec<T> = Arc<Mutex<Option<(Vec<T>, std::time::Instant)>>>;
 
 /// Guard against duplicate background operations for one resource.
 /// Cloneable so worker threads can clear their own flag when done.
-#[derive(Default, Clone)]
+#[derive(Default, Clone, Debug)]
 pub struct InFlight(Arc<AtomicBool>);
 
 impl InFlight {

@@ -152,7 +152,7 @@ fn open_destructive_process_verified(
 /// through the freshly opened handle and compared BEFORE returning it; on a
 /// mismatch (pid recycled between snapshot and action) the handle is closed
 /// and an error is returned instead of acting on an unrelated process.
-fn open_process_verified(
+pub(crate) fn open_process_verified(
     pid: u32,
     access: th::PROCESS_ACCESS_RIGHTS,
     expected_start_epoch_s: Option<i64>,

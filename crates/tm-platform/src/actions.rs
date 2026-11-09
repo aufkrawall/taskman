@@ -24,6 +24,7 @@ pub struct Capabilities {
     pub process_modules: bool,
     pub process_threads: bool,
     pub process_connections: bool,
+    pub process_file_io: bool,
     pub unload_module: bool,
     pub start_with_windows: bool,
 }
@@ -310,6 +311,20 @@ pub struct ProcessConnection {
     pub state: Option<TcpState>,
 }
 
+/// One open file observed for a process, including read/write byte positions.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(target_os = "windows", derive(serde::Serialize, serde::Deserialize))]
+pub struct ProcessFileIo {
+    pub path: String,
+    pub read_bytes: u64,
+    pub write_bytes: u64,
+    pub total_bytes: u64,
+    pub file_size: Option<u64>,
+    pub is_read: bool,
+    pub is_write: bool,
+    pub open_handles: u32,
+}
+
 /// Wire/request capability marker appended to module paths by current GUIs.
 ///
 /// Windows file names cannot contain NUL, so a stale implementation cannot
@@ -491,6 +506,14 @@ pub trait PlatformActions: Send + Sync {
     /// re-check the identity against a fresh snapshot.
     fn list_process_connections(&self, _pid: u32) -> Result<Vec<ProcessConnection>> {
         Err(tm_core::TmError::Unsupported("process connections"))
+    }
+    /// Enumerate open files for `pid`, their read/write positions and sizes.
+    fn list_process_file_io(
+        &self,
+        _pid: u32,
+        _expected_start_epoch_s: Option<i64>,
+    ) -> Result<Vec<ProcessFileIo>> {
+        Err(tm_core::TmError::Unsupported("process file I/O"))
     }
     /// Ask the target process to perform one `FreeLibrary` call for one exact
     /// mapped module. This is a diagnostic escape hatch: callers must

@@ -4276,7 +4276,9 @@ pub fn process_properties_dialog(app: &mut TaskManApp, ctx: &egui::Context) {
         }
         _ => {}
     }
-    dialog.io.tick(app, ctx, &identity);
+    dialog
+        .io
+        .tick(app, ctx, &identity, dialog.tab == ProcessPropertiesTab::Io);
     let pal = theme::palette_ctx(ctx);
     let snapshot = app.latest_snapshot();
     let process = snapshot
