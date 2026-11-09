@@ -731,10 +731,11 @@ pub fn show(
 
     ui.add_space(4.0);
 
-    const COL_READ_W: f32 = 80.0;
-    const COL_WRITE_W: f32 = 85.0;
-    const COL_TOTAL_W: f32 = 85.0;
-    const COL_SIZE_W: f32 = 80.0;
+    const COL_FILE_MIN_W: f32 = 240.0;
+    const COL_READ_W: f32 = 95.0;
+    const COL_WRITE_W: f32 = 105.0;
+    const COL_TOTAL_W: f32 = 115.0;
+    const COL_SIZE_W: f32 = 105.0;
 
     let mut sort_change = None;
     let mut selected_clicked = None;
@@ -742,7 +743,7 @@ pub fn show(
 
     egui::Grid::new("process-io-files-grid")
         .num_columns(5)
-        .spacing(Vec2::new(14.0, 6.0))
+        .spacing(Vec2::new(24.0, 6.0))
         .striped(true)
         .show(ui, |ui| {
             // Header Row
@@ -755,13 +756,26 @@ pub fn show(
             } else {
                 ""
             };
-            let file_btn = ui.add(
-                egui::Label::new(
-                    egui::RichText::new(format!("{}{}", i18n::tr(K::PropIoColFile), file_arrow))
-                        .strong(),
+            let file_btn = ui
+                .allocate_ui_with_layout(
+                    egui::vec2(COL_FILE_MIN_W, 18.0),
+                    egui::Layout::left_to_right(egui::Align::Center),
+                    |ui| {
+                        ui.set_min_size(egui::vec2(COL_FILE_MIN_W, 18.0));
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(format!(
+                                    "{}{}",
+                                    i18n::tr(K::PropIoColFile),
+                                    file_arrow
+                                ))
+                                .strong(),
+                            )
+                            .sense(egui::Sense::click()),
+                        )
+                    },
                 )
-                .sense(egui::Sense::click()),
-            );
+                .inner;
             if file_btn
                 .on_hover_cursor(egui::CursorIcon::PointingHand)
                 .clicked()
@@ -786,6 +800,7 @@ pub fn show(
                             egui::vec2(width, 18.0),
                             egui::Layout::right_to_left(egui::Align::Center),
                             |ui| {
+                                ui.set_min_size(egui::vec2(width, 18.0));
                                 ui.add(
                                     egui::Label::new(egui::RichText::new(text).strong())
                                         .sense(egui::Sense::click()),
@@ -833,6 +848,7 @@ pub fn show(
                     egui::vec2(width, 18.0),
                     egui::Layout::right_to_left(egui::Align::Center),
                     |ui| {
+                        ui.set_min_size(egui::vec2(width, 18.0));
                         ui.label(text);
                     },
                 );
@@ -842,19 +858,24 @@ pub fn show(
             for file in display_files {
                 let is_selected = selected_path.as_deref() == Some(&file.path);
                 let row_resp = ui
-                    .horizontal(|ui| {
-                        let name_text = if is_selected {
-                            egui::RichText::new(&file.name).strong().color(pal.accent)
-                        } else {
-                            egui::RichText::new(&file.name).strong()
-                        };
-                        ui.label(name_text);
-                        if file.open_handles == 0 {
-                            ui.weak("(closed)");
-                        } else if file.open_handles > 1 {
-                            ui.weak(format!("({} handles)", file.open_handles));
-                        }
-                    })
+                    .allocate_ui_with_layout(
+                        egui::vec2(COL_FILE_MIN_W, 18.0),
+                        egui::Layout::left_to_right(egui::Align::Center),
+                        |ui| {
+                            ui.set_min_size(egui::vec2(COL_FILE_MIN_W, 18.0));
+                            let name_text = if is_selected {
+                                egui::RichText::new(&file.name).strong().color(pal.accent)
+                            } else {
+                                egui::RichText::new(&file.name).strong()
+                            };
+                            ui.label(name_text);
+                            if file.open_handles == 0 {
+                                ui.weak("(closed)");
+                            } else if file.open_handles > 1 {
+                                ui.weak(format!("({} handles)", file.open_handles));
+                            }
+                        },
+                    )
                     .response
                     .on_hover_text(&file.path);
 
