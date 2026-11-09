@@ -39,12 +39,7 @@ struct SystemProcessIdInformation {
 
 /// Full image path of `pid` as a DOS path, or `None` when the kernel will not
 /// name it.
-///
-/// Test-only: production goes through [`ImagePaths`], which caches both the
-/// per-process answer and the volume map. This is the single-shot form the
-/// live tests pin the NT layout with.
-#[cfg(test)]
-fn of_pid(pid: u32) -> Option<PathBuf> {
+pub(crate) fn of_pid(pid: u32) -> Option<PathBuf> {
     let nt_path = nt_path_of_pid(pid)?;
     Some(PathBuf::from(dos_path(&nt_path, &device_map())))
 }

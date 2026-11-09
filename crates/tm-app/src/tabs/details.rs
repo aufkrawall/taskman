@@ -3347,6 +3347,61 @@ fn process_properties_started(start_epoch_s: Option<i64>) -> String {
     )
 }
 
+fn clean_label(s: Option<&str>) -> Option<&str> {
+    s.map(str::trim).filter(|v| !v.is_empty())
+}
+
+pub(crate) fn format_parent_process(
+    parent_display: Option<&str>,
+    parent_name: Option<&str>,
+    parent_pid: u32,
+    alive: Option<bool>,
+) -> String {
+    if parent_pid == 0 {
+        return "—".into();
+    }
+
+    let display = clean_label(parent_display);
+    let name = clean_label(parent_name);
+
+    match (display, name) {
+        (Some(disp), Some(bin)) if !disp.eq_ignore_ascii_case(bin) => {
+            if alive == Some(false) {
+                format!(
+                    "{disp} ({bin}) ({parent_pid}) ({})",
+                    i18n::tr(K::NonExistentProcess)
+                )
+            } else {
+                format!("{disp} ({bin}) ({parent_pid})")
+            }
+        }
+        (Some(disp), _) => {
+            if alive == Some(false) {
+                format!(
+                    "{disp} ({parent_pid}) ({})",
+                    i18n::tr(K::NonExistentProcess)
+                )
+            } else {
+                format!("{disp} ({parent_pid})")
+            }
+        }
+        (_, Some(bin)) => {
+            if alive == Some(false) {
+                format!("{bin} ({parent_pid}) ({})", i18n::tr(K::NonExistentProcess))
+            } else {
+                format!("{bin} ({parent_pid})")
+            }
+        }
+        _ => {
+            if alive == Some(false) {
+                format!("{parent_pid} ({})", i18n::tr(K::NonExistentProcess))
+            } else {
+                parent_pid.to_string()
+            }
+        }
+    }
+}
+
 fn selectable_text_context_menu(resp: &egui::Response, fallback_text: &str) {
     menu::context_menu(resp, |ui| {
         let active_sel = egui::text_selection::LabelSelectionState::active_selection(ui.ctx());
@@ -3463,6 +3518,8 @@ struct ProcessSecuritySummary {
     protection: String,
     critical: String,
     mitigations: String,
+    #[cfg(target_os = "windows")]
+    parent: Option<tm_platform::win::ProcessParentInfo>,
 }
 
 fn process_properties_body_height(available_height: f32, viewport_height: f32) -> f32 {
@@ -3606,6 +3663,7 @@ fn process_security_summary(dialog: &ProcessPropertiesDialog) -> ProcessSecurity
                 .map(|value| i18n::tr(if value { K::Yes } else { K::No }).to_string())
                 .unwrap_or_else(|| i18n::tr(K::UacUnknown).to_string()),
             mitigations: active_mitigation_summary(info),
+            parent: info.parent.clone(),
         };
     }
     let pending = if dialog.security_error.is_some() {
@@ -3618,6 +3676,7 @@ fn process_security_summary(dialog: &ProcessPropertiesDialog) -> ProcessSecurity
         protection: pending.into(),
         critical: pending.into(),
         mitigations: pending.into(),
+        parent: None,
     }
 }
 
@@ -3870,15 +3929,40 @@ fn process_properties_general(
         .as_ref()
         .map(|path| path.to_string_lossy().into_owned())
         .unwrap_or_else(|| "—".into());
-    let parent = process
-        .ppid
-        .map(|pid| {
-            snapshot
-                .process(pid)
-                .map(|parent| format!("{} ({pid})", parent.shown_name()))
-                .unwrap_or_else(|| pid.to_string())
-        })
-        .unwrap_or_else(|| "—".into());
+    let parent = {
+        #[cfg(target_os = "windows")]
+        let from_security = security.parent.as_ref().map(|info| {
+            let snap_proc = snapshot.process(info.pid);
+            let display = info
+                .display
+                .as_deref()
+                .or_else(|| snap_proc.map(|p| p.display.as_str()));
+            let name = info
+                .name
+                .as_deref()
+                .or_else(|| snap_proc.map(|p| p.name.as_str()));
+            format_parent_process(display, name, info.pid, Some(info.alive))
+        });
+        #[cfg(not(target_os = "windows"))]
+        let from_security: Option<String> = None;
+
+        if let Some(formatted) = from_security {
+            formatted
+        } else if let Some(pid) = process.ppid {
+            if let Some(p) = snapshot.process(pid) {
+                format_parent_process(
+                    (!p.display.is_empty()).then_some(p.display.as_str()),
+                    (!p.name.is_empty()).then_some(p.name.as_str()),
+                    pid,
+                    Some(true),
+                )
+            } else {
+                format_parent_process(None, None, pid, None)
+            }
+        } else {
+            "—".into()
+        }
+    };
     let status = match process.status {
         ProcStatus::Running => i18n::tr(K::StRunning),
         ProcStatus::Suspended => i18n::tr(K::StSuspended),
@@ -4801,6 +4885,49 @@ fn search_commit_picks_the_first_display_order_match() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn format_parent_process_formats_display_and_binary_name() {
+        assert_eq!(
+            format_parent_process(
+                Some("Services and Controller app"),
+                Some("services.exe"),
+                1496,
+                Some(true)
+            ),
+            "Services and Controller app (services.exe) (1496)"
+        );
+        assert_eq!(
+            format_parent_process(Some("cmd.exe"), Some("cmd.exe"), 5120, Some(true)),
+            "cmd.exe (5120)"
+        );
+        assert_eq!(
+            format_parent_process(None, Some("cmd.exe"), 5120, Some(true)),
+            "cmd.exe (5120)"
+        );
+        assert_eq!(
+            format_parent_process(Some("Windows-Explorer"), None, 9384, Some(true)),
+            "Windows-Explorer (9384)"
+        );
+        assert_eq!(format_parent_process(None, None, 1234, None), "1234");
+        assert_eq!(format_parent_process(None, None, 0, None), "—");
+        assert_eq!(
+            format_parent_process(
+                Some("Services and Controller app"),
+                Some("services.exe"),
+                1496,
+                Some(false)
+            ),
+            format!(
+                "Services and Controller app (services.exe) (1496) ({})",
+                i18n::tr(K::NonExistentProcess)
+            )
+        );
+        assert_eq!(
+            format_parent_process(None, None, 1234, Some(false)),
+            format!("1234 ({})", i18n::tr(K::NonExistentProcess))
+        );
+    }
 
     #[test]
     fn dump_filename_for_process_formats_and_sanitizes() {

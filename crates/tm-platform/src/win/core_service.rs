@@ -72,8 +72,9 @@ pub const SERVICE_LOG_FILE_PREFIX: &str = "taskman-service.log";
 // can fill those fields for elevated targets such as Windows Task Manager. v9
 // adds drained, identity-bound sampled instruction-pointer attribution for
 // the Modules page. v10 adds bounded, identity-bound process file I/O
-// enumeration (ProcessFileIo).
-pub const PROTOCOL_VERSION: u16 = 10;
+// enumeration (ProcessFileIo). v11 adds identity-bound parent process
+// evidence (ProcessParentInfo) in ProcessSecurityInfo.
+pub const PROTOCOL_VERSION: u16 = 11;
 
 const PIPE_NAME: &str = r"\\.\pipe\Taskman.Core.v1";
 const FRAME_MAGIC: [u8; 4] = *b"TMB1";
@@ -4179,6 +4180,80 @@ mod tests {
         assert_eq!(identity.name, "SYSTEM");
         assert_eq!(identity.sid.as_deref(), Some("S-1-5-18"));
         assert_eq!(identity.elevated, Some(true));
+    }
+
+    #[test]
+    fn process_security_info_round_trips_with_parent_process_info() {
+        let request = BrokerRequest::ProcessSecurityInfo {
+            pid: 101,
+            expected_start_epoch_s: Some(202),
+        };
+        let encoded = serde_json::to_string(&request).unwrap();
+        assert_eq!(
+            encoded,
+            r#"{"operation":"process_security_info","pid":101,"expected_start_epoch_s":202}"#
+        );
+        assert!(matches!(
+            serde_json::from_str::<BrokerRequest>(&encoded).unwrap(),
+            BrokerRequest::ProcessSecurityInfo {
+                pid: 101,
+                expected_start_epoch_s: Some(202),
+            }
+        ));
+        let grown = encoded.replace('}', r#","extra":true}"#);
+        assert!(serde_json::from_str::<BrokerRequest>(&grown).is_err());
+
+        let response = BrokerResponse {
+            protocol_version: PROTOCOL_VERSION,
+            value: Ok(BrokerValue::ProcessSecurity(
+                crate::win::ProcessSecurityInfo {
+                    protection: Some(crate::win::ProcessProtectionLevel::None),
+                    machine: Some(crate::win::ProcessMachineType::X64),
+                    critical: Some(false),
+                    dep: Some(1),
+                    dep_permanent: Some(true),
+                    aslr: None,
+                    dynamic_code: None,
+                    strict_handle: None,
+                    system_call: None,
+                    extension_point: None,
+                    control_flow_guard: None,
+                    signature: None,
+                    font: None,
+                    image_load: None,
+                    child_process: None,
+                    user_shadow_stack: None,
+                    sehop: None,
+                    side_channel: None,
+                    payload_restriction: None,
+                    parent: Some(crate::win::ProcessParentInfo {
+                        pid: 1496,
+                        name: Some("services.exe".into()),
+                        display: Some("Services and Controller app".into()),
+                        path: Some(r"C:\Windows\System32\services.exe".into()),
+                        alive: true,
+                    }),
+                },
+            )),
+        };
+        let decoded: BrokerResponse =
+            serde_json::from_slice(&serde_json::to_vec(&response).unwrap()).unwrap();
+        let Ok(BrokerValue::ProcessSecurity(security)) = decoded.value else {
+            panic!("security response did not round trip");
+        };
+        assert_eq!(security.critical, Some(false));
+        let parent = security.parent.expect("parent info present");
+        assert_eq!(parent.pid, 1496);
+        assert_eq!(parent.name.as_deref(), Some("services.exe"));
+        assert_eq!(
+            parent.display.as_deref(),
+            Some("Services and Controller app")
+        );
+        assert_eq!(
+            parent.path.as_deref(),
+            Some(r"C:\Windows\System32\services.exe")
+        );
+        assert!(parent.alive);
     }
 
     /// Sampled code is another read-only, exact-identity query. A PID alone or

@@ -109,6 +109,8 @@ struct ProcRaw {
     /// Image base name from the kernel table (empty when unparseable).
     /// Remembered for processes that exit so their CPU churn can be named.
     name: Box<str>,
+    /// InheritedFromUniqueProcessId recorded at process creation.
+    parent_pid: u32,
     /// Hard page faults since process start — faults served from DISK.
     /// `None` when the record was too short to carry the field.
     hard_faults: Option<u64>,
@@ -301,6 +303,20 @@ impl CpuLoadAccountant {
             return None;
         }
         Some(raw.session_id)
+    }
+
+    /// InheritedFromUniqueProcessId (parent PID recorded at creation) from the
+    /// newest native kernel process table.
+    ///
+    /// Every Windows process has this recorded by the kernel; handle-based queries
+    /// return nothing for elevated/protected processes, whereas the kernel table
+    /// answers for all processes. Identity-guarded like [`Self::base_priority`].
+    pub fn parent_pid_of(&self, pid: u32, start_epoch_s: Option<i64>) -> Option<u32> {
+        let raw = self.prev.as_ref()?.procs.get(&pid)?;
+        if !matches_start_epoch(start_epoch_s, raw.create_time) {
+            return None;
+        }
+        (raw.parent_pid > 0).then_some(raw.parent_pid)
     }
 
     /// Process working set (in bytes) from the newest native process table.
@@ -533,6 +549,7 @@ impl CpuLoadAccountant {
             let user = read_i64(buf, pos + off.user_time);
             let kernel = read_i64(buf, pos + off.kernel_time);
             let pid = read_usize(buf, pos + off.pid) as u32;
+            let parent_pid = read_usize(buf, pos + off.inherited_from) as u32;
             let base_priority = read_u32(buf, pos + off.base_priority) as i32;
             let session_id = read_u32(buf, pos + off.session_id);
             let handle_count = read_u32(buf, pos + off.handle_count);
@@ -574,6 +591,7 @@ impl CpuLoadAccountant {
                         peak_working_set,
                         commit,
                         name,
+                        parent_pid,
                         hard_faults,
                         io_ops,
                         io_read_bytes: raw_io.map(|io| io.read_bytes),
@@ -1650,6 +1668,7 @@ mod tests {
             peak_working_set: 0,
             commit: 0,
             name: name.into(),
+            parent_pid: 0,
             hard_faults: None,
             io_ops: None,
             io_read_bytes: None,
@@ -1952,6 +1971,7 @@ mod tests {
                 peak_working_set: 2048,
                 commit: 1024,
                 name: "test.exe".into(),
+                parent_pid: 5678,
                 hard_faults: None,
                 io_ops: None,
                 io_read_bytes: None,
@@ -1984,6 +2004,7 @@ mod tests {
         assert_eq!(load.working_set_of(1234, Some(1_700_000_001)), Some(1024));
         assert_eq!(load.handle_count_of(1234, Some(1_700_000_001)), Some(10));
         assert_eq!(load.thread_count_of(1234, Some(1_700_000_001)), Some(4));
+        assert_eq!(load.parent_pid_of(1234, Some(1_700_000_001)), Some(5678));
 
         // 2-second difference rejected (recycled PID)
         assert!(!load.is_process_live(1234, Some(1_700_000_002)));
@@ -1993,6 +2014,7 @@ mod tests {
         assert_eq!(load.working_set_of(1234, Some(1_700_000_002)), None);
         assert_eq!(load.handle_count_of(1234, Some(1_700_000_002)), None);
         assert_eq!(load.thread_count_of(1234, Some(1_700_000_002)), None);
+        assert_eq!(load.parent_pid_of(1234, Some(1_700_000_002)), None);
 
         // None expected start accepts presence
         assert!(load.is_process_live(1234, None));

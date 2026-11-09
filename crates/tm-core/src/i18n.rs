@@ -398,6 +398,7 @@ keys! {
     Statistics => ["Statistik", "Statistics"],
     PropCommandLine => ["Befehlszeile", "Command line"],
     PropParentProcess => ["Übergeordneter Prozess", "Parent process"],
+    NonExistentProcess => ["Nicht vorhandener Prozess", "Non-existent process"],
     PropStarted => ["Gestartet", "Started"],
     PropPrivateWorkingSet => ["Privater Arbeitssatz", "Private working set"],
     PropWorkingSet => ["Arbeitssatz", "Working set"],

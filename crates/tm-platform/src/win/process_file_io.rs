@@ -423,8 +423,9 @@ mod tests {
 
     #[test]
     fn current_process_file_io_discovers_opened_files() {
-        let test_path =
-            std::env::temp_dir().join(format!("test_file_io_{}.bin", std::process::id()));
+        let tag = format!("{}_{:?}", std::process::id(), std::thread::current().id());
+        let test_name = format!("test_file_io_{tag}.bin");
+        let test_path = std::env::temp_dir().join(&test_name);
 
         // Write some bytes and keep the handle open
         let mut file = std::fs::File::create(&test_path).unwrap();
@@ -434,10 +435,7 @@ mod tests {
         let pid = std::process::id();
         let snapshot = list_process_file_io(pid, None).expect("query current process files");
 
-        let found = snapshot
-            .files
-            .iter()
-            .find(|f| f.path.ends_with(&format!("test_file_io_{}.bin", pid)));
+        let found = snapshot.files.iter().find(|f| f.path.ends_with(&test_name));
         assert!(found.is_some(), "opened temporary file must be discovered");
         let found = found.unwrap();
         assert!(found.is_write);
@@ -455,7 +453,7 @@ mod tests {
         let found2 = snapshot2
             .files
             .iter()
-            .find(|f| f.path.ends_with(&format!("test_file_io_{}.bin", pid)));
+            .find(|f| f.path.ends_with(&test_name));
         assert!(found2.is_some(), "read file must be discovered");
         let found2 = found2.unwrap();
         assert!(found2.is_read);
@@ -467,8 +465,9 @@ mod tests {
 
     #[test]
     fn write_only_idle_handle_does_not_attribute_file_size() {
-        let test_path =
-            std::env::temp_dir().join(format!("test_file_idle_{}.bin", std::process::id()));
+        let tag = format!("{}_{:?}", std::process::id(), std::thread::current().id());
+        let test_name = format!("test_file_idle_{tag}.bin");
+        let test_path = std::env::temp_dir().join(&test_name);
 
         // Create an 8 MiB file on disk
         std::fs::write(&test_path, vec![7u8; 8 * 1024 * 1024]).unwrap();
@@ -481,10 +480,7 @@ mod tests {
 
         let pid = std::process::id();
         let snapshot = list_process_file_io(pid, None).expect("query current process files");
-        let found = snapshot
-            .files
-            .iter()
-            .find(|f| f.path.ends_with(&format!("test_file_idle_{}.bin", pid)));
+        let found = snapshot.files.iter().find(|f| f.path.ends_with(&test_name));
         assert!(found.is_some(), "opened write-only file must be discovered");
         let found = found.unwrap();
         assert!(found.is_write);
@@ -498,8 +494,9 @@ mod tests {
 
     #[test]
     fn read_write_handle_does_not_fabricate_split() {
-        let test_path =
-            std::env::temp_dir().join(format!("test_file_rw_{}.bin", std::process::id()));
+        let tag = format!("{}_{:?}", std::process::id(), std::thread::current().id());
+        let test_name = format!("test_file_rw_{tag}.bin");
+        let test_path = std::env::temp_dir().join(&test_name);
 
         let file = std::fs::OpenOptions::new()
             .read(true)
@@ -511,10 +508,7 @@ mod tests {
 
         let pid = std::process::id();
         let snapshot = list_process_file_io(pid, None).expect("query current process files");
-        let found = snapshot
-            .files
-            .iter()
-            .find(|f| f.path.ends_with(&format!("test_file_rw_{}.bin", pid)));
+        let found = snapshot.files.iter().find(|f| f.path.ends_with(&test_name));
         assert!(found.is_some(), "opened read/write file must be discovered");
         let found = found.unwrap();
         assert!(found.is_read);

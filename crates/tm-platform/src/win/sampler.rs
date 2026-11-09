@@ -1545,7 +1545,6 @@ impl Sampler {
                     entry.company = Some(ver[1].clone());
                 }
             }
-            entry.ppid = p.parent().map(|x| x.as_u32());
             // sysinfo reads the creation time through a process handle and
             // yields 0 when it cannot open one — about half the process list
             // for an unelevated session. A `Some(0)` is a FABRICATED identity
@@ -1558,6 +1557,10 @@ impl Sampler {
             } else {
                 self.cpu_load.start_epoch_of(pid_u)
             };
+            entry.ppid = p
+                .parent()
+                .map(|x| x.as_u32())
+                .or_else(|| self.cpu_load.parent_pid_of(pid_u, entry.start_epoch_s));
 
             // From the kernel process table `cpu_load` refreshed at the top
             // of this tick. A Toolhelp thread snapshot used to lead here; it

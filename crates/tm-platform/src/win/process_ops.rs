@@ -226,6 +226,18 @@ pub struct ProcessSecurityInfo {
     pub sehop: Option<u32>,
     pub side_channel: Option<u32>,
     pub payload_restriction: Option<u32>,
+    pub parent: Option<ProcessParentInfo>,
+}
+
+/// Parent process metadata resolved by Process Properties (or the elevation service).
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProcessParentInfo {
+    pub pid: u32,
+    pub name: Option<String>,
+    pub display: Option<String>,
+    pub path: Option<String>,
+    pub alive: bool,
 }
 
 fn process_protection_level(process: HANDLE) -> Option<ProcessProtectionLevel> {
@@ -347,10 +359,128 @@ pub fn process_security_info(
             sehop: mitigation_flags(process, th::ProcessSEHOPPolicy),
             side_channel: mitigation_flags(process, th::ProcessSideChannelIsolationPolicy),
             payload_restriction: mitigation_flags(process, th::ProcessPayloadRestrictionPolicy),
+            parent: query_process_parent_info(process),
         })
     };
     let _ = unsafe { CloseHandle(process) };
     result
+}
+
+/// Resolve parent process metadata (executable name, version description, path,
+/// and live status) for `parent_pid`. Works without elevation through NT query fallback,
+/// and when called by the LocalSystem broker has full access to query elevated and service processes.
+pub fn resolve_parent_process_info(parent_pid: u32) -> ProcessParentInfo {
+    if parent_pid == 0 {
+        return ProcessParentInfo {
+            pid: 0,
+            name: None,
+            display: None,
+            path: None,
+            alive: false,
+        };
+    }
+
+    // Try opening parent process with PROCESS_QUERY_LIMITED_INFORMATION
+    let parent_handle = open_process(parent_pid, th::PROCESS_QUERY_LIMITED_INFORMATION);
+    if let Ok(ph) = parent_handle {
+        let mut buffer = vec![0u16; 32768];
+        let mut length = buffer.len() as u32;
+        let res = unsafe {
+            th::QueryFullProcessImageNameW(
+                ph,
+                Default::default(),
+                windows::core::PWSTR(buffer.as_mut_ptr()),
+                &mut length,
+            )
+        };
+        unsafe {
+            let _ = CloseHandle(ph);
+        }
+        if res.is_ok() && length > 0 {
+            buffer.truncate(length as usize);
+            let path_str = String::from_utf16_lossy(&buffer);
+            let p = std::path::Path::new(&path_str);
+            let name = p.file_name().map(|f| f.to_string_lossy().into_owned());
+            let ver = super::version::query(&path_str);
+            let display = if !ver[0].is_empty() {
+                Some(ver[0].clone())
+            } else {
+                None
+            };
+            return ProcessParentInfo {
+                pid: parent_pid,
+                name,
+                display,
+                path: Some(path_str),
+                alive: true,
+            };
+        }
+        return ProcessParentInfo {
+            pid: parent_pid,
+            name: None,
+            display: None,
+            path: None,
+            alive: true,
+        };
+    }
+
+    // Handle could not be opened (e.g. elevated/SYSTEM process when caller is unelevated).
+    // NtQuerySystemInformation(SystemProcessIdInformation) queries the image without a handle.
+    if let Some(path) = super::image_path::of_pid(parent_pid) {
+        let path_str = path.to_string_lossy().into_owned();
+        let p = std::path::Path::new(&path_str);
+        let name = p.file_name().map(|f| f.to_string_lossy().into_owned());
+        let ver = super::version::query(&path_str);
+        let display = if !ver[0].is_empty() {
+            Some(ver[0].clone())
+        } else {
+            None
+        };
+        return ProcessParentInfo {
+            pid: parent_pid,
+            name,
+            display,
+            path: Some(path_str),
+            alive: true,
+        };
+    }
+
+    // Process is no longer running (terminated / non-existent)
+    ProcessParentInfo {
+        pid: parent_pid,
+        name: None,
+        display: None,
+        path: None,
+        alive: false,
+    }
+}
+
+/// Query parent PID from an open process handle via `NtQueryInformationProcess(ProcessBasicInformation)`
+/// and resolve its parent process metadata.
+pub(crate) fn query_process_parent_info(process: HANDLE) -> Option<ProcessParentInfo> {
+    use windows::Wdk::System::Threading::{NtQueryInformationProcess, ProcessBasicInformation};
+    use windows::Win32::System::Threading::PROCESS_BASIC_INFORMATION;
+
+    let mut basic = std::mem::MaybeUninit::<PROCESS_BASIC_INFORMATION>::uninit();
+    let status = unsafe {
+        NtQueryInformationProcess(
+            process,
+            ProcessBasicInformation,
+            basic.as_mut_ptr().cast(),
+            std::mem::size_of::<PROCESS_BASIC_INFORMATION>() as u32,
+            std::ptr::null_mut(),
+        )
+    };
+    if status.0 != 0 {
+        return None;
+    }
+    let basic = unsafe { basic.assume_init() };
+    let parent_pid = basic.InheritedFromUniqueProcessId as u32;
+    if parent_pid == 0 {
+        return None;
+    }
+
+    Some(resolve_parent_process_info(parent_pid))
 }
 
 /// Refuse operations that can destabilize the entire machine. The service
@@ -3243,5 +3373,47 @@ mod tests {
             Some("S-1-5-18")
         );
         assert_eq!(well_known_sid_for_account("SYSTEM"), Some("S-1-5-18"));
+    }
+
+    #[test]
+    fn resolve_parent_process_info_for_current_and_invalid_pids() {
+        // PID 0 is Idle / no parent
+        let idle = resolve_parent_process_info(0);
+        assert_eq!(idle.pid, 0);
+        assert!(!idle.alive);
+
+        // Invalid PID
+        let invalid = resolve_parent_process_info(u32::MAX - 8);
+        assert_eq!(invalid.pid, u32::MAX - 8);
+        assert!(!invalid.alive);
+        assert!(invalid.name.is_none());
+
+        // Own process is live: resolving own PID must succeed and find its binary name
+        let own = resolve_parent_process_info(std::process::id());
+        assert_eq!(own.pid, std::process::id());
+        assert!(own.alive);
+        assert!(own.name.is_some());
+        let name = own.name.unwrap();
+        assert!(name.ends_with(".exe") || !name.is_empty());
+    }
+
+    #[test]
+    fn query_process_parent_info_for_own_process() {
+        let handle = open_process(std::process::id(), th::PROCESS_QUERY_LIMITED_INFORMATION)
+            .expect("open own process");
+        let parent = query_process_parent_info(handle);
+        unsafe {
+            let _ = CloseHandle(handle);
+        }
+        assert!(parent.is_some(), "own process must report parent info");
+        let parent = parent.unwrap();
+        assert!(parent.pid > 0);
+        // The process that spawned this test runner (cargo/runner/shell) is alive
+        if parent.alive {
+            assert!(
+                parent.name.is_some(),
+                "live parent must report a binary name"
+            );
+        }
     }
 }

@@ -1,3 +1,16 @@
+## 2026-11-09 — Process Properties Parent Process Name and Binary with Elevation Service
+
+- Parent process name and executable binary display on Process Properties:
+  - Formatted parent process on the General tab to show both the friendly process name and the binary name alongside the PID (e.g. `Services and Controller app (services.exe) (1496)` or `Windows-Explorer (explorer.exe) (9384)`).
+  - Handles dead/terminated parent processes clearly (e.g. `1234 (Nicht vorhandener Prozess)` / `1234 (Non-existent process)`) rather than displaying a raw bare PID.
+  - Implemented `format_parent_process` in `tm-app::tabs::details` with thorough unit tests covering all permutations of display name, binary name, PID, and live/terminated state.
+- Brokered parent process resolution for elevated processes and services via elevation service:
+  - Added `ProcessParentInfo` to `ProcessSecurityInfo` in `tm-platform::win::process_ops` and bumped core service protocol to v11 (`PROTOCOL_VERSION = 11`).
+  - Evaluated in `query_process_parent_info` via `NtQueryInformationProcess(ProcessBasicInformation)` to read `InheritedFromUniqueProcessId`, then `resolve_parent_process_info` to open the parent process with `PROCESS_QUERY_LIMITED_INFORMATION`, query `QueryFullProcessImageNameW`, and extract image name, version description, and path.
+  - Thanks to the LocalSystem elevation service with `SeDebugPrivilege`, this succeeds for all processes (including elevated ones, protected processes, and system services in any session) without requiring an elevated GUI token.
+  - Non-elevated local fallback uses `image_path::of_pid` (`NtQuerySystemInformation(SystemProcessIdInformation)`) to inspect parent process image paths without requiring handles.
+  - Added `parent_pid_of` to `CpuLoadSampler` extracting `InheritedFromUniqueProcessId` directly from `SYSTEM_PROCESS_INFORMATION`, providing kernel-table fallback for `ProcessEntry::ppid` in `sampler.rs` so parent PIDs are never omitted.
+
 ## 2026-11-09 — Brokered Process File I/O and System/Protected fallback
 
 - Added protocol v10 `ProcessFileIo` endpoint to core elevation service:

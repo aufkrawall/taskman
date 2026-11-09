@@ -59,8 +59,8 @@ mod process_ops;
 mod process_threads;
 mod profile_etw;
 pub use process_ops::{
-    ProcessMachineType, ProcessProtectionLevel, ProcessSecurityInfo, command_line_of,
-    enable_debug_privilege,
+    ProcessMachineType, ProcessParentInfo, ProcessProtectionLevel, ProcessSecurityInfo,
+    command_line_of, enable_debug_privilege, resolve_parent_process_info,
 };
 mod sampler;
 mod services;

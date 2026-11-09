@@ -38,7 +38,7 @@ contract.
 
 ## IPC and authorization
 
-- Protocol v10 uses `\\.\pipe\Taskman.Core.v1` with fixed 12-byte framed JSON.
+- Protocol v11 uses `\\.\pipe\Taskman.Core.v1` with fixed 12-byte framed JSON.
   Requests are capped at 64 KiB and responses at 512 KiB; unknown request
   fields are rejected.
 - The pipe rejects remote clients and uses first-instance creation to prevent
@@ -193,10 +193,11 @@ Image_Load versions 1–3 plus the load-only version-0 layout, and rejects ETW
 loss or a target-record decode failure that could make the rundown partial.
 Unknown future versions stay unavailable. Protocol v10 adds
 `ProcessFileIo`, a read-only identity-bound open file handle enumeration and
-accounting query for one exact PID + creation time. It allows an unelevated GUI
-to inspect open files and read/write byte positions for services and elevated
-processes without running the GUI elevated; responses are capped at 1024 file
-entries and protected by the 512 KiB response frame limit. The counter
+accounting query for one exact PID + creation time. Protocol v11 adds
+identity-bound parent process evidence (`ProcessParentInfo`) inside
+`ProcessSecurityInfo`, allowing the unelevated GUI to resolve the parent process
+handle, image path, binary name, FileDescription, and live status for services
+and elevated targets without requiring elevated GUI tokens. The counter
 endpoints take no parameters, can change nothing, drain or prune server-side
 against the service's own idea of which PIDs are live, are capped per
 response, and stop their trace on an idle watchdog once the GUI stops polling.

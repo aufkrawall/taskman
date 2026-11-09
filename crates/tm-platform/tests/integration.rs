@@ -201,6 +201,7 @@ fn sample_produces_sane_snapshot() {
     let real: Vec<_> = s2.processes.iter().filter(|p| !p.synthetic).collect();
     let with_path = real.iter().filter(|p| p.exe_path.is_some()).count();
     let with_session = real.iter().filter(|p| p.session_id.is_some()).count();
+    let with_ppid = real.iter().filter(|p| p.ppid.is_some()).count();
     // Generous thresholds: a couple of kernel pseudo-processes legitimately
     // have neither, and the point is to catch a regression back to ~50 %.
     assert!(
@@ -211,6 +212,11 @@ fn sample_produces_sane_snapshot() {
     assert!(
         with_session * 10 >= real.len() * 9,
         "only {with_session}/{} processes have a session id",
+        real.len()
+    );
+    assert!(
+        with_ppid * 10 >= real.len() * 9,
+        "only {with_ppid}/{} processes have a parent PID",
         real.len()
     );
 
@@ -341,6 +347,51 @@ fn windows_extras() {
             .is_some_and(|name| !name.is_empty())),
         "no process carries a hosted service name"
     );
+}
+
+#[cfg(target_os = "windows")]
+#[test]
+fn parent_process_resolution_for_live_and_system_processes() {
+    let mut collector = tm_platform::create_collector();
+    let actions = tm_platform::create_actions();
+    let snap = collector.sample(std::time::Instant::now()).unwrap();
+
+    // 1. Own process parent info
+    let own_security = actions
+        .process_security_info_checked(std::process::id(), None)
+        .expect("own security info");
+    let own_parent = own_security.parent.expect("own parent info");
+    assert!(own_parent.pid > 0);
+    if own_parent.alive {
+        assert!(
+            own_parent.name.is_some(),
+            "alive parent must report binary name"
+        );
+    }
+
+    // 2. A system service (svchost) whose parent is services.exe
+    if let Some(svchost) = snap
+        .processes
+        .iter()
+        .find(|p| p.name.eq_ignore_ascii_case("svchost.exe") && p.ppid.is_some())
+    {
+        let parent_info = tm_platform::win::resolve_parent_process_info(svchost.ppid.unwrap());
+        if parent_info.alive {
+            assert!(
+                parent_info.name.is_some(),
+                "alive system parent must report binary name"
+            );
+            assert!(
+                parent_info
+                    .name
+                    .as_deref()
+                    .unwrap()
+                    .eq_ignore_ascii_case("services.exe"),
+                "svchost parent should resolve to services.exe, got {:?}",
+                parent_info.name
+            );
+        }
+    }
 }
 
 #[cfg(target_os = "windows")]
