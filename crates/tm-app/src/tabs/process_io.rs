@@ -757,7 +757,16 @@ pub fn show(
     let display_files = state.sorted_and_filtered_files();
     if display_files.is_empty() {
         ui.add_space(6.0);
-        ui.weak(i18n::tr(K::PropIoNoFiles));
+        let unavailable = state
+            .accounting
+            .as_ref()
+            .is_some_and(|a| !a.handles_complete);
+        let msg = if unavailable {
+            i18n::tr(K::PropIoFilesUnavailable)
+        } else {
+            i18n::tr(K::PropIoNoFiles)
+        };
+        ui.weak(msg);
         if process.disk_read_bps > 0.0
             || process.disk_write_bps > 0.0
             || process.io_other_bps.unwrap_or(0.0) > 0.0
@@ -1445,5 +1454,24 @@ mod tests {
         });
         output.textures_delta.clear();
         assert!(!output.shapes.is_empty());
+    }
+
+    #[test]
+    fn empty_files_with_incomplete_handles_reports_unavailable() {
+        let mut state = State::default();
+        state.merge_files(ProcessFileIoSnapshot {
+            files: Vec::new(),
+            accounting: FileIoAccounting {
+                handles_complete: false,
+                counter_read_bytes: Some(1024),
+                counter_write_bytes: Some(2048),
+                ..Default::default()
+            },
+        });
+        assert!(state.files.is_empty());
+        assert_eq!(
+            state.accounting.as_ref().map(|a| a.handles_complete),
+            Some(false)
+        );
     }
 }

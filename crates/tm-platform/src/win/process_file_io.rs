@@ -8,6 +8,7 @@
 use std::collections::HashMap;
 
 use tm_core::error::{Result, TmError};
+use windows::Wdk::System::SystemInformation::SystemProcessInformation;
 use windows::Wdk::System::Threading::{NtQueryInformationProcess, PROCESSINFOCLASS};
 use windows::Win32::Foundation::{CloseHandle, DUPLICATE_SAME_ACCESS, DuplicateHandle, HANDLE};
 use windows::Win32::Storage::FileSystem::{
@@ -58,26 +59,143 @@ pub(crate) fn strip_verbatim(path: &str) -> String {
     }
 }
 
+fn is_access_denied_or_system(err: &TmError, pid: u32) -> bool {
+    if pid <= 4 {
+        return true;
+    }
+    match err {
+        TmError::Platform { detail, .. } => {
+            detail.contains("0x80070005")
+                || detail.to_lowercase().contains("access is denied")
+                || detail.to_lowercase().contains("zugriff verweigert")
+        }
+        _ => false,
+    }
+}
+
+fn query_kernel_process_io(
+    pid: u32,
+    expected_start_epoch_s: Option<i64>,
+) -> Result<(Option<u64>, Option<u64>)> {
+    let mut buf = vec![0u8; 512 * 1024];
+    let written =
+        crate::win::cpu_load::CpuLoadAccountant::nt_query(&mut buf, SystemProcessInformation)
+            .ok_or_else(|| TmError::platform("NtQuerySystemInformation", "query failed"))?;
+    let off = crate::win::cpu_load::Offsets::get();
+    let mut pos = 0usize;
+    loop {
+        if pos.checked_add(off.min_size).is_none() || pos + off.min_size > written {
+            break;
+        }
+        let proc_pid = crate::win::cpu_load::read_usize(&buf, pos + off.pid) as u32;
+        let next = crate::win::cpu_load::read_u32(&buf, pos) as usize;
+        let record_end = if next == 0 {
+            written
+        } else if next >= off.min_size {
+            match pos.checked_add(next) {
+                Some(end) if end <= written => end,
+                _ => break,
+            }
+        } else {
+            break;
+        };
+        if proc_pid == pid {
+            let create_time = crate::win::cpu_load::read_i64(&buf, pos + off.create_time);
+            if let Some(expected) = expected_start_epoch_s {
+                let actual = crate::win::cpu_load::filetime_to_unix_seconds(create_time);
+                if pid > 4 && expected > 0 && actual != Some(expected) {
+                    return Err(TmError::ProcessNotFound { pid });
+                }
+            }
+            if let Some(raw_io) =
+                crate::win::cpu_load::read_raw_io_counters(&buf, pos, record_end, &off)
+            {
+                return Ok((Some(raw_io.read_bytes), Some(raw_io.write_bytes)));
+            }
+            return Ok((None, None));
+        }
+        if next == 0 {
+            break;
+        }
+        pos += next;
+    }
+    Err(TmError::ProcessNotFound { pid })
+}
+
+fn query_process_io_fallback(
+    pid: u32,
+    expected_start_epoch_s: Option<i64>,
+) -> Result<(Option<u64>, Option<u64>)> {
+    if pid > 4
+        && let Ok(h) = super::process_ops::open_process_verified(
+            pid,
+            th::PROCESS_QUERY_LIMITED_INFORMATION,
+            expected_start_epoch_s,
+        )
+    {
+        let mut io_counters = th::IO_COUNTERS::default();
+        let ok = unsafe { th::GetProcessIoCounters(h, &mut io_counters) }.is_ok();
+        unsafe {
+            let _ = CloseHandle(h);
+        }
+        if ok {
+            return Ok((
+                Some(io_counters.ReadTransferCount),
+                Some(io_counters.WriteTransferCount),
+            ));
+        }
+    }
+    query_kernel_process_io(pid, expected_start_epoch_s)
+}
+
 pub fn list_process_file_io(
     pid: u32,
     expected_start_epoch_s: Option<i64>,
 ) -> Result<ProcessFileIoSnapshot> {
     super::process_ops::enable_debug_privilege();
 
-    let h_process = super::process_ops::open_process_verified(
-        pid,
-        th::PROCESS_QUERY_INFORMATION | th::PROCESS_DUP_HANDLE,
-        expected_start_epoch_s,
-    )?;
+    let open_result = if pid <= 4 {
+        Err(TmError::platform(
+            "OpenProcess",
+            "system process is protected",
+        ))
+    } else {
+        super::process_ops::open_process_verified(
+            pid,
+            th::PROCESS_QUERY_INFORMATION | th::PROCESS_DUP_HANDLE,
+            expected_start_epoch_s,
+        )
+    };
 
-    let mut io_counters = th::IO_COUNTERS::default();
-    let has_counters = unsafe { th::GetProcessIoCounters(h_process, &mut io_counters) }.is_ok();
+    let (files, counter_read_bytes, counter_write_bytes, handles_complete) = match open_result {
+        Ok(h_process) => {
+            let mut io_counters = th::IO_COUNTERS::default();
+            let has_counters =
+                unsafe { th::GetProcessIoCounters(h_process, &mut io_counters) }.is_ok();
+            let (cr, cw) = if has_counters {
+                (
+                    Some(io_counters.ReadTransferCount),
+                    Some(io_counters.WriteTransferCount),
+                )
+            } else {
+                (None, None)
+            };
+            let result = enumerate_process_files(h_process);
+            unsafe {
+                let _ = CloseHandle(h_process);
+            }
+            (result?, cr, cw, true)
+        }
+        Err(error) => {
+            if is_access_denied_or_system(&error, pid) {
+                let (cr, cw) = query_process_io_fallback(pid, expected_start_epoch_s)?;
+                (Vec::new(), cr, cw, false)
+            } else {
+                return Err(error);
+            }
+        }
+    };
 
-    let result = enumerate_process_files(h_process);
-    unsafe {
-        let _ = CloseHandle(h_process);
-    }
-    let files = result?;
     let accounting = FileIoAccounting {
         state: FileIoAccountingState::Unavailable,
         since_ms: 0,
@@ -89,18 +207,10 @@ pub fn list_process_file_io(
         unnamed_write_bytes: 0,
         omitted_read_bytes: 0,
         omitted_write_bytes: 0,
-        counter_read_bytes: if has_counters {
-            Some(io_counters.ReadTransferCount)
-        } else {
-            None
-        },
-        counter_write_bytes: if has_counters {
-            Some(io_counters.WriteTransferCount)
-        } else {
-            None
-        },
+        counter_read_bytes,
+        counter_write_bytes,
         events_lost: None,
-        handles_complete: true,
+        handles_complete,
     };
     Ok(ProcessFileIoSnapshot { files, accounting })
 }
@@ -416,6 +526,14 @@ mod tests {
 
         drop(file);
         let _ = std::fs::remove_file(&test_path);
+    }
+
+    #[test]
+    fn system_process_file_io_succeeds_with_kernel_counters() {
+        let snapshot = list_process_file_io(4, None).expect("system process file io");
+        assert!(snapshot.files.is_empty());
+        assert!(!snapshot.accounting.handles_complete);
+        assert!(snapshot.accounting.counter_read_bytes.is_some());
     }
 
     #[test]

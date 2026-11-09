@@ -2,6 +2,7 @@
 //! These exercise the platform layer end-to-end without a GUI.
 
 use tm_core::model::*;
+use tm_platform::actions::PlatformActions;
 
 /// Poll `probe` until it answers or the deadline passes.
 ///
@@ -1223,4 +1224,34 @@ fn sampled_profile_attributes_code_to_this_process() {
         window.attributed_samples > 0,
         "target samples did not match any current module"
     );
+}
+
+#[test]
+fn list_process_file_io_for_system_process_succeeds_without_error() {
+    let actions = tm_platform::win::WinActions;
+    let snapshot = actions
+        .list_process_file_io(4, None)
+        .expect("list_process_file_io for pid 4 (System) must succeed");
+    assert!(
+        snapshot.files.is_empty(),
+        "system process has no accessible user-mode duplicate handles"
+    );
+    assert!(
+        !snapshot.accounting.handles_complete,
+        "handles must be marked incomplete"
+    );
+    assert!(
+        snapshot.accounting.counter_read_bytes.is_some(),
+        "system process must report kernel read transfer counter"
+    );
+}
+
+#[test]
+fn list_process_file_io_for_current_process_has_complete_handles() {
+    let actions = tm_platform::win::WinActions;
+    let pid = std::process::id();
+    let snapshot = actions
+        .list_process_file_io(pid, None)
+        .expect("own process file io");
+    assert!(snapshot.accounting.handles_complete);
 }

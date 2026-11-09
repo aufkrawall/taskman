@@ -13,6 +13,7 @@
 
 ### Fixed
 
+- **Process Properties I/O handle access for services and system processes:** Resolved `OpenProcess: Zugriff verweigert (0x80070005)` errors when opening the I/O tab for services (such as background services) or system processes. File I/O queries now route through the authenticated LocalSystem elevation service (`TaskmanCore`) via protocol v10 `ProcessFileIo` endpoint, allowing an unelevated GUI to inspect open files and read/write byte positions for services. For processes where handle duplication is restricted by the kernel (such as PID 4 System or protected PPL processes), queries fall back to reading process-level kernel `IO_COUNTERS` via `PROCESS_QUERY_LIMITED_INFORMATION` or `SystemProcessInformation` without failing, rendering file availability as unavailable rather than reporting an error.
 - **Process Properties I/O per-file attribution honesty and accuracy:** Eliminated false byte counts in the file list on the Process Properties I/O tab, where write-only file handles on existing files previously fabricated their entire file size as written bytes, and read/write handles duplicated their seek pointer into both columns and double-counted in total. Handle pointer offsets are now strictly separated from cumulative transfer counts, read/write access is accurately differentiated, and an explanatory tooltip and non-file I/O notice clarify why kernel process I/O (network sockets, named pipes, IPC, and closed temporary files) in the graphs above exceeds the open disk file handles below.
 
 

@@ -610,18 +610,18 @@ pub(crate) fn current_creation_epoch(pid: u32) -> Option<i64> {
 
 /// Raw `IO_COUNTERS` read directly from the kernel process table.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-struct RawIoCounters {
-    read_ops: u64,
-    write_ops: u64,
-    other_ops: u64,
-    read_bytes: u64,
-    write_bytes: u64,
-    other_bytes: u64,
+pub(crate) struct RawIoCounters {
+    pub(crate) read_ops: u64,
+    pub(crate) write_ops: u64,
+    pub(crate) other_ops: u64,
+    pub(crate) read_bytes: u64,
+    pub(crate) write_bytes: u64,
+    pub(crate) other_bytes: u64,
 }
 
 /// The six `IO_COUNTERS` 64-bit integers: read/write/other operation counts,
 /// followed by read/write/other transfer counts.
-fn read_raw_io_counters(
+pub(crate) fn read_raw_io_counters(
     buf: &[u8],
     pos: usize,
     record_end: usize,

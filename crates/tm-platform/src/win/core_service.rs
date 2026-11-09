@@ -71,8 +71,9 @@ pub const SERVICE_LOG_FILE_PREFIX: &str = "taskman-service.log";
 // identity-bound thread start-address and cycle evidence so an unelevated GUI
 // can fill those fields for elevated targets such as Windows Task Manager. v9
 // adds drained, identity-bound sampled instruction-pointer attribution for
-// the Modules page.
-pub const PROTOCOL_VERSION: u16 = 9;
+// the Modules page. v10 adds bounded, identity-bound process file I/O
+// enumeration (ProcessFileIo).
+pub const PROTOCOL_VERSION: u16 = 10;
 
 const PIPE_NAME: &str = r"\\.\pipe\Taskman.Core.v1";
 const FRAME_MAGIC: [u8; 4] = *b"TMB1";
@@ -86,6 +87,7 @@ const MAX_REQUEST_BYTES: usize = 64 * 1024;
 const MAX_RESPONSE_BYTES: usize = 512 * 1024;
 const MAX_MODULES_PER_RESPONSE: usize = 1024;
 const MAX_THREAD_DETAILS_PER_RESPONSE: usize = 4096;
+const MAX_FILES_PER_RESPONSE: usize = 1024;
 const PIPE_BUFFER_BYTES: u32 = 64 * 1024;
 const WORKER_COUNT: usize = 2;
 const WORK_QUEUE_CAP: usize = 16;
@@ -202,6 +204,11 @@ enum BrokerRequest {
     /// own token. Bound to the exact process creation time and to each
     /// thread's creation time before any value is returned.
     ProcessThreadDetails {
+        pid: u32,
+        expected_start_epoch_s: Option<i64>,
+    },
+    /// Read-only, identity-bound open file handles and I/O accounting.
+    ProcessFileIo {
         pid: u32,
         expected_start_epoch_s: Option<i64>,
     },
@@ -337,6 +344,7 @@ enum BrokerValue {
     ProcessModules(Vec<ProcessModule>),
     ProcessModuleCodeSamples(Option<ProcessModuleCodeWindow>),
     ProcessThreadDetails(Vec<ProcessThreadDetail>),
+    ProcessFileIo(crate::actions::ProcessFileIoSnapshot),
     /// Result of `UnloadModule`. `released` is retained only for compatibility
     /// with the earlier v2 wire shape; it now means successful remote
     /// FreeLibrary calls, not an observable loader-reference count. `verified`
@@ -1392,7 +1400,24 @@ impl PlatformActions for BrokeredActions {
         pid: u32,
         expected_start_epoch_s: Option<i64>,
     ) -> Result<crate::actions::ProcessFileIoSnapshot> {
-        self.local.list_process_file_io(pid, expected_start_epoch_s)
+        let Some(start_epoch_s) = expected_start_epoch_s.filter(|value| *value > 0) else {
+            return self.local.list_process_file_io(pid, expected_start_epoch_s);
+        };
+        let local = || self.local.list_process_file_io(pid, Some(start_epoch_s));
+        match self.client.call(BrokerRequest::ProcessFileIo {
+            pid,
+            expected_start_epoch_s: Some(start_epoch_s),
+        }) {
+            Ok(BrokerValue::ProcessFileIo(snapshot)) => Ok(snapshot),
+            Ok(_) => Err(TmError::platform(
+                "core service",
+                "unexpected process file I/O response type",
+            )),
+            Err(BrokerCallError::Unavailable(_)) => local(),
+            Err(BrokerCallError::Rejected(detail)) => {
+                local().map_err(|_| TmError::platform("core service", detail))
+            }
+        }
     }
 
     fn unload_process_module(
@@ -2351,6 +2376,43 @@ fn dispatch(
                 ));
             }
             Ok(BrokerValue::ProcessThreadDetails(details))
+        }
+        BrokerRequest::ProcessFileIo {
+            pid,
+            expected_start_epoch_s,
+        } => {
+            let Some(start_epoch_s) = expected_start_epoch_s.filter(|value| *value > 0) else {
+                return Err(TmError::platform(
+                    "broker process file io",
+                    "a valid sampled process creation time is required",
+                ));
+            };
+            let mut snapshot =
+                super::process_file_io::list_process_file_io(pid, Some(start_epoch_s))?;
+            if snapshot.files.len() > MAX_FILES_PER_RESPONSE {
+                let omitted = snapshot.files.split_off(MAX_FILES_PER_RESPONSE);
+                snapshot.accounting.handles_complete = false;
+                for file in omitted {
+                    if let Some(r) = file.read_bytes {
+                        snapshot.accounting.omitted_read_bytes =
+                            snapshot.accounting.omitted_read_bytes.saturating_add(r);
+                    }
+                    if let Some(w) = file.write_bytes {
+                        snapshot.accounting.omitted_write_bytes =
+                            snapshot.accounting.omitted_write_bytes.saturating_add(w);
+                    }
+                }
+            }
+            let encoded_len = serde_json::to_vec(&snapshot)
+                .map_err(|error| TmError::platform("broker process file io", error.to_string()))?
+                .len();
+            if encoded_len > MAX_RESPONSE_BYTES.saturating_sub(1024) {
+                return Err(TmError::platform(
+                    "broker process file io",
+                    "file I/O snapshot exceeds the bounded broker response limit",
+                ));
+            }
+            Ok(BrokerValue::ProcessFileIo(snapshot))
         }
         BrokerRequest::KillProcess {
             pid,
@@ -4308,6 +4370,126 @@ mod tests {
         assert!(
             encoded.len() <= MAX_RESPONSE_BYTES,
             "worst-case thread response {} exceeds the {MAX_RESPONSE_BYTES}-byte cap",
+            encoded.len()
+        );
+    }
+
+    #[test]
+    fn the_file_io_read_requires_an_exact_process_identity() {
+        let probe = |expected_start_epoch_s| {
+            dispatch(
+                &crate::win::WinActions,
+                BrokerRequest::ProcessFileIo {
+                    pid: 101,
+                    expected_start_epoch_s,
+                },
+                500,
+            )
+        };
+        assert!(probe(None).is_err(), "pid-only reads are refused");
+        assert!(
+            probe(Some(0)).is_err(),
+            "an implausible creation time is refused"
+        );
+    }
+
+    #[test]
+    fn file_io_round_trips_and_rejects_untargeted_or_grown_payloads() {
+        let request = BrokerRequest::ProcessFileIo {
+            pid: 101,
+            expected_start_epoch_s: Some(202),
+        };
+        let encoded = serde_json::to_string(&request).unwrap();
+        assert_eq!(
+            encoded,
+            r#"{"operation":"process_file_io","pid":101,"expected_start_epoch_s":202}"#
+        );
+        assert!(matches!(
+            serde_json::from_str::<BrokerRequest>(&encoded).unwrap(),
+            BrokerRequest::ProcessFileIo {
+                pid: 101,
+                expected_start_epoch_s: Some(202),
+            }
+        ));
+        let grown = encoded.replace('}', r#","extra":true}"#);
+        assert!(serde_json::from_str::<BrokerRequest>(&grown).is_err());
+
+        let response = BrokerResponse {
+            protocol_version: PROTOCOL_VERSION,
+            value: Ok(BrokerValue::ProcessFileIo(
+                crate::actions::ProcessFileIoSnapshot {
+                    files: vec![crate::actions::ProcessFileIo {
+                        path: r"C:\Windows\System32\kernel32.dll".into(),
+                        read_bytes: Some(1024),
+                        write_bytes: Some(0),
+                        read_ops: None,
+                        write_ops: None,
+                        file_size: Some(2048),
+                        offset: Some(1024),
+                        is_read: true,
+                        is_write: false,
+                        open_handles: 1,
+                    }],
+                    accounting: crate::actions::FileIoAccounting {
+                        state: crate::actions::FileIoAccountingState::Unavailable,
+                        since_ms: 0,
+                        read_bytes: 0,
+                        write_bytes: 0,
+                        read_ops: 0,
+                        write_ops: 0,
+                        unnamed_read_bytes: 0,
+                        unnamed_write_bytes: 0,
+                        omitted_read_bytes: 0,
+                        omitted_write_bytes: 0,
+                        counter_read_bytes: Some(1024),
+                        counter_write_bytes: Some(0),
+                        events_lost: None,
+                        handles_complete: true,
+                    },
+                },
+            )),
+        };
+        let decoded: BrokerResponse =
+            serde_json::from_slice(&serde_json::to_vec(&response).unwrap()).unwrap();
+        let Ok(BrokerValue::ProcessFileIo(snapshot)) = decoded.value else {
+            panic!("file I/O response did not round trip");
+        };
+        assert_eq!(snapshot.files.len(), 1);
+        assert_eq!(snapshot.files[0].path, r"C:\Windows\System32\kernel32.dll");
+        assert_eq!(snapshot.accounting.counter_read_bytes, Some(1024));
+    }
+
+    #[test]
+    fn a_capped_file_io_response_fits_the_frame_limit() {
+        let files: Vec<crate::actions::ProcessFileIo> = (0..MAX_FILES_PER_RESPONSE)
+            .map(|index| crate::actions::ProcessFileIo {
+                path: format!(
+                    r"C:\Program Files\Example\Subdirectory\VeryLongFileName_{index}.dat"
+                ),
+                read_bytes: Some(u64::MAX - index as u64),
+                write_bytes: Some(index as u64),
+                read_ops: Some(100),
+                write_ops: Some(20),
+                file_size: Some(1024 * 1024),
+                offset: Some(512),
+                is_read: true,
+                is_write: false,
+                open_handles: 1,
+            })
+            .collect();
+        let response = BrokerResponse {
+            protocol_version: PROTOCOL_VERSION,
+            value: Ok(BrokerValue::ProcessFileIo(
+                crate::actions::ProcessFileIoSnapshot {
+                    files,
+                    accounting: crate::actions::FileIoAccounting::default(),
+                },
+            )),
+        };
+        let encoded = serde_json::to_vec(&response).unwrap();
+        assert!(
+            encoded.len() <= MAX_RESPONSE_BYTES,
+            "worst-case file I/O response {} exceeds the {MAX_RESPONSE_BYTES}-byte cap",
             encoded.len()
         );
     }

@@ -1,3 +1,13 @@
+## 2026-11-09 — Brokered Process File I/O and System/Protected fallback
+
+- Added protocol v10 `ProcessFileIo` endpoint to core elevation service:
+  - Added `BrokerRequest::ProcessFileIo` and `BrokerValue::ProcessFileIo` with exact creation-identity verification (`expected_start_epoch_s`).
+  - Wire response capped at `MAX_FILES_PER_RESPONSE` (1024) and checked against `MAX_RESPONSE_BYTES` (512 KiB). Excess file entries track their read/write bytes into `omitted_read_bytes` and mark `handles_complete = false`.
+  - Routed `BrokeredActions::list_process_file_io` through the authenticated LocalSystem elevation service, enabling unelevated GUIs to inspect file I/O for services (such as `green-curve`) and elevated processes.
+- Graceful access-denied fallback for System (PID 4) and Protected (PPL) processes:
+  - When handle duplication (`PROCESS_DUP_HANDLE`) fails with `ERROR_ACCESS_DENIED` or for PID <= 4, falls back to reading process-level kernel `IO_COUNTERS` via `PROCESS_QUERY_LIMITED_INFORMATION` or `SystemProcessInformation` without failing with a platform error.
+  - UI renders `PropIoFilesUnavailable` ("File information unavailable") when `handles_complete == false` and file list is empty, preserving the product invariant that unavailable telemetry never errors or fabricates zeros.
+
 ## 2026-11-09 — Process Properties I/O per-file attribution honesty and accuracy
 
 - Root-cause corrections for per-file attribution in the Process Properties I/O dialog:
