@@ -6,6 +6,7 @@
   - Themed series traces and translucent fills: Read using `pal.disk_graph` (green), Write using `pal.disk_write_graph` (amber), and Inter-Process / Other using `pal.network_send_graph` (teal).
   - Modern caption row above each chart indicating series title and current transfer rate / delta on the left and vertical scale maximum on the right.
   - Hover readout tooltips now appear directly anchored at the cursor pointer on the tooltip layer with color swatches and age headers, remaining pinned to the hovered sample timestamp across rolling graph updates until the pointer moves.
+  - In the "Disk & Inter-Process I/O" table, bounded column widths with right-to-left label allocation were applied to value cells across all three metric columns, fixing an issue where the trailing "Other (IPC)" column expanded across the remaining dialog width and pushed values to the far right window border.
 
 ## 2026-11-08 — Process Properties I/O page with inter-process (IPC) telemetry
 

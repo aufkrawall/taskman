@@ -8,7 +8,7 @@
 
 ### Improved
 
-- **Process Properties I/O graphs theming and pinned hover readout:** Process Properties I/O tab graphs now match the styling and theming of the Performance page for disks: dark/light adaptive sunken inset card surfaces (`pal.card_bg_sunken` to visually distinguish chart cells from the modal dialog window background), subtle gridlines, and coordinated series colors (green for Read, amber for Write, and teal for Inter-Process/Other) with translucent area fills, replacing retro green-on-black canvases. Cursor hover tooltips now appear directly at the pointer position with series swatches, and stay pinned to the inspected sample timestamp across rolling graph updates until the pointer is moved again.
+- **Process Properties I/O graphs theming and pinned hover readout:** Process Properties I/O tab graphs now match the styling and theming of the Performance page for disks: dark/light adaptive sunken inset card surfaces (`pal.card_bg_sunken` to visually distinguish chart cells from the modal dialog window background), subtle gridlines, and coordinated series colors (green for Read, amber for Write, and teal for Inter-Process/Other) with translucent area fills, replacing retro green-on-black canvases. Cursor hover tooltips now appear directly at the pointer position with series swatches, and stay pinned to the inspected sample timestamp across rolling graph updates until the pointer is moved again. In the Disk & Inter-Process I/O table, the values for the trailing "Other (IPC)" column now use measured bounded cell allocations so their spacing matches the clean 16 px gap of the Read and Write columns instead of stretching to the window border.
 
 
 ## 0.1.23 - 2026-11-03

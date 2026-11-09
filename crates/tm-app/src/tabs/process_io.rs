@@ -358,6 +358,36 @@ pub fn show(
                 })
                 .unwrap_or_else(|| "—".into());
 
+            let font = egui::FontId::proportional(13.0);
+            let text_w = |s: &str| {
+                ui.painter()
+                    .layout_no_wrap(s.to_owned(), font.clone(), pal.text)
+                    .size()
+                    .x
+            };
+            let read_val_w = text_w(&read_ops_str)
+                .max(text_w(&read_bytes_str))
+                .max(text_w(&read_delta_str))
+                .ceil();
+            let write_val_w = text_w(&write_ops_str)
+                .max(text_w(&write_bytes_str))
+                .max(text_w(&write_delta_str))
+                .ceil();
+            let other_val_w = text_w(&other_ops_str)
+                .max(text_w(&other_bytes_str))
+                .max(text_w(&other_delta_str))
+                .ceil();
+
+            let show_val = |ui: &mut egui::Ui, text: &str, width: f32| {
+                ui.allocate_ui_with_layout(
+                    egui::vec2(width, 18.0),
+                    egui::Layout::right_to_left(egui::Align::Center),
+                    |ui| {
+                        ui.label(text);
+                    },
+                );
+            };
+
             egui::Grid::new("process-io-stats-grid")
                 .num_columns(6)
                 .spacing(Vec2::new(16.0, 6.0))
@@ -365,53 +395,35 @@ pub fn show(
                 .show(ui, |ui| {
                     // Row 1: Operations
                     ui.weak(i18n::tr(K::PropIoReads));
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.label(&read_ops_str);
-                    });
+                    show_val(ui, &read_ops_str, read_val_w);
 
                     ui.weak(i18n::tr(K::PropIoWrites));
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.label(&write_ops_str);
-                    });
+                    show_val(ui, &write_ops_str, write_val_w);
 
                     ui.weak(i18n::tr(K::PropIoOther));
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.label(&other_ops_str);
-                    });
+                    show_val(ui, &other_ops_str, other_val_w);
                     ui.end_row();
 
                     // Row 2: Bytes
                     ui.weak(i18n::tr(K::PropIoReadBytes));
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.label(&read_bytes_str);
-                    });
+                    show_val(ui, &read_bytes_str, read_val_w);
 
                     ui.weak(i18n::tr(K::PropIoWriteBytes));
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.label(&write_bytes_str);
-                    });
+                    show_val(ui, &write_bytes_str, write_val_w);
 
                     ui.weak(i18n::tr(K::PropIoOtherBytes));
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.label(&other_bytes_str);
-                    });
+                    show_val(ui, &other_bytes_str, other_val_w);
                     ui.end_row();
 
                     // Row 3: Delta
                     ui.weak(i18n::tr(K::PropIoReadDelta));
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.label(&read_delta_str);
-                    });
+                    show_val(ui, &read_delta_str, read_val_w);
 
                     ui.weak(i18n::tr(K::PropIoWriteDelta));
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.label(&write_delta_str);
-                    });
+                    show_val(ui, &write_delta_str, write_val_w);
 
                     ui.weak(i18n::tr(K::PropIoOtherDelta));
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.label(&other_delta_str);
-                    });
+                    show_val(ui, &other_delta_str, other_val_w);
                     ui.end_row();
                 });
         });
@@ -595,6 +607,71 @@ mod tests {
         assert!(
             near_rolled,
             "readout remains visible near cursor after graph update"
+        );
+    }
+
+    #[test]
+    fn stats_grid_other_column_spacing_is_bounded() {
+        let screen = egui::Rect::from_min_size(Pos2::ZERO, egui::vec2(900.0, 600.0));
+        let ctx = egui::Context::default();
+        let mut other_lbl_rect = None;
+        let mut other_val_rect = None;
+
+        for _ in 0..2 {
+            let input = egui::RawInput {
+                screen_rect: Some(screen),
+                ..Default::default()
+            };
+            let mut output = ctx.run_ui(input, |ui| {
+                let font = egui::FontId::proportional(13.0);
+                let read_ops_str = "48.705";
+                let write_ops_str = "5.290";
+                let other_ops_str = "135.251";
+                let text_w = |s: &str| {
+                    ui.painter()
+                        .layout_no_wrap(s.to_owned(), font.clone(), Color32::WHITE)
+                        .size()
+                        .x
+                };
+                let read_val_w = text_w(read_ops_str).ceil();
+                let write_val_w = text_w(write_ops_str).ceil();
+                let other_val_w = text_w(other_ops_str).ceil();
+
+                let show_val = |ui: &mut egui::Ui, text: &str, width: f32| -> egui::Response {
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(width, 18.0),
+                        egui::Layout::right_to_left(egui::Align::Center),
+                        |ui| ui.label(text),
+                    )
+                    .response
+                };
+
+                egui::Grid::new("test-stats-grid")
+                    .num_columns(6)
+                    .spacing(Vec2::new(16.0, 6.0))
+                    .show(ui, |ui| {
+                        ui.weak("Reads");
+                        show_val(ui, read_ops_str, read_val_w);
+
+                        ui.weak("Writes");
+                        show_val(ui, write_ops_str, write_val_w);
+
+                        let lbl_resp = ui.weak("Other (IPC)");
+                        other_lbl_rect = Some(lbl_resp.rect);
+                        let val_resp = show_val(ui, other_ops_str, other_val_w);
+                        other_val_rect = Some(val_resp.rect);
+                        ui.end_row();
+                    });
+            });
+            output.textures_delta.clear();
+        }
+
+        let lbl = other_lbl_rect.unwrap();
+        let val = other_val_rect.unwrap();
+        let gap = val.left() - lbl.right();
+        assert!(
+            (gap - 16.0).abs() < 2.0,
+            "gap between Other label and value must match grid spacing (16 px), was {gap}"
         );
     }
 }
