@@ -1,8 +1,9 @@
 ## 2026-11-09 — Process Properties Parent Process Name and Binary with Elevation Service
 
 - Parent process name and executable binary display on Process Properties:
-  - Formatted parent process on the General tab to show both the friendly process name and the binary name alongside the PID (e.g. `Services and Controller app (services.exe) (1496)` or `Windows-Explorer (explorer.exe) (9384)`).
-  - Handles dead/terminated parent processes clearly (e.g. `1234 (Nicht vorhandener Prozess)` / `1234 (Non-existent process)`) rather than displaying a raw bare PID.
+  - Formatted parent process on the General tab to show both the friendly process name and the binary name alongside the PID (e.g. `Services and Controller app (services.exe) (1496)` or `Userinit Logon Application (userinit.exe) (5428) (Non-existent process)`).
+  - Handles dead/terminated parent processes clearly rather than displaying a raw bare PID: when `QueryFullProcessImageNameW` in Win32 format fails with `0x8007001F` on a terminated parent (such as `userinit.exe` for `explorer.exe`), resolution automatically falls back to native NT format (`PROCESS_NAME_FORMAT(1)`) on the open handle and `etw_dos_path` translation, and checks `GetExitCodeProcess != STILL_ACTIVE` (259) to accurately discover the binary name and mark it as terminated.
+  - Added an in-session bounded process history cache (`process_history_cache`) to `TaskManApp` to retain process names and display labels even if handles are completely closed.
   - Implemented `format_parent_process` in `tm-app::tabs::details` with thorough unit tests covering all permutations of display name, binary name, PID, and live/terminated state.
 - Brokered parent process resolution for elevated processes and services via elevation service:
   - Added `ProcessParentInfo` to `ProcessSecurityInfo` in `tm-platform::win::process_ops` and bumped core service protocol to v11 (`PROTOCOL_VERSION = 11`).

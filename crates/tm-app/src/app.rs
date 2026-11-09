@@ -345,6 +345,9 @@ pub struct TaskManApp {
     /// window setting must never silently truncate the visible history.
     pub history_cap: usize,
     pub app_history_db: tm_core::AppHistoryDb,
+    /// Bounded cache of recently seen process names and display labels keyed by PID,
+    /// so parent process names can still be resolved after the parent has exited.
+    pub process_history_cache: std::collections::HashMap<u32, (String, String)>,
     /// Measured startup cost per image, persisted across restarts. Filled by
     /// [`TaskManApp::startup_impact_tracker`] while the machine is still
     /// inside its startup window; the Startup tab joins it by image path.
@@ -803,6 +806,7 @@ impl TaskManApp {
             history: Vec::with_capacity(history_cap + 8),
             history_cap,
             app_history_db,
+            process_history_cache: Default::default(),
             startup_impact,
             startup_impact_tracker: None,
             tab,
@@ -962,6 +966,16 @@ impl TaskManApp {
             // Feed the persistent app-history database.
             let interval_s = self.engine.interval().as_secs_f64().max(0.05);
             self.app_history_db.observe(&latest, interval_s);
+
+            for process in &latest.processes {
+                if !process.synthetic {
+                    self.process_history_cache
+                        .insert(process.pid, (process.name.clone(), process.display.clone()));
+                }
+            }
+            if self.process_history_cache.len() > 4096 {
+                self.process_history_cache.clear();
+            }
             // Startup impact is measured between the first sample and the end
             // of the boot window. The tracker is created from the FIRST
             // snapshot's uptime: an app started long after boot never opens a

@@ -3903,6 +3903,7 @@ fn process_properties_general(
     snapshot: &tm_core::model::Snapshot,
     process: &ProcessEntry,
     security: &ProcessSecuritySummary,
+    process_history: &std::collections::HashMap<u32, (String, String)>,
 ) {
     let head_resp = ui.heading(process.shown_name());
     selectable_text_context_menu(&head_resp, process.shown_name());
@@ -3933,14 +3934,17 @@ fn process_properties_general(
         #[cfg(target_os = "windows")]
         let from_security = security.parent.as_ref().map(|info| {
             let snap_proc = snapshot.process(info.pid);
+            let hist_proc = process_history.get(&info.pid);
             let display = info
                 .display
                 .as_deref()
-                .or_else(|| snap_proc.map(|p| p.display.as_str()));
+                .or_else(|| snap_proc.map(|p| p.display.as_str()))
+                .or_else(|| hist_proc.map(|(_, d)| d.as_str()));
             let name = info
                 .name
                 .as_deref()
-                .or_else(|| snap_proc.map(|p| p.name.as_str()));
+                .or_else(|| snap_proc.map(|p| p.name.as_str()))
+                .or_else(|| hist_proc.map(|(n, _)| n.as_str()));
             format_parent_process(display, name, info.pid, Some(info.alive))
         });
         #[cfg(not(target_os = "windows"))]
@@ -3955,6 +3959,13 @@ fn process_properties_general(
                     (!p.name.is_empty()).then_some(p.name.as_str()),
                     pid,
                     Some(true),
+                )
+            } else if let Some((name, display)) = process_history.get(&pid) {
+                format_parent_process(
+                    (!display.is_empty()).then_some(display.as_str()),
+                    (!name.is_empty()).then_some(name.as_str()),
+                    pid,
+                    Some(false),
                 )
             } else {
                 format_parent_process(None, None, pid, None)
@@ -4593,7 +4604,13 @@ pub fn process_properties_dialog(app: &mut TaskManApp, ctx: &egui::Context) {
                                 #[cfg(not(target_os = "windows"))]
                                 ui.label("—");
                             }
-                            _ => process_properties_general(ui, snapshot, process, &security),
+                            _ => process_properties_general(
+                                ui,
+                                snapshot,
+                                process,
+                                &security,
+                                &app.process_history_cache,
+                            ),
                         });
                 }
             }

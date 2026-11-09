@@ -383,6 +383,12 @@ pub fn resolve_parent_process_info(parent_pid: u32) -> ProcessParentInfo {
     // Try opening parent process with PROCESS_QUERY_LIMITED_INFORMATION
     let parent_handle = open_process(parent_pid, th::PROCESS_QUERY_LIMITED_INFORMATION);
     if let Ok(ph) = parent_handle {
+        const STILL_ACTIVE: u32 = 259;
+        let mut exit_code = 0u32;
+        let alive = unsafe { th::GetExitCodeProcess(ph, &mut exit_code) }.is_ok()
+            && exit_code == STILL_ACTIVE;
+
+        // Try standard Win32 path format first
         let mut buffer = vec![0u16; 32768];
         let mut length = buffer.len() as u32;
         let res = unsafe {
@@ -393,12 +399,33 @@ pub fn resolve_parent_process_info(parent_pid: u32) -> ProcessParentInfo {
                 &mut length,
             )
         };
+        let path_str = if res.is_ok() && length > 0 {
+            buffer.truncate(length as usize);
+            Some(String::from_utf16_lossy(&buffer))
+        } else {
+            // For terminated processes, standard Win32 query fails with 0x8007001F (device not connected),
+            // but native NT path format (PROCESS_NAME_NATIVE = 1) succeeds on lingering process objects.
+            let mut native_len = buffer.len() as u32;
+            let native_res = unsafe {
+                th::QueryFullProcessImageNameW(
+                    ph,
+                    th::PROCESS_NAME_FORMAT(1),
+                    windows::core::PWSTR(buffer.as_mut_ptr()),
+                    &mut native_len,
+                )
+            };
+            if native_res.is_ok() && native_len > 0 {
+                buffer.truncate(native_len as usize);
+                let nt_path = String::from_utf16_lossy(&buffer);
+                Some(super::image_path::etw_dos_path(&nt_path))
+            } else {
+                None
+            }
+        };
         unsafe {
             let _ = CloseHandle(ph);
         }
-        if res.is_ok() && length > 0 {
-            buffer.truncate(length as usize);
-            let path_str = String::from_utf16_lossy(&buffer);
+        if let Some(path_str) = path_str {
             let p = std::path::Path::new(&path_str);
             let name = p.file_name().map(|f| f.to_string_lossy().into_owned());
             let ver = super::version::query(&path_str);
@@ -412,7 +439,7 @@ pub fn resolve_parent_process_info(parent_pid: u32) -> ProcessParentInfo {
                 name,
                 display,
                 path: Some(path_str),
-                alive: true,
+                alive,
             };
         }
         return ProcessParentInfo {
@@ -420,7 +447,7 @@ pub fn resolve_parent_process_info(parent_pid: u32) -> ProcessParentInfo {
             name: None,
             display: None,
             path: None,
-            alive: true,
+            alive,
         };
     }
 

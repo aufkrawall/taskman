@@ -396,6 +396,32 @@ fn parent_process_resolution_for_live_and_system_processes() {
 
 #[cfg(target_os = "windows")]
 #[test]
+fn explorer_parent_process_resolves_to_userinit() {
+    let mut collector = tm_platform::create_collector();
+    let actions = tm_platform::create_actions();
+    let snap = collector.sample(std::time::Instant::now()).unwrap();
+
+    let explorer = snap
+        .processes
+        .iter()
+        .find(|p| p.name.eq_ignore_ascii_case("explorer.exe") && p.ppid.is_some())
+        .expect("explorer process in snapshot");
+
+    let sec = actions
+        .process_security_info_checked(explorer.pid, explorer.start_epoch_s)
+        .expect("explorer security info");
+    let parent = sec.parent.expect("explorer parent info");
+    assert_eq!(parent.pid, explorer.ppid.unwrap());
+    assert_eq!(
+        parent.name.as_deref(),
+        Some("userinit.exe"),
+        "explorer parent binary must be userinit.exe"
+    );
+    assert!(!parent.alive, "userinit must be reported as terminated");
+}
+
+#[cfg(target_os = "windows")]
+#[test]
 fn kill_spawned_child() {
     let actions = tm_platform::create_actions();
 
