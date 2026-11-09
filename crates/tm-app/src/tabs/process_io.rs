@@ -691,16 +691,15 @@ pub fn show(
             ui.label(egui::RichText::new(summary).color(pal.text_dim).size(12.0));
         }
 
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if !state.file_filter.is_empty() && ui.small_button("✖").clicked() {
-                state.file_filter.clear();
-            }
-            ui.add(
-                egui::TextEdit::singleline(&mut state.file_filter)
-                    .hint_text(i18n::tr(K::PropIoSearchPlaceholder))
-                    .desired_width(180.0),
-            );
-        });
+        ui.add_space(16.0);
+        ui.add(
+            egui::TextEdit::singleline(&mut state.file_filter)
+                .hint_text(i18n::tr(K::PropIoSearchPlaceholder))
+                .desired_width(160.0),
+        );
+        if !state.file_filter.is_empty() && ui.small_button("✖").clicked() {
+            state.file_filter.clear();
+        }
     });
 
     if let Some(stale) = state.file_stale.as_deref() {
@@ -732,6 +731,11 @@ pub fn show(
 
     ui.add_space(4.0);
 
+    const COL_READ_W: f32 = 80.0;
+    const COL_WRITE_W: f32 = 85.0;
+    const COL_TOTAL_W: f32 = 85.0;
+    const COL_SIZE_W: f32 = 80.0;
+
     let mut sort_change = None;
     let mut selected_clicked = None;
     let selected_path = state.selected_path.clone();
@@ -740,7 +744,6 @@ pub fn show(
         .num_columns(5)
         .spacing(Vec2::new(14.0, 6.0))
         .striped(true)
-        .min_col_width(70.0)
         .show(ui, |ui| {
             // Header Row
             let file_arrow = if state.file_sort_column == FileSortColumn::File {
@@ -766,131 +769,74 @@ pub fn show(
                 sort_change = Some(FileSortColumn::File);
             }
 
-            let read_arrow = if state.file_sort_column == FileSortColumn::Read {
-                if state.file_sort_ascending {
-                    " ▲"
-                } else {
-                    " ▼"
-                }
-            } else {
-                ""
-            };
-            let read_btn = ui
-                .with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.add(
-                        egui::Label::new(
-                            egui::RichText::new(format!(
-                                "{}{}",
-                                i18n::tr(K::PropIoColRead),
-                                read_arrow
-                            ))
-                            .strong(),
+            let mut show_num_header =
+                |ui: &mut egui::Ui, label: &str, col: FileSortColumn, width: f32| {
+                    let arrow = if state.file_sort_column == col {
+                        if state.file_sort_ascending {
+                            " ▲"
+                        } else {
+                            " ▼"
+                        }
+                    } else {
+                        ""
+                    };
+                    let text = format!("{label}{arrow}");
+                    let resp = ui
+                        .allocate_ui_with_layout(
+                            egui::vec2(width, 18.0),
+                            egui::Layout::right_to_left(egui::Align::Center),
+                            |ui| {
+                                ui.add(
+                                    egui::Label::new(egui::RichText::new(text).strong())
+                                        .sense(egui::Sense::click()),
+                                )
+                            },
                         )
-                        .sense(egui::Sense::click()),
-                    )
-                })
-                .inner;
-            if read_btn
-                .on_hover_cursor(egui::CursorIcon::PointingHand)
-                .clicked()
-            {
-                sort_change = Some(FileSortColumn::Read);
-            }
+                        .inner;
+                    if resp
+                        .on_hover_cursor(egui::CursorIcon::PointingHand)
+                        .clicked()
+                    {
+                        sort_change = Some(col);
+                    }
+                };
 
-            let write_arrow = if state.file_sort_column == FileSortColumn::Written {
-                if state.file_sort_ascending {
-                    " ▲"
-                } else {
-                    " ▼"
-                }
-            } else {
-                ""
-            };
-            let write_btn = ui
-                .with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.add(
-                        egui::Label::new(
-                            egui::RichText::new(format!(
-                                "{}{}",
-                                i18n::tr(K::PropIoColWritten),
-                                write_arrow
-                            ))
-                            .strong(),
-                        )
-                        .sense(egui::Sense::click()),
-                    )
-                })
-                .inner;
-            if write_btn
-                .on_hover_cursor(egui::CursorIcon::PointingHand)
-                .clicked()
-            {
-                sort_change = Some(FileSortColumn::Written);
-            }
-
-            let total_arrow = if state.file_sort_column == FileSortColumn::Total {
-                if state.file_sort_ascending {
-                    " ▲"
-                } else {
-                    " ▼"
-                }
-            } else {
-                ""
-            };
-            let total_btn = ui
-                .with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.add(
-                        egui::Label::new(
-                            egui::RichText::new(format!(
-                                "{}{}",
-                                i18n::tr(K::PropIoColTotal),
-                                total_arrow
-                            ))
-                            .strong(),
-                        )
-                        .sense(egui::Sense::click()),
-                    )
-                })
-                .inner;
-            if total_btn
-                .on_hover_cursor(egui::CursorIcon::PointingHand)
-                .clicked()
-            {
-                sort_change = Some(FileSortColumn::Total);
-            }
-
-            let size_arrow = if state.file_sort_column == FileSortColumn::Size {
-                if state.file_sort_ascending {
-                    " ▲"
-                } else {
-                    " ▼"
-                }
-            } else {
-                ""
-            };
-            let size_btn = ui
-                .with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.add(
-                        egui::Label::new(
-                            egui::RichText::new(format!(
-                                "{}{}",
-                                i18n::tr(K::PropIoColSize),
-                                size_arrow
-                            ))
-                            .strong(),
-                        )
-                        .sense(egui::Sense::click()),
-                    )
-                })
-                .inner;
-            if size_btn
-                .on_hover_cursor(egui::CursorIcon::PointingHand)
-                .clicked()
-            {
-                sort_change = Some(FileSortColumn::Size);
-            }
+            show_num_header(
+                ui,
+                i18n::tr(K::PropIoColRead),
+                FileSortColumn::Read,
+                COL_READ_W,
+            );
+            show_num_header(
+                ui,
+                i18n::tr(K::PropIoColWritten),
+                FileSortColumn::Written,
+                COL_WRITE_W,
+            );
+            show_num_header(
+                ui,
+                i18n::tr(K::PropIoColTotal),
+                FileSortColumn::Total,
+                COL_TOTAL_W,
+            );
+            show_num_header(
+                ui,
+                i18n::tr(K::PropIoColSize),
+                FileSortColumn::Size,
+                COL_SIZE_W,
+            );
 
             ui.end_row();
+
+            let show_num_cell = |ui: &mut egui::Ui, text: egui::RichText, width: f32| {
+                ui.allocate_ui_with_layout(
+                    egui::vec2(width, 18.0),
+                    egui::Layout::right_to_left(egui::Align::Center),
+                    |ui| {
+                        ui.label(text);
+                    },
+                );
+            };
 
             // Rows
             for file in display_files {
@@ -932,42 +878,34 @@ pub fn show(
                 });
 
                 // Read bytes
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let s = if file.read_bytes == 0 && !file.is_read {
-                        "—".to_string()
-                    } else {
-                        format::format_bytes_loc(file.read_bytes)
-                    };
-                    ui.label(s);
-                });
+                let s = if file.read_bytes == 0 && !file.is_read {
+                    "—".to_string()
+                } else {
+                    format::format_bytes_loc(file.read_bytes)
+                };
+                show_num_cell(ui, egui::RichText::new(s), COL_READ_W);
 
                 // Written bytes
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let s = if file.write_bytes == 0 && !file.is_write {
-                        "—".to_string()
-                    } else {
-                        format::format_bytes_loc(file.write_bytes)
-                    };
-                    ui.label(s);
-                });
+                let s = if file.write_bytes == 0 && !file.is_write {
+                    "—".to_string()
+                } else {
+                    format::format_bytes_loc(file.write_bytes)
+                };
+                show_num_cell(ui, egui::RichText::new(s), COL_WRITE_W);
 
                 // Total bytes
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let s = if file.total_bytes == 0 {
-                        "—".to_string()
-                    } else {
-                        format::format_bytes_loc(file.total_bytes)
-                    };
-                    ui.label(egui::RichText::new(s).strong());
-                });
+                let s = if file.total_bytes == 0 {
+                    "—".to_string()
+                } else {
+                    format::format_bytes_loc(file.total_bytes)
+                };
+                show_num_cell(ui, egui::RichText::new(s).strong(), COL_TOTAL_W);
 
                 // File size
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let s = file
-                        .file_size
-                        .map_or_else(|| "—".to_string(), format::format_bytes_loc);
-                    ui.label(s);
-                });
+                let s = file
+                    .file_size
+                    .map_or_else(|| "—".to_string(), format::format_bytes_loc);
+                show_num_cell(ui, egui::RichText::new(s), COL_SIZE_W);
 
                 ui.end_row();
             }
