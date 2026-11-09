@@ -9,7 +9,7 @@ use eframe::egui::{self, Color32, Pos2, Stroke, Vec2};
 use tm_core::format;
 use tm_core::i18n::{self, K};
 use tm_core::model::ProcessEntry;
-use tm_platform::actions::ProcessFileIo;
+use tm_platform::actions::{FileIoAccounting, ProcessFileIoSnapshot};
 
 use crate::app::{ProcessIdentity, TaskManApp};
 use crate::tabs::inspector::{self, Poll};
@@ -43,9 +43,10 @@ pub enum FileSortColumn {
 pub struct TrackedFileIo {
     pub path: String,
     pub name: String,
-    pub read_bytes: u64,
-    pub write_bytes: u64,
-    pub total_bytes: u64,
+    pub read_bytes: Option<u64>,
+    pub write_bytes: Option<u64>,
+    pub total_bytes: Option<u64>,
+    pub offset: Option<u64>,
     pub file_size: Option<u64>,
     pub is_read: bool,
     pub is_write: bool,
@@ -60,8 +61,9 @@ pub struct State {
     pub show_other_graph: bool,
     pub unit_is_rate: bool,
 
-    poll: Poll<Vec<ProcessFileIo>>,
+    poll: Poll<ProcessFileIoSnapshot>,
     pub files: Vec<TrackedFileIo>,
+    pub accounting: Option<FileIoAccounting>,
     pub file_filter: String,
     pub file_sort_column: FileSortColumn,
     pub file_sort_ascending: bool,
@@ -80,6 +82,7 @@ impl Default for State {
             unit_is_rate: true,
             poll: Poll::default(),
             files: Vec::new(),
+            accounting: None,
             file_filter: String::new(),
             file_sort_column: FileSortColumn::Written,
             file_sort_ascending: false,
@@ -137,10 +140,10 @@ impl State {
         if let Some(result) = self.poll.take() {
             self.file_loading = false;
             match result {
-                Ok(new_files) => {
+                Ok(snapshot) => {
                     self.file_error = None;
                     self.file_stale = None;
-                    self.merge_files(new_files);
+                    self.merge_files(snapshot);
                 }
                 Err(err) => {
                     if self.files.is_empty() {
@@ -184,28 +187,52 @@ impl State {
         self.history.clear();
     }
 
-    pub fn merge_files(&mut self, new_files: Vec<ProcessFileIo>) {
+    pub fn merge_files(&mut self, snapshot: ProcessFileIoSnapshot) {
+        self.accounting = Some(snapshot.accounting);
         let mut seen = HashSet::new();
-        for file in new_files {
+        for file in snapshot.files {
             seen.insert(file.path.clone());
             if let Some(existing) = self.files.iter_mut().find(|f| f.path == file.path) {
                 existing.open_handles = file.open_handles;
                 existing.is_read |= file.is_read;
                 existing.is_write |= file.is_write;
-                existing.read_bytes = existing.read_bytes.max(file.read_bytes);
-                existing.write_bytes = existing.write_bytes.max(file.write_bytes);
-                existing.total_bytes = existing.read_bytes.saturating_add(existing.write_bytes);
+                existing.offset = file.offset.or(existing.offset);
+                existing.read_bytes = match (existing.read_bytes, file.read_bytes) {
+                    (Some(a), Some(b)) => Some(a.max(b)),
+                    (Some(a), None) => Some(a),
+                    (None, Some(b)) => Some(b),
+                    (None, None) => None,
+                };
+                existing.write_bytes = match (existing.write_bytes, file.write_bytes) {
+                    (Some(a), Some(b)) => Some(a.max(b)),
+                    (Some(a), None) => Some(a),
+                    (None, Some(b)) => Some(b),
+                    (None, None) => None,
+                };
+                existing.total_bytes = match (existing.read_bytes, existing.write_bytes) {
+                    (Some(r), Some(w)) => Some(r.saturating_add(w)),
+                    (Some(r), None) => Some(r),
+                    (None, Some(w)) => Some(w),
+                    (None, None) => existing.offset,
+                };
                 if let Some(sz) = file.file_size {
                     existing.file_size = Some(existing.file_size.map_or(sz, |prev| prev.max(sz)));
                 }
             } else {
                 let name = extract_file_name(&file.path);
+                let total_bytes = match (file.read_bytes, file.write_bytes) {
+                    (Some(r), Some(w)) => Some(r.saturating_add(w)),
+                    (Some(r), None) => Some(r),
+                    (None, Some(w)) => Some(w),
+                    (None, None) => file.offset,
+                };
                 self.files.push(TrackedFileIo {
                     path: file.path,
                     name,
                     read_bytes: file.read_bytes,
                     write_bytes: file.write_bytes,
-                    total_bytes: file.total_bytes,
+                    total_bytes,
+                    offset: file.offset,
                     file_size: file.file_size,
                     is_read: file.is_read,
                     is_write: file.is_write,
@@ -241,17 +268,20 @@ impl State {
             let ord = match col {
                 FileSortColumn::Written => a
                     .write_bytes
-                    .cmp(&b.write_bytes)
-                    .then_with(|| a.read_bytes.cmp(&b.read_bytes))
+                    .unwrap_or(0)
+                    .cmp(&b.write_bytes.unwrap_or(0))
+                    .then_with(|| a.read_bytes.unwrap_or(0).cmp(&b.read_bytes.unwrap_or(0)))
                     .then_with(|| a.name.cmp(&b.name)),
                 FileSortColumn::Read => a
                     .read_bytes
-                    .cmp(&b.read_bytes)
-                    .then_with(|| a.write_bytes.cmp(&b.write_bytes))
+                    .unwrap_or(0)
+                    .cmp(&b.read_bytes.unwrap_or(0))
+                    .then_with(|| a.write_bytes.unwrap_or(0).cmp(&b.write_bytes.unwrap_or(0)))
                     .then_with(|| a.name.cmp(&b.name)),
                 FileSortColumn::Total => a
                     .total_bytes
-                    .cmp(&b.total_bytes)
+                    .unwrap_or(0)
+                    .cmp(&b.total_bytes.unwrap_or(0))
                     .then_with(|| a.name.cmp(&b.name)),
                 FileSortColumn::Size => a
                     .file_size
@@ -670,15 +700,17 @@ pub fn show(
 
     // Section header with title, summary totals and search filter
     ui.horizontal(|ui| {
+        let open_count = state.files.iter().filter(|f| f.open_handles > 0).count();
         let title = if state.files.is_empty() {
             i18n::tr(K::PropIoFiles).to_string()
         } else {
-            format!("{} ({})", i18n::tr(K::PropIoFiles), state.files.len())
+            format!("{} ({} open)", i18n::tr(K::PropIoFiles), open_count)
         };
-        ui.strong(title);
+        ui.strong(title)
+            .on_hover_text(i18n::tr(K::PropIoFilesTooltip));
 
-        let total_read: u64 = state.files.iter().map(|f| f.read_bytes).sum();
-        let total_written: u64 = state.files.iter().map(|f| f.write_bytes).sum();
+        let total_read: u64 = state.files.iter().filter_map(|f| f.read_bytes).sum();
+        let total_written: u64 = state.files.iter().filter_map(|f| f.write_bytes).sum();
         if total_read > 0 || total_written > 0 {
             ui.add_space(8.0);
             let summary = format!(
@@ -726,6 +758,17 @@ pub fn show(
     if display_files.is_empty() {
         ui.add_space(6.0);
         ui.weak(i18n::tr(K::PropIoNoFiles));
+        if process.disk_read_bps > 0.0
+            || process.disk_write_bps > 0.0
+            || process.io_other_bps.unwrap_or(0.0) > 0.0
+        {
+            ui.add_space(2.0);
+            ui.label(
+                egui::RichText::new(i18n::tr(K::PropIoNonFileNote))
+                    .small()
+                    .color(pal.text_dim),
+            );
+        }
         return;
     }
 
@@ -876,14 +919,36 @@ pub fn show(
                             }
                         },
                     )
-                    .response
-                    .on_hover_text(&file.path);
+                    .response;
+
+                let hover_info = format!(
+                    "{}\nAccess: {}{}\nPosition: {}\nSize: {}",
+                    file.path,
+                    if file.is_read && file.is_write {
+                        "Read / Write"
+                    } else if file.is_write {
+                        "Write"
+                    } else if file.is_read {
+                        "Read"
+                    } else {
+                        "None"
+                    },
+                    if file.open_handles == 0 {
+                        " (closed)"
+                    } else {
+                        ""
+                    },
+                    file.offset
+                        .map_or("—".to_string(), format::format_bytes_loc),
+                    file.file_size
+                        .map_or("—".to_string(), format::format_bytes_loc),
+                );
 
                 if row_resp.clicked() {
                     selected_clicked = Some(file.path.clone());
                 }
 
-                row_resp.context_menu(|ui| {
+                row_resp.on_hover_text(hover_info).context_menu(|ui| {
                     if ui.button(i18n::tr(K::OpenFileLocation)).clicked() {
                         let _ = app.actions.open_file_location(&file.path);
                         ui.close();
@@ -899,26 +964,23 @@ pub fn show(
                 });
 
                 // Read bytes
-                let s = if file.read_bytes == 0 && !file.is_read {
-                    "—".to_string()
-                } else {
-                    format::format_bytes_loc(file.read_bytes)
+                let s = match file.read_bytes {
+                    Some(b) if b > 0 || file.is_read => format::format_bytes_loc(b),
+                    _ => "—".to_string(),
                 };
                 show_num_cell(ui, egui::RichText::new(s), COL_READ_W);
 
                 // Written bytes
-                let s = if file.write_bytes == 0 && !file.is_write {
-                    "—".to_string()
-                } else {
-                    format::format_bytes_loc(file.write_bytes)
+                let s = match file.write_bytes {
+                    Some(b) if b > 0 || file.is_write => format::format_bytes_loc(b),
+                    _ => "—".to_string(),
                 };
                 show_num_cell(ui, egui::RichText::new(s), COL_WRITE_W);
 
                 // Total bytes
-                let s = if file.total_bytes == 0 {
-                    "—".to_string()
-                } else {
-                    format::format_bytes_loc(file.total_bytes)
+                let s = match file.total_bytes {
+                    Some(b) if b > 0 => format::format_bytes_loc(b),
+                    _ => "—".to_string(),
                 };
                 show_num_cell(ui, egui::RichText::new(s).strong(), COL_TOTAL_W);
 
@@ -948,6 +1010,7 @@ pub fn show(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tm_platform::actions::ProcessFileIo;
 
     #[test]
     fn state_defaults_and_clear() {
@@ -987,9 +1050,11 @@ mod tests {
         let batch1 = vec![
             ProcessFileIo {
                 path: r"C:\data\input.txt".to_string(),
-                read_bytes: 1000,
-                write_bytes: 0,
-                total_bytes: 1000,
+                read_bytes: Some(1000),
+                write_bytes: Some(0),
+                read_ops: None,
+                write_ops: None,
+                offset: Some(1000),
                 file_size: Some(5000),
                 is_read: true,
                 is_write: false,
@@ -997,28 +1062,35 @@ mod tests {
             },
             ProcessFileIo {
                 path: r"C:\data\output.log".to_string(),
-                read_bytes: 0,
-                write_bytes: 500,
-                total_bytes: 500,
+                read_bytes: Some(0),
+                write_bytes: Some(500),
+                read_ops: None,
+                write_ops: None,
+                offset: Some(500),
                 file_size: Some(500),
                 is_read: false,
                 is_write: true,
                 open_handles: 1,
             },
         ];
-        state.merge_files(batch1);
+        state.merge_files(ProcessFileIoSnapshot {
+            files: batch1,
+            accounting: Default::default(),
+        });
         assert_eq!(state.files.len(), 2);
-        assert_eq!(state.files[0].read_bytes, 1000);
+        assert_eq!(state.files[0].read_bytes, Some(1000));
         assert_eq!(state.files[0].open_handles, 1);
-        assert_eq!(state.files[1].write_bytes, 500);
+        assert_eq!(state.files[1].write_bytes, Some(500));
 
         // Batch 2: input.txt closed, output.log grew, new file opened
         let batch2 = vec![
             ProcessFileIo {
                 path: r"C:\data\output.log".to_string(),
-                read_bytes: 0,
-                write_bytes: 1500,
-                total_bytes: 1500,
+                read_bytes: Some(0),
+                write_bytes: Some(1500),
+                read_ops: None,
+                write_ops: None,
+                offset: Some(1500),
                 file_size: Some(1500),
                 is_read: false,
                 is_write: true,
@@ -1026,16 +1098,21 @@ mod tests {
             },
             ProcessFileIo {
                 path: r"C:\data\config.json".to_string(),
-                read_bytes: 200,
-                write_bytes: 0,
-                total_bytes: 200,
+                read_bytes: Some(200),
+                write_bytes: Some(0),
+                read_ops: None,
+                write_ops: None,
+                offset: Some(200),
                 file_size: Some(200),
                 is_read: true,
                 is_write: false,
                 open_handles: 1,
             },
         ];
-        state.merge_files(batch2);
+        state.merge_files(ProcessFileIoSnapshot {
+            files: batch2,
+            accounting: Default::default(),
+        });
         assert_eq!(state.files.len(), 3);
 
         let input = state
@@ -1043,7 +1120,7 @@ mod tests {
             .iter()
             .find(|f| f.path.contains("input.txt"))
             .unwrap();
-        assert_eq!(input.read_bytes, 1000);
+        assert_eq!(input.read_bytes, Some(1000));
         assert_eq!(
             input.open_handles, 0,
             "closed file must have 0 open handles"
@@ -1054,7 +1131,7 @@ mod tests {
             .iter()
             .find(|f| f.path.contains("output.log"))
             .unwrap();
-        assert_eq!(output.write_bytes, 1500);
+        assert_eq!(output.write_bytes, Some(1500));
         assert_eq!(output.open_handles, 1);
     }
 
@@ -1065,9 +1142,10 @@ mod tests {
                 TrackedFileIo {
                     path: r"C:\alpha\doc.pdf".to_string(),
                     name: "doc.pdf".to_string(),
-                    read_bytes: 5000,
-                    write_bytes: 100,
-                    total_bytes: 5100,
+                    read_bytes: Some(5000),
+                    write_bytes: Some(100),
+                    total_bytes: Some(5100),
+                    offset: Some(5000),
                     file_size: Some(10000),
                     is_read: true,
                     is_write: false,
@@ -1076,9 +1154,10 @@ mod tests {
                 TrackedFileIo {
                     path: r"C:\beta\heavy_write.dat".to_string(),
                     name: "heavy_write.dat".to_string(),
-                    read_bytes: 100,
-                    write_bytes: 9000,
-                    total_bytes: 9100,
+                    read_bytes: Some(100),
+                    write_bytes: Some(9000),
+                    total_bytes: Some(9100),
+                    offset: Some(9000),
                     file_size: Some(9000),
                     is_read: false,
                     is_write: true,
@@ -1087,9 +1166,10 @@ mod tests {
                 TrackedFileIo {
                     path: r"C:\gamma\notes.txt".to_string(),
                     name: "notes.txt".to_string(),
-                    read_bytes: 2000,
-                    write_bytes: 2000,
-                    total_bytes: 4000,
+                    read_bytes: Some(2000),
+                    write_bytes: Some(2000),
+                    total_bytes: Some(4000),
+                    offset: Some(2000),
                     file_size: Some(2000),
                     is_read: true,
                     is_write: true,
@@ -1309,9 +1389,10 @@ mod tests {
                 TrackedFileIo {
                     path: r"C:\alpha\doc.pdf".to_string(),
                     name: "doc.pdf".to_string(),
-                    read_bytes: 5000,
-                    write_bytes: 100,
-                    total_bytes: 5100,
+                    read_bytes: Some(5000),
+                    write_bytes: Some(100),
+                    total_bytes: Some(5100),
+                    offset: Some(5000),
                     file_size: Some(10000),
                     is_read: true,
                     is_write: false,
@@ -1320,9 +1401,10 @@ mod tests {
                 TrackedFileIo {
                     path: r"C:\beta\heavy_write.dat".to_string(),
                     name: "heavy_write.dat".to_string(),
-                    read_bytes: 100,
-                    write_bytes: 9000,
-                    total_bytes: 9100,
+                    read_bytes: Some(100),
+                    write_bytes: Some(9000),
+                    total_bytes: Some(9100),
+                    offset: Some(9000),
                     file_size: Some(9000),
                     is_read: false,
                     is_write: true,
@@ -1353,9 +1435,9 @@ mod tests {
 
                     for f in display_files {
                         ui.label(&f.name);
-                        ui.label(format::format_bytes_loc(f.read_bytes));
-                        ui.label(format::format_bytes_loc(f.write_bytes));
-                        ui.label(format::format_bytes_loc(f.total_bytes));
+                        ui.label(f.read_bytes.map_or("—".into(), format::format_bytes_loc));
+                        ui.label(f.write_bytes.map_or("—".into(), format::format_bytes_loc));
+                        ui.label(f.total_bytes.map_or("—".into(), format::format_bytes_loc));
                         ui.label(f.file_size.map_or("—".into(), format::format_bytes_loc));
                         ui.end_row();
                     }

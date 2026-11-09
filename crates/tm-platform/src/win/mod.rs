@@ -534,7 +534,7 @@ impl PlatformActions for WinActions {
         &self,
         pid: u32,
         expected_start_epoch_s: Option<i64>,
-    ) -> Result<Vec<ProcessFileIo>> {
+    ) -> Result<crate::actions::ProcessFileIoSnapshot> {
         process_file_io::list_process_file_io(pid, expected_start_epoch_s)
     }
     fn unload_process_module(

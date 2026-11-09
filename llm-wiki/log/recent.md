@@ -1,3 +1,11 @@
+## 2026-11-09 — Process Properties I/O per-file attribution honesty and accuracy
+
+- Root-cause corrections for per-file attribution in the Process Properties I/O dialog:
+  - Eliminated false byte counts where write-only file handles on existing files previously fabricated their entire file size as written bytes (`file_size.unwrap_or(0)`). Write-only handles now accurately attribute only observed file pointer movement (`current_pos`), reporting zero if idle.
+  - Eliminated double-counting where handles with simultaneous read and write permissions (`FILE_READ_DATA | FILE_WRITE_DATA`) duplicated their seek pointer into both read and write columns. Handles with joint permissions now report unallocated read/write values (`None`) instead of fabricating a guess.
+  - Replaced raw `Vec<ProcessFileIo>` in `PlatformActions::list_process_file_io` with `ProcessFileIoSnapshot`, which carries process-level kernel `IO_COUNTERS` (`ReadTransferCount`, `WriteTransferCount`) alongside open file handles.
+  - Clarified UI telemetry: added header tooltip and non-file I/O notice explaining that the graphs and counters above reflect total kernel process I/O (which includes network sockets, named pipes, IPC, and closed temporary files), while the table below displays active disk file handles.
+
 ## 2026-11-09 — Process Properties I/O per-file read/written tracking and sorting
 
 - Added per-file read and written byte tracking and interactive sorting to Process Properties I/O dialog:

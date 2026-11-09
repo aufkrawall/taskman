@@ -17,7 +17,9 @@ use windows::Win32::Storage::FileSystem::{
 };
 use windows::Win32::System::Threading as th;
 
-use crate::actions::ProcessFileIo;
+use crate::actions::{
+    FileIoAccounting, FileIoAccountingState, ProcessFileIo, ProcessFileIoSnapshot,
+};
 
 const PROCESS_HANDLE_INFORMATION: PROCESSINFOCLASS = PROCESSINFOCLASS(51);
 
@@ -59,7 +61,7 @@ pub(crate) fn strip_verbatim(path: &str) -> String {
 pub fn list_process_file_io(
     pid: u32,
     expected_start_epoch_s: Option<i64>,
-) -> Result<Vec<ProcessFileIo>> {
+) -> Result<ProcessFileIoSnapshot> {
     super::process_ops::enable_debug_privilege();
 
     let h_process = super::process_ops::open_process_verified(
@@ -68,11 +70,39 @@ pub fn list_process_file_io(
         expected_start_epoch_s,
     )?;
 
+    let mut io_counters = th::IO_COUNTERS::default();
+    let has_counters = unsafe { th::GetProcessIoCounters(h_process, &mut io_counters) }.is_ok();
+
     let result = enumerate_process_files(h_process);
     unsafe {
         let _ = CloseHandle(h_process);
     }
-    result
+    let files = result?;
+    let accounting = FileIoAccounting {
+        state: FileIoAccountingState::Unavailable,
+        since_ms: 0,
+        read_bytes: 0,
+        write_bytes: 0,
+        read_ops: 0,
+        write_ops: 0,
+        unnamed_read_bytes: 0,
+        unnamed_write_bytes: 0,
+        omitted_read_bytes: 0,
+        omitted_write_bytes: 0,
+        counter_read_bytes: if has_counters {
+            Some(io_counters.ReadTransferCount)
+        } else {
+            None
+        },
+        counter_write_bytes: if has_counters {
+            Some(io_counters.WriteTransferCount)
+        } else {
+            None
+        },
+        events_lost: None,
+        handles_complete: true,
+    };
+    Ok(ProcessFileIoSnapshot { files, accounting })
 }
 
 fn enumerate_process_files(h_process: HANDLE) -> Result<Vec<ProcessFileIo>> {
@@ -182,7 +212,11 @@ fn enumerate_process_files(h_process: HANDLE) -> Result<Vec<ProcessFileIo>> {
         let mut pos: i64 = 0;
         let pos_ok =
             unsafe { SetFilePointerEx(dup_handle, 0, Some(&mut pos), FILE_CURRENT) }.is_ok();
-        let current_pos = if pos_ok && pos > 0 { pos as u64 } else { 0 };
+        let current_pos = if pos_ok && pos >= 0 {
+            Some(pos as u64)
+        } else {
+            None
+        };
 
         // Query file standard information (size, directory).
         let mut std_info = FILE_STANDARD_INFO::default();
@@ -214,24 +248,16 @@ fn enumerate_process_files(h_process: HANDLE) -> Result<Vec<ProcessFileIo>> {
         let is_write =
             (entry.granted_access & (FILE_WRITE_DATA | FILE_APPEND_DATA | GENERIC_WRITE)) != 0;
 
-        let (handle_read, handle_write) = if is_write && !is_read {
-            (0, current_pos.max(file_size.unwrap_or(0)))
-        } else if is_read && !is_write {
-            (current_pos, 0)
-        } else if is_read && is_write {
-            (current_pos, current_pos)
-        } else {
-            (current_pos, 0)
-        };
-
         let file_entry = map
             .entry(clean_path.clone())
             .or_insert_with(|| ProcessFileIo {
                 path: clean_path,
-                read_bytes: 0,
-                write_bytes: 0,
-                total_bytes: 0,
+                read_bytes: None,
+                write_bytes: None,
+                read_ops: None,
+                write_ops: None,
                 file_size,
+                offset: current_pos,
                 is_read: false,
                 is_write: false,
                 open_handles: 0,
@@ -240,11 +266,27 @@ fn enumerate_process_files(h_process: HANDLE) -> Result<Vec<ProcessFileIo>> {
         file_entry.open_handles = file_entry.open_handles.saturating_add(1);
         file_entry.is_read |= is_read;
         file_entry.is_write |= is_write;
-        file_entry.read_bytes = file_entry.read_bytes.max(handle_read);
-        file_entry.write_bytes = file_entry.write_bytes.max(handle_write);
-        file_entry.total_bytes = file_entry.read_bytes.saturating_add(file_entry.write_bytes);
+        if let Some(pos_val) = current_pos {
+            file_entry.offset = Some(file_entry.offset.map_or(pos_val, |prev| prev.max(pos_val)));
+        }
         if let Some(sz) = file_size {
             file_entry.file_size = Some(file_entry.file_size.map_or(sz, |prev| prev.max(sz)));
+        }
+    }
+
+    // Attribute observed handle positions based strictly on granted access rights.
+    // Never attribute file_size as written bytes, and never duplicate positions across both.
+    for file_entry in map.values_mut() {
+        if file_entry.is_read && !file_entry.is_write {
+            file_entry.read_bytes = file_entry.offset;
+            file_entry.write_bytes = Some(0);
+        } else if file_entry.is_write && !file_entry.is_read {
+            file_entry.read_bytes = Some(0);
+            file_entry.write_bytes = file_entry.offset;
+        } else {
+            // Read and write: cannot guess the split between read and write.
+            file_entry.read_bytes = None;
+            file_entry.write_bytes = None;
         }
     }
 
@@ -280,15 +322,16 @@ mod tests {
         file.flush().unwrap();
 
         let pid = std::process::id();
-        let files = list_process_file_io(pid, None).expect("query current process files");
+        let snapshot = list_process_file_io(pid, None).expect("query current process files");
 
-        let found = files
+        let found = snapshot
+            .files
             .iter()
             .find(|f| f.path.ends_with(&format!("test_file_io_{}.bin", pid)));
         assert!(found.is_some(), "opened temporary file must be discovered");
         let found = found.unwrap();
         assert!(found.is_write);
-        assert!(found.write_bytes >= 4096);
+        assert!(found.write_bytes.is_some_and(|w| w >= 4096));
         assert_eq!(found.file_size, Some(4096));
 
         drop(file);
@@ -298,16 +341,80 @@ mod tests {
         let mut buf = [0u8; 1024];
         read_file.read_exact(&mut buf).unwrap();
 
-        let files2 = list_process_file_io(pid, None).expect("query current process files");
-        let found2 = files2
+        let snapshot2 = list_process_file_io(pid, None).expect("query current process files");
+        let found2 = snapshot2
+            .files
             .iter()
             .find(|f| f.path.ends_with(&format!("test_file_io_{}.bin", pid)));
         assert!(found2.is_some(), "read file must be discovered");
         let found2 = found2.unwrap();
         assert!(found2.is_read);
-        assert!(found2.read_bytes >= 1024);
+        assert!(found2.read_bytes.is_some_and(|r| r >= 1024));
 
         drop(read_file);
+        let _ = std::fs::remove_file(&test_path);
+    }
+
+    #[test]
+    fn write_only_idle_handle_does_not_attribute_file_size() {
+        let test_path =
+            std::env::temp_dir().join(format!("test_file_idle_{}.bin", std::process::id()));
+
+        // Create an 8 MiB file on disk
+        std::fs::write(&test_path, vec![7u8; 8 * 1024 * 1024]).unwrap();
+
+        // Open write-only without writing anything
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&test_path)
+            .unwrap();
+
+        let pid = std::process::id();
+        let snapshot = list_process_file_io(pid, None).expect("query current process files");
+        let found = snapshot
+            .files
+            .iter()
+            .find(|f| f.path.ends_with(&format!("test_file_idle_{}.bin", pid)));
+        assert!(found.is_some(), "opened write-only file must be discovered");
+        let found = found.unwrap();
+        assert!(found.is_write);
+        assert_eq!(found.file_size, Some(8 * 1024 * 1024));
+        // Crucial invariant: 0 bytes were written, so write_bytes must be 0, NEVER 8 MB!
+        assert_eq!(found.write_bytes, Some(0));
+
+        drop(file);
+        let _ = std::fs::remove_file(&test_path);
+    }
+
+    #[test]
+    fn read_write_handle_does_not_fabricate_split() {
+        let test_path =
+            std::env::temp_dir().join(format!("test_file_rw_{}.bin", std::process::id()));
+
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&test_path)
+            .unwrap();
+
+        let pid = std::process::id();
+        let snapshot = list_process_file_io(pid, None).expect("query current process files");
+        let found = snapshot
+            .files
+            .iter()
+            .find(|f| f.path.ends_with(&format!("test_file_rw_{}.bin", pid)));
+        assert!(found.is_some(), "opened read/write file must be discovered");
+        let found = found.unwrap();
+        assert!(found.is_read);
+        assert!(found.is_write);
+        // Neither read nor write is fabricated; offset is tracked
+        assert!(found.read_bytes.is_none());
+        assert!(found.write_bytes.is_none());
+        assert_eq!(found.offset, Some(0));
+
+        drop(file);
         let _ = std::fs::remove_file(&test_path);
     }
 

@@ -436,7 +436,16 @@ keys! {
         "Inter-process I/O includes operations and transfers that do not target physical disks (named pipes, ALPC, socket controls, and IOCTLs)."
     ],
     PropIoFiles => ["Dateien", "Files"],
+    PropIoFilesTooltip => [
+        "Dateiliste erfasst offene Datei-Handles des Prozesses und deren Position. Prozess-E/A-Graphen oben erfassen alle E/A-Vorgänge (inklusive Netzwerk-Sockets, Pipes, IPC und kurzlebiger geschlossener Dateien).",
+        "File list tracks open process file handles and handle positions. Process I/O graphs above track all process I/O (including network sockets, pipes, IPC, and closed temporary files)."
+    ],
+    PropIoNonFileNote => [
+        "Aktive E/A ohne gelistete Dateien stammt aus Netzwerk-Sockets, Named Pipes, IPC oder kurzlebigen Dateien.",
+        "Active I/O without listed files originates from network sockets, named pipes, IPC, or closed files."
+    ],
     PropIoColFile => ["Datei", "File"],
+    PropIoColOffset => ["Position", "Offset"],
     PropIoColRead => ["Gelesen", "Read"],
     PropIoColWritten => ["Geschrieben", "Written"],
     PropIoColTotal => ["Gesamt", "Total"],

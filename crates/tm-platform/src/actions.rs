@@ -311,18 +311,101 @@ pub struct ProcessConnection {
     pub state: Option<TcpState>,
 }
 
-/// One open file observed for a process, including read/write byte positions.
+/// One file a process has an open handle to and/or has read or written since
+/// per-file accounting began.
+///
+/// The byte and operation counts are MEASURED request totals, never inferred
+/// from a handle's file pointer or a file's size (neither says how much a
+/// process really transferred: rewrites, repeated reads, positional I/O,
+/// short-lived handles and mapped views all defeat them). `None` therefore
+/// means "not measured" and must render as unavailable, never as zero; `Some(0)`
+/// is a measured zero.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(target_os = "windows", derive(serde::Serialize, serde::Deserialize))]
 pub struct ProcessFileIo {
     pub path: String,
-    pub read_bytes: u64,
-    pub write_bytes: u64,
-    pub total_bytes: u64,
+    /// Bytes this process read from the file since accounting began.
+    pub read_bytes: Option<u64>,
+    /// Bytes this process wrote to the file since accounting began.
+    pub write_bytes: Option<u64>,
+    pub read_ops: Option<u64>,
+    pub write_ops: Option<u64>,
+    /// Current size, known only while a handle to the file is open.
     pub file_size: Option<u64>,
+    /// Current file pointer offset of open handle(s), if known.
+    pub offset: Option<u64>,
+    /// Access rights of the currently open handles; both `false` once the
+    /// file is closed.
     pub is_read: bool,
     pub is_write: bool,
     pub open_handles: u32,
+}
+
+/// Whether, and how far, per-file byte accounting could be trusted for one
+/// answer.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[cfg_attr(target_os = "windows", derive(serde::Serialize, serde::Deserialize))]
+pub enum FileIoAccountingState {
+    /// No per-file accounting is running (unsupported platform, or neither
+    /// the privileged service nor an elevated session can trace file I/O).
+    /// The rows carry no byte counts.
+    #[default]
+    Unavailable,
+    /// A trace is running but has delivered no file event for ANY process,
+    /// so a silent window cannot be told apart from a broken subscription.
+    /// Treated as unknown rather than as zero activity.
+    Undelivered,
+    /// The target issued file requests but none of the records could be
+    /// decoded: the payload layout is not what this build expects.
+    Undecodable,
+    /// Counts are measured. Absence of a file means it saw no I/O.
+    Measured,
+}
+
+/// What per-file accounting covers, and how it reconciles with the kernel's
+/// per-process I/O counters (the numbers the graphs plot).
+///
+/// `read_bytes`/`write_bytes` are everything the trace attributed to the
+/// process, whether or not it ended up on a row; the rows plus the three
+/// remainders below add up to them exactly. The counters differ from them by
+/// whatever does not go through a file object (pipes, devices, console) and by
+/// ETW loss, which is why they are carried alongside instead of being
+/// inferred.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[cfg_attr(target_os = "windows", derive(serde::Serialize, serde::Deserialize))]
+pub struct FileIoAccounting {
+    pub state: FileIoAccountingState,
+    /// How long accounting has been running, in milliseconds. Only I/O after
+    /// that point is counted.
+    pub since_ms: u64,
+    pub read_bytes: u64,
+    pub write_bytes: u64,
+    pub read_ops: u64,
+    pub write_ops: u64,
+    /// Part of the totals whose file name could not be resolved (no row).
+    pub unnamed_read_bytes: u64,
+    pub unnamed_write_bytes: u64,
+    /// Part of the totals dropped from `files` by a capacity limit.
+    pub omitted_read_bytes: u64,
+    pub omitted_write_bytes: u64,
+    /// Growth of the kernel's per-process read/write byte counters over the
+    /// same span, read at the same moments as the trace. `None` when the
+    /// counters could not be read.
+    pub counter_read_bytes: Option<u64>,
+    pub counter_write_bytes: Option<u64>,
+    /// Events the trace session reports as lost; counts are lower bounds when
+    /// this is non-zero. `None` when it could not be queried.
+    pub events_lost: Option<u64>,
+    /// Whether the open-handle enumeration (names, sizes, access) completed.
+    pub handles_complete: bool,
+}
+
+/// Files of one process plus the accounting scope they were measured under.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[cfg_attr(target_os = "windows", derive(serde::Serialize, serde::Deserialize))]
+pub struct ProcessFileIoSnapshot {
+    pub files: Vec<ProcessFileIo>,
+    pub accounting: FileIoAccounting,
 }
 
 /// Wire/request capability marker appended to module paths by current GUIs.
@@ -507,12 +590,14 @@ pub trait PlatformActions: Send + Sync {
     fn list_process_connections(&self, _pid: u32) -> Result<Vec<ProcessConnection>> {
         Err(tm_core::TmError::Unsupported("process connections"))
     }
-    /// Enumerate open files for `pid`, their read/write positions and sizes.
+    /// Files `pid` has open or has touched since accounting began, with
+    /// measured per-file read/write totals where the platform can measure
+    /// them (see [`ProcessFileIoSnapshot`]).
     fn list_process_file_io(
         &self,
         _pid: u32,
         _expected_start_epoch_s: Option<i64>,
-    ) -> Result<Vec<ProcessFileIo>> {
+    ) -> Result<ProcessFileIoSnapshot> {
         Err(tm_core::TmError::Unsupported("process file I/O"))
     }
     /// Ask the target process to perform one `FreeLibrary` call for one exact

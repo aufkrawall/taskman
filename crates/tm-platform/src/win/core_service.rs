@@ -1391,7 +1391,7 @@ impl PlatformActions for BrokeredActions {
         &self,
         pid: u32,
         expected_start_epoch_s: Option<i64>,
-    ) -> Result<Vec<crate::actions::ProcessFileIo>> {
+    ) -> Result<crate::actions::ProcessFileIoSnapshot> {
         self.local.list_process_file_io(pid, expected_start_epoch_s)
     }
 

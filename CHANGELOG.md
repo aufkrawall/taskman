@@ -11,6 +11,10 @@
 
 - **Process Properties I/O graphs theming and pinned hover readout:** Process Properties I/O tab graphs now match the styling and theming of the Performance page for disks: dark/light adaptive sunken inset card surfaces (`pal.card_bg_sunken` to visually distinguish chart cells from the modal dialog window background), subtle gridlines, and coordinated series colors (green for Read, amber for Write, and teal for Inter-Process/Other) with translucent area fills, replacing retro green-on-black canvases. Cursor hover tooltips now appear directly at the pointer position with series swatches, and stay pinned to the inspected sample timestamp across rolling graph updates until the pointer is moved again. In the Disk & Inter-Process I/O table, the values for the trailing "Other (IPC)" column now use measured bounded cell allocations so their spacing matches the clean 16 px gap of the Read and Write columns instead of stretching to the window border.
 
+### Fixed
+
+- **Process Properties I/O per-file attribution honesty and accuracy:** Eliminated false byte counts in the file list on the Process Properties I/O tab, where write-only file handles on existing files previously fabricated their entire file size as written bytes, and read/write handles duplicated their seek pointer into both columns and double-counted in total. Handle pointer offsets are now strictly separated from cumulative transfer counts, read/write access is accurately differentiated, and an explanatory tooltip and non-file I/O notice clarify why kernel process I/O (network sockets, named pipes, IPC, and closed temporary files) in the graphs above exceeds the open disk file handles below.
+
 
 ## 0.1.23 - 2026-11-03
 

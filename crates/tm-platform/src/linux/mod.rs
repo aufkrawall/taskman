@@ -895,12 +895,12 @@ impl PlatformActions for LinuxActions {
         &self,
         pid: u32,
         _expected_start_epoch_s: Option<i64>,
-    ) -> Result<Vec<crate::actions::ProcessFileIo>> {
+    ) -> Result<crate::actions::ProcessFileIoSnapshot> {
         list_linux_process_file_io(pid)
     }
 }
 
-fn list_linux_process_file_io(pid: u32) -> Result<Vec<crate::actions::ProcessFileIo>> {
+fn list_linux_process_file_io(pid: u32) -> Result<crate::actions::ProcessFileIoSnapshot> {
     let fd_dir = format!("/proc/{pid}/fd");
     let entries = std::fs::read_dir(&fd_dir)
         .map_err(|e| tm_core::TmError::platform("read /proc/pid/fd", e.to_string()))?;
@@ -918,10 +918,12 @@ fn list_linux_process_file_io(pid: u32) -> Result<Vec<crate::actions::ProcessFil
         let fdinfo_path = format!("/proc/{pid}/fdinfo/{}", fd_name.to_string_lossy());
         let mut pos = 0u64;
         let mut flags = 0u32;
+        let mut has_pos = false;
         if let Ok(info_content) = std::fs::read_to_string(&fdinfo_path) {
             for line in info_content.lines() {
                 if let Some(rest) = line.strip_prefix("pos:\t") {
                     pos = rest.trim().parse().unwrap_or(0);
+                    has_pos = true;
                 } else if let Some(rest) = line.strip_prefix("flags:\t") {
                     flags = u32::from_str_radix(rest.trim(), 8).unwrap_or(0);
                 }
@@ -931,21 +933,18 @@ fn list_linux_process_file_io(pid: u32) -> Result<Vec<crate::actions::ProcessFil
         let is_read = access_mode == 0 || access_mode == 2;
         let is_write = access_mode == 1 || access_mode == 2;
         let file_size = std::fs::metadata(&path_str).map(|m| m.len()).ok();
-        let (handle_read, handle_write) = if is_write && !is_read {
-            (0, pos.max(file_size.unwrap_or(0)))
-        } else if is_read && !is_write {
-            (pos, 0)
-        } else {
-            (pos, pos)
-        };
+        let handle_pos = if has_pos { Some(pos) } else { None };
+
         let item = map
             .entry(path_str.clone())
             .or_insert_with(|| crate::actions::ProcessFileIo {
                 path: path_str,
-                read_bytes: 0,
-                write_bytes: 0,
-                total_bytes: 0,
+                read_bytes: None,
+                write_bytes: None,
+                read_ops: None,
+                write_ops: None,
                 file_size,
+                offset: handle_pos,
                 is_read: false,
                 is_write: false,
                 open_handles: 0,
@@ -953,14 +952,61 @@ fn list_linux_process_file_io(pid: u32) -> Result<Vec<crate::actions::ProcessFil
         item.open_handles = item.open_handles.saturating_add(1);
         item.is_read |= is_read;
         item.is_write |= is_write;
-        item.read_bytes = item.read_bytes.max(handle_read);
-        item.write_bytes = item.write_bytes.max(handle_write);
-        item.total_bytes = item.read_bytes.saturating_add(item.write_bytes);
+        if let Some(p) = handle_pos {
+            item.offset = Some(item.offset.map_or(p, |prev| prev.max(p)));
+        }
         if let Some(sz) = file_size {
             item.file_size = Some(item.file_size.map_or(sz, |prev| prev.max(sz)));
         }
     }
-    Ok(map.into_values().collect())
+
+    for file_entry in map.values_mut() {
+        if file_entry.is_read && !file_entry.is_write {
+            file_entry.read_bytes = file_entry.offset;
+            file_entry.write_bytes = Some(0);
+        } else if file_entry.is_write && !file_entry.is_read {
+            file_entry.read_bytes = Some(0);
+            file_entry.write_bytes = file_entry.offset;
+        } else {
+            file_entry.read_bytes = None;
+            file_entry.write_bytes = None;
+        }
+    }
+
+    // Read process-level I/O counters from /proc/[pid]/io if readable
+    let mut counter_read = None;
+    let mut counter_write = None;
+    if let Ok(io_content) = std::fs::read_to_string(format!("/proc/{pid}/io")) {
+        for line in io_content.lines() {
+            if let Some(rest) = line.strip_prefix("read_bytes: ") {
+                counter_read = rest.trim().parse::<u64>().ok();
+            } else if let Some(rest) = line.strip_prefix("write_bytes: ") {
+                counter_write = rest.trim().parse::<u64>().ok();
+            }
+        }
+    }
+
+    let accounting = crate::actions::FileIoAccounting {
+        state: crate::actions::FileIoAccountingState::Unavailable,
+        since_ms: 0,
+        read_bytes: 0,
+        write_bytes: 0,
+        read_ops: 0,
+        write_ops: 0,
+        unnamed_read_bytes: 0,
+        unnamed_write_bytes: 0,
+        omitted_read_bytes: 0,
+        omitted_write_bytes: 0,
+        counter_read_bytes: counter_read,
+        counter_write_bytes: counter_write,
+        events_lost: None,
+        handles_complete: true,
+    };
+
+    Ok(crate::actions::ProcessFileIoSnapshot {
+        files: map.into_values().collect(),
+        accounting,
+    })
 }
 
 fn send_signal(pid: u32, sig: i32) -> Result<()> {
