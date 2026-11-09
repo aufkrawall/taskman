@@ -6,6 +6,10 @@
 
 - **Process Properties I/O page with inter-process (IPC) telemetry:** Added a dedicated "I/O" tab to the Process Properties dialog featuring Process Hacker / System Informer style rolling history graphs for Read (yellow), Write (purple), and Inter-Process / Other (cyan) I/O, along with a "Disk & Inter-Process I/O" table breaking down cumulative operation counts (Reads, Writes, Other), cumulative transfer bytes, interval deltas, and current transfer rates. Inter-process I/O captures operations not involving physical disks (such as named pipes, ALPC, device controls/IOCTLs, and socket communications) read directly from the Windows kernel process table's `IO_COUNTERS` block without requiring elevated process handles.
 
+### Improved
+
+- **Process Properties I/O graphs theming and pinned hover readout:** Process Properties I/O tab graphs now match the styling and theming of the Performance page for disks: dark/light adaptive card surfaces, subtle gridlines, and coordinated series colors (green for Read, amber for Write, and teal for Inter-Process/Other) with translucent area fills, replacing retro green-on-black canvases. Cursor hover tooltips now appear directly at the pointer position with series swatches, and stay pinned to the inspected sample timestamp across rolling graph updates until the pointer is moved again.
+
 
 ## 0.1.23 - 2026-11-03
 

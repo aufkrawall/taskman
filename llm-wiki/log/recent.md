@@ -1,3 +1,12 @@
+## 2026-11-09 — Process Properties I/O page theming and pinned hover tooltip
+
+- Aligned Process Properties I/O graphs with the Performance page disk theming:
+  - Replaced retro green-on-black GroupBox canvases (`#000700` fill with `#003000` grid and neon `#00ff00` text) with modern `chart_multi` widgets matching the rest of the application.
+  - Themed card surfaces (`pal.card_bg`), subtle gridlines (`pal.chart_grid`), and border frames (`pal.stroke`) adaptive to dark and light modes.
+  - Themed series traces and translucent fills: Read using `pal.disk_graph` (green), Write using `pal.disk_write_graph` (amber), and Inter-Process / Other using `pal.network_send_graph` (teal).
+  - Modern caption row above each chart indicating series title and current transfer rate / delta on the left and vertical scale maximum on the right.
+  - Hover readout tooltips now appear directly anchored at the cursor pointer on the tooltip layer with color swatches and age headers, remaining pinned to the hovered sample timestamp across rolling graph updates until the pointer moves.
+
 ## 2026-11-08 — Process Properties I/O page with inter-process (IPC) telemetry
 
 - Added Process Hacker / System Informer style I/O tab to Process Properties dialog:
