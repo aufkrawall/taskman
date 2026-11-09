@@ -1,3 +1,19 @@
+## 2026-11-10 — Process Properties process name and I/O tab cleanup & files path column
+
+- Process Properties title bar and heading name alignment:
+  - Both the window title bar (`<name> (<pid>) — Process properties`) and the top heading on the General tab now name the executable image name (e.g. `explorer.exe`), rather than the process description (e.g. `Windows-Explorer`).
+  - Implemented in `tm-app::tabs::details` with regression coverage in `process_properties_uses_process_name_for_title_and_heading`.
+- Process Properties I/O tab cleanup:
+  - Removed the Options dropdown menu button and the elevation "Protection" label along with the vertical gap between the summary counters grid and the File I/O section.
+- Files table Path column and entry context menu:
+  - Added dedicated "Path" column to the files table with interactive sorting (`FileSortColumn::Path`) and truncated text rendering.
+  - Enabled `ScrollArea::both` for horizontal scroll capability on narrow dialog widths.
+  - Right-clicking table entries offers a context menu with:
+    - "Copy": copies the active label text selection if present, or the full cell text as fallback with toast confirmation.
+    - "Select all": selects all text in that specific cell/entry widget.
+    - "Open file location": reveals the path in Explorer with the file preselected via `open_file_location`.
+  - Added unit test coverage for Path column sorting and cell context menu popup triggers.
+
 ## 2026-11-09 — Process Properties Parent Process Name and Binary with Elevation Service
 
 - Parent process name and executable binary display on Process Properties:

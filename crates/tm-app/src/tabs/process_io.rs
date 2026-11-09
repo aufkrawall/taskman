@@ -32,6 +32,7 @@ pub struct IoSample {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FileSortColumn {
     File,
+    Path,
     Read,
     Written,
     Total,
@@ -183,6 +184,7 @@ impl State {
         self.poll.request();
     }
 
+    #[allow(dead_code)]
     pub fn clear_history(&mut self) {
         self.history.clear();
     }
@@ -287,6 +289,11 @@ impl State {
                     .file_size
                     .unwrap_or(0)
                     .cmp(&b.file_size.unwrap_or(0))
+                    .then_with(|| a.name.cmp(&b.name)),
+                FileSortColumn::Path => a
+                    .path
+                    .to_lowercase()
+                    .cmp(&b.path.to_lowercase())
                     .then_with(|| a.name.cmp(&b.name)),
                 FileSortColumn::File => a
                     .name
@@ -644,57 +651,8 @@ pub fn show(
                 });
         });
 
-    // 5. Options and Protection status row
-    ui.add_space(2.0);
-    ui.horizontal(|ui| {
-        ui.menu_button(i18n::tr(K::PropIoOptions), |ui| {
-            ui.set_min_width(220.0);
-            if ui
-                .checkbox(
-                    &mut state.show_other_graph,
-                    i18n::tr(K::PropIoShowOtherGraph),
-                )
-                .changed()
-            {
-                // Toggle state
-            }
-            ui.separator();
-            if ui
-                .selectable_label(state.unit_is_rate, i18n::tr(K::PropIoRateUnits))
-                .clicked()
-            {
-                state.unit_is_rate = true;
-                ui.close();
-            }
-            if ui
-                .selectable_label(!state.unit_is_rate, i18n::tr(K::PropIoDeltaUnits))
-                .clicked()
-            {
-                state.unit_is_rate = false;
-                ui.close();
-            }
-            ui.separator();
-            if ui.button(i18n::tr(K::PropIoClearHistory)).clicked() {
-                state.clear_history();
-                ui.close();
-            }
-        });
-
-        ui.add_space(12.0);
-        let protection_str = match process.elevated {
-            Some(true) => "Elevated",
-            Some(false) => "Standard",
-            None => "N/A",
-        };
-        ui.label(format!(
-            "{}: {}",
-            i18n::tr(K::PropProtection),
-            protection_str
-        ));
-    });
-
-    // 6. File I/O Section: list of files read from and written to
-    ui.add_space(8.0);
+    // 5. File I/O Section: list of files read from and written to
+    ui.add_space(6.0);
     ui.separator();
     ui.add_space(4.0);
 
@@ -783,19 +741,20 @@ pub fn show(
 
     ui.add_space(4.0);
 
-    const COL_FILE_MIN_W: f32 = 240.0;
-    const COL_READ_W: f32 = 95.0;
-    const COL_WRITE_W: f32 = 105.0;
-    const COL_TOTAL_W: f32 = 115.0;
-    const COL_SIZE_W: f32 = 105.0;
+    const COL_FILE_MIN_W: f32 = 160.0;
+    const COL_PATH_MIN_W: f32 = 260.0;
+    const COL_READ_W: f32 = 85.0;
+    const COL_WRITE_W: f32 = 95.0;
+    const COL_TOTAL_W: f32 = 105.0;
+    const COL_SIZE_W: f32 = 90.0;
 
     let mut sort_change = None;
     let mut selected_clicked = None;
     let selected_path = state.selected_path.clone();
 
     egui::Grid::new("process-io-files-grid")
-        .num_columns(5)
-        .spacing(Vec2::new(24.0, 6.0))
+        .num_columns(6)
+        .spacing(Vec2::new(16.0, 6.0))
         .striped(true)
         .show(ui, |ui| {
             // Header Row
@@ -833,6 +792,42 @@ pub fn show(
                 .clicked()
             {
                 sort_change = Some(FileSortColumn::File);
+            }
+
+            let path_arrow = if state.file_sort_column == FileSortColumn::Path {
+                if state.file_sort_ascending {
+                    " ▲"
+                } else {
+                    " ▼"
+                }
+            } else {
+                ""
+            };
+            let path_btn = ui
+                .allocate_ui_with_layout(
+                    egui::vec2(COL_PATH_MIN_W, 18.0),
+                    egui::Layout::left_to_right(egui::Align::Center),
+                    |ui| {
+                        ui.set_min_size(egui::vec2(COL_PATH_MIN_W, 18.0));
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(format!(
+                                    "{}{}",
+                                    i18n::tr(K::ColPath),
+                                    path_arrow
+                                ))
+                                .strong(),
+                            )
+                            .sense(egui::Sense::click()),
+                        )
+                    },
+                )
+                .inner;
+            if path_btn
+                .on_hover_cursor(egui::CursorIcon::PointingHand)
+                .clicked()
+            {
+                sort_change = Some(FileSortColumn::Path);
             }
 
             let mut show_num_header =
@@ -895,40 +890,9 @@ pub fn show(
 
             ui.end_row();
 
-            let show_num_cell = |ui: &mut egui::Ui, text: egui::RichText, width: f32| {
-                ui.allocate_ui_with_layout(
-                    egui::vec2(width, 18.0),
-                    egui::Layout::right_to_left(egui::Align::Center),
-                    |ui| {
-                        ui.set_min_size(egui::vec2(width, 18.0));
-                        ui.label(text);
-                    },
-                );
-            };
-
             // Rows
             for file in display_files {
                 let is_selected = selected_path.as_deref() == Some(&file.path);
-                let row_resp = ui
-                    .allocate_ui_with_layout(
-                        egui::vec2(COL_FILE_MIN_W, 18.0),
-                        egui::Layout::left_to_right(egui::Align::Center),
-                        |ui| {
-                            ui.set_min_size(egui::vec2(COL_FILE_MIN_W, 18.0));
-                            let name_text = if is_selected {
-                                egui::RichText::new(&file.name).strong().color(pal.accent)
-                            } else {
-                                egui::RichText::new(&file.name).strong()
-                            };
-                            ui.label(name_text);
-                            if file.open_handles == 0 {
-                                ui.weak("(closed)");
-                            } else if file.open_handles > 1 {
-                                ui.weak(format!("({} handles)", file.open_handles));
-                            }
-                        },
-                    )
-                    .response;
 
                 let hover_info = format!(
                     "{}\nAccess: {}{}\nPosition: {}\nSize: {}",
@@ -953,51 +917,157 @@ pub fn show(
                         .map_or("—".to_string(), format::format_bytes_loc),
                 );
 
-                if row_resp.clicked() {
+                // File column
+                let name_cell = ui.allocate_ui_with_layout(
+                    egui::vec2(COL_FILE_MIN_W, 18.0),
+                    egui::Layout::left_to_right(egui::Align::Center),
+                    |ui| {
+                        ui.set_min_size(egui::vec2(COL_FILE_MIN_W, 18.0));
+                        let name_text = if is_selected {
+                            egui::RichText::new(&file.name).strong().color(pal.accent)
+                        } else {
+                            egui::RichText::new(&file.name).strong()
+                        };
+                        let l_resp =
+                            ui.add(egui::Label::new(name_text).selectable(true).truncate());
+                        if file.open_handles == 0 {
+                            ui.weak("(closed)");
+                        } else if file.open_handles > 1 {
+                            ui.weak(format!("({} handles)", file.open_handles));
+                        }
+                        l_resp
+                    },
+                );
+                let name_label_resp = name_cell.inner;
+                let name_cell_resp = name_cell.response.interact(egui::Sense::click());
+                if name_cell_resp.clicked()
+                    || name_label_resp.clicked()
+                    || name_cell_resp.secondary_clicked()
+                    || name_label_resp.secondary_clicked()
+                {
                     selected_clicked = Some(file.path.clone());
                 }
+                name_cell_resp.clone().on_hover_text(&hover_info);
+                name_label_resp.clone().on_hover_text(&hover_info);
+                file_entry_cell_context_menu(
+                    app,
+                    &name_cell_resp,
+                    &name_label_resp,
+                    &file.name,
+                    &file.path,
+                );
+                file_entry_cell_context_menu(
+                    app,
+                    &name_label_resp,
+                    &name_label_resp,
+                    &file.name,
+                    &file.path,
+                );
 
-                row_resp.on_hover_text(hover_info).context_menu(|ui| {
-                    if ui.button(i18n::tr(K::OpenFileLocation)).clicked() {
-                        let _ = app.actions.open_file_location(&file.path);
-                        ui.close();
-                    }
-                    if ui.button(i18n::tr(K::CopyPath)).clicked() {
-                        ui.ctx().copy_text(file.path.clone());
-                        ui.close();
-                    }
-                    if ui.button(i18n::tr(K::FileProperties)).clicked() {
-                        let _ = app.actions.open_properties(&file.path);
-                        ui.close();
-                    }
-                });
+                // Path column
+                let path_cell = ui.allocate_ui_with_layout(
+                    egui::vec2(COL_PATH_MIN_W, 18.0),
+                    egui::Layout::left_to_right(egui::Align::Center),
+                    |ui| {
+                        ui.set_min_size(egui::vec2(COL_PATH_MIN_W, 18.0));
+                        let path_text = if is_selected {
+                            egui::RichText::new(&file.path).color(pal.accent)
+                        } else {
+                            egui::RichText::new(&file.path)
+                        };
+                        ui.add(egui::Label::new(path_text).selectable(true).truncate())
+                    },
+                );
+                let path_label_resp = path_cell.inner;
+                let path_cell_resp = path_cell.response.interact(egui::Sense::click());
+                if path_cell_resp.clicked()
+                    || path_label_resp.clicked()
+                    || path_cell_resp.secondary_clicked()
+                    || path_label_resp.secondary_clicked()
+                {
+                    selected_clicked = Some(file.path.clone());
+                }
+                path_cell_resp.clone().on_hover_text(&hover_info);
+                path_label_resp.clone().on_hover_text(&hover_info);
+                file_entry_cell_context_menu(
+                    app,
+                    &path_cell_resp,
+                    &path_label_resp,
+                    &file.path,
+                    &file.path,
+                );
+                file_entry_cell_context_menu(
+                    app,
+                    &path_label_resp,
+                    &path_label_resp,
+                    &file.path,
+                    &file.path,
+                );
+
+                // Numeric columns helper
+                let mut show_num_cell =
+                    |ui: &mut egui::Ui, text: egui::RichText, raw_str: &str, width: f32| {
+                        let num_cell = ui.allocate_ui_with_layout(
+                            egui::vec2(width, 18.0),
+                            egui::Layout::right_to_left(egui::Align::Center),
+                            |ui| {
+                                ui.set_min_size(egui::vec2(width, 18.0));
+                                ui.add(egui::Label::new(text).selectable(true))
+                            },
+                        );
+                        let num_label_resp = num_cell.inner;
+                        let num_cell_resp = num_cell.response.interact(egui::Sense::click());
+                        if num_cell_resp.clicked()
+                            || num_label_resp.clicked()
+                            || num_cell_resp.secondary_clicked()
+                            || num_label_resp.secondary_clicked()
+                        {
+                            selected_clicked = Some(file.path.clone());
+                        }
+                        num_cell_resp.clone().on_hover_text(&hover_info);
+                        num_label_resp.clone().on_hover_text(&hover_info);
+                        file_entry_cell_context_menu(
+                            app,
+                            &num_cell_resp,
+                            &num_label_resp,
+                            raw_str,
+                            &file.path,
+                        );
+                        file_entry_cell_context_menu(
+                            app,
+                            &num_label_resp,
+                            &num_label_resp,
+                            raw_str,
+                            &file.path,
+                        );
+                    };
 
                 // Read bytes
                 let s = match file.read_bytes {
                     Some(b) if b > 0 || file.is_read => format::format_bytes_loc(b),
                     _ => "—".to_string(),
                 };
-                show_num_cell(ui, egui::RichText::new(s), COL_READ_W);
+                show_num_cell(ui, egui::RichText::new(&s), &s, COL_READ_W);
 
                 // Written bytes
                 let s = match file.write_bytes {
                     Some(b) if b > 0 || file.is_write => format::format_bytes_loc(b),
                     _ => "—".to_string(),
                 };
-                show_num_cell(ui, egui::RichText::new(s), COL_WRITE_W);
+                show_num_cell(ui, egui::RichText::new(&s), &s, COL_WRITE_W);
 
                 // Total bytes
                 let s = match file.total_bytes {
                     Some(b) if b > 0 => format::format_bytes_loc(b),
                     _ => "—".to_string(),
                 };
-                show_num_cell(ui, egui::RichText::new(s).strong(), COL_TOTAL_W);
+                show_num_cell(ui, egui::RichText::new(&s).strong(), &s, COL_TOTAL_W);
 
                 // File size
                 let s = file
                     .file_size
                     .map_or_else(|| "—".to_string(), format::format_bytes_loc);
-                show_num_cell(ui, egui::RichText::new(s), COL_SIZE_W);
+                show_num_cell(ui, egui::RichText::new(&s), &s, COL_SIZE_W);
 
                 ui.end_row();
             }
@@ -1008,12 +1078,67 @@ pub fn show(
             state.file_sort_ascending = !state.file_sort_ascending;
         } else {
             state.file_sort_column = col;
-            state.file_sort_ascending = col == FileSortColumn::File;
+            state.file_sort_ascending = col == FileSortColumn::File || col == FileSortColumn::Path;
         }
     }
     if let Some(path) = selected_clicked {
         state.selected_path = Some(path);
     }
+}
+
+fn file_entry_cell_context_menu(
+    app: &TaskManApp,
+    resp: &egui::Response,
+    label_resp: &egui::Response,
+    fallback_text: &str,
+    file_path: &str,
+) {
+    file_entry_cell_context_menu_actions(
+        &app.actions,
+        &|msg| app.shared.toast(msg),
+        resp,
+        label_resp,
+        fallback_text,
+        file_path,
+    );
+}
+
+fn file_entry_cell_context_menu_actions(
+    actions: &std::sync::Arc<dyn tm_platform::actions::PlatformActions>,
+    toast: &dyn Fn(&str),
+    resp: &egui::Response,
+    label_resp: &egui::Response,
+    fallback_text: &str,
+    file_path: &str,
+) {
+    crate::widgets::menu::context_menu(resp, |ui| {
+        let active_sel = egui::text_selection::LabelSelectionState::active_selection(ui.ctx());
+        if crate::widgets::menu::item(ui, i18n::tr(K::Copy)).clicked() {
+            if let Some(sel) = active_sel {
+                ui.ctx().copy_text(sel);
+            } else {
+                ui.ctx().copy_text(fallback_text.to_owned());
+            }
+            toast(i18n::tr(K::Copied));
+            ui.close();
+        }
+        if crate::widgets::menu::item(ui, i18n::tr(K::SelectAll)).clicked() {
+            egui::text_selection::LabelSelectionState::select_all_in_widget(
+                ui.ctx(),
+                label_resp.layer_id,
+                label_resp.id,
+            );
+            ui.close();
+        }
+        let has_path = !file_path.trim().is_empty();
+        if crate::widgets::menu::item_enabled(ui, i18n::tr(K::OpenFileLocation), has_path).clicked()
+        {
+            if let Err(error) = actions.open_file_location(file_path) {
+                toast(&i18n::trf(K::ErrMsg, &[&error.to_string()]));
+            }
+            ui.close();
+        }
+    });
 }
 
 #[cfg(test)]
@@ -1217,6 +1342,22 @@ mod tests {
         let filtered = state.sorted_and_filtered_files();
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0].name, "heavy_write.dat");
+
+        // Sort by Path ascending
+        state.file_filter.clear();
+        state.file_sort_column = FileSortColumn::Path;
+        state.file_sort_ascending = true;
+        let sorted_path = state.sorted_and_filtered_files();
+        assert_eq!(sorted_path[0].name, "doc.pdf"); // C:\alpha
+        assert_eq!(sorted_path[1].name, "heavy_write.dat"); // C:\beta
+        assert_eq!(sorted_path[2].name, "notes.txt"); // C:\gamma
+
+        // Sort by Path descending
+        state.file_sort_ascending = false;
+        let sorted_path_desc = state.sorted_and_filtered_files();
+        assert_eq!(sorted_path_desc[0].name, "notes.txt"); // C:\gamma
+        assert_eq!(sorted_path_desc[1].name, "heavy_write.dat"); // C:\beta
+        assert_eq!(sorted_path_desc[2].name, "doc.pdf"); // C:\alpha
     }
 
     #[test]
@@ -1432,10 +1573,11 @@ mod tests {
             let display_files = state.sorted_and_filtered_files();
             assert_eq!(display_files.len(), 2);
             egui::Grid::new("test-file-grid")
-                .num_columns(5)
+                .num_columns(6)
                 .striped(true)
                 .show(ui, |ui| {
                     ui.label("File");
+                    ui.label("Path");
                     ui.label("Read");
                     ui.label("Written");
                     ui.label("Total");
@@ -1444,6 +1586,7 @@ mod tests {
 
                     for f in display_files {
                         ui.label(&f.name);
+                        ui.label(&f.path);
                         ui.label(f.read_bytes.map_or("—".into(), format::format_bytes_loc));
                         ui.label(f.write_bytes.map_or("—".into(), format::format_bytes_loc));
                         ui.label(f.total_bytes.map_or("—".into(), format::format_bytes_loc));
@@ -1472,6 +1615,79 @@ mod tests {
         assert_eq!(
             state.accounting.as_ref().map(|a| a.handles_complete),
             Some(false)
+        );
+    }
+
+    struct DummyActions;
+    impl tm_platform::actions::PlatformActions for DummyActions {}
+
+    #[test]
+    fn file_entry_cell_context_menu_renders_options() {
+        let ctx = egui::Context::default();
+        let val_rect = std::cell::Cell::new(egui::Rect::NOTHING);
+        let actions: std::sync::Arc<dyn tm_platform::actions::PlatformActions> =
+            std::sync::Arc::new(DummyActions);
+        let toast_called = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let toast_cb = {
+            let tc = toast_called.clone();
+            move |_: &str| {
+                tc.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+        };
+
+        let frame = |events: Vec<egui::Event>| {
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(800.0, 600.0),
+                )),
+                events,
+                ..Default::default()
+            };
+            let output = ctx.run_ui(input, |ui| {
+                let resp = ui.add(egui::Label::new("C:\\data\\test.txt").selectable(true));
+                val_rect.set(resp.rect);
+                file_entry_cell_context_menu_actions(
+                    &actions,
+                    &toast_cb,
+                    &resp,
+                    &resp,
+                    "test.txt",
+                    "C:\\data\\test.txt",
+                );
+            });
+            output.drop_without_applying_deltas();
+        };
+
+        // Frame 1: layout
+        frame(Vec::new());
+
+        // Frame 2: pointer move
+        let at = val_rect.get().center();
+        frame(vec![egui::Event::PointerMoved(at)]);
+
+        // Frame 3: right click
+        frame(vec![
+            egui::Event::PointerButton {
+                pos: at,
+                button: egui::PointerButton::Secondary,
+                pressed: true,
+                modifiers: Default::default(),
+            },
+            egui::Event::PointerButton {
+                pos: at,
+                button: egui::PointerButton::Secondary,
+                pressed: false,
+                modifiers: Default::default(),
+            },
+        ]);
+
+        // Frame 4: popup sizing pass
+        frame(Vec::new());
+
+        assert!(
+            ctx.any_popup_open(),
+            "right clicking file entry opens context menu"
         );
     }
 }

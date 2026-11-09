@@ -3905,12 +3905,17 @@ fn process_properties_general(
     security: &ProcessSecuritySummary,
     process_history: &std::collections::HashMap<u32, (String, String)>,
 ) {
-    let head_resp = ui.heading(process.shown_name());
-    selectable_text_context_menu(&head_resp, process.shown_name());
+    let proc_name = if !process.name.is_empty() {
+        process.name.as_str()
+    } else {
+        process.shown_name()
+    };
+    let head_resp = ui.heading(proc_name);
+    selectable_text_context_menu(&head_resp, proc_name);
     if let Some(description) = process
         .description
         .as_deref()
-        .filter(|value| !value.trim().is_empty() && *value != process.shown_name())
+        .filter(|value| !value.trim().is_empty() && *value != proc_name)
     {
         let desc_resp = ui.label(egui::RichText::new(description).size(13.0));
         selectable_text_context_menu(&desc_resp, description);
@@ -4389,9 +4394,14 @@ pub fn process_properties_dialog(app: &mut TaskManApp, ctx: &egui::Context) {
             )
         },
         |process| {
+            let proc_name = if !process.name.is_empty() {
+                process.name.as_str()
+            } else {
+                process.shown_name()
+            };
             format!(
                 "{} ({}) — {}",
-                process.shown_name(),
+                proc_name,
                 process.pid,
                 i18n::tr(K::ProcessProperties)
             )
@@ -4568,7 +4578,7 @@ pub fn process_properties_dialog(app: &mut TaskManApp, ctx: &egui::Context) {
                         egui::Layout::top_down(egui::Align::Min),
                         |ui| {
                             ui.set_min_size(size);
-                            egui::ScrollArea::vertical()
+                            egui::ScrollArea::both()
                                 .max_height(body_height)
                                 .max_width(size.x)
                                 .auto_shrink([false, false])
@@ -5870,6 +5880,48 @@ mod tests {
             ctx.any_popup_open(),
             "right clicking property row opens context menu"
         );
+    }
+
+    #[test]
+    fn process_properties_uses_process_name_for_title_and_heading() {
+        let mut p = ProcessEntry::new(9384, "explorer.exe");
+        p.display = "Windows-Explorer".into();
+        p.company = Some("Microsoft Corporation".into());
+
+        let proc_name = if !p.name.is_empty() {
+            p.name.as_str()
+        } else {
+            p.shown_name()
+        };
+        assert_eq!(proc_name, "explorer.exe");
+        assert_ne!(proc_name, p.shown_name());
+        assert_eq!(p.shown_name(), "Windows-Explorer");
+
+        let title = format!(
+            "{} ({}) — {}",
+            proc_name,
+            p.pid,
+            i18n::tr(K::ProcessProperties)
+        );
+        assert!(title.starts_with("explorer.exe (9384) — "));
+        assert!(!title.contains("Windows-Explorer"));
+
+        let ctx = egui::Context::default();
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(800.0, 600.0),
+            )),
+            ..Default::default()
+        };
+        let snap = tm_core::model::Snapshot::default();
+        let sec = ProcessSecuritySummary::default();
+        let hist = std::collections::HashMap::new();
+
+        let output = ctx.run_ui(input, |ui| {
+            process_properties_general(ui, &snap, &p, &sec, &hist);
+        });
+        output.drop_without_applying_deltas();
     }
 
     fn mk_proc(pid: u32, name: &str) -> ProcessEntry {
