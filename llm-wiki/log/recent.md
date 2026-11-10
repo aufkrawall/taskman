@@ -1,3 +1,8 @@
+## 2026-11-10 — v0.1.24 release
+
+- 2026-11-10: Released v0.1.24. Followed `build.md` §Publishing path: `--check` + `--audit` green, stable clippy green, bump pushed on main, `build.py --all-targets` for archives (Windows x86_64/ARM64, Linux x86_64 musl) and setup installers (`taskman-v0.1.24-windows-x86_64-setup.exe`, `taskman-v0.1.24-windows-arm64-setup.exe`), `.sha256` generated beside each, `gh release create --latest`.
+  Release covers: per-file read and written byte tracking in Process Properties I/O dialog, dedicated Process Properties I/O page with inter-process (IPC) telemetry, parent process name and binary display with elevation service support, process properties title and heading process name alignment, I/O tab cleanup and files table path column, I/O graphs theming and pinned hover readout, brokered process file I/O and graceful system process fallback, and process properties file I/O attribution honesty.
+
 ## 2026-11-10 — Process Properties process name and I/O tab cleanup & files path column
 
 - Process Properties title bar and heading name alignment:

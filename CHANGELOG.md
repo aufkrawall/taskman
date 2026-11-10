@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.1.24 - 2026-11-10
+
 ### New
 
 - **Per-file read and written byte tracking in Process Properties I/O dialog:** Added a sortable file activity table below the I/O graphs and summary counters in the Process Properties dialog. The table enumerates open and active files for the inspected process, displaying exact amounts read and written, total transfer size, and on-disk file size. Users can interactively sort by written most, read from most, total transfer, file size, or filename (toggling ascending/descending order with indicators), filter files with a live search box, and access context-menu actions to open the file location in Explorer, copy the path, or open file properties.
