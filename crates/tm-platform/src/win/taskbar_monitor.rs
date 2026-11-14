@@ -36,7 +36,7 @@ use windows::Win32::Graphics::Direct2D::{
 };
 use windows::Win32::Graphics::DirectWrite::{
     DWRITE_FACTORY_TYPE_SHARED, DWRITE_FONT_STRETCH_NORMAL, DWRITE_FONT_STYLE_NORMAL,
-    DWRITE_FONT_WEIGHT_NORMAL, DWRITE_PARAGRAPH_ALIGNMENT_CENTER, DWRITE_TEXT_ALIGNMENT_LEADING,
+    DWRITE_FONT_WEIGHT_NORMAL, DWRITE_PARAGRAPH_ALIGNMENT_NEAR, DWRITE_TEXT_ALIGNMENT_LEADING,
     DWRITE_TEXT_ALIGNMENT_TRAILING, DWRITE_TEXT_METRICS, DWRITE_WORD_WRAPPING_NO_WRAP,
     DWriteCreateFactory, IDWriteFactory, IDWriteTextFormat, IDWriteTextLayout,
 };
@@ -260,6 +260,8 @@ struct DibSurface {
     hdc: HDC,
     bitmap: HBITMAP,
     old_obj: HGDIOBJ,
+    #[cfg_attr(not(test), allow(dead_code))]
+    bits: *const u8,
     width: i32,
     height: i32,
 }
@@ -289,7 +291,10 @@ impl DibSurface {
             let mut bits: *mut std::ffi::c_void = std::ptr::null_mut();
             let bitmap =
                 CreateDIBSection(Some(hdc), &bmi, DIB_RGB_COLORS, &mut bits, None, 0).ok()?;
-            if bitmap.is_invalid() {
+            if bitmap.is_invalid() || bits.is_null() {
+                if !bitmap.is_invalid() {
+                    let _ = DeleteObject(HGDIOBJ(bitmap.0));
+                }
                 let _ = DeleteDC(hdc);
                 return None;
             }
@@ -298,10 +303,19 @@ impl DibSurface {
                 hdc,
                 bitmap,
                 old_obj,
+                bits: bits.cast::<u8>(),
                 width,
                 height,
             })
         }
+    }
+
+    #[cfg(test)]
+    fn pixels(&self) -> &[u8] {
+        let len = (self.width.max(0) as usize)
+            .saturating_mul(self.height.max(0) as usize)
+            .saturating_mul(4);
+        unsafe { std::slice::from_raw_parts(self.bits, len) }
     }
 }
 
@@ -383,7 +397,7 @@ impl Renderer {
                 )
                 .ok()?;
             let _ = fmt.SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
-            let _ = fmt.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+            let _ = fmt.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_NEAR);
             Some(fmt)
         }
     }
@@ -469,22 +483,24 @@ impl Renderer {
 
         let row_h = line_h1.max(line_h2).max(line_h3).max(line_h4).max(12.0);
         let two_rows = has_net || (display.cpu.is_some() && display.ram.is_some());
-        let row_gap = if two_rows { 1.0 } else { 0.0 };
-        let col_gap = if has_net && has_sys { 10.0 } else { 0.0 };
-        let pad_x = 8.0;
-        let pad_y = 4.0;
-
-        let content_h = if two_rows {
-            row_h * 2.0 + row_gap
-        } else {
-            row_h
-        };
-        let dip_w = (pad_x * 2.0 + net_col_w + col_gap + sys_col_w).ceil();
         let max_h = if max_taskbar_dip_h > 16.0 {
             max_taskbar_dip_h - 4.0
         } else {
             44.0
         };
+        let mut row_gap = if two_rows { 1.0 } else { 0.0 };
+        if two_rows && row_h * 2.0 + row_gap + 4.0 > max_h {
+            row_gap = 0.0;
+        }
+        let col_gap = if has_net && has_sys { 10.0 } else { 0.0 };
+        let pad_x = 8.0;
+        let content_h = if two_rows {
+            row_h * 2.0 + row_gap
+        } else {
+            row_h
+        };
+        let pad_y = ((max_h - content_h) * 0.5).clamp(1.0, 4.0);
+        let dip_w = (pad_x * 2.0 + net_col_w + col_gap + sys_col_w).ceil();
         let dip_h = (content_h + pad_y * 2.0).clamp(22.0, max_h).ceil();
 
         let dpi_scale = (display.dpi.max(96) as f32) / 96.0;
@@ -574,6 +590,7 @@ impl Renderer {
                 let x = pad_x;
                 if let Some(layout) = sent_layout {
                     let _ = layout.SetMaxWidth(net_col_w);
+                    let _ = layout.SetMaxHeight(row_h);
                     let _ = layout.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
                     self.dc_rt.DrawTextLayout(
                         windows_numerics::Vector2 { X: x, Y: top_y },
@@ -584,6 +601,7 @@ impl Renderer {
                 }
                 if let Some(layout) = recv_layout {
                     let _ = layout.SetMaxWidth(net_col_w);
+                    let _ = layout.SetMaxHeight(row_h);
                     let _ = layout.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
                     self.dc_rt.DrawTextLayout(
                         windows_numerics::Vector2 { X: x, Y: row2_y },
@@ -599,6 +617,7 @@ impl Renderer {
                 match (cpu_layout, ram_layout) {
                     (Some(cpu_l), Some(ram_l)) => {
                         let _ = cpu_l.SetMaxWidth(sys_col_w);
+                        let _ = cpu_l.SetMaxHeight(row_h);
                         let _ = cpu_l.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_TRAILING);
                         self.dc_rt.DrawTextLayout(
                             windows_numerics::Vector2 { X: x, Y: top_y },
@@ -607,6 +626,7 @@ impl Renderer {
                             D2D1_DRAW_TEXT_OPTIONS_NONE,
                         );
                         let _ = ram_l.SetMaxWidth(sys_col_w);
+                        let _ = ram_l.SetMaxHeight(row_h);
                         let _ = ram_l.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_TRAILING);
                         self.dc_rt.DrawTextLayout(
                             windows_numerics::Vector2 { X: x, Y: row2_y },
@@ -618,6 +638,7 @@ impl Renderer {
                     (Some(single), None) | (None, Some(single)) => {
                         let single_y = ((dip_h - row_h) * 0.5).max(0.0);
                         let _ = single.SetMaxWidth(sys_col_w);
+                        let _ = single.SetMaxHeight(row_h);
                         let _ = single.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
                         self.dc_rt.DrawTextLayout(
                             windows_numerics::Vector2 { X: x, Y: single_y },
@@ -761,6 +782,10 @@ impl WindowCtx {
     }
 
     fn set_visible(&mut self, visible: bool) {
+        if !visible {
+            self.hovered = false;
+            self.tracking_mouse = false;
+        }
         if self.last_visible == visible {
             return;
         }
@@ -787,7 +812,7 @@ impl WindowCtx {
         }
     }
 
-    fn show_context_menu(&self) {
+    fn show_context_menu(&mut self) {
         let config = {
             let guard = self.shared.lock().unwrap_or_else(|e| e.into_inner());
             guard.config.clone()
@@ -842,6 +867,22 @@ impl WindowCtx {
             );
             let _ = PostMessageW(Some(self.hwnd), WM_NULL, WPARAM(0), LPARAM(0));
             let _ = DestroyMenu(hmenu);
+
+            if self.hovered {
+                let mut cur = POINT::default();
+                let mut wr = RECT::default();
+                let inside = GetCursorPos(&mut cur).is_ok()
+                    && GetWindowRect(self.hwnd, &mut wr).is_ok()
+                    && cur.x >= wr.left
+                    && cur.x < wr.right
+                    && cur.y >= wr.top
+                    && cur.y < wr.bottom;
+                if !inside {
+                    self.hovered = false;
+                    self.tracking_mouse = false;
+                    self.refresh(true);
+                }
+            }
 
             match cmd.0 {
                 1 => (self.callback)(Action::OpenMain),
@@ -1458,5 +1499,77 @@ mod tests {
         };
         assert!(!maximized.covers(monitor));
         assert!(borderless_fs.covers(monitor));
+    }
+
+    #[test]
+    fn rendered_text_pixels_fall_inside_layered_bitmap_bounds() {
+        let _ = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
+        let mut renderer = Renderer::new().expect("Direct2D/DirectWrite renderer");
+        let cfg = Config {
+            enabled: true,
+            show_cpu: true,
+            show_ram: true,
+            show_network: true,
+            ..Config::default()
+        };
+        let metrics = Metrics {
+            cpu_pct: Some(23.0),
+            ram_pct: Some(48.0),
+            net_sent_bps: Some(12_300.0),
+            net_recv_bps: Some(456_700.0),
+        };
+        let display = build_display(&cfg, &metrics, false, false, 96);
+        let (w, h, _hdc) = renderer
+            .measure_and_render(&display, 48.0)
+            .expect("rendered surface");
+        assert!(w > 40 && h > 20, "unexpected widget size {w}x{h}");
+
+        let pixels = renderer.surface.as_ref().unwrap().pixels();
+        // Text color is white [255, 255, 255] while background clear is alpha 1/255.
+        // Every quadrant (top-left upload, bottom-left download, top-right CPU,
+        // bottom-right RAM) must contain rendered glyph pixels, while background
+        // corner pixels remain nearly transparent.
+        assert_eq!(
+            &pixels[0..4],
+            &[0, 0, 0, 1],
+            "unexpected non-hovered corner pixel"
+        );
+        let mut quadrants = [0usize; 4];
+        let half_w = (w / 2) as usize;
+        let half_h = (h / 2) as usize;
+        for y in 0..h as usize {
+            for x in 0..w as usize {
+                let idx = (y * w as usize + x) * 4;
+                if pixels[idx + 3] >= 64 && pixels[idx + 2] >= 64 {
+                    let q = usize::from(y >= half_h) * 2 + usize::from(x >= half_w);
+                    quadrants[q] += 1;
+                }
+            }
+        }
+        assert!(
+            quadrants.iter().all(|&c| c >= 20),
+            "expected >= 20 glyph pixels in all 4 quadrants of {w}x{h} bitmap, got {quadrants:?}"
+        );
+
+        let hi_dpi = build_display(&cfg, &metrics, false, false, 144);
+        let (hw, hh, _hdc2) = renderer
+            .measure_and_render(&hi_dpi, 48.0)
+            .expect("hi-dpi rendered surface");
+        assert!(hw > w && hh > h, "144 DPI should scale widget size");
+        let hi_glyph_pixels = renderer
+            .surface
+            .as_ref()
+            .unwrap()
+            .pixels()
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .filter(|px| px[3] >= 64 && px[2] >= 64)
+            .count();
+        assert!(
+            hi_glyph_pixels >= 100,
+            "expected >= 100 rendered glyph pixels at 144 DPI inside {hw}x{hh} bitmap, got {hi_glyph_pixels}"
+        );
+        unsafe { CoUninitialize() };
     }
 }
