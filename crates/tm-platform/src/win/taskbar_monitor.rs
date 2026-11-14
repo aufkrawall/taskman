@@ -50,7 +50,9 @@ use windows::Win32::Graphics::DirectWrite::{
     DWriteCreateFactory, IDWriteFactory, IDWriteRenderingParams, IDWriteTextFormat,
     IDWriteTextLayout,
 };
-use windows::Win32::Graphics::Dwm::{DWMWA_TRANSITIONS_FORCEDISABLED, DwmSetWindowAttribute};
+use windows::Win32::Graphics::Dwm::{
+    DWMWA_CLOAKED, DWMWA_TRANSITIONS_FORCEDISABLED, DwmGetWindowAttribute, DwmSetWindowAttribute,
+};
 use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
 use windows::Win32::Graphics::Gdi::{
     AC_SRC_ALPHA, AC_SRC_OVER, BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BLENDFUNCTION,
@@ -86,12 +88,13 @@ use windows::Win32::UI::WindowsAndMessaging::{
     CS_DBLCLKS, CreatePopupMenu, CreateWindowExW, DeregisterShellHookWindow, DestroyMenu,
     DestroyWindow, DispatchMessageW, EVENT_OBJECT_HIDE, EVENT_OBJECT_LOCATIONCHANGE,
     EVENT_OBJECT_REORDER, EVENT_OBJECT_SHOW, EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_MINIMIZEEND,
-    EVENT_SYSTEM_MINIMIZESTART, EVENT_SYSTEM_MOVESIZEEND, FindWindowExW, FindWindowW, GW_HWNDPREV,
-    GWL_EXSTYLE, GWLP_HWNDPARENT, GWLP_USERDATA, GetClassNameW, GetCursorPos, GetDesktopWindow,
-    GetForegroundWindow, GetMessageW, GetShellWindow, GetWindow, GetWindowLongPtrW, GetWindowRect,
-    GetWindowThreadProcessId, HMENU, HSHELL_WINDOWACTIVATED, HSHELL_WINDOWCREATED,
-    HSHELL_WINDOWDESTROYED, HSHELL_WINDOWREPLACED, HWND_NOTOPMOST, HWND_TOPMOST, IDC_ARROW,
-    InsertMenuW, IsChild, IsIconic, IsWindowVisible, KillTimer, LoadCursorW, MA_NOACTIVATE,
+    EVENT_SYSTEM_MINIMIZESTART, EVENT_SYSTEM_MOVESIZEEND, EnumWindows, FindWindowExW, FindWindowW,
+    GW_HWNDPREV, GWL_EXSTYLE, GWLP_HWNDPARENT, GWLP_USERDATA, GetClassNameW, GetCursorPos,
+    GetDesktopWindow, GetForegroundWindow, GetLayeredWindowAttributes, GetMessageW, GetShellWindow,
+    GetWindow, GetWindowLongPtrW, GetWindowRect, GetWindowThreadProcessId, HMENU,
+    HSHELL_WINDOWACTIVATED, HSHELL_WINDOWCREATED, HSHELL_WINDOWDESTROYED, HSHELL_WINDOWREPLACED,
+    HWND_NOTOPMOST, HWND_TOPMOST, IDC_ARROW, InsertMenuW, IsChild, IsIconic, IsWindowVisible,
+    KillTimer, LAYERED_WINDOW_ATTRIBUTES_FLAGS, LWA_ALPHA, LoadCursorW, MA_NOACTIVATE,
     MF_BYPOSITION, MF_SEPARATOR, MF_STRING, MSG, OBJID_WINDOW, PostMessageW, PostQuitMessage,
     RegisterClassExW, RegisterShellHookWindow, RegisterWindowMessageW, SW_HIDE, SW_SHOWNOACTIVATE,
     SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOOWNERZORDER, SWP_NOSENDCHANGING, SWP_NOSIZE, SWP_NOZORDER,
@@ -100,9 +103,9 @@ use windows::Win32::UI::WindowsAndMessaging::{
     UpdateLayeredWindow, WINEVENT_OUTOFCONTEXT, WINEVENT_SKIPOWNPROCESS, WM_APP, WM_CLOSE,
     WM_CREATE, WM_DESTROY, WM_DISPLAYCHANGE, WM_DPICHANGED, WM_LBUTTONUP, WM_MOUSEACTIVATE,
     WM_MOUSEMOVE, WM_NULL, WM_RBUTTONUP, WM_SETTINGCHANGE, WM_TIMER, WNDCLASSEXW, WS_EX_LAYERED,
-    WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+    WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
 };
-use windows::core::{Interface, PCWSTR, w};
+use windows::core::{BOOL, Interface, PCWSTR, w};
 
 use crate::taskbar_monitor::{Action, Config, Metrics};
 
@@ -1380,7 +1383,10 @@ struct TaskbarEnv {
 fn query_taskbar_env(own_hwnd: HWND) -> Option<TaskbarEnv> {
     unsafe {
         let tray_hwnd = FindWindowW(w!("Shell_TrayWnd"), None).ok()?;
-        if tray_hwnd.0.is_null() || !IsWindowVisible(tray_hwnd).as_bool() {
+        if tray_hwnd.0.is_null()
+            || !IsWindowVisible(tray_hwnd).as_bool()
+            || is_window_cloaked(tray_hwnd)
+        {
             return None;
         }
         let mut tray_r = RECT::default();
@@ -1404,7 +1410,9 @@ fn query_taskbar_env(own_hwnd: HWND) -> Option<TaskbarEnv> {
             return None;
         }
 
-        if is_fullscreen_covering_monitor(monitor, monitor_rect, tray_hwnd, own_hwnd) {
+        if is_fullscreen_covering_monitor(monitor, monitor_rect, tray_hwnd, own_hwnd)
+            || is_fullscreen_window_above_taskbar(monitor_rect, tray_hwnd, own_hwnd)
+        {
             return None;
         }
 
@@ -1469,6 +1477,9 @@ unsafe fn is_fullscreen_covering_monitor(
     if unsafe { !IsWindowVisible(fg).as_bool() || IsIconic(fg).as_bool() } {
         return false;
     }
+    if is_window_cloaked(fg) {
+        return false;
+    }
     let fg_mon = unsafe { MonitorFromWindow(fg, MONITOR_DEFAULTTONULL) };
     if fg_mon != taskbar_monitor {
         return false;
@@ -1486,6 +1497,95 @@ unsafe fn is_fullscreen_covering_monitor(
         return false;
     }
     PixelRect::from_win32(fg_rect).covers(monitor_rect)
+}
+
+fn is_window_cloaked(hwnd: HWND) -> bool {
+    let mut cloaked: u32 = 0;
+    let ok = unsafe {
+        DwmGetWindowAttribute(
+            hwnd,
+            DWMWA_CLOAKED,
+            (&mut cloaked as *mut u32).cast(),
+            std::mem::size_of::<u32>() as u32,
+        )
+    }
+    .is_ok();
+    ok && cloaked != 0
+}
+
+fn is_transparent_overlay(hwnd: HWND) -> bool {
+    let ex_style = unsafe { GetWindowLongPtrW(hwnd, GWL_EXSTYLE) } as u32;
+    if (ex_style & WS_EX_LAYERED.0) == 0 {
+        return false;
+    }
+    if (ex_style & WS_EX_TRANSPARENT.0) != 0 {
+        return true;
+    }
+    let mut alpha = 255u8;
+    let mut flags = LAYERED_WINDOW_ATTRIBUTES_FLAGS(0);
+    unsafe { GetLayeredWindowAttributes(hwnd, None, Some(&mut alpha), Some(&mut flags)) }.is_ok()
+        && (flags & LWA_ALPHA) != LAYERED_WINDOW_ATTRIBUTES_FLAGS(0)
+        && alpha == 0
+}
+
+struct AboveTaskbarScan {
+    tray_hwnd: HWND,
+    own_hwnd: HWND,
+    desktop_hwnd: HWND,
+    shell_hwnd: HWND,
+    monitor_rect: PixelRect,
+    covered: bool,
+    saw_tray: bool,
+}
+
+unsafe extern "system" fn above_taskbar_enum_cb(hwnd: HWND, lparam: LPARAM) -> BOOL {
+    let scan = unsafe { &mut *(lparam.0 as *mut AboveTaskbarScan) };
+    if hwnd == scan.tray_hwnd {
+        scan.saw_tray = true;
+        return BOOL(0);
+    }
+    if hwnd == scan.own_hwnd || hwnd == scan.desktop_hwnd || hwnd == scan.shell_hwnd {
+        return BOOL(1);
+    }
+    if unsafe { !IsWindowVisible(hwnd).as_bool() || IsIconic(hwnd).as_bool() } {
+        return BOOL(1);
+    }
+    if is_desktop_shell_class(hwnd) || is_window_cloaked(hwnd) || is_transparent_overlay(hwnd) {
+        return BOOL(1);
+    }
+    let mut r = RECT::default();
+    if unsafe { GetWindowRect(hwnd, &mut r) }.is_ok()
+        && PixelRect::from_win32(r).covers(scan.monitor_rect)
+    {
+        scan.covered = true;
+    }
+    BOOL(1)
+}
+
+/// Detects fullscreen windows still sitting above `tray_hwnd` in Z-order even
+/// when they no longer hold foreground focus (e.g. while holding Alt+Tab over
+/// a fullscreen game so the task switcher dialog is foreground above both).
+fn is_fullscreen_window_above_taskbar(
+    monitor_rect: PixelRect,
+    tray_hwnd: HWND,
+    own_hwnd: HWND,
+) -> bool {
+    let mut scan = AboveTaskbarScan {
+        tray_hwnd,
+        own_hwnd,
+        desktop_hwnd: unsafe { GetDesktopWindow() },
+        shell_hwnd: unsafe { GetShellWindow() },
+        monitor_rect,
+        covered: false,
+        saw_tray: false,
+    };
+    unsafe {
+        let _ = EnumWindows(
+            Some(above_taskbar_enum_cb),
+            LPARAM(&mut scan as *mut AboveTaskbarScan as isize),
+        );
+    }
+    scan.saw_tray && scan.covered
 }
 
 fn is_desktop_shell_class(hwnd: HWND) -> bool {
@@ -2084,6 +2184,17 @@ fn ensure_just_above_taskbar(widget_hwnd: HWND, tray_hwnd: HWND, force_repositio
         if widget_topmost {
             unsafe {
                 let _ = SetWindowPos(widget_hwnd, Some(HWND_NOTOPMOST), 0, 0, 0, 0, flags);
+            }
+        }
+        // Keep the non-topmost widget directly above `tray_hwnd` so demoting
+        // from `HWND_TOPMOST` via `HWND_NOTOPMOST` never places it above a
+        // window that is currently covering the demoted taskbar.
+        if let Ok(prev) = unsafe { GetWindow(tray_hwnd, GW_HWNDPREV) }
+            && !prev.0.is_null()
+            && prev != widget_hwnd
+        {
+            unsafe {
+                let _ = SetWindowPos(widget_hwnd, Some(prev), 0, 0, 0, 0, flags);
             }
         }
         return;
@@ -2956,6 +3067,179 @@ mod tests {
         unsafe {
             let _ = DestroyWindow(widget);
             let _ = DestroyWindow(mock_menu);
+            let _ = DestroyWindow(mock_fullscreen);
+            let _ = DestroyWindow(mock_tray);
+        }
+    }
+
+    #[test]
+    fn fullscreen_above_taskbar_stays_detected_under_alt_tab_and_ignores_cloaked_or_transparent() {
+        use windows::Win32::Graphics::Dwm::DWMWA_CLOAK;
+        use windows::Win32::UI::WindowsAndMessaging::HWND_TOP;
+
+        let hinstance = unsafe { GetModuleHandleW(None).unwrap() };
+        let class_name = register_window_class(HINSTANCE(hinstance.0)).unwrap();
+        let mock_monitor = rect(-10_000, -10_000, -9_900, -9_900);
+
+        let make_win = |ex_style, x: i32, y: i32, w: i32, h: i32| unsafe {
+            CreateWindowExW(
+                ex_style,
+                class_name,
+                w!("above-taskbar visibility test"),
+                WS_POPUP,
+                x,
+                y,
+                w,
+                h,
+                None,
+                None,
+                Some(HINSTANCE(hinstance.0)),
+                None,
+            )
+            .unwrap()
+        };
+
+        let mock_tray = make_win(
+            WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TOPMOST,
+            -10_000,
+            -9_940,
+            100,
+            40,
+        );
+        let mock_fullscreen = make_win(
+            WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+            -10_000,
+            -10_000,
+            100,
+            100,
+        );
+        // Smaller centered overlay simulating the Windows Alt+Tab switcher above both.
+        let mock_switcher = make_win(
+            WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TOPMOST,
+            -9_980,
+            -9_980,
+            60,
+            60,
+        );
+
+        unsafe {
+            let _ = ShowWindow(mock_fullscreen, SW_SHOWNOACTIVATE);
+            let _ = ShowWindow(mock_tray, SW_SHOWNOACTIVATE);
+            let _ = ShowWindow(mock_switcher, SW_SHOWNOACTIVATE);
+            // Normal desktop: tray is TOPMOST above fullscreen/normal windows; switcher alone
+            // does not cover the monitor.
+            let _ = SetWindowPos(
+                mock_tray,
+                Some(HWND_TOPMOST),
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+            );
+            let _ = SetWindowPos(
+                mock_switcher,
+                Some(HWND_TOPMOST),
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+            );
+        }
+        assert!(
+            !is_fullscreen_window_above_taskbar(mock_monitor, mock_tray, HWND::default()),
+            "taskbar above normal windows with Alt+Tab dialog on top must remain visible"
+        );
+
+        // Fullscreen game active and user holds Alt+Tab: taskbar stays demoted behind
+        // mock_fullscreen while mock_switcher sits on top of both.
+        unsafe {
+            let _ = SetWindowPos(
+                mock_tray,
+                Some(windows::Win32::UI::WindowsAndMessaging::HWND_BOTTOM),
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+            );
+            let _ = SetWindowPos(
+                mock_fullscreen,
+                Some(HWND_TOP),
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+            );
+        }
+        assert!(
+            is_fullscreen_window_above_taskbar(mock_monitor, mock_tray, HWND::default()),
+            "fullscreen window behind Alt+Tab switcher and above demoted taskbar must hide widget"
+        );
+
+        // If the fullscreen window is click-through transparent, it must not suppress the widget.
+        let orig_ex = unsafe { GetWindowLongPtrW(mock_fullscreen, GWL_EXSTYLE) };
+        unsafe {
+            SetWindowLongPtrW(
+                mock_fullscreen,
+                GWL_EXSTYLE,
+                orig_ex | (WS_EX_LAYERED.0 | WS_EX_TRANSPARENT.0) as isize,
+            );
+        }
+        assert!(
+            !is_fullscreen_window_above_taskbar(mock_monitor, mock_tray, HWND::default()),
+            "click-through transparent overlay must not suppress taskbar monitor"
+        );
+        unsafe {
+            SetWindowLongPtrW(mock_fullscreen, GWL_EXSTYLE, orig_ex);
+        }
+        assert!(is_fullscreen_window_above_taskbar(
+            mock_monitor,
+            mock_tray,
+            HWND::default()
+        ));
+
+        // If the fullscreen window is cloaked (e.g. another virtual desktop), ignore it.
+        let cloak_on = BOOL::from(true);
+        if unsafe {
+            DwmSetWindowAttribute(
+                mock_fullscreen,
+                DWMWA_CLOAK,
+                (&cloak_on as *const BOOL).cast(),
+                std::mem::size_of::<BOOL>() as u32,
+            )
+        }
+        .is_ok()
+        {
+            assert!(
+                !is_fullscreen_window_above_taskbar(mock_monitor, mock_tray, HWND::default()),
+                "cloaked fullscreen window must not suppress taskbar monitor"
+            );
+            let cloak_off = BOOL::from(false);
+            let _ = unsafe {
+                DwmSetWindowAttribute(
+                    mock_fullscreen,
+                    DWMWA_CLOAK,
+                    (&cloak_off as *const BOOL).cast(),
+                    std::mem::size_of::<BOOL>() as u32,
+                )
+            };
+        }
+
+        // Hiding the fullscreen window restores visibility.
+        unsafe {
+            let _ = ShowWindow(mock_fullscreen, SW_HIDE);
+        }
+        assert!(!is_fullscreen_window_above_taskbar(
+            mock_monitor,
+            mock_tray,
+            HWND::default()
+        ));
+
+        unsafe {
+            let _ = DestroyWindow(mock_switcher);
             let _ = DestroyWindow(mock_fullscreen);
             let _ = DestroyWindow(mock_tray);
         }

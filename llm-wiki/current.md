@@ -1091,9 +1091,11 @@ rebase runbook.
   filtered to `OBJID_WINDOW` `SHOW`/`HIDE`/`LOCATIONCHANGE` on tray + `IsChild`
   descendants plus `EVENT_OBJECT_REORDER`) with `REFRESH_PENDING` /
   `LAYOUT_DIRTY` coalescing plus a 300 ms one-shot settle timer so
-  fullscreen/auto-hide transitions hide and restore immediately and Z-order
-  demotes atomically with `Shell_TrayWnd` (staying below popups, context menus,
-  and fullscreen windows).
+  fullscreen/auto-hide transitions hide and restore immediately (including when
+  holding `Alt+Tab` or another overlay takes foreground while an uncloaked,
+  opaque fullscreen window still sits above `Shell_TrayWnd` in Z-order) and
+  Z-order demotes atomically with `Shell_TrayWnd` (staying below popups,
+  context menus, and fullscreen windows).
 - **Automagic UIA collision-free placement:** Dedicated `"tm-taskbar-uia"` MTA +
   Per-Monitor V2 thread queries visible interactive UIA elements under
   `Shell_TrayWnd` in a single cached `FindAllBuildCache` RPC (`CUIAutomation8`

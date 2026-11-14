@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Fixed
+
+- **Taskbar monitor visibility while holding Alt+Tab in fullscreen apps:** The Windows taskbar performance monitor no longer pops up while holding `Alt+Tab` over a fullscreen game or app when the taskbar itself remains hidden behind the fullscreen window. Visibility detection now checks Z-order for uncloaked, non-transparent fullscreen windows still sitting above `Shell_TrayWnd` even after the task switcher takes foreground focus, and non-topmost demotion keeps the widget anchored right above `Shell_TrayWnd`.
+
 ## 0.1.26 - 2026-11-14
 
 ### Improved
