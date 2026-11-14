@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.1.26 - 2026-11-14
+
 ### Improved
 
 - **Collision-free Windows taskbar monitor placement:** The taskbar stats overlay now inspects visible `Shell_TrayWnd` UI Automation bounds on a dedicated event-driven MTA thread and places itself into open taskbar space—stepping past XAML Widgets/Copilot controls beside the tray, relocating with hysteresis to an open alternate gap (such as the left side of a crowded centered Windows 11 taskbar), switching to a narrower compact layout (`C`/`R` labels) when tight, and cleanly hiding instead of overlapping taskbar buttons if the taskbar fills end-to-end (with `TrayNotifyWnd`-relative fallback if UIA is unavailable).
