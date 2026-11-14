@@ -1073,17 +1073,23 @@ rebase runbook.
 ## Windows taskbar monitor (2026-11-14)
 
 - **DWM-safe layered rendering:** `tm-platform/src/win/taskbar_monitor.rs`
-  runs an independent `WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE |
-  WS_EX_TOPMOST` window on a dedicated `"tm-taskbar"` thread using software
-  Direct2D (`D2D1_RENDER_TARGET_TYPE_SOFTWARE`) + DirectWrite into a cached
-  32bpp premultiplied ARGB `CreateDIBSection` and `UpdateLayeredWindow`. It
-  never calls `GetDC(NULL)`/`GetPixel`/`BitBlt` and never uses cross-process
+  runs an independent `WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE`
+  popup owned by `Shell_TrayWnd` (without hardcoding `WS_EX_TOPMOST`, and
+  with `DWMWA_TRANSITIONS_FORCEDISABLED`) on a dedicated `"tm-taskbar"` thread
+  using software Direct2D (`D2D1_RENDER_TARGET_TYPE_SOFTWARE`) + DirectWrite
+  with GDI-classic ClearType-matched glyph rendering into a cached 32bpp
+  premultiplied ARGB `CreateDIBSection` and `UpdateLayeredWindow`. It never
+  calls `GetDC(NULL)`/`GetPixel`/`BitBlt` and never uses cross-process
   `SetParent` on Explorer's `Shell_TrayWnd` thread.
 - **Zero-cost fullscreen & auto-hide suppression:** Watches taskbar position,
-  `SystemUsesLightTheme` (`WM_SETTINGCHANGE`), `TaskbarCreated`, and
-  `EVENT_SYSTEM_FOREGROUND` to hide cleanly when the taskbar auto-hides or a
-  fullscreen window covers its monitor (preserving Independent Flip / MPO and
-  avoiding HUD overlap).
+  `SystemUsesLightTheme` (`WM_SETTINGCHANGE`), `TaskbarCreated`,
+  `RegisterShellHookWindow` (`HSHELL_RUDEAPPACTIVATED`, `HSHELL_WINDOWACTIVATED`),
+  `EVENT_SYSTEM_FOREGROUND`/`MINIMIZESTART..END`/`MOVESIZEEND`, and
+  thread-scoped `SetWinEventHook` hooks on the active foreground thread and
+  `Shell_TrayWnd` thread (`EVENT_OBJECT_LOCATIONCHANGE`/`SHOW`..`REORDER`) with
+  `REFRESH_PENDING` coalescing so fullscreen/auto-hide transitions hide and
+  restore immediately and Z-order demotes atomically with `Shell_TrayWnd`
+  (staying below popups, context menus, and fullscreen windows).
 - **Tray keep-alive & engine decoupled updates:** While enabled, closing the
   main window hides TaskMan to the tray even if `close_to_tray` is off, and
   `tm-engine`'s notifier pushes `Metrics::from_snapshot` directly to the

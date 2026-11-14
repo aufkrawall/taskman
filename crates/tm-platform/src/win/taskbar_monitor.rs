@@ -9,8 +9,8 @@
 //!   from the screen DC (which causes DWM screen-capture fences). Taskbar
 //!   light/dark contrast comes from `SystemUsesLightTheme` + `WM_SETTINGCHANGE`.
 //! - **Zero cross-process `SetParent`:** runs as an independent `WS_EX_LAYERED |
-//!   WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TOPMOST` window on its own
-//!   dedicated thread, never attaching to Explorer's Taskbar thread.
+//!   WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE` popup owned by `Shell_TrayWnd` on its
+//!   own dedicated thread, never attaching to Explorer's Taskbar thread.
 //! - **Zero GPU swapchain:** uses `D2D1_RENDER_TARGET_TYPE_SOFTWARE` into a
 //!   cached DIB section and only calls `UpdateLayeredWindow` when rendered
 //!   content, hover state, or DPI/geometry actually changes.
@@ -42,6 +42,7 @@ use windows::Win32::Graphics::DirectWrite::{
     DWriteCreateFactory, IDWriteFactory, IDWriteRenderingParams, IDWriteTextFormat,
     IDWriteTextLayout,
 };
+use windows::Win32::Graphics::Dwm::{DWMWA_TRANSITIONS_FORCEDISABLED, DwmSetWindowAttribute};
 use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
 use windows::Win32::Graphics::Gdi::{
     AC_SRC_ALPHA, AC_SRC_OVER, BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BLENDFUNCTION,
@@ -62,16 +63,20 @@ use windows::Win32::UI::Shell::{
     SHAppBarMessage, SHQueryUserNotificationState,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CS_DBLCLKS, CreatePopupMenu, CreateWindowExW, DestroyMenu, DestroyWindow, DispatchMessageW,
-    EVENT_SYSTEM_FOREGROUND, FindWindowExW, FindWindowW, GW_HWNDPREV, GWL_EXSTYLE, GWLP_HWNDPARENT,
-    GWLP_USERDATA, GetClassNameW, GetCursorPos, GetDesktopWindow, GetForegroundWindow, GetMessageW,
-    GetShellWindow, GetWindow, GetWindowLongPtrW, GetWindowRect, HMENU, HWND_TOPMOST, IDC_ARROW,
+    CS_DBLCLKS, CreatePopupMenu, CreateWindowExW, DeregisterShellHookWindow, DestroyMenu,
+    DestroyWindow, DispatchMessageW, EVENT_OBJECT_LOCATIONCHANGE, EVENT_OBJECT_REORDER,
+    EVENT_OBJECT_SHOW, EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_MINIMIZEEND,
+    EVENT_SYSTEM_MINIMIZESTART, EVENT_SYSTEM_MOVESIZEEND, FindWindowExW, FindWindowW, GW_HWNDPREV,
+    GWL_EXSTYLE, GWLP_HWNDPARENT, GWLP_USERDATA, GetClassNameW, GetCursorPos, GetDesktopWindow,
+    GetForegroundWindow, GetMessageW, GetShellWindow, GetWindow, GetWindowLongPtrW, GetWindowRect,
+    GetWindowThreadProcessId, HMENU, HSHELL_WINDOWACTIVATED, HSHELL_WINDOWCREATED,
+    HSHELL_WINDOWDESTROYED, HSHELL_WINDOWREPLACED, HWND_NOTOPMOST, HWND_TOPMOST, IDC_ARROW,
     InsertMenuW, IsIconic, IsWindowVisible, LoadCursorW, MA_NOACTIVATE, MF_BYPOSITION,
-    MF_SEPARATOR, MF_STRING, MSG, PostMessageW, PostQuitMessage, RegisterClassExW,
-    RegisterWindowMessageW, SW_HIDE, SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOMOVE,
-    SWP_NOOWNERZORDER, SWP_NOSENDCHANGING, SWP_NOSIZE, SWP_NOZORDER, SetForegroundWindow,
-    SetMenuDefaultItem, SetWindowLongPtrW, SetWindowPos, ShowWindow, TPM_BOTTOMALIGN,
-    TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenuEx, TranslateMessage, ULW_ALPHA,
+    MF_SEPARATOR, MF_STRING, MSG, OBJID_WINDOW, PostMessageW, PostQuitMessage, RegisterClassExW,
+    RegisterShellHookWindow, RegisterWindowMessageW, SW_HIDE, SW_SHOWNOACTIVATE, SWP_NOACTIVATE,
+    SWP_NOMOVE, SWP_NOOWNERZORDER, SWP_NOSENDCHANGING, SWP_NOSIZE, SWP_NOZORDER,
+    SetForegroundWindow, SetMenuDefaultItem, SetWindowLongPtrW, SetWindowPos, ShowWindow,
+    TPM_BOTTOMALIGN, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenuEx, TranslateMessage, ULW_ALPHA,
     UpdateLayeredWindow, WINEVENT_OUTOFCONTEXT, WINEVENT_SKIPOWNPROCESS, WM_APP, WM_CLOSE,
     WM_CREATE, WM_DESTROY, WM_DISPLAYCHANGE, WM_DPICHANGED, WM_LBUTTONUP, WM_MOUSEACTIVATE,
     WM_MOUSEMOVE, WM_NULL, WM_RBUTTONUP, WM_SETTINGCHANGE, WNDCLASSEXW, WS_EX_LAYERED,
@@ -83,10 +88,29 @@ use crate::taskbar_monitor::{Action, Config, Metrics};
 
 const WM_APP_REFRESH: u32 = WM_APP + 10;
 const WM_MOUSELEAVE: u32 = 0x02A3;
+// `HSHELL_HIGHBIT | HSHELL_WINDOWACTIVATED`: Windows Shell notification fired
+// when a fullscreen / "rude" app enters or leaves fullscreen focus.
+const HSHELL_RUDEAPPACTIVATED_MSG: u32 = 0x8004;
 
-/// Global HWND of the live taskbar monitor window so `SetWinEventHook` callbacks
-/// (which carry no user-data pointer) can coalesce onto the window's queue.
+/// Global HWNDs and coalescing flag so WinEvent hooks (which carry no
+/// user-data pointer) can wake `"tm-taskbar"` immediately without flooding its
+/// message queue.
 static LIVE_HWND: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
+static LIVE_FG_HWND: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
+static LIVE_TRAY_HWND: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
+static REFRESH_PENDING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn post_refresh() {
+    let raw = LIVE_HWND.load(std::sync::atomic::Ordering::Acquire);
+    if raw != 0 && !REFRESH_PENDING.swap(true, std::sync::atomic::Ordering::AcqRel) {
+        let target = HWND(raw as *mut std::ffi::c_void);
+        let posted =
+            unsafe { PostMessageW(Some(target), WM_APP_REFRESH, WPARAM(0), LPARAM(0)).is_ok() };
+        if !posted {
+            REFRESH_PENDING.store(false, std::sync::atomic::Ordering::Release);
+        }
+    }
+}
 
 #[derive(Debug)]
 struct SharedState {
@@ -162,13 +186,7 @@ impl TaskbarMonitorHandle {
     }
 
     fn post_refresh(&self) {
-        let raw = LIVE_HWND.load(std::sync::atomic::Ordering::Acquire);
-        if raw != 0 {
-            let hwnd = HWND(raw as *mut std::ffi::c_void);
-            unsafe {
-                let _ = PostMessageW(Some(hwnd), WM_APP_REFRESH, WPARAM(0), LPARAM(0));
-            }
-        }
+        post_refresh();
     }
 
     fn ensure_started(&self) {
@@ -794,9 +812,109 @@ struct WindowCtx {
     last_pos: Option<(i32, i32)>,
     last_visible: bool,
     msg_taskbar_created: u32,
+    msg_shell_hook: u32,
+    tracked_fg_tid: u32,
+    fg_loc_hook: HWINEVENTHOOK,
+    tracked_tray_tid: u32,
+    tray_hook: HWINEVENTHOOK,
+}
+
+impl Drop for WindowCtx {
+    fn drop(&mut self) {
+        self.unhook_dynamic_hooks();
+    }
 }
 
 impl WindowCtx {
+    fn unhook_dynamic_hooks(&mut self) {
+        LIVE_FG_HWND.store(0, std::sync::atomic::Ordering::Release);
+        LIVE_TRAY_HWND.store(0, std::sync::atomic::Ordering::Release);
+        if !self.fg_loc_hook.is_invalid() {
+            unsafe {
+                let _ = UnhookWinEvent(self.fg_loc_hook);
+            }
+            self.fg_loc_hook = HWINEVENTHOOK::default();
+        }
+        if !self.tray_hook.is_invalid() {
+            unsafe {
+                let _ = UnhookWinEvent(self.tray_hook);
+            }
+            self.tray_hook = HWINEVENTHOOK::default();
+        }
+        self.tracked_fg_tid = 0;
+        self.tracked_tray_tid = 0;
+    }
+
+    fn sync_foreground_hook(&mut self) {
+        let fg = unsafe { GetForegroundWindow() };
+        LIVE_FG_HWND.store(fg.0 as isize, std::sync::atomic::Ordering::Release);
+        let mut pid = 0u32;
+        let tid = if fg.0.is_null() {
+            0
+        } else {
+            unsafe { GetWindowThreadProcessId(fg, Some(&mut pid)) }
+        };
+        let target_tid = if tid != 0 && pid != std::process::id() {
+            tid
+        } else {
+            0
+        };
+        if target_tid == self.tracked_fg_tid {
+            return;
+        }
+        if !self.fg_loc_hook.is_invalid() {
+            unsafe {
+                let _ = UnhookWinEvent(self.fg_loc_hook);
+            }
+            self.fg_loc_hook = HWINEVENTHOOK::default();
+        }
+        self.tracked_fg_tid = target_tid;
+        if target_tid != 0 {
+            self.fg_loc_hook = unsafe {
+                SetWinEventHook(
+                    EVENT_OBJECT_LOCATIONCHANGE,
+                    EVENT_OBJECT_LOCATIONCHANGE,
+                    None,
+                    Some(fg_location_event_proc),
+                    0,
+                    target_tid,
+                    WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS,
+                )
+            };
+        }
+    }
+
+    fn sync_tray_hook(&mut self, tray_hwnd: HWND) {
+        if tray_hwnd.0.is_null() {
+            return;
+        }
+        LIVE_TRAY_HWND.store(tray_hwnd.0 as isize, std::sync::atomic::Ordering::Release);
+        let tid = unsafe { GetWindowThreadProcessId(tray_hwnd, None) };
+        if tid == self.tracked_tray_tid {
+            return;
+        }
+        if !self.tray_hook.is_invalid() {
+            unsafe {
+                let _ = UnhookWinEvent(self.tray_hook);
+            }
+            self.tray_hook = HWINEVENTHOOK::default();
+        }
+        self.tracked_tray_tid = tid;
+        if tid != 0 {
+            self.tray_hook = unsafe {
+                SetWinEventHook(
+                    EVENT_OBJECT_SHOW,
+                    EVENT_OBJECT_LOCATIONCHANGE,
+                    None,
+                    Some(tray_event_proc),
+                    0,
+                    tid,
+                    WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS,
+                )
+            };
+        }
+    }
+
     fn sync_owner(&mut self, tray_hwnd: HWND) {
         let raw = tray_hwnd.0 as isize;
         if raw != 0 && self.owner_hwnd != raw {
@@ -821,6 +939,13 @@ impl WindowCtx {
             return;
         }
 
+        // Track the active foreground window's thread even when hidden during
+        // fullscreen so exiting fullscreen (F11 / Esc / resize) wakes immediately.
+        self.sync_foreground_hook();
+        if self.owner_hwnd != 0 {
+            self.sync_tray_hook(HWND(self.owner_hwnd as *mut std::ffi::c_void));
+        }
+
         let env = query_taskbar_env(self.hwnd);
         let Some(env) = env else {
             self.set_visible(false);
@@ -828,6 +953,7 @@ impl WindowCtx {
         };
 
         self.sync_owner(env.tray_hwnd);
+        self.sync_tray_hook(env.tray_hwnd);
 
         let display = build_display(&config, &metrics, self.light_taskbar, self.hovered, env.dpi);
         let size_changed_or_needed = force_render
@@ -853,8 +979,8 @@ impl WindowCtx {
                 if let Some((x, y)) = pos {
                     self.present_layered(x, y, w, h, src_dc);
                     self.last_pos = Some((x, y));
-                    let became_visible = self.set_visible(true);
-                    ensure_just_above_taskbar(self.hwnd, env.tray_hwnd, became_visible);
+                    ensure_just_above_taskbar(self.hwnd, env.tray_hwnd, !self.last_visible);
+                    let _ = self.set_visible(true);
                 } else {
                     self.set_visible(false);
                 }
@@ -886,8 +1012,8 @@ impl WindowCtx {
                     }
                     self.last_pos = Some((x, y));
                 }
-                let became_visible = self.set_visible(true);
-                ensure_just_above_taskbar(self.hwnd, env.tray_hwnd, became_visible);
+                ensure_just_above_taskbar(self.hwnd, env.tray_hwnd, !self.last_visible);
+                let _ = self.set_visible(true);
             } else {
                 self.set_visible(false);
             }
@@ -1268,12 +1394,28 @@ fn is_window_above(target: HWND, anchor: HWND) -> bool {
 }
 
 /// Keeps `widget_hwnd` directly above `tray_hwnd`, never climbing in front of
-/// popup menus, tray flyouts, or other programs' topmost windows.
+/// popup menus, tray flyouts, or other programs' topmost windows, and never
+/// remaining pinned as `TOPMOST` if Explorer itself was demoted behind a
+/// fullscreen window.
 fn ensure_just_above_taskbar(widget_hwnd: HWND, tray_hwnd: HWND, force_reposition: bool) {
-    if !force_reposition && is_window_above(widget_hwnd, tray_hwnd) {
+    let tray_topmost =
+        (unsafe { GetWindowLongPtrW(tray_hwnd, GWL_EXSTYLE) } as u32 & WS_EX_TOPMOST.0) != 0;
+    let widget_topmost =
+        (unsafe { GetWindowLongPtrW(widget_hwnd, GWL_EXSTYLE) } as u32 & WS_EX_TOPMOST.0) != 0;
+    let flags = SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_NOSENDCHANGING;
+
+    if !tray_topmost {
+        if widget_topmost {
+            unsafe {
+                let _ = SetWindowPos(widget_hwnd, Some(HWND_NOTOPMOST), 0, 0, 0, 0, flags);
+            }
+        }
         return;
     }
-    let flags = SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_NOSENDCHANGING;
+
+    if !force_reposition && widget_topmost && is_window_above(widget_hwnd, tray_hwnd) {
+        return;
+    }
     let mut cur = tray_hwnd;
     for _ in 0..64 {
         let Ok(prev) = (unsafe { GetWindow(cur, GW_HWNDPREV) }) else {
@@ -1296,7 +1438,7 @@ fn ensure_just_above_taskbar(widget_hwnd: HWND, tray_hwnd: HWND, force_repositio
             return;
         }
     }
-    if !is_window_above(widget_hwnd, tray_hwnd) {
+    if !is_window_above(widget_hwnd, tray_hwnd) || !widget_topmost {
         unsafe {
             let _ = SetWindowPos(widget_hwnd, Some(HWND_TOPMOST), 0, 0, 0, 0, flags);
         }
@@ -1356,12 +1498,44 @@ unsafe extern "system" fn fg_event_proc(
     _id_event_thread: u32,
     _dwms_event_time: u32,
 ) {
-    let raw = LIVE_HWND.load(std::sync::atomic::Ordering::Acquire);
-    if raw != 0 {
-        let target = HWND(raw as *mut std::ffi::c_void);
-        unsafe {
-            let _ = PostMessageW(Some(target), WM_APP_REFRESH, WPARAM(0), LPARAM(0));
-        }
+    post_refresh();
+}
+
+unsafe extern "system" fn fg_location_event_proc(
+    _hook: HWINEVENTHOOK,
+    _event: u32,
+    hwnd: HWND,
+    id_object: i32,
+    id_child: i32,
+    _id_event_thread: u32,
+    _dwms_event_time: u32,
+) {
+    // OBJID_WINDOW (0) + CHILDID_SELF (0): ignore carets, scrollbars, and child DOM controls.
+    if id_object == OBJID_WINDOW.0
+        && id_child == 0
+        && !hwnd.0.is_null()
+        && hwnd.0 as isize == LIVE_FG_HWND.load(std::sync::atomic::Ordering::Acquire)
+    {
+        post_refresh();
+    }
+}
+
+unsafe extern "system" fn tray_event_proc(
+    _hook: HWINEVENTHOOK,
+    event: u32,
+    hwnd: HWND,
+    id_object: i32,
+    id_child: i32,
+    _id_event_thread: u32,
+    _dwms_event_time: u32,
+) {
+    let tray = LIVE_TRAY_HWND.load(std::sync::atomic::Ordering::Acquire);
+    if tray != 0
+        && !hwnd.0.is_null()
+        && hwnd.0 as isize == tray
+        && ((id_object == OBJID_WINDOW.0 && id_child == 0) || event == EVENT_OBJECT_REORDER)
+    {
+        post_refresh();
     }
 }
 
@@ -1412,8 +1586,23 @@ unsafe extern "system" fn wnd_proc(
         return LRESULT(0);
     }
 
+    if ctx.msg_shell_hook != 0 && msg == ctx.msg_shell_hook {
+        match wparam.0 as u32 {
+            HSHELL_WINDOWCREATED
+            | HSHELL_WINDOWDESTROYED
+            | HSHELL_WINDOWACTIVATED
+            | HSHELL_RUDEAPPACTIVATED_MSG
+            | HSHELL_WINDOWREPLACED => {
+                ctx.refresh(false);
+            }
+            _ => {}
+        }
+        return LRESULT(0);
+    }
+
     match msg {
         WM_APP_REFRESH => {
+            REFRESH_PENDING.store(false, std::sync::atomic::Ordering::Release);
             ctx.refresh(false);
             LRESULT(0)
         }
@@ -1510,6 +1699,7 @@ fn taskbar_thread_main(
     };
 
     let msg_taskbar_created = unsafe { RegisterWindowMessageW(w!("TaskbarCreated")) };
+    let msg_shell_hook = unsafe { RegisterWindowMessageW(w!("SHELLHOOK")) };
 
     loop {
         let tray_owner = unsafe { FindWindowW(w!("Shell_TrayWnd"), None) }
@@ -1546,12 +1736,17 @@ fn taskbar_thread_main(
             last_pos: None,
             last_visible: false,
             msg_taskbar_created,
+            msg_shell_hook,
+            tracked_fg_tid: 0,
+            fg_loc_hook: HWINEVENTHOOK::default(),
+            tracked_tray_tid: 0,
+            tray_hook: HWINEVENTHOOK::default(),
         });
 
         let ctx_ptr: *mut WindowCtx = &mut *ctx_box;
         let hwnd = match unsafe {
             CreateWindowExW(
-                WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TOPMOST,
+                WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
                 class_name,
                 w!("TaskMan Taskbar Monitor"),
                 WS_POPUP,
@@ -1571,7 +1766,20 @@ fn taskbar_thread_main(
             }
         };
 
+        // Disable DWM show/hide transition animations so entering or exiting
+        // fullscreen applies on the very next compositor vblank without fade lag.
+        let disable_transitions = windows::core::BOOL::from(true);
+        unsafe {
+            let _ = DwmSetWindowAttribute(
+                hwnd,
+                DWMWA_TRANSITIONS_FORCEDISABLED,
+                (&disable_transitions as *const windows::core::BOOL).cast(),
+                std::mem::size_of::<windows::core::BOOL>() as u32,
+            );
+        }
+
         ctx_box.hwnd = hwnd;
+        REFRESH_PENDING.store(false, std::sync::atomic::Ordering::Release);
         LIVE_HWND.store(hwnd.0 as isize, std::sync::atomic::Ordering::Release);
 
         // If `shutdown()` / `set_config(enabled = false)` raced before `LIVE_HWND`
@@ -1582,6 +1790,7 @@ fn taskbar_thread_main(
         };
         if !still_enabled {
             LIVE_HWND.store(0, std::sync::atomic::Ordering::Release);
+            REFRESH_PENDING.store(false, std::sync::atomic::Ordering::Release);
             unsafe {
                 SetWindowLongPtrW(hwnd, GWLP_HWNDPARENT, 0);
                 let _ = DestroyWindow(hwnd);
@@ -1590,10 +1799,11 @@ fn taskbar_thread_main(
             break;
         }
 
-        let hook = unsafe {
+        let shell_hook_registered = unsafe { RegisterShellHookWindow(hwnd).as_bool() };
+        let install_sys_hook = |min_ev: u32, max_ev: u32| unsafe {
             SetWinEventHook(
-                EVENT_SYSTEM_FOREGROUND,
-                EVENT_SYSTEM_FOREGROUND,
+                min_ev,
+                max_ev,
                 None,
                 Some(fg_event_proc),
                 0,
@@ -1601,6 +1811,9 @@ fn taskbar_thread_main(
                 WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS,
             )
         };
+        let fg_hook = install_sys_hook(EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND);
+        let movesize_hook = install_sys_hook(EVENT_SYSTEM_MOVESIZEEND, EVENT_SYSTEM_MOVESIZEEND);
+        let minimize_hook = install_sys_hook(EVENT_SYSTEM_MINIMIZESTART, EVENT_SYSTEM_MINIMIZEEND);
 
         ctx_box.refresh(true);
 
@@ -1615,11 +1828,20 @@ fn taskbar_thread_main(
         }
 
         LIVE_HWND.store(0, std::sync::atomic::Ordering::Release);
-        if !hook.is_invalid() {
-            unsafe {
-                let _ = UnhookWinEvent(hook);
+        REFRESH_PENDING.store(false, std::sync::atomic::Ordering::Release);
+        for hook in [fg_hook, movesize_hook, minimize_hook] {
+            if !hook.is_invalid() {
+                unsafe {
+                    let _ = UnhookWinEvent(hook);
+                }
             }
         }
+        if shell_hook_registered {
+            unsafe {
+                let _ = DeregisterShellHookWindow(hwnd);
+            }
+        }
+        ctx_box.unhook_dynamic_hooks();
         let user_closing = ctx_box.user_closing;
         drop(ctx_box);
 
@@ -1908,6 +2130,121 @@ mod tests {
         unsafe {
             let _ = DestroyWindow(widget);
             let _ = DestroyWindow(mock_menu);
+            let _ = DestroyWindow(mock_tray);
+        }
+    }
+
+    #[test]
+    fn widget_demotes_with_taskbar_behind_fullscreen_and_restores_on_exit() {
+        let hinstance = unsafe { GetModuleHandleW(None).unwrap() };
+        let class_name = register_window_class(HINSTANCE(hinstance.0)).unwrap();
+
+        let make_win = |ex_style, owner: Option<HWND>| unsafe {
+            CreateWindowExW(
+                ex_style,
+                class_name,
+                w!("fullscreen z-order test"),
+                WS_POPUP,
+                -200,
+                -200,
+                10,
+                10,
+                owner,
+                None,
+                Some(HINSTANCE(hinstance.0)),
+                None,
+            )
+            .unwrap()
+        };
+
+        let mock_tray = make_win(WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TOPMOST, None);
+        let mock_fullscreen = make_win(WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE, None);
+        let mock_menu = make_win(WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TOPMOST, None);
+        // Owned by mock_tray without explicitly forcing WS_EX_TOPMOST on creation.
+        let widget = make_win(
+            WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+            Some(mock_tray),
+        );
+
+        unsafe {
+            let _ = ShowWindow(mock_fullscreen, SW_SHOWNOACTIVATE);
+            let _ = ShowWindow(mock_tray, SW_SHOWNOACTIVATE);
+            let _ = ShowWindow(widget, SW_SHOWNOACTIVATE);
+            let _ = ShowWindow(mock_menu, SW_SHOWNOACTIVATE);
+            let _ = SetWindowPos(
+                mock_menu,
+                Some(HWND_TOPMOST),
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+            );
+        }
+
+        ensure_just_above_taskbar(widget, mock_tray, true);
+        assert!(is_window_above(widget, mock_tray));
+        assert!(is_window_above(mock_menu, widget));
+
+        // Simulate Explorer demoting Shell_TrayWnd behind a normal-band fullscreen window:
+        // because widget is owned by mock_tray, Win32 demotes it behind mock_fullscreen
+        // synchronously before ensure_just_above_taskbar even runs.
+        unsafe {
+            let _ = SetWindowPos(
+                mock_tray,
+                Some(windows::Win32::UI::WindowsAndMessaging::HWND_BOTTOM),
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+            );
+        }
+        assert!(
+            is_window_above(mock_fullscreen, widget),
+            "owned widget must drop behind fullscreen window atomically when taskbar demotes"
+        );
+        ensure_just_above_taskbar(widget, mock_tray, true);
+        let widget_ex = unsafe { GetWindowLongPtrW(widget, GWL_EXSTYLE) } as u32;
+        assert_eq!(
+            widget_ex & WS_EX_TOPMOST.0,
+            0,
+            "widget must not stay TOPMOST when taskbar itself was demoted"
+        );
+        assert!(
+            is_window_above(mock_fullscreen, widget),
+            "widget must sit behind normal-band fullscreen window when taskbar is demoted"
+        );
+
+        // Simulate exiting fullscreen: Shell_TrayWnd re-enters TOPMOST band.
+        unsafe {
+            let _ = SetWindowPos(
+                mock_tray,
+                Some(HWND_TOPMOST),
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+            );
+            let _ = SetWindowPos(
+                mock_menu,
+                Some(HWND_TOPMOST),
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+            );
+        }
+        ensure_just_above_taskbar(widget, mock_tray, true);
+        assert!(is_window_above(widget, mock_tray));
+        assert!(is_window_above(mock_menu, widget));
+
+        unsafe {
+            let _ = DestroyWindow(widget);
+            let _ = DestroyWindow(mock_menu);
+            let _ = DestroyWindow(mock_fullscreen);
             let _ = DestroyWindow(mock_tray);
         }
     }
