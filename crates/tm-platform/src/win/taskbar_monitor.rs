@@ -36,9 +36,11 @@ use windows::Win32::Graphics::Direct2D::{
 };
 use windows::Win32::Graphics::DirectWrite::{
     DWRITE_FACTORY_TYPE_SHARED, DWRITE_FONT_STRETCH_NORMAL, DWRITE_FONT_STYLE_NORMAL,
-    DWRITE_FONT_WEIGHT_NORMAL, DWRITE_PARAGRAPH_ALIGNMENT_NEAR, DWRITE_TEXT_ALIGNMENT_LEADING,
-    DWRITE_TEXT_ALIGNMENT_TRAILING, DWRITE_TEXT_METRICS, DWRITE_WORD_WRAPPING_NO_WRAP,
-    DWriteCreateFactory, IDWriteFactory, IDWriteTextFormat, IDWriteTextLayout,
+    DWRITE_FONT_WEIGHT_NORMAL, DWRITE_PARAGRAPH_ALIGNMENT_NEAR, DWRITE_PIXEL_GEOMETRY_BGR,
+    DWRITE_PIXEL_GEOMETRY_RGB, DWRITE_RENDERING_MODE_DEFAULT, DWRITE_RENDERING_MODE_GDI_CLASSIC,
+    DWRITE_TEXT_ALIGNMENT_LEADING, DWRITE_TEXT_ALIGNMENT_TRAILING, DWRITE_TEXT_METRICS,
+    DWRITE_WORD_WRAPPING_NO_WRAP, DWriteCreateFactory, IDWriteFactory, IDWriteRenderingParams,
+    IDWriteTextFormat, IDWriteTextLayout,
 };
 use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
 use windows::Win32::Graphics::Gdi::{
@@ -51,7 +53,9 @@ use windows::Win32::System::Com::{COINIT_APARTMENTTHREADED, CoInitializeEx, CoUn
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Registry::{HKEY_CURRENT_USER, RRF_RT_REG_DWORD, RegGetValueW};
 use windows::Win32::UI::Accessibility::{HWINEVENTHOOK, SetWinEventHook, UnhookWinEvent};
-use windows::Win32::UI::HiDpi::GetDpiForWindow;
+use windows::Win32::UI::HiDpi::{
+    DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, GetDpiForWindow, SetThreadDpiAwarenessContext,
+};
 use windows::Win32::UI::Input::KeyboardAndMouse::{TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent};
 use windows::Win32::UI::Shell::{
     ABM_GETSTATE, ABS_AUTOHIDE, APPBARDATA, QUNS_PRESENTATION_MODE, QUNS_RUNNING_D3D_FULL_SCREEN,
@@ -242,12 +246,15 @@ impl PixelRect {
 
 #[derive(Debug, Clone, PartialEq)]
 struct RenderedDisplay {
+    show_net: bool,
     net_sent: Option<String>,
     net_recv: Option<String>,
-    cpu: Option<String>,
-    ram: Option<String>,
     net_sample: String,
-    sys_sample: String,
+    cpu_label: Option<String>,
+    cpu_val: Option<String>,
+    ram_label: Option<String>,
+    ram_val: Option<String>,
+    sys_val_sample: String,
     font_family: String,
     font_size_pt: f32,
     text_rgb: [u8; 3],
@@ -427,62 +434,139 @@ impl Renderer {
         }
     }
 
+    fn apply_text_rendering_params(&self, hwnd: Option<isize>, dpi: u32) {
+        let params = crate::win::text_rendering::query(hwnd);
+        let geom = if params.bgr {
+            DWRITE_PIXEL_GEOMETRY_BGR
+        } else {
+            DWRITE_PIXEL_GEOMETRY_RGB
+        };
+        let mode = if dpi <= 120 {
+            // Grid-fitted classic hinting keeps small taskbar fonts crisp at 100%–125% DPI.
+            DWRITE_RENDERING_MODE_GDI_CLASSIC
+        } else {
+            DWRITE_RENDERING_MODE_DEFAULT
+        };
+        unsafe {
+            // UpdateLayeredWindow uses scalar alpha, so D2D grayscale AA must stay active
+            // while inheriting the monitor's ClearType gamma/contrast calibration.
+            if let Ok(rp) = self.dwrite_factory.CreateCustomRenderingParams(
+                params.gamma,
+                params.contrast.max(0.5),
+                0.0,
+                geom,
+                mode,
+            ) {
+                let rp_base: IDWriteRenderingParams = rp;
+                self.dc_rt.SetTextRenderingParams(&rp_base);
+            }
+        }
+    }
+
     fn measure_and_render(
         &mut self,
         display: &RenderedDisplay,
         max_taskbar_dip_h: f32,
+        hwnd: Option<isize>,
     ) -> Option<(i32, i32, HDC)> {
         let _ = &self.d2d_factory;
         let fmt = self
             .create_text_format(&display.font_family, display.font_size_pt)
             .or_else(|| self.create_text_format("Segoe UI", display.font_size_pt))?;
 
-        let has_net = display.net_sent.is_some() && display.net_recv.is_some();
-        let has_sys = display.cpu.is_some() || display.ram.is_some();
+        let has_net = display.show_net && display.net_sent.is_some() && display.net_recv.is_some();
+        let has_cpu = display.cpu_label.is_some() && display.cpu_val.is_some();
+        let has_ram = display.ram_label.is_some() && display.ram_val.is_some();
+        let has_sys = has_cpu || has_ram;
         if !has_net && !has_sys {
             return None;
         }
 
+        let (up_w, arrow_h1, up_layout) = if has_net {
+            self.measure_text(&fmt, "↑")
+        } else {
+            (0.0, 0.0, None)
+        };
+        let (down_w, arrow_h2, down_layout) = if has_net {
+            self.measure_text(&fmt, "↓")
+        } else {
+            (0.0, 0.0, None)
+        };
+        let arrow_w = up_w.max(down_w);
+
         let (sent_w, line_h1, sent_layout) = match display.net_sent.as_deref() {
-            Some(s) => self.measure_text(&fmt, s),
-            None => (0.0, 0.0, None),
+            Some(s) if has_net => self.measure_text(&fmt, s),
+            _ => (0.0, 0.0, None),
         };
         let (recv_w, line_h2, recv_layout) = match display.net_recv.as_deref() {
-            Some(s) => self.measure_text(&fmt, s),
-            None => (0.0, 0.0, None),
+            Some(s) if has_net => self.measure_text(&fmt, s),
+            _ => (0.0, 0.0, None),
         };
         let (net_sample_w, _, _) = if has_net {
             self.measure_text(&fmt, &display.net_sample)
         } else {
             (0.0, 0.0, None)
         };
+        let net_arrow_gap = if has_net { 3.0 } else { 0.0 };
+        let net_val_w = if has_net {
+            sent_w.max(recv_w).max(net_sample_w) + 1.0
+        } else {
+            0.0
+        };
         let net_col_w = if has_net {
-            sent_w.max(recv_w).max(net_sample_w)
+            arrow_w + net_arrow_gap + net_val_w
         } else {
             0.0
         };
 
-        let (cpu_w, line_h3, cpu_layout) = match display.cpu.as_deref() {
+        let (cpu_lw, cpu_lh, cpu_label_layout) = match display.cpu_label.as_deref() {
             Some(s) => self.measure_text(&fmt, s),
             None => (0.0, 0.0, None),
         };
-        let (ram_w, line_h4, ram_layout) = match display.ram.as_deref() {
+        let (cpu_vw, line_h3, cpu_val_layout) = match display.cpu_val.as_deref() {
             Some(s) => self.measure_text(&fmt, s),
             None => (0.0, 0.0, None),
         };
-        let (sys_sample_w, _, _) = if has_sys {
-            self.measure_text(&fmt, &display.sys_sample)
+        let (ram_lw, ram_lh, ram_label_layout) = match display.ram_label.as_deref() {
+            Some(s) => self.measure_text(&fmt, s),
+            None => (0.0, 0.0, None),
+        };
+        let (ram_vw, line_h4, ram_val_layout) = match display.ram_val.as_deref() {
+            Some(s) => self.measure_text(&fmt, s),
+            None => (0.0, 0.0, None),
+        };
+        let (sys_val_sample_w, _, _) = if has_sys {
+            self.measure_text(&fmt, &display.sys_val_sample)
         } else {
             (0.0, 0.0, None)
         };
+        let sys_label_w = if has_sys {
+            cpu_lw.max(ram_lw) + 1.0
+        } else {
+            0.0
+        };
+        let sys_label_gap = if has_sys { 4.0 } else { 0.0 };
+        let sys_val_w = if has_sys {
+            cpu_vw.max(ram_vw).max(sys_val_sample_w) + 1.0
+        } else {
+            0.0
+        };
         let sys_col_w = if has_sys {
-            cpu_w.max(ram_w).max(sys_sample_w)
+            sys_label_w + sys_label_gap + sys_val_w
         } else {
             0.0
         };
 
-        let row_h = line_h1.max(line_h2).max(line_h3).max(line_h4).max(12.0);
-        let two_rows = has_net || (display.cpu.is_some() && display.ram.is_some());
+        let row_h = line_h1
+            .max(line_h2)
+            .max(line_h3)
+            .max(line_h4)
+            .max(arrow_h1)
+            .max(arrow_h2)
+            .max(cpu_lh)
+            .max(ram_lh)
+            .max(12.0);
+        let two_rows = has_net || (has_cpu && has_ram);
         let max_h = if max_taskbar_dip_h > 16.0 {
             max_taskbar_dip_h - 4.0
         } else {
@@ -492,8 +576,8 @@ impl Renderer {
         if two_rows && row_h * 2.0 + row_gap + 4.0 > max_h {
             row_gap = 0.0;
         }
-        let col_gap = if has_net && has_sys { 10.0 } else { 0.0 };
-        let pad_x = 8.0;
+        let col_gap = if has_net && has_sys { 6.0 } else { 0.0 };
+        let pad_x = 6.0;
         let content_h = if two_rows {
             row_h * 2.0 + row_gap
         } else {
@@ -504,6 +588,7 @@ impl Renderer {
         let dip_h = (content_h + pad_y * 2.0).clamp(22.0, max_h).ceil();
 
         let dpi_scale = (display.dpi.max(96) as f32) / 96.0;
+        let snap_dip = |v: f32| -> f32 { (v * dpi_scale).round() / dpi_scale };
         let px_w = (dip_w * dpi_scale).round().max(1.0) as i32;
         let px_h = (dip_h * dpi_scale).round().max(1.0) as i32;
 
@@ -523,6 +608,7 @@ impl Renderer {
             bottom: px_h,
         };
         let dpi_f = display.dpi.max(96) as f32;
+        self.apply_text_rendering_params(hwnd, display.dpi.max(96));
         unsafe {
             self.dc_rt.SetDpi(dpi_f, dpi_f);
             self.dc_rt.BindDC(surface.hdc, &bind_rect).ok()?;
@@ -583,28 +669,61 @@ impl Renderer {
                     }
                 };
 
-            let top_y = ((dip_h - content_h) * 0.5).max(0.0);
-            let row2_y = top_y + row_h + row_gap;
+            let top_y = snap_dip(((dip_h - content_h) * 0.5).max(0.0));
+            let row2_y = snap_dip(top_y + row_h + row_gap);
+            let single_y = snap_dip(((dip_h - row_h) * 0.5).max(0.0));
 
             if has_net {
-                let x = pad_x;
-                if let Some(layout) = sent_layout {
-                    let _ = layout.SetMaxWidth(net_col_w);
+                let arrow_x = snap_dip(pad_x);
+                let val_x = snap_dip(pad_x + arrow_w + net_arrow_gap);
+                if let Some(layout) = up_layout {
+                    let _ = layout.SetMaxWidth(arrow_w);
                     let _ = layout.SetMaxHeight(row_h);
                     let _ = layout.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
                     self.dc_rt.DrawTextLayout(
-                        windows_numerics::Vector2 { X: x, Y: top_y },
+                        windows_numerics::Vector2 {
+                            X: arrow_x,
+                            Y: top_y,
+                        },
+                        &layout,
+                        &brush,
+                        D2D1_DRAW_TEXT_OPTIONS_NONE,
+                    );
+                }
+                if let Some(layout) = sent_layout {
+                    let _ = layout.SetMaxWidth(net_val_w);
+                    let _ = layout.SetMaxHeight(row_h);
+                    let _ = layout.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_TRAILING);
+                    self.dc_rt.DrawTextLayout(
+                        windows_numerics::Vector2 { X: val_x, Y: top_y },
+                        &layout,
+                        &brush,
+                        D2D1_DRAW_TEXT_OPTIONS_NONE,
+                    );
+                }
+                if let Some(layout) = down_layout {
+                    let _ = layout.SetMaxWidth(arrow_w);
+                    let _ = layout.SetMaxHeight(row_h);
+                    let _ = layout.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
+                    self.dc_rt.DrawTextLayout(
+                        windows_numerics::Vector2 {
+                            X: arrow_x,
+                            Y: row2_y,
+                        },
                         &layout,
                         &brush,
                         D2D1_DRAW_TEXT_OPTIONS_NONE,
                     );
                 }
                 if let Some(layout) = recv_layout {
-                    let _ = layout.SetMaxWidth(net_col_w);
+                    let _ = layout.SetMaxWidth(net_val_w);
                     let _ = layout.SetMaxHeight(row_h);
-                    let _ = layout.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
+                    let _ = layout.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_TRAILING);
                     self.dc_rt.DrawTextLayout(
-                        windows_numerics::Vector2 { X: x, Y: row2_y },
+                        windows_numerics::Vector2 {
+                            X: val_x,
+                            Y: row2_y,
+                        },
                         &layout,
                         &brush,
                         D2D1_DRAW_TEXT_OPTIONS_NONE,
@@ -613,41 +732,41 @@ impl Renderer {
             }
 
             if has_sys {
-                let x = pad_x + net_col_w + if has_net { col_gap } else { 0.0 };
-                match (cpu_layout, ram_layout) {
-                    (Some(cpu_l), Some(ram_l)) => {
-                        let _ = cpu_l.SetMaxWidth(sys_col_w);
-                        let _ = cpu_l.SetMaxHeight(row_h);
-                        let _ = cpu_l.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_TRAILING);
-                        self.dc_rt.DrawTextLayout(
-                            windows_numerics::Vector2 { X: x, Y: top_y },
-                            &cpu_l,
-                            &brush,
-                            D2D1_DRAW_TEXT_OPTIONS_NONE,
-                        );
-                        let _ = ram_l.SetMaxWidth(sys_col_w);
-                        let _ = ram_l.SetMaxHeight(row_h);
-                        let _ = ram_l.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_TRAILING);
-                        self.dc_rt.DrawTextLayout(
-                            windows_numerics::Vector2 { X: x, Y: row2_y },
-                            &ram_l,
-                            &brush,
-                            D2D1_DRAW_TEXT_OPTIONS_NONE,
-                        );
-                    }
-                    (Some(single), None) | (None, Some(single)) => {
-                        let single_y = ((dip_h - row_h) * 0.5).max(0.0);
-                        let _ = single.SetMaxWidth(sys_col_w);
-                        let _ = single.SetMaxHeight(row_h);
-                        let _ = single.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
-                        self.dc_rt.DrawTextLayout(
-                            windows_numerics::Vector2 { X: x, Y: single_y },
-                            &single,
-                            &brush,
-                            D2D1_DRAW_TEXT_OPTIONS_NONE,
-                        );
-                    }
-                    (None, None) => {}
+                let label_x = snap_dip(pad_x + net_col_w + if has_net { col_gap } else { 0.0 });
+                let val_x = snap_dip(label_x + sys_label_w + sys_label_gap);
+                let draw_sys_row =
+                    |lbl: Option<IDWriteTextLayout>, val: Option<IDWriteTextLayout>, y: f32| {
+                        if let Some(l) = lbl {
+                            let _ = l.SetMaxWidth(sys_label_w);
+                            let _ = l.SetMaxHeight(row_h);
+                            let _ = l.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
+                            self.dc_rt.DrawTextLayout(
+                                windows_numerics::Vector2 { X: label_x, Y: y },
+                                &l,
+                                &brush,
+                                D2D1_DRAW_TEXT_OPTIONS_NONE,
+                            );
+                        }
+                        if let Some(v) = val {
+                            let _ = v.SetMaxWidth(sys_val_w);
+                            let _ = v.SetMaxHeight(row_h);
+                            let _ = v.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_TRAILING);
+                            self.dc_rt.DrawTextLayout(
+                                windows_numerics::Vector2 { X: val_x, Y: y },
+                                &v,
+                                &brush,
+                                D2D1_DRAW_TEXT_OPTIONS_NONE,
+                            );
+                        }
+                    };
+
+                if has_cpu && has_ram {
+                    draw_sys_row(cpu_label_layout, cpu_val_layout, top_y);
+                    draw_sys_row(ram_label_layout, ram_val_layout, row2_y);
+                } else if has_cpu {
+                    draw_sys_row(cpu_label_layout, cpu_val_layout, single_y);
+                } else if has_ram {
+                    draw_sys_row(ram_label_layout, ram_val_layout, single_y);
                 }
             }
 
@@ -700,7 +819,8 @@ impl WindowCtx {
         if size_changed_or_needed {
             let max_dip_h = env.taskbar_rect.height() as f32 / (env.dpi.max(96) as f32 / 96.0);
             if let Some(renderer) = self.renderer.as_mut()
-                && let Some((w, h, src_dc)) = renderer.measure_and_render(&display, max_dip_h)
+                && let Some((w, h, src_dc)) =
+                    renderer.measure_and_render(&display, max_dip_h, Some(self.hwnd.0 as isize))
             {
                 self.last_display = Some(display);
                 self.last_size = (w, h);
@@ -902,41 +1022,31 @@ fn build_display(
     dpi: u32,
 ) -> RenderedDisplay {
     let (net_sent, net_recv, net_sample) = if config.show_network {
-        let up = format!(
-            "↑ {}",
-            format_taskbar_rate(
-                metrics.net_sent_bps,
-                config.net_unit_bits,
-                config.net_unit_mode
-            )
+        let up = format_taskbar_rate(
+            metrics.net_sent_bps,
+            config.net_unit_bits,
+            config.net_unit_mode,
         );
-        let down = format!(
-            "↓ {}",
-            format_taskbar_rate(
-                metrics.net_recv_bps,
-                config.net_unit_bits,
-                config.net_unit_mode
-            )
+        let down = format_taskbar_rate(
+            metrics.net_recv_bps,
+            config.net_unit_bits,
+            config.net_unit_mode,
         );
         let sample = match (config.net_unit_bits, config.net_unit_mode) {
-            (false, TaskbarNetUnit::FixedKB) => "↑ 999.9 KB/s",
-            (false, TaskbarNetUnit::FixedMB) => "↑ 99.99 MB/s",
-            (false, TaskbarNetUnit::Auto) => "↑ 999.9 KB/s",
-            (true, TaskbarNetUnit::FixedKB) => "↑ 999.9 Kbps",
-            (true, TaskbarNetUnit::FixedMB) => "↑ 99.99 Mbps",
-            (true, TaskbarNetUnit::Auto) => "↑ 999.9 Kbps",
+            (false, TaskbarNetUnit::FixedKB) | (false, TaskbarNetUnit::Auto) => "999.9 KB/s",
+            (false, TaskbarNetUnit::FixedMB) => "99.99 MB/s",
+            (true, TaskbarNetUnit::FixedKB) | (true, TaskbarNetUnit::Auto) => "999.9 Kbps",
+            (true, TaskbarNetUnit::FixedMB) => "99.99 Mbps",
         };
         (Some(up), Some(down), sample.to_string())
     } else {
         (None, None, String::new())
     };
 
-    let cpu = config
-        .show_cpu
-        .then(|| format!("CPU {}", format_taskbar_pct(metrics.cpu_pct)));
-    let ram = config
-        .show_ram
-        .then(|| format!("RAM {}", format_taskbar_pct(metrics.ram_pct)));
+    let cpu_label = config.show_cpu.then(|| "CPU".to_string());
+    let cpu_val = config.show_cpu.then(|| format_taskbar_pct(metrics.cpu_pct));
+    let ram_label = config.show_ram.then(|| "RAM".to_string());
+    let ram_val = config.show_ram.then(|| format_taskbar_pct(metrics.ram_pct));
 
     let text_rgb = match config.color_mode {
         TaskbarColorMode::Auto => {
@@ -950,12 +1060,15 @@ fn build_display(
     };
 
     RenderedDisplay {
+        show_net: config.show_network,
         net_sent,
         net_recv,
-        cpu,
-        ram,
         net_sample,
-        sys_sample: "RAM 100%".to_string(),
+        cpu_label,
+        cpu_val,
+        ram_label,
+        ram_val,
+        sys_val_sample: "100%".to_string(),
         font_family: config.font_family.clone(),
         font_size_pt: config.font_size,
         text_rgb,
@@ -1318,6 +1431,7 @@ fn taskbar_thread_main(
     callback: Arc<dyn Fn(Action) + Send + Sync>,
 ) {
     unsafe {
+        let _ = SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
         let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
     }
 
@@ -1520,7 +1634,7 @@ mod tests {
         };
         let display = build_display(&cfg, &metrics, false, false, 96);
         let (w, h, _hdc) = renderer
-            .measure_and_render(&display, 48.0)
+            .measure_and_render(&display, 48.0, None)
             .expect("rendered surface");
         assert!(w > 40 && h > 20, "unexpected widget size {w}x{h}");
 
@@ -1553,7 +1667,7 @@ mod tests {
 
         let hi_dpi = build_display(&cfg, &metrics, false, false, 144);
         let (hw, hh, _hdc2) = renderer
-            .measure_and_render(&hi_dpi, 48.0)
+            .measure_and_render(&hi_dpi, 48.0, None)
             .expect("hi-dpi rendered surface");
         assert!(hw > w && hh > h, "144 DPI should scale widget size");
         let hi_glyph_pixels = renderer
@@ -1570,6 +1684,61 @@ mod tests {
             hi_glyph_pixels >= 100,
             "expected >= 100 rendered glyph pixels at 144 DPI inside {hw}x{hh} bitmap, got {hi_glyph_pixels}"
         );
+        unsafe { CoUninitialize() };
+    }
+
+    #[test]
+    fn cpu_label_position_stays_fixed_across_digit_width_changes() {
+        let _ = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
+        let mut renderer = Renderer::new().expect("Direct2D/DirectWrite renderer");
+        let cfg = Config {
+            enabled: true,
+            show_cpu: true,
+            show_ram: false,
+            show_network: true,
+            ..Config::default()
+        };
+        let low_metrics = Metrics {
+            cpu_pct: Some(1.0),
+            ram_pct: None,
+            net_sent_bps: Some(0.0),
+            net_recv_bps: Some(0.0),
+        };
+        let high_metrics = Metrics {
+            cpu_pct: Some(100.0),
+            ram_pct: None,
+            net_sent_bps: Some(0.0),
+            net_recv_bps: Some(0.0),
+        };
+
+        let (w1, h1, _) = renderer
+            .measure_and_render(
+                &build_display(&cfg, &low_metrics, false, false, 96),
+                48.0,
+                None,
+            )
+            .expect("low load render");
+        let snap1 = renderer.surface.as_ref().unwrap().pixels().to_vec();
+
+        let (w2, h2, _) = renderer
+            .measure_and_render(
+                &build_display(&cfg, &high_metrics, false, false, 96),
+                48.0,
+                None,
+            )
+            .expect("high load render");
+        let snap2 = renderer.surface.as_ref().unwrap().pixels().to_vec();
+
+        assert_eq!((w1, h1), (w2, h2));
+
+        // Locate the first lit glyph pixel inside the right-hand CPU column (x >= w/2):
+        // that edge belongs to the "CPU" label and must not shift when "1%" becomes "100%".
+        let first_cpu_x = |buf: &[u8]| -> usize {
+            (w1 as usize / 2..w1 as usize)
+                .find(|&x| (0..h1 as usize).any(|y| buf[(y * w1 as usize + x) * 4 + 3] >= 64))
+                .expect("CPU label pixels present")
+        };
+        assert_eq!(first_cpu_x(&snap1), first_cpu_x(&snap2));
         unsafe { CoUninitialize() };
     }
 }
