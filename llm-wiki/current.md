@@ -1083,13 +1083,28 @@ rebase runbook.
   `SetParent` on Explorer's `Shell_TrayWnd` thread.
 - **Zero-cost fullscreen & auto-hide suppression:** Watches taskbar position,
   `SystemUsesLightTheme` (`WM_SETTINGCHANGE`), `TaskbarCreated`,
-  `RegisterShellHookWindow` (`HSHELL_RUDEAPPACTIVATED`, `HSHELL_WINDOWACTIVATED`),
+  `RegisterShellHookWindow` (`HSHELL_RUDEAPPACTIVATED`, `HSHELL_WINDOWACTIVATED`,
+  `HSHELL_WINDOWCREATED`/`DESTROYED`/`REPLACED`),
   `EVENT_SYSTEM_FOREGROUND`/`MINIMIZESTART..END`/`MOVESIZEEND`, and
   thread-scoped `SetWinEventHook` hooks on the active foreground thread and
-  `Shell_TrayWnd` thread (`EVENT_OBJECT_LOCATIONCHANGE`/`SHOW`..`REORDER`) with
-  `REFRESH_PENDING` coalescing so fullscreen/auto-hide transitions hide and
-  restore immediately and Z-order demotes atomically with `Shell_TrayWnd`
-  (staying below popups, context menus, and fullscreen windows).
+  `Shell_TrayWnd` thread (`EVENT_OBJECT_SHOW`..`EVENT_OBJECT_LOCATIONCHANGE`,
+  filtered to `OBJID_WINDOW` `SHOW`/`HIDE`/`LOCATIONCHANGE` on tray + `IsChild`
+  descendants plus `EVENT_OBJECT_REORDER`) with `REFRESH_PENDING` /
+  `LAYOUT_DIRTY` coalescing plus a 300 ms one-shot settle timer so
+  fullscreen/auto-hide transitions hide and restore immediately and Z-order
+  demotes atomically with `Shell_TrayWnd` (staying below popups, context menus,
+  and fullscreen windows).
+- **Automagic UIA collision-free placement:** Dedicated `"tm-taskbar-uia"` MTA +
+  Per-Monitor V2 thread queries visible interactive UIA elements under
+  `Shell_TrayWnd` in a single cached `FindAllBuildCache` RPC (`CUIAutomation8`
+  with 50 ms / 80 ms timeouts, `AutomationElementMode_None`, 80 ms burst
+  coalescing, sorted rect diff gating). `solve_taskbar_placement` projects
+  elements (ignoring `>= 60%` container frames) + `TrayNotifyWnd` into 1D
+  intervals, preferring `TrayAdjacent`, falling back with hysteresis to an
+  outer-edge-anchored `AlternateGap` (e.g. centered Win11 left space),
+  adapting to `compact = true` (`"C"`/`"R"` labels) when tight, cleanly hiding
+  via `SW_HIDE` if completely packed, and falling back to classic
+  `TrayNotifyWnd` positioning if UIA fails or returns empty.
 - **Tray keep-alive & engine decoupled updates:** While enabled, closing the
   main window hides TaskMan to the tray even if `close_to_tray` is off, and
   `tm-engine`'s notifier pushes `Metrics::from_snapshot` directly to the

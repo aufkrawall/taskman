@@ -2,7 +2,8 @@
 //!
 //! Renders CPU, RAM, and network rates directly into a 32-bit premultiplied
 //! ARGB DIB section and presents it via `UpdateLayeredWindow` (`ULW_ALPHA`)
-//! positioned beside `TrayNotifyWnd` on the primary Windows taskbar.
+//! automatically positioned inside the largest non-overlapping open region on
+//! the primary Windows taskbar (preferring the gap beside `TrayNotifyWnd`).
 //!
 //! Design invariants (avoiding DWM / Explorer interference):
 //! - **Zero screen reads:** never calls `GetDC(NULL)`, `GetPixel`, or `BitBlt`
@@ -14,11 +15,18 @@
 //! - **Zero GPU swapchain:** uses `D2D1_RENDER_TARGET_TYPE_SOFTWARE` into a
 //!   cached DIB section and only calls `UpdateLayeredWindow` when rendered
 //!   content, hover state, or DPI/geometry actually changes.
+//! - **Collision-free automagic placement:** queries visible taskbar buttons,
+//!   Widgets, and tray controls out-of-process via a dedicated MTA UI
+//!   Automation scanner thread (`FindAllBuildCache` with `AutomationElementMode_None`
+//!   and an 80 ms transaction timeout, triggered only on shell/tray layout
+//!   events), relocating across open taskbar gaps, compacting when tight, and
+//!   hiding cleanly if the taskbar is 100% full.
 //! - **Fullscreen-safe:** hides automatically when a fullscreen window covers
 //!   the taskbar monitor (preserving DWM Independent Flip / MPO and never
 //!   floating over games/videos) or when an auto-hide taskbar slides away.
 
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use tm_core::format::{format_taskbar_pct, format_taskbar_rate};
 use tm_core::settings::{TaskbarColorMode, TaskbarNetUnit};
@@ -50,10 +58,22 @@ use windows::Win32::Graphics::Gdi::{
     HGDIOBJ, HMONITOR, MONITOR_DEFAULTTONULL, MONITOR_DEFAULTTOPRIMARY, MONITORINFO,
     MonitorFromWindow, SelectObject,
 };
-use windows::Win32::System::Com::{COINIT_APARTMENTTHREADED, CoInitializeEx, CoUninitialize};
+use windows::Win32::System::Com::{
+    CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED, COINIT_MULTITHREADED, CoCreateInstance,
+    CoInitializeEx, CoUninitialize,
+};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Registry::{HKEY_CURRENT_USER, RRF_RT_REG_DWORD, RegGetValueW};
-use windows::Win32::UI::Accessibility::{HWINEVENTHOOK, SetWinEventHook, UnhookWinEvent};
+use windows::Win32::System::Variant::VARIANT;
+use windows::Win32::UI::Accessibility::{
+    AutomationElementMode_None, CUIAutomation, CUIAutomation8, HWINEVENTHOOK, IUIAutomation,
+    IUIAutomation2, IUIAutomationCacheRequest, IUIAutomationCondition, SetWinEventHook,
+    TreeScope_Descendants, TreeScope_Element, UIA_BoundingRectanglePropertyId,
+    UIA_ButtonControlTypeId, UIA_CheckBoxControlTypeId, UIA_ComboBoxControlTypeId,
+    UIA_ControlTypePropertyId, UIA_EditControlTypeId, UIA_IsOffscreenPropertyId,
+    UIA_ListItemControlTypeId, UIA_MenuItemControlTypeId, UIA_SplitButtonControlTypeId,
+    UnhookWinEvent,
+};
 use windows::Win32::UI::HiDpi::{
     DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, GetDpiForWindow, SetThreadDpiAwarenessContext,
 };
@@ -64,41 +84,44 @@ use windows::Win32::UI::Shell::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CS_DBLCLKS, CreatePopupMenu, CreateWindowExW, DeregisterShellHookWindow, DestroyMenu,
-    DestroyWindow, DispatchMessageW, EVENT_OBJECT_LOCATIONCHANGE, EVENT_OBJECT_REORDER,
-    EVENT_OBJECT_SHOW, EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_MINIMIZEEND,
+    DestroyWindow, DispatchMessageW, EVENT_OBJECT_HIDE, EVENT_OBJECT_LOCATIONCHANGE,
+    EVENT_OBJECT_REORDER, EVENT_OBJECT_SHOW, EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_MINIMIZEEND,
     EVENT_SYSTEM_MINIMIZESTART, EVENT_SYSTEM_MOVESIZEEND, FindWindowExW, FindWindowW, GW_HWNDPREV,
     GWL_EXSTYLE, GWLP_HWNDPARENT, GWLP_USERDATA, GetClassNameW, GetCursorPos, GetDesktopWindow,
     GetForegroundWindow, GetMessageW, GetShellWindow, GetWindow, GetWindowLongPtrW, GetWindowRect,
     GetWindowThreadProcessId, HMENU, HSHELL_WINDOWACTIVATED, HSHELL_WINDOWCREATED,
     HSHELL_WINDOWDESTROYED, HSHELL_WINDOWREPLACED, HWND_NOTOPMOST, HWND_TOPMOST, IDC_ARROW,
-    InsertMenuW, IsIconic, IsWindowVisible, LoadCursorW, MA_NOACTIVATE, MF_BYPOSITION,
-    MF_SEPARATOR, MF_STRING, MSG, OBJID_WINDOW, PostMessageW, PostQuitMessage, RegisterClassExW,
-    RegisterShellHookWindow, RegisterWindowMessageW, SW_HIDE, SW_SHOWNOACTIVATE, SWP_NOACTIVATE,
-    SWP_NOMOVE, SWP_NOOWNERZORDER, SWP_NOSENDCHANGING, SWP_NOSIZE, SWP_NOZORDER,
-    SetForegroundWindow, SetMenuDefaultItem, SetWindowLongPtrW, SetWindowPos, ShowWindow,
+    InsertMenuW, IsChild, IsIconic, IsWindowVisible, KillTimer, LoadCursorW, MA_NOACTIVATE,
+    MF_BYPOSITION, MF_SEPARATOR, MF_STRING, MSG, OBJID_WINDOW, PostMessageW, PostQuitMessage,
+    RegisterClassExW, RegisterShellHookWindow, RegisterWindowMessageW, SW_HIDE, SW_SHOWNOACTIVATE,
+    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOOWNERZORDER, SWP_NOSENDCHANGING, SWP_NOSIZE, SWP_NOZORDER,
+    SetForegroundWindow, SetMenuDefaultItem, SetTimer, SetWindowLongPtrW, SetWindowPos, ShowWindow,
     TPM_BOTTOMALIGN, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenuEx, TranslateMessage, ULW_ALPHA,
     UpdateLayeredWindow, WINEVENT_OUTOFCONTEXT, WINEVENT_SKIPOWNPROCESS, WM_APP, WM_CLOSE,
     WM_CREATE, WM_DESTROY, WM_DISPLAYCHANGE, WM_DPICHANGED, WM_LBUTTONUP, WM_MOUSEACTIVATE,
-    WM_MOUSEMOVE, WM_NULL, WM_RBUTTONUP, WM_SETTINGCHANGE, WNDCLASSEXW, WS_EX_LAYERED,
+    WM_MOUSEMOVE, WM_NULL, WM_RBUTTONUP, WM_SETTINGCHANGE, WM_TIMER, WNDCLASSEXW, WS_EX_LAYERED,
     WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
-use windows::core::{PCWSTR, w};
+use windows::core::{Interface, PCWSTR, w};
 
 use crate::taskbar_monitor::{Action, Config, Metrics};
 
 const WM_APP_REFRESH: u32 = WM_APP + 10;
 const WM_MOUSELEAVE: u32 = 0x02A3;
+const UIA_SETTLE_TIMER_ID: usize = 1;
+const UIA_SETTLE_DELAY_MS: u32 = 300;
 // `HSHELL_HIGHBIT | HSHELL_WINDOWACTIVATED`: Windows Shell notification fired
 // when a fullscreen / "rude" app enters or leaves fullscreen focus.
 const HSHELL_RUDEAPPACTIVATED_MSG: u32 = 0x8004;
 
-/// Global HWNDs and coalescing flag so WinEvent hooks (which carry no
+/// Global HWNDs and coalescing flags so WinEvent hooks (which carry no
 /// user-data pointer) can wake `"tm-taskbar"` immediately without flooding its
 /// message queue.
 static LIVE_HWND: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
 static LIVE_FG_HWND: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
 static LIVE_TRAY_HWND: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
 static REFRESH_PENDING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static LAYOUT_DIRTY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 fn post_refresh() {
     let raw = LIVE_HWND.load(std::sync::atomic::Ordering::Acquire);
@@ -265,6 +288,13 @@ impl PixelRect {
             && self.right >= other.right
             && self.bottom >= other.bottom
     }
+
+    fn intersects(self, other: Self) -> bool {
+        self.right > other.left
+            && self.left < other.right
+            && self.bottom > other.top
+            && self.top < other.bottom
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -284,6 +314,7 @@ struct RenderedDisplay {
     light_taskbar: bool,
     hovered: bool,
     dpi: u32,
+    compact: bool,
 }
 
 struct DibSurface {
@@ -486,12 +517,11 @@ impl Renderer {
         }
     }
 
-    fn measure_and_render(
-        &mut self,
+    fn measure_layout(
+        &self,
         display: &RenderedDisplay,
         max_taskbar_dip_h: f32,
-        hwnd: Option<isize>,
-    ) -> Option<(i32, i32, HDC)> {
+    ) -> Option<MeasuredLayout> {
         let _ = &self.d2d_factory;
         let fmt = self
             .create_text_format(&display.font_family, display.font_size_pt)
@@ -530,7 +560,11 @@ impl Renderer {
         } else {
             (0.0, 0.0, None)
         };
-        let net_arrow_gap = if has_net { 1.5 } else { 0.0 };
+        let net_arrow_gap = if has_net {
+            if display.compact { 1.0 } else { 1.5 }
+        } else {
+            0.0
+        };
         let net_val_w = if has_net {
             sent_w.max(recv_w).max(net_sample_w)
         } else {
@@ -564,7 +598,11 @@ impl Renderer {
             (0.0, 0.0, None)
         };
         let sys_label_w = if has_sys { cpu_lw.max(ram_lw) } else { 0.0 };
-        let sys_label_gap = if has_sys { 2.5 } else { 0.0 };
+        let sys_label_gap = if has_sys {
+            if display.compact { 1.5 } else { 2.5 }
+        } else {
+            0.0
+        };
         let sys_val_w = if has_sys {
             cpu_vw.max(ram_vw).max(sys_val_sample_w)
         } else {
@@ -595,8 +633,12 @@ impl Renderer {
         if two_rows && row_h * 2.0 + row_gap + 4.0 > max_h {
             row_gap = 0.0;
         }
-        let col_gap = if has_net && has_sys { 7.0 } else { 0.0 };
-        let pad_x = 6.0;
+        let col_gap = if has_net && has_sys {
+            if display.compact { 4.0 } else { 7.0 }
+        } else {
+            0.0
+        };
+        let pad_x = if display.compact { 3.0 } else { 6.0 };
         let content_h = if two_rows {
             row_h * 2.0 + row_gap
         } else {
@@ -607,10 +649,50 @@ impl Renderer {
         let dip_h = (content_h + pad_y * 2.0).clamp(22.0, max_h).ceil();
 
         let dpi_scale = (display.dpi.max(96) as f32) / 96.0;
-        let snap_dip = |v: f32| -> f32 { (v * dpi_scale).round() / dpi_scale };
         let px_w = (dip_w * dpi_scale).round().max(1.0) as i32;
         let px_h = (dip_h * dpi_scale).round().max(1.0) as i32;
 
+        Some(MeasuredLayout {
+            px_w,
+            px_h,
+            dip_w,
+            dip_h,
+            dpi_scale,
+            pad_x,
+            row_h,
+            row_gap,
+            content_h,
+            col_gap,
+            has_net,
+            has_sys,
+            has_cpu,
+            has_ram,
+            arrow_w,
+            net_arrow_gap,
+            net_val_w,
+            net_col_w,
+            sys_label_w,
+            sys_label_gap,
+            sys_val_w,
+            up_layout,
+            down_layout,
+            sent_layout,
+            recv_layout,
+            cpu_label_layout,
+            cpu_val_layout,
+            ram_label_layout,
+            ram_val_layout,
+        })
+    }
+
+    fn render_layout(
+        &mut self,
+        display: &RenderedDisplay,
+        layout: MeasuredLayout,
+        hwnd: Option<isize>,
+    ) -> Option<(i32, i32, HDC)> {
+        let px_w = layout.px_w;
+        let px_h = layout.px_h;
         let needs_alloc = self
             .surface
             .as_ref()
@@ -627,6 +709,7 @@ impl Renderer {
             bottom: px_h,
         };
         let dpi_f = display.dpi.max(96) as f32;
+        let snap_dip = |v: f32| -> f32 { (v * layout.dpi_scale).round() / layout.dpi_scale };
         self.apply_text_rendering_params(hwnd, display.dpi.max(96));
         unsafe {
             self.dc_rt.SetDpi(dpi_f, dpi_f);
@@ -663,8 +746,8 @@ impl Renderer {
                         rect: D2D_RECT_F {
                             left: 0.5,
                             top: 0.5,
-                            right: dip_w - 0.5,
-                            bottom: dip_h - 0.5,
+                            right: layout.dip_w - 0.5,
+                            bottom: layout.dip_h - 0.5,
                         },
                         radiusX: 4.0,
                         radiusY: 4.0,
@@ -688,104 +771,53 @@ impl Renderer {
                     }
                 };
 
-            let top_y = snap_dip(((dip_h - content_h) * 0.5).max(0.0));
-            let row2_y = snap_dip(top_y + row_h + row_gap);
-            let single_y = snap_dip(((dip_h - row_h) * 0.5).max(0.0));
+            let draw_text = |tl: Option<IDWriteTextLayout>, x: f32, y: f32, max_w: f32| {
+                if let Some(tl) = tl {
+                    let _ = tl.SetMaxWidth(max_w);
+                    let _ = tl.SetMaxHeight(layout.row_h);
+                    let _ = tl.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
+                    self.dc_rt.DrawTextLayout(
+                        windows_numerics::Vector2 { X: x, Y: y },
+                        &tl,
+                        &brush,
+                        D2D1_DRAW_TEXT_OPTIONS_NONE,
+                    );
+                }
+            };
 
-            if has_net {
-                let arrow_x = snap_dip(pad_x);
-                let val_x = snap_dip(pad_x + arrow_w + net_arrow_gap);
-                if let Some(layout) = up_layout {
-                    let _ = layout.SetMaxWidth(arrow_w);
-                    let _ = layout.SetMaxHeight(row_h);
-                    let _ = layout.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
-                    self.dc_rt.DrawTextLayout(
-                        windows_numerics::Vector2 {
-                            X: arrow_x,
-                            Y: top_y,
-                        },
-                        &layout,
-                        &brush,
-                        D2D1_DRAW_TEXT_OPTIONS_NONE,
-                    );
-                }
-                if let Some(layout) = sent_layout {
-                    let _ = layout.SetMaxWidth(net_val_w);
-                    let _ = layout.SetMaxHeight(row_h);
-                    let _ = layout.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
-                    self.dc_rt.DrawTextLayout(
-                        windows_numerics::Vector2 { X: val_x, Y: top_y },
-                        &layout,
-                        &brush,
-                        D2D1_DRAW_TEXT_OPTIONS_NONE,
-                    );
-                }
-                if let Some(layout) = down_layout {
-                    let _ = layout.SetMaxWidth(arrow_w);
-                    let _ = layout.SetMaxHeight(row_h);
-                    let _ = layout.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
-                    self.dc_rt.DrawTextLayout(
-                        windows_numerics::Vector2 {
-                            X: arrow_x,
-                            Y: row2_y,
-                        },
-                        &layout,
-                        &brush,
-                        D2D1_DRAW_TEXT_OPTIONS_NONE,
-                    );
-                }
-                if let Some(layout) = recv_layout {
-                    let _ = layout.SetMaxWidth(net_val_w);
-                    let _ = layout.SetMaxHeight(row_h);
-                    let _ = layout.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
-                    self.dc_rt.DrawTextLayout(
-                        windows_numerics::Vector2 {
-                            X: val_x,
-                            Y: row2_y,
-                        },
-                        &layout,
-                        &brush,
-                        D2D1_DRAW_TEXT_OPTIONS_NONE,
-                    );
-                }
+            let top_y = snap_dip(((layout.dip_h - layout.content_h) * 0.5).max(0.0));
+            let row2_y = snap_dip(top_y + layout.row_h + layout.row_gap);
+            let single_y = snap_dip(((layout.dip_h - layout.row_h) * 0.5).max(0.0));
+
+            if layout.has_net {
+                let arrow_x = snap_dip(layout.pad_x);
+                let val_x = snap_dip(layout.pad_x + layout.arrow_w + layout.net_arrow_gap);
+                draw_text(layout.up_layout, arrow_x, top_y, layout.arrow_w);
+                draw_text(layout.sent_layout, val_x, top_y, layout.net_val_w);
+                draw_text(layout.down_layout, arrow_x, row2_y, layout.arrow_w);
+                draw_text(layout.recv_layout, val_x, row2_y, layout.net_val_w);
             }
 
-            if has_sys {
-                let label_x = snap_dip(pad_x + net_col_w + if has_net { col_gap } else { 0.0 });
-                let val_x = snap_dip(label_x + sys_label_w + sys_label_gap);
+            if layout.has_sys {
+                let label_x = snap_dip(
+                    layout.pad_x
+                        + layout.net_col_w
+                        + if layout.has_net { layout.col_gap } else { 0.0 },
+                );
+                let val_x = snap_dip(label_x + layout.sys_label_w + layout.sys_label_gap);
                 let draw_sys_row =
                     |lbl: Option<IDWriteTextLayout>, val: Option<IDWriteTextLayout>, y: f32| {
-                        if let Some(l) = lbl {
-                            let _ = l.SetMaxWidth(sys_label_w);
-                            let _ = l.SetMaxHeight(row_h);
-                            let _ = l.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
-                            self.dc_rt.DrawTextLayout(
-                                windows_numerics::Vector2 { X: label_x, Y: y },
-                                &l,
-                                &brush,
-                                D2D1_DRAW_TEXT_OPTIONS_NONE,
-                            );
-                        }
-                        if let Some(v) = val {
-                            let _ = v.SetMaxWidth(sys_val_w);
-                            let _ = v.SetMaxHeight(row_h);
-                            let _ = v.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
-                            self.dc_rt.DrawTextLayout(
-                                windows_numerics::Vector2 { X: val_x, Y: y },
-                                &v,
-                                &brush,
-                                D2D1_DRAW_TEXT_OPTIONS_NONE,
-                            );
-                        }
+                        draw_text(lbl, label_x, y, layout.sys_label_w);
+                        draw_text(val, val_x, y, layout.sys_val_w);
                     };
 
-                if has_cpu && has_ram {
-                    draw_sys_row(cpu_label_layout, cpu_val_layout, top_y);
-                    draw_sys_row(ram_label_layout, ram_val_layout, row2_y);
-                } else if has_cpu {
-                    draw_sys_row(cpu_label_layout, cpu_val_layout, single_y);
-                } else if has_ram {
-                    draw_sys_row(ram_label_layout, ram_val_layout, single_y);
+                if layout.has_cpu && layout.has_ram {
+                    draw_sys_row(layout.cpu_label_layout, layout.cpu_val_layout, top_y);
+                    draw_sys_row(layout.ram_label_layout, layout.ram_val_layout, row2_y);
+                } else if layout.has_cpu {
+                    draw_sys_row(layout.cpu_label_layout, layout.cpu_val_layout, single_y);
+                } else if layout.has_ram {
+                    draw_sys_row(layout.ram_label_layout, layout.ram_val_layout, single_y);
                 }
             }
 
@@ -795,6 +827,49 @@ impl Renderer {
             Some((px_w, px_h, surface.hdc))
         }
     }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn measure_and_render(
+        &mut self,
+        display: &RenderedDisplay,
+        max_taskbar_dip_h: f32,
+        hwnd: Option<isize>,
+    ) -> Option<(i32, i32, HDC)> {
+        let layout = self.measure_layout(display, max_taskbar_dip_h)?;
+        self.render_layout(display, layout, hwnd)
+    }
+}
+
+struct MeasuredLayout {
+    px_w: i32,
+    px_h: i32,
+    dip_w: f32,
+    dip_h: f32,
+    dpi_scale: f32,
+    pad_x: f32,
+    row_h: f32,
+    row_gap: f32,
+    content_h: f32,
+    col_gap: f32,
+    has_net: bool,
+    has_sys: bool,
+    has_cpu: bool,
+    has_ram: bool,
+    arrow_w: f32,
+    net_arrow_gap: f32,
+    net_val_w: f32,
+    net_col_w: f32,
+    sys_label_w: f32,
+    sys_label_gap: f32,
+    sys_val_w: f32,
+    up_layout: Option<IDWriteTextLayout>,
+    down_layout: Option<IDWriteTextLayout>,
+    sent_layout: Option<IDWriteTextLayout>,
+    recv_layout: Option<IDWriteTextLayout>,
+    cpu_label_layout: Option<IDWriteTextLayout>,
+    cpu_val_layout: Option<IDWriteTextLayout>,
+    ram_label_layout: Option<IDWriteTextLayout>,
+    ram_val_layout: Option<IDWriteTextLayout>,
 }
 
 struct WindowCtx {
@@ -804,6 +879,7 @@ struct WindowCtx {
     shared: Arc<Mutex<SharedState>>,
     callback: Arc<dyn Fn(Action) + Send + Sync>,
     renderer: Option<Renderer>,
+    uia_scanner: Arc<UiaScanner>,
     light_taskbar: bool,
     hovered: bool,
     tracking_mouse: bool,
@@ -811,6 +887,10 @@ struct WindowCtx {
     last_size: (i32, i32),
     last_pos: Option<(i32, i32)>,
     last_visible: bool,
+    last_anchor_slot: Option<AnchorSlot>,
+    last_compact: bool,
+    last_env_geom: Option<(isize, PixelRect, Option<PixelRect>, u32)>,
+    pending_uia_scan: bool,
     msg_taskbar_created: u32,
     msg_shell_hook: u32,
     tracked_fg_tid: u32,
@@ -826,6 +906,20 @@ impl Drop for WindowCtx {
 }
 
 impl WindowCtx {
+    fn mark_layout_dirty(&mut self, arm_settle: bool) {
+        self.pending_uia_scan = true;
+        if arm_settle && !self.hwnd.0.is_null() {
+            unsafe {
+                let _ = SetTimer(
+                    Some(self.hwnd),
+                    UIA_SETTLE_TIMER_ID,
+                    UIA_SETTLE_DELAY_MS,
+                    None,
+                );
+            }
+        }
+    }
+
     fn unhook_dynamic_hooks(&mut self) {
         LIVE_FG_HWND.store(0, std::sync::atomic::Ordering::Release);
         LIVE_TRAY_HWND.store(0, std::sync::atomic::Ordering::Release);
@@ -948,6 +1042,8 @@ impl WindowCtx {
 
         let env = query_taskbar_env(self.hwnd);
         let Some(env) = env else {
+            self.last_env_geom = None;
+            self.pending_uia_scan = true;
             self.set_visible(false);
             return;
         };
@@ -955,69 +1051,131 @@ impl WindowCtx {
         self.sync_owner(env.tray_hwnd);
         self.sync_tray_hook(env.tray_hwnd);
 
-        let display = build_display(&config, &metrics, self.light_taskbar, self.hovered, env.dpi);
-        let size_changed_or_needed = force_render
-            || self.last_display.as_ref() != Some(&display)
-            || self.last_size == (0, 0);
-
-        if size_changed_or_needed {
-            let max_dip_h = env.taskbar_rect.height() as f32 / (env.dpi.max(96) as f32 / 96.0);
-            if let Some(renderer) = self.renderer.as_mut()
-                && let Some((w, h, src_dc)) =
-                    renderer.measure_and_render(&display, max_dip_h, Some(self.hwnd.0 as isize))
-            {
-                self.last_display = Some(display);
-                self.last_size = (w, h);
-
-                let pos = compute_widget_position(
-                    env.taskbar_rect,
-                    env.tray_notify_rect,
-                    env.monitor_rect,
-                    (w, h),
-                    env.dpi,
-                );
-                if let Some((x, y)) = pos {
-                    self.present_layered(x, y, w, h, src_dc);
-                    self.last_pos = Some((x, y));
-                    ensure_just_above_taskbar(self.hwnd, env.tray_hwnd, !self.last_visible);
-                    let _ = self.set_visible(true);
-                } else {
-                    self.set_visible(false);
-                }
-                return;
-            }
-            self.set_visible(false);
-            return;
+        let tray_raw = env.tray_hwnd.0 as isize;
+        let geom = (tray_raw, env.taskbar_rect, env.tray_notify_rect, env.dpi);
+        let geom_changed = self.last_env_geom != Some(geom);
+        if geom_changed {
+            self.last_env_geom = Some(geom);
+            self.pending_uia_scan = true;
         }
 
-        if self.last_size != (0, 0) {
-            if let Some((x, y)) = compute_widget_position(
+        let uia_occupied = self.uia_scanner.snapshot_for(tray_raw, env.taskbar_rect);
+        if self.pending_uia_scan || uia_occupied.is_none() {
+            self.pending_uia_scan = false;
+            self.uia_scanner.request_scan(tray_raw, env.taskbar_rect);
+        }
+
+        let max_dip_h = env.taskbar_rect.height() as f32 / (env.dpi.max(96) as f32 / 96.0);
+        let normal_display = build_display(
+            &config,
+            &metrics,
+            self.light_taskbar,
+            self.hovered,
+            env.dpi,
+            false,
+        );
+        let Some(renderer) = self.renderer.as_mut() else {
+            self.set_visible(false);
+            return;
+        };
+        let Some(normal_layout) = renderer.measure_layout(&normal_display, max_dip_h) else {
+            self.set_visible(false);
+            return;
+        };
+        let normal_size = (normal_layout.px_w, normal_layout.px_h);
+
+        let same_footprint = self.last_display.as_ref().is_some_and(|d| {
+            d.show_net == normal_display.show_net
+                && d.cpu_val.is_some() == normal_display.cpu_val.is_some()
+                && d.ram_val.is_some() == normal_display.ram_val.is_some()
+                && d.net_sample == normal_display.net_sample
+                && d.font_family == normal_display.font_family
+                && (d.font_size_pt - normal_display.font_size_pt).abs() < 0.01
+                && d.dpi == normal_display.dpi
+        });
+        let normal_placement = solve_taskbar_placement(
+            env.taskbar_rect,
+            env.tray_notify_rect,
+            uia_occupied.as_deref(),
+            normal_size,
+            env.dpi,
+            self.last_anchor_slot,
+            self.last_compact && same_footprint && !force_render,
+        );
+
+        let (display, layout, placement) = if let Some(placement) = normal_placement {
+            (normal_display, normal_layout, placement)
+        } else {
+            let compact_display = build_display(
+                &config,
+                &metrics,
+                self.light_taskbar,
+                self.hovered,
+                env.dpi,
+                true,
+            );
+            let Some(compact_layout) = renderer.measure_layout(&compact_display, max_dip_h) else {
+                self.set_visible(false);
+                return;
+            };
+            let compact_size = (compact_layout.px_w, compact_layout.px_h);
+            let Some(placement) = solve_taskbar_placement(
                 env.taskbar_rect,
                 env.tray_notify_rect,
-                env.monitor_rect,
-                self.last_size,
+                uia_occupied.as_deref(),
+                compact_size,
                 env.dpi,
-            ) {
-                if self.last_pos != Some((x, y)) {
-                    unsafe {
-                        let _ = SetWindowPos(
-                            self.hwnd,
-                            None,
-                            x,
-                            y,
-                            self.last_size.0,
-                            self.last_size.1,
-                            SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_NOSENDCHANGING,
-                        );
-                    }
-                    self.last_pos = Some((x, y));
-                }
+                self.last_anchor_slot,
+                false,
+            ) else {
+                // Taskbar is completely full even in compact form: step out of the way
+                // instead of overlapping taskbar buttons or stealing their clicks.
+                self.set_visible(false);
+                return;
+            };
+            (compact_display, compact_layout, placement)
+        };
+
+        self.last_anchor_slot = Some(placement.slot);
+        self.last_compact = display.compact;
+        let (w, h) = (layout.px_w, layout.px_h);
+        let (x, y) = placement.pos;
+        let needs_render = force_render
+            || self.last_display.as_ref() != Some(&display)
+            || self.last_size != (w, h);
+
+        if needs_render {
+            if let Some((rw, rh, src_dc)) =
+                renderer.render_layout(&display, layout, Some(self.hwnd.0 as isize))
+            {
+                self.last_display = Some(display);
+                self.last_size = (rw, rh);
+                self.present_layered(x, y, rw, rh, src_dc);
+                self.last_pos = Some((x, y));
                 ensure_just_above_taskbar(self.hwnd, env.tray_hwnd, !self.last_visible);
                 let _ = self.set_visible(true);
             } else {
                 self.set_visible(false);
             }
+            return;
         }
+
+        if self.last_pos != Some((x, y)) {
+            unsafe {
+                let _ = SetWindowPos(
+                    self.hwnd,
+                    None,
+                    x,
+                    y,
+                    w,
+                    h,
+                    SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_NOSENDCHANGING,
+                );
+            }
+            self.last_pos = Some((x, y));
+        }
+        ensure_just_above_taskbar(self.hwnd, env.tray_hwnd, !self.last_visible);
+        let _ = self.set_visible(true);
     }
 
     fn present_layered(&self, x: i32, y: i32, w: i32, h: i32, src_dc: HDC) {
@@ -1148,6 +1306,7 @@ fn build_display(
     light_taskbar: bool,
     hovered: bool,
     dpi: u32,
+    compact: bool,
 ) -> RenderedDisplay {
     let (net_sent, net_recv, net_sample) = if config.show_network {
         let up = format_taskbar_rate(
@@ -1171,9 +1330,13 @@ fn build_display(
         (None, None, String::new())
     };
 
-    let cpu_label = config.show_cpu.then(|| "CPU".to_string());
+    let cpu_label = config
+        .show_cpu
+        .then(|| if compact { "C" } else { "CPU" }.to_string());
     let cpu_val = config.show_cpu.then(|| format_taskbar_pct(metrics.cpu_pct));
-    let ram_label = config.show_ram.then(|| "RAM".to_string());
+    let ram_label = config
+        .show_ram
+        .then(|| if compact { "R" } else { "RAM" }.to_string());
     let ram_val = config.show_ram.then(|| format_taskbar_pct(metrics.ram_pct));
 
     let text_rgb = match config.color_mode {
@@ -1203,6 +1366,7 @@ fn build_display(
         light_taskbar,
         hovered,
         dpi,
+        compact,
     }
 }
 
@@ -1210,7 +1374,6 @@ struct TaskbarEnv {
     tray_hwnd: HWND,
     taskbar_rect: PixelRect,
     tray_notify_rect: Option<PixelRect>,
-    monitor_rect: PixelRect,
     dpi: u32,
 }
 
@@ -1261,7 +1424,6 @@ fn query_taskbar_env(own_hwnd: HWND) -> Option<TaskbarEnv> {
             tray_hwnd,
             taskbar_rect,
             tray_notify_rect,
-            monitor_rect,
             dpi: if dpi == 0 { 96 } else { dpi },
         })
     }
@@ -1373,6 +1535,520 @@ fn compute_widget_position(
             None => (taskbar_rect.bottom - h - gap).max(taskbar_rect.top + gap),
         };
         Some((x, y))
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AnchorSlot {
+    /// Positioned beside `TrayNotifyWnd` (stepped back past any adjacent XAML
+    /// controls such as Widgets or Copilot).
+    TrayAdjacent,
+    /// Positioned in an alternate open taskbar gap, anchored toward the
+    /// taskbar edge so centered icons growing/shrinking keep it stationary.
+    AlternateGap { anchor_to_end: bool },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PlacementResult {
+    pos: (i32, i32),
+    slot: AnchorSlot,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct Gap1D {
+    avail_start: i32,
+    avail_end: i32,
+    tray_adjacent: bool,
+    dist_to_tray: i32,
+}
+
+impl Gap1D {
+    fn avail_len(self) -> i32 {
+        self.avail_end - self.avail_start
+    }
+}
+
+/// Computes collision-free widget coordinates inside `taskbar_rect` from out-of-process
+/// UIA obstacle rectangles plus `tray_notify_rect`, preferring the tray-adjacent slot
+/// and falling back to an alternate open gap before reporting `None` (hide).
+/// When `uia_occupied` is `None` or empty, falls back to classic Win32 tray placement.
+fn solve_taskbar_placement(
+    taskbar_rect: PixelRect,
+    tray_notify_rect: Option<PixelRect>,
+    uia_occupied: Option<&[PixelRect]>,
+    widget_size: (i32, i32),
+    dpi: u32,
+    prev_slot: Option<AnchorSlot>,
+    prefer_keep_compact: bool,
+) -> Option<PlacementResult> {
+    let (w, h) = widget_size;
+    if w <= 0 || h <= 0 || taskbar_rect.is_empty() {
+        return None;
+    }
+
+    let Some(uia_rects) = uia_occupied.filter(|s| !s.is_empty()) else {
+        // Safety fallback: if UIA has not reported elements yet or Explorer UIA is
+        // unavailable/empty, keep the widget visible using TrayNotifyWnd geometry.
+        return compute_widget_position(
+            taskbar_rect,
+            tray_notify_rect,
+            taskbar_rect,
+            widget_size,
+            dpi,
+        )
+        .map(|pos| PlacementResult {
+            pos,
+            slot: AnchorSlot::TrayAdjacent,
+        });
+    };
+
+    let scale = dpi.max(96) as f32 / 96.0;
+    let gap = ((6.0 * scale).round() as i32).max(2);
+    let hysteresis = ((16.0 * scale).round() as i32).max(8);
+    let tray_adj_limit = (320.0 * scale).round() as i32;
+
+    let horizontal = taskbar_rect.width() >= taskbar_rect.height();
+    let project = |r: PixelRect| -> (i32, i32) {
+        if horizontal {
+            (r.left, r.right)
+        } else {
+            (r.top, r.bottom)
+        }
+    };
+    let (bar_start, bar_end) = project(taskbar_rect);
+    let (cross_pos, widget_len) = if horizontal {
+        (taskbar_rect.top + (taskbar_rect.height() - h) / 2, w)
+    } else {
+        (taskbar_rect.left + (taskbar_rect.width() - w) / 2, h)
+    };
+    let bar_len = bar_end - bar_start;
+    let req_len = if prefer_keep_compact {
+        widget_len + hysteresis
+    } else {
+        widget_len
+    };
+    if bar_len < req_len + 2 * gap {
+        return None;
+    }
+
+    let notify_span = tray_notify_rect
+        .filter(|n| n.intersects(taskbar_rect))
+        .map(project)
+        .map(|(s, e)| (s.max(bar_start), e.min(bar_end)))
+        .filter(|(s, e)| e > s);
+
+    // Filter out bogus container-sized UIA elements spanning most of the taskbar
+    // (e.g., XAML root composition bridges or toolbar frames).
+    let mut intervals: Vec<(i32, i32)> = uia_rects
+        .iter()
+        .copied()
+        .filter(|r| !r.is_empty() && r.intersects(taskbar_rect))
+        .filter_map(|r| {
+            let (raw_s, raw_e) = project(r);
+            let span = raw_e - raw_s;
+            if bar_len >= 400 && span >= bar_len * 60 / 100 {
+                return None;
+            }
+            let s = raw_s.max(bar_start);
+            let e = raw_e.min(bar_end);
+            (e > s).then_some((s, e))
+        })
+        .collect();
+    if let Some(ns) = notify_span {
+        intervals.push(ns);
+    }
+    if intervals.is_empty() {
+        return compute_widget_position(
+            taskbar_rect,
+            tray_notify_rect,
+            taskbar_rect,
+            widget_size,
+            dpi,
+        )
+        .map(|pos| PlacementResult {
+            pos,
+            slot: AnchorSlot::TrayAdjacent,
+        });
+    }
+
+    intervals.sort_unstable();
+    let mut merged: Vec<(i32, i32)> = Vec::with_capacity(intervals.len());
+    for (s, e) in intervals {
+        if let Some(last) = merged.last_mut()
+            && s <= last.1
+        {
+            last.1 = last.1.max(e);
+            continue;
+        }
+        merged.push((s, e));
+    }
+
+    let (tray_at_end, tray_edge) = match notify_span {
+        Some((ns, ne)) => {
+            if ns - bar_start >= bar_end - ne {
+                (true, ns)
+            } else {
+                (false, ne)
+            }
+        }
+        None => (true, bar_end),
+    };
+
+    let mut gaps = Vec::new();
+    let mut push_gap = |g_start: i32, g_end: i32| {
+        let avail_start = g_start + gap;
+        let avail_end = g_end - gap;
+        if avail_end - avail_start < req_len {
+            return;
+        }
+        let (on_main_side, dist_to_tray) = if tray_at_end {
+            (g_end <= tray_edge + 2, (tray_edge - g_end).max(0))
+        } else {
+            (g_start >= tray_edge - 2, (g_start - tray_edge).max(0))
+        };
+        if !on_main_side {
+            return;
+        }
+        gaps.push(Gap1D {
+            avail_start,
+            avail_end,
+            tray_adjacent: dist_to_tray <= tray_adj_limit,
+            dist_to_tray,
+        });
+    };
+
+    let mut cursor = bar_start;
+    for (s, e) in merged {
+        if s > cursor {
+            push_gap(cursor, s);
+        }
+        cursor = cursor.max(e);
+    }
+    if bar_end > cursor {
+        push_gap(cursor, bar_end);
+    }
+
+    if gaps.is_empty() {
+        return None;
+    }
+
+    let best_tray = gaps
+        .iter()
+        .copied()
+        .filter(|g| g.tray_adjacent)
+        .min_by_key(|g| (g.dist_to_tray, std::cmp::Reverse(g.avail_len())));
+    let best_alt = gaps
+        .iter()
+        .copied()
+        .filter(|g| !g.tray_adjacent)
+        .max_by_key(|g| g.avail_len());
+
+    let was_alt = matches!(prev_slot, Some(AnchorSlot::AlternateGap { .. }));
+    let (chosen, slot, anchor_to_end) = match (best_tray, best_alt) {
+        (Some(tray_g), Some(alt_g)) => {
+            // Require extra margin before leaving an alternate open gap back to
+            // the tray side so hover/animations at the threshold never oscillate.
+            if was_alt && tray_g.avail_len() < widget_len + hysteresis {
+                let end = (bar_end - alt_g.avail_end) < (alt_g.avail_start - bar_start);
+                (alt_g, AnchorSlot::AlternateGap { anchor_to_end: end }, end)
+            } else {
+                (tray_g, AnchorSlot::TrayAdjacent, tray_at_end)
+            }
+        }
+        (Some(tray_g), None) => (tray_g, AnchorSlot::TrayAdjacent, tray_at_end),
+        (None, Some(alt_g)) => {
+            let end = (bar_end - alt_g.avail_end) < (alt_g.avail_start - bar_start);
+            (alt_g, AnchorSlot::AlternateGap { anchor_to_end: end }, end)
+        }
+        (None, None) => return None,
+    };
+
+    let primary = if anchor_to_end {
+        chosen.avail_end - widget_len
+    } else {
+        chosen.avail_start
+    };
+    let pos = if horizontal {
+        (primary, cross_pos)
+    } else {
+        (cross_pos, primary)
+    };
+    Some(PlacementResult { pos, slot })
+}
+
+struct ComMtaGuard {
+    initialized: bool,
+}
+
+impl ComMtaGuard {
+    fn enter() -> Self {
+        let hr = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
+        Self {
+            initialized: hr.is_ok(),
+        }
+    }
+}
+
+impl Drop for ComMtaGuard {
+    fn drop(&mut self) {
+        if self.initialized {
+            unsafe { CoUninitialize() };
+        }
+    }
+}
+
+struct UiaSession {
+    uia: IUIAutomation,
+    condition: IUIAutomationCondition,
+    cache_request: IUIAutomationCacheRequest,
+}
+
+impl UiaSession {
+    fn new() -> windows::core::Result<Self> {
+        let uia: IUIAutomation = unsafe {
+            if let Ok(uia2) =
+                CoCreateInstance::<_, IUIAutomation2>(&CUIAutomation8, None, CLSCTX_INPROC_SERVER)
+            {
+                let _ = uia2.SetConnectionTimeout(50);
+                let _ = uia2.SetTransactionTimeout(80);
+                uia2.cast()?
+            } else {
+                CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER)?
+            }
+        };
+
+        let control_view = unsafe { uia.ControlViewCondition()? };
+        let not_offscreen = unsafe {
+            let v = VARIANT::from(false);
+            uia.CreatePropertyCondition(UIA_IsOffscreenPropertyId, &v)?
+        };
+        let control_types = [
+            UIA_ButtonControlTypeId,
+            UIA_SplitButtonControlTypeId,
+            UIA_CheckBoxControlTypeId,
+            UIA_MenuItemControlTypeId,
+            UIA_EditControlTypeId,
+            UIA_ComboBoxControlTypeId,
+            UIA_ListItemControlTypeId,
+        ];
+        let mut type_conds = Vec::with_capacity(control_types.len());
+        for ct in control_types {
+            let v = VARIANT::from(ct.0);
+            let c = unsafe { uia.CreatePropertyCondition(UIA_ControlTypePropertyId, &v)? };
+            type_conds.push(Some(c));
+        }
+        let or_types = unsafe { uia.CreateOrConditionFromNativeArray(&type_conds)? };
+        let visible_controls = unsafe { uia.CreateAndCondition(&control_view, &not_offscreen)? };
+        let condition = unsafe { uia.CreateAndCondition(&visible_controls, &or_types)? };
+
+        let cache_request = unsafe { uia.CreateCacheRequest()? };
+        unsafe {
+            cache_request.AddProperty(UIA_BoundingRectanglePropertyId)?;
+            cache_request.SetTreeScope(TreeScope_Element)?;
+            cache_request.SetAutomationElementMode(AutomationElementMode_None)?;
+        }
+
+        Ok(Self {
+            uia,
+            condition,
+            cache_request,
+        })
+    }
+
+    fn scan_tray(&self, tray_raw: isize) -> windows::core::Result<Vec<PixelRect>> {
+        let tray_hwnd = HWND(tray_raw as *mut std::ffi::c_void);
+        if tray_raw == 0
+            || !unsafe {
+                windows::Win32::UI::WindowsAndMessaging::IsWindow(Some(tray_hwnd)).as_bool()
+            }
+        {
+            return Ok(Vec::new());
+        }
+        let root = unsafe { self.uia.ElementFromHandle(tray_hwnd)? };
+        let found = unsafe {
+            root.FindAllBuildCache(TreeScope_Descendants, &self.condition, &self.cache_request)?
+        };
+        let len = unsafe { found.Length()? };
+        let mut rects = Vec::with_capacity(len.max(0) as usize);
+        for i in 0..len {
+            let Ok(elem) = (unsafe { found.GetElement(i) }) else {
+                continue;
+            };
+            let Ok(rc) = (unsafe { elem.CachedBoundingRectangle() }) else {
+                continue;
+            };
+            let px = PixelRect::from_win32(rc);
+            if !px.is_empty() {
+                rects.push(px);
+            }
+        }
+        rects.sort_unstable_by_key(|r| (r.left, r.top, r.right, r.bottom));
+        rects.dedup();
+        Ok(rects)
+    }
+}
+
+struct UiaCache {
+    tray_hwnd: isize,
+    taskbar_rect: PixelRect,
+    rects: Option<Vec<PixelRect>>,
+}
+
+struct UiaShared {
+    pending: Option<(isize, PixelRect)>,
+    cache: UiaCache,
+    shutdown: bool,
+}
+
+/// Scans `Shell_TrayWnd` UI Automation bounding rectangles on a dedicated MTA
+/// thread so cross-process UIA COM calls never pump messages or block `"tm-taskbar"`.
+struct UiaScanner {
+    state: Arc<(Mutex<UiaShared>, Condvar)>,
+    worker: Mutex<Option<std::thread::JoinHandle<()>>>,
+}
+
+impl UiaScanner {
+    fn start() -> Self {
+        let state = Arc::new((
+            Mutex::new(UiaShared {
+                pending: None,
+                cache: UiaCache {
+                    tray_hwnd: 0,
+                    taskbar_rect: PixelRect {
+                        left: 0,
+                        top: 0,
+                        right: 0,
+                        bottom: 0,
+                    },
+                    rects: None,
+                },
+                shutdown: false,
+            }),
+            Condvar::new(),
+        ));
+        let worker_state = state.clone();
+        let handle = std::thread::Builder::new()
+            .name("tm-taskbar-uia".to_string())
+            .spawn(move || uia_worker_main(worker_state))
+            .ok();
+        Self {
+            state,
+            worker: Mutex::new(handle),
+        }
+    }
+
+    fn snapshot_for(&self, tray_raw: isize, taskbar_rect: PixelRect) -> Option<Vec<PixelRect>> {
+        let guard = self.state.0.lock().unwrap_or_else(|e| e.into_inner());
+        if guard.cache.tray_hwnd == tray_raw && guard.cache.taskbar_rect == taskbar_rect {
+            guard.cache.rects.clone()
+        } else {
+            None
+        }
+    }
+
+    fn request_scan(&self, tray_raw: isize, taskbar_rect: PixelRect) {
+        if tray_raw == 0 || taskbar_rect.is_empty() {
+            return;
+        }
+        let mut guard = self.state.0.lock().unwrap_or_else(|e| e.into_inner());
+        if guard.shutdown {
+            return;
+        }
+        guard.pending = Some((tray_raw, taskbar_rect));
+        self.state.1.notify_one();
+    }
+
+    fn shutdown(&self) {
+        {
+            let mut guard = self.state.0.lock().unwrap_or_else(|e| e.into_inner());
+            guard.shutdown = true;
+            guard.pending = None;
+            self.state.1.notify_all();
+        }
+        if let Ok(mut slot) = self.worker.lock()
+            && let Some(handle) = slot.take()
+        {
+            let _ = handle.join();
+        }
+    }
+}
+
+impl Drop for UiaScanner {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
+fn uia_worker_main(state: Arc<(Mutex<UiaShared>, Condvar)>) {
+    unsafe {
+        let _ = SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+    }
+    let _com = ComMtaGuard::enter();
+    let min_interval = Duration::from_millis(80);
+    let mut session: Option<UiaSession> = None;
+    let mut last_scan: Option<Instant> = None;
+
+    loop {
+        let target = {
+            let mut guard = state.0.lock().unwrap_or_else(|e| e.into_inner());
+            loop {
+                if guard.shutdown {
+                    return;
+                }
+                if let Some(target) = guard.pending {
+                    if let Some(prev_at) = last_scan {
+                        let elapsed = prev_at.elapsed();
+                        if elapsed < min_interval {
+                            let (g, _) = state
+                                .1
+                                .wait_timeout(guard, min_interval - elapsed)
+                                .unwrap_or_else(|e| e.into_inner());
+                            guard = g;
+                            continue;
+                        }
+                    }
+                    guard.pending = None;
+                    break target;
+                }
+                guard = state.1.wait(guard).unwrap_or_else(|e| e.into_inner());
+            }
+        };
+
+        last_scan = Some(Instant::now());
+        if session.is_none() {
+            session = UiaSession::new().ok();
+        }
+        let result = match session.as_ref() {
+            Some(s) => match s.scan_tray(target.0) {
+                Ok(rects) => Ok(rects),
+                Err(_) => {
+                    session = None;
+                    Err(())
+                }
+            },
+            None => Err(()),
+        };
+
+        let mut changed = false;
+        if let Ok(rects) = result {
+            let next_rects = (!rects.is_empty()).then_some(rects);
+            let mut guard = state.0.lock().unwrap_or_else(|e| e.into_inner());
+            if !guard.shutdown {
+                let same_target =
+                    guard.cache.tray_hwnd == target.0 && guard.cache.taskbar_rect == target.1;
+                if next_rects.is_some() || !same_target {
+                    changed = !same_target || guard.cache.rects != next_rects;
+                    guard.cache = UiaCache {
+                        tray_hwnd: target.0,
+                        taskbar_rect: target.1,
+                        rects: next_rects,
+                    };
+                }
+            }
+        }
+        if changed {
+            post_refresh();
+        }
     }
 }
 
@@ -1491,13 +2167,16 @@ fn set_popup_menu_theme(dark: bool) {
 
 unsafe extern "system" fn fg_event_proc(
     _hook: HWINEVENTHOOK,
-    _event: u32,
+    event: u32,
     _hwnd: HWND,
     _id_object: i32,
     _id_child: i32,
     _id_event_thread: u32,
     _dwms_event_time: u32,
 ) {
+    if event == EVENT_SYSTEM_MOVESIZEEND {
+        LAYOUT_DIRTY.store(true, std::sync::atomic::Ordering::Release);
+    }
     post_refresh();
 }
 
@@ -1530,11 +2209,19 @@ unsafe extern "system" fn tray_event_proc(
     _dwms_event_time: u32,
 ) {
     let tray = LIVE_TRAY_HWND.load(std::sync::atomic::Ordering::Acquire);
-    if tray != 0
-        && !hwnd.0.is_null()
-        && hwnd.0 as isize == tray
-        && ((id_object == OBJID_WINDOW.0 && id_child == 0) || event == EVENT_OBJECT_REORDER)
-    {
+    if tray == 0 || hwnd.0.is_null() {
+        return;
+    }
+    let tray_hwnd = HWND(tray as *mut std::ffi::c_void);
+    let is_tray_or_child = hwnd.0 as isize == tray || unsafe { IsChild(tray_hwnd, hwnd).as_bool() };
+    let relevant_event = event == EVENT_OBJECT_REORDER
+        || (matches!(
+            event,
+            EVENT_OBJECT_SHOW | EVENT_OBJECT_HIDE | EVENT_OBJECT_LOCATIONCHANGE
+        ) && id_object == OBJID_WINDOW.0
+            && id_child == 0);
+    if is_tray_or_child && relevant_event {
+        LAYOUT_DIRTY.store(true, std::sync::atomic::Ordering::Release);
         post_refresh();
     }
 }
@@ -1582,17 +2269,18 @@ unsafe extern "system" fn wnd_proc(
     let ctx = unsafe { &mut *ptr };
 
     if ctx.msg_taskbar_created != 0 && msg == ctx.msg_taskbar_created {
+        ctx.mark_layout_dirty(true);
         ctx.refresh(true);
         return LRESULT(0);
     }
 
     if ctx.msg_shell_hook != 0 && msg == ctx.msg_shell_hook {
         match wparam.0 as u32 {
-            HSHELL_WINDOWCREATED
-            | HSHELL_WINDOWDESTROYED
-            | HSHELL_WINDOWACTIVATED
-            | HSHELL_RUDEAPPACTIVATED_MSG
-            | HSHELL_WINDOWREPLACED => {
+            HSHELL_WINDOWCREATED | HSHELL_WINDOWDESTROYED | HSHELL_WINDOWREPLACED => {
+                ctx.mark_layout_dirty(true);
+                ctx.refresh(false);
+            }
+            HSHELL_WINDOWACTIVATED | HSHELL_RUDEAPPACTIVATED_MSG => {
                 ctx.refresh(false);
             }
             _ => {}
@@ -1603,10 +2291,24 @@ unsafe extern "system" fn wnd_proc(
     match msg {
         WM_APP_REFRESH => {
             REFRESH_PENDING.store(false, std::sync::atomic::Ordering::Release);
+            if LAYOUT_DIRTY.swap(false, std::sync::atomic::Ordering::AcqRel) {
+                ctx.mark_layout_dirty(true);
+            }
             ctx.refresh(false);
             LRESULT(0)
         }
+        WM_TIMER => {
+            if wparam.0 == UIA_SETTLE_TIMER_ID {
+                unsafe {
+                    let _ = KillTimer(Some(hwnd), UIA_SETTLE_TIMER_ID);
+                }
+                ctx.mark_layout_dirty(false);
+                ctx.refresh(false);
+            }
+            LRESULT(0)
+        }
         WM_SETTINGCHANGE => {
+            ctx.mark_layout_dirty(true);
             let light = read_system_uses_light_theme();
             if light != ctx.light_taskbar {
                 ctx.light_taskbar = light;
@@ -1617,6 +2319,7 @@ unsafe extern "system" fn wnd_proc(
             LRESULT(0)
         }
         WM_DISPLAYCHANGE | WM_DPICHANGED => {
+            ctx.mark_layout_dirty(true);
             ctx.refresh(true);
             LRESULT(0)
         }
@@ -1658,6 +2361,7 @@ unsafe extern "system" fn wnd_proc(
         WM_CLOSE => {
             ctx.user_closing = true;
             unsafe {
+                let _ = KillTimer(Some(hwnd), UIA_SETTLE_TIMER_ID);
                 SetWindowLongPtrW(hwnd, GWLP_HWNDPARENT, 0);
                 let _ = DestroyWindow(hwnd);
             }
@@ -1700,6 +2404,8 @@ fn taskbar_thread_main(
 
     let msg_taskbar_created = unsafe { RegisterWindowMessageW(w!("TaskbarCreated")) };
     let msg_shell_hook = unsafe { RegisterWindowMessageW(w!("SHELLHOOK")) };
+    LAYOUT_DIRTY.store(false, std::sync::atomic::Ordering::Release);
+    let uia_scanner = Arc::new(UiaScanner::start());
 
     loop {
         let tray_owner = unsafe { FindWindowW(w!("Shell_TrayWnd"), None) }
@@ -1728,6 +2434,7 @@ fn taskbar_thread_main(
             shared: shared.clone(),
             callback: callback.clone(),
             renderer,
+            uia_scanner: uia_scanner.clone(),
             light_taskbar: read_system_uses_light_theme(),
             hovered: false,
             tracking_mouse: false,
@@ -1735,6 +2442,10 @@ fn taskbar_thread_main(
             last_size: (0, 0),
             last_pos: None,
             last_visible: false,
+            last_anchor_slot: None,
+            last_compact: false,
+            last_env_geom: None,
+            pending_uia_scan: true,
             msg_taskbar_created,
             msg_shell_hook,
             tracked_fg_tid: 0,
@@ -1854,6 +2565,7 @@ fn taskbar_thread_main(
         }
     }
 
+    uia_scanner.shutdown();
     unsafe { CoUninitialize() };
 }
 
@@ -1950,7 +2662,7 @@ mod tests {
             net_sent_bps: Some(12_300.0),
             net_recv_bps: Some(456_700.0),
         };
-        let display = build_display(&cfg, &metrics, false, false, 96);
+        let display = build_display(&cfg, &metrics, false, false, 96, false);
         let (w, h, _hdc) = renderer
             .measure_and_render(&display, 48.0, None)
             .expect("rendered surface");
@@ -1983,7 +2695,7 @@ mod tests {
             "expected >= 20 glyph pixels in all 4 quadrants of {w}x{h} bitmap, got {quadrants:?}"
         );
 
-        let hi_dpi = build_display(&cfg, &metrics, false, false, 144);
+        let hi_dpi = build_display(&cfg, &metrics, false, false, 144, false);
         let (hw, hh, _hdc2) = renderer
             .measure_and_render(&hi_dpi, 48.0, None)
             .expect("hi-dpi rendered surface");
@@ -2031,7 +2743,7 @@ mod tests {
 
         let (w1, h1, _) = renderer
             .measure_and_render(
-                &build_display(&cfg, &low_metrics, false, false, 96),
+                &build_display(&cfg, &low_metrics, false, false, 96, false),
                 48.0,
                 None,
             )
@@ -2040,7 +2752,7 @@ mod tests {
 
         let (w2, h2, _) = renderer
             .measure_and_render(
-                &build_display(&cfg, &high_metrics, false, false, 96),
+                &build_display(&cfg, &high_metrics, false, false, 96, false),
                 48.0,
                 None,
             )
@@ -2247,5 +2959,289 @@ mod tests {
             let _ = DestroyWindow(mock_fullscreen);
             let _ = DestroyWindow(mock_tray);
         }
+    }
+
+    fn rect(left: i32, top: i32, right: i32, bottom: i32) -> PixelRect {
+        PixelRect {
+            left,
+            top,
+            right,
+            bottom,
+        }
+    }
+
+    #[test]
+    fn placement_steps_past_xaml_tray_adjacent_controls() {
+        let taskbar = rect(0, 1032, 1920, 1080);
+        let notify = rect(1700, 1032, 1920, 1080);
+        // Win11 left-aligned: Start+Search+Apps occupy 0..480, Copilot sits right
+        // next to TrayNotifyWnd at 1640..1694.
+        let uia = [rect(0, 1032, 480, 1080), rect(1640, 1036, 1694, 1076)];
+        let res = solve_taskbar_placement(
+            taskbar,
+            Some(notify),
+            Some(&uia),
+            (150, 36),
+            96,
+            None,
+            false,
+        )
+        .expect("should fit left of Copilot");
+        assert_eq!(res.slot, AnchorSlot::TrayAdjacent);
+        assert_eq!(res.pos.0, 1640 - 150 - 6);
+        assert!(res.pos.0 + 150 <= 1640);
+    }
+
+    #[test]
+    fn placement_relocates_to_open_centered_left_gap_with_hysteresis() {
+        let taskbar = rect(0, 1032, 1920, 1080);
+        let notify = rect(1700, 1032, 1920, 1080);
+        let widgets = rect(8, 1036, 150, 1076);
+        let copilot = rect(1640, 1036, 1694, 1076);
+
+        // Right tray gap is 1640 - 1560 = 80px (too narrow for 150px widget),
+        // while left open gap between Widgets (150) and centered Start+Apps (600) is 450px.
+        let packed_right = [widgets, rect(600, 1034, 1560, 1078), copilot];
+        let alt = solve_taskbar_placement(
+            taskbar,
+            Some(notify),
+            Some(&packed_right),
+            (150, 36),
+            96,
+            Some(AnchorSlot::TrayAdjacent),
+            false,
+        )
+        .expect("should relocate to open left gap");
+        assert_eq!(
+            alt.slot,
+            AnchorSlot::AlternateGap {
+                anchor_to_end: false
+            }
+        );
+        assert_eq!(alt.pos.0, 150 + 6);
+
+        // Reopening right gap just above 150 + 2*6 = 162px (avail = 154px, < 150 + 16 hysteresis)
+        // must keep widget anchored on the left instead of oscillating.
+        let barely_open_right = [widgets, rect(600, 1034, 1474, 1078), copilot];
+        let stayed = solve_taskbar_placement(
+            taskbar,
+            Some(notify),
+            Some(&barely_open_right),
+            (150, 36),
+            96,
+            Some(alt.slot),
+            false,
+        )
+        .expect("should stay anchored in left gap within hysteresis band");
+        assert_eq!(stayed.slot, alt.slot);
+        assert_eq!(stayed.pos.0, 150 + 6);
+
+        // Once right gap clears hysteresis (1640 - 1440 - 12 = 188px >= 166px), move back right.
+        let wide_open_right = [widgets, rect(600, 1034, 1440, 1078), copilot];
+        let returned = solve_taskbar_placement(
+            taskbar,
+            Some(notify),
+            Some(&wide_open_right),
+            (150, 36),
+            96,
+            Some(stayed.slot),
+            false,
+        )
+        .expect("should return beside tray once ample space opens");
+        assert_eq!(returned.slot, AnchorSlot::TrayAdjacent);
+        assert_eq!(returned.pos.0, 1640 - 150 - 6);
+    }
+
+    #[test]
+    fn placement_adapts_compact_then_hides_when_packed_and_falls_back_without_uia() {
+        let taskbar = rect(0, 1032, 1920, 1080);
+        let notify = rect(1700, 1032, 1920, 1080);
+        let chunk_items = |start: i32, end: i32| -> Vec<PixelRect> {
+            let mut out = Vec::new();
+            let mut x = start;
+            while x < end {
+                let next = (x + 120).min(end);
+                out.push(rect(x, 1034, next, 1078));
+                x = next;
+            }
+            out
+        };
+
+        // Only 142px raw -> 130px usable: normal (150px) does not fit, compact (118px) does.
+        let tight = chunk_items(0, 1558);
+        assert!(
+            solve_taskbar_placement(
+                taskbar,
+                Some(notify),
+                Some(&tight),
+                (150, 36),
+                96,
+                None,
+                false,
+            )
+            .is_none()
+        );
+        let compact_res = solve_taskbar_placement(
+            taskbar,
+            Some(notify),
+            Some(&tight),
+            (118, 36),
+            96,
+            None,
+            false,
+        )
+        .expect("compact width should fit");
+        assert_eq!(compact_res.slot, AnchorSlot::TrayAdjacent);
+        assert_eq!(compact_res.pos, (1700 - 118 - 6, 1032 + (48 - 36) / 2));
+
+        // At 152px usable (>= 150 but < 150+16), prefer_keep_compact keeps compact active.
+        let borderline = chunk_items(0, 1536);
+        assert!(
+            solve_taskbar_placement(
+                taskbar,
+                Some(notify),
+                Some(&borderline),
+                (150, 36),
+                96,
+                Some(AnchorSlot::TrayAdjacent),
+                true,
+            )
+            .is_none()
+        );
+
+        // Packed end-to-end: clean None -> caller hides widget cleanly.
+        let completely_full = chunk_items(0, 1695);
+        assert!(
+            solve_taskbar_placement(
+                taskbar,
+                Some(notify),
+                Some(&completely_full),
+                (118, 36),
+                96,
+                None,
+                false,
+            )
+            .is_none()
+        );
+
+        // Missing/empty UIA falls back safely to TrayNotifyWnd placement instead of hiding.
+        for empty_uia in [None, Some(&[][..])] {
+            let fallback = solve_taskbar_placement(
+                taskbar,
+                Some(notify),
+                empty_uia,
+                (150, 36),
+                96,
+                None,
+                false,
+            )
+            .expect("missing UIA must never hide");
+            assert_eq!(fallback.pos, (1700 - 150 - 6, 1032 + (48 - 36) / 2));
+        }
+    }
+
+    #[test]
+    fn placement_ignores_container_rects_and_handles_negative_rtl_vertical() {
+        // Negative secondary/left monitor coords + bogus container-wide XAML bridge (>= 60%).
+        let neg_bar = rect(-1920, 1032, 0, 1080);
+        let neg_notify = rect(-220, 1032, 0, 1080);
+        let uia_with_container = [
+            rect(-1920, 1032, -220, 1080), // 1700/1920 = 88% bogus container bridge
+            rect(-1920, 1032, -1600, 1080),
+        ];
+        let neg_res = solve_taskbar_placement(
+            neg_bar,
+            Some(neg_notify),
+            Some(&uia_with_container),
+            (150, 36),
+            96,
+            None,
+            false,
+        )
+        .expect("bogus >=60% container rect must be ignored");
+        assert_eq!(neg_res.pos, (-220 - 150 - 6, 1032 + (48 - 36) / 2));
+
+        // RTL taskbar: tray on the left edge [0..220], apps on [900..1920].
+        let rtl_bar = rect(0, 1032, 1920, 1080);
+        let rtl_notify = rect(0, 1032, 220, 1080);
+        let rtl_uia = [rect(900, 1032, 1920, 1080)];
+        let rtl_res = solve_taskbar_placement(
+            rtl_bar,
+            Some(rtl_notify),
+            Some(&rtl_uia),
+            (150, 36),
+            96,
+            None,
+            false,
+        )
+        .expect("RTL tray-adjacent gap should fit");
+        assert_eq!(rtl_res.slot, AnchorSlot::TrayAdjacent);
+        assert_eq!(rtl_res.pos.0, 220 + 6);
+
+        // Vertical taskbar on right edge [1840..1920] x [0..1080], tray at bottom [880..1080].
+        let vert_bar = rect(1840, 0, 1920, 1080);
+        let vert_notify = rect(1840, 880, 1920, 1080);
+        let vert_uia = [rect(1840, 0, 1920, 420), rect(1840, 830, 1920, 880)];
+        let vert_res = solve_taskbar_placement(
+            vert_bar,
+            Some(vert_notify),
+            Some(&vert_uia),
+            (72, 38),
+            96,
+            None,
+            false,
+        )
+        .expect("vertical tray-adjacent gap above 830 should fit");
+        assert_eq!(vert_res.slot, AnchorSlot::TrayAdjacent);
+        assert_eq!(vert_res.pos.1, 830 - 38 - 6);
+    }
+
+    #[test]
+    fn compact_mode_renders_narrower_bitmap_with_all_quadrants_lit() {
+        let _ = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
+        let mut renderer = Renderer::new().expect("Direct2D/DirectWrite renderer");
+        let cfg = Config {
+            enabled: true,
+            show_cpu: true,
+            show_ram: true,
+            show_network: true,
+            ..Config::default()
+        };
+        let metrics = Metrics {
+            cpu_pct: Some(23.0),
+            ram_pct: Some(48.0),
+            net_sent_bps: Some(12_300.0),
+            net_recv_bps: Some(456_700.0),
+        };
+        let normal = build_display(&cfg, &metrics, false, false, 96, false);
+        let compact = build_display(&cfg, &metrics, false, false, 96, true);
+        let (nw, _nh, _) = renderer
+            .measure_and_render(&normal, 48.0, None)
+            .expect("normal render");
+        let (cw, ch, _) = renderer
+            .measure_and_render(&compact, 48.0, None)
+            .expect("compact render");
+        assert!(
+            cw < nw,
+            "compact widget width ({cw}) must be strictly narrower than normal ({nw})"
+        );
+        let pixels = renderer.surface.as_ref().unwrap().pixels();
+        let mut quadrants = [0usize; 4];
+        let half_w = (cw / 2) as usize;
+        let half_h = (ch / 2) as usize;
+        for y in 0..ch as usize {
+            for x in 0..cw as usize {
+                let idx = (y * cw as usize + x) * 4;
+                if pixels[idx + 3] >= 64 && pixels[idx + 2] >= 64 {
+                    let q = usize::from(y >= half_h) * 2 + usize::from(x >= half_w);
+                    quadrants[q] += 1;
+                }
+            }
+        }
+        assert!(
+            quadrants.iter().all(|&c| c >= 12),
+            "compact layout should render all 4 quadrants cleanly inside {cw}x{ch}, got {quadrants:?}"
+        );
+        unsafe { CoUninitialize() };
     }
 }
