@@ -1082,7 +1082,8 @@ rebase runbook.
   calls `GetDC(NULL)`/`GetPixel`/`BitBlt` and never uses cross-process
   `SetParent` on Explorer's `Shell_TrayWnd` thread.
 - **Zero-cost fullscreen & auto-hide suppression:** Watches taskbar position,
-  `SystemUsesLightTheme` (`WM_SETTINGCHANGE`), `TaskbarCreated`,
+  `SystemUsesLightTheme` + `ColorPrevalence`/`AccentColor` luminance
+  (`WM_SETTINGCHANGE`, `WM_DWMCOLORIZATIONCOLORCHANGED`), `TaskbarCreated`,
   `RegisterShellHookWindow` (`HSHELL_RUDEAPPACTIVATED`, `HSHELL_WINDOWACTIVATED`,
   `HSHELL_WINDOWCREATED`/`DESTROYED`/`REPLACED`),
   `EVENT_SYSTEM_FOREGROUND`/`MINIMIZESTART..END`/`MOVESIZEEND`, and
@@ -1104,9 +1105,12 @@ rebase runbook.
   elements (ignoring `>= 60%` container frames) + `TrayNotifyWnd` into 1D
   intervals, preferring `TrayAdjacent`, falling back with hysteresis to an
   outer-edge-anchored `AlternateGap` (e.g. centered Win11 left space),
-  adapting to `compact = true` (`"C"`/`"R"` labels) when tight, cleanly hiding
-  via `SW_HIDE` if completely packed, and falling back to classic
-  `TrayNotifyWnd` positioning if UIA fails or returns empty.
+  adapting to stacked vertical layout when a vertical bar's cross-axis width is
+  narrower than side-by-side columns (stepping down font size to `6.5` pt if
+  needed on short/narrow bars, rejecting cross-axis overflow), adapting to
+  `compact = true` (`"C"`/`"R"` labels) when tight, cleanly hiding via
+  `SW_HIDE` if completely packed, and falling back to classic `TrayNotifyWnd`
+  positioning if UIA fails or returns empty.
 - **Tray keep-alive & engine decoupled updates:** While enabled, closing the
   main window hides TaskMan to the tray even if `close_to_tray` is off, and
   `tm-engine`'s notifier pushes `Metrics::from_snapshot` directly to the

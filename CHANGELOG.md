@@ -4,6 +4,7 @@
 
 ### Fixed
 
+- **Taskbar monitor vertical, small-bar, and accent-color handling:** The Windows taskbar performance monitor now stacks network and CPU/RAM sections vertically when a left- or right-pinned vertical taskbar is narrower than side-by-side columns, steps down font size (down to `6.5` pt) when needed to fit short horizontal or narrow vertical taskbars without clipping or `clamp` panics, and hides cleanly rather than overflowing if the taskbar remains too narrow. In `Auto` color mode, contrast detection now also evaluates Windows `ColorPrevalence` and `DWM\AccentColor` luminance on `WM_SETTINGCHANGE` and `WM_DWMCOLORIZATIONCOLORCHANGED` so dark or light accent-colored taskbars get matching text contrast without screen pixel reads.
 - **Taskbar monitor visibility while holding Alt+Tab in fullscreen apps:** The Windows taskbar performance monitor no longer pops up while holding `Alt+Tab` over a fullscreen game or app when the taskbar itself remains hidden behind the fullscreen window. Visibility detection now checks Z-order for uncloaked, non-transparent fullscreen windows still sitting above `Shell_TrayWnd` even after the task switcher takes foreground focus, and non-topmost demotion keeps the widget anchored right above `Shell_TrayWnd`.
 
 ## 0.1.26 - 2026-11-14

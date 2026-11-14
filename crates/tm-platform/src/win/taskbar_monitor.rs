@@ -8,7 +8,8 @@
 //! Design invariants (avoiding DWM / Explorer interference):
 //! - **Zero screen reads:** never calls `GetDC(NULL)`, `GetPixel`, or `BitBlt`
 //!   from the screen DC (which causes DWM screen-capture fences). Taskbar
-//!   light/dark contrast comes from `SystemUsesLightTheme` + `WM_SETTINGCHANGE`.
+//!   light/dark contrast comes from `SystemUsesLightTheme` + `ColorPrevalence`
+//!   / `AccentColor` on `WM_SETTINGCHANGE` and `WM_DWMCOLORIZATIONCOLORCHANGED`.
 //! - **Zero cross-process `SetParent`:** runs as an independent `WS_EX_LAYERED |
 //!   WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE` popup owned by `Shell_TrayWnd` on its
 //!   own dedicated thread, never attaching to Explorer's Taskbar thread.
@@ -101,9 +102,10 @@ use windows::Win32::UI::WindowsAndMessaging::{
     SetForegroundWindow, SetMenuDefaultItem, SetTimer, SetWindowLongPtrW, SetWindowPos, ShowWindow,
     TPM_BOTTOMALIGN, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenuEx, TranslateMessage, ULW_ALPHA,
     UpdateLayeredWindow, WINEVENT_OUTOFCONTEXT, WINEVENT_SKIPOWNPROCESS, WM_APP, WM_CLOSE,
-    WM_CREATE, WM_DESTROY, WM_DISPLAYCHANGE, WM_DPICHANGED, WM_LBUTTONUP, WM_MOUSEACTIVATE,
-    WM_MOUSEMOVE, WM_NULL, WM_RBUTTONUP, WM_SETTINGCHANGE, WM_TIMER, WNDCLASSEXW, WS_EX_LAYERED,
-    WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
+    WM_CREATE, WM_DESTROY, WM_DISPLAYCHANGE, WM_DPICHANGED, WM_DWMCOLORIZATIONCOLORCHANGED,
+    WM_LBUTTONUP, WM_MOUSEACTIVATE, WM_MOUSEMOVE, WM_NULL, WM_RBUTTONUP, WM_SETTINGCHANGE,
+    WM_TIMER, WNDCLASSEXW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
+    WS_EX_TRANSPARENT, WS_POPUP,
 };
 use windows::core::{BOOL, Interface, PCWSTR, w};
 
@@ -113,9 +115,53 @@ const WM_APP_REFRESH: u32 = WM_APP + 10;
 const WM_MOUSELEAVE: u32 = 0x02A3;
 const UIA_SETTLE_TIMER_ID: usize = 1;
 const UIA_SETTLE_DELAY_MS: u32 = 300;
+const MIN_ADAPTIVE_FONT_PT: f32 = 6.5;
 // `HSHELL_HIGHBIT | HSHELL_WINDOWACTIVATED`: Windows Shell notification fired
 // when a fullscreen / "rude" app enters or leaves fullscreen focus.
 const HSHELL_RUDEAPPACTIVATED_MSG: u32 = 0x8004;
+
+#[derive(Clone, Copy, Debug)]
+struct LayoutBounds {
+    horizontal: bool,
+    max_dip_w: f32,
+    max_dip_h: f32,
+}
+
+impl LayoutBounds {
+    fn from_taskbar(taskbar_rect: PixelRect, dpi: u32) -> Self {
+        let scale = dpi.max(96) as f32 / 96.0;
+        Self {
+            horizontal: taskbar_rect.width() >= taskbar_rect.height(),
+            max_dip_w: taskbar_rect.width() as f32 / scale,
+            max_dip_h: taskbar_rect.height() as f32 / scale,
+        }
+    }
+
+    #[cfg(test)]
+    fn horizontal(max_dip_h: f32) -> Self {
+        Self {
+            horizontal: true,
+            max_dip_w: f32::INFINITY,
+            max_dip_h,
+        }
+    }
+
+    fn avail_dip_h(self) -> f32 {
+        if self.max_dip_h > 16.0 {
+            (self.max_dip_h - 4.0).max(12.0)
+        } else {
+            (self.max_dip_h - 2.0).max(1.0)
+        }
+    }
+}
+
+fn layout_fits_cross_axis(layout: &MeasuredLayout, bounds: LayoutBounds) -> bool {
+    if bounds.horizontal {
+        layout.content_h + 2.0 <= bounds.avail_dip_h()
+    } else {
+        layout.dip_w <= (bounds.max_dip_w - 2.0).max(1.0)
+    }
+}
 
 /// Global HWNDs and coalescing flags so WinEvent hooks (which carry no
 /// user-data pointer) can wake `"tm-taskbar"` immediately without flooding its
@@ -523,12 +569,46 @@ impl Renderer {
     fn measure_layout(
         &self,
         display: &RenderedDisplay,
-        max_taskbar_dip_h: f32,
+        bounds: LayoutBounds,
+    ) -> Option<MeasuredLayout> {
+        let mut best = self.measure_layout_at_size(display, display.font_size_pt, bounds)?;
+        if layout_fits_cross_axis(&best, bounds) || display.font_size_pt <= MIN_ADAPTIVE_FONT_PT {
+            return Some(best);
+        }
+
+        // Step down gently in 0.5 pt increments when a short horizontal bar or narrow
+        // vertical bar cannot fit the user's configured font size without clipping.
+        let mut size =
+            ((display.font_size_pt * 2.0).floor() / 2.0 - 0.5).min(display.font_size_pt - 0.25);
+        while size >= MIN_ADAPTIVE_FONT_PT {
+            if let Some(candidate) = self.measure_layout_at_size(display, size, bounds) {
+                let fits = layout_fits_cross_axis(&candidate, bounds);
+                best = candidate;
+                if fits {
+                    return Some(best);
+                }
+            }
+            size -= 0.5;
+        }
+        if (size + 0.5 - MIN_ADAPTIVE_FONT_PT).abs() > 0.05
+            && let Some(candidate) =
+                self.measure_layout_at_size(display, MIN_ADAPTIVE_FONT_PT, bounds)
+        {
+            best = candidate;
+        }
+        Some(best)
+    }
+
+    fn measure_layout_at_size(
+        &self,
+        display: &RenderedDisplay,
+        font_size_pt: f32,
+        bounds: LayoutBounds,
     ) -> Option<MeasuredLayout> {
         let _ = &self.d2d_factory;
         let fmt = self
-            .create_text_format(&display.font_family, display.font_size_pt)
-            .or_else(|| self.create_text_format("Segoe UI", display.font_size_pt))?;
+            .create_text_format(&display.font_family, font_size_pt)
+            .or_else(|| self.create_text_format("Segoe UI", font_size_pt))?;
 
         let has_net = display.show_net && display.net_sent.is_some() && display.net_recv.is_some();
         let has_cpu = display.cpu_label.is_some() && display.cpu_val.is_some();
@@ -625,31 +705,56 @@ impl Renderer {
             .max(arrow_h2)
             .max(cpu_lh)
             .max(ram_lh)
-            .max(12.0);
-        let two_rows = has_net || (has_cpu && has_ram);
-        let max_h = if max_taskbar_dip_h > 16.0 {
-            max_taskbar_dip_h - 4.0
-        } else {
-            44.0
-        };
-        let mut row_gap = if two_rows { 1.0 } else { 0.0 };
-        if two_rows && row_h * 2.0 + row_gap + 4.0 > max_h {
-            row_gap = 0.0;
-        }
+            .max(10.0);
+        let avail_h = bounds.avail_dip_h();
+        let pad_x = if display.compact { 3.0 } else { 6.0 };
         let col_gap = if has_net && has_sys {
             if display.compact { 4.0 } else { 7.0 }
         } else {
             0.0
         };
-        let pad_x = if display.compact { 3.0 } else { 6.0 };
-        let content_h = if two_rows {
+        let side_by_side_w = pad_x * 2.0 + net_col_w + col_gap + sys_col_w;
+        // On a vertical taskbar, stack Network above CPU/RAM when side-by-side
+        // columns exceed the bar's cross-axis width.
+        let stacked = !bounds.horizontal
+            && has_net
+            && has_sys
+            && side_by_side_w > (bounds.max_dip_w - 2.0).max(1.0);
+
+        let two_rows = has_net || (has_cpu && has_ram);
+        let mut row_gap = if two_rows { 1.0 } else { 0.0 };
+        if !stacked && two_rows && row_h * 2.0 + row_gap + 4.0 > avail_h {
+            row_gap = 0.0;
+        }
+        let section_gap = if stacked {
+            if display.compact { 2.0 } else { 3.0 }
+        } else {
+            0.0
+        };
+        let net_rows_h = if has_net { row_h * 2.0 + row_gap } else { 0.0 };
+        let sys_rows_h = if has_cpu && has_ram {
+            row_h * 2.0 + row_gap
+        } else if has_sys {
+            row_h
+        } else {
+            0.0
+        };
+        let content_h = if stacked {
+            net_rows_h + section_gap + sys_rows_h
+        } else if two_rows {
             row_h * 2.0 + row_gap
         } else {
             row_h
         };
-        let pad_y = ((max_h - content_h) * 0.5).clamp(1.0, 4.0);
-        let dip_w = (pad_x * 2.0 + net_col_w + col_gap + sys_col_w).ceil();
-        let dip_h = (content_h + pad_y * 2.0).clamp(22.0, max_h).ceil();
+        let content_w = if stacked {
+            net_col_w.max(sys_col_w)
+        } else {
+            net_col_w + col_gap + sys_col_w
+        };
+        let pad_y = ((avail_h - content_h) * 0.5).clamp(1.0, 4.0);
+        let dip_w = (pad_x * 2.0 + content_w).ceil();
+        let min_h = 22.0_f32.min(avail_h);
+        let dip_h = (content_h + pad_y * 2.0).clamp(min_h, avail_h).ceil();
 
         let dpi_scale = (display.dpi.max(96) as f32) / 96.0;
         let px_w = (dip_w * dpi_scale).round().max(1.0) as i32;
@@ -664,8 +769,10 @@ impl Renderer {
             pad_x,
             row_h,
             row_gap,
+            section_gap,
             content_h,
             col_gap,
+            stacked,
             has_net,
             has_sys,
             has_cpu,
@@ -802,11 +909,13 @@ impl Renderer {
             }
 
             if layout.has_sys {
-                let label_x = snap_dip(
+                let label_x = snap_dip(if layout.stacked {
+                    layout.pad_x
+                } else {
                     layout.pad_x
                         + layout.net_col_w
-                        + if layout.has_net { layout.col_gap } else { 0.0 },
-                );
+                        + if layout.has_net { layout.col_gap } else { 0.0 }
+                });
                 let val_x = snap_dip(label_x + layout.sys_label_w + layout.sys_label_gap);
                 let draw_sys_row =
                     |lbl: Option<IDWriteTextLayout>, val: Option<IDWriteTextLayout>, y: f32| {
@@ -814,13 +923,25 @@ impl Renderer {
                         draw_text(val, val_x, y, layout.sys_val_w);
                     };
 
+                let (sys_y1, sys_y2, sys_single_y) = if layout.stacked {
+                    let net_block_h = layout.row_h * 2.0 + layout.row_gap;
+                    let sys_top = snap_dip(top_y + net_block_h + layout.section_gap);
+                    (
+                        sys_top,
+                        snap_dip(sys_top + layout.row_h + layout.row_gap),
+                        sys_top,
+                    )
+                } else {
+                    (top_y, row2_y, single_y)
+                };
+
                 if layout.has_cpu && layout.has_ram {
-                    draw_sys_row(layout.cpu_label_layout, layout.cpu_val_layout, top_y);
-                    draw_sys_row(layout.ram_label_layout, layout.ram_val_layout, row2_y);
+                    draw_sys_row(layout.cpu_label_layout, layout.cpu_val_layout, sys_y1);
+                    draw_sys_row(layout.ram_label_layout, layout.ram_val_layout, sys_y2);
                 } else if layout.has_cpu {
-                    draw_sys_row(layout.cpu_label_layout, layout.cpu_val_layout, single_y);
+                    draw_sys_row(layout.cpu_label_layout, layout.cpu_val_layout, sys_single_y);
                 } else if layout.has_ram {
-                    draw_sys_row(layout.ram_label_layout, layout.ram_val_layout, single_y);
+                    draw_sys_row(layout.ram_label_layout, layout.ram_val_layout, sys_single_y);
                 }
             }
 
@@ -831,14 +952,24 @@ impl Renderer {
         }
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     fn measure_and_render(
         &mut self,
         display: &RenderedDisplay,
         max_taskbar_dip_h: f32,
         hwnd: Option<isize>,
     ) -> Option<(i32, i32, HDC)> {
-        let layout = self.measure_layout(display, max_taskbar_dip_h)?;
+        self.measure_and_render_in(display, LayoutBounds::horizontal(max_taskbar_dip_h), hwnd)
+    }
+
+    #[cfg(test)]
+    fn measure_and_render_in(
+        &mut self,
+        display: &RenderedDisplay,
+        bounds: LayoutBounds,
+        hwnd: Option<isize>,
+    ) -> Option<(i32, i32, HDC)> {
+        let layout = self.measure_layout(display, bounds)?;
         self.render_layout(display, layout, hwnd)
     }
 }
@@ -852,8 +983,10 @@ struct MeasuredLayout {
     pad_x: f32,
     row_h: f32,
     row_gap: f32,
+    section_gap: f32,
     content_h: f32,
     col_gap: f32,
+    stacked: bool,
     has_net: bool,
     has_sys: bool,
     has_cpu: bool,
@@ -892,6 +1025,7 @@ struct WindowCtx {
     last_visible: bool,
     last_anchor_slot: Option<AnchorSlot>,
     last_compact: bool,
+    last_stacked: bool,
     last_env_geom: Option<(isize, PixelRect, Option<PixelRect>, u32)>,
     pending_uia_scan: bool,
     msg_taskbar_created: u32,
@@ -1068,7 +1202,7 @@ impl WindowCtx {
             self.uia_scanner.request_scan(tray_raw, env.taskbar_rect);
         }
 
-        let max_dip_h = env.taskbar_rect.height() as f32 / (env.dpi.max(96) as f32 / 96.0);
+        let bounds = LayoutBounds::from_taskbar(env.taskbar_rect, env.dpi);
         let normal_display = build_display(
             &config,
             &metrics,
@@ -1081,14 +1215,16 @@ impl WindowCtx {
             self.set_visible(false);
             return;
         };
-        let Some(normal_layout) = renderer.measure_layout(&normal_display, max_dip_h) else {
+        let Some(normal_layout) = renderer.measure_layout(&normal_display, bounds) else {
             self.set_visible(false);
             return;
         };
         let normal_size = (normal_layout.px_w, normal_layout.px_h);
 
         let same_footprint = self.last_display.as_ref().is_some_and(|d| {
-            d.show_net == normal_display.show_net
+            !geom_changed
+                && self.last_stacked == normal_layout.stacked
+                && d.show_net == normal_display.show_net
                 && d.cpu_val.is_some() == normal_display.cpu_val.is_some()
                 && d.ram_val.is_some() == normal_display.ram_val.is_some()
                 && d.net_sample == normal_display.net_sample
@@ -1117,7 +1253,7 @@ impl WindowCtx {
                 env.dpi,
                 true,
             );
-            let Some(compact_layout) = renderer.measure_layout(&compact_display, max_dip_h) else {
+            let Some(compact_layout) = renderer.measure_layout(&compact_display, bounds) else {
                 self.set_visible(false);
                 return;
             };
@@ -1141,11 +1277,13 @@ impl WindowCtx {
 
         self.last_anchor_slot = Some(placement.slot);
         self.last_compact = display.compact;
+        let layout_stacked = layout.stacked;
         let (w, h) = (layout.px_w, layout.px_h);
         let (x, y) = placement.pos;
         let needs_render = force_render
             || self.last_display.as_ref() != Some(&display)
-            || self.last_size != (w, h);
+            || self.last_size != (w, h)
+            || self.last_stacked != layout_stacked;
 
         if needs_render {
             if let Some((rw, rh, src_dc)) =
@@ -1153,6 +1291,7 @@ impl WindowCtx {
             {
                 self.last_display = Some(display);
                 self.last_size = (rw, rh);
+                self.last_stacked = layout_stacked;
                 self.present_layered(x, y, rw, rh, src_dc);
                 self.last_pos = Some((x, y));
                 ensure_just_above_taskbar(self.hwnd, env.tray_hwnd, !self.last_visible);
@@ -1612,6 +1751,9 @@ fn compute_widget_position(
     if w <= 0 || h <= 0 || taskbar_rect.is_empty() {
         return None;
     }
+    if w > taskbar_rect.width() || h > taskbar_rect.height() {
+        return None;
+    }
     let gap = ((6.0 * (dpi.max(96) as f32 / 96.0)).round() as i32).max(2);
     if taskbar_rect.width() >= taskbar_rect.height() {
         let x = match tray_notify_rect {
@@ -1631,7 +1773,15 @@ fn compute_widget_position(
     } else {
         let x = taskbar_rect.left + (taskbar_rect.width() - w) / 2;
         let y = match tray_notify_rect {
-            Some(notify) => (notify.top - h - gap).max(taskbar_rect.top + gap),
+            Some(notify) => {
+                let top_space = notify.top - taskbar_rect.top;
+                let bottom_space = taskbar_rect.bottom - notify.bottom;
+                if top_space >= bottom_space {
+                    (notify.top - h - gap).max(taskbar_rect.top + gap)
+                } else {
+                    (notify.bottom + gap).min(taskbar_rect.bottom - h - gap)
+                }
+            }
             None => (taskbar_rect.bottom - h - gap).max(taskbar_rect.top + gap),
         };
         Some((x, y))
@@ -1716,11 +1866,24 @@ fn solve_taskbar_placement(
         }
     };
     let (bar_start, bar_end) = project(taskbar_rect);
-    let (cross_pos, widget_len) = if horizontal {
-        (taskbar_rect.top + (taskbar_rect.height() - h) / 2, w)
+    let (cross_pos, widget_len, cross_avail, widget_cross) = if horizontal {
+        (
+            taskbar_rect.top + (taskbar_rect.height() - h) / 2,
+            w,
+            taskbar_rect.height(),
+            h,
+        )
     } else {
-        (taskbar_rect.left + (taskbar_rect.width() - w) / 2, h)
+        (
+            taskbar_rect.left + (taskbar_rect.width() - w) / 2,
+            h,
+            taskbar_rect.width(),
+            w,
+        )
     };
+    if widget_cross > cross_avail {
+        return None;
+    }
     let bar_len = bar_end - bar_start;
     let req_len = if prefer_keep_compact {
         widget_len + hysteresis
@@ -2232,21 +2395,54 @@ fn ensure_just_above_taskbar(widget_hwnd: HWND, tray_hwnd: HWND, force_repositio
     }
 }
 
-fn read_system_uses_light_theme() -> bool {
+fn read_hkcu_dword(subkey: PCWSTR, value: PCWSTR) -> Option<u32> {
     let mut data: u32 = 0;
     let mut size = std::mem::size_of::<u32>() as u32;
     let rc = unsafe {
         RegGetValueW(
             HKEY_CURRENT_USER,
-            w!("Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize"),
-            w!("SystemUsesLightTheme"),
+            subkey,
+            value,
             RRF_RT_REG_DWORD,
             None,
             Some(&mut data as *mut u32 as *mut std::ffi::c_void),
             Some(&mut size),
         )
     };
-    rc.is_ok() && data != 0
+    rc.is_ok().then_some(data)
+}
+
+fn is_rgb_light([r, g, b]: [u8; 3]) -> bool {
+    // Matches Windows Shell's `IsColorLight` luminance threshold.
+    (5 * u32::from(g) + 2 * u32::from(r) + u32::from(b)) > 8 * 128
+}
+
+fn resolve_light_taskbar(
+    system_uses_light: bool,
+    color_prevalence: bool,
+    accent_rgb: Option<[u8; 3]>,
+) -> bool {
+    if color_prevalence && let Some(rgb) = accent_rgb {
+        return is_rgb_light(rgb);
+    }
+    system_uses_light
+}
+
+fn read_taskbar_is_light() -> bool {
+    let personalize = w!("Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize");
+    let dwm = w!("Software\\Microsoft\\Windows\\DWM");
+    let system_uses_light =
+        read_hkcu_dword(personalize, w!("SystemUsesLightTheme")).is_some_and(|v| v != 0);
+    let color_prevalence =
+        read_hkcu_dword(personalize, w!("ColorPrevalence")).is_some_and(|v| v != 0);
+    // `DWM\AccentColor` is stored as 0xAABBGGRR; `ColorizationColor` is 0xAARRGGBB.
+    let accent_rgb = read_hkcu_dword(dwm, w!("AccentColor"))
+        .map(|raw| [raw as u8, (raw >> 8) as u8, (raw >> 16) as u8])
+        .or_else(|| {
+            read_hkcu_dword(dwm, w!("ColorizationColor"))
+                .map(|raw| [(raw >> 16) as u8, (raw >> 8) as u8, raw as u8])
+        });
+    resolve_light_taskbar(system_uses_light, color_prevalence, accent_rgb)
 }
 
 fn set_popup_menu_theme(dark: bool) {
@@ -2380,6 +2576,7 @@ unsafe extern "system" fn wnd_proc(
     let ctx = unsafe { &mut *ptr };
 
     if ctx.msg_taskbar_created != 0 && msg == ctx.msg_taskbar_created {
+        ctx.light_taskbar = read_taskbar_is_light();
         ctx.mark_layout_dirty(true);
         ctx.refresh(true);
         return LRESULT(0);
@@ -2420,12 +2617,20 @@ unsafe extern "system" fn wnd_proc(
         }
         WM_SETTINGCHANGE => {
             ctx.mark_layout_dirty(true);
-            let light = read_system_uses_light_theme();
+            let light = read_taskbar_is_light();
             if light != ctx.light_taskbar {
                 ctx.light_taskbar = light;
                 ctx.refresh(true);
             } else {
                 ctx.refresh(false);
+            }
+            LRESULT(0)
+        }
+        WM_DWMCOLORIZATIONCOLORCHANGED => {
+            let light = read_taskbar_is_light();
+            if light != ctx.light_taskbar {
+                ctx.light_taskbar = light;
+                ctx.refresh(true);
             }
             LRESULT(0)
         }
@@ -2546,7 +2751,7 @@ fn taskbar_thread_main(
             callback: callback.clone(),
             renderer,
             uia_scanner: uia_scanner.clone(),
-            light_taskbar: read_system_uses_light_theme(),
+            light_taskbar: read_taskbar_is_light(),
             hovered: false,
             tracking_mouse: false,
             last_display: None,
@@ -2555,6 +2760,7 @@ fn taskbar_thread_main(
             last_visible: false,
             last_anchor_slot: None,
             last_compact: false,
+            last_stacked: false,
             last_env_geom: None,
             pending_uia_scan: true,
             msg_taskbar_created,
@@ -3527,5 +3733,137 @@ mod tests {
             "compact layout should render all 4 quadrants cleanly inside {cw}x{ch}, got {quadrants:?}"
         );
         unsafe { CoUninitialize() };
+    }
+
+    #[test]
+    fn vertical_taskbar_stacks_sections_to_fit_cross_axis_and_rejects_too_narrow() {
+        let _ = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
+        let mut renderer = Renderer::new().expect("Direct2D/DirectWrite renderer");
+        let cfg = Config {
+            enabled: true,
+            show_cpu: true,
+            show_ram: true,
+            show_network: true,
+            ..Config::default()
+        };
+        let metrics = Metrics {
+            cpu_pct: Some(23.0),
+            ram_pct: Some(48.0),
+            net_sent_bps: Some(12_300.0),
+            net_recv_bps: Some(456_700.0),
+        };
+        let display = build_display(&cfg, &metrics, false, false, 96, false);
+
+        let vert_bounds = LayoutBounds {
+            horizontal: false,
+            max_dip_w: 80.0,
+            max_dip_h: 1080.0,
+        };
+        let layout = renderer
+            .measure_layout(&display, vert_bounds)
+            .expect("vertical layout");
+        assert!(
+            layout.stacked,
+            "vertical 80px taskbar must stack Net above CPU/RAM"
+        );
+        assert!(
+            layout.px_w <= 80,
+            "stacked vertical width ({}) must fit inside 80px taskbar",
+            layout.px_w
+        );
+        let (vw, vh, _) = renderer
+            .render_layout(&display, layout, None)
+            .expect("vertical render");
+        let pixels = renderer.surface.as_ref().unwrap().pixels();
+        let top_lit = (0..(vh / 2) as usize)
+            .any(|y| (0..vw as usize).any(|x| pixels[(y * vw as usize + x) * 4 + 3] >= 64));
+        let bottom_lit = ((vh / 2) as usize..vh as usize)
+            .any(|y| (0..vw as usize).any(|x| pixels[(y * vw as usize + x) * 4 + 3] >= 64));
+        assert!(
+            top_lit && bottom_lit,
+            "stacked layout must render both top and bottom sections"
+        );
+
+        // Placement must reject a widget that still exceeds cross-axis taskbar width.
+        let narrow_bar = rect(0, 0, 50, 1080);
+        let narrow_notify = rect(0, 900, 50, 1080);
+        let narrow_uia = [rect(0, 0, 50, 300)];
+        assert_eq!(
+            solve_taskbar_placement(
+                narrow_bar,
+                Some(narrow_notify),
+                Some(&narrow_uia),
+                (vw, vh),
+                96,
+                None,
+                false,
+            ),
+            None,
+            "oversized widget must hide instead of overflowing left-pinned taskbar"
+        );
+        unsafe { CoUninitialize() };
+    }
+
+    #[test]
+    fn small_horizontal_taskbar_clamps_safely_without_panicking() {
+        let _ = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
+        let mut renderer = Renderer::new().expect("Direct2D/DirectWrite renderer");
+        let cfg = Config {
+            enabled: true,
+            show_cpu: true,
+            show_ram: true,
+            show_network: true,
+            font_size: 12.0,
+            ..Config::default()
+        };
+        let metrics = Metrics {
+            cpu_pct: Some(15.0),
+            ram_pct: Some(50.0),
+            net_sent_bps: Some(1_024.0),
+            net_recv_bps: Some(2_048.0),
+        };
+        let display = build_display(&cfg, &metrics, false, false, 96, false);
+
+        // Previously panicked when max_dip_h in (16.0, 26.0) made max_h < 22.0 in clamp(22.0, max_h).
+        let tiny_bounds = LayoutBounds::horizontal(20.0);
+        let (tw, th, _) = renderer
+            .measure_and_render_in(&display, tiny_bounds, None)
+            .expect("tiny horizontal taskbar must not panic");
+        assert!(tw > 0 && th <= 20, "tiny bar height {th} must stay <= 20px");
+
+        // Windows 10 small taskbar (~30 DIPs): larger configured font steps down to fit cleanly.
+        let small_bounds = LayoutBounds::horizontal(30.0);
+        let small_layout = renderer
+            .measure_layout(&display, small_bounds)
+            .expect("small taskbar layout");
+        assert!(
+            small_layout.px_h <= 30 && small_layout.content_h <= small_layout.dip_h,
+            "small taskbar layout {}x{} (content_h={}) must fit 30px height",
+            small_layout.px_w,
+            small_layout.px_h,
+            small_layout.content_h
+        );
+        unsafe { CoUninitialize() };
+    }
+
+    #[test]
+    fn light_taskbar_contrast_respects_color_prevalence_and_accent_luminance() {
+        // Without ColorPrevalence, SystemUsesLightTheme drives light/dark contrast.
+        assert!(resolve_light_taskbar(true, false, Some([0, 120, 212])));
+        assert!(!resolve_light_taskbar(false, false, Some([255, 210, 0])));
+
+        // With ColorPrevalence enabled, accent color luminance overrides SystemUsesLightTheme.
+        assert!(
+            !resolve_light_taskbar(true, true, Some([0, 120, 212])),
+            "dark blue accent taskbar needs white text even when SystemUsesLightTheme is true"
+        );
+        assert!(
+            resolve_light_taskbar(false, true, Some([255, 185, 0])),
+            "bright yellow accent taskbar needs dark text even when SystemUsesLightTheme is false"
+        );
+
+        // Missing accent value falls back safely to SystemUsesLightTheme.
+        assert!(resolve_light_taskbar(true, true, None));
+        assert!(!resolve_light_taskbar(false, true, None));
     }
 }
