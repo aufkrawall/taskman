@@ -1170,6 +1170,32 @@ keys! {
 
     // ------------------------------------------------ window title
     WindowTitle => ["Task-Manager", "Task Manager"],
+
+    // ------------------------------------------------ taskbar monitor
+    TaskbarMonitorHeading => ["Taskleisten-Monitor", "Taskbar monitor"],
+    TaskbarMonitorEnable => [
+        "Auslastung in der Taskleiste anzeigen",
+        "Show performance in taskbar",
+    ],
+    TaskbarMonitorHint => [
+        "Zeigt CPU, RAM und Netzwerk neben dem Infobereich. Solange aktiv, bleibt TaskMan beim Schließen im Infobereich.",
+        "Displays CPU, RAM, and network next to the system tray. While active, closing the window keeps TaskMan in the tray.",
+    ],
+    TaskbarMetricsLabel => ["Angezeigte Werte:", "Displayed metrics:"],
+    TaskbarMetricCpu => ["CPU", "CPU"],
+    TaskbarMetricRam => ["RAM", "RAM"],
+    TaskbarMetricNetwork => ["Netzwerk", "Network"],
+    TaskbarFontFamilyLabel => ["Schriftart:", "Font:"],
+    TaskbarFontSizeLabel => ["Schriftgröße:", "Font size:"],
+    TaskbarNetUnitLabel => ["Netzwerkeinheit:", "Network unit:"],
+    TaskbarUnitAuto => ["Automatisch", "Auto"],
+    TaskbarNetUnitBits => [
+        "Netzwerkrate in Bit/s statt Byte/s",
+        "Show network speed in bits/s instead of Bytes/s",
+    ],
+    TaskbarColorLabel => ["Textfarbe:", "Text color:"],
+    TaskbarColorAuto => ["Automatisch (Taskleiste)", "Auto (taskbar theme)"],
+    TaskbarColorCustom => ["Benutzerdefiniert", "Custom"],
 }
 
 /// Unit words that follow the UI language (used by the formatters).

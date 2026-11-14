@@ -346,3 +346,185 @@ pub mod text_rendering {
         }
     }
 }
+
+/// Windows taskbar performance monitor (`UpdateLayeredWindow` + software Direct2D).
+/// Non-Windows hosts expose a zero-cost stub so callers stay cross-platform.
+pub mod taskbar_monitor {
+    #[cfg(not(target_os = "windows"))]
+    use std::sync::Arc;
+    use tm_core::settings::{Settings, TaskbarColorMode, TaskbarNetUnit};
+
+    #[derive(Debug, Clone, PartialEq)]
+    pub struct Config {
+        pub enabled: bool,
+        pub show_cpu: bool,
+        pub show_ram: bool,
+        pub show_network: bool,
+        pub font_family: String,
+        pub font_size: f32,
+        pub net_unit_bits: bool,
+        pub net_unit_mode: TaskbarNetUnit,
+        pub color_mode: TaskbarColorMode,
+        pub custom_color: [u8; 3],
+        pub menu_open_label: String,
+        pub menu_settings_label: String,
+        pub menu_exit_label: String,
+        pub menu_dark: bool,
+    }
+
+    impl Default for Config {
+        fn default() -> Self {
+            Self {
+                enabled: false,
+                show_cpu: true,
+                show_ram: true,
+                show_network: true,
+                font_family: "Segoe UI".into(),
+                font_size: 9.0,
+                net_unit_bits: false,
+                net_unit_mode: TaskbarNetUnit::Auto,
+                color_mode: TaskbarColorMode::Auto,
+                custom_color: [255, 255, 255],
+                menu_open_label: "Task Manager".into(),
+                menu_settings_label: "Settings".into(),
+                menu_exit_label: "Exit".into(),
+                menu_dark: true,
+            }
+        }
+    }
+
+    impl Config {
+        pub fn from_settings(
+            s: &Settings,
+            menu_open_label: String,
+            menu_settings_label: String,
+            menu_exit_label: String,
+            menu_dark: bool,
+        ) -> Self {
+            Self {
+                enabled: s.taskbar_monitor_enabled,
+                show_cpu: s.taskbar_show_cpu,
+                show_ram: s.taskbar_show_ram,
+                show_network: s.taskbar_show_network,
+                font_family: s.taskbar_font_family.clone(),
+                font_size: s.taskbar_font_size,
+                net_unit_bits: s.taskbar_net_unit_bits,
+                net_unit_mode: s.taskbar_net_unit_mode,
+                color_mode: s.taskbar_color_mode,
+                custom_color: s.taskbar_custom_color,
+                menu_open_label,
+                menu_settings_label,
+                menu_exit_label,
+                menu_dark,
+            }
+        }
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Default)]
+    pub struct Metrics {
+        pub cpu_pct: Option<f32>,
+        pub ram_pct: Option<f32>,
+        pub net_sent_bps: Option<f64>,
+        pub net_recv_bps: Option<f64>,
+    }
+
+    impl Metrics {
+        pub fn from_snapshot(snap: &tm_core::model::Snapshot) -> Self {
+            let ram_pct = if snap.memory.total_bytes > 0 {
+                Some(
+                    (snap.memory.used_bytes as f64 / snap.memory.total_bytes as f64 * 100.0) as f32,
+                )
+            } else {
+                None
+            };
+            let mut has_net = false;
+            let mut sent = 0.0f64;
+            let mut recv = 0.0f64;
+            for n in &snap.networks {
+                if n.kind == "Loopback" {
+                    continue;
+                }
+                has_net = true;
+                sent += n.sent_bps;
+                recv += n.recv_bps;
+            }
+            Self {
+                cpu_pct: Some(snap.cpu.utilization_pct),
+                ram_pct,
+                net_sent_bps: has_net.then_some(sent),
+                net_recv_bps: has_net.then_some(recv),
+            }
+        }
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum Action {
+        OpenMain,
+        OpenSettings,
+        Exit,
+    }
+
+    #[cfg(target_os = "windows")]
+    pub use crate::win::taskbar_monitor::TaskbarMonitorHandle;
+
+    #[cfg(not(target_os = "windows"))]
+    pub struct TaskbarMonitorHandle;
+
+    #[cfg(not(target_os = "windows"))]
+    impl TaskbarMonitorHandle {
+        pub fn new(_callback: Arc<dyn Fn(Action) + Send + Sync>) -> Self {
+            Self
+        }
+        pub fn set_config(&self, _config: Config) {}
+        pub fn update_metrics(&self, _metrics: Metrics) {}
+        pub fn shutdown(&self) {}
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use tm_core::model::{NetworkInfo, Snapshot};
+
+        #[test]
+        fn metrics_from_snapshot_excludes_loopback_and_handles_missing_ram() {
+            let mut snap = Snapshot::default();
+            snap.cpu.utilization_pct = 24.5;
+            snap.memory.total_bytes = 0;
+            snap.networks.push(NetworkInfo {
+                name: "lo".into(),
+                kind: "Loopback".into(),
+                recv_bps: 99_999.0,
+                sent_bps: 99_999.0,
+                ..Default::default()
+            });
+
+            let m = Metrics::from_snapshot(&snap);
+            assert_eq!(m.cpu_pct, Some(24.5));
+            assert_eq!(m.ram_pct, None);
+            assert_eq!(m.net_recv_bps, None);
+            assert_eq!(m.net_sent_bps, None);
+
+            snap.memory.total_bytes = 1000;
+            snap.memory.used_bytes = 400;
+            snap.networks.push(NetworkInfo {
+                name: "eth0".into(),
+                kind: "Ethernet".into(),
+                recv_bps: 1200.0,
+                sent_bps: 300.0,
+                ..Default::default()
+            });
+            snap.networks.push(NetworkInfo {
+                name: "wlan0".into(),
+                kind: "Wi-Fi".into(),
+                recv_bps: 800.0,
+                sent_bps: 200.0,
+                ..Default::default()
+            });
+
+            let m2 = Metrics::from_snapshot(&snap);
+            assert_eq!(m2.ram_pct, Some(40.0));
+            assert_eq!(m2.net_recv_bps, Some(2000.0));
+            assert_eq!(m2.net_sent_bps, Some(500.0));
+        }
+    }
+}

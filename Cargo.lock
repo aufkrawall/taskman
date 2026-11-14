@@ -3559,6 +3559,7 @@ dependencies = [
  "tm-core",
  "tracing",
  "windows",
+ "windows-numerics",
  "windows-service",
 ]
 

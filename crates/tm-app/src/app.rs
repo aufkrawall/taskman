@@ -489,6 +489,9 @@ pub struct TaskManApp {
     advanced_state_last_refresh: Option<std::time::Instant>,
     #[cfg(target_os = "windows")]
     pub core_service_change_inflight: Arc<AtomicBool>,
+    taskbar_monitor: Arc<tm_platform::taskbar_monitor::TaskbarMonitorHandle>,
+    taskbar_config_applied: Option<tm_platform::taskbar_monitor::Config>,
+    last_taskbar_interval_active: bool,
 }
 
 impl TaskManApp {
@@ -519,13 +522,43 @@ impl TaskManApp {
 
         let ctx = cc.egui_ctx.clone();
 
+        let taskbar_monitor = Arc::new(tm_platform::taskbar_monitor::TaskbarMonitorHandle::new(
+            Arc::new(|_action| {
+                #[cfg(target_os = "windows")]
+                match _action {
+                    tm_platform::taskbar_monitor::Action::OpenMain => {
+                        crate::signal_tray(crate::TRAY_ACTION_OPEN);
+                    }
+                    tm_platform::taskbar_monitor::Action::OpenSettings => {
+                        crate::signal_tray(crate::TRAY_ACTION_SETTINGS);
+                    }
+                    tm_platform::taskbar_monitor::Action::Exit => {
+                        crate::signal_tray(crate::TRAY_ACTION_EXIT);
+                    }
+                }
+            }),
+        ));
+
         // ---- engine: parked until the first frame completes ----------------
         // The notifier makes sampling event-driven: every publication wakes
         // the UI exactly once instead of the old double-poll per interval.
         let interval = settings.update_speed.interval();
+        let tb_engine: Arc<std::sync::OnceLock<EngineHandle>> =
+            Arc::new(std::sync::OnceLock::new());
         let notifier: tm_core::engine::NotifyFn = {
             let ctx = ctx.clone();
-            Arc::new(move || ctx.request_repaint())
+            let tb_engine = tb_engine.clone();
+            let tb_handle = taskbar_monitor.clone();
+            Arc::new(move || {
+                if let Some(eng) = tb_engine.get()
+                    && let Some(snap) = eng.latest()
+                {
+                    tb_handle.update_metrics(tm_platform::taskbar_monitor::Metrics::from_snapshot(
+                        &snap,
+                    ));
+                }
+                ctx.request_repaint();
+            })
         };
         let factory: tm_core::engine::CollectorFactory = if mock {
             Box::new(|| Box::new(tm_core::mock::MockCollector::new()))
@@ -534,6 +567,7 @@ impl TaskManApp {
         };
         let (engine, _join) = tm_core::engine::spawn_lazy(factory, interval, Some(notifier))
             .expect("failed to spawn sampling engine");
+        let _ = tb_engine.set(engine.clone());
         if settings.update_speed == tm_core::settings::UpdateSpeed::Paused {
             engine.pause();
         }
@@ -879,6 +913,9 @@ impl TaskManApp {
             advanced_state_last_refresh: None,
             #[cfg(target_os = "windows")]
             core_service_change_inflight: Arc::new(AtomicBool::new(false)),
+            taskbar_monitor,
+            taskbar_config_applied: None,
+            last_taskbar_interval_active: false,
         }
     }
 
@@ -1220,24 +1257,76 @@ impl TaskManApp {
     /// restored window does not open on data up to [`HIDDEN_INTERVAL`] old.
     fn sync_surface_visibility(&mut self) {
         let visible = std::mem::replace(&mut self.painted_last_frame, false);
-        if visible == self.surface_visible {
+        let taskbar_active = self.shared.settings.taskbar_monitor_enabled;
+        if visible == self.surface_visible && taskbar_active == self.last_taskbar_interval_active {
             return;
         }
+        let vis_changed = visible != self.surface_visible;
         self.surface_visible = visible;
-        self.engine.set_background(!visible);
+        self.last_taskbar_interval_active = taskbar_active;
+        if vis_changed {
+            self.engine.set_background(!visible);
+        }
         // A paused engine is the user's explicit choice and outranks this:
         // it must not start ticking again because the window went away.
         if self.shared.settings.update_speed != tm_core::settings::UpdateSpeed::Paused {
-            self.engine.set_interval(if visible {
+            self.engine.set_interval(if visible || taskbar_active {
                 self.shared.settings.update_speed.interval()
             } else {
                 HIDDEN_INTERVAL
             });
         }
-        if visible {
+        if vis_changed && visible {
             self.engine.request_refresh();
         }
-        tracing::debug!(visible, "surface visibility changed");
+        if vis_changed {
+            tracing::debug!(visible, "surface visibility changed");
+        }
+    }
+
+    fn sync_taskbar_monitor(&mut self, ctx: &egui::Context) {
+        let menu_dark = match self.shared.settings.theme {
+            tm_core::settings::ThemeMode::Dark => true,
+            tm_core::settings::ThemeMode::Light => false,
+            tm_core::settings::ThemeMode::System => ctx.theme() == egui::Theme::Dark,
+        };
+        let cfg = tm_platform::taskbar_monitor::Config::from_settings(
+            &self.shared.settings,
+            i18n::tr(K::TrayOpen).to_string(),
+            i18n::tr(K::Settings).to_string(),
+            i18n::tr(K::TrayExit).to_string(),
+            menu_dark,
+        );
+        if self.taskbar_config_applied.as_ref() != Some(&cfg) {
+            let became_enabled = cfg.enabled
+                && !self
+                    .taskbar_config_applied
+                    .as_ref()
+                    .is_some_and(|c| c.enabled);
+            self.taskbar_config_applied = Some(cfg.clone());
+            if became_enabled && let Some(snap) = self.latest_snapshot() {
+                self.taskbar_monitor
+                    .update_metrics(tm_platform::taskbar_monitor::Metrics::from_snapshot(&snap));
+            }
+            self.taskbar_monitor.set_config(cfg);
+        }
+    }
+
+    fn ensure_engine_started(&mut self) {
+        if !self.engine_started {
+            self.engine_started = true;
+            // Open the log file here, for the same reason the engine starts
+            // here: creating the directory and the rolling appender is disk
+            // I/O that must not sit on the path to the first frame. Until
+            // this call the records live in the bounded ring in
+            // `tm_core::logging`, and it replays them in order.
+            tm_core::logging::attach_file_logging(tm_core::logging::LogConfig {
+                console: false,
+                level: None,
+            });
+            self.engine.start();
+            tracing::info!("engine started");
+        }
     }
 
     /// Invalidate every tab-local cache and force one fresh sample (F5 /
@@ -1322,6 +1411,7 @@ impl TaskManApp {
     /// Shared shutdown path for both eframe trait signatures (the optional
     /// Glow context changes the signature at compile time).
     pub(crate) fn shutdown(&mut self) {
+        self.taskbar_monitor.shutdown();
         // Persist final settings (honors the autosave gate; the gate choice
         // itself was already force-persisted when toggled).
         self.save_settings();
@@ -1745,6 +1835,12 @@ impl eframe::App for TaskManApp {
         self.sync_surface_visibility();
         // Ship telemetry-demand changes (tab switches etc.).
         self.update_demand();
+        // Keep the taskbar monitor config/visibility synchronized even while
+        // the main window starts or sits hidden in the tray.
+        self.sync_taskbar_monitor(ctx);
+        if !self.surface_visible && self.shared.settings.taskbar_monitor_enabled {
+            self.ensure_engine_started();
+        }
 
         // Only animations need timed repaints; everything else is woken by
         // events (engine publication, worker completion, input).
@@ -1875,6 +1971,7 @@ impl eframe::App for TaskManApp {
         // ------------------------------------------------ dialogs & toasts
         if self.show_settings {
             crate::app_ui::settings_dialog(self, &ctx, &pal);
+            self.sync_taskbar_monitor(&ctx);
         }
         if self.run_dialog_open {
             crate::app_ui::run_task_dialog(self, &ctx, &pal);
@@ -1953,20 +2050,7 @@ impl eframe::App for TaskManApp {
 
         // First frame fully submitted → NOW start sampling. Everything below
         // this line in the process lifetime happens after the shell painted.
-        if !self.engine_started {
-            self.engine_started = true;
-            // Open the log file here, for the same reason the engine starts
-            // here: creating the directory and the rolling appender is disk
-            // I/O that must not sit on the path to the first frame. Until
-            // this call the records live in the bounded ring in
-            // `tm_core::logging`, and it replays them in order.
-            tm_core::logging::attach_file_logging(tm_core::logging::LogConfig {
-                console: false,
-                level: None,
-            });
-            self.engine.start();
-            tracing::info!("engine started after first frame");
-        }
+        self.ensure_engine_started();
     }
 
     #[cfg(feature = "glow")]

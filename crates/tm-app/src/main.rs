@@ -654,7 +654,9 @@ impl NativeApp {
             *tm_core::sync::lock(TRAY_CONTEXT.get_or_init(Default::default)) = Some(ctx.clone());
         }
         #[cfg(target_os = "windows")]
-        let tray_requested = initially_hidden || inner.shared.settings.close_to_tray;
+        let tray_requested = initially_hidden
+            || inner.shared.settings.close_to_tray
+            || inner.shared.settings.taskbar_monitor_enabled;
         #[cfg(target_os = "windows")]
         let tray = if tray_requested {
             TrayShell::new(true)
@@ -765,7 +767,9 @@ impl eframe::App for NativeApp {
         #[cfg(target_os = "windows")]
         {
             self.handle_tray_actions(ui.ctx());
-            let tray_enabled = self.inner.shared.settings.close_to_tray || self.hidden_to_tray;
+            let keep_in_tray = self.inner.shared.settings.close_to_tray
+                || self.inner.shared.settings.taskbar_monitor_enabled;
+            let tray_enabled = keep_in_tray || self.hidden_to_tray;
             if tray_enabled && self.tray.is_none() && !self.tray_init_attempted {
                 self.tray_init_attempted = true;
                 self.tray = TrayShell::new(tray_enabled);
@@ -778,11 +782,7 @@ impl eframe::App for NativeApp {
             if close_requested && PROGRAMMATIC_EXIT.load(std::sync::atomic::Ordering::Acquire) {
                 self.exit_requested = true;
             }
-            if close_requested
-                && !self.exit_requested
-                && self.inner.shared.settings.close_to_tray
-                && self.tray.is_some()
-            {
+            if close_requested && !self.exit_requested && keep_in_tray && self.tray.is_some() {
                 ui.ctx()
                     .send_viewport_cmd(eframe::egui::ViewportCommand::CancelClose);
                 ui.ctx()
@@ -825,9 +825,11 @@ impl eframe::App for NativeApp {
 }
 
 #[cfg(target_os = "windows")]
-const TRAY_ACTION_OPEN: u8 = 1;
+pub(crate) const TRAY_ACTION_OPEN: u8 = 1;
 #[cfg(target_os = "windows")]
-const TRAY_ACTION_EXIT: u8 = 2;
+pub(crate) const TRAY_ACTION_SETTINGS: u8 = 2;
+#[cfg(target_os = "windows")]
+pub(crate) const TRAY_ACTION_EXIT: u8 = 3;
 #[cfg(target_os = "windows")]
 static TRAY_ACTION: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 #[cfg(target_os = "windows")]
@@ -837,7 +839,7 @@ static TRAY_CONTEXT: std::sync::OnceLock<std::sync::Mutex<Option<eframe::egui::C
 static TRAY_HANDLERS: std::sync::Once = std::sync::Once::new();
 
 #[cfg(target_os = "windows")]
-fn signal_tray(action: u8) {
+pub(crate) fn signal_tray(action: u8) {
     TRAY_ACTION.fetch_max(action, std::sync::atomic::Ordering::AcqRel);
     if let Some(context) = TRAY_CONTEXT.get()
         && let Some(context) = tm_core::sync::lock(context).as_ref()
@@ -1280,6 +1282,10 @@ impl NativeApp {
         match TRAY_ACTION.swap(0, std::sync::atomic::Ordering::AcqRel) {
             TRAY_ACTION_OPEN => {
                 self.restore_window(ctx);
+            }
+            TRAY_ACTION_SETTINGS => {
+                self.restore_window(ctx);
+                self.inner.show_settings = true;
             }
             TRAY_ACTION_EXIT => {
                 self.exit_requested = true;

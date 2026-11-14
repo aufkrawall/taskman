@@ -50,7 +50,10 @@ windows = { workspace = true, features = [
   "Win32_UI_Input_KeyboardAndMouse",
   "Win32_UI_WindowsAndMessaging",
   "Win32_Graphics_Dwm",
+  "Win32_Graphics_Direct2D",
+  "Win32_Graphics_Direct2D_Common",
   "Win32_Graphics_Dxgi",
+  "Win32_Graphics_Dxgi_Common",
   "Win32_Graphics_Gdi",
   # Sub-pixel text: the monitor's ClearType parameters, and the DPI-awareness gate.
   "Win32_Graphics_DirectWrite",
@@ -61,6 +64,7 @@ windows = { workspace = true, features = [
   "Win32_Networking_WinSock",
 ] }
 raw-cpuid = "11"
+windows-numerics = "0.3"
 windows-service = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]

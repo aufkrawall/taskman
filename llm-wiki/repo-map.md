@@ -136,6 +136,12 @@ platform boundary (`tm-core` ← `tm-platform` ← `tm-app` / `tm-service`), and
     for a hung target) — plus an event-driven strict-topmost
     keeper that reasserts the root HWND on foreground/show events and UNHOOKS itself
     when always-on-top is turned off),
+    `taskbar_monitor.rs` (optional taskbar CPU/RAM/network monitor on a
+    dedicated `"tm-taskbar"` thread: `WS_EX_LAYERED | WS_EX_TOOLWINDOW |
+    WS_EX_NOACTIVATE | WS_EX_TOPMOST` with software Direct2D + DirectWrite into
+    a cached 32bpp DIB and `UpdateLayeredWindow`; never `GetDC(NULL)`/`GetPixel`
+    or cross-process `SetParent`; hides on taskbar auto-hide and per-monitor
+    fullscreen foreground windows),
     `hotkey_hook.rs` (dedicated `WH_KEYBOARD_LL` thread intercepting Ctrl+Shift+Esc,
     installed only while the IFEO replacement is registered and driven by a
     `RegNotifyChangeKeyValue` watch rather than polling; bypasses shell hotkey

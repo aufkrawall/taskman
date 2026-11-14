@@ -1,6 +1,6 @@
 # Current State
 
-Last cross-checked: 2026-10-26
+Last cross-checked: 2026-11-14
 
 ## Summary
 
@@ -1069,6 +1069,28 @@ rebase runbook.
   Users/Services/Startup show the centered "Gathering data" placeholder
   while their background fetch runs; `cmd_button` measures its label
   instead of a per-char heuristic.
+
+## Windows taskbar monitor (2026-11-14)
+
+- **DWM-safe layered rendering:** `tm-platform/src/win/taskbar_monitor.rs`
+  runs an independent `WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE |
+  WS_EX_TOPMOST` window on a dedicated `"tm-taskbar"` thread using software
+  Direct2D (`D2D1_RENDER_TARGET_TYPE_SOFTWARE`) + DirectWrite into a cached
+  32bpp premultiplied ARGB `CreateDIBSection` and `UpdateLayeredWindow`. It
+  never calls `GetDC(NULL)`/`GetPixel`/`BitBlt` and never uses cross-process
+  `SetParent` on Explorer's `Shell_TrayWnd` thread.
+- **Zero-cost fullscreen & auto-hide suppression:** Watches taskbar position,
+  `SystemUsesLightTheme` (`WM_SETTINGCHANGE`), `TaskbarCreated`, and
+  `EVENT_SYSTEM_FOREGROUND` to hide cleanly when the taskbar auto-hides or a
+  fullscreen window covers its monitor (preserving Independent Flip / MPO and
+  avoiding HUD overlap).
+- **Tray keep-alive & engine decoupled updates:** While enabled, closing the
+  main window hides TaskMan to the tray even if `close_to_tray` is off, and
+  `tm-engine`'s notifier pushes `Metrics::from_snapshot` directly to the
+  taskbar window at `update_speed.interval()` even while the eframe surface
+  is hidden (`TelemetryDemand::hidden()` and background sampler mode remain
+  preserved). Non-Windows targets use a no-op stub in
+  `tm-platform/src/lib.rs`.
 
 ## Routing
 

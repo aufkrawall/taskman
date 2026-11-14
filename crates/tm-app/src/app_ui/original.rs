@@ -5,6 +5,8 @@
 use eframe::egui::{self, Align2, Color32, CornerRadius, FontId, Pos2, Rect, Sense, Stroke};
 use tm_core::i18n::{self, K};
 use tm_core::settings::{RenderMode, Settings, TextSmoothing, ThemeMode};
+#[cfg(target_os = "windows")]
+use tm_core::settings::{TaskbarColorMode, TaskbarNetUnit};
 
 #[cfg(test)]
 use crate::app::Tab;
@@ -1532,6 +1534,178 @@ pub fn settings_dialog(app: &mut TaskManApp, ctx: &egui::Context, _pal: &theme::
             #[cfg(target_os = "windows")]
             {
                 use tm_platform::actions::{CoreServiceState, TaskManagerReplacementState};
+                ui.add_space(14.0);
+                ui.heading(i18n::tr(K::TaskbarMonitorHeading));
+
+                let mut tb_enabled = app.shared.settings.taskbar_monitor_enabled;
+                if crate::widgets::controls::checkbox(
+                    ui,
+                    &mut tb_enabled,
+                    i18n::tr(K::TaskbarMonitorEnable),
+                    _pal,
+                )
+                .changed()
+                {
+                    app.shared.settings.taskbar_monitor_enabled = tb_enabled;
+                    app.save_settings();
+                }
+                ui.label(
+                    egui::RichText::new(i18n::tr(K::TaskbarMonitorHint))
+                        .size(11.0)
+                        .color(_pal.text_dim),
+                );
+
+                if app.shared.settings.taskbar_monitor_enabled {
+                    ui.add_space(6.0);
+                    ui.indent("taskbar-monitor-options", |ui| {
+                        ui.label(i18n::tr(K::TaskbarMetricsLabel));
+                        ui.horizontal(|ui| {
+                            let mut show_cpu = app.shared.settings.taskbar_show_cpu;
+                            if crate::widgets::controls::checkbox(
+                                ui,
+                                &mut show_cpu,
+                                i18n::tr(K::TaskbarMetricCpu),
+                                _pal,
+                            )
+                            .changed()
+                            {
+                                app.shared.settings.taskbar_show_cpu = show_cpu;
+                                app.save_settings();
+                            }
+                            let mut show_ram = app.shared.settings.taskbar_show_ram;
+                            if crate::widgets::controls::checkbox(
+                                ui,
+                                &mut show_ram,
+                                i18n::tr(K::TaskbarMetricRam),
+                                _pal,
+                            )
+                            .changed()
+                            {
+                                app.shared.settings.taskbar_show_ram = show_ram;
+                                app.save_settings();
+                            }
+                            let mut show_net = app.shared.settings.taskbar_show_network;
+                            if crate::widgets::controls::checkbox(
+                                ui,
+                                &mut show_net,
+                                i18n::tr(K::TaskbarMetricNetwork),
+                                _pal,
+                            )
+                            .changed()
+                            {
+                                app.shared.settings.taskbar_show_network = show_net;
+                                app.save_settings();
+                            }
+                        });
+
+                        ui.add_space(6.0);
+                        ui.label(i18n::tr(K::TaskbarNetUnitLabel));
+                        let bits = app.shared.settings.taskbar_net_unit_bits;
+                        ui.horizontal_wrapped(|ui| {
+                            let choices = [
+                                (TaskbarNetUnit::Auto, i18n::tr(K::TaskbarUnitAuto)),
+                                (TaskbarNetUnit::FixedKB, if bits { "Kbps" } else { "KB/s" }),
+                                (TaskbarNetUnit::FixedMB, if bits { "Mbps" } else { "MB/s" }),
+                            ];
+                            for (mode, label) in choices {
+                                if ui
+                                    .selectable_label(
+                                        app.shared.settings.taskbar_net_unit_mode == mode,
+                                        label,
+                                    )
+                                    .clicked()
+                                {
+                                    app.shared.settings.taskbar_net_unit_mode = mode;
+                                    app.save_settings();
+                                }
+                            }
+                        });
+                        let mut bits_mut = bits;
+                        if crate::widgets::controls::checkbox(
+                            ui,
+                            &mut bits_mut,
+                            i18n::tr(K::TaskbarNetUnitBits),
+                            _pal,
+                        )
+                        .changed()
+                        {
+                            app.shared.settings.taskbar_net_unit_bits = bits_mut;
+                            app.save_settings();
+                        }
+
+                        ui.add_space(6.0);
+                        ui.label(i18n::tr(K::TaskbarFontFamilyLabel));
+                        ui.horizontal_wrapped(|ui| {
+                            for family in [
+                                "Segoe UI",
+                                "Segoe UI Variable Text",
+                                "Consolas",
+                                "Cascadia Mono",
+                                "Arial",
+                                "Tahoma",
+                            ] {
+                                if ui
+                                    .selectable_label(
+                                        app.shared
+                                            .settings
+                                            .taskbar_font_family
+                                            .eq_ignore_ascii_case(family),
+                                        family,
+                                    )
+                                    .clicked()
+                                {
+                                    app.shared.settings.taskbar_font_family = family.to_string();
+                                    app.save_settings();
+                                }
+                            }
+                        });
+
+                        ui.add_space(4.0);
+                        ui.label(i18n::tr(K::TaskbarFontSizeLabel));
+                        ui.horizontal_wrapped(|ui| {
+                            for size in [8.0f32, 9.0, 10.0, 11.0, 12.0, 14.0] {
+                                if ui
+                                    .selectable_label(
+                                        (app.shared.settings.taskbar_font_size - size).abs() < 0.1,
+                                        format!("{} pt", size as u32),
+                                    )
+                                    .clicked()
+                                {
+                                    app.shared.settings.taskbar_font_size = size;
+                                    app.save_settings();
+                                }
+                            }
+                        });
+
+                        ui.add_space(6.0);
+                        ui.label(i18n::tr(K::TaskbarColorLabel));
+                        ui.horizontal_wrapped(|ui| {
+                            for (mode, label) in [
+                                (TaskbarColorMode::Auto, i18n::tr(K::TaskbarColorAuto)),
+                                (TaskbarColorMode::Custom, i18n::tr(K::TaskbarColorCustom)),
+                            ] {
+                                if ui
+                                    .selectable_label(
+                                        app.shared.settings.taskbar_color_mode == mode,
+                                        label,
+                                    )
+                                    .clicked()
+                                {
+                                    app.shared.settings.taskbar_color_mode = mode;
+                                    app.save_settings();
+                                }
+                            }
+                            if app.shared.settings.taskbar_color_mode == TaskbarColorMode::Custom {
+                                let mut rgb = app.shared.settings.taskbar_custom_color;
+                                if ui.color_edit_button_srgb(&mut rgb).changed() {
+                                    app.shared.settings.taskbar_custom_color = rgb;
+                                    app.save_settings();
+                                }
+                            }
+                        });
+                    });
+                }
+
                 ui.add_space(14.0);
                 ui.heading(i18n::tr(K::AdvancedHeading));
 

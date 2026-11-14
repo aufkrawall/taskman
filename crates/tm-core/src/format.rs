@@ -512,4 +512,150 @@ mod tests {
         assert_eq!(nice_rate_max(1.9 * K * K), band);
         assert_eq!(nice_rate_max(1.05 * K * K), band);
     }
+
+    #[test]
+    fn taskbar_rate_respects_units_and_missing_values() {
+        use crate::settings::TaskbarNetUnit;
+        let loc = crate::locale::EN_US;
+        assert_eq!(
+            format_taskbar_rate_in(None, false, TaskbarNetUnit::Auto, loc),
+            "—"
+        );
+        assert_eq!(
+            format_taskbar_rate_in(Some(0.0), false, TaskbarNetUnit::FixedMB, loc),
+            "0.00 MB/s"
+        );
+        assert_eq!(
+            format_taskbar_rate_in(Some(1_572_864.0), false, TaskbarNetUnit::FixedMB, loc),
+            "1.50 MB/s"
+        );
+        assert_eq!(
+            format_taskbar_rate_in(Some(1_536.0), false, TaskbarNetUnit::FixedKB, loc),
+            "1.5 KB/s"
+        );
+        assert_eq!(
+            format_taskbar_rate_in(Some(512.0), false, TaskbarNetUnit::Auto, loc),
+            "512 B/s"
+        );
+        assert_eq!(
+            format_taskbar_rate_in(Some(125_000.0), true, TaskbarNetUnit::FixedMB, loc),
+            "1.00 Mbps"
+        );
+        assert_eq!(
+            format_taskbar_rate_in(Some(125_000.0), true, TaskbarNetUnit::Auto, loc),
+            "1.00 Mbps"
+        );
+        assert_eq!(
+            format_taskbar_rate_in(Some(500.0), true, TaskbarNetUnit::Auto, loc),
+            "4.0 Kbps"
+        );
+    }
+
+    #[test]
+    fn taskbar_pct_handles_unavailable_and_clamping() {
+        assert_eq!(format_taskbar_pct(None), "—");
+        assert_eq!(format_taskbar_pct(Some(f32::NAN)), "—");
+        assert_eq!(format_taskbar_pct(Some(3.4)), "3%");
+        assert_eq!(format_taskbar_pct(Some(38.6)), "39%");
+        assert_eq!(format_taskbar_pct(Some(105.0)), "100%");
+    }
+}
+
+/// Format a percentage for the compact taskbar widget (`3%`, `38%`, or `—` when unavailable).
+pub fn format_taskbar_pct(pct: Option<f32>) -> String {
+    match pct {
+        Some(v) if v.is_finite() => format!("{}%", v.clamp(0.0, 100.0).round() as u32),
+        _ => "—".into(),
+    }
+}
+
+/// Format a network rate (input in bytes/sec) for the taskbar monitor.
+pub fn format_taskbar_rate(
+    bps: Option<f64>,
+    bits: bool,
+    unit: crate::settings::TaskbarNetUnit,
+) -> String {
+    format_taskbar_rate_in(bps, bits, unit, locale::get())
+}
+
+/// Locale-parameterized core of [`format_taskbar_rate`].
+pub fn format_taskbar_rate_in(
+    bps: Option<f64>,
+    bits: bool,
+    unit: crate::settings::TaskbarNetUnit,
+    loc: LocaleFmt,
+) -> String {
+    use crate::settings::TaskbarNetUnit;
+
+    let Some(raw) = bps else {
+        return "—".into();
+    };
+    let bps = if raw.is_finite() && raw > 0.0 {
+        raw
+    } else {
+        0.0
+    };
+
+    if bits {
+        let bit_s = bps * 8.0;
+        const K: f64 = 1000.0;
+        match unit {
+            TaskbarNetUnit::FixedKB => {
+                let v = bit_s / K;
+                let dec = if v >= 1000.0 { 0 } else { 1 };
+                format!("{} Kbps", fixed_with(v, dec, loc))
+            }
+            TaskbarNetUnit::FixedMB => {
+                let v = bit_s / (K * K);
+                let dec = if v >= 100.0 { 1 } else { 2 };
+                format!("{} Mbps", fixed_with(v, dec, loc))
+            }
+            TaskbarNetUnit::Auto => {
+                if bit_s < K {
+                    format!("{:.0} bps", bit_s)
+                } else if bit_s < K * K {
+                    let v = bit_s / K;
+                    let dec = if v >= 100.0 { 0 } else { 1 };
+                    format!("{} Kbps", fixed_with(v, dec, loc))
+                } else if bit_s < K * K * K {
+                    let v = bit_s / (K * K);
+                    let dec = if v >= 100.0 { 1 } else { 2 };
+                    format!("{} Mbps", fixed_with(v, dec, loc))
+                } else {
+                    let v = bit_s / (K * K * K);
+                    format!("{} Gbps", fixed_with(v, 2, loc))
+                }
+            }
+        }
+    } else {
+        const K: f64 = 1024.0;
+        match unit {
+            TaskbarNetUnit::FixedKB => {
+                let v = bps / K;
+                let dec = if v >= 1000.0 { 0 } else { 1 };
+                format!("{} KB/s", fixed_with(v, dec, loc))
+            }
+            TaskbarNetUnit::FixedMB => {
+                let v = bps / (K * K);
+                let dec = if v >= 100.0 { 1 } else { 2 };
+                format!("{} MB/s", fixed_with(v, dec, loc))
+            }
+            TaskbarNetUnit::Auto => {
+                if bps < K {
+                    format!("{:.0} B/s", bps)
+                } else if bps < K * K {
+                    let v = bps / K;
+                    let dec = if v >= 100.0 { 0 } else { 1 };
+                    format!("{} KB/s", fixed_with(v, dec, loc))
+                } else if bps < K * K * K {
+                    let v = bps / (K * K);
+                    let dec = if v >= 100.0 { 1 } else { 2 };
+                    format!("{} MB/s", fixed_with(v, dec, loc))
+                } else {
+                    let v = bps / (K * K * K);
+                    format!("{} GB/s", fixed_with(v, 2, loc))
+                }
+            }
+        }
+    }
 }

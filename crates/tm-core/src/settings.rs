@@ -162,6 +162,25 @@ pub enum RowDensity {
     Compact,
 }
 
+/// Network throughput unit mode for the Windows taskbar monitor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TaskbarNetUnit {
+    #[default]
+    Auto,
+    FixedKB,
+    FixedMB,
+}
+
+/// Text color selection mode for the Windows taskbar monitor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TaskbarColorMode {
+    #[default]
+    Auto,
+    Custom,
+}
+
 /// Persisted sort for one table, keyed by stable table/column identifiers.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SortPreference {
@@ -286,6 +305,26 @@ pub struct Settings {
     pub processes_row_density: RowDensity,
     /// Row spacing on the Details page (`compact` by default).
     pub details_row_density: RowDensity,
+    /// Show CPU, RAM, and network usage in the Windows taskbar.
+    pub taskbar_monitor_enabled: bool,
+    /// Include CPU utilization in the taskbar monitor.
+    pub taskbar_show_cpu: bool,
+    /// Include RAM utilization in the taskbar monitor.
+    pub taskbar_show_ram: bool,
+    /// Include network upload/download rate in the taskbar monitor.
+    pub taskbar_show_network: bool,
+    /// Font family name used by the taskbar monitor.
+    pub taskbar_font_family: String,
+    /// Font size in points used by the taskbar monitor.
+    pub taskbar_font_size: f32,
+    /// Display network rates in bits/s instead of Bytes/s in the taskbar monitor.
+    pub taskbar_net_unit_bits: bool,
+    /// Network rate unit selection for the taskbar monitor (`auto`, `kb`, `mb`).
+    pub taskbar_net_unit_mode: TaskbarNetUnit,
+    /// Taskbar monitor text color mode (`auto` follows Windows taskbar theme).
+    pub taskbar_color_mode: TaskbarColorMode,
+    /// Custom sRGB text color when `taskbar_color_mode == Custom`.
+    pub taskbar_custom_color: [u8; 3],
 }
 
 impl Default for Settings {
@@ -321,6 +360,16 @@ impl Default for Settings {
             render_mode: RenderMode::default(),
             processes_row_density: RowDensity::Normal,
             details_row_density: RowDensity::Compact,
+            taskbar_monitor_enabled: false,
+            taskbar_show_cpu: true,
+            taskbar_show_ram: true,
+            taskbar_show_network: true,
+            taskbar_font_family: "Segoe UI".into(),
+            taskbar_font_size: 9.0,
+            taskbar_net_unit_bits: false,
+            taskbar_net_unit_mode: TaskbarNetUnit::Auto,
+            taskbar_color_mode: TaskbarColorMode::Auto,
+            taskbar_custom_color: [255, 255, 255],
         }
     }
 }
@@ -661,6 +710,55 @@ impl RowDensity {
     }
 }
 
+impl TaskbarNetUnit {
+    fn as_cfg(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::FixedKB => "kb",
+            Self::FixedMB => "mb",
+        }
+    }
+    fn from_cfg(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "auto" => Some(Self::Auto),
+            "kb" | "fixed_kb" | "kib" => Some(Self::FixedKB),
+            "mb" | "fixed_mb" | "mib" => Some(Self::FixedMB),
+            _ => None,
+        }
+    }
+}
+
+impl TaskbarColorMode {
+    fn as_cfg(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Custom => "custom",
+        }
+    }
+    fn from_cfg(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "auto" | "system" => Some(Self::Auto),
+            "custom" => Some(Self::Custom),
+            _ => None,
+        }
+    }
+}
+
+fn parse_hex_rgb(s: &str) -> Option<[u8; 3]> {
+    let hex = s.trim().strip_prefix('#').unwrap_or(s.trim());
+    if hex.len() != 6 || !hex.is_ascii() {
+        return None;
+    }
+    let r = u8::from_str_radix(&hex[0..2], 16).ok()?;
+    let g = u8::from_str_radix(&hex[2..4], 16).ok()?;
+    let b = u8::from_str_radix(&hex[4..6], 16).ok()?;
+    Some([r, g, b])
+}
+
+fn write_hex_rgb(rgb: [u8; 3]) -> String {
+    format!("#{:02x}{:02x}{:02x}", rgb[0], rgb[1], rgb[2])
+}
+
 // ------------------------------------------------------------------- loading
 
 impl Settings {
@@ -814,6 +912,37 @@ impl Settings {
         if let Some(v) = get("general", "details_row_density").and_then(|v| RowDensity::from_cfg(v))
         {
             s.details_row_density = v;
+        }
+        s.taskbar_monitor_enabled = b(
+            "general",
+            "taskbar_monitor_enabled",
+            s.taskbar_monitor_enabled,
+        );
+        s.taskbar_show_cpu = b("general", "taskbar_show_cpu", s.taskbar_show_cpu);
+        s.taskbar_show_ram = b("general", "taskbar_show_ram", s.taskbar_show_ram);
+        s.taskbar_show_network = b("general", "taskbar_show_network", s.taskbar_show_network);
+        if let Some(v) = get("general", "taskbar_font_family") {
+            let family = v.trim();
+            if !family.is_empty() && family.len() <= 64 && !family.chars().any(char::is_control) {
+                s.taskbar_font_family = family.to_string();
+            }
+        }
+        if let Some(v) = get("general", "taskbar_font_size").and_then(|v| parse_f32(v)) {
+            s.taskbar_font_size = v.clamp(7.0, 18.0);
+        }
+        s.taskbar_net_unit_bits = b("general", "taskbar_net_unit_bits", s.taskbar_net_unit_bits);
+        if let Some(v) =
+            get("general", "taskbar_net_unit_mode").and_then(|v| TaskbarNetUnit::from_cfg(v))
+        {
+            s.taskbar_net_unit_mode = v;
+        }
+        if let Some(v) =
+            get("general", "taskbar_color_mode").and_then(|v| TaskbarColorMode::from_cfg(v))
+        {
+            s.taskbar_color_mode = v;
+        }
+        if let Some(rgb) = get("general", "taskbar_custom_color").and_then(|v| parse_hex_rgb(v)) {
+            s.taskbar_custom_color = rgb;
         }
 
         // Column preferences, ID-keyed schema: `[columns.<table>]
@@ -988,6 +1117,34 @@ impl Settings {
             (
                 "details_row_density",
                 self.details_row_density.as_cfg().to_string(),
+            ),
+            (
+                "taskbar_monitor_enabled",
+                self.taskbar_monitor_enabled.to_string(),
+            ),
+            ("taskbar_show_cpu", self.taskbar_show_cpu.to_string()),
+            ("taskbar_show_ram", self.taskbar_show_ram.to_string()),
+            (
+                "taskbar_show_network",
+                self.taskbar_show_network.to_string(),
+            ),
+            ("taskbar_font_family", self.taskbar_font_family.clone()),
+            ("taskbar_font_size", self.taskbar_font_size.to_string()),
+            (
+                "taskbar_net_unit_bits",
+                self.taskbar_net_unit_bits.to_string(),
+            ),
+            (
+                "taskbar_net_unit_mode",
+                self.taskbar_net_unit_mode.as_cfg().to_string(),
+            ),
+            (
+                "taskbar_color_mode",
+                self.taskbar_color_mode.as_cfg().to_string(),
+            ),
+            (
+                "taskbar_custom_color",
+                write_hex_rgb(self.taskbar_custom_color),
             ),
         ];
         let mut body = String::from("[general]\n");
@@ -1651,5 +1808,45 @@ rule.1=["c:\\\\ok.exe",{"priority":"High","affinity_mask":3}]
         );
         assert_eq!(unknown.processes_row_density, RowDensity::Normal);
         assert_eq!(unknown.details_row_density, RowDensity::Compact);
+    }
+
+    #[test]
+    fn taskbar_monitor_settings_round_trip_and_bounds() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.ini");
+        let s = Settings {
+            taskbar_monitor_enabled: true,
+            taskbar_show_cpu: true,
+            taskbar_show_ram: false,
+            taskbar_show_network: true,
+            taskbar_font_family: "Consolas".into(),
+            taskbar_font_size: 11.0,
+            taskbar_net_unit_bits: true,
+            taskbar_net_unit_mode: TaskbarNetUnit::FixedMB,
+            taskbar_color_mode: TaskbarColorMode::Custom,
+            taskbar_custom_color: [0x12, 0xab, 0xef],
+            ..Settings::default()
+        };
+        s.save_to(&path).unwrap();
+        let loaded = Settings::load_from(&path);
+        assert!(loaded.taskbar_monitor_enabled);
+        assert!(loaded.taskbar_show_cpu);
+        assert!(!loaded.taskbar_show_ram);
+        assert!(loaded.taskbar_show_network);
+        assert_eq!(loaded.taskbar_font_family, "Consolas");
+        assert_eq!(loaded.taskbar_font_size, 11.0);
+        assert!(loaded.taskbar_net_unit_bits);
+        assert_eq!(loaded.taskbar_net_unit_mode, TaskbarNetUnit::FixedMB);
+        assert_eq!(loaded.taskbar_color_mode, TaskbarColorMode::Custom);
+        assert_eq!(loaded.taskbar_custom_color, [0x12, 0xab, 0xef]);
+
+        let invalid = Settings::from_ini_text(
+            "[general]\ntaskbar_font_family=\ntaskbar_font_size=99\ntaskbar_net_unit_mode=bad\ntaskbar_color_mode=bad\ntaskbar_custom_color=xyz\n",
+        );
+        assert_eq!(invalid.taskbar_font_family, "Segoe UI");
+        assert_eq!(invalid.taskbar_font_size, 18.0);
+        assert_eq!(invalid.taskbar_net_unit_mode, TaskbarNetUnit::Auto);
+        assert_eq!(invalid.taskbar_color_mode, TaskbarColorMode::Auto);
+        assert_eq!(invalid.taskbar_custom_color, [255, 255, 255]);
     }
 }
