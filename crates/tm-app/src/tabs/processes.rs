@@ -333,14 +333,23 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
                 app.select_all_requested = true;
                 ui.close();
             }
+            menu::separator(ui);
+            if crate::app_ui::row_density_submenu(
+                ui,
+                &mut app.shared.settings.processes_row_density,
+            ) {
+                app.save_settings();
+            }
         },
     );
 
     let value_order = app.processes_state.value_order.clone();
+    let row_h = tablekit::row_height(app.shared.settings.processes_row_density);
     // Only the numeric block is draggable: `heat_cells` paints the blue band
     // as one contiguous span, and the Name cell owns the tree chevron.
     let mut table = app
         .make_table("processes", columns(&value_order))
+        .with_row_height(row_h)
         .reorderable(FIXED_COLS..FIXED_COLS + VALUE_COLS);
 
     // Rebuild the flattened model only when snapshot/search/sort/view-state
@@ -464,7 +473,7 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
             for i in range {
                 match rows.get(i) {
                     Some(DisplayRow::GroupHeader(gi, total)) => {
-                        group_header(app, ui, &pal, *gi, *total, content_w);
+                        group_header(app, ui, &pal, *gi, *total, content_w, table.row_h);
                     }
                     Some(DisplayRow::Process(row)) => {
                         row_ui(app, ui, &pal, table, row, rows, i);
@@ -550,11 +559,9 @@ fn handle_keyboard_navigation(
     // Page movement spans the rows the table actually shows — not the whole
     // window content height, which counts the header and toolbar and used to
     // overshoot by half a page.
-    let page_rows = tablekit::page_rows(ctx, "processes", tablekit::ROW_H).unwrap_or_else(|| {
-        (ctx.content_rect().height() / tablekit::ROW_H)
-            .floor()
-            .max(1.0) as usize
-    });
+    let row_h = tablekit::row_height(app.shared.settings.processes_row_density);
+    let page_rows = tablekit::page_rows(ctx, "processes", row_h)
+        .unwrap_or_else(|| (ctx.content_rect().height() / row_h).floor().max(1.0) as usize);
     // While a header cell or resize handle owns the arrows, egui's spatial
     // navigation moves between header widgets; the selection must not also
     // move (see `tablekit::header_has_focus`).
@@ -945,6 +952,7 @@ fn group_header(
     gi: u8,
     total: usize,
     width: f32,
+    row_h: f32,
 ) {
     let label = match gi {
         0 => i18n::tr(K::GroupApps),
@@ -958,8 +966,7 @@ fn group_header(
     // horizontal scroll extents (and thus header/body alignment) identical.
     // Non-focusable like every row (see `TmTable::row`): the group is
     // collapsed/expanded through its own click or the tree's Left/Right keys.
-    let (rect, resp) =
-        ui.allocate_exact_size(egui::vec2(width, tablekit::ROW_H), egui::Sense::CLICK);
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(width, row_h), egui::Sense::CLICK);
     // TM group headers sit directly on the window background — no fill band
     // (the old subtle tint read as a misplaced stripe).
     let cx = rect.left() + 14.0;
@@ -975,11 +982,16 @@ fn group_header(
         },
         pal.text_dim,
     );
+    let font_size = if row_h <= tablekit::ROW_H_DENSE {
+        14.5
+    } else {
+        20.0
+    };
     ui.painter().text(
         egui::Pos2::new(rect.left() + 28.0, rect.center().y),
         egui::Align2::LEFT_CENTER,
         format!("{label} [{total}]"),
-        egui::FontId::proportional(20.0),
+        egui::FontId::proportional(font_size),
         pal.text,
     );
     if resp.clicked() {

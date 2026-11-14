@@ -121,3 +121,69 @@ pub fn tab_header(
     }
     ui.add_space(2.0);
 }
+
+/// Submenu for switching a table's row spacing between `Normal` and `Compact`.
+/// Returns `true` when the setting changed so the caller can persist it.
+pub fn row_density_submenu(ui: &mut egui::Ui, density: &mut tm_core::settings::RowDensity) -> bool {
+    use tm_core::settings::RowDensity;
+    let mut changed = false;
+    crate::widgets::menu::submenu(ui, i18n::tr(K::RowSpacing), |ui| {
+        if crate::widgets::menu::check(
+            ui,
+            i18n::tr(K::RowDensityNormal),
+            *density == RowDensity::Normal,
+        )
+        .clicked()
+        {
+            if *density != RowDensity::Normal {
+                *density = RowDensity::Normal;
+                changed = true;
+            }
+            ui.close();
+        }
+        if crate::widgets::menu::check(
+            ui,
+            i18n::tr(K::RowDensityCompact),
+            *density == RowDensity::Compact,
+        )
+        .clicked()
+        {
+            if *density != RowDensity::Compact {
+                *density = RowDensity::Compact;
+                changed = true;
+            }
+            ui.close();
+        }
+    });
+    changed
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tm_core::settings::RowDensity;
+
+    #[test]
+    fn row_height_maps_density_variants() {
+        assert_eq!(
+            crate::widgets::tablekit::row_height(RowDensity::Normal),
+            crate::widgets::tablekit::ROW_H
+        );
+        assert_eq!(
+            crate::widgets::tablekit::row_height(RowDensity::Compact),
+            crate::widgets::tablekit::ROW_H_DENSE
+        );
+    }
+
+    #[test]
+    fn row_density_submenu_renders_without_panicking() {
+        let ctx = egui::Context::default();
+        let mut density = RowDensity::Compact;
+        let mut out = ctx.run_ui(egui::RawInput::default(), |ui| {
+            let changed = row_density_submenu(ui, &mut density);
+            assert!(!changed);
+        });
+        out.textures_delta.clear();
+        assert_eq!(density, RowDensity::Compact);
+    }
+}

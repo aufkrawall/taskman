@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### New
+
+- **Row spacing option in Processes and Details overflow menus:** Added a **Row spacing** (**Normal** / **Compact**) submenu to the top-right `…` menu on both the Processes and Details pages. Processes defaults to **Normal** (32 px) and Details defaults to **Compact** (20 px), and each page's choice is persisted independently in `config.ini`.
+
 ## 0.1.24 - 2026-11-10
 
 ### New

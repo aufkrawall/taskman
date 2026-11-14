@@ -46,6 +46,14 @@ pub const ROW_H: f32 = 32.0;
 /// [`TmTable::icon_cell`] derives its glyph side from `row_h - 6`, so going
 /// lower starts shrinking the icons rather than the gap.
 pub const ROW_H_DENSE: f32 = 20.0;
+
+/// Pixel row height for the user's chosen [`tm_core::settings::RowDensity`].
+pub fn row_height(density: tm_core::settings::RowDensity) -> f32 {
+    match density {
+        tm_core::settings::RowDensity::Normal => ROW_H,
+        tm_core::settings::RowDensity::Compact => ROW_H_DENSE,
+    }
+}
 /// Header height for tables with aggregates (two-line).
 pub const HEADER_H: f32 = 57.0;
 /// Header height for single-line headers (Details/Services/Startup).

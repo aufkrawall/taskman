@@ -1073,6 +1073,11 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
                 app.details_state.select_columns_open = true;
                 ui.close();
             }
+            menu::separator(ui);
+            if crate::app_ui::row_density_submenu(ui, &mut app.shared.settings.details_row_density)
+            {
+                app.save_settings();
+            }
         },
     );
 
@@ -1107,11 +1112,12 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
 
     let visible_cols = app.details_state.ordered_visible();
     let cols_rendered: Vec<TmColumn> = visible_cols.iter().map(|c| (c.col)()).collect();
-    // Native TM packs the Details list; the 32 px app-list row height reads
-    // as broken gaps between entries here.
+    let row_h = tablekit::row_height(app.shared.settings.details_row_density);
+    // Native TM packs the Details list by default; the user can switch to
+    // Normal (32 px) from the tab's overflow menu.
     let mut table = app
         .make_table("details", cols_rendered)
-        .with_row_height(tablekit::ROW_H_DENSE);
+        .with_row_height(row_h);
 
     let key = (
         snap.timestamp_ms,
@@ -1509,12 +1515,9 @@ fn handle_keyboard_navigation(
     // Page movement must count the rows this page actually renders. The
     // table's own viewport measurement is one frame stale but stable; the
     // content-rect fallback covers the very first frame.
-    let page_rows =
-        tablekit::page_rows(ctx, "details", tablekit::ROW_H_DENSE).unwrap_or_else(|| {
-            (ctx.content_rect().height() / tablekit::ROW_H_DENSE)
-                .floor()
-                .max(1.0) as usize
-        });
+    let row_h = tablekit::row_height(app.shared.settings.details_row_density);
+    let page_rows = tablekit::page_rows(ctx, "details", row_h)
+        .unwrap_or_else(|| (ctx.content_rect().height() / row_h).floor().max(1.0) as usize);
     let select_all = std::mem::take(&mut app.select_all_requested)
         || (!ctx.egui_wants_keyboard_input()
             && ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::A)));

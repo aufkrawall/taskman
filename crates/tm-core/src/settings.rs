@@ -152,6 +152,16 @@ pub enum RenderMode {
     Software,
 }
 
+/// Row spacing density for table pages that let the user switch between
+/// airy Win11 spacing (`Normal`) and dense packing (`Compact`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RowDensity {
+    #[default]
+    Normal,
+    Compact,
+}
+
 /// Persisted sort for one table, keyed by stable table/column identifiers.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SortPreference {
@@ -272,6 +282,10 @@ pub struct Settings {
     /// Rendering path. Read once during startup — the renderer and adapter are
     /// chosen before the window exists — so changing it needs a restart.
     pub render_mode: RenderMode,
+    /// Row spacing on the Processes page (`normal` by default).
+    pub processes_row_density: RowDensity,
+    /// Row spacing on the Details page (`compact` by default).
+    pub details_row_density: RowDensity,
 }
 
 impl Default for Settings {
@@ -305,6 +319,8 @@ impl Default for Settings {
             start_elevated: false,
             text_smoothing: TextSmoothing::default(),
             render_mode: RenderMode::default(),
+            processes_row_density: RowDensity::Normal,
+            details_row_density: RowDensity::Compact,
         }
     }
 }
@@ -629,6 +645,22 @@ impl UpdateSpeed {
     }
 }
 
+impl RowDensity {
+    fn as_cfg(self) -> &'static str {
+        match self {
+            Self::Normal => "normal",
+            Self::Compact => "compact",
+        }
+    }
+    fn from_cfg(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "normal" => Some(Self::Normal),
+            "compact" => Some(Self::Compact),
+            _ => None,
+        }
+    }
+}
+
 // ------------------------------------------------------------------- loading
 
 impl Settings {
@@ -773,6 +805,15 @@ impl Settings {
             .or_else(|| get("general", "gpu_acceleration").and_then(|v| RenderMode::from_cfg(v)))
         {
             s.render_mode = v;
+        }
+        if let Some(v) =
+            get("general", "processes_row_density").and_then(|v| RowDensity::from_cfg(v))
+        {
+            s.processes_row_density = v;
+        }
+        if let Some(v) = get("general", "details_row_density").and_then(|v| RowDensity::from_cfg(v))
+        {
+            s.details_row_density = v;
         }
 
         // Column preferences, ID-keyed schema: `[columns.<table>]
@@ -940,6 +981,14 @@ impl Settings {
             ("start_elevated", self.start_elevated.to_string()),
             ("text_smoothing", self.text_smoothing.as_cfg().to_string()),
             ("render_mode", self.render_mode.as_cfg().to_string()),
+            (
+                "processes_row_density",
+                self.processes_row_density.as_cfg().to_string(),
+            ),
+            (
+                "details_row_density",
+                self.details_row_density.as_cfg().to_string(),
+            ),
         ];
         let mut body = String::from("[general]\n");
         for (k, v) in g {
@@ -1233,6 +1282,8 @@ text_smoothing=banana
         s.close_to_tray = true;
         s.start_with_windows = true;
         s.start_elevated = true;
+        s.processes_row_density = RowDensity::Compact;
+        s.details_row_density = RowDensity::Normal;
         s.col_widths.insert(
             "processes".into(),
             BTreeMap::from([("name".into(), 340.0), ("cpu".into(), 110.5)]),
@@ -1581,5 +1632,24 @@ rule.1=["c:\\\\ok.exe",{"priority":"High","affinity_mask":3}]
 
         let loaded = Settings::load_from(&path);
         assert_eq!(loaded.graph_seconds, 45);
+    }
+
+    #[test]
+    fn row_density_defaults_and_unknown_values() {
+        let def = Settings::default();
+        assert_eq!(def.processes_row_density, RowDensity::Normal);
+        assert_eq!(def.details_row_density, RowDensity::Compact);
+
+        let parsed = Settings::from_ini_text(
+            "[general]\nprocesses_row_density=compact\ndetails_row_density=NORMAL\n",
+        );
+        assert_eq!(parsed.processes_row_density, RowDensity::Compact);
+        assert_eq!(parsed.details_row_density, RowDensity::Normal);
+
+        let unknown = Settings::from_ini_text(
+            "[general]\nprocesses_row_density=bogus\ndetails_row_density=bogus\n",
+        );
+        assert_eq!(unknown.processes_row_density, RowDensity::Normal);
+        assert_eq!(unknown.details_row_density, RowDensity::Compact);
     }
 }
