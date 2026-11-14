@@ -63,19 +63,19 @@ use windows::Win32::UI::Shell::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CS_DBLCLKS, CreatePopupMenu, CreateWindowExW, DestroyMenu, DestroyWindow, DispatchMessageW,
-    EVENT_SYSTEM_FOREGROUND, FindWindowExW, FindWindowW, GWLP_HWNDPARENT, GWLP_USERDATA,
-    GetClassNameW, GetCursorPos, GetDesktopWindow, GetForegroundWindow, GetMessageW,
-    GetShellWindow, GetWindowLongPtrW, GetWindowRect, HMENU, HWND_TOPMOST, IDC_ARROW, InsertMenuW,
-    IsIconic, IsWindowVisible, LoadCursorW, MA_NOACTIVATE, MF_BYPOSITION, MF_SEPARATOR, MF_STRING,
-    MSG, PostMessageW, PostQuitMessage, RegisterClassExW, RegisterWindowMessageW, SW_HIDE,
-    SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOOWNERZORDER, SWP_NOSENDCHANGING,
-    SWP_NOSIZE, SetForegroundWindow, SetMenuDefaultItem, SetWindowLongPtrW, SetWindowPos,
-    ShowWindow, TPM_BOTTOMALIGN, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenuEx,
-    TranslateMessage, ULW_ALPHA, UpdateLayeredWindow, WINEVENT_OUTOFCONTEXT,
-    WINEVENT_SKIPOWNPROCESS, WM_APP, WM_CLOSE, WM_CREATE, WM_DESTROY, WM_DISPLAYCHANGE,
-    WM_DPICHANGED, WM_LBUTTONUP, WM_MOUSEACTIVATE, WM_MOUSEMOVE, WM_NULL, WM_RBUTTONUP,
-    WM_SETTINGCHANGE, WNDCLASSEXW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
-    WS_EX_TOPMOST, WS_POPUP,
+    EVENT_SYSTEM_FOREGROUND, FindWindowExW, FindWindowW, GW_HWNDPREV, GWL_EXSTYLE, GWLP_HWNDPARENT,
+    GWLP_USERDATA, GetClassNameW, GetCursorPos, GetDesktopWindow, GetForegroundWindow, GetMessageW,
+    GetShellWindow, GetWindow, GetWindowLongPtrW, GetWindowRect, HMENU, HWND_TOPMOST, IDC_ARROW,
+    InsertMenuW, IsIconic, IsWindowVisible, LoadCursorW, MA_NOACTIVATE, MF_BYPOSITION,
+    MF_SEPARATOR, MF_STRING, MSG, PostMessageW, PostQuitMessage, RegisterClassExW,
+    RegisterWindowMessageW, SW_HIDE, SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOMOVE,
+    SWP_NOOWNERZORDER, SWP_NOSENDCHANGING, SWP_NOSIZE, SWP_NOZORDER, SetForegroundWindow,
+    SetMenuDefaultItem, SetWindowLongPtrW, SetWindowPos, ShowWindow, TPM_BOTTOMALIGN,
+    TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenuEx, TranslateMessage, ULW_ALPHA,
+    UpdateLayeredWindow, WINEVENT_OUTOFCONTEXT, WINEVENT_SKIPOWNPROCESS, WM_APP, WM_CLOSE,
+    WM_CREATE, WM_DESTROY, WM_DISPLAYCHANGE, WM_DPICHANGED, WM_LBUTTONUP, WM_MOUSEACTIVATE,
+    WM_MOUSEMOVE, WM_NULL, WM_RBUTTONUP, WM_SETTINGCHANGE, WNDCLASSEXW, WS_EX_LAYERED,
+    WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
 use windows::core::{PCWSTR, w};
 
@@ -853,8 +853,8 @@ impl WindowCtx {
                 if let Some((x, y)) = pos {
                     self.present_layered(x, y, w, h, src_dc);
                     self.last_pos = Some((x, y));
-                    self.set_visible(true);
-                    self.ensure_topmost();
+                    let became_visible = self.set_visible(true);
+                    ensure_just_above_taskbar(self.hwnd, env.tray_hwnd, became_visible);
                 } else {
                     self.set_visible(false);
                 }
@@ -876,18 +876,18 @@ impl WindowCtx {
                     unsafe {
                         let _ = SetWindowPos(
                             self.hwnd,
-                            Some(HWND_TOPMOST),
+                            None,
                             x,
                             y,
                             self.last_size.0,
                             self.last_size.1,
-                            SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_NOSENDCHANGING,
+                            SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_NOSENDCHANGING,
                         );
                     }
                     self.last_pos = Some((x, y));
                 }
-                self.set_visible(true);
-                self.ensure_topmost();
+                let became_visible = self.set_visible(true);
+                ensure_just_above_taskbar(self.hwnd, env.tray_hwnd, became_visible);
             } else {
                 self.set_visible(false);
             }
@@ -919,35 +919,19 @@ impl WindowCtx {
         }
     }
 
-    fn set_visible(&mut self, visible: bool) {
+    fn set_visible(&mut self, visible: bool) -> bool {
         if !visible {
             self.hovered = false;
             self.tracking_mouse = false;
         }
         if self.last_visible == visible {
-            return;
+            return false;
         }
         self.last_visible = visible;
         unsafe {
             let _ = ShowWindow(self.hwnd, if visible { SW_SHOWNOACTIVATE } else { SW_HIDE });
         }
-    }
-
-    fn ensure_topmost(&self) {
-        if !self.last_visible {
-            return;
-        }
-        unsafe {
-            let _ = SetWindowPos(
-                self.hwnd,
-                Some(HWND_TOPMOST),
-                0,
-                0,
-                0,
-                0,
-                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_NOSENDCHANGING,
-            );
-        }
+        visible
     }
 
     fn show_context_menu(&mut self) {
@@ -1263,6 +1247,59 @@ fn compute_widget_position(
             None => (taskbar_rect.bottom - h - gap).max(taskbar_rect.top + gap),
         };
         Some((x, y))
+    }
+}
+
+fn is_window_above(target: HWND, anchor: HWND) -> bool {
+    let mut cur = anchor;
+    for _ in 0..128 {
+        let Ok(prev) = (unsafe { GetWindow(cur, GW_HWNDPREV) }) else {
+            return false;
+        };
+        if prev.0.is_null() {
+            return false;
+        }
+        if prev == target {
+            return true;
+        }
+        cur = prev;
+    }
+    false
+}
+
+/// Keeps `widget_hwnd` directly above `tray_hwnd`, never climbing in front of
+/// popup menus, tray flyouts, or other programs' topmost windows.
+fn ensure_just_above_taskbar(widget_hwnd: HWND, tray_hwnd: HWND, force_reposition: bool) {
+    if !force_reposition && is_window_above(widget_hwnd, tray_hwnd) {
+        return;
+    }
+    let flags = SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_NOSENDCHANGING;
+    let mut cur = tray_hwnd;
+    for _ in 0..64 {
+        let Ok(prev) = (unsafe { GetWindow(cur, GW_HWNDPREV) }) else {
+            break;
+        };
+        if prev.0.is_null() {
+            break;
+        }
+        cur = prev;
+        if prev == widget_hwnd {
+            continue;
+        }
+        let visible = unsafe { IsWindowVisible(prev).as_bool() };
+        let ex_style = unsafe { GetWindowLongPtrW(prev, GWL_EXSTYLE) } as u32;
+        if visible
+            && (ex_style & WS_EX_TOPMOST.0) != 0
+            && unsafe { SetWindowPos(widget_hwnd, Some(prev), 0, 0, 0, 0, flags) }.is_ok()
+            && is_window_above(widget_hwnd, tray_hwnd)
+        {
+            return;
+        }
+    }
+    if !is_window_above(widget_hwnd, tray_hwnd) {
+        unsafe {
+            let _ = SetWindowPos(widget_hwnd, Some(HWND_TOPMOST), 0, 0, 0, 0, flags);
+        }
     }
 }
 
@@ -1810,5 +1847,68 @@ mod tests {
             "CPU label + value should stay compact without right-align padding, got {cpu_span}px"
         );
         unsafe { CoUninitialize() };
+    }
+
+    #[test]
+    fn widget_stays_above_taskbar_and_below_menus_and_topmost_windows() {
+        let hinstance = unsafe { GetModuleHandleW(None).unwrap() };
+        let class_name = register_window_class(HINSTANCE(hinstance.0)).unwrap();
+
+        let make_win = |ex_style, owner: Option<HWND>| unsafe {
+            CreateWindowExW(
+                ex_style,
+                class_name,
+                w!("z-order test"),
+                WS_POPUP,
+                -200,
+                -200,
+                10,
+                10,
+                owner,
+                None,
+                Some(HINSTANCE(hinstance.0)),
+                None,
+            )
+            .unwrap()
+        };
+
+        let mock_tray = make_win(WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TOPMOST, None);
+        let mock_menu = make_win(WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TOPMOST, None);
+        let widget = make_win(
+            WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TOPMOST,
+            Some(mock_tray),
+        );
+
+        unsafe {
+            let _ = ShowWindow(mock_tray, SW_SHOWNOACTIVATE);
+            let _ = ShowWindow(widget, SW_SHOWNOACTIVATE);
+            let _ = ShowWindow(mock_menu, SW_SHOWNOACTIVATE);
+            let _ = SetWindowPos(
+                mock_menu,
+                Some(HWND_TOPMOST),
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+            );
+        }
+
+        // First force_reposition (simulating unhide while another topmost popup/window exists),
+        // then steady-state ticks (force_reposition = false): both must keep widget above
+        // mock_tray while keeping mock_menu on top of widget.
+        ensure_just_above_taskbar(widget, mock_tray, true);
+        assert!(is_window_above(widget, mock_tray));
+        assert!(is_window_above(mock_menu, widget));
+
+        ensure_just_above_taskbar(widget, mock_tray, false);
+        assert!(is_window_above(widget, mock_tray));
+        assert!(is_window_above(mock_menu, widget));
+
+        unsafe {
+            let _ = DestroyWindow(widget);
+            let _ = DestroyWindow(mock_menu);
+            let _ = DestroyWindow(mock_tray);
+        }
     }
 }
