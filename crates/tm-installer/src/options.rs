@@ -2,7 +2,7 @@
 //!
 //! Flag spelling follows the established Windows setup conventions (and the
 //! green-curve setup this installer was modeled on): `/S`, `--uninstall`,
-//! `--no-start-menu`, `--desktop`, `--launch`. Everything else fails loudly -
+//! `--no-start-menu`, `--desktop`, `--no-launch`. Everything else fails loudly -
 //! a setup that silently ignores a mistyped flag installs the wrong thing.
 
 use tm_core::error::{Result, TmError};
@@ -18,7 +18,7 @@ OPTIONS:
   --uninstall           Remove an existing installation
   --no-start-menu       Do not create the Start menu shortcut
   --desktop             Create a desktop shortcut (off by default)
-  --launch              Start Task Manager when the install completes
+  --no-launch           Do not start Task Manager when the install completes
   --no-service          Do not register the background service now
                         (removes an existing service during upgrade;
                          the app can register it later from Settings, with UAC)
@@ -52,11 +52,12 @@ impl Default for Options {
         Options {
             mode: Mode::Install,
             silent: false,
-            // Start menu on, desktop off: the install is machine-wide, the
-            // shortcuts are for the desktop user who initiated setup.
+            // Start menu and post-install launch on, desktop off: the install
+            // is machine-wide, the shortcuts/launch are for the desktop user
+            // who initiated setup.
             start_menu: true,
             desktop: false,
-            launch: false,
+            launch: true,
             service: true,
             dry_run: false,
             help: false,
@@ -85,6 +86,7 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Options> {
                 "--no-start-menu" => opts.start_menu = false,
                 "--desktop" => opts.desktop = true,
                 "--launch" => opts.launch = true,
+                "--no-launch" => opts.launch = false,
                 "--no-service" => opts.service = false,
                 _ => {
                     if lower.starts_with("/d=") || lower.starts_with("/d:") {
@@ -120,7 +122,7 @@ mod tests {
         assert!(opts.service, "service install is on by default");
         assert!(opts.start_menu, "Start menu shortcut is on by default");
         assert!(!opts.desktop, "desktop shortcut is opt-in");
-        assert!(!opts.launch);
+        assert!(opts.launch, "post-install launch is on by default");
         assert!(!opts.silent);
     }
 
@@ -136,12 +138,20 @@ mod tests {
 
     #[test]
     fn shortcut_and_service_opt_outs_parse() {
-        let opts =
-            parse_all(&["--no-start-menu", "--desktop", "--launch", "--no-service"]).unwrap();
+        let opts = parse_all(&[
+            "--no-start-menu",
+            "--desktop",
+            "--no-launch",
+            "--no-service",
+        ])
+        .unwrap();
         assert!(!opts.start_menu);
         assert!(opts.desktop);
-        assert!(opts.launch);
+        assert!(!opts.launch);
         assert!(!opts.service);
+
+        let opts = parse_all(&["--no-launch", "--launch"]).unwrap();
+        assert!(opts.launch);
     }
 
     /// `/D` is the Windows convention for "install here"; accepting it and

@@ -2,10 +2,16 @@
 
 ## Unreleased
 
+## 0.1.25 - 2026-11-14
+
 ### New
 
 - **Windows taskbar performance monitor:** Added an optional taskbar overlay in **Settings** that renders live CPU usage, RAM usage, and total network upload/download rates next to the notification tray using software Direct2D/DirectWrite + `UpdateLayeredWindow` (without `GetDC(NULL)`/`GetPixel` screen reads or Explorer `SetParent` hooks). Supports toggling individual metrics, font family/size, network speed units (`Auto`, `KB/s`/`Kbps`, `MB/s`/`Mbps`, Bytes/s vs bits/s), and `Auto` (taskbar theme) or custom RGB text color; automatically hides when the taskbar auto-hides or a fullscreen window covers its monitor, and keeps TaskMan alive in the system tray on window close while enabled.
 - **Row spacing option in Processes and Details overflow menus:** Added a **Row spacing** (**Normal** / **Compact**) submenu to the top-right `…` menu on both the Processes and Details pages. Processes defaults to **Normal** (32 px) and Details defaults to **Compact** (20 px), and each page's choice is persisted independently in `config.ini`.
+
+### Changed
+
+- **Installer post-install launch enabled by default:** The "Launch Task Manager when setup completes" checkbox in `taskman-setup.exe` is now ticked by default (and silent CLI installs launch Task Manager unless `--no-launch` is passed).
 
 ## 0.1.24 - 2026-11-10
 

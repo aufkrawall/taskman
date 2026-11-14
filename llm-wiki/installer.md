@@ -138,7 +138,7 @@ Deliberate constraints:
   generation before replacing files; settings survive because they never live
   in the install tree.
 - **Silent/CLI:** `/S`, `--uninstall`, `--no-start-menu`, `--desktop`,
-  `--launch`, `--no-service`, `--dry-run`, `--help`. Unknown flags fail
+  `--no-launch`, `--no-service`, `--dry-run`, `--help`. Unknown flags fail
   loudly. Progress is written to `%SystemRoot%\Logs\TaskMan\setup.log`,
   best-effort like the service log. That folder is created with an
   admin-only DACL, and a reparse-point folder or log file is refused rather

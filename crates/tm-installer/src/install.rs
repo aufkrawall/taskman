@@ -563,12 +563,13 @@ mod tests {
                 "Install program files and register service",
                 "Register uninstaller in Settings",
                 "Create shortcuts",
+                "Launch Task Manager",
             ]
         );
 
         opts.service = false;
         opts.start_menu = false;
-        opts.launch = true;
+        opts.launch = false;
         let steps = install_steps(&opts);
         assert_eq!(
             steps,
@@ -577,9 +578,8 @@ mod tests {
                 "Stop running Task Manager",
                 "Install program files without background service",
                 "Register uninstaller in Settings",
-                "Launch Task Manager",
             ],
-            "no service step and no shortcut step when disabled"
+            "no service step, no shortcut step, and no launch step when disabled"
         );
     }
 
