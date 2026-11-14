@@ -18,7 +18,7 @@
 //!   the taskbar monitor (preserving DWM Independent Flip / MPO and never
 //!   floating over games/videos) or when an auto-hide taskbar slides away.
 
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 
 use tm_core::format::{format_taskbar_pct, format_taskbar_rate};
 use tm_core::settings::{TaskbarColorMode, TaskbarNetUnit};
@@ -38,9 +38,9 @@ use windows::Win32::Graphics::DirectWrite::{
     DWRITE_FACTORY_TYPE_SHARED, DWRITE_FONT_STRETCH_NORMAL, DWRITE_FONT_STYLE_NORMAL,
     DWRITE_FONT_WEIGHT_NORMAL, DWRITE_PARAGRAPH_ALIGNMENT_NEAR, DWRITE_PIXEL_GEOMETRY_BGR,
     DWRITE_PIXEL_GEOMETRY_RGB, DWRITE_RENDERING_MODE_DEFAULT, DWRITE_RENDERING_MODE_GDI_CLASSIC,
-    DWRITE_TEXT_ALIGNMENT_LEADING, DWRITE_TEXT_ALIGNMENT_TRAILING, DWRITE_TEXT_METRICS,
-    DWRITE_WORD_WRAPPING_NO_WRAP, DWriteCreateFactory, IDWriteFactory, IDWriteRenderingParams,
-    IDWriteTextFormat, IDWriteTextLayout,
+    DWRITE_TEXT_ALIGNMENT_LEADING, DWRITE_TEXT_METRICS, DWRITE_WORD_WRAPPING_NO_WRAP,
+    DWriteCreateFactory, IDWriteFactory, IDWriteRenderingParams, IDWriteTextFormat,
+    IDWriteTextLayout,
 };
 use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
 use windows::Win32::Graphics::Gdi::{
@@ -63,11 +63,11 @@ use windows::Win32::UI::Shell::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CS_DBLCLKS, CreatePopupMenu, CreateWindowExW, DestroyMenu, DestroyWindow, DispatchMessageW,
-    EVENT_SYSTEM_FOREGROUND, FindWindowExW, FindWindowW, GWLP_USERDATA, GetClassNameW,
-    GetCursorPos, GetDesktopWindow, GetForegroundWindow, GetMessageW, GetShellWindow,
-    GetWindowLongPtrW, GetWindowRect, HMENU, HWND_TOPMOST, IDC_ARROW, InsertMenuW, IsIconic,
-    IsWindowVisible, LoadCursorW, MA_NOACTIVATE, MF_BYPOSITION, MF_SEPARATOR, MF_STRING, MSG,
-    PostMessageW, PostQuitMessage, RegisterClassExW, RegisterWindowMessageW, SW_HIDE,
+    EVENT_SYSTEM_FOREGROUND, FindWindowExW, FindWindowW, GWLP_HWNDPARENT, GWLP_USERDATA,
+    GetClassNameW, GetCursorPos, GetDesktopWindow, GetForegroundWindow, GetMessageW,
+    GetShellWindow, GetWindowLongPtrW, GetWindowRect, HMENU, HWND_TOPMOST, IDC_ARROW, InsertMenuW,
+    IsIconic, IsWindowVisible, LoadCursorW, MA_NOACTIVATE, MF_BYPOSITION, MF_SEPARATOR, MF_STRING,
+    MSG, PostMessageW, PostQuitMessage, RegisterClassExW, RegisterWindowMessageW, SW_HIDE,
     SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOOWNERZORDER, SWP_NOSENDCHANGING,
     SWP_NOSIZE, SetForegroundWindow, SetMenuDefaultItem, SetWindowLongPtrW, SetWindowPos,
     ShowWindow, TPM_BOTTOMALIGN, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenuEx,
@@ -97,6 +97,7 @@ struct SharedState {
 
 pub struct TaskbarMonitorHandle {
     shared: Arc<Mutex<SharedState>>,
+    state_cv: Arc<Condvar>,
     callback: Arc<dyn Fn(Action) + Send + Sync>,
     worker: Mutex<Option<std::thread::JoinHandle<()>>>,
 }
@@ -109,6 +110,7 @@ impl TaskbarMonitorHandle {
                 metrics: Metrics::default(),
                 generation: 0,
             })),
+            state_cv: Arc::new(Condvar::new()),
             callback,
             worker: Mutex::new(None),
         }
@@ -123,6 +125,7 @@ impl TaskbarMonitorHandle {
             }
             guard.config = config;
             guard.generation = guard.generation.wrapping_add(1);
+            self.state_cv.notify_all();
         }
 
         if should_run {
@@ -153,6 +156,7 @@ impl TaskbarMonitorHandle {
             let mut guard = self.shared.lock().unwrap_or_else(|e| e.into_inner());
             guard.config.enabled = false;
             guard.generation = guard.generation.wrapping_add(1);
+            self.state_cv.notify_all();
         }
         self.stop_worker();
     }
@@ -176,10 +180,11 @@ impl TaskbarMonitorHandle {
         }
         *worker = None;
         let shared = self.shared.clone();
+        let state_cv = self.state_cv.clone();
         let callback = self.callback.clone();
         match std::thread::Builder::new()
             .name("tm-taskbar".into())
-            .spawn(move || taskbar_thread_main(shared, callback))
+            .spawn(move || taskbar_thread_main(shared, state_cv, callback))
         {
             Ok(handle) => *worker = Some(handle),
             Err(error) => tracing::warn!(%error, "cannot start taskbar monitor thread"),
@@ -507,9 +512,9 @@ impl Renderer {
         } else {
             (0.0, 0.0, None)
         };
-        let net_arrow_gap = if has_net { 3.0 } else { 0.0 };
+        let net_arrow_gap = if has_net { 1.5 } else { 0.0 };
         let net_val_w = if has_net {
-            sent_w.max(recv_w).max(net_sample_w) + 1.0
+            sent_w.max(recv_w).max(net_sample_w)
         } else {
             0.0
         };
@@ -540,14 +545,10 @@ impl Renderer {
         } else {
             (0.0, 0.0, None)
         };
-        let sys_label_w = if has_sys {
-            cpu_lw.max(ram_lw) + 1.0
-        } else {
-            0.0
-        };
-        let sys_label_gap = if has_sys { 4.0 } else { 0.0 };
+        let sys_label_w = if has_sys { cpu_lw.max(ram_lw) } else { 0.0 };
+        let sys_label_gap = if has_sys { 2.5 } else { 0.0 };
         let sys_val_w = if has_sys {
-            cpu_vw.max(ram_vw).max(sys_val_sample_w) + 1.0
+            cpu_vw.max(ram_vw).max(sys_val_sample_w)
         } else {
             0.0
         };
@@ -576,7 +577,7 @@ impl Renderer {
         if two_rows && row_h * 2.0 + row_gap + 4.0 > max_h {
             row_gap = 0.0;
         }
-        let col_gap = if has_net && has_sys { 6.0 } else { 0.0 };
+        let col_gap = if has_net && has_sys { 7.0 } else { 0.0 };
         let pad_x = 6.0;
         let content_h = if two_rows {
             row_h * 2.0 + row_gap
@@ -693,7 +694,7 @@ impl Renderer {
                 if let Some(layout) = sent_layout {
                     let _ = layout.SetMaxWidth(net_val_w);
                     let _ = layout.SetMaxHeight(row_h);
-                    let _ = layout.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_TRAILING);
+                    let _ = layout.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
                     self.dc_rt.DrawTextLayout(
                         windows_numerics::Vector2 { X: val_x, Y: top_y },
                         &layout,
@@ -718,7 +719,7 @@ impl Renderer {
                 if let Some(layout) = recv_layout {
                     let _ = layout.SetMaxWidth(net_val_w);
                     let _ = layout.SetMaxHeight(row_h);
-                    let _ = layout.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_TRAILING);
+                    let _ = layout.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
                     self.dc_rt.DrawTextLayout(
                         windows_numerics::Vector2 {
                             X: val_x,
@@ -750,7 +751,7 @@ impl Renderer {
                         if let Some(v) = val {
                             let _ = v.SetMaxWidth(sys_val_w);
                             let _ = v.SetMaxHeight(row_h);
-                            let _ = v.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_TRAILING);
+                            let _ = v.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
                             self.dc_rt.DrawTextLayout(
                                 windows_numerics::Vector2 { X: val_x, Y: y },
                                 &v,
@@ -780,6 +781,8 @@ impl Renderer {
 
 struct WindowCtx {
     hwnd: HWND,
+    owner_hwnd: isize,
+    user_closing: bool,
     shared: Arc<Mutex<SharedState>>,
     callback: Arc<dyn Fn(Action) + Send + Sync>,
     renderer: Option<Renderer>,
@@ -794,6 +797,19 @@ struct WindowCtx {
 }
 
 impl WindowCtx {
+    fn sync_owner(&mut self, tray_hwnd: HWND) {
+        let raw = tray_hwnd.0 as isize;
+        if raw != 0 && self.owner_hwnd != raw {
+            // Setting Shell_TrayWnd as Win32 owner (not SetParent) keeps
+            // independent message queues while guaranteeing Win32 keeps our
+            // widget above the taskbar atomically on taskbar clicks.
+            unsafe {
+                SetWindowLongPtrW(self.hwnd, GWLP_HWNDPARENT, raw);
+            }
+            self.owner_hwnd = raw;
+        }
+    }
+
     fn refresh(&mut self, force_render: bool) {
         let (config, metrics) = {
             let guard = self.shared.lock().unwrap_or_else(|e| e.into_inner());
@@ -810,6 +826,8 @@ impl WindowCtx {
             self.set_visible(false);
             return;
         };
+
+        self.sync_owner(env.tray_hwnd);
 
         let display = build_display(&config, &metrics, self.light_taskbar, self.hovered, env.dpi);
         let size_changed_or_needed = force_render
@@ -1079,6 +1097,7 @@ fn build_display(
 }
 
 struct TaskbarEnv {
+    tray_hwnd: HWND,
     taskbar_rect: PixelRect,
     tray_notify_rect: Option<PixelRect>,
     monitor_rect: PixelRect,
@@ -1129,6 +1148,7 @@ fn query_taskbar_env(own_hwnd: HWND) -> Option<TaskbarEnv> {
 
         let dpi = GetDpiForWindow(tray_hwnd);
         Some(TaskbarEnv {
+            tray_hwnd,
             taskbar_rect,
             tray_notify_rect,
             monitor_rect,
@@ -1410,7 +1430,11 @@ unsafe extern "system" fn wnd_proc(
             LRESULT(0)
         }
         WM_CLOSE => {
-            let _ = unsafe { DestroyWindow(hwnd) };
+            ctx.user_closing = true;
+            unsafe {
+                SetWindowLongPtrW(hwnd, GWLP_HWNDPARENT, 0);
+                let _ = DestroyWindow(hwnd);
+            }
             LRESULT(0)
         }
         WM_DESTROY => {
@@ -1428,6 +1452,7 @@ unsafe extern "system" fn wnd_proc(
 
 fn taskbar_thread_main(
     shared: Arc<Mutex<SharedState>>,
+    state_cv: Arc<Condvar>,
     callback: Arc<dyn Fn(Action) + Send + Sync>,
 ) {
     unsafe {
@@ -1448,94 +1473,128 @@ fn taskbar_thread_main(
     };
 
     let msg_taskbar_created = unsafe { RegisterWindowMessageW(w!("TaskbarCreated")) };
-    let renderer = Renderer::new();
-    let mut ctx_box = Box::new(WindowCtx {
-        hwnd: HWND::default(),
-        shared,
-        callback,
-        renderer,
-        light_taskbar: read_system_uses_light_theme(),
-        hovered: false,
-        tracking_mouse: false,
-        last_display: None,
-        last_size: (0, 0),
-        last_pos: None,
-        last_visible: false,
-        msg_taskbar_created,
-    });
 
-    let ctx_ptr: *mut WindowCtx = &mut *ctx_box;
-    let hwnd = match unsafe {
-        CreateWindowExW(
-            WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TOPMOST,
-            class_name,
-            w!("TaskMan Taskbar Monitor"),
-            WS_POPUP,
-            0,
-            0,
-            1,
-            1,
-            None,
-            None,
-            Some(hmodule),
-            Some(ctx_ptr.cast()),
-        )
-    } {
-        Ok(h) if !h.0.is_null() => h,
-        _ => {
-            unsafe { CoUninitialize() };
-            return;
-        }
-    };
-
-    ctx_box.hwnd = hwnd;
-    LIVE_HWND.store(hwnd.0 as isize, std::sync::atomic::Ordering::Release);
-
-    // If `shutdown()` / `set_config(enabled = false)` raced before `LIVE_HWND`
-    // was published, exit immediately instead of parking in `GetMessageW`.
-    let still_enabled = {
-        let guard = ctx_box.shared.lock().unwrap_or_else(|e| e.into_inner());
-        guard.config.enabled
-    };
-    if !still_enabled {
-        LIVE_HWND.store(0, std::sync::atomic::Ordering::Release);
-        let _ = unsafe { DestroyWindow(hwnd) };
-        drop(ctx_box);
-        unsafe { CoUninitialize() };
-        return;
-    }
-
-    let hook = unsafe {
-        SetWinEventHook(
-            EVENT_SYSTEM_FOREGROUND,
-            EVENT_SYSTEM_FOREGROUND,
-            None,
-            Some(fg_event_proc),
-            0,
-            0,
-            WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS,
-        )
-    };
-
-    ctx_box.refresh(true);
-
-    let mut msg = MSG::default();
     loop {
-        let res = unsafe { GetMessageW(&mut msg, None, 0, 0) };
-        if res.0 <= 0 {
+        let tray_owner = unsafe { FindWindowW(w!("Shell_TrayWnd"), None) }
+            .ok()
+            .filter(|h| !h.0.is_null());
+        let Some(owner) = tray_owner else {
+            let mut guard = shared.lock().unwrap_or_else(|e| e.into_inner());
+            if !guard.config.enabled {
+                break;
+            }
+            let (g, _) = state_cv
+                .wait_timeout(guard, std::time::Duration::from_millis(250))
+                .unwrap_or_else(|e| e.into_inner());
+            guard = g;
+            if !guard.config.enabled {
+                break;
+            }
+            continue;
+        };
+
+        let renderer = Renderer::new();
+        let mut ctx_box = Box::new(WindowCtx {
+            hwnd: HWND::default(),
+            owner_hwnd: owner.0 as isize,
+            user_closing: false,
+            shared: shared.clone(),
+            callback: callback.clone(),
+            renderer,
+            light_taskbar: read_system_uses_light_theme(),
+            hovered: false,
+            tracking_mouse: false,
+            last_display: None,
+            last_size: (0, 0),
+            last_pos: None,
+            last_visible: false,
+            msg_taskbar_created,
+        });
+
+        let ctx_ptr: *mut WindowCtx = &mut *ctx_box;
+        let hwnd = match unsafe {
+            CreateWindowExW(
+                WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TOPMOST,
+                class_name,
+                w!("TaskMan Taskbar Monitor"),
+                WS_POPUP,
+                0,
+                0,
+                1,
+                1,
+                Some(owner),
+                None,
+                Some(hmodule),
+                Some(ctx_ptr.cast()),
+            )
+        } {
+            Ok(h) if !h.0.is_null() => h,
+            _ => {
+                break;
+            }
+        };
+
+        ctx_box.hwnd = hwnd;
+        LIVE_HWND.store(hwnd.0 as isize, std::sync::atomic::Ordering::Release);
+
+        // If `shutdown()` / `set_config(enabled = false)` raced before `LIVE_HWND`
+        // was published, exit immediately instead of parking in `GetMessageW`.
+        let still_enabled = {
+            let guard = ctx_box.shared.lock().unwrap_or_else(|e| e.into_inner());
+            guard.config.enabled
+        };
+        if !still_enabled {
+            LIVE_HWND.store(0, std::sync::atomic::Ordering::Release);
+            unsafe {
+                SetWindowLongPtrW(hwnd, GWLP_HWNDPARENT, 0);
+                let _ = DestroyWindow(hwnd);
+            }
+            drop(ctx_box);
             break;
         }
-        let _ = unsafe { TranslateMessage(&msg) };
-        unsafe { DispatchMessageW(&msg) };
-    }
 
-    LIVE_HWND.store(0, std::sync::atomic::Ordering::Release);
-    if !hook.is_invalid() {
-        unsafe {
-            let _ = UnhookWinEvent(hook);
+        let hook = unsafe {
+            SetWinEventHook(
+                EVENT_SYSTEM_FOREGROUND,
+                EVENT_SYSTEM_FOREGROUND,
+                None,
+                Some(fg_event_proc),
+                0,
+                0,
+                WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS,
+            )
+        };
+
+        ctx_box.refresh(true);
+
+        let mut msg = MSG::default();
+        loop {
+            let res = unsafe { GetMessageW(&mut msg, None, 0, 0) };
+            if res.0 <= 0 {
+                break;
+            }
+            let _ = unsafe { TranslateMessage(&msg) };
+            unsafe { DispatchMessageW(&msg) };
+        }
+
+        LIVE_HWND.store(0, std::sync::atomic::Ordering::Release);
+        if !hook.is_invalid() {
+            unsafe {
+                let _ = UnhookWinEvent(hook);
+            }
+        }
+        let user_closing = ctx_box.user_closing;
+        drop(ctx_box);
+
+        let still_enabled = {
+            let guard = shared.lock().unwrap_or_else(|e| e.into_inner());
+            guard.config.enabled
+        };
+        if user_closing || !still_enabled {
+            break;
         }
     }
-    drop(ctx_box);
+
     unsafe { CoUninitialize() };
 }
 
@@ -1739,6 +1798,17 @@ mod tests {
                 .expect("CPU label pixels present")
         };
         assert_eq!(first_cpu_x(&snap1), first_cpu_x(&snap2));
+
+        // Ensure "1%" starts right after the "CPU"/"RAM" label slot without the wide
+        // right-aligned padding void: total CPU-label-to-1%-end span stays compact.
+        let last_cpu_x = (w1 as usize / 2..w1 as usize)
+            .rfind(|&x| (0..h1 as usize).any(|y| snap1[(y * w1 as usize + x) * 4 + 3] >= 64))
+            .expect("CPU percent pixels present");
+        let cpu_span = last_cpu_x - first_cpu_x(&snap1);
+        assert!(
+            cpu_span <= 42,
+            "CPU label + value should stay compact without right-align padding, got {cpu_span}px"
+        );
         unsafe { CoUninitialize() };
     }
 }
