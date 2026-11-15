@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Improved
+
+- **Faster taskbar monitor reappearance when Alt+Tabbing out of fullscreen:** Alt+Tabbing or switching away from a fullscreen window now restores the taskbar stats display immediately whenever the taskbar geometry and DPI are unchanged, instead of discarding the cached layout and waiting for a fresh UI Automation scan. The widget reappears click-through (`WS_EX_TRANSPARENT`) on its cached placement while UI Automation verifies taskbar button positions in the background, tracks the suppressing fullscreen window across focus handoff, and runs a short bounded transition check if Windows finishes clearing fullscreen Z-order or D3D state slightly after focus changes. Changed taskbar geometry, failed scans, or a full taskbar still wait for fresh UI Automation confirmation.
+
 ### Fixed
 
 - **Taskbar monitor visibility with Windows 11 Start, Search, and shell flyouts open:** Opening the Windows 11 Start Menu, Search, or tray flyouts no longer hides the taskbar stats. On Windows 11, opening Start or Search promotes `Shell_TrayWnd` into immersive band 6 (`ZBID_IMMERSIVE_MOGO`), which `EnumWindows` omits from non-immersive callers (`tray_missing_in_enum`), and places `Windows.UI.Core.CoreWindow` overlay canvases (`StartMenuExperienceHost.exe`, `SearchHost.exe`, `SearchApp.exe`, `ShellExperienceHost.exe`, `ShellHost.exe`) in band 6 above the taskbar. Occlusion and fullscreen scans now skip lower-band windows (`band < tray_band`), keep Band-16 stats visible while a live `Shell_TrayWnd` resides in an elevated band (> 1) omitted by `EnumWindows`, ignore those shell host `CoreWindow` canvases (while still hiding behind genuine overlapping popup menus such as `#32768` or `Xaml_WindowedPopupClass`), and ignore cross-band higher windows in band-1 fallback ordering.

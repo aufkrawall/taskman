@@ -1,3 +1,31 @@
+## 2026-11-15 — instant taskbar stats restore on Alt+Tab out of fullscreen
+
+- Investigated delayed taskbar monitor reappearance when Alt+Tabbing out of a
+  fullscreen window:
+  1. `WindowCtx::refresh` previously cleared `self.last_env_geom = None` on
+     fullscreen suppression, forcing `geom_changed = true` ->
+     `invalidate_uia_layout = true` (`guard.cache.rects = None`) on return even
+     when the taskbar HWND, rect, `TrayNotifyWnd`, and DPI were unchanged, and
+     `!uia_occupied.current` blocked hidden windows from reappearing until a
+     full cross-process UIA scan (plus 80 ms worker burst coalescing) completed.
+  2. When foreground moved away from a fullscreen suppressor (Alt+Tab) while
+     the suppressor or `Shell_TrayWnd` Z-order / `SHQueryUserNotificationState`
+     was still settling, `sync_foreground_hook` unhooked the fullscreen thread
+     and pure Z-order raises emit desktop `EVENT_OBJECT_REORDER` rather than
+     `EVENT_OBJECT_LOCATIONCHANGE`.
+- Preserved `last_env_geom` across transient suppression and added
+  `restore_from_cached_layout` so previously visible widgets reappear
+  immediately click-through (`WS_EX_TRANSPARENT`) on their cached UIA layout
+  while background UIA revalidates (restoring hit testing once current, or
+  relocating/hiding if buttons moved; startup, `no_placement_slot`, failed
+  scans, and geometry/DPI changes still wait for fresh UIA). Added
+  `sync_fullscreen_hook` (`LIVE_FS_HWND` -> `EVENT_OBJECT_LOCATIONCHANGE`) on
+  the suppressing window's thread plus a bounded `FULLSCREEN_EXIT_TIMER_ID`
+  (20 ms × 8) when foreground has left a settling fullscreen/D3D state.
+- Added `fullscreen_suppression_restores_immediately_on_cached_layout_without_stealing_clicks`
+  and `fullscreen_hook_tracks_suppressing_window_moves_after_foreground_leaves`;
+  live desktop Alt+Tab visual timing awaits interactive user confirmation.
+
 ## 2026-11-15 — taskbar stats kept visible when Windows 11 Start / Search open
 
 - Investigated user report that taskbar stats disappeared upon opening the

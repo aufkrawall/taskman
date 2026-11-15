@@ -1121,12 +1121,16 @@ rebase runbook.
   even while telemetry updates are paused), and (c) the
   `Shell_TrayWnd` thread (`EVENT_OBJECT_SHOW`..`EVENT_OBJECT_LOCATIONCHANGE`,
   filtered to `OBJID_WINDOW` `SHOW`/`HIDE`/`LOCATIONCHANGE` on tray + `IsChild`
-  descendants plus top-level topmost moves on Explorer's thread and `EVENT_OBJECT_REORDER`) with `REFRESH_PENDING`,
-  `LAYOUT_DIRTY`, and `LAYOUT_RECHECK_PENDING` coalescing plus a 300 ms
-  one-shot settle timer to refresh on
-  fullscreen/auto-hide transitions (including when
-  holding `Alt+Tab` or another overlay takes foreground while an uncloaked,
-  opaque fullscreen window still sits above `Shell_TrayWnd` in Z-order). In the
+  descendants plus top-level topmost moves on Explorer's thread and `EVENT_OBJECT_REORDER`),
+  and (d) the suppressing fullscreen window's thread (`sync_fullscreen_hook` ->
+  `EVENT_OBJECT_LOCATIONCHANGE`, kept even after `Alt+Tab` moves foreground
+  away while the fullscreen window is still settling) with `REFRESH_PENDING`,
+  `LAYOUT_RECHECK_PENDING`, and `FULLSCREEN_WAKE_PENDING` coalescing plus a
+  300 ms UIA settle timer and a bounded 20 ms × 8 fullscreen-exit transition
+  recheck when foreground has already left a settling fullscreen/D3D state
+  (including when holding `Alt+Tab` or another overlay takes foreground while
+  an uncloaked, opaque fullscreen window still sits above `Shell_TrayWnd` in
+  Z-order). In the
   band-1 fallback path, Z-order follows `Shell_TrayWnd` using the nearest visible,
   uncloaked same-band predecessor (skipping cross-band windows such as band-6
   `StartMenuExperienceHost` canvases), without fixed-count window walks or
@@ -1153,9 +1157,15 @@ rebase runbook.
   creation/destruction/replacement and taskbar root/child/control notifications
   revalidate transactionally: an already visible widget preserves its pixels
   and footprint but sets `WS_EX_TRANSPARENT` to pass clicks through until the
-  latest scan completes. A hidden widget never reappears on provisional data.
-  There can be transient visual overlap during revalidation; fresh occupancy
-  relocates or hides the widget before restoring interaction. Actual
+  latest scan completes. Widgets hidden only by transient fullscreen or
+  occlusion suppression (`restore_from_cached_layout`) preserve `last_env_geom`
+  and reappear immediately click-through (`WS_EX_TRANSPARENT`) on their cached
+  occupancy when returning to unchanged geometry/DPI while background UIA
+  revalidates; widgets without a confirmed prior slot (startup,
+  `no_placement_slot`, failed scan, or geometry/DPI change) still wait for
+  validation before appearing. There can be transient visual overlap during
+  revalidation; fresh occupancy relocates or hides the widget before restoring
+  interaction. Actual
   taskbar/tray/DPI geometry or taskbar identity changes discard the old layout
   and hide immediately. Stacking-only repair runs in the existing taskbar
   foreground/root WinEvent callbacks before posting refresh, without app/UIA

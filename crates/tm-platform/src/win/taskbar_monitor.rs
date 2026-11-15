@@ -128,6 +128,9 @@ const WM_APP_REFRESH: u32 = WM_APP + 10;
 const WM_MOUSELEAVE: u32 = 0x02A3;
 const UIA_SETTLE_TIMER_ID: usize = 1;
 const UIA_SETTLE_DELAY_MS: u32 = 300;
+const FULLSCREEN_EXIT_TIMER_ID: usize = 2;
+const FULLSCREEN_EXIT_RECHECK_MS: u32 = 20;
+const FULLSCREEN_EXIT_MAX_RETRIES: u8 = 8;
 const MIN_ADAPTIVE_FONT_PT: f32 = 6.5;
 // `HSHELL_HIGHBIT | HSHELL_WINDOWACTIVATED`: Windows Shell notification fired
 // when a fullscreen / "rude" app enters or leaves fullscreen focus.
@@ -184,10 +187,13 @@ fn layout_fits_cross_axis(layout: &MeasuredLayout, bounds: LayoutBounds) -> bool
 /// message queue.
 static LIVE_HWND: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
 static LIVE_FG_HWND: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
+static LIVE_FS_HWND: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
 static LIVE_TRAY_HWND: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
 static IN_ELEVATED_BAND: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static REFRESH_PENDING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static LAYOUT_RECHECK_PENDING: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+static FULLSCREEN_WAKE_PENDING: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1105,13 +1111,19 @@ struct WindowCtx {
     last_env_geom: Option<(isize, PixelRect, Option<PixelRect>, u32)>,
     pending_uia_scan: bool,
     invalidate_uia_layout: bool,
+    restore_from_cached_layout: bool,
     msg_taskbar_created: u32,
     msg_shell_hook: u32,
     tracked_fg_tid: u32,
     fg_loc_hook: HWINEVENTHOOK,
+    tracked_fs_tid: u32,
+    fs_loc_hook: HWINEVENTHOOK,
     tracked_tray_tid: u32,
     tray_hook: HWINEVENTHOOK,
     topmost_hooks: Vec<(u32, HWINEVENTHOOK)>,
+    last_fg_hwnd: isize,
+    fullscreen_recheck_remaining: u8,
+    fullscreen_recheck_armed: bool,
 }
 
 impl Drop for WindowCtx {
@@ -1124,7 +1136,10 @@ impl Drop for WindowCtx {
 impl WindowCtx {
     fn request_layout_scan(&mut self, update: LayoutUpdate, arm_settle: bool) {
         self.pending_uia_scan = true;
-        self.invalidate_uia_layout |= update == LayoutUpdate::Invalidate;
+        if update == LayoutUpdate::Invalidate {
+            self.invalidate_uia_layout = true;
+            self.restore_from_cached_layout = false;
+        }
         if arm_settle && !self.hwnd.0.is_null() {
             unsafe {
                 let _ = SetTimer(
@@ -1139,12 +1154,19 @@ impl WindowCtx {
 
     fn unhook_dynamic_hooks(&mut self) {
         LIVE_FG_HWND.store(0, std::sync::atomic::Ordering::Release);
+        LIVE_FS_HWND.store(0, std::sync::atomic::Ordering::Release);
         LIVE_TRAY_HWND.store(0, std::sync::atomic::Ordering::Release);
         if !self.fg_loc_hook.is_invalid() {
             unsafe {
                 let _ = UnhookWinEvent(self.fg_loc_hook);
             }
             self.fg_loc_hook = HWINEVENTHOOK::default();
+        }
+        if !self.fs_loc_hook.is_invalid() {
+            unsafe {
+                let _ = UnhookWinEvent(self.fs_loc_hook);
+            }
+            self.fs_loc_hook = HWINEVENTHOOK::default();
         }
         if !self.tray_hook.is_invalid() {
             unsafe {
@@ -1160,7 +1182,52 @@ impl WindowCtx {
             }
         }
         self.tracked_fg_tid = 0;
+        self.tracked_fs_tid = 0;
         self.tracked_tray_tid = 0;
+    }
+
+    fn sync_fullscreen_hook(&mut self, fs_hwnd: HWND) {
+        LIVE_FS_HWND.store(fs_hwnd.0 as isize, std::sync::atomic::Ordering::Release);
+        let tid = if fs_hwnd.0.is_null() {
+            0
+        } else {
+            unsafe { GetWindowThreadProcessId(fs_hwnd, None) }
+        };
+        let self_tid = unsafe { GetCurrentThreadId() };
+        let target_tid = if tid != 0 && tid != self_tid { tid } else { 0 };
+        if target_tid == self.tracked_fs_tid {
+            return;
+        }
+        if !self.fs_loc_hook.is_invalid() {
+            unsafe {
+                let _ = UnhookWinEvent(self.fs_loc_hook);
+            }
+            self.fs_loc_hook = HWINEVENTHOOK::default();
+        }
+        self.tracked_fs_tid = target_tid;
+        if target_tid != 0 {
+            self.fs_loc_hook = unsafe {
+                SetWinEventHook(
+                    EVENT_OBJECT_LOCATIONCHANGE,
+                    EVENT_OBJECT_LOCATIONCHANGE,
+                    None,
+                    Some(fs_location_event_proc),
+                    0,
+                    target_tid,
+                    WINEVENT_OUTOFCONTEXT,
+                )
+            };
+        }
+    }
+
+    fn disarm_fullscreen_exit_recheck(&mut self) {
+        if self.fullscreen_recheck_armed && !self.hwnd.0.is_null() {
+            unsafe {
+                let _ = KillTimer(Some(self.hwnd), FULLSCREEN_EXIT_TIMER_ID);
+            }
+        }
+        self.fullscreen_recheck_armed = false;
+        self.fullscreen_recheck_remaining = 0;
     }
 
     fn sync_foreground_hook(&mut self) {
@@ -1281,13 +1348,17 @@ impl WindowCtx {
     }
 
     fn refresh(&mut self, force_render: bool) {
+        let wake_recheck = FULLSCREEN_WAKE_PENDING.swap(false, std::sync::atomic::Ordering::AcqRel);
         let (config, metrics) = {
             let guard = self.shared.lock().unwrap_or_else(|e| e.into_inner());
             (guard.config.clone(), guard.metrics)
         };
 
         if !config.enabled || (!config.show_cpu && !config.show_ram && !config.show_network) {
+            self.sync_fullscreen_hook(HWND::default());
+            self.disarm_fullscreen_exit_recheck();
             self.sync_topmost_hooks(HWND::default());
+            self.restore_from_cached_layout = false;
             self.set_visible(false);
             return;
         }
@@ -1299,12 +1370,55 @@ impl WindowCtx {
         self.sync_tray_hook(tray_hwnd);
         self.sync_topmost_hooks(tray_hwnd);
 
-        let env = query_taskbar_env(tray_hwnd, self.hwnd);
-        let Some(env) = env else {
-            self.last_env_geom = None;
-            self.pending_uia_scan = true;
-            self.hide("env_unavailable_or_fullscreen", None);
-            return;
+        let fg_raw = unsafe { GetForegroundWindow() }.0 as isize;
+        let fg_changed = fg_raw != self.last_fg_hwnd;
+        self.last_fg_hwnd = fg_raw;
+
+        let env = match probe_taskbar_env(tray_hwnd, self.hwnd) {
+            TaskbarEnvProbe::Ready(env) => {
+                self.sync_fullscreen_hook(HWND::default());
+                self.disarm_fullscreen_exit_recheck();
+                env
+            }
+            TaskbarEnvProbe::Fullscreen {
+                suppressor,
+                fg_covers_monitor,
+            } => {
+                self.sync_fullscreen_hook(suppressor.unwrap_or_default());
+                if fg_covers_monitor {
+                    self.disarm_fullscreen_exit_recheck();
+                } else {
+                    if wake_recheck || fg_changed {
+                        self.fullscreen_recheck_remaining = FULLSCREEN_EXIT_MAX_RETRIES;
+                    }
+                    if self.fullscreen_recheck_remaining > 0 && !self.hwnd.0.is_null() {
+                        unsafe {
+                            let _ = SetTimer(
+                                Some(self.hwnd),
+                                FULLSCREEN_EXIT_TIMER_ID,
+                                FULLSCREEN_EXIT_RECHECK_MS,
+                                None,
+                            );
+                        }
+                        self.fullscreen_recheck_armed = true;
+                    } else {
+                        self.disarm_fullscreen_exit_recheck();
+                    }
+                }
+                // Preserve `last_env_geom` and `restore_from_cached_layout` across
+                // transient fullscreen suppression so returning to an unchanged
+                // taskbar can reappear immediately while UIA revalidates.
+                self.pending_uia_scan = true;
+                self.hide("env_unavailable_or_fullscreen", None);
+                return;
+            }
+            TaskbarEnvProbe::Unavailable => {
+                self.sync_fullscreen_hook(HWND::default());
+                self.disarm_fullscreen_exit_recheck();
+                self.pending_uia_scan = true;
+                self.hide("env_unavailable_or_fullscreen", None);
+                return;
+            }
         };
 
         self.refresh_taskbar_env(&config, &metrics, env, force_render);
@@ -1337,6 +1451,7 @@ impl WindowCtx {
     fn hide_occluded_if_needed(&mut self, tray_hwnd: HWND, target_rect: Option<PixelRect>) -> bool {
         if self.in_elevated_band {
             let Some(rect) = target_rect else {
+                self.restore_from_cached_layout = false;
                 self.hide("missing_target_rect", None);
                 return true;
             };
@@ -1359,6 +1474,17 @@ impl WindowCtx {
         }
     }
 
+    fn finish_show(&mut self, tray_hwnd: HWND, allow_input: bool) {
+        let positioned = self.in_elevated_band || ensure_just_above_taskbar(self.hwnd, tray_hwnd);
+        let hit_test_ok = self.set_interactive(allow_input);
+        self.set_visible(positioned && hit_test_ok);
+        if !hit_test_ok {
+            self.restore_from_cached_layout = false;
+        } else if allow_input && self.last_visible {
+            self.restore_from_cached_layout = true;
+        }
+    }
+
     fn refresh_taskbar_env(
         &mut self,
         config: &Config,
@@ -1373,6 +1499,7 @@ impl WindowCtx {
             self.last_env_geom = Some(geom);
             self.pending_uia_scan = true;
             self.invalidate_uia_layout = true;
+            self.restore_from_cached_layout = false;
         }
 
         if self.pending_uia_scan {
@@ -1386,23 +1513,33 @@ impl WindowCtx {
         let Some(uia_occupied) = self.uia_scanner.snapshot_for(tray_raw, env.taskbar_rect) else {
             self.uia_scanner
                 .request_scan(tray_raw, env.taskbar_rect, false);
+            self.restore_from_cached_layout = false;
             self.set_visible(false);
             return;
         };
 
         if !uia_occupied.current {
-            // A layout hint is not evidence that our pixels collide. Keep the
-            // already presented footprint stable while scanning, but never
-            // intercept a control that may have moved underneath it. Hidden
-            // windows must wait for validation before appearing again.
-            if !self.set_interactive(false) {
-                self.set_visible(false);
+            if self.last_visible {
+                // A layout hint is not evidence that our pixels collide. Keep
+                // the already presented footprint stable while scanning, but
+                // never intercept a control that may have moved underneath it.
+                if !self.set_interactive(false) {
+                    self.restore_from_cached_layout = false;
+                    self.set_visible(false);
+                    return;
+                }
+                let _ = self.hide_occluded_if_needed(env.tray_hwnd, self.last_rect());
                 return;
             }
-            if self.last_visible && self.hide_occluded_if_needed(env.tray_hwnd, self.last_rect()) {
+            if !self.restore_from_cached_layout {
+                // Hidden windows without a previously confirmed, geometry-matched
+                // layout (e.g. startup or after `no_placement_slot`) must wait
+                // for fresh UIA validation before appearing.
+                if !self.set_interactive(false) {
+                    self.set_visible(false);
+                }
                 return;
             }
-            return;
         }
 
         // Repair a taskbar raise before DirectWrite measurement/rasterization.
@@ -1434,10 +1571,12 @@ impl WindowCtx {
             false,
         );
         let Some(renderer) = self.renderer.as_mut() else {
+            self.restore_from_cached_layout = false;
             self.set_visible(false);
             return;
         };
         let Some(normal_layout) = renderer.measure_layout(&normal_display, bounds) else {
+            self.restore_from_cached_layout = false;
             self.set_visible(false);
             return;
         };
@@ -1476,6 +1615,7 @@ impl WindowCtx {
                 true,
             );
             let Some(compact_layout) = renderer.measure_layout(&compact_display, bounds) else {
+                self.restore_from_cached_layout = false;
                 self.set_visible(false);
                 return;
             };
@@ -1491,6 +1631,7 @@ impl WindowCtx {
             ) else {
                 // Taskbar is completely full even in compact form: step out of the way
                 // instead of overlapping taskbar buttons or stealing their clicks.
+                self.restore_from_cached_layout = false;
                 self.hide("no_placement_slot", None);
                 return;
             };
@@ -1531,6 +1672,7 @@ impl WindowCtx {
                 renderer.render_layout(&display, layout, Some(self.hwnd.0 as isize))
             {
                 if !self.present_layered(x, y, rw, rh, src_dc) {
+                    self.restore_from_cached_layout = false;
                     self.set_visible(false);
                     return;
                 }
@@ -1538,11 +1680,9 @@ impl WindowCtx {
                 self.last_size = (rw, rh);
                 self.last_stacked = layout_stacked;
                 self.last_pos = Some((x, y));
-                let positioned =
-                    self.in_elevated_band || ensure_just_above_taskbar(self.hwnd, env.tray_hwnd);
-                let interactive = self.set_interactive(true);
-                self.set_visible(positioned && interactive);
+                self.finish_show(env.tray_hwnd, uia_occupied.current);
             } else {
+                self.restore_from_cached_layout = false;
                 self.set_visible(false);
             }
             return;
@@ -1562,10 +1702,7 @@ impl WindowCtx {
             }
             self.last_pos = Some((x, y));
         }
-        let positioned =
-            self.in_elevated_band || ensure_just_above_taskbar(self.hwnd, env.tray_hwnd);
-        let interactive = self.set_interactive(true);
-        self.set_visible(positioned && interactive);
+        self.finish_show(env.tray_hwnd, uia_occupied.current);
     }
 
     fn set_interactive(&self, interactive: bool) -> bool {
@@ -1909,19 +2046,30 @@ struct TaskbarEnv {
     dpi: u32,
 }
 
-fn query_taskbar_env(tray_hwnd: HWND, own_hwnd: HWND) -> Option<TaskbarEnv> {
+enum TaskbarEnvProbe {
+    Ready(TaskbarEnv),
+    Fullscreen {
+        suppressor: Option<HWND>,
+        fg_covers_monitor: bool,
+    },
+    Unavailable,
+}
+
+fn probe_taskbar_env(tray_hwnd: HWND, own_hwnd: HWND) -> TaskbarEnvProbe {
     unsafe {
         if tray_hwnd.0.is_null()
             || !IsWindowVisible(tray_hwnd).as_bool()
             || is_window_cloaked(tray_hwnd)
         {
-            return None;
+            return TaskbarEnvProbe::Unavailable;
         }
         let mut tray_r = RECT::default();
-        GetWindowRect(tray_hwnd, &mut tray_r).ok()?;
+        if GetWindowRect(tray_hwnd, &mut tray_r).is_err() {
+            return TaskbarEnvProbe::Unavailable;
+        }
         let taskbar_rect = PixelRect::from_win32(tray_r);
         if taskbar_rect.is_empty() {
-            return None;
+            return TaskbarEnvProbe::Unavailable;
         }
 
         let monitor: HMONITOR = MonitorFromWindow(tray_hwnd, MONITOR_DEFAULTTOPRIMARY);
@@ -1930,18 +2078,35 @@ fn query_taskbar_env(tray_hwnd: HWND, own_hwnd: HWND) -> Option<TaskbarEnv> {
             ..Default::default()
         };
         if !windows::Win32::Graphics::Gdi::GetMonitorInfoW(monitor, &mut mi).as_bool() {
-            return None;
+            return TaskbarEnvProbe::Unavailable;
         }
         let monitor_rect = PixelRect::from_win32(mi.rcMonitor);
 
         if is_taskbar_autohidden(taskbar_rect, monitor_rect) {
-            return None;
+            return TaskbarEnvProbe::Unavailable;
         }
 
-        if is_fullscreen_covering_monitor(monitor, monitor_rect, tray_hwnd, own_hwnd)
-            || is_fullscreen_window_above_taskbar(monitor_rect, tray_hwnd, own_hwnd)
+        let (fg_fs, fg_covers_monitor, fg_suppressor) =
+            fullscreen_covering_monitor_state(monitor, monitor_rect, tray_hwnd, own_hwnd);
+        if fg_covers_monitor {
+            return TaskbarEnvProbe::Fullscreen {
+                suppressor: fg_suppressor,
+                fg_covers_monitor: true,
+            };
+        }
+        if let Some(above_suppressor) =
+            fullscreen_window_above_taskbar(monitor_rect, tray_hwnd, own_hwnd)
         {
-            return None;
+            return TaskbarEnvProbe::Fullscreen {
+                suppressor: Some(above_suppressor),
+                fg_covers_monitor: false,
+            };
+        }
+        if fg_fs {
+            return TaskbarEnvProbe::Fullscreen {
+                suppressor: None,
+                fg_covers_monitor: false,
+            };
         }
 
         let notify_hwnd = FindWindowExW(Some(tray_hwnd), None, w!("TrayNotifyWnd"), None).ok();
@@ -1956,7 +2121,7 @@ fn query_taskbar_env(tray_hwnd: HWND, own_hwnd: HWND) -> Option<TaskbarEnv> {
         });
 
         let dpi = GetDpiForWindow(tray_hwnd);
-        Some(TaskbarEnv {
+        TaskbarEnvProbe::Ready(TaskbarEnv {
             tray_hwnd,
             taskbar_rect,
             tray_notify_rect,
@@ -1987,44 +2152,48 @@ fn taskbar_slid_offscreen(taskbar_rect: PixelRect, monitor_rect: PixelRect) -> b
     (vis_right - vis_left) <= 8 || (vis_bottom - vis_top) <= 8
 }
 
-unsafe fn is_fullscreen_covering_monitor(
+unsafe fn fullscreen_covering_monitor_state(
     taskbar_monitor: HMONITOR,
     monitor_rect: PixelRect,
     tray_hwnd: HWND,
     own_hwnd: HWND,
-) -> bool {
+) -> (bool, bool, Option<HWND>) {
     let fg = unsafe { GetForegroundWindow() };
     if fg.0.is_null() || fg == tray_hwnd || fg == own_hwnd {
-        return false;
+        return (false, false, None);
     }
     let desktop = unsafe { GetDesktopWindow() };
     let shell = unsafe { GetShellWindow() };
     if fg == desktop || fg == shell {
-        return false;
+        return (false, false, None);
     }
     if unsafe { !IsWindowVisible(fg).as_bool() || IsIconic(fg).as_bool() } {
-        return false;
+        return (false, false, None);
     }
     if is_window_cloaked(fg) {
-        return false;
+        return (false, false, None);
     }
     let fg_mon = unsafe { MonitorFromWindow(fg, MONITOR_DEFAULTTONULL) };
     if fg_mon != taskbar_monitor {
-        return false;
+        return (false, false, None);
     }
     if is_desktop_shell_class(fg) || is_non_occluding_shell_host_window(fg) {
-        return false;
+        return (false, false, None);
+    }
+    let fg_covers = {
+        let mut fg_rect = RECT::default();
+        unsafe { GetWindowRect(fg, &mut fg_rect) }.is_ok()
+            && PixelRect::from_win32(fg_rect).covers(monitor_rect)
+    };
+    if fg_covers {
+        return (true, true, Some(fg));
     }
     if let Ok(state) = unsafe { SHQueryUserNotificationState() }
         && (state == QUNS_RUNNING_D3D_FULL_SCREEN || state == QUNS_PRESENTATION_MODE)
     {
-        return true;
+        return (true, false, None);
     }
-    let mut fg_rect = RECT::default();
-    if unsafe { GetWindowRect(fg, &mut fg_rect) }.is_err() {
-        return false;
-    }
-    PixelRect::from_win32(fg_rect).covers(monitor_rect)
+    (false, false, None)
 }
 
 fn is_window_cloaked(hwnd: HWND) -> bool {
@@ -2074,7 +2243,7 @@ struct AboveTaskbarScan {
     shell_hwnd: HWND,
     tray_band: Option<u32>,
     monitor_rect: PixelRect,
-    covered: bool,
+    covering_hwnd: Option<HWND>,
     saw_tray: bool,
 }
 
@@ -2102,17 +2271,17 @@ unsafe extern "system" fn above_taskbar_enum_cb(hwnd: HWND, lparam: LPARAM) -> B
     if unsafe { GetWindowRect(hwnd, &mut r) }.is_ok()
         && PixelRect::from_win32(r).covers(scan.monitor_rect)
     {
-        scan.covered = true;
+        scan.covering_hwnd.get_or_insert(hwnd);
     }
     BOOL(1)
 }
 
-fn is_fullscreen_window_above_taskbar_in_band(
+fn fullscreen_window_above_taskbar_in_band(
     monitor_rect: PixelRect,
     tray_hwnd: HWND,
     own_hwnd: HWND,
     tray_band: Option<u32>,
-) -> bool {
+) -> Option<HWND> {
     let mut scan = AboveTaskbarScan {
         tray_hwnd,
         own_hwnd,
@@ -2120,7 +2289,7 @@ fn is_fullscreen_window_above_taskbar_in_band(
         shell_hwnd: unsafe { GetShellWindow() },
         tray_band,
         monitor_rect,
-        covered: false,
+        covering_hwnd: None,
         saw_tray: false,
     };
     unsafe {
@@ -2129,23 +2298,44 @@ fn is_fullscreen_window_above_taskbar_in_band(
             LPARAM(&mut scan as *mut AboveTaskbarScan as isize),
         );
     }
-    fullscreen_above_result(scan.saw_tray, scan.tray_band, scan.covered)
+    fullscreen_above_result(scan.saw_tray, scan.tray_band, scan.covering_hwnd.is_some())
+        .then_some(scan.covering_hwnd)
+        .flatten()
 }
 
 /// Detects fullscreen windows still sitting above `tray_hwnd` in Z-order even
 /// when they no longer hold foreground focus (e.g. while holding Alt+Tab over
 /// a fullscreen game so the task switcher dialog is foreground above both).
-fn is_fullscreen_window_above_taskbar(
+fn fullscreen_window_above_taskbar(
     monitor_rect: PixelRect,
     tray_hwnd: HWND,
     own_hwnd: HWND,
-) -> bool {
-    is_fullscreen_window_above_taskbar_in_band(
+) -> Option<HWND> {
+    fullscreen_window_above_taskbar_in_band(
         monitor_rect,
         tray_hwnd,
         own_hwnd,
         window_band(tray_hwnd),
     )
+}
+
+#[cfg(test)]
+fn is_fullscreen_window_above_taskbar_in_band(
+    monitor_rect: PixelRect,
+    tray_hwnd: HWND,
+    own_hwnd: HWND,
+    tray_band: Option<u32>,
+) -> bool {
+    fullscreen_window_above_taskbar_in_band(monitor_rect, tray_hwnd, own_hwnd, tray_band).is_some()
+}
+
+#[cfg(test)]
+fn is_fullscreen_window_above_taskbar(
+    monitor_rect: PixelRect,
+    tray_hwnd: HWND,
+    own_hwnd: HWND,
+) -> bool {
+    fullscreen_window_above_taskbar(monitor_rect, tray_hwnd, own_hwnd).is_some()
 }
 
 fn read_window_class(hwnd: HWND) -> Option<String> {
@@ -3314,7 +3504,31 @@ unsafe extern "system" fn fg_event_proc(
     if event == EVENT_SYSTEM_MOVESIZEEND {
         LAYOUT_RECHECK_PENDING.store(true, std::sync::atomic::Ordering::Release);
     }
+    if matches!(
+        event,
+        EVENT_SYSTEM_FOREGROUND | EVENT_SYSTEM_MINIMIZESTART | EVENT_SYSTEM_MINIMIZEEND
+    ) {
+        FULLSCREEN_WAKE_PENDING.store(true, std::sync::atomic::Ordering::Release);
+    }
     post_refresh();
+}
+
+unsafe extern "system" fn fs_location_event_proc(
+    _hook: HWINEVENTHOOK,
+    _event: u32,
+    hwnd: HWND,
+    id_object: i32,
+    id_child: i32,
+    _id_event_thread: u32,
+    _dwms_event_time: u32,
+) {
+    if id_object == OBJID_WINDOW.0
+        && id_child == 0
+        && !hwnd.0.is_null()
+        && hwnd.0 as isize == LIVE_FS_HWND.load(std::sync::atomic::Ordering::Acquire)
+    {
+        post_refresh();
+    }
 }
 
 unsafe extern "system" fn fg_location_event_proc(
@@ -3551,10 +3765,14 @@ unsafe extern "system" fn wnd_proc(
     if ctx.msg_shell_hook != 0 && msg == ctx.msg_shell_hook {
         match wparam.0 as u32 {
             HSHELL_WINDOWCREATED | HSHELL_WINDOWDESTROYED | HSHELL_WINDOWREPLACED => {
+                if wparam.0 as u32 == HSHELL_WINDOWDESTROYED {
+                    FULLSCREEN_WAKE_PENDING.store(true, std::sync::atomic::Ordering::Release);
+                }
                 ctx.request_layout_scan(LayoutUpdate::Recheck, true);
                 ctx.refresh(false);
             }
             HSHELL_WINDOWACTIVATED | HSHELL_RUDEAPPACTIVATED_MSG => {
+                FULLSCREEN_WAKE_PENDING.store(true, std::sync::atomic::Ordering::Release);
                 ctx.refresh(false);
             }
             _ => {}
@@ -3578,6 +3796,14 @@ unsafe extern "system" fn wnd_proc(
                     let _ = KillTimer(Some(hwnd), UIA_SETTLE_TIMER_ID);
                 }
                 ctx.request_layout_scan(LayoutUpdate::Recheck, false);
+                ctx.refresh(false);
+            } else if wparam.0 == FULLSCREEN_EXIT_TIMER_ID {
+                unsafe {
+                    let _ = KillTimer(Some(hwnd), FULLSCREEN_EXIT_TIMER_ID);
+                }
+                ctx.fullscreen_recheck_armed = false;
+                ctx.fullscreen_recheck_remaining =
+                    ctx.fullscreen_recheck_remaining.saturating_sub(1);
                 ctx.refresh(false);
             }
             LRESULT(0)
@@ -3647,8 +3873,11 @@ unsafe extern "system" fn wnd_proc(
         }
         WM_CLOSE => {
             ctx.user_closing = true;
+            ctx.fullscreen_recheck_armed = false;
+            ctx.fullscreen_recheck_remaining = 0;
             unsafe {
                 let _ = KillTimer(Some(hwnd), UIA_SETTLE_TIMER_ID);
+                let _ = KillTimer(Some(hwnd), FULLSCREEN_EXIT_TIMER_ID);
                 let _ = DestroyWindow(hwnd);
             }
             LRESULT(0)
@@ -3691,6 +3920,7 @@ fn taskbar_thread_main(
     let msg_taskbar_created = unsafe { RegisterWindowMessageW(w!("TaskbarCreated")) };
     let msg_shell_hook = unsafe { RegisterWindowMessageW(w!("SHELLHOOK")) };
     LAYOUT_RECHECK_PENDING.store(false, std::sync::atomic::Ordering::Release);
+    FULLSCREEN_WAKE_PENDING.store(false, std::sync::atomic::Ordering::Release);
     let uia_scanner = Arc::new(UiaScanner::start());
 
     loop {
@@ -3718,13 +3948,19 @@ fn taskbar_thread_main(
             last_env_geom: None,
             pending_uia_scan: true,
             invalidate_uia_layout: true,
+            restore_from_cached_layout: false,
             msg_taskbar_created,
             msg_shell_hook,
             tracked_fg_tid: 0,
             fg_loc_hook: HWINEVENTHOOK::default(),
+            tracked_fs_tid: 0,
+            fs_loc_hook: HWINEVENTHOOK::default(),
             tracked_tray_tid: 0,
             tray_hook: HWINEVENTHOOK::default(),
             topmost_hooks: Vec::new(),
+            last_fg_hwnd: 0,
+            fullscreen_recheck_remaining: 0,
+            fullscreen_recheck_armed: false,
         });
 
         let ctx_ptr: *mut WindowCtx = &mut *ctx_box;
@@ -4158,13 +4394,19 @@ mod tests {
             last_env_geom: Some((tray.0 as isize, bar, Some(notify), 96)),
             pending_uia_scan: false,
             invalidate_uia_layout: false,
+            restore_from_cached_layout: false,
             msg_taskbar_created: 0,
             msg_shell_hook: 0,
             tracked_fg_tid: 0,
             fg_loc_hook: HWINEVENTHOOK::default(),
+            tracked_fs_tid: 0,
+            fs_loc_hook: HWINEVENTHOOK::default(),
             tracked_tray_tid: 0,
             tray_hook: HWINEVENTHOOK::default(),
             topmost_hooks: Vec::new(),
+            last_fg_hwnd: 0,
+            fullscreen_recheck_remaining: 0,
+            fullscreen_recheck_armed: false,
         };
         ctx.refresh_taskbar_env(&config, &metrics, env, false);
         assert!(
@@ -5549,13 +5791,19 @@ mod tests {
             last_env_geom: Some((tray.0 as isize, bar, Some(notify), 96)),
             pending_uia_scan: false,
             invalidate_uia_layout: false,
+            restore_from_cached_layout: false,
             msg_taskbar_created: 0,
             msg_shell_hook: 0,
             tracked_fg_tid: 0,
             fg_loc_hook: HWINEVENTHOOK::default(),
+            tracked_fs_tid: 0,
+            fs_loc_hook: HWINEVENTHOOK::default(),
             tracked_tray_tid: 0,
             tray_hook: HWINEVENTHOOK::default(),
             topmost_hooks: Vec::new(),
+            last_fg_hwnd: 0,
+            fullscreen_recheck_remaining: 0,
+            fullscreen_recheck_armed: false,
         };
 
         ctx.refresh_taskbar_env(&config, &metrics, env, false);
@@ -5761,13 +6009,19 @@ mod tests {
             last_env_geom: None,
             pending_uia_scan: false,
             invalidate_uia_layout: false,
+            restore_from_cached_layout: false,
             msg_taskbar_created: 0,
             msg_shell_hook: 0,
             tracked_fg_tid: 0,
             fg_loc_hook: HWINEVENTHOOK::default(),
+            tracked_fs_tid: 0,
+            fs_loc_hook: HWINEVENTHOOK::default(),
             tracked_tray_tid: 0,
             tray_hook: HWINEVENTHOOK::default(),
             topmost_hooks: Vec::new(),
+            last_fg_hwnd: 0,
+            fullscreen_recheck_remaining: 0,
+            fullscreen_recheck_armed: false,
         };
         assert!(ctx.ensure_visible_order(tray, None));
         assert!(is_window_above(hwnd, tray));
@@ -5959,13 +6213,19 @@ mod tests {
             last_env_geom: None,
             pending_uia_scan: false,
             invalidate_uia_layout: false,
+            restore_from_cached_layout: false,
             msg_taskbar_created: 0,
             msg_shell_hook: 0,
             tracked_fg_tid: 0,
             fg_loc_hook: HWINEVENTHOOK::default(),
+            tracked_fs_tid: 0,
+            fs_loc_hook: HWINEVENTHOOK::default(),
             tracked_tray_tid: 0,
             tray_hook: HWINEVENTHOOK::default(),
             topmost_hooks: Vec::new(),
+            last_fg_hwnd: 0,
+            fullscreen_recheck_remaining: 0,
+            fullscreen_recheck_armed: false,
         };
 
         ctx.sync_topmost_hooks(tray);
@@ -6223,5 +6483,338 @@ mod tests {
             HWND::default(),
             Some(6),
         ));
+    }
+
+    #[test]
+    fn fullscreen_suppression_restores_immediately_on_cached_layout_without_stealing_clicks() {
+        let _zorder = z_order_test_lock();
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let _com = ComMtaGuard::enter();
+        let hinstance = HINSTANCE(unsafe { GetModuleHandleW(None).unwrap() }.0);
+        let class_name = register_window_class(hinstance).unwrap();
+        let tray = create_monitor_window(hinstance, class_name, std::ptr::null_mut()).unwrap();
+        let hwnd = create_monitor_window(hinstance, class_name, std::ptr::null_mut()).unwrap();
+        let _windows = TestWindows(vec![tray, hwnd]);
+        let bar = rect(-10_000, -10_000, -8_080, -9_952);
+        let notify = rect(-8_300, -10_000, -8_080, -9_952);
+        let env = TaskbarEnv {
+            tray_hwnd: tray,
+            taskbar_rect: bar,
+            tray_notify_rect: Some(notify),
+            dpi: 96,
+        };
+        unsafe {
+            SetWindowPos(
+                tray,
+                Some(HWND_TOPMOST),
+                bar.left,
+                bar.top,
+                bar.width(),
+                bar.height(),
+                SWP_NOACTIVATE,
+            )
+            .unwrap();
+            let _ = ShowWindow(tray, SW_SHOWNOACTIVATE);
+            SetWindowPos(
+                hwnd,
+                Some(HWND_TOPMOST),
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+            )
+            .unwrap();
+        }
+        let config = Config {
+            enabled: true,
+            ..Config::default()
+        };
+        let mut metrics = Metrics::default();
+        let notifications = Arc::new(AtomicUsize::new(0));
+        let observed = notifications.clone();
+        let scanner = Arc::new(UiaScanner {
+            state: Arc::new((
+                Mutex::new(UiaShared {
+                    cache: UiaCache {
+                        tray_hwnd: tray.0 as isize,
+                        taskbar_rect: bar,
+                        rects: Some(vec![notify]),
+                        generation: 0,
+                    },
+                    ..Default::default()
+                }),
+                Condvar::new(),
+            )),
+            worker: Mutex::new(None),
+        });
+        let mut ctx = WindowCtx {
+            hwnd,
+            in_elevated_band: false,
+            user_closing: false,
+            shared: Arc::new(Mutex::new(SharedState {
+                config: config.clone(),
+                metrics,
+                generation: 0,
+            })),
+            visibility: Arc::new(MonitorVisibility {
+                visible: std::sync::atomic::AtomicBool::new(false),
+                notifier: Arc::new(move || {
+                    observed.fetch_add(1, Ordering::Relaxed);
+                }),
+            }),
+            callback: Arc::new(|_| {}),
+            renderer: Renderer::new(),
+            uia_scanner: scanner,
+            light_taskbar: false,
+            hovered: false,
+            tracking_mouse: false,
+            last_display: None,
+            last_size: (0, 0),
+            last_pos: None,
+            last_visible: false,
+            last_present_error: None,
+            last_anchor_slot: None,
+            last_compact: false,
+            last_stacked: false,
+            last_env_geom: Some((tray.0 as isize, bar, Some(notify), 96)),
+            pending_uia_scan: false,
+            invalidate_uia_layout: false,
+            restore_from_cached_layout: false,
+            msg_taskbar_created: 0,
+            msg_shell_hook: 0,
+            tracked_fg_tid: 0,
+            fg_loc_hook: HWINEVENTHOOK::default(),
+            tracked_fs_tid: 0,
+            fs_loc_hook: HWINEVENTHOOK::default(),
+            tracked_tray_tid: 0,
+            tray_hook: HWINEVENTHOOK::default(),
+            topmost_hooks: Vec::new(),
+            last_fg_hwnd: 0,
+            fullscreen_recheck_remaining: 0,
+            fullscreen_recheck_armed: false,
+        };
+
+        // Initial confirmed visibility.
+        ctx.refresh_taskbar_env(&config, &metrics, env, false);
+        assert!(ctx.last_visible);
+        assert!(ctx.accepts_input());
+        assert!(ctx.restore_from_cached_layout);
+        assert_eq!(notifications.load(Ordering::Relaxed), 1);
+
+        // Simulate entering fullscreen: geometry is preserved, background UIA
+        // revalidation is marked pending, and the widget hides.
+        ctx.pending_uia_scan = true;
+        ctx.hide("env_unavailable_or_fullscreen", None);
+        assert!(!ctx.last_visible);
+        assert!(!unsafe { IsWindowVisible(hwnd).as_bool() });
+        assert_eq!(notifications.load(Ordering::Relaxed), 2);
+
+        // Simulate Alt+Tab out of fullscreen with updated metrics before the
+        // background UIA scan completes: widget must reappear immediately using
+        // its cached layout, while passing clicks through (`WS_EX_TRANSPARENT`).
+        metrics.cpu_pct = Some(42.0);
+        ctx.refresh_taskbar_env(&config, &metrics, env, false);
+        assert!(
+            ctx.last_visible && unsafe { IsWindowVisible(hwnd).as_bool() },
+            "widget must reappear immediately on cached layout when returning from fullscreen"
+        );
+        assert!(
+            !ctx.accepts_input(),
+            "widget must remain click-through until UIA verification completes"
+        );
+        assert_eq!(notifications.load(Ordering::Relaxed), 3);
+        assert!(
+            ctx.uia_scanner
+                .snapshot_for(tray.0 as isize, bar)
+                .is_some_and(|s| !s.current),
+            "cached occupancy must remain available while background verification runs"
+        );
+
+        // Once the background UIA scan finishes, hit testing is restored.
+        {
+            let mut state = ctx.uia_scanner.state.0.lock().unwrap();
+            let target = state.pending.take().unwrap();
+            assert!(state.publish(target, Some(vec![notify])));
+        }
+        ctx.refresh_taskbar_env(&config, &metrics, env, false);
+        assert!(ctx.last_visible);
+        assert!(ctx.accepts_input());
+        assert_eq!(notifications.load(Ordering::Relaxed), 3);
+
+        // If geometry actually changed while in fullscreen (e.g. resolution/DPI
+        // change), returning must invalidate stale cache and wait for UIA.
+        ctx.pending_uia_scan = true;
+        ctx.hide("env_unavailable_or_fullscreen", None);
+        let mut changed_env = env;
+        changed_env.taskbar_rect.top -= 4;
+        ctx.refresh_taskbar_env(&config, &metrics, changed_env, false);
+        assert!(
+            !ctx.last_visible && unsafe { !IsWindowVisible(hwnd).as_bool() },
+            "changed taskbar geometry after fullscreen must wait for fresh UIA scan"
+        );
+    }
+
+    #[test]
+    fn fullscreen_hook_tracks_suppressing_window_moves_after_foreground_leaves() {
+        use std::sync::atomic::Ordering;
+        use std::sync::mpsc;
+        use windows::Win32::UI::WindowsAndMessaging::{
+            MsgWaitForMultipleObjects, PM_REMOVE, PeekMessageW, QS_ALLINPUT,
+        };
+
+        let _zorder = z_order_test_lock();
+        let hinstance = HINSTANCE(unsafe { GetModuleHandleW(None).unwrap() }.0);
+        let class_name = register_window_class(hinstance).unwrap();
+        let hwnd = create_monitor_window(hinstance, class_name, std::ptr::null_mut()).unwrap();
+        let _windows = TestWindows(vec![hwnd]);
+
+        enum FsCmd {
+            Move,
+            Exit,
+        }
+        let (cmd_tx, cmd_rx) = mpsc::channel::<FsCmd>();
+        let (ready_tx, ready_rx) = mpsc::channel::<(isize, u32)>();
+        let (ack_tx, ack_rx) = mpsc::channel::<()>();
+
+        let fs_join = std::thread::spawn(move || {
+            let hinstance = HINSTANCE(unsafe { GetModuleHandleW(None).unwrap() }.0);
+            let class_name = register_window_class(hinstance).unwrap();
+            let fs_hwnd =
+                create_monitor_window(hinstance, class_name, std::ptr::null_mut()).unwrap();
+            unsafe {
+                SetWindowPos(
+                    fs_hwnd,
+                    None,
+                    -22_000,
+                    -22_000,
+                    1920,
+                    1080,
+                    SWP_NOZORDER | SWP_NOACTIVATE,
+                )
+                .unwrap();
+                let _ = ShowWindow(fs_hwnd, SW_SHOWNOACTIVATE);
+            }
+            let tid = unsafe { GetCurrentThreadId() };
+            ready_tx.send((fs_hwnd.0 as isize, tid)).unwrap();
+            while let Ok(cmd) = cmd_rx.recv() {
+                match cmd {
+                    FsCmd::Move => {
+                        unsafe {
+                            SetWindowPos(
+                                fs_hwnd,
+                                None,
+                                -22_000,
+                                -22_000,
+                                800,
+                                600,
+                                SWP_NOZORDER | SWP_NOACTIVATE,
+                            )
+                            .unwrap();
+                        }
+                        ack_tx.send(()).unwrap();
+                    }
+                    FsCmd::Exit => {
+                        unsafe {
+                            let _ = DestroyWindow(fs_hwnd);
+                        }
+                        break;
+                    }
+                }
+            }
+        });
+
+        let (fs_raw, fs_tid) = ready_rx.recv().expect("fullscreen thread ready");
+        let fs_hwnd = HWND(fs_raw as *mut std::ffi::c_void);
+        LIVE_HWND.store(hwnd.0 as isize, Ordering::Release);
+        LIVE_FG_HWND.store(0, Ordering::Release);
+
+        let mut ctx = WindowCtx {
+            hwnd,
+            in_elevated_band: true,
+            user_closing: false,
+            shared: Arc::new(Mutex::new(SharedState {
+                config: Config::default(),
+                metrics: Metrics::default(),
+                generation: 0,
+            })),
+            visibility: Arc::new(MonitorVisibility {
+                visible: std::sync::atomic::AtomicBool::new(false),
+                notifier: Arc::new(|| {}),
+            }),
+            callback: Arc::new(|_| {}),
+            renderer: None,
+            uia_scanner: Arc::new(UiaScanner {
+                state: Arc::new((Mutex::new(UiaShared::default()), Condvar::new())),
+                worker: Mutex::new(None),
+            }),
+            light_taskbar: false,
+            hovered: false,
+            tracking_mouse: false,
+            last_display: None,
+            last_size: (0, 0),
+            last_pos: None,
+            last_visible: false,
+            last_present_error: None,
+            last_anchor_slot: None,
+            last_compact: false,
+            last_stacked: false,
+            last_env_geom: None,
+            pending_uia_scan: false,
+            invalidate_uia_layout: false,
+            restore_from_cached_layout: false,
+            msg_taskbar_created: 0,
+            msg_shell_hook: 0,
+            tracked_fg_tid: 0,
+            fg_loc_hook: HWINEVENTHOOK::default(),
+            tracked_fs_tid: 0,
+            fs_loc_hook: HWINEVENTHOOK::default(),
+            tracked_tray_tid: 0,
+            tray_hook: HWINEVENTHOOK::default(),
+            topmost_hooks: Vec::new(),
+            last_fg_hwnd: 0,
+            fullscreen_recheck_remaining: 0,
+            fullscreen_recheck_armed: false,
+        };
+
+        ctx.sync_fullscreen_hook(fs_hwnd);
+        assert_eq!(ctx.tracked_fs_tid, fs_tid);
+        assert!(!ctx.fs_loc_hook.is_invalid());
+
+        REFRESH_PENDING.store(false, Ordering::Release);
+        cmd_tx.send(FsCmd::Move).unwrap();
+        ack_rx.recv().unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut msg = MSG::default();
+        while !REFRESH_PENDING.load(Ordering::Acquire) && Instant::now() < deadline {
+            while unsafe { PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE) }.as_bool() {
+                let _ = unsafe { TranslateMessage(&msg) };
+                unsafe { DispatchMessageW(&msg) };
+            }
+            if REFRESH_PENDING.load(Ordering::Acquire) {
+                break;
+            }
+            let remaining_ms = deadline
+                .saturating_duration_since(Instant::now())
+                .as_millis()
+                .min(50) as u32;
+            unsafe {
+                let _ = MsgWaitForMultipleObjects(None, false, remaining_ms, QS_ALLINPUT);
+            }
+        }
+        assert!(
+            REFRESH_PENDING.load(Ordering::Acquire),
+            "resizing a non-topmost fullscreen suppressor after foreground left must wake refresh"
+        );
+
+        ctx.sync_fullscreen_hook(HWND::default());
+        assert_eq!(ctx.tracked_fs_tid, 0);
+        assert_eq!(LIVE_FS_HWND.load(Ordering::Acquire), 0);
+        LIVE_HWND.store(0, Ordering::Release);
+        REFRESH_PENDING.store(false, Ordering::Release);
+
+        let _ = cmd_tx.send(FsCmd::Exit);
+        let _ = fs_join.join();
     }
 }
