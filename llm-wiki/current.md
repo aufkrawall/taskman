@@ -1082,15 +1082,30 @@ rebase runbook.
   calls `GetDC(NULL)`/`GetPixel`/`BitBlt` and never uses cross-process
   `SetParent` or window ownership on Explorer's `Shell_TrayWnd` thread. Win32
   ownership across threads implicitly attaches input queues; a dedicated thread
-  alone does not isolate an Explorer-owned popup. Layered updates still enter
+  alone does not isolate an Explorer-owned popup. On Windows hosts that
+  allow `CreateWindowInBand` (`ZBID_GENUINE_WINDOWS = 16`, verified via
+  `GetWindowBand`), the widget runs in band 16 so taskbar activation synchronously
+  raising `Shell_TrayWnd` inside band 1 cannot cover it for even a single
+  compositor frame; if band 16 is unavailable/denied, it falls back cleanly to
+  standard band 1 (`CreateWindowExW`) with async focus-time Z-order repair. In
+  band 16, `is_rect_occluded_above_taskbar` (via `DWMWA_EXTENDED_FRAME_BOUNDS`
+  with `GetWindowRect` fallback) hides the widget whenever any visible,
+  uncloaked, non-transparent window above `Shell_TrayWnd` (including menus,
+  flyouts, Start/Search, `tooltips_class32`, or `always_on_top` apps) overlaps
+  its footprint, and `show_context_menu` (`context_menu_anchor`) anchors the
+  right-click popup flush outside the taskbar edge. Layered updates still enter
   DWM; Independent Flip/MPO selection is not guaranteed by software rendering.
 - **Event-driven fullscreen & auto-hide suppression:** Watches taskbar position,
   `SystemUsesLightTheme` + `ColorPrevalence`/`AccentColor` luminance
   (`WM_SETTINGCHANGE`, `WM_DWMCOLORIZATIONCOLORCHANGED`), `TaskbarCreated`,
   `RegisterShellHookWindow` (`HSHELL_RUDEAPPACTIVATED`, `HSHELL_WINDOWACTIVATED`,
   `HSHELL_WINDOWCREATED`/`DESTROYED`/`REPLACED`),
-  `EVENT_SYSTEM_FOREGROUND`/`MINIMIZESTART..END`/`MOVESIZEEND`, and
-  thread-scoped `SetWinEventHook` hooks on the active foreground thread and
+  `EVENT_SYSTEM_FOREGROUND`/`MINIMIZESTART..END`/`MOVESIZEEND`,
+  `EVENT_SYSTEM_MENUPOPUPSTART..END`, filtered top-level
+  `EVENT_OBJECT_SHOW..HIDE`, and
+  thread-scoped `SetWinEventHook` hooks on the active foreground thread (when
+  `fg_tid != GetCurrentThreadId()`, including TaskMan's main GUI thread for
+  `always_on_top` moves) and
   `Shell_TrayWnd` thread (`EVENT_OBJECT_SHOW`..`EVENT_OBJECT_LOCATIONCHANGE`,
   filtered to `OBJID_WINDOW` `SHOW`/`HIDE`/`LOCATIONCHANGE` on tray + `IsChild`
   descendants plus `EVENT_OBJECT_REORDER`) with `REFRESH_PENDING`,
@@ -1098,9 +1113,10 @@ rebase runbook.
   one-shot settle timer to refresh on
   fullscreen/auto-hide transitions (including when
   holding `Alt+Tab` or another overlay takes foreground while an uncloaked,
-  opaque fullscreen window still sits above `Shell_TrayWnd` in Z-order) and
-  Z-order follows `Shell_TrayWnd` using the nearest visible, uncloaked predecessor
-  in its band, without fixed-count window walks or manipulating Explorer.
+  opaque fullscreen window still sits above `Shell_TrayWnd` in Z-order). In the
+  band-1 fallback path, Z-order follows `Shell_TrayWnd` using the nearest visible,
+  uncloaked predecessor in its band, without fixed-count window walks or
+  manipulating Explorer.
   Invisible bookkeeping windows are not placement anchors: a native probe found
   that taskbar focus can put hidden `ForegroundStaging` immediately above the
   tray, and inserting after it returns access denied. If positioning against

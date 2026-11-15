@@ -1,3 +1,29 @@
+## 2026-11-15 — taskbar focus text flicker fixed cleanly via window band 16
+
+- Confirmed why the async focus-time WinEvent repair (`6a85d20`) still showed a
+  1+ frame text flash when clicking the taskbar after another window had focus:
+  `Shell_TrayWnd` lives in band 1 (`ZBID_DESKTOP`, `WS_EX_TOPMOST`), so
+  `win32k` synchronously moves `Shell_TrayWnd` to the top of band 1 (above an
+  unowned band-1 widget) on activation before any `WINEVENT_OUTOFCONTEXT` hook
+  can run. Restoring cross-thread `GWLP_HWNDPARENT` on Explorer was ruled out
+  and empirically re-confirmed to block `SetWindowPos` for >3s on a hung owner.
+- Implemented native band 16 (`CreateWindowInBand(..., 16)` `ZBID_GENUINE_WINDOWS`,
+  verified via `GetWindowBand`, with `CreateWindowExW` band-1 fallback when
+  unavailable or denied). Because band 16 sits natively above band 1 without
+  ownership, `Shell_TrayWnd` activation can never overtake the widget. Added
+  `is_rect_occluded_above_taskbar` (using `DWMWA_EXTENDED_FRAME_BOUNDS` with
+  `GetWindowRect` fallback, triggered on `EVENT_SYSTEM_MENUPOPUPSTART..END`,
+  filtered top-level `EVENT_OBJECT_SHOW..HIDE`, and foreground/location hooks)
+  so overlapping menus, flyouts, tooltips (`tooltips_class32`), Start/Search,
+  or `always_on_top` windows still win visually while non-overlapping or
+  below-tray windows do not hide it, and anchored right-click context menus
+  flush outside all 4 taskbar edges (`context_menu_anchor`).
+- Automated regression tests verify band-16 persistence across repeated mock
+  band-1 tray activations without repair calls, overlap hiding/restoration under
+  Per-Monitor V2 DPI, transparent/below-tray exemptions, and context-menu
+  anchoring; final live desktop taskbar-click visual check awaits interactive
+  user verification.
+
 ## 2026-11-15 — remaining taskbar text flash after revalidation fix
 
 - User verification of `c0a75da` confirms the bad full-element flashing is gone,

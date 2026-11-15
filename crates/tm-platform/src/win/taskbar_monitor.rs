@@ -11,7 +11,11 @@
 //!   light/dark contrast comes from `SystemUsesLightTheme` + `ColorPrevalence`
 //!   / `AccentColor` on `WM_SETTINGCHANGE` and `WM_DWMCOLORIZATIONCOLORCHANGED`.
 //! - **Independent input queue:** runs as an unowned `WS_EX_LAYERED |
-//!   WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE` popup on its own dedicated thread.
+//!   WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE` popup on its own dedicated thread in
+//!   window band 16 (`CreateWindowInBand`, falling back to standard band 1 when
+//!   unavailable) so taskbar focus/clicks in band 1 cannot raise `Shell_TrayWnd`
+//!   over the widget for even a single compositor frame, while hiding cleanly
+//!   if a higher or peer popup/menu/flyout/topmost window overlaps its footprint.
 //!   Neither cross-process parenting nor ownership may attach it to Explorer.
 //! - **Zero GPU swapchain:** uses `D2D1_RENDER_TARGET_TYPE_SOFTWARE` into a
 //!   cached DIB section and only calls `UpdateLayeredWindow` when rendered
@@ -54,7 +58,8 @@ use windows::Win32::Graphics::DirectWrite::{
     IDWriteTextLayout,
 };
 use windows::Win32::Graphics::Dwm::{
-    DWMWA_CLOAKED, DWMWA_TRANSITIONS_FORCEDISABLED, DwmGetWindowAttribute, DwmSetWindowAttribute,
+    DWMWA_CLOAKED, DWMWA_EXTENDED_FRAME_BOUNDS, DWMWA_TRANSITIONS_FORCEDISABLED,
+    DwmGetWindowAttribute, DwmSetWindowAttribute,
 };
 use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
 use windows::Win32::Graphics::Gdi::{
@@ -67,8 +72,9 @@ use windows::Win32::System::Com::{
     CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED, COINIT_MULTITHREADED, CoCreateInstance,
     CoInitializeEx, CoUninitialize,
 };
-use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
 use windows::Win32::System::Registry::{HKEY_CURRENT_USER, RRF_RT_REG_DWORD, RegGetValueW};
+use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::System::Variant::VARIANT;
 use windows::Win32::UI::Accessibility::{
     AutomationElementMode_None, CUIAutomation, CUIAutomation8, HWINEVENTHOOK, IUIAutomation,
@@ -90,26 +96,27 @@ use windows::Win32::UI::Shell::{
 use windows::Win32::UI::WindowsAndMessaging::{
     CS_DBLCLKS, CreatePopupMenu, CreateWindowExW, DeregisterShellHookWindow, DestroyMenu,
     DestroyWindow, DispatchMessageW, EVENT_OBJECT_HIDE, EVENT_OBJECT_LOCATIONCHANGE,
-    EVENT_OBJECT_REORDER, EVENT_OBJECT_SHOW, EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_MINIMIZEEND,
-    EVENT_SYSTEM_MINIMIZESTART, EVENT_SYSTEM_MOVESIZEEND, EnumWindows, FindWindowExW, FindWindowW,
-    GW_HWNDPREV, GWL_EXSTYLE, GWLP_USERDATA, GetClassNameW, GetCursorPos, GetDesktopWindow,
-    GetForegroundWindow, GetLayeredWindowAttributes, GetMessageW, GetShellWindow, GetWindow,
-    GetWindowLongPtrW, GetWindowRect, GetWindowThreadProcessId, HMENU, HSHELL_WINDOWACTIVATED,
-    HSHELL_WINDOWCREATED, HSHELL_WINDOWDESTROYED, HSHELL_WINDOWREPLACED, HWND_NOTOPMOST, HWND_TOP,
-    HWND_TOPMOST, IDC_ARROW, InsertMenuW, IsChild, IsIconic, IsWindowVisible, KillTimer,
+    EVENT_OBJECT_REORDER, EVENT_OBJECT_SHOW, EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_MENUPOPUPEND,
+    EVENT_SYSTEM_MENUPOPUPSTART, EVENT_SYSTEM_MINIMIZEEND, EVENT_SYSTEM_MINIMIZESTART,
+    EVENT_SYSTEM_MOVESIZEEND, EnumWindows, FindWindowExW, FindWindowW, GW_HWNDPREV, GWL_EXSTYLE,
+    GWL_STYLE, GWLP_USERDATA, GetClassNameW, GetCursorPos, GetDesktopWindow, GetForegroundWindow,
+    GetLayeredWindowAttributes, GetMessageW, GetShellWindow, GetWindow, GetWindowLongPtrW,
+    GetWindowRect, GetWindowThreadProcessId, HMENU, HSHELL_WINDOWACTIVATED, HSHELL_WINDOWCREATED,
+    HSHELL_WINDOWDESTROYED, HSHELL_WINDOWREPLACED, HWND_NOTOPMOST, HWND_TOP, HWND_TOPMOST,
+    IDC_ARROW, InsertMenuW, IsChild, IsIconic, IsWindowVisible, KillTimer,
     LAYERED_WINDOW_ATTRIBUTES_FLAGS, LWA_ALPHA, LoadCursorW, MA_NOACTIVATE, MF_BYPOSITION,
     MF_SEPARATOR, MF_STRING, MSG, OBJID_WINDOW, PostMessageW, PostQuitMessage, RegisterClassExW,
     RegisterShellHookWindow, RegisterWindowMessageW, SW_HIDE, SW_SHOWNOACTIVATE, SWP_HIDEWINDOW,
     SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOOWNERZORDER, SWP_NOSENDCHANGING, SWP_NOSIZE, SWP_NOZORDER,
     SetForegroundWindow, SetMenuDefaultItem, SetTimer, SetWindowLongPtrW, SetWindowPos, ShowWindow,
-    TPM_BOTTOMALIGN, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenuEx, TranslateMessage, ULW_ALPHA,
-    UpdateLayeredWindow, WINEVENT_OUTOFCONTEXT, WINEVENT_SKIPOWNPROCESS, WM_APP, WM_CLOSE,
-    WM_CREATE, WM_DESTROY, WM_DISPLAYCHANGE, WM_DPICHANGED, WM_DWMCOLORIZATIONCOLORCHANGED,
-    WM_LBUTTONUP, WM_MOUSEACTIVATE, WM_MOUSEMOVE, WM_NULL, WM_RBUTTONUP, WM_SETTINGCHANGE,
-    WM_TIMER, WNDCLASSEXW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
-    WS_EX_TRANSPARENT, WS_POPUP,
+    TPM_BOTTOMALIGN, TPM_LEFTALIGN, TPM_RETURNCMD, TPM_RIGHTALIGN, TPM_RIGHTBUTTON, TPM_TOPALIGN,
+    TrackPopupMenuEx, TranslateMessage, ULW_ALPHA, UpdateLayeredWindow, WINEVENT_OUTOFCONTEXT,
+    WINEVENT_SKIPOWNPROCESS, WM_APP, WM_CLOSE, WM_CREATE, WM_DESTROY, WM_DISPLAYCHANGE,
+    WM_DPICHANGED, WM_DWMCOLORIZATIONCOLORCHANGED, WM_LBUTTONUP, WM_MOUSEACTIVATE, WM_MOUSEMOVE,
+    WM_NULL, WM_RBUTTONUP, WM_SETTINGCHANGE, WM_TIMER, WNDCLASSEXW, WS_CHILD, WS_EX_LAYERED,
+    WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
 };
-use windows::core::{BOOL, Interface, PCWSTR, w};
+use windows::core::{BOOL, Interface, PCWSTR, s, w};
 
 use crate::taskbar_monitor::{Action, Config, Metrics};
 
@@ -121,6 +128,9 @@ const MIN_ADAPTIVE_FONT_PT: f32 = 6.5;
 // `HSHELL_HIGHBIT | HSHELL_WINDOWACTIVATED`: Windows Shell notification fired
 // when a fullscreen / "rude" app enters or leaves fullscreen focus.
 const HSHELL_RUDEAPPACTIVATED_MSG: u32 = 0x8004;
+// Native Task Manager's band (`ZBID_GENUINE_WINDOWS`), strictly above
+// `Shell_TrayWnd` in band 1 (`ZBID_DESKTOP`) without Explorer ownership.
+const TASKBAR_MONITOR_BAND: u32 = 16;
 
 #[derive(Clone, Copy, Debug)]
 struct LayoutBounds {
@@ -171,6 +181,7 @@ fn layout_fits_cross_axis(layout: &MeasuredLayout, bounds: LayoutBounds) -> bool
 static LIVE_HWND: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
 static LIVE_FG_HWND: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
 static LIVE_TRAY_HWND: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
+static IN_ELEVATED_BAND: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static REFRESH_PENDING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static LAYOUT_RECHECK_PENDING: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
@@ -1069,6 +1080,7 @@ struct MeasuredLayout {
 
 struct WindowCtx {
     hwnd: HWND,
+    in_elevated_band: bool,
     user_closing: bool,
     shared: Arc<Mutex<SharedState>>,
     visibility: Arc<MonitorVisibility>,
@@ -1142,17 +1154,13 @@ impl WindowCtx {
     fn sync_foreground_hook(&mut self) {
         let fg = unsafe { GetForegroundWindow() };
         LIVE_FG_HWND.store(fg.0 as isize, std::sync::atomic::Ordering::Release);
-        let mut pid = 0u32;
         let tid = if fg.0.is_null() {
             0
         } else {
-            unsafe { GetWindowThreadProcessId(fg, Some(&mut pid)) }
+            unsafe { GetWindowThreadProcessId(fg, None) }
         };
-        let target_tid = if tid != 0 && pid != std::process::id() {
-            tid
-        } else {
-            0
-        };
+        let self_tid = unsafe { GetCurrentThreadId() };
+        let target_tid = if tid != 0 && tid != self_tid { tid } else { 0 };
         if target_tid == self.tracked_fg_tid {
             return;
         }
@@ -1172,7 +1180,7 @@ impl WindowCtx {
                     Some(fg_location_event_proc),
                     0,
                     target_tid,
-                    WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS,
+                    WINEVENT_OUTOFCONTEXT,
                 )
             };
         }
@@ -1238,6 +1246,29 @@ impl WindowCtx {
         self.refresh_taskbar_env(&config, &metrics, env, force_render);
     }
 
+    fn last_rect(&self) -> Option<PixelRect> {
+        let (x, y) = self.last_pos?;
+        let (w, h) = self.last_size;
+        let r = PixelRect {
+            left: x,
+            top: y,
+            right: x.saturating_add(w),
+            bottom: y.saturating_add(h),
+        };
+        (!r.is_empty()).then_some(r)
+    }
+
+    fn ensure_visible_order(&self, tray_hwnd: HWND, target_rect: Option<PixelRect>) -> bool {
+        if self.in_elevated_band {
+            let Some(rect) = target_rect else {
+                return false;
+            };
+            !is_rect_occluded_above_taskbar(tray_hwnd, self.hwnd, rect)
+        } else {
+            ensure_just_above_taskbar(self.hwnd, tray_hwnd)
+        }
+    }
+
     fn refresh_taskbar_env(
         &mut self,
         config: &Config,
@@ -1278,7 +1309,7 @@ impl WindowCtx {
                 self.set_visible(false);
                 return;
             }
-            if self.last_visible && !ensure_just_above_taskbar(self.hwnd, env.tray_hwnd) {
+            if self.last_visible && !self.ensure_visible_order(env.tray_hwnd, self.last_rect()) {
                 self.set_visible(false);
             }
             return;
@@ -1298,7 +1329,7 @@ impl WindowCtx {
                 };
                 uia_occupied.rects.iter().all(|r| !r.intersects(current))
             })
-            && !ensure_just_above_taskbar(self.hwnd, env.tray_hwnd)
+            && !self.ensure_visible_order(env.tray_hwnd, self.last_rect())
         {
             self.set_visible(false);
             return;
@@ -1382,6 +1413,18 @@ impl WindowCtx {
         let layout_stacked = layout.stacked;
         let (w, h) = (layout.px_w, layout.px_h);
         let (x, y) = placement.pos;
+        let target_rect = PixelRect {
+            left: x,
+            top: y,
+            right: x.saturating_add(w),
+            bottom: y.saturating_add(h),
+        };
+        if self.in_elevated_band
+            && is_rect_occluded_above_taskbar(env.tray_hwnd, self.hwnd, target_rect)
+        {
+            self.set_visible(false);
+            return;
+        }
         let needs_render = force_render
             || self.last_display.as_ref() != Some(&display)
             || self.last_size != (w, h)
@@ -1399,7 +1442,8 @@ impl WindowCtx {
                 self.last_size = (rw, rh);
                 self.last_stacked = layout_stacked;
                 self.last_pos = Some((x, y));
-                let positioned = ensure_just_above_taskbar(self.hwnd, env.tray_hwnd);
+                let positioned =
+                    self.in_elevated_band || ensure_just_above_taskbar(self.hwnd, env.tray_hwnd);
                 let interactive = self.set_interactive(true);
                 self.set_visible(positioned && interactive);
             } else {
@@ -1422,7 +1466,8 @@ impl WindowCtx {
             }
             self.last_pos = Some((x, y));
         }
-        let positioned = ensure_just_above_taskbar(self.hwnd, env.tray_hwnd);
+        let positioned =
+            self.in_elevated_band || ensure_just_above_taskbar(self.hwnd, env.tray_hwnd);
         let interactive = self.set_interactive(true);
         self.set_visible(positioned && interactive);
     }
@@ -1564,11 +1609,37 @@ impl WindowCtx {
             let _ = SetForegroundWindow(self.hwnd);
             let mut pt = POINT::default();
             let _ = GetCursorPos(&mut pt);
+            let tray_hwnd = FindWindowW(w!("Shell_TrayWnd"), None).unwrap_or_default();
+            let tray_rect = (!tray_hwnd.0.is_null())
+                .then(|| {
+                    let mut r = RECT::default();
+                    GetWindowRect(tray_hwnd, &mut r)
+                        .ok()
+                        .map(|()| PixelRect::from_win32(r))
+                })
+                .flatten()
+                .or_else(|| self.last_env_geom.map(|(_, bar, _, _)| bar));
+            let mon_rect = tray_rect.and_then(|_| {
+                let target = if !tray_hwnd.0.is_null() {
+                    tray_hwnd
+                } else {
+                    self.hwnd
+                };
+                let mon = MonitorFromWindow(target, MONITOR_DEFAULTTOPRIMARY);
+                let mut mi = MONITORINFO {
+                    cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+                    ..Default::default()
+                };
+                windows::Win32::Graphics::Gdi::GetMonitorInfoW(mon, &mut mi)
+                    .as_bool()
+                    .then(|| PixelRect::from_win32(mi.rcMonitor))
+            });
+            let (menu_pt, align_flags) = context_menu_anchor(pt, tray_rect, mon_rect);
             let cmd = TrackPopupMenuEx(
                 hmenu,
-                (TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_BOTTOMALIGN).0,
-                pt.x,
-                pt.y,
+                (TPM_RETURNCMD | TPM_RIGHTBUTTON).0 | align_flags,
+                menu_pt.x,
+                menu_pt.y,
                 self.hwnd,
                 None,
             );
@@ -1597,6 +1668,59 @@ impl WindowCtx {
                 3 => (self.callback)(Action::Exit),
                 _ => {}
             }
+        }
+    }
+}
+
+fn context_menu_anchor(
+    cursor: POINT,
+    taskbar: Option<PixelRect>,
+    monitor: Option<PixelRect>,
+) -> (POINT, u32) {
+    let Some(bar) = taskbar.filter(|b| !b.is_empty()) else {
+        return (cursor, TPM_BOTTOMALIGN.0);
+    };
+    if bar.width() >= bar.height() {
+        let is_top = monitor
+            .filter(|m| !m.is_empty())
+            .map_or(bar.top < 200, |m| bar.top - m.top < m.bottom - bar.bottom);
+        if is_top {
+            (
+                POINT {
+                    x: cursor.x,
+                    y: bar.bottom,
+                },
+                TPM_TOPALIGN.0,
+            )
+        } else {
+            (
+                POINT {
+                    x: cursor.x,
+                    y: bar.top,
+                },
+                TPM_BOTTOMALIGN.0,
+            )
+        }
+    } else {
+        let is_left = monitor
+            .filter(|m| !m.is_empty())
+            .map_or(bar.left < 200, |m| bar.left - m.left < m.right - bar.right);
+        if is_left {
+            (
+                POINT {
+                    x: bar.right,
+                    y: cursor.y,
+                },
+                TPM_LEFTALIGN.0,
+            )
+        } else {
+            (
+                POINT {
+                    x: bar.left,
+                    y: cursor.y,
+                },
+                TPM_RIGHTALIGN.0,
+            )
         }
     }
 }
@@ -1897,6 +2021,106 @@ fn is_desktop_shell_class(hwnd: HWND) -> bool {
         name.as_str(),
         "Progman" | "WorkerW" | "Shell_TrayWnd" | "Shell_SecondaryTrayWnd"
     )
+}
+
+fn is_tooltip_class(hwnd: HWND) -> bool {
+    let mut buf = [0u16; 64];
+    let len = unsafe { GetClassNameW(hwnd, &mut buf) };
+    if len <= 0 {
+        return false;
+    }
+    String::from_utf16_lossy(&buf[..len as usize]).eq_ignore_ascii_case("tooltips_class32")
+}
+
+fn visible_frame_rect(hwnd: HWND) -> Option<PixelRect> {
+    let mut r = RECT::default();
+    if unsafe {
+        DwmGetWindowAttribute(
+            hwnd,
+            DWMWA_EXTENDED_FRAME_BOUNDS,
+            (&mut r as *mut RECT).cast(),
+            std::mem::size_of::<RECT>() as u32,
+        )
+    }
+    .is_ok()
+    {
+        let pr = PixelRect::from_win32(r);
+        if !pr.is_empty() {
+            return Some(pr);
+        }
+    }
+    if unsafe { GetWindowRect(hwnd, &mut r) }.is_ok() {
+        let pr = PixelRect::from_win32(r);
+        if !pr.is_empty() {
+            return Some(pr);
+        }
+    }
+    None
+}
+
+struct WidgetOcclusionScan {
+    tray_hwnd: HWND,
+    own_hwnd: HWND,
+    desktop_hwnd: HWND,
+    shell_hwnd: HWND,
+    target_rect: PixelRect,
+    occluded: bool,
+    saw_tray: bool,
+}
+
+unsafe extern "system" fn widget_occlusion_enum_cb(hwnd: HWND, lparam: LPARAM) -> BOOL {
+    let scan = unsafe { &mut *(lparam.0 as *mut WidgetOcclusionScan) };
+    if hwnd == scan.tray_hwnd {
+        scan.saw_tray = true;
+        return BOOL(0);
+    }
+    if hwnd == scan.own_hwnd || hwnd == scan.desktop_hwnd || hwnd == scan.shell_hwnd {
+        return BOOL(1);
+    }
+    if unsafe { !IsWindowVisible(hwnd).as_bool() || IsIconic(hwnd).as_bool() } {
+        return BOOL(1);
+    }
+    if is_desktop_shell_class(hwnd) || is_window_cloaked(hwnd) {
+        return BOOL(1);
+    }
+    if !is_tooltip_class(hwnd) && is_transparent_overlay(hwnd) {
+        return BOOL(1);
+    }
+    if let Some(frame) = visible_frame_rect(hwnd)
+        && frame.intersects(scan.target_rect)
+    {
+        scan.occluded = true;
+        return BOOL(0);
+    }
+    BOOL(1)
+}
+
+/// Detects visible, uncloaked, non-transparent windows above `tray_hwnd` (such as
+/// popup menus, tray flyouts, tooltips, Start/Search, or always-on-top apps)
+/// whose visible frame overlaps `target_rect`. Used in elevated window band 16
+/// so the widget never floats on top of overlapping shell/app popups.
+fn is_rect_occluded_above_taskbar(tray_hwnd: HWND, own_hwnd: HWND, target_rect: PixelRect) -> bool {
+    if target_rect.is_empty()
+        || !unsafe { windows::Win32::UI::WindowsAndMessaging::IsWindow(Some(tray_hwnd)).as_bool() }
+    {
+        return true;
+    }
+    let mut scan = WidgetOcclusionScan {
+        tray_hwnd,
+        own_hwnd,
+        desktop_hwnd: unsafe { GetDesktopWindow() },
+        shell_hwnd: unsafe { GetShellWindow() },
+        target_rect,
+        occluded: false,
+        saw_tray: false,
+    };
+    unsafe {
+        let _ = EnumWindows(
+            Some(widget_occlusion_enum_cb),
+            LPARAM(&mut scan as *mut WidgetOcclusionScan as isize),
+        );
+    }
+    scan.occluded || !scan.saw_tray
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2609,6 +2833,9 @@ fn repair_visible_taskbar_order(widget_hwnd: HWND, tray_hwnd: HWND) {
 
 fn repair_live_taskbar_order() {
     use std::sync::atomic::Ordering;
+    if IN_ELEVATED_BAND.load(Ordering::Acquire) {
+        return;
+    }
     let widget = LIVE_HWND.load(Ordering::Acquire);
     let tray = LIVE_TRAY_HWND.load(Ordering::Acquire);
     repair_visible_taskbar_order(
@@ -2698,11 +2925,19 @@ unsafe extern "system" fn fg_event_proc(
     _hook: HWINEVENTHOOK,
     event: u32,
     hwnd: HWND,
-    _id_object: i32,
-    _id_child: i32,
+    id_object: i32,
+    id_child: i32,
     _id_event_thread: u32,
     _dwms_event_time: u32,
 ) {
+    if (event == EVENT_OBJECT_SHOW || event == EVENT_OBJECT_HIDE)
+        && (id_object != OBJID_WINDOW.0
+            || id_child != 0
+            || hwnd.0.is_null()
+            || (unsafe { GetWindowLongPtrW(hwnd, GWL_STYLE) } as u32 & WS_CHILD.0) != 0)
+    {
+        return;
+    }
     if event == EVENT_SYSTEM_FOREGROUND
         && hwnd.0 as isize == LIVE_TRAY_HWND.load(std::sync::atomic::Ordering::Acquire)
     {
@@ -2775,6 +3010,58 @@ fn register_window_class(hinstance: HINSTANCE) -> Option<PCWSTR> {
     ok.then_some(class_name)
 }
 
+type CreateWindowInBandFn = unsafe extern "system" fn(
+    u32,
+    PCWSTR,
+    PCWSTR,
+    u32,
+    i32,
+    i32,
+    i32,
+    i32,
+    HWND,
+    HMENU,
+    HINSTANCE,
+    *const std::ffi::c_void,
+    u32,
+) -> HWND;
+type GetWindowBandFn = unsafe extern "system" fn(HWND, *mut u32) -> BOOL;
+
+#[derive(Clone, Copy)]
+struct BandExports {
+    create_in_band: Option<CreateWindowInBandFn>,
+    get_band: Option<GetWindowBandFn>,
+}
+
+fn band_exports() -> BandExports {
+    static EXPORTS: OnceLock<BandExports> = OnceLock::new();
+    *EXPORTS.get_or_init(|| unsafe {
+        let Ok(user32) = GetModuleHandleW(w!("user32.dll")) else {
+            return BandExports {
+                create_in_band: None,
+                get_band: None,
+            };
+        };
+        let create_in_band = GetProcAddress(user32, s!("CreateWindowInBand")).map(|p| {
+            std::mem::transmute::<unsafe extern "system" fn() -> isize, CreateWindowInBandFn>(p)
+        });
+        let get_band = GetProcAddress(user32, s!("GetWindowBand")).map(|p| {
+            std::mem::transmute::<unsafe extern "system" fn() -> isize, GetWindowBandFn>(p)
+        });
+        BandExports {
+            create_in_band,
+            get_band,
+        }
+    })
+}
+
+fn window_band(hwnd: HWND) -> Option<u32> {
+    let get_band = band_exports().get_band?;
+    let mut band = 0u32;
+    let ok = unsafe { get_band(hwnd, &mut band) };
+    ok.as_bool().then_some(band)
+}
+
 fn create_monitor_window(
     hinstance: HINSTANCE,
     class_name: PCWSTR,
@@ -2798,6 +3085,43 @@ fn create_monitor_window(
             Some(ctx.cast()),
         )
     }
+}
+
+fn create_elevated_monitor_window(
+    hinstance: HINSTANCE,
+    class_name: PCWSTR,
+    ctx: *mut WindowCtx,
+) -> windows::core::Result<(HWND, bool)> {
+    // Place the widget in `ZBID_GENUINE_WINDOWS` (band 16) so band-1 taskbar
+    // activation cannot raise `Shell_TrayWnd` above it for even a single frame,
+    // without touching Explorer ownership or input queues. Fall back cleanly
+    // to standard band 1 when `CreateWindowInBand` is unavailable or denied.
+    if let Some(create_in_band) = band_exports().create_in_band {
+        let hwnd = unsafe {
+            create_in_band(
+                (WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE).0,
+                class_name,
+                w!("TaskMan Taskbar Monitor"),
+                WS_POPUP.0,
+                0,
+                0,
+                1,
+                1,
+                HWND::default(),
+                HMENU::default(),
+                hinstance,
+                ctx.cast(),
+                TASKBAR_MONITOR_BAND,
+            )
+        };
+        if !hwnd.0.is_null() {
+            let in_elevated_band = window_band(hwnd) == Some(TASKBAR_MONITOR_BAND);
+            return Ok((hwnd, in_elevated_band));
+        }
+        let error = windows::core::Error::from_thread();
+        tracing::warn!(%error, "CreateWindowInBand failed; falling back to band 1");
+    }
+    create_monitor_window(hinstance, class_name, ctx).map(|hwnd| (hwnd, false))
 }
 
 unsafe extern "system" fn wnd_proc(
@@ -2980,6 +3304,7 @@ fn taskbar_thread_main(
         let renderer = Renderer::new();
         let mut ctx_box = Box::new(WindowCtx {
             hwnd: HWND::default(),
+            in_elevated_band: false,
             user_closing: false,
             shared: shared.clone(),
             visibility: visibility.clone(),
@@ -3009,12 +3334,13 @@ fn taskbar_thread_main(
         });
 
         let ctx_ptr: *mut WindowCtx = &mut *ctx_box;
-        let hwnd = match create_monitor_window(hmodule, class_name, ctx_ptr) {
-            Ok(h) if !h.0.is_null() => h,
-            _ => {
-                break;
-            }
-        };
+        let (hwnd, in_elevated_band) =
+            match create_elevated_monitor_window(hmodule, class_name, ctx_ptr) {
+                Ok((h, band)) if !h.0.is_null() => (h, band),
+                _ => {
+                    break;
+                }
+            };
 
         // Disable DWM show/hide transition animations so entering or exiting
         // fullscreen applies on the very next compositor vblank without fade lag.
@@ -3029,7 +3355,9 @@ fn taskbar_thread_main(
         }
 
         ctx_box.hwnd = hwnd;
+        ctx_box.in_elevated_band = in_elevated_band;
         REFRESH_PENDING.store(false, std::sync::atomic::Ordering::Release);
+        IN_ELEVATED_BAND.store(in_elevated_band, std::sync::atomic::Ordering::Release);
         LIVE_HWND.store(hwnd.0 as isize, std::sync::atomic::Ordering::Release);
 
         // If `shutdown()` / `set_config(enabled = false)` raced before `LIVE_HWND`
@@ -3040,6 +3368,7 @@ fn taskbar_thread_main(
         };
         if !still_enabled {
             LIVE_HWND.store(0, std::sync::atomic::Ordering::Release);
+            IN_ELEVATED_BAND.store(false, std::sync::atomic::Ordering::Release);
             REFRESH_PENDING.store(false, std::sync::atomic::Ordering::Release);
             unsafe {
                 let _ = DestroyWindow(hwnd);
@@ -3063,6 +3392,8 @@ fn taskbar_thread_main(
         let fg_hook = install_sys_hook(EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND);
         let movesize_hook = install_sys_hook(EVENT_SYSTEM_MOVESIZEEND, EVENT_SYSTEM_MOVESIZEEND);
         let minimize_hook = install_sys_hook(EVENT_SYSTEM_MINIMIZESTART, EVENT_SYSTEM_MINIMIZEEND);
+        let menu_hook = install_sys_hook(EVENT_SYSTEM_MENUPOPUPSTART, EVENT_SYSTEM_MENUPOPUPEND);
+        let obj_vis_hook = install_sys_hook(EVENT_OBJECT_SHOW, EVENT_OBJECT_HIDE);
 
         ctx_box.refresh(true);
 
@@ -3077,8 +3408,15 @@ fn taskbar_thread_main(
         }
 
         LIVE_HWND.store(0, std::sync::atomic::Ordering::Release);
+        IN_ELEVATED_BAND.store(false, std::sync::atomic::Ordering::Release);
         REFRESH_PENDING.store(false, std::sync::atomic::Ordering::Release);
-        for hook in [fg_hook, movesize_hook, minimize_hook] {
+        for hook in [
+            fg_hook,
+            movesize_hook,
+            minimize_hook,
+            menu_hook,
+            obj_vis_hook,
+        ] {
             if !hook.is_invalid() {
                 unsafe {
                     let _ = UnhookWinEvent(hook);
@@ -3111,6 +3449,14 @@ fn taskbar_thread_main(
 mod tests {
     use super::*;
 
+    // Desktop Z-order (`HWND_TOPMOST` / `EnumWindows`) is session-global state;
+    // serialize tests that mutate or assert relative top-level Z-order.
+    static ZORDER_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    fn z_order_test_lock() -> std::sync::MutexGuard<'static, ()> {
+        ZORDER_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     struct TestWindows(Vec<HWND>);
 
     impl Drop for TestWindows {
@@ -3125,6 +3471,7 @@ mod tests {
 
     #[test]
     fn monitor_window_is_unowned_and_survives_tray_destruction() {
+        let _zorder = z_order_test_lock();
         use windows::Win32::UI::WindowsAndMessaging::{GW_OWNER, IsWindow};
         let hinstance = HINSTANCE(unsafe { GetModuleHandleW(None).unwrap() }.0);
         let class_name = register_window_class(hinstance).unwrap();
@@ -3153,6 +3500,7 @@ mod tests {
 
     #[test]
     fn z_order_check_handles_more_than_128_intervening_windows() {
+        let _zorder = z_order_test_lock();
         let hinstance = HINSTANCE(unsafe { GetModuleHandleW(None).unwrap() }.0);
         let class_name = register_window_class(hinstance).unwrap();
         let mut windows = TestWindows(Vec::new());
@@ -3303,6 +3651,7 @@ mod tests {
 
     #[test]
     fn taskbar_focus_refresh_keeps_confirmed_layout_and_window_visible() {
+        let _zorder = z_order_test_lock();
         use std::sync::atomic::{AtomicUsize, Ordering};
         let _com = ComMtaGuard::enter();
         let hinstance = HINSTANCE(unsafe { GetModuleHandleW(None).unwrap() }.0);
@@ -3365,6 +3714,7 @@ mod tests {
         });
         let mut ctx = WindowCtx {
             hwnd,
+            in_elevated_band: false,
             user_closing: false,
             shared: Arc::new(Mutex::new(SharedState {
                 config: config.clone(),
@@ -3823,6 +4173,7 @@ mod tests {
 
     #[test]
     fn widget_stays_above_taskbar_and_below_menus_and_topmost_windows() {
+        let _zorder = z_order_test_lock();
         let hinstance = unsafe { GetModuleHandleW(None).unwrap() };
         let class_name = register_window_class(HINSTANCE(hinstance.0)).unwrap();
 
@@ -3885,6 +4236,7 @@ mod tests {
 
     #[test]
     fn widget_demotes_with_taskbar_behind_fullscreen_and_restores_on_exit() {
+        let _zorder = z_order_test_lock();
         let hinstance = unsafe { GetModuleHandleW(None).unwrap() };
         let class_name = register_window_class(HINSTANCE(hinstance.0)).unwrap();
 
@@ -3996,6 +4348,7 @@ mod tests {
 
     #[test]
     fn fullscreen_above_taskbar_stays_detected_under_alt_tab_and_ignores_cloaked_or_transparent() {
+        let _zorder = z_order_test_lock();
         use windows::Win32::Graphics::Dwm::DWMWA_CLOAK;
         use windows::Win32::UI::WindowsAndMessaging::HWND_TOP;
 
@@ -4583,5 +4936,310 @@ mod tests {
         // Missing accent value falls back safely to SystemUsesLightTheme.
         assert!(resolve_light_taskbar(true, true, None));
         assert!(!resolve_light_taskbar(false, true, None));
+    }
+
+    #[test]
+    fn elevated_band_window_stays_above_activated_tray_without_z_order_repair() {
+        let _zorder = z_order_test_lock();
+        let _com = ComMtaGuard::enter();
+        let hinstance = HINSTANCE(unsafe { GetModuleHandleW(None).unwrap() }.0);
+        let class_name = register_window_class(hinstance).unwrap();
+        let tray = create_monitor_window(hinstance, class_name, std::ptr::null_mut()).unwrap();
+        let (hwnd, in_elevated_band) =
+            create_elevated_monitor_window(hinstance, class_name, std::ptr::null_mut()).unwrap();
+        let _windows = TestWindows(vec![tray, hwnd]);
+
+        assert!(
+            unsafe { GetWindow(hwnd, windows::Win32::UI::WindowsAndMessaging::GW_OWNER) }
+                .unwrap_or_default()
+                .0
+                .is_null(),
+            "elevated-band widget must remain unowned"
+        );
+        if band_exports().create_in_band.is_some() {
+            assert!(
+                in_elevated_band,
+                "CreateWindowInBand(..., {TASKBAR_MONITOR_BAND}) should place the widget in band {TASKBAR_MONITOR_BAND}"
+            );
+            assert_eq!(window_band(hwnd), Some(TASKBAR_MONITOR_BAND));
+        }
+
+        let bar = rect(-20_000, -20_000, -18_080, -19_952);
+        unsafe {
+            let _ = ShowWindow(tray, SW_SHOWNOACTIVATE);
+            SetWindowPos(
+                tray,
+                Some(HWND_TOPMOST),
+                bar.left,
+                bar.top,
+                bar.width(),
+                bar.height(),
+                SWP_NOACTIVATE,
+            )
+            .unwrap();
+            let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+            SetWindowPos(
+                hwnd,
+                Some(HWND_TOPMOST),
+                bar.left + 100,
+                bar.top + 4,
+                160,
+                40,
+                SWP_NOACTIVATE,
+            )
+            .unwrap();
+        }
+        assert!(is_window_above(hwnd, tray));
+
+        // Simulate Band-1 taskbar activation moving `tray` to the top of Band 1.
+        // Without calling `repair_visible_taskbar_order`, a Band-16 widget must
+        // remain above `tray` natively.
+        if in_elevated_band {
+            for _ in 0..3 {
+                unsafe {
+                    SetWindowPos(
+                        tray,
+                        Some(HWND_TOPMOST),
+                        0,
+                        0,
+                        0,
+                        0,
+                        SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+                    )
+                    .unwrap();
+                }
+                assert!(
+                    is_window_above(hwnd, tray),
+                    "Band-{TASKBAR_MONITOR_BAND} widget must never fall below activated Band-1 tray"
+                );
+                assert!(unsafe { IsWindowVisible(hwnd).as_bool() });
+            }
+        }
+    }
+
+    #[test]
+    fn elevated_band_hides_on_overlapping_topmost_popup_and_restores() {
+        let _zorder = z_order_test_lock();
+        struct DpiContextGuard(windows::Win32::UI::HiDpi::DPI_AWARENESS_CONTEXT);
+        impl Drop for DpiContextGuard {
+            fn drop(&mut self) {
+                if !self.0.is_invalid() {
+                    unsafe {
+                        let _ = SetThreadDpiAwarenessContext(self.0);
+                    }
+                }
+            }
+        }
+        let _dpi = DpiContextGuard(unsafe {
+            SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2)
+        });
+        let _com = ComMtaGuard::enter();
+        let hinstance = HINSTANCE(unsafe { GetModuleHandleW(None).unwrap() }.0);
+        let class_name = register_window_class(hinstance).unwrap();
+        let tray = create_monitor_window(hinstance, class_name, std::ptr::null_mut()).unwrap();
+        let (hwnd, _) =
+            create_elevated_monitor_window(hinstance, class_name, std::ptr::null_mut()).unwrap();
+        let popup = create_monitor_window(hinstance, class_name, std::ptr::null_mut()).unwrap();
+        let _windows = TestWindows(vec![tray, hwnd, popup]);
+
+        let bar = rect(-30_000, -30_000, -28_080, -29_952);
+        let notify = rect(-28_300, -30_000, -28_080, -29_952);
+        let env = TaskbarEnv {
+            tray_hwnd: tray,
+            taskbar_rect: bar,
+            tray_notify_rect: Some(notify),
+            dpi: 96,
+        };
+        unsafe {
+            let _ = ShowWindow(tray, SW_SHOWNOACTIVATE);
+            SetWindowPos(
+                tray,
+                Some(HWND_TOPMOST),
+                bar.left,
+                bar.top,
+                bar.width(),
+                bar.height(),
+                SWP_NOACTIVATE,
+            )
+            .unwrap();
+        }
+
+        let config = Config {
+            enabled: true,
+            ..Config::default()
+        };
+        let metrics = Metrics::default();
+        let scanner = Arc::new(UiaScanner {
+            state: Arc::new((
+                Mutex::new(UiaShared {
+                    cache: UiaCache {
+                        tray_hwnd: tray.0 as isize,
+                        taskbar_rect: bar,
+                        rects: Some(vec![notify]),
+                        generation: 0,
+                    },
+                    ..Default::default()
+                }),
+                Condvar::new(),
+            )),
+            worker: Mutex::new(None),
+        });
+        let mut ctx = WindowCtx {
+            hwnd,
+            in_elevated_band: true,
+            user_closing: false,
+            shared: Arc::new(Mutex::new(SharedState {
+                config: config.clone(),
+                metrics,
+                generation: 0,
+            })),
+            visibility: Arc::new(MonitorVisibility {
+                visible: std::sync::atomic::AtomicBool::new(false),
+                notifier: Arc::new(|| {}),
+            }),
+            callback: Arc::new(|_| {}),
+            renderer: Renderer::new(),
+            uia_scanner: scanner,
+            light_taskbar: false,
+            hovered: false,
+            tracking_mouse: false,
+            last_display: None,
+            last_size: (0, 0),
+            last_pos: None,
+            last_visible: false,
+            last_present_error: None,
+            last_anchor_slot: None,
+            last_compact: false,
+            last_stacked: false,
+            last_env_geom: Some((tray.0 as isize, bar, Some(notify), 96)),
+            pending_uia_scan: false,
+            invalidate_uia_layout: false,
+            msg_taskbar_created: 0,
+            msg_shell_hook: 0,
+            tracked_fg_tid: 0,
+            fg_loc_hook: HWINEVENTHOOK::default(),
+            tracked_tray_tid: 0,
+            tray_hook: HWINEVENTHOOK::default(),
+        };
+
+        ctx.refresh_taskbar_env(&config, &metrics, env, false);
+        assert!(ctx.last_visible);
+        let widget_rect = ctx.last_rect().expect("visible widget rect");
+
+        // Non-overlapping topmost popup leaves the widget visible.
+        unsafe {
+            let _ = ShowWindow(popup, SW_SHOWNOACTIVATE);
+            SetWindowPos(
+                popup,
+                Some(HWND_TOPMOST),
+                bar.left,
+                bar.bottom + 200,
+                200,
+                100,
+                SWP_NOACTIVATE,
+            )
+            .unwrap();
+        }
+        ctx.refresh_taskbar_env(&config, &metrics, env, false);
+        assert!(ctx.last_visible);
+
+        // Overlapping topmost popup (menu, flyout, or always-on-top window) hides the widget.
+        unsafe {
+            SetWindowPos(
+                popup,
+                Some(HWND_TOPMOST),
+                widget_rect.left,
+                widget_rect.top,
+                widget_rect.width().max(40),
+                widget_rect.height().max(24),
+                SWP_NOACTIVATE,
+            )
+            .unwrap();
+        }
+        ctx.refresh_taskbar_env(&config, &metrics, env, false);
+        assert!(
+            !ctx.last_visible && unsafe { !IsWindowVisible(hwnd).as_bool() },
+            "Band-16 widget must hide when a topmost popup overlaps its footprint"
+        );
+
+        // Click-through transparent overlay does not occlude the widget.
+        let orig_ex = unsafe { GetWindowLongPtrW(popup, GWL_EXSTYLE) };
+        unsafe {
+            SetWindowLongPtrW(popup, GWL_EXSTYLE, orig_ex | WS_EX_TRANSPARENT.0 as isize);
+        }
+        ctx.refresh_taskbar_env(&config, &metrics, env, false);
+        assert!(ctx.last_visible);
+
+        // Non-topmost overlapping window behind the tray also does not hide the widget.
+        unsafe {
+            SetWindowLongPtrW(popup, GWL_EXSTYLE, orig_ex);
+            SetWindowPos(
+                popup,
+                Some(HWND_NOTOPMOST),
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+            )
+            .unwrap();
+        }
+        ctx.refresh_taskbar_env(&config, &metrics, env, false);
+        assert!(
+            ctx.last_visible,
+            "non-topmost window behind tray must not occlude Band-16 widget"
+        );
+
+        // Restoring the overlapping topmost popup hides again, and hiding it restores visibility.
+        unsafe {
+            SetWindowPos(
+                popup,
+                Some(HWND_TOPMOST),
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+            )
+            .unwrap();
+        }
+        ctx.refresh_taskbar_env(&config, &metrics, env, false);
+        assert!(!ctx.last_visible);
+
+        unsafe {
+            let _ = ShowWindow(popup, SW_HIDE);
+        }
+        ctx.refresh_taskbar_env(&config, &metrics, env, false);
+        assert!(ctx.last_visible);
+    }
+
+    #[test]
+    fn context_menu_anchor_places_menu_outside_taskbar_edges() {
+        let monitor = Some(rect(0, 0, 1920, 1080));
+
+        let (pt, align) = context_menu_anchor(
+            POINT { x: 1600, y: 1050 },
+            Some(rect(0, 1032, 1920, 1080)),
+            monitor,
+        );
+        assert_eq!((pt.x, pt.y, align), (1600, 1032, TPM_BOTTOMALIGN.0));
+
+        let (pt, align) = context_menu_anchor(
+            POINT { x: 1600, y: 20 },
+            Some(rect(0, 0, 1920, 48)),
+            monitor,
+        );
+        assert_eq!((pt.x, pt.y, align), (1600, 48, TPM_TOPALIGN.0));
+
+        let (pt, align) =
+            context_menu_anchor(POINT { x: 30, y: 900 }, Some(rect(0, 0, 64, 1080)), monitor);
+        assert_eq!((pt.x, pt.y, align), (64, 900, TPM_LEFTALIGN.0));
+
+        let (pt, align) = context_menu_anchor(
+            POINT { x: 1880, y: 900 },
+            Some(rect(1856, 0, 1920, 1080)),
+            monitor,
+        );
+        assert_eq!((pt.x, pt.y, align), (1856, 900, TPM_RIGHTALIGN.0));
     }
 }

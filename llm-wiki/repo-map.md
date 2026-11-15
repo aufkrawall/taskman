@@ -138,11 +138,14 @@ platform boundary (`tm-core` ← `tm-platform` ← `tm-app` / `tm-service`), and
     when always-on-top is turned off),
     `taskbar_monitor.rs` (optional taskbar CPU/RAM/network monitor on a
     dedicated `"tm-taskbar"` thread: `WS_EX_LAYERED | WS_EX_TOOLWINDOW |
-    WS_EX_NOACTIVATE` unowned popup with software Direct2D + DirectWrite into
+    WS_EX_NOACTIVATE` unowned popup in window band 16 via `CreateWindowInBand`
+    with band-1 fallback, software Direct2D + DirectWrite into
     a cached 32bpp DIB and `UpdateLayeredWindow`; never `GetDC(NULL)`/`GetPixel`
-    or cross-process parenting/ownership; follows taskbar Z-order, hides when
-    UIA occupancy is unknown, on taskbar auto-hide, and under fullscreen windows;
-    visibility notifications restore background cadence when both surfaces hide),
+    or cross-process parenting/ownership; hides when overlapping higher/peer
+    popups/topmost windows occlude it, UIA occupancy is unknown, on taskbar
+    auto-hide, and under fullscreen windows; context menu anchors outside the
+    taskbar edge; visibility notifications restore background cadence when both
+    surfaces hide),
     `hotkey_hook.rs` (dedicated `WH_KEYBOARD_LL` thread intercepting Ctrl+Shift+Esc,
     installed only while the IFEO replacement is registered and driven by a
     `RegNotifyChangeKeyValue` watch rather than polling; bypasses shell hotkey
