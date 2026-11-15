@@ -4,6 +4,7 @@
 
 ### Fixed
 
+- **Taskbar monitor click flicker:** Focusing or clicking the taskbar no longer deliberately hides the monitor while layout data is rescanned. Stacking notifications retain confirmed occupancy, actual control/geometry changes still invalidate it, and Z-order placement ignores hidden/cloaked bookkeeping windows while staying below visible popups. The monitor remains unowned and keeps its input queue independent of Explorer.
 - **Taskbar monitor isolation and background work:** The Windows taskbar monitor no longer shares an input queue with Explorer through cross-process window ownership. It follows taskbar Z-order without modifying Explorer, hides if safe positioning is denied, and restores the five-second background sampling interval whenever both the main window and taskbar monitor are hidden. Showing the monitor requests a fresh sample while preserving Pause.
 - **Taskbar button access and visibility checks:** The monitor stays hidden until UI Automation confirms taskbar occupancy, discards failed or stale layout results, and no longer places itself over buttons when layout information is unavailable. Z-order regression checks now handle desktops with more than 128 intervening windows.
 

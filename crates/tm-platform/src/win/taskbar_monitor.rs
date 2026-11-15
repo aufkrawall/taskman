@@ -172,6 +172,40 @@ static LIVE_FG_HWND: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicI
 static LIVE_TRAY_HWND: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
 static REFRESH_PENDING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static LAYOUT_DIRTY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static LAYOUT_RECHECK_PENDING: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LayoutUpdate {
+    Recheck,
+    Invalidate,
+}
+
+fn taskbar_event_layout_update(
+    event: u32,
+    is_tray: bool,
+    id_object: i32,
+    id_child: i32,
+) -> Option<LayoutUpdate> {
+    let window_self = id_object == OBJID_WINDOW.0 && id_child == 0;
+    if event != EVENT_OBJECT_REORDER
+        && !(window_self
+            && matches!(
+                event,
+                EVENT_OBJECT_SHOW | EVENT_OBJECT_HIDE | EVENT_OBJECT_LOCATIONCHANGE
+            ))
+    {
+        return None;
+    }
+    // Focusing/raising Shell_TrayWnd can report a reorder or unchanged window
+    // position. Verify its bounds in refresh, but retain the proven occupancy.
+    // Child/control changes still invalidate immediately to protect their clicks.
+    Some(if is_tray && window_self {
+        LayoutUpdate::Recheck
+    } else {
+        LayoutUpdate::Invalidate
+    })
+}
 
 fn post_refresh() {
     let raw = LIVE_HWND.load(std::sync::atomic::Ordering::Acquire);
@@ -1079,9 +1113,9 @@ impl Drop for WindowCtx {
 }
 
 impl WindowCtx {
-    fn mark_layout_dirty(&mut self, arm_settle: bool) {
+    fn request_layout_scan(&mut self, update: LayoutUpdate, arm_settle: bool) {
         self.pending_uia_scan = true;
-        self.invalidate_uia_layout |= arm_settle;
+        self.invalidate_uia_layout |= update == LayoutUpdate::Invalidate;
         if arm_settle && !self.hwnd.0.is_null() {
             unsafe {
                 let _ = SetTimer(
@@ -1209,6 +1243,16 @@ impl WindowCtx {
             return;
         };
 
+        self.refresh_taskbar_env(&config, &metrics, env, force_render);
+    }
+
+    fn refresh_taskbar_env(
+        &mut self,
+        config: &Config,
+        metrics: &Metrics,
+        env: TaskbarEnv,
+        force_render: bool,
+    ) {
         let tray_raw = env.tray_hwnd.0 as isize;
         let geom = (tray_raw, env.taskbar_rect, env.tray_notify_rect, env.dpi);
         let geom_changed = self.last_env_geom != Some(geom);
@@ -1234,10 +1278,32 @@ impl WindowCtx {
             return;
         }
 
+        // Repair a taskbar raise before DirectWrite measurement/rasterization.
+        // Only reuse our position while fresh geometry and known controls still
+        // leave that rectangle clear; otherwise the placement solver runs first.
+        if self.last_visible
+            && !geom_changed
+            && self.last_pos.is_some_and(|(x, y)| {
+                let current = PixelRect {
+                    left: x,
+                    top: y,
+                    right: x.saturating_add(self.last_size.0),
+                    bottom: y.saturating_add(self.last_size.1),
+                };
+                uia_occupied
+                    .as_ref()
+                    .is_some_and(|rects| rects.iter().all(|r| !r.intersects(current)))
+            })
+            && !ensure_just_above_taskbar(self.hwnd, env.tray_hwnd)
+        {
+            self.set_visible(false);
+            return;
+        }
+
         let bounds = LayoutBounds::from_taskbar(env.taskbar_rect, env.dpi);
         let normal_display = build_display(
-            &config,
-            &metrics,
+            config,
+            metrics,
             self.light_taskbar,
             self.hovered,
             env.dpi,
@@ -1278,8 +1344,8 @@ impl WindowCtx {
             (normal_display, normal_layout, placement)
         } else {
             let compact_display = build_display(
-                &config,
-                &metrics,
+                config,
+                metrics,
                 self.light_taskbar,
                 self.hovered,
                 env.dpi,
@@ -1408,6 +1474,12 @@ impl WindowCtx {
             let _ = ShowWindow(self.hwnd, if visible { SW_SHOWNOACTIVATE } else { SW_HIDE });
         }
         self.last_visible = unsafe { IsWindowVisible(self.hwnd).as_bool() };
+        if self.last_visible == visible {
+            tracing::debug!(
+                visible = self.last_visible,
+                "taskbar monitor visibility changed"
+            );
+        }
         self.visibility.set(self.last_visible);
         self.last_visible
     }
@@ -1564,6 +1636,7 @@ fn build_display(
     }
 }
 
+#[derive(Clone, Copy)]
 struct TaskbarEnv {
     tray_hwnd: HWND,
     taskbar_rect: PixelRect,
@@ -2354,7 +2427,56 @@ fn is_window_above(target: HWND, anchor: HWND) -> bool {
     scan.saw_anchor && scan.saw_target
 }
 
-/// Keeps `widget_hwnd` directly above `tray_hwnd`, never climbing in front of
+struct TaskbarZOrder {
+    tray: HWND,
+    widget: HWND,
+    topmost: bool,
+    predecessor: Option<HWND>,
+    saw_tray: bool,
+    saw_widget: bool,
+    visible_after_widget: bool,
+}
+
+unsafe extern "system" fn taskbar_z_order_enum_cb(hwnd: HWND, lparam: LPARAM) -> BOOL {
+    let scan = unsafe { &mut *(lparam.0 as *mut TaskbarZOrder) };
+    if hwnd == scan.tray {
+        scan.saw_tray = true;
+        return BOOL(0);
+    }
+    if hwnd == scan.widget {
+        scan.saw_widget = true;
+    } else if unsafe { IsWindowVisible(hwnd).as_bool() }
+        && !is_window_cloaked(hwnd)
+        && ((unsafe { GetWindowLongPtrW(hwnd, GWL_EXSTYLE) } as u32 & WS_EX_TOPMOST.0) != 0)
+            == scan.topmost
+    {
+        scan.predecessor = Some(hwnd);
+        scan.visible_after_widget |= scan.saw_widget;
+    }
+    BOOL(1)
+}
+
+fn hide_and_demote_widget(hwnd: HWND) {
+    unsafe {
+        let _ = SetWindowPos(
+            hwnd,
+            Some(HWND_NOTOPMOST),
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE
+                | SWP_NOSIZE
+                | SWP_NOACTIVATE
+                | SWP_NOOWNERZORDER
+                | SWP_NOSENDCHANGING
+                | SWP_HIDEWINDOW,
+        );
+        let _ = ShowWindow(hwnd, SW_HIDE);
+    }
+}
+
+/// Keeps `widget_hwnd` above `tray_hwnd`, never climbing in front of visible
 /// popup menus, tray flyouts, or other programs' topmost windows, and never
 /// remaining pinned as `TOPMOST` if Explorer itself was demoted behind a
 /// fullscreen window.
@@ -2366,31 +2488,42 @@ fn ensure_just_above_taskbar(widget_hwnd: HWND, tray_hwnd: HWND) -> bool {
     let flags = SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_NOSENDCHANGING;
 
     if !unsafe { windows::Win32::UI::WindowsAndMessaging::IsWindow(Some(tray_hwnd)).as_bool() } {
-        unsafe {
-            let _ = SetWindowPos(
-                widget_hwnd,
-                Some(HWND_NOTOPMOST),
-                0,
-                0,
-                0,
-                0,
-                flags | SWP_HIDEWINDOW,
-            );
-            let _ = ShowWindow(widget_hwnd, SW_HIDE);
-        }
+        hide_and_demote_widget(widget_hwnd);
         return false;
     }
     let prev = unsafe { GetWindow(tray_hwnd, GW_HWNDPREV) }.unwrap_or_default();
     if prev == widget_hwnd && widget_topmost == tray_topmost {
         return true;
     }
-    let prev_topmost = !prev.0.is_null()
-        && (unsafe { GetWindowLongPtrW(prev, GWL_EXSTYLE) } as u32 & WS_EX_TOPMOST.0) != 0;
-    // Inserting after a normal-band predecessor demotes and positions in one call.
-    // At a band boundary use the band marker instead of inheriting a topmost
-    // predecessor's band. No operation changes Explorer's own window or owner.
-    let insert_after = if !prev.0.is_null() && prev != widget_hwnd && prev_topmost == tray_topmost {
-        prev
+    // Hidden bookkeeping windows (e.g. ForegroundStaging) may be inaccessible
+    // insertion anchors. They have no visible content to preserve. Enumerate
+    // without a fixed cap, and retain ordering below every visible peer instead.
+    let mut scan = TaskbarZOrder {
+        tray: tray_hwnd,
+        widget: widget_hwnd,
+        topmost: tray_topmost,
+        predecessor: None,
+        saw_tray: false,
+        saw_widget: false,
+        visible_after_widget: false,
+    };
+    unsafe {
+        let _ = EnumWindows(
+            Some(taskbar_z_order_enum_cb),
+            LPARAM(&mut scan as *mut TaskbarZOrder as isize),
+        );
+    }
+    if !scan.saw_tray {
+        hide_and_demote_widget(widget_hwnd);
+        return false;
+    }
+    if scan.saw_widget && !scan.visible_after_widget && widget_topmost == tray_topmost {
+        return true;
+    }
+    // At the top of the selected band use its marker; never inherit another
+    // band's predecessor. No operation changes Explorer's own window or owner.
+    let insert_after = if let Some(predecessor) = scan.predecessor {
+        predecessor
     } else if tray_topmost {
         HWND_TOPMOST
     } else if widget_topmost {
@@ -2404,18 +2537,7 @@ fn ensure_just_above_taskbar(widget_hwnd: HWND, tray_hwnd: HWND) -> bool {
             // An inaccessible predecessor (e.g. a higher-integrity window) is not
             // permission to raise above it. Hide and demote only our own popup.
             let was_visible = unsafe { IsWindowVisible(widget_hwnd).as_bool() };
-            unsafe {
-                let _ = SetWindowPos(
-                    widget_hwnd,
-                    Some(HWND_NOTOPMOST),
-                    0,
-                    0,
-                    0,
-                    0,
-                    flags | SWP_HIDEWINDOW,
-                );
-                let _ = ShowWindow(widget_hwnd, SW_HIDE);
-            }
+            hide_and_demote_widget(widget_hwnd);
             if was_visible {
                 tracing::warn!(%error, "cannot position taskbar monitor; keeping it hidden");
             }
@@ -2550,14 +2672,15 @@ unsafe extern "system" fn tray_event_proc(
     }
     let tray_hwnd = HWND(tray as *mut std::ffi::c_void);
     let is_tray_or_child = hwnd.0 as isize == tray || unsafe { IsChild(tray_hwnd, hwnd).as_bool() };
-    let relevant_event = event == EVENT_OBJECT_REORDER
-        || (matches!(
-            event,
-            EVENT_OBJECT_SHOW | EVENT_OBJECT_HIDE | EVENT_OBJECT_LOCATIONCHANGE
-        ) && id_object == OBJID_WINDOW.0
-            && id_child == 0);
-    if is_tray_or_child && relevant_event {
-        LAYOUT_DIRTY.store(true, std::sync::atomic::Ordering::Release);
+    if is_tray_or_child
+        && let Some(update) =
+            taskbar_event_layout_update(event, hwnd == tray_hwnd, id_object, id_child)
+    {
+        let pending = match update {
+            LayoutUpdate::Recheck => &LAYOUT_RECHECK_PENDING,
+            LayoutUpdate::Invalidate => &LAYOUT_DIRTY,
+        };
+        pending.store(true, std::sync::atomic::Ordering::Release);
         post_refresh();
     }
 }
@@ -2631,7 +2754,7 @@ unsafe extern "system" fn wnd_proc(
 
     if ctx.msg_taskbar_created != 0 && msg == ctx.msg_taskbar_created {
         ctx.light_taskbar = read_taskbar_is_light();
-        ctx.mark_layout_dirty(true);
+        ctx.request_layout_scan(LayoutUpdate::Invalidate, true);
         ctx.refresh(true);
         return LRESULT(0);
     }
@@ -2639,7 +2762,7 @@ unsafe extern "system" fn wnd_proc(
     if ctx.msg_shell_hook != 0 && msg == ctx.msg_shell_hook {
         match wparam.0 as u32 {
             HSHELL_WINDOWCREATED | HSHELL_WINDOWDESTROYED | HSHELL_WINDOWREPLACED => {
-                ctx.mark_layout_dirty(true);
+                ctx.request_layout_scan(LayoutUpdate::Invalidate, true);
                 ctx.refresh(false);
             }
             HSHELL_WINDOWACTIVATED | HSHELL_RUDEAPPACTIVATED_MSG => {
@@ -2653,8 +2776,17 @@ unsafe extern "system" fn wnd_proc(
     match msg {
         WM_APP_REFRESH => {
             REFRESH_PENDING.store(false, std::sync::atomic::Ordering::Release);
-            if LAYOUT_DIRTY.swap(false, std::sync::atomic::Ordering::AcqRel) {
-                ctx.mark_layout_dirty(true);
+            let invalidate = LAYOUT_DIRTY.swap(false, std::sync::atomic::Ordering::AcqRel);
+            let recheck = LAYOUT_RECHECK_PENDING.swap(false, std::sync::atomic::Ordering::AcqRel);
+            if invalidate || recheck {
+                ctx.request_layout_scan(
+                    if invalidate {
+                        LayoutUpdate::Invalidate
+                    } else {
+                        LayoutUpdate::Recheck
+                    },
+                    true,
+                );
             }
             ctx.refresh(false);
             LRESULT(0)
@@ -2664,13 +2796,13 @@ unsafe extern "system" fn wnd_proc(
                 unsafe {
                     let _ = KillTimer(Some(hwnd), UIA_SETTLE_TIMER_ID);
                 }
-                ctx.mark_layout_dirty(false);
+                ctx.request_layout_scan(LayoutUpdate::Recheck, false);
                 ctx.refresh(false);
             }
             LRESULT(0)
         }
         WM_SETTINGCHANGE => {
-            ctx.mark_layout_dirty(true);
+            ctx.request_layout_scan(LayoutUpdate::Invalidate, true);
             let light = read_taskbar_is_light();
             if light != ctx.light_taskbar {
                 ctx.light_taskbar = light;
@@ -2689,7 +2821,7 @@ unsafe extern "system" fn wnd_proc(
             LRESULT(0)
         }
         WM_DISPLAYCHANGE | WM_DPICHANGED => {
-            ctx.mark_layout_dirty(true);
+            ctx.request_layout_scan(LayoutUpdate::Invalidate, true);
             ctx.refresh(true);
             LRESULT(0)
         }
@@ -2774,6 +2906,7 @@ fn taskbar_thread_main(
     let msg_taskbar_created = unsafe { RegisterWindowMessageW(w!("TaskbarCreated")) };
     let msg_shell_hook = unsafe { RegisterWindowMessageW(w!("SHELLHOOK")) };
     LAYOUT_DIRTY.store(false, std::sync::atomic::Ordering::Release);
+    LAYOUT_RECHECK_PENDING.store(false, std::sync::atomic::Ordering::Release);
     let uia_scanner = Arc::new(UiaScanner::start());
 
     loop {
@@ -3048,6 +3181,217 @@ mod tests {
         }
         assert!(scanner.snapshot_for(2, bar).is_none());
         assert!(scanner.snapshot_for(1, rect(0, 0, 1920, 48)).is_none());
+    }
+
+    #[test]
+    fn taskbar_focus_refresh_keeps_confirmed_layout_and_window_visible() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let _com = ComMtaGuard::enter();
+        let hinstance = HINSTANCE(unsafe { GetModuleHandleW(None).unwrap() }.0);
+        let class_name = register_window_class(hinstance).unwrap();
+        let tray = create_monitor_window(hinstance, class_name, std::ptr::null_mut()).unwrap();
+        let hwnd = create_monitor_window(hinstance, class_name, std::ptr::null_mut()).unwrap();
+        let _windows = TestWindows(vec![tray, hwnd]);
+        let bar = rect(-10_000, -10_000, -8_080, -9_952);
+        let notify = rect(-8_300, -10_000, -8_080, -9_952);
+        let env = TaskbarEnv {
+            tray_hwnd: tray,
+            taskbar_rect: bar,
+            tray_notify_rect: Some(notify),
+            dpi: 96,
+        };
+        unsafe {
+            SetWindowPos(
+                tray,
+                Some(HWND_TOPMOST),
+                bar.left,
+                bar.top,
+                bar.width(),
+                bar.height(),
+                SWP_NOACTIVATE,
+            )
+            .unwrap();
+            let _ = ShowWindow(tray, SW_SHOWNOACTIVATE);
+            SetWindowPos(
+                hwnd,
+                Some(HWND_TOPMOST),
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+            )
+            .unwrap();
+        }
+        let config = Config {
+            enabled: true,
+            ..Config::default()
+        };
+        let metrics = Metrics::default();
+        let notifications = Arc::new(AtomicUsize::new(0));
+        let observed = notifications.clone();
+        let scanner = Arc::new(UiaScanner {
+            state: Arc::new((
+                Mutex::new(UiaShared {
+                    cache: UiaCache {
+                        tray_hwnd: tray.0 as isize,
+                        taskbar_rect: bar,
+                        rects: Some(vec![notify]),
+                    },
+                    ..Default::default()
+                }),
+                Condvar::new(),
+            )),
+            worker: Mutex::new(None),
+        });
+        let mut ctx = WindowCtx {
+            hwnd,
+            user_closing: false,
+            shared: Arc::new(Mutex::new(SharedState {
+                config: config.clone(),
+                metrics,
+                generation: 0,
+            })),
+            visibility: Arc::new(MonitorVisibility {
+                visible: std::sync::atomic::AtomicBool::new(false),
+                notifier: Arc::new(move || {
+                    observed.fetch_add(1, Ordering::Relaxed);
+                }),
+            }),
+            callback: Arc::new(|_| {}),
+            renderer: Renderer::new(),
+            uia_scanner: scanner,
+            light_taskbar: false,
+            hovered: false,
+            tracking_mouse: false,
+            last_display: None,
+            last_size: (0, 0),
+            last_pos: None,
+            last_visible: false,
+            last_present_error: None,
+            last_anchor_slot: None,
+            last_compact: false,
+            last_stacked: false,
+            last_env_geom: Some((tray.0 as isize, bar, Some(notify), 96)),
+            pending_uia_scan: false,
+            invalidate_uia_layout: false,
+            msg_taskbar_created: 0,
+            msg_shell_hook: 0,
+            tracked_fg_tid: 0,
+            fg_loc_hook: HWINEVENTHOOK::default(),
+            tracked_tray_tid: 0,
+            tray_hook: HWINEVENTHOOK::default(),
+        };
+        ctx.refresh_taskbar_env(&config, &metrics, env, false);
+        assert!(
+            ctx.last_visible,
+            "initial display rendered={}, positioned={}, known_layout={}",
+            ctx.last_display.is_some(),
+            ctx.last_pos.is_some(),
+            ctx.uia_scanner.snapshot_for(tray.0 as isize, bar).is_some()
+        );
+        assert_eq!(notifications.load(Ordering::Relaxed), 1);
+
+        // Reproduce focusing the tray: its band/geometry and occupied buttons stay
+        // unchanged, but a layout notification arrives before the next UIA scan.
+        unsafe {
+            SetWindowPos(
+                tray,
+                Some(HWND_TOPMOST),
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+            )
+            .unwrap();
+        }
+        for event in [
+            EVENT_OBJECT_REORDER,
+            EVENT_OBJECT_LOCATIONCHANGE,
+            EVENT_OBJECT_SHOW,
+        ] {
+            let update = taskbar_event_layout_update(event, true, OBJID_WINDOW.0, 0).unwrap();
+            ctx.request_layout_scan(update, true);
+            ctx.refresh_taskbar_env(&config, &metrics, env, false);
+            assert!(
+                ctx.last_visible,
+                "focus-only taskbar notification must not hide the widget"
+            );
+            assert_eq!(
+                notifications.load(Ordering::Relaxed),
+                1,
+                "focus must not publish hide/show transitions"
+            );
+            assert!(ctx.uia_scanner.snapshot_for(tray.0 as isize, bar).is_some());
+            assert!(is_window_above(hwnd, tray));
+        }
+
+        // A real child-layout change still hides until a fresh scan completes.
+        let update =
+            taskbar_event_layout_update(EVENT_OBJECT_LOCATIONCHANGE, false, OBJID_WINDOW.0, 0)
+                .unwrap();
+        ctx.request_layout_scan(update, true);
+        ctx.request_layout_scan(LayoutUpdate::Recheck, true);
+        ctx.refresh_taskbar_env(&config, &metrics, env, false);
+        assert!(!ctx.last_visible);
+        assert_eq!(notifications.load(Ordering::Relaxed), 2);
+        assert!(ctx.uia_scanner.snapshot_for(tray.0 as isize, bar).is_none());
+        {
+            let mut state = ctx.uia_scanner.state.0.lock().unwrap();
+            let target = state.pending.take().unwrap();
+            assert!(state.publish(target, Some(vec![notify])));
+        }
+        ctx.refresh_taskbar_env(&config, &metrics, env, false);
+        assert!(ctx.last_visible);
+        assert_eq!(notifications.load(Ordering::Relaxed), 3);
+
+        // A root-window notification also invalidates if the queried geometry moved.
+        let mut moved = env;
+        moved.taskbar_rect.left -= 1;
+        moved.taskbar_rect.right -= 1;
+        ctx.request_layout_scan(LayoutUpdate::Recheck, true);
+        ctx.refresh_taskbar_env(&config, &metrics, moved, false);
+        assert!(!ctx.last_visible);
+        assert_eq!(notifications.load(Ordering::Relaxed), 4);
+    }
+
+    #[test]
+    fn taskbar_event_classification_preserves_real_layout_invalidation() {
+        use windows::Win32::UI::WindowsAndMessaging::OBJID_CLIENT;
+        for event in [
+            EVENT_OBJECT_SHOW,
+            EVENT_OBJECT_HIDE,
+            EVENT_OBJECT_LOCATIONCHANGE,
+            EVENT_OBJECT_REORDER,
+        ] {
+            assert_eq!(
+                taskbar_event_layout_update(event, true, OBJID_WINDOW.0, 0),
+                Some(LayoutUpdate::Recheck)
+            );
+            assert_eq!(
+                taskbar_event_layout_update(event, false, OBJID_WINDOW.0, 0),
+                Some(LayoutUpdate::Invalidate)
+            );
+        }
+        // Reordering accessible children can change occupancy without changing
+        // Shell_TrayWnd's own rectangle (e.g. XAML taskbar button additions).
+        assert_eq!(
+            taskbar_event_layout_update(EVENT_OBJECT_REORDER, true, OBJID_CLIENT.0, 0),
+            Some(LayoutUpdate::Invalidate)
+        );
+        assert_eq!(
+            taskbar_event_layout_update(EVENT_OBJECT_REORDER, true, OBJID_WINDOW.0, 1),
+            Some(LayoutUpdate::Invalidate)
+        );
+        assert_eq!(
+            taskbar_event_layout_update(EVENT_OBJECT_LOCATIONCHANGE, true, OBJID_CLIENT.0, 0),
+            None
+        );
+        assert_eq!(
+            taskbar_event_layout_update(EVENT_SYSTEM_FOREGROUND, true, OBJID_WINDOW.0, 0),
+            None
+        );
     }
 
     #[test]

@@ -1,3 +1,19 @@
+## 2026-11-15 — taskbar focus flicker regression
+
+- The input-queue isolation change introduced two deliberate hide paths on
+  ordinary taskbar focus: treating root stacking/unchanged-position notifications
+  as invalid occupancy, and inserting after a hidden, inaccessible predecessor.
+  A native probe identified Windows' hidden `ForegroundStaging` as one such
+  predecessor; it must not be used as an anchor or special-cased by class name.
+- Root-window hints now recheck cached occupancy while child/control and actual
+  geometry changes still invalidate it. Placement enumerates visible/uncloaked
+  peers without a count cap and repairs Z-order before text layout. Explorer
+  ownership remains disabled, and failed/empty UIA results still hide the widget.
+- A native off-screen regression reproduces taskbar raising with a pending scan,
+  asserts no visibility notifications for unchanged geometry, and verifies that
+  child/geometry changes still hide and recover. Visibility transitions now emit
+  debug-level diagnostics; real desktop visuals remain a manual check.
+
 ## 2026-11-15 — taskbar monitor isolation and hidden sampling
 
 - Removed Explorer ownership from the layered popup: cross-thread Win32 ownership

@@ -1093,13 +1093,17 @@ rebase runbook.
   thread-scoped `SetWinEventHook` hooks on the active foreground thread and
   `Shell_TrayWnd` thread (`EVENT_OBJECT_SHOW`..`EVENT_OBJECT_LOCATIONCHANGE`,
   filtered to `OBJID_WINDOW` `SHOW`/`HIDE`/`LOCATIONCHANGE` on tray + `IsChild`
-  descendants plus `EVENT_OBJECT_REORDER`) with `REFRESH_PENDING` /
-  `LAYOUT_DIRTY` coalescing plus a 300 ms one-shot settle timer to refresh on
+  descendants plus `EVENT_OBJECT_REORDER`) with `REFRESH_PENDING`,
+  `LAYOUT_DIRTY`, and `LAYOUT_RECHECK_PENDING` coalescing plus a 300 ms
+  one-shot settle timer to refresh on
   fullscreen/auto-hide transitions (including when
   holding `Alt+Tab` or another overlay takes foreground while an uncloaked,
   opaque fullscreen window still sits above `Shell_TrayWnd` in Z-order) and
-  Z-order follows `Shell_TrayWnd` using its immediate predecessor, without
-  fixed-count window walks or manipulating Explorer. If positioning against
+  Z-order follows `Shell_TrayWnd` using the nearest visible, uncloaked predecessor
+  in its band, without fixed-count window walks or manipulating Explorer.
+  Invisible bookkeeping windows are not placement anchors: a native probe found
+  that taskbar focus can put hidden `ForegroundStaging` immediately above the
+  tray, and inserting after it returns access denied. If positioning against
   an inaccessible predecessor is denied, only the widget is hidden/demoted.
   Unlike Explorer ownership, shell-event handling is asynchronous; headless
   tests do not establish frame-perfect fullscreen transitions on every driver.
@@ -1115,11 +1119,19 @@ rebase runbook.
   narrower than side-by-side columns (stepping down font size if
   needed on short/narrow bars, rejecting cross-axis overflow), adapting to
   `compact = true` (`"C"`/`"R"` labels) when tight, cleanly hiding via
-  `SW_HIDE` if completely packed or occupancy is unknown. Layout changes
-  invalidate cached bounds; generation checks reject older in-flight scans,
+  `SW_HIDE` if completely packed or occupancy is unknown. Root-window stacking
+  and unchanged-position hints recheck confirmed occupancy without clearing it;
+  child/control changes or actual taskbar/tray/DPI geometry changes invalidate
+  immediately, even if a recheck is coalesced afterward. Z-order repair runs
+  before text measurement when the current rectangle is still clear. A previous
+  version invalidated on every root reorder, causing a hide/rescan/show flash on
+  taskbar focus; do not restore that coupling or Explorer ownership.
+  Generation checks reject older in-flight scans,
   and failed/empty scans clear stale data. The settle scan can reuse valid
   bounds until its result arrives. Layout and presentation failures have
-  rate-limited diagnostics. There is no unverified tray-relative fallback.
+  rate-limited diagnostics; debug-level visibility transition messages distinguish
+  explicit hide/show from occlusion in Z-order. There is no unverified
+  tray-relative fallback.
 - **Tray keep-alive & engine decoupled updates:** While enabled, closing the
   main window hides TaskMan to the tray even if `close_to_tray` is off, and
   `tm-engine`'s notifier pushes `Metrics::from_snapshot` directly to the
