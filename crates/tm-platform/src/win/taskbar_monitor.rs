@@ -131,8 +131,11 @@ const WM_MOUSELEAVE: u32 = 0x02A3;
 const UIA_SETTLE_TIMER_ID: usize = 1;
 const UIA_SETTLE_DELAY_MS: u32 = 300;
 const FULLSCREEN_EXIT_TIMER_ID: usize = 2;
-const FULLSCREEN_EXIT_RECHECK_MS: u32 = 16;
-const FULLSCREEN_EXIT_MAX_RETRIES: u8 = 45;
+// `USER_TIMER_MINIMUM` (10 ms): on Windows' default 15.625 ms tick, 16 ms spills
+// onto the second tick (~31 ms), whereas 10 ms catches the next 15.6 ms tick
+// without changing system timer resolution.
+const FULLSCREEN_EXIT_RECHECK_MS: u32 = 10;
+const FULLSCREEN_EXIT_MAX_RETRIES: u8 = 70;
 const TOPMOST_RECHECK_TIMER_ID: usize = 3;
 const TOPMOST_RECHECK_MS: u32 = 500;
 const UIA_MIN_SCAN_INTERVAL: Duration = Duration::from_millis(80);
@@ -7328,6 +7331,7 @@ mod tests {
         let _windows = TestWindows(vec![hwnd]);
 
         let (close_tx, close_rx) = mpsc::channel::<()>();
+        let (exit_tx, exit_rx) = mpsc::channel::<()>();
         let (ready_tx, ready_rx) = mpsc::channel::<(isize, u32)>();
 
         let fs_join = std::thread::spawn(move || {
@@ -7354,6 +7358,7 @@ mod tests {
             unsafe {
                 let _ = DestroyWindow(fs_hwnd);
             }
+            let _ = exit_rx.recv();
         });
 
         let (fs_raw, fs_tid) = ready_rx.recv().expect("fullscreen thread ready");
@@ -7421,7 +7426,6 @@ mod tests {
         REFRESH_PENDING.store(false, Ordering::Release);
         FULLSCREEN_WAKE_PENDING.store(false, Ordering::Release);
         close_tx.send(()).unwrap();
-        fs_join.join().unwrap();
 
         let deadline = Instant::now() + Duration::from_secs(2);
         let mut msg = MSG::default();
@@ -7476,6 +7480,8 @@ mod tests {
         assert!(ctx.fs_lifecycle_hook.is_invalid());
         assert!(ctx.fs_cloak_hook.is_invalid());
         assert_eq!(LIVE_FS_HWND.load(Ordering::Acquire), 0);
+        let _ = exit_tx.send(());
+        let _ = fs_join.join();
         LIVE_HWND.store(0, Ordering::Release);
         REFRESH_PENDING.store(false, Ordering::Release);
         FULLSCREEN_WAKE_PENDING.store(false, Ordering::Release);

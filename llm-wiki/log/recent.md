@@ -11,8 +11,9 @@
      (~160 ms) could expire before window teardown or D3D fullscreen release
      finished. Added `fs_lifecycle_hook`, `fs_cloak_hook`, and global top-level
      `cloak_hook`, flagged `FULLSCREEN_WAKE_PENDING` on hide/cloak/destroy
-     transitions, and widened `FULLSCREEN_EXIT_TIMER_ID` to `16 ms × 45`
-     (~720 ms).
+     transitions, and tuned `FULLSCREEN_EXIT_TIMER_ID` to `10 ms × 70`
+     (`USER_TIMER_MINIMUM`, avoiding 2-tick 31 ms quantization on 64 Hz Windows
+     clocks while keeping a >=700 ms bounded window).
   2. **`Win+Tab` Task View hides taskbar stats:** Windows 11 Task View uses
      DirectComposition host windows (`XamlExplorerHostIslandWindow` /
      `MultitaskingViewFrame`) under `%SystemRoot%\explorer.exe` across the

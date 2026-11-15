@@ -1132,7 +1132,7 @@ rebase runbook.
   with `REFRESH_PENDING`,
   `LAYOUT_RECHECK_PENDING`, and `FULLSCREEN_WAKE_PENDING` coalescing (marked on
   foreground/minimize/hide/cloak/destroy fullscreen exits) plus a
-  300 ms UIA settle timer and a bounded 16 ms × 45 fullscreen-exit transition
+  300 ms UIA settle timer and a bounded 10 ms × 70 fullscreen-exit transition
   recheck when foreground has already left a settling fullscreen/D3D state
   (including when holding `Alt+Tab` or another overlay takes foreground while
   an uncloaked, opaque fullscreen window still sits above `Shell_TrayWnd` in
