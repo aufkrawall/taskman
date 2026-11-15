@@ -1,3 +1,31 @@
+## 2026-11-15 — faster restore on fullscreen close & Task View (`Win+Tab`) visibility
+
+- Fixed two remaining Windows 11 taskbar monitor suppression/latency bugs in
+  `crates/tm-platform/src/win/taskbar_monitor.rs`:
+  1. **Delayed restore on closing a fullscreen window:** `sync_fullscreen_hook`
+     previously only hooked `EVENT_OBJECT_LOCATIONCHANGE` on `tracked_fs_tid`,
+     missing `EVENT_OBJECT_DESTROY..EVENT_OBJECT_HIDE` and
+     `EVENT_OBJECT_CLOAKED..EVENT_OBJECT_UNCLOAKED`; `fg_event_proc` /
+     `fs_location_event_proc` also didn't mark `FULLSCREEN_WAKE_PENDING` on
+     hide/cloak/destroy events, and `FULLSCREEN_EXIT_MAX_RETRIES = 8` at `20 ms`
+     (~160 ms) could expire before window teardown or D3D fullscreen release
+     finished. Added `fs_lifecycle_hook`, `fs_cloak_hook`, and global top-level
+     `cloak_hook`, flagged `FULLSCREEN_WAKE_PENDING` on hide/cloak/destroy
+     transitions, and widened `FULLSCREEN_EXIT_TIMER_ID` to `16 ms × 45`
+     (~720 ms).
+  2. **`Win+Tab` Task View hides taskbar stats:** Windows 11 Task View uses
+     DirectComposition host windows (`XamlExplorerHostIslandWindow` /
+     `MultitaskingViewFrame`) under `%SystemRoot%\explorer.exe` across the
+     monitor while leaving `Shell_TrayWnd` visible and drawn. Added
+     `is_shell_host_overlay_class` (`Windows.UI.Core.CoreWindow |
+     XamlExplorerHostIslandWindow | MultitaskingViewFrame`) and exempted
+     `%SystemRoot%\explorer.exe` in `is_shell_host_overlay_identity`, keeping
+     `CabinetWClass`, tray overflow, menus, and tooltips occluding.
+- Updated `shell_host_overlay_identity_matches_only_trusted_shell_core_windows`
+  and added `fullscreen_hook_wakes_immediately_when_suppressing_window_closes`.
+  Live Windows 11 desktop `Win+Tab` and real-app fullscreen close timing still
+  require interactive desktop confirmation (`AGENTS.md`).
+
 ## 2026-11-15 — taskbar monitor review fixes (WndProc re-entrancy, background topmost promotion, UIA backoff)
 
 - Confirmed all 3 findings from the post-commit taskbar monitor review against `crates/tm-platform/src/win/taskbar_monitor.rs`:

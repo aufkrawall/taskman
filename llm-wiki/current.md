@@ -1092,10 +1092,12 @@ rebase runbook.
   with `GetWindowRect` fallback) hides the widget whenever any visible,
   uncloaked, non-transparent window above `Shell_TrayWnd` (including `#32768` /
   `Xaml_WindowedPopupClass` menus, `tooltips_class32`, or `always_on_top`
-  apps) overlaps its footprint while ignoring `Windows.UI.Core.CoreWindow`
-  overlay canvases owned by verified Windows shell hosts
-  (`StartMenuExperienceHost.exe`, `SearchHost.exe`, `SearchApp.exe`,
-  `ShellExperienceHost.exe`, `ShellHost.exe` via
+  apps) overlaps its footprint while ignoring shell overlay canvases
+  (`Windows.UI.Core.CoreWindow`, `XamlExplorerHostIslandWindow`,
+  and `MultitaskingViewFrame`) owned by verified Windows shell hosts
+  (`%SystemRoot%\explorer.exe`, `StartMenuExperienceHost.exe`, `SearchHost.exe`,
+  `SearchApp.exe`, `ShellExperienceHost.exe`, `ShellHost.exe` via
+  `is_shell_host_overlay_class` / `is_shell_host_overlay_identity` /
   `is_non_occluding_shell_host_window`), ignoring lower-band (`band <
   tray_band`) windows, and treating live `tray_hwnd` in elevated/immersive
   bands (`band > 1`, such as band-6 `Shell_TrayWnd` while Start/Search is
@@ -1123,10 +1125,14 @@ rebase runbook.
   filtered to `OBJID_WINDOW` `SHOW`/`HIDE`/`LOCATIONCHANGE` on tray + `IsChild`
   descendants plus top-level topmost moves on Explorer's thread and `EVENT_OBJECT_REORDER`),
   and (d) the suppressing fullscreen window's thread (`sync_fullscreen_hook` ->
-  `EVENT_OBJECT_LOCATIONCHANGE`, kept even after `Alt+Tab` moves foreground
-  away while the fullscreen window is still settling) with `REFRESH_PENDING`,
-  `LAYOUT_RECHECK_PENDING`, and `FULLSCREEN_WAKE_PENDING` coalescing plus a
-  300 ms UIA settle timer and a bounded 20 ms × 8 fullscreen-exit transition
+  `EVENT_OBJECT_LOCATIONCHANGE`, `EVENT_OBJECT_DESTROY..EVENT_OBJECT_HIDE`, and
+  `EVENT_OBJECT_CLOAKED..EVENT_OBJECT_UNCLOAKED`, kept even after `Alt+Tab` moves
+  foreground away while the fullscreen window is still settling), plus a global
+  top-level `EVENT_OBJECT_CLOAKED..EVENT_OBJECT_UNCLOAKED` hook (`cloak_hook`)
+  with `REFRESH_PENDING`,
+  `LAYOUT_RECHECK_PENDING`, and `FULLSCREEN_WAKE_PENDING` coalescing (marked on
+  foreground/minimize/hide/cloak/destroy fullscreen exits) plus a
+  300 ms UIA settle timer and a bounded 16 ms × 45 fullscreen-exit transition
   recheck when foreground has already left a settling fullscreen/D3D state
   (including when holding `Alt+Tab` or another overlay takes foreground while
   an uncloaked, opaque fullscreen window still sits above `Shell_TrayWnd` in

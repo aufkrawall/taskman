@@ -100,22 +100,23 @@ use windows::Win32::UI::Shell::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CS_DBLCLKS, CreatePopupMenu, CreateWindowExW, DeregisterShellHookWindow, DestroyMenu,
-    DestroyWindow, DispatchMessageW, EVENT_OBJECT_HIDE, EVENT_OBJECT_LOCATIONCHANGE,
-    EVENT_OBJECT_REORDER, EVENT_OBJECT_SHOW, EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_MENUPOPUPEND,
-    EVENT_SYSTEM_MENUPOPUPSTART, EVENT_SYSTEM_MINIMIZEEND, EVENT_SYSTEM_MINIMIZESTART,
-    EVENT_SYSTEM_MOVESIZEEND, EnumWindows, FindWindowExW, FindWindowW, GW_HWNDPREV, GWL_EXSTYLE,
-    GWL_STYLE, GWLP_USERDATA, GetClassNameW, GetCursorPos, GetDesktopWindow, GetForegroundWindow,
-    GetLayeredWindowAttributes, GetMessageW, GetShellWindow, GetWindow, GetWindowLongPtrW,
-    GetWindowRect, GetWindowThreadProcessId, HMENU, HSHELL_WINDOWACTIVATED, HSHELL_WINDOWCREATED,
-    HSHELL_WINDOWDESTROYED, HSHELL_WINDOWREPLACED, HWND_NOTOPMOST, HWND_TOP, HWND_TOPMOST,
-    IDC_ARROW, InsertMenuW, IsChild, IsIconic, IsWindowVisible, KillTimer,
-    LAYERED_WINDOW_ATTRIBUTES_FLAGS, LWA_ALPHA, LoadCursorW, MA_NOACTIVATE, MF_BYPOSITION,
-    MF_SEPARATOR, MF_STRING, MSG, OBJID_WINDOW, PostMessageW, PostQuitMessage, RegisterClassExW,
-    RegisterShellHookWindow, RegisterWindowMessageW, SW_HIDE, SW_SHOWNOACTIVATE, SWP_HIDEWINDOW,
-    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOOWNERZORDER, SWP_NOSENDCHANGING, SWP_NOSIZE, SWP_NOZORDER,
-    SetForegroundWindow, SetMenuDefaultItem, SetTimer, SetWindowLongPtrW, SetWindowPos, ShowWindow,
-    TPM_BOTTOMALIGN, TPM_LEFTALIGN, TPM_RETURNCMD, TPM_RIGHTALIGN, TPM_RIGHTBUTTON, TPM_TOPALIGN,
-    TrackPopupMenuEx, TranslateMessage, ULW_ALPHA, UpdateLayeredWindow, WINEVENT_OUTOFCONTEXT,
+    DestroyWindow, DispatchMessageW, EVENT_OBJECT_CLOAKED, EVENT_OBJECT_DESTROY, EVENT_OBJECT_HIDE,
+    EVENT_OBJECT_LOCATIONCHANGE, EVENT_OBJECT_REORDER, EVENT_OBJECT_SHOW, EVENT_OBJECT_UNCLOAKED,
+    EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_MENUPOPUPEND, EVENT_SYSTEM_MENUPOPUPSTART,
+    EVENT_SYSTEM_MINIMIZEEND, EVENT_SYSTEM_MINIMIZESTART, EVENT_SYSTEM_MOVESIZEEND, EnumWindows,
+    FindWindowExW, FindWindowW, GW_HWNDPREV, GWL_EXSTYLE, GWL_STYLE, GWLP_USERDATA, GetClassNameW,
+    GetCursorPos, GetDesktopWindow, GetForegroundWindow, GetLayeredWindowAttributes, GetMessageW,
+    GetShellWindow, GetWindow, GetWindowLongPtrW, GetWindowRect, GetWindowThreadProcessId, HMENU,
+    HSHELL_WINDOWACTIVATED, HSHELL_WINDOWCREATED, HSHELL_WINDOWDESTROYED, HSHELL_WINDOWREPLACED,
+    HWND_NOTOPMOST, HWND_TOP, HWND_TOPMOST, IDC_ARROW, InsertMenuW, IsChild, IsIconic,
+    IsWindowVisible, KillTimer, LAYERED_WINDOW_ATTRIBUTES_FLAGS, LWA_ALPHA, LoadCursorW,
+    MA_NOACTIVATE, MF_BYPOSITION, MF_SEPARATOR, MF_STRING, MSG, OBJID_WINDOW, PostMessageW,
+    PostQuitMessage, RegisterClassExW, RegisterShellHookWindow, RegisterWindowMessageW, SW_HIDE,
+    SW_SHOWNOACTIVATE, SWP_HIDEWINDOW, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOOWNERZORDER,
+    SWP_NOSENDCHANGING, SWP_NOSIZE, SWP_NOZORDER, SetForegroundWindow, SetMenuDefaultItem,
+    SetTimer, SetWindowLongPtrW, SetWindowPos, ShowWindow, TPM_BOTTOMALIGN, TPM_LEFTALIGN,
+    TPM_RETURNCMD, TPM_RIGHTALIGN, TPM_RIGHTBUTTON, TPM_TOPALIGN, TrackPopupMenuEx,
+    TranslateMessage, ULW_ALPHA, UpdateLayeredWindow, WINEVENT_OUTOFCONTEXT,
     WINEVENT_SKIPOWNPROCESS, WM_APP, WM_CLOSE, WM_CREATE, WM_DESTROY, WM_DISPLAYCHANGE,
     WM_DPICHANGED, WM_DWMCOLORIZATIONCOLORCHANGED, WM_LBUTTONUP, WM_MOUSEACTIVATE, WM_MOUSEMOVE,
     WM_NULL, WM_RBUTTONUP, WM_SETTINGCHANGE, WM_TIMER, WNDCLASSEXW, WS_CHILD, WS_EX_LAYERED,
@@ -130,8 +131,8 @@ const WM_MOUSELEAVE: u32 = 0x02A3;
 const UIA_SETTLE_TIMER_ID: usize = 1;
 const UIA_SETTLE_DELAY_MS: u32 = 300;
 const FULLSCREEN_EXIT_TIMER_ID: usize = 2;
-const FULLSCREEN_EXIT_RECHECK_MS: u32 = 20;
-const FULLSCREEN_EXIT_MAX_RETRIES: u8 = 8;
+const FULLSCREEN_EXIT_RECHECK_MS: u32 = 16;
+const FULLSCREEN_EXIT_MAX_RETRIES: u8 = 45;
 const TOPMOST_RECHECK_TIMER_ID: usize = 3;
 const TOPMOST_RECHECK_MS: u32 = 500;
 const UIA_MIN_SCAN_INTERVAL: Duration = Duration::from_millis(80);
@@ -1126,6 +1127,8 @@ struct WindowCtx {
     fg_loc_hook: HWINEVENTHOOK,
     tracked_fs_tid: u32,
     fs_loc_hook: HWINEVENTHOOK,
+    fs_lifecycle_hook: HWINEVENTHOOK,
+    fs_cloak_hook: HWINEVENTHOOK,
     tracked_tray_tid: u32,
     tray_hook: HWINEVENTHOOK,
     topmost_hooks: Vec<(u32, HWINEVENTHOOK)>,
@@ -1173,11 +1176,17 @@ impl WindowCtx {
             }
             self.fg_loc_hook = HWINEVENTHOOK::default();
         }
-        if !self.fs_loc_hook.is_invalid() {
-            unsafe {
-                let _ = UnhookWinEvent(self.fs_loc_hook);
+        for hook in [
+            &mut self.fs_loc_hook,
+            &mut self.fs_lifecycle_hook,
+            &mut self.fs_cloak_hook,
+        ] {
+            if !hook.is_invalid() {
+                unsafe {
+                    let _ = UnhookWinEvent(*hook);
+                }
+                *hook = HWINEVENTHOOK::default();
             }
-            self.fs_loc_hook = HWINEVENTHOOK::default();
         }
         if !self.tray_hook.is_invalid() {
             unsafe {
@@ -1209,18 +1218,24 @@ impl WindowCtx {
         if target_tid == self.tracked_fs_tid {
             return;
         }
-        if !self.fs_loc_hook.is_invalid() {
-            unsafe {
-                let _ = UnhookWinEvent(self.fs_loc_hook);
+        for hook in [
+            &mut self.fs_loc_hook,
+            &mut self.fs_lifecycle_hook,
+            &mut self.fs_cloak_hook,
+        ] {
+            if !hook.is_invalid() {
+                unsafe {
+                    let _ = UnhookWinEvent(*hook);
+                }
+                *hook = HWINEVENTHOOK::default();
             }
-            self.fs_loc_hook = HWINEVENTHOOK::default();
         }
         self.tracked_fs_tid = target_tid;
         if target_tid != 0 {
-            self.fs_loc_hook = unsafe {
+            let install_fs_hook = |min_ev: u32, max_ev: u32| unsafe {
                 SetWinEventHook(
-                    EVENT_OBJECT_LOCATIONCHANGE,
-                    EVENT_OBJECT_LOCATIONCHANGE,
+                    min_ev,
+                    max_ev,
                     None,
                     Some(fs_location_event_proc),
                     0,
@@ -1228,6 +1243,10 @@ impl WindowCtx {
                     WINEVENT_OUTOFCONTEXT,
                 )
             };
+            self.fs_loc_hook =
+                install_fs_hook(EVENT_OBJECT_LOCATIONCHANGE, EVENT_OBJECT_LOCATIONCHANGE);
+            self.fs_lifecycle_hook = install_fs_hook(EVENT_OBJECT_DESTROY, EVENT_OBJECT_HIDE);
+            self.fs_cloak_hook = install_fs_hook(EVENT_OBJECT_CLOAKED, EVENT_OBJECT_UNCLOAKED);
         }
     }
 
@@ -2391,12 +2410,20 @@ fn process_image_path(pid: u32) -> Option<String> {
     Some(String::from_utf16_lossy(&buf[..len as usize]))
 }
 
+fn is_shell_host_overlay_class(class_name: &str) -> bool {
+    matches!(
+        class_name,
+        "Windows.UI.Core.CoreWindow" | "XamlExplorerHostIslandWindow" | "MultitaskingViewFrame"
+    )
+}
+
 fn is_shell_host_overlay_identity(class_name: &str, image_path: &str, windows_root: &str) -> bool {
-    // Windows 11 Start, Search, and tray flyouts use `Windows.UI.Core.CoreWindow`
-    // hosts backed by `WS_EX_NOREDIRECTIONBITMAP` DirectComposition canvases whose
+    // Windows 11 Start, Search, tray flyouts, and Task View (`Win+Tab`) use
+    // `Windows.UI.Core.CoreWindow`, `XamlExplorerHostIslandWindow`, or
+    // `MultitaskingViewFrame` hosts backed by DirectComposition canvases whose
     // HWND bounds can span the screen or overlap the taskbar top edge even though
-    // their visible cards float above the taskbar and never occlude taskbar stats.
-    if class_name != "Windows.UI.Core.CoreWindow" {
+    // the taskbar remains visible and unobscured.
+    if !is_shell_host_overlay_class(class_name) {
         return false;
     }
     let root = windows_root
@@ -2407,7 +2434,7 @@ fn is_shell_host_overlay_identity(class_name: &str, image_path: &str, windows_ro
     let Some(rel) = path.strip_prefix(&root) else {
         return false;
     };
-    if rel == r"\system32\shellhost.exe" {
+    if rel == r"\explorer.exe" || rel == r"\system32\shellhost.exe" {
         return true;
     }
     let Some(app_rel) = rel.strip_prefix(r"\systemapps\") else {
@@ -2429,7 +2456,7 @@ fn is_non_occluding_shell_host_window(hwnd: HWND) -> bool {
     let Some(class_name) = read_window_class(hwnd) else {
         return false;
     };
-    if class_name != "Windows.UI.Core.CoreWindow" {
+    if !is_shell_host_overlay_class(&class_name) {
         return false;
     }
     let mut pid = 0u32;
@@ -3529,11 +3556,13 @@ unsafe extern "system" fn fg_event_proc(
     _id_event_thread: u32,
     _dwms_event_time: u32,
 ) {
-    if (event == EVENT_OBJECT_SHOW || event == EVENT_OBJECT_HIDE)
-        && (id_object != OBJID_WINDOW.0
-            || id_child != 0
-            || hwnd.0.is_null()
-            || (unsafe { GetWindowLongPtrW(hwnd, GWL_STYLE) } as u32 & WS_CHILD.0) != 0)
+    if matches!(
+        event,
+        EVENT_OBJECT_SHOW | EVENT_OBJECT_HIDE | EVENT_OBJECT_CLOAKED | EVENT_OBJECT_UNCLOAKED
+    ) && (id_object != OBJID_WINDOW.0
+        || id_child != 0
+        || hwnd.0.is_null()
+        || (unsafe { GetWindowLongPtrW(hwnd, GWL_STYLE) } as u32 & WS_CHILD.0) != 0)
     {
         return;
     }
@@ -3547,7 +3576,12 @@ unsafe extern "system" fn fg_event_proc(
     }
     if matches!(
         event,
-        EVENT_SYSTEM_FOREGROUND | EVENT_SYSTEM_MINIMIZESTART | EVENT_SYSTEM_MINIMIZEEND
+        EVENT_SYSTEM_FOREGROUND
+            | EVENT_SYSTEM_MINIMIZESTART
+            | EVENT_SYSTEM_MINIMIZEEND
+            | EVENT_OBJECT_HIDE
+            | EVENT_OBJECT_CLOAKED
+            | EVENT_OBJECT_UNCLOAKED
     ) {
         FULLSCREEN_WAKE_PENDING.store(true, std::sync::atomic::Ordering::Release);
     }
@@ -3556,7 +3590,7 @@ unsafe extern "system" fn fg_event_proc(
 
 unsafe extern "system" fn fs_location_event_proc(
     _hook: HWINEVENTHOOK,
-    _event: u32,
+    event: u32,
     hwnd: HWND,
     id_object: i32,
     id_child: i32,
@@ -3568,6 +3602,9 @@ unsafe extern "system" fn fs_location_event_proc(
         && !hwnd.0.is_null()
         && hwnd.0 as isize == LIVE_FS_HWND.load(std::sync::atomic::Ordering::Acquire)
     {
+        if event != EVENT_OBJECT_LOCATIONCHANGE {
+            FULLSCREEN_WAKE_PENDING.store(true, std::sync::atomic::Ordering::Release);
+        }
         post_refresh();
     }
 }
@@ -4352,6 +4389,8 @@ fn taskbar_thread_main(
                 fg_loc_hook: HWINEVENTHOOK::default(),
                 tracked_fs_tid: 0,
                 fs_loc_hook: HWINEVENTHOOK::default(),
+                fs_lifecycle_hook: HWINEVENTHOOK::default(),
+                fs_cloak_hook: HWINEVENTHOOK::default(),
                 tracked_tray_tid: 0,
                 tray_hook: HWINEVENTHOOK::default(),
                 topmost_hooks: Vec::new(),
@@ -4429,6 +4468,7 @@ fn taskbar_thread_main(
         let minimize_hook = install_sys_hook(EVENT_SYSTEM_MINIMIZESTART, EVENT_SYSTEM_MINIMIZEEND);
         let menu_hook = install_sys_hook(EVENT_SYSTEM_MENUPOPUPSTART, EVENT_SYSTEM_MENUPOPUPEND);
         let obj_vis_hook = install_sys_hook(EVENT_OBJECT_SHOW, EVENT_OBJECT_HIDE);
+        let cloak_hook = install_sys_hook(EVENT_OBJECT_CLOAKED, EVENT_OBJECT_UNCLOAKED);
 
         state.with_ctx_mut(hwnd, |ctx| ctx.refresh(true));
 
@@ -4451,6 +4491,7 @@ fn taskbar_thread_main(
             minimize_hook,
             menu_hook,
             obj_vis_hook,
+            cloak_hook,
         ] {
             if !hook.is_invalid() {
                 unsafe {
@@ -4815,6 +4856,8 @@ mod tests {
             fg_loc_hook: HWINEVENTHOOK::default(),
             tracked_fs_tid: 0,
             fs_loc_hook: HWINEVENTHOOK::default(),
+            fs_lifecycle_hook: HWINEVENTHOOK::default(),
+            fs_cloak_hook: HWINEVENTHOOK::default(),
             tracked_tray_tid: 0,
             tray_hook: HWINEVENTHOOK::default(),
             topmost_hooks: Vec::new(),
@@ -6213,6 +6256,8 @@ mod tests {
             fg_loc_hook: HWINEVENTHOOK::default(),
             tracked_fs_tid: 0,
             fs_loc_hook: HWINEVENTHOOK::default(),
+            fs_lifecycle_hook: HWINEVENTHOOK::default(),
+            fs_cloak_hook: HWINEVENTHOOK::default(),
             tracked_tray_tid: 0,
             tray_hook: HWINEVENTHOOK::default(),
             topmost_hooks: Vec::new(),
@@ -6432,6 +6477,8 @@ mod tests {
             fg_loc_hook: HWINEVENTHOOK::default(),
             tracked_fs_tid: 0,
             fs_loc_hook: HWINEVENTHOOK::default(),
+            fs_lifecycle_hook: HWINEVENTHOOK::default(),
+            fs_cloak_hook: HWINEVENTHOOK::default(),
             tracked_tray_tid: 0,
             tray_hook: HWINEVENTHOOK::default(),
             topmost_hooks: Vec::new(),
@@ -6637,6 +6684,8 @@ mod tests {
             fg_loc_hook: HWINEVENTHOOK::default(),
             tracked_fs_tid: 0,
             fs_loc_hook: HWINEVENTHOOK::default(),
+            fs_lifecycle_hook: HWINEVENTHOOK::default(),
+            fs_cloak_hook: HWINEVENTHOOK::default(),
             tracked_tray_tid: 0,
             tray_hook: HWINEVENTHOOK::default(),
             topmost_hooks: Vec::new(),
@@ -6720,32 +6769,52 @@ mod tests {
             r"C:\Windows\SystemApps\Microsoft.Windows.Search_cw5n1h2txyewy\SearchApp.exe",
             r"C:\Windows\SystemApps\ShellExperienceHost_cw5n1h2txyewy\ShellExperienceHost.exe",
             r"C:\Windows\System32\ShellHost.exe",
+            r"C:\Windows\explorer.exe",
         ] {
-            assert!(
-                is_shell_host_overlay_identity("Windows.UI.Core.CoreWindow", path, root),
-                "expected CoreWindow overlay exemption for {path}"
-            );
-            assert!(
-                !is_shell_host_overlay_identity("Xaml_WindowedPopupClass", path, root),
-                "popup submenus inside {path} must still participate in occlusion checks"
-            );
-            assert!(
-                !is_shell_host_overlay_identity("#32768", path, root),
-                "classic menus must still participate in occlusion checks"
-            );
+            for overlay_class in [
+                "Windows.UI.Core.CoreWindow",
+                "XamlExplorerHostIslandWindow",
+                "MultitaskingViewFrame",
+            ] {
+                assert!(
+                    is_shell_host_overlay_identity(overlay_class, path, root),
+                    "expected {overlay_class} overlay exemption for {path}"
+                );
+            }
+            for non_exempt_class in [
+                "CabinetWClass",
+                "TopLevelWindowForOverflowXamlIsland",
+                "Xaml_WindowedPopupClass",
+                "#32768",
+                "tooltips_class32",
+            ] {
+                assert!(
+                    !is_shell_host_overlay_identity(non_exempt_class, path, root),
+                    "{non_exempt_class} inside {path} must still participate in occlusion/fullscreen checks"
+                );
+            }
         }
 
         for untrusted in [
             r"C:\Users\Julian\StartMenuExperienceHost.exe",
+            r"C:\Temp\explorer.exe",
+            r"D:\Windows\explorer.exe",
             r"D:\Windows\SystemApps\Microsoft.Windows.StartMenuExperienceHost_cw5n1h2txyewy\StartMenuExperienceHost.exe",
             r"C:\Windows\System32\notepad.exe",
             r"C:\Windows\SystemApps\Evil_pkg\App.exe",
+            r"C:\Windows\SystemApps\Evil_pkg\explorer.exe",
             r"C:\Program Files\WindowsApps\App\Game.exe",
         ] {
-            assert!(
-                !is_shell_host_overlay_identity("Windows.UI.Core.CoreWindow", untrusted, root),
-                "untrusted or non-shell image {untrusted} must not be exempted"
-            );
+            for overlay_class in [
+                "Windows.UI.Core.CoreWindow",
+                "XamlExplorerHostIslandWindow",
+                "MultitaskingViewFrame",
+            ] {
+                assert!(
+                    !is_shell_host_overlay_identity(overlay_class, untrusted, root),
+                    "untrusted or non-shell image {untrusted} ({overlay_class}) must not be exempted"
+                );
+            }
         }
     }
 
@@ -7005,6 +7074,8 @@ mod tests {
             fg_loc_hook: HWINEVENTHOOK::default(),
             tracked_fs_tid: 0,
             fs_loc_hook: HWINEVENTHOOK::default(),
+            fs_lifecycle_hook: HWINEVENTHOOK::default(),
+            fs_cloak_hook: HWINEVENTHOOK::default(),
             tracked_tray_tid: 0,
             tray_hook: HWINEVENTHOOK::default(),
             topmost_hooks: Vec::new(),
@@ -7188,6 +7259,8 @@ mod tests {
             fg_loc_hook: HWINEVENTHOOK::default(),
             tracked_fs_tid: 0,
             fs_loc_hook: HWINEVENTHOOK::default(),
+            fs_lifecycle_hook: HWINEVENTHOOK::default(),
+            fs_cloak_hook: HWINEVENTHOOK::default(),
             tracked_tray_tid: 0,
             tray_hook: HWINEVENTHOOK::default(),
             topmost_hooks: Vec::new(),
@@ -7238,6 +7311,174 @@ mod tests {
 
         let _ = cmd_tx.send(FsCmd::Exit);
         let _ = fs_join.join();
+    }
+
+    #[test]
+    fn fullscreen_hook_wakes_immediately_when_suppressing_window_closes() {
+        use std::sync::atomic::Ordering;
+        use std::sync::mpsc;
+        use windows::Win32::UI::WindowsAndMessaging::{
+            MsgWaitForMultipleObjects, PM_REMOVE, PeekMessageW, QS_ALLINPUT,
+        };
+
+        let _zorder = z_order_test_lock();
+        let hinstance = HINSTANCE(unsafe { GetModuleHandleW(None).unwrap() }.0);
+        let class_name = register_window_class(hinstance).unwrap();
+        let hwnd = create_monitor_window(hinstance, class_name, std::ptr::null_mut()).unwrap();
+        let _windows = TestWindows(vec![hwnd]);
+
+        let (close_tx, close_rx) = mpsc::channel::<()>();
+        let (ready_tx, ready_rx) = mpsc::channel::<(isize, u32)>();
+
+        let fs_join = std::thread::spawn(move || {
+            let hinstance = HINSTANCE(unsafe { GetModuleHandleW(None).unwrap() }.0);
+            let class_name = register_window_class(hinstance).unwrap();
+            let fs_hwnd =
+                create_monitor_window(hinstance, class_name, std::ptr::null_mut()).unwrap();
+            unsafe {
+                SetWindowPos(
+                    fs_hwnd,
+                    None,
+                    -22_000,
+                    -22_000,
+                    1920,
+                    1080,
+                    SWP_NOZORDER | SWP_NOACTIVATE,
+                )
+                .unwrap();
+                let _ = ShowWindow(fs_hwnd, SW_SHOWNOACTIVATE);
+            }
+            let tid = unsafe { GetCurrentThreadId() };
+            ready_tx.send((fs_hwnd.0 as isize, tid)).unwrap();
+            let _ = close_rx.recv();
+            unsafe {
+                let _ = DestroyWindow(fs_hwnd);
+            }
+        });
+
+        let (fs_raw, fs_tid) = ready_rx.recv().expect("fullscreen thread ready");
+        let fs_hwnd = HWND(fs_raw as *mut std::ffi::c_void);
+        LIVE_HWND.store(hwnd.0 as isize, Ordering::Release);
+        LIVE_FG_HWND.store(0, Ordering::Release);
+
+        let mut ctx = WindowCtx {
+            hwnd,
+            in_elevated_band: true,
+            user_closing: false,
+            shared: Arc::new(Mutex::new(SharedState {
+                config: Config::default(),
+                metrics: Metrics::default(),
+                generation: 0,
+            })),
+            visibility: Arc::new(MonitorVisibility {
+                visible: std::sync::atomic::AtomicBool::new(false),
+                notifier: Arc::new(|| {}),
+            }),
+            callback: Arc::new(|_| {}),
+            renderer: None,
+            uia_scanner: Arc::new(UiaScanner {
+                state: Arc::new((Mutex::new(UiaShared::default()), Condvar::new())),
+                worker: Mutex::new(None),
+            }),
+            light_taskbar: false,
+            hovered: false,
+            tracking_mouse: false,
+            last_display: None,
+            last_size: (0, 0),
+            last_pos: None,
+            last_visible: false,
+            last_present_error: None,
+            last_anchor_slot: None,
+            last_compact: false,
+            last_stacked: false,
+            last_env_geom: None,
+            pending_uia_scan: false,
+            invalidate_uia_layout: false,
+            restore_from_cached_layout: false,
+            tracked_fg_tid: 0,
+            fg_loc_hook: HWINEVENTHOOK::default(),
+            tracked_fs_tid: 0,
+            fs_loc_hook: HWINEVENTHOOK::default(),
+            fs_lifecycle_hook: HWINEVENTHOOK::default(),
+            fs_cloak_hook: HWINEVENTHOOK::default(),
+            tracked_tray_tid: 0,
+            tray_hook: HWINEVENTHOOK::default(),
+            topmost_hooks: Vec::new(),
+            last_fg_hwnd: 0,
+            fullscreen_recheck_remaining: 0,
+            fullscreen_recheck_armed: false,
+            hidden_by_occlusion: false,
+            last_occluded_rect: None,
+            topmost_recheck_armed: false,
+        };
+
+        ctx.sync_fullscreen_hook(fs_hwnd);
+        assert_eq!(ctx.tracked_fs_tid, fs_tid);
+        assert!(!ctx.fs_loc_hook.is_invalid());
+        assert!(!ctx.fs_lifecycle_hook.is_invalid());
+        assert!(!ctx.fs_cloak_hook.is_invalid());
+
+        REFRESH_PENDING.store(false, Ordering::Release);
+        FULLSCREEN_WAKE_PENDING.store(false, Ordering::Release);
+        close_tx.send(()).unwrap();
+        fs_join.join().unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut msg = MSG::default();
+        while (!REFRESH_PENDING.load(Ordering::Acquire)
+            || !FULLSCREEN_WAKE_PENDING.load(Ordering::Acquire))
+            && Instant::now() < deadline
+        {
+            while unsafe { PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE) }.as_bool() {
+                let _ = unsafe { TranslateMessage(&msg) };
+                unsafe { DispatchMessageW(&msg) };
+            }
+            if REFRESH_PENDING.load(Ordering::Acquire)
+                && FULLSCREEN_WAKE_PENDING.load(Ordering::Acquire)
+            {
+                break;
+            }
+            let remaining_ms = deadline
+                .saturating_duration_since(Instant::now())
+                .as_millis()
+                .min(50) as u32;
+            unsafe {
+                let _ = MsgWaitForMultipleObjects(None, false, remaining_ms, QS_ALLINPUT);
+            }
+        }
+        assert!(
+            REFRESH_PENDING.load(Ordering::Acquire)
+                && FULLSCREEN_WAKE_PENDING.load(Ordering::Acquire),
+            "closing a suppressing fullscreen window must wake refresh and re-arm exit recheck"
+        );
+
+        // Top-level hide and cloak events via `fg_event_proc` must also arm fullscreen wake.
+        for ev in [
+            EVENT_OBJECT_HIDE,
+            EVENT_OBJECT_CLOAKED,
+            EVENT_OBJECT_UNCLOAKED,
+        ] {
+            REFRESH_PENDING.store(false, Ordering::Release);
+            FULLSCREEN_WAKE_PENDING.store(false, Ordering::Release);
+            unsafe {
+                fg_event_proc(HWINEVENTHOOK::default(), ev, hwnd, OBJID_WINDOW.0, 0, 0, 0);
+            }
+            assert!(
+                REFRESH_PENDING.load(Ordering::Acquire)
+                    && FULLSCREEN_WAKE_PENDING.load(Ordering::Acquire),
+                "top-level event {ev:#x} must set FULLSCREEN_WAKE_PENDING and wake refresh"
+            );
+        }
+
+        ctx.sync_fullscreen_hook(HWND::default());
+        assert_eq!(ctx.tracked_fs_tid, 0);
+        assert!(ctx.fs_loc_hook.is_invalid());
+        assert!(ctx.fs_lifecycle_hook.is_invalid());
+        assert!(ctx.fs_cloak_hook.is_invalid());
+        assert_eq!(LIVE_FS_HWND.load(Ordering::Acquire), 0);
+        LIVE_HWND.store(0, Ordering::Release);
+        REFRESH_PENDING.store(false, Ordering::Release);
+        FULLSCREEN_WAKE_PENDING.store(false, Ordering::Release);
     }
 
     #[test]
@@ -7313,6 +7554,8 @@ mod tests {
                 fg_loc_hook: HWINEVENTHOOK::default(),
                 tracked_fs_tid: 0,
                 fs_loc_hook: HWINEVENTHOOK::default(),
+                fs_lifecycle_hook: HWINEVENTHOOK::default(),
+                fs_cloak_hook: HWINEVENTHOOK::default(),
                 tracked_tray_tid: 0,
                 tray_hook: HWINEVENTHOOK::default(),
                 topmost_hooks: Vec::new(),
@@ -7555,6 +7798,8 @@ mod tests {
             fg_loc_hook: HWINEVENTHOOK::default(),
             tracked_fs_tid: 0,
             fs_loc_hook: HWINEVENTHOOK::default(),
+            fs_lifecycle_hook: HWINEVENTHOOK::default(),
+            fs_cloak_hook: HWINEVENTHOOK::default(),
             tracked_tray_tid: 0,
             tray_hook: HWINEVENTHOOK::default(),
             topmost_hooks: Vec::new(),
@@ -7737,6 +7982,8 @@ mod tests {
             fg_loc_hook: HWINEVENTHOOK::default(),
             tracked_fs_tid: 0,
             fs_loc_hook: HWINEVENTHOOK::default(),
+            fs_lifecycle_hook: HWINEVENTHOOK::default(),
+            fs_cloak_hook: HWINEVENTHOOK::default(),
             tracked_tray_tid: 0,
             tray_hook: HWINEVENTHOOK::default(),
             topmost_hooks: Vec::new(),
