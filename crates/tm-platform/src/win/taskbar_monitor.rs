@@ -1496,14 +1496,20 @@ impl WindowCtx {
             self.hovered = false;
             self.tracking_mouse = false;
         }
-        if self.last_visible == visible {
+        // The stacking-only WinEvent path can hide a popup whose safe ordering
+        // failed. Reconcile native state instead of trusting our last refresh.
+        let native_visible = unsafe { IsWindowVisible(self.hwnd).as_bool() };
+        if self.last_visible == visible && native_visible == visible {
             return false;
         }
-        unsafe {
-            let _ = ShowWindow(self.hwnd, if visible { SW_SHOWNOACTIVATE } else { SW_HIDE });
+        if native_visible != visible {
+            unsafe {
+                let _ = ShowWindow(self.hwnd, if visible { SW_SHOWNOACTIVATE } else { SW_HIDE });
+            }
         }
+        let previous = self.last_visible;
         self.last_visible = unsafe { IsWindowVisible(self.hwnd).as_bool() };
-        if self.last_visible == visible {
+        if self.last_visible != previous {
             tracing::debug!(
                 visible = self.last_visible,
                 "taskbar monitor visibility changed"
@@ -2588,6 +2594,29 @@ fn ensure_just_above_taskbar(widget_hwnd: HWND, tray_hwnd: HWND) -> bool {
     }
 }
 
+/// Repair a taskbar raise in its WinEvent delivery, before posting any heavier
+/// work. Only already visible popups participate; fullscreen/auto-hide checks
+/// and all rendering remain in refresh. Keeping immediately above the tray also
+/// preserves the order below windows that Explorer itself sits behind.
+fn repair_visible_taskbar_order(widget_hwnd: HWND, tray_hwnd: HWND) {
+    if !widget_hwnd.0.is_null()
+        && !tray_hwnd.0.is_null()
+        && unsafe { IsWindowVisible(widget_hwnd).as_bool() && IsWindowVisible(tray_hwnd).as_bool() }
+    {
+        ensure_just_above_taskbar(widget_hwnd, tray_hwnd);
+    }
+}
+
+fn repair_live_taskbar_order() {
+    use std::sync::atomic::Ordering;
+    let widget = LIVE_HWND.load(Ordering::Acquire);
+    let tray = LIVE_TRAY_HWND.load(Ordering::Acquire);
+    repair_visible_taskbar_order(
+        HWND(widget as *mut std::ffi::c_void),
+        HWND(tray as *mut std::ffi::c_void),
+    );
+}
+
 fn read_hkcu_dword(subkey: PCWSTR, value: PCWSTR) -> Option<u32> {
     let mut data: u32 = 0;
     let mut size = std::mem::size_of::<u32>() as u32;
@@ -2668,12 +2697,17 @@ fn set_popup_menu_theme(dark: bool) {
 unsafe extern "system" fn fg_event_proc(
     _hook: HWINEVENTHOOK,
     event: u32,
-    _hwnd: HWND,
+    hwnd: HWND,
     _id_object: i32,
     _id_child: i32,
     _id_event_thread: u32,
     _dwms_event_time: u32,
 ) {
+    if event == EVENT_SYSTEM_FOREGROUND
+        && hwnd.0 as isize == LIVE_TRAY_HWND.load(std::sync::atomic::Ordering::Acquire)
+    {
+        repair_live_taskbar_order();
+    }
     if event == EVENT_SYSTEM_MOVESIZEEND {
         LAYOUT_RECHECK_PENDING.store(true, std::sync::atomic::Ordering::Release);
     }
@@ -2715,6 +2749,9 @@ unsafe extern "system" fn tray_event_proc(
     let tray_hwnd = HWND(tray as *mut std::ffi::c_void);
     let is_tray_or_child = hwnd.0 as isize == tray || unsafe { IsChild(tray_hwnd, hwnd).as_bool() };
     if is_tray_or_child && taskbar_event_layout_update(event, id_object, id_child).is_some() {
+        if hwnd == tray_hwnd {
+            repair_live_taskbar_order();
+        }
         LAYOUT_RECHECK_PENDING.store(true, std::sync::atomic::Ordering::Release);
         post_refresh();
     }
@@ -3388,6 +3425,15 @@ mod tests {
             )
             .unwrap();
         }
+        // Focus-time repair must not wait on the app state or UIA worker, nor
+        // require processing the WM_APP_REFRESH posted after the hook returns.
+        {
+            let _app_state = ctx.shared.lock().unwrap();
+            let _layout_state = ctx.uia_scanner.state.0.lock().unwrap();
+            repair_visible_taskbar_order(hwnd, tray);
+            assert!(is_window_above(hwnd, tray));
+            assert!(unsafe { IsWindowVisible(hwnd).as_bool() });
+        }
         for event in [
             EVENT_OBJECT_REORDER,
             EVENT_OBJECT_LOCATIONCHANGE,
@@ -3498,6 +3544,16 @@ mod tests {
         }
         ctx.refresh_taskbar_env(&config, &metrics, env, false);
         assert!(ctx.last_visible);
+        assert_eq!(notifications.load(Ordering::Relaxed), 5);
+
+        // A failed hook-time positioning attempt may already have hidden the
+        // native popup. A successful refresh must be able to show it again.
+        unsafe {
+            let _ = ShowWindow(hwnd, SW_HIDE);
+        }
+        assert!(ctx.last_visible);
+        ctx.set_visible(true);
+        assert!(unsafe { IsWindowVisible(hwnd).as_bool() });
         assert_eq!(notifications.load(Ordering::Relaxed), 5);
 
         // A root-window notification also invalidates if the queried geometry moved.

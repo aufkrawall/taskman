@@ -1,3 +1,21 @@
+## 2026-11-15 — remaining taskbar text flash after revalidation fix
+
+- User verification of `c0a75da` confirms the bad full-element flashing is gone,
+  while text still flashes on taskbar focus. The installed build hash matched
+  the new release. Passive focus callbacks saw the widget visible and above the
+  tray; that sampling does not exclude a brief earlier compositor occlusion.
+- The previous no-flash implementation (`59b65a2`) relied on Explorer ownership,
+  which also attaches input queues. Do not silently restore that coupling.
+  Stacking-only repair now runs directly in the existing out-of-context taskbar
+  foreground/root event callbacks, before posting heavier refresh work. It uses
+  no app/UIA state locks, rendering or additional hooks, changes only our popup,
+  and never reveals a hidden widget. Native visibility is reconciled on refresh
+  if a failed callback-time placement has hidden it.
+- Native coverage raises a mock taskbar, repairs order before any queued refresh
+  with both app/UIA mutexes held, and checks visibility reconciliation. This
+  removes an avoidable delay; WinEvent delivery itself remains asynchronous, so
+  the remaining text flash needs user verification.
+
 ## 2026-11-15 — taskbar revalidation still hid on main-window restore
 
 - The root-only focus fix was insufficient. A passive desktop event capture

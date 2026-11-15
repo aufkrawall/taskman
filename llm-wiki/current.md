@@ -1127,10 +1127,14 @@ rebase runbook.
   There can be transient visual overlap during revalidation; fresh occupancy
   relocates or hides the widget before restoring interaction. Actual
   taskbar/tray/DPI geometry or taskbar identity changes discard the old layout
-  and hide immediately. Z-order repair precedes text measurement (and still
-  runs during revalidation). The earlier root-only recheck fix missed shell
-  creation and native child layout bursts: opening TaskMan still caused
-  hide/rescan/show flashes even when the changed controls were far away.
+  and hide immediately. Stacking-only repair runs in the existing taskbar
+  foreground/root WinEvent callbacks before posting refresh, without app/UIA
+  locks or rendering; it never reveals a hidden widget. Refresh also repairs
+  order before text measurement and during revalidation, reconciling native
+  visibility after callback-time placement failures. The earlier root-only
+  recheck fix missed shell creation and native child layout bursts: opening
+  TaskMan still caused hide/rescan/show flashes even when the changed controls
+  were far away.
   Every request advances the generation, rejecting older in-flight scans;
   unchanged completed results still wake the window to restore hit testing.
   Failed/empty scans clear stale data. Layout and presentation failures have
