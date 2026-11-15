@@ -1,3 +1,25 @@
+## 2026-11-15 — UIA worker failure requeue & occluded candidate rect priority
+
+- Confirmed and fixed both P2 findings from the `5e6d6fe..main` review against
+  `crates/tm-platform/src/win/taskbar_monitor.rs`:
+  1. **UIA failure retry while sampling is paused:** `UiaShared::publish_at`
+     returned `changed == false` when `rects` stayed `None`, so
+     `uia_worker_main` did not call `post_refresh()` and left `pending` empty
+     until an external `request_scan` arrived (stalling recovery indefinitely when
+     `UpdateSpeed::Paused`). `publish_at` now re-queues `self.pending =
+     Some(target)` on failure (`rects.is_none()`, clearing stale same-generation
+     `pending` on success), keeping `500 ms -> 1 s -> 2 s -> 5 s` worker backoff
+     without waking the UI loop or breaking `request_scan` deduplication.
+  2. **Stale occlusion recheck rect after relocated hide:**
+     `recheck_topmost_occlusion_with_tray` previously evaluated
+     `self.last_rect().or(self.last_occluded_rect)`, which checked the old
+     displayed rect (`last_pos`) instead of the blocked candidate rect stored in
+     `last_occluded_rect` before `last_pos` updated. Switched to
+     `self.last_occluded_rect.or_else(|| self.last_rect())`.
+- Added regression tests
+  `uia_failed_scan_requeues_retry_in_worker_without_caller_refresh` and
+  `recheck_topmost_occlusion_prefers_blocked_candidate_rect_over_stale_last_rect`.
+
 ## 2026-11-15 — faster restore on fullscreen close & Task View (`Win+Tab`) visibility
 
 - Fixed two remaining Windows 11 taskbar monitor suppression/latency bugs in

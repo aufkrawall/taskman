@@ -1183,7 +1183,10 @@ rebase runbook.
   were far away.
   Every request advances the generation, rejecting older in-flight scans;
   unchanged completed results still wake the window to restore hit testing.
-  Failed/empty scans clear stale data. Layout and presentation failures have
+  Failed/empty scans clear stale data, record progressive failure backoff
+  (`500` ms -> `1` s -> `2` s -> `5` s), and re-queue the failed target inside
+  `UiaShared::publish_at` so `uia_worker_main` retries automatically after backoff
+  even when sampling is paused. Layout and presentation failures have
   rate-limited diagnostics; debug-level visibility transition messages distinguish
   explicit hide/show from occlusion in Z-order. There is no unverified
   tray-relative fallback.

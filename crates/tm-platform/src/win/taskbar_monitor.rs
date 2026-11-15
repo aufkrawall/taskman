@@ -1302,7 +1302,7 @@ impl WindowCtx {
             return false;
         }
         if self.hidden_by_occlusion {
-            let Some(rect) = self.last_rect().or(self.last_occluded_rect) else {
+            let Some(rect) = self.last_occluded_rect.or_else(|| self.last_rect()) else {
                 self.hidden_by_occlusion = false;
                 self.disarm_topmost_recheck();
                 return true;
@@ -3105,10 +3105,21 @@ impl UiaShared {
         let changed = if rects.is_some() {
             self.consecutive_failures = 0;
             self.backoff_until = None;
+            if self
+                .pending
+                .is_some_and(|pending| pending.generation == target.generation)
+            {
+                self.pending = None;
+            }
             !same_target || self.cache.rects != rects || self.cache.generation != target.generation
         } else {
             self.consecutive_failures = self.consecutive_failures.saturating_add(1);
             self.backoff_until = Some(now + uia_failure_backoff(self.consecutive_failures));
+            // Keep retry ownership inside the UIA worker across failures so recovery
+            // continues after backoff even when sampling is paused and `changed == false`.
+            if self.pending.is_none() && target.tray_hwnd != 0 && !target.taskbar_rect.is_empty() {
+                self.pending = Some(target);
+            }
             // Only wake the window if previously cached rectangles for this target
             // must be cleared; repeated unavailable scans must not spin refresh.
             had_rects_for_target
@@ -7851,6 +7862,116 @@ mod tests {
     }
 
     #[test]
+    fn recheck_topmost_occlusion_prefers_blocked_candidate_rect_over_stale_last_rect() {
+        let _zorder = z_order_test_lock();
+        let _dpi = DpiContextGuard::per_monitor_v2();
+        let hinstance = HINSTANCE(unsafe { GetModuleHandleW(None).unwrap() }.0);
+        let class_name = register_window_class(hinstance).unwrap();
+        let tray = create_topmost_test_window(hinstance, class_name);
+        let hwnd = create_monitor_window(hinstance, class_name, std::ptr::null()).unwrap();
+        let popup_old = create_topmost_test_window(hinstance, class_name);
+        let popup_new = create_topmost_test_window(hinstance, class_name);
+        let _windows = TestWindows(vec![hwnd, tray, popup_old, popup_new]);
+
+        let rect_old = rect(-22_500, -24_000, -22_400, -23_960);
+        let rect_new = rect(-22_900, -24_000, -22_800, -23_960);
+        unsafe {
+            SetWindowPos(
+                tray,
+                Some(HWND_TOPMOST),
+                -24_000,
+                -24_000,
+                1920,
+                48,
+                SWP_NOACTIVATE,
+            )
+            .unwrap();
+            let _ = ShowWindow(tray, SW_SHOWNOACTIVATE);
+            for (popup, r) in [(popup_old, rect_old), (popup_new, rect_new)] {
+                SetWindowPos(
+                    popup,
+                    Some(HWND_TOP),
+                    r.left,
+                    r.top,
+                    r.width(),
+                    r.height(),
+                    SWP_NOACTIVATE,
+                )
+                .unwrap();
+                let _ = ShowWindow(popup, SW_SHOWNOACTIVATE);
+            }
+        }
+
+        let mut ctx = WindowCtx {
+            hwnd,
+            in_elevated_band: true,
+            user_closing: false,
+            shared: Arc::new(Mutex::new(SharedState {
+                config: Config::default(),
+                metrics: Metrics::default(),
+                generation: 0,
+            })),
+            visibility: Arc::new(MonitorVisibility {
+                visible: std::sync::atomic::AtomicBool::new(false),
+                notifier: Arc::new(|| {}),
+            }),
+            callback: Arc::new(|_| {}),
+            renderer: None,
+            uia_scanner: Arc::new(UiaScanner {
+                state: Arc::new((Mutex::new(UiaShared::default()), Condvar::new())),
+                worker: Mutex::new(None),
+            }),
+            light_taskbar: false,
+            hovered: false,
+            tracking_mouse: false,
+            last_display: None,
+            last_size: (rect_old.width(), rect_old.height()),
+            last_pos: Some((rect_old.left, rect_old.top)),
+            last_visible: false,
+            last_present_error: None,
+            last_anchor_slot: None,
+            last_compact: false,
+            last_stacked: false,
+            last_env_geom: None,
+            pending_uia_scan: false,
+            invalidate_uia_layout: false,
+            restore_from_cached_layout: false,
+            tracked_fg_tid: 0,
+            fg_loc_hook: HWINEVENTHOOK::default(),
+            tracked_fs_tid: 0,
+            fs_loc_hook: HWINEVENTHOOK::default(),
+            fs_lifecycle_hook: HWINEVENTHOOK::default(),
+            fs_cloak_hook: HWINEVENTHOOK::default(),
+            tracked_tray_tid: 0,
+            tray_hook: HWINEVENTHOOK::default(),
+            topmost_hooks: Vec::new(),
+            last_fg_hwnd: 0,
+            fullscreen_recheck_remaining: 0,
+            fullscreen_recheck_armed: false,
+            hidden_by_occlusion: false,
+            last_occluded_rect: None,
+            topmost_recheck_armed: false,
+        };
+
+        // Simulate a relocation to `rect_new` blocked by `popup_new` before `last_pos` updates.
+        ctx.last_occluded_rect = Some(rect_new);
+        ctx.hide("occluded_above_tray", Some(popup_new));
+        assert!(ctx.hidden_by_occlusion);
+        assert_eq!(ctx.last_occluded_rect, Some(rect_new));
+        assert_eq!(ctx.last_rect(), Some(rect_old));
+        assert!(!ctx.recheck_topmost_occlusion_with_tray(tray));
+
+        // Clear the blocked candidate slot while `rect_old` stays occluded by `popup_old`.
+        unsafe {
+            let _ = ShowWindow(popup_new, SW_HIDE);
+        }
+        assert!(
+            ctx.recheck_topmost_occlusion_with_tray(tray),
+            "recheck must inspect `last_occluded_rect` before stale `last_rect()`"
+        );
+    }
+
+    #[test]
     fn uia_unavailable_scans_do_not_spin_and_back_off_progressively() {
         let _zorder = z_order_test_lock();
         let scanner = Arc::new(UiaScanner {
@@ -8016,5 +8137,61 @@ mod tests {
             "repeated refresh calls while retry is queued must not churn UIA generation"
         );
         assert!(!ctx.last_visible);
+    }
+
+    #[test]
+    fn uia_failed_scan_requeues_retry_in_worker_without_caller_refresh() {
+        let scanner = UiaScanner {
+            state: Arc::new((Mutex::new(UiaShared::default()), Condvar::new())),
+            worker: Mutex::new(None),
+        };
+        let bar = rect(-24_000, -24_000, -22_080, -23_952);
+        let t0 = Instant::now();
+
+        scanner.request_scan(1, bar, true);
+        let t1 = scanner.state.0.lock().unwrap().pending.take().unwrap();
+        assert!(!scanner.state.0.lock().unwrap().publish_at(t1, None, t0));
+
+        // Even with no further `request_scan` (e.g. paused sampling), the worker
+        // re-queues the failed target and honors progressive backoff before retrying.
+        let t2 = {
+            let mut guard = scanner.state.0.lock().unwrap();
+            assert_eq!(
+                guard.next_wait(Some(t0), t0),
+                Some(Duration::from_millis(500))
+            );
+            guard
+                .pending
+                .take()
+                .expect("failed scan must leave retry queued in UiaShared::pending")
+        };
+
+        let t1_step = t0 + Duration::from_millis(500);
+        assert!(
+            !scanner
+                .state
+                .0
+                .lock()
+                .unwrap()
+                .publish_at(t2, None, t1_step)
+        );
+        let t3 = {
+            let mut guard = scanner.state.0.lock().unwrap();
+            assert_eq!(
+                guard.next_wait(Some(t1_step), t1_step),
+                Some(Duration::from_secs(1))
+            );
+            guard
+                .pending
+                .take()
+                .expect("repeated failure must stay queued for next backoff")
+        };
+
+        assert!(scanner.state.0.lock().unwrap().publish_at(
+            t3,
+            Some(vec![rect(-22_300, -24_000, -22_080, -23_952)]),
+            t1_step + Duration::from_secs(1),
+        ));
+        assert!(scanner.state.0.lock().unwrap().pending.is_none());
     }
 }
