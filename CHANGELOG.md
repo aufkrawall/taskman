@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.1.27 - 2026-11-15
+
 ### Fixed
 
 - **Taskbar monitor vertical, small-bar, and accent-color handling:** The Windows taskbar performance monitor now stacks network and CPU/RAM sections vertically when a left- or right-pinned vertical taskbar is narrower than side-by-side columns, steps down font size (down to `6.5` pt) when needed to fit short horizontal or narrow vertical taskbars without clipping or `clamp` panics, and hides cleanly rather than overflowing if the taskbar remains too narrow. In `Auto` color mode, contrast detection now also evaluates Windows `ColorPrevalence` and `DWM\AccentColor` luminance on `WM_SETTINGCHANGE` and `WM_DWMCOLORIZATIONCOLORCHANGED` so dark or light accent-colored taskbars get matching text contrast without screen pixel reads.
