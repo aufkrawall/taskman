@@ -1635,8 +1635,9 @@ impl WindowCtx {
     fn hide(&mut self, reason: &'static str, detail: Option<HWND>) {
         if self.last_visible {
             let class = detail.and_then(read_window_class);
+            let band = detail.and_then(window_band);
             let frame = detail.and_then(visible_frame_rect);
-            tracing::debug!(reason, ?class, ?frame, "hiding taskbar monitor");
+            tracing::debug!(reason, ?class, ?band, ?frame, "hiding taskbar monitor");
         }
         self.set_visible(false);
     }
@@ -2055,11 +2056,23 @@ fn is_transparent_overlay(hwnd: HWND) -> bool {
         && alpha == 0
 }
 
+fn is_below_band(hwnd: HWND, tray_band: Option<u32>) -> bool {
+    tray_band.is_some_and(|tb| window_band(hwnd).is_some_and(|wb| wb < tb))
+}
+
+fn fullscreen_above_result(saw_tray: bool, tray_band: Option<u32>, covered: bool) -> bool {
+    // Windows 11 promotes `Shell_TrayWnd` into band 6 (`ZBID_IMMERSIVE_MOGO`)
+    // when Start/Search opens, and `EnumWindows` omits immersive bands from
+    // non-immersive callers; windows in bands above `tray_band` still cover it.
+    covered && (saw_tray || tray_band.is_some_and(|band| band > 1))
+}
+
 struct AboveTaskbarScan {
     tray_hwnd: HWND,
     own_hwnd: HWND,
     desktop_hwnd: HWND,
     shell_hwnd: HWND,
+    tray_band: Option<u32>,
     monitor_rect: PixelRect,
     covered: bool,
     saw_tray: bool,
@@ -2077,7 +2090,8 @@ unsafe extern "system" fn above_taskbar_enum_cb(hwnd: HWND, lparam: LPARAM) -> B
     if unsafe { !IsWindowVisible(hwnd).as_bool() || IsIconic(hwnd).as_bool() } {
         return BOOL(1);
     }
-    if is_desktop_shell_class(hwnd)
+    if is_below_band(hwnd, scan.tray_band)
+        || is_desktop_shell_class(hwnd)
         || is_non_occluding_shell_host_window(hwnd)
         || is_window_cloaked(hwnd)
         || is_transparent_overlay(hwnd)
@@ -2093,19 +2107,18 @@ unsafe extern "system" fn above_taskbar_enum_cb(hwnd: HWND, lparam: LPARAM) -> B
     BOOL(1)
 }
 
-/// Detects fullscreen windows still sitting above `tray_hwnd` in Z-order even
-/// when they no longer hold foreground focus (e.g. while holding Alt+Tab over
-/// a fullscreen game so the task switcher dialog is foreground above both).
-fn is_fullscreen_window_above_taskbar(
+fn is_fullscreen_window_above_taskbar_in_band(
     monitor_rect: PixelRect,
     tray_hwnd: HWND,
     own_hwnd: HWND,
+    tray_band: Option<u32>,
 ) -> bool {
     let mut scan = AboveTaskbarScan {
         tray_hwnd,
         own_hwnd,
         desktop_hwnd: unsafe { GetDesktopWindow() },
         shell_hwnd: unsafe { GetShellWindow() },
+        tray_band,
         monitor_rect,
         covered: false,
         saw_tray: false,
@@ -2116,7 +2129,23 @@ fn is_fullscreen_window_above_taskbar(
             LPARAM(&mut scan as *mut AboveTaskbarScan as isize),
         );
     }
-    scan.saw_tray && scan.covered
+    fullscreen_above_result(scan.saw_tray, scan.tray_band, scan.covered)
+}
+
+/// Detects fullscreen windows still sitting above `tray_hwnd` in Z-order even
+/// when they no longer hold foreground focus (e.g. while holding Alt+Tab over
+/// a fullscreen game so the task switcher dialog is foreground above both).
+fn is_fullscreen_window_above_taskbar(
+    monitor_rect: PixelRect,
+    tray_hwnd: HWND,
+    own_hwnd: HWND,
+) -> bool {
+    is_fullscreen_window_above_taskbar_in_band(
+        monitor_rect,
+        tray_hwnd,
+        own_hwnd,
+        window_band(tray_hwnd),
+    )
 }
 
 fn read_window_class(hwnd: HWND) -> Option<String> {
@@ -2313,6 +2342,7 @@ struct WidgetOcclusionScan {
     own_hwnd: HWND,
     desktop_hwnd: HWND,
     shell_hwnd: HWND,
+    tray_band: Option<u32>,
     target_rect: PixelRect,
     occluder: Option<HWND>,
     saw_tray: bool,
@@ -2324,7 +2354,9 @@ unsafe extern "system" fn widget_occlusion_enum_cb(hwnd: HWND, lparam: LPARAM) -
         scan.saw_tray = true;
         return BOOL(0);
     }
-    if !is_potential_occluder_window(hwnd, scan.own_hwnd, scan.desktop_hwnd, scan.shell_hwnd) {
+    if !is_potential_occluder_window(hwnd, scan.own_hwnd, scan.desktop_hwnd, scan.shell_hwnd)
+        || is_below_band(hwnd, scan.tray_band)
+    {
         return BOOL(1);
     }
     if let Some(frame) = visible_frame_rect(hwnd)
@@ -2336,17 +2368,32 @@ unsafe extern "system" fn widget_occlusion_enum_cb(hwnd: HWND, lparam: LPARAM) -
     BOOL(1)
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum OcclusionCheck {
     Clear,
     TrayMissing,
     Occluded(HWND),
 }
 
-fn check_rect_occluded_above_taskbar(
+fn occlusion_result_after_enum(
+    saw_tray: bool,
+    tray_band: Option<u32>,
+    occluder: Option<HWND>,
+) -> OcclusionCheck {
+    if let Some(hwnd) = occluder {
+        OcclusionCheck::Occluded(hwnd)
+    } else if !saw_tray && !tray_band.is_some_and(|band| band > 1) {
+        OcclusionCheck::TrayMissing
+    } else {
+        OcclusionCheck::Clear
+    }
+}
+
+fn check_rect_occluded_above_taskbar_in_band(
     tray_hwnd: HWND,
     own_hwnd: HWND,
     target_rect: PixelRect,
+    tray_band: Option<u32>,
 ) -> OcclusionCheck {
     if target_rect.is_empty()
         || !unsafe { windows::Win32::UI::WindowsAndMessaging::IsWindow(Some(tray_hwnd)).as_bool() }
@@ -2358,6 +2405,7 @@ fn check_rect_occluded_above_taskbar(
         own_hwnd,
         desktop_hwnd: unsafe { GetDesktopWindow() },
         shell_hwnd: unsafe { GetShellWindow() },
+        tray_band,
         target_rect,
         occluder: None,
         saw_tray: false,
@@ -2368,13 +2416,20 @@ fn check_rect_occluded_above_taskbar(
             LPARAM(&mut scan as *mut WidgetOcclusionScan as isize),
         );
     }
-    if let Some(hwnd) = scan.occluder {
-        OcclusionCheck::Occluded(hwnd)
-    } else if !scan.saw_tray {
-        OcclusionCheck::TrayMissing
-    } else {
-        OcclusionCheck::Clear
-    }
+    occlusion_result_after_enum(scan.saw_tray, scan.tray_band, scan.occluder)
+}
+
+fn check_rect_occluded_above_taskbar(
+    tray_hwnd: HWND,
+    own_hwnd: HWND,
+    target_rect: PixelRect,
+) -> OcclusionCheck {
+    check_rect_occluded_above_taskbar_in_band(
+        tray_hwnd,
+        own_hwnd,
+        target_rect,
+        window_band(tray_hwnd),
+    )
 }
 
 /// Detects visible, uncloaked, non-transparent windows above `tray_hwnd` (such as
@@ -5391,22 +5446,28 @@ mod tests {
         }
     }
 
-    #[test]
-    fn elevated_band_hides_on_overlapping_topmost_popup_and_restores() {
-        let _zorder = z_order_test_lock();
-        struct DpiContextGuard(windows::Win32::UI::HiDpi::DPI_AWARENESS_CONTEXT);
-        impl Drop for DpiContextGuard {
-            fn drop(&mut self) {
-                if !self.0.is_invalid() {
-                    unsafe {
-                        let _ = SetThreadDpiAwarenessContext(self.0);
-                    }
+    struct DpiContextGuard(windows::Win32::UI::HiDpi::DPI_AWARENESS_CONTEXT);
+    impl DpiContextGuard {
+        fn per_monitor_v2() -> Self {
+            Self(unsafe {
+                SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2)
+            })
+        }
+    }
+    impl Drop for DpiContextGuard {
+        fn drop(&mut self) {
+            if !self.0.is_invalid() {
+                unsafe {
+                    let _ = SetThreadDpiAwarenessContext(self.0);
                 }
             }
         }
-        let _dpi = DpiContextGuard(unsafe {
-            SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2)
-        });
+    }
+
+    #[test]
+    fn elevated_band_hides_on_overlapping_topmost_popup_and_restores() {
+        let _zorder = z_order_test_lock();
+        let _dpi = DpiContextGuard::per_monitor_v2();
         let _com = ComMtaGuard::enter();
         let hinstance = HINSTANCE(unsafe { GetModuleHandleW(None).unwrap() }.0);
         let class_name = register_window_class(hinstance).unwrap();
@@ -6011,6 +6072,7 @@ mod tests {
     #[test]
     fn band1_ensure_just_above_taskbar_ignores_cross_band_topmost_windows() {
         let _zorder = z_order_test_lock();
+        let _dpi = DpiContextGuard::per_monitor_v2();
         let hinstance = HINSTANCE(unsafe { GetModuleHandleW(None).unwrap() }.0);
         let class_name = register_window_class(hinstance).unwrap();
         let tray = create_topmost_test_window(hinstance, class_name);
@@ -6082,5 +6144,84 @@ mod tests {
             is_window_above(widget, tray),
             "Band-1 widget must remain immediately above Band-1 tray"
         );
+    }
+
+    #[test]
+    fn tray_in_elevated_band_ignores_lower_band_occluders_and_omission_from_enum() {
+        assert_eq!(
+            occlusion_result_after_enum(false, Some(6), None),
+            OcclusionCheck::Clear
+        );
+        assert_eq!(
+            occlusion_result_after_enum(false, Some(1), None),
+            OcclusionCheck::TrayMissing
+        );
+        assert_eq!(
+            occlusion_result_after_enum(false, None, None),
+            OcclusionCheck::TrayMissing
+        );
+        assert!(fullscreen_above_result(false, Some(6), true));
+        assert!(!fullscreen_above_result(false, Some(1), true));
+
+        let _zorder = z_order_test_lock();
+        let _dpi = DpiContextGuard::per_monitor_v2();
+        let hinstance = HINSTANCE(unsafe { GetModuleHandleW(None).unwrap() }.0);
+        let class_name = register_window_class(hinstance).unwrap();
+        let tray = create_topmost_test_window(hinstance, class_name);
+        let lower_band_popup = create_topmost_test_window(hinstance, class_name);
+        let _windows = TestWindows(vec![tray, lower_band_popup]);
+
+        let mon = rect(-25_000, -25_000, -23_080, -23_920);
+        let widget_rect = rect(-23_500, -23_968, -23_300, -23_920);
+        unsafe {
+            let _ = ShowWindow(tray, SW_SHOWNOACTIVATE);
+            SetWindowPos(
+                tray,
+                Some(HWND_TOPMOST),
+                -25_000,
+                -23_968,
+                1920,
+                48,
+                SWP_NOACTIVATE,
+            )
+            .unwrap();
+            let _ = ShowWindow(lower_band_popup, SW_SHOWNOACTIVATE);
+            SetWindowPos(
+                lower_band_popup,
+                Some(HWND_TOPMOST),
+                mon.left,
+                mon.top,
+                mon.width(),
+                mon.height(),
+                SWP_NOACTIVATE,
+            )
+            .unwrap();
+        }
+
+        // With a Band-1 tray beneath it, the Band-1 fullscreen/overlapping window
+        // acts as an occluder and a fullscreen coverer.
+        assert_eq!(
+            check_rect_occluded_above_taskbar_in_band(tray, HWND::default(), widget_rect, Some(1)),
+            OcclusionCheck::Occluded(lower_band_popup)
+        );
+        assert!(is_fullscreen_window_above_taskbar_in_band(
+            mon,
+            tray,
+            HWND::default(),
+            Some(1),
+        ));
+
+        // When Windows promotes `Shell_TrayWnd` into an immersive band (band 6 > 1),
+        // Band-1 windows sit beneath it and must never count as above-tray occluders.
+        assert_eq!(
+            check_rect_occluded_above_taskbar_in_band(tray, HWND::default(), widget_rect, Some(6)),
+            OcclusionCheck::Clear
+        );
+        assert!(!is_fullscreen_window_above_taskbar_in_band(
+            mon,
+            tray,
+            HWND::default(),
+            Some(6),
+        ));
     }
 }

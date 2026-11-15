@@ -23,6 +23,21 @@
   (class + frame rect on `true -> false` transitions) plus regression tests
   `shell_host_overlay_identity_matches_only_trusted_shell_core_windows` and
   `band1_ensure_just_above_taskbar_ignores_cross_band_topmost_windows`.
+- Follow-up live desktop diagnostic (`diag_start.ps1` + `RUST_LOG=info,tm_platform::win::taskbar_monitor=debug`
+  on Windows 11 26H2 build `26300`) captured the exact hide trigger when Start
+  opened: `hiding taskbar monitor reason="tray_missing_in_enum"`, alongside
+  `Shell_TrayWnd` (`0x100DE`) promoted to `band=6` (`ZBID_IMMERSIVE_MOGO`) and
+  `SearchHost.exe` `Windows.UI.Core.CoreWindow` foregrounded in `band=6`, with
+  `enumCount=269, enumErr=0, trayIdx=-1, fgIdx=-1` (while `taskman`'s widget
+  remained in `band=16`). `EnumWindows` (`NtUserBuildHwndList`) omits band-6
+  immersive windows from non-immersive callers, so `widget_occlusion_enum_cb`
+  missed `tray_hwnd` and scanned into Band 1 below the taskbar. Fixed
+  `check_rect_occluded_above_taskbar` and `is_fullscreen_window_above_taskbar`
+  via `is_below_band`, `occlusion_result_after_enum`, and
+  `fullscreen_above_result` so lower-band windows (`wb < tb`) are skipped and a
+  live `tray_hwnd` in `band > 1` omitted from `EnumWindows` is not misclassified
+  as `TrayMissing`; added regression test
+  `tray_in_elevated_band_ignores_lower_band_occluders_and_omission_from_enum`.
 
 ## 2026-11-15 — taskbar focus text flicker fixed cleanly via window band 16
 

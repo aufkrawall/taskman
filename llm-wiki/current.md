@@ -1088,7 +1088,7 @@ rebase runbook.
   raising `Shell_TrayWnd` inside band 1 cannot cover it for even a single
   compositor frame; if band 16 is unavailable/denied, it falls back cleanly to
   standard band 1 (`CreateWindowExW`) with async focus-time Z-order repair. In
-  band 16, `is_rect_occluded_above_taskbar` (via `DWMWA_EXTENDED_FRAME_BOUNDS`
+  band 16, `check_rect_occluded_above_taskbar` (via `DWMWA_EXTENDED_FRAME_BOUNDS`
   with `GetWindowRect` fallback) hides the widget whenever any visible,
   uncloaked, non-transparent window above `Shell_TrayWnd` (including `#32768` /
   `Xaml_WindowedPopupClass` menus, `tooltips_class32`, or `always_on_top`
@@ -1096,7 +1096,11 @@ rebase runbook.
   overlay canvases owned by verified Windows shell hosts
   (`StartMenuExperienceHost.exe`, `SearchHost.exe`, `SearchApp.exe`,
   `ShellExperienceHost.exe`, `ShellHost.exe` via
-  `is_non_occluding_shell_host_window`), and `show_context_menu`
+  `is_non_occluding_shell_host_window`), ignoring lower-band (`band <
+  tray_band`) windows, and treating live `tray_hwnd` in elevated/immersive
+  bands (`band > 1`, such as band-6 `Shell_TrayWnd` while Start/Search is
+  open, which `EnumWindows` omits for non-immersive callers) as clear when no
+  higher-band occluder is present. `show_context_menu`
   (`context_menu_anchor`) anchors the right-click popup flush outside the
   taskbar edge. Layered updates still enter
   DWM; Independent Flip/MPO selection is not guaranteed by software rendering.
