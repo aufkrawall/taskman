@@ -475,6 +475,15 @@ pub mod taskbar_monitor {
         pub fn new(_callback: Arc<dyn Fn(Action) + Send + Sync>) -> Self {
             Self
         }
+        pub fn new_with_visibility_notifier(
+            _callback: Arc<dyn Fn(Action) + Send + Sync>,
+            _visibility_notifier: Arc<dyn Fn() + Send + Sync>,
+        ) -> Self {
+            Self
+        }
+        pub fn is_visible(&self) -> bool {
+            false
+        }
         pub fn set_config(&self, _config: Config) {}
         pub fn update_metrics(&self, _metrics: Metrics) {}
         pub fn shutdown(&self) {}

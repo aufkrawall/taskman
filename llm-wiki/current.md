@@ -1070,18 +1070,21 @@ rebase runbook.
   while their background fetch runs; `cmd_button` measures its label
   instead of a per-char heuristic.
 
-## Windows taskbar monitor (2026-11-14)
+## Windows taskbar monitor (2026-11-15)
 
-- **DWM-safe layered rendering:** `tm-platform/src/win/taskbar_monitor.rs`
+- **Software layered rendering:** `tm-platform/src/win/taskbar_monitor.rs`
   runs an independent `WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE`
-  popup owned by `Shell_TrayWnd` (without hardcoding `WS_EX_TOPMOST`, and
+  unowned popup (without hardcoding `WS_EX_TOPMOST`, and
   with `DWMWA_TRANSITIONS_FORCEDISABLED`) on a dedicated `"tm-taskbar"` thread
   using software Direct2D (`D2D1_RENDER_TARGET_TYPE_SOFTWARE`) + DirectWrite
   with GDI-classic ClearType-matched glyph rendering into a cached 32bpp
   premultiplied ARGB `CreateDIBSection` and `UpdateLayeredWindow`. It never
   calls `GetDC(NULL)`/`GetPixel`/`BitBlt` and never uses cross-process
-  `SetParent` on Explorer's `Shell_TrayWnd` thread.
-- **Zero-cost fullscreen & auto-hide suppression:** Watches taskbar position,
+  `SetParent` or window ownership on Explorer's `Shell_TrayWnd` thread. Win32
+  ownership across threads implicitly attaches input queues; a dedicated thread
+  alone does not isolate an Explorer-owned popup. Layered updates still enter
+  DWM; Independent Flip/MPO selection is not guaranteed by software rendering.
+- **Event-driven fullscreen & auto-hide suppression:** Watches taskbar position,
   `SystemUsesLightTheme` + `ColorPrevalence`/`AccentColor` luminance
   (`WM_SETTINGCHANGE`, `WM_DWMCOLORIZATIONCOLORCHANGED`), `TaskbarCreated`,
   `RegisterShellHookWindow` (`HSHELL_RUDEAPPACTIVATED`, `HSHELL_WINDOWACTIVATED`,
@@ -1091,12 +1094,15 @@ rebase runbook.
   `Shell_TrayWnd` thread (`EVENT_OBJECT_SHOW`..`EVENT_OBJECT_LOCATIONCHANGE`,
   filtered to `OBJID_WINDOW` `SHOW`/`HIDE`/`LOCATIONCHANGE` on tray + `IsChild`
   descendants plus `EVENT_OBJECT_REORDER`) with `REFRESH_PENDING` /
-  `LAYOUT_DIRTY` coalescing plus a 300 ms one-shot settle timer so
-  fullscreen/auto-hide transitions hide and restore immediately (including when
+  `LAYOUT_DIRTY` coalescing plus a 300 ms one-shot settle timer to refresh on
+  fullscreen/auto-hide transitions (including when
   holding `Alt+Tab` or another overlay takes foreground while an uncloaked,
   opaque fullscreen window still sits above `Shell_TrayWnd` in Z-order) and
-  Z-order demotes atomically with `Shell_TrayWnd` (staying below popups,
-  context menus, and fullscreen windows).
+  Z-order follows `Shell_TrayWnd` using its immediate predecessor, without
+  fixed-count window walks or manipulating Explorer. If positioning against
+  an inaccessible predecessor is denied, only the widget is hidden/demoted.
+  Unlike Explorer ownership, shell-event handling is asynchronous; headless
+  tests do not establish frame-perfect fullscreen transitions on every driver.
 - **Automagic UIA collision-free placement:** Dedicated `"tm-taskbar-uia"` MTA +
   Per-Monitor V2 thread queries visible interactive UIA elements under
   `Shell_TrayWnd` in a single cached `FindAllBuildCache` RPC (`CUIAutomation8`
@@ -1106,17 +1112,23 @@ rebase runbook.
   intervals, preferring `TrayAdjacent`, falling back with hysteresis to an
   outer-edge-anchored `AlternateGap` (e.g. centered Win11 left space),
   adapting to stacked vertical layout when a vertical bar's cross-axis width is
-  narrower than side-by-side columns (stepping down font size to `6.5` pt if
+  narrower than side-by-side columns (stepping down font size if
   needed on short/narrow bars, rejecting cross-axis overflow), adapting to
   `compact = true` (`"C"`/`"R"` labels) when tight, cleanly hiding via
-  `SW_HIDE` if completely packed, and falling back to classic `TrayNotifyWnd`
-  positioning if UIA fails or returns empty.
+  `SW_HIDE` if completely packed or occupancy is unknown. Layout changes
+  invalidate cached bounds; generation checks reject older in-flight scans,
+  and failed/empty scans clear stale data. The settle scan can reuse valid
+  bounds until its result arrives. Layout and presentation failures have
+  rate-limited diagnostics. There is no unverified tray-relative fallback.
 - **Tray keep-alive & engine decoupled updates:** While enabled, closing the
   main window hides TaskMan to the tray even if `close_to_tray` is off, and
   `tm-engine`'s notifier pushes `Metrics::from_snapshot` directly to the
-  taskbar window at `update_speed.interval()` even while the eframe surface
-  is hidden (`TelemetryDemand::hidden()` and background sampler mode remain
-  preserved). Non-Windows targets use a no-op stub in
+  taskbar window at `update_speed.interval()` while either surface is visible.
+  The widget publishes visibility transitions through an atomic flag plus an
+  app repaint notifier: when both surfaces are hidden, sampling returns to
+  five seconds, and showing the widget requests an immediate sample unless
+  paused. `TelemetryDemand::hidden()` and background sampler mode remain
+  preserved while the main window is hidden. Non-Windows targets use a no-op stub in
   `tm-platform/src/lib.rs`.
 
 ## Routing

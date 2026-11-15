@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+### Fixed
+
+- **Taskbar monitor isolation and background work:** The Windows taskbar monitor no longer shares an input queue with Explorer through cross-process window ownership. It follows taskbar Z-order without modifying Explorer, hides if safe positioning is denied, and restores the five-second background sampling interval whenever both the main window and taskbar monitor are hidden. Showing the monitor requests a fresh sample while preserving Pause.
+- **Taskbar button access and visibility checks:** The monitor stays hidden until UI Automation confirms taskbar occupancy, discards failed or stale layout results, and no longer places itself over buttons when layout information is unavailable. Z-order regression checks now handle desktops with more than 128 intervening windows.
+
 ## 0.1.27 - 2026-11-15
 
 ### Fixed

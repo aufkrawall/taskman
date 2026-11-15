@@ -522,22 +522,28 @@ impl TaskManApp {
 
         let ctx = cc.egui_ctx.clone();
 
-        let taskbar_monitor = Arc::new(tm_platform::taskbar_monitor::TaskbarMonitorHandle::new(
-            Arc::new(|_action| {
-                #[cfg(target_os = "windows")]
-                match _action {
-                    tm_platform::taskbar_monitor::Action::OpenMain => {
-                        crate::signal_tray(crate::TRAY_ACTION_OPEN);
+        let taskbar_monitor = Arc::new(
+            tm_platform::taskbar_monitor::TaskbarMonitorHandle::new_with_visibility_notifier(
+                Arc::new(|_action| {
+                    #[cfg(target_os = "windows")]
+                    match _action {
+                        tm_platform::taskbar_monitor::Action::OpenMain => {
+                            crate::signal_tray(crate::TRAY_ACTION_OPEN);
+                        }
+                        tm_platform::taskbar_monitor::Action::OpenSettings => {
+                            crate::signal_tray(crate::TRAY_ACTION_SETTINGS);
+                        }
+                        tm_platform::taskbar_monitor::Action::Exit => {
+                            crate::signal_tray(crate::TRAY_ACTION_EXIT);
+                        }
                     }
-                    tm_platform::taskbar_monitor::Action::OpenSettings => {
-                        crate::signal_tray(crate::TRAY_ACTION_SETTINGS);
-                    }
-                    tm_platform::taskbar_monitor::Action::Exit => {
-                        crate::signal_tray(crate::TRAY_ACTION_EXIT);
-                    }
-                }
-            }),
-        ));
+                }),
+                Arc::new({
+                    let ctx = ctx.clone();
+                    move || ctx.request_repaint()
+                }),
+            ),
+        );
 
         // ---- engine: parked until the first frame completes ----------------
         // The notifier makes sampling event-driven: every publication wakes
@@ -1249,7 +1255,7 @@ impl TaskManApp {
     /// A task manager the user parked in the tray is still a background
     /// process, and a background process may not keep kernel ETW sessions,
     /// PDH wildcard queries and a one-second tick running against the whole
-    /// machine on the strength of an icon nobody is looking at. On the way
+    /// machine when neither surface is visible. On the way
     /// out this releases every provider that costs the SYSTEM something
     /// ([`TelemetryDemand::hidden`]), stretches the tick and drops the
     /// sampling thread into Windows' background scheduling mode; on the way
@@ -1257,11 +1263,13 @@ impl TaskManApp {
     /// restored window does not open on data up to [`HIDDEN_INTERVAL`] old.
     fn sync_surface_visibility(&mut self) {
         let visible = std::mem::replace(&mut self.painted_last_frame, false);
-        let taskbar_active = self.shared.settings.taskbar_monitor_enabled;
+        let taskbar_active =
+            self.shared.settings.taskbar_monitor_enabled && self.taskbar_monitor.is_visible();
         if visible == self.surface_visible && taskbar_active == self.last_taskbar_interval_active {
             return;
         }
         let vis_changed = visible != self.surface_visible;
+        let taskbar_became_visible = taskbar_active && !self.last_taskbar_interval_active;
         self.surface_visible = visible;
         self.last_taskbar_interval_active = taskbar_active;
         if vis_changed {
@@ -1269,14 +1277,15 @@ impl TaskManApp {
         }
         // A paused engine is the user's explicit choice and outranks this:
         // it must not start ticking again because the window went away.
-        if self.shared.settings.update_speed != tm_core::settings::UpdateSpeed::Paused {
-            self.engine.set_interval(if visible || taskbar_active {
-                self.shared.settings.update_speed.interval()
-            } else {
-                HIDDEN_INTERVAL
-            });
+        if let Some(interval) =
+            surface_sampling_interval(visible, taskbar_active, self.shared.settings.update_speed)
+        {
+            self.engine.set_interval(interval);
         }
-        if vis_changed && visible {
+        if (vis_changed && visible)
+            || (taskbar_became_visible
+                && self.shared.settings.update_speed != tm_core::settings::UpdateSpeed::Paused)
+        {
             self.engine.request_refresh();
         }
         if vis_changed {
@@ -2080,6 +2089,20 @@ pub(crate) fn history_min_interval_s() -> f64 {
 /// series plots at its real position on the axis instead of being stretched
 /// to fill the window — which is what makes stretching the tick safe here.
 pub(crate) const HIDDEN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+
+fn surface_sampling_interval(
+    main_visible: bool,
+    taskbar_visible: bool,
+    speed: tm_core::settings::UpdateSpeed,
+) -> Option<std::time::Duration> {
+    if speed == tm_core::settings::UpdateSpeed::Paused {
+        None
+    } else if main_visible || taskbar_visible {
+        Some(speed.interval())
+    } else {
+        Some(HIDDEN_INTERVAL)
+    }
+}
 
 /// Deque capacity for `seconds` of visible history sampled at the fastest
 /// configured speed. Split out for unit testing (audit §10).
@@ -2991,6 +3014,37 @@ mod tests {
             assert!(
                 HIDDEN_INTERVAL > speed.interval(),
                 "{speed:?} must tick faster than a hidden window"
+            );
+        }
+    }
+
+    #[test]
+    fn taskbar_sampling_slows_while_suppressed_and_respects_pause() {
+        use tm_core::settings::UpdateSpeed;
+        for speed in [UpdateSpeed::High, UpdateSpeed::Normal, UpdateSpeed::Low] {
+            // Fullscreen, auto-hide, unknown occupancy, and a packed bar all publish
+            // false visibility even though the taskbar setting remains enabled.
+            assert_eq!(
+                surface_sampling_interval(false, false, speed),
+                Some(HIDDEN_INTERVAL)
+            );
+            assert_eq!(
+                surface_sampling_interval(false, true, speed),
+                Some(speed.interval())
+            );
+            assert_eq!(
+                surface_sampling_interval(true, false, speed),
+                Some(speed.interval())
+            );
+            assert_eq!(
+                surface_sampling_interval(true, true, speed),
+                Some(speed.interval())
+            );
+        }
+        for (main, taskbar) in [(false, false), (false, true), (true, false), (true, true)] {
+            assert_eq!(
+                surface_sampling_interval(main, taskbar, UpdateSpeed::Paused),
+                None
             );
         }
     }

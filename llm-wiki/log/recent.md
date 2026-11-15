@@ -1,3 +1,19 @@
+## 2026-11-15 — taskbar monitor isolation and hidden sampling
+
+- Removed Explorer ownership from the layered popup: cross-thread Win32 ownership
+  implicitly attaches input queues, even with `WS_EX_NOACTIVATE`. Placement now
+  changes only the widget, follows the taskbar's immediate Z-order predecessor,
+  and hides/demotes on denied positioning. Explorer restart rebinds observation
+  hooks without transferring ownership.
+- Visibility transitions wake app logic, restore the five-second sampler cadence
+  when both surfaces hide, and request a fresh sample when the widget returns
+  unless paused. Unknown UIA occupancy hides the widget; generation checks reject
+  superseded scans and failed/empty results discard stale bounds.
+- Added regression coverage for unowned window lifetime, visibility notifications,
+  hidden/visible/paused sampling, failed/stale UIA results, and Z-order checks with
+  more than 128 intervening windows. Native window tests do not establish DWM/MPO
+  behavior or frame-perfect transitions in real games.
+
 ## 2026-11-10 — v0.1.24 release
 
 - 2026-11-10: Released v0.1.24. Followed `build.md` §Publishing path: `--check` + `--audit` green, stable clippy green, bump pushed on main, `build.py --all-targets` for archives (Windows x86_64/ARM64, Linux x86_64 musl) and setup installers (`taskman-v0.1.24-windows-x86_64-setup.exe`, `taskman-v0.1.24-windows-arm64-setup.exe`), `.sha256` generated beside each, `gh release create --latest`.
