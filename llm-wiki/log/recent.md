@@ -1,3 +1,11 @@
+## 2026-11-15 — taskbar monitor review fixes (WndProc re-entrancy, background topmost promotion, UIA backoff)
+
+- Confirmed all 3 findings from the post-commit taskbar monitor review against `crates/tm-platform/src/win/taskbar_monitor.rs`:
+  1. `wnd_proc` held `&mut WindowCtx` from `GWLP_USERDATA` across synchronously re-entrant Win32 calls (`ShowWindow`, `SHAppBarMessage`, `DestroyWindow`) and `TrackPopupMenuEx`'s modal menu loop. Replaced raw `*mut WindowCtx` with `Box::into_raw(Box::new(WndProcState))` (`RefCell<WindowCtx>` + `menu_open: Cell<bool>` + deferred `reentrant_*` `Cell` flags); `with_ctx_mut_or` defers re-entrant updates until the outer `RefMut` drops, drops the borrow before `TrackPopupMenuEx` / `callback(...)`, and cleans up `GWLP_USERDATA` + `Box::from_raw` around `DestroyWindow`.
+  2. Empirical WinEvent (`0x0001..0xFFFF`) + `SHELLHOOK` probes confirmed `SetWindowPos(bg, HWND_TOPMOST/HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE)` emits zero events on an untracked background thread. Added `TOPMOST_RECHECK_TIMER_ID` (`500` ms) armed only while `in_elevated_band && (last_visible || hidden_by_occlusion)` (0 overhead when disabled, Band 1, or fullscreen-suppressed), syncing `topmost_hooks`, hiding on newly overlapping topmost windows, and refreshing to restore once occlusion clears.
+  3. `UiaShared::publish` returned `changed = true` when `rects` stayed `None` across generations, driving an 80 ms `post_refresh()` -> `request_scan()` spin loop while hidden. Added `UiaShared::publish_at` (`rects == None -> None` returns `false` while valid-to-`None` loss still wakes), progressive failure backoff (`500` ms, `1` s, `2` s, `5` s), `next_wait`, and pending non-invalidating scan dedup.
+- Added regression tests `wnd_proc_handles_reentrant_show_and_messages_without_aliasing_or_panic`, `elevated_band_recheck_detects_background_topmost_promotion_and_demotion`, and `uia_unavailable_scans_do_not_spin_and_back_off_progressively`. Band-16 creation requires genuine-windows integrity (falls back to Band 1 in test runs); DWM/MPO/game frame impact requires live desktop testing with `PresentMon`/games.
+
 ## 2026-11-15 — instant taskbar stats restore on Alt+Tab out of fullscreen
 
 - Investigated delayed taskbar monitor reappearance when Alt+Tabbing out of a
