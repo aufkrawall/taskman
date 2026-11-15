@@ -18,11 +18,22 @@
   or `always_on_top` windows still win visually while non-overlapping or
   below-tray windows do not hide it, and anchored right-click context menus
   flush outside all 4 taskbar edges (`context_menu_anchor`).
+- Follow-up refinements: added `sync_topmost_hooks` so `EVENT_OBJECT_LOCATIONCHANGE`
+  also tracks already-visible background `WS_EX_TOPMOST` / elevated-band threads
+  above `Shell_TrayWnd` (as well as non-child topmost windows on the foreground
+  or `Shell_TrayWnd` threads) without installing a global `LOCATIONCHANGE` hook
+  that would wake on mouse cursor/caret movement, so background topmost/PiP
+  moves trigger overlap checks promptly even while updates are paused; made
+  `elevated_band_window_stays_above_activated_tray_without_z_order_repair`
+  portable across access-denied Band-16 fallback hosts and added explicit Band-1
+  fallback (`band1_fallback_restores_order_when_elevated_band_disabled`) plus
+  background-thread movement (`sync_topmost_hooks_tracks_background_topmost_thread_moves`)
+  regression tests.
 - Automated regression tests verify band-16 persistence across repeated mock
-  band-1 tray activations without repair calls, overlap hiding/restoration under
-  Per-Monitor V2 DPI, transparent/below-tray exemptions, and context-menu
-  anchoring; final live desktop taskbar-click visual check awaits interactive
-  user verification.
+  band-1 tray activations without repair calls, Band-1 fallback recovery,
+  overlap hiding/restoration under Per-Monitor V2 DPI, transparent/below-tray
+  exemptions, background topmost move wakeups, and context-menu anchoring; final
+  live desktop taskbar-click visual check awaits interactive user verification.
 
 ## 2026-11-15 — remaining taskbar text flash after revalidation fix
 

@@ -1103,12 +1103,16 @@ rebase runbook.
   `EVENT_SYSTEM_FOREGROUND`/`MINIMIZESTART..END`/`MOVESIZEEND`,
   `EVENT_SYSTEM_MENUPOPUPSTART..END`, filtered top-level
   `EVENT_OBJECT_SHOW..HIDE`, and
-  thread-scoped `SetWinEventHook` hooks on the active foreground thread (when
-  `fg_tid != GetCurrentThreadId()`, including TaskMan's main GUI thread for
-  `always_on_top` moves) and
+  thread-scoped `SetWinEventHook` hooks on: (a) the active foreground thread
+  (when `fg_tid != GetCurrentThreadId()`, including TaskMan's main GUI thread),
+  (b) any background thread owning a visible, uncloaked, non-transparent
+  `WS_EX_TOPMOST` / elevated-band top-level window above `Shell_TrayWnd`
+  (`sync_topmost_hooks` -> `EVENT_OBJECT_LOCATIONCHANGE`, avoiding global
+  cursor/caret wakeups while still catching background topmost/PiP moves
+  even while telemetry updates are paused), and (c) the
   `Shell_TrayWnd` thread (`EVENT_OBJECT_SHOW`..`EVENT_OBJECT_LOCATIONCHANGE`,
   filtered to `OBJID_WINDOW` `SHOW`/`HIDE`/`LOCATIONCHANGE` on tray + `IsChild`
-  descendants plus `EVENT_OBJECT_REORDER`) with `REFRESH_PENDING`,
+  descendants plus top-level topmost moves on Explorer's thread and `EVENT_OBJECT_REORDER`) with `REFRESH_PENDING`,
   `LAYOUT_DIRTY`, and `LAYOUT_RECHECK_PENDING` coalescing plus a 300 ms
   one-shot settle timer to refresh on
   fullscreen/auto-hide transitions (including when

@@ -1107,6 +1107,7 @@ struct WindowCtx {
     fg_loc_hook: HWINEVENTHOOK,
     tracked_tray_tid: u32,
     tray_hook: HWINEVENTHOOK,
+    topmost_hooks: Vec<(u32, HWINEVENTHOOK)>,
 }
 
 impl Drop for WindowCtx {
@@ -1146,6 +1147,13 @@ impl WindowCtx {
                 let _ = UnhookWinEvent(self.tray_hook);
             }
             self.tray_hook = HWINEVENTHOOK::default();
+        }
+        for (_, hook) in self.topmost_hooks.drain(..) {
+            if !hook.is_invalid() {
+                unsafe {
+                    let _ = UnhookWinEvent(hook);
+                }
+            }
         }
         self.tracked_fg_tid = 0;
         self.tracked_tray_tid = 0;
@@ -1218,6 +1226,56 @@ impl WindowCtx {
         }
     }
 
+    fn sync_topmost_hooks(&mut self, tray_hwnd: HWND) {
+        let target_tids = if self.in_elevated_band && !tray_hwnd.0.is_null() {
+            let excluded = [
+                unsafe { GetCurrentThreadId() },
+                self.tracked_fg_tid,
+                self.tracked_tray_tid,
+            ];
+            collect_topmost_occluder_tids(tray_hwnd, self.hwnd, &excluded)
+        } else {
+            Vec::new()
+        };
+
+        self.topmost_hooks.retain(|&(tid, hook)| {
+            if target_tids.contains(&tid) {
+                true
+            } else {
+                if !hook.is_invalid() {
+                    unsafe {
+                        let _ = UnhookWinEvent(hook);
+                    }
+                }
+                false
+            }
+        });
+
+        for tid in target_tids {
+            if self
+                .topmost_hooks
+                .iter()
+                .any(|&(existing, _)| existing == tid)
+            {
+                continue;
+            }
+            let hook = unsafe {
+                SetWinEventHook(
+                    EVENT_OBJECT_LOCATIONCHANGE,
+                    EVENT_OBJECT_LOCATIONCHANGE,
+                    None,
+                    Some(topmost_location_event_proc),
+                    0,
+                    tid,
+                    WINEVENT_OUTOFCONTEXT,
+                )
+            };
+            if !hook.is_invalid() {
+                self.topmost_hooks.push((tid, hook));
+            }
+        }
+    }
+
     fn refresh(&mut self, force_render: bool) {
         let (config, metrics) = {
             let guard = self.shared.lock().unwrap_or_else(|e| e.into_inner());
@@ -1225,6 +1283,7 @@ impl WindowCtx {
         };
 
         if !config.enabled || (!config.show_cpu && !config.show_ram && !config.show_network) {
+            self.sync_topmost_hooks(HWND::default());
             self.set_visible(false);
             return;
         }
@@ -1234,6 +1293,7 @@ impl WindowCtx {
         self.sync_foreground_hook();
         let tray_hwnd = unsafe { FindWindowW(w!("Shell_TrayWnd"), None) }.unwrap_or_default();
         self.sync_tray_hook(tray_hwnd);
+        self.sync_topmost_hooks(tray_hwnd);
 
         let env = query_taskbar_env(tray_hwnd, self.hwnd);
         let Some(env) = env else {
@@ -2058,6 +2118,54 @@ fn visible_frame_rect(hwnd: HWND) -> Option<PixelRect> {
     None
 }
 
+fn is_potential_occluder_window(
+    hwnd: HWND,
+    own_hwnd: HWND,
+    desktop_hwnd: HWND,
+    shell_hwnd: HWND,
+) -> bool {
+    if hwnd == own_hwnd || hwnd == desktop_hwnd || hwnd == shell_hwnd {
+        return false;
+    }
+    if unsafe { !IsWindowVisible(hwnd).as_bool() || IsIconic(hwnd).as_bool() } {
+        return false;
+    }
+    if is_desktop_shell_class(hwnd) || is_window_cloaked(hwnd) {
+        return false;
+    }
+    is_tooltip_class(hwnd) || !is_transparent_overlay(hwnd)
+}
+
+fn is_topmost_or_elevated_window(hwnd: HWND) -> bool {
+    let ex_style = unsafe { GetWindowLongPtrW(hwnd, GWL_EXSTYLE) } as u32;
+    (ex_style & WS_EX_TOPMOST.0) != 0 || window_band(hwnd).is_some_and(|band| band > 1)
+}
+
+fn is_topmost_location_candidate(hwnd: HWND, id_object: i32, id_child: i32) -> bool {
+    if id_object != OBJID_WINDOW.0 || id_child != 0 || hwnd.0.is_null() {
+        return false;
+    }
+    let raw = hwnd.0 as isize;
+    if raw == LIVE_HWND.load(std::sync::atomic::Ordering::Acquire)
+        || raw == LIVE_TRAY_HWND.load(std::sync::atomic::Ordering::Acquire)
+    {
+        return false;
+    }
+    let style = unsafe { GetWindowLongPtrW(hwnd, GWL_STYLE) } as u32;
+    if (style & WS_CHILD.0) != 0 {
+        return false;
+    }
+    if !is_potential_occluder_window(
+        hwnd,
+        HWND::default(),
+        unsafe { GetDesktopWindow() },
+        unsafe { GetShellWindow() },
+    ) {
+        return false;
+    }
+    is_topmost_or_elevated_window(hwnd)
+}
+
 struct WidgetOcclusionScan {
     tray_hwnd: HWND,
     own_hwnd: HWND,
@@ -2074,16 +2182,7 @@ unsafe extern "system" fn widget_occlusion_enum_cb(hwnd: HWND, lparam: LPARAM) -
         scan.saw_tray = true;
         return BOOL(0);
     }
-    if hwnd == scan.own_hwnd || hwnd == scan.desktop_hwnd || hwnd == scan.shell_hwnd {
-        return BOOL(1);
-    }
-    if unsafe { !IsWindowVisible(hwnd).as_bool() || IsIconic(hwnd).as_bool() } {
-        return BOOL(1);
-    }
-    if is_desktop_shell_class(hwnd) || is_window_cloaked(hwnd) {
-        return BOOL(1);
-    }
-    if !is_tooltip_class(hwnd) && is_transparent_overlay(hwnd) {
+    if !is_potential_occluder_window(hwnd, scan.own_hwnd, scan.desktop_hwnd, scan.shell_hwnd) {
         return BOOL(1);
     }
     if let Some(frame) = visible_frame_rect(hwnd)
@@ -2121,6 +2220,53 @@ fn is_rect_occluded_above_taskbar(tray_hwnd: HWND, own_hwnd: HWND, target_rect: 
         );
     }
     scan.occluded || !scan.saw_tray
+}
+
+struct TopmostTidScan<'a> {
+    tray_hwnd: HWND,
+    own_hwnd: HWND,
+    desktop_hwnd: HWND,
+    shell_hwnd: HWND,
+    excluded: &'a [u32],
+    tids: Vec<u32>,
+}
+
+unsafe extern "system" fn topmost_tid_enum_cb(hwnd: HWND, lparam: LPARAM) -> BOOL {
+    let scan = unsafe { &mut *(lparam.0 as *mut TopmostTidScan<'_>) };
+    if hwnd == scan.tray_hwnd {
+        return BOOL(0);
+    }
+    if !is_potential_occluder_window(hwnd, scan.own_hwnd, scan.desktop_hwnd, scan.shell_hwnd)
+        || !is_topmost_or_elevated_window(hwnd)
+    {
+        return BOOL(1);
+    }
+    let tid = unsafe { GetWindowThreadProcessId(hwnd, None) };
+    if tid != 0 && !scan.excluded.contains(&tid) && !scan.tids.contains(&tid) {
+        scan.tids.push(tid);
+    }
+    BOOL(1)
+}
+
+fn collect_topmost_occluder_tids(tray_hwnd: HWND, own_hwnd: HWND, excluded: &[u32]) -> Vec<u32> {
+    if !unsafe { windows::Win32::UI::WindowsAndMessaging::IsWindow(Some(tray_hwnd)).as_bool() } {
+        return Vec::new();
+    }
+    let mut scan = TopmostTidScan {
+        tray_hwnd,
+        own_hwnd,
+        desktop_hwnd: unsafe { GetDesktopWindow() },
+        shell_hwnd: unsafe { GetShellWindow() },
+        excluded,
+        tids: Vec::new(),
+    };
+    unsafe {
+        let _ = EnumWindows(
+            Some(topmost_tid_enum_cb),
+            LPARAM(&mut scan as *mut TopmostTidScan<'_> as isize),
+        );
+    }
+    scan.tids
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2962,7 +3108,26 @@ unsafe extern "system" fn fg_location_event_proc(
     if id_object == OBJID_WINDOW.0
         && id_child == 0
         && !hwnd.0.is_null()
-        && hwnd.0 as isize == LIVE_FG_HWND.load(std::sync::atomic::Ordering::Acquire)
+        && (hwnd.0 as isize == LIVE_FG_HWND.load(std::sync::atomic::Ordering::Acquire)
+            || (IN_ELEVATED_BAND.load(std::sync::atomic::Ordering::Acquire)
+                && is_topmost_location_candidate(hwnd, id_object, id_child)))
+    {
+        post_refresh();
+    }
+}
+
+unsafe extern "system" fn topmost_location_event_proc(
+    _hook: HWINEVENTHOOK,
+    event: u32,
+    hwnd: HWND,
+    id_object: i32,
+    id_child: i32,
+    _id_event_thread: u32,
+    _dwms_event_time: u32,
+) {
+    if event == EVENT_OBJECT_LOCATIONCHANGE
+        && IN_ELEVATED_BAND.load(std::sync::atomic::Ordering::Acquire)
+        && is_topmost_location_candidate(hwnd, id_object, id_child)
     {
         post_refresh();
     }
@@ -2988,6 +3153,12 @@ unsafe extern "system" fn tray_event_proc(
             repair_live_taskbar_order();
         }
         LAYOUT_RECHECK_PENDING.store(true, std::sync::atomic::Ordering::Release);
+        post_refresh();
+    } else if event == EVENT_OBJECT_LOCATIONCHANGE
+        && !is_tray_or_child
+        && IN_ELEVATED_BAND.load(std::sync::atomic::Ordering::Acquire)
+        && is_topmost_location_candidate(hwnd, id_object, id_child)
+    {
         post_refresh();
     }
 }
@@ -3331,6 +3502,7 @@ fn taskbar_thread_main(
             fg_loc_hook: HWINEVENTHOOK::default(),
             tracked_tray_tid: 0,
             tray_hook: HWINEVENTHOOK::default(),
+            topmost_hooks: Vec::new(),
         });
 
         let ctx_ptr: *mut WindowCtx = &mut *ctx_box;
@@ -3750,6 +3922,7 @@ mod tests {
             fg_loc_hook: HWINEVENTHOOK::default(),
             tracked_tray_tid: 0,
             tray_hook: HWINEVENTHOOK::default(),
+            topmost_hooks: Vec::new(),
         };
         ctx.refresh_taskbar_env(&config, &metrics, env, false);
         assert!(
@@ -4956,12 +5129,10 @@ mod tests {
                 .is_null(),
             "elevated-band widget must remain unowned"
         );
-        if band_exports().create_in_band.is_some() {
-            assert!(
-                in_elevated_band,
-                "CreateWindowInBand(..., {TASKBAR_MONITOR_BAND}) should place the widget in band {TASKBAR_MONITOR_BAND}"
-            );
+        if in_elevated_band {
             assert_eq!(window_band(hwnd), Some(TASKBAR_MONITOR_BAND));
+        } else {
+            assert_ne!(window_band(hwnd), Some(TASKBAR_MONITOR_BAND));
         }
 
         let bar = rect(-20_000, -20_000, -18_080, -19_952);
@@ -4993,7 +5164,8 @@ mod tests {
 
         // Simulate Band-1 taskbar activation moving `tray` to the top of Band 1.
         // Without calling `repair_visible_taskbar_order`, a Band-16 widget must
-        // remain above `tray` natively.
+        // remain above `tray` natively; on hosts that fall back to Band 1,
+        // `ensure_just_above_taskbar` must recover the order cleanly.
         if in_elevated_band {
             for _ in 0..3 {
                 unsafe {
@@ -5014,6 +5186,21 @@ mod tests {
                 );
                 assert!(unsafe { IsWindowVisible(hwnd).as_bool() });
             }
+        } else {
+            unsafe {
+                SetWindowPos(
+                    tray,
+                    Some(HWND_TOPMOST),
+                    0,
+                    0,
+                    0,
+                    0,
+                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+                )
+                .unwrap();
+            }
+            assert!(ensure_just_above_taskbar(hwnd, tray));
+            assert!(is_window_above(hwnd, tray));
         }
     }
 
@@ -5120,6 +5307,7 @@ mod tests {
             fg_loc_hook: HWINEVENTHOOK::default(),
             tracked_tray_tid: 0,
             tray_hook: HWINEVENTHOOK::default(),
+            topmost_hooks: Vec::new(),
         };
 
         ctx.refresh_taskbar_env(&config, &metrics, env, false);
@@ -5241,5 +5429,365 @@ mod tests {
             monitor,
         );
         assert_eq!((pt.x, pt.y, align), (1856, 900, TPM_RIGHTALIGN.0));
+    }
+
+    #[test]
+    fn band1_fallback_restores_order_when_elevated_band_disabled() {
+        let _zorder = z_order_test_lock();
+        let _com = ComMtaGuard::enter();
+        let hinstance = HINSTANCE(unsafe { GetModuleHandleW(None).unwrap() }.0);
+        let class_name = register_window_class(hinstance).unwrap();
+        let tray = create_monitor_window(hinstance, class_name, std::ptr::null_mut()).unwrap();
+        let hwnd = create_monitor_window(hinstance, class_name, std::ptr::null_mut()).unwrap();
+        let _windows = TestWindows(vec![tray, hwnd]);
+
+        unsafe {
+            let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+            SetWindowPos(
+                hwnd,
+                Some(HWND_TOPMOST),
+                -25_000,
+                -25_000,
+                160,
+                40,
+                SWP_NOACTIVATE,
+            )
+            .unwrap();
+            let _ = ShowWindow(tray, SW_SHOWNOACTIVATE);
+            SetWindowPos(
+                tray,
+                Some(HWND_TOPMOST),
+                -25_100,
+                -25_000,
+                1920,
+                48,
+                SWP_NOACTIVATE,
+            )
+            .unwrap();
+            // A freshly promoted `!WS_EX_TOPMOST` window can enter below existing
+            // topmost peers on Windows 11; asserting again when already topmost
+            // moves `tray` strictly to the top of Band 1 above `hwnd`.
+            SetWindowPos(
+                tray,
+                Some(HWND_TOPMOST),
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+            )
+            .unwrap();
+        }
+        assert!(
+            is_window_above(tray, hwnd),
+            "tray must start above hwnd (tray_ex={:#x}, hwnd_ex={:#x}, hwnd_above_tray={}, tray_visible={}, hwnd_visible={})",
+            unsafe { GetWindowLongPtrW(tray, GWL_EXSTYLE) },
+            unsafe { GetWindowLongPtrW(hwnd, GWL_EXSTYLE) },
+            is_window_above(hwnd, tray),
+            unsafe { IsWindowVisible(tray).as_bool() },
+            unsafe { IsWindowVisible(hwnd).as_bool() },
+        );
+
+        let ctx = WindowCtx {
+            hwnd,
+            in_elevated_band: false,
+            user_closing: false,
+            shared: Arc::new(Mutex::new(SharedState {
+                config: Config::default(),
+                metrics: Metrics::default(),
+                generation: 0,
+            })),
+            visibility: Arc::new(MonitorVisibility {
+                visible: std::sync::atomic::AtomicBool::new(false),
+                notifier: Arc::new(|| {}),
+            }),
+            callback: Arc::new(|_| {}),
+            renderer: None,
+            uia_scanner: Arc::new(UiaScanner {
+                state: Arc::new((Mutex::new(UiaShared::default()), Condvar::new())),
+                worker: Mutex::new(None),
+            }),
+            light_taskbar: false,
+            hovered: false,
+            tracking_mouse: false,
+            last_display: None,
+            last_size: (0, 0),
+            last_pos: None,
+            last_visible: false,
+            last_present_error: None,
+            last_anchor_slot: None,
+            last_compact: false,
+            last_stacked: false,
+            last_env_geom: None,
+            pending_uia_scan: false,
+            invalidate_uia_layout: false,
+            msg_taskbar_created: 0,
+            msg_shell_hook: 0,
+            tracked_fg_tid: 0,
+            fg_loc_hook: HWINEVENTHOOK::default(),
+            tracked_tray_tid: 0,
+            tray_hook: HWINEVENTHOOK::default(),
+            topmost_hooks: Vec::new(),
+        };
+        assert!(ctx.ensure_visible_order(tray, None));
+        assert!(is_window_above(hwnd, tray));
+    }
+
+    #[test]
+    fn sync_topmost_hooks_tracks_background_topmost_thread_moves() {
+        use std::sync::atomic::Ordering;
+        use std::sync::mpsc;
+        use windows::Win32::UI::WindowsAndMessaging::{
+            MsgWaitForMultipleObjects, PM_REMOVE, PeekMessageW, QS_ALLINPUT,
+        };
+
+        struct LiveGlobalsGuard {
+            prev_elevated: bool,
+            prev_hwnd: isize,
+            prev_tray: isize,
+            prev_pending: bool,
+        }
+        impl Drop for LiveGlobalsGuard {
+            fn drop(&mut self) {
+                IN_ELEVATED_BAND.store(self.prev_elevated, Ordering::Release);
+                LIVE_HWND.store(self.prev_hwnd, Ordering::Release);
+                LIVE_TRAY_HWND.store(self.prev_tray, Ordering::Release);
+                REFRESH_PENDING.store(self.prev_pending, Ordering::Release);
+            }
+        }
+
+        let _zorder = z_order_test_lock();
+        let _com = ComMtaGuard::enter();
+        let _globals = LiveGlobalsGuard {
+            prev_elevated: IN_ELEVATED_BAND.load(Ordering::Acquire),
+            prev_hwnd: LIVE_HWND.load(Ordering::Acquire),
+            prev_tray: LIVE_TRAY_HWND.load(Ordering::Acquire),
+            prev_pending: REFRESH_PENDING.load(Ordering::Acquire),
+        };
+
+        let hinstance = HINSTANCE(unsafe { GetModuleHandleW(None).unwrap() }.0);
+        let class_name = register_window_class(hinstance).unwrap();
+        let make_topmost_win = |x: i32, y: i32, w: i32, h: i32| unsafe {
+            CreateWindowExW(
+                WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TOPMOST,
+                class_name,
+                w!("sync_topmost_test"),
+                WS_POPUP,
+                x,
+                y,
+                w,
+                h,
+                None,
+                None,
+                Some(hinstance),
+                None,
+            )
+            .unwrap()
+        };
+        let bar = rect(-26_000, -26_000, -24_080, -25_952);
+        let tray = make_topmost_win(bar.left, bar.top, bar.width(), bar.height());
+        let (hwnd, _) =
+            create_elevated_monitor_window(hinstance, class_name, std::ptr::null_mut()).unwrap();
+        let _windows = TestWindows(vec![tray, hwnd]);
+
+        unsafe {
+            let _ = ShowWindow(tray, SW_SHOWNOACTIVATE);
+            SetWindowPos(
+                tray,
+                Some(HWND_TOPMOST),
+                bar.left,
+                bar.top,
+                bar.width(),
+                bar.height(),
+                SWP_NOACTIVATE,
+            )
+            .unwrap();
+        }
+
+        #[derive(Clone, Copy)]
+        enum BgCmd {
+            Move,
+            Hide,
+            Exit,
+        }
+        let (cmd_tx, cmd_rx) = mpsc::channel::<BgCmd>();
+        let (ready_tx, ready_rx) = mpsc::channel::<(isize, u32)>();
+        let (ack_tx, ack_rx) = mpsc::channel::<()>();
+        let hinst_raw = hinstance.0 as usize;
+        let cls_raw = class_name.0 as usize;
+        let bg_join = std::thread::spawn(move || {
+            let hinst = HINSTANCE(hinst_raw as *mut std::ffi::c_void);
+            let cls = PCWSTR(cls_raw as *const u16);
+            let bg = unsafe {
+                CreateWindowExW(
+                    WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TOPMOST,
+                    cls,
+                    w!("sync_topmost_bg"),
+                    WS_POPUP,
+                    -26_000,
+                    -25_500,
+                    120,
+                    40,
+                    None,
+                    None,
+                    Some(hinst),
+                    None,
+                )
+                .unwrap()
+            };
+            unsafe {
+                let _ = ShowWindow(bg, SW_SHOWNOACTIVATE);
+                SetWindowPos(
+                    bg,
+                    Some(HWND_TOPMOST),
+                    0,
+                    0,
+                    0,
+                    0,
+                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+                )
+                .unwrap();
+            }
+            let _ = ready_tx.send((bg.0 as isize, unsafe { GetCurrentThreadId() }));
+            while let Ok(cmd) = cmd_rx.recv() {
+                match cmd {
+                    BgCmd::Move => {
+                        unsafe {
+                            SetWindowPos(
+                                bg,
+                                None,
+                                -25_900,
+                                -25_500,
+                                120,
+                                40,
+                                SWP_NOZORDER | SWP_NOACTIVATE,
+                            )
+                            .unwrap();
+                        }
+                        let _ = ack_tx.send(());
+                    }
+                    BgCmd::Hide => {
+                        unsafe {
+                            let _ = ShowWindow(bg, SW_HIDE);
+                        }
+                        let _ = ack_tx.send(());
+                    }
+                    BgCmd::Exit => break,
+                }
+            }
+            unsafe {
+                let _ = DestroyWindow(bg);
+            }
+        });
+
+        let (bg_raw, bg_tid) = ready_rx.recv().expect("background topmost thread ready");
+        let bg_hwnd = HWND(bg_raw as *mut std::ffi::c_void);
+        IN_ELEVATED_BAND.store(true, Ordering::Release);
+        LIVE_HWND.store(hwnd.0 as isize, Ordering::Release);
+        LIVE_TRAY_HWND.store(tray.0 as isize, Ordering::Release);
+
+        let mut ctx = WindowCtx {
+            hwnd,
+            in_elevated_band: true,
+            user_closing: false,
+            shared: Arc::new(Mutex::new(SharedState {
+                config: Config::default(),
+                metrics: Metrics::default(),
+                generation: 0,
+            })),
+            visibility: Arc::new(MonitorVisibility {
+                visible: std::sync::atomic::AtomicBool::new(false),
+                notifier: Arc::new(|| {}),
+            }),
+            callback: Arc::new(|_| {}),
+            renderer: None,
+            uia_scanner: Arc::new(UiaScanner {
+                state: Arc::new((Mutex::new(UiaShared::default()), Condvar::new())),
+                worker: Mutex::new(None),
+            }),
+            light_taskbar: false,
+            hovered: false,
+            tracking_mouse: false,
+            last_display: None,
+            last_size: (0, 0),
+            last_pos: None,
+            last_visible: false,
+            last_present_error: None,
+            last_anchor_slot: None,
+            last_compact: false,
+            last_stacked: false,
+            last_env_geom: None,
+            pending_uia_scan: false,
+            invalidate_uia_layout: false,
+            msg_taskbar_created: 0,
+            msg_shell_hook: 0,
+            tracked_fg_tid: 0,
+            fg_loc_hook: HWINEVENTHOOK::default(),
+            tracked_tray_tid: 0,
+            tray_hook: HWINEVENTHOOK::default(),
+            topmost_hooks: Vec::new(),
+        };
+
+        ctx.sync_topmost_hooks(tray);
+        assert!(
+            ctx.topmost_hooks.iter().any(|&(tid, _)| tid == bg_tid),
+            "background topmost thread {bg_tid} must receive a location hook (hooks={:?}, bg_above_tray={}, tray_above_bg={}, potential={}, topmost_or_elev={}, bg_ex={:#x}, tray_ex={:#x}, bg_band={:?}, tray_band={:?})",
+            ctx.topmost_hooks
+                .iter()
+                .map(|(t, _)| *t)
+                .collect::<Vec<_>>(),
+            is_window_above(bg_hwnd, tray),
+            is_window_above(tray, bg_hwnd),
+            is_potential_occluder_window(bg_hwnd, hwnd, unsafe { GetDesktopWindow() }, unsafe {
+                GetShellWindow()
+            }),
+            is_topmost_or_elevated_window(bg_hwnd),
+            unsafe { GetWindowLongPtrW(bg_hwnd, GWL_EXSTYLE) },
+            unsafe { GetWindowLongPtrW(tray, GWL_EXSTYLE) },
+            window_band(bg_hwnd),
+            window_band(tray),
+        );
+
+        REFRESH_PENDING.store(false, Ordering::Release);
+        cmd_tx.send(BgCmd::Move).unwrap();
+        ack_rx.recv().unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut msg = MSG::default();
+        while !REFRESH_PENDING.load(Ordering::Acquire) && Instant::now() < deadline {
+            while unsafe { PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE) }.as_bool() {
+                let _ = unsafe { TranslateMessage(&msg) };
+                unsafe { DispatchMessageW(&msg) };
+            }
+            if REFRESH_PENDING.load(Ordering::Acquire) {
+                break;
+            }
+            let remaining_ms = deadline
+                .saturating_duration_since(Instant::now())
+                .as_millis()
+                .min(50) as u32;
+            unsafe {
+                let _ = MsgWaitForMultipleObjects(None, false, remaining_ms, QS_ALLINPUT);
+            }
+        }
+        assert!(
+            REFRESH_PENDING.load(Ordering::Acquire),
+            "moving an already-visible background topmost window must wake overlap refresh \
+             (candidate={}, rect={:?}, bg_ex={:#x})",
+            is_topmost_location_candidate(bg_hwnd, OBJID_WINDOW.0, 0),
+            visible_frame_rect(bg_hwnd),
+            unsafe { GetWindowLongPtrW(bg_hwnd, GWL_EXSTYLE) }
+        );
+
+        cmd_tx.send(BgCmd::Hide).unwrap();
+        ack_rx.recv().unwrap();
+        ctx.sync_topmost_hooks(tray);
+        assert!(
+            !ctx.topmost_hooks.iter().any(|&(tid, _)| tid == bg_tid),
+            "hiding background topmost window must remove its thread hook"
+        );
+
+        let _ = cmd_tx.send(BgCmd::Exit);
+        let _ = bg_join.join();
     }
 }
