@@ -1,3 +1,26 @@
+## 2026-11-15 — taskbar revalidation still hid on main-window restore
+
+- The root-only focus fix was insufficient. A passive desktop event capture
+  confirmed two explicit hide/show cycles (about 114 and 128 ms) around opening
+  TaskMan, coinciding with ReBar client reorder and native task-list location
+  events away from the widget. The installed executable matched the previous
+  release build, ruling out a stale executable.
+- Shell creation/destruction/replacement, movesize completion, settings and
+  native/accessibility control hints now revalidate instead of discarding the
+  cache. During revalidation only an already visible widget retains its pixels
+  and footprint, and layered-window `WS_EX_TRANSPARENT` passes clicks through.
+  Confirmed results restore interaction or relocate/hide; failed/empty scans
+  still clear stale data, and identity/geometry changes still hide immediately.
+  Transient visual overlap is possible until revalidation completes, but input
+  is not intercepted. Explorer ownership remains disabled.
+- Every scan request supersedes older generations, including soft rechecks;
+  an unchanged completed scan must wake the widget to restore input. Native
+  regressions reproduce the captured control burst, freeze forced redraws while
+  pending, and check failure, full-taskbar, recovery and geometry transitions.
+  Scanner tests pin stale-result rejection and unchanged-result notification.
+  The capture identifies explicit hides; frame-perfect compositor behavior still
+  needs a real desktop visual check of the rebuilt executable.
+
 ## 2026-11-15 — taskbar focus flicker regression
 
 - The input-queue isolation change introduced two deliberate hide paths on

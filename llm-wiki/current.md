@@ -1119,16 +1119,21 @@ rebase runbook.
   narrower than side-by-side columns (stepping down font size if
   needed on short/narrow bars, rejecting cross-axis overflow), adapting to
   `compact = true` (`"C"`/`"R"` labels) when tight, cleanly hiding via
-  `SW_HIDE` if completely packed or occupancy is unknown. Root-window stacking
-  and unchanged-position hints recheck confirmed occupancy without clearing it;
-  child/control changes or actual taskbar/tray/DPI geometry changes invalidate
-  immediately, even if a recheck is coalesced afterward. Z-order repair runs
-  before text measurement when the current rectangle is still clear. A previous
-  version invalidated on every root reorder, causing a hide/rescan/show flash on
-  taskbar focus; do not restore that coupling or Explorer ownership.
-  Generation checks reject older in-flight scans,
-  and failed/empty scans clear stale data. The settle scan can reuse valid
-  bounds until its result arrives. Layout and presentation failures have
+  `SW_HIDE` if completely packed or occupancy is unknown. Shell window
+  creation/destruction/replacement and taskbar root/child/control notifications
+  revalidate transactionally: an already visible widget preserves its pixels
+  and footprint but sets `WS_EX_TRANSPARENT` to pass clicks through until the
+  latest scan completes. A hidden widget never reappears on provisional data.
+  There can be transient visual overlap during revalidation; fresh occupancy
+  relocates or hides the widget before restoring interaction. Actual
+  taskbar/tray/DPI geometry or taskbar identity changes discard the old layout
+  and hide immediately. Z-order repair precedes text measurement (and still
+  runs during revalidation). The earlier root-only recheck fix missed shell
+  creation and native child layout bursts: opening TaskMan still caused
+  hide/rescan/show flashes even when the changed controls were far away.
+  Every request advances the generation, rejecting older in-flight scans;
+  unchanged completed results still wake the window to restore hit testing.
+  Failed/empty scans clear stale data. Layout and presentation failures have
   rate-limited diagnostics; debug-level visibility transition messages distinguish
   explicit hide/show from occlusion in Z-order. There is no unverified
   tray-relative fallback.

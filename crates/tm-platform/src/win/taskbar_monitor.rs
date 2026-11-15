@@ -21,7 +21,8 @@
 //!   Automation scanner thread (`FindAllBuildCache` with `AutomationElementMode_None`
 //!   and an 80 ms transaction timeout, triggered only on shell/tray layout
 //!   events), relocating across open taskbar gaps, compacting when tight, and
-//!   hiding cleanly if occupancy is unknown or the taskbar is 100% full.
+//!   hiding cleanly if occupancy is unknown or the taskbar is 100% full. During
+//!   revalidation, existing pixels stay fixed and the window passes clicks through.
 //! - **Fullscreen suppression:** hides when a fullscreen window covers the
 //!   taskbar monitor or an auto-hide taskbar slides away. Visibility changes
 //!   wake the app so invisible telemetry returns to its background cadence.
@@ -171,7 +172,6 @@ static LIVE_HWND: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsiz
 static LIVE_FG_HWND: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
 static LIVE_TRAY_HWND: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
 static REFRESH_PENDING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-static LAYOUT_DIRTY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static LAYOUT_RECHECK_PENDING: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
@@ -181,12 +181,7 @@ enum LayoutUpdate {
     Invalidate,
 }
 
-fn taskbar_event_layout_update(
-    event: u32,
-    is_tray: bool,
-    id_object: i32,
-    id_child: i32,
-) -> Option<LayoutUpdate> {
+fn taskbar_event_layout_update(event: u32, id_object: i32, id_child: i32) -> Option<LayoutUpdate> {
     let window_self = id_object == OBJID_WINDOW.0 && id_child == 0;
     if event != EVENT_OBJECT_REORDER
         && !(window_self
@@ -197,14 +192,11 @@ fn taskbar_event_layout_update(
     {
         return None;
     }
-    // Focusing/raising Shell_TrayWnd can report a reorder or unchanged window
-    // position. Verify its bounds in refresh, but retain the proven occupancy.
-    // Child/control changes still invalidate immediately to protect their clicks.
-    Some(if is_tray && window_self {
-        LayoutUpdate::Recheck
-    } else {
-        LayoutUpdate::Invalidate
-    })
+    // Both native taskbar children and accessible controls report changes when
+    // focus or unrelated app buttons change. Revalidate transactionally: keep
+    // the last pixels, but pass clicks through until fresh occupancy arrives.
+    // Refresh separately invalidates an actual taskbar identity/geometry change.
+    Some(LayoutUpdate::Recheck)
 }
 
 fn post_refresh() {
@@ -1270,11 +1262,25 @@ impl WindowCtx {
                 std::mem::take(&mut self.invalidate_uia_layout),
             );
         }
-        let uia_occupied = self.uia_scanner.snapshot_for(tray_raw, env.taskbar_rect);
-        if uia_occupied.is_none() {
+        let Some(uia_occupied) = self.uia_scanner.snapshot_for(tray_raw, env.taskbar_rect) else {
             self.uia_scanner
                 .request_scan(tray_raw, env.taskbar_rect, false);
             self.set_visible(false);
+            return;
+        };
+
+        if !uia_occupied.current {
+            // A layout hint is not evidence that our pixels collide. Keep the
+            // already presented footprint stable while scanning, but never
+            // intercept a control that may have moved underneath it. Hidden
+            // windows must wait for validation before appearing again.
+            if !self.set_interactive(false) {
+                self.set_visible(false);
+                return;
+            }
+            if self.last_visible && !ensure_just_above_taskbar(self.hwnd, env.tray_hwnd) {
+                self.set_visible(false);
+            }
             return;
         }
 
@@ -1290,9 +1296,7 @@ impl WindowCtx {
                     right: x.saturating_add(self.last_size.0),
                     bottom: y.saturating_add(self.last_size.1),
                 };
-                uia_occupied
-                    .as_ref()
-                    .is_some_and(|rects| rects.iter().all(|r| !r.intersects(current)))
+                uia_occupied.rects.iter().all(|r| !r.intersects(current))
             })
             && !ensure_just_above_taskbar(self.hwnd, env.tray_hwnd)
         {
@@ -1333,7 +1337,7 @@ impl WindowCtx {
         let normal_placement = solve_taskbar_placement(
             env.taskbar_rect,
             env.tray_notify_rect,
-            uia_occupied.as_deref(),
+            Some(&uia_occupied.rects),
             normal_size,
             env.dpi,
             self.last_anchor_slot,
@@ -1359,7 +1363,7 @@ impl WindowCtx {
             let Some(placement) = solve_taskbar_placement(
                 env.taskbar_rect,
                 env.tray_notify_rect,
-                uia_occupied.as_deref(),
+                Some(&uia_occupied.rects),
                 compact_size,
                 env.dpi,
                 self.last_anchor_slot,
@@ -1396,7 +1400,8 @@ impl WindowCtx {
                 self.last_stacked = layout_stacked;
                 self.last_pos = Some((x, y));
                 let positioned = ensure_just_above_taskbar(self.hwnd, env.tray_hwnd);
-                self.set_visible(positioned);
+                let interactive = self.set_interactive(true);
+                self.set_visible(positioned && interactive);
             } else {
                 self.set_visible(false);
             }
@@ -1418,7 +1423,31 @@ impl WindowCtx {
             self.last_pos = Some((x, y));
         }
         let positioned = ensure_just_above_taskbar(self.hwnd, env.tray_hwnd);
-        self.set_visible(positioned);
+        let interactive = self.set_interactive(true);
+        self.set_visible(positioned && interactive);
+    }
+
+    fn set_interactive(&self, interactive: bool) -> bool {
+        let style = unsafe { GetWindowLongPtrW(self.hwnd, GWL_EXSTYLE) };
+        let next = if interactive {
+            style & !(WS_EX_TRANSPARENT.0 as isize)
+        } else {
+            style | WS_EX_TRANSPARENT.0 as isize
+        };
+        if style != next {
+            unsafe { SetWindowLongPtrW(self.hwnd, GWL_EXSTYLE, next) };
+        }
+        let applied = unsafe { GetWindowLongPtrW(self.hwnd, GWL_EXSTYLE) } == next;
+        if !applied && self.last_visible {
+            tracing::warn!("cannot update taskbar monitor hit testing; keeping it hidden");
+        }
+        applied
+    }
+
+    fn accepts_input(&self) -> bool {
+        self.last_visible
+            && unsafe { GetWindowLongPtrW(self.hwnd, GWL_EXSTYLE) } as u32 & WS_EX_TRANSPARENT.0
+                == 0
     }
 
     fn present_layered(&mut self, x: i32, y: i32, w: i32, h: i32, src_dc: HDC) -> bool {
@@ -2204,6 +2233,12 @@ struct UiaCache {
     tray_hwnd: isize,
     taskbar_rect: PixelRect,
     rects: Option<Vec<PixelRect>>,
+    generation: u64,
+}
+
+struct UiaSnapshot {
+    rects: Vec<PixelRect>,
+    current: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -2229,11 +2264,13 @@ impl UiaShared {
         let rects = rects.filter(|r| !r.is_empty());
         let changed = self.cache.tray_hwnd != target.tray_hwnd
             || self.cache.taskbar_rect != target.taskbar_rect
-            || self.cache.rects != rects;
+            || self.cache.rects != rects
+            || self.cache.generation != target.generation;
         self.cache = UiaCache {
             tray_hwnd: target.tray_hwnd,
             taskbar_rect: target.taskbar_rect,
             rects,
+            generation: target.generation,
         };
         changed
     }
@@ -2266,10 +2303,13 @@ impl UiaScanner {
         }
     }
 
-    fn snapshot_for(&self, tray_raw: isize, taskbar_rect: PixelRect) -> Option<Vec<PixelRect>> {
+    fn snapshot_for(&self, tray_raw: isize, taskbar_rect: PixelRect) -> Option<UiaSnapshot> {
         let guard = self.state.0.lock().unwrap_or_else(|e| e.into_inner());
         if guard.cache.tray_hwnd == tray_raw && guard.cache.taskbar_rect == taskbar_rect {
-            guard.cache.rects.clone()
+            guard.cache.rects.clone().map(|rects| UiaSnapshot {
+                rects,
+                current: guard.cache.generation == guard.generation,
+            })
         } else {
             None
         }
@@ -2285,8 +2325,10 @@ impl UiaScanner {
         }
         if invalidate {
             guard.cache.rects = None;
-            guard.generation = guard.generation.wrapping_add(1);
         }
+        // Even a recheck supersedes an in-flight scan. Publishing unchanged
+        // rectangles must wake the window so it can restore hit testing.
+        guard.generation = guard.generation.wrapping_add(1);
         guard.pending = Some(UiaTarget {
             tray_hwnd: tray_raw,
             taskbar_rect,
@@ -2633,7 +2675,7 @@ unsafe extern "system" fn fg_event_proc(
     _dwms_event_time: u32,
 ) {
     if event == EVENT_SYSTEM_MOVESIZEEND {
-        LAYOUT_DIRTY.store(true, std::sync::atomic::Ordering::Release);
+        LAYOUT_RECHECK_PENDING.store(true, std::sync::atomic::Ordering::Release);
     }
     post_refresh();
 }
@@ -2672,15 +2714,8 @@ unsafe extern "system" fn tray_event_proc(
     }
     let tray_hwnd = HWND(tray as *mut std::ffi::c_void);
     let is_tray_or_child = hwnd.0 as isize == tray || unsafe { IsChild(tray_hwnd, hwnd).as_bool() };
-    if is_tray_or_child
-        && let Some(update) =
-            taskbar_event_layout_update(event, hwnd == tray_hwnd, id_object, id_child)
-    {
-        let pending = match update {
-            LayoutUpdate::Recheck => &LAYOUT_RECHECK_PENDING,
-            LayoutUpdate::Invalidate => &LAYOUT_DIRTY,
-        };
-        pending.store(true, std::sync::atomic::Ordering::Release);
+    if is_tray_or_child && taskbar_event_layout_update(event, id_object, id_child).is_some() {
+        LAYOUT_RECHECK_PENDING.store(true, std::sync::atomic::Ordering::Release);
         post_refresh();
     }
 }
@@ -2762,7 +2797,7 @@ unsafe extern "system" fn wnd_proc(
     if ctx.msg_shell_hook != 0 && msg == ctx.msg_shell_hook {
         match wparam.0 as u32 {
             HSHELL_WINDOWCREATED | HSHELL_WINDOWDESTROYED | HSHELL_WINDOWREPLACED => {
-                ctx.request_layout_scan(LayoutUpdate::Invalidate, true);
+                ctx.request_layout_scan(LayoutUpdate::Recheck, true);
                 ctx.refresh(false);
             }
             HSHELL_WINDOWACTIVATED | HSHELL_RUDEAPPACTIVATED_MSG => {
@@ -2776,17 +2811,9 @@ unsafe extern "system" fn wnd_proc(
     match msg {
         WM_APP_REFRESH => {
             REFRESH_PENDING.store(false, std::sync::atomic::Ordering::Release);
-            let invalidate = LAYOUT_DIRTY.swap(false, std::sync::atomic::Ordering::AcqRel);
             let recheck = LAYOUT_RECHECK_PENDING.swap(false, std::sync::atomic::Ordering::AcqRel);
-            if invalidate || recheck {
-                ctx.request_layout_scan(
-                    if invalidate {
-                        LayoutUpdate::Invalidate
-                    } else {
-                        LayoutUpdate::Recheck
-                    },
-                    true,
-                );
+            if recheck {
+                ctx.request_layout_scan(LayoutUpdate::Recheck, true);
             }
             ctx.refresh(false);
             LRESULT(0)
@@ -2802,7 +2829,7 @@ unsafe extern "system" fn wnd_proc(
             LRESULT(0)
         }
         WM_SETTINGCHANGE => {
-            ctx.request_layout_scan(LayoutUpdate::Invalidate, true);
+            ctx.request_layout_scan(LayoutUpdate::Recheck, true);
             let light = read_taskbar_is_light();
             if light != ctx.light_taskbar {
                 ctx.light_taskbar = light;
@@ -2853,11 +2880,15 @@ unsafe extern "system" fn wnd_proc(
             LRESULT(0)
         }
         WM_LBUTTONUP => {
-            (ctx.callback)(Action::OpenMain);
+            if ctx.accepts_input() {
+                (ctx.callback)(Action::OpenMain);
+            }
             LRESULT(0)
         }
         WM_RBUTTONUP => {
-            ctx.show_context_menu();
+            if ctx.accepts_input() {
+                ctx.show_context_menu();
+            }
             LRESULT(0)
         }
         WM_CLOSE => {
@@ -2905,7 +2936,6 @@ fn taskbar_thread_main(
 
     let msg_taskbar_created = unsafe { RegisterWindowMessageW(w!("TaskbarCreated")) };
     let msg_shell_hook = unsafe { RegisterWindowMessageW(w!("SHELLHOOK")) };
-    LAYOUT_DIRTY.store(false, std::sync::atomic::Ordering::Release);
     LAYOUT_RECHECK_PENDING.store(false, std::sync::atomic::Ordering::Release);
     let uia_scanner = Arc::new(UiaScanner::start());
 
@@ -3152,7 +3182,7 @@ mod tests {
                 .unwrap()
                 .publish(old_target, Some(occupied.clone()))
         );
-        assert_eq!(scanner.snapshot_for(1, bar), Some(occupied.clone()));
+        assert_eq!(scanner.snapshot_for(1, bar).unwrap().rects, occupied);
 
         scanner.request_scan(1, bar, true);
         assert!(scanner.snapshot_for(1, bar).is_none());
@@ -3181,6 +3211,57 @@ mod tests {
         }
         assert!(scanner.snapshot_for(2, bar).is_none());
         assert!(scanner.snapshot_for(1, rect(0, 0, 1920, 48)).is_none());
+    }
+
+    #[test]
+    fn uia_revalidation_preserves_pixels_but_requires_latest_scan_for_input() {
+        let scanner = UiaScanner {
+            state: Arc::new((Mutex::new(UiaShared::default()), Condvar::new())),
+            worker: Mutex::new(None),
+        };
+        let bar = rect(0, 1032, 1920, 1080);
+        let occupied = vec![rect(500, 1032, 1000, 1080)];
+        scanner.request_scan(1, bar, true);
+        let initial = scanner.state.0.lock().unwrap().pending.take().unwrap();
+        assert!(
+            scanner
+                .state
+                .0
+                .lock()
+                .unwrap()
+                .publish(initial, Some(occupied.clone()))
+        );
+        assert!(scanner.snapshot_for(1, bar).unwrap().current);
+
+        scanner.request_scan(1, bar, false);
+        let superseded = scanner.state.0.lock().unwrap().pending.take().unwrap();
+        scanner.request_scan(1, bar, false);
+        let provisional = scanner.snapshot_for(1, bar).unwrap();
+        assert_eq!(provisional.rects, occupied);
+        assert!(!provisional.current);
+        assert!(
+            !scanner
+                .state
+                .0
+                .lock()
+                .unwrap()
+                .publish(superseded, Some(occupied.clone()))
+        );
+        assert!(!scanner.snapshot_for(1, bar).unwrap().current);
+
+        let latest = scanner.state.0.lock().unwrap().pending.take().unwrap();
+        assert!(
+            scanner
+                .state
+                .0
+                .lock()
+                .unwrap()
+                .publish(latest, Some(occupied.clone())),
+            "unchanged occupancy must still wake the window to restore input"
+        );
+        let validated = scanner.snapshot_for(1, bar).unwrap();
+        assert!(validated.current);
+        assert_eq!(validated.rects, occupied);
     }
 
     #[test]
@@ -3237,6 +3318,7 @@ mod tests {
                         tray_hwnd: tray.0 as isize,
                         taskbar_rect: bar,
                         rects: Some(vec![notify]),
+                        generation: 0,
                     },
                     ..Default::default()
                 }),
@@ -3311,7 +3393,7 @@ mod tests {
             EVENT_OBJECT_LOCATIONCHANGE,
             EVENT_OBJECT_SHOW,
         ] {
-            let update = taskbar_event_layout_update(event, true, OBJID_WINDOW.0, 0).unwrap();
+            let update = taskbar_event_layout_update(event, OBJID_WINDOW.0, 0).unwrap();
             ctx.request_layout_scan(update, true);
             ctx.refresh_taskbar_env(&config, &metrics, env, false);
             assert!(
@@ -3327,16 +3409,32 @@ mod tests {
             assert!(is_window_above(hwnd, tray));
         }
 
-        // A real child-layout change still hides until a fresh scan completes.
-        let update =
-            taskbar_event_layout_update(EVENT_OBJECT_LOCATIONCHANGE, false, OBJID_WINDOW.0, 0)
-                .unwrap();
-        ctx.request_layout_scan(update, true);
-        ctx.request_layout_scan(LayoutUpdate::Recheck, true);
-        ctx.refresh_taskbar_env(&config, &metrics, env, false);
-        assert!(!ctx.last_visible);
-        assert_eq!(notifications.load(Ordering::Relaxed), 2);
-        assert!(ctx.uia_scanner.snapshot_for(tray.0 as isize, bar).is_none());
+        // Captured opening/restoring TaskMan: shell creation plus ReBar client
+        // reorder and native task-list location notifications, far from us.
+        // Preserve both pixels and footprint until the entire burst is scanned.
+        let previous_pos = ctx.last_pos;
+        let previous_size = ctx.last_size;
+        let previous_display = ctx.last_display.clone();
+        use windows::Win32::UI::WindowsAndMessaging::OBJID_CLIENT;
+        for (event, object, child) in [
+            (EVENT_OBJECT_REORDER, OBJID_CLIENT.0, 0),
+            (EVENT_OBJECT_LOCATIONCHANGE, OBJID_WINDOW.0, 0),
+            (EVENT_OBJECT_SHOW, OBJID_WINDOW.0, 0),
+            (EVENT_OBJECT_HIDE, OBJID_WINDOW.0, 0),
+        ] {
+            let update = taskbar_event_layout_update(event, object, child).unwrap();
+            ctx.request_layout_scan(update, true);
+            ctx.refresh_taskbar_env(&config, &metrics, env, true);
+            assert!(ctx.last_visible);
+            assert!(
+                !ctx.accepts_input(),
+                "pending occupancy must not steal clicks"
+            );
+            assert_eq!(ctx.last_pos, previous_pos);
+            assert_eq!(ctx.last_size, previous_size);
+            assert_eq!(ctx.last_display, previous_display);
+            assert_eq!(notifications.load(Ordering::Relaxed), 1);
+        }
         {
             let mut state = ctx.uia_scanner.state.0.lock().unwrap();
             let target = state.pending.take().unwrap();
@@ -3344,7 +3442,63 @@ mod tests {
         }
         ctx.refresh_taskbar_env(&config, &metrics, env, false);
         assert!(ctx.last_visible);
+        assert!(ctx.accepts_input());
+        assert_eq!(notifications.load(Ordering::Relaxed), 1);
+
+        // A completed scan that finds no free space still hides immediately.
+        ctx.request_layout_scan(LayoutUpdate::Recheck, true);
+        ctx.refresh_taskbar_env(&config, &metrics, env, false);
+        {
+            let mut state = ctx.uia_scanner.state.0.lock().unwrap();
+            let target = state.pending.take().unwrap();
+            let middle = bar.left + bar.width() / 2;
+            assert!(state.publish(
+                target,
+                Some(vec![
+                    rect(bar.left, bar.top, middle, bar.bottom),
+                    rect(middle, bar.top, bar.right, bar.bottom),
+                ])
+            ));
+        }
+        ctx.refresh_taskbar_env(&config, &metrics, env, false);
+        assert!(!ctx.last_visible);
+        assert_eq!(notifications.load(Ordering::Relaxed), 2);
+
+        // A hidden widget must not reappear on provisional cached data.
+        ctx.request_layout_scan(LayoutUpdate::Recheck, true);
+        ctx.refresh_taskbar_env(&config, &metrics, env, false);
+        assert!(!ctx.last_visible);
+        {
+            let mut state = ctx.uia_scanner.state.0.lock().unwrap();
+            let target = state.pending.take().unwrap();
+            assert!(state.publish(target, Some(vec![notify])));
+        }
+        ctx.refresh_taskbar_env(&config, &metrics, env, false);
+        assert!(ctx.last_visible);
+        assert!(ctx.accepts_input());
         assert_eq!(notifications.load(Ordering::Relaxed), 3);
+
+        // A failed validation clears cached pixels; rechecks cannot revive them.
+        ctx.request_layout_scan(LayoutUpdate::Recheck, true);
+        ctx.refresh_taskbar_env(&config, &metrics, env, false);
+        {
+            let mut state = ctx.uia_scanner.state.0.lock().unwrap();
+            let target = state.pending.take().unwrap();
+            assert!(state.publish(target, None));
+        }
+        ctx.refresh_taskbar_env(&config, &metrics, env, false);
+        assert!(!ctx.last_visible);
+        assert!(!ctx.accepts_input());
+        assert_eq!(notifications.load(Ordering::Relaxed), 4);
+
+        {
+            let mut state = ctx.uia_scanner.state.0.lock().unwrap();
+            let target = state.pending.take().unwrap();
+            assert!(state.publish(target, Some(vec![notify])));
+        }
+        ctx.refresh_taskbar_env(&config, &metrics, env, false);
+        assert!(ctx.last_visible);
+        assert_eq!(notifications.load(Ordering::Relaxed), 5);
 
         // A root-window notification also invalidates if the queried geometry moved.
         let mut moved = env;
@@ -3353,11 +3507,11 @@ mod tests {
         ctx.request_layout_scan(LayoutUpdate::Recheck, true);
         ctx.refresh_taskbar_env(&config, &metrics, moved, false);
         assert!(!ctx.last_visible);
-        assert_eq!(notifications.load(Ordering::Relaxed), 4);
+        assert_eq!(notifications.load(Ordering::Relaxed), 6);
     }
 
     #[test]
-    fn taskbar_event_classification_preserves_real_layout_invalidation() {
+    fn taskbar_layout_hints_recheck_without_discarding_pixels() {
         use windows::Win32::UI::WindowsAndMessaging::OBJID_CLIENT;
         for event in [
             EVENT_OBJECT_SHOW,
@@ -3366,30 +3520,26 @@ mod tests {
             EVENT_OBJECT_REORDER,
         ] {
             assert_eq!(
-                taskbar_event_layout_update(event, true, OBJID_WINDOW.0, 0),
+                taskbar_event_layout_update(event, OBJID_WINDOW.0, 0),
                 Some(LayoutUpdate::Recheck)
-            );
-            assert_eq!(
-                taskbar_event_layout_update(event, false, OBJID_WINDOW.0, 0),
-                Some(LayoutUpdate::Invalidate)
             );
         }
         // Reordering accessible children can change occupancy without changing
         // Shell_TrayWnd's own rectangle (e.g. XAML taskbar button additions).
         assert_eq!(
-            taskbar_event_layout_update(EVENT_OBJECT_REORDER, true, OBJID_CLIENT.0, 0),
-            Some(LayoutUpdate::Invalidate)
+            taskbar_event_layout_update(EVENT_OBJECT_REORDER, OBJID_CLIENT.0, 0),
+            Some(LayoutUpdate::Recheck)
         );
         assert_eq!(
-            taskbar_event_layout_update(EVENT_OBJECT_REORDER, true, OBJID_WINDOW.0, 1),
-            Some(LayoutUpdate::Invalidate)
+            taskbar_event_layout_update(EVENT_OBJECT_REORDER, OBJID_WINDOW.0, 1),
+            Some(LayoutUpdate::Recheck)
         );
         assert_eq!(
-            taskbar_event_layout_update(EVENT_OBJECT_LOCATIONCHANGE, true, OBJID_CLIENT.0, 0),
+            taskbar_event_layout_update(EVENT_OBJECT_LOCATIONCHANGE, OBJID_CLIENT.0, 0),
             None
         );
         assert_eq!(
-            taskbar_event_layout_update(EVENT_SYSTEM_FOREGROUND, true, OBJID_WINDOW.0, 0),
+            taskbar_event_layout_update(EVENT_SYSTEM_FOREGROUND, OBJID_WINDOW.0, 0),
             None
         );
     }
