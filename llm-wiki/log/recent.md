@@ -1,3 +1,29 @@
+## 2026-11-15 — taskbar stats kept visible when Windows 11 Start / Search open
+
+- Investigated user report that taskbar stats disappeared upon opening the
+  Windows 11 Start Menu after the Band-16 change. Confirmed on this host that
+  `CreateWindowInBand(..., 16)` succeeds (`band = 16`), so Start Menu's
+  `Windows.UI.Core.CoreWindow` (`StartMenuExperienceHost.exe`, band 6) is
+  enumerated above `Shell_TrayWnd` (band 1) by `is_rect_occluded_above_taskbar`
+  and becomes `GetForegroundWindow()`. Because Windows 11 UWP shell flyout hosts
+  (`StartMenuExperienceHost.exe`, `SearchHost.exe`, `ShellExperienceHost.exe`,
+  `ShellHost.exe`) use `WS_EX_NOREDIRECTIONBITMAP` DirectComposition
+  transparent canvases rather than `WS_EX_LAYERED | WS_EX_TRANSPARENT`, their
+  HWND rects can span the monitor or overlap the taskbar top edge even though
+  the floating card sits above the taskbar and leaves the stats unobscured.
+- Added `is_non_occluding_shell_host_window` (`is_shell_host_overlay_identity`,
+  verifying class `Windows.UI.Core.CoreWindow` + trusted `%SystemRoot%\SystemApps\`
+  or `%SystemRoot%\System32\ShellHost.exe` path) so Start/Search/tray-flyout
+  `CoreWindow` canvases do not trigger `is_fullscreen_covering_monitor`,
+  `is_fullscreen_window_above_taskbar`, `is_rect_occluded_above_taskbar`, or
+  `sync_topmost_hooks` while real sub-popups (`#32768`, `Xaml_WindowedPopupClass`)
+  still occlude when overlapping. Also updated `TaskbarZOrder` to match
+  `window_band(tray_hwnd)` so Band-1 fallback never anchors against a higher-band
+  window, and added transition-only `tracing::debug!` hide-reason diagnostics
+  (class + frame rect on `true -> false` transitions) plus regression tests
+  `shell_host_overlay_identity_matches_only_trusted_shell_core_windows` and
+  `band1_ensure_just_above_taskbar_ignores_cross_band_topmost_windows`.
+
 ## 2026-11-15 — taskbar focus text flicker fixed cleanly via window band 16
 
 - Confirmed why the async focus-time WinEvent repair (`6a85d20`) still showed a

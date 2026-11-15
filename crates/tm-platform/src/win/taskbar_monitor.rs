@@ -38,7 +38,7 @@ use std::time::{Duration, Instant};
 use tm_core::format::{format_taskbar_pct, format_taskbar_rate};
 use tm_core::settings::{TaskbarColorMode, TaskbarNetUnit};
 use windows::Win32::Foundation::{
-    COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM,
+    COLORREF, CloseHandle, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM,
 };
 use windows::Win32::Graphics::Direct2D::Common::{
     D2D_RECT_F, D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_COLOR_F, D2D1_PIXEL_FORMAT,
@@ -74,7 +74,11 @@ use windows::Win32::System::Com::{
 };
 use windows::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
 use windows::Win32::System::Registry::{HKEY_CURRENT_USER, RRF_RT_REG_DWORD, RegGetValueW};
-use windows::Win32::System::Threading::GetCurrentThreadId;
+use windows::Win32::System::SystemInformation::GetSystemWindowsDirectoryW;
+use windows::Win32::System::Threading::{
+    GetCurrentThreadId, OpenProcess, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
+    QueryFullProcessImageNameW,
+};
 use windows::Win32::System::Variant::VARIANT;
 use windows::Win32::UI::Accessibility::{
     AutomationElementMode_None, CUIAutomation, CUIAutomation8, HWINEVENTHOOK, IUIAutomation,
@@ -116,7 +120,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WM_NULL, WM_RBUTTONUP, WM_SETTINGCHANGE, WM_TIMER, WNDCLASSEXW, WS_CHILD, WS_EX_LAYERED,
     WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
 };
-use windows::core::{BOOL, Interface, PCWSTR, s, w};
+use windows::core::{BOOL, Interface, PCWSTR, PWSTR, s, w};
 
 use crate::taskbar_monitor::{Action, Config, Metrics};
 
@@ -1299,7 +1303,7 @@ impl WindowCtx {
         let Some(env) = env else {
             self.last_env_geom = None;
             self.pending_uia_scan = true;
-            self.set_visible(false);
+            self.hide("env_unavailable_or_fullscreen", None);
             return;
         };
 
@@ -1318,6 +1322,7 @@ impl WindowCtx {
         (!r.is_empty()).then_some(r)
     }
 
+    #[cfg(test)]
     fn ensure_visible_order(&self, tray_hwnd: HWND, target_rect: Option<PixelRect>) -> bool {
         if self.in_elevated_band {
             let Some(rect) = target_rect else {
@@ -1326,6 +1331,31 @@ impl WindowCtx {
             !is_rect_occluded_above_taskbar(tray_hwnd, self.hwnd, rect)
         } else {
             ensure_just_above_taskbar(self.hwnd, tray_hwnd)
+        }
+    }
+
+    fn hide_occluded_if_needed(&mut self, tray_hwnd: HWND, target_rect: Option<PixelRect>) -> bool {
+        if self.in_elevated_band {
+            let Some(rect) = target_rect else {
+                self.hide("missing_target_rect", None);
+                return true;
+            };
+            match check_rect_occluded_above_taskbar(tray_hwnd, self.hwnd, rect) {
+                OcclusionCheck::Clear => false,
+                OcclusionCheck::TrayMissing => {
+                    self.hide("tray_missing_in_enum", None);
+                    true
+                }
+                OcclusionCheck::Occluded(hwnd) => {
+                    self.hide("occluded_above_tray", Some(hwnd));
+                    true
+                }
+            }
+        } else if !ensure_just_above_taskbar(self.hwnd, tray_hwnd) {
+            self.hide("z_order_failed", None);
+            true
+        } else {
+            false
         }
     }
 
@@ -1369,8 +1399,8 @@ impl WindowCtx {
                 self.set_visible(false);
                 return;
             }
-            if self.last_visible && !self.ensure_visible_order(env.tray_hwnd, self.last_rect()) {
-                self.set_visible(false);
+            if self.last_visible && self.hide_occluded_if_needed(env.tray_hwnd, self.last_rect()) {
+                return;
             }
             return;
         }
@@ -1389,9 +1419,8 @@ impl WindowCtx {
                 };
                 uia_occupied.rects.iter().all(|r| !r.intersects(current))
             })
-            && !self.ensure_visible_order(env.tray_hwnd, self.last_rect())
+            && self.hide_occluded_if_needed(env.tray_hwnd, self.last_rect())
         {
-            self.set_visible(false);
             return;
         }
 
@@ -1462,7 +1491,7 @@ impl WindowCtx {
             ) else {
                 // Taskbar is completely full even in compact form: step out of the way
                 // instead of overlapping taskbar buttons or stealing their clicks.
-                self.set_visible(false);
+                self.hide("no_placement_slot", None);
                 return;
             };
             (compact_display, compact_layout, placement)
@@ -1479,11 +1508,18 @@ impl WindowCtx {
             right: x.saturating_add(w),
             bottom: y.saturating_add(h),
         };
-        if self.in_elevated_band
-            && is_rect_occluded_above_taskbar(env.tray_hwnd, self.hwnd, target_rect)
-        {
-            self.set_visible(false);
-            return;
+        if self.in_elevated_band {
+            match check_rect_occluded_above_taskbar(env.tray_hwnd, self.hwnd, target_rect) {
+                OcclusionCheck::Clear => {}
+                OcclusionCheck::TrayMissing => {
+                    self.hide("tray_missing_in_enum", None);
+                    return;
+                }
+                OcclusionCheck::Occluded(hwnd) => {
+                    self.hide("occluded_above_tray", Some(hwnd));
+                    return;
+                }
+            }
         }
         let needs_render = force_render
             || self.last_display.as_ref() != Some(&display)
@@ -1594,6 +1630,15 @@ impl WindowCtx {
                 false
             }
         }
+    }
+
+    fn hide(&mut self, reason: &'static str, detail: Option<HWND>) {
+        if self.last_visible {
+            let class = detail.and_then(read_window_class);
+            let frame = detail.and_then(visible_frame_rect);
+            tracing::debug!(reason, ?class, ?frame, "hiding taskbar monitor");
+        }
+        self.set_visible(false);
     }
 
     fn set_visible(&mut self, visible: bool) -> bool {
@@ -1966,7 +2011,7 @@ unsafe fn is_fullscreen_covering_monitor(
     if fg_mon != taskbar_monitor {
         return false;
     }
-    if is_desktop_shell_class(fg) {
+    if is_desktop_shell_class(fg) || is_non_occluding_shell_host_window(fg) {
         return false;
     }
     if let Ok(state) = unsafe { SHQueryUserNotificationState() }
@@ -2032,7 +2077,11 @@ unsafe extern "system" fn above_taskbar_enum_cb(hwnd: HWND, lparam: LPARAM) -> B
     if unsafe { !IsWindowVisible(hwnd).as_bool() || IsIconic(hwnd).as_bool() } {
         return BOOL(1);
     }
-    if is_desktop_shell_class(hwnd) || is_window_cloaked(hwnd) || is_transparent_overlay(hwnd) {
+    if is_desktop_shell_class(hwnd)
+        || is_non_occluding_shell_host_window(hwnd)
+        || is_window_cloaked(hwnd)
+        || is_transparent_overlay(hwnd)
+    {
         return BOOL(1);
     }
     let mut r = RECT::default();
@@ -2070,13 +2119,16 @@ fn is_fullscreen_window_above_taskbar(
     scan.saw_tray && scan.covered
 }
 
-fn is_desktop_shell_class(hwnd: HWND) -> bool {
+fn read_window_class(hwnd: HWND) -> Option<String> {
     let mut buf = [0u16; 64];
     let len = unsafe { GetClassNameW(hwnd, &mut buf) };
-    if len <= 0 {
+    (len > 0).then(|| String::from_utf16_lossy(&buf[..len as usize]))
+}
+
+fn is_desktop_shell_class(hwnd: HWND) -> bool {
+    let Some(name) = read_window_class(hwnd) else {
         return false;
-    }
-    let name = String::from_utf16_lossy(&buf[..len as usize]);
+    };
     matches!(
         name.as_str(),
         "Progman" | "WorkerW" | "Shell_TrayWnd" | "Shell_SecondaryTrayWnd"
@@ -2084,12 +2136,99 @@ fn is_desktop_shell_class(hwnd: HWND) -> bool {
 }
 
 fn is_tooltip_class(hwnd: HWND) -> bool {
-    let mut buf = [0u16; 64];
-    let len = unsafe { GetClassNameW(hwnd, &mut buf) };
-    if len <= 0 {
+    read_window_class(hwnd).is_some_and(|name| name.eq_ignore_ascii_case("tooltips_class32"))
+}
+
+fn windows_root_dir() -> &'static str {
+    static ROOT: OnceLock<String> = OnceLock::new();
+    ROOT.get_or_init(|| {
+        let mut buf = [0u16; 260];
+        let len = unsafe { GetSystemWindowsDirectoryW(Some(&mut buf)) } as usize;
+        let raw = if len > 0 && len <= buf.len() {
+            String::from_utf16_lossy(&buf[..len])
+        } else {
+            r"C:\Windows".to_string()
+        };
+        raw.replace('/', "\\")
+            .trim_end_matches('\\')
+            .to_ascii_lowercase()
+    })
+}
+
+fn process_image_path(pid: u32) -> Option<String> {
+    if pid == 0 {
+        return None;
+    }
+    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) }.ok()?;
+    let mut buf = [0u16; 520];
+    let mut len = buf.len() as u32;
+    let ok = unsafe {
+        QueryFullProcessImageNameW(
+            handle,
+            PROCESS_NAME_WIN32,
+            PWSTR(buf.as_mut_ptr()),
+            &mut len,
+        )
+    }
+    .is_ok();
+    unsafe {
+        let _ = CloseHandle(handle);
+    }
+    if !ok || len == 0 {
+        return None;
+    }
+    Some(String::from_utf16_lossy(&buf[..len as usize]))
+}
+
+fn is_shell_host_overlay_identity(class_name: &str, image_path: &str, windows_root: &str) -> bool {
+    // Windows 11 Start, Search, and tray flyouts use `Windows.UI.Core.CoreWindow`
+    // hosts backed by `WS_EX_NOREDIRECTIONBITMAP` DirectComposition canvases whose
+    // HWND bounds can span the screen or overlap the taskbar top edge even though
+    // their visible cards float above the taskbar and never occlude taskbar stats.
+    if class_name != "Windows.UI.Core.CoreWindow" {
         return false;
     }
-    String::from_utf16_lossy(&buf[..len as usize]).eq_ignore_ascii_case("tooltips_class32")
+    let root = windows_root
+        .replace('/', "\\")
+        .trim_end_matches('\\')
+        .to_ascii_lowercase();
+    let path = image_path.replace('/', "\\").to_ascii_lowercase();
+    let Some(rel) = path.strip_prefix(&root) else {
+        return false;
+    };
+    if rel == r"\system32\shellhost.exe" {
+        return true;
+    }
+    let Some(app_rel) = rel.strip_prefix(r"\systemapps\") else {
+        return false;
+    };
+    let Some(file) = app_rel.rsplit('\\').next() else {
+        return false;
+    };
+    matches!(
+        file,
+        "startmenuexperiencehost.exe"
+            | "searchhost.exe"
+            | "searchapp.exe"
+            | "shellexperiencehost.exe"
+    )
+}
+
+fn is_non_occluding_shell_host_window(hwnd: HWND) -> bool {
+    let Some(class_name) = read_window_class(hwnd) else {
+        return false;
+    };
+    if class_name != "Windows.UI.Core.CoreWindow" {
+        return false;
+    }
+    let mut pid = 0u32;
+    unsafe {
+        let _ = GetWindowThreadProcessId(hwnd, Some(&mut pid));
+    }
+    let Some(image_path) = process_image_path(pid) else {
+        return false;
+    };
+    is_shell_host_overlay_identity(&class_name, &image_path, windows_root_dir())
 }
 
 fn visible_frame_rect(hwnd: HWND) -> Option<PixelRect> {
@@ -2130,7 +2269,10 @@ fn is_potential_occluder_window(
     if unsafe { !IsWindowVisible(hwnd).as_bool() || IsIconic(hwnd).as_bool() } {
         return false;
     }
-    if is_desktop_shell_class(hwnd) || is_window_cloaked(hwnd) {
+    if is_desktop_shell_class(hwnd)
+        || is_non_occluding_shell_host_window(hwnd)
+        || is_window_cloaked(hwnd)
+    {
         return false;
     }
     is_tooltip_class(hwnd) || !is_transparent_overlay(hwnd)
@@ -2172,7 +2314,7 @@ struct WidgetOcclusionScan {
     desktop_hwnd: HWND,
     shell_hwnd: HWND,
     target_rect: PixelRect,
-    occluded: bool,
+    occluder: Option<HWND>,
     saw_tray: bool,
 }
 
@@ -2188,21 +2330,28 @@ unsafe extern "system" fn widget_occlusion_enum_cb(hwnd: HWND, lparam: LPARAM) -
     if let Some(frame) = visible_frame_rect(hwnd)
         && frame.intersects(scan.target_rect)
     {
-        scan.occluded = true;
+        scan.occluder = Some(hwnd);
         return BOOL(0);
     }
     BOOL(1)
 }
 
-/// Detects visible, uncloaked, non-transparent windows above `tray_hwnd` (such as
-/// popup menus, tray flyouts, tooltips, Start/Search, or always-on-top apps)
-/// whose visible frame overlaps `target_rect`. Used in elevated window band 16
-/// so the widget never floats on top of overlapping shell/app popups.
-fn is_rect_occluded_above_taskbar(tray_hwnd: HWND, own_hwnd: HWND, target_rect: PixelRect) -> bool {
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum OcclusionCheck {
+    Clear,
+    TrayMissing,
+    Occluded(HWND),
+}
+
+fn check_rect_occluded_above_taskbar(
+    tray_hwnd: HWND,
+    own_hwnd: HWND,
+    target_rect: PixelRect,
+) -> OcclusionCheck {
     if target_rect.is_empty()
         || !unsafe { windows::Win32::UI::WindowsAndMessaging::IsWindow(Some(tray_hwnd)).as_bool() }
     {
-        return true;
+        return OcclusionCheck::TrayMissing;
     }
     let mut scan = WidgetOcclusionScan {
         tray_hwnd,
@@ -2210,7 +2359,7 @@ fn is_rect_occluded_above_taskbar(tray_hwnd: HWND, own_hwnd: HWND, target_rect: 
         desktop_hwnd: unsafe { GetDesktopWindow() },
         shell_hwnd: unsafe { GetShellWindow() },
         target_rect,
-        occluded: false,
+        occluder: None,
         saw_tray: false,
     };
     unsafe {
@@ -2219,7 +2368,22 @@ fn is_rect_occluded_above_taskbar(tray_hwnd: HWND, own_hwnd: HWND, target_rect: 
             LPARAM(&mut scan as *mut WidgetOcclusionScan as isize),
         );
     }
-    scan.occluded || !scan.saw_tray
+    if let Some(hwnd) = scan.occluder {
+        OcclusionCheck::Occluded(hwnd)
+    } else if !scan.saw_tray {
+        OcclusionCheck::TrayMissing
+    } else {
+        OcclusionCheck::Clear
+    }
+}
+
+/// Detects visible, uncloaked, non-transparent windows above `tray_hwnd` (such as
+/// popup menus, tooltips, or always-on-top apps) whose visible frame overlaps
+/// `target_rect`. Used in elevated window band 16 so the widget never floats on
+/// top of overlapping popups or always-on-top windows.
+#[cfg(test)]
+fn is_rect_occluded_above_taskbar(tray_hwnd: HWND, own_hwnd: HWND, target_rect: PixelRect) -> bool {
+    check_rect_occluded_above_taskbar(tray_hwnd, own_hwnd, target_rect) != OcclusionCheck::Clear
 }
 
 struct TopmostTidScan<'a> {
@@ -2849,6 +3013,7 @@ struct TaskbarZOrder {
     tray: HWND,
     widget: HWND,
     topmost: bool,
+    tray_band: Option<u32>,
     predecessor: Option<HWND>,
     saw_tray: bool,
     saw_widget: bool,
@@ -2867,6 +3032,7 @@ unsafe extern "system" fn taskbar_z_order_enum_cb(hwnd: HWND, lparam: LPARAM) ->
         && !is_window_cloaked(hwnd)
         && ((unsafe { GetWindowLongPtrW(hwnd, GWL_EXSTYLE) } as u32 & WS_EX_TOPMOST.0) != 0)
             == scan.topmost
+        && (scan.tray_band.is_none() || window_band(hwnd) == scan.tray_band)
     {
         scan.predecessor = Some(hwnd);
         scan.visible_after_widget |= scan.saw_widget;
@@ -2920,6 +3086,7 @@ fn ensure_just_above_taskbar(widget_hwnd: HWND, tray_hwnd: HWND) -> bool {
         tray: tray_hwnd,
         widget: widget_hwnd,
         topmost: tray_topmost,
+        tray_band: window_band(tray_hwnd),
         predecessor: None,
         saw_tray: false,
         saw_widget: false,
@@ -3638,6 +3805,26 @@ mod tests {
                     let _ = DestroyWindow(*hwnd);
                 }
             }
+        }
+    }
+
+    fn create_topmost_test_window(hinstance: HINSTANCE, class_name: PCWSTR) -> HWND {
+        unsafe {
+            CreateWindowExW(
+                WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TOPMOST,
+                class_name,
+                w!("Mock Topmost Test Window"),
+                WS_POPUP,
+                0,
+                0,
+                1,
+                1,
+                None,
+                None,
+                Some(hinstance),
+                None,
+            )
+            .unwrap()
         }
     }
 
@@ -5117,7 +5304,7 @@ mod tests {
         let _com = ComMtaGuard::enter();
         let hinstance = HINSTANCE(unsafe { GetModuleHandleW(None).unwrap() }.0);
         let class_name = register_window_class(hinstance).unwrap();
-        let tray = create_monitor_window(hinstance, class_name, std::ptr::null_mut()).unwrap();
+        let tray = create_topmost_test_window(hinstance, class_name);
         let (hwnd, in_elevated_band) =
             create_elevated_monitor_window(hinstance, class_name, std::ptr::null_mut()).unwrap();
         let _windows = TestWindows(vec![tray, hwnd]);
@@ -5223,7 +5410,7 @@ mod tests {
         let _com = ComMtaGuard::enter();
         let hinstance = HINSTANCE(unsafe { GetModuleHandleW(None).unwrap() }.0);
         let class_name = register_window_class(hinstance).unwrap();
-        let tray = create_monitor_window(hinstance, class_name, std::ptr::null_mut()).unwrap();
+        let tray = create_topmost_test_window(hinstance, class_name);
         let (hwnd, _) =
             create_elevated_monitor_window(hinstance, class_name, std::ptr::null_mut()).unwrap();
         let popup = create_monitor_window(hinstance, class_name, std::ptr::null_mut()).unwrap();
@@ -5375,7 +5562,12 @@ mod tests {
         ctx.refresh_taskbar_env(&config, &metrics, env, false);
         assert!(
             ctx.last_visible,
-            "non-topmost window behind tray must not occlude Band-16 widget"
+            "non-topmost window behind tray must not occlude Band-16 widget \
+             (popup_above_tray={}, tray_ex={:#x}, popup_ex={:#x}, occluded={})",
+            is_window_above(popup, tray),
+            unsafe { GetWindowLongPtrW(tray, GWL_EXSTYLE) },
+            unsafe { GetWindowLongPtrW(popup, GWL_EXSTYLE) },
+            is_rect_occluded_above_taskbar(tray, hwnd, widget_rect),
         );
 
         // Restoring the overlapping topmost popup hides again, and hiding it restores visibility.
@@ -5437,8 +5629,8 @@ mod tests {
         let _com = ComMtaGuard::enter();
         let hinstance = HINSTANCE(unsafe { GetModuleHandleW(None).unwrap() }.0);
         let class_name = register_window_class(hinstance).unwrap();
-        let tray = create_monitor_window(hinstance, class_name, std::ptr::null_mut()).unwrap();
-        let hwnd = create_monitor_window(hinstance, class_name, std::ptr::null_mut()).unwrap();
+        let tray = create_topmost_test_window(hinstance, class_name);
+        let hwnd = create_topmost_test_window(hinstance, class_name);
         let _windows = TestWindows(vec![tray, hwnd]);
 
         unsafe {
@@ -5462,19 +5654,6 @@ mod tests {
                 1920,
                 48,
                 SWP_NOACTIVATE,
-            )
-            .unwrap();
-            // A freshly promoted `!WS_EX_TOPMOST` window can enter below existing
-            // topmost peers on Windows 11; asserting again when already topmost
-            // moves `tray` strictly to the top of Band 1 above `hwnd`.
-            SetWindowPos(
-                tray,
-                Some(HWND_TOPMOST),
-                0,
-                0,
-                0,
-                0,
-                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
             )
             .unwrap();
         }
@@ -5789,5 +5968,119 @@ mod tests {
 
         let _ = cmd_tx.send(BgCmd::Exit);
         let _ = bg_join.join();
+    }
+
+    #[test]
+    fn shell_host_overlay_identity_matches_only_trusted_shell_core_windows() {
+        let root = r"C:\Windows";
+        for path in [
+            r"C:\WINDOWS\SystemApps\Microsoft.Windows.StartMenuExperienceHost_cw5n1h2txyewy\StartMenuExperienceHost.exe",
+            r"C:\Windows\SystemApps\MicrosoftWindows.Client.CBS_cw5n1h2txyewy\SearchHost.exe",
+            r"C:\Windows\SystemApps\Microsoft.Windows.Search_cw5n1h2txyewy\SearchApp.exe",
+            r"C:\Windows\SystemApps\ShellExperienceHost_cw5n1h2txyewy\ShellExperienceHost.exe",
+            r"C:\Windows\System32\ShellHost.exe",
+        ] {
+            assert!(
+                is_shell_host_overlay_identity("Windows.UI.Core.CoreWindow", path, root),
+                "expected CoreWindow overlay exemption for {path}"
+            );
+            assert!(
+                !is_shell_host_overlay_identity("Xaml_WindowedPopupClass", path, root),
+                "popup submenus inside {path} must still participate in occlusion checks"
+            );
+            assert!(
+                !is_shell_host_overlay_identity("#32768", path, root),
+                "classic menus must still participate in occlusion checks"
+            );
+        }
+
+        for untrusted in [
+            r"C:\Users\Julian\StartMenuExperienceHost.exe",
+            r"D:\Windows\SystemApps\Microsoft.Windows.StartMenuExperienceHost_cw5n1h2txyewy\StartMenuExperienceHost.exe",
+            r"C:\Windows\System32\notepad.exe",
+            r"C:\Windows\SystemApps\Evil_pkg\App.exe",
+            r"C:\Program Files\WindowsApps\App\Game.exe",
+        ] {
+            assert!(
+                !is_shell_host_overlay_identity("Windows.UI.Core.CoreWindow", untrusted, root),
+                "untrusted or non-shell image {untrusted} must not be exempted"
+            );
+        }
+    }
+
+    #[test]
+    fn band1_ensure_just_above_taskbar_ignores_cross_band_topmost_windows() {
+        let _zorder = z_order_test_lock();
+        let hinstance = HINSTANCE(unsafe { GetModuleHandleW(None).unwrap() }.0);
+        let class_name = register_window_class(hinstance).unwrap();
+        let tray = create_topmost_test_window(hinstance, class_name);
+        let widget = create_monitor_window(hinstance, class_name, std::ptr::null_mut()).unwrap();
+        let (higher_band_win, elevated) =
+            create_elevated_monitor_window(hinstance, class_name, std::ptr::null_mut()).unwrap();
+        let _windows = TestWindows(vec![tray, widget, higher_band_win]);
+        if !elevated {
+            return;
+        }
+
+        unsafe {
+            let _ = ShowWindow(tray, SW_SHOWNOACTIVATE);
+            SetWindowPos(
+                tray,
+                Some(HWND_TOPMOST),
+                -25_000,
+                -25_000,
+                400,
+                40,
+                SWP_NOACTIVATE,
+            )
+            .unwrap();
+            let _ = ShowWindow(higher_band_win, SW_SHOWNOACTIVATE);
+            SetWindowPos(
+                higher_band_win,
+                Some(HWND_TOPMOST),
+                -25_000,
+                -25_100,
+                400,
+                140,
+                SWP_NOACTIVATE,
+            )
+            .unwrap();
+            let _ = ShowWindow(widget, SW_SHOWNOACTIVATE);
+            SetWindowPos(
+                widget,
+                Some(HWND_TOPMOST),
+                -24_900,
+                -25_000,
+                120,
+                40,
+                SWP_NOACTIVATE,
+            )
+            .unwrap();
+            // Put Band-1 tray above Band-1 widget so repair must choose a Band-1 anchor
+            // without picking `higher_band_win` (band 16) as `insert_after`.
+            SetWindowPos(
+                tray,
+                Some(HWND_TOPMOST),
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE,
+            )
+            .unwrap();
+        }
+
+        assert!(
+            ensure_just_above_taskbar(widget, tray),
+            "cross-band higher window above Band-1 tray must not break Band-1 repair"
+        );
+        assert!(
+            unsafe { IsWindowVisible(widget).as_bool() },
+            "Band-1 widget must stay visible when higher-band window sits above tray"
+        );
+        assert!(
+            is_window_above(widget, tray),
+            "Band-1 widget must remain immediately above Band-1 tray"
+        );
     }
 }

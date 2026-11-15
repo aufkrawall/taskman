@@ -1090,10 +1090,15 @@ rebase runbook.
   standard band 1 (`CreateWindowExW`) with async focus-time Z-order repair. In
   band 16, `is_rect_occluded_above_taskbar` (via `DWMWA_EXTENDED_FRAME_BOUNDS`
   with `GetWindowRect` fallback) hides the widget whenever any visible,
-  uncloaked, non-transparent window above `Shell_TrayWnd` (including menus,
-  flyouts, Start/Search, `tooltips_class32`, or `always_on_top` apps) overlaps
-  its footprint, and `show_context_menu` (`context_menu_anchor`) anchors the
-  right-click popup flush outside the taskbar edge. Layered updates still enter
+  uncloaked, non-transparent window above `Shell_TrayWnd` (including `#32768` /
+  `Xaml_WindowedPopupClass` menus, `tooltips_class32`, or `always_on_top`
+  apps) overlaps its footprint while ignoring `Windows.UI.Core.CoreWindow`
+  overlay canvases owned by verified Windows shell hosts
+  (`StartMenuExperienceHost.exe`, `SearchHost.exe`, `SearchApp.exe`,
+  `ShellExperienceHost.exe`, `ShellHost.exe` via
+  `is_non_occluding_shell_host_window`), and `show_context_menu`
+  (`context_menu_anchor`) anchors the right-click popup flush outside the
+  taskbar edge. Layered updates still enter
   DWM; Independent Flip/MPO selection is not guaranteed by software rendering.
 - **Event-driven fullscreen & auto-hide suppression:** Watches taskbar position,
   `SystemUsesLightTheme` + `ColorPrevalence`/`AccentColor` luminance
@@ -1119,7 +1124,8 @@ rebase runbook.
   holding `Alt+Tab` or another overlay takes foreground while an uncloaked,
   opaque fullscreen window still sits above `Shell_TrayWnd` in Z-order). In the
   band-1 fallback path, Z-order follows `Shell_TrayWnd` using the nearest visible,
-  uncloaked predecessor in its band, without fixed-count window walks or
+  uncloaked same-band predecessor (skipping cross-band windows such as band-6
+  `StartMenuExperienceHost` canvases), without fixed-count window walks or
   manipulating Explorer.
   Invisible bookkeeping windows are not placement anchors: a native probe found
   that taskbar focus can put hidden `ForegroundStaging` immediately above the
