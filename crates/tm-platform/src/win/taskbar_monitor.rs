@@ -1287,6 +1287,9 @@ impl WindowCtx {
         if update == LayoutUpdate::Invalidate {
             self.invalidate_uia_layout = true;
             self.restore_from_cached_layout = false;
+            self.last_display = None;
+            self.last_anchor_slot = None;
+            self.last_compact = false;
         }
         if arm_settle && !self.hwnd.0.is_null() {
             unsafe {
@@ -1818,6 +1821,9 @@ impl WindowCtx {
             self.pending_uia_scan = true;
             self.invalidate_uia_layout = true;
             self.restore_from_cached_layout = false;
+            self.last_display = None;
+            self.last_anchor_slot = None;
+            self.last_compact = false;
         } else if notify_geom_changed {
             self.last_env_geom = Some(geom);
             self.request_layout_scan(LayoutUpdate::Recheck, true);
@@ -1871,6 +1877,7 @@ impl WindowCtx {
         // Only reuse our position while fresh geometry and known controls still
         // leave that rectangle clear; otherwise the placement solver runs first.
         if self.last_visible
+            && self.last_display.is_some()
             && !core_geom_changed
             && !notify_geom_changed
             && self.last_pos.is_some_and(|(x, y)| {
@@ -2087,6 +2094,7 @@ impl WindowCtx {
             {
                 if !self.present_layered(x, y, rw, rh, src_dc) {
                     self.restore_from_cached_layout = false;
+                    self.last_display = None;
                     self.hide("present_failed", None);
                     return;
                 }
@@ -2097,6 +2105,7 @@ impl WindowCtx {
                 self.finish_show(env.tray_hwnd, uia_occupied.current);
             } else {
                 self.restore_from_cached_layout = false;
+                self.last_display = None;
                 self.hide("render_failed", None);
             }
             return;
@@ -3445,23 +3454,32 @@ impl UiaSession {
             root.FindAllBuildCache(TreeScope_Descendants, &self.condition, &self.cache_request)?
         };
         let len = unsafe { found.Length()? };
-        let mut rects = Vec::with_capacity(len.max(0) as usize);
-        for i in 0..len {
-            let Ok(elem) = (unsafe { found.GetElement(i) }) else {
-                continue;
-            };
-            let Ok(rc) = (unsafe { elem.CachedBoundingRectangle() }) else {
-                continue;
-            };
-            let px = PixelRect::from_win32(rc);
-            if !px.is_empty() {
-                rects.push(px);
-            }
-        }
-        rects.sort_unstable_by_key(|r| (r.left, r.top, r.right, r.bottom));
-        rects.dedup();
-        Ok(rects)
+        collect_cached_rects(len, |i| unsafe {
+            let elem = found.GetElement(i)?;
+            elem.CachedBoundingRectangle()
+        })
     }
+}
+
+fn collect_cached_rects<I>(len: i32, mut read_rect: I) -> windows::core::Result<Vec<PixelRect>>
+where
+    I: FnMut(i32) -> windows::core::Result<RECT>,
+{
+    let mut rects = Vec::with_capacity(len.max(0) as usize);
+    for i in 0..len {
+        // Propagate any per-element cache/COM error so a failed rectangle read
+        // triggers `uia_worker_main`'s retry/backoff path instead of publishing
+        // a partial obstacle list that could place the widget over an omitted
+        // taskbar button and intercept its clicks.
+        let rc = read_rect(i)?;
+        let px = PixelRect::from_win32(rc);
+        if !px.is_empty() {
+            rects.push(px);
+        }
+    }
+    rects.sort_unstable_by_key(|r| (r.left, r.top, r.right, r.bottom));
+    rects.dedup();
+    Ok(rects)
 }
 
 #[derive(Default)]
@@ -9150,5 +9168,193 @@ mod tests {
         }
         assert!(REFRESH_PENDING.load(Ordering::Acquire));
         assert!(LAYOUT_RECHECK_PENDING.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn core_geometry_change_remeasures_layout_after_pending_uia_wait() {
+        let _zorder = z_order_test_lock();
+        let _com = ComMtaGuard::enter();
+        let hinstance = HINSTANCE(unsafe { GetModuleHandleW(None).unwrap() }.0);
+        let class_name = register_window_class(hinstance).unwrap();
+        let tray = create_monitor_window(hinstance, class_name, std::ptr::null_mut()).unwrap();
+        let hwnd = create_monitor_window(hinstance, class_name, std::ptr::null_mut()).unwrap();
+        let _windows = TestWindows(vec![tray, hwnd]);
+        let small_bar = rect(-10_000, -10_000, -8_080, -9_970);
+        let notify_initial = rect(-8_300, -10_000, -8_080, -9_952);
+        let env = TaskbarEnv {
+            tray_hwnd: tray,
+            taskbar_rect: small_bar,
+            tray_notify_rect: Some(notify_initial),
+            dpi: 96,
+        };
+        unsafe {
+            SetWindowPos(
+                tray,
+                Some(HWND_TOPMOST),
+                small_bar.left,
+                small_bar.top,
+                small_bar.width(),
+                small_bar.height(),
+                SWP_NOACTIVATE,
+            )
+            .unwrap();
+            let _ = ShowWindow(tray, SW_SHOWNOACTIVATE);
+            SetWindowPos(
+                hwnd,
+                Some(HWND_TOPMOST),
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+            )
+            .unwrap();
+        }
+
+        let config = Config {
+            enabled: true,
+            font_size: 12.0,
+            ..Config::default()
+        };
+        let metrics = Metrics {
+            cpu_pct: Some(25.0),
+            ram_pct: Some(50.0),
+            ..Metrics::default()
+        };
+        let scanner = Arc::new(UiaScanner {
+            state: Arc::new((
+                Mutex::new(UiaShared {
+                    cache: UiaCache {
+                        tray_hwnd: tray.0 as isize,
+                        taskbar_rect: small_bar,
+                        rects: Some(vec![notify_initial]),
+                        generation: 0,
+                    },
+                    ..Default::default()
+                }),
+                Condvar::new(),
+            )),
+            worker: Mutex::new(None),
+        });
+        let mut ctx = WindowCtx {
+            hwnd,
+            in_elevated_band: false,
+            user_closing: false,
+            shared: Arc::new(Mutex::new(SharedState {
+                config: config.clone(),
+                metrics,
+                generation: 0,
+            })),
+            visibility: Arc::new(MonitorVisibility {
+                visible: std::sync::atomic::AtomicBool::new(false),
+                notifier: Arc::new(|| {}),
+            }),
+            callback: Arc::new(|_| {}),
+            renderer: Renderer::new(),
+            uia_scanner: scanner.clone(),
+            light_taskbar: false,
+            hovered: false,
+            tracking_mouse: false,
+            last_display: None,
+            last_size: (0, 0),
+            last_pos: None,
+            last_visible: false,
+            last_present_error: None,
+            last_anchor_slot: None,
+            last_compact: false,
+            last_stacked: false,
+            last_env_geom: Some((tray.0 as isize, small_bar, Some(notify_initial), 96)),
+            pending_uia_scan: false,
+            invalidate_uia_layout: false,
+            restore_from_cached_layout: false,
+            tracked_fg_tid: 0,
+            fg_loc_hook: HWINEVENTHOOK::default(),
+            tracked_fs_tid: 0,
+            fs_loc_hook: HWINEVENTHOOK::default(),
+            fs_lifecycle_hook: HWINEVENTHOOK::default(),
+            fs_cloak_hook: HWINEVENTHOOK::default(),
+            tracked_tray_tid: 0,
+            tray_hook: HWINEVENTHOOK::default(),
+            topmost_hooks: Vec::new(),
+            last_fg_hwnd: 0,
+            fullscreen_recheck_remaining: 0,
+            fullscreen_recheck_armed: false,
+            hidden_by_occlusion: false,
+            hidden_by_tray_missing: false,
+            last_occluded_rect: None,
+            topmost_recheck_armed: false,
+        };
+
+        ctx.refresh_taskbar_env(&config, &metrics, env, false);
+        assert!(ctx.last_visible);
+        let old_size = ctx.last_size;
+
+        // Grow taskbar height from 30 px to 48 px: the first refresh updates
+        // `last_env_geom`, invalidates UIA, and returns early while UIA is pending.
+        let grown_bar = rect(-10_000, -10_000, -8_080, -9_952);
+        let grown_env = TaskbarEnv {
+            taskbar_rect: grown_bar,
+            ..env
+        };
+        ctx.refresh_taskbar_env(&config, &metrics, grown_env, true);
+        assert!(!ctx.last_visible);
+
+        // Once UIA finishes scanning the grown taskbar and triggers `refresh(false)`,
+        // `ctx` must remeasure and rerender for the new 48 px taskbar bounds rather
+        // than reusing the stale 30 px layout size.
+        {
+            let mut state = scanner.state.0.lock().unwrap();
+            let target = state.pending.take().unwrap();
+            assert!(state.publish(target, Some(vec![notify_initial])));
+        }
+        ctx.refresh_taskbar_env(&config, &metrics, grown_env, false);
+        assert!(ctx.last_visible);
+        let display = build_display(&config, &metrics, false, false, 96, false);
+        let expected = ctx
+            .renderer
+            .as_mut()
+            .unwrap()
+            .measure_layout(&display, LayoutBounds::from_taskbar(grown_bar, 96))
+            .unwrap();
+        assert_ne!(old_size, (expected.px_w, expected.px_h));
+        assert_eq!(
+            ctx.last_size,
+            (expected.px_w, expected.px_h),
+            "layout must be remeasured after core taskbar geometry changes across a UIA wait"
+        );
+    }
+
+    #[test]
+    fn collect_cached_rects_propagates_element_error_instead_of_returning_partial_occupancy() {
+        let ok_rects = [
+            RECT {
+                left: -9_900,
+                top: -10_000,
+                right: -9_850,
+                bottom: -9_952,
+            },
+            RECT {
+                left: -8_300,
+                top: -10_000,
+                right: -8_080,
+                bottom: -9_952,
+            },
+        ];
+        let full = collect_cached_rects(2, |i| Ok(ok_rects[i as usize])).unwrap();
+        assert_eq!(full.len(), 2);
+
+        let err = collect_cached_rects(2, |i| {
+            if i == 0 {
+                Err(windows::core::Error::from_hresult(windows::core::HRESULT(
+                    0x80040201u32 as i32,
+                )))
+            } else {
+                Ok(ok_rects[1])
+            }
+        });
+        assert!(
+            err.is_err(),
+            "per-element failure must abort scan rather than publishing a partial obstacle map"
+        );
     }
 }

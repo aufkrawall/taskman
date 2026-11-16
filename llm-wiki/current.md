@@ -1166,8 +1166,9 @@ rebase runbook.
   Per-Monitor V2 thread queries visible interactive UIA elements under
   `Shell_TrayWnd` in a single cached `FindAllBuildCache` RPC (`CUIAutomation8`
   with 150 ms / 250 ms timeouts, `AutomationElementMode_None`, 80 ms burst
-  coalescing, sorted rect diff gating, per-element error skip, and one-time
-  immediate session re-init on first scan error). `solve_taskbar_placement` projects
+  coalescing, sorted rect diff gating, `collect_cached_rects` propagating any
+  per-element error so partial obstacle maps are never published as complete,
+  and one-time immediate session re-init on first scan error). `solve_taskbar_placement` projects
   elements (ignoring `>= 60%` container frames) + `TrayNotifyWnd` into 1D
   intervals, preferring `TrayAdjacent`, falling back with hysteresis to an
   outer-edge-anchored `AlternateGap` (e.g. centered Win11 left space),
@@ -1196,7 +1197,8 @@ rebase runbook.
   revalidation; fresh occupancy relocates or hides the widget before restoring
   interaction. Core
   taskbar/DPI geometry or taskbar identity changes discard the old layout
-  and hide immediately. Stacking-only repair runs in the existing taskbar
+  (`last_display = None`, `last_anchor_slot = None`, `last_compact = false`)
+  and hide immediately so layout bounds are always remeasured once UIA completes. Stacking-only repair runs in the existing taskbar
   foreground/root WinEvent callbacks before posting refresh, without app/UIA
   locks or rendering; it never reveals a hidden widget. Refresh also repairs
   order before text measurement and during revalidation, reconciling native
