@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.1.28 - 2026-11-16
+
 ### Improved
 
 - **Faster taskbar monitor reappearance when Alt+Tabbing out of fullscreen:** Alt+Tabbing or switching away from a fullscreen window now restores the taskbar stats display immediately whenever the taskbar geometry and DPI are unchanged, instead of discarding the cached layout and waiting for a fresh UI Automation scan. The widget reappears click-through (`WS_EX_TRANSPARENT`) on its cached placement while UI Automation verifies taskbar button positions in the background, tracks the suppressing fullscreen window across focus handoff, and runs a short bounded transition check if Windows finishes clearing fullscreen Z-order or D3D state slightly after focus changes. Changed taskbar geometry, failed scans, or a full taskbar still wait for fresh UI Automation confirmation.
