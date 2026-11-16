@@ -1265,30 +1265,29 @@ impl TaskManApp {
         let visible = std::mem::replace(&mut self.painted_last_frame, false);
         let taskbar_active =
             self.shared.settings.taskbar_monitor_enabled && self.taskbar_monitor.is_visible();
-        if visible == self.surface_visible && taskbar_active == self.last_taskbar_interval_active {
+        let Some(transition) = surface_visibility_transition(
+            self.surface_visible,
+            self.last_taskbar_interval_active,
+            visible,
+            taskbar_active,
+            self.shared.settings.update_speed,
+        ) else {
             return;
-        }
-        let vis_changed = visible != self.surface_visible;
-        let taskbar_became_visible = taskbar_active && !self.last_taskbar_interval_active;
+        };
         self.surface_visible = visible;
         self.last_taskbar_interval_active = taskbar_active;
-        if vis_changed {
-            self.engine.set_background(!visible);
+        if let Some(bg) = transition.background {
+            self.engine.set_background(bg);
         }
         // A paused engine is the user's explicit choice and outranks this:
         // it must not start ticking again because the window went away.
-        if let Some(interval) =
-            surface_sampling_interval(visible, taskbar_active, self.shared.settings.update_speed)
-        {
+        if let Some(interval) = transition.set_interval {
             self.engine.set_interval(interval);
         }
-        if (vis_changed && visible)
-            || (taskbar_became_visible
-                && self.shared.settings.update_speed != tm_core::settings::UpdateSpeed::Paused)
-        {
+        if transition.request_refresh {
             self.engine.request_refresh();
         }
-        if vis_changed {
+        if transition.background.is_some() {
             tracing::debug!(visible, "surface visibility changed");
         }
     }
@@ -2089,6 +2088,37 @@ pub(crate) fn history_min_interval_s() -> f64 {
 /// series plots at its real position on the axis instead of being stretched
 /// to fill the window — which is what makes stretching the tick safe here.
 pub(crate) const HIDDEN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SurfaceVisibilityTransition {
+    background: Option<bool>,
+    set_interval: Option<std::time::Duration>,
+    request_refresh: bool,
+}
+
+fn surface_visibility_transition(
+    prev_main: bool,
+    prev_taskbar: bool,
+    main: bool,
+    taskbar: bool,
+    speed: tm_core::settings::UpdateSpeed,
+) -> Option<SurfaceVisibilityTransition> {
+    if main == prev_main && taskbar == prev_taskbar {
+        return None;
+    }
+    let vis_changed = main != prev_main;
+    let prev_interval = surface_sampling_interval(prev_main, prev_taskbar, speed);
+    let next_interval = surface_sampling_interval(main, taskbar, speed);
+    let was_any_visible = prev_main || prev_taskbar;
+    let is_any_visible = main || taskbar;
+    let request_refresh = (vis_changed && main)
+        || (!was_any_visible && is_any_visible && speed != tm_core::settings::UpdateSpeed::Paused);
+    Some(SurfaceVisibilityTransition {
+        background: vis_changed.then_some(!main),
+        set_interval: next_interval.filter(|_| next_interval != prev_interval),
+        request_refresh,
+    })
+}
 
 fn surface_sampling_interval(
     main_visible: bool,
@@ -3047,6 +3077,55 @@ mod tests {
                 None
             );
         }
+
+        // Taskbar toggling while the main window stays visible must neither
+        // re-send `set_interval` nor force an off-schedule `request_refresh`.
+        assert_eq!(
+            surface_visibility_transition(true, false, true, true, UpdateSpeed::Normal),
+            Some(SurfaceVisibilityTransition {
+                background: None,
+                set_interval: None,
+                request_refresh: false,
+            })
+        );
+        assert_eq!(
+            surface_visibility_transition(true, true, true, false, UpdateSpeed::Normal),
+            Some(SurfaceVisibilityTransition {
+                background: None,
+                set_interval: None,
+                request_refresh: false,
+            })
+        );
+
+        // Taskbar appearing when both surfaces were hidden wakes the sampler
+        // from HIDDEN_INTERVAL and requests a fresh sample (unless paused).
+        assert_eq!(
+            surface_visibility_transition(false, false, false, true, UpdateSpeed::Normal),
+            Some(SurfaceVisibilityTransition {
+                background: None,
+                set_interval: Some(UpdateSpeed::Normal.interval()),
+                request_refresh: true,
+            })
+        );
+        assert_eq!(
+            surface_visibility_transition(false, false, false, true, UpdateSpeed::Paused),
+            Some(SurfaceVisibilityTransition {
+                background: None,
+                set_interval: None,
+                request_refresh: false,
+            })
+        );
+
+        // Restoring main window while taskbar was active restores providers
+        // and refreshes without altering an already-active sampling interval.
+        assert_eq!(
+            surface_visibility_transition(false, true, true, true, UpdateSpeed::Normal),
+            Some(SurfaceVisibilityTransition {
+                background: Some(false),
+                set_interval: None,
+                request_refresh: true,
+            })
+        );
     }
 
     /// Regression ("graphs stop updating"): the history was a `VecDeque`

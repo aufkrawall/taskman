@@ -522,6 +522,14 @@ mod tests {
             "—"
         );
         assert_eq!(
+            format_taskbar_rate_in(Some(f64::NAN), false, TaskbarNetUnit::Auto, loc),
+            "—"
+        );
+        assert_eq!(
+            format_taskbar_rate_in(Some(f64::INFINITY), true, TaskbarNetUnit::Auto, loc),
+            "—"
+        );
+        assert_eq!(
             format_taskbar_rate_in(Some(0.0), false, TaskbarNetUnit::FixedMB, loc),
             "0.00 MB/s"
         );
@@ -587,14 +595,10 @@ pub fn format_taskbar_rate_in(
 ) -> String {
     use crate::settings::TaskbarNetUnit;
 
-    let Some(raw) = bps else {
+    let Some(raw) = bps.filter(|v| v.is_finite()) else {
         return "—".into();
     };
-    let bps = if raw.is_finite() && raw > 0.0 {
-        raw
-    } else {
-        0.0
-    };
+    let bps = raw.max(0.0);
 
     if bits {
         let bit_s = bps * 8.0;

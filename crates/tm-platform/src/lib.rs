@@ -431,9 +431,9 @@ pub mod taskbar_monitor {
     impl Metrics {
         pub fn from_snapshot(snap: &tm_core::model::Snapshot) -> Self {
             let ram_pct = if snap.memory.total_bytes > 0 {
-                Some(
-                    (snap.memory.used_bytes as f64 / snap.memory.total_bytes as f64 * 100.0) as f32,
-                )
+                let pct =
+                    (snap.memory.used_bytes as f64 / snap.memory.total_bytes as f64 * 100.0) as f32;
+                pct.is_finite().then_some(pct)
             } else {
                 None
             };
@@ -449,10 +449,14 @@ pub mod taskbar_monitor {
                 recv += n.recv_bps;
             }
             Self {
-                cpu_pct: Some(snap.cpu.utilization_pct),
+                cpu_pct: snap
+                    .cpu
+                    .utilization_pct
+                    .is_finite()
+                    .then_some(snap.cpu.utilization_pct),
                 ram_pct,
-                net_sent_bps: has_net.then_some(sent),
-                net_recv_bps: has_net.then_some(recv),
+                net_sent_bps: (has_net && sent.is_finite()).then_some(sent),
+                net_recv_bps: (has_net && recv.is_finite()).then_some(recv),
             }
         }
     }
@@ -534,6 +538,13 @@ pub mod taskbar_monitor {
             assert_eq!(m2.ram_pct, Some(40.0));
             assert_eq!(m2.net_recv_bps, Some(2000.0));
             assert_eq!(m2.net_sent_bps, Some(500.0));
+
+            snap.cpu.utilization_pct = f32::NAN;
+            snap.networks[1].recv_bps = f64::NAN;
+            let m3 = Metrics::from_snapshot(&snap);
+            assert_eq!(m3.cpu_pct, None);
+            assert_eq!(m3.net_recv_bps, None);
+            assert_eq!(m3.net_sent_bps, Some(500.0));
         }
     }
 }

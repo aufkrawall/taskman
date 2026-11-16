@@ -99,28 +99,29 @@ use windows::Win32::UI::Shell::{
     SHAppBarMessage, SHQueryUserNotificationState,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CS_DBLCLKS, CreatePopupMenu, CreateWindowExW, DeregisterShellHookWindow, DestroyMenu,
-    DestroyWindow, DispatchMessageW, EVENT_OBJECT_CLOAKED, EVENT_OBJECT_DESTROY, EVENT_OBJECT_HIDE,
-    EVENT_OBJECT_LOCATIONCHANGE, EVENT_OBJECT_REORDER, EVENT_OBJECT_SHOW, EVENT_OBJECT_UNCLOAKED,
-    EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_MENUPOPUPEND, EVENT_SYSTEM_MENUPOPUPSTART,
-    EVENT_SYSTEM_MINIMIZEEND, EVENT_SYSTEM_MINIMIZESTART, EVENT_SYSTEM_MOVESIZEEND, EnumWindows,
-    FindWindowExW, FindWindowW, GW_HWNDPREV, GWL_EXSTYLE, GWL_STYLE, GWLP_USERDATA, GetClassNameW,
-    GetCursorPos, GetDesktopWindow, GetForegroundWindow, GetLayeredWindowAttributes, GetMessageW,
-    GetShellWindow, GetWindow, GetWindowLongPtrW, GetWindowRect, GetWindowThreadProcessId, HMENU,
-    HSHELL_WINDOWACTIVATED, HSHELL_WINDOWCREATED, HSHELL_WINDOWDESTROYED, HSHELL_WINDOWREPLACED,
-    HWND_NOTOPMOST, HWND_TOP, HWND_TOPMOST, IDC_ARROW, InsertMenuW, IsChild, IsIconic,
-    IsWindowVisible, KillTimer, LAYERED_WINDOW_ATTRIBUTES_FLAGS, LWA_ALPHA, LoadCursorW,
-    MA_NOACTIVATE, MF_BYPOSITION, MF_SEPARATOR, MF_STRING, MSG, OBJID_WINDOW, PostMessageW,
-    PostQuitMessage, RegisterClassExW, RegisterShellHookWindow, RegisterWindowMessageW, SW_HIDE,
-    SW_SHOWNOACTIVATE, SWP_HIDEWINDOW, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOOWNERZORDER,
-    SWP_NOSENDCHANGING, SWP_NOSIZE, SWP_NOZORDER, SetForegroundWindow, SetMenuDefaultItem,
-    SetTimer, SetWindowLongPtrW, SetWindowPos, ShowWindow, TPM_BOTTOMALIGN, TPM_LEFTALIGN,
-    TPM_RETURNCMD, TPM_RIGHTALIGN, TPM_RIGHTBUTTON, TPM_TOPALIGN, TrackPopupMenuEx,
-    TranslateMessage, ULW_ALPHA, UpdateLayeredWindow, WINEVENT_OUTOFCONTEXT,
-    WINEVENT_SKIPOWNPROCESS, WM_APP, WM_CLOSE, WM_CREATE, WM_DESTROY, WM_DISPLAYCHANGE,
-    WM_DPICHANGED, WM_DWMCOLORIZATIONCOLORCHANGED, WM_LBUTTONUP, WM_MOUSEACTIVATE, WM_MOUSEMOVE,
-    WM_NULL, WM_RBUTTONUP, WM_SETTINGCHANGE, WM_TIMER, WNDCLASSEXW, WS_CHILD, WS_EX_LAYERED,
-    WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
+    CS_DBLCLKS, ChangeWindowMessageFilterEx, CreatePopupMenu, CreateWindowExW,
+    DeregisterShellHookWindow, DestroyMenu, DestroyWindow, DispatchMessageW, EVENT_OBJECT_CLOAKED,
+    EVENT_OBJECT_DESTROY, EVENT_OBJECT_HIDE, EVENT_OBJECT_LOCATIONCHANGE, EVENT_OBJECT_REORDER,
+    EVENT_OBJECT_SHOW, EVENT_OBJECT_UNCLOAKED, EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_MENUPOPUPEND,
+    EVENT_SYSTEM_MENUPOPUPSTART, EVENT_SYSTEM_MINIMIZEEND, EVENT_SYSTEM_MINIMIZESTART,
+    EVENT_SYSTEM_MOVESIZEEND, EnumWindows, FindWindowExW, FindWindowW, GW_HWNDPREV, GWL_EXSTYLE,
+    GWL_STYLE, GWLP_USERDATA, GetClassNameW, GetCursorPos, GetDesktopWindow, GetForegroundWindow,
+    GetLayeredWindowAttributes, GetMessageW, GetShellWindow, GetWindow, GetWindowLongPtrW,
+    GetWindowRect, GetWindowThreadProcessId, HMENU, HSHELL_WINDOWACTIVATED, HSHELL_WINDOWCREATED,
+    HSHELL_WINDOWDESTROYED, HSHELL_WINDOWREPLACED, HWND_NOTOPMOST, HWND_TOP, HWND_TOPMOST,
+    IDC_ARROW, InsertMenuW, IsChild, IsIconic, IsWindowVisible, KillTimer,
+    LAYERED_WINDOW_ATTRIBUTES_FLAGS, LWA_ALPHA, LoadCursorW, MA_NOACTIVATE, MF_BYPOSITION,
+    MF_SEPARATOR, MF_STRING, MSG, MSGFLT_ALLOW, OBJID_WINDOW, PostMessageW, PostQuitMessage,
+    RegisterClassExW, RegisterShellHookWindow, RegisterWindowMessageW, SW_HIDE, SW_SHOWNOACTIVATE,
+    SWP_HIDEWINDOW, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOOWNERZORDER, SWP_NOSENDCHANGING, SWP_NOSIZE,
+    SWP_NOZORDER, SetForegroundWindow, SetMenuDefaultItem, SetTimer, SetWindowLongPtrW,
+    SetWindowPos, ShowWindow, TPM_BOTTOMALIGN, TPM_LEFTALIGN, TPM_RETURNCMD, TPM_RIGHTALIGN,
+    TPM_RIGHTBUTTON, TPM_TOPALIGN, TrackPopupMenuEx, TranslateMessage, ULW_ALPHA,
+    UpdateLayeredWindow, WINEVENT_OUTOFCONTEXT, WINEVENT_SKIPOWNPROCESS, WM_APP, WM_CLOSE,
+    WM_CREATE, WM_DESTROY, WM_DISPLAYCHANGE, WM_DPICHANGED, WM_DWMCOLORIZATIONCOLORCHANGED,
+    WM_LBUTTONUP, WM_MOUSEACTIVATE, WM_MOUSEMOVE, WM_NULL, WM_RBUTTONUP, WM_SETTINGCHANGE,
+    WM_TIMER, WNDCLASSEXW, WS_CHILD, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
+    WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
 };
 use windows::core::{BOOL, Interface, PCWSTR, PWSTR, s, w};
 
@@ -149,7 +150,7 @@ const MIN_ADAPTIVE_FONT_PT: f32 = 6.5;
 // `HSHELL_HIGHBIT | HSHELL_WINDOWACTIVATED`: Windows Shell notification fired
 // when a fullscreen / "rude" app enters or leaves fullscreen focus.
 const HSHELL_RUDEAPPACTIVATED_MSG: u32 = 0x8004;
-// Native Task Manager's band (`ZBID_GENUINE_WINDOWS`), strictly above
+// Native Task Manager's band (`ZBID_SYSTEM_TOOLS`), strictly above
 // `Shell_TrayWnd` in band 1 (`ZBID_DESKTOP`) without Explorer ownership.
 const TASKBAR_MONITOR_BAND: u32 = 16;
 
@@ -203,6 +204,7 @@ static LIVE_HWND: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsiz
 static LIVE_FG_HWND: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
 static LIVE_FS_HWND: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
 static LIVE_TRAY_HWND: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
+static LIVE_OCCLUDER_HWND: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
 static IN_ELEVATED_BAND: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static REFRESH_PENDING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static LAYOUT_RECHECK_PENDING: std::sync::atomic::AtomicBool =
@@ -539,11 +541,29 @@ impl Drop for DibSurface {
     }
 }
 
+struct CachedFormatLayout {
+    family: String,
+    dip_size_bits: u32,
+    fmt: IDWriteTextFormat,
+    up: (f32, f32, Option<IDWriteTextLayout>),
+    down: (f32, f32, Option<IDWriteTextLayout>),
+    cpu_label: (f32, f32, Option<IDWriteTextLayout>),
+    c_label: (f32, f32, Option<IDWriteTextLayout>),
+    ram_label: (f32, f32, Option<IDWriteTextLayout>),
+    r_label: (f32, f32, Option<IDWriteTextLayout>),
+    net_sample: Option<(String, f32)>,
+    sys_val_sample: Option<(String, f32)>,
+}
+
 struct Renderer {
     d2d_factory: ID2D1Factory,
     dwrite_factory: IDWriteFactory,
     dc_rt: ID2D1DCRenderTarget,
     surface: Option<DibSurface>,
+    format_cache: Vec<CachedFormatLayout>,
+    rendering_params: Option<(isize, bool, IDWriteRenderingParams)>,
+    text_brush: Option<([u8; 3], ID2D1SolidColorBrush)>,
+    hover_brush: Option<(bool, ID2D1SolidColorBrush)>,
 }
 
 impl Renderer {
@@ -571,8 +591,16 @@ impl Renderer {
                 dwrite_factory,
                 dc_rt,
                 surface: None,
+                format_cache: Vec::new(),
+                rendering_params: None,
+                text_brush: None,
+                hover_brush: None,
             })
         }
+    }
+
+    fn invalidate_rendering_params(&mut self) {
+        self.rendering_params = None;
     }
 
     fn create_text_format(
@@ -586,7 +614,7 @@ impl Renderer {
             font_family.trim()
         };
         let wide_family: Vec<u16> = family.encode_utf16().chain([0]).collect();
-        let dip_size = (font_size_pt.clamp(7.0, 18.0)) * (96.0 / 72.0);
+        let dip_size = (font_size_pt.clamp(MIN_ADAPTIVE_FONT_PT, 18.0)) * (96.0 / 72.0);
         unsafe {
             let fmt = self
                 .dwrite_factory
@@ -631,14 +659,72 @@ impl Renderer {
         }
     }
 
-    fn apply_text_rendering_params(&self, hwnd: Option<isize>, dpi: u32) {
+    fn cached_format_index(&mut self, font_family: &str, font_size_pt: f32) -> Option<usize> {
+        let family = if font_family.trim().is_empty() {
+            "Segoe UI"
+        } else {
+            font_family.trim()
+        };
+        let dip_size = (font_size_pt.clamp(MIN_ADAPTIVE_FONT_PT, 18.0)) * (96.0 / 72.0);
+        let dip_size_bits = dip_size.to_bits();
+        if let Some(idx) = self
+            .format_cache
+            .iter()
+            .position(|c| c.dip_size_bits == dip_size_bits && c.family == family)
+        {
+            return Some(idx);
+        }
+
+        let fmt = self
+            .create_text_format(family, font_size_pt)
+            .or_else(|| self.create_text_format("Segoe UI", font_size_pt))?;
+        let up = self.measure_text(&fmt, "↑");
+        let down = self.measure_text(&fmt, "↓");
+        let cpu_label = self.measure_text(&fmt, "CPU");
+        let c_label = self.measure_text(&fmt, "C");
+        let ram_label = self.measure_text(&fmt, "RAM");
+        let r_label = self.measure_text(&fmt, "R");
+        if self.format_cache.len() >= 6 {
+            self.format_cache.remove(0);
+        }
+        self.format_cache.push(CachedFormatLayout {
+            family: family.to_string(),
+            dip_size_bits,
+            fmt,
+            up,
+            down,
+            cpu_label,
+            c_label,
+            ram_label,
+            r_label,
+            net_sample: None,
+            sys_val_sample: None,
+        });
+        Some(self.format_cache.len() - 1)
+    }
+
+    fn apply_text_rendering_params(&mut self, hwnd: Option<isize>, dpi: u32) {
+        let monitor_raw = unsafe {
+            MonitorFromWindow(
+                HWND(hwnd.unwrap_or(0) as *mut std::ffi::c_void),
+                MONITOR_DEFAULTTOPRIMARY,
+            )
+        }
+        .0 as isize;
+        let classic = dpi <= 120;
+        if let Some((cached_mon, cached_classic, _)) = &self.rendering_params
+            && *cached_mon == monitor_raw
+            && *cached_classic == classic
+        {
+            return;
+        }
         let params = crate::win::text_rendering::query(hwnd);
         let geom = if params.bgr {
             DWRITE_PIXEL_GEOMETRY_BGR
         } else {
             DWRITE_PIXEL_GEOMETRY_RGB
         };
-        let mode = if dpi <= 120 {
+        let mode = if classic {
             // Grid-fitted classic hinting keeps small taskbar fonts crisp at 100%–125% DPI.
             DWRITE_RENDERING_MODE_GDI_CLASSIC
         } else {
@@ -656,12 +742,13 @@ impl Renderer {
             ) {
                 let rp_base: IDWriteRenderingParams = rp;
                 self.dc_rt.SetTextRenderingParams(&rp_base);
+                self.rendering_params = Some((monitor_raw, classic, rp_base));
             }
         }
     }
 
     fn measure_layout(
-        &self,
+        &mut self,
         display: &RenderedDisplay,
         bounds: LayoutBounds,
     ) -> Option<MeasuredLayout> {
@@ -694,15 +781,14 @@ impl Renderer {
     }
 
     fn measure_layout_at_size(
-        &self,
+        &mut self,
         display: &RenderedDisplay,
         font_size_pt: f32,
         bounds: LayoutBounds,
     ) -> Option<MeasuredLayout> {
         let _ = &self.d2d_factory;
-        let fmt = self
-            .create_text_format(&display.font_family, font_size_pt)
-            .or_else(|| self.create_text_format("Segoe UI", font_size_pt))?;
+        let cache_idx = self.cached_format_index(&display.font_family, font_size_pt)?;
+        let fmt = self.format_cache[cache_idx].fmt.clone();
 
         let has_net = display.show_net && display.net_sent.is_some() && display.net_recv.is_some();
         let has_cpu = display.cpu_label.is_some() && display.cpu_val.is_some();
@@ -713,12 +799,12 @@ impl Renderer {
         }
 
         let (up_w, arrow_h1, up_layout) = if has_net {
-            self.measure_text(&fmt, "↑")
+            self.format_cache[cache_idx].up.clone()
         } else {
             (0.0, 0.0, None)
         };
         let (down_w, arrow_h2, down_layout) = if has_net {
-            self.measure_text(&fmt, "↓")
+            self.format_cache[cache_idx].down.clone()
         } else {
             (0.0, 0.0, None)
         };
@@ -732,10 +818,18 @@ impl Renderer {
             Some(s) if has_net => self.measure_text(&fmt, s),
             _ => (0.0, 0.0, None),
         };
-        let (net_sample_w, _, _) = if has_net {
-            self.measure_text(&fmt, &display.net_sample)
+        let net_sample_w = if has_net {
+            if let Some((cached_s, cached_w)) = &self.format_cache[cache_idx].net_sample
+                && cached_s == &display.net_sample
+            {
+                *cached_w
+            } else {
+                let (w, _, _) = self.measure_text(&fmt, &display.net_sample);
+                self.format_cache[cache_idx].net_sample = Some((display.net_sample.clone(), w));
+                w
+            }
         } else {
-            (0.0, 0.0, None)
+            0.0
         };
         let net_arrow_gap = if has_net {
             if display.compact { 1.0 } else { 1.5 }
@@ -754,6 +848,8 @@ impl Renderer {
         };
 
         let (cpu_lw, cpu_lh, cpu_label_layout) = match display.cpu_label.as_deref() {
+            Some("CPU") => self.format_cache[cache_idx].cpu_label.clone(),
+            Some("C") => self.format_cache[cache_idx].c_label.clone(),
             Some(s) => self.measure_text(&fmt, s),
             None => (0.0, 0.0, None),
         };
@@ -762,6 +858,8 @@ impl Renderer {
             None => (0.0, 0.0, None),
         };
         let (ram_lw, ram_lh, ram_label_layout) = match display.ram_label.as_deref() {
+            Some("RAM") => self.format_cache[cache_idx].ram_label.clone(),
+            Some("R") => self.format_cache[cache_idx].r_label.clone(),
             Some(s) => self.measure_text(&fmt, s),
             None => (0.0, 0.0, None),
         };
@@ -769,10 +867,19 @@ impl Renderer {
             Some(s) => self.measure_text(&fmt, s),
             None => (0.0, 0.0, None),
         };
-        let (sys_val_sample_w, _, _) = if has_sys {
-            self.measure_text(&fmt, &display.sys_val_sample)
+        let sys_val_sample_w = if has_sys {
+            if let Some((cached_s, cached_w)) = &self.format_cache[cache_idx].sys_val_sample
+                && cached_s == &display.sys_val_sample
+            {
+                *cached_w
+            } else {
+                let (w, _, _) = self.measure_text(&fmt, &display.sys_val_sample);
+                self.format_cache[cache_idx].sys_val_sample =
+                    Some((display.sys_val_sample.clone(), w));
+                w
+            }
         } else {
-            (0.0, 0.0, None)
+            0.0
         };
         let sys_label_w = if has_sys { cpu_lw.max(ram_lw) } else { 0.0 };
         let sys_label_gap = if has_sys {
@@ -904,7 +1011,7 @@ impl Renderer {
         if needs_alloc {
             self.surface = DibSurface::new(px_w, px_h);
         }
-        let surface = self.surface.as_ref()?;
+        let surface_hdc = self.surface.as_ref()?.hdc;
 
         let bind_rect = RECT {
             left: 0,
@@ -917,7 +1024,7 @@ impl Renderer {
         self.apply_text_rendering_params(hwnd, display.dpi.max(96));
         unsafe {
             self.dc_rt.SetDpi(dpi_f, dpi_f);
-            self.dc_rt.BindDC(surface.hdc, &bind_rect).ok()?;
+            self.dc_rt.BindDC(surface_hdc, &bind_rect).ok()?;
             self.dc_rt.BeginDraw();
 
             // 1/255 alpha makes the full widget box hit-testable for hover and
@@ -930,22 +1037,33 @@ impl Renderer {
             }));
 
             if display.hovered {
-                let hover_color = if display.light_taskbar {
-                    D2D1_COLOR_F {
-                        r: 0.0,
-                        g: 0.0,
-                        b: 0.0,
-                        a: 0.06,
-                    }
-                } else {
-                    D2D1_COLOR_F {
-                        r: 1.0,
-                        g: 1.0,
-                        b: 1.0,
-                        a: 0.08,
+                let hover_brush = match &self.hover_brush {
+                    Some((light, b)) if *light == display.light_taskbar => Some(b.clone()),
+                    _ => {
+                        let hover_color = if display.light_taskbar {
+                            D2D1_COLOR_F {
+                                r: 0.0,
+                                g: 0.0,
+                                b: 0.0,
+                                a: 0.06,
+                            }
+                        } else {
+                            D2D1_COLOR_F {
+                                r: 1.0,
+                                g: 1.0,
+                                b: 1.0,
+                                a: 0.08,
+                            }
+                        };
+                        self.dc_rt
+                            .CreateSolidColorBrush(&hover_color, None)
+                            .ok()
+                            .inspect(|b| {
+                                self.hover_brush = Some((display.light_taskbar, b.clone()));
+                            })
                     }
                 };
-                if let Ok(hover_brush) = self.dc_rt.CreateSolidColorBrush(&hover_color, None) {
+                if let Some(hover_brush) = hover_brush {
                     let rr = D2D1_ROUNDED_RECT {
                         rect: D2D_RECT_F {
                             left: 0.5,
@@ -960,20 +1078,29 @@ impl Renderer {
                 }
             }
 
-            let text_color = D2D1_COLOR_F {
-                r: f32::from(display.text_rgb[0]) / 255.0,
-                g: f32::from(display.text_rgb[1]) / 255.0,
-                b: f32::from(display.text_rgb[2]) / 255.0,
-                a: 1.0,
-            };
-            let brush: ID2D1SolidColorBrush =
-                match self.dc_rt.CreateSolidColorBrush(&text_color, None) {
-                    Ok(b) => b,
-                    Err(_) => {
-                        let _ = self.dc_rt.EndDraw(None, None);
-                        return None;
+            let brush: ID2D1SolidColorBrush = match &self.text_brush {
+                Some((rgb, b)) if *rgb == display.text_rgb => b.clone(),
+                _ => {
+                    let text_color = D2D1_COLOR_F {
+                        r: f32::from(display.text_rgb[0]) / 255.0,
+                        g: f32::from(display.text_rgb[1]) / 255.0,
+                        b: f32::from(display.text_rgb[2]) / 255.0,
+                        a: 1.0,
+                    };
+                    match self.dc_rt.CreateSolidColorBrush(&text_color, None) {
+                        Ok(b) => {
+                            self.text_brush = Some((display.text_rgb, b.clone()));
+                            b
+                        }
+                        Err(_) => {
+                            let _ = self.dc_rt.EndDraw(None, None);
+                            self.text_brush = None;
+                            self.hover_brush = None;
+                            return None;
+                        }
                     }
-                };
+                }
+            };
 
             let draw_text = |tl: Option<IDWriteTextLayout>, x: f32, y: f32, max_w: f32| {
                 if let Some(tl) = tl {
@@ -1040,9 +1167,12 @@ impl Renderer {
             }
 
             if self.dc_rt.EndDraw(None, None).is_err() {
+                self.text_brush = None;
+                self.hover_brush = None;
+                self.rendering_params = None;
                 return None;
             }
-            Some((px_w, px_h, surface.hdc))
+            Some((px_w, px_h, surface_hdc))
         }
     }
 
@@ -1139,6 +1269,7 @@ struct WindowCtx {
     fullscreen_recheck_remaining: u8,
     fullscreen_recheck_armed: bool,
     hidden_by_occlusion: bool,
+    hidden_by_tray_missing: bool,
     last_occluded_rect: Option<PixelRect>,
     topmost_recheck_armed: bool,
 }
@@ -1173,6 +1304,7 @@ impl WindowCtx {
         LIVE_FG_HWND.store(0, std::sync::atomic::Ordering::Release);
         LIVE_FS_HWND.store(0, std::sync::atomic::Ordering::Release);
         LIVE_TRAY_HWND.store(0, std::sync::atomic::Ordering::Release);
+        LIVE_OCCLUDER_HWND.store(0, std::sync::atomic::Ordering::Release);
         if !self.fg_loc_hook.is_invalid() {
             unsafe {
                 let _ = UnhookWinEvent(self.fg_loc_hook);
@@ -1273,7 +1405,8 @@ impl WindowCtx {
     }
 
     fn sync_topmost_recheck(&mut self) {
-        let should_arm = self.in_elevated_band && (self.last_visible || self.hidden_by_occlusion);
+        let should_arm = self.in_elevated_band
+            && (self.last_visible || self.hidden_by_occlusion || self.hidden_by_tray_missing);
         if should_arm {
             if !self.topmost_recheck_armed && !self.hwnd.0.is_null() {
                 unsafe {
@@ -1291,33 +1424,54 @@ impl WindowCtx {
         }
     }
 
+    fn excluded_topmost_tids(&self) -> [u32; 3] {
+        [
+            unsafe { GetCurrentThreadId() },
+            self.tracked_fg_tid,
+            self.tracked_tray_tid,
+        ]
+    }
+
     fn recheck_topmost_occlusion_with_tray(&mut self, tray_hwnd: HWND) -> bool {
-        if !self.in_elevated_band || (!self.last_visible && !self.hidden_by_occlusion) {
+        if !self.in_elevated_band
+            || (!self.last_visible && !self.hidden_by_occlusion && !self.hidden_by_tray_missing)
+        {
             self.disarm_topmost_recheck();
             return false;
         }
-        self.sync_topmost_hooks(tray_hwnd);
+        if self.hidden_by_tray_missing {
+            self.hidden_by_tray_missing = false;
+            return true;
+        }
+        let probe_rect = if self.last_visible {
+            self.last_rect()
+        } else if self.hidden_by_occlusion {
+            match self.last_occluded_rect.or_else(|| self.last_rect()) {
+                Some(r) => Some(r),
+                None => {
+                    self.hidden_by_occlusion = false;
+                    self.disarm_topmost_recheck();
+                    return true;
+                }
+            }
+        } else {
+            None
+        };
+        let excluded = self.excluded_topmost_tids();
+        let summary = scan_above_tray(tray_hwnd, self.hwnd, None, probe_rect, Some(&excluded));
+        self.sync_topmost_hooks_with_tids(&summary.topmost_tids);
+        let prechecked = probe_rect.zip(summary.occlusion);
         if self.last_visible {
-            let _ = self.hide_occluded_if_needed(tray_hwnd, self.last_rect());
+            let _ = self.hide_occluded_if_needed_cached(tray_hwnd, probe_rect, prechecked);
             return false;
         }
-        if self.hidden_by_occlusion {
-            let Some(rect) = self.last_occluded_rect.or_else(|| self.last_rect()) else {
-                self.hidden_by_occlusion = false;
-                self.disarm_topmost_recheck();
-                return true;
-            };
-            if check_rect_occluded_above_taskbar(tray_hwnd, self.hwnd, rect)
-                == OcclusionCheck::Clear
-            {
-                return true;
-            }
-        }
-        false
+        self.hidden_by_occlusion && summary.occlusion == Some(OcclusionCheck::Clear)
     }
 
     fn recheck_topmost_occlusion(&mut self) {
-        if !self.in_elevated_band || (!self.last_visible && !self.hidden_by_occlusion) {
+        if !self.in_elevated_band
+            || (!self.last_visible && !self.hidden_by_occlusion && !self.hidden_by_tray_missing)
+        {
             self.disarm_topmost_recheck();
             return;
         }
@@ -1401,18 +1555,18 @@ impl WindowCtx {
         }
     }
 
+    #[cfg(test)]
     fn sync_topmost_hooks(&mut self, tray_hwnd: HWND) {
         let target_tids = if self.in_elevated_band && !tray_hwnd.0.is_null() {
-            let excluded = [
-                unsafe { GetCurrentThreadId() },
-                self.tracked_fg_tid,
-                self.tracked_tray_tid,
-            ];
+            let excluded = self.excluded_topmost_tids();
             collect_topmost_occluder_tids(tray_hwnd, self.hwnd, &excluded)
         } else {
             Vec::new()
         };
+        self.sync_topmost_hooks_with_tids(&target_tids);
+    }
 
+    fn sync_topmost_hooks_with_tids(&mut self, target_tids: &[u32]) {
         self.topmost_hooks.retain(|&(tid, hook)| {
             if target_tids.contains(&tid) {
                 true
@@ -1426,7 +1580,7 @@ impl WindowCtx {
             }
         });
 
-        for tid in target_tids {
+        for &tid in target_tids {
             if self
                 .topmost_hooks
                 .iter()
@@ -1461,11 +1615,9 @@ impl WindowCtx {
         if !config.enabled || (!config.show_cpu && !config.show_ram && !config.show_network) {
             self.sync_fullscreen_hook(HWND::default());
             self.disarm_fullscreen_exit_recheck();
-            self.sync_topmost_hooks(HWND::default());
-            self.hidden_by_occlusion = false;
-            self.last_occluded_rect = None;
+            self.sync_topmost_hooks_with_tids(&[]);
             self.restore_from_cached_layout = false;
-            self.set_visible(false);
+            self.hide("disabled", None);
             return;
         }
 
@@ -1474,22 +1626,42 @@ impl WindowCtx {
         self.sync_foreground_hook();
         let tray_hwnd = unsafe { FindWindowW(w!("Shell_TrayWnd"), None) }.unwrap_or_default();
         self.sync_tray_hook(tray_hwnd);
-        self.sync_topmost_hooks(tray_hwnd);
 
         let fg_raw = unsafe { GetForegroundWindow() }.0 as isize;
         let fg_changed = fg_raw != self.last_fg_hwnd;
         self.last_fg_hwnd = fg_raw;
 
-        let env = match probe_taskbar_env(tray_hwnd, self.hwnd) {
-            TaskbarEnvProbe::Ready(env) => {
+        let occlusion_probe = if !self.in_elevated_band {
+            None
+        } else if self.last_visible {
+            self.last_rect()
+        } else if self.hidden_by_occlusion {
+            self.last_occluded_rect.or_else(|| self.last_rect())
+        } else {
+            None
+        };
+        let excluded_tids = self.excluded_topmost_tids();
+
+        let (env, prechecked_occlusion, topmost_tids) = match probe_taskbar_env(
+            tray_hwnd,
+            self.hwnd,
+            occlusion_probe,
+            self.in_elevated_band.then_some(&excluded_tids[..]),
+        ) {
+            TaskbarEnvProbe::Ready {
+                env,
+                prechecked_occlusion,
+                topmost_tids,
+            } => {
                 self.sync_fullscreen_hook(HWND::default());
                 self.disarm_fullscreen_exit_recheck();
-                env
+                (env, prechecked_occlusion, topmost_tids)
             }
             TaskbarEnvProbe::Fullscreen {
                 suppressor,
                 fg_covers_monitor,
             } => {
+                self.sync_topmost_hooks_with_tids(&[]);
                 self.sync_fullscreen_hook(suppressor.unwrap_or_default());
                 if fg_covers_monitor {
                     self.disarm_fullscreen_exit_recheck();
@@ -1515,19 +1687,27 @@ impl WindowCtx {
                 // transient fullscreen suppression so returning to an unchanged
                 // taskbar can reappear immediately while UIA revalidates.
                 self.pending_uia_scan = true;
-                self.hide("env_unavailable_or_fullscreen", None);
+                self.hide("fullscreen", suppressor);
                 return;
             }
-            TaskbarEnvProbe::Unavailable => {
+            TaskbarEnvProbe::Unavailable(reason) => {
+                self.sync_topmost_hooks_with_tids(&[]);
                 self.sync_fullscreen_hook(HWND::default());
                 self.disarm_fullscreen_exit_recheck();
                 self.pending_uia_scan = true;
-                self.hide("env_unavailable_or_fullscreen", None);
+                self.hide(reason, None);
                 return;
             }
         };
 
-        self.refresh_taskbar_env(&config, &metrics, env, force_render);
+        self.sync_topmost_hooks_with_tids(&topmost_tids);
+        self.refresh_taskbar_env_with_occlusion(
+            &config,
+            &metrics,
+            env,
+            force_render,
+            prechecked_occlusion,
+        );
     }
 
     fn last_rect(&self) -> Option<PixelRect> {
@@ -1554,14 +1734,23 @@ impl WindowCtx {
         }
     }
 
-    fn hide_occluded_if_needed(&mut self, tray_hwnd: HWND, target_rect: Option<PixelRect>) -> bool {
+    fn hide_occluded_if_needed_cached(
+        &mut self,
+        tray_hwnd: HWND,
+        target_rect: Option<PixelRect>,
+        prechecked: Option<(PixelRect, OcclusionCheck)>,
+    ) -> bool {
         if self.in_elevated_band {
             let Some(rect) = target_rect else {
                 self.restore_from_cached_layout = false;
                 self.hide("missing_target_rect", None);
                 return true;
             };
-            match check_rect_occluded_above_taskbar(tray_hwnd, self.hwnd, rect) {
+            let check = match prechecked {
+                Some((checked_rect, res)) if checked_rect == rect => res,
+                _ => check_rect_occluded_above_taskbar(tray_hwnd, self.hwnd, rect),
+            };
+            match check {
                 OcclusionCheck::Clear => false,
                 OcclusionCheck::TrayMissing => {
                     self.hide("tray_missing_in_enum", None);
@@ -1582,15 +1771,23 @@ impl WindowCtx {
 
     fn finish_show(&mut self, tray_hwnd: HWND, allow_input: bool) {
         let positioned = self.in_elevated_band || ensure_just_above_taskbar(self.hwnd, tray_hwnd);
+        if !positioned {
+            self.hide("z_order_failed", None);
+            return;
+        }
         let hit_test_ok = self.set_interactive(allow_input);
-        self.set_visible(positioned && hit_test_ok);
         if !hit_test_ok {
             self.restore_from_cached_layout = false;
-        } else if allow_input && self.last_visible {
+            self.hide("hit_test_failed", None);
+            return;
+        }
+        self.set_visible(true);
+        if allow_input && self.last_visible {
             self.restore_from_cached_layout = true;
         }
     }
 
+    #[cfg(test)]
     fn refresh_taskbar_env(
         &mut self,
         config: &Config,
@@ -1598,14 +1795,32 @@ impl WindowCtx {
         env: TaskbarEnv,
         force_render: bool,
     ) {
+        self.refresh_taskbar_env_with_occlusion(config, metrics, env, force_render, None);
+    }
+
+    fn refresh_taskbar_env_with_occlusion(
+        &mut self,
+        config: &Config,
+        metrics: &Metrics,
+        env: TaskbarEnv,
+        force_render: bool,
+        prechecked_occlusion: Option<(PixelRect, OcclusionCheck)>,
+    ) {
         let tray_raw = env.tray_hwnd.0 as isize;
+        let prev_geom = self.last_env_geom;
         let geom = (tray_raw, env.taskbar_rect, env.tray_notify_rect, env.dpi);
-        let geom_changed = self.last_env_geom != Some(geom);
-        if geom_changed {
+        let core_geom_changed = prev_geom
+            .is_none_or(|(t, bar, _, dpi)| (t, bar, dpi) != (tray_raw, env.taskbar_rect, env.dpi));
+        let notify_geom_changed = !core_geom_changed
+            && prev_geom.is_some_and(|(_, _, notify, _)| notify != env.tray_notify_rect);
+        if core_geom_changed {
             self.last_env_geom = Some(geom);
             self.pending_uia_scan = true;
             self.invalidate_uia_layout = true;
             self.restore_from_cached_layout = false;
+        } else if notify_geom_changed {
+            self.last_env_geom = Some(geom);
+            self.request_layout_scan(LayoutUpdate::Recheck, true);
         }
 
         if self.pending_uia_scan {
@@ -1620,29 +1835,33 @@ impl WindowCtx {
             self.uia_scanner
                 .request_scan(tray_raw, env.taskbar_rect, false);
             self.restore_from_cached_layout = false;
-            self.set_visible(false);
+            self.hide("uia_unavailable", None);
             return;
         };
 
         if !uia_occupied.current {
-            if self.last_visible {
+            if self.last_visible && !notify_geom_changed {
                 // A layout hint is not evidence that our pixels collide. Keep
                 // the already presented footprint stable while scanning, but
                 // never intercept a control that may have moved underneath it.
                 if !self.set_interactive(false) {
                     self.restore_from_cached_layout = false;
-                    self.set_visible(false);
+                    self.hide("hit_test_failed", None);
                     return;
                 }
-                let _ = self.hide_occluded_if_needed(env.tray_hwnd, self.last_rect());
+                let _ = self.hide_occluded_if_needed_cached(
+                    env.tray_hwnd,
+                    self.last_rect(),
+                    prechecked_occlusion,
+                );
                 return;
             }
-            if !self.restore_from_cached_layout {
+            if !self.last_visible && !self.restore_from_cached_layout {
                 // Hidden windows without a previously confirmed, geometry-matched
                 // layout (e.g. startup or after `no_placement_slot`) must wait
                 // for fresh UIA validation before appearing.
                 if !self.set_interactive(false) {
-                    self.set_visible(false);
+                    self.hide("hit_test_failed", None);
                 }
                 return;
             }
@@ -1652,7 +1871,8 @@ impl WindowCtx {
         // Only reuse our position while fresh geometry and known controls still
         // leave that rectangle clear; otherwise the placement solver runs first.
         if self.last_visible
-            && !geom_changed
+            && !core_geom_changed
+            && !notify_geom_changed
             && self.last_pos.is_some_and(|(x, y)| {
                 let current = PixelRect {
                     left: x,
@@ -1662,9 +1882,18 @@ impl WindowCtx {
                 };
                 uia_occupied.rects.iter().all(|r| !r.intersects(current))
             })
-            && self.hide_occluded_if_needed(env.tray_hwnd, self.last_rect())
+            && self.hide_occluded_if_needed_cached(
+                env.tray_hwnd,
+                self.last_rect(),
+                prechecked_occlusion,
+            )
         {
             return;
+        }
+
+        if self.hovered && uia_occupied.current && !cursor_inside_window(self.hwnd) {
+            self.hovered = false;
+            self.tracking_mouse = false;
         }
 
         let bounds = LayoutBounds::from_taskbar(env.taskbar_rect, env.dpi);
@@ -1678,18 +1907,92 @@ impl WindowCtx {
         );
         let Some(renderer) = self.renderer.as_mut() else {
             self.restore_from_cached_layout = false;
-            self.set_visible(false);
+            self.hide("no_renderer", None);
             return;
         };
+        if force_render {
+            renderer.invalidate_rendering_params();
+        }
+
+        // Fast path: when display content, DPI, and taskbar bounds are unchanged
+        // in normal (non-compact) mode, reuse the known pixel footprint without
+        // recreating DirectWrite layouts.
+        let cached_normal_placement = if !self.last_compact
+            && !force_render
+            && !core_geom_changed
+            && self.last_display.as_ref() == Some(&normal_display)
+            && self.last_size.0 > 0
+            && self.last_size.1 > 0
+        {
+            solve_taskbar_placement(
+                env.taskbar_rect,
+                env.tray_notify_rect,
+                Some(&uia_occupied.rects),
+                self.last_size,
+                env.dpi,
+                self.last_anchor_slot,
+                false,
+            )
+        } else {
+            None
+        };
+
+        if let Some(placement) = cached_normal_placement {
+            self.last_anchor_slot = Some(placement.slot);
+            self.last_compact = false;
+            let (w, h) = self.last_size;
+            let (x, y) = placement.pos;
+            let target_rect = PixelRect {
+                left: x,
+                top: y,
+                right: x.saturating_add(w),
+                bottom: y.saturating_add(h),
+            };
+            if self.in_elevated_band {
+                let check = match prechecked_occlusion {
+                    Some((checked_rect, res)) if checked_rect == target_rect => res,
+                    _ => check_rect_occluded_above_taskbar(env.tray_hwnd, self.hwnd, target_rect),
+                };
+                match check {
+                    OcclusionCheck::Clear => {}
+                    OcclusionCheck::TrayMissing => {
+                        self.hide("tray_missing_in_enum", None);
+                        return;
+                    }
+                    OcclusionCheck::Occluded(hwnd) => {
+                        self.last_occluded_rect = Some(target_rect);
+                        self.hide("occluded_above_tray", Some(hwnd));
+                        return;
+                    }
+                }
+            }
+            if self.last_pos != Some((x, y)) {
+                unsafe {
+                    let _ = SetWindowPos(
+                        self.hwnd,
+                        None,
+                        x,
+                        y,
+                        w,
+                        h,
+                        SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_NOSENDCHANGING,
+                    );
+                }
+                self.last_pos = Some((x, y));
+            }
+            self.finish_show(env.tray_hwnd, uia_occupied.current);
+            return;
+        }
+
         let Some(normal_layout) = renderer.measure_layout(&normal_display, bounds) else {
             self.restore_from_cached_layout = false;
-            self.set_visible(false);
+            self.hide("measure_failed", None);
             return;
         };
         let normal_size = (normal_layout.px_w, normal_layout.px_h);
 
         let same_footprint = self.last_display.as_ref().is_some_and(|d| {
-            !geom_changed
+            !core_geom_changed
                 && self.last_stacked == normal_layout.stacked
                 && d.show_net == normal_display.show_net
                 && d.cpu_val.is_some() == normal_display.cpu_val.is_some()
@@ -1722,7 +2025,7 @@ impl WindowCtx {
             );
             let Some(compact_layout) = renderer.measure_layout(&compact_display, bounds) else {
                 self.restore_from_cached_layout = false;
-                self.set_visible(false);
+                self.hide("measure_failed", None);
                 return;
             };
             let compact_size = (compact_layout.px_w, compact_layout.px_h);
@@ -1756,7 +2059,11 @@ impl WindowCtx {
             bottom: y.saturating_add(h),
         };
         if self.in_elevated_band {
-            match check_rect_occluded_above_taskbar(env.tray_hwnd, self.hwnd, target_rect) {
+            let check = match prechecked_occlusion {
+                Some((checked_rect, res)) if checked_rect == target_rect => res,
+                _ => check_rect_occluded_above_taskbar(env.tray_hwnd, self.hwnd, target_rect),
+            };
+            match check {
                 OcclusionCheck::Clear => {}
                 OcclusionCheck::TrayMissing => {
                     self.hide("tray_missing_in_enum", None);
@@ -1780,7 +2087,7 @@ impl WindowCtx {
             {
                 if !self.present_layered(x, y, rw, rh, src_dc) {
                     self.restore_from_cached_layout = false;
-                    self.set_visible(false);
+                    self.hide("present_failed", None);
                     return;
                 }
                 self.last_display = Some(display);
@@ -1790,7 +2097,7 @@ impl WindowCtx {
                 self.finish_show(env.tray_hwnd, uia_occupied.current);
             } else {
                 self.restore_from_cached_layout = false;
-                self.set_visible(false);
+                self.hide("render_failed", None);
             }
             return;
         }
@@ -1884,6 +2191,13 @@ impl WindowCtx {
             tracing::debug!(reason, ?class, ?band, ?frame, "hiding taskbar monitor");
         }
         self.hidden_by_occlusion = reason == "occluded_above_tray";
+        self.hidden_by_tray_missing = reason == "tray_missing_in_enum";
+        let occluder_raw = if self.hidden_by_occlusion {
+            detail.map_or(0, |h| h.0 as isize)
+        } else {
+            0
+        };
+        LIVE_OCCLUDER_HWND.store(occluder_raw, std::sync::atomic::Ordering::Release);
         if !self.hidden_by_occlusion {
             self.last_occluded_rect = None;
         } else if self.last_occluded_rect.is_none() {
@@ -1895,12 +2209,15 @@ impl WindowCtx {
     fn set_visible(&mut self, visible: bool) -> bool {
         if visible {
             self.hidden_by_occlusion = false;
+            self.hidden_by_tray_missing = false;
             self.last_occluded_rect = None;
+            LIVE_OCCLUDER_HWND.store(0, std::sync::atomic::Ordering::Release);
         } else {
             self.hovered = false;
             self.tracking_mouse = false;
             if !self.hidden_by_occlusion {
                 self.last_occluded_rect = None;
+                LIVE_OCCLUDER_HWND.store(0, std::sync::atomic::Ordering::Release);
             }
         }
         // The stacking-only WinEvent path can hide a popup whose safe ordering
@@ -2052,6 +2369,13 @@ fn build_display(
     }
 }
 
+fn cursor_inside_window(hwnd: HWND) -> bool {
+    let mut cur = POINT::default();
+    let mut wr = RECT::default();
+    let ok = unsafe { GetCursorPos(&mut cur).is_ok() && GetWindowRect(hwnd, &mut wr).is_ok() };
+    ok && cur.x >= wr.left && cur.x < wr.right && cur.y >= wr.top && cur.y < wr.bottom
+}
+
 #[derive(Clone, Copy)]
 struct TaskbarEnv {
     tray_hwnd: HWND,
@@ -2061,29 +2385,38 @@ struct TaskbarEnv {
 }
 
 enum TaskbarEnvProbe {
-    Ready(TaskbarEnv),
+    Ready {
+        env: TaskbarEnv,
+        prechecked_occlusion: Option<(PixelRect, OcclusionCheck)>,
+        topmost_tids: Vec<u32>,
+    },
     Fullscreen {
         suppressor: Option<HWND>,
         fg_covers_monitor: bool,
     },
-    Unavailable,
+    Unavailable(&'static str),
 }
 
-fn probe_taskbar_env(tray_hwnd: HWND, own_hwnd: HWND) -> TaskbarEnvProbe {
+fn probe_taskbar_env(
+    tray_hwnd: HWND,
+    own_hwnd: HWND,
+    occlusion_probe: Option<PixelRect>,
+    excluded_tids: Option<&[u32]>,
+) -> TaskbarEnvProbe {
     unsafe {
         if tray_hwnd.0.is_null()
             || !IsWindowVisible(tray_hwnd).as_bool()
             || is_window_cloaked(tray_hwnd)
         {
-            return TaskbarEnvProbe::Unavailable;
+            return TaskbarEnvProbe::Unavailable("tray_unavailable");
         }
         let mut tray_r = RECT::default();
         if GetWindowRect(tray_hwnd, &mut tray_r).is_err() {
-            return TaskbarEnvProbe::Unavailable;
+            return TaskbarEnvProbe::Unavailable("tray_unavailable");
         }
         let taskbar_rect = PixelRect::from_win32(tray_r);
         if taskbar_rect.is_empty() {
-            return TaskbarEnvProbe::Unavailable;
+            return TaskbarEnvProbe::Unavailable("tray_unavailable");
         }
 
         let monitor: HMONITOR = MonitorFromWindow(tray_hwnd, MONITOR_DEFAULTTOPRIMARY);
@@ -2092,12 +2425,12 @@ fn probe_taskbar_env(tray_hwnd: HWND, own_hwnd: HWND) -> TaskbarEnvProbe {
             ..Default::default()
         };
         if !windows::Win32::Graphics::Gdi::GetMonitorInfoW(monitor, &mut mi).as_bool() {
-            return TaskbarEnvProbe::Unavailable;
+            return TaskbarEnvProbe::Unavailable("monitor_unavailable");
         }
         let monitor_rect = PixelRect::from_win32(mi.rcMonitor);
 
         if is_taskbar_autohidden(taskbar_rect, monitor_rect) {
-            return TaskbarEnvProbe::Unavailable;
+            return TaskbarEnvProbe::Unavailable("tray_autohidden");
         }
 
         let (fg_fs, fg_covers_monitor, fg_suppressor) =
@@ -2108,9 +2441,15 @@ fn probe_taskbar_env(tray_hwnd: HWND, own_hwnd: HWND) -> TaskbarEnvProbe {
                 fg_covers_monitor: true,
             };
         }
-        if let Some(above_suppressor) =
-            fullscreen_window_above_taskbar(monitor_rect, tray_hwnd, own_hwnd)
-        {
+
+        let summary = scan_above_tray(
+            tray_hwnd,
+            own_hwnd,
+            Some(monitor_rect),
+            occlusion_probe,
+            excluded_tids,
+        );
+        if let Some(above_suppressor) = summary.fullscreen_coverer {
             return TaskbarEnvProbe::Fullscreen {
                 suppressor: Some(above_suppressor),
                 fg_covers_monitor: false,
@@ -2118,7 +2457,7 @@ fn probe_taskbar_env(tray_hwnd: HWND, own_hwnd: HWND) -> TaskbarEnvProbe {
         }
         if fg_fs {
             return TaskbarEnvProbe::Fullscreen {
-                suppressor: None,
+                suppressor: fg_suppressor,
                 fg_covers_monitor: false,
             };
         }
@@ -2135,12 +2474,16 @@ fn probe_taskbar_env(tray_hwnd: HWND, own_hwnd: HWND) -> TaskbarEnvProbe {
         });
 
         let dpi = GetDpiForWindow(tray_hwnd);
-        TaskbarEnvProbe::Ready(TaskbarEnv {
-            tray_hwnd,
-            taskbar_rect,
-            tray_notify_rect,
-            dpi: if dpi == 0 { 96 } else { dpi },
-        })
+        TaskbarEnvProbe::Ready {
+            env: TaskbarEnv {
+                tray_hwnd,
+                taskbar_rect,
+                tray_notify_rect,
+                dpi: if dpi == 0 { 96 } else { dpi },
+            },
+            prechecked_occlusion: occlusion_probe.zip(summary.occlusion),
+            topmost_tids: summary.topmost_tids,
+        }
     }
 }
 
@@ -2184,7 +2527,7 @@ unsafe fn fullscreen_covering_monitor_state(
     if unsafe { !IsWindowVisible(fg).as_bool() || IsIconic(fg).as_bool() } {
         return (false, false, None);
     }
-    if is_window_cloaked(fg) {
+    if is_window_cloaked(fg) || is_transparent_overlay(fg) {
         return (false, false, None);
     }
     let fg_mon = unsafe { MonitorFromWindow(fg, MONITOR_DEFAULTTONULL) };
@@ -2202,10 +2545,14 @@ unsafe fn fullscreen_covering_monitor_state(
     if fg_covers {
         return (true, true, Some(fg));
     }
+    // `SHQueryUserNotificationState` is session-global; only suppress when `fg`
+    // is actually ordered above `tray_hwnd` on this monitor (avoiding false
+    // hides from secondary-monitor D3D/presentations or post-exit QUNS lag).
     if let Ok(state) = unsafe { SHQueryUserNotificationState() }
         && (state == QUNS_RUNNING_D3D_FULL_SCREEN || state == QUNS_PRESENTATION_MODE)
+        && is_window_above(fg, tray_hwnd)
     {
-        return (true, false, None);
+        return (true, false, Some(fg));
     }
     (false, false, None)
 }
@@ -2250,126 +2597,71 @@ fn fullscreen_above_result(saw_tray: bool, tray_band: Option<u32>, covered: bool
     covered && (saw_tray || tray_band.is_some_and(|band| band > 1))
 }
 
-struct AboveTaskbarScan {
-    tray_hwnd: HWND,
-    own_hwnd: HWND,
-    desktop_hwnd: HWND,
-    shell_hwnd: HWND,
-    tray_band: Option<u32>,
-    monitor_rect: PixelRect,
-    covering_hwnd: Option<HWND>,
-    saw_tray: bool,
+struct ClassNameBuf {
+    buf: [u16; 64],
+    len: usize,
 }
 
-unsafe extern "system" fn above_taskbar_enum_cb(hwnd: HWND, lparam: LPARAM) -> BOOL {
-    let scan = unsafe { &mut *(lparam.0 as *mut AboveTaskbarScan) };
-    if hwnd == scan.tray_hwnd {
-        scan.saw_tray = true;
-        return BOOL(0);
+impl ClassNameBuf {
+    fn read(hwnd: HWND) -> Option<Self> {
+        let mut buf = [0u16; 64];
+        let len = unsafe { GetClassNameW(hwnd, &mut buf) };
+        (len > 0).then_some(Self {
+            buf,
+            len: len as usize,
+        })
     }
-    if hwnd == scan.own_hwnd || hwnd == scan.desktop_hwnd || hwnd == scan.shell_hwnd {
-        return BOOL(1);
-    }
-    if unsafe { !IsWindowVisible(hwnd).as_bool() || IsIconic(hwnd).as_bool() } {
-        return BOOL(1);
-    }
-    if is_below_band(hwnd, scan.tray_band)
-        || is_desktop_shell_class(hwnd)
-        || is_non_occluding_shell_host_window(hwnd)
-        || is_window_cloaked(hwnd)
-        || is_transparent_overlay(hwnd)
-    {
-        return BOOL(1);
-    }
-    let mut r = RECT::default();
-    if unsafe { GetWindowRect(hwnd, &mut r) }.is_ok()
-        && PixelRect::from_win32(r).covers(scan.monitor_rect)
-    {
-        scan.covering_hwnd.get_or_insert(hwnd);
-    }
-    BOOL(1)
-}
 
-fn fullscreen_window_above_taskbar_in_band(
-    monitor_rect: PixelRect,
-    tray_hwnd: HWND,
-    own_hwnd: HWND,
-    tray_band: Option<u32>,
-) -> Option<HWND> {
-    let mut scan = AboveTaskbarScan {
-        tray_hwnd,
-        own_hwnd,
-        desktop_hwnd: unsafe { GetDesktopWindow() },
-        shell_hwnd: unsafe { GetShellWindow() },
-        tray_band,
-        monitor_rect,
-        covering_hwnd: None,
-        saw_tray: false,
-    };
-    unsafe {
-        let _ = EnumWindows(
-            Some(above_taskbar_enum_cb),
-            LPARAM(&mut scan as *mut AboveTaskbarScan as isize),
-        );
+    fn slice(&self) -> &[u16] {
+        &self.buf[..self.len]
     }
-    fullscreen_above_result(scan.saw_tray, scan.tray_band, scan.covering_hwnd.is_some())
-        .then_some(scan.covering_hwnd)
-        .flatten()
-}
 
-/// Detects fullscreen windows still sitting above `tray_hwnd` in Z-order even
-/// when they no longer hold foreground focus (e.g. while holding Alt+Tab over
-/// a fullscreen game so the task switcher dialog is foreground above both).
-fn fullscreen_window_above_taskbar(
-    monitor_rect: PixelRect,
-    tray_hwnd: HWND,
-    own_hwnd: HWND,
-) -> Option<HWND> {
-    fullscreen_window_above_taskbar_in_band(
-        monitor_rect,
-        tray_hwnd,
-        own_hwnd,
-        window_band(tray_hwnd),
-    )
-}
+    fn eq_ascii(&self, s: &str) -> bool {
+        self.len == s.len()
+            && self
+                .slice()
+                .iter()
+                .zip(s.bytes())
+                .all(|(&w, b)| w == u16::from(b))
+    }
 
-#[cfg(test)]
-fn is_fullscreen_window_above_taskbar_in_band(
-    monitor_rect: PixelRect,
-    tray_hwnd: HWND,
-    own_hwnd: HWND,
-    tray_band: Option<u32>,
-) -> bool {
-    fullscreen_window_above_taskbar_in_band(monitor_rect, tray_hwnd, own_hwnd, tray_band).is_some()
-}
+    fn eq_ascii_ignore_case(&self, s: &str) -> bool {
+        self.len == s.len()
+            && self
+                .slice()
+                .iter()
+                .zip(s.bytes())
+                .all(|(&w, b)| u8::try_from(w).is_ok_and(|c| c.eq_ignore_ascii_case(&b)))
+    }
 
-#[cfg(test)]
-fn is_fullscreen_window_above_taskbar(
-    monitor_rect: PixelRect,
-    tray_hwnd: HWND,
-    own_hwnd: HWND,
-) -> bool {
-    fullscreen_window_above_taskbar(monitor_rect, tray_hwnd, own_hwnd).is_some()
+    fn to_string_lossy(&self) -> String {
+        String::from_utf16_lossy(self.slice())
+    }
 }
 
 fn read_window_class(hwnd: HWND) -> Option<String> {
-    let mut buf = [0u16; 64];
-    let len = unsafe { GetClassNameW(hwnd, &mut buf) };
-    (len > 0).then(|| String::from_utf16_lossy(&buf[..len as usize]))
+    ClassNameBuf::read(hwnd).map(|c| c.to_string_lossy())
+}
+
+fn is_desktop_shell_class_buf(cls: &ClassNameBuf) -> bool {
+    cls.eq_ascii("Progman")
+        || cls.eq_ascii("WorkerW")
+        || cls.eq_ascii("Shell_TrayWnd")
+        || cls.eq_ascii("Shell_SecondaryTrayWnd")
 }
 
 fn is_desktop_shell_class(hwnd: HWND) -> bool {
-    let Some(name) = read_window_class(hwnd) else {
-        return false;
-    };
-    matches!(
-        name.as_str(),
-        "Progman" | "WorkerW" | "Shell_TrayWnd" | "Shell_SecondaryTrayWnd"
-    )
+    ClassNameBuf::read(hwnd).is_some_and(|c| is_desktop_shell_class_buf(&c))
 }
 
-fn is_tooltip_class(hwnd: HWND) -> bool {
-    read_window_class(hwnd).is_some_and(|name| name.eq_ignore_ascii_case("tooltips_class32"))
+fn is_tooltip_class_buf(cls: &ClassNameBuf) -> bool {
+    cls.eq_ascii_ignore_case("tooltips_class32")
+}
+
+fn is_shell_host_overlay_class_buf(cls: &ClassNameBuf) -> bool {
+    cls.eq_ascii("Windows.UI.Core.CoreWindow")
+        || cls.eq_ascii("XamlExplorerHostIslandWindow")
+        || cls.eq_ascii("MultitaskingViewFrame")
 }
 
 fn windows_root_dir() -> &'static str {
@@ -2455,11 +2747,8 @@ fn is_shell_host_overlay_identity(class_name: &str, image_path: &str, windows_ro
     )
 }
 
-fn is_non_occluding_shell_host_window(hwnd: HWND) -> bool {
-    let Some(class_name) = read_window_class(hwnd) else {
-        return false;
-    };
-    if !is_shell_host_overlay_class(&class_name) {
+fn is_non_occluding_shell_host_with_class(hwnd: HWND, cls: &ClassNameBuf) -> bool {
+    if !is_shell_host_overlay_class_buf(cls) {
         return false;
     }
     let mut pid = 0u32;
@@ -2469,7 +2758,12 @@ fn is_non_occluding_shell_host_window(hwnd: HWND) -> bool {
     let Some(image_path) = process_image_path(pid) else {
         return false;
     };
+    let class_name = cls.to_string_lossy();
     is_shell_host_overlay_identity(&class_name, &image_path, windows_root_dir())
+}
+
+fn is_non_occluding_shell_host_window(hwnd: HWND) -> bool {
+    ClassNameBuf::read(hwnd).is_some_and(|c| is_non_occluding_shell_host_with_class(hwnd, &c))
 }
 
 fn visible_frame_rect(hwnd: HWND) -> Option<PixelRect> {
@@ -2510,13 +2804,16 @@ fn is_potential_occluder_window(
     if unsafe { !IsWindowVisible(hwnd).as_bool() || IsIconic(hwnd).as_bool() } {
         return false;
     }
-    if is_desktop_shell_class(hwnd)
-        || is_non_occluding_shell_host_window(hwnd)
-        || is_window_cloaked(hwnd)
-    {
+    if is_window_cloaked(hwnd) {
         return false;
     }
-    is_tooltip_class(hwnd) || !is_transparent_overlay(hwnd)
+    let Some(cls) = ClassNameBuf::read(hwnd) else {
+        return !is_transparent_overlay(hwnd);
+    };
+    if is_desktop_shell_class_buf(&cls) || is_non_occluding_shell_host_with_class(hwnd, &cls) {
+        return false;
+    }
+    is_tooltip_class_buf(&cls) || !is_transparent_overlay(hwnd)
 }
 
 fn is_topmost_or_elevated_window(hwnd: HWND) -> bool {
@@ -2549,37 +2846,6 @@ fn is_topmost_location_candidate(hwnd: HWND, id_object: i32, id_child: i32) -> b
     is_topmost_or_elevated_window(hwnd)
 }
 
-struct WidgetOcclusionScan {
-    tray_hwnd: HWND,
-    own_hwnd: HWND,
-    desktop_hwnd: HWND,
-    shell_hwnd: HWND,
-    tray_band: Option<u32>,
-    target_rect: PixelRect,
-    occluder: Option<HWND>,
-    saw_tray: bool,
-}
-
-unsafe extern "system" fn widget_occlusion_enum_cb(hwnd: HWND, lparam: LPARAM) -> BOOL {
-    let scan = unsafe { &mut *(lparam.0 as *mut WidgetOcclusionScan) };
-    if hwnd == scan.tray_hwnd {
-        scan.saw_tray = true;
-        return BOOL(0);
-    }
-    if !is_potential_occluder_window(hwnd, scan.own_hwnd, scan.desktop_hwnd, scan.shell_hwnd)
-        || is_below_band(hwnd, scan.tray_band)
-    {
-        return BOOL(1);
-    }
-    if let Some(frame) = visible_frame_rect(hwnd)
-        && frame.intersects(scan.target_rect)
-    {
-        scan.occluder = Some(hwnd);
-        return BOOL(0);
-    }
-    BOOL(1)
-}
-
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum OcclusionCheck {
     Clear,
@@ -2592,43 +2858,247 @@ fn occlusion_result_after_enum(
     tray_band: Option<u32>,
     occluder: Option<HWND>,
 ) -> OcclusionCheck {
-    if let Some(hwnd) = occluder {
-        OcclusionCheck::Occluded(hwnd)
-    } else if !saw_tray && !tray_band.is_some_and(|band| band > 1) {
+    let tray_accounted = saw_tray || tray_band.is_some_and(|band| band > 1);
+    if !tray_accounted {
         OcclusionCheck::TrayMissing
+    } else if let Some(hwnd) = occluder {
+        OcclusionCheck::Occluded(hwnd)
     } else {
         OcclusionCheck::Clear
     }
 }
 
+struct AboveTraySummary {
+    topmost_tids: Vec<u32>,
+    fullscreen_coverer: Option<HWND>,
+    occlusion: Option<OcclusionCheck>,
+}
+
+struct AboveTrayScan<'a> {
+    tray_hwnd: HWND,
+    own_hwnd: HWND,
+    desktop_hwnd: HWND,
+    shell_hwnd: HWND,
+    tray_band: Option<u32>,
+    monitor_rect: Option<PixelRect>,
+    probe_rect: Option<PixelRect>,
+    excluded_tids: Option<&'a [u32]>,
+    topmost_tids: Vec<u32>,
+    fullscreen_coverer: Option<HWND>,
+    occluder: Option<HWND>,
+    saw_tray: bool,
+}
+
+unsafe extern "system" fn above_tray_enum_cb(hwnd: HWND, lparam: LPARAM) -> BOOL {
+    let scan = unsafe { &mut *(lparam.0 as *mut AboveTrayScan<'_>) };
+    if hwnd == scan.tray_hwnd {
+        scan.saw_tray = true;
+        return BOOL(0);
+    }
+    if hwnd == scan.own_hwnd || hwnd == scan.desktop_hwnd || hwnd == scan.shell_hwnd {
+        return BOOL(1);
+    }
+    if unsafe { !IsWindowVisible(hwnd).as_bool() || IsIconic(hwnd).as_bool() } {
+        return BOOL(1);
+    }
+    if is_below_band(hwnd, scan.tray_band) || is_window_cloaked(hwnd) {
+        return BOOL(1);
+    }
+    let cls = ClassNameBuf::read(hwnd);
+    if let Some(ref c) = cls
+        && (is_desktop_shell_class_buf(c) || is_non_occluding_shell_host_with_class(hwnd, c))
+    {
+        return BOOL(1);
+    }
+    let is_tooltip = cls.as_ref().is_some_and(is_tooltip_class_buf);
+    let transparent = is_transparent_overlay(hwnd);
+
+    if let Some(mon_rect) = scan.monitor_rect
+        && scan.fullscreen_coverer.is_none()
+        && !transparent
+    {
+        let mut r = RECT::default();
+        if unsafe { GetWindowRect(hwnd, &mut r) }.is_ok()
+            && PixelRect::from_win32(r).covers(mon_rect)
+        {
+            scan.fullscreen_coverer = Some(hwnd);
+        }
+    }
+
+    if is_tooltip || !transparent {
+        if let Some(excluded) = scan.excluded_tids
+            && is_topmost_or_elevated_window(hwnd)
+        {
+            let tid = unsafe { GetWindowThreadProcessId(hwnd, None) };
+            if tid != 0 && !excluded.contains(&tid) && !scan.topmost_tids.contains(&tid) {
+                scan.topmost_tids.push(tid);
+            }
+        }
+        if let Some(target_rect) = scan.probe_rect
+            && !target_rect.is_empty()
+            && scan.occluder.is_none()
+            && let Some(frame) = visible_frame_rect(hwnd)
+            && frame.intersects(target_rect)
+        {
+            scan.occluder = Some(hwnd);
+        }
+    }
+    BOOL(1)
+}
+
+fn scan_above_tray_in_band(
+    tray_hwnd: HWND,
+    own_hwnd: HWND,
+    tray_band: Option<u32>,
+    monitor_rect: Option<PixelRect>,
+    probe_rect: Option<PixelRect>,
+    excluded_tids: Option<&[u32]>,
+) -> (AboveTraySummary, bool) {
+    if !unsafe { windows::Win32::UI::WindowsAndMessaging::IsWindow(Some(tray_hwnd)).as_bool() } {
+        return (
+            AboveTraySummary {
+                topmost_tids: Vec::new(),
+                fullscreen_coverer: None,
+                occlusion: probe_rect.map(|_| OcclusionCheck::TrayMissing),
+            },
+            false,
+        );
+    }
+    let mut scan = AboveTrayScan {
+        tray_hwnd,
+        own_hwnd,
+        desktop_hwnd: unsafe { GetDesktopWindow() },
+        shell_hwnd: unsafe { GetShellWindow() },
+        tray_band,
+        monitor_rect,
+        probe_rect,
+        excluded_tids,
+        topmost_tids: Vec::new(),
+        fullscreen_coverer: None,
+        occluder: None,
+        saw_tray: false,
+    };
+    unsafe {
+        let _ = EnumWindows(
+            Some(above_tray_enum_cb),
+            LPARAM(&mut scan as *mut AboveTrayScan<'_> as isize),
+        );
+    }
+    let fullscreen_coverer = fullscreen_above_result(
+        scan.saw_tray,
+        scan.tray_band,
+        scan.fullscreen_coverer.is_some(),
+    )
+    .then_some(scan.fullscreen_coverer)
+    .flatten();
+    let occlusion = probe_rect.map(|r| {
+        if r.is_empty() {
+            OcclusionCheck::TrayMissing
+        } else {
+            occlusion_result_after_enum(scan.saw_tray, scan.tray_band, scan.occluder)
+        }
+    });
+    (
+        AboveTraySummary {
+            topmost_tids: scan.topmost_tids,
+            fullscreen_coverer,
+            occlusion,
+        },
+        scan.saw_tray,
+    )
+}
+
+fn scan_above_tray(
+    tray_hwnd: HWND,
+    own_hwnd: HWND,
+    monitor_rect: Option<PixelRect>,
+    probe_rect: Option<PixelRect>,
+    excluded_tids: Option<&[u32]>,
+) -> AboveTraySummary {
+    let initial_band = window_band(tray_hwnd);
+    let (summary, saw_tray) = scan_above_tray_in_band(
+        tray_hwnd,
+        own_hwnd,
+        initial_band,
+        monitor_rect,
+        probe_rect,
+        excluded_tids,
+    );
+    if !saw_tray {
+        let current_band = window_band(tray_hwnd);
+        if current_band != initial_band {
+            return scan_above_tray_in_band(
+                tray_hwnd,
+                own_hwnd,
+                current_band,
+                monitor_rect,
+                probe_rect,
+                excluded_tids,
+            )
+            .0;
+        }
+    }
+    summary
+}
+
+#[cfg(test)]
+fn fullscreen_window_above_taskbar_in_band(
+    monitor_rect: PixelRect,
+    tray_hwnd: HWND,
+    own_hwnd: HWND,
+    tray_band: Option<u32>,
+) -> Option<HWND> {
+    scan_above_tray_in_band(
+        tray_hwnd,
+        own_hwnd,
+        tray_band,
+        Some(monitor_rect),
+        None,
+        None,
+    )
+    .0
+    .fullscreen_coverer
+}
+
+#[cfg(test)]
+fn is_fullscreen_window_above_taskbar_in_band(
+    monitor_rect: PixelRect,
+    tray_hwnd: HWND,
+    own_hwnd: HWND,
+    tray_band: Option<u32>,
+) -> bool {
+    fullscreen_window_above_taskbar_in_band(monitor_rect, tray_hwnd, own_hwnd, tray_band).is_some()
+}
+
+#[cfg(test)]
+fn is_fullscreen_window_above_taskbar(
+    monitor_rect: PixelRect,
+    tray_hwnd: HWND,
+    own_hwnd: HWND,
+) -> bool {
+    scan_above_tray(tray_hwnd, own_hwnd, Some(monitor_rect), None, None)
+        .fullscreen_coverer
+        .is_some()
+}
+
+#[cfg(test)]
 fn check_rect_occluded_above_taskbar_in_band(
     tray_hwnd: HWND,
     own_hwnd: HWND,
     target_rect: PixelRect,
     tray_band: Option<u32>,
 ) -> OcclusionCheck {
-    if target_rect.is_empty()
-        || !unsafe { windows::Win32::UI::WindowsAndMessaging::IsWindow(Some(tray_hwnd)).as_bool() }
-    {
-        return OcclusionCheck::TrayMissing;
-    }
-    let mut scan = WidgetOcclusionScan {
+    scan_above_tray_in_band(
         tray_hwnd,
         own_hwnd,
-        desktop_hwnd: unsafe { GetDesktopWindow() },
-        shell_hwnd: unsafe { GetShellWindow() },
         tray_band,
-        target_rect,
-        occluder: None,
-        saw_tray: false,
-    };
-    unsafe {
-        let _ = EnumWindows(
-            Some(widget_occlusion_enum_cb),
-            LPARAM(&mut scan as *mut WidgetOcclusionScan as isize),
-        );
-    }
-    occlusion_result_after_enum(scan.saw_tray, scan.tray_band, scan.occluder)
+        None,
+        Some(target_rect),
+        None,
+    )
+    .0
+    .occlusion
+    .unwrap_or(OcclusionCheck::TrayMissing)
 }
 
 fn check_rect_occluded_above_taskbar(
@@ -2636,12 +3106,9 @@ fn check_rect_occluded_above_taskbar(
     own_hwnd: HWND,
     target_rect: PixelRect,
 ) -> OcclusionCheck {
-    check_rect_occluded_above_taskbar_in_band(
-        tray_hwnd,
-        own_hwnd,
-        target_rect,
-        window_band(tray_hwnd),
-    )
+    scan_above_tray(tray_hwnd, own_hwnd, None, Some(target_rect), None)
+        .occlusion
+        .unwrap_or(OcclusionCheck::TrayMissing)
 }
 
 /// Detects visible, uncloaked, non-transparent windows above `tray_hwnd` (such as
@@ -2653,51 +3120,9 @@ fn is_rect_occluded_above_taskbar(tray_hwnd: HWND, own_hwnd: HWND, target_rect: 
     check_rect_occluded_above_taskbar(tray_hwnd, own_hwnd, target_rect) != OcclusionCheck::Clear
 }
 
-struct TopmostTidScan<'a> {
-    tray_hwnd: HWND,
-    own_hwnd: HWND,
-    desktop_hwnd: HWND,
-    shell_hwnd: HWND,
-    excluded: &'a [u32],
-    tids: Vec<u32>,
-}
-
-unsafe extern "system" fn topmost_tid_enum_cb(hwnd: HWND, lparam: LPARAM) -> BOOL {
-    let scan = unsafe { &mut *(lparam.0 as *mut TopmostTidScan<'_>) };
-    if hwnd == scan.tray_hwnd {
-        return BOOL(0);
-    }
-    if !is_potential_occluder_window(hwnd, scan.own_hwnd, scan.desktop_hwnd, scan.shell_hwnd)
-        || !is_topmost_or_elevated_window(hwnd)
-    {
-        return BOOL(1);
-    }
-    let tid = unsafe { GetWindowThreadProcessId(hwnd, None) };
-    if tid != 0 && !scan.excluded.contains(&tid) && !scan.tids.contains(&tid) {
-        scan.tids.push(tid);
-    }
-    BOOL(1)
-}
-
+#[cfg(test)]
 fn collect_topmost_occluder_tids(tray_hwnd: HWND, own_hwnd: HWND, excluded: &[u32]) -> Vec<u32> {
-    if !unsafe { windows::Win32::UI::WindowsAndMessaging::IsWindow(Some(tray_hwnd)).as_bool() } {
-        return Vec::new();
-    }
-    let mut scan = TopmostTidScan {
-        tray_hwnd,
-        own_hwnd,
-        desktop_hwnd: unsafe { GetDesktopWindow() },
-        shell_hwnd: unsafe { GetShellWindow() },
-        excluded,
-        tids: Vec::new(),
-    };
-    unsafe {
-        let _ = EnumWindows(
-            Some(topmost_tid_enum_cb),
-            LPARAM(&mut scan as *mut TopmostTidScan<'_> as isize),
-        );
-    }
-    scan.tids
+    scan_above_tray(tray_hwnd, own_hwnd, None, None, Some(excluded)).topmost_tids
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2960,8 +3385,8 @@ impl UiaSession {
             if let Ok(uia2) =
                 CoCreateInstance::<_, IUIAutomation2>(&CUIAutomation8, None, CLSCTX_INPROC_SERVER)
             {
-                let _ = uia2.SetConnectionTimeout(50);
-                let _ = uia2.SetTransactionTimeout(80);
+                let _ = uia2.SetConnectionTimeout(150);
+                let _ = uia2.SetTransactionTimeout(250);
                 uia2.cast()?
             } else {
                 CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER)?
@@ -3022,8 +3447,12 @@ impl UiaSession {
         let len = unsafe { found.Length()? };
         let mut rects = Vec::with_capacity(len.max(0) as usize);
         for i in 0..len {
-            let elem = unsafe { found.GetElement(i)? };
-            let rc = unsafe { elem.CachedBoundingRectangle()? };
+            let Ok(elem) = (unsafe { found.GetElement(i) }) else {
+                continue;
+            };
+            let Ok(rc) = (unsafe { elem.CachedBoundingRectangle() }) else {
+                continue;
+            };
             let px = PixelRect::from_win32(rc);
             if !px.is_empty() {
                 rects.push(px);
@@ -3060,6 +3489,7 @@ struct UiaShared {
     pending: Option<UiaTarget>,
     cache: UiaCache,
     generation: u64,
+    min_valid_generation: u64,
     shutdown: bool,
     consecutive_failures: u32,
     backoff_until: Option<Instant>,
@@ -3095,10 +3525,33 @@ impl UiaShared {
         rects: Option<Vec<PixelRect>>,
         now: Instant,
     ) -> bool {
-        if self.shutdown || target.generation != self.generation {
+        if self.shutdown {
             return false;
         }
         let rects = rects.filter(|r| !r.is_empty());
+        if target.generation != self.generation {
+            // If an in-flight scan started after the latest invalidation/target
+            // change finishes with valid rectangles while `cache.rects` is still
+            // empty (e.g. startup or post-resize burst), populate `cache.rects`
+            // with `target.generation` (`current == false`) instead of starving
+            // the cache across back-to-back recheck requests.
+            let valid_for_current_target = self.last_target
+                == Some((target.tray_hwnd, target.taskbar_rect))
+                && target.generation.wrapping_sub(self.min_valid_generation)
+                    <= self.generation.wrapping_sub(self.min_valid_generation);
+            if valid_for_current_target && self.cache.rects.is_none() && rects.is_some() {
+                self.consecutive_failures = 0;
+                self.backoff_until = None;
+                self.cache = UiaCache {
+                    tray_hwnd: target.tray_hwnd,
+                    taskbar_rect: target.taskbar_rect,
+                    rects,
+                    generation: target.generation,
+                };
+                return true;
+            }
+            return false;
+        }
         let same_target = self.cache.tray_hwnd == target.tray_hwnd
             && self.cache.taskbar_rect == target.taskbar_rect;
         let had_rects_for_target = same_target && self.cache.rects.is_some();
@@ -3200,6 +3653,9 @@ impl UiaScanner {
         // Even a recheck supersedes an in-flight scan. Publishing unchanged
         // rectangles must wake the window so it can restore hit testing.
         guard.generation = guard.generation.wrapping_add(1);
+        if target_changed || invalidate {
+            guard.min_valid_generation = guard.generation;
+        }
         guard.pending = Some(UiaTarget {
             tray_hwnd: tray_raw,
             taskbar_rect,
@@ -3265,21 +3721,49 @@ fn uia_worker_main(state: Arc<(Mutex<UiaShared>, Condvar)>) {
         if session.is_none() {
             session = UiaSession::new().ok();
         }
-        let result = match session.as_ref() {
+        let mut scan_error: Option<windows::core::Error> = None;
+        let mut result = match session.as_ref() {
             Some(s) => match s.scan_tray(target.tray_hwnd) {
                 Ok(rects) => Ok(rects),
-                Err(_) => {
+                Err(err) => {
                     session = None;
+                    scan_error = Some(err);
                     Err(())
                 }
             },
             None => Err(()),
         };
 
+        // If the first attempt hit a transient COM/RPC error while previously
+        // healthy, re-initialize the UIA session and retry once immediately
+        // before clearing the layout cache and entering progressive backoff.
+        if result.is_err() && scan_error.is_some() {
+            let should_retry_immediately = {
+                let guard = state.0.lock().unwrap_or_else(|e| e.into_inner());
+                !guard.shutdown && guard.consecutive_failures == 0 && guard.pending.is_none()
+            };
+            if should_retry_immediately {
+                session = UiaSession::new().ok();
+                if let Some(s) = session.as_ref() {
+                    match s.scan_tray(target.tray_hwnd) {
+                        Ok(rects) => {
+                            scan_error = None;
+                            result = Ok(rects);
+                        }
+                        Err(err) => {
+                            session = None;
+                            scan_error = Some(err);
+                        }
+                    }
+                }
+            }
+        }
+
         let rects = result.ok().filter(|r| !r.is_empty());
         if rects.is_none() {
             if last_failure_report.is_none_or(|at| at.elapsed() >= Duration::from_secs(30)) {
                 tracing::warn!(
+                    error = ?scan_error,
                     "taskbar layout unavailable; monitor hidden until UI Automation recovers"
                 );
                 last_failure_report = Some(Instant::now());
@@ -3298,7 +3782,6 @@ fn uia_worker_main(state: Arc<(Mutex<UiaShared>, Condvar)>) {
     }
 }
 
-#[cfg(test)]
 struct ZOrderScan {
     target: HWND,
     anchor: HWND,
@@ -3306,7 +3789,6 @@ struct ZOrderScan {
     saw_anchor: bool,
 }
 
-#[cfg(test)]
 unsafe extern "system" fn z_order_enum_cb(hwnd: HWND, lparam: LPARAM) -> BOOL {
     let scan = unsafe { &mut *(lparam.0 as *mut ZOrderScan) };
     if hwnd == scan.anchor {
@@ -3319,7 +3801,6 @@ unsafe extern "system" fn z_order_enum_cb(hwnd: HWND, lparam: LPARAM) -> BOOL {
     BOOL(1)
 }
 
-#[cfg(test)]
 fn is_window_above(target: HWND, anchor: HWND) -> bool {
     let mut scan = ZOrderScan {
         target,
@@ -3570,6 +4051,22 @@ unsafe extern "system" fn fg_event_proc(
     _id_event_thread: u32,
     _dwms_event_time: u32,
 ) {
+    if event == EVENT_OBJECT_DESTROY {
+        if id_object != OBJID_WINDOW.0 || id_child != 0 || hwnd.0.is_null() {
+            return;
+        }
+        let raw = hwnd.0 as isize;
+        let is_fs = raw == LIVE_FS_HWND.load(std::sync::atomic::Ordering::Acquire);
+        let is_occluder = raw == LIVE_OCCLUDER_HWND.load(std::sync::atomic::Ordering::Acquire);
+        if !is_fs && !is_occluder {
+            return;
+        }
+        if is_fs {
+            FULLSCREEN_WAKE_PENDING.store(true, std::sync::atomic::Ordering::Release);
+        }
+        post_refresh();
+        return;
+    }
     if matches!(
         event,
         EVENT_OBJECT_SHOW | EVENT_OBJECT_HIDE | EVENT_OBJECT_CLOAKED | EVENT_OBJECT_UNCLOAKED
@@ -3580,12 +4077,11 @@ unsafe extern "system" fn fg_event_proc(
     {
         return;
     }
-    if event == EVENT_SYSTEM_FOREGROUND
-        && hwnd.0 as isize == LIVE_TRAY_HWND.load(std::sync::atomic::Ordering::Acquire)
-    {
+    let tray_raw = LIVE_TRAY_HWND.load(std::sync::atomic::Ordering::Acquire);
+    if event == EVENT_SYSTEM_FOREGROUND && hwnd.0 as isize == tray_raw {
         repair_live_taskbar_order();
     }
-    if event == EVENT_SYSTEM_MOVESIZEEND {
+    if event == EVENT_SYSTEM_MOVESIZEEND && tray_raw != 0 && hwnd.0 as isize == tray_raw {
         LAYOUT_RECHECK_PENDING.store(true, std::sync::atomic::Ordering::Release);
     }
     if matches!(
@@ -3791,7 +4287,7 @@ fn create_elevated_monitor_window(
     class_name: PCWSTR,
     state: *const WndProcState,
 ) -> windows::core::Result<(HWND, bool)> {
-    // Place the widget in `ZBID_GENUINE_WINDOWS` (band 16) so band-1 taskbar
+    // Place the widget in `ZBID_SYSTEM_TOOLS` (band 16) so band-1 taskbar
     // activation cannot raise `Shell_TrayWnd` above it for even a single frame,
     // without touching Explorer ownership or input queues. Fall back cleanly
     // to standard band 1 when `CreateWindowInBand` is unavailable or denied.
@@ -4020,20 +4516,10 @@ fn show_context_menu(state: &WndProcState, hwnd: HWND) {
                 return;
             }
             should_dispatch_action = true;
-            if ctx.hovered {
-                let mut cur = POINT::default();
-                let mut wr = RECT::default();
-                let inside = unsafe { GetCursorPos(&mut cur).is_ok() }
-                    && unsafe { GetWindowRect(hwnd, &mut wr).is_ok() }
-                    && cur.x >= wr.left
-                    && cur.x < wr.right
-                    && cur.y >= wr.top
-                    && cur.y < wr.bottom;
-                if !inside {
-                    ctx.hovered = false;
-                    ctx.tracking_mouse = false;
-                    ctx.refresh(true);
-                }
+            if ctx.hovered && !cursor_inside_window(hwnd) {
+                ctx.hovered = false;
+                ctx.tracking_mouse = false;
+                ctx.refresh(true);
             }
         });
     }
@@ -4216,6 +4702,9 @@ unsafe extern "system" fn wnd_proc(
                     state.reentrant_refresh.set(true);
                 },
                 |ctx| {
+                    if let Some(renderer) = ctx.renderer.as_mut() {
+                        renderer.invalidate_rendering_params();
+                    }
                     ctx.request_layout_scan(LayoutUpdate::Recheck, true);
                     let light = read_taskbar_is_light();
                     if light != ctx.light_taskbar {
@@ -4412,6 +4901,7 @@ fn taskbar_thread_main(
                 fullscreen_recheck_remaining: 0,
                 fullscreen_recheck_armed: false,
                 hidden_by_occlusion: false,
+                hidden_by_tray_missing: false,
                 last_occluded_rect: None,
                 topmost_recheck_armed: false,
             },
@@ -4466,6 +4956,18 @@ fn taskbar_thread_main(
         }
 
         let shell_hook_registered = unsafe { RegisterShellHookWindow(hwnd).as_bool() };
+        for allowed_msg in [
+            msg_taskbar_created,
+            msg_shell_hook,
+            WM_SETTINGCHANGE,
+            WM_DWMCOLORIZATIONCOLORCHANGED,
+        ] {
+            if allowed_msg != 0 {
+                unsafe {
+                    let _ = ChangeWindowMessageFilterEx(hwnd, allowed_msg, MSGFLT_ALLOW, None);
+                }
+            }
+        }
         let install_sys_hook = |min_ev: u32, max_ev: u32| unsafe {
             SetWinEventHook(
                 min_ev,
@@ -4481,7 +4983,7 @@ fn taskbar_thread_main(
         let movesize_hook = install_sys_hook(EVENT_SYSTEM_MOVESIZEEND, EVENT_SYSTEM_MOVESIZEEND);
         let minimize_hook = install_sys_hook(EVENT_SYSTEM_MINIMIZESTART, EVENT_SYSTEM_MINIMIZEEND);
         let menu_hook = install_sys_hook(EVENT_SYSTEM_MENUPOPUPSTART, EVENT_SYSTEM_MENUPOPUPEND);
-        let obj_vis_hook = install_sys_hook(EVENT_OBJECT_SHOW, EVENT_OBJECT_HIDE);
+        let obj_vis_hook = install_sys_hook(EVENT_OBJECT_DESTROY, EVENT_OBJECT_HIDE);
         let cloak_hook = install_sys_hook(EVENT_OBJECT_CLOAKED, EVENT_OBJECT_UNCLOAKED);
 
         state.with_ctx_mut(hwnd, |ctx| ctx.refresh(true));
@@ -4879,6 +5381,7 @@ mod tests {
             fullscreen_recheck_remaining: 0,
             fullscreen_recheck_armed: false,
             hidden_by_occlusion: false,
+            hidden_by_tray_missing: false,
             last_occluded_rect: None,
             topmost_recheck_armed: false,
         };
@@ -6279,6 +6782,7 @@ mod tests {
             fullscreen_recheck_remaining: 0,
             fullscreen_recheck_armed: false,
             hidden_by_occlusion: false,
+            hidden_by_tray_missing: false,
             last_occluded_rect: None,
             topmost_recheck_armed: false,
         };
@@ -6500,6 +7004,7 @@ mod tests {
             fullscreen_recheck_remaining: 0,
             fullscreen_recheck_armed: false,
             hidden_by_occlusion: false,
+            hidden_by_tray_missing: false,
             last_occluded_rect: None,
             topmost_recheck_armed: false,
         };
@@ -6707,6 +7212,7 @@ mod tests {
             fullscreen_recheck_remaining: 0,
             fullscreen_recheck_armed: false,
             hidden_by_occlusion: false,
+            hidden_by_tray_missing: false,
             last_occluded_rect: None,
             topmost_recheck_armed: false,
         };
@@ -7097,6 +7603,7 @@ mod tests {
             fullscreen_recheck_remaining: 0,
             fullscreen_recheck_armed: false,
             hidden_by_occlusion: false,
+            hidden_by_tray_missing: false,
             last_occluded_rect: None,
             topmost_recheck_armed: false,
         };
@@ -7282,6 +7789,7 @@ mod tests {
             fullscreen_recheck_remaining: 0,
             fullscreen_recheck_armed: false,
             hidden_by_occlusion: false,
+            hidden_by_tray_missing: false,
             last_occluded_rect: None,
             topmost_recheck_armed: false,
         };
@@ -7424,6 +7932,7 @@ mod tests {
             fullscreen_recheck_remaining: 0,
             fullscreen_recheck_armed: false,
             hidden_by_occlusion: false,
+            hidden_by_tray_missing: false,
             last_occluded_rect: None,
             topmost_recheck_armed: false,
         };
@@ -7580,6 +8089,7 @@ mod tests {
                 fullscreen_recheck_remaining: 0,
                 fullscreen_recheck_armed: false,
                 hidden_by_occlusion: false,
+                hidden_by_tray_missing: false,
                 last_occluded_rect: None,
                 topmost_recheck_armed: false,
             },
@@ -7824,6 +8334,7 @@ mod tests {
             fullscreen_recheck_remaining: 0,
             fullscreen_recheck_armed: false,
             hidden_by_occlusion: false,
+            hidden_by_tray_missing: false,
             last_occluded_rect: None,
             topmost_recheck_armed: false,
         };
@@ -7949,6 +8460,7 @@ mod tests {
             fullscreen_recheck_remaining: 0,
             fullscreen_recheck_armed: false,
             hidden_by_occlusion: false,
+            hidden_by_tray_missing: false,
             last_occluded_rect: None,
             topmost_recheck_armed: false,
         };
@@ -8118,6 +8630,7 @@ mod tests {
             fullscreen_recheck_remaining: 0,
             fullscreen_recheck_armed: false,
             hidden_by_occlusion: false,
+            hidden_by_tray_missing: false,
             last_occluded_rect: None,
             topmost_recheck_armed: false,
         };
@@ -8193,5 +8706,449 @@ mod tests {
             t1_step + Duration::from_secs(1),
         ));
         assert!(scanner.state.0.lock().unwrap().pending.is_none());
+    }
+
+    #[test]
+    fn tray_notify_resize_repositions_on_cached_layout_without_hiding_or_discarding_uia() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let _zorder = z_order_test_lock();
+        let _com = ComMtaGuard::enter();
+        let hinstance = HINSTANCE(unsafe { GetModuleHandleW(None).unwrap() }.0);
+        let class_name = register_window_class(hinstance).unwrap();
+        let tray = create_monitor_window(hinstance, class_name, std::ptr::null_mut()).unwrap();
+        let hwnd = create_monitor_window(hinstance, class_name, std::ptr::null_mut()).unwrap();
+        let _windows = TestWindows(vec![tray, hwnd]);
+        let bar = rect(-10_000, -10_000, -8_080, -9_952);
+        let notify_initial = rect(-8_300, -10_000, -8_080, -9_952);
+        let env = TaskbarEnv {
+            tray_hwnd: tray,
+            taskbar_rect: bar,
+            tray_notify_rect: Some(notify_initial),
+            dpi: 96,
+        };
+        unsafe {
+            SetWindowPos(
+                tray,
+                Some(HWND_TOPMOST),
+                bar.left,
+                bar.top,
+                bar.width(),
+                bar.height(),
+                SWP_NOACTIVATE,
+            )
+            .unwrap();
+            let _ = ShowWindow(tray, SW_SHOWNOACTIVATE);
+            SetWindowPos(
+                hwnd,
+                Some(HWND_TOPMOST),
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+            )
+            .unwrap();
+        }
+
+        let config = Config {
+            enabled: true,
+            ..Config::default()
+        };
+        let metrics = Metrics {
+            cpu_pct: Some(25.0),
+            ram_pct: Some(50.0),
+            ..Metrics::default()
+        };
+        let notifications = Arc::new(AtomicUsize::new(0));
+        let observed = notifications.clone();
+        let scanner = Arc::new(UiaScanner {
+            state: Arc::new((
+                Mutex::new(UiaShared {
+                    cache: UiaCache {
+                        tray_hwnd: tray.0 as isize,
+                        taskbar_rect: bar,
+                        rects: Some(vec![notify_initial]),
+                        generation: 0,
+                    },
+                    ..Default::default()
+                }),
+                Condvar::new(),
+            )),
+            worker: Mutex::new(None),
+        });
+        let mut ctx = WindowCtx {
+            hwnd,
+            in_elevated_band: false,
+            user_closing: false,
+            shared: Arc::new(Mutex::new(SharedState {
+                config: config.clone(),
+                metrics,
+                generation: 0,
+            })),
+            visibility: Arc::new(MonitorVisibility {
+                visible: std::sync::atomic::AtomicBool::new(false),
+                notifier: Arc::new(move || {
+                    observed.fetch_add(1, Ordering::Relaxed);
+                }),
+            }),
+            callback: Arc::new(|_| {}),
+            renderer: Renderer::new(),
+            uia_scanner: scanner.clone(),
+            light_taskbar: false,
+            hovered: false,
+            tracking_mouse: false,
+            last_display: None,
+            last_size: (0, 0),
+            last_pos: None,
+            last_visible: false,
+            last_present_error: None,
+            last_anchor_slot: None,
+            last_compact: false,
+            last_stacked: false,
+            last_env_geom: Some((tray.0 as isize, bar, Some(notify_initial), 96)),
+            pending_uia_scan: false,
+            invalidate_uia_layout: false,
+            restore_from_cached_layout: false,
+            tracked_fg_tid: 0,
+            fg_loc_hook: HWINEVENTHOOK::default(),
+            tracked_fs_tid: 0,
+            fs_loc_hook: HWINEVENTHOOK::default(),
+            fs_lifecycle_hook: HWINEVENTHOOK::default(),
+            fs_cloak_hook: HWINEVENTHOOK::default(),
+            tracked_tray_tid: 0,
+            tray_hook: HWINEVENTHOOK::default(),
+            topmost_hooks: Vec::new(),
+            last_fg_hwnd: 0,
+            fullscreen_recheck_remaining: 0,
+            fullscreen_recheck_armed: false,
+            hidden_by_occlusion: false,
+            hidden_by_tray_missing: false,
+            last_occluded_rect: None,
+            topmost_recheck_armed: false,
+        };
+
+        ctx.refresh_taskbar_env(&config, &metrics, env, false);
+        assert!(ctx.last_visible);
+        assert!(ctx.accepts_input());
+        assert_eq!(notifications.load(Ordering::Relaxed), 1);
+        let initial_pos = ctx.last_pos.expect("widget must have initial placement");
+
+        // Simulate `TrayNotifyWnd` growing leftward (e.g. IME/privacy indicator appearing
+        // on foreground window switch). The widget must stay visible without a hide/show
+        // transition, slide left immediately using the updated `tray_notify_rect` + cached
+        // UIA rects, and become click-through while the soft UIA recheck is in flight.
+        let notify_expanded = rect(-8_360, -10_000, -8_080, -9_952);
+        let expanded_env = TaskbarEnv {
+            tray_notify_rect: Some(notify_expanded),
+            ..env
+        };
+        ctx.refresh_taskbar_env(&config, &metrics, expanded_env, false);
+        assert!(
+            ctx.last_visible && unsafe { IsWindowVisible(hwnd).as_bool() },
+            "TrayNotifyWnd resize must not hide the taskbar monitor"
+        );
+        assert_eq!(
+            notifications.load(Ordering::Relaxed),
+            1,
+            "TrayNotifyWnd resize must not emit a visibility transition"
+        );
+        let shifted_pos = ctx.last_pos.expect("widget must remain placed");
+        assert!(
+            shifted_pos.0 < initial_pos.0,
+            "expanded TrayNotifyWnd must immediately shift widget left (initial_x={}, shifted_x={})",
+            initial_pos.0,
+            shifted_pos.0
+        );
+        assert!(
+            !ctx.accepts_input(),
+            "widget must be click-through while soft UIA recheck is pending"
+        );
+        assert!(
+            scanner
+                .snapshot_for(tray.0 as isize, bar)
+                .is_some_and(|s| !s.current),
+            "TrayNotifyWnd resize must preserve cached UIA rects during background recheck"
+        );
+
+        // Once the background UIA scan completes, publish wakes refresh and hit-testing is restored.
+        {
+            let mut state = scanner.state.0.lock().unwrap();
+            let target = state.pending.take().unwrap();
+            assert!(state.publish(target, Some(vec![notify_expanded])));
+        }
+        ctx.refresh_taskbar_env(&config, &metrics, expanded_env, false);
+        assert!(ctx.last_visible);
+        assert!(ctx.accepts_input());
+        assert_eq!(notifications.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn uia_superseded_scan_populates_empty_cache_while_keeping_provisional_status() {
+        let scanner = UiaScanner {
+            state: Arc::new((Mutex::new(UiaShared::default()), Condvar::new())),
+            worker: Mutex::new(None),
+        };
+        let bar = rect(-24_000, -24_000, -22_080, -23_952);
+        let t0 = Instant::now();
+
+        // Start from an invalidated cache (`rects = None`).
+        scanner.request_scan(1, bar, true);
+        let target_1 = scanner.state.0.lock().unwrap().pending.take().unwrap();
+
+        // While `target_1` is running on the worker thread, a soft recheck arrives and bumps generation.
+        scanner.request_scan(1, bar, false);
+        let target_2 = scanner.state.0.lock().unwrap().pending.unwrap();
+        assert!(target_2.generation > target_1.generation);
+
+        // When `target_1` finishes with valid rects, `publish_at` must populate the empty
+        // cache immediately and wake refresh, while keeping `current == false` until `target_2` completes.
+        let sample_rects = vec![rect(-22_300, -24_000, -22_080, -23_952)];
+        assert!(scanner.state.0.lock().unwrap().publish_at(
+            target_1,
+            Some(sample_rects.clone()),
+            t0,
+        ));
+        let snap = scanner
+            .snapshot_for(1, bar)
+            .expect("superseded post-invalidation scan must populate empty cache");
+        assert!(!snap.current);
+        assert_eq!(&*snap.rects, &sample_rects[..]);
+
+        // Now complete `target_2`: snapshot becomes current and wakes refresh so hit-testing can be restored.
+        let target_2_taken = scanner.state.0.lock().unwrap().pending.take().unwrap();
+        assert!(scanner.state.0.lock().unwrap().publish_at(
+            target_2_taken,
+            Some(sample_rects),
+            t0 + Duration::from_millis(50),
+        ));
+        assert!(scanner.snapshot_for(1, bar).unwrap().current);
+
+        // Conversely, a scan started BEFORE a hard `invalidate = true` boundary must never
+        // repopulate the invalidated cache.
+        scanner.request_scan(1, bar, false);
+        let pre_inval_target = scanner.state.0.lock().unwrap().pending.take().unwrap();
+        scanner.request_scan(1, bar, true);
+        assert!(!scanner.state.0.lock().unwrap().publish_at(
+            pre_inval_target,
+            Some(vec![rect(-22_300, -24_000, -22_080, -23_952)]),
+            t0 + Duration::from_millis(100),
+        ));
+        assert!(
+            scanner.snapshot_for(1, bar).is_none(),
+            "scan from before an invalidation boundary must not populate cache"
+        );
+    }
+
+    #[test]
+    fn occlusion_result_rejects_unverified_band1_occluder_when_tray_missing_from_enum() {
+        let dummy = HWND(0x1234 as *mut std::ffi::c_void);
+        assert_eq!(
+            occlusion_result_after_enum(false, Some(1), Some(dummy)),
+            OcclusionCheck::TrayMissing,
+            "Band-1 occluder without seeing tray in EnumWindows must be treated as TrayMissing"
+        );
+        assert_eq!(
+            occlusion_result_after_enum(true, Some(1), Some(dummy)),
+            OcclusionCheck::Occluded(dummy)
+        );
+        assert_eq!(
+            occlusion_result_after_enum(false, Some(6), Some(dummy)),
+            OcclusionCheck::Occluded(dummy)
+        );
+
+        let _zorder = z_order_test_lock();
+        let hinstance = HINSTANCE(unsafe { GetModuleHandleW(None).unwrap() }.0);
+        let class_name = register_window_class(hinstance).unwrap();
+        let tray = create_topmost_test_window(hinstance, class_name);
+        let hwnd = create_monitor_window(hinstance, class_name, std::ptr::null_mut()).unwrap();
+        let _windows = TestWindows(vec![tray, hwnd]);
+        unsafe {
+            let _ = ShowWindow(tray, SW_SHOWNOACTIVATE);
+            SetWindowPos(
+                tray,
+                Some(HWND_TOPMOST),
+                -24_000,
+                -24_000,
+                400,
+                48,
+                SWP_NOACTIVATE,
+            )
+            .unwrap();
+        }
+
+        let mut ctx = WindowCtx {
+            hwnd,
+            in_elevated_band: true,
+            user_closing: false,
+            shared: Arc::new(Mutex::new(SharedState {
+                config: Config::default(),
+                metrics: Metrics::default(),
+                generation: 0,
+            })),
+            visibility: Arc::new(MonitorVisibility {
+                visible: std::sync::atomic::AtomicBool::new(false),
+                notifier: Arc::new(|| {}),
+            }),
+            callback: Arc::new(|_| {}),
+            renderer: None,
+            uia_scanner: Arc::new(UiaScanner {
+                state: Arc::new((Mutex::new(UiaShared::default()), Condvar::new())),
+                worker: Mutex::new(None),
+            }),
+            light_taskbar: false,
+            hovered: false,
+            tracking_mouse: false,
+            last_display: None,
+            last_size: (120, 40),
+            last_pos: Some((-23_800, -24_000)),
+            last_visible: true,
+            last_present_error: None,
+            last_anchor_slot: None,
+            last_compact: false,
+            last_stacked: false,
+            last_env_geom: None,
+            pending_uia_scan: false,
+            invalidate_uia_layout: false,
+            restore_from_cached_layout: false,
+            tracked_fg_tid: 0,
+            fg_loc_hook: HWINEVENTHOOK::default(),
+            tracked_fs_tid: 0,
+            fs_loc_hook: HWINEVENTHOOK::default(),
+            fs_lifecycle_hook: HWINEVENTHOOK::default(),
+            fs_cloak_hook: HWINEVENTHOOK::default(),
+            tracked_tray_tid: 0,
+            tray_hook: HWINEVENTHOOK::default(),
+            topmost_hooks: Vec::new(),
+            last_fg_hwnd: 0,
+            fullscreen_recheck_remaining: 0,
+            fullscreen_recheck_armed: false,
+            hidden_by_occlusion: false,
+            hidden_by_tray_missing: false,
+            last_occluded_rect: None,
+            topmost_recheck_armed: false,
+        };
+
+        ctx.hide("tray_missing_in_enum", None);
+        assert!(ctx.hidden_by_tray_missing);
+        assert!(
+            ctx.topmost_recheck_armed,
+            "tray_missing_in_enum hide must arm the 500ms recovery timer"
+        );
+        assert!(
+            ctx.recheck_topmost_occlusion_with_tray(tray),
+            "recheck_topmost_occlusion_with_tray must wake recovery once tray is visible in EnumWindows"
+        );
+    }
+
+    #[test]
+    fn fg_event_proc_wakes_on_tracked_occluder_destroy_and_ignores_non_tray_movesize() {
+        use std::sync::atomic::Ordering;
+
+        struct EventGlobalsGuard {
+            hwnd: isize,
+            tray: isize,
+            occluder: isize,
+            refresh: bool,
+            layout: bool,
+        }
+        impl Drop for EventGlobalsGuard {
+            fn drop(&mut self) {
+                LIVE_HWND.store(self.hwnd, Ordering::Release);
+                LIVE_TRAY_HWND.store(self.tray, Ordering::Release);
+                LIVE_OCCLUDER_HWND.store(self.occluder, Ordering::Release);
+                REFRESH_PENDING.store(self.refresh, Ordering::Release);
+                LAYOUT_RECHECK_PENDING.store(self.layout, Ordering::Release);
+            }
+        }
+
+        let _zorder = z_order_test_lock();
+        let _guard = EventGlobalsGuard {
+            hwnd: LIVE_HWND.load(Ordering::Acquire),
+            tray: LIVE_TRAY_HWND.load(Ordering::Acquire),
+            occluder: LIVE_OCCLUDER_HWND.load(Ordering::Acquire),
+            refresh: REFRESH_PENDING.load(Ordering::Acquire),
+            layout: LAYOUT_RECHECK_PENDING.load(Ordering::Acquire),
+        };
+
+        let hinstance = HINSTANCE(unsafe { GetModuleHandleW(None).unwrap() }.0);
+        let class_name = register_window_class(hinstance).unwrap();
+        let hwnd = create_monitor_window(hinstance, class_name, std::ptr::null_mut()).unwrap();
+        let tray = create_monitor_window(hinstance, class_name, std::ptr::null_mut()).unwrap();
+        let occluder = create_monitor_window(hinstance, class_name, std::ptr::null_mut()).unwrap();
+        let unrelated = create_monitor_window(hinstance, class_name, std::ptr::null_mut()).unwrap();
+        let _windows = TestWindows(vec![hwnd, tray, occluder, unrelated]);
+
+        LIVE_HWND.store(hwnd.0 as isize, Ordering::Release);
+        LIVE_TRAY_HWND.store(tray.0 as isize, Ordering::Release);
+        LIVE_OCCLUDER_HWND.store(occluder.0 as isize, Ordering::Release);
+
+        // Destroying an unrelated window must not wake refresh.
+        REFRESH_PENDING.store(false, Ordering::Release);
+        unsafe {
+            fg_event_proc(
+                HWINEVENTHOOK::default(),
+                EVENT_OBJECT_DESTROY,
+                unrelated,
+                OBJID_WINDOW.0,
+                0,
+                0,
+                0,
+            );
+        }
+        assert!(!REFRESH_PENDING.load(Ordering::Acquire));
+
+        // Destroying the tracked occluder window must immediately wake refresh.
+        unsafe {
+            fg_event_proc(
+                HWINEVENTHOOK::default(),
+                EVENT_OBJECT_DESTROY,
+                occluder,
+                OBJID_WINDOW.0,
+                0,
+                0,
+                0,
+            );
+        }
+        assert!(
+            REFRESH_PENDING.load(Ordering::Acquire),
+            "EVENT_OBJECT_DESTROY for LIVE_OCCLUDER_HWND must wake refresh"
+        );
+
+        // EVENT_SYSTEM_MOVESIZEEND on a non-tray window must wake refresh without setting LAYOUT_RECHECK_PENDING.
+        REFRESH_PENDING.store(false, Ordering::Release);
+        LAYOUT_RECHECK_PENDING.store(false, Ordering::Release);
+        unsafe {
+            fg_event_proc(
+                HWINEVENTHOOK::default(),
+                EVENT_SYSTEM_MOVESIZEEND,
+                unrelated,
+                OBJID_WINDOW.0,
+                0,
+                0,
+                0,
+            );
+        }
+        assert!(REFRESH_PENDING.load(Ordering::Acquire));
+        assert!(
+            !LAYOUT_RECHECK_PENDING.load(Ordering::Acquire),
+            "non-tray EVENT_SYSTEM_MOVESIZEEND must not queue a taskbar UIA layout recheck"
+        );
+
+        // EVENT_SYSTEM_MOVESIZEEND on `LIVE_TRAY_HWND` must queue `LAYOUT_RECHECK_PENDING`.
+        REFRESH_PENDING.store(false, Ordering::Release);
+        unsafe {
+            fg_event_proc(
+                HWINEVENTHOOK::default(),
+                EVENT_SYSTEM_MOVESIZEEND,
+                tray,
+                OBJID_WINDOW.0,
+                0,
+                0,
+                0,
+            );
+        }
+        assert!(REFRESH_PENDING.load(Ordering::Acquire));
+        assert!(LAYOUT_RECHECK_PENDING.load(Ordering::Acquire));
     }
 }
