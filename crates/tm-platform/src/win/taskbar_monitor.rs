@@ -120,8 +120,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
     UpdateLayeredWindow, WINEVENT_OUTOFCONTEXT, WINEVENT_SKIPOWNPROCESS, WM_APP, WM_CLOSE,
     WM_CREATE, WM_DESTROY, WM_DISPLAYCHANGE, WM_DPICHANGED, WM_DWMCOLORIZATIONCOLORCHANGED,
     WM_LBUTTONUP, WM_MOUSEACTIVATE, WM_MOUSEMOVE, WM_NULL, WM_RBUTTONUP, WM_SETTINGCHANGE,
-    WM_TIMER, WNDCLASSEXW, WS_CHILD, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
-    WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
+    WM_TIMER, WNDCLASSEXW, WS_CAPTION, WS_CHILD, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
+    WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_MAXIMIZE, WS_POPUP,
 };
 use windows::core::{BOOL, Interface, PCWSTR, PWSTR, s, w};
 
@@ -140,6 +140,17 @@ const FULLSCREEN_EXIT_MAX_RETRIES: u8 = 70;
 const TOPMOST_RECHECK_TIMER_ID: usize = 3;
 const TOPMOST_RECHECK_MS: u32 = 500;
 const UIA_MIN_SCAN_INTERVAL: Duration = Duration::from_millis(80);
+/// Event-driven rechecks scan once the taskbar has been quiet this long
+/// (trailing edge), so a burst of shell/taskbar notifications costs Explorer
+/// one cross-process UIA walk instead of one per 80 ms plus a settle rescan.
+const UIA_RECHECK_SETTLE: Duration = Duration::from_millis(UIA_SETTLE_DELAY_MS as u64);
+/// Upper bound on how long a continuous notification stream may postpone a
+/// debounced recheck.
+const UIA_RECHECK_MAX_DELAY: Duration = Duration::from_secs(1);
+/// Consecutive failed rechecks of an unchanged taskbar that keep the last
+/// confirmed layout (click-through, never current) before it is discarded and
+/// the widget hides. With the backoff steps below this is roughly 3.5 s.
+const UIA_STALE_LAYOUT_MAX_FAILURES: u32 = 3;
 const UIA_FAILURE_BACKOFF_STEPS: [Duration; 4] = [
     Duration::from_millis(500),
     Duration::from_secs(1),
@@ -571,6 +582,27 @@ fn occlusion_outcome(size: (i32, i32), clips: &[PixelRect]) -> OcclusionOutcome 
         }
     }
     OcclusionOutcome::Clipped
+}
+
+/// Whether applying `check` at `target_rect` leaves the window without any
+/// cut-out. Such a decision only drops a stale region and is applied after a
+/// move/new frame; every other decision (new or larger cut-out, hide) is
+/// applied before it, so the widget never paints over an occluder in between.
+fn occlusion_leaves_unclipped(
+    target_rect: PixelRect,
+    check: OcclusionCheck,
+    occluder_rects: &[PixelRect],
+) -> bool {
+    match check {
+        OcclusionCheck::Clear => true,
+        OcclusionCheck::TrayMissing => false,
+        OcclusionCheck::Occluded(_) => {
+            occlusion_outcome(
+                (target_rect.width(), target_rect.height()),
+                &local_clip_rects(target_rect, occluder_rects),
+            ) == OcclusionOutcome::Clear
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1385,6 +1417,9 @@ struct WindowCtx {
     last_stacked: bool,
     last_env_geom: Option<(isize, PixelRect, Option<PixelRect>, u32)>,
     pending_uia_scan: bool,
+    /// The pending scan came from an event-driven recheck and may wait for
+    /// the notification burst to settle (see `UiaScanner::request_debounced_recheck`).
+    debounce_uia_scan: bool,
     invalidate_uia_layout: bool,
     restore_from_cached_layout: bool,
     tracked_fg_tid: u32,
@@ -1418,7 +1453,17 @@ impl Drop for WindowCtx {
 
 impl WindowCtx {
     fn request_layout_scan(&mut self, update: LayoutUpdate, arm_settle: bool) {
+        if update == LayoutUpdate::Recheck && arm_settle {
+            // Event-driven recheck: the next refresh marks the layout
+            // unconfirmed (click-through) but the worker scans once the burst
+            // settles. That trailing scan replaces the settle-timer rescan.
+            // Any immediate request queued meanwhile still wins.
+            self.debounce_uia_scan = !self.pending_uia_scan || self.debounce_uia_scan;
+            self.pending_uia_scan = true;
+            return;
+        }
         self.pending_uia_scan = true;
+        self.debounce_uia_scan = false;
         if update == LayoutUpdate::Invalidate {
             self.invalidate_uia_layout = true;
             self.restore_from_cached_layout = false;
@@ -1516,10 +1561,40 @@ impl WindowCtx {
                     WINEVENT_OUTOFCONTEXT,
                 )
             };
-            self.fs_loc_hook =
-                install_fs_hook(EVENT_OBJECT_LOCATIONCHANGE, EVENT_OBJECT_LOCATIONCHANGE);
             self.fs_lifecycle_hook = install_fs_hook(EVENT_OBJECT_DESTROY, EVENT_OBJECT_HIDE);
             self.fs_cloak_hook = install_fs_hook(EVENT_OBJECT_CLOAKED, EVENT_OBJECT_UNCLOAKED);
+        }
+        self.sync_fullscreen_location_hook();
+    }
+
+    /// `EVENT_OBJECT_LOCATIONCHANGE` also fires for every cursor/caret move on
+    /// the hooked thread, and each delivery wakes this thread. When the
+    /// fullscreen suppressor runs on the foreground thread (the usual game
+    /// case) the foreground hook already covers it (`fg_location_event_proc`
+    /// accepts `LIVE_FS_HWND`), so a second hook would only double every
+    /// cursor-move wakeup. Install the dedicated one only when the threads
+    /// differ (e.g. after Alt+Tab away from a still-settling fullscreen app).
+    fn sync_fullscreen_location_hook(&mut self) {
+        let covered_by_fg_hook =
+            self.tracked_fs_tid == self.tracked_fg_tid && !self.fg_loc_hook.is_invalid();
+        let wanted = self.tracked_fs_tid != 0 && !covered_by_fg_hook;
+        if wanted && self.fs_loc_hook.is_invalid() {
+            self.fs_loc_hook = unsafe {
+                SetWinEventHook(
+                    EVENT_OBJECT_LOCATIONCHANGE,
+                    EVENT_OBJECT_LOCATIONCHANGE,
+                    None,
+                    Some(fs_location_event_proc),
+                    0,
+                    self.tracked_fs_tid,
+                    WINEVENT_OUTOFCONTEXT,
+                )
+            };
+        } else if !wanted && !self.fs_loc_hook.is_invalid() {
+            unsafe {
+                let _ = UnhookWinEvent(self.fs_loc_hook);
+            }
+            self.fs_loc_hook = HWINEVENTHOOK::default();
         }
     }
 
@@ -1643,12 +1718,7 @@ impl WindowCtx {
         if target_tid == self.tracked_fg_tid {
             return;
         }
-        if !self.fg_loc_hook.is_invalid() {
-            unsafe {
-                let _ = UnhookWinEvent(self.fg_loc_hook);
-            }
-            self.fg_loc_hook = HWINEVENTHOOK::default();
-        }
+        let previous_hook = std::mem::take(&mut self.fg_loc_hook);
         self.tracked_fg_tid = target_tid;
         if target_tid != 0 {
             self.fg_loc_hook = unsafe {
@@ -1662,6 +1732,14 @@ impl WindowCtx {
                     WINEVENT_OUTOFCONTEXT,
                 )
             };
+        }
+        // Hand location coverage of a still-tracked fullscreen thread over
+        // before dropping the old hook, so no move of it is missed.
+        self.sync_fullscreen_location_hook();
+        if !previous_hook.is_invalid() {
+            unsafe {
+                let _ = UnhookWinEvent(previous_hook);
+            }
         }
     }
 
@@ -1828,7 +1906,9 @@ impl WindowCtx {
                 // Preserve `last_env_geom` and `restore_from_cached_layout` across
                 // transient fullscreen suppression so returning to an unchanged
                 // taskbar can reappear immediately while UIA revalidates.
+                // No scan runs while suppressed; the one on return is immediate.
                 self.pending_uia_scan = true;
+                self.debounce_uia_scan = false;
                 self.hide("fullscreen", suppressor);
                 return;
             }
@@ -1837,6 +1917,7 @@ impl WindowCtx {
                 self.sync_fullscreen_hook(HWND::default());
                 self.disarm_fullscreen_exit_recheck();
                 self.pending_uia_scan = true;
+                self.debounce_uia_scan = false;
                 self.hide(reason, None);
                 return;
             }
@@ -2064,6 +2145,7 @@ impl WindowCtx {
         if core_geom_changed {
             self.last_env_geom = Some(geom);
             self.pending_uia_scan = true;
+            self.debounce_uia_scan = false;
             self.invalidate_uia_layout = true;
             self.restore_from_cached_layout = false;
             self.last_display = None;
@@ -2076,11 +2158,14 @@ impl WindowCtx {
 
         if self.pending_uia_scan {
             self.pending_uia_scan = false;
-            self.uia_scanner.request_scan(
-                tray_raw,
-                env.taskbar_rect,
-                std::mem::take(&mut self.invalidate_uia_layout),
-            );
+            let invalidate = std::mem::take(&mut self.invalidate_uia_layout);
+            if std::mem::take(&mut self.debounce_uia_scan) && !invalidate {
+                self.uia_scanner
+                    .request_debounced_recheck(tray_raw, env.taskbar_rect);
+            } else {
+                self.uia_scanner
+                    .request_scan(tray_raw, env.taskbar_rect, invalidate);
+            }
         }
         let Some(uia_occupied) = self.uia_scanner.snapshot_for(tray_raw, env.taskbar_rect) else {
             self.uia_scanner
@@ -2100,11 +2185,15 @@ impl WindowCtx {
                     self.hide("hit_test_failed", None);
                     return;
                 }
-                let _ = self.hide_occluded_if_needed_cached(
+                if !self.hide_occluded_if_needed_cached(
                     env.tray_hwnd,
                     self.last_rect(),
                     prechecked_occlusion,
-                );
+                ) {
+                    // Values keep updating while occupancy is unconfirmed; only
+                    // the footprint is frozen.
+                    self.rerender_in_place(config, metrics, &env, force_render);
+                }
                 return;
             }
             if !self.last_visible && !self.restore_from_cached_layout {
@@ -2200,6 +2289,7 @@ impl WindowCtx {
                 right: x.saturating_add(w),
                 bottom: y.saturating_add(h),
             };
+            let mut deferred_occlusion = None;
             if self.in_elevated_band {
                 let (check, rects) = match prechecked_occlusion.as_ref() {
                     Some((checked_rect, res, rects)) if *checked_rect == target_rect => {
@@ -2207,7 +2297,9 @@ impl WindowCtx {
                     }
                     _ => occlusion_check_with_rects(env.tray_hwnd, self.hwnd, target_rect),
                 };
-                if self.apply_occlusion_policy(target_rect, check, rects) {
+                if occlusion_leaves_unclipped(target_rect, check, &rects) {
+                    deferred_occlusion = Some((check, rects));
+                } else if self.apply_occlusion_policy(target_rect, check, rects) {
                     return;
                 }
             }
@@ -2224,6 +2316,11 @@ impl WindowCtx {
                     );
                 }
                 self.last_pos = Some((x, y));
+            }
+            if let Some((check, rects)) = deferred_occlusion
+                && self.apply_occlusion_policy(target_rect, check, rects)
+            {
+                return;
             }
             self.finish_show(env.tray_hwnd, uia_occupied.current);
             return;
@@ -2303,10 +2400,11 @@ impl WindowCtx {
             right: x.saturating_add(w),
             bottom: y.saturating_add(h),
         };
-        // Resolve the occlusion check before touching renderer state, but apply
-        // the policy only after the renderer borrow ends: clipping mutates the
-        // window and its tracked occluder (and must run before `finish_show`
-        // restores that handle on show).
+        // Clipping mutates the window and its tracked occluder, and must run
+        // before `finish_show` restores that handle on show. A cut-out that
+        // appears or grows (or a hide) is applied before the new frame is
+        // presented, so a moving/resizing widget never paints over a menu or
+        // topmost window; removing a cut-out waits until the frame is in place.
         let occlusion_check = self
             .in_elevated_band
             .then(|| match prechecked_occlusion.as_ref() {
@@ -2315,12 +2413,26 @@ impl WindowCtx {
                 }
                 _ => occlusion_check_with_rects(env.tray_hwnd, self.hwnd, target_rect),
             });
+        let deferred_occlusion = match occlusion_check {
+            Some((check, rects)) if !occlusion_leaves_unclipped(target_rect, check, &rects) => {
+                if self.apply_occlusion_policy(target_rect, check, rects) {
+                    return;
+                }
+                None
+            }
+            other => other,
+        };
         let needs_render = force_render
             || self.last_display.as_ref() != Some(&display)
             || self.last_size != (w, h)
             || self.last_stacked != layout_stacked;
 
         if needs_render {
+            let Some(renderer) = self.renderer.as_mut() else {
+                self.restore_from_cached_layout = false;
+                self.hide("no_renderer", None);
+                return;
+            };
             if let Some((rw, rh, src_dc)) =
                 renderer.render_layout(&display, layout, Some(self.hwnd.0 as isize))
             {
@@ -2356,12 +2468,61 @@ impl WindowCtx {
             }
             self.last_pos = Some((x, y));
         }
-        if let Some((check, rects)) = occlusion_check
+        if let Some((check, rects)) = deferred_occlusion
             && self.apply_occlusion_policy(target_rect, check, rects)
         {
             return;
         }
         self.finish_show(env.tray_hwnd, uia_occupied.current);
+    }
+
+    /// Re-renders changed content at the current footprint while UIA
+    /// revalidates. Never moves or resizes the window: if the new content needs
+    /// a different size, the pixels stay as they are until the scan completes.
+    fn rerender_in_place(
+        &mut self,
+        config: &Config,
+        metrics: &Metrics,
+        env: &TaskbarEnv,
+        force_render: bool,
+    ) {
+        let Some((x, y)) = self.last_pos else {
+            return;
+        };
+        let Some(previous) = self.last_display.as_ref() else {
+            return;
+        };
+        let display = build_display(
+            config,
+            metrics,
+            self.light_taskbar,
+            self.hovered,
+            env.dpi,
+            self.last_compact,
+        );
+        if !force_render && previous == &display {
+            return;
+        }
+        let bounds = LayoutBounds::from_taskbar(env.taskbar_rect, env.dpi);
+        let hwnd_raw = self.hwnd.0 as isize;
+        let Some(renderer) = self.renderer.as_mut() else {
+            return;
+        };
+        if force_render {
+            renderer.invalidate_rendering_params();
+        }
+        let Some(layout) = renderer.measure_layout(&display, bounds) else {
+            return;
+        };
+        if (layout.px_w, layout.px_h) != self.last_size || layout.stacked != self.last_stacked {
+            return;
+        }
+        let Some((w, h, src_dc)) = renderer.render_layout(&display, layout, Some(hwnd_raw)) else {
+            return;
+        };
+        if self.present_layered(x, y, w, h, src_dc) {
+            self.last_display = Some(display);
+        }
     }
 
     fn set_interactive(&self, interactive: bool) -> bool {
@@ -2429,7 +2590,7 @@ impl WindowCtx {
     }
 
     fn hide(&mut self, reason: &'static str, detail: Option<HWND>) {
-        if self.last_visible {
+        if self.last_visible && tracing::enabled!(tracing::Level::DEBUG) {
             let class = detail.and_then(read_window_class);
             let band = detail.and_then(window_band);
             let frame = detail.and_then(visible_frame_rect);
@@ -2750,15 +2911,18 @@ fn probe_taskbar_env(
 }
 
 fn is_taskbar_autohidden(taskbar_rect: PixelRect, monitor_rect: PixelRect) -> bool {
+    // Geometry first: `ABM_GETSTATE` is a synchronous cross-process message to
+    // Explorer (~25 µs, and it waits on a hung Explorer). Only a taskbar that
+    // actually looks slid away needs the auto-hide confirmation.
+    if !taskbar_slid_offscreen(taskbar_rect, monitor_rect) {
+        return false;
+    }
     let mut abd = APPBARDATA {
         cbSize: std::mem::size_of::<APPBARDATA>() as u32,
         ..Default::default()
     };
     let state = unsafe { SHAppBarMessage(ABM_GETSTATE, &mut abd) };
-    if (state as u32 & ABS_AUTOHIDE) == 0 {
-        return false;
-    }
-    taskbar_slid_offscreen(taskbar_rect, monitor_rect)
+    (state as u32 & ABS_AUTOHIDE) != 0
 }
 
 fn taskbar_slid_offscreen(taskbar_rect: PixelRect, monitor_rect: PixelRect) -> bool {
@@ -2799,7 +2963,8 @@ unsafe fn fullscreen_covering_monitor_state(
     if is_desktop_shell_class(fg) || is_non_occluding_shell_host_window(fg) {
         return (false, false, None);
     }
-    let fg_covers = {
+    let fg_style = unsafe { GetWindowLongPtrW(fg, GWL_STYLE) } as u32;
+    let fg_covers = !is_captioned_maximized_style(fg_style) && {
         let mut fg_rect = RECT::default();
         unsafe { GetWindowRect(fg, &mut fg_rect) }.is_ok()
             && PixelRect::from_win32(fg_rect).covers(monitor_rect)
@@ -2810,13 +2975,24 @@ unsafe fn fullscreen_covering_monitor_state(
     // `SHQueryUserNotificationState` is session-global; only suppress when `fg`
     // is actually ordered above `tray_hwnd` on this monitor (avoiding false
     // hides from secondary-monitor D3D/presentations or post-exit QUNS lag).
-    if let Ok(state) = unsafe { SHQueryUserNotificationState() }
+    // The Z-order test runs first: it stops at the tray and is false for every
+    // ordinary foreground window, which skips the costlier shell query.
+    if is_window_above(fg, tray_hwnd)
+        && let Ok(state) = unsafe { SHQueryUserNotificationState() }
         && (state == QUNS_RUNNING_D3D_FULL_SCREEN || state == QUNS_PRESENTATION_MODE)
-        && is_window_above(fg, tray_hwnd)
     {
         return (true, false, Some(fg));
     }
     (false, false, None)
+}
+
+/// A maximized window with a standard caption is not a fullscreen app, even
+/// when its frame covers the whole monitor: with an auto-hide taskbar the work
+/// area is the full monitor, so every maximized window's (border-inflated)
+/// rect covers it. Windows keeps revealing the taskbar over such windows, so
+/// the widget must not treat them as suppressors either.
+fn is_captioned_maximized_style(style: u32) -> bool {
+    (style & WS_MAXIMIZE.0) != 0 && (style & WS_CAPTION.0) == WS_CAPTION.0
 }
 
 fn is_window_cloaked(hwnd: HWND) -> bool {
@@ -3856,6 +4032,10 @@ struct UiaCache {
     taskbar_rect: PixelRect,
     rects: Option<Vec<PixelRect>>,
     generation: u64,
+    /// The last confirmed rectangles survived a failed recheck of the same
+    /// taskbar. They keep an already placed widget where it is (click-through),
+    /// but never count as current until a scan succeeds again.
+    stale: bool,
 }
 
 struct UiaSnapshot {
@@ -3880,6 +4060,10 @@ struct UiaShared {
     consecutive_failures: u32,
     backoff_until: Option<Instant>,
     last_target: Option<(isize, PixelRect)>,
+    /// Trailing-edge deadline of a debounced recheck (`None` = scan now).
+    not_before: Option<Instant>,
+    /// Start of the current debounced burst, capping `not_before`.
+    burst_started: Option<Instant>,
 }
 
 fn uia_failure_backoff(consecutive_failures: u32) -> Duration {
@@ -3897,8 +4081,17 @@ impl UiaShared {
             .map(|prev| prev + UIA_MIN_SCAN_INTERVAL)
             .into_iter()
             .chain(self.backoff_until)
+            .chain(self.not_before)
             .max()?;
         (now < wait_until).then(|| wait_until - now)
+    }
+
+    /// Hands the pending target to the worker and ends any debounce burst.
+    fn take_pending(&mut self) -> Option<UiaTarget> {
+        let target = self.pending.take()?;
+        self.not_before = None;
+        self.burst_started = None;
+        Some(target)
     }
 
     fn publish(&mut self, target: UiaTarget, rects: Option<Vec<PixelRect>>) -> bool {
@@ -3933,6 +4126,7 @@ impl UiaShared {
                     taskbar_rect: target.taskbar_rect,
                     rects,
                     generation: target.generation,
+                    stale: false,
                 };
                 return true;
             }
@@ -3950,7 +4144,10 @@ impl UiaShared {
             {
                 self.pending = None;
             }
-            !same_target || self.cache.rects != rects || self.cache.generation != target.generation
+            !same_target
+                || self.cache.stale
+                || self.cache.rects != rects
+                || self.cache.generation != target.generation
         } else {
             self.consecutive_failures = self.consecutive_failures.saturating_add(1);
             self.backoff_until = Some(now + uia_failure_backoff(self.consecutive_failures));
@@ -3958,6 +4155,17 @@ impl UiaShared {
             // continues after backoff even when sampling is paused and `changed == false`.
             if self.pending.is_none() && target.tray_hwnd != 0 && !target.taskbar_rect.is_empty() {
                 self.pending = Some(target);
+            }
+            // A timed-out or momentarily empty recheck of an unchanged taskbar
+            // is not evidence that the confirmed layout vanished. Keep it as
+            // stale (click-through, never current) while the worker retries,
+            // instead of blinking the widget out for the whole backoff. Only a
+            // persistent failure discards it. Geometry/identity changes never
+            // get here with old rects: they invalidate the cache up front.
+            if had_rects_for_target && self.consecutive_failures <= UIA_STALE_LAYOUT_MAX_FAILURES {
+                let newly_stale = !self.cache.stale;
+                self.cache.stale = true;
+                return newly_stale && self.cache.generation == target.generation;
             }
             // Only wake the window if previously cached rectangles for this target
             // must be cleared; repeated unavailable scans must not spin refresh.
@@ -3968,6 +4176,7 @@ impl UiaShared {
             taskbar_rect: target.taskbar_rect,
             rects,
             generation: target.generation,
+            stale: false,
         };
         changed
     }
@@ -4005,14 +4214,34 @@ impl UiaScanner {
         if guard.cache.tray_hwnd == tray_raw && guard.cache.taskbar_rect == taskbar_rect {
             guard.cache.rects.clone().map(|rects| UiaSnapshot {
                 rects,
-                current: guard.cache.generation == guard.generation,
+                current: !guard.cache.stale && guard.cache.generation == guard.generation,
             })
         } else {
             None
         }
     }
 
+    /// Requests a scan as soon as the worker's rate limit/backoff allows.
     fn request_scan(&self, tray_raw: isize, taskbar_rect: PixelRect, invalidate: bool) {
+        self.request_scan_at(tray_raw, taskbar_rect, invalidate, false, Instant::now());
+    }
+
+    /// Requests an event-driven recheck that runs once notifications have been
+    /// quiet for [`UIA_RECHECK_SETTLE`] (bounded by [`UIA_RECHECK_MAX_DELAY`]).
+    /// The cached layout stops being current immediately, so the widget passes
+    /// clicks through until the trailing scan confirms it.
+    fn request_debounced_recheck(&self, tray_raw: isize, taskbar_rect: PixelRect) {
+        self.request_scan_at(tray_raw, taskbar_rect, false, true, Instant::now());
+    }
+
+    fn request_scan_at(
+        &self,
+        tray_raw: isize,
+        taskbar_rect: PixelRect,
+        invalidate: bool,
+        debounce: bool,
+        now: Instant,
+    ) {
         if tray_raw == 0 || taskbar_rect.is_empty() {
             return;
         }
@@ -4029,6 +4258,7 @@ impl UiaScanner {
         }
         if invalidate {
             guard.cache.rects = None;
+            guard.cache.stale = false;
         }
         // If occupancy is already unavailable and a retry is already pending for
         // the same target, avoid churning `generation` or waking the worker.
@@ -4036,6 +4266,7 @@ impl UiaScanner {
         {
             return;
         }
+        let pending_immediately = guard.pending.is_some() && guard.not_before.is_none();
         // Even a recheck supersedes an in-flight scan. Publishing unchanged
         // rectangles must wake the window so it can restore hit testing.
         guard.generation = guard.generation.wrapping_add(1);
@@ -4047,6 +4278,17 @@ impl UiaScanner {
             taskbar_rect,
             generation: guard.generation,
         });
+        // A debounced recheck never delays a scan that is already due now
+        // (startup, invalidation, failure retry); an immediate request ends
+        // any debounce burst.
+        if debounce && !target_changed && !pending_immediately {
+            let started = *guard.burst_started.get_or_insert(now);
+            guard.not_before =
+                Some((now + UIA_RECHECK_SETTLE).min(started + UIA_RECHECK_MAX_DELAY));
+        } else {
+            guard.not_before = None;
+            guard.burst_started = None;
+        }
         self.state.1.notify_one();
     }
 
@@ -4087,7 +4329,7 @@ fn uia_worker_main(state: Arc<(Mutex<UiaShared>, Condvar)>) {
                 if guard.shutdown {
                     return;
                 }
-                if let Some(target) = guard.pending {
+                if guard.pending.is_some() {
                     if let Some(wait) = guard.next_wait(last_scan, Instant::now()) {
                         let (g, _) = state
                             .1
@@ -4096,8 +4338,9 @@ fn uia_worker_main(state: Arc<(Mutex<UiaShared>, Condvar)>) {
                         guard = g;
                         continue;
                     }
-                    guard.pending = None;
-                    break target;
+                    if let Some(target) = guard.take_pending() {
+                        break target;
+                    }
                 }
                 guard = state.1.wait(guard).unwrap_or_else(|e| e.into_inner());
             }
@@ -4146,22 +4389,27 @@ fn uia_worker_main(state: Arc<(Mutex<UiaShared>, Condvar)>) {
         }
 
         let rects = result.ok().filter(|r| !r.is_empty());
-        if rects.is_none() {
+        let failed = rects.is_none();
+        let (changed, failures, kept_stale) = {
+            let mut guard = state.0.lock().unwrap_or_else(|e| e.into_inner());
+            let changed = guard.publish(target, rects);
+            let kept_stale = guard.cache.stale && guard.cache.rects.is_some();
+            (changed, guard.consecutive_failures, kept_stale)
+        };
+        if failed {
             if last_failure_report.is_none_or(|at| at.elapsed() >= Duration::from_secs(30)) {
                 tracing::warn!(
                     error = ?scan_error,
-                    "taskbar layout unavailable; monitor hidden until UI Automation recovers"
+                    consecutive_failures = failures,
+                    kept_last_layout = kept_stale,
+                    "taskbar layout scan failed; retrying with backoff (monitor stays put \
+                     click-through on its last layout, or hides once that is discarded)"
                 );
                 last_failure_report = Some(Instant::now());
             }
         } else {
             last_failure_report = None;
         }
-        let changed = state
-            .0
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .publish(target, rects);
         if changed {
             post_refresh();
         }
@@ -4515,10 +4763,13 @@ unsafe extern "system" fn fg_location_event_proc(
     _dwms_event_time: u32,
 ) {
     // OBJID_WINDOW (0) + CHILDID_SELF (0): ignore carets, scrollbars, and child DOM controls.
+    // This single per-thread hook also covers the fullscreen suppressor when it
+    // runs on the foreground thread (see `sync_fullscreen_location_hook`).
     if id_object == OBJID_WINDOW.0
         && id_child == 0
         && !hwnd.0.is_null()
         && (hwnd.0 as isize == LIVE_FG_HWND.load(std::sync::atomic::Ordering::Acquire)
+            || hwnd.0 as isize == LIVE_FS_HWND.load(std::sync::atomic::Ordering::Acquire)
             || (IN_ELEVATED_BAND.load(std::sync::atomic::Ordering::Acquire)
                 && is_topmost_location_candidate(hwnd, id_object, id_child)))
     {
@@ -4540,6 +4791,67 @@ unsafe extern "system" fn topmost_location_event_proc(
         && is_topmost_location_candidate(hwnd, id_object, id_child)
     {
         post_refresh();
+    }
+}
+
+/// Last `DWMWA_CLOAKED` value reported for the widget by
+/// `own_cloak_event_proc` (0 = uncloaked). Diagnostics only.
+static OWN_CLOAK_STATE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// Diagnostics for disappearances that are not `hide()` calls: the system
+/// hooks skip our own process, so a DWM/shell cloak of the widget itself (e.g.
+/// during a virtual-desktop switch animation) was invisible in the logs. This
+/// thread-scoped hook on the widget's own thread records and logs it. The
+/// value is a `DWM_CLOAKED_*` mask: 1 = app, 2 = shell, 4 = inherited.
+unsafe extern "system" fn own_cloak_event_proc(
+    _hook: HWINEVENTHOOK,
+    event: u32,
+    hwnd: HWND,
+    id_object: i32,
+    id_child: i32,
+    _id_event_thread: u32,
+    _dwms_event_time: u32,
+) {
+    if id_object != OBJID_WINDOW.0
+        || id_child != 0
+        || hwnd.0.is_null()
+        || hwnd.0 as isize != LIVE_HWND.load(std::sync::atomic::Ordering::Acquire)
+    {
+        return;
+    }
+    let mut cloaked: u32 = 0;
+    let _ = unsafe {
+        DwmGetWindowAttribute(
+            hwnd,
+            DWMWA_CLOAKED,
+            (&mut cloaked as *mut u32).cast(),
+            std::mem::size_of::<u32>() as u32,
+        )
+    };
+    OWN_CLOAK_STATE.store(cloaked, std::sync::atomic::Ordering::Release);
+    tracing::debug!(
+        event = if event == EVENT_OBJECT_CLOAKED {
+            "cloaked"
+        } else {
+            "uncloaked"
+        },
+        cloaked_mask = cloaked,
+        window_visible = unsafe { IsWindowVisible(hwnd).as_bool() },
+        "taskbar monitor DWM cloak state changed (not a hide)"
+    );
+}
+
+fn install_own_cloak_hook() -> HWINEVENTHOOK {
+    unsafe {
+        SetWinEventHook(
+            EVENT_OBJECT_CLOAKED,
+            EVENT_OBJECT_UNCLOAKED,
+            None,
+            Some(own_cloak_event_proc),
+            0,
+            GetCurrentThreadId(),
+            WINEVENT_OUTOFCONTEXT,
+        )
     }
 }
 
@@ -5272,6 +5584,7 @@ fn taskbar_thread_main(
                 last_stacked: false,
                 last_env_geom: None,
                 pending_uia_scan: true,
+                debounce_uia_scan: false,
                 invalidate_uia_layout: true,
                 restore_from_cached_layout: false,
                 tracked_fg_tid: 0,
@@ -5373,6 +5686,7 @@ fn taskbar_thread_main(
         let menu_hook = install_sys_hook(EVENT_SYSTEM_MENUPOPUPSTART, EVENT_SYSTEM_MENUPOPUPEND);
         let obj_vis_hook = install_sys_hook(EVENT_OBJECT_DESTROY, EVENT_OBJECT_HIDE);
         let cloak_hook = install_sys_hook(EVENT_OBJECT_CLOAKED, EVENT_OBJECT_UNCLOAKED);
+        let own_cloak_hook = install_own_cloak_hook();
 
         state.with_ctx_mut(hwnd, |ctx| ctx.refresh(true));
 
@@ -5396,6 +5710,7 @@ fn taskbar_thread_main(
             menu_hook,
             obj_vis_hook,
             cloak_hook,
+            own_cloak_hook,
         ] {
             if !hook.is_invalid() {
                 unsafe {
@@ -5561,7 +5876,7 @@ mod tests {
     }
 
     #[test]
-    fn uia_cache_rejects_stale_scans_and_clears_failed_or_empty_results() {
+    fn uia_cache_rejects_stale_scans_and_demotes_failed_or_empty_results() {
         let scanner = UiaScanner {
             state: Arc::new((Mutex::new(UiaShared::default()), Condvar::new())),
             worker: Mutex::new(None),
@@ -5599,12 +5914,27 @@ mod tests {
                 .lock()
                 .unwrap()
                 .publish(target, Some(occupied.clone()));
-            assert!(scanner.state.0.lock().unwrap().publish(target, unavailable));
+            assert!(scanner.snapshot_for(1, bar).unwrap().current);
             assert!(
-                scanner.snapshot_for(1, bar).is_none(),
-                "failed layout must not reuse stale buttons"
+                scanner.state.0.lock().unwrap().publish(target, unavailable),
+                "losing confirmation of a current layout must wake the window to drop input"
             );
+            let kept = scanner
+                .snapshot_for(1, bar)
+                .expect("a transient failure keeps the confirmed layout");
+            assert_eq!(kept.rects, occupied);
+            assert!(!kept.current, "a failed layout must never count as current");
         }
+        // Only a persistent failure discards the layout (and wakes the window).
+        for _ in 1..UIA_STALE_LAYOUT_MAX_FAILURES {
+            assert!(!scanner.state.0.lock().unwrap().publish(target, None));
+            assert!(!scanner.snapshot_for(1, bar).unwrap().current);
+        }
+        assert!(scanner.state.0.lock().unwrap().publish(target, None));
+        assert!(
+            scanner.snapshot_for(1, bar).is_none(),
+            "persistently failed layout must not reuse stale buttons"
+        );
         assert!(scanner.snapshot_for(2, bar).is_none());
         assert!(scanner.snapshot_for(1, rect(0, 0, 1920, 48)).is_none());
     }
@@ -5716,7 +6046,10 @@ mod tests {
                         taskbar_rect: bar,
                         rects: Some(vec![notify]),
                         generation: 0,
+                        stale: false,
                     },
+                    // The cached layout came from scanning this very taskbar.
+                    last_target: Some((tray.0 as isize, bar)),
                     ..Default::default()
                 }),
                 Condvar::new(),
@@ -5754,6 +6087,7 @@ mod tests {
             last_stacked: false,
             last_env_geom: Some((tray.0 as isize, bar, Some(notify), 96)),
             pending_uia_scan: false,
+            debounce_uia_scan: false,
             invalidate_uia_layout: false,
             restore_from_cached_layout: false,
             tracked_fg_tid: 0,
@@ -5855,6 +6189,26 @@ mod tests {
             assert_eq!(ctx.last_display, previous_display);
             assert_eq!(notifications.load(Ordering::Relaxed), 1);
         }
+        // The burst costs Explorer one trailing scan, not one per event.
+        assert!(
+            ctx.uia_scanner.state.0.lock().unwrap().not_before.is_some(),
+            "event-driven rechecks must wait for the burst to settle"
+        );
+        // Values keep updating in place while occupancy is unconfirmed.
+        let live = Metrics {
+            cpu_pct: Some(42.0),
+            ..metrics
+        };
+        ctx.refresh_taskbar_env(&config, &live, env, false);
+        assert!(ctx.last_visible);
+        assert!(!ctx.accepts_input());
+        assert_eq!(ctx.last_pos, previous_pos);
+        assert_eq!(ctx.last_size, previous_size);
+        assert_eq!(
+            ctx.last_display.as_ref().and_then(|d| d.cpu_val.clone()),
+            Some(format_taskbar_pct(Some(42.0))),
+            "revalidation must not freeze the displayed values"
+        );
         {
             let mut state = ctx.uia_scanner.state.0.lock().unwrap();
             let target = state.pending.take().unwrap();
@@ -5898,9 +6252,27 @@ mod tests {
         assert!(ctx.accepts_input());
         assert_eq!(notifications.load(Ordering::Relaxed), 3);
 
-        // A failed validation clears cached pixels; rechecks cannot revive them.
+        // A transiently failed validation keeps the confirmed footprint in
+        // place, click-through, while the worker retries; it never blinks out.
         ctx.request_layout_scan(LayoutUpdate::Recheck, true);
         ctx.refresh_taskbar_env(&config, &metrics, env, false);
+        let held_pos = ctx.last_pos;
+        for _ in 0..UIA_STALE_LAYOUT_MAX_FAILURES {
+            {
+                let mut state = ctx.uia_scanner.state.0.lock().unwrap();
+                let target = state.pending.take().unwrap();
+                assert!(!state.publish(target, None));
+            }
+            ctx.refresh_taskbar_env(&config, &metrics, env, false);
+            assert!(ctx.last_visible, "a transient UIA failure must not hide");
+            assert!(
+                !ctx.accepts_input(),
+                "an unconfirmed layout must not take clicks"
+            );
+            assert_eq!(ctx.last_pos, held_pos);
+            assert_eq!(notifications.load(Ordering::Relaxed), 3);
+        }
+        // A persistent failure discards cached pixels; rechecks cannot revive them.
         {
             let mut state = ctx.uia_scanner.state.0.lock().unwrap();
             let target = state.pending.take().unwrap();
@@ -7121,6 +7493,7 @@ mod tests {
                         taskbar_rect: bar,
                         rects: Some(vec![notify]),
                         generation: 0,
+                        stale: false,
                     },
                     ..Default::default()
                 }),
@@ -7157,6 +7530,7 @@ mod tests {
             last_stacked: false,
             last_env_geom: Some((tray.0 as isize, bar, Some(notify), 96)),
             pending_uia_scan: false,
+            debounce_uia_scan: false,
             invalidate_uia_layout: false,
             restore_from_cached_layout: false,
             tracked_fg_tid: 0,
@@ -7381,6 +7755,7 @@ mod tests {
             last_stacked: false,
             last_env_geom: None,
             pending_uia_scan: false,
+            debounce_uia_scan: false,
             invalidate_uia_layout: false,
             restore_from_cached_layout: false,
             tracked_fg_tid: 0,
@@ -7591,6 +7966,7 @@ mod tests {
             last_stacked: false,
             last_env_geom: None,
             pending_uia_scan: false,
+            debounce_uia_scan: false,
             invalidate_uia_layout: false,
             restore_from_cached_layout: false,
             tracked_fg_tid: 0,
@@ -7946,6 +8322,7 @@ mod tests {
                         taskbar_rect: bar,
                         rects: Some(vec![notify]),
                         generation: 0,
+                        stale: false,
                     },
                     ..Default::default()
                 }),
@@ -7984,6 +8361,7 @@ mod tests {
             last_stacked: false,
             last_env_geom: Some((tray.0 as isize, bar, Some(notify), 96)),
             pending_uia_scan: false,
+            debounce_uia_scan: false,
             invalidate_uia_layout: false,
             restore_from_cached_layout: false,
             tracked_fg_tid: 0,
@@ -8172,6 +8550,7 @@ mod tests {
             last_stacked: false,
             last_env_geom: None,
             pending_uia_scan: false,
+            debounce_uia_scan: false,
             invalidate_uia_layout: false,
             restore_from_cached_layout: false,
             tracked_fg_tid: 0,
@@ -8317,6 +8696,7 @@ mod tests {
             last_stacked: false,
             last_env_geom: None,
             pending_uia_scan: false,
+            debounce_uia_scan: false,
             invalidate_uia_layout: false,
             restore_from_cached_layout: false,
             tracked_fg_tid: 0,
@@ -8476,6 +8856,7 @@ mod tests {
                 last_stacked: false,
                 last_env_geom: None,
                 pending_uia_scan: false,
+                debounce_uia_scan: false,
                 invalidate_uia_layout: false,
                 restore_from_cached_layout: false,
                 tracked_fg_tid: 0,
@@ -8723,6 +9104,7 @@ mod tests {
             last_stacked: false,
             last_env_geom: None,
             pending_uia_scan: false,
+            debounce_uia_scan: false,
             invalidate_uia_layout: false,
             restore_from_cached_layout: false,
             tracked_fg_tid: 0,
@@ -8851,6 +9233,7 @@ mod tests {
             last_stacked: false,
             last_env_geom: None,
             pending_uia_scan: false,
+            debounce_uia_scan: false,
             invalidate_uia_layout: false,
             restore_from_cached_layout: false,
             tracked_fg_tid: 0,
@@ -9023,6 +9406,7 @@ mod tests {
             last_stacked: false,
             last_env_geom: Some((tray.0 as isize, bar, None, 96)),
             pending_uia_scan: false,
+            debounce_uia_scan: false,
             invalidate_uia_layout: false,
             restore_from_cached_layout: false,
             tracked_fg_tid: 0,
@@ -9180,6 +9564,7 @@ mod tests {
                         taskbar_rect: bar,
                         rects: Some(vec![notify_initial]),
                         generation: 0,
+                        stale: false,
                     },
                     ..Default::default()
                 }),
@@ -9218,6 +9603,7 @@ mod tests {
             last_stacked: false,
             last_env_geom: Some((tray.0 as isize, bar, Some(notify_initial), 96)),
             pending_uia_scan: false,
+            debounce_uia_scan: false,
             invalidate_uia_layout: false,
             restore_from_cached_layout: false,
             tracked_fg_tid: 0,
@@ -9421,6 +9807,7 @@ mod tests {
             last_stacked: false,
             last_env_geom: None,
             pending_uia_scan: false,
+            debounce_uia_scan: false,
             invalidate_uia_layout: false,
             restore_from_cached_layout: false,
             tracked_fg_tid: 0,
@@ -9625,6 +10012,7 @@ mod tests {
                         taskbar_rect: small_bar,
                         rects: Some(vec![notify_initial]),
                         generation: 0,
+                        stale: false,
                     },
                     ..Default::default()
                 }),
@@ -9661,6 +10049,7 @@ mod tests {
             last_stacked: false,
             last_env_geom: Some((tray.0 as isize, small_bar, Some(notify_initial), 96)),
             pending_uia_scan: false,
+            debounce_uia_scan: false,
             invalidate_uia_layout: false,
             restore_from_cached_layout: false,
             tracked_fg_tid: 0,
@@ -9868,9 +10257,13 @@ mod tests {
     }
 
     #[test]
-    fn failed_uia_scan_still_clears_cached_layout_and_counts_failure() {
-        let scanner = UiaScanner::start();
+    fn failed_uia_rechecks_keep_stale_layout_until_persistent_then_clear() {
+        let scanner = UiaScanner {
+            state: Arc::new((Mutex::new(UiaShared::default()), Condvar::new())),
+            worker: Mutex::new(None),
+        };
         let target_rect = rect(0, 0, 1920, 48);
+        let confirmed = vec![rect(100, 0, 200, 48)];
         let target = UiaTarget {
             tray_hwnd: 42,
             taskbar_rect: target_rect,
@@ -9878,14 +10271,449 @@ mod tests {
         };
         {
             let mut guard = scanner.state.0.lock().unwrap();
-            assert!(guard.publish(target, Some(vec![rect(100, 0, 200, 48)])));
+            assert!(guard.publish(target, Some(confirmed.clone())));
+            for failure in 1..=UIA_STALE_LAYOUT_MAX_FAILURES {
+                // Only the first failure changes what the window must do.
+                assert_eq!(guard.publish(target, None), failure == 1);
+                assert_eq!(guard.cache.rects.as_ref(), Some(&confirmed));
+                assert!(guard.cache.stale);
+                assert_eq!(guard.consecutive_failures, failure);
+                assert!(guard.pending.is_some(), "the worker keeps retrying");
+            }
+        }
+        let held = scanner.snapshot_for(42, target_rect).unwrap();
+        assert!(!held.current);
+        assert_eq!(held.rects, confirmed);
+        {
+            let mut guard = scanner.state.0.lock().unwrap();
             assert!(guard.publish(target, None));
             assert_eq!(
                 guard.cache.rects, None,
-                "a real failure must clear cached pixels"
+                "a persistent failure must clear cached pixels"
             );
-            assert_eq!(guard.consecutive_failures, 1);
+            assert!(!guard.cache.stale);
         }
         assert!(scanner.snapshot_for(42, target_rect).is_none());
+
+        // A successful retry within the grace restores a current layout.
+        let mut guard = scanner.state.0.lock().unwrap();
+        assert!(guard.publish(target, Some(confirmed.clone())));
+        assert!(guard.publish(target, None));
+        assert!(guard.cache.stale);
+        assert!(
+            guard.publish(target, Some(confirmed.clone())),
+            "a recovered layout must wake the window to restore input"
+        );
+        assert!(!guard.cache.stale);
+        assert_eq!(guard.consecutive_failures, 0);
+        drop(guard);
+        assert!(scanner.snapshot_for(42, target_rect).unwrap().current);
+    }
+
+    fn test_window_ctx(hwnd: HWND, in_elevated_band: bool) -> WindowCtx {
+        WindowCtx {
+            hwnd,
+            in_elevated_band,
+            user_closing: false,
+            shared: Arc::new(Mutex::new(SharedState {
+                config: Config::default(),
+                metrics: Metrics::default(),
+                generation: 0,
+            })),
+            visibility: Arc::new(MonitorVisibility {
+                visible: std::sync::atomic::AtomicBool::new(false),
+                notifier: Arc::new(|| {}),
+            }),
+            callback: Arc::new(|_| {}),
+            renderer: None,
+            uia_scanner: Arc::new(UiaScanner {
+                state: Arc::new((Mutex::new(UiaShared::default()), Condvar::new())),
+                worker: Mutex::new(None),
+            }),
+            light_taskbar: false,
+            hovered: false,
+            tracking_mouse: false,
+            last_display: None,
+            last_size: (0, 0),
+            last_pos: None,
+            last_visible: false,
+            last_present_error: None,
+            last_anchor_slot: None,
+            last_compact: false,
+            last_stacked: false,
+            last_env_geom: None,
+            pending_uia_scan: false,
+            debounce_uia_scan: false,
+            invalidate_uia_layout: false,
+            restore_from_cached_layout: false,
+            tracked_fg_tid: 0,
+            fg_loc_hook: HWINEVENTHOOK::default(),
+            tracked_fs_tid: 0,
+            fs_loc_hook: HWINEVENTHOOK::default(),
+            fs_lifecycle_hook: HWINEVENTHOOK::default(),
+            fs_cloak_hook: HWINEVENTHOOK::default(),
+            tracked_tray_tid: 0,
+            tray_hook: HWINEVENTHOOK::default(),
+            topmost_hooks: Vec::new(),
+            last_fg_hwnd: 0,
+            fullscreen_recheck_remaining: 0,
+            fullscreen_recheck_armed: false,
+            hidden_by_occlusion: false,
+            hidden_by_tray_missing: false,
+            last_occluded_rect: None,
+            applied_clip: None,
+            clip_occluder: HWND::default(),
+            topmost_recheck_armed: false,
+        }
+    }
+
+    /// Dispatches this thread's messages (out-of-context WinEvents arrive
+    /// through them) until `done` holds or the deadline passes.
+    fn pump_until(timeout: Duration, done: impl Fn() -> bool) -> bool {
+        use windows::Win32::UI::WindowsAndMessaging::{
+            MsgWaitForMultipleObjects, PM_REMOVE, PeekMessageW, QS_ALLINPUT,
+        };
+        let deadline = Instant::now() + timeout;
+        let mut msg = MSG::default();
+        loop {
+            while unsafe { PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE) }.as_bool() {
+                let _ = unsafe { TranslateMessage(&msg) };
+                unsafe { DispatchMessageW(&msg) };
+            }
+            if done() {
+                return true;
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return false;
+            }
+            unsafe {
+                let _ = MsgWaitForMultipleObjects(
+                    None,
+                    false,
+                    remaining.as_millis().min(50) as u32,
+                    QS_ALLINPUT,
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn debounced_rechecks_scan_once_after_the_burst_settles() {
+        let scanner = UiaScanner {
+            state: Arc::new((Mutex::new(UiaShared::default()), Condvar::new())),
+            worker: Mutex::new(None),
+        };
+        let bar = rect(0, 1032, 1920, 1080);
+        let occupied = vec![rect(500, 1032, 1000, 1080)];
+        let t0 = Instant::now();
+
+        // Startup/invalidation scans run immediately.
+        scanner.request_scan_at(1, bar, true, false, t0);
+        {
+            let mut guard = scanner.state.0.lock().unwrap();
+            assert_eq!(guard.next_wait(None, t0), None);
+            let target = guard.take_pending().unwrap();
+            assert!(guard.publish_at(target, Some(occupied.clone()), t0));
+        }
+
+        // A burst of event-driven rechecks: the layout is unconfirmed at once
+        // (click-through), but the scan waits until the burst goes quiet.
+        let step = Duration::from_millis(100);
+        for i in 0..5u32 {
+            scanner.request_scan_at(1, bar, false, true, t0 + step * i);
+            assert!(!scanner.snapshot_for(1, bar).unwrap().current);
+        }
+        let last = t0 + step * 4;
+        {
+            let guard = scanner.state.0.lock().unwrap();
+            assert_eq!(guard.next_wait(None, last), Some(UIA_RECHECK_SETTLE));
+            assert_eq!(guard.next_wait(None, last + UIA_RECHECK_SETTLE), None);
+        }
+
+        // A continuous notification stream cannot postpone it past the cap.
+        for i in 5..30u32 {
+            scanner.request_scan_at(1, bar, false, true, t0 + step * i);
+        }
+        {
+            let mut guard = scanner.state.0.lock().unwrap();
+            assert_eq!(guard.not_before, Some(t0 + UIA_RECHECK_MAX_DELAY));
+            assert_eq!(guard.next_wait(None, t0 + UIA_RECHECK_MAX_DELAY), None);
+            // One scan answers the whole burst and restores input.
+            let target = guard.take_pending().unwrap();
+            assert!(guard.not_before.is_none() && guard.burst_started.is_none());
+            assert!(guard.publish_at(target, Some(occupied.clone()), t0 + UIA_RECHECK_MAX_DELAY));
+        }
+        assert!(scanner.snapshot_for(1, bar).unwrap().current);
+
+        // A debounced request never delays one that is already due, and an
+        // immediate request ends a running burst.
+        let t1 = t0 + Duration::from_secs(5);
+        scanner.request_scan_at(1, bar, false, false, t1);
+        scanner.request_scan_at(1, bar, false, true, t1);
+        assert!(scanner.state.0.lock().unwrap().not_before.is_none());
+        let _ = scanner.state.0.lock().unwrap().take_pending();
+        scanner.request_scan_at(1, bar, false, true, t1);
+        assert!(scanner.state.0.lock().unwrap().not_before.is_some());
+        scanner.request_scan_at(1, bar, false, false, t1);
+        assert!(scanner.state.0.lock().unwrap().not_before.is_none());
+
+        // A different taskbar target has no layout yet: scan it immediately.
+        let _ = scanner.state.0.lock().unwrap().take_pending();
+        scanner.request_scan_at(1, rect(0, 0, 1920, 48), false, true, t1);
+        assert!(scanner.state.0.lock().unwrap().not_before.is_none());
+    }
+
+    #[test]
+    fn layout_scan_requests_debounce_only_event_driven_rechecks() {
+        let mut ctx = test_window_ctx(HWND::default(), false);
+        ctx.request_layout_scan(LayoutUpdate::Recheck, true);
+        assert!(ctx.pending_uia_scan && ctx.debounce_uia_scan);
+        // The settle-timer path and invalidations scan immediately; a later
+        // event-driven recheck must not demote an already immediate request.
+        ctx.request_layout_scan(LayoutUpdate::Recheck, false);
+        assert!(ctx.pending_uia_scan && !ctx.debounce_uia_scan);
+        ctx.request_layout_scan(LayoutUpdate::Recheck, true);
+        assert!(!ctx.debounce_uia_scan);
+        ctx.pending_uia_scan = false;
+        ctx.request_layout_scan(LayoutUpdate::Recheck, true);
+        ctx.request_layout_scan(LayoutUpdate::Invalidate, false);
+        assert!(ctx.pending_uia_scan && !ctx.debounce_uia_scan && ctx.invalidate_uia_layout);
+    }
+
+    #[test]
+    fn fullscreen_location_hook_reuses_the_foreground_hook_on_the_same_thread() {
+        use std::sync::atomic::Ordering;
+        use std::sync::mpsc;
+
+        let _zorder = z_order_test_lock();
+        let hinstance = HINSTANCE(unsafe { GetModuleHandleW(None).unwrap() }.0);
+        let class_name = register_window_class(hinstance).unwrap();
+        let hwnd = create_monitor_window(hinstance, class_name, std::ptr::null_mut()).unwrap();
+        let _windows = TestWindows(vec![hwnd]);
+
+        // `Some(width)` resizes the suppressor, `None` destroys it.
+        let (cmd_tx, cmd_rx) = mpsc::channel::<Option<i32>>();
+        let (ready_tx, ready_rx) = mpsc::channel::<(isize, u32)>();
+        let (ack_tx, ack_rx) = mpsc::channel::<()>();
+        let fs_join = std::thread::spawn(move || {
+            let hinstance = HINSTANCE(unsafe { GetModuleHandleW(None).unwrap() }.0);
+            let class_name = register_window_class(hinstance).unwrap();
+            let fs_hwnd =
+                create_monitor_window(hinstance, class_name, std::ptr::null_mut()).unwrap();
+            unsafe {
+                SetWindowPos(
+                    fs_hwnd,
+                    None,
+                    -22_000,
+                    -22_000,
+                    1920,
+                    1080,
+                    SWP_NOZORDER | SWP_NOACTIVATE,
+                )
+                .unwrap();
+                let _ = ShowWindow(fs_hwnd, SW_SHOWNOACTIVATE);
+            }
+            ready_tx
+                .send((fs_hwnd.0 as isize, unsafe { GetCurrentThreadId() }))
+                .unwrap();
+            while let Ok(Some(width)) = cmd_rx.recv() {
+                unsafe {
+                    SetWindowPos(
+                        fs_hwnd,
+                        None,
+                        -22_000,
+                        -22_000,
+                        width,
+                        600,
+                        SWP_NOZORDER | SWP_NOACTIVATE,
+                    )
+                    .unwrap();
+                }
+                ack_tx.send(()).unwrap();
+            }
+            unsafe {
+                let _ = DestroyWindow(fs_hwnd);
+            }
+        });
+        let (fs_raw, fs_tid) = ready_rx.recv().expect("fullscreen thread ready");
+        let fs_hwnd = HWND(fs_raw as *mut std::ffi::c_void);
+        LIVE_HWND.store(hwnd.0 as isize, Ordering::Release);
+        LIVE_FG_HWND.store(0, Ordering::Release);
+
+        let install_fg_hook = |tid: u32| unsafe {
+            SetWinEventHook(
+                EVENT_OBJECT_LOCATIONCHANGE,
+                EVENT_OBJECT_LOCATIONCHANGE,
+                None,
+                Some(fg_location_event_proc),
+                0,
+                tid,
+                WINEVENT_OUTOFCONTEXT,
+            )
+        };
+        let resize_wakes_refresh = |width: i32| {
+            REFRESH_PENDING.store(false, Ordering::Release);
+            cmd_tx.send(Some(width)).unwrap();
+            ack_rx.recv().unwrap();
+            pump_until(Duration::from_secs(2), || {
+                REFRESH_PENDING.load(Ordering::Acquire)
+            })
+        };
+
+        let mut ctx = test_window_ctx(hwnd, true);
+        // The usual game case: the suppressor is the foreground window, so the
+        // foreground hook already listens on its thread.
+        ctx.tracked_fg_tid = fs_tid;
+        ctx.fg_loc_hook = install_fg_hook(fs_tid);
+        assert!(!ctx.fg_loc_hook.is_invalid());
+        ctx.sync_fullscreen_hook(fs_hwnd);
+        assert_eq!(ctx.tracked_fs_tid, fs_tid);
+        assert!(
+            ctx.fs_loc_hook.is_invalid(),
+            "a second LOCATIONCHANGE hook on the same thread doubles every cursor-move wakeup"
+        );
+        assert!(!ctx.fs_lifecycle_hook.is_invalid());
+        assert!(!ctx.fs_cloak_hook.is_invalid());
+        assert!(
+            resize_wakes_refresh(800),
+            "the shared foreground hook must still wake on suppressor moves"
+        );
+
+        // Foreground leaves the suppressor's thread: the dedicated hook takes over.
+        unsafe {
+            let _ = UnhookWinEvent(std::mem::take(&mut ctx.fg_loc_hook));
+        }
+        ctx.tracked_fg_tid = 0;
+        ctx.sync_fullscreen_location_hook();
+        assert!(!ctx.fs_loc_hook.is_invalid());
+        assert!(
+            resize_wakes_refresh(1024),
+            "suppressor moves must wake refresh after foreground left its thread"
+        );
+
+        // Foreground returns to it: the duplicate is dropped again.
+        ctx.tracked_fg_tid = fs_tid;
+        ctx.fg_loc_hook = install_fg_hook(fs_tid);
+        ctx.sync_fullscreen_location_hook();
+        assert!(ctx.fs_loc_hook.is_invalid());
+
+        ctx.unhook_dynamic_hooks();
+        LIVE_HWND.store(0, Ordering::Release);
+        REFRESH_PENDING.store(false, Ordering::Release);
+        let _ = cmd_tx.send(None);
+        let _ = fs_join.join();
+    }
+
+    #[test]
+    fn maximized_captioned_windows_are_not_fullscreen_suppressors() {
+        use windows::Win32::UI::WindowsAndMessaging::{WS_BORDER, WS_OVERLAPPEDWINDOW};
+        assert!(is_captioned_maximized_style(
+            (WS_OVERLAPPEDWINDOW | WS_MAXIMIZE).0
+        ));
+        assert!(!is_captioned_maximized_style(WS_OVERLAPPEDWINDOW.0));
+        assert!(
+            !is_captioned_maximized_style((WS_POPUP | WS_MAXIMIZE).0),
+            "borderless fullscreen apps may be maximized popups"
+        );
+        assert!(
+            !is_captioned_maximized_style((WS_POPUP | WS_BORDER | WS_MAXIMIZE).0),
+            "a border alone is not a caption"
+        );
+        // Why the rect test alone is wrong: with an auto-hide taskbar the work
+        // area is the monitor, so a maximized frame (inflated by its borders)
+        // covers the whole monitor although the taskbar still reveals over it.
+        let monitor = rect(0, 0, 1920, 1080);
+        assert!(rect(-8, -8, 1928, 1088).covers(monitor));
+    }
+
+    #[test]
+    fn growing_cutouts_apply_before_present_and_vanishing_ones_after() {
+        let target = rect(1000, 1040, 1100, 1080);
+        // Any non-null handle: the occluder identity is not inspected here.
+        let occluder = HWND(std::ptr::dangling_mut());
+        assert!(occlusion_leaves_unclipped(
+            target,
+            OcclusionCheck::Clear,
+            &[]
+        ));
+        assert!(!occlusion_leaves_unclipped(
+            target,
+            OcclusionCheck::TrayMissing,
+            &[]
+        ));
+        // A reported occluder that no longer reaches the target only drops a
+        // stale region: that happens after the frame/move.
+        assert!(occlusion_leaves_unclipped(
+            target,
+            OcclusionCheck::Occluded(occluder),
+            &[rect(0, 0, 500, 500)]
+        ));
+        // Partial cover (cut-out) and full cover (hide) happen before it.
+        assert!(!occlusion_leaves_unclipped(
+            target,
+            OcclusionCheck::Occluded(occluder),
+            &[rect(1050, 900, 1300, 1060)]
+        ));
+        assert!(!occlusion_leaves_unclipped(
+            target,
+            OcclusionCheck::Occluded(occluder),
+            &[rect(900, 900, 1300, 1100)]
+        ));
+    }
+
+    #[test]
+    fn own_cloak_hook_reports_widget_cloak_changes() {
+        use std::sync::atomic::Ordering;
+        use windows::Win32::Graphics::Dwm::DWMWA_CLOAK;
+
+        let _zorder = z_order_test_lock();
+        let hinstance = HINSTANCE(unsafe { GetModuleHandleW(None).unwrap() }.0);
+        let class_name = register_window_class(hinstance).unwrap();
+        let hwnd = create_monitor_window(hinstance, class_name, std::ptr::null_mut()).unwrap();
+        let _windows = TestWindows(vec![hwnd]);
+        unsafe {
+            SetWindowPos(
+                hwnd,
+                None,
+                -22_000,
+                -22_000,
+                100,
+                40,
+                SWP_NOZORDER | SWP_NOACTIVATE,
+            )
+            .unwrap();
+            let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+        }
+        LIVE_HWND.store(hwnd.0 as isize, Ordering::Release);
+        OWN_CLOAK_STATE.store(0, Ordering::Release);
+        let hook = install_own_cloak_hook();
+        assert!(!hook.is_invalid());
+
+        let set_cloak = |cloak: bool| {
+            let value = windows::core::BOOL::from(cloak);
+            unsafe {
+                DwmSetWindowAttribute(
+                    hwnd,
+                    DWMWA_CLOAK,
+                    (&value as *const windows::core::BOOL).cast(),
+                    std::mem::size_of::<windows::core::BOOL>() as u32,
+                )
+            }
+        };
+        let cloaked = set_cloak(true).is_ok()
+            && pump_until(Duration::from_secs(2), || {
+                OWN_CLOAK_STATE.load(Ordering::Acquire) != 0
+            });
+        let uncloaked = set_cloak(false).is_ok()
+            && pump_until(Duration::from_secs(2), || {
+                OWN_CLOAK_STATE.load(Ordering::Acquire) == 0
+            });
+        unsafe {
+            let _ = UnhookWinEvent(hook);
+        }
+        LIVE_HWND.store(0, Ordering::Release);
+        assert!(cloaked, "a DWM cloak of the widget itself must be observed");
+        assert!(uncloaked, "the matching uncloak must be observed");
     }
 }

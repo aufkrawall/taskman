@@ -1138,20 +1138,31 @@ rebase runbook.
   filtered to `OBJID_WINDOW` `SHOW`/`HIDE`/`LOCATIONCHANGE` on tray + `IsChild`
   descendants plus top-level topmost moves on Explorer's thread and `EVENT_OBJECT_REORDER`),
   and (d) the suppressing fullscreen window's thread (`sync_fullscreen_hook` ->
-  `EVENT_OBJECT_LOCATIONCHANGE`, `EVENT_OBJECT_DESTROY..EVENT_OBJECT_HIDE`, and
+  `EVENT_OBJECT_DESTROY..EVENT_OBJECT_HIDE` and
   `EVENT_OBJECT_CLOAKED..EVENT_OBJECT_UNCLOAKED`, kept even after `Alt+Tab` moves
-  foreground away while the fullscreen window is still settling), plus a global
+  foreground away while the fullscreen window is still settling; its
+  `EVENT_OBJECT_LOCATIONCHANGE` hook (`sync_fullscreen_location_hook`) exists only
+  while the suppressor's thread differs from the hooked foreground thread, because
+  `fg_location_event_proc` also accepts `LIVE_FS_HWND`), plus a global
   top-level `EVENT_OBJECT_CLOAKED..EVENT_OBJECT_UNCLOAKED` hook (`cloak_hook`)
+  and a diagnostics-only own-thread cloak hook (`own_cloak_event_proc`, debug
+  log + `OWN_CLOAK_STATE`; the system hooks use `WINEVENT_SKIPOWNPROCESS`)
   with `REFRESH_PENDING`,
   `LAYOUT_RECHECK_PENDING`, and `FULLSCREEN_WAKE_PENDING` coalescing (marked on
   foreground/minimize/hide/cloak/destroy fullscreen exits) plus a
-  300 ms UIA settle timer and a bounded 10 ms × 70 fullscreen-exit transition
+  300 ms UIA settle timer (invalidations only) and a bounded 10 ms × 70 fullscreen-exit transition
   recheck when foreground has already left a settling fullscreen/D3D state
   (including when holding `Alt+Tab` or another overlay takes foreground while
   an uncloaked, opaque fullscreen window still sits above `Shell_TrayWnd` in
   Z-order; `SHQueryUserNotificationState` `QUNS_RUNNING_D3D_FULL_SCREEN` /
   `QUNS_PRESENTATION_MODE` only suppresses when `fg` is non-transparent and
-  ordered above `tray_hwnd` on the taskbar monitor). In the
+  ordered above `tray_hwnd` on the taskbar monitor, and the cheap Z-order test
+  runs before the ~57 µs query). A foreground window only counts as covering the
+  monitor when it is not a maximized window with a standard caption
+  (`is_captioned_maximized_style`): with an auto-hide taskbar the work area is
+  the monitor, so every maximized frame covers it while Windows keeps revealing
+  the taskbar over it. `is_taskbar_autohidden` checks the slid-away geometry
+  before `ABM_GETSTATE`, a synchronous ~25 µs message to Explorer. In the
   band-1 fallback path, Z-order follows `Shell_TrayWnd` using the nearest visible,
   uncloaked same-band predecessor (skipping cross-band windows such as band-6
   `StartMenuExperienceHost` canvases), without fixed-count window walks or
@@ -1165,8 +1176,13 @@ rebase runbook.
 - **Automagic UIA collision-free placement:** Dedicated `"tm-taskbar-uia"` MTA +
   Per-Monitor V2 thread queries visible interactive UIA elements under
   `Shell_TrayWnd` in a single cached `FindAllBuildCache` RPC (`CUIAutomation8`
-  with 150 ms / 250 ms timeouts, `AutomationElementMode_None`, 80 ms burst
-  coalescing, sorted rect diff gating, `collect_cached_rects` propagating any
+  with 150 ms / 250 ms timeouts, `AutomationElementMode_None`, 80 ms minimum
+  scan interval, event-driven rechecks debounced in the worker
+  (`request_debounced_recheck`: one trailing scan once requests are quiet for
+  `UIA_RECHECK_SETTLE` = 300 ms, capped at `UIA_RECHECK_MAX_DELAY` = 1 s; startup,
+  invalidation, new targets, failure retries and fullscreen return stay immediate;
+  measured 2026-11-17: one scan ≈ 15 ms wall / ≈ 38 M Explorer cycles),
+  sorted rect diff gating, `collect_cached_rects` propagating any
   per-element error so partial obstacle maps are never published as complete,
   and one-time immediate session re-init on first scan error). `solve_taskbar_placement` projects
   elements (ignoring `>= 60%` container frames) + `TrayNotifyWnd` into 1D
@@ -1182,7 +1198,11 @@ rebase runbook.
   revalidate transactionally: an already visible widget preserves its pixels
   (and immediately re-solves placement against the new `tray_notify_rect` +
   cached UIA rects when `TrayNotifyWnd` resizes) while setting `WS_EX_TRANSPARENT`
-  to pass clicks through until the latest scan completes. Widgets hidden only by
+  to pass clicks through until the latest scan completes; new values are still
+  re-rendered in place (`rerender_in_place`) when they fit the unchanged
+  footprint. Moving/resizing applies a new or growing cut-out (or a hide) before
+  presenting and drops a vanishing cut-out only afterwards
+  (`occlusion_leaves_unclipped`). Widgets hidden only by
   transient fullscreen or
   occlusion suppression (`restore_from_cached_layout`) preserve `last_env_geom`
   and reappear immediately click-through (`WS_EX_TRANSPARENT`) on their cached
@@ -1208,7 +1228,11 @@ rebase runbook.
   were far away.
   Every request advances the generation, rejecting older in-flight scans;
   unchanged completed results still wake the window to restore hit testing.
-  Failed/empty scans clear stale data, record progressive failure backoff
+  Failed/empty rechecks of an unchanged target keep the last confirmed rects as
+  `UiaCache::stale` (never `current`, so the widget stays put click-through) for up
+  to `UIA_STALE_LAYOUT_MAX_FAILURES` = 3 consecutive failures (≈ 3.5 s) and only
+  then clear them and hide; failed scans without prior rects clear as before.
+  All failures record progressive failure backoff
   (`500` ms -> `1` s -> `2` s -> `5` s), and re-queue the failed target inside
   `UiaShared::publish_at` so `uia_worker_main` retries automatically after backoff
   even when sampling is paused. Layout and presentation failures have
