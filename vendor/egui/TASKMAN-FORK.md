@@ -18,8 +18,9 @@ It started for two rendering things taskman needs that are not reachable from st
 Both are served by one new backend, so they are one change. The inventory below also
 carries later, unrelated additions: the keyboard Menu/Application key (#5) and modal
 windows plus public accesskit reparenting (#6), both of which the keyboard and
-screen-reader model in `llm-wiki/current.md` depends on, and a text-cursor blink restart
-(#7).
+screen-reader model in `llm-wiki/current.md` depends on, a text-cursor blink restart
+(#7), text-selection preservation on secondary click (#8), and not registering for raw
+device input (#9).
 
 The full design, the blend math, and the verification plan live in
 `llm-wiki/render-pipeline.md` in the parent repo. This file is only the *inventory* of what
@@ -216,9 +217,13 @@ Behaviour-only and tiny; droppable once upstream restarts the blink on focus gai
 
 | File | Change | Why |
 | --- | --- | --- |
-| `crates/eframe/src/native/run.rs` | `create_event_loop()` calls `event_loop.listen_device_events(DeviceEvents::Never)` after `builder.build()` | winit registers all mice/keyboards for raw input with its default `DeviceEvents::WhenFocused`, so on Windows every mouse packet system-wide arrives as `WM_INPUT` while any of our windows is in the foreground, and winit dispatches up to three `DeviceEvent`s per packet. egui never consumes device events — `egui-winit` feeds pointer positions from window `CursorMoved` events, and the raw `MouseMotion` deltas only add a redundant `Event::MouseMoved` that repaints the UI. Measured on Windows 11 at 1 kHz mouse movement: a focused window with the cursor outside burned ~0.14 cores per second of movement in a minimal eframe app (and up to a full core once the tracked pointer position goes stale); with the registration removed the same movement costs ~0. |
+| `crates/eframe/src/native/run.rs` | `create_event_loop()` calls `event_loop.listen_device_events(DeviceEvents::Never)` after `builder.build()` | winit registers all mice/keyboards for raw input with its default `DeviceEvents::WhenFocused`, so on Windows every mouse packet system-wide arrives as `WM_INPUT` while any of our windows is in the foreground, and winit dispatches up to three `DeviceEvent`s per packet. taskman does not need device events — `egui-winit` feeds pointer positions from window `CursorMoved` events; the raw `MouseMotion` deltas only add `Event::MouseMoved` (for `pointer.motion()`, which nothing in taskman reads) and repaint the UI. Measured on Windows 11 at 1 kHz mouse movement: a focused window with the cursor outside burned ~0.14 cores per second of movement in a minimal eframe app (and up to a full core once the tracked pointer position goes stale); with the registration removed the same movement costs ~0. |
 
-One line through winit's public API; on macOS/Wayland/Android it is a no-op and on X11 it only drops the raw XI2 events egui does not read. Plausibly upstreamable: eframe has no `DeviceEvent` consumer other than the redundant `MouseMotion` forward.
+One line through winit's public API; on macOS/Wayland/Android it is a no-op and on X11 it only drops the raw XI2 events.
+
+**Behaviour change.** With device events off, eframe never emits `Event::MouseMoved` on Windows and X11, so `PointerState::motion()` stays `None` and `Response::drag_motion()` (documented as raw, unaccelerated, unclamped movement) falls back to the screen-clamped `pointer.delta()`. macOS and Wayland still deliver `DeviceEvent::MouseMotion`, so raw motion remains there. taskman reads neither, so nothing regresses here. The call is unconditional, so it is *not* upstreamable as is — upstream would need an opt-out (a `NativeOptions` field defaulting to today's behaviour).
+
+**Coverage.** Pinned on Windows by `native::run::tests::event_loop_creation_unregisters_raw_mouse_and_keyboard_input`, which reads `GetRegisteredRawInputDevices` after `create_event_loop`. `eframe::create_native` with a caller-supplied event loop does not go through `create_event_loop` and is not covered; taskman uses `run_native`.
 
 ## Rebase runbook
 
@@ -277,6 +282,9 @@ After pulling:
 3. `tools/check-fork.ps1` (lints this workspace) **and** `python build.py --check` (lints the
    parent). Neither covers the other: `cargo clippy --workspace` in the parent does not deny
    warnings in an excluded path dependency.
+4. The raw-input test in `cargo test -p eframe` (part of `tools/check-fork.ps1`) must stay green: it
+   goes red when a conflict resolution loses the `listen_device_events(Never)` call (#9) or a winit
+   bump changes where raw input is registered. Fix the call site; do not delete the test.
 
 ### Rebase tripwires
 

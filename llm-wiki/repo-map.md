@@ -477,6 +477,9 @@ few things that stock egui cannot do: sub-pixel (ClearType) text, a native CPU
 renderer, the keyboard Menu/Application key (`Key::ContextMenu`, fork
 divergence #5), and genuinely modal `Window`s plus public accesskit
 reparenting (divergence #6 — the keyboard/screen-reader model depends on both).
+The smaller later divergences are the text-cursor blink restart (#7), text-selection
+preservation on secondary click (#8), and no raw device-input registration (#9, pinned by
+a Windows test in `eframe`'s `native/run.rs`).
 `vendor/egui/TASKMAN-FORK.md` is the divergence inventory and rebase runbook;
 `llm-wiki/render-pipeline.md` is the design. The fork has its own quality gate,
 `tools/check-fork.ps1`, because `cargo clippy --workspace` does not reach an excluded

@@ -286,3 +286,8 @@ wgpu = { workspace = true, optional = true }
 # Native dev dependencies for testing
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
 directories.workspace = true
+
+# TASKMAN-FORK: the raw-input regression test in `native/run.rs` reads the process's raw input
+# registrations; the feature is dev-only so shipped builds do not pull the extra bindings.
+[target.'cfg(target_os = "windows")'.dev-dependencies]
+windows-sys = { workspace = true, features = ["Win32_UI_Input"] }

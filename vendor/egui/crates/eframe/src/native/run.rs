@@ -51,10 +51,12 @@ fn create_event_loop(native_options: &mut epi::NativeOptions) -> Result<EventLoo
     // default `DeviceEvents::WhenFocused`. On Windows that delivers a WM_INPUT
     // per mouse packet system-wide while any of our windows is in the
     // foreground, and each packet is dispatched as up to three DeviceEvents.
-    // egui never consumes device events (egui-winit feeds pointer positions
-    // from window CursorMoved events; the raw MouseMotion deltas only add a
-    // redundant Event::MouseMoved), so unregister them. Without this, mouse
-    // movement outside a focused window burns CPU in the UI thread.
+    // taskman does not need device events (egui-winit feeds pointer positions
+    // from window CursorMoved events; the raw MouseMotion deltas only add
+    // Event::MouseMoved for `pointer.motion()`, which taskman never reads), so
+    // unregister them. Without this, mouse movement outside a focused window
+    // burns CPU in the UI thread. Pinned by the Windows test at the bottom of
+    // this file; TASKMAN-FORK.md #9 has the behaviour change.
     event_loop.listen_device_events(winit::event_loop::DeviceEvents::Never);
     Ok(event_loop)
 }
@@ -624,4 +626,84 @@ pub enum EframePumpStatus {
 
     /// The exit code for the application
     Exit(i32),
+}
+
+/// TASKMAN-FORK: pins the "do not register for raw device input" divergence
+/// (`vendor/egui/TASKMAN-FORK.md` #9). A subtree rebase that drops the
+/// `listen_device_events(Never)` call leaves winit's default `WhenFocused`
+/// registration in place, and every mouse packet system-wide then reaches the
+/// UI thread as `WM_INPUT` while one of our windows is focused.
+#[cfg(all(test, target_os = "windows"))]
+mod tests {
+    use windows_sys::Win32::UI::Input::{GetRegisteredRawInputDevices, RAWINPUTDEVICE};
+    use winit::platform::windows::EventLoopBuilderExtWindows as _;
+
+    use super::*;
+
+    const HID_USAGE_PAGE_GENERIC: u16 = 0x01;
+    const HID_USAGE_GENERIC_MOUSE: u16 = 0x02;
+    const HID_USAGE_GENERIC_KEYBOARD: u16 = 0x06;
+
+    /// The raw-input registrations of this process (registration is process-wide).
+    #[expect(unsafe_code)]
+    fn registered_raw_input_devices() -> Vec<RAWINPUTDEVICE> {
+        let device_size = size_of::<RAWINPUTDEVICE>() as u32;
+        let mut count = 0_u32;
+        // SAFETY: a null buffer only asks for the number of registered devices,
+        // which is written to the valid `count`.
+        let queried =
+            unsafe { GetRegisteredRawInputDevices(std::ptr::null_mut(), &mut count, device_size) };
+        assert_eq!(queried, 0, "querying the raw input device count failed");
+        if count == 0 {
+            // A non-null buffer with a zero capacity is rejected, so do not ask.
+            return Vec::new();
+        }
+
+        let mut devices = vec![
+            RAWINPUTDEVICE {
+                usUsagePage: 0,
+                usUsage: 0,
+                dwFlags: 0,
+                hwndTarget: std::ptr::null_mut(),
+            };
+            count as usize
+        ];
+        // SAFETY: `devices` holds `count` initialised entries and `count` is its
+        // exact capacity in `RAWINPUTDEVICE`s, as the API requires.
+        let written =
+            unsafe { GetRegisteredRawInputDevices(devices.as_mut_ptr(), &mut count, device_size) };
+        assert_ne!(written, u32::MAX, "reading the raw input devices failed");
+        devices.truncate(written as usize);
+        devices
+    }
+
+    #[test]
+    fn event_loop_creation_unregisters_raw_mouse_and_keyboard_input() {
+        let mut native_options = epi::NativeOptions {
+            // The test thread is not the main thread; winit refuses to build an
+            // event loop there unless asked to.
+            event_loop_builder: Some(Box::new(|builder| {
+                builder.with_any_thread(true);
+            })),
+            ..Default::default()
+        };
+        let _event_loop = create_event_loop(&mut native_options).expect("event loop");
+
+        let still_registered: Vec<(u16, u16)> = registered_raw_input_devices()
+            .iter()
+            .filter(|device| {
+                device.usUsagePage == HID_USAGE_PAGE_GENERIC
+                    && matches!(
+                        device.usUsage,
+                        HID_USAGE_GENERIC_MOUSE | HID_USAGE_GENERIC_KEYBOARD
+                    )
+            })
+            .map(|device| (device.usUsagePage, device.usUsage))
+            .collect();
+        assert!(
+            still_registered.is_empty(),
+            "raw mouse/keyboard input is still registered after event loop creation \
+             (page, usage): {still_registered:?}"
+        );
+    }
 }

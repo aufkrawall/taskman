@@ -398,6 +398,17 @@ Found by the 2026-10-21 row-vs-total audit and deliberately not changed:
 - **Loopback:** only 127.0.0.0/8, ::1 and ::ffff:127/104 are excluded from
   per-process network; traffic to the machine's own adapter address also
   stays inside the stack but is still counted.
+
+## Mouse movement over the focused window still repaints per move (2026-11-17)
+
+- The 2026-11-17 raw-input fix (fork divergence #9) removed the cost of mouse movement
+  *outside* a focused TaskMan window. Movement *over* the window is unchanged: a minimal
+  eframe probe measured ~0.96 cores at 1 kHz movement, which the investigation attributed
+  to egui's normal per-`CursorMoved` repaint (`llm-wiki/log/recent.md`, 2026-11-17).
+  Not measured on the live TaskMan UI and not investigated further; a fix would be in the
+  repaint scheduling (for example coalescing pointer-move repaints, or skipping them when no
+  hover state changes) and is unverified.
+
 ## Falsified findings — do not re-raise
 
 - "`process_ops::tests::service_catalog_discovers_active_services` is timing-sensitive"
