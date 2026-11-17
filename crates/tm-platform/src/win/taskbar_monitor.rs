@@ -146,6 +146,17 @@ const UIA_FAILURE_BACKOFF_STEPS: [Duration; 4] = [
     Duration::from_secs(2),
     Duration::from_secs(5),
 ];
+// A transient empty UIA result (virtual-desktop animation) gets a few quick,
+// bounded retries so the widget reappears interactively promptly. After that
+// it is treated as a real failure: back off and hide instead of spinning COM
+// scans every `UIA_MIN_SCAN_INTERVAL` against an empty taskbar.
+const UIA_PROVISIONAL_EMPTY_LIMIT: u32 = 5;
+const UIA_PROVISIONAL_BACKOFF_STEPS: [Duration; 4] = [
+    Duration::from_millis(120),
+    Duration::from_millis(250),
+    Duration::from_millis(500),
+    Duration::from_millis(1000),
+];
 const MIN_ADAPTIVE_FONT_PT: f32 = 6.5;
 // `HSHELL_HIGHBIT | HSHELL_WINDOWACTIVATED`: Windows Shell notification fired
 // when a fullscreen / "rude" app enters or leaves fullscreen focus.
@@ -473,6 +484,26 @@ enum OcclusionOutcome {
 struct AppliedClip {
     size: (i32, i32),
     local_rects: Vec<PixelRect>,
+}
+
+/// Sub-pixel jitter in an animating occluder's frame would otherwise reinstall
+/// an identical window region on every refresh, forcing needless DWM
+/// recomposition. Skip the region update while the difference stays tiny.
+const CLIP_TOLERANCE_PX: i32 = 2;
+
+fn applied_clip_equivalent(previous: &AppliedClip, next: &AppliedClip) -> bool {
+    previous.size == next.size
+        && previous.local_rects.len() == next.local_rects.len()
+        && previous
+            .local_rects
+            .iter()
+            .zip(&next.local_rects)
+            .all(|(a, b)| {
+                (a.left - b.left).abs() <= CLIP_TOLERANCE_PX
+                    && (a.top - b.top).abs() <= CLIP_TOLERANCE_PX
+                    && (a.right - b.right).abs() <= CLIP_TOLERANCE_PX
+                    && (a.bottom - b.bottom).abs() <= CLIP_TOLERANCE_PX
+            })
 }
 
 fn local_clip_rects(target: PixelRect, occluder_rects: &[PixelRect]) -> Vec<PixelRect> {
@@ -1578,7 +1609,11 @@ impl WindowCtx {
         let excluded = self.excluded_topmost_tids();
         let summary = scan_above_tray(tray_hwnd, self.hwnd, None, probe_rect, Some(&excluded));
         self.sync_topmost_hooks_with_tids(&summary.topmost_tids);
-        let prechecked = probe_rect.zip(summary.occlusion);
+        let occlusion = summary.occlusion;
+        let occluder_rects = Arc::new(summary.occluder_rects);
+        let prechecked = probe_rect
+            .zip(occlusion)
+            .map(|(rect, check)| (rect, check, occluder_rects));
         if self.last_visible {
             let _ = self.hide_occluded_if_needed_cached(tray_hwnd, probe_rect, prechecked);
             return false;
@@ -1895,9 +1930,9 @@ impl WindowCtx {
     /// Returns `true` when the caller must stop refreshing because we hid.
     fn apply_occlusion_policy(
         &mut self,
-        tray_hwnd: HWND,
         target_rect: PixelRect,
         check: OcclusionCheck,
+        occluder_rects: Vec<PixelRect>,
     ) -> bool {
         match check {
             OcclusionCheck::Clear => {
@@ -1910,15 +1945,6 @@ impl WindowCtx {
                 true
             }
             OcclusionCheck::Occluded(hwnd) => {
-                let occluder_rects = scan_above_tray_with_collect(
-                    tray_hwnd,
-                    self.hwnd,
-                    None,
-                    Some(target_rect),
-                    None,
-                    true,
-                )
-                .occluder_rects;
                 let local_rects = local_clip_rects(target_rect, &occluder_rects);
                 let key = AppliedClip {
                     size: (target_rect.width(), target_rect.height()),
@@ -1937,7 +1963,11 @@ impl WindowCtx {
                     }
                     OcclusionOutcome::Clipped => {}
                 }
-                if self.applied_clip.as_ref() != Some(&key) && !self.apply_window_clip(&key) {
+                let unchanged = self
+                    .applied_clip
+                    .as_ref()
+                    .is_some_and(|previous| applied_clip_equivalent(previous, &key));
+                if !unchanged && !self.apply_window_clip(&key) {
                     self.reset_clip();
                     self.last_occluded_rect = Some(target_rect);
                     self.hide("occluded_above_tray", Some(hwnd));
@@ -1972,7 +2002,7 @@ impl WindowCtx {
         &mut self,
         tray_hwnd: HWND,
         target_rect: Option<PixelRect>,
-        prechecked: Option<(PixelRect, OcclusionCheck)>,
+        prechecked: Option<PrecheckedOcclusion>,
     ) -> bool {
         if self.in_elevated_band {
             let Some(rect) = target_rect else {
@@ -1980,11 +2010,13 @@ impl WindowCtx {
                 self.hide("missing_target_rect", None);
                 return true;
             };
-            let check = match prechecked {
-                Some((checked_rect, res)) if checked_rect == rect => res,
-                _ => check_rect_occluded_above_taskbar(tray_hwnd, self.hwnd, rect),
+            let (check, rects) = match prechecked.as_ref() {
+                Some((checked_rect, res, rects)) if *checked_rect == rect => {
+                    (*res, rects.as_ref().clone())
+                }
+                _ => occlusion_check_with_rects(tray_hwnd, self.hwnd, rect),
             };
-            self.apply_occlusion_policy(tray_hwnd, rect, check)
+            self.apply_occlusion_policy(rect, check, rects)
         } else {
             self.reset_clip();
             if !ensure_just_above_taskbar(self.hwnd, tray_hwnd) {
@@ -2031,7 +2063,7 @@ impl WindowCtx {
         metrics: &Metrics,
         env: TaskbarEnv,
         force_render: bool,
-        prechecked_occlusion: Option<(PixelRect, OcclusionCheck)>,
+        prechecked_occlusion: Option<PrecheckedOcclusion>,
     ) {
         let tray_raw = env.tray_hwnd.0 as isize;
         let prev_geom = self.last_env_geom;
@@ -2084,10 +2116,8 @@ impl WindowCtx {
                     self.last_rect(),
                     prechecked_occlusion,
                 );
-                // A provisional (empty) scan must not leave us click-through
-                // forever: ask the worker to revalidate the layout again.
-                self.uia_scanner
-                    .request_scan(tray_raw, env.taskbar_rect, false);
+                // The worker owns bounded retries for provisional empty scans;
+                // requesting another scan here would close a 80 ms feedback loop.
                 return;
             }
             if !self.last_visible && !self.restore_from_cached_layout {
@@ -2120,7 +2150,7 @@ impl WindowCtx {
             && self.hide_occluded_if_needed_cached(
                 env.tray_hwnd,
                 self.last_rect(),
-                prechecked_occlusion,
+                prechecked_occlusion.clone(),
             )
         {
             return;
@@ -2184,11 +2214,13 @@ impl WindowCtx {
                 bottom: y.saturating_add(h),
             };
             if self.in_elevated_band {
-                let check = match prechecked_occlusion {
-                    Some((checked_rect, res)) if checked_rect == target_rect => res,
-                    _ => check_rect_occluded_above_taskbar(env.tray_hwnd, self.hwnd, target_rect),
+                let (check, rects) = match prechecked_occlusion.as_ref() {
+                    Some((checked_rect, res, rects)) if *checked_rect == target_rect => {
+                        (*res, rects.as_ref().clone())
+                    }
+                    _ => occlusion_check_with_rects(env.tray_hwnd, self.hwnd, target_rect),
                 };
-                if self.apply_occlusion_policy(env.tray_hwnd, target_rect, check) {
+                if self.apply_occlusion_policy(target_rect, check, rects) {
                     return;
                 }
             }
@@ -2288,10 +2320,14 @@ impl WindowCtx {
         // the policy only after the renderer borrow ends: clipping mutates the
         // window and its tracked occluder (and must run before `finish_show`
         // restores that handle on show).
-        let occlusion_check = self.in_elevated_band.then(|| match prechecked_occlusion {
-            Some((checked_rect, res)) if checked_rect == target_rect => res,
-            _ => check_rect_occluded_above_taskbar(env.tray_hwnd, self.hwnd, target_rect),
-        });
+        let occlusion_check = self
+            .in_elevated_band
+            .then(|| match prechecked_occlusion.as_ref() {
+                Some((checked_rect, res, rects)) if *checked_rect == target_rect => {
+                    (*res, rects.as_ref().clone())
+                }
+                _ => occlusion_check_with_rects(env.tray_hwnd, self.hwnd, target_rect),
+            });
         let needs_render = force_render
             || self.last_display.as_ref() != Some(&display)
             || self.last_size != (w, h)
@@ -2333,8 +2369,8 @@ impl WindowCtx {
             }
             self.last_pos = Some((x, y));
         }
-        if let Some(check) = occlusion_check
-            && self.apply_occlusion_policy(env.tray_hwnd, target_rect, check)
+        if let Some((check, rects)) = occlusion_check
+            && self.apply_occlusion_policy(target_rect, check, rects)
         {
             return;
         }
@@ -2622,7 +2658,7 @@ struct TaskbarEnv {
 enum TaskbarEnvProbe {
     Ready {
         env: TaskbarEnv,
-        prechecked_occlusion: Option<(PixelRect, OcclusionCheck)>,
+        prechecked_occlusion: Option<PrecheckedOcclusion>,
         topmost_tids: Vec<u32>,
     },
     Fullscreen {
@@ -2709,6 +2745,8 @@ fn probe_taskbar_env(
         });
 
         let dpi = GetDpiForWindow(tray_hwnd);
+        let occlusion = summary.occlusion;
+        let occluder_rects = Arc::new(summary.occluder_rects);
         TaskbarEnvProbe::Ready {
             env: TaskbarEnv {
                 tray_hwnd,
@@ -2716,7 +2754,9 @@ fn probe_taskbar_env(
                 tray_notify_rect,
                 dpi: if dpi == 0 { 96 } else { dpi },
             },
-            prechecked_occlusion: occlusion_probe.zip(summary.occlusion),
+            prechecked_occlusion: occlusion_probe
+                .zip(occlusion)
+                .map(|(rect, check)| (rect, check, occluder_rects)),
             topmost_tids: summary.topmost_tids,
         }
     }
@@ -3129,6 +3169,24 @@ enum OcclusionCheck {
     Occluded(HWND),
 }
 
+/// Occlusion result together with the occluder frames collected by the *same*
+/// enumeration. Reusing them avoids a second `EnumWindows` pass that could
+/// observe a different window set and clip against a vanished occluder.
+type PrecheckedOcclusion = (PixelRect, OcclusionCheck, Arc<Vec<PixelRect>>);
+
+fn occlusion_check_with_rects(
+    tray_hwnd: HWND,
+    own_hwnd: HWND,
+    target_rect: PixelRect,
+) -> (OcclusionCheck, Vec<PixelRect>) {
+    let summary =
+        scan_above_tray_with_collect(tray_hwnd, own_hwnd, None, Some(target_rect), None, true);
+    (
+        summary.occlusion.unwrap_or(OcclusionCheck::TrayMissing),
+        summary.occluder_rects,
+    )
+}
+
 fn occlusion_result_after_enum(
     saw_tray: bool,
     tray_band: Option<u32>,
@@ -3319,13 +3377,15 @@ fn scan_above_tray(
     probe_rect: Option<PixelRect>,
     excluded_tids: Option<&[u32]>,
 ) -> AboveTraySummary {
+    // Any scan with a probe rect feeds the occlusion policy, which needs the
+    // occluder frames from that exact enumeration to clip deterministically.
     scan_above_tray_with_collect(
         tray_hwnd,
         own_hwnd,
         monitor_rect,
         probe_rect,
         excluded_tids,
-        false,
+        probe_rect.is_some(),
     )
 }
 
@@ -3430,6 +3490,7 @@ fn check_rect_occluded_above_taskbar_in_band(
     .unwrap_or(OcclusionCheck::TrayMissing)
 }
 
+#[cfg(test)]
 fn check_rect_occluded_above_taskbar(
     tray_hwnd: HWND,
     own_hwnd: HWND,
@@ -3830,6 +3891,7 @@ struct UiaShared {
     min_valid_generation: u64,
     shutdown: bool,
     consecutive_failures: u32,
+    consecutive_empty_scans: u32,
     backoff_until: Option<Instant>,
     last_target: Option<(isize, PixelRect)>,
 }
@@ -3841,6 +3903,12 @@ fn uia_failure_backoff(consecutive_failures: u32) -> Duration {
     let idx =
         (consecutive_failures.saturating_sub(1) as usize).min(UIA_FAILURE_BACKOFF_STEPS.len() - 1);
     UIA_FAILURE_BACKOFF_STEPS[idx]
+}
+
+fn uia_provisional_backoff(consecutive_empty_scans: u32) -> Duration {
+    let idx = (consecutive_empty_scans.saturating_sub(1) as usize)
+        .min(UIA_PROVISIONAL_BACKOFF_STEPS.len() - 1);
+    UIA_PROVISIONAL_BACKOFF_STEPS[idx]
 }
 
 impl UiaShared {
@@ -3860,23 +3928,27 @@ impl UiaShared {
     /// An empty *successful* scan (virtual-desktop transition, tray XAML
     /// rebuild) keeps the last confirmed rectangles but marks them stale, so
     /// the widget stays put and click-through until the next real result.
-    /// Genuine scan failures still go through `publish_at(target, None)`,
-    /// which clears the cache and hides the monitor.
-    fn mark_empty_scan_provisional(&mut self, target: UiaTarget) -> bool {
-        if self.cache.rects.is_some()
-            && self.cache.tray_hwnd == target.tray_hwnd
-            && self.cache.taskbar_rect == target.taskbar_rect
+    /// Retries are bounded and backed off here, in the worker: a permanently
+    /// empty taskbar must not spin COM scans or leave the widget click-through
+    /// forever. Once the limit is exhausted this returns false so the caller
+    /// falls through to the normal failure path (clear cache, back off, hide).
+    fn mark_empty_scan_provisional(&mut self, target: UiaTarget, now: Instant) -> bool {
+        if self.cache.rects.is_none()
+            || self.cache.tray_hwnd != target.tray_hwnd
+            || self.cache.taskbar_rect != target.taskbar_rect
         {
-            self.cache.generation = self.generation.wrapping_sub(1);
-            if self
-                .pending
-                .is_some_and(|p| p.generation == target.generation)
-            {
-                self.pending = None;
-            }
-            return true;
+            return false;
         }
-        false
+        self.consecutive_empty_scans = self.consecutive_empty_scans.saturating_add(1);
+        if self.consecutive_empty_scans > UIA_PROVISIONAL_EMPTY_LIMIT {
+            return false;
+        }
+        self.cache.generation = self.generation.wrapping_sub(1);
+        self.backoff_until = Some(now + uia_provisional_backoff(self.consecutive_empty_scans));
+        // Keep retry ownership inside the worker so recovery happens even when
+        // sampling is paused; no refresh-side `request_scan` feedback loop.
+        self.pending = Some(target);
+        true
     }
 
     fn publish_at(
@@ -3901,6 +3973,7 @@ impl UiaShared {
                     <= self.generation.wrapping_sub(self.min_valid_generation);
             if valid_for_current_target && self.cache.rects.is_none() && rects.is_some() {
                 self.consecutive_failures = 0;
+                self.consecutive_empty_scans = 0;
                 self.backoff_until = None;
                 self.cache = UiaCache {
                     tray_hwnd: target.tray_hwnd,
@@ -3917,6 +3990,7 @@ impl UiaShared {
         let had_rects_for_target = same_target && self.cache.rects.is_some();
         let changed = if rects.is_some() {
             self.consecutive_failures = 0;
+            self.consecutive_empty_scans = 0;
             self.backoff_until = None;
             if self
                 .pending
@@ -3927,6 +4001,7 @@ impl UiaShared {
             !same_target || self.cache.rects != rects || self.cache.generation != target.generation
         } else {
             self.consecutive_failures = self.consecutive_failures.saturating_add(1);
+            self.consecutive_empty_scans = 0;
             self.backoff_until = Some(now + uia_failure_backoff(self.consecutive_failures));
             // Keep retry ownership inside the UIA worker across failures so recovery
             // continues after backoff even when sampling is paused and `changed == false`.
@@ -3999,6 +4074,7 @@ impl UiaScanner {
         if target_changed {
             guard.last_target = Some(target_key);
             guard.consecutive_failures = 0;
+            guard.consecutive_empty_scans = 0;
             guard.backoff_until = None;
         }
         if invalidate {
@@ -4132,7 +4208,7 @@ fn uia_worker_main(state: Arc<(Mutex<UiaShared>, Condvar)>) {
                     .0
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
-                    .mark_empty_scan_provisional(target);
+                    .mark_empty_scan_provisional(target, Instant::now());
                 if provisional {
                     post_refresh();
                     continue;
@@ -9805,6 +9881,29 @@ mod tests {
     }
 
     #[test]
+    fn clip_key_tolerance_skips_jitter_but_not_real_moves() {
+        let base = AppliedClip {
+            size: (200, 40),
+            local_rects: vec![rect(20, 0, 90, 40)],
+        };
+        let jitter = AppliedClip {
+            size: (200, 40),
+            local_rects: vec![rect(21, 0, 91, 40)],
+        };
+        let moved = AppliedClip {
+            size: (200, 40),
+            local_rects: vec![rect(30, 0, 100, 40)],
+        };
+        let resized = AppliedClip {
+            size: (220, 40),
+            local_rects: vec![rect(21, 0, 91, 40)],
+        };
+        assert!(applied_clip_equivalent(&base, &jitter));
+        assert!(!applied_clip_equivalent(&base, &moved));
+        assert!(!applied_clip_equivalent(&base, &resized));
+    }
+
+    #[test]
     fn occlusion_outcome_distinguishes_clear_clipped_and_hidden() {
         let size = (100, 40);
         assert_eq!(occlusion_outcome(size, &[]), OcclusionOutcome::Clear);
@@ -9852,7 +9951,7 @@ mod tests {
         {
             let mut guard = scanner.state.0.lock().unwrap();
             assert!(
-                guard.mark_empty_scan_provisional(target),
+                guard.mark_empty_scan_provisional(target, Instant::now()),
                 "an empty successful scan for the confirmed target must be provisional"
             );
             assert_eq!(
@@ -9870,6 +9969,48 @@ mod tests {
             .expect("cache retained");
         assert!(!snapshot.current, "retained layout must be marked stale");
         assert_eq!(snapshot.rects, vec![rect(100, 0, 200, 48)]);
+    }
+
+    #[test]
+    fn repeated_empty_uia_scans_stop_being_provisional_and_fall_back_to_failure() {
+        let scanner = UiaScanner::start();
+        let target_rect = rect(0, 0, 1920, 48);
+        let target = UiaTarget {
+            tray_hwnd: 42,
+            taskbar_rect: target_rect,
+            generation: 0,
+        };
+        let now = Instant::now();
+        {
+            let mut guard = scanner.state.0.lock().unwrap();
+            assert!(guard.publish(target, Some(vec![rect(100, 0, 200, 48)])));
+            for i in 1..=UIA_PROVISIONAL_EMPTY_LIMIT {
+                assert!(
+                    guard.mark_empty_scan_provisional(target, now),
+                    "retry {i} must still be provisional"
+                );
+                assert!(
+                    guard.pending == Some(target),
+                    "the worker must retain retry ownership, not the UI thread"
+                );
+                assert!(
+                    guard.backoff_until.is_some(),
+                    "a provisional retry must be backed off to avoid an 80 ms spin"
+                );
+            }
+            assert!(
+                !guard.mark_empty_scan_provisional(target, now),
+                "a persistently empty taskbar must stop being treated as transient"
+            );
+            assert_eq!(guard.consecutive_failures, 0);
+            assert!(guard.publish(target, None));
+            assert_eq!(guard.cache.rects, None);
+            assert_eq!(guard.consecutive_failures, 1);
+            assert_eq!(guard.consecutive_empty_scans, 0);
+            // A healthy result resets the provisional streak as well.
+            assert!(guard.publish(target, Some(vec![rect(100, 0, 200, 48)])));
+            assert_eq!(guard.consecutive_empty_scans, 0);
+        }
     }
 
     #[test]

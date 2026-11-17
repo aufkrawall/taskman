@@ -420,21 +420,30 @@ fn explorer_parent_info_matches_the_live_snapshot() {
     // is still in the same snapshot must resolve to that process's image and
     // be reported alive; a parent that is gone must be reported terminated.
     match snap.processes.iter().find(|p| p.pid == parent.pid) {
-        Some(live_parent) => {
+        Some(live_parent) if parent.alive => assert_eq!(
+            parent.name.as_deref(),
+            Some(live_parent.name.as_str()),
+            "resolved parent name must match the live process in the same snapshot"
+        ),
+        Some(_) => {
+            // The parent can exit between the snapshot and the security query.
+            let resample = collector.sample(std::time::Instant::now()).unwrap();
             assert!(
-                parent.alive,
-                "a parent present in the live snapshot must be reported alive"
-            );
-            assert_eq!(
-                parent.name.as_deref(),
-                Some(live_parent.name.as_str()),
-                "resolved parent name must match the live process in the same snapshot"
+                resample.processes.iter().all(|p| p.pid != parent.pid),
+                "a parent reported terminated must no longer be live"
             );
         }
-        None => assert!(
-            !parent.alive,
-            "a parent absent from the live snapshot must be reported terminated"
-        ),
+        None if !parent.alive => {}
+        None => {
+            // Conversely it can start between the two observations.
+            let resample = collector.sample(std::time::Instant::now()).unwrap();
+            let live = resample
+                .processes
+                .iter()
+                .find(|p| p.pid == parent.pid)
+                .expect("a parent reported alive must exist in a fresh snapshot");
+            assert_eq!(parent.name.as_deref(), Some(live.name.as_str()));
+        }
     }
 }
 
