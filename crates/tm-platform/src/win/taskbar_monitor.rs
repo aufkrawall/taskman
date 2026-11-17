@@ -146,17 +146,6 @@ const UIA_FAILURE_BACKOFF_STEPS: [Duration; 4] = [
     Duration::from_secs(2),
     Duration::from_secs(5),
 ];
-// A transient empty UIA result (virtual-desktop animation) gets a few quick,
-// bounded retries so the widget reappears interactively promptly. After that
-// it is treated as a real failure: back off and hide instead of spinning COM
-// scans every `UIA_MIN_SCAN_INTERVAL` against an empty taskbar.
-const UIA_PROVISIONAL_EMPTY_LIMIT: u32 = 5;
-const UIA_PROVISIONAL_BACKOFF_STEPS: [Duration; 4] = [
-    Duration::from_millis(120),
-    Duration::from_millis(250),
-    Duration::from_millis(500),
-    Duration::from_millis(1000),
-];
 const MIN_ADAPTIVE_FONT_PT: f32 = 6.5;
 // `HSHELL_HIGHBIT | HSHELL_WINDOWACTIVATED`: Windows Shell notification fired
 // when a fullscreen / "rude" app enters or leaves fullscreen focus.
@@ -2072,54 +2061,6 @@ impl WindowCtx {
             .is_none_or(|(t, bar, _, dpi)| (t, bar, dpi) != (tray_raw, env.taskbar_rect, env.dpi));
         let notify_geom_changed = !core_geom_changed
             && prev_geom.is_some_and(|(_, _, notify, _)| notify != env.tray_notify_rect);
-
-        // A virtual-desktop switch slides the whole taskbar without resizing it.
-        // Following that pure translation keeps the widget attached to the
-        // taskbar for the animation instead of hiding it for a UIA revalidation
-        // that cannot succeed until the motion stops.
-        if core_geom_changed
-            && self.last_visible
-            && self.last_display.is_some()
-            && let Some((x, y)) = self.last_pos
-            && let Some((prev_tray, prev_bar, _, prev_dpi)) = prev_geom
-            && prev_tray == tray_raw
-            && prev_dpi == env.dpi
-            && prev_bar.width() == env.taskbar_rect.width()
-            && prev_bar.height() == env.taskbar_rect.height()
-            // A one-pixel correction is a geometry change that must be
-            // revalidated; only a real slide animation is followed directly.
-            && (env.taskbar_rect.left - prev_bar.left)
-                .abs()
-                .max((env.taskbar_rect.top - prev_bar.top).abs())
-                >= 4
-        {
-            let nx = x.saturating_add(env.taskbar_rect.left - prev_bar.left);
-            let ny = y.saturating_add(env.taskbar_rect.top - prev_bar.top);
-            unsafe {
-                let _ = SetWindowPos(
-                    self.hwnd,
-                    None,
-                    nx,
-                    ny,
-                    0,
-                    0,
-                    SWP_NOSIZE
-                        | SWP_NOZORDER
-                        | SWP_NOACTIVATE
-                        | SWP_NOOWNERZORDER
-                        | SWP_NOSENDCHANGING,
-                );
-            }
-            self.last_pos = Some((nx, ny));
-            self.last_env_geom = Some(geom);
-            self.restore_from_cached_layout = true;
-            // Defer the scan until the motion stops; requesting one per frame
-            // would hammer UI Automation during the animation.
-            self.pending_uia_scan = true;
-            let _ = self.set_interactive(false);
-            return;
-        }
-
         if core_geom_changed {
             self.last_env_geom = Some(geom);
             self.pending_uia_scan = true;
@@ -2144,18 +2085,6 @@ impl WindowCtx {
         let Some(uia_occupied) = self.uia_scanner.snapshot_for(tray_raw, env.taskbar_rect) else {
             self.uia_scanner
                 .request_scan(tray_raw, env.taskbar_rect, false);
-            // First frame after a slide animation: the cache is still keyed to
-            // the old taskbar rect. The cached layout is geometry-matched up to
-            // a translation, so keep the pixels visible but click-through until
-            // the scan for the new rect completes.
-            if self.restore_from_cached_layout
-                && self.last_visible
-                && self.last_display.is_some()
-                && !self.uia_scanner.has_cache_for(tray_raw, env.taskbar_rect)
-                && self.set_interactive(false)
-            {
-                return;
-            }
             self.restore_from_cached_layout = false;
             self.hide("uia_unavailable", None);
             return;
@@ -2176,8 +2105,6 @@ impl WindowCtx {
                     self.last_rect(),
                     prechecked_occlusion,
                 );
-                // The worker owns bounded retries for provisional empty scans;
-                // requesting another scan here would close a 80 ms feedback loop.
                 return;
             }
             if !self.last_visible && !self.restore_from_cached_layout {
@@ -2502,13 +2429,6 @@ impl WindowCtx {
     }
 
     fn hide(&mut self, reason: &'static str, detail: Option<HWND>) {
-        // The virtual-desktop switch animation briefly looks like a fullscreen
-        // app and an above-tray occluder. Its shell helper window exists only
-        // for the animation, so keep the already-presented widget in place and
-        // re-evaluate normally once the helper disappears.
-        if self.last_visible && desktop_switch_in_progress() {
-            return;
-        }
         if self.last_visible {
             let class = detail.and_then(read_window_class);
             let band = detail.and_then(window_band);
@@ -3014,10 +2934,6 @@ fn is_shell_host_overlay_class_buf(cls: &ClassNameBuf) -> bool {
     cls.eq_ascii("Windows.UI.Core.CoreWindow")
         || cls.eq_ascii("XamlExplorerHostIslandWindow")
         || cls.eq_ascii("MultitaskingViewFrame")
-        // Transient full-screen helper the shell shows at the start of a
-        // Ctrl+Win+arrow desktop switch (~200 ms before it cloaks the old
-        // desktop). It covers the whole monitor but is not real content.
-        || cls.eq_ascii("VirtualDesktopHotkeySwitcher")
 }
 
 fn windows_root_dir() -> &'static str {
@@ -3064,10 +2980,7 @@ fn process_image_path(pid: u32) -> Option<String> {
 fn is_shell_host_overlay_class(class_name: &str) -> bool {
     matches!(
         class_name,
-        "Windows.UI.Core.CoreWindow"
-            | "XamlExplorerHostIslandWindow"
-            | "MultitaskingViewFrame"
-            | "VirtualDesktopHotkeySwitcher"
+        "Windows.UI.Core.CoreWindow" | "XamlExplorerHostIslandWindow" | "MultitaskingViewFrame"
     )
 }
 
@@ -3106,25 +3019,7 @@ fn is_shell_host_overlay_identity(class_name: &str, image_path: &str, windows_ro
     )
 }
 
-fn is_desktop_switch_helper_class(cls: &ClassNameBuf) -> bool {
-    cls.eq_ascii("VirtualDesktopHotkeySwitcher")
-}
-
-/// The shell shows this transient full-screen helper for the whole duration of
-/// a Ctrl+Win+arrow desktop switch. Its presence is a reliable signal that the
-/// desktop is animating, so visibility decisions can be deferred until it goes.
-fn desktop_switch_in_progress() -> bool {
-    unsafe { FindWindowW(w!("VirtualDesktopHotkeySwitcher"), None) }.is_ok()
-}
-
 fn is_non_occluding_shell_host_with_class(hwnd: HWND, cls: &ClassNameBuf) -> bool {
-    // `VirtualDesktopHotkeySwitcher` is a Windows-internal class owned by the
-    // shell, which our unelevated token often cannot open for an image-path
-    // query. Exempt it by name alone; the other overlay hosts still require a
-    // verified trusted shell image.
-    if is_desktop_switch_helper_class(cls) {
-        return true;
-    }
     if !is_shell_host_overlay_class_buf(cls) {
         return false;
     }
@@ -3983,7 +3878,6 @@ struct UiaShared {
     min_valid_generation: u64,
     shutdown: bool,
     consecutive_failures: u32,
-    consecutive_empty_scans: u32,
     backoff_until: Option<Instant>,
     last_target: Option<(isize, PixelRect)>,
 }
@@ -3995,12 +3889,6 @@ fn uia_failure_backoff(consecutive_failures: u32) -> Duration {
     let idx =
         (consecutive_failures.saturating_sub(1) as usize).min(UIA_FAILURE_BACKOFF_STEPS.len() - 1);
     UIA_FAILURE_BACKOFF_STEPS[idx]
-}
-
-fn uia_provisional_backoff(consecutive_empty_scans: u32) -> Duration {
-    let idx = (consecutive_empty_scans.saturating_sub(1) as usize)
-        .min(UIA_PROVISIONAL_BACKOFF_STEPS.len() - 1);
-    UIA_PROVISIONAL_BACKOFF_STEPS[idx]
 }
 
 impl UiaShared {
@@ -4015,32 +3903,6 @@ impl UiaShared {
 
     fn publish(&mut self, target: UiaTarget, rects: Option<Vec<PixelRect>>) -> bool {
         self.publish_at(target, rects, Instant::now())
-    }
-
-    /// An empty *successful* scan (virtual-desktop transition, tray XAML
-    /// rebuild) keeps the last confirmed rectangles but marks them stale, so
-    /// the widget stays put and click-through until the next real result.
-    /// Retries are bounded and backed off here, in the worker: a permanently
-    /// empty taskbar must not spin COM scans or leave the widget click-through
-    /// forever. Once the limit is exhausted this returns false so the caller
-    /// falls through to the normal failure path (clear cache, back off, hide).
-    fn mark_empty_scan_provisional(&mut self, target: UiaTarget, now: Instant) -> bool {
-        if self.cache.rects.is_none()
-            || self.cache.tray_hwnd != target.tray_hwnd
-            || self.cache.taskbar_rect != target.taskbar_rect
-        {
-            return false;
-        }
-        self.consecutive_empty_scans = self.consecutive_empty_scans.saturating_add(1);
-        if self.consecutive_empty_scans > UIA_PROVISIONAL_EMPTY_LIMIT {
-            return false;
-        }
-        self.cache.generation = self.generation.wrapping_sub(1);
-        self.backoff_until = Some(now + uia_provisional_backoff(self.consecutive_empty_scans));
-        // Keep retry ownership inside the worker so recovery happens even when
-        // sampling is paused; no refresh-side `request_scan` feedback loop.
-        self.pending = Some(target);
-        true
     }
 
     fn publish_at(
@@ -4065,7 +3927,6 @@ impl UiaShared {
                     <= self.generation.wrapping_sub(self.min_valid_generation);
             if valid_for_current_target && self.cache.rects.is_none() && rects.is_some() {
                 self.consecutive_failures = 0;
-                self.consecutive_empty_scans = 0;
                 self.backoff_until = None;
                 self.cache = UiaCache {
                     tray_hwnd: target.tray_hwnd,
@@ -4082,7 +3943,6 @@ impl UiaShared {
         let had_rects_for_target = same_target && self.cache.rects.is_some();
         let changed = if rects.is_some() {
             self.consecutive_failures = 0;
-            self.consecutive_empty_scans = 0;
             self.backoff_until = None;
             if self
                 .pending
@@ -4093,7 +3953,6 @@ impl UiaShared {
             !same_target || self.cache.rects != rects || self.cache.generation != target.generation
         } else {
             self.consecutive_failures = self.consecutive_failures.saturating_add(1);
-            self.consecutive_empty_scans = 0;
             self.backoff_until = Some(now + uia_failure_backoff(self.consecutive_failures));
             // Keep retry ownership inside the UIA worker across failures so recovery
             // continues after backoff even when sampling is paused and `changed == false`.
@@ -4141,13 +4000,6 @@ impl UiaScanner {
         }
     }
 
-    /// Whether the cache is keyed to this exact taskbar target. Distinguishes
-    /// "not scanned for this moved taskbar yet" from "scanned and unavailable".
-    fn has_cache_for(&self, tray_raw: isize, taskbar_rect: PixelRect) -> bool {
-        let guard = self.state.0.lock().unwrap_or_else(|e| e.into_inner());
-        guard.cache.tray_hwnd == tray_raw && guard.cache.taskbar_rect == taskbar_rect
-    }
-
     fn snapshot_for(&self, tray_raw: isize, taskbar_rect: PixelRect) -> Option<UiaSnapshot> {
         let guard = self.state.0.lock().unwrap_or_else(|e| e.into_inner());
         if guard.cache.tray_hwnd == tray_raw && guard.cache.taskbar_rect == taskbar_rect {
@@ -4173,7 +4025,6 @@ impl UiaScanner {
         if target_changed {
             guard.last_target = Some(target_key);
             guard.consecutive_failures = 0;
-            guard.consecutive_empty_scans = 0;
             guard.backoff_until = None;
         }
         if invalidate {
@@ -4294,25 +4145,8 @@ fn uia_worker_main(state: Arc<(Mutex<UiaShared>, Condvar)>) {
             }
         }
 
-        let empty_but_successful = result.is_ok();
         let rects = result.ok().filter(|r| !r.is_empty());
         if rects.is_none() {
-            if empty_but_successful {
-                // An empty control list is not a failure: Windows returns one
-                // while animating a virtual-desktop switch (or while the tray
-                // XAML island is momentarily rebuilt). Keep the last confirmed
-                // rectangles and only mark them stale so the widget stays put,
-                // click-through, until a fresh scan validates the layout.
-                let provisional = state
-                    .0
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .mark_empty_scan_provisional(target, Instant::now());
-                if provisional {
-                    post_refresh();
-                    continue;
-                }
-            }
             if last_failure_report.is_none_or(|at| at.elapsed() >= Duration::from_secs(30)) {
                 tracing::warn!(
                     error = ?scan_error,
@@ -7857,7 +7691,6 @@ mod tests {
                 "Windows.UI.Core.CoreWindow",
                 "XamlExplorerHostIslandWindow",
                 "MultitaskingViewFrame",
-                "VirtualDesktopHotkeySwitcher",
             ] {
                 assert!(
                     is_shell_host_overlay_identity(overlay_class, path, root),
@@ -7892,44 +7725,12 @@ mod tests {
                 "Windows.UI.Core.CoreWindow",
                 "XamlExplorerHostIslandWindow",
                 "MultitaskingViewFrame",
-                "VirtualDesktopHotkeySwitcher",
             ] {
                 assert!(
                     !is_shell_host_overlay_identity(overlay_class, untrusted, root),
                     "untrusted or non-shell image {untrusted} ({overlay_class}) must not be exempted"
                 );
             }
-        }
-    }
-
-    #[test]
-    fn virtual_desktop_hotkey_switcher_is_a_non_occluding_shell_overlay() {
-        for class in [
-            "VirtualDesktopHotkeySwitcher",
-            "Windows.UI.Core.CoreWindow",
-            "XamlExplorerHostIslandWindow",
-            "MultitaskingViewFrame",
-        ] {
-            assert!(
-                is_shell_host_overlay_class_buf(&ClassNameBuf::from_ascii(class)),
-                "{class} must be skipped by the scan callback"
-            );
-            assert!(
-                is_shell_host_overlay_class(class),
-                "{class} must be skipped by fullscreen detection"
-            );
-        }
-        assert!(is_desktop_switch_helper_class(&ClassNameBuf::from_ascii(
-            "VirtualDesktopHotkeySwitcher"
-        )));
-        assert!(!is_desktop_switch_helper_class(&ClassNameBuf::from_ascii(
-            "XamlExplorerHostIslandWindow"
-        )));
-        for class in ["Shell_TrayWnd", "Xaml_WindowedPopupClass", "CabinetWClass"] {
-            assert!(!is_shell_host_overlay_class_buf(&ClassNameBuf::from_ascii(
-                class
-            )));
-            assert!(!is_shell_host_overlay_class(class));
         }
     }
 
@@ -9318,139 +9119,6 @@ mod tests {
     }
 
     #[test]
-    fn taskbar_slide_translation_moves_widget_without_hiding() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-
-        let _zorder = z_order_test_lock();
-        let _com = ComMtaGuard::enter();
-        let hinstance = HINSTANCE(unsafe { GetModuleHandleW(None).unwrap() }.0);
-        let class_name = register_window_class(hinstance).unwrap();
-        let tray = create_monitor_window(hinstance, class_name, std::ptr::null_mut()).unwrap();
-        let hwnd = create_monitor_window(hinstance, class_name, std::ptr::null_mut()).unwrap();
-        let _windows = TestWindows(vec![tray, hwnd]);
-        let bar = rect(-10_000, -10_000, -8_080, -9_952);
-        let notify = rect(-8_300, -10_000, -8_080, -9_952);
-        let env = TaskbarEnv {
-            tray_hwnd: tray,
-            taskbar_rect: bar,
-            tray_notify_rect: Some(notify),
-            dpi: 96,
-        };
-        unsafe {
-            let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
-        }
-        let config = Config {
-            enabled: true,
-            ..Config::default()
-        };
-        let metrics = Metrics {
-            cpu_pct: Some(25.0),
-            ram_pct: Some(50.0),
-            ..Metrics::default()
-        };
-        let display = build_display(&config, &metrics, false, false, 96, false);
-        let notifications = Arc::new(AtomicUsize::new(0));
-        let observed = notifications.clone();
-        let scanner = Arc::new(UiaScanner {
-            state: Arc::new((
-                Mutex::new(UiaShared {
-                    cache: UiaCache {
-                        tray_hwnd: tray.0 as isize,
-                        taskbar_rect: bar,
-                        rects: Some(vec![notify]),
-                        generation: 0,
-                    },
-                    ..Default::default()
-                }),
-                Condvar::new(),
-            )),
-            worker: Mutex::new(None),
-        });
-        let mut ctx = WindowCtx {
-            hwnd,
-            in_elevated_band: false,
-            user_closing: false,
-            shared: Arc::new(Mutex::new(SharedState {
-                config: config.clone(),
-                metrics,
-                generation: 0,
-            })),
-            visibility: Arc::new(MonitorVisibility {
-                visible: std::sync::atomic::AtomicBool::new(true),
-                notifier: Arc::new(move || {
-                    observed.fetch_add(1, Ordering::Relaxed);
-                }),
-            }),
-            callback: Arc::new(|_| {}),
-            renderer: Renderer::new(),
-            uia_scanner: scanner,
-            light_taskbar: false,
-            hovered: false,
-            tracking_mouse: false,
-            last_display: Some(display),
-            last_size: (100, 40),
-            last_pos: Some((1400, 1008)),
-            last_visible: true,
-            last_present_error: None,
-            last_anchor_slot: None,
-            last_compact: false,
-            last_stacked: false,
-            last_env_geom: Some((tray.0 as isize, bar, Some(notify), 96)),
-            pending_uia_scan: false,
-            invalidate_uia_layout: false,
-            restore_from_cached_layout: true,
-            tracked_fg_tid: 0,
-            fg_loc_hook: HWINEVENTHOOK::default(),
-            tracked_fs_tid: 0,
-            fs_loc_hook: HWINEVENTHOOK::default(),
-            fs_lifecycle_hook: HWINEVENTHOOK::default(),
-            fs_cloak_hook: HWINEVENTHOOK::default(),
-            tracked_tray_tid: 0,
-            tray_hook: HWINEVENTHOOK::default(),
-            topmost_hooks: Vec::new(),
-            last_fg_hwnd: 0,
-            fullscreen_recheck_remaining: 0,
-            fullscreen_recheck_armed: false,
-            hidden_by_occlusion: false,
-            hidden_by_tray_missing: false,
-            last_occluded_rect: None,
-            applied_clip: None,
-            clip_occluder: HWND::default(),
-            topmost_recheck_armed: false,
-        };
-
-        // Slide the whole taskbar 300 px right with no size change: the widget
-        // must follow it, stay visible, and go click-through until UIA catches up.
-        let shifted = TaskbarEnv {
-            taskbar_rect: rect(bar.left + 300, bar.top, bar.right + 300, bar.bottom),
-            tray_notify_rect: Some(rect(
-                notify.left + 300,
-                notify.top,
-                notify.right + 300,
-                notify.bottom,
-            )),
-            ..env
-        };
-        ctx.refresh_taskbar_env(&config, &metrics, shifted, false);
-        assert!(
-            ctx.last_visible,
-            "a pure taskbar slide must not hide the widget"
-        );
-        assert_eq!(ctx.last_pos, Some((1700, 1008)));
-        assert_eq!(notifications.load(Ordering::Relaxed), 0);
-        assert!(
-            !ctx.accepts_input(),
-            "clicks must pass through while revalidating"
-        );
-
-        // Settled frame: UIA is still keyed to the old rect, but the cached
-        // layout must keep the widget visible until the deferred scan returns.
-        ctx.refresh_taskbar_env(&config, &metrics, shifted, false);
-        assert!(ctx.last_visible);
-        assert_eq!(notifications.load(Ordering::Relaxed), 0);
-    }
-
-    #[test]
     fn tray_notify_resize_repositions_on_cached_layout_without_hiding_or_discarding_uia() {
         use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -10197,85 +9865,6 @@ mod tests {
             &[rect(0, 0, 49, 40), rect(50, 0, 100, 40)],
         );
         assert_eq!(occlusion_outcome(size, &gapped), OcclusionOutcome::Clipped);
-    }
-
-    #[test]
-    fn empty_uia_scan_keeps_confirmed_layout_but_marks_it_provisional() {
-        let scanner = UiaScanner::start();
-        let target_rect = rect(0, 0, 1920, 48);
-        let target = UiaTarget {
-            tray_hwnd: 42,
-            taskbar_rect: target_rect,
-            generation: 0,
-        };
-        {
-            let mut guard = scanner.state.0.lock().unwrap();
-            assert!(guard.publish(target, Some(vec![rect(100, 0, 200, 48)])));
-            assert!(guard.pending.is_none());
-        }
-        {
-            let mut guard = scanner.state.0.lock().unwrap();
-            assert!(
-                guard.mark_empty_scan_provisional(target, Instant::now()),
-                "an empty successful scan for the confirmed target must be provisional"
-            );
-            assert_eq!(
-                guard.cache.rects,
-                Some(vec![rect(100, 0, 200, 48)]),
-                "confirmed rectangles must survive a transient empty scan"
-            );
-            assert_eq!(
-                guard.consecutive_failures, 0,
-                "empty success is not a failure"
-            );
-        }
-        let snapshot = scanner
-            .snapshot_for(42, target_rect)
-            .expect("cache retained");
-        assert!(!snapshot.current, "retained layout must be marked stale");
-        assert_eq!(snapshot.rects, vec![rect(100, 0, 200, 48)]);
-    }
-
-    #[test]
-    fn repeated_empty_uia_scans_stop_being_provisional_and_fall_back_to_failure() {
-        let scanner = UiaScanner::start();
-        let target_rect = rect(0, 0, 1920, 48);
-        let target = UiaTarget {
-            tray_hwnd: 42,
-            taskbar_rect: target_rect,
-            generation: 0,
-        };
-        let now = Instant::now();
-        {
-            let mut guard = scanner.state.0.lock().unwrap();
-            assert!(guard.publish(target, Some(vec![rect(100, 0, 200, 48)])));
-            for i in 1..=UIA_PROVISIONAL_EMPTY_LIMIT {
-                assert!(
-                    guard.mark_empty_scan_provisional(target, now),
-                    "retry {i} must still be provisional"
-                );
-                assert!(
-                    guard.pending == Some(target),
-                    "the worker must retain retry ownership, not the UI thread"
-                );
-                assert!(
-                    guard.backoff_until.is_some(),
-                    "a provisional retry must be backed off to avoid an 80 ms spin"
-                );
-            }
-            assert!(
-                !guard.mark_empty_scan_provisional(target, now),
-                "a persistently empty taskbar must stop being treated as transient"
-            );
-            assert_eq!(guard.consecutive_failures, 0);
-            assert!(guard.publish(target, None));
-            assert_eq!(guard.cache.rects, None);
-            assert_eq!(guard.consecutive_failures, 1);
-            assert_eq!(guard.consecutive_empty_scans, 0);
-            // A healthy result resets the provisional streak as well.
-            assert!(guard.publish(target, Some(vec![rect(100, 0, 200, 48)])));
-            assert_eq!(guard.consecutive_empty_scans, 0);
-        }
     }
 
     #[test]
