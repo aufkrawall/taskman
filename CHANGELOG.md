@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.1.30 - 2026-11-17
+
 ### New
 
 - **2 s update speed option:** the Settings dialog's Update speed block now offers a `2 s` choice between Normal (1 s) and Low (4 s), in addition to the existing High, Normal, Low and Paused values. It persists in the config as `update_speed=2s` and makes the engine and update-speed-driven pages sample every two seconds; pages with a longer floor (Services: 5 s) keep that floor, and Paused still freezes updates.
