@@ -1248,12 +1248,14 @@ pub fn settings_dialog(app: &mut TaskManApp, ctx: &egui::Context, _pal: &theme::
                 for speed in [
                     tm_core::settings::UpdateSpeed::High,
                     tm_core::settings::UpdateSpeed::Normal,
+                    tm_core::settings::UpdateSpeed::TwoSeconds,
                     tm_core::settings::UpdateSpeed::Low,
                     tm_core::settings::UpdateSpeed::Paused,
                 ] {
                     let key = match speed {
                         tm_core::settings::UpdateSpeed::High => K::SpdHigh,
                         tm_core::settings::UpdateSpeed::Normal => K::SpdNormal,
+                        tm_core::settings::UpdateSpeed::TwoSeconds => K::SpdTwoSeconds,
                         tm_core::settings::UpdateSpeed::Low => K::SpdLow,
                         tm_core::settings::UpdateSpeed::Paused => K::SpdPaused,
                     };

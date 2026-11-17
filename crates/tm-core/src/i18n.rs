@@ -687,6 +687,7 @@ keys! {
     UpdateSpeedHeading => ["Aktualisierungsgeschwindigkeit", "Update speed"],
     SpdHigh => ["Hoch (0,5 s)", "High (0.5 s)"],
     SpdNormal => ["Normal (1 s)", "Normal (1 s)"],
+    SpdTwoSeconds => ["2 s", "2 s"],
     SpdLow => ["Niedrig (4 s)", "Low (4 s)"],
     SpdPaused => ["Angehalten", "Paused"],
     GraphWindowLabel => ["Diagrammfenster:", "Graph window:"],

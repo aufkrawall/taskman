@@ -84,6 +84,8 @@ pub enum UpdateSpeed {
     High,
     /// 1000 ms (Task Manager default)
     Normal,
+    /// 2000 ms
+    TwoSeconds,
     /// 4000 ms
     Low,
     Paused,
@@ -94,6 +96,7 @@ impl UpdateSpeed {
         match self {
             UpdateSpeed::High => std::time::Duration::from_millis(500),
             UpdateSpeed::Normal => std::time::Duration::from_millis(1000),
+            UpdateSpeed::TwoSeconds => std::time::Duration::from_millis(2000),
             UpdateSpeed::Low => std::time::Duration::from_millis(4000),
             UpdateSpeed::Paused => std::time::Duration::from_secs(3600),
         }
@@ -679,6 +682,7 @@ impl UpdateSpeed {
         match self {
             Self::High => "high",
             Self::Normal => "normal",
+            Self::TwoSeconds => "2s",
             Self::Low => "low",
             Self::Paused => "paused",
         }
@@ -687,6 +691,7 @@ impl UpdateSpeed {
         match s.to_ascii_lowercase().as_str() {
             "high" => Some(Self::High),
             "normal" => Some(Self::Normal),
+            "2s" => Some(Self::TwoSeconds),
             "low" => Some(Self::Low),
             "paused" => Some(Self::Paused),
             _ => None,
@@ -1764,9 +1769,24 @@ rule.1=["c:\\\\ok.exe",{"priority":"High","affinity_mask":3}]
             std::time::Duration::from_secs(1)
         );
         assert_eq!(
+            UpdateSpeed::TwoSeconds.interval(),
+            std::time::Duration::from_secs(2)
+        );
+        assert_eq!(
             UpdateSpeed::Low.interval(),
             std::time::Duration::from_secs(4)
         );
+    }
+
+    #[test]
+    fn two_seconds_speed_roundtrips_through_config() {
+        let s = Settings::from_ini_text(
+            "[general]
+update_speed=2s
+",
+        );
+        assert_eq!(s.update_speed, UpdateSpeed::TwoSeconds);
+        assert_eq!(UpdateSpeed::TwoSeconds.as_cfg(), "2s");
     }
 
     #[test]

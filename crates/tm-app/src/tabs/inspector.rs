@@ -208,6 +208,15 @@ mod tests {
         assert_eq!(page_interval(UpdateSpeed::High, floor), Some(floor));
         assert_eq!(page_interval(UpdateSpeed::Normal, floor), Some(floor));
         assert_eq!(
+            page_interval(UpdateSpeed::TwoSeconds, floor),
+            Some(Duration::from_secs(2))
+        );
+        // A faster per-page floor (Threads: 1 s) must not speed up the 2 s choice.
+        assert_eq!(
+            page_interval(UpdateSpeed::TwoSeconds, Duration::from_secs(1)),
+            Some(Duration::from_secs(2))
+        );
+        assert_eq!(
             page_interval(UpdateSpeed::Low, floor),
             Some(Duration::from_secs(4))
         );

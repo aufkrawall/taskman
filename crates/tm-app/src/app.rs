@@ -3039,6 +3039,7 @@ mod tests {
         for speed in [
             tm_core::settings::UpdateSpeed::High,
             tm_core::settings::UpdateSpeed::Normal,
+            tm_core::settings::UpdateSpeed::TwoSeconds,
             tm_core::settings::UpdateSpeed::Low,
         ] {
             assert!(
@@ -3051,7 +3052,12 @@ mod tests {
     #[test]
     fn taskbar_sampling_slows_while_suppressed_and_respects_pause() {
         use tm_core::settings::UpdateSpeed;
-        for speed in [UpdateSpeed::High, UpdateSpeed::Normal, UpdateSpeed::Low] {
+        for speed in [
+            UpdateSpeed::High,
+            UpdateSpeed::Normal,
+            UpdateSpeed::TwoSeconds,
+            UpdateSpeed::Low,
+        ] {
             // Fullscreen, auto-hide, unknown occupancy, and a packed bar all publish
             // false visibility even though the taskbar setting remains enabled.
             assert_eq!(

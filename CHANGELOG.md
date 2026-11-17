@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### New
+
+- **2 s update speed option:** the Settings dialog's Update speed block now offers a `2 s` choice between Normal (1 s) and Low (4 s), in addition to the existing High, Normal, Low and Paused values. It persists in the config as `update_speed=2s` and makes the engine and update-speed-driven pages sample every two seconds; pages with a longer floor (Services: 5 s) keep that floor, and Paused still freezes updates.
+
 ### Fixed
 
 - **Mouse movement outside the TaskMan window no longer raises CPU load while the window has focus:** winit registers all mice and keyboards for raw input with its default `DeviceEvents::WhenFocused`, so on Windows every mouse packet system-wide arrived as `WM_INPUT` while any TaskMan window was in the foreground — even with the cursor 100% outside the window — and each packet was dispatched through the UI thread (and could even trigger a full repaint when the tracked pointer position was stale). The vendored egui fork now unregisters raw device input when the event loop is created (`listen_device_events(DeviceEvents::Never)`); egui receives pointer movement from ordinary window cursor events, so hover, drags and tooltips are unchanged. Measured on the live app with synthetic ~5 kHz mouse movement outside the focused window: ~0.6 cores before, at idle level (~0.04–0.15 cores) after; at a realistic 1 kHz a minimal eframe app went from ~0.14 cores to ~0. Movement over the window itself still repaints per move and is unchanged.
