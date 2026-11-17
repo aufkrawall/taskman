@@ -3007,6 +3007,10 @@ fn is_shell_host_overlay_class_buf(cls: &ClassNameBuf) -> bool {
     cls.eq_ascii("Windows.UI.Core.CoreWindow")
         || cls.eq_ascii("XamlExplorerHostIslandWindow")
         || cls.eq_ascii("MultitaskingViewFrame")
+        // Transient full-screen helper the shell shows at the start of a
+        // Ctrl+Win+arrow desktop switch (~200 ms before it cloaks the old
+        // desktop). It covers the whole monitor but is not real content.
+        || cls.eq_ascii("VirtualDesktopHotkeySwitcher")
 }
 
 fn windows_root_dir() -> &'static str {
@@ -3053,7 +3057,10 @@ fn process_image_path(pid: u32) -> Option<String> {
 fn is_shell_host_overlay_class(class_name: &str) -> bool {
     matches!(
         class_name,
-        "Windows.UI.Core.CoreWindow" | "XamlExplorerHostIslandWindow" | "MultitaskingViewFrame"
+        "Windows.UI.Core.CoreWindow"
+            | "XamlExplorerHostIslandWindow"
+            | "MultitaskingViewFrame"
+            | "VirtualDesktopHotkeySwitcher"
     )
 }
 
@@ -7825,6 +7832,7 @@ mod tests {
                 "Windows.UI.Core.CoreWindow",
                 "XamlExplorerHostIslandWindow",
                 "MultitaskingViewFrame",
+                "VirtualDesktopHotkeySwitcher",
             ] {
                 assert!(
                     is_shell_host_overlay_identity(overlay_class, path, root),
@@ -7859,12 +7867,38 @@ mod tests {
                 "Windows.UI.Core.CoreWindow",
                 "XamlExplorerHostIslandWindow",
                 "MultitaskingViewFrame",
+                "VirtualDesktopHotkeySwitcher",
             ] {
                 assert!(
                     !is_shell_host_overlay_identity(overlay_class, untrusted, root),
                     "untrusted or non-shell image {untrusted} ({overlay_class}) must not be exempted"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn virtual_desktop_hotkey_switcher_is_a_non_occluding_shell_overlay() {
+        for class in [
+            "VirtualDesktopHotkeySwitcher",
+            "Windows.UI.Core.CoreWindow",
+            "XamlExplorerHostIslandWindow",
+            "MultitaskingViewFrame",
+        ] {
+            assert!(
+                is_shell_host_overlay_class_buf(&ClassNameBuf::from_ascii(class)),
+                "{class} must be skipped by the scan callback"
+            );
+            assert!(
+                is_shell_host_overlay_class(class),
+                "{class} must be skipped by fullscreen detection"
+            );
+        }
+        for class in ["Shell_TrayWnd", "Xaml_WindowedPopupClass", "CabinetWClass"] {
+            assert!(!is_shell_host_overlay_class_buf(&ClassNameBuf::from_ascii(
+                class
+            )));
+            assert!(!is_shell_host_overlay_class(class));
         }
     }
 
