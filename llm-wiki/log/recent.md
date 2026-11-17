@@ -1,3 +1,10 @@
+## 2026-11-17 - process file-I/O list: stale handle-snapshot access and position write-back
+
+- Flaky `current_process_file_io_discovers_opened_files` (~1 in 7 full `tm-platform` runs; 51/1500 runs of the six `process_file_io` tests via the test binary) root-caused: every failure showed the write-only test file as `is_read: true` with `open_handles: 2`. A concurrent enumerator's temporary duplicate of that file reused the handle value of a closed read handle, and `enumerate_process_files` combined the snapshot entry's stale `granted_access` with the duplicate's path/offset. Real product race for any target that churns handles.
+- Fix in `crates/tm-platform/src/win/process_file_io.rs`: `inspect_handle` / `inspect_duplicated_handle` read all facts from the duplicate; access via `NtQueryObject(ObjectBasicInformation)` (`None` -> neither flag -> split shown as unavailable). Also replaced `SetFilePointerEx(0, FILE_CURRENT)` (query + write-back into the target's shared file object, could rewind a concurrent target write) with `NtQueryInformationFile(FilePositionInformation)`. New `windows` features: `Wdk_Foundation`, `Wdk_Storage_FileSystem`, `Win32_System_IO`. After: 0/1500.
+- Tests: `handle_facts_come_from_the_inspected_handle` (access/offset/size from the handle, position query leaves the target position alone), `unknown_access_sets_neither_read_nor_write`.
+- Seen once while looping the whole lib test binary, not investigated: `win::taskbar_monitor::hooks::tests::fullscreen_hook_wakes_immediately_when_suppressing_window_closes` failed at `hooks.rs:1012` in 1 of 18 runs (open: environment/focus dependence like the band-recheck test, or a real race).
+
 ## 2026-11-17 - virtual-desktop switch disappearance: measured, not fixable from TaskMan
 
 - Live probes (out-of-context WinEvent hooks + 60 Hz DPI-aware screen captures of the widget area during scripted Ctrl+Win+Right/Left switches against the installed `8cef091` build; scripts stayed in the session scratchpad):

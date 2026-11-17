@@ -829,6 +829,14 @@ rebase runbook.
   byte deltas, and current transfer rates. Inter-process I/O captures operations
   not involving physical disks (named pipes, ALPC, device controls/IOCTLs, and
   socket communication) directly from the kernel process table's `IO_COUNTERS`.
+  The open-files list (`win/process_file_io.rs`) snapshots the handle table,
+  duplicates each handle and reads every fact (type, path, size, position,
+  granted access) from that duplicate only: snapshot entries go stale as the
+  target closes handles and values get reused (measured: 51/1500 runs of the
+  module's parallel tests showed a write-only file as read/write while access
+  came from the snapshot). Position is queried with `NtQueryInformationFile
+  (FilePositionInformation)`, never `SetFilePointerEx`, which writes the
+  position back into the file object shared with the target.
   Threads come from one
   `SystemExtendedProcessInformation` snapshot (no handle needed, so SYSTEM
   and service processes work unelevated); Windows 11 build 26300 ZEROES that

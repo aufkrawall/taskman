@@ -3,20 +3,33 @@
 //! Enumerates open handles for the target process via `NtQueryInformationProcess(51)`.
 //! For each handle that represents a disk file (`GetFileType == FILE_TYPE_DISK`),
 //! resolves the normalized file path, file size (`EndOfFile`), current read/write
-//! position (`SetFilePointerEx`), and granted access rights.
+//! position (`FilePositionInformation`), and granted access rights.
+//!
+//! Every per-file fact is read from our duplicate of the handle, never from the
+//! handle snapshot: the target can close a handle after the snapshot, and the
+//! same handle value can then name a different object (seen when a concurrent
+//! enumerator's temporary duplicate reused the value of a closed read handle,
+//! which made a write-only file look read/write). All queries are read-only, so
+//! the target's shared file position is never written.
 
 use std::collections::HashMap;
 
 use tm_core::error::{Result, TmError};
+use windows::Wdk::Foundation::{NtQueryObject, ObjectBasicInformation};
+use windows::Wdk::Storage::FileSystem::{
+    FILE_POSITION_INFORMATION, FilePositionInformation, NtQueryInformationFile,
+};
 use windows::Wdk::System::SystemInformation::SystemProcessInformation;
 use windows::Wdk::System::Threading::{NtQueryInformationProcess, PROCESSINFOCLASS};
 use windows::Win32::Foundation::{CloseHandle, DUPLICATE_SAME_ACCESS, DuplicateHandle, HANDLE};
 use windows::Win32::Storage::FileSystem::{
-    FILE_CURRENT, FILE_NAME_NORMALIZED, FILE_STANDARD_INFO, FILE_TYPE_DISK, FileStandardInfo,
+    FILE_NAME_NORMALIZED, FILE_STANDARD_INFO, FILE_TYPE_DISK, FileStandardInfo,
     GETFINALPATHNAMEBYHANDLE_FLAGS, GetFileInformationByHandleEx, GetFileType,
-    GetFinalPathNameByHandleW, SetFilePointerEx, VOLUME_NAME_DOS,
+    GetFinalPathNameByHandleW, VOLUME_NAME_DOS,
 };
+use windows::Win32::System::IO::IO_STATUS_BLOCK;
 use windows::Win32::System::Threading as th;
+use windows::Win32::System::WindowsProgramming::PUBLIC_OBJECT_BASIC_INFORMATION;
 
 use crate::actions::{
     FileIoAccounting, FileIoAccountingState, ProcessFileIo, ProcessFileIoSnapshot,
@@ -272,7 +285,6 @@ fn enumerate_process_files(h_process: HANDLE) -> Result<Vec<ProcessFileIo>> {
     let current_proc = unsafe { th::GetCurrentProcess() };
 
     let mut map: HashMap<String, ProcessFileIo> = HashMap::new();
-    let path_flags = GETFINALPATHNAMEBYHANDLE_FLAGS(FILE_NAME_NORMALIZED.0 | VOLUME_NAME_DOS.0);
     let mut path_buf = vec![0u16; 1024];
 
     for i in 0..count {
@@ -280,94 +292,23 @@ fn enumerate_process_files(h_process: HANDLE) -> Result<Vec<ProcessFileIo>> {
         if entry.handle_value == 0 {
             continue;
         }
-
-        let mut dup_handle = HANDLE::default();
-        let ok = unsafe {
-            DuplicateHandle(
-                h_process,
-                HANDLE(entry.handle_value as *mut core::ffi::c_void),
-                current_proc,
-                &mut dup_handle,
-                0,
-                false,
-                DUPLICATE_SAME_ACCESS,
-            )
+        let Some(facts) =
+            inspect_handle(h_process, current_proc, entry.handle_value, &mut path_buf)
+        else {
+            continue;
         };
-        if ok.is_err() || dup_handle.is_invalid() {
-            continue;
-        }
-
-        // Only disk files; strictly avoid named pipes, sockets, or devices that could hang.
-        let file_type = unsafe { GetFileType(dup_handle) };
-        if file_type != FILE_TYPE_DISK {
-            unsafe {
-                let _ = CloseHandle(dup_handle);
-            }
-            continue;
-        }
-
-        let len =
-            unsafe { GetFinalPathNameByHandleW(dup_handle, &mut path_buf, path_flags) } as usize;
-        if len == 0 || len >= path_buf.len() {
-            unsafe {
-                let _ = CloseHandle(dup_handle);
-            }
-            continue;
-        }
-
-        let raw_path = String::from_utf16_lossy(&path_buf[..len]);
-        let clean_path = strip_verbatim(&raw_path);
-
-        // Query file position if available.
-        let mut pos: i64 = 0;
-        let pos_ok =
-            unsafe { SetFilePointerEx(dup_handle, 0, Some(&mut pos), FILE_CURRENT) }.is_ok();
-        let current_pos = if pos_ok && pos >= 0 {
-            Some(pos as u64)
-        } else {
-            None
-        };
-
-        // Query file standard information (size, directory).
-        let mut std_info = FILE_STANDARD_INFO::default();
-        let std_ok = unsafe {
-            GetFileInformationByHandleEx(
-                dup_handle,
-                FileStandardInfo,
-                (&raw mut std_info).cast(),
-                std::mem::size_of::<FILE_STANDARD_INFO>() as u32,
-            )
-        }
-        .is_ok();
-
-        let (file_size, is_dir) = if std_ok {
-            (Some(std_info.EndOfFile.max(0) as u64), std_info.Directory)
-        } else {
-            (None, false)
-        };
-
-        unsafe {
-            let _ = CloseHandle(dup_handle);
-        }
-
-        if is_dir {
-            continue;
-        }
-
-        let is_read = (entry.granted_access & (FILE_READ_DATA | GENERIC_READ)) != 0;
-        let is_write =
-            (entry.granted_access & (FILE_WRITE_DATA | FILE_APPEND_DATA | GENERIC_WRITE)) != 0;
+        let (is_read, is_write) = access_flags(facts.granted_access);
 
         let file_entry = map
-            .entry(clean_path.clone())
+            .entry(facts.path.clone())
             .or_insert_with(|| ProcessFileIo {
-                path: clean_path,
+                path: facts.path,
                 read_bytes: None,
                 write_bytes: None,
                 read_ops: None,
                 write_ops: None,
-                file_size,
-                offset: current_pos,
+                file_size: facts.file_size,
+                offset: facts.offset,
                 is_read: false,
                 is_write: false,
                 open_handles: 0,
@@ -376,10 +317,10 @@ fn enumerate_process_files(h_process: HANDLE) -> Result<Vec<ProcessFileIo>> {
         file_entry.open_handles = file_entry.open_handles.saturating_add(1);
         file_entry.is_read |= is_read;
         file_entry.is_write |= is_write;
-        if let Some(pos_val) = current_pos {
+        if let Some(pos_val) = facts.offset {
             file_entry.offset = Some(file_entry.offset.map_or(pos_val, |prev| prev.max(pos_val)));
         }
-        if let Some(sz) = file_size {
+        if let Some(sz) = facts.file_size {
             file_entry.file_size = Some(file_entry.file_size.map_or(sz, |prev| prev.max(sz)));
         }
     }
@@ -401,6 +342,130 @@ fn enumerate_process_files(h_process: HANDLE) -> Result<Vec<ProcessFileIo>> {
     }
 
     Ok(map.into_values().collect())
+}
+
+/// What one open disk-file handle says about itself, all read from the same
+/// duplicated handle so the facts always describe one object.
+struct HandleFacts {
+    path: String,
+    offset: Option<u64>,
+    file_size: Option<u64>,
+    /// `None` when the object could not be queried; never taken from the
+    /// handle snapshot, whose entry may describe a since-closed handle.
+    granted_access: Option<u32>,
+}
+
+/// Read/write flags for a handle's granted access. Unknown access sets
+/// neither, so the attribution reports the split as unavailable instead of
+/// guessing.
+fn access_flags(granted_access: Option<u32>) -> (bool, bool) {
+    let access = granted_access.unwrap_or(0);
+    (
+        (access & (FILE_READ_DATA | GENERIC_READ)) != 0,
+        (access & (FILE_WRITE_DATA | FILE_APPEND_DATA | GENERIC_WRITE)) != 0,
+    )
+}
+
+/// Duplicates `handle_value` out of `h_process` and inspects the duplicate
+/// read-only. Returns `None` for handles that are gone, are not disk files,
+/// are directories, or have no resolvable path.
+fn inspect_handle(
+    h_process: HANDLE,
+    current_proc: HANDLE,
+    handle_value: usize,
+    path_buf: &mut [u16],
+) -> Option<HandleFacts> {
+    let mut dup = HANDLE::default();
+    let ok = unsafe {
+        DuplicateHandle(
+            h_process,
+            HANDLE(handle_value as *mut core::ffi::c_void),
+            current_proc,
+            &mut dup,
+            0,
+            false,
+            DUPLICATE_SAME_ACCESS,
+        )
+    };
+    if ok.is_err() || dup.is_invalid() {
+        return None;
+    }
+    let facts = inspect_duplicated_handle(dup, path_buf);
+    unsafe {
+        let _ = CloseHandle(dup);
+    }
+    facts
+}
+
+fn inspect_duplicated_handle(dup: HANDLE, path_buf: &mut [u16]) -> Option<HandleFacts> {
+    // Only disk files; strictly avoid named pipes, sockets, or devices that could hang.
+    if unsafe { GetFileType(dup) } != FILE_TYPE_DISK {
+        return None;
+    }
+
+    let path_flags = GETFINALPATHNAMEBYHANDLE_FLAGS(FILE_NAME_NORMALIZED.0 | VOLUME_NAME_DOS.0);
+    let len = unsafe { GetFinalPathNameByHandleW(dup, path_buf, path_flags) } as usize;
+    if len == 0 || len >= path_buf.len() {
+        return None;
+    }
+    let path = strip_verbatim(&String::from_utf16_lossy(&path_buf[..len]));
+
+    let mut std_info = FILE_STANDARD_INFO::default();
+    let std_ok = unsafe {
+        GetFileInformationByHandleEx(
+            dup,
+            FileStandardInfo,
+            (&raw mut std_info).cast(),
+            std::mem::size_of::<FILE_STANDARD_INFO>() as u32,
+        )
+    }
+    .is_ok();
+    if std_ok && std_info.Directory {
+        return None;
+    }
+    let file_size = std_ok.then(|| std_info.EndOfFile.max(0) as u64);
+
+    Some(HandleFacts {
+        path,
+        offset: query_file_position(dup),
+        file_size,
+        granted_access: query_granted_access(dup),
+    })
+}
+
+/// Current byte offset of the file object behind `handle`. Query only:
+/// `SetFilePointerEx(0, FILE_CURRENT)` reads the position and then writes it
+/// back, and the file object (with its position) is shared with the target
+/// process, so a target write landing in between would be rewound.
+fn query_file_position(handle: HANDLE) -> Option<u64> {
+    let mut iosb = IO_STATUS_BLOCK::default();
+    let mut info = FILE_POSITION_INFORMATION::default();
+    let status = unsafe {
+        NtQueryInformationFile(
+            handle,
+            &mut iosb,
+            (&raw mut info).cast(),
+            std::mem::size_of::<FILE_POSITION_INFORMATION>() as u32,
+            FilePositionInformation,
+        )
+    };
+    (status.is_ok() && info.CurrentByteOffset >= 0).then_some(info.CurrentByteOffset as u64)
+}
+
+/// Access granted to `handle` itself. A duplicate made with
+/// `DUPLICATE_SAME_ACCESS` carries exactly the source handle's access.
+fn query_granted_access(handle: HANDLE) -> Option<u32> {
+    let mut info = PUBLIC_OBJECT_BASIC_INFORMATION::default();
+    let status = unsafe {
+        NtQueryObject(
+            Some(handle),
+            ObjectBasicInformation,
+            Some((&raw mut info).cast()),
+            std::mem::size_of::<PUBLIC_OBJECT_BASIC_INFORMATION>() as u32,
+            None,
+        )
+    };
+    status.is_ok().then_some(info.GrantedAccess)
 }
 
 #[cfg(test)]
@@ -461,6 +526,54 @@ mod tests {
 
         drop(read_file);
         let _ = std::fs::remove_file(&test_path);
+    }
+
+    #[test]
+    fn handle_facts_come_from_the_inspected_handle() {
+        use std::os::windows::io::AsRawHandle;
+
+        let tag = format!("{}_{:?}", std::process::id(), std::thread::current().id());
+        let test_name = format!("test_file_facts_{tag}.bin");
+        let test_path = std::env::temp_dir().join(&test_name);
+        let mut file = std::fs::File::create(&test_path).unwrap();
+        file.write_all(&[9u8; 300]).unwrap();
+
+        // The access must be the handle's own (write-only here), not whatever
+        // a possibly stale snapshot entry recorded for the same handle value.
+        let current = unsafe { th::GetCurrentProcess() };
+        let mut path_buf = vec![0u16; 1024];
+        let facts = inspect_handle(
+            current,
+            current,
+            file.as_raw_handle() as usize,
+            &mut path_buf,
+        )
+        .expect("open disk file must be inspectable");
+        assert!(facts.path.ends_with(&test_name));
+        assert_eq!(access_flags(facts.granted_access), (false, true));
+        assert_eq!(facts.offset, Some(300));
+        assert_eq!(facts.file_size, Some(300));
+
+        // Reading the position is a query: the target's position is untouched.
+        file.write_all(&[9u8; 10]).unwrap();
+        let facts = inspect_handle(
+            current,
+            current,
+            file.as_raw_handle() as usize,
+            &mut path_buf,
+        )
+        .unwrap();
+        assert_eq!(facts.offset, Some(310));
+
+        drop(file);
+        let _ = std::fs::remove_file(&test_path);
+    }
+
+    #[test]
+    fn unknown_access_sets_neither_read_nor_write() {
+        assert_eq!(access_flags(None), (false, false));
+        assert_eq!(access_flags(Some(GENERIC_READ)), (true, false));
+        assert_eq!(access_flags(Some(FILE_APPEND_DATA)), (false, true));
     }
 
     #[test]
