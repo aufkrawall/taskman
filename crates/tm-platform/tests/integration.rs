@@ -396,7 +396,7 @@ fn parent_process_resolution_for_live_and_system_processes() {
 
 #[cfg(target_os = "windows")]
 #[test]
-fn explorer_parent_process_resolves_to_userinit() {
+fn explorer_parent_info_matches_the_live_snapshot() {
     let mut collector = tm_platform::create_collector();
     let actions = tm_platform::create_actions();
     let snap = collector.sample(std::time::Instant::now()).unwrap();
@@ -412,12 +412,30 @@ fn explorer_parent_process_resolves_to_userinit() {
         .expect("explorer security info");
     let parent = sec.parent.expect("explorer parent info");
     assert_eq!(parent.pid, explorer.ppid.unwrap());
-    assert_eq!(
-        parent.name.as_deref(),
-        Some("userinit.exe"),
-        "explorer parent binary must be userinit.exe"
-    );
-    assert!(!parent.alive, "userinit must be reported as terminated");
+
+    // Explorer's parent is normally the already-exited `userinit.exe`, but a
+    // restarted shell can legitimately be parented by a live process (e.g. a
+    // Task Manager replacement that relaunched Explorer). Assert the invariant
+    // that matters instead of one particular Windows genealogy: a parent that
+    // is still in the same snapshot must resolve to that process's image and
+    // be reported alive; a parent that is gone must be reported terminated.
+    match snap.processes.iter().find(|p| p.pid == parent.pid) {
+        Some(live_parent) => {
+            assert!(
+                parent.alive,
+                "a parent present in the live snapshot must be reported alive"
+            );
+            assert_eq!(
+                parent.name.as_deref(),
+                Some(live_parent.name.as_str()),
+                "resolved parent name must match the live process in the same snapshot"
+            );
+        }
+        None => assert!(
+            !parent.alive,
+            "a parent absent from the live snapshot must be reported terminated"
+        ),
+    }
 }
 
 #[cfg(target_os = "windows")]

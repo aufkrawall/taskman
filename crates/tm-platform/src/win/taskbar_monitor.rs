@@ -64,10 +64,10 @@ use windows::Win32::Graphics::Dwm::{
 };
 use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
 use windows::Win32::Graphics::Gdi::{
-    AC_SRC_ALPHA, AC_SRC_OVER, BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BLENDFUNCTION,
-    CreateCompatibleDC, CreateDIBSection, DIB_RGB_COLORS, DeleteDC, DeleteObject, HBITMAP, HDC,
-    HGDIOBJ, HMONITOR, MONITOR_DEFAULTTONULL, MONITOR_DEFAULTTOPRIMARY, MONITORINFO,
-    MonitorFromWindow, SelectObject,
+    AC_SRC_ALPHA, AC_SRC_OVER, BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BLENDFUNCTION, CombineRgn,
+    CreateCompatibleDC, CreateDIBSection, CreateRectRgn, DIB_RGB_COLORS, DeleteDC, DeleteObject,
+    HBITMAP, HDC, HGDIOBJ, HMONITOR, MONITOR_DEFAULTTONULL, MONITOR_DEFAULTTOPRIMARY, MONITORINFO,
+    MonitorFromWindow, RGN_DIFF, SelectObject, SetWindowRgn,
 };
 use windows::Win32::System::Com::{
     CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED, COINIT_MULTITHREADED, CoCreateInstance,
@@ -440,6 +440,117 @@ impl PixelRect {
             && self.bottom > other.top
             && self.top < other.bottom
     }
+
+    /// The overlapping area in window-local coordinates, if any.
+    fn local_intersection(self, other: Self) -> Option<Self> {
+        let left = self.left.max(other.left);
+        let top = self.top.max(other.top);
+        let right = self.right.min(other.right);
+        let bottom = self.bottom.min(other.bottom);
+        (right > left && bottom > top).then_some(Self {
+            left: left - self.left,
+            top: top - self.top,
+            right: right - self.left,
+            bottom: bottom - self.top,
+        })
+    }
+}
+
+/// How a partially occluded widget should react to a set of occluder rects.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OcclusionOutcome {
+    /// No occluder: any stale clip must be removed.
+    Clear,
+    /// Still partly visible: keep the window and cut out the covered strips.
+    Clipped,
+    /// Nothing left to present: fall back to hiding.
+    Hidden,
+}
+
+/// Normalized, stable local clip rects used both as the region recipe and as
+/// the change-detection key, so redundant `SetWindowRgn` calls are skipped.
+#[derive(Clone, PartialEq, Eq, Debug)]
+struct AppliedClip {
+    size: (i32, i32),
+    local_rects: Vec<PixelRect>,
+}
+
+fn local_clip_rects(target: PixelRect, occluder_rects: &[PixelRect]) -> Vec<PixelRect> {
+    let mut rects: Vec<PixelRect> = occluder_rects
+        .iter()
+        .filter_map(|frame| target.local_intersection(*frame))
+        .filter(|r| !r.is_empty())
+        .collect();
+    rects.sort_unstable_by_key(|r| (r.left, r.top, r.right, r.bottom));
+    rects.dedup();
+    rects
+}
+
+/// Exact rectangle subtraction: split each remaining piece around the clip.
+fn subtract_local_rect(pieces: &mut Vec<PixelRect>, clip: PixelRect) {
+    let mut next = Vec::with_capacity(pieces.len().saturating_add(3));
+    for piece in pieces.drain(..) {
+        let left = piece.left.max(clip.left);
+        let top = piece.top.max(clip.top);
+        let right = piece.right.min(clip.right);
+        let bottom = piece.bottom.min(clip.bottom);
+        if right <= left || bottom <= top {
+            next.push(piece);
+            continue;
+        }
+        if piece.left < left {
+            next.push(PixelRect {
+                left: piece.left,
+                top: piece.top,
+                right: left,
+                bottom: piece.bottom,
+            });
+        }
+        if right < piece.right {
+            next.push(PixelRect {
+                left: right,
+                top: piece.top,
+                right: piece.right,
+                bottom: piece.bottom,
+            });
+        }
+        if piece.top < top {
+            next.push(PixelRect {
+                left,
+                top: piece.top,
+                right,
+                bottom: top,
+            });
+        }
+        if bottom < piece.bottom {
+            next.push(PixelRect {
+                left,
+                top: bottom,
+                right,
+                bottom: piece.bottom,
+            });
+        }
+    }
+    *pieces = next;
+}
+
+fn occlusion_outcome(size: (i32, i32), clips: &[PixelRect]) -> OcclusionOutcome {
+    if clips.is_empty() || size.0 <= 0 || size.1 <= 0 {
+        return OcclusionOutcome::Clear;
+    }
+    let mut remaining = vec![PixelRect {
+        left: 0,
+        top: 0,
+        right: size.0,
+        bottom: size.1,
+    }];
+    for clip in clips {
+        subtract_local_rect(&mut remaining, *clip);
+        if remaining.is_empty() {
+            return OcclusionOutcome::Hidden;
+        }
+    }
+    OcclusionOutcome::Clipped
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1271,6 +1382,10 @@ struct WindowCtx {
     hidden_by_occlusion: bool,
     hidden_by_tray_missing: bool,
     last_occluded_rect: Option<PixelRect>,
+    applied_clip: Option<AppliedClip>,
+    /// Kept separately from the global so a later `set_visible(true)` can
+    /// restore the occluder we are still clipping around.
+    clip_occluder: HWND,
     topmost_recheck_armed: bool,
 }
 
@@ -1725,6 +1840,122 @@ impl WindowCtx {
         (!r.is_empty()).then_some(r)
     }
 
+    /// Drop any window region we installed and forget its occluder. Called when
+    /// the occluder disappears, when we change hide reason, and on teardown.
+    fn reset_clip(&mut self) {
+        if self.applied_clip.is_some() && !self.hwnd.0.is_null() {
+            unsafe {
+                // A null region removes the current one; the system releases it.
+                let _ = SetWindowRgn(self.hwnd, None, true);
+            }
+        }
+        self.applied_clip = None;
+        self.clip_occluder = HWND::default();
+        LIVE_OCCLUDER_HWND.store(0, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Subtract the occluder strips from the layered window's region. A null
+    /// result or a GDI failure means clipping is unusable and the caller must
+    /// fall back to hiding, exactly as before this policy existed.
+    fn apply_window_clip(&self, key: &AppliedClip) -> bool {
+        if self.hwnd.0.is_null() || key.size.0 <= 0 || key.size.1 <= 0 {
+            return false;
+        }
+        unsafe {
+            let visible = CreateRectRgn(0, 0, key.size.0, key.size.1);
+            if visible.0.is_null() {
+                return false;
+            }
+            for rect in &key.local_rects {
+                let cut = CreateRectRgn(rect.left, rect.top, rect.right, rect.bottom);
+                if cut.0.is_null() {
+                    let _ = DeleteObject(HGDIOBJ(visible.0));
+                    return false;
+                }
+                let combined = CombineRgn(Some(visible), Some(visible), Some(cut), RGN_DIFF);
+                let _ = DeleteObject(HGDIOBJ(cut.0));
+                if combined.0 == 0 {
+                    // ERROR: the system region is untouched, release our copy.
+                    let _ = DeleteObject(HGDIOBJ(visible.0));
+                    return false;
+                }
+            }
+            // On success the window owns the region; on failure it stays ours.
+            if SetWindowRgn(self.hwnd, Some(visible), true) == 0 {
+                let _ = DeleteObject(HGDIOBJ(visible.0));
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Single decision point for all elevated-band occlusion checks. Partial
+    /// overlap keeps the widget visible with a window region cutting out the
+    /// covered strips; only a fully covered widget (or a GDI failure) hides.
+    /// Returns `true` when the caller must stop refreshing because we hid.
+    fn apply_occlusion_policy(
+        &mut self,
+        tray_hwnd: HWND,
+        target_rect: PixelRect,
+        check: OcclusionCheck,
+    ) -> bool {
+        match check {
+            OcclusionCheck::Clear => {
+                self.reset_clip();
+                false
+            }
+            OcclusionCheck::TrayMissing => {
+                self.reset_clip();
+                self.hide("tray_missing_in_enum", None);
+                true
+            }
+            OcclusionCheck::Occluded(hwnd) => {
+                let occluder_rects = scan_above_tray_with_collect(
+                    tray_hwnd,
+                    self.hwnd,
+                    None,
+                    Some(target_rect),
+                    None,
+                    true,
+                )
+                .occluder_rects;
+                let local_rects = local_clip_rects(target_rect, &occluder_rects);
+                let key = AppliedClip {
+                    size: (target_rect.width(), target_rect.height()),
+                    local_rects,
+                };
+                match occlusion_outcome(key.size, &key.local_rects) {
+                    OcclusionOutcome::Hidden => {
+                        self.reset_clip();
+                        self.last_occluded_rect = Some(target_rect);
+                        self.hide("occluded_above_tray", Some(hwnd));
+                        return true;
+                    }
+                    OcclusionOutcome::Clear => {
+                        self.reset_clip();
+                        return false;
+                    }
+                    OcclusionOutcome::Clipped => {}
+                }
+                if self.applied_clip.as_ref() != Some(&key) && !self.apply_window_clip(&key) {
+                    self.reset_clip();
+                    self.last_occluded_rect = Some(target_rect);
+                    self.hide("occluded_above_tray", Some(hwnd));
+                    return true;
+                }
+                tracing::debug!(
+                    occluder = ?hwnd,
+                    strips = key.local_rects.len(),
+                    "clipping taskbar monitor around occluder"
+                );
+                self.applied_clip = Some(key);
+                self.clip_occluder = hwnd;
+                LIVE_OCCLUDER_HWND.store(hwnd.0 as isize, std::sync::atomic::Ordering::Release);
+                false
+            }
+        }
+    }
+
     #[cfg(test)]
     fn ensure_visible_order(&self, tray_hwnd: HWND, target_rect: Option<PixelRect>) -> bool {
         if self.in_elevated_band {
@@ -1753,22 +1984,15 @@ impl WindowCtx {
                 Some((checked_rect, res)) if checked_rect == rect => res,
                 _ => check_rect_occluded_above_taskbar(tray_hwnd, self.hwnd, rect),
             };
-            match check {
-                OcclusionCheck::Clear => false,
-                OcclusionCheck::TrayMissing => {
-                    self.hide("tray_missing_in_enum", None);
-                    true
-                }
-                OcclusionCheck::Occluded(hwnd) => {
-                    self.hide("occluded_above_tray", Some(hwnd));
-                    true
-                }
-            }
-        } else if !ensure_just_above_taskbar(self.hwnd, tray_hwnd) {
-            self.hide("z_order_failed", None);
-            true
+            self.apply_occlusion_policy(tray_hwnd, rect, check)
         } else {
-            false
+            self.reset_clip();
+            if !ensure_just_above_taskbar(self.hwnd, tray_hwnd) {
+                self.hide("z_order_failed", None);
+                true
+            } else {
+                false
+            }
         }
     }
 
@@ -1860,6 +2084,10 @@ impl WindowCtx {
                     self.last_rect(),
                     prechecked_occlusion,
                 );
+                // A provisional (empty) scan must not leave us click-through
+                // forever: ask the worker to revalidate the layout again.
+                self.uia_scanner
+                    .request_scan(tray_raw, env.taskbar_rect, false);
                 return;
             }
             if !self.last_visible && !self.restore_from_cached_layout {
@@ -1960,17 +2188,8 @@ impl WindowCtx {
                     Some((checked_rect, res)) if checked_rect == target_rect => res,
                     _ => check_rect_occluded_above_taskbar(env.tray_hwnd, self.hwnd, target_rect),
                 };
-                match check {
-                    OcclusionCheck::Clear => {}
-                    OcclusionCheck::TrayMissing => {
-                        self.hide("tray_missing_in_enum", None);
-                        return;
-                    }
-                    OcclusionCheck::Occluded(hwnd) => {
-                        self.last_occluded_rect = Some(target_rect);
-                        self.hide("occluded_above_tray", Some(hwnd));
-                        return;
-                    }
+                if self.apply_occlusion_policy(env.tray_hwnd, target_rect, check) {
+                    return;
                 }
             }
             if self.last_pos != Some((x, y)) {
@@ -2065,24 +2284,14 @@ impl WindowCtx {
             right: x.saturating_add(w),
             bottom: y.saturating_add(h),
         };
-        if self.in_elevated_band {
-            let check = match prechecked_occlusion {
-                Some((checked_rect, res)) if checked_rect == target_rect => res,
-                _ => check_rect_occluded_above_taskbar(env.tray_hwnd, self.hwnd, target_rect),
-            };
-            match check {
-                OcclusionCheck::Clear => {}
-                OcclusionCheck::TrayMissing => {
-                    self.hide("tray_missing_in_enum", None);
-                    return;
-                }
-                OcclusionCheck::Occluded(hwnd) => {
-                    self.last_occluded_rect = Some(target_rect);
-                    self.hide("occluded_above_tray", Some(hwnd));
-                    return;
-                }
-            }
-        }
+        // Resolve the occlusion check before touching renderer state, but apply
+        // the policy only after the renderer borrow ends: clipping mutates the
+        // window and its tracked occluder (and must run before `finish_show`
+        // restores that handle on show).
+        let occlusion_check = self.in_elevated_band.then(|| match prechecked_occlusion {
+            Some((checked_rect, res)) if checked_rect == target_rect => res,
+            _ => check_rect_occluded_above_taskbar(env.tray_hwnd, self.hwnd, target_rect),
+        });
         let needs_render = force_render
             || self.last_display.as_ref() != Some(&display)
             || self.last_size != (w, h)
@@ -2102,13 +2311,12 @@ impl WindowCtx {
                 self.last_size = (rw, rh);
                 self.last_stacked = layout_stacked;
                 self.last_pos = Some((x, y));
-                self.finish_show(env.tray_hwnd, uia_occupied.current);
             } else {
                 self.restore_from_cached_layout = false;
                 self.last_display = None;
                 self.hide("render_failed", None);
+                return;
             }
-            return;
         }
 
         if self.last_pos != Some((x, y)) {
@@ -2124,6 +2332,11 @@ impl WindowCtx {
                 );
             }
             self.last_pos = Some((x, y));
+        }
+        if let Some(check) = occlusion_check
+            && self.apply_occlusion_policy(env.tray_hwnd, target_rect, check)
+        {
+            return;
         }
         self.finish_show(env.tray_hwnd, uia_occupied.current);
     }
@@ -2199,6 +2412,9 @@ impl WindowCtx {
             let frame = detail.and_then(visible_frame_rect);
             tracing::debug!(reason, ?class, ?band, ?frame, "hiding taskbar monitor");
         }
+        // Hiding is mutually exclusive with presenting a clipped region: the
+        // system owns the old HRGN and must get it back before SW_HIDE.
+        self.reset_clip();
         self.hidden_by_occlusion = reason == "occluded_above_tray";
         self.hidden_by_tray_missing = reason == "tray_missing_in_enum";
         let occluder_raw = if self.hidden_by_occlusion {
@@ -2217,10 +2433,20 @@ impl WindowCtx {
 
     fn set_visible(&mut self, visible: bool) -> bool {
         if visible {
+            // A clipped window still tracks the occluder it is clipped around;
+            // `set_visible(true)` must not lose that global tracking handle.
+            let clip_occluder = self.clip_occluder;
             self.hidden_by_occlusion = false;
             self.hidden_by_tray_missing = false;
             self.last_occluded_rect = None;
-            LIVE_OCCLUDER_HWND.store(0, std::sync::atomic::Ordering::Release);
+            LIVE_OCCLUDER_HWND.store(
+                if clip_occluder.0.is_null() {
+                    0
+                } else {
+                    clip_occluder.0 as isize
+                },
+                std::sync::atomic::Ordering::Release,
+            );
         } else {
             self.hovered = false;
             self.tracking_mouse = false;
@@ -2881,6 +3107,7 @@ struct AboveTraySummary {
     topmost_tids: Vec<u32>,
     fullscreen_coverer: Option<HWND>,
     occlusion: Option<OcclusionCheck>,
+    occluder_rects: Vec<PixelRect>,
 }
 
 struct AboveTrayScan<'a> {
@@ -2892,9 +3119,11 @@ struct AboveTrayScan<'a> {
     monitor_rect: Option<PixelRect>,
     probe_rect: Option<PixelRect>,
     excluded_tids: Option<&'a [u32]>,
+    collect_rects: bool,
     topmost_tids: Vec<u32>,
     fullscreen_coverer: Option<HWND>,
     occluder: Option<HWND>,
+    occluder_rects: Vec<PixelRect>,
     saw_tray: bool,
 }
 
@@ -2945,11 +3174,16 @@ unsafe extern "system" fn above_tray_enum_cb(hwnd: HWND, lparam: LPARAM) -> BOOL
         }
         if let Some(target_rect) = scan.probe_rect
             && !target_rect.is_empty()
-            && scan.occluder.is_none()
+            && (scan.collect_rects || scan.occluder.is_none())
             && let Some(frame) = visible_frame_rect(hwnd)
             && frame.intersects(target_rect)
         {
-            scan.occluder = Some(hwnd);
+            if scan.occluder.is_none() {
+                scan.occluder = Some(hwnd);
+            }
+            if scan.collect_rects && !scan.occluder_rects.contains(&frame) {
+                scan.occluder_rects.push(frame);
+            }
         }
     }
     BOOL(1)
@@ -2962,6 +3196,7 @@ fn scan_above_tray_in_band(
     monitor_rect: Option<PixelRect>,
     probe_rect: Option<PixelRect>,
     excluded_tids: Option<&[u32]>,
+    collect_rects: bool,
 ) -> (AboveTraySummary, bool) {
     if !unsafe { windows::Win32::UI::WindowsAndMessaging::IsWindow(Some(tray_hwnd)).as_bool() } {
         return (
@@ -2969,6 +3204,7 @@ fn scan_above_tray_in_band(
                 topmost_tids: Vec::new(),
                 fullscreen_coverer: None,
                 occlusion: probe_rect.map(|_| OcclusionCheck::TrayMissing),
+                occluder_rects: Vec::new(),
             },
             false,
         );
@@ -2982,9 +3218,11 @@ fn scan_above_tray_in_band(
         monitor_rect,
         probe_rect,
         excluded_tids,
+        collect_rects,
         topmost_tids: Vec::new(),
         fullscreen_coverer: None,
         occluder: None,
+        occluder_rects: Vec::new(),
         saw_tray: false,
     };
     unsafe {
@@ -3012,6 +3250,7 @@ fn scan_above_tray_in_band(
             topmost_tids: scan.topmost_tids,
             fullscreen_coverer,
             occlusion,
+            occluder_rects: scan.occluder_rects,
         },
         scan.saw_tray,
     )
@@ -3024,6 +3263,27 @@ fn scan_above_tray(
     probe_rect: Option<PixelRect>,
     excluded_tids: Option<&[u32]>,
 ) -> AboveTraySummary {
+    scan_above_tray_with_collect(
+        tray_hwnd,
+        own_hwnd,
+        monitor_rect,
+        probe_rect,
+        excluded_tids,
+        false,
+    )
+}
+
+/// Same enumeration as [`scan_above_tray`], optionally gathering every
+/// intersecting occluder frame so a partially covered widget can be clipped
+/// instead of hidden. Rect collection is only enabled on that rare path.
+fn scan_above_tray_with_collect(
+    tray_hwnd: HWND,
+    own_hwnd: HWND,
+    monitor_rect: Option<PixelRect>,
+    probe_rect: Option<PixelRect>,
+    excluded_tids: Option<&[u32]>,
+    collect_rects: bool,
+) -> AboveTraySummary {
     let initial_band = window_band(tray_hwnd);
     let (summary, saw_tray) = scan_above_tray_in_band(
         tray_hwnd,
@@ -3032,6 +3292,7 @@ fn scan_above_tray(
         monitor_rect,
         probe_rect,
         excluded_tids,
+        collect_rects,
     );
     if !saw_tray {
         let current_band = window_band(tray_hwnd);
@@ -3043,6 +3304,7 @@ fn scan_above_tray(
                 monitor_rect,
                 probe_rect,
                 excluded_tids,
+                collect_rects,
             )
             .0;
         }
@@ -3064,6 +3326,7 @@ fn fullscreen_window_above_taskbar_in_band(
         Some(monitor_rect),
         None,
         None,
+        false,
     )
     .0
     .fullscreen_coverer
@@ -3104,6 +3367,7 @@ fn check_rect_occluded_above_taskbar_in_band(
         None,
         Some(target_rect),
         None,
+        false,
     )
     .0
     .occlusion
@@ -3537,6 +3801,28 @@ impl UiaShared {
         self.publish_at(target, rects, Instant::now())
     }
 
+    /// An empty *successful* scan (virtual-desktop transition, tray XAML
+    /// rebuild) keeps the last confirmed rectangles but marks them stale, so
+    /// the widget stays put and click-through until the next real result.
+    /// Genuine scan failures still go through `publish_at(target, None)`,
+    /// which clears the cache and hides the monitor.
+    fn mark_empty_scan_provisional(&mut self, target: UiaTarget) -> bool {
+        if self.cache.rects.is_some()
+            && self.cache.tray_hwnd == target.tray_hwnd
+            && self.cache.taskbar_rect == target.taskbar_rect
+        {
+            self.cache.generation = self.generation.wrapping_sub(1);
+            if self
+                .pending
+                .is_some_and(|p| p.generation == target.generation)
+            {
+                self.pending = None;
+            }
+            return true;
+        }
+        false
+    }
+
     fn publish_at(
         &mut self,
         target: UiaTarget,
@@ -3777,8 +4063,25 @@ fn uia_worker_main(state: Arc<(Mutex<UiaShared>, Condvar)>) {
             }
         }
 
+        let empty_but_successful = result.is_ok();
         let rects = result.ok().filter(|r| !r.is_empty());
         if rects.is_none() {
+            if empty_but_successful {
+                // An empty control list is not a failure: Windows returns one
+                // while animating a virtual-desktop switch (or while the tray
+                // XAML island is momentarily rebuilt). Keep the last confirmed
+                // rectangles and only mark them stale so the widget stays put,
+                // click-through, until a fresh scan validates the layout.
+                let provisional = state
+                    .0
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .mark_empty_scan_provisional(target);
+                if provisional {
+                    post_refresh();
+                    continue;
+                }
+            }
             if last_failure_report.is_none_or(|at| at.elapsed() >= Duration::from_secs(30)) {
                 tracing::warn!(
                     error = ?scan_error,
@@ -4921,6 +5224,8 @@ fn taskbar_thread_main(
                 hidden_by_occlusion: false,
                 hidden_by_tray_missing: false,
                 last_occluded_rect: None,
+                applied_clip: None,
+                clip_occluder: HWND::default(),
                 topmost_recheck_armed: false,
             },
         )));
@@ -5401,6 +5706,8 @@ mod tests {
             hidden_by_occlusion: false,
             hidden_by_tray_missing: false,
             last_occluded_rect: None,
+            applied_clip: None,
+            clip_occluder: HWND::default(),
             topmost_recheck_armed: false,
         };
         ctx.refresh_taskbar_env(&config, &metrics, env, false);
@@ -6802,6 +7109,8 @@ mod tests {
             hidden_by_occlusion: false,
             hidden_by_tray_missing: false,
             last_occluded_rect: None,
+            applied_clip: None,
+            clip_occluder: HWND::default(),
             topmost_recheck_armed: false,
         };
 
@@ -7024,6 +7333,8 @@ mod tests {
             hidden_by_occlusion: false,
             hidden_by_tray_missing: false,
             last_occluded_rect: None,
+            applied_clip: None,
+            clip_occluder: HWND::default(),
             topmost_recheck_armed: false,
         };
         assert!(ctx.ensure_visible_order(tray, None));
@@ -7232,6 +7543,8 @@ mod tests {
             hidden_by_occlusion: false,
             hidden_by_tray_missing: false,
             last_occluded_rect: None,
+            applied_clip: None,
+            clip_occluder: HWND::default(),
             topmost_recheck_armed: false,
         };
 
@@ -7623,6 +7936,8 @@ mod tests {
             hidden_by_occlusion: false,
             hidden_by_tray_missing: false,
             last_occluded_rect: None,
+            applied_clip: None,
+            clip_occluder: HWND::default(),
             topmost_recheck_armed: false,
         };
 
@@ -7809,6 +8124,8 @@ mod tests {
             hidden_by_occlusion: false,
             hidden_by_tray_missing: false,
             last_occluded_rect: None,
+            applied_clip: None,
+            clip_occluder: HWND::default(),
             topmost_recheck_armed: false,
         };
 
@@ -7952,6 +8269,8 @@ mod tests {
             hidden_by_occlusion: false,
             hidden_by_tray_missing: false,
             last_occluded_rect: None,
+            applied_clip: None,
+            clip_occluder: HWND::default(),
             topmost_recheck_armed: false,
         };
 
@@ -8109,6 +8428,8 @@ mod tests {
                 hidden_by_occlusion: false,
                 hidden_by_tray_missing: false,
                 last_occluded_rect: None,
+                applied_clip: None,
+                clip_occluder: HWND::default(),
                 topmost_recheck_armed: false,
             },
         )));
@@ -8354,6 +8675,8 @@ mod tests {
             hidden_by_occlusion: false,
             hidden_by_tray_missing: false,
             last_occluded_rect: None,
+            applied_clip: None,
+            clip_occluder: HWND::default(),
             topmost_recheck_armed: false,
         };
 
@@ -8480,6 +8803,8 @@ mod tests {
             hidden_by_occlusion: false,
             hidden_by_tray_missing: false,
             last_occluded_rect: None,
+            applied_clip: None,
+            clip_occluder: HWND::default(),
             topmost_recheck_armed: false,
         };
 
@@ -8650,6 +8975,8 @@ mod tests {
             hidden_by_occlusion: false,
             hidden_by_tray_missing: false,
             last_occluded_rect: None,
+            applied_clip: None,
+            clip_occluder: HWND::default(),
             topmost_recheck_armed: false,
         };
 
@@ -8843,6 +9170,8 @@ mod tests {
             hidden_by_occlusion: false,
             hidden_by_tray_missing: false,
             last_occluded_rect: None,
+            applied_clip: None,
+            clip_occluder: HWND::default(),
             topmost_recheck_armed: false,
         };
 
@@ -9044,6 +9373,8 @@ mod tests {
             hidden_by_occlusion: false,
             hidden_by_tray_missing: false,
             last_occluded_rect: None,
+            applied_clip: None,
+            clip_occluder: HWND::default(),
             topmost_recheck_armed: false,
         };
 
@@ -9282,6 +9613,8 @@ mod tests {
             hidden_by_occlusion: false,
             hidden_by_tray_missing: false,
             last_occluded_rect: None,
+            applied_clip: None,
+            clip_occluder: HWND::default(),
             topmost_recheck_armed: false,
         };
 
@@ -9356,5 +9689,116 @@ mod tests {
             err.is_err(),
             "per-element failure must abort scan rather than publishing a partial obstacle map"
         );
+    }
+
+    #[test]
+    fn local_clip_rects_intersect_translate_sort_and_dedup() {
+        let target = rect(100, 200, 180, 240);
+        let clips = local_clip_rects(
+            target,
+            &[
+                rect(150, 210, 200, 230), // partial overlap -> local (50,10,80,30)
+                rect(-20, 0, 110, 250),   // clipped to target's left edge
+                rect(150, 210, 200, 230), // duplicate
+                rect(500, 500, 600, 600), // disjoint: dropped
+                rect(100, 200, 180, 205), // top strip
+            ],
+        );
+        assert_eq!(
+            clips,
+            vec![rect(0, 0, 10, 40), rect(0, 0, 80, 5), rect(50, 10, 80, 30),],
+            "clips must be local to the widget, bounded by it, stable and unique"
+        );
+        assert!(local_clip_rects(target, &[rect(500, 500, 600, 600)]).is_empty());
+    }
+
+    #[test]
+    fn occlusion_outcome_distinguishes_clear_clipped_and_hidden() {
+        let size = (100, 40);
+        assert_eq!(occlusion_outcome(size, &[]), OcclusionOutcome::Clear);
+        assert_eq!(
+            occlusion_outcome((0, 40), &[rect(0, 0, 10, 10)]),
+            OcclusionOutcome::Clear
+        );
+
+        let partial = local_clip_rects(rect(0, 0, 100, 40), &[rect(20, 0, 60, 40)]);
+        assert_eq!(occlusion_outcome(size, &partial), OcclusionOutcome::Clipped);
+
+        // Two strips that only cover the widget when their union is considered.
+        let halves = local_clip_rects(
+            rect(0, 0, 100, 40),
+            &[rect(-10, 0, 50, 40), rect(50, 0, 110, 40)],
+        );
+        assert_eq!(
+            occlusion_outcome(size, &halves),
+            OcclusionOutcome::Hidden,
+            "a full union must hide even when no single occluder covers the widget"
+        );
+
+        // Adjacent strips leave a one-pixel gap: still clipped, not hidden.
+        let gapped = local_clip_rects(
+            rect(0, 0, 100, 40),
+            &[rect(0, 0, 49, 40), rect(50, 0, 100, 40)],
+        );
+        assert_eq!(occlusion_outcome(size, &gapped), OcclusionOutcome::Clipped);
+    }
+
+    #[test]
+    fn empty_uia_scan_keeps_confirmed_layout_but_marks_it_provisional() {
+        let scanner = UiaScanner::start();
+        let target_rect = rect(0, 0, 1920, 48);
+        let target = UiaTarget {
+            tray_hwnd: 42,
+            taskbar_rect: target_rect,
+            generation: 0,
+        };
+        {
+            let mut guard = scanner.state.0.lock().unwrap();
+            assert!(guard.publish(target, Some(vec![rect(100, 0, 200, 48)])));
+            assert!(guard.pending.is_none());
+        }
+        {
+            let mut guard = scanner.state.0.lock().unwrap();
+            assert!(
+                guard.mark_empty_scan_provisional(target),
+                "an empty successful scan for the confirmed target must be provisional"
+            );
+            assert_eq!(
+                guard.cache.rects,
+                Some(vec![rect(100, 0, 200, 48)]),
+                "confirmed rectangles must survive a transient empty scan"
+            );
+            assert_eq!(
+                guard.consecutive_failures, 0,
+                "empty success is not a failure"
+            );
+        }
+        let snapshot = scanner
+            .snapshot_for(42, target_rect)
+            .expect("cache retained");
+        assert!(!snapshot.current, "retained layout must be marked stale");
+        assert_eq!(snapshot.rects, vec![rect(100, 0, 200, 48)]);
+    }
+
+    #[test]
+    fn failed_uia_scan_still_clears_cached_layout_and_counts_failure() {
+        let scanner = UiaScanner::start();
+        let target_rect = rect(0, 0, 1920, 48);
+        let target = UiaTarget {
+            tray_hwnd: 42,
+            taskbar_rect: target_rect,
+            generation: 0,
+        };
+        {
+            let mut guard = scanner.state.0.lock().unwrap();
+            assert!(guard.publish(target, Some(vec![rect(100, 0, 200, 48)])));
+            assert!(guard.publish(target, None));
+            assert_eq!(
+                guard.cache.rects, None,
+                "a real failure must clear cached pixels"
+            );
+            assert_eq!(guard.consecutive_failures, 1);
+        }
+        assert!(scanner.snapshot_for(42, target_rect).is_none());
     }
 }
