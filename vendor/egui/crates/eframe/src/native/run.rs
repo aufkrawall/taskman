@@ -46,7 +46,17 @@ fn create_event_loop(native_options: &mut epi::NativeOptions) -> Result<EventLoo
     }
 
     profiling::scope!("EventLoopBuilder::build");
-    Ok(builder.build()?)
+    let event_loop = builder.build()?;
+    // TASKMAN-FORK: winit registers all mice/keyboards for raw input with its
+    // default `DeviceEvents::WhenFocused`. On Windows that delivers a WM_INPUT
+    // per mouse packet system-wide while any of our windows is in the
+    // foreground, and each packet is dispatched as up to three DeviceEvents.
+    // egui never consumes device events (egui-winit feeds pointer positions
+    // from window CursorMoved events; the raw MouseMotion deltas only add a
+    // redundant Event::MouseMoved), so unregister them. Without this, mouse
+    // movement outside a focused window burns CPU in the UI thread.
+    event_loop.listen_device_events(winit::event_loop::DeviceEvents::Never);
+    Ok(event_loop)
 }
 
 /// Access a thread-local event loop.

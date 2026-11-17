@@ -212,6 +212,14 @@ Behaviour-only and tiny; droppable once upstream restarts the blink on focus gai
 | `crates/egui/src/text_selection/text_cursor_state.rs` | `PointerButton::Primary` instead of `any_pressed()` for drag/click start | Secondary (right) click must not collapse existing text selection to a point. Right click is used for context menus (Copy / Select all). |
 | `crates/egui/src/text_selection/label_text_selection.rs` | Primary-only dragging, deselect only on primary click outside and when no popup is open, tracking `selected_text`, `active_selection()`, and `select_all_in_widget()` | Allows context menus to preserve and inspect selected text, copy it, or programmatically select all text in a label widget. |
 
+### 9. `eframe`: do not register for raw device input
+
+| File | Change | Why |
+| --- | --- | --- |
+| `crates/eframe/src/native/run.rs` | `create_event_loop()` calls `event_loop.listen_device_events(DeviceEvents::Never)` after `builder.build()` | winit registers all mice/keyboards for raw input with its default `DeviceEvents::WhenFocused`, so on Windows every mouse packet system-wide arrives as `WM_INPUT` while any of our windows is in the foreground, and winit dispatches up to three `DeviceEvent`s per packet. egui never consumes device events — `egui-winit` feeds pointer positions from window `CursorMoved` events, and the raw `MouseMotion` deltas only add a redundant `Event::MouseMoved` that repaints the UI. Measured on Windows 11 at 1 kHz mouse movement: a focused window with the cursor outside burned ~0.14 cores per second of movement in a minimal eframe app (and up to a full core once the tracked pointer position goes stale); with the registration removed the same movement costs ~0. |
+
+One line through winit's public API; on macOS/Wayland/Android it is a no-op and on X11 it only drops the raw XI2 events egui does not read. Plausibly upstreamable: eframe has no `DeviceEvent` consumer other than the redundant `MouseMotion` forward.
+
 ## Rebase runbook
 
 ```

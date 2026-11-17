@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Fixed
+
+- **Mouse movement no longer raises CPU load while the TaskMan window has focus:** winit registers all mice and keyboards for raw input with its default `DeviceEvents::WhenFocused`, so on Windows every mouse packet system-wide arrived as `WM_INPUT` while any TaskMan window was in the foreground — even with the cursor 100% outside the window — and each packet was dispatched through the UI thread (and could even trigger a full repaint when the tracked pointer position was stale). The vendored egui fork now unregisters raw device input when the event loop is created (`listen_device_events(DeviceEvents::Never)`); egui receives pointer movement from ordinary window cursor events, so hover, drags and tooltips are unchanged. Measured on the live app with synthetic ~5 kHz mouse movement outside the focused window: ~0.6 cores before, at idle level (~0.04–0.15 cores) after; at a realistic 1 kHz a minimal eframe app went from ~0.14 cores to ~0.
+
 ## 0.1.29 - 2026-11-17
 
 ### Fixed
