@@ -2872,6 +2872,16 @@ impl ClassNameBuf {
     fn to_string_lossy(&self) -> String {
         String::from_utf16_lossy(self.slice())
     }
+
+    #[cfg(test)]
+    fn from_ascii(s: &str) -> Self {
+        let mut buf = [0u16; 64];
+        let len = s.len().min(buf.len());
+        for (slot, byte) in buf.iter_mut().zip(s.bytes().take(len)) {
+            *slot = u16::from(byte);
+        }
+        Self { buf, len }
+    }
 }
 
 fn read_window_class(hwnd: HWND) -> Option<String> {
@@ -3001,6 +3011,37 @@ fn is_non_occluding_shell_host_window(hwnd: HWND) -> bool {
     ClassNameBuf::read(hwnd).is_some_and(|c| is_non_occluding_shell_host_with_class(hwnd, &c))
 }
 
+fn is_taskbar_flyout_class(cls: Option<&ClassNameBuf>) -> bool {
+    cls.is_some_and(|class| {
+        class.eq_ascii_ignore_case("Xaml_WindowedPopupClass")
+            || class.eq_ascii_ignore_case("TopLevelWindowForOverflowXamlIsland")
+    })
+}
+
+/// Windows 11 taskbar flyouts (the right-click menu and tray overflow) render an
+/// invisible XAML drop-shadow *inside* their HWND frame. Their frame can extend
+/// below the visible menu into the taskbar even though no menu pixels are there.
+/// Our widget is placed inside the taskbar, so only the part of such a popup
+/// above the taskbar can actually cover it; the rest is shadow and must not be
+/// subtracted from the widget region.
+fn occluder_frame_for_target(
+    frame: PixelRect,
+    is_taskbar_flyout: bool,
+    taskbar_rect: Option<PixelRect>,
+) -> PixelRect {
+    if is_taskbar_flyout
+        && let Some(taskbar) = taskbar_rect
+        && !taskbar.is_empty()
+    {
+        PixelRect {
+            bottom: frame.bottom.min(taskbar.top),
+            ..frame
+        }
+    } else {
+        frame
+    }
+}
+
 fn visible_frame_rect(hwnd: HWND) -> Option<PixelRect> {
     let mut r = RECT::default();
     if unsafe {
@@ -3117,6 +3158,7 @@ struct AboveTrayScan<'a> {
     shell_hwnd: HWND,
     tray_band: Option<u32>,
     monitor_rect: Option<PixelRect>,
+    taskbar_rect: Option<PixelRect>,
     probe_rect: Option<PixelRect>,
     excluded_tids: Option<&'a [u32]>,
     collect_rects: bool,
@@ -3176,13 +3218,19 @@ unsafe extern "system" fn above_tray_enum_cb(hwnd: HWND, lparam: LPARAM) -> BOOL
             && !target_rect.is_empty()
             && (scan.collect_rects || scan.occluder.is_none())
             && let Some(frame) = visible_frame_rect(hwnd)
-            && frame.intersects(target_rect)
         {
-            if scan.occluder.is_none() {
-                scan.occluder = Some(hwnd);
-            }
-            if scan.collect_rects && !scan.occluder_rects.contains(&frame) {
-                scan.occluder_rects.push(frame);
+            let frame = occluder_frame_for_target(
+                frame,
+                is_taskbar_flyout_class(cls.as_ref()),
+                scan.taskbar_rect,
+            );
+            if !frame.is_empty() && frame.intersects(target_rect) {
+                if scan.occluder.is_none() {
+                    scan.occluder = Some(hwnd);
+                }
+                if scan.collect_rects && !scan.occluder_rects.contains(&frame) {
+                    scan.occluder_rects.push(frame);
+                }
             }
         }
     }
@@ -3209,6 +3257,13 @@ fn scan_above_tray_in_band(
             false,
         );
     }
+    let taskbar_rect = {
+        let mut r = RECT::default();
+        unsafe { GetWindowRect(tray_hwnd, &mut r) }
+            .ok()
+            .map(|_| PixelRect::from_win32(r))
+            .filter(|rect| !rect.is_empty())
+    };
     let mut scan = AboveTrayScan {
         tray_hwnd,
         own_hwnd,
@@ -3216,6 +3271,7 @@ fn scan_above_tray_in_band(
         shell_hwnd: unsafe { GetShellWindow() },
         tray_band,
         monitor_rect,
+        taskbar_rect,
         probe_rect,
         excluded_tids,
         collect_rects,
@@ -9688,6 +9744,42 @@ mod tests {
         assert!(
             err.is_err(),
             "per-element failure must abort scan rather than publishing a partial obstacle map"
+        );
+    }
+
+    #[test]
+    fn taskbar_flyout_shadow_does_not_clip_the_widget() {
+        assert!(is_taskbar_flyout_class(Some(&ClassNameBuf::from_ascii(
+            "Xaml_WindowedPopupClass"
+        ))));
+        assert!(is_taskbar_flyout_class(Some(&ClassNameBuf::from_ascii(
+            "TopLevelWindowForOverflowXamlIsland"
+        ))));
+        assert!(!is_taskbar_flyout_class(Some(&ClassNameBuf::from_ascii(
+            "#32768"
+        ))));
+        assert!(!is_taskbar_flyout_class(None));
+
+        let taskbar = rect(0, 1000, 1920, 1050);
+        let widget = rect(1400, 1008, 1600, 1040);
+        let menu_frame = rect(1380, 820, 1620, 1018); // 18 px of shadow inside the taskbar
+        let clamped = occluder_frame_for_target(menu_frame, true, Some(taskbar));
+        assert_eq!(clamped.bottom, taskbar.top);
+        assert!(
+            !clamped.intersects(widget),
+            "invisible flyout shadow must not be subtracted from the widget region"
+        );
+        assert!(local_clip_rects(widget, &[clamped]).is_empty());
+
+        // Ordinary occluders keep their full frame, and we cannot clamp without
+        // a known taskbar geometry.
+        assert_eq!(
+            occluder_frame_for_target(menu_frame, false, Some(taskbar)),
+            menu_frame
+        );
+        assert_eq!(
+            occluder_frame_for_target(menu_frame, true, None),
+            menu_frame
         );
     }
 
