@@ -2502,6 +2502,13 @@ impl WindowCtx {
     }
 
     fn hide(&mut self, reason: &'static str, detail: Option<HWND>) {
+        // The virtual-desktop switch animation briefly looks like a fullscreen
+        // app and an above-tray occluder. Its shell helper window exists only
+        // for the animation, so keep the already-presented widget in place and
+        // re-evaluate normally once the helper disappears.
+        if self.last_visible && desktop_switch_in_progress() {
+            return;
+        }
         if self.last_visible {
             let class = detail.and_then(read_window_class);
             let band = detail.and_then(window_band);
@@ -3099,7 +3106,25 @@ fn is_shell_host_overlay_identity(class_name: &str, image_path: &str, windows_ro
     )
 }
 
+fn is_desktop_switch_helper_class(cls: &ClassNameBuf) -> bool {
+    cls.eq_ascii("VirtualDesktopHotkeySwitcher")
+}
+
+/// The shell shows this transient full-screen helper for the whole duration of
+/// a Ctrl+Win+arrow desktop switch. Its presence is a reliable signal that the
+/// desktop is animating, so visibility decisions can be deferred until it goes.
+fn desktop_switch_in_progress() -> bool {
+    unsafe { FindWindowW(w!("VirtualDesktopHotkeySwitcher"), None) }.is_ok()
+}
+
 fn is_non_occluding_shell_host_with_class(hwnd: HWND, cls: &ClassNameBuf) -> bool {
+    // `VirtualDesktopHotkeySwitcher` is a Windows-internal class owned by the
+    // shell, which our unelevated token often cannot open for an image-path
+    // query. Exempt it by name alone; the other overlay hosts still require a
+    // verified trusted shell image.
+    if is_desktop_switch_helper_class(cls) {
+        return true;
+    }
     if !is_shell_host_overlay_class_buf(cls) {
         return false;
     }
@@ -7894,6 +7919,12 @@ mod tests {
                 "{class} must be skipped by fullscreen detection"
             );
         }
+        assert!(is_desktop_switch_helper_class(&ClassNameBuf::from_ascii(
+            "VirtualDesktopHotkeySwitcher"
+        )));
+        assert!(!is_desktop_switch_helper_class(&ClassNameBuf::from_ascii(
+            "XamlExplorerHostIslandWindow"
+        )));
         for class in ["Shell_TrayWnd", "Xaml_WindowedPopupClass", "CabinetWClass"] {
             assert!(!is_shell_host_overlay_class_buf(&ClassNameBuf::from_ascii(
                 class
