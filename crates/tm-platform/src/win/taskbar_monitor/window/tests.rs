@@ -678,9 +678,15 @@ fn elevated_band_recheck_detects_background_topmost_promotion_and_demotion() {
     let widget_rect = rect(-25_100, -26_500, -24_980, -26_452);
     unsafe {
         let _ = ShowWindow(tray, SW_SHOWNOACTIVATE);
+        // The mock tray is deliberately NOT topmost. When the test process is
+        // not in the foreground, Windows inserts a newly promoted topmost
+        // window below the existing topmost windows instead of at the top, so
+        // a topmost mock tray would make the promotion below depend on which
+        // app has focus. Every topmost window is above every non-topmost one,
+        // so the promotion is deterministic against a non-topmost tray.
         SetWindowPos(
             tray,
-            Some(HWND_TOPMOST),
+            Some(HWND_NOTOPMOST),
             bar.left,
             bar.top,
             bar.width(),
@@ -700,6 +706,7 @@ fn elevated_band_recheck_detects_background_topmost_promotion_and_demotion() {
         )
         .unwrap();
     }
+    let tray_raw = tray.0 as isize;
 
     #[derive(Clone, Copy)]
     enum BgZCmd {
@@ -708,10 +715,11 @@ fn elevated_band_recheck_detects_background_topmost_promotion_and_demotion() {
         Exit,
     }
     let (cmd_tx, cmd_rx) = mpsc::channel::<BgZCmd>();
-    let (ready_tx, ready_rx) = mpsc::channel::<u32>();
+    let (ready_tx, ready_rx) = mpsc::channel::<(u32, isize)>();
     let (ack_tx, ack_rx) = mpsc::channel::<()>();
     let bg_join = std::thread::spawn(move || {
         let _dpi = DpiContextGuard::per_monitor_v2();
+        let tray = HWND(tray_raw as *mut std::ffi::c_void);
         let hinst = HINSTANCE(unsafe { GetModuleHandleW(None).unwrap() }.0);
         let cls = register_window_class(hinst).unwrap();
         let bg = unsafe {
@@ -733,11 +741,11 @@ fn elevated_band_recheck_detects_background_topmost_promotion_and_demotion() {
         };
         unsafe {
             let _ = ShowWindow(bg, SW_SHOWNOACTIVATE);
-            // Start visible and demoted behind `tray` without stealing desktop focus;
-            // Win32 then allows subsequent SWP_NOACTIVATE topmost promotion from this thread.
+            // Start visible, non-topmost and directly behind `tray` without
+            // stealing desktop focus.
             SetWindowPos(
                 bg,
-                Some(HWND_NOTOPMOST),
+                Some(tray),
                 0,
                 0,
                 0,
@@ -746,7 +754,9 @@ fn elevated_band_recheck_detects_background_topmost_promotion_and_demotion() {
             )
             .unwrap();
         }
-        ready_tx.send(unsafe { GetCurrentThreadId() }).unwrap();
+        ready_tx
+            .send((unsafe { GetCurrentThreadId() }, bg.0 as isize))
+            .unwrap();
         while let Ok(cmd) = cmd_rx.recv() {
             match cmd {
                 BgZCmd::PromoteTopmost => {
@@ -766,9 +776,12 @@ fn elevated_band_recheck_detects_background_topmost_promotion_and_demotion() {
                 }
                 BgZCmd::DemoteNoTopmost => {
                     unsafe {
+                        // Inserting after a non-topmost window also clears
+                        // topmost status (HWND_NOTOPMOST alone would land it
+                        // above the non-topmost mock tray).
                         SetWindowPos(
                             bg,
-                            Some(HWND_NOTOPMOST),
+                            Some(tray),
                             0,
                             0,
                             0,
@@ -787,7 +800,12 @@ fn elevated_band_recheck_detects_background_topmost_promotion_and_demotion() {
         }
     });
 
-    let bg_tid = ready_rx.recv().unwrap();
+    let (bg_tid, bg_raw) = ready_rx.recv().unwrap();
+    let bg = HWND(bg_raw as *mut std::ffi::c_void);
+    assert!(
+        !is_window_above(bg, tray),
+        "background window must start behind the mock tray"
+    );
     let mut ctx = test_window_ctx(hwnd, true);
     ctx.last_size = (widget_rect.width(), widget_rect.height());
     ctx.last_pos = Some((widget_rect.left, widget_rect.top));
@@ -800,6 +818,10 @@ fn elevated_band_recheck_detects_background_topmost_promotion_and_demotion() {
     // Promote already-visible background window to TOPMOST with no move/size/activate.
     cmd_tx.send(BgZCmd::PromoteTopmost).unwrap();
     ack_rx.recv().unwrap();
+    assert!(
+        is_window_above(bg, tray),
+        "topmost promotion must order the background window above the mock tray"
+    );
     assert!(!ctx.recheck_topmost_occlusion_with_tray(tray));
     assert!(
         !ctx.is_visible() && unsafe { !IsWindowVisible(hwnd).as_bool() },
@@ -812,6 +834,10 @@ fn elevated_band_recheck_detects_background_topmost_promotion_and_demotion() {
     // Demote it back behind the taskbar with no move/size/activate.
     cmd_tx.send(BgZCmd::DemoteNoTopmost).unwrap();
     ack_rx.recv().unwrap();
+    assert!(
+        !is_window_above(bg, tray),
+        "demotion must order the background window behind the mock tray"
+    );
     assert!(
         ctx.recheck_topmost_occlusion_with_tray(tray),
         "demoting the overlapping background window must request refresh to restore"
