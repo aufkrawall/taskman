@@ -1072,7 +1072,39 @@ rebase runbook.
 
 ## Windows taskbar monitor (2026-11-16)
 
-- **Software layered rendering:** `tm-platform/src/win/taskbar_monitor.rs`
+- **Module layout (2026-11-17):** `tm-platform/src/win/taskbar_monitor/` —
+  `mod.rs` (public `TaskbarMonitorHandle`, shared timer constants,
+  `PixelRect`), `render.rs` (`Renderer`, `DibSurface`, `MeasuredLayout`,
+  `build_display`, light/dark probe), `placement.rs` (`solve_taskbar_placement`,
+  `Gap1D`, `AnchorSlot`, `context_menu_anchor`), `occlusion.rs`
+  (`scan_above_tray*`, clip-rect helpers, `occlusion_*`), `identity.rs`
+  (class-name / shell-host / cloak / frame helpers), `fullscreen.rs`
+  (`probe_taskbar_env`, `fullscreen_covering_monitor_state`), `uia.rs`
+  (`UiaSession`, `UiaShared`, `UiaScanner`, `uia_worker_main`), `zorder.rs`
+  (window bands, band-1 Z-order repair), `hooks.rs` (`LIVE_*` globals,
+  `*_event_proc`, `WindowCtx` hook sync), `visibility.rs` (state machine below),
+  `window.rs` (`WindowCtx`, refresh pipeline; its tests in `window/tests.rs`),
+  `thread.rs` (`WndProcState`, `wnd_proc`, context menu,
+  `taskbar_thread_main`), and `test_support.rs` (shared fixtures incl.
+  `test_window_ctx`, which every test `WindowCtx` starts from). Items are
+  `pub(super)`; tests live next to the code they cover.
+- **Explicit visibility state (`visibility.rs`):** `WindowCtx::state:
+  WidgetState` holds `Visibility::{Hidden(HideReason), Revalidating, Shown}`
+  (Revalidating = on screen but `WS_EX_TRANSPARENT` until a current UIA scan),
+  the installed `ActiveClip` (kept beside the phase because a cut-out is
+  installed on a still-hidden window right before it is shown) and
+  `layout_confirmed` (formerly `restore_from_cached_layout`). Every transition
+  goes through `apply_visibility` (debug hide log, clip release, hover reset,
+  `ShowWindow` + native reconcile, `LIVE_OCCLUDER_HWND`, notifier, topmost
+  recheck timer). Hide reasons are typed; `HideReason::name()` keeps the
+  historic log strings and `keeps_confirmed_layout()` encodes which hides keep
+  the cached layout (fullscreen, taskbar unavailable/auto-hidden, occluded,
+  tray missing, z-order failure) versus discard it (own pipeline failures,
+  disabled). Occlusion is decided by the pure `decide_occlusion`
+  (`Clear` / `Clip` / `Hide`) and applied by `apply_occlusion_policy`.
+  `HideReason::AwaitingRefresh` is the initial state and what a topmost recheck
+  leaves when it hands a tray-missing hide over to a full refresh.
+- **Software layered rendering:** the `"tm-taskbar"` window
   runs an independent `WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE`
   unowned popup (without hardcoding `WS_EX_TOPMOST`, and
   with `DWMWA_TRANSITIONS_FORCEDISABLED`) on a dedicated `"tm-taskbar"` thread
@@ -1204,7 +1236,7 @@ rebase runbook.
   presenting and drops a vanishing cut-out only afterwards
   (`occlusion_leaves_unclipped`). Widgets hidden only by
   transient fullscreen or
-  occlusion suppression (`restore_from_cached_layout`) preserve `last_env_geom`
+  occlusion suppression (`WidgetState::layout_confirmed`) preserve `last_env_geom`
   and reappear immediately click-through (`WS_EX_TRANSPARENT`) on their cached
   occupancy when returning to unchanged core geometry/DPI while background UIA
   revalidates; widgets without a confirmed prior slot (startup,

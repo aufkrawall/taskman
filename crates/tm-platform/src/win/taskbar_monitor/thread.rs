@@ -8,6 +8,7 @@ use super::hooks::{
 use super::placement::context_menu_anchor;
 use super::render::{Renderer, read_taskbar_is_light};
 use super::uia::UiaScanner;
+use super::visibility::WidgetState;
 use super::window::{WindowCtx, cursor_inside_window};
 use super::zorder::{TASKBAR_MONITOR_BAND, band_exports, window_band};
 use super::{
@@ -719,7 +720,7 @@ pub(super) fn taskbar_thread_main(
                 last_display: None,
                 last_size: (0, 0),
                 last_pos: None,
-                last_visible: false,
+                state: WidgetState::default(),
                 last_present_error: None,
                 last_anchor_slot: None,
                 last_compact: false,
@@ -728,7 +729,6 @@ pub(super) fn taskbar_thread_main(
                 pending_uia_scan: true,
                 debounce_uia_scan: false,
                 invalidate_uia_layout: true,
-                restore_from_cached_layout: false,
                 tracked_fg_tid: 0,
                 fg_loc_hook: HWINEVENTHOOK::default(),
                 tracked_fs_tid: 0,
@@ -741,11 +741,6 @@ pub(super) fn taskbar_thread_main(
                 last_fg_hwnd: 0,
                 fullscreen_recheck_remaining: 0,
                 fullscreen_recheck_armed: false,
-                hidden_by_occlusion: false,
-                hidden_by_tray_missing: false,
-                last_occluded_rect: None,
-                applied_clip: None,
-                clip_occluder: HWND::default(),
                 topmost_recheck_armed: false,
             },
         )));
@@ -996,7 +991,7 @@ mod tests {
                     SWP_NOZORDER | SWP_NOACTIVATE,
                 );
             }
-            assert!(ctx.set_visible(true));
+            assert!(ctx.show());
             assert!(ctx.set_interactive(true));
             unsafe {
                 let _ = SendMessageW(hwnd, WM_SETTINGCHANGE, Some(WPARAM(0)), Some(LPARAM(0)));

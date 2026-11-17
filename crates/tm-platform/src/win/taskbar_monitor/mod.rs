@@ -42,6 +42,7 @@ mod render;
 mod test_support;
 mod thread;
 mod uia;
+mod visibility;
 mod window;
 mod zorder;
 

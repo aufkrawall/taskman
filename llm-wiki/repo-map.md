@@ -136,7 +136,12 @@ platform boundary (`tm-core` ← `tm-platform` ← `tm-app` / `tm-service`), and
     for a hung target) — plus an event-driven strict-topmost
     keeper that reasserts the root HWND on foreground/show events and UNHOOKS itself
     when always-on-top is turned off),
-    `taskbar_monitor.rs` (optional taskbar CPU/RAM/network monitor on a
+    `taskbar_monitor/` (module directory: `render`, `placement`, `occlusion`,
+    `identity`, `fullscreen`, `uia`, `zorder`, `hooks`, `visibility`
+    (explicit `Hidden(reason)`/`Revalidating`/`Shown` state machine),
+    `window` (`WindowCtx` refresh pipeline), `thread` (`wnd_proc`, message
+    loop), `test_support`; see `current.md` § Windows taskbar monitor —
+    optional taskbar CPU/RAM/network monitor on a
     dedicated `"tm-taskbar"` thread: `WS_EX_LAYERED | WS_EX_TOOLWINDOW |
     WS_EX_NOACTIVATE` unowned popup in window band 16 via `CreateWindowInBand`
     with band-1 fallback, software Direct2D + DirectWrite into

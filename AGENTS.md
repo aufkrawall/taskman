@@ -73,6 +73,9 @@
 - **Environment gotchas:**
   - Long inline heredocs (>6 KB) get truncated in some shells here — write
     patch scripts to a file first, then execute them.
+  - Write multi-line scripts with the Write tool and change them with Edit;
+    avoid `sed -i` for replacements that contain backslashes or quotes
+    (Git Bash escaping mangles them).
   - Tests that flip process-global state (settings path override) must hold
     `TEST_OVERRIDE_LOCK`; two such tests exist in `tm-core/src/settings.rs`
     — follow that pattern for new ones.

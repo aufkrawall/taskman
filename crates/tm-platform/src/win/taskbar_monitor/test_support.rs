@@ -1,6 +1,7 @@
 //! Shared fixtures for the taskbar monitor tests.
 
 use super::uia::{UiaScanner, UiaShared};
+use super::visibility::WidgetState;
 use super::window::WindowCtx;
 use super::{MonitorVisibility, PixelRect, SharedState};
 use crate::taskbar_monitor::{Config, Metrics};
@@ -110,7 +111,7 @@ pub(super) fn test_window_ctx(hwnd: HWND, in_elevated_band: bool) -> WindowCtx {
         last_display: None,
         last_size: (0, 0),
         last_pos: None,
-        last_visible: false,
+        state: WidgetState::default(),
         last_present_error: None,
         last_anchor_slot: None,
         last_compact: false,
@@ -119,7 +120,6 @@ pub(super) fn test_window_ctx(hwnd: HWND, in_elevated_band: bool) -> WindowCtx {
         pending_uia_scan: false,
         debounce_uia_scan: false,
         invalidate_uia_layout: false,
-        restore_from_cached_layout: false,
         tracked_fg_tid: 0,
         fg_loc_hook: HWINEVENTHOOK::default(),
         tracked_fs_tid: 0,
@@ -132,11 +132,6 @@ pub(super) fn test_window_ctx(hwnd: HWND, in_elevated_band: bool) -> WindowCtx {
         last_fg_hwnd: 0,
         fullscreen_recheck_remaining: 0,
         fullscreen_recheck_armed: false,
-        hidden_by_occlusion: false,
-        hidden_by_tray_missing: false,
-        last_occluded_rect: None,
-        applied_clip: None,
-        clip_occluder: HWND::default(),
         topmost_recheck_armed: false,
     }
 }

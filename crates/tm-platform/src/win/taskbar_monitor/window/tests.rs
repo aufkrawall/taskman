@@ -1,6 +1,6 @@
 use super::*;
 use crate::win::taskbar_monitor::hooks::taskbar_event_layout_update;
-use crate::win::taskbar_monitor::occlusion::occlusion_result_after_enum;
+use crate::win::taskbar_monitor::occlusion::{OcclusionCheck, occlusion_result_after_enum};
 use crate::win::taskbar_monitor::test_support::{
     DpiContextGuard, TestWindows, create_topmost_test_window, rect, test_window_ctx,
     z_order_test_lock,
@@ -11,6 +11,7 @@ use crate::win::taskbar_monitor::thread::{
 use crate::win::taskbar_monitor::uia::{
     ComMtaGuard, UIA_MIN_SCAN_INTERVAL, UIA_STALE_LAYOUT_MAX_FAILURES, UiaCache, UiaShared,
 };
+use crate::win::taskbar_monitor::visibility::{HideReason, Visibility};
 use crate::win::taskbar_monitor::zorder::{is_window_above, repair_visible_taskbar_order};
 use std::sync::Condvar;
 use tm_core::format::format_taskbar_pct;
@@ -18,8 +19,10 @@ use windows::Win32::Foundation::HINSTANCE;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DestroyWindow, EVENT_OBJECT_HIDE, EVENT_OBJECT_LOCATIONCHANGE,
-    EVENT_OBJECT_REORDER, EVENT_OBJECT_SHOW, HWND_NOTOPMOST, HWND_TOP, HWND_TOPMOST, OBJID_WINDOW,
-    SWP_NOMOVE, SWP_NOSIZE, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+    EVENT_OBJECT_REORDER, EVENT_OBJECT_SHOW, GWL_EXSTYLE, GetWindowLongPtrW, HWND_NOTOPMOST,
+    HWND_TOP, HWND_TOPMOST, IsWindowVisible, OBJID_WINDOW, SW_HIDE, SW_SHOWNOACTIVATE, SWP_NOMOVE,
+    SWP_NOSIZE, SetWindowLongPtrW, ShowWindow, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
+    WS_EX_TRANSPARENT, WS_POPUP,
 };
 
 #[test]
@@ -105,7 +108,7 @@ fn taskbar_focus_refresh_keeps_confirmed_layout_and_window_visible() {
     ctx.last_env_geom = Some((tray.0 as isize, bar, Some(notify), 96));
     ctx.refresh_taskbar_env(&config, &metrics, env, false);
     assert!(
-        ctx.last_visible,
+        ctx.is_visible(),
         "initial display rendered={}, positioned={}, known_layout={}",
         ctx.last_display.is_some(),
         ctx.last_pos.is_some(),
@@ -145,7 +148,7 @@ fn taskbar_focus_refresh_keeps_confirmed_layout_and_window_visible() {
         ctx.request_layout_scan(update, true);
         ctx.refresh_taskbar_env(&config, &metrics, env, false);
         assert!(
-            ctx.last_visible,
+            ctx.is_visible(),
             "focus-only taskbar notification must not hide the widget"
         );
         assert_eq!(
@@ -173,7 +176,7 @@ fn taskbar_focus_refresh_keeps_confirmed_layout_and_window_visible() {
         let update = taskbar_event_layout_update(event, object, child).unwrap();
         ctx.request_layout_scan(update, true);
         ctx.refresh_taskbar_env(&config, &metrics, env, true);
-        assert!(ctx.last_visible);
+        assert!(ctx.is_visible());
         assert!(
             !ctx.accepts_input(),
             "pending occupancy must not steal clicks"
@@ -194,7 +197,7 @@ fn taskbar_focus_refresh_keeps_confirmed_layout_and_window_visible() {
         ..metrics
     };
     ctx.refresh_taskbar_env(&config, &live, env, false);
-    assert!(ctx.last_visible);
+    assert!(ctx.is_visible());
     assert!(!ctx.accepts_input());
     assert_eq!(ctx.last_pos, previous_pos);
     assert_eq!(ctx.last_size, previous_size);
@@ -209,7 +212,7 @@ fn taskbar_focus_refresh_keeps_confirmed_layout_and_window_visible() {
         assert!(state.publish(target, Some(vec![notify])));
     }
     ctx.refresh_taskbar_env(&config, &metrics, env, false);
-    assert!(ctx.last_visible);
+    assert!(ctx.is_visible());
     assert!(ctx.accepts_input());
     assert_eq!(notifications.load(Ordering::Relaxed), 1);
 
@@ -229,20 +232,20 @@ fn taskbar_focus_refresh_keeps_confirmed_layout_and_window_visible() {
         ));
     }
     ctx.refresh_taskbar_env(&config, &metrics, env, false);
-    assert!(!ctx.last_visible);
+    assert!(!ctx.is_visible());
     assert_eq!(notifications.load(Ordering::Relaxed), 2);
 
     // A hidden widget must not reappear on provisional cached data.
     ctx.request_layout_scan(LayoutUpdate::Recheck, true);
     ctx.refresh_taskbar_env(&config, &metrics, env, false);
-    assert!(!ctx.last_visible);
+    assert!(!ctx.is_visible());
     {
         let mut state = ctx.uia_scanner.state.0.lock().unwrap();
         let target = state.pending.take().unwrap();
         assert!(state.publish(target, Some(vec![notify])));
     }
     ctx.refresh_taskbar_env(&config, &metrics, env, false);
-    assert!(ctx.last_visible);
+    assert!(ctx.is_visible());
     assert!(ctx.accepts_input());
     assert_eq!(notifications.load(Ordering::Relaxed), 3);
 
@@ -258,7 +261,7 @@ fn taskbar_focus_refresh_keeps_confirmed_layout_and_window_visible() {
             assert!(!state.publish(target, None));
         }
         ctx.refresh_taskbar_env(&config, &metrics, env, false);
-        assert!(ctx.last_visible, "a transient UIA failure must not hide");
+        assert!(ctx.is_visible(), "a transient UIA failure must not hide");
         assert!(
             !ctx.accepts_input(),
             "an unconfirmed layout must not take clicks"
@@ -273,7 +276,7 @@ fn taskbar_focus_refresh_keeps_confirmed_layout_and_window_visible() {
         assert!(state.publish(target, None));
     }
     ctx.refresh_taskbar_env(&config, &metrics, env, false);
-    assert!(!ctx.last_visible);
+    assert!(!ctx.is_visible());
     assert!(!ctx.accepts_input());
     assert_eq!(notifications.load(Ordering::Relaxed), 4);
 
@@ -283,7 +286,7 @@ fn taskbar_focus_refresh_keeps_confirmed_layout_and_window_visible() {
         assert!(state.publish(target, Some(vec![notify])));
     }
     ctx.refresh_taskbar_env(&config, &metrics, env, false);
-    assert!(ctx.last_visible);
+    assert!(ctx.is_visible());
     assert_eq!(notifications.load(Ordering::Relaxed), 5);
 
     // A failed hook-time positioning attempt may already have hidden the
@@ -291,8 +294,8 @@ fn taskbar_focus_refresh_keeps_confirmed_layout_and_window_visible() {
     unsafe {
         let _ = ShowWindow(hwnd, SW_HIDE);
     }
-    assert!(ctx.last_visible);
-    ctx.set_visible(true);
+    assert!(ctx.is_visible());
+    ctx.show();
     assert!(unsafe { IsWindowVisible(hwnd).as_bool() });
     assert_eq!(notifications.load(Ordering::Relaxed), 5);
 
@@ -302,7 +305,7 @@ fn taskbar_focus_refresh_keeps_confirmed_layout_and_window_visible() {
     moved.taskbar_rect.right -= 1;
     ctx.request_layout_scan(LayoutUpdate::Recheck, true);
     ctx.refresh_taskbar_env(&config, &metrics, moved, false);
-    assert!(!ctx.last_visible);
+    assert!(!ctx.is_visible());
     assert_eq!(notifications.load(Ordering::Relaxed), 6);
 }
 
@@ -373,7 +376,7 @@ fn elevated_band_hides_on_overlapping_topmost_popup_and_restores() {
     ctx.last_env_geom = Some((tray.0 as isize, bar, Some(notify), 96));
 
     ctx.refresh_taskbar_env(&config, &metrics, env, false);
-    assert!(ctx.last_visible);
+    assert!(ctx.is_visible());
     let widget_rect = ctx.last_rect().expect("visible widget rect");
 
     // Non-overlapping topmost popup leaves the widget visible.
@@ -391,7 +394,7 @@ fn elevated_band_hides_on_overlapping_topmost_popup_and_restores() {
         .unwrap();
     }
     ctx.refresh_taskbar_env(&config, &metrics, env, false);
-    assert!(ctx.last_visible);
+    assert!(ctx.is_visible());
 
     // Overlapping topmost popup (menu, flyout, or always-on-top window) hides the widget.
     unsafe {
@@ -408,7 +411,7 @@ fn elevated_band_hides_on_overlapping_topmost_popup_and_restores() {
     }
     ctx.refresh_taskbar_env(&config, &metrics, env, false);
     assert!(
-        !ctx.last_visible && unsafe { !IsWindowVisible(hwnd).as_bool() },
+        !ctx.is_visible() && unsafe { !IsWindowVisible(hwnd).as_bool() },
         "Band-16 widget must hide when a topmost popup overlaps its footprint"
     );
 
@@ -418,7 +421,7 @@ fn elevated_band_hides_on_overlapping_topmost_popup_and_restores() {
         SetWindowLongPtrW(popup, GWL_EXSTYLE, orig_ex | WS_EX_TRANSPARENT.0 as isize);
     }
     ctx.refresh_taskbar_env(&config, &metrics, env, false);
-    assert!(ctx.last_visible);
+    assert!(ctx.is_visible());
 
     // Non-topmost overlapping window behind the tray also does not hide the widget.
     unsafe {
@@ -436,7 +439,7 @@ fn elevated_band_hides_on_overlapping_topmost_popup_and_restores() {
     }
     ctx.refresh_taskbar_env(&config, &metrics, env, false);
     assert!(
-        ctx.last_visible,
+        ctx.is_visible(),
         "non-topmost window behind tray must not occlude Band-16 widget \
          (popup_above_tray={}, tray_ex={:#x}, popup_ex={:#x}, occluded={})",
         is_window_above(popup, tray),
@@ -459,13 +462,13 @@ fn elevated_band_hides_on_overlapping_topmost_popup_and_restores() {
         .unwrap();
     }
     ctx.refresh_taskbar_env(&config, &metrics, env, false);
-    assert!(!ctx.last_visible);
+    assert!(!ctx.is_visible());
 
     unsafe {
         let _ = ShowWindow(popup, SW_HIDE);
     }
     ctx.refresh_taskbar_env(&config, &metrics, env, false);
-    assert!(ctx.last_visible);
+    assert!(ctx.is_visible());
 }
 
 #[test]
@@ -599,16 +602,16 @@ fn fullscreen_suppression_restores_immediately_on_cached_layout_without_stealing
 
     // Initial confirmed visibility.
     ctx.refresh_taskbar_env(&config, &metrics, env, false);
-    assert!(ctx.last_visible);
+    assert!(ctx.is_visible());
     assert!(ctx.accepts_input());
-    assert!(ctx.restore_from_cached_layout);
+    assert!(ctx.state.layout_confirmed);
     assert_eq!(notifications.load(Ordering::Relaxed), 1);
 
     // Simulate entering fullscreen: geometry is preserved, background UIA
     // revalidation is marked pending, and the widget hides.
     ctx.pending_uia_scan = true;
-    ctx.hide("env_unavailable_or_fullscreen", None);
-    assert!(!ctx.last_visible);
+    ctx.hide(HideReason::Fullscreen { suppressor: None });
+    assert!(!ctx.is_visible());
     assert!(!unsafe { IsWindowVisible(hwnd).as_bool() });
     assert_eq!(notifications.load(Ordering::Relaxed), 2);
 
@@ -618,7 +621,7 @@ fn fullscreen_suppression_restores_immediately_on_cached_layout_without_stealing
     metrics.cpu_pct = Some(42.0);
     ctx.refresh_taskbar_env(&config, &metrics, env, false);
     assert!(
-        ctx.last_visible && unsafe { IsWindowVisible(hwnd).as_bool() },
+        ctx.is_visible() && unsafe { IsWindowVisible(hwnd).as_bool() },
         "widget must reappear immediately on cached layout when returning from fullscreen"
     );
     assert!(
@@ -640,19 +643,19 @@ fn fullscreen_suppression_restores_immediately_on_cached_layout_without_stealing
         assert!(state.publish(target, Some(vec![notify])));
     }
     ctx.refresh_taskbar_env(&config, &metrics, env, false);
-    assert!(ctx.last_visible);
+    assert!(ctx.is_visible());
     assert!(ctx.accepts_input());
     assert_eq!(notifications.load(Ordering::Relaxed), 3);
 
     // If geometry actually changed while in fullscreen (e.g. resolution/DPI
     // change), returning must invalidate stale cache and wait for UIA.
     ctx.pending_uia_scan = true;
-    ctx.hide("env_unavailable_or_fullscreen", None);
+    ctx.hide(HideReason::Fullscreen { suppressor: None });
     let mut changed_env = env;
     changed_env.taskbar_rect.top -= 4;
     ctx.refresh_taskbar_env(&config, &metrics, changed_env, false);
     assert!(
-        !ctx.last_visible && unsafe { !IsWindowVisible(hwnd).as_bool() },
+        !ctx.is_visible() && unsafe { !IsWindowVisible(hwnd).as_bool() },
         "changed taskbar geometry after fullscreen must wait for fresh UIA scan"
     );
 }
@@ -788,10 +791,10 @@ fn elevated_band_recheck_detects_background_topmost_promotion_and_demotion() {
     let mut ctx = test_window_ctx(hwnd, true);
     ctx.last_size = (widget_rect.width(), widget_rect.height());
     ctx.last_pos = Some((widget_rect.left, widget_rect.top));
-    ctx.last_visible = true;
+    ctx.state.visibility = Visibility::Shown;
 
     assert!(!ctx.recheck_topmost_occlusion_with_tray(tray));
-    assert!(ctx.last_visible);
+    assert!(ctx.is_visible());
     assert!(!ctx.topmost_hooks.iter().any(|&(t, _)| t == bg_tid));
 
     // Promote already-visible background window to TOPMOST with no move/size/activate.
@@ -799,10 +802,10 @@ fn elevated_band_recheck_detects_background_topmost_promotion_and_demotion() {
     ack_rx.recv().unwrap();
     assert!(!ctx.recheck_topmost_occlusion_with_tray(tray));
     assert!(
-        !ctx.last_visible && unsafe { !IsWindowVisible(hwnd).as_bool() },
+        !ctx.is_visible() && unsafe { !IsWindowVisible(hwnd).as_bool() },
         "pure Z-order promotion of an overlapping background window must hide elevated widget"
     );
-    assert!(ctx.hidden_by_occlusion);
+    assert!(ctx.hidden_by_occlusion());
     assert!(ctx.topmost_recheck_armed);
     assert!(ctx.topmost_hooks.iter().any(|&(t, _)| t == bg_tid));
 
@@ -815,8 +818,8 @@ fn elevated_band_recheck_detects_background_topmost_promotion_and_demotion() {
     );
     assert!(!ctx.topmost_hooks.iter().any(|&(t, _)| t == bg_tid));
 
-    ctx.hide("env_unavailable_or_fullscreen", None);
-    assert!(!ctx.hidden_by_occlusion);
+    ctx.hide(HideReason::Fullscreen { suppressor: None });
+    assert!(!ctx.hidden_by_occlusion());
     assert!(!ctx.topmost_recheck_armed);
 
     let _ = cmd_tx.send(BgZCmd::Exit);
@@ -869,10 +872,12 @@ fn recheck_topmost_occlusion_prefers_blocked_candidate_rect_over_stale_last_rect
     ctx.last_pos = Some((rect_old.left, rect_old.top));
 
     // Simulate a relocation to `rect_new` blocked by `popup_new` before `last_pos` updates.
-    ctx.last_occluded_rect = Some(rect_new);
-    ctx.hide("occluded_above_tray", Some(popup_new));
-    assert!(ctx.hidden_by_occlusion);
-    assert_eq!(ctx.last_occluded_rect, Some(rect_new));
+    ctx.hide(HideReason::Occluded {
+        rect: rect_new,
+        occluder: popup_new,
+    });
+    assert!(ctx.hidden_by_occlusion());
+    assert_eq!(ctx.state.occluded_rect(), Some(rect_new));
     assert_eq!(ctx.last_rect(), Some(rect_old));
     assert!(!ctx.recheck_topmost_occlusion_with_tray(tray));
 
@@ -882,7 +887,7 @@ fn recheck_topmost_occlusion_prefers_blocked_candidate_rect_over_stale_last_rect
     }
     assert!(
         ctx.recheck_topmost_occlusion_with_tray(tray),
-        "recheck must inspect `last_occluded_rect` before stale `last_rect()`"
+        "recheck must inspect the occluded footprint before stale `last_rect()`"
     );
 }
 
@@ -1012,7 +1017,7 @@ fn uia_unavailable_scans_do_not_spin_and_back_off_progressively() {
         retry_gen,
         "repeated refresh calls while retry is queued must not churn UIA generation"
     );
-    assert!(!ctx.last_visible);
+    assert!(!ctx.is_visible());
 }
 
 #[test]
@@ -1102,7 +1107,7 @@ fn tray_notify_resize_repositions_on_cached_layout_without_hiding_or_discarding_
     ctx.last_env_geom = Some((tray.0 as isize, bar, Some(notify_initial), 96));
 
     ctx.refresh_taskbar_env(&config, &metrics, env, false);
-    assert!(ctx.last_visible);
+    assert!(ctx.is_visible());
     assert!(ctx.accepts_input());
     assert_eq!(notifications.load(Ordering::Relaxed), 1);
     let initial_pos = ctx.last_pos.expect("widget must have initial placement");
@@ -1118,7 +1123,7 @@ fn tray_notify_resize_repositions_on_cached_layout_without_hiding_or_discarding_
     };
     ctx.refresh_taskbar_env(&config, &metrics, expanded_env, false);
     assert!(
-        ctx.last_visible && unsafe { IsWindowVisible(hwnd).as_bool() },
+        ctx.is_visible() && unsafe { IsWindowVisible(hwnd).as_bool() },
         "TrayNotifyWnd resize must not hide the taskbar monitor"
     );
     assert_eq!(
@@ -1151,7 +1156,7 @@ fn tray_notify_resize_repositions_on_cached_layout_without_hiding_or_discarding_
         assert!(state.publish(target, Some(vec![notify_expanded])));
     }
     ctx.refresh_taskbar_env(&config, &metrics, expanded_env, false);
-    assert!(ctx.last_visible);
+    assert!(ctx.is_visible());
     assert!(ctx.accepts_input());
     assert_eq!(notifications.load(Ordering::Relaxed), 1);
 }
@@ -1196,10 +1201,10 @@ fn occlusion_result_rejects_unverified_band1_occluder_when_tray_missing_from_enu
     let mut ctx = test_window_ctx(hwnd, true);
     ctx.last_size = (120, 40);
     ctx.last_pos = Some((-23_800, -24_000));
-    ctx.last_visible = true;
+    ctx.state.visibility = Visibility::Shown;
 
-    ctx.hide("tray_missing_in_enum", None);
-    assert!(ctx.hidden_by_tray_missing);
+    ctx.hide(HideReason::TrayMissing);
+    assert!(ctx.hidden_by_tray_missing());
     assert!(
         ctx.topmost_recheck_armed,
         "tray_missing_in_enum hide must arm the 500ms recovery timer"
@@ -1288,7 +1293,7 @@ fn core_geometry_change_remeasures_layout_after_pending_uia_wait() {
     ctx.last_env_geom = Some((tray.0 as isize, small_bar, Some(notify_initial), 96));
 
     ctx.refresh_taskbar_env(&config, &metrics, env, false);
-    assert!(ctx.last_visible);
+    assert!(ctx.is_visible());
     let old_size = ctx.last_size;
 
     // Grow taskbar height from 30 px to 48 px: the first refresh updates
@@ -1299,7 +1304,7 @@ fn core_geometry_change_remeasures_layout_after_pending_uia_wait() {
         ..env
     };
     ctx.refresh_taskbar_env(&config, &metrics, grown_env, true);
-    assert!(!ctx.last_visible);
+    assert!(!ctx.is_visible());
 
     // Once UIA finishes scanning the grown taskbar and triggers `refresh(false)`,
     // `ctx` must remeasure and rerender for the new 48 px taskbar bounds rather
@@ -1310,7 +1315,7 @@ fn core_geometry_change_remeasures_layout_after_pending_uia_wait() {
         assert!(state.publish(target, Some(vec![notify_initial])));
     }
     ctx.refresh_taskbar_env(&config, &metrics, grown_env, false);
-    assert!(ctx.last_visible);
+    assert!(ctx.is_visible());
     let display = build_display(&config, &metrics, false, false, 96, false);
     let expected = ctx
         .renderer
