@@ -1,3 +1,12 @@
+## 2026-11-17 - virtual-desktop switch disappearance: measured, not fixable from TaskMan
+
+- Live probes (out-of-context WinEvent hooks + 60 Hz DPI-aware screen captures of the widget area during scripted Ctrl+Win+Right/Left switches against the installed `8cef091` build; scripts stayed in the session scratchpad):
+  - Explorer shows `VirtualDesktopHotkeySwitcher` (band 2, full monitor, ex-style `0x8200088`, owner `C:\Windows\explorer.exe`) ~10 ms after the hotkey and hides it ~600 ms later; the visible slide itself lasts only ~100 ms in the middle. `Shell_TrayWnd` never moves or cloaks; the widget never cloaks.
+  - The widget does `SW_HIDE` 1 ms after the switcher takes the foreground (fullscreen rule) and shows again within ~10 ms of the switcher's hide.
+  - With the `tm-taskbar` thread suspended across the switch (no hide), the stats still vanish for the same span: the animation includes them, but at ~2.5% opacity (uniform contrast ratio 0.024–0.030 across all glyph pixels).
+  - A band-1 topmost tool-window ULW test window over the taskbar was likewise drawn at ~2.5%, while identical windows above the taskbar slid at full opacity, so the animation draws the taskbar layer over every separate window. Plain and layered child windows of `Shell_TrayWnd` were not drawn on the taskbar at all (even outside the switch).
+- Conclusion: not fixable from a separate overlay window; recorded as a known limitation in `current.md` § Windows taskbar monitor. Resolves the open question from the audit entry below (the earlier `409848e` / `28b1d3e` records were both partly right: there is a `fullscreen` hide, but removing it changes nothing on screen). No code change.
+
 ## 2026-11-17 - taskbar monitor module split and explicit visibility state
 
 - Split `crates/tm-platform/src/win/taskbar_monitor.rs` into the `taskbar_monitor/` module directory (layout in `current.md` § Windows taskbar monitor) with tests moved next to their code; all 14 hand-written test `WindowCtx` literals now start from `test_support::test_window_ctx` plus explicit overrides. Mechanical move, no behavior change (separate commit).

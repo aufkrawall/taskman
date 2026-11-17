@@ -1288,6 +1288,22 @@ rebase runbook.
   `TelemetryDemand::hidden()` and background sampler mode remain
   preserved while the main window is hidden. Non-Windows targets use a no-op stub in
   `tm-platform/src/lib.rs`.
+- **Known limitation — virtual-desktop switch (Ctrl+Win+arrow), measured
+  2026-11-17 on 26H2:** the stats are not visible for the ~0.6–0.9 s that
+  Explorer's full-screen `VirtualDesktopHotkeySwitcher` (band 2, owned by
+  `%SystemRoot%\explorer.exe`) is shown, and this is the shell's animation, not
+  TaskMan. The animation draws the taskbar layer *above* every separate window,
+  so anything over the taskbar (our band-16 widget, or a band-1 test window)
+  shows through its ~97%-opaque background at ~2.5% opacity; the same windows
+  above the taskbar slide at full opacity. The widget's own `fullscreen` hide of
+  the switcher coincides but changes nothing visible: with the `tm-taskbar`
+  thread suspended (no hide at all) the screen gap is the same, and the widget
+  already reappears within ~10 ms of the switcher's hide. Child windows of
+  `Shell_TrayWnd` (plain or layered) are not drawn on the 26H2 taskbar at all,
+  so embedding is not a way out either. Exempting the switcher (`409848e`),
+  deferring hides (`2be2939`) and following a taskbar slide (`e53dbf6`; the real
+  `Shell_TrayWnd` never moves) were all reverted in `28b1d3e`; do not re-land
+  them for this symptom.
 
 ## Routing
 
