@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.1.29 - 2026-11-17
+
 ### Fixed
 
 - **Process Properties I/O no longer disturbs the inspected process or mislabels its files:** reading each open file's position used to write that position back into the file object the target process shares with TaskMan, so a write the target made at that moment could be rewound; positions are now only queried. Access rights are now read from the handle actually inspected instead of from the earlier handle snapshot, so a handle the target closed and reused in between can no longer make a write-only file show up as read/write (with its byte counts then shown as unavailable).
