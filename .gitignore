@@ -2,6 +2,7 @@
 bench/*/target
 bench/dist
 /dist
+/temp
 __pycache__/
 *.log.tmp
 *.png
