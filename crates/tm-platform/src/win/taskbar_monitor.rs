@@ -2072,6 +2072,54 @@ impl WindowCtx {
             .is_none_or(|(t, bar, _, dpi)| (t, bar, dpi) != (tray_raw, env.taskbar_rect, env.dpi));
         let notify_geom_changed = !core_geom_changed
             && prev_geom.is_some_and(|(_, _, notify, _)| notify != env.tray_notify_rect);
+
+        // A virtual-desktop switch slides the whole taskbar without resizing it.
+        // Following that pure translation keeps the widget attached to the
+        // taskbar for the animation instead of hiding it for a UIA revalidation
+        // that cannot succeed until the motion stops.
+        if core_geom_changed
+            && self.last_visible
+            && self.last_display.is_some()
+            && let Some((x, y)) = self.last_pos
+            && let Some((prev_tray, prev_bar, _, prev_dpi)) = prev_geom
+            && prev_tray == tray_raw
+            && prev_dpi == env.dpi
+            && prev_bar.width() == env.taskbar_rect.width()
+            && prev_bar.height() == env.taskbar_rect.height()
+            // A one-pixel correction is a geometry change that must be
+            // revalidated; only a real slide animation is followed directly.
+            && (env.taskbar_rect.left - prev_bar.left)
+                .abs()
+                .max((env.taskbar_rect.top - prev_bar.top).abs())
+                >= 4
+        {
+            let nx = x.saturating_add(env.taskbar_rect.left - prev_bar.left);
+            let ny = y.saturating_add(env.taskbar_rect.top - prev_bar.top);
+            unsafe {
+                let _ = SetWindowPos(
+                    self.hwnd,
+                    None,
+                    nx,
+                    ny,
+                    0,
+                    0,
+                    SWP_NOSIZE
+                        | SWP_NOZORDER
+                        | SWP_NOACTIVATE
+                        | SWP_NOOWNERZORDER
+                        | SWP_NOSENDCHANGING,
+                );
+            }
+            self.last_pos = Some((nx, ny));
+            self.last_env_geom = Some(geom);
+            self.restore_from_cached_layout = true;
+            // Defer the scan until the motion stops; requesting one per frame
+            // would hammer UI Automation during the animation.
+            self.pending_uia_scan = true;
+            let _ = self.set_interactive(false);
+            return;
+        }
+
         if core_geom_changed {
             self.last_env_geom = Some(geom);
             self.pending_uia_scan = true;
@@ -2096,6 +2144,18 @@ impl WindowCtx {
         let Some(uia_occupied) = self.uia_scanner.snapshot_for(tray_raw, env.taskbar_rect) else {
             self.uia_scanner
                 .request_scan(tray_raw, env.taskbar_rect, false);
+            // First frame after a slide animation: the cache is still keyed to
+            // the old taskbar rect. The cached layout is geometry-matched up to
+            // a translation, so keep the pixels visible but click-through until
+            // the scan for the new rect completes.
+            if self.restore_from_cached_layout
+                && self.last_visible
+                && self.last_display.is_some()
+                && !self.uia_scanner.has_cache_for(tray_raw, env.taskbar_rect)
+                && self.set_interactive(false)
+            {
+                return;
+            }
             self.restore_from_cached_layout = false;
             self.hide("uia_unavailable", None);
             return;
@@ -4047,6 +4107,13 @@ impl UiaScanner {
             state,
             worker: Mutex::new(handle),
         }
+    }
+
+    /// Whether the cache is keyed to this exact taskbar target. Distinguishes
+    /// "not scanned for this moved taskbar yet" from "scanned and unavailable".
+    fn has_cache_for(&self, tray_raw: isize, taskbar_rect: PixelRect) -> bool {
+        let guard = self.state.0.lock().unwrap_or_else(|e| e.into_inner());
+        guard.cache.tray_hwnd == tray_raw && guard.cache.taskbar_rect == taskbar_rect
     }
 
     fn snapshot_for(&self, tray_raw: isize, taskbar_rect: PixelRect) -> Option<UiaSnapshot> {
@@ -9183,6 +9250,139 @@ mod tests {
             t1_step + Duration::from_secs(1),
         ));
         assert!(scanner.state.0.lock().unwrap().pending.is_none());
+    }
+
+    #[test]
+    fn taskbar_slide_translation_moves_widget_without_hiding() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let _zorder = z_order_test_lock();
+        let _com = ComMtaGuard::enter();
+        let hinstance = HINSTANCE(unsafe { GetModuleHandleW(None).unwrap() }.0);
+        let class_name = register_window_class(hinstance).unwrap();
+        let tray = create_monitor_window(hinstance, class_name, std::ptr::null_mut()).unwrap();
+        let hwnd = create_monitor_window(hinstance, class_name, std::ptr::null_mut()).unwrap();
+        let _windows = TestWindows(vec![tray, hwnd]);
+        let bar = rect(-10_000, -10_000, -8_080, -9_952);
+        let notify = rect(-8_300, -10_000, -8_080, -9_952);
+        let env = TaskbarEnv {
+            tray_hwnd: tray,
+            taskbar_rect: bar,
+            tray_notify_rect: Some(notify),
+            dpi: 96,
+        };
+        unsafe {
+            let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+        }
+        let config = Config {
+            enabled: true,
+            ..Config::default()
+        };
+        let metrics = Metrics {
+            cpu_pct: Some(25.0),
+            ram_pct: Some(50.0),
+            ..Metrics::default()
+        };
+        let display = build_display(&config, &metrics, false, false, 96, false);
+        let notifications = Arc::new(AtomicUsize::new(0));
+        let observed = notifications.clone();
+        let scanner = Arc::new(UiaScanner {
+            state: Arc::new((
+                Mutex::new(UiaShared {
+                    cache: UiaCache {
+                        tray_hwnd: tray.0 as isize,
+                        taskbar_rect: bar,
+                        rects: Some(vec![notify]),
+                        generation: 0,
+                    },
+                    ..Default::default()
+                }),
+                Condvar::new(),
+            )),
+            worker: Mutex::new(None),
+        });
+        let mut ctx = WindowCtx {
+            hwnd,
+            in_elevated_band: false,
+            user_closing: false,
+            shared: Arc::new(Mutex::new(SharedState {
+                config: config.clone(),
+                metrics,
+                generation: 0,
+            })),
+            visibility: Arc::new(MonitorVisibility {
+                visible: std::sync::atomic::AtomicBool::new(true),
+                notifier: Arc::new(move || {
+                    observed.fetch_add(1, Ordering::Relaxed);
+                }),
+            }),
+            callback: Arc::new(|_| {}),
+            renderer: Renderer::new(),
+            uia_scanner: scanner,
+            light_taskbar: false,
+            hovered: false,
+            tracking_mouse: false,
+            last_display: Some(display),
+            last_size: (100, 40),
+            last_pos: Some((1400, 1008)),
+            last_visible: true,
+            last_present_error: None,
+            last_anchor_slot: None,
+            last_compact: false,
+            last_stacked: false,
+            last_env_geom: Some((tray.0 as isize, bar, Some(notify), 96)),
+            pending_uia_scan: false,
+            invalidate_uia_layout: false,
+            restore_from_cached_layout: true,
+            tracked_fg_tid: 0,
+            fg_loc_hook: HWINEVENTHOOK::default(),
+            tracked_fs_tid: 0,
+            fs_loc_hook: HWINEVENTHOOK::default(),
+            fs_lifecycle_hook: HWINEVENTHOOK::default(),
+            fs_cloak_hook: HWINEVENTHOOK::default(),
+            tracked_tray_tid: 0,
+            tray_hook: HWINEVENTHOOK::default(),
+            topmost_hooks: Vec::new(),
+            last_fg_hwnd: 0,
+            fullscreen_recheck_remaining: 0,
+            fullscreen_recheck_armed: false,
+            hidden_by_occlusion: false,
+            hidden_by_tray_missing: false,
+            last_occluded_rect: None,
+            applied_clip: None,
+            clip_occluder: HWND::default(),
+            topmost_recheck_armed: false,
+        };
+
+        // Slide the whole taskbar 300 px right with no size change: the widget
+        // must follow it, stay visible, and go click-through until UIA catches up.
+        let shifted = TaskbarEnv {
+            taskbar_rect: rect(bar.left + 300, bar.top, bar.right + 300, bar.bottom),
+            tray_notify_rect: Some(rect(
+                notify.left + 300,
+                notify.top,
+                notify.right + 300,
+                notify.bottom,
+            )),
+            ..env
+        };
+        ctx.refresh_taskbar_env(&config, &metrics, shifted, false);
+        assert!(
+            ctx.last_visible,
+            "a pure taskbar slide must not hide the widget"
+        );
+        assert_eq!(ctx.last_pos, Some((1700, 1008)));
+        assert_eq!(notifications.load(Ordering::Relaxed), 0);
+        assert!(
+            !ctx.accepts_input(),
+            "clicks must pass through while revalidating"
+        );
+
+        // Settled frame: UIA is still keyed to the old rect, but the cached
+        // layout must keep the widget visible until the deferred scan returns.
+        ctx.refresh_taskbar_env(&config, &metrics, shifted, false);
+        assert!(ctx.last_visible);
+        assert_eq!(notifications.load(Ordering::Relaxed), 0);
     }
 
     #[test]
