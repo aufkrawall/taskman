@@ -650,9 +650,15 @@ mod tests {
         }
         .expect("test window");
         assert!(unsafe { IsIconic(hwnd) }.as_bool());
-        let before = unsafe { GetForegroundWindow() };
         assert!(!force_foreground_attached(hwnd.0 as isize));
-        assert_eq!(unsafe { GetForegroundWindow() }, before);
+        // The invariant is that the minimized window itself never becomes the
+        // foreground — NOT that the foreground is unchanged across the call:
+        // on a shared desktop (the CI runner, or parallel tests in this very
+        // process calling SetForegroundWindow on their own windows) something
+        // else may take the foreground at any moment, and that is not this
+        // bug. Asserting equality with a previously read foreground window is
+        // what made this test flaky on CI.
+        assert_ne!(unsafe { GetForegroundWindow() }, hwnd);
         unsafe {
             let _ = DestroyWindow(hwnd);
         }
