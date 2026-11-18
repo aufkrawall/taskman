@@ -1315,6 +1315,17 @@ fn context_menu(app: &mut TaskManApp, ui: &mut egui::Ui, row: &RowData) {
         }
         ui.close();
     }
+    // Restarting the shell is a singleton operation on the clicked row, never
+    // a batch command, so it is offered whenever that row is a live
+    // explorer.exe — same entry the top bar shows for this selection.
+    #[cfg(target_os = "windows")]
+    if let Some(target) =
+        crate::app_ui::explorer_restart_identity(app, identity_of(row), &row.name, row.synthetic)
+        && menu::item(ui, i18n::tr(K::RestartService)).clicked()
+    {
+        crate::app_ui::restart_explorer(app, &ctx, target);
+        ui.close();
+    }
     menu::separator(ui);
     if menu::check(
         ui,

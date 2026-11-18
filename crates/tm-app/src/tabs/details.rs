@@ -2545,6 +2545,23 @@ pub fn context_menu(app: &mut TaskManApp, ui: &mut egui::Ui, p: &ProcessEntry, h
     {
         let _ = p.name.as_str();
     }
+    // Restarting the shell is a singleton operation on the clicked row, never
+    // a batch command, so it is offered whenever that row is a live
+    // explorer.exe — same entry the top bar shows for this selection.
+    #[cfg(target_os = "windows")]
+    if let Some(target) = crate::app_ui::explorer_restart_identity(
+        app,
+        crate::app::ProcessIdentity {
+            pid: p.pid,
+            start_epoch_s: p.start_epoch_s,
+        },
+        &p.name,
+        p.synthetic,
+    ) && menu::item(ui, i18n::tr(K::RestartService)).clicked()
+    {
+        crate::app_ui::restart_explorer(app, &ctx, target);
+        ui.close();
+    }
 
     // Saved scheduling rules are program-scoped, not selection-scoped. Hide
     // that control for a batch so changing several processes cannot silently

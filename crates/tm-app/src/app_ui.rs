@@ -13,6 +13,25 @@ use crate::app::TaskManApp;
 use crate::icons::Icon;
 use crate::theme::Palette;
 
+/// Gate shared by the toolbar button and both tab context menus: `identity`
+/// belongs to a live, non-synthetic `explorer.exe` in the latest snapshot.
+/// The start-time comparison keeps a recycled PID from being mistaken for
+/// the shell.
+#[cfg(target_os = "windows")]
+pub(crate) fn explorer_restart_identity(
+    app: &TaskManApp,
+    identity: ProcessIdentity,
+    name: &str,
+    synthetic: bool,
+) -> Option<ProcessIdentity> {
+    if synthetic || !name.eq_ignore_ascii_case("explorer.exe") {
+        return None;
+    }
+    let snapshot = app.latest_snapshot()?;
+    let process = snapshot.process(identity.pid)?;
+    (!process.synthetic && process.start_epoch_s == identity.start_epoch_s).then_some(identity)
+}
+
 #[cfg(target_os = "windows")]
 fn explorer_restart_target(app: &TaskManApp) -> Option<ProcessIdentity> {
     if !matches!(
@@ -26,14 +45,11 @@ fn explorer_restart_target(app: &TaskManApp) -> Option<ProcessIdentity> {
     let target = app.selection.primary()?.clone();
     let snapshot = app.latest_snapshot()?;
     let process = snapshot.process(target.pid)?;
-    (!process.synthetic
-        && process.start_epoch_s == target.start_epoch_s
-        && process.name.eq_ignore_ascii_case("explorer.exe"))
-    .then_some(target)
+    explorer_restart_identity(app, target, &process.name, process.synthetic)
 }
 
 #[cfg(target_os = "windows")]
-fn restart_explorer(app: &mut TaskManApp, ctx: &egui::Context, target: ProcessIdentity) {
+pub(crate) fn restart_explorer(app: &mut TaskManApp, ctx: &egui::Context, target: ProcessIdentity) {
     if !app.identity_is_live(&target) {
         app.shared.toast(i18n::tr(K::ProcessExited));
         return;
