@@ -416,12 +416,17 @@ pub fn clear_history_dialog(app: &mut TaskManApp, ctx: &egui::Context, pal: &the
     let mut clicked = crate::app_ui::DialogButtonClick::None;
     egui::Window::new(i18n::tr(K::ClearHistoryLink))
         .modal(true)
+        .id(egui::Id::new("app-history-clear-dialog"))
         .open(&mut open)
         .collapsible(false)
         .resizable(false)
+        // Pin the outer size like the End task dialog: without `fixed_size` the
+        // egui `Window` default size ([340, 420]) applies and the dialog opens
+        // far taller than its content.
+        .fixed_size([420.0, 124.0])
         .anchor(egui::Align2::CENTER_CENTER, [0.0, -40.0])
         .show(ctx, |ui| {
-            ui.set_width(420.0);
+            ui.set_width(400.0);
             ui.label(i18n::tr(K::ClearHistoryConfirm));
             ui.add_space(8.0);
             clicked = crate::app_ui::dialog_button_row(

@@ -10,6 +10,8 @@
 
 ### Fixed
 
+- **"Delete usage history" confirmation dialog no longer opens oversized:** the dialog window now pins its outer size (420×124, stable window id) exactly like the End task confirmation, instead of falling back to egui's default window size (340×420), which made it render roughly three times taller than its content.
+
 - **Background 30 FPS games (such as Fortnite) no longer falsely report "Not responding":**
   - Excluded non-interactive auxiliary top-level windows from application/hung tracking unless `WS_EX_APPWINDOW` is set: `WS_EX_NOACTIVATE` overlays/helpers, owned windows whose owner is already visible (`GW_OWNER`), `Shell_TrayWnd`, and non-desktop shell window bands (retaining UWP `ApplicationFrameWindow` / `CoreWindow` bands).
   - Resolved DWM `"Ghost"` windows back to the underlying hung window via `HungWindowFromGhostWindow` instead of blaming `dwm.exe`, and checked hosted UWP `CoreWindow` child handles directly instead of `ApplicationFrameHost.exe`'s shared frame.
