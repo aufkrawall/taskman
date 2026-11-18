@@ -110,6 +110,14 @@ pub(crate) fn software_frame_stats_take() -> crate::SoftwareFrameStats {
     }
 }
 
+fn should_force_full_paint(
+    has_presented_once: bool,
+    presented_while_visible: bool,
+    buffer_age: u8,
+) -> bool {
+    !has_presented_once || !presented_while_visible || buffer_age != 1
+}
+
 pub struct SoftwareWinitApp<'app> {
     repaint_proxy: Arc<egui::mutex::Mutex<winit::event_loop::EventLoopProxy<UserEvent>>>,
     app_name: String,
@@ -142,9 +150,13 @@ struct SoftwareWinitRunning<'app> {
     /// the window.
     has_presented_once: bool,
 
-    /// Whether the window was hidden/minimized on a previous tick, so restoring it
-    /// forces a full repaint and full present into the newly-revealed DWM surface.
-    was_hidden: bool,
+    /// Whether the full buffer has been presented while the window was actually
+    /// visible and unminimized. Frame 1 paints while hidden (before `post_rendering`
+    /// calls `window.set_visible(true)`), and a tray/minimize hide discards the
+    /// DWM surface even though `softbuffer` still reports `age() == 1`. Until a
+    /// full `present()` succeeds on the visible window, unchanged tiles would stay
+    /// at the OS background brush (white).
+    presented_while_visible: bool,
 
     /// Set once the first frame has actually reached the screen, so the log records
     /// that the CPU path is live and what it decided about sub-pixel text. A renderer
@@ -346,7 +358,7 @@ impl<'app> SoftwareWinitApp<'app> {
                 size: (0, 0),
             })),
             has_presented_once: false,
-            was_hidden: false,
+            presented_while_visible: false,
             logged_first_frame: false,
             pending_deltas: Default::default(),
         });
@@ -436,7 +448,9 @@ impl SoftwareWinitRunning<'_> {
         let paintable = size.width > 0 && size.height > 0 && (!hidden || !self.has_presented_once);
 
         if paintable {
-            let restored = std::mem::take(&mut self.was_hidden);
+            if hidden {
+                self.presented_while_visible = false;
+            }
             // Take the sub-pixel mode from the ATLAS, not from the style. The atlas is
             // what actually holds the coverage, so asking it makes the blend mode and the
             // rasterization mode agree by construction -- the one failure here that does
@@ -488,7 +502,11 @@ impl SoftwareWinitRunning<'_> {
                 let mut buffer = state.surface.buffer_mut().map_err(|err| {
                     crate::Error::AppCreation(format!("softbuffer buffer: {err}").into())
                 })?;
-                let force_full = !self.has_presented_once || restored || buffer.age() != 1;
+                let force_full = should_force_full_paint(
+                    self.has_presented_once,
+                    self.presented_while_visible,
+                    buffer.age(),
+                );
 
                 let paint_start = Instant::now();
                 let damage = if let Some(mut target) =
@@ -585,6 +603,9 @@ impl SoftwareWinitRunning<'_> {
                         .present_ns_sum
                         .fetch_add(present_ns, Ordering::Relaxed);
                     update_max(&SOFTWARE_FRAME_STATS.present_ns_max, present_ns);
+                    if !hidden && full_screen {
+                        self.presented_while_visible = true;
+                    }
                 }
             }
 
@@ -596,9 +617,32 @@ impl SoftwareWinitRunning<'_> {
             deltas.clear();
 
             self.integration.post_rendering(&self.window);
+
+            // Frame 1 painted and presented while the window was still hidden
+            // (`IsWindowVisible == false`), so Windows discarded that `BitBlt`.
+            // Now that `post_rendering` revealed the window, immediately blit
+            // the already-painted buffer if `softbuffer` kept it (`age == 1`),
+            // or schedule a redraw otherwise.
+            let visible_now =
+                self.window.is_visible() != Some(false) && self.window.is_minimized() != Some(true);
+            if !self.presented_while_visible && visible_now {
+                let mut presented_now = false;
+                if let Ok(mut state) = self.surface.try_borrow_mut()
+                    && let Ok(buffer) = state.surface.buffer_mut()
+                    && buffer.age() == 1
+                    && buffer.present().is_ok()
+                {
+                    presented_now = true;
+                }
+                if presented_now {
+                    self.presented_while_visible = true;
+                } else {
+                    self.window.request_redraw();
+                }
+            }
         } else {
             if hidden {
-                self.was_hidden = true;
+                self.presented_while_visible = false;
             }
             // Nothing was painted, so the shapes are dropped here. The deltas are NOT:
             // they stay in `pending_deltas` for the next paintable frame.
@@ -793,7 +837,12 @@ impl WinitApp for SoftwareWinitApp<'_> {
                 // winit signals "minimised" on Windows as a resize to 0x0.
                 if 0 < size.width && 0 < size.height {
                     repaint_asap = true;
+                } else {
+                    running.presented_while_visible = false;
                 }
+            }
+            winit::event::WindowEvent::Occluded(false) => {
+                running.presented_while_visible = false;
             }
             _ => {}
         }
@@ -822,5 +871,25 @@ impl WinitApp for SoftwareWinitApp<'_> {
             event.window_id,
             &event.window_event,
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::should_force_full_paint;
+
+    #[test]
+    fn full_paint_required_until_presented_while_visible() {
+        // Frame 1 (hidden): must force full paint.
+        assert!(should_force_full_paint(false, false, 0));
+        // Frame 2 right after Frame 1 revealed the window: softbuffer reports
+        // age == 1 from the hidden Frame 1, so `presented_while_visible == false`
+        // must still force a full paint/present onto the visible window.
+        assert!(should_force_full_paint(true, false, 1));
+        // Once presented while visible and buffer age is 1, incremental damage is valid.
+        assert!(!should_force_full_paint(true, true, 1));
+        // Any buffer age other than 1 (new/resized/multi-buffered) forces full.
+        assert!(should_force_full_paint(true, true, 0));
+        assert!(should_force_full_paint(true, true, 2));
     }
 }
