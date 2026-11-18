@@ -53,6 +53,11 @@ use std::sync::{Arc, Mutex};
 use windows::Win32::Foundation::{HWND, LPARAM, RECT, WPARAM};
 use windows::Win32::UI::WindowsAndMessaging::{PostMessageW, WM_APP, WM_CLOSE};
 
+/// Query `GetWindowBand` for `hwnd` when exported by `user32.dll`.
+pub(crate) fn window_band(hwnd: HWND) -> Option<u32> {
+    zorder::window_band(hwnd)
+}
+
 const WM_APP_REFRESH: u32 = WM_APP + 10;
 
 const UIA_SETTLE_TIMER_ID: usize = 1;

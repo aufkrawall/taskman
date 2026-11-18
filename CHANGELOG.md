@@ -4,6 +4,11 @@
 
 ### Fixed
 
+- **Background 30 FPS games (such as Fortnite) no longer falsely report "Not responding":**
+  - Excluded non-interactive auxiliary top-level windows from application/hung tracking unless `WS_EX_APPWINDOW` is set: `WS_EX_NOACTIVATE` overlays/helpers, owned windows whose owner is already visible (`GW_OWNER`), `Shell_TrayWnd`, and non-desktop shell window bands (retaining UWP `ApplicationFrameWindow` / `CoreWindow` bands).
+  - Resolved DWM `"Ghost"` windows back to the underlying hung window via `HungWindowFromGhostWindow` instead of blaming `dwm.exe`, and checked hosted UWP `CoreWindow` child handles directly instead of `ApplicationFrameHost.exe`'s shared frame.
+  - Added bounded non-aborting `SendMessageTimeoutW(..., WM_NULL, SMTO_BLOCK, 200 ms)` verification (deduplicated per thread within a 600 ms scan budget) whenever `IsHungAppWindow` fires, so threads actively pumping at 30 FPS that trigger kernel `IsPumpingInputMsgs` false positives (e.g. via filtered `PeekMessage`) clear immediately instead of tripping `NotRespondingHold` while deadlocked/blocked and elevation-gated (`ERROR_ACCESS_DENIED`) hung windows remain detected.
+
 - **In-window mouse movement no longer spins the CPU or repaints the full window:**
   - Stopped `egui`'s tooltip wait loop (`show_tooltips_only_when_still = false` in `tm-ui`) from requesting immediate `ControlFlow::Poll` repaints on every frame while the cursor moves over any tooltipped widget.
   - Replaced the row-wide `POINTER_TRACKING_HINT` with `POINTER_STABLE_RECT` (`egui-winit` #10) so table rows only repaint when crossing into a different cell or status glyph (and anchored row tooltips at the opening pointer position via `hover_text_at_fixed_pointer` instead of chasing cursor jitter), while charts (`Rect::NOTHING`) keep smooth readout tracking.

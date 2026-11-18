@@ -1,3 +1,14 @@
+## 2026-11-18 - False-positive NotResponding on background 30 FPS Fortnite (`windows_enum.rs`)
+
+- User report (side-by-side screenshot): Fortnite (`FortniteClient-Win64-Shipping.exe`) running in the background at `30 FPS [ 30 | 30 ]` was intermittently marked `"Not responding"` in TaskMan while native Windows 11 Task Manager showed normal (Running) status.
+- Static verification via `cdb -z` against OS binaries (`win32kfull.sys`, `user32.dll`, `Taskmgr.exe`, `TaskManagerDataLayer.dll`):
+  1. `win32kfull!IsHungWindow` returns true when `IsThreadHung(pti)` **or** `!IsPumpingInputMsgs(pwnd)`. `IsPumpingInputMsgs` fails even while a thread calls `PeekMessage` at 30 FPS if window-filtered `PeekMessage` leaves `[pti+528h]` older than `HungAppTimeout` (5 s) and any sibling input-hang node on `[pti+518h]` ages past 5 s.
+  2. Unlike `TaskManagerDataLayer!WindowDataUnit2::IsWindowUserInteractive` / `IsDesktopWindow` and `Taskmgr!WdcWindowMonitor::ShouldIncludeWindow`, `crates/tm-platform/src/win/windows_enum.rs` did not filter `WS_EX_NOACTIVATE` (without `WS_EX_APPWINDOW`), visible-owner `GW_OWNER` windows (without `WS_EX_APPWINDOW`), `Shell_TrayWnd`, DWM `"Ghost"` windows (`HungWindowFromGhostWindow` — previously risked blaming `dwm.exe`), or non-desktop window bands (`GetWindowBand`), and did not verify `IsHungAppWindow` hits with `WM_NULL`.
+- Fix in `crates/tm-platform/src/win/windows_enum.rs` (sharing `window_band` from `tm-platform::win::taskbar_monitor`):
+  - Enforced Task Manager's interactive style (`WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE` skipped unless `WS_EX_APPWINDOW`), visible-owner exclusion, `Shell_TrayWnd`/`Ghost` filtering, `HungWindowFromGhostWindow` original-window attribution, `GetWindowBand` desktop/UIAccess/system-tools (+ `13` for UWP) gating, and direct `CoreWindow` probing for hosted UWP frames.
+  - Added post-scan `resolve_hung_candidates` using non-aborting `SendMessageTimeoutW(hwnd, WM_NULL, ..., SMTO_BLOCK, 200 ms)` deduplicated per `(pid, tid)` with a 600 ms total scan budget (`ERROR_ACCESS_DENIED` UIPI fallback retains the filtered `IsHungAppWindow` verdict so elevated hung windows remain detectable).
+- Tests (`cargo test -p tm-platform windows_enum`): 16/16 pass including real Win32 HWND eligibility checks and pumping-vs-blocked thread `WM_NULL` probe checks. Live visual check on Fortnite in background after release rebuild remains to be confirmed interactively by the user.
+
 ## 2026-11-18 - in-window cursor CPU root causes: tooltip loop, stable-rect skip, interval cache, tile damage, own-process hook
 
 - Follow-up to `c2a9612` and `d4e07dd` after code audit showed four remaining CPU sinks on the live Windows software-rendered build:
