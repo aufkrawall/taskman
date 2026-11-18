@@ -387,6 +387,8 @@ pub struct GpuInfo {
     pub dedicated_used_bytes: u64,
     /// Shared/system-memory usage where distinguishable (0 = unknown).
     pub shared_used_bytes: u64,
+    /// Shared/system-memory capacity exposed to this adapter (0 = unknown).
+    pub shared_total_bytes: u64,
     pub temperature_c: Option<f32>,
     /// LUID of this adapter when known; PDH engine records join on this.
     pub luid: Option<AdapterLuid>,

@@ -744,6 +744,7 @@ fn drm_card_gpu(
         mem_total_bytes: vram_total.unwrap_or(0),
         dedicated_used_bytes: vram_used,
         shared_used_bytes: 0,
+        shared_total_bytes: 0,
         temperature_c: None,
         luid: None,
         engines: vec![GpuEngine {

@@ -269,6 +269,13 @@ pub struct Settings {
     /// adapters, and a mode naming an engine the selected adapter does not
     /// expose falls back to the overall graph rather than showing a flat zero.
     pub gpu_graph_mode: String,
+    /// Performance GPU page layout: `true` shows the 2x2 engine graph grid
+    /// (default, matching Windows 11 Task Manager); `false` shows the single
+    /// utilization graph controlled by `gpu_graph_mode`.
+    pub gpu_multi_engine: bool,
+    /// Selected engine (or `"overall"` / `"all"`) for each of the 4 panes in
+    /// the GPU multi-engine 2x2 grid.
+    pub gpu_graph_engines: [String; 4],
     /// Overlay kernel time (darker band) in the CPU graphs.
     pub show_kernel_times: bool,
     /// Show Wi-Fi connection details (SSID, signal strength) on the
@@ -352,6 +359,13 @@ impl Default for Settings {
             perf_card_width: 252.0,
             cpu_graph_mode: "overall".into(),
             gpu_graph_mode: "overall".into(),
+            gpu_multi_engine: true,
+            gpu_graph_engines: [
+                "3D".into(),
+                "Copy".into(),
+                "VideoEncode".into(),
+                "VideoDecode".into(),
+            ],
             show_kernel_times: false,
             wifi_details: false,
             perf_selected_key: "cpu".into(),
@@ -868,13 +882,20 @@ impl Settings {
             // drivers report engine types such as "High Priority Compute",
             // which used to be reset to "overall" on every restart.
             let mode = v.trim();
-            if !mode.is_empty()
-                && mode.len() <= 32
-                && mode
-                    .chars()
-                    .all(|c| c.is_alphanumeric() || c == '_' || c == ' ')
-            {
+            if is_valid_gpu_engine_mode(mode) {
                 s.gpu_graph_mode = mode.to_string();
+            }
+        }
+        s.gpu_multi_engine = b("general", "gpu_multi_engine", s.gpu_multi_engine);
+        if let Some(v) = get("general", "gpu_graph_engines") {
+            let parts: Vec<&str> = v.split(',').map(str::trim).collect();
+            if parts.len() == 4 && parts.iter().all(|p| is_valid_gpu_engine_mode(p)) {
+                s.gpu_graph_engines = [
+                    parts[0].to_string(),
+                    parts[1].to_string(),
+                    parts[2].to_string(),
+                    parts[3].to_string(),
+                ];
             }
         }
         s.show_kernel_times = b("general", "show_kernel_times", s.show_kernel_times);
@@ -1103,6 +1124,8 @@ impl Settings {
             ("perf_card_width", self.perf_card_width.to_string()),
             ("cpu_graph_mode", self.cpu_graph_mode.clone()),
             ("gpu_graph_mode", self.gpu_graph_mode.clone()),
+            ("gpu_multi_engine", self.gpu_multi_engine.to_string()),
+            ("gpu_graph_engines", self.gpu_graph_engines.join(",")),
             ("show_kernel_times", self.show_kernel_times.to_string()),
             ("wifi_details", self.wifi_details.to_string()),
             ("perf_selected_key", self.perf_selected_key.clone()),
@@ -1190,6 +1213,14 @@ impl Settings {
             tracing::warn!(error = %e, "failed to save settings (forced)");
         }
     }
+}
+
+fn is_valid_gpu_engine_mode(mode: &str) -> bool {
+    !mode.is_empty()
+        && mode.len() <= 32
+        && mode
+            .chars()
+            .all(|c| c.is_alphanumeric() || c == '_' || c == ' ')
 }
 
 static TEST_PATH_OVERRIDE: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
@@ -1390,6 +1421,47 @@ perf_selected_key={long}
 "
         );
         assert_eq!(Settings::from_ini_text(&ini).perf_selected_key, "cpu");
+    }
+
+    #[test]
+    fn gpu_multi_engine_and_slot_engines_round_trip_and_reject_junk() {
+        let def = Settings::default();
+        assert!(def.gpu_multi_engine);
+        assert_eq!(
+            def.gpu_graph_engines,
+            ["3D", "Copy", "VideoEncode", "VideoDecode"]
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.ini");
+        let s = Settings {
+            gpu_multi_engine: false,
+            gpu_graph_engines: [
+                "3D".into(),
+                "High Priority Compute".into(),
+                "JPEG_Decode_0".into(),
+                "overall".into(),
+            ],
+            ..Settings::default()
+        };
+        s.save_to(&path).unwrap();
+        let loaded = Settings::load_from(&path);
+        assert!(!loaded.gpu_multi_engine);
+        assert_eq!(loaded.gpu_graph_engines, s.gpu_graph_engines);
+
+        // Wrong slot count or invalid characters fall back to defaults.
+        for bad in [
+            "3D,Copy,VideoEncode",
+            "3D,Copy,VideoEncode,VideoDecode,Compute",
+            "3D,,VideoEncode,VideoDecode",
+            "3D,Copy,bad=engine,VideoDecode",
+        ] {
+            let ini = format!("[general]\ngpu_graph_engines={bad}\n");
+            assert_eq!(
+                Settings::from_ini_text(&ini).gpu_graph_engines,
+                def.gpu_graph_engines
+            );
+        }
     }
 
     #[test]

@@ -123,7 +123,8 @@ pub fn snapshot(seed: u32) -> Snapshot {
             wifi_access_denied: false,
         }],
         gpus: vec![GpuInfo {
-            shared_used_bytes: 0,
+            shared_used_bytes: 128 * 1024 * 1024,
+            shared_total_bytes: 16 * 1024 * 1024 * 1024,
             luid: None,
             id: 0,
             name: "Mock RTX GPU".into(),
@@ -140,6 +141,14 @@ pub fn snapshot(seed: u32) -> Snapshot {
                 },
                 GpuEngine {
                     name: "Copy".into(),
+                    util_pct: (s * 1.5) % 25.0,
+                },
+                GpuEngine {
+                    name: "VideoEncode".into(),
+                    util_pct: (s * 2.0) % 40.0,
+                },
+                GpuEngine {
+                    name: "VideoDecode".into(),
                     util_pct: 0.0,
                 },
             ],

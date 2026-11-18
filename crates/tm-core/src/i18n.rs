@@ -696,6 +696,7 @@ keys! {
     CpuGraphOverall => ["Gesamtauslastung", "Overall utilization"],
     ChangeGraphTo => ["Diagramm ändern zu", "Change graph to"],
     GpuAllEngines => ["Alle Engines", "All engines"],
+    GpuMultiEngine => ["Mehrere Engines (2×2)", "Multiple engines (2×2)"],
     CpuGraphLogical => ["Logische Prozessoren", "Logical processors"],
     ShowKernelTimes => ["Kernelzeiten anzeigen", "Show kernel times"],
     MinShort => ["Min.", "min"],
@@ -1006,9 +1007,14 @@ keys! {
     GpuMemStat => ["GPU-Speicher", "GPU memory"],
     GpuDedicatedStat => ["Dedizierter Speicher", "Dedicated memory"],
     GpuSharedStat => ["Gemeinsamer Speicher", "Shared memory"],
+    StatTemperature => ["Temperatur", "Temperature"],
     KvDedicatedCapacity => [
         "Dedizierter Speicher (Kapazität):",
         "Dedicated memory (capacity):"
+    ],
+    KvSharedCapacity => [
+        "Gemeinsamer Speicher (Kapazität):",
+        "Shared memory (capacity):"
     ],
     KvDedicatedMem => ["Dedizierter Speicher:", "Dedicated memory:"],
     KvTemperature => ["Temperatur:", "Temperature:"],

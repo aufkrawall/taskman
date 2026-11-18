@@ -271,6 +271,106 @@ mod tests {
     }
 
     #[test]
+    fn gpu_shared_memory_series_follows_adapter_and_aligns_with_window() {
+        let mut p1 = pt(500);
+        p1.gpus = vec![
+            crate::app::GpuHistoryPoint {
+                id: 0,
+                dedicated_used_bytes: 1_000,
+                shared_used_bytes: 2_000,
+                ..Default::default()
+            },
+            crate::app::GpuHistoryPoint {
+                id: 1,
+                dedicated_used_bytes: 5_000,
+                shared_used_bytes: 9_000,
+                ..Default::default()
+            },
+        ];
+        let win = vec![pt(0), p1, pt(1000)];
+        assert_eq!(
+            gpu_series(&win, "0", GpuField::Shared),
+            vec![0.0, 2000.0, 0.0]
+        );
+        assert_eq!(
+            gpu_series(&win, "1", GpuField::Shared),
+            vec![0.0, 9000.0, 0.0]
+        );
+    }
+
+    #[test]
+    fn gpu_grid_layout_uses_two_columns_and_collapses_when_narrow() {
+        let (cols_wide, w_wide, h_wide) = gpu_grid_layout(700.0);
+        assert_eq!(cols_wide, 2);
+        assert!((w_wide - 345.0).abs() < 0.01);
+        assert!(h_wide > 90.0);
+
+        let (cols_narrow, w_narrow, _) = gpu_grid_layout(360.0);
+        assert_eq!(cols_narrow, 1);
+        assert!((w_narrow - 360.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn gpu_engine_chart_spec_resolves_engines_and_falls_back_cleanly() {
+        let mut p1 = pt(500);
+        p1.gpus = vec![crate::app::GpuHistoryPoint {
+            id: 0,
+            util_pct: 42.0,
+            ..Default::default()
+        }];
+        p1.gpu_engines = vec![(0, "3D".into(), 42.0), (0, "VideoEncode".into(), 18.0)];
+        let win = vec![pt(0), p1];
+        let gpu = tm_core::model::GpuInfo {
+            id: 0,
+            util_pct: 42.0,
+            engines: vec![
+                tm_core::model::GpuEngine {
+                    name: "3D".into(),
+                    util_pct: 42.0,
+                },
+                tm_core::model::GpuEngine {
+                    name: "VideoEncode".into(),
+                    util_pct: 18.0,
+                },
+            ],
+            ..Default::default()
+        };
+        let pal = crate::theme::DARK;
+        let engines = gpu_engine_names(&win, &gpu.engines, "0");
+
+        let enc = gpu_engine_chart_spec(&win, &gpu, "0", "VideoEncode", &engines, &pal);
+        assert_eq!(enc.resolved_mode, "VideoEncode");
+        assert_eq!(enc.title, "Video Encode");
+        assert_eq!(enc.right_pct, format::format_pct_hdr(18.0));
+
+        // Unknown engine on this adapter falls back to overall instead of flat 0.
+        let missing = gpu_engine_chart_spec(&win, &gpu, "0", "UnknownVendorEngine", &engines, &pal);
+        assert_eq!(missing.resolved_mode, "overall");
+        assert_eq!(missing.right_pct, format::format_pct_hdr(42.0));
+    }
+
+    #[test]
+    fn gpu_total_mem_omits_capacity_unless_both_capacities_are_known() {
+        let known = tm_core::model::GpuInfo {
+            dedicated_used_bytes: 2 * 1024 * 1024 * 1024,
+            shared_used_bytes: 1024 * 1024 * 1024,
+            mem_total_bytes: 12 * 1024 * 1024 * 1024,
+            shared_total_bytes: 16 * 1024 * 1024 * 1024,
+            ..Default::default()
+        };
+        let ratio = gpu_total_mem_value(&known);
+        assert!(ratio.contains('/'), "expected used/total, got {ratio}");
+
+        // When shared capacity is unknown (0), do not divide dedicated+shared
+        // against dedicated-only capacity.
+        let unknown_shared_cap = tm_core::model::GpuInfo {
+            shared_total_bytes: 0,
+            ..known
+        };
+        assert!(!gpu_total_mem_value(&unknown_shared_cap).contains('/'));
+    }
+
+    #[test]
     fn memory_composition_used_does_not_zero_out_with_standby_cache() {
         let mem = tm_core::model::MemoryInfo {
             total_bytes: 32 * 1024 * 1024 * 1024,
@@ -1058,6 +1158,7 @@ fn engine_label(name: &str) -> String {
 enum GpuField {
     Util,
     Dedicated,
+    Shared,
 }
 
 fn gpu_series(win: &[HistoryPoint], key: &str, field: GpuField) -> Vec<f64> {
@@ -1069,6 +1170,7 @@ fn gpu_series(win: &[HistoryPoint], key: &str, field: GpuField) -> Vec<f64> {
                 .map_or(0.0, |point| match field {
                     GpuField::Util => point.util_pct as f64,
                     GpuField::Dedicated => point.dedicated_used_bytes as f64,
+                    GpuField::Shared => point.shared_used_bytes as f64,
                 })
         })
         .collect()
@@ -1116,34 +1218,60 @@ fn caption(ui: &mut egui::Ui, pal: &Palette, left: &str, right: &str) -> egui::R
 }
 
 /// Caption whose left label carries a "this switches" dropdown marker and
-/// then a trailing part (", 1min"). The marker is drawn, not typed: a `▾`
-/// glyph renders as a tofu box in any font that lacks it (Segoe UI Variable
-/// does), and a switchable graph's affordance must never read as a broken
-/// placeholder.
-fn caption_dropdown(ui: &mut egui::Ui, pal: &Palette, title: &str, rest: &str) -> egui::Response {
-    let (rect, _) =
-        ui.allocate_exact_size(egui::vec2(ui.available_width(), 20.0), egui::Sense::hover());
+/// then either a trailing part (", 1min") or a right-aligned current value
+/// ("1 %"). The marker is drawn, not typed: a `▾` glyph renders as a tofu box
+/// in any font that lacks it (Segoe UI Variable does), and a switchable
+/// graph's affordance must never read as a broken placeholder.
+#[allow(clippy::too_many_arguments)]
+fn caption_dropdown_impl(
+    ui: &mut egui::Ui,
+    pal: &Palette,
+    id_salt: impl std::hash::Hash + std::fmt::Debug,
+    width: f32,
+    left_inset: f32,
+    right_inset: f32,
+    title: &str,
+    after_arrow: Option<&str>,
+    right_text: Option<&str>,
+) -> egui::Response {
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(width, 20.0), egui::Sense::hover());
     let painter = ui.painter();
     let font = FontId::proportional(11.5);
+    let center_y = rect.center().y;
+    let left = rect.left() + left_inset;
+    let s = 3.2f32;
+
+    let right_w = right_text
+        .map(|text| {
+            painter
+                .layout_no_wrap(text.to_owned(), font.clone(), pal.text_dim)
+                .size()
+                .x
+                + 8.0
+        })
+        .unwrap_or(0.0);
+    let after_w = after_arrow
+        .map(|text| {
+            painter
+                .layout_no_wrap(text.to_owned(), font.clone(), pal.text_dim)
+                .size()
+                .x
+        })
+        .unwrap_or(0.0);
+    let max_title_w = (rect.right() - right_inset - left - right_w - after_w - 18.0).max(24.0);
+    let display_title = ellipsize(ui, title, &font, max_title_w);
     let title_width = painter
-        .layout_no_wrap(title.to_owned(), font.clone(), pal.text_dim)
+        .layout_no_wrap(display_title.clone(), font.clone(), pal.text_dim)
         .size()
         .x;
-    let left = rect.left() + GUTTER;
-    let center_y = rect.center().y;
     let marker_x = left + title_width + 5.0;
-    let s = 3.2f32;
 
     let dropdown_rect = egui::Rect::from_min_max(
         Pos2::new(left, rect.top()),
         Pos2::new(marker_x + s + 6.0, rect.bottom()),
     );
     let arrow_resp = ui
-        .interact(
-            dropdown_rect,
-            ui.id().with("gpu_metric_arrow"),
-            egui::Sense::click(),
-        )
+        .interact(dropdown_rect, ui.id().with(id_salt), egui::Sense::click())
         .on_hover_cursor(CursorIcon::PointingHand);
     arrow_resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, title));
     if arrow_resp.has_focus() {
@@ -1161,7 +1289,7 @@ fn caption_dropdown(ui: &mut egui::Ui, pal: &Palette, title: &str, rest: &str) -
     painter.text(
         Pos2::new(left, center_y),
         Align2::LEFT_CENTER,
-        title,
+        &display_title,
         font.clone(),
         text_color,
     );
@@ -1174,14 +1302,61 @@ fn caption_dropdown(ui: &mut egui::Ui, pal: &Palette, title: &str, rest: &str) -
         text_color,
         egui::Stroke::NONE,
     ));
-    painter.text(
-        Pos2::new(marker_x + s + 4.0, center_y),
-        Align2::LEFT_CENTER,
-        format!(", {rest}"),
-        font,
-        pal.text_dim,
-    );
+    if let Some(rest) = after_arrow {
+        painter.text(
+            Pos2::new(marker_x + s + 4.0, center_y),
+            Align2::LEFT_CENTER,
+            rest,
+            font.clone(),
+            pal.text_dim,
+        );
+    }
+    if let Some(right) = right_text {
+        painter.text(
+            Pos2::new(rect.right() - right_inset, center_y),
+            Align2::RIGHT_CENTER,
+            right,
+            font,
+            pal.text_dim,
+        );
+    }
     arrow_resp
+}
+
+fn caption_dropdown(ui: &mut egui::Ui, pal: &Palette, title: &str, rest: &str) -> egui::Response {
+    let suffix = format!(", {rest}");
+    caption_dropdown_impl(
+        ui,
+        pal,
+        "gpu_metric_arrow",
+        ui.available_width(),
+        GUTTER,
+        GUTTER,
+        title,
+        Some(&suffix),
+        None,
+    )
+}
+
+fn caption_dropdown_cell(
+    ui: &mut egui::Ui,
+    pal: &Palette,
+    slot: usize,
+    width: f32,
+    title: &str,
+    right_pct: &str,
+) -> egui::Response {
+    caption_dropdown_impl(
+        ui,
+        pal,
+        ("gpu_metric_arrow", slot),
+        width,
+        0.0,
+        0.0,
+        title,
+        None,
+        Some(right_pct),
+    )
 }
 
 /// Big-value stat (label above, large number below).
@@ -1704,6 +1879,19 @@ fn cpu_page(app: &mut TaskManApp, ui: &mut egui::Ui, pal: &Palette) {
     ui.add_space(16.0);
 }
 
+fn time_window_menu_items(app: &mut TaskManApp, ui: &mut egui::Ui) {
+    menu::title(ui, i18n::tr(K::GraphWindowLabel));
+    menu::separator(ui);
+    for secs in [30u32, 60, 120] {
+        let current = app.shared.settings.graph_seconds == secs;
+        if menu::check(ui, &format!("{secs} s"), current).clicked() {
+            app.shared.settings.graph_seconds = secs;
+            app.save_settings();
+            ui.close();
+        }
+    }
+}
+
 /// Right-click or Menu-key context menu for the graphs that have no other options (memory, disk,
 /// network): the time window is the one thing they can change, and a native
 /// Task Manager user right-clicks every graph expecting *something*.
@@ -1714,16 +1902,7 @@ fn time_window_context_menu(app: &mut TaskManApp, resp: &egui::Response) {
         && menu::keyboard_menu_requested(&resp.ctx);
     menu::context_menu_kb(resp, kb_open, |ui| {
         ui.set_min_width(170.0);
-        menu::title(ui, i18n::tr(K::GraphWindowLabel));
-        menu::separator(ui);
-        for secs in [30u32, 60, 120] {
-            let current = app.shared.settings.graph_seconds == secs;
-            if menu::check(ui, &format!("{secs} s"), current).clicked() {
-                app.shared.settings.graph_seconds = secs;
-                app.save_settings();
-                ui.close();
-            }
-        }
+        time_window_menu_items(app, ui);
     });
 }
 
@@ -1766,7 +1945,9 @@ fn gpu_graph_menu_contents(
     ui: &mut egui::Ui,
     current: &str,
     engines: &[String],
+    multi_engine: bool,
     chosen: &mut Option<String>,
+    toggled_multi: &mut Option<bool>,
 ) {
     menu::title(ui, i18n::tr(K::ChangeGraphTo));
     menu::separator(ui);
@@ -1787,34 +1968,93 @@ fn gpu_graph_menu_contents(
             ui.close();
         }
     }
+    menu::separator(ui);
+    if menu::check(ui, i18n::tr(K::GpuMultiEngine), multi_engine).clicked() {
+        *toggled_multi = Some(!multi_engine);
+        ui.close();
+    }
 }
 
-fn gpu_graph_context_menu(app: &mut TaskManApp, resp: &egui::Response, engines: &[String]) {
-    let current = app.shared.settings.gpu_graph_mode.clone();
+fn current_gpu_slot_mode(app: &TaskManApp, slot: Option<usize>) -> String {
+    match slot {
+        Some(idx) => app.shared.settings.gpu_graph_engines[idx].clone(),
+        None => app.shared.settings.gpu_graph_mode.clone(),
+    }
+}
+
+fn apply_gpu_menu_choice(
+    app: &mut TaskManApp,
+    slot: Option<usize>,
+    chosen: Option<String>,
+    toggled_multi: Option<bool>,
+) {
+    let mut changed = false;
+    if let Some(mode) = chosen {
+        match slot {
+            Some(idx) => app.shared.settings.gpu_graph_engines[idx] = mode,
+            None => app.shared.settings.gpu_graph_mode = mode,
+        }
+        changed = true;
+    }
+    if let Some(multi) = toggled_multi {
+        app.shared.settings.gpu_multi_engine = multi;
+        changed = true;
+    }
+    if changed {
+        app.save_settings();
+    }
+}
+
+fn gpu_graph_context_menu(
+    app: &mut TaskManApp,
+    resp: &egui::Response,
+    slot: Option<usize>,
+    engines: &[String],
+) {
+    let current = current_gpu_slot_mode(app, slot);
+    let multi_engine = app.shared.settings.gpu_multi_engine;
     let mut chosen = None;
+    let mut toggled_multi = None;
     let kb_open = resp.has_focus()
         && !app.modal_open()
         && !resp.ctx.any_popup_open()
         && menu::keyboard_menu_requested(&resp.ctx);
     menu::context_menu_kb(resp, kb_open, |ui| {
-        gpu_graph_menu_contents(ui, &current, engines, &mut chosen);
+        gpu_graph_menu_contents(
+            ui,
+            &current,
+            engines,
+            multi_engine,
+            &mut chosen,
+            &mut toggled_multi,
+        );
+        menu::separator(ui);
+        time_window_menu_items(app, ui);
     });
-    if let Some(mode) = chosen {
-        app.shared.settings.gpu_graph_mode = mode;
-        app.save_settings();
-    }
+    apply_gpu_menu_choice(app, slot, chosen, toggled_multi);
 }
 
-fn gpu_graph_dropdown_menu(app: &mut TaskManApp, resp: &egui::Response, engines: &[String]) {
-    let current = app.shared.settings.gpu_graph_mode.clone();
+fn gpu_graph_dropdown_menu(
+    app: &mut TaskManApp,
+    resp: &egui::Response,
+    slot: Option<usize>,
+    engines: &[String],
+) {
+    let current = current_gpu_slot_mode(app, slot);
+    let multi_engine = app.shared.settings.gpu_multi_engine;
     let mut chosen = None;
+    let mut toggled_multi = None;
     menu::dropdown_menu(resp, |ui| {
-        gpu_graph_menu_contents(ui, &current, engines, &mut chosen);
+        gpu_graph_menu_contents(
+            ui,
+            &current,
+            engines,
+            multi_engine,
+            &mut chosen,
+            &mut toggled_multi,
+        );
     });
-    if let Some(mode) = chosen {
-        app.shared.settings.gpu_graph_mode = mode;
-        app.save_settings();
-    }
+    apply_gpu_menu_choice(app, slot, chosen, toggled_multi);
 }
 
 // ---------------------------------------------------------------- Memory page
@@ -2303,6 +2543,161 @@ fn network_page(app: &mut TaskManApp, ui: &mut egui::Ui, pal: &Palette, entry: &
 
 // ---------------------------------------------------------------- GPU page
 
+struct GpuEngineChartSpec {
+    resolved_mode: String,
+    title: String,
+    right_pct: String,
+    series: Vec<MultiSeries>,
+}
+
+fn gpu_grid_layout(width: f32) -> (usize, f32, f32) {
+    const GAP: f32 = 10.0;
+    let cols = if width < 420.0 { 1 } else { 2 };
+    let cell_w = ((width - GAP * (cols - 1) as f32) / cols as f32).max(120.0);
+    let cell_h = if cols == 2 { 106.0 } else { 92.0 };
+    (cols, cell_w, cell_h)
+}
+
+fn gpu_engine_chart_spec(
+    win: &[HistoryPoint],
+    gpu: &tm_core::model::GpuInfo,
+    key: &str,
+    requested: &str,
+    engines: &[String],
+    pal: &Palette,
+) -> GpuEngineChartSpec {
+    // An engine this adapter never reported falls back to the overall
+    // (busiest-engine) view rather than drawing a flat zero the user cannot
+    // tell from an idle engine.
+    let resolved_mode =
+        if requested == "overall" || requested == "all" || engines.iter().any(|e| e == requested) {
+            requested.to_string()
+        } else {
+            "overall".to_string()
+        };
+
+    match resolved_mode.as_str() {
+        "all" => GpuEngineChartSpec {
+            resolved_mode,
+            title: i18n::tr(K::GpuAllEngines).to_string(),
+            right_pct: format::format_pct_hdr(gpu.util_pct),
+            series: engines
+                .iter()
+                .enumerate()
+                .map(|(index, name)| {
+                    MultiSeries::new(
+                        engine_label(name),
+                        gpu_engine_series(win, key, name),
+                        // One hue, stepped in brightness: these are shares of
+                        // the same adapter, and a second accent colour on this
+                        // page would read as a different resource.
+                        theme::toned(pal, pal.gpu_graph, 1.0 - 0.13 * (index.min(5) as f32)),
+                    )
+                })
+                .collect(),
+        },
+        "overall" => GpuEngineChartSpec {
+            resolved_mode,
+            title: i18n::tr(K::StatUtilization).to_string(),
+            right_pct: format::format_pct_hdr(gpu.util_pct),
+            series: vec![MultiSeries::new(
+                i18n::tr(K::StatUtilization),
+                gpu_series(win, key, GpuField::Util),
+                pal.gpu_graph,
+            )],
+        },
+        engine => {
+            let pct = gpu
+                .engines
+                .iter()
+                .find(|e| e.name == engine)
+                .map_or(0.0, |e| e.util_pct);
+            let label = engine_label(engine);
+            let series = vec![MultiSeries::new(
+                label.clone(),
+                gpu_engine_series(win, key, engine),
+                pal.gpu_graph,
+            )];
+            GpuEngineChartSpec {
+                resolved_mode,
+                title: label,
+                right_pct: format::format_pct_hdr(pct),
+                series,
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn gpu_memory_chart(
+    ui: &mut egui::Ui,
+    pal: &Palette,
+    id: &'static str,
+    chart_label: &str,
+    window_key: K,
+    window_text: &str,
+    samples_bytes: Vec<f64>,
+    capacity_bytes: u64,
+    width: f32,
+    height: f32,
+    axis: TimeAxis,
+) -> egui::Response {
+    let peak = samples_bytes.iter().copied().fold(0.0f64, f64::max) as u64;
+    let max_bytes = capacity_bytes.max(peak).max(1);
+    caption(
+        ui,
+        pal,
+        &i18n::trf(window_key, &[window_text]),
+        &format::format_bytes_loc(max_bytes),
+    );
+    // Mebibytes, matching `fmt_mib` — avoids mislabelling MiB values as GB.
+    let mib: Vec<f64> = samples_bytes
+        .into_iter()
+        .map(|v| v / 1024.0 / 1024.0)
+        .collect();
+    page_chart(
+        ui,
+        id,
+        chart_label,
+        width,
+        height,
+        &[MultiSeries::new(
+            chart_label,
+            mib,
+            theme::toned(pal, pal.gpu_graph, 0.62),
+        )],
+        max_bytes as f64 / 1024.0 / 1024.0,
+        Some(axis),
+        fmt_mib,
+    )
+}
+
+fn gpu_mem_ratio_value(used_bytes: u64, total_bytes: u64) -> String {
+    if total_bytes > 0 {
+        format!(
+            "{}/{}",
+            format::format_bytes_loc(used_bytes),
+            format::format_bytes_loc(total_bytes)
+        )
+    } else {
+        format::format_bytes_loc(used_bytes)
+    }
+}
+
+fn gpu_total_mem_value(gpu: &tm_core::model::GpuInfo) -> String {
+    let used = gpu
+        .dedicated_used_bytes
+        .saturating_add(gpu.shared_used_bytes);
+    if gpu.mem_total_bytes > 0 && gpu.shared_total_bytes > 0 {
+        gpu_mem_ratio_value(
+            used,
+            gpu.mem_total_bytes.saturating_add(gpu.shared_total_bytes),
+        )
+    } else {
+        format::format_bytes_loc(used)
+    }
+}
+
 fn gpu_page(app: &mut TaskManApp, ui: &mut egui::Ui, pal: &Palette, entry: &ResourceEntry) {
     let Some(snap) = app.latest_snapshot() else {
         return;
@@ -2316,132 +2711,170 @@ fn gpu_page(app: &mut TaskManApp, ui: &mut egui::Ui, pal: &Palette, entry: &Reso
     let ts = timestamps(win);
     let axis = TimeAxis::new(&ts, app.shared.settings.graph_seconds);
     let width = content_width(ui);
-
-    // Which engine the top graph shows. An engine this adapter never reported
-    // falls back to the overall (busiest-engine) view rather than drawing a
-    // flat zero the user cannot tell from an idle engine.
+    let window_text = window_label(app.shared.settings.graph_seconds);
     let engines = gpu_engine_names(win, &gpu.engines, &entry.key);
-    let mode = app.shared.settings.gpu_graph_mode.clone();
-    let mode = if mode == "overall" || mode == "all" || engines.contains(&mode) {
-        mode
+    let multi_engine = app.shared.settings.gpu_multi_engine;
+
+    let mut engine_menus: Vec<(Option<usize>, egui::Response, egui::Response)> = Vec::new();
+    let mut visible_engines: Vec<String> = Vec::new();
+
+    if multi_engine {
+        let (cols, cell_w, cell_h) = gpu_grid_layout(width);
+        let slot_modes = app.shared.settings.gpu_graph_engines.clone();
+        ui.horizontal(|ui| {
+            ui.add_space(GUTTER);
+            egui::Grid::new("gpu-engine-grid")
+                .spacing([10.0, 8.0])
+                .show(ui, |ui| {
+                    for (slot, requested) in slot_modes.iter().enumerate() {
+                        let spec =
+                            gpu_engine_chart_spec(win, gpu, &entry.key, requested, &engines, pal);
+                        visible_engines.push(spec.resolved_mode);
+                        ui.vertical(|ui| {
+                            ui.spacing_mut().item_spacing.y = 2.0;
+                            let cap_resp = caption_dropdown_cell(
+                                ui,
+                                pal,
+                                slot,
+                                cell_w,
+                                &spec.title,
+                                &spec.right_pct,
+                            );
+                            let chart = ui
+                                .push_id(("gpu-engine-chart", slot), |ui| {
+                                    chart_multi(
+                                        ui,
+                                        egui::vec2(cell_w, cell_h),
+                                        &spec.series,
+                                        100.0,
+                                        Some(axis),
+                                        fmt_percent,
+                                    )
+                                })
+                                .inner;
+                            chart.widget_info(|| {
+                                egui::WidgetInfo::labeled(
+                                    egui::WidgetType::Other,
+                                    true,
+                                    &spec.title,
+                                )
+                            });
+                            ui.ctx().accesskit_node_builder(chart.id, |node| {
+                                node.set_label(spec.title.as_str());
+                            });
+                            engine_menus.push((Some(slot), cap_resp, chart));
+                        });
+                        if (slot + 1) % cols == 0 {
+                            ui.end_row();
+                        }
+                    }
+                });
+        });
+        ui.add_space(6.0);
     } else {
-        "overall".to_string()
-    };
+        let requested = app.shared.settings.gpu_graph_mode.clone();
+        let spec = gpu_engine_chart_spec(win, gpu, &entry.key, &requested, &engines, pal);
+        visible_engines.push(spec.resolved_mode);
+        let cap_resp = caption_dropdown(ui, pal, &spec.title, &window_text);
+        let chart = page_chart(
+            ui,
+            "gpu-utilization-chart",
+            i18n::tr(K::GpuTitle),
+            width,
+            150.0,
+            &spec.series,
+            100.0,
+            Some(axis),
+            fmt_percent,
+        );
+        engine_menus.push((None, cap_resp, chart));
+    }
 
-    let (series_list, title) = match mode.as_str() {
-        "all" => (
-            engines
-                .iter()
-                .enumerate()
-                .map(|(index, name)| {
-                    MultiSeries::new(
-                        engine_label(name),
-                        gpu_engine_series(win, &entry.key, name),
-                        // One hue, stepped in brightness: these are shares of
-                        // the same adapter, and a second accent colour on this
-                        // page would read as a different resource.
-                        theme::toned(pal, pal.gpu_graph, 1.0 - 0.13 * (index.min(5) as f32)),
-                    )
-                })
-                .collect::<Vec<_>>(),
-            i18n::tr(K::GpuAllEngines).to_string(),
-        ),
-        "overall" => (
-            vec![MultiSeries::new(
-                i18n::tr(K::StatUtilization),
-                gpu_series(win, &entry.key, GpuField::Util),
-                pal.gpu_graph,
-            )],
-            i18n::tr(K::StatUtilization).to_string(),
-        ),
-        engine => (
-            vec![MultiSeries::new(
-                engine_label(engine),
-                gpu_engine_series(win, &entry.key, engine),
-                pal.gpu_graph,
-            )],
-            engine_label(engine),
-        ),
-    };
-    let cap_resp = caption_dropdown(
+    let mem_chart_h = if multi_engine { 92.0 } else { 130.0 };
+    let dedicated_chart = gpu_memory_chart(
         ui,
         pal,
-        &title,
-        &window_label(app.shared.settings.graph_seconds),
-    );
-    // The menu mutates settings, so it runs once the history borrow that
-    // built these series has ended — at the bottom of this function.
-    let chart = page_chart(
-        ui,
-        "gpu-utilization-chart",
-        i18n::tr(K::GpuTitle),
-        width,
-        150.0,
-        &series_list,
-        100.0,
-        Some(axis),
-        fmt_percent,
-    );
-
-    // Dedicated (VRAM) memory graph.
-    let dedicated = gpu_series(win, &entry.key, GpuField::Dedicated);
-    let dedicated_max = gpu
-        .mem_total_bytes
-        .max(dedicated.iter().cloned().fold(0.0f64, f64::max) as u64)
-        .max(1);
-    caption(
-        ui,
-        pal,
-        &i18n::trf(
-            K::GpuDedicatedWindow,
-            &[&window_label(app.shared.settings.graph_seconds)],
-        ),
-        &format::format_bytes_loc(dedicated_max),
-    );
-    // Mebibytes, matching `fmt_mib` — these were called `*_gb` while holding
-    // MiB, which is exactly how a chart ends up mislabelled.
-    let dedicated_mib: Vec<f64> = dedicated.iter().map(|v| v / 1024.0 / 1024.0).collect();
-    let dedicated_chart = page_chart(
-        ui,
         "gpu-dedicated-chart",
         i18n::tr(K::GpuDedicatedStat),
+        K::GpuDedicatedWindow,
+        &window_text,
+        gpu_series(win, &entry.key, GpuField::Dedicated),
+        gpu.mem_total_bytes,
         width,
-        150.0,
-        &[MultiSeries::new(
-            i18n::tr(K::GpuDedicatedStat),
-            dedicated_mib,
-            theme::toned(pal, pal.gpu_graph, 0.62),
-        )],
-        dedicated_max as f64 / 1024.0 / 1024.0,
-        Some(axis),
-        fmt_mib,
+        mem_chart_h,
+        axis,
+    );
+    let shared_chart = gpu_memory_chart(
+        ui,
+        pal,
+        "gpu-shared-chart",
+        i18n::tr(K::GpuSharedStat),
+        K::GpuSharedWindow,
+        &window_text,
+        gpu_series(win, &entry.key, GpuField::Shared),
+        gpu.shared_total_bytes,
+        width,
+        mem_chart_h,
+        axis,
     );
 
     ui.add_space(10.0);
     stats_block(
         ui,
-        400.0,
+        436.0,
         |ui| {
-            ui.vertical(|ui| {
-                let w = 170.0;
-                big_stat(
-                    ui,
-                    pal,
-                    i18n::tr(K::StatUtilization),
-                    &format::format_pct_hdr(gpu.util_pct),
-                    w,
-                );
-                big_stat(
-                    ui,
-                    pal,
-                    i18n::tr(K::GpuDedicatedStat),
-                    &format::format_bytes_loc(gpu.dedicated_used_bytes),
-                    w,
-                );
+            ui.horizontal_top(|ui| {
+                ui.vertical(|ui| {
+                    let w = 195.0;
+                    big_stat(
+                        ui,
+                        pal,
+                        i18n::tr(K::StatUtilization),
+                        &format::format_pct_hdr(gpu.util_pct),
+                        w,
+                    );
+                    big_stat(
+                        ui,
+                        pal,
+                        i18n::tr(K::GpuMemStat),
+                        &gpu_total_mem_value(gpu),
+                        w,
+                    );
+                });
+                ui.add_space(16.0);
+                ui.vertical(|ui| {
+                    let w = 225.0;
+                    big_stat(
+                        ui,
+                        pal,
+                        i18n::tr(K::PropGpuDedicated),
+                        &gpu_mem_ratio_value(gpu.dedicated_used_bytes, gpu.mem_total_bytes),
+                        w,
+                    );
+                    big_stat(
+                        ui,
+                        pal,
+                        i18n::tr(K::PropGpuShared),
+                        &gpu_mem_ratio_value(gpu.shared_used_bytes, gpu.shared_total_bytes),
+                        w,
+                    );
+                    if let Some(t) = gpu.temperature_c {
+                        big_stat(
+                            ui,
+                            pal,
+                            i18n::tr(K::StatTemperature),
+                            &format!("{t:.0} °C"),
+                            w,
+                        );
+                    }
+                });
             });
         },
         |ui| {
             ui.vertical(|ui| {
+                if !gpu.driver_version.is_empty() {
+                    kv_row(ui, pal, i18n::tr(K::KvDriverVersion), &gpu.driver_version);
+                }
                 if gpu.mem_total_bytes > 0 {
                     kv_row(
                         ui,
@@ -2450,21 +2883,23 @@ fn gpu_page(app: &mut TaskManApp, ui: &mut egui::Ui, pal: &Palette, entry: &Reso
                         &format::format_bytes_loc(gpu.mem_total_bytes),
                     );
                 }
-                if gpu.shared_used_bytes > 0 {
+                if gpu.shared_total_bytes > 0 {
                     kv_row(
                         ui,
                         pal,
-                        i18n::tr(K::GpuSharedStat),
-                        &format::format_bytes_loc(gpu.shared_used_bytes),
+                        i18n::tr(K::KvSharedCapacity),
+                        &format::format_bytes_loc(gpu.shared_total_bytes),
                     );
                 }
-                if let Some(t) = gpu.temperature_c {
-                    kv_row(ui, pal, i18n::tr(K::KvTemperature), &format!("{t:.0} °C"));
-                }
-                if !gpu.driver_version.is_empty() {
-                    kv_row(ui, pal, i18n::tr(K::KvDriverVersion), &gpu.driver_version);
-                }
-                for e in gpu.engines.iter().take(4) {
+                // Surface any active engine that is not already plotted in the
+                // visible graph slot(s) so background work on vendor engines
+                // (e.g. JPEG/OFA) remains noticeable without repeating idle rows.
+                for e in gpu
+                    .engines
+                    .iter()
+                    .filter(|e| e.util_pct > 0.0 && !visible_engines.contains(&e.name))
+                    .take(4)
+                {
                     kv_row(
                         ui,
                         pal,
@@ -2475,8 +2910,13 @@ fn gpu_page(app: &mut TaskManApp, ui: &mut egui::Ui, pal: &Palette, entry: &Reso
             });
         },
     );
-    gpu_graph_dropdown_menu(app, &cap_resp, &engines);
-    gpu_graph_context_menu(app, &chart, &engines);
+
+    // Menus mutate settings, so they run once the history borrow has ended.
+    for (slot, cap_resp, chart) in &engine_menus {
+        gpu_graph_dropdown_menu(app, cap_resp, *slot, &engines);
+        gpu_graph_context_menu(app, chart, *slot, &engines);
+    }
     time_window_context_menu(app, &dedicated_chart);
+    time_window_context_menu(app, &shared_chart);
     ui.add_space(16.0);
 }

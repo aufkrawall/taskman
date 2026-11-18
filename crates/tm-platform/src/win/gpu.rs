@@ -30,6 +30,7 @@ use windows::core::Interface;
 pub struct AdapterInfo {
     pub name: String,
     pub dedicated_vram: u64,
+    pub shared_system_memory: u64,
     pub luid: AdapterLuid,
     pub driver_version: String,
     pub is_software: bool,
@@ -71,6 +72,7 @@ pub fn adapters() -> Vec<AdapterInfo> {
                 out.push(AdapterInfo {
                     name,
                     dedicated_vram: desc.DedicatedVideoMemory as u64,
+                    shared_system_memory: desc.SharedSystemMemory as u64,
                     luid: AdapterLuid {
                         high: desc.AdapterLuid.HighPart,
                         low: desc.AdapterLuid.LowPart,
@@ -197,6 +199,7 @@ pub fn merge(
                 mem_total_bytes: a.dedicated_vram,
                 dedicated_used_bytes: ded_used,
                 shared_used_bytes: shared_used,
+                shared_total_bytes: a.shared_system_memory,
                 temperature_c: None,
                 luid: Some(a.luid),
                 engines: adapter_engines(&loads),
@@ -336,6 +339,7 @@ mod tests {
             AdapterInfo {
                 name: "iGPU".into(),
                 dedicated_vram: 1024,
+                shared_system_memory: 0,
                 luid: luid(0x1111),
                 driver_version: String::new(),
                 is_software: false,
@@ -343,6 +347,7 @@ mod tests {
             AdapterInfo {
                 name: "dGPU".into(),
                 dedicated_vram: 8192,
+                shared_system_memory: 0,
                 luid: luid(0x2222),
                 driver_version: String::new(),
                 is_software: false,
@@ -365,6 +370,7 @@ mod tests {
         let adapters = vec![AdapterInfo {
             name: "gpu".into(),
             dedicated_vram: 4096,
+            shared_system_memory: 0,
             luid: luid(7),
             driver_version: String::new(),
             is_software: false,
@@ -429,6 +435,7 @@ mod tests {
         AdapterInfo {
             name: name.into(),
             dedicated_vram: 8192,
+            shared_system_memory: 0,
             luid: luid(luid_low),
             driver_version: String::new(),
             is_software: false,
@@ -482,6 +489,7 @@ mod tests {
         let software = AdapterInfo {
             name: "Microsoft Basic Render Driver".into(),
             dedicated_vram: 0,
+            shared_system_memory: 0,
             luid: luid(0xd52a),
             driver_version: String::new(),
             is_software: true,
@@ -561,6 +569,7 @@ mod tests {
         let adapters = vec![AdapterInfo {
             name: "NVIDIA GeForce RTX 5070".into(),
             dedicated_vram: 12 * 1024 * 1024 * 1024,
+            shared_system_memory: 16 * 1024 * 1024 * 1024,
             luid: luid(42),
             driver_version: "32.0.16.1692".into(),
             is_software: false,
@@ -576,6 +585,7 @@ mod tests {
         assert_eq!(merged[0].dedicated_used_bytes, 1_500_000_000);
         assert_eq!(merged[0].mem_used_bytes, 1_500_000_000);
         assert_eq!(merged[0].shared_used_bytes, 150_000_000);
+        assert_eq!(merged[0].shared_total_bytes, 16 * 1024 * 1024 * 1024);
     }
 
     #[test]
@@ -584,6 +594,7 @@ mod tests {
             AdapterInfo {
                 name: "NVIDIA GeForce RTX 5070".into(),
                 dedicated_vram: 12 * 1024 * 1024 * 1024,
+                shared_system_memory: 0,
                 luid: luid(1),
                 driver_version: "32.0.16.1692".into(),
                 is_software: false,
@@ -591,6 +602,7 @@ mod tests {
             AdapterInfo {
                 name: "Microsoft Basic Render Driver".into(),
                 dedicated_vram: 0,
+                shared_system_memory: 0,
                 luid: luid(2),
                 driver_version: String::new(),
                 is_software: true,
@@ -604,6 +616,7 @@ mod tests {
         let software_only = vec![AdapterInfo {
             name: "Microsoft Basic Render Driver".into(),
             dedicated_vram: 0,
+            shared_system_memory: 0,
             luid: luid(2),
             driver_version: String::new(),
             is_software: true,

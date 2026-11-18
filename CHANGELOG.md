@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+### Improved
+
+- **Multi-engine GPU Performance page with Dedicated and Shared memory graphs:**
+  - Replaced the single top GPU utilization graph with a 2×2 grid of per-engine charts (`3D`, `Copy`, `Video Encode`, and `Video Decode` by default, collapsing to one column on narrow windows), each with its own engine switcher dropdown, live percentage readout, and right-click menu. Added a persistent `Multiple engines (2×2)` toggle (`gpu_multi_engine`) and per-pane selections (`gpu_graph_engines`) in settings while keeping the single-graph mode available.
+  - Added a **Shared GPU memory** rolling chart below **Dedicated GPU memory**, scaling against DXGI's `SharedSystemMemory` capacity on Windows, and updated the bottom GPU summary to show combined **GPU memory**, **Dedicated GPU memory**, and **Shared GPU memory** usage/capacity ratios alongside active non-grid engines.
+
 ### Fixed
 
 - **Background 30 FPS games (such as Fortnite) no longer falsely report "Not responding":**
