@@ -136,15 +136,27 @@ fn series(n: usize, seed: u64, scale: f64) -> Vec<f64> {
 
 /// Lay out a representative taskman frame: sidebar, table, and a chart grid.
 fn build_frame(ctx: &egui::Context) -> egui::FullOutput {
+    build_frame_with_input(ctx, WIDTH, HEIGHT, Vec::new(), 0.0)
+}
+
+fn build_frame_with_input(
+    ctx: &egui::Context,
+    width: u32,
+    height: u32,
+    events: Vec<egui::Event>,
+    time: f64,
+) -> egui::FullOutput {
     let pal: Palette = theme::DARK;
     let mut table = TmTable::new("snapshot", columns(), None);
 
     ctx.run_ui(
         egui::RawInput {
+            time: Some(time),
             screen_rect: Some(Rect::from_min_size(
                 Pos2::ZERO,
-                vec2(WIDTH as f32, HEIGHT as f32),
+                vec2(width as f32, height as f32),
             )),
+            events,
             ..Default::default()
         },
         |root| {
@@ -578,6 +590,183 @@ mod tests {
                 "solid sidebar fill changed at y={y} when sub-pixel was enabled"
             );
         }
+    }
+
+    #[test]
+    fn damaged_repaint_matches_full_paint_on_real_widgets() {
+        let apply = |painter: &mut Painter, output: &mut egui::FullOutput| {
+            for (id, deltas) in &output.textures_delta.set {
+                for delta in deltas {
+                    painter.set_texture(*id, delta);
+                }
+            }
+            for id in &output.textures_delta.free {
+                painter.free_texture(*id);
+            }
+            output.textures_delta.clear();
+        };
+
+        let ctx_dmg = egui::Context::default();
+        theme::install_visuals(&ctx_dmg);
+        ctx_dmg.set_theme(egui::ThemePreference::Dark);
+        let mut dmg_painter = Painter::new();
+
+        // Warmup + Frame A (idle pointer).
+        let mut out_w = build_frame_with_input(&ctx_dmg, WIDTH, HEIGHT, Vec::new(), 0.0);
+        apply(&mut dmg_painter, &mut out_w);
+        let mut out_a = build_frame_with_input(&ctx_dmg, WIDTH, HEIGHT, Vec::new(), 0.1);
+        apply(&mut dmg_painter, &mut out_a);
+        let shape_ctx_a = ShapeContext {
+            pixels_per_point: out_a.pixels_per_point,
+            options: ctx_dmg.tessellation_options(|o| *o),
+            font_tex_size: ctx_dmg.fonts(|f| f.font_image_size()),
+            prepared_discs: ctx_dmg.fonts(|f| f.fonts.texture_atlas().prepared_discs()),
+        };
+
+        let bg = theme::DARK.window_bg;
+        let mut dmg_buf = vec![0u32; (WIDTH * HEIGHT) as usize];
+        {
+            let mut target = Target::new(&mut dmg_buf, WIDTH, HEIGHT).unwrap();
+            let s1 =
+                dmg_painter.paint_shapes_damaged(&mut target, &shape_ctx_a, out_a.shapes, bg, true);
+            assert_eq!(s1.dirty_tiles, s1.total_tiles);
+        }
+
+        // Frame B: pointer moves onto the chart (marker + cursor readout) and a row.
+        let mut out_b = build_frame_with_input(
+            &ctx_dmg,
+            WIDTH,
+            HEIGHT,
+            vec![egui::Event::PointerMoved(pos2(200.0, 70.0))],
+            0.2,
+        );
+        apply(&mut dmg_painter, &mut out_b);
+        let shape_ctx_b = ShapeContext {
+            pixels_per_point: out_b.pixels_per_point,
+            options: ctx_dmg.tessellation_options(|o| *o),
+            font_tex_size: ctx_dmg.fonts(|f| f.font_image_size()),
+            prepared_discs: ctx_dmg.fonts(|f| f.fonts.texture_atlas().prepared_discs()),
+        };
+        let shapes_b_for_full = out_b.shapes.clone();
+        {
+            let mut target = Target::new(&mut dmg_buf, WIDTH, HEIGHT).unwrap();
+            let s2 = dmg_painter.paint_shapes_damaged(
+                &mut target,
+                &shape_ctx_b,
+                out_b.shapes,
+                bg,
+                false,
+            );
+            assert!(
+                s2.dirty_tiles > 0 && s2.dirty_tiles < s2.total_tiles,
+                "expected partial tile damage on row hover, got {}/{}",
+                s2.dirty_tiles,
+                s2.total_tiles
+            );
+        }
+
+        // Reference full paint of Frame B using the exact same textures/galleys.
+        let mut full_buf = vec![0u32; (WIDTH * HEIGHT) as usize];
+        {
+            let mut target = Target::new(&mut full_buf, WIDTH, HEIGHT).unwrap();
+            Painter::clear(&mut target, bg);
+            dmg_painter.paint_shapes(&mut target, &shape_ctx_b, shapes_b_for_full);
+        }
+        assert_eq!(
+            dmg_buf, full_buf,
+            "damaged repaint of real tablekit/chart widgets must be pixel-identical to a full paint"
+        );
+
+        // Identical steady-state frame C -> zero dirty tiles.
+        let mut out_c = build_frame_with_input(&ctx_dmg, WIDTH, HEIGHT, Vec::new(), 0.2);
+        apply(&mut dmg_painter, &mut out_c);
+        {
+            let mut target = Target::new(&mut dmg_buf, WIDTH, HEIGHT).unwrap();
+            let s3 = dmg_painter.paint_shapes_damaged(
+                &mut target,
+                &shape_ctx_b,
+                out_c.shapes,
+                bg,
+                false,
+            );
+            assert_eq!(
+                s3.dirty_tiles, 0,
+                "identical frame must produce zero dirty tiles: {:?}",
+                s3.dirty_rects
+            );
+        }
+    }
+
+    /// Headless benchmark for a 2288x1575 Processes-like frame (full vs 1-row hover damage).
+    #[test]
+    #[ignore = "timing benchmark; run explicitly with --ignored --nocapture"]
+    fn bench_2288x1575_processes_frame() {
+        const BW: u32 = 2288;
+        const BH: u32 = 1575;
+        let ctx = egui::Context::default();
+        theme::install_visuals(&ctx);
+        ctx.set_theme(egui::ThemePreference::Dark);
+        let mut painter = Painter::new();
+
+        let apply = |painter: &mut Painter, output: &mut egui::FullOutput| {
+            for (id, deltas) in &output.textures_delta.set {
+                for delta in deltas {
+                    painter.set_texture(*id, delta);
+                }
+            }
+            for id in &output.textures_delta.free {
+                painter.free_texture(*id);
+            }
+            output.textures_delta.clear();
+        };
+
+        let mut warmup = build_frame_with_input(&ctx, BW, BH, Vec::new(), 0.0);
+        apply(&mut painter, &mut warmup);
+
+        let t_pass = std::time::Instant::now();
+        let mut out = build_frame_with_input(&ctx, BW, BH, Vec::new(), 0.1);
+        let pass_ms = t_pass.elapsed().as_secs_f64() * 1000.0;
+        apply(&mut painter, &mut out);
+        let shape_ctx = ShapeContext {
+            pixels_per_point: out.pixels_per_point,
+            options: ctx.tessellation_options(|o| *o),
+            font_tex_size: ctx.fonts(|f| f.font_image_size()),
+            prepared_discs: ctx.fonts(|f| f.fonts.texture_atlas().prepared_discs()),
+        };
+
+        let mut buf = vec![0u32; (BW * BH) as usize];
+        let mut target = Target::new(&mut buf, BW, BH).unwrap();
+        let t_full = std::time::Instant::now();
+        painter.paint_shapes_damaged(
+            &mut target,
+            &shape_ctx,
+            out.shapes,
+            theme::DARK.window_bg,
+            true,
+        );
+        let full_paint_ms = t_full.elapsed().as_secs_f64() * 1000.0;
+
+        let mut out_hover = build_frame_with_input(
+            &ctx,
+            BW,
+            BH,
+            vec![egui::Event::PointerMoved(pos2(200.0, 70.0))],
+            0.2,
+        );
+        apply(&mut painter, &mut out_hover);
+        let t_dmg = std::time::Instant::now();
+        let stats = painter.paint_shapes_damaged(
+            &mut target,
+            &shape_ctx,
+            out_hover.shapes,
+            theme::DARK.window_bg,
+            false,
+        );
+        let dmg_paint_ms = t_dmg.elapsed().as_secs_f64() * 1000.0;
+        eprintln!(
+            "2288x1575 bench: pass={pass_ms:.2}ms full_paint={full_paint_ms:.2}ms dmg_paint={dmg_paint_ms:.2}ms dirty_tiles={}/{}",
+            stats.dirty_tiles, stats.total_tiles
+        );
     }
 }
 

@@ -225,6 +225,44 @@ pub use native::file_storage::storage_dir;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod icon_data;
 
+/// TASKMAN-FORK: per-frame timing and tile-damage statistics for the software
+/// renderer (`TASKMAN_INPUT_STATS=1`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SoftwareFrameStats {
+    /// Total frames executed in the window.
+    pub frames: u64,
+    /// Frames skipped because zero tiles changed.
+    pub skipped_damage: u64,
+    /// Sum of dirty 64x64 tiles across painted frames.
+    pub dirty_tiles: u64,
+    /// Sum of total 64x64 tiles across painted frames.
+    pub total_tiles: u64,
+    /// Sum of egui pass durations in nanoseconds.
+    pub pass_ns_sum: u64,
+    /// Maximum egui pass duration in nanoseconds.
+    pub pass_ns_max: u64,
+    /// Sum of software rasterizer durations in nanoseconds.
+    pub paint_ns_sum: u64,
+    /// Maximum software rasterizer duration in nanoseconds.
+    pub paint_ns_max: u64,
+    /// Sum of `softbuffer` present durations in nanoseconds.
+    pub present_ns_sum: u64,
+    /// Maximum `softbuffer` present duration in nanoseconds.
+    pub present_ns_max: u64,
+}
+
+/// TASKMAN-FORK: take and reset accumulated software-renderer frame stats.
+pub fn software_frame_stats_take() -> SoftwareFrameStats {
+    #[cfg(all(feature = "software", not(target_arch = "wasm32")))]
+    {
+        native::software_frame_stats_take()
+    }
+    #[cfg(not(all(feature = "software", not(target_arch = "wasm32"))))]
+    {
+        SoftwareFrameStats::default()
+    }
+}
+
 // ----------------------------------------------------------------------------
 
 /// Attach an [`egui_inspection::InspectionPlugin`] to `ctx` when enabled via the environment.

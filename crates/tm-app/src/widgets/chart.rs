@@ -527,9 +527,9 @@ fn hover_pos(ui: &egui::Ui, response: &Response, rect: Rect) -> Option<Pos2> {
         ui.ctx().data_mut(|d| d.remove::<Pin>(pin_id(response.id)));
     } else {
         // The hover readout is anchored at the exact pointer position, so
-        // cursor moves over the chart must keep repainting (the egui-winit
-        // pointer-move throttle otherwise skips moves within one widget).
-        egui_winit::set_pointer_tracking_hint(ui.ctx());
+        // cursor moves over the chart must keep repainting (throttled to
+        // display refresh rate).
+        egui_winit::set_pointer_stable_rect(ui.ctx(), Rect::NOTHING);
     }
     pos
 }

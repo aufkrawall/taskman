@@ -6,6 +6,8 @@ pub mod run;
 // TASKMAN-FORK: the CPU renderer.
 #[cfg(feature = "software")]
 mod software_integration;
+#[cfg(feature = "software")]
+pub(crate) use software_integration::software_frame_stats_take;
 
 #[cfg(target_os = "macos")]
 pub(crate) mod macos;

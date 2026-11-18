@@ -109,6 +109,10 @@ enum MoveRepaint {
 }
 
 impl PointerMoveThrottle {
+    fn has_armed_trailing(&self, now: web_time::Instant) -> bool {
+        self.trailing_at.is_some_and(|trailing| now < trailing)
+    }
+
     fn plan(
         &mut self,
         now: web_time::Instant,
@@ -143,6 +147,85 @@ impl PointerMoveThrottle {
     }
 }
 
+/// TASKMAN-FORK (#10): per-decision counters for `WindowEvent::CursorMoved`
+/// diagnostics (`TASKMAN_INPUT_STATS=1`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PointerMoveStats {
+    pub total_moves: u64,
+    pub skipped_dup_pos: u64,
+    pub skipped_coalesced: u64,
+    pub skipped_same_target: u64,
+    pub vetoed_by_stable_rect: u64,
+    pub repaint_now: u64,
+    pub trailing_armed: u64,
+    pub pointer_active_now: u64,
+}
+
+#[derive(Default)]
+struct AtomicPointerMoveStats {
+    total_moves: std::sync::atomic::AtomicU64,
+    skipped_dup_pos: std::sync::atomic::AtomicU64,
+    skipped_coalesced: std::sync::atomic::AtomicU64,
+    skipped_same_target: std::sync::atomic::AtomicU64,
+    vetoed_by_stable_rect: std::sync::atomic::AtomicU64,
+    repaint_now: std::sync::atomic::AtomicU64,
+    trailing_armed: std::sync::atomic::AtomicU64,
+    pointer_active_now: std::sync::atomic::AtomicU64,
+}
+
+impl AtomicPointerMoveStats {
+    fn take(&self) -> PointerMoveStats {
+        use std::sync::atomic::Ordering::Relaxed;
+        PointerMoveStats {
+            total_moves: self.total_moves.swap(0, Relaxed),
+            skipped_dup_pos: self.skipped_dup_pos.swap(0, Relaxed),
+            skipped_coalesced: self.skipped_coalesced.swap(0, Relaxed),
+            skipped_same_target: self.skipped_same_target.swap(0, Relaxed),
+            vetoed_by_stable_rect: self.vetoed_by_stable_rect.swap(0, Relaxed),
+            repaint_now: self.repaint_now.swap(0, Relaxed),
+            trailing_armed: self.trailing_armed.swap(0, Relaxed),
+            pointer_active_now: self.pointer_active_now.swap(0, Relaxed),
+        }
+    }
+}
+
+static POINTER_MOVE_STATS: AtomicPointerMoveStats = AtomicPointerMoveStats {
+    total_moves: std::sync::atomic::AtomicU64::new(0),
+    skipped_dup_pos: std::sync::atomic::AtomicU64::new(0),
+    skipped_coalesced: std::sync::atomic::AtomicU64::new(0),
+    skipped_same_target: std::sync::atomic::AtomicU64::new(0),
+    vetoed_by_stable_rect: std::sync::atomic::AtomicU64::new(0),
+    repaint_now: std::sync::atomic::AtomicU64::new(0),
+    trailing_armed: std::sync::atomic::AtomicU64::new(0),
+    pointer_active_now: std::sync::atomic::AtomicU64::new(0),
+};
+
+/// TASKMAN-FORK (#10): take and reset accumulated `CursorMoved` decision counts.
+pub fn pointer_move_stats_take() -> PointerMoveStats {
+    POINTER_MOVE_STATS.take()
+}
+
+const INTERVAL_CACHE_TTL: web_time::Duration = web_time::Duration::from_secs(2);
+
+fn interval_cache_valid(
+    cached: Option<(web_time::Duration, web_time::Instant)>,
+    now: web_time::Instant,
+) -> Option<web_time::Duration> {
+    let (interval, cached_at) = cached?;
+    (now.saturating_duration_since(cached_at) < INTERVAL_CACHE_TTL).then_some(interval)
+}
+
+fn invalidates_interval_cache(event: &winit::event::WindowEvent) -> bool {
+    use winit::event::WindowEvent;
+    matches!(
+        event,
+        WindowEvent::Moved(_)
+            | WindowEvent::Resized(_)
+            | WindowEvent::ScaleFactorChanged { .. }
+            | WindowEvent::Focused(true)
+    )
+}
+
 /// TASKMAN-FORK (#10): minimum interval between pointer-move-triggered
 /// repaints — one display refresh period, falling back to 60 Hz and clamped
 /// to at least 2 ms.
@@ -157,48 +240,160 @@ fn pointer_move_min_interval(window: &Window) -> web_time::Duration {
         .max(web_time::Duration::from_millis(2))
 }
 
-/// TASKMAN-FORK (#10): id of the per-frame hint an app sets (via
-/// [`set_pointer_tracking_hint`]) when the widget under the pointer paints
-/// something anchored at the exact pointer position (a hover readout box, an
-/// `on_hover_*_at_pointer` tooltip). While the hint is set, pointer moves
-/// always repaint (throttled), because the visuals change within the same
-/// widget. The app should clear it at the start of every frame with
-/// [`clear_pointer_tracking_hint`] and re-set it where needed.
-pub const POINTER_TRACKING_HINT: &str = "egui-winit/pointer-tracking-hint";
+/// TASKMAN-FORK (#10): id of the per-frame sub-widget stable rect.
+///
+/// An app sets this via [`set_pointer_stable_rect`] when the widget under the
+/// pointer paints something whose output does not change while the pointer
+/// stays inside that rect (for example a single table cell whose tooltip
+/// differs from neighbouring cells in the same row). Pass `Rect::NOTHING` for
+/// visuals that track every pointer position continuously (e.g. chart hover
+/// readouts). Cleared at the start of every frame with
+/// [`clear_pointer_stable_rect`].
+pub const POINTER_STABLE_RECT: &str = "egui-winit/pointer-stable-rect";
 
-/// TASKMAN-FORK (#10): mark the current frame as having a pointer-anchored
-/// visual under the pointer. See [`POINTER_TRACKING_HINT`].
-pub fn set_pointer_tracking_hint(ctx: &egui::Context) {
-    ctx.data_mut(|d| d.insert_temp::<bool>(egui::Id::new(POINTER_TRACKING_HINT), true));
+/// TASKMAN-FORK (#10): declare a sub-widget region in points where pointer
+/// moves cannot change the current hover output. Repeated calls within the
+/// same frame intersect with the already-recorded rect.
+pub fn set_pointer_stable_rect(ctx: &egui::Context, rect: egui::Rect) {
+    let id = egui::Id::new(POINTER_STABLE_RECT);
+    ctx.data_mut(|d| {
+        let existing = d.get_temp::<Option<egui::Rect>>(id).flatten();
+        let next = match existing {
+            Some(prev) => prev.intersect(rect),
+            None => rect,
+        };
+        d.insert_temp::<Option<egui::Rect>>(id, Some(next));
+    });
 }
 
-/// TASKMAN-FORK (#10): clear the hint set by [`set_pointer_tracking_hint`].
-pub fn clear_pointer_tracking_hint(ctx: &egui::Context) {
-    ctx.data_mut(|d| d.remove_temp::<bool>(egui::Id::new(POINTER_TRACKING_HINT)));
+/// TASKMAN-FORK (#10): clear the stable rect set by [`set_pointer_stable_rect`].
+pub fn clear_pointer_stable_rect(ctx: &egui::Context) {
+    ctx.data_mut(|d| d.remove_temp::<Option<egui::Rect>>(egui::Id::new(POINTER_STABLE_RECT)));
 }
 
-fn pointer_tracking_hint_active(ctx: &egui::Context) -> bool {
-    ctx.data(|d| {
-        d.get_temp::<bool>(egui::Id::new(POINTER_TRACKING_HINT))
-            .unwrap_or(false)
-    })
+fn pointer_stable_rect_vetoes(ctx: &egui::Context, pos: egui::Pos2) -> bool {
+    ctx.data(|d| d.get_temp::<Option<egui::Rect>>(egui::Id::new(POINTER_STABLE_RECT)))
+        .flatten()
+        .is_some_and(|rect| !rect.contains(pos))
 }
 
-/// TASKMAN-FORK (#10): would the set of widgets under `new_pos` differ from
-/// the set under the pointer position of the last completed pass? If not, a
-/// pointer move cannot change any hover visual, so no repaint is needed.
-fn hover_target_changed(ctx: &egui::Context, new_pos: egui::Pos2) -> bool {
+/// Signature of the widgets that determine egui's hover and interact-radius
+/// highlights (`contains_pointer`, `click`, `drag` in `interaction::interact`).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct HoverSignature {
+    contains_pointer: Vec<egui::Id>,
+    click: Option<egui::Id>,
+    drag: Option<egui::Id>,
+}
+
+impl HoverSignature {
+    fn fill_from(&mut self, hits: &egui::WidgetHits) {
+        self.contains_pointer.clear();
+        self.contains_pointer
+            .extend(hits.contains_pointer.iter().map(|widget| widget.id));
+        self.click = hits.click.map(|widget| widget.id);
+        self.drag = hits.drag.map(|widget| widget.id);
+    }
+}
+
+#[derive(Default)]
+struct HoverTargetCache {
+    pass_nr: u64,
+    last_pos: Option<egui::Pos2>,
+    last_sig: HoverSignature,
+    scratch_sig: HoverSignature,
+}
+
+/// TASKMAN-FORK (#10): would the hover/interact targets under `new_pos` differ
+/// from those under the pointer position of the last completed pass? Compares
+/// `contains_pointer`, `click`, and `drag` (so approaching within
+/// `interact_radius` is detected) and caches the last pass's signature per
+/// `(pass_nr, last_pos)`.
+fn hover_target_changed(
+    ctx: &egui::Context,
+    cache: &mut HoverTargetCache,
+    new_pos: egui::Pos2,
+) -> bool {
     let Some(last_pos) = ctx.pointer_latest_pos() else {
         return true;
     };
-    let ids_at = |pos: egui::Pos2| -> Vec<egui::Id> {
-        ctx.hit_test_last_pass(pos)
-            .contains_pointer
-            .iter()
-            .map(|widget| widget.id)
-            .collect()
+    let pass_nr = ctx.cumulative_pass_nr();
+    if cache.pass_nr != pass_nr || cache.last_pos != Some(last_pos) {
+        let last_hits = ctx.hit_test_last_pass(last_pos);
+        cache.last_sig.fill_from(&last_hits);
+        cache.pass_nr = pass_nr;
+        cache.last_pos = Some(last_pos);
+    }
+    let new_hits = ctx.hit_test_last_pass(new_pos);
+    cache.scratch_sig.fill_from(&new_hits);
+    cache.scratch_sig != cache.last_sig
+}
+
+fn push_or_coalesce_pointer_moved(
+    events: &mut Vec<egui::Event>,
+    pos_in_points: egui::Pos2,
+    any_pointer_button_down: bool,
+) {
+    if !any_pointer_button_down && let Some(egui::Event::PointerMoved(last)) = events.last_mut() {
+        *last = pos_in_points;
+    } else {
+        events.push(egui::Event::PointerMoved(pos_in_points));
+    }
+}
+
+#[expect(clippy::too_many_arguments)]
+fn plan_cursor_move_decision(
+    ctx: &egui::Context,
+    viewport_id: ViewportId,
+    throttle: &mut PointerMoveThrottle,
+    hover_cache: &mut HoverTargetCache,
+    now: web_time::Instant,
+    pos_in_points: egui::Pos2,
+    pos_changed: bool,
+    pointer_active: bool,
+    stats: &AtomicPointerMoveStats,
+    mut min_interval: impl FnMut() -> web_time::Duration,
+) -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+    stats.total_moves.fetch_add(1, Relaxed);
+    if !pos_changed && !pointer_active {
+        stats.skipped_dup_pos.fetch_add(1, Relaxed);
+        return false;
+    }
+    if !pointer_active && throttle.has_armed_trailing(now) {
+        stats.skipped_coalesced.fetch_add(1, Relaxed);
+        return false;
+    }
+    let relevant = if pointer_active {
+        stats.pointer_active_now.fetch_add(1, Relaxed);
+        true
+    } else if pointer_stable_rect_vetoes(ctx, pos_in_points) {
+        stats.vetoed_by_stable_rect.fetch_add(1, Relaxed);
+        true
+    } else if hover_target_changed(ctx, hover_cache, pos_in_points) {
+        true
+    } else {
+        stats.skipped_same_target.fetch_add(1, Relaxed);
+        false
     };
-    ids_at(new_pos) != ids_at(last_pos)
+    if !relevant {
+        return false;
+    }
+    match throttle.plan(now, pos_changed, min_interval(), pointer_active) {
+        MoveRepaint::Now => {
+            stats.repaint_now.fetch_add(1, Relaxed);
+            true
+        }
+        MoveRepaint::After(delay) => {
+            stats.trailing_armed.fetch_add(1, Relaxed);
+            ctx.request_repaint_after_for(delay, viewport_id);
+            false
+        }
+        MoveRepaint::Skip => {
+            stats.skipped_coalesced.fetch_add(1, Relaxed);
+            false
+        }
+    }
 }
 
 // ----------------------------------------------------------------------------
@@ -224,6 +419,10 @@ pub struct State {
     any_pointer_button_down: bool,
     /// TASKMAN-FORK (#10): coalesces pointer-move repaints, see the struct.
     pointer_move_throttle: PointerMoveThrottle,
+    /// TASKMAN-FORK (#10): cached display refresh period for `pointer_move_throttle`.
+    cached_min_interval: Option<(web_time::Duration, web_time::Instant)>,
+    /// TASKMAN-FORK (#10): cached last-pass hit-test signature + scratch buffers.
+    hover_cache: HoverTargetCache,
     current_cursor_icon: Option<egui::CursorIcon>,
 
     /// Cached `CustomCursor` for the last RGBA bitmap pushed through
@@ -289,6 +488,8 @@ impl State {
             pointer_pos_in_points: None,
             any_pointer_button_down: false,
             pointer_move_throttle: PointerMoveThrottle::default(),
+            cached_min_interval: None,
+            hover_cache: HoverTargetCache::default(),
             current_cursor_icon: None,
             current_custom_cursor: None,
 
@@ -449,6 +650,10 @@ impl State {
             _ => {}
         }
 
+        if invalidates_interval_cache(event) {
+            self.cached_min_interval = None;
+        }
+
         match event {
             WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
                 let native_pixels_per_point = *scale_factor as f32;
@@ -481,10 +686,10 @@ impl State {
             WindowEvent::CursorMoved { position, .. } => {
                 // TASKMAN-FORK (#10): upstream repaints on every move. We
                 // skip moves that cannot change anything (unchanged position,
-                // or the same widgets under the pointer as in the last painted
-                // frame and no pointer-anchored visual), dedupe the rest, and
-                // coalesce them to one frame per display refresh with a
-                // guaranteed trailing repaint.
+                // already armed trailing repaint, or the same hover/interact
+                // targets as in the last painted frame within the optional
+                // stable rect), and coalesce the rest to one frame per display
+                // refresh with a guaranteed trailing repaint.
                 let pixels_per_point = pixels_per_point(&self.egui_ctx, window);
                 let pos_in_points = egui::pos2(
                     position.x as f32 / pixels_per_point,
@@ -493,28 +698,15 @@ impl State {
                 let pos_changed = self.pointer_pos_in_points != Some(pos_in_points);
                 let pointer_active =
                     self.any_pointer_button_down || self.egui_ctx.egui_is_using_pointer();
-                let hover_relevant = pos_changed
-                    && (pointer_active
-                        || pointer_tracking_hint_active(&self.egui_ctx)
-                        || hover_target_changed(&self.egui_ctx, pos_in_points));
-                let repaint = if hover_relevant {
-                    match self.pointer_move_throttle.plan(
-                        web_time::Instant::now(),
-                        pos_changed,
-                        pointer_move_min_interval(window),
-                        pointer_active,
-                    ) {
-                        MoveRepaint::Now => true,
-                        MoveRepaint::After(delay) => {
-                            self.egui_ctx
-                                .request_repaint_after_for(delay, self.viewport_id);
-                            false
-                        }
-                        MoveRepaint::Skip => false,
-                    }
-                } else {
-                    false
-                };
+                let now = web_time::Instant::now();
+                let repaint = self.plan_cursor_move_repaint(
+                    window,
+                    now,
+                    pos_in_points,
+                    pos_changed,
+                    pointer_active,
+                    &POINTER_MOVE_STATS,
+                );
                 self.on_cursor_moved(window, *position);
                 EventResponse {
                     repaint,
@@ -1006,6 +1198,37 @@ impl State {
         }
     }
 
+    fn plan_cursor_move_repaint(
+        &mut self,
+        window: &Window,
+        now: web_time::Instant,
+        pos_in_points: egui::Pos2,
+        pos_changed: bool,
+        pointer_active: bool,
+        stats: &AtomicPointerMoveStats,
+    ) -> bool {
+        let cached_min_interval = &mut self.cached_min_interval;
+        plan_cursor_move_decision(
+            &self.egui_ctx,
+            self.viewport_id,
+            &mut self.pointer_move_throttle,
+            &mut self.hover_cache,
+            now,
+            pos_in_points,
+            pos_changed,
+            pointer_active,
+            stats,
+            || {
+                if let Some(interval) = interval_cache_valid(*cached_min_interval, now) {
+                    return interval;
+                }
+                let interval = pointer_move_min_interval(window);
+                *cached_min_interval = Some((interval, now));
+                interval
+            },
+        )
+    }
+
     fn on_cursor_moved(
         &mut self,
         window: &Window,
@@ -1034,9 +1257,11 @@ impl State {
                 });
             }
         } else {
-            self.egui_input
-                .events
-                .push(egui::Event::PointerMoved(pos_in_points));
+            push_or_coalesce_pointer_moved(
+                &mut self.egui_input.events,
+                pos_in_points,
+                self.any_pointer_button_down,
+            );
         }
     }
 
@@ -2610,37 +2835,226 @@ mod pointer_move_throttle_tests {
         let inside_a = egui::pos2(10.0, 10.0);
         let inside_b = egui::pos2(90.0, 10.0);
         let blank = egui::pos2(500.0, 500.0);
+        // Within `interact_radius` (~5 pt) of `widget`, outside its rect.
+        let near_edge = egui::pos2(102.0, 10.0);
+        let mut cache = HoverTargetCache::default();
 
         // Last painted frame had the pointer inside the widget.
         pass_with_widget(&ctx, inside_a, widget);
         // Moving within the same widget: no hover change.
-        assert!(!hover_target_changed(&ctx, inside_b));
+        assert!(!hover_target_changed(&ctx, &mut cache, inside_b));
         // Moving off the widget onto blank space: hover changes.
-        assert!(hover_target_changed(&ctx, blank));
+        assert!(hover_target_changed(&ctx, &mut cache, blank));
 
         // Last painted frame had the pointer on blank space.
         pass_with_widget(&ctx, blank, widget);
         // Moving onto the widget: hover changes.
-        assert!(hover_target_changed(&ctx, inside_b));
+        assert!(hover_target_changed(&ctx, &mut cache, inside_b));
         // Staying on blank space: no change.
-        assert!(!hover_target_changed(&ctx, egui::pos2(600.0, 600.0)));
+        assert!(!hover_target_changed(
+            &ctx,
+            &mut cache,
+            egui::pos2(600.0, 600.0)
+        ));
+        // Approaching the widget within `interact_radius` (outside its rect):
+        // `contains_pointer` is empty, but `hits.click` changes, so hover
+        // must repaint rather than leaving the button highlight stale.
+        assert!(hover_target_changed(&ctx, &mut cache, near_edge));
     }
 
     #[test]
     fn hover_target_changed_without_any_pass_is_true() {
         let ctx = egui::Context::default();
+        let mut cache = HoverTargetCache::default();
         // No frame has run yet, so there is no last pointer position: a move
         // must be treated as relevant (repaint), never skipped.
-        assert!(hover_target_changed(&ctx, egui::pos2(1.0, 1.0)));
+        assert!(hover_target_changed(&ctx, &mut cache, egui::pos2(1.0, 1.0)));
     }
 
     #[test]
-    fn pointer_tracking_hint_roundtrip() {
+    fn pointer_stable_rect_roundtrip_and_intersection() {
         let ctx = egui::Context::default();
-        assert!(!pointer_tracking_hint_active(&ctx));
-        set_pointer_tracking_hint(&ctx);
-        assert!(pointer_tracking_hint_active(&ctx));
-        clear_pointer_tracking_hint(&ctx);
-        assert!(!pointer_tracking_hint_active(&ctx));
+        let pos_in = egui::pos2(15.0, 15.0);
+        let pos_sibling = egui::pos2(45.0, 15.0);
+        assert!(!pointer_stable_rect_vetoes(&ctx, pos_in));
+
+        let row = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(100.0, 24.0));
+        let cell = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(30.0, 24.0));
+        set_pointer_stable_rect(&ctx, row);
+        assert!(!pointer_stable_rect_vetoes(&ctx, pos_in));
+        assert!(!pointer_stable_rect_vetoes(&ctx, pos_sibling));
+
+        // Narrowing to `cell` intersects with `row`.
+        set_pointer_stable_rect(&ctx, cell);
+        assert!(!pointer_stable_rect_vetoes(&ctx, pos_in));
+        assert!(pointer_stable_rect_vetoes(&ctx, pos_sibling));
+
+        // Passing `Rect::NOTHING` vetoes all positions.
+        set_pointer_stable_rect(&ctx, egui::Rect::NOTHING);
+        assert!(pointer_stable_rect_vetoes(&ctx, pos_in));
+
+        clear_pointer_stable_rect(&ctx);
+        assert!(!pointer_stable_rect_vetoes(&ctx, pos_in));
+    }
+
+    #[test]
+    fn interval_cache_validity_and_invalidation() {
+        let t0 = web_time::Instant::now();
+        let d = web_time::Duration::from_millis(8);
+        assert_eq!(interval_cache_valid(None, t0), None);
+        assert_eq!(interval_cache_valid(Some((d, t0)), t0), Some(d));
+        assert_eq!(interval_cache_valid(Some((d, t0)), at(t0, 1999)), Some(d));
+        assert_eq!(interval_cache_valid(Some((d, t0)), at(t0, 2000)), None);
+
+        use winit::dpi::{PhysicalPosition, PhysicalSize};
+        use winit::event::WindowEvent;
+        assert!(invalidates_interval_cache(&WindowEvent::Moved(
+            PhysicalPosition::new(10, 20)
+        )));
+        assert!(invalidates_interval_cache(&WindowEvent::Resized(
+            PhysicalSize::new(800, 600)
+        )));
+        assert!(invalidates_interval_cache(&WindowEvent::Focused(true)));
+        assert!(!invalidates_interval_cache(&WindowEvent::Focused(false)));
+        assert!(!invalidates_interval_cache(&WindowEvent::CursorEntered {
+            device_id: winit::event::DeviceId::dummy(),
+        }));
+    }
+
+    #[test]
+    fn pointer_moved_coalescing_keeps_latest_and_preserves_button_order() {
+        let mut events = Vec::new();
+        let p1 = egui::pos2(10.0, 10.0);
+        let p2 = egui::pos2(20.0, 20.0);
+        let p3 = egui::pos2(30.0, 30.0);
+
+        push_or_coalesce_pointer_moved(&mut events, p1, false);
+        push_or_coalesce_pointer_moved(&mut events, p2, false);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0], egui::Event::PointerMoved(p2));
+
+        // Button press separates moves; while button is down, do not coalesce.
+        events.push(egui::Event::PointerButton {
+            pos: p2,
+            button: egui::PointerButton::Primary,
+            pressed: true,
+            modifiers: egui::Modifiers::default(),
+        });
+        push_or_coalesce_pointer_moved(&mut events, p3, true);
+        assert_eq!(events.len(), 3);
+        assert_eq!(events[2], egui::Event::PointerMoved(p3));
+    }
+
+    #[test]
+    fn pointer_move_stats_record_decisions() {
+        let ctx = egui::Context::default();
+        let widget = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(100.0, 20.0));
+        let inside_a = egui::pos2(10.0, 10.0);
+        let inside_b = egui::pos2(20.0, 10.0);
+        let blank = egui::pos2(500.0, 500.0);
+        pass_with_widget(&ctx, inside_a, widget);
+
+        let mut throttle = PointerMoveThrottle::default();
+        let mut cache = HoverTargetCache::default();
+        let stats = AtomicPointerMoveStats::default();
+        let t0 = web_time::Instant::now();
+        let mut interval_queries = 0u32;
+        let mut get_interval = || {
+            interval_queries += 1;
+            INTERVAL
+        };
+
+        // 1. Duplicate position -> skipped_dup_pos (no interval query).
+        assert!(!plan_cursor_move_decision(
+            &ctx,
+            ViewportId::ROOT,
+            &mut throttle,
+            &mut cache,
+            t0,
+            inside_a,
+            false,
+            false,
+            &stats,
+            &mut get_interval,
+        ));
+        // 2. Same widget inside stable rect -> skipped_same_target.
+        set_pointer_stable_rect(&ctx, widget);
+        assert!(!plan_cursor_move_decision(
+            &ctx,
+            ViewportId::ROOT,
+            &mut throttle,
+            &mut cache,
+            at(t0, 1),
+            inside_b,
+            true,
+            false,
+            &stats,
+            &mut get_interval,
+        ));
+        // 3. Outside stable rect -> vetoed_by_stable_rect -> repaint_now.
+        assert!(plan_cursor_move_decision(
+            &ctx,
+            ViewportId::ROOT,
+            &mut throttle,
+            &mut cache,
+            at(t0, 2),
+            blank,
+            true,
+            false,
+            &stats,
+            &mut get_interval,
+        ));
+        // 4. Clear stable rect; hover_target_changed still triggers within interval -> trailing_armed.
+        clear_pointer_stable_rect(&ctx);
+        assert!(!plan_cursor_move_decision(
+            &ctx,
+            ViewportId::ROOT,
+            &mut throttle,
+            &mut cache,
+            at(t0, 5),
+            egui::pos2(505.0, 500.0),
+            true,
+            false,
+            &stats,
+            &mut get_interval,
+        ));
+        // 5. While trailing is armed -> skipped_coalesced (no interval query).
+        assert!(!plan_cursor_move_decision(
+            &ctx,
+            ViewportId::ROOT,
+            &mut throttle,
+            &mut cache,
+            at(t0, 8),
+            egui::pos2(510.0, 500.0),
+            true,
+            false,
+            &stats,
+            &mut get_interval,
+        ));
+        // 6. Active pointer -> pointer_active_now -> repaint_now.
+        assert!(plan_cursor_move_decision(
+            &ctx,
+            ViewportId::ROOT,
+            &mut throttle,
+            &mut cache,
+            at(t0, 9),
+            egui::pos2(512.0, 500.0),
+            true,
+            true,
+            &stats,
+            &mut get_interval,
+        ));
+
+        let taken = stats.take();
+        assert_eq!(taken.total_moves, 6);
+        assert_eq!(taken.skipped_dup_pos, 1);
+        assert_eq!(taken.skipped_same_target, 1);
+        assert_eq!(taken.vetoed_by_stable_rect, 1);
+        assert_eq!(taken.repaint_now, 2);
+        assert_eq!(taken.trailing_armed, 1);
+        assert_eq!(taken.skipped_coalesced, 1);
+        assert_eq!(taken.pointer_active_now, 1);
+        assert_eq!(interval_queries, 3);
+        assert_eq!(stats.take(), PointerMoveStats::default());
     }
 }

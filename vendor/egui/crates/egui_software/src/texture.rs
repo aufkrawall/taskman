@@ -93,11 +93,19 @@ fn wrap(v: i64, size: i64, mode: TextureWrapMode) -> i64 {
 #[derive(Default)]
 pub struct TextureStore {
     textures: std::collections::HashMap<TextureId, Texture>,
+    generations: std::collections::HashMap<TextureId, u64>,
+    next_gen: u64,
 }
 
 impl TextureStore {
     pub fn get(&self, id: TextureId) -> Option<&Texture> {
         self.textures.get(&id)
+    }
+
+    /// Monotonic generation counter for `id` (bumped on full upload, non-atlas
+    /// partial update, and free), used by tile damage tracking.
+    pub fn generation(&self, id: TextureId) -> u64 {
+        self.generations.get(&id).copied().unwrap_or(0)
     }
 
     pub fn len(&self) -> usize {
@@ -106,6 +114,11 @@ impl TextureStore {
 
     pub fn is_empty(&self) -> bool {
         self.textures.is_empty()
+    }
+
+    fn bump_generation(&mut self, id: TextureId) {
+        self.next_gen = self.next_gen.wrapping_add(1).max(1);
+        self.generations.insert(id, self.next_gen);
     }
 
     /// Apply one entry of a [`epaint::textures::TexturesDelta`].
@@ -129,6 +142,7 @@ impl TextureStore {
                         options: delta.options,
                     },
                 );
+                self.bump_generation(id);
             }
             Some([x, y]) => {
                 let Some(tex) = self.textures.get_mut(&id) else {
@@ -150,12 +164,20 @@ impl TextureStore {
                         dst.copy_from_slice(src);
                     }
                 }
+                // Managed(0) is the font atlas: partial patches only allocate fresh
+                // glyph slots and never overwrite existing glyphs, whereas any other
+                // texture patched in-place may change pixels of existing meshes.
+                if id != TextureId::Managed(0) {
+                    self.bump_generation(id);
+                }
             }
         }
     }
 
     pub fn free(&mut self, id: TextureId) {
-        self.textures.remove(&id);
+        if self.textures.remove(&id).is_some() {
+            self.bump_generation(id);
+        }
     }
 }
 

@@ -399,23 +399,31 @@ Found by the 2026-10-21 row-vs-total audit and deliberately not changed:
   per-process network; traffic to the machine's own adapter address also
   stays inside the stack but is still counted.
 
-## Mouse movement over the window repaints per move — FIXED 2026-11-17 (fork divergence #10)
+## Mouse movement over the window repaints per move — MITIGATED 2026-11-18 (live verification pending)
 
 - The 2026-11-17 raw-input fix (fork divergence #9) removed the cost of mouse movement
   *outside* a focused TaskMan window. Movement *over* the window used to repaint per
-  `CursorMoved`: a minimal eframe probe measured ~0.96 cores at 1 kHz movement
-  (`llm-wiki/log/recent.md`, 2026-11-17).
-- Fixed by coalescing pointer-move repaints in `egui-winit` (fork divergence #10, with the
-  `Context::hit_test_last_pass` accessor #11 in `egui` itself): a move is skipped entirely
-  when its position is unchanged or when the widgets under the pointer are the same as in
-  the last painted frame (so blank areas like the lower sidebar cost nothing); all other
-  moves are throttled to one frame per display refresh with one armed trailing repaint so
-  the final position is always painted; drags and pressed buttons always repaint
-  immediately. Pointer-anchored visuals (chart hover readout, at-pointer row tooltips)
-  set a per-frame hint (`egui_winit::set_pointer_tracking_hint`, set in `tablekit::row`
-  and `chart::hover_pos`) so they keep repainting per move — the hover-target skip alone
-  would freeze them within one widget. Live before/after measurement with synthetic mouse
-  movement is still open — see `llm-wiki/log/recent.md`.
+  `CursorMoved`, and the initial `c2a9612` / `d4e07dd` fixes left four gaps on the live
+  Windows software renderer:
+  1. `egui` tooltips defaulted to `show_tooltips_only_when_still = true`, causing
+     `tooltip.rs:362` to call `request_repaint()` every frame while moving over any
+     tooltipped widget (uncapped `ControlFlow::Poll` on software renderer).
+  2. `tablekit::TmTable::row` set the boolean tracking hint for every hovered row,
+     disabling the same-widget skip over almost the entire window.
+  3. Repainting `CursorMoved` events called `window.current_monitor()` →
+     `EnumDisplaySettingsExW` on every move.
+  4. Each frame cleared, rasterized, and `BitBlt`-presented the entire window buffer,
+     and the taskbar monitor's foreground `LOCATIONCHANGE` hook still hooked TaskMan's
+     own UI thread while TaskMan had focus.
+- Fixed in code (2026-11-18): `show_tooltips_only_when_still = false` in `tm-ui/theme.rs`,
+  `POINTER_STABLE_RECT` + anchored `hover_text_at_fixed_pointer` replacing the row-wide
+  hint, 2 s refresh-interval cache + `interact_radius`-aware `hover_target_changed` +
+  trailing short-circuit + `PointerMoved` queue coalescing in `egui-winit`, 64×64 tile
+  damage tracking + `present_with_damage` in `egui_software` / `software_integration.rs`,
+  own-process skip in `taskbar_monitor/hooks.rs` (`sync_foreground_hook`) with app-side
+  move/resize refresh, zero-alloc `sync_taskbar_monitor`, and `TASKMAN_INPUT_STATS=1`
+  diagnostics. Live `TASKMAN_INPUT_STATS=1` + `typeperf` measurement on the installed
+  Windows build is still needed to confirm the live CPU reduction.
 
 ## Falsified findings — do not re-raise
 

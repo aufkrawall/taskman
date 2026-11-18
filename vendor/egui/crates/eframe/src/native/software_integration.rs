@@ -27,7 +27,16 @@
 //! `egui::ViewportCommand`s that act on the root window (title, visibility, close,
 //! decorations, always-on-top, ...) are handled in full via `egui_winit`.
 
-use std::{cell::RefCell, num::NonZeroU32, rc::Rc, sync::Arc, time::Instant};
+use std::{
+    cell::RefCell,
+    num::NonZeroU32,
+    rc::Rc,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::Instant,
+};
 
 use egui::{DeferredViewportUiCallback, ViewportId, ViewportInfo, ViewportOutput};
 #[cfg(feature = "accesskit")]
@@ -49,6 +58,57 @@ use crate::{
         },
     },
 };
+
+struct AtomicSoftwareFrameStats {
+    frames: AtomicU64,
+    skipped_damage: AtomicU64,
+    dirty_tiles: AtomicU64,
+    total_tiles: AtomicU64,
+    pass_ns_sum: AtomicU64,
+    pass_ns_max: AtomicU64,
+    paint_ns_sum: AtomicU64,
+    paint_ns_max: AtomicU64,
+    present_ns_sum: AtomicU64,
+    present_ns_max: AtomicU64,
+}
+
+static SOFTWARE_FRAME_STATS: AtomicSoftwareFrameStats = AtomicSoftwareFrameStats {
+    frames: AtomicU64::new(0),
+    skipped_damage: AtomicU64::new(0),
+    dirty_tiles: AtomicU64::new(0),
+    total_tiles: AtomicU64::new(0),
+    pass_ns_sum: AtomicU64::new(0),
+    pass_ns_max: AtomicU64::new(0),
+    paint_ns_sum: AtomicU64::new(0),
+    paint_ns_max: AtomicU64::new(0),
+    present_ns_sum: AtomicU64::new(0),
+    present_ns_max: AtomicU64::new(0),
+};
+
+fn update_max(slot: &AtomicU64, val: u64) {
+    slot.fetch_max(val, Ordering::Relaxed);
+}
+
+pub(crate) fn software_frame_stats_take() -> crate::SoftwareFrameStats {
+    crate::SoftwareFrameStats {
+        frames: SOFTWARE_FRAME_STATS.frames.swap(0, Ordering::Relaxed),
+        skipped_damage: SOFTWARE_FRAME_STATS
+            .skipped_damage
+            .swap(0, Ordering::Relaxed),
+        dirty_tiles: SOFTWARE_FRAME_STATS.dirty_tiles.swap(0, Ordering::Relaxed),
+        total_tiles: SOFTWARE_FRAME_STATS.total_tiles.swap(0, Ordering::Relaxed),
+        pass_ns_sum: SOFTWARE_FRAME_STATS.pass_ns_sum.swap(0, Ordering::Relaxed),
+        pass_ns_max: SOFTWARE_FRAME_STATS.pass_ns_max.swap(0, Ordering::Relaxed),
+        paint_ns_sum: SOFTWARE_FRAME_STATS.paint_ns_sum.swap(0, Ordering::Relaxed),
+        paint_ns_max: SOFTWARE_FRAME_STATS.paint_ns_max.swap(0, Ordering::Relaxed),
+        present_ns_sum: SOFTWARE_FRAME_STATS
+            .present_ns_sum
+            .swap(0, Ordering::Relaxed),
+        present_ns_max: SOFTWARE_FRAME_STATS
+            .present_ns_max
+            .swap(0, Ordering::Relaxed),
+    }
+}
 
 pub struct SoftwareWinitApp<'app> {
     repaint_proxy: Arc<egui::mutex::Mutex<winit::event_loop::EventLoopProxy<UserEvent>>>,
@@ -81,6 +141,10 @@ struct SoftwareWinitRunning<'app> {
     /// while the window is hidden, because it is what triggers `post_rendering` to show
     /// the window.
     has_presented_once: bool,
+
+    /// Whether the window was hidden/minimized on a previous tick, so restoring it
+    /// forces a full repaint and full present into the newly-revealed DWM surface.
+    was_hidden: bool,
 
     /// Set once the first frame has actually reached the screen, so the log records
     /// that the CPU path is live and what it decided about sub-pixel text. A renderer
@@ -282,6 +346,7 @@ impl<'app> SoftwareWinitApp<'app> {
                 size: (0, 0),
             })),
             has_presented_once: false,
+            was_hidden: false,
             logged_first_frame: false,
             pending_deltas: Default::default(),
         });
@@ -328,11 +393,18 @@ impl SoftwareWinitRunning<'_> {
         self.info.events.clear();
 
         // --- user code; holds no borrow of the surface ---
+        let pass_start = Instant::now();
         let full_output = self.integration.update(
             self.app.as_mut(),
             None::<&DeferredViewportUiCallback>,
             raw_input,
         );
+        let pass_ns = pass_start.elapsed().as_nanos() as u64;
+        SOFTWARE_FRAME_STATS.frames.fetch_add(1, Ordering::Relaxed);
+        SOFTWARE_FRAME_STATS
+            .pass_ns_sum
+            .fetch_add(pass_ns, Ordering::Relaxed);
+        update_max(&SOFTWARE_FRAME_STATS.pass_ns_max, pass_ns);
 
         let egui::FullOutput {
             platform_output,
@@ -364,6 +436,7 @@ impl SoftwareWinitRunning<'_> {
         let paintable = size.width > 0 && size.height > 0 && (!hidden || !self.has_presented_once);
 
         if paintable {
+            let restored = std::mem::take(&mut self.was_hidden);
             // Take the sub-pixel mode from the ATLAS, not from the style. The atlas is
             // what actually holds the coverage, so asking it makes the blend mode and the
             // rasterization mode agree by construction -- the one failure here that does
@@ -415,20 +488,39 @@ impl SoftwareWinitRunning<'_> {
                 let mut buffer = state.surface.buffer_mut().map_err(|err| {
                     crate::Error::AppCreation(format!("softbuffer buffer: {err}").into())
                 })?;
+                let force_full = !self.has_presented_once || restored || buffer.age() != 1;
 
-                if let Some(mut target) =
+                let paint_start = Instant::now();
+                let damage = if let Some(mut target) =
                     egui_software::Target::new(&mut buffer, size.width, size.height)
                 {
                     // `clear_color` returns premultiplied gamma-space floats in 0..=1.
                     // The alpha is meaningless on an opaque window buffer, so only the RGB
                     // is used, scaled back to bytes.
                     let byte = |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() as u8;
-                    egui_software::Painter::clear(
+                    let clear_color =
+                        egui::Color32::from_rgb(byte(clear[0]), byte(clear[1]), byte(clear[2]));
+                    self.painter.paint_shapes_damaged(
                         &mut target,
-                        egui::Color32::from_rgb(byte(clear[0]), byte(clear[1]), byte(clear[2])),
-                    );
-                    self.painter.paint_shapes(&mut target, &shape_ctx, shapes);
-                }
+                        &shape_ctx,
+                        shapes,
+                        clear_color,
+                        force_full,
+                    )
+                } else {
+                    egui_software::DamageStats::default()
+                };
+                let paint_ns = paint_start.elapsed().as_nanos() as u64;
+                SOFTWARE_FRAME_STATS
+                    .paint_ns_sum
+                    .fetch_add(paint_ns, Ordering::Relaxed);
+                update_max(&SOFTWARE_FRAME_STATS.paint_ns_max, paint_ns);
+                SOFTWARE_FRAME_STATS
+                    .dirty_tiles
+                    .fetch_add(damage.dirty_tiles as u64, Ordering::Relaxed);
+                SOFTWARE_FRAME_STATS
+                    .total_tiles
+                    .fetch_add(damage.total_tiles as u64, Ordering::Relaxed);
 
                 self.has_presented_once = true;
                 if !self.logged_first_frame {
@@ -441,9 +533,59 @@ impl SoftwareWinitRunning<'_> {
                     );
                 }
 
-                buffer.present().map_err(|err| {
-                    crate::Error::AppCreation(format!("softbuffer present: {err}").into())
-                })?;
+                if damage.dirty_rects.is_empty() {
+                    SOFTWARE_FRAME_STATS
+                        .skipped_damage
+                        .fetch_add(1, Ordering::Relaxed);
+                } else {
+                    let present_start = Instant::now();
+                    let full_screen = damage.dirty_rects.len() == 1
+                        && damage.dirty_rects[0]
+                            == egui_software::PixelRect {
+                                min_x: 0,
+                                min_y: 0,
+                                max_x: size.width as i32,
+                                max_y: size.height as i32,
+                            };
+                    if full_screen {
+                        buffer.present().map_err(|err| {
+                            crate::Error::AppCreation(format!("softbuffer present: {err}").into())
+                        })?;
+                    } else {
+                        let rects: Vec<softbuffer::Rect> = damage
+                            .dirty_rects
+                            .iter()
+                            .filter_map(|r| {
+                                let w = NonZeroU32::new(u32::try_from(r.width()).ok()?)?;
+                                let h = NonZeroU32::new(u32::try_from(r.height()).ok()?)?;
+                                Some(softbuffer::Rect {
+                                    x: u32::try_from(r.min_x).ok()?,
+                                    y: u32::try_from(r.min_y).ok()?,
+                                    width: w,
+                                    height: h,
+                                })
+                            })
+                            .collect();
+                        if rects.is_empty() {
+                            buffer.present().map_err(|err| {
+                                crate::Error::AppCreation(
+                                    format!("softbuffer present: {err}").into(),
+                                )
+                            })?;
+                        } else {
+                            buffer.present_with_damage(&rects).map_err(|err| {
+                                crate::Error::AppCreation(
+                                    format!("softbuffer present_with_damage: {err}").into(),
+                                )
+                            })?;
+                        }
+                    }
+                    let present_ns = present_start.elapsed().as_nanos() as u64;
+                    SOFTWARE_FRAME_STATS
+                        .present_ns_sum
+                        .fetch_add(present_ns, Ordering::Relaxed);
+                    update_max(&SOFTWARE_FRAME_STATS.present_ns_max, present_ns);
+                }
             }
 
             #[expect(clippy::iter_over_hash_type)] // a set of ids; order is irrelevant
@@ -455,6 +597,9 @@ impl SoftwareWinitRunning<'_> {
 
             self.integration.post_rendering(&self.window);
         } else {
+            if hidden {
+                self.was_hidden = true;
+            }
             // Nothing was painted, so the shapes are dropped here. The deltas are NOT:
             // they stay in `pending_deltas` for the next paintable frame.
             drop(shapes);

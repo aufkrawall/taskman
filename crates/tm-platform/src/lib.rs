@@ -418,6 +418,31 @@ pub mod taskbar_monitor {
                 menu_dark,
             }
         }
+
+        /// Compare against `Settings` and borrowed labels without allocating.
+        pub fn matches_settings(
+            &self,
+            s: &Settings,
+            menu_open_label: &str,
+            menu_settings_label: &str,
+            menu_exit_label: &str,
+            menu_dark: bool,
+        ) -> bool {
+            self.enabled == s.taskbar_monitor_enabled
+                && self.show_cpu == s.taskbar_show_cpu
+                && self.show_ram == s.taskbar_show_ram
+                && self.show_network == s.taskbar_show_network
+                && self.font_family == s.taskbar_font_family
+                && self.font_size == s.taskbar_font_size
+                && self.net_unit_bits == s.taskbar_net_unit_bits
+                && self.net_unit_mode == s.taskbar_net_unit_mode
+                && self.color_mode == s.taskbar_color_mode
+                && self.custom_color == s.taskbar_custom_color
+                && self.menu_open_label == menu_open_label
+                && self.menu_settings_label == menu_settings_label
+                && self.menu_exit_label == menu_exit_label
+                && self.menu_dark == menu_dark
+        }
     }
 
     #[derive(Debug, Clone, Copy, PartialEq, Default)]
@@ -490,6 +515,7 @@ pub mod taskbar_monitor {
         }
         pub fn set_config(&self, _config: Config) {}
         pub fn update_metrics(&self, _metrics: Metrics) {}
+        pub fn request_refresh(&self) {}
         pub fn shutdown(&self) {}
     }
 

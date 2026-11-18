@@ -260,6 +260,10 @@ pub fn install_visuals(ctx: &egui::Context) {
             .into();
             style.visuals.window_corner_radius = CornerRadius::same(8);
             style.visuals.menu_corner_radius = CornerRadius::same(8);
+            // Allow tooltip delay to rely on a single scheduled repaint after
+            // `tooltip_delay` rather than calling `request_repaint()` every
+            // frame while the pointer moves over a tooltipped widget.
+            style.interaction.show_tooltips_only_when_still = false;
             style.spacing.item_spacing = egui::vec2(8.0, 6.0);
             style.spacing.button_padding = egui::vec2(10.0, 4.0);
             // Win11-style scroll bars: a thin idle handle that expands on

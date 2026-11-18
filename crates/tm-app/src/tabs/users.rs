@@ -790,6 +790,9 @@ fn user_row_ui(
 ) {
     let selected = app.selected_user == Some(s.id);
     let (rect, resp) = table.row(ui, pal, selected, ("user", s.id));
+    if resp.hovered() {
+        table.set_hovered_cell_stable_rect(ui.ctx(), rect);
+    }
     table.describe_row(ui, &resp, display, index);
 
     let expanded = app.processes_state.expanded_users.contains(&s.id);

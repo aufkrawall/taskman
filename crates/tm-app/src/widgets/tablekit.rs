@@ -1280,13 +1280,6 @@ impl TmTable {
             egui::Id::new(self.id).with(key),
             Sense::CLICK.union(Sense::hover()),
         );
-        if resp.hovered() {
-            // Rows carry at-pointer tooltips whose content depends on the exact
-            // pointer position within the row, so cursor moves over a row must
-            // keep repainting (the egui-winit pointer-move throttle otherwise
-            // skips moves that stay within one widget).
-            egui_winit::set_pointer_tracking_hint(ui.ctx());
-        }
         ui.ctx()
             .register_accesskit_parent(resp.id, crate::search::content_focus_id(self.id));
         self.current_row.set(Some(resp.id));
@@ -1344,6 +1337,23 @@ impl TmTable {
             );
         }
         (rect, resp)
+    }
+
+    /// Narrow the pointer-move skip region to whichever column cell of
+    /// `row_rect` currently contains the pointer.
+    pub fn set_hovered_cell_stable_rect(&self, ctx: &egui::Context, row_rect: Rect) {
+        let Some(pos) = ctx.pointer_latest_pos() else {
+            return;
+        };
+        let mut hit = None;
+        for col in 0..self.cols.len() {
+            let cell = self.col_rect(col, row_rect);
+            if cell.contains(pos) {
+                hit = Some(cell);
+                break;
+            }
+        }
+        egui_winit::set_pointer_stable_rect(ctx, hit.unwrap_or(Rect::NOTHING));
     }
 
     /// Name and one-based position of a visible row. The row key is deliberately
@@ -1693,6 +1703,87 @@ impl Aggregates {
                 .map_or_else(|| "\u{2014}".to_string(), format::format_pct_hdr),
         ]
     }
+}
+
+/// Narrow `outer` to a sub-rectangle containing `pos` that either equals the
+/// matching sub-rect in `subrects` (if `pos` is inside one) or stays strictly
+/// disjoint from every sub-rect.
+pub fn rect_excluding_subrects_containing(outer: Rect, subrects: &[Rect], pos: Pos2) -> Rect {
+    for &sub in subrects {
+        if sub.contains(pos) {
+            return sub;
+        }
+    }
+    let mut min_x = outer.left();
+    let mut max_x = outer.right();
+    let mut min_y = outer.top();
+    let mut max_y = outer.bottom();
+    for &sub in subrects {
+        if pos.x < sub.left() {
+            max_x = max_x.min(sub.left());
+        } else if pos.x >= sub.right() {
+            min_x = min_x.max(sub.right());
+        } else if pos.y < sub.top() {
+            max_y = max_y.min(sub.top());
+        } else if pos.y >= sub.bottom() {
+            min_y = min_y.max(sub.bottom());
+        }
+    }
+    Rect::from_min_max(Pos2::new(min_x, min_y), Pos2::new(max_x, max_y))
+}
+
+/// Show a tooltip anchored at the pointer position where it first opened
+/// instead of following subsequent pointer moves like `on_hover_text_at_pointer`.
+///
+/// Anchors are keyed on `(resp.id, text_hash)` and invalidated if the tooltip
+/// stops being continuously open, so moving between cells of the same row
+/// re-anchors cleanly at the new cell.
+pub fn hover_text_at_fixed_pointer(
+    resp: egui::Response,
+    text: impl Into<egui::WidgetText>,
+) -> egui::Response {
+    use std::hash::{Hash as _, Hasher as _};
+
+    let widget_text: egui::WidgetText = text.into();
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    widget_text.text().hash(&mut hasher);
+    let tip_hash = hasher.finish();
+    let anchor_key = resp.id.with("tm-fixed-tip-anchor");
+    let pass_nr = resp.ctx.cumulative_pass_nr();
+
+    let mut tooltip = egui::Tooltip::for_enabled(&resp);
+    if tooltip.popup.is_open() {
+        let pointer_pos = resp
+            .ctx
+            .pointer_hover_pos()
+            .or_else(|| resp.ctx.pointer_latest_pos());
+        let stored = resp
+            .ctx
+            .data(|d| d.get_temp::<(u64, Pos2, u64)>(anchor_key));
+        let anchor_pos = match (stored, pointer_pos) {
+            (Some((prev_hash, pos, prev_pass)), _)
+                if prev_hash == tip_hash && prev_pass.saturating_add(1) >= pass_nr =>
+            {
+                Some(pos)
+            }
+            (_, Some(pos)) => Some(pos),
+            (Some((_, pos, _)), None) => Some(pos),
+            (None, None) => None,
+        };
+        if let Some(pos) = anchor_pos {
+            resp.ctx
+                .data_mut(|d| d.insert_temp(anchor_key, (tip_hash, pos, pass_nr)));
+            tooltip.popup = tooltip.popup.at_position(pos);
+            tooltip.show(|ui| {
+                ui.set_max_width(ui.spacing().tooltip_width);
+                ui.add(egui::Label::new(widget_text));
+            });
+        }
+    } else {
+        resp.ctx
+            .data_mut(|d| d.remove_temp::<(u64, Pos2, u64)>(anchor_key));
+    }
+    resp
 }
 
 #[cfg(test)]
@@ -3377,6 +3468,82 @@ mod tests {
             ctx.memory(|m| m.focused()),
             Some(body_id),
             "Escape restores focus to table body"
+        );
+    }
+
+    #[test]
+    fn rect_excluding_subrects_picks_disjoint_strip_around_glyphs() {
+        let outer = Rect::from_min_max(Pos2::new(100.0, 40.0), Pos2::new(190.0, 64.0));
+        let g1 = Rect::from_min_max(Pos2::new(107.0, 41.0), Pos2::new(129.0, 63.0));
+        let g2 = Rect::from_min_max(Pos2::new(129.0, 41.0), Pos2::new(151.0, 63.0));
+        let subs = [g1, g2];
+
+        // Inside glyph 1 -> returns g1.
+        assert_eq!(
+            rect_excluding_subrects_containing(outer, &subs, Pos2::new(115.0, 50.0)),
+            g1
+        );
+        // Right of glyph 2 -> interior is strictly disjoint from both glyphs.
+        let right = rect_excluding_subrects_containing(outer, &subs, Pos2::new(170.0, 50.0));
+        assert!(right.contains(Pos2::new(170.0, 50.0)));
+        assert!(!right.intersect(g1).is_positive() && !right.intersect(g2).is_positive());
+        // Left of glyph 1 -> interior is strictly disjoint from both glyphs.
+        let left = rect_excluding_subrects_containing(outer, &subs, Pos2::new(103.0, 50.0));
+        assert!(left.contains(Pos2::new(103.0, 50.0)));
+        assert!(!left.intersect(g1).is_positive() && !left.intersect(g2).is_positive());
+    }
+
+    #[test]
+    fn hover_text_at_fixed_pointer_anchors_on_open_and_stays_fixed() {
+        let ctx = egui::Context::default();
+        crate::theme::install_visuals(&ctx);
+
+        let run_at = |time: f64, pos: Option<Pos2>, tip: &str| -> Option<Rect> {
+            let events = pos
+                .map(|p| vec![egui::Event::PointerMoved(p)])
+                .unwrap_or_default();
+            let mut out = ctx.run_ui(
+                egui::RawInput {
+                    time: Some(time),
+                    events,
+                    ..Default::default()
+                },
+                |ui| {
+                    let row_rect =
+                        Rect::from_min_size(Pos2::new(0.0, 0.0), egui::vec2(400.0, 24.0));
+                    let resp = ui.interact(
+                        row_rect,
+                        egui::Id::new("fixed-tip-row"),
+                        egui::Sense::click().union(egui::Sense::hover()),
+                    );
+                    let _ = hover_text_at_fixed_pointer(resp, tip);
+                },
+            );
+            out.textures_delta.clear();
+            let tip_id = egui::Tooltip::tooltip_id(egui::Id::new("fixed-tip-row"), 0);
+            ctx.memory(|m| m.area_rect(tip_id))
+        };
+
+        // Enter widget at t=0.0, then stay still past tooltip_delay (0.5s) so it opens at p_open.
+        let p_open = Pos2::new(50.0, 12.0);
+        let _ = run_at(0.0, Some(p_open), "cell A");
+        let _ = run_at(1.0, None, "cell A");
+        let rect1 = run_at(1.05, None, "cell A").expect("tooltip should open after delay");
+
+        // Move within the same cell: tooltip must remain at the original anchor.
+        let p_moved = Pos2::new(120.0, 12.0);
+        let rect2 = run_at(1.10, Some(p_moved), "cell A").expect("tooltip should remain open");
+        assert_eq!(
+            rect1.min, rect2.min,
+            "tooltip must stay fixed while tip is unchanged"
+        );
+
+        // Switch to a different cell tooltip: anchor moves to the new pointer pos.
+        let p_other = Pos2::new(260.0, 12.0);
+        let rect3 = run_at(1.15, Some(p_other), "cell B").expect("new tooltip should open");
+        assert_ne!(
+            rect1.min, rect3.min,
+            "new cell tooltip should re-anchor near pointer"
         );
     }
 }

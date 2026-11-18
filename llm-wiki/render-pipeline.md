@@ -179,7 +179,8 @@ tests cannot cover, and the CPU-cost measurements in the plan need it too.
   - Uniform untextured triangle fast paths (opaque and translucent) with single-branch edge testing.
   - Text blitting with hoisted `linear_u16` LUTs, clamped row slices, and solid-glyph interior bypass.
   - Full-target memset clear path.
+  - 64×64 tile damage tracking (`egui_software::damage`, `Painter::paint_shapes_damaged`, `softbuffer::Buffer::present_with_damage` when `age() == 1` and not restored from hidden), skipping unchanged frames completely and repainting/presenting only dirty tiles on partial updates.
   - Taskman process table caching by reference, avoiding per-frame vector cloning.
   - IconCache O(1) lazy expiration and direct unmultiplied upload.
-  Remaining potential work: SIMD for span fills, damage tracking.
+  Remaining potential work: SIMD for span fills.
 - **Retiring wgpu and glow.** Both are still compiled in as fallbacks.

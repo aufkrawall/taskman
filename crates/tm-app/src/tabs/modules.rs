@@ -1071,6 +1071,9 @@ pub fn show(
                         let origin_dim = matches!(row.activity, ModuleActivity::Idle { .. });
                         let selected = state.selected_base == Some(module.base_address);
                         let (rect, response) = table.row(ui, pal, selected, module.base_address);
+                        if response.hovered() {
+                            table.set_hovered_cell_stable_rect(ui.ctx(), rect);
+                        }
                         table.describe_row(ui, &response, &module.name, index);
                         let name_truncated = table.text_cell(ui, rect, 0, &module.name, pal, false);
                         let base_cell = table.col_rect(1, rect);

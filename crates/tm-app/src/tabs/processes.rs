@@ -1054,7 +1054,14 @@ fn row_ui(
     // Manager draws glyphs here — an orange pause for suspended, a green leaf
     // for efficiency mode — and puts the words in a tooltip; only
     // "not responding" stays spelled out.
-    let status_tip = status_cell(ui, pal, table, rect, row);
+    let (status_tip, status_stable) = status_cell(ui, pal, table, rect, row);
+    if resp.hovered() {
+        if let Some(stable) = status_stable {
+            egui_winit::set_pointer_stable_rect(ui.ctx(), stable);
+        } else {
+            table.set_hovered_cell_stable_rect(ui.ctx(), rect);
+        }
+    }
 
     // Heat cells: intensities were normalized per column across the whole
     // display model during cache build (audit P0.2); here we only paint.
@@ -1135,10 +1142,10 @@ fn row_ui(
     // row's own explanation (e.g. unattributable CPU) applies.
     let fallback_tip = name_tip;
     let resp = match (status_tip, net_tip, row.tooltip.clone(), fallback_tip) {
-        (Some(tip), _, _, _) => resp.on_hover_text_at_pointer(tip),
-        (None, Some(tip), _, _) => resp.on_hover_text_at_pointer(tip),
-        (None, None, Some(tip), _) => resp.on_hover_text_at_pointer(tip),
-        (None, None, None, Some(tip)) => resp.on_hover_text_at_pointer(tip),
+        (Some(tip), _, _, _) => tablekit::hover_text_at_fixed_pointer(resp, tip),
+        (None, Some(tip), _, _) => tablekit::hover_text_at_fixed_pointer(resp, tip),
+        (None, None, Some(tip), _) => tablekit::hover_text_at_fixed_pointer(resp, tip),
+        (None, None, None, Some(tip)) => tablekit::hover_text_at_fixed_pointer(resp, tip),
         (None, None, None, None) => resp,
     };
     // Pseudo-rows carry no killable process — no action menu at all.
@@ -1212,11 +1219,13 @@ fn status_cell(
     table: &tablekit::TmTable,
     rect: egui::Rect,
     row: &RowData,
-) -> Option<&'static str> {
+) -> (Option<&'static str>, Option<egui::Rect>) {
     let cell = table.col_rect(1, rect);
     let pointer = ui.ctx().pointer_latest_pos();
     let mut x = cell.left() + 10.0;
     let mut hovered = None;
+    let mut glyph_rects = [egui::Rect::NOTHING; 2];
+    let mut glyph_count = 0usize;
     let mut glyph = |icon: Icon, color: egui::Color32, tip: &'static str| {
         let r = egui::Rect::from_center_size(
             egui::Pos2::new(x + 8.0, rect.center().y),
@@ -1224,7 +1233,12 @@ fn status_cell(
         );
         if cell.contains(r.right_center()) {
             crate::icons::draw_at(ui, r, icon, color);
-            if pointer.is_some_and(|p| r.expand(3.0).contains(p)) {
+            let hit = r.expand(3.0);
+            if glyph_count < glyph_rects.len() {
+                glyph_rects[glyph_count] = hit;
+                glyph_count += 1;
+            }
+            if pointer.is_some_and(|p| hit.contains(p)) {
                 hovered = Some(tip);
             }
         }
@@ -1246,7 +1260,10 @@ fn status_cell(
             pal.text,
         );
     }
-    hovered
+    let stable = pointer.filter(|p| cell.contains(*p)).map(|p| {
+        tablekit::rect_excluding_subrects_containing(cell, &glyph_rects[..glyph_count], p)
+    });
+    (hovered, stable)
 }
 
 fn context_menu(app: &mut TaskManApp, ui: &mut egui::Ui, row: &RowData) {

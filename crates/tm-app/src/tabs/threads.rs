@@ -808,6 +808,9 @@ pub fn show(
                 let dim = matches!(view.row.activity, Activity::Idle { .. });
                 let selected = state.selected == Some(thread.tid);
                 let (rect, response) = table.row(ui, pal, selected, ("thread", thread.tid));
+                if response.hovered() {
+                    table.set_hovered_cell_stable_rect(ui.ctx(), rect);
+                }
                 table.describe_row(ui, &response, &thread.tid.to_string(), index);
                 inspector::num_cell(ui, table, rect, 0, &thread.tid.to_string(), pal, dim);
                 inspector::num_cell(ui, table, rect, 1, &view.cpu, pal, dim);

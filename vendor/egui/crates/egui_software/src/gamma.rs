@@ -95,6 +95,16 @@ impl TextGamma {
         (self.gamma - gamma).abs() < 1e-4 && (self.contrast - contrast).abs() < 1e-4
     }
 
+    #[inline]
+    pub fn gamma(&self) -> f32 {
+        self.gamma
+    }
+
+    #[inline]
+    pub fn contrast(&self) -> f32 {
+        self.contrast
+    }
+
     /// Pre-look up `to_linear[v]` as a `u32`.
     #[inline(always)]
     pub fn linear_u16(&self, v: u8) -> u32 {

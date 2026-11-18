@@ -492,6 +492,32 @@ pub struct TaskManApp {
     taskbar_monitor: Arc<tm_platform::taskbar_monitor::TaskbarMonitorHandle>,
     taskbar_config_applied: Option<tm_platform::taskbar_monitor::Config>,
     last_taskbar_interval_active: bool,
+    /// Last viewport outer/inner rects observed in `ui`, used to refresh the
+    /// taskbar monitor when our own window moves or resizes (since own-process
+    /// windows skip `EVENT_OBJECT_LOCATIONCHANGE` hooks).
+    last_viewport_rects: Option<(Option<egui::Rect>, Option<egui::Rect>)>,
+    /// Input/frame diagnostics enabled via `TASKMAN_INPUT_STATS=1`.
+    input_stats: InputStatsRecorder,
+    accesskit_logged: bool,
+}
+
+struct InputStatsRecorder {
+    enabled: bool,
+    window_start: std::time::Instant,
+    causes: HashMap<(&'static str, u32), u32>,
+}
+
+impl InputStatsRecorder {
+    fn from_env() -> Self {
+        let enabled = std::env::var("TASKMAN_INPUT_STATS")
+            .ok()
+            .is_some_and(|v| !v.is_empty() && v != "0");
+        Self {
+            enabled,
+            window_start: std::time::Instant::now(),
+            causes: HashMap::new(),
+        }
+    }
 }
 
 impl TaskManApp {
@@ -586,6 +612,7 @@ impl TaskManApp {
 
         // Frame-rate diagnostics: TASKMAN_FPS_PROBE=1 forces a continuous
         // frame stream and overlays/logs the achieved rate vs display Hz.
+        let input_stats = InputStatsRecorder::from_env();
         let fps_probe = std::env::var("TASKMAN_FPS_PROBE")
             .ok()
             .is_some_and(|v| !v.is_empty() && v != "0");
@@ -922,6 +949,9 @@ impl TaskManApp {
             taskbar_monitor,
             taskbar_config_applied: None,
             last_taskbar_interval_active: false,
+            last_viewport_rects: None,
+            input_stats,
+            accesskit_logged: false,
         }
     }
 
@@ -1298,26 +1328,38 @@ impl TaskManApp {
             tm_core::settings::ThemeMode::Light => false,
             tm_core::settings::ThemeMode::System => ctx.theme() == egui::Theme::Dark,
         };
+        let open_label = i18n::tr(K::TrayOpen);
+        let settings_label = i18n::tr(K::Settings);
+        let exit_label = i18n::tr(K::TrayExit);
+        if self.taskbar_config_applied.as_ref().is_some_and(|applied| {
+            applied.matches_settings(
+                &self.shared.settings,
+                open_label,
+                settings_label,
+                exit_label,
+                menu_dark,
+            )
+        }) {
+            return;
+        }
         let cfg = tm_platform::taskbar_monitor::Config::from_settings(
             &self.shared.settings,
-            i18n::tr(K::TrayOpen).to_string(),
-            i18n::tr(K::Settings).to_string(),
-            i18n::tr(K::TrayExit).to_string(),
+            open_label.to_string(),
+            settings_label.to_string(),
+            exit_label.to_string(),
             menu_dark,
         );
-        if self.taskbar_config_applied.as_ref() != Some(&cfg) {
-            let became_enabled = cfg.enabled
-                && !self
-                    .taskbar_config_applied
-                    .as_ref()
-                    .is_some_and(|c| c.enabled);
-            self.taskbar_config_applied = Some(cfg.clone());
-            if became_enabled && let Some(snap) = self.latest_snapshot() {
-                self.taskbar_monitor
-                    .update_metrics(tm_platform::taskbar_monitor::Metrics::from_snapshot(&snap));
-            }
-            self.taskbar_monitor.set_config(cfg);
+        let became_enabled = cfg.enabled
+            && !self
+                .taskbar_config_applied
+                .as_ref()
+                .is_some_and(|c| c.enabled);
+        self.taskbar_config_applied = Some(cfg.clone());
+        if became_enabled && let Some(snap) = self.latest_snapshot() {
+            self.taskbar_monitor
+                .update_metrics(tm_platform::taskbar_monitor::Metrics::from_snapshot(&snap));
         }
+        self.taskbar_monitor.set_config(cfg);
     }
 
     fn ensure_engine_started(&mut self) {
@@ -1852,6 +1894,13 @@ impl eframe::App for TaskManApp {
 
         // Only animations need timed repaints; everything else is woken by
         // events (engine publication, worker completion, input).
+        if !self.accesskit_logged && ctx.is_accesskit_enabled() {
+            self.accesskit_logged = true;
+            tracing::info!("accesskit tree generation activated");
+        }
+        if self.input_stats.enabled {
+            self.update_input_stats(ctx);
+        }
         if self.fps_probe {
             ctx.request_repaint_after(std::time::Duration::from_millis(1));
         } else if self.active_dump.is_some() {
@@ -1915,10 +1964,10 @@ impl eframe::App for TaskManApp {
         // dialogs opening this frame record focus as it was before the page
         // was drawn disabled (see `app_ui::restore_focus` / `capture_focus`).
         crate::app_ui::begin_frame_focus(&ctx);
-        // Pointer-tracking hint from the previous frame is stale now; the
-        // widgets that paint at the pointer (chart hover readout, at-pointer
-        // tooltips) re-set it below if the pointer is over them this frame.
-        egui_winit::clear_pointer_tracking_hint(&ctx);
+        // Pointer-tracking stable rect from the previous frame is stale now;
+        // widgets that paint sub-widget pointer-dependent visuals re-set it
+        // below if the pointer is over them this frame.
+        egui_winit::clear_pointer_stable_rect(&ctx);
         ctx.data_mut(|data| data.remove_temp::<&'static str>(egui::Id::new("tm-content-present")));
         let first_keyboard_frame = ctx.data(|data| {
             data.get_temp::<bool>(egui::Id::new("tm-keyboard-initialized")) != Some(true)
@@ -2044,20 +2093,25 @@ impl eframe::App for TaskManApp {
             });
         }
 
-        // Track window size for persistence (only while remembering). A
-        // maximized window's inner size is the monitor's, not the restore
-        // geometry — keep the last normal size so a relaunch does not open
-        // fullscreen-sized; maximized state itself persists separately.
-        if self.shared.settings.remember_window {
-            let (size, maximized) = ctx.input(|i| {
-                (
-                    i.viewport().inner_rect.map(|r| r.size()),
-                    i.viewport().maximized.unwrap_or(false),
-                )
-            });
-            if !maximized && let Some(sz) = size {
-                self.shared.settings.window_size = [sz.x, sz.y];
-            }
+        // Track window size for persistence (only while remembering), and notify
+        // the taskbar monitor if our own window moved or resized.
+        let (outer_rect, inner_rect, maximized) = ctx.input(|i| {
+            (
+                i.viewport().outer_rect,
+                i.viewport().inner_rect,
+                i.viewport().maximized.unwrap_or(false),
+            )
+        });
+        let rects = (outer_rect, inner_rect);
+        if self.last_viewport_rects.is_some_and(|prev| prev != rects) {
+            self.taskbar_monitor.request_refresh();
+        }
+        self.last_viewport_rects = Some(rects);
+        if self.shared.settings.remember_window
+            && !maximized
+            && let Some(sz) = inner_rect.map(|r| r.size())
+        {
+            self.shared.settings.window_size = [sz.x, sz.y];
         }
 
         // First frame fully submitted → NOW start sampling. Everything below
@@ -2868,6 +2922,64 @@ impl TaskManApp {
                 });
             });
     }
+
+    /// Input/render diagnostics (`TASKMAN_INPUT_STATS=1`): logs `CursorMoved`
+    /// decisions, software-renderer pass/paint/present timings, tile-damage
+    /// skip ratio, AccessKit activation, and top repaint causes once per second.
+    fn update_input_stats(&mut self, ctx: &egui::Context) {
+        for cause in ctx.repaint_causes() {
+            *self
+                .input_stats
+                .causes
+                .entry((cause.file, cause.line))
+                .or_insert(0) += 1;
+        }
+        let elapsed = self.input_stats.window_start.elapsed();
+        if elapsed < std::time::Duration::from_secs(1) {
+            return;
+        }
+        let secs = elapsed.as_secs_f64().max(0.001);
+        let moves = egui_winit::pointer_move_stats_take();
+        let sw = eframe::software_frame_stats_take();
+
+        let mut top: Vec<((&'static str, u32), u32)> = self.input_stats.causes.drain().collect();
+        top.sort_by_key(|a| std::cmp::Reverse(a.1));
+        top.truncate(4);
+        let causes_summary: Vec<String> = top
+            .into_iter()
+            .map(|((file, line), count)| {
+                let short = file.rsplit(['/', '\\']).next().unwrap_or(file);
+                format!("{short}:{line}({count})")
+            })
+            .collect();
+
+        let frames = sw.frames.max(1) as f64;
+        let to_ms = |ns: u64| ns as f64 / 1_000_000.0;
+        let painted_frames = sw.frames.saturating_sub(sw.skipped_damage).max(1) as f64;
+        tracing::info!(
+            moves_s = format_args!("{:.0}", moves.total_moves as f64 / secs),
+            dup = moves.skipped_dup_pos,
+            same_target = moves.skipped_same_target,
+            stable_veto = moves.vetoed_by_stable_rect,
+            coalesced = moves.skipped_coalesced,
+            repaint_now = moves.repaint_now,
+            trailing = moves.trailing_armed,
+            active = moves.pointer_active_now,
+            fps = format_args!("{:.1}", sw.frames as f64 / secs),
+            skipped_damage = sw.skipped_damage,
+            dirty_tiles = format_args!("{}/{}", sw.dirty_tiles, sw.total_tiles),
+            pass_avg_ms = format_args!("{:.2}", to_ms(sw.pass_ns_sum) / frames),
+            pass_max_ms = format_args!("{:.2}", to_ms(sw.pass_ns_max)),
+            paint_avg_ms = format_args!("{:.2}", to_ms(sw.paint_ns_sum) / frames),
+            paint_max_ms = format_args!("{:.2}", to_ms(sw.paint_ns_max)),
+            present_avg_ms = format_args!("{:.2}", to_ms(sw.present_ns_sum) / painted_frames),
+            present_max_ms = format_args!("{:.2}", to_ms(sw.present_ns_max)),
+            accesskit = ctx.is_accesskit_enabled(),
+            causes = %causes_summary.join(","),
+            "input stats"
+        );
+        self.input_stats.window_start = std::time::Instant::now();
+    }
 }
 
 #[cfg(test)]
@@ -3218,6 +3330,88 @@ mod tests {
         assert_eq!(
             next_region(&ctx, Tab::Performance, true),
             egui::Id::new(("tm-sidebar-tab", "performance"))
+        );
+    }
+
+    #[test]
+    fn hovering_tooltip_while_pointer_moves_does_not_request_immediate_repaint() {
+        let run_moving_hover =
+            |only_when_still: bool| -> (std::time::Duration, Vec<egui::RepaintCause>) {
+                let ctx = egui::Context::default();
+                crate::theme::install_visuals(&ctx);
+                for theme in [egui::Theme::Dark, egui::Theme::Light] {
+                    ctx.style_mut_of(theme, |style| {
+                        style.interaction.show_tooltips_only_when_still = only_when_still;
+                    });
+                }
+                let mut last_delay = std::time::Duration::MAX;
+                for step in 0..9 {
+                    let is_settle = step >= 7;
+                    let events = if is_settle {
+                        Vec::new()
+                    } else {
+                        vec![egui::Event::PointerMoved(egui::pos2(
+                            20.0 + step as f32 * 2.0,
+                            20.0,
+                        ))]
+                    };
+                    let time = match step {
+                        7 => 0.256,
+                        8 => 0.272,
+                        _ => step as f64 * 0.04,
+                    };
+                    let mut out = ctx.run_ui(
+                        egui::RawInput {
+                            // Step past the button's 0.08 s hover animation, then
+                            // run two post-move settle passes so `outstanding`
+                            // drains after `wants_repaint_after`.
+                            time: Some(time),
+                            events,
+                            ..Default::default()
+                        },
+                        |ui| {
+                            let _ = ui
+                                .add(egui::Button::new("Process"))
+                                .on_hover_text("Tooltip text");
+                        },
+                    );
+                    out.textures_delta.clear();
+                    last_delay = out
+                        .viewport_output
+                        .get(&egui::ViewportId::ROOT)
+                        .map_or(std::time::Duration::MAX, |vo| vo.repaint_delay);
+                }
+                (last_delay, ctx.repaint_causes())
+            };
+
+        // Regression check: with `show_tooltips_only_when_still = true`, tooltip.rs
+        // requests an immediate (zero-delay) repaint on every pass while moving.
+        let (old_delay, old_causes) = run_moving_hover(true);
+        assert_eq!(old_delay, std::time::Duration::ZERO);
+        assert!(
+            old_causes.iter().any(|c| c.file.ends_with("tooltip.rs")),
+            "expected tooltip.rs immediate repaint when show_tooltips_only_when_still=true, got {old_causes:?}"
+        );
+
+        // With `theme::install_visuals` (`show_tooltips_only_when_still = false`),
+        // tooltip.rs schedules a delayed repaint after tooltip_delay instead of
+        // spinning at zero delay.
+        let ctx = egui::Context::default();
+        crate::theme::install_visuals(&ctx);
+        assert!(
+            !ctx.style_of(egui::Theme::Dark)
+                .interaction
+                .show_tooltips_only_when_still
+        );
+        assert!(
+            !ctx.style_of(egui::Theme::Light)
+                .interaction
+                .show_tooltips_only_when_still
+        );
+        let (new_delay, new_causes) = run_moving_hover(false);
+        assert!(
+            new_delay > std::time::Duration::from_millis(100),
+            "moving over a tooltipped widget must schedule a delayed repaint, not spin (delay={new_delay:?}, causes={new_causes:?})"
         );
     }
 }

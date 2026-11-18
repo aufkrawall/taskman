@@ -171,6 +171,21 @@ impl TaskbarMonitorHandle {
             .load(std::sync::atomic::Ordering::Acquire)
     }
 
+    /// Ask the taskbar monitor thread to re-probe occlusion/layout (e.g. after
+    /// our own GUI window moves or resizes, since own-process windows are not
+    /// monitored with `EVENT_OBJECT_LOCATIONCHANGE`).
+    pub fn request_refresh(&self) {
+        let enabled = self
+            .shared
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .config
+            .enabled;
+        if enabled {
+            self.post_refresh();
+        }
+    }
+
     fn post_refresh(&self) {
         post_refresh();
     }

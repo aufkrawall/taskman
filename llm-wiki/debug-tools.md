@@ -97,6 +97,11 @@ normal GUI log.
   `WGPU_POWER_PREF=high` is the opt-in discrete/high-performance override.
 - `TASKMAN_FPS_PROBE=1` forces continuous repaint and displays frame rate, but
   it requires launching the GUI and should be reserved for an interactive run.
+- `TASKMAN_INPUT_STATS=1` logs a once-per-second summary of `CursorMoved`
+  decisions (`moves_s`, `dup`, `same_target`, `stable_veto`, `coalesced`,
+  `repaint_now`, `trailing`, `active`), software-renderer frame timings
+  (`pass_avg/max_ms`, `paint_avg/max_ms`, `present_avg/max_ms`), tile-damage
+  skips/counts, AccessKit activation status, and top `ctx.repaint_causes()`.
 
 ## UI/capture diagnostics
 

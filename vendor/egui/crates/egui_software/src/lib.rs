@@ -45,6 +45,7 @@
 //! }
 //! ```
 
+mod damage;
 mod gamma;
 mod raster;
 mod span;
@@ -52,6 +53,7 @@ mod target;
 mod text;
 mod texture;
 
+pub use damage::{DamageStats, TILE_SIZE};
 pub use gamma::TextGamma;
 pub use target::{PixelRect, Target, clip_rect_to_pixels, pack_rgb};
 pub use text::TextBlend;
@@ -113,6 +115,10 @@ pub struct Painter {
     /// occurrence, because a missing texture usually means *every* glyph is missing and
     /// per-primitive logging would bury the actual cause.
     missing_texture_draws: usize,
+    /// Per-tile frame-to-frame damage tracker for partial clears, painting, and presents.
+    damage: damage::DamageTracker,
+    /// Reusable scratch buffer for flattened shape bounds during damage planning.
+    damage_shape_bounds: Vec<PixelRect>,
 }
 
 impl Painter {
@@ -191,7 +197,20 @@ impl Painter {
         pixels_per_point: f32,
         primitives: &[ClippedPrimitive],
     ) {
-        let bounds = target.bounds();
+        self.paint_with_scissor(target, pixels_per_point, primitives, target.bounds());
+    }
+
+    fn paint_with_scissor(
+        &mut self,
+        target: &mut Target<'_>,
+        pixels_per_point: f32,
+        primitives: &[ClippedPrimitive],
+        scissor: PixelRect,
+    ) {
+        let bounds = target.bounds().intersect(scissor);
+        if bounds.is_empty() {
+            return;
+        }
         for ClippedPrimitive {
             clip_rect,
             primitive,
@@ -227,22 +246,97 @@ impl Painter {
         ctx: &ShapeContext,
         shapes: Vec<ClippedShape>,
     ) {
+        let mut flat_shapes = Vec::with_capacity(shapes.len());
+        flatten_clipped_shapes(shapes, &mut flat_shapes);
+        let bounds = target.bounds();
+        self.paint_flat_shapes_in_rects(target, ctx, flat_shapes, None, &[bounds]);
+    }
+
+    /// Clear and repaint only the tiles whose shapes or render state changed
+    /// since the previous call, returning the disjoint dirty rectangles so the
+    /// caller can skip or restrict `present_with_damage`.
+    ///
+    /// Pass `force_full = true` whenever the target buffer does not preserve
+    /// the previously painted frame (e.g. `softbuffer::Buffer::age() != 1`).
+    pub fn paint_shapes_damaged(
+        &mut self,
+        target: &mut Target<'_>,
+        ctx: &ShapeContext,
+        shapes: Vec<ClippedShape>,
+        clear: Color32,
+        force_full: bool,
+    ) -> DamageStats {
+        let mut flat_shapes = Vec::with_capacity(shapes.len());
+        flatten_clipped_shapes(shapes, &mut flat_shapes);
+        let bounds = target.bounds();
+        let clear_bgrx = pack_rgb(clear.r(), clear.g(), clear.b());
+        let key = damage::FrameKey::new(
+            target.width(),
+            target.height(),
+            ctx,
+            clear_bgrx,
+            self.text_mode,
+            self.subpixel,
+            self.gamma.gamma(),
+            self.gamma.contrast(),
+        );
+        let mut shape_bounds = std::mem::take(&mut self.damage_shape_bounds);
+        let stats = self.damage.plan(
+            key,
+            &flat_shapes,
+            ctx,
+            &self.textures,
+            force_full,
+            bounds,
+            &mut shape_bounds,
+        );
+        if !stats.dirty_rects.is_empty() {
+            for &rect in &stats.dirty_rects {
+                target.fill_rect(rect, clear_bgrx);
+            }
+            self.paint_flat_shapes_in_rects(
+                target,
+                ctx,
+                flat_shapes,
+                Some(&shape_bounds),
+                &stats.dirty_rects,
+            );
+        }
+        self.damage_shape_bounds = shape_bounds;
+        stats
+    }
+
+    fn paint_flat_shapes_in_rects(
+        &mut self,
+        target: &mut Target<'_>,
+        ctx: &ShapeContext,
+        flat_shapes: Vec<ClippedShape>,
+        shape_bounds: Option<&[PixelRect]>,
+        dirty_rects: &[PixelRect],
+    ) {
         let mut tess = Self::tessellator(ctx);
 
         if self.text_mode == TextMode::Tessellate {
-            let primitives = tess.tessellate_shapes(shapes);
-            self.paint(target, ctx.pixels_per_point, &primitives);
+            let primitives = tess.tessellate_shapes(flat_shapes);
+            for &dr in dirty_rects {
+                self.paint_with_scissor(target, ctx.pixels_per_point, &primitives, dr);
+            }
             return;
         }
-
-        let mut flat_shapes = Vec::with_capacity(shapes.len());
-        flatten_clipped_shapes(shapes, &mut flat_shapes);
 
         let bounds = target.bounds();
         let mut batch: Vec<ClippedShape> = Vec::new();
         let mut primitives: Vec<ClippedPrimitive> = Vec::new();
 
-        for clipped in flat_shapes {
+        for (idx, clipped) in flat_shapes.into_iter().enumerate() {
+            if let Some(sb) = shape_bounds
+                && !dirty_rects
+                    .iter()
+                    .any(|dr| !sb[idx].intersect(*dr).is_empty())
+            {
+                continue;
+            }
+
             // Only unrotated text can be blitted; a rotated `TextShape` is not an
             // axis-aligned quad, so it goes through the tessellator like any other
             // geometry and comes out grayscale.
@@ -269,7 +363,9 @@ impl Painter {
                 for shape in batch.drain(..) {
                     tess.tessellate_clipped_shape(shape, &mut primitives);
                 }
-                self.paint(target, ctx.pixels_per_point, &primitives);
+                for &dr in dirty_rects {
+                    self.paint_with_scissor(target, ctx.pixels_per_point, &primitives, dr);
+                }
                 primitives.clear();
             }
 
@@ -279,21 +375,33 @@ impl Painter {
                 let Shape::Rect(r) = &clipped.shape else {
                     unreachable!("fast_rect only matches Shape::Rect")
                 };
-                span::fill(target, clip, rect, r.fill);
+                for &dr in dirty_rects {
+                    let scissored = clip.intersect(dr);
+                    if !scissored.is_empty() {
+                        span::fill(target, scissored, rect, r.fill);
+                    }
+                }
                 continue;
             }
 
             let Shape::Text(text) = &clipped.shape else {
                 unreachable!("checked above")
             };
-            self.paint_text(target, clip, clipped.clip_rect, ctx, text, &mut tess);
+            for &dr in dirty_rects {
+                let scissored = clip.intersect(dr);
+                if !scissored.is_empty() {
+                    self.paint_text(target, scissored, clipped.clip_rect, ctx, text, &mut tess);
+                }
+            }
         }
 
         if !batch.is_empty() {
             for shape in batch.drain(..) {
                 tess.tessellate_clipped_shape(shape, &mut primitives);
             }
-            self.paint(target, ctx.pixels_per_point, &primitives);
+            for &dr in dirty_rects {
+                self.paint_with_scissor(target, ctx.pixels_per_point, &primitives, dr);
+            }
         }
     }
 
@@ -474,7 +582,7 @@ impl Painter {
                 });
             }
             let primitives = tess.tessellate_shapes(shapes);
-            self.paint(target, ppp, &primitives);
+            self.paint_with_scissor(target, ppp, &primitives, clip);
         }
     }
 

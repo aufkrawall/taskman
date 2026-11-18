@@ -3759,6 +3759,12 @@ impl Context {
     pub fn disable_accesskit(&self) {
         self.write(|ctx| ctx.is_accesskit_enabled = false);
     }
+
+    /// TASKMAN-FORK: whether AccessKit tree generation is currently enabled.
+    #[must_use]
+    pub fn is_accesskit_enabled(&self) -> bool {
+        self.read(|ctx| ctx.is_accesskit_enabled)
+    }
 }
 
 /// ## Image loading

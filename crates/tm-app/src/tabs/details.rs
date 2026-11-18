@@ -1351,9 +1351,12 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
                     (None, Some(cmd)) => Some(cmd.to_string()),
                     (None, None) => None,
                 };
+                if resp.hovered() {
+                    table.set_hovered_cell_stable_rect(ui.ctx(), rect);
+                }
                 let resp = match (unknown_tip, fallback_tip) {
-                    (Some(tip), _) => resp.on_hover_text_at_pointer(tip),
-                    (None, Some(tip)) => resp.on_hover_text_at_pointer(tip),
+                    (Some(tip), _) => tablekit::hover_text_at_fixed_pointer(resp, tip),
+                    (None, Some(tip)) => tablekit::hover_text_at_fixed_pointer(resp, tip),
                     (None, None) => resp,
                 };
 

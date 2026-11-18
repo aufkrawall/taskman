@@ -9,7 +9,7 @@ use super::window::WindowCtx;
 use super::zorder::repair_live_taskbar_order;
 use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
 use windows::Win32::Graphics::Dwm::{DWMWA_CLOAKED, DwmGetWindowAttribute};
-use windows::Win32::System::Threading::GetCurrentThreadId;
+use windows::Win32::System::Threading::{GetCurrentProcessId, GetCurrentThreadId};
 use windows::Win32::UI::Accessibility::{HWINEVENTHOOK, SetWinEventHook, UnhookWinEvent};
 use windows::Win32::UI::WindowsAndMessaging::{
     EVENT_OBJECT_CLOAKED, EVENT_OBJECT_DESTROY, EVENT_OBJECT_HIDE, EVENT_OBJECT_LOCATIONCHANGE,
@@ -200,13 +200,15 @@ impl WindowCtx {
     pub(super) fn sync_foreground_hook(&mut self) {
         let fg = unsafe { GetForegroundWindow() };
         LIVE_FG_HWND.store(fg.0 as isize, std::sync::atomic::Ordering::Release);
+        let mut fg_pid = 0u32;
         let tid = if fg.0.is_null() {
             0
         } else {
-            unsafe { GetWindowThreadProcessId(fg, None) }
+            unsafe { GetWindowThreadProcessId(fg, Some(&mut fg_pid)) }
         };
         let self_tid = unsafe { GetCurrentThreadId() };
-        let target_tid = if tid != 0 && tid != self_tid { tid } else { 0 };
+        let self_pid = unsafe { GetCurrentProcessId() };
+        let target_tid = foreground_hook_target_tid(tid, fg_pid, self_tid, self_pid);
         if target_tid == self.tracked_fg_tid {
             return;
         }
@@ -315,6 +317,19 @@ impl WindowCtx {
                 self.topmost_hooks.push((tid, hook));
             }
         }
+    }
+}
+
+pub(super) fn foreground_hook_target_tid(
+    fg_tid: u32,
+    fg_pid: u32,
+    self_tid: u32,
+    self_pid: u32,
+) -> u32 {
+    if fg_tid != 0 && fg_tid != self_tid && fg_pid != self_pid {
+        fg_tid
+    } else {
+        0
     }
 }
 
@@ -1351,5 +1366,17 @@ mod tests {
         LIVE_HWND.store(0, Ordering::Release);
         assert!(cloaked, "a DWM cloak of the widget itself must be observed");
         assert!(uncloaked, "the matching uncloak must be observed");
+    }
+
+    #[test]
+    fn foreground_hook_skips_own_process_and_own_thread() {
+        assert_eq!(foreground_hook_target_tid(0, 100, 10, 200), 0);
+        assert_eq!(foreground_hook_target_tid(10, 100, 10, 200), 0);
+        assert_eq!(
+            foreground_hook_target_tid(42, 200, 10, 200),
+            0,
+            "own-process foreground window (UI thread) must not receive LOCATIONCHANGE hook"
+        );
+        assert_eq!(foreground_hook_target_tid(42, 100, 10, 200), 42);
     }
 }
