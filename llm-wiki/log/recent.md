@@ -1,3 +1,33 @@
+## 2026-11-17 - mouse movement over the window no longer repaints per move: pointer-move throttle in egui-winit (fork #10)
+
+- Follow-up to the raw-input fix (#9): movement *inside* the window still ran a full frame
+  (logic + whole UI tree + tessellation + paint) per `CursorMoved`, because upstream
+  `egui-winit` returns `repaint: true` for every move; a probe measured ~0.96 cores at
+  1 kHz. `WM_MOUSEMOVE` is delivered to the window under the cursor regardless of focus,
+  which is why the cost appeared focused or not, and over empty areas like the lower
+  sidebar too — nothing widget-specific was involved.
+- Fix (fork divergence #10, `vendor/egui/crates/egui-winit/src/lib.rs`): a per-window
+  `PointerMoveThrottle` now decides the `CursorMoved` repaint. Moves whose position in
+  points is unchanged (sub-point jitter at high report rates) are skipped; the first move
+  repaints immediately; further moves within one display-refresh period (monitor refresh
+  rate, fallback 60 Hz, floor 2 ms) arm exactly one trailing repaint via
+  `Context::request_repaint_after_for`, which rides the existing
+  `UserEvent::RequestRepaint` -> `EventResult::RepaintAt` plumbing, so the final pointer
+  position is always painted. Moves while any pointer button is down or egui is using the
+  pointer (drags, selection) always repaint immediately. Hover visuals therefore update at
+  most once per display period instead of per mouse packet.
+- Deliberately not done: skipping repaints when the hovered widget is unchanged. The chart
+  hover readout (`widgets/chart.rs`) and the command-line/process tooltips are anchored at
+  the pointer and change continuously *within* the same widget, so a hover-rect check would
+  freeze them; the refresh-rate cap keeps them smooth.
+- Tests: `pointer_move_throttle_tests` in `egui-winit/src/lib.rs` pin the decision table
+  (first move immediate, dedupe, single armed trailing repaint, cadence restart, active
+  pointer bypass) — 6 tests, `cargo test -p egui-winit` in `vendor/egui` green, plus
+  `cargo fmt --check` and `clippy -D warnings` on the crate. No test moves a real cursor.
+- Not yet measured live on the running app (GUI behaviour is not verifiable headlessly);
+  the SendInput probe harness from the #9 entry plus `TASKMAN_FPS_PROBE=1` is the intended
+  before/after measurement.
+
 ## 2026-11-17 - focused-window mouse movement burned CPU: raw input unregistered in the egui fork
 
 - User report: with the TaskMan window open and focused, quickly moving the mouse raised TaskMan's CPU even when the movement was entirely outside the window; clicking another window (focus loss, window still visible) made the same movement cheap.

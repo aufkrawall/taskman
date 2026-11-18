@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Fixed
+
+- **Mouse movement inside the TaskMan window no longer drives a full repaint per mouse packet:** moving the cursor anywhere over the window (focused or not — even over empty areas like the lower sidebar) used to run a complete UI frame for every `WM_MOUSEMOVE`, because the vendored egui fork repainted unconditionally on each cursor move. Cursor-move repaints are now deduplicated by position and coalesced to one frame per display refresh rate, with a guaranteed trailing repaint so the final hover position is always shown; hover highlights, pointer-anchored tooltips and chart readouts stay smooth, and drags/clicks still repaint immediately. Implemented in the egui fork's `egui-winit` (divergence #10).
+
 ## 0.1.30 - 2026-11-17
 
 ### New

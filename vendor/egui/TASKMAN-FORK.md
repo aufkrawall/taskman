@@ -19,8 +19,8 @@ Both are served by one new backend, so they are one change. The inventory below 
 carries later, unrelated additions: the keyboard Menu/Application key (#5) and modal
 windows plus public accesskit reparenting (#6), both of which the keyboard and
 screen-reader model in `llm-wiki/current.md` depends on, a text-cursor blink restart
-(#7), text-selection preservation on secondary click (#8), and not registering for raw
-device input (#9).
+(#7), text-selection preservation on secondary click (#8), not registering for raw
+device input (#9), and coalescing pointer-move repaints to the display refresh rate (#10).
 
 The full design, the blend math, and the verification plan live in
 `llm-wiki/render-pipeline.md` in the parent repo. This file is only the *inventory* of what
@@ -224,6 +224,14 @@ One line through winit's public API; on macOS/Wayland/Android it is a no-op and 
 **Behaviour change.** With device events off, eframe never emits `Event::MouseMoved` on Windows and X11, so `PointerState::motion()` stays `None` and `Response::drag_motion()` (documented as raw, unaccelerated, unclamped movement) falls back to the screen-clamped `pointer.delta()`. macOS and Wayland still deliver `DeviceEvent::MouseMotion`, so raw motion remains there. taskman reads neither, so nothing regresses here. The call is unconditional, so it is *not* upstreamable as is — upstream would need an opt-out (a `NativeOptions` field defaulting to today's behaviour).
 
 **Coverage.** Pinned on Windows by `native::run::tests::event_loop_creation_unregisters_raw_mouse_and_keyboard_input`, which reads `GetRegisteredRawInputDevices` after `create_event_loop`. `eframe::create_native` with a caller-supplied event loop does not go through `create_event_loop` and is not covered; taskman uses `run_native`.
+
+### 10. `egui-winit`: coalesce pointer-move repaints
+
+| File | Change | Why |
+| --- | --- | --- |
+| `crates/egui-winit/src/lib.rs` | the `WindowEvent::CursorMoved` arm no longer returns `repaint: true` unconditionally; a `PointerMoveThrottle` dedupes unchanged positions and coalesces moves to one frame per display refresh, arming one trailing repaint via `Context::request_repaint_after_for` so the final position is always painted. Moves while a pointer button is down or egui is using the pointer always repaint immediately | Upstream runs a full UI pass (layout, tessellation, paint) per `CursorMoved`, so a mouse reporting at up to 1 kHz drives up to 1 kHz frames; Windows Task Manager only repaints when a hover actually changes. Measured on Windows 11 at 1 kHz movement over the window: ~0.96 cores in a minimal eframe app. With the throttle, hover-driven frames are capped at the monitor refresh rate (fallback 60 Hz, floor 2 ms) and stationary/sub-point-jitter cursors repaint never |
+
+The trailing repaint goes through the existing `UserEvent::RequestRepaint` → `EventResult::RepaintAt` plumbing, so no `eframe` change is needed. The throttle lives per `egui_winit::State` (i.e. per window/viewport). **Behaviour change:** hover highlight, pointer-anchored tooltips and cursor-icon updates now refresh at most once per display period instead of per mouse packet — imperceptible at ≥60 Hz, and drags/clicks are unaffected (they always repaint immediately). Not upstreamable as is — upstream would want the cadence configurable. **Coverage:** `pointer_move_throttle_tests` in `egui-winit/src/lib.rs` pin the decision table (first move immediate, dedupe, single armed trailing repaint, cadence restart after the interval, active-pointer bypass).
 
 ## Rebase runbook
 

@@ -77,6 +77,88 @@ pub struct EventResponse {
 
 // ----------------------------------------------------------------------------
 
+/// TASKMAN-FORK (#10): repaint throttle for `CursorMoved` events.
+///
+/// Upstream repaints on every pointer move, so a mouse reporting at up to 1 kHz
+/// drives a full UI pass (layout, tessellation, paint) per report. Hover
+/// visuals only need to update at the display refresh rate, so moves that
+/// arrive faster than `min_interval` are coalesced: the first move repaints
+/// immediately, later moves within the window arm one trailing repaint (via
+/// `Context::request_repaint_after_for`) so the final pointer position is
+/// always painted. Moves whose position in points did not change at all
+/// (sub-point jitter) are skipped entirely, and moves while a pointer button
+/// is down or egui is using the pointer (drags, text selection) always
+/// repaint immediately.
+#[derive(Default)]
+struct PointerMoveThrottle {
+    /// When the last immediate pointer-move repaint was requested.
+    last_move_repaint: Option<web_time::Instant>,
+    /// Scheduled time of the armed trailing repaint, if any.
+    trailing_at: Option<web_time::Instant>,
+}
+
+/// What to do about the repaint for a `CursorMoved` event.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MoveRepaint {
+    /// Request a repaint now.
+    Now,
+    /// Do not repaint now; arm a repaint after this delay (once per window).
+    After(web_time::Duration),
+    /// Do not repaint at all.
+    Skip,
+}
+
+impl PointerMoveThrottle {
+    fn plan(
+        &mut self,
+        now: web_time::Instant,
+        pos_changed: bool,
+        min_interval: web_time::Duration,
+        pointer_active: bool,
+    ) -> MoveRepaint {
+        if pointer_active {
+            self.last_move_repaint = Some(now);
+            self.trailing_at = None;
+            return MoveRepaint::Now;
+        }
+        if !pos_changed {
+            return MoveRepaint::Skip;
+        }
+        if let Some(trailing) = self.trailing_at
+            && now < trailing
+        {
+            // A trailing repaint is already armed and will paint this position.
+            return MoveRepaint::Skip;
+        }
+        if let Some(last) = self.last_move_repaint
+            && let Some(next_allowed) = last.checked_add(min_interval)
+            && now < next_allowed
+        {
+            self.trailing_at = Some(next_allowed);
+            return MoveRepaint::After(next_allowed - now);
+        }
+        self.last_move_repaint = Some(now);
+        self.trailing_at = None;
+        MoveRepaint::Now
+    }
+}
+
+/// TASKMAN-FORK (#10): minimum interval between pointer-move-triggered
+/// repaints — one display refresh period, falling back to 60 Hz and clamped
+/// to at least 2 ms.
+fn pointer_move_min_interval(window: &Window) -> web_time::Duration {
+    let from_refresh = window
+        .current_monitor()
+        .and_then(|monitor| monitor.refresh_rate_millihertz())
+        .filter(|millihertz| *millihertz > 0)
+        .map(|millihertz| web_time::Duration::from_secs_f64(1000.0 / f64::from(millihertz)));
+    from_refresh
+        .unwrap_or_else(|| web_time::Duration::from_secs_f64(1.0 / 60.0))
+        .max(web_time::Duration::from_millis(2))
+}
+
+// ----------------------------------------------------------------------------
+
 /// Handles the integration between egui and a winit Window.
 ///
 /// Instantiate one of these per viewport/window.
@@ -96,6 +178,8 @@ pub struct State {
 
     pointer_pos_in_points: Option<egui::Pos2>,
     any_pointer_button_down: bool,
+    /// TASKMAN-FORK (#10): coalesces pointer-move repaints, see the struct.
+    pointer_move_throttle: PointerMoveThrottle,
     current_cursor_icon: Option<egui::CursorIcon>,
 
     /// Cached `CustomCursor` for the last RGBA bitmap pushed through
@@ -160,6 +244,7 @@ impl State {
             modifiers: egui::Modifiers::default(),
             pointer_pos_in_points: None,
             any_pointer_button_down: false,
+            pointer_move_throttle: PointerMoveThrottle::default(),
             current_cursor_icon: None,
             current_custom_cursor: None,
 
@@ -350,9 +435,34 @@ impl State {
                 }
             }
             WindowEvent::CursorMoved { position, .. } => {
+                // TASKMAN-FORK (#10): upstream repaints on every move; we
+                // dedupe unchanged positions and coalesce moves to one frame
+                // per display refresh, with a guaranteed trailing repaint.
+                let pixels_per_point = pixels_per_point(&self.egui_ctx, window);
+                let pos_in_points = egui::pos2(
+                    position.x as f32 / pixels_per_point,
+                    position.y as f32 / pixels_per_point,
+                );
+                let pos_changed = self.pointer_pos_in_points != Some(pos_in_points);
+                let pointer_active =
+                    self.any_pointer_button_down || self.egui_ctx.egui_is_using_pointer();
+                let repaint = match self.pointer_move_throttle.plan(
+                    web_time::Instant::now(),
+                    pos_changed,
+                    pointer_move_min_interval(window),
+                    pointer_active,
+                ) {
+                    MoveRepaint::Now => true,
+                    MoveRepaint::After(delay) => {
+                        self.egui_ctx
+                            .request_repaint_after_for(delay, self.viewport_id);
+                        false
+                    }
+                    MoveRepaint::Skip => false,
+                };
                 self.on_cursor_moved(window, *position);
                 EventResponse {
-                    repaint: true,
+                    repaint,
                     consumed: self.egui_ctx.egui_is_using_pointer(),
                 }
             }
@@ -2310,5 +2420,111 @@ pub fn short_window_event_description(event: &winit::event::WindowEvent) -> &'st
         WindowEvent::ThemeChanged { .. } => "WindowEvent::ThemeChanged",
         WindowEvent::Occluded { .. } => "WindowEvent::Occluded",
         WindowEvent::PanGesture { .. } => "WindowEvent::PanGesture",
+    }
+}
+
+// TASKMAN-FORK (#10): tests for the pointer-move repaint throttle.
+#[cfg(test)]
+mod pointer_move_throttle_tests {
+    use super::*;
+
+    const INTERVAL: web_time::Duration = web_time::Duration::from_millis(16);
+
+    fn at(now: web_time::Instant, ms: u64) -> web_time::Instant {
+        now.checked_add(web_time::Duration::from_millis(ms))
+            .unwrap()
+    }
+
+    #[test]
+    fn first_move_repaints_now() {
+        let mut t = PointerMoveThrottle::default();
+        let now = web_time::Instant::now();
+        assert_eq!(
+            t.plan(now, true, INTERVAL, false),
+            MoveRepaint::Now,
+            "the first move must repaint immediately"
+        );
+    }
+
+    #[test]
+    fn unchanged_position_is_skipped() {
+        let mut t = PointerMoveThrottle::default();
+        let now = web_time::Instant::now();
+        assert_eq!(t.plan(now, true, INTERVAL, false), MoveRepaint::Now);
+        // Sub-point jitter: same position in points, even right after a repaint.
+        assert_eq!(t.plan(now, false, INTERVAL, false), MoveRepaint::Skip);
+        assert_eq!(
+            t.plan(at(now, 1), false, INTERVAL, false),
+            MoveRepaint::Skip
+        );
+    }
+
+    #[test]
+    fn moves_within_interval_arm_one_trailing_repaint() {
+        let mut t = PointerMoveThrottle::default();
+        let now = web_time::Instant::now();
+        assert_eq!(t.plan(now, true, INTERVAL, false), MoveRepaint::Now);
+        // 4 ms later: no immediate repaint, but a trailing one 12 ms out.
+        assert_eq!(
+            t.plan(at(now, 4), true, INTERVAL, false),
+            MoveRepaint::After(web_time::Duration::from_millis(12))
+        );
+        // Further moves within the window do not arm another one.
+        assert_eq!(t.plan(at(now, 8), true, INTERVAL, false), MoveRepaint::Skip);
+        assert_eq!(
+            t.plan(at(now, 12), true, INTERVAL, false),
+            MoveRepaint::Skip
+        );
+        // At the armed time the cadence continues: the next move repaints now.
+        assert_eq!(t.plan(at(now, 16), true, INTERVAL, false), MoveRepaint::Now);
+        assert_eq!(
+            t.plan(at(now, 20), true, INTERVAL, false),
+            MoveRepaint::After(web_time::Duration::from_millis(12))
+        );
+    }
+
+    #[test]
+    fn move_after_interval_repaints_now() {
+        let mut t = PointerMoveThrottle::default();
+        let now = web_time::Instant::now();
+        assert_eq!(t.plan(now, true, INTERVAL, false), MoveRepaint::Now);
+        assert_eq!(
+            t.plan(at(now, 100), true, INTERVAL, false),
+            MoveRepaint::Now
+        );
+    }
+
+    #[test]
+    fn active_pointer_always_repaints_now_and_resets_cadence() {
+        let mut t = PointerMoveThrottle::default();
+        let now = web_time::Instant::now();
+        assert_eq!(t.plan(now, true, INTERVAL, false), MoveRepaint::Now);
+        // A drag 4 ms later must not be throttled.
+        assert_eq!(
+            t.plan(at(now, 4), true, INTERVAL, true),
+            MoveRepaint::Now,
+            "drags and pressed buttons must repaint immediately"
+        );
+        // The cadence restarts from the drag, not from the first move.
+        assert_eq!(
+            t.plan(at(now, 8), true, INTERVAL, false),
+            MoveRepaint::After(web_time::Duration::from_millis(12))
+        );
+        // Unchanged position while active still repaints (button state may matter).
+        assert_eq!(t.plan(at(now, 9), false, INTERVAL, true), MoveRepaint::Now);
+    }
+
+    #[test]
+    fn unchanged_position_never_arms_a_trailing_repaint() {
+        let mut t = PointerMoveThrottle::default();
+        let now = web_time::Instant::now();
+        // Even with no repaint ever requested, a stationary cursor is skipped.
+        assert_eq!(t.plan(now, false, INTERVAL, false), MoveRepaint::Skip);
+        assert_eq!(
+            t.plan(at(now, 1), false, INTERVAL, false),
+            MoveRepaint::Skip
+        );
+        // The first real move still repaints immediately.
+        assert_eq!(t.plan(at(now, 2), true, INTERVAL, false), MoveRepaint::Now);
     }
 }

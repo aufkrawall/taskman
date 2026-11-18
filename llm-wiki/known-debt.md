@@ -399,15 +399,19 @@ Found by the 2026-10-21 row-vs-total audit and deliberately not changed:
   per-process network; traffic to the machine's own adapter address also
   stays inside the stack but is still counted.
 
-## Mouse movement over the focused window still repaints per move (2026-11-17)
+## Mouse movement over the window repaints per move — FIXED 2026-11-17 (fork divergence #10)
 
 - The 2026-11-17 raw-input fix (fork divergence #9) removed the cost of mouse movement
-  *outside* a focused TaskMan window. Movement *over* the window is unchanged: a minimal
-  eframe probe measured ~0.96 cores at 1 kHz movement, which the investigation attributed
-  to egui's normal per-`CursorMoved` repaint (`llm-wiki/log/recent.md`, 2026-11-17).
-  Not measured on the live TaskMan UI and not investigated further; a fix would be in the
-  repaint scheduling (for example coalescing pointer-move repaints, or skipping them when no
-  hover state changes) and is unverified.
+  *outside* a focused TaskMan window. Movement *over* the window used to repaint per
+  `CursorMoved`: a minimal eframe probe measured ~0.96 cores at 1 kHz movement
+  (`llm-wiki/log/recent.md`, 2026-11-17).
+- Fixed by coalescing pointer-move repaints in `egui-winit` (fork divergence #10): moves are
+  deduped by position and throttled to one frame per display refresh, with one trailing
+  repaint armed so the final hover position is always painted; drags and pressed buttons
+  still repaint immediately. Hover-unchanged skipping was considered and rejected: several
+  readouts (chart hover box, command-line tooltips) are anchored at the pointer and change
+  within the same widget, so they need per-move frames. Live before/after measurement with
+  synthetic mouse movement is still open — see `llm-wiki/log/recent.md`.
 
 ## Falsified findings — do not re-raise
 
