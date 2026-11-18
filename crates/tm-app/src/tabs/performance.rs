@@ -2875,20 +2875,34 @@ fn gpu_page(app: &mut TaskManApp, ui: &mut egui::Ui, pal: &Palette, entry: &Reso
                 if !gpu.driver_version.is_empty() {
                     kv_row(ui, pal, i18n::tr(K::KvDriverVersion), &gpu.driver_version);
                 }
-                if gpu.mem_total_bytes > 0 {
+                if let Some(date_s) = gpu.driver_date_epoch_s {
                     kv_row(
                         ui,
                         pal,
-                        i18n::tr(K::KvDedicatedCapacity),
-                        &format::format_bytes_loc(gpu.mem_total_bytes),
+                        i18n::tr(K::KvDriverDate),
+                        &format::format_date(date_s),
                     );
                 }
-                if gpu.shared_total_bytes > 0 {
+                if !gpu.directx_version.is_empty() {
+                    kv_row(ui, pal, i18n::tr(K::KvDirectXVersion), &gpu.directx_version);
+                }
+                if let Some((bus, dev, func)) = gpu.pci_location {
                     kv_row(
                         ui,
                         pal,
-                        i18n::tr(K::KvSharedCapacity),
-                        &format::format_bytes_loc(gpu.shared_total_bytes),
+                        i18n::tr(K::KvPhysicalLocation),
+                        &i18n::trf(
+                            K::PciLocationFmt,
+                            &[&bus.to_string(), &dev.to_string(), &func.to_string()],
+                        ),
+                    );
+                }
+                if gpu.hardware_reserved_bytes > 0 {
+                    kv_row(
+                        ui,
+                        pal,
+                        i18n::tr(K::KvHwReserved),
+                        &format::format_bytes_loc(gpu.hardware_reserved_bytes),
                     );
                 }
                 // Surface any active engine that is not already plotted in the

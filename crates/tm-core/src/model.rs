@@ -368,7 +368,7 @@ impl DiskGroupLoad {
 
 /// Adapter LUID as exposed by DXGI/PDH — the join key between static adapter
 /// discovery and per-engine counter instances.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 pub struct AdapterLuid {
     pub high: i32,
     pub low: u32,
@@ -380,6 +380,12 @@ pub struct GpuInfo {
     pub id: usize,
     pub name: String,
     pub driver_version: String,
+    /// Driver release date as UTC Unix epoch seconds (start of day), when known.
+    pub driver_date_epoch_s: Option<i64>,
+    /// Supported DirectX feature level summary, e.g. `"12 (FL 12.2)"` (empty = unknown).
+    pub directx_version: String,
+    /// Physical PCI location `(bus, device, function)`, when known.
+    pub pci_location: Option<(u32, u32, u32)>,
     pub util_pct: f32,
     pub mem_used_bytes: u64,
     pub mem_total_bytes: u64,
@@ -389,6 +395,8 @@ pub struct GpuInfo {
     pub shared_used_bytes: u64,
     /// Shared/system-memory capacity exposed to this adapter (0 = unknown).
     pub shared_total_bytes: u64,
+    /// Dedicated/hardware-reserved GPU memory not available to applications (0 = unknown).
+    pub hardware_reserved_bytes: u64,
     pub temperature_c: Option<f32>,
     /// LUID of this adapter when known; PDH engine records join on this.
     pub luid: Option<AdapterLuid>,

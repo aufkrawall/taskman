@@ -1012,13 +1012,16 @@ keys! {
         "Dedizierter Speicher (Kapazität):",
         "Dedicated memory (capacity):"
     ],
-    KvSharedCapacity => [
-        "Gemeinsamer Speicher (Kapazität):",
-        "Shared memory (capacity):"
-    ],
     KvDedicatedMem => ["Dedizierter Speicher:", "Dedicated memory:"],
     KvTemperature => ["Temperatur:", "Temperature:"],
     KvDriverVersion => ["Treiberversion:", "Driver version:"],
+    KvDriverDate => ["Treiberdatum:", "Driver date:"],
+    KvDirectXVersion => ["DirectX-Version:", "DirectX version:"],
+    KvPhysicalLocation => ["Physischer Standort:", "Physical location:"],
+    PciLocationFmt => [
+        "PCI-Bus {}, Gerät {}, Funktion {}",
+        "PCI bus {}, device {}, function {}"
+    ],
     KvEnginePrefix => ["Engine", "Engine"],
 
     // ------------------------------------------------ toasts
