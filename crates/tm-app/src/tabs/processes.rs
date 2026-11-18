@@ -1320,7 +1320,7 @@ fn context_menu(app: &mut TaskManApp, ui: &mut egui::Ui, row: &RowData) {
     // explorer.exe — same entry the top bar shows for this selection.
     #[cfg(target_os = "windows")]
     if let Some(target) =
-        crate::app_ui::explorer_restart_identity(app, identity_of(row), &row.name, row.synthetic)
+        crate::app_ui::explorer_restart_identity(app, identity_of(row), row.synthetic)
         && menu::item(ui, i18n::tr(K::RestartService)).clicked()
     {
         crate::app_ui::restart_explorer(app, &ctx, target);

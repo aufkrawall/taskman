@@ -15,21 +15,39 @@ use crate::theme::Palette;
 
 /// Gate shared by the toolbar button and both tab context menus: `identity`
 /// belongs to a live, non-synthetic `explorer.exe` in the latest snapshot.
-/// The start-time comparison keeps a recycled PID from being mistaken for
-/// the shell.
+/// The image name is read from the snapshot, never from the clicked row's
+/// label — the Processes page shows display names like
+/// "Windows Explorer (explorer.exe)". The start-time comparison keeps a
+/// recycled PID from being mistaken for the shell. `row_synthetic` is only a
+/// cheap pre-check for pseudo-rows ("System interrupts"), which have no OS
+/// process behind them.
 #[cfg(target_os = "windows")]
 pub(crate) fn explorer_restart_identity(
     app: &TaskManApp,
     identity: ProcessIdentity,
-    name: &str,
-    synthetic: bool,
+    row_synthetic: bool,
 ) -> Option<ProcessIdentity> {
-    if synthetic || !name.eq_ignore_ascii_case("explorer.exe") {
+    if row_synthetic {
         return None;
     }
     let snapshot = app.latest_snapshot()?;
     let process = snapshot.process(identity.pid)?;
-    (!process.synthetic && process.start_epoch_s == identity.start_epoch_s).then_some(identity)
+    is_live_explorer_process(process, &identity).then_some(identity)
+}
+
+/// Pure core of [`explorer_restart_identity`]: the snapshot entry behind
+/// `identity` is a non-synthetic `explorer.exe` of the same process
+/// generation. Matching uses the image name (`process.name`), never a
+/// display label — the Processes page renders "Windows Explorer
+/// (explorer.exe)", so a row label must not be what decides this.
+#[cfg(target_os = "windows")]
+fn is_live_explorer_process(
+    process: &tm_core::model::ProcessEntry,
+    identity: &ProcessIdentity,
+) -> bool {
+    !process.synthetic
+        && process.start_epoch_s == identity.start_epoch_s
+        && process.name.eq_ignore_ascii_case("explorer.exe")
 }
 
 #[cfg(target_os = "windows")]
@@ -43,9 +61,8 @@ fn explorer_restart_target(app: &TaskManApp) -> Option<ProcessIdentity> {
     }
 
     let target = app.selection.primary()?.clone();
-    let snapshot = app.latest_snapshot()?;
-    let process = snapshot.process(target.pid)?;
-    explorer_restart_identity(app, target, &process.name, process.synthetic)
+    // Selection only ever holds real process rows, never pseudo-rows.
+    explorer_restart_identity(app, target, false)
 }
 
 #[cfg(target_os = "windows")]
@@ -189,6 +206,47 @@ mod tests {
             crate::widgets::tablekit::row_height(RowDensity::Compact),
             crate::widgets::tablekit::ROW_H_DENSE
         );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn explorer_gate_matches_image_name_not_display_label() {
+        use tm_core::model::ProcessEntry;
+
+        let mut explorer = ProcessEntry::new(4242, "EXPLORER.EXE");
+        explorer.display = "Windows Explorer".to_string();
+        explorer.start_epoch_s = Some(1_700_000_000);
+        let identity = ProcessIdentity {
+            pid: 4242,
+            start_epoch_s: Some(1_700_000_000),
+        };
+        assert!(is_live_explorer_process(&explorer, &identity));
+
+        // Same display label but a different image name must not qualify.
+        let mut impostor = ProcessEntry::new(4243, "not_explorer.exe");
+        impostor.display = "Windows Explorer".to_string();
+        impostor.start_epoch_s = Some(1_700_000_000);
+        let identity = ProcessIdentity {
+            pid: 4243,
+            start_epoch_s: Some(1_700_000_000),
+        };
+        assert!(!is_live_explorer_process(&impostor, &identity));
+
+        // Recycled PID: the start time must match the clicked generation.
+        let identity = ProcessIdentity {
+            pid: 4242,
+            start_epoch_s: Some(1_700_000_001),
+        };
+        assert!(!is_live_explorer_process(&explorer, &identity));
+
+        // Synthetic pseudo-rows never qualify.
+        let mut synth = ProcessEntry::new(4244, "explorer.exe");
+        synth.synthetic = true;
+        let identity = ProcessIdentity {
+            pid: 4244,
+            start_epoch_s: None,
+        };
+        assert!(!is_live_explorer_process(&synth, &identity));
     }
 
     #[test]

@@ -2555,7 +2555,6 @@ pub fn context_menu(app: &mut TaskManApp, ui: &mut egui::Ui, p: &ProcessEntry, h
             pid: p.pid,
             start_epoch_s: p.start_epoch_s,
         },
-        &p.name,
         p.synthetic,
     ) && menu::item(ui, i18n::tr(K::RestartService)).clicked()
     {
