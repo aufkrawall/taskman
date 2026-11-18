@@ -157,6 +157,50 @@ fn pointer_move_min_interval(window: &Window) -> web_time::Duration {
         .max(web_time::Duration::from_millis(2))
 }
 
+/// TASKMAN-FORK (#10): id of the per-frame hint an app sets (via
+/// [`set_pointer_tracking_hint`]) when the widget under the pointer paints
+/// something anchored at the exact pointer position (a hover readout box, an
+/// `on_hover_*_at_pointer` tooltip). While the hint is set, pointer moves
+/// always repaint (throttled), because the visuals change within the same
+/// widget. The app should clear it at the start of every frame with
+/// [`clear_pointer_tracking_hint`] and re-set it where needed.
+pub const POINTER_TRACKING_HINT: &str = "egui-winit/pointer-tracking-hint";
+
+/// TASKMAN-FORK (#10): mark the current frame as having a pointer-anchored
+/// visual under the pointer. See [`POINTER_TRACKING_HINT`].
+pub fn set_pointer_tracking_hint(ctx: &egui::Context) {
+    ctx.data_mut(|d| d.insert_temp::<bool>(egui::Id::new(POINTER_TRACKING_HINT), true));
+}
+
+/// TASKMAN-FORK (#10): clear the hint set by [`set_pointer_tracking_hint`].
+pub fn clear_pointer_tracking_hint(ctx: &egui::Context) {
+    ctx.data_mut(|d| d.remove_temp::<bool>(egui::Id::new(POINTER_TRACKING_HINT)));
+}
+
+fn pointer_tracking_hint_active(ctx: &egui::Context) -> bool {
+    ctx.data(|d| {
+        d.get_temp::<bool>(egui::Id::new(POINTER_TRACKING_HINT))
+            .unwrap_or(false)
+    })
+}
+
+/// TASKMAN-FORK (#10): would the set of widgets under `new_pos` differ from
+/// the set under the pointer position of the last completed pass? If not, a
+/// pointer move cannot change any hover visual, so no repaint is needed.
+fn hover_target_changed(ctx: &egui::Context, new_pos: egui::Pos2) -> bool {
+    let Some(last_pos) = ctx.pointer_latest_pos() else {
+        return true;
+    };
+    let ids_at = |pos: egui::Pos2| -> Vec<egui::Id> {
+        ctx.hit_test_last_pass(pos)
+            .contains_pointer
+            .iter()
+            .map(|widget| widget.id)
+            .collect()
+    };
+    ids_at(new_pos) != ids_at(last_pos)
+}
+
 // ----------------------------------------------------------------------------
 
 /// Handles the integration between egui and a winit Window.
@@ -435,9 +479,12 @@ impl State {
                 }
             }
             WindowEvent::CursorMoved { position, .. } => {
-                // TASKMAN-FORK (#10): upstream repaints on every move; we
-                // dedupe unchanged positions and coalesce moves to one frame
-                // per display refresh, with a guaranteed trailing repaint.
+                // TASKMAN-FORK (#10): upstream repaints on every move. We
+                // skip moves that cannot change anything (unchanged position,
+                // or the same widgets under the pointer as in the last painted
+                // frame and no pointer-anchored visual), dedupe the rest, and
+                // coalesce them to one frame per display refresh with a
+                // guaranteed trailing repaint.
                 let pixels_per_point = pixels_per_point(&self.egui_ctx, window);
                 let pos_in_points = egui::pos2(
                     position.x as f32 / pixels_per_point,
@@ -446,19 +493,27 @@ impl State {
                 let pos_changed = self.pointer_pos_in_points != Some(pos_in_points);
                 let pointer_active =
                     self.any_pointer_button_down || self.egui_ctx.egui_is_using_pointer();
-                let repaint = match self.pointer_move_throttle.plan(
-                    web_time::Instant::now(),
-                    pos_changed,
-                    pointer_move_min_interval(window),
-                    pointer_active,
-                ) {
-                    MoveRepaint::Now => true,
-                    MoveRepaint::After(delay) => {
-                        self.egui_ctx
-                            .request_repaint_after_for(delay, self.viewport_id);
-                        false
+                let hover_relevant = pos_changed
+                    && (pointer_active
+                        || pointer_tracking_hint_active(&self.egui_ctx)
+                        || hover_target_changed(&self.egui_ctx, pos_in_points));
+                let repaint = if hover_relevant {
+                    match self.pointer_move_throttle.plan(
+                        web_time::Instant::now(),
+                        pos_changed,
+                        pointer_move_min_interval(window),
+                        pointer_active,
+                    ) {
+                        MoveRepaint::Now => true,
+                        MoveRepaint::After(delay) => {
+                            self.egui_ctx
+                                .request_repaint_after_for(delay, self.viewport_id);
+                            false
+                        }
+                        MoveRepaint::Skip => false,
                     }
-                    MoveRepaint::Skip => false,
+                } else {
+                    false
                 };
                 self.on_cursor_moved(window, *position);
                 EventResponse {
@@ -2526,5 +2581,66 @@ mod pointer_move_throttle_tests {
         );
         // The first real move still repaints immediately.
         assert_eq!(t.plan(at(now, 2), true, INTERVAL, false), MoveRepaint::Now);
+    }
+
+    /// Run one pass with the pointer at `pointer_pos` and a clickable widget
+    /// at `widget_rect`, leaving the context in its post-pass state.
+    fn pass_with_widget(ctx: &egui::Context, pointer_pos: egui::Pos2, widget_rect: egui::Rect) {
+        ctx.begin_pass(egui::RawInput {
+            events: vec![egui::Event::PointerMoved(pointer_pos)],
+            ..Default::default()
+        });
+        let ui = egui::Ui::new(
+            ctx.clone(),
+            egui::Id::new("root"),
+            egui::UiBuilder::new().max_rect(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1000.0, 1000.0),
+            )),
+        );
+        ui.interact(widget_rect, egui::Id::new("widget"), egui::Sense::click());
+        let mut output = ctx.end_pass();
+        output.textures_delta.clear();
+    }
+
+    #[test]
+    fn hover_target_change_detection() {
+        let ctx = egui::Context::default();
+        let widget = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(100.0, 20.0));
+        let inside_a = egui::pos2(10.0, 10.0);
+        let inside_b = egui::pos2(90.0, 10.0);
+        let blank = egui::pos2(500.0, 500.0);
+
+        // Last painted frame had the pointer inside the widget.
+        pass_with_widget(&ctx, inside_a, widget);
+        // Moving within the same widget: no hover change.
+        assert!(!hover_target_changed(&ctx, inside_b));
+        // Moving off the widget onto blank space: hover changes.
+        assert!(hover_target_changed(&ctx, blank));
+
+        // Last painted frame had the pointer on blank space.
+        pass_with_widget(&ctx, blank, widget);
+        // Moving onto the widget: hover changes.
+        assert!(hover_target_changed(&ctx, inside_b));
+        // Staying on blank space: no change.
+        assert!(!hover_target_changed(&ctx, egui::pos2(600.0, 600.0)));
+    }
+
+    #[test]
+    fn hover_target_changed_without_any_pass_is_true() {
+        let ctx = egui::Context::default();
+        // No frame has run yet, so there is no last pointer position: a move
+        // must be treated as relevant (repaint), never skipped.
+        assert!(hover_target_changed(&ctx, egui::pos2(1.0, 1.0)));
+    }
+
+    #[test]
+    fn pointer_tracking_hint_roundtrip() {
+        let ctx = egui::Context::default();
+        assert!(!pointer_tracking_hint_active(&ctx));
+        set_pointer_tracking_hint(&ctx);
+        assert!(pointer_tracking_hint_active(&ctx));
+        clear_pointer_tracking_hint(&ctx);
+        assert!(!pointer_tracking_hint_active(&ctx));
     }
 }

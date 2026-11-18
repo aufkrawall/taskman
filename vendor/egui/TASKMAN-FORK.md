@@ -20,7 +20,9 @@ carries later, unrelated additions: the keyboard Menu/Application key (#5) and m
 windows plus public accesskit reparenting (#6), both of which the keyboard and
 screen-reader model in `llm-wiki/current.md` depends on, a text-cursor blink restart
 (#7), text-selection preservation on secondary click (#8), not registering for raw
-device input (#9), and coalescing pointer-move repaints to the display refresh rate (#10).
+device input (#9), coalescing pointer-move repaints to the display refresh rate and
+skipping moves that cannot change the hover target (#10, with the `hit_test_last_pass`
+accessor #11 in `egui` itself).
 
 The full design, the blend math, and the verification plan live in
 `llm-wiki/render-pipeline.md` in the parent repo. This file is only the *inventory* of what
@@ -229,9 +231,18 @@ One line through winit's public API; on macOS/Wayland/Android it is a no-op and 
 
 | File | Change | Why |
 | --- | --- | --- |
-| `crates/egui-winit/src/lib.rs` | the `WindowEvent::CursorMoved` arm no longer returns `repaint: true` unconditionally; a `PointerMoveThrottle` dedupes unchanged positions and coalesces moves to one frame per display refresh, arming one trailing repaint via `Context::request_repaint_after_for` so the final position is always painted. Moves while a pointer button is down or egui is using the pointer always repaint immediately | Upstream runs a full UI pass (layout, tessellation, paint) per `CursorMoved`, so a mouse reporting at up to 1 kHz drives up to 1 kHz frames; Windows Task Manager only repaints when a hover actually changes. Measured on Windows 11 at 1 kHz movement over the window: ~0.96 cores in a minimal eframe app. With the throttle, hover-driven frames are capped at the monitor refresh rate (fallback 60 Hz, floor 2 ms) and stationary/sub-point-jitter cursors repaint never |
+| `crates/egui-winit/src/lib.rs` | the `WindowEvent::CursorMoved` arm no longer returns `repaint: true` unconditionally. A move is skipped entirely when its position in points is unchanged (sub-point jitter) or when the set of widgets under the pointer is the same as in the last painted frame (`Context::hit_test_last_pass`, #11) and the app did not set the pointer-tracking hint. Remaining moves are coalesced by a `PointerMoveThrottle` to one frame per display refresh (monitor refresh rate, fallback 60 Hz, floor 2 ms), arming one trailing repaint via `Context::request_repaint_after_for` so the final position is always painted. Moves while a pointer button is down or egui is using the pointer always repaint immediately. New public items: `POINTER_TRACKING_HINT`, `set_pointer_tracking_hint`, `clear_pointer_tracking_hint` | Upstream runs a full UI pass (layout, tessellation, paint) per `CursorMoved`, so a mouse reporting at up to 1 kHz drives up to 1 kHz frames; Windows Task Manager only repaints when a hover actually changes. Measured on Windows 11 at 1 kHz movement over the window: ~0.96 cores in a minimal eframe app. With the throttle plus the hover-target skip, moving over blank areas (no widget under the pointer) repaints never, and hover-driven frames elsewhere are capped at the monitor refresh rate |
 
-The trailing repaint goes through the existing `UserEvent::RequestRepaint` → `EventResult::RepaintAt` plumbing, so no `eframe` change is needed. The throttle lives per `egui_winit::State` (i.e. per window/viewport). **Behaviour change:** hover highlight, pointer-anchored tooltips and cursor-icon updates now refresh at most once per display period instead of per mouse packet — imperceptible at ≥60 Hz, and drags/clicks are unaffected (they always repaint immediately). Not upstreamable as is — upstream would want the cadence configurable. **Coverage:** `pointer_move_throttle_tests` in `egui-winit/src/lib.rs` pin the decision table (first move immediate, dedupe, single armed trailing repaint, cadence restart after the interval, active-pointer bypass).
+The app sets the per-frame hint wherever it paints something anchored at the exact pointer position (chart hover readout, at-pointer row tooltips), so those keep repainting per move (throttled) — the hover-target skip alone would freeze them within one widget. The hint is `IdTypeMap` temp data cleared by the app at frame start. The trailing repaint goes through the existing `UserEvent::RequestRepaint` → `EventResult::RepaintAt` plumbing, so no `eframe` change is needed. The throttle lives per `egui_winit::State` (i.e. per window/viewport). **Behaviour change:** hover highlight and cursor-icon updates now refresh only when the hovered widget actually changes, and pointer-anchored visuals at most once per display period — drags/clicks are unaffected (always immediate). Not upstreamable as is — upstream would want the cadence and the skip configurable. **Coverage:** `pointer_move_throttle_tests` in `egui-winit/src/lib.rs` pin the throttle decision table (first move immediate, dedupe, single armed trailing repaint, cadence restart, active-pointer bypass), the hover-target comparison against a real pass (`hover_target_change_detection`), and the hint roundtrip.
+
+### 11. `egui`: public hit-test of the previous pass's widgets
+
+| File | Change | Why |
+| --- | --- | --- |
+| `crates/egui/src/lib.rs` | re-export `hit_test::WidgetHits` | the type is returned by the new accessor but the `hit_test` module stays private |
+| `crates/egui/src/context.rs` | new `Context::hit_test_last_pass(pos)` that runs the same `hit_test` over `prev_pass.widgets` (interactable layers only, sorted, layer transforms applied, `interact_radius`) that `begin_pass` runs for the live pointer | lets integrations answer "would the hovered widgets change if the pointer were at `pos`?" between frames, without running a pass — the core of fork divergence #10's skip decision |
+
+Plain oversight-style accessor, plausibly upstreamable. **Coverage:** exercised through `egui-winit`'s `hover_target_change_detection` test, which runs a real pass with a widget and checks same-widget/off-widget/blank comparisons.
 
 ## Rebase runbook
 

@@ -1915,6 +1915,10 @@ impl eframe::App for TaskManApp {
         // dialogs opening this frame record focus as it was before the page
         // was drawn disabled (see `app_ui::restore_focus` / `capture_focus`).
         crate::app_ui::begin_frame_focus(&ctx);
+        // Pointer-tracking hint from the previous frame is stale now; the
+        // widgets that paint at the pointer (chart hover readout, at-pointer
+        // tooltips) re-set it below if the pointer is over them this frame.
+        egui_winit::clear_pointer_tracking_hint(&ctx);
         ctx.data_mut(|data| data.remove_temp::<&'static str>(egui::Id::new("tm-content-present")));
         let first_keyboard_frame = ctx.data(|data| {
             data.get_temp::<bool>(egui::Id::new("tm-keyboard-initialized")) != Some(true)

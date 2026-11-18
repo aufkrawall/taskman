@@ -1,3 +1,34 @@
+## 2026-11-18 - in-window mouse movement: skip repaints that cannot change the hover target (fork #10 extended, #11)
+
+- Follow-up measurement after the first throttle (fork #10, refresh-rate cap) still showed
+  ~6% total CPU (8c/16t) while moving the cursor across the blank lower sidebar: at a
+  high display refresh rate, one full frame per vsync is still ~1 core, because each
+  frame rebuilds the whole UI tree and tessellates the full window. Task Manager repaints
+  only when the hover target changes, so the cap alone is not enough.
+- Change: the `CursorMoved` arm in `egui-winit` now skips the repaint entirely when the
+  widgets under the new pointer position are the same as under the last painted frame's
+  pointer position — computed with a new `egui` accessor `Context::hit_test_last_pass`
+  (fork #11) that runs the exact `hit_test` `begin_pass` runs, over `prev_pass.widgets`
+  with interactable layers, layer transforms and `interact_radius`. Blank areas (no
+  widget under the pointer) therefore cost zero frames while moving. Moves that do change
+  the hover target still go through the #10 throttle (one frame per display refresh,
+  single armed trailing repaint).
+- Pointer-anchored visuals must not freeze within one widget, so the app sets a per-frame
+  hint `egui_winit::POINTER_TRACKING_HINT` (new public fns `set_/clear_pointer_tracking_hint`)
+  where it paints at the exact pointer position: `tablekit::TmTable::row` when the row is
+  hovered (covers the at-pointer row tooltips on Processes/Details/Modules/Threads/Users)
+  and `chart::hover_pos` for the chart hover readout. `app.rs` clears the hint at frame
+  start; the hint vetoes the skip, so those areas keep per-move repaints (throttled).
+- App-side dep: tm-app now depends on `egui-winit` by path (like `egui_software`) to reach
+  the hint fns; resolves to the same patched crate, `cargo tree -d` clean.
+- Tests (no real cursor movement): `pointer_move_throttle_tests` in egui-winit now also
+  covers `hover_target_change_detection` (runs a real pass with a widget via
+  `Ui::new` + `ctx.interact`, then checks same-widget vs off-widget vs blank comparisons
+  and the no-pass-yet case) and the hint roundtrip — 9 tests green in `cargo test -p
+  egui-winit`; `cargo test -p tm-app` 319 ok.
+- Not yet measured live on the running app (GUI not verifiable headlessly); the SendInput
+  probe + `TASKMAN_FPS_PROBE=1` harness from the #9 entry is the intended before/after.
+
 ## 2026-11-17 - mouse movement over the window no longer repaints per move: pointer-move throttle in egui-winit (fork #10)
 
 - Follow-up to the raw-input fix (#9): movement *inside* the window still ran a full frame

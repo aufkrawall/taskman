@@ -405,13 +405,17 @@ Found by the 2026-10-21 row-vs-total audit and deliberately not changed:
   *outside* a focused TaskMan window. Movement *over* the window used to repaint per
   `CursorMoved`: a minimal eframe probe measured ~0.96 cores at 1 kHz movement
   (`llm-wiki/log/recent.md`, 2026-11-17).
-- Fixed by coalescing pointer-move repaints in `egui-winit` (fork divergence #10): moves are
-  deduped by position and throttled to one frame per display refresh, with one trailing
-  repaint armed so the final hover position is always painted; drags and pressed buttons
-  still repaint immediately. Hover-unchanged skipping was considered and rejected: several
-  readouts (chart hover box, command-line tooltips) are anchored at the pointer and change
-  within the same widget, so they need per-move frames. Live before/after measurement with
-  synthetic mouse movement is still open — see `llm-wiki/log/recent.md`.
+- Fixed by coalescing pointer-move repaints in `egui-winit` (fork divergence #10, with the
+  `Context::hit_test_last_pass` accessor #11 in `egui` itself): a move is skipped entirely
+  when its position is unchanged or when the widgets under the pointer are the same as in
+  the last painted frame (so blank areas like the lower sidebar cost nothing); all other
+  moves are throttled to one frame per display refresh with one armed trailing repaint so
+  the final position is always painted; drags and pressed buttons always repaint
+  immediately. Pointer-anchored visuals (chart hover readout, at-pointer row tooltips)
+  set a per-frame hint (`egui_winit::set_pointer_tracking_hint`, set in `tablekit::row`
+  and `chart::hover_pos`) so they keep repainting per move — the hover-target skip alone
+  would freeze them within one widget. Live before/after measurement with synthetic mouse
+  movement is still open — see `llm-wiki/log/recent.md`.
 
 ## Falsified findings — do not re-raise
 

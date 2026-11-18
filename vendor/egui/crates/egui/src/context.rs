@@ -1379,6 +1379,41 @@ impl Context {
     /// are currently blocked from interaction. The returned rectangles are in
     /// global viewport coordinates, with layer transforms applied.
     ///
+    /// TASKMAN-FORK (#11): hit-test the widgets of the previous pass, exactly
+    /// as `begin_pass` does for the current pointer position. Lets an
+    /// integration ask "would the hovered widgets change if the pointer were
+    /// at `pos`?" between frames, without running a pass.
+    #[must_use]
+    pub fn hit_test_last_pass(&self, pos: Pos2) -> crate::WidgetHits {
+        self.read(|ctx| {
+            let Some(viewport) = ctx.viewports.get(&ctx.viewport_id()) else {
+                return crate::WidgetHits::default();
+            };
+            // Areas that are not interactable are click-through: skip them in
+            // the hit-test, like `begin_pass` does.
+            let mut layers: Vec<LayerId> = viewport
+                .prev_pass
+                .widgets
+                .layer_ids()
+                .filter(|layer_id| ctx.memory.areas().is_interactable(*layer_id))
+                .collect();
+            layers.sort_by(|&a, &b| ctx.memory.areas().compare_order(a, b));
+            let interact_radius = ctx.memory.options.style().interaction.interact_radius;
+            crate::hit_test::hit_test(
+                &viewport.prev_pass.widgets,
+                &layers,
+                &ctx.memory.to_global,
+                pos,
+                interact_radius,
+            )
+        })
+    }
+
+    /// The interactive widget rectangles of the previous pass, with disabled
+    /// widgets, non-interactive widgets, and layers that are currently blocked
+    /// from interaction filtered out. The returned rectangles are in global
+    /// viewport coordinates, with layer transforms applied.
+    ///
     /// This is meant for integrations that must declare platform input regions
     /// before pointer events can be delivered to egui, such as transparent or
     /// click-through overlays.

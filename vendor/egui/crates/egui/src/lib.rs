@@ -496,6 +496,10 @@ pub use self::{
     widgets::*,
 };
 
+// TASKMAN-FORK (#11): re-export the hit-test result type so integrations can
+// use `Context::hit_test_last_pass` without the `hit_test` module being public.
+pub use hit_test::WidgetHits;
+
 // ----------------------------------------------------------------------------
 
 /// Helper function that adds a label when compiling with debug assertions enabled.

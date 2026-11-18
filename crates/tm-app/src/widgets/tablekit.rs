@@ -1280,6 +1280,13 @@ impl TmTable {
             egui::Id::new(self.id).with(key),
             Sense::CLICK.union(Sense::hover()),
         );
+        if resp.hovered() {
+            // Rows carry at-pointer tooltips whose content depends on the exact
+            // pointer position within the row, so cursor moves over a row must
+            // keep repainting (the egui-winit pointer-move throttle otherwise
+            // skips moves that stay within one widget).
+            egui_winit::set_pointer_tracking_hint(ui.ctx());
+        }
         ui.ctx()
             .register_accesskit_parent(resp.id, crate::search::content_focus_id(self.id));
         self.current_row.set(Some(resp.id));

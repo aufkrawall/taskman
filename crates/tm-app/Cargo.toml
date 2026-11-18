@@ -33,6 +33,11 @@ eframe = { version = "=0.36.1", default-features = false, features = [
 tracing = { workspace = true }
 serde_json = { workspace = true }
 rfd = "0.15"
+# Vendored egui fork, reached by path like egui_software below: used for the
+# pointer-tracking hint that keeps at-pointer hover visuals repainting while
+# the fork's egui-winit coalesces cursor-move repaints (fork divergence #10).
+# Default features stay off; eframe already enables the winit features it needs.
+egui-winit = { path = "../../vendor/egui/crates/egui-winit", default-features = false }
 
 [package.metadata.notes]
 renderer = "wgpu primary, glow fallback; wayland+x11 enabled for native Linux"
