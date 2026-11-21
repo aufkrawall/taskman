@@ -439,29 +439,28 @@ fn run_gui(mock: bool, args: &[String]) {
         opts
     };
 
-    // Compatibility mode IS the OpenGL backend; an explicit TASKMAN_RENDERER
-    // still wins so the diagnostic override keeps working.
-    let renderer_pref = match std::env::var("TASKMAN_RENDERER") {
-        Ok(v) if !v.is_empty() => v,
-        // "No GPU" now means the native CPU rasterizer, not a WARP adapter emulating a
-        // D3D12 driver. Compatibility mode still means OpenGL.
-        _ if render_mode == tm_core::settings::RenderMode::Software => "software".to_string(),
-        _ if render_mode == tm_core::settings::RenderMode::Compatibility => "glow".to_string(),
-        _ => String::new(),
-    };
+    let explicit_renderer = std::env::var("TASKMAN_RENDERER")
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty());
     StartupTrace::mark("run_native_enter");
 
     // The Start-menu-proof window band is chosen when the window is created,
     // so it reflects the persisted setting at launch only. A band-16 window
     // is permanently topmost and cannot be demoted, so this stays conditional.
     let topmost_band = settings.always_on_top;
-    let mut last_err = None;
-    for renderer in preferred_renderers(&renderer_pref) {
+    let mut failures: Vec<(eframe::Renderer, String)> = Vec::new();
+    for renderer in preferred_renderers(render_mode, explicit_renderer.as_deref()) {
         // Every renderer attempt creates a new window; re-request the band in
         // case a previous attempt cleared it after its first frame.
         if topmost_band {
             tm_platform::request_topmost_band();
         }
+        store_render_mode(active_mode_for_renderer(
+            render_mode,
+            renderer,
+            explicit_renderer.is_some(),
+        ));
         tracing::info!(?renderer, "trying renderer");
         let use_mock = mock;
         let initial_tab = initial_tab_arg.clone();
@@ -496,51 +495,146 @@ fn run_gui(mock: bool, args: &[String]) {
         match eframe::run_native("Task-Manager", opts, Box::new(creator)) {
             Ok(()) => return,
             Err(e) => {
-                tracing::warn!(error = %e, "renderer failed; falling back");
-                last_err = Some(e);
+                let abort = should_abort_renderer_fallback(&e);
+                let detail = e.to_string();
+                if abort {
+                    tracing::error!(
+                        ?renderer,
+                        error = %detail,
+                        "display/event loop initialization failed; not trying fallback renderers"
+                    );
+                    failures.push((renderer, detail));
+                    break;
+                }
+                tracing::warn!(?renderer, error = %detail, "renderer failed; falling back");
+                failures.push((renderer, detail));
             }
         }
     }
-    eprintln!(
-        "taskman: no usable GPU renderer found: {:?}",
-        last_err.map(|e| e.to_string())
-    );
+    let error_message = format_renderer_startup_error(explicit_renderer.as_deref(), &failures);
+    tracing::error!("{error_message}");
+    tm_core::logging::attach_file_logging(tm_core::logging::LogConfig {
+        console: false,
+        level: None,
+    });
+    tm_core::logging::shutdown();
+    eprintln!("{error_message}");
     std::process::exit(1);
+}
 
-    /// Renderers to try, in order.
-    ///
-    /// The native CPU renderer goes first: it needs no driver, starts without enumerating
-    /// adapters or compiling shaders, and is the only backend that can do sub-pixel
-    /// (ClearType) text. The GPU backends remain as fallbacks so an unusual display
-    /// stack -- or a bug in the new path -- still yields a usable window.
-    ///
-    /// `TASKMAN_RENDERER` picks exactly one; anything else is filtered out.
-    #[allow(clippy::vec_init_then_push)]
-    fn preferred_renderers(pref: &str) -> Vec<eframe::Renderer> {
-        let mut all = Vec::<eframe::Renderer>::with_capacity(3);
+/// Renderers to try, in order.
+///
+/// The native CPU renderer goes first for `Auto` and `Software`: it needs no
+/// driver, starts without enumerating adapters or compiling shaders, and is the
+/// only backend that can do sub-pixel (ClearType) text. `Software` mode also
+/// installs `select_software_adapter` on `Wgpu` so a fallback to `Wgpu` prefers
+/// a CPU rasterizer (WARP/lavapipe) before falling back to a GPU adapter.
+/// `Compatibility` prefers `Glow` (OpenGL) first and falls back to `Software`
+/// then `Wgpu` if OpenGL initialization fails.
+///
+/// An explicit `TASKMAN_RENDERER` override narrows the list to that single
+/// compiled backend for diagnostics.
+#[allow(clippy::vec_init_then_push)]
+fn preferred_renderers(
+    mode: tm_core::settings::RenderMode,
+    explicit_pref: Option<&str>,
+) -> Vec<eframe::Renderer> {
+    use tm_core::settings::RenderMode;
+
+    if let Some(pref) = explicit_pref.map(str::trim).filter(|p| !p.is_empty()) {
+        let mut filtered = Vec::<eframe::Renderer>::with_capacity(1);
         #[cfg(feature = "software")]
-        all.push(eframe::Renderer::Software);
+        if pref.eq_ignore_ascii_case("software") {
+            filtered.push(eframe::Renderer::Software);
+        }
         #[cfg(feature = "wgpu")]
-        all.push(eframe::Renderer::Wgpu);
+        if pref.eq_ignore_ascii_case("wgpu") {
+            filtered.push(eframe::Renderer::Wgpu);
+        }
         #[cfg(feature = "glow")]
-        all.push(eframe::Renderer::Glow);
-        all.into_iter()
-            .filter(|r| {
-                if pref.is_empty() {
-                    return true;
-                }
-                match r {
-                    #[cfg(feature = "software")]
-                    eframe::Renderer::Software => pref.eq_ignore_ascii_case("software"),
-                    #[cfg(feature = "wgpu")]
-                    eframe::Renderer::Wgpu => pref.eq_ignore_ascii_case("wgpu"),
-                    #[cfg(feature = "glow")]
-                    eframe::Renderer::Glow => pref.eq_ignore_ascii_case("glow"),
-                    #[allow(unreachable_patterns)]
-                    _ => true,
-                }
-            })
-            .collect()
+        if pref.eq_ignore_ascii_case("glow") {
+            filtered.push(eframe::Renderer::Glow);
+        }
+        return filtered;
+    }
+
+    let mut ordered = Vec::<eframe::Renderer>::with_capacity(3);
+    match mode {
+        RenderMode::Auto | RenderMode::Software => {
+            #[cfg(feature = "software")]
+            ordered.push(eframe::Renderer::Software);
+            #[cfg(feature = "wgpu")]
+            ordered.push(eframe::Renderer::Wgpu);
+            #[cfg(feature = "glow")]
+            ordered.push(eframe::Renderer::Glow);
+        }
+        RenderMode::Compatibility => {
+            #[cfg(feature = "glow")]
+            ordered.push(eframe::Renderer::Glow);
+            #[cfg(feature = "software")]
+            ordered.push(eframe::Renderer::Software);
+            #[cfg(feature = "wgpu")]
+            ordered.push(eframe::Renderer::Wgpu);
+        }
+    }
+    ordered
+}
+
+fn active_mode_for_renderer(
+    requested: tm_core::settings::RenderMode,
+    renderer: eframe::Renderer,
+    explicit_renderer: bool,
+) -> tm_core::settings::RenderMode {
+    use tm_core::settings::RenderMode;
+    if !explicit_renderer && requested == RenderMode::Auto {
+        return RenderMode::Auto;
+    }
+    match renderer {
+        #[cfg(feature = "software")]
+        eframe::Renderer::Software => RenderMode::Software,
+        #[cfg(feature = "wgpu")]
+        eframe::Renderer::Wgpu => {
+            if !explicit_renderer && requested == RenderMode::Software {
+                // `select_software_adapter` flips this to `Auto` if no CPU
+                // adapter exists and WGPU falls back to a GPU adapter.
+                RenderMode::Software
+            } else {
+                RenderMode::Auto
+            }
+        }
+        #[cfg(feature = "glow")]
+        eframe::Renderer::Glow => RenderMode::Compatibility,
+    }
+}
+
+/// Event loop initialization/execution errors belong to the display server
+/// connection rather than the chosen renderer, so trying fallback renderers
+/// cannot succeed and previously masked the primary OS error behind winit's
+/// `EventLoop can't be recreated`.
+fn should_abort_renderer_fallback(err: &eframe::Error) -> bool {
+    matches!(err, eframe::Error::WinitEventLoop(_))
+}
+
+fn format_renderer_startup_error(
+    explicit_pref: Option<&str>,
+    failures: &[(eframe::Renderer, String)],
+) -> String {
+    match failures {
+        [] => {
+            let pref = explicit_pref.map(str::trim).unwrap_or("");
+            format!("taskman: no compiled renderer matches TASKMAN_RENDERER={pref:?}")
+        }
+        [(renderer, err)] => {
+            format!("taskman: failed to start GUI ({renderer}: {err})")
+        }
+        many => {
+            let details = many
+                .iter()
+                .map(|(renderer, err)| format!("{renderer}: {err}"))
+                .collect::<Vec<_>>()
+                .join("; ");
+            format!("taskman: failed to start GUI (all renderers failed — {details})")
+        }
     }
 }
 
@@ -1324,3 +1418,160 @@ fn attach_parent_console() {
 #[cfg(any(not(target_os = "windows"), debug_assertions))]
 #[allow(dead_code)]
 fn attach_parent_console() {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tm_core::settings::RenderMode;
+
+    #[test]
+    fn preferred_renderers_never_empty_for_any_render_mode() {
+        for mode in [
+            RenderMode::Auto,
+            RenderMode::Software,
+            RenderMode::Compatibility,
+        ] {
+            let list = preferred_renderers(mode, None);
+            assert!(
+                !list.is_empty(),
+                "RenderMode::{mode:?} must always yield at least one compiled renderer"
+            );
+            let blank = preferred_renderers(mode, Some("  "));
+            assert_eq!(blank, list);
+        }
+    }
+
+    #[cfg(all(feature = "software", feature = "wgpu", feature = "glow"))]
+    #[test]
+    fn preferred_renderers_ordering_by_render_mode_and_override() {
+        assert_eq!(
+            preferred_renderers(RenderMode::Auto, None),
+            vec![
+                eframe::Renderer::Software,
+                eframe::Renderer::Wgpu,
+                eframe::Renderer::Glow,
+            ]
+        );
+        assert_eq!(
+            preferred_renderers(RenderMode::Software, None),
+            vec![
+                eframe::Renderer::Software,
+                eframe::Renderer::Wgpu,
+                eframe::Renderer::Glow,
+            ]
+        );
+        assert_eq!(
+            preferred_renderers(RenderMode::Compatibility, None),
+            vec![
+                eframe::Renderer::Glow,
+                eframe::Renderer::Software,
+                eframe::Renderer::Wgpu,
+            ]
+        );
+
+        assert_eq!(
+            preferred_renderers(RenderMode::Auto, Some(" GLOW ")),
+            vec![eframe::Renderer::Glow]
+        );
+        assert_eq!(
+            preferred_renderers(RenderMode::Compatibility, Some("software")),
+            vec![eframe::Renderer::Software]
+        );
+        assert_eq!(
+            preferred_renderers(RenderMode::Software, Some("wgpu")),
+            vec![eframe::Renderer::Wgpu]
+        );
+        assert!(preferred_renderers(RenderMode::Auto, Some("unknown")).is_empty());
+    }
+
+    #[cfg(all(feature = "software", feature = "wgpu", feature = "glow"))]
+    #[test]
+    fn active_mode_for_renderer_reports_honest_fallbacks() {
+        assert_eq!(
+            active_mode_for_renderer(RenderMode::Auto, eframe::Renderer::Software, false),
+            RenderMode::Auto
+        );
+        assert_eq!(
+            active_mode_for_renderer(RenderMode::Auto, eframe::Renderer::Wgpu, false),
+            RenderMode::Auto
+        );
+        assert_eq!(
+            active_mode_for_renderer(RenderMode::Software, eframe::Renderer::Software, false),
+            RenderMode::Software
+        );
+        assert_eq!(
+            active_mode_for_renderer(RenderMode::Software, eframe::Renderer::Wgpu, false),
+            RenderMode::Software
+        );
+        assert_eq!(
+            active_mode_for_renderer(RenderMode::Software, eframe::Renderer::Glow, false),
+            RenderMode::Compatibility
+        );
+        assert_eq!(
+            active_mode_for_renderer(RenderMode::Compatibility, eframe::Renderer::Glow, false),
+            RenderMode::Compatibility
+        );
+        assert_eq!(
+            active_mode_for_renderer(RenderMode::Compatibility, eframe::Renderer::Software, false),
+            RenderMode::Software
+        );
+        assert_eq!(
+            active_mode_for_renderer(RenderMode::Compatibility, eframe::Renderer::Wgpu, false),
+            RenderMode::Auto
+        );
+        assert_eq!(
+            active_mode_for_renderer(RenderMode::Auto, eframe::Renderer::Glow, true),
+            RenderMode::Compatibility
+        );
+    }
+
+    #[test]
+    fn event_loop_error_aborts_renderer_fallback_and_preserves_primary_error() {
+        let loop_err = eframe::Error::WinitEventLoop(
+            egui_winit::winit::error::EventLoopError::RecreationAttempt,
+        );
+        assert!(should_abort_renderer_fallback(&loop_err));
+
+        let renderer_err = eframe::Error::AppCreation("softbuffer surface failed".into());
+        assert!(!should_abort_renderer_fallback(&renderer_err));
+    }
+
+    #[cfg(all(feature = "software", feature = "wgpu", feature = "glow"))]
+    #[test]
+    fn format_renderer_startup_error_is_accurate_and_human_readable() {
+        let missing = format_renderer_startup_error(Some("vulkan"), &[]);
+        assert!(missing.contains("TASKMAN_RENDERER=\"vulkan\""), "{missing}");
+        assert!(!missing.contains("GPU renderer"), "{missing}");
+        assert!(!missing.contains("Some("), "{missing}");
+
+        let single = format_renderer_startup_error(
+            None,
+            &[(
+                eframe::Renderer::Software,
+                "winit EventLoopError: os error: Failed to open connection to X server".into(),
+            )],
+        );
+        assert!(single.contains("software:"), "{single}");
+        assert!(
+            single.contains("Failed to open connection to X server"),
+            "{single}"
+        );
+        assert!(!single.contains("GPU renderer"), "{single}");
+        assert!(!single.contains("Some("), "{single}");
+
+        let multi = format_renderer_startup_error(
+            None,
+            &[
+                (eframe::Renderer::Software, "softbuffer failed".into()),
+                (eframe::Renderer::Wgpu, "no adapter".into()),
+                (eframe::Renderer::Glow, "no GL config".into()),
+            ],
+        );
+        assert!(
+            multi.contains("software: softbuffer failed; wgpu: no adapter; glow: no GL config"),
+            "{multi}"
+        );
+        assert!(!multi.contains("GPU renderer"), "{multi}");
+        assert!(!multi.contains("Some("), "{multi}");
+    }
+}

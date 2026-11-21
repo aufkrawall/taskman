@@ -11,6 +11,10 @@
 - **Sub-second PID-reuse identity protection:** process creation timestamps now preserve native 100-ns (`FILETIME` on Windows, microsecond `proc_pidinfo` on macOS, clock-tick `/proc/<pid>/stat` on Linux) resolution without ±1 s tolerance, `PlatformActions` checked/unchecked defaults fail closed cleanly, and Linux signals pin targets via `pidfd_open`/`pidfd_send_signal` (with identity-checked fallback when unavailable).
 - **Recycled-PID process grouping:** Processes-tab tree parenting, flat same-image family grouping, Details search ancestor reveal, and same-image Windows service account inheritance now verify `is_plausible_parent`, keeping older orphan workers from attaching to a younger unrelated process or collapsing into shared `termination_targets`.
 - **Windows service `ControlService` and restart errors:** stopping or restarting a service now passes writable `SERVICE_STATUS` storage instead of a null pointer to `ControlService`, and `Restart` propagates real stop failures rather than silently timing out in `wait_state`.
+- **Renderer fallback, `EventLoop` recreation masking, and startup error diagnostics:**
+  - `winit::event_loop::EventLoopBuilder::build()` now resets `EVENT_LOOP_CREATED` when backend initialization returns an error instead of leaving the process-wide guard set after no event loop was created.
+  - GUI startup (`tm-app`) now aborts renderer fallback immediately on `eframe::Error::WinitEventLoop(_)` instead of retrying other renderers and overwriting the real display-server error with `EventLoop can't be recreated`, flushes early startup logs to disk on fatal failure, and reports a plain failure message naming each attempted renderer instead of `"no usable GPU renderer found: Some(...)"`.
+  - `RenderMode::Software` and `RenderMode::Compatibility` now preserve runtime fallback renderers (so `RenderMode::Software` can actually reach `Wgpu` with `select_software_adapter` and `Compatibility` falls back to `Software`/`Wgpu` instead of exiting immediately on GL failure or single-feature builds) while updating `active_render_mode()` to reflect the fallback path actually started.
 
 ## 0.1.31 - 2026-11-18
 

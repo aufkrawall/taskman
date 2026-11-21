@@ -121,10 +121,18 @@ impl<T> EventLoopBuilder<T> {
 
         // Certain platforms accept a mutable reference in their API.
         #[allow(clippy::unnecessary_mut_passed)]
-        Ok(EventLoop {
-            event_loop: platform_impl::EventLoop::new(&mut self.platform_specific)?,
-            _marker: PhantomData,
-        })
+        let event_loop = match platform_impl::EventLoop::new(&mut self.platform_specific) {
+            Ok(event_loop) => event_loop,
+            Err(err) => {
+                // TaskMan fork: a failed backend initialization did not create an EventLoop,
+                // so roll back the guard instead of poisoning later attempts with
+                // `EventLoopError::RecreationAttempt`.
+                EVENT_LOOP_CREATED.store(false, Ordering::Relaxed);
+                return Err(err);
+            },
+        };
+
+        Ok(EventLoop { event_loop, _marker: PhantomData })
     }
 
     #[cfg(web_platform)]

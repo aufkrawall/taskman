@@ -2,9 +2,9 @@
 
 This directory is a vendored copy of [`winit`](https://github.com/rust-windowing/winit)
 **0.30.13** (crates.io), reached only through `[patch.crates-io]` in the root
-`Cargo.toml`. It exists for exactly one change.
+`Cargo.toml`. It carries two small patches.
 
-## The change: window band for always-on-top
+## 1. Window band for always-on-top
 
 Native Windows Task Manager creates its main window with `CreateWindowInBand`
 in **window band 16**. That band is above the Start menu's band 6, which is
@@ -40,15 +40,28 @@ value differs from the startup value.
   - Imports for `GetModuleHandleW`/`GetProcAddress`, `HINSTANCE`, `HMENU`,
     `WINDOW_EX_STYLE` and `WINDOW_STYLE`.
 
-Nothing else is changed. `grep -n TASKMAN_WINDOW_BAND vendor/winit/src` lists
-every taskman-specific line.
+Nothing else in `windows/window.rs` is changed. `grep -n TASKMAN_WINDOW_BAND vendor/winit/src` lists
+every window-band line.
+
+## 2. Do not poison `EVENT_LOOP_CREATED` when `EventLoopBuilder::build()` fails
+
+In `src/event_loop.rs`, `EventLoopBuilder::build()` swaps `EVENT_LOOP_CREATED` to
+`true` before calling `platform_impl::EventLoop::new(...)`. When backend creation
+returned `Err`, the flag stayed `true` even though no `EventLoop` existed, so
+every subsequent `build()` call failed with `EventLoopError::RecreationAttempt`
+(`"EventLoop can't be recreated"`), masking the real display-connection error.
+
+### Files touched
+
+- `src/event_loop.rs`
+  - `EventLoopBuilder::build()` resets `EVENT_LOOP_CREATED` to `false` if
+    `platform_impl::EventLoop::new()` returns `Err`, marked with `TaskMan fork:`.
 
 ## Rebase procedure
 
 1. Copy the new upstream crate over this directory (keep the deleted
    `Cargo.lock` deleted).
-2. Re-apply the change above; the marker comment in `create_window_native`
-   starts with `TaskMan fork:`.
+2. Re-apply both changes above; the marker comments start with `TaskMan fork:`.
 3. `pwsh tools/check-fork.ps1` (clippy + tests for this fork; `cargo fmt` is
    deliberately skipped because upstream's tree is not formatted with this
    nightly rustfmt).

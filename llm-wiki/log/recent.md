@@ -1,3 +1,13 @@
+## 2026-11-21 - Renderer fallback, `EventLoop can't be recreated` masking, and startup error clarity
+
+- Investigated user report on `taskman-v0.1.31-linux-x86_64-musl.tar.gz` (Linux Mint 22.3 XFCE) failing with `taskman: no usable GPU renderer found: Some("winit EventLoopError: EventLoop can't be recreated")` and later starting normally:
+  1. Static musl builds lack `dlopen` (`build.py` falls back to `x86_64-unknown-linux-musl` when `cross` and `zig` are absent; `zig` was not installed on the build host); under X11 (`x11-dl`) or any failed `platform_impl::EventLoop::new()` (e.g. stale `WAYLAND_DISPLAY` / X11 display/auth failure), `winit::EventLoopBuilder::build()` had already swapped `EVENT_LOOP_CREATED = true` before calling `platform_impl::EventLoop::new()`.
+  2. `crates/tm-app/src/main.rs` treated that `WinitEventLoop` error as a per-renderer failure, looped into `Wgpu` and `Glow`, hit `EventLoopError::RecreationAttempt` on the poisoned flag, overwrote `last_err`, and printed the stale `"taskman: no usable GPU renderer found: Some(...)"` message.
+  3. Additionally, `main.rs` filtered `preferred_renderers` down to a single `"software"` / `"glow"` entry for `RenderMode::Software` and `RenderMode::Compatibility`, making `select_software_adapter` unreachable in `Software` mode, removing fallback on OpenGL failure, and leaving single-feature builds (`--features glow`) empty under `Software` mode.
+- Fixes:
+  - `vendor/winit/src/event_loop.rs`: `EventLoopBuilder::build()` now resets `EVENT_LOOP_CREATED` to `false` when `platform_impl::EventLoop::new()` returns `Err`.
+  - `crates/tm-app/src/main.rs`: extracted `preferred_renderers(mode, explicit_pref)`, `active_mode_for_renderer`, `should_abort_renderer_fallback`, and `format_renderer_startup_error`; aborted fallback immediately on `eframe::Error::WinitEventLoop(_)`; preserved fallback ordering for `Software` (`[Software, Wgpu, Glow]`) and `Compatibility` (`[Glow, Software, Wgpu]`) while pinning only explicit `TASKMAN_RENDERER` overrides; logged and flushed deferred startup logs to disk on fatal GUI init failure; added 5 unit tests in `tm-app`.
+
 ## 2026-11-21 - Safety, PID-reuse, persistence, and service-control hardening (7 P1/P2 fixes)
 
 - Verified and fixed seven P1/P2 bugs across `tm-core`, `tm-platform`, `tm-installer`, and `tm-app`:
