@@ -307,6 +307,10 @@ impl AppHistoryDb {
                             .or_insert_with(|| key.clone());
                     }
                 }
+                // Drop blank icon paths a previous build persisted: they made
+                // the page ask the shell for an empty name, which answered with
+                // the current directory's folder icon.
+                dbf.icon_paths.retain(|_, path| !path.trim().is_empty());
                 self.since_epoch_s = dbf.since_epoch_s;
                 if self.state.observing {
                     // A slow load may have allowed new observations. Those
@@ -562,9 +566,15 @@ impl AppHistoryDb {
                 .entry(key.clone())
                 .or_insert_with(|| p.shown_name().to_string());
             if let Some(exe) = &p.exe_path {
-                self.icon_paths
-                    .entry(key.clone())
-                    .or_insert_with(|| exe.to_string_lossy().into_owned());
+                let path = exe.to_string_lossy();
+                // A blank "path" is no path. Stored as-is it reached the shell
+                // as an empty name, which answers with the current directory's
+                // folder icon on the App history page.
+                if !path.trim().is_empty() {
+                    self.icon_paths
+                        .entry(key.clone())
+                        .or_insert_with(|| path.into_owned());
+                }
             } else if std::path::Path::new(&key).is_absolute() {
                 self.icon_paths
                     .entry(key.clone())
@@ -900,6 +910,61 @@ mod tests {
             db3.icon_path(r"c:\program files\test.exe"),
             Some(r"c:\program files\test.exe")
         );
+    }
+
+    /// A blank executable path is no icon source: stored as-is it made the page
+    /// ask the shell for an empty name, which answered with the current
+    /// directory's folder icon.
+    #[test]
+    fn blank_icon_paths_are_never_stored_or_kept() {
+        let mut db = AppHistoryDb::in_memory();
+        let mut p = ProcessEntry::new(10, "cmd.exe");
+        p.category = ProcCategory::App;
+        p.exe_path = Some(std::path::PathBuf::new());
+        let snap = Snapshot {
+            timestamp_ms: 1000,
+            processes: vec![p],
+            ..Default::default()
+        };
+        db.observe(&snap, 1.0);
+        assert_eq!(db.icon_path("cmd.exe"), None);
+
+        // A known image afterwards still fills the entry in — under its
+        // path identity, which is why such an app can hold two rows.
+        let mut p = ProcessEntry::new(10, "cmd.exe");
+        p.category = ProcCategory::App;
+        p.exe_path = Some(r"C:\Windows\System32\cmd.exe".into());
+        let snap = Snapshot {
+            timestamp_ms: 2000,
+            processes: vec![p],
+            ..Default::default()
+        };
+        db.observe(&snap, 1.0);
+        assert_eq!(
+            db.icon_path(r"c:\windows\system32\cmd.exe"),
+            Some(r"C:\Windows\System32\cmd.exe")
+        );
+        assert_eq!(db.icon_path("cmd.exe"), None);
+
+        // Files written by an older build can carry a blank path; loading one
+        // drops it instead of feeding it to the shell.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("history.json");
+        let legacy_json = serde_json::json!({
+            "since_epoch_s": 12345,
+            "entries": {
+                "cmd.exe": {
+                    "cpu_seconds": 0.0,
+                    "network_bytes": 0,
+                    "network_available": false
+                }
+            },
+            "names": { "cmd.exe": "cmd.exe" },
+            "icon_paths": { "cmd.exe": "" }
+        });
+        std::fs::write(&path, legacy_json.to_string()).unwrap();
+        let loaded = AppHistoryDb::open(path);
+        assert_eq!(loaded.icon_path("cmd.exe"), None);
     }
 
     #[test]

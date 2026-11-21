@@ -27,7 +27,9 @@ platform boundary (`tm-core` ← `tm-platform` ← `tm-app` / `tm-service`), and
     `[columns.<table>]` / `.visible` / `.order` sections + debounced
     SettingsWriter), `app_history.rs` (per-app usage db, single serialized
     writer thread with generations, late-load merge, Unix non-system
-    eligibility),
+    eligibility; identity is the exe path, so an app first seen without one
+    keeps a name-keyed row; icon paths are stored per key and blank/bare ones
+    are dropped on load and never written),
     `demand.rs` (TelemetryDemand bitmask),
     `persist.rs` (crate-private: synced temp-file-then-rename replacement
     for every persisted file, and `set_aside` — an existing file that cannot
@@ -90,8 +92,10 @@ platform boundary (`tm-core` ← `tm-platform` ← `tm-app` / `tm-service`), and
     a process lives), `icons.rs` (shell icon extraction via `SHGetFileInfoW`,
     plus `default_app_icon_rgba` — the shell's generic application icon from
     `SHGFI_USEFILEATTRIBUTES`, i.e. what Explorer shows for an icon-less `.exe`;
-    extraction is serialized process-wide and initializes COM per thread
-    because the shell icon cache is not safe to hit concurrently),
+    extraction is serialized process-wide, initializes COM per thread (the
+    shell icon cache is not safe to hit concurrently), and refuses blank or
+    bare names — the shell answers an empty name with the CURRENT DIRECTORY's
+    folder icon),
     `net_info.rs` (cached adapter/link/IP metadata plus
     `wifi_details()`, the ONLY location-gated call — SSID/signal, opt-in via
     `Settings.wifi_details`),
@@ -270,7 +274,8 @@ platform boundary (`tm-core` ← `tm-platform` ← `tm-app` / `tm-service`), and
     point `icon_or_default` — the row's executable icon, else the platform's
     `default_app_icon_rgba` when the row has no path or the OS has no icon for
     that image, else nothing while extraction is in flight; the UI draws no
-    icon of its own),
+    icon of its own, and `usable_icon_path` keeps blank/bare strings from ever
+    becoming a cache key or a shell lookup),
     `action_executor.rs`. Theme and font setup moved to `crates/tm-ui`;
     `tm-app` re-exports them as `crate::theme` / `crate::fonts`.
 - `crates/tm-ui`

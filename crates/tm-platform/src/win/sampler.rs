@@ -1682,7 +1682,11 @@ impl Sampler {
                 .names_by_pid
                 .get(&pid_u)
                 .map(|names| names.join(", "));
-            entry.exe_path = exe_owned;
+            // A path that is not a path is not identity: an empty image path
+            // (sysinfo can yield one for a process it cannot query) would
+            // otherwise be persisted and handed to the shell, which answers an
+            // empty name with the CURRENT DIRECTORY's icon.
+            entry.exe_path = exe_owned.filter(|p| !p.as_os_str().is_empty());
             entry.threads = threads;
             processes.push(entry);
         }
@@ -1738,7 +1742,10 @@ impl Sampler {
             // it could replay that executable's saved scheduling rules onto
             // this unrelated process.
             if p.exe_path.is_none() {
-                p.exe_path = self.image_paths.get(p.pid, p.start_epoch_s);
+                p.exe_path = self
+                    .image_paths
+                    .get(p.pid, p.start_epoch_s)
+                    .filter(|exe| !exe.as_os_str().is_empty());
                 if let Some(exe) = p.exe_path.as_ref() {
                     let ver = version::query(&exe.to_string_lossy());
                     if p.display == p.name && !ver[0].is_empty() {

@@ -49,6 +49,40 @@ fn compare_rows(a: &Row, b: &Row, sort: tablekit::SortState) -> Ordering {
         .then_with(|| tablekit::cmp_ignore_case(&a.name, &b.name))
 }
 
+/// Where a history row's icon comes from.
+///
+/// The database's stored executable path is authoritative, but only when it is
+/// one: entries written by older builds can carry a blank path (or a bare
+/// process name) for an app whose image was not known when it was first seen,
+/// and such a value must not reach the shell — an empty name makes it answer
+/// with the current directory's folder icon. Those rows fall back to the live
+/// snapshot, and to the platform's default application icon after that.
+fn resolve_row_icon_path(
+    db_icons: &std::collections::BTreeMap<String, String>,
+    key: &str,
+    shown: &str,
+    latest_snap: Option<&tm_core::model::Snapshot>,
+) -> Option<String> {
+    if let Some(path) = db_icons
+        .get(key)
+        .and_then(|p| crate::icon_cache::usable_icon_path(p))
+    {
+        return Some(path.to_string());
+    }
+    if std::path::Path::new(key).is_absolute() {
+        return Some(key.to_string());
+    }
+    latest_snap.and_then(|snap| {
+        snap.processes.iter().find_map(|p| {
+            if p.name.eq_ignore_ascii_case(key) || p.shown_name() == shown {
+                crate::icon_cache::row_icon_key(p.exe_path.as_deref())
+            } else {
+                None
+            }
+        })
+    })
+}
+
 /// egui temp-data key of the keyboard selection: the row OWNER (the display
 /// name, the same identity `TmTable::row` receives). The page has no other
 /// selection state, and the entry is touched every frame the page is shown.
@@ -194,21 +228,7 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
         .iter()
         .map(|(k, v)| {
             let shown = db_names.get(k).cloned().unwrap_or_else(|| k.clone());
-            let icon_path = db_icons.get(k).cloned().or_else(|| {
-                if std::path::Path::new(k).is_absolute() {
-                    Some(k.clone())
-                } else {
-                    latest_snap.as_deref().and_then(|snap| {
-                        snap.processes.iter().find_map(|p| {
-                            if p.name.eq_ignore_ascii_case(k) || p.shown_name() == shown {
-                                crate::icon_cache::row_icon_key(p.exe_path.as_deref())
-                            } else {
-                                None
-                            }
-                        })
-                    })
-                }
-            });
+            let icon_path = resolve_row_icon_path(&db_icons, k, &shown, latest_snap.as_deref());
             Row {
                 name: shown,
                 icon_path,
@@ -463,6 +483,49 @@ pub fn clear_history_dialog(app: &mut TaskManApp, ctx: &egui::Context, pal: &the
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A stored blank path is no icon source. It used to be handed to the
+    /// shell, which answered with the current directory's folder icon; the row
+    /// must instead use the live snapshot, and nothing at all when the app is
+    /// not running.
+    #[test]
+    fn blank_stored_icon_paths_fall_back_to_the_live_snapshot() {
+        let mut icons = std::collections::BTreeMap::new();
+        icons.insert("cmd.exe".to_string(), String::new());
+        icons.insert("clang-cl.exe".to_string(), "clang-cl.exe".to_string());
+
+        let mut running = tm_core::model::ProcessEntry::new(10, "cmd.exe");
+        running.exe_path = Some(r"C:\Windows\System32\cmd.exe".into());
+        let snap = tm_core::model::Snapshot {
+            processes: vec![running],
+            ..Default::default()
+        };
+
+        // Blank for a running app: the live process supplies the image.
+        assert_eq!(
+            resolve_row_icon_path(&icons, "cmd.exe", "cmd.exe", Some(&snap)).as_deref(),
+            Some(r"C:\Windows\System32\cmd.exe")
+        );
+        // Bare name (not a path) for an app that is not running: nothing.
+        assert_eq!(
+            resolve_row_icon_path(&icons, "clang-cl.exe", "clang-cl.exe", None),
+            None
+        );
+        // A stored path that is a path stays authoritative.
+        icons.insert(
+            r"c:\tools\app.exe".to_string(),
+            r"C:\Tools\app.exe".to_string(),
+        );
+        assert_eq!(
+            resolve_row_icon_path(&icons, r"c:\tools\app.exe", "app.exe", Some(&snap)).as_deref(),
+            Some(r"C:\Tools\app.exe")
+        );
+        // An absolute-path key needs no stored entry.
+        assert_eq!(
+            resolve_row_icon_path(&icons, r"c:\other\b.exe", "b.exe", None).as_deref(),
+            Some(r"c:\other\b.exe")
+        );
+    }
 
     #[test]
     fn unavailable_network_sorts_last_in_both_directions() {

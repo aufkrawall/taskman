@@ -97,8 +97,9 @@ impl IconCache {
         actions: &Arc<dyn tm_platform::actions::PlatformActions>,
         path: Option<&str>,
     ) -> Option<egui::TextureHandle> {
-        let Some(path) = path else {
-            // No image at all: ask for the OS default straight away.
+        let Some(path) = path.and_then(usable_icon_path) else {
+            // No image at all (or only a blank one persisted by an older
+            // build): ask for the OS default straight away.
             return self.default_app_icon(ctx, actions);
         };
         match self.lookup(ctx, actions, path) {
@@ -333,7 +334,7 @@ fn icon_worker(
     }
 }
 
-/// The cache key for a process row: its executable path, when the OS knows it.
+/// The cache key for a process row: its executable path, when the OS knows one.
 ///
 /// Rows without one are not keyed at all — [`IconCache::icon_or_default`]
 /// paints the platform's default application icon for them. Nothing is derived
@@ -341,7 +342,20 @@ fn icon_worker(
 /// row's behalf (a pseudo-process "Registry" shown as regedit.exe, say) invents
 /// an association the OS does not have.
 pub fn row_icon_key(exe_path: Option<&std::path::Path>) -> Option<String> {
-    exe_path.map(|p| p.to_string_lossy().into_owned())
+    let path = exe_path?;
+    usable_icon_path(&path.to_string_lossy()).map(str::to_string)
+}
+
+/// Whether `path` can name an application's image at all.
+///
+/// Seen through the shell, an empty name is the CURRENT DIRECTORY (its folder
+/// icon) and a bare name is resolved against the working directory, so
+/// anything without a separator — a kernel pseudo-process's `MemCompression`,
+/// `Registry`, or a blank string persisted by an older build — is no icon
+/// source and must fall through to the platform's default application icon.
+pub fn usable_icon_path(path: &str) -> Option<&str> {
+    let path = path.trim();
+    (!path.is_empty() && path.contains(['\\', '/'])).then_some(path)
 }
 
 #[cfg(test)]
@@ -522,6 +536,33 @@ mod tests {
             Some(r"C:\x\a.exe".to_string())
         );
         assert_eq!(row_icon_key(None), None);
+    }
+
+    /// A blank path and a bare process name are not image paths. Asking the
+    /// shell for one makes it answer with the current directory's folder icon
+    /// (the folder glyph App History showed for path-less apps), so they count
+    /// as "no icon of its own".
+    #[test]
+    fn blank_and_bare_icon_paths_are_not_asked_for() {
+        for path in ["", "   ", "cmd.exe", "MemCompression"] {
+            assert_eq!(row_icon_key(Some(Path::new(path))), None, "{path:?}");
+            assert_eq!(usable_icon_path(path), None, "{path:?}");
+        }
+        assert_eq!(
+            usable_icon_path(r"C:\Windows\System32\cmd.exe"),
+            Some(r"C:\Windows\System32\cmd.exe")
+        );
+        assert_eq!(usable_icon_path(r"   C:\x\a.exe   "), Some(r"C:\x\a.exe"));
+
+        // …and such a row paints the platform's default icon, keyed nowhere
+        // near the blank string.
+        let ctx = egui::Context::default();
+        let actions: Arc<dyn PlatformActions> = Arc::new(IconActions::all());
+        let cache = IconCache::default();
+        let blank = pump(&cache, &ctx, &actions, Some("")).expect("default icon");
+        let default = pump(&cache, &ctx, &actions, None).expect("default icon");
+        assert_eq!(blank.id(), default.id());
+        assert!(!sync::lock(&cache.inner).tex.contains_key(""));
     }
 
     /// End to end against the real Windows shell (no broker, no GUI): a row

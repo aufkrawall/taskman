@@ -64,7 +64,17 @@ pub struct IconRgba {
 /// with them every kernel pseudo-process) yields the shell's generic
 /// application icon — the same "no icon" glyph Explorer draws. There is no
 /// substitute drawn here: the icon theme is the shell's to decide.
+///
+/// Only something that looks like a file path is asked for at all: an empty
+/// name makes `SHGetFileInfoW` answer with the icon of the CURRENT DIRECTORY
+/// (a folder — that is how App History rows for path-less apps came to show a
+/// folder glyph), and a bare name such as the kernel's `MemCompression` is
+/// resolved against the working directory.
 pub fn extract_icon_rgba(path: &str) -> Option<IconRgba> {
+    let path = path.trim();
+    if path.is_empty() || !path.contains(['\\', '/']) {
+        return None;
+    }
     initialize_com();
     let _serial = extract_lock();
     let wide: Vec<u16> = path.encode_utf16().chain(std::iter::once(0)).collect();
@@ -312,6 +322,24 @@ unsafe fn ddb_row_bytes(
 mod tests {
     use super::*;
     use windows::Win32::Graphics::Gdi::CreateBitmap;
+
+    /// The shell answers an empty name with the CURRENT DIRECTORY's folder
+    /// icon and resolves a bare name against the working directory, so neither
+    /// is ever asked for: both must come back empty instead of as a folder.
+    #[test]
+    fn blank_and_bare_names_have_no_shell_icon() {
+        for name in ["", "   ", ".", "MemCompression", "Registry", "cmd.exe"] {
+            assert!(
+                extract_icon_rgba(name).is_none(),
+                "{name:?} is not a file path"
+            );
+        }
+        let system_root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into());
+        assert!(
+            extract_icon_rgba(&format!(r"{system_root}\System32\cmd.exe")).is_some(),
+            "a real image path still resolves"
+        );
+    }
 
     /// The OS default application icon exists on a real Windows host and is a
     /// 32x32 RGBA image.
