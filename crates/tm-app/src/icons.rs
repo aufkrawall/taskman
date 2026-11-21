@@ -355,26 +355,6 @@ pub fn draw(ui: &egui::Ui, icon: Icon, rect: Rect, color: Color32) {
     }
 }
 
-/// Draw the generic "app window" glyph used for processes whose real icon
-/// is not (yet) available — echoes the default TM window icon.
-pub fn draw_app_window(ui: &egui::Ui, rect: Rect, color: Color32) {
-    let painter = ui.painter();
-    let r = rect.intersect(rect).shrink(1.0);
-    painter.rect_filled(r, 2.0, color.gamma_multiply(0.35));
-    painter.rect_stroke(
-        r,
-        2.0,
-        Stroke::new(1.0, color.gamma_multiply(0.9)),
-        egui::StrokeKind::Inside,
-    );
-    // Title bar strip.
-    let strip = Rect::from_min_max(
-        r.left_top(),
-        egui::pos2(r.right(), r.top() + r.height() * 0.32),
-    );
-    painter.rect_filled(strip, 2.0, color.gamma_multiply(0.8));
-}
-
 /// Draw an icon at an absolute rect (convenience wrapper).
 pub fn draw_at(ui: &egui::Ui, rect: egui::Rect, icon: Icon, color: Color32) {
     draw(ui, icon, rect, color);

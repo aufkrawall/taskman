@@ -14,13 +14,41 @@ use windows::Win32::Graphics::Gdi::GetBitmapBits;
 use windows::Win32::Graphics::Gdi::GetDIBits;
 use windows::Win32::Graphics::Gdi::GetObjectW;
 use windows::Win32::Graphics::Gdi::SelectObject;
+use windows::Win32::Storage::FileSystem::FILE_ATTRIBUTE_NORMAL;
+use windows::Win32::Storage::FileSystem::FILE_FLAGS_AND_ATTRIBUTES;
 use windows::Win32::UI::Shell::SHFILEINFOW;
+use windows::Win32::UI::Shell::SHGFI_FLAGS;
 use windows::Win32::UI::Shell::SHGFI_ICON;
+use windows::Win32::UI::Shell::SHGFI_USEFILEATTRIBUTES;
 use windows::Win32::UI::Shell::SHGetFileInfoW;
 use windows::Win32::UI::WindowsAndMessaging::DestroyIcon;
 use windows::Win32::UI::WindowsAndMessaging::GetIconInfoExW;
+use windows::Win32::UI::WindowsAndMessaging::HICON;
 use windows::Win32::UI::WindowsAndMessaging::ICONINFOEXW;
 use windows::core::PCWSTR;
+
+/// Give the calling thread a COM apartment before asking the shell for icons.
+///
+/// `SHGetFileInfo` loads icons through the shell's image lists, which need COM
+/// on the calling thread; without it extraction intermittently answers with no
+/// icon at all — a process row then lost its icon for no visible reason.
+/// Initializes once per thread, and a thread that already has an apartment
+/// (`RPC_E_CHANGED_MODE`) is left alone.
+fn initialize_com() {
+    thread_local! {
+        static INIT: () = {
+            // SAFETY: no interface is created or stored here; the shell only
+            // needs an apartment to exist for the duration of the call.
+            let _ = unsafe {
+                windows::Win32::System::Com::CoInitializeEx(
+                    None,
+                    windows::Win32::System::Com::COINIT_APARTMENTTHREADED,
+                )
+            };
+        };
+    }
+    INIT.with(|_| ());
+}
 
 /// Decoded icon: converted to straight-alpha RGBA, `w*h*4` bytes.
 pub struct IconRgba {
@@ -29,67 +57,101 @@ pub struct IconRgba {
     pub rgba: Vec<u8>,
 }
 
-/// Kernel pseudo-processes ("System", "Registry", ...) are named as bare
-/// names with no image file; map the ones that do have a real backing image
-/// to it, so the shell icon matches what Task Manager shows. The others keep
-/// the generic glyph — there is no file whose icon would be honest.
-fn icon_source_path(path: &str) -> std::borrow::Cow<'_, str> {
-    if path.contains(['\\', '/']) {
-        return std::borrow::Cow::Borrowed(path);
-    }
-    let system_root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_string());
-    match path.to_ascii_lowercase().as_str() {
-        "system" | "[system process]" => {
-            std::borrow::Cow::Owned(format!(r"{system_root}\System32\ntoskrnl.exe"))
-        }
-        "registry" => std::borrow::Cow::Owned(format!(r"{system_root}\regedit.exe")),
-        _ => std::borrow::Cow::Borrowed(path),
-    }
+/// Extract the per-user 32x32 icon the shell shows for `path` (an executable
+/// or .lnk).
+///
+/// An image without an icon resource of its own (lsass.exe, ntoskrnl.exe, and
+/// with them every kernel pseudo-process) yields the shell's generic
+/// application icon — the same "no icon" glyph Explorer draws. There is no
+/// substitute drawn here: the icon theme is the shell's to decide.
+pub fn extract_icon_rgba(path: &str) -> Option<IconRgba> {
+    initialize_com();
+    let _serial = extract_lock();
+    let wide: Vec<u16> = path.encode_utf16().chain(std::iter::once(0)).collect();
+    let info = shell_icon_info(&wide, Default::default(), SHGFI_ICON)?;
+    icon_rgba(info.hIcon)
 }
 
-/// Extract the per-user 32x32 icon for `path` (an executable or lnk).
-pub fn extract_icon_rgba(path: &str) -> Option<IconRgba> {
-    let path = icon_source_path(path);
-    let wide: Vec<u16> = path.encode_utf16().chain(std::iter::once(0)).collect();
-    unsafe {
-        let mut info = SHFILEINFOW {
-            hIcon: Default::default(),
-            iIcon: 0,
-            dwAttributes: 0,
-            szDisplayName: [0; 260],
-            szTypeName: [0; 80],
-        };
-        let ok = SHGetFileInfoW(
-            PCWSTR(wide.as_ptr()),
-            Default::default(),
+/// The shell's default application icon: what Explorer shows for an `.exe`
+/// that has no icon resource of its own.
+///
+/// `SHGFI_USEFILEATTRIBUTES` makes the shell answer from the file-type
+/// association instead of touching the disk, so no file has to exist — the
+/// result is the OS's generic application glyph for the current
+/// theme/DPI/icon settings. The GUI paints this wherever a process has no
+/// icon it could extract its own.
+pub fn default_app_icon_rgba() -> Option<IconRgba> {
+    initialize_com();
+    let _serial = extract_lock();
+    const PROBE: &str = "application.exe";
+    let wide: Vec<u16> = PROBE.encode_utf16().chain(std::iter::once(0)).collect();
+    let info = shell_icon_info(
+        &wide,
+        FILE_ATTRIBUTE_NORMAL,
+        SHGFI_ICON | SHGFI_USEFILEATTRIBUTES,
+    )?;
+    icon_rgba(info.hIcon)
+}
+
+/// Serializes shell icon extraction process-wide.
+///
+/// The shell's icon cache is not safe for concurrent extraction: two threads
+/// asking at the same time intermittently get "no icon" for a file that has
+/// one (reproducible with the icon tests below, gone once the calls are
+/// serialized). Extraction is ~ms and runs on one worker thread anyway, so the
+/// lock costs nothing it does not already serialize.
+fn extract_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// `SHGetFileInfoW(..., SHGFI_ICON)` into a `SHFILEINFOW`; the caller owns the
+/// returned `hIcon`.
+fn shell_icon_info(
+    wide_path: &[u16],
+    attributes: FILE_FLAGS_AND_ATTRIBUTES,
+    flags: SHGFI_FLAGS,
+) -> Option<SHFILEINFOW> {
+    let mut info = SHFILEINFOW {
+        hIcon: Default::default(),
+        iIcon: 0,
+        dwAttributes: 0,
+        szDisplayName: [0; 260],
+        szTypeName: [0; 80],
+    };
+    let ok = unsafe {
+        SHGetFileInfoW(
+            PCWSTR(wide_path.as_ptr()),
+            attributes,
             Some(&mut info),
             std::mem::size_of::<SHFILEINFOW>() as u32,
-            SHGFI_ICON,
-        );
-        if ok == 0 || info.hIcon.is_invalid() {
+            flags,
+        )
+    };
+    (ok != 0 && !info.hIcon.is_invalid()).then_some(info)
+}
+
+/// Convert a shell `HICON` to straight-alpha RGBA and release it.
+fn icon_rgba(hicon: HICON) -> Option<IconRgba> {
+    let result = (|| {
+        let mut ii = ICONINFOEXW {
+            cbSize: std::mem::size_of::<ICONINFOEXW>() as u32,
+            ..Default::default()
+        };
+        if !unsafe { GetIconInfoExW(hicon, &mut ii) }.as_bool() {
             return None;
         }
-        let hicon = info.hIcon;
-        let result = (|| {
-            let mut ii = ICONINFOEXW {
-                cbSize: std::mem::size_of::<ICONINFOEXW>() as u32,
-                ..Default::default()
-            };
-            if !GetIconInfoExW(hicon, &mut ii).as_bool() {
-                return None;
-            }
-            let out = bitmap_to_rgba(ii.hbmColor, ii.hbmMask);
-            if !ii.hbmColor.is_invalid() {
-                let _ = DeleteObject(ii.hbmColor.into());
-            }
-            if !ii.hbmMask.is_invalid() {
-                let _ = DeleteObject(ii.hbmMask.into());
-            }
-            out
-        })();
-        let _ = DestroyIcon(hicon);
-        result
-    }
+        let out = unsafe { bitmap_to_rgba(ii.hbmColor, ii.hbmMask) };
+        if !ii.hbmColor.is_invalid() {
+            let _ = unsafe { DeleteObject(ii.hbmColor.into()) };
+        }
+        if !ii.hbmMask.is_invalid() {
+            let _ = unsafe { DeleteObject(ii.hbmMask.into()) };
+        }
+        out
+    })();
+    let _ = unsafe { DestroyIcon(hicon) };
+    result
 }
 
 /// Read a 32-bpp copy of `color`, apply the AND `mask` for icons without
@@ -251,24 +313,34 @@ mod tests {
     use super::*;
     use windows::Win32::Graphics::Gdi::CreateBitmap;
 
-    /// Kernel pseudo-process names resolve to a real OS image, so they get the
-    /// shell icon instead of failing extraction forever.
+    /// The OS default application icon exists on a real Windows host and is a
+    /// 32x32 RGBA image.
     #[test]
-    fn pseudo_process_names_map_to_real_os_images() {
-        assert!(icon_source_path(r"C:\Windows\System32\lsass.exe").contains('\\'));
-        assert!(icon_source_path("System").ends_with(r"ntoskrnl.exe"));
-        assert!(icon_source_path("[System Process]").ends_with(r"ntoskrnl.exe"));
-        assert!(icon_source_path("Registry").ends_with(r"regedit.exe"));
-        assert_eq!(icon_source_path("MemCompression"), "MemCompression");
-    }
-
-    /// The mapped image actually yields an icon on a real Windows host.
-    #[cfg(target_os = "windows")]
-    #[test]
-    fn pseudo_process_icon_extracts() {
-        let ic = extract_icon_rgba("Registry").expect("registry maps to a real image icon");
+    fn default_app_icon_extracts() {
+        let ic = default_app_icon_rgba().expect("the shell always has a default application icon");
         assert_eq!((ic.width, ic.height), (32, 32));
         assert_eq!(ic.rgba.len(), (32 * 32 * 4) as usize);
+        assert!(
+            ic.rgba.as_chunks::<4>().0.iter().any(|px| px[3] != 0),
+            "the default icon is not fully transparent"
+        );
+    }
+
+    /// An image without an icon resource resolves to exactly that default, so
+    /// rows for kernel pseudo-processes (no image path at all) and rows for
+    /// icon-less system images show the same OS glyph instead of two
+    /// different placeholders.
+    #[test]
+    fn icon_less_image_matches_the_default_app_icon() {
+        let system_root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into());
+        let image = extract_icon_rgba(&format!(r"{system_root}\System32\lsass.exe"))
+            .expect("lsass.exe has no icon resource, the shell returns the generic one");
+        let default = default_app_icon_rgba().expect("default icon");
+        assert_eq!(
+            (image.width, image.height, image.rgba),
+            (default.width, default.height, default.rgba),
+            "the generic shell icon must be what a path-less row paints"
+        );
     }
 
     /// Pins the layout fact the mask decoder depends on: a monochrome DDB

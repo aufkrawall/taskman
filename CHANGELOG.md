@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Improved
+
+- **Every row icon now comes from the OS icon theme:** rows without an application icon no longer show a glyph of our own. Processes, Details, Users, Startup and App History paint the platform's own default application icon instead — on Windows the shell's generic `.exe` icon (the "no icon defined" window glyph Explorer and Task Manager show), on Linux the desktop theme's `application-x-executable` icon. The accent-colored rounded square that `Memory Compression`, `System Interrupts`, `smss.exe` and other path-less kernel rows used to show is gone; icon-less system images (`lsass.exe`, `winlogon.exe`, `ntoskrnl.exe`) and path-less pseudo-processes now render the same OS glyph. Row icons are also never invented for a row that has no image.
+
 ### New
 
 - **Linux application icons from the desktop icon theme:** on Linux, rows on the Processes, Details, Users, Startup and App History pages now resolve each application's icon through the freedesktop icon theme spec — the `.desktop` entry's `Icon=` matched by `Exec=` basename or desktop-file id across the XDG data dirs, then the current GTK icon theme (with its `Inherits` chain), `hicolor`, and the legacy pixmaps dir; PNG icons are decoded and capped at 64 px — instead of always showing the placeholder glyph.
@@ -9,7 +13,8 @@
 ### Fixed
 
 - **Process icons no longer randomly revert to the placeholder:** the icon texture cache evicted arbitrary (HashMap-iteration-order) entries once it passed its 512-icon cap, so on-screen rows could lose a just-loaded icon and flash the placeholder; eviction is now true LRU, a repaint is requested whenever textures are uploaded (the last batch no longer waits for an unrelated repaint), and a dead icon worker thread is respawned on the next request.
-- **Kernel pseudo-process icons on Windows:** rows for `System` / `[System Process]` and `Registry` now show the real OS image icons (`ntoskrnl.exe`, `regedit.exe`) via the same shell extraction as every other process; pseudo-processes without a backing image (`Memory Compression`, `Secure System`) keep the placeholder.
+- **Windows shell icons no longer intermittently come back empty:** `SHGetFileInfoW` returns no icon when several threads extract at the same time, and needs a COM apartment on the calling thread; extraction is now serialized process-wide and initializes COM per thread, so a row does not lose its icon (and fall back to the generic one for 30 s) for no visible reason.
+- **Kernel pseudo-process rows and the file actions:** the fabricated `System` → `ntoskrnl.exe` / `Registry` → `regedit.exe` name mapping is gone. It gave `Registry` an icon Windows itself does not show, and — because the same string doubled as the row's executable — enabled **Open file location** / **Properties** for processes that have no file (they failed or opened nothing). Pseudo-processes now show the OS default icon and those menu entries are disabled again, exactly as before.
 - **Startup-page icons for env-var/`.lnk` commands on Windows:** the Startup tab's icon lookup now uses the same command resolver as the publisher/impact columns (expands `%VAR%`, resolves `.lnk` targets), so those entries get their real application icon instead of the placeholder.
 
 - **Mock mode OS isolation:** `--mock` now wires an inert `MockActions` backend and skips the Windows Task Manager replacement check and Explorer restart path, preventing simulated UI actions from affecting real host processes or system state.

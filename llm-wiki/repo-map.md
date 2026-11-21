@@ -87,9 +87,11 @@ platform boundary (`tm-core` ← `tm-platform` ← `tm-app` / `tm-service`), and
     `users.rs`, `image_path.rs` (`NtQuerySystemInformation(SystemProcessIdInformation)`:
     the image path of a process no handle can be opened for, plus NT-device to
     drive-letter translation; both answers cached because neither changes while
-    a process lives), `icons.rs` (shell icon extraction via `SHGetFileInfoW`;
-    bare kernel pseudo-process names map to their real OS image —
-    `System`/`[System Process]` → `ntoskrnl.exe`, `Registry` → `regedit.exe`),
+    a process lives), `icons.rs` (shell icon extraction via `SHGetFileInfoW`,
+    plus `default_app_icon_rgba` — the shell's generic application icon from
+    `SHGFI_USEFILEATTRIBUTES`, i.e. what Explorer shows for an icon-less `.exe`;
+    extraction is serialized process-wide and initializes COM per thread
+    because the shell icon cache is not safe to hit concurrently),
     `net_info.rs` (cached adapter/link/IP metadata plus
     `wifi_details()`, the ONLY location-gated call — SSID/signal, opt-in via
     `Settings.wifi_details`),
@@ -167,7 +169,10 @@ platform boundary (`tm-core` ← `tm-platform` ← `tm-app` / `tm-service`), and
     table). `xdg_icons.rs` (freedesktop icon-theme resolution used by the
     Linux backend's `process_icon_rgba`: `.desktop` `Icon=` via XDG data dirs,
     current GTK theme + `Inherits` + `hicolor` + pixmaps, PNG decode capped at
-    64 px; platform-neutral so its tests run on the Windows host too).
+    64 px; plus `default_app_icon_rgba`, the theme's
+    `application-x-executable` / `application-default-icon` / `image-missing`
+    chain, which is what a row without an icon of its own paints;
+    platform-neutral so its tests run on the Windows host too).
     Linux/macOS backends exist and are
     built by default (`build.py`).
 - `crates/tm-app`
@@ -261,9 +266,11 @@ platform boundary (`tm-core` ← `tm-platform` ← `tm-app` / `tm-service`), and
      plus `keyboard_sample`/`chart_accessible_value` — a keyboard cursor
      pinned to a sample TIMESTAMP so live telemetry cannot slide it, and the
      selected sample published as the chart's accesskit value),
-    `icon_cache.rs` (lazy worker, upload budget, true-LRU cap; cache key via
-    `row_icon_key`, which falls back to the bare name of kernel
-    pseudo-processes so the backend can map them to a real OS image),
+    `icon_cache.rs` (lazy worker, upload budget, true-LRU cap; single entry
+    point `icon_or_default` — the row's executable icon, else the platform's
+    `default_app_icon_rgba` when the row has no path or the OS has no icon for
+    that image, else nothing while extraction is in flight; the UI draws no
+    icon of its own),
     `action_executor.rs`. Theme and font setup moved to `crates/tm-ui`;
     `tm-app` re-exports them as `crate::theme` / `crate::fonts`.
 - `crates/tm-ui`

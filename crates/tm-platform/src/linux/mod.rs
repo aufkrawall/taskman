@@ -944,6 +944,12 @@ impl PlatformActions for LinuxActions {
         crate::xdg_icons::process_icon_rgba(exe_path)
     }
 
+    fn default_app_icon_rgba(&self) -> Option<(u32, u32, Vec<u8>)> {
+        // Rows without an icon of their own (kernel threads, an app with no
+        // desktop entry) keep the same theme: the standard executable icon.
+        crate::xdg_icons::default_app_icon_rgba()
+    }
+
     fn list_process_file_io(
         &self,
         pid: u32,

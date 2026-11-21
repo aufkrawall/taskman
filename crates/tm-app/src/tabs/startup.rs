@@ -356,10 +356,11 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
                 // Windows) so the icon lookup hits a real file, not a raw
                 // command token.
                 let exe = resolve_startup_target(&item.command);
-                let tex = exe
-                    .as_deref()
-                    .and_then(|p| app.shared.icons.get(ui.ctx(), &app.actions, p, 4));
-                table.icon_cell(ui, rect, tex.as_ref(), pal.accent);
+                let tex = app
+                    .shared
+                    .icons
+                    .icon_or_default(ui.ctx(), &app.actions, exe.as_deref());
+                table.icon_cell(ui, rect, tex.as_ref());
                 let name_rect = table.col_rect(0, rect);
                 ui.painter_at(name_rect).text(
                     egui::Pos2::new(name_rect.left() + 56.0, rect.center().y),

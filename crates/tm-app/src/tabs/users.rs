@@ -891,14 +891,11 @@ fn app_row_ui(
     // with its session.
     let (rect, resp) = table.row(ui, pal, false, ("app", session_id, name));
     table.describe_row(ui, &resp, name, index);
-    let tex = crate::icon_cache::row_icon_key(exe.map(std::path::Path::new), name)
-        .and_then(|k| app.shared.icons.get(ui.ctx(), &app.actions, &k, 6));
-    table.icon_cell(
-        ui,
-        rect.translate(egui::vec2(22.0, 0.0)),
-        tex.as_ref(),
-        pal.accent,
-    );
+    let tex = app
+        .shared
+        .icons
+        .icon_or_default(ui.ctx(), &app.actions, exe);
+    table.icon_cell(ui, rect.translate(egui::vec2(22.0, 0.0)), tex.as_ref());
     let nr = table.col_rect(0, rect);
     let label = if roll.count > 1 {
         format!("{name} ({})", roll.count)

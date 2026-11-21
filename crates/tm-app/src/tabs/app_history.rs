@@ -201,7 +201,7 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
                     latest_snap.as_deref().and_then(|snap| {
                         snap.processes.iter().find_map(|p| {
                             if p.name.eq_ignore_ascii_case(k) || p.shown_name() == shown {
-                                crate::icon_cache::row_icon_key(p.exe_path.as_deref(), &p.name)
+                                crate::icon_cache::row_icon_key(p.exe_path.as_deref())
                             } else {
                                 None
                             }
@@ -331,11 +331,12 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
                     // (painted later in this same row pass) re-applies it.
                     table.repaint_row_selected(ui, &pal, rect);
                 }
-                let tex = row
-                    .icon_path
-                    .as_deref()
-                    .and_then(|p| app.shared.icons.get(ui.ctx(), &app.actions, p, 6));
-                table.icon_cell(ui, rect, tex.as_ref(), pal.accent);
+                let tex = app.shared.icons.icon_or_default(
+                    ui.ctx(),
+                    &app.actions,
+                    row.icon_path.as_deref(),
+                );
+                table.icon_cell(ui, rect, tex.as_ref());
                 let name_rect = table.col_rect(0, rect);
                 ui.painter_at(name_rect).text(
                     egui::Pos2::new(name_rect.left() + 56.0, rect.center().y),

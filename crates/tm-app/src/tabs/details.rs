@@ -1260,11 +1260,12 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
                         {
                             app.details_state.toggle_expanded(row.pid);
                         }
-                        let tex = row
-                            .icon_path
-                            .as_ref()
-                            .and_then(|p| app.shared.icons.get(ui.ctx(), &app.actions, p, 6));
-                        table.icon_cell(ui, indented_cell, tex.as_ref(), pal.accent);
+                        let tex = app.shared.icons.icon_or_default(
+                            ui.ctx(),
+                            &app.actions,
+                            row.icon_path.as_deref(),
+                        );
+                        table.icon_cell(ui, indented_cell, tex.as_ref());
                         let name_x = cell.left() + 56.0 + row.depth as f32 * TREE_INDENT;
                         if pointer.is_some_and(|pos| cell.contains(pos))
                             && tablekit::text_width(ui, &row.name, tablekit::FONT_ROW) + 10.0
@@ -2123,7 +2124,7 @@ fn row_from_process(p: &ProcessEntry, depth: usize, children: bool) -> Row {
         pid: p.pid,
         start_epoch_s: p.start_epoch_s,
         name: detail_name(p),
-        icon_path: crate::icon_cache::row_icon_key(p.exe_path.as_deref(), &p.name),
+        icon_path: crate::icon_cache::row_icon_key(p.exe_path.as_deref()),
         depth,
         children,
         pid_s: p.pid.to_string(),

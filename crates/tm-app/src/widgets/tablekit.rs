@@ -1510,30 +1510,28 @@ impl TmTable {
         resp.clicked()
     }
 
-    pub fn icon_cell(
-        &self,
-        ui: &egui::Ui,
-        row: Rect,
-        tex: Option<&egui::TextureHandle>,
-        tint: Color32,
-    ) {
+    /// Paint a row's icon from `tex`.
+    ///
+    /// `tex` always comes from the platform's icon layer
+    /// ([`crate::icon_cache::IconCache::icon_or_default`]) — the real
+    /// application icon or the OS's default one. There is no drawn fallback
+    /// here on purpose: an icon placeholder of our own would fight the OS icon
+    /// theme, so an unavailable icon leaves the cell empty.
+    pub fn icon_cell(&self, ui: &egui::Ui, row: Rect, tex: Option<&egui::TextureHandle>) {
         let side = 18.0f32.min(self.row_h - 6.0);
         let r = Rect::from_center_size(
             Pos2::new(row.left() + 38.0, row.center().y),
             egui::vec2(side, side),
         );
-        let painter = ui.painter_at(row);
-        match tex {
-            Some(t) => {
-                painter.image(
-                    t.id(),
-                    r,
-                    Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
-                    Color32::WHITE,
-                );
-            }
-            None => icons::draw_app_window(ui, r, tint),
-        }
+        let Some(tex) = tex else {
+            return;
+        };
+        ui.painter_at(row).image(
+            tex.id(),
+            r,
+            Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
+            Color32::WHITE,
+        );
     }
 }
 

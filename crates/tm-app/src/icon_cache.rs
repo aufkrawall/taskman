@@ -7,6 +7,10 @@
 //! for one more repaint so the rest stream in without a frame hitch.
 //! The cache is bounded by an LRU cap and transient failures retry after a
 //! TTL instead of being remembered forever.
+//!
+//! Every icon the UI paints comes from here ([`IconCache::icon_or_default`]):
+//! the row's own application icon when the OS has one, otherwise the platform's
+//! default application icon. The UI never draws an icon of its own.
 
 use eframe::egui;
 use std::collections::{HashMap, HashSet};
@@ -20,6 +24,19 @@ const CACHE_CAP: usize = 512;
 const UPLOAD_BUDGET: usize = 6;
 /// Retry window for icons whose extraction failed (e.g. file locked).
 const FAILURE_RETRY_TTL: std::time::Duration = std::time::Duration::from_secs(30);
+/// Cache key for the platform's default application icon. No real path
+/// contains a NUL, so this can never collide with one.
+const DEFAULT_APP_ICON_KEY: &str = "\u{0}os-default-app-icon";
+
+/// What the cache knows about one key right now.
+enum Lookup {
+    /// The texture is uploaded and ready to paint.
+    Ready(egui::TextureHandle),
+    /// Extraction is queued or running; the answer arrives on a later frame.
+    Pending,
+    /// The platform has no icon for this key.
+    Missing,
+}
 
 #[derive(Default)]
 struct Inner {
@@ -59,52 +76,94 @@ pub struct IconCache {
 }
 
 impl IconCache {
-    /// Look up the texture for `path`; schedules background extraction when
-    /// unknown and uploads up to [`UPLOAD_BUDGET`] freshly decoded results
-    /// per frame. Never blocks; starts its worker on first use.
-    pub fn get(
+    /// The texture to paint for a row whose executable is `path`.
+    ///
+    /// This is the only icon entry point the pages use, and it never lets the
+    /// UI invent an icon:
+    ///
+    /// * a row with a real executable paints the icon the OS shell has for it;
+    /// * a row without one (kernel pseudo-processes such as "System" or
+    ///   "Memory Compression") and a row whose image has no icon the shell can
+    ///   extract both paint the platform's *default application icon* — the
+    ///   same glyph Explorer shows for an application without an icon of its
+    ///   own. The platform's icon theme decides, not ours.
+    ///
+    /// `None` means "nothing honest to paint yet": the row has a path and its
+    /// icon is still being extracted. Never blocks; extraction happens on the
+    /// worker thread and the texture arrives on a later frame.
+    pub fn icon_or_default(
         &self,
         ctx: &egui::Context,
         actions: &Arc<dyn tm_platform::actions::PlatformActions>,
-        path: &str,
-        _budget: usize,
+        path: Option<&str>,
     ) -> Option<egui::TextureHandle> {
+        let Some(path) = path else {
+            // No image at all: ask for the OS default straight away.
+            return self.default_app_icon(ctx, actions);
+        };
+        match self.lookup(ctx, actions, path) {
+            Lookup::Ready(tex) => Some(tex),
+            Lookup::Missing => self.default_app_icon(ctx, actions),
+            // Its own icon is in flight: painting the default here and
+            // swapping it a frame later would read as a flicker of the wrong
+            // icon, so the row stays empty until the platform answers.
+            Lookup::Pending => None,
+        }
+    }
+
+    /// The platform's default application icon, if it has one.
+    fn default_app_icon(
+        &self,
+        ctx: &egui::Context,
+        actions: &Arc<dyn tm_platform::actions::PlatformActions>,
+    ) -> Option<egui::TextureHandle> {
+        match self.lookup(ctx, actions, DEFAULT_APP_ICON_KEY) {
+            Lookup::Ready(tex) => Some(tex),
+            Lookup::Pending | Lookup::Missing => None,
+        }
+    }
+
+    /// Resolve `key` against the cache, scheduling background extraction when
+    /// it is unknown and uploading up to [`UPLOAD_BUDGET`] freshly decoded
+    /// results per frame. Never blocks; starts its worker on first use.
+    fn lookup(
+        &self,
+        ctx: &egui::Context,
+        actions: &Arc<dyn tm_platform::actions::PlatformActions>,
+        key: &str,
+    ) -> Lookup {
         self.ensure_worker(actions);
         self.drain_results(ctx);
 
         let mut inner = sync::lock(&self.inner);
         let use_tick = inner.next_use;
-        enum Hit {
-            Ready(egui::TextureHandle),
-            Miss,
-        }
-        let hit = match inner.tex.get_mut(path) {
+        let hit = match inner.tex.get_mut(key) {
             Some(Entry::Ready { tex, last_used }) => {
                 *last_used = use_tick;
-                Hit::Ready(tex.clone())
+                Lookup::Ready(tex.clone())
             }
             Some(Entry::Failed(at)) => {
                 if at.elapsed() >= FAILURE_RETRY_TTL {
-                    inner.tex.remove(path);
-                    Hit::Miss
+                    inner.tex.remove(key);
+                    Lookup::Missing
                 } else {
-                    return None;
+                    return Lookup::Missing;
                 }
             }
-            None => Hit::Miss,
+            None => Lookup::Missing,
         };
-        if let Hit::Ready(t) = hit {
+        if let Lookup::Ready(_) = hit {
             inner.next_use = use_tick + 1;
-            return Some(t);
+            return hit;
         }
-        if !inner.queued.contains(path)
+        if !inner.queued.contains(key)
             && self.in_flight.load(std::sync::atomic::Ordering::Relaxed) < 64
         {
-            inner.queued.insert(path.to_string());
+            inner.queued.insert(key.to_string());
             drop(inner);
-            self.send_request(path);
+            self.send_request(key);
         }
-        None
+        Lookup::Pending
     }
 
     fn send_request(&self, path: &str) {
@@ -171,11 +230,12 @@ impl IconCache {
                 let tex = d.icon.map(|(w, h, rgba)| {
                     let img =
                         egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], &rgba);
-                    ctx.load_texture(
-                        format!("icon:{}", d.path),
-                        img,
-                        egui::TextureOptions::LINEAR,
-                    )
+                    let name = if d.path == DEFAULT_APP_ICON_KEY {
+                        "icon:os-default-app".to_string()
+                    } else {
+                        format!("icon:{}", d.path)
+                    };
+                    ctx.load_texture(name, img, egui::TextureOptions::LINEAR)
                 });
                 inner.queued.remove(&d.path);
                 let entry = match tex {
@@ -197,8 +257,8 @@ impl IconCache {
             // Bound the cache, evicting least-recently-used entries beyond the
             // cap. Failed entries carry no texture and are dropped first. (A
             // plain HashMap key dump would evict RANDOM entries — including
-            // icons currently on screen — which is what made icons flicker
-            // back to the placeholder once the cache filled up.)
+            // icons currently on screen — which made icons blink out once the
+            // cache filled up.)
             if inner.tex.len() > CACHE_CAP {
                 let mut excess = inner.tex.len() - CACHE_CAP;
                 let failed: Vec<String> = inner
@@ -262,27 +322,26 @@ fn icon_worker(
     results: Arc<Mutex<Vec<Decoded>>>,
 ) {
     while let Ok(path) = rx.recv() {
-        let icon = actions.process_icon_rgba(&path);
+        // The default application icon is a platform property, not a file
+        // icon: ask for it directly instead of resolving it as a path.
+        let icon = if path == DEFAULT_APP_ICON_KEY {
+            actions.default_app_icon_rgba()
+        } else {
+            actions.process_icon_rgba(&path)
+        };
         sync::lock(&results).push(Decoded { path, icon });
     }
 }
 
-/// The cache key for a process row: the exe path when known; otherwise the
-/// bare process name for the kernel pseudo-processes ("System", "Registry",
-/// ...) that have no image path — the Windows backend maps those names to
-/// the real OS image in the icon layer. Any other process without a path has
-/// no icon to find, so it stays `None` and keeps the placeholder glyph.
-pub fn row_icon_key(exe_path: Option<&std::path::Path>, name: &str) -> Option<String> {
-    if let Some(p) = exe_path {
-        return Some(p.to_string_lossy().into_owned());
-    }
-    let lower = name.to_ascii_lowercase();
-    let stem = lower.strip_suffix(".exe").unwrap_or(&lower);
-    matches!(
-        stem,
-        "system" | "[system process]" | "registry" | "memcompression" | "secure system"
-    )
-    .then(|| name.to_string())
+/// The cache key for a process row: its executable path, when the OS knows it.
+///
+/// Rows without one are not keyed at all — [`IconCache::icon_or_default`]
+/// paints the platform's default application icon for them. Nothing is derived
+/// from the process name: a bare name is not a file, and naming an image on the
+/// row's behalf (a pseudo-process "Registry" shown as regedit.exe, say) invents
+/// an association the OS does not have.
+pub fn row_icon_key(exe_path: Option<&std::path::Path>) -> Option<String> {
+    exe_path.map(|p| p.to_string_lossy().into_owned())
 }
 
 #[cfg(test)]
@@ -291,25 +350,57 @@ mod tests {
     use std::path::Path;
     use tm_platform::actions::PlatformActions;
 
-    /// Actions stub that "extracts" a 2x2 red icon for every path.
-    struct IconActions;
-    impl PlatformActions for IconActions {
-        fn process_icon_rgba(&self, _exe_path: &str) -> Option<(u32, u32, Vec<u8>)> {
-            Some((2, 2, [200u8, 10, 10, 255].repeat(4)))
+    /// The written pixels of a 2x2 icon, so a test can tell which texture the
+    /// cache handed back.
+    const RED: [u8; 4] = [200, 10, 10, 255];
+    const GREEN: [u8; 4] = [10, 200, 10, 255];
+
+    /// Actions stub that "extracts" a 2x2 red icon for every path and a green
+    /// default application icon; `None`s the paths in `missing`.
+    struct IconActions {
+        /// Paths the platform has no icon for.
+        missing: Vec<String>,
+        /// Whether the platform has a default application icon at all.
+        default_icon: Option<[u8; 4]>,
+    }
+
+    impl IconActions {
+        fn all() -> Self {
+            Self {
+                missing: Vec::new(),
+                default_icon: Some(GREEN),
+            }
+        }
+
+        fn missing(path: &str) -> Self {
+            Self {
+                missing: vec![path.to_string()],
+                default_icon: Some(GREEN),
+            }
         }
     }
 
-    /// Drive `get` until the background worker's result is uploaded. Bounded
-    /// deadline poll — no sleeps.
+    impl PlatformActions for IconActions {
+        fn process_icon_rgba(&self, exe_path: &str) -> Option<(u32, u32, Vec<u8>)> {
+            (!self.missing.iter().any(|m| m == exe_path)).then(|| (2, 2, RED.repeat(4)))
+        }
+
+        fn default_app_icon_rgba(&self) -> Option<(u32, u32, Vec<u8>)> {
+            self.default_icon.map(|c| (2, 2, c.repeat(4)))
+        }
+    }
+
+    /// Drive `icon_or_default` until the background worker's result is
+    /// uploaded. Bounded deadline poll — no sleeps.
     fn pump(
         cache: &IconCache,
         ctx: &egui::Context,
         actions: &Arc<dyn PlatformActions>,
-        path: &str,
+        path: Option<&str>,
     ) -> Option<egui::TextureHandle> {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         loop {
-            if let Some(t) = cache.get(ctx, actions, path, 6) {
+            if let Some(t) = cache.icon_or_default(ctx, actions, path) {
                 return Some(t);
             }
             if std::time::Instant::now() >= deadline {
@@ -319,34 +410,99 @@ mod tests {
         }
     }
 
+    /// A row with a real executable paints that executable's icon and caches
+    /// it: the second lookup is a pure hit.
     #[test]
-    fn get_eventually_returns_the_extracted_texture() {
+    fn path_icon_arrives_and_is_cached() {
         let ctx = egui::Context::default();
-        let actions: Arc<dyn PlatformActions> = Arc::new(IconActions);
+        let actions: Arc<dyn PlatformActions> = Arc::new(IconActions::all());
         let cache = IconCache::default();
-        assert!(pump(&cache, &ctx, &actions, r"C:\Windows\System32\lsass.exe").is_some());
-        // Second call is a pure cache hit.
+        let exe = r"C:\Windows\System32\lsass.exe";
+        assert!(pump(&cache, &ctx, &actions, Some(exe)).is_some());
+        let before = cache.len();
+        assert!(cache.icon_or_default(&ctx, &actions, Some(exe)).is_some());
+        assert_eq!(cache.len(), before, "a hit does not add an entry");
         assert!(
-            cache
-                .get(&ctx, &actions, r"C:\Windows\System32\lsass.exe", 6)
-                .is_some()
+            !sync::lock(&cache.inner)
+                .tex
+                .contains_key(DEFAULT_APP_ICON_KEY)
         );
+    }
+
+    /// A row whose image the platform has no icon for paints the platform's
+    /// default application icon — the same texture a row without any image
+    /// path gets, never a placeholder of our own.
+    #[test]
+    fn row_without_an_icon_paints_the_platform_default() {
+        let ctx = egui::Context::default();
+        let exe = r"C:\Windows\System32\no-icon-image.exe";
+        let actions: Arc<dyn PlatformActions> = Arc::new(IconActions::missing(exe));
+        let cache = IconCache::default();
+        let without_icon = pump(&cache, &ctx, &actions, Some(exe)).expect("default icon");
+        let without_path = pump(&cache, &ctx, &actions, None).expect("default icon");
+        assert_eq!(
+            without_icon.id(),
+            without_path.id(),
+            "an icon-less image must paint the platform default, not something else"
+        );
+    }
+
+    /// A row with no image path at all (kernel pseudo-processes) asks for the
+    /// platform default straight away instead of never resolving.
+    #[test]
+    fn row_without_a_path_still_gets_an_icon() {
+        let ctx = egui::Context::default();
+        let actions: Arc<dyn PlatformActions> = Arc::new(IconActions::all());
+        let cache = IconCache::default();
+        assert!(pump(&cache, &ctx, &actions, None).is_some());
+        assert!(
+            sync::lock(&cache.inner)
+                .tex
+                .contains_key(DEFAULT_APP_ICON_KEY)
+        );
+    }
+
+    /// A platform without a default icon (mock backend, an XDG theme that ships
+    /// none) leaves the cell empty: nothing is drawn in the OS's name.
+    #[test]
+    fn no_platform_default_means_no_texture() {
+        let ctx = egui::Context::default();
+        let actions: Arc<dyn PlatformActions> = Arc::new(IconActions {
+            missing: Vec::new(),
+            default_icon: None,
+        });
+        let cache = IconCache::default();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(300);
+        while std::time::Instant::now() < deadline {
+            assert!(cache.icon_or_default(&ctx, &actions, None).is_none());
+            std::thread::yield_now();
+        }
     }
 
     #[test]
     fn eviction_is_lru_not_random() {
         let ctx = egui::Context::default();
-        let actions: Arc<dyn PlatformActions> = Arc::new(IconActions);
+        let actions: Arc<dyn PlatformActions> = Arc::new(IconActions::all());
         let cache = IconCache::default();
         let path = |i: usize| format!(r"C:\apps\app{i}.exe");
         for i in 0..CACHE_CAP {
-            assert!(pump(&cache, &ctx, &actions, &path(i)).is_some(), "app{i}");
+            assert!(
+                pump(&cache, &ctx, &actions, Some(&path(i))).is_some(),
+                "app{i}"
+            );
         }
         // Touch app0 so it becomes the most-recently-used entry.
-        assert!(cache.get(&ctx, &actions, &path(0), 6).is_some());
+        assert!(
+            cache
+                .icon_or_default(&ctx, &actions, Some(&path(0)))
+                .is_some()
+        );
         // Push past the cap: the four oldest UNTOUCHED entries must go.
         for i in CACHE_CAP..CACHE_CAP + 4 {
-            assert!(pump(&cache, &ctx, &actions, &path(i)).is_some(), "app{i}");
+            assert!(
+                pump(&cache, &ctx, &actions, Some(&path(i))).is_some(),
+                "app{i}"
+            );
         }
         assert_eq!(cache.len(), CACHE_CAP);
         let inner = sync::lock(&cache.inner);
@@ -357,20 +513,41 @@ mod tests {
         assert!(inner.tex.contains_key(&path(CACHE_CAP + 3)));
     }
 
+    /// Only a real executable path is a cache key; a bare process name is not a
+    /// file and must not be turned into one.
     #[test]
-    fn row_icon_key_uses_exe_path_and_only_pseudo_names_otherwise() {
+    fn row_icon_key_is_the_exe_path_only() {
         assert_eq!(
-            row_icon_key(Some(Path::new(r"C:\x\a.exe")), "a.exe"),
+            row_icon_key(Some(Path::new(r"C:\x\a.exe"))),
             Some(r"C:\x\a.exe".to_string())
         );
-        assert_eq!(row_icon_key(None, "Registry"), Some("Registry".to_string()));
-        assert_eq!(row_icon_key(None, "System"), Some("System".to_string()));
-        assert_eq!(
-            row_icon_key(None, "MemCompression"),
-            Some("MemCompression".to_string())
+        assert_eq!(row_icon_key(None), None);
+    }
+
+    /// End to end against the real Windows shell (no broker, no GUI): a row
+    /// with an image gets that image's icon, a row without any gets the OS
+    /// default, and an image the shell has no icon for gets the same default —
+    /// never a blank cell on a path-less row, never a glyph of ours.
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn real_shell_answers_row_icons_and_the_default() {
+        let ctx = egui::Context::default();
+        let actions: Arc<dyn PlatformActions> = Arc::new(tm_platform::win::WinActions);
+        let cache = IconCache::default();
+        let system_root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into());
+        let image = format!(r"{system_root}\System32\lsass.exe");
+        assert!(
+            pump(&cache, &ctx, &actions, Some(&image)).is_some(),
+            "a known image has a shell icon"
         );
-        // A real process whose path is simply unknown has no icon to find.
-        assert_eq!(row_icon_key(None, "explorer.exe"), None);
-        assert_eq!(row_icon_key(None, "myapp"), None);
+        let default = pump(&cache, &ctx, &actions, None).expect("the OS has a default app icon");
+        let unknown_image = format!(r"{system_root}\System32\no-such-image-xyz.exe");
+        let fallback = pump(&cache, &ctx, &actions, Some(&unknown_image))
+            .expect("an unresolvable image paints the OS default");
+        assert_eq!(
+            fallback.id(),
+            default.id(),
+            "an image the shell cannot resolve must paint the OS default icon"
+        );
     }
 }

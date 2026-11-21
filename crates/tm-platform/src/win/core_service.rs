@@ -1594,6 +1594,10 @@ impl PlatformActions for BrokeredActions {
         self.local.process_icon_rgba(exe_path)
     }
 
+    fn default_app_icon_rgba(&self) -> Option<(u32, u32, Vec<u8>)> {
+        self.local.default_app_icon_rgba()
+    }
+
     fn backend_name(&self) -> &'static str {
         "win32+core-service"
     }

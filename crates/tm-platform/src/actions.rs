@@ -704,6 +704,17 @@ pub trait PlatformActions: Send + Sync {
         None
     }
 
+    /// The OS's default application icon — what the platform's shell shows for
+    /// an application that has no icon of its own — as straight-alpha RGBA.
+    ///
+    /// The UI paints this wherever a row has no icon it can resolve (a kernel
+    /// pseudo-process without an image path, an app without a themed icon,
+    /// a failed extraction), so the lists keep the OS icon theme instead of a
+    /// drawn placeholder. Backends without a shell icon answer `None`.
+    fn default_app_icon_rgba(&self) -> Option<(u32, u32, Vec<u8>)> {
+        None
+    }
+
     fn backend_name(&self) -> &'static str {
         "unknown"
     }

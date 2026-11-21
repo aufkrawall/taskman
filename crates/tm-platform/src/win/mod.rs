@@ -650,6 +650,9 @@ impl PlatformActions for WinActions {
     fn process_icon_rgba(&self, exe_path: &str) -> Option<(u32, u32, Vec<u8>)> {
         icons::extract_icon_rgba(exe_path).map(|ic| (ic.width, ic.height, ic.rgba))
     }
+    fn default_app_icon_rgba(&self) -> Option<(u32, u32, Vec<u8>)> {
+        icons::default_app_icon_rgba().map(|ic| (ic.width, ic.height, ic.rgba))
+    }
     fn backend_name(&self) -> &'static str {
         "win32"
     }

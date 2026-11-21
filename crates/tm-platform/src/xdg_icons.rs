@@ -26,6 +26,16 @@ const MAX_ICON_EDGE: u32 = 64;
 /// The GUI paints icons at ~18 px; 32 is the size desktop shells hand out.
 const TARGET_SIZE: u32 = 32;
 
+/// Icon names that stand for "an application without an icon of its own", in
+/// fallback order: the standard executable icon every theme ships (the
+/// freedesktop equivalent of the Windows shell's generic application icon),
+/// then the spec's missing-image icon.
+pub const DEFAULT_APP_ICON_NAMES: [&str; 3] = [
+    "application-x-executable",
+    "application-default-icon",
+    "image-missing",
+];
+
 /// Where to look for desktop files and icon themes.
 #[derive(Debug, Clone, Default)]
 pub struct IconLookup {
@@ -132,6 +142,15 @@ impl IconResolver {
         let name = self.icon_name_for(exe_path)?;
         let file = self.find_icon_file(&name)?;
         decode_png_rgba(&file)
+    }
+
+    /// The icon the theme shows for an executable that has no icon of its own
+    /// (a kernel thread, an app without a `.desktop` entry): the standard
+    /// "this is an application" icon, then the spec's missing-image icon.
+    pub fn default_app_icon_rgba(&self) -> Option<(u32, u32, Vec<u8>)> {
+        DEFAULT_APP_ICON_NAMES
+            .iter()
+            .find_map(|name| self.find_icon_file(name).and_then(|f| decode_png_rgba(&f)))
     }
 
     /// The icon name (or absolute path) the OS would use for `exe_path`.
@@ -563,6 +582,12 @@ pub fn process_icon_rgba(exe_path: &str) -> Option<(u32, u32, Vec<u8>)> {
     IconResolver::shared().icon_rgba_for_exe(exe_path)
 }
 
+/// Linux backend entry point for the theme's default application icon.
+#[cfg(target_os = "linux")]
+pub fn default_app_icon_rgba() -> Option<(u32, u32, Vec<u8>)> {
+    IconResolver::shared().default_app_icon_rgba()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -816,5 +841,42 @@ mod tests {
             r.icon_rgba_for_exe("/usr/bin/definitely-not-installed-xyz")
                 .is_none()
         );
+    }
+
+    /// An executable with no icon of its own still gets the theme's standard
+    /// application icon, so a row never falls back to a drawn placeholder.
+    #[test]
+    fn default_app_icon_is_the_themes_executable_icon() {
+        let sb = Sandbox::new("default-app");
+        write_desktop(
+            &sb.root.join("share/icons/hicolor/index.theme"),
+            HICOLOR_INDEX,
+        );
+        write_png(
+            &sb.root
+                .join("share/icons/hicolor/32x32/apps/application-x-executable.png"),
+            32,
+            32,
+            [7, 8, 9, 255],
+        );
+        let r = IconResolver::new(sb.lookup());
+        let (w, h, rgba) = r.default_app_icon_rgba().expect("executable icon");
+        assert_eq!((w, h), (32, 32));
+        assert_eq!(&rgba[..4], &[7, 8, 9, 255]);
+        // And the row lookup itself stays strict: the app layer decides to
+        // fall back, so a missing app icon must not masquerade as a real one.
+        assert!(
+            r.icon_rgba_for_exe("/usr/bin/definitely-not-installed-xyz")
+                .is_none()
+        );
+    }
+
+    /// Without any theme icon there is nothing to paint; the caller draws
+    /// nothing rather than inventing an icon.
+    #[test]
+    fn default_app_icon_is_none_when_the_theme_has_none() {
+        let sb = Sandbox::new("default-app-missing");
+        let r = IconResolver::new(sb.lookup());
+        assert!(r.default_app_icon_rgba().is_none());
     }
 }
