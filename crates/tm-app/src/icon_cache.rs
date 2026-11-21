@@ -27,11 +27,17 @@ struct Inner {
     tex: HashMap<String, Entry>,
     /// Paths queued or awaiting upload (dedup guard).
     queued: HashSet<String>,
+    /// Monotonic clock for LRU: bumped on every cache hit.
+    next_use: u64,
 }
 
 #[derive(Clone)]
 enum Entry {
-    Ready(egui::TextureHandle),
+    Ready {
+        tex: egui::TextureHandle,
+        /// LRU clock value of the last hit; eviction removes the smallest.
+        last_used: u64,
+    },
     Failed(std::time::Instant),
 }
 
@@ -50,7 +56,6 @@ pub struct IconCache {
     worker_started: Arc<std::sync::atomic::AtomicBool>,
     /// Bounded hand-off queue length.
     in_flight: Arc<std::sync::atomic::AtomicUsize>,
-    pending_repaint: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl IconCache {
@@ -68,16 +73,29 @@ impl IconCache {
         self.drain_results(ctx);
 
         let mut inner = sync::lock(&self.inner);
-        match inner.tex.get(path) {
-            Some(Entry::Ready(t)) => return Some(t.clone()),
+        let use_tick = inner.next_use;
+        enum Hit {
+            Ready(egui::TextureHandle),
+            Miss,
+        }
+        let hit = match inner.tex.get_mut(path) {
+            Some(Entry::Ready { tex, last_used }) => {
+                *last_used = use_tick;
+                Hit::Ready(tex.clone())
+            }
             Some(Entry::Failed(at)) => {
                 if at.elapsed() >= FAILURE_RETRY_TTL {
                     inner.tex.remove(path);
+                    Hit::Miss
                 } else {
                     return None;
                 }
             }
-            None => {}
+            None => Hit::Miss,
+        };
+        if let Hit::Ready(t) = hit {
+            inner.next_use = use_tick + 1;
+            return Some(t);
         }
         if !inner.queued.contains(path)
             && self.in_flight.load(std::sync::atomic::Ordering::Relaxed) < 64
@@ -98,6 +116,11 @@ impl IconCache {
                 self.in_flight
                     .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
                 sync::lock(&self.inner).queued.remove(path);
+                // The worker thread is gone (panicked or the channel closed):
+                // allow ensure_worker to spawn a fresh one on the next get().
+                *sync::lock(&self.tx) = None;
+                self.worker_started
+                    .store(false, std::sync::atomic::Ordering::SeqCst);
             }
         }
     }
@@ -125,7 +148,9 @@ impl IconCache {
     }
 
     /// Upload finished extractions into textures, respecting the per-frame
-    /// budget; requests another repaint when backlog remains.
+    /// budget; requests a repaint whenever anything was uploaded (and again
+    /// when a backlog remains) so fresh icons appear without waiting for an
+    /// unrelated frame.
     fn drain_results(&self, ctx: &egui::Context) {
         let mut ready: Vec<Decoded> = {
             let mut r = sync::lock(&self.results);
@@ -153,41 +178,69 @@ impl IconCache {
                     )
                 });
                 inner.queued.remove(&d.path);
-                inner.tex.insert(
-                    d.path.clone(),
-                    match tex {
-                        Some(t) => Entry::Ready(t),
-                        None => Entry::Failed(std::time::Instant::now()),
+                let entry = match tex {
+                    Some(t) => Entry::Ready {
+                        tex: t,
+                        last_used: inner.next_use,
                     },
-                );
+                    None => Entry::Failed(std::time::Instant::now()),
+                };
+                inner.next_use += 1;
+                inner.tex.insert(d.path.clone(), entry);
                 uploaded += 1;
             }
             // Expire failed entries so transient failures can retry.
             inner.tex.retain(|_, e| match e {
                 Entry::Failed(at) => at.elapsed() < FAILURE_RETRY_TTL,
-                Entry::Ready(_) => true,
+                Entry::Ready { .. } => true,
             });
-            // LRU-style bound: evict least-recently-used entries beyond cap.
+            // Bound the cache, evicting least-recently-used entries beyond the
+            // cap. Failed entries carry no texture and are dropped first. (A
+            // plain HashMap key dump would evict RANDOM entries — including
+            // icons currently on screen — which is what made icons flicker
+            // back to the placeholder once the cache filled up.)
             if inner.tex.len() > CACHE_CAP {
-                let excess = inner.tex.len() - CACHE_CAP;
-                let keys: Vec<String> = inner.tex.keys().take(excess).cloned().collect();
-                for k in keys {
+                let mut excess = inner.tex.len() - CACHE_CAP;
+                let failed: Vec<String> = inner
+                    .tex
+                    .iter()
+                    .filter(|(_, e)| matches!(e, Entry::Failed(_)))
+                    .map(|(k, _)| k.clone())
+                    .collect();
+                for k in failed {
+                    if excess == 0 {
+                        break;
+                    }
                     inner.tex.remove(&k);
+                    excess -= 1;
+                }
+                if excess > 0 {
+                    let mut by_use: Vec<(String, u64)> = inner
+                        .tex
+                        .iter()
+                        .filter_map(|(k, e)| match e {
+                            Entry::Ready { last_used, .. } => Some((k.clone(), *last_used)),
+                            Entry::Failed(_) => None,
+                        })
+                        .collect();
+                    by_use.sort_by_key(|(_, u)| *u);
+                    for (k, _) in by_use.into_iter().take(excess) {
+                        inner.tex.remove(&k);
+                    }
                 }
             }
         }
         self.in_flight
             .fetch_sub(uploaded, std::sync::atomic::Ordering::Relaxed);
+        if uploaded > 0 {
+            // Freshly uploaded textures must be painted even when nothing is
+            // left in the queue — otherwise the last batch waits for an
+            // unrelated repaint.
+            ctx.request_repaint();
+        }
         if !leftover.is_empty() {
             *sync::lock(&self.results) = leftover;
-            if !self
-                .pending_repaint
-                .swap(true, std::sync::atomic::Ordering::Relaxed)
-            {
-                ctx.request_repaint();
-                self.pending_repaint
-                    .store(false, std::sync::atomic::Ordering::Relaxed);
-            }
+            ctx.request_repaint();
         }
     }
 
@@ -211,5 +264,113 @@ fn icon_worker(
     while let Ok(path) = rx.recv() {
         let icon = actions.process_icon_rgba(&path);
         sync::lock(&results).push(Decoded { path, icon });
+    }
+}
+
+/// The cache key for a process row: the exe path when known; otherwise the
+/// bare process name for the kernel pseudo-processes ("System", "Registry",
+/// ...) that have no image path — the Windows backend maps those names to
+/// the real OS image in the icon layer. Any other process without a path has
+/// no icon to find, so it stays `None` and keeps the placeholder glyph.
+pub fn row_icon_key(exe_path: Option<&std::path::Path>, name: &str) -> Option<String> {
+    if let Some(p) = exe_path {
+        return Some(p.to_string_lossy().into_owned());
+    }
+    let lower = name.to_ascii_lowercase();
+    let stem = lower.strip_suffix(".exe").unwrap_or(&lower);
+    matches!(
+        stem,
+        "system" | "[system process]" | "registry" | "memcompression" | "secure system"
+    )
+    .then(|| name.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+    use tm_platform::actions::PlatformActions;
+
+    /// Actions stub that "extracts" a 2x2 red icon for every path.
+    struct IconActions;
+    impl PlatformActions for IconActions {
+        fn process_icon_rgba(&self, _exe_path: &str) -> Option<(u32, u32, Vec<u8>)> {
+            Some((2, 2, [200u8, 10, 10, 255].repeat(4)))
+        }
+    }
+
+    /// Drive `get` until the background worker's result is uploaded. Bounded
+    /// deadline poll — no sleeps.
+    fn pump(
+        cache: &IconCache,
+        ctx: &egui::Context,
+        actions: &Arc<dyn PlatformActions>,
+        path: &str,
+    ) -> Option<egui::TextureHandle> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            if let Some(t) = cache.get(ctx, actions, path, 6) {
+                return Some(t);
+            }
+            if std::time::Instant::now() >= deadline {
+                return None;
+            }
+            std::thread::yield_now();
+        }
+    }
+
+    #[test]
+    fn get_eventually_returns_the_extracted_texture() {
+        let ctx = egui::Context::default();
+        let actions: Arc<dyn PlatformActions> = Arc::new(IconActions);
+        let cache = IconCache::default();
+        assert!(pump(&cache, &ctx, &actions, r"C:\Windows\System32\lsass.exe").is_some());
+        // Second call is a pure cache hit.
+        assert!(
+            cache
+                .get(&ctx, &actions, r"C:\Windows\System32\lsass.exe", 6)
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn eviction_is_lru_not_random() {
+        let ctx = egui::Context::default();
+        let actions: Arc<dyn PlatformActions> = Arc::new(IconActions);
+        let cache = IconCache::default();
+        let path = |i: usize| format!(r"C:\apps\app{i}.exe");
+        for i in 0..CACHE_CAP {
+            assert!(pump(&cache, &ctx, &actions, &path(i)).is_some(), "app{i}");
+        }
+        // Touch app0 so it becomes the most-recently-used entry.
+        assert!(cache.get(&ctx, &actions, &path(0), 6).is_some());
+        // Push past the cap: the four oldest UNTOUCHED entries must go.
+        for i in CACHE_CAP..CACHE_CAP + 4 {
+            assert!(pump(&cache, &ctx, &actions, &path(i)).is_some(), "app{i}");
+        }
+        assert_eq!(cache.len(), CACHE_CAP);
+        let inner = sync::lock(&cache.inner);
+        assert!(inner.tex.contains_key(&path(0)), "touched entry survives");
+        for i in 1..5 {
+            assert!(!inner.tex.contains_key(&path(i)), "stale app{i} evicted");
+        }
+        assert!(inner.tex.contains_key(&path(CACHE_CAP + 3)));
+    }
+
+    #[test]
+    fn row_icon_key_uses_exe_path_and_only_pseudo_names_otherwise() {
+        assert_eq!(
+            row_icon_key(Some(Path::new(r"C:\x\a.exe")), "a.exe"),
+            Some(r"C:\x\a.exe".to_string())
+        );
+        assert_eq!(row_icon_key(None, "Registry"), Some("Registry".to_string()));
+        assert_eq!(row_icon_key(None, "System"), Some("System".to_string()));
+        assert_eq!(
+            row_icon_key(None, "MemCompression"),
+            Some("MemCompression".to_string())
+        );
+        // A real process whose path is simply unknown has no icon to find.
+        assert_eq!(row_icon_key(None, "explorer.exe"), None);
+        assert_eq!(row_icon_key(None, "myapp"), None);
     }
 }

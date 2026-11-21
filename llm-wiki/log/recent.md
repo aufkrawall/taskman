@@ -1,3 +1,13 @@
+## 2026-11-21 - OS icon-theme adherence on all pages (Windows shell icons + Linux XDG), icon-cache LRU fix
+
+- User report: process rows randomly showed the blue placeholder instead of the real app icon; on Linux every row was placeholder (no `process_icon_rgba` impl).
+- Verified with a scratch probe (since removed) that on Windows the sampler DOES give system processes a DOS exe path (kernel class 88) and `SHGetFileInfoW` extraction succeeds for `lsass.exe` etc.; real remaining defects were in the cache/UI layer, plus total absence on Linux.
+- `crates/tm-app/src/icon_cache.rs`: eviction past the 512 cap was HashMap-order (random) — now true LRU via a `last_used` tick bumped on every hit (test `eviction_is_lru_not_random`); `drain_results` now requests a repaint whenever it uploaded anything (previously only when a backlog remained, so the final batch waited for an unrelated repaint); a dead worker channel resets `worker_started` so the next `get` respawns it. Added `row_icon_key(exe_path, name)`: exe path when known, else the bare name for kernel pseudo-processes only.
+- `crates/tm-platform/src/win/icons.rs`: bare pseudo names map to real OS images — `System`/`[System Process]` → `%SystemRoot%\System32\ntoskrnl.exe`, `Registry` → `%SystemRoot%\regedit.exe`; `MemCompression`/`Secure System` have no image file and keep the placeholder. Tests pin the mapping + extraction.
+- `crates/tm-platform/src/xdg_icons.rs` (new, platform-neutral so tests run on Windows): XDG icon-theme lookup — desktop-file index (Exec basename / desktop stem → `Icon=`), theme chain (GTK settings theme → `Inherits` → hicolor) over `$XDG_DATA_HOME/icons` + `$XDG_DATA_DIRS/icons`, pixmaps last, size closest to 32 preferred, PNG-only decode with box downscale to ≤64 px. Wired into `LinuxActions::process_icon_rgba`; `png 0.18` added to tm-platform deps (already in the lockfile via tm-app). 10 unit tests.
+- Tabs: processes/details/users/app_history rows now build the icon key via `row_icon_key`; startup tab icon uses `resolve_startup_target` (expands `%VAR%`, resolves `.lnk` on Windows) instead of the raw first token.
+- Services page intentionally keeps the gear glyph (matches native TM, which shows no app icons there; service hosts would all be svchost).
+
 ## 2026-11-21 - GUI-capable Linux glibc cross-build via `ziglang`, `build.py` hardening, and static-musl startup hint
 
 - Provisioned `ziglang` (`0.17.1`, `zig.exe` in user site-packages) on the build host so `cargo-zigbuild` has an out-of-the-box `zig` compiler without requiring manual `PATH` edits.

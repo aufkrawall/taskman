@@ -6,6 +6,9 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 
 pub mod actions;
+/// Freedesktop icon-theme lookup, shared by the Unix backends. Platform-
+/// neutral on purpose so its tests run on every host.
+pub mod xdg_icons;
 
 #[cfg(target_os = "windows")]
 pub mod win;

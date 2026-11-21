@@ -9,6 +9,8 @@ license.workspace = true
 tm-core = { workspace = true }
 sysinfo = { workspace = true }
 tracing = { workspace = true }
+# XDG icon-theme decoding (xdg_icons); already in the tree via tm-app.
+png = "0.18"
 
 [target.'cfg(windows)'.dependencies]
 serde = { workspace = true }

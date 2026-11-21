@@ -937,6 +937,13 @@ impl PlatformActions for LinuxActions {
         "linux"
     }
 
+    fn process_icon_rgba(&self, exe_path: &str) -> Option<(u32, u32, Vec<u8>)> {
+        // Adhere to the desktop's icon theme: resolve the exe through its
+        // .desktop entry into the current icon theme (XDG spec), exactly what
+        // the shell shows for the app.
+        crate::xdg_icons::process_icon_rgba(exe_path)
+    }
+
     fn list_process_file_io(
         &self,
         pid: u32,

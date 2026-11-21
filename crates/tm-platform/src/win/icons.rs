@@ -29,8 +29,27 @@ pub struct IconRgba {
     pub rgba: Vec<u8>,
 }
 
+/// Kernel pseudo-processes ("System", "Registry", ...) are named as bare
+/// names with no image file; map the ones that do have a real backing image
+/// to it, so the shell icon matches what Task Manager shows. The others keep
+/// the generic glyph — there is no file whose icon would be honest.
+fn icon_source_path(path: &str) -> std::borrow::Cow<'_, str> {
+    if path.contains(['\\', '/']) {
+        return std::borrow::Cow::Borrowed(path);
+    }
+    let system_root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_string());
+    match path.to_ascii_lowercase().as_str() {
+        "system" | "[system process]" => {
+            std::borrow::Cow::Owned(format!(r"{system_root}\System32\ntoskrnl.exe"))
+        }
+        "registry" => std::borrow::Cow::Owned(format!(r"{system_root}\regedit.exe")),
+        _ => std::borrow::Cow::Borrowed(path),
+    }
+}
+
 /// Extract the per-user 32x32 icon for `path` (an executable or lnk).
 pub fn extract_icon_rgba(path: &str) -> Option<IconRgba> {
+    let path = icon_source_path(path);
     let wide: Vec<u16> = path.encode_utf16().chain(std::iter::once(0)).collect();
     unsafe {
         let mut info = SHFILEINFOW {
@@ -231,6 +250,26 @@ unsafe fn ddb_row_bytes(
 mod tests {
     use super::*;
     use windows::Win32::Graphics::Gdi::CreateBitmap;
+
+    /// Kernel pseudo-process names resolve to a real OS image, so they get the
+    /// shell icon instead of failing extraction forever.
+    #[test]
+    fn pseudo_process_names_map_to_real_os_images() {
+        assert!(icon_source_path(r"C:\Windows\System32\lsass.exe").contains('\\'));
+        assert!(icon_source_path("System").ends_with(r"ntoskrnl.exe"));
+        assert!(icon_source_path("[System Process]").ends_with(r"ntoskrnl.exe"));
+        assert!(icon_source_path("Registry").ends_with(r"regedit.exe"));
+        assert_eq!(icon_source_path("MemCompression"), "MemCompression");
+    }
+
+    /// The mapped image actually yields an icon on a real Windows host.
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn pseudo_process_icon_extracts() {
+        let ic = extract_icon_rgba("Registry").expect("registry maps to a real image icon");
+        assert_eq!((ic.width, ic.height), (32, 32));
+        assert_eq!(ic.rgba.len(), (32 * 32 * 4) as usize);
+    }
 
     /// Pins the layout fact the mask decoder depends on: a monochrome DDB
     /// pads rows to 16 bits, not 32 (48 px -> 6 bytes, not 8).

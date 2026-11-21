@@ -201,9 +201,7 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
                     latest_snap.as_deref().and_then(|snap| {
                         snap.processes.iter().find_map(|p| {
                             if p.name.eq_ignore_ascii_case(k) || p.shown_name() == shown {
-                                p.exe_path
-                                    .as_ref()
-                                    .map(|path| path.to_string_lossy().into_owned())
+                                crate::icon_cache::row_icon_key(p.exe_path.as_deref(), &p.name)
                             } else {
                                 None
                             }

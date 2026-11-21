@@ -2,7 +2,15 @@
 
 ## Unreleased
 
+### New
+
+- **Linux application icons from the desktop icon theme:** on Linux, rows on the Processes, Details, Users, Startup and App History pages now resolve each application's icon through the freedesktop icon theme spec — the `.desktop` entry's `Icon=` matched by `Exec=` basename or desktop-file id across the XDG data dirs, then the current GTK icon theme (with its `Inherits` chain), `hicolor`, and the legacy pixmaps dir; PNG icons are decoded and capped at 64 px — instead of always showing the placeholder glyph.
+
 ### Fixed
+
+- **Process icons no longer randomly revert to the placeholder:** the icon texture cache evicted arbitrary (HashMap-iteration-order) entries once it passed its 512-icon cap, so on-screen rows could lose a just-loaded icon and flash the placeholder; eviction is now true LRU, a repaint is requested whenever textures are uploaded (the last batch no longer waits for an unrelated repaint), and a dead icon worker thread is respawned on the next request.
+- **Kernel pseudo-process icons on Windows:** rows for `System` / `[System Process]` and `Registry` now show the real OS image icons (`ntoskrnl.exe`, `regedit.exe`) via the same shell extraction as every other process; pseudo-processes without a backing image (`Memory Compression`, `Secure System`) keep the placeholder.
+- **Startup-page icons for env-var/`.lnk` commands on Windows:** the Startup tab's icon lookup now uses the same command resolver as the publisher/impact columns (expands `%VAR%`, resolves `.lnk` targets), so those entries get their real application icon instead of the placeholder.
 
 - **Mock mode OS isolation:** `--mock` now wires an inert `MockActions` backend and skips the Windows Task Manager replacement check and Explorer restart path, preventing simulated UI actions from affecting real host processes or system state.
 - **Concurrent settings and history save safety:** atomic file replacement (`replace_file`) now uses unique exclusive temp files (`create_new(true)` per PID/sequence) and cleans them up on failure instead of sharing a fixed `<name>.tmp` path across threads or multiple instances.

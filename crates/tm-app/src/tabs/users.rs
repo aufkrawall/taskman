@@ -891,7 +891,8 @@ fn app_row_ui(
     // with its session.
     let (rect, resp) = table.row(ui, pal, false, ("app", session_id, name));
     table.describe_row(ui, &resp, name, index);
-    let tex = exe.and_then(|p| app.shared.icons.get(ui.ctx(), &app.actions, p, 6));
+    let tex = crate::icon_cache::row_icon_key(exe.map(std::path::Path::new), name)
+        .and_then(|k| app.shared.icons.get(ui.ctx(), &app.actions, &k, 6));
     table.icon_cell(
         ui,
         rect.translate(egui::vec2(22.0, 0.0)),

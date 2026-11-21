@@ -352,7 +352,10 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
                 let (rect, resp) = table.row(ui, &pal, selected, item.id.as_str());
                 table.describe_row(ui, &resp, &item.name, vi);
 
-                let exe = exe_from_command(&item.command);
+                // Resolve through the platform resolver (env vars, .lnk on
+                // Windows) so the icon lookup hits a real file, not a raw
+                // command token.
+                let exe = resolve_startup_target(&item.command);
                 let tex = exe
                     .as_deref()
                     .and_then(|p| app.shared.icons.get(ui.ctx(), &app.actions, p, 4));

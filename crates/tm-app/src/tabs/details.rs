@@ -2123,10 +2123,7 @@ fn row_from_process(p: &ProcessEntry, depth: usize, children: bool) -> Row {
         pid: p.pid,
         start_epoch_s: p.start_epoch_s,
         name: detail_name(p),
-        icon_path: p
-            .exe_path
-            .as_ref()
-            .map(|path| path.to_string_lossy().into_owned()),
+        icon_path: crate::icon_cache::row_icon_key(p.exe_path.as_deref(), &p.name),
         depth,
         children,
         pid_s: p.pid.to_string(),

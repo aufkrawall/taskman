@@ -87,7 +87,10 @@ platform boundary (`tm-core` ← `tm-platform` ← `tm-app` / `tm-service`), and
     `users.rs`, `image_path.rs` (`NtQuerySystemInformation(SystemProcessIdInformation)`:
     the image path of a process no handle can be opened for, plus NT-device to
     drive-letter translation; both answers cached because neither changes while
-    a process lives), `net_info.rs` (cached adapter/link/IP metadata plus
+    a process lives), `icons.rs` (shell icon extraction via `SHGetFileInfoW`;
+    bare kernel pseudo-process names map to their real OS image —
+    `System`/`[System Process]` → `ntoskrnl.exe`, `Registry` → `regedit.exe`),
+    `net_info.rs` (cached adapter/link/IP metadata plus
     `wifi_details()`, the ONLY location-gated call — SSID/signal, opt-in via
     `Settings.wifi_details`),
     `etw.rs` (shared real-time-session plumbing: fixed per-role session names,
@@ -161,7 +164,11 @@ platform boundary (`tm-core` ← `tm-platform` ← `tm-app` / `tm-service`), and
     `version.rs` (cached PE metadata, read through each file's own
     `\VarFileInfo\Translation` table with a UI-language preference — hardcoded
     English codepages silently blanked every binary shipping only a localized
-    table). Linux/macOS backends exist and are
+    table). `xdg_icons.rs` (freedesktop icon-theme resolution used by the
+    Linux backend's `process_icon_rgba`: `.desktop` `Icon=` via XDG data dirs,
+    current GTK theme + `Inherits` + `hicolor` + pixmaps, PNG decode capped at
+    64 px; platform-neutral so its tests run on the Windows host too).
+    Linux/macOS backends exist and are
     built by default (`build.py`).
 - `crates/tm-app`
   - eframe GUI. `main.rs` (startup sequence: args → console only for CLI →
@@ -254,7 +261,9 @@ platform boundary (`tm-core` ← `tm-platform` ← `tm-app` / `tm-service`), and
      plus `keyboard_sample`/`chart_accessible_value` — a keyboard cursor
      pinned to a sample TIMESTAMP so live telemetry cannot slide it, and the
      selected sample published as the chart's accesskit value),
-    `icon_cache.rs` (lazy worker, upload budget, bounded LRU),
+    `icon_cache.rs` (lazy worker, upload budget, true-LRU cap; cache key via
+    `row_icon_key`, which falls back to the bare name of kernel
+    pseudo-processes so the backend can map them to a real OS image),
     `action_executor.rs`. Theme and font setup moved to `crates/tm-ui`;
     `tm-app` re-exports them as `crate::theme` / `crate::fonts`.
 - `crates/tm-ui`

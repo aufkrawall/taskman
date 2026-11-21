@@ -2012,10 +2012,7 @@ fn emit_flat_with_family_groups(
                 start_epoch_s: p.start_epoch_s,
                 depth: 0,
                 name: format!("{} [{}]", family_label(p, fam), fam.len()),
-                icon_path: p
-                    .exe_path
-                    .as_ref()
-                    .map(|path| path.to_string_lossy().into_owned()),
+                icon_path: crate::icon_cache::row_icon_key(p.exe_path.as_deref(), &p.name),
                 children: true,
                 aggregate: true,
                 termination_targets: fam
@@ -2429,10 +2426,7 @@ fn make_flat_row(p: &ProcessEntry) -> DisplayRow {
         start_epoch_s: p.start_epoch_s,
         depth: 0,
         name: process_display_name(p),
-        icon_path: p
-            .exe_path
-            .as_ref()
-            .map(|path| path.to_string_lossy().into_owned()),
+        icon_path: crate::icon_cache::row_icon_key(p.exe_path.as_deref(), &p.name),
         children: false,
         aggregate: false,
         termination_targets: vec![process_identity(p)],
@@ -2480,10 +2474,7 @@ fn make_own_row(p: &ProcessEntry, depth: usize) -> DisplayRow {
         start_epoch_s: p.start_epoch_s,
         depth,
         name: process_display_name(p),
-        icon_path: p
-            .exe_path
-            .as_ref()
-            .map(|x| x.to_string_lossy().into_owned()),
+        icon_path: crate::icon_cache::row_icon_key(p.exe_path.as_deref(), &p.name),
         children: false,
         aggregate: false,
         termination_targets: vec![process_identity(p)],
@@ -2645,10 +2636,7 @@ fn emit_tree<'a>(
             start_epoch_s: root.start_epoch_s,
             depth: 0,
             name: format!("{} [{}]", process_display_name(root), members.len()),
-            icon_path: root
-                .exe_path
-                .as_ref()
-                .map(|path| path.to_string_lossy().into_owned()),
+            icon_path: crate::icon_cache::row_icon_key(root.exe_path.as_deref(), &root.name),
             children: true,
             aggregate: true,
             termination_targets: members
