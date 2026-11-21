@@ -37,7 +37,12 @@ class LinuxBuildToolingTests(unittest.TestCase):
                 patch.object(build.shutil, "which", return_value=None),
                 patch.object(build.importlib.util, "find_spec", return_value=fake_spec),
             ):
-                self.assertEqual(build.find_zig(), zig_bin)
+                found = build.find_zig()
+                self.assertIsNotNone(found)
+                # find_zig canonicalizes the package origin; compare canonical
+                # paths so a runner whose temp dir has an 8.3 short name (or a
+                # junction) does not compare short vs long spellings.
+                self.assertEqual(found.resolve(), zig_bin.resolve())
 
     def test_linux_cross_command_prefers_zigbuild_when_zig_resolved_off_path(self):
         with (
