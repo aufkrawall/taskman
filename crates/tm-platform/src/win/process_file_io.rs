@@ -115,8 +115,12 @@ fn query_kernel_process_io(
         if proc_pid == pid {
             let create_time = crate::win::cpu_load::read_i64(&buf, pos + off.create_time);
             if let Some(expected) = expected_start_epoch_s {
-                let actual = crate::win::cpu_load::filetime_to_unix_seconds(create_time);
-                if pid > 4 && expected > 0 && actual != Some(expected) {
+                let actual = crate::win::cpu_load::filetime_to_unix_ticks(create_time);
+                if pid > 4
+                    && expected > 0
+                    && !actual
+                        .is_some_and(|ts| tm_core::model::creation_timestamps_match(expected, ts))
+                {
                     return Err(TmError::ProcessNotFound { pid });
                 }
             }

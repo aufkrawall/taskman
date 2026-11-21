@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- **Mock mode OS isolation:** `--mock` now wires an inert `MockActions` backend and skips the Windows Task Manager replacement check and Explorer restart path, preventing simulated UI actions from affecting real host processes or system state.
+- **Concurrent settings and history save safety:** atomic file replacement (`replace_file`) now uses unique exclusive temp files (`create_new(true)` per PID/sequence) and cleans them up on failure instead of sharing a fixed `<name>.tmp` path across threads or multiple instances.
+- **Installer shutdown PID-reuse TOCTOU:** `stop_running_gui` now opens each target `taskman.exe` process handle with query/terminate/synchronize rights first, verifies its full image path through that pinned handle, and terminates only the verified handle on timeout.
+- **Session-scoped Windows Explorer restart:** Explorer restart now fails closed unless the target carries a verified creation timestamp matching the current desktop session's shell window (`GetShellWindow`), preventing cross-session Explorer termination from an elevated instance.
+- **Sub-second PID-reuse identity protection:** process creation timestamps now preserve native 100-ns (`FILETIME` on Windows, microsecond `proc_pidinfo` on macOS, clock-tick `/proc/<pid>/stat` on Linux) resolution without ±1 s tolerance, `PlatformActions` checked/unchecked defaults fail closed cleanly, and Linux signals pin targets via `pidfd_open`/`pidfd_send_signal` (with identity-checked fallback when unavailable).
+- **Recycled-PID process grouping:** Processes-tab tree parenting, flat same-image family grouping, Details search ancestor reveal, and same-image Windows service account inheritance now verify `is_plausible_parent`, keeping older orphan workers from attaching to a younger unrelated process or collapsing into shared `termination_targets`.
+- **Windows service `ControlService` and restart errors:** stopping or restarting a service now passes writable `SERVICE_STATUS` storage instead of a null pointer to `ControlService`, and `Restart` propagates real stop failures rather than silently timing out in `wait_state`.
+
 ## 0.1.31 - 2026-11-18
 
 ### Improved

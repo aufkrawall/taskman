@@ -9,24 +9,63 @@
 //! then overwrites the user's real settings or history with defaults.
 
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
-/// Replace `path` with whatever `write` produces, via `<path>.<tmp_ext>`.
+static NEXT_TMP_ID: AtomicU64 = AtomicU64::new(0);
+
+fn create_unique_temp(path: &Path, tmp_ext: &str) -> std::io::Result<(PathBuf, std::fs::File)> {
+    let parent = path
+        .parent()
+        .filter(|dir| !dir.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let file_name = path
+        .file_name()
+        .map(|name| name.to_string_lossy())
+        .unwrap_or_else(|| std::borrow::Cow::Borrowed("file"));
+    let pid = std::process::id();
+    let mut attempt = 0u32;
+    loop {
+        let seq = NEXT_TMP_ID.fetch_add(1, Ordering::Relaxed);
+        let candidate = parent.join(format!("{file_name}.{pid}-{seq}.{tmp_ext}"));
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&candidate)
+        {
+            Ok(file) => return Ok((candidate, file)),
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists && attempt < 1024 => {
+                attempt += 1;
+            }
+            Err(err) => return Err(err),
+        }
+    }
+}
+
+/// Replace `path` with whatever `write` produces via an exclusive temp file.
 pub(crate) fn replace_file(
     path: &Path,
     tmp_ext: &str,
     write: impl FnOnce(&mut std::io::BufWriter<std::fs::File>) -> std::io::Result<()>,
 ) -> std::io::Result<()> {
-    if let Some(parent) = path.parent() {
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
         std::fs::create_dir_all(parent)?;
     }
-    let tmp = path.with_extension(tmp_ext);
-    let mut out = std::io::BufWriter::new(std::fs::File::create(&tmp)?);
-    write(&mut out)?;
-    out.flush()?;
-    out.get_ref().sync_all()?;
-    drop(out);
-    std::fs::rename(&tmp, path)
+    let (tmp, file) = create_unique_temp(path, tmp_ext)?;
+    let write_result = (|| {
+        let mut out = std::io::BufWriter::new(file);
+        write(&mut out)?;
+        out.flush()?;
+        out.get_ref().sync_all()?;
+        drop(out);
+        std::fs::rename(&tmp, path)
+    })();
+    if write_result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    write_result
 }
 
 /// Move an existing file that could not be used out of the way (to
@@ -72,6 +111,81 @@ mod tests {
             std::fs::read_to_string(dir.join("store.json.bad")).unwrap(),
             "second"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn concurrent_saves_never_share_temp_file_or_corrupt_destination() {
+        let unique = format!(
+            "tm-persist-concurrent-{}-{}",
+            std::process::id(),
+            NEXT_TMP_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        );
+        let dir = std::env::temp_dir().join(unique);
+        let dest = dir.join("settings.ini");
+
+        let threads = 4usize;
+        let iters = 20usize;
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(threads));
+        let observed_errors = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+
+        let mut handles = Vec::with_capacity(threads);
+        for tid in 0..threads {
+            let barrier = std::sync::Arc::clone(&barrier);
+            let dest = dest.clone();
+            let observed_errors = std::sync::Arc::clone(&observed_errors);
+            handles.push(std::thread::spawn(move || {
+                barrier.wait();
+                for iter in 0..iters {
+                    let expected =
+                        format!("worker={tid};iter={iter};payload={}\n", "x".repeat(256));
+                    // Verify temp creation succeeds without colliding on a fixed name;
+                    // atomic rename may hit transient Windows PermissionDenied under
+                    // heavy simultaneous rename contention on NTFS, which is fine as
+                    // long as the destination stays uncorrupted and no temp files leak.
+                    if let Err(err) =
+                        replace_file(&dest, "ini.tmp", |out| out.write_all(expected.as_bytes()))
+                        && err.kind() != std::io::ErrorKind::PermissionDenied
+                    {
+                        observed_errors
+                            .lock()
+                            .expect("lock")
+                            .push(format!("worker {tid} iter {iter}: {err}"));
+                    }
+                    if let Ok(content) = std::fs::read_to_string(&dest) {
+                        let ok = content.starts_with("worker=")
+                            && content.contains(";payload=")
+                            && content.ends_with('\n')
+                            && content.lines().count() == 1;
+                        if !ok {
+                            observed_errors
+                                .lock()
+                                .expect("lock")
+                                .push(format!("corrupt content: {content:?}"));
+                        }
+                    }
+                }
+            }));
+        }
+        for handle in handles {
+            handle.join().expect("worker panicked");
+        }
+
+        let errs = observed_errors.lock().expect("lock");
+        assert!(errs.is_empty(), "unexpected errors: {errs:?}");
+        let final_content = std::fs::read_to_string(&dest).expect("final destination readable");
+        assert!(final_content.ends_with('\n'));
+
+        let entries: std::collections::HashSet<String> = std::fs::read_dir(&dir)
+            .expect("read_dir")
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            entries,
+            std::collections::HashSet::from(["settings.ini".to_string()])
+        );
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

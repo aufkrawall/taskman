@@ -444,7 +444,10 @@ pub(crate) fn protected_process_modules(
     pid: u32,
     expected_start_epoch_s: i64,
 ) -> Result<ModuleRundown> {
-    if super::cpu_load::current_creation_epoch(pid) != Some(expected_start_epoch_s) {
+    let Some(actual) = super::cpu_load::current_creation_epoch(pid) else {
+        return Err(TmError::ProcessNotFound { pid });
+    };
+    if !tm_core::model::creation_timestamps_match(expected_start_epoch_s, actual) {
         return Err(TmError::ProcessNotFound { pid });
     }
     let mut slot = match active_trace().lock() {

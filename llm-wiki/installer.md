@@ -53,8 +53,10 @@ Steps (visible in the wizard and in `--dry-run`):
    failure page with guidance to the packaged installer (uninstall is exempt:
    it needs no payload).
 2. Stop running `taskman.exe` instances whose image path is the installed
-   GUI (WM_CLOSE first, bounded handle wait, terminate as fallback). Portable
-   copies elsewhere are left alone.
+   GUI: `stop_running_gui` opens each candidate with query, synchronize, and
+   terminate rights first, verifies `QueryFullProcessImageNameW` on that pinned
+   kernel handle (`OwnedHandle`), and only then runs `WM_CLOSE` / bounded wait
+   / `TerminateProcess` fallback. Portable copies elsewhere are left alone.
 3. Program files + service: run the app's own elevated helper
    `taskman.exe --core-service=install --core-service-user=<sid>`. That helper
    owns the pinned copy, ACLs, broker manifest and SCM registration; the

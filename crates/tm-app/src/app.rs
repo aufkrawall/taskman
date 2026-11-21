@@ -606,7 +606,7 @@ impl TaskManApp {
 
         // ---- cheap platform surface only -----------------------------------
         // Never construct a collector just to get actions (§4.3).
-        let actions: Arc<dyn PlatformActions> = Arc::from(tm_platform::create_actions());
+        let actions = create_app_actions(mock);
         let is_elevated = actions.is_elevated();
 
         // Frame-rate diagnostics: TASKMAN_FPS_PROBE=1 forces a continuous
@@ -843,7 +843,9 @@ impl TaskManApp {
         // debugger command and Ctrl+Shift+Esc opens NOTHING, not even the
         // built-in Task Manager. Check once per start, off the startup path.
         #[cfg(target_os = "windows")]
-        check_task_manager_replacement(&actions, &toasts, &ctx);
+        if !mock {
+            check_task_manager_replacement(&actions, &toasts, &ctx);
+        }
         let executor = ActionExecutor::start();
         if executor.is_none() {
             tracing::error!("action workers could not start; blocking controls are disabled");
@@ -2981,6 +2983,14 @@ impl TaskManApp {
     }
 }
 
+pub(crate) fn create_app_actions(mock: bool) -> Arc<dyn PlatformActions> {
+    if mock {
+        Arc::from(tm_platform::create_mock_actions())
+    } else {
+        Arc::from(tm_platform::create_actions())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3412,5 +3422,19 @@ mod tests {
             new_delay > std::time::Duration::from_millis(100),
             "moving over a tooltipped widget must schedule a delayed repaint, not spin (delay={new_delay:?}, causes={new_causes:?})"
         );
+    }
+
+    #[test]
+    fn mock_mode_selects_inert_actions_backend() {
+        let actions = super::create_app_actions(true);
+        assert_eq!(actions.backend_name(), "mock");
+        assert!(!actions.capabilities().end_process);
+        assert!(!actions.capabilities().services_control);
+        assert!(!actions.capabilities().set_priority);
+        assert!(!actions.is_elevated());
+        assert!(matches!(
+            actions.kill_process(1000, None, false),
+            Err(tm_core::TmError::Unsupported(_))
+        ));
     }
 }

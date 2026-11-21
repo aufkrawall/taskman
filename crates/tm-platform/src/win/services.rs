@@ -261,32 +261,53 @@ pub fn control_service(name: &str, action: crate::actions::ServiceAction) -> Res
             }
         };
 
-        let outcome = (|| -> Result<()> {
-            match action {
-                Start => {
-                    scm::StartServiceW(svc, None).map_err(wrap("StartServiceW"))?;
-                    wait_state(svc, &[scm::SERVICE_RUNNING.0], 10)?;
-                }
-                Stop => {
-                    scm::ControlService(svc, scm::SERVICE_CONTROL_STOP, std::ptr::null_mut())
-                        .map_err(wrap("ControlService(stop)"))?;
-                    wait_state(svc, &[scm::SERVICE_STOPPED.0], 15)?;
-                }
-                Restart => {
-                    let _ =
-                        scm::ControlService(svc, scm::SERVICE_CONTROL_STOP, std::ptr::null_mut());
-                    wait_state(svc, &[scm::SERVICE_STOPPED.0], 15)?;
-                    scm::StartServiceW(svc, None).map_err(wrap("StartServiceW(restart)"))?;
-                    wait_state(svc, &[scm::SERVICE_RUNNING.0], 10)?;
-                }
-            }
-            Ok(())
-        })();
+        let outcome = execute_service_action(
+            action,
+            |label| scm::StartServiceW(svc, None).map_err(wrap(label)),
+            |status| scm::ControlService(svc, scm::SERVICE_CONTROL_STOP, status),
+            |err| err.code() == windows::Win32::Foundation::ERROR_SERVICE_NOT_ACTIVE.to_hresult(),
+            |label, err| wrap(label)(err),
+            |states, timeout| wait_state(svc, states, timeout),
+        );
 
         let _ = scm::CloseServiceHandle(svc);
         let _ = scm::CloseServiceHandle(mgr);
         outcome
     }
+}
+
+fn execute_service_action<E>(
+    action: crate::actions::ServiceAction,
+    mut start_service: impl FnMut(&'static str) -> Result<()>,
+    mut control_stop: impl FnMut(&mut scm::SERVICE_STATUS) -> std::result::Result<(), E>,
+    is_not_active: impl Fn(&E) -> bool,
+    wrap_stop_err: impl Fn(&'static str, E) -> TmError,
+    mut wait_for_state: impl FnMut(&[u32], u64) -> Result<()>,
+) -> Result<()> {
+    use crate::actions::ServiceAction::*;
+    match action {
+        Start => {
+            start_service("StartServiceW")?;
+            wait_for_state(&[scm::SERVICE_RUNNING.0], 10)?;
+        }
+        Stop => {
+            let mut status = scm::SERVICE_STATUS::default();
+            control_stop(&mut status).map_err(|err| wrap_stop_err("ControlService(stop)", err))?;
+            wait_for_state(&[scm::SERVICE_STOPPED.0], 15)?;
+        }
+        Restart => {
+            let mut status = scm::SERVICE_STATUS::default();
+            match control_stop(&mut status) {
+                Ok(()) => {}
+                Err(err) if is_not_active(&err) => {}
+                Err(err) => return Err(wrap_stop_err("ControlService(restart stop)", err)),
+            }
+            wait_for_state(&[scm::SERVICE_STOPPED.0], 15)?;
+            start_service("StartServiceW(restart)")?;
+            wait_for_state(&[scm::SERVICE_RUNNING.0], 10)?;
+        }
+    }
+    Ok(())
 }
 
 fn wrap(ctx: &'static str) -> impl Fn(windows::core::Error) -> TmError {
@@ -330,4 +351,86 @@ fn pwstr_copy(p: windows::core::PWSTR) -> String {
         return String::new();
     }
     unsafe { p.to_string().unwrap_or_default() }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::actions::ServiceAction;
+
+    #[test]
+    fn stop_action_supplies_writable_status_and_waits_for_stopped() {
+        let mut waited = Vec::new();
+        let res = execute_service_action(
+            ServiceAction::Stop,
+            |_| unreachable!("start must not be called for Stop"),
+            |status| {
+                // Verify caller passed writable SERVICE_STATUS storage.
+                status.dwCurrentState = scm::SERVICE_STOPPED;
+                Ok::<(), u32>(())
+            },
+            |_| false,
+            |ctx, err| TmError::platform(ctx, format!("code={err}")),
+            |states, timeout| {
+                waited.push((states.to_vec(), timeout));
+                Ok(())
+            },
+        );
+        assert!(res.is_ok());
+        assert_eq!(waited, vec![(vec![scm::SERVICE_STOPPED.0], 15)]);
+    }
+
+    #[test]
+    fn restart_preserves_control_stop_error_when_not_already_stopped() {
+        let mut waited = false;
+        let mut started = false;
+        let res = execute_service_action(
+            ServiceAction::Restart,
+            |_| {
+                started = true;
+                Ok(())
+            },
+            |_status| Err(5u32), // ERROR_ACCESS_DENIED
+            |err| *err == 1062,  // ERROR_SERVICE_NOT_ACTIVE
+            |ctx, err| TmError::platform(ctx, format!("access denied: {err}")),
+            |_, _| {
+                waited = true;
+                Ok(())
+            },
+        );
+        assert!(matches!(res, Err(TmError::Platform { .. })));
+        assert!(
+            !waited,
+            "restart must fail fast instead of waiting on failed stop"
+        );
+        assert!(!started, "restart must not start after failed stop");
+    }
+
+    #[test]
+    fn restart_proceeds_when_service_is_already_stopped() {
+        let steps = std::cell::RefCell::new(Vec::new());
+        let res = execute_service_action(
+            ServiceAction::Restart,
+            |label| {
+                steps.borrow_mut().push(format!("start:{label}"));
+                Ok(())
+            },
+            |_status| Err(1062u32), // ERROR_SERVICE_NOT_ACTIVE
+            |err| *err == 1062,
+            |ctx, err| TmError::platform(ctx, format!("err={err}")),
+            |states, _| {
+                steps.borrow_mut().push(format!("wait:{states:?}"));
+                Ok(())
+            },
+        );
+        assert!(res.is_ok());
+        assert_eq!(
+            *steps.borrow(),
+            vec![
+                format!("wait:[{}]", scm::SERVICE_STOPPED.0),
+                "start:StartServiceW(restart)".to_string(),
+                format!("wait:[{}]", scm::SERVICE_RUNNING.0),
+            ]
+        );
+    }
 }

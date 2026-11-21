@@ -427,28 +427,48 @@ pub(crate) fn sid_for_token(token: HANDLE) -> Result<String> {
 // Stopping a running Task Manager
 // ---------------------------------------------------------------------------
 
-fn process_image_path(pid: u32) -> Option<PathBuf> {
-    use windows::Win32::System::Threading::{
-        OpenProcess, PROCESS_NAME_FORMAT, PROCESS_QUERY_LIMITED_INFORMATION,
-        QueryFullProcessImageNameW,
-    };
+struct OwnedHandle(HANDLE);
+
+impl Drop for OwnedHandle {
+    fn drop(&mut self) {
+        let _ = unsafe { CloseHandle(self.0) };
+    }
+}
+
+fn handle_image_path(handle: HANDLE) -> Option<PathBuf> {
+    use windows::Win32::System::Threading::{PROCESS_NAME_FORMAT, QueryFullProcessImageNameW};
     unsafe {
-        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).ok()?;
         let mut buffer = vec![0u16; 32_768];
         let mut size = buffer.len() as u32;
-        let ok = QueryFullProcessImageNameW(
+        QueryFullProcessImageNameW(
             handle,
             PROCESS_NAME_FORMAT(0),
             PWSTR(buffer.as_mut_ptr()),
             &mut size,
-        );
-        let _ = CloseHandle(handle);
-        ok.ok()?;
+        )
+        .ok()?;
         Some(PathBuf::from(from_wide(&buffer[..size as usize])))
     }
 }
 
-fn pids_for_image(wanted: &str) -> Vec<u32> {
+fn open_verified_gui_handle(pid: u32, wanted: &str) -> Option<OwnedHandle> {
+    use windows::Win32::System::Threading::{
+        OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE,
+    };
+    let handle = unsafe {
+        OpenProcess(
+            PROCESS_TERMINATE | PROCESS_SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION,
+            false,
+            pid,
+        )
+    }
+    .ok()?;
+    let owned = OwnedHandle(handle);
+    let path = handle_image_path(owned.0)?;
+    (normalize(&path) == wanted).then_some(owned)
+}
+
+fn verified_handles_for_image(wanted: &str) -> Vec<(u32, OwnedHandle)> {
     use windows::Win32::System::Diagnostics::ToolHelp::{
         CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW,
         TH32CS_SNAPPROCESS,
@@ -457,27 +477,26 @@ fn pids_for_image(wanted: &str) -> Vec<u32> {
         let Ok(snapshot) = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) else {
             return Vec::new();
         };
+        let _snapshot_guard = OwnedHandle(snapshot);
         let mut entry = PROCESSENTRY32W {
             dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
             ..Default::default()
         };
-        let mut pids = Vec::new();
+        let mut verified = Vec::new();
         if Process32FirstW(snapshot, &mut entry).is_ok() {
             loop {
                 let name = from_wide(&entry.szExeFile);
                 if name.eq_ignore_ascii_case(GUI_EXE_NAME)
-                    && let Some(path) = process_image_path(entry.th32ProcessID)
-                    && normalize(&path) == wanted
+                    && let Some(handle) = open_verified_gui_handle(entry.th32ProcessID, wanted)
                 {
-                    pids.push(entry.th32ProcessID);
+                    verified.push((entry.th32ProcessID, handle));
                 }
                 if Process32NextW(snapshot, &mut entry).is_err() {
                     break;
                 }
             }
         }
-        let _ = CloseHandle(snapshot);
-        pids
+        verified
     }
 }
 
@@ -519,26 +538,21 @@ fn post_close_to_windows(pid: u32) {
 /// process handle); anything still alive after the deadline is terminated.
 /// Returns how many processes were stopped.
 pub fn stop_running_gui(image: &Path) -> Result<usize> {
-    use windows::Win32::System::Threading::{
-        OpenProcess, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE, TerminateProcess, WaitForSingleObject,
-    };
+    use windows::Win32::System::Threading::{TerminateProcess, WaitForSingleObject};
     let wanted = normalize(image);
     let mut stopped = 0usize;
-    for pid in pids_for_image(&wanted) {
-        let Ok(handle) =
-            (unsafe { OpenProcess(PROCESS_TERMINATE | PROCESS_SYNCHRONIZE, false, pid) })
-        else {
-            continue;
-        };
-        post_close_to_windows(pid);
-        // Give the window a chance to close on its own; a task manager has no
-        // unsaved state, so the deadline below is a UX courtesy, not a race.
-        let mut exited = unsafe { WaitForSingleObject(handle, 3000) } == WAIT_OBJECT_0;
+    for (pid, handle) in verified_handles_for_image(&wanted) {
+        let mut exited = unsafe { WaitForSingleObject(handle.0, 0) } == WAIT_OBJECT_0;
         if !exited {
-            let _ = unsafe { TerminateProcess(handle, 1) };
-            exited = unsafe { WaitForSingleObject(handle, 5000) } == WAIT_OBJECT_0;
+            post_close_to_windows(pid);
+            // Give the window a chance to close on its own; a task manager has no
+            // unsaved state, so the deadline below is a UX courtesy, not a race.
+            exited = unsafe { WaitForSingleObject(handle.0, 3000) } == WAIT_OBJECT_0;
         }
-        let _ = unsafe { CloseHandle(handle) };
+        if !exited {
+            let _ = unsafe { TerminateProcess(handle.0, 1) };
+            exited = unsafe { WaitForSingleObject(handle.0, 5000) } == WAIT_OBJECT_0;
+        }
         if exited {
             stopped += 1;
         } else {
@@ -1297,5 +1311,23 @@ mod tests {
         assert!(remove_file_at_exact_path(&real.join(SETUP_LOG_NAME)).unwrap());
         assert!(!real.join(SETUP_LOG_NAME).exists());
         assert!(!remove_file_at_exact_path(&real.join(SETUP_LOG_NAME)).unwrap());
+    }
+
+    #[test]
+    fn open_verified_gui_handle_accepts_matching_image_and_rejects_mismatch() {
+        let current_pid = std::process::id();
+        let current_exe = std::env::current_exe().expect("current test exe");
+        assert!(
+            open_verified_gui_handle(current_pid, &normalize(&current_exe)).is_some(),
+            "open_verified_gui_handle must accept the process's own image path while holding the handle"
+        );
+        assert!(
+            open_verified_gui_handle(
+                current_pid,
+                &normalize(Path::new(r"C:\nonexistent\taskman.exe")),
+            )
+            .is_none(),
+            "open_verified_gui_handle must reject a non-matching image path"
+        );
     }
 }

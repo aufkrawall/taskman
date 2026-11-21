@@ -27,27 +27,39 @@ pub(crate) fn explorer_restart_identity(
     identity: ProcessIdentity,
     row_synthetic: bool,
 ) -> Option<ProcessIdentity> {
-    if row_synthetic {
+    if row_synthetic || !app.actions.capabilities().end_process {
         return None;
     }
+    let shell_owner_pid = tm_platform::win::shell_window_owner_pid()?;
     let snapshot = app.latest_snapshot()?;
     let process = snapshot.process(identity.pid)?;
-    is_live_explorer_process(process, &identity).then_some(identity)
+    is_shell_explorer_process(process, &identity, Some(shell_owner_pid)).then_some(identity)
 }
 
 /// Pure core of [`explorer_restart_identity`]: the snapshot entry behind
 /// `identity` is a non-synthetic `explorer.exe` of the same process
-/// generation. Matching uses the image name (`process.name`), never a
-/// display label — the Processes page renders "Windows Explorer
-/// (explorer.exe)", so a row label must not be what decides this.
+/// generation with a verified creation timestamp. Matching uses the image
+/// name (`process.name`), never a display label — the Processes page renders
+/// "Windows Explorer (explorer.exe)", so a row label must not be what decides
+/// this.
 #[cfg(target_os = "windows")]
 fn is_live_explorer_process(
     process: &tm_core::model::ProcessEntry,
     identity: &ProcessIdentity,
 ) -> bool {
     !process.synthetic
+        && identity.start_epoch_s.is_some_and(|start| start > 0)
         && process.start_epoch_s == identity.start_epoch_s
         && process.name.eq_ignore_ascii_case("explorer.exe")
+}
+
+#[cfg(target_os = "windows")]
+fn is_shell_explorer_process(
+    process: &tm_core::model::ProcessEntry,
+    identity: &ProcessIdentity,
+    shell_owner_pid: Option<u32>,
+) -> bool {
+    shell_owner_pid == Some(identity.pid) && is_live_explorer_process(process, identity)
 }
 
 #[cfg(target_os = "windows")]
@@ -67,6 +79,9 @@ fn explorer_restart_target(app: &TaskManApp) -> Option<ProcessIdentity> {
 
 #[cfg(target_os = "windows")]
 pub(crate) fn restart_explorer(app: &mut TaskManApp, ctx: &egui::Context, target: ProcessIdentity) {
+    if !app.actions.capabilities().end_process {
+        return;
+    }
     if !app.identity_is_live(&target) {
         app.shared.toast(i18n::tr(K::ProcessExited));
         return;
@@ -259,5 +274,37 @@ mod tests {
         });
         out.textures_delta.clear();
         assert_eq!(density, RowDensity::Compact);
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn shell_explorer_gate_requires_timestamp_and_matching_shell_owner() {
+        use tm_core::model::ProcessEntry;
+
+        let mut entry = ProcessEntry::new(400, "explorer.exe");
+        entry.start_epoch_s = Some(1_700_000_000);
+        let id = ProcessIdentity {
+            pid: 400,
+            start_epoch_s: Some(1_700_000_000),
+        };
+        assert!(is_shell_explorer_process(&entry, &id, Some(400)));
+        assert!(
+            !is_shell_explorer_process(&entry, &id, Some(999)),
+            "another session's explorer.exe must be rejected"
+        );
+        assert!(
+            !is_shell_explorer_process(&entry, &id, None),
+            "missing shell window owner must be rejected"
+        );
+
+        let no_ts = ProcessIdentity {
+            pid: 400,
+            start_epoch_s: None,
+        };
+        entry.start_epoch_s = None;
+        assert!(
+            !is_shell_explorer_process(&entry, &no_ts, Some(400)),
+            "missing creation identity must fail closed"
+        );
     }
 }

@@ -1953,10 +1953,13 @@ fn build_rows(
             let mut cursor = matched;
             let mut seen = HashSet::new();
             while seen.insert(cursor) {
-                let Some(parent) = by_pid
-                    .get(&cursor)
-                    .and_then(|process| process.ppid)
+                let Some(current) = by_pid.get(&cursor).copied() else {
+                    break;
+                };
+                let Some(parent) = current
+                    .ppid
                     .and_then(|pid| by_pid.get(&pid).copied())
+                    .filter(|parent| tm_core::model::is_plausible_parent(parent, current))
                 else {
                     break;
                 };
@@ -3356,7 +3359,7 @@ pub(crate) fn process_properties_target<'a>(
 }
 
 fn process_properties_started(start_epoch_s: Option<i64>) -> String {
-    let Some(epoch_s) = start_epoch_s else {
+    let Some(epoch_s) = start_epoch_s.map(tm_core::model::epoch_timestamp_to_unix_seconds) else {
         return "—".into();
     };
     let seconds = epoch_s.rem_euclid(86_400);

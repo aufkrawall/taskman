@@ -468,73 +468,71 @@ pub trait PlatformActions: Send + Sync {
     /// the UI-level snapshot check still applies there.
     fn kill_process(
         &self,
-        pid: u32,
-        expected_start_epoch_s: Option<i64>,
-        tree: bool,
+        _pid: u32,
+        _expected_start_epoch_s: Option<i64>,
+        _tree: bool,
     ) -> Result<()> {
-        let _ = (expected_start_epoch_s, tree);
-        self.kill_single(pid)
-    }
-    fn kill_single(&self, pid: u32) -> Result<()> {
-        let _ = pid;
         Err(tm_core::TmError::Unsupported("end task"))
     }
-    fn suspend_process(&self, _pid: u32, _suspend: bool) -> Result<()> {
-        Err(tm_core::TmError::Unsupported("suspend/resume"))
+    fn kill_single(&self, pid: u32) -> Result<()> {
+        self.kill_process(pid, None, false)
+    }
+    fn suspend_process(&self, pid: u32, suspend: bool) -> Result<()> {
+        self.suspend_process_checked(pid, None, suspend)
     }
     fn suspend_process_checked(
         &self,
-        pid: u32,
+        _pid: u32,
         _expected_start_epoch_s: Option<i64>,
-        suspend: bool,
+        _suspend: bool,
     ) -> Result<()> {
-        self.suspend_process(pid, suspend)
+        Err(tm_core::TmError::Unsupported("suspend/resume"))
     }
-    fn set_priority(&self, _pid: u32, _priority: PriorityClass) -> Result<()> {
-        Err(tm_core::TmError::Unsupported("set priority"))
+    fn set_priority(&self, pid: u32, priority: PriorityClass) -> Result<()> {
+        self.set_priority_checked(pid, None, priority)
     }
     fn set_priority_checked(
         &self,
-        pid: u32,
+        _pid: u32,
         _expected_start_epoch_s: Option<i64>,
-        priority: PriorityClass,
+        _priority: PriorityClass,
     ) -> Result<()> {
-        self.set_priority(pid, priority)
+        Err(tm_core::TmError::Unsupported("set priority"))
     }
-    fn get_affinity_mask(&self, _pid: u32) -> Result<u64> {
-        Err(tm_core::TmError::Unsupported("affinity"))
+    fn get_affinity_mask(&self, pid: u32) -> Result<u64> {
+        self.get_affinity_mask_checked(pid, None)
     }
     fn get_affinity_mask_checked(
         &self,
-        pid: u32,
+        _pid: u32,
         _expected_start_epoch_s: Option<i64>,
     ) -> Result<u64> {
-        self.get_affinity_mask(pid)
+        Err(tm_core::TmError::Unsupported("affinity"))
     }
     fn system_affinity_mask(&self) -> Result<u64> {
         Err(tm_core::TmError::Unsupported("affinity"))
     }
-    fn set_affinity_mask(&self, _pid: u32, _mask: u64) -> Result<()> {
-        Err(tm_core::TmError::Unsupported("affinity"))
+    fn set_affinity_mask(&self, pid: u32, mask: u64) -> Result<()> {
+        self.set_affinity_mask_checked(pid, None, mask)
     }
     fn set_affinity_mask_checked(
         &self,
-        pid: u32,
+        _pid: u32,
         _expected_start_epoch_s: Option<i64>,
-        mask: u64,
+        _mask: u64,
     ) -> Result<()> {
-        self.set_affinity_mask(pid, mask)
+        Err(tm_core::TmError::Unsupported("affinity"))
     }
-    fn set_efficiency_mode(&self, _pid: u32, _on: bool) -> Result<()> {
-        Err(tm_core::TmError::Unsupported("efficiency mode"))
+    fn set_efficiency_mode(&self, pid: u32, on: bool) -> Result<()> {
+        self.set_efficiency_mode_checked(pid, None, on)
     }
     fn set_efficiency_mode_checked(
         &self,
-        pid: u32,
+        _pid: u32,
         _expected_start_epoch_s: Option<i64>,
-        on: bool,
+        _on: bool,
     ) -> Result<()> {
-        self.set_efficiency_mode(pid, on)
+        Err(tm_core::TmError::Unsupported("efficiency mode"))
     }
     fn set_uac_virtualization_checked(
         &self,
@@ -708,5 +706,15 @@ pub trait PlatformActions: Send + Sync {
 
     fn backend_name(&self) -> &'static str {
         "unknown"
+    }
+}
+
+/// Inert action backend for `--mock` sessions so UI testing can never mutate or
+/// terminate real host processes, services, or registry state.
+pub struct MockActions;
+
+impl PlatformActions for MockActions {
+    fn backend_name(&self) -> &'static str {
+        "mock"
     }
 }

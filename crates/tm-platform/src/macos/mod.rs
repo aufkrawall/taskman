@@ -90,7 +90,8 @@ impl SystemCollector for MacCollector {
             entry.mem_bytes = p.memory();
             entry.working_set_bytes = Some(p.memory());
             entry.commit_bytes = Some(p.virtual_memory());
-            entry.start_epoch_s = Some(p.start_time() as i64);
+            entry.start_epoch_s = macos_proc_start_timestamp(pid_u)
+                .or_else(|| (p.start_time() > 0).then_some(p.start_time() as i64));
             // macOS accumulated cpu time unit: microseconds in sysinfo? treat ms fallback.
             entry.cpu_time_s = Some(p.accumulated_cpu_time() as f64 / 1000.0);
             entry.disk_read_bps = du.read_bytes as f64 / interval_s;
@@ -361,12 +362,24 @@ impl PlatformActions for MacActions {
         Ok(startup::list_plists())
     }
 
-    fn kill_single(&self, pid: u32) -> Result<()> {
-        send_signal(pid, libc::SIGTERM)
+    fn kill_process(
+        &self,
+        pid: u32,
+        expected_start_epoch_s: Option<i64>,
+        tree: bool,
+    ) -> Result<()> {
+        let _ = tree;
+        send_signal_checked(pid, expected_start_epoch_s, libc::SIGTERM)
     }
-    fn suspend_process(&self, pid: u32, suspend: bool) -> Result<()> {
-        send_signal(
+    fn suspend_process_checked(
+        &self,
+        pid: u32,
+        expected_start_epoch_s: Option<i64>,
+        suspend: bool,
+    ) -> Result<()> {
+        send_signal_checked(
             pid,
+            expected_start_epoch_s,
             if suspend {
                 libc::SIGSTOP
             } else {
@@ -374,7 +387,16 @@ impl PlatformActions for MacActions {
             },
         )
     }
-    fn set_priority(&self, pid: u32, priority: PriorityClass) -> Result<()> {
+    fn set_priority_checked(
+        &self,
+        pid: u32,
+        expected_start_epoch_s: Option<i64>,
+        priority: PriorityClass,
+    ) -> Result<()> {
+        if pid == 0 {
+            return Err(tm_core::TmError::platform("setpriority", "kernel process"));
+        }
+        verify_process_identity(pid, expected_start_epoch_s)?;
         let nice: i32 = match priority {
             PriorityClass::Realtime | PriorityClass::High => -5,
             PriorityClass::AboveNormal => -2,
@@ -412,15 +434,75 @@ impl PlatformActions for MacActions {
 }
 
 fn send_signal(pid: u32, sig: i32) -> Result<()> {
-    let rc = unsafe { libc::kill(pid as libc::pid_t, sig) };
+    if pid == 0 {
+        return Err(tm_core::TmError::platform("kill", "kernel process"));
+    }
+    let Ok(pid_t) = libc::pid_t::try_from(pid) else {
+        return Err(tm_core::TmError::ProcessNotFound { pid });
+    };
+    let rc = unsafe { libc::kill(pid_t, sig) };
     if rc == 0 {
         Ok(())
+    } else if std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
+        Err(tm_core::TmError::ProcessNotFound { pid })
     } else {
         Err(tm_core::TmError::platform(
             "kill",
             format!("signal {sig} failed"),
         ))
     }
+}
+
+fn send_signal_checked(pid: u32, expected_start_epoch_s: Option<i64>, sig: i32) -> Result<()> {
+    if pid == 0 {
+        return Err(tm_core::TmError::platform("kill", "kernel process"));
+    }
+    verify_process_identity(pid, expected_start_epoch_s)?;
+    send_signal(pid, sig)
+}
+
+fn bsd_info(pid: u32) -> Option<libc::proc_bsdinfo> {
+    let pid_i32 = i32::try_from(pid).ok()?;
+    let mut info = unsafe { std::mem::zeroed::<libc::proc_bsdinfo>() };
+    let expected = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+    let rc = unsafe {
+        libc::proc_pidinfo(
+            pid_i32,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            (&raw mut info).cast(),
+            expected,
+        )
+    };
+    (rc == expected).then_some(info)
+}
+
+fn macos_start_timestamp(tvsec: u64, tvusec: u64) -> Option<i64> {
+    if tvsec == 0 && tvusec == 0 {
+        return None;
+    }
+    let sec_ticks =
+        i128::from(tvsec).checked_mul(i128::from(tm_core::model::HIGH_RES_TICKS_PER_SECOND))?;
+    let usec_ticks = i128::from(tvusec).checked_mul(10)?;
+    i64::try_from(sec_ticks.checked_add(usec_ticks)?).ok()
+}
+
+fn macos_proc_start_timestamp(pid: u32) -> Option<i64> {
+    let info = bsd_info(pid)?;
+    macos_start_timestamp(info.pbi_start_tvsec, info.pbi_start_tvusec)
+}
+
+fn verify_process_identity(pid: u32, expected_start_epoch_s: Option<i64>) -> Result<()> {
+    let Some(expected) = expected_start_epoch_s else {
+        return Ok(());
+    };
+    let Some(actual) = macos_proc_start_timestamp(pid) else {
+        return Err(tm_core::TmError::ProcessNotFound { pid });
+    };
+    if !tm_core::model::creation_timestamps_match(expected, actual) {
+        return Err(tm_core::TmError::ProcessNotFound { pid });
+    }
+    Ok(())
 }
 
 pub fn create_collector() -> MacCollector {
@@ -461,6 +543,18 @@ mod tests {
         assert_eq!(
             bsd_run_state(std::process::id()).map(status_from_bsd),
             Some(ProcStatus::Running)
+        );
+    }
+
+    #[test]
+    fn microsecond_timestamps_catch_same_second_reuse() {
+        let ts_a = macos_start_timestamp(1_700_000_000, 100).unwrap();
+        let ts_b = macos_start_timestamp(1_700_000_000, 200).unwrap();
+        assert!(ts_a >= tm_core::model::HIGH_RES_EPOCH_THRESHOLD);
+        assert!(!tm_core::model::creation_timestamps_match(ts_a, ts_b));
+        assert_eq!(
+            tm_core::model::epoch_timestamp_to_unix_seconds(ts_a),
+            1_700_000_000
         );
     }
 }

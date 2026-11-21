@@ -1080,7 +1080,9 @@ fn is_zombie(
         return true;
     }
     if !live_in_kernel_table() {
-        let is_recent = start_epoch_s.is_some_and(|s| (now_s - s).abs() <= 2);
+        let is_recent = start_epoch_s.is_some_and(|s| {
+            (now_s - tm_core::model::epoch_timestamp_to_unix_seconds(s)).abs() <= 2
+        });
         return !is_recent;
     }
     false
@@ -1552,11 +1554,11 @@ impl Sampler {
             // kernel process table, which reports a creation time for every
             // process, and leave it unknown when even that has none.
             let sysinfo_start = p.start_time();
-            entry.start_epoch_s = if sysinfo_start > 0 {
-                Some(sysinfo_start as i64)
-            } else {
-                self.cpu_load.start_epoch_of(pid_u)
-            };
+            entry.start_epoch_s = self
+                .cpu_load
+                .start_epoch_of(pid_u)
+                .or_else(|| super::process_ops::creation_epoch_of_pid(pid_u))
+                .or_else(|| (sysinfo_start > 0).then_some(sysinfo_start as i64));
             entry.ppid = p
                 .parent()
                 .map(|x| x.as_u32())
@@ -2429,30 +2431,35 @@ fn inherit_same_image_service_accounts(
     if catalog.accounts_by_pid.is_empty() {
         return;
     }
-    let parents: HashMap<u32, (String, String, Option<String>)> = processes
+    let parents: HashMap<u32, &ProcessEntry> = processes
         .iter()
-        .filter(|p| catalog.accounts_by_pid.contains_key(&p.pid))
-        .filter_map(|p| {
-            let user = p.user.clone()?;
-            Some((p.pid, (p.name.clone(), user, p.user_sid.clone())))
-        })
+        .filter(|p| catalog.accounts_by_pid.contains_key(&p.pid) && p.user.is_some())
+        .map(|p| (p.pid, p))
         .collect();
     if parents.is_empty() {
         return;
     }
-    for p in processes.iter_mut() {
-        if p.user.is_some() || p.has_window || p.synthetic {
-            continue;
-        }
-        let Some(parent) = p.ppid.and_then(|ppid| parents.get(&ppid)) else {
-            continue;
-        };
-        if !parent.0.eq_ignore_ascii_case(&p.name) {
-            continue;
-        }
-        p.user = Some(parent.1.clone());
-        if p.user_sid.is_none() {
-            p.user_sid = parent.2.clone();
+    let inherited: Vec<(usize, String, Option<String>)> = processes
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, p)| {
+            if p.user.is_some() || p.has_window || p.synthetic {
+                return None;
+            }
+            let parent = p.ppid.and_then(|ppid| parents.get(&ppid).copied())?;
+            if !tm_core::model::is_plausible_parent(parent, p)
+                || !parent.name.eq_ignore_ascii_case(&p.name)
+            {
+                return None;
+            }
+            let user = parent.user.clone()?;
+            Some((idx, user, parent.user_sid.clone()))
+        })
+        .collect();
+    for (idx, user, user_sid) in inherited {
+        processes[idx].user = Some(user);
+        if processes[idx].user_sid.is_none() {
+            processes[idx].user_sid = user_sid;
         }
     }
 }

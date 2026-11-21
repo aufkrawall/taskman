@@ -243,7 +243,7 @@ impl CpuLoadAccountant {
     /// identity or an honest `None`.
     pub fn start_epoch_of(&self, pid: u32) -> Option<i64> {
         let raw = self.prev.as_ref()?.procs.get(&pid)?;
-        filetime_to_unix_seconds(raw.create_time)
+        filetime_to_unix_ticks(raw.create_time)
     }
 
     /// Whether the newest native process table (from `NtQuerySystemInformation(SystemProcessInformation)`)
@@ -379,12 +379,21 @@ impl CpuLoadAccountant {
     /// tolerated to accommodate rounding differences between sysinfo and
     /// the kernel process table.
     pub fn is_suspended(&self, pid: u32, start_epoch_s: Option<i64>) -> bool {
-        let Some(native_start) = self.suspended.get(&pid) else {
+        let Some(&native_start) = self.suspended.get(&pid) else {
             return false;
         };
-        match start_epoch_s {
-            Some(expected) => (*native_start - expected).abs() <= 1,
-            None => true,
+        let Some(expected) = start_epoch_s else {
+            return true;
+        };
+        if native_start >= tm_core::model::HIGH_RES_EPOCH_THRESHOLD
+            && expected >= tm_core::model::HIGH_RES_EPOCH_THRESHOLD
+        {
+            native_start == expected
+        } else {
+            (tm_core::model::epoch_timestamp_to_unix_seconds(native_start)
+                - tm_core::model::epoch_timestamp_to_unix_seconds(expected))
+            .abs()
+                <= 1
         }
     }
 
@@ -572,7 +581,7 @@ impl CpuLoadAccountant {
             if kernel >= 0 && user >= 0 {
                 if pid != 0
                     && process_suspended(buf, pos, record_end, number_of_threads) == Some(true)
-                    && let Some(start_epoch_s) = filetime_to_unix_seconds(create_time)
+                    && let Some(start_epoch_s) = filetime_to_unix_ticks(create_time)
                 {
                     suspended.insert(pid, start_epoch_s);
                 }
@@ -623,7 +632,7 @@ pub(crate) fn current_creation_epoch(pid: u32) -> Option<i64> {
     let mut accountant = CpuLoadAccountant::new();
     let procs = accountant.query_procs()?;
     let raw = procs.get(&pid)?;
-    filetime_to_unix_seconds(raw.create_time)
+    filetime_to_unix_ticks(raw.create_time)
 }
 
 /// Raw `IO_COUNTERS` read directly from the kernel process table.
@@ -665,21 +674,34 @@ const THREAD_STATE_WAITING: u32 = 5;
 const WAIT_REASON_SUSPENDED: u32 = 5;
 const WINDOWS_TO_UNIX_EPOCH_100NS: i64 = 116_444_736_000_000_000;
 
-pub(crate) fn filetime_to_unix_seconds(create_time: i64) -> Option<i64> {
+pub(crate) fn filetime_to_unix_ticks(create_time: i64) -> Option<i64> {
     create_time
         .checked_sub(WINDOWS_TO_UNIX_EPOCH_100NS)
         .filter(|value| *value >= 0)
-        .map(|value| value / 10_000_000)
+}
+
+#[cfg(test)]
+pub(crate) fn filetime_to_unix_seconds(create_time: i64) -> Option<i64> {
+    filetime_to_unix_ticks(create_time).map(|value| value / 10_000_000)
 }
 
 fn matches_start_epoch(expected: Option<i64>, actual_filetime: i64) -> bool {
     let Some(expected) = expected else {
         return true;
     };
-    let Some(actual) = filetime_to_unix_seconds(actual_filetime) else {
+    let Some(actual) = filetime_to_unix_ticks(actual_filetime) else {
         return false;
     };
-    (actual - expected).abs() <= 1
+    if expected >= tm_core::model::HIGH_RES_EPOCH_THRESHOLD
+        && actual >= tm_core::model::HIGH_RES_EPOCH_THRESHOLD
+    {
+        actual == expected
+    } else {
+        (tm_core::model::epoch_timestamp_to_unix_seconds(actual)
+            - tm_core::model::epoch_timestamp_to_unix_seconds(expected))
+        .abs()
+            <= 1
+    }
 }
 
 /// `SYSTEM_PROCESS_INFORMATION` is immediately followed by its thread array.
@@ -1558,7 +1580,7 @@ mod tests {
         let pid = std::process::id();
         let mut acc = CpuLoadAccountant::new();
         let procs = acc.query_procs().expect("NtQuerySystemInformation");
-        let expected = filetime_to_unix_seconds(
+        let expected = filetime_to_unix_ticks(
             procs
                 .get(&pid)
                 .expect("own process in kernel table")
@@ -2028,5 +2050,24 @@ mod tests {
         load.prev.as_mut().expect("warmed up").at = stale_at;
         assert!(load.is_process_live(9999, Some(1_700_000_000)));
         assert!(load.is_process_live(1234, Some(1_700_000_002)));
+    }
+
+    #[test]
+    fn high_res_matches_start_epoch_and_is_suspended_reject_same_second_reuse() {
+        let ft_a = 133_500_000_000_000_000i64;
+        let ft_b = ft_a + 10_000;
+        let ts_a = filetime_to_unix_ticks(ft_a).expect("ticks A");
+        let ts_b = filetime_to_unix_ticks(ft_b).expect("ticks B");
+
+        assert!(matches_start_epoch(Some(ts_a), ft_a));
+        assert!(
+            !matches_start_epoch(Some(ts_a), ft_b),
+            "same-second FILETIME must not match a recycled process"
+        );
+
+        let mut accountant = CpuLoadAccountant::new();
+        accountant.suspended.insert(42, ts_a);
+        assert!(accountant.is_suspended(42, Some(ts_a)));
+        assert!(!accountant.is_suspended(42, Some(ts_b)));
     }
 }

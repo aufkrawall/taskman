@@ -792,7 +792,39 @@ impl ProcessEntry {
     }
 
     pub fn uptime_s(&self, now_epoch_s: i64) -> Option<i64> {
-        self.start_epoch_s.map(|s| (now_epoch_s - s).max(0))
+        self.start_epoch_s
+            .map(|s| (now_epoch_s - epoch_timestamp_to_unix_seconds(s)).max(0))
+    }
+}
+
+/// Timestamps above this threshold are encoded as 100-nanosecond ticks since
+/// the Unix epoch (`10_000_000` ticks/s, ~year 5138 if interpreted as seconds).
+/// Legacy/synthetic fixtures below this threshold represent whole Unix seconds.
+pub const HIGH_RES_EPOCH_THRESHOLD: i64 = 100_000_000_000;
+
+/// Scale factor from Unix seconds to the high-resolution creation timestamp unit.
+pub const HIGH_RES_TICKS_PER_SECOND: i64 = 10_000_000;
+
+/// Convert a whole-second or 100-ns creation timestamp into whole Unix seconds.
+#[inline]
+pub fn epoch_timestamp_to_unix_seconds(timestamp: i64) -> i64 {
+    if timestamp >= HIGH_RES_EPOCH_THRESHOLD {
+        timestamp / HIGH_RES_TICKS_PER_SECOND
+    } else {
+        timestamp
+    }
+}
+
+/// Compare two process creation timestamps for PID-reuse verification.
+/// High-resolution timestamps (`>= HIGH_RES_EPOCH_THRESHOLD`) must match
+/// down to the native tick; mixed or legacy second-precision values compare
+/// at whole-second granularity without adding fuzz tolerance.
+#[inline]
+pub fn creation_timestamps_match(expected: i64, actual: i64) -> bool {
+    if expected >= HIGH_RES_EPOCH_THRESHOLD && actual >= HIGH_RES_EPOCH_THRESHOLD {
+        expected == actual
+    } else {
+        epoch_timestamp_to_unix_seconds(expected) == epoch_timestamp_to_unix_seconds(actual)
     }
 }
 
@@ -802,7 +834,14 @@ impl ProcessEntry {
 /// Unknown timestamps are never treated as evidence — the link stands.
 pub fn is_plausible_parent(parent: &ProcessEntry, child: &ProcessEntry) -> bool {
     match (parent.start_epoch_s, child.start_epoch_s) {
-        (Some(parent_start), Some(child_start)) => parent_start <= child_start,
+        (Some(parent_start), Some(child_start)) => {
+            if parent_start >= HIGH_RES_EPOCH_THRESHOLD && child_start >= HIGH_RES_EPOCH_THRESHOLD {
+                parent_start <= child_start
+            } else {
+                epoch_timestamp_to_unix_seconds(parent_start)
+                    <= epoch_timestamp_to_unix_seconds(child_start)
+            }
+        }
         _ => true,
     }
 }
@@ -1081,5 +1120,26 @@ mod tests {
         // Parent started AFTER child -> rejected (PID reuse)
         parent.start_epoch_s = Some(1100);
         assert!(!is_plausible_parent(&parent, &child));
+    }
+
+    #[test]
+    fn high_res_timestamps_reject_same_second_reuse_and_convert_uptime() {
+        let base_s = 1_700_000_000i64;
+        let t1 = base_s * super::HIGH_RES_TICKS_PER_SECOND + 100_000;
+        let t2 = base_s * super::HIGH_RES_TICKS_PER_SECOND + 200_000;
+        assert_eq!(super::epoch_timestamp_to_unix_seconds(base_s), base_s);
+        assert_eq!(super::epoch_timestamp_to_unix_seconds(t1), base_s);
+        assert!(super::creation_timestamps_match(t1, t1));
+        assert!(!super::creation_timestamps_match(t1, t2));
+        assert!(super::creation_timestamps_match(base_s, t1));
+
+        let mut p1 = ProcessEntry::new(10, "a.exe");
+        p1.start_epoch_s = Some(t1);
+        assert_eq!(p1.uptime_s(base_s + 5), Some(5));
+
+        let mut p2 = ProcessEntry::new(20, "b.exe");
+        p2.start_epoch_s = Some(t2);
+        assert!(is_plausible_parent(&p1, &p2));
+        assert!(!is_plausible_parent(&p2, &p1));
     }
 }

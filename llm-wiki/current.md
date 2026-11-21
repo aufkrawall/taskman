@@ -627,7 +627,14 @@ rebase runbook.
 
 - `start_epoch_s` is never a fabricated `Some(0)` any more: sysinfo returns 0
   whenever it cannot open a process handle (half the list unelevated), so the
-  kernel process table fills it instead. The same table supplies a base
+  kernel process table fills it instead. Since 2026-11-21 it prefers native
+  high-resolution 100-ns Unix ticks (`SystemProcessInformation` /
+  `GetProcessTimes` on Windows, `/proc/stat` `btime` + `/proc/<pid>/stat`
+  `starttime` on Linux, `proc_pidinfo(PROC_PIDTBSDINFO)` on macOS) and falls back
+  to `sysinfo` whole seconds only when native creation time is unavailable;
+  `tm_core::model::{epoch_timestamp_to_unix_seconds, creation_timestamps_match}`
+  handle display conversion and strict high-res vs fallback comparison. The same
+  kernel table supplies a base
   priority, which resolves the priority class for every process no handle can
   be opened for — unknown priorities went from 130/261 to 1 (pid 0).
 - The Details process tree is no longer a mode. It IS the Name column's third

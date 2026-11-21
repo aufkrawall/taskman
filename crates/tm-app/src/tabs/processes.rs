@@ -1707,6 +1707,7 @@ fn build_display_rows(
         return out;
     }
 
+    let all_by_pid: HashMap<u32, &ProcessEntry> = all.iter().copied().map(|p| (p.pid, p)).collect();
     for gi in 0..3u8 {
         let cat = match gi {
             0 => ProcCategory::App,
@@ -1751,7 +1752,13 @@ fn build_display_rows(
             // stay fully flat so a busy build tool under a console shell is
             // never hidden inside an unexpanded parent.
             emit_flat_with_family_groups(
-                &mut out, &members, &children, sort_col, ascending, expanded,
+                &mut out,
+                &members,
+                &children,
+                &all_by_pid,
+                sort_col,
+                ascending,
+                expanded,
             );
         }
     }
@@ -1908,13 +1915,21 @@ fn family_values(members: &[&ProcessEntry]) -> [f64; VALUE_COLS] {
 /// `svchost.exe` instances are the deliberate system-process exception: the
 /// collapsed Windows section stays compact while one chevron still exposes
 /// every concrete host for inspection/actions.
-fn sibling_run_key(p: &ProcessEntry) -> Option<(u32, String)> {
+fn sibling_run_key(
+    p: &ProcessEntry,
+    by_pid: &HashMap<u32, &ProcessEntry>,
+) -> Option<(u32, String)> {
     let groupable_service_host = p.name.eq_ignore_ascii_case("svchost.exe");
     if (is_system_boundary(&p.name) && !groupable_service_host) || p.has_window {
         return None;
     }
     p.ppid
-        .filter(|ppid| *ppid != p.pid)
+        .filter(|ppid| {
+            *ppid != p.pid
+                && by_pid
+                    .get(ppid)
+                    .is_none_or(|parent| tm_core::model::is_plausible_parent(parent, p))
+        })
         .map(|ppid| (ppid, p.name.to_lowercase()))
 }
 
@@ -1929,6 +1944,7 @@ fn emit_flat_with_family_groups(
     out: &mut Vec<DisplayRow>,
     members: &[&ProcessEntry],
     children: &HashMap<u32, Vec<&ProcessEntry>>,
+    all_by_pid: &HashMap<u32, &ProcessEntry>,
     sort_col: usize,
     ascending: bool,
     expanded: &HashSet<u32>,
@@ -1953,7 +1969,7 @@ fn emit_flat_with_family_groups(
         if swallowed.contains(&p.pid) || family_heads.contains_key(&p.pid) {
             continue;
         }
-        if let Some(key) = sibling_run_key(p) {
+        if let Some(key) = sibling_run_key(p, all_by_pid) {
             runs.entry(key).or_default().push(p);
         }
     }
@@ -2521,7 +2537,7 @@ fn display_children_map<'a>(
     category: &HashMap<u32, ProcCategory>,
     app_roots: &HashSet<u32>,
 ) -> HashMap<u32, Vec<&'a ProcessEntry>> {
-    let pids: HashSet<u32> = list.iter().map(|p| p.pid).collect();
+    let by_pid: HashMap<u32, &ProcessEntry> = list.iter().map(|p| (p.pid, *p)).collect();
     let mut m: HashMap<u32, Vec<&ProcessEntry>> = HashMap::new();
     for p in list {
         let child_cat = category.get(&p.pid).copied().unwrap_or(p.category);
@@ -2529,8 +2545,9 @@ fn display_children_map<'a>(
             continue;
         }
         if let Some(ppid) = p.ppid
+            && let Some(parent) = by_pid.get(&ppid)
             && ppid != p.pid
-            && pids.contains(&ppid)
+            && tm_core::model::is_plausible_parent(parent, p)
             && category.get(&ppid).copied() == Some(child_cat)
         {
             m.entry(ppid).or_default().push(*p);
@@ -3546,6 +3563,71 @@ mod tests {
             head.status,
             ProcStatus::Suspended,
             "collapsed family head shows suspended status"
+        );
+    }
+
+    #[test]
+    fn recycled_parent_pid_does_not_group_older_process_into_collapsed_termination_targets() {
+        // Recycled PID 10 started AFTER older worker processes (PIDs 20, 21) whose
+        // recorded PPID happened to be 10. Neither tree parenting nor family
+        // sibling grouping may attach the older workers to that younger process.
+        let base_ticks = 1_700_000_000i64 * tm_core::model::HIGH_RES_TICKS_PER_SECOND;
+        let mut younger_recycled_parent = proc(10, None, "unrelated.exe", ProcCategory::Background);
+        younger_recycled_parent.start_epoch_s = Some(base_ticks + 500_000);
+
+        let mut worker_a = proc(20, Some(10), "worker.exe", ProcCategory::Background);
+        worker_a.start_epoch_s = Some(base_ticks + 100_000);
+        let mut worker_b = proc(21, Some(10), "worker.exe", ProcCategory::Background);
+        worker_b.start_epoch_s = Some(base_ticks + 100_000);
+
+        let all = [&younger_recycled_parent, &worker_a, &worker_b];
+        let grouping = derive_display_groups(&all);
+        let children = display_children_map(&all, &grouping.category, &grouping.app_roots);
+        assert!(
+            !children.contains_key(&10),
+            "display_children_map must reject a younger recycled parent PID"
+        );
+
+        let snap = snap_of(vec![younger_recycled_parent.clone(), worker_a, worker_b]);
+        let rows = build_display_rows(&snap, "", 0, true, &HashSet::new(), &[false; 3]);
+        let worker_rows: Vec<_> = rows
+            .iter()
+            .filter_map(|row| match row {
+                DisplayRow::Process(r) if r.pid == 20 || r.pid == 21 => Some(r),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            worker_rows.len(),
+            2,
+            "both workers stay ungrouped singletons"
+        );
+        for row in worker_rows {
+            assert_eq!(
+                row.termination_targets.len(),
+                1,
+                "recycled parent PID must not collapse multiple workers into shared termination_targets"
+            );
+            assert_eq!(row.termination_targets[0].pid, row.pid);
+        }
+
+        // Control: when PID 10 started BEFORE worker_c in the same category,
+        // tree parenting works as expected.
+        let mut older_real_parent = younger_recycled_parent;
+        older_real_parent.start_epoch_s = Some(base_ticks + 50_000);
+        let mut worker_c = proc(22, Some(10), "worker.exe", ProcCategory::Background);
+        worker_c.start_epoch_s = Some(base_ticks + 100_000);
+        let control_all = [&older_real_parent, &worker_c];
+        let control_grouping = derive_display_groups(&control_all);
+        let control_children = display_children_map(
+            &control_all,
+            &control_grouping.category,
+            &control_grouping.app_roots,
+        );
+        assert_eq!(
+            control_children.get(&10).map(Vec::len),
+            Some(1),
+            "older parent in same category must still group its child"
         );
     }
 

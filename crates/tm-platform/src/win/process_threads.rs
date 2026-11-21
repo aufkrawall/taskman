@@ -16,9 +16,7 @@
 //! it only when the process and thread creation identities match.
 
 use crate::actions::{ProcessThread, ProcessThreads, ThreadState};
-use crate::win::cpu_load::{
-    CpuLoadAccountant, Offsets, filetime_to_unix_seconds, read_i64, read_u32, read_usize,
-};
+use crate::win::cpu_load::{CpuLoadAccountant, Offsets, read_i64, read_u32, read_usize};
 use tm_core::error::{Result, TmError};
 use windows::Wdk::System::SystemInformation::SYSTEM_INFORMATION_CLASS;
 use windows::Wdk::System::Threading::{NtQueryInformationThread, ThreadQuerySetWin32StartAddress};
@@ -169,9 +167,12 @@ fn parse_process_threads(
             return Err(corrupt());
         };
         if read_usize(buf, pos + off.pid) as u32 == pid {
-            let created = filetime_to_unix_seconds(read_i64(buf, pos + off.create_time));
+            let created =
+                super::cpu_load::filetime_to_unix_ticks(read_i64(buf, pos + off.create_time));
             if let Some(expected) = expected_start_epoch_s
-                && created != Some(expected)
+                && !created.is_some_and(|actual| {
+                    tm_core::model::creation_timestamps_match(expected, actual)
+                })
             {
                 return Err(TmError::ProcessNotFound { pid });
             }
@@ -211,7 +212,7 @@ fn parse_thread(buf: &[u8], base: usize, off: &ThreadOffsets) -> ParsedThread {
             context_switches: read_u32(buf, base + off.context_switches),
             kernel_time_100ns: u64::try_from(read_i64(buf, base + off.kernel_time)).unwrap_or(0),
             user_time_100ns: u64::try_from(read_i64(buf, base + off.user_time)).unwrap_or(0),
-            created_epoch_s: filetime_to_unix_seconds(created_raw),
+            created_epoch_s: super::cpu_load::filetime_to_unix_ticks(created_raw),
             state: ThreadState::from_raw(read_u32(buf, base + off.state)),
             wait_reason: read_u32(buf, base + off.wait_reason),
             cycles: None,

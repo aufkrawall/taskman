@@ -181,6 +181,11 @@ pub fn create_actions() -> Box<dyn actions::PlatformActions> {
     }
 }
 
+/// Create an inert action backend for `--mock` mode.
+pub fn create_mock_actions() -> Box<dyn actions::PlatformActions> {
+    Box::new(actions::MockActions)
+}
+
 /// Build only the system collector.
 pub fn create_collector() -> Box<dyn tm_core::engine::SystemCollector> {
     #[cfg(target_os = "windows")]

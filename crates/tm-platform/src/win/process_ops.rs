@@ -41,23 +41,44 @@ fn creation_filetime_from_handle(h: HANDLE) -> Option<u64> {
     }
 }
 
-/// Creation time in Unix seconds for matching sampler identities. It is read
-/// through an already-open handle, so PID recycling cannot change the answer.
-fn creation_epoch_from_handle(h: HANDLE) -> Option<i64> {
+/// Creation time in 100-ns Unix ticks for matching sampler identities. It is
+/// read through an already-open handle, so PID recycling cannot change it.
+pub(crate) fn creation_epoch_from_handle(h: HANDLE) -> Option<i64> {
     filetime_to_epoch(creation_filetime_from_handle(h)?)
 }
 
-/// Raw FILETIME -> the Unix seconds every identity check compares.
-fn filetime_to_epoch(raw: u64) -> Option<i64> {
-    i64::try_from(raw.saturating_sub(116_444_736_000_000_000) / 10_000_000).ok()
+/// Best-effort creation time in 100-ns Unix ticks for a PID. Used only when
+/// populating sampled process metadata outside destructive action paths.
+pub(crate) fn creation_epoch_of_pid(pid: u32) -> Option<i64> {
+    if pid <= 4 {
+        return None;
+    }
+    unsafe {
+        let handle = windows::Win32::System::Threading::OpenProcess(
+            windows::Win32::System::Threading::PROCESS_QUERY_LIMITED_INFORMATION,
+            false,
+            pid,
+        )
+        .ok()?;
+        let created = creation_epoch_from_handle(handle);
+        let _ = windows::Win32::Foundation::CloseHandle(handle);
+        created
+    }
+}
+
+/// Raw FILETIME -> 100-ns ticks since the Unix epoch.
+pub(crate) fn filetime_to_epoch(raw: u64) -> Option<i64> {
+    raw.checked_sub(116_444_736_000_000_000)
+        .and_then(|ticks| i64::try_from(ticks).ok())
 }
 
 fn creation_matches(expected: i64, actual: Option<i64>) -> bool {
     match actual {
-        // sysinfo and this handle-bound path both truncate the same FILETIME
-        // value to Unix seconds. Exact matching minimizes the PID-reuse
-        // window and also avoids arithmetic overflow on hostile IPC input.
-        Some(actual) => actual == expected,
+        // Both sampler (SystemProcessInformation CreateTime) and this
+        // handle-bound path (GetProcessTimes) yield exact 100-ns FILETIME
+        // ticks since the Unix epoch, eliminating sub-second PID-reuse windows.
+        // Low-resolution timestamps still fall back cleanly to second equality.
+        Some(actual) => tm_core::model::creation_timestamps_match(expected, actual),
         // Cannot verify the identity of a destructive operation → fail
         // closed. GetProcessTimes only fails on handles that cannot
         // terminate anyway (protected processes).
@@ -3442,5 +3463,20 @@ mod tests {
                 "live parent must report a binary name"
             );
         }
+    }
+
+    #[test]
+    fn same_second_filetimes_do_not_match_as_same_process() {
+        // Two processes started 1 ms (10_000 * 100ns) apart in the same Unix second.
+        let ft_a = 133_500_000_000_000_000u64;
+        let ft_b = ft_a + 10_000;
+        let ts_a = super::filetime_to_epoch(ft_a).expect("valid filetime A");
+        let ts_b = super::filetime_to_epoch(ft_b).expect("valid filetime B");
+        assert!(ts_a >= tm_core::model::HIGH_RES_EPOCH_THRESHOLD);
+        assert!(super::creation_matches(ts_a, Some(ts_a)));
+        assert!(
+            !super::creation_matches(ts_a, Some(ts_b)),
+            "same-second 100-ns timestamps 1 ms apart must not match"
+        );
     }
 }

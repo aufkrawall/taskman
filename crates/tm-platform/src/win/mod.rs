@@ -183,6 +183,11 @@ pub fn process_security_info(
     process_ops::process_security_info(pid, expected_start_epoch_s)
 }
 
+/// Return the PID that owns the current session's shell window, if any.
+pub fn shell_window_owner_pid() -> Option<u32> {
+    explorer_restart::shell_window_owner_pid()
+}
+
 /// Restart one exact Windows Explorer shell generation in the interactive
 /// user's session. This deliberately never crosses the LocalSystem broker.
 pub fn restart_explorer(pid: u32, expected_start_epoch_s: Option<i64>) -> Result<()> {

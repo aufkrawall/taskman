@@ -160,7 +160,8 @@ impl StartupImpactTracker {
             // older than boot (or of unknown age) only contributes deltas.
             let started_after_boot = matches!(
                 (process.start_epoch_s, self.boot_epoch_s),
-                (Some(start), Some(boot)) if start >= boot
+                (Some(start), Some(boot))
+                    if crate::model::epoch_timestamp_to_unix_seconds(start) >= boot
             );
             let baseline = match previous {
                 Some(prev) => Some((prev.cpu_s, prev.io_bytes)),

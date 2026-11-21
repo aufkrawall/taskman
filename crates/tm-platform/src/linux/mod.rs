@@ -83,6 +83,10 @@ impl SystemCollector for LinuxCollector {
             .values()
             .filter(|p| p.thread_kind().is_none())
             .count();
+        let btime_and_hz = std::fs::read_to_string("/proc/stat")
+            .ok()
+            .and_then(|s| parse_proc_stat_btime(&s))
+            .zip(linux_clk_tck());
         let mut processes = Vec::with_capacity(n_procs);
         for (pid, p) in self.sys.processes() {
             // sysinfo 0.39 keeps `tasks` enabled even in
@@ -117,7 +121,11 @@ impl SystemCollector for LinuxCollector {
             entry.working_set_bytes = Some(p.memory());
             entry.commit_bytes = Some(p.virtual_memory());
             entry.peak_mem_bytes = proc_status_kb(pid_u, "VmHWM");
-            entry.start_epoch_s = Some(p.start_time() as i64);
+            entry.start_epoch_s = btime_and_hz
+                .and_then(|(btime_s, clk_tck)| {
+                    linux_proc_start_timestamp_with(pid_u, btime_s, clk_tck)
+                })
+                .or_else(|| (p.start_time() > 0).then_some(p.start_time() as i64));
             entry.cpu_time_s = Some(p.accumulated_cpu_time() as f64 / 1000.0);
             entry.disk_read_bps = du.read_bytes as f64 / interval_s;
             entry.disk_write_bps = du.written_bytes as f64 / interval_s;
@@ -799,12 +807,24 @@ impl PlatformActions for LinuxActions {
         startup::set_enabled(item_id, enabled)
     }
 
-    fn kill_single(&self, pid: u32) -> Result<()> {
-        send_signal(pid, libc::SIGTERM)
+    fn kill_process(
+        &self,
+        pid: u32,
+        expected_start_epoch_s: Option<i64>,
+        tree: bool,
+    ) -> Result<()> {
+        let _ = tree;
+        send_signal_checked(pid, expected_start_epoch_s, libc::SIGTERM)
     }
-    fn suspend_process(&self, pid: u32, suspend: bool) -> Result<()> {
-        send_signal(
+    fn suspend_process_checked(
+        &self,
+        pid: u32,
+        expected_start_epoch_s: Option<i64>,
+        suspend: bool,
+    ) -> Result<()> {
+        send_signal_checked(
             pid,
+            expected_start_epoch_s,
             if suspend {
                 libc::SIGSTOP
             } else {
@@ -812,14 +832,22 @@ impl PlatformActions for LinuxActions {
             },
         )
     }
-    fn set_priority(&self, pid: u32, priority: PriorityClass) -> Result<()> {
+    fn set_priority_checked(
+        &self,
+        pid: u32,
+        expected_start_epoch_s: Option<i64>,
+        priority: PriorityClass,
+    ) -> Result<()> {
+        verify_process_identity(pid, expected_start_epoch_s)?;
         let Some(nice) = nice_for_priority(priority) else {
             return Err(tm_core::TmError::platform(
                 "setpriority",
                 "an explicit priority class is required",
             ));
         };
-        apply_to_threads("setpriority", &process_tids(pid), |tid| {
+        let tids = process_tids(pid);
+        verify_process_identity(pid, expected_start_epoch_s)?;
+        apply_to_threads("setpriority", &tids, |tid| {
             let rc = unsafe { libc::setpriority(libc::PRIO_PROCESS, tid, nice) };
             if rc == 0 {
                 Ok(())
@@ -828,7 +856,12 @@ impl PlatformActions for LinuxActions {
             }
         })
     }
-    fn get_affinity_mask(&self, pid: u32) -> Result<u64> {
+    fn get_affinity_mask_checked(
+        &self,
+        pid: u32,
+        expected_start_epoch_s: Option<i64>,
+    ) -> Result<u64> {
+        verify_process_identity(pid, expected_start_epoch_s)?;
         unsafe {
             let mut set: libc::cpu_set_t = std::mem::zeroed();
             if libc::sched_getaffinity(pid as i32, std::mem::size_of::<libc::cpu_set_t>(), &mut set)
@@ -846,9 +879,15 @@ impl PlatformActions for LinuxActions {
         }
     }
     fn system_affinity_mask(&self) -> Result<u64> {
-        self.get_affinity_mask(std::process::id())
+        self.get_affinity_mask_checked(std::process::id(), None)
     }
-    fn set_affinity_mask(&self, pid: u32, mask: u64) -> Result<()> {
+    fn set_affinity_mask_checked(
+        &self,
+        pid: u32,
+        expected_start_epoch_s: Option<i64>,
+        mask: u64,
+    ) -> Result<()> {
+        verify_process_identity(pid, expected_start_epoch_s)?;
         let set = unsafe {
             let mut set: libc::cpu_set_t = std::mem::zeroed();
             libc::CPU_ZERO(&mut set);
@@ -859,7 +898,9 @@ impl PlatformActions for LinuxActions {
             }
             set
         };
-        apply_to_threads("sched_setaffinity", &process_tids(pid), |tid| {
+        let tids = process_tids(pid);
+        verify_process_identity(pid, expected_start_epoch_s)?;
+        apply_to_threads("sched_setaffinity", &tids, |tid| {
             let rc = unsafe {
                 libc::sched_setaffinity(
                     tid as libc::pid_t,
@@ -899,8 +940,9 @@ impl PlatformActions for LinuxActions {
     fn list_process_file_io(
         &self,
         pid: u32,
-        _expected_start_epoch_s: Option<i64>,
+        expected_start_epoch_s: Option<i64>,
     ) -> Result<crate::actions::ProcessFileIoSnapshot> {
+        verify_process_identity(pid, expected_start_epoch_s)?;
         list_linux_process_file_io(pid)
     }
 }
@@ -1015,15 +1057,145 @@ fn list_linux_process_file_io(pid: u32) -> Result<crate::actions::ProcessFileIoS
 }
 
 fn send_signal(pid: u32, sig: i32) -> Result<()> {
-    let rc = unsafe { libc::kill(pid as libc::pid_t, sig) };
+    let Ok(pid_t) = libc::pid_t::try_from(pid) else {
+        return Err(tm_core::TmError::ProcessNotFound { pid });
+    };
+    let rc = unsafe { libc::kill(pid_t, sig) };
     if rc == 0 {
         Ok(())
+    } else if std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
+        Err(tm_core::TmError::ProcessNotFound { pid })
     } else {
         Err(tm_core::TmError::platform(
             "kill",
             format!("signal {sig} failed"),
         ))
     }
+}
+
+fn send_signal_checked(pid: u32, expected_start_epoch_s: Option<i64>, sig: i32) -> Result<()> {
+    if pid == 0 {
+        return Err(tm_core::TmError::platform("kill", "system process"));
+    }
+    let Some(expected) = expected_start_epoch_s else {
+        return send_signal(pid, sig);
+    };
+    let Ok(pid_t) = libc::pid_t::try_from(pid) else {
+        return Err(tm_core::TmError::ProcessNotFound { pid });
+    };
+
+    struct OwnedFd(libc::c_int);
+    impl Drop for OwnedFd {
+        fn drop(&mut self) {
+            unsafe {
+                libc::close(self.0);
+            }
+        }
+    }
+
+    // Acquire a pidfd first so the kernel object identity is pinned across the
+    // /proc/<pid>/stat verification and the signal delivery itself.
+    let raw_fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid_t, 0 as libc::c_uint) };
+    if raw_fd >= 0 {
+        let fd = OwnedFd(raw_fd as libc::c_int);
+        verify_process_identity(pid, Some(expected))?;
+        let rc = unsafe {
+            libc::syscall(
+                libc::SYS_pidfd_send_signal,
+                fd.0,
+                sig as libc::c_int,
+                std::ptr::null::<libc::c_void>(),
+                0 as libc::c_uint,
+            )
+        };
+        if rc == 0 {
+            return Ok(());
+        }
+        return match std::io::Error::last_os_error().raw_os_error() {
+            Some(libc::ESRCH) => Err(tm_core::TmError::ProcessNotFound { pid }),
+            Some(libc::EPERM) => Err(tm_core::TmError::platform(
+                "pidfd_send_signal",
+                "insufficient privileges to signal process",
+            )),
+            _ => Err(tm_core::TmError::platform(
+                "pidfd_send_signal",
+                format!("signal {sig} failed"),
+            )),
+        };
+    }
+
+    match std::io::Error::last_os_error().raw_os_error() {
+        Some(libc::ESRCH) => Err(tm_core::TmError::ProcessNotFound { pid }),
+        // Old kernels (< 5.1) or restrictive seccomp profiles may block pidfd_open:
+        // verify start time against /proc before falling back to kill(2).
+        Some(libc::ENOSYS | libc::EPERM) => {
+            verify_process_identity(pid, Some(expected))?;
+            send_signal(pid, sig)
+        }
+        other => Err(tm_core::TmError::platform(
+            "pidfd_open",
+            format!("pidfd_open failed: {other:?}"),
+        )),
+    }
+}
+
+fn parse_proc_stat_btime(proc_stat: &str) -> Option<u64> {
+    for line in proc_stat.lines() {
+        if let Some(rest) = line.strip_prefix("btime ") {
+            return rest.split_ascii_whitespace().next()?.parse().ok();
+        }
+    }
+    None
+}
+
+fn parse_proc_stat_starttime(pid_stat: &str) -> Option<u64> {
+    // Field 2 (comm) is enclosed in parens and may contain spaces or `)`.
+    let after_comm = pid_stat.rfind(')')?.checked_add(1)?;
+    let rest = pid_stat.get(after_comm..)?;
+    // Field 3 is index 0, so field 22 (starttime) is index 19.
+    rest.split_ascii_whitespace().nth(19)?.parse().ok()
+}
+
+fn linux_start_timestamp(btime_s: u64, ticks_since_boot: u64, clk_tck: u64) -> Option<i64> {
+    if btime_s == 0 || clk_tck == 0 {
+        return None;
+    }
+    let ticks_per_sec = i128::from(tm_core::model::HIGH_RES_TICKS_PER_SECOND);
+    let boot_ticks = i128::from(btime_s).checked_mul(ticks_per_sec)?;
+    let offset_ticks =
+        i128::from(ticks_since_boot).checked_mul(ticks_per_sec)? / i128::from(clk_tck);
+    i64::try_from(boot_ticks.checked_add(offset_ticks)?).ok()
+}
+
+fn linux_proc_start_timestamp_with(pid: u32, btime_s: u64, clk_tck: u64) -> Option<i64> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let ticks = parse_proc_stat_starttime(&stat)?;
+    linux_start_timestamp(btime_s, ticks, clk_tck)
+}
+
+fn linux_clk_tck() -> Option<u64> {
+    let raw = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+    u64::try_from(raw).ok().filter(|&hz| hz > 0)
+}
+
+fn linux_proc_start_timestamp(pid: u32) -> Option<i64> {
+    let proc_stat = std::fs::read_to_string("/proc/stat").ok()?;
+    let btime_s = parse_proc_stat_btime(&proc_stat)?;
+    let clk_tck = linux_clk_tck()?;
+    linux_proc_start_timestamp_with(pid, btime_s, clk_tck)
+}
+
+fn verify_process_identity(pid: u32, expected_start_epoch_s: Option<i64>) -> Result<()> {
+    let Some(expected) = expected_start_epoch_s else {
+        return Ok(());
+    };
+    let Some(actual) = linux_proc_start_timestamp(pid) else {
+        return Err(tm_core::TmError::ProcessNotFound { pid });
+    };
+    if !tm_core::model::creation_timestamps_match(expected, actual) {
+        return Err(tm_core::TmError::ProcessNotFound { pid });
+    }
+    Ok(())
 }
 
 pub fn create_collector() -> LinuxCollector {
@@ -1180,5 +1352,24 @@ mod tests {
             Some(12345)
         );
         assert_eq!(parse_file_nr(""), None);
+    }
+
+    #[test]
+    fn parses_proc_stat_btime_and_comm_with_parens_and_spaces() {
+        let stat = "cpu  1 2 3 4\nbtime 1700000000\n";
+        assert_eq!(parse_proc_stat_btime(stat), Some(1_700_000_000));
+
+        let pid_stat =
+            "42 (Web Content (1)) S 1 42 42 0 -1 4194304 10 0 2 0 1 0 0 0 20 0 4 0 12345 1000 50";
+        assert_eq!(parse_proc_stat_starttime(pid_stat), Some(12_345));
+
+        let ts_a = linux_start_timestamp(1_700_000_000, 12_345, 100).unwrap();
+        let ts_b = linux_start_timestamp(1_700_000_000, 12_346, 100).unwrap();
+        assert!(ts_a >= tm_core::model::HIGH_RES_EPOCH_THRESHOLD);
+        assert!(!tm_core::model::creation_timestamps_match(ts_a, ts_b));
+        assert_eq!(
+            tm_core::model::epoch_timestamp_to_unix_seconds(ts_a),
+            1_700_000_123
+        );
     }
 }

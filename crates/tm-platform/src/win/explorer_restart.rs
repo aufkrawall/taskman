@@ -7,20 +7,23 @@
 
 use tm_core::error::{Result, TmError};
 use windows::Win32::Foundation::{
-    CloseHandle, ERROR_INVALID_PARAMETER, FILETIME, HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT,
+    CloseHandle, ERROR_INVALID_PARAMETER, HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
 use windows::Win32::System::Threading as th;
 use windows::core::PWSTR;
 
-fn creation_epoch_from_handle(process: HANDLE) -> Option<i64> {
+/// Return the PID that owns the current interactive desktop's shell window
+/// (`Progman` / `explorer.exe`), or `None` if no shell window is present.
+pub fn shell_window_owner_pid() -> Option<u32> {
+    use windows::Win32::UI::WindowsAndMessaging::{GetShellWindow, GetWindowThreadProcessId};
     unsafe {
-        let mut create = FILETIME::default();
-        let mut exit = FILETIME::default();
-        let mut kernel = FILETIME::default();
-        let mut user = FILETIME::default();
-        th::GetProcessTimes(process, &mut create, &mut exit, &mut kernel, &mut user).ok()?;
-        let raw = (u64::from(create.dwHighDateTime) << 32) | u64::from(create.dwLowDateTime);
-        i64::try_from(raw.saturating_sub(116_444_736_000_000_000) / 10_000_000).ok()
+        let hwnd = GetShellWindow();
+        if hwnd.0.is_null() {
+            return None;
+        }
+        let mut pid = 0u32;
+        GetWindowThreadProcessId(hwnd, Some(&mut pid));
+        (pid > 4).then_some(pid)
     }
 }
 
@@ -68,6 +71,18 @@ pub fn restart(pid: u32, expected_start_epoch_s: Option<i64>) -> Result<()> {
             "system process is protected",
         ));
     }
+    let Some(expected) = expected_start_epoch_s.filter(|&s| s > 0) else {
+        return Err(TmError::platform(
+            "restart Windows Explorer",
+            "verified shell process creation identity is required",
+        ));
+    };
+    if shell_window_owner_pid() != Some(pid) {
+        return Err(TmError::platform(
+            "restart Windows Explorer",
+            "target process does not own the current session shell window",
+        ));
+    }
 
     let access =
         th::PROCESS_TERMINATE | th::PROCESS_QUERY_LIMITED_INFORMATION | th::PROCESS_SYNCHRONIZE;
@@ -80,10 +95,15 @@ pub fn restart(pid: u32, expected_start_epoch_s: Option<i64>) -> Result<()> {
     })?;
 
     let result = (|| -> Result<()> {
-        if let Some(expected) = expected_start_epoch_s
-            && creation_epoch_from_handle(process) != Some(expected)
-        {
+        let actual = super::process_ops::creation_epoch_from_handle(process);
+        if !actual.is_some_and(|a| tm_core::model::creation_timestamps_match(expected, a)) {
             return Err(TmError::ProcessNotFound { pid });
+        }
+        if shell_window_owner_pid() != Some(pid) {
+            return Err(TmError::platform(
+                "restart Windows Explorer",
+                "target process no longer owns the current session shell window",
+            ));
         }
 
         // Use the existing machine-safety policy too. The already-open handle
@@ -120,4 +140,22 @@ pub fn restart(pid: u32, expected_start_epoch_s: Option<i64>) -> Result<()> {
 
     let _ = unsafe { CloseHandle(process) };
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::restart;
+
+    #[test]
+    fn restart_rejects_missing_identity_or_non_shell_pid() {
+        let current_pid = std::process::id();
+        assert!(
+            restart(current_pid, None).is_err(),
+            "explorer restart must fail closed when creation identity is missing"
+        );
+        assert!(
+            restart(current_pid, Some(1_700_000_000)).is_err(),
+            "explorer restart must reject processes that do not own the session shell window"
+        );
+    }
 }
