@@ -155,7 +155,7 @@ pub fn run_code_samples() -> i32 {
         .processes
         .iter()
         .find(|process| process.pid == pid)
-        .and_then(|process| process.start_epoch_s)
+        .and_then(|process| process.creation_identity())
         .filter(|start| *start > 0)
     else {
         tracing::error!(

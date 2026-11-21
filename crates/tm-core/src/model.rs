@@ -662,8 +662,11 @@ pub struct ProcessEntry {
     /// Page faults delta per second where available.
     pub page_faults_per_s: Option<u32>,
 
-    /// Process start time (seconds since UNIX epoch).
+    /// Wall-clock start time in Unix seconds or native-resolution Unix ticks.
     pub start_epoch_s: Option<i64>,
+    /// Linux process creation identity in clock ticks since boot.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub boot_start_ticks: Option<i64>,
     /// Accumulated CPU time in seconds.
     pub cpu_time_s: Option<f64>,
     /// Base priority class.
@@ -766,6 +769,7 @@ impl ProcessEntry {
             threads: None,
             page_faults_per_s: None,
             start_epoch_s: None,
+            boot_start_ticks: None,
             cpu_time_s: None,
             priority: PriorityClass::Unknown,
             exe_path: None,
@@ -789,6 +793,11 @@ impl ProcessEntry {
         } else {
             &self.display
         }
+    }
+
+    /// Stable creation evidence for process actions and per-process state.
+    pub fn creation_identity(&self) -> Option<i64> {
+        self.boot_start_ticks.or(self.start_epoch_s)
     }
 
     pub fn uptime_s(&self, now_epoch_s: i64) -> Option<i64> {
@@ -833,6 +842,9 @@ pub fn creation_timestamps_match(expected: i64, actual: i64) -> bool {
 /// Informer rejects those links and shows the child as a root; so do we.
 /// Unknown timestamps are never treated as evidence — the link stands.
 pub fn is_plausible_parent(parent: &ProcessEntry, child: &ProcessEntry) -> bool {
+    if let (Some(parent), Some(child)) = (parent.boot_start_ticks, child.boot_start_ticks) {
+        return parent <= child;
+    }
     match (parent.start_epoch_s, child.start_epoch_s) {
         (Some(parent_start), Some(child_start)) => {
             if parent_start >= HIGH_RES_EPOCH_THRESHOLD && child_start >= HIGH_RES_EPOCH_THRESHOLD {

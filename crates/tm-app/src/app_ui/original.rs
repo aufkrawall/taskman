@@ -4,7 +4,7 @@
 
 use eframe::egui::{self, Align2, Color32, CornerRadius, FontId, Pos2, Rect, Sense, Stroke};
 use tm_core::i18n::{self, K};
-use tm_core::settings::{RenderMode, Settings, TextSmoothing, ThemeMode};
+use tm_core::settings::{Settings, TextSmoothing, ThemeMode};
 #[cfg(target_os = "windows")]
 use tm_core::settings::{TaskbarColorMode, TaskbarNetUnit};
 
@@ -1347,13 +1347,9 @@ pub fn settings_dialog(app: &mut TaskManApp, ctx: &egui::Context, _pal: &theme::
             ui.add_space(10.0);
             ui.label(i18n::tr(K::RenderModeLabel));
             ui.horizontal_wrapped(|ui| {
-                for (mode, key) in [
-                    (RenderMode::Auto, K::RenderAuto),
-                    (RenderMode::Compatibility, K::RenderCompat),
-                    (RenderMode::Software, K::RenderSoftware),
-                ] {
+                for &mode in crate::renderer_choices() {
                     if ui
-                        .selectable_label(app.shared.settings.render_mode == mode, i18n::tr(key))
+                        .selectable_label(app.shared.settings.render_mode == mode, mode.label())
                         .clicked()
                     {
                         app.shared.settings.render_mode = mode;
@@ -1361,24 +1357,10 @@ pub fn settings_dialog(app: &mut TaskManApp, ctx: &egui::Context, _pal: &theme::
                     }
                 }
             });
-            ui.label(
-                egui::RichText::new(i18n::tr(K::RenderModeHint))
-                    .size(11.0)
-                    .color(_pal.text_dim),
-            );
-            if app.shared.settings.render_mode == RenderMode::Software {
-                // Informational, not a warning: this used to select WARP, a D3D12 driver
-                // emulated on the CPU at ~3 fps. It now selects a native rasterizer, so
-                // the orange caution colour would be actively misleading.
+            let active_mode = crate::active_render_mode();
+            if app.shared.settings.render_mode != active_mode {
                 ui.label(
-                    egui::RichText::new(i18n::tr(K::RenderSoftwareWarning))
-                        .size(11.0)
-                        .color(_pal.text_dim),
-                );
-            }
-            if app.shared.settings.render_mode != crate::active_render_mode() {
-                ui.label(
-                    egui::RichText::new(i18n::tr(K::RestartRequired))
+                    egui::RichText::new(i18n::trf(K::RenderBackendActive, &[active_mode.label()]))
                         .size(11.0)
                         .color(_pal.text_dim),
                 );

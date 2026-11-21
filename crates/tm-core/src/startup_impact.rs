@@ -149,7 +149,8 @@ impl StartupImpactTracker {
             // A recycled pid must not bridge two different processes: without
             // a matching start time the baseline is reset, never subtracted.
             let previous = self.prev.get(&process.pid).filter(|prev| {
-                process.start_epoch_s.is_none() || prev.start_epoch_s == process.start_epoch_s
+                process.creation_identity().is_none()
+                    || prev.start_epoch_s == process.creation_identity()
             });
             // A process first seen here that STARTED after boot spent its
             // whole life inside the window, so its counters are charged from
@@ -184,7 +185,7 @@ impl StartupImpactTracker {
             live.insert(
                 process.pid,
                 PrevCounters {
-                    start_epoch_s: process.start_epoch_s,
+                    start_epoch_s: process.creation_identity(),
                     cpu_s,
                     io_bytes,
                 },

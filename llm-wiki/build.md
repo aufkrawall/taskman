@@ -271,11 +271,18 @@ one target-native backend through a target-specific direct `wgpu` dependency:
 - Linux: Vulkan only.
 - macOS: Metal only.
 
-The GUI now tries the native CPU renderer (`Renderer::Software`) first; WGPU and Glow
-remain as fallbacks. The CPU path needs no driver, starts without enumerating adapters or
-compiling shaders, and is the only backend that can do sub-pixel text.
-Surface presentation is FIFO with one-frame maximum latency, and WGPU prefers
-the low-power adapter unless `WGPU_POWER_PREF` overrides it. This trims unused
+The packaged GUI defaults to native CPU rendering. The Windows Graphics
+setting offers CPU or D3D12, and Linux offers CPU or Vulkan. A GPU startup
+failure falls back to CPU. OpenGL remains a diagnostic and final fallback,
+and macOS can also select Metal or OpenGL. Preferences apply at the next
+launch. Legacy auto/software preferences map to CPU, and the old compatibility
+preference maps to the Windows/Linux default.
+
+CPU rendering requires a working native display connection and software
+presentation surface. It has no GPU adapter or shader compiler dependency.
+Linux desktop launches require the glibc build. The static musl build supports
+headless checks. WGPU accepts only surface-compatible GPUs and defaults to FIFO
+presentation and a low-power adapter unless `WGPU_POWER_PREF` overrides it. This trims unused
 backend dependency/code without making older or unusual graphics systems a
 hard failure. The first 2026-08-31 backend-trim build measured 13,470,208
 bytes. The final service/tray/reliability build is 13,873,664 bytes versus the

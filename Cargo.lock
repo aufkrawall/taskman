@@ -3563,6 +3563,7 @@ dependencies = [
  "windows",
  "windows-numerics",
  "windows-service",
+ "x11rb",
 ]
 
 [[package]]

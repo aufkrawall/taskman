@@ -4,6 +4,8 @@
 
 ### Improved
 
+- **Graphics backend:** CPU rendering is the default on Windows and Linux. Settings can select D3D12 on Windows or Vulkan on Linux for the next launch. The GPU choices require a compatible hardware adapter. Initialization failures fall back to native CPU rendering, and Settings shows the active backend.
+
 - **Every row icon now comes from the OS icon theme:** rows without an application icon no longer show a glyph of our own. Processes, Details, Users, Startup and App History paint the platform's own default application icon instead — on Windows the shell's generic `.exe` icon (the "no icon defined" window glyph Explorer and Task Manager show), on Linux the desktop theme's `application-x-executable` icon. The accent-colored rounded square that `Memory Compression`, `System Interrupts`, `smss.exe` and other path-less kernel rows used to show is gone; icon-less system images (`lsass.exe`, `winlogon.exe`, `ntoskrnl.exe`) and path-less pseudo-processes now render the same OS glyph. Row icons are also never invented for a row that has no image.
 
 ### New
@@ -12,7 +14,10 @@
 
 ### Fixed
 
-- **App History rows no longer show Explorer's folder icon:** rows whose app had no known executable store a blank icon path, and the shell answers an empty name with the icon of the *current directory* — the yellow folder glyph. Blank and bare inputs are now rejected at every layer (history store, icon cache, Windows shell extraction), existing history files drop them when loaded, and such rows fall back to the running process's real icon or the OS default application icon. The Windows sampler also no longer stores an empty image path in the first place.
+- **Unix process actions:** Linux and macOS confirm that the sampled process generation remained the same across the telemetry refresh. Linux keeps the native boot-relative start ticks stable across system clock corrections.
+- **Application icon loading:** Startup icon paths are resolved in the background. Linux resolves bare Startup commands and reads the current X11 session icon theme. Missing icons retain their retry delay when the texture cache is full.
+
+- **App History rows no longer show Explorer's folder icon:** rows whose app had no known executable store a blank icon path, and the shell answers an empty name with the icon of the *current directory* — the yellow folder glyph. Blank history values are dropped during load, and bare names are filtered before Windows shell extraction. Those rows fall back to the running process’s icon or the OS default application icon. The Windows sampler also no longer stores an empty image path in the first place.
 - **Process icons no longer randomly revert to the placeholder:** the icon texture cache evicted arbitrary (HashMap-iteration-order) entries once it passed its 512-icon cap, so on-screen rows could lose a just-loaded icon and flash the placeholder; eviction is now true LRU, a repaint is requested whenever textures are uploaded (the last batch no longer waits for an unrelated repaint), and a dead icon worker thread is respawned on the next request.
 - **Windows shell icons no longer intermittently come back empty:** `SHGetFileInfoW` returns no icon when several threads extract at the same time, and needs a COM apartment on the calling thread; extraction is now serialized process-wide and initializes COM per thread, so a row does not lose its icon (and fall back to the generic one for 30 s) for no visible reason.
 - **Kernel pseudo-process rows and the file actions:** the fabricated `System` → `ntoskrnl.exe` / `Registry` → `regedit.exe` name mapping is gone. It gave `Registry` an icon Windows itself does not show, and — because the same string doubled as the row's executable — enabled **Open file location** / **Properties** for processes that have no file (they failed or opened nothing). Pseudo-processes now show the OS default icon and those menu entries are disabled again, exactly as before.
@@ -28,7 +33,7 @@
 - **Renderer fallback, `EventLoop` recreation masking, and startup error diagnostics:**
   - `winit::event_loop::EventLoopBuilder::build()` now resets `EVENT_LOOP_CREATED` when backend initialization returns an error instead of leaving the process-wide guard set after no event loop was created.
   - GUI startup (`tm-app`) now aborts renderer fallback immediately on `eframe::Error::WinitEventLoop(_)` instead of retrying other renderers and overwriting the real display-server error with `EventLoop can't be recreated`, flushes early startup logs to disk on fatal failure, and reports a plain failure message naming each attempted renderer instead of `"no usable GPU renderer found: Some(...)"`.
-  - `RenderMode::Software` and `RenderMode::Compatibility` now preserve runtime fallback renderers (so `RenderMode::Software` can actually reach `Wgpu` with `select_software_adapter` and `Compatibility` falls back to `Software`/`Wgpu` instead of exiting immediately on GL failure or single-feature builds) while updating `active_render_mode()` to reflect the fallback path actually started.
+  - Startup records which backend created the window and logs initialization failures before trying the next backend.
 - **Linux glibc release cross-build discovery & static-musl startup hint:**
   - `build.py` now locates `zig` across `ZIG`, `PATH`, Python's `ziglang` package, and standard Windows install paths (`WinGet`, `Scoop`, `Chocolatey`, per-user/system Python), supplies `ZIG`/`PATH` to `cargo zigbuild`, cleans stale opposite-flavor (`-musl.tar.gz` vs glibc `.tar.gz`) Linux archives from `dist/`, and falls back from inaccessible WindowsApps `pwsh` aliases to `powershell` in `check_fork()`.
   - `tm-app` now appends an actionable static-musl note directing users to the glibc `linux-x86_64` build (or `--selfcheck`) whenever startup fails with `"Dynamic loading not supported"`.

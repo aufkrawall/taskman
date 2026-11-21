@@ -1,6 +1,8 @@
 //! Integration tests running against the REAL system.
 //! These exercise the platform layer end-to-end without a GUI.
 
+#![cfg(target_os = "windows")]
+
 use tm_core::model::*;
 use tm_platform::actions::PlatformActions;
 

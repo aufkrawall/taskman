@@ -523,7 +523,7 @@ impl AppHistoryDb {
             // PID reuse / identity change → treat as first sighting no
             // matter which direction the raw counters moved.
             let same_process = prev.is_some_and(|prev| {
-                prev.app_identity == key && prev.start_epoch_s == p.start_epoch_s
+                prev.app_identity == key && prev.start_epoch_s == p.creation_identity()
             });
 
             // Cumulative counters are differenced only against a reading of
@@ -584,7 +584,7 @@ impl AppHistoryDb {
             next_prev.insert(
                 p.pid,
                 PrevTick {
-                    start_epoch_s: p.start_epoch_s,
+                    start_epoch_s: p.creation_identity(),
                     app_identity: key,
                     cpu_time_s: p.cpu_time_s,
                     net_total_bytes: net_total,

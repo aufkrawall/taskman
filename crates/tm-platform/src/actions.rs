@@ -461,11 +461,9 @@ pub trait PlatformActions: Send + Sync {
     }
 
     // ------------------------------------------------ process control
-    /// Terminate a process; `tree=true` also kills descendants. When
-    /// `expected_start_epoch_s` is `Some`, platforms that CAN verify process
-    /// identity must refuse to act on a recycled pid (creation-time check at
-    /// kill time). Platforms without such verification ignore the hint —
-    /// the UI-level snapshot check still applies there.
+    /// Terminate a process. Backends with tree support also kill its
+    /// descendants when requested. The expected creation token comes from
+    /// ProcessEntry::creation_identity and is verified before acting.
     fn kill_process(
         &self,
         _pid: u32,

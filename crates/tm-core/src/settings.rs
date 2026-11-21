@@ -126,33 +126,17 @@ pub enum TextSmoothing {
     Smooth,
 }
 
-/// Which rendering path the GUI starts on.
-///
-/// [`Self::Software`] used to mean WARP -- a D3D12 driver emulated on the CPU, measured at
-/// ~14 cores and 2.9 fps on a 16-thread desktop, with a per-frame cost that did not depend
-/// on window size or content. It now means a native CPU rasterizer that draws the UI
-/// directly, which is a different thing entirely: no driver, no shader compiler, and the
-/// only path that can render sub-pixel (ClearType) text.
-///
-/// The persisted value keeps its name and its meaning to the user ("no GPU"), so no config
-/// migration is needed.
+/// Preferred rendering backend at the next GUI launch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum RenderMode {
-    /// Try the renderers in their preferred order: the CPU rasterizer first, then
-    /// D3D12/Vulkan/Metal through wgpu, then OpenGL.
     #[default]
-    Auto,
-    /// Force the OpenGL backend: a completely separate driver path, for
-    /// machines where the D3D12/Vulkan driver misbehaves. Still GPU-accelerated,
-    /// and still comfortably real-time.
-    Compatibility,
-    /// The native CPU rasterizer — no driver, no adapter, and the only path
-    /// that renders sub-pixel (ClearType) text. It is also the DEFAULT first
-    /// choice in `Auto`, not a slow last resort. If that renderer cannot be
-    /// built, the wgpu fallback honours this mode by selecting a CPU-type
-    /// adapter (WARP on Windows), which *is* slow; the settings dialog reports
-    /// which path actually came up.
-    Software,
+    #[serde(alias = "Auto", alias = "Software")]
+    Cpu,
+    D3d12,
+    Vulkan,
+    Metal,
+    #[serde(alias = "Compatibility")]
+    OpenGl,
 }
 
 /// Row spacing density for table pages that let the user switch between
@@ -651,25 +635,36 @@ impl ThemeMode {
 }
 
 impl RenderMode {
-    fn as_cfg(self) -> &'static str {
+    pub fn label(self) -> &'static str {
         match self {
-            Self::Auto => "auto",
-            Self::Compatibility => "compatibility",
-            Self::Software => "software",
-        }
-    }
-    fn from_cfg(s: &str) -> Option<Self> {
-        match s.to_ascii_lowercase().as_str() {
-            "auto" | "automatic" | "automatisch" | "gpu" | "true" | "on" => Some(Self::Auto),
-            "compatibility" | "kompatibilitaet" | "opengl" | "gl" => Some(Self::Compatibility),
-            "software" | "cpu" | "warp" | "false" | "off" => Some(Self::Software),
-            _ => None,
+            Self::Cpu => "CPU",
+            Self::D3d12 => "D3D12",
+            Self::Vulkan => "Vulkan",
+            Self::Metal => "Metal",
+            Self::OpenGl => "OpenGL",
         }
     }
 
-    /// True when this mode still renders on the GPU.
-    pub fn is_accelerated(self) -> bool {
-        !matches!(self, Self::Software)
+    fn as_cfg(self) -> &'static str {
+        match self {
+            Self::Cpu => "cpu",
+            Self::D3d12 => "d3d12",
+            Self::Vulkan => "vulkan",
+            Self::Metal => "metal",
+            Self::OpenGl => "opengl",
+        }
+    }
+
+    pub fn from_cfg(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "cpu" | "auto" | "automatic" | "automatisch" | "software" | "warp" | "false"
+            | "off" | "0" | "gpu" | "true" | "on" | "1" => Some(Self::Cpu),
+            "d3d12" | "dx12" => Some(Self::D3d12),
+            "vulkan" => Some(Self::Vulkan),
+            "metal" => Some(Self::Metal),
+            "compatibility" | "kompatibilitaet" | "opengl" | "gl" => Some(Self::OpenGl),
+            _ => None,
+        }
     }
 }
 
@@ -1359,32 +1354,23 @@ fn settings_writer_loop(rx: std::sync::mpsc::Receiver<WriteMsg>) {
 mod tests {
 
     #[test]
-    fn render_mode_round_trips_and_accepts_the_legacy_bool() {
+    fn render_mode_round_trips_and_migrates_legacy_preferences() {
         for mode in [
-            RenderMode::Auto,
-            RenderMode::Compatibility,
-            RenderMode::Software,
+            RenderMode::Cpu,
+            RenderMode::D3d12,
+            RenderMode::Vulkan,
+            RenderMode::Metal,
         ] {
             assert_eq!(RenderMode::from_cfg(mode.as_cfg()), Some(mode));
         }
-        // A hand-edited `gpu_acceleration=off` must still land on software.
-        let s = Settings::from_ini_text(
-            "[general]
-gpu_acceleration=off
-",
-        );
-        assert_eq!(s.render_mode, RenderMode::Software);
-        assert!(!s.render_mode.is_accelerated());
-        // An explicit render_mode wins over the legacy key.
-        let s = Settings::from_ini_text(
-            "[general]
-gpu_acceleration=off
-render_mode=compatibility
-",
-        );
-        assert_eq!(s.render_mode, RenderMode::Compatibility);
-        assert!(s.render_mode.is_accelerated());
-        assert_eq!(Settings::default().render_mode, RenderMode::Auto);
+        for old in ["auto", "software", "off", "on"] {
+            assert_eq!(RenderMode::from_cfg(old), Some(RenderMode::Cpu));
+        }
+        let s = Settings::from_ini_text("[general]\ngpu_acceleration=off\nrender_mode=vulkan\n");
+        assert_eq!(s.render_mode, RenderMode::Vulkan);
+        let legacy = Settings::from_ini_text("[general]\nrender_mode=compatibility\n");
+        assert_eq!(legacy.render_mode, RenderMode::OpenGl);
+        assert_eq!(Settings::default().render_mode, RenderMode::Cpu);
     }
 
     /// The Performance page's selected resource card survives a restart; a

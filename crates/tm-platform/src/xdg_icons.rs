@@ -82,8 +82,110 @@ impl IconLookup {
     }
 }
 
+/// Prefer the running desktop's XSettings owner to GTK's fallback files.
+#[cfg(target_os = "linux")]
+fn x11_icon_theme() -> Option<String> {
+    use x11rb::protocol::xproto::ConnectionExt as _;
+
+    let (conn, screen) = x11rb::connect(None).ok()?;
+    let selection = conn
+        .intern_atom(true, format!("_XSETTINGS_S{screen}").as_bytes())
+        .ok()?
+        .reply()
+        .ok()?
+        .atom;
+    let window = conn
+        .get_selection_owner(selection)
+        .ok()?
+        .reply()
+        .ok()?
+        .owner;
+    if window == x11rb::NONE {
+        return None;
+    }
+    let settings = conn
+        .intern_atom(true, b"_XSETTINGS_SETTINGS")
+        .ok()?
+        .reply()
+        .ok()?
+        .atom;
+    let property = conn
+        .get_property(false, window, settings, settings, 0, 16_384)
+        .ok()?
+        .reply()
+        .ok()?;
+    if property.format != 8 || property.bytes_after != 0 {
+        return None;
+    }
+    parse_xsettings_icon_theme(&property.value).map(str::to_owned)
+}
+
+/// XSettings property format, shared with the parser tests on every host.
+#[cfg(any(target_os = "linux", test))]
+fn parse_xsettings_icon_theme(mut data: &[u8]) -> Option<&str> {
+    fn take<'a>(data: &mut &'a [u8], len: usize) -> Option<&'a [u8]> {
+        let (value, rest) = data.split_at_checked(len)?;
+        *data = rest;
+        Some(value)
+    }
+
+    let header = take(&mut data, 12)?;
+    let big_endian = match header[0] {
+        0 => false,
+        1 => true,
+        _ => return None,
+    };
+    let as_u16 = |bytes: [u8; 2]| {
+        if big_endian {
+            u16::from_be_bytes(bytes)
+        } else {
+            u16::from_le_bytes(bytes)
+        }
+    };
+    let as_u32 = |bytes: [u8; 4]| {
+        if big_endian {
+            u32::from_be_bytes(bytes)
+        } else {
+            u32::from_le_bytes(bytes)
+        }
+    };
+
+    let count = as_u32(header[8..12].try_into().ok()?);
+    let mut theme = None;
+    for _ in 0..count {
+        let record = take(&mut data, 4)?;
+        let name_len = usize::from(as_u16(record[2..4].try_into().ok()?));
+        let name = &take(&mut data, name_len.next_multiple_of(4))?[..name_len];
+        take(&mut data, 4)?; // last-change serial
+        match record[0] {
+            0 => {
+                take(&mut data, 4)?;
+            }
+            1 => {
+                let len = as_u32(take(&mut data, 4)?.try_into().ok()?) as usize;
+                let padded = len.checked_add(3)? & !3;
+                let value = &take(&mut data, padded)?[..len];
+                if name == b"Net/IconThemeName" {
+                    theme = std::str::from_utf8(value)
+                        .ok()
+                        .filter(|name| !name.is_empty());
+                }
+            }
+            2 => {
+                take(&mut data, 8)?;
+            }
+            _ => return None,
+        }
+    }
+    theme
+}
+
 /// `gtk-icon-theme-name` from the GTK 3/4 settings.ini, if present.
 fn current_icon_theme(home: Option<&Path>) -> Option<String> {
+    #[cfg(target_os = "linux")]
+    if let Some(theme) = x11_icon_theme() {
+        return Some(theme);
+    }
     let config_home = std::env::var_os("XDG_CONFIG_HOME")
         .filter(|s| !s.is_empty())
         .map(PathBuf::from)
@@ -592,6 +694,40 @@ pub fn default_app_icon_rgba() -> Option<(u32, u32, Vec<u8>)> {
 mod tests {
     use super::*;
     use std::io::Write;
+
+    #[test]
+    fn xsettings_icon_theme_is_read_in_both_byte_orders() {
+        let name = b"Net/IconThemeName";
+        for big_endian in [false, true] {
+            let u16_bytes = |value: u16| {
+                if big_endian {
+                    value.to_be_bytes()
+                } else {
+                    value.to_le_bytes()
+                }
+            };
+            let u32_bytes = |value: u32| {
+                if big_endian {
+                    value.to_be_bytes()
+                } else {
+                    value.to_le_bytes()
+                }
+            };
+            let mut property = vec![u8::from(big_endian), 0, 0, 0];
+            property.extend(u32_bytes(1));
+            property.extend(u32_bytes(1));
+            property.extend([1, 0]);
+            property.extend(u16_bytes(name.len() as u16));
+            property.extend(name);
+            property.resize(property.len() + (4 - name.len() % 4) % 4, 0);
+            property.extend(u32_bytes(1));
+            property.extend(u32_bytes(6));
+            property.extend(b"Breeze\0\0");
+            assert_eq!(parse_xsettings_icon_theme(&property), Some("Breeze"));
+            property.pop();
+            assert_eq!(parse_xsettings_icon_theme(&property), None);
+        }
+    }
 
     fn write_png(path: &Path, w: u32, h: u32, rgba: [u8; 4]) {
         if let Some(parent) = path.parent() {

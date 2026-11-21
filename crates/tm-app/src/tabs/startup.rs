@@ -26,25 +26,23 @@ use crate::widgets::tablekit::{self, TmColumn};
 /// frame — every mouse move — so they are computed by the fetch job instead.
 #[derive(Default)]
 pub struct Derived {
-    /// Item id -> impact-store key of the image the item launches.
-    rule_keys: HashMap<String, String>,
+    /// Item id -> resolved icon target and impact-store key.
+    targets: HashMap<String, (String, String)>,
     last_bios_ms: Option<u64>,
 }
 
 impl Derived {
     fn compute(items: &[StartupItem], last_bios_ms: Option<u64>) -> Self {
-        let rule_keys = items
+        let targets = items
             .iter()
             .filter_map(|item| {
                 let target = resolve_startup_target(&item.command)?;
-                Some((
-                    item.id.clone(),
-                    tm_core::settings::process_rule_key(std::path::Path::new(&target)),
-                ))
+                let rule_key = tm_core::settings::process_rule_key(std::path::Path::new(&target));
+                Some((item.id.clone(), (target, rule_key)))
             })
             .collect();
         Self {
-            rule_keys,
+            targets,
             last_bios_ms,
         }
     }
@@ -54,7 +52,7 @@ impl Derived {
         if !item.enabled {
             return None;
         }
-        let key = self.rule_keys.get(&item.id)?;
+        let (_, key) = self.targets.get(&item.id)?;
         app.startup_impact.get(key).copied()
     }
 
@@ -352,14 +350,11 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
                 let (rect, resp) = table.row(ui, &pal, selected, item.id.as_str());
                 table.describe_row(ui, &resp, &item.name, vi);
 
-                // Resolve through the platform resolver (env vars, .lnk on
-                // Windows) so the icon lookup hits a real file, not a raw
-                // command token.
-                let exe = resolve_startup_target(&item.command);
+                let exe = derived.targets.get(&item.id).map(|(path, _)| path.as_str());
                 let tex = app
                     .shared
                     .icons
-                    .icon_or_default(ui.ctx(), &app.actions, exe.as_deref());
+                    .icon_or_default(ui.ctx(), &app.actions, exe);
                 table.icon_cell(ui, rect, tex.as_ref());
                 let name_rect = table.col_rect(0, rect);
                 ui.painter_at(name_rect).text(

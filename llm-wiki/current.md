@@ -615,9 +615,9 @@ rebase runbook.
   `cttune.exe` calibration. It is gated on the display, the user's font-smoothing
   settings, and per-monitor DPI awareness, because enabling it where it is not
   valid looks worse than grayscale.
-- `render_mode = software` keeps its name and its meaning to the user ("no GPU")
-  but no longer means WARP at ~3 fps. `Auto` now prefers the CPU renderer and
-  falls back to the GPU.
+- CPU rendering is the default. Graphics settings can select D3D12 on Windows,
+  Vulkan on Linux, and Metal or OpenGL on macOS. The saved choice applies at
+  the next launch. WGPU falls back to native CPU rendering if it cannot start.
 - The fork has its own quality gate, `tools/check-fork.ps1`, run by
   `build.py --check`: `cargo clippy --workspace` does not reach an excluded
   workspace, so without it the fork's crates sat outside the gate entirely.
@@ -625,18 +625,15 @@ rebase runbook.
 
 ## Recently landed (2026-08-31 — identity/priority fallback, tray, tree sort)
 
-- `start_epoch_s` is never a fabricated `Some(0)` any more: sysinfo returns 0
-  whenever it cannot open a process handle (half the list unelevated), so the
-  kernel process table fills it instead. Since 2026-11-21 it prefers native
-  high-resolution 100-ns Unix ticks (`SystemProcessInformation` /
-  `GetProcessTimes` on Windows, `/proc/stat` `btime` + `/proc/<pid>/stat`
-  `starttime` on Linux, `proc_pidinfo(PROC_PIDTBSDINFO)` on macOS) and falls back
-  to `sysinfo` whole seconds only when native creation time is unavailable;
-  `tm_core::model::{epoch_timestamp_to_unix_seconds, creation_timestamps_match}`
-  handle display conversion and strict high-res vs fallback comparison. The same
-  kernel table supplies a base
-  priority, which resolves the priority class for every process no handle can
-  be opened for — unknown priorities went from 130/261 to 1 (pid 0).
+- Windows prefers 100-ns creation timestamps from the kernel process table
+  or a process handle. The kernel table also supplies base priority when
+  opening the process fails.
+- Unix collectors verify the process generation across the telemetry refresh
+  before publishing an action token. macOS verifies the native executable
+  identity at microsecond resolution. Linux keeps boot-relative
+  `/proc/<pid>/stat` ticks as the token and derives wall time separately.
+  The `ProcessEntry::creation_identity()` accessor supplies the right token
+  to selections, actions, and per-process history.
 - The Details process tree is no longer a mode. It IS the Name column's third
   sort state; clicking any other column leaves it and sorts purely by that
   column. `details_tree_view` migrated into `details_tree_hierarchical`.

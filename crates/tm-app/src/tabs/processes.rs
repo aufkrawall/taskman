@@ -742,7 +742,7 @@ fn family_tooltip(members: &[&ProcessEntry]) -> Option<String> {
 fn process_identity(process: &ProcessEntry) -> crate::app::ProcessIdentity {
     crate::app::ProcessIdentity {
         pid: process.pid,
-        start_epoch_s: process.start_epoch_s,
+        start_epoch_s: process.creation_identity(),
     }
 }
 
@@ -2008,7 +2008,7 @@ fn emit_flat_with_family_groups(
             let gpu_available = fam.iter().any(|member| gpu_known(member));
             out.push(DisplayRow::Process(RowData {
                 pid: p.pid,
-                start_epoch_s: p.start_epoch_s,
+                start_epoch_s: p.creation_identity(),
                 depth: 0,
                 name: format!("{} [{}]", family_label(p, fam), fam.len()),
                 icon_path: crate::icon_cache::row_icon_key(p.exe_path.as_deref()),
@@ -2422,7 +2422,7 @@ fn normalize_heat(rows: &mut [DisplayRow]) {
 fn make_flat_row(p: &ProcessEntry) -> DisplayRow {
     DisplayRow::Process(RowData {
         pid: p.pid,
-        start_epoch_s: p.start_epoch_s,
+        start_epoch_s: p.creation_identity(),
         depth: 0,
         name: process_display_name(p),
         icon_path: crate::icon_cache::row_icon_key(p.exe_path.as_deref()),
@@ -2470,7 +2470,7 @@ fn gpu_known(p: &ProcessEntry) -> bool {
 fn make_own_row(p: &ProcessEntry, depth: usize) -> DisplayRow {
     DisplayRow::Process(RowData {
         pid: p.pid,
-        start_epoch_s: p.start_epoch_s,
+        start_epoch_s: p.creation_identity(),
         depth,
         name: process_display_name(p),
         icon_path: crate::icon_cache::row_icon_key(p.exe_path.as_deref()),

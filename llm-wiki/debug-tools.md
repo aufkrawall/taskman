@@ -70,12 +70,10 @@ normal GUI log.
 
 ## Renderer diagnostics
 
-- Default order is WGPU, then Glow. `TASKMAN_RENDERER=wgpu|glow` forces one.
-- `TASKMAN_GPU=auto|compatibility|software` overrides the persisted
-  `render_mode` for one run (`0`/`1` still map to software/auto).
-  `compatibility` is the Glow/OpenGL path; `software` selects the CPU adapter
-  (WARP on Windows), which is correct but costs ~14 cores at 2.9 fps — see
-  `known-debt.md` before using it for anything but a comparison.
+- CPU rendering is the default. `TASKMAN_RENDERER=cpu|d3d12|vulkan|metal|glow`
+  pins one compiled backend (`software` and `wgpu` still work).
+- `TASKMAN_GPU=cpu|d3d12|vulkan|metal` overrides the saved preference for
+  one run and permits fallbacks. The numeric legacy values select CPU.
 - `TASKMAN_PRESENT=fifo|immediate|mailbox|autovsync` and
   `TASKMAN_FRAME_LATENCY=<n>` (0 = leave it to wgpu) tune the swapchain while
   investigating frame pacing.
@@ -84,15 +82,11 @@ normal GUI log.
   draws rainbow-tinted text, so the interlock in `theme.rs` wins. With no
   override, the mode follows Windows' own font-smoothing settings and the
   per-monitor ClearType calibration.
-- `TASKMAN_RENDERER=software|wgpu|glow` now includes the native CPU renderer.
-  It is what `render_mode = software` selects and what the default order tries
-  first. `TASKMAN_PRESENT` and `TASKMAN_FRAME_LATENCY` are wgpu swapchain knobs
-  and do nothing on the CPU path.
+- The CPU renderer uses software presentation on the native display. The
+  swapchain settings apply to WGPU only.
 - `TASKMAN_TEXT_SMOOTHING=sharp|standard|smooth` overrides the persisted glyph
   weight/grid-fitting profile for A/B comparison without touching config.ini.
 - Windows WGPU compiles only D3D12; Linux only Vulkan; macOS only Metal.
-  `WGPU_BACKEND` may narrow the compiled set but cannot enable a backend that
-  was not compiled for that host.
 - WGPU defaults to the low-power adapter for this 2D monitor UI.
   `WGPU_POWER_PREF=high` is the opt-in discrete/high-performance override.
 - `TASKMAN_FPS_PROBE=1` forces continuous repaint and displays frame rate, but

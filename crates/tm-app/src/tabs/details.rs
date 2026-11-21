@@ -2122,7 +2122,7 @@ fn row_from_process(p: &ProcessEntry, depth: usize, children: bool) -> Row {
     };
     Row {
         pid: p.pid,
-        start_epoch_s: p.start_epoch_s,
+        start_epoch_s: p.creation_identity(),
         name: detail_name(p),
         icon_path: crate::icon_cache::row_icon_key(p.exe_path.as_deref()),
         depth,
@@ -2210,7 +2210,7 @@ fn row_from_process(p: &ProcessEntry, depth: usize, children: bool) -> Row {
 fn identity_still_live(app: &TaskManApp, p: &ProcessEntry) -> bool {
     app.identity_is_live(&crate::app::ProcessIdentity {
         pid: p.pid,
-        start_epoch_s: p.start_epoch_s,
+        start_epoch_s: p.creation_identity(),
     })
 }
 
@@ -2227,7 +2227,7 @@ fn action_targets(
     } else if identity_still_live(app, p) {
         vec![crate::app::ProcessIdentity {
             pid: p.pid,
-            start_epoch_s: p.start_epoch_s,
+            start_epoch_s: p.creation_identity(),
         }]
     } else {
         Vec::new()
@@ -2525,7 +2525,14 @@ pub fn context_menu(app: &mut TaskManApp, ui: &mut egui::Ui, p: &ProcessEntry, h
             let ctx = ctx.clone();
             app.end_selected(&ctx);
         } else {
-            end_process(app, &ctx, p.pid, p.start_epoch_s, false, p.shown_name());
+            end_process(
+                app,
+                &ctx,
+                p.pid,
+                p.creation_identity(),
+                false,
+                p.shown_name(),
+            );
         }
         ui.close();
     }
@@ -2538,7 +2545,14 @@ pub fn context_menu(app: &mut TaskManApp, ui: &mut egui::Ui, p: &ProcessEntry, h
                 tree: true,
             });
         } else {
-            end_process(app, &ctx, p.pid, p.start_epoch_s, true, p.shown_name());
+            end_process(
+                app,
+                &ctx,
+                p.pid,
+                p.creation_identity(),
+                true,
+                p.shown_name(),
+            );
         }
         ui.close();
     }
@@ -2554,7 +2568,7 @@ pub fn context_menu(app: &mut TaskManApp, ui: &mut egui::Ui, p: &ProcessEntry, h
         app,
         crate::app::ProcessIdentity {
             pid: p.pid,
-            start_epoch_s: p.start_epoch_s,
+            start_epoch_s: p.creation_identity(),
         },
         p.synthetic,
     ) && menu::item(ui, i18n::tr(K::RestartService)).clicked()
@@ -2581,7 +2595,7 @@ pub fn context_menu(app: &mut TaskManApp, ui: &mut egui::Ui, p: &ProcessEntry, h
         let targets = targets(app);
         let identity = crate::app::ProcessIdentity {
             pid: p.pid,
-            start_epoch_s: p.start_epoch_s,
+            start_epoch_s: p.creation_identity(),
         };
         open_affinity_dialog(app, &ctx, identity, targets, rule_key);
         ui.close();
@@ -2611,7 +2625,7 @@ pub fn context_menu(app: &mut TaskManApp, ui: &mut egui::Ui, p: &ProcessEntry, h
             }
             let target = crate::app::ProcessIdentity {
                 pid: p.pid,
-                start_epoch_s: p.start_epoch_s,
+                start_epoch_s: p.creation_identity(),
             };
             app.set_suspended_batch(&ctx, vec![target], target_suspended);
         }
@@ -2640,7 +2654,7 @@ pub fn context_menu(app: &mut TaskManApp, ui: &mut egui::Ui, p: &ProcessEntry, h
                 &ctx,
                 &crate::app::ProcessIdentity {
                     pid: p.pid,
-                    start_epoch_s: p.start_epoch_s,
+                    start_epoch_s: p.creation_identity(),
                 },
             );
             ui.close();
@@ -2665,7 +2679,7 @@ pub fn context_menu(app: &mut TaskManApp, ui: &mut egui::Ui, p: &ProcessEntry, h
                 app.pending_uac_virtualization = Some(crate::app::PendingUacVirtualization {
                     identity: crate::app::ProcessIdentity {
                         pid: p.pid,
-                        start_epoch_s: p.start_epoch_s,
+                        start_epoch_s: p.creation_identity(),
                     },
                     name: p.shown_name().to_string(),
                     enabled: !uac_enabled,
@@ -2750,7 +2764,7 @@ pub fn context_menu(app: &mut TaskManApp, ui: &mut egui::Ui, p: &ProcessEntry, h
             app,
             crate::app::ProcessIdentity {
                 pid: p.pid,
-                start_epoch_s: p.start_epoch_s,
+                start_epoch_s: p.creation_identity(),
             },
         );
         ui.close();
@@ -3060,7 +3074,7 @@ pub(crate) fn create_dumps(
 
                 let res = actions.create_dump_file_with_progress(
                     p.pid,
-                    p.start_epoch_s,
+                    p.creation_identity(),
                     &path,
                     dump_type,
                     Some(tracker_worker.clone()),
@@ -3352,7 +3366,8 @@ pub(crate) fn process_properties_target<'a>(
 ) -> Option<&'a ProcessEntry> {
     let process = snapshot.process(identity.pid)?;
     (!process.synthetic
-        && (process.start_epoch_s.is_none() || process.start_epoch_s == identity.start_epoch_s))
+        && (process.creation_identity().is_none()
+            || process.creation_identity() == identity.start_epoch_s))
         .then_some(process)
 }
 

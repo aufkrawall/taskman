@@ -40,52 +40,65 @@ mod widgets;
 pub use tm_ui::fonts;
 pub use tm_ui::theme;
 
-use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::Instant;
 
-/// The rendering path this process actually started on. The renderer and
-/// adapter are chosen once, before the window exists, so the settings dialog
-/// compares the live value against the persisted one to decide whether to
-/// show its "takes effect at the next start" note.
-static ACTIVE_RENDER_MODE: AtomicU8 = AtomicU8::new(0);
+use tm_core::settings::RenderMode;
 
-fn store_render_mode(mode: tm_core::settings::RenderMode) {
-    use tm_core::settings::RenderMode;
-    ACTIVE_RENDER_MODE.store(
-        match mode {
-            RenderMode::Auto => 0,
-            RenderMode::Compatibility => 1,
-            RenderMode::Software => 2,
-        },
-        Ordering::Relaxed,
-    );
+/// The backend that initialized the current window.
+static ACTIVE_RENDER_MODE: std::sync::Mutex<RenderMode> = std::sync::Mutex::new(RenderMode::Cpu);
+
+pub fn active_render_mode() -> RenderMode {
+    *tm_core::sync::lock(&ACTIVE_RENDER_MODE)
 }
 
-pub fn active_render_mode() -> tm_core::settings::RenderMode {
-    use tm_core::settings::RenderMode;
-    match ACTIVE_RENDER_MODE.load(Ordering::Relaxed) {
-        1 => RenderMode::Compatibility,
-        2 => RenderMode::Software,
-        _ => RenderMode::Auto,
+fn effective_render_mode(settings: &tm_core::settings::Settings) -> RenderMode {
+    let requested = std::env::var("TASKMAN_GPU")
+        .ok()
+        .and_then(|value| RenderMode::from_cfg(&value))
+        .unwrap_or(settings.render_mode);
+    configured_render_mode(requested)
+}
+
+/// A configuration copied from a different OS falls back to the local default.
+fn configured_render_mode(requested: RenderMode) -> RenderMode {
+    if renderer_choices().contains(&requested) {
+        requested
+    } else {
+        renderer_choices().first().copied().unwrap_or_default()
     }
 }
 
-/// Effective rendering path: the persisted setting unless
-/// `TASKMAN_GPU=auto|compatibility|software` (or the legacy `0`/`1`)
-/// overrides it for diagnostics.
-fn effective_render_mode(settings: &tm_core::settings::Settings) -> tm_core::settings::RenderMode {
-    use tm_core::settings::RenderMode;
-    match std::env::var("TASKMAN_GPU")
-        .unwrap_or_default()
-        .trim()
-        .to_ascii_lowercase()
-        .as_str()
+pub(crate) fn renderer_choices() -> &'static [RenderMode] {
+    const CHOICES: &[RenderMode] = &[
+        #[cfg(feature = "software")]
+        RenderMode::Cpu,
+        #[cfg(feature = "wgpu")]
+        native_gpu_mode(),
+        #[cfg(all(feature = "glow", not(any(target_os = "windows", target_os = "linux"))))]
+        RenderMode::OpenGl,
+        #[cfg(all(
+            feature = "glow",
+            not(any(feature = "software", feature = "wgpu")),
+            any(target_os = "windows", target_os = "linux")
+        ))]
+        RenderMode::OpenGl,
+    ];
+    CHOICES
+}
+
+#[cfg(feature = "wgpu")]
+const fn native_gpu_mode() -> RenderMode {
+    #[cfg(target_os = "windows")]
     {
-        "" => settings.render_mode,
-        "0" | "off" | "false" | "software" | "cpu" | "warp" => RenderMode::Software,
-        "gl" | "opengl" | "compatibility" => RenderMode::Compatibility,
-        "1" | "on" | "true" | "auto" => RenderMode::Auto,
-        _ => settings.render_mode,
+        RenderMode::D3d12
+    }
+    #[cfg(target_os = "linux")]
+    {
+        RenderMode::Vulkan
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "linux")))]
+    {
+        RenderMode::Metal
     }
 }
 
@@ -347,7 +360,7 @@ fn run_gui(mock: bool, args: &[String]) {
     }
     tm_core::i18n::set_lang(settings.language.resolve());
     let render_mode = effective_render_mode(&settings);
-    store_render_mode(render_mode);
+    settings.render_mode = configured_render_mode(settings.render_mode);
     let window_size = [settings.window_size[0], settings.window_size[1]];
     let restore_position = has_saved_settings && settings.remember_window;
     let window_position = restore_position.then(ui_state::window_position).flatten();
@@ -418,21 +431,34 @@ fn run_gui(mock: bool, args: &[String]) {
             // Compile and enumerate only the native backend for each host.
             // On Windows this makes D3D12 explicit and avoids loading the
             // Vulkan stack before the existing Glow fallback is considered.
-            setup.instance_descriptor.backends =
-                eframe::wgpu::Backends::from_env().unwrap_or_else(compiled_wgpu_backends);
+            setup.instance_descriptor.backends = compiled_wgpu_backends();
             // This is a 2D monitor, so prefer the low-power adapter by
             // default rather than waking a discrete GPU. WGPU_POWER_PREF
             // remains an opt-in override for diagnostics.
-            setup.power_preference = eframe::wgpu::PowerPreference::from_env()
+            let power_preference = eframe::wgpu::PowerPreference::from_env()
                 .unwrap_or(eframe::wgpu::PowerPreference::LowPower);
-            // "GPU acceleration off" means the platform's software
-            // rasterizer (WARP on Windows, lavapipe on Linux), which
-            // enumerates as a CPU-type adapter on the same backend. If the
-            // host has none, keep rendering rather than refusing to start —
-            // the settings dialog reports what actually happened.
-            if render_mode == tm_core::settings::RenderMode::Software {
-                setup.native_adapter_selector = Some(std::sync::Arc::new(select_software_adapter));
-            }
+            setup.power_preference = power_preference;
+            setup.native_adapter_selector = Some(std::sync::Arc::new(move |adapters, surface| {
+                adapters
+                    .iter()
+                    .filter_map(|adapter| {
+                        let rank = hardware_adapter_rank(
+                            adapter.get_info().device_type,
+                            power_preference,
+                        )?;
+                        surface
+                            .is_none_or(|surface| adapter.is_surface_supported(surface))
+                            .then_some((rank, adapter))
+                    })
+                    .min_by_key(|(rank, _)| *rank)
+                    .map(|(_, adapter)| adapter.clone())
+                    .ok_or_else(|| {
+                        format!(
+                            "no surface-compatible hardware {} adapter",
+                            native_gpu_mode().label()
+                        )
+                    })
+            }));
             opts.wgpu_options = config;
             opts
         };
@@ -456,11 +482,6 @@ fn run_gui(mock: bool, args: &[String]) {
         if topmost_band {
             tm_platform::request_topmost_band();
         }
-        store_render_mode(active_mode_for_renderer(
-            render_mode,
-            renderer,
-            explicit_renderer.is_some(),
-        ));
         tracing::info!(?renderer, "trying renderer");
         let use_mock = mock;
         let initial_tab = initial_tab_arg.clone();
@@ -472,6 +493,7 @@ fn run_gui(mock: bool, args: &[String]) {
         let is_software = false;
 
         let creator = move |cc: &eframe::CreationContext<'_>| {
+            *tm_core::sync::lock(&ACTIVE_RENDER_MODE) = mode_for_renderer(renderer);
             StartupTrace::mark("creation_context_enter");
             // Now the window exists, so the DPI-awareness gate reports the truth. Doing
             // this before `apply_startup` means the very first frame already rasterizes
@@ -522,88 +544,48 @@ fn run_gui(mock: bool, args: &[String]) {
     std::process::exit(1);
 }
 
-/// Renderers to try, in order.
-///
-/// The native CPU renderer goes first for `Auto` and `Software`: it needs no
-/// driver, starts without enumerating adapters or compiling shaders, and is the
-/// only backend that can do sub-pixel (ClearType) text. `Software` mode also
-/// installs `select_software_adapter` on `Wgpu` so a fallback to `Wgpu` prefers
-/// a CPU rasterizer (WARP/lavapipe) before falling back to a GPU adapter.
-/// `Compatibility` prefers `Glow` (OpenGL) first and falls back to `Software`
-/// then `Wgpu` if OpenGL initialization fails.
-///
-/// An explicit `TASKMAN_RENDERER` override narrows the list to that single
-/// compiled backend for diagnostics.
+/// The configured backend comes first. Keep CPU as the first fallback for an
+/// unavailable GPU. OpenGL is also available through the diagnostic override.
 #[allow(clippy::vec_init_then_push)]
-fn preferred_renderers(
-    mode: tm_core::settings::RenderMode,
-    explicit_pref: Option<&str>,
-) -> Vec<eframe::Renderer> {
-    use tm_core::settings::RenderMode;
+fn preferred_renderers(mode: RenderMode, explicit_pref: Option<&str>) -> Vec<eframe::Renderer> {
+    let mut compiled = Vec::with_capacity(3);
+    #[cfg(feature = "software")]
+    compiled.push(("software", eframe::Renderer::Software));
+    #[cfg(feature = "wgpu")]
+    compiled.push(("wgpu", eframe::Renderer::Wgpu));
+    #[cfg(feature = "glow")]
+    compiled.push(("glow", eframe::Renderer::Glow));
 
     if let Some(pref) = explicit_pref.map(str::trim).filter(|p| !p.is_empty()) {
-        let mut filtered = Vec::<eframe::Renderer>::with_capacity(1);
-        #[cfg(feature = "software")]
-        if pref.eq_ignore_ascii_case("software") {
-            filtered.push(eframe::Renderer::Software);
-        }
-        #[cfg(feature = "wgpu")]
-        if pref.eq_ignore_ascii_case("wgpu") {
-            filtered.push(eframe::Renderer::Wgpu);
-        }
-        #[cfg(feature = "glow")]
-        if pref.eq_ignore_ascii_case("glow") {
-            filtered.push(eframe::Renderer::Glow);
-        }
-        return filtered;
+        let mode = match pref.to_ascii_lowercase().as_str() {
+            "cpu" => Some(RenderMode::Cpu),
+            "d3d12" | "dx12" => Some(RenderMode::D3d12),
+            "vulkan" => Some(RenderMode::Vulkan),
+            "metal" => Some(RenderMode::Metal),
+            "opengl" => Some(RenderMode::OpenGl),
+            _ => None,
+        };
+        return compiled
+            .into_iter()
+            .filter_map(|(name, renderer)| {
+                (pref.eq_ignore_ascii_case(name) || mode == Some(mode_for_renderer(renderer)))
+                    .then_some(renderer)
+            })
+            .collect();
     }
 
-    let mut ordered = Vec::<eframe::Renderer>::with_capacity(3);
-    match mode {
-        RenderMode::Auto | RenderMode::Software => {
-            #[cfg(feature = "software")]
-            ordered.push(eframe::Renderer::Software);
-            #[cfg(feature = "wgpu")]
-            ordered.push(eframe::Renderer::Wgpu);
-            #[cfg(feature = "glow")]
-            ordered.push(eframe::Renderer::Glow);
-        }
-        RenderMode::Compatibility => {
-            #[cfg(feature = "glow")]
-            ordered.push(eframe::Renderer::Glow);
-            #[cfg(feature = "software")]
-            ordered.push(eframe::Renderer::Software);
-            #[cfg(feature = "wgpu")]
-            ordered.push(eframe::Renderer::Wgpu);
-        }
-    }
-    ordered
+    compiled.sort_by_key(|&(_, renderer)| mode_for_renderer(renderer) != mode);
+    compiled.into_iter().map(|(_, renderer)| renderer).collect()
 }
 
-fn active_mode_for_renderer(
-    requested: tm_core::settings::RenderMode,
-    renderer: eframe::Renderer,
-    explicit_renderer: bool,
-) -> tm_core::settings::RenderMode {
-    use tm_core::settings::RenderMode;
-    if !explicit_renderer && requested == RenderMode::Auto {
-        return RenderMode::Auto;
-    }
+fn mode_for_renderer(renderer: eframe::Renderer) -> RenderMode {
     match renderer {
         #[cfg(feature = "software")]
-        eframe::Renderer::Software => RenderMode::Software,
+        eframe::Renderer::Software => RenderMode::Cpu,
         #[cfg(feature = "wgpu")]
-        eframe::Renderer::Wgpu => {
-            if !explicit_renderer && requested == RenderMode::Software {
-                // `select_software_adapter` flips this to `Auto` if no CPU
-                // adapter exists and WGPU falls back to a GPU adapter.
-                RenderMode::Software
-            } else {
-                RenderMode::Auto
-            }
-        }
+        eframe::Renderer::Wgpu => native_gpu_mode(),
         #[cfg(feature = "glow")]
-        eframe::Renderer::Glow => RenderMode::Compatibility,
+        eframe::Renderer::Glow => RenderMode::OpenGl,
     }
 }
 
@@ -648,33 +630,20 @@ fn format_renderer_startup_error(
     }
 }
 
-/// Pick the software rasterizer among the enumerated adapters, preferring
-/// one that can actually present to our surface. Falls back to any adapter so
-/// a machine without a software rasterizer still gets a window.
+/// GPU backends accept only an identified GPU. WARP and lavapipe report
+/// Cpu, which leaves the native software renderer as the fallback.
 #[cfg(feature = "wgpu")]
-fn select_software_adapter(
-    adapters: &[eframe::wgpu::Adapter],
-    surface: Option<&eframe::wgpu::Surface<'_>>,
-) -> Result<eframe::wgpu::Adapter, String> {
-    let compatible = |a: &eframe::wgpu::Adapter| surface.is_none_or(|s| a.is_surface_supported(s));
-    let is_cpu =
-        |a: &eframe::wgpu::Adapter| a.get_info().device_type == eframe::wgpu::DeviceType::Cpu;
-    let chosen = adapters
-        .iter()
-        .find(|a| is_cpu(a) && compatible(a))
-        .or_else(|| adapters.iter().find(|a| is_cpu(a)))
-        .inspect(|a| {
-            tracing::info!(adapter = %a.get_info().name, "software rendering active");
-        })
-        .or_else(|| {
-            // Report what actually happened instead of pretending the choice
-            // took effect; the settings dialog reads this back.
-            store_render_mode(tm_core::settings::RenderMode::Auto);
-            tracing::warn!("no software rasterizer available; staying on the GPU adapter");
-            adapters.iter().find(|a| compatible(a))
-        })
-        .ok_or_else(|| "no usable wgpu adapter".to_string())?;
-    Ok(chosen.clone())
+fn hardware_adapter_rank(
+    device_type: eframe::wgpu::DeviceType,
+    power: eframe::wgpu::PowerPreference,
+) -> Option<u8> {
+    use eframe::wgpu::{DeviceType, PowerPreference};
+    match device_type {
+        DeviceType::IntegratedGpu => Some(u8::from(power != PowerPreference::LowPower)),
+        DeviceType::DiscreteGpu => Some(u8::from(power == PowerPreference::LowPower)),
+        DeviceType::VirtualGpu => Some(2),
+        DeviceType::Cpu | DeviceType::Other => None,
+    }
 }
 
 /// `TASKMAN_PRESENT=fifo|immediate|mailbox|autovsync` (diagnostics).
@@ -1432,107 +1401,74 @@ fn attach_parent_console() {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tm_core::settings::RenderMode;
-
     #[test]
-    fn preferred_renderers_never_empty_for_any_render_mode() {
-        for mode in [
-            RenderMode::Auto,
-            RenderMode::Software,
-            RenderMode::Compatibility,
-        ] {
+    fn renderer_choices_start_with_their_backend() {
+        for &mode in renderer_choices() {
             let list = preferred_renderers(mode, None);
-            assert!(
-                !list.is_empty(),
-                "RenderMode::{mode:?} must always yield at least one compiled renderer"
-            );
-            let blank = preferred_renderers(mode, Some("  "));
-            assert_eq!(blank, list);
+            assert_eq!(mode_for_renderer(list[0]), mode);
+            assert_eq!(list, preferred_renderers(mode, Some("  ")));
         }
     }
 
     #[cfg(all(feature = "software", feature = "wgpu", feature = "glow"))]
     #[test]
-    fn preferred_renderers_ordering_by_render_mode_and_override() {
+    fn desktop_backends_prefer_cpu_and_fall_back_from_gpu_to_cpu() {
+        use eframe::Renderer::{Glow, Software, Wgpu};
+        #[cfg(target_os = "windows")]
+        assert_eq!(renderer_choices(), [RenderMode::Cpu, RenderMode::D3d12]);
+        #[cfg(target_os = "linux")]
+        assert_eq!(renderer_choices(), [RenderMode::Cpu, RenderMode::Vulkan]);
         assert_eq!(
-            preferred_renderers(RenderMode::Auto, None),
-            vec![
-                eframe::Renderer::Software,
-                eframe::Renderer::Wgpu,
-                eframe::Renderer::Glow,
-            ]
+            preferred_renderers(RenderMode::Cpu, None),
+            [Software, Wgpu, Glow]
         );
         assert_eq!(
-            preferred_renderers(RenderMode::Software, None),
-            vec![
-                eframe::Renderer::Software,
-                eframe::Renderer::Wgpu,
-                eframe::Renderer::Glow,
-            ]
+            preferred_renderers(native_gpu_mode(), None),
+            [Wgpu, Software, Glow]
         );
         assert_eq!(
-            preferred_renderers(RenderMode::Compatibility, None),
-            vec![
-                eframe::Renderer::Glow,
-                eframe::Renderer::Software,
-                eframe::Renderer::Wgpu,
-            ]
+            preferred_renderers(RenderMode::Cpu, Some(" CPU ")),
+            [Software]
         );
-
-        assert_eq!(
-            preferred_renderers(RenderMode::Auto, Some(" GLOW ")),
-            vec![eframe::Renderer::Glow]
-        );
-        assert_eq!(
-            preferred_renderers(RenderMode::Compatibility, Some("software")),
-            vec![eframe::Renderer::Software]
-        );
-        assert_eq!(
-            preferred_renderers(RenderMode::Software, Some("wgpu")),
-            vec![eframe::Renderer::Wgpu]
-        );
-        assert!(preferred_renderers(RenderMode::Auto, Some("unknown")).is_empty());
+        assert_eq!(preferred_renderers(RenderMode::Cpu, Some(" GLOW ")), [Glow]);
+        assert_eq!(preferred_renderers(RenderMode::Cpu, Some("wgpu")), [Wgpu]);
+        assert!(preferred_renderers(RenderMode::Cpu, Some("unknown")).is_empty());
+        let foreign = if cfg!(target_os = "linux") {
+            RenderMode::D3d12
+        } else {
+            RenderMode::Vulkan
+        };
+        assert_eq!(configured_render_mode(foreign), RenderMode::Cpu);
     }
 
-    #[cfg(all(feature = "software", feature = "wgpu", feature = "glow"))]
+    #[cfg(feature = "wgpu")]
     #[test]
-    fn active_mode_for_renderer_reports_honest_fallbacks() {
-        assert_eq!(
-            active_mode_for_renderer(RenderMode::Auto, eframe::Renderer::Software, false),
-            RenderMode::Auto
-        );
-        assert_eq!(
-            active_mode_for_renderer(RenderMode::Auto, eframe::Renderer::Wgpu, false),
-            RenderMode::Auto
-        );
-        assert_eq!(
-            active_mode_for_renderer(RenderMode::Software, eframe::Renderer::Software, false),
-            RenderMode::Software
-        );
-        assert_eq!(
-            active_mode_for_renderer(RenderMode::Software, eframe::Renderer::Wgpu, false),
-            RenderMode::Software
-        );
-        assert_eq!(
-            active_mode_for_renderer(RenderMode::Software, eframe::Renderer::Glow, false),
-            RenderMode::Compatibility
-        );
-        assert_eq!(
-            active_mode_for_renderer(RenderMode::Compatibility, eframe::Renderer::Glow, false),
-            RenderMode::Compatibility
-        );
-        assert_eq!(
-            active_mode_for_renderer(RenderMode::Compatibility, eframe::Renderer::Software, false),
-            RenderMode::Software
-        );
-        assert_eq!(
-            active_mode_for_renderer(RenderMode::Compatibility, eframe::Renderer::Wgpu, false),
-            RenderMode::Auto
-        );
-        assert_eq!(
-            active_mode_for_renderer(RenderMode::Auto, eframe::Renderer::Glow, true),
-            RenderMode::Compatibility
-        );
+    fn gpu_adapter_selection_excludes_software_and_respects_power_preference() {
+        use eframe::wgpu::{DeviceType, PowerPreference};
+        for power in [
+            PowerPreference::None,
+            PowerPreference::LowPower,
+            PowerPreference::HighPerformance,
+        ] {
+            assert_eq!(hardware_adapter_rank(DeviceType::Cpu, power), None);
+            assert_eq!(hardware_adapter_rank(DeviceType::Other, power), None);
+            assert!(hardware_adapter_rank(DeviceType::VirtualGpu, power).is_some());
+        }
+        for (power, first, second) in [
+            (
+                PowerPreference::LowPower,
+                DeviceType::IntegratedGpu,
+                DeviceType::DiscreteGpu,
+            ),
+            (
+                PowerPreference::HighPerformance,
+                DeviceType::DiscreteGpu,
+                DeviceType::IntegratedGpu,
+            ),
+        ] {
+            assert_eq!(hardware_adapter_rank(first, power), Some(0));
+            assert_eq!(hardware_adapter_rank(second, power), Some(1));
+        }
     }
 
     #[test]
@@ -1549,8 +1485,11 @@ mod tests {
     #[cfg(all(feature = "software", feature = "wgpu", feature = "glow"))]
     #[test]
     fn format_renderer_startup_error_is_accurate_and_human_readable() {
-        let missing = format_renderer_startup_error(Some("vulkan"), &[]);
-        assert!(missing.contains("TASKMAN_RENDERER=\"vulkan\""), "{missing}");
+        let missing = format_renderer_startup_error(Some("unknown"), &[]);
+        assert!(
+            missing.contains("TASKMAN_RENDERER=\"unknown\""),
+            "{missing}"
+        );
         assert!(!missing.contains("GPU renderer"), "{missing}");
         assert!(!missing.contains("Some("), "{missing}");
 

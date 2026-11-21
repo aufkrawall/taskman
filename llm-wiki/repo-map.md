@@ -172,7 +172,8 @@ platform boundary (`tm-core` ← `tm-platform` ← `tm-app` / `tm-service`), and
     English codepages silently blanked every binary shipping only a localized
     table). `xdg_icons.rs` (freedesktop icon-theme resolution used by the
     Linux backend's `process_icon_rgba`: `.desktop` `Icon=` via XDG data dirs,
-    current GTK theme + `Inherits` + `hicolor` + pixmaps, PNG decode capped at
+    X11 XSettings or GTK config for the theme, then inheritance, hicolor,
+    and pixmaps. PNG decode is capped at
     64 px; plus `default_app_icon_rgba`, the theme's
     `application-x-executable` / `application-default-icon` / `image-missing`
     chain, which is what a row without an icon of its own paints;

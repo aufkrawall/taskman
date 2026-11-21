@@ -183,4 +183,8 @@ tests cannot cover, and the CPU-cost measurements in the plan need it too.
   - Taskman process table caching by reference, avoiding per-frame vector cloning.
   - IconCache O(1) lazy expiration and direct unmultiplied upload.
   Remaining potential work: SIMD for span fills.
-- **Retiring wgpu and glow.** Both are still compiled in as fallbacks. `tm-app`'s startup loop (`preferred_renderers`) tries `Software -> Wgpu -> Glow` for `Auto` and `Software` (with `select_software_adapter` active on `Wgpu` in `Software` mode) and `Glow -> Software -> Wgpu` for `Compatibility`, aborts fallback immediately on `eframe::Error::WinitEventLoop(_)` (while `vendor/winit`'s `EventLoopBuilder::build()` also rolls back `EVENT_LOOP_CREATED` on backend init error), and records the actual active mode via `store_render_mode`.
+- **Renderer startup.** CPU is the default. Settings can prefer the platform
+  WGPU backend, which falls back to CPU on a renderer initialization failure.
+  OpenGL remains a diagnostic and final fallback. An event-loop error stops
+  fallback because the renderers share that display connection. Startup
+  records the backend that successfully creates the window.

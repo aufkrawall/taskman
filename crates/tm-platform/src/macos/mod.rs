@@ -6,6 +6,8 @@ mod startup;
 
 use crate::actions::*;
 use std::collections::HashMap;
+use std::os::unix::ffi::OsStrExt as _;
+use std::path::PathBuf;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use sysinfo::{
     Disks, MemoryRefreshKind, Networks, ProcessRefreshKind, ProcessesToUpdate, RefreshKind, System,
@@ -46,6 +48,16 @@ impl SystemCollector for MacCollector {
                 )
                 .with_memory(MemoryRefreshKind::nothing().with_ram().with_swap()),
         );
+        // Bind each actionable row to the generation that spans the refresh.
+        let before_refresh: HashMap<_, _> = self
+            .sys
+            .processes()
+            .keys()
+            .filter_map(|pid| {
+                let pid = pid.as_u32();
+                macos_proc_start_timestamp(pid).map(|start| (pid, start))
+            })
+            .collect();
         self.sys.refresh_processes_specifics(
             ProcessesToUpdate::All,
             true,
@@ -69,7 +81,24 @@ impl SystemCollector for MacCollector {
         let mut processes = Vec::with_capacity(n_procs);
         for (pid, p) in self.sys.processes() {
             let pid_u = pid.as_u32();
-            let name = p.name().to_string_lossy().into_owned();
+            // Sysinfo's macOS cache distinguishes generations at whole-second
+            // precision. Get the displayed image from the native observation
+            // too, so same-second PID reuse cannot preserve a stale label.
+            let observed = before_refresh.get(&pid_u).and_then(|&before| {
+                let path = macos_process_path(pid_u);
+                let info = bsd_info(pid_u)?;
+                (macos_start_timestamp(info.pbi_start_tvsec, info.pbi_start_tvusec) == Some(before))
+                    .then_some((before, path, info))
+            });
+            let name = observed.as_ref().map_or_else(
+                || p.name().to_string_lossy().into_owned(),
+                |(_, path, info)| {
+                    path.as_deref()
+                        .and_then(std::path::Path::file_name)
+                        .map(|name| name.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| macos_process_name(info))
+                },
+            );
 
             let category = classify::classify(classify::ClassifyInput {
                 pid: pid_u,
@@ -90,18 +119,22 @@ impl SystemCollector for MacCollector {
             entry.mem_bytes = p.memory();
             entry.working_set_bytes = Some(p.memory());
             entry.commit_bytes = Some(p.virtual_memory());
-            entry.start_epoch_s = macos_proc_start_timestamp(pid_u)
-                .or_else(|| (p.start_time() > 0).then_some(p.start_time() as i64));
+            entry.start_epoch_s = observed.as_ref().map(|(start, _, _)| *start);
             // macOS accumulated cpu time unit: microseconds in sysinfo? treat ms fallback.
             entry.cpu_time_s = Some(p.accumulated_cpu_time() as f64 / 1000.0);
             entry.disk_read_bps = du.read_bytes as f64 / interval_s;
             entry.disk_write_bps = du.written_bytes as f64 / interval_s;
             entry.disk_read_total = du.total_read_bytes;
             entry.disk_write_total = du.total_written_bytes;
-            entry.exe_path = p.exe().map(|e| e.to_path_buf());
             entry.user = None;
-            entry.status = bsd_run_state(pid_u)
-                .map_or_else(|| status_from_sysinfo(p.status()), status_from_bsd);
+            if let Some((_, path, info)) = observed {
+                entry.exe_path = path;
+                entry.status = status_from_bsd(info.pbi_status);
+            } else {
+                entry.exe_path = p.exe().map(|e| e.to_path_buf());
+                entry.status = bsd_run_state(pid_u)
+                    .map_or_else(|| status_from_sysinfo(p.status()), status_from_bsd);
+            }
             processes.push(entry);
         }
 
@@ -362,6 +395,18 @@ impl PlatformActions for MacActions {
         Ok(startup::list_plists())
     }
 
+    fn kill_single(&self, pid: u32) -> Result<()> {
+        self.kill_process(pid, macos_proc_start_timestamp(pid), false)
+    }
+
+    fn suspend_process(&self, pid: u32, suspend: bool) -> Result<()> {
+        self.suspend_process_checked(pid, macos_proc_start_timestamp(pid), suspend)
+    }
+
+    fn set_priority(&self, pid: u32, priority: PriorityClass) -> Result<()> {
+        self.set_priority_checked(pid, macos_proc_start_timestamp(pid), priority)
+    }
+
     fn kill_process(
         &self,
         pid: u32,
@@ -477,6 +522,36 @@ fn bsd_info(pid: u32) -> Option<libc::proc_bsdinfo> {
     (rc == expected).then_some(info)
 }
 
+fn macos_process_path(pid: u32) -> Option<PathBuf> {
+    let mut buf = [0u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
+    let written = unsafe {
+        libc::proc_pidpath(
+            i32::try_from(pid).ok()?,
+            buf.as_mut_ptr().cast(),
+            buf.len() as u32,
+        )
+    };
+    let path = buf
+        .get(..usize::try_from(written).ok()?)?
+        .split(|&byte| byte == 0)
+        .next()?;
+    (!path.is_empty()).then(|| std::ffi::OsStr::from_bytes(path).into())
+}
+
+fn macos_process_name(info: &libc::proc_bsdinfo) -> String {
+    let name = if info.pbi_name[0] == 0 {
+        info.pbi_comm.as_slice()
+    } else {
+        info.pbi_name.as_slice()
+    };
+    let bytes: Vec<_> = name
+        .iter()
+        .take_while(|&&byte| byte != 0)
+        .map(|&byte| byte as u8)
+        .collect();
+    String::from_utf8_lossy(&bytes).into_owned()
+}
+
 fn macos_start_timestamp(tvsec: u64, tvusec: u64) -> Option<i64> {
     if tvsec == 0 && tvusec == 0 {
         return None;
@@ -493,13 +568,16 @@ fn macos_proc_start_timestamp(pid: u32) -> Option<i64> {
 }
 
 fn verify_process_identity(pid: u32, expected_start_epoch_s: Option<i64>) -> Result<()> {
-    let Some(expected) = expected_start_epoch_s else {
-        return Ok(());
-    };
+    let expected = expected_start_epoch_s.ok_or_else(|| {
+        tm_core::TmError::platform(
+            "verify process identity",
+            "process creation identity unavailable",
+        )
+    })?;
     let Some(actual) = macos_proc_start_timestamp(pid) else {
         return Err(tm_core::TmError::ProcessNotFound { pid });
     };
-    if !tm_core::model::creation_timestamps_match(expected, actual) {
+    if expected != actual {
         return Err(tm_core::TmError::ProcessNotFound { pid });
     }
     Ok(())

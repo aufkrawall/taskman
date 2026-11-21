@@ -139,6 +139,7 @@ impl Tab {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ProcessIdentity {
     pub pid: u32,
+    /// The sampled creation token, in boot-relative ticks on Linux.
     pub start_epoch_s: Option<i64>,
 }
 
@@ -1090,8 +1091,8 @@ impl TaskManApp {
                 self.selection.retain_live(|identity| {
                     live.contains(&identity.pid)
                         && snapshot.process(identity.pid).is_some_and(|process| {
-                            process.start_epoch_s.is_none()
-                                || process.start_epoch_s == identity.start_epoch_s
+                            process.creation_identity().is_none()
+                                || process.creation_identity() == identity.start_epoch_s
                         })
                 });
             }
@@ -1112,10 +1113,12 @@ impl TaskManApp {
             .processes
             .iter()
             .filter_map(|process| {
-                process.start_epoch_s.map(|start_epoch_s| ProcessIdentity {
-                    pid: process.pid,
-                    start_epoch_s: Some(start_epoch_s),
-                })
+                process
+                    .creation_identity()
+                    .map(|start_epoch_s| ProcessIdentity {
+                        pid: process.pid,
+                        start_epoch_s: Some(start_epoch_s),
+                    })
             })
             .collect::<HashSet<_>>();
         self.process_rules_applied
@@ -1161,7 +1164,8 @@ impl TaskManApp {
             if process.pid == std::process::id() {
                 continue;
             }
-            let (Some(start_epoch_s), Some(path)) = (process.start_epoch_s, &process.exe_path)
+            let (Some(start_epoch_s), Some(path)) =
+                (process.creation_identity(), &process.exe_path)
             else {
                 continue;
             };
@@ -2317,7 +2321,7 @@ impl TaskManApp {
                 };
                 let selected_matches = self.selection.primary().is_some_and(|identity| {
                     snapshot.process(identity.pid).is_some_and(|p| {
-                        p.start_epoch_s == identity.start_epoch_s && q.matches_process(p)
+                        p.creation_identity() == identity.start_epoch_s && q.matches_process(p)
                     })
                 });
                 let identity = if selected_matches {
@@ -2448,7 +2452,8 @@ impl TaskManApp {
             .and_then(|s| s.process(identity.pid))
             .is_some_and(|p| {
                 !p.synthetic
-                    && (p.start_epoch_s.is_none() || p.start_epoch_s == identity.start_epoch_s)
+                    && (p.creation_identity().is_none()
+                        || p.creation_identity() == identity.start_epoch_s)
             })
     }
 

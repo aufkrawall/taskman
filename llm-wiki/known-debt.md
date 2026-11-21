@@ -67,15 +67,9 @@ items across Phases 2–6. The following concrete gaps remain:
   3x rasterization and the per-channel blend now live in `vendor/egui`. See
   `render-pipeline.md`. Linux follows fontconfig's `rgba` (`rgb`/`bgr` only) since
   2026-09-08; vertical orders and unknown/none stay grayscale.
-- **Software rendering performance: SUPERSEDED** (2026-09-01). `render_mode = software`
-  no longer means WARP -- a D3D12 driver emulated on the CPU at ~14 cores and 2.9 fps --
-  but a native CPU rasterizer that draws the UI directly. The old measurement was correct
-  and is retained here only to explain why the option used to carry a warning. Do not make
-  WARP the *primary* meaning of `Software` again -- but note that the WARP adapter selector
-  still exists and is correct where it sits: `main.rs::select_software_adapter` is installed
-  only on the wgpu path, which `preferred_renderers` reaches only after the native CPU
-  renderer has failed to come up. There it is the honest way to honour "no GPU"; it also
-  reports back through `store_render_mode` when no CPU adapter exists at all.
+- **Software rendering performance: SUPERSEDED.** CPU mode directly rasterizes
+  the UI. The old WARP path measured about 14 cores at 2.9 fps. D3D12 and Vulkan
+  select a surface-compatible GPU.
 - **Stack overflow under `TASKMAN_FPS_PROBE=1` on the software renderer.** Forcing
   continuous repaints crashes the process after a few seconds with "thread 'main' has
   overflowed its stack". Diagnostic-only: normal operation is event driven and stable

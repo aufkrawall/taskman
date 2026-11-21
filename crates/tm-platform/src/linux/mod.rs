@@ -52,6 +52,18 @@ impl SystemCollector for LinuxCollector {
                 )
                 .with_memory(MemoryRefreshKind::nothing().with_ram().with_swap()),
         );
+        // Bracket sysinfo's observation. An identity read only after the
+        // refresh could belong to a later occupant of the same PID.
+        let before_refresh: HashMap<_, _> = self
+            .sys
+            .processes()
+            .values()
+            .filter(|p| p.thread_kind().is_none())
+            .filter_map(|p| {
+                let pid = p.pid().as_u32();
+                linux_proc_start_ticks(pid).map(|ticks| (pid, ticks))
+            })
+            .collect();
         self.sys.refresh_processes_specifics(
             ProcessesToUpdate::All,
             true,
@@ -121,11 +133,17 @@ impl SystemCollector for LinuxCollector {
             entry.working_set_bytes = Some(p.memory());
             entry.commit_bytes = Some(p.virtual_memory());
             entry.peak_mem_bytes = proc_status_kb(pid_u, "VmHWM");
-            entry.start_epoch_s = btime_and_hz
-                .and_then(|(btime_s, clk_tck)| {
-                    linux_proc_start_timestamp_with(pid_u, btime_s, clk_tck)
-                })
-                .or_else(|| (p.start_time() > 0).then_some(p.start_time() as i64));
+            entry.boot_start_ticks = before_refresh
+                .get(&pid_u)
+                .copied()
+                .filter(|&before| linux_proc_start_ticks(pid_u) == Some(before));
+            entry.start_epoch_s =
+                entry
+                    .boot_start_ticks
+                    .zip(btime_and_hz)
+                    .and_then(|(ticks, (btime_s, clk_tck))| {
+                        linux_start_timestamp(btime_s, ticks, clk_tck)
+                    });
             entry.cpu_time_s = Some(p.accumulated_cpu_time() as f64 / 1000.0);
             entry.disk_read_bps = du.read_bytes as f64 / interval_s;
             entry.disk_write_bps = du.written_bytes as f64 / interval_s;
@@ -807,6 +825,26 @@ impl PlatformActions for LinuxActions {
         startup::set_enabled(item_id, enabled)
     }
 
+    fn kill_single(&self, pid: u32) -> Result<()> {
+        self.kill_process(pid, linux_proc_start_ticks(pid), false)
+    }
+
+    fn suspend_process(&self, pid: u32, suspend: bool) -> Result<()> {
+        self.suspend_process_checked(pid, linux_proc_start_ticks(pid), suspend)
+    }
+
+    fn set_priority(&self, pid: u32, priority: PriorityClass) -> Result<()> {
+        self.set_priority_checked(pid, linux_proc_start_ticks(pid), priority)
+    }
+
+    fn get_affinity_mask(&self, pid: u32) -> Result<u64> {
+        self.get_affinity_mask_checked(pid, linux_proc_start_ticks(pid))
+    }
+
+    fn set_affinity_mask(&self, pid: u32, mask: u64) -> Result<()> {
+        self.set_affinity_mask_checked(pid, linux_proc_start_ticks(pid), mask)
+    }
+
     fn kill_process(
         &self,
         pid: u32,
@@ -879,7 +917,7 @@ impl PlatformActions for LinuxActions {
         }
     }
     fn system_affinity_mask(&self) -> Result<u64> {
-        self.get_affinity_mask_checked(std::process::id(), None)
+        self.get_affinity_mask(std::process::id())
     }
     fn set_affinity_mask_checked(
         &self,
@@ -1090,9 +1128,9 @@ fn send_signal_checked(pid: u32, expected_start_epoch_s: Option<i64>, sig: i32) 
     if pid == 0 {
         return Err(tm_core::TmError::platform("kill", "system process"));
     }
-    let Some(expected) = expected_start_epoch_s else {
-        return send_signal(pid, sig);
-    };
+    let expected = expected_start_epoch_s.ok_or_else(|| {
+        tm_core::TmError::platform("kill", "process creation identity unavailable")
+    })?;
     let Ok(pid_t) = libc::pid_t::try_from(pid) else {
         return Err(tm_core::TmError::ProcessNotFound { pid });
     };
@@ -1161,29 +1199,29 @@ fn parse_proc_stat_btime(proc_stat: &str) -> Option<u64> {
     None
 }
 
-fn parse_proc_stat_starttime(pid_stat: &str) -> Option<u64> {
-    // Field 2 (comm) is enclosed in parens and may contain spaces or `)`.
-    let after_comm = pid_stat.rfind(')')?.checked_add(1)?;
-    let rest = pid_stat.get(after_comm..)?;
-    // Field 3 is index 0, so field 22 (starttime) is index 19.
-    rest.split_ascii_whitespace().nth(19)?.parse().ok()
+fn parse_proc_stat_starttime(pid_stat: &[u8]) -> Option<i64> {
+    // Field 2 (comm) can contain spaces, right parentheses and non-UTF-8 bytes.
+    let after_comm = pid_stat.iter().rposition(|&byte| byte == b')')? + 1;
+    let ticks = pid_stat[after_comm..]
+        .split(|byte| byte.is_ascii_whitespace())
+        .filter(|part| !part.is_empty())
+        .nth(19)?;
+    std::str::from_utf8(ticks).ok()?.parse().ok()
 }
 
-fn linux_start_timestamp(btime_s: u64, ticks_since_boot: u64, clk_tck: u64) -> Option<i64> {
+fn linux_start_timestamp(btime_s: u64, ticks_since_boot: i64, clk_tck: u64) -> Option<i64> {
     if btime_s == 0 || clk_tck == 0 {
         return None;
     }
-    let ticks_per_sec = i128::from(tm_core::model::HIGH_RES_TICKS_PER_SECOND);
-    let boot_ticks = i128::from(btime_s).checked_mul(ticks_per_sec)?;
-    let offset_ticks =
-        i128::from(ticks_since_boot).checked_mul(ticks_per_sec)? / i128::from(clk_tck);
-    i64::try_from(boot_ticks.checked_add(offset_ticks)?).ok()
+    let ticks_per_sec = i128::from(HIGH_RES_TICKS_PER_SECOND);
+    let boot_ticks = i128::from(btime_s) * ticks_per_sec;
+    let offset_ticks = i128::from(ticks_since_boot) * ticks_per_sec / i128::from(clk_tck);
+    i64::try_from(boot_ticks + offset_ticks).ok()
 }
 
-fn linux_proc_start_timestamp_with(pid: u32, btime_s: u64, clk_tck: u64) -> Option<i64> {
-    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-    let ticks = parse_proc_stat_starttime(&stat)?;
-    linux_start_timestamp(btime_s, ticks, clk_tck)
+fn linux_proc_start_ticks(pid: u32) -> Option<i64> {
+    let stat = std::fs::read(format!("/proc/{pid}/stat")).ok()?;
+    parse_proc_stat_starttime(&stat)
 }
 
 fn linux_clk_tck() -> Option<u64> {
@@ -1191,21 +1229,14 @@ fn linux_clk_tck() -> Option<u64> {
     u64::try_from(raw).ok().filter(|&hz| hz > 0)
 }
 
-fn linux_proc_start_timestamp(pid: u32) -> Option<i64> {
-    let proc_stat = std::fs::read_to_string("/proc/stat").ok()?;
-    let btime_s = parse_proc_stat_btime(&proc_stat)?;
-    let clk_tck = linux_clk_tck()?;
-    linux_proc_start_timestamp_with(pid, btime_s, clk_tck)
-}
-
-fn verify_process_identity(pid: u32, expected_start_epoch_s: Option<i64>) -> Result<()> {
-    let Some(expected) = expected_start_epoch_s else {
-        return Ok(());
-    };
-    let Some(actual) = linux_proc_start_timestamp(pid) else {
-        return Err(tm_core::TmError::ProcessNotFound { pid });
-    };
-    if !tm_core::model::creation_timestamps_match(expected, actual) {
+fn verify_process_identity(pid: u32, expected_start_ticks: Option<i64>) -> Result<()> {
+    let expected = expected_start_ticks.ok_or_else(|| {
+        tm_core::TmError::platform(
+            "verify process identity",
+            "process creation identity unavailable",
+        )
+    })?;
+    if linux_proc_start_ticks(pid) != Some(expected) {
         return Err(tm_core::TmError::ProcessNotFound { pid });
     }
     Ok(())
@@ -1373,7 +1404,7 @@ mod tests {
         assert_eq!(parse_proc_stat_btime(stat), Some(1_700_000_000));
 
         let pid_stat =
-            "42 (Web Content (1)) S 1 42 42 0 -1 4194304 10 0 2 0 1 0 0 0 20 0 4 0 12345 1000 50";
+            b"42 (Web Content (\xff)) S 1 42 42 0 -1 4194304 10 0 2 0 1 0 0 0 20 0 4 0 12345 1000 50";
         assert_eq!(parse_proc_stat_starttime(pid_stat), Some(12_345));
 
         let ts_a = linux_start_timestamp(1_700_000_000, 12_345, 100).unwrap();
@@ -1384,5 +1415,21 @@ mod tests {
             tm_core::model::epoch_timestamp_to_unix_seconds(ts_a),
             1_700_000_123
         );
+    }
+
+    #[test]
+    fn linux_identity_uses_raw_ticks_and_requires_observed_evidence() {
+        let pid = std::process::id();
+        let ticks = linux_proc_start_ticks(pid).unwrap();
+        assert!(verify_process_identity(pid, Some(ticks)).is_ok());
+        assert!(verify_process_identity(pid, Some(ticks + 1)).is_err());
+        assert!(verify_process_identity(pid, None).is_err());
+        let mut process = ProcessEntry::new(pid, "test");
+        process.boot_start_ticks = Some(ticks);
+        process.start_epoch_s = linux_start_timestamp(1_700_000_000, ticks, 100);
+        let corrected_time = linux_start_timestamp(1_700_000_010, ticks, 100);
+        assert_ne!(process.start_epoch_s, corrected_time);
+        process.start_epoch_s = corrected_time;
+        assert_eq!(process.creation_identity(), Some(ticks));
     }
 }

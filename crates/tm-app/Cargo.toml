@@ -11,8 +11,8 @@ path = "src/main.rs"
 
 [features]
 default = ["software", "wgpu", "glow"]
-# The native CPU renderer. Tried first: it needs no driver, and it is the only backend
-# that can do sub-pixel (ClearType) text. The GPU backends stay as fallbacks for now.
+# Native CPU rasterization is the default for desktop builds.
+# It draws directly and supports sub-pixel (ClearType) text.
 software = ["eframe/software"]
 wgpu = ["eframe/wgpu_no_default_features", "dep:wgpu"]
 glow = ["eframe/glow"]
@@ -40,7 +40,7 @@ rfd = "0.15"
 egui-winit = { path = "../../vendor/egui/crates/egui-winit", default-features = false }
 
 [package.metadata.notes]
-renderer = "wgpu primary, glow fallback; wayland+x11 enabled for native Linux"
+renderer = "CPU default; D3D12 on Windows, Vulkan on Linux, Metal on macOS"
 
 [target.'cfg(windows)'.dependencies]
 windows = { workspace = true, features = [

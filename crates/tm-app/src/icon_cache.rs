@@ -20,6 +20,7 @@ use tm_core::sync;
 
 /// Maximum textures kept alive (32×32 RGBA ≈ 4 KiB each → ~2 MiB at 512).
 const CACHE_CAP: usize = 512;
+const FAILURE_CACHE_CAP: usize = 512;
 /// Texture uploads allowed per frame (implement.md §10.4).
 const UPLOAD_BUDGET: usize = 6;
 /// Retry window for icons whose extraction failed (e.g. file locked).
@@ -41,21 +42,17 @@ enum Lookup {
 #[derive(Default)]
 struct Inner {
     /// exe path -> cached entry.
-    tex: HashMap<String, Entry>,
+    tex: HashMap<String, CachedTexture>,
+    failed: HashMap<String, std::time::Instant>,
     /// Paths queued or awaiting upload (dedup guard).
     queued: HashSet<String>,
     /// Monotonic clock for LRU: bumped on every cache hit.
     next_use: u64,
 }
 
-#[derive(Clone)]
-enum Entry {
-    Ready {
-        tex: egui::TextureHandle,
-        /// LRU clock value of the last hit; eviction removes the smallest.
-        last_used: u64,
-    },
-    Failed(std::time::Instant),
+struct CachedTexture {
+    tex: egui::TextureHandle,
+    last_used: u64,
 }
 
 /// Decoded RGBA result handed over from the worker.
@@ -97,7 +94,7 @@ impl IconCache {
         actions: &Arc<dyn tm_platform::actions::PlatformActions>,
         path: Option<&str>,
     ) -> Option<egui::TextureHandle> {
-        let Some(path) = path.and_then(usable_icon_path) else {
+        let Some(path) = path.and_then(icon_lookup_key) else {
             // No image at all (or only a blank one persisted by an older
             // build): ask for the OS default straight away.
             return self.default_app_icon(ctx, actions);
@@ -138,24 +135,17 @@ impl IconCache {
 
         let mut inner = sync::lock(&self.inner);
         let use_tick = inner.next_use;
-        let hit = match inner.tex.get_mut(key) {
-            Some(Entry::Ready { tex, last_used }) => {
-                *last_used = use_tick;
-                Lookup::Ready(tex.clone())
+        if let Some(cached) = inner.tex.get_mut(key) {
+            cached.last_used = use_tick;
+            let tex = cached.tex.clone();
+            inner.next_use += 1;
+            return Lookup::Ready(tex);
+        }
+        if let Some(at) = inner.failed.get(key) {
+            if at.elapsed() < FAILURE_RETRY_TTL {
+                return Lookup::Missing;
             }
-            Some(Entry::Failed(at)) => {
-                if at.elapsed() >= FAILURE_RETRY_TTL {
-                    inner.tex.remove(key);
-                    Lookup::Missing
-                } else {
-                    return Lookup::Missing;
-                }
-            }
-            None => Lookup::Missing,
-        };
-        if let Lookup::Ready(_) = hit {
-            inner.next_use = use_tick + 1;
-            return hit;
+            inner.failed.remove(key);
         }
         if !inner.queued.contains(key)
             && self.in_flight.load(std::sync::atomic::Ordering::Relaxed) < 64
@@ -239,55 +229,40 @@ impl IconCache {
                     ctx.load_texture(name, img, egui::TextureOptions::LINEAR)
                 });
                 inner.queued.remove(&d.path);
-                let entry = match tex {
-                    Some(t) => Entry::Ready {
-                        tex: t,
-                        last_used: inner.next_use,
-                    },
-                    None => Entry::Failed(std::time::Instant::now()),
-                };
-                inner.next_use += 1;
-                inner.tex.insert(d.path.clone(), entry);
+                if let Some(tex) = tex {
+                    let last_used = inner.next_use;
+                    inner.next_use += 1;
+                    inner.tex.insert(d.path, CachedTexture { tex, last_used });
+                } else {
+                    inner.failed.insert(d.path, std::time::Instant::now());
+                }
                 uploaded += 1;
             }
-            // Expire failed entries so transient failures can retry.
-            inner.tex.retain(|_, e| match e {
-                Entry::Failed(at) => at.elapsed() < FAILURE_RETRY_TTL,
-                Entry::Ready { .. } => true,
-            });
-            // Bound the cache, evicting least-recently-used entries beyond the
-            // cap. Failed entries carry no texture and are dropped first. (A
-            // plain HashMap key dump would evict RANDOM entries — including
-            // icons currently on screen — which made icons blink out once the
-            // cache filled up.)
+            inner
+                .failed
+                .retain(|_, at| at.elapsed() < FAILURE_RETRY_TTL);
+            if inner.failed.len() > FAILURE_CACHE_CAP {
+                let excess = inner.failed.len() - FAILURE_CACHE_CAP;
+                let mut oldest: Vec<_> = inner
+                    .failed
+                    .iter()
+                    .map(|(k, &at)| (k.clone(), at))
+                    .collect();
+                oldest.sort_by_key(|&(_, at)| at);
+                for (key, _) in oldest.into_iter().take(excess) {
+                    inner.failed.remove(&key);
+                }
+            }
             if inner.tex.len() > CACHE_CAP {
-                let mut excess = inner.tex.len() - CACHE_CAP;
-                let failed: Vec<String> = inner
+                let excess = inner.tex.len() - CACHE_CAP;
+                let mut by_use: Vec<_> = inner
                     .tex
                     .iter()
-                    .filter(|(_, e)| matches!(e, Entry::Failed(_)))
-                    .map(|(k, _)| k.clone())
+                    .map(|(k, cached)| (k.clone(), cached.last_used))
                     .collect();
-                for k in failed {
-                    if excess == 0 {
-                        break;
-                    }
-                    inner.tex.remove(&k);
-                    excess -= 1;
-                }
-                if excess > 0 {
-                    let mut by_use: Vec<(String, u64)> = inner
-                        .tex
-                        .iter()
-                        .filter_map(|(k, e)| match e {
-                            Entry::Ready { last_used, .. } => Some((k.clone(), *last_used)),
-                            Entry::Failed(_) => None,
-                        })
-                        .collect();
-                    by_use.sort_by_key(|(_, u)| *u);
-                    for (k, _) in by_use.into_iter().take(excess) {
-                        inner.tex.remove(&k);
-                    }
+                by_use.sort_by_key(|&(_, last_used)| last_used);
+                for (key, _) in by_use.into_iter().take(excess) {
+                    inner.tex.remove(&key);
                 }
             }
         }
@@ -300,7 +275,10 @@ impl IconCache {
             ctx.request_repaint();
         }
         if !leftover.is_empty() {
-            *sync::lock(&self.results) = leftover;
+            // The worker can publish more results while we upload this batch.
+            let mut results = sync::lock(&self.results);
+            leftover.append(&mut results);
+            *results = leftover;
             ctx.request_repaint();
         }
     }
@@ -344,6 +322,17 @@ fn icon_worker(
 pub fn row_icon_key(exe_path: Option<&std::path::Path>) -> Option<String> {
     let path = exe_path?;
     usable_icon_path(&path.to_string_lossy()).map(str::to_string)
+}
+
+fn icon_lookup_key(path: &str) -> Option<&str> {
+    #[cfg(target_os = "linux")]
+    {
+        // XDG resolves bare commands from Startup entries through desktop files.
+        let path = path.trim();
+        (!path.is_empty()).then_some(path)
+    }
+    #[cfg(not(target_os = "linux"))]
+    usable_icon_path(path)
 }
 
 /// Whether `path` can name an application's image at all.
@@ -525,6 +514,53 @@ mod tests {
             assert!(!inner.tex.contains_key(&path(i)), "stale app{i} evicted");
         }
         assert!(inner.tex.contains_key(&path(CACHE_CAP + 3)));
+    }
+
+    #[test]
+    fn failed_lookup_keeps_its_retry_delay_when_texture_cache_is_full() {
+        let ctx = egui::Context::default();
+        let cache = IconCache::default();
+        let texture = ctx.load_texture(
+            "test",
+            egui::ColorImage::filled([1, 1], egui::Color32::WHITE),
+            egui::TextureOptions::LINEAR,
+        );
+        {
+            let mut inner = sync::lock(&cache.inner);
+            for i in 0..CACHE_CAP {
+                inner.tex.insert(
+                    format!("/apps/{i}"),
+                    CachedTexture {
+                        tex: texture.clone(),
+                        last_used: i as u64,
+                    },
+                );
+            }
+        }
+        let path = "/apps/missing";
+        cache
+            .in_flight
+            .store(1, std::sync::atomic::Ordering::Relaxed);
+        sync::lock(&cache.results).push(Decoded {
+            path: path.to_string(),
+            icon: None,
+        });
+        let actions: Arc<dyn PlatformActions> = Arc::new(IconActions::missing(path));
+        assert!(matches!(
+            cache.lookup(&ctx, &actions, path),
+            Lookup::Missing
+        ));
+        assert_eq!(cache.len(), CACHE_CAP);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn startup_command_can_resolve_an_xdg_icon_by_basename() {
+        let ctx = egui::Context::default();
+        let actions: Arc<dyn PlatformActions> = Arc::new(IconActions::all());
+        let cache = IconCache::default();
+        assert!(pump(&cache, &ctx, &actions, Some("firefox")).is_some());
+        assert!(sync::lock(&cache.inner).tex.contains_key("firefox"));
     }
 
     /// Only a real executable path is a cache key; a bare process name is not a

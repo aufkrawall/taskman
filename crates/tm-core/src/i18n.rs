@@ -729,16 +729,9 @@ keys! {
         "This process's share of the disks' measured busy time. Measured from the disk events themselves - not from the I/O byte counters, which also count reads the cache served."
     ],
     RenderModeLabel => ["Grafikausgabe:", "Graphics:"],
-    RenderAuto => ["Automatisch", "Automatic"],
-    RenderCompat => ["Kompatibilität (OpenGL)", "Compatibility (OpenGL)"],
-    RenderSoftware => ["Software (CPU)", "Software (CPU)"],
-    RenderModeHint => [
-        "Automatisch bevorzugt den CPU-Renderer und weicht auf die GPU aus, falls er nicht startet. Kompatibilität erzwingt OpenGL.",
-        "Automatic prefers the CPU renderer and falls back to the GPU if it cannot start. Compatibility forces OpenGL."
-    ],
-    RenderSoftwareWarning => [
-        "Zeichnet ohne Grafiktreiber direkt auf der CPU. Nur dieser Modus kann ClearType-Subpixel-Text darstellen.",
-        "Draws directly on the CPU with no graphics driver. This is the only mode that can render ClearType sub-pixel text."
+    RenderBackendActive => [
+        "Aktiv: {}. Änderungen gelten ab dem nächsten Start.",
+        "Active: {}. Changes apply on restart."
     ],
     RestartRequired => [
         "Wird beim nächsten Start übernommen.",

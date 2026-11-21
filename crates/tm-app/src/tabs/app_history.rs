@@ -521,9 +521,11 @@ mod tests {
             Some(r"C:\Tools\app.exe")
         );
         // An absolute-path key needs no stored entry.
+        let absolute = std::env::temp_dir().join("app-history-icon-test.exe");
+        let key = absolute.to_str().expect("UTF-8 test path");
         assert_eq!(
-            resolve_row_icon_path(&icons, r"c:\other\b.exe", "b.exe", None).as_deref(),
-            Some(r"c:\other\b.exe")
+            resolve_row_icon_path(&icons, key, "test.exe", None).as_deref(),
+            Some(key)
         );
     }
 

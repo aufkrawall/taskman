@@ -1,3 +1,9 @@
+## 2026-11-21 - Explicit desktop renderer choices and review fixes
+
+- Packaged desktop builds default to native CPU rendering. Windows Settings offers D3D12 and Linux offers Vulkan. WGPU requires a surface-compatible hardware adapter. A failed GPU preference falls back to the native CPU renderer.
+- Unix collectors corroborate process creation across sysinfo’s refresh. macOS also reads the native image for actionable rows because sysinfo’s cache only distinguishes starts at whole-second precision. Linux keeps boot-relative start ticks separate from the wall-clock timestamp.
+- Startup uses its background-derived icon targets and preserves Linux executable basenames. Linux icon lookup checks the X11 XSettings owner before GTK fallback files. The icon cache bounds failed lookups independently and preserves concurrent worker results during upload.
+
 ## 2026-11-21 - App History showed Explorer folder icons: the shell answers a blank path with the CURRENT DIRECTORY
 
 - Follow-up report after the OS-default-icon fix: on App history, the rows with `0:00:00` CPU time showed a yellow folder instead of an app icon (`clang-22.exe`, `cmd.exe`, `code-tunnel.exe`, …).

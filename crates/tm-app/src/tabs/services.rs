@@ -409,7 +409,7 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
                             .latest_snapshot()
                             .as_ref()
                             .and_then(|snapshot| snapshot.process(pid))
-                            .and_then(|process| process.start_epoch_s);
+                            .and_then(|process| process.creation_identity());
                         app.pending_details_focus = Some(crate::app::PendingDetailsFocus(vec![
                             crate::app::ProcessIdentity { pid, start_epoch_s },
                         ]));
