@@ -1,3 +1,8 @@
+## 2026-11-21 - Released v0.1.32; fixed the CI-only ziglang path test
+
+- Released v0.1.32 (`ff92443`, tag `v0.1.32`): Windows x86_64/arm64 zip and setup installers, Linux x86_64/arm64 glibc tarballs (zigbuild), each with a `.sha256`. The published Windows GUI (mock) and Linux x86_64 binary (glibc, real backend under WSL) both pass `--selfcheck`; the tag stays on the documented version-bump commit, and CI is green on `main` afterwards.
+- CI had been red since `1fc00ed`: `tools/tests/test_build_linux.py::test_find_zig_uses_ziglang_package_when_not_on_path` compared `find_zig()`'s **resolved** package origin against the unresolved `tempfile` path. The hosted runner exposes `%TEMP%` through its 8.3 short name (`C:/Users/RUNNER~1/...`), so the two spellings never matched and `build.py --check` failed before any Rust build. Fixed by comparing `.resolve()` on both sides (`60f9bcb`). Reproduce locally by pointing `TMP`/`TEMP` at a junction: the old assertion fails, the canonical comparison passes.
+
 ## 2026-11-21 - Explicit desktop renderer choices and review fixes
 
 - Packaged desktop builds default to native CPU rendering. Windows Settings offers D3D12 and Linux offers Vulkan. WGPU requires a surface-compatible hardware adapter. A failed GPU preference falls back to the native CPU renderer.
