@@ -619,7 +619,7 @@ fn format_renderer_startup_error(
     explicit_pref: Option<&str>,
     failures: &[(eframe::Renderer, String)],
 ) -> String {
-    match failures {
+    let base = match failures {
         [] => {
             let pref = explicit_pref.map(str::trim).unwrap_or("");
             format!("taskman: no compiled renderer matches TASKMAN_RENDERER={pref:?}")
@@ -635,6 +635,16 @@ fn format_renderer_startup_error(
                 .join("; ");
             format!("taskman: failed to start GUI (all renderers failed — {details})")
         }
+    };
+    if failures
+        .iter()
+        .any(|(_, err)| err.contains("Dynamic loading not supported"))
+    {
+        format!(
+            "{base}\nnote: static musl builds lack dlopen() and cannot load X11/Wayland GUI libraries; use the glibc linux-x86_64 build for the desktop GUI (or run with --selfcheck for headless verification)"
+        )
+    } else {
+        base
     }
 }
 
@@ -1573,5 +1583,19 @@ mod tests {
         );
         assert!(!multi.contains("GPU renderer"), "{multi}");
         assert!(!multi.contains("Some("), "{multi}");
+
+        let musl = format_renderer_startup_error(
+            None,
+            &[(
+                eframe::Renderer::Software,
+                "winit EventLoopError: os error: LibraryOpenError(Dlopen { desc: \"Dynamic loading not supported\" })".into(),
+            )],
+        );
+        assert!(musl.contains("Dynamic loading not supported"), "{musl}");
+        assert!(
+            musl.contains("note: static musl builds lack dlopen()"),
+            "{musl}"
+        );
+        assert!(musl.contains("glibc linux-x86_64"), "{musl}");
     }
 }

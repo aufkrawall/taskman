@@ -14,6 +14,7 @@ verified at install time.
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import os
 import platform
 import re
@@ -121,6 +122,90 @@ def read_version() -> str:
 
 def have(tool: str) -> bool:
     return shutil.which(tool) is not None
+
+
+def find_cargo_tool(name: str) -> str | None:
+    """Resolve a cargo subcommand binary on PATH or in ``~/.cargo/bin``."""
+    found = shutil.which(name)
+    if found:
+        return found
+    exe = f"{name}.exe" if platform.system() == "Windows" else name
+    fallback = Path.home() / ".cargo" / "bin" / exe
+    return str(fallback) if fallback.is_file() else None
+
+
+def find_zig() -> Path | None:
+    """Locate ``zig`` on PATH, via the ``ziglang`` Python package, or Windows defaults."""
+    env_zig = os.environ.get("ZIG", "").strip()
+    if env_zig:
+        candidate = Path(env_zig)
+        if candidate.is_file():
+            return candidate
+
+    found = shutil.which("zig")
+    if found:
+        return Path(found)
+
+    exe_name = "zig.exe" if platform.system() == "Windows" else "zig"
+    try:
+        spec = importlib.util.find_spec("ziglang")
+    except (ImportError, ValueError):
+        spec = None
+    if spec is not None:
+        search_dirs: list[Path] = []
+        if spec.origin:
+            search_dirs.append(Path(spec.origin).resolve().parent)
+        if spec.submodule_search_locations:
+            search_dirs.extend(Path(loc) for loc in spec.submodule_search_locations)
+        for directory in search_dirs:
+            candidate = directory / exe_name
+            if candidate.is_file():
+                return candidate
+
+    if platform.system() == "Windows":
+        local_app_data = Path(
+            os.environ.get("LOCALAPPDATA") or (Path.home() / "AppData" / "Local")
+        )
+        app_data = Path(os.environ.get("APPDATA") or (Path.home() / "AppData" / "Roaming"))
+        direct_candidates = [
+            local_app_data / "Microsoft" / "WinGet" / "Links" / exe_name,
+            Path.home() / "scoop" / "shims" / exe_name,
+            Path.home() / "scoop" / "apps" / "zig" / "current" / exe_name,
+            Path(os.environ.get("ProgramData") or r"C:\ProgramData")
+            / "chocolatey"
+            / "bin"
+            / exe_name,
+        ]
+        for candidate in direct_candidates:
+            try:
+                if candidate.is_file():
+                    return candidate
+            except OSError:
+                continue
+
+        glob_roots: list[tuple[Path, str]] = [
+            (local_app_data / "Microsoft" / "WinGet" / "Packages", f"zig.zig*/**/{exe_name}"),
+            (app_data / "Python", f"Python*/site-packages/ziglang/{exe_name}"),
+            (
+                local_app_data / "Programs" / "Python",
+                f"Python*/Lib/site-packages/ziglang/{exe_name}",
+            ),
+            (
+                Path(os.environ.get("ProgramFiles") or r"C:\Program Files"),
+                f"Python*/Lib/site-packages/ziglang/{exe_name}",
+            ),
+        ]
+        for base, pattern in glob_roots:
+            try:
+                if not base.is_dir():
+                    continue
+                for candidate in sorted(base.glob(pattern), reverse=True):
+                    if candidate.is_file():
+                        return candidate
+            except OSError:
+                continue
+
+    return None
 
 
 # Non-host backends the project claims to support (README, AGENTS.md). The
@@ -233,18 +318,19 @@ def renderer_feature_check() -> bool:
 
 
 def linux_cross_command(profile: str, target: str = LINUX_TARGET) -> tuple[list[str], str] | None:
-    if have("cross"):
+    cross = find_cargo_tool("cross")
+    if cross is not None:
         return (
-            ["cross", "build", "--profile", profile, "--target", target],
+            [cross, "build", "--profile", profile, "--target", target],
             str(ROOT / "target" / target / profile),
         )
-    if have("cargo-zigbuild") and have("zig"):
+    if find_cargo_tool("cargo-zigbuild") is not None and find_zig() is not None:
         # Pin the glibc ABI floor. cargo-zigbuild's default tracks the host's
         # glibc (2.30+ here), which excludes older LTS distros; 2.17 is the
         # oldest glibc zig ships stubs for and what Rust's own gnu std targets.
         return (
             [
-                "cargo",
+                cargo(),
                 "zigbuild",
                 "--profile",
                 profile,
@@ -388,7 +474,15 @@ def build_linux(profile: str, target: str = LINUX_TARGET) -> tuple[Path | None, 
     cmd = linux_cross_command(profile, target)
     if cmd is not None:
         command, out_dir = cmd
-        if not run(command, env=release_rustflags(False) if profile != "dev" else None):
+        env = dict(release_rustflags(False) or {}) if profile != "dev" else {}
+        if len(command) > 1 and command[1] == "zigbuild":
+            zig_path = find_zig()
+            if zig_path is not None:
+                env["ZIG"] = str(zig_path)
+                zig_dir = str(zig_path.parent)
+                current_path = os.environ.get("PATH", "")
+                env["PATH"] = f"{zig_dir}{os.pathsep}{current_path}" if current_path else zig_dir
+        if not run(command, env=env or None):
             return None, True, "gnu"
         exe = Path(out_dir) / "taskman"
         if not exe.exists():
@@ -400,6 +494,21 @@ def build_linux(profile: str, target: str = LINUX_TARGET) -> tuple[Path | None, 
     # No glibc cross toolchain: the rust-lld/musl path works with rustup alone.
     exe, attempted = build_linux_musl(profile)
     return exe, attempted, "musl"
+
+
+def clean_stale_linux_artifacts(version: str, active_flavor: str) -> None:
+    """Remove opposite-flavor x86_64 Linux archives so stale musl/gnu files do not linger."""
+    if active_flavor == "gnu":
+        stale_base = f"taskman-v{version}-linux-x86_64-musl.tar.gz"
+    elif active_flavor == "musl":
+        stale_base = f"taskman-v{version}-linux-x86_64.tar.gz"
+    else:
+        return
+    for name in (stale_base, f"{stale_base}.sha256"):
+        stale = DIST / name
+        if stale.exists():
+            stale.unlink()
+            log(f"removed stale linux artifact: {stale}")
 
 
 def package_zip(name: str, files: list[tuple[Path, str]]) -> Path:
@@ -511,6 +620,24 @@ def audit_scan() -> bool:
     return ok
 
 
+def find_powershell() -> str | None:
+    """Return a runnable PowerShell binary, skipping inaccessible WindowsApps aliases."""
+    for candidate in ("pwsh", "powershell"):
+        path = shutil.which(candidate)
+        if path is None:
+            continue
+        try:
+            proc = subprocess.run(
+                [path, "-NoProfile", "-Command", "exit 0"],
+                capture_output=True,
+            )
+        except OSError:
+            continue
+        if proc.returncode == 0:
+            return path
+    return None
+
+
 def check_fork() -> bool:
     """Lint and test the vendored egui fork at vendor/egui.
 
@@ -527,7 +654,7 @@ def check_fork() -> bool:
         log("vendor/egui not present - skipping fork gate")
         return True
     script = ROOT / "tools" / "check-fork.ps1"
-    shell = shutil.which("pwsh") or shutil.which("powershell")
+    shell = find_powershell()
     if shell is None:
         log("no pwsh/powershell found - skipping fork gate (CI must provide one)")
         return True
@@ -719,9 +846,11 @@ def main() -> int:
                 else:
                     log(f"setup installer ready: {setup}")
 
+    linux_x86_64_flavor: str | None = None
     if linux_requested:
         exe, attempted, flavor = build_linux(profile)
         if exe is not None:
+            linux_x86_64_flavor = flavor
             log(f"linux binary ready ({flavor}): {exe}")
             files = [(exe, "taskman")]
             if LINUX_DESKTOP.exists():
@@ -759,6 +888,8 @@ def main() -> int:
             else:
                 dest = package_tar(name, files)
             log(f"packaged: {dest}")
+        if linux_x86_64_flavor is not None:
+            clean_stale_linux_artifacts(version, linux_x86_64_flavor)
 
     if failures:
         log(f"DONE with {failures} failure(s)")

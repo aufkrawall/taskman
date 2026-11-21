@@ -1,3 +1,10 @@
+## 2026-11-21 - GUI-capable Linux glibc cross-build via `ziglang`, `build.py` hardening, and static-musl startup hint
+
+- Provisioned `ziglang` (`0.17.1`, `zig.exe` in user site-packages) on the build host so `cargo-zigbuild` has an out-of-the-box `zig` compiler without requiring manual `PATH` edits.
+- Hardened `build.py`: added `find_cargo_tool`, `find_zig` (`ZIG`, `PATH`, Python `ziglang` package, and Windows `WinGet`/`Scoop`/`Chocolatey`/Python fallback paths), `ZIG`/`PATH` env propagation into `cargo zigbuild` (keeping the `.2.17` glibc floor), `clean_stale_linux_artifacts` (removes opposite-flavor `linux-x86_64` archives and `.sha256` from `dist/`), and `find_powershell` (probes `pwsh`/`powershell` cleanly so inaccessible WindowsApps `pwsh.EXE` stubs fall back to `powershell` in `check_fork()`).
+- Added unit tests in `tools/tests/test_build_linux.py` covering `find_zig()`, `linux_cross_command()`, `clean_stale_linux_artifacts()`, and `find_powershell()`.
+- Updated `crates/tm-app/src/main.rs::format_renderer_startup_error` (+ unit test) to append an actionable static-musl hint whenever startup fails with `"Dynamic loading not supported"`.
+
 ## 2026-11-21 - Renderer fallback, `EventLoop can't be recreated` masking, and startup error clarity
 
 - Investigated user report on `taskman-v0.1.31-linux-x86_64-musl.tar.gz` (Linux Mint 22.3 XFCE) failing with `taskman: no usable GPU renderer found: Some("winit EventLoopError: EventLoop can't be recreated")` and later starting normally:

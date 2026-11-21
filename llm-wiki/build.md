@@ -1,6 +1,6 @@
 # Build System
 
-Last verified: 2026-09-24
+Last verified: 2026-11-21
 
 Primary sources:
 - `build.py`
@@ -20,8 +20,11 @@ selection use the same host target. Regression: `python tools/tests/test_build_h
    Windows this must produce both `taskman.exe` and `taskman-service.exe`.
 2. Linux x86_64 release build **by default** — the workspace ships a
    real Linux collector (`crates/tm-platform/src/linux/`). Toolchain
-   resolution: `cross` first, then `cargo-zigbuild` when `zig` is also
-   available (both produce a glibc binary, artifact
+   resolution (`linux_cross_command`, `find_cargo_tool`, `find_zig`): `cross` first,
+   then `cargo-zigbuild` paired with `zig` (searching `ZIG`, `PATH`, Python's
+   `ziglang` package, and Windows `WinGet`/`Scoop`/`Chocolatey`/Python locations;
+   `build_linux` injects `ZIG` and prepends `zig.parent` to `PATH` when invoking
+   `cargo zigbuild`; both produce a glibc binary, artifact
    `taskman-v<version>-linux-x86_64`; the zigbuild path is
    pinned to a glibc 2.17 ABI floor for old-LTS compatibility). Without either, the
    self-contained path is used: `x86_64-unknown-linux-musl` std (installed
@@ -30,12 +33,16 @@ selection use the same host target. Regression: `python tools/tests/test_build_h
    compiler, container or zig, so `python build.py` always produces a Linux
    artifact on a rustup machine. **Static musl has no `dlopen`, so this
    artifact is headless/`--selfcheck` only**: winit cannot load Wayland/X11
-   and the GUI cannot start on a glibc distro. Prefer `cross`/`cargo-zigbuild`
-   for a GUI-capable glibc artifact; `build.py` warns when it falls back.
+   and the GUI cannot start on a glibc distro (`tm-app` now prints an explicit
+   note if `"Dynamic loading not supported"` is seen at GUI startup). Prefer
+   `cross`/`cargo-zigbuild`+`ziglang` for a GUI-capable glibc artifact; `build.py`
+   warns when it falls back, and `clean_stale_linux_artifacts()` removes any
+   opposite-flavor `linux-x86_64` archive (`.tar.gz` and `.sha256`) from `dist/`.
    It creates an empty `target/cross-stubs/libdl.a`
    because `libloading` emits `-ldl`, which musl folds into libc. The Linux
    step is skipped only when neither path is available (or with
-   `--host-only`); `--require-all-targets` makes a skip fatal.
+   `--host-only`); `--require-all-targets` makes a skip fatal. Regression:
+   `python tools/tests/test_build_linux.py`.
 3. Packaging into `dist/`: Windows → `.zip` containing the GUI and service
    plus the self-contained setup installer
    `taskman-v<version>-<platform>-setup.exe` (see `installer.md`); Linux →
@@ -131,7 +138,7 @@ git config --local lfs.allowincompletepush true
   The host gate cannot see `cfg`-gated platform code, and this is exactly the
   check that was missing when both non-Windows backends stopped compiling
   (2026-09-08 audit; CI installs both targets so the gate is complete there).
-- `tools/check-fork.ps1` -- the vendored egui fork's own fmt/clippy/test. **Not
+- `tools/check-fork.ps1` -- the vendored egui fork's own fmt/clippy/test (`find_powershell()` probes `pwsh` then `powershell` so an inaccessible WindowsApps `pwsh` stub falls back cleanly). **Not
   redundant:** `cargo clippy --workspace -- -D warnings` only passes those flags to the
   packages cargo selected, and `vendor/egui` is a deliberately excluded separate
   workspace. Without this step the fork's crates sit outside the gate entirely.

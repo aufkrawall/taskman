@@ -15,6 +15,9 @@
   - `winit::event_loop::EventLoopBuilder::build()` now resets `EVENT_LOOP_CREATED` when backend initialization returns an error instead of leaving the process-wide guard set after no event loop was created.
   - GUI startup (`tm-app`) now aborts renderer fallback immediately on `eframe::Error::WinitEventLoop(_)` instead of retrying other renderers and overwriting the real display-server error with `EventLoop can't be recreated`, flushes early startup logs to disk on fatal failure, and reports a plain failure message naming each attempted renderer instead of `"no usable GPU renderer found: Some(...)"`.
   - `RenderMode::Software` and `RenderMode::Compatibility` now preserve runtime fallback renderers (so `RenderMode::Software` can actually reach `Wgpu` with `select_software_adapter` and `Compatibility` falls back to `Software`/`Wgpu` instead of exiting immediately on GL failure or single-feature builds) while updating `active_render_mode()` to reflect the fallback path actually started.
+- **Linux glibc release cross-build discovery & static-musl startup hint:**
+  - `build.py` now locates `zig` across `ZIG`, `PATH`, Python's `ziglang` package, and standard Windows install paths (`WinGet`, `Scoop`, `Chocolatey`, per-user/system Python), supplies `ZIG`/`PATH` to `cargo zigbuild`, cleans stale opposite-flavor (`-musl.tar.gz` vs glibc `.tar.gz`) Linux archives from `dist/`, and falls back from inaccessible WindowsApps `pwsh` aliases to `powershell` in `check_fork()`.
+  - `tm-app` now appends an actionable static-musl note directing users to the glibc `linux-x86_64` build (or `--selfcheck`) whenever startup fails with `"Dynamic loading not supported"`.
 
 ## 0.1.31 - 2026-11-18
 
