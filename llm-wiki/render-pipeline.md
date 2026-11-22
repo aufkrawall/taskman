@@ -36,7 +36,9 @@ tm-app/theme.rs                     the ONLY place that decides the sub-pixel mo
         |-- Shape::Text        -> glyph blit, per-channel ClearType blend
         |-- pixel-aligned Rect -> span::fast_rect fill (flat + Shape::Vec containers)
         \-- everything else    -> epaint::Tessellator -> triangle rasterizer
-[FORK] eframe Renderer::Software -> softbuffer -> BitBlt / SHM / wl_shm / CoreGraphics
+[FORK] eframe Renderer::Software
+        |-- Windows: own Win32 DIB surface -> BitBlt (checked) + ValidateRect per blitted rect
+        \-- X11/Wayland/macOS: softbuffer -> SHM / wl_shm / CoreGraphics
 ```
 
 ## The rules that are load-bearing
@@ -68,6 +70,27 @@ channel against its own coverage. Two interlocks enforce this:
 - `software_integration.rs` reads the mode from the **atlas** (`f.options().subpixel`),
   not from the style, so the blend mode and the rasterization mode agree by construction.
   Disagreement is the one failure here that does not error — it just draws wrong colours.
+
+**On Windows the presentation path is ours, not softbuffer's.** `platform_surface` in
+`software_integration.rs` owns a `CreateCompatibleDC` + top-down 32-bpp `CreateDIBSection`
+surface and presents with `BitBlt`, for four reasons that are all failure behaviour:
+
+- softbuffer 0.4.8 ignores `BitBlt`'s return value, `ValidateRect`s the **whole** window and
+  still marks the buffer presented; a failed blit therefore froze garbage in place with no
+  error. Ours checks every `BitBlt`, validates only the rects that succeeded, and on failure
+  clears `age()` and retries in 50 ms.
+- A `WM_PAINT` and an app-requested repaint arrive as the same winit `RedrawRequested`.
+  `GetUpdateRect` (queried **before** `DefWindowProcW` validates it) is merged into the
+  present set, so a frame with zero dirty egui tiles still blits the region Windows needs.
+- GDI allocation is fallible: every step returns `Result`, nothing asserts. The old path
+  aborted the process on a failed allocation, because release builds panic on assert.
+- The buffer is a memory DIB under our control, so the "presented while visible" flag
+  (`should_force_full_paint`) can force a full repaint after a reveal or a display change
+  instead of trusting a frame counter.
+
+Paint and present failures are **never fatal**: they warn, mark the surface unpainted and
+schedule a 50 ms retry. `EventResult::Wait` (not `RepaintNow`) is returned from inside
+`WM_PAINT`, because scheduling a repaint synchronously there recurses into the same paint.
 
 ## Sub-pixel rendering, concretely
 
@@ -169,6 +192,13 @@ tests cannot cover, and the CPU-cost measurements in the plan need it too.
 
 ## Still open
 
+- **Window-lifecycle recovery is tested, not seen.** The present/restore paths added for
+  the reliability audit (`WM_DISPLAYCHANGE` invalidation, OS-update-rect merge, paint-error
+  retry, paint-before-acknowledge restore, tray-failure rescue, off-screen placement repair)
+  are covered by unit tests over their pure policy and by the whole workspace gate, but the
+  scenario that matters — a display mode change, an exclusive-fullscreen game, a hung
+  renderer — cannot be reproduced headlessly. `tools/test-resize.ps1` and the
+  `TASKMAN_FPS_PROBE=1` overlay are the intended manual checks.
 - **DirectWrite as the glyph source.** The blend parameters already come from DirectWrite;
   the *rasterization* is still epaint's own 3x path. `IDWriteGlyphRunAnalysis` with
   `DWRITE_TEXTURE_CLEARTYPE_3x1` would give bitmaps identical to Windows'. It also requires
@@ -179,7 +209,7 @@ tests cannot cover, and the CPU-cost measurements in the plan need it too.
   - Uniform untextured triangle fast paths (opaque and translucent) with single-branch edge testing.
   - Text blitting with hoisted `linear_u16` LUTs, clamped row slices, and solid-glyph interior bypass.
   - Full-target memset clear path.
-  - 64×64 tile damage tracking (`egui_software::damage`, `Painter::paint_shapes_damaged`, `softbuffer::Buffer::present_with_damage` when `age() == 1` and not restored from hidden), skipping unchanged frames completely and repainting/presenting only dirty tiles on partial updates.
+  - 64×64 tile damage tracking (`egui_software::damage`, `Painter::paint_shapes_damaged`, the `age() == 1` present-in-damage path — `BitBlt` + `ValidateRect` per dirty rect on Windows, `softbuffer::Buffer::present_with_damage` elsewhere — and not restored from hidden), skipping unchanged frames completely and repainting/presenting only dirty tiles on partial updates.
   - Taskman process table caching by reference, avoiding per-frame vector cloning.
   - IconCache O(1) lazy expiration and direct unmultiplied upload.
   Remaining potential work: SIMD for span fills.

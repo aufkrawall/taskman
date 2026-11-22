@@ -448,16 +448,16 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
                     }
                     if menu::item(ui, i18n::tr(K::OnlineSearch)).clicked() {
                         let url = crate::search::online_search_url(&item.name);
-                        if let Err(e) = app.actions.open_url(&url) {
-                            app.shared.toast(i18n::trf(K::ErrMsg, &[&e.to_string()]));
-                        }
+                        let actions = app.actions.clone();
+                        app.run_shell_action(ui.ctx(), move || actions.open_url(&url));
                         ui.close();
                     }
                     if menu::item(ui, i18n::tr(K::OpenFileLocation)).clicked()
                         && let Some(exe) = exe_from_command(&item.command)
-                        && let Err(e) = app.actions.open_file_location(&exe)
                     {
-                        app.shared.toast(i18n::trf(K::ErrMsg, &[&e.to_string()]));
+                        let actions = app.actions.clone();
+                        app.run_shell_action(ui.ctx(), move || actions.open_file_location(&exe));
+                        ui.close();
                     }
                 });
             }

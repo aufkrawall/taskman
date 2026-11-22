@@ -2523,10 +2523,11 @@ fn network_page(app: &mut TaskManApp, ui: &mut egui::Ui, pal: &Palette, entry: &
                     if ui
                         .add(egui::Button::new(i18n::tr(K::OpenLocationSettings)).small())
                         .clicked()
-                        && let Err(error) = app.actions.open_url("ms-settings:privacy-location")
                     {
-                        app.shared
-                            .toast(i18n::trf(K::ErrMsg, &[&error.to_string()]));
+                        let actions = app.actions.clone();
+                        app.run_shell_action(ui.ctx(), move || {
+                            actions.open_url("ms-settings:privacy-location")
+                        });
                     }
                 }
                 if let Some(ipv4) = &net.ipv4 {

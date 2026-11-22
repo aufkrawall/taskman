@@ -103,6 +103,18 @@ pub enum Event {
     /// On touch-up first send `PointerButton{pressed: false, …}` followed by `PointerLeft`.
     PointerGone,
 
+    /// TASKMAN-FORK: `button` was released outside the window, or the platform took
+    /// the mouse capture away while it was down.
+    ///
+    /// The button state is cleared, but unlike [`Self::PointerButton`] with
+    /// `pressed: false` this never synthesizes a click: the user did not release
+    /// over whatever widget happened to be under the press position, so activating
+    /// it would be wrong (a stolen capture during a press would "click" a button).
+    PointerButtonReleasedOutside {
+        /// What mouse button? For touches, use [`PointerButton::Primary`].
+        button: PointerButton,
+    },
+
     /// Zoom scale factor this frame (e.g. from a pinch gesture).
     ///
     /// * `zoom = 1`: no change.

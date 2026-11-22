@@ -1469,10 +1469,8 @@ fn context_menu(app: &mut TaskManApp, ui: &mut egui::Ui, row: &RowData) {
     });
     if menu::item(ui, i18n::tr(K::OnlineSearch)).clicked() {
         let url = search::online_search_url(&row.name);
-        if let Err(error) = app.actions.open_url(&url) {
-            app.shared
-                .toast(i18n::trf(K::ErrMsg, &[&error.to_string()]));
-        }
+        let actions = app.actions.clone();
+        app.run_shell_action(ui.ctx(), move || actions.open_url(&url));
         ui.close();
     }
     menu::separator(ui);
@@ -1482,11 +1480,10 @@ fn context_menu(app: &mut TaskManApp, ui: &mut egui::Ui, row: &RowData) {
             menu::item_enabled(ui, i18n::tr(K::FileProperties), row.icon_path.is_some())
                 .on_disabled_hover_text(i18n::tr(K::NoFileForProcess));
         if file_properties.clicked() {
-            if let Some(path) = row.icon_path.as_deref()
-                && let Err(error) = app.actions.open_properties(path)
-            {
-                app.shared
-                    .toast(i18n::trf(K::ErrMsg, &[&error.to_string()]));
+            if let Some(path) = row.icon_path.as_deref() {
+                let actions = app.actions.clone();
+                let path = path.to_owned();
+                app.run_shell_action(ui.ctx(), move || actions.open_properties(&path));
             }
             ui.close();
         }

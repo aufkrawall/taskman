@@ -296,6 +296,186 @@ pub fn set_cloaked(hwnd: isize, cloaked: bool) {
     );
 }
 
+/// Whether DWM currently cloaks `hwnd` (by any party: this process's restore
+/// cloak, a virtual-desktop switch, or the shell). `false` when it cannot be
+/// read, so an unreadable answer never blocks an uncloak decision.
+pub fn is_cloaked(hwnd: isize) -> bool {
+    use windows::Win32::Graphics::Dwm::{DWMWA_CLOAKED, DwmGetWindowAttribute};
+
+    let mut value: u32 = 0;
+    let read = unsafe {
+        DwmGetWindowAttribute(
+            HWND(hwnd as *mut std::ffi::c_void),
+            DWMWA_CLOAKED,
+            (&raw mut value).cast(),
+            std::mem::size_of::<u32>() as u32,
+        )
+    };
+    read.is_ok() && value != 0
+}
+
+/// Fit `rect` (`[left, top, right, bottom]`, pixels) into `bounds` (the same
+/// layout): the window never exceeds `bounds` and is moved so every edge, title
+/// bar included, is inside it. Pure so the policy is testable without a second
+/// monitor.
+///
+/// A degenerate `bounds` (a display stack that reports nothing usable) returns
+/// `rect` untouched instead of panicking in `clamp` with `min > max`.
+pub(crate) fn fit_rect_to_bounds(rect: [i32; 4], bounds: [i32; 4]) -> [i32; 4] {
+    let bounds_w = bounds[2] - bounds[0];
+    let bounds_h = bounds[3] - bounds[1];
+    if bounds_w <= 0 || bounds_h <= 0 {
+        return rect;
+    }
+    let w = (rect[2] - rect[0]).clamp(1, bounds_w);
+    let h = (rect[3] - rect[1]).clamp(1, bounds_h);
+    let left = rect[0].clamp(bounds[0], bounds[2] - w);
+    let top = rect[1].clamp(bounds[1], bounds[3] - h);
+    [left, top, left + w, top + h]
+}
+
+/// Move/shrink a normal (not minimized, not maximized) window so it is fully
+/// inside the virtual desktop — the bounding box of every monitor, NOT the work
+/// area of the monitor it happens to be nearest.
+///
+/// The distinction matters: a window deliberately spanning two monitors is
+/// wider than either one, and fitting it into the nearest work area would
+/// shrink it on every restore. Only a window that reaches outside the whole
+/// desktop (an unplugged monitor, a resolution drop, a save from a layout that
+/// no longer exists) is moved, and only one larger than the entire desktop is
+/// shrunk. Returns whether the window was moved.
+///
+/// Safe to call from the UI thread; it never activates the window.
+pub fn ensure_window_on_screen(hwnd: isize) -> bool {
+    use windows::Win32::Foundation::RECT;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GetSystemMetrics, GetWindowRect, IsZoomed, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN,
+        SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, SWP_NOACTIVATE, SWP_NOZORDER,
+    };
+
+    let Some(window) = live_window(hwnd) else {
+        return false;
+    };
+    unsafe {
+        if IsIconic(window).as_bool() || IsZoomed(window).as_bool() {
+            return false;
+        }
+        let mut rect = RECT::default();
+        if GetWindowRect(window, &mut rect).is_err() {
+            return false;
+        }
+        let (left, top) = (
+            GetSystemMetrics(SM_XVIRTUALSCREEN),
+            GetSystemMetrics(SM_YVIRTUALSCREEN),
+        );
+        let (width, height) = (
+            GetSystemMetrics(SM_CXVIRTUALSCREEN),
+            GetSystemMetrics(SM_CYVIRTUALSCREEN),
+        );
+        let desktop = [left, top, left + width.max(0), top + height.max(0)];
+        let current = [rect.left, rect.top, rect.right, rect.bottom];
+        let fitted = fit_rect_to_bounds(current, desktop);
+        if fitted == current {
+            return false;
+        }
+        tracing::info!(
+            ?current,
+            ?fitted,
+            ?desktop,
+            "moving window back onto the screen"
+        );
+        SetWindowPos(
+            window,
+            None,
+            fitted[0],
+            fitted[1],
+            fitted[2] - fitted[0],
+            fitted[3] - fitted[1],
+            SWP_NOZORDER | SWP_NOACTIVATE,
+        )
+        .is_ok()
+    }
+}
+
+/// Outer window position in physical screen pixels, `None` for a dead,
+/// minimized or maximized window (whose rect is not the restore geometry).
+pub fn window_outer_position_px(hwnd: isize) -> Option<[i32; 2]> {
+    use windows::Win32::Foundation::RECT;
+    use windows::Win32::UI::WindowsAndMessaging::{GetWindowRect, IsZoomed};
+
+    let window = live_window(hwnd)?;
+    unsafe {
+        if IsIconic(window).as_bool() || IsZoomed(window).as_bool() {
+            return None;
+        }
+        let mut rect = RECT::default();
+        GetWindowRect(window, &mut rect).ok()?;
+        Some([rect.left, rect.top])
+    }
+}
+
+/// Move the window to a physical-pixel position without resizing or
+/// activating it. Used at startup instead of a logical position, which winit
+/// would scale by the PRIMARY monitor's DPI whatever monitor it names.
+pub fn set_window_outer_position_px(hwnd: isize, pos: [i32; 2]) {
+    use windows::Win32::UI::WindowsAndMessaging::{SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER};
+
+    let Some(window) = live_window(hwnd) else {
+        return;
+    };
+    unsafe {
+        let _ = SetWindowPos(
+            window,
+            None,
+            pos[0],
+            pos[1],
+            0,
+            0,
+            SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+        );
+    }
+}
+
+/// Last-resort visibility repair for a window that should be on screen:
+/// uncloak it, restore it if iconic and show it if hidden. Deliberately
+/// separate from [`force_foreground`], which must not uncloak because a
+/// restore cloaks on purpose for a few frames.
+pub fn ensure_presentable(hwnd: isize) {
+    use windows::Win32::UI::WindowsAndMessaging::{SW_RESTORE, SW_SHOW, ShowWindowAsync};
+
+    let Some(window) = live_window(hwnd) else {
+        return;
+    };
+    if is_cloaked(hwnd) {
+        set_cloaked(hwnd, false);
+    }
+    unsafe {
+        if IsIconic(window).as_bool() {
+            let _ = ShowWindowAsync(window, SW_RESTORE);
+        } else if !IsWindowVisible(window).as_bool() {
+            let _ = ShowWindowAsync(window, SW_SHOW);
+        }
+    }
+}
+
+/// Raise `target` above everything in its band, including a lingering
+/// `WS_EX_TOPMOST` borderless game window that a plain `HWND_TOP` cannot
+/// outrank. Promotes through `HWND_TOPMOST` and, unless always-on-top is on,
+/// demotes straight back so the window does not stay pinned.
+unsafe fn raise_above_topmost(
+    target: HWND,
+    extra_flags: windows::Win32::UI::WindowsAndMessaging::SET_WINDOW_POS_FLAGS,
+) {
+    use std::sync::atomic::Ordering;
+    let flags = SWP_NOMOVE | SWP_NOSIZE | extra_flags;
+    unsafe {
+        let _ = SetWindowPos(target, Some(HWND_TOPMOST), 0, 0, 0, 0, flags);
+        if !STRICT_TOPMOST_ENABLED.load(Ordering::Acquire) {
+            let _ = SetWindowPos(target, Some(HWND_NOTOPMOST), 0, 0, 0, 0, flags);
+        }
+    }
+}
+
 /// `hwnd` as a live window handle, or `None` for zero and stale handles.
 fn live_window(hwnd: isize) -> Option<HWND> {
     if hwnd == 0 {
@@ -399,6 +579,7 @@ unsafe fn activate_owned(target: HWND) {
             0,
             SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW,
         );
+        raise_above_topmost(target, SWP_NOACTIVATE);
         let _ = BringWindowToTop(target);
         let _ = SetForegroundWindow(target);
         let _ = SetFocus(Some(target));
@@ -448,6 +629,7 @@ unsafe fn activate_foreign(target: HWND) {
             0,
             SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW | SWP_ASYNCWINDOWPOS,
         );
+        raise_above_topmost(target, SWP_ASYNCWINDOWPOS | SWP_NOACTIVATE);
         // Activating a window of another input queue queues the activation
         // to that queue; it does not wait for the owner to process it.
         let _ = SetForegroundWindow(target);
@@ -753,6 +935,69 @@ mod tests {
             let _ = DestroyWindow(hwnd);
             let _ = ClipCursor(None);
         }
+    }
+
+    /// The work-area fit is the policy behind every "window is off screen"
+    /// repair, so each way a layout can go wrong is pinned.
+    #[test]
+    fn fit_rect_keeps_windows_fully_inside_the_desktop() {
+        let desktop = [0, 0, 1920, 1040];
+        // Already inside: untouched.
+        assert_eq!(
+            fit_rect_to_bounds([100, 100, 900, 700], desktop),
+            [100, 100, 900, 700]
+        );
+        // A window deliberately spanning two monitors is WIDER than one monitor
+        // but still inside the desktop, so it must not be shrunk.
+        assert_eq!(
+            fit_rect_to_bounds([0, 100, 3840, 900], [0, 0, 3840, 1040]),
+            [0, 100, 3840, 900]
+        );
+        // On a monitor that was unplugged (far right): pulled back in, size kept.
+        assert_eq!(
+            fit_rect_to_bounds([3000, 200, 3800, 800], desktop),
+            [1120, 200, 1920, 800]
+        );
+        // Negative coordinates of a monitor that no longer exists.
+        assert_eq!(
+            fit_rect_to_bounds([-1900, -50, -1100, 550], desktop),
+            [0, 0, 800, 600]
+        );
+        // Larger than the whole (shrunken) desktop: shrunk to it.
+        assert_eq!(
+            fit_rect_to_bounds([50, 50, 2250, 1450], [0, 0, 1280, 720]),
+            [0, 0, 1280, 720]
+        );
+        // Hanging off the bottom: title bar and bottom edge both visible.
+        assert_eq!(
+            fit_rect_to_bounds([10, 900, 810, 1500], desktop),
+            [10, 440, 810, 1040]
+        );
+        // Offset desktop (secondary monitor left of the primary).
+        assert_eq!(
+            fit_rect_to_bounds([-100, 10, 700, 610], [-1920, 0, 0, 1040]),
+            [-800, 10, 0, 610]
+        );
+        // A display stack that reports nothing usable must not panic in `clamp`
+        // (this runs on the UI thread, right where the repair was meant to help).
+        assert_eq!(
+            fit_rect_to_bounds([10, 20, 900, 700], [0, 0, 0, 0]),
+            [10, 20, 900, 700]
+        );
+        assert_eq!(
+            fit_rect_to_bounds([10, 20, 900, 700], [100, 100, 50, 50]),
+            [10, 20, 900, 700]
+        );
+    }
+
+    #[test]
+    fn screen_repairs_ignore_dead_handles() {
+        assert!(!ensure_window_on_screen(0));
+        assert!(!ensure_window_on_screen(0x12345));
+        assert_eq!(window_outer_position_px(0), None);
+        set_window_outer_position_px(0x12345, [0, 0]);
+        ensure_presentable(0);
+        assert!(!is_cloaked(0));
     }
 
     /// The merge partner is only ever a live foreign foreground thread.

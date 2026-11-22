@@ -2162,6 +2162,10 @@ fn run_task_dialog_key_action(
     None
 }
 
+/// Result slot of an asynchronous "Browse..." file pick: `None` while the
+/// system dialog is open, `Some(None)` when it was cancelled.
+type BrowseSlot = std::sync::Arc<std::sync::Mutex<Option<Option<std::path::PathBuf>>>>;
+
 pub fn run_task_dialog(app: &mut TaskManApp, ctx: &egui::Context, _pal: &theme::Palette) {
     let focus_id = egui::Id::new("run-task-dialog-focus");
     let restore_id = egui::Id::new("run-task-dialog-restore-focus");
@@ -2176,6 +2180,25 @@ pub fn run_task_dialog(app: &mut TaskManApp, ctx: &egui::Context, _pal: &theme::
     {
         let captured = capture_focus(ctx);
         ctx.data_mut(|data| data.insert_temp(restore_id, captured));
+    }
+
+    // Collect a finished "Browse..." pick (the system dialog runs on its own
+    // thread; see the Browse action below).
+    let browse_id = egui::Id::new("run-task-dialog-browse");
+    let browse_slot: Option<BrowseSlot> = ctx.data(|data| data.get_temp(browse_id));
+    let mut browse_open = browse_slot.is_some();
+    if let Some(slot) = &browse_slot
+        && let Some(result) = tm_core::sync::lock(slot).take()
+    {
+        ctx.data_mut(|data| data.remove_temp::<BrowseSlot>(browse_id));
+        browse_open = false;
+        if let Some(path) = result {
+            app.run_dialog_text = path.to_string_lossy().into_owned();
+            // A successful browse has completed the input step; make the
+            // default action the next keyboard stop rather than reopening
+            // the file picker on a second Enter.
+            focus = RunTaskDialogFocus::Ok;
+        }
     }
 
     // Own the dialog's focus traversal instead of requesting text focus every
@@ -2291,12 +2314,37 @@ pub fn run_task_dialog(app: &mut TaskManApp, ctx: &egui::Context, _pal: &theme::
             app.run_dialog_open = false;
         }
         Some(RunTaskDialogAction::Browse) => {
-            if let Some(path) = rfd::FileDialog::new().pick_file() {
-                app.run_dialog_text = path.to_string_lossy().into_owned();
-                // A successful browse has completed the input step; make the
-                // default action the next keyboard stop rather than reopening
-                // the file picker on a second Enter.
-                focus = RunTaskDialogFocus::Ok;
+            // The picker is a blocking system dialog: on the UI thread it
+            // would starve WM_PAINT and freeze the whole window while open.
+            if !browse_open {
+                let slot: BrowseSlot = std::sync::Arc::new(std::sync::Mutex::new(None));
+                let worker_slot = slot.clone();
+                let wake = ctx.clone();
+                // Resolved here, on the UI thread, so the system dialog gets
+                // an owner: an unowned one can end up behind our window.
+                #[cfg(target_os = "windows")]
+                let parent = crate::dialogs::main_window_parent();
+                let spawned =
+                    std::thread::Builder::new()
+                        .name("tm-browse".into())
+                        .spawn(move || {
+                            #[cfg(target_os = "windows")]
+                            let parent = parent.as_ref();
+                            let dialog = rfd::FileDialog::new();
+                            #[cfg(target_os = "windows")]
+                            let dialog = match parent {
+                                Some(parent) => dialog.set_parent(parent),
+                                None => dialog,
+                            };
+                            let picked = dialog.pick_file();
+                            *tm_core::sync::lock(&worker_slot) = Some(picked);
+                            wake.request_repaint();
+                        });
+                if spawned.is_ok() {
+                    ctx.data_mut(|data| data.insert_temp(browse_id, slot));
+                } else {
+                    app.shared.toast(i18n::tr(K::ActionFailed));
+                }
             }
         }
         Some(RunTaskDialogAction::ToggleElevated) => {
@@ -2334,6 +2382,10 @@ pub fn run_task_dialog(app: &mut TaskManApp, ctx: &egui::Context, _pal: &theme::
     if app.run_dialog_open {
         ctx.data_mut(|data| data.insert_temp(focus_id, focus));
     } else {
+        // A picker this session started may still be open in its worker
+        // thread. Forget its slot so the NEXT session starts with a clean
+        // one instead of treating a stale picker as its own.
+        ctx.data_mut(|data| data.remove_temp::<BrowseSlot>(browse_id));
         let saved = ctx
             .data(|data| data.get_temp::<Option<egui::Id>>(restore_id))
             .flatten();

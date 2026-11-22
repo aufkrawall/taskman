@@ -1187,17 +1187,19 @@ pub fn show(
                                 ui.close();
                             }
                             if menu::item(ui, i18n::tr(K::OpenFileLocation)).clicked() {
-                                if let Err(error) = app.actions.open_file_location(&module.path) {
-                                    app.shared
-                                        .toast(i18n::trf(K::ErrMsg, &[&error.to_string()]));
-                                }
+                                let actions = app.actions.clone();
+                                let path = module.path.clone();
+                                app.run_shell_action(ui.ctx(), move || {
+                                    actions.open_file_location(&path)
+                                });
                                 ui.close();
                             }
                             if menu::item(ui, i18n::tr(K::Properties)).clicked() {
-                                if let Err(error) = app.actions.open_properties(&module.path) {
-                                    app.shared
-                                        .toast(i18n::trf(K::ErrMsg, &[&error.to_string()]));
-                                }
+                                let actions = app.actions.clone();
+                                let path = module.path.clone();
+                                app.run_shell_action(ui.ctx(), move || {
+                                    actions.open_properties(&path)
+                                });
                                 ui.close();
                             }
                             menu::separator(ui);

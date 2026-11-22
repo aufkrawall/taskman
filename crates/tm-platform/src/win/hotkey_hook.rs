@@ -642,6 +642,12 @@ fn serve_press(trigger: HANDLE, shown: HANDLE) {
         force_foreground_attached(hwnd);
     }
     let outcome = await_shown(hwnd, trigger, shown);
+    if outcome == ShowOutcome::Busy && hwnd != 0 {
+        // The UI answered probes but did not confirm a painted window in
+        // time: whatever it is busy with, the user pressed the combo, so make
+        // sure the window is not left cloaked, iconic or hidden meanwhile.
+        super::window_chrome::ensure_presentable(hwnd);
+    }
     let activated = matches!(outcome, ShowOutcome::Shown | ShowOutcome::Busy)
         && hwnd != 0
         && TARGET_WINDOW.load(Ordering::Acquire) == hwnd

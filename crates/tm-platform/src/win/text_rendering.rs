@@ -160,8 +160,8 @@ fn is_per_monitor_dpi_aware() -> bool {
 /// reproduce a subset of that, badly.
 fn dwrite_params(hwnd: Option<isize>) -> Option<TextRenderingParams> {
     use windows::Win32::Graphics::DirectWrite::{
-        DWRITE_FACTORY_TYPE_SHARED, DWRITE_PIXEL_GEOMETRY_BGR, DWriteCreateFactory, IDWriteFactory,
-        IDWriteRenderingParams,
+        DWRITE_FACTORY_TYPE_SHARED, DWRITE_PIXEL_GEOMETRY_BGR, DWRITE_PIXEL_GEOMETRY_FLAT,
+        DWriteCreateFactory, IDWriteFactory, IDWriteRenderingParams,
     };
     use windows::Win32::Graphics::Gdi::{HMONITOR, MONITOR_DEFAULTTOPRIMARY, MonitorFromWindow};
 
@@ -186,8 +186,10 @@ fn dwrite_params(hwnd: Option<isize>) -> Option<TextRenderingParams> {
     Some(TextRenderingParams {
         // A ClearType level of zero means the user asked for grayscale through the tuner
         // even though the system reports ClearType; honour it rather than drawing fringes
-        // they explicitly turned off.
-        enabled: level > 0.0,
+        // they explicitly turned off. A FLAT pixel geometry means the display has no
+        // usable RGB/BGR stripes (rotated or unusual panel): coloured fringes would be
+        // wrong there, so draw grayscale.
+        enabled: level > 0.0 && geometry != DWRITE_PIXEL_GEOMETRY_FLAT,
         bgr: geometry == DWRITE_PIXEL_GEOMETRY_BGR,
         gamma,
         contrast,

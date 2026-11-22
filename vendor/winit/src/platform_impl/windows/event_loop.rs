@@ -21,8 +21,9 @@ use windows_sys::Win32::Foundation::{
     GetLastError, FALSE, HANDLE, HWND, LPARAM, LRESULT, POINT, RECT, WAIT_FAILED, WPARAM,
 };
 use windows_sys::Win32::Graphics::Gdi::{
-    GetMonitorInfoW, MonitorFromRect, MonitorFromWindow, RedrawWindow, ScreenToClient,
-    ValidateRect, MONITORINFO, MONITOR_DEFAULTTONULL, RDW_INTERNALPAINT, SC_SCREENSAVE,
+    GetMonitorInfoW, GetUpdateRect, InvalidateRgn, MonitorFromRect, MonitorFromWindow,
+    RedrawWindow, ScreenToClient, ValidateRect, MONITORINFO, MONITOR_DEFAULTTONULL,
+    RDW_INTERNALPAINT, RDW_INVALIDATE, SC_SCREENSAVE,
 };
 use windows_sys::Win32::System::Ole::RevokeDragDrop;
 use windows_sys::Win32::System::Threading::{
@@ -51,16 +52,17 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     PT_TOUCH, QS_ALLINPUT, RI_MOUSE_HWHEEL, RI_MOUSE_WHEEL, SC_MINIMIZE, SC_RESTORE,
     SIZE_MAXIMIZED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, WHEEL_DELTA, WINDOWPOS,
     WMSZ_BOTTOM, WMSZ_BOTTOMLEFT, WMSZ_BOTTOMRIGHT, WMSZ_LEFT, WMSZ_RIGHT, WMSZ_TOP, WMSZ_TOPLEFT,
-    WMSZ_TOPRIGHT, WM_CAPTURECHANGED, WM_CLOSE, WM_CREATE, WM_DESTROY, WM_DPICHANGED,
-    WM_ENTERSIZEMOVE, WM_EXITSIZEMOVE, WM_GETMINMAXINFO, WM_IME_COMPOSITION, WM_IME_ENDCOMPOSITION,
-    WM_IME_SETCONTEXT, WM_IME_STARTCOMPOSITION, WM_INPUT, WM_INPUT_DEVICE_CHANGE, WM_KEYDOWN,
-    WM_KEYUP, WM_KILLFOCUS, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP,
-    WM_MENUCHAR, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCACTIVATE, WM_NCCALCSIZE,
-    WM_NCCREATE, WM_NCDESTROY, WM_NCLBUTTONDOWN, WM_PAINT, WM_POINTERDOWN, WM_POINTERUP,
-    WM_POINTERUPDATE, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETCURSOR, WM_SETFOCUS, WM_SETTINGCHANGE,
-    WM_SIZE, WM_SIZING, WM_SYSCOMMAND, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_TOUCH, WM_WINDOWPOSCHANGED,
-    WM_WINDOWPOSCHANGING, WM_XBUTTONDOWN, WM_XBUTTONUP, WNDCLASSEXW, WS_EX_LAYERED,
-    WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TRANSPARENT, WS_OVERLAPPED, WS_POPUP, WS_VISIBLE,
+    WMSZ_TOPRIGHT, WM_CAPTURECHANGED, WM_CLOSE, WM_CREATE, WM_DESTROY, WM_DISPLAYCHANGE,
+    WM_DPICHANGED, WM_DWMCOMPOSITIONCHANGED, WM_ENTERSIZEMOVE, WM_EXITSIZEMOVE, WM_GETMINMAXINFO,
+    WM_IME_COMPOSITION, WM_IME_ENDCOMPOSITION, WM_IME_SETCONTEXT, WM_IME_STARTCOMPOSITION,
+    WM_INPUT, WM_INPUT_DEVICE_CHANGE, WM_KEYDOWN, WM_KEYUP, WM_KILLFOCUS, WM_LBUTTONDOWN,
+    WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MENUCHAR, WM_MOUSEHWHEEL, WM_MOUSEMOVE,
+    WM_MOUSEWHEEL, WM_NCACTIVATE, WM_NCCALCSIZE, WM_NCCREATE, WM_NCDESTROY, WM_NCLBUTTONDOWN,
+    WM_PAINT, WM_POINTERDOWN, WM_POINTERUP, WM_POINTERUPDATE, WM_RBUTTONDOWN, WM_RBUTTONUP,
+    WM_SETCURSOR, WM_SETFOCUS, WM_SETTINGCHANGE, WM_SIZE, WM_SIZING, WM_SYSCOMMAND, WM_SYSKEYDOWN,
+    WM_SYSKEYUP, WM_TOUCH, WM_WINDOWPOSCHANGED, WM_WINDOWPOSCHANGING, WM_XBUTTONDOWN, WM_XBUTTONUP,
+    WNDCLASSEXW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TRANSPARENT,
+    WS_OVERLAPPED, WS_POPUP, WS_VISIBLE,
 };
 
 use crate::dpi::{PhysicalPosition, PhysicalSize};
@@ -1274,13 +1276,24 @@ unsafe fn public_window_callback_inner(
         },
 
         WM_PAINT => {
-            userdata.window_state_lock().redraw_requested =
-                userdata.event_loop_runner.should_buffer();
+            let should_buffer = userdata.event_loop_runner.should_buffer();
+            userdata.window_state_lock().redraw_requested = should_buffer;
+
+            let mut buffered_update_rect = RECT {
+                left: 0,
+                top: 0,
+                right: 0,
+                bottom: 0,
+            };
+            let has_buffered_update_rect = should_buffer
+                && unsafe { GetUpdateRect(window, &mut buffered_update_rect, FALSE) } != 0
+                && buffered_update_rect.right > buffered_update_rect.left
+                && buffered_update_rect.bottom > buffered_update_rect.top;
 
             // We'll buffer only in response to `UpdateWindow`, if win32 decides to redraw the
             // window outside the normal flow of the event loop. This way mark event as handled
             // and request a normal redraw with `RedrawWindow`.
-            if !userdata.event_loop_runner.should_buffer() {
+            if !should_buffer {
                 userdata.send_event(Event::WindowEvent {
                     window_id: RootWindowId(WindowId(window)),
                     event: WindowEvent::RedrawRequested,
@@ -1293,8 +1306,22 @@ unsafe fn public_window_callback_inner(
             // after marking `WM_PAINT` as handled.
             result = ProcResult::Value(unsafe { DefWindowProcW(window, msg, wparam, lparam) });
             if std::mem::take(&mut userdata.window_state_lock().redraw_requested) {
-                unsafe { RedrawWindow(window, ptr::null(), 0, RDW_INTERNALPAINT) };
+                if has_buffered_update_rect {
+                    unsafe {
+                        RedrawWindow(
+                            window,
+                            &buffered_update_rect,
+                            0,
+                            RDW_INVALIDATE | RDW_INTERNALPAINT,
+                        )
+                    };
+                } else {
+                    unsafe { RedrawWindow(window, ptr::null(), 0, RDW_INTERNALPAINT) };
+                }
             }
+        },
+        WM_DISPLAYCHANGE | WM_DWMCOMPOSITIONCHANGED => {
+            unsafe { InvalidateRgn(window, 0, FALSE) };
         },
         WM_WINDOWPOSCHANGING => {
             let mut window_state = userdata.window_state_lock();
@@ -1930,7 +1957,27 @@ unsafe fn public_window_callback_inner(
             // can happen if `SetCapture` is called on our window when it already has the mouse
             // capture.
             if lparam != window {
-                userdata.window_state_lock().mouse.capture_count = 0;
+                let had_capture = {
+                    let mut window_state = userdata.window_state_lock();
+                    let count = window_state.mouse.capture_count;
+                    window_state.mouse.capture_count = 0;
+                    count > 0
+                };
+                if had_capture {
+                    use crate::event::ElementState::Released;
+                    use crate::event::MouseButton::{Back, Forward, Left, Middle, Right};
+                    use crate::event::WindowEvent::MouseInput;
+                    for button in [Left, Right, Middle, Back, Forward] {
+                        userdata.send_event(Event::WindowEvent {
+                            window_id: RootWindowId(WindowId(window)),
+                            event: MouseInput {
+                                device_id: DEVICE_ID,
+                                state: Released,
+                                button,
+                            },
+                        });
+                    }
+                }
             }
             result = ProcResult::Value(0);
         },
@@ -2260,12 +2307,13 @@ unsafe fn public_window_callback_inner(
                 // margin_bottom = adjusted_rect.bottom - suggested_rect.bottom;
             }
 
-            let old_physical_inner_rect = util::WindowArea::Inner
-                .get_rect(window)
-                .expect("failed to query (old) inner window area");
+            let Ok(old_physical_inner_rect) = util::WindowArea::Inner.get_rect(window) else {
+                result = ProcResult::Value(0);
+                return;
+            };
             let old_physical_inner_size = PhysicalSize::new(
-                (old_physical_inner_rect.right - old_physical_inner_rect.left) as u32,
-                (old_physical_inner_rect.bottom - old_physical_inner_rect.top) as u32,
+                (old_physical_inner_rect.right.saturating_sub(old_physical_inner_rect.left)) as u32,
+                (old_physical_inner_rect.bottom.saturating_sub(old_physical_inner_rect.top)) as u32,
             );
 
             // `allow_resize` prevents us from re-applying DPI adjustment to the restored size after

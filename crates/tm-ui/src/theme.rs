@@ -220,15 +220,31 @@ pub fn refresh_text_rendering(ctx: &egui::Context) {
     ctx.request_repaint();
 }
 
+/// The text-rendering half of the visuals: exactly what
+/// [`apply_text_aa`] derives from the smoothing setting and the display's
+/// ClearType parameters.
+///
+/// Two different values mean the glyph atlas has to be rasterized again, so
+/// this — not just the weight setting — is what [`ensure_visuals`] compares.
+/// The parameters can change without the dark/light mode or the weight
+/// moving: a monitor with its own ClearType calibration, or the startup
+/// query landing after the first frame on a slow display stack.
+fn text_aa_state(theme: egui::Theme) -> egui::epaint::TextOptions {
+    let mut opts = egui::epaint::TextOptions::default();
+    apply_text_aa(&mut opts, theme);
+    opts
+}
+
 /// Re-install custom visuals when the active dark/light mode or the glyph
-/// weight changed. Cheap enough to call every frame.
+/// rendering changed. Cheap enough to call every frame.
 pub fn ensure_visuals(ctx: &egui::Context) {
     let state = (
         ctx.style_of(egui::Theme::Dark).visuals.dark_mode,
-        SMOOTHING.load(Ordering::Relaxed),
-        SUBPIXEL_CAPABLE.load(Ordering::Relaxed),
+        text_aa_state(egui::Theme::Dark),
     );
-    let applied = ctx.data(|d| d.get_temp::<(bool, u8, bool)>(egui::Id::new("tm-visuals-dark")));
+    let applied = ctx.data(|d| {
+        d.get_temp::<(bool, egui::epaint::TextOptions)>(egui::Id::new("tm-visuals-dark"))
+    });
     if applied != Some(state) {
         install_visuals(ctx);
         ctx.data_mut(|d| d.insert_temp(egui::Id::new("tm-visuals-dark"), state));

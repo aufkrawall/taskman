@@ -1317,6 +1317,31 @@ rebase runbook.
   `Shell_TrayWnd` never moves) were all reverted in `28b1d3e`; do not re-land
   them for this symptom.
 
+## Recently landed (2026-11-22 — window reliability)
+
+The window itself is now treated as a thing that can fail, not as a given:
+
+- **Presentation is owned on Windows.** The software renderer presents through its own
+  `CreateDIBSection` surface, checks every `BitBlt`, validates only what it blitted, and
+  merges the `WM_PAINT` update region into the present set — so a failed blit or a
+  zero-tile repaint can no longer leave stale pixels. Full detail in `render-pipeline.md`.
+- **A restore is not acknowledged until a frame was painted.** `finish_restore` owns both
+  the uncloak and `acknowledge_show`, bounded by 8 frames / 2 s; the hotkey worker and the
+  second-launch handshake therefore cannot mistake a message loop that merely pumps for a
+  window the user can see. `ensure_presentable`, `ensure_window_on_screen` and
+  `raise_above_topmost` are the repair primitives (tm-platform).
+- **Placement is physical.** `ui_state` stores `position_px=` beside the legacy logical
+  line and the window is fitted into the nearest monitor's work area at startup, on every
+  restore and on a monitor-size change; the minimum size is clamped to the largest monitor
+  and `ui_zoom` is applied at creation.
+- **No path may abort or hang on a graphics resource.** GDI steps are `Result`s, the
+  software surface owns its DC (no allocator thread), and a failed `wgpu` surface
+  recreation keeps the old entry and retries.
+- **Tray, drags and dialogs.** Close-to-tray and start-minimized require a created icon
+  (`TRAY_STATE`); `WM_CAPTURECHANGED` and focus loss release held buttons; the dump picker,
+  the Run dialog's Browse and the shell verbs (`open file location`, `properties`, URLs)
+  run on the action executor.
+
 ## Routing
 
 - Build/release: `build.md`.

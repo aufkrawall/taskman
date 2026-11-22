@@ -57,11 +57,48 @@ every subsequent `build()` call failed with `EventLoopError::RecreationAttempt`
   - `EventLoopBuilder::build()` resets `EVENT_LOOP_CREATED` to `false` if
     `platform_impl::EventLoop::new()` returns `Err`, marked with `TaskMan fork:`.
 
+## 3. Windows window reliability: paint, display change, capture, DPI
+
+Everything here fixes a path where a window could be blank, stale or stuck without an
+error surfacing. All of it is Windows-only and marked with a `TASKMAN-FORK:` comment.
+
+### Files touched
+
+- `src/platform_impl/windows/event_loop.rs`
+  - `WM_PAINT`, buffered redraw case: the update rect is captured with
+    `GetUpdateRect` and the window re-invalidated with
+    `RDW_INVALIDATE | RDW_INTERNALPAINT` instead of being validated away with
+    nothing painted. This is what lets the software renderer blit exactly the
+    region Windows asked for even when no egui tile changed.
+  - `WM_DISPLAYCHANGE` and `WM_DWMCOMPOSITIONCHANGED` invalidate the whole
+    client area (`InvalidateRgn(window, 0, FALSE)`), so a mode change that keeps
+    the client size identical still produces a repaint.
+  - `WM_CAPTURECHANGED` with a foreign `lparam` and a nonzero capture count now
+    synthesizes `MouseInput { Released }` for Left/Right/Middle/Back/Forward,
+    so egui never keeps a drag pressed after Windows took the capture away.
+  - `WM_DPICHANGED` no longer `expect`s the old inner rect; a failed
+    `GetWindowRect` leaves the window as it was instead of panicking.
+- `src/platform_impl/windows/window.rs`
+  - `outer_position`, `inner_size` and `outer_size` return
+    `NotSupportedError`/zero sizes instead of panicking when `ClientToScreen`
+    or the client rect query fails, and subtract borders with
+    `saturating_sub`.
+  - **Note:** this file also carries the window-band change from §1; keep both
+    when rebasing.
+
+### Why these are fork-local
+
+`WM_PAINT` buffering and the DPI accessors are upstream's design and are being
+fixed upstream; the synthesized button release and the display-change
+invalidation are defensible upstream too, but this fork needs them now and
+carries them as one reviewed patch.
+
 ## Rebase procedure
 
 1. Copy the new upstream crate over this directory (keep the deleted
    `Cargo.lock` deleted).
-2. Re-apply both changes above; the marker comments start with `TaskMan fork:`.
+2. Re-apply the three changes above; the marker comments start with
+   `TaskMan fork:` (`grep -n "TaskMan fork:" vendor/winit/src` lists them).
 3. `pwsh tools/check-fork.ps1` (clippy + tests for this fork; `cargo fmt` is
    deliberately skipped because upstream's tree is not formatted with this
    nightly rustfmt).

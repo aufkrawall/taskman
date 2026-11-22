@@ -25,6 +25,17 @@ use crate::{
 /// See <https://github.com/emilk/egui/issues/7776>.
 const INVISIBLE_WINDOW_REPAINT_INTERVAL: Duration = Duration::from_millis(100);
 
+fn throttle_invisible_repaint(
+    requested: Instant,
+    last_invisible_repaint: Option<Instant>,
+) -> Instant {
+    if let Some(last) = last_invisible_repaint {
+        requested.max(last + INVISIBLE_WINDOW_REPAINT_INTERVAL)
+    } else {
+        requested
+    }
+}
+
 // ----------------------------------------------------------------------------
 fn create_event_loop(native_options: &mut epi::NativeOptions) -> Result<EventLoop<UserEvent>> {
     #[cfg(target_os = "android")]
@@ -90,6 +101,8 @@ fn with_event_loop<R>(
 /// some events, but otherwise forwards events to the [`WinitApp`].
 struct WinitAppWrapper<T: WinitApp> {
     windows_next_repaint_times: HashMap<WindowId, Instant>,
+    last_invisible_repaint: HashMap<WindowId, Instant>,
+    in_check_redraw: bool,
     winit_app: T,
     return_result: Result<(), crate::Error>,
     run_and_return: bool,
@@ -99,6 +112,8 @@ impl<T: WinitApp> WinitAppWrapper<T> {
     fn new(winit_app: T, run_and_return: bool) -> Self {
         Self {
             windows_next_repaint_times: HashMap::default(),
+            last_invisible_repaint: HashMap::default(),
+            in_check_redraw: false,
             winit_app,
             return_result: Ok(()),
             run_and_return,
@@ -121,8 +136,7 @@ impl<T: WinitApp> WinitAppWrapper<T> {
             && let Ok(EventResult::RepaintNow(window_id)) = event_result
         {
             log::trace!("RepaintNow of {window_id:?}");
-            self.windows_next_repaint_times
-                .insert(window_id, Instant::now());
+            self.windows_next_repaint_times.remove(&window_id);
 
             // Fix flickering on Windows, see https://github.com/emilk/egui/pull/2280
             event_result = self.winit_app.run_ui_and_paint(event_loop, window_id);
@@ -198,6 +212,15 @@ impl<T: WinitApp> WinitAppWrapper<T> {
     }
 
     fn check_redraw_requests(&mut self, event_loop: &ActiveEventLoop) {
+        // TASKMAN-FORK: `handle_event_result` inside the invisible-window loop
+        // below calls `check_redraw_requests`; guard against recursion so
+        // continuous `request_repaint()` calls on a hidden/minimized window
+        // cannot recurse on the stack before reaching the throttle below.
+        if self.in_check_redraw {
+            return;
+        }
+        self.in_check_redraw = true;
+
         let now = Instant::now();
 
         let mut invisible_window_ids = Vec::new();
@@ -217,11 +240,13 @@ impl<T: WinitApp> WinitAppWrapper<T> {
                     if is_invisible_or_minimized(&window) {
                         invisible_window_ids.push(*window_id);
                     } else {
+                        self.last_invisible_repaint.remove(window_id);
                         log::trace!("request_redraw for {window_id:?}");
                         event_loop.set_control_flow(ControlFlow::Poll);
                         window.request_redraw();
                     }
                 } else {
+                    self.last_invisible_repaint.remove(window_id);
                     log::trace!("No window found for {window_id:?}");
                 }
                 false
@@ -231,6 +256,8 @@ impl<T: WinitApp> WinitAppWrapper<T> {
         // RedrawRequested events on Windows. This ensures that viewport
         // commands like Visible(true) are still processed.
         for window_id in &invisible_window_ids {
+            self.last_invisible_repaint
+                .insert(*window_id, Instant::now());
             let event_result = self.winit_app.run_ui_and_paint(event_loop, *window_id);
             self.handle_event_result(event_loop, event_result);
         }
@@ -240,11 +267,30 @@ impl<T: WinitApp> WinitAppWrapper<T> {
         // the window will simply sleep.
         // See: https://github.com/emilk/egui/issues/7776
         if !invisible_window_ids.is_empty() {
-            let next_paint = Instant::now() + INVISIBLE_WINDOW_REPAINT_INTERVAL;
+            let now = Instant::now();
             for window_id in &invisible_window_ids {
-                self.windows_next_repaint_times
-                    .entry(*window_id)
-                    .and_modify(|t| *t = (*t).min(next_paint));
+                if let Some(window) = self.winit_app.window(*window_id) {
+                    if is_invisible_or_minimized(&window) {
+                        let last = self.last_invisible_repaint.get(window_id).copied();
+                        self.windows_next_repaint_times
+                            .entry(*window_id)
+                            .and_modify(|t| *t = throttle_invisible_repaint(*t, last));
+                    } else {
+                        // The window became visible during `run_ui_and_paint`
+                        // (e.g. `ViewportCommand::Visible(true)`). Do not delay
+                        // its immediate redraw.
+                        self.last_invisible_repaint.remove(window_id);
+                        if self
+                            .windows_next_repaint_times
+                            .get(window_id)
+                            .is_some_and(|t| *t <= now)
+                        {
+                            self.windows_next_repaint_times.remove(window_id);
+                            event_loop.set_control_flow(ControlFlow::Poll);
+                            window.request_redraw();
+                        }
+                    }
+                }
             }
         }
 
@@ -252,6 +298,8 @@ impl<T: WinitApp> WinitAppWrapper<T> {
         if let Some(next_repaint_time) = next_repaint_time {
             event_loop.set_control_flow(ControlFlow::WaitUntil(next_repaint_time));
         }
+
+        self.in_check_redraw = false;
     }
 }
 
@@ -325,12 +373,17 @@ impl<T: WinitApp> ApplicationHandler<UserEvent> for WinitAppWrapper<T> {
                             self.winit_app.window_id_from_viewport_id(viewport_id)
                         {
                             // Throttle repaints for invisible windows to prevent
-                            // high CPU usage on Windows.
+                            // high CPU usage on Windows, while keeping the first
+                            // wakeup of an idle hidden/minimized window (e.g. tray
+                            // click or Ctrl+Shift+Esc) immediate.
                             // See: https://github.com/emilk/egui/issues/7776
                             let when = if let Some(window) = self.winit_app.window(window_id)
                                 && is_invisible_or_minimized(&window)
                             {
-                                when.max(Instant::now() + INVISIBLE_WINDOW_REPAINT_INTERVAL)
+                                throttle_invisible_repaint(
+                                    when,
+                                    self.last_invisible_repaint.get(&window_id).copied(),
+                                )
                             } else {
                                 when
                             };
@@ -704,6 +757,25 @@ mod tests {
             still_registered.is_empty(),
             "raw mouse/keyboard input is still registered after event loop creation \
              (page, usage): {still_registered:?}"
+        );
+    }
+
+    #[test]
+    fn throttle_invisible_repaint_wakes_idle_windows_immediately_and_throttles_bursts() {
+        let t0 = Instant::now();
+        // An invisible window that has not painted recently wakes up immediately.
+        assert_eq!(throttle_invisible_repaint(t0, None), t0);
+        // An invisible window that painted >100 ms ago also wakes up immediately.
+        let requested_after_idle = t0 + Duration::from_millis(250);
+        assert_eq!(
+            throttle_invisible_repaint(requested_after_idle, Some(t0)),
+            requested_after_idle
+        );
+        // A burst request 10 ms after painting is pushed out to `last + 100 ms`.
+        let burst = t0 + Duration::from_millis(10);
+        assert_eq!(
+            throttle_invisible_repaint(burst, Some(t0)),
+            t0 + INVISIBLE_WINDOW_REPAINT_INTERVAL
         );
     }
 }

@@ -1087,25 +1087,32 @@ pub fn show(
 }
 
 fn file_entry_cell_context_menu(
-    app: &TaskManApp,
+    app: &mut TaskManApp,
     resp: &egui::Response,
     label_resp: &egui::Response,
     fallback_text: &str,
     file_path: &str,
 ) {
+    // The item only reports the pick: dispatching it needs `app` mutably,
+    // which the toast callback below has borrowed for the menu's lifetime.
+    let reveal: std::cell::Cell<Option<String>> = std::cell::Cell::new(None);
     file_entry_cell_context_menu_actions(
-        &app.actions,
         &|msg| app.shared.toast(msg),
+        &|path| reveal.set(Some(path.to_owned())),
         resp,
         label_resp,
         fallback_text,
         file_path,
     );
+    if let Some(path) = reveal.take() {
+        let actions = app.actions.clone();
+        app.run_shell_action(&resp.ctx, move || actions.open_file_location(&path));
+    }
 }
 
 fn file_entry_cell_context_menu_actions(
-    actions: &std::sync::Arc<dyn tm_platform::actions::PlatformActions>,
     toast: &dyn Fn(&str),
+    reveal_in_explorer: &dyn Fn(&str),
     resp: &egui::Response,
     label_resp: &egui::Response,
     fallback_text: &str,
@@ -1133,9 +1140,7 @@ fn file_entry_cell_context_menu_actions(
         let has_path = !file_path.trim().is_empty();
         if crate::widgets::menu::item_enabled(ui, i18n::tr(K::OpenFileLocation), has_path).clicked()
         {
-            if let Err(error) = actions.open_file_location(file_path) {
-                toast(&i18n::trf(K::ErrMsg, &[&error.to_string()]));
-            }
+            reveal_in_explorer(file_path);
             ui.close();
         }
     });
@@ -1618,20 +1623,22 @@ mod tests {
         );
     }
 
-    struct DummyActions;
-    impl tm_platform::actions::PlatformActions for DummyActions {}
-
     #[test]
     fn file_entry_cell_context_menu_renders_options() {
         let ctx = egui::Context::default();
         let val_rect = std::cell::Cell::new(egui::Rect::NOTHING);
-        let actions: std::sync::Arc<dyn tm_platform::actions::PlatformActions> =
-            std::sync::Arc::new(DummyActions);
         let toast_called = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let toast_cb = {
             let tc = toast_called.clone();
             move |_: &str| {
                 tc.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+        };
+        let reveal_requested = std::sync::Arc::new(std::sync::Mutex::new(None::<String>));
+        let reveal_cb = {
+            let rr = reveal_requested.clone();
+            move |path: &str| {
+                *tm_core::sync::lock(&rr) = Some(path.to_owned());
             }
         };
 
@@ -1648,8 +1655,8 @@ mod tests {
                 let resp = ui.add(egui::Label::new("C:\\data\\test.txt").selectable(true));
                 val_rect.set(resp.rect);
                 file_entry_cell_context_menu_actions(
-                    &actions,
                     &toast_cb,
+                    &reveal_cb,
                     &resp,
                     &resp,
                     "test.txt",

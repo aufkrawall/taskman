@@ -107,11 +107,20 @@ impl ActionExecutor {
         let wake = Arc::new(wake);
         let completion_wake = wake.clone();
         let send_result = move |res: Result<(), tm_core::TmError>| {
-            let msg = match res {
-                Ok(()) => success_msg(),
-                Err(e) => i18n::trf(K::ErrMsg, &[&e.to_string()]),
-            };
-            crate::app::toast_from(&toasts, msg);
+            match res {
+                Ok(()) => {
+                    // An empty success message is how a call site says "nothing
+                    // to report" (`open file location`, `properties`, closing a
+                    // process). Pushing it would draw an empty frame with a
+                    // close button in the corner, and a burst of them could
+                    // push a real message out of the capped queue.
+                    let msg = success_msg();
+                    if !msg.trim().is_empty() {
+                        crate::app::toast_from(&toasts, msg);
+                    }
+                }
+                Err(e) => crate::app::toast_from(&toasts, i18n::trf(K::ErrMsg, &[&e.to_string()])),
+            }
             completion_wake();
         };
         let queued: Job = Box::new(move || send_result(job()));
@@ -386,6 +395,46 @@ mod tests {
             "job completed and toasted"
         );
         assert_eq!(toasts.lock().unwrap()[0].msg, "did it");
+    }
+
+    /// Regression: a successful action that has nothing to say (`open file
+    /// location`, `open properties`, closing a process) passes `String::new` as
+    /// its success message. That used to be pushed as a toast like any other, so
+    /// the corner gained an empty frame with a close button — and a burst of them
+    /// could push a real message out of the capped queue. A *failure* toast is
+    /// never dropped, whatever the success message would have been.
+    #[test]
+    fn an_empty_success_message_never_becomes_an_empty_toast() {
+        let executor = ActionExecutor::start().expect("executor starts");
+        let toasts: Toasts = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let woken = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let wake_flag = woken.clone();
+        assert!(executor.run(
+            toasts.clone(),
+            move || wake_flag.store(true, Ordering::Relaxed),
+            || "   ".to_string(),
+            || Ok(()),
+        ));
+        assert!(
+            wait_for(|| woken.load(Ordering::Relaxed), 5000),
+            "job completed"
+        );
+        assert!(
+            toasts.lock().unwrap().is_empty(),
+            "a whitespace-only success message must not toast"
+        );
+
+        let ok = executor.run(
+            toasts.clone(),
+            || {},
+            String::new,
+            || Err(tm_core::TmError::ChannelClosed),
+        );
+        assert!(ok);
+        assert!(
+            wait_for(|| !toasts.lock().unwrap().is_empty(), 5000),
+            "the failure toast still appears"
+        );
     }
 
     #[test]

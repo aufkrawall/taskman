@@ -1695,6 +1695,16 @@ fn select_columns_dialog(app: &mut TaskManApp, ctx: &egui::Context, pal: &theme:
     }
     let keys = crate::app_ui::consume_dialog_keys_tab_through(ctx, false);
     let close_now = keys.escape || keys.enter;
+    // Bound the list by the space the window actually has. A fixed 330 pt
+    // list plus this dialog's title and Close row is taller than a high-zoom
+    // or small viewport, and a modal whose Close button sits below the
+    // bottom edge cannot be dismissed with the mouse at all.
+    let viewport_height = ctx.input(|i| {
+        i.viewport()
+            .inner_rect
+            .map_or(f32::INFINITY, |r| r.height())
+    });
+    let list_max_height = (viewport_height - 190.0).clamp(120.0, 330.0);
     egui::Window::new(i18n::tr(K::SelectColumns))
         .modal(true)
         .open(&mut open)
@@ -1706,7 +1716,7 @@ fn select_columns_dialog(app: &mut TaskManApp, ctx: &egui::Context, pal: &theme:
             ui.spacing_mut().item_spacing.y = 2.0;
             let mut first_checkbox: Option<egui::Response> = None;
             egui::ScrollArea::vertical()
-                .max_height(330.0)
+                .max_height(list_max_height)
                 .show(ui, |ui| {
                     // Iterate a snapshot because arrow clicks mutate the live
                     // ordering. The updated order is visible next frame.
@@ -2502,10 +2512,8 @@ pub fn context_menu(app: &mut TaskManApp, ui: &mut egui::Ui, p: &ProcessEntry, h
     }
     if menu::item(ui, i18n::tr(K::OnlineSearch)).clicked() {
         let url = search::online_search_url(p.shown_name());
-        if let Err(error) = app.actions.open_url(&url) {
-            app.shared
-                .toast(i18n::trf(K::ErrMsg, &[&error.to_string()]));
-        }
+        let actions = app.actions.clone();
+        app.run_shell_action(ui.ctx(), move || actions.open_url(&url));
         ui.close();
     }
     // With several rows selected the menu was opened on one of them, so the
@@ -2750,11 +2758,10 @@ pub fn context_menu(app: &mut TaskManApp, ui: &mut egui::Ui, p: &ProcessEntry, h
             menu::item_enabled(ui, i18n::tr(K::FileProperties), image_path.is_some())
                 .on_disabled_hover_text(i18n::tr(K::NoFileForProcess));
         if file_properties.clicked() {
-            if let Some(path) = image_path.as_deref()
-                && let Err(error) = app.actions.open_properties(path)
-            {
-                app.shared
-                    .toast(i18n::trf(K::ErrMsg, &[&error.to_string()]));
+            if let Some(path) = image_path.as_deref() {
+                let actions = app.actions.clone();
+                let path = path.to_owned();
+                app.run_shell_action(ui.ctx(), move || actions.open_properties(&path));
             }
             ui.close();
         }
@@ -2971,35 +2978,108 @@ pub(crate) fn create_dumps(
     }
 
     let timestamp = local_timestamp_for_filename();
-    let targets: Vec<(ProcessEntry, std::path::PathBuf)> = if live_processes.len() == 1 {
-        let p = &live_processes[0];
-        let default_name = dump_filename_for_process(p, &timestamp);
-        let Some(path) = rfd::FileDialog::new()
-            .set_file_name(&default_name)
-            .save_file()
-        else {
-            app.shared.dump_write.end();
-            return;
-        };
-        vec![(p.clone(), path)]
+    // The file/folder picker is a blocking system dialog. It runs on its own
+    // thread so the UI keeps painting and answering input (a modal dialog on
+    // the UI thread starves WM_PAINT and the whole window goes stale while it
+    // is open). `poll_dump_picker` picks the answer up on a later frame.
+    let (tx, rx) = std::sync::mpsc::channel::<Option<std::path::PathBuf>>();
+    let single_default_name = (live_processes.len() == 1)
+        .then(|| dump_filename_for_process(&live_processes[0], &timestamp));
+    // The dialog's owner is resolved here, on the UI thread, while the window
+    // handle is known: an unowned system dialog can end up behind our window.
+    #[cfg(target_os = "windows")]
+    let parent = crate::dialogs::main_window_parent();
+    let wake = ctx.clone();
+    let spawned = std::thread::Builder::new()
+        .name("tm-dump-picker".into())
+        .spawn(move || {
+            #[cfg(target_os = "windows")]
+            let parent = parent.as_ref();
+            let dialog = rfd::FileDialog::new();
+            #[cfg(target_os = "windows")]
+            let dialog = match parent {
+                Some(parent) => dialog.set_parent(parent),
+                None => dialog,
+            };
+            let picked = if let Some(default_name) = single_default_name {
+                dialog.set_file_name(&default_name).save_file()
+            } else {
+                dialog
+                    .set_title(i18n::tr(K::SelectDumpFolder))
+                    .pick_folder()
+            };
+            let _ = tx.send(picked);
+            wake.request_repaint();
+        });
+    if spawned.is_err() {
+        app.shared.dump_write.end();
+        app.shared.toast(i18n::tr(K::ActionFailed));
+        return;
+    }
+    app.pending_dump_pick = Some(PendingDumpPick {
+        rx,
+        processes: live_processes,
+        dump_type,
+        timestamp,
+    });
+}
+
+/// A dump whose destination is still being chosen in the system dialog.
+pub(crate) struct PendingDumpPick {
+    rx: std::sync::mpsc::Receiver<Option<std::path::PathBuf>>,
+    processes: Vec<ProcessEntry>,
+    dump_type: DumpType,
+    timestamp: String,
+}
+
+/// Collect the answer of the dump destination dialog (see [`create_dumps`])
+/// and start the dump job. Cheap when nothing is pending; call every frame.
+pub(crate) fn poll_dump_picker(app: &mut TaskManApp, ctx: &egui::Context) {
+    use std::sync::mpsc::TryRecvError;
+
+    let Some(pending) = app.pending_dump_pick.as_ref() else {
+        return;
+    };
+    let picked = match pending.rx.try_recv() {
+        Ok(picked) => picked,
+        Err(TryRecvError::Empty) => return,
+        // The picker thread died without answering: treat as cancelled.
+        Err(TryRecvError::Disconnected) => None,
+    };
+    let Some(PendingDumpPick {
+        processes,
+        dump_type,
+        timestamp,
+        ..
+    }) = app.pending_dump_pick.take()
+    else {
+        return;
+    };
+    let Some(picked) = picked else {
+        app.shared.dump_write.end();
+        return;
+    };
+    let targets: Vec<(ProcessEntry, std::path::PathBuf)> = if processes.len() == 1 {
+        processes.into_iter().map(|p| (p, picked.clone())).collect()
     } else {
-        let Some(folder) = rfd::FileDialog::new()
-            .set_title(i18n::tr(K::SelectDumpFolder))
-            .pick_folder()
-        else {
-            app.shared.dump_write.end();
-            return;
-        };
-        live_processes
+        processes
             .into_iter()
             .map(|p| {
                 let name = dump_filename_for_process(&p, &timestamp);
-                let path = folder.join(name);
+                let path = picked.join(name);
                 (p, path)
             })
             .collect()
     };
+    start_dump_job(app, ctx, targets, dump_type);
+}
 
+fn start_dump_job(
+    app: &mut TaskManApp,
+    ctx: &egui::Context,
+    targets: Vec<(ProcessEntry, std::path::PathBuf)>,
+    dump_type: DumpType,
+) {
     let count = targets.len();
     if count == 0 {
         app.shared.dump_write.end();
@@ -4677,10 +4757,10 @@ pub fn process_properties_dialog(app: &mut TaskManApp, ctx: &egui::Context) {
                     )
                     .clicked()
                     && let Some(path) = path.as_deref()
-                    && let Err(error) = app.actions.open_properties(path)
                 {
-                    app.shared
-                        .toast(i18n::trf(K::ErrMsg, &[&error.to_string()]));
+                    let actions = app.actions.clone();
+                    let path = path.to_owned();
+                    app.run_shell_action(ui.ctx(), move || actions.open_properties(&path));
                 }
                 if ui
                     .add_enabled(
@@ -4689,10 +4769,10 @@ pub fn process_properties_dialog(app: &mut TaskManApp, ctx: &egui::Context) {
                     )
                     .clicked()
                     && let Some(path) = path.as_deref()
-                    && let Err(error) = app.actions.open_file_location(path)
                 {
-                    app.shared
-                        .toast(i18n::trf(K::ErrMsg, &[&error.to_string()]));
+                    let actions = app.actions.clone();
+                    let path = path.to_owned();
+                    app.run_shell_action(ui.ctx(), move || actions.open_file_location(&path));
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui.button(i18n::tr(K::Close)).clicked() {

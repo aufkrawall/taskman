@@ -611,7 +611,8 @@ impl GlowWinitRunning<'_> {
             };
             egui_winit::update_viewport_info(&mut viewport.info, &egui_ctx, window, false);
 
-            let is_visible = viewport.info.visible().unwrap_or(true);
+            let is_visible = viewport.info.visible().unwrap_or(true)
+                && (self.integration.is_first_frame || window.is_visible() != Some(false));
 
             let Some(egui_winit) = viewport.egui_winit.as_mut() else {
                 return Ok(EventResult::Wait);
@@ -668,16 +669,22 @@ impl GlowWinitRunning<'_> {
                 }
             }
 
-            sleep_if_invisible_or_minimized(
-                self.glutin
-                    .borrow()
+            let now_visible = {
+                let glutin_ref = self.glutin.borrow();
+                let window = glutin_ref
                     .viewports
                     .get(&viewport_id)
-                    .and_then(|viewport| viewport.window.as_deref()),
-            );
+                    .and_then(|viewport| viewport.window.as_deref());
+                sleep_if_invisible_or_minimized(window);
+                window.is_some_and(|w| {
+                    !crate::native::winit_integration::is_invisible_or_minimized(w)
+                })
+            };
 
             return Ok(if self.integration.should_close() {
                 EventResult::CloseRequested
+            } else if now_visible {
+                EventResult::RepaintNext(window_id)
             } else {
                 EventResult::Wait
             });
@@ -835,7 +842,7 @@ impl GlowWinitRunning<'_> {
                     }
                 }
 
-                integration.post_rendering(&window);
+                integration.post_rendering(&window, true);
             }
 
             {

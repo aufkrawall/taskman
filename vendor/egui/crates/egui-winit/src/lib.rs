@@ -795,6 +795,7 @@ impl State {
                 if !focused {
                     // Avoid sticky modifiers when focus is lost (egui clears its own copy too).
                     self.modifiers = egui::Modifiers::default();
+                    self.any_pointer_button_down = false;
                 }
                 self.egui_input
                     .events
@@ -1158,11 +1159,12 @@ impl State {
         state: winit::event::ElementState,
         button: winit::event::MouseButton,
     ) {
-        if let Some(pos) = self.pointer_pos_in_points
-            && let Some(button) = translate_mouse_button(button)
-        {
-            let pressed = state == winit::event::ElementState::Pressed;
+        let Some(button) = translate_mouse_button(button) else {
+            return;
+        };
+        let pressed = state == winit::event::ElementState::Pressed;
 
+        if let Some(pos) = self.pointer_pos_in_points {
             self.egui_input.events.push(egui::Event::PointerButton {
                 pos,
                 button,
@@ -1191,6 +1193,58 @@ impl State {
                         id: egui::TouchId(0),
                         phase: egui::TouchPhase::End,
                         pos,
+                        force: None,
+                    });
+                }
+            }
+        } else if !pressed {
+            // TASKMAN-FORK: When the cursor leaves the window during a drag
+            // (`WindowEvent::CursorLeft` clears `pointer_pos_in_points`) or
+            // Win32 mouse capture is broken (`WM_CAPTURECHANGED` synthesizes a
+            // button release), the release arrives while `pointer_pos_in_points`
+            // is `None`. Clear the button if it is currently down (or was
+            // pressed earlier in this batch) so drags never stick -- but never
+            // as a click: there is no release position, and activating whatever
+            // sat under the press point would fire on a stolen capture.
+            let pending_press = self
+                .egui_input
+                .events
+                .iter()
+                .rev()
+                .find_map(|event| match event {
+                    egui::Event::PointerButton {
+                        pos,
+                        button: b,
+                        pressed,
+                        ..
+                    } if *b == button => Some((*pressed, *pos)),
+                    _ => None,
+                });
+            let is_down = pending_press
+                .map(|(p, _)| p)
+                .unwrap_or_else(|| self.egui_ctx.input(|i| i.pointer.button_down(button)));
+            if is_down {
+                self.egui_input
+                    .events
+                    .push(egui::Event::PointerButtonReleasedOutside { button });
+                self.egui_input.events.push(egui::Event::PointerGone);
+                if self.simulate_touch_screen {
+                    self.any_pointer_button_down = false;
+                    let touch_pos = pending_press
+                        .map(|(_, pos)| pos)
+                        .or_else(|| {
+                            self.egui_ctx.input(|i| {
+                                i.pointer
+                                    .interact_pos()
+                                    .or_else(|| i.pointer.press_origin())
+                            })
+                        })
+                        .unwrap_or(egui::Pos2::ZERO);
+                    self.egui_input.events.push(egui::Event::Touch {
+                        device_id: egui::TouchDeviceId(0),
+                        id: egui::TouchId(0),
+                        phase: egui::TouchPhase::End,
+                        pos: touch_pos,
                         force: None,
                     });
                 }
@@ -3056,5 +3110,43 @@ mod pointer_move_throttle_tests {
         assert_eq!(taken.pointer_active_now, 1);
         assert_eq!(interval_queries, 3);
         assert_eq!(stats.take(), PointerMoveStats::default());
+    }
+
+    #[test]
+    fn mouse_release_outside_window_after_cursor_left_releases_held_button() {
+        struct NoDisplay;
+        impl raw_window_handle::HasDisplayHandle for NoDisplay {
+            fn display_handle(
+                &self,
+            ) -> Result<raw_window_handle::DisplayHandle<'_>, raw_window_handle::HandleError>
+            {
+                Err(raw_window_handle::HandleError::NotSupported)
+            }
+        }
+
+        let ctx = egui::Context::default();
+        let mut state = State::new(ctx.clone(), ViewportId::ROOT, &NoDisplay, None, None, None);
+
+        let press_pos = egui::pos2(80.0, 90.0);
+        state.pointer_pos_in_points = Some(press_pos);
+        state.on_mouse_button_input(ElementState::Pressed, winit::event::MouseButton::Left);
+
+        // Simulate a frame pass where the button press took effect, followed by CursorLeft.
+        let mut out = ctx.run_ui(state.egui_input.take(), |_| {});
+        out.textures_delta.clear();
+        assert!(ctx.input(|i| i.pointer.primary_down()));
+
+        state.pointer_pos_in_points = None;
+        state.on_mouse_button_input(ElementState::Released, winit::event::MouseButton::Left);
+
+        let mut out = ctx.run_ui(state.egui_input.take(), |_| {});
+        out.textures_delta.clear();
+        assert!(!ctx.input(|i| i.pointer.primary_down()));
+        assert!(ctx.input(|i| i.pointer.primary_released()));
+        // The press must not turn into a click: the release happened outside the
+        // window, so activating whatever sat under the press point (a stolen
+        // Win32 capture during a press) would be wrong.
+        assert!(!ctx.input(|i| i.pointer.primary_clicked()));
+        assert!(!ctx.input(|i| i.pointer.any_click()));
     }
 }

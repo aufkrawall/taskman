@@ -668,11 +668,24 @@ impl WgpuWinitRunning<'_> {
             };
             egui_winit::update_viewport_info(info, &integration.egui_ctx, window, false);
 
-            let is_visible = viewport.info.visible().unwrap_or(true);
+            let is_visible = viewport.info.visible().unwrap_or(true)
+                && (integration.is_first_frame || window.is_visible() != Some(false));
 
             {
                 profiling::scope!("set_window");
-                pollster::block_on(painter.set_window(viewport_id, Some(Arc::clone(window))))?;
+                if let Err(err) =
+                    pollster::block_on(painter.set_window(viewport_id, Some(Arc::clone(window))))
+                {
+                    if integration.is_first_frame {
+                        return Err(err.into());
+                    }
+                    log::warn!("Transient wgpu set_window failure for {viewport_id:?}: {err}");
+                    integration.egui_ctx.request_repaint_after_for(
+                        std::time::Duration::from_millis(100),
+                        viewport_id,
+                    );
+                    return Ok(EventResult::Wait);
+                }
             }
 
             let Some(egui_winit) = egui_winit.as_mut() else {
@@ -733,16 +746,22 @@ impl WgpuWinitRunning<'_> {
                 }
             }
 
-            sleep_if_invisible_or_minimized(
-                shared
-                    .borrow()
+            let now_visible = {
+                let shared_ref = shared.borrow();
+                let window = shared_ref
                     .viewports
                     .get(&viewport_id)
-                    .and_then(|viewport| viewport.window.as_deref()),
-            );
+                    .and_then(|viewport| viewport.window.as_deref());
+                sleep_if_invisible_or_minimized(window);
+                window.is_some_and(|w| {
+                    !crate::native::winit_integration::is_invisible_or_minimized(w)
+                })
+            };
 
             return Ok(if integration.should_close() {
                 EventResult::CloseRequested
+            } else if now_visible {
+                EventResult::RepaintNext(window_id)
             } else {
                 EventResult::Wait
             });
@@ -842,7 +861,7 @@ impl WgpuWinitRunning<'_> {
                 }
             }
 
-            integration.post_rendering(window);
+            integration.post_rendering(window, true);
 
             vsync_secs
         } else {

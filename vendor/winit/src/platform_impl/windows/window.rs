@@ -168,21 +168,15 @@ impl Window {
     pub fn outer_position(&self) -> Result<PhysicalPosition<i32>, NotSupportedError> {
         util::WindowArea::Outer
             .get_rect(self.hwnd())
-            .map(|rect| Ok(PhysicalPosition::new(rect.left, rect.top)))
-            .expect(
-                "Unexpected GetWindowRect failure; please report this error to \
-                 rust-windowing/winit",
-            )
+            .map(|rect| PhysicalPosition::new(rect.left, rect.top))
+            .map_err(|_| NotSupportedError::new())
     }
 
     #[inline]
     pub fn inner_position(&self) -> Result<PhysicalPosition<i32>, NotSupportedError> {
         let mut position: POINT = unsafe { mem::zeroed() };
         if unsafe { ClientToScreen(self.hwnd(), &mut position) } == false.into() {
-            panic!(
-                "Unexpected ClientToScreen failure: please report this error to \
-                 rust-windowing/winit"
-            )
+            return Err(NotSupportedError::new());
         }
         Ok(PhysicalPosition::new(position.x, position.y))
     }
@@ -218,12 +212,12 @@ impl Window {
     pub fn inner_size(&self) -> PhysicalSize<u32> {
         let mut rect: RECT = unsafe { mem::zeroed() };
         if unsafe { GetClientRect(self.hwnd(), &mut rect) } == false.into() {
-            panic!(
-                "Unexpected GetClientRect failure: please report this error to \
-                 rust-windowing/winit"
-            )
+            return PhysicalSize::new(0, 0);
         }
-        PhysicalSize::new((rect.right - rect.left) as u32, (rect.bottom - rect.top) as u32)
+        PhysicalSize::new(
+            (rect.right.saturating_sub(rect.left)) as u32,
+            (rect.bottom.saturating_sub(rect.top)) as u32,
+        )
     }
 
     #[inline]
@@ -231,9 +225,12 @@ impl Window {
         util::WindowArea::Outer
             .get_rect(self.hwnd())
             .map(|rect| {
-                PhysicalSize::new((rect.right - rect.left) as u32, (rect.bottom - rect.top) as u32)
+                PhysicalSize::new(
+                    (rect.right.saturating_sub(rect.left)) as u32,
+                    (rect.bottom.saturating_sub(rect.top)) as u32,
+                )
             })
-            .unwrap()
+            .unwrap_or_else(|_| PhysicalSize::new(0, 0))
     }
 
     #[inline]

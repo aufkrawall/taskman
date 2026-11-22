@@ -1,5 +1,23 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- **A failed or skipped blit can no longer leave the window blank, stale or half-painted.** The Windows software renderer now presents through its own Win32 DIB surface: every `BitBlt` result is checked, only the rectangles that were actually blitted are validated, and a `WM_PAINT` update region is merged into the present set even when no egui tile changed. A failed resize, buffer access or present warns, marks the surface unpainted and retries in 50 ms instead of aborting (release builds abort on panic) or silently freezing the old pixels in place.
+- **The window repaints after a display-mode change.** `WM_DISPLAYCHANGE` and a DWM composition change now invalidate the client area, so a resolution or refresh change that keeps the client size identical no longer leaves whatever was on screen until something else forces a redraw. A minimized, hidden or zero-sized window also stops running the UI pass, which used to keep a "painted" frame counter advancing while nothing could be seen.
+- **Ctrl+Shift+Esc, the tray icon and a second launch only report success once the window is really usable.** The restore no longer acknowledges the request before the queued show/unminimize commands ran: it uncloaks after a frame was painted into the visible window (bounded to 8 frames / 2 s), re-checks DWM's cloak state instead of assuming the uncloak worked, repairs a window left off-screen, and raises itself above a lingering always-on-top fullscreen game. A hidden window whose tray icon never appeared is restored automatically instead of disappearing for good, and close-to-tray now requires the icon to exist rather than merely its thread to have started.
+- **Saved window placement survives mixed-DPI layouts and unplugged monitors.** The outer position is stored in physical pixels alongside the legacy logical `position=` line (which is still read and written), applied before the first frame, fitted into the desktop, and re-fitted when the monitor layout changes. A window deliberately spanning two monitors is left alone; only geometry that reaches outside every monitor is moved, and only a window larger than the whole desktop is shrunk. The 720×480 minimum is clamped to the largest monitor, and the UI zoom is applied when the window is created so a non-1.0 zoom no longer resizes the window on every restart.
+- **Graphics resource failures no longer abort or wait forever.** GDI allocation returns an error instead of asserting, the software surface owns its device context (no allocator thread to wait on), and a D3D12 surface that cannot be recreated keeps its old entry and schedules a retry — previously the entry was dropped before the recreate attempt, so nothing ever retried and a paused window stayed stale. GDI surface sizes are bounded (64 megapixels) rather than trusted.
+- **A drag no longer sticks when Windows takes the mouse capture away.** `WM_CAPTURECHANGED` now synthesizes the button releases, focus loss clears the held-button state, and a release that arrives after the pointer left the window clears the button too — without turning that interrupted press into a click that would activate whatever sat under the cursor.
+- **The file pickers and shell actions no longer freeze the window.** The dump-destination picker, the Run dialog's **Browse…** and the shell calls behind **Open file location**, **Properties** and **Open link** (including `ms-settings:` jumps) run off the UI thread on the bounded action executor; the system dialogs keep the main window as their owner (so they cannot be buried behind it), the Run dialog stays responsive while a picker is open, and a cancelled pick is remembered correctly.
+- **An action with nothing to report no longer shows an empty toast.** A success message that is empty (or only whitespace) is dropped, so **Open file location** and friends no longer draw an empty frame with a close button that could also push a real message out of the toast queue.
+- **The Select columns dialog fits a short or high-zoom window.** Its list height is bounded by the viewport instead of a fixed 330 pt, so the dialog's **Close** button cannot end up below the bottom edge where nothing can reach it.
+
+### Improved
+
+- **Text rendering follows the monitor it is actually on.** The startup ClearType query uses the real window handle, a FLAT pixel geometry (rotated or non-RGB-stripe panels) disables sub-pixel rendering, and the theme refresh key now covers the whole text-rendering state, so a change of the display's parameters re-rasterizes the font atlas instead of reusing glyphs built for the previous monitor.
+
 ## 0.1.32 - 2026-11-21
 
 ### Improved

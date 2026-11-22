@@ -257,6 +257,25 @@ Plain oversight-style accessors, plausibly upstreamable. **Coverage:** exercised
 
 **Coverage:** `egui_software`'s `damage::tests` (zero-damage identical frames, single-row change partial damage matching full paint bit-for-bit, draw-order swap detection, disjoint tile merging) and `tm-app`'s `render_snapshot::tests::damaged_repaint_matches_full_paint_on_real_widgets` (real `tablekit`/`chart`/`icons` widgets).
 
+### 13. `eframe` + `egui-winit` + `egui-wgpu`: window-reliability hardening
+
+Divergences added for the GUI-reliability audit. Everything here exists because a window
+could end up blank, stale, invisible or unresponsive without any error surfacing.
+
+| File | Change | Why |
+| --- | --- | --- |
+| `crates/eframe/src/native/software_integration.rs` | **Windows surface replaced**: `mod platform_surface` now owns a `CreateCompatibleDC` + top-down `CreateDIBSection` buffer instead of `softbuffer`, presents with per-rect `BitBlt` whose result is checked, `ValidateRect`s only what it blitted, merges `GetUpdateRect` into the present set (`rects_to_present`), returns `Result` from every GDI step, retries a failed resize/buffer/present after 50 ms instead of aborting, and skips running `ui` at all for hidden/minimized/0×0 windows after the first frame (`update_logic_only`). Non-Windows keeps `softbuffer` behind the same `FrameBuffer`/`SurfaceState` shape | softbuffer 0.4.8 ignored `BitBlt` failures and validated the whole window, so a failed blit froze garbage; a `WM_PAINT` with no dirty egui tiles skipped the blit entirely; GDI allocation asserted (fatal in release); and a paint error from inside `WM_PAINT` used to re-enter the paint |
+| `crates/eframe/src/native/run.rs` | `throttle_invisible_repaint` (a burst is delayed to `last + 100 ms`, an idle window wakes immediately), `in_check_redraw` re-entrancy guard, `windows_next_repaint_times` cleared before painting | the invisible-window repaint loop could recurse into `check_redraw_requests` and throttled tray-restore/hotkey wakeups to 100 ms+ |
+| `crates/eframe/src/native/{epi_integration,glow_integration,wgpu_integration}.rs` | `min_inner_size` clamped to the largest monitor's point size; `is_visible` also honours `window.is_visible()` and a logic-only reveal returns `EventResult::RepaintNext`; a transient `set_window` failure warns and retries instead of ending the loop; `post_rendering(window, reveal_first_frame)` does not reveal the window when the app itself asked for it to stay hidden in the same frame (`note_visibility_commands` in the software backend) | a 720×480 logical minimum exceeded small/high-zoom viewports, a revealed-but-unpainted window waited for an unrelated event, and a start-in-tray launch had its `ViewportCommand::Visible(false)` overridden by eframe's first-frame reveal — leaving the window visible with nothing left to hide it |
+| `crates/egui-wgpu/src/winit.rs` | zero-size surfaces return instead of `expect`-ing a default config; a failed `recreate_surface` schedules a retry; `recreate_surface` creates the replacement **before** dropping the old surface | a lost surface whose recreation failed used to return with the map entry gone, so nothing ever retried and the paused window stayed stale |
+| `crates/egui-winit/src/lib.rs` | focus loss clears `any_pointer_button_down`; a button release that arrives with `pointer_pos_in_points == None` is forwarded at the last known position and followed by `PointerGone` | Windows can take mouse capture away mid-drag (`WM_CAPTURECHANGED`, cursor leaving the window); egui then kept the button pressed forever |
+| `crates/egui/src/input_state/mod.rs` + `crates/egui/src/data/input/event.rs` | new `Event::PointerButtonReleasedOutside { button }`, handled by `PointerState::begin_pass` as a release with `click: None` (and `WindowFocused(false)` now shares `release_all_buttons_without_click`); the state is cleared without a click | egui-winit synthesizes the release when the platform lost the capture, and a normal `PointerButton { pressed: false }` at the press position would register a **click** under `could_any_button_be_click` — activating a control the user never released over |
+
+**Coverage:** `throttle_invisible_repaint_...` (eframe `run.rs`), `software_integration`'s
+`rects_to_present`/`should_force_full_paint` tests, `mouse_release_outside_window_after_cursor_left_releases_held_button`
+and `window_focus_loss_releases_held_pointer_buttons_without_click` (egui-winit/egui), plus
+`tm-platform`'s `fit_rect_keeps_windows_fully_inside_the_desktop` and `screen_repairs_ignore_dead_handles`.
+
 ## Rebase runbook
 
 ```

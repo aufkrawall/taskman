@@ -1213,6 +1213,29 @@ impl PointerState {
                     clear_history_after_velocity_calculation = true;
                 }
                 Event::MouseMoved(delta) => *self.motion.get_or_insert(Vec2::ZERO) += *delta,
+                Event::WindowFocused(false) => {
+                    // TASKMAN-FORK: release any held pointer buttons when window focus is lost
+                    // (e.g. Alt+Tab, UAC prompt, or a fullscreen game stealing foreground) so
+                    // active drags terminate cleanly without synthesizing a click.
+                    self.release_all_buttons_without_click();
+                }
+                Event::PointerButtonReleasedOutside { button } => {
+                    // TASKMAN-FORK: the platform lost the capture, or the release arrived after
+                    // the pointer left the window. Clear the button without a click: the user
+                    // never released over the widget under the press position.
+                    let button = *button;
+                    if self.down[button as usize] {
+                        self.down[button as usize] = false;
+                        self.pointer_events.push(PointerEvent::Released {
+                            click: None,
+                            button,
+                        });
+                    }
+                    if !self.any_down() {
+                        self.press_origin = None;
+                        self.press_start_time = None;
+                    }
+                }
                 _ => {}
             }
         }
@@ -1415,6 +1438,32 @@ impl PointerState {
     /// Buttons released this frame are NOT considered down.
     pub fn any_down(&self) -> bool {
         self.down.iter().any(|&down| down)
+    }
+
+    /// TASKMAN-FORK: release every held button without registering a click.
+    ///
+    /// Used when the press can no longer become a real click: the window lost
+    /// focus, or the platform took the mouse capture away. The widgets see an
+    /// ordinary release (`PointerEvent::Released` with `click: None`), so drags
+    /// end instead of sticking, but nothing is activated.
+    fn release_all_buttons_without_click(&mut self) {
+        for button in [
+            PointerButton::Primary,
+            PointerButton::Secondary,
+            PointerButton::Middle,
+            PointerButton::Extra1,
+            PointerButton::Extra2,
+        ] {
+            if self.down[button as usize] {
+                self.down[button as usize] = false;
+                self.pointer_events.push(PointerEvent::Released {
+                    click: None,
+                    button,
+                });
+            }
+        }
+        self.press_origin = None;
+        self.press_start_time = None;
     }
 
     /// Were there any type of click this frame?
@@ -1700,5 +1749,47 @@ impl PointerState {
         ui.label(format!("last_last_click_time: {last_last_click_time:#?}"));
         ui.label(format!("last_move_time: {last_move_time:#?}"));
         ui.label(format!("pointer_events: {pointer_events:?}"));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn window_focus_loss_releases_held_pointer_buttons_without_click() {
+        let mut state = InputState::default();
+        let pos = Pos2::new(40.0, 50.0);
+
+        state = state.begin_pass(
+            RawInput {
+                events: vec![Event::PointerButton {
+                    pos,
+                    button: PointerButton::Primary,
+                    pressed: true,
+                    modifiers: Modifiers::NONE,
+                }],
+                ..Default::default()
+            },
+            false,
+            1.0,
+            InputOptions::default(),
+        );
+        assert!(state.pointer.primary_down());
+        assert!(state.pointer.any_down());
+
+        state = state.begin_pass(
+            RawInput {
+                events: vec![Event::WindowFocused(false)],
+                ..Default::default()
+            },
+            false,
+            1.0,
+            InputOptions::default(),
+        );
+        assert!(!state.pointer.primary_down());
+        assert!(!state.pointer.any_down());
+        assert!(state.pointer.primary_released());
+        assert!(!state.pointer.primary_clicked());
     }
 }

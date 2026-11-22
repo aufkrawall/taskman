@@ -19,6 +19,7 @@ compile_error!("tm-app requires at least one renderer feature: `software`, `wgpu
 mod action_executor;
 mod app;
 mod app_ui;
+mod dialogs;
 mod icon_cache;
 mod icons;
 /// Headless CPU rendering of the real widgets; see the module docs.
@@ -362,8 +363,26 @@ fn run_gui(mock: bool, args: &[String]) {
     let render_mode = effective_render_mode(&settings);
     settings.render_mode = configured_render_mode(settings.render_mode);
     let window_size = [settings.window_size[0], settings.window_size[1]];
+    // The egui context still has zoom 1.0 while the window is created
+    // (`TaskManApp::new` applies `ui_zoom` afterwards), but the first frame
+    // reads the window size back in zoomed points. Creating the window at
+    // `size * zoom` makes that read-back equal the saved size, so a non-1.0
+    // zoom no longer shrinks or grows the window on every restart.
+    let creation_zoom = if settings.ui_zoom.is_finite() && settings.ui_zoom > 0.0 {
+        settings.ui_zoom
+    } else {
+        1.0
+    };
+    let creation_size = [
+        window_size[0] * creation_zoom,
+        window_size[1] * creation_zoom,
+    ];
+    let creation_min_size = [720.0 * creation_zoom, 480.0 * creation_zoom];
     let restore_position = has_saved_settings && settings.remember_window;
     let window_position = restore_position.then(ui_state::window_position).flatten();
+    let window_position_px = restore_position
+        .then(ui_state::window_position_px)
+        .flatten();
     let restore_maximized = restore_position && ui_state::window_maximized();
 
     let initial_tab_arg = args
@@ -402,8 +421,8 @@ fn run_gui(mock: bool, args: &[String]) {
             // Wayland compositors use app_id to associate windows with
             // the matching desktop entry/icon and group them correctly.
             .with_app_id(APP_ID)
-            .with_inner_size(window_size)
-            .with_min_inner_size([720.0, 480.0])
+            .with_inner_size(creation_size)
+            .with_min_inner_size(creation_min_size)
             .with_visible(!initially_hidden)
             .with_icon(icon_data());
         if let Some(pos) = window_position {
@@ -495,15 +514,53 @@ fn run_gui(mock: bool, args: &[String]) {
         let creator = move |cc: &eframe::CreationContext<'_>| {
             *tm_core::sync::lock(&ACTIVE_RENDER_MODE) = mode_for_renderer(renderer);
             StartupTrace::mark("creation_context_enter");
+            // `creation_size` is the saved size times `ui_zoom`, because the
+            // window is created at the unzoomed context's scale. eframe's
+            // persistence is off, so `zoom_factor` is 1.0 here; if that ever
+            // changes (persistence on, or a zoom restored into the context),
+            // the size would be scaled twice — say so instead of silently
+            // growing the window on every start.
+            let context_zoom = cc.egui_ctx.zoom_factor();
+            if (context_zoom - 1.0).abs() > f32::EPSILON {
+                tracing::warn!(
+                    context_zoom,
+                    ui_zoom = creation_zoom,
+                    "egui context already zoomed at window creation; the saved size may be scaled twice"
+                );
+            }
             // Now the window exists, so the DPI-awareness gate reports the truth. Doing
             // this before `apply_startup` means the very first frame already rasterizes
             // at the right coverage rather than rebuilding the atlas a frame later.
-            // `None` means the primary monitor. eframe keeps the raw handle private, and the
-            // gate that actually mattered here -- per-monitor DPI awareness -- is a property
-            // of the thread rather than of the window, so it is unaffected. The only thing
-            // lost is picking up a *secondary* monitor's own ClearType calibration, which
-            // differs from the primary's only if the user tuned them separately.
-            theme::set_subpixel_capable(is_software, tm_platform::text_rendering::query(None));
+            // The window handle selects the monitor whose ClearType calibration is
+            // used; without one (`None`) the primary monitor's is.
+            #[cfg(target_os = "windows")]
+            let creation_hwnd = {
+                use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+                match cc.window_handle().map(|handle| handle.as_raw()) {
+                    Ok(RawWindowHandle::Win32(win32)) => Some(win32.hwnd.get()),
+                    _ => None,
+                }
+            };
+            #[cfg(not(target_os = "windows"))]
+            let creation_hwnd: Option<isize> = {
+                let _ = window_position_px;
+                None
+            };
+            #[cfg(target_os = "windows")]
+            if let Some(hwnd) = creation_hwnd {
+                // The logical position the window was created with is
+                // scaled by the primary monitor's DPI whatever monitor it
+                // names; the physical position saved at the last exit is
+                // exact. Then pull the window onto a monitor that exists.
+                if let Some(pos) = window_position_px {
+                    tm_platform::set_window_outer_position_px(hwnd, pos);
+                }
+                tm_platform::ensure_window_on_screen(hwnd);
+            }
+            theme::set_subpixel_capable(
+                is_software,
+                tm_platform::text_rendering::query(creation_hwnd),
+            );
             theme::apply_startup(&cc.egui_ctx);
             fonts::install_async(cc.egui_ctx.clone());
             let application = app::TaskManApp::new(cc, use_mock, app_settings, initial_tab);
@@ -696,6 +753,21 @@ fn compiled_wgpu_backends() -> eframe::wgpu::Backends {
     }
 }
 
+/// How long a start-minimized launch waits for the tray icon before showing
+/// the window instead: a window hidden behind an icon that never appears
+/// cannot be brought back.
+#[cfg(target_os = "windows")]
+const INITIAL_HIDE_TRAY_WAIT: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// Upper bound on frames a restore waits for a painted frame before it
+/// uncloaks anyway, so the window can never stay invisible.
+#[cfg(target_os = "windows")]
+const RESTORE_MAX_TICKS: u8 = 8;
+/// ...and on the time before the acknowledgement is sent regardless. The
+/// waiting launch gave up long before this; it only releases the state.
+#[cfg(target_os = "windows")]
+const RESTORE_ACK_DEADLINE: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// Thin native-shell wrapper. TaskManApp already owns all UI/application
 /// state; this layer only records the viewport's desktop-space position and
 /// delegates every application hook unchanged.
@@ -712,10 +784,34 @@ struct NativeApp {
     /// Native window handle, cached the first time a frame hands it over.
     #[cfg(target_os = "windows")]
     hwnd: Option<isize>,
-    /// Frames still owed before the window is uncloaked after a restore.
-    /// See [`NativeApp::restore_window`]; 0 means "not cloaked by us".
+    /// The window was cloaked by [`NativeApp::restore_window`] and still is.
     #[cfg(target_os = "windows")]
-    uncloak_in: u8,
+    cloaked_for_restore: bool,
+    /// A show request was accepted but not yet acknowledged: the waiting
+    /// launch or hotkey worker gets its answer only once a frame has really
+    /// been painted into the restored window.
+    #[cfg(target_os = "windows")]
+    show_ack_pending: bool,
+    /// `ui` ran in a frame after the restore frame, so the window (visible
+    /// and unminimized by then, or `ui` would not run) has real content.
+    #[cfg(target_os = "windows")]
+    painted_since_restore: bool,
+    /// Frames seen since the restore was requested.
+    #[cfg(target_os = "windows")]
+    restore_ticks: u8,
+    #[cfg(target_os = "windows")]
+    restore_started: Option<std::time::Instant>,
+    /// Latest monitor size egui reported; a change means the display layout
+    /// changed under the window.
+    #[cfg(target_os = "windows")]
+    last_monitor_size: Option<eframe::egui::Vec2>,
+    /// A close request arrived (seen in the raw input, so it is also seen
+    /// while the window is minimized and `ui` does not run).
+    #[cfg(target_os = "windows")]
+    close_request_seen: bool,
+    /// Give up waiting for the tray icon at this time and show the window.
+    #[cfg(target_os = "windows")]
+    initial_hide_deadline: std::time::Instant,
 }
 
 impl NativeApp {
@@ -751,7 +847,21 @@ impl NativeApp {
             #[cfg(target_os = "windows")]
             hwnd: None,
             #[cfg(target_os = "windows")]
-            uncloak_in: 0,
+            cloaked_for_restore: false,
+            #[cfg(target_os = "windows")]
+            show_ack_pending: false,
+            #[cfg(target_os = "windows")]
+            painted_since_restore: false,
+            #[cfg(target_os = "windows")]
+            restore_ticks: 0,
+            #[cfg(target_os = "windows")]
+            restore_started: None,
+            #[cfg(target_os = "windows")]
+            last_monitor_size: None,
+            #[cfg(target_os = "windows")]
+            close_request_seen: false,
+            #[cfg(target_os = "windows")]
+            initial_hide_deadline: std::time::Instant::now() + INITIAL_HIDE_TRAY_WAIT,
         }
     }
 
@@ -799,22 +909,63 @@ impl eframe::App for NativeApp {
         self.finish_restore(ctx);
         #[cfg(target_os = "windows")]
         self.handle_tray_actions(ctx);
+        #[cfg(target_os = "windows")]
+        self.handle_close_request(ctx);
+        #[cfg(target_os = "windows")]
+        self.rescue_window_hidden_without_tray(ctx);
         if self.initial_hide_pending {
             #[cfg(target_os = "windows")]
-            if self.tray.is_some() {
-                ctx.send_viewport_cmd(eframe::egui::ViewportCommand::Visible(false));
-            } else {
-                self.hidden_to_tray = false;
-                ctx.send_viewport_cmd(eframe::egui::ViewportCommand::Visible(true));
+            {
+                let tray_state = self
+                    .tray
+                    .as_ref()
+                    .map(|tray| (tray.is_ready(), tray.has_failed()));
+                match tray_state {
+                    // The icon exists: it is now safe to disappear into it.
+                    Some((true, _)) => {
+                        ctx.send_viewport_cmd(eframe::egui::ViewportCommand::Visible(false));
+                        self.initial_hide_pending = false;
+                    }
+                    // Still being created: stay hidden (the window was created
+                    // invisible) and look again shortly, but not forever.
+                    Some((false, false))
+                        if std::time::Instant::now() < self.initial_hide_deadline =>
+                    {
+                        ctx.request_repaint_after(std::time::Duration::from_millis(25));
+                    }
+                    _ => {
+                        tracing::warn!(
+                            "tray icon unavailable for a start-minimized launch; showing the window"
+                        );
+                        self.hidden_to_tray = false;
+                        ctx.send_viewport_cmd(eframe::egui::ViewportCommand::Visible(true));
+                        self.initial_hide_pending = false;
+                    }
+                }
             }
             #[cfg(not(target_os = "windows"))]
             {
                 self.hidden_to_tray = false;
                 ctx.send_viewport_cmd(eframe::egui::ViewportCommand::Visible(true));
+                self.initial_hide_pending = false;
             }
-            self.initial_hide_pending = false;
         }
         <app::TaskManApp as eframe::App>::logic(&mut self.inner, ctx, frame);
+    }
+
+    fn raw_input_hook(
+        &mut self,
+        ctx: &eframe::egui::Context,
+        raw_input: &mut eframe::egui::RawInput,
+    ) {
+        // `ui` does not run while the window is minimized or hidden, and
+        // `logic` cannot read the viewport's close request from the context
+        // then; the raw input reaches both paths.
+        #[cfg(target_os = "windows")]
+        if raw_input.viewport().close_requested() {
+            self.close_request_seen = true;
+        }
+        <app::TaskManApp as eframe::App>::raw_input_hook(&mut self.inner, ctx, raw_input);
     }
 
     fn ui(&mut self, ui: &mut eframe::egui::Ui, frame: &mut eframe::Frame) {
@@ -851,16 +1002,23 @@ impl eframe::App for NativeApp {
                 tray.set_visible(tray_enabled);
                 tray.sync_menu_theme(ui.ctx().theme());
             }
-            let close_requested = ui.ctx().input(|input| input.viewport().close_requested());
-            if close_requested && PROGRAMMATIC_EXIT.load(std::sync::atomic::Ordering::Acquire) {
-                self.exit_requested = true;
+            // `ui` only runs for a visible, unminimized window, so a frame
+            // after the restore frame is real content in the restored window.
+            if (self.show_ack_pending || self.cloaked_for_restore) && self.restore_ticks >= 1 {
+                self.painted_since_restore = true;
             }
-            if close_requested && !self.exit_requested && keep_in_tray && self.tray.is_some() {
-                ui.ctx()
-                    .send_viewport_cmd(eframe::egui::ViewportCommand::CancelClose);
-                ui.ctx()
-                    .send_viewport_cmd(eframe::egui::ViewportCommand::Visible(false));
-                self.hidden_to_tray = true;
+            // A changed monitor size means the display layout changed under
+            // the window (resolution switch by a game, monitor unplugged or
+            // re-docked): pull the window back inside the visible desktop.
+            if let Some(monitor_size) = ui.ctx().input(|i| i.viewport().monitor_size) {
+                if let Some(hwnd) = self.hwnd
+                    && self
+                        .last_monitor_size
+                        .is_some_and(|prev| prev != monitor_size)
+                {
+                    tm_platform::ensure_window_on_screen(hwnd);
+                }
+                self.last_monitor_size = Some(monitor_size);
             }
         }
         if self.inner.shared.settings.remember_window {
@@ -880,6 +1038,13 @@ impl eframe::App for NativeApp {
                 // restore geometry — keep the last normal position instead.
                 if !maximized && let Some(pos) = pos {
                     ui_state::set_window_position([pos.x, pos.y]);
+                }
+                #[cfg(target_os = "windows")]
+                if !maximized
+                    && let Some(hwnd) = self.hwnd
+                    && let Some(px) = tm_platform::window_outer_position_px(hwnd)
+                {
+                    ui_state::set_window_position_px(px);
                 }
                 ui_state::set_window_maximized(maximized);
             }
@@ -995,6 +1160,17 @@ const TRAY_MSG_APPLY_VISIBLE: u32 = windows::Win32::UI::WindowsAndMessaging::WM_
 
 #[cfg(target_os = "windows")]
 static TRAY_HWND: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
+
+/// Lifecycle of the tray thread's icon: the UI only trusts the tray as a way
+/// back to the window once the icon actually exists.
+#[cfg(target_os = "windows")]
+static TRAY_STATE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(TRAY_STARTING);
+#[cfg(target_os = "windows")]
+const TRAY_STARTING: u8 = 0;
+#[cfg(target_os = "windows")]
+const TRAY_READY: u8 = 1;
+#[cfg(target_os = "windows")]
+const TRAY_FAILED: u8 = 2;
 
 /// Show the notification-area context menu.
 ///
@@ -1124,6 +1300,7 @@ fn tray_thread_main() {
         Ok(icon) => icon,
         Err(error) => {
             tracing::warn!(%error, "cannot create tray icon image");
+            TRAY_STATE.store(TRAY_FAILED, std::sync::atomic::Ordering::Release);
             return;
         }
     };
@@ -1135,6 +1312,7 @@ fn tray_thread_main() {
         Ok(icon) => icon,
         Err(error) => {
             tracing::warn!(%error, "cannot create notification-area icon");
+            TRAY_STATE.store(TRAY_FAILED, std::sync::atomic::Ordering::Release);
             return;
         }
     };
@@ -1151,6 +1329,10 @@ fn tray_thread_main() {
         std::sync::atomic::Ordering::SeqCst,
     );
     let _ = icon.set_visible(TRAY_DESIRED_VISIBLE.load(std::sync::atomic::Ordering::SeqCst));
+    // Only now is there an icon the user can click. The UI must not hide the
+    // window into the tray before this: a window hidden behind a tray icon
+    // that never appeared cannot be brought back.
+    TRAY_STATE.store(TRAY_READY, std::sync::atomic::Ordering::Release);
 
     let mut msg = MSG::default();
     loop {
@@ -1171,6 +1353,7 @@ fn tray_thread_main() {
     // Dropping the icon on its own thread removes the notification-area
     // entry and destroys the window; `DestroyWindow` would fail from any
     // other thread.
+    TRAY_STATE.store(TRAY_FAILED, std::sync::atomic::Ordering::Release);
     TRAY_HWND.store(0, std::sync::atomic::Ordering::Release);
     TRAY_THREAD_ID.store(0, std::sync::atomic::Ordering::SeqCst);
 }
@@ -1191,15 +1374,31 @@ impl TrayShell {
     /// means no tray, the same visible outcome as a failed icon creation.
     fn new(initially_visible: bool) -> Option<Self> {
         TRAY_DESIRED_VISIBLE.store(initially_visible, std::sync::atomic::Ordering::SeqCst);
-        std::thread::Builder::new()
+        TRAY_STATE.store(TRAY_STARTING, std::sync::atomic::Ordering::Release);
+        if std::thread::Builder::new()
             .name("tm-tray".into())
             .spawn(tray_thread_main)
-            .ok()?;
+            .is_err()
+        {
+            TRAY_STATE.store(TRAY_FAILED, std::sync::atomic::Ordering::Release);
+            return None;
+        }
         Some(Self {
             visible: Some(initially_visible),
             menu_dark: None,
             shutdown: false,
         })
+    }
+
+    /// The icon exists and can bring the window back.
+    fn is_ready(&self) -> bool {
+        !self.shutdown && TRAY_STATE.load(std::sync::atomic::Ordering::Acquire) == TRAY_READY
+    }
+
+    /// The icon could not be created (or its thread ended): nothing will
+    /// ever appear in the notification area.
+    fn has_failed(&self) -> bool {
+        TRAY_STATE.load(std::sync::atomic::Ordering::Acquire) == TRAY_FAILED
     }
 
     fn set_visible(&mut self, visible: bool) {
@@ -1284,10 +1483,9 @@ impl NativeApp {
         // add a blink to the restore animation.
         if was_hidden && let Some(hwnd) = self.hwnd {
             tm_platform::set_window_cloaked(hwnd, true);
-            // Two frames. `Visible(true)` below is queued and applied after
-            // THIS frame, so the first frame that can present into a visible
-            // window is the next one; the one after that reveals it.
-            self.uncloak_in = 2;
+            // `finish_restore` uncloaks once a frame has been painted into
+            // the visible window (or after a bounded number of frames).
+            self.cloaked_for_restore = true;
         }
         ctx.send_viewport_cmd(eframe::egui::ViewportCommand::Visible(true));
         // Un-minimize before activating. Activation is a no-op on a minimized
@@ -1310,44 +1508,116 @@ impl NativeApp {
         // ran, so it still reads false.)
         #[cfg(target_os = "windows")]
         if let Some(hwnd) = self.hwnd {
+            // Put a window that Windows or a display change left off-screen
+            // back on a monitor before it is shown.
+            tm_platform::ensure_window_on_screen(hwnd);
             // The non-attaching activation: this is the UI thread inside
             // `update()`, which does not pump its message queue until the
             // frame ends. The hotkey worker does the attaching one, and it is
             // the only caller that may.
             tm_platform::force_foreground(hwnd);
         }
-        // Tell a waiting launch that the request has been processed by the
-        // thread that actually draws: that, and not the request arriving, is
-        // what proves this instance is alive enough to keep the request.
-        #[cfg(target_os = "windows")]
-        tm_platform::win::instance::acknowledge_show();
+        // The request is NOT acknowledged here. The waiting launch or hotkey
+        // worker treats an acknowledgement as "the window is usable", and at
+        // this point the show/restore commands above are only queued and the
+        // window may still be cloaked or unpainted. `finish_restore`
+        // acknowledges once a frame has been painted into the window.
+        self.show_ack_pending = true;
+        self.painted_since_restore = false;
+        self.restore_ticks = 0;
+        self.restore_started = Some(std::time::Instant::now());
         // The UI is event driven and the engine may be paused, so the frames
         // the countdown needs have to be asked for explicitly.
         ctx.request_repaint();
     }
 
-    /// Uncloak once the frames owed by [`Self::restore_window`] have gone by.
+    /// Finish what [`Self::restore_window`] started: uncloak and acknowledge.
     ///
-    /// Driven from the START of every frame rather than a one-shot callback,
-    /// for two reasons. A frame's paint has been presented by the time the
-    /// next one begins, so counting here means the window is only revealed
-    /// once real content is behind it. And running unconditionally every
-    /// frame means the window can never be left invisible: whatever happens
-    /// in between, the countdown keeps ticking and reaches zero.
+    /// Driven from the START of every frame rather than a one-shot callback.
+    /// A frame's paint has been presented by the time the next one begins, so
+    /// the window is only revealed once real content is behind it
+    /// (`painted_since_restore`, set by `ui`). Running every frame, with
+    /// bounds ([`RESTORE_MAX_TICKS`], [`RESTORE_ACK_DEADLINE`]) for a frame
+    /// that never comes, means the window can never be left invisible and the
+    /// waiting launch is never left without an answer.
     fn finish_restore(&mut self, ctx: &eframe::egui::Context) {
-        if self.uncloak_in == 0 {
+        if !self.show_ack_pending && !self.cloaked_for_restore {
             return;
         }
-        self.uncloak_in -= 1;
-        if self.uncloak_in == 0 {
+        self.restore_ticks = self.restore_ticks.saturating_add(1);
+        let painted = self.painted_since_restore && self.restore_ticks >= 2;
+        let waited = self
+            .restore_started
+            .map_or(std::time::Duration::ZERO, |t| t.elapsed());
+        if self.cloaked_for_restore && (painted || self.restore_ticks >= RESTORE_MAX_TICKS) {
             if let Some(hwnd) = self.hwnd {
                 tm_platform::set_window_cloaked(hwnd, false);
-                #[cfg(target_os = "windows")]
+                tm_platform::ensure_window_on_screen(hwnd);
                 tm_platform::force_foreground(hwnd);
             }
-        } else {
+            self.cloaked_for_restore = false;
+        }
+        if self.show_ack_pending
+            && !self.cloaked_for_restore
+            && (painted || waited >= RESTORE_ACK_DEADLINE)
+        {
+            if !painted {
+                tracing::warn!(
+                    waited_ms = waited.as_millis() as u64,
+                    "restore acknowledged without a painted frame"
+                );
+            }
+            // A window another party (virtual desktops, the shell) left
+            // cloaked would be "shown" yet invisible: repair before answering.
+            if let Some(hwnd) = self.hwnd
+                && tm_platform::is_window_cloaked(hwnd)
+            {
+                tm_platform::set_window_cloaked(hwnd, false);
+            }
+            tm_platform::win::instance::acknowledge_show();
+            self.show_ack_pending = false;
+        }
+        if self.show_ack_pending || self.cloaked_for_restore {
             // The countdown must not stall on an idle, event-driven UI.
             ctx.request_repaint();
+        }
+    }
+
+    /// Act on a close request: close to the tray when that is configured AND
+    /// the icon really exists, otherwise let the window close. Runs from
+    /// `logic`, so it also works for a minimized window, where `ui` does not.
+    fn handle_close_request(&mut self, ctx: &eframe::egui::Context) {
+        if !std::mem::take(&mut self.close_request_seen) {
+            return;
+        }
+        if PROGRAMMATIC_EXIT.load(std::sync::atomic::Ordering::Acquire) {
+            self.exit_requested = true;
+        }
+        let keep_in_tray = self.inner.shared.settings.close_to_tray
+            || self.inner.shared.settings.taskbar_monitor_enabled;
+        if self.exit_requested || !keep_in_tray {
+            return;
+        }
+        if self.tray.as_ref().is_some_and(TrayShell::is_ready) {
+            ctx.send_viewport_cmd(eframe::egui::ViewportCommand::CancelClose);
+            ctx.send_viewport_cmd(eframe::egui::ViewportCommand::Visible(false));
+            self.hidden_to_tray = true;
+        } else {
+            // Hiding behind an icon that does not exist would strand the
+            // window; closing is the honest outcome.
+            tracing::warn!("close requested but the tray icon is not available; closing");
+        }
+    }
+
+    /// A window hidden "to the tray" whose icon failed (or whose thread
+    /// ended) cannot be restored by the user: bring it back.
+    fn rescue_window_hidden_without_tray(&mut self, ctx: &eframe::egui::Context) {
+        if self.hidden_to_tray
+            && !self.initial_hide_pending
+            && self.tray.as_ref().is_none_or(TrayShell::has_failed)
+        {
+            tracing::warn!("window is hidden but the tray icon is unavailable; restoring it");
+            self.restore_window(ctx);
         }
     }
 

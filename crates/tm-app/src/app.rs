@@ -427,6 +427,8 @@ pub struct TaskManApp {
     pub pending_uac_virtualization: Option<PendingUacVirtualization>,
     /// Active crash dump creation awaiting completion or cancellation.
     pub active_dump: Option<ActiveDump>,
+    /// Dump destination dialog still open on its picker thread.
+    pub pending_dump_pick: Option<crate::tabs::details::PendingDumpPick>,
     // Services tab.
     pub services_selected_name: Option<String>,
 
@@ -913,6 +915,7 @@ impl TaskManApp {
             pending_process_end,
             pending_uac_virtualization: None,
             active_dump,
+            pending_dump_pick: None,
             services_selected_name: None,
             pending_details_focus: None,
             scroll_to_pid: None,
@@ -1438,6 +1441,22 @@ impl TaskManApp {
         }
     }
 
+    /// Like [`TaskManApp::run_action`], but for the shell calls menus make
+    /// (`ShellExecuteW` / `ShellExecuteExW`: open a URL, reveal a file in
+    /// Explorer, open the Properties sheet).
+    ///
+    /// Handing the request to the shell usually takes microseconds, but a
+    /// network path, a hung shell extension or a busy Explorer stalls it for
+    /// seconds — and on the UI thread that freezes the whole window, not just
+    /// the menu. Success has nothing to report, so it produces no toast.
+    pub fn run_shell_action(
+        &mut self,
+        ctx: &egui::Context,
+        job: impl FnOnce() -> Result<(), tm_core::TmError> + Send + 'static,
+    ) -> bool {
+        self.run_action(ctx, String::new, job)
+    }
+
     /// Like [`TaskManApp::run_action`], but forces one out-of-band sample
     /// once the action has COMPLETED.
     ///
@@ -1863,6 +1882,8 @@ impl eframe::App for TaskManApp {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // Adopt asynchronously loaded app history as soon as it arrives.
         self.app_history_db.poll_load();
+        // Collect the answer of an open dump destination dialog.
+        crate::tabs::details::poll_dump_picker(self, ctx);
 
         // Single poll per repaint — publications wake us via the notifier,
         // so no periodic request_repaint_after is needed anymore.

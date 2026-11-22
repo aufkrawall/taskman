@@ -4261,3 +4261,55 @@ history recorded yet.
   musl fallback in that case. The automated gate passed. Installed-service
   upgrade/rollback and elevated ETW behavior still require disposable-VM
   testing.
+
+- 2026-11-22: GUI-reliability audit implementation (six claims: lost pixels in the CPU
+  renderer, restore acknowledged before the window was usable, placement broken on
+  mixed-DPI/disconnected displays, fatal/hanging graphics-resource failures, close-to-tray
+  without a tray icon, stuck drags plus synchronous file pickers). Claim-by-claim:
+  - **Presentation:** `vendor/egui/crates/eframe/src/native/software_integration.rs` no
+    longer uses softbuffer on Windows. `platform_surface` owns a `CreateCompatibleDC` +
+    top-down `CreateDIBSection` buffer; `present_rects` checks every `BitBlt`, validates
+    only the blitted rects and returns `Err` (retried in 50 ms) instead of freezing
+    garbage; `os_update_rect()` (`GetUpdateRect`, queried before `DefWindowProcW`
+    validates) is merged by `rects_to_present` so a zero-tile `WM_PAINT` still blits; every
+    GDI step is fallible (release builds abort on panic); the buffer is bounded to 64
+    megapixels. Non-Windows keeps softbuffer behind the same
+    `FrameBuffer`/`SurfaceState` shape — and `cargo check --target
+    x86_64-unknown-linux-gnu -p eframe --features software` is now part of understanding a
+    change here: the previous state did **not** compile for Linux (`age()`/`pixels_mut()`
+    do not exist on `softbuffer::Buffer`), which `build.py --check` caught only because it
+    cross-builds Linux.
+  - **Restore/ack:** `restore_window` no longer calls `acknowledge_show`; `finish_restore`
+    acknowledges after a painted frame (`painted_since_restore`, bounded by
+    `RESTORE_MAX_TICKS = 8` / `RESTORE_ACK_DEADLINE = 2 s`) and warns when it gives up.
+    Uncloaking re-reads `DwmGetWindowAttribute(DWMWA_CLOAKED)`, `ensure_window_on_screen`
+    repairs off-screen geometry, `raise_above_topmost` outranks a lingering topmost
+    fullscreen game, and `ensure_presentable` covers the hotkey worker's busy outcome.
+  - **Placement:** `ui_state` persists `position_px=` (physical pixels) next to the legacy
+    logical `position=` (both still parsed and written); startup applies the pixel position
+    and fits the rect into the monitor's work area; `ensure_window_on_screen` also runs on
+    every restore and on a monitor-size change; `min_inner_size` is clamped to the largest
+    monitor and the window is created at `size * ui_zoom` so the first frame's read-back
+    matches.
+  - **Graphics failures:** GDI failures are `Result`s, no allocator thread to wait on, and
+    `egui-wgpu`'s `recreate_surface` creates the replacement before dropping the old
+    surface (a failed recreate used to delete the map entry, so the new retry had nothing
+    to retry and a paused window stayed stale); zero-size surfaces no longer `expect`.
+  - **Tray:** `TRAY_STATE` (starting/ready/failed) gates both close-to-tray and a
+    start-minimized launch (`INITIAL_HIDE_TRAY_WAIT = 3 s`); `rescue_window_hidden_without_tray`
+    brings back a window hidden to a tray that later failed.
+  - **Input/dialogs:** `WM_CAPTURECHANGED` synthesizes button releases, egui clears held
+    buttons on focus loss, a release after `CursorLeft` is forwarded at the last known
+    position; the dump picker and the Run dialog's Browse run on their own threads and are
+    polled; `run_shell_action` moved `open_url`/`open_file_location`/`open_properties` onto
+    the action executor; `toast_from` drops empty messages; the Select columns list height
+    is clamped to the viewport.
+  Gates: `pwsh tools/check-fork.ps1` green, `python build.py --check` green (fmt, clippy
+  `-D warnings`, all workspace tests, Windows release + setup, Linux glibc cross-build),
+  `cargo +stable clippy --workspace --all-targets --all-features -- -D warnings` green.
+  Still open: the audit asked for the display-change / exclusive-fullscreen / hung-renderer
+  scenarios to be reproduced on a real desktop; they cannot be verified headlessly, so the
+  manual checks are `tools/test-resize.ps1` and `TASKMAN_FPS_PROBE=1`. Deliberately not
+  done: the chat's dialog-window sizing note (settings/properties windows larger than a
+  small viewport) — it changes visible layout and needs the user's eyes; the select-columns
+  clamp was the safe part.

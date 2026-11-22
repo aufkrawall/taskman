@@ -118,6 +118,583 @@ fn should_force_full_paint(
     !has_presented_once || !presented_while_visible || buffer_age != 1
 }
 
+/// Clamp `rect` to `[0..width, 0..height]`, returning `None` when the intersection is empty.
+fn clamp_pixel_rect(
+    rect: egui_software::PixelRect,
+    width: u32,
+    height: u32,
+) -> Option<egui_software::PixelRect> {
+    let max_w = i32::try_from(width).ok()?;
+    let max_h = i32::try_from(height).ok()?;
+    let min_x = rect.min_x.clamp(0, max_w);
+    let min_y = rect.min_y.clamp(0, max_h);
+    let max_x = rect.max_x.clamp(0, max_w);
+    let max_y = rect.max_y.clamp(0, max_h);
+    (min_x < max_x && min_y < max_y).then_some(egui_software::PixelRect {
+        min_x,
+        min_y,
+        max_x,
+        max_y,
+    })
+}
+
+fn rect_contains(outer: egui_software::PixelRect, inner: egui_software::PixelRect) -> bool {
+    outer.min_x <= inner.min_x
+        && outer.min_y <= inner.min_y
+        && outer.max_x >= inner.max_x
+        && outer.max_y >= inner.max_y
+}
+
+/// Combine egui's tile-damage rects with any OS-invalidated update rect (`WM_PAINT`).
+///
+/// Even when zero egui tiles changed, a non-empty OS update region means the windowing
+/// system needs those pixels re-blitted from our retained buffer. Returns `(rects, is_full)`.
+fn rects_to_present(
+    dirty_rects: &[egui_software::PixelRect],
+    os_update_rect: Option<egui_software::PixelRect>,
+    width: u32,
+    height: u32,
+) -> (Vec<egui_software::PixelRect>, bool) {
+    let Some(full_rect) = clamp_pixel_rect(
+        egui_software::PixelRect {
+            min_x: 0,
+            min_y: 0,
+            max_x: i32::try_from(width).unwrap_or(i32::MAX),
+            max_y: i32::try_from(height).unwrap_or(i32::MAX),
+        },
+        width,
+        height,
+    ) else {
+        return (Vec::new(), false);
+    };
+
+    let os_clamped = os_update_rect.and_then(|r| clamp_pixel_rect(r, width, height));
+    if os_clamped == Some(full_rect) || (dirty_rects.len() == 1 && dirty_rects[0] == full_rect) {
+        return (vec![full_rect], true);
+    }
+
+    let mut rects: Vec<egui_software::PixelRect> = dirty_rects
+        .iter()
+        .copied()
+        .filter_map(|r| clamp_pixel_rect(r, width, height))
+        .collect();
+
+    if let Some(os_rc) = os_clamped
+        && !rects.iter().any(|r| rect_contains(*r, os_rc))
+    {
+        rects.push(os_rc);
+    }
+
+    let is_full = rects.len() == 1 && rects[0] == full_rect;
+    (rects, is_full)
+}
+
+/// Track the app's own visibility request, so eframe's first-frame reveal cannot
+/// override it (see [`EpiIntegration::post_rendering`]).
+fn note_visibility_commands(app_requested_hidden: &mut bool, commands: &[egui::ViewportCommand]) {
+    for command in commands {
+        if let egui::ViewportCommand::Visible(visible) = command {
+            *app_requested_hidden = !visible;
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+#[expect(unsafe_code)]
+mod platform_surface {
+    use std::{
+        num::NonZeroU32,
+        ptr::{self, NonNull},
+        slice,
+        sync::Arc,
+    };
+
+    use raw_window_handle::{HasWindowHandle as _, RawWindowHandle};
+    use windows_sys::Win32::{
+        Foundation::{HWND, RECT},
+        Graphics::Gdi,
+    };
+    use winit::window::Window;
+
+    /// Upper bound on buffer allocation (64 megapixels = 256 MiB, well above dual-8K).
+    const MAX_BUFFER_PIXELS: usize = 64 * 1024 * 1024;
+
+    #[repr(C)]
+    struct BitmapInfo {
+        bmi_header: Gdi::BITMAPINFOHEADER,
+        bmi_colors: [Gdi::RGBQUAD; 3],
+    }
+
+    const ZERO_QUAD: Gdi::RGBQUAD = Gdi::RGBQUAD {
+        rgbBlue: 0,
+        rgbGreen: 0,
+        rgbRed: 0,
+        rgbReserved: 0,
+    };
+
+    pub(super) struct Win32Buffer {
+        dc: Gdi::HDC,
+        bitmap: Gdi::HBITMAP,
+        old_obj: Gdi::HGDIOBJ,
+        pixels: NonNull<u32>,
+        width: u32,
+        height: u32,
+        len: usize,
+        presented: bool,
+    }
+
+    impl Drop for Win32Buffer {
+        fn drop(&mut self) {
+            // SAFETY: `dc`, `bitmap`, and `old_obj` are owned GDI handles created on this thread.
+            unsafe {
+                if !self.old_obj.is_null() {
+                    Gdi::SelectObject(self.dc, self.old_obj);
+                }
+                if !self.bitmap.is_null() {
+                    Gdi::DeleteObject(self.bitmap);
+                }
+                if !self.dc.is_null() {
+                    Gdi::DeleteDC(self.dc);
+                }
+            }
+        }
+    }
+
+    impl Win32Buffer {
+        fn new(width: NonZeroU32, height: NonZeroU32) -> Result<Self, String> {
+            let w_u32 = width.get();
+            let h_u32 = height.get();
+            let w_i32 = i32::try_from(w_u32).map_err(|_| "width out of i32 range".to_owned())?;
+            let h_i32 = i32::try_from(h_u32).map_err(|_| "height out of i32 range".to_owned())?;
+            let len = (w_u32 as usize)
+                .checked_mul(h_u32 as usize)
+                .filter(|&n| n > 0 && n <= MAX_BUFFER_PIXELS)
+                .ok_or_else(|| format!("invalid buffer dimensions {w_u32}x{h_u32}"))?;
+
+            // SAFETY: Creates a memory DC compatible with the current display on the window thread.
+            let dc = unsafe { Gdi::CreateCompatibleDC(ptr::null_mut()) };
+            if dc.is_null() {
+                return Err(format!(
+                    "CreateCompatibleDC failed: {}",
+                    std::io::Error::last_os_error()
+                ));
+            }
+
+            let bitmap_info = BitmapInfo {
+                bmi_header: Gdi::BITMAPINFOHEADER {
+                    biSize: std::mem::size_of::<Gdi::BITMAPINFOHEADER>() as u32,
+                    biWidth: w_i32,
+                    biHeight: -h_i32, // top-down DIB
+                    biPlanes: 1,
+                    biBitCount: 32,
+                    biCompression: Gdi::BI_BITFIELDS,
+                    biSizeImage: 0,
+                    biXPelsPerMeter: 0,
+                    biYPelsPerMeter: 0,
+                    biClrUsed: 0,
+                    biClrImportant: 0,
+                },
+                bmi_colors: [
+                    Gdi::RGBQUAD {
+                        rgbRed: 0xff,
+                        ..ZERO_QUAD
+                    },
+                    Gdi::RGBQUAD {
+                        rgbGreen: 0xff,
+                        ..ZERO_QUAD
+                    },
+                    Gdi::RGBQUAD {
+                        rgbBlue: 0xff,
+                        ..ZERO_QUAD
+                    },
+                ],
+            };
+
+            let mut raw_pixels: *mut u32 = ptr::null_mut();
+            // SAFETY: `bitmap_info` is a valid 32-bpp BI_BITFIELDS header and `raw_pixels` receives
+            // the GDI-allocated section pointer.
+            let bitmap = unsafe {
+                Gdi::CreateDIBSection(
+                    dc,
+                    ptr::from_ref(&bitmap_info).cast(),
+                    Gdi::DIB_RGB_COLORS,
+                    ptr::from_mut(&mut raw_pixels).cast(),
+                    ptr::null_mut(),
+                    0,
+                )
+            };
+            let Some(pixels) = (!bitmap.is_null())
+                .then(|| NonNull::new(raw_pixels))
+                .flatten()
+            else {
+                let err = std::io::Error::last_os_error();
+                // SAFETY: Clean up any partially created GDI objects before returning error.
+                unsafe {
+                    if !bitmap.is_null() {
+                        Gdi::DeleteObject(bitmap);
+                    }
+                    Gdi::DeleteDC(dc);
+                }
+                return Err(format!("CreateDIBSection({w_u32}x{h_u32}) failed: {err}"));
+            };
+
+            // SAFETY: `dc` and `bitmap` are valid handles just created above.
+            let old_obj = unsafe { Gdi::SelectObject(dc, bitmap) };
+            if old_obj.is_null() {
+                // SAFETY: Clean up GDI handles on SelectObject failure.
+                unsafe {
+                    Gdi::DeleteObject(bitmap);
+                    Gdi::DeleteDC(dc);
+                }
+                return Err("SelectObject failed for DIB section".to_owned());
+            }
+
+            Ok(Self {
+                dc,
+                bitmap,
+                old_obj,
+                pixels,
+                width: w_u32,
+                height: h_u32,
+                len,
+                presented: false,
+            })
+        }
+
+        pub(super) fn age(&self) -> u8 {
+            u8::from(self.presented)
+        }
+
+        pub(super) fn pixels_mut(&mut self) -> &mut [u32] {
+            // SAFETY: `pixels` points to `len` 32-bit pixels allocated by `CreateDIBSection` and
+            // exclusively borrowed via `&mut self`.
+            unsafe { slice::from_raw_parts_mut(self.pixels.as_ptr(), self.len) }
+        }
+    }
+
+    /// One frame's pixels: the surface's DIB, borrowed for the frame. The
+    /// other platform's `FrameBuffer` owns its buffer instead, so this is the
+    /// same shape to the shared paint path.
+    pub(super) struct FrameBuffer<'a> {
+        buffer: &'a mut Win32Buffer,
+    }
+
+    impl FrameBuffer<'_> {
+        pub(super) fn age(&self) -> u8 {
+            self.buffer.age()
+        }
+
+        pub(super) fn pixels_mut(&mut self) -> &mut [u32] {
+            self.buffer.pixels_mut()
+        }
+    }
+
+    pub(super) struct SurfaceState {
+        hwnd: HWND,
+        _window: Arc<Window>,
+        buffer: Option<Win32Buffer>,
+        pub(super) size: (u32, u32),
+    }
+
+    impl SurfaceState {
+        pub(super) fn new(window: &Arc<Window>) -> crate::Result<Self> {
+            let raw = window
+                .window_handle()
+                .map_err(|err| crate::Error::AppCreation(format!("window_handle: {err}").into()))?
+                .as_raw();
+            let RawWindowHandle::Win32(handle) = raw else {
+                return Err(crate::Error::AppCreation(
+                    "expected Win32 window handle".into(),
+                ));
+            };
+            let hwnd = handle.hwnd.get() as HWND;
+            if hwnd.is_null() {
+                return Err(crate::Error::AppCreation("Win32 HWND is null".into()));
+            }
+            // Verify that a device context can be acquired for this window.
+            // SAFETY: `hwnd` is a live window handle created by winit on this thread.
+            let dc = unsafe { Gdi::GetDC(hwnd) };
+            if dc.is_null() {
+                return Err(crate::Error::AppCreation(
+                    format!("GetDC failed: {}", std::io::Error::last_os_error()).into(),
+                ));
+            }
+            // SAFETY: Releases the common DC back to the window immediately.
+            unsafe {
+                Gdi::ReleaseDC(hwnd, dc);
+            }
+            Ok(Self {
+                hwnd,
+                _window: Arc::clone(window),
+                buffer: None,
+                size: (0, 0),
+            })
+        }
+
+        pub(super) fn resize(
+            &mut self,
+            width: NonZeroU32,
+            height: NonZeroU32,
+        ) -> Result<(), String> {
+            if self
+                .buffer
+                .as_ref()
+                .is_some_and(|b| b.width == width.get() && b.height == height.get())
+            {
+                self.size = (width.get(), height.get());
+                return Ok(());
+            }
+            let new_buffer = Win32Buffer::new(width, height)?;
+            self.buffer = Some(new_buffer);
+            self.size = (width.get(), height.get());
+            Ok(())
+        }
+
+        pub(super) fn buffer_mut(&mut self) -> Result<FrameBuffer<'_>, String> {
+            let buffer = self
+                .buffer
+                .as_mut()
+                .ok_or_else(|| "surface buffer not allocated".to_owned())?;
+            Ok(FrameBuffer { buffer })
+        }
+
+        /// Query the OS update region (`GetUpdateRect`) before `DefWindowProcW` validates it.
+        pub(super) fn os_update_rect(&self) -> Option<egui_software::PixelRect> {
+            let mut rc = RECT {
+                left: 0,
+                top: 0,
+                right: 0,
+                bottom: 0,
+            };
+            // SAFETY: `self.hwnd` is valid for the lifetime of `_window`.
+            let has_update = unsafe { Gdi::GetUpdateRect(self.hwnd, &mut rc, 0) != 0 };
+            if has_update && rc.right > rc.left && rc.bottom > rc.top {
+                Some(egui_software::PixelRect {
+                    min_x: rc.left,
+                    min_y: rc.top,
+                    max_x: rc.right,
+                    max_y: rc.bottom,
+                })
+            } else {
+                None
+            }
+        }
+
+        /// Blit `rects` from the DIB buffer to the window DC, checking `BitBlt`'s return value
+        /// and validating only regions that actually succeeded.
+        pub(super) fn present_rects(
+            &mut self,
+            rects: &[egui_software::PixelRect],
+            validate_full: bool,
+        ) -> Result<(), String> {
+            let Some(buffer) = self.buffer.as_mut() else {
+                return Err("surface buffer not allocated".to_owned());
+            };
+            // Acquire a fresh DC per present rather than holding a common DC across frames or
+            // display-mode changes.
+            // SAFETY: `self.hwnd` is valid on this thread.
+            let window_dc = unsafe { Gdi::GetDC(self.hwnd) };
+            if window_dc.is_null() {
+                buffer.presented = false;
+                return Err(format!(
+                    "GetDC returned null during present: {}",
+                    std::io::Error::last_os_error()
+                ));
+            }
+
+            let max_w = i32::try_from(buffer.width).unwrap_or(i32::MAX);
+            let max_h = i32::try_from(buffer.height).unwrap_or(i32::MAX);
+            for rect in rects.iter().copied() {
+                let min_x = rect.min_x.clamp(0, max_w);
+                let min_y = rect.min_y.clamp(0, max_h);
+                let max_x = rect.max_x.clamp(0, max_w);
+                let max_y = rect.max_y.clamp(0, max_h);
+                let width = max_x - min_x;
+                let height = max_y - min_y;
+                if width <= 0 || height <= 0 {
+                    continue;
+                }
+                // SAFETY: `window_dc` and `buffer.dc` are valid DCs and the rectangle is clamped
+                // to the allocated DIB dimensions.
+                let ok = unsafe {
+                    Gdi::BitBlt(
+                        window_dc,
+                        min_x,
+                        min_y,
+                        width,
+                        height,
+                        buffer.dc,
+                        min_x,
+                        min_y,
+                        Gdi::SRCCOPY,
+                    )
+                };
+                if ok == 0 {
+                    let err = std::io::Error::last_os_error();
+                    // SAFETY: Always release the common window DC before returning.
+                    unsafe {
+                        Gdi::ReleaseDC(self.hwnd, window_dc);
+                    }
+                    buffer.presented = false;
+                    return Err(format!(
+                        "BitBlt({min_x},{min_y} {width}x{height}) failed: {err}"
+                    ));
+                }
+                if !validate_full {
+                    let valid = RECT {
+                        left: min_x,
+                        top: min_y,
+                        right: max_x,
+                        bottom: max_y,
+                    };
+                    // SAFETY: Validates only the rectangle whose pixels were just blitted.
+                    unsafe {
+                        Gdi::ValidateRect(self.hwnd, &valid);
+                    }
+                }
+            }
+
+            // SAFETY: Release the common window DC.
+            unsafe {
+                Gdi::ReleaseDC(self.hwnd, window_dc);
+                if validate_full {
+                    Gdi::ValidateRect(self.hwnd, ptr::null());
+                }
+            }
+            buffer.presented = true;
+            Ok(())
+        }
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+mod platform_surface {
+    use std::{num::NonZeroU32, sync::Arc};
+    use winit::window::Window;
+
+    /// One frame's pixels, in the shape the shared paint path asks for.
+    ///
+    /// `softbuffer` hands out a `Buffer` that derefs to the pixel slice but
+    /// knows nothing about the lifetime of its contents, which the shared path
+    /// needs for `age()`: every softbuffer backend reuses the same segment (X11
+    /// and Wayland both keep one back buffer), so the pixels survive a frame
+    /// once one has been presented into them.
+    pub(super) struct FrameBuffer<'a> {
+        buffer: softbuffer::Buffer<'a, Arc<Window>, Arc<Window>>,
+        age: u8,
+    }
+
+    impl FrameBuffer<'_> {
+        /// `1` when this buffer already holds presented pixels, `0` for a
+        /// first frame that must be painted in full.
+        pub(super) fn age(&self) -> u8 {
+            self.age
+        }
+
+        pub(super) fn pixels_mut(&mut self) -> &mut [u32] {
+            &mut self.buffer
+        }
+    }
+
+    pub(super) struct SurfaceState {
+        /// Field order is load-bearing: `surface` borrows from `_context`, and Rust drops
+        /// fields in declaration order.
+        surface: softbuffer::Surface<Arc<Window>, Arc<Window>>,
+        _context: softbuffer::Context<Arc<Window>>,
+        pub(super) size: (u32, u32),
+        /// A frame reached the window, so the reused buffer holds real pixels.
+        presented: bool,
+    }
+
+    impl SurfaceState {
+        pub(super) fn new(window: &Arc<Window>) -> crate::Result<Self> {
+            let context = softbuffer::Context::new(Arc::clone(window)).map_err(|err| {
+                crate::Error::AppCreation(format!("softbuffer context: {err}").into())
+            })?;
+            let surface =
+                softbuffer::Surface::new(&context, Arc::clone(window)).map_err(|err| {
+                    crate::Error::AppCreation(format!("softbuffer surface: {err}").into())
+                })?;
+            Ok(Self {
+                surface,
+                _context: context,
+                size: (0, 0),
+                presented: false,
+            })
+        }
+
+        pub(super) fn resize(
+            &mut self,
+            width: NonZeroU32,
+            height: NonZeroU32,
+        ) -> Result<(), String> {
+            if self.size == (width.get(), height.get()) {
+                return Ok(());
+            }
+            self.surface
+                .resize(width, height)
+                .map_err(|err| format!("resize: {err}"))?;
+            self.size = (width.get(), height.get());
+            Ok(())
+        }
+
+        pub(super) fn buffer_mut(&mut self) -> Result<FrameBuffer<'_>, String> {
+            let age = u8::from(self.presented);
+            let buffer = self
+                .surface
+                .buffer_mut()
+                .map_err(|err| format!("softbuffer buffer: {err}"))?;
+            Ok(FrameBuffer { buffer, age })
+        }
+
+        #[expect(clippy::unused_self)]
+        pub(super) fn os_update_rect(&self) -> Option<egui_software::PixelRect> {
+            // The X11/Wayland backends report damage to the window system
+            // themselves (`present_with_damage`), so there is no OS-side
+            // update region to merge in.
+            None
+        }
+
+        pub(super) fn present_rects(
+            &mut self,
+            rects: &[egui_software::PixelRect],
+            validate_full: bool,
+        ) -> Result<(), String> {
+            let buffer = self
+                .surface
+                .buffer_mut()
+                .map_err(|err| format!("softbuffer buffer: {err}"))?;
+            let presented = if validate_full {
+                buffer.present()
+            } else {
+                let sb_rects: Vec<softbuffer::Rect> = rects
+                    .iter()
+                    .filter_map(|r| {
+                        let w = NonZeroU32::new(u32::try_from(r.width()).ok()?)?;
+                        let h = NonZeroU32::new(u32::try_from(r.height()).ok()?)?;
+                        Some(softbuffer::Rect {
+                            x: u32::try_from(r.min_x).ok()?,
+                            y: u32::try_from(r.min_y).ok()?,
+                            width: w,
+                            height: h,
+                        })
+                    })
+                    .collect();
+                if sb_rects.is_empty() {
+                    buffer.present()
+                } else {
+                    buffer.present_with_damage(&sb_rects)
+                }
+            };
+            presented.map_err(|err| format!("softbuffer present: {err}"))?;
+            self.presented = true;
+            Ok(())
+        }
+    }
+}
+
+use platform_surface::SurfaceState;
+
 pub struct SoftwareWinitApp<'app> {
     repaint_proxy: Arc<egui::mutex::Mutex<winit::event_loop::EventLoopProxy<UserEvent>>>,
     app_name: String,
@@ -167,15 +744,23 @@ struct SoftwareWinitRunning<'app> {
     /// zero-sized). Dropping a `TexturesDelta` panics, and skipping one would leave the
     /// atlas permanently stale, so they accumulate until a frame can consume them.
     pending_deltas: egui::TexturesDelta,
+
+    /// The app itself asked for the window to be hidden and has not asked for it
+    /// back since. `post_rendering` reveals the window after the first painted
+    /// frame, which must not override that request: a start-in-tray launch sends
+    /// `ViewportCommand::Visible(false)` in its first frame, and the reveal would
+    /// leave the window on screen with nothing left to hide it.
+    app_requested_hidden: bool,
 }
 
-struct SurfaceState {
-    /// Field order is load-bearing: `surface` borrows from `context`, and Rust drops
-    /// fields in declaration order.
-    surface: softbuffer::Surface<Arc<Window>, Arc<Window>>,
-    _context: softbuffer::Context<Arc<Window>>,
-    /// Last size we told softbuffer about, so `resize` is not called every frame.
-    size: (u32, u32),
+impl Drop for SoftwareWinitRunning<'_> {
+    fn drop(&mut self) {
+        // A `TexturesDelta` left unapplied panics in its `Drop` (debug builds):
+        // exiting while the window is hidden, with a font/theme/texture change
+        // still queued, would panic during teardown. The atlas is gone with the
+        // window anyway.
+        self.pending_deltas.clear();
+    }
 }
 
 impl<'app> SoftwareWinitApp<'app> {
@@ -240,12 +825,7 @@ impl<'app> SoftwareWinitApp<'app> {
             Arc::new(window)
         };
 
-        let context = softbuffer::Context::new(Arc::clone(&window)).map_err(|err| {
-            crate::Error::AppCreation(format!("softbuffer context: {err}").into())
-        })?;
-        let surface = softbuffer::Surface::new(&context, Arc::clone(&window)).map_err(|err| {
-            crate::Error::AppCreation(format!("softbuffer surface: {err}").into())
-        })?;
+        let surface_state = SurfaceState::new(&window)?;
 
         let mut egui_winit = egui_winit::State::new(
             egui_ctx.clone(),
@@ -352,15 +932,12 @@ impl<'app> SoftwareWinitApp<'app> {
             egui_winit,
             info,
             painter: egui_software::Painter::new(),
-            surface: Rc::new(RefCell::new(SurfaceState {
-                surface,
-                _context: context,
-                size: (0, 0),
-            })),
+            surface: Rc::new(RefCell::new(surface_state)),
             has_presented_once: false,
             presented_while_visible: false,
             logged_first_frame: false,
             pending_deltas: Default::default(),
+            app_requested_hidden: false,
         });
 
         Ok(())
@@ -398,6 +975,74 @@ impl SoftwareWinitRunning<'_> {
             false,
         );
 
+        let initial_size = self.window.inner_size();
+        let initial_hidden = self.window.is_visible() == Some(false)
+            || self.window.is_minimized() == Some(true)
+            || self.info.occluded == Some(true);
+
+        if initial_hidden {
+            self.presented_while_visible = false;
+        }
+
+        // After the first frame has been painted, a hidden, minimized, or occluded
+        // window runs only `App::logic` (`update_logic_only`), matching `wgpu` and
+        // `glow`. This keeps `App::ui` from running while off-screen (so the app
+        // knows to release background telemetry providers and stretch its tick) and
+        // avoids laying out into a 0x0 minimized viewport. If `logic` issues a
+        // viewport command that reveals/unminimizes the window (e.g. tray restore
+        // or Ctrl+Shift+Esc), we process those commands and immediately fall through
+        // to paint and present the restored frame in this same turn.
+        if self.has_presented_once
+            && (initial_hidden || initial_size.width == 0 || initial_size.height == 0)
+        {
+            let mut raw_input = self.egui_winit.take_egui_input(&self.window);
+            raw_input.viewports = std::iter::once((ViewportId::ROOT, self.info.clone())).collect();
+            self.info.events.clear();
+
+            let egui::LogicOutput {
+                platform_output,
+                viewport_commands,
+            } = self
+                .integration
+                .update_logic_only(self.app.as_mut(), raw_input);
+
+            self.egui_winit
+                .handle_platform_output(&self.window, platform_output);
+
+            if let Some(commands) = viewport_commands.get(&ViewportId::ROOT) {
+                let mut actions_requested: Vec<ActionRequested> = Vec::new();
+                note_visibility_commands(&mut self.app_requested_hidden, commands);
+                process_viewport_commands(
+                    &self.integration.egui_ctx,
+                    &mut self.info,
+                    commands.iter().cloned(),
+                    &self.window,
+                    &mut actions_requested,
+                );
+            }
+
+            let now_hidden = self.window.is_visible() == Some(false)
+                || self.window.is_minimized() == Some(true)
+                || self.info.occluded == Some(true);
+            let now_size = self.window.inner_size();
+            if now_hidden || now_size.width == 0 || now_size.height == 0 {
+                sleep_if_invisible_or_minimized(Some(&self.window));
+                self.integration
+                    .maybe_autosave(self.app.as_mut(), Some(&self.window));
+                if self.integration.should_close() {
+                    return Ok(EventResult::CloseRequested);
+                }
+                return Ok(EventResult::Wait);
+            }
+
+            egui_winit::update_viewport_info(
+                &mut self.info,
+                &self.integration.egui_ctx,
+                &self.window,
+                false,
+            );
+        }
+
         let mut raw_input = self.egui_winit.take_egui_input(&self.window);
         raw_input.viewports = std::iter::once((ViewportId::ROOT, self.info.clone())).collect();
         // Handed to egui now, so they must not be delivered again next frame -- a Close
@@ -431,34 +1076,32 @@ impl SoftwareWinitRunning<'_> {
         self.egui_winit
             .handle_platform_output(&self.window, platform_output);
 
-        // The *first* frame must be painted even though the window is still hidden:
-        // `post_rendering` below is what reveals it, and eframe deliberately keeps the
-        // window hidden until something has been drawn to avoid a white flash. After
-        // that, painting a window nobody can see is pure waste -- and worse than waste
-        // on Windows, where upstream documents an invisible window burning a whole core
-        // (emilk/egui#7776). Forced continuous repaints into a hidden window also grow
-        // the stack until the process dies, which is reproducible here with the painting
-        // removed entirely, so it is the repaint loop and not the rasterizer.
-        //
-        // Skipping is safe because visibility changes arrive as viewport commands, which
-        // are processed below regardless -- restoring from the tray resumes painting.
+        // Process viewport commands BEFORE painting if they reveal or unminimize the
+        // window, so the present below lands directly onto the visible window surface.
+        for (id, output) in &viewport_output {
+            if *id == ViewportId::ROOT {
+                self.handle_root_viewport_output(output);
+            } else {
+                log::warn!(
+                    "eframe: the software renderer supports only the root viewport; \
+                     ignoring viewport {id:?}"
+                );
+            }
+        }
+
         let size = self.window.inner_size();
-        let hidden =
-            self.window.is_visible() == Some(false) || self.window.is_minimized() == Some(true);
+        let hidden = self.window.is_visible() == Some(false)
+            || self.window.is_minimized() == Some(true)
+            || self.info.occluded == Some(true);
         let paintable = size.width > 0 && size.height > 0 && (!hidden || !self.has_presented_once);
 
         if paintable {
             if hidden {
                 self.presented_while_visible = false;
             }
-            // Take the sub-pixel mode from the ATLAS, not from the style. The atlas is
-            // what actually holds the coverage, so asking it makes the blend mode and the
-            // rasterization mode agree by construction -- the one failure here that does
-            // not error, it just draws wrong colours.
             // Sub-pixel mode *and* its blend parameters both come from the atlas's
             // options, so the way glyphs were rasterized and the way they are blended
-            // cannot disagree. That is the one failure here that does not error -- it
-            // just draws wrong colours.
+            // cannot disagree.
             let (subpixel, gamma, contrast) = self.integration.egui_ctx.fonts(|f| {
                 let o = f.options();
                 (o.subpixel, o.text_gamma, o.text_contrast)
@@ -485,126 +1128,113 @@ impl SoftwareWinitRunning<'_> {
                 }
             }
 
+            if let (Some(w), Some(h)) = (NonZeroU32::new(size.width), NonZeroU32::new(size.height))
             {
                 let mut state = self.surface.borrow_mut();
-                let (Some(w), Some(h)) =
-                    (NonZeroU32::new(size.width), NonZeroU32::new(size.height))
-                else {
-                    return Ok(EventResult::Wait);
-                };
-                if state.size != (size.width, size.height) {
-                    state.surface.resize(w, h).map_err(|err| {
-                        crate::Error::AppCreation(format!("resize: {err}").into())
-                    })?;
-                    state.size = (size.width, size.height);
-                }
-
-                let mut buffer = state.surface.buffer_mut().map_err(|err| {
-                    crate::Error::AppCreation(format!("softbuffer buffer: {err}").into())
-                })?;
-                let force_full = should_force_full_paint(
-                    self.has_presented_once,
-                    self.presented_while_visible,
-                    buffer.age(),
-                );
-
-                let paint_start = Instant::now();
-                let damage = if let Some(mut target) =
-                    egui_software::Target::new(&mut buffer, size.width, size.height)
-                {
-                    // `clear_color` returns premultiplied gamma-space floats in 0..=1.
-                    // The alpha is meaningless on an opaque window buffer, so only the RGB
-                    // is used, scaled back to bytes.
-                    let byte = |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() as u8;
-                    let clear_color =
-                        egui::Color32::from_rgb(byte(clear[0]), byte(clear[1]), byte(clear[2]));
-                    self.painter.paint_shapes_damaged(
-                        &mut target,
-                        &shape_ctx,
-                        shapes,
-                        clear_color,
-                        force_full,
-                    )
+                let os_dirty = if hidden { None } else { state.os_update_rect() };
+                if let Err(err) = state.resize(w, h) {
+                    log::warn!("software renderer resize({}x{}) failed: {err}", w, h);
+                    self.presented_while_visible = false;
+                    self.integration
+                        .egui_ctx
+                        .request_repaint_after(std::time::Duration::from_millis(50));
                 } else {
-                    egui_software::DamageStats::default()
-                };
-                let paint_ns = paint_start.elapsed().as_nanos() as u64;
-                SOFTWARE_FRAME_STATS
-                    .paint_ns_sum
-                    .fetch_add(paint_ns, Ordering::Relaxed);
-                update_max(&SOFTWARE_FRAME_STATS.paint_ns_max, paint_ns);
-                SOFTWARE_FRAME_STATS
-                    .dirty_tiles
-                    .fetch_add(damage.dirty_tiles as u64, Ordering::Relaxed);
-                SOFTWARE_FRAME_STATS
-                    .total_tiles
-                    .fetch_add(damage.total_tiles as u64, Ordering::Relaxed);
-
-                self.has_presented_once = true;
-                if !self.logged_first_frame {
-                    self.logged_first_frame = true;
-                    log::info!(
-                        "software renderer: first frame {}x{} px, sub-pixel text {:?}",
-                        size.width,
-                        size.height,
-                        subpixel
-                    );
-                }
-
-                if damage.dirty_rects.is_empty() {
-                    SOFTWARE_FRAME_STATS
-                        .skipped_damage
-                        .fetch_add(1, Ordering::Relaxed);
-                } else {
-                    let present_start = Instant::now();
-                    let full_screen = damage.dirty_rects.len() == 1
-                        && damage.dirty_rects[0]
-                            == egui_software::PixelRect {
-                                min_x: 0,
-                                min_y: 0,
-                                max_x: size.width as i32,
-                                max_y: size.height as i32,
+                    let paint_outcome = match state.buffer_mut() {
+                        Ok(mut buffer) => {
+                            let force_full = should_force_full_paint(
+                                self.has_presented_once,
+                                self.presented_while_visible,
+                                buffer.age(),
+                            );
+                            let paint_start = Instant::now();
+                            let damage = if let Some(mut target) = egui_software::Target::new(
+                                buffer.pixels_mut(),
+                                size.width,
+                                size.height,
+                            ) {
+                                let byte = |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() as u8;
+                                let clear_color = egui::Color32::from_rgb(
+                                    byte(clear[0]),
+                                    byte(clear[1]),
+                                    byte(clear[2]),
+                                );
+                                self.painter.paint_shapes_damaged(
+                                    &mut target,
+                                    &shape_ctx,
+                                    shapes,
+                                    clear_color,
+                                    force_full,
+                                )
+                            } else {
+                                egui_software::DamageStats::default()
                             };
-                    if full_screen {
-                        buffer.present().map_err(|err| {
-                            crate::Error::AppCreation(format!("softbuffer present: {err}").into())
-                        })?;
-                    } else {
-                        let rects: Vec<softbuffer::Rect> = damage
-                            .dirty_rects
-                            .iter()
-                            .filter_map(|r| {
-                                let w = NonZeroU32::new(u32::try_from(r.width()).ok()?)?;
-                                let h = NonZeroU32::new(u32::try_from(r.height()).ok()?)?;
-                                Some(softbuffer::Rect {
-                                    x: u32::try_from(r.min_x).ok()?,
-                                    y: u32::try_from(r.min_y).ok()?,
-                                    width: w,
-                                    height: h,
-                                })
-                            })
-                            .collect();
-                        if rects.is_empty() {
-                            buffer.present().map_err(|err| {
-                                crate::Error::AppCreation(
-                                    format!("softbuffer present: {err}").into(),
-                                )
-                            })?;
-                        } else {
-                            buffer.present_with_damage(&rects).map_err(|err| {
-                                crate::Error::AppCreation(
-                                    format!("softbuffer present_with_damage: {err}").into(),
-                                )
-                            })?;
+                            let paint_ns = paint_start.elapsed().as_nanos() as u64;
+                            SOFTWARE_FRAME_STATS
+                                .paint_ns_sum
+                                .fetch_add(paint_ns, Ordering::Relaxed);
+                            update_max(&SOFTWARE_FRAME_STATS.paint_ns_max, paint_ns);
+                            SOFTWARE_FRAME_STATS
+                                .dirty_tiles
+                                .fetch_add(damage.dirty_tiles as u64, Ordering::Relaxed);
+                            SOFTWARE_FRAME_STATS
+                                .total_tiles
+                                .fetch_add(damage.total_tiles as u64, Ordering::Relaxed);
+                            Some((damage, force_full))
                         }
-                    }
-                    let present_ns = present_start.elapsed().as_nanos() as u64;
-                    SOFTWARE_FRAME_STATS
-                        .present_ns_sum
-                        .fetch_add(present_ns, Ordering::Relaxed);
-                    update_max(&SOFTWARE_FRAME_STATS.present_ns_max, present_ns);
-                    if !hidden && full_screen {
-                        self.presented_while_visible = true;
+                        Err(err) => {
+                            log::warn!("software renderer buffer access failed: {err}");
+                            self.presented_while_visible = false;
+                            self.integration
+                                .egui_ctx
+                                .request_repaint_after(std::time::Duration::from_millis(50));
+                            None
+                        }
+                    };
+
+                    if let Some((damage, force_full)) = paint_outcome {
+                        self.has_presented_once = true;
+                        if !self.logged_first_frame {
+                            self.logged_first_frame = true;
+                            log::info!(
+                                "software renderer: first frame {}x{} px, sub-pixel text {:?}",
+                                size.width,
+                                size.height,
+                                subpixel
+                            );
+                        }
+
+                        let (present_rects, full_screen) = rects_to_present(
+                            &damage.dirty_rects,
+                            os_dirty,
+                            size.width,
+                            size.height,
+                        );
+                        if present_rects.is_empty() {
+                            SOFTWARE_FRAME_STATS
+                                .skipped_damage
+                                .fetch_add(1, Ordering::Relaxed);
+                        } else {
+                            let present_start = Instant::now();
+                            match state.present_rects(&present_rects, full_screen) {
+                                Ok(()) => {
+                                    let present_ns = present_start.elapsed().as_nanos() as u64;
+                                    SOFTWARE_FRAME_STATS
+                                        .present_ns_sum
+                                        .fetch_add(present_ns, Ordering::Relaxed);
+                                    update_max(&SOFTWARE_FRAME_STATS.present_ns_max, present_ns);
+                                    if !hidden && (full_screen || force_full) {
+                                        self.presented_while_visible = true;
+                                    }
+                                }
+                                Err(err) => {
+                                    log::warn!("software renderer present failed: {err}");
+                                    self.presented_while_visible = false;
+                                    self.integration.egui_ctx.request_repaint_after(
+                                        std::time::Duration::from_millis(50),
+                                    );
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -616,21 +1246,27 @@ impl SoftwareWinitRunning<'_> {
             let mut deltas = deltas;
             deltas.clear();
 
-            self.integration.post_rendering(&self.window);
+            self.integration
+                .post_rendering(&self.window, !self.app_requested_hidden);
 
             // Frame 1 painted and presented while the window was still hidden
             // (`IsWindowVisible == false`), so Windows discarded that `BitBlt`.
             // Now that `post_rendering` revealed the window, immediately blit
-            // the already-painted buffer if `softbuffer` kept it (`age == 1`),
-            // or schedule a redraw otherwise.
-            let visible_now =
-                self.window.is_visible() != Some(false) && self.window.is_minimized() != Some(true);
+            // the already-painted buffer if kept (`age == 1`), or schedule a redraw.
+            let visible_now = self.window.is_visible() != Some(false)
+                && self.window.is_minimized() != Some(true)
+                && self.info.occluded != Some(true);
             if !self.presented_while_visible && visible_now {
+                let full_rect = egui_software::PixelRect {
+                    min_x: 0,
+                    min_y: 0,
+                    max_x: i32::try_from(size.width).unwrap_or(0),
+                    max_y: i32::try_from(size.height).unwrap_or(0),
+                };
                 let mut presented_now = false;
                 if let Ok(mut state) = self.surface.try_borrow_mut()
-                    && let Ok(buffer) = state.surface.buffer_mut()
-                    && buffer.age() == 1
-                    && buffer.present().is_ok()
+                    && state.buffer_mut().is_ok_and(|b| b.age() == 1)
+                    && state.present_rects(&[full_rect], true).is_ok()
                 {
                     presented_now = true;
                 }
@@ -649,23 +1285,6 @@ impl SoftwareWinitRunning<'_> {
             drop(shapes);
         }
 
-        let mut result = EventResult::Wait;
-        for (id, output) in viewport_output {
-            if id == ViewportId::ROOT {
-                self.handle_root_viewport_output(&output);
-                if output.repaint_delay.is_zero() {
-                    result = EventResult::RepaintNext(self.window.id());
-                } else if let Some(when) = Instant::now().checked_add(output.repaint_delay) {
-                    result = EventResult::RepaintAt(self.window.id(), when);
-                }
-            } else {
-                log::warn!(
-                    "eframe: the software renderer supports only the root viewport; \
-                     ignoring viewport {id:?}"
-                );
-            }
-        }
-
         sleep_if_invisible_or_minimized(Some(&self.window));
 
         self.integration
@@ -678,13 +1297,18 @@ impl SoftwareWinitRunning<'_> {
         }
 
         let _ = event_loop;
-        Ok(result)
+        // Repaint scheduling is driven by `set_request_repaint_callback` (which
+        // sends `UserEvent::RequestRepaint`), matching `wgpu_integration` and
+        // `glow_integration`. Returning `EventResult::Wait` here prevents duplicate
+        // synchronous repaint scheduling inside `WM_PAINT`.
+        Ok(EventResult::Wait)
     }
 
     fn handle_root_viewport_output(&mut self, output: &ViewportOutput) {
         // Screenshot and cut/copy/paste requests come back here. The software renderer
         // has no separate framebuffer to read back, so they are collected and dropped
         // rather than silently pretended-to-be-handled.
+        note_visibility_commands(&mut self.app_requested_hidden, &output.commands);
         let mut actions_requested: Vec<ActionRequested> = Vec::new();
         process_viewport_commands(
             &self.integration.egui_ctx,
@@ -841,8 +1465,11 @@ impl WinitApp for SoftwareWinitApp<'_> {
                     running.presented_while_visible = false;
                 }
             }
-            winit::event::WindowEvent::Occluded(false) => {
-                running.presented_while_visible = false;
+            winit::event::WindowEvent::Occluded(is_occluded) => {
+                running.info.occluded = Some(*is_occluded);
+                if !*is_occluded {
+                    running.presented_while_visible = false;
+                }
             }
             _ => {}
         }
@@ -876,20 +1503,81 @@ impl WinitApp for SoftwareWinitApp<'_> {
 
 #[cfg(test)]
 mod tests {
-    use super::should_force_full_paint;
+    use super::{rects_to_present, should_force_full_paint};
+    use egui_software::PixelRect;
 
     #[test]
     fn full_paint_required_until_presented_while_visible() {
         // Frame 1 (hidden): must force full paint.
         assert!(should_force_full_paint(false, false, 0));
-        // Frame 2 right after Frame 1 revealed the window: softbuffer reports
+        // Frame 2 right after Frame 1 revealed the window: buffer reports
         // age == 1 from the hidden Frame 1, so `presented_while_visible == false`
         // must still force a full paint/present onto the visible window.
         assert!(should_force_full_paint(true, false, 1));
         // Once presented while visible and buffer age is 1, incremental damage is valid.
         assert!(!should_force_full_paint(true, true, 1));
-        // Any buffer age other than 1 (new/resized/multi-buffered) forces full.
+        // Any buffer age other than 1 (new/resized/failed present) forces full.
         assert!(should_force_full_paint(true, true, 0));
         assert!(should_force_full_paint(true, true, 2));
+    }
+
+    #[test]
+    fn os_update_rect_forces_present_even_when_zero_egui_tiles_changed() {
+        let os_rect = PixelRect {
+            min_x: 10,
+            min_y: 20,
+            max_x: 150,
+            max_y: 90,
+        };
+        // Zero egui damage + no OS update region -> skip present.
+        let (rects, is_full) = rects_to_present(&[], None, 800, 600);
+        assert!(rects.is_empty());
+        assert!(!is_full);
+
+        // Zero egui damage + OS WM_PAINT update region -> must blit the OS region.
+        let (rects, is_full) = rects_to_present(&[], Some(os_rect), 800, 600);
+        assert_eq!(rects, vec![os_rect]);
+        assert!(!is_full);
+
+        // Full-window OS update region promotes to full-window present.
+        let full_os = PixelRect {
+            min_x: -5,
+            min_y: 0,
+            max_x: 900,
+            max_y: 600,
+        };
+        let (rects, is_full) = rects_to_present(&[], Some(full_os), 800, 600);
+        assert!(is_full);
+        assert_eq!(
+            rects,
+            vec![PixelRect {
+                min_x: 0,
+                min_y: 0,
+                max_x: 800,
+                max_y: 600,
+            }]
+        );
+
+        // Partial egui damage + disjoint OS update rect includes both.
+        let tile = PixelRect {
+            min_x: 200,
+            min_y: 200,
+            max_x: 264,
+            max_y: 264,
+        };
+        let (rects, is_full) = rects_to_present(&[tile], Some(os_rect), 800, 600);
+        assert!(!is_full);
+        assert_eq!(rects, vec![tile, os_rect]);
+
+        // OS update rect already covered by an egui damage rect is not duplicated.
+        let covering = PixelRect {
+            min_x: 0,
+            min_y: 0,
+            max_x: 300,
+            max_y: 300,
+        };
+        let (rects, is_full) = rects_to_present(&[covering], Some(os_rect), 800, 600);
+        assert!(!is_full);
+        assert_eq!(rects, vec![covering]);
     }
 }

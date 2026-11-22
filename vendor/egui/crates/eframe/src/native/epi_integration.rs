@@ -52,13 +52,16 @@ pub fn viewport_builder(
             viewport_builder = viewport_builder.with_position(pos);
         }
 
-        if clamp_size_to_monitor_size && let Some(initial_window_size) = viewport_builder.inner_size
-        {
-            let initial_window_size = egui::NumExt::at_most(
-                initial_window_size,
-                largest_monitor_point_size(egui_zoom_factor, event_loop),
-            );
-            viewport_builder = viewport_builder.with_inner_size(initial_window_size);
+        if clamp_size_to_monitor_size {
+            let max_size = largest_monitor_point_size(egui_zoom_factor, event_loop);
+            if let Some(initial_window_size) = viewport_builder.inner_size {
+                let initial_window_size = egui::NumExt::at_most(initial_window_size, max_size);
+                viewport_builder = viewport_builder.with_inner_size(initial_window_size);
+            }
+            if let Some(min_inner_size) = viewport_builder.min_inner_size {
+                let min_inner_size = egui::NumExt::at_most(min_inner_size, max_size);
+                viewport_builder = viewport_builder.with_min_inner_size(min_inner_size);
+            }
         }
 
         viewport_builder.inner_size
@@ -154,7 +157,7 @@ pub struct EpiIntegration {
     pub frame: epi::Frame,
     last_auto_save: Instant,
     pub beginning: Instant,
-    is_first_frame: bool,
+    pub(crate) is_first_frame: bool,
     pub egui_ctx: egui::Context,
 
     /// Input that we have received, but not yet given to egui,
@@ -377,9 +380,19 @@ impl EpiIntegration {
         self.frame.info.cpu_usage = Some(seconds);
     }
 
-    pub fn post_rendering(&mut self, window: &winit::window::Window) {
+    /// Reveal the window after its first painted frame.
+    ///
+    /// `reveal_first_frame` is `false` when the app itself asked for the window
+    /// to be hidden in the frame that just ended. eframe starts the window
+    /// hidden (`ViewportBuilder::with_visible(false)`) to avoid a white flash and
+    /// reveals it here; a start-in-tray launch instead sends
+    /// `ViewportCommand::Visible(false)` from `App::logic`, which would then be
+    /// overridden by this reveal — and since the viewport command was already
+    /// consumed, nothing would hide the window again. `is_first_frame` is
+    /// consumed either way.
+    pub fn post_rendering(&mut self, window: &winit::window::Window, reveal_first_frame: bool) {
         profiling::function_scope!();
-        if std::mem::take(&mut self.is_first_frame) {
+        if std::mem::take(&mut self.is_first_frame) && reveal_first_frame {
             // We keep hidden until we've painted something. See https://github.com/emilk/egui/pull/2279
             window.set_visible(true);
         }

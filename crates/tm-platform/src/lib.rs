@@ -120,6 +120,51 @@ pub fn set_window_cloaked(hwnd: isize, cloaked: bool) {
 #[cfg(not(target_os = "windows"))]
 pub fn set_window_cloaked(_hwnd: isize, _cloaked: bool) {}
 
+/// Whether DWM currently cloaks the window (see
+/// [`win::window_chrome::is_cloaked`]). Always `false` off Windows.
+#[cfg(target_os = "windows")]
+pub fn is_window_cloaked(hwnd: isize) -> bool {
+    win::window_chrome::is_cloaked(hwnd)
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn is_window_cloaked(_hwnd: isize) -> bool {
+    false
+}
+
+/// Move/shrink the window back inside the work area of its (nearest)
+/// monitor — see [`win::window_chrome::ensure_window_on_screen`]. Returns
+/// whether it was moved.
+#[cfg(target_os = "windows")]
+pub fn ensure_window_on_screen(hwnd: isize) -> bool {
+    win::window_chrome::ensure_window_on_screen(hwnd)
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn ensure_window_on_screen(_hwnd: isize) -> bool {
+    false
+}
+
+/// Outer position of a normal window in physical screen pixels.
+#[cfg(target_os = "windows")]
+pub fn window_outer_position_px(hwnd: isize) -> Option<[i32; 2]> {
+    win::window_chrome::window_outer_position_px(hwnd)
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn window_outer_position_px(_hwnd: isize) -> Option<[i32; 2]> {
+    None
+}
+
+/// Move the window to a physical-pixel position without resizing it.
+#[cfg(target_os = "windows")]
+pub fn set_window_outer_position_px(hwnd: isize, pos: [i32; 2]) {
+    win::window_chrome::set_window_outer_position_px(hwnd, pos);
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn set_window_outer_position_px(_hwnd: isize, _pos: [i32; 2]) {}
+
 /// Show, restore and activate `hwnd` without touching anyone else's input
 /// queue. Safe to call from any thread; from a thread that does not own the
 /// window every request is posted, never waited on.

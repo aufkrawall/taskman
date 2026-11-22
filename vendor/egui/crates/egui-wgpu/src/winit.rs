@@ -115,6 +115,20 @@ impl Painter {
 
         let width = surface_state.width;
         let height = surface_state.height;
+        if width == 0 || height == 0 {
+            return;
+        }
+
+        let Some(default_config) =
+            surface_state
+                .surface
+                .get_default_config(&render_state.adapter, width, height)
+        else {
+            log::warn!(
+                "The surface isn't supported by this adapter or has invalid size ({width}x{height})"
+            );
+            return;
+        };
 
         let mut surf_config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
@@ -122,10 +136,7 @@ impl Painter {
             present_mode,
             alpha_mode: surface_state.alpha_mode,
             view_formats: vec![render_state.target_format],
-            ..surface_state
-                .surface
-                .get_default_config(&render_state.adapter, width, height)
-                .expect("The surface isn't supported by this adapter")
+            ..default_config
         };
 
         if let Some(desired_maximum_frame_latency) = desired_maximum_frame_latency {
@@ -137,11 +148,16 @@ impl Painter {
             .configure(&render_state.device, &surf_config);
     }
 
-    /// Drop the existing [`wgpu::Surface`] for `viewport_id` and create a fresh one for the
-    /// given window via [`wgpu::Instance::create_surface`], then configure it.
+    /// Replace the [`wgpu::Surface`] for `viewport_id` with a fresh one for the given window
+    /// via [`wgpu::Instance::create_surface`], then configure it.
     ///
     /// Used to recover from [`wgpu::CurrentSurfaceTexture::Lost`], where reconfiguring the
     /// existing surface object cannot recover.
+    ///
+    /// The replacement is created *before* the old surface is dropped: if surface creation
+    /// itself fails (device removed, adapter gone, output destroyed), the viewport keeps its
+    /// previous entry, so the retry the caller schedules still has a state to replace and the
+    /// window is not left without one.
     fn recreate_surface(
         &mut self,
         viewport_id: ViewportId,
@@ -149,18 +165,13 @@ impl Painter {
     ) -> Result<(), crate::WgpuError> {
         profiling::function_scope!();
 
-        let Some(old_state) = self.surfaces.remove(&viewport_id) else {
+        let Some(old_state) = self.surfaces.get(&viewport_id) else {
             return Ok(());
         };
+        let (width, height, resizing) = (old_state.width, old_state.height, old_state.resizing);
 
         let surface = self.instance.create_surface(Arc::clone(window))?;
-        self.install_surface(
-            surface,
-            viewport_id,
-            old_state.width,
-            old_state.height,
-            old_state.resizing,
-        );
+        self.install_surface(surface, viewport_id, width, height, resizing);
         Ok(())
     }
 
@@ -519,6 +530,8 @@ impl Painter {
             && let Err(err) = self.recreate_surface(viewport_id, window)
         {
             log::error!("Failed to recreate surface for {viewport_id:?}: {err}");
+            self.context
+                .request_repaint_after_for(std::time::Duration::from_millis(100), viewport_id);
             return vsync_sec;
         }
 
@@ -548,6 +561,9 @@ impl Painter {
         let Some(surface_state) = self.surfaces.get_mut(&viewport_id) else {
             return vsync_sec;
         };
+        if surface_state.width == 0 || surface_state.height == 0 {
+            return vsync_sec;
+        }
 
         let mut encoder =
             render_state

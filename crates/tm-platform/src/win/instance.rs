@@ -427,6 +427,7 @@ fn handshake(names: &Names, show: HANDLE, ack: HANDLE) -> Activation {
                 // the user is actually typing into. The foreground right was
                 // already handed over with `AllowSetForegroundWindow` above,
                 // so the plain activation is normally enough anyway.
+                super::window_chrome::ensure_presentable(hwnd);
                 super::window_chrome::force_foreground(hwnd);
                 return Activation::Activated;
             }
