@@ -70,8 +70,8 @@ normal GUI log.
 
 ## Renderer diagnostics
 
-- CPU rendering is the default. `TASKMAN_RENDERER=cpu|d3d12|vulkan|metal|glow`
-  pins one compiled backend (`software` and `wgpu` still work).
+- CPU rendering is the default. `TASKMAN_RENDERER=cpu|d3d12|vulkan|metal|opengl|software|wgpu`
+  pins one compiled backend.
 - `TASKMAN_GPU=cpu|d3d12|vulkan|metal` overrides the saved preference for
   one run and permits fallbacks. The numeric legacy values select CPU.
 - `TASKMAN_PRESENT=fifo|immediate|mailbox|autovsync` and

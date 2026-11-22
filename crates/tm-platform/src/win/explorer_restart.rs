@@ -149,13 +149,16 @@ mod tests {
     #[test]
     fn restart_rejects_missing_identity_or_non_shell_pid() {
         let current_pid = std::process::id();
+        let missing = restart(current_pid, None).unwrap_err();
         assert!(
-            restart(current_pid, None).is_err(),
-            "explorer restart must fail closed when creation identity is missing"
+            format!("{missing}").contains("creation identity is required"),
+            "the missing-identity gate must reject before any PID lookup: {missing}"
         );
+        let wrong_pid = restart(current_pid, Some(1_700_000_000)).unwrap_err();
         assert!(
-            restart(current_pid, Some(1_700_000_000)).is_err(),
-            "explorer restart must reject processes that do not own the session shell window"
+            format!("{wrong_pid}").contains("does not own the current session shell window"),
+            "a non-shell pid must be rejected by the shell-window gate, not by a \
+             seconds/ticks mismatch: {wrong_pid}"
         );
     }
 }

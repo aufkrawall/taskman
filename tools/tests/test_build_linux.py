@@ -123,6 +123,41 @@ class LinuxBuildToolingTests(unittest.TestCase):
                 r"C:\Windows\System32\powershell.exe",
             )
 
+    def test_zigbuild_env_exposes_the_discovered_zig(self):
+        zig = Path("/opt/zig/zig")
+        with (
+            patch.object(build, "find_zig", return_value=zig),
+            patch.dict(build.os.environ, {"PATH": "/usr/bin"}, clear=False),
+        ):
+            env = build.linux_cross_env(
+                ["cargo", "zigbuild", "--profile", "release"], "release"
+            )
+        self.assertEqual(env["ZIG"], str(zig))
+        self.assertTrue(env["PATH"].startswith(f"{zig.parent}{os.pathsep}"))
+        self.assertTrue(env["PATH"].endswith("/usr/bin"))
+
+    def test_non_zigbuild_does_not_inject_zig(self):
+        with patch.object(
+            build, "find_zig", side_effect=AssertionError("must not be called")
+        ):
+            env = build.linux_cross_env(["cargo", "build"], "release")
+        self.assertNotIn("ZIG", env)
+
+    def test_check_fork_skips_only_when_powershell_is_absent(self):
+        with patch.object(build, "probe_powershell", return_value=(None, None)):
+            self.assertTrue(build.check_fork())
+
+    def test_check_fork_fails_when_powershell_exists_but_cannot_run(self):
+        with (
+            patch.object(
+                build,
+                "probe_powershell",
+                return_value=(None, "pwsh at C:\\WindowsApps\\pwsh.EXE: access denied"),
+            ),
+            patch.object(build, "log"),
+        ):
+            self.assertFalse(build.check_fork())
+
 
 if __name__ == "__main__":
     unittest.main()

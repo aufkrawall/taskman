@@ -28,8 +28,9 @@ platform boundary (`tm-core` ← `tm-platform` ← `tm-app` / `tm-service`), and
     SettingsWriter), `app_history.rs` (per-app usage db, single serialized
     writer thread with generations, late-load merge, Unix non-system
     eligibility; identity is the exe path, so an app first seen without one
-    keeps a name-keyed row; icon paths are stored per key and blank/bare ones
-    are dropped on load and never written),
+    keeps a name-keyed row; icon paths are stored per key, blank ones are
+    dropped on load and never written, and bare names are filtered before
+    shell extraction — on Linux a bare name is a legitimate XDG lookup key),
     `demand.rs` (TelemetryDemand bitmask),
     `persist.rs` (crate-private: synced temp-file-then-rename replacement
     for every persisted file, and `set_aside` — an existing file that cannot
@@ -271,12 +272,13 @@ platform boundary (`tm-core` ← `tm-platform` ← `tm-app` / `tm-service`), and
      plus `keyboard_sample`/`chart_accessible_value` — a keyboard cursor
      pinned to a sample TIMESTAMP so live telemetry cannot slide it, and the
      selected sample published as the chart's accesskit value),
-    `icon_cache.rs` (lazy worker, upload budget, true-LRU cap; single entry
+    `icon_cache.rs` (lazy worker, per-egui-pass upload budget, true-LRU cap; single entry
     point `icon_or_default` — the row's executable icon, else the platform's
     `default_app_icon_rgba` when the row has no path or the OS has no icon for
     that image, else nothing while extraction is in flight; the UI draws no
     icon of its own, and `usable_icon_path` keeps blank/bare strings from ever
-    becoming a cache key or a shell lookup),
+    becoming a cache key or a shell lookup; Linux accepts a bare command as an
+    XDG lookup key),
     `action_executor.rs`. Theme and font setup moved to `crates/tm-ui`;
     `tm-app` re-exports them as `crate::theme` / `crate::fonts`.
 - `crates/tm-ui`

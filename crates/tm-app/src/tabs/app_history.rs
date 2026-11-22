@@ -69,6 +69,17 @@ fn resolve_row_icon_path(
     {
         return Some(path.to_string());
     }
+    // On Linux a bare command name is a legitimate lookup key: `icon_or_default`
+    // resolves it through the `.desktop` index (Startup rows rely on this).
+    // On Windows/macOS a bare name is not an image path, and asking the shell
+    // for one yields the current directory's folder icon.
+    #[cfg(target_os = "linux")]
+    {
+        let key = key.trim();
+        if !key.is_empty() {
+            return Some(key.to_string());
+        }
+    }
     if std::path::Path::new(key).is_absolute() {
         return Some(key.to_string());
     }

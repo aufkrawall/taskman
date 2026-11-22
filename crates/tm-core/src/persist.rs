@@ -42,6 +42,49 @@ fn create_unique_temp(path: &Path, tmp_ext: &str) -> std::io::Result<(PathBuf, s
     }
 }
 
+/// A temp file older than this is a leftover from a crash: live writers keep
+/// their temp for milliseconds. Sweeping them prevents stale copies of user
+/// data from accumulating in the config/data directory.
+const STALE_TEMP_AGE: std::time::Duration = std::time::Duration::from_secs(60 * 60);
+
+/// Remove temp files for `path` that no live save can own any more. Only
+/// names matching this destination's `.<pid>-<seq>.<tmp_ext>` shape are
+/// touched, and only when they are old enough that a concurrent writer (in
+/// this process or another instance) cannot still be filling one.
+fn sweep_stale_temps(path: &Path, tmp_ext: &str) {
+    let parent = path
+        .parent()
+        .filter(|dir| !dir.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let file_name = path
+        .file_name()
+        .map(|name| name.to_string_lossy())
+        .unwrap_or_else(|| std::borrow::Cow::Borrowed("file"));
+    let prefix = format!("{file_name}.");
+    let suffix = format!(".{tmp_ext}");
+    let Ok(entries) = std::fs::read_dir(parent) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if !name.starts_with(&prefix) || !name.ends_with(&suffix) {
+            continue;
+        }
+        let Ok(metadata) = entry.metadata() else {
+            continue;
+        };
+        let Ok(modified) = metadata.modified() else {
+            continue;
+        };
+        if modified.elapsed().is_ok_and(|age| age > STALE_TEMP_AGE) {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
+
 /// Replace `path` with whatever `write` produces via an exclusive temp file.
 pub(crate) fn replace_file(
     path: &Path,
@@ -53,6 +96,7 @@ pub(crate) fn replace_file(
     {
         std::fs::create_dir_all(parent)?;
     }
+    sweep_stale_temps(path, tmp_ext);
     let (tmp, file) = create_unique_temp(path, tmp_ext)?;
     let write_result = (|| {
         let mut out = std::io::BufWriter::new(file);
@@ -111,6 +155,38 @@ mod tests {
             std::fs::read_to_string(dir.join("store.json.bad")).unwrap(),
             "second"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_old_temp_file_is_swept_but_a_recent_one_is_left_alone() {
+        let dir = std::env::temp_dir().join(format!(
+            "tm-persist-sweep-{}-{}",
+            std::process::id(),
+            NEXT_TMP_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let dest = dir.join("store.json");
+        let stale = dir.join("store.json.99999-0.json.tmp");
+        let recent = dir.join("store.json.99999-1.json.tmp");
+        std::fs::write(&stale, b"old").unwrap();
+        std::fs::write(&recent, b"live").unwrap();
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(2 * 60 * 60);
+        std::fs::File::options()
+            .write(true)
+            .open(&stale)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+
+        replace_file(&dest, "json.tmp", |out| out.write_all(b"fresh")).unwrap();
+
+        assert!(!stale.exists(), "a crash leftover must be swept");
+        assert!(
+            recent.exists(),
+            "a recent temp may still belong to a live save"
+        );
+        assert_eq!(std::fs::read_to_string(&dest).unwrap(), "fresh");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

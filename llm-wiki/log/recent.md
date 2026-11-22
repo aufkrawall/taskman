@@ -1,3 +1,38 @@
+## 2026-11-22 - Third-party review fixes (icons, identity, restore, diagnostics)
+
+- Fixed a release-abort in Linux icon decoding: 16-bit theme PNGs now decode
+  through `normalize_to_color8`, the decoder allocation is bounded, and the GUI
+  validates the RGBA length before upload. XDG indexing now tracks depth per
+  directory, skips shared interpreters (`python3`/`java`/`wine`/`flatpak`), and
+  downscaling is alpha-weighted so transparent borders do not darken icons.
+- Startup impact resets the previous baseline when the current creation
+  identity is unknown; a recycled PID could otherwise subtract the old
+  process's counters and then double-charge the new one.
+- Start-in-tray always asserts `Visible(false)` while the tray is starting; the
+  previous wait arm sent no command and eframe's first-frame reveal showed the
+  window. Capture loss now sends `CursorLeft` before the synthetic releases, so
+  an interrupted press cannot register as a click.
+- `ensure_window_on_screen` enumerates monitors and moves a window in a
+  non-rectangular layout hole onto the nearest work area; genuinely spanning
+  windows keep their size. Restore re-fits after unminimize, and a failed
+  reveal re-present uses the 50 ms backoff instead of an immediate redraw.
+- Broker protocol v12 (`expected_start_epoch_s` is 100-ns ticks); module ETW
+  accepts the mixed-precision token. The sampler's creation-time lookup refuses
+  a stale kernel table.
+- Details file actions and Linux group selection use `row_icon_key` /
+  `creation_identity`. `--mock` uses in-memory app history and startup impact.
+  Stored renderer choices are no longer rewritten.
+- New tests cover 16-bit PNGs, XDG depth/wrappers, alpha downscaling, the
+  startup-impact unknown identity, slow-tray visibility, monitor holes, the
+  per-frame icon upload budget, and the fork-gate PowerShell failure.
+  Gates: `python build.py --check` green (fmt, clippy `-D warnings`, workspace
+  tests, vendored fork gate, Windows setup, Linux glibc cross-build), plus
+  `cargo +stable clippy --workspace --all-targets --all-features` green.
+- Still open (documented in `known-debt.md`): macOS icon source,
+  restart-scoped icon/theme cache, restore-ack paint signal, startup
+  derived/item lock pairing, directory-fsync/ACL durability, and persistent
+  topmost games.
+
 ## 2026-11-21 - Released v0.1.32; fixed the CI-only ziglang path test
 
 - Released v0.1.32 (`ff92443`, tag `v0.1.32`): Windows x86_64/arm64 zip and setup installers, Linux x86_64/arm64 glibc tarballs (zigbuild), each with a `.sha256`. The published Windows GUI (mock) and Linux x86_64 binary (glibc, real backend under WSL) both pass `--selfcheck`; the tag stays on the documented version-bump commit, and CI is green on `main` afterwards.
@@ -4305,8 +4340,8 @@ history recorded yet.
     buttons on focus loss, a release after `CursorLeft` is forwarded at the last known
     position; the dump picker and the Run dialog's Browse run on their own threads and are
     polled; `run_shell_action` moved `open_url`/`open_file_location`/`open_properties` onto
-    the action executor; `toast_from` drops empty messages; the Select columns list height
-    is clamped to the viewport.
+    the action executor; `ActionExecutor::run` drops an empty success message (never an
+    error); the Select columns list height is clamped to the viewport.
 
   Review pass (independent read of the diff, before the commit) caught five real defects
   that were then fixed: (1) the software backend processed viewport commands *before*
@@ -4319,9 +4354,10 @@ history recorded yet.
   focus-loss arm through `release_all_buttons_without_click`; (3) fitting every window into
   the nearest monitor's work area shrank legitimately monitor-spanning windows — now the
   virtual desktop is the fit target; (4) `fit_rect` could panic on a zero-width bounds rect
-  (`clamp` with `min > max`) inside the event loop — it returns the rect untouched; (5) the
-  empty-toast filter lived in `toast_from` and would also swallow a whitespace-only *error*
-  message — it moved to `ActionExecutor::run`'s success path. Also added: a `Drop` guard for
+  (`clamp` with `min > max`) inside the event loop — it returns the rect untouched; (5) an
+  earlier iteration put the empty-toast filter in `toast_from`, which would also have
+  swallowed a whitespace-only *error* message — the filter lives only in
+  `ActionExecutor::run`'s success path. Also added: a `Drop` guard for
   `pending_deltas` (a hidden window exiting with a pending `TexturesDelta` panicked in debug
   teardown) and an owner HWND for both async pickers (`crates/tm-app/src/dialogs.rs`, via
   the published window), so a system dialog cannot be buried behind the main window.

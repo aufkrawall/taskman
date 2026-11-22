@@ -2629,7 +2629,10 @@ fn emit_tree<'a>(
         let gpu_available = members.iter().any(|member| gpu_known(member));
         out.push(DisplayRow::Process(RowData {
             pid: root.pid,
-            start_epoch_s: root.start_epoch_s,
+            // Selection identity must be the same token `identity_is_live`
+            // compares: on Linux `start_epoch_s` is wall-clock seconds while
+            // `creation_identity()` prefers the boot-relative start ticks.
+            start_epoch_s: root.creation_identity(),
             depth: 0,
             name: format!("{} [{}]", process_display_name(root), members.len()),
             icon_path: crate::icon_cache::row_icon_key(root.exe_path.as_deref()),

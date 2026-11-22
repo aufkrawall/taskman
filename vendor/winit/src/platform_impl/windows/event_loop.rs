@@ -1966,7 +1966,22 @@ unsafe fn public_window_callback_inner(
                 if had_capture {
                     use crate::event::ElementState::Released;
                     use crate::event::MouseButton::{Back, Forward, Left, Middle, Right};
-                    use crate::event::WindowEvent::MouseInput;
+                    use crate::event::WindowEvent::{CursorLeft, MouseInput};
+
+                    // The pointer may still be over the window, but the
+                    // interaction was taken away. Tell the toolkit it left
+                    // BEFORE the releases: its release handler then clears the
+                    // held buttons without turning the interrupted press into
+                    // a click at the press position. Without this, a synthetic
+                    // Left release during a middle-button drag could activate
+                    // the control under the cursor (`could_any_button_be_click`
+                    // only checks that *some* button was down).
+                    userdata.send_event(Event::WindowEvent {
+                        window_id: RootWindowId(WindowId(window)),
+                        event: CursorLeft {
+                            device_id: DEVICE_ID,
+                        },
+                    });
                     for button in [Left, Right, Middle, Back, Forward] {
                         userdata.send_event(Event::WindowEvent {
                             window_id: RootWindowId(WindowId(window)),

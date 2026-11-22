@@ -2701,10 +2701,11 @@ pub fn context_menu(app: &mut TaskManApp, ui: &mut egui::Ui, p: &ProcessEntry, h
         }
     }
 
-    let image_path = p
-        .exe_path
-        .as_ref()
-        .map(|path| path.to_string_lossy().into_owned());
+    // A kernel pseudo-process's `exe_path` is a bare name ("Registry",
+    // "Memory Compression"), not a file: enabling Explorer actions for it
+    // opens nothing or the current directory. `row_icon_key` applies the
+    // same "this can name an image" rule the icon column uses.
+    let image_path = crate::icon_cache::row_icon_key(p.exe_path.as_deref());
     if let Some(path) = image_path.as_deref()
         && menu::item(ui, i18n::tr(K::OpenFileLocation)).clicked()
     {
@@ -4744,10 +4745,9 @@ pub fn process_properties_dialog(app: &mut TaskManApp, ctx: &egui::Context) {
             }
 
             ui.separator();
-            let path = process
-                .exe_path
-                .as_ref()
-                .map(|path| path.to_string_lossy().into_owned());
+            // See the tree's context menu: pseudo-process paths are bare
+            // kernel names, so they must not enable file actions.
+            let path = crate::icon_cache::row_icon_key(process.exe_path.as_deref());
             ui.horizontal(|ui| {
                 #[cfg(target_os = "windows")]
                 if ui

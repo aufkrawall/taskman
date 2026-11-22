@@ -1264,15 +1264,30 @@ impl SoftwareWinitRunning<'_> {
                     max_y: i32::try_from(size.height).unwrap_or(0),
                 };
                 let mut presented_now = false;
+                let mut present_failed = false;
                 if let Ok(mut state) = self.surface.try_borrow_mut()
                     && state.buffer_mut().is_ok_and(|b| b.age() == 1)
-                    && state.present_rects(&[full_rect], true).is_ok()
                 {
-                    presented_now = true;
+                    match state.present_rects(&[full_rect], true) {
+                        Ok(()) => presented_now = true,
+                        Err(err) => {
+                            // Do not request an immediate redraw here: that
+                            // would bypass the 50 ms backoff the paint path
+                            // scheduled and spin at the event rate while the
+                            // DC/display is broken.
+                            present_failed = true;
+                            log::warn!("software renderer reveal re-present failed: {err}");
+                            self.integration
+                                .egui_ctx
+                                .request_repaint_after(std::time::Duration::from_millis(50));
+                        }
+                    }
                 }
                 if presented_now {
                     self.presented_while_visible = true;
-                } else {
+                } else if !present_failed {
+                    // No kept buffer yet: a fresh frame must be painted before
+                    // this window can show anything but stale pixels.
                     self.window.request_redraw();
                 }
             }

@@ -148,10 +148,12 @@ impl StartupImpactTracker {
             let key = crate::settings::process_rule_key(path);
             // A recycled pid must not bridge two different processes: without
             // a matching start time the baseline is reset, never subtracted.
-            let previous = self.prev.get(&process.pid).filter(|prev| {
-                process.creation_identity().is_none()
-                    || prev.start_epoch_s == process.creation_identity()
-            });
+            // `None == None` still matches, so a platform that cannot publish
+            // a creation token keeps accumulating deltas for a stable process.
+            let previous = self
+                .prev
+                .get(&process.pid)
+                .filter(|prev| prev.start_epoch_s == process.creation_identity());
             // A process first seen here that STARTED after boot spent its
             // whole life inside the window, so its counters are charged from
             // zero. Recording only a baseline lost everything it did before
@@ -244,7 +246,8 @@ impl ImpactStore {
         }
     }
 
-    /// A store that never touches disk (tests, and platforms with no data dir).
+    /// A store that never touches disk (tests, `--mock`, and platforms with
+    /// no data dir).
     pub fn in_memory() -> Self {
         Self {
             entries: BTreeMap::new(),
@@ -394,6 +397,27 @@ mod tests {
         let mut reused = snapshot_with(500.0, 10_000_000, 11);
         reused.processes[0].start_epoch_s = Some(900);
         assert!(!tracker.observe(&reused));
+        assert!(tracker.totals().is_empty());
+    }
+
+    /// Regression: an unknown *current* identity (the Linux/macOS bracket
+    /// deliberately publishes `None` when the before/after reads disagree)
+    /// must reset the baseline, not keep the previous process's counters and
+    /// subtract them from the new occupant of the pid.
+    #[test]
+    fn an_unknown_current_identity_does_not_reuse_the_old_baseline() {
+        let first = snapshot_with(1.0, 1_000, 10);
+        let mut tracker = StartupImpactTracker::new(first.system.uptime_s, 1_000);
+        tracker.observe(&first);
+
+        let mut reused = snapshot_with(500.0, 10_000_000, 11);
+        reused.processes[0].start_epoch_s = None;
+        reused.processes[0].boot_start_ticks = None;
+        assert!(
+            !tracker.observe(&reused),
+            "an identity-less current process must not be charged the \
+             previous occupant's lifetime difference"
+        );
         assert!(tracker.totals().is_empty());
     }
 

@@ -1349,7 +1349,10 @@ pub fn settings_dialog(app: &mut TaskManApp, ctx: &egui::Context, _pal: &theme::
             ui.horizontal_wrapped(|ui| {
                 for &mode in crate::renderer_choices() {
                     if ui
-                        .selectable_label(app.shared.settings.render_mode == mode, mode.label())
+                        .selectable_label(
+                            crate::configured_render_mode(app.shared.settings.render_mode) == mode,
+                            mode.label(),
+                        )
                         .clicked()
                     {
                         app.shared.settings.render_mode = mode;
@@ -2166,6 +2169,21 @@ fn run_task_dialog_key_action(
 /// system dialog is open, `Some(None)` when it was cancelled.
 type BrowseSlot = std::sync::Arc<std::sync::Mutex<Option<Option<std::path::PathBuf>>>>;
 
+/// If the picker worker unwinds before publishing a result, publish
+/// `Some(None)` from the guard so the dialog treats it as cancelled. Without
+/// this the slot stays `None` (the dialog is still "open") and Browse is inert
+/// until the dialog is reopened.
+struct BrowseGuard(BrowseSlot);
+
+impl Drop for BrowseGuard {
+    fn drop(&mut self) {
+        let mut slot = tm_core::sync::lock(&self.0);
+        if slot.is_none() {
+            *slot = Some(None);
+        }
+    }
+}
+
 pub fn run_task_dialog(app: &mut TaskManApp, ctx: &egui::Context, _pal: &theme::Palette) {
     let focus_id = egui::Id::new("run-task-dialog-focus");
     let restore_id = egui::Id::new("run-task-dialog-restore-focus");
@@ -2328,6 +2346,7 @@ pub fn run_task_dialog(app: &mut TaskManApp, ctx: &egui::Context, _pal: &theme::
                     std::thread::Builder::new()
                         .name("tm-browse".into())
                         .spawn(move || {
+                            let _guard = BrowseGuard(worker_slot.clone());
                             #[cfg(target_os = "windows")]
                             let parent = parent.as_ref();
                             let dialog = rfd::FileDialog::new();

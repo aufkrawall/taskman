@@ -163,7 +163,8 @@ Release packaging produces two ways to install:
 
 | Environment variable | Effect |
 | --- | --- |
-| `TASKMAN_RENDERER=cpu\|d3d12\|vulkan\|metal\|glow` | Force renderer |
+| `TASKMAN_RENDERER=cpu\|d3d12\|vulkan\|metal\|opengl\|software\|wgpu` | Pin one compiled renderer backend |
+| `TASKMAN_GPU=cpu\|d3d12\|vulkan\|metal` | Override the saved renderer preference for one run (fallbacks allowed) |
 | `TASKMAN_FPS_PROBE=1` | Continuous repaints + fps overlay |
 | `TASKMAN_DIALOG=settings\|run` | Open a dialog at startup |
 | `TASKMAN_PERF=<key>` | Preselect a Performance resource |

@@ -366,6 +366,43 @@ remain follow-up rather than being simulated in headless tests:
     Performance page still shows 0 threads; Linux/macOS disk byte rates read
     0 B/s on the first sample (the model has no unknown rate).
 
+### 2026-11-22 reliability-review residuals
+
+- **macOS has no application-icon source.** `MacActions` implements neither
+  `process_icon_rgba` nor `default_app_icon_rgba`, and the UI deliberately
+  draws no icon of its own, so macOS rows keep an empty icon cell. Implementing
+  it needs `NSWorkspace`/`objc2-app-kit` FFI that no gate on this host can
+  compile or exercise; the 0.1.32 changelog is scoped to Windows/Linux until
+  that exists.
+- **Icon cache invalidation is restart-scoped.** Textures are keyed by image
+  path and the Linux `IconResolver` (including the XDG theme name) is a
+  `OnceLock`, so replacing an app at the same path or switching the desktop
+  icon theme keeps the old icon until TaskMan restarts. Re-reading XSettings
+  per lookup or statting every row per frame was rejected as UI-thread work;
+  a future fix should re-key on theme/mtime and invalidate explicitly.
+- **Restore acknowledgement still falls back to a 2 s deadline.** The
+  "painted" signal is the app's `ui` pass (main.rs), which runs before the
+  software backend's `present_rects`; a failed present therefore still lets
+  the ack deadline fire with a warning. A precise signal needs a post-present
+  callback in the eframe fork; the minimized-window re-fit now happens in the
+  ack path.
+- **Startup rows and their derived targets are published under two locks.**
+  The worker writes `startup_derived` then `startup_cache`, and the UI reads
+  them in that order; a descheduled writer can still present new targets with
+  the previous row list for one frame. Visual-only; fixing it means publishing
+  both in one `Arc` and touching five call sites.
+- **Persistence durability is still rename-based.** `replace_file` fsyncs the
+  file but not the parent directory (Unix) and does not use `ReplaceFileW`
+  (Windows), so a power loss immediately after a save can lose that one save
+  (the previous file remains) and the replacement inherits the directory ACL.
+  Stale temp files are now swept on the next save.
+- **A persistently `WS_EX_TOPMOST` game still outranks a restored window.**
+  `raise_above_topmost` briefly applies topmost and demotes unless strict
+  topmost is enabled, so it wins against a fullscreen game that only *looks*
+  topmost. Keeping TaskMan above a real topmost game for its active lifetime
+  would need the existing strict-topmost hooks; not done without a desktop
+  repro.
+
 ## Row/total audit leftovers (2026-10-21)
 
 Found by the 2026-10-21 row-vs-total audit and deliberately not changed:

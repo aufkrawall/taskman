@@ -463,6 +463,23 @@ def build_host(profile: str) -> Path | None:
     return exe
 
 
+def linux_cross_env(command: list[str], profile: str) -> dict[str, str]:
+    """Environment for a Linux cross build, including zig for `cargo zigbuild`.
+
+    `cargo-zigbuild` invokes the `zig` binary itself; a package-installed
+    ziglang is not on PATH, so point `ZIG` at it and prepend its directory.
+    """
+    env = dict(release_rustflags(False) or {}) if profile != "dev" else {}
+    if len(command) > 1 and command[1] == "zigbuild":
+        zig_path = find_zig()
+        if zig_path is not None:
+            env["ZIG"] = str(zig_path)
+            zig_dir = str(zig_path.parent)
+            current_path = os.environ.get("PATH", "")
+            env["PATH"] = f"{zig_dir}{os.pathsep}{current_path}" if current_path else zig_dir
+    return env
+
+
 def build_linux(profile: str, target: str = LINUX_TARGET) -> tuple[Path | None, bool, str]:
     """Build one Linux artifact, preferring a glibc cross toolchain.
 
@@ -474,14 +491,7 @@ def build_linux(profile: str, target: str = LINUX_TARGET) -> tuple[Path | None, 
     cmd = linux_cross_command(profile, target)
     if cmd is not None:
         command, out_dir = cmd
-        env = dict(release_rustflags(False) or {}) if profile != "dev" else {}
-        if len(command) > 1 and command[1] == "zigbuild":
-            zig_path = find_zig()
-            if zig_path is not None:
-                env["ZIG"] = str(zig_path)
-                zig_dir = str(zig_path.parent)
-                current_path = os.environ.get("PATH", "")
-                env["PATH"] = f"{zig_dir}{os.pathsep}{current_path}" if current_path else zig_dir
+        env = linux_cross_env(command, profile)
         if not run(command, env=env or None):
             return None, True, "gnu"
         exe = Path(out_dir) / "taskman"
@@ -620,8 +630,15 @@ def audit_scan() -> bool:
     return ok
 
 
-def find_powershell() -> str | None:
-    """Return a runnable PowerShell binary, skipping inaccessible WindowsApps aliases."""
+def probe_powershell() -> tuple[str | None, str | None]:
+    """Return ``(path, problem)`` for a runnable PowerShell.
+
+    ``problem`` is set when a PowerShell was found but could not be probed
+    (an inaccessible WindowsApps alias, a policy block, or a wedged process).
+    That is different from "not installed": the fork gate must not silently
+    skip when the shell it needs exists but is unusable.
+    """
+    problem: str | None = None
     for candidate in ("pwsh", "powershell"):
         path = shutil.which(candidate)
         if path is None:
@@ -630,12 +647,20 @@ def find_powershell() -> str | None:
             proc = subprocess.run(
                 [path, "-NoProfile", "-Command", "exit 0"],
                 capture_output=True,
+                timeout=10,
             )
-        except OSError:
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            problem = f"{candidate} at {path}: {exc}"
             continue
         if proc.returncode == 0:
-            return path
-    return None
+            return path, None
+        problem = f"{candidate} at {path} exited {proc.returncode}"
+    return None, problem
+
+
+def find_powershell() -> str | None:
+    """Return a runnable PowerShell binary, skipping inaccessible WindowsApps aliases."""
+    return probe_powershell()[0]
 
 
 def check_fork() -> bool:
@@ -654,8 +679,14 @@ def check_fork() -> bool:
         log("vendor/egui not present - skipping fork gate")
         return True
     script = ROOT / "tools" / "check-fork.ps1"
-    shell = find_powershell()
+    shell, problem = probe_powershell()
     if shell is None:
+        if problem:
+            log(
+                f"PowerShell was found but cannot run ({problem}); "
+                "the vendored fork gate cannot run"
+            )
+            return False
         log("no pwsh/powershell found - skipping fork gate (CI must provide one)")
         return True
     return run([shell, "-NoProfile", "-File", str(script)])

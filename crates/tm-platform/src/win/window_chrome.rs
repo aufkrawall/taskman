@@ -334,6 +334,114 @@ pub(crate) fn fit_rect_to_bounds(rect: [i32; 4], bounds: [i32; 4]) -> [i32; 4] {
     [left, top, left + w, top + h]
 }
 
+/// One monitor's full rectangle and work area, in physical pixels.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct MonitorArea {
+    pub rect: [i32; 4],
+    pub work: [i32; 4],
+}
+
+/// Enumerate the active monitors. Empty means Windows could not answer;
+/// callers then fall back to the virtual-desktop rectangle.
+fn monitor_areas() -> Vec<MonitorArea> {
+    use windows::Win32::Foundation::{LPARAM, RECT};
+    use windows::Win32::Graphics::Gdi::{
+        EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITORINFO,
+    };
+    use windows::core::BOOL;
+
+    unsafe extern "system" fn collect(
+        monitor: HMONITOR,
+        _dc: HDC,
+        _clip: *mut RECT,
+        data: LPARAM,
+    ) -> BOOL {
+        // SAFETY: `monitor_areas` passes a pointer to a live `Vec` that
+        // outlives this callback, and Windows calls it synchronously.
+        let out = unsafe { &mut *(data.0 as *mut Vec<MonitorArea>) };
+        let mut info = MONITORINFO {
+            cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+            ..Default::default()
+        };
+        if unsafe { GetMonitorInfoW(monitor, &mut info) }.as_bool() {
+            out.push(MonitorArea {
+                rect: [
+                    info.rcMonitor.left,
+                    info.rcMonitor.top,
+                    info.rcMonitor.right,
+                    info.rcMonitor.bottom,
+                ],
+                work: [
+                    info.rcWork.left,
+                    info.rcWork.top,
+                    info.rcWork.right,
+                    info.rcWork.bottom,
+                ],
+            });
+        }
+        BOOL(1)
+    }
+
+    let mut areas = Vec::new();
+    unsafe {
+        let _ = EnumDisplayMonitors(None, None, Some(collect), LPARAM((&raw mut areas) as isize));
+    }
+    areas
+}
+
+fn rects_intersect(a: [i32; 4], b: [i32; 4]) -> bool {
+    a[0] < b[2] && a[2] > b[0] && a[1] < b[3] && a[3] > b[1]
+}
+
+/// Squared gap between `rect` and `monitor`; zero when they intersect.
+fn monitor_gap_sq(rect: [i32; 4], monitor: [i32; 4]) -> i64 {
+    let dx = if rect[2] <= monitor[0] {
+        monitor[0] - rect[2]
+    } else if rect[0] >= monitor[2] {
+        rect[0] - monitor[2]
+    } else {
+        0
+    };
+    let dy = if rect[3] <= monitor[1] {
+        monitor[1] - rect[3]
+    } else if rect[1] >= monitor[3] {
+        rect[1] - monitor[3]
+    } else {
+        0
+    };
+    let (dx, dy) = (i64::from(dx), i64::from(dy));
+    dx * dx + dy * dy
+}
+
+/// Fit `rect` so it is reachable on a real monitor.
+///
+/// A rect that intersects any monitor keeps the virtual-desktop rule: a
+/// window deliberately spanning two monitors must not be shrunk. A rect in a
+/// *hole* of a non-rectangular layout (monitor B of an A/B/C/D grid is gone)
+/// intersects none, even though it is inside the virtual-screen bounding box;
+/// it is moved onto the nearest monitor's work area instead of being left
+/// invisible and unreachable.
+pub(crate) fn fit_rect_to_monitors(
+    rect: [i32; 4],
+    monitors: &[MonitorArea],
+    desktop: [i32; 4],
+) -> [i32; 4] {
+    if monitors.is_empty() {
+        return fit_rect_to_bounds(rect, desktop);
+    }
+    if monitors
+        .iter()
+        .any(|monitor| rects_intersect(rect, monitor.rect))
+    {
+        return fit_rect_to_bounds(rect, desktop);
+    }
+    let nearest = monitors
+        .iter()
+        .min_by_key(|monitor| monitor_gap_sq(rect, monitor.rect))
+        .expect("checked non-empty above");
+    fit_rect_to_bounds(rect, nearest.work)
+}
+
 /// Move/shrink a normal (not minimized, not maximized) window so it is fully
 /// inside the virtual desktop — the bounding box of every monitor, NOT the work
 /// area of the monitor it happens to be nearest.
@@ -343,7 +451,10 @@ pub(crate) fn fit_rect_to_bounds(rect: [i32; 4], bounds: [i32; 4]) -> [i32; 4] {
 /// shrink it on every restore. Only a window that reaches outside the whole
 /// desktop (an unplugged monitor, a resolution drop, a save from a layout that
 /// no longer exists) is moved, and only one larger than the entire desktop is
-/// shrunk. Returns whether the window was moved.
+/// shrunk. A window in a *hole* of a non-rectangular layout is outside every
+/// monitor even though it is inside that bounding box, so it is fitted onto
+/// the nearest monitor's work area instead (see [`fit_rect_to_monitors`]).
+/// Returns whether the window was moved.
 ///
 /// Safe to call from the UI thread; it never activates the window.
 pub fn ensure_window_on_screen(hwnd: isize) -> bool {
@@ -374,7 +485,7 @@ pub fn ensure_window_on_screen(hwnd: isize) -> bool {
         );
         let desktop = [left, top, left + width.max(0), top + height.max(0)];
         let current = [rect.left, rect.top, rect.right, rect.bottom];
-        let fitted = fit_rect_to_bounds(current, desktop);
+        let fitted = fit_rect_to_monitors(current, &monitor_areas(), desktop);
         if fitted == current {
             return false;
         }
@@ -987,6 +1098,66 @@ mod tests {
         assert_eq!(
             fit_rect_to_bounds([10, 20, 900, 700], [100, 100, 50, 50]),
             [10, 20, 900, 700]
+        );
+    }
+
+    fn area(rect: [i32; 4], work: [i32; 4]) -> MonitorArea {
+        MonitorArea { rect, work }
+    }
+
+    /// Regression: a non-rectangular monitor layout has a hole inside the
+    /// virtual-screen bounding box. A window saved into that hole intersects
+    /// no monitor and used to satisfy the bounding-box fit, so it was never
+    /// moved and could not be reached.
+    #[test]
+    fn fit_rect_moves_a_window_out_of_a_layout_hole() {
+        let monitors = [
+            area([0, 0, 1920, 1080], [0, 0, 1920, 1040]),
+            area([0, 1080, 1920, 2160], [0, 1080, 1920, 2120]),
+            area([1920, 1080, 3840, 2160], [1920, 1080, 3840, 2120]),
+        ];
+        let desktop = [0, 0, 3840, 2160];
+        let in_hole = [2000, 200, 2600, 800];
+        assert!(
+            !monitors
+                .iter()
+                .any(|monitor| rects_intersect(in_hole, monitor.rect)),
+            "the fixture must sit in the hole"
+        );
+        let fitted = fit_rect_to_monitors(in_hole, &monitors, desktop);
+        assert_ne!(fitted, in_hole);
+        assert!(
+            monitors
+                .iter()
+                .any(|monitor| rects_intersect(fitted, monitor.rect)),
+            "the repaired window must be on a real monitor: {fitted:?}"
+        );
+        assert!(fitted[0] >= desktop[0] && fitted[2] <= desktop[2]);
+        assert!(fitted[1] >= desktop[1] && fitted[3] <= desktop[3]);
+    }
+
+    /// A window deliberately spanning two real monitors is not in a hole and
+    /// must keep its geometry.
+    #[test]
+    fn fit_rect_leaves_a_monitor_spanning_window_alone() {
+        let monitors = [
+            area([0, 0, 1920, 1080], [0, 0, 1920, 1040]),
+            area([1920, 0, 3840, 1080], [1920, 0, 3840, 1040]),
+        ];
+        let spanning = [0, 100, 3840, 900];
+        assert_eq!(
+            fit_rect_to_monitors(spanning, &monitors, [0, 0, 3840, 1080]),
+            spanning
+        );
+    }
+
+    /// No monitor list (Windows could not answer) keeps the old virtual-box
+    /// behavior rather than doing nothing.
+    #[test]
+    fn fit_rect_without_monitors_uses_the_virtual_desktop() {
+        assert_eq!(
+            fit_rect_to_monitors([3000, 200, 3800, 800], &[], [0, 0, 1920, 1040]),
+            fit_rect_to_bounds([3000, 200, 3800, 800], [0, 0, 1920, 1040])
         );
     }
 

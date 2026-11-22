@@ -770,11 +770,20 @@ impl TaskManApp {
         let history_cap = history_cap_for(settings.graph_seconds, min_interval_s);
 
         // App history loads on a worker; observations wait for it (ms-scale).
+        // A mock session must not leave fabricated usage in the real store.
         let history_path = tm_core::settings::taskman_data_dir().join("app-history.json");
-        let app_history_db = tm_core::AppHistoryDb::open_deferred(history_path);
-        let startup_impact = tm_core::ImpactStore::open(
-            tm_core::settings::taskman_data_dir().join("startup-impact.json"),
-        );
+        let app_history_db = if mock {
+            tm_core::AppHistoryDb::in_memory()
+        } else {
+            tm_core::AppHistoryDb::open_deferred(history_path)
+        };
+        let startup_impact = if mock {
+            tm_core::ImpactStore::in_memory()
+        } else {
+            tm_core::ImpactStore::open(
+                tm_core::settings::taskman_data_dir().join("startup-impact.json"),
+            )
+        };
 
         // Details tab column visibility/order live in the settings file;
         // apply them before the first frame so telemetry demand and the

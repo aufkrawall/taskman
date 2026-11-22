@@ -52,7 +52,7 @@ from the same device set with the same "busiest device" rule:
 - **Sampling is demand-only and identity-bound.** It runs only while the
   Modules page is visible, uses fixed per-role sessions
   (`TaskMan-Profile-Service|App`), stops after 30 s idle, and is drained
-  through protocol v9's exact PID + creation-time
+  through the broker's exact PID + creation-time
   `ProcessModuleCodeSamples` request. Long-lived target threads are seeded
   from ToolHelp and maintained by kernel thread start/stop/rundown events; a
   sample header naming the exact target PID can recover a missed thread start.
@@ -710,13 +710,15 @@ rebase runbook.
   is single-channel and both renderers blend with one scalar alpha. Measured:
   0 RGB channel spread in our text, visible fringing in the reference Task
   Manager capture. See `known-debt.md`.
-- **`render_mode`** (`auto` / `compatibility` / `software`) replaces the
-  transient `gpu_acceleration` bool and is read once at startup. `auto` is
-  wgpu/D3D12 (0.2–0.3 cores at continuous repaint), `compatibility` forces the
-  OpenGL backend (1.0–1.1 cores) for machines with a broken D3D driver, and
-  `software` is WARP — correct but ~14 cores at 2.9 fps, with a fixed
-  per-frame cost the app cannot influence, so the settings dialog warns about
-  it explicitly.
+- **`render_mode`** is `cpu` (default on Windows and Linux), `d3d12` (Windows),
+  `vulkan` (Linux), `metal` (macOS), or `opengl`; the legacy `auto`,
+  `software`/`warp` and `compatibility` spellings are still accepted on load.
+  It is read once at startup: a GPU choice that cannot initialize falls back
+  to CPU, Settings offers only the modes the current build compiles, and a
+  stored mode the platform does not offer is used as a local fallback without
+  being rewritten on disk. `TASKMAN_GPU` overrides the saved preference for
+  one launch; `TASKMAN_RENDERER` pins a specific compiled backend
+  (`cpu|d3d12|vulkan|metal|opengl|software|wgpu`) for diagnostics.
 
 ## Recently landed (2026-08-31 — table look, status glyphs and tree)
 
@@ -1338,9 +1340,11 @@ The window itself is now treated as a thing that can fail, not as a given:
   software surface owns its DC (no allocator thread), and a failed `wgpu` surface
   recreation keeps the old entry and retries.
 - **Tray, drags and dialogs.** Close-to-tray and start-minimized require a created icon
-  (`TRAY_STATE`); `WM_CAPTURECHANGED` and focus loss release held buttons; the dump picker,
-  the Run dialog's Browse and the shell verbs (`open file location`, `properties`, URLs)
-  run on the action executor.
+  (`TRAY_STATE`); a pending start-minimized launch keeps asserting hidden so eframe's
+  first-frame reveal cannot flash the window. `WM_CAPTURECHANGED` sends `CursorLeft`
+  before releasing held buttons (no click), focus loss clears the held-button state, and
+  the dump picker, the Run dialog's Browse and the shell verbs (`open file location`,
+  `properties`, URLs) run on the action executor.
 
 ## Routing
 

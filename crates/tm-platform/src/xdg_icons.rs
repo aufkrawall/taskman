@@ -23,8 +23,42 @@ use std::sync::OnceLock;
 /// Maximum edge of a decoded icon; larger PNGs are box-downsampled so the
 /// GUI-side texture cache stays small (64×64×4 ≈ 16 KiB per icon).
 const MAX_ICON_EDGE: u32 = 64;
+/// Refuse absurd source images before allocating their decoded buffer. A
+/// 2048×2048 RGBA image is already 16 MiB — far more than any icon needs,
+/// and it still gets downsampled to [`MAX_ICON_EDGE`].
+const MAX_ICON_SOURCE_EDGE: u32 = 2048;
+/// Decoder allocation ceiling. The dimension cap above already bounds the
+/// useful case; this also keeps a PNG with malicious chunk sizes from
+/// reserving the library's 64 MiB default.
+const MAX_ICON_DECODE_BYTES: usize = 32 * 1024 * 1024;
 /// The GUI paints icons at ~18 px; 32 is the size desktop shells hand out.
 const TARGET_SIZE: u32 = 32;
+
+/// `Exec=` binaries that merely launch another application. A `.desktop`
+/// entry for a Python/Java/Wine/Flatpak app must not make the interpreter's
+/// own process show that app's icon.
+const WRAPPER_BINARIES: &[&str] = &[
+    "python",
+    "python2",
+    "python3",
+    "java",
+    "wine",
+    "wine64",
+    "wine-preloader",
+    "flatpak",
+    "snap",
+    "sh",
+    "bash",
+    "dash",
+    "node",
+    "nodejs",
+    "perl",
+    "ruby",
+    "mono",
+    "electron",
+    "steam",
+    "xdg-open",
+];
 
 /// Icon names that stand for "an application without an icon of its own", in
 /// fallback order: the standard executable icon every theme ships (the
@@ -344,22 +378,22 @@ impl IconResolver {
 /// `Exec=` (skipping `env VAR=..` prefixes) by basename, or the desktop
 /// file's own id. Higher-precedence data dirs are scanned first and win.
 fn build_desktop_index(data_dirs: &[PathBuf]) -> HashMap<String, String> {
+    // `applications/` is depth 0; two levels below it cover legacy layouts
+    // such as `applications/kde4/` or `applications/vendor/foo/`.
+    const MAX_DEPTH: u8 = 2;
     let mut index = HashMap::new();
     for data_dir in data_dirs {
         let apps = data_dir.join("applications");
-        let mut stack = vec![apps.clone()];
-        // Two levels cover applications/ and e.g. applications/kde4/.
-        let mut depth_left = 2;
-        while let Some(dir) = stack.pop() {
+        let mut stack = vec![(apps, 0u8)];
+        while let Some((dir, depth)) = stack.pop() {
             let Ok(entries) = std::fs::read_dir(&dir) else {
                 continue;
             };
             for entry in entries.flatten() {
                 let p = entry.path();
                 if p.is_dir() {
-                    if depth_left > 0 {
-                        depth_left -= 1;
-                        stack.push(p);
+                    if depth < MAX_DEPTH {
+                        stack.push((p, depth + 1));
                     }
                     continue;
                 }
@@ -379,7 +413,7 @@ fn build_desktop_index(data_dirs: &[PathBuf]) -> HashMap<String, String> {
                     .as_deref()
                     .and_then(exec_first_binary)
                     .and_then(|b| b.rsplit('/').next().map(str::to_ascii_lowercase))
-                    .filter(|b| !b.is_empty())
+                    .filter(|b| !b.is_empty() && !WRAPPER_BINARIES.contains(&b.as_str()))
                 {
                     index.entry(exe_base).or_insert_with(|| icon.clone());
                 }
@@ -593,11 +627,18 @@ fn theme_directories(theme_dir: &Path) -> Option<Vec<(u32, String)>> {
 pub fn decode_png_rgba(path: &Path) -> Option<(u32, u32, Vec<u8>)> {
     let file = std::fs::File::open(path).ok()?;
     let mut decoder = png::Decoder::new(std::io::BufReader::new(file));
-    // EXPAND: palette -> RGB, grayscale <8bit -> 8bit, tRNS -> alpha channel.
-    decoder.set_transformations(png::Transformations::EXPAND);
+    // normalize_to_color8 = EXPAND | STRIP_16: palettes and low-bit
+    // grayscale become 8-bit RGB, tRNS becomes an alpha channel, and 16-bit
+    // samples are stripped to 8 bits. Without STRIP_16 a legal 16-bit theme
+    // icon produces two bytes per channel and the GUI's texture upload
+    // asserts on the length (release builds abort).
+    decoder.set_transformations(png::Transformations::normalize_to_color8());
+    decoder.set_limits(png::Limits {
+        bytes: MAX_ICON_DECODE_BYTES,
+    });
     let mut reader = decoder.read_info().ok()?;
     let (w, h) = (reader.info().width, reader.info().height);
-    if w == 0 || h == 0 || w > 4096 || h > 4096 {
+    if w == 0 || h == 0 || w > MAX_ICON_SOURCE_EDGE || h > MAX_ICON_SOURCE_EDGE {
         return None;
     }
     let out_size = reader.output_buffer_size()?;
@@ -631,6 +672,13 @@ pub fn decode_png_rgba(path: &Path) -> Option<(u32, u32, Vec<u8>)> {
         }
         _ => return None,
     };
+    // Every branch above claims 8-bit RGBA. Reject anything else instead of
+    // handing `ColorImage::from_rgba_unmultiplied` a buffer whose length
+    // trips its assert on the UI thread.
+    let expected = (w as usize).checked_mul(h as usize)?.checked_mul(4)?;
+    if src.len() != expected {
+        return None;
+    }
     Some(if w.max(h) > MAX_ICON_EDGE {
         downscale_rgba(&src, w, h)
     } else {
@@ -639,6 +687,10 @@ pub fn decode_png_rgba(path: &Path) -> Option<(u32, u32, Vec<u8>)> {
 }
 
 /// Box-filter downscale so the longest edge is at most [`MAX_ICON_EDGE`].
+///
+/// RGB is averaged weighted by alpha and divided by the summed alpha, so a
+/// transparent border (usually RGB 0) cannot darken the edge pixels into a
+/// black halo around a large theme icon.
 fn downscale_rgba(rgba: &[u8], w: u32, h: u32) -> (u32, u32, Vec<u8>) {
     let scale = (w.max(h) as f32 / MAX_ICON_EDGE as f32).ceil();
     let (nw, nh) = (
@@ -657,21 +709,32 @@ fn downscale_rgba(rgba: &[u8], w: u32, h: u32) -> (u32, u32, Vec<u8>) {
             let y1 = (((y + 1) as f32 * h as f32 / nh as f32) as u32)
                 .max(y0 + 1)
                 .min(h);
+            // [alpha, r*alpha, g*alpha, b*alpha]
             let mut acc = [0u64; 4];
             let mut count = 0u64;
             for sy in y0..y1 {
                 for sx in x0..x1 {
                     let i = ((sy * w + sx) * 4) as usize;
-                    for (a, c) in acc.iter_mut().zip(rgba[i..i + 4].iter()) {
-                        *a += *c as u64;
-                    }
+                    let a = u64::from(rgba[i + 3]);
+                    acc[0] += a;
+                    acc[1] += u64::from(rgba[i]) * a;
+                    acc[2] += u64::from(rgba[i + 1]) * a;
+                    acc[3] += u64::from(rgba[i + 2]) * a;
                     count += 1;
                 }
             }
             let o = ((y * nw + x) * 4) as usize;
-            for (a, c) in acc.iter().zip(out[o..o + 4].iter_mut()) {
-                *c = (*a / count.max(1)) as u8;
+            let alpha_sum = acc[0];
+            if let (Some(r), Some(g), Some(b)) = (
+                acc[1].checked_div(alpha_sum),
+                acc[2].checked_div(alpha_sum),
+                acc[3].checked_div(alpha_sum),
+            ) {
+                out[o] = r as u8;
+                out[o + 1] = g as u8;
+                out[o + 2] = b as u8;
             }
+            out[o + 3] = (alpha_sum / count.max(1)) as u8;
         }
     }
     (nw, nh, out)
@@ -730,6 +793,10 @@ mod tests {
     }
 
     fn write_png(path: &Path, w: u32, h: u32, rgba: [u8; 4]) {
+        write_png_pixels(path, w, h, &rgba.repeat((w * h) as usize));
+    }
+
+    fn write_png_pixels(path: &Path, w: u32, h: u32, pixels: &[u8]) {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).unwrap();
         }
@@ -738,9 +805,28 @@ mod tests {
         enc.set_color(png::ColorType::Rgba);
         enc.set_depth(png::BitDepth::Eight);
         let mut writer = enc.write_header().unwrap();
-        let mut data = Vec::with_capacity((w * h * 4) as usize);
+        assert_eq!(pixels.len(), (w * h * 4) as usize);
+        writer.write_image_data(pixels).unwrap();
+        writer.finish().unwrap();
+    }
+
+    /// A 16-bit RGBA PNG: legal, common in some third-party themes, and the
+    /// input that used to trip `ColorImage::from_rgba_unmultiplied`'s length
+    /// assert (release builds abort).
+    fn write_png_16(path: &Path, w: u32, h: u32, rgba: [u16; 4]) {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        let file = std::fs::File::create(path).unwrap();
+        let mut enc = png::Encoder::new(file, w, h);
+        enc.set_color(png::ColorType::Rgba);
+        enc.set_depth(png::BitDepth::Sixteen);
+        let mut writer = enc.write_header().unwrap();
+        let mut data = Vec::with_capacity((w * h * 8) as usize);
         for _ in 0..(w * h) {
-            data.extend_from_slice(&rgba);
+            for channel in rgba {
+                data.extend_from_slice(&channel.to_be_bytes());
+            }
         }
         writer.write_image_data(&data).unwrap();
         writer.finish().unwrap();
@@ -1014,5 +1100,100 @@ mod tests {
         let sb = Sandbox::new("default-app-missing");
         let r = IconResolver::new(sb.lookup());
         assert!(r.default_app_icon_rgba().is_none());
+    }
+
+    /// Regression: a legal 16-bit theme PNG must decode to 8-bit RGBA, not
+    /// hand 8 bytes per pixel to the GUI's texture upload.
+    #[test]
+    fn sixteen_bit_png_is_stripped_to_eight_bit_rgba() {
+        let sb = Sandbox::new("png16");
+        write_png_16(
+            &sb.root.join("icon16.png"),
+            32,
+            32,
+            [0xABCD, 0x1234, 0x5678, 0xFFFF],
+        );
+        let (w, h, rgba) = decode_png_rgba(&sb.root.join("icon16.png")).expect("decode");
+        assert_eq!((w, h), (32, 32));
+        assert_eq!(rgba.len(), 32 * 32 * 4);
+    }
+
+    /// A large 16-bit PNG is downsampled, never left at 8 bytes/pixel.
+    #[test]
+    fn large_sixteen_bit_png_is_downsampled_to_eight_bit_rgba() {
+        let sb = Sandbox::new("png16-large");
+        write_png_16(&sb.root.join("big16.png"), 128, 64, [0xFFFF, 0, 0, 0xFFFF]);
+        let (w, h, rgba) = decode_png_rgba(&sb.root.join("big16.png")).expect("decode");
+        assert_eq!((w, h), (64, 32));
+        assert_eq!(rgba.len(), 64 * 32 * 4);
+    }
+
+    /// Transparent pixels are RGB 0 in most theme PNGs; averaging straight
+    /// RGB darkens the edge into a black halo. The box filter must weight
+    /// RGB by alpha.
+    #[test]
+    fn downscale_does_not_darken_transparent_edges() {
+        let sb = Sandbox::new("downscale-alpha");
+        let (w, h) = (128, 128);
+        let mut pixels = vec![0u8; (w * h * 4) as usize];
+        for y in 0..h {
+            for x in 0..w {
+                let i = ((y * w + x) * 4) as usize;
+                if x % 2 == 0 {
+                    // Opaque red in every other column.
+                    pixels[i..i + 4].copy_from_slice(&[255, 0, 0, 255]);
+                }
+            }
+        }
+        write_png_pixels(&sb.root.join("edge.png"), w, h, &pixels);
+        let (ow, oh, rgba) = decode_png_rgba(&sb.root.join("edge.png")).expect("decode");
+        assert_eq!((ow, oh), (64, 64));
+        let (r, g, b, a) = (rgba[0], rgba[1], rgba[2], rgba[3]);
+        assert_eq!(a, 127, "half the source box is transparent");
+        assert!(
+            r > 250 && g < 5 && b < 5,
+            "opaque red must stay red, not be averaged with transparent black: {r},{g},{b}"
+        );
+    }
+
+    /// Three sibling subdirectories must all be scanned; the old DFS-wide
+    /// two-step counter stopped after whichever two `read_dir` returned
+    /// first, and the third app lost its theme icon.
+    #[test]
+    fn desktop_index_scans_every_subdirectory() {
+        let sb = Sandbox::new("index-depth");
+        for name in ["alpha", "beta", "gamma"] {
+            write_desktop(
+                &sb.root
+                    .join(format!("share/applications/{name}/{name}.desktop")),
+                &format!("[Desktop Entry]\nName={name}\nExec=/usr/bin/{name}\nIcon={name}-icon\n"),
+            );
+        }
+        let index = build_desktop_index(&[sb.root.join("share")]);
+        for name in ["alpha", "beta", "gamma"] {
+            let expected = format!("{name}-icon");
+            assert_eq!(
+                index.get(name).map(String::as_str),
+                Some(expected.as_str()),
+                "{name} was not indexed"
+            );
+        }
+    }
+
+    /// A desktop entry whose Exec is a shared interpreter must not claim
+    /// that interpreter's process icon.
+    #[test]
+    fn desktop_index_skips_shared_interpreters() {
+        let sb = Sandbox::new("index-wrapper");
+        write_desktop(
+            &sb.root.join("share/applications/pyapp.desktop"),
+            "[Desktop Entry]\nName=PyApp\nExec=python3 /opt/pyapp/main.py\nIcon=pyapp\n",
+        );
+        let index = build_desktop_index(&[sb.root.join("share")]);
+        assert_eq!(index.get("pyapp").map(String::as_str), Some("pyapp"));
+        assert!(
+            !index.contains_key("python3"),
+            "python3 is a wrapper, not PyApp's image"
+        );
     }
 }

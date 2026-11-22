@@ -233,16 +233,23 @@ impl CpuLoadAccountant {
         }
     }
 
-    /// Process creation time (Unix seconds) from the newest native process
-    /// table.
+    /// Process creation time from a process table refreshed within
+    /// [`PROC_TABLE_MAX_AGE`].
     ///
-    /// sysinfo reads this through a process HANDLE and reports 0 when it
-    /// cannot open one — roughly half the process list for an unelevated
-    /// session. The kernel table carries a creation time for every process,
-    /// so this is what turns a fabricated `Some(0)` into either the real
-    /// identity or an honest `None`.
+    /// sysinfo reads the creation time through a process HANDLE and reports 0
+    /// when it cannot open one — roughly half the process list for an
+    /// unelevated session. The kernel table carries a time for every process,
+    /// so this turns a fabricated `Some(0)` into either the real identity or
+    /// an honest `None`. A stale table can still describe the previous
+    /// occupant of a recycled PID, so it is not identity evidence: callers
+    /// fall back to a handle-bound read or sysinfo instead.
+    /// `is_process_live` checks the same age for the same reason.
     pub fn start_epoch_of(&self, pid: u32) -> Option<i64> {
-        let raw = self.prev.as_ref()?.procs.get(&pid)?;
+        let prev = self.prev.as_ref()?;
+        if prev.at.elapsed() > PROC_TABLE_MAX_AGE {
+            return None;
+        }
+        let raw = prev.procs.get(&pid)?;
         filetime_to_unix_ticks(raw.create_time)
     }
 

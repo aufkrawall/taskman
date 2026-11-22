@@ -486,7 +486,9 @@ pub(crate) fn protected_process_modules(
     // Revalidate after reading the cache and immediately before it crosses the
     // privileged broker boundary. A PID recycled during the rundown cannot
     // receive the previous process's module list.
-    if super::cpu_load::current_creation_epoch(pid) != Some(expected_start_epoch_s) {
+    if super::cpu_load::current_creation_epoch(pid).is_none_or(|actual| {
+        !tm_core::model::creation_timestamps_match(expected_start_epoch_s, actual)
+    }) {
         *slot = None;
         return Err(TmError::ProcessNotFound { pid });
     }

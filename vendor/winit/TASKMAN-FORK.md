@@ -2,7 +2,7 @@
 
 This directory is a vendored copy of [`winit`](https://github.com/rust-windowing/winit)
 **0.30.13** (crates.io), reached only through `[patch.crates-io]` in the root
-`Cargo.toml`. It carries two small patches.
+`Cargo.toml`. It carries three patches.
 
 ## 1. Window band for always-on-top
 
@@ -73,9 +73,13 @@ error surfacing. All of it is Windows-only and marked with a `TASKMAN-FORK:` com
   - `WM_DISPLAYCHANGE` and `WM_DWMCOMPOSITIONCHANGED` invalidate the whole
     client area (`InvalidateRgn(window, 0, FALSE)`), so a mode change that keeps
     the client size identical still produces a repaint.
-  - `WM_CAPTURECHANGED` with a foreign `lparam` and a nonzero capture count now
-    synthesizes `MouseInput { Released }` for Left/Right/Middle/Back/Forward,
-    so egui never keeps a drag pressed after Windows took the capture away.
+  - `WM_CAPTURECHANGED` with a foreign `lparam` and a nonzero capture count sends
+    `CursorLeft` and then synthesizes `MouseInput { Released }` for
+    Left/Right/Middle/Back/Forward, so egui never keeps a drag pressed after
+    Windows took the capture away. The `CursorLeft` is what makes egui take its
+    "released outside" path: a release with a still-cached position would be
+    eligible to register as a click (and a synthetic Left release during a
+    middle-button drag could activate the control under the cursor).
   - `WM_DPICHANGED` no longer `expect`s the old inner rect; a failed
     `GetWindowRect` leaves the window as it was instead of panicking.
 - `src/platform_impl/windows/window.rs`

@@ -360,8 +360,19 @@ fn run_gui(mock: bool, args: &[String]) {
         settings.window_size = sz;
     }
     tm_core::i18n::set_lang(settings.language.resolve());
+    // Coerce only the value actually used on this platform. Rewriting the
+    // stored setting would silently destroy an explicit choice (a v0.1.31
+    // `compatibility`/OpenGL preference on Windows) and make it unrecoverable
+    // if the user moves the config to a platform that still offers it.
+    let configured = configured_render_mode(settings.render_mode);
+    if configured != settings.render_mode {
+        tracing::warn!(
+            stored = ?settings.render_mode,
+            using = ?configured,
+            "stored renderer is unavailable on this platform; keeping the stored choice"
+        );
+    }
     let render_mode = effective_render_mode(&settings);
-    settings.render_mode = configured_render_mode(settings.render_mode);
     let window_size = [settings.window_size[0], settings.window_size[1]];
     // The egui context still has zoom 1.0 while the window is created
     // (`TaskManApp::new` applies `ui_zoom` afterwards), but the first frame
@@ -495,6 +506,10 @@ fn run_gui(mock: bool, args: &[String]) {
     // is permanently topmost and cannot be demoted, so this stays conditional.
     let topmost_band = settings.always_on_top;
     let mut failures: Vec<(eframe::Renderer, String)> = Vec::new();
+    // A post-start event-loop failure (ExitFailure) is not a startup failure:
+    // the app may have run for hours before the display server or event loop
+    // failed, and reporting it as "could not start" hides that.
+    let mut post_start_failure = false;
     for renderer in preferred_renderers(render_mode, explicit_renderer.as_deref()) {
         // Every renderer attempt creates a new window; re-request the band in
         // case a previous attempt cleared it after its first frame.
@@ -577,11 +592,20 @@ fn run_gui(mock: bool, args: &[String]) {
                 let abort = should_abort_renderer_fallback(&e);
                 let detail = e.to_string();
                 if abort {
-                    tracing::error!(
-                        ?renderer,
-                        error = %detail,
-                        "display/event loop initialization failed; not trying fallback renderers"
-                    );
+                    post_start_failure = event_loop_failed_after_start(&e);
+                    if post_start_failure {
+                        tracing::error!(
+                            ?renderer,
+                            error = %detail,
+                            "event loop failed after startup; not trying fallback renderers"
+                        );
+                    } else {
+                        tracing::error!(
+                            ?renderer,
+                            error = %detail,
+                            "display/event loop initialization failed; not trying fallback renderers"
+                        );
+                    }
                     failures.push((renderer, detail));
                     break;
                 }
@@ -590,7 +614,11 @@ fn run_gui(mock: bool, args: &[String]) {
             }
         }
     }
-    let error_message = format_renderer_startup_error(explicit_renderer.as_deref(), &failures);
+    let error_message = if post_start_failure {
+        format_event_loop_failure(&failures)
+    } else {
+        format_renderer_startup_error(explicit_renderer.as_deref(), &failures)
+    };
     tracing::error!("{error_message}");
     tm_core::logging::attach_file_logging(tm_core::logging::LogConfig {
         console: false,
@@ -652,6 +680,24 @@ fn mode_for_renderer(renderer: eframe::Renderer) -> RenderMode {
 /// `EventLoop can't be recreated`.
 fn should_abort_renderer_fallback(err: &eframe::Error) -> bool {
     matches!(err, eframe::Error::WinitEventLoop(_))
+}
+
+/// `ExitFailure` means the event loop ran and then exited with a failure
+/// status; the GUI was up, so "failed to start" would be wrong.
+fn event_loop_failed_after_start(err: &eframe::Error) -> bool {
+    matches!(
+        err,
+        eframe::Error::WinitEventLoop(egui_winit::winit::error::EventLoopError::ExitFailure(_))
+    )
+}
+
+fn format_event_loop_failure(failures: &[(eframe::Renderer, String)]) -> String {
+    let details = failures
+        .iter()
+        .map(|(renderer, err)| format!("{renderer}: {err}"))
+        .collect::<Vec<_>>()
+        .join("; ");
+    format!("taskman: event loop failed after startup ({details})")
 }
 
 fn format_renderer_startup_error(
@@ -758,6 +804,33 @@ fn compiled_wgpu_backends() -> eframe::wgpu::Backends {
 /// cannot be brought back.
 #[cfg(target_os = "windows")]
 const INITIAL_HIDE_TRAY_WAIT: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// What a start-minimized launch should do while the tray icon is not ready.
+#[cfg(target_os = "windows")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InitialHideAction {
+    /// The icon exists: it is safe to disappear into it.
+    Hide,
+    /// Still being created: keep the window hidden and look again shortly.
+    Wait,
+    /// The icon can never appear (or the wait expired): show the window.
+    Show,
+}
+
+/// Decide a start-minimized launch's visibility for one frame.
+///
+/// `Wait` still means "assert hidden": the window is created invisible, but
+/// eframe's first-frame reveal keys off the app's own `Visible` command, so
+/// sending nothing here would let `post_rendering` show the window until the
+/// tray poll notices `READY`.
+#[cfg(target_os = "windows")]
+fn initial_hide_action(tray: Option<(bool, bool)>, before_deadline: bool) -> InitialHideAction {
+    match tray {
+        Some((true, _)) => InitialHideAction::Hide,
+        Some((false, false)) if before_deadline => InitialHideAction::Wait,
+        _ => InitialHideAction::Show,
+    }
+}
 
 /// Upper bound on frames a restore waits for a painted frame before it
 /// uncloaks anyway, so the window can never stay invisible.
@@ -920,20 +993,25 @@ impl eframe::App for NativeApp {
                     .tray
                     .as_ref()
                     .map(|tray| (tray.is_ready(), tray.has_failed()));
-                match tray_state {
+                let action = initial_hide_action(
+                    tray_state,
+                    std::time::Instant::now() < self.initial_hide_deadline,
+                );
+                match action {
                     // The icon exists: it is now safe to disappear into it.
-                    Some((true, _)) => {
+                    InitialHideAction::Hide => {
                         ctx.send_viewport_cmd(eframe::egui::ViewportCommand::Visible(false));
                         self.initial_hide_pending = false;
                     }
                     // Still being created: stay hidden (the window was created
-                    // invisible) and look again shortly, but not forever.
-                    Some((false, false))
-                        if std::time::Instant::now() < self.initial_hide_deadline =>
-                    {
+                    // invisible) and look again shortly, but not forever. The
+                    // command is still sent so eframe's first-frame reveal
+                    // cannot override the request while we wait.
+                    InitialHideAction::Wait => {
+                        ctx.send_viewport_cmd(eframe::egui::ViewportCommand::Visible(false));
                         ctx.request_repaint_after(std::time::Duration::from_millis(25));
                     }
-                    _ => {
+                    InitialHideAction::Show => {
                         tracing::warn!(
                             "tray icon unavailable for a start-minimized launch; showing the window"
                         );
@@ -1569,10 +1647,15 @@ impl NativeApp {
             }
             // A window another party (virtual desktops, the shell) left
             // cloaked would be "shown" yet invisible: repair before answering.
-            if let Some(hwnd) = self.hwnd
-                && tm_platform::is_window_cloaked(hwnd)
-            {
-                tm_platform::set_window_cloaked(hwnd, false);
+            // Re-fit as well: a hotkey/tray restore of a minimized window
+            // skipped the pre-unminimize check (`IsIconic` returns early), so
+            // an unplugged monitor can leave it at its old off-screen
+            // geometry until this point.
+            if let Some(hwnd) = self.hwnd {
+                if tm_platform::is_window_cloaked(hwnd) {
+                    tm_platform::set_window_cloaked(hwnd, false);
+                }
+                tm_platform::ensure_window_on_screen(hwnd);
             }
             tm_platform::win::instance::acknowledge_show();
             self.show_ack_pending = false;
@@ -1711,6 +1794,20 @@ mod tests {
         assert_eq!(configured_render_mode(foreign), RenderMode::Cpu);
     }
 
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn start_minimized_keeps_the_window_hidden_until_the_tray_is_ready() {
+        use InitialHideAction::{Hide, Show, Wait};
+        assert_eq!(initial_hide_action(Some((true, false)), true), Hide);
+        assert_eq!(initial_hide_action(Some((true, true)), false), Hide);
+        // Regression: a slow tray must still assert hidden; the old wait arm
+        // sent no command and eframe's first-frame reveal showed the window.
+        assert_eq!(initial_hide_action(Some((false, false)), true), Wait);
+        assert_eq!(initial_hide_action(Some((false, false)), false), Show);
+        assert_eq!(initial_hide_action(Some((false, true)), true), Show);
+        assert_eq!(initial_hide_action(None, true), Show);
+    }
+
     #[cfg(feature = "wgpu")]
     #[test]
     fn gpu_adapter_selection_excludes_software_and_respects_power_preference() {
@@ -1750,6 +1847,22 @@ mod tests {
 
         let renderer_err = eframe::Error::AppCreation("softbuffer surface failed".into());
         assert!(!should_abort_renderer_fallback(&renderer_err));
+    }
+
+    #[test]
+    fn an_exit_failure_is_reported_as_a_runtime_failure_not_a_startup_failure() {
+        let exit =
+            eframe::Error::WinitEventLoop(egui_winit::winit::error::EventLoopError::ExitFailure(1));
+        assert!(should_abort_renderer_fallback(&exit));
+        assert!(event_loop_failed_after_start(&exit));
+        let recreate = eframe::Error::WinitEventLoop(
+            egui_winit::winit::error::EventLoopError::RecreationAttempt,
+        );
+        assert!(!event_loop_failed_after_start(&recreate));
+        assert_eq!(
+            format_event_loop_failure(&[(eframe::Renderer::Software, "exit 1".into())]),
+            "taskman: event loop failed after startup (software: exit 1)"
+        );
     }
 
     #[cfg(all(feature = "software", feature = "wgpu", feature = "glow"))]

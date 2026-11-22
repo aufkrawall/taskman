@@ -70,6 +70,10 @@ pub struct IconCache {
     worker_started: Arc<std::sync::atomic::AtomicBool>,
     /// Bounded hand-off queue length.
     in_flight: Arc<std::sync::atomic::AtomicUsize>,
+    /// `(egui pass number, textures uploaded in that pass)`. The budget is
+    /// per frame, not per row: `drain_results` runs once for every visible
+    /// row, so a per-call counter let one cold frame upload everything.
+    budget: Arc<Mutex<(u64, usize)>>,
 }
 
 impl IconCache {
@@ -202,6 +206,16 @@ impl IconCache {
     /// when a backlog remains) so fresh icons appear without waiting for an
     /// unrelated frame.
     fn drain_results(&self, ctx: &egui::Context) {
+        let pass = ctx.cumulative_pass_nr();
+        let mut budget = sync::lock(&self.budget);
+        if budget.0 == pass && budget.1 >= UPLOAD_BUDGET {
+            // This frame's budget is spent; do not drain/requeue the whole
+            // backlog for every remaining row.
+            return;
+        }
+        if budget.0 != pass {
+            *budget = (pass, 0);
+        }
         let mut ready: Vec<Decoded> = {
             let mut r = sync::lock(&self.results);
             std::mem::take(&mut *r)
@@ -209,16 +223,32 @@ impl IconCache {
         if ready.is_empty() {
             return;
         }
-        let mut uploaded = 0usize;
+        let remaining = UPLOAD_BUDGET.saturating_sub(budget.1);
+        let mut loaded = 0usize;
+        let mut processed = 0usize;
         let mut leftover: Vec<Decoded> = Vec::new();
         {
             let mut inner = sync::lock(&self.inner);
             for d in ready.drain(..) {
-                if uploaded >= UPLOAD_BUDGET {
+                if loaded >= remaining {
                     leftover.push(d);
                     continue;
                 }
-                let tex = d.icon.map(|(w, h, rgba)| {
+                let tex = d.icon.and_then(|(w, h, rgba)| {
+                    let expected = (w as usize).checked_mul(h as usize)?.checked_mul(4)?;
+                    if rgba.len() != expected {
+                        // A platform decoder handed us a buffer the texture
+                        // type would assert on (and release builds abort).
+                        // Treat it as an extraction failure, never a panic.
+                        tracing::warn!(
+                            path = %d.path,
+                            w,
+                            h,
+                            len = rgba.len(),
+                            "icon decoder returned a mismatched RGBA buffer"
+                        );
+                        return None;
+                    }
                     let img =
                         egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], &rgba);
                     let name = if d.path == DEFAULT_APP_ICON_KEY {
@@ -226,17 +256,18 @@ impl IconCache {
                     } else {
                         format!("icon:{}", d.path)
                     };
-                    ctx.load_texture(name, img, egui::TextureOptions::LINEAR)
+                    Some(ctx.load_texture(name, img, egui::TextureOptions::LINEAR))
                 });
                 inner.queued.remove(&d.path);
                 if let Some(tex) = tex {
                     let last_used = inner.next_use;
                     inner.next_use += 1;
                     inner.tex.insert(d.path, CachedTexture { tex, last_used });
+                    loaded += 1;
                 } else {
                     inner.failed.insert(d.path, std::time::Instant::now());
                 }
-                uploaded += 1;
+                processed += 1;
             }
             inner
                 .failed
@@ -266,9 +297,11 @@ impl IconCache {
                 }
             }
         }
+        budget.1 += loaded;
+        drop(budget);
         self.in_flight
-            .fetch_sub(uploaded, std::sync::atomic::Ordering::Relaxed);
-        if uploaded > 0 {
+            .fetch_sub(processed, std::sync::atomic::Ordering::Relaxed);
+        if loaded > 0 {
             // Freshly uploaded textures must be painted even when nothing is
             // left in the queue — otherwise the last batch waits for an
             // unrelated repaint.
@@ -409,6 +442,10 @@ mod tests {
             if std::time::Instant::now() >= deadline {
                 return None;
             }
+            // The upload budget is per egui pass; advance one so a backlog
+            // larger than the budget can drain while a test waits.
+            let mut out = ctx.run_ui(egui::RawInput::default(), |_| {});
+            out.textures_delta.clear();
             std::thread::yield_now();
         }
     }
@@ -551,6 +588,48 @@ mod tests {
             Lookup::Missing
         ));
         assert_eq!(cache.len(), CACHE_CAP);
+        let inner = sync::lock(&cache.inner);
+        assert!(
+            inner.failed.contains_key(path),
+            "a failed extraction must be remembered, not re-queued"
+        );
+        assert!(!inner.queued.contains(path));
+        assert!(
+            !inner.tex.contains_key(path),
+            "a failure must not become a texture"
+        );
+        drop(inner);
+        assert_eq!(
+            cache.in_flight.load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
+    }
+
+    #[test]
+    fn upload_budget_is_per_frame_not_per_row() {
+        let ctx = egui::Context::default();
+        let cache = IconCache::default();
+        for i in 0..(2 * UPLOAD_BUDGET) {
+            sync::lock(&cache.results).push(Decoded {
+                path: format!("/apps/{i}"),
+                icon: Some((1, 1, vec![255, 0, 0, 255])),
+            });
+        }
+        // `lookup` calls this once per visible row; the budget must not reset
+        // between those calls.
+        cache.drain_results(&ctx);
+        assert_eq!(cache.len(), UPLOAD_BUDGET);
+        cache.drain_results(&ctx);
+        assert_eq!(
+            cache.len(),
+            UPLOAD_BUDGET,
+            "a second row in the same pass must not upload another batch"
+        );
+        // The next pass may spend the budget again.
+        let mut out = ctx.run_ui(egui::RawInput::default(), |_| {});
+        out.textures_delta.clear();
+        cache.drain_results(&ctx);
+        assert_eq!(cache.len(), 2 * UPLOAD_BUDGET);
     }
 
     #[cfg(target_os = "linux")]
@@ -613,10 +692,8 @@ mod tests {
         let cache = IconCache::default();
         let system_root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into());
         let image = format!(r"{system_root}\System32\lsass.exe");
-        assert!(
-            pump(&cache, &ctx, &actions, Some(&image)).is_some(),
-            "a known image has a shell icon"
-        );
+        let known =
+            pump(&cache, &ctx, &actions, Some(&image)).expect("a known image has a shell icon");
         let default = pump(&cache, &ctx, &actions, None).expect("the OS has a default app icon");
         let unknown_image = format!(r"{system_root}\System32\no-such-image-xyz.exe");
         let fallback = pump(&cache, &ctx, &actions, Some(&unknown_image))
@@ -625,6 +702,11 @@ mod tests {
             fallback.id(),
             default.id(),
             "an image the shell cannot resolve must paint the OS default icon"
+        );
+        assert_ne!(
+            known.id(),
+            default.id(),
+            "the known image's own icon must not silently be the OS default"
         );
     }
 }

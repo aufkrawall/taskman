@@ -15,9 +15,10 @@
   makes the light ones redundant:
   - Ordinary change → `cargo test -p <touched-crate>`.
   - Cross-crate changes, engine/model/settings/platform changes, or anything
-    startup-sensitive → full gate:
-    `python build.py --check` (fmt --check + clippy `-D warnings` +
-    workspace tests), then a release build (`python build.py --host-only`).
+    startup-sensitive → full gate: `python build.py --check` — fmt --check,
+    clippy `-D warnings`, workspace tests, then the host and Linux artifact
+    build and packaging (`--host-only` skips Linux; `--require-all-targets`
+    makes a skipped Linux build fatal).
 - The light gate does NOT cover lint or cross-crate breakage.
 - The heavy gate covers formatting, clippy with warnings-as-errors, all
   workspace tests (incl. Windows integration tests), and release packaging.
@@ -176,7 +177,8 @@
 | `tools/discover-debug-tools.ps1` | Non-mutating Windows SDK/MSVC/Sysinternals/Rust tool discovery | `powershell -ExecutionPolicy Bypass -File .\tools\discover-debug-tools.ps1` |
 | Discovery regression test | Regression test for generic debug-tool discovery | `powershell -ExecutionPolicy Bypass -File .\tools\tests\test-debug-tool-discovery.ps1` |
 | `--selfcheck` | Headless sampling smoke test, prints JSON summary | `target/release/taskman.exe --selfcheck [--mock]` |
-| `TASKMAN_RENDERER=glow\|wgpu` | Force renderer | env var before launch |
+| `TASKMAN_RENDERER=cpu\|d3d12\|vulkan\|metal\|opengl\|software\|wgpu` | Pin one compiled renderer backend | env var before launch |
+| `TASKMAN_GPU=cpu\|d3d12\|vulkan\|metal` | Override the saved renderer preference for one run (fallbacks allowed) | env var before launch |
 | `TASKMAN_FPS_PROBE=1` | Continuous repaints + fps overlay vs display Hz | env var |
 | `TASKMAN_DIALOG=settings\|run` | Open a dialog at startup (UI tests) | env var |
 | `TASKMAN_PERF=<key>` | Preselect Performance resource (`cpu`, `mem`, ...) | env var |

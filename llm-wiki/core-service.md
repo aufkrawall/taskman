@@ -38,9 +38,11 @@ contract.
 
 ## IPC and authorization
 
-- Protocol v11 uses `\\.\pipe\Taskman.Core.v1` with fixed 12-byte framed JSON.
+- Protocol v12 uses `\\.\pipe\Taskman.Core.v1` with fixed 12-byte framed JSON.
   Requests are capped at 64 KiB and responses at 512 KiB; unknown request
-  fields are rejected.
+  fields are rejected. v12 makes the creation-time identity token explicit
+  100-ns ticks; a GUI and service from different versions fail at the
+  handshake instead of misreading the token as seconds.
 - The pipe rejects remote clients and uses first-instance creation to prevent
   pre-creation/squatting. Its protected DACL denies Network, grants full access
   to System/Administrators, and grants the one installing user
@@ -197,7 +199,11 @@ accounting query for one exact PID + creation time. Protocol v11 adds
 identity-bound parent process evidence (`ProcessParentInfo`) inside
 `ProcessSecurityInfo`, allowing the unelevated GUI to resolve the parent process
 handle, image path, binary name, FileDescription, and live status for services
-and elevated targets without requiring elevated GUI tokens. The counter
+and elevated targets without requiring elevated GUI tokens. Protocol v12 makes
+the creation-time token 100-ns ticks (previously Unix seconds) and bumps the
+version so a new GUI against an older running service fails at the handshake
+with "unsupported broker protocol version" instead of reporting every
+protected target as exited. The counter
 endpoints take no parameters, can change nothing, drain or prune server-side
 against the service's own idea of which PIDs are live, are capped per
 response, and stop their trace on an idle watchdog once the GUI stops polling.

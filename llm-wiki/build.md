@@ -138,7 +138,7 @@ git config --local lfs.allowincompletepush true
   The host gate cannot see `cfg`-gated platform code, and this is exactly the
   check that was missing when both non-Windows backends stopped compiling
   (2026-09-08 audit; CI installs both targets so the gate is complete there).
-- `tools/check-fork.ps1` -- the vendored egui fork's own fmt/clippy/test (`find_powershell()` probes `pwsh` then `powershell` so an inaccessible WindowsApps `pwsh` stub falls back cleanly). **Not
+- `tools/check-fork.ps1` -- the vendored egui fork's own fmt/clippy/test (`probe_powershell()` tries `pwsh` then `powershell` with a 10 s timeout, falls back cleanly from an inaccessible WindowsApps stub, and makes the gate fail if a shell exists but cannot run). **Not
   redundant:** `cargo clippy --workspace -- -D warnings` only passes those flags to the
   packages cargo selected, and `vendor/egui` is a deliberately excluded separate
   workspace. Without this step the fork's crates sit outside the gate entirely.

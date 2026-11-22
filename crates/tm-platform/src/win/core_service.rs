@@ -74,7 +74,7 @@ pub const SERVICE_LOG_FILE_PREFIX: &str = "taskman-service.log";
 // the Modules page. v10 adds bounded, identity-bound process file I/O
 // enumeration (ProcessFileIo). v11 adds identity-bound parent process
 // evidence (ProcessParentInfo) in ProcessSecurityInfo.
-pub const PROTOCOL_VERSION: u16 = 11;
+pub const PROTOCOL_VERSION: u16 = 12;
 
 const PIPE_NAME: &str = r"\\.\pipe\Taskman.Core.v1";
 const FRAME_MAGIC: [u8; 4] = *b"TMB1";
