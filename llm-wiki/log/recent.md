@@ -4287,10 +4287,13 @@ history recorded yet.
     fullscreen game, and `ensure_presentable` covers the hotkey worker's busy outcome.
   - **Placement:** `ui_state` persists `position_px=` (physical pixels) next to the legacy
     logical `position=` (both still parsed and written); startup applies the pixel position
-    and fits the rect into the monitor's work area; `ensure_window_on_screen` also runs on
-    every restore and on a monitor-size change; `min_inner_size` is clamped to the largest
-    monitor and the window is created at `size * ui_zoom` so the first frame's read-back
-    matches.
+    and fits the rect into the **virtual desktop** (`GetSystemMetrics(SM_*VIRTUALSCREEN)`,
+    not the nearest monitor's work area — a window deliberately spanning two monitors must
+    not be shrunk, and a degenerate bounds rect returns untouched instead of panicking in
+    `clamp`); `ensure_window_on_screen` also runs on every restore and on a monitor-size
+    change; `min_inner_size` is clamped to the largest monitor and the window is created at
+    `size * ui_zoom` so the first frame's read-back matches (with a warning if the egui
+    context is ever already zoomed at creation).
   - **Graphics failures:** GDI failures are `Result`s, no allocator thread to wait on, and
     `egui-wgpu`'s `recreate_surface` creates the replacement before dropping the old
     surface (a failed recreate used to delete the map entry, so the new retry had nothing
@@ -4304,6 +4307,24 @@ history recorded yet.
     polled; `run_shell_action` moved `open_url`/`open_file_location`/`open_properties` onto
     the action executor; `toast_from` drops empty messages; the Select columns list height
     is clamped to the viewport.
+
+  Review pass (independent read of the diff, before the commit) caught five real defects
+  that were then fixed: (1) the software backend processed viewport commands *before*
+  painting, so eframe's first-frame reveal overrode a start-in-tray `Visible(false)` and
+  left the window visible — `EpiIntegration::post_rendering` now takes
+  `reveal_first_frame` and the backend tracks the app's own visibility request
+  (`note_visibility_commands`); (2) the synthesized capture-loss release carried the press
+  position, so within 0.6 s it registered a **click** on whatever sat under it — replaced by
+  `Event::PointerButtonReleasedOutside` (release with `click: None`), shared with the
+  focus-loss arm through `release_all_buttons_without_click`; (3) fitting every window into
+  the nearest monitor's work area shrank legitimately monitor-spanning windows — now the
+  virtual desktop is the fit target; (4) `fit_rect` could panic on a zero-width bounds rect
+  (`clamp` with `min > max`) inside the event loop — it returns the rect untouched; (5) the
+  empty-toast filter lived in `toast_from` and would also swallow a whitespace-only *error*
+  message — it moved to `ActionExecutor::run`'s success path. Also added: a `Drop` guard for
+  `pending_deltas` (a hidden window exiting with a pending `TexturesDelta` panicked in debug
+  teardown) and an owner HWND for both async pickers (`crates/tm-app/src/dialogs.rs`, via
+  the published window), so a system dialog cannot be buried behind the main window.
   Gates: `pwsh tools/check-fork.ps1` green, `python build.py --check` green (fmt, clippy
   `-D warnings`, all workspace tests, Windows release + setup, Linux glibc cross-build),
   `cargo +stable clippy --workspace --all-targets --all-features -- -D warnings` green.
