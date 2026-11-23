@@ -1649,6 +1649,7 @@ fn native_app_groups(
     for mut members in grouped.into_values() {
         members.sort_by_key(|process| {
             (
+                if process.has_window { 0 } else { 1 },
                 if process.app_root { 0 } else { 1 },
                 process.creation_identity().unwrap_or(i64::MAX),
                 process.pid,
@@ -2187,21 +2188,27 @@ fn derive_display_groups(all: &[&ProcessEntry]) -> DisplayGroups {
         };
     }
 
-    // The platform category is authoritative for Windows/system processes.
-    // For user/session processes, rebuild App membership from visible-window
-    // ownership so a shell parent cannot turn all of its descendants into
-    // foreground Apps.
+    // The collector's System category remains authoritative. Unix core-image
+    // names are still tree boundaries below, but a name must never re-promote
+    // an App/Background fact produced by the platform classifier.
     let mut category: HashMap<u32, ProcCategory> = all
         .iter()
         .map(|p| {
-            let system = p.category == ProcCategory::System || is_system_boundary(&p.name);
+            if p.desktop_role.is_some() {
+                // Linux's collector already applied window ownership,
+                // cgroup role, graphical gate and generation checks. In
+                // particular, a Background `systemd`/`dbus` user process or
+                // an Unknown app.slice process must not be re-promoted by a
+                // userspace infrastructure name in the UI.
+                return (p.pid, p.category);
+            }
             let native_app = p
                 .app_group
                 .as_deref()
                 .is_some_and(|group| !group.is_empty());
             (
                 p.pid,
-                if system {
+                if p.category == ProcCategory::System {
                     ProcCategory::System
                 } else if p.has_window || native_app {
                     ProcCategory::App
@@ -2294,6 +2301,17 @@ fn derive_display_groups(all: &[&ProcessEntry]) -> DisplayGroups {
             for child in kids {
                 if app_roots.contains(&child.pid)
                     || category.get(&child.pid) == Some(&ProcCategory::System)
+                    || child
+                        .app_group
+                        .as_deref()
+                        .is_some_and(|group| !group.is_empty())
+                    || matches!(
+                        child.desktop_role,
+                        Some(
+                            tm_core::classify::DesktopRoleEvidence::Background
+                                | tm_core::classify::DesktopRoleEvidence::Unknown
+                        )
+                    )
                 {
                     continue;
                 }
@@ -3425,6 +3443,73 @@ mod tests {
             row,
             DisplayRow::Process(row) if row.pid == 20
         )));
+    }
+
+    #[test]
+    fn xwayland_app_descent_preserves_authoritative_linux_background_and_unknown_children() {
+        let mut app = proc(10, None, "org.example.Editor", ProcCategory::App);
+        app.has_window = true;
+        app.app_group = Some("systemd:/user:app".into());
+        let mut background = proc(11, Some(10), "org.example.worker", ProcCategory::Background);
+        background.desktop_role = Some(tm_core::classify::DesktopRoleEvidence::Background);
+        let mut unknown = proc(12, Some(10), "org.example.helper", ProcCategory::Unknown);
+        unknown.desktop_role = Some(tm_core::classify::DesktopRoleEvidence::Unknown);
+        let mut native_member = proc(13, Some(10), "org.example.renderer", ProcCategory::App);
+        native_member.app_group = app.app_group.clone();
+        native_member.desktop_role = Some(tm_core::classify::DesktopRoleEvidence::App);
+
+        let processes = [&app, &background, &unknown, &native_member];
+        let grouping = derive_display_groups(&processes);
+
+        assert_eq!(grouping.category.get(&10), Some(&ProcCategory::App));
+        assert_eq!(
+            grouping.category.get(&11),
+            Some(&ProcCategory::Background),
+            "authoritative background.slice evidence must survive App descent"
+        );
+        assert_eq!(
+            grouping.category.get(&12),
+            Some(&ProcCategory::Unknown),
+            "authoritative Unknown evidence must survive App descent"
+        );
+        assert_eq!(
+            grouping.category.get(&13),
+            Some(&ProcCategory::App),
+            "native app-family members are not fabricated descendants"
+        );
+        assert!(grouping.app_roots.contains(&10));
+    }
+
+    #[test]
+    fn linux_authoritative_background_is_not_repromoted_by_unix_name() {
+        let mut app = proc(10, None, "org.example.Editor", ProcCategory::App);
+        app.has_window = true;
+        let mut user_systemd = proc(11, None, "systemd", ProcCategory::Background);
+        user_systemd.desktop_role = Some(tm_core::classify::DesktopRoleEvidence::Background);
+        let mut user_dbus = proc(12, None, "dbus-daemon", ProcCategory::Background);
+        user_dbus.desktop_role = Some(tm_core::classify::DesktopRoleEvidence::Background);
+
+        let processes = [&app, &user_systemd, &user_dbus];
+        let grouping = derive_display_groups(&processes);
+
+        assert_eq!(grouping.category.get(&11), Some(&ProcCategory::Background));
+        assert_eq!(grouping.category.get(&12), Some(&ProcCategory::Background));
+    }
+
+    #[test]
+    fn legacy_collector_background_is_not_repromoted_by_a_core_name() {
+        let mut app = proc(10, None, "org.example.Editor", ProcCategory::App);
+        app.has_window = true;
+        let legacy_dbus = proc(11, None, "dbus-daemon", ProcCategory::Background);
+
+        let processes = [&app, &legacy_dbus];
+        let grouping = derive_display_groups(&processes);
+
+        assert_eq!(
+            grouping.category.get(&11),
+            Some(&ProcCategory::Background),
+            "tree boundaries must not overwrite collector categories"
+        );
     }
 
     #[test]

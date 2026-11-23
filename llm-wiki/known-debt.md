@@ -487,15 +487,29 @@ remain follow-up rather than being simulated in headless tests:
   scopes under `user@UID.service` have no session component and therefore do
   not contribute to session rollups.
 - **Native-Wayland App/Background roles are launcher evidence, not compositor
-  facts.** A standard user `app.slice` unit or a complete trusted
-  per-process Flatpak/Snap/GIO/BAMF hint can identify an application family,
-  but native Wayland still has no portable whole-window inventory or focus
-  signal. Applications outside those conventions, environment reads blocked
-  by procfs policy, malformed/ambiguous cgroups and exact X11 no-window
+  facts.** A standard user `app.slice` unit can identify an App only when its
+  complete environment carries a non-empty Wayland/X11 display variable; the
+  same variable gate plus weak user-session evidence is required for a trusted
+  Flatpak/Snap/GIO/BAMF hint. A complete headless app.slice is Background and
+  unavailable/partial/oversized evidence stays Unknown. Native Wayland still
+  has no portable whole-window inventory or focus signal. Applications outside
+  those conventions, malformed/ambiguous cgroups and exact X11 no-window
   evidence can leave a process Unknown or Background rather than recovered.
   GNOME Shell.Introspect (sender-allowlisted) and interactive KWin APIs are
-  deliberately not used. WSL without a relevant systemd user hierarchy also
-  stays Unknown unless X11 ownership supplies independent evidence.
+  deliberately not used. WSL without real systemd PID 1 stays Unknown for its
+  synthetic `/init.scope` evidence unless X11 ownership supplies independent
+  evidence.
+- **Linux desktop-evidence cache can lag cgroup movement by five seconds.**
+  Environment is immutable for a PID generation, but a process that moves
+  between user-manager units within the bounded TTL keeps its prior parsed
+  role until refresh. PID reuse still refreshes immediately because the cache
+  key includes validated boot-relative start ticks.
+- **Native App-root selection is deterministic, not semantic, when no member
+  has a window.** The collector prefers any positively windowed app-family
+  member and otherwise chooses creation ticks then PID. A short-lived
+  native-Wayland wrapper with no observable window can therefore still be the
+  representative; a richer selection key would need additional launcher or
+  compositor evidence.
 - **Linux-only tests are still not executed by the Windows host gate.** The
   final gate cross-checks the non-host targets, which type-checks Linux tests
   only if the test targets themselves are included; parser/live-procfs

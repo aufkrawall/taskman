@@ -48,6 +48,7 @@ pub struct LinuxCollector {
     /// over every CPU runs once instead of every tick.
     cache_kb: [u64; 3],
     window_observer: x11_windows::WindowObserver,
+    desktop_evidence: desktop_session::DesktopEvidenceCache,
 }
 
 impl SystemCollector for LinuxCollector {
@@ -122,6 +123,7 @@ impl SystemCollector for LinuxCollector {
             .and_then(parse_proc_stat_btime)
             .zip(linux_clk_tck());
         let mut processes = Vec::with_capacity(n_procs);
+        let mut live_pids = HashSet::with_capacity(n_procs);
         for (pid, p) in self.sys.processes() {
             // sysinfo 0.39 keeps `tasks` enabled even in
             // `ProcessRefreshKind::nothing()`, so every Linux task (thread) is
@@ -134,6 +136,7 @@ impl SystemCollector for LinuxCollector {
                 continue;
             }
             let pid_u = pid.as_u32();
+            live_pids.insert(pid_u);
             let name = p.name().to_string_lossy().into_owned();
 
             let boot_start_ticks = before_refresh
@@ -142,7 +145,7 @@ impl SystemCollector for LinuxCollector {
                 .filter(|&before| linux_proc_start_ticks(pid_u) == Some(before));
             let desktop_evidence = boot_start_ticks
                 .map_or_else(desktop_session::DesktopEvidence::default, |ticks| {
-                    desktop_session::inspect(pid_u, ticks)
+                    self.desktop_evidence.evidence(pid_u, ticks, started)
                 });
             let has_window = window_evidence(
                 window_observation.owners.get(&pid_u).copied(),
@@ -163,6 +166,7 @@ impl SystemCollector for LinuxCollector {
             entry.display = name.clone();
             entry.ppid = p.parent().map(|x| x.as_u32());
             entry.category = category;
+            entry.desktop_role = Some(desktop_evidence.role_marker());
             entry.cpu_pct = (p.cpu_usage() / nb_cpus).clamp(0.0, 100.0);
             entry.mem_bytes = p.memory();
             entry.working_set_bytes = Some(p.memory());
@@ -207,6 +211,7 @@ impl SystemCollector for LinuxCollector {
             entry.elevated = entry.user.as_deref().map(|u| u == "root");
             processes.push(entry);
         }
+        self.desktop_evidence.retain_live(&live_pids);
         mark_desktop_app_roots(&mut processes);
 
         let diskstats = diskstats::read();
@@ -379,7 +384,11 @@ fn mark_desktop_app_roots(processes: &mut [ProcessEntry]) {
     for members in groups.values() {
         let Some(&root) = members.iter().min_by_key(|&&index| {
             let process = &processes[index];
-            (process.creation_identity().unwrap_or(i64::MAX), process.pid)
+            (
+                !process.has_window,
+                process.creation_identity().unwrap_or(i64::MAX),
+                process.pid,
+            )
         }) else {
             continue;
         };
@@ -1307,6 +1316,7 @@ pub fn create_collector() -> LinuxCollector {
         first_tick_done: false,
         cache_kb: cache_totals_kb(&read_cache_indexes()),
         window_observer: x11_windows::WindowObserver::new(),
+        desktop_evidence: desktop_session::DesktopEvidenceCache::new(),
     }
 }
 
@@ -1410,6 +1420,31 @@ mod tests {
         assert!(processes.iter().any(|p| p.pid == 100 && p.app_root));
         assert!(!processes.iter().any(|p| p.pid == 101 && p.app_root));
         assert!(processes.iter().any(|p| p.pid == 200 && p.app_root));
+    }
+
+    #[test]
+    fn desktop_app_root_prefers_a_windowed_member_over_an_older_wrapper() {
+        let mut wrapper = ProcessEntry::new(100, "wrapper");
+        wrapper.category = ProcCategory::App;
+        wrapper.boot_start_ticks = Some(10);
+        wrapper.app_group = Some("scope-a".into());
+        let mut windowed = ProcessEntry::new(101, "windowed-app");
+        windowed.category = ProcCategory::App;
+        windowed.boot_start_ticks = Some(20);
+        windowed.has_window = true;
+        windowed.app_group = Some("scope-a".into());
+        let mut processes = vec![wrapper, windowed];
+
+        mark_desktop_app_roots(&mut processes);
+
+        assert!(
+            !processes[0].app_root,
+            "the short-lived wrapper is not the app"
+        );
+        assert!(
+            processes[1].app_root,
+            "the positively windowed member is the app"
+        );
     }
 
     #[test]

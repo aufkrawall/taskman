@@ -1,6 +1,7 @@
 //! Snapshot data model. One `Snapshot` is a fully consistent view of the
 //! system produced by a single sampling tick; the UI never mutates it.
 
+use crate::classify::DesktopRoleEvidence;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
@@ -568,6 +569,12 @@ pub struct ProcessEntry {
     /// Description metadata when known.
     pub description: Option<String>,
     pub category: ProcCategory,
+    /// Authoritative platform desktop-role evidence. `None` means the backend
+    /// supplied no such marker (Windows, macOS, or legacy snapshots), so
+    /// presentation fallbacks may refine the category. Linux always records
+    /// the resolved role, including [`DesktopRoleEvidence::Unknown`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub desktop_role: Option<DesktopRoleEvidence>,
     pub status: ProcStatus,
     pub user: Option<String>,
     /// String form of the token user SID ("S-1-5-18"). The unqualified
@@ -702,8 +709,9 @@ pub struct ProcessEntry {
     /// Topmost process of an app subtree (Task Manager's "Apps" root rows).
     pub app_root: bool,
     /// Stable platform-provided identity shared by one semantic application
-    /// family. Linux uses validated systemd app scope/service paths, or a
-    /// conservative per-process desktop-launch hint as a fallback.
+    /// family. Linux uses a validated user app scope/service after its
+    /// graphical-session gate passes, or a conservative per-process
+    /// desktop-launch hint on weak user-session evidence.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub app_group: Option<String>,
     /// Runs elevated (admin/root) when determinable.
@@ -754,6 +762,7 @@ impl ProcessEntry {
             company: None,
             description: None,
             category: ProcCategory::Background,
+            desktop_role: None,
             status: ProcStatus::Running,
             user: None,
             user_sid: None,
@@ -1033,6 +1042,22 @@ pub struct UserSession {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn desktop_role_marker_is_serialized_and_defaults_for_legacy_snapshots() {
+        let mut process = ProcessEntry::new(42, "app");
+        process.desktop_role = Some(DesktopRoleEvidence::Unknown);
+        let mut value = serde_json::to_value(&process).expect("serialize process");
+        assert_eq!(value["desktop_role"].as_str(), Some("Unknown"));
+
+        value
+            .as_object_mut()
+            .expect("process object")
+            .remove("desktop_role");
+        let restored: ProcessEntry =
+            serde_json::from_value(value).expect("deserialize legacy process");
+        assert_eq!(restored.desktop_role, None);
+    }
 
     #[test]
     fn shared_working_set_computes_difference() {

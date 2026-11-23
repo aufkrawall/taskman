@@ -11,6 +11,7 @@
 //! Background process on a stock system, not a Windows process.
 
 use crate::model::ProcCategory;
+use serde::{Deserialize, Serialize};
 
 /// Kernel pseudo-process names that are not image files at all.
 const KERNEL_NAMES: &[&str] = &[
@@ -41,14 +42,21 @@ const WINDOWS_CORE_IMAGES: &[&str] = &[
     "conhost.exe",
 ];
 
-/// Linux/macOS equivalents that are clearly kernel-side or session
-/// infrastructure.
-const SYSTEM_UNIX: &[&str] = &[
+/// Unix kernel-thread names. These are absolute System evidence just like
+/// Windows kernel pseudo-process names.
+const UNIX_KERNEL_NAMES: &[&str] = &[
     "kthreadd",
     "ksoftirqd",
     "kworker",
     "rcu_",
     "migration",
+    "kernel_task",
+];
+
+/// Unix user-space infrastructure names. A positive desktop App/Background
+/// role can refine these; the name alone remains a conservative fallback for
+/// older/unsupported collectors.
+const UNIX_USERSPACE_INFRASTRUCTURE: &[&str] = &[
     "systemd",
     "systemd-journal",
     "systemd-udevd",
@@ -58,7 +66,6 @@ const SYSTEM_UNIX: &[&str] = &[
     "launchd",
     "loginwindow",
     "windowserver",
-    "kernel_task",
 ];
 
 fn normalize(name: &str) -> String {
@@ -69,25 +76,38 @@ fn is_kernel_name(name_lower: &str) -> bool {
     KERNEL_NAMES.contains(&name_lower)
 }
 
-fn matches_core(name_lower: &str) -> bool {
-    if is_kernel_name(name_lower) || WINDOWS_CORE_IMAGES.contains(&name_lower) {
-        return true;
-    }
+fn is_unix_kernel_name(name_lower: &str) -> bool {
     // Linux kernel threads are bracketed ("[kworker/0:1]").
     if name_lower.starts_with('[') {
         return true;
     }
-    SYSTEM_UNIX
+    UNIX_KERNEL_NAMES
         .iter()
         .any(|n| name_lower.starts_with(n) || name_lower == *n)
+}
+
+fn is_windows_core_image(name_lower: &str) -> bool {
+    is_kernel_name(name_lower) || WINDOWS_CORE_IMAGES.contains(&name_lower)
+}
+
+fn is_unix_userspace_infrastructure(name_lower: &str) -> bool {
+    UNIX_USERSPACE_INFRASTRUCTURE
+        .iter()
+        .any(|name| name_lower.starts_with(name) || name_lower == *name)
+}
+
+fn matches_core(name_lower: &str) -> bool {
+    is_unix_kernel_name(name_lower)
+        || is_windows_core_image(name_lower)
+        || is_unix_userspace_infrastructure(name_lower)
 }
 
 /// True for a kernel pseudo-process or a core OS image, by name alone.
 ///
 /// The presentation layer uses the same set as process-tree boundaries, so
-/// the platform and the UI cannot drift apart on what "a system process" is.
-/// Name matches are never evidence by themselves for actions: the classifier
-/// additionally requires Windows ownership (see [`ClassifyInput`]).
+/// the platform and the UI cannot drift apart on what a core-name boundary is.
+/// Classification still applies role/window precedence: Unix userspace names
+/// are only a fallback, and Windows core images require accepted ownership.
 pub fn is_core_os_image(name: &str) -> bool {
     matches_core(&normalize(name))
 }
@@ -97,11 +117,14 @@ pub fn is_core_os_image(name: &str) -> bool {
 /// This is deliberately only a role, not a window inventory. Linux derives it
 /// from validated systemd cgroup membership and conservative per-process
 /// desktop-launch metadata; native Wayland has no portable whole-window list.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DesktopRoleEvidence {
     App,
     Background,
     System,
+    /// Authoritative Linux role collection ran, but the available cgroup and
+    /// environment evidence could not support App, Background, or System.
+    Unknown,
 }
 
 /// Classification input gathered from a snapshot's raw fields.
@@ -122,19 +145,20 @@ pub struct ClassifyInput<'a> {
     /// Windows process). `None` = metadata unavailable, so a known core name
     /// is trusted; `Some(false)` rejects the name match.
     pub windows_owned: Option<bool>,
-    /// Positive desktop-session role evidence. `None` means the platform has
-    /// no authoritative role for this process, never that it is windowless.
+    /// Desktop-session role evidence. `None` means the platform supplied no
+    /// authoritative marker; [`DesktopRoleEvidence::Unknown`] means collection
+    /// ran but could not support a role. Neither means "windowless".
     pub desktop_role: Option<DesktopRoleEvidence>,
 }
 
-/// Precedence: hard System evidence, an observed window, complete no-window
-/// evidence, positive desktop App evidence, positive desktop Background
-/// evidence, then Unknown. A missing window observation is never a negative
-/// window fact.
+/// Precedence: hard kernel/Windows/PID-1 System evidence, a positive System
+/// desktop role, observed window ownership, positive desktop App/Background
+/// evidence, userspace Unix infrastructure-name fallback, then Unknown. A
+/// missing window observation is never a negative window fact.
 pub fn classify(input: ClassifyInput<'_>) -> ProcCategory {
     let name = normalize(input.name);
 
-    if input.pid <= 4 || is_kernel_name(&name) {
+    if input.pid <= 4 || is_kernel_name(&name) || is_unix_kernel_name(&name) {
         return ProcCategory::System;
     }
 
@@ -142,7 +166,7 @@ pub fn classify(input: ClassifyInput<'_>) -> ProcCategory {
         return ProcCategory::System;
     }
 
-    if matches_core(&name) && input.windows_owned.unwrap_or(true) {
+    if is_windows_core_image(&name) && input.windows_owned.unwrap_or(true) {
         return ProcCategory::System;
     }
 
@@ -159,7 +183,10 @@ pub fn classify(input: ClassifyInput<'_>) -> ProcCategory {
         None => match input.desktop_role {
             Some(DesktopRoleEvidence::App) => ProcCategory::App,
             Some(DesktopRoleEvidence::Background) => ProcCategory::Background,
-            Some(DesktopRoleEvidence::System) | None => ProcCategory::Unknown,
+            Some(DesktopRoleEvidence::System) => ProcCategory::System,
+            Some(DesktopRoleEvidence::Unknown) => ProcCategory::Unknown,
+            None if is_unix_userspace_infrastructure(&name) => ProcCategory::System,
+            None => ProcCategory::Unknown,
         },
     }
 }
@@ -418,6 +445,91 @@ mod tests {
         );
         assert_eq!(
             classify_win(66, "[kworker/0:1]", false, None, None),
+            ProcCategory::System
+        );
+    }
+
+    #[test]
+    fn positive_desktop_role_refines_unix_userspace_infrastructure_names() {
+        for name in ["systemd", "dbus-daemon", "dbus-broker"] {
+            assert_eq!(
+                classify(ClassifyInput {
+                    pid: 3000,
+                    name,
+                    has_window: None,
+                    critical: None,
+                    windows_owned: None,
+                    desktop_role: Some(DesktopRoleEvidence::Background),
+                }),
+                ProcCategory::Background,
+                "{name} inside a validated user session is user infrastructure"
+            );
+        }
+
+        for name in ["systemd-journald", "dbus-daemon", "dbus-broker"] {
+            assert_eq!(
+                classify(ClassifyInput {
+                    pid: 3000,
+                    name,
+                    has_window: None,
+                    critical: None,
+                    windows_owned: None,
+                    desktop_role: Some(DesktopRoleEvidence::System),
+                }),
+                ProcCategory::System,
+                "{name} in system.slice remains a system process"
+            );
+        }
+    }
+
+    #[test]
+    fn hard_kernel_and_windows_evidence_wins_over_a_desktop_role() {
+        for (pid, name, owned) in [
+            (1, "systemd", None),
+            (3000, "kworker/u16:2", None),
+            (3000, "svchost.exe", Some(true)),
+        ] {
+            assert_eq!(
+                classify(ClassifyInput {
+                    pid,
+                    name,
+                    has_window: None,
+                    critical: None,
+                    windows_owned: owned,
+                    desktop_role: Some(DesktopRoleEvidence::Background),
+                }),
+                ProcCategory::System,
+                "{name} must remain hard System evidence"
+            );
+        }
+    }
+
+    #[test]
+    fn authoritative_unknown_does_not_become_a_desktop_fact() {
+        assert_eq!(
+            classify(ClassifyInput {
+                pid: 3000,
+                name: "dbus-daemon",
+                has_window: None,
+                critical: None,
+                windows_owned: None,
+                desktop_role: Some(DesktopRoleEvidence::Unknown),
+            }),
+            ProcCategory::Unknown
+        );
+    }
+
+    #[test]
+    fn legacy_unknown_platform_evidence_retains_the_unix_name_fallback() {
+        assert_eq!(
+            classify(ClassifyInput {
+                pid: 3000,
+                name: "dbus-daemon",
+                has_window: None,
+                critical: None,
+                windows_owned: None,
+                desktop_role: None,
+            }),
             ProcCategory::System
         );
     }

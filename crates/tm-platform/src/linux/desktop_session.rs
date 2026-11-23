@@ -2,17 +2,22 @@
 //!
 //! Native Wayland has no portable whole-desktop window inventory. Instead,
 //! this module reads one validated systemd hierarchy from
-//! `/proc/<pid>/cgroup`: standard user `app.slice` units identify launcher-
-//! managed applications, while `background.slice`, `session.slice`, direct
-//! logind session scopes and other members of a user manager identify
-//! background/session work. `system.slice` and `init.scope` identify system
-//! processes.
+//! `/proc/<pid>/cgroup`: a standard user `app.slice` unit can identify a
+//! launcher-managed application only when its complete environment also
+//! carries a graphical-session display signal. `background.slice`,
+//! `session.slice`, direct logind session scopes and user-manager
+//! `init.scope` identify explicit background/session work; generic
+//! `user@UID.service` membership is only weak context. Top-level
+//! `system.slice`/`init.scope` identify System only when systemd is really
+//! PID 1, so synthetic WSL cgroups stay Unknown.
 //!
 //! Some applications bypass systemd scopes. For a process already proven to
 //! be inside a user-session hierarchy, a capped `/proc/<pid>/environ` read may
-//! supply launch metadata such as Flatpak, Snap, GIO or BAMF identity. Values
-//! inherited by every process in the desktop session (`XDG_CURRENT_DESKTOP`
-//! and similar) are never treated as per-process app evidence.
+//! supply launch metadata such as Flatpak, Snap, GIO or BAMF identity. A
+//! non-empty `WAYLAND_DISPLAY`, `WAYLAND_SOCKET`, or `DISPLAY` is a mandatory
+//! graphical-session gate but never an app identity. Values inherited by
+//! every process in the desktop session (`XDG_CURRENT_DESKTOP` and similar)
+//! are never treated as per-process app evidence.
 //!
 //! This identifies launcher-managed applications, not compositor focus or an
 //! exact window inventory. Malformed, escaped, ambiguous, inaccessible,
@@ -22,8 +27,11 @@
 //! hierarchy; this module does not call GNOME Shell.Introspect or interactive
 //! KWin APIs to fill the gap.
 
+use std::collections::{HashMap, HashSet};
 use std::io::Read;
 use std::path::Path;
+use std::sync::OnceLock;
+use std::time::{Duration, Instant};
 use tm_core::classify::DesktopRoleEvidence;
 
 const MAX_CGROUP_BYTES: usize = 16 * 1024;
@@ -31,6 +39,8 @@ const MAX_CGROUP_PATH_BYTES: usize = 8 * 1024;
 const MAX_UNIT_BYTES: usize = 512;
 const MAX_ENVIRON_BYTES: usize = 64 * 1024;
 const MAX_HINT_VALUE_BYTES: usize = 512;
+const MAX_COMM_BYTES: usize = 64;
+pub(super) const DESKTOP_EVIDENCE_TTL: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(super) struct DesktopEvidence {
@@ -40,31 +50,103 @@ pub(super) struct DesktopEvidence {
     /// under `app.slice`.
     pub(super) app_group: Option<String>,
     pub(super) session_id: Option<u32>,
+    /// Validated user `app.slice` family awaiting the graphical-environment
+    /// gate. It becomes `app_group` only when that gate is positive.
+    app_unit_group: Option<String>,
     user_session: bool,
-    /// Canonical user session/user-manager prefix used to keep environment-
-    /// derived app families from colliding across different users/sessions.
+    /// Canonical user session/user-manager prefix, always with exactly one
+    /// leading slash. It keeps app families from colliding across users and
+    /// provides one canonical prefix for every app-family key.
     user_scope: Option<String>,
+    /// False for malformed standard units or authoritative closed roles whose
+    /// environment must not be allowed to turn an Unknown into an App.
+    environment_eligible: bool,
 }
 
-/// Read role evidence after sysinfo refreshed, then verify that the PID still
-/// has the same boot-relative start ticks. Any disappearance or reuse discards
-/// every role, session and grouping fact read for the old generation.
-pub(super) fn inspect(pid: u32, expected_start_ticks: i64) -> DesktopEvidence {
-    if super::linux_proc_start_ticks(pid) != Some(expected_start_ticks) {
-        return DesktopEvidence::default();
+impl DesktopEvidence {
+    /// Linux always records the collector outcome, including Unknown, so the
+    /// presentation layer can distinguish authoritative roles from Windows or
+    /// legacy fallback snapshots.
+    pub(super) fn role_marker(&self) -> DesktopRoleEvidence {
+        self.role.unwrap_or(DesktopRoleEvidence::Unknown)
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CachedEvidence {
+    observed_at: Instant,
+    evidence: DesktopEvidence,
+}
+
+/// Collector-owned per-tick cache. The key includes the process generation;
+/// environment is immutable for that generation and cgroup movement is rare,
+/// so a short TTL avoids rereading both files on every sampling tick.
+#[derive(Debug, Default)]
+pub(super) struct DesktopEvidenceCache {
+    entries: HashMap<(u32, i64), CachedEvidence>,
+    system_manager: Option<bool>,
+}
+
+impl DesktopEvidenceCache {
+    pub(super) fn new() -> Self {
+        Self::default()
+    }
+
+    pub(super) fn evidence(&mut self, pid: u32, start_ticks: i64, now: Instant) -> DesktopEvidence {
+        if let Some(evidence) = self.cached(pid, start_ticks, now) {
+            return evidence;
+        }
+
+        let system_manager = *self
+            .system_manager
+            .get_or_insert_with(systemd_system_manager_available);
+        let evidence = inspect(pid, start_ticks, system_manager);
+        self.remember(pid, start_ticks, now, evidence.clone());
+        evidence
+    }
+
+    fn cached(&self, pid: u32, start_ticks: i64, now: Instant) -> Option<DesktopEvidence> {
+        self.entries
+            .get(&(pid, start_ticks))
+            .filter(|entry| now.saturating_duration_since(entry.observed_at) < DESKTOP_EVIDENCE_TTL)
+            .map(|entry| entry.evidence.clone())
+    }
+
+    fn remember(&mut self, pid: u32, start_ticks: i64, now: Instant, evidence: DesktopEvidence) {
+        self.entries
+            .retain(|(existing_pid, _), _| *existing_pid != pid);
+        self.entries.insert(
+            (pid, start_ticks),
+            CachedEvidence {
+                observed_at: now,
+                evidence,
+            },
+        );
+    }
+
+    /// Keep the cache bounded by the processes observed in this tick.
+    pub(super) fn retain_live(&mut self, live: &HashSet<u32>) {
+        self.entries.retain(|(pid, _), _| live.contains(pid));
+    }
+}
+
+/// Read role evidence after the collector validated the expected generation.
+/// One final post-read identity check discards every role, session and
+/// grouping fact if the PID was reused while cgroup/environ were read.
+fn inspect(pid: u32, expected_start_ticks: i64, system_manager: bool) -> DesktopEvidence {
     let Some(raw) = read_bounded_file(&format!("/proc/{pid}/cgroup"), MAX_CGROUP_BYTES) else {
         return DesktopEvidence::default();
     };
-    let Some(mut evidence) = parse_cgroup(&raw) else {
+    let Some(mut evidence) = parse_cgroup(&raw, system_manager) else {
         return DesktopEvidence::default();
     };
 
-    // App scopes already carry a stronger group identity. Environment reads
-    // are only useful for user-session processes without one, and never for
-    // unrelated/malformed cgroups (whose parsed evidence is empty).
+    // Environment reads are only useful for a weak user-session role, a
+    // validated app.slice unit awaiting its graphical gate, or a fallback
+    // launcher identity. Authoritative Background/System roles never read it.
     if evidence.user_session
-        && evidence.app_group.is_none()
+        && evidence.environment_eligible
+        && evidence.role.is_none()
         && let Some(hints) = read_environment_hints(pid)
     {
         apply_environment_hints(&mut evidence, hints);
@@ -76,6 +158,22 @@ pub(super) fn inspect(pid: u32, expected_start_ticks: i64) -> DesktopEvidence {
     evidence
 }
 
+fn systemd_system_manager_available() -> bool {
+    static AVAILABLE: OnceLock<bool> = OnceLock::new();
+    *AVAILABLE.get_or_init(|| {
+        Path::new("/run/systemd/system").is_dir()
+            && read_bounded_file("/proc/1/comm", MAX_COMM_BYTES)
+                .as_deref()
+                .is_some_and(pid1_comm_is_systemd)
+    })
+}
+
+fn pid1_comm_is_systemd(raw: &[u8]) -> bool {
+    std::str::from_utf8(raw)
+        .ok()
+        .is_some_and(|comm| comm.trim_end_matches(|c| matches!(c, '\r' | '\n')) == "systemd")
+}
+
 fn read_bounded_file(path: &str, max_bytes: usize) -> Option<Vec<u8>> {
     let file = std::fs::File::open(path).ok()?;
     let mut bytes = Vec::with_capacity(max_bytes.min(4096));
@@ -85,17 +183,19 @@ fn read_bounded_file(path: &str, max_bytes: usize) -> Option<Vec<u8>> {
     (bytes.len() <= max_bytes).then_some(bytes)
 }
 
-fn parse_cgroup(raw: &[u8]) -> Option<DesktopEvidence> {
+fn parse_cgroup(raw: &[u8], system_manager: bool) -> Option<DesktopEvidence> {
     let text = std::str::from_utf8(raw).ok()?;
     let path = systemd_cgroup_path(text)?;
-    parse_systemd_path(path)
+    parse_systemd_path(path, system_manager)
 }
 
-/// cgroup v2 publishes one `0::/path` hierarchy. A v1/hybrid process exposes
-/// the systemd named hierarchy separately. Multiple candidates are ambiguous:
-/// never choose one and guess which membership is authoritative.
+/// cgroup v2 publishes one `0::/path` hierarchy. A v1/hybrid process may also
+/// expose the compatibility `name=systemd` hierarchy. Prefer unified v2 when
+/// present; within one authority, disagreeing candidates are ambiguous and
+/// must not be guessed.
 fn systemd_cgroup_path(raw: &str) -> Option<&str> {
-    let mut selected = None;
+    let mut unified = None;
+    let mut named = None;
     for line in raw.lines() {
         if line.is_empty() {
             continue;
@@ -109,34 +209,43 @@ fn systemd_cgroup_path(raw: &str) -> Option<&str> {
             return None;
         }
 
-        let systemd_line = if hierarchy == "0" {
+        let target = if hierarchy == "0" {
             if !controllers.is_empty() {
                 return None;
             }
-            true
+            &mut unified
         } else {
-            controllers
+            if controllers
                 .split(',')
                 .any(|controller| controller == "name=systemd")
-        };
-        if systemd_line {
-            if selected.replace(path).is_some() {
-                return None;
+            {
+                &mut named
+            } else {
+                continue;
             }
+        };
+        match *target {
+            Some(existing) if existing != path => return None,
+            Some(_) => {}
+            None => *target = Some(path),
         }
     }
-    selected
+    unified.or(named)
 }
 
-fn parse_systemd_path(path: &str) -> Option<DesktopEvidence> {
+fn parse_systemd_path(path: &str, system_manager: bool) -> Option<DesktopEvidence> {
     let components = canonical_components(path)?;
     if components.is_empty() {
         return Some(DesktopEvidence::default());
     }
     if components.first() == Some(&"system.slice") || components.first() == Some(&"init.scope") {
-        return Some(DesktopEvidence {
-            role: Some(DesktopRoleEvidence::System),
-            ..DesktopEvidence::default()
+        return Some(if system_manager {
+            DesktopEvidence {
+                role: Some(DesktopRoleEvidence::System),
+                ..DesktopEvidence::default()
+            }
+        } else {
+            DesktopEvidence::default()
         });
     }
     if components.first() != Some(&"user.slice") {
@@ -153,43 +262,70 @@ fn parse_systemd_path(path: &str) -> Option<DesktopEvidence> {
         return Some(DesktopEvidence::default());
     };
 
-    if let Some(session_id) = parse_session_scope(*session_or_manager) {
-        return Some(DesktopEvidence {
-            role: Some(DesktopRoleEvidence::Background),
-            session_id: Some(session_id),
-            user_session: true,
-            user_scope: Some(components[..=2].join("/")),
-            ..DesktopEvidence::default()
-        });
-    }
-
-    let Some(manager_uid) = parse_user_manager(*session_or_manager) else {
-        return None;
-    };
-    if manager_uid != uid {
-        // Mismatched user identities cannot be attributed to one desktop
-        // session. Do not even use the environment as a weaker fallback.
-        return None;
-    }
-
-    let rest = &components[3..];
-    let mut evidence = DesktopEvidence {
-        role: Some(DesktopRoleEvidence::Background),
-        user_session: true,
-        user_scope: Some(components[..=2].join("/")),
-        ..DesktopEvidence::default()
-    };
-    if rest.first() == Some(&"app.slice") {
-        let Some(unit) = rest.get(1) else {
-            // A process directly in app.slice is not an app scope/service.
+    let (session_id, session_root) =
+        if let Some(session_id) = parse_session_scope(*session_or_manager) {
+            (Some(session_id), true)
+        } else if let Some(manager_uid) = parse_user_manager(*session_or_manager) {
+            if manager_uid != uid {
+                // Mismatched user identities cannot be attributed to one desktop
+                // session. Do not even use the environment as a weaker fallback.
+                return None;
+            }
+            (None, false)
+        } else {
             return None;
         };
-        if !valid_application_unit(unit) {
-            return None;
+
+    let user_scope = Some(format!("/{}", components[..=2].join("/")));
+    let rest = &components[3..];
+    let mut evidence = DesktopEvidence {
+        session_id,
+        user_session: true,
+        user_scope,
+        environment_eligible: true,
+        ..DesktopEvidence::default()
+    };
+
+    if rest.is_empty() {
+        if session_root {
+            evidence.role = Some(DesktopRoleEvidence::Background);
+            evidence.environment_eligible = false;
         }
-        let unit_index = 4;
-        evidence.role = Some(DesktopRoleEvidence::App);
-        evidence.app_group = Some(format!("systemd:/{}", components[..=unit_index].join("/")));
+        return Some(evidence);
+    }
+
+    match rest[0] {
+        // User-manager init.scope and the two standard background/session
+        // slices are explicit Background roles. A missing/malformed unit does
+        // not turn the whole slice into a guessed Background fact.
+        "init.scope" => {
+            evidence.role = Some(DesktopRoleEvidence::Background);
+            evidence.environment_eligible = false;
+        }
+        "background.slice" | "session.slice" => {
+            if rest
+                .get(1)
+                .copied()
+                .is_some_and(|unit| valid_user_unit(unit))
+            {
+                evidence.role = Some(DesktopRoleEvidence::Background);
+            }
+            evidence.environment_eligible = false;
+        }
+        "app.slice" => {
+            if let Some(unit) = rest.get(1).copied().filter(|unit| valid_user_unit(unit)) {
+                let scope = evidence.user_scope.as_deref()?;
+                evidence.app_unit_group = Some(format!("systemd:{scope}/{}", rest[..=1].join("/")));
+            } else {
+                evidence.environment_eligible = false;
+            }
+        }
+        _ => {
+            // Generic user@UID.service/<unit> or session-N.scope/<path>
+            // membership is only a weak user-session context. It is not
+            // Background by itself; complete graphical launch evidence may
+            // refine it to App.
+        }
     }
     Some(evidence)
 }
@@ -245,7 +381,7 @@ fn parse_decimal(value: &str) -> Option<u32> {
     value.parse().ok()
 }
 
-fn valid_application_unit(component: &str) -> bool {
+fn valid_user_unit(component: &str) -> bool {
     if component.len() > MAX_UNIT_BYTES {
         return false;
     }
@@ -265,6 +401,9 @@ struct DesktopHints {
     flatpak_id: Option<String>,
     snap_instance: Option<String>,
     desktop_file: Option<String>,
+    wayland_display: Option<String>,
+    wayland_socket: Option<String>,
+    display: Option<String>,
 }
 
 fn read_environment_hints(pid: u32) -> Option<DesktopHints> {
@@ -286,7 +425,7 @@ fn parse_environment(raw: &[u8]) -> Option<DesktopHints> {
     }
     let body = &raw[..raw.len() - 1];
     if body.is_empty() {
-        return None;
+        return Some(DesktopHints::default());
     }
 
     let mut hints = DesktopHints::default();
@@ -306,10 +445,21 @@ fn parse_environment(raw: &[u8]) -> Option<DesktopHints> {
             b"GIO_LAUNCHED_DESKTOP_FILE" | b"BAMF_DESKTOP_FILE_HINT" => {
                 assign_desktop_file(&mut hints.desktop_file, value)?
             }
+            b"WAYLAND_DISPLAY" => assign_display(&mut hints.wayland_display, value)?,
+            b"WAYLAND_SOCKET" => assign_display(&mut hints.wayland_socket, value)?,
+            b"DISPLAY" => assign_display(&mut hints.display, value)?,
             _ => {}
         }
     }
     Some(hints)
+}
+
+fn assign_display(slot: &mut Option<String>, raw: &[u8]) -> Option<()> {
+    let value = std::str::from_utf8(raw).ok()?;
+    if value.len() > MAX_HINT_VALUE_BYTES || value.chars().any(char::is_control) {
+        return None;
+    }
+    assign_unique(slot, value.to_owned())
 }
 
 fn assign_identity(slot: &mut Option<String>, raw: &[u8]) -> Option<()> {
@@ -361,18 +511,41 @@ impl DesktopHints {
                 .map(|desktop_file| format!("desktop:{desktop_file}"))
         }
     }
+
+    fn graphical_session(&self) -> bool {
+        [
+            self.wayland_display.as_deref(),
+            self.wayland_socket.as_deref(),
+            self.display.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        .any(|value| !value.is_empty())
+    }
 }
 
 fn apply_environment_hints(evidence: &mut DesktopEvidence, hints: DesktopHints) {
-    if !evidence.user_session || evidence.role == Some(DesktopRoleEvidence::App) {
+    if !evidence.user_session || !evidence.environment_eligible || evidence.role.is_some() {
         return;
     }
-    if let Some(app_group) = hints.app_group() {
-        let Some(user_scope) = evidence.user_scope.as_deref() else {
-            return;
-        };
+
+    if !hints.graphical_session() {
+        if evidence.app_unit_group.is_some() {
+            evidence.role = Some(DesktopRoleEvidence::Background);
+        }
+        return;
+    }
+
+    if let Some(app_group) = evidence.app_unit_group.clone() {
         evidence.role = Some(DesktopRoleEvidence::App);
-        evidence.app_group = Some(format!("systemd:/{user_scope}:{app_group}"));
+        evidence.app_group = Some(app_group);
+        return;
+    }
+
+    if let (Some(user_scope), Some(app_group)) = (evidence.user_scope.as_deref(), hints.app_group())
+    {
+        evidence.role = Some(DesktopRoleEvidence::App);
+        evidence.app_group = Some(format!("systemd:{user_scope}:{app_group}"));
     }
 }
 
@@ -385,11 +558,21 @@ mod tests {
     }
 
     fn parse_v2(path: &str) -> Option<DesktopEvidence> {
-        parse_cgroup(format!("0::{path}\n").as_bytes())
+        parse_v2_with(path, true)
+    }
+
+    fn parse_v2_with(path: &str, system_manager: bool) -> Option<DesktopEvidence> {
+        parse_cgroup(format!("0::{path}\n").as_bytes(), system_manager)
+    }
+
+    fn apply_graphical_gate(evidence: &mut DesktopEvidence) {
+        let hints = parse_environment(b"WAYLAND_DISPLAY=wayland-0\0")
+            .expect("complete graphical environment");
+        apply_environment_hints(evidence, hints);
     }
 
     #[test]
-    fn gnome_kde_flatpak_and_snap_app_units_are_apps_with_distinct_families() {
+    fn app_units_require_graphical_environment_and_keep_distinct_families() {
         let units = [
             "app.slice/app-gnome-org.gnome.Terminal-42.scope",
             "app.slice/app-org.gnome.Nautilus-11.scope",
@@ -400,14 +583,31 @@ mod tests {
         let mut groups = std::collections::HashSet::new();
         for unit in units {
             let path = user_path(unit);
-            let evidence = parse_v2(&path).expect("valid user app cgroup");
+            let mut evidence = parse_v2(&path).expect("valid user app cgroup");
+            assert_eq!(evidence.role, None, "{unit} lacks graphical evidence");
+            assert_eq!(
+                evidence.role_marker(),
+                DesktopRoleEvidence::Unknown,
+                "{unit} must remain explicitly Unknown"
+            );
+            assert!(evidence.app_unit_group.is_some());
+            apply_graphical_gate(&mut evidence);
             assert_eq!(
                 evidence.role,
                 Some(DesktopRoleEvidence::App),
                 "{unit} must be an app"
             );
             assert!(evidence.user_session);
+            assert_eq!(
+                evidence.user_scope.as_deref(),
+                Some("/user.slice/user-1000.slice/user@1000.service"),
+                "the user scope must be canonicalized once without a second slash"
+            );
             let group = evidence.app_group.expect("stable app family");
+            assert!(
+                !group.contains("systemd://"),
+                "app-family keys must not double the scope slash: {group}"
+            );
             assert!(group.ends_with(unit), "{group} must retain {unit}");
             assert!(
                 groups.insert(group),
@@ -419,20 +619,21 @@ mod tests {
     #[test]
     fn descendants_of_one_app_unit_share_its_family_identity() {
         let scope = user_path("app.slice/app-org.kde.konsole-17.scope");
-        let direct = parse_v2(&scope).expect("scope");
-        let nested = parse_v2(&format!("{scope}/child")).expect("nested child");
+        let mut direct = parse_v2(&scope).expect("scope");
+        let mut nested = parse_v2(&format!("{scope}/child")).expect("nested child");
+        apply_graphical_gate(&mut direct);
+        apply_graphical_gate(&mut nested);
         assert_eq!(direct.role, Some(DesktopRoleEvidence::App));
         assert_eq!(direct.app_group, nested.app_group);
     }
 
     #[test]
-    fn background_session_and_direct_session_paths_are_background() {
+    fn explicit_background_session_roles_are_not_weak_user_context() {
         for path in [
             user_path("background.slice/org.example.worker.service"),
             user_path("session.slice/org.gnome.Shell@wayland.service"),
             user_path("init.scope"),
             "/user.slice/user-1000.slice/session-4.scope".to_owned(),
-            "/user.slice/user-1000.slice/session-4.scope/org.example.worker".to_owned(),
         ] {
             let evidence = parse_v2(&path).expect("valid user-session cgroup");
             assert_eq!(
@@ -444,10 +645,44 @@ mod tests {
         let evidence =
             parse_v2("/user.slice/user-1000.slice/session-4.scope").expect("session scope");
         assert_eq!(evidence.session_id, Some(4));
+
+        for path in [
+            "/user.slice/user-1000.slice/session-4.scope/org.example.worker".to_owned(),
+            user_path("org.example.worker.service"),
+            user_path(""),
+        ] {
+            let evidence = parse_v2(path.trim_end_matches('/')).expect("weak user-session path");
+            assert_eq!(
+                evidence.role, None,
+                "{path} is not authoritative Background"
+            );
+            assert!(evidence.user_session);
+        }
     }
 
     #[test]
-    fn system_cgroups_are_system_but_only_inside_the_system_hierarchy() {
+    fn nested_session_app_scope_is_parsed_before_assigning_background() {
+        let exact =
+            "/user.slice/user-1000.slice/session-4.scope/app.slice/app-org.example.Editor-7.scope";
+        let mut evidence = parse_v2(exact).expect("nested session app scope");
+        assert_eq!(evidence.session_id, Some(4));
+        assert_eq!(evidence.role, None);
+        assert_eq!(
+            evidence.user_scope.as_deref(),
+            Some("/user.slice/user-1000.slice/session-4.scope")
+        );
+        apply_graphical_gate(&mut evidence);
+        assert_eq!(evidence.role, Some(DesktopRoleEvidence::App));
+        assert_eq!(
+            evidence.app_group.as_deref(),
+            Some(
+                "systemd:/user.slice/user-1000.slice/session-4.scope/app.slice/app-org.example.Editor-7.scope"
+            )
+        );
+    }
+
+    #[test]
+    fn system_cgroups_require_a_real_systemd_pid1_manager() {
         for path in [
             "/system.slice/org.example.service",
             "/system.slice/org.example.service/worker",
@@ -457,10 +692,57 @@ mod tests {
             let evidence = parse_v2(path).expect("valid system cgroup");
             assert_eq!(evidence.role, Some(DesktopRoleEvidence::System), "{path}");
         }
+        for path in ["/system.slice/org.example.service", "/init.scope"] {
+            let evidence =
+                parse_v2_with(path, false).expect("synthetic WSL cgroup remains parseable");
+            assert_eq!(
+                evidence.role, None,
+                "synthetic WSL cgroup {path} must stay Unknown"
+            );
+            assert_eq!(
+                tm_core::classify::classify(tm_core::classify::ClassifyInput {
+                    pid: 3000,
+                    name: "dbus-daemon",
+                    has_window: None,
+                    critical: None,
+                    windows_owned: None,
+                    desktop_role: Some(evidence.role_marker()),
+                }),
+                tm_core::model::ProcCategory::Unknown,
+                "synthetic WSL evidence must not fall back to a System name fact"
+            );
+        }
         let unrelated = parse_v2("/machine.slice/app.slice/app-org.example-1.scope")
             .expect("well-formed unrelated cgroup");
         assert_eq!(unrelated.role, None);
         assert!(!unrelated.user_session);
+        assert!(pid1_comm_is_systemd(b"systemd\n"));
+        assert!(!pid1_comm_is_systemd(b"init\n"));
+    }
+
+    #[test]
+    fn user_session_infrastructure_is_background_but_system_slice_is_system() {
+        let user =
+            parse_v2("/user.slice/user-1000.slice/session-4.scope").expect("user session cgroup");
+        let system = parse_v2("/system.slice/dbus.service").expect("system service cgroup");
+        let classify_with = |role| {
+            tm_core::classify::classify(tm_core::classify::ClassifyInput {
+                pid: 3000,
+                name: "dbus-daemon",
+                has_window: None,
+                critical: None,
+                windows_owned: None,
+                desktop_role: role,
+            })
+        };
+        assert_eq!(
+            classify_with(user.role),
+            tm_core::model::ProcCategory::Background
+        );
+        assert_eq!(
+            classify_with(system.role),
+            tm_core::model::ProcCategory::System
+        );
     }
 
     #[test]
@@ -471,27 +753,54 @@ mod tests {
             "/user.slice/user-1000.slice/user@1000.service/app.slice/app-org.example\\x2d1.scope",
             "/user.slice/user-1000.slice/user@1001.service/app.slice/app-org.example-1.scope",
             "/user.slice/user-1000.slice/app.slice/app-org.example-1.scope",
-            "/user.slice/user-1000.slice/user@1000.service/app.slice/not-a-unit",
         ] {
             assert_eq!(parse_v2(path), None, "{path}");
         }
+        let malformed_unit =
+            parse_v2("/user.slice/user-1000.slice/user@1000.service/app.slice/not-a-unit")
+                .expect("recognizable user path");
+        assert_eq!(malformed_unit.role, None);
+        assert!(!malformed_unit.environment_eligible);
         let unrelated = parse_v2("/foo.slice/thing.service").expect("well-formed path");
         assert_eq!(unrelated, DesktopEvidence::default());
     }
 
     #[test]
-    fn multiple_systemd_hierarchies_are_ambiguous() {
+    fn hybrid_cgroups_prefer_unified_v2_and_same_authority_conflicts_fail_closed() {
         let raw = "\
-0::/user.slice/user-1000.slice/session-4.scope
-1:name=systemd:/system.slice/org.example.service
+2:cpu,cpuacct:/
+1:name=systemd:/user.slice/user-1000.slice/session-7.scope
+0::/user.slice/user-1000.slice/user@1000.service/app.slice/app-org.example-1.scope
 ";
-        assert_eq!(parse_cgroup(raw.as_bytes()), None);
+        let evidence = parse_cgroup(raw.as_bytes(), true).expect("hybrid cgroup");
+        assert_eq!(
+            evidence.role, None,
+            "app.slice still awaits its graphic gate"
+        );
+        assert!(evidence.app_unit_group.is_some());
+
+        let ambiguous = "\
+0::/user.slice/user-1000.slice/session-4.scope
+0::/user.slice/user-1000.slice/session-5.scope
+";
+        assert_eq!(parse_cgroup(ambiguous.as_bytes(), true), None);
+        let duplicate = "\
+0::/user.slice/user-1000.slice/session-4.scope
+0::/user.slice/user-1000.slice/session-4.scope
+";
+        assert_eq!(
+            parse_cgroup(duplicate.as_bytes(), true)
+                .expect("identical duplicate candidate")
+                .role,
+            Some(DesktopRoleEvidence::Background)
+        );
     }
 
     #[test]
     fn cgroup_v1_named_systemd_hierarchy_is_supported() {
         let evidence = parse_cgroup(
             b"2:cpu,cpuacct:/\n1:name=systemd:/user.slice/user-1000.slice/session-7.scope\n",
+            true,
         )
         .expect("v1 systemd path");
         assert_eq!(evidence.role, Some(DesktopRoleEvidence::Background));
@@ -499,8 +808,8 @@ mod tests {
     }
 
     #[test]
-    fn desktop_launch_hints_upgrade_only_a_user_session_and_ignore_desktop_wide_keys() {
-        let raw = b"PATH=/usr/bin\0XDG_CURRENT_DESKTOP=KDE\0GIO_LAUNCHED_DESKTOP_FILE=/usr/share/applications/org.gnome.Terminal.desktop\0";
+    fn desktop_launch_hints_require_graphical_user_session_evidence() {
+        let raw = b"PATH=/usr/bin\0WAYLAND_DISPLAY=wayland-0\0XDG_CURRENT_DESKTOP=KDE\0GIO_LAUNCHED_DESKTOP_FILE=/usr/share/applications/org.gnome.Terminal.desktop\0";
         let hints = parse_environment(raw).expect("complete environment");
         assert_eq!(
             hints.app_group().as_deref(),
@@ -508,9 +817,9 @@ mod tests {
         );
 
         let mut user = DesktopEvidence {
-            role: Some(DesktopRoleEvidence::Background),
             user_session: true,
             user_scope: Some("/user.slice/user-1000.slice/session-4.scope".into()),
+            environment_eligible: true,
             ..DesktopEvidence::default()
         };
         apply_environment_hints(&mut user, hints.clone());
@@ -522,9 +831,9 @@ mod tests {
             )
         );
         let mut other_user = DesktopEvidence {
-            role: Some(DesktopRoleEvidence::Background),
             user_session: true,
             user_scope: Some("/user.slice/user-1001.slice/session-5.scope".into()),
+            environment_eligible: true,
             ..DesktopEvidence::default()
         };
         apply_environment_hints(&mut other_user, hints.clone());
@@ -533,41 +842,89 @@ mod tests {
             "launcher hints must not merge across user sessions"
         );
 
-        let mut background = parse_v2(&user_path("background.slice/org.example.launcher.service"))
-            .expect("background user unit");
-        apply_environment_hints(&mut background, hints.clone());
-        assert_eq!(
-            background.role,
-            Some(DesktopRoleEvidence::App),
-            "an App hint outranks a positive Background role"
-        );
+        for path in [
+            user_path("background.slice/org.example.launcher.service"),
+            user_path("session.slice/org.gnome.Shell@wayland.service"),
+            user_path("init.scope"),
+            "/user.slice/user-1000.slice/session-4.scope".to_owned(),
+        ] {
+            let mut background = parse_v2(&path).expect("authoritative background path");
+            apply_environment_hints(&mut background, hints.clone());
+            assert_eq!(
+                background.role,
+                Some(DesktopRoleEvidence::Background),
+                "an App hint must not override {path}"
+            );
+            assert_eq!(background.app_group, None);
+        }
 
         let mut unrelated = DesktopEvidence::default();
-        apply_environment_hints(&mut unrelated, hints);
+        apply_environment_hints(
+            &mut unrelated,
+            parse_environment(b"WAYLAND_DISPLAY=wayland-0\0FLATPAK_ID=org.example.App\0")
+                .expect("complete environment"),
+        );
         assert_eq!(unrelated, DesktopEvidence::default());
 
-        let desktop_wide_only =
-            parse_environment(b"XDG_CURRENT_DESKTOP=GNOME\0").expect("complete environment");
+        let no_graphical_gate = parse_environment(
+            b"XDG_CURRENT_DESKTOP=GNOME\0GIO_LAUNCHED_DESKTOP_FILE=/usr/share/applications/a.desktop\0",
+        )
+        .expect("complete environment");
         let mut user = DesktopEvidence {
-            role: Some(DesktopRoleEvidence::Background),
             user_session: true,
             user_scope: Some("/user.slice/user-1000.slice/session-4.scope".into()),
+            environment_eligible: true,
             ..DesktopEvidence::default()
         };
-        apply_environment_hints(&mut user, desktop_wide_only);
-        assert_eq!(user.role, Some(DesktopRoleEvidence::Background));
+        apply_environment_hints(&mut user, no_graphical_gate);
+        assert_eq!(user.role, None);
         assert_eq!(user.app_group, None);
     }
 
     #[test]
+    fn headless_gui_and_unavailable_app_slice_roles_are_distinct() {
+        let path = user_path("app.slice/app-org.example.Tool-9.scope");
+        let unavailable = parse_v2(&path).expect("app slice");
+        assert_eq!(unavailable.role, None);
+        assert_eq!(unavailable.role_marker(), DesktopRoleEvidence::Unknown);
+
+        let mut headless = parse_v2(&path).expect("app slice");
+        apply_environment_hints(
+            &mut headless,
+            parse_environment(b"PATH=/usr/bin\0WAYLAND_DISPLAY=\0FLATPAK_ID=org.example.Tool\0")
+                .expect("complete headless environment"),
+        );
+        assert_eq!(headless.role, Some(DesktopRoleEvidence::Background));
+        assert_eq!(headless.app_group, None);
+
+        let mut gui = parse_v2(&path).expect("app slice");
+        apply_environment_hints(
+            &mut gui,
+            parse_environment(b"DISPLAY=:0\0FLATPAK_ID=org.example.Tool\0")
+                .expect("complete GUI environment"),
+        );
+        assert_eq!(gui.role, Some(DesktopRoleEvidence::App));
+        assert_eq!(
+            gui.app_group.as_deref(),
+            Some(
+                "systemd:/user.slice/user-1000.slice/user@1000.service/app.slice/app-org.example.Tool-9.scope"
+            )
+        );
+    }
+
+    #[test]
     fn flatpak_and_snap_hints_supply_fallback_identity() {
-        let flatpak = parse_environment(b"FLATPAK_ID=org.gnome.Builder\0").expect("environment");
+        let flatpak =
+            parse_environment(b"WAYLAND_DISPLAY=wayland-0\0FLATPAK_ID=org.gnome.Builder\0")
+                .expect("environment");
         assert_eq!(
             flatpak.app_group().as_deref(),
             Some("flatpak:org.gnome.Builder")
         );
-        let snap = parse_environment(b"SNAP_INSTANCE_NAME=firefox_foo\0").expect("environment");
+        let snap = parse_environment(b"WAYLAND_SOCKET=3\0SNAP_INSTANCE_NAME=firefox_foo\0")
+            .expect("environment");
         assert_eq!(snap.app_group().as_deref(), Some("snap:firefox_foo"));
+        assert!(snap.graphical_session());
     }
 
     #[test]
@@ -603,14 +960,24 @@ mod tests {
             None,
             "unsafe hint values must not become app identity"
         );
+        assert_eq!(
+            parse_environment(b"WAYLAND_DISPLAY=a\0WAYLAND_DISPLAY=b\0"),
+            None,
+            "disagreeing duplicate graphical evidence is ambiguous"
+        );
+        assert!(
+            parse_environment(b"WAYLAND_DISPLAY=a\0WAYLAND_DISPLAY=a\0")
+                .expect("identical duplicate")
+                .graphical_session()
+        );
     }
 
     #[test]
     fn malformed_cgroup_and_unavailable_environment_remain_unknown() {
-        assert_eq!(parse_cgroup(b"0::not-absolute\n"), None);
+        assert_eq!(parse_cgroup(b"0::not-absolute\n", true), None);
         assert_eq!(read_environment_hints(u32::MAX), None);
         let evidence = DesktopEvidence {
-            role: parse_cgroup(b"0::not-absolute\n").and_then(|evidence| evidence.role),
+            role: parse_cgroup(b"0::not-absolute\n", true).and_then(|evidence| evidence.role),
             ..DesktopEvidence::default()
         };
         assert_eq!(
@@ -630,14 +997,66 @@ mod tests {
     fn unreadable_environ_does_not_override_positive_cgroup_evidence_or_guess() {
         assert_eq!(read_environment_hints(u32::MAX), None);
         let app = parse_v2(&user_path("app.slice/app-org.example-1.scope")).expect("app cgroup");
-        assert_eq!(app.role, Some(DesktopRoleEvidence::App));
-        assert!(app.app_group.is_some());
+        assert_eq!(app.role, None);
+        assert_eq!(app.role_marker(), DesktopRoleEvidence::Unknown);
+        assert!(app.app_unit_group.is_some());
+    }
+
+    #[test]
+    fn evidence_cache_reuses_generation_for_ttl_refreshes_and_prunes() {
+        let now = Instant::now();
+        let first = DesktopEvidence {
+            role: Some(DesktopRoleEvidence::App),
+            app_group: Some("systemd:/scope/app".into()),
+            session_id: Some(7),
+            ..DesktopEvidence::default()
+        };
+        let second = DesktopEvidence {
+            role: Some(DesktopRoleEvidence::Background),
+            ..DesktopEvidence::default()
+        };
+        let mut cache = DesktopEvidenceCache::default();
+        cache.remember(10, 100, now, first.clone());
+
+        assert_eq!(
+            cache.cached(10, 100, now + Duration::from_secs(1)),
+            Some(first.clone())
+        );
+        assert_eq!(
+            cache.cached(10, 100, now + DESKTOP_EVIDENCE_TTL),
+            None,
+            "the bounded TTL must expire"
+        );
+        assert_eq!(
+            cache.cached(10, 101, now + Duration::from_secs(1)),
+            None,
+            "a new PID generation must refresh immediately"
+        );
+
+        cache.remember(10, 101, now + Duration::from_secs(2), second.clone());
+        assert_eq!(cache.cached(10, 100, now + Duration::from_secs(2)), None);
+        assert_eq!(
+            cache.cached(10, 101, now + Duration::from_secs(2)),
+            Some(second)
+        );
+
+        cache.remember(
+            20,
+            200,
+            now,
+            DesktopEvidence {
+                role: Some(DesktopRoleEvidence::Background),
+                ..DesktopEvidence::default()
+            },
+        );
+        cache.retain_live(&HashSet::from([10]));
+        assert_eq!(cache.cached(20, 200, now), None, "dead PIDs are pruned");
     }
 
     #[test]
     fn evidence_from_an_old_process_generation_is_discarded() {
         let pid = std::process::id();
         let ticks = super::super::linux_proc_start_ticks(pid).expect("own start ticks");
-        assert_eq!(inspect(pid, ticks + 1), DesktopEvidence::default());
+        assert_eq!(inspect(pid, ticks + 1, true), DesktopEvidence::default());
     }
 }

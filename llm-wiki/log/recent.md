@@ -1,36 +1,52 @@
+## 2026-11-23 - Native-Wayland classification review corrections
+
+- Corrected `desktop_session` role parsing: canonical user-scope keys have
+  exactly one leading slash; nested session app scopes are parsed before any
+  session Background role; generic `user@UID.service/...` membership is weak
+  and never guessed Background.
+- A validated user app.slice is an App only with a complete capped
+  environment containing non-empty `WAYLAND_DISPLAY`, `WAYLAND_SOCKET` or
+  `DISPLAY`. Complete headless environments become Background; unavailable,
+  partial, oversized or conflicting environments stay Unknown. Flatpak, Snap,
+  GIO and BAMF hints obey the same graphical gate, require weak user-session
+  evidence, and cannot override explicit Background/System roles.
+- Synthetic WSL `/init.scope` and `/system.slice` evidence is no longer
+  authoritative System: top-level system cgroups require `/run/systemd/system`
+  plus PID 1 named `systemd`. Hybrid cgroup files prefer unified `0::` over
+  the compatibility `name=systemd` line, while disagreeing same-authority
+  candidates fail closed.
+- Split hard kernel/PID-1/Windows core-name rules from Unix userspace
+  infrastructure fallback. Positive Linux Background/App evidence can refine
+  user `systemd`/`dbus-daemon`/`dbus-broker` names; explicit collector Unknown
+  is not re-promoted by name. The Processes presentation no longer applies the
+  unconditional core-name category override and preserves authoritative
+  Background/Unknown/native-family descendants during App descent.
+- Added a serialized/defaulted `ProcessEntry::desktop_role` marker, a
+  collector-owned five-second cache keyed by PID plus validated start ticks,
+  immediate generation refresh, per-tick dead-PID pruning, cached session IDs,
+  and windowed App-root preference. One final post-evidence identity check
+  remains; the redundant pre-read check inside `inspect` was removed.
+- Added pure regressions for synthetic/real systemd init.scope, hybrid
+  cgroups, headless/GUI app.slice, nested sessions, generic user-manager
+  membership, user systemd/dbus refinement, mixed XWayland explicit
+  Background/Unknown children, authoritative Background versus environment
+  hints, cache TTL/generation/pruning, serialization defaults and App-root
+  preference. Under the task restriction, Cargo/rustc/tests/build were not run;
+  only formatting, static checks and secret scans were available.
+- Residual: App/Background remains launcher evidence, not compositor focus;
+  cgroup movement may trail by the five-second cache TTL, and a no-window
+  native family still uses deterministic creation/PID root selection.
+
 ## 2026-11-23 - Linux native-Wayland process classification (static implementation)
 
-- Added `linux/desktop_session.rs` to derive positive Apps/Background/System
-  roles from one unambiguous systemd cgroup hierarchy instead of requiring
-  EWMH window ownership. Standard user `app.slice` scope/service units are
-  Apps; `background.slice`, `session.slice`, direct `session-N.scope`
-  descendants and other validated user-manager membership are Background;
-  `system.slice`/`init.scope` are System. Malformed, escaped, mismatched,
-  duplicate-hierarchy, unrelated or unreadable evidence stays Unknown.
-- User-session processes without an app unit may use a complete 64 KiB-capped
-  `/proc/<pid>/environ` read for only Flatpak, Snap, GIO and BAMF launch
-  metadata. `XDG_CURRENT_DESKTOP` and other session-wide values are ignored.
-- Extended `tm-core::classify::ClassifyInput` with
-  `DesktopRoleEvidence` and established the precedence System > observed
-  window > complete no-window > App role > Background role > Unknown.
-- Added `ProcessEntry::app_group`, stable Linux scope/hint family keys, and
-  oldest-member `app_root` selection. The Processes presentation now seeds
-  App roots from both windows and native roles and synthesizes family edges
-  for disconnected members of the same validated unit, so mixed
-  XWayland/native sessions preserve native Apps and keep unrelated app scopes
-  separate.
-- Evidence reads are bracketed by the refresh-validated `boot_start_ticks`
-  generation. A PID that disappears or is reused during cgroup/environ
-  collection loses the role, session and group evidence.
-- Added pure parser, environment, precedence, app-root and mixed-window/UI
-  regressions. Per the task's explicit prohibition, no Cargo/rustc test,
-  clippy or build run was performed; only formatting and static/secret checks
-  were possible.
-- Residual: this identifies launcher-managed applications, not an exact
-  compositor focus/window inventory. GNOME Shell.Introspect and interactive
-  KWin enumeration remain intentionally unused. WSL without the relevant
-  systemd user hierarchy keeps the Unknown fallback unless X11 supplies
-  independent window ownership.
+- Initial implementation of `linux/desktop_session.rs`, `DesktopRoleEvidence`,
+  `ProcessEntry::app_group/app_root` and mixed XWayland/native presentation.
+  Its initial app.slice-without-graphical-evidence, broad user-manager
+  Background, synthetic WSL System and environment-hint precedence rules were
+  superseded by the review-correction entry above; use that entry as the
+  behavioral record.
+- This first pass was source-reviewed and statically checked but not compiled
+  or tested on the implementing host.
 
 ## 2026-11-23 - Final Linux parity review corrections
 

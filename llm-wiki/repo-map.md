@@ -190,16 +190,21 @@ platform boundary (`tm-core` ← `tm-platform` ← `tm-app` / `tm-service`), and
     only fresh complete observations may prove a process windowless. Native
     Wayland has no portable whole-window inventory, so XWayland clients are
     the available X11 subset. `linux/desktop_session.rs` supplies the
-    independent native-Wayland fallback: it selects one unambiguous systemd
-    cgroup hierarchy, classifies validated user `app.slice` units as Apps and
-    background/session/user-manager membership as Background, recognizes
-    `system.slice`/`init.scope` as System, and may read a complete capped
-    per-process environ only for user-session processes to recover trusted
-    Flatpak/Snap/GIO/BAMF launcher identity. It also reuses that cgroup read
-    for exact logind `session-N.scope` association. Session/unit paths remain
-    stable family keys; malformed, escaped, ambiguous or unrelated evidence
-    stays Unknown. This is launcher metadata, not compositor focus, and WSL
-    without a relevant systemd user hierarchy also keeps the Unknown fallback.
+    independent native-Wayland fallback: it prefers the unified cgroup v2 path
+    in hybrid files, classifies validated user `app.slice` units as Apps only
+    when a complete capped process environment has a non-empty
+    `WAYLAND_DISPLAY`, `WAYLAND_SOCKET` or `DISPLAY`, treats a complete
+    headless app.slice as Background, and keeps unavailable/partial
+    environments Unknown. Exact session scopes, user-manager `init.scope`,
+    `background.slice` and `session.slice` are explicit Background roles;
+    generic user-manager membership stays weak. `system.slice`/`init.scope`
+    become System only with `/run/systemd/system` and PID 1 named `systemd`, so
+    synthetic WSL cgroups stay Unknown. Flatpak/Snap/GIO/BAMF hints require the
+    graphical gate and weak user-session evidence and never override explicit
+    Background. The collector caches role evidence for five seconds per
+    PID/start-tick generation, reuses it for `session-N.scope` IDs, and prunes
+    dead PIDs. Session/unit paths remain stable family keys. This is launcher
+    metadata, not compositor focus.
     Linux privileged execution adds `linux/polkit.rs` (direct-first escalation,
     trusted `systemctl` execution through Polkit, and explicit fail-closed
     portable-install behavior),
