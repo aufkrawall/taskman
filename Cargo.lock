@@ -3536,6 +3536,7 @@ dependencies = [
  "eframe",
  "egui",
  "flate2",
+ "raw-window-handle",
  "serde",
  "serde_json",
  "sha2",

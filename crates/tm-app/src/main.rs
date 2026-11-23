@@ -1153,6 +1153,12 @@ impl NativeApp {
             return;
         };
         let Some(key) = tm_platform::text_rendering::window_placement_key(hwnd) else {
+            let changed =
+                theme::set_subpixel_params(tm_platform::text_rendering::Params::default());
+            self.last_text_rendering_key = None;
+            if changed {
+                theme::refresh_text_rendering(ctx);
+            }
             return;
         };
         if self.last_text_rendering_key == Some(key) {
@@ -1236,8 +1242,6 @@ impl eframe::App for NativeApp {
             ctx.input_mut(|i| i.focused = true);
         }
         #[cfg(target_os = "windows")]
-        self.sync_text_rendering(ctx);
-        #[cfg(target_os = "windows")]
         poll_show_event_fallback(ctx);
         // Before the tray actions, so a restore requested THIS frame cannot
         // spend one of the frames it is owed on the frame that requested it.
@@ -1299,6 +1303,11 @@ impl eframe::App for NativeApp {
         ctx: &eframe::egui::Context,
         raw_input: &mut eframe::egui::RawInput,
     ) {
+        // This hook runs before egui begins the pass, so a monitor-policy
+        // change can affect the same frame instead of leaving one frame on
+        // the previous stripe order.
+        #[cfg(target_os = "windows")]
+        self.sync_text_rendering(ctx);
         // `ui` does not run while the window is minimized or hidden, and
         // `logic` cannot read the viewport's close request from the context
         // then; the raw input reaches both paths.

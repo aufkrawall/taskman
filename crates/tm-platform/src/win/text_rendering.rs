@@ -85,7 +85,7 @@ pub fn query(hwnd: Option<isize>) -> TextRenderingParams {
         return TextRenderingParams::disabled();
     }
     let params = match hwnd {
-        Some(hwnd) => query_window_monitors(hwnd),
+        Some(hwnd) => query_window_monitors(hwnd).unwrap_or_else(TextRenderingParams::disabled),
         None => dwrite_params(None)
             .and_then(validated_params)
             .unwrap_or_else(TextRenderingParams::disabled),
@@ -137,9 +137,9 @@ pub fn window_placement_key(hwnd: isize) -> Option<crate::text_rendering::Window
     })
 }
 
-/// Query every monitor intersecting the window and fail closed when their validated
-/// DirectWrite policies disagree.
-fn query_window_monitors(hwnd: isize) -> TextRenderingParams {
+/// Query every monitor intersecting the window. Any inability to enumerate or read one
+/// intersecting monitor returns `None`; the caller must then keep LCD disabled.
+fn query_window_monitors(hwnd: isize) -> Option<TextRenderingParams> {
     use windows::Win32::Foundation::LPARAM;
     use windows::Win32::Graphics::Gdi::{
         EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITORINFO,
@@ -163,9 +163,7 @@ fn query_window_monitors(hwnd: isize) -> TextRenderingParams {
     let window = HWND(hwnd as *mut std::ffi::c_void);
     let mut window_rect = RECT::default();
     if window.0.is_null() || unsafe { GetWindowRect(window, &mut window_rect) }.is_err() {
-        return dwrite_params(Some(hwnd))
-            .and_then(validated_params)
-            .unwrap_or_else(TextRenderingParams::disabled);
+        return None;
     }
     let window_rect = [
         window_rect.left,
@@ -175,37 +173,40 @@ fn query_window_monitors(hwnd: isize) -> TextRenderingParams {
     ];
 
     let mut monitors = Vec::new();
-    unsafe {
-        let _ = EnumDisplayMonitors(
+    let enumerated = unsafe {
+        EnumDisplayMonitors(
             None,
             None,
             Some(collect),
             LPARAM((&raw mut monitors) as isize),
-        );
+        )
+    };
+    if !enumerated.as_bool() {
+        return None;
     }
-    let intersecting: Vec<HMONITOR> = monitors
-        .into_iter()
-        .filter(|monitor| {
-            let mut info = MONITORINFO {
-                cbSize: std::mem::size_of::<MONITORINFO>() as u32,
-                ..Default::default()
-            };
-            unsafe { GetMonitorInfoW(*monitor, &mut info) }.as_bool()
-                && rects_intersect(
-                    window_rect,
-                    [
-                        info.rcMonitor.left,
-                        info.rcMonitor.top,
-                        info.rcMonitor.right,
-                        info.rcMonitor.bottom,
-                    ],
-                )
-        })
-        .collect();
+    let mut intersecting = Vec::new();
+    for monitor in monitors {
+        let mut info = MONITORINFO {
+            cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+            ..Default::default()
+        };
+        if !unsafe { GetMonitorInfoW(monitor, &mut info) }.as_bool() {
+            return None;
+        }
+        if rects_intersect(
+            window_rect,
+            [
+                info.rcMonitor.left,
+                info.rcMonitor.top,
+                info.rcMonitor.right,
+                info.rcMonitor.bottom,
+            ],
+        ) {
+            intersecting.push(monitor);
+        }
+    }
     if intersecting.is_empty() {
-        return dwrite_params(Some(hwnd))
-            .and_then(validated_params)
-            .unwrap_or_else(TextRenderingParams::disabled);
+        return None;
     }
 
     let factory = dwrite_factory();
@@ -225,7 +226,7 @@ fn query_window_monitors(hwnd: isize) -> TextRenderingParams {
             "window intersects monitors with conflicting text-rendering policies; LCD disabled"
         );
     }
-    policy
+    Some(policy)
 }
 
 fn rects_intersect(a: [i32; 4], b: [i32; 4]) -> bool {

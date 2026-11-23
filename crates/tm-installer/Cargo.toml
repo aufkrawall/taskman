@@ -40,6 +40,7 @@ eframe = { version = "=0.36.1", default-features = false, features = [
 ] }
 
 [target.'cfg(windows)'.dependencies]
+raw-window-handle = "0.6.2"
 windows = { workspace = true, features = [
   "Win32_Foundation",
   "Win32_Security",

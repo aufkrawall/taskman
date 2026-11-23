@@ -181,6 +181,14 @@ fn normalized_contrast(contrast: f32) -> f32 {
     }
 }
 
+/// Reference CPU formula for the contrast curve implemented by `egui_lcd.wgsl`.
+#[cfg(test)]
+fn enhanced_lcd_coverage(coverage: f32, contrast: f32) -> f32 {
+    let coverage = coverage.clamp(0.0, 1.0);
+    let contrast = normalized_contrast(contrast);
+    (coverage * (1.0 + contrast * (1.0 - coverage))).clamp(0.0, 1.0)
+}
+
 fn lcd_shader_source() -> String {
     format!(
         "enable dual_source_blending;\n{}{}",
@@ -216,8 +224,6 @@ fn bounded_validation_error(
     device: &wgpu::Device,
     error: impl std::future::Future<Output = Option<wgpu::Error>>,
 ) -> Result<Option<wgpu::Error>, ()> {
-    use std::future::Future as _;
-
     let mut error = std::pin::pin!(error);
     let waker = std::task::Waker::noop();
     let mut context = std::task::Context::from_waker(waker);
@@ -640,6 +646,8 @@ impl Renderer {
                 }
                 Ok(()) => {
                     let validation = device.push_error_scope(wgpu::ErrorFilter::Validation);
+                    let internal = device.push_error_scope(wgpu::ErrorFilter::Internal);
+                    let out_of_memory = device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
                     let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
                         label: Some("egui_lcd"),
                         source: wgpu::ShaderSource::Wgsl(Cow::Owned(source)),
@@ -661,22 +669,36 @@ impl Renderer {
                             alpha: alpha_blend,
                         },
                     );
-                    match bounded_validation_error(device, validation.pop()) {
-                        Ok(None) => Some(pipeline),
-                        Ok(Some(error)) => {
-                            log::warn!(
-                                "LCD pipeline validation failed; using grayscale pipeline: {error}"
-                            );
-                            None
-                        }
-                        Err(()) => {
-                            log::warn!(
-                                "LCD pipeline validation did not complete within 250 ms; \
-                                 using grayscale pipeline"
-                            );
-                            None
+                    let mut failed = false;
+                    for (kind, scope) in [
+                        (
+                            "out-of-memory",
+                            bounded_validation_error(device, out_of_memory.pop()),
+                        ),
+                        ("internal", bounded_validation_error(device, internal.pop())),
+                        (
+                            "validation",
+                            bounded_validation_error(device, validation.pop()),
+                        ),
+                    ] {
+                        match scope {
+                            Ok(None) => {}
+                            Ok(Some(error)) => {
+                                failed = true;
+                                log::warn!(
+                                    "LCD pipeline {kind} error; using grayscale pipeline: {error}"
+                                );
+                            }
+                            Err(()) => {
+                                failed = true;
+                                log::warn!(
+                                    "LCD pipeline {kind} validation did not complete within 250 ms; \
+                                     using grayscale pipeline"
+                                );
+                            }
                         }
                     }
+                    if failed { None } else { Some(pipeline) }
                 }
             }
         } else {
@@ -796,11 +818,17 @@ impl Renderer {
                         .expect("You must call .update_buffers() before .render()");
 
                     if let Some(Texture { bind_group, .. }) = self.textures.get(&mesh.texture_id) {
-                        let all_white_uv = mesh
-                            .vertices
-                            .iter()
-                            .all(|vertex| vertex.uv == epaint::WHITE_UV);
                         let lcd_pipeline = self.lcd_pipeline.as_ref().filter(|_| {
+                            if mesh.texture_id != epaint::TextureId::default()
+                                || !self.font_atlas_has_subpixel
+                                || self.subpixel_mode.is_off()
+                            {
+                                return false;
+                            }
+                            let all_white_uv = mesh
+                                .vertices
+                                .iter()
+                                .all(|vertex| vertex.uv == epaint::WHITE_UV);
                             use_lcd_pipeline(
                                 mesh.texture_id,
                                 all_white_uv,
@@ -907,7 +935,10 @@ impl Renderer {
         };
         let data_bytes: &[u8] = bytemuck::cast_slice(data_color32.as_slice());
 
-        if id == epaint::TextureId::default() {
+        if id == epaint::TextureId::default()
+            && self.lcd_pipeline.is_some()
+            && (!self.font_atlas_has_subpixel || image_delta.pos.is_none())
+        {
             self.font_atlas_has_subpixel =
                 font_subpixel_after(self.font_atlas_has_subpixel, image_delta);
         }
@@ -1460,9 +1491,9 @@ fn renderer_impl_send_sync() {
 #[cfg(test)]
 mod tests {
     use super::{
-        UniformBuffer, font_subpixel_after, lcd_shader_source, normalized_contrast,
-        subpixel_order_code, supports_subpixel_features, texel_mapping_is_one_to_one,
-        use_lcd_pipeline, validate_lcd_shader_source,
+        UniformBuffer, enhanced_lcd_coverage, font_subpixel_after, lcd_shader_source,
+        normalized_contrast, subpixel_order_code, supports_subpixel_features,
+        texel_mapping_is_one_to_one, use_lcd_pipeline, validate_lcd_shader_source,
     };
     use epaint::{Color32, ColorImage, ImageDelta, textures::TextureOptions};
 
@@ -1602,6 +1633,17 @@ mod tests {
         assert_eq!(normalized_contrast(-1.0), 0.0);
         assert_eq!(normalized_contrast(2.0), 1.0);
         assert_eq!(normalized_contrast(f32::NAN), 0.5);
+    }
+
+    #[test]
+    fn neutral_lcd_coverage_receives_the_contrast_curve() {
+        assert_eq!(enhanced_lcd_coverage(0.0, 0.5), 0.0);
+        assert_eq!(enhanced_lcd_coverage(1.0, 0.5), 1.0);
+        assert_eq!(enhanced_lcd_coverage(0.5, 0.0), 0.5);
+        assert!(
+            enhanced_lcd_coverage(0.5, 0.5) > 0.5,
+            "neutral LCD coverage must receive the same contrast curve as tinted coverage"
+        );
     }
 
     #[test]

@@ -81,14 +81,18 @@ struct SetupApp {
     finished: Option<std::result::Result<(), String>>,
     worker: Option<mpsc::Receiver<Event>>,
     ctx: egui::Context,
+    #[cfg(target_os = "windows")]
+    last_text_rendering_key: Option<tm_platform::text_rendering::WindowPlacementKey>,
+    #[cfg(target_os = "windows")]
+    hwnd: Option<isize>,
 }
 
 impl SetupApp {
     fn new(ctx: &egui::Context, opts: Options) -> Self {
-        // Match the app's text rendering: the software renderer blends per
-        // channel, so ClearType-style rasterization is enabled exactly as the
-        // app enables it.
-        theme::set_subpixel_capable(true, tm_platform::text_rendering::query(None));
+        // The software renderer can blend per channel, but the installer's
+        // window does not exist yet. Start grayscale and resolve the real
+        // monitor policy from the first frame's window handle.
+        theme::set_subpixel_capable(true, tm_platform::text_rendering::Params::default());
         theme::apply_startup(ctx);
         fonts::install_async(ctx.clone());
         let icon = ctx.load_texture(
@@ -132,6 +136,10 @@ impl SetupApp {
             finished,
             worker: None,
             ctx: ctx.clone(),
+            #[cfg(target_os = "windows")]
+            last_text_rendering_key: None,
+            #[cfg(target_os = "windows")]
+            hwnd: None,
         }
     }
 
@@ -231,12 +239,58 @@ fn plan_steps(opts: &Options) -> Vec<(String, StepState, String)> {
 type FooterButton = (&'static str, egui::Rect, bool);
 
 impl eframe::App for SetupApp {
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
+        #[cfg(target_os = "windows")]
+        if self.hwnd.is_none() {
+            use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+            self.hwnd = frame
+                .window_handle()
+                .ok()
+                .and_then(|handle| match handle.as_raw() {
+                    RawWindowHandle::Win32(win32) => Some(win32.hwnd.get()),
+                    _ => None,
+                });
+        }
         let _ = self.draw(ui);
+    }
+
+    fn raw_input_hook(
+        &mut self,
+        ctx: &eframe::egui::Context,
+        _raw_input: &mut eframe::egui::RawInput,
+    ) {
+        #[cfg(target_os = "windows")]
+        self.sync_text_rendering(ctx);
     }
 }
 
 impl SetupApp {
+    #[cfg(target_os = "windows")]
+    fn sync_text_rendering(&mut self, ctx: &egui::Context) {
+        let Some(hwnd) = self.hwnd else {
+            if theme::set_subpixel_params(tm_platform::text_rendering::Params::default()) {
+                theme::refresh_text_rendering(ctx);
+            }
+            self.last_text_rendering_key = None;
+            return;
+        };
+        let Some(key) = tm_platform::text_rendering::window_placement_key(hwnd) else {
+            if theme::set_subpixel_params(tm_platform::text_rendering::Params::default()) {
+                theme::refresh_text_rendering(ctx);
+            }
+            self.last_text_rendering_key = None;
+            return;
+        };
+        if self.last_text_rendering_key == Some(key) {
+            return;
+        }
+        let params = tm_platform::text_rendering::query(Some(hwnd));
+        self.last_text_rendering_key = Some(key);
+        if theme::set_subpixel_params(params) {
+            theme::refresh_text_rendering(ctx);
+        }
+    }
+
     /// One wizard frame. Returns the footer buttons' layout records; the
     /// regression tests assert on them, the app ignores them.
     fn draw(&mut self, ui: &mut egui::Ui) -> Vec<FooterButton> {
