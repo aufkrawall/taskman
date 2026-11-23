@@ -1,6 +1,6 @@
 # Render Pipeline
 
-Last verified: 2026-11-23 (GPU LCD path and Linux fontconfig audit by source inspection; GPU execution unrun)
+Last verified: 2026-11-24 (GPU LCD path, manual D3D12/Vulkan validation, and Linux fontconfig)
 
 Primary sources:
 - `vendor/egui/TASKMAN-FORK.md` (what diverges from upstream egui, and why)
@@ -178,9 +178,9 @@ closed.
 Before device shader creation, the combined WGSL is parsed and validated with Naga on the
 CPU. The same test runs in the normal `egui-wgpu` suite and covers both linear- and
 gamma-framebuffer fragment entry points, the extension declaration, `@blend_src` interface
-and derivative use. Device shader/pipeline validation then runs inside a validation error
-scope with a bounded 250 ms resolution wait. Any parse, shader or pipeline failure logs,
-drops only `lcd_pipeline`, retains the ordinary pipeline and leaves
+and derivative use. Device shader/pipeline validation then runs inside Validation, Internal
+and OutOfMemory error scopes with a bounded 250 ms resolution wait, popped in LIFO order.
+Any parse, shader or pipeline failure logs, drops only `lcd_pipeline`, retains the ordinary pipeline and leaves
 `has_subpixel_pipeline()` false. It cannot panic or block startup indefinitely.
 HLSL/SPIR-V generation is deliberately not part of that CPU test: it would require
 enabling additional Naga backend features in the vendored workspace, and it does not
@@ -272,7 +272,7 @@ Everything below is headless; none of it opens a window.
   code and asserts structural properties of the output, plus the end-to-end sub-pixel
   check: enabling the mode must add channel spread to glyph edges and leave solid fills
   bit-identical.
-- `cargo test -p egui-wgpu` — pure coverage for feature detection/request policy, atlas
+- `(cd vendor/egui && cargo test -p egui-wgpu)` - pure coverage for feature detection/request policy, atlas
   full/partial state transitions, managed-texture-only pipeline selection, transform
   fallback policy, all-white untextured exclusion, RGB/BGR/contrast uniform fields, the
   32-byte uniform layout, and Naga parse/validation of both LCD fragment entry points.
@@ -280,8 +280,8 @@ Everything below is headless; none of it opens a window.
   antialias false, malformed output, lcd filter mapping, trusted program/parent metadata,
   absolute font-file policy, bounded output and timeout kill/reap. Windows tests cover
   placement-key changes and conflicting-monitor fail-closed policy.
-- **Manual GPU path:** `TASKMAN_RUN_GPU_SUBPIXEL_TESTS=1 cargo test -p egui_kittest
-  --features wgpu --test subpixel_text -- --ignored --test-threads=1`. The tests are
+- **Manual GPU path:** `(cd vendor/egui && TASKMAN_RUN_GPU_SUBPIXEL_TESTS=1 cargo test
+  -p egui_kittest --features wgpu --test subpixel_text -- --ignored --test-threads=1)`. The tests are
   ignored by default and fail if the opt-in variable or a non-CPU D3D12/Vulkan dual-source
   adapter is missing. They cover plain/off-grid text, BGR, neutral/tinted contrast,
   opaque/translucent and colored text, hardware filtering, dithering and the sRGB
@@ -289,12 +289,12 @@ Everything below is headless; none of it opens a window.
 - `TASKMAN_RENDER_SNAPSHOT=target/frame.png cargo test -p tm-app write_cpu_frame_snapshot`
   writes the frame, and a `-cleartype` variant beside it, to look at.
 
-**Unrun in the 2026-11-23 GPU-LCD correction pass:** the task explicitly prohibited
-compiling, running tests or building. The new Naga test is normal deterministic CPU
-coverage once the suite is run, but it was not executed in this pass. The D3D12/Vulkan
-visual path still needs the manual hardware suite and a real window. Current epaint has no
-color-glyph source, so hardware color-glyph coverage is not practical; the software and
-renderer-policy tests cover synthetic premultiplied color texels.
+**Validation after the 2026-11-23 correction pass:** the task workers were prohibited from
+compiling or running tests, but parent-side integration then passed `cargo check` for the
+app/installer, the normal `egui-wgpu` Naga/unit suite, and the manual D3D12/Vulkan hardware
+suite. The full release gate and a user-visible visual review remain final checks. Current
+epaint has no color-glyph source, so hardware color-glyph coverage is not practical; the
+software and renderer-policy tests cover synthetic premultiplied color texels.
 
 ## Still open
 

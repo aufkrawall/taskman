@@ -237,8 +237,8 @@ fn bgr_swaps_the_colored_channel_order() {
 
 #[test]
 #[ignore = "manual hardware GPU test; set TASKMAN_RUN_GPU_SUBPIXEL_TESTS=1"]
-fn neutral_coverage_receives_contrast_and_text_alpha_still_blends() {
-    require_hardware("neutral_coverage_receives_contrast_and_text_alpha_still_blends");
+fn tinted_contrast_and_text_alpha_still_blend() {
+    require_hardware("tinted_contrast_and_text_alpha_still_blend");
 
     let no_contrast = render(RenderConfig {
         contrast: 0.0,

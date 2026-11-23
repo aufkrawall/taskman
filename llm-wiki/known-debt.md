@@ -88,12 +88,12 @@ items across Phases 2–6. The following concrete gaps remain:
     choice. Off-grid glyphs use the grayscale fallback, but a compositor that resamples an
     otherwise 1:1 fractional-Wayland surface can still reduce LCD correctness; no
     fontconfig property proves that compositor behavior.
-  - **Verification residual:** the 2026-11-23 implementation and correction passes were
-    explicitly forbidden from compiling or running tests. Normal `egui-wgpu` tests now
-    include CPU Naga validation for both LCD fragment paths, but they were not executed.
-    The D3D12/Vulkan shader and visual output need the ignored hardware suite, with
-    `TASKMAN_RUN_GPU_SUBPIXEL_TESTS=1`, on a non-CPU dual-source adapter before treating the
-    GPU path as release-verified. There is no portable CI GPU claim.
+  - **Verification residual:** the implementation/correction workers were explicitly
+    forbidden from compiling or running tests. Parent-side integration then passed
+    `cargo check` for the app/installer, the normal `egui-wgpu` unit/Naga suite, and the
+    manual D3D12/Vulkan hardware suite with
+    `TASKMAN_RUN_GPU_SUBPIXEL_TESTS=1`. The final release gate and user-visible visual
+    review remain separate checks; portable CI still has no GPU hardware claim.
   - **Color-glyph hardware residual:** current epaint has no COLR/CBDT source, so the
     manual GPU suite cannot create a real color glyph. Synthetic premultiplied color
     texels are covered in software, and renderer policy keeps all non-LCD texels on the

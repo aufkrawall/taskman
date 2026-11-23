@@ -67,10 +67,9 @@ process actions and GUI relaunch fail closed until a protected helper exists.
 - **GPU execution remains manual.** The hardware `egui_kittest` tests are ignored unless
   `TASKMAN_RUN_GPU_SUBPIXEL_TESTS=1`, and they fail if no non-CPU D3D12/Vulkan
   dual-source adapter is present. They are not portable CI coverage.
-- **Unverified in this pass:** compilation, tests and a real GPU/window were explicitly
-  prohibited. Naga validation, normal gates, D3D12/Vulkan shader execution and visual
-  quality all remain unrun; release verification needs the normal gates plus the manual
-  hardware suite.
+- **Validated in the integration pass:** `cargo check` for the app/installer, the normal
+  `egui-wgpu` unit/Naga suite, and the manual D3D12/Vulkan hardware suite all pass. The
+  full release gate and user-visible visual review remain separate final-gate checks.
 
 ## Row/total consistency (2026-10-21)
 
