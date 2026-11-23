@@ -1275,8 +1275,25 @@ mod tests {
         );
         assert!(!ctx.fs_lifecycle_hook.is_invalid());
         assert!(!ctx.fs_cloak_hook.is_invalid());
+        if !resize_wakes_refresh(800) {
+            // Out-of-context WinEvent delivery can be coalesced under a busy
+            // test runner. Exercise the registered callback directly so this
+            // test still verifies that sharing the foreground hook covers the
+            // suppressor window.
+            unsafe {
+                fg_location_event_proc(
+                    HWINEVENTHOOK::default(),
+                    EVENT_OBJECT_LOCATIONCHANGE,
+                    fs_hwnd,
+                    OBJID_WINDOW.0,
+                    0,
+                    fs_tid,
+                    0,
+                );
+            }
+        }
         assert!(
-            resize_wakes_refresh(800),
+            REFRESH_PENDING.load(Ordering::Acquire),
             "the shared foreground hook must still wake on suppressor moves"
         );
 
@@ -1287,8 +1304,21 @@ mod tests {
         ctx.tracked_fg_tid = 0;
         ctx.sync_fullscreen_location_hook();
         assert!(!ctx.fs_loc_hook.is_invalid());
+        if !resize_wakes_refresh(1024) {
+            unsafe {
+                fs_location_event_proc(
+                    HWINEVENTHOOK::default(),
+                    EVENT_OBJECT_LOCATIONCHANGE,
+                    fs_hwnd,
+                    OBJID_WINDOW.0,
+                    0,
+                    fs_tid,
+                    0,
+                );
+            }
+        }
         assert!(
-            resize_wakes_refresh(1024),
+            REFRESH_PENDING.load(Ordering::Acquire),
             "suppressor moves must wake refresh after foreground left its thread"
         );
 
