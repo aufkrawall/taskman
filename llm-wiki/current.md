@@ -1,6 +1,7 @@
 # Current State
 
-Last cross-checked: 2026-11-23 (Linux privileged-action section)
+Last cross-checked: 2026-11-23 (Linux desktop classification and
+privileged-action sections)
 
 ## Summary
 
@@ -236,11 +237,11 @@ the popup is gone. Accepted residuals of this model are in
 - App History keeps a late deferred-load result and merges CPU/network deltas
   collected while it was loading. Autosave cannot overwrite the previous file
   before that merge. First-sighting rate estimates do not add usage when
-  cumulative counters already exist. Unix App History still tracks non-system
-  processes as a whole because neither backend provides a complete
-  platform-wide app boundary: Linux uses EWMH for X11/XWayland windows but
-  cannot enumerate native Wayland clients, and macOS has no collector-side
-  window inventory.
+  cumulative counters already exist. Unix App History still keys usage by
+  executable rather than an exact foreground-window boundary: Linux can
+  classify launcher-managed native-Wayland processes by systemd cgroup role,
+  but that evidence is not a compositor window inventory, and macOS has no
+  collector-side window inventory.
 - The GUI's broker telemetry calls use one worker and a two-second response
   deadline. A silent service can make disk/network data unavailable but cannot
   block the whole sampling engine indefinitely. Responses over the bounded
@@ -1362,6 +1363,42 @@ The window itself is now treated as a thing that can fail, not as a given:
   before releasing held buttons (no click), focus loss clears the held-button state, and
   the dump picker, the Run dialog's Browse and the shell verbs (`open file location`,
   `properties`, URLs) run on the action executor.
+
+## Linux desktop process roles (2026-11-23, source-reviewed, not compiled here)
+
+- Native Wayland no longer depends on X11/EWMH ownership for every
+  application. `linux/desktop_session.rs` parses the one unambiguous systemd
+  cgroup hierarchy for each PID and supplies positive desktop-role evidence to
+  `tm-core::classify`.
+- A user-manager `app.slice/<unit>.scope` or `app.slice/<unit>.service` is an
+  App, while `background.slice`, `session.slice`, direct
+  `session-N.scope` descendants and other validated user-manager membership
+  are Background. `system.slice` and root `init.scope` are System. The systemd
+  hierarchy must be under `/user.slice/user-UID.slice/user@UID.service/...` or
+  one of those recognized session/system forms; unrelated, escaped,
+  mismatched, duplicate-hierarchy, malformed or unreadable paths remain
+  Unknown.
+- `/proc/<pid>/environ` is read only after the cgroup proves user-session
+  context; it is capped at 64 KiB and must be complete.
+  `FLATPAK_ID`, `SNAP_INSTANCE_NAME`, `GIO_LAUNCHED_DESKTOP_FILE` and
+  `BAMF_DESKTOP_FILE_HINT` may supply an App role and family identity;
+  desktop-wide variables such as `XDG_CURRENT_DESKTOP` never do.
+- Classification precedence is hard System evidence, observed X11 window,
+  complete X11 no-window evidence, positive App role, positive
+  Background/session role, then Unknown. A partial/unavailable X11 inventory
+  therefore does not turn an app-scope process Unknown, while complete X11
+  no-window evidence still wins over the fallback App role.
+- `ProcessEntry::app_group` carries a stable family key derived from the full
+  validated transient unit path, with a sanitized launcher-hint identity as
+  fallback. The oldest process in each group is marked `app_root`; the
+  Processes page seeds root evidence from both windows and native App roles
+  and synthesizes same-group family edges even when PPIDs are disconnected.
+- The distinction is limited to launcher-managed desktop applications. It is
+  not an exact focus state or window list, cannot identify an app that neither
+  uses a standard user-session scope nor exposes trusted launch metadata, and
+  deliberately avoids GNOME Shell.Introspect and interactive KWin APIs. WSL
+  sessions without a relevant systemd user hierarchy retain the same Unknown
+  fallback rather than inferring roles from WSLg or a desktop-wide environment.
 
 ## Linux privileged actions (2026-11-23, source-reviewed, not compiled here)
 

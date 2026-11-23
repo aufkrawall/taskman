@@ -1610,6 +1610,62 @@ fn end_process_checked(app: &mut TaskManApp, ctx: &egui::Context, row: &RowData,
 struct DisplayGroups {
     category: HashMap<u32, ProcCategory>,
     app_roots: HashSet<u32>,
+    app_group_parent: HashMap<u32, u32>,
+}
+
+struct NativeAppGroups {
+    roots: HashSet<u32>,
+    root_by_pid: HashMap<u32, u32>,
+    parent_by_pid: HashMap<u32, u32>,
+}
+
+/// Represent one positive platform app family as one display group even when
+/// its members are not connected through PPIDs. Linux supplies this identity
+/// from a validated systemd app scope/service or a conservative desktop-launch
+/// hint. Distinct groups sharing `app.slice` retain distinct roots.
+fn native_app_groups(
+    all: &[&ProcessEntry],
+    category: &HashMap<u32, ProcCategory>,
+) -> NativeAppGroups {
+    let mut grouped: HashMap<&str, Vec<&ProcessEntry>> = HashMap::new();
+    for process in all.iter().copied() {
+        if category.get(&process.pid) != Some(&ProcCategory::App) {
+            continue;
+        }
+        if let Some(group) = process
+            .app_group
+            .as_deref()
+            .filter(|group| !group.is_empty())
+        {
+            grouped.entry(group).or_default().push(process);
+        }
+    }
+
+    let mut groups = NativeAppGroups {
+        roots: HashSet::new(),
+        root_by_pid: HashMap::new(),
+        parent_by_pid: HashMap::new(),
+    };
+    for mut members in grouped.into_values() {
+        members.sort_by_key(|process| {
+            (
+                if process.app_root { 0 } else { 1 },
+                process.creation_identity().unwrap_or(i64::MAX),
+                process.pid,
+            )
+        });
+        let Some(root) = members.first().copied() else {
+            continue;
+        };
+        groups.roots.insert(root.pid);
+        for member in members {
+            groups.root_by_pid.insert(member.pid, root.pid);
+            if member.pid != root.pid {
+                groups.parent_by_pid.insert(member.pid, root.pid);
+            }
+        }
+    }
+    groups
 }
 
 /// Share of total machine capacity at which an external task absorbed into an
@@ -1688,7 +1744,12 @@ fn build_display_rows(
     let mut all: Vec<&ProcessEntry> = snap.processes.iter().collect();
     all.sort_by_key(|p| (p.start_epoch_s, p.pid));
     let grouping = derive_display_groups(&all);
-    let children_all = display_children_map(&all, &grouping.category, &grouping.app_roots);
+    let children_all = display_children_map(
+        &all,
+        &grouping.category,
+        &grouping.app_roots,
+        &grouping.app_group_parent,
+    );
     let subtree = subtree_rollups(&all, &children_all);
     let mut out = Vec::new();
 
@@ -1729,7 +1790,12 @@ fn build_display_rows(
         if cat == ProcCategory::Unknown && members.is_empty() {
             continue;
         }
-        let children = display_children_map(&members, &grouping.category, &grouping.app_roots);
+        let children = display_children_map(
+            &members,
+            &grouping.category,
+            &grouping.app_roots,
+            &grouping.app_group_parent,
+        );
         let roots = tree_roots(&members, &children);
         // Native Task Manager's "Apps (N)" counts top-level app groups, while
         // Background/Windows counters count processes. This is why Brave (28)
@@ -2090,12 +2156,14 @@ fn derive_display_groups(all: &[&ProcessEntry]) -> DisplayGroups {
     if !all.iter().any(|p| p.has_window) {
         let category: HashMap<u32, ProcCategory> =
             all.iter().map(|p| (p.pid, p.category)).collect();
-        let mut app_roots: HashSet<u32> = all
-            .iter()
-            .copied()
-            .filter(|p| p.category == ProcCategory::App && p.app_root)
-            .map(|p| p.pid)
-            .collect();
+        let native_groups = native_app_groups(all, &category);
+        let mut app_roots = native_groups.roots;
+        app_roots.extend(
+            all.iter()
+                .copied()
+                .filter(|p| p.category == ProcCategory::App && p.app_root)
+                .map(|p| p.pid),
+        );
         if app_roots.is_empty() {
             for p in all
                 .iter()
@@ -2115,6 +2183,7 @@ fn derive_display_groups(all: &[&ProcessEntry]) -> DisplayGroups {
         return DisplayGroups {
             category,
             app_roots,
+            app_group_parent: native_groups.parent_by_pid,
         };
     }
 
@@ -2126,10 +2195,16 @@ fn derive_display_groups(all: &[&ProcessEntry]) -> DisplayGroups {
         .iter()
         .map(|p| {
             let system = p.category == ProcCategory::System || is_system_boundary(&p.name);
+            let native_app = p
+                .app_group
+                .as_deref()
+                .is_some_and(|group| !group.is_empty());
             (
                 p.pid,
                 if system {
                     ProcCategory::System
+                } else if p.has_window || native_app {
+                    ProcCategory::App
                 } else if p.category == ProcCategory::Unknown {
                     ProcCategory::Unknown
                 } else {
@@ -2138,6 +2213,7 @@ fn derive_display_groups(all: &[&ProcessEntry]) -> DisplayGroups {
             )
         })
         .collect();
+    let native_groups = native_app_groups(all, &category);
 
     let mut raw_children: HashMap<u32, Vec<&ProcessEntry>> = HashMap::new();
     for p in all {
@@ -2152,7 +2228,7 @@ fn derive_display_groups(all: &[&ProcessEntry]) -> DisplayGroups {
         }
     }
 
-    let mut app_roots = HashSet::new();
+    let mut app_roots = native_groups.roots.clone();
     for p in all.iter().copied().filter(|p| p.has_window) {
         if category.get(&p.pid) == Some(&ProcCategory::System) {
             continue;
@@ -2186,7 +2262,16 @@ fn derive_display_groups(all: &[&ProcessEntry]) -> DisplayGroups {
             }
             cur = parent;
         }
-        app_roots.insert(cur.pid);
+        let root = if p.app_group.is_some() {
+            native_groups
+                .root_by_pid
+                .get(&p.pid)
+                .copied()
+                .unwrap_or(cur.pid)
+        } else {
+            cur.pid
+        };
+        app_roots.insert(root);
     }
 
     // App roots own their helper descendants, except for shell roots that are
@@ -2220,6 +2305,7 @@ fn derive_display_groups(all: &[&ProcessEntry]) -> DisplayGroups {
     DisplayGroups {
         category: promote_busy_external_tasks(all, &by_pid, &raw_children, category, &app_roots),
         app_roots,
+        app_group_parent: native_groups.parent_by_pid,
     }
 }
 
@@ -2313,6 +2399,7 @@ fn promote_busy_external_tasks<'a>(
             // windowed processes are handled by plausibly_same_application
             // instead, which makes them their own app root.
             !p.has_window
+                && p.app_group.is_none()
                 && p.cpu_pct >= PROMOTE_CPU_PCT
                 && category.get(&p.pid) == Some(&ProcCategory::App)
                 && !app_roots.contains(&p.pid)
@@ -2331,6 +2418,7 @@ fn promote_busy_external_tasks<'a>(
                 // parent they surface as their own app root instead of a
                 // GUI window landing in Background.
                 if !kid.has_window
+                    && kid.app_group.is_none()
                     && category.get(&kid.pid) == Some(&ProcCategory::App)
                     && !app_roots.contains(&kid.pid)
                 {
@@ -2539,12 +2627,23 @@ fn display_children_map<'a>(
     list: &[&'a ProcessEntry],
     category: &HashMap<u32, ProcCategory>,
     app_roots: &HashSet<u32>,
+    app_group_parent: &HashMap<u32, u32>,
 ) -> HashMap<u32, Vec<&'a ProcessEntry>> {
     let by_pid: HashMap<u32, &ProcessEntry> = list.iter().map(|p| (p.pid, *p)).collect();
     let mut m: HashMap<u32, Vec<&ProcessEntry>> = HashMap::new();
     for p in list {
         let child_cat = category.get(&p.pid).copied().unwrap_or(p.category);
         if child_cat == ProcCategory::App && app_roots.contains(&p.pid) {
+            continue;
+        }
+        if child_cat == ProcCategory::App
+            && let Some(&root_pid) = app_group_parent.get(&p.pid)
+            && let Some(root) = by_pid.get(&root_pid).copied()
+            && category.get(&root.pid).copied() == Some(ProcCategory::App)
+        {
+            // A validated app scope/hint is stronger than an otherwise
+            // disconnected PPID: every member remains in the same app family.
+            m.entry(root.pid).or_default().push(*p);
             continue;
         }
         if let Some(ppid) = p.ppid
@@ -3261,6 +3360,74 @@ mod tests {
     }
 
     #[test]
+    fn mixed_xwayland_window_and_native_app_role_stay_apps_and_share_scope_family() {
+        let mut terminal = proc(10, None, "org.gnome.Terminal", ProcCategory::App);
+        terminal.has_window = true;
+        terminal.app_root = true;
+        terminal.app_group = Some("systemd:/user.slice/user-1000.slice/user@1000.service/app.slice/app-gnome-org.gnome.Terminal-10.scope".into());
+
+        let mut terminal_server = proc(11, Some(99), "gnome-terminal-server", ProcCategory::App);
+        terminal_server.has_window = false;
+        terminal_server.app_group = terminal.app_group.clone();
+
+        let mut shell = proc(12, Some(1), "bash", ProcCategory::App);
+        shell.has_window = false;
+        shell.app_group = terminal.app_group.clone();
+
+        let mut konsole = proc(20, None, "org.kde.konsole", ProcCategory::App);
+        konsole.has_window = false;
+        konsole.app_group = Some(
+            "systemd:/user.slice/user-1000.slice/user@1000.service/app.slice/app-org.kde.konsole-20.scope"
+                .into(),
+        );
+
+        let snap = snap_of(vec![terminal, terminal_server, shell, konsole]);
+        let rows = build_display_rows(&snap, "", 0, true, &HashSet::new(), &[false; 3]);
+        assert_eq!(
+            rows.iter().find_map(|row| match row {
+                DisplayRow::GroupHeader(0, count) => Some(*count),
+                _ => None,
+            }),
+            Some(2),
+            "the two app scopes remain two Apps"
+        );
+
+        let terminal_group = rows
+            .iter()
+            .find_map(|row| match row {
+                DisplayRow::Process(row) if row.pid == 10 && row.aggregate => Some(row),
+                _ => None,
+            })
+            .expect("native app scope family");
+        let mut family = terminal_group
+            .termination_targets
+            .iter()
+            .map(|identity| identity.pid)
+            .collect::<Vec<_>>();
+        family.sort_unstable();
+        assert_eq!(family, [10, 11, 12]);
+
+        let background_pids: Vec<u32> = rows
+            .iter()
+            .skip_while(|row| !matches!(row, DisplayRow::GroupHeader(1, _)))
+            .skip(1)
+            .take_while(|row| !matches!(row, DisplayRow::GroupHeader(..)))
+            .filter_map(|row| match row {
+                DisplayRow::Process(row) => Some(row.pid),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            background_pids.is_empty(),
+            "positive native app roles must not be demoted: {background_pids:?}"
+        );
+        assert!(rows.iter().any(|row| matches!(
+            row,
+            DisplayRow::Process(row) if row.pid == 20
+        )));
+    }
+
+    #[test]
     fn shell_launched_gui_is_not_folded_into_terminal_group() {
         let terminal = proc(10, None, "WindowsTerminal.exe", ProcCategory::App);
         let mut shell = proc(11, Some(10), "powershell.exe", ProcCategory::App);
@@ -3509,7 +3676,12 @@ mod tests {
         let snap = snap_of(vec![root, renderer, quiet]);
         let all: Vec<&ProcessEntry> = snap.processes.iter().collect();
         let grouping = derive_display_groups(&all);
-        let children = display_children_map(&all, &grouping.category, &grouping.app_roots);
+        let children = display_children_map(
+            &all,
+            &grouping.category,
+            &grouping.app_roots,
+            &grouping.app_group_parent,
+        );
         let st = subtree_rollups(&all, &children);
         assert!(st.efficiency(1), "head inherits its renderer's leaf");
         assert!(st.efficiency(2));
@@ -3536,7 +3708,12 @@ mod tests {
         let snap = snap_of(vec![root, renderer, quiet]);
         let all: Vec<&ProcessEntry> = snap.processes.iter().collect();
         let grouping = derive_display_groups(&all);
-        let children = display_children_map(&all, &grouping.category, &grouping.app_roots);
+        let children = display_children_map(
+            &all,
+            &grouping.category,
+            &grouping.app_roots,
+            &grouping.app_group_parent,
+        );
         let st = subtree_rollups(&all, &children);
         assert_eq!(
             st.status(1),
@@ -3603,7 +3780,12 @@ mod tests {
 
         let all = [&younger_recycled_parent, &worker_a, &worker_b];
         let grouping = derive_display_groups(&all);
-        let children = display_children_map(&all, &grouping.category, &grouping.app_roots);
+        let children = display_children_map(
+            &all,
+            &grouping.category,
+            &grouping.app_roots,
+            &grouping.app_group_parent,
+        );
         assert!(
             !children.contains_key(&10),
             "display_children_map must reject a younger recycled parent PID"
@@ -3644,6 +3826,7 @@ mod tests {
             &control_all,
             &control_grouping.category,
             &control_grouping.app_roots,
+            &control_grouping.app_group_parent,
         );
         assert_eq!(
             control_children.get(&10).map(Vec::len),

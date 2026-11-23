@@ -1,6 +1,6 @@
 # Known and Accepted Debt
 
-Last verified: 2026-11-23 (Linux privileged-action residuals)
+Last verified: 2026-11-23 (Linux desktop-role and privileged-action residuals)
 
 Primary sources:
 - `AGENTS.md`
@@ -486,6 +486,16 @@ remain follow-up rather than being simulated in headless tests:
   avoids guessing from usernames, but some systemd user-manager application
   scopes under `user@UID.service` have no session component and therefore do
   not contribute to session rollups.
+- **Native-Wayland App/Background roles are launcher evidence, not compositor
+  facts.** A standard user `app.slice` unit or a complete trusted
+  per-process Flatpak/Snap/GIO/BAMF hint can identify an application family,
+  but native Wayland still has no portable whole-window inventory or focus
+  signal. Applications outside those conventions, environment reads blocked
+  by procfs policy, malformed/ambiguous cgroups and exact X11 no-window
+  evidence can leave a process Unknown or Background rather than recovered.
+  GNOME Shell.Introspect (sender-allowlisted) and interactive KWin APIs are
+  deliberately not used. WSL without a relevant systemd user hierarchy also
+  stays Unknown unless X11 ownership supplies independent evidence.
 - **Linux-only tests are still not executed by the Windows host gate.** The
   final gate cross-checks the non-host targets, which type-checks Linux tests
   only if the test targets themselves are included; parser/live-procfs

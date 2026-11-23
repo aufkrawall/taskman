@@ -2,7 +2,9 @@
 //!
 //! Session enumeration uses `loginctl` only when systemd is the running
 //! service manager. Disconnect/logoff controls remain unavailable: safely
-//! terminating a session is not a read-only metadata operation.
+//! terminating a session is not a read-only metadata operation. Per-process
+//! session IDs come from the same validated cgroup read used by
+//! `desktop_session`, so the collector does not reread procfs for them.
 
 use std::path::Path;
 use std::process::{Child, Command, Output};
@@ -258,24 +260,9 @@ fn map_state(state: &str) -> UserSessionState {
     }
 }
 
-/// Exact `session-<id>.scope` cgroup membership is the reliable process →
-/// logind-session join. `/proc/<pid>/stat` field 6 is an unrelated POSIX
-/// session id and must not be used for the Users page.
-pub fn process_session_id(pid: u32) -> Option<u32> {
-    std::fs::read_to_string(format!("/proc/{pid}/cgroup"))
-        .ok()
-        .and_then(|text| parse_session_scope(&text))
-}
-
-fn parse_session_scope(cgroup: &str) -> Option<u32> {
-    cgroup.lines().find_map(|line| {
-        line.split('/').find_map(|component| {
-            let id = component.strip_prefix("session-")?.strip_suffix(".scope")?;
-            id.parse().ok()
-        })
-    })
-}
-
+/// Wall-clock boot time used to turn logind's monotonic login timestamp into
+/// the model's Unix timestamp. Process-to-session joins are collected from the
+/// same validated cgroup evidence used for desktop-role classification.
 fn system_boot_epoch_s() -> Option<u64> {
     let stat = std::fs::read_to_string("/proc/stat").ok()?;
     stat.lines().find_map(|line| {
@@ -366,26 +353,6 @@ TimestampMonotonic=1234567890
         );
         assert_eq!(logon_epoch_s(Some(1_700_000_000), Some(0)), None);
         assert_eq!(logon_epoch_s(None, Some(1)), None);
-    }
-
-    #[test]
-    fn process_session_uses_an_exact_systemd_scope_component() {
-        let cgroup = "\
-0::/user.slice/user-1000.slice/session-12.scope
-";
-        assert_eq!(parse_session_scope(cgroup), Some(12));
-        assert_eq!(
-            parse_session_scope("0::/user.slice/user-1000.slice/app.slice/session-7.scope/app"),
-            Some(7)
-        );
-        assert_eq!(
-            parse_session_scope("0::/user.slice/user-1000.slice/session-12.scope.extra"),
-            None
-        );
-        assert_eq!(
-            parse_session_scope("1:name=systemd:/user.slice/user-1000.slice/session-9.scope"),
-            Some(9)
-        );
     }
 
     #[test]

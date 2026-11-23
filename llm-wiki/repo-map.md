@@ -52,9 +52,11 @@ platform boundary (`tm-core` ← `tm-platform` ← `tm-app` / `tm-service`), and
     outlive the process. Elevated installer helper remains
     memory/console-only), `classify.rs`
     (conservative Apps/Background/System classification: kernel names + core
-    OS images + `IsProcessCritical`; `is_core_os_image` is the shared
-    core-image list used by the sampler's tree boundaries and the Processes
-    page), `i18n.rs` (DE/EN keys macro), `format.rs`, `mock.rs`.
+    OS images + `IsProcessCritical`, then observed-window or explicit
+    platform desktop-role evidence in precedence order;
+    `is_core_os_image` is the shared core-image list used by the sampler's tree
+    boundaries and the Processes page), `i18n.rs` (DE/EN keys macro),
+    `format.rs`, `mock.rs`.
 - `crates/tm-platform`
   - OS collectors/actions behind traits (`actions.rs`, including explicit
     native-shell, elevation, login-start, and process-tree capabilities;
@@ -186,8 +188,18 @@ platform boundary (`tm-core` ← `tm-platform` ← `tm-app` / `tm-service`), and
     thread: EWMH client lists are merged, X-Resource supplies local client
     PIDs where available, machine-verified `_NET_WM_PID` is the fallback, and
     only fresh complete observations may prove a process windowless. Native
-    Wayland clients remain unobservable; XWayland clients are the available
-    X11 subset.
+    Wayland has no portable whole-window inventory, so XWayland clients are
+    the available X11 subset. `linux/desktop_session.rs` supplies the
+    independent native-Wayland fallback: it selects one unambiguous systemd
+    cgroup hierarchy, classifies validated user `app.slice` units as Apps and
+    background/session/user-manager membership as Background, recognizes
+    `system.slice`/`init.scope` as System, and may read a complete capped
+    per-process environ only for user-session processes to recover trusted
+    Flatpak/Snap/GIO/BAMF launcher identity. It also reuses that cgroup read
+    for exact logind `session-N.scope` association. Session/unit paths remain
+    stable family keys; malformed, escaped, ambiguous or unrelated evidence
+    stays Unknown. This is launcher metadata, not compositor focus, and WSL
+    without a relevant systemd user hierarchy also keeps the Unknown fallback.
     Linux privileged execution adds `linux/polkit.rs` (direct-first escalation,
     trusted `systemctl` execution through Polkit, and explicit fail-closed
     portable-install behavior),
@@ -454,7 +466,11 @@ platform boundary (`tm-core` ← `tm-platform` ← `tm-app` / `tm-service`), and
   Windows-process membership is NOT inherited from Session 0 or system ancestry:
   it requires a core OS image name or `IsProcessCritical`, so third-party SCM
   services and Microsoft background machinery (WMI Provider Host, SmartScreen,
-  shell brokers, windowless user tools) remain Background.
+  shell brokers, windowless user tools) remain Background. Positive native
+  desktop roles are carried by `ProcessEntry::app_group`; when any real window
+  exists, the page seeds App roots from both windows and those roles, keeps
+  same-group members together even without PPID edges, and never merges two
+  unrelated scopes merely because both use `app.slice`.
   Expandable application/family rows are virtual presentation parents: the
   virtual row owns the aggregate, while expansion reveals every concrete member
   (including the former head/root) as a child with only its own metrics. Flat

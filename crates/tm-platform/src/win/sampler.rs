@@ -2504,6 +2504,7 @@ fn refine_categories_and_group_apps(processes: &mut [ProcessEntry], window_scan_
             has_window,
             critical: p.critical,
             windows_owned,
+            desktop_role: None,
         });
     }
 

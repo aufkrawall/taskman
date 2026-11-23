@@ -106,6 +106,7 @@ impl SystemCollector for MacCollector {
                 has_window: None,
                 critical: None,
                 windows_owned: None,
+                desktop_role: None,
             });
 
             let du = p.disk_usage();

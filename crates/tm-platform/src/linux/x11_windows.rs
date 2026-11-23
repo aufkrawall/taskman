@@ -17,7 +17,9 @@
 //! inventory, so every XWayland observation remains partial. Missing or
 //! malformed properties and bounded-budget truncation also produce partial
 //! coverage; callers must then keep unobserved window ownership unknown
-//! instead of turning it into a false "windowless" fact.
+//! instead of turning it into a false "windowless" fact. Native-Wayland app
+//! roles are instead supplied separately by `desktop_session` from systemd
+//! cgroup and capped per-process launcher evidence.
 //!
 //! The collector reuses one connection and atom set, reconnecting with a
 //! short backoff. It rejects remote displays (which could block the sampling

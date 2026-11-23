@@ -1,6 +1,6 @@
 //! Process classification into Windows-Task-Manager-like groups: Apps /
-//! Background / System, plus Unknown when window ownership is unavailable.
-//! Pure logic, unit-tested.
+//! Background / System, plus Unknown when the platform cannot supply positive
+//! ownership or desktop-role evidence. Pure logic, unit-tested.
 //!
 //! The native rule is deliberately conservative (Raymond Chen, "How does
 //! Task Manager categorize processes as App, Background Process, or Windows
@@ -92,6 +92,18 @@ pub fn is_core_os_image(name: &str) -> bool {
     matches_core(&normalize(name))
 }
 
+/// Positive desktop-session role evidence supplied by the platform.
+///
+/// This is deliberately only a role, not a window inventory. Linux derives it
+/// from validated systemd cgroup membership and conservative per-process
+/// desktop-launch metadata; native Wayland has no portable whole-window list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DesktopRoleEvidence {
+    App,
+    Background,
+    System,
+}
+
 /// Classification input gathered from a snapshot's raw fields.
 #[derive(Debug, Clone)]
 pub struct ClassifyInput<'a> {
@@ -110,8 +122,15 @@ pub struct ClassifyInput<'a> {
     /// Windows process). `None` = metadata unavailable, so a known core name
     /// is trusted; `Some(false)` rejects the name match.
     pub windows_owned: Option<bool>,
+    /// Positive desktop-session role evidence. `None` means the platform has
+    /// no authoritative role for this process, never that it is windowless.
+    pub desktop_role: Option<DesktopRoleEvidence>,
 }
 
+/// Precedence: hard System evidence, an observed window, complete no-window
+/// evidence, positive desktop App evidence, positive desktop Background
+/// evidence, then Unknown. A missing window observation is never a negative
+/// window fact.
 pub fn classify(input: ClassifyInput<'_>) -> ProcCategory {
     let name = normalize(input.name);
 
@@ -127,10 +146,21 @@ pub fn classify(input: ClassifyInput<'_>) -> ProcCategory {
         return ProcCategory::System;
     }
 
+    // system.slice/init.scope membership is positive system evidence. It
+    // must win over a window: a system service may own a window without
+    // becoming an application.
+    if input.desktop_role == Some(DesktopRoleEvidence::System) {
+        return ProcCategory::System;
+    }
+
     match input.has_window {
         Some(true) => ProcCategory::App,
         Some(false) => ProcCategory::Background,
-        None => ProcCategory::Unknown,
+        None => match input.desktop_role {
+            Some(DesktopRoleEvidence::App) => ProcCategory::App,
+            Some(DesktopRoleEvidence::Background) => ProcCategory::Background,
+            Some(DesktopRoleEvidence::System) | None => ProcCategory::Unknown,
+        },
     }
 }
 
@@ -151,6 +181,7 @@ mod tests {
             has_window: Some(has_window),
             critical,
             windows_owned,
+            desktop_role: None,
         })
     }
 
@@ -225,9 +256,108 @@ mod tests {
                 has_window: None,
                 critical: None,
                 windows_owned: None,
+                desktop_role: None,
             }),
             ProcCategory::Unknown
         );
+    }
+
+    #[test]
+    fn desktop_roles_classify_only_when_window_evidence_is_absent() {
+        let category = |has_window, desktop_role| {
+            classify(ClassifyInput {
+                pid: 3000,
+                name: "desktop-app",
+                has_window,
+                critical: None,
+                windows_owned: None,
+                desktop_role,
+            })
+        };
+        assert_eq!(
+            category(None, Some(DesktopRoleEvidence::App)),
+            ProcCategory::App
+        );
+        assert_eq!(
+            category(None, Some(DesktopRoleEvidence::Background)),
+            ProcCategory::Background
+        );
+        assert_eq!(
+            category(Some(true), Some(DesktopRoleEvidence::Background)),
+            ProcCategory::App
+        );
+        assert_eq!(
+            category(Some(false), Some(DesktopRoleEvidence::App)),
+            ProcCategory::Background
+        );
+    }
+
+    #[test]
+    fn system_role_wins_over_window_evidence() {
+        let category = |has_window, desktop_role| {
+            classify(ClassifyInput {
+                pid: 3000,
+                name: "desktop-infrastructure",
+                has_window,
+                critical: None,
+                windows_owned: None,
+                desktop_role,
+            })
+        };
+        assert_eq!(
+            category(Some(true), Some(DesktopRoleEvidence::System)),
+            ProcCategory::System
+        );
+        assert_eq!(
+            category(Some(false), Some(DesktopRoleEvidence::System)),
+            ProcCategory::System
+        );
+        assert_eq!(
+            classify(ClassifyInput {
+                pid: 3000,
+                name: "svchost.exe",
+                has_window: Some(true),
+                critical: None,
+                windows_owned: Some(true),
+                desktop_role: Some(DesktopRoleEvidence::App),
+            }),
+            ProcCategory::System
+        );
+    }
+
+    #[test]
+    fn classification_precedence_is_system_window_negative_app_background_unknown() {
+        let category = |has_window, desktop_role| {
+            classify(ClassifyInput {
+                pid: 3000,
+                name: "desktop-process",
+                has_window,
+                critical: None,
+                windows_owned: None,
+                desktop_role,
+            })
+        };
+        assert_eq!(
+            category(None, Some(DesktopRoleEvidence::System)),
+            ProcCategory::System
+        );
+        assert_eq!(
+            category(Some(true), Some(DesktopRoleEvidence::App)),
+            ProcCategory::App
+        );
+        assert_eq!(
+            category(Some(false), Some(DesktopRoleEvidence::App)),
+            ProcCategory::Background
+        );
+        assert_eq!(
+            category(None, Some(DesktopRoleEvidence::App)),
+            ProcCategory::App
+        );
+        assert_eq!(
+            category(None, Some(DesktopRoleEvidence::Background)),
+            ProcCategory::Background
+        );
+        assert_eq!(category(None, None), ProcCategory::Unknown);
     }
 
     #[test]

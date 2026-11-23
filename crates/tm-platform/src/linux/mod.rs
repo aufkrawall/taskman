@@ -1,8 +1,10 @@
-//! Linux backend: sysinfo + procfs/sysfs + systemd + XDG autostart + X11/EWMH.
+//! Linux backend: sysinfo + procfs/sysfs + systemd desktop roles + XDG
+//! autostart + X11/EWMH window evidence.
 
 pub mod activation;
 mod autostart;
 mod cpu_stat;
+mod desktop_session;
 mod diskstats;
 mod drm;
 mod launch;
@@ -102,9 +104,10 @@ impl SystemCollector for LinuxCollector {
             .and_then(|text| self.cpu_stats.sample(text));
 
         // EWMH makes the X11 client inventory available when DISPLAY is
-        // usable. Native Wayland clients have no portable equivalent, so a
-        // Wayland session observes at most its XWayland clients; it never
-        // invents owners for the remainder.
+        // usable. Native Wayland has no portable whole-window inventory, so a
+        // Wayland session observes at most its XWayland clients. Per-process
+        // systemd desktop-role evidence below supplies the native-Wayland
+        // fallback without inventing window facts.
         let window_observation = self.window_observer.observe();
 
         let n_procs = self
@@ -137,6 +140,10 @@ impl SystemCollector for LinuxCollector {
                 .get(&pid_u)
                 .copied()
                 .filter(|&before| linux_proc_start_ticks(pid_u) == Some(before));
+            let desktop_evidence = boot_start_ticks
+                .map_or_else(desktop_session::DesktopEvidence::default, |ticks| {
+                    desktop_session::inspect(pid_u, ticks)
+                });
             let has_window = window_evidence(
                 window_observation.owners.get(&pid_u).copied(),
                 boot_start_ticks,
@@ -148,6 +155,7 @@ impl SystemCollector for LinuxCollector {
                 has_window,
                 critical: None,
                 windows_owned: None,
+                desktop_role: desktop_evidence.role,
             });
 
             let du = p.disk_usage();
@@ -174,6 +182,11 @@ impl SystemCollector for LinuxCollector {
             entry.disk_read_total = du.total_read_bytes;
             entry.disk_write_total = du.total_written_bytes;
             entry.has_window = has_window == Some(true);
+            entry.app_group = if category == ProcCategory::App {
+                desktop_evidence.app_group.clone()
+            } else {
+                None
+            };
             entry.exe_path = p.exe().map(|e| e.to_path_buf());
             entry.user = p
                 .user_id()
@@ -183,7 +196,7 @@ impl SystemCollector for LinuxCollector {
                 _ => ProcStatus::Running,
             };
             if sessions_available {
-                entry.session_id = sessions::process_session_id(pid_u);
+                entry.session_id = desktop_evidence.session_id;
             }
             // sysinfo's task set excludes the leader; Windows' count includes
             // it, so add the main thread back for parity.
@@ -194,6 +207,7 @@ impl SystemCollector for LinuxCollector {
             entry.elevated = entry.user.as_deref().map(|u| u == "root");
             processes.push(entry);
         }
+        mark_desktop_app_roots(&mut processes);
 
         let diskstats = diskstats::read();
         let mut disks = Vec::new();
@@ -346,6 +360,31 @@ fn username_for_uid(users: &sysinfo::Users, uid: &sysinfo::Uid) -> Option<String
         .iter()
         .find(|u| u.id() == uid)
         .map(|u| u.name().to_string())
+}
+
+fn mark_desktop_app_roots(processes: &mut [ProcessEntry]) {
+    let mut groups: HashMap<String, Vec<usize>> = HashMap::new();
+    for (index, process) in processes.iter().enumerate() {
+        if process.category != ProcCategory::App {
+            continue;
+        }
+        if let Some(group) = process
+            .app_group
+            .as_deref()
+            .filter(|group| !group.is_empty())
+        {
+            groups.entry(group.to_owned()).or_default().push(index);
+        }
+    }
+    for members in groups.values() {
+        let Some(&root) = members.iter().min_by_key(|&&index| {
+            let process = &processes[index];
+            (process.creation_identity().unwrap_or(i64::MAX), process.pid)
+        }) else {
+            continue;
+        };
+        processes[root].app_root = true;
+    }
 }
 
 fn proc_meminfo_field(field: &str) -> u64 {
@@ -1316,6 +1355,61 @@ mod tests {
         assert_eq!(window_evidence(None, Some(7), Complete), Some(false));
         assert_eq!(window_evidence(None, Some(7), Partial), None);
         assert_eq!(window_evidence(None, Some(7), Unavailable), None);
+    }
+
+    #[test]
+    fn app_role_survives_partial_or_unavailable_x11_coverage() {
+        use x11_windows::WindowCoverage::{Complete, Partial, Unavailable};
+        for coverage in [Partial, Unavailable] {
+            let has_window = window_evidence(None, Some(7), coverage);
+            assert_eq!(has_window, None);
+            assert_eq!(
+                classify::classify(classify::ClassifyInput {
+                    pid: 3000,
+                    name: "gnome-terminal",
+                    has_window,
+                    critical: None,
+                    windows_owned: None,
+                    desktop_role: Some(classify::DesktopRoleEvidence::App),
+                }),
+                ProcCategory::App
+            );
+        }
+        let has_window = window_evidence(None, Some(7), Complete);
+        assert_eq!(
+            classify::classify(classify::ClassifyInput {
+                pid: 3000,
+                name: "gnome-terminal",
+                has_window,
+                critical: None,
+                windows_owned: None,
+                desktop_role: Some(classify::DesktopRoleEvidence::App),
+            }),
+            ProcCategory::Background
+        );
+    }
+
+    #[test]
+    fn desktop_app_roots_are_stable_within_one_scope_and_distinct_between_scopes() {
+        let mut first = ProcessEntry::new(100, "app");
+        first.category = ProcCategory::App;
+        first.boot_start_ticks = Some(10);
+        first.app_group = Some("scope-a".into());
+        let mut second = ProcessEntry::new(101, "helper");
+        second.category = ProcCategory::App;
+        second.boot_start_ticks = Some(20);
+        second.app_group = Some("scope-a".into());
+        let mut other = ProcessEntry::new(200, "other");
+        other.category = ProcCategory::App;
+        other.boot_start_ticks = Some(30);
+        other.app_group = Some("scope-b".into());
+        let mut processes = vec![second, other, first];
+
+        mark_desktop_app_roots(&mut processes);
+
+        assert!(processes.iter().any(|p| p.pid == 100 && p.app_root));
+        assert!(!processes.iter().any(|p| p.pid == 101 && p.app_root));
+        assert!(processes.iter().any(|p| p.pid == 200 && p.app_root));
     }
 
     #[test]

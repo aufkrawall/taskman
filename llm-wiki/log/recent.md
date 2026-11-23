@@ -1,3 +1,37 @@
+## 2026-11-23 - Linux native-Wayland process classification (static implementation)
+
+- Added `linux/desktop_session.rs` to derive positive Apps/Background/System
+  roles from one unambiguous systemd cgroup hierarchy instead of requiring
+  EWMH window ownership. Standard user `app.slice` scope/service units are
+  Apps; `background.slice`, `session.slice`, direct `session-N.scope`
+  descendants and other validated user-manager membership are Background;
+  `system.slice`/`init.scope` are System. Malformed, escaped, mismatched,
+  duplicate-hierarchy, unrelated or unreadable evidence stays Unknown.
+- User-session processes without an app unit may use a complete 64 KiB-capped
+  `/proc/<pid>/environ` read for only Flatpak, Snap, GIO and BAMF launch
+  metadata. `XDG_CURRENT_DESKTOP` and other session-wide values are ignored.
+- Extended `tm-core::classify::ClassifyInput` with
+  `DesktopRoleEvidence` and established the precedence System > observed
+  window > complete no-window > App role > Background role > Unknown.
+- Added `ProcessEntry::app_group`, stable Linux scope/hint family keys, and
+  oldest-member `app_root` selection. The Processes presentation now seeds
+  App roots from both windows and native roles and synthesizes family edges
+  for disconnected members of the same validated unit, so mixed
+  XWayland/native sessions preserve native Apps and keep unrelated app scopes
+  separate.
+- Evidence reads are bracketed by the refresh-validated `boot_start_ticks`
+  generation. A PID that disappears or is reused during cgroup/environ
+  collection loses the role, session and group evidence.
+- Added pure parser, environment, precedence, app-root and mixed-window/UI
+  regressions. Per the task's explicit prohibition, no Cargo/rustc test,
+  clippy or build run was performed; only formatting and static/secret checks
+  were possible.
+- Residual: this identifies launcher-managed applications, not an exact
+  compositor focus/window inventory. GNOME Shell.Introspect and interactive
+  KWin enumeration remain intentionally unused. WSL without the relevant
+  systemd user hierarchy keeps the Unknown fallback unless X11 supplies
+  independent window ownership.
+
 ## 2026-11-23 - Final Linux parity review corrections
 
 - Removed two integration blockers: the duplicate `command_line` module and

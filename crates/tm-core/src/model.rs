@@ -426,8 +426,9 @@ pub enum ProcCategory {
     App,
     Background,
     System,
-    /// Window ownership could not be observed, so the process cannot be
-    /// classified as an App or Background process without inventing evidence.
+    /// Neither window ownership nor an authoritative desktop role could be
+    /// observed, so the process cannot be classified without inventing
+    /// evidence.
     Unknown,
 }
 
@@ -700,6 +701,11 @@ pub struct ProcessEntry {
     pub has_window: bool,
     /// Topmost process of an app subtree (Task Manager's "Apps" root rows).
     pub app_root: bool,
+    /// Stable platform-provided identity shared by one semantic application
+    /// family. Linux uses validated systemd app scope/service paths, or a
+    /// conservative per-process desktop-launch hint as a fallback.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub app_group: Option<String>,
     /// Runs elevated (admin/root) when determinable.
     pub elevated: Option<bool>,
     /// 32-bit process on a 64-bit OS (Windows WOW64).
@@ -799,6 +805,7 @@ impl ProcessEntry {
             command_line: None,
             has_window: false,
             app_root: false,
+            app_group: None,
             elevated: None,
             wow64: None,
             service_name: None,
