@@ -226,17 +226,40 @@ mod tests {
             (0, "VideoEncode".into(), 12.0),
             (1, "3D".into(), 5.0),
         ];
-        let win = vec![pt(0), busy, pt(1000)];
+        let win = vec![pt(0), busy.clone(), pt(1000)];
 
-        assert_eq!(
-            gpu_engine_series(&win, "0", "VideoEncode"),
-            vec![0.0, 12.0, 0.0]
-        );
-        assert_eq!(gpu_engine_series(&win, "0", "3D"), vec![0.0, 90.0, 0.0]);
+        let video = gpu_engine_series(&win, "0", "VideoEncode");
+        assert!(video[0].is_nan());
+        assert_eq!(video[1], 12.0);
+        assert!(video[2].is_nan());
+        let three_d = gpu_engine_series(&win, "0", "3D");
+        assert!(three_d[0].is_nan());
+        assert_eq!(three_d[1], 90.0);
+        assert!(three_d[2].is_nan());
         // Another adapter's engine of the same name must not bleed in.
-        assert_eq!(gpu_engine_series(&win, "1", "3D"), vec![0.0, 5.0, 0.0]);
-        // An engine this adapter never reported is a flat, honest zero.
-        assert_eq!(gpu_engine_series(&win, "0", "Copy"), vec![0.0, 0.0, 0.0]);
+        let other = gpu_engine_series(&win, "1", "3D");
+        assert!(other[0].is_nan());
+        assert_eq!(other[1], 5.0);
+        assert!(other[2].is_nan());
+        // Once the adapter itself supplied engine counters, an engine it did
+        // not report is a measured idle zero.
+        let copy = gpu_engine_series(&win, "0", "Copy");
+        assert!(copy[0].is_nan());
+        assert_eq!(copy[1], 0.0);
+        assert!(copy[2].is_nan());
+
+        // A present adapter whose PDH engine sample failed is unknown, not a
+        // fabricated zero.
+        let mut unavailable = pt(1_500);
+        unavailable.gpus = vec![crate::app::GpuHistoryPoint {
+            id: 0,
+            util_pct_available: false,
+            ..Default::default()
+        }];
+        let win = vec![busy, unavailable];
+        let unavailable = gpu_engine_series(&win, "0", "Copy");
+        assert_eq!(unavailable[0], 0.0);
+        assert!(unavailable[1].is_nan());
     }
 
     /// An engine that has gone idle drops out of the snapshot's truncated,
@@ -1124,6 +1147,12 @@ fn net_series(win: &[HistoryPoint], key: &str, idx: usize) -> Vec<f64> {
 fn gpu_engine_series(win: &[HistoryPoint], key: &str, engine: &str) -> Vec<f64> {
     win.iter()
         .map(|h| {
+            let Some(adapter) = h.gpus.iter().find(|point| point.id.to_string() == key) else {
+                return f64::NAN;
+            };
+            if !adapter.util_pct_available {
+                return f64::NAN;
+            }
             h.gpu_engines
                 .iter()
                 .filter(|(id, name, _)| id.to_string() == key && name == engine)
@@ -2710,11 +2739,12 @@ fn gpu_engine_chart_spec(
             )],
         },
         engine => {
-            let pct = gpu
-                .engines
-                .iter()
-                .find(|e| e.name == engine)
-                .map_or(0.0, |e| e.util_pct);
+            let pct = gpu.util_pct_available.then(|| {
+                gpu.engines
+                    .iter()
+                    .find(|e| e.name == engine)
+                    .map_or(0.0, |e| e.util_pct)
+            });
             let label = engine_label(engine);
             let series = vec![MultiSeries::new(
                 label.clone(),
@@ -2724,7 +2754,7 @@ fn gpu_engine_chart_spec(
             GpuEngineChartSpec {
                 resolved_mode,
                 title: label,
-                right_pct: format::format_pct_hdr(pct),
+                right_pct: pct.map_or_else(|| "\u{2014}".to_string(), format::format_pct_hdr),
                 series,
             }
         }

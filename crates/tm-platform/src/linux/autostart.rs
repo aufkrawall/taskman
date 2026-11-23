@@ -61,9 +61,36 @@ fn set_enabled_at(config_home: &Path, executable: &Path, enabled: bool) -> Resul
         .ok_or_else(|| TmError::platform("XDG autostart", "entry has no parent directory"))?;
     fs::create_dir_all(parent)
         .map_err(|error| TmError::platform("create XDG autostart directory", error.to_string()))?;
+    validate_autostart_directory(parent)?;
     let contents = desktop_entry(executable)?;
     write_owned_entry(&path, &contents)?;
     tracing::info!(?path, "enabled self-owned XDG autostart entry");
+    Ok(())
+}
+
+fn validate_autostart_directory(path: &Path) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|error| TmError::platform("inspect XDG autostart directory", error.to_string()))?;
+    if !metadata.file_type().is_dir() {
+        return Err(TmError::platform(
+            "XDG autostart",
+            "autostart path is not a real directory",
+        ));
+    }
+    if metadata.uid() != unsafe { libc::geteuid() } {
+        return Err(TmError::platform(
+            "XDG autostart",
+            "autostart directory is owned by another user",
+        ));
+    }
+    if metadata.mode() & 0o022 != 0 {
+        return Err(TmError::platform(
+            "XDG autostart",
+            "autostart directory is writable by another user",
+        ));
+    }
     Ok(())
 }
 
@@ -166,41 +193,30 @@ fn quote_exec_arg(argument: &str) -> std::result::Result<String, String> {
 }
 
 fn write_owned_entry(path: &Path, contents: &str) -> Result<()> {
-    let (mut file, created) = match OpenOptions::new()
+    let mut existing = match OpenOptions::new()
         .read(true)
         .write(true)
-        .create_new(true)
-        .mode(0o600)
         .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK)
         .open(path)
     {
-        Ok(file) => (file, true),
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-            let file = OpenOptions::new()
-                .read(true)
-                .write(true)
-                .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK)
-                .open(path)
-                .map_err(|error| {
-                    TmError::platform("open XDG autostart entry", error.to_string())
-                })?;
-            (file, false)
-        }
+        Ok(file) => Some(file),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
         Err(error) => {
             return Err(TmError::platform(
-                "create XDG autostart entry",
+                "open XDG autostart entry",
                 error.to_string(),
             ));
         }
     };
-    validate_owned_regular_file(&file)?;
-
-    if file.metadata().map_err(TmError::from)?.mode() & 0o7777 != 0o600 {
-        file.set_permissions(fs::Permissions::from_mode(0o600))
-            .map_err(|error| TmError::platform("secure XDG autostart entry", error.to_string()))?;
-    }
-    if !created {
-        let existing = read_entry(&mut file)?;
+    if let Some(file) = existing.as_mut() {
+        validate_owned_regular_file(file)?;
+        if file.metadata().map_err(TmError::from)?.mode() & 0o7777 != 0o600 {
+            file.set_permissions(fs::Permissions::from_mode(0o600))
+                .map_err(|error| {
+                    TmError::platform("secure XDG autostart entry", error.to_string())
+                })?;
+        }
+        let existing = read_entry(file)?;
         if !is_owned_entry(&existing) {
             return Err(TmError::platform(
                 "XDG autostart",
@@ -236,7 +252,11 @@ fn write_owned_entry(path: &Path, contents: &str) -> Result<()> {
             .open(&temp_path)?;
         temp.write_all(contents.as_bytes())?;
         temp.sync_all()?;
-        fs::rename(&temp_path, path)?;
+        if existing.is_some() {
+            fs::rename(&temp_path, path)?;
+        } else {
+            rename_noreplace(&temp_path, path)?;
+        }
         Ok(())
     })();
     if let Err(error) = write_result {
@@ -260,6 +280,31 @@ fn write_owned_entry(path: &Path, contents: &str) -> Result<()> {
         ));
     }
     Ok(())
+}
+
+fn rename_noreplace(from: &Path, to: &Path) -> std::io::Result<()> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let from = CString::new(from.as_os_str().as_bytes())
+        .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+    let to = CString::new(to.as_os_str().as_bytes())
+        .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+    let result = unsafe {
+        libc::syscall(
+            libc::SYS_renameat2,
+            libc::AT_FDCWD,
+            from.as_ptr(),
+            libc::AT_FDCWD,
+            to.as_ptr(),
+            libc::RENAME_NOREPLACE,
+        )
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
 }
 
 fn remove_owned_entry(path: &Path) -> Result<()> {
@@ -365,6 +410,7 @@ fn is_owned_entry(text: &str) -> bool {
 mod tests {
     use super::*;
     use std::os::unix::fs::MetadataExt as _;
+    use std::os::unix::fs::PermissionsExt as _;
 
     fn test_config(name: &str) -> PathBuf {
         let path = std::env::temp_dir().join(format!(
@@ -450,6 +496,21 @@ mod tests {
             fs::read_to_string(&target).unwrap(),
             "[Desktop Entry]\nName=Elsewhere\n"
         );
+        let _ = fs::remove_dir_all(config);
+    }
+
+    #[test]
+    fn failed_first_write_does_not_leave_a_placeholder_entry() {
+        let config = test_config("failed-first-write");
+        let dir = config.join("autostart");
+        fs::create_dir(&dir).unwrap();
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o500)).unwrap();
+        let path = dir.join(ENTRY_FILE_NAME);
+
+        assert!(set_enabled_at(&config, Path::new("/opt/taskman"), true).is_err());
+        assert!(!path.exists());
+
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
         let _ = fs::remove_dir_all(config);
     }
 }

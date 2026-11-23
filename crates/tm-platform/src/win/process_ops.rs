@@ -2310,6 +2310,10 @@ pub fn is_elevated() -> bool {
     token_security(std::process::id()).elevated.unwrap_or(false)
 }
 
+pub fn elevation_status() -> Option<bool> {
+    token_security(std::process::id()).elevated
+}
+
 pub fn run_new_task(command_line: &str, elevate: bool) -> Result<()> {
     let (file, params) = split_command(command_line);
     if file.is_empty() {

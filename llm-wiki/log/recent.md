@@ -1,3 +1,38 @@
+## 2026-11-23 - Final Linux parity review corrections
+
+- Removed two integration blockers: the duplicate `command_line` module and
+  duplicate `StartWithSystem` i18n key.
+- Wheel repainting now has one end-to-end cadence: egui wheel-only input and
+  smoothing use a minimum-delay repaint request, expired trailing tokens
+  recover, zero-delta Start/End/Cancel phases schedule delivery, and a
+  Start+Move+End batch preserves its scroll distance. Mixed modified wheel
+  events now separate scroll and zoom instead of applying the last modifier
+  to the whole batch.
+- Linux activation acknowledgement now requires a post-request UI pass plus
+  observed `minimized=false` and `focused=true`. X11/Wayland is detected from
+  the actual raw window handle; unsupported or unconfirmed focus rejects the
+  handoff before the waiting launch's deadline so it opens independently
+  rather than receiving a false success.
+- Windows unavailable GPU memory is now represented by per-field availability
+  flags, and engine history turns an unavailable PDH tick into a chart gap.
+  Windows window classification also keeps absence Unknown when `EnumWindows`
+  did not complete.
+- Linux `loginctl` has one bounded deadline across list/property probes and a
+  cooldown instead of a permanent disable latch. Services now require a
+  trusted root-owned systemctl path, and session/service/startup query errors
+  remain visible instead of becoming empty successful tables.
+- X11 attribute errors downgrade coverage, IPv6 selection honors tentative,
+  DAD-failed, optimistic, temporary and deprecated flags, and network
+  inspection checks namespace stability even when the initial socket set is
+  empty. File-I/O empty/filter states and retention-cap completeness now follow
+  the handle-list evidence rather than per-file counter availability.
+- Autostart first-write publication is atomic/no-replace and the autostart
+  directory is owner/mode validated; failed first writes leave no placeholder.
+  Settings elevation is tri-state, so a failed Windows token query renders
+  Unknown instead of claiming unelevated.
+- No compile, test, formatter gate or release build was run in the review
+  passes. The integration branch remains pending its one final gate.
+
 ## 2026-11-23 - Platform-aware GUI capabilities
 
 - Expanded `tm-platform` `Capabilities` for native Services/account surfaces,

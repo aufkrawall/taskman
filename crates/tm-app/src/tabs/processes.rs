@@ -308,7 +308,7 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
                 &pal,
                 Icon::Close,
                 i18n::tr(K::EndTask),
-                !app.selection.is_empty(),
+                caps.end_process && !app.selection.is_empty(),
             ) {
                 app.end_selected(&ctx);
             }
@@ -1333,12 +1333,13 @@ fn context_menu(app: &mut TaskManApp, ui: &mut egui::Ui, row: &RowData) {
         ui.close();
     }
     menu::separator(ui);
-    if menu::check(
-        ui,
-        &batch_label(i18n::tr(K::EfficiencyMode)),
-        row.power_throttled,
-    )
-    .clicked()
+    if app.actions.capabilities().efficiency_mode
+        && menu::check(
+            ui,
+            &batch_label(i18n::tr(K::EfficiencyMode)),
+            row.power_throttled,
+        )
+        .clicked()
     {
         if batch {
             let on = !row.power_throttled;
@@ -1567,7 +1568,9 @@ fn scheduling_menu_items(
         save_rule.clone(),
         &scope,
     );
-    if menu::item(ui, &batch_label(i18n::tr(K::SetAffinity))).clicked() {
+    if app.actions.capabilities().set_affinity
+        && menu::item(ui, &batch_label(i18n::tr(K::SetAffinity))).clicked()
+    {
         let targets = scope(app);
         crate::tabs::details::open_affinity_dialog(
             app,

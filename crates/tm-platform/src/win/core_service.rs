@@ -1471,6 +1471,9 @@ impl PlatformActions for BrokeredActions {
     fn is_elevated(&self) -> bool {
         self.local.is_elevated()
     }
+    fn elevation_status(&self) -> Option<bool> {
+        self.local.elevation_status()
+    }
 
     fn run_new_task(&self, command_line: &str, elevate: bool) -> Result<()> {
         self.local.run_new_task(command_line, elevate)

@@ -222,9 +222,6 @@ fn connection_protocol_rank(protocol: ConnectionProtocol) -> u8 {
 pub(super) fn list_process_connections(pid: u32) -> Result<Vec<ProcessConnection>> {
     let namespace_before = net_namespace(pid)?;
     let inodes_before = process_socket_inodes(pid)?;
-    if inodes_before.is_empty() {
-        return Ok(Vec::new());
-    }
 
     let mut sockets = Vec::new();
     let mut seen_inodes = HashSet::new();

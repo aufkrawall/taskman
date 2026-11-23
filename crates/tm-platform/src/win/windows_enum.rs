@@ -16,6 +16,8 @@ use windows::core::{s, w};
 pub struct WindowOwners {
     pub visible: HashSet<u32>,
     pub not_responding: HashSet<u32>,
+    /// Whether EnumWindows completed the full top-level window walk.
+    pub complete: bool,
 }
 
 /// Scratch state of one `EnumWindows` pass: the owners found so far, candidates
@@ -35,12 +37,13 @@ static CACHE: Mutex<Option<WindowOwners>> = Mutex::new(None);
 
 pub fn window_owners() -> WindowOwners {
     let mut scan = Scan::default();
-    unsafe {
-        let _ = windows::Win32::UI::WindowsAndMessaging::EnumWindows(
+    scan.owners.complete = unsafe {
+        windows::Win32::UI::WindowsAndMessaging::EnumWindows(
             Some(enum_cb),
             windows::Win32::Foundation::LPARAM(&mut scan as *mut _ as isize),
-        );
-    }
+        )
+        .is_ok()
+    };
     pair_minimized_views(&mut scan);
     scan.owners.not_responding =
         resolve_hung_candidates(&scan.hung_candidates, probe_window_responds);

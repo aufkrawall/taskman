@@ -668,6 +668,11 @@ pub trait PlatformActions: Send + Sync {
     fn is_elevated(&self) -> bool {
         false
     }
+    /// Tri-state current-process elevation. Backends that can fail a token
+    /// query return `None` instead of turning unknown into unelevated.
+    fn elevation_status(&self) -> Option<bool> {
+        Some(self.is_elevated())
+    }
     fn run_new_task(&self, command_line: &str, elevate: bool) -> Result<()> {
         let _ = (command_line, elevate);
         Err(tm_core::TmError::Unsupported("run new task"))

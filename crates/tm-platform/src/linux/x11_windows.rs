@@ -502,7 +502,13 @@ fn query_window_owners(connection: &RustConnection, atoms: Atoms) -> QueryOutcom
         let attributes = match connection.get_window_attributes(window) {
             Ok(cookie) => match cookie.reply() {
                 Ok(attributes) => attributes,
-                Err(ReplyError::X11Error(_)) => continue,
+                Err(ReplyError::X11Error(_)) => {
+                    // The window disappeared or changed identity between the
+                    // client-list query and this read. We cannot turn that
+                    // unobserved window into a negative ownership fact.
+                    coverage = WindowCoverage::Partial;
+                    continue;
+                }
                 Err(ReplyError::ConnectionError(_)) => {
                     return QueryOutcome {
                         observation: WindowObservation {

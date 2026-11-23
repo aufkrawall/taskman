@@ -337,6 +337,7 @@ fn enumerate_process_files(h_process: HANDLE) -> Result<FileEnumeration> {
             });
 
         file_entry.open_handles = file_entry.open_handles.saturating_add(1);
+        file_entry.access_known |= facts.granted_access.is_some();
         file_entry.is_read |= is_read;
         file_entry.is_write |= is_write;
         if let Some(pos_val) = facts.offset {

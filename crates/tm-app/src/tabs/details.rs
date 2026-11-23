@@ -1016,7 +1016,7 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
                 &pal,
                 Icon::Close,
                 i18n::tr(K::EndTask),
-                !app.selection.is_empty(),
+                caps.end_process && !app.selection.is_empty(),
             ) {
                 app.end_selected(&ctx);
             }
@@ -2599,7 +2599,9 @@ pub fn context_menu(app: &mut TaskManApp, ui: &mut egui::Ui, p: &ProcessEntry, h
         (!batch).then_some(rule_key.clone()),
         &targets,
     );
-    if menu::item(ui, &batch_label(i18n::tr(K::SetAffinity))).clicked() {
+    if app.actions.capabilities().set_affinity
+        && menu::item(ui, &batch_label(i18n::tr(K::SetAffinity))).clicked()
+    {
         let targets = targets(app);
         let identity = crate::app::ProcessIdentity {
             pid: p.pid,

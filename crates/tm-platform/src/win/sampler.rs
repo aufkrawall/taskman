@@ -1878,7 +1878,7 @@ impl Sampler {
         // steamwebhelper's window; Terminal absorbs its shell children).
         // The ancestor walk stops at windowed processes and at system
         // processes (svchost/services/...), matching Task Manager.
-        refine_categories_and_group_apps(&mut processes);
+        refine_categories_and_group_apps(&mut processes, window_owners.complete);
 
         // ---- per-process network (ETW) --------------------------------------------
         // Runs after the process list is final so pruning sees exactly the
@@ -2473,7 +2473,7 @@ fn inherit_same_image_service_accounts(
     }
 }
 
-fn refine_categories_and_group_apps(processes: &mut [ProcessEntry]) {
+fn refine_categories_and_group_apps(processes: &mut [ProcessEntry], window_scan_complete: bool) {
     // pid -> index for O(1) parent lookups.
     let idx_by_pid: HashMap<u32, usize> = processes
         .iter()
@@ -2491,10 +2491,17 @@ fn refine_categories_and_group_apps(processes: &mut [ProcessEntry]) {
     for p in processes.iter_mut() {
         let windows_owned = is_windows_owned_image(p);
         let name = p.name.clone();
+        let has_window = if p.has_window {
+            Some(true)
+        } else if window_scan_complete {
+            Some(false)
+        } else {
+            None
+        };
         p.category = classify::classify(classify::ClassifyInput {
             pid: p.pid,
             name: &name,
-            has_window: Some(p.has_window),
+            has_window,
             critical: p.critical,
             windows_owned,
         });
@@ -2864,7 +2871,7 @@ mod tests {
         critical.critical = Some(true);
 
         let mut processes = vec![services, battle, steam, taskman, wmi, shell, critical];
-        refine_categories_and_group_apps(&mut processes);
+        refine_categories_and_group_apps(&mut processes, true);
 
         let category = |pid| processes.iter().find(|p| p.pid == pid).unwrap().category;
         assert_eq!(category(100), ProcCategory::System);
@@ -2942,11 +2949,27 @@ mod tests {
         bg2.ppid = Some(2000);
 
         let mut processes = vec![app, bg1, bg2];
-        refine_categories_and_group_apps(&mut processes);
+        refine_categories_and_group_apps(&mut processes, true);
 
         // Must complete without hanging in an infinite loop.
         let category = |pid| processes.iter().find(|p| p.pid == pid).unwrap().category;
         assert_eq!(category(1000), ProcCategory::App);
+    }
+
+    #[test]
+    fn incomplete_window_scan_keeps_window_absence_unknown() {
+        let mut process = ProcessEntry::new(1000, "user-app.exe");
+        process.exe_path = Some(r"C:\Users\dev\user-app.exe".into());
+        let mut processes = vec![process];
+
+        refine_categories_and_group_apps(&mut processes, false);
+        assert_eq!(processes[0].category, ProcCategory::Unknown);
+
+        // A positive window fact remains usable even when the rest of the
+        // enumeration failed; only absence is downgraded to unknown.
+        processes[0].has_window = true;
+        refine_categories_and_group_apps(&mut processes, false);
+        assert_eq!(processes[0].category, ProcCategory::App);
     }
 
     #[test]

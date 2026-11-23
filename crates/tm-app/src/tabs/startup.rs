@@ -122,7 +122,7 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
         if stale && app.shared.startup_fetch.begin() {
             let cache = app.shared.startup_cache.clone();
             let derived = app.shared.startup_derived.clone();
-            let toasts = app.shared.toasts.clone();
+            let error_slot = app.shared.startup_error.clone();
             let done = app.shared.startup_fetch.flag();
             let actions = app.actions.clone();
             let wake = {
@@ -131,12 +131,10 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
             };
             let job = move || {
                 let items = actions.list_startup();
-                if let Err(e) = &items {
-                    crate::app::toast_from(
-                        &toasts,
-                        i18n::trf(K::StartupUnavailable, &[&e.to_string()]),
-                    );
-                }
+                *tm_core::sync::lock(&error_slot) = items
+                    .as_ref()
+                    .err()
+                    .map(|error| i18n::trf(K::StartupUnavailable, &[&error.to_string()]));
                 let items = items.unwrap_or_default();
                 // Published before the list so a frame that sees the new list
                 // never pairs it with the previous list's targets.
@@ -209,6 +207,7 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
         |app, ui| {
             if menu::item(ui, i18n::tr(K::RefreshNow)).clicked() {
                 *tm_core::sync::lock(&app.shared.startup_cache) = None;
+                *tm_core::sync::lock(&app.shared.startup_error) = None;
                 app.refresh_all();
                 ui.close();
             }
@@ -232,6 +231,11 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
             egui::FontId::proportional(13.0),
             pal.text,
         );
+    }
+
+    if let Some(error) = tm_core::sync::lock(&app.shared.startup_error).clone() {
+        ui.centered_and_justified(|ui| ui.colored_label(pal.heat_high, error));
+        return;
     }
 
     let cache_arc = app.shared.startup_cache.clone();

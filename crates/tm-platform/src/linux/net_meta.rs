@@ -19,6 +19,12 @@ pub struct NetMeta {
     pub ipv6: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Ipv6Address {
+    address: Ipv6Addr,
+    flags: u8,
+}
+
 pub fn collect() -> HashMap<String, NetMeta> {
     let ipv4 = ipv4_addresses();
     let ipv6 = std::fs::read_to_string("/proc/net/if_inet6")
@@ -132,16 +138,39 @@ fn preferred_ipv4(addresses: impl Iterator<Item = Ipv4Addr>) -> Option<String> {
     fallback.map(|address| address.to_string())
 }
 
-fn preferred_ipv6(addresses: impl Iterator<Item = Ipv6Addr>) -> Option<String> {
-    let mut fallback = None;
-    for address in addresses.filter(|address| !address.is_unspecified() && !address.is_loopback()) {
-        if is_ipv6_link_local(address) {
-            fallback.get_or_insert(address);
-        } else {
-            return Some(address.to_string());
+fn preferred_ipv6(addresses: impl Iterator<Item = Ipv6Address>) -> Option<String> {
+    let mut best: Option<(u8, Ipv6Addr)> = None;
+    for address in addresses
+        .filter(|address| !address.address.is_unspecified() && !address.address.is_loopback())
+    {
+        let Some(rank) = ipv6_address_rank(address) else {
+            continue;
+        };
+        if best.is_none_or(|(best_rank, _)| rank < best_rank) {
+            best = Some((rank, address.address));
         }
     }
-    fallback.map(|address| address.to_string())
+    best.map(|(_, address)| address.to_string())
+}
+
+fn ipv6_address_rank(address: Ipv6Address) -> Option<u8> {
+    const IFA_F_TENTATIVE: u8 = 0x40;
+    const IFA_F_DADFAILED: u8 = 0x08;
+    const IFA_F_OPTIMISTIC: u8 = 0x04;
+    const IFA_F_DEPRECATED: u8 = 0x20;
+    const IFA_F_TEMPORARY: u8 = 0x01;
+
+    if address.flags & (IFA_F_TENTATIVE | IFA_F_DADFAILED | IFA_F_OPTIMISTIC) != 0 {
+        return None;
+    }
+    let stability_rank = if address.flags & IFA_F_DEPRECATED != 0 {
+        2
+    } else if address.flags & IFA_F_TEMPORARY != 0 {
+        1
+    } else {
+        0
+    };
+    Some(stability_rank * 2 + u8::from(is_ipv6_link_local(address.address)))
 }
 
 fn is_ipv6_link_local(address: Ipv6Addr) -> bool {
@@ -150,8 +179,8 @@ fn is_ipv6_link_local(address: Ipv6Addr) -> bool {
 
 /// `/proc/net/if_inet6` rows are:
 /// `address ifindex prefixlen scope flags interface`.
-fn parse_if_inet6(text: &str) -> HashMap<String, Vec<Ipv6Addr>> {
-    let mut out: HashMap<String, Vec<Ipv6Addr>> = HashMap::new();
+fn parse_if_inet6(text: &str) -> HashMap<String, Vec<Ipv6Address>> {
+    let mut out: HashMap<String, Vec<Ipv6Address>> = HashMap::new();
     for line in text.lines() {
         let fields: Vec<&str> = line.split_ascii_whitespace().collect();
         if fields.len() < 6 {
@@ -160,7 +189,12 @@ fn parse_if_inet6(text: &str) -> HashMap<String, Vec<Ipv6Addr>> {
         let Some(address) = parse_ipv6_hex(fields[0]) else {
             continue;
         };
-        out.entry(fields[5].to_string()).or_default().push(address);
+        let Some(flags) = u8::from_str_radix(fields[4], 16).ok() else {
+            continue;
+        };
+        out.entry(fields[5].to_string())
+            .or_default()
+            .push(Ipv6Address { address, flags });
     }
     out
 }
@@ -227,23 +261,92 @@ fe800000000000000000000000000001 02 40 20 80 eth0
 ";
         let parsed = parse_if_inet6(text);
         assert_eq!(parsed["eth0"].len(), 2);
-        assert_eq!(parsed["eth0"][0], "2001:db8::1".parse().unwrap());
-        assert_eq!(parsed["lo"][0], Ipv6Addr::LOCALHOST);
+        assert_eq!(parsed["eth0"][0].address, "2001:db8::1".parse().unwrap());
+        assert_eq!(parsed["lo"][0].address, Ipv6Addr::LOCALHOST);
     }
 
     #[test]
-    fn preferred_ipv6_uses_global_before_link_local_and_skips_loopback() {
-        let link_local: Ipv6Addr = "fe80::1".parse().unwrap();
-        let global: Ipv6Addr = "2001:db8::10".parse().unwrap();
+    fn preferred_ipv6_uses_stable_global_before_link_local_and_skips_loopback() {
+        let address = |text: &str, flags| Ipv6Address {
+            address: text.parse().unwrap(),
+            flags,
+        };
+        let link_local = address("fe80::1", 0);
+        let global = address("2001:db8::10", 0);
         assert_eq!(
-            preferred_ipv6([Ipv6Addr::LOCALHOST, link_local, global].into_iter()),
-            Some(global.to_string())
+            preferred_ipv6(
+                [
+                    Ipv6Address {
+                        address: Ipv6Addr::LOCALHOST,
+                        flags: 0,
+                    },
+                    link_local,
+                    global,
+                ]
+                .into_iter()
+            ),
+            Some(global.address.to_string())
         );
         assert_eq!(
-            preferred_ipv6([link_local, Ipv6Addr::LOCALHOST].into_iter()),
-            Some(link_local.to_string())
+            preferred_ipv6(
+                [
+                    link_local,
+                    Ipv6Address {
+                        address: Ipv6Addr::LOCALHOST,
+                        flags: 0,
+                    },
+                ]
+                .into_iter()
+            ),
+            Some(link_local.address.to_string())
         );
-        assert_eq!(preferred_ipv6([Ipv6Addr::LOCALHOST].into_iter()), None);
+        assert_eq!(
+            preferred_ipv6(
+                [Ipv6Address {
+                    address: Ipv6Addr::LOCALHOST,
+                    flags: 0,
+                }]
+                .into_iter()
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn preferred_ipv6_rejects_tentative_dad_failed_and_optimistic_addresses() {
+        let address = |text: &str, flags| Ipv6Address {
+            address: text.parse().unwrap(),
+            flags,
+        };
+        assert_eq!(
+            preferred_ipv6(
+                [
+                    address("2001:db8::1", 0x40),
+                    address("2001:db8::2", 0x08),
+                    address("2001:db8::3", 0x04),
+                ]
+                .into_iter()
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn deprecated_address_is_only_a_fallback() {
+        let address = |text: &str, flags| Ipv6Address {
+            address: text.parse().unwrap(),
+            flags,
+        };
+        let stable_link = address("fe80::1", 0);
+        let deprecated_global = address("2001:db8::10", 0x20);
+        assert_eq!(
+            preferred_ipv6([deprecated_global, stable_link].into_iter()),
+            Some(stable_link.address.to_string())
+        );
+        assert_eq!(
+            preferred_ipv6([deprecated_global].into_iter()),
+            Some(deprecated_global.address.to_string())
+        );
     }
 
     #[test]

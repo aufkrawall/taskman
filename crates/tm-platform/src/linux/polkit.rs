@@ -1,9 +1,9 @@
 //! On-demand Linux elevation through the desktop's Polkit `pkexec` helper.
 //!
-//! Normal startup never elevates. A denied direct syscall or service control
-//! asks `pkexec` to re-enter this same executable in a short-lived, typed
-//! helper mode. The helper accepts only the actions built here; it never runs
-//! a privileged shell command.
+//! Normal startup never elevates. systemd service control is retried through
+//! a trusted absolute `systemctl` path after a real authorization failure.
+//! The portable TaskMan image is deliberately never executed as root: privileged
+//! process actions and GUI relaunch fail closed until a protected helper ships.
 
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
@@ -59,10 +59,9 @@ pub fn handle_helper(args: &[String]) -> Option<i32> {
     }
 }
 
-/// Re-run the current executable through `pkexec`, preserving its original
-/// argv entries as separate arguments and forwarding only allowlisted desktop
-/// variables. The process is authenticated and typed; no command text reaches
-/// a privileged shell.
+/// Elevating the portable, user-writable TaskMan image would turn the Polkit
+/// prompt into privilege escalation for mutable code, so this path fails
+/// closed until a protected helper image exists.
 pub fn relaunch_elevated() -> Result<()> {
     Err(TmError::Unsupported(
         "elevated GUI relaunch from a portable, user-writable installation",

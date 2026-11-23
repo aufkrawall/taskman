@@ -5,12 +5,15 @@
 //! terminating a session is not a read-only metadata operation.
 
 use std::path::Path;
-use std::process::Command;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::process::{Child, Command, Output};
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 use tm_core::error::{Result, TmError};
 use tm_core::model::{UserSession, UserSessionState};
 
-static LISTING_FAILED: AtomicBool = AtomicBool::new(false);
+const LOGINCTL_DEADLINE: Duration = Duration::from_secs(3);
+const LISTING_RETRY: Duration = Duration::from_secs(30);
+static LISTING_RETRY_AFTER: Mutex<Option<Instant>> = Mutex::new(None);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SessionListRow {
@@ -29,7 +32,7 @@ pub fn available() -> bool {
     Path::new("/run/systemd/system").is_dir()
         && Path::new("/run/dbus/system_bus_socket").exists()
         && loginctl_path().is_some()
-        && !LISTING_FAILED.load(Ordering::Acquire)
+        && listing_available(Instant::now())
 }
 
 pub fn list_sessions() -> Result<Vec<UserSession>> {
@@ -38,22 +41,24 @@ pub fn list_sessions() -> Result<Vec<UserSession>> {
     }
     let loginctl =
         loginctl_path().ok_or_else(|| TmError::Unsupported("user sessions (loginctl path)"))?;
-    let output = Command::new(loginctl)
-        .args(["list-sessions", "--no-legend", "--no-pager"])
-        .env("LC_ALL", "C")
-        .output()
-        .map_err(|error| {
-            LISTING_FAILED.store(true, Ordering::Release);
-            TmError::platform("loginctl list-sessions", error.to_string())
-        })?;
+    let deadline = Instant::now() + LOGINCTL_DEADLINE;
+    let output = run_loginctl(
+        &loginctl,
+        &["list-sessions", "--no-legend", "--no-pager"],
+        deadline,
+    )
+    .map_err(|error| {
+        note_listing_failure();
+        TmError::platform("loginctl list-sessions", error.to_string())
+    })?;
     if !output.status.success() {
-        LISTING_FAILED.store(true, Ordering::Release);
+        note_listing_failure();
         return Err(TmError::platform(
             "loginctl list-sessions",
             String::from_utf8_lossy(&output.stderr).trim().to_string(),
         ));
     }
-    LISTING_FAILED.store(false, Ordering::Release);
+    note_listing_success();
 
     let rows = parse_session_list(&String::from_utf8_lossy(&output.stdout));
     let boot_epoch_s = system_boot_epoch_s();
@@ -62,7 +67,11 @@ pub fn list_sessions() -> Result<Vec<UserSession>> {
         // A session can disappear between list-sessions and show-session.
         // Keep the stable list fields and report its state as unknown rather
         // than dropping a real session or failing the entire page.
-        let properties = show_session(row.id).unwrap_or_default();
+        let properties = if Instant::now() < deadline {
+            show_session(row.id, deadline).unwrap_or_default()
+        } else {
+            SessionProperties::default()
+        };
         let user = properties
             .name
             .filter(|name| !name.is_empty())
@@ -88,18 +97,122 @@ pub fn list_sessions() -> Result<Vec<UserSession>> {
     Ok(out)
 }
 
-fn show_session(id: u32) -> Option<SessionProperties> {
-    let output = Command::new(loginctl_path()?)
-        .arg("show-session")
-        .args(["--no-pager", "--property=Name,State,TimestampMonotonic"])
-        .arg(id.to_string())
-        .env("LC_ALL", "C")
-        .output()
-        .ok()?;
+fn show_session(id: u32, deadline: Instant) -> Option<SessionProperties> {
+    let id = id.to_string();
+    let output = run_loginctl(
+        &loginctl_path()?,
+        &[
+            "show-session",
+            "--no-pager",
+            "--property=Name,State,TimestampMonotonic",
+            &id,
+        ],
+        deadline,
+    )
+    .ok()?;
     output
         .status
         .success()
         .then(|| parse_session_properties(&String::from_utf8_lossy(&output.stdout)))
+}
+
+fn run_loginctl(loginctl: &Path, args: &[&str], deadline: Instant) -> std::io::Result<Output> {
+    let mut child = Command::new(loginctl)
+        .args(args)
+        .env("LC_ALL", "C")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()?;
+    if let Err(error) = wait_for_exit(&mut child, deadline) {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(error);
+    }
+    child.wait_with_output()
+}
+
+fn wait_for_exit(child: &mut Child, deadline: Instant) -> std::io::Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, child.id() as libc::pid_t, 0) };
+        if fd >= 0 {
+            let result = wait_pidfd(fd as libc::c_int, deadline);
+            unsafe {
+                libc::close(fd as libc::c_int);
+            }
+            return result;
+        }
+    }
+
+    loop {
+        if child.try_wait()?.is_some() {
+            return Ok(());
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "loginctl exceeded its deadline",
+            ));
+        }
+        std::thread::sleep((deadline - now).min(Duration::from_millis(10)));
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn wait_pidfd(fd: libc::c_int, deadline: Instant) -> std::io::Result<()> {
+    loop {
+        let now = Instant::now();
+        if now >= deadline {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "loginctl exceeded its deadline",
+            ));
+        }
+        let remaining_ms = (deadline - now).as_millis().min(i32::MAX as u128) as i32;
+        let mut pollfd = libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let result = unsafe { libc::poll(&mut pollfd, 1, remaining_ms) };
+        if result > 0 {
+            return Ok(());
+        }
+        if result == 0 {
+            continue;
+        }
+        let error = std::io::Error::last_os_error();
+        if error.kind() != std::io::ErrorKind::Interrupted {
+            return Err(error);
+        }
+    }
+}
+
+fn listing_available(now: Instant) -> bool {
+    listing_retry_available(
+        *LISTING_RETRY_AFTER
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()),
+        now,
+    )
+}
+
+fn listing_retry_available(retry_after: Option<Instant>, now: Instant) -> bool {
+    retry_after.is_none_or(|retry_after| now >= retry_after)
+}
+
+fn note_listing_failure() {
+    *LISTING_RETRY_AFTER
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Instant::now() + LISTING_RETRY);
+}
+
+fn note_listing_success() {
+    *LISTING_RETRY_AFTER
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
 }
 
 fn parse_session_list(text: &str) -> Vec<SessionListRow> {
@@ -273,5 +386,26 @@ TimestampMonotonic=1234567890
             parse_session_scope("1:name=systemd:/user.slice/user-1000.slice/session-9.scope"),
             Some(9)
         );
+    }
+
+    #[test]
+    fn failed_session_listing_has_a_bounded_retry_window() {
+        let now = Instant::now();
+        assert!(listing_retry_available(None, now));
+        assert!(!listing_retry_available(Some(now + LISTING_RETRY), now));
+        assert!(listing_retry_available(Some(now), now));
+    }
+
+    #[test]
+    fn command_runner_enforces_its_absolute_deadline() {
+        let started = Instant::now();
+        let error = run_loginctl(
+            Path::new("/bin/sh"),
+            &["-c", "while :; do :; done"],
+            started + Duration::from_millis(100),
+        )
+        .expect_err("the busy child must hit the deadline");
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        assert!(started.elapsed() < Duration::from_secs(2));
     }
 }

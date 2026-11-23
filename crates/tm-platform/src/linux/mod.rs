@@ -486,7 +486,7 @@ fn leader_first(pid: u32, tids: impl IntoIterator<Item = u32>) -> Vec<u32> {
 /// leader's failure is the process's failure and leaves the other threads
 /// untouched. A thread that exited between listing and the call (ESRCH) is
 /// not a miss; any other failure is reported so a permission denial can
-/// trigger the privileged helper instead of being hidden.
+/// reach the fail-closed elevation policy instead of being hidden.
 fn apply_to_threads(
     op: &'static str,
     tids: &[u32],
@@ -731,8 +731,8 @@ pub struct LinuxActions;
 impl PlatformActions for LinuxActions {
     fn capabilities(&self) -> Capabilities {
         Capabilities {
-            services_list: true,
-            services_control: true,
+            services_list: services::available(),
+            services_control: services::available(),
             open_services_app: false,
             startup_toggle: true,
             end_process_tree: true,

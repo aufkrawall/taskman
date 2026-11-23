@@ -407,6 +407,7 @@ impl InputState {
         let mut rotation_radians = 0.0;
 
         self.wheel.smooth_wheel_delta = Vec2::ZERO;
+        self.wheel.smooth_zoom_delta = Vec2::ZERO;
 
         for event in &mut new.events {
             match event {
@@ -467,15 +468,10 @@ impl InputState {
             let dt = stable_dt.at_most(0.1);
             self.wheel.after_events(time, dt);
 
-            let is_zoom = self.wheel.modifiers.matches_any(options.zoom_modifier);
-
-            if is_zoom {
-                zoom_factor_delta *= (options.scroll_zoom_speed
-                    * (self.wheel.smooth_wheel_delta.x + self.wheel.smooth_wheel_delta.y))
-                    .exp();
-            } else {
-                smooth_scroll_delta = self.wheel.smooth_wheel_delta;
-            }
+            zoom_factor_delta *= (options.scroll_zoom_speed
+                * (self.wheel.smooth_zoom_delta.x + self.wheel.smooth_zoom_delta.y))
+                .exp();
+            smooth_scroll_delta = self.wheel.smooth_wheel_delta;
         }
 
         Self {
@@ -665,10 +661,15 @@ impl InputState {
     /// cause a repaint.
     pub(crate) fn wants_repaint_after(&self) -> Option<Duration> {
         if self.pointer.wants_repaint()
-            || self
-                .events
-                .iter()
-                .any(|event| !matches!(event, Event::MouseWheel { .. }))
+            || self.events.iter().any(|event| {
+                !matches!(
+                    event,
+                    Event::MouseWheel {
+                        phase: crate::TouchPhase::Move,
+                        ..
+                    }
+                )
+            })
             || !self.raw.hovered_files.is_empty()
             || !self.raw.dropped_files.is_empty()
         {
@@ -676,7 +677,14 @@ impl InputState {
             return Some(Duration::ZERO);
         }
 
-        if self.wheel.unprocessed_wheel_delta.abs().max_elem() > 0.2 {
+        if self
+            .wheel
+            .unprocessed_wheel_delta
+            .abs()
+            .max_elem()
+            .max(self.wheel.unprocessed_zoom_delta.abs().max_elem())
+            > 0.2
+        {
             // Mouse-wheel smoothing is discrete follow-up input rather than an
             // animation. Let the backend deliver it at the display cadence
             // instead of asking for back-to-back frames.
@@ -1829,6 +1837,87 @@ mod tests {
         );
 
         assert_eq!(state.wants_repaint_after(), None);
+    }
+
+    #[test]
+    fn zero_delta_wheel_lifecycle_phases_request_their_delivery_frame() {
+        for phase in [
+            crate::TouchPhase::Start,
+            crate::TouchPhase::End,
+            crate::TouchPhase::Cancel,
+        ] {
+            let state = InputState::default().begin_pass(
+                RawInput {
+                    events: vec![Event::MouseWheel {
+                        unit: crate::MouseWheelUnit::Point,
+                        delta: Vec2::ZERO,
+                        phase,
+                        modifiers: Modifiers::NONE,
+                    }],
+                    ..Default::default()
+                },
+                false,
+                1.0,
+                InputOptions::default(),
+            );
+            assert_eq!(state.wants_repaint_after(), Some(Duration::ZERO));
+        }
+    }
+
+    #[test]
+    fn move_and_end_in_one_coalesced_batch_still_deliver_scroll_delta() {
+        for (unit, expected) in [
+            (crate::MouseWheelUnit::Point, vec2(2.0, -3.0)),
+            (crate::MouseWheelUnit::Line, vec2(80.0, -120.0)),
+        ] {
+            let wheel = |phase, delta| Event::MouseWheel {
+                unit,
+                delta,
+                phase,
+                modifiers: Modifiers::NONE,
+            };
+            let state = InputState::default().begin_pass(
+                RawInput {
+                    events: vec![
+                        wheel(crate::TouchPhase::Start, Vec2::ZERO),
+                        wheel(crate::TouchPhase::Move, vec2(2.0, -3.0)),
+                        wheel(crate::TouchPhase::End, Vec2::ZERO),
+                    ],
+                    ..Default::default()
+                },
+                false,
+                1.0,
+                InputOptions::default(),
+            );
+            assert_eq!(state.smooth_scroll_delta(), expected);
+            assert!(!state.is_scrolling());
+        }
+    }
+
+    #[test]
+    fn mixed_modifier_wheel_events_split_scroll_and_zoom_in_one_pass() {
+        let ctrl = Modifiers {
+            ctrl: true,
+            ..Default::default()
+        };
+        let wheel = |modifiers| Event::MouseWheel {
+            unit: crate::MouseWheelUnit::Line,
+            delta: vec2(0.0, 1.0),
+            phase: crate::TouchPhase::Move,
+            modifiers,
+        };
+        let state = InputState::default().begin_pass(
+            RawInput {
+                events: vec![wheel(Modifiers::NONE), wheel(ctrl)],
+                ..Default::default()
+            },
+            false,
+            1.0,
+            InputOptions::default(),
+        );
+
+        assert!(state.smooth_scroll_delta().y > 0.0);
+        assert!(state.zoom_delta() > 1.0);
     }
 
     #[test]

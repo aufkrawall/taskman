@@ -51,6 +51,8 @@ pub struct WheelState {
 
     /// Used for smoothing the scroll delta.
     pub unprocessed_wheel_delta: Vec2,
+    /// Pending non-scroll deltas whose modifiers request zoom.
+    pub unprocessed_zoom_delta: Vec2,
 
     /// How many points the user scrolled, smoothed over a few frames.
     ///
@@ -65,6 +67,8 @@ pub struct WheelState {
     /// [`crate::ScrollArea`] will both read and write to this field, so that
     /// at the end of the frame this will be zero if a scroll-area consumed the delta.
     pub smooth_wheel_delta: Vec2,
+    /// Smoothed zoom delta for this pass.
+    pub smooth_zoom_delta: Vec2,
 }
 
 impl Default for WheelState {
@@ -74,7 +78,9 @@ impl Default for WheelState {
             modifiers: Default::default(),
             last_wheel_event: f64::NEG_INFINITY,
             unprocessed_wheel_delta: Vec2::ZERO,
+            unprocessed_zoom_delta: Vec2::ZERO,
             smooth_wheel_delta: Vec2::ZERO,
+            smooth_zoom_delta: Vec2::ZERO,
         }
     }
 }
@@ -143,17 +149,37 @@ impl WheelState {
                         MouseWheelUnit::Line | MouseWheelUnit::Page => false,
                     };
 
+                let is_zoom = self.modifiers.matches_any(options.zoom_modifier);
                 if is_smooth {
-                    self.smooth_wheel_delta += delta;
+                    if is_zoom {
+                        self.smooth_zoom_delta += delta;
+                    } else {
+                        self.smooth_wheel_delta += delta;
+                    }
+                } else if is_zoom {
+                    self.unprocessed_zoom_delta += delta;
                 } else {
                     self.unprocessed_wheel_delta += delta;
                 }
             }
-            crate::TouchPhase::End | crate::TouchPhase::Cancel => {
+            crate::TouchPhase::End => {
+                self.status = Status::Static;
+                self.modifiers = Default::default();
+                // A coalesced batch can contain Start, a real Move and End in
+                // one frame. Commit the accumulated line delta before ending
+                // so the movement reaches the UI in this same pass.
+                self.smooth_wheel_delta += self.unprocessed_wheel_delta;
+                self.smooth_zoom_delta += self.unprocessed_zoom_delta;
+                self.unprocessed_wheel_delta = Default::default();
+                self.unprocessed_zoom_delta = Default::default();
+            }
+            crate::TouchPhase::Cancel => {
                 self.status = Status::Static;
                 self.modifiers = Default::default();
                 self.unprocessed_wheel_delta = Default::default();
+                self.unprocessed_zoom_delta = Default::default();
                 self.smooth_wheel_delta = Default::default();
+                self.smooth_zoom_delta = Default::default();
             }
         }
     }
@@ -170,6 +196,18 @@ impl WheelState {
                     let applied = t * self.unprocessed_wheel_delta[d];
                     self.smooth_wheel_delta[d] += applied;
                     self.unprocessed_wheel_delta[d] -= applied;
+                }
+            }
+        }
+        if self.unprocessed_zoom_delta != Vec2::ZERO {
+            for d in 0..2 {
+                if self.unprocessed_zoom_delta[d].abs() < 1.0 {
+                    self.smooth_zoom_delta[d] += self.unprocessed_zoom_delta[d];
+                    self.unprocessed_zoom_delta[d] = 0.0;
+                } else {
+                    let applied = t * self.unprocessed_zoom_delta[d];
+                    self.smooth_zoom_delta[d] += applied;
+                    self.unprocessed_zoom_delta[d] -= applied;
                 }
             }
         }
@@ -201,7 +239,9 @@ impl WheelState {
             modifiers,
             last_wheel_event,
             unprocessed_wheel_delta,
+            unprocessed_zoom_delta,
             smooth_wheel_delta,
+            smooth_zoom_delta,
         } = self;
 
         let time = ui.input(|i| i.time);
@@ -227,6 +267,14 @@ impl WheelState {
 
                 ui.label("smooth_wheel_delta");
                 ui.monospace(smooth_wheel_delta.to_string());
+                ui.end_row();
+
+                ui.label("unprocessed_zoom_delta");
+                ui.monospace(unprocessed_zoom_delta.to_string());
+                ui.end_row();
+
+                ui.label("smooth_zoom_delta");
+                ui.monospace(smooth_zoom_delta.to_string());
                 ui.end_row();
             });
     }

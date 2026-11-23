@@ -175,6 +175,11 @@ pub fn is_elevated() -> bool {
     process_ops::is_elevated()
 }
 
+/// Current-process elevation, or `None` when the token query failed.
+pub fn elevation_status() -> Option<bool> {
+    process_ops::elevation_status()
+}
+
 /// Lazily inspect one live process's Windows protection and mitigation state.
 pub fn process_security_info(
     pid: u32,
@@ -567,6 +572,9 @@ impl PlatformActions for WinActions {
     }
     fn is_elevated(&self) -> bool {
         process_ops::is_elevated()
+    }
+    fn elevation_status(&self) -> Option<bool> {
+        process_ops::elevation_status()
     }
     fn run_new_task(&self, command_line: &str, elevate: bool) -> Result<()> {
         process_ops::run_new_task(command_line, elevate)

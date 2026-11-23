@@ -1875,16 +1875,16 @@ pub fn settings_dialog(app: &mut TaskManApp, ctx: &egui::Context, _pal: &theme::
                 ui.add_space(10.0);
                 ui.heading(i18n::tr(K::ElevatedHeading));
                 ui.label(
-                    egui::RichText::new(if app.is_elevated {
-                        i18n::tr(K::ElevatedRunning)
-                    } else {
-                        i18n::tr(K::ElevatedNotRunning)
+                    egui::RichText::new(match app.is_elevated {
+                        Some(true) => i18n::tr(K::ElevatedRunning),
+                        Some(false) => i18n::tr(K::ElevatedNotRunning),
+                        None => i18n::tr(K::ElevatedUnknown),
                     })
                     .size(11.5)
                     .color(_pal.text_dim),
                 );
                 if elevation.relaunch
-                    && !app.is_elevated
+                    && app.is_elevated != Some(true)
                     && ui.button(i18n::tr(K::RestartElevated)).clicked()
                 {
                     let actions = app.actions.clone();
@@ -2315,6 +2315,16 @@ pub fn run_task_dialog(app: &mut TaskManApp, ctx: &egui::Context, _pal: &theme::
     } else {
         run_task_dialog_key_action_with_elevated(focus, enter, space, can_run_elevated)
     };
+    let run_prompt = if cfg!(target_os = "linux") {
+        K::RunPromptLinux
+    } else {
+        K::RunPrompt
+    };
+    let run_hint = if cfg!(target_os = "linux") {
+        K::RunHintLinux
+    } else {
+        K::RunHint
+    };
 
     let mut open = true;
     egui::Window::new(i18n::tr(K::RunDialogTitle))
@@ -2327,11 +2337,11 @@ pub fn run_task_dialog(app: &mut TaskManApp, ctx: &egui::Context, _pal: &theme::
         .anchor(Align2::CENTER_CENTER, [0.0, -40.0])
         .show(ctx, |ui| {
             ui.set_width(420.0);
-            ui.label(i18n::tr(K::RunPrompt));
+            ui.label(i18n::tr(run_prompt));
             ui.add_space(4.0);
             let command = ui.add(
                 egui::TextEdit::singleline(&mut app.run_dialog_text)
-                    .hint_text(i18n::tr(K::RunHint))
+                    .hint_text(i18n::tr(run_hint))
                     .desired_width(f32::INFINITY),
             );
             if command.clicked() {

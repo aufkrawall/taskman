@@ -60,6 +60,7 @@ pub struct Cache {
     /// Shared so a frame can take its own handle and release the lock (see
     /// `show`).
     pub items: Arc<[ServiceInfo]>,
+    pub error: Option<String>,
     pub fetched: Instant,
 }
 
@@ -74,7 +75,6 @@ fn ensure_fresh(app: &TaskManApp, ctx: &egui::Context) {
     if stale && app.shared.services_fetch.begin() {
         let cache = app.shared.services_cache.clone();
         let done = app.shared.services_fetch.flag();
-        let toasts = app.shared.toasts.clone();
         let actions = app.actions.clone();
         let wake = {
             let c = ctx.clone();
@@ -83,14 +83,13 @@ fn ensure_fresh(app: &TaskManApp, ctx: &egui::Context) {
         let job = move || {
             let items = actions.list_services();
             let fetched = Instant::now();
-            if let Err(e) = &items {
-                crate::app::toast_from(
-                    &toasts,
-                    i18n::trf(K::ServicesUnavailable, &[&e.to_string()]),
-                );
-            }
+            let error = items
+                .as_ref()
+                .err()
+                .map(|error| i18n::trf(K::ServicesUnavailable, &[&error.to_string()]));
             *tm_core::sync::lock(&cache) = Some(Cache {
                 items: items.unwrap_or_default().into(),
+                error,
                 fetched,
             });
             done.store(false, std::sync::atomic::Ordering::Relaxed);
@@ -116,6 +115,12 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
     let pal = theme::palette(ui);
     let frame_ctx = ui.ctx().clone();
     let capabilities = app.actions.capabilities();
+    if !capabilities.services_list {
+        ui.centered_and_justified(|ui| {
+            ui.label(i18n::trf(K::ServicesUnavailable, &[""]));
+        });
+        return;
+    }
     ensure_fresh(app, &frame_ctx);
 
     if let Some(name) = tm_core::sync::lock(&app.svc_jump).take() {
@@ -203,13 +208,17 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
     // dispatches through `dispatch_control`, which clears this same cache,
     // and a std Mutex is not re-entrant — holding the guard for the whole
     // table froze the UI thread on that click.
-    let items = tm_core::sync::lock(&app.shared.services_cache)
+    let snapshot = tm_core::sync::lock(&app.shared.services_cache)
         .as_ref()
-        .map(|c| c.items.clone());
-    let Some(items) = items else {
+        .map(|cache| (cache.items.clone(), cache.error.clone()));
+    let Some((items, error)) = snapshot else {
         ui.centered_and_justified(|ui| ui.label(i18n::tr(K::GatheringData)));
         return;
     };
+    if let Some(error) = error {
+        ui.centered_and_justified(|ui| ui.colored_label(pal.heat_high, error));
+        return;
+    }
 
     let q = crate::search::Query::new(&app.search);
     let mut rows: Vec<&ServiceInfo> = items.iter().filter(|s| matches_search(&q, s)).collect();

@@ -1,12 +1,18 @@
 //! systemd services via `systemctl` (no dbus dependency; graceful fallback).
 
+use super::launch;
 use crate::actions::ServiceAction;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use tm_core::error::{Result, TmError};
 use tm_core::model::{ServiceInfo, ServiceStatus};
 
+pub fn available() -> bool {
+    Path::new("/run/systemd/system").is_dir() && systemctl_path().is_ok()
+}
+
 pub fn list_systemd_units() -> Result<Vec<ServiceInfo>> {
-    let out = Command::new("systemctl")
+    let out = Command::new(systemctl_path()?)
         .args([
             "list-units",
             "--type=service",
@@ -100,7 +106,8 @@ pub(crate) fn control_unit_direct(unit: &str, action: ServiceAction) -> Result<(
         Stop => "stop",
         Restart => "restart",
     };
-    let out = Command::new("systemctl")
+    let systemctl = systemctl_path()?;
+    let out = Command::new(systemctl)
         .env("LC_ALL", "C")
         .arg("--no-ask-password")
         .arg(verb)
@@ -113,6 +120,20 @@ pub(crate) fn control_unit_direct(unit: &str, action: ServiceAction) -> Result<(
     } else {
         Err(control_failure(&out, verb, unit))
     }
+}
+
+fn systemctl_path() -> Result<PathBuf> {
+    for candidate in ["/usr/bin/systemctl", "/bin/systemctl"] {
+        let candidate = Path::new(candidate);
+        if candidate.is_file()
+            && let Ok(path) = launch::trusted_system_program(candidate)
+        {
+            return Ok(path);
+        }
+    }
+    Err(TmError::Unsupported(
+        "systemd service control (trusted systemctl path)",
+    ))
 }
 
 fn control_failure(output: &std::process::Output, verb: &str, unit: &str) -> TmError {

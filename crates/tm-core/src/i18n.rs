@@ -703,6 +703,8 @@ keys! {
     RunDialogTitle => ["Neuen Task ausführen", "Create new task"],
     RunPrompt => ["Name des Programms, Ordners oder Dokuments:", "Type the name of a program, folder or document:"],
     RunHint => ["z. B. notepad", "e.g. notepad"],
+    RunPromptLinux => ["Programm und Argumente:", "Program and arguments:"],
+    RunHintLinux => ["z. B. firefox --private-window", "e.g. firefox --private-window"],
     RunElevated => [
         "Mit erhöhten Rechten ausführen",
         "Run with elevated privileges"
@@ -778,10 +780,6 @@ keys! {
         "Bei der Systemanmeldung starten",
         "Start at system login"
     ],
-    StartWithSystem => [
-        "Mit dem System starten",
-        "Start with the system"
-    ],
     SaveConfigAuto => [
         "Einstellungen automatisch in config.ini speichern",
         "Save settings automatically to config.ini"
@@ -803,6 +801,10 @@ keys! {
         "Running without elevated privileges; actions on protected processes may be limited."
     ],
     RestartElevated => ["Mit erhöhten Rechten neu starten", "Restart with elevated privileges"],
+    ElevatedUnknown => [
+        "Status der erhÃ¶hten Rechte unbekannt.",
+        "Elevation status unknown."
+    ],
     StartElevated => [
         "Immer mit erhöhten Rechten starten",
         "Always start with elevated privileges"

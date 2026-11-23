@@ -110,6 +110,8 @@ pub struct GpuEngineRecord {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GpuAdapterMemRecord {
     pub luid: RawLuid,
+    pub dedicated_available: bool,
+    pub shared_available: bool,
     pub dedicated_bytes: u64,
     pub shared_bytes: u64,
 }
@@ -530,6 +532,8 @@ impl PdhCounters {
             .into_iter()
             .map(|luid| GpuAdapterMemRecord {
                 luid,
+                dedicated_available: ded.contains_key(&luid),
+                shared_available: shared.contains_key(&luid),
                 dedicated_bytes: ded.get(&luid).copied().unwrap_or(0),
                 shared_bytes: shared.get(&luid).copied().unwrap_or(0),
             })

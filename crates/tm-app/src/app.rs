@@ -221,10 +221,12 @@ pub struct SharedState {
     /// Cached service/startup/user lists refreshed lazily in the background.
     pub services_cache: Arc<Mutex<Option<crate::tabs::services::Cache>>>,
     pub startup_cache: CachedVec<tm_core::model::StartupItem>,
+    pub startup_error: Arc<Mutex<Option<String>>>,
     /// Per-list facts the Startup page needs every frame, computed by the
     /// fetch job (see `tabs::startup::Derived`).
     pub startup_derived: Arc<Mutex<Arc<crate::tabs::startup::Derived>>>,
     pub sessions_cache: CachedVec<tm_core::model::UserSession>,
+    pub sessions_error: Arc<Mutex<Option<String>>>,
     /// Shell icon textures keyed by executable path (lazy worker inside).
     pub icons: crate::icon_cache::IconCache,
     /// Toast queue. Workers push, the UI drains.
@@ -334,7 +336,7 @@ pub struct TaskManApp {
     /// Elevation status of THIS process; fixed at process creation, so it is
     /// queried exactly once. Backends advertise whether the status is
     /// meaningful before Settings renders it.
-    pub is_elevated: bool,
+    pub is_elevated: Option<bool>,
     pub shared: SharedState,
     /// Rolling tick history for all Performance-tab charts. MUST stay a
     /// contiguous, append-ordered buffer (plain `Vec`): the Performance tab
@@ -613,7 +615,7 @@ impl TaskManApp {
         // ---- cheap platform surface only -----------------------------------
         // Never construct a collector just to get actions (§4.3).
         let actions = create_app_actions(mock);
-        let is_elevated = actions.is_elevated();
+        let is_elevated = actions.elevation_status();
 
         // Frame-rate diagnostics: TASKMAN_FPS_PROBE=1 forces a continuous
         // frame stream and overlays/logs the achieved rate vs display Hz.
@@ -875,8 +877,10 @@ impl TaskManApp {
                 settings,
                 services_cache: Arc::new(Mutex::new(None)),
                 startup_cache: Arc::new(Mutex::new(None)),
+                startup_error: Arc::default(),
                 startup_derived: Arc::default(),
                 sessions_cache: Arc::new(Mutex::new(None)),
+                sessions_error: Arc::default(),
                 icons: crate::icon_cache::IconCache::default(),
                 toasts,
                 executor,
@@ -1409,7 +1413,9 @@ impl TaskManApp {
         self.engine.request_refresh();
         *tm_core::sync::lock(&self.shared.services_cache) = None;
         *tm_core::sync::lock(&self.shared.startup_cache) = None;
+        *tm_core::sync::lock(&self.shared.startup_error) = None;
         *tm_core::sync::lock(&self.shared.sessions_cache) = None;
+        *tm_core::sync::lock(&self.shared.sessions_error) = None;
         // Display caches rebuild on the next snapshot/tick generation.
         self.processes_state.invalidate();
         self.details_state.invalidate();
@@ -1837,7 +1843,9 @@ fn route_global_keyboard(app: &mut TaskManApp, ctx: &egui::Context) {
     }
     if modifiers.ctrl && pressed(egui::Key::N) {
         consume(egui::Key::N);
-        app.run_dialog_open = true;
+        if app.actions.capabilities().run_new_task {
+            app.run_dialog_open = true;
+        }
         return;
     }
     if modifiers.ctrl && pressed(egui::Key::Comma) {

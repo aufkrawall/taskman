@@ -89,11 +89,13 @@ pub(crate) fn is_privileged_helper_arg(argument: &str) -> bool {
     argument.starts_with(PRIVILEGED_ARG_PREFIX)
 }
 
-/// Build the exact argv passed to `pkexec` after the executable path.
+/// Build the exact typed argv for a protected helper invocation.
 ///
 /// No value is ever concatenated into a shell command. Every action field is
 /// carried by its own typed flag, and relaunch arguments remain distinct argv
-/// entries even when they contain spaces or shell metacharacters.
+/// entries even when they contain spaces or shell metacharacters. The current
+/// portable GUI does not pass this argv to `pkexec`; only trusted `systemctl`
+/// is elevated until a protected helper image is installed.
 #[cfg(test)]
 pub(crate) fn invocation_args(action: &PrivilegedAction) -> Result<Vec<String>, String> {
     let mut args = Vec::new();

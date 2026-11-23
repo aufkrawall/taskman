@@ -290,6 +290,12 @@ impl State {
             self.files.retain(|file| file.open_handles > 0);
         }
         if self.files.len() > MAX_RETAINED_IO_ROWS {
+            if let Some(accounting) = self.accounting.as_mut() {
+                // The cap is a presentation/retention limit, so the table is
+                // intentionally incomplete even when the backend enumeration
+                // itself succeeded.
+                accounting.handles_complete = false;
+            }
             let mut open = Vec::new();
             let mut closed = Vec::new();
             for file in self.files.drain(..) {
@@ -773,11 +779,9 @@ pub fn show(
     }
     if display_files.is_empty() {
         ui.add_space(6.0);
-        let unavailable = handles_incomplete
-            || state
-                .accounting
-                .as_ref()
-                .is_none_or(|accounting| accounting.state != FileIoAccountingState::Measured);
+        // Per-file byte/op accounting is normally Unavailable, but the file
+        // LIST is still a measured fact when handle enumeration completed.
+        let unavailable = handles_incomplete || state.accounting.is_none();
         let msg = if unavailable {
             i18n::tr(K::PropIoFilesUnavailable)
         } else if !state.file_filter.trim().is_empty() {
@@ -1740,6 +1744,39 @@ mod tests {
             },
         });
         assert!(state.files.is_empty());
+        assert_eq!(
+            state.accounting.as_ref().map(|a| a.handles_complete),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn retained_row_cap_marks_the_presented_snapshot_incomplete() {
+        let files = (0..=MAX_RETAINED_IO_ROWS)
+            .map(|index| tm_platform::actions::ProcessFileIo {
+                path: format!("/tmp/file-{index}"),
+                read_bytes: None,
+                write_bytes: None,
+                read_ops: None,
+                write_ops: None,
+                file_size: None,
+                offset: None,
+                access_known: false,
+                is_read: false,
+                is_write: false,
+                open_handles: 1,
+            })
+            .collect();
+        let mut state = State::default();
+        state.merge_files(ProcessFileIoSnapshot {
+            files,
+            accounting: FileIoAccounting {
+                handles_complete: true,
+                ..Default::default()
+            },
+        });
+
+        assert_eq!(state.files.len(), MAX_RETAINED_IO_ROWS);
         assert_eq!(
             state.accounting.as_ref().map(|a| a.handles_complete),
             Some(false)

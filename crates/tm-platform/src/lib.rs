@@ -6,16 +6,14 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 
 pub mod actions;
-#[cfg(any(target_os = "linux", test))]
-pub(crate) mod command_line;
 /// Freedesktop icon-theme lookup, shared by the Unix backends. Platform-
 /// neutral on purpose so its tests run on every host.
 pub mod xdg_icons;
 
-/// Shell-free parsing for the Run dialog and the Linux Polkit helper.
+/// Shell-free parsing for the Run dialog and typed Linux helper arguments.
 #[cfg(any(target_os = "linux", test))]
 mod command_line;
-/// Pure parsing and construction for Linux privileged helper requests.
+/// Parsing and construction for a future protected Linux helper.
 #[cfg(any(target_os = "linux", test))]
 mod linux_action_support;
 

@@ -480,16 +480,37 @@ impl PlatformActions for MacActions {
         cmd.stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
-        let mut child = cmd
+        let child = cmd
             .spawn()
             .map_err(|e| tm_core::TmError::platform("spawn", e.to_string()))?;
-        std::thread::Builder::new()
+        let child = std::sync::Arc::new(std::sync::Mutex::new(Some(child)));
+        let reaper_child = std::sync::Arc::clone(&child);
+        let spawned = std::thread::Builder::new()
             .name("tm-macos-run-reaper".into())
             .spawn(move || {
+                if let Some(mut child) = reaper_child
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .take()
+                {
+                    let _ = child.wait();
+                }
+            });
+        if let Err(error) = spawned {
+            if let Some(mut child) = child
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .take()
+            {
+                let _ = child.kill();
                 let _ = child.wait();
-            })
-            .map(|_| ())
-            .map_err(|e| tm_core::TmError::platform("spawn reaper", e.to_string()))
+            }
+            return Err(tm_core::TmError::platform(
+                "spawn reaper",
+                error.to_string(),
+            ));
+        }
+        Ok(())
     }
     fn run_new_task_probe(&self, _command_line: &str, _elevate: bool) -> Result<()> {
         Err(tm_core::TmError::Unsupported(

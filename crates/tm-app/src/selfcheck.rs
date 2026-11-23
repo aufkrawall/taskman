@@ -51,6 +51,11 @@ pub fn run(mock: bool) -> i32 {
 
     // Unknown telemetry is reported as null, never as a fabricated zero — the
     // same invariant the UI renders as "—".
+    let session_capability = if mock {
+        false
+    } else {
+        tm_platform::create_actions().capabilities().users_sessions
+    };
     let summary = serde_json::json!({
         "ok": true,
         "backend": if mock { "mock".to_string() } else { "platform".to_string() },
@@ -64,6 +69,8 @@ pub fn run(mock: bool) -> i32 {
                 .then_some(snap.cpu.utilization_pct),
             "logical": snap.cpu.logical_count,
             "brand": snap.cpu.brand,
+            "kernel_pct": snap.cpu.kernel_pct,
+            "per_core_count": snap.cpu.per_core_pct.len(),
             // Measured current frequency; only the CPU_SPEED provider fills it.
             "freq_mhz": snap.cpu.freq_mhz,
         },
@@ -81,7 +88,19 @@ pub fn run(mock: bool) -> i32 {
             .filter_map(|d| d.active_pct)
             .reduce(f32::max),
         "networks": snap.networks.len(),
-        "gpus": snap.gpus.iter().map(|g| g.name.clone()).collect::<Vec<_>>(),
+        "network_metadata": {
+            "ipv4": snap.networks.iter().filter(|n| n.ipv4.is_some()).count(),
+            "ipv6": snap.networks.iter().filter(|n| n.ipv6.is_some()).count(),
+            "described": snap.networks.iter().filter(|n| !n.desc.is_empty()).count(),
+        },
+        "gpus": snap.gpus.iter().map(|g| serde_json::json!({
+            "name": g.name.clone(),
+            "util_available": g.util_pct_available,
+            "dedicated_available": g.dedicated_mem_available,
+            "shared_available": g.shared_mem_available,
+            "engine_count": g.engines.len(),
+        })).collect::<Vec<_>>(),
+        "users_sessions_capable": session_capability,
         // How many processes carry a per-process network reading. `0` with a
         // running trace is a real answer; the provider is simply unavailable
         // without administrator rights.
@@ -131,7 +150,11 @@ pub fn run(mock: bool) -> i32 {
     let _ = join.join();
 
     // Basic sanity gates.
-    if !mock && (snap.processes.len() < 5 || snap.cpu.logical_count == 0) {
+    if !mock
+        && (snap.processes.len() < 5
+            || snap.cpu.logical_count == 0
+            || !snap.cpu.utilization_pct_available)
+    {
         eprintln!("selfcheck: implausible snapshot; failing");
         return 1;
     }

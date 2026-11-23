@@ -127,10 +127,10 @@ impl StartupTrace {
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
 
-    // Short-lived privileged helper for Linux service/process actions and
-    // the validated same-executable relaunch. Handle it before logging,
-    // locale, settings or any renderer initialization so pkexec never
-    // flashes the GUI.
+    // Root-only diagnostic/helper entry point retained for a future protected
+    // Linux install. The portable GUI never asks pkexec to execute this
+    // user-writable binary; trusted service elevation launches systemctl.
+    // Handle it before logging, locale, settings or renderer initialization.
     #[cfg(target_os = "linux")]
     if let Some(code) = tm_platform::linux::polkit::handle_helper(&args) {
         std::process::exit(code);
@@ -351,7 +351,9 @@ fn run_gui(mock: bool, args: &[String]) {
     #[cfg(target_os = "windows")]
     if settings.start_elevated
         && std::env::var_os("TASKMAN_CONFIG_DIR").is_none()
-        && !tm_platform::win::is_elevated()
+        // A failed token query is unknown, not a reason to request a redundant
+        // UAC handoff.
+        && tm_platform::win::elevation_status() == Some(false)
     {
         let mut forwarded_args = args.to_vec();
         if tm_platform::win::instance::is_unresponsive_marked() {
@@ -887,6 +889,17 @@ struct NativeActivation {
     inbox: Option<tm_platform::linux::activation::ActivationInbox>,
 }
 
+#[cfg(target_os = "linux")]
+const LINUX_ACTIVATION_CONFIRM_DEADLINE: std::time::Duration =
+    std::time::Duration::from_millis(700);
+
+#[cfg(target_os = "linux")]
+struct LinuxActivationPending {
+    request: tm_platform::linux::activation::ActivationRequest,
+    queued_ui_seq: u64,
+    deadline: std::time::Instant,
+}
+
 impl NativeActivation {
     fn install_waker(&self, ctx: &eframe::egui::Context) {
         #[cfg(target_os = "linux")]
@@ -898,47 +911,46 @@ impl NativeActivation {
         let _ = ctx;
     }
 
-    /// Apply every queued activation on the UI thread. The acknowledgement is
-    /// sent only after show/unminimize/focus commands have been queued.
-    fn apply_pending(&self, ctx: &eframe::egui::Context) -> Vec<ActivationRequest> {
-        #[cfg(target_os = "linux")]
-        {
-            let mut pending = Vec::new();
-            if let Some(inbox) = &self.inbox {
-                while let Some(request) = inbox.try_recv() {
-                    ctx.send_viewport_cmd(eframe::egui::ViewportCommand::Visible(true));
-                    ctx.send_viewport_cmd(eframe::egui::ViewportCommand::Minimized(false));
-                    ctx.send_viewport_cmd(eframe::egui::ViewportCommand::Focus);
-                    ctx.send_viewport_cmd(eframe::egui::ViewportCommand::RequestUserAttention(
-                        eframe::egui::UserAttentionType::Critical,
-                    ));
-                    if linux_activation_can_focus() {
-                        tracing::info!("queued Linux activation request on the UI thread");
-                        pending.push(request);
-                    } else {
-                        tracing::info!(
-                            "Linux activation cannot confirm restoration on Wayland; new window will open"
-                        );
-                        request.reject();
-                    }
-                }
+    /// Queue show/unminimize/focus commands for every activation on the UI
+    /// thread. The caller decides whether the actual window backend can prove
+    /// that the resulting focus transition happened.
+    #[cfg(target_os = "linux")]
+    fn apply_pending(
+        &self,
+        ctx: &eframe::egui::Context,
+    ) -> Vec<tm_platform::linux::activation::ActivationRequest> {
+        let mut pending = Vec::new();
+        if let Some(inbox) = &self.inbox {
+            while let Some(request) = inbox.try_recv() {
+                ctx.send_viewport_cmd(eframe::egui::ViewportCommand::Visible(true));
+                ctx.send_viewport_cmd(eframe::egui::ViewportCommand::Minimized(false));
+                ctx.send_viewport_cmd(eframe::egui::ViewportCommand::Focus);
+                ctx.send_viewport_cmd(eframe::egui::ViewportCommand::RequestUserAttention(
+                    eframe::egui::UserAttentionType::Critical,
+                ));
+                pending.push(request);
             }
-            pending
         }
-        #[cfg(not(target_os = "linux"))]
-        {
-            let _ = ctx;
-            Vec::new()
-        }
+        pending
     }
 }
 
 #[cfg(target_os = "linux")]
-fn linux_activation_can_focus() -> bool {
-    !std::env::var("XDG_SESSION_TYPE")
-        .ok()
-        .is_some_and(|kind| kind.eq_ignore_ascii_case("wayland"))
-        && !std::env::var_os("WAYLAND_DISPLAY").is_some_and(|value| !value.is_empty())
+fn linux_activation_can_confirm_focus(frame: &eframe::Frame) -> bool {
+    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    matches!(
+        frame.window_handle().map(|handle| handle.as_raw()),
+        Ok(RawWindowHandle::Xlib(_) | RawWindowHandle::Xcb(_))
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn linux_activation_restore_confirmed(
+    painted_after_request: bool,
+    minimized: Option<bool>,
+    focused: Option<bool>,
+) -> bool {
+    painted_after_request && minimized == Some(false) && focused == Some(true)
 }
 
 /// Thin native-shell wrapper. TaskManApp already owns all UI/application
@@ -948,9 +960,9 @@ struct NativeApp {
     inner: app::TaskManApp,
     activation: NativeActivation,
     #[cfg(target_os = "linux")]
-    linux_activation_acks: Vec<tm_platform::linux::activation::ActivationRequest>,
+    linux_activation_acks: Vec<LinuxActivationPending>,
     #[cfg(target_os = "linux")]
-    linux_activation_painted: bool,
+    linux_activation_ui_seq: u64,
     #[cfg(target_os = "windows")]
     tray: Option<TrayShell>,
     #[cfg(target_os = "windows")]
@@ -1024,7 +1036,7 @@ impl NativeApp {
             #[cfg(target_os = "linux")]
             linux_activation_acks: Vec::new(),
             #[cfg(target_os = "linux")]
-            linux_activation_painted: false,
+            linux_activation_ui_seq: 0,
             #[cfg(target_os = "windows")]
             tray,
             #[cfg(target_os = "windows")]
@@ -1054,6 +1066,45 @@ impl NativeApp {
         }
     }
 
+    #[cfg(target_os = "linux")]
+    fn resolve_linux_activations(&mut self, ctx: &eframe::egui::Context) {
+        if self.linux_activation_acks.is_empty() {
+            return;
+        }
+        let (minimized, focused) =
+            ctx.input(|input| (input.viewport().minimized, input.viewport().focused));
+        let now = std::time::Instant::now();
+        let ui_seq = self.linux_activation_ui_seq;
+        let mut still_pending = Vec::with_capacity(self.linux_activation_acks.len());
+        let mut next_wake = None;
+        for pending in self.linux_activation_acks.drain(..) {
+            let painted_after_request = ui_seq > pending.queued_ui_seq;
+            if linux_activation_restore_confirmed(painted_after_request, minimized, focused) {
+                pending.request.acknowledge();
+                tracing::info!("confirmed Linux activation restore and focus");
+            } else if now >= pending.deadline {
+                tracing::info!(
+                    minimized = ?minimized,
+                    focused = ?focused,
+                    painted_after_request,
+                    "Linux activation could not be confirmed; new window will open"
+                );
+                pending.request.reject();
+            } else {
+                next_wake = Some(
+                    next_wake.map_or(pending.deadline, |current: std::time::Instant| {
+                        current.min(pending.deadline)
+                    }),
+                );
+                still_pending.push(pending);
+            }
+        }
+        self.linux_activation_acks = still_pending;
+        if let Some(deadline) = next_wake {
+            ctx.request_repaint_after(deadline.saturating_duration_since(now));
+        }
+    }
+
     fn shutdown(&mut self) {
         #[cfg(target_os = "windows")]
         if let Some(tray) = &mut self.tray {
@@ -1069,18 +1120,36 @@ impl NativeApp {
 impl eframe::App for NativeApp {
     fn logic(&mut self, ctx: &eframe::egui::Context, frame: &mut eframe::Frame) {
         #[cfg(target_os = "linux")]
-        if self.linux_activation_painted {
-            for request in self.linux_activation_acks.drain(..) {
-                request.acknowledge();
-            }
-            self.linux_activation_painted = false;
-        }
+        self.resolve_linux_activations(ctx);
+        #[cfg(target_os = "linux")]
         let activation_requests = self.activation.apply_pending(ctx);
+        #[cfg(not(target_os = "linux"))]
+        let activation_requests = Vec::new();
         if !activation_requests.is_empty() {
             self.hidden_to_tray = false;
             self.initial_hide_pending = false;
             #[cfg(target_os = "linux")]
-            self.linux_activation_acks.extend(activation_requests);
+            {
+                let can_confirm = linux_activation_can_confirm_focus(frame);
+                let ui_seq = self.linux_activation_ui_seq;
+                for request in activation_requests {
+                    if can_confirm {
+                        self.linux_activation_acks.push(LinuxActivationPending {
+                            request,
+                            queued_ui_seq: ui_seq,
+                            deadline: std::time::Instant::now() + LINUX_ACTIVATION_CONFIRM_DEADLINE,
+                        });
+                    } else {
+                        tracing::info!(
+                            "Linux activation cannot confirm restoration on Wayland; new window will open"
+                        );
+                        request.reject();
+                    }
+                }
+                if !self.linux_activation_acks.is_empty() {
+                    ctx.request_repaint_after(LINUX_ACTIVATION_CONFIRM_DEADLINE);
+                }
+            }
             #[cfg(not(target_os = "linux"))]
             let _ = activation_requests;
             ctx.request_repaint();
@@ -1180,10 +1249,6 @@ impl eframe::App for NativeApp {
     }
 
     fn ui(&mut self, ui: &mut eframe::egui::Ui, frame: &mut eframe::Frame) {
-        #[cfg(target_os = "linux")]
-        {
-            self.linux_activation_painted = true;
-        }
         #[cfg(target_os = "windows")]
         if self.hwnd.is_none() {
             use raw_window_handle::{HasWindowHandle, RawWindowHandle};
@@ -1203,6 +1268,13 @@ impl eframe::App for NativeApp {
             ui.ctx().input_mut(|i| i.focused = true);
         }
         <app::TaskManApp as eframe::App>::ui(&mut self.inner, ui, frame);
+        #[cfg(target_os = "linux")]
+        {
+            self.linux_activation_ui_seq = self.linux_activation_ui_seq.wrapping_add(1);
+            if !self.linux_activation_acks.is_empty() {
+                ui.ctx().request_repaint();
+            }
+        }
         #[cfg(target_os = "windows")]
         {
             self.handle_tray_actions(ui.ctx());
@@ -2056,5 +2128,31 @@ mod tests {
             "{musl}"
         );
         assert!(musl.contains("glibc linux-x86_64"), "{musl}");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn activation_requires_a_post_request_paint_restore_and_focus() {
+        assert!(linux_activation_restore_confirmed(
+            true,
+            Some(false),
+            Some(true)
+        ));
+        assert!(!linux_activation_restore_confirmed(
+            false,
+            Some(false),
+            Some(true)
+        ));
+        assert!(!linux_activation_restore_confirmed(
+            true,
+            Some(true),
+            Some(true)
+        ));
+        assert!(!linux_activation_restore_confirmed(
+            true,
+            Some(false),
+            Some(false)
+        ));
+        assert!(!linux_activation_restore_confirmed(true, None, None));
     }
 }

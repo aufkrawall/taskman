@@ -308,7 +308,7 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
         };
         if stale && app.shared.sessions_fetch.begin() {
             let cache = app.shared.sessions_cache.clone();
-            let toasts = app.shared.toasts.clone();
+            let error_slot = app.shared.sessions_error.clone();
             let done = app.shared.sessions_fetch.flag();
             let actions = app.actions.clone();
             let wake = {
@@ -317,12 +317,10 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
             };
             let job = move || {
                 let sessions = actions.list_user_sessions();
-                if let Err(e) = &sessions {
-                    crate::app::toast_from(
-                        &toasts,
-                        i18n::trf(K::SessionsUnavailable, &[&e.to_string()]),
-                    );
-                }
+                *tm_core::sync::lock(&error_slot) = sessions
+                    .as_ref()
+                    .err()
+                    .map(|error| i18n::trf(K::SessionsUnavailable, &[&error.to_string()]));
                 *tm_core::sync::lock(&cache) = Some((sessions.unwrap_or_default(), Instant::now()));
                 done.store(false, std::sync::atomic::Ordering::Relaxed);
                 wake();
@@ -395,6 +393,11 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
             }
         },
     );
+
+    if let Some(error) = tm_core::sync::lock(&app.shared.sessions_error).clone() {
+        ui.centered_and_justified(|ui| ui.colored_label(pal.heat_high, error));
+        return;
+    }
 
     let sessions_arc = app.shared.sessions_cache.clone();
     let guard = tm_core::sync::lock(&sessions_arc);

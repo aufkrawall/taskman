@@ -260,11 +260,16 @@ impl WheelRepaintThrottle {
         if !wants_repaint {
             return WheelRepaint::Skip;
         }
-        if self.trailing_at.is_some() {
+        if let Some(trailing_at) = self.trailing_at {
             // A repaint is already pending and will take the input queued so
             // far. This also covers an event arriving between the deadline
             // and the event-loop turn that delivers the trailing frame.
-            return WheelRepaint::Coalesced;
+            if now < trailing_at {
+                return WheelRepaint::Coalesced;
+            }
+            // The callback can be dropped as outdated by eframe. Do not let
+            // that lost token wedge every later wheel event in Coalesced.
+            self.trailing_at = None;
         }
         if let Some(last) = self.last_repaint
             && let Some(next_allowed) = last.checked_add(min_interval)
@@ -274,6 +279,7 @@ impl WheelRepaintThrottle {
             return WheelRepaint::After(next_allowed - now);
         }
         self.last_repaint = Some(now);
+        self.trailing_at = None;
         WheelRepaint::Now
     }
 
@@ -3152,6 +3158,26 @@ mod wheel_repaint_tests {
 
         throttle.note_frame(at(t0, 32), true);
         assert!(repaint(&ctx, &mut throttle, &stats, at(t0, 48), true));
+    }
+
+    #[test]
+    fn expired_trailing_repaint_token_cannot_wedge_later_wheel_events() {
+        let ctx = egui::Context::default();
+        let mut throttle = WheelRepaintThrottle::default();
+        let stats = AtomicWheelRepaintStats::default();
+        let t0 = web_time::Instant::now();
+
+        assert!(repaint(&ctx, &mut throttle, &stats, t0, true));
+        throttle.note_frame(t0, true);
+        assert!(!repaint(&ctx, &mut throttle, &stats, at(t0, 4), true));
+        assert_eq!(throttle.trailing_at, Some(at(t0, 16)));
+
+        // The trailing callback was dropped, so no frame consumed the queued
+        // delta. A later wheel report must recover rather than staying
+        // Coalesced forever.
+        assert!(repaint(&ctx, &mut throttle, &stats, at(t0, 20), true));
+        assert_eq!(throttle.last_repaint, Some(at(t0, 20)));
+        assert!(throttle.trailing_at.is_none());
     }
 
     #[test]

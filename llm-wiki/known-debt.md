@@ -376,27 +376,25 @@ remain follow-up rather than being simulated in headless tests:
 - **Linux Run no longer interprets shell syntax.** It tokenizes quotes and
   escapes and launches the resulting argv directly, so pipes, redirects,
   command substitution, globbing and `;` remain ordinary arguments. This is
-  deliberate: the same action must never become arbitrary text in the
-  privileged helper. A user who needs shell composition should run a shell
+  deliberate: the same action must never become arbitrary text on a future
+  privileged surface. A user who needs shell composition should run a shell
   explicitly and remains responsible for that unprivileged launch.
 - **Linux Properties uses the containing directory.** `xdg-open` has no
   standardized properties verb, so the action opens the parent directory
   rather than opening the file with an unrelated default application. A
   proper properties dialog needs a FileManager1 implementation or
   file-manager-specific integration.
-- **Root GUI relaunch can still be refused by the desktop.** Desktop variables
-  are allowlisted, but Wayland/X11 access can still be refused by the
-  compositor or Polkit agent. The elevated GUI also inherits the root account's
-  home rather than the caller's per-user configuration directory.
-- **There is no TaskMan-specific Polkit policy.** The helper uses the desktop's
-  normal `pkexec` prompt. Deployment can add a narrowly scoped policy later,
-  but no installer or daemon is required for the current flow.
-- **The helper image is not hash-pinned.** With no installer or daemon there
-  is no protected same-binary copy to compare against. The helper protocol and
-  target checks narrow what an authorized run can do, but Polkit's authorization
-  prompt remains the only boundary for executing the current TaskMan image as
-  root. A packaged deployment should install a root-owned image and, optionally,
-  a TaskMan-specific Polkit action.
+- **Privileged process actions need a protected helper.** A portable install
+  deliberately refuses to elevate the mutable TaskMan image, so kill/suspend/
+  resume, priority and affinity remain limited to processes the same user may
+  already control. A packaged deployment needs a root-owned helper and,
+  optionally, a narrowly scoped TaskMan Polkit action.
+- **Linux has no elevated GUI relaunch.** A portable install hides and rejects
+  that action instead of executing its own user-writable image as root. The
+  current Settings elevation block therefore reports status only.
+- **There is no TaskMan-specific service-control policy.** The active Polkit
+  path invokes trusted `systemctl`, so authorization follows the desktop's
+  normal systemd unit-management policy. No installer or daemon is required.
 
 ### 2026-11-22 reliability-review residuals
 
@@ -437,13 +435,17 @@ remain follow-up rather than being simulated in headless tests:
 
 ### 2026-11-23 Linux activation/autostart residuals
 
-- **Linux activation focus is best-effort.** The primary queues
-  `Visible(true)`, `Minimized(false)`, `Focus`, and a critical attention
-  request on its UI thread; the secondary exits once that UI work is
-  acknowledged, not after compositor confirmation. X11 normally honors focus;
-  Wayland compositors may reject programmatic focus and may present only an
-  attention hint. There is no portable stronger mechanism, and adding an
-  X11-only EWMH path was not attempted.
+- **Linux activation success requires observed X11 focus.** The primary queues
+  `Visible(true)`, `Minimized(false)`, `Focus`, and attention, then waits for a
+  later UI pass reporting `minimized=false` and `focused=true` before
+  acknowledging. A failed or missing focus transition is rejected so the
+  waiting launch opens independently. This is winit/egui state, not a direct
+  compositor acknowledgement, and Wayland does not attempt the handoff because
+  its programmatic focus path is unavailable.
+- **Activation shutdown can wait for one in-flight handoff.** The listener's
+  eventfd interrupts accept polling, but a peer already inside a bounded
+  connection read/write can delay GUI shutdown by up to the five-second
+  handoff deadline.
 - **The coordinator is per `XDG_RUNTIME_DIR`, not per graphical seat.** Two
   simultaneous graphical sessions for the same Unix user can therefore share
   one activation endpoint. The owner-only directory and same-UID
@@ -464,6 +466,35 @@ remain follow-up rather than being simulated in headless tests:
   because the Startup page can deliberately set `Hidden=true` on the same
   file and a later launch must not undo that choice. For the same reason, a
   Startup-page toggle of that file does not update the Settings checkbox.
+- **Autostart parent ancestry still has a same-user TOCTOU window.** The final
+  `autostart` directory must be real, current-user owned and not group/other
+  writable, and final publication is no-replace/atomic. Symlinked ancestors and
+  a same-user swap between validation and path-based rename/unlink are not
+  eliminated with directory-FD `openat`/`renameat`/`unlinkat` operations.
+
+### 2026-11-23 remaining Linux parity contracts
+
+- **Per-core history is positional, not CPU-ID keyed.** The Linux sampler
+  detects topology changes and inserts a gap, but labels vectors as CPU 0..N.
+  A non-contiguous online set such as CPU 0 and CPU 2 is presented as CPU 0
+  and CPU 1 until the model carries logical IDs alongside percentages.
+- **GPU history identity is the display index.** Linux derives `GpuInfo::id`
+  from sorted card enumeration; if cards appear or disappear, a different
+  adapter can inherit the same history slot. A stable PCI/sysfs identity is
+  needed for multi-GPU hotplug.
+- **Users maps only exact `session-N.scope` cgroups.** That is deliberate and
+  avoids guessing from usernames, but some systemd user-manager application
+  scopes under `user@UID.service` have no session component and therefore do
+  not contribute to session rollups.
+- **Linux-only tests are still not executed by the Windows host gate.** The
+  final gate cross-checks the non-host targets, which type-checks Linux tests
+  only if the test targets themselves are included; parser/live-procfs
+  regression tests still need a native Linux CI runner.
+- **`tm-platform::Capabilities` remains a public exhaustive struct.** New
+  fields preserve the in-tree callers and the deprecated startup method alias,
+  but downstream exhaustive literals and old field access still break. If the
+  crate is consumed externally, introduce a builder/accessor contract or a
+  deliberate compatibility major bump.
 
 ## Row/total audit leftovers (2026-10-21)
 

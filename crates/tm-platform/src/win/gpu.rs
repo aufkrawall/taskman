@@ -692,8 +692,8 @@ pub fn merge(
                 pci_location: a.pci_location,
                 util_pct_available: !engines.is_empty(),
                 util_pct: util,
-                dedicated_mem_available: true,
-                shared_mem_available: true,
+                dedicated_mem_available: mem.is_some_and(|m| m.dedicated_available),
+                shared_mem_available: mem.is_some_and(|m| m.shared_available),
                 mem_used_bytes: ded_used,
                 mem_total_bytes: a.dedicated_vram,
                 dedicated_used_bytes: ded_used,
@@ -859,6 +859,43 @@ mod tests {
         assert_eq!(merged[1].engines.len(), 0);
         assert_eq!(merged[0].luid, Some(luid(0x1111)));
         assert_eq!(merged[1].luid, Some(luid(0x2222)));
+        assert!(!merged[0].dedicated_mem_available);
+        assert!(!merged[0].shared_mem_available);
+    }
+
+    #[test]
+    fn missing_adapter_memory_is_unknown_not_measured_zero() {
+        let adapters = vec![AdapterInfo {
+            name: "gpu".into(),
+            dedicated_vram: 4096,
+            shared_system_memory: 8192,
+            luid: luid(7),
+            ..Default::default()
+        }];
+        let merged = merge(adapters, &[], &[]);
+        assert_eq!(merged.len(), 1);
+        assert!(!merged[0].dedicated_mem_available);
+        assert!(!merged[0].shared_mem_available);
+
+        let partial = merge(
+            vec![AdapterInfo {
+                name: "gpu".into(),
+                dedicated_vram: 4096,
+                shared_system_memory: 8192,
+                luid: luid(7),
+                ..Default::default()
+            }],
+            &[],
+            &[GpuAdapterMemRecord {
+                luid: luid(7),
+                dedicated_available: true,
+                shared_available: false,
+                dedicated_bytes: 123,
+                shared_bytes: 0,
+            }],
+        );
+        assert!(partial[0].dedicated_mem_available);
+        assert!(!partial[0].shared_mem_available);
     }
 
     #[test]
@@ -891,11 +928,15 @@ mod tests {
         let adapter_mems = vec![
             GpuAdapterMemRecord {
                 luid: luid(7),
+                dedicated_available: true,
+                shared_available: true,
                 dedicated_bytes: 10,
                 shared_bytes: 4,
             },
             GpuAdapterMemRecord {
                 luid: luid(9),
+                dedicated_available: true,
+                shared_available: true,
                 dedicated_bytes: 999,
                 shared_bytes: 0,
             },
@@ -1071,6 +1112,8 @@ mod tests {
         // Real adapter usage: 1.5 GB dedicated, 150 MB shared.
         let adapter_mems = vec![GpuAdapterMemRecord {
             luid: luid(42),
+            dedicated_available: true,
+            shared_available: true,
             dedicated_bytes: 1_500_000_000,
             shared_bytes: 150_000_000,
         }];
