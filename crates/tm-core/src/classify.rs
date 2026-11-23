@@ -127,9 +127,24 @@ pub enum DesktopRoleEvidence {
     Unknown,
 }
 
+/// The platform whose name and PID rules apply to a classification decision.
+///
+/// Callers must choose explicitly rather than relying on which build is
+/// running: snapshots and tests can be inspected on a host other than the
+/// platform that produced them. `Unix` covers Linux and macOS.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProcessPlatform {
+    Windows,
+    Unix,
+}
+
 /// Classification input gathered from a snapshot's raw fields.
 #[derive(Debug, Clone)]
 pub struct ClassifyInput<'a> {
+    /// Selects the platform-specific hard System rules. Windows applies its
+    /// PID 0-4 and core-image names; Unix applies kernel-thread names and its
+    /// conservative userspace-infrastructure fallback.
+    pub platform: ProcessPlatform,
     pub pid: u32,
     pub name: &'a str,
     /// Window ownership when the platform could observe it. `None` means the
@@ -151,23 +166,32 @@ pub struct ClassifyInput<'a> {
     pub desktop_role: Option<DesktopRoleEvidence>,
 }
 
-/// Precedence: hard kernel/Windows/PID-1 System evidence, a positive System
+/// Precedence: platform-specific hard System evidence, a positive System
 /// desktop role, observed window ownership, positive desktop App/Background
 /// evidence, userspace Unix infrastructure-name fallback, then Unknown. A
 /// missing window observation is never a negative window fact.
 pub fn classify(input: ClassifyInput<'_>) -> ProcCategory {
     let name = normalize(input.name);
 
-    if input.pid <= 4 || is_kernel_name(&name) || is_unix_kernel_name(&name) {
-        return ProcCategory::System;
-    }
-
-    if input.critical == Some(true) {
-        return ProcCategory::System;
-    }
-
-    if is_windows_core_image(&name) && input.windows_owned.unwrap_or(true) {
-        return ProcCategory::System;
+    match input.platform {
+        ProcessPlatform::Windows => {
+            if input.pid <= 4 || is_kernel_name(&name) {
+                return ProcCategory::System;
+            }
+            if input.critical == Some(true) {
+                return ProcCategory::System;
+            }
+            if is_windows_core_image(&name) && input.windows_owned.unwrap_or(true) {
+                return ProcCategory::System;
+            }
+        }
+        ProcessPlatform::Unix => {
+            // Unix `critical` and `windows_owned` fields are Windows-only
+            // evidence and must not leak into the Unix decision.
+            if is_unix_kernel_name(&name) {
+                return ProcCategory::System;
+            }
+        }
     }
 
     // system.slice/init.scope membership is positive system evidence. It
@@ -185,7 +209,11 @@ pub fn classify(input: ClassifyInput<'_>) -> ProcCategory {
             Some(DesktopRoleEvidence::Background) => ProcCategory::Background,
             Some(DesktopRoleEvidence::System) => ProcCategory::System,
             Some(DesktopRoleEvidence::Unknown) => ProcCategory::Unknown,
-            None if is_unix_userspace_infrastructure(&name) => ProcCategory::System,
+            None if input.platform == ProcessPlatform::Unix
+                && is_unix_userspace_infrastructure(&name) =>
+            {
+                ProcCategory::System
+            }
             None => ProcCategory::Unknown,
         },
     }
@@ -203,12 +231,30 @@ mod tests {
         windows_owned: Option<bool>,
     ) -> ProcCategory {
         classify(ClassifyInput {
+            platform: ProcessPlatform::Windows,
             pid,
             name,
             has_window: Some(has_window),
             critical,
             windows_owned,
             desktop_role: None,
+        })
+    }
+
+    fn classify_unix(
+        pid: u32,
+        name: &str,
+        has_window: Option<bool>,
+        desktop_role: Option<DesktopRoleEvidence>,
+    ) -> ProcCategory {
+        classify(ClassifyInput {
+            platform: ProcessPlatform::Unix,
+            pid,
+            name,
+            has_window,
+            critical: None,
+            windows_owned: None,
+            desktop_role,
         })
     }
 
@@ -278,6 +324,7 @@ mod tests {
     fn unknown_window_ownership_is_not_a_negative_window_fact() {
         assert_eq!(
             classify(ClassifyInput {
+                platform: ProcessPlatform::Windows,
                 pid: 3000,
                 name: "app",
                 has_window: None,
@@ -293,6 +340,7 @@ mod tests {
     fn desktop_roles_classify_only_when_window_evidence_is_absent() {
         let category = |has_window, desktop_role| {
             classify(ClassifyInput {
+                platform: ProcessPlatform::Windows,
                 pid: 3000,
                 name: "desktop-app",
                 has_window,
@@ -323,6 +371,7 @@ mod tests {
     fn system_role_wins_over_window_evidence() {
         let category = |has_window, desktop_role| {
             classify(ClassifyInput {
+                platform: ProcessPlatform::Windows,
                 pid: 3000,
                 name: "desktop-infrastructure",
                 has_window,
@@ -341,6 +390,7 @@ mod tests {
         );
         assert_eq!(
             classify(ClassifyInput {
+                platform: ProcessPlatform::Windows,
                 pid: 3000,
                 name: "svchost.exe",
                 has_window: Some(true),
@@ -356,6 +406,7 @@ mod tests {
     fn classification_precedence_is_system_window_negative_app_background_unknown() {
         let category = |has_window, desktop_role| {
             classify(ClassifyInput {
+                platform: ProcessPlatform::Windows,
                 pid: 3000,
                 name: "desktop-process",
                 has_window,
@@ -422,7 +473,7 @@ mod tests {
     }
 
     #[test]
-    fn low_pids_are_system() {
+    fn windows_low_pids_are_system() {
         assert_eq!(
             classify_win(4, "System", false, Some(true), None),
             ProcCategory::System
@@ -436,17 +487,39 @@ mod tests {
     #[test]
     fn unix_kernel_threads_are_system() {
         assert_eq!(
-            classify_win(55, "kworker/u16:2", false, None, None),
+            classify_unix(55, "kworker/u16:2", Some(false), None),
             ProcCategory::System
         );
         assert_eq!(
-            classify_win(1, "systemd", false, None, None),
+            classify_unix(1, "systemd", None, None),
             ProcCategory::System
         );
         assert_eq!(
-            classify_win(66, "[kworker/0:1]", false, None, None),
+            classify_unix(66, "[kworker/0:1]", Some(false), None),
             ProcCategory::System
         );
+    }
+
+    #[test]
+    fn windows_does_not_apply_unix_kernel_name_rules() {
+        for name in ["migration.exe", "kworker.exe", "systemd", "dbus-daemon"] {
+            assert_eq!(
+                classify_win(3000, name, false, None, Some(false)),
+                ProcCategory::Background,
+                "{name} must not inherit a Unix name rule on Windows"
+            );
+        }
+    }
+
+    #[test]
+    fn unix_low_pids_are_not_assumed_system() {
+        for pid in 1..=4 {
+            assert_eq!(
+                classify_unix(pid, "container-worker", None, None),
+                ProcCategory::Unknown,
+                "PID {pid} has no Windows-style boot-process meaning on Unix"
+            );
+        }
     }
 
     #[test]
@@ -454,6 +527,7 @@ mod tests {
         for name in ["systemd", "dbus-daemon", "dbus-broker"] {
             assert_eq!(
                 classify(ClassifyInput {
+                    platform: ProcessPlatform::Unix,
                     pid: 3000,
                     name,
                     has_window: None,
@@ -469,6 +543,7 @@ mod tests {
         for name in ["systemd-journald", "dbus-daemon", "dbus-broker"] {
             assert_eq!(
                 classify(ClassifyInput {
+                    platform: ProcessPlatform::Unix,
                     pid: 3000,
                     name,
                     has_window: None,
@@ -484,30 +559,52 @@ mod tests {
 
     #[test]
     fn hard_kernel_and_windows_evidence_wins_over_a_desktop_role() {
-        for (pid, name, owned) in [
-            (1, "systemd", None),
-            (3000, "kworker/u16:2", None),
-            (3000, "svchost.exe", Some(true)),
-        ] {
+        for (pid, name) in [(1, "[kworker/0:1]"), (3000, "kworker/u16:2")] {
             assert_eq!(
-                classify(ClassifyInput {
-                    pid,
-                    name,
-                    has_window: None,
-                    critical: None,
-                    windows_owned: owned,
-                    desktop_role: Some(DesktopRoleEvidence::Background),
-                }),
+                classify_unix(pid, name, None, Some(DesktopRoleEvidence::Background)),
                 ProcCategory::System,
                 "{name} must remain hard System evidence"
             );
         }
+        assert_eq!(
+            classify_win(3000, "svchost.exe", false, None, Some(true)),
+            ProcCategory::System,
+            "a verified Windows core image must remain hard System evidence"
+        );
+    }
+
+    #[test]
+    fn positive_unix_roles_win_over_userspace_names_even_at_low_pids() {
+        for (pid, name) in [(1, "systemd"), (2, "dbus-daemon"), (3, "dbus-broker")] {
+            assert_eq!(
+                classify_unix(pid, name, None, Some(DesktopRoleEvidence::Background)),
+                ProcCategory::Background,
+                "{name} inside an authoritative user session is not a Windows boot PID"
+            );
+        }
+    }
+
+    #[test]
+    fn unix_ignores_windows_only_critical_and_ownership_evidence() {
+        assert_eq!(
+            classify(ClassifyInput {
+                platform: ProcessPlatform::Unix,
+                pid: 3000,
+                name: "vendor-protector",
+                has_window: Some(false),
+                critical: Some(true),
+                windows_owned: Some(true),
+                desktop_role: None,
+            }),
+            ProcCategory::Background
+        );
     }
 
     #[test]
     fn authoritative_unknown_does_not_become_a_desktop_fact() {
         assert_eq!(
             classify(ClassifyInput {
+                platform: ProcessPlatform::Unix,
                 pid: 3000,
                 name: "dbus-daemon",
                 has_window: None,
@@ -523,6 +620,7 @@ mod tests {
     fn legacy_unknown_platform_evidence_retains_the_unix_name_fallback() {
         assert_eq!(
             classify(ClassifyInput {
+                platform: ProcessPlatform::Unix,
                 pid: 3000,
                 name: "dbus-daemon",
                 has_window: None,

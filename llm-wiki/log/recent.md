@@ -1,3 +1,36 @@
+## 2026-11-23 - Wayland classification final review corrections
+
+- The Linux collector now has one classifier mapper that passes
+  `DesktopEvidence::role_marker()` into `ClassifyInput`, so an authoritative
+  Unknown cannot fall back to the legacy Unix userspace-name rule. A collector
+  mapper regression covers synthetic-WSL `systemd`/`dbus-daemon` and a low-PID
+  user `systemd` Background role.
+- `ClassifyInput` gained a required public
+  `ProcessPlatform::{Windows,Unix}` discriminator. Windows PID <= 4/core-image/
+  critical/ownership rules no longer apply to Unix, and Unix kernel-thread/
+  userspace-name rules no longer apply to Windows. Tests cover Windows
+  `migration.exe`/`kworker.exe`, Unix container PIDs 1-4, Unix kernel threads,
+  user systemd/dbus roles, and the legacy Windows display tree preserving a
+  Background category for core-looking names.
+- User `app.slice` units now need a recognized launcher shape (`app-*` or
+  `snap.*.*.service`/`.scope`) for cgroup app identity. Generic valid units
+  such as `sleep.service`/`run-u42.scope` remain Unknown with inherited display
+  variables and only become Apps with a validated Flatpak/Snap/GIO/BAMF
+  launcher identity plus the graphical gate. Whitespace-only display variables
+  no longer satisfy that gate.
+- Hybrid cgroups now fall back from a root `0::/` to a useful non-root
+  `name=systemd` path while still preferring a useful unified path.
+- Cache hits revalidate the current `/proc/<pid>/stat` generation, remove stale
+  entries and reinspect on mismatch. Deterministic expiry jitter spreads refresh
+  over 4.5-5.5 seconds around the five-second nominal TTL to avoid one
+  synchronized sweep. Tests pin generation-mismatch reinspection, staggered
+  expiration and the bounded same-generation exec residual; environment and
+  cgroup membership are explicitly not treated as immutable.
+- Under the task restriction, no Cargo/rustc/test/Python/build command was run.
+  `cargo fmt --all`, static searches, `git diff --check` and the required
+  pre/post-commit secret scans are the available checks. Linux live-procfs and
+  target-specific tests remain unexecuted on this Windows host.
+
 ## 2026-11-23 - Native-Wayland classification review corrections
 
 - Corrected `desktop_session` role parsing: canonical user-scope keys have

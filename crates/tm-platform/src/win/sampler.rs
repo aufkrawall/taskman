@@ -2499,6 +2499,7 @@ fn refine_categories_and_group_apps(processes: &mut [ProcessEntry], window_scan_
             None
         };
         p.category = classify::classify(classify::ClassifyInput {
+            platform: classify::ProcessPlatform::Windows,
             pid: p.pid,
             name: &name,
             has_window,

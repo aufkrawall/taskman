@@ -1371,11 +1371,16 @@ The window itself is now treated as a thing that can fail, not as a given:
   cgroup hierarchy for each PID and supplies positive desktop-role evidence to
   `tm-core::classify`.
 - A user-manager or nested `session-N.scope` `app.slice/<unit>.scope` or
-  `.service` is an App only after a complete capped `/proc/<pid>/environ`
-  read contains a non-empty `WAYLAND_DISPLAY`, `WAYLAND_SOCKET` or `DISPLAY`.
-  A complete headless app.slice environment becomes Background; unavailable,
-  partial, oversized or ambiguous environment evidence leaves the role
-  Unknown. The display variables are a gate only, never app-family identity.
+  `.service` identifies an app family by cgroup only for the standard `app-*`
+  shape or a Snap launcher (`snap.*.*.service`/`.scope`). It becomes an App
+  only after a complete capped `/proc/<pid>/environ` read contains a
+  non-whitespace `WAYLAND_DISPLAY`, `WAYLAND_SOCKET` or `DISPLAY`. A complete
+  headless recognized app unit becomes Background. Arbitrary but well-formed
+  units such as `sleep.service` or `run-u42.scope` remain weak context and
+  become Apps only with a validated Flatpak/Snap/GIO/BAMF launcher identity;
+  inherited display variables alone leave them Unknown. Unavailable, partial,
+  oversized or ambiguous environment evidence also leaves the role Unknown.
+  Display variables are a gate only, never app-family identity.
 - Exact `session-N.scope`, user-manager `init.scope`,
   `background.slice/<valid-unit>` and `session.slice/<valid-unit>` are
   authoritative Background evidence. Generic `user@UID.service/...`
@@ -1385,15 +1390,18 @@ The window itself is now treated as a thing that can fail, not as a given:
 - Top-level `system.slice` and `init.scope` are System only when
   `/run/systemd/system` exists and `/proc/1/comm` resolves to exactly
   `systemd`; this check is cached. WSL layouts whose PID 1 is not systemd keep
-  their synthetic `/init.scope` evidence Unknown. Hybrid cgroup files prefer
-  the unified `0::` path; disagreeing same-authority candidates fail closed.
-  Escaped, traversal, mismatched-user, malformed and unrelated paths remain
-  Unknown.
+  their synthetic `/init.scope` evidence Unknown. Hybrid cgroup files prefer a
+  non-root unified `0::` path; when unified is `/`, a useful non-root
+  `name=systemd` path is used instead. Disagreeing same-authority candidates
+  fail closed. Escaped, traversal, mismatched-user, malformed and unrelated
+  paths remain Unknown.
 - The user-scope prefix is canonicalized once with exactly one leading slash,
   and every app-family key uses that canonical prefix. `ProcessEntry` carries
   a serialized/defaulted authoritative desktop-role marker, including explicit
   Unknown, so the UI can distinguish Linux collector facts from Windows or
-  legacy fallback data.
+  legacy fallback data. The Linux collector passes that same marker into
+  `ClassifyInput`; it never passes the raw `None`, which would invoke the
+  legacy Unix userspace-name fallback for an authoritative Unknown.
 - `/proc/<pid>/environ` is read only after the cgroup proves user-session
   context; it is capped at 64 KiB and must be complete.
   `FLATPAK_ID`, `SNAP_INSTANCE_NAME`, `GIO_LAUNCHED_DESKTOP_FILE` and
@@ -1401,11 +1409,18 @@ The window itself is now treated as a thing that can fail, not as a given:
   cgroup role is weak and the graphical gate is positive. They never override
   authoritative Background/System roles, and desktop-wide variables such as
   `XDG_CURRENT_DESKTOP` never identify an app.
-- Classification precedence is hard System evidence, observed X11 window,
-  complete X11 no-window evidence, positive App/Background role, Unix
-  user-space infrastructure-name fallback, then Unknown. Kernel names and PID
-  <= 4 remain absolute System evidence; a positive Linux role refines userspace
-  names such as the user `systemd` manager or `dbus-daemon`. An explicit
+- `tm_core::classify::ClassifyInput` now requires a public
+  `ProcessPlatform::{Windows, Unix}` discriminator. Windows applies PID <= 4,
+  Windows kernel pseudo-processes, `IsProcessCritical`, and verified core
+  images; Unix applies kernel-thread names and the conservative userspace
+  infrastructure-name fallback. Unix does not apply Windows low-PID
+  assumptions, and a Windows image such as `migration.exe`/`kworker.exe` is not
+  System merely because its name matches a Linux kernel thread.
+- Classification precedence is platform-specific hard System evidence,
+  observed X11 window, complete X11 no-window evidence, positive
+  App/Background role, Unix user-space infrastructure-name fallback, then
+  Unknown. A positive Linux role refines userspace names such as the user
+  `systemd` manager or `dbus-daemon`, even at a low container PID. An explicit
   collector Unknown does not become a System fact merely from such a name.
 - `ProcessEntry::app_group` carries a stable family key derived from the full
   validated transient unit path, or a sanitized launcher-hint identity on weak
@@ -1415,18 +1430,25 @@ The window itself is now treated as a thing that can fail, not as a given:
   both windows and native App roles, synthesizes same-group family edges even
   when PPIDs are disconnected, and never lets window descent overwrite explicit
   Linux Background/Unknown or native app-family evidence.
-- Desktop evidence is cached per collector for five seconds, keyed by PID and
-  the already-validated boot-relative start ticks. A new PID generation
-  refreshes immediately, dead PIDs are pruned each sampling tick, and cached
-  evidence is reused for the logind session id as well. Cgroup movement can
-  therefore be reflected after at most the short TTL.
-- The distinction is limited to launcher-managed desktop applications. It is
-  not an exact focus state or window list, cannot identify an app that neither
-  uses a standard user-session scope nor exposes a complete graphical
-  environment with trusted launch metadata, and deliberately avoids GNOME
-  Shell.Introspect and interactive KWin APIs. WSL without real systemd or a
-  relevant systemd user hierarchy retains Unknown rather than inferring roles
-  from WSLg or a desktop-wide environment.
+- Desktop evidence is cached per collector, keyed by PID and the
+  already-validated boot-relative start ticks. Every cache hit re-reads
+  `/proc/<pid>/stat` and discards/reinspects on a generation mismatch, so PID
+  reuse cannot inherit an App/System role, session or app group. Entries expire
+  after a deterministic 4.5-5.5 second per-generation stagger around the
+  five-second nominal TTL, dead PIDs are pruned each sampling tick, and cached
+  evidence is reused for the logind session id as well.
+- `execve` preserves PID/start ticks and can replace the environment, while
+  cgroup movement also preserves both. Therefore launcher identity and cgroup
+  role can trail for at most the staggered cache TTL; the cache does not claim
+  that environment or cgroup membership are immutable. This residual is
+  deliberate and pinned by tests.
+- Linux app identity is systemd app-unit/launcher metadata plus graphical
+  evidence, not compositor focus. It is not an exact focus state or window
+  list, cannot identify an app that neither uses a recognized user-session
+  unit nor exposes a complete graphical environment with trusted launch
+  metadata, and deliberately avoids GNOME Shell.Introspect and interactive KWin
+  APIs. WSL without real systemd or a relevant systemd user hierarchy retains
+  Unknown rather than inferring roles from WSLg or a desktop-wide environment.
 
 ## Linux privileged actions (2026-11-23, source-reviewed, not compiled here)
 

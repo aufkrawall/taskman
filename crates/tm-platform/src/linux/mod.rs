@@ -152,14 +152,7 @@ impl SystemCollector for LinuxCollector {
                 boot_start_ticks,
                 window_observation.coverage,
             );
-            let category = classify::classify(classify::ClassifyInput {
-                pid: pid_u,
-                name: &name,
-                has_window,
-                critical: None,
-                windows_owned: None,
-                desktop_role: desktop_evidence.role,
-            });
+            let category = classify_collected_process(pid_u, &name, has_window, &desktop_evidence);
 
             let du = p.disk_usage();
             let mut entry = ProcessEntry::new(pid_u, name.clone());
@@ -1273,6 +1266,27 @@ fn window_evidence(
     }
 }
 
+/// The collector always has an authoritative Linux desktop-role result, even
+/// when that result is Unknown. Passing the raw optional role would make
+/// `classify` treat Unknown as a legacy no-marker snapshot and reapply Unix
+/// userspace name fallbacks (for example, a synthetic-WSL `dbus-daemon`).
+fn classify_collected_process(
+    pid: u32,
+    name: &str,
+    has_window: Option<bool>,
+    desktop_evidence: &desktop_session::DesktopEvidence,
+) -> ProcCategory {
+    classify::classify(classify::ClassifyInput {
+        platform: classify::ProcessPlatform::Unix,
+        pid,
+        name,
+        has_window,
+        critical: None,
+        windows_owned: None,
+        desktop_role: Some(desktop_evidence.role_marker()),
+    })
+}
+
 pub(super) fn verify_process_identity(pid: u32, expected_start_ticks: Option<i64>) -> Result<()> {
     let expected = expected_start_ticks.ok_or_else(|| {
         tm_core::TmError::platform(
@@ -1375,6 +1389,7 @@ mod tests {
             assert_eq!(has_window, None);
             assert_eq!(
                 classify::classify(classify::ClassifyInput {
+                    platform: classify::ProcessPlatform::Unix,
                     pid: 3000,
                     name: "gnome-terminal",
                     has_window,
@@ -1388,6 +1403,7 @@ mod tests {
         let has_window = window_evidence(None, Some(7), Complete);
         assert_eq!(
             classify::classify(classify::ClassifyInput {
+                platform: classify::ProcessPlatform::Unix,
                 pid: 3000,
                 name: "gnome-terminal",
                 has_window,
@@ -1396,6 +1412,27 @@ mod tests {
                 desktop_role: Some(classify::DesktopRoleEvidence::App),
             }),
             ProcCategory::Background
+        );
+    }
+
+    #[test]
+    fn collector_classifier_preserves_authoritative_unknown_for_userspace_names() {
+        let evidence = desktop_session::DesktopEvidence::default();
+        assert_eq!(evidence.role, None, "the collector saw no positive role");
+        for name in ["systemd", "dbus-daemon"] {
+            assert_eq!(
+                classify_collected_process(3000, name, None, &evidence),
+                ProcCategory::Unknown,
+                "the collector must pass its authoritative Unknown marker for {name}, not None"
+            );
+        }
+
+        let mut background = desktop_session::DesktopEvidence::default();
+        background.role = Some(classify::DesktopRoleEvidence::Background);
+        assert_eq!(
+            classify_collected_process(1, "systemd", None, &background),
+            ProcCategory::Background,
+            "an explicit user-session role must beat the Unix userspace-name fallback"
         );
     }
 

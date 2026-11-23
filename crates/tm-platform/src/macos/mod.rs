@@ -101,6 +101,7 @@ impl SystemCollector for MacCollector {
             );
 
             let category = classify::classify(classify::ClassifyInput {
+                platform: classify::ProcessPlatform::Unix,
                 pid: pid_u,
                 name: &name,
                 has_window: None,

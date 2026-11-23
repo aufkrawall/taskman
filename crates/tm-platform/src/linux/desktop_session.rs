@@ -2,9 +2,11 @@
 //!
 //! Native Wayland has no portable whole-desktop window inventory. Instead,
 //! this module reads one validated systemd hierarchy from
-//! `/proc/<pid>/cgroup`: a standard user `app.slice` unit can identify a
-//! launcher-managed application only when its complete environment also
-//! carries a graphical-session display signal. `background.slice`,
+//! `/proc/<pid>/cgroup`: a standard `app-*` unit or a Snap-launcher unit in
+//! user `app.slice` can identify a launcher-managed application only when its
+//! complete environment also carries a graphical-session display signal.
+//! Arbitrary well-formed units under `app.slice` stay weak context and require
+//! a validated Flatpak/Snap/GIO/BAMF launcher identity. `background.slice`,
 //! `session.slice`, direct logind session scopes and user-manager
 //! `init.scope` identify explicit background/session work; generic
 //! `user@UID.service` membership is only weak context. Top-level
@@ -14,7 +16,7 @@
 //! Some applications bypass systemd scopes. For a process already proven to
 //! be inside a user-session hierarchy, a capped `/proc/<pid>/environ` read may
 //! supply launch metadata such as Flatpak, Snap, GIO or BAMF identity. A
-//! non-empty `WAYLAND_DISPLAY`, `WAYLAND_SOCKET`, or `DISPLAY` is a mandatory
+//! non-whitespace `WAYLAND_DISPLAY`, `WAYLAND_SOCKET`, or `DISPLAY` is a mandatory
 //! graphical-session gate but never an app identity. Values inherited by
 //! every process in the desktop session (`XDG_CURRENT_DESKTOP` and similar)
 //! are never treated as per-process app evidence.
@@ -41,6 +43,7 @@ const MAX_ENVIRON_BYTES: usize = 64 * 1024;
 const MAX_HINT_VALUE_BYTES: usize = 512;
 const MAX_COMM_BYTES: usize = 64;
 pub(super) const DESKTOP_EVIDENCE_TTL: Duration = Duration::from_secs(5);
+const DESKTOP_EVIDENCE_JITTER_MS: u64 = 1_000;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(super) struct DesktopEvidence {
@@ -78,9 +81,11 @@ struct CachedEvidence {
     evidence: DesktopEvidence,
 }
 
-/// Collector-owned per-tick cache. The key includes the process generation;
-/// environment is immutable for that generation and cgroup movement is rare,
-/// so a short TTL avoids rereading both files on every sampling tick.
+/// Collector-owned per-tick cache. The key includes the process generation,
+/// and every hit revalidates that generation against `/proc/<pid>/stat`.
+/// `execve` preserves that token and may replace the environment, while cgroup
+/// movement preserves both, so those two facts can trail until the jittered
+/// TTL expires. A short TTL avoids rereading both files on every tick.
 #[derive(Debug, Default)]
 pub(super) struct DesktopEvidenceCache {
     entries: HashMap<(u32, i64), CachedEvidence>,
@@ -93,23 +98,65 @@ impl DesktopEvidenceCache {
     }
 
     pub(super) fn evidence(&mut self, pid: u32, start_ticks: i64, now: Instant) -> DesktopEvidence {
-        if let Some(evidence) = self.cached(pid, start_ticks, now) {
+        self.evidence_with(
+            pid,
+            start_ticks,
+            now,
+            super::linux_proc_start_ticks,
+            systemd_system_manager_available,
+            inspect,
+        )
+    }
+
+    fn evidence_with<G, M, I>(
+        &mut self,
+        pid: u32,
+        start_ticks: i64,
+        now: Instant,
+        current_start_ticks: G,
+        system_manager_available: M,
+        inspect_evidence: I,
+    ) -> DesktopEvidence
+    where
+        G: FnOnce(u32) -> Option<i64>,
+        M: FnOnce() -> bool,
+        I: FnOnce(u32, i64, bool) -> DesktopEvidence,
+    {
+        if let Some(evidence) = self.cached(pid, start_ticks, now, current_start_ticks) {
             return evidence;
         }
 
         let system_manager = *self
             .system_manager
-            .get_or_insert_with(systemd_system_manager_available);
-        let evidence = inspect(pid, start_ticks, system_manager);
+            .get_or_insert_with(system_manager_available);
+        let evidence = inspect_evidence(pid, start_ticks, system_manager);
         self.remember(pid, start_ticks, now, evidence.clone());
         evidence
     }
 
-    fn cached(&self, pid: u32, start_ticks: i64, now: Instant) -> Option<DesktopEvidence> {
-        self.entries
-            .get(&(pid, start_ticks))
-            .filter(|entry| now.saturating_duration_since(entry.observed_at) < DESKTOP_EVIDENCE_TTL)
-            .map(|entry| entry.evidence.clone())
+    fn cached<G>(
+        &mut self,
+        pid: u32,
+        start_ticks: i64,
+        now: Instant,
+        current_start_ticks: G,
+    ) -> Option<DesktopEvidence>
+    where
+        G: FnOnce(u32) -> Option<i64>,
+    {
+        let key = (pid, start_ticks);
+        let fresh = self.entries.get(&key).is_some_and(|entry| {
+            now.saturating_duration_since(entry.observed_at) < evidence_ttl(pid, start_ticks)
+        });
+        if !fresh {
+            self.entries.remove(&key);
+            return None;
+        }
+        if current_start_ticks(pid) != Some(start_ticks) {
+            self.entries.remove(&key);
+            return None;
+        }
+        self.entries.get(&key).map(|entry| entry.evidence.clone())
     }
 
     fn remember(&mut self, pid: u32, start_ticks: i64, now: Instant, evidence: DesktopEvidence) {
@@ -128,6 +175,17 @@ impl DesktopEvidenceCache {
     pub(super) fn retain_live(&mut self, live: &HashSet<u32>) {
         self.entries.retain(|(pid, _), _| live.contains(pid));
     }
+}
+
+/// Stagger refreshes across a one-second window around the five-second
+/// nominal TTL. Otherwise every process cached during one sampling tick would
+/// reread cgroup/environment in lockstep every five seconds.
+fn evidence_ttl(pid: u32, start_ticks: i64) -> Duration {
+    let mixed =
+        u64::from(pid).wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ (start_ticks as u64).rotate_left(23);
+    let jitter_ms = mixed % (DESKTOP_EVIDENCE_JITTER_MS + 1);
+    DESKTOP_EVIDENCE_TTL - Duration::from_millis(DESKTOP_EVIDENCE_JITTER_MS / 2)
+        + Duration::from_millis(jitter_ms)
 }
 
 /// Read role evidence after the collector validated the expected generation.
@@ -190,9 +248,10 @@ fn parse_cgroup(raw: &[u8], system_manager: bool) -> Option<DesktopEvidence> {
 }
 
 /// cgroup v2 publishes one `0::/path` hierarchy. A v1/hybrid process may also
-/// expose the compatibility `name=systemd` hierarchy. Prefer unified v2 when
-/// present; within one authority, disagreeing candidates are ambiguous and
-/// must not be guessed.
+/// expose the compatibility `name=systemd` hierarchy. Prefer a useful unified
+/// v2 path, but a root `0::/` carries no evidence and must not hide a useful
+/// named-systemd path. Within one authority, disagreeing candidates are
+/// ambiguous and must not be guessed.
 fn systemd_cgroup_path(raw: &str) -> Option<&str> {
     let mut unified = None;
     let mut named = None;
@@ -230,7 +289,10 @@ fn systemd_cgroup_path(raw: &str) -> Option<&str> {
             None => *target = Some(path),
         }
     }
-    unified.or(named)
+    match unified {
+        Some(path) if path != "/" => Some(path),
+        unified => named.filter(|path| *path != "/").or(unified),
+    }
 }
 
 fn parse_systemd_path(path: &str, system_manager: bool) -> Option<DesktopEvidence> {
@@ -313,9 +375,17 @@ fn parse_systemd_path(path: &str, system_manager: bool) -> Option<DesktopEvidenc
             evidence.environment_eligible = false;
         }
         "app.slice" => {
-            if let Some(unit) = rest.get(1).copied().filter(|unit| valid_user_unit(unit)) {
-                let scope = evidence.user_scope.as_deref()?;
-                evidence.app_unit_group = Some(format!("systemd:{scope}/{}", rest[..=1].join("/")));
+            if let Some(unit) = rest.get(1).copied() {
+                if !valid_user_unit(unit) {
+                    evidence.environment_eligible = false;
+                } else if valid_application_unit(unit) {
+                    let scope = evidence.user_scope.as_deref()?;
+                    evidence.app_unit_group =
+                        Some(format!("systemd:{scope}/{}", rest[..=1].join("/")));
+                }
+                // A syntactically valid generic unit is weak context. It may
+                // be identified by a validated per-process launcher hint, but
+                // never by a merely inherited display variable.
             } else {
                 evidence.environment_eligible = false;
             }
@@ -396,6 +466,30 @@ fn valid_user_unit(component: &str) -> bool {
     })
 }
 
+/// Only launcher-shaped units may identify an app family by cgroup alone.
+/// A generic but syntactically valid user unit (`sleep.service`,
+/// `run-u42.scope`) is not application evidence.
+fn valid_application_unit(component: &str) -> bool {
+    if !valid_user_unit(component) {
+        return false;
+    }
+    let stem = component
+        .strip_suffix(".scope")
+        .or_else(|| component.strip_suffix(".service"))
+        .unwrap_or_default();
+    let standard_app = stem
+        .strip_prefix("app-")
+        .is_some_and(|identity| !identity.is_empty());
+    let snap_app = {
+        let mut parts = stem.split('.');
+        parts.next() == Some("snap")
+            && parts.next().is_some_and(|part| !part.is_empty())
+            && parts.next().is_some_and(|part| !part.is_empty())
+            && parts.all(|part| !part.is_empty())
+    };
+    standard_app || snap_app
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct DesktopHints {
     flatpak_id: Option<String>,
@@ -455,9 +549,12 @@ fn parse_environment(raw: &[u8]) -> Option<DesktopHints> {
 }
 
 fn assign_display(slot: &mut Option<String>, raw: &[u8]) -> Option<()> {
-    let value = std::str::from_utf8(raw).ok()?;
+    let value = std::str::from_utf8(raw).ok()?.trim();
     if value.len() > MAX_HINT_VALUE_BYTES || value.chars().any(char::is_control) {
         return None;
+    }
+    if value.is_empty() {
+        return Some(());
     }
     assign_unique(slot, value.to_owned())
 }
@@ -579,6 +676,7 @@ mod tests {
             "app.slice/app-org.kde.konsole-17.scope",
             "app.slice/app-flatpak-org.gnome.Builder-123.scope",
             "app.slice/snap.firefox.firefox.service",
+            "app.slice/snap.gimp.gimp.scope",
         ];
         let mut groups = std::collections::HashSet::new();
         for unit in units {
@@ -614,6 +712,59 @@ mod tests {
                 "unrelated units must not share a family"
             );
         }
+    }
+
+    #[test]
+    fn arbitrary_app_slice_units_need_a_validated_launcher_identity() {
+        for unit in ["sleep.service", "run-u42.scope"] {
+            assert!(valid_user_unit(unit), "{unit} is syntactically valid");
+            assert!(
+                !valid_application_unit(unit),
+                "{unit} is not a launcher-shaped application unit"
+            );
+            let mut evidence =
+                parse_v2(&user_path(&format!("app.slice/{unit}"))).expect("valid user cgroup");
+            assert_eq!(evidence.role, None);
+            assert_eq!(evidence.app_unit_group, None);
+            assert!(evidence.environment_eligible);
+
+            apply_environment_hints(
+                &mut evidence,
+                parse_environment(b"WAYLAND_DISPLAY=wayland-0\0")
+                    .expect("inherited graphical environment"),
+            );
+            assert_eq!(
+                evidence.role, None,
+                "a display variable inherited from the session is not app identity"
+            );
+            assert_eq!(evidence.app_group, None);
+        }
+
+        for unit in [
+            "app-org.example.Editor-7.scope",
+            "snap.firefox.firefox.service",
+            "snap.gimp.gimp.scope",
+        ] {
+            assert!(
+                valid_application_unit(unit),
+                "{unit} is a recognized application shape"
+            );
+        }
+
+        let mut identified =
+            parse_v2(&user_path("app.slice/sleep.service")).expect("generic user unit");
+        apply_environment_hints(
+            &mut identified,
+            parse_environment(b"WAYLAND_DISPLAY=wayland-0\0FLATPAK_ID=org.example.SleepHelper\0")
+                .expect("validated launcher identity"),
+        );
+        assert_eq!(identified.role, Some(DesktopRoleEvidence::App));
+        assert_eq!(
+            identified.app_group.as_deref(),
+            Some(
+                "systemd:/user.slice/user-1000.slice/user@1000.service:flatpak:org.example.SleepHelper"
+            )
+        );
     }
 
     #[test]
@@ -701,6 +852,7 @@ mod tests {
             );
             assert_eq!(
                 tm_core::classify::classify(tm_core::classify::ClassifyInput {
+                    platform: tm_core::classify::ProcessPlatform::Unix,
                     pid: 3000,
                     name: "dbus-daemon",
                     has_window: None,
@@ -727,6 +879,7 @@ mod tests {
         let system = parse_v2("/system.slice/dbus.service").expect("system service cgroup");
         let classify_with = |role| {
             tm_core::classify::classify(tm_core::classify::ClassifyInput {
+                platform: tm_core::classify::ProcessPlatform::Unix,
                 pid: 3000,
                 name: "dbus-daemon",
                 has_window: None,
@@ -805,6 +958,25 @@ mod tests {
         .expect("v1 systemd path");
         assert_eq!(evidence.role, Some(DesktopRoleEvidence::Background));
         assert_eq!(evidence.session_id, Some(7));
+    }
+
+    #[test]
+    fn hybrid_cgroups_do_not_let_a_root_unified_path_hide_useful_named_evidence() {
+        let named_useful = "\
+0::/
+1:name=systemd:/user.slice/user-1000.slice/session-7.scope
+";
+        let evidence = parse_cgroup(named_useful.as_bytes(), true).expect("hybrid cgroup");
+        assert_eq!(evidence.role, Some(DesktopRoleEvidence::Background));
+        assert_eq!(evidence.session_id, Some(7));
+
+        let unified_useful = "\
+1:name=systemd:/
+0::/user.slice/user-1000.slice/session-8.scope
+";
+        let evidence = parse_cgroup(unified_useful.as_bytes(), true).expect("hybrid cgroup");
+        assert_eq!(evidence.role, Some(DesktopRoleEvidence::Background));
+        assert_eq!(evidence.session_id, Some(8));
     }
 
     #[test]
@@ -938,6 +1110,7 @@ mod tests {
         };
         assert_eq!(
             tm_core::classify::classify(tm_core::classify::ClassifyInput {
+                platform: tm_core::classify::ProcessPlatform::Unix,
                 pid: 3000,
                 name: "native-wayland-app",
                 has_window: None,
@@ -970,6 +1143,22 @@ mod tests {
                 .expect("identical duplicate")
                 .graphical_session()
         );
+        let whitespace_display =
+            parse_environment(b"WAYLAND_DISPLAY=   \0DISPLAY=\t\0FLATPAK_ID=org.example.App\0")
+                .expect("complete whitespace-only display environment");
+        assert!(
+            !whitespace_display.graphical_session(),
+            "whitespace-only display variables must not satisfy the graphical gate"
+        );
+        let mut whitespace_app =
+            parse_v2(&user_path("app.slice/app-org.example.App-1.scope")).expect("app slice");
+        apply_environment_hints(&mut whitespace_app, whitespace_display);
+        assert_eq!(
+            whitespace_app.role,
+            Some(DesktopRoleEvidence::Background),
+            "a whitespace-only display is a complete headless environment"
+        );
+        assert_eq!(whitespace_app.app_group, None);
     }
 
     #[test]
@@ -982,6 +1171,7 @@ mod tests {
         };
         assert_eq!(
             tm_core::classify::classify(tm_core::classify::ClassifyInput {
+                platform: tm_core::classify::ProcessPlatform::Unix,
                 pid: 3000,
                 name: "native-wayland-app",
                 has_window: None,
@@ -1003,7 +1193,7 @@ mod tests {
     }
 
     #[test]
-    fn evidence_cache_reuses_generation_for_ttl_refreshes_and_prunes() {
+    fn evidence_cache_expires_with_stagger_and_prunes_dead_pids() {
         let now = Instant::now();
         let first = DesktopEvidence {
             role: Some(DesktopRoleEvidence::App),
@@ -1019,24 +1209,27 @@ mod tests {
         cache.remember(10, 100, now, first.clone());
 
         assert_eq!(
-            cache.cached(10, 100, now + Duration::from_secs(1)),
+            cache.cached(10, 100, now + Duration::from_secs(1), |_| Some(100)),
             Some(first.clone())
         );
         assert_eq!(
-            cache.cached(10, 100, now + DESKTOP_EVIDENCE_TTL),
+            cache.cached(10, 100, now + evidence_ttl(10, 100), |_| Some(100)),
             None,
-            "the bounded TTL must expire"
+            "the staggered TTL must expire"
         );
         assert_eq!(
-            cache.cached(10, 101, now + Duration::from_secs(1)),
+            cache.cached(10, 101, now + Duration::from_secs(1), |_| Some(101)),
             None,
             "a new PID generation must refresh immediately"
         );
 
         cache.remember(10, 101, now + Duration::from_secs(2), second.clone());
-        assert_eq!(cache.cached(10, 100, now + Duration::from_secs(2)), None);
         assert_eq!(
-            cache.cached(10, 101, now + Duration::from_secs(2)),
+            cache.cached(10, 100, now + Duration::from_secs(2), |_| Some(101)),
+            None
+        );
+        assert_eq!(
+            cache.cached(10, 101, now + Duration::from_secs(2), |_| Some(101)),
             Some(second)
         );
 
@@ -1050,7 +1243,133 @@ mod tests {
             },
         );
         cache.retain_live(&HashSet::from([10]));
-        assert_eq!(cache.cached(20, 200, now), None, "dead PIDs are pruned");
+        assert_eq!(
+            cache.cached(20, 200, now, |_| Some(200)),
+            None,
+            "dead PIDs are pruned"
+        );
+    }
+
+    #[test]
+    fn cache_hit_generation_mismatch_invalidates_and_reinspects() {
+        let now = Instant::now();
+        let first = DesktopEvidence {
+            role: Some(DesktopRoleEvidence::App),
+            app_group: Some("systemd:/scope/app".into()),
+            session_id: Some(7),
+            ..DesktopEvidence::default()
+        };
+        let replacement = DesktopEvidence {
+            role: Some(DesktopRoleEvidence::Unknown),
+            ..DesktopEvidence::default()
+        };
+        let mut cache = DesktopEvidenceCache::default();
+        cache.remember(10, 100, now, first);
+
+        assert_eq!(
+            cache.cached(10, 100, now + Duration::from_secs(1), |_| Some(101)),
+            None,
+            "a cache hit must revalidate the current /proc generation"
+        );
+        assert!(
+            !cache.entries.contains_key(&(10, 100)),
+            "the stale generation entry must be removed"
+        );
+
+        cache.remember(
+            10,
+            100,
+            now,
+            DesktopEvidence {
+                role: Some(DesktopRoleEvidence::App),
+                ..DesktopEvidence::default()
+            },
+        );
+        let mut manager_reads = 0;
+        let mut evidence_reads = 0;
+        let got = cache.evidence_with(
+            10,
+            100,
+            now + Duration::from_secs(1),
+            |_| Some(101),
+            || {
+                manager_reads += 1;
+                true
+            },
+            |_, _, _| {
+                evidence_reads += 1;
+                replacement.clone()
+            },
+        );
+        assert_eq!(got, replacement);
+        assert_eq!(manager_reads, 1);
+        assert_eq!(evidence_reads, 1, "a generation mismatch must reinspect");
+    }
+
+    #[test]
+    fn same_generation_exec_staleness_is_bounded_by_the_cache_ttl() {
+        let now = Instant::now();
+        let cached = DesktopEvidence {
+            role: Some(DesktopRoleEvidence::App),
+            app_group: Some("flatpak:org.example.BeforeExec".into()),
+            ..DesktopEvidence::default()
+        };
+        let after_exec = DesktopEvidence {
+            role: Some(DesktopRoleEvidence::Background),
+            ..DesktopEvidence::default()
+        };
+        let mut cache = DesktopEvidenceCache::default();
+        cache.remember(10, 100, now, cached.clone());
+        let ttl = evidence_ttl(10, 100);
+
+        assert_eq!(
+            cache.evidence_with(
+                10,
+                100,
+                now + ttl.saturating_sub(Duration::from_millis(1)),
+                |_| Some(100),
+                || panic!("a fresh hit must not query the system manager"),
+                |_, _, _| panic!("a fresh hit must not refresh evidence"),
+            ),
+            cached,
+            "exec preserves PID/start ticks, so the old environment is reused briefly"
+        );
+
+        let mut evidence_reads = 0;
+        assert_eq!(
+            cache.evidence_with(
+                10,
+                100,
+                now + ttl,
+                |_| Some(100),
+                || true,
+                |_, _, _| {
+                    evidence_reads += 1;
+                    after_exec.clone()
+                },
+            ),
+            after_exec,
+            "the bounded TTL refreshes after an environment-changing exec"
+        );
+        assert_eq!(evidence_reads, 1);
+    }
+
+    #[test]
+    fn cache_expiry_jitter_is_deterministic_and_near_the_nominal_ttl() {
+        let floor = DESKTOP_EVIDENCE_TTL - Duration::from_millis(500);
+        let ceiling = DESKTOP_EVIDENCE_TTL + Duration::from_millis(500);
+        let ttls: HashSet<_> = (1..=32)
+            .map(|pid| evidence_ttl(pid, i64::from(pid) * 100))
+            .collect();
+        assert!(
+            ttls.len() > 1,
+            "different generations must not all expire in one synchronized sweep"
+        );
+        assert!(
+            ttls.iter().all(|ttl| (floor..=ceiling).contains(ttl)),
+            "the jitter must stay within one second of the nominal TTL"
+        );
+        assert_eq!(evidence_ttl(7, 700), evidence_ttl(7, 700));
     }
 
     #[test]

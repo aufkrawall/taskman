@@ -487,23 +487,34 @@ remain follow-up rather than being simulated in headless tests:
   scopes under `user@UID.service` have no session component and therefore do
   not contribute to session rollups.
 - **Native-Wayland App/Background roles are launcher evidence, not compositor
-  facts.** A standard user `app.slice` unit can identify an App only when its
-  complete environment carries a non-empty Wayland/X11 display variable; the
-  same variable gate plus weak user-session evidence is required for a trusted
-  Flatpak/Snap/GIO/BAMF hint. A complete headless app.slice is Background and
+  facts.** Only a standard `app-*` unit or Snap launcher in user `app.slice`
+  supplies cgroup app-family identity. It can identify an App only when its
+  complete environment carries a non-whitespace Wayland/X11 display variable.
+  Arbitrary well-formed app.slice units remain Unknown unless the same
+  graphical gate and weak user-session evidence accompany a trusted
+  Flatpak/Snap/GIO/BAMF per-process hint; an inherited display variable alone
+  is not identity. A complete headless recognized app unit is Background and
   unavailable/partial/oversized evidence stays Unknown. Native Wayland still
-  has no portable whole-window inventory or focus signal. Applications outside
-  those conventions, malformed/ambiguous cgroups and exact X11 no-window
-  evidence can leave a process Unknown or Background rather than recovered.
-  GNOME Shell.Introspect (sender-allowlisted) and interactive KWin APIs are
-  deliberately not used. WSL without real systemd PID 1 stays Unknown for its
-  synthetic `/init.scope` evidence unless X11 ownership supplies independent
-  evidence.
-- **Linux desktop-evidence cache can lag cgroup movement by five seconds.**
-  Environment is immutable for a PID generation, but a process that moves
-  between user-manager units within the bounded TTL keeps its prior parsed
-  role until refresh. PID reuse still refreshes immediately because the cache
-  key includes validated boot-relative start ticks.
+  has no portable whole-window inventory, focus signal or exact compositor
+  mapping. Applications outside these conventions, malformed/ambiguous cgroups
+  and exact X11 no-window evidence can leave a process Unknown or Background
+  rather than recovered. GNOME Shell.Introspect (sender-allowlisted) and
+  interactive KWin APIs are deliberately not used. WSL without real systemd
+  PID 1 stays Unknown for its synthetic `/init.scope` evidence unless X11
+  ownership supplies independent evidence.
+- **Linux desktop-evidence cache has a bounded same-generation staleness
+  window.** Cache hits now revalidate `/proc/<pid>/stat`, so PID reuse removes
+  the old entry immediately. `execve` and cgroup movement preserve PID/start
+  ticks, however; an environment-changing exec or unit move can retain the
+  prior launcher role, session and app group until the jittered 4.5-5.5 second
+  expiry. This trade keeps procfs reads bounded and is pinned by deterministic
+  same-generation/TTL tests; it is not an immutability claim.
+- **`tm_core::classify::ClassifyInput` gained a required public
+  `ProcessPlatform` field.** In-tree callers now distinguish Windows from
+  Unix name/PID rules, preventing cross-platform spoof promotion and false
+  low-PID System results. Downstream exhaustive literals must set the field;
+  if `tm-core` is consumed externally, treat this as a deliberate API break or
+  add a compatibility constructor/builder in a later contract change.
 - **Native App-root selection is deterministic, not semantic, when no member
   has a window.** The collector prefers any positively windowed app-family
   member and otherwise chooses creation ticks then PID. A short-lived

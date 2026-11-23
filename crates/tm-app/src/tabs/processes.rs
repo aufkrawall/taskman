@@ -3497,19 +3497,27 @@ mod tests {
     }
 
     #[test]
-    fn legacy_collector_background_is_not_repromoted_by_a_core_name() {
+    fn legacy_windows_background_is_not_repromoted_by_cross_platform_core_names() {
         let mut app = proc(10, None, "org.example.Editor", ProcCategory::App);
         app.has_window = true;
         let legacy_dbus = proc(11, None, "dbus-daemon", ProcCategory::Background);
+        let legacy_migration = proc(12, None, "migration.exe", ProcCategory::Background);
+        let legacy_kworker = proc(13, None, "kworker.exe", ProcCategory::Background);
 
-        let processes = [&app, &legacy_dbus];
+        let processes = [&app, &legacy_dbus, &legacy_migration, &legacy_kworker];
         let grouping = derive_display_groups(&processes);
 
-        assert_eq!(
-            grouping.category.get(&11),
-            Some(&ProcCategory::Background),
-            "tree boundaries must not overwrite collector categories"
-        );
+        for (pid, name) in [
+            (11, "dbus-daemon"),
+            (12, "migration.exe"),
+            (13, "kworker.exe"),
+        ] {
+            assert_eq!(
+                grouping.category.get(&pid),
+                Some(&ProcCategory::Background),
+                "tree boundary name {name} must not overwrite the legacy collector category"
+            );
+        }
     }
 
     #[test]
