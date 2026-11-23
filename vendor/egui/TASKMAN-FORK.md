@@ -22,7 +22,8 @@ screen-reader model in `llm-wiki/current.md` depends on, a text-cursor blink res
 (#7), text-selection preservation on secondary click (#8), not registering for raw
 device input (#9), coalescing pointer-move repaints to the display refresh rate and
 skipping moves that cannot change the hover target (#10, with the `hit_test_last_pass`
-accessor #11 in `egui` itself).
+accessor #11 in `egui` itself), and coalescing wheel repaint requests to the same cadence
+(#14).
 
 The full design, the blend math, and the verification plan live in
 `llm-wiki/render-pipeline.md` in the parent repo. This file is only the *inventory* of what
@@ -275,6 +276,17 @@ could end up blank, stale, invisible or unresponsive without any error surfacing
 `rects_to_present`/`should_force_full_paint` tests, `mouse_release_outside_window_after_cursor_left_releases_held_button`
 and `window_focus_loss_releases_held_pointer_buttons_without_click` (egui-winit/egui), plus
 `tm-platform`'s `fit_rect_keeps_windows_fully_inside_the_desktop` and `screen_repairs_ignore_dead_handles`.
+
+### 14. `egui-winit`: coalesce wheel repaint requests
+
+| File | Change | Why |
+| --- | --- | --- |
+| `crates/egui-winit/src/lib.rs` | `WindowEvent::MouseWheel` no longer returns `repaint: true` unconditionally. A per-window `WheelRepaintThrottle` allows the first wheel event through immediately, then limits further wheel repaints to one per display refresh and arms exactly one trailing repaint through `Context::request_repaint_after_for`. Adjacent line-unit `Move` events with identical modifiers are summed componentwise in a `WheelEventBuffer`; pixel-unit and phased touchpad events remain individual events. Buffered input is flushed before any non-wheel event and again in `take_egui_input`, preserving unit, modifier, phase and click order while the trailing frame carries the final accumulated delta. New `WheelRepaintStats` / `wheel_repaint_stats_take` counters are emitted by `TASKMAN_INPUT_STATS=1` as wheel, coalesced, immediate and trailing counts | On Windows every wheel event caused a synchronous full UI pass, so a high-resolution or rapidly spinning wheel can run layout, tessellation, rasterization and presentation many times per display refresh. The cadence makes scrolling update at the rate that can be seen while keeping the immediate first response and a guaranteed final frame; line deltas are accumulated without changing horizontal/vertical direction, and point events are deliberately not summed because egui uses their per-event magnitude for touchpad smoothing |
+| `crates/tm-app/src/app.rs` | consumes `wheel_repaint_stats_take()` into the existing once-per-second `TASKMAN_INPUT_STATS=1` record | keeps the wheel decision counters in the same diagnostic line as pointer-move and frame timings, with no per-event logging |
+
+**Coverage:** `wheel_repaint_tests` pins bursts and cadence, the final accumulated line
+delta, mixed units/axes/modifiers and order, touchpad phase preservation, click boundaries,
+zero deltas, and the diagnostics counters. The tests are deterministic and do not sleep.
 
 ## Rebase runbook
 
