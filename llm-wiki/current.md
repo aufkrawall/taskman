@@ -234,8 +234,11 @@ the popup is gone. Accepted residuals of this model are in
 - App History keeps a late deferred-load result and merges CPU/network deltas
   collected while it was loading. Autosave cannot overwrite the previous file
   before that merge. First-sighting rate estimates do not add usage when
-  cumulative counters already exist. On Linux/macOS, non-system processes are
-  tracked because those backends cannot establish visible-window ownership.
+  cumulative counters already exist. Unix App History still tracks non-system
+  processes as a whole because neither backend provides a complete
+  platform-wide app boundary: Linux uses EWMH for X11/XWayland windows but
+  cannot enumerate native Wayland clients, and macOS has no collector-side
+  window inventory.
 - The GUI's broker telemetry calls use one worker and a two-second response
   deadline. A silent service can make disk/network data unavailable but cannot
   block the whole sampling engine indefinitely. Responses over the bounded

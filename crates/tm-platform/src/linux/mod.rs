@@ -1,8 +1,9 @@
-//! Linux backend: sysinfo + procfs/sysfs + systemd + XDG autostart.
+//! Linux backend: sysinfo + procfs/sysfs + systemd + XDG autostart + X11/EWMH.
 
 mod diskstats;
 pub(crate) mod services;
 mod startup;
+mod x11_windows;
 
 use crate::actions::*;
 use std::collections::{HashMap, HashSet};
@@ -84,10 +85,11 @@ impl SystemCollector for LinuxCollector {
         let nb_cpus = logical as f32;
         let (physical_cores, sockets) = cpu_topology();
 
-        // Wayland intentionally prevents arbitrary clients from enumerating
-        // every other client's top-level windows. Keep classification honest
-        // rather than introducing compositor-specific unsafe heuristics.
-        let window_owners: HashSet<u32> = HashSet::new();
+        // EWMH makes the X11 client inventory available when DISPLAY is
+        // usable. Native Wayland clients have no portable equivalent, so a
+        // Wayland session observes at most its XWayland clients; it never
+        // invents owners for the remainder.
+        let window_owners = x11_windows::window_owner_pids();
 
         let n_procs = self
             .sys

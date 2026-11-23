@@ -179,8 +179,12 @@ platform boundary (`tm-core` ← `tm-platform` ← `tm-app` / `tm-service`), and
     `application-x-executable` / `application-default-icon` / `image-missing`
     chain, which is what a row without an icon of its own paints;
     platform-neutral so its tests run on the Windows host too).
-    Linux/macOS backends exist and are
-    built by default (`build.py`).
+    Linux/macOS backends exist and are built by default (`build.py`). The Linux
+    collector uses `linux/x11_windows.rs` for one EWMH connection per sample:
+    `_NET_CLIENT_LIST` and `_NET_CLIENT_LIST_STACKING` are merged, stale or
+    non-viewable windows are skipped, and `_NET_WM_PID` yields owner PIDs for
+    App classification. Native Wayland clients remain unobservable; XWayland
+    clients are the available X11 subset.
 - `crates/tm-app`
   - eframe GUI. `main.rs` (startup sequence: args → console only for CLI →
     early logging → hand a duplicate launch to the running instance → lazy
