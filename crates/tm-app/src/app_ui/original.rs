@@ -1897,6 +1897,7 @@ pub fn settings_dialog(app: &mut TaskManApp, ctx: &egui::Context, _pal: &theme::
                             // The action succeeds only after the replacement
                             // process was handed off. Close this instance so
                             // its settings and history flush exactly once.
+                            #[cfg(target_os = "windows")]
                             crate::request_programmatic_exit();
                             close_ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                             Ok(())

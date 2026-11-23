@@ -84,7 +84,9 @@ fn parse_ipv4(hex: &str) -> Option<Ipv4Addr> {
     if hex.len() != 8 {
         return None;
     }
-    Some(Ipv4Addr::from(u32::from_str_radix(hex, 16)?.to_le_bytes()))
+    Some(Ipv4Addr::from(
+        u32::from_str_radix(hex, 16).ok()?.to_le_bytes(),
+    ))
 }
 
 fn parse_ipv6(hex: &str) -> Option<Ipv6Addr> {
@@ -95,7 +97,7 @@ fn parse_ipv6(hex: &str) -> Option<Ipv6Addr> {
     for (index, chunk) in hex.as_bytes().chunks_exact(8).enumerate() {
         let word = std::str::from_utf8(chunk).ok()?;
         octets[index * 4..index * 4 + 4]
-            .copy_from_slice(&u32::from_str_radix(word, 16)?.to_le_bytes());
+            .copy_from_slice(&u32::from_str_radix(word, 16).ok()?.to_le_bytes());
     }
     Some(Ipv6Addr::from(octets))
 }
@@ -183,17 +185,15 @@ fn parse_net_table<R: BufRead>(
                     continue;
                 };
                 let remote = SocketAddr::new(ip, port);
-                let Some(remote) = remote_of(state, remote) else {
+                let remote = match remote_of(state, remote) {
+                    Some(remote) => Some(remote),
                     // Listeners and placeholder peers are the only TCP rows
                     // allowed to omit a peer. An established row with a
                     // malformed address must not masquerade as a listener.
-                    if state == TcpState::Listen {
-                        None
-                    } else {
-                        continue;
-                    }
+                    None if state == TcpState::Listen => None,
+                    None => continue,
                 };
-                Some(remote)
+                remote
             }
             None => None,
         };

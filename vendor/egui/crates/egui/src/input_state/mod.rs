@@ -462,17 +462,15 @@ impl InputState {
             }
         }
 
-        let mut smooth_scroll_delta = Vec2::ZERO;
-
-        {
+        let smooth_scroll_delta = {
             let dt = stable_dt.at_most(0.1);
             self.wheel.after_events(time, dt);
 
             zoom_factor_delta *= (options.scroll_zoom_speed
                 * (self.wheel.smooth_zoom_delta.x + self.wheel.smooth_zoom_delta.y))
                 .exp();
-            smooth_scroll_delta = self.wheel.smooth_wheel_delta;
-        }
+            self.wheel.smooth_wheel_delta
+        };
 
         Self {
             pointer,

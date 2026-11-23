@@ -215,12 +215,20 @@ mod tests {
     #[test]
     fn a_gpu_engine_series_follows_that_engine_only() {
         let mut busy = pt(500);
-        busy.gpus = vec![crate::app::GpuHistoryPoint {
-            id: 0,
-            util_pct_available: true,
-            util_pct: 90.0,
-            ..Default::default()
-        }];
+        busy.gpus = vec![
+            crate::app::GpuHistoryPoint {
+                id: 0,
+                util_pct_available: true,
+                util_pct: 90.0,
+                ..Default::default()
+            },
+            crate::app::GpuHistoryPoint {
+                id: 1,
+                util_pct_available: true,
+                util_pct: 5.0,
+                ..Default::default()
+            },
+        ];
         busy.gpu_engines = vec![
             (0, "3D".into(), 90.0),
             (0, "VideoEncode".into(), 12.0),

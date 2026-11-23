@@ -37,11 +37,14 @@ use crate::actions::{
 
 const PROCESS_HANDLE_INFORMATION: PROCESSINFOCLASS = PROCESSINFOCLASS(51);
 
+type HandleInspection<T> = std::result::Result<T, ()>;
+
 const FILE_READ_DATA: u32 = 0x0001;
 const FILE_WRITE_DATA: u32 = 0x0002;
 const FILE_APPEND_DATA: u32 = 0x0004;
 const GENERIC_READ: u32 = 0x8000_0000;
 const GENERIC_WRITE: u32 = 0x4000_0000;
+const OBJ_KERNEL_HANDLE: u32 = 0x0000_0200;
 
 #[repr(C)]
 struct ProcessHandleSnapshotInformation {
@@ -303,7 +306,7 @@ fn enumerate_process_files(h_process: HANDLE) -> Result<FileEnumeration> {
 
     for i in 0..count {
         let entry = unsafe { *entries_ptr.add(i) };
-        if entry.handle_value == 0 {
+        if entry.handle_value == 0 || entry.handle_attributes & OBJ_KERNEL_HANDLE != 0 {
             continue;
         }
         let facts = match inspect_handle(h_process, current_proc, entry.handle_value, &mut path_buf)
@@ -352,7 +355,6 @@ fn enumerate_process_files(h_process: HANDLE) -> Result<FileEnumeration> {
     // byte/operation source is available in this enumeration, so every row
     // keeps those fields unavailable; the process-wide counters above remain
     // separate facts.
-
     Ok(FileEnumeration {
         files: map.into_values().collect(),
         complete,
@@ -392,12 +394,20 @@ fn inspect_handle(
     current_proc: HANDLE,
     handle_value: usize,
     path_buf: &mut [u16],
-) -> Result<Option<HandleFacts>, ()> {
+) -> HandleInspection<Option<HandleFacts>> {
+    let source = HANDLE(handle_value as *mut core::ffi::c_void);
+    // Query the local handle table entry before asking PROCESS_DUP_HANDLE to
+    // copy it. Most of a real process's table is non-files; protected or
+    // non-duplicable special handles must not turn a complete file walk into
+    // an incomplete one.
+    if unsafe { GetFileType(source) } != FILE_TYPE_DISK {
+        return Ok(None);
+    }
     let mut dup = HANDLE::default();
     let ok = unsafe {
         DuplicateHandle(
             h_process,
-            HANDLE(handle_value as *mut core::ffi::c_void),
+            source,
             current_proc,
             &mut dup,
             0,
@@ -415,7 +425,10 @@ fn inspect_handle(
     facts
 }
 
-fn inspect_duplicated_handle(dup: HANDLE, path_buf: &mut [u16]) -> Result<Option<HandleFacts>, ()> {
+fn inspect_duplicated_handle(
+    dup: HANDLE,
+    path_buf: &mut [u16],
+) -> HandleInspection<Option<HandleFacts>> {
     // Only disk files; strictly avoid named pipes, sockets, or devices that could hang.
     if unsafe { GetFileType(dup) } != FILE_TYPE_DISK {
         return Ok(None);

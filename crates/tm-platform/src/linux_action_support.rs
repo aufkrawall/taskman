@@ -72,6 +72,7 @@ pub(crate) enum PrivilegedAction {
 }
 
 impl PrivilegedAction {
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub(crate) fn label(&self) -> &'static str {
         match self {
             Self::Service { .. } => "service control",
@@ -431,6 +432,7 @@ pub(crate) fn validate_environment_name(name: &str) -> Result<(), String> {
     }
 }
 
+#[cfg(test)]
 fn priority_argument(priority: PriorityClass) -> Option<&'static str> {
     match priority {
         PriorityClass::High => Some("high"),

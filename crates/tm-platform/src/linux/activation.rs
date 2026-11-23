@@ -9,10 +9,11 @@
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::net::Shutdown;
 use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
-use std::os::unix::net::{Shutdown, UnixListener, UnixStream};
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, SyncSender, TryRecvError};
@@ -152,7 +153,7 @@ impl ActivationInbox {
 impl ActivationOwner {
     fn stop(&self) {
         self.stop.store(true, Ordering::Release);
-        self.shared.ready.notify_all();
+        self.shared().ready.notify_all();
     }
 
     fn shared(&self) -> &InboxShared {

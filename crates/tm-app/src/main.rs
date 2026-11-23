@@ -958,6 +958,7 @@ fn linux_activation_restore_confirmed(
 /// delegates every application hook unchanged.
 struct NativeApp {
     inner: app::TaskManApp,
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     activation: NativeActivation,
     #[cfg(target_os = "linux")]
     linux_activation_acks: Vec<LinuxActivationPending>,
@@ -1124,7 +1125,7 @@ impl eframe::App for NativeApp {
         #[cfg(target_os = "linux")]
         let activation_requests = self.activation.apply_pending(ctx);
         #[cfg(not(target_os = "linux"))]
-        let activation_requests = Vec::new();
+        let activation_requests: Vec<()> = Vec::new();
         if !activation_requests.is_empty() {
             self.hidden_to_tray = false;
             self.initial_hide_pending = false;

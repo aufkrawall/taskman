@@ -1275,6 +1275,7 @@ mod tests {
         state.merge_files(ProcessFileIoSnapshot {
             files: batch1,
             accounting: FileIoAccounting {
+                state: FileIoAccountingState::Measured,
                 handles_complete: true,
                 ..Default::default()
             },
@@ -1316,6 +1317,7 @@ mod tests {
         state.merge_files(ProcessFileIoSnapshot {
             files: batch2,
             accounting: FileIoAccounting {
+                state: FileIoAccountingState::Measured,
                 handles_complete: true,
                 ..Default::default()
             },
@@ -1483,11 +1485,10 @@ mod tests {
                 ..Default::default()
             },
         });
-        let file = &state.files[0];
-        assert_eq!(file.open_handles, 0);
-        assert!(!file.is_read);
-        assert!(!file.is_write);
-        assert_eq!(file.offset, None);
+        assert!(
+            state.files.is_empty(),
+            "an unmeasured closed row is dropped instead of being retained forever"
+        );
     }
 
     #[test]

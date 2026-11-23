@@ -10,6 +10,7 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
+use std::time::{SystemTime, UNIX_EPOCH};
 use tm_core::error::{Result, TmError};
 
 const ENTRY_FILE_NAME: &str = "io.github.aufkrawall.Taskman.desktop";
@@ -378,7 +379,7 @@ fn validate_owned_regular_file(file: &File) -> Result<()> {
 fn read_entry(file: &mut File) -> Result<String> {
     file.seek(SeekFrom::Start(0)).map_err(TmError::from)?;
     let mut text = String::new();
-    file.by_ref()
+    Read::by_ref(file)
         .take(MAX_ENTRY_BYTES + 1)
         .read_to_string(&mut text)
         .map_err(|error| TmError::platform("read XDG autostart entry", error.to_string()))?;

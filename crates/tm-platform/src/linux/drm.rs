@@ -189,14 +189,14 @@ fn driver_name(device: &Path) -> Option<String> {
 
 fn read_temperature(device: &Path) -> Option<f32> {
     let hwmon = device.join("hwmon");
-    let mut sensors: Vec<PathBuf> = std::fs::read_dir(hwmon)
+    let mut sensors: Vec<PathBuf> = std::fs::read_dir(&hwmon)
         .ok()?
         .flatten()
         .map(|entry| entry.path().join("temp1_input"))
         .filter(|path| path.exists())
         .collect();
     if sensors.is_empty() {
-        sensors = std::fs::read_dir(hwmon)
+        sensors = std::fs::read_dir(&hwmon)
             .ok()?
             .flatten()
             .flat_map(|entry| {

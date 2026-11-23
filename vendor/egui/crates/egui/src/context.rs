@@ -4491,11 +4491,11 @@ mod test {
 
     fn capture_repaint_delays(
         ctx: &Context,
-    ) -> std::sync::Arc<std::sync::Mutex<Vec<std::time::Duration>>> {
-        let delays = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    ) -> std::sync::Arc<crate::mutex::Mutex<Vec<std::time::Duration>>> {
+        let delays = std::sync::Arc::new(crate::mutex::Mutex::new(Vec::new()));
         let captured = std::sync::Arc::clone(&delays);
         ctx.set_request_repaint_callback(move |info| {
-            captured.lock().unwrap().push(info.delay);
+            captured.lock().push(info.delay);
         });
         delays
     }
@@ -4514,7 +4514,7 @@ mod test {
         );
         output.drop_without_applying_deltas();
 
-        assert_eq!(delays.lock().unwrap().as_slice(), [delay]);
+        assert_eq!(delays.lock().as_slice(), [delay]);
     }
 
     #[test]
@@ -4539,7 +4539,7 @@ mod test {
         output.drop_without_applying_deltas();
 
         assert_eq!(
-            delays.lock().unwrap().as_slice(),
+            delays.lock().as_slice(),
             [std::time::Duration::from_secs_f32(refresh)]
         );
     }

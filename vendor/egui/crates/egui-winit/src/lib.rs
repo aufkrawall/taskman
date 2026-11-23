@@ -3101,11 +3101,11 @@ mod wheel_repaint_tests {
 
     fn capture_repaint_delays(
         ctx: &egui::Context,
-    ) -> std::sync::Arc<std::sync::Mutex<Vec<web_time::Duration>>> {
-        let delays = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    ) -> std::sync::Arc<egui::mutex::Mutex<Vec<web_time::Duration>>> {
+        let delays = std::sync::Arc::new(egui::mutex::Mutex::new(Vec::new()));
         let captured = std::sync::Arc::clone(&delays);
         ctx.set_request_repaint_callback(move |info| {
-            captured.lock().unwrap().push(info.delay);
+            captured.lock().push(info.delay);
         });
         delays
     }
@@ -3120,17 +3120,17 @@ mod wheel_repaint_tests {
 
         assert!(repaint(&ctx, &mut throttle, &stats, t0, true));
         throttle.note_frame(t0, true);
-        assert!(delays.lock().unwrap().is_empty());
+        assert!(delays.lock().is_empty());
 
         assert!(!repaint(&ctx, &mut throttle, &stats, at(t0, 4), true));
         assert_eq!(
-            delays.lock().unwrap().as_slice(),
+            delays.lock().as_slice(),
             [web_time::Duration::from_millis(12)]
         );
 
         assert!(!repaint(&ctx, &mut throttle, &stats, at(t0, 8), true));
         assert_eq!(
-            delays.lock().unwrap().as_slice(),
+            delays.lock().as_slice(),
             [web_time::Duration::from_millis(12)],
             "a coalesced event must not arm another callback"
         );
@@ -3357,7 +3357,7 @@ mod wheel_repaint_tests {
         let mut buffer = WheelEventBuffer::default();
         let modifiers = egui::Modifiers::default();
 
-        let mut pass = |events: Vec<egui::Event>| {
+        let pass = |events: Vec<egui::Event>| {
             ctx.run_ui(
                 egui::RawInput {
                     events,
