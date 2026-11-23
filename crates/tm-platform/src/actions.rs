@@ -11,23 +11,46 @@ use tm_core::model::{PriorityClass, ProcStatus, ServiceInfo, StartupItem, UserSe
 pub struct Capabilities {
     pub services_list: bool,
     pub services_control: bool,
+    /// A native service-management UI exists (not just list/control actions).
+    pub open_services_app: bool,
     pub startup_toggle: bool,
     pub end_process_tree: bool,
     pub users_sessions: bool,
     pub user_disconnect: bool,
+    /// A native account-management surface exists.
+    pub manage_user_accounts: bool,
     pub end_process: bool,
     pub suspend_resume: bool,
     pub set_priority: bool,
     pub set_affinity: bool,
     pub efficiency_mode: bool,
     pub run_new_task: bool,
+    /// Arbitrary Run may use an elevated launch path. Linux and macOS keep
+    /// this false because no safe general-purpose elevated launcher exists.
+    pub run_elevated: bool,
     pub per_process_network: bool,
     pub process_modules: bool,
     pub process_threads: bool,
     pub process_connections: bool,
     pub process_file_io: bool,
     pub unload_module: bool,
-    pub start_with_windows: bool,
+    /// A backend can register/unregister TaskMan's own login-start entry.
+    pub start_with_system: bool,
+    /// This process's elevation state is meaningful and can be displayed.
+    pub elevation_status: bool,
+    /// Settings can hand the current process to an elevated replacement.
+    pub relaunch_elevated: bool,
+    /// A future launch can follow a persisted elevated-start policy.
+    pub start_elevated: bool,
+}
+
+impl Capabilities {
+    /// Elevated Run needs both the general launch surface and an explicit
+    /// elevated-launch implementation. Keeping this as one predicate prevents
+    /// a platform from exposing a checkbox that only turns into an error.
+    pub fn supports_elevated_run(self) -> bool {
+        self.run_new_task && self.run_elevated
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -457,6 +480,11 @@ pub trait PlatformActions: Send + Sync {
     fn control_service(&self, _name: &str, _action: ServiceAction) -> Result<()> {
         Err(tm_core::TmError::Unsupported("service control"))
     }
+    /// Open the platform's native service-management surface. Platforms
+    /// without one leave `Capabilities::open_services_app` false.
+    fn open_services_app(&self) -> Result<()> {
+        Err(tm_core::TmError::Unsupported("Services app"))
+    }
 
     // ------------------------------------------------ startup
     fn list_startup(&self) -> Result<Vec<StartupItem>> {
@@ -472,6 +500,11 @@ pub trait PlatformActions: Send + Sync {
     }
     fn control_user_session(&self, _session_id: u32, _action: UserSessionAction) -> Result<()> {
         Err(tm_core::TmError::Unsupported("session control"))
+    }
+    /// Open the platform's native account-management surface. This is separate
+    /// from session listing/control, which several Unix flavors implement.
+    fn manage_user_accounts(&self) -> Result<()> {
+        Err(tm_core::TmError::Unsupported("user account management"))
     }
 
     // ------------------------------------------------ process control
@@ -660,8 +693,14 @@ pub trait PlatformActions: Send + Sync {
     fn repair_task_manager_replacement(&self) -> Result<bool> {
         Ok(false)
     }
-    fn set_start_with_windows(&self, _enabled: bool, _start_minimized: bool) -> Result<()> {
-        Err(tm_core::TmError::Unsupported("start with Windows"))
+    fn set_start_with_system(&self, _enabled: bool, _start_minimized: bool) -> Result<()> {
+        Err(tm_core::TmError::Unsupported("start with system"))
+    }
+    /// Remove only TaskMan's own login-start registration. The default action
+    /// delegates to the same capability-owning implementation as the setting,
+    /// so Reset cannot drift from the platform's ownership checks.
+    fn clear_self_autostart(&self) -> Result<()> {
+        self.set_start_with_system(false, true)
     }
     fn core_service_state(&self) -> CoreServiceState {
         CoreServiceState::Unsupported
@@ -739,5 +778,37 @@ pub struct MockActions;
 impl PlatformActions for MockActions {
     fn backend_name(&self) -> &'static str {
         "mock"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn elevated_run_requires_both_capabilities() {
+        assert!(!Capabilities::default().supports_elevated_run());
+        assert!(
+            !Capabilities {
+                run_new_task: true,
+                ..Default::default()
+            }
+            .supports_elevated_run()
+        );
+        assert!(
+            !Capabilities {
+                run_elevated: true,
+                ..Default::default()
+            }
+            .supports_elevated_run()
+        );
+        assert!(
+            Capabilities {
+                run_new_task: true,
+                run_elevated: true,
+                ..Default::default()
+            }
+            .supports_elevated_run()
+        );
     }
 }

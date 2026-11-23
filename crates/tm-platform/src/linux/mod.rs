@@ -810,23 +810,29 @@ impl PlatformActions for LinuxActions {
         Capabilities {
             services_list: true,
             services_control: true,
+            open_services_app: false,
             startup_toggle: true,
             end_process_tree: true,
             users_sessions: false,
             user_disconnect: false,
+            manage_user_accounts: false,
             end_process: true,
             suspend_resume: true,
             set_priority: true,
             set_affinity: true,
             efficiency_mode: false,
             run_new_task: true,
+            run_elevated: false,
             per_process_network: false,
             process_modules: true,
             process_threads: true,
             process_connections: true,
             process_file_io: true,
             unload_module: false,
-            start_with_windows: false,
+            start_with_system: false,
+            elevation_status: true,
+            relaunch_elevated: false,
+            start_elevated: false,
         }
     }
 
@@ -973,19 +979,49 @@ impl PlatformActions for LinuxActions {
 
     fn run_new_task(&self, command_line: &str, elevate: bool) -> Result<()> {
         use std::process::{Command, Stdio};
-        let mut cmd = if elevate {
-            let mut c = Command::new("pkexec");
-            c.arg("sh").arg("-c").arg(command_line);
-            c
-        } else {
-            let mut c = Command::new("sh");
-            c.arg("-c").arg(command_line);
-            c
+        if elevate {
+            return Err(tm_core::TmError::Unsupported(
+                "elevated arbitrary task launch",
+            ));
+        }
+        let argv = crate::command_line::split(command_line).map_err(|error| {
+            tm_core::TmError::platform(
+                "run new task",
+                format!("invalid command line: {error}"),
+            )
+        })?;
+        let Some((program, arguments)) = argv.split_first() else {
+            return Err(tm_core::TmError::platform(
+                "run new task",
+                "empty command",
+            ));
         };
-        cmd.stdout(Stdio::null()).stderr(Stdio::null());
-        cmd.spawn()
-            .map(|_| ())
-            .map_err(|e| tm_core::TmError::platform("spawn", e.to_string()))
+        let mut cmd = Command::new(program);
+        cmd.args(arguments);
+        cmd.stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let mut child = cmd
+            .spawn()
+            .map_err(|e| tm_core::TmError::platform("spawn", e.to_string()))?;
+        if let Err(error) = std::thread::Builder::new()
+            .name("tm-linux-run-reaper".into())
+            .spawn(move || {
+                let _ = child.wait();
+            })
+        {
+            // The program was launched successfully; failing the user action
+            // now would be false. A persistent GUI has nothing to reap while
+            // it runs, and the process exits normally on this rare path.
+            tracing::warn!(%error, "could not start the Run child reaper");
+        }
+        Ok(())
+    }
+    fn run_new_task_probe(&self, command_line: &str, elevate: bool) -> Result<()> {
+        self.run_new_task(command_line, elevate)
+    }
+    fn is_elevated(&self) -> bool {
+        unsafe { libc::geteuid() == 0 }
     }
 
     fn list_process_modules(
@@ -1233,6 +1269,20 @@ mod tests {
         assert!(capabilities.process_connections);
         assert!(capabilities.end_process_tree);
         assert!(!capabilities.unload_module);
+        assert!(capabilities.run_new_task);
+        assert!(!capabilities.run_elevated);
+        assert!(capabilities.elevation_status);
+        assert!(!capabilities.relaunch_elevated);
+        assert!(!capabilities.start_elevated);
+        assert!(!capabilities.start_with_system);
+        assert!(!capabilities.open_services_app);
+        assert!(!capabilities.manage_user_accounts);
+    }
+
+    #[test]
+    fn elevated_run_is_rejected_before_spawning_anything() {
+        let error = create_actions().run_new_task("true", true).unwrap_err();
+        assert!(matches!(error, tm_core::TmError::Unsupported(_)));
     }
 
     #[test]

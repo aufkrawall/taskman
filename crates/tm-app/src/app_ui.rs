@@ -158,7 +158,13 @@ pub fn tab_header(
                 }
                 original::vsep(ui, pal);
             }
-            if original::cmd_button(ui, pal, Icon::RunTask, i18n::tr(K::RunNewTask), true) {
+            if original::cmd_button(
+                ui,
+                pal,
+                Icon::RunTask,
+                i18n::tr(K::RunNewTask),
+                app.actions.capabilities().run_new_task,
+            ) {
                 app.run_dialog_open = true;
             }
         });

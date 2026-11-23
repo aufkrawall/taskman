@@ -384,23 +384,29 @@ impl PlatformActions for WinActions {
         Capabilities {
             services_list: true,
             services_control: true,
+            open_services_app: true,
             startup_toggle: true,
             end_process_tree: true,
             users_sessions: true,
             user_disconnect: true,
+            manage_user_accounts: true,
             end_process: true,
             suspend_resume: true,
             set_priority: true,
             set_affinity: true,
             efficiency_mode: true,
             run_new_task: true,
+            run_elevated: true,
             per_process_network: false,
             process_modules: true,
             process_threads: true,
             process_connections: true,
             process_file_io: true,
             unload_module: true,
-            start_with_windows: true,
+            start_with_system: true,
+            elevation_status: true,
+            relaunch_elevated: true,
+            start_elevated: true,
         }
     }
 
@@ -409,6 +415,9 @@ impl PlatformActions for WinActions {
     }
     fn control_service(&self, name: &str, action: ServiceAction) -> Result<()> {
         services::control_service(name, action)
+    }
+    fn open_services_app(&self) -> Result<()> {
+        self.run_new_task("services.msc", false)
     }
     fn list_startup(&self) -> Result<Vec<StartupItem>> {
         Ok(startup::list_startup())
@@ -421,6 +430,9 @@ impl PlatformActions for WinActions {
     }
     fn control_user_session(&self, session_id: u32, action: UserSessionAction) -> Result<()> {
         users::control_session(session_id, action)
+    }
+    fn manage_user_accounts(&self) -> Result<()> {
+        self.run_new_task("ms-settings:otherusers", false)
     }
     fn kill_process(
         &self,
@@ -607,7 +619,7 @@ impl PlatformActions for WinActions {
         Ok(true)
     }
 
-    fn set_start_with_windows(&self, enabled: bool, start_minimized: bool) -> Result<()> {
+    fn set_start_with_system(&self, enabled: bool, start_minimized: bool) -> Result<()> {
         autostart::set_enabled(enabled, start_minimized)
     }
 
@@ -672,6 +684,19 @@ pub fn create_actions() -> core_service::BrokeredActions {
 #[cfg(all(test, target_os = "windows"))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn capabilities_match_windows_native_surfaces() {
+        let capabilities = WinActions.capabilities();
+        assert!(capabilities.open_services_app);
+        assert!(capabilities.manage_user_accounts);
+        assert!(capabilities.start_with_system);
+        assert!(capabilities.elevation_status);
+        assert!(capabilities.relaunch_elevated);
+        assert!(capabilities.start_elevated);
+        assert!(capabilities.supports_elevated_run());
+        assert!(capabilities.end_process_tree);
+    }
 
     /// Parse with the OS ground truth (CommandLineToArgvW — the same rules
     /// the elevated relaunch's target uses). The returned argv buffer is

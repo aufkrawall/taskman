@@ -954,15 +954,15 @@ rebase runbook.
 
 ## Recently landed (2026-08-28)
 
-- Settings dialog (Windows, "Advanced" block): elevation status, a persisted
-  "Always start with administrator privileges" policy (startup re-execs
-  elevated via runas before the window opens; declined UAC degrades to an
-  unelevated start; `TASKMAN_CONFIG_DIR` overrides skip it), and a one-shot
-  "Restart as administrator" button (`relaunch_elevated()` on the action
-  executor, then a graceful `ViewportCommand::Close` from the executor
-  thread; declined UAC surfaces the error toast). Elevation is cached once
-  at startup (`TaskManApp::is_elevated`). `tools/capture.ps1` now uses an
-  isolated temp config dir. See `log/recent.md` 2026-08-28.
+- Settings dialog elevation block: status, a persisted always-start-elevated
+  policy, and a one-shot elevated-restart button are now capability-gated
+  independently of the Windows-only taskbar/core-service/Task Manager
+  sections. On Windows, startup re-execs elevated via runas before the window
+  opens; declined UAC degrades to an unelevated start, and
+  `TASKMAN_CONFIG_DIR` overrides skip it. The restart action then closes the
+  outgoing instance gracefully. Elevation is cached once at startup
+  (`TaskManApp::is_elevated`). `tools/capture.ps1` uses an isolated temp config
+  dir. See `log/recent.md` 2026-11-23 and 2026-08-28.
 - Chart-freeze fix: `TaskManApp.history` was a `VecDeque` whose ring buffer
   wraps after `history_cap` pop/push cycles; the Performance tab read only
   `as_slices().0` (the OLD half), so all graphs and card sparklines froze on

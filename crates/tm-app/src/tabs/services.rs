@@ -115,6 +115,7 @@ fn ensure_fresh(app: &TaskManApp, ctx: &egui::Context) {
 pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
     let pal = theme::palette(ui);
     let frame_ctx = ui.ctx().clone();
+    let capabilities = app.actions.capabilities();
     ensure_fresh(app, &frame_ctx);
 
     if let Some(name) = tm_core::sync::lock(&app.svc_jump).take() {
@@ -174,15 +175,18 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
                     tm_platform::actions::ServiceAction::Restart,
                 );
             }
-            crate::app_ui::vsep(ui, &pal);
-            if crate::app_ui::cmd_button(
-                ui,
-                &pal,
-                Icon::OpenExternal,
-                i18n::tr(K::OpenServicesApp),
-                true,
-            ) {
-                let _ = app.actions.run_new_task("services.msc", false);
+            if capabilities.open_services_app {
+                crate::app_ui::vsep(ui, &pal);
+                if crate::app_ui::cmd_button(
+                    ui,
+                    &pal,
+                    Icon::OpenExternal,
+                    i18n::tr(K::OpenServicesApp),
+                    true,
+                ) {
+                    let actions = app.actions.clone();
+                    app.run_shell_action(ui.ctx(), move || actions.open_services_app());
+                }
             }
         },
         |_app, ui| {
@@ -416,8 +420,11 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
                         app.tab = crate::app::Tab::Details;
                         ui.close();
                     }
-                    if menu::item(ui, i18n::tr(K::OpenServicesApp)).clicked() {
-                        let _ = app.actions.run_new_task("services.msc", false);
+                    if capabilities.open_services_app
+                        && menu::item(ui, i18n::tr(K::OpenServicesApp)).clicked()
+                    {
+                        let actions = app.actions.clone();
+                        app.run_shell_action(&mctx, move || actions.open_services_app());
                         ui.close();
                     }
                     if menu::item(ui, i18n::tr(K::CopyName)).clicked() {

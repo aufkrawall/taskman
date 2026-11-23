@@ -328,9 +328,8 @@ pub struct TaskManApp {
 
     pub actions: Arc<dyn PlatformActions>,
     /// Elevation status of THIS process; fixed at process creation, so it is
-    /// queried exactly once (settings dialog shows it and offers an elevated
-    /// restart). Read only by the Windows-only settings section.
-    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+    /// queried exactly once. Backends advertise whether the status is
+    /// meaningful before Settings renders it.
     pub is_elevated: bool,
     pub shared: SharedState,
     /// Rolling tick history for all Performance-tab charts. MUST stay a

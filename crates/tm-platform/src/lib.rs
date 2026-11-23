@@ -6,6 +6,8 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 
 pub mod actions;
+#[cfg(any(target_os = "linux", test))]
+pub(crate) mod command_line;
 /// Freedesktop icon-theme lookup, shared by the Unix backends. Platform-
 /// neutral on purpose so its tests run on every host.
 pub mod xdg_icons;

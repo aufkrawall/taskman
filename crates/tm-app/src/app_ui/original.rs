@@ -7,6 +7,7 @@ use tm_core::i18n::{self, K};
 use tm_core::settings::{Settings, TextSmoothing, ThemeMode};
 #[cfg(target_os = "windows")]
 use tm_core::settings::{TaskbarColorMode, TaskbarNetUnit};
+use tm_platform::actions::Capabilities;
 
 #[cfg(test)]
 use crate::app::Tab;
@@ -1182,7 +1183,27 @@ fn commit_search_on_down(
 
 // ---------------------------------------------------------------- dialogs
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SettingsElevationVisibility {
+    section: bool,
+    relaunch: bool,
+    start_elevated: bool,
+}
+
+/// Elevation controls are meaningful only as one coherent capability group.
+/// A backend that cannot report the current state must not expose a relaunch
+/// or always-start switch that assumes it can.
+fn settings_elevation_visibility(capabilities: Capabilities) -> SettingsElevationVisibility {
+    SettingsElevationVisibility {
+        section: capabilities.elevation_status,
+        relaunch: capabilities.elevation_status && capabilities.relaunch_elevated,
+        start_elevated: capabilities.elevation_status && capabilities.start_elevated,
+    }
+}
+
 pub fn settings_dialog(app: &mut TaskManApp, ctx: &egui::Context, _pal: &theme::Palette) {
+    let capabilities = app.actions.capabilities();
+    let elevation = settings_elevation_visibility(capabilities);
     let mut open = true;
     // A tab-through dialog: the controls must stay keyboard-reachable, so Tab
     // is left to egui's focus system and Enter only closes while no control
@@ -1434,26 +1455,6 @@ pub fn settings_dialog(app: &mut TaskManApp, ctx: &egui::Context, _pal: &theme::
                     app.save_settings();
                 }
 
-                let mut start_with_windows = app.shared.settings.start_with_windows;
-                if crate::widgets::controls::checkbox(
-                    ui,
-                    &mut start_with_windows,
-                    i18n::tr(K::StartWithWindows),
-                    _pal,
-                )
-                .changed()
-                {
-                    match app.actions.set_start_with_windows(start_with_windows, true) {
-                        Ok(()) => {
-                            app.shared.settings.start_with_windows = start_with_windows;
-                            app.save_settings();
-                        }
-                        Err(error) => app
-                            .shared
-                            .toast(i18n::trf(K::ErrMsg, &[&error.to_string()])),
-                    }
-                }
-
                 // Opt-in for the SSID/signal rows. OFF means the
                 // location-gated WLAN query is never called at all — no
                 // Windows location permission prompt, no "location in use"
@@ -1478,6 +1479,28 @@ pub fn settings_dialog(app: &mut TaskManApp, ctx: &egui::Context, _pal: &theme::
                         .size(11.0)
                         .color(_pal.text_dim),
                 );
+            }
+
+            if capabilities.start_with_system {
+                let mut start_with_system = app.shared.settings.start_with_windows;
+                if crate::widgets::controls::checkbox(
+                    ui,
+                    &mut start_with_system,
+                    i18n::tr(K::StartWithSystem),
+                    _pal,
+                )
+                .changed()
+                {
+                    match app.actions.set_start_with_system(start_with_system, true) {
+                        Ok(()) => {
+                            app.shared.settings.start_with_windows = start_with_system;
+                            app.save_settings();
+                        }
+                        Err(error) => app
+                            .shared
+                            .toast(i18n::trf(K::ErrMsg, &[&error.to_string()])),
+                    }
+                }
             }
 
             ui.add_space(10.0);
@@ -1846,7 +1869,9 @@ pub fn settings_dialog(app: &mut TaskManApp, ctx: &egui::Context, _pal: &theme::
                 } else {
                     ui.label(i18n::tr(K::CheckingAdvancedState));
                 }
+            }
 
+            if elevation.section {
                 ui.add_space(10.0);
                 ui.heading(i18n::tr(K::ElevatedHeading));
                 ui.label(
@@ -1858,7 +1883,10 @@ pub fn settings_dialog(app: &mut TaskManApp, ctx: &egui::Context, _pal: &theme::
                     .size(11.5)
                     .color(_pal.text_dim),
                 );
-                if !app.is_elevated && ui.button(i18n::tr(K::RestartElevated)).clicked() {
+                if elevation.relaunch
+                    && !app.is_elevated
+                    && ui.button(i18n::tr(K::RestartElevated)).clicked()
+                {
                     let actions = app.actions.clone();
                     let close_ctx = ctx.clone();
                     app.run_action(
@@ -1866,31 +1894,30 @@ pub fn settings_dialog(app: &mut TaskManApp, ctx: &egui::Context, _pal: &theme::
                         || i18n::tr(K::RelaunchElevatedToast).to_string(),
                         move || {
                             actions.relaunch_elevated()?;
-                            // ShellExecuteExW returns only after UAC consent
-                            // succeeded and the elevated instance is spawning;
-                            // shut this one down gracefully so on_exit flushes
-                            // settings and history. A declined prompt surfaces
-                            // as an error toast instead.
+                            // The action succeeds only after the replacement
+                            // process was handed off. Close this instance so
+                            // its settings and history flush exactly once.
                             crate::request_programmatic_exit();
                             close_ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                             Ok(())
                         },
                     );
                 }
-                let mut start_elevated = app.shared.settings.start_elevated;
-                if crate::widgets::controls::checkbox(
-                    ui,
-                    &mut start_elevated,
-                    i18n::tr(K::StartElevated),
-                    _pal,
-                )
-                .changed()
-                {
-                    // Policy for FUTURE launches: startup re-execs elevated
-                    // when unelevated (main.rs); the current session is not
-                    // touched — use the restart button above to elevate now.
-                    app.shared.settings.start_elevated = start_elevated;
-                    app.save_settings();
+                if elevation.start_elevated {
+                    let mut start_elevated = app.shared.settings.start_elevated;
+                    if crate::widgets::controls::checkbox(
+                        ui,
+                        &mut start_elevated,
+                        i18n::tr(K::StartElevated),
+                        _pal,
+                    )
+                    .changed()
+                    {
+                        // Policy for FUTURE launches: startup re-execs elevated
+                        // when unelevated; the current session is unchanged.
+                        app.shared.settings.start_elevated = start_elevated;
+                        app.save_settings();
+                    }
                 }
             }
 
@@ -1903,11 +1930,11 @@ pub fn settings_dialog(app: &mut TaskManApp, ctx: &egui::Context, _pal: &theme::
                     app.shared.toast(i18n::tr(K::ColWidthsResetToast));
                 }
                 if ui.button(i18n::tr(K::Reset)).clicked() {
-                    #[cfg_attr(not(target_os = "windows"), allow(unused_mut))]
                     let mut defaults = Settings::default();
-                    #[cfg(target_os = "windows")]
-                    if let Err(error) = app.actions.set_start_with_windows(false, true) {
-                        // The registry is authoritative for autostart. If it
+                    if capabilities.start_with_system
+                        && let Err(error) = app.actions.clear_self_autostart()
+                    {
+                        // The platform autostart backend is authoritative. If it
                         // could not be cleared, keep the matching setting and
                         // surface the mismatch instead of claiming a reset.
                         defaults.start_with_windows = app.shared.settings.start_with_windows;
@@ -2111,19 +2138,40 @@ enum RunTaskDialogFocus {
 }
 
 impl RunTaskDialogFocus {
-    fn next(self, backwards: bool) -> Self {
+    fn next_with_elevated(self, backwards: bool, elevated_available: bool) -> Self {
         use RunTaskDialogFocus::*;
-        const ORDER: [RunTaskDialogFocus; 5] = [Command, Elevated, Cancel, Browse, Ok];
-        let index = ORDER
-            .iter()
-            .position(|candidate| *candidate == self)
-            .expect("known run-dialog focus target");
-        let next = if backwards {
-            (index + ORDER.len() - 1) % ORDER.len()
+        const WITH_ELEVATED: [RunTaskDialogFocus; 5] = [
+            RunTaskDialogFocus::Command,
+            RunTaskDialogFocus::Elevated,
+            RunTaskDialogFocus::Cancel,
+            RunTaskDialogFocus::Browse,
+            RunTaskDialogFocus::Ok,
+        ];
+        const WITHOUT_ELEVATED: [RunTaskDialogFocus; 4] = [
+            RunTaskDialogFocus::Command,
+            RunTaskDialogFocus::Cancel,
+            RunTaskDialogFocus::Browse,
+            RunTaskDialogFocus::Ok,
+        ];
+        let order: &[RunTaskDialogFocus] = if elevated_available {
+            &WITH_ELEVATED
         } else {
-            (index + 1) % ORDER.len()
+            &WITHOUT_ELEVATED
         };
-        ORDER[next]
+        let focus = if self == Elevated && !elevated_available {
+            Command
+        } else {
+            self
+        };
+        let index = order
+            .iter()
+            .position(|candidate| *candidate == focus)
+            .expect("known run-dialog focus target");
+        if backwards {
+            order[(index + order.len() - 1) % order.len()]
+        } else {
+            order[(index + 1) % order.len()]
+        }
     }
 }
 
@@ -2139,11 +2187,17 @@ enum RunTaskDialogAction {
 /// otherwise it invokes the default OK action. Space toggles the checkbox or
 /// activates a focused push button, but remains ordinary text in the command
 /// field.
-fn run_task_dialog_key_action(
+fn run_task_dialog_key_action_with_elevated(
     focus: RunTaskDialogFocus,
     enter: bool,
     space: bool,
+    elevated_available: bool,
 ) -> Option<RunTaskDialogAction> {
+    let focus = if focus == RunTaskDialogFocus::Elevated && !elevated_available {
+        RunTaskDialogFocus::Command
+    } else {
+        focus
+    };
     if enter {
         return Some(match focus {
             RunTaskDialogFocus::Cancel => RunTaskDialogAction::Cancel,
@@ -2185,11 +2239,18 @@ impl Drop for BrowseGuard {
 }
 
 pub fn run_task_dialog(app: &mut TaskManApp, ctx: &egui::Context, _pal: &theme::Palette) {
+    let can_run_elevated = app.actions.capabilities().supports_elevated_run();
+    if !can_run_elevated {
+        app.run_elevated = false;
+    }
     let focus_id = egui::Id::new("run-task-dialog-focus");
     let restore_id = egui::Id::new("run-task-dialog-restore-focus");
     let mut focus = ctx
         .data(|data| data.get_temp::<RunTaskDialogFocus>(focus_id))
         .unwrap_or_default();
+    if focus == RunTaskDialogFocus::Elevated && !can_run_elevated {
+        focus = RunTaskDialogFocus::Command;
+    }
     // First frame of this dialog session: remember what held focus before
     // the dialog took over, so closing can hand it back.
     if ctx
@@ -2226,7 +2287,7 @@ pub fn run_task_dialog(app: &mut TaskManApp, ctx: &egui::Context, _pal: &theme::
         ctx.input_mut(|input| input.consume_key(egui::Modifiers::SHIFT, egui::Key::Tab));
     let tab = ctx.input_mut(|input| input.consume_key(Default::default(), egui::Key::Tab));
     if shift_tab || tab {
-        focus = focus.next(shift_tab);
+        focus = focus.next_with_elevated(shift_tab, can_run_elevated);
     }
 
     let escape = ctx.input_mut(|input| input.consume_key(Default::default(), egui::Key::Escape));
@@ -2237,7 +2298,7 @@ pub fn run_task_dialog(app: &mut TaskManApp, ctx: &egui::Context, _pal: &theme::
     let mut action = if escape {
         Some(RunTaskDialogAction::Cancel)
     } else {
-        run_task_dialog_key_action(focus, enter, space)
+        run_task_dialog_key_action_with_elevated(focus, enter, space, can_run_elevated)
     };
 
     let mut open = true;
@@ -2265,18 +2326,20 @@ pub fn run_task_dialog(app: &mut TaskManApp, ctx: &egui::Context, _pal: &theme::
                 command.request_focus();
             }
 
-            ui.add_space(4.0);
-            let elevated = crate::widgets::controls::checkbox(
-                ui,
-                &mut app.run_elevated,
-                i18n::tr(K::RunElevated),
-                _pal,
-            );
-            if elevated.clicked() {
-                focus = RunTaskDialogFocus::Elevated;
-            }
-            if focus == RunTaskDialogFocus::Elevated {
-                elevated.request_focus();
+            if can_run_elevated {
+                ui.add_space(4.0);
+                let elevated = crate::widgets::controls::checkbox(
+                    ui,
+                    &mut app.run_elevated,
+                    i18n::tr(K::RunElevated),
+                    _pal,
+                );
+                if elevated.clicked() {
+                    focus = RunTaskDialogFocus::Elevated;
+                }
+                if focus == RunTaskDialogFocus::Elevated {
+                    elevated.request_focus();
+                }
             }
 
             ui.add_space(8.0);
@@ -2967,6 +3030,46 @@ mod tests {
     use super::*;
     use std::time::{Duration, Instant};
 
+    #[test]
+    fn elevation_controls_are_fail_closed_behind_status_capability() {
+        let none = settings_elevation_visibility(Capabilities::default());
+        assert_eq!(
+            none,
+            SettingsElevationVisibility {
+                section: false,
+                relaunch: false,
+                start_elevated: false,
+            }
+        );
+
+        let malformed = settings_elevation_visibility(Capabilities {
+            relaunch_elevated: true,
+            start_elevated: true,
+            ..Default::default()
+        });
+        assert!(!malformed.section);
+        assert!(!malformed.relaunch);
+        assert!(!malformed.start_elevated);
+
+        let status_only = settings_elevation_visibility(Capabilities {
+            elevation_status: true,
+            ..Default::default()
+        });
+        assert!(status_only.section);
+        assert!(!status_only.relaunch);
+        assert!(!status_only.start_elevated);
+
+        let complete = settings_elevation_visibility(Capabilities {
+            elevation_status: true,
+            relaunch_elevated: true,
+            start_elevated: true,
+            ..Default::default()
+        });
+        assert!(complete.section);
+        assert!(complete.relaunch);
+        assert!(complete.start_elevated);
+    }
+
     /// Regression: Process Properties (or any dialog) opened from a row's
     /// context menu handed focus back to nothing, so Delete did nothing until
     /// the row was clicked again. Drives the real pointer path: right-click a
@@ -3517,13 +3620,32 @@ mod tests {
         assert_eq!(RunTaskDialogFocus::default(), Command);
         let mut focus = Command;
         for expected in [Elevated, Cancel, Browse, Ok, Command] {
-            focus = focus.next(false);
+            focus = focus.next_with_elevated(false, true);
             assert_eq!(focus, expected);
         }
         for expected in [Ok, Browse, Cancel, Elevated, Command] {
-            focus = focus.next(true);
+            focus = focus.next_with_elevated(true, true);
             assert_eq!(focus, expected);
         }
+    }
+
+    #[test]
+    fn run_task_dialog_skips_hidden_elevation_control_in_focus_order() {
+        use RunTaskDialogFocus::*;
+        let mut focus = Command;
+        for expected in [Cancel, Browse, Ok, Command] {
+            focus = focus.next_with_elevated(false, false);
+            assert_eq!(focus, expected);
+        }
+        focus = Command;
+        for expected in [Ok, Browse, Cancel, Command] {
+            focus = focus.next_with_elevated(true, false);
+            assert_eq!(focus, expected);
+        }
+        assert_eq!(
+            run_task_dialog_key_action_with_elevated(Elevated, false, true, false),
+            None
+        );
     }
 
     #[test]
@@ -3531,31 +3653,31 @@ mod tests {
         use RunTaskDialogAction as Action;
         use RunTaskDialogFocus as Focus;
         assert_eq!(
-            run_task_dialog_key_action(Focus::Command, true, false),
+            run_task_dialog_key_action_with_elevated(Focus::Command, true, false, true),
             Some(Action::Submit)
         );
         assert_eq!(
-            run_task_dialog_key_action(Focus::Elevated, true, false),
+            run_task_dialog_key_action_with_elevated(Focus::Elevated, true, false, true),
             Some(Action::Submit)
         );
         assert_eq!(
-            run_task_dialog_key_action(Focus::Cancel, true, false),
+            run_task_dialog_key_action_with_elevated(Focus::Cancel, true, false, true),
             Some(Action::Cancel)
         );
         assert_eq!(
-            run_task_dialog_key_action(Focus::Browse, true, false),
+            run_task_dialog_key_action_with_elevated(Focus::Browse, true, false, true),
             Some(Action::Browse)
         );
         assert_eq!(
-            run_task_dialog_key_action(Focus::Ok, true, false),
+            run_task_dialog_key_action_with_elevated(Focus::Ok, true, false, true),
             Some(Action::Submit)
         );
         assert_eq!(
-            run_task_dialog_key_action(Focus::Elevated, false, true),
+            run_task_dialog_key_action_with_elevated(Focus::Elevated, false, true, true),
             Some(Action::ToggleElevated)
         );
         assert_eq!(
-            run_task_dialog_key_action(Focus::Command, false, true),
+            run_task_dialog_key_action_with_elevated(Focus::Command, false, true, true),
             None
         );
     }

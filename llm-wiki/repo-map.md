@@ -56,8 +56,10 @@ platform boundary (`tm-core` ← `tm-platform` ← `tm-app` / `tm-service`), and
     core-image list used by the sampler's tree boundaries and the Processes
     page), `i18n.rs` (DE/EN keys macro), `format.rs`, `mock.rs`.
 - `crates/tm-platform`
-  - OS collectors/actions behind traits (`actions.rs`). Windows stack under
-    `win/`: `sampler.rs` (sysinfo + NtQuerySystemInformation CPU accountant,
+  - OS collectors/actions behind traits (`actions.rs`, including explicit
+    native-shell, elevation, login-start, and process-tree capabilities;
+    `command_line.rs` provides shell-free argv parsing for Linux Run). Windows
+    stack under `win/`: `sampler.rs` (sysinfo + NtQuerySystemInformation CPU accountant,
     time-based attr TTL cache with token security + command-line queries and a
     brokered token-identity fallback (bounded retry per process) for the
     SYSTEM/service processes no local token read reaches, plus role fallbacks
