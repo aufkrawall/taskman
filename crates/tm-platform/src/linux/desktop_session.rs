@@ -950,10 +950,10 @@ mod tests {
     }
 
     #[test]
-    fn hybrid_cgroups_prefer_unified_v2_and_same_authority_conflicts_fail_closed() {
+    fn hybrid_cgroups_prefer_useful_unified_v2_and_same_authority_conflicts_fail_closed() {
         let raw = "\
 2:cpu,cpuacct:/
-1:name=systemd:/user.slice/user-1000.slice/session-7.scope
+1:name=systemd:/
 0::/user.slice/user-1000.slice/user@1000.service/app.slice/app-org.example-1.scope
 ";
         let evidence = parse_cgroup(raw.as_bytes(), true).expect("hybrid cgroup");

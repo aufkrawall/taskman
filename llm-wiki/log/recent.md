@@ -45,9 +45,9 @@
   evidence, and cannot override explicit Background/System roles.
 - Synthetic WSL `/init.scope` and `/system.slice` evidence is no longer
   authoritative System: top-level system cgroups require `/run/systemd/system`
-  plus PID 1 named `systemd`. Hybrid cgroup files prefer unified `0::` over
-  the compatibility `name=systemd` line, while disagreeing same-authority
-  candidates fail closed.
+  plus PID 1 named `systemd`. Hybrid cgroup files prefer a meaningful unified
+  `0::` path, fall back to useful compatibility `name=systemd` evidence, and
+  fail closed when meaningful paths from different authorities disagree.
 - Split hard kernel/PID-1/Windows core-name rules from Unix userspace
   infrastructure fallback. Positive Linux Background/App evidence can refine
   user `systemd`/`dbus-daemon`/`dbus-broker` names; explicit collector Unknown
