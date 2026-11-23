@@ -243,16 +243,50 @@ fn read_bounded_file(path: &str, max_bytes: usize) -> Option<Vec<u8>> {
 
 fn parse_cgroup(raw: &[u8], system_manager: bool) -> Option<DesktopEvidence> {
     let text = std::str::from_utf8(raw).ok()?;
-    let path = systemd_cgroup_path(text)?;
-    parse_systemd_path(path, system_manager)
+    let paths = systemd_cgroup_paths(text)?;
+    let unified = paths
+        .unified
+        .and_then(|path| parse_systemd_path(path, system_manager));
+    let named = paths
+        .named
+        .and_then(|path| parse_systemd_path(path, system_manager));
+    let meaningful = |evidence: &DesktopEvidence| {
+        evidence.role.is_some()
+            || evidence.session_id.is_some()
+            || evidence.user_session
+            || evidence.app_unit_group.is_some()
+    };
+
+    match (unified, named) {
+        (Some(unified), Some(named)) => {
+            let unified_meaningful = meaningful(&unified);
+            let named_meaningful = meaningful(&named);
+            if unified_meaningful && named_meaningful && unified != named {
+                None
+            } else if unified_meaningful || !named_meaningful {
+                Some(unified)
+            } else {
+                Some(named)
+            }
+        }
+        (Some(unified), None) => Some(unified),
+        (None, Some(named)) => Some(named),
+        (None, None) => None,
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SystemdCgroupPaths<'a> {
+    unified: Option<&'a str>,
+    named: Option<&'a str>,
 }
 
 /// cgroup v2 publishes one `0::/path` hierarchy. A v1/hybrid process may also
-/// expose the compatibility `name=systemd` hierarchy. Prefer a useful unified
-/// v2 path, but a root `0::/` carries no evidence and must not hide a useful
-/// named-systemd path. Within one authority, disagreeing candidates are
-/// ambiguous and must not be guessed.
-fn systemd_cgroup_path(raw: &str) -> Option<&str> {
+/// expose the compatibility `name=systemd` hierarchy. Return both candidates;
+/// the caller prefers the unified path only when it carries evidence. Within
+/// one authority, disagreeing candidates are ambiguous and must not be
+/// guessed.
+fn systemd_cgroup_paths(raw: &str) -> Option<SystemdCgroupPaths<'_>> {
     let mut unified = None;
     let mut named = None;
     for line in raw.lines() {
@@ -289,10 +323,7 @@ fn systemd_cgroup_path(raw: &str) -> Option<&str> {
             None => *target = Some(path),
         }
     }
-    match unified {
-        Some(path) if path != "/" => Some(path),
-        unified => named.filter(|path| *path != "/").or(unified),
-    }
+    (unified.is_some() || named.is_some()).then_some(SystemdCgroupPaths { unified, named })
 }
 
 fn parse_systemd_path(path: &str, system_manager: bool) -> Option<DesktopEvidence> {
@@ -980,6 +1011,26 @@ mod tests {
     }
 
     #[test]
+    fn hybrid_neutral_unified_paths_fall_back_to_useful_named_evidence() {
+        let neutral_unified = "\
+0::/machine.slice/unrelated
+1:name=systemd:/user.slice/user-1000.slice/session-9.scope
+";
+        let evidence = parse_cgroup(neutral_unified.as_bytes(), true).expect("hybrid cgroup");
+        assert_eq!(evidence.role, Some(DesktopRoleEvidence::Background));
+        assert_eq!(evidence.session_id, Some(9));
+        assert_eq!(
+            parse_cgroup(
+                b"0::/user.slice/user-1000.slice/session-4.scope\n\
+                  1:name=systemd:/system.slice/org.example.service\n",
+                true,
+            ),
+            None,
+            "different meaningful authorities must fail closed"
+        );
+    }
+
+    #[test]
     fn desktop_launch_hints_require_graphical_user_session_evidence() {
         let raw = b"PATH=/usr/bin\0WAYLAND_DISPLAY=wayland-0\0XDG_CURRENT_DESKTOP=KDE\0GIO_LAUNCHED_DESKTOP_FILE=/usr/share/applications/org.gnome.Terminal.desktop\0";
         let hints = parse_environment(raw).expect("complete environment");
@@ -1112,11 +1163,11 @@ mod tests {
             tm_core::classify::classify(tm_core::classify::ClassifyInput {
                 platform: tm_core::classify::ProcessPlatform::Unix,
                 pid: 3000,
-                name: "native-wayland-app",
+                name: "dbus-daemon",
                 has_window: None,
                 critical: None,
                 windows_owned: None,
-                desktop_role: evidence.role,
+                desktop_role: Some(evidence.role_marker()),
             }),
             tm_core::model::ProcCategory::Unknown
         );
@@ -1165,19 +1216,16 @@ mod tests {
     fn malformed_cgroup_and_unavailable_environment_remain_unknown() {
         assert_eq!(parse_cgroup(b"0::not-absolute\n", true), None);
         assert_eq!(read_environment_hints(u32::MAX), None);
-        let evidence = DesktopEvidence {
-            role: parse_cgroup(b"0::not-absolute\n", true).and_then(|evidence| evidence.role),
-            ..DesktopEvidence::default()
-        };
+        let evidence = DesktopEvidence::default();
         assert_eq!(
             tm_core::classify::classify(tm_core::classify::ClassifyInput {
                 platform: tm_core::classify::ProcessPlatform::Unix,
                 pid: 3000,
-                name: "native-wayland-app",
+                name: "dbus-daemon",
                 has_window: None,
                 critical: None,
                 windows_owned: None,
-                desktop_role: evidence.role,
+                desktop_role: Some(evidence.role_marker()),
             }),
             tm_core::model::ProcCategory::Unknown
         );

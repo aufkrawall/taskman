@@ -515,6 +515,12 @@ remain follow-up rather than being simulated in headless tests:
   low-PID System results. Downstream exhaustive literals must set the field;
   if `tm-core` is consumed externally, treat this as a deliberate API break or
   add a compatibility constructor/builder in a later contract change.
+- **`is_core_os_image` remains a union of Windows and Unix presentation
+  boundaries.** Classification itself is platform-aware, but the shared tree
+  boundary used by the Processes page and Windows sampler still treats
+  cross-platform kernel-looking names as boundaries. This can affect family
+  nesting for a hostile or coincidentally named app, not its category; a
+  platform-specific boundary helper would close that residual.
 - **Native App-root selection is deterministic, not semantic, when no member
   has a window.** The collector prefers any positively windowed app-family
   member and otherwise chooses creation ticks then PID. A short-lived

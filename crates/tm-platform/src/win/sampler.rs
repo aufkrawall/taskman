@@ -2489,7 +2489,17 @@ fn refine_categories_and_group_apps(processes: &mut [ProcessEntry], window_scan_
     // font driver and the per-session shell brokers as Windows processes.
     // The ownership test only rejects a spoofed core image name.
     for p in processes.iter_mut() {
-        let windows_owned = is_windows_owned_image(p);
+        // `Registry` and the other bare pseudo-process names have no image
+        // path. If one of those names is backed by a real file instead, reject
+        // the kernel-pseudo interpretation even when version metadata cannot
+        // establish a publisher.
+        let windows_owned = if classify::is_kernel_pseudo_name(&p.name)
+            && kernel_pseudo_role(p.exe_path.as_deref()).is_none()
+        {
+            Some(false)
+        } else {
+            is_windows_owned_image(p)
+        };
         let name = p.name.clone();
         let has_window = if p.has_window {
             Some(true)

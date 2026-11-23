@@ -42,15 +42,17 @@ const WINDOWS_CORE_IMAGES: &[&str] = &[
     "conhost.exe",
 ];
 
-/// Unix kernel-thread names. These are absolute System evidence just like
-/// Windows kernel pseudo-process names.
-const UNIX_KERNEL_NAMES: &[&str] = &[
-    "kthreadd",
-    "ksoftirqd",
-    "kworker",
+/// Unix kernel-thread name prefixes. These are absolute System evidence just
+/// like Windows kernel pseudo-process names, but the trailing separator is
+/// deliberate: a normal macOS application named "Migration Assistant" is not
+/// the Linux `migration/<cpu>` kernel thread.
+const UNIX_KERNEL_PREFIXES: &[&str] = &[
+    "kworker/",
+    "ksoftirqd/",
+    "migration/",
     "rcu_",
-    "migration",
-    "kernel_task",
+    "watchdog/",
+    "cpuhp/",
 ];
 
 /// Unix user-space infrastructure names. A positive desktop App/Background
@@ -76,18 +78,28 @@ fn is_kernel_name(name_lower: &str) -> bool {
     KERNEL_NAMES.contains(&name_lower)
 }
 
+/// True only for the kernel's bare pseudo-process names.
+///
+/// The caller must still establish that the name came from the kernel. A
+/// path-backed image can use any basename, including these names.
+pub fn is_kernel_pseudo_name(name: &str) -> bool {
+    is_kernel_name(&normalize(name))
+}
+
 fn is_unix_kernel_name(name_lower: &str) -> bool {
-    // Linux kernel threads are bracketed ("[kworker/0:1]").
-    if name_lower.starts_with('[') {
-        return true;
-    }
-    UNIX_KERNEL_NAMES
-        .iter()
-        .any(|n| name_lower.starts_with(n) || name_lower == *n)
+    let bare = name_lower
+        .strip_prefix('[')
+        .and_then(|name| name.strip_suffix(']'))
+        .unwrap_or(name_lower);
+    bare == "kthreadd"
+        || bare == "kernel_task"
+        || UNIX_KERNEL_PREFIXES
+            .iter()
+            .any(|prefix| bare.starts_with(prefix))
 }
 
 fn is_windows_core_image(name_lower: &str) -> bool {
-    is_kernel_name(name_lower) || WINDOWS_CORE_IMAGES.contains(&name_lower)
+    WINDOWS_CORE_IMAGES.contains(&name_lower)
 }
 
 fn is_unix_userspace_infrastructure(name_lower: &str) -> bool {
@@ -175,7 +187,13 @@ pub fn classify(input: ClassifyInput<'_>) -> ProcCategory {
 
     match input.platform {
         ProcessPlatform::Windows => {
-            if input.pid <= 4 || is_kernel_name(&name) {
+            if input.pid <= 4 {
+                return ProcCategory::System;
+            }
+            // Kernel pseudo-processes have no image file. A real image with a
+            // kernel-like basename still carries ownership evidence, so it
+            // must not inherit System merely from its name.
+            if is_kernel_name(&name) && input.windows_owned.is_none() {
                 return ProcCategory::System;
             }
             if input.critical == Some(true) {
@@ -509,6 +527,34 @@ mod tests {
                 "{name} must not inherit a Unix name rule on Windows"
             );
         }
+    }
+
+    #[test]
+    fn kernel_pseudo_names_require_positive_kernel_evidence_on_windows() {
+        assert_eq!(
+            classify_win(3000, "Registry", false, None, Some(false)),
+            ProcCategory::Background,
+            "a user image named Registry is not a kernel pseudo-process"
+        );
+        assert_eq!(
+            classify_win(3000, "Registry", false, None, None),
+            ProcCategory::System,
+            "the kernel's bare pseudo-process name remains trusted"
+        );
+    }
+
+    #[test]
+    fn macos_application_names_do_not_match_linux_kernel_prefixes() {
+        assert_eq!(
+            classify_unix(3000, "Migration Assistant", None, None),
+            ProcCategory::Unknown,
+            "macOS application names must not match Linux kernel threads"
+        );
+        assert_eq!(
+            classify_unix(3000, "[not-a-kernel-thread]", None, None),
+            ProcCategory::Unknown,
+            "an arbitrary bracketed executable is not kernel evidence"
+        );
     }
 
     #[test]

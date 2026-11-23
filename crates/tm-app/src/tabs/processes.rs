@@ -2305,6 +2305,9 @@ fn derive_display_groups(all: &[&ProcessEntry]) -> DisplayGroups {
                         .app_group
                         .as_deref()
                         .is_some_and(|group| !group.is_empty())
+                    || (child.desktop_role.is_none()
+                        && child.category == ProcCategory::Background
+                        && is_system_boundary(&child.name))
                     || matches!(
                         child.desktop_role,
                         Some(
@@ -3497,21 +3500,16 @@ mod tests {
     }
 
     #[test]
-    fn legacy_windows_background_is_not_repromoted_by_cross_platform_core_names() {
+    fn parented_legacy_core_names_are_not_repromoted_into_an_app() {
         let mut app = proc(10, None, "org.example.Editor", ProcCategory::App);
         app.has_window = true;
-        let legacy_dbus = proc(11, None, "dbus-daemon", ProcCategory::Background);
-        let legacy_migration = proc(12, None, "migration.exe", ProcCategory::Background);
-        let legacy_kworker = proc(13, None, "kworker.exe", ProcCategory::Background);
+        let legacy_dbus = proc(11, Some(10), "dbus-daemon", ProcCategory::Background);
+        let legacy_systemd = proc(12, Some(10), "systemd", ProcCategory::Background);
 
-        let processes = [&app, &legacy_dbus, &legacy_migration, &legacy_kworker];
+        let processes = [&app, &legacy_dbus, &legacy_systemd];
         let grouping = derive_display_groups(&processes);
 
-        for (pid, name) in [
-            (11, "dbus-daemon"),
-            (12, "migration.exe"),
-            (13, "kworker.exe"),
-        ] {
+        for (pid, name) in [(11, "dbus-daemon"), (12, "systemd")] {
             assert_eq!(
                 grouping.category.get(&pid),
                 Some(&ProcCategory::Background),

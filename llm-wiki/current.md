@@ -1390,11 +1390,13 @@ The window itself is now treated as a thing that can fail, not as a given:
 - Top-level `system.slice` and `init.scope` are System only when
   `/run/systemd/system` exists and `/proc/1/comm` resolves to exactly
   `systemd`; this check is cached. WSL layouts whose PID 1 is not systemd keep
-  their synthetic `/init.scope` evidence Unknown. Hybrid cgroup files prefer a
-  non-root unified `0::` path; when unified is `/`, a useful non-root
-  `name=systemd` path is used instead. Disagreeing same-authority candidates
-  fail closed. Escaped, traversal, mismatched-user, malformed and unrelated
-  paths remain Unknown.
+  their synthetic `/init.scope` evidence Unknown. Hybrid cgroup files parse
+  both the unified `0::` and compatibility `name=systemd` candidates. A
+  meaningful unified path wins; otherwise a useful named path is used, so a
+  root or neutral unified path cannot hide real evidence. Different meaningful
+  candidates across the two authorities fail closed, as do conflicting
+  candidates within one authority. Escaped, traversal, mismatched-user,
+  malformed and unrelated paths remain Unknown.
 - The user-scope prefix is canonicalized once with exactly one leading slash,
   and every app-family key uses that canonical prefix. `ProcessEntry` carries
   a serialized/defaulted authoritative desktop-role marker, including explicit
@@ -1411,10 +1413,12 @@ The window itself is now treated as a thing that can fail, not as a given:
   `XDG_CURRENT_DESKTOP` never identify an app.
 - `tm_core::classify::ClassifyInput` now requires a public
   `ProcessPlatform::{Windows, Unix}` discriminator. Windows applies PID <= 4,
-  Windows kernel pseudo-processes, `IsProcessCritical`, and verified core
-  images; Unix applies kernel-thread names and the conservative userspace
-  infrastructure-name fallback. Unix does not apply Windows low-PID
-  assumptions, and a Windows image such as `migration.exe`/`kworker.exe` is not
+  kernel-pseudo evidence only when the kernel's bare-name inventory or an
+  unavailable path supports it, `IsProcessCritical`, and verified core images;
+  Unix applies boundary-aware kernel-thread prefixes and the conservative
+  userspace infrastructure-name fallback. Unix does not apply Windows low-PID
+  assumptions, macOS `Migration Assistant` is not the Linux `migration/*`
+  thread, and a Windows image such as `migration.exe`/`kworker.exe` is not
   System merely because its name matches a Linux kernel thread.
 - Classification precedence is platform-specific hard System evidence,
   observed X11 window, complete X11 no-window evidence, positive
@@ -1429,7 +1433,8 @@ The window itself is now treated as a thing that can fail, not as a given:
   creation-tick then PID ordering. The Processes page seeds root evidence from
   both windows and native App roles, synthesizes same-group family edges even
   when PPIDs are disconnected, and never lets window descent overwrite explicit
-  Linux Background/Unknown or native app-family evidence.
+  Linux Background/Unknown, native app-family evidence, or a parented legacy
+  Background row whose name is a cross-platform core boundary.
 - Desktop evidence is cached per collector, keyed by PID and the
   already-validated boot-relative start ticks. Every cache hit re-reads
   `/proc/<pid>/stat` and discards/reinspects on a generation mismatch, so PID
