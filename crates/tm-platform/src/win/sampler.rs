@@ -1928,6 +1928,7 @@ impl Sampler {
                 brand: cpu_brand,
                 vendor: cpu_vendor,
                 architecture: std::env::consts::ARCH.to_string(),
+                utilization_pct_available: true,
                 utilization_pct: utilization.clamp(0.0, 100.0),
                 per_core_pct,
                 per_core_kernel_pct: load

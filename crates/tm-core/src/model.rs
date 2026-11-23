@@ -44,6 +44,10 @@ pub struct CpuInfo {
     pub brand: String,
     pub vendor: String,
     pub architecture: String,
+    /// Whether `utilization_pct` and the per-core vectors describe a measured
+    /// interval. The first counter-only sample is unavailable, not idle.
+    #[serde(default)]
+    pub utilization_pct_available: bool,
     /// Aggregate utilization 0..=100 (TM-style, all cores averaged).
     pub utilization_pct: f32,
     /// Utilization per logical processor 0..=100.
@@ -386,6 +390,11 @@ pub struct GpuInfo {
     pub directx_version: String,
     /// Physical PCI location `(bus, device, function)`, when known.
     pub pci_location: Option<(u32, u32, u32)>,
+    /// Whether `util_pct` is a measured sample. A measured idle adapter is
+    /// available and has `util_pct == 0`; an adapter with no usable usage
+    /// source is unavailable and must not render as an idle zero.
+    #[serde(default)]
+    pub util_pct_available: bool,
     pub util_pct: f32,
     pub mem_used_bytes: u64,
     pub mem_total_bytes: u64,

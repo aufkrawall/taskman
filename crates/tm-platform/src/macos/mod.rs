@@ -191,6 +191,7 @@ impl SystemCollector for MacCollector {
                     .map(|c| c.vendor_id().to_string())
                     .unwrap_or_default(),
                 architecture: std::env::consts::ARCH.into(),
+                utilization_pct_available: true,
                 utilization_pct: utilization.clamp(0.0, 100.0),
                 per_core_pct: cpus
                     .iter()

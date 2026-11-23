@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### New
+
+- **Linux telemetry and session parity:** Linux now computes aggregate and per-core CPU utilization plus kernel time from `/proc/stat` deltas (the counter-only first sample stays unavailable), reports adapter IPv4/IPv6 and sysfs driver/hardware descriptions, enriches every DRM adapter with available PCI identity, driver, VRAM/GTT and temperature data, and lists systemd login sessions through `loginctl` when available. Missing CPU/GPU utilization is reported as unavailable rather than idle zero, no engine data is invented, and Wi-Fi SSID/signal plus session logoff/disconnect remain unavailable rather than guessed.
+
 ### Fixed
 
 - **A failed or skipped blit can no longer leave the window blank, stale or half-painted.** The Windows software renderer now presents through its own Win32 DIB surface: every `BitBlt` result is checked, only the rectangles that were actually blitted are validated, and a `WM_PAINT` update region is merged into the present set even when no egui tile changed. A failed resize, buffer access or present warns, marks the surface unpainted and retries in 50 ms instead of aborting (release builds abort on panic) or silently freezing the old pixels in place.

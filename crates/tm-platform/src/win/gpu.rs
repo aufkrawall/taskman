@@ -678,6 +678,7 @@ pub fn merge(
             } else {
                 None
             };
+            let engines = adapter_engines(&loads);
             GpuInfo {
                 id,
                 name: if a.name.is_empty() {
@@ -689,6 +690,7 @@ pub fn merge(
                 driver_date_epoch_s: a.driver_date_epoch_s,
                 directx_version: a.directx_version,
                 pci_location: a.pci_location,
+                util_pct_available: !engines.is_empty(),
                 util_pct: util,
                 mem_used_bytes: ded_used,
                 mem_total_bytes: a.dedicated_vram,
@@ -698,7 +700,7 @@ pub fn merge(
                 hardware_reserved_bytes: a.hardware_reserved_bytes,
                 temperature_c,
                 luid: Some(a.luid),
-                engines: adapter_engines(&loads),
+                engines,
             }
         })
         .collect()

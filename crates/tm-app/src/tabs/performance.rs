@@ -217,6 +217,7 @@ mod tests {
         let mut busy = pt(500);
         busy.gpus = vec![crate::app::GpuHistoryPoint {
             id: 0,
+            util_pct_available: true,
             util_pct: 90.0,
             ..Default::default()
         }];
@@ -315,6 +316,7 @@ mod tests {
         let mut p1 = pt(500);
         p1.gpus = vec![crate::app::GpuHistoryPoint {
             id: 0,
+            util_pct_available: true,
             util_pct: 42.0,
             ..Default::default()
         }];
@@ -322,6 +324,7 @@ mod tests {
         let win = vec![pt(0), p1];
         let gpu = tm_core::model::GpuInfo {
             id: 0,
+            util_pct_available: true,
             util_pct: 42.0,
             engines: vec![
                 tm_core::model::GpuEngine {
@@ -347,6 +350,32 @@ mod tests {
         let missing = gpu_engine_chart_spec(&win, &gpu, "0", "UnknownVendorEngine", &engines, &pal);
         assert_eq!(missing.resolved_mode, "overall");
         assert_eq!(missing.right_pct, format::format_pct_hdr(42.0));
+    }
+
+    #[test]
+    fn unavailable_gpu_utilization_is_not_rendered_as_idle_zero() {
+        let gpu = tm_core::model::GpuInfo {
+            id: 0,
+            util_pct_available: false,
+            util_pct: 0.0,
+            ..Default::default()
+        };
+        assert_eq!(gpu_util_text(&gpu), "\u{2014}");
+
+        let measured_idle = tm_core::model::GpuInfo {
+            util_pct_available: true,
+            ..gpu
+        };
+        assert_eq!(gpu_util_text(&measured_idle), format::format_pct_hdr(0.0));
+    }
+
+    #[test]
+    fn unavailable_cpu_utilization_is_not_rendered_as_idle_zero() {
+        let mut cpu = tm_core::model::CpuInfo::default();
+        assert_eq!(cpu_util_text(&cpu), "\u{2014}");
+
+        cpu.utilization_pct_available = true;
+        assert_eq!(cpu_util_text(&cpu), format::format_pct_hdr(0.0));
     }
 
     #[test]
@@ -583,7 +612,13 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
                                 return disk_activity_series(win, &e.key);
                             }
                             let values = match e.kind {
-                                ResourceKind::Cpu => series(win, |h| h.cpu_total as f64),
+                                ResourceKind::Cpu => series(win, |h| {
+                                    if h.cpu_available {
+                                        h.cpu_total as f64
+                                    } else {
+                                        f64::NAN
+                                    }
+                                }),
                                 ResourceKind::Memory => {
                                     series(win, |h| pct_of(h.mem_used_bytes, h.mem_total_bytes))
                                 }
@@ -854,7 +889,7 @@ fn build_resource_list(app: &TaskManApp) -> Vec<ResourceEntry> {
         subtitle: String::new(),
         value_line: format!(
             "{}  {}",
-            format::format_pct_hdr(snap.cpu.utilization_pct),
+            cpu_util_text(&snap.cpu),
             format::format_freq_ghz(snap.cpu.freq_mhz)
         ),
     });
@@ -923,7 +958,7 @@ fn build_resource_list(app: &TaskManApp) -> Vec<ResourceEntry> {
             subtitle: g.name.clone(),
             value_line: format!(
                 "{}{}",
-                format::format_pct_hdr(g.util_pct),
+                gpu_util_text(g),
                 g.temperature_c
                     .map(|t| format!("  ({t:.0} °C)"))
                     .unwrap_or_default()
@@ -1105,6 +1140,13 @@ fn gpu_engine_names(
     snapshot: &[tm_core::model::GpuEngine],
     key: &str,
 ) -> Vec<String> {
+    let has_measurement = !snapshot.is_empty()
+        || win
+            .iter()
+            .any(|point| point.gpu_engines.iter().any(|(id, ..)| id.to_string() == key));
+    if !has_measurement {
+        return Vec::new();
+    }
     let mut names: Vec<String> = vec![
         "3D".into(),
         "Copy".into(),
@@ -1168,12 +1210,29 @@ fn gpu_series(win: &[HistoryPoint], key: &str, field: GpuField) -> Vec<f64> {
                 .iter()
                 .find(|point| point.id.to_string() == key)
                 .map_or(0.0, |point| match field {
-                    GpuField::Util => point.util_pct as f64,
+                    GpuField::Util if point.util_pct_available => point.util_pct as f64,
+                    GpuField::Util => f64::NAN,
                     GpuField::Dedicated => point.dedicated_used_bytes as f64,
                     GpuField::Shared => point.shared_used_bytes as f64,
                 })
         })
         .collect()
+}
+
+fn gpu_util_text(gpu: &tm_core::model::GpuInfo) -> String {
+    if gpu.util_pct_available {
+        format::format_pct_hdr(gpu.util_pct)
+    } else {
+        "\u{2014}".to_string()
+    }
+}
+
+fn cpu_util_text(cpu: &tm_core::model::CpuInfo) -> String {
+    if cpu.utilization_pct_available {
+        format::format_pct_hdr(cpu.utilization_pct)
+    } else {
+        "\u{2014}".to_string()
+    }
 }
 
 /// Page title row: big name left, detail right.
@@ -1597,8 +1656,20 @@ fn cpu_page(app: &mut TaskManApp, ui: &mut egui::Ui, pal: &Palette) {
     let win = window(app);
     let ts = timestamps(win);
     let axis = TimeAxis::new(&ts, app.shared.settings.graph_seconds);
-    let total_series = series(win, |h| h.cpu_total as f64);
-    let kernel_series = series(win, |h| h.cpu_kernel as f64);
+    let total_series = series(win, |h| {
+        if h.cpu_available {
+            h.cpu_total as f64
+        } else {
+            f64::NAN
+        }
+    });
+    let kernel_series = series(win, |h| {
+        if h.cpu_available {
+            h.cpu_kernel as f64
+        } else {
+            f64::NAN
+        }
+    });
     let cores = snap.cpu.per_core_pct.len();
     let mut core_hist: Vec<Vec<f64>> = (0..cores).map(|_| Vec::with_capacity(win.len())).collect();
     let mut core_kern: Vec<Vec<f64>> = (0..cores).map(|_| Vec::with_capacity(win.len())).collect();
@@ -1776,7 +1847,7 @@ fn cpu_page(app: &mut TaskManApp, ui: &mut egui::Ui, pal: &Palette) {
                         ui,
                         pal,
                         i18n::tr(K::StatUtilization),
-                        &format::format_pct_hdr(snap.cpu.utilization_pct),
+                        &cpu_util_text(&snap.cpu),
                         w,
                     );
                     big_stat(
@@ -1955,23 +2026,23 @@ fn gpu_graph_menu_contents(
         *chosen = Some("overall".to_string());
         ui.close();
     }
-    if menu::check(ui, i18n::tr(K::GpuAllEngines), current == "all").clicked() {
-        *chosen = Some("all".to_string());
-        ui.close();
-    }
     if !engines.is_empty() {
-        menu::separator(ui);
-    }
-    for engine in engines {
-        if menu::check(ui, &engine_label(engine), current == *engine).clicked() {
-            *chosen = Some(engine.clone());
+        if menu::check(ui, i18n::tr(K::GpuAllEngines), current == "all").clicked() {
+            *chosen = Some("all".to_string());
             ui.close();
         }
-    }
-    menu::separator(ui);
-    if menu::check(ui, i18n::tr(K::GpuMultiEngine), multi_engine).clicked() {
-        *toggled_multi = Some(!multi_engine);
-        ui.close();
+        menu::separator(ui);
+        for engine in engines {
+            if menu::check(ui, &engine_label(engine), current == *engine).clicked() {
+                *chosen = Some(engine.clone());
+                ui.close();
+            }
+        }
+        menu::separator(ui);
+        if menu::check(ui, i18n::tr(K::GpuMultiEngine), multi_engine).clicked() {
+            *toggled_multi = Some(!multi_engine);
+            ui.close();
+        }
     }
 }
 
@@ -2570,18 +2641,22 @@ fn gpu_engine_chart_spec(
     // An engine this adapter never reported falls back to the overall
     // (busiest-engine) view rather than drawing a flat zero the user cannot
     // tell from an idle engine.
-    let resolved_mode =
-        if requested == "overall" || requested == "all" || engines.iter().any(|e| e == requested) {
-            requested.to_string()
-        } else {
-            "overall".to_string()
-        };
+    let resolved_mode = if engines.is_empty() {
+        "overall".to_string()
+    } else if requested == "overall"
+        || requested == "all"
+        || engines.iter().any(|e| e == requested)
+    {
+        requested.to_string()
+    } else {
+        "overall".to_string()
+    };
 
     match resolved_mode.as_str() {
         "all" => GpuEngineChartSpec {
             resolved_mode,
             title: i18n::tr(K::GpuAllEngines).to_string(),
-            right_pct: format::format_pct_hdr(gpu.util_pct),
+            right_pct: gpu_util_text(gpu),
             series: engines
                 .iter()
                 .enumerate()
@@ -2600,7 +2675,7 @@ fn gpu_engine_chart_spec(
         "overall" => GpuEngineChartSpec {
             resolved_mode,
             title: i18n::tr(K::StatUtilization).to_string(),
-            right_pct: format::format_pct_hdr(gpu.util_pct),
+            right_pct: gpu_util_text(gpu),
             series: vec![MultiSeries::new(
                 i18n::tr(K::StatUtilization),
                 gpu_series(win, key, GpuField::Util),
@@ -2714,7 +2789,7 @@ fn gpu_page(app: &mut TaskManApp, ui: &mut egui::Ui, pal: &Palette, entry: &Reso
     let width = content_width(ui);
     let window_text = window_label(app.shared.settings.graph_seconds);
     let engines = gpu_engine_names(win, &gpu.engines, &entry.key);
-    let multi_engine = app.shared.settings.gpu_multi_engine;
+    let multi_engine = app.shared.settings.gpu_multi_engine && !engines.is_empty();
 
     let mut engine_menus: Vec<(Option<usize>, egui::Response, egui::Response)> = Vec::new();
     let mut visible_engines: Vec<String> = Vec::new();
@@ -2831,7 +2906,7 @@ fn gpu_page(app: &mut TaskManApp, ui: &mut egui::Ui, pal: &Palette, entry: &Reso
                         ui,
                         pal,
                         i18n::tr(K::StatUtilization),
-                        &format::format_pct_hdr(gpu.util_pct),
+                        &gpu_util_text(gpu),
                         w,
                     );
                     big_stat(

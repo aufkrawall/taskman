@@ -61,16 +61,9 @@ pub(crate) fn first_search_match_session_id(app: &TaskManApp, q: &search::Query)
         );
     }
     for p in &snap.processes {
-        let sid = p.session_id.or_else(|| {
-            sessions
-                .iter()
-                .find(|s| {
-                    p.user
-                        .as_deref()
-                        .is_some_and(|u| u.eq_ignore_ascii_case(&s.user))
-                })
-                .map(|s| s.id)
-        });
+        let sid = p
+            .session_id
+            .or_else(|| unique_session_for_user(&sessions, p.user.as_deref()));
         let Some(sid) = sid else { continue };
         let Some(a) = aggs.get_mut(&sid) else {
             continue;
@@ -211,6 +204,18 @@ fn accumulate(a: &mut Agg, p: &tm_core::model::ProcessEntry) {
             .as_ref()
             .map(|x| x.to_string_lossy().into_owned());
     }
+}
+
+/// Username is only a safe fallback when exactly one real session has that
+/// case-sensitive account. With two remote/local sessions for the same user,
+/// guessing the first would attribute CPU and I/O to the wrong session.
+fn unique_session_for_user(sessions: &[&UserSession], user: Option<&str>) -> Option<u32> {
+    let user = user?;
+    let mut matching = sessions
+        .iter()
+        .filter(|session| session.user.as_str() == user);
+    let session = matching.next()?;
+    matching.next().is_none().then_some(session.id)
 }
 
 /// Per-column maximum, for the heat band. Unmeasured cells are left out: they
@@ -408,16 +413,9 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
         );
     }
     for p in &snap.processes {
-        let sid = p.session_id.or_else(|| {
-            sessions
-                .iter()
-                .find(|s| {
-                    p.user
-                        .as_deref()
-                        .is_some_and(|u| u.eq_ignore_ascii_case(&s.user))
-                })
-                .map(|s| s.id)
-        });
+        let sid = p
+            .session_id
+            .or_else(|| unique_session_for_user(&sessions, p.user.as_deref()));
         let Some(sid) = sid else { continue };
         let Some(a) = aggs.get_mut(&sid) else {
             continue;
@@ -1233,5 +1231,31 @@ mod tests {
             ),
             Ordering::Greater
         );
+    }
+
+    #[test]
+    fn username_fallback_requires_one_unambiguous_session() {
+        let alice = UserSession {
+            id: 1,
+            user: "alice".into(),
+            ..Default::default()
+        };
+        let alice_remote = UserSession {
+            id: 2,
+            user: "alice".into(),
+            ..Default::default()
+        };
+        let bob = UserSession {
+            id: 3,
+            user: "Bob".into(),
+            ..Default::default()
+        };
+
+        let unique = [&bob];
+        assert_eq!(unique_session_for_user(&unique, Some("Bob")), Some(3));
+        assert_eq!(unique_session_for_user(&unique, Some("bob")), None);
+
+        let ambiguous = [&alice, &alice_remote, &bob];
+        assert_eq!(unique_session_for_user(&ambiguous, Some("alice")), None);
     }
 }

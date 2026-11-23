@@ -30,6 +30,7 @@ use tm_platform::actions::PlatformActions;
 #[derive(Debug, Clone, Default)]
 pub struct HistoryPoint {
     pub t_ms: u64,
+    pub cpu_available: bool,
     pub cpu_total: f32,
     pub cpu_kernel: f32,
     pub per_core: Vec<f32>,
@@ -60,6 +61,7 @@ pub struct HistoryPoint {
 #[derive(Debug, Clone, Copy, Default)]
 pub struct GpuHistoryPoint {
     pub id: usize,
+    pub util_pct_available: bool,
     pub util_pct: f32,
     /// Dedicated (VRAM) bytes in use.
     pub dedicated_used_bytes: u64,
@@ -1009,6 +1011,7 @@ impl TaskManApp {
         if latest.timestamp_ms != self.history.last().map_or(0, |h| h.t_ms) {
             let pt = HistoryPoint {
                 t_ms: latest.timestamp_ms,
+                cpu_available: latest.cpu.utilization_pct_available,
                 cpu_total: latest.cpu.utilization_pct,
                 cpu_kernel: latest.cpu.kernel_pct,
                 per_core: latest.cpu.per_core_pct.clone(),
@@ -1033,6 +1036,7 @@ impl TaskManApp {
                     .iter()
                     .map(|g| GpuHistoryPoint {
                         id: g.id,
+                        util_pct_available: g.util_pct_available,
                         util_pct: g.util_pct,
                         dedicated_used_bytes: g.dedicated_used_bytes,
                         shared_used_bytes: g.shared_used_bytes,

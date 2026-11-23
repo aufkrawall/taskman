@@ -1,7 +1,11 @@
 //! Linux backend: sysinfo + procfs/sysfs + systemd + XDG autostart.
 
+mod cpu_stat;
 mod diskstats;
+mod drm;
+mod net_meta;
 pub(crate) mod services;
+mod sessions;
 mod startup;
 
 use crate::actions::*;
@@ -22,6 +26,7 @@ pub struct LinuxCollector {
     disks: Disks,
     networks: Networks,
     users: sysinfo::Users,
+    cpu_stats: cpu_stat::CpuStatSampler,
     prev_net_totals: HashMap<String, (u64, u64)>,
     last_tick: Option<Instant>,
     first_tick_done: bool,
@@ -32,7 +37,7 @@ pub struct LinuxCollector {
 
 impl SystemCollector for LinuxCollector {
     fn backend_name(&self) -> &'static str {
-        "linux/sysinfo+procfs+sysfs"
+        "linux/sysinfo+procfs+sysfs+systemd"
     }
 
     fn sample(&mut self, started: Instant) -> Result<Snapshot> {
@@ -46,9 +51,7 @@ impl SystemCollector for LinuxCollector {
         self.sys.refresh_specifics(
             RefreshKind::nothing()
                 .with_cpu(
-                    sysinfo::CpuRefreshKind::nothing()
-                        .with_cpu_usage()
-                        .with_frequency(),
+                    sysinfo::CpuRefreshKind::nothing().with_frequency(),
                 )
                 .with_memory(MemoryRefreshKind::nothing().with_ram().with_swap()),
         );
@@ -79,10 +82,13 @@ impl SystemCollector for LinuxCollector {
 
         let cpus = self.sys.cpus();
         let logical = cpus.len().max(1);
-        let utilization = cpus.iter().map(|c| c.cpu_usage()).sum::<f32>() / logical as f32;
         let freq = cpus.iter().map(|c| c.frequency() as f32).sum::<f32>() / logical as f32;
         let nb_cpus = logical as f32;
         let (physical_cores, sockets) = cpu_topology();
+        let proc_stat = std::fs::read_to_string("/proc/stat").ok();
+        let cpu_sample = proc_stat
+            .as_deref()
+            .and_then(|text| self.cpu_stats.sample(text));
 
         // Wayland intentionally prevents arbitrary clients from enumerating
         // every other client's top-level windows. Keep classification honest
@@ -95,9 +101,10 @@ impl SystemCollector for LinuxCollector {
             .values()
             .filter(|p| p.thread_kind().is_none())
             .count();
-        let btime_and_hz = std::fs::read_to_string("/proc/stat")
-            .ok()
-            .and_then(|s| parse_proc_stat_btime(&s))
+        let sessions_available = sessions::available();
+        let btime_and_hz = proc_stat
+            .as_deref()
+            .and_then(parse_proc_stat_btime)
             .zip(linux_clk_tck());
         let mut processes = Vec::with_capacity(n_procs);
         for (pid, p) in self.sys.processes() {
@@ -158,6 +165,9 @@ impl SystemCollector for LinuxCollector {
                 sysinfo::ProcessStatus::Stop => ProcStatus::Suspended,
                 _ => ProcStatus::Running,
             };
+            if sessions_available {
+                entry.session_id = sessions::process_session_id(pid_u);
+            }
             // sysinfo's task set excludes the leader; Windows' count includes
             // it, so add the main thread back for parity.
             entry.threads = p.tasks().map(|tasks| tasks.len() as u32 + 1);
@@ -203,6 +213,7 @@ impl SystemCollector for LinuxCollector {
             });
         }
 
+        let network_metadata = net_meta::collect();
         let mut nets = Vec::new();
         for (name, data) in &self.networks {
             let recv_total = data.total_received();
@@ -217,7 +228,10 @@ impl SystemCollector for LinuxCollector {
                 ),
                 _ => (0.0, 0.0),
             };
-            let meta = net_meta(name);
+            let meta = network_metadata
+                .get(name.as_str())
+                .cloned()
+                .unwrap_or_default();
             nets.push(NetworkInfo {
                 name: name.to_string(),
                 desc: meta.desc,
@@ -229,8 +243,8 @@ impl SystemCollector for LinuxCollector {
                 total_sent_bytes: sent_total,
                 link_bps: meta.link_bps,
                 ssid: None,
-                ipv4: None,
-                ipv6: None,
+                ipv4: meta.ipv4,
+                ipv6: meta.ipv6,
                 signal_quality_pct: None,
                 wifi_access_denied: false,
             });
@@ -253,13 +267,17 @@ impl SystemCollector for LinuxCollector {
                     .map(|c| c.vendor_id().to_string())
                     .unwrap_or_default(),
                 architecture: std::env::consts::ARCH.into(),
-                utilization_pct: utilization.clamp(0.0, 100.0),
-                per_core_pct: cpus
-                    .iter()
-                    .map(|c| c.cpu_usage().clamp(0.0, 100.0))
-                    .collect(),
-                per_core_kernel_pct: Vec::new(),
-                kernel_pct: 0.0,
+                utilization_pct_available: cpu_sample.is_some(),
+                utilization_pct: cpu_sample
+                    .as_ref()
+                    .map_or(0.0, |sample| sample.utilization_pct),
+                per_core_pct: cpu_sample
+                    .as_ref()
+                    .map_or_else(Vec::new, |sample| sample.per_core_pct.clone()),
+                per_core_kernel_pct: cpu_sample
+                    .as_ref()
+                    .map_or_else(Vec::new, |sample| sample.per_core_kernel_pct.clone()),
+                kernel_pct: cpu_sample.as_ref().map_or(0.0, |sample| sample.kernel_pct),
                 freq_mhz: freq,
                 freq_base_mhz: base_freq_from_cpufreq(),
                 logical_count: logical,
@@ -286,7 +304,7 @@ impl SystemCollector for LinuxCollector {
             },
             disks,
             networks: nets,
-            gpus: drm_gpus(),
+            gpus: drm::gpus(),
             processes,
             system: SystemMisc {
                 hostname: hostname(),
@@ -607,53 +625,6 @@ fn base_freq_from_cpufreq() -> f32 {
         .fold(0.0f32, f32::max)
 }
 
-struct NetMeta {
-    kind: String,
-    oper_up: bool,
-    link_bps: u64,
-    desc: String,
-}
-
-fn net_meta(name: &str) -> NetMeta {
-    let base = Path::new("/sys/class/net").join(name);
-    let kind = if name == "lo" {
-        "Loopback"
-    } else if base.join("wireless").exists() {
-        "Wi-Fi"
-    } else if base.join("device").exists() {
-        "Ethernet"
-    } else {
-        "Virtual"
-    }
-    .to_string();
-    let operstate = std::fs::read_to_string(base.join("operstate"))
-        .unwrap_or_default()
-        .trim()
-        .to_string();
-    let carrier = std::fs::read_to_string(base.join("carrier"))
-        .ok()
-        .is_some_and(|s| s.trim() == "1");
-    let oper_up = matches!(operstate.as_str(), "up" | "unknown") && (carrier || name == "lo");
-    let link_bps = std::fs::read_to_string(base.join("speed"))
-        .ok()
-        .and_then(|s| s.trim().parse::<u64>().ok())
-        .filter(|&mbps| mbps > 0 && mbps < 1_000_000)
-        .map_or(0, |mbps| mbps * 1_000_000);
-    let desc = std::fs::read_to_string(base.join("device/uevent"))
-        .ok()
-        .and_then(|text| {
-            text.lines()
-                .find_map(|l| l.strip_prefix("DRIVER=").map(str::to_string))
-        })
-        .unwrap_or_default();
-    NetMeta {
-        kind,
-        oper_up,
-        link_bps,
-        desc,
-    }
-}
-
 /// Kernel block device name for a mount source, as /proc/diskstats lists
 /// it. LVM/LUKS volumes mount as `/dev/mapper/<name>` symlinks to
 /// `/dev/dm-N`, and diskstats only knows `dm-N`, so resolve links first.
@@ -716,74 +687,6 @@ fn parse_file_nr(text: &str) -> Option<usize> {
     text.split_whitespace().next()?.parse().ok()
 }
 
-fn drm_gpus() -> Vec<GpuInfo> {
-    let mut out = Vec::new();
-    if let Ok(entries) = std::fs::read_dir("/sys/class/drm") {
-        let mut cards: Vec<_> = entries
-            .flatten()
-            .filter(|e| {
-                let n = e.file_name().to_string_lossy().to_string();
-                n.starts_with("card") && n[4..].chars().all(|c| c.is_ascii_digit())
-            })
-            .collect();
-        cards.sort_by_key(|e| e.file_name());
-        for card in cards {
-            let device = card.path().join("device");
-            let read = |file: &str| {
-                std::fs::read_to_string(device.join(file))
-                    .ok()
-                    .map(|t| t.trim().to_string())
-            };
-            let gpu = drm_card_gpu(
-                out.len(),
-                read("gpu_busy_percent").and_then(|t| t.parse().ok()),
-                read("mem_info_vram_used").and_then(|t| t.parse().ok()),
-                read("mem_info_vram_total").and_then(|t| t.parse().ok()),
-            );
-            out.extend(gpu);
-        }
-    }
-    out
-}
-
-/// One DRM card's adapter entry, or `None` when the driver exposes no
-/// utilization or VRAM-usage source. Only amdgpu publishes
-/// `gpu_busy_percent`/`mem_info_vram_*`; i915, xe, nouveau, nvidia and
-/// simpledrm publish neither, and the model has no "unknown" for
-/// utilization or dedicated memory, so such a card is left out rather than
-/// shown as an idle, empty GPU. A missing VRAM total stays 0, which the
-/// page already treats as unknown.
-fn drm_card_gpu(
-    id: usize,
-    busy_pct: Option<f32>,
-    vram_used: Option<u64>,
-    vram_total: Option<u64>,
-) -> Option<GpuInfo> {
-    let busy = busy_pct?;
-    let vram_used = vram_used?;
-    Some(GpuInfo {
-        id,
-        name: format!("GPU {id}"),
-        driver_version: String::new(),
-        driver_date_epoch_s: None,
-        directx_version: String::new(),
-        pci_location: None,
-        util_pct: busy,
-        mem_used_bytes: vram_used,
-        mem_total_bytes: vram_total.unwrap_or(0),
-        dedicated_used_bytes: vram_used,
-        shared_used_bytes: 0,
-        shared_total_bytes: 0,
-        hardware_reserved_bytes: 0,
-        temperature_c: None,
-        luid: None,
-        engines: vec![GpuEngine {
-            name: "3D".into(),
-            util_pct: busy,
-        }],
-    })
-}
-
 // ------------------------------------------------------------------ actions
 
 pub struct LinuxActions;
@@ -794,7 +697,7 @@ impl PlatformActions for LinuxActions {
             services_list: true,
             services_control: true,
             startup_toggle: true,
-            users_sessions: false,
+            users_sessions: sessions::available(),
             user_disconnect: false,
             end_process: true,
             suspend_resume: true,
@@ -823,6 +726,9 @@ impl PlatformActions for LinuxActions {
     }
     fn set_startup_enabled(&self, item_id: &str, _location: &str, enabled: bool) -> Result<()> {
         startup::set_enabled(item_id, enabled)
+    }
+    fn list_user_sessions(&self) -> Result<Vec<UserSession>> {
+        sessions::list_sessions()
     }
 
     fn kill_single(&self, pid: u32) -> Result<()> {
@@ -1248,6 +1154,7 @@ pub fn create_collector() -> LinuxCollector {
         disks: Disks::new_with_refreshed_list(),
         networks: Networks::new_with_refreshed_list(),
         users: sysinfo::Users::new_with_refreshed_list(),
+        cpu_stats: cpu_stat::CpuStatSampler::default(),
         prev_net_totals: HashMap::new(),
         last_tick: None,
         first_tick_done: false,
@@ -1374,19 +1281,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(name, "dm-3");
         assert_eq!(block_device_name("/nonexistent/sda1"), "sda1");
-    }
-
-    #[test]
-    fn gpu_without_utilization_or_vram_source_is_not_reported() {
-        assert!(drm_card_gpu(0, None, None, None).is_none());
-        assert!(drm_card_gpu(0, None, Some(1), Some(2)).is_none());
-        assert!(drm_card_gpu(0, Some(5.0), None, Some(2)).is_none());
-
-        let gpu = drm_card_gpu(1, Some(37.0), Some(512 << 20), None).expect("amdgpu-like card");
-        assert_eq!(gpu.id, 1);
-        assert_eq!(gpu.util_pct, 37.0);
-        assert_eq!(gpu.dedicated_used_bytes, 512 << 20);
-        assert_eq!(gpu.mem_total_bytes, 0);
     }
 
     #[test]
