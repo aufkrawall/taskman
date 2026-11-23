@@ -9,8 +9,9 @@ use tm_core::settings::TextSmoothing;
 /// Whether the active renderer can display sub-pixel (`ClearType`) text.
 ///
 /// This is an interlock, not a preference. An atlas rasterized with per-channel coverage
-/// is only meaningful to a renderer that blends per channel; handing it to `egui_glow` or
-/// `egui-wgpu` draws rainbow-tinted text. `main.rs` sets this once the renderer is known.
+/// is only meaningful to a renderer that blends per channel. The software painter always
+/// can; WGPU can only after its device enabled dual-source blending; Glow and unsupported
+/// WGPU draw rainbow-tinted text. `main.rs` sets this once the renderer is known.
 static SUBPIXEL_CAPABLE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// The platform's text-rendering parameters, resolved once at startup.
@@ -333,14 +334,13 @@ pub fn install_visuals(ctx: &egui::Context) {
 
 /// Glyph anti-aliasing, as close to the Windows UI look as egui allows.
 ///
-/// IMPORTANT — what is NOT possible here: egui stores every glyph in a
-/// single-channel coverage atlas and tints it in the shader, so there is no
-/// per-channel (RGB sub-pixel) coverage anywhere in the pipeline. True
-/// ClearType would need a 3-channel atlas plus dual-source blending in both
-/// the glow and wgpu backends; upstream tracks this as emilk/egui#2639.
-/// Everything below therefore tunes GRAYSCALE anti-aliasing.
+/// The fork stores per-channel LCD coverage in the atlas's RGB channels. The software
+/// painter always consumes it; WGPU does so through a dual-source font-atlas pipeline
+/// when the device enabled that feature. Glow and unsupported WGPU adapters remain on the
+/// byte-identical grayscale path, so the renderer interlock above still decides whether
+/// LCD rasterization is valid at all.
 ///
-/// What we do control:
+/// For grayscale text:
 /// * `font_hinting` stays on: stems snap toward the pixel grid, like
 ///   ClearType's hinted rendering.
 /// * Glyph positions snap to physical pixels (`TessellationOptions`
@@ -375,6 +375,7 @@ fn apply_text_aa(opts: &mut egui::epaint::TextOptions, theme: egui::Theme) {
     if !subpixel.is_off() {
         let params = subpixel_params();
         opts.cleartype_level = params.cleartype_level;
+        opts.lcd_filter = lcd_filter(params.lcd_filter);
 
         // Under sub-pixel rendering the smoothing profile becomes a WEIGHT control, which
         // is the only thing left for it to be: the coverage ramp it used to select is not
@@ -398,6 +399,20 @@ fn apply_text_aa(opts: &mut egui::epaint::TextOptions, theme: egui::Theme) {
     // Hinting is already the default; assert the intent so a future default
     // flip cannot silently soften our text.
     opts.font_hinting = true;
+}
+
+/// Map the platform-neutral fontconfig choice onto the fork's filter tables.
+fn lcd_filter(choice: tm_platform::text_rendering::LcdFilterChoice) -> egui::epaint::LcdFilter {
+    use tm_platform::text_rendering::LcdFilterChoice;
+    match choice {
+        LcdFilterChoice::Default => egui::epaint::LcdFilter::FREETYPE_DEFAULT,
+        LcdFilterChoice::Light => egui::epaint::LcdFilter::LIGHT,
+        // fontconfig's legacy filter and epaint's classic ClearType filter have the same
+        // role; use the normalized five-tap approximation rather than inventing an
+        // unverified FreeType coefficient table.
+        LcdFilterChoice::Legacy => egui::epaint::LcdFilter::CLASSIC,
+        LcdFilterChoice::None => egui::epaint::LcdFilter::NONE,
+    }
 }
 
 /// Blend gamma and contrast for a smoothing profile under sub-pixel rendering.
@@ -533,6 +548,27 @@ pub fn palette_ctx(ctx: &egui::Context) -> Palette {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fontconfig_lcdfilter_choices_map_to_filter_tables() {
+        use tm_platform::text_rendering::LcdFilterChoice;
+        assert_eq!(
+            lcd_filter(LcdFilterChoice::Default),
+            egui::epaint::LcdFilter::FREETYPE_DEFAULT
+        );
+        assert_eq!(
+            lcd_filter(LcdFilterChoice::Light),
+            egui::epaint::LcdFilter::LIGHT
+        );
+        assert_eq!(
+            lcd_filter(LcdFilterChoice::Legacy),
+            egui::epaint::LcdFilter::CLASSIC
+        );
+        assert_eq!(
+            lcd_filter(LcdFilterChoice::None),
+            egui::epaint::LcdFilter::NONE
+        );
+    }
 
     /// The heat map must have no unpainted floor and must rise smoothly:
     /// an idle process still shows the base tint, and every step up in

@@ -164,6 +164,11 @@ impl crate::TestRenderer for WgpuTestRenderer {
         output: &egui::FullOutput,
     ) -> Result<RgbaImage, String> {
         let mut renderer = self.render_state.renderer.write();
+        let (subpixel, contrast) = ctx.fonts(|fonts| {
+            let options = fonts.options();
+            (options.subpixel, options.text_contrast)
+        });
+        renderer.set_subpixel_text_options(subpixel, contrast);
 
         let mut encoder =
             self.render_state

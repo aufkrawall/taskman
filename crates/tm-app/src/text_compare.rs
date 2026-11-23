@@ -275,9 +275,10 @@ mod tests {
             write_zoomed(&base.join(format!("{prefix}-{name}-lcd.png")), &buf);
         }
         // The LCD filter matters more than the profile does: it trades sharpness against
-        // colour directly. Both shipped presets, for comparison.
+        // colour directly. Every shipped preset, for comparison.
         for (name, filter) in [
             ("filter-freetype", LcdFilter::FREETYPE_DEFAULT),
+            ("filter-light", LcdFilter::LIGHT),
             ("filter-classic", LcdFilter::CLASSIC),
             ("filter-none", LcdFilter::NONE),
         ] {

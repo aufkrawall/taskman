@@ -1,6 +1,6 @@
 # Known and Accepted Debt
 
-Last verified: 2026-11-23 (Linux desktop-role and privileged-action residuals)
+Last verified: 2026-11-24 (Linux desktop-role and GPU/Linux LCD text residuals)
 
 Primary sources:
 - `AGENTS.md`
@@ -59,14 +59,28 @@ items across Phases 2–6. The following concrete gaps remain:
   instead of nested beneath it the way System Informer shows it. Restoring
   the link would mean re-introducing a parent the collector API did not
   report; the honest root is preferred over a synthesized edge.
-- **Sub-pixel (ClearType) text: DONE** (2026-09-01). Kept only so the reasoning is not
-  re-derived, because this entry was half wrong. epaint's atlas is *not* single-channel --
-  it has stored `Color32` since 0.36 -- so per-channel coverage needed no new format at
-  all. What was genuinely blocked is per-channel *blending*: on a GPU that needs
-  dual-source blending (upstream emilk/egui#2639), and on a CPU it is a multiply. Both the
-  3x rasterization and the per-channel blend now live in `vendor/egui`. See
-  `render-pipeline.md`. Linux follows fontconfig's `rgba` (`rgb`/`bgr` only) since
-  2026-09-08; vertical orders and unknown/none stay grayscale.
+- **Sub-pixel (ClearType-like) text: DONE with platform residuals** (updated
+  2026-11-23). epaint always stored `Color32`, so per-channel coverage needed no new
+  texture format; the contract now uses RGB coverage with alpha = minimum RGB, which also
+  identifies LCD texels in a mixed grayscale/color atlas. The software renderer applies
+  the full gamma/contrast model. WGPU uses a second dual-source font-atlas pipeline only
+  when the selected device enabled `DUAL_SOURCE_BLENDING`; Glow and unsupported adapters
+  stay grayscale.
+  - **Accepted GPU limitation:** fixed-function dual-source blending cannot reproduce the
+    software renderer's nonlinear destination-gamma term. WGPU carries RGB/BGR order and
+    contrast, but its output is not claimed to be DirectWrite-gamma-exact.
+  - **Linux source:** the process-wide startup query follows effective per-user fontconfig
+    `antialias`, horizontal `rgba` and `lcdfilter` values, using trusted absolute
+    `fc-match` paths and inheriting the user's environment. Vertical/unknown/none,
+    `antialias: False` and malformed values fail closed.
+  - **Linux per-monitor limitation:** fontconfig exposes one effective order/filter, not
+    a proven order for each monitor. Mixed-panel desktops therefore use one process-wide
+    choice. Off-grid glyphs use the grayscale fallback, but a compositor that resamples an
+    otherwise 1:1 fractional-Wayland surface can still reduce LCD correctness; no
+    fontconfig property proves that compositor behavior.
+  - **Verification residual:** the 2026-11-23 implementation pass was explicitly forbidden
+    from compiling or running tests. The D3D12/Vulkan shader and visual output need a real
+    hardware run before treating the GPU path as release-verified.
 - **Software rendering performance: SUPERSEDED.** CPU mode directly rasterizes
   the UI. The old WARP path measured about 14 cores at 2.9 fps. D3D12 and Vulkan
   select a surface-compatible GPU.

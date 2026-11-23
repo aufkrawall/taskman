@@ -385,17 +385,23 @@ fn rasterize_subpixel(
 
         for (x, rgb) in filtered.iter().enumerate() {
             let rgb = crate::text::subpixel::apply_cleartype_level(*rgb, opts.cleartype_level);
-            // R, G and B carry per-channel coverage; alpha carries a representative
-            // coverage so a renderer that cannot blend per channel still has
-            // something sane to fall back on. `max` rather than the mean, so thin
-            // stems do not disappear on that path.
-            let a = rgb[0].max(rgb[1]).max(rgb[2]);
-            image[(x + glyph_pos.0, y + glyph_pos.1)] =
-                Color32::from_rgba_premultiplied(rgb[0], rgb[1], rgb[2], a);
+            // R, G and B carry per-channel coverage. Alpha is the minimum, not a
+            // representative coverage: a premultiplied colour glyph can never have a
+            // channel above its alpha, so `max(rgb) > alpha` is the exact sentinel a
+            // renderer uses to distinguish LCD coverage from color-glyph pixels.
+            image[(x + glyph_pos.0, y + glyph_pos.1)] = lcd_texel(rgb);
         }
     }
 
     glyph_pos
+}
+
+/// Pack one filtered RGB-coverage sample into the atlas sentinel documented in
+/// [`crate::text::SubpixelMode`].
+#[inline]
+fn lcd_texel(rgb: [u8; 3]) -> Color32 {
+    let alpha = rgb[0].min(rgb[1]).min(rgb[2]);
+    Color32::from_rgba_premultiplied(rgb[0], rgb[1], rgb[2], alpha)
 }
 
 struct VelloPen<'a> {
@@ -960,6 +966,26 @@ pub(super) fn is_kana(c: char) -> bool {
 pub(super) fn is_cjk(c: char) -> bool {
     // TODO(bigfarts): Add support for Korean Hangul.
     is_cjk_ideograph(c) || is_kana(c)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::lcd_texel;
+
+    #[test]
+    fn lcd_texels_use_min_alpha_as_the_subpixel_sentinel() {
+        let [r, g, b, a] = lcd_texel([255, 128, 0]).to_array();
+        assert_eq!((r, g, b, a), (255, 128, 0, 0));
+        assert!(r.max(g).max(b) > a, "must identify as LCD coverage");
+
+        let [r, g, b, a] = lcd_texel([128, 128, 128]).to_array();
+        assert_eq!((r, g, b, a), (128, 128, 128, 128));
+        assert_eq!(r.max(g).max(b), a, "neutral coverage stays neutral");
+
+        let [r, g, b, a] = lcd_texel([255, 255, 255]).to_array();
+        assert_eq!((r, g, b, a), (255, 255, 255, 255));
+        assert_eq!(r.max(g).max(b), a, "solid white needs no LCD blend");
+    }
 }
 
 #[inline]

@@ -149,6 +149,73 @@ struct UniformBuffer {
     ///
     /// See also <https://github.com/emilk/egui/issues/5295>.
     predictable_texture_filtering: u32,
+
+    /// `0` = grayscale/off, `1` = RGB stripes, `2` = BGR stripes.
+    subpixel_order: u32,
+
+    /// Enhanced-contrast weight from [`epaint::TextOptions::text_contrast`].
+    subpixel_contrast: f32,
+}
+
+fn subpixel_order_code(mode: epaint::text::SubpixelMode) -> u32 {
+    match mode {
+        epaint::text::SubpixelMode::Off => 0,
+        epaint::text::SubpixelMode::Rgb => 1,
+        epaint::text::SubpixelMode::Bgr => 2,
+    }
+}
+
+fn supports_subpixel_features(features: wgpu::Features) -> bool {
+    features.contains(wgpu::Features::DUAL_SOURCE_BLENDING)
+}
+
+fn normalized_contrast(contrast: f32) -> f32 {
+    if contrast.is_finite() {
+        contrast.clamp(0.0, 1.0)
+    } else {
+        0.5
+    }
+}
+
+/// Did the managed font atlas contain LCD coverage after `delta`, given the previous
+/// state?
+///
+/// Sub-pixel texels have `max(r, g, b) > a`; grayscale coverage has
+/// `r == g == b == a`, and premultiplied color glyphs never have a channel above alpha.
+/// A full replacement starts over because it is a newly rasterized atlas. A partial update
+/// only allocates new glyph slots, so it can turn the state on but must not turn it off.
+fn font_subpixel_after(was: bool, delta: &epaint::ImageDelta) -> bool {
+    let epaint::ImageData::Color(image) = &delta.image;
+    let contains_subpixel = image.pixels.iter().any(|texel| {
+        let [r, g, b, a] = texel.to_array();
+        r.max(g).max(b) > a
+    });
+    (was && delta.pos.is_some()) || contains_subpixel
+}
+
+fn use_lcd_pipeline(
+    texture_id: epaint::TextureId,
+    lcd_available: bool,
+    font_atlas_has_subpixel: bool,
+    mode: epaint::text::SubpixelMode,
+) -> bool {
+    lcd_available
+        && texture_id == epaint::TextureId::default()
+        && font_atlas_has_subpixel
+        && !mode.is_off()
+}
+
+/// The shader and this helper use the same "one texel per display pixel, at its center"
+/// policy. It exists as a pure function so the transform fallback stays regression-tested
+/// without requiring a GPU in unit tests.
+#[cfg(test)]
+fn texel_mapping_is_one_to_one(
+    dx: [f32; 2],
+    dy: [f32; 2],
+    texel_center_fraction: [f32; 2],
+) -> bool {
+    let error = (dx[0] - 1.0).abs() + dx[1].abs() + dy[0].abs() + (dy[1] - 1.0).abs();
+    error < 0.01 && texel_center_fraction[0] < 0.02 && texel_center_fraction[1] < 0.02
 }
 
 struct SlicedBuffer {
@@ -236,6 +303,20 @@ impl Default for RendererOptions {
 pub struct Renderer {
     pipeline: wgpu::RenderPipeline,
 
+    /// Draws the managed font atlas with per-channel dual-source blending, when the
+    /// device, atlas contents and active text mode all allow it.
+    lcd_pipeline: Option<wgpu::RenderPipeline>,
+
+    /// Whether the managed font atlas currently contains the alpha-min sentinel used by
+    /// sub-pixel coverage. A full replacement recomputes this; partial glyph additions
+    /// retain it or turn it on.
+    font_atlas_has_subpixel: bool,
+
+    /// Current atlas contract and weight. These are uploaded through the uniform buffer;
+    /// the renderer never guesses them from colors.
+    subpixel_mode: epaint::text::SubpixelMode,
+    subpixel_contrast: f32,
+
     index_buffer: SlicedBuffer,
     vertex_buffer: SlicedBuffer,
 
@@ -260,6 +341,31 @@ pub struct Renderer {
 }
 
 impl Renderer {
+    /// Whether this device can draw sub-pixel text.
+    ///
+    /// This is deliberately checked on the device rather than the adapter alone: a caller
+    /// may supply an existing `wgpu::Device`, and an adapter feature only matters if the
+    /// application actually requested it during device creation.
+    pub fn supports_subpixel_text(device: &wgpu::Device) -> bool {
+        supports_subpixel_features(device.features())
+    }
+
+    /// Whether [`Self::new`] created the LCD pipeline on this renderer.
+    pub fn has_subpixel_pipeline(&self) -> bool {
+        self.lcd_pipeline.is_some()
+    }
+
+    /// Publish the atlas contract and the user's text-weight choice for the next frame.
+    ///
+    /// RGB/BGR is a blend-time swap because the atlas is always filtered in RGB signal
+    /// order. Contrast is the renderer's coverage-weight curve. The software renderer's
+    /// nonlinear destination-gamma blend is documented as a GPU limitation: fixed-function
+    /// blending cannot reproduce it without reading the framebuffer.
+    pub fn set_subpixel_text_options(&mut self, mode: epaint::text::SubpixelMode, contrast: f32) {
+        self.subpixel_mode = mode;
+        self.subpixel_contrast = normalized_contrast(contrast);
+    }
+
     /// Creates a renderer for a egui UI.
     ///
     /// `output_color_format` should preferably be [`wgpu::TextureFormat::Rgba8Unorm`] or
@@ -286,6 +392,8 @@ impl Renderer {
                 screen_size_in_points: [0.0, 0.0],
                 dithering: u32::from(options.dithering),
                 predictable_texture_filtering: u32::from(options.predictable_texture_filtering),
+                subpixel_order: subpixel_order_code(epaint::text::SubpixelMode::Off),
+                subpixel_contrast: 0.5,
             }]),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
@@ -367,14 +475,17 @@ impl Renderer {
                 bias: wgpu::DepthBiasState::default(),
             });
 
-        let pipeline = {
+        let create_pipeline = |label: &str,
+                               module: &wgpu::ShaderModule,
+                               fragment_entry_point: &str,
+                               blend: wgpu::BlendState| {
             profiling::scope!("create_render_pipeline");
             device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                label: Some("egui_pipeline"),
+                label: Some(label),
                 layout: Some(&pipeline_layout),
                 vertex: wgpu::VertexState {
                     entry_point: Some("vs_main"),
-                    module: &module,
+                    module,
                     buffers: &[Some(wgpu::VertexBufferLayout {
                         array_stride: 5 * 4,
                         step_mode: wgpu::VertexStepMode::Vertex,
@@ -394,7 +505,7 @@ impl Renderer {
                     polygon_mode: wgpu::PolygonMode::default(),
                     strip_index_format: None,
                 },
-                depth_stencil,
+                depth_stencil: depth_stencil.clone(),
                 multisample: wgpu::MultisampleState {
                     alpha_to_coverage_enabled: false,
                     count: options.msaa_samples.max(1),
@@ -402,36 +513,80 @@ impl Renderer {
                 },
 
                 fragment: Some(wgpu::FragmentState {
-                    module: &module,
-                    entry_point: Some(if output_color_format.is_srgb() {
-                        log::warn!("Detected a linear (sRGBA aware) framebuffer {output_color_format:?}. egui prefers Rgba8Unorm or Bgra8Unorm");
-                        "fs_main_linear_framebuffer"
-                    } else {
-                        "fs_main_gamma_framebuffer" // this is what we prefer
-                    }),
+                    module,
+                    entry_point: Some(fragment_entry_point),
                     targets: &[Some(wgpu::ColorTargetState {
                         format: output_color_format,
-                        blend: Some(wgpu::BlendState {
-                            color: wgpu::BlendComponent {
-                                src_factor: wgpu::BlendFactor::One,
-                                dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
-                                operation: wgpu::BlendOperation::Add,
-                            },
-                            alpha: wgpu::BlendComponent {
-                                src_factor: wgpu::BlendFactor::OneMinusDstAlpha,
-                                dst_factor: wgpu::BlendFactor::One,
-                                operation: wgpu::BlendOperation::Add,
-                            },
-                        }),
+                        blend: Some(blend),
                         write_mask: wgpu::ColorWrites::ALL,
                     })],
                     compilation_options: wgpu::PipelineCompilationOptions::default()
                 }),
                 multiview_mask: None,
                 cache: None,
-            }
-        )
+            })
         };
+
+        let linear_framebuffer = output_color_format.is_srgb();
+        if linear_framebuffer {
+            log::warn!(
+                "Detected a linear (sRGBA aware) framebuffer {output_color_format:?}. egui prefers Rgba8Unorm or Bgra8Unorm"
+            );
+        }
+
+        let alpha_blend = wgpu::BlendComponent {
+            src_factor: wgpu::BlendFactor::OneMinusDstAlpha,
+            dst_factor: wgpu::BlendFactor::One,
+            operation: wgpu::BlendOperation::Add,
+        };
+        let pipeline = create_pipeline(
+            "egui_pipeline",
+            &module,
+            if linear_framebuffer {
+                "fs_main_linear_framebuffer"
+            } else {
+                "fs_main_gamma_framebuffer"
+            },
+            wgpu::BlendState {
+                color: wgpu::BlendComponent {
+                    src_factor: wgpu::BlendFactor::One,
+                    dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
+                    operation: wgpu::BlendOperation::Add,
+                },
+                alpha: alpha_blend,
+            },
+        );
+
+        // The font atlas can use a source color plus a per-channel coverage source. Both
+        // sources share location 0; WGSL marks the second output with `@blend_src(1)`.
+        let lcd_pipeline = Self::supports_subpixel_text(device).then(|| {
+            let source = format!(
+                "enable dual_source_blending;\n{}{}",
+                include_str!("egui.wgsl"),
+                include_str!("egui_lcd.wgsl")
+            );
+            let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("egui_lcd"),
+                source: wgpu::ShaderSource::Wgsl(Cow::Owned(source)),
+            });
+            create_pipeline(
+                "egui_lcd_pipeline",
+                &module,
+                if linear_framebuffer {
+                    "fs_lcd_linear_framebuffer"
+                } else {
+                    "fs_lcd_gamma_framebuffer"
+                },
+                wgpu::BlendState {
+                    color: wgpu::BlendComponent {
+                        src_factor: wgpu::BlendFactor::One,
+                        dst_factor: wgpu::BlendFactor::OneMinusSrc1,
+                        operation: wgpu::BlendOperation::Add,
+                    },
+                    alpha: alpha_blend,
+                },
+            )
+        });
 
         const VERTEX_BUFFER_START_CAPACITY: wgpu::BufferAddress =
             (std::mem::size_of::<Vertex>() * 1024) as _;
@@ -440,6 +595,10 @@ impl Renderer {
 
         Self {
             pipeline,
+            lcd_pipeline,
+            font_atlas_has_subpixel: false,
+            subpixel_mode: epaint::text::SubpixelMode::Off,
+            subpixel_contrast: 0.5,
             vertex_buffer: SlicedBuffer {
                 buffer: create_vertex_buffer(device, VERTEX_BUFFER_START_CAPACITY),
                 slices: Vec::with_capacity(64),
@@ -487,6 +646,7 @@ impl Renderer {
         // Whether or not we need to reset the render pass because a paint callback has just
         // run.
         let mut needs_reset = true;
+        let mut lcd_pipeline_set = false;
 
         let mut index_buffer_slices = self.index_buffer.slices.iter();
         let mut vertex_buffer_slices = self.vertex_buffer.slices.iter();
@@ -507,6 +667,7 @@ impl Renderer {
                 );
                 render_pass.set_pipeline(&self.pipeline);
                 render_pass.set_bind_group(0, &self.uniform_bind_group, &[]);
+                lcd_pipeline_set = false;
                 needs_reset = false;
             }
 
@@ -540,6 +701,18 @@ impl Renderer {
                         .expect("You must call .update_buffers() before .render()");
 
                     if let Some(Texture { bind_group, .. }) = self.textures.get(&mesh.texture_id) {
+                        let lcd_pipeline = self.lcd_pipeline.as_ref().filter(|_| {
+                            use_lcd_pipeline(
+                                mesh.texture_id,
+                                true,
+                                self.font_atlas_has_subpixel,
+                                self.subpixel_mode,
+                            )
+                        });
+                        if lcd_pipeline.is_some() != lcd_pipeline_set {
+                            render_pass.set_pipeline(lcd_pipeline.unwrap_or(&self.pipeline));
+                            lcd_pipeline_set = lcd_pipeline.is_some();
+                        }
                         render_pass.set_bind_group(1, bind_group, &[]);
                         render_pass.set_index_buffer(
                             self.index_buffer.buffer.slice(
@@ -633,6 +806,11 @@ impl Renderer {
             }
         };
         let data_bytes: &[u8] = bytemuck::cast_slice(data_color32.as_slice());
+
+        if id == epaint::TextureId::default() {
+            self.font_atlas_has_subpixel =
+                font_subpixel_after(self.font_atlas_has_subpixel, image_delta);
+        }
 
         let queue_write_data_to_texture = |texture, origin| {
             profiling::scope!("write_texture");
@@ -750,6 +928,9 @@ impl Renderer {
     }
 
     pub fn free_texture(&mut self, id: &epaint::TextureId) {
+        if *id == epaint::TextureId::default() {
+            self.font_atlas_has_subpixel = false;
+        }
         if let Some(texture) = self.textures.remove(id).and_then(|t| t.texture) {
             texture.destroy();
         }
@@ -925,6 +1106,8 @@ impl Renderer {
             screen_size_in_points,
             dithering: u32::from(self.options.dithering),
             predictable_texture_filtering: u32::from(self.options.predictable_texture_filtering),
+            subpixel_order: subpixel_order_code(self.subpixel_mode),
+            subpixel_contrast: self.subpixel_contrast,
         };
         if uniform_buffer_content != self.previous_uniform_buffer_content {
             profiling::scope!("update uniforms");
@@ -1171,4 +1354,126 @@ impl ScissorRect {
 fn renderer_impl_send_sync() {
     fn assert_send_sync<T: Send + Sync>() {}
     assert_send_sync::<Renderer>();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        font_subpixel_after, normalized_contrast, subpixel_order_code, supports_subpixel_features,
+        texel_mapping_is_one_to_one, use_lcd_pipeline,
+    };
+    use epaint::{Color32, ColorImage, ImageDelta, textures::TextureOptions};
+
+    fn delta(texel: Color32, pos: Option<[usize; 2]>) -> ImageDelta {
+        let image = ColorImage::filled([2, 2], texel);
+        match pos {
+            Some(pos) => ImageDelta::partial(pos, image, TextureOptions::LINEAR),
+            None => ImageDelta::full(image, TextureOptions::LINEAR),
+        }
+    }
+
+    #[test]
+    fn font_atlas_subpixel_state_tracks_full_and_partial_updates() {
+        let grayscale = Color32::from_rgba_premultiplied(90, 90, 90, 90);
+        let color_glyph = Color32::from_rgba_premultiplied(100, 30, 20, 200);
+        let subpixel = Color32::from_rgba_premultiplied(120, 90, 60, 60);
+
+        // Partial additions can turn it on but never turn it off.
+        assert!(!font_subpixel_after(false, &delta(grayscale, Some([0, 0]))));
+        assert!(!font_subpixel_after(
+            false,
+            &delta(color_glyph, Some([0, 0]))
+        ));
+        assert!(font_subpixel_after(false, &delta(subpixel, Some([0, 0]))));
+        assert!(font_subpixel_after(true, &delta(grayscale, Some([4, 0]))));
+        assert!(font_subpixel_after(true, &delta(color_glyph, Some([4, 0]))));
+
+        // A full replacement is a new atlas and always starts from its own contents.
+        assert!(font_subpixel_after(false, &delta(subpixel, None)));
+        assert!(!font_subpixel_after(true, &delta(grayscale, None)));
+        assert!(!font_subpixel_after(true, &delta(color_glyph, None)));
+    }
+
+    #[test]
+    fn dual_source_support_requires_the_device_feature() {
+        assert!(!supports_subpixel_features(wgpu::Features::empty()));
+        assert!(supports_subpixel_features(
+            wgpu::Features::DUAL_SOURCE_BLENDING
+        ));
+        assert!(supports_subpixel_features(
+            wgpu::Features::DUAL_SOURCE_BLENDING | wgpu::Features::DEPTH_CLIP_CONTROL
+        ));
+    }
+
+    #[test]
+    fn lcd_pipeline_is_only_for_default_subpixel_font_atlas() {
+        let mode = epaint::text::SubpixelMode::Rgb;
+        assert!(use_lcd_pipeline(
+            epaint::TextureId::default(),
+            true,
+            true,
+            mode
+        ));
+        assert!(!use_lcd_pipeline(
+            epaint::TextureId::User(7),
+            true,
+            true,
+            mode
+        ));
+        assert!(!use_lcd_pipeline(
+            epaint::TextureId::default(),
+            false,
+            true,
+            mode
+        ));
+        assert!(!use_lcd_pipeline(
+            epaint::TextureId::default(),
+            true,
+            false,
+            mode
+        ));
+        assert!(!use_lcd_pipeline(
+            epaint::TextureId::default(),
+            true,
+            true,
+            epaint::text::SubpixelMode::Off
+        ));
+    }
+
+    #[test]
+    fn transformed_or_fractional_texel_mapping_falls_back() {
+        let centered = [0.0, 0.0];
+        assert!(texel_mapping_is_one_to_one(
+            [1.0, 0.0],
+            [0.0, 1.0],
+            centered
+        ));
+        assert!(!texel_mapping_is_one_to_one(
+            [0.98, 0.20],
+            [-0.20, 0.98],
+            centered
+        ));
+        assert!(!texel_mapping_is_one_to_one(
+            [1.37, 0.0],
+            [0.0, 1.37],
+            centered
+        ));
+        assert!(!texel_mapping_is_one_to_one(
+            [1.0, 0.0],
+            [0.0, 1.0],
+            [0.25, 0.0]
+        ));
+    }
+
+    #[test]
+    fn rgb_bgr_and_contrast_are_carried_as_renderer_data() {
+        use epaint::text::SubpixelMode;
+        assert_eq!(subpixel_order_code(SubpixelMode::Off), 0);
+        assert_eq!(subpixel_order_code(SubpixelMode::Rgb), 1);
+        assert_eq!(subpixel_order_code(SubpixelMode::Bgr), 2);
+        assert_eq!(normalized_contrast(0.25), 0.25);
+        assert_eq!(normalized_contrast(-1.0), 0.0);
+        assert_eq!(normalized_contrast(2.0), 1.0);
+        assert_eq!(normalized_contrast(f32::NAN), 0.5);
+    }
 }

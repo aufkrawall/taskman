@@ -332,6 +332,16 @@ impl Painter {
             .map(|rs| rs.device.limits().max_texture_dimension_2d as usize)
     }
 
+    /// Whether this painter created the managed-font dual-source pipeline.
+    ///
+    /// `None` means the render state has not been initialized yet. This reports the actual
+    /// device feature, not just what the selected adapter advertised.
+    pub fn subpixel_text(&self) -> Option<bool> {
+        self.render_state
+            .as_ref()
+            .map(|rs| rs.renderer.read().has_subpixel_pipeline())
+    }
+
     fn resize_and_generate_depth_texture_view_and_msaa_view(
         &mut self,
         viewport_id: ViewportId,
@@ -578,8 +588,14 @@ impl Painter {
             pixels_per_point,
         };
 
+        let subpixel_text_options = self.context.fonts(|fonts| {
+            let options = fonts.options();
+            (options.subpixel, options.text_contrast)
+        });
+
         let user_cmd_bufs = {
             let mut renderer = render_state.renderer.write();
+            renderer.set_subpixel_text_options(subpixel_text_options.0, subpixel_text_options.1);
             #[expect(clippy::iter_over_hash_type)] // Order doesn't matter here
             for (id, image_deltas) in textures_delta.set.drain() {
                 for image_delta in image_deltas {

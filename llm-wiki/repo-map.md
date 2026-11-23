@@ -223,7 +223,9 @@ platform boundary (`tm-core` ← `tm-platform` ← `tm-app` / `tm-service`), and
     checked before renderer creation; the primary listener wakes the UI to
     show/restore/focus, and a timed-out or hostile owner leaves the new launch
     independent. `linux/autostart.rs` writes/removes only its marked, quoted
-    `$XDG_CONFIG_HOME/autostart` entry.
+    `$XDG_CONFIG_HOME/autostart` entry. `fontconfig_text.rs` is the shared
+    root-level Linux text query: cached `fc-match -v`, trusted absolute binary
+    resolution, and strict `antialias`/horizontal-`rgba`/`lcdfilter` parsing.
 - `crates/tm-app`
   - eframe GUI. `main.rs` (startup sequence: args → console only for CLI →
     early logging → hand a duplicate launch to the running instance → lazy
@@ -327,8 +329,9 @@ platform boundary (`tm-core` ← `tm-platform` ← `tm-app` / `tm-service`), and
 - `crates/tm-ui`
   - Shared UI foundation used by the GUI and the Windows setup installer so
     both render the exact same Windows 11 look: `theme.rs` (dark/light
-    palette, widget visuals, text-weight and sub-pixel tuning) and `fonts.rs`
-    (async OS-native font load). egui-only; it never depends on eframe.
+    palette, widget visuals, renderer capability interlock, text-weight and
+    sub-pixel/filter tuning) and `fonts.rs` (async OS-native font load).
+    egui-only; it never depends on eframe.
 - `crates/tm-service`
   - Windows service executable. Starts under SCM as plain auto-start
     LocalSystem,
@@ -506,7 +509,10 @@ platform boundary (`tm-core` ← `tm-platform` ← `tm-app` / `tm-service`), and
   and against the shrunken INNER rect for solid ones, so a solid bar can
   oscillate on width-dependent content. Space reservation comes from
   `floating_allocated_width`, not from turning `floating` off; `tablekit`'s
-  header must mirror the body's reservation (`prev_bar_use`).
+  header must mirror the body's reservation (`prev_bar_use`). The sub-pixel
+  interlock must stay tied to the actual renderer/device capability; the
+  environment override may force an otherwise valid mode but may never bypass
+  that capability.
 - `crates/tm-platform/src/win/core_service.rs` — privileged trust boundary.
   Do not add arbitrary commands, output paths, or unbounded/generic telemetry to its protocol.
   Preserve exact PID+creation-time checks, client/server executable binding,
@@ -547,13 +553,17 @@ platform boundary (`tm-core` ← `tm-platform` ← `tm-app` / `tm-service`), and
 ## Rendering
 
 `vendor/egui/` is a vendored fork of egui (subtree, tag 0.36.1). It exists for a
-few things that stock egui cannot do: sub-pixel (ClearType) text, a native CPU
+few things that stock egui cannot do: sub-pixel (ClearType-like) text on both
+the native CPU renderer and capability-gated D3D12/Vulkan WGPU, a native CPU
 renderer, the keyboard Menu/Application key (`Key::ContextMenu`, fork
 divergence #5), and genuinely modal `Window`s plus public accesskit
 reparenting (divergence #6 — the keyboard/screen-reader model depends on both).
 The smaller later divergences are the text-cursor blink restart (#7), text-selection
-preservation on secondary click (#8), and no raw device-input registration (#9, pinned by
-a Windows test in `eframe`'s `native/run.rs`).
+preservation on secondary click (#8), no raw device-input registration (#9, pinned by
+a Windows test in `eframe`'s `native/run.rs`), wheel coalescing (#14), and the
+dual-source LCD font pipeline plus transformed-text grayscale fallback (#15).
+Linux capability parameters come from `tm-platform/src/fontconfig_text.rs`, which
+caches a trusted absolute `fc-match` query and maps `antialias`/`rgba`/`lcdfilter`.
 `vendor/egui/TASKMAN-FORK.md` is the divergence inventory and rebase runbook;
 `llm-wiki/render-pipeline.md` is the design. The fork has its own quality gate,
 `tools/check-fork.ps1`, because `cargo clippy --workspace` does not reach an excluded

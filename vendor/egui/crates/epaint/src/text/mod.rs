@@ -59,8 +59,9 @@ pub struct TextOptions {
     ///
     /// This changes what an atlas texel *means*, so it is a contract with the renderer
     /// rather than a quality setting -- see [`crate::text::SubpixelMode`]. Only enable it
-    /// when the active backend blends each channel against its own coverage; a GPU
-    /// backend cannot, and will draw rainbow-tinted text.
+    /// when the active backend blends each channel against its own coverage. The software
+    /// renderer always can; WGPU needs dual-source blending. A renderer that multiplies
+    /// the atlas as an ordinary premultiplied texture draws rainbow-tinted text.
     ///
     /// Default: [`SubpixelMode::Off`].
     pub subpixel: SubpixelMode,
@@ -86,7 +87,10 @@ pub struct TextOptions {
     /// ever changed when the user picks a different smoothing profile, which rebuilds the
     /// atlas regardless.
     ///
-    /// Windows' default is 1.8. Lower renders thinner.
+    /// Windows' default is 1.8. Lower renders thinner. The software renderer applies the
+    /// full nonlinear destination-gamma model. The WGPU dual-source path can apply
+    /// [`Self::text_contrast`] but not destination gamma: fixed-function blending cannot
+    /// read the framebuffer. This limitation is deliberate and documented in the renderer.
     pub text_gamma: f32,
 
     /// TASKMAN-FORK: enhanced-contrast boost applied to coverage before blending.

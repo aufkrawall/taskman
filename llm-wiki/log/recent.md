@@ -81,6 +81,33 @@
 - This first pass was source-reviewed and statically checked but not compiled
   or tested on the implementing host.
 
+## 2026-11-23 - GPU LCD text and Linux fontconfig audit
+
+- Added an `egui-wgpu` dual-source font-atlas pipeline. Device creation requests
+  `DUAL_SOURCE_BLENDING` only from the selected adapter's feature intersection; the
+  renderer creates the LCD pipeline only if the resulting device has the feature. The
+  pipeline is selected only for `TextureId::default()` while the active mode is non-off and
+  the managed atlas contains LCD texels.
+- Changed the epaint LCD atlas tag to alpha zero on every non-empty LCD texel. This makes
+  neutral, tinted and full coverage identifiable while premultiplied color glyphs retain
+  their ordinary alpha. Full atlas resets recompute the renderer state; partial additions
+  retain it or turn it on.
+- Added RGB/BGR order and text contrast to the padded 32-byte WGPU uniform path. The shader
+  applies the contrast curve and falls back to mean-coverage grayscale when derivatives or
+  texel-center checks show rotated, scaled or non-pixel-aligned glyphs. Fixed-function
+  destination gamma is not claimed and is documented as a GPU limitation.
+- Wired `tm-app` capability after window/device creation: software is capable, WGPU is
+  capable only when its LCD pipeline exists, and Glow/unsupported WGPU fail closed.
+- Replaced Linux's `PATH`-based fontconfig probe with a cached query through trusted
+  absolute root-owned `fc-match` locations, still inheriting the user's environment.
+  Parsing now rejects `antialias: False` and unknown/vertical/none/malformed `rgba`, and
+  maps `lcdfilter` to FreeType default/light/legacy-classic/none.
+- Added pure regression coverage for feature detection/request, atlas state transitions,
+  pipeline selection, transform fallback, alpha tag, RGB/BGR/contrast fields and
+  fontconfig parsing/trust policy. The manual headless `egui_kittest` WGPU suite ran
+  successfully on D3D12 and Vulkan; the normal `egui-wgpu` suite validates both LCD WGSL
+  entry points with Naga and covers the padded uniform layout.
+
 ## 2026-11-23 - Final Linux parity review corrections
 
 - Removed two integration blockers: the duplicate `command_line` module and

@@ -15,6 +15,12 @@ struct Locals {
     /// 1 to do manual filtering for more predictable kittest snapshot images.
     /// See also https://github.com/emilk/egui/issues/5295
     predictable_texture_filtering: u32,
+
+    /// 0 = off, 1 = RGB stripes, 2 = BGR stripes. Used only by egui_lcd.wgsl.
+    subpixel_order: u32,
+
+    /// Enhanced-contrast coverage weight for LCD text.
+    subpixel_contrast: f32,
 };
 @group(0) @binding(0) var<uniform> r_locals: Locals;
 

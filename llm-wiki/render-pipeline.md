@@ -1,27 +1,30 @@
 # Render Pipeline
 
-Last verified: 2026-09-01
+Last verified: 2026-11-23 (GPU LCD path and Linux fontconfig audit by source inspection; GPU execution unrun)
 
 Primary sources:
 - `vendor/egui/TASKMAN-FORK.md` (what diverges from upstream egui, and why)
 - `vendor/winit/TASKMAN-FORK.md` (window-band patch for always-on-top)
 - `vendor/egui/crates/egui_software/` (the CPU rasterizer)
+- `vendor/egui/crates/egui-wgpu/src/{renderer.rs,egui_lcd.wgsl}` (the GPU LCD path)
 - `vendor/egui/crates/eframe/src/native/software_integration.rs`
-- `crates/tm-platform/src/win/text_rendering.rs`
+- `crates/tm-platform/src/{fontconfig_text.rs,win/text_rendering.rs}`
 
 ## Why there is a fork
 
 Two requirements met in one place:
 
-1. **Sub-pixel (ClearType) text.** Per-channel glyph coverage has to be blended per
-   channel. On a GPU that needs dual-source blending, which egui's pipelines do not use
-   (upstream `emilk/egui#2639`). On a CPU it is a multiply.
+1. **Sub-pixel (ClearType-like) text.** Per-channel glyph coverage has to be blended per
+   channel. On the CPU that is a multiply. On D3D12/Vulkan it is a second `egui-wgpu`
+   pipeline using dual-source blending, created only when the device enabled that feature.
+   Glow and unsupported WGPU devices stay grayscale.
 2. **No GPU at all** — and not a software *driver* either. The old `render_mode = software`
    was WARP: a D3D12 driver emulated on the CPU, costing ~14 cores at 2.9 fps because it
    emulates a whole graphics stack to draw a 2D UI.
 
-Requirement 1 can only be satisfied by a renderer that satisfies requirement 2, so they
-are one project. egui is vendored at `vendor/egui` (see `TASKMAN-FORK.md` for the
+The CPU renderer still satisfies both requirements without a GPU stack. The vendored
+WGPU path extends the same atlas contract to D3D12/Vulkan when the hardware exposes
+dual-source blending. egui is vendored at `vendor/egui` (see `TASKMAN-FORK.md` for the
 divergence inventory and the rebase runbook).
 
 ## The layers
@@ -30,8 +33,9 @@ divergence inventory and the rebase runbook).
 tm-platform/win/text_rendering.rs   SPI gates + IDWriteRenderingParams
         |  plain data; no `windows` type goes further up
 tm-app/theme.rs                     the ONLY place that decides the sub-pixel mode
-        |  written into style.visuals.text_options
+        |  written into style.visuals.text_options after renderer capability
 [FORK] epaint                       3x rasterization -> per-channel coverage in the atlas
+[FORK] egui-wgpu                    optional dual-source font-atlas pipeline
 [FORK] egui_software::Painter       shapes -> pixels
         |-- Shape::Text        -> glyph blit, per-channel ClearType blend
         |-- pixel-aligned Rect -> span::fast_rect fill (flat + Shape::Vec containers)
@@ -62,14 +66,30 @@ through the chart area fills) or neither does (a crack). `widgets/chart.rs`'s
 
 **A sub-pixel atlas is a contract, not a setting.** With `SubpixelMode::Off` a texel is
 `(c, c, c, c)` and any backend can multiply it by the text colour. With sub-pixel coverage
-it is `(cov_r, cov_g, cov_b, cov_max)`, meaningful only to a renderer that blends each
-channel against its own coverage. Two interlocks enforce this:
+it is `(cov_r, cov_g, cov_b, min(cov_r, cov_g, cov_b))`, meaningful only to a renderer
+that blends each channel against its own coverage. The alpha-min sentinel is what
+distinguishes coverage from premultiplied color glyphs: a color texel never has a channel
+above alpha, while an LCD edge usually does. Neutral LCD texels (`r == g == b == a`) need
+no special blend because the ordinary and per-channel formulas agree. These interlocks
+enforce the contract:
 
-- `theme.rs` gates the mode on the active renderer. `TASKMAN_SUBPIXEL=1` cannot override
-  it, because the result would be rainbow-tinted text rather than a preference.
-- `software_integration.rs` reads the mode from the **atlas** (`f.options().subpixel`),
-  not from the style, so the blend mode and the rasterization mode agree by construction.
-  Disagreement is the one failure here that does not error — it just draws wrong colours.
+- `theme.rs` gates the mode on the active renderer capability. Software is always capable;
+  WGPU is capable only when its device actually enabled `DUAL_SOURCE_BLENDING`; Glow and
+  unsupported WGPU devices stay off. `TASKMAN_SUBPIXEL=1` cannot override capability.
+- The software painter and the WGPU painter read the mode from the **atlas**
+  (`fonts.options().subpixel`), not from an independent style copy, so blend order and
+  rasterization order agree.
+- `egui-wgpu` tracks both the active mode and whether the managed font texture actually
+  contains sub-pixel texels. The LCD pipeline is selected only for
+  `TextureId::default()` with that state true. A full atlas replacement recomputes the
+  state; a partial glyph addition retains it or turns it on.
+
+**Transformed text falls back to grayscale.** The WGPU shader checks the texture-coordinate
+derivatives and the sampled texel center. Rotated, scaled or fractionally translated glyphs
+do not map one source texel to one display pixel, so they average RGB coverage and use the
+ordinary grayscale blend. The software renderer applies the same policy: its triangle path
+converts LCD texels to mean coverage before filtering. This is intentional weight loss,
+not a failure to find a better sampler; preserving the fringes would be visibly wrong.
 
 **On Windows the presentation path is ours, not softbuffer's.** `platform_surface` in
 `software_integration.rs` owns a `CreateCompatibleDC` + top-down 32-bpp `CreateDIBSection`
@@ -110,7 +130,8 @@ Two details that make it correct rather than approximately correct:
 
 **BGR panels swap R and B at blend time** rather than rebuilding the atlas. Valid because
 the filter is symmetric, so filtering in RGB and swapping is algebraically identical to
-filtering in BGR — which means a mixed-panel multi-monitor desk costs nothing.
+filtering in BGR. The mode is still process/window-wide; Linux fontconfig does not expose
+per-monitor orders, so mixed-panel LCD layouts remain a documented limitation.
 
 Blending is gamma-corrected with a contrast boost:
 
@@ -124,6 +145,26 @@ values are not proportional to light. **The curve is an empirical match, not a p
 specification** — Microsoft has never documented DirectWrite's exact one; this is the model
 Skia and Chromium converged on. The *parameters* are not guesswork: they come from
 `IDWriteRenderingParams` for the monitor, carrying the user's own `cttune.exe` calibration.
+
+### WGPU dual-source path
+
+`egui-wgpu` asks for `DUAL_SOURCE_BLENDING` only when the selected adapter advertises it
+(`adapter.features() & DUAL_SOURCE_BLENDING` in the device descriptor). `Renderer::new`
+creates the LCD pipeline only when the resulting device feature is present. A custom
+device descriptor or an existing device that did not request the feature therefore fails
+closed.
+
+For the managed atlas, `egui_lcd.wgsl` emits source color at location 0 / source 0 and
+per-channel coverage at location 0 / source 1. The pipeline blends `ONE` against
+`ONE_MINUS_SRC1`, so RGB each use their own coverage. BGR is a blend-time channel swap;
+the atlas remains RGB-filtered. The same uniform carries the active order and
+`TextOptions::text_contrast`, so Sharp/Standard/Smooth still change weight without a
+hardcoded color-dependent approximation.
+
+**GPU gamma limitation:** fixed-function dual-source blending cannot read the framebuffer,
+so it cannot implement the software path's nonlinear `dst^gamma` term. WGPU applies the
+contrast curve and preserves the configured stripe order, but the result is not claimed to
+be DirectWrite-gamma-exact. The software renderer keeps the full gamma/contrast model.
 
 ## Text weight, and what `TextSmoothing` now means
 
@@ -140,6 +181,9 @@ used to select is not consulted on the sub-pixel path at all:
 | `Smooth` | no | yes | the display's own parameters | -- |
 
 `theme::cleartype_weight` is the single definition, shared with the comparison harness.
+The software renderer consumes both returned values. The WGPU path carries the contrast
+value and its RGB/BGR order through its uniform, but cannot carry the gamma term into a
+fixed-function destination blend (see above).
 
 **Measure at 150% scaling, not 100%.** At 100% the three profiles are indistinguishable
 (edge sharpness 75.4 / 75.3 / 75.5) and the weight question is invisible. At 150%, where
@@ -163,9 +207,17 @@ Enabling it where it is not valid looks *worse* than grayscale, so it is gated o
   smear the fringes into colour noise. Also covers RDP and Magnifier. winit sets
   per-monitor-v2, so this normally passes — but it is checked, because the failure mode is
   ugly rather than obvious. (It correctly reports "off" inside `cargo test`.)
-- Any non-Windows platform, for now. The rasterizer and blend path are
-  platform-independent; what is missing is the equivalent signal — fontconfig's `rgba` on
-  X11, and on Wayland only when the surface is not fractionally scaled.
+- The active GPU backend is Glow, or WGPU did not enable dual-source blending. These are
+  renderer capabilities, not user preferences.
+- Linux fontconfig reports `antialias: False`, an unknown/vertical/none `rgba`, a
+  malformed value, or no explicit antialias state. Only horizontal `rgb`/`bgr` enables
+  per-channel coverage. This is *ClearType-like*, not Microsoft ClearType.
+- A glyph quad is transformed or fractionally aligned, as described above.
+
+Linux `fc-match` is resolved from absolute root-owned system locations rather than
+`PATH`, but it inherits the user's environment and reads the effective per-user KDE/GNOME
+fontconfig files. The result is cached process-wide; no frame spawns `fc-match`.
+`lcdfilter` maps to FreeType default, light, legacy/classic and none.
 
 ## Verification
 
@@ -184,11 +236,21 @@ Everything below is headless; none of it opens a window.
   code and asserts structural properties of the output, plus the end-to-end sub-pixel
   check: enabling the mode must add channel spread to glyph edges and leave solid fills
   bit-identical.
+- `cargo test -p egui-wgpu` — pure coverage for feature detection/request policy, atlas
+  full/partial state transitions, managed-texture-only pipeline selection, transform
+  fallback policy and RGB/BGR/contrast uniform fields.
+- `cargo test -p tm-platform` — fontconfig parser policy for RGB/BGR, unknown/vertical/none,
+  antialias false, malformed output, lcd filter mapping and trusted program metadata.
+- `cargo test -p egui_kittest --features wgpu --test subpixel_text` — headless dual-source
+  render coverage. It prints an explicit SKIP and returns only when no adapter supports the
+  feature; it does not report a pass for an absent GPU.
 - `TASKMAN_RENDER_SNAPSHOT=target/frame.png cargo test -p tm-app write_cpu_frame_snapshot`
   writes the frame, and a `-cleartype` variant beside it, to look at.
 
-**Not yet verified:** the window path. Opening a real window is the one thing the headless
-tests cannot cover, and the CPU-cost measurements in the plan need it too.
+**Unrun in the 2026-11-23 GPU-LCD implementation pass:** the task explicitly prohibited
+compiling, running tests or building. The new tests and shader are source-reviewed only;
+the D3D12/Vulkan visual path still needs a real GPU run. Opening a real window remains the
+one thing headless tests cannot cover.
 
 ## Still open
 
@@ -204,6 +266,12 @@ tests cannot cover, and the CPU-cost measurements in the plan need it too.
   `DWRITE_TEXTURE_CLEARTYPE_3x1` would give bitmaps identical to Windows'. It also requires
   switching layout to linear (unhinted) advances to match `MEASURING_MODE_NATURAL`, which
   inverts the grid-fitting argument in `fonts.rs`'s module doc — read that before starting.
+- **Linux per-monitor LCD policy.** fontconfig supplies one process-wide `rgba`/`lcdfilter`
+  result. Mixed-panel desktops or a monitor with a different stripe order cannot be
+  resolved per window from that signal alone. Fractional Wayland scaling is handled
+  conservatively by the transformed-glyph fallback, but a compositor that resamples an
+  otherwise 1:1 surface remains a deployment risk rather than something fontconfig can
+  prove.
 - **Performance work.** The rasterizer and application loops are optimized for low CPU load:
   - Axis-aligned rect fast path (`span::fast_rect` with `Shape::Vec` recursive flattening for containers).
   - Uniform untextured triangle fast paths (opaque and translucent) with single-branch edge testing.

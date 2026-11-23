@@ -92,6 +92,30 @@ pub fn triangle(
     v: [ScreenVertex; 3],
     texture: Option<&Texture>,
 ) {
+    triangle_impl(target, clip, v, texture, false);
+}
+
+/// Rasterize transformed text whose font-atlas mesh contains LCD coverage.
+///
+/// LCD texels are reduced to their mean coverage before sampling. That is the correct
+/// grayscale fallback for rotated, scaled and fractional glyph quads; color glyphs in the
+/// same atlas pass through unchanged.
+pub(crate) fn triangle_gray_lcd(
+    target: &mut Target<'_>,
+    clip: PixelRect,
+    v: [ScreenVertex; 3],
+    texture: Option<&Texture>,
+) {
+    triangle_impl(target, clip, v, texture, true);
+}
+
+fn triangle_impl(
+    target: &mut Target<'_>,
+    clip: PixelRect,
+    v: [ScreenVertex; 3],
+    texture: Option<&Texture>,
+    gray_lcd: bool,
+) {
     let mut v = v;
 
     let (mut x0, mut y0) = (to_fixed(v[0].x), to_fixed(v[0].y));
@@ -239,7 +263,7 @@ pub fn triangle(
                 let l1 = w[1] as f32 * inv_area;
                 let l2 = 1.0 - l0 - l1;
 
-                let src = shade(&v, l0, l1, l2, texture);
+                let src = shade(&v, l0, l1, l2, texture, gray_lcd);
                 if src[3] > 0.0
                     && let Some(dst) = row.get_mut(x as usize)
                 {
@@ -265,7 +289,14 @@ pub fn triangle(
 /// it bit-for-bit; the integer and SIMD fast paths come later, guarded by the parity test
 /// this enables.
 #[inline]
-fn shade(v: &[ScreenVertex; 3], l0: f32, l1: f32, l2: f32, texture: Option<&Texture>) -> [f32; 4] {
+fn shade(
+    v: &[ScreenVertex; 3],
+    l0: f32,
+    l1: f32,
+    l2: f32,
+    texture: Option<&Texture>,
+    gray_lcd: bool,
+) -> [f32; 4] {
     let c0 = v[0].color.to_array();
     let c1 = v[1].color.to_array();
     let c2 = v[2].color.to_array();
@@ -288,7 +319,12 @@ fn shade(v: &[ScreenVertex; 3], l0: f32, l1: f32, l2: f32, texture: Option<&Text
     if let Some(tex) = texture {
         let u = v[0].u * l0 + v[1].u * l1 + v[2].u * l2;
         let vv = v[0].v * l0 + v[1].v * l1 + v[2].v * l2;
-        let texel = tex.sample(u, vv).to_array();
+        let texel = if gray_lcd {
+            tex.sample_gray_lcd(u, vv)
+        } else {
+            tex.sample(u, vv)
+        }
+        .to_array();
         for i in 0..4 {
             out[i] = out[i] * texel[i] as f32 * (1.0 / 255.0);
         }

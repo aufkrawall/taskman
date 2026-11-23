@@ -27,8 +27,9 @@
 //! That still has to be *checked* rather than assumed: italics shear the quad
 //! (`text_layout.rs` offsets the top edge by `height * 0.25`), and a rotated
 //! [`epaint::TextShape`] rotates it. [`blit_quad`] returns `false` for anything that is
-//! not a clean axis-aligned 1:1 blit, and the caller falls back to the triangle path --
-//! which is why the output is identical either way.
+//! not a clean axis-aligned 1:1 blit. The caller then uses the triangle path, converting
+//! LCD texels to mean grayscale coverage first so transformed text keeps its weight but
+//! cannot smear colored fringes.
 
 use ecolor::Color32;
 use epaint::text::SubpixelMode;
@@ -450,8 +451,9 @@ mod tests {
     #[test]
     fn subpixel_coverage_produces_a_tinted_pixel() {
         let atlas = Texture {
-            // Red fully covered, green half, blue not at all.
-            pixels: vec![Color32::from_rgba_premultiplied(255, 128, 0, 255)],
+            // Red fully covered, green half, blue not at all. Alpha is the minimum
+            // channel, the atlas sentinel used by both GPU and CPU renderers.
+            pixels: vec![Color32::from_rgba_premultiplied(255, 128, 0, 0)],
             width: 1,
             height: 1,
             options: TextureOptions::NEAREST,
@@ -477,7 +479,7 @@ mod tests {
     #[test]
     fn bgr_mirrors_rgb() {
         let atlas = Texture {
-            pixels: vec![Color32::from_rgba_premultiplied(255, 128, 0, 255)],
+            pixels: vec![Color32::from_rgba_premultiplied(255, 128, 0, 0)],
             width: 1,
             height: 1,
             options: TextureOptions::NEAREST,

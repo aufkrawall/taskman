@@ -1,5 +1,14 @@
 use std::sync::Arc;
 
+/// Request dual-source blending only when the selected adapter advertises it.
+///
+/// Unknown adapters must keep the ordinary grayscale path: requesting a feature they do
+/// not support makes device creation fail, and requesting it from an adapter that only
+/// advertises it does not create the capability. This is the exact intersection.
+fn requested_dual_source_blending(adapter_features: wgpu::Features) -> wgpu::Features {
+    adapter_features & wgpu::Features::DUAL_SOURCE_BLENDING
+}
+
 /// A cloneable display handle for use with [`wgpu::InstanceDescriptor`].
 ///
 /// [`wgpu::InstanceDescriptor`] stores its display handle as a non-cloneable
@@ -263,6 +272,7 @@ impl WgpuSetupCreateNew {
 
                 wgpu::DeviceDescriptor {
                     label: Some("egui wgpu device"),
+                    required_features: requested_dual_source_blending(adapter.features()),
                     required_limits: wgpu::Limits {
                         // When using a depth buffer, we have to be able to create a texture
                         // large enough for the entire surface, and we want to support 4k+ displays.
@@ -273,6 +283,26 @@ impl WgpuSetupCreateNew {
                 }
             }),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::requested_dual_source_blending;
+
+    #[test]
+    fn dual_source_is_requested_only_when_the_adapter_has_it() {
+        let dual = wgpu::Features::DUAL_SOURCE_BLENDING;
+        assert_eq!(
+            requested_dual_source_blending(wgpu::Features::empty()),
+            wgpu::Features::empty()
+        );
+        assert_eq!(requested_dual_source_blending(dual), dual);
+        assert_eq!(
+            requested_dual_source_blending(dual | wgpu::Features::DEPTH_CLIP_CONTROL),
+            dual,
+            "unrelated adapter features must not leak into the device request"
+        );
     }
 }
 

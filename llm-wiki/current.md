@@ -1,7 +1,7 @@
 # Current State
 
-Last cross-checked: 2026-11-23 (Linux desktop classification and
-privileged-action sections)
+Last cross-checked: 2026-11-24 (Linux desktop classification and
+GPU/Linux LCD text)
 
 ## Summary
 
@@ -17,6 +17,37 @@ in `known-debt.md`. Normal GUI startup remains unelevated; privileged controls
 can cross a protected, allowlisted service boundary after one explicit install.
 Linux can elevate only a trusted `systemctl` for service control; elevated
 process actions and GUI relaunch fail closed until a protected helper exists.
+
+## GPU LCD text and Linux fontconfig (2026-11-23)
+
+- **D3D12/Vulkan now have their own LCD font path.** The vendored `egui-wgpu` renderer
+  creates a second pipeline with dual-source blending only when the selected device
+  actually enabled `DUAL_SOURCE_BLENDING`. It draws only `TextureId::default()` while the
+  managed atlas contains the alpha-min sub-pixel sentinel and the active mode is non-off.
+  Grayscale/color glyphs keep the ordinary shader arithmetic, every non-font texture stays
+  on the existing pipeline, and Glow or an unsupported WGPU device stays grayscale.
+- **The atlas contract is now self-identifying.** LCD texels store `(cov_r, cov_g, cov_b,
+  min(cov))`; premultiplied color glyphs cannot exceed alpha. Full atlas replacements
+  recompute the state, partial glyph additions retain or set it, and BGR is a blend-time
+  swap rather than a second rasterization.
+- **Transform fallback is explicit.** WGPU checks texture derivatives and texel-center
+  alignment; rotated, scaled or fractional glyphs render through the grayscale path.
+  Software transformed text converts LCD texels to mean coverage before triangle sampling.
+- **Capability is wired after window/device creation.** `tm-app` enables the theme
+  interlock for the software renderer and for a WGPU renderer whose LCD pipeline exists;
+  unsupported WGPU and Glow set it false. `TASKMAN_SUBPIXEL=1` still cannot override that.
+- **WGPU contrast is honored; destination gamma is not claimed.** RGB/BGR and
+  `TextOptions::text_contrast` travel through the renderer uniform. Fixed-function
+  dual-source blending cannot read the framebuffer, so the nonlinear software
+  destination-gamma term remains a documented GPU limitation.
+- **Linux uses the desktop's effective fontconfig policy.** A cached startup query reads
+  horizontal `rgba`, `antialias` and `lcdfilter` through a trusted absolute `fc-match`
+  path while inheriting the user's KDE/GNOME fontconfig environment. `rgb`/`bgr` enable
+  ClearType-like text; disabled antialiasing, unknown/vertical/none orders and malformed
+  output fail closed. Default/light/legacy/none map to the fork's filter presets.
+- **Unverified in this pass:** compilation, tests and a real GPU/window were explicitly
+  prohibited. The source and test inventory is complete, but D3D12/Vulkan shader validity
+  and visual quality still require the normal gates and a hardware smoke run.
 
 ## Row/total consistency (2026-10-21)
 
@@ -614,13 +645,15 @@ rebase runbook.
   inventing one, so a golden-image diff against the GPU is a valid test. Idle cost
   in the tray is 0.04 cores -- the same as wgpu and glow, i.e. rendering is
   effectively free and what remains is the sampling engine.
-- **Sub-pixel (ClearType) text**, which the debt list called impossible. Glyphs are
+- **Sub-pixel (ClearType-like) text**, which the debt list called impossible. Glyphs are
   rasterized at 3x horizontal resolution, filtered to per-channel coverage, and
   blended per channel with gamma and enhanced contrast taken from
   `IDWriteRenderingParams` for the monitor -- including the user's own
   `cttune.exe` calibration. It is gated on the display, the user's font-smoothing
   settings, and per-monitor DPI awareness, because enabling it where it is not
-  valid looks worse than grayscale.
+  valid looks worse than grayscale. D3D12/Vulkan gained a capability-gated
+  dual-source pipeline on 2026-11-23 (see the top section); Linux uses the
+  desktop's horizontal fontconfig order/filter.
 - CPU rendering is the default. Graphics settings can select D3D12 on Windows,
   Vulkan on Linux, and Metal or OpenGL on macOS. The saved choice applies at
   the next launch. WGPU falls back to native CPU rendering if it cannot start.
@@ -718,7 +751,8 @@ rebase runbook.
   horizontal grid-fitting OFF and lift dark-mode coverage by `2c − c²`, which
   together produce the "blurry and fat" look; `sharp` reverses both. Applies
   live, no restart.
-- **Sub-pixel (ClearType) rendering stays impossible** — epaint's glyph atlas
+- **Sub-pixel (ClearType) rendering stayed impossible at that time (superseded
+  2026-09-01 by the fork's RGB atlas and per-channel blend)** — epaint's glyph atlas
   is single-channel and both renderers blend with one scalar alpha. Measured:
   0 RGB channel spread in our text, visible fringing in the reference Task
   Manager capture. See `known-debt.md`.

@@ -21,20 +21,34 @@ impl Texture {
     /// GPU backend uploads mipmaps by default, so a separate minification path would only
     /// differ where the GPU is itself aliasing.
     pub fn sample(&self, u: f32, v: f32) -> Color32 {
+        self.sample_impl(u, v, false)
+    }
+
+    /// Sample the font atlas with LCD texels reduced to their mean grayscale coverage.
+    ///
+    /// Rotated, scaled or otherwise non-1:1 text cannot use the direct per-channel blit.
+    /// Its triangles still sample the font atlas, so converting the LCD texels before
+    /// filtering prevents tinted fringes while preserving a premultiplied grayscale blend.
+    /// Color glyphs (`max(rgb) <= alpha`) pass through unchanged.
+    pub(crate) fn sample_gray_lcd(&self, u: f32, v: f32) -> Color32 {
+        self.sample_impl(u, v, true)
+    }
+
+    fn sample_impl(&self, u: f32, v: f32, gray_lcd: bool) -> Color32 {
         if self.width == 0 || self.height == 0 {
             return Color32::TRANSPARENT;
         }
         if self.options.magnification == TextureFilter::Linear {
-            self.bilinear(u, v)
+            self.bilinear(u, v, gray_lcd)
         } else {
             // GL samples the texel whose cell contains the coordinate.
             let x = (u * self.width as f32).floor();
             let y = (v * self.height as f32).floor();
-            self.texel_wrapped(x as i64, y as i64)
+            self.texel_wrapped(x as i64, y as i64, gray_lcd)
         }
     }
 
-    fn bilinear(&self, u: f32, v: f32) -> Color32 {
+    fn bilinear(&self, u: f32, v: f32, gray_lcd: bool) -> Color32 {
         // Texel centres sit at (i + 0.5) / size, so the continuous coordinate of texel i
         // is `uv * size - 0.5`. Getting this half-texel shift wrong is the classic cause
         // of software renderers looking subtly blurrier than the GPU.
@@ -46,10 +60,10 @@ impl Texture {
         let fy = y - y0;
         let (x0, y0) = (x0 as i64, y0 as i64);
 
-        let c00 = self.texel_wrapped(x0, y0);
-        let c10 = self.texel_wrapped(x0 + 1, y0);
-        let c01 = self.texel_wrapped(x0, y0 + 1);
-        let c11 = self.texel_wrapped(x0 + 1, y0 + 1);
+        let c00 = self.texel_wrapped(x0, y0, gray_lcd);
+        let c10 = self.texel_wrapped(x0 + 1, y0, gray_lcd);
+        let c01 = self.texel_wrapped(x0, y0 + 1, gray_lcd);
+        let c11 = self.texel_wrapped(x0 + 1, y0 + 1, gray_lcd);
 
         let lerp = |a: u8, b: u8, t: f32| a as f32 + (b as f32 - a as f32) * t;
         let mut out = [0u8; 4];
@@ -62,15 +76,30 @@ impl Texture {
     }
 
     /// Fetch a texel, applying the texture's wrap mode to out-of-range coordinates.
-    fn texel_wrapped(&self, x: i64, y: i64) -> Color32 {
+    fn texel_wrapped(&self, x: i64, y: i64, gray_lcd: bool) -> Color32 {
         let x = wrap(x, self.width as i64, self.options.wrap_mode);
         let y = wrap(y, self.height as i64, self.options.wrap_mode);
         let idx = (y as usize) * self.width + (x as usize);
-        self.pixels
+        let texel = self
+            .pixels
             .get(idx)
             .copied()
-            .unwrap_or(Color32::TRANSPARENT)
+            .unwrap_or(Color32::TRANSPARENT);
+        if gray_lcd {
+            gray_lcd_texel(texel)
+        } else {
+            texel
+        }
     }
+}
+
+fn gray_lcd_texel(texel: Color32) -> Color32 {
+    let [r, g, b, a] = texel.to_array();
+    if r.max(g).max(b) <= a {
+        return texel;
+    }
+    let gray = ((u32::from(r) + u32::from(g) + u32::from(b) + 1) / 3) as u8;
+    Color32::from_rgba_premultiplied(gray, gray, gray, gray)
 }
 
 #[inline]
@@ -269,6 +298,26 @@ mod tests {
         };
         assert_eq!(tex.sample(0.25, 0.25), Color32::RED);
         assert_eq!(tex.sample(0.75, 0.75), Color32::WHITE);
+    }
+
+    #[test]
+    fn gray_lcd_sampling_neutralizes_coverage_but_preserves_color_glyphs() {
+        let subpixel = Color32::from_rgba_premultiplied(255, 128, 0, 0);
+        let color_glyph = Color32::from_rgba_premultiplied(200, 40, 10, 220);
+        let tex = Texture {
+            pixels: vec![subpixel, color_glyph],
+            width: 2,
+            height: 1,
+            options: TextureOptions::NEAREST,
+        };
+
+        let gray = tex.sample_gray_lcd(0.25, 0.5).to_array();
+        assert!(
+            gray[0] == gray[1] && gray[1] == gray[2] && gray[2] == gray[3],
+            "LCD texel must become neutral premultiplied coverage: {gray:?}"
+        );
+        assert!(gray[0] > 0);
+        assert_eq!(tex.sample_gray_lcd(0.75, 0.5), color_glyph);
     }
 
     #[test]

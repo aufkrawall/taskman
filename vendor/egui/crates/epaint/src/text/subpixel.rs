@@ -18,25 +18,32 @@
 //! * **Gamma and contrast.** Blending coverage linearly in sRGB makes light-on-dark text
 //!   look bloated and dark-on-light text look anaemic. Windows blends in a
 //!   gamma-corrected space with a contrast boost; [`crate::text::TextOptions`] carries
-//!   those parameters and the *renderer* applies them, because they depend on the text
-//!   and background colours, which the rasterizer does not know.
+//!   those parameters and the *renderer* applies them where its blend model can. The
+//!   software renderer implements the nonlinear destination-gamma curve; fixed-function
+//!   dual-source WGPU blending can apply contrast but cannot read the framebuffer for the
+//!   destination-gamma term.
 //!
 //! # Why the atlas needs no new format
 //!
 //! `TextureAtlas` already stores `Color32`. Per-channel coverage goes straight into R, G
-//! and B, with the alpha channel carrying a representative coverage for consumers that
-//! cannot do per-channel blending. Only a renderer that knows the texel is sub-pixel
-//! coverage may use the RGB channels that way -- see [`SubpixelMode`].
+//! and B, with alpha set to the **minimum** of the three. A premultiplied colour glyph
+//! never has a channel above its alpha, so `max(r, g, b) > a` identifies a sub-pixel
+//! texel. Grayscale coverage has `r == g == b == a` and is indistinguishable from a
+//! neutral sub-pixel texel, but it needs no special treatment either: the ordinary and
+//! LCD blends agree when all three coverages are equal. Only a renderer that understands
+//! this sentinel may use the RGB channels as per-channel coverage -- see
+//! [`SubpixelMode`].
 
 /// Whether glyphs are rasterized with per-channel (sub-pixel) coverage.
 ///
 /// **This is a contract with the renderer, not just a quality knob.** With
 /// [`Self::Off`] an atlas texel is `(c, c, c, c)` and any backend can multiply it by the
-/// text colour. With sub-pixel coverage the texel is `(cov_r, cov_g, cov_b, cov_max)`,
-/// which is only meaningful to a renderer that blends each channel against its own
-/// coverage. A GPU backend cannot: that needs dual-source blending, which egui's
-/// pipelines do not use. Handing a sub-pixel atlas to `egui_glow` or `egui-wgpu` produces
-/// rainbow-tinted text, so the choice must be gated on the active renderer.
+/// text colour. With sub-pixel coverage the texel is
+/// `(cov_r, cov_g, cov_b, min(cov_r, cov_g, cov_b))`, which is only meaningful to a
+/// renderer that blends each channel against its own coverage. A GPU backend needs
+/// dual-source blending for that. Handing a sub-pixel atlas to a renderer that multiplies
+/// the texel as an ordinary premultiplied colour produces rainbow-tinted text, so the
+/// choice must be gated on the active renderer.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum SubpixelMode {
     /// Grayscale coverage; every backend understands it.
@@ -78,7 +85,8 @@ pub struct LcdFilter(pub [u16; 5]);
 impl LcdFilter {
     /// `[1, 2, 3, 2, 1] / 9` -- the filter described in the original `ClearType` work.
     ///
-    /// Softer, and suppresses colour more aggressively.
+    /// Softer, and suppresses colour more aggressively. This is also the closest
+    /// available approximation to fontconfig's legacy LCD filter.
     pub const CLASSIC: Self = Self([28, 57, 86, 57, 28]);
 
     /// `FreeType`'s `FT_LCD_FILTER_DEFAULT`, tuned by eye *against* `ClearType` output.
@@ -86,6 +94,12 @@ impl LcdFilter {
     /// Noticeably sharper than [`Self::CLASSIC`] with slightly more colour. This is the
     /// default because the reference we are matching -- Windows 11 -- reads sharp.
     pub const FREETYPE_DEFAULT: Self = Self([8, 77, 86, 77, 8]);
+
+    /// `FreeType`'s `FT_LCD_FILTER_LIGHT`: a gentler, narrower filter than the default.
+    ///
+    /// fontconfig exposes this as `lcdfilter: light`; desktops use it when the user asks
+    /// for less colour fringing at the cost of a little sharpness.
+    pub const LIGHT: Self = Self([0, 85, 86, 85, 0]);
 
     /// No filtering: raw 3x samples. Maximum sharpness, heavy fringing.
     ///
@@ -172,6 +186,7 @@ mod tests {
         // is easy to make when hand-tuning taps and hard to spot by eye.
         assert!(LcdFilter::CLASSIC.is_normalized());
         assert!(LcdFilter::FREETYPE_DEFAULT.is_normalized());
+        assert!(LcdFilter::LIGHT.is_normalized());
         assert!(LcdFilter::NONE.is_normalized());
         assert!(!LcdFilter([1, 2, 3, 2, 1]).is_normalized());
     }
@@ -183,6 +198,7 @@ mod tests {
         for f in [
             LcdFilter::CLASSIC,
             LcdFilter::FREETYPE_DEFAULT,
+            LcdFilter::LIGHT,
             LcdFilter::NONE,
         ] {
             assert_eq!(f.0[0], f.0[4], "{f:?}");
@@ -197,6 +213,7 @@ mod tests {
         for f in [
             LcdFilter::CLASSIC,
             LcdFilter::FREETYPE_DEFAULT,
+            LcdFilter::LIGHT,
             LcdFilter::NONE,
         ] {
             filter_row(&samples, 8, f, &mut out);

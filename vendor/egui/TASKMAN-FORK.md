@@ -9,21 +9,24 @@ git subtree add --prefix=vendor/egui https://github.com/emilk/egui 0.36.1 --squa
 
 It started for two rendering things taskman needs that are not reachable from stock egui:
 
-1. **Sub-pixel (ClearType) text.** Per-channel glyph coverage needs per-channel alpha
-   blending. On a GPU that means dual-source blending, which egui's backends do not have
-   (upstream `emilk/egui#2639`). On a CPU it is a per-channel multiply.
+1. **Sub-pixel (ClearType-like) text.** Per-channel glyph coverage needs per-channel alpha
+   blending. On a CPU it is a per-channel multiply. `egui-wgpu` now has a second
+   dual-source font-atlas pipeline for D3D12/Vulkan devices that actually enabled the
+   feature; Glow and unsupported WGPU devices remain grayscale.
 2. **A native CPU renderer.** eframe offers only glow and wgpu; `RenderMode::Software`
    used to mean WARP, a D3D12 driver emulated on the CPU at ~14 cores and 2.9 fps.
 
-Both are served by one new backend, so they are one change. The inventory below also
-carries later, unrelated additions: the keyboard Menu/Application key (#5) and modal
+The CPU backend serves both without a GPU stack; the later WGPU pipeline reuses the same
+atlas and falls back cleanly where dual-source blending is unavailable. The inventory
+below also carries later, unrelated additions: the keyboard Menu/Application key (#5) and modal
 windows plus public accesskit reparenting (#6), both of which the keyboard and
 screen-reader model in `llm-wiki/current.md` depends on, a text-cursor blink restart
 (#7), text-selection preservation on secondary click (#8), not registering for raw
 device input (#9), coalescing pointer-move repaints to the display refresh rate and
 skipping moves that cannot change the hover target (#10, with the `hit_test_last_pass`
 accessor #11 in `egui` itself), and coalescing wheel repaint requests to the same cadence
-(#14).
+(#14). Divergence #15 extends the original sub-pixel feature to a dual-source `egui-wgpu`
+font-atlas pipeline and makes transformed software text use a grayscale fallback.
 
 The full design, the blend math, and the verification plan live in
 `llm-wiki/render-pipeline.md` in the parent repo. This file is only the *inventory* of what
@@ -75,18 +78,18 @@ Both are upstreamable as plain oversight fixes; drop them if upstream adds equiv
 
 ### 2. `epaint`: opt-in sub-pixel glyph rasterization
 
-*(not yet implemented — this section is the contract)*
+Implemented as the atlas contract below. There is no separate `rasterizer.rs` in this
+0.36.1 tree; the customization lives directly in `font.rs`, with the modes/filter/filtering
+math in the new `subpixel.rs`.
 
 | File | Nature |
 | --- | --- |
-| `crates/epaint/src/text/rasterizer.rs` | **new** — `GlyphRasterizer` trait, `GlyphRequest`, `GlyphBitmap` |
-| `crates/epaint/src/text/subpixel.rs` | **new** — `SubpixelMode`, LCD filter, gamma/contrast model |
-| `crates/epaint/src/text/font.rs` | **edit** — one hunk in `allocate_glyph_uncached` |
-| `crates/epaint/src/text/mod.rs` | **edit** — new `TextOptions` fields |
-| `crates/epaint/src/texture_atlas.rs` | **edit** — keep `prepared_discs` on the grayscale ramp |
-| `crates/epaint/src/lib.rs` | **edit** — re-exports |
+| `crates/epaint/src/text/subpixel.rs` | **new** — `SubpixelMode`, LCD filters and coverage filtering |
+| `crates/epaint/src/text/font.rs` | **edit** — 3x horizontal fill, one-pixel bounds expansion, RGB filtering, alpha-min sentinel |
+| `crates/epaint/src/text/mod.rs` | **edit** — `subpixel`, `lcd_filter`, `cleartype_level`, `text_gamma`, `text_contrast` |
+| `crates/epaint/src/lib.rs` | **edit** — re-exports `LcdFilter` and `SubpixelMode` |
 
-The `font.rs` hunk must be shaped as
+The rasterizer branch is still shaped so grayscale stays isolated:
 
 ```rust
 if opts.subpixel.is_off() {
@@ -96,7 +99,9 @@ if opts.subpixel.is_off() {
 }
 ```
 
-so the conflict, when it comes, is one block and not a merge of two rasterizers.
+so the conflict, when it comes, is one block and not a merge of two rasterizers. Alpha is
+the minimum RGB coverage, not the maximum: premultiplied color glyphs never have a channel
+above alpha, so `max(rgb) > alpha` is the exact GPU/CPU sentinel for LCD coverage.
 
 ### 3. `egui_software`: the CPU painter
 
@@ -295,6 +300,32 @@ splitting. The context test proves egui no longer turns a sub-16 ms smoothing de
 and the winit test advances past an unconsumed trailing token to prove it cannot wedge later
 wheel reports. The tests are deterministic and do not sleep.
 
+### 15. `egui-wgpu` + software fallback: dual-source LCD text
+
+The WGPU extension consumes the atlas contract from divergence #2. It is opt-in by atlas
+contents and by device capability; with sub-pixel text off, or on a device without the
+feature, the ordinary pipeline remains selected.
+
+| File | Change | Why |
+| --- | --- | --- |
+| `crates/egui-wgpu/src/egui_lcd.wgsl` | **new** — dual-source fragment outputs, per-channel coverage blend, RGB/BGR swap, contrast curve, one-texel-per-pixel derivative/center test | A fixed-function GPU needs source color and per-channel source alpha separately; one scalar alpha cannot express LCD stripes |
+| `crates/egui-wgpu/src/renderer.rs` | second optional pipeline; `ONE / ONE_MINUS_SRC1`; managed-atlas sub-pixel state; pipeline selection only for `TextureId::default()`; renderer-level order/contrast uniform | Keep non-font textures, color glyphs and unsupported devices on the byte-identical ordinary path |
+| `crates/egui-wgpu/src/setup.rs` | request `DUAL_SOURCE_BLENDING` as `adapter.features() & DUAL_SOURCE_BLENDING` | Request only what the selected adapter advertises; never make device creation fail for an unsupported adapter |
+| `crates/egui-wgpu/src/winit.rs` | publish current `TextOptions` to the renderer each frame; expose whether the LCD pipeline exists | The renderer needs the atlas order and weight but must not guess them from colors |
+| `crates/egui_software/src/{raster.rs,texture.rs,lib.rs}` | transformed glyph triangles convert LCD texels to mean grayscale before filtering | Rotated/scaled/fractionally aligned software text must not smear color fringes |
+| `crates/egui_kittest/tests/subpixel_text.rs` | **new** — headless GPU color/BGR/transform coverage with explicit no-adapter skip | Detect shader/pipeline regressions when a suitable WGPU adapter is available |
+
+The GPU path carries the selected `TextOptions::text_contrast` and RGB/BGR order through a
+uniform. It deliberately does not claim to implement the software renderer's nonlinear
+destination gamma: fixed-function blending cannot read the destination. The software path
+keeps its full gamma/contrast model.
+
+**Coverage:** `egui-wgpu` unit tests cover feature detection/request, full/partial atlas
+state transitions, default-texture-only selection, transform mapping and order/contrast
+fields. `egui_software` covers grayscale conversion of LCD texels while leaving color
+glyphs unchanged. The `egui_kittest` test is not part of the shipped fork gate but is
+available as an explicit hardware check.
+
 ## Rebase runbook
 
 ```
@@ -360,10 +391,14 @@ After pulling:
 
 Things that are safe today but would silently break the sub-pixel path:
 
-- **Colour glyphs.** epaint 0.36.1 fills every glyph with `OpaqueColor::WHITE` — there is no
-  COLR/CBDT path, so every atlas texel is coverage. The day upstream adds colour glyphs, the
-  atlas needs a per-glyph "coverage vs colour" bit, because a colour glyph's RGB is not
-  per-channel coverage.
+- **Atlas alpha sentinel.** LCD texels use `alpha = min(rgb)`, which works because
+  premultiplied color glyphs never exceed alpha. A future color format that violates that
+  invariant needs a real per-texel coverage/color tag; do not infer LCD coverage from color
+  alone.
+- **WGPU pipeline selection.** The LCD pipeline must remain restricted to
+  `TextureId::default()`, a non-empty dual-source capability, the active sub-pixel mode and
+  an atlas state that actually contains LCD texels. Relaxing any one of those conditions
+  reinterprets ordinary textures or grayscale/color glyphs as coverage.
 - **`TextOptions` gaining fields upstream.** It is compared by value to decide atlas
   invalidation; a new field that we do not thread through means stale atlases.
 - **`epaint::Vertex` layout changes.** The software rasterizer reproduces the glow shader

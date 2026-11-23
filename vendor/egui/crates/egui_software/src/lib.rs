@@ -4,8 +4,9 @@
 //! driver, and no shader compiler. It exists for taskman, where two requirements meet:
 //!
 //! * **Sub-pixel (`ClearType`) text.** Per-channel glyph coverage needs per-channel alpha
-//!   blending. On a GPU that means dual-source blending, which egui's backends do not
-//!   have; on a CPU it is a per-channel multiply.
+//!   blending. On the CPU that is a per-channel multiply. The WGPU backend has a separate
+//!   dual-source font-atlas pipeline for the same atlas contract; transformed text falls
+//!   back to grayscale in both renderers.
 //! * **No GPU at all**, without falling back to a software *driver* like WARP or
 //!   lavapipe, which emulate a whole graphics stack and cost orders of magnitude more
 //!   than drawing a 2D UI needs to.
@@ -550,16 +551,16 @@ impl Painter {
                     // of its triangles draw through the general path.
                 }
 
-                raster::triangle(
-                    target,
-                    clip,
-                    [
-                        resolve(idx[0], true),
-                        resolve(idx[1], true),
-                        resolve(idx[2], true),
-                    ],
-                    Some(atlas),
-                );
+                let vertices = [
+                    resolve(idx[0], true),
+                    resolve(idx[1], true),
+                    resolve(idx[2], true),
+                ];
+                if !self.subpixel.is_off() && idx.iter().all(|i| glyphs.contains(i)) {
+                    raster::triangle_gray_lcd(target, clip, vertices, Some(atlas));
+                } else {
+                    raster::triangle(target, clip, vertices, Some(atlas));
+                }
             }
         }
 
@@ -629,12 +630,12 @@ impl Painter {
                 v: v.uv.y,
                 color: v.color,
             };
-            raster::triangle(
-                target,
-                clip,
-                [to_screen(va), to_screen(vb), to_screen(vc)],
-                sampler,
-            );
+            let vertices = [to_screen(va), to_screen(vb), to_screen(vc)];
+            if !self.subpixel.is_off() && mesh.texture_id == epaint::TextureId::default() {
+                raster::triangle_gray_lcd(target, clip, vertices, sampler);
+            } else {
+                raster::triangle(target, clip, vertices, sampler);
+            }
         }
     }
 }

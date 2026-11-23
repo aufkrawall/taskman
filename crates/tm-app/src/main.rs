@@ -560,11 +560,6 @@ fn run_gui(mock: bool, args: &[String]) {
         let app_settings = settings.clone();
         let start_hidden = initially_hidden;
         let native_activation = native_activation.clone();
-        #[cfg(feature = "software")]
-        let is_software = matches!(renderer, eframe::Renderer::Software);
-        #[cfg(not(feature = "software"))]
-        let is_software = false;
-
         let creator = move |cc: &eframe::CreationContext<'_>| {
             *tm_core::sync::lock(&ACTIVE_RENDER_MODE) = mode_for_renderer(renderer);
             StartupTrace::mark("creation_context_enter");
@@ -611,10 +606,25 @@ fn run_gui(mock: bool, args: &[String]) {
                 }
                 tm_platform::ensure_window_on_screen(hwnd);
             }
+            #[cfg(feature = "wgpu")]
+            let wgpu_dual_source = cc
+                .wgpu_render_state
+                .as_ref()
+                .is_some_and(|state| state.renderer.read().has_subpixel_pipeline());
+            #[cfg(not(feature = "wgpu"))]
+            let wgpu_dual_source = false;
+            let subpixel_capable = renderer_supports_subpixel(renderer, wgpu_dual_source);
+            tracing::debug!(
+                ?renderer,
+                wgpu_dual_source,
+                subpixel_capable,
+                "resolved sub-pixel text capability"
+            );
             theme::set_subpixel_capable(
-                is_software,
+                subpixel_capable,
                 tm_platform::text_rendering::query(creation_hwnd),
             );
+            StartupTrace::mark("subpixel_capability_resolved");
             theme::apply_startup(&cc.egui_ctx);
             fonts::install_async(cc.egui_ctx.clone());
             let application = app::TaskManApp::new(cc, use_mock, app_settings, initial_tab);
@@ -713,6 +723,21 @@ fn mode_for_renderer(renderer: eframe::Renderer) -> RenderMode {
         #[cfg(feature = "glow")]
         eframe::Renderer::Glow => RenderMode::OpenGl,
     }
+}
+
+/// Sub-pixel atlas coverage is only safe when the active backend can blend each channel
+/// independently. The software painter can; WGPU can only after its device actually
+/// enabled dual-source blending; Glow and unsupported WGPU fail closed to grayscale.
+fn renderer_supports_subpixel(renderer: eframe::Renderer, wgpu_dual_source: bool) -> bool {
+    #[cfg(feature = "software")]
+    if matches!(renderer, eframe::Renderer::Software) {
+        return true;
+    }
+    #[cfg(feature = "wgpu")]
+    if matches!(renderer, eframe::Renderer::Wgpu) {
+        return wgpu_dual_source;
+    }
+    false
 }
 
 /// Event loop initialization/execution errors belong to the display server
@@ -1971,6 +1996,22 @@ mod tests {
             assert_eq!(mode_for_renderer(list[0]), mode);
             assert_eq!(list, preferred_renderers(mode, Some("  ")));
         }
+    }
+
+    #[test]
+    fn renderer_capability_fails_closed_for_subpixel_text() {
+        #[cfg(feature = "software")]
+        assert!(renderer_supports_subpixel(
+            eframe::Renderer::Software,
+            false
+        ));
+        #[cfg(feature = "wgpu")]
+        {
+            assert!(renderer_supports_subpixel(eframe::Renderer::Wgpu, true));
+            assert!(!renderer_supports_subpixel(eframe::Renderer::Wgpu, false));
+        }
+        #[cfg(feature = "glow")]
+        assert!(!renderer_supports_subpixel(eframe::Renderer::Glow, true));
     }
 
     #[cfg(all(feature = "software", feature = "wgpu", feature = "glow"))]

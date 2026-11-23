@@ -13,6 +13,8 @@ pub mod xdg_icons;
 /// Shell-free parsing for the Run dialog and typed Linux helper arguments.
 #[cfg(any(target_os = "linux", test))]
 mod command_line;
+#[cfg(any(target_os = "linux", test))]
+mod fontconfig_text;
 /// Parsing and construction for a future protected Linux helper.
 #[cfg(any(target_os = "linux", test))]
 mod linux_action_support;
@@ -260,10 +262,28 @@ pub fn create_collector() -> Box<dyn tm_core::engine::SystemCollector> {
 /// Sub-pixel (`ClearType`) text-rendering parameters for the current display.
 ///
 /// Windows reports the user's font-smoothing choice and their per-monitor `cttune.exe`
-/// calibration; every other platform reports "off" for now. Sub-pixel rendering is only
-/// correct when our pixels map one-to-one onto the panel's, so this is a capability query
-/// rather than a preference -- see `win::text_rendering` for the gates it applies.
+/// calibration. Linux reads the desktop's effective fontconfig `antialias`, `rgba` and
+/// `lcdfilter` values. Other platforms report "off". Sub-pixel rendering is only correct
+/// when our pixels map one-to-one onto the panel's, so this is a capability query rather
+/// than a preference.
 pub mod text_rendering {
+    /// Which LCD FIR filter the desktop asked for.
+    ///
+    /// This mirrors fontconfig's `lcdfilter` values without making `tm-platform`
+    /// depend on epaint. `tm-ui` maps it to the fork's concrete filter tables.
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    pub enum LcdFilterChoice {
+        /// FreeType's default LCD filter.
+        #[default]
+        Default,
+        /// FreeType's light LCD filter.
+        Light,
+        /// The legacy ClearType-style filter.
+        Legacy,
+        /// No LCD filtering.
+        None,
+    }
+
     /// Plain data, deliberately free of any platform type so the renderer and the egui
     /// fork stay platform-independent.
     #[derive(Clone, Copy, Debug, PartialEq)]
@@ -273,6 +293,7 @@ pub mod text_rendering {
         pub gamma: f32,
         pub contrast: f32,
         pub cleartype_level: f32,
+        pub lcd_filter: LcdFilterChoice,
     }
 
     impl Default for Params {
@@ -283,6 +304,7 @@ pub mod text_rendering {
                 gamma: 1.8,
                 contrast: 0.5,
                 cleartype_level: 1.0,
+                lcd_filter: LcdFilterChoice::Default,
             }
         }
     }
@@ -311,69 +333,26 @@ pub mod text_rendering {
             gamma: p.gamma,
             contrast: p.contrast,
             cleartype_level: p.cleartype_level,
+            lcd_filter: LcdFilterChoice::Default,
         }
     }
 
-    /// Linux: follow fontconfig's `rgba` sub-pixel order.
+    /// Linux: follow the desktop's fontconfig text settings.
     ///
-    /// `fc-match -v` reports the desktop's declared stripe order as an integer:
-    /// 0 unknown, 1 rgb, 2 bgr, 3 vrgb, 4 vbgr, 5 none. Only the horizontal
-    /// orders can be rendered; everything else (including an absent property,
-    /// which is what a fractional-scaling compositor that resamples fringes
-    /// wants) stays grayscale. This is the same signal GTK/Qt consume.
+    /// `fc-match -v` reports the user's effective fontconfig values, including
+    /// per-user files and environment overrides. Only horizontal `rgba=rgb|bgr`
+    /// with antialiasing enabled can use per-channel coverage; unknown, vertical,
+    /// none and malformed values fail closed to grayscale. `lcdfilter` selects the
+    /// fork's matching FIR weights.
     #[cfg(target_os = "linux")]
     pub fn query(_hwnd: Option<isize>) -> Params {
-        fontconfig_subpixel()
+        crate::fontconfig_text::query()
     }
 
     /// Linux: the same fontconfig blend signal; safe before a window exists.
     #[cfg(target_os = "linux")]
     pub fn blend_params(_hwnd: Option<isize>) -> Params {
-        fontconfig_subpixel()
-    }
-
-    #[cfg(target_os = "linux")]
-    fn fontconfig_subpixel() -> Params {
-        let mut params = Params::default();
-        let Ok(out) = std::process::Command::new("fc-match")
-            .args(["-v", "sans-serif"])
-            .output()
-        else {
-            return params;
-        };
-        if !out.status.success() {
-            return params;
-        }
-        if let Some(order) = parse_fontconfig_rgba(&String::from_utf8_lossy(&out.stdout)) {
-            match order {
-                1 => {
-                    params.enabled = true;
-                    params.bgr = false;
-                }
-                2 => {
-                    params.enabled = true;
-                    params.bgr = true;
-                }
-                _ => {}
-            }
-        }
-        params
-    }
-
-    /// First `rgba:` value from `fc-match -v` output, if present.
-    #[cfg(any(target_os = "linux", test))]
-    fn parse_fontconfig_rgba(text: &str) -> Option<u8> {
-        for line in text.lines() {
-            let Some(rest) = line.strip_prefix("rgba:") else {
-                continue;
-            };
-            return rest
-                .trim()
-                .split(['(', ' '])
-                .next()
-                .and_then(|value| value.parse::<u8>().ok());
-        }
-        None
+        crate::fontconfig_text::query()
     }
 
     /// Other platforms: sub-pixel rendering is off.
@@ -390,20 +369,6 @@ pub mod text_rendering {
     #[cfg(not(any(target_os = "windows", target_os = "linux")))]
     pub fn blend_params(_hwnd: Option<isize>) -> Params {
         Params::default()
-    }
-
-    #[cfg(test)]
-    mod tests {
-        use super::parse_fontconfig_rgba;
-
-        #[test]
-        fn fontconfig_rgba_orders_map_to_subpixel_modes() {
-            assert_eq!(parse_fontconfig_rgba("rgba: 1(i)(w)\n"), Some(1));
-            assert_eq!(parse_fontconfig_rgba("rgba: 2(i)(w)\n"), Some(2));
-            assert_eq!(parse_fontconfig_rgba("rgba: 5(i)(w)\n"), Some(5));
-            assert_eq!(parse_fontconfig_rgba("antialias: True(w)\n"), None);
-            assert_eq!(parse_fontconfig_rgba(""), None);
-        }
     }
 }
 
