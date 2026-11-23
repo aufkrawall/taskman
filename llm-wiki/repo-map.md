@@ -1,6 +1,6 @@
 # Repo Map (code map)
 
-Last cross-checked: 2026-10-26
+Last cross-checked: 2026-11-23
 
 Primary sources:
 - workspace tree (verified against working tree)
@@ -183,8 +183,12 @@ platform boundary (`tm-core` ← `tm-platform` ← `tm-app` / `tm-service`), and
     collector uses `linux/x11_windows.rs` for one EWMH connection per sample:
     `_NET_CLIENT_LIST` and `_NET_CLIENT_LIST_STACKING` are merged, stale or
     non-viewable windows are skipped, and `_NET_WM_PID` yields owner PIDs for
-    App classification. Native Wayland clients remain unobservable; XWayland
-    clients are the available X11 subset.
+    App classification. `linux/activation.rs` adds a per-user advisory lock +
+    Unix-socket handoff checked before renderer creation; the primary listener
+    wakes the UI to show/restore/focus, and a timed-out or hostile owner leaves
+    the new launch independent. `linux/autostart.rs` writes/removes only its
+    marked, quoted `$XDG_CONFIG_HOME/autostart` entry. Native Wayland clients
+    remain unobservable; XWayland clients are the available X11 subset.
 - `crates/tm-app`
   - eframe GUI. `main.rs` (startup sequence: args → console only for CLI →
     early logging → hand a duplicate launch to the running instance → lazy

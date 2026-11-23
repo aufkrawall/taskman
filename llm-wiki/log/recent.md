@@ -1,3 +1,32 @@
+## 2026-11-23 - Linux single-instance activation and XDG autostart
+
+- Added `linux/activation.rs`: an owner-only runtime directory plus advisory
+  lock owns a mode-0600 Unix socket; accepted peers are checked with
+  `SO_PEERCRED`; activation messages and acknowledgements use a fixed,
+  nonce-bound protocol; stale sockets are removed only after a refused
+  connect; PID records are diagnostics only, never authority. A secondary
+  waits within a 3 s deadline and otherwise starts independently.
+- The primary listener is event-driven through `poll` plus an eventfd. Its
+  activation inbox wakes egui, applies show/unminimize/focus/attention on the
+  UI thread, and acknowledges after queuing those commands. Allocation and
+  engine construction still happen only for the process that will display a
+  window; a handed-off secondary exits before settings or renderer work.
+- Added `linux/autostart.rs` and capability-driven Linux Settings exposure.
+  The marked `$XDG_CONFIG_HOME/autostart/io.github.aufkrawall.Taskman.desktop`
+  entry is idempotent, hard-link/symlink/owner checked, rewritten only when
+  TaskMan-owned, and removed only when its marker still matches. `Exec` paths
+  use Exec-layer quoting followed by key-file escaping, with `%` doubled.
+  Hidden startup is omitted because Linux has no tray in this backend.
+- Static coverage added for private runtime-directory ownership/mode,
+  fallback creation, exact message parsing, stale live/refused sockets,
+  advisory-lock release, PID-reuse rejection, desktop-entry quoting,
+  idempotence, and foreign-file refusal. The task explicitly prohibited
+  compiling or running tests, so the gate is unrun; static diff/Git checks
+  and the documented secret-scan fallback are the only verification.
+- No X11 display-string parsing was added: activation is display-server
+  neutral, with focus handed to winit/egui only after the request crosses the
+  Unix-socket boundary.
+
 ## 2026-11-23 - Linux file-I/O honesty and process-tree parity
 
 - Split Linux procfs action handling into `linux/process_io.rs` and

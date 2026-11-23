@@ -757,6 +757,10 @@ keys! {
         "Mit Windows im Infobereich starten",
         "Start with Windows in the notification area"
     ],
+    StartWithSystem => [
+        "Mit dem System starten",
+        "Start with the system"
+    ],
     SaveConfigAuto => [
         "Einstellungen automatisch in config.ini speichern",
         "Save settings automatically to config.ini"

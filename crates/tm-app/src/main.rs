@@ -294,6 +294,34 @@ fn run_gui(mock: bool, args: &[String]) {
         return;
     }
 
+    // Detect and hand off to an existing Linux instance before settings,
+    // locale, or renderer initialization. A wedged owner is not killed and
+    // cannot make this launch fail: the handoff deadline exits as an ordinary
+    // uncoordinated GUI process instead.
+    #[cfg(target_os = "linux")]
+    let (_linux_activation_owner, native_activation) = if mock {
+        (None, NativeActivation::default())
+    } else {
+        match tm_platform::linux::activation::acquire() {
+            tm_platform::linux::activation::ActivationAcquisition::HandedOff => {
+                tracing::info!("handed this launch to the running Linux instance");
+                return;
+            }
+            tm_platform::linux::activation::ActivationAcquisition::Primary { owner, inbox } => (
+                Some(owner),
+                NativeActivation { inbox: Some(inbox) },
+            ),
+            tm_platform::linux::activation::ActivationAcquisition::Uncoordinated { detail } => {
+                tracing::warn!(%detail, "starting without Linux single-instance coordination");
+                (None, NativeActivation::default())
+            }
+        }
+    };
+    #[cfg(target_os = "linux")]
+    StartupTrace::mark("linux_instance_acquired");
+    #[cfg(not(target_os = "linux"))]
+    let native_activation = NativeActivation::default();
+
     tm_core::locale::init(tm_platform::detect_locale());
 
     // A genuinely fresh install gets a roomier first window. Existing users
@@ -521,6 +549,7 @@ fn run_gui(mock: bool, args: &[String]) {
         let initial_tab = initial_tab_arg.clone();
         let app_settings = settings.clone();
         let start_hidden = initially_hidden;
+        let native_activation = native_activation.clone();
         #[cfg(feature = "software")]
         let is_software = matches!(renderer, eframe::Renderer::Software);
         #[cfg(not(feature = "software"))]
@@ -580,8 +609,12 @@ fn run_gui(mock: bool, args: &[String]) {
             fonts::install_async(cc.egui_ctx.clone());
             let application = app::TaskManApp::new(cc, use_mock, app_settings, initial_tab);
             Ok(
-                Box::new(NativeApp::new(application, &cc.egui_ctx, start_hidden))
-                    as Box<dyn eframe::App>,
+                Box::new(NativeApp::new(
+                    application,
+                    &cc.egui_ctx,
+                    start_hidden,
+                    native_activation,
+                )) as Box<dyn eframe::App>,
             )
         };
         let opts = options(renderer);
@@ -841,11 +874,59 @@ const RESTORE_MAX_TICKS: u8 = 8;
 #[cfg(target_os = "windows")]
 const RESTORE_ACK_DEADLINE: std::time::Duration = std::time::Duration::from_secs(2);
 
+/// Platform-neutral holder for a native instance-activation channel.
+#[derive(Clone, Default)]
+struct NativeActivation {
+    #[cfg(target_os = "linux")]
+    inbox: Option<tm_platform::linux::activation::ActivationInbox>,
+}
+
+impl NativeActivation {
+    fn install_waker(&self, ctx: &eframe::egui::Context) {
+        #[cfg(target_os = "linux")]
+        if let Some(inbox) = &self.inbox {
+            let ctx = ctx.clone();
+            inbox.install_waker(move || ctx.request_repaint());
+        }
+        #[cfg(not(target_os = "linux"))]
+        let _ = ctx;
+    }
+
+    /// Apply every queued activation on the UI thread. The acknowledgement is
+    /// sent only after show/unminimize/focus commands have been queued.
+    fn apply_pending(&self, ctx: &eframe::egui::Context) -> bool {
+        #[cfg(target_os = "linux")]
+        {
+            let mut applied = false;
+            if let Some(inbox) = &self.inbox {
+                while let Some(request) = inbox.try_recv() {
+                    ctx.send_viewport_cmd(eframe::egui::ViewportCommand::Visible(true));
+                    ctx.send_viewport_cmd(eframe::egui::ViewportCommand::Minimized(false));
+                    ctx.send_viewport_cmd(eframe::egui::ViewportCommand::Focus);
+                    ctx.send_viewport_cmd(eframe::egui::ViewportCommand::RequestUserAttention(
+                        eframe::egui::UserAttentionType::Critical,
+                    ));
+                    tracing::info!("applied Linux activation request on the UI thread");
+                    request.acknowledge();
+                    applied = true;
+                }
+            }
+            applied
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = ctx;
+            false
+        }
+    }
+}
+
 /// Thin native-shell wrapper. TaskManApp already owns all UI/application
 /// state; this layer only records the viewport's desktop-space position and
 /// delegates every application hook unchanged.
 struct NativeApp {
     inner: app::TaskManApp,
+    activation: NativeActivation,
     #[cfg(target_os = "windows")]
     tray: Option<TrayShell>,
     #[cfg(target_os = "windows")]
@@ -888,7 +969,13 @@ struct NativeApp {
 }
 
 impl NativeApp {
-    fn new(inner: app::TaskManApp, ctx: &eframe::egui::Context, initially_hidden: bool) -> Self {
+    fn new(
+        inner: app::TaskManApp,
+        ctx: &eframe::egui::Context,
+        initially_hidden: bool,
+        activation: NativeActivation,
+    ) -> Self {
+        activation.install_waker(ctx);
         #[cfg(target_os = "windows")]
         {
             // The single-instance show event needs a repaint target even when
@@ -905,10 +992,11 @@ impl NativeApp {
         } else {
             None
         };
-        #[cfg(not(target_os = "windows"))]
+        #[cfg(not(any(target_os = "windows", target_os = "linux")))]
         let _ = ctx;
         Self {
             inner,
+            activation,
             #[cfg(target_os = "windows")]
             tray,
             #[cfg(target_os = "windows")]
@@ -952,6 +1040,10 @@ impl NativeApp {
 
 impl eframe::App for NativeApp {
     fn logic(&mut self, ctx: &eframe::egui::Context, frame: &mut eframe::Frame) {
+        if self.activation.apply_pending(ctx) {
+            self.hidden_to_tray = false;
+            self.initial_hide_pending = false;
+        }
         #[cfg(target_os = "windows")]
         if self.hwnd.is_none() {
             let published = tm_platform::win::instance::published_window();

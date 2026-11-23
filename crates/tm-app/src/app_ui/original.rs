@@ -1434,26 +1434,6 @@ pub fn settings_dialog(app: &mut TaskManApp, ctx: &egui::Context, _pal: &theme::
                     app.save_settings();
                 }
 
-                let mut start_with_windows = app.shared.settings.start_with_windows;
-                if crate::widgets::controls::checkbox(
-                    ui,
-                    &mut start_with_windows,
-                    i18n::tr(K::StartWithWindows),
-                    _pal,
-                )
-                .changed()
-                {
-                    match app.actions.set_start_with_windows(start_with_windows, true) {
-                        Ok(()) => {
-                            app.shared.settings.start_with_windows = start_with_windows;
-                            app.save_settings();
-                        }
-                        Err(error) => app
-                            .shared
-                            .toast(i18n::trf(K::ErrMsg, &[&error.to_string()])),
-                    }
-                }
-
                 // Opt-in for the SSID/signal rows. OFF means the
                 // location-gated WLAN query is never called at all — no
                 // Windows location permission prompt, no "location in use"
@@ -1478,6 +1458,36 @@ pub fn settings_dialog(app: &mut TaskManApp, ctx: &egui::Context, _pal: &theme::
                         .size(11.0)
                         .color(_pal.text_dim),
                 );
+            }
+
+            if app.actions.capabilities().start_with_windows {
+                let mut start_with_windows = app.shared.settings.start_with_windows;
+                let label = if cfg!(target_os = "windows") {
+                    K::StartWithWindows
+                } else {
+                    K::StartWithSystem
+                };
+                if crate::widgets::controls::checkbox(
+                    ui,
+                    &mut start_with_windows,
+                    i18n::tr(label),
+                    _pal,
+                )
+                .changed()
+                {
+                    match app
+                        .actions
+                        .set_start_with_windows(start_with_windows, cfg!(target_os = "windows"))
+                    {
+                        Ok(()) => {
+                            app.shared.settings.start_with_windows = start_with_windows;
+                            app.save_settings();
+                        }
+                        Err(error) => app
+                            .shared
+                            .toast(i18n::trf(K::ErrMsg, &[&error.to_string()])),
+                    }
+                }
             }
 
             ui.add_space(10.0);
@@ -1903,13 +1913,16 @@ pub fn settings_dialog(app: &mut TaskManApp, ctx: &egui::Context, _pal: &theme::
                     app.shared.toast(i18n::tr(K::ColWidthsResetToast));
                 }
                 if ui.button(i18n::tr(K::Reset)).clicked() {
-                    #[cfg_attr(not(target_os = "windows"), allow(unused_mut))]
                     let mut defaults = Settings::default();
-                    #[cfg(target_os = "windows")]
-                    if let Err(error) = app.actions.set_start_with_windows(false, true) {
-                        // The registry is authoritative for autostart. If it
-                        // could not be cleared, keep the matching setting and
-                        // surface the mismatch instead of claiming a reset.
+                    if app.actions.capabilities().start_with_windows
+                        && let Err(error) = app
+                            .actions
+                            .set_start_with_windows(false, cfg!(target_os = "windows"))
+                    {
+                        // The OS integration is authoritative for autostart.
+                        // If it could not be cleared, keep the matching
+                        // setting and surface the mismatch instead of claiming
+                        // a reset.
                         defaults.start_with_windows = app.shared.settings.start_with_windows;
                         app.shared
                             .toast(i18n::trf(K::ErrMsg, &[&error.to_string()]));

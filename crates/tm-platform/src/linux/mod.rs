@@ -1,5 +1,7 @@
 //! Linux backend: sysinfo + procfs/sysfs + systemd + XDG autostart + X11/EWMH.
 
+pub mod activation;
+mod autostart;
 mod diskstats;
 mod process_connections;
 mod process_io;
@@ -826,7 +828,7 @@ impl PlatformActions for LinuxActions {
             process_connections: true,
             process_file_io: true,
             unload_module: false,
-            start_with_windows: false,
+            start_with_windows: autostart::supported(),
         }
     }
 
@@ -841,6 +843,14 @@ impl PlatformActions for LinuxActions {
     }
     fn set_startup_enabled(&self, item_id: &str, _location: &str, enabled: bool) -> Result<()> {
         startup::set_enabled(item_id, enabled)
+    }
+    fn set_start_with_windows(&self, enabled: bool, start_minimized: bool) -> Result<()> {
+        if start_minimized {
+            tracing::debug!(
+                "Linux XDG autostart has no supported hidden-start mode; starting visibly"
+            );
+        }
+        autostart::set_enabled(enabled)
     }
 
     fn kill_single(&self, pid: u32) -> Result<()> {
@@ -1233,6 +1243,11 @@ mod tests {
         assert!(capabilities.process_connections);
         assert!(capabilities.end_process_tree);
         assert!(!capabilities.unload_module);
+        assert_eq!(
+            capabilities.start_with_windows,
+            autostart::supported(),
+            "Settings exposes Linux autostart only when an absolute XDG config home and executable are usable"
+        );
     }
 
     #[test]

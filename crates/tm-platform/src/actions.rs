@@ -660,8 +660,13 @@ pub trait PlatformActions: Send + Sync {
     fn repair_task_manager_replacement(&self) -> Result<bool> {
         Ok(false)
     }
+    /// Enable or disable the per-user OS startup registration.
+    ///
+    /// `start_minimized` is only a request for a genuinely supported hidden
+    /// startup path (currently the Windows notification-area launch); callers
+    /// must pass `false` where the platform cannot honor it.
     fn set_start_with_windows(&self, _enabled: bool, _start_minimized: bool) -> Result<()> {
-        Err(tm_core::TmError::Unsupported("start with Windows"))
+        Err(tm_core::TmError::Unsupported("start with system"))
     }
     fn core_service_state(&self) -> CoreServiceState {
         CoreServiceState::Unsupported

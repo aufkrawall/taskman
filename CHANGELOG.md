@@ -4,6 +4,8 @@
 
 ### New
 
+- **Linux single-instance activation and start with the system:** a second Linux launch now asks the running process to show, restore and focus its window, then exits. Coordination uses an owner-only runtime lock and Unix socket with same-user peer checks, a strict non-executable activation message, stale-socket cleanup and a bounded handoff; a wedged owner cannot prevent a new window from opening. Settings now offers a capability-driven **Start with the system** option backed by a self-owned, safely quoted XDG autostart entry that can be disabled idempotently without touching unrelated desktop files. The entry starts visibly because this Linux build has no tray/hidden-start support.
+
 - **Linux process inspection:** Process Properties now lists loaded file mappings, per-thread scheduler and CPU evidence, and TCP/UDP endpoints from procfs on Linux. PID/TID generation and network-namespace changes are rejected rather than mixing snapshots; socket reuse is filtered across before/after handle walks; malformed rows are omitted instead of rendered as listeners; and missing switch/cycle evidence remains unknown rather than becoming “Idle”. The module inventory is read-only, and data that procfs cannot provide remains unavailable rather than being fabricated.
 
 ### Fixed
