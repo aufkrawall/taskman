@@ -9,7 +9,7 @@ use tm_core::model::{StartupImpact, StartupItem};
 
 const TASKMAN_OVERRIDE_KEY: &str = "X-Taskman-Override=true";
 
-fn config_home() -> Option<PathBuf> {
+pub(super) fn config_home() -> Option<PathBuf> {
     std::env::var("XDG_CONFIG_HOME")
         .ok()
         .filter(|s| !s.is_empty())

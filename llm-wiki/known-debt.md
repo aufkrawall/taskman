@@ -435,6 +435,36 @@ remain follow-up rather than being simulated in headless tests:
   would need the existing strict-topmost hooks; not done without a desktop
   repro.
 
+### 2026-11-23 Linux activation/autostart residuals
+
+- **Linux activation focus is best-effort.** The primary queues
+  `Visible(true)`, `Minimized(false)`, `Focus`, and a critical attention
+  request on its UI thread; the secondary exits once that UI work is
+  acknowledged, not after compositor confirmation. X11 normally honors focus;
+  Wayland compositors may reject programmatic focus and may present only an
+  attention hint. There is no portable stronger mechanism, and adding an
+  X11-only EWMH path was not attempted.
+- **The coordinator is per `XDG_RUNTIME_DIR`, not per graphical seat.** Two
+  simultaneous graphical sessions for the same Unix user can therefore share
+  one activation endpoint. The owner-only directory and same-UID
+  `SO_PEERCRED` check prevent cross-user access, but no display/seat parsing
+  is performed.
+- **A degraded independent window does not usurp a wedged lock owner.** It
+  opens normally, but later launches continue probing the old owner until its
+  own handoff deadline expires. The lock is deliberately not force-reclaimed;
+  the remedy is to terminate the wedged owner or let it exit.
+- **Linux autostart starts visibly.** This backend has no tray implementation
+  or supported hidden-start mode, so Settings passes `start_minimized=false`
+  and the desktop entry omits `--minimized-to-tray`. Adding a tray needs
+  desktop-shell/system-package assumptions that are intentionally out of
+  scope.
+- **The autostart entry pins the current executable path.** Moving an
+  unpacked binary after enabling startup leaves the old `Exec` until the user
+  toggles the setting again. Startup does not silently rewrite the entry,
+  because the Startup page can deliberately set `Hidden=true` on the same
+  file and a later launch must not undo that choice. For the same reason, a
+  Startup-page toggle of that file does not update the Settings checkbox.
+
 ## Row/total audit leftovers (2026-10-21)
 
 Found by the 2026-10-21 row-vs-total audit and deliberately not changed:

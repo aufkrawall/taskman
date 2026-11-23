@@ -1,6 +1,6 @@
 # Repo Map (code map)
 
-Last cross-checked: 2026-11-23 (Linux action modules)
+Last cross-checked: 2026-11-23 (Linux action, lifecycle, and evidence modules)
 
 Primary sources:
 - workspace tree (verified against working tree)
@@ -195,6 +195,11 @@ platform boundary (`tm-core` ← `tm-platform` ← `tm-app` / `tm-service`), and
     `linux/shell.rs` (`xdg-open` file/location/URL actions), plus the
     platform-neutral `linux_action_support.rs` parser/security contract and
     `command_line.rs` shell-free Run tokenizer.
+    `linux/activation.rs` adds a per-user advisory lock and Unix-socket handoff
+    checked before renderer creation; the primary listener wakes the UI to
+    show/restore/focus, and a timed-out or hostile owner leaves the new launch
+    independent. `linux/autostart.rs` writes/removes only its marked, quoted
+    `$XDG_CONFIG_HOME/autostart` entry.
 - `crates/tm-app`
   - eframe GUI. `main.rs` (startup sequence: args → console only for CLI →
     early logging → hand a duplicate launch to the running instance → lazy

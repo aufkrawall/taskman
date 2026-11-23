@@ -778,6 +778,10 @@ keys! {
         "Bei der Systemanmeldung starten",
         "Start at system login"
     ],
+    StartWithSystem => [
+        "Mit dem System starten",
+        "Start with the system"
+    ],
     SaveConfigAuto => [
         "Einstellungen automatisch in config.ini speichern",
         "Save settings automatically to config.ini"

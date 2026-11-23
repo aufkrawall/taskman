@@ -1,5 +1,7 @@
 //! Linux backend: sysinfo + procfs/sysfs + systemd + XDG autostart + X11/EWMH.
 
+pub mod activation;
+mod autostart;
 mod cpu_stat;
 mod diskstats;
 mod drm;
@@ -750,7 +752,7 @@ impl PlatformActions for LinuxActions {
             process_connections: true,
             process_file_io: true,
             unload_module: false,
-            start_with_system: false,
+            start_with_system: autostart::supported(),
             elevation_status: true,
             relaunch_elevated: false,
             start_elevated: false,
@@ -778,6 +780,14 @@ impl PlatformActions for LinuxActions {
     }
     fn list_user_sessions(&self) -> Result<Vec<UserSession>> {
         sessions::list_sessions()
+    }
+    fn set_start_with_system(&self, enabled: bool, start_minimized: bool) -> Result<()> {
+        if enabled && start_minimized {
+            tracing::debug!(
+                "Linux XDG autostart has no supported hidden-start mode; starting visibly"
+            );
+        }
+        autostart::set_enabled(enabled)
     }
 
     fn kill_single(&self, pid: u32) -> Result<()> {
@@ -1287,7 +1297,7 @@ mod tests {
         assert!(capabilities.elevation_status);
         assert!(!capabilities.relaunch_elevated);
         assert!(!capabilities.start_elevated);
-        assert!(!capabilities.start_with_system);
+        assert_eq!(capabilities.start_with_system, autostart::supported());
         assert!(!capabilities.open_services_app);
         assert!(!capabilities.manage_user_accounts);
     }
