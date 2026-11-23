@@ -23,31 +23,54 @@ process actions and GUI relaunch fail closed until a protected helper exists.
 - **D3D12/Vulkan now have their own LCD font path.** The vendored `egui-wgpu` renderer
   creates a second pipeline with dual-source blending only when the selected device
   actually enabled `DUAL_SOURCE_BLENDING`. It draws only `TextureId::default()` while the
-  managed atlas contains the alpha-min sub-pixel sentinel and the active mode is non-off.
-  Grayscale/color glyphs keep the ordinary shader arithmetic, every non-font texture stays
-  on the existing pipeline, and Glow or an unsupported WGPU device stays grayscale.
-- **The atlas contract is now self-identifying.** LCD texels store `(cov_r, cov_g, cov_b,
-  min(cov))`; premultiplied color glyphs cannot exceed alpha. Full atlas replacements
-  recompute the state, partial glyph additions retain or set it, and BGR is a blend-time
-  swap rather than a second rasterization.
+  managed atlas contains the LCD tag and the active mode is non-off. All-`WHITE_UV` solid
+  geometry stays on the ordinary pipeline. Grayscale/color glyphs keep the ordinary shader
+  arithmetic, every non-font texture stays on the existing pipeline, and Glow or an
+  unsupported WGPU device stays grayscale. Device shader/pipeline validation is bounded;
+  failure drops only the LCD pipeline and leaves renderer capability false.
+- **The atlas contract is now self-identifying.** Every non-empty LCD texel stores
+  `(cov_r, cov_g, cov_b, 0)`: neutral, tinted and full coverage share the explicit
+  zero-alpha tag, zero coverage stays `(0,0,0,0)`, and premultiplied color glyphs retain
+  non-zero alpha. Full atlas replacements recompute the state, partial additions short-
+  circuit once true, and BGR is a blend-time swap rather than a second rasterization.
+- **Neutral LCD coverage receives contrast.** The previous alpha-min encoding made neutral
+  `(c,c,c,c)` look grayscale and skip WGPU's LCD curve. Software direct blits now route
+  each texel independently: LCD tags use per-channel coverage, ordinary grayscale/color
+  texels use the normal blend. Transformed software text and GPU fallback recover mean
+  coverage from RGB.
 - **Transform fallback is explicit.** WGPU checks texture derivatives and texel-center
   alignment; rotated, scaled or fractional glyphs render through the grayscale path.
   Software transformed text converts LCD texels to mean coverage before triangle sampling.
 - **Capability is wired after window/device creation.** `tm-app` enables the theme
   interlock for the software renderer and for a WGPU renderer whose LCD pipeline exists;
   unsupported WGPU and Glow set it false. `TASKMAN_SUBPIXEL=1` still cannot override that.
+- **Monitor moves refresh policy without recreating the renderer.** Windows tracks the
+  window rectangle, current monitor identity/rectangle and effective DPI. A change queries
+  every monitor intersecting the window; agreement updates only theme parameters, while
+  an unavailable query, malformed parameters or conflicting monitor policies disable LCD
+  for that window. Moving back to a complete agreement re-enables it.
+  `TASKMAN_SUBPIXEL=0` still forces off.
 - **WGPU contrast is honored; destination gamma is not claimed.** RGB/BGR and
   `TextOptions::text_contrast` travel through the renderer uniform. Fixed-function
   dual-source blending cannot read the framebuffer, so the nonlinear software
-  destination-gamma term remains a documented GPU limitation.
+  destination-gamma term remains a documented GPU limitation. The `Locals` uniform is
+  explicitly padded to 32 bytes, and Naga parse+validation covers both fragment paths in
+  the normal `egui-wgpu` suite.
 - **Linux uses the desktop's effective fontconfig policy.** A cached startup query reads
   horizontal `rgba`, `antialias` and `lcdfilter` through a trusted absolute `fc-match`
   path while inheriting the user's KDE/GNOME fontconfig environment. `rgb`/`bgr` enable
   ClearType-like text; disabled antialiasing, unknown/vertical/none orders and malformed
-  output fail closed. Default/light/legacy/none map to the fork's filter presets.
+  output fail closed. Default/light/legacy/none map to the fork's filter presets. System
+  font lookup uses the same canonical absolute executable and root-owned parent policy;
+  one 750 ms deadline caps output at 64 KiB and timed-out children are killed and reaped.
+  Linux still has one process-wide fontconfig policy; there is no per-monitor signal.
+- **GPU execution remains manual.** The hardware `egui_kittest` tests are ignored unless
+  `TASKMAN_RUN_GPU_SUBPIXEL_TESTS=1`, and they fail if no non-CPU D3D12/Vulkan
+  dual-source adapter is present. They are not portable CI coverage.
 - **Unverified in this pass:** compilation, tests and a real GPU/window were explicitly
-  prohibited. The source and test inventory is complete, but D3D12/Vulkan shader validity
-  and visual quality still require the normal gates and a hardware smoke run.
+  prohibited. Naga validation, normal gates, D3D12/Vulkan shader execution and visual
+  quality all remain unrun; release verification needs the normal gates plus the manual
+  hardware suite.
 
 ## Row/total consistency (2026-10-21)
 

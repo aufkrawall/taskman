@@ -66,12 +66,12 @@ through the chart area fills) or neither does (a crack). `widgets/chart.rs`'s
 
 **A sub-pixel atlas is a contract, not a setting.** With `SubpixelMode::Off` a texel is
 `(c, c, c, c)` and any backend can multiply it by the text colour. With sub-pixel coverage
-it is `(cov_r, cov_g, cov_b, min(cov_r, cov_g, cov_b))`, meaningful only to a renderer
-that blends each channel against its own coverage. The alpha-min sentinel is what
-distinguishes coverage from premultiplied color glyphs: a color texel never has a channel
-above alpha, while an LCD edge usually does. Neutral LCD texels (`r == g == b == a`) need
-no special blend because the ordinary and per-channel formulas agree. These interlocks
-enforce the contract:
+every non-empty texel is `(cov_r, cov_g, cov_b, 0)`, meaningful only to a renderer that
+blends each channel against its own coverage. Alpha is an explicit tag, never coverage:
+neutral `(c,c,c,0)`, tinted `(r,g,b,0)` and full `(255,255,255,0)` coverage are equally
+identifiable. Zero coverage is `(0,0,0,0)` and draws nothing; premultiplied color glyphs
+keep non-zero alpha. Transformed text and GPU fallback recover mean coverage from RGB and
+rebuild premultiplied grayscale alpha. These interlocks enforce the contract:
 
 - `theme.rs` gates the mode on the active renderer capability. Software is always capable;
   WGPU is capable only when its device actually enabled `DUAL_SOURCE_BLENDING`; Glow and
@@ -80,9 +80,11 @@ enforce the contract:
   (`fonts.options().subpixel`), not from an independent style copy, so blend order and
   rasterization order agree.
 - `egui-wgpu` tracks both the active mode and whether the managed font texture actually
-  contains sub-pixel texels. The LCD pipeline is selected only for
-  `TextureId::default()` with that state true. A full atlas replacement recomputes the
-  state; a partial glyph addition retains it or turns it on.
+  contains the zero-alpha LCD tag. The LCD pipeline is selected only for
+  `TextureId::default()` when the state is true **and** the mesh is not all `WHITE_UV`;
+  solid untextured geometry therefore stays on the ordinary pipeline. A full atlas
+  replacement recomputes the state; after the state is true, partial updates short-circuit
+  without rescanning unrelated glyph uploads.
 
 **Transformed text falls back to grayscale.** The WGPU shader checks the texture-coordinate
 derivatives and the sampled texel center. Rotated, scaled or fractionally translated glyphs
@@ -90,6 +92,25 @@ do not map one source texel to one display pixel, so they average RGB coverage a
 ordinary grayscale blend. The software renderer applies the same policy: its triangle path
 converts LCD texels to mean coverage before filtering. This is intentional weight loss,
 not a failure to find a better sampler; preserving the fringes would be visibly wrong.
+
+The software direct 1:1 blitter decides per texel: tagged LCD texels use per-channel
+coverage, while grayscale and premultiplied color glyphs in the same atlas use the ordinary
+blend. A mixed-atlas regression pins that distinction.
+
+**Windows monitor policy follows the window without recreating the renderer.**
+`NativeApp` keeps a cheap placement key (window rectangle, current monitor handle and
+rectangle, effective DPI). A same-sized move, monitor topology change or DPI change runs a
+fresh DirectWrite query for every monitor intersecting the window rectangle.
+
+- All intersecting monitors agreeing updates only the theme blend parameters. `SUBPIXEL_CAPABLE`
+  is preserved; the next WGPU frame uploads the new order/contrast from `TextOptions`.
+- Any unavailable DirectWrite query, disagreement in validated parameters or RGB/BGR order,
+  or malformed parameter set disables LCD for the whole window/viewport. Choosing one half
+  of a straddling window or assuming RGB after a failed query is never allowed.
+- Moving back to agreement re-enables LCD without restarting the process or renderer.
+- `TASKMAN_SUBPIXEL=0` remains an unconditional off switch. `TASKMAN_SUBPIXEL=1` is an A/B
+  request only; it cannot override unsupported channels, a renderer without the capability,
+  or a fail-closed monitor policy.
 
 **On Windows the presentation path is ours, not softbuffer's.** `platform_surface` in
 `software_integration.rs` owns a `CreateCompatibleDC` + top-down 32-bpp `CreateDIBSection`
@@ -154,6 +175,17 @@ creates the LCD pipeline only when the resulting device feature is present. A cu
 device descriptor or an existing device that did not request the feature therefore fails
 closed.
 
+Before device shader creation, the combined WGSL is parsed and validated with Naga on the
+CPU. The same test runs in the normal `egui-wgpu` suite and covers both linear- and
+gamma-framebuffer fragment entry points, the extension declaration, `@blend_src` interface
+and derivative use. Device shader/pipeline validation then runs inside a validation error
+scope with a bounded 250 ms resolution wait. Any parse, shader or pipeline failure logs,
+drops only `lcd_pipeline`, retains the ordinary pipeline and leaves
+`has_subpixel_pipeline()` false. It cannot panic or block startup indefinitely.
+HLSL/SPIR-V generation is deliberately not part of that CPU test: it would require
+enabling additional Naga backend features in the vendored workspace, and it does not
+replace the required per-driver pipeline run.
+
 For the managed atlas, `egui_lcd.wgsl` emits source color at location 0 / source 0 and
 per-channel coverage at location 0 / source 1. The pipeline blends `ONE` against
 `ONE_MINUS_SRC1`, so RGB each use their own coverage. BGR is a blend-time channel swap;
@@ -217,7 +249,11 @@ Enabling it where it is not valid looks *worse* than grayscale, so it is gated o
 Linux `fc-match` is resolved from absolute root-owned system locations rather than
 `PATH`, but it inherits the user's environment and reads the effective per-user KDE/GNOME
 fontconfig files. The result is cached process-wide; no frame spawns `fc-match`.
-`lcdfilter` maps to FreeType default, light, legacy/classic and none.
+`lcdfilter` maps to FreeType default, light, legacy/classic and none. The system-font lookup
+uses the same canonical absolute executable and parent-directory policy as the policy
+query. One 750 ms absolute deadline covers process output, which is capped at 64 KiB; a
+timed-out or oversized helper is killed and reaped, and every failure returns unavailable
+grayscale rather than the user's `PATH` or an invented policy.
 
 ## Verification
 
@@ -238,19 +274,27 @@ Everything below is headless; none of it opens a window.
   bit-identical.
 - `cargo test -p egui-wgpu` — pure coverage for feature detection/request policy, atlas
   full/partial state transitions, managed-texture-only pipeline selection, transform
-  fallback policy and RGB/BGR/contrast uniform fields.
+  fallback policy, all-white untextured exclusion, RGB/BGR/contrast uniform fields, the
+  32-byte uniform layout, and Naga parse/validation of both LCD fragment entry points.
 - `cargo test -p tm-platform` — fontconfig parser policy for RGB/BGR, unknown/vertical/none,
-  antialias false, malformed output, lcd filter mapping and trusted program metadata.
-- `cargo test -p egui_kittest --features wgpu --test subpixel_text` — headless dual-source
-  render coverage. It prints an explicit SKIP and returns only when no adapter supports the
-  feature; it does not report a pass for an absent GPU.
+  antialias false, malformed output, lcd filter mapping, trusted program/parent metadata,
+  absolute font-file policy, bounded output and timeout kill/reap. Windows tests cover
+  placement-key changes and conflicting-monitor fail-closed policy.
+- **Manual GPU path:** `TASKMAN_RUN_GPU_SUBPIXEL_TESTS=1 cargo test -p egui_kittest
+  --features wgpu --test subpixel_text -- --ignored --test-threads=1`. The tests are
+  ignored by default and fail if the opt-in variable or a non-CPU D3D12/Vulkan dual-source
+  adapter is missing. They cover plain/off-grid text, BGR, neutral/tinted contrast,
+  opaque/translucent and colored text, hardware filtering, dithering and the sRGB
+  framebuffer entry point. This is manual hardware coverage, not portable CI coverage.
 - `TASKMAN_RENDER_SNAPSHOT=target/frame.png cargo test -p tm-app write_cpu_frame_snapshot`
   writes the frame, and a `-cleartype` variant beside it, to look at.
 
-**Unrun in the 2026-11-23 GPU-LCD implementation pass:** the task explicitly prohibited
-compiling, running tests or building. The new tests and shader are source-reviewed only;
-the D3D12/Vulkan visual path still needs a real GPU run. Opening a real window remains the
-one thing headless tests cannot cover.
+**Unrun in the 2026-11-23 GPU-LCD correction pass:** the task explicitly prohibited
+compiling, running tests or building. The new Naga test is normal deterministic CPU
+coverage once the suite is run, but it was not executed in this pass. The D3D12/Vulkan
+visual path still needs the manual hardware suite and a real window. Current epaint has no
+color-glyph source, so hardware color-glyph coverage is not practical; the software and
+renderer-policy tests cover synthetic premultiplied color texels.
 
 ## Still open
 
@@ -272,6 +316,9 @@ one thing headless tests cannot cover.
   conservatively by the transformed-glyph fallback, but a compositor that resamples an
   otherwise 1:1 surface remains a deployment risk rather than something fontconfig can
   prove.
+- **GPU hardware validation is manual.** The normal CPU-side Naga test proves WGSL syntax
+  and module validity but not per-driver dual-source blend behavior. Release verification
+  must run the ignored `egui_kittest` suite on D3D12 and Vulkan hardware.
 - **Performance work.** The rasterizer and application loops are optimized for low CPU load:
   - Axis-aligned rect fast path (`span::fast_rect` with `Shape::Vec` recursive flattening for containers).
   - Uniform untextured triangle fast paths (opaque and translucent) with single-branch edge testing.

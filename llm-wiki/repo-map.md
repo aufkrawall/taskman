@@ -224,8 +224,10 @@ platform boundary (`tm-core` ← `tm-platform` ← `tm-app` / `tm-service`), and
     show/restore/focus, and a timed-out or hostile owner leaves the new launch
     independent. `linux/autostart.rs` writes/removes only its marked, quoted
     `$XDG_CONFIG_HOME/autostart` entry. `fontconfig_text.rs` is the shared
-    root-level Linux text query: cached `fc-match -v`, trusted absolute binary
-    resolution, and strict `antialias`/horizontal-`rgba`/`lcdfilter` parsing.
+    root-level Linux Fontconfig process layer: cached `fc-match -v`, canonical
+    trusted absolute executable and parent-directory validation, strict
+    `antialias`/horizontal-`rgba`/`lcdfilter` parsing, and one bounded
+    750 ms/64 KiB capture shared with `tm-ui` system-font selection.
 - `crates/tm-app`
   - eframe GUI. `main.rs` (startup sequence: args → console only for CLI →
     early logging → hand a duplicate launch to the running instance → lazy
@@ -563,7 +565,14 @@ preservation on secondary click (#8), no raw device-input registration (#9, pinn
 a Windows test in `eframe`'s `native/run.rs`), wheel coalescing (#14), and the
 dual-source LCD font pipeline plus transformed-text grayscale fallback (#15).
 Linux capability parameters come from `tm-platform/src/fontconfig_text.rs`, which
-caches a trusted absolute `fc-match` query and maps `antialias`/`rgba`/`lcdfilter`.
+caches a trusted absolute `fc-match` query, maps `antialias`/`rgba`/`lcdfilter`,
+and bounds/reaps the process. LCD glyph texels use `(cov_r,cov_g,cov_b,0)`; WGPU
+selects its second pipeline only for font-atlas meshes with LCD content and
+non-white UVs. Windows `NativeApp` refreshes the monitor policy from a
+placement/monitor/DPI key and fails closed across conflicting monitors; Linux
+remains one process-wide fontconfig policy. `egui-wgpu` has a normal Naga
+parse/validation test, and hardware rendering tests are ignored/manual rather
+than portable CI.
 `vendor/egui/TASKMAN-FORK.md` is the divergence inventory and rebase runbook;
 `llm-wiki/render-pipeline.md` is the design. The fork has its own quality gate,
 `tools/check-fork.ps1`, because `cargo clippy --workspace` does not reach an excluded

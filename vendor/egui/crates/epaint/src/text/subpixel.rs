@@ -26,24 +26,30 @@
 //! # Why the atlas needs no new format
 //!
 //! `TextureAtlas` already stores `Color32`. Per-channel coverage goes straight into R, G
-//! and B, with alpha set to the **minimum** of the three. A premultiplied colour glyph
-//! never has a channel above its alpha, so `max(r, g, b) > a` identifies a sub-pixel
-//! texel. Grayscale coverage has `r == g == b == a` and is indistinguishable from a
-//! neutral sub-pixel texel, but it needs no special treatment either: the ordinary and
-//! LCD blends agree when all three coverages are equal. Only a renderer that understands
-//! this sentinel may use the RGB channels as per-channel coverage -- see
-//! [`SubpixelMode`].
+//! and B, with alpha set to **zero for every non-empty LCD texel**. The tag is therefore
+//! explicit and independent of the coverage values: neutral `(c,c,c,0)`, tinted
+//! `(r,g,b,0)` and full `(255,255,255,0)` coverage all identify as LCD. Zero coverage is
+//! `(0,0,0,0)` and draws nothing, so it needs no separate tag.
+//!
+//! A premultiplied colour glyph always has non-zero alpha (unless it is fully
+//! transparent), so it remains distinguishable from LCD coverage. Grayscale glyphs also
+//! retain `r == g == b == a` and use the ordinary blend. Only a renderer that understands
+//! this tag may use the RGB channels as per-channel coverage -- see [`SubpixelMode`].
+//!
+//! The alpha channel is **not** coverage on either path. The software direct blitter
+//! reads RGB per channel; transformed text and GPU fallback recover mean coverage from
+//! RGB and rebuild a premultiplied grayscale alpha.
 
 /// Whether glyphs are rasterized with per-channel (sub-pixel) coverage.
 ///
 /// **This is a contract with the renderer, not just a quality knob.** With
 /// [`Self::Off`] an atlas texel is `(c, c, c, c)` and any backend can multiply it by the
-/// text colour. With sub-pixel coverage the texel is
-/// `(cov_r, cov_g, cov_b, min(cov_r, cov_g, cov_b))`, which is only meaningful to a
-/// renderer that blends each channel against its own coverage. A GPU backend needs
-/// dual-source blending for that. Handing a sub-pixel atlas to a renderer that multiplies
-/// the texel as an ordinary premultiplied colour produces rainbow-tinted text, so the
-/// choice must be gated on the active renderer.
+/// text colour. With sub-pixel coverage the non-empty texel is
+/// `(cov_r, cov_g, cov_b, 0)`, which is only meaningful to a renderer that blends each
+/// channel against its own coverage. A GPU backend needs dual-source blending for that.
+/// Handing a sub-pixel atlas to a renderer that multiplies the texel as an ordinary
+/// premultiplied colour produces rainbow-tinted text, so the choice must be gated on the
+/// active renderer.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum SubpixelMode {
     /// Grayscale coverage; every backend understands it.
@@ -60,6 +66,17 @@ pub enum SubpixelMode {
     /// identical to filtering in BGR, so panel order is a renderer-side flag and does not
     /// force an atlas rebuild. That matters on a multi-monitor desk with mixed panels.
     Bgr,
+}
+
+/// Whether a managed-atlas texel is tagged as LCD per-channel coverage.
+///
+/// The tag is `alpha == 0` plus at least one non-zero RGB channel. This identifies neutral,
+/// tinted and full coverage equally, while zero coverage stays invisible and premultiplied
+/// colour glyphs keep their non-zero alpha.
+#[inline]
+pub fn is_lcd_texel(texel: ecolor::Color32) -> bool {
+    let [r, g, b, a] = texel.to_array();
+    a == 0 && (r | g | b) != 0
 }
 
 impl SubpixelMode {
@@ -281,5 +298,26 @@ mod tests {
         assert!(SubpixelMode::Off.is_off());
         assert!(!SubpixelMode::Rgb.swaps_rb());
         assert!(SubpixelMode::Bgr.swaps_rb());
+    }
+
+    #[test]
+    fn lcd_tag_covers_neutral_tinted_full_and_zero_coverage() {
+        use ecolor::Color32;
+
+        assert!(is_lcd_texel(Color32::from_rgba_premultiplied(
+            128, 128, 128, 0
+        )));
+        assert!(is_lcd_texel(Color32::from_rgba_premultiplied(
+            255, 128, 0, 0
+        )));
+        assert!(is_lcd_texel(Color32::from_rgba_premultiplied(
+            255, 255, 255, 0
+        )));
+        assert!(!is_lcd_texel(Color32::TRANSPARENT));
+
+        let grayscale = Color32::from_rgba_premultiplied(128, 128, 128, 128);
+        let color_glyph = Color32::from_rgba_premultiplied(200, 40, 10, 220);
+        assert!(!is_lcd_texel(grayscale));
+        assert!(!is_lcd_texel(color_glyph));
     }
 }

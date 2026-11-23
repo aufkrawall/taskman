@@ -385,10 +385,10 @@ fn rasterize_subpixel(
 
         for (x, rgb) in filtered.iter().enumerate() {
             let rgb = crate::text::subpixel::apply_cleartype_level(*rgb, opts.cleartype_level);
-            // R, G and B carry per-channel coverage. Alpha is the minimum, not a
-            // representative coverage: a premultiplied colour glyph can never have a
-            // channel above its alpha, so `max(rgb) > alpha` is the exact sentinel a
-            // renderer uses to distinguish LCD coverage from color-glyph pixels.
+            // R, G and B carry per-channel coverage. Alpha is the explicit LCD tag, not
+            // coverage: every non-empty LCD texel is stored as alpha zero so neutral,
+            // tinted, and full coverage are identified identically. Color glyphs keep a
+            // non-zero premultiplied alpha and remain distinguishable.
             image[(x + glyph_pos.0, y + glyph_pos.1)] = lcd_texel(rgb);
         }
     }
@@ -396,12 +396,13 @@ fn rasterize_subpixel(
     glyph_pos
 }
 
-/// Pack one filtered RGB-coverage sample into the atlas sentinel documented in
+/// Pack one filtered RGB-coverage sample into the atlas tag documented in
 /// [`crate::text::SubpixelMode`].
 #[inline]
 fn lcd_texel(rgb: [u8; 3]) -> Color32 {
-    let alpha = rgb[0].min(rgb[1]).min(rgb[2]);
-    Color32::from_rgba_premultiplied(rgb[0], rgb[1], rgb[2], alpha)
+    // `(0,0,0,0)` is zero coverage and stays as-is. Any non-zero coverage is tagged by
+    // alpha zero; renderers recover mean coverage from RGB rather than alpha.
+    Color32::from_rgba_premultiplied(rgb[0], rgb[1], rgb[2], 0)
 }
 
 struct VelloPen<'a> {
@@ -973,18 +974,30 @@ mod tests {
     use super::lcd_texel;
 
     #[test]
-    fn lcd_texels_use_min_alpha_as_the_subpixel_sentinel() {
+    fn lcd_texels_use_zero_alpha_as_the_subpixel_tag() {
         let [r, g, b, a] = lcd_texel([255, 128, 0]).to_array();
         assert_eq!((r, g, b, a), (255, 128, 0, 0));
-        assert!(r.max(g).max(b) > a, "must identify as LCD coverage");
+        assert!(crate::text::subpixel::is_lcd_texel(lcd_texel([
+            255, 128, 0
+        ])));
 
         let [r, g, b, a] = lcd_texel([128, 128, 128]).to_array();
-        assert_eq!((r, g, b, a), (128, 128, 128, 128));
-        assert_eq!(r.max(g).max(b), a, "neutral coverage stays neutral");
+        assert_eq!((r, g, b, a), (128, 128, 128, 0));
+        assert!(crate::text::subpixel::is_lcd_texel(lcd_texel([
+            128, 128, 128
+        ])));
 
         let [r, g, b, a] = lcd_texel([255, 255, 255]).to_array();
-        assert_eq!((r, g, b, a), (255, 255, 255, 255));
-        assert_eq!(r.max(g).max(b), a, "solid white needs no LCD blend");
+        assert_eq!((r, g, b, a), (255, 255, 255, 0));
+        assert!(crate::text::subpixel::is_lcd_texel(lcd_texel([
+            255, 255, 255
+        ])));
+
+        assert_eq!(lcd_texel([0, 0, 0]).to_array(), [0, 0, 0, 0]);
+        assert!(!crate::text::subpixel::is_lcd_texel(lcd_texel([0, 0, 0])));
+
+        let color_glyph = crate::Color32::from_rgba_premultiplied(200, 40, 10, 220);
+        assert!(!crate::text::subpixel::is_lcd_texel(color_glyph));
     }
 }
 

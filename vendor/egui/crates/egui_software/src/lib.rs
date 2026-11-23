@@ -631,7 +631,10 @@ impl Painter {
                 color: v.color,
             };
             let vertices = [to_screen(va), to_screen(vb), to_screen(vc)];
-            if !self.subpixel.is_off() && mesh.texture_id == epaint::TextureId::default() {
+            if !all_white_uv
+                && !self.subpixel.is_off()
+                && mesh.texture_id == epaint::TextureId::default()
+            {
                 raster::triangle_gray_lcd(target, clip, vertices, sampler);
             } else {
                 raster::triangle(target, clip, vertices, sampler);

@@ -155,6 +155,10 @@ struct UniformBuffer {
 
     /// Enhanced-contrast weight from [`epaint::TextOptions::text_contrast`].
     subpixel_contrast: f32,
+
+    /// WGSL uniform structs have a 16-byte size/alignment contract. Keep the Rust layout
+    /// explicit rather than relying on a backend to accept the otherwise 24-byte struct.
+    _padding: [u32; 2],
 }
 
 fn subpixel_order_code(mode: epaint::text::SubpixelMode) -> u32 {
@@ -177,30 +181,95 @@ fn normalized_contrast(contrast: f32) -> f32 {
     }
 }
 
+fn lcd_shader_source() -> String {
+    format!(
+        "enable dual_source_blending;\n{}{}",
+        include_str!("egui.wgsl"),
+        include_str!("egui_lcd.wgsl")
+    )
+}
+
+/// Parse and validate the complete LCD WGSL before asking a backend to compile it.
+///
+/// This is deterministic CPU-side coverage in the normal `egui-wgpu` test suite, including
+/// on hosts with no dual-source adapter. It catches both fragment entry points, the
+/// extension declaration, `@blend_src` interface shape and derivative use.
+fn validate_lcd_shader_source(source: &str) -> Result<(), String> {
+    let module =
+        wgpu::naga::front::wgsl::parse_str(source).map_err(|error| error.emit_to_string(source))?;
+    wgpu::naga::valid::Validator::new(
+        wgpu::naga::valid::ValidationFlags::all(),
+        wgpu::naga::valid::Capabilities::all(),
+    )
+    .validate(&module)
+    .map_err(|error| error.emit_to_string(source))?;
+    Ok(())
+}
+
+/// Resolve an error scope without an unbounded wait.
+///
+/// wgpu may deliver validation results through a future or a device callback. One
+/// non-blocking poll covers the normal immediate case; a bounded device wait covers a
+/// deferred callback. If neither resolves, the caller retains the ordinary pipeline and
+/// leaves LCD capability false rather than risking startup.
+fn bounded_validation_error(
+    device: &wgpu::Device,
+    error: impl std::future::Future<Output = Option<wgpu::Error>>,
+) -> Result<Option<wgpu::Error>, ()> {
+    use std::future::Future as _;
+
+    let mut error = std::pin::pin!(error);
+    let waker = std::task::Waker::noop();
+    let mut context = std::task::Context::from_waker(waker);
+    match error.as_mut().poll(&mut context) {
+        std::task::Poll::Ready(error) => return Ok(error),
+        std::task::Poll::Pending => {}
+    }
+    device.poll(wgpu::PollType::Poll).map_err(|_| ())?;
+    match error.as_mut().poll(&mut context) {
+        std::task::Poll::Ready(error) => return Ok(error),
+        std::task::Poll::Pending => {}
+    }
+    device
+        .poll(wgpu::PollType::Wait {
+            submission_index: None,
+            timeout: Some(std::time::Duration::from_millis(250)),
+        })
+        .map_err(|_| ())?;
+    match error.as_mut().poll(&mut context) {
+        std::task::Poll::Ready(error) => Ok(error),
+        std::task::Poll::Pending => Err(()),
+    }
+}
+
 /// Did the managed font atlas contain LCD coverage after `delta`, given the previous
 /// state?
 ///
-/// Sub-pixel texels have `max(r, g, b) > a`; grayscale coverage has
-/// `r == g == b == a`, and premultiplied color glyphs never have a channel above alpha.
-/// A full replacement starts over because it is a newly rasterized atlas. A partial update
-/// only allocates new glyph slots, so it can turn the state on but must not turn it off.
+/// LCD texels have `alpha == 0` and at least one non-zero RGB channel. A full replacement
+/// starts over because it is a newly rasterized atlas. A partial update only allocates new
+/// glyph slots, so once enabled it must not rescan every unrelated later atlas delta.
 fn font_subpixel_after(was: bool, delta: &epaint::ImageDelta) -> bool {
+    if was && delta.pos.is_some() {
+        return true;
+    }
     let epaint::ImageData::Color(image) = &delta.image;
-    let contains_subpixel = image.pixels.iter().any(|texel| {
-        let [r, g, b, a] = texel.to_array();
-        r.max(g).max(b) > a
-    });
-    (was && delta.pos.is_some()) || contains_subpixel
+    image
+        .pixels
+        .iter()
+        .copied()
+        .any(epaint::text::subpixel::is_lcd_texel)
 }
 
 fn use_lcd_pipeline(
     texture_id: epaint::TextureId,
+    all_white_uv: bool,
     lcd_available: bool,
     font_atlas_has_subpixel: bool,
     mode: epaint::text::SubpixelMode,
 ) -> bool {
     lcd_available
         && texture_id == epaint::TextureId::default()
+        && !all_white_uv
         && font_atlas_has_subpixel
         && !mode.is_off()
 }
@@ -307,7 +376,7 @@ pub struct Renderer {
     /// device, atlas contents and active text mode all allow it.
     lcd_pipeline: Option<wgpu::RenderPipeline>,
 
-    /// Whether the managed font atlas currently contains the alpha-min sentinel used by
+    /// Whether the managed font atlas currently contains the zero-alpha LCD tag used by
     /// sub-pixel coverage. A full replacement recomputes this; partial glyph additions
     /// retain it or turn it on.
     font_atlas_has_subpixel: bool,
@@ -394,6 +463,7 @@ impl Renderer {
                 predictable_texture_filtering: u32::from(options.predictable_texture_filtering),
                 subpixel_order: subpixel_order_code(epaint::text::SubpixelMode::Off),
                 subpixel_contrast: 0.5,
+                _padding: [0; 2],
             }]),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
@@ -559,34 +629,59 @@ impl Renderer {
 
         // The font atlas can use a source color plus a per-channel coverage source. Both
         // sources share location 0; WGSL marks the second output with `@blend_src(1)`.
-        let lcd_pipeline = Self::supports_subpixel_text(device).then(|| {
-            let source = format!(
-                "enable dual_source_blending;\n{}{}",
-                include_str!("egui.wgsl"),
-                include_str!("egui_lcd.wgsl")
-            );
-            let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-                label: Some("egui_lcd"),
-                source: wgpu::ShaderSource::Wgsl(Cow::Owned(source)),
-            });
-            create_pipeline(
-                "egui_lcd_pipeline",
-                &module,
-                if linear_framebuffer {
-                    "fs_lcd_linear_framebuffer"
-                } else {
-                    "fs_lcd_gamma_framebuffer"
-                },
-                wgpu::BlendState {
-                    color: wgpu::BlendComponent {
-                        src_factor: wgpu::BlendFactor::One,
-                        dst_factor: wgpu::BlendFactor::OneMinusSrc1,
-                        operation: wgpu::BlendOperation::Add,
-                    },
-                    alpha: alpha_blend,
-                },
-            )
-        });
+        // Validate the complete shader on the CPU first, then keep backend validation in a
+        // bounded error scope. Any failure drops only the LCD pipeline.
+        let lcd_pipeline = if Self::supports_subpixel_text(device) {
+            let source = lcd_shader_source();
+            match validate_lcd_shader_source(&source) {
+                Err(error) => {
+                    log::warn!("LCD shader validation failed; using grayscale pipeline: {error}");
+                    None
+                }
+                Ok(()) => {
+                    let validation = device.push_error_scope(wgpu::ErrorFilter::Validation);
+                    let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                        label: Some("egui_lcd"),
+                        source: wgpu::ShaderSource::Wgsl(Cow::Owned(source)),
+                    });
+                    let pipeline = create_pipeline(
+                        "egui_lcd_pipeline",
+                        &module,
+                        if linear_framebuffer {
+                            "fs_lcd_linear_framebuffer"
+                        } else {
+                            "fs_lcd_gamma_framebuffer"
+                        },
+                        wgpu::BlendState {
+                            color: wgpu::BlendComponent {
+                                src_factor: wgpu::BlendFactor::One,
+                                dst_factor: wgpu::BlendFactor::OneMinusSrc1,
+                                operation: wgpu::BlendOperation::Add,
+                            },
+                            alpha: alpha_blend,
+                        },
+                    );
+                    match bounded_validation_error(device, validation.pop()) {
+                        Ok(None) => Some(pipeline),
+                        Ok(Some(error)) => {
+                            log::warn!(
+                                "LCD pipeline validation failed; using grayscale pipeline: {error}"
+                            );
+                            None
+                        }
+                        Err(()) => {
+                            log::warn!(
+                                "LCD pipeline validation did not complete within 250 ms; \
+                                 using grayscale pipeline"
+                            );
+                            None
+                        }
+                    }
+                }
+            }
+        } else {
+            None
+        };
 
         const VERTEX_BUFFER_START_CAPACITY: wgpu::BufferAddress =
             (std::mem::size_of::<Vertex>() * 1024) as _;
@@ -701,9 +796,14 @@ impl Renderer {
                         .expect("You must call .update_buffers() before .render()");
 
                     if let Some(Texture { bind_group, .. }) = self.textures.get(&mesh.texture_id) {
+                        let all_white_uv = mesh
+                            .vertices
+                            .iter()
+                            .all(|vertex| vertex.uv == epaint::WHITE_UV);
                         let lcd_pipeline = self.lcd_pipeline.as_ref().filter(|_| {
                             use_lcd_pipeline(
                                 mesh.texture_id,
+                                all_white_uv,
                                 true,
                                 self.font_atlas_has_subpixel,
                                 self.subpixel_mode,
@@ -1108,6 +1208,7 @@ impl Renderer {
             predictable_texture_filtering: u32::from(self.options.predictable_texture_filtering),
             subpixel_order: subpixel_order_code(self.subpixel_mode),
             subpixel_contrast: self.subpixel_contrast,
+            _padding: [0; 2],
         };
         if uniform_buffer_content != self.previous_uniform_buffer_content {
             profiling::scope!("update uniforms");
@@ -1359,8 +1460,9 @@ fn renderer_impl_send_sync() {
 #[cfg(test)]
 mod tests {
     use super::{
-        font_subpixel_after, normalized_contrast, subpixel_order_code, supports_subpixel_features,
-        texel_mapping_is_one_to_one, use_lcd_pipeline,
+        UniformBuffer, font_subpixel_after, lcd_shader_source, normalized_contrast,
+        subpixel_order_code, supports_subpixel_features, texel_mapping_is_one_to_one,
+        use_lcd_pipeline, validate_lcd_shader_source,
     };
     use epaint::{Color32, ColorImage, ImageDelta, textures::TextureOptions};
 
@@ -1376,7 +1478,9 @@ mod tests {
     fn font_atlas_subpixel_state_tracks_full_and_partial_updates() {
         let grayscale = Color32::from_rgba_premultiplied(90, 90, 90, 90);
         let color_glyph = Color32::from_rgba_premultiplied(100, 30, 20, 200);
-        let subpixel = Color32::from_rgba_premultiplied(120, 90, 60, 60);
+        let tinted_lcd = Color32::from_rgba_premultiplied(120, 90, 60, 0);
+        let neutral_lcd = Color32::from_rgba_premultiplied(128, 128, 128, 0);
+        let full_lcd = Color32::from_rgba_premultiplied(255, 255, 255, 0);
 
         // Partial additions can turn it on but never turn it off.
         assert!(!font_subpixel_after(false, &delta(grayscale, Some([0, 0]))));
@@ -1384,14 +1488,28 @@ mod tests {
             false,
             &delta(color_glyph, Some([0, 0]))
         ));
-        assert!(font_subpixel_after(false, &delta(subpixel, Some([0, 0]))));
+        assert!(!font_subpixel_after(
+            false,
+            &delta(Color32::TRANSPARENT, Some([0, 0]))
+        ));
+        assert!(font_subpixel_after(
+            false,
+            &delta(neutral_lcd, Some([0, 0]))
+        ));
+        assert!(font_subpixel_after(false, &delta(tinted_lcd, Some([0, 0]))));
+        assert!(font_subpixel_after(false, &delta(full_lcd, Some([0, 0]))));
         assert!(font_subpixel_after(true, &delta(grayscale, Some([4, 0]))));
         assert!(font_subpixel_after(true, &delta(color_glyph, Some([4, 0]))));
 
         // A full replacement is a new atlas and always starts from its own contents.
-        assert!(font_subpixel_after(false, &delta(subpixel, None)));
+        assert!(font_subpixel_after(false, &delta(neutral_lcd, None)));
+        assert!(font_subpixel_after(false, &delta(tinted_lcd, None)));
         assert!(!font_subpixel_after(true, &delta(grayscale, None)));
         assert!(!font_subpixel_after(true, &delta(color_glyph, None)));
+        assert!(!font_subpixel_after(
+            true,
+            &delta(Color32::TRANSPARENT, None)
+        ));
     }
 
     #[test]
@@ -1410,12 +1528,18 @@ mod tests {
         let mode = epaint::text::SubpixelMode::Rgb;
         assert!(use_lcd_pipeline(
             epaint::TextureId::default(),
+            false,
             true,
             true,
             mode
         ));
+        assert!(
+            !use_lcd_pipeline(epaint::TextureId::default(), true, true, true, mode),
+            "untextured solid geometry uses WHITE_UV and must stay on the ordinary pipeline"
+        );
         assert!(!use_lcd_pipeline(
             epaint::TextureId::User(7),
+            false,
             true,
             true,
             mode
@@ -1423,17 +1547,20 @@ mod tests {
         assert!(!use_lcd_pipeline(
             epaint::TextureId::default(),
             false,
+            false,
             true,
             mode
         ));
         assert!(!use_lcd_pipeline(
             epaint::TextureId::default(),
+            false,
             true,
             false,
             mode
         ));
         assert!(!use_lcd_pipeline(
             epaint::TextureId::default(),
+            false,
             true,
             true,
             epaint::text::SubpixelMode::Off
@@ -1475,5 +1602,36 @@ mod tests {
         assert_eq!(normalized_contrast(-1.0), 0.0);
         assert_eq!(normalized_contrast(2.0), 1.0);
         assert_eq!(normalized_contrast(f32::NAN), 0.5);
+    }
+
+    #[test]
+    fn uniform_layout_is_wgsl_compatible_and_explicitly_padded() {
+        assert_eq!(
+            std::mem::offset_of!(UniformBuffer, screen_size_in_points),
+            0
+        );
+        assert_eq!(std::mem::offset_of!(UniformBuffer, dithering), 8);
+        assert_eq!(
+            std::mem::offset_of!(UniformBuffer, predictable_texture_filtering),
+            12
+        );
+        assert_eq!(std::mem::offset_of!(UniformBuffer, subpixel_order), 16);
+        assert_eq!(std::mem::offset_of!(UniformBuffer, subpixel_contrast), 20);
+        assert_eq!(std::mem::size_of::<UniformBuffer>(), 32);
+        assert!(std::mem::size_of::<UniformBuffer>().is_multiple_of(16));
+    }
+
+    #[test]
+    fn lcd_wgsl_parses_and_validates_both_fragment_entry_points() {
+        let source = lcd_shader_source();
+        assert!(source.starts_with("enable dual_source_blending;"));
+        assert!(source.contains("@blend_src(0)"));
+        assert!(source.contains("@blend_src(1)"));
+        assert!(source.contains("dpdx("));
+        assert!(source.contains("dpdy("));
+        assert!(source.contains("fn fs_lcd_linear_framebuffer("));
+        assert!(source.contains("fn fs_lcd_gamma_framebuffer("));
+        validate_lcd_shader_source(&source)
+            .unwrap_or_else(|error| panic!("LCD WGSL failed Naga validation:\n{error}"));
     }
 }

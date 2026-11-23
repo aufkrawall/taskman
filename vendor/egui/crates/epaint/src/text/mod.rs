@@ -61,7 +61,8 @@ pub struct TextOptions {
     /// rather than a quality setting -- see [`crate::text::SubpixelMode`]. Only enable it
     /// when the active backend blends each channel against its own coverage. The software
     /// renderer always can; WGPU needs dual-source blending. A renderer that multiplies
-    /// the atlas as an ordinary premultiplied texture draws rainbow-tinted text.
+    /// the atlas as an ordinary premultiplied texture draws rainbow-tinted text. LCD
+    /// coverage uses `(cov_r, cov_g, cov_b, 0)`; alpha is a tag, never coverage.
     ///
     /// Default: [`SubpixelMode::Off`].
     pub subpixel: SubpixelMode,

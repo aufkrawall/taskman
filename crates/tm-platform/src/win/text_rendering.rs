@@ -18,7 +18,7 @@
 //! Nothing here leaks a `windows` type upward: [`TextRenderingParams`] is plain data, so
 //! the renderer and the egui fork stay free of platform dependencies.
 
-use windows::Win32::Foundation::HWND;
+use windows::Win32::Foundation::{HWND, RECT};
 
 /// Everything the renderer needs to decide how to draw text.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -40,11 +40,10 @@ pub struct TextRenderingParams {
 }
 
 impl Default for TextRenderingParams {
-    /// Windows' documented defaults, with sub-pixel rendering **on**.
+    /// Windows' documented blend defaults, with sub-pixel rendering **on**.
     ///
-    /// Used when DirectWrite is unavailable but the system gates passed: falling back to
-    /// grayscale there would throw away the feature over a missing accessor, and these
-    /// values are what the vast majority of machines report anyway.
+    /// This is sample data for tests and neutral blend input. [`query`] must fail closed
+    /// when DirectWrite cannot name the monitor's actual parameters and stripe order.
     fn default() -> Self {
         Self {
             enabled: true,
@@ -85,9 +84,184 @@ pub fn query(hwnd: Option<isize>) -> TextRenderingParams {
         tracing::debug!("not per-monitor DPI aware; sub-pixel text disabled");
         return TextRenderingParams::disabled();
     }
-    let params = dwrite_params(hwnd).unwrap_or_default();
+    let params = match hwnd {
+        Some(hwnd) => query_window_monitors(hwnd),
+        None => dwrite_params(None)
+            .and_then(validated_params)
+            .unwrap_or_else(TextRenderingParams::disabled),
+    };
     tracing::debug!(?params, "sub-pixel text parameters");
     params
+}
+
+/// Cheap identity of the window's current monitor placement.
+pub fn window_placement_key(hwnd: isize) -> Option<crate::text_rendering::WindowPlacementKey> {
+    use windows::Win32::Graphics::Gdi::{
+        GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromWindow,
+    };
+    use windows::Win32::UI::HiDpi::GetDpiForWindow;
+    use windows::Win32::UI::WindowsAndMessaging::GetWindowRect;
+
+    let window = HWND(hwnd as *mut std::ffi::c_void);
+    if window.0.is_null() {
+        return None;
+    }
+    let mut window_rect = RECT::default();
+    unsafe { GetWindowRect(window, &mut window_rect) }.ok()?;
+    let monitor = unsafe { MonitorFromWindow(window, MONITOR_DEFAULTTONEAREST) };
+    if monitor.is_invalid() {
+        return None;
+    }
+    let mut info = MONITORINFO {
+        cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+        ..Default::default()
+    };
+    if !unsafe { GetMonitorInfoW(monitor, &mut info) }.as_bool() {
+        return None;
+    }
+    Some(crate::text_rendering::WindowPlacementKey {
+        window_rect: [
+            window_rect.left,
+            window_rect.top,
+            window_rect.right,
+            window_rect.bottom,
+        ],
+        monitor: monitor.0 as isize,
+        monitor_rect: [
+            info.rcMonitor.left,
+            info.rcMonitor.top,
+            info.rcMonitor.right,
+            info.rcMonitor.bottom,
+        ],
+        effective_dpi: unsafe { GetDpiForWindow(window) },
+    })
+}
+
+/// Query every monitor intersecting the window and fail closed when their validated
+/// DirectWrite policies disagree.
+fn query_window_monitors(hwnd: isize) -> TextRenderingParams {
+    use windows::Win32::Foundation::LPARAM;
+    use windows::Win32::Graphics::Gdi::{
+        EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITORINFO,
+    };
+    use windows::Win32::UI::WindowsAndMessaging::GetWindowRect;
+    use windows::core::BOOL;
+
+    unsafe extern "system" fn collect(
+        monitor: HMONITOR,
+        _dc: HDC,
+        _clip: *mut RECT,
+        data: LPARAM,
+    ) -> BOOL {
+        // SAFETY: `query_window_monitors` passes a pointer to a live Vec that outlives
+        // this synchronous callback.
+        let monitors = unsafe { &mut *(data.0 as *mut Vec<HMONITOR>) };
+        monitors.push(monitor);
+        BOOL(1)
+    }
+
+    let window = HWND(hwnd as *mut std::ffi::c_void);
+    let mut window_rect = RECT::default();
+    if window.0.is_null() || unsafe { GetWindowRect(window, &mut window_rect) }.is_err() {
+        return dwrite_params(Some(hwnd))
+            .and_then(validated_params)
+            .unwrap_or_else(TextRenderingParams::disabled);
+    }
+    let window_rect = [
+        window_rect.left,
+        window_rect.top,
+        window_rect.right,
+        window_rect.bottom,
+    ];
+
+    let mut monitors = Vec::new();
+    unsafe {
+        let _ = EnumDisplayMonitors(
+            None,
+            None,
+            Some(collect),
+            LPARAM((&raw mut monitors) as isize),
+        );
+    }
+    let intersecting: Vec<HMONITOR> = monitors
+        .into_iter()
+        .filter(|monitor| {
+            let mut info = MONITORINFO {
+                cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+                ..Default::default()
+            };
+            unsafe { GetMonitorInfoW(*monitor, &mut info) }.as_bool()
+                && rects_intersect(
+                    window_rect,
+                    [
+                        info.rcMonitor.left,
+                        info.rcMonitor.top,
+                        info.rcMonitor.right,
+                        info.rcMonitor.bottom,
+                    ],
+                )
+        })
+        .collect();
+    if intersecting.is_empty() {
+        return dwrite_params(Some(hwnd))
+            .and_then(validated_params)
+            .unwrap_or_else(TextRenderingParams::disabled);
+    }
+
+    let factory = dwrite_factory();
+    let params: Vec<_> = intersecting
+        .iter()
+        .map(|monitor| {
+            factory
+                .as_ref()
+                .and_then(|factory| dwrite_params_for_monitor(factory, *monitor))
+                .and_then(validated_params)
+        })
+        .collect();
+    let policy = monitor_policy(&params);
+    if params.len() > 1 && params.iter().any(|candidate| *candidate != params[0]) {
+        tracing::debug!(
+            monitor_count = params.len(),
+            "window intersects monitors with conflicting text-rendering policies; LCD disabled"
+        );
+    }
+    policy
+}
+
+fn rects_intersect(a: [i32; 4], b: [i32; 4]) -> bool {
+    a[0] < b[2] && a[2] > b[0] && a[1] < b[3] && a[3] > b[1]
+}
+
+fn validated_params(params: TextRenderingParams) -> Option<TextRenderingParams> {
+    (params.gamma.is_finite()
+        && params.gamma >= 1.0
+        && params.contrast.is_finite()
+        && (0.0..=1.0).contains(&params.contrast)
+        && params.cleartype_level.is_finite()
+        && (0.0..=1.0).contains(&params.cleartype_level))
+    .then_some(params)
+}
+
+/// Combine the validated policies of every monitor intersecting the window.
+///
+/// A failed individual DirectWrite query is unknown rather than an implicit RGB panel, so
+/// even a single monitor fails closed. Unknown or disagreeing multi-monitor data also fails
+/// closed.
+fn monitor_policy(monitors: &[Option<TextRenderingParams>]) -> TextRenderingParams {
+    match monitors {
+        [] => TextRenderingParams::disabled(),
+        [only] => only.unwrap_or_else(TextRenderingParams::disabled),
+        [first, rest @ ..] => {
+            let Some(first) = first else {
+                return TextRenderingParams::disabled();
+            };
+            if rest.iter().all(|candidate| *candidate == Some(*first)) {
+                *first
+            } else {
+                TextRenderingParams::disabled()
+            }
+        }
+    }
 }
 
 /// The monitor's blend parameters, **without** the validity gates.
@@ -159,20 +333,31 @@ fn is_per_monitor_dpi_aware() -> bool {
 /// and the user's per-monitor `cttune.exe` calibration. Reading the registry by hand would
 /// reproduce a subset of that, badly.
 fn dwrite_params(hwnd: Option<isize>) -> Option<TextRenderingParams> {
-    use windows::Win32::Graphics::DirectWrite::{
-        DWRITE_FACTORY_TYPE_SHARED, DWRITE_PIXEL_GEOMETRY_BGR, DWRITE_PIXEL_GEOMETRY_FLAT,
-        DWriteCreateFactory, IDWriteFactory, IDWriteRenderingParams,
-    };
     use windows::Win32::Graphics::Gdi::{HMONITOR, MONITOR_DEFAULTTOPRIMARY, MonitorFromWindow};
 
-    let factory: IDWriteFactory =
-        unsafe { DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED) }.ok()?;
+    let factory = dwrite_factory()?;
 
     let monitor: HMONITOR = unsafe {
         MonitorFromWindow(
             HWND(hwnd.unwrap_or(0) as *mut std::ffi::c_void),
             MONITOR_DEFAULTTOPRIMARY,
         )
+    };
+    dwrite_params_for_monitor(&factory, monitor)
+}
+
+fn dwrite_factory() -> Option<windows::Win32::Graphics::DirectWrite::IDWriteFactory> {
+    use windows::Win32::Graphics::DirectWrite::{DWRITE_FACTORY_TYPE_SHARED, DWriteCreateFactory};
+
+    unsafe { DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED) }.ok()
+}
+
+fn dwrite_params_for_monitor(
+    factory: &windows::Win32::Graphics::DirectWrite::IDWriteFactory,
+    monitor: windows::Win32::Graphics::Gdi::HMONITOR,
+) -> Option<TextRenderingParams> {
+    use windows::Win32::Graphics::DirectWrite::{
+        DWRITE_PIXEL_GEOMETRY_BGR, DWRITE_PIXEL_GEOMETRY_FLAT, IDWriteRenderingParams,
     };
 
     let params: IDWriteRenderingParams =
@@ -239,6 +424,71 @@ mod tests {
             p.cleartype_level.is_finite() && (0.0..=1.0).contains(&p.cleartype_level),
             "level {}",
             p.cleartype_level
+        );
+    }
+
+    #[test]
+    fn monitor_policy_keeps_lcd_when_every_intersecting_monitor_agrees() {
+        let rgb = TextRenderingParams::default();
+        assert_eq!(monitor_policy(&[Some(rgb), Some(rgb)]), rgb);
+
+        let bgr = TextRenderingParams {
+            bgr: true,
+            gamma: 2.2,
+            contrast: 0.7,
+            ..rgb
+        };
+        assert_eq!(monitor_policy(&[Some(bgr), Some(bgr)]), bgr);
+    }
+
+    #[test]
+    fn monitor_policy_fails_closed_on_conflicts_and_unknown_multi_monitor_data() {
+        let rgb = TextRenderingParams::default();
+        let bgr = TextRenderingParams { bgr: true, ..rgb };
+        let warm = TextRenderingParams { gamma: 2.2, ..rgb };
+        let disabled = TextRenderingParams::disabled();
+
+        for policies in [
+            [Some(rgb), Some(bgr)],
+            [Some(rgb), Some(warm)],
+            [Some(rgb), Some(disabled)],
+            [Some(rgb), None],
+            [None, Some(rgb)],
+        ] {
+            assert!(
+                !monitor_policy(&policies).enabled,
+                "conflicting or unknown monitor policy must disable LCD: {policies:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn unavailable_monitor_queries_fail_closed_even_on_one_monitor() {
+        assert!(!monitor_policy(&[None]).enabled);
+        assert!(!monitor_policy(&[]).enabled);
+    }
+
+    #[test]
+    fn malformed_monitor_parameters_are_treated_as_unavailable() {
+        for malformed in [
+            TextRenderingParams {
+                gamma: 0.0,
+                ..TextRenderingParams::default()
+            },
+            TextRenderingParams {
+                contrast: f32::NAN,
+                ..TextRenderingParams::default()
+            },
+            TextRenderingParams {
+                cleartype_level: 2.0,
+                ..TextRenderingParams::default()
+            },
+        ] {
+            assert_eq!(validated_params(malformed), None);
+        }
+        assert_eq!(
+            validated_params(TextRenderingParams::default()),
+            Some(TextRenderingParams::default())
         );
     }
 }

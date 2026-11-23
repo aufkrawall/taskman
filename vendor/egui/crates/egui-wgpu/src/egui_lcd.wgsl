@@ -1,10 +1,9 @@
 // TASKMAN-FORK: sub-pixel (LCD) glyph coverage for the managed font atlas only.
 //
 // This source is appended to `egui.wgsl` after `enable dual_source_blending;`. A
-// sub-pixel atlas texel stores one coverage per color channel and alpha is the minimum
-// of those channels. A premultiplied color glyph never has a channel above its alpha, so
-// `max(rgb) > alpha` distinguishes LCD coverage from grayscale glyphs and color/emoji
-// glyphs sharing the atlas.
+// sub-pixel atlas texel stores one coverage per color channel and alpha zero as an
+// explicit tag. Neutral, tinted and full LCD coverage all carry that tag. Zero coverage
+// is (0,0,0,0), while premultiplied color/emoji glyphs retain non-zero alpha.
 //
 // The fixed-function blend uses `ONE / ONE_MINUS_SRC1`. Fragment output 0 is the
 // premultiplied source color; fragment output 1 is the per-channel coverage. That yields
@@ -17,11 +16,16 @@
 // gamma limitation rather than pretending the result is DirectWrite-exact.
 
 fn is_lcd_texel(tex: vec4<f32>) -> bool {
-    return max(tex.r, max(tex.g, tex.b)) > tex.a + 0.5 / 255.0;
+    return tex.a <= 0.5 / 255.0
+        && max(tex.r, max(tex.g, tex.b)) > 0.5 / 255.0;
 }
 
 fn enhance_lcd_contrast(coverage: vec3<f32>) -> vec3<f32> {
-    return coverage * (1.0 + r_locals.subpixel_contrast * (1.0 - coverage));
+    return clamp(
+        coverage * (1.0 + r_locals.subpixel_contrast * (1.0 - coverage)),
+        vec3<f32>(0.0),
+        vec3<f32>(1.0),
+    );
 }
 
 fn lcd_fallback_gray(tex: vec4<f32>) -> vec4<f32> {

@@ -14,30 +14,54 @@ use tm_core::settings::TextSmoothing;
 /// WGPU draw rainbow-tinted text. `main.rs` sets this once the renderer is known.
 static SUBPIXEL_CAPABLE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-/// The platform's text-rendering parameters, resolved once at startup.
+/// The platform's text-rendering parameters, refreshed when Windows reports a monitor
+/// placement/DPI change.
 static SUBPIXEL_PARAMS: std::sync::Mutex<Option<tm_platform::text_rendering::Params>> =
     std::sync::Mutex::new(None);
 
 /// Record that the active renderer blends per channel, and the display's parameters.
 pub fn set_subpixel_capable(capable: bool, params: tm_platform::text_rendering::Params) {
     SUBPIXEL_CAPABLE.store(capable, Ordering::Relaxed);
-    *SUBPIXEL_PARAMS.lock().unwrap_or_else(|e| e.into_inner()) = Some(params);
+    let _ = set_subpixel_params(params);
+}
+
+/// Update the display policy without changing the renderer capability.
+///
+/// This is used when the window moves to another monitor. The renderer is not recreated:
+/// the next frame reads the new parameters from the atlas options and uploads them to the
+/// renderer uniform. Returns whether the atlas/options actually need reinstalling.
+pub fn set_subpixel_params(params: tm_platform::text_rendering::Params) -> bool {
+    let mut current = SUBPIXEL_PARAMS.lock().unwrap_or_else(|e| e.into_inner());
+    if *current == Some(params) {
+        return false;
+    }
+    *current = Some(params);
+    true
 }
 
 /// The sub-pixel mode to rasterize glyphs with, or `Off`.
 pub fn subpixel_mode() -> egui::epaint::text::SubpixelMode {
+    let params = *SUBPIXEL_PARAMS.lock().unwrap_or_else(|e| e.into_inner());
+    resolve_subpixel_mode(
+        SUBPIXEL_CAPABLE.load(Ordering::Relaxed),
+        env_subpixel(),
+        params,
+    )
+}
+
+fn resolve_subpixel_mode(
+    capable: bool,
+    forced: Option<bool>,
+    params: Option<tm_platform::text_rendering::Params>,
+) -> egui::epaint::text::SubpixelMode {
     use egui::epaint::text::SubpixelMode;
-    if let Some(forced) = env_subpixel() {
-        // The override still cannot enable it on a renderer that would draw it wrong.
-        if !forced || !SUBPIXEL_CAPABLE.load(Ordering::Relaxed) {
-            return SubpixelMode::Off;
-        }
-    } else if !SUBPIXEL_CAPABLE.load(Ordering::Relaxed) {
+    // The override can force off, but can never energize an unsupported renderer or a
+    // platform policy whose channel order is unknown.
+    if forced == Some(false) || !capable {
         return SubpixelMode::Off;
     }
-    let params = *SUBPIXEL_PARAMS.lock().unwrap_or_else(|e| e.into_inner());
     match params {
-        Some(p) if p.enabled || env_subpixel() == Some(true) => {
+        Some(p) if p.enabled => {
             if p.bgr {
                 SubpixelMode::Bgr
             } else {
@@ -53,7 +77,8 @@ pub fn subpixel_params() -> tm_platform::text_rendering::Params {
     (*SUBPIXEL_PARAMS.lock().unwrap_or_else(|e| e.into_inner())).unwrap_or_default()
 }
 
-/// `TASKMAN_SUBPIXEL=0|1` forces sub-pixel text off or on for A/B comparison.
+/// `TASKMAN_SUBPIXEL=0` forces sub-pixel text off. `=1` requests the supported policy for
+/// A/B comparison, but never overrides a disabled platform policy or renderer capability.
 fn env_subpixel() -> Option<bool> {
     static OVERRIDE: std::sync::OnceLock<Option<bool>> = std::sync::OnceLock::new();
     *OVERRIDE.get_or_init(|| match std::env::var("TASKMAN_SUBPIXEL").ok()?.trim() {
@@ -548,6 +573,42 @@ pub fn palette_ctx(ctx: &egui::Context) -> Palette {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn subpixel_override_can_force_off_but_never_bypasses_platform_or_renderer_capability() {
+        use egui::epaint::text::SubpixelMode;
+
+        let rgb = tm_platform::text_rendering::Params {
+            enabled: true,
+            ..Default::default()
+        };
+        let bgr = tm_platform::text_rendering::Params { bgr: true, ..rgb };
+        let disabled = tm_platform::text_rendering::Params {
+            enabled: false,
+            ..rgb
+        };
+
+        assert_eq!(
+            resolve_subpixel_mode(true, None, Some(bgr)),
+            SubpixelMode::Bgr
+        );
+        assert_eq!(
+            resolve_subpixel_mode(true, Some(true), Some(rgb)),
+            SubpixelMode::Rgb
+        );
+        assert_eq!(
+            resolve_subpixel_mode(true, Some(false), Some(rgb)),
+            SubpixelMode::Off
+        );
+        assert_eq!(
+            resolve_subpixel_mode(false, Some(true), Some(rgb)),
+            SubpixelMode::Off
+        );
+        assert_eq!(
+            resolve_subpixel_mode(true, Some(true), Some(disabled)),
+            SubpixelMode::Off
+        );
+    }
 
     #[test]
     fn fontconfig_lcdfilter_choices_map_to_filter_tables() {

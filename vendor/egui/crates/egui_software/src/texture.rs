@@ -29,7 +29,7 @@ impl Texture {
     /// Rotated, scaled or otherwise non-1:1 text cannot use the direct per-channel blit.
     /// Its triangles still sample the font atlas, so converting the LCD texels before
     /// filtering prevents tinted fringes while preserving a premultiplied grayscale blend.
-    /// Color glyphs (`max(rgb) <= alpha`) pass through unchanged.
+    /// Non-LCD texels (including premultiplied colour glyphs) pass through unchanged.
     pub(crate) fn sample_gray_lcd(&self, u: f32, v: f32) -> Color32 {
         self.sample_impl(u, v, true)
     }
@@ -94,10 +94,10 @@ impl Texture {
 }
 
 fn gray_lcd_texel(texel: Color32) -> Color32 {
-    let [r, g, b, a] = texel.to_array();
-    if r.max(g).max(b) <= a {
+    if !epaint::text::subpixel::is_lcd_texel(texel) {
         return texel;
     }
+    let [r, g, b, _] = texel.to_array();
     let gray = ((u32::from(r) + u32::from(g) + u32::from(b) + 1) / 3) as u8;
     Color32::from_rgba_premultiplied(gray, gray, gray, gray)
 }
@@ -303,21 +303,23 @@ mod tests {
     #[test]
     fn gray_lcd_sampling_neutralizes_coverage_but_preserves_color_glyphs() {
         let subpixel = Color32::from_rgba_premultiplied(255, 128, 0, 0);
+        let neutral = Color32::from_rgba_premultiplied(128, 128, 128, 0);
         let color_glyph = Color32::from_rgba_premultiplied(200, 40, 10, 220);
         let tex = Texture {
-            pixels: vec![subpixel, color_glyph],
-            width: 2,
+            pixels: vec![subpixel, neutral, color_glyph],
+            width: 3,
             height: 1,
             options: TextureOptions::NEAREST,
         };
 
-        let gray = tex.sample_gray_lcd(0.25, 0.5).to_array();
+        let gray = tex.sample_gray_lcd(1.0 / 6.0, 0.5).to_array();
         assert!(
             gray[0] == gray[1] && gray[1] == gray[2] && gray[2] == gray[3],
             "LCD texel must become neutral premultiplied coverage: {gray:?}"
         );
         assert!(gray[0] > 0);
-        assert_eq!(tex.sample_gray_lcd(0.75, 0.5), color_glyph);
+        assert_eq!(tex.sample_gray_lcd(0.5, 0.5).to_array()[0], 128);
+        assert_eq!(tex.sample_gray_lcd(5.0 / 6.0, 0.5), color_glyph);
     }
 
     #[test]

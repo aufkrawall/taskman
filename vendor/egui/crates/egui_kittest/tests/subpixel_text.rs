@@ -1,9 +1,10 @@
 #![cfg(all(feature = "wgpu", not(target_arch = "wasm32")))]
 
-//! Headless WGPU coverage for the managed-font dual-source LCD pipeline.
+//! Manual hardware coverage for the managed-font dual-source LCD pipeline.
 //!
-//! This test is intentionally explicit about skipping: if the host has no adapter that
-//! supports dual-source blending, it says so and returns instead of claiming a pass.
+//! These tests are ignored by default. Set `TASKMAN_RUN_GPU_SUBPIXEL_TESTS=1` and provide
+//! a D3D12 or Vulkan adapter with `DUAL_SOURCE_BLENDING`; a missing prerequisite is a
+//! failure, never a reported pass.
 
 use std::sync::Arc;
 
@@ -12,13 +13,37 @@ use egui::{
     epaint::text::SubpixelMode,
 };
 use egui_kittest::{Harness, wgpu::WgpuTestRenderer};
-use egui_wgpu::{WgpuSetup, wgpu};
+use egui_wgpu::{RendererOptions, WgpuSetup, wgpu};
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum Draw {
     Plain,
     Rotated,
     Scaled,
+    FractionalTranslation,
+}
+
+#[derive(Clone, Copy)]
+struct RenderConfig {
+    mode: SubpixelMode,
+    draw: Draw,
+    contrast: f32,
+    text_color: Color32,
+    options: RendererOptions,
+    srgb_target: bool,
+}
+
+impl Default for RenderConfig {
+    fn default() -> Self {
+        Self {
+            mode: SubpixelMode::Rgb,
+            draw: Draw::Plain,
+            contrast: 0.5,
+            text_color: Color32::WHITE,
+            options: RendererOptions::PREDICTABLE,
+            srgb_target: false,
+        }
+    }
 }
 
 fn target_backend(backend: wgpu::Backend) -> bool {
@@ -31,10 +56,22 @@ fn dual_source_available() -> bool {
     let adapters = pollster::block_on(instance.enumerate_adapters(wgpu::Backends::all()));
     adapters.iter().any(|adapter| {
         target_backend(adapter.get_info().backend)
+            && adapter.get_info().device_type != wgpu::DeviceType::Cpu
             && adapter
                 .features()
                 .contains(wgpu::Features::DUAL_SOURCE_BLENDING)
     })
+}
+
+fn require_hardware(test: &str) {
+    assert!(
+        std::env::var_os("TASKMAN_RUN_GPU_SUBPIXEL_TESTS").is_some(),
+        "{test} is manual: set TASKMAN_RUN_GPU_SUBPIXEL_TESTS=1 to run it"
+    );
+    assert!(
+        dual_source_available(),
+        "{test} requires a D3D12 or Vulkan adapter with DUAL_SOURCE_BLENDING"
+    );
 }
 
 fn setup_for_dual_source() -> WgpuSetup {
@@ -47,6 +84,7 @@ fn setup_for_dual_source() -> WgpuSetup {
             .iter()
             .find(|adapter| {
                 target_backend(adapter.get_info().backend)
+                    && adapter.get_info().device_type != wgpu::DeviceType::Cpu
                     && adapter
                         .features()
                         .contains(wgpu::Features::DUAL_SOURCE_BLENDING)
@@ -57,8 +95,16 @@ fn setup_for_dual_source() -> WgpuSetup {
     setup
 }
 
-fn render(mode: SubpixelMode, draw: Draw) -> image::RgbaImage {
-    let renderer = WgpuTestRenderer::from_setup(setup_for_dual_source());
+fn render(config: RenderConfig) -> image::RgbaImage {
+    let renderer = if config.srgb_target {
+        WgpuTestRenderer::from_setup_and_format(
+            setup_for_dual_source(),
+            config.options,
+            wgpu::TextureFormat::Rgba8UnormSrgb,
+        )
+    } else {
+        WgpuTestRenderer::from_setup_and_options(setup_for_dual_source(), config.options)
+    };
     let mut harness = Harness::builder()
         .with_size(Vec2::new(240.0, 60.0))
         .with_pixels_per_point(1.0)
@@ -66,22 +112,32 @@ fn render(mode: SubpixelMode, draw: Draw) -> image::RgbaImage {
         .build_ui(move |ui| {
             ui.ctx().set_theme(Theme::Dark);
             ui.ctx().style_mut_of(Theme::Dark, |style| {
-                style.visuals.text_options.subpixel = mode;
+                style.visuals.text_options.subpixel = config.mode;
+                style.visuals.text_options.text_contrast = config.contrast;
             });
             ui.painter()
                 .rect_filled(ui.ctx().content_rect(), 0.0, Color32::BLACK);
             let galley = ui.painter().layout_no_wrap(
                 "Hamburgefonstiv".to_owned(),
                 FontId::proportional(14.0),
-                Color32::WHITE,
+                config.text_color,
             );
-            let mut shape = TextShape::new(Pos2::new(10.0, 20.0), galley, Color32::WHITE);
-            if draw == Draw::Rotated {
+            let mut shape = TextShape::new(Pos2::new(10.0, 20.0), galley, config.text_color);
+            if config.draw == Draw::Rotated {
                 shape = shape.with_angle(0.2);
             }
-            if draw == Draw::Scaled {
-                ui.ctx()
-                    .set_transform_layer(ui.layer_id(), TSTransform::from_scaling(1.37));
+            match config.draw {
+                Draw::Scaled => {
+                    ui.ctx()
+                        .set_transform_layer(ui.layer_id(), TSTransform::from_scaling(1.37));
+                }
+                Draw::FractionalTranslation => {
+                    ui.ctx().set_transform_layer(
+                        ui.layer_id(),
+                        TSTransform::from_translation(Vec2::new(0.25, 0.0)),
+                    );
+                }
+                Draw::Plain | Draw::Rotated => {}
             }
             ui.painter().add(shape);
         });
@@ -106,47 +162,133 @@ fn ink(image: &image::RgbaImage) -> u64 {
     image.pixels().map(|pixel| u64::from(pixel.0[1])).sum()
 }
 
-#[test]
-fn dual_source_text_is_colored_on_pixels_and_grayscale_off_grid() {
-    if !dual_source_available() {
-        eprintln!(
-            "SKIP dual_source_text_is_colored_on_pixels_and_grayscale_off_grid: \
-             no wgpu adapter with DUAL_SOURCE_BLENDING"
-        );
-        return;
-    }
+fn neutral_contrast_changes(first: &image::RgbaImage, second: &image::RgbaImage) -> usize {
+    first
+        .pixels()
+        .zip(second.pixels())
+        .filter(|(a, b)| {
+            let [ar, ag, ab, aa] = a.0;
+            let [br, bg, bb, ba] = b.0;
+            aa > 0 && ba > 0 && ar == ag && ag == ab && br == bg && bg == bb && ar != br
+        })
+        .count()
+}
 
-    let lcd = render(SubpixelMode::Rgb, Draw::Plain);
+fn tinted_contrast_changes(first: &image::RgbaImage, second: &image::RgbaImage) -> usize {
+    first
+        .pixels()
+        .zip(second.pixels())
+        .filter(|(a, b)| {
+            let [ar, ag, ab, aa] = a.0;
+            let [br, bg, bb, ba] = b.0;
+            aa > 0
+                && ba > 0
+                && ar.max(ag).max(ab) - ar.min(ag).min(ab) > 24
+                && [ar, ag, ab] != [br, bg, bb]
+        })
+        .count()
+}
+
+#[test]
+#[ignore = "manual hardware GPU test; set TASKMAN_RUN_GPU_SUBPIXEL_TESTS=1"]
+fn dual_source_text_is_colored_on_pixels_and_grayscale_off_grid() {
+    require_hardware("dual_source_text_is_colored_on_pixels_and_grayscale_off_grid");
+
+    let lcd = render(RenderConfig::default());
     assert!(
         chromatic_pixels(&lcd) > 50,
         "plain LCD text did not produce color fringes"
     );
     assert!(ink(&lcd) > 0, "plain LCD text drew no ink");
 
-    for draw in [Draw::Rotated, Draw::Scaled] {
-        let image = render(SubpixelMode::Rgb, draw);
+    for draw in [Draw::Rotated, Draw::Scaled, Draw::FractionalTranslation] {
+        let image = render(RenderConfig {
+            draw,
+            ..Default::default()
+        });
         assert_eq!(
             chromatic_pixels(&image),
             0,
-            "off-grid text must fall back to grayscale"
+            "{draw:?} text must fall back to grayscale"
         );
-        assert!(ink(&image) > 0, "off-grid fallback drew no ink");
+        assert!(ink(&image) > 0, "{draw:?} fallback drew no ink");
     }
 }
 
 #[test]
+#[ignore = "manual hardware GPU test; set TASKMAN_RUN_GPU_SUBPIXEL_TESTS=1"]
 fn bgr_swaps_the_colored_channel_order() {
-    if !dual_source_available() {
-        eprintln!(
-            "SKIP bgr_swaps_the_colored_channel_order: \
-             no wgpu adapter with DUAL_SOURCE_BLENDING"
-        );
-        return;
-    }
+    require_hardware("bgr_swaps_the_colored_channel_order");
 
-    let rgb = render(SubpixelMode::Rgb, Draw::Plain);
-    let bgr = render(SubpixelMode::Bgr, Draw::Plain);
+    let rgb = render(RenderConfig::default());
+    let bgr = render(RenderConfig {
+        mode: SubpixelMode::Bgr,
+        ..Default::default()
+    });
     let red: u64 = rgb.pixels().map(|pixel| u64::from(pixel.0[0])).sum();
     let blue_of_bgr: u64 = bgr.pixels().map(|pixel| u64::from(pixel.0[2])).sum();
     assert_eq!(red, blue_of_bgr);
+}
+
+#[test]
+#[ignore = "manual hardware GPU test; set TASKMAN_RUN_GPU_SUBPIXEL_TESTS=1"]
+fn neutral_coverage_receives_contrast_and_text_alpha_still_blends() {
+    require_hardware("neutral_coverage_receives_contrast_and_text_alpha_still_blends");
+
+    let no_contrast = render(RenderConfig {
+        contrast: 0.0,
+        ..Default::default()
+    });
+    let contrast = render(RenderConfig::default());
+    assert!(
+        neutral_contrast_changes(&no_contrast, &contrast) > 10,
+        "neutral LCD coverage must receive the contrast curve, not only tinted texels"
+    );
+    assert!(
+        tinted_contrast_changes(&no_contrast, &contrast) > 10,
+        "tinted LCD coverage must also receive the contrast curve"
+    );
+
+    let translucent = render(RenderConfig {
+        text_color: Color32::from_white_alpha(128),
+        ..Default::default()
+    });
+    assert!(ink(&translucent) > 0, "translucent text drew no ink");
+    assert!(
+        ink(&translucent) < ink(&contrast),
+        "translucent text must blend below opaque text"
+    );
+
+    let colored = render(RenderConfig {
+        text_color: Color32::from_rgb(220, 80, 20),
+        ..Default::default()
+    });
+    assert!(ink(&colored) > 0, "colored text drew no ink");
+    assert!(chromatic_pixels(&colored) > 0);
+}
+
+#[test]
+#[ignore = "manual hardware GPU test; set TASKMAN_RUN_GPU_SUBPIXEL_TESTS=1"]
+fn hardware_sampling_dithering_and_srgb_entry_points_still_render_lcd() {
+    require_hardware("hardware_sampling_dithering_and_srgb_entry_points_still_render_lcd");
+
+    for dithering in [false, true] {
+        let image = render(RenderConfig {
+            options: RendererOptions {
+                dithering,
+                predictable_texture_filtering: false,
+                ..RendererOptions::default()
+            },
+            ..Default::default()
+        });
+        assert!(ink(&image) > 0);
+        assert!(chromatic_pixels(&image) > 0);
+    }
+
+    let srgb = render(RenderConfig {
+        srgb_target: true,
+        ..Default::default()
+    });
+    assert!(ink(&srgb) > 0, "sRGB-framebuffer LCD path drew no ink");
+    assert!(chromatic_pixels(&srgb) > 0);
 }

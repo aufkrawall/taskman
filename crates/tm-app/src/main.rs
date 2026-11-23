@@ -1021,6 +1021,9 @@ struct NativeApp {
     /// changed under the window.
     #[cfg(target_os = "windows")]
     last_monitor_size: Option<eframe::egui::Vec2>,
+    /// Last window placement whose DirectWrite policy was applied.
+    #[cfg(target_os = "windows")]
+    last_text_rendering_key: Option<tm_platform::text_rendering::WindowPlacementKey>,
     /// A close request arrived (seen in the raw input, so it is also seen
     /// while the window is minimized and `ui` does not run).
     #[cfg(target_os = "windows")]
@@ -1086,6 +1089,8 @@ impl NativeApp {
             #[cfg(target_os = "windows")]
             last_monitor_size: None,
             #[cfg(target_os = "windows")]
+            last_text_rendering_key: None,
+            #[cfg(target_os = "windows")]
             close_request_seen: false,
             #[cfg(target_os = "windows")]
             initial_hide_deadline: std::time::Instant::now() + INITIAL_HIDE_TRAY_WAIT,
@@ -1140,6 +1145,34 @@ impl NativeApp {
             ui_state::save();
         }
         self.inner.shutdown();
+    }
+
+    #[cfg(target_os = "windows")]
+    fn sync_text_rendering(&mut self, ctx: &eframe::egui::Context) {
+        let Some(hwnd) = self.hwnd else {
+            return;
+        };
+        let Some(key) = tm_platform::text_rendering::window_placement_key(hwnd) else {
+            return;
+        };
+        if self.last_text_rendering_key == Some(key) {
+            return;
+        }
+
+        let params = tm_platform::text_rendering::query(Some(hwnd));
+        let changed = theme::set_subpixel_params(params);
+        self.last_text_rendering_key = Some(key);
+        if changed {
+            theme::refresh_text_rendering(ctx);
+            tracing::debug!(
+                window_rect = ?key.window_rect,
+                monitor = key.monitor,
+                monitor_rect = ?key.monitor_rect,
+                effective_dpi = key.effective_dpi,
+                ?params,
+                "updated text-rendering policy for window placement"
+            );
+        }
     }
 }
 
@@ -1202,6 +1235,8 @@ impl eframe::App for NativeApp {
         {
             ctx.input_mut(|i| i.focused = true);
         }
+        #[cfg(target_os = "windows")]
+        self.sync_text_rendering(ctx);
         #[cfg(target_os = "windows")]
         poll_show_event_fallback(ctx);
         // Before the tray actions, so a restore requested THIS frame cannot
@@ -2012,6 +2047,36 @@ mod tests {
         }
         #[cfg(feature = "glow")]
         assert!(!renderer_supports_subpixel(eframe::Renderer::Glow, true));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn same_sized_moves_and_dpi_changes_produce_different_placement_keys() {
+        use tm_platform::text_rendering::WindowPlacementKey;
+
+        let original = WindowPlacementKey {
+            window_rect: [0, 0, 800, 600],
+            monitor: 1,
+            monitor_rect: [0, 0, 1920, 1080],
+            effective_dpi: 96,
+        };
+        assert_ne!(
+            original,
+            WindowPlacementKey {
+                window_rect: [1920, 0, 2720, 600],
+                ..original
+            },
+            "a same-sized move to another monitor must be detected"
+        );
+        assert_ne!(
+            original,
+            WindowPlacementKey {
+                effective_dpi: 144,
+                monitor_rect: [0, 0, 2880, 1620],
+                ..original
+            },
+            "a DPI/topology change must be detected"
+        );
     }
 
     #[cfg(all(feature = "software", feature = "wgpu", feature = "glow"))]

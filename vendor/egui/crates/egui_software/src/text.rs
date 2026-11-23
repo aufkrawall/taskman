@@ -161,6 +161,23 @@ fn blit_rect(
     let s_lin_r = blend.gamma.linear_u16(sr);
     let s_lin_g = blend.gamma.linear_u16(sg);
     let s_lin_b = blend.gamma.linear_u16(sb);
+    let ordinary_texel = |texel: Color32, dst: u32| -> Option<u32> {
+        let [tr, tg, tb, ta] = texel.to_array();
+        if (ta | tr | tg | tb) == 0 {
+            return None;
+        }
+        if ta == 255 && ca == 255 && tr == 255 && tg == 255 && tb == 255 {
+            return Some(solid_packed);
+        }
+        let inv_255 = 1.0f32 / 255.0;
+        let src = [
+            cr as f32 * tr as f32 * inv_255,
+            cg as f32 * tg as f32 * inv_255,
+            cb as f32 * tb as f32 * inv_255,
+            ca as f32 * ta as f32 * inv_255,
+        ];
+        Some(crate::raster::blend_over(src, dst))
+    };
 
     for y in bounds.min_y..bounds.max_y {
         let src_y = v0 + (y - y0);
@@ -185,32 +202,22 @@ fn blit_rect(
         let dst_slice = &mut dst_row[x_start as usize..x_start as usize + count];
 
         if !is_subpixel {
-            let inv_255 = 1.0f32 / 255.0;
             for (&texel, dst) in src_slice.iter().zip(dst_slice.iter_mut()) {
-                let [tr, tg, tb, ta] = texel.to_array();
-                if (ta | tr | tg | tb) == 0 {
-                    continue;
+                if let Some(pixel) = ordinary_texel(texel, *dst) {
+                    *dst = pixel;
                 }
-                if ta == 255 && ca == 255 && tr == 255 && tg == 255 && tb == 255 {
-                    *dst = solid_packed;
-                    continue;
-                }
-                let src = [
-                    cr as f32 * tr as f32 * inv_255,
-                    cg as f32 * tg as f32 * inv_255,
-                    cb as f32 * tb as f32 * inv_255,
-                    ca as f32 * ta as f32 * inv_255,
-                ];
-                *dst = crate::raster::blend_over(src, *dst);
             }
         } else if ca == 255 {
             // Hot path: opaque sub-pixel ClearType text.
             if swaps_rb {
                 for (&texel, dst) in src_slice.iter().zip(dst_slice.iter_mut()) {
-                    let [tr, tg, tb, ta] = texel.to_array();
-                    if (ta | tr | tg | tb) == 0 {
+                    if !epaint::text::subpixel::is_lcd_texel(texel) {
+                        if let Some(pixel) = ordinary_texel(texel, *dst) {
+                            *dst = pixel;
+                        }
                         continue;
                     }
+                    let [tr, tg, tb, _] = texel.to_array();
                     if tb == 255 && tg == 255 && tr == 255 {
                         *dst = solid_packed;
                         continue;
@@ -226,10 +233,13 @@ fn blit_rect(
                 }
             } else {
                 for (&texel, dst) in src_slice.iter().zip(dst_slice.iter_mut()) {
-                    let [tr, tg, tb, ta] = texel.to_array();
-                    if (ta | tr | tg | tb) == 0 {
+                    if !epaint::text::subpixel::is_lcd_texel(texel) {
+                        if let Some(pixel) = ordinary_texel(texel, *dst) {
+                            *dst = pixel;
+                        }
                         continue;
                     }
+                    let [tr, tg, tb, _] = texel.to_array();
                     if tr == 255 && tg == 255 && tb == 255 {
                         *dst = solid_packed;
                         continue;
@@ -248,10 +258,13 @@ fn blit_rect(
             // Translucent sub-pixel text.
             let scale = |cov: u8| ((u32::from(cov) * u32::from(ca) + 127) / 255) as u8;
             for (&texel, dst) in src_slice.iter().zip(dst_slice.iter_mut()) {
-                let [tr, tg, tb, ta] = texel.to_array();
-                if (ta | tr | tg | tb) == 0 {
+                if !epaint::text::subpixel::is_lcd_texel(texel) {
+                    if let Some(pixel) = ordinary_texel(texel, *dst) {
+                        *dst = pixel;
+                    }
                     continue;
                 }
+                let [tr, tg, tb, _] = texel.to_array();
                 let (cov_r, cov_b) = if swaps_rb { (tb, tr) } else { (tr, tb) };
                 let d = *dst;
                 let dr = ((d >> 16) & 0xff) as u8;
@@ -451,8 +464,8 @@ mod tests {
     #[test]
     fn subpixel_coverage_produces_a_tinted_pixel() {
         let atlas = Texture {
-            // Red fully covered, green half, blue not at all. Alpha is the minimum
-            // channel, the atlas sentinel used by both GPU and CPU renderers.
+            // Red fully covered, green half, blue not at all. Alpha zero is the explicit
+            // LCD tag used by both GPU and CPU renderers.
             pixels: vec![Color32::from_rgba_premultiplied(255, 128, 0, 0)],
             width: 1,
             height: 1,
@@ -512,7 +525,7 @@ mod tests {
     #[test]
     fn equal_coverage_produces_no_tint() {
         let atlas = Texture {
-            pixels: vec![Color32::from_rgba_premultiplied(128, 128, 128, 128)],
+            pixels: vec![Color32::from_rgba_premultiplied(128, 128, 128, 0)],
             width: 1,
             height: 1,
             options: TextureOptions::NEAREST,
@@ -537,7 +550,7 @@ mod tests {
     #[test]
     fn text_alpha_scales_coverage_without_tinting() {
         let atlas = Texture {
-            pixels: vec![Color32::from_rgba_premultiplied(255, 255, 255, 255)],
+            pixels: vec![Color32::from_rgba_premultiplied(255, 255, 255, 0)],
             width: 1,
             height: 1,
             options: TextureOptions::NEAREST,
@@ -561,5 +574,81 @@ mod tests {
         let (r, g, b) = ((half >> 16) & 0xff, (half >> 8) & 0xff, half & 0xff);
         assert_eq!(r, g, "fading must not tint");
         assert_eq!(g, b, "fading must not tint");
+    }
+
+    #[test]
+    fn neutral_and_tinted_lcd_coverage_use_contrast_in_the_direct_blit() {
+        for coverage in [[128, 128, 128], [255, 96, 16]] {
+            let atlas = Texture {
+                pixels: vec![Color32::from_rgba_premultiplied(
+                    coverage[0],
+                    coverage[1],
+                    coverage[2],
+                    0,
+                )],
+                width: 1,
+                height: 1,
+                options: TextureOptions::NEAREST,
+            };
+            let render = |contrast| {
+                let gamma = TextGamma::new(1.8, contrast);
+                let blend = TextBlend {
+                    subpixel: SubpixelMode::Rgb,
+                    gamma: &gamma,
+                };
+                let mut buf = vec![0u32; 4];
+                let mut target = Target::new(&mut buf, 2, 2).unwrap();
+                let q = quad(0.0, 0.0, 1.0, 1.0, 0.0, 0.0, Color32::WHITE);
+                assert!(blit_quad(&mut target, full_clip(2, 2), &q, &atlas, blend));
+                buf[0]
+            };
+            let channels = |pixel| ((pixel >> 16) & 0xff) + ((pixel >> 8) & 0xff) + (pixel & 0xff);
+            assert!(
+                channels(render(0.5)) > channels(render(0.0)),
+                "LCD coverage {coverage:?} must receive the contrast boost"
+            );
+        }
+    }
+
+    #[test]
+    fn mixed_atlas_direct_blit_uses_lcd_only_for_tagged_texels() {
+        let neutral_lcd = Color32::from_rgba_premultiplied(128, 128, 128, 0);
+        let tinted_lcd = Color32::from_rgba_premultiplied(255, 96, 16, 0);
+        let color_glyph = Color32::from_rgba_premultiplied(200, 40, 10, 220);
+        let grayscale = Color32::from_rgba_premultiplied(96, 96, 96, 96);
+        let zero = Color32::TRANSPARENT;
+        let atlas = Texture {
+            pixels: vec![neutral_lcd, tinted_lcd, color_glyph, grayscale, zero],
+            width: 5,
+            height: 1,
+            options: TextureOptions::NEAREST,
+        };
+        let mut buf = vec![0x00101010; 8];
+        let mut target = Target::new(&mut buf, 5, 1).unwrap();
+        let q = quad(0.0, 0.0, 5.0, 1.0, 0.0, 0.0, Color32::WHITE);
+        assert!(blit_quad(
+            &mut target,
+            full_clip(5, 1),
+            &q,
+            &atlas,
+            lcd(SubpixelMode::Rgb)
+        ));
+
+        let neutral = buf[0];
+        let tinted = buf[1];
+        assert_eq!((neutral >> 16) & 0xff, (neutral >> 8) & 0xff);
+        assert_eq!((neutral >> 8) & 0xff, neutral & 0xff);
+        assert!(
+            ((tinted >> 16) & 0xff) > ((tinted >> 8) & 0xff)
+                && ((tinted >> 8) & 0xff) > (tinted & 0xff),
+            "tagged tinted coverage must stay on the LCD path"
+        );
+        assert_ne!(buf[2], 0x00101010, "color glyph used the ordinary blend");
+        assert_eq!(
+            buf[3],
+            crate::raster::blend_over([96.0, 96.0, 96.0, 96.0], 0x00101010),
+            "grayscale coverage must use the ordinary premultiplied blend"
+        );
+        assert_eq!(buf[4], 0x00101010, "zero coverage must draw nothing");
     }
 }

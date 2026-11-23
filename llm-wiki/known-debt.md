@@ -61,26 +61,43 @@ items across Phases 2–6. The following concrete gaps remain:
   report; the honest root is preferred over a synthesized edge.
 - **Sub-pixel (ClearType-like) text: DONE with platform residuals** (updated
   2026-11-23). epaint always stored `Color32`, so per-channel coverage needed no new
-  texture format; the contract now uses RGB coverage with alpha = minimum RGB, which also
-  identifies LCD texels in a mixed grayscale/color atlas. The software renderer applies
-  the full gamma/contrast model. WGPU uses a second dual-source font-atlas pipeline only
-  when the selected device enabled `DUAL_SOURCE_BLENDING`; Glow and unsupported adapters
-  stay grayscale.
+  texture format; the contract now uses RGB coverage with alpha zero as an explicit LCD
+  tag. Neutral, tinted and full coverage are equally identifiable; zero coverage is
+  `(0,0,0,0)`, and mixed premultiplied color glyphs retain non-zero alpha. The software
+  renderer applies the full gamma/contrast model and routes direct-blit texels
+  individually. WGPU uses a second dual-source font-atlas pipeline only when the selected
+  device enabled `DUAL_SOURCE_BLENDING`; the pipeline is selected only for non-white-UV
+  managed-font meshes with LCD content. Glow and unsupported adapters stay grayscale.
   - **Accepted GPU limitation:** fixed-function dual-source blending cannot reproduce the
     software renderer's nonlinear destination-gamma term. WGPU carries RGB/BGR order and
     contrast, but its output is not claimed to be DirectWrite-gamma-exact.
+  - **Windows monitor policy:** the window placement/monitor/DPI key refreshes the
+    DirectWrite policy after moves, including same-sized moves. Multiple intersecting
+    monitors must agree on validated parameters and stripe order; any failed/malformed
+    query or conflict disables LCD for that window instead of assuming RGB or choosing one
+    half. Linux has no equivalent per-monitor signal.
   - **Linux source:** the process-wide startup query follows effective per-user fontconfig
     `antialias`, horizontal `rgba` and `lcdfilter` values, using trusted absolute
-    `fc-match` paths and inheriting the user's environment. Vertical/unknown/none,
-    `antialias: False` and malformed values fail closed.
+    canonical `fc-match` paths with root-owned, non-group/world-writable parent directories,
+    while inheriting the user's environment. Vertical/unknown/none, `antialias: False` and
+    malformed values fail closed. A single 750 ms absolute deadline caps stdout at 64 KiB;
+    timeout/overflow kills and reaps the child. System-font selection shares that resolver
+    and process runner.
   - **Linux per-monitor limitation:** fontconfig exposes one effective order/filter, not
     a proven order for each monitor. Mixed-panel desktops therefore use one process-wide
     choice. Off-grid glyphs use the grayscale fallback, but a compositor that resamples an
     otherwise 1:1 fractional-Wayland surface can still reduce LCD correctness; no
     fontconfig property proves that compositor behavior.
-  - **Verification residual:** the 2026-11-23 implementation pass was explicitly forbidden
-    from compiling or running tests. The D3D12/Vulkan shader and visual output need a real
-    hardware run before treating the GPU path as release-verified.
+  - **Verification residual:** the 2026-11-23 implementation and correction passes were
+    explicitly forbidden from compiling or running tests. Normal `egui-wgpu` tests now
+    include CPU Naga validation for both LCD fragment paths, but they were not executed.
+    The D3D12/Vulkan shader and visual output need the ignored hardware suite, with
+    `TASKMAN_RUN_GPU_SUBPIXEL_TESTS=1`, on a non-CPU dual-source adapter before treating the
+    GPU path as release-verified. There is no portable CI GPU claim.
+  - **Color-glyph hardware residual:** current epaint has no COLR/CBDT source, so the
+    manual GPU suite cannot create a real color glyph. Synthetic premultiplied color
+    texels are covered in software, and renderer policy keeps all non-LCD texels on the
+    ordinary blend. Revisit if upstream adds color-glyph rasterization.
 - **Software rendering performance: SUPERSEDED.** CPU mode directly rasterizes
   the UI. The old WARP path measured about 14 cores at 2.9 fps. D3D12 and Vulkan
   select a surface-compatible GPU.

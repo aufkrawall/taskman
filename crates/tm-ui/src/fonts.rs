@@ -263,22 +263,12 @@ fn build_definitions() -> FontDefinitions {
 
 /// Ask Fontconfig for the user's configured generic family. This respects
 /// KDE Plasma's font settings, per-user ~/.config/fontconfig rules and distro
-/// aliases instead of assuming a particular Noto/DejaVu installation path.
+/// aliases instead of assuming a particular Noto/DejaVu installation path. The
+/// `tm-platform` helper uses the same trusted absolute `fc-match`, bounded capture and
+/// fail-closed environment handling as the text-rendering policy query.
 #[cfg(target_os = "linux")]
 fn fontconfig_match(pattern: &str) -> Option<String> {
-    let out = std::process::Command::new("fc-match")
-        .args(["-f", "%{file}\n", pattern])
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let path = String::from_utf8_lossy(&out.stdout)
-        .lines()
-        .next()?
-        .trim()
-        .to_string();
-    (!path.is_empty() && std::path::Path::new(&path).is_file()).then_some(path)
+    tm_platform::fontconfig::match_file(pattern)
 }
 
 fn load_first(paths: &[String]) -> Option<FontData> {

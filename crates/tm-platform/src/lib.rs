@@ -309,6 +309,24 @@ pub mod text_rendering {
         }
     }
 
+    /// Cheap identity of the window's current monitor placement.
+    ///
+    /// The window rectangle makes same-sized moves visible, while the monitor handle,
+    /// monitor rectangle and effective DPI cover topology and scaling changes. A caller
+    /// can compare this every frame and only run the more expensive monitor-policy query
+    /// when it changes.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct WindowPlacementKey {
+        /// Outer window rectangle in physical pixels.
+        pub window_rect: [i32; 4],
+        /// Current monitor identity chosen by the window system.
+        pub monitor: isize,
+        /// Full rectangle of the current monitor in physical pixels.
+        pub monitor_rect: [i32; 4],
+        /// Effective DPI reported for the window.
+        pub effective_dpi: u32,
+    }
+
     /// Query the display showing `hwnd` (or the primary display when `None`).
     ///
     /// **Only valid once a window exists** -- one of the gates depends on DPI awareness,
@@ -316,6 +334,18 @@ pub mod text_rendering {
     #[cfg(target_os = "windows")]
     pub fn query(hwnd: Option<isize>) -> Params {
         convert(crate::win::text_rendering::query(hwnd))
+    }
+
+    /// Cheap placement/monitor/DPI identity for change detection.
+    #[cfg(target_os = "windows")]
+    pub fn window_placement_key(hwnd: isize) -> Option<WindowPlacementKey> {
+        crate::win::text_rendering::window_placement_key(hwnd)
+    }
+
+    /// Non-Windows platforms have no per-window monitor policy.
+    #[cfg(not(target_os = "windows"))]
+    pub fn window_placement_key(_hwnd: isize) -> Option<WindowPlacementKey> {
+        None
     }
 
     /// Blend parameters only, without the validity gates. Safe to call before a window
@@ -369,6 +399,16 @@ pub mod text_rendering {
     #[cfg(not(any(target_os = "windows", target_os = "linux")))]
     pub fn blend_params(_hwnd: Option<isize>) -> Params {
         Params::default()
+    }
+}
+
+/// Trusted, bounded Fontconfig process helpers.
+#[cfg(target_os = "linux")]
+pub mod fontconfig {
+    /// Resolve a generic family through the same absolute, validated `fc-match` path used
+    /// by the text-policy query.
+    pub fn match_file(pattern: &str) -> Option<String> {
+        crate::fontconfig_text::match_file(pattern)
     }
 }
 

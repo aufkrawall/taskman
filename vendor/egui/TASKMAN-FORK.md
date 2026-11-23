@@ -85,7 +85,7 @@ math in the new `subpixel.rs`.
 | File | Nature |
 | --- | --- |
 | `crates/epaint/src/text/subpixel.rs` | **new** — `SubpixelMode`, LCD filters and coverage filtering |
-| `crates/epaint/src/text/font.rs` | **edit** — 3x horizontal fill, one-pixel bounds expansion, RGB filtering, alpha-min sentinel |
+| `crates/epaint/src/text/font.rs` | **edit** — 3x horizontal fill, one-pixel bounds expansion, RGB filtering, explicit zero-alpha LCD tag |
 | `crates/epaint/src/text/mod.rs` | **edit** — `subpixel`, `lcd_filter`, `cleartype_level`, `text_gamma`, `text_contrast` |
 | `crates/epaint/src/lib.rs` | **edit** — re-exports `LcdFilter` and `SubpixelMode` |
 
@@ -99,9 +99,11 @@ if opts.subpixel.is_off() {
 }
 ```
 
-so the conflict, when it comes, is one block and not a merge of two rasterizers. Alpha is
-the minimum RGB coverage, not the maximum: premultiplied color glyphs never have a channel
-above alpha, so `max(rgb) > alpha` is the exact GPU/CPU sentinel for LCD coverage.
+so the conflict, when it comes, is one block and not a merge of two rasterizers. Every
+non-empty LCD texel is `(cov_r, cov_g, cov_b, 0)`, so neutral, tinted and full coverage
+share one explicit tag. Zero coverage is `(0,0,0,0)`, and premultiplied color glyphs keep
+non-zero alpha. Alpha is never treated as LCD coverage; transformed/fallback paths recover
+mean coverage from RGB.
 
 ### 3. `egui_software`: the CPU painter
 
@@ -309,11 +311,11 @@ feature, the ordinary pipeline remains selected.
 | File | Change | Why |
 | --- | --- | --- |
 | `crates/egui-wgpu/src/egui_lcd.wgsl` | **new** — dual-source fragment outputs, per-channel coverage blend, RGB/BGR swap, contrast curve, one-texel-per-pixel derivative/center test | A fixed-function GPU needs source color and per-channel source alpha separately; one scalar alpha cannot express LCD stripes |
-| `crates/egui-wgpu/src/renderer.rs` | second optional pipeline; `ONE / ONE_MINUS_SRC1`; managed-atlas sub-pixel state; pipeline selection only for `TextureId::default()`; renderer-level order/contrast uniform | Keep non-font textures, color glyphs and unsupported devices on the byte-identical ordinary path |
+| `crates/egui-wgpu/src/renderer.rs` | second optional pipeline; `ONE / ONE_MINUS_SRC1`; managed-atlas sub-pixel state; pipeline selection only for `TextureId::default()` with non-white UVs; 32-byte padded order/contrast uniform; Naga validation and a 250 ms-bounded backend error scope | Keep non-font textures, all-white solid geometry, color glyphs and unsupported devices on the byte-identical ordinary path, and never advertise a pipeline that failed validation |
 | `crates/egui-wgpu/src/setup.rs` | request `DUAL_SOURCE_BLENDING` as `adapter.features() & DUAL_SOURCE_BLENDING` | Request only what the selected adapter advertises; never make device creation fail for an unsupported adapter |
 | `crates/egui-wgpu/src/winit.rs` | publish current `TextOptions` to the renderer each frame; expose whether the LCD pipeline exists | The renderer needs the atlas order and weight but must not guess them from colors |
-| `crates/egui_software/src/{raster.rs,texture.rs,lib.rs}` | transformed glyph triangles convert LCD texels to mean grayscale before filtering | Rotated/scaled/fractionally aligned software text must not smear color fringes |
-| `crates/egui_kittest/tests/subpixel_text.rs` | **new** — headless GPU color/BGR/transform coverage with explicit no-adapter skip | Detect shader/pipeline regressions when a suitable WGPU adapter is available |
+| `crates/egui_software/src/{raster.rs,texture.rs,text.rs,lib.rs}` | transformed glyph triangles convert LCD texels to mean grayscale before filtering; direct blits choose LCD vs ordinary blending per texel | Rotated/scaled/fractionally aligned software text must not smear color fringes, and mixed grayscale/color glyphs must keep their normal blend |
+| `crates/egui_kittest/tests/subpixel_text.rs` | **new, manual** — ignored GPU color/BGR/transform/contrast/sampling/dithering/sRGB coverage; requires `TASKMAN_RUN_GPU_SUBPIXEL_TESTS=1` and a suitable adapter | Detect shader/pipeline regressions on real dual-source hardware without claiming portable CI coverage or reporting a missing-adapter skip as a pass |
 
 The GPU path carries the selected `TextOptions::text_contrast` and RGB/BGR order through a
 uniform. It deliberately does not claim to implement the software renderer's nonlinear
@@ -321,10 +323,21 @@ destination gamma: fixed-function blending cannot read the destination. The soft
 keeps its full gamma/contrast model.
 
 **Coverage:** `egui-wgpu` unit tests cover feature detection/request, full/partial atlas
-state transitions, default-texture-only selection, transform mapping and order/contrast
-fields. `egui_software` covers grayscale conversion of LCD texels while leaving color
-glyphs unchanged. The `egui_kittest` test is not part of the shipped fork gate but is
-available as an explicit hardware check.
+state transitions, default-texture/non-white-UV selection, transform mapping, order/contrast
+fields, the 32-byte uniform layout, and Naga parse+validation of both LCD fragment entry
+points. `egui_software` covers neutral contrast, tinted/full/zero coverage, mixed-atlas
+per-texel direct blits, and transformed grayscale conversion. The `egui_kittest` suite is
+ignored/manual and is not part of the shipped fork gate:
+
+```bash
+TASKMAN_RUN_GPU_SUBPIXEL_TESTS=1 cargo test -p egui_kittest --features wgpu \
+  --test subpixel_text -- --ignored --test-threads=1
+```
+
+It fails if the opt-in variable or a non-CPU D3D12/Vulkan adapter with
+`DUAL_SOURCE_BLENDING` is missing. Current epaint has no color-glyph source, so hardware
+color-glyph coverage is not practical; synthetic premultiplied color texels are covered in
+software and policy tests.
 
 ## Rebase runbook
 
@@ -391,14 +404,14 @@ After pulling:
 
 Things that are safe today but would silently break the sub-pixel path:
 
-- **Atlas alpha sentinel.** LCD texels use `alpha = min(rgb)`, which works because
-  premultiplied color glyphs never exceed alpha. A future color format that violates that
-  invariant needs a real per-texel coverage/color tag; do not infer LCD coverage from color
-  alone.
+- **Atlas LCD tag.** Every non-empty LCD texel uses `alpha = 0` with non-zero RGB. Zero
+  coverage is `(0,0,0,0)`; premultiplied color/emoji glyphs must retain non-zero alpha or
+  gain a separate per-texel coverage/color mask. Do not infer color glyphs from RGB alone.
 - **WGPU pipeline selection.** The LCD pipeline must remain restricted to
-  `TextureId::default()`, a non-empty dual-source capability, the active sub-pixel mode and
-  an atlas state that actually contains LCD texels. Relaxing any one of those conditions
-  reinterprets ordinary textures or grayscale/color glyphs as coverage.
+  `TextureId::default()` with non-`WHITE_UV` geometry, a non-empty dual-source capability,
+  the active sub-pixel mode and an atlas state that actually contains LCD tags. Relaxing
+  any one of those conditions reinterprets solid UI geometry, ordinary textures or
+  grayscale/color glyphs as coverage.
 - **`TextOptions` gaining fields upstream.** It is compared by value to decide atlas
   invalidation; a new field that we do not thread through means stale atlases.
 - **`epaint::Vertex` layout changes.** The software rasterizer reproduces the glow shader

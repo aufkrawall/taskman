@@ -81,6 +81,37 @@
 - This first pass was source-reviewed and statically checked but not compiled
   or tested on the implementing host.
 
+## 2026-11-23 - GPU LCD correction pass
+
+- Independent review found no P0. Reviewed tip `edb9b8fc` was integrated from base
+  `218e6a0b` as one cherry-pick, then corrected in a separate commit.
+- Replaced the ambiguous alpha-min LCD encoding with an explicit zero-alpha tag:
+  non-empty coverage is `(cov_r,cov_g,cov_b,0)` regardless of neutrality, tint or full
+  coverage; `(0,0,0,0)` remains zero; premultiplied color glyphs retain non-zero alpha.
+  Software direct blits now choose LCD vs ordinary blend per texel, transformed text and
+  GPU fallback recover mean coverage from RGB, and regressions cover neutral contrast,
+  tinted/full/zero and mixed-atlas color/grayscale texels.
+- Windows now tracks a window placement/monitor/DPI key and refreshes DirectWrite policy
+  on same-sized moves or topology changes without recreating the renderer. All intersecting
+  monitors must agree; any failed/malformed query or conflict fails closed for that window,
+  including one monitor. All agreement preserves LCD. Linux remains explicitly
+  process-wide.
+- Hardened WGPU: the uniform `Locals` struct is padded to 32 bytes; normal `egui-wgpu`
+  tests parse/validate both LCD fragment paths with Naga; backend shader/pipeline creation
+  runs in a 250 ms-bounded validation error scope and drops only `lcd_pipeline` on failure.
+  All-`WHITE_UV` geometry stays ordinary, and atlas state short-circuits redundant partial
+  rescans. Hardware `egui_kittest` tests are ignored/manual and require an opt-in plus a
+  D3D12/Vulkan dual-source adapter; no missing-adapter test can pass as a skip.
+- Unified Linux system-font lookup with the trusted absolute `fc-match` resolver. Both
+  queries use one 750 ms absolute deadline, a 64 KiB stdout cap, kill/reap on timeout or
+  overflow, and canonical executable/parent-directory policy; the user's fontconfig
+  environment is inherited. Parser/path/limit/timeout tests use synthetic commands, not
+  the live desktop configuration.
+- The correction pass was forbidden from compiling, running tests, building or
+  running Python. Follow-up parent-side validation then ran the Naga/unit suite and the
+  manual D3D12/Vulkan hardware suite successfully; the final gate remains the release
+  certification step.
+
 ## 2026-11-23 - GPU LCD text and Linux fontconfig audit
 
 - Added an `egui-wgpu` dual-source font-atlas pipeline. Device creation requests

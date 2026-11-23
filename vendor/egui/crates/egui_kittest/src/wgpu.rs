@@ -77,6 +77,22 @@ pub fn create_render_state(
     .expect("Failed to create render state")
 }
 
+/// Create a headless renderer with an explicit target format.
+///
+/// The default headless setup selects a gamma-unaware target. This variant exists so the
+/// manual LCD hardware suite can exercise the sRGB-framebuffer shader entry point.
+pub fn create_render_state_with_format(
+    setup: WgpuSetup,
+    options: egui_wgpu::RendererOptions,
+    target_format: wgpu::TextureFormat,
+) -> egui_wgpu::RenderState {
+    let mut state = create_render_state(setup, options);
+    let renderer = egui_wgpu::Renderer::new(&state.device, target_format, options);
+    state.target_format = target_format;
+    state.renderer = Arc::new(egui::epaint::mutex::RwLock::new(renderer));
+    state
+}
+
 /// Utility to render snapshots from a [`crate::Harness`] using [`egui_wgpu`].
 pub struct WgpuTestRenderer {
     render_state: RenderState,
@@ -101,8 +117,24 @@ impl WgpuTestRenderer {
 
     /// Create a new [`WgpuTestRenderer`] with the given setup.
     pub fn from_setup(setup: WgpuSetup) -> Self {
+        Self::from_setup_and_options(setup, egui_wgpu::RendererOptions::PREDICTABLE)
+    }
+
+    /// Create a new [`WgpuTestRenderer`] from a setup and explicit render options.
+    pub fn from_setup_and_options(setup: WgpuSetup, options: egui_wgpu::RendererOptions) -> Self {
         Self {
-            render_state: create_render_state(setup, egui_wgpu::RendererOptions::PREDICTABLE),
+            render_state: create_render_state(setup, options),
+        }
+    }
+
+    /// Create a new [`WgpuTestRenderer`] with an explicit target framebuffer format.
+    pub fn from_setup_and_format(
+        setup: WgpuSetup,
+        options: egui_wgpu::RendererOptions,
+        target_format: wgpu::TextureFormat,
+    ) -> Self {
+        Self {
+            render_state: create_render_state_with_format(setup, options, target_format),
         }
     }
 
