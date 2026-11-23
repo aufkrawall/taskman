@@ -6,8 +6,14 @@
 //! list.
 
 use crate::actions::ProcessModule;
+use std::io::Read;
 use std::path::Path;
 use tm_core::error::{Result, TmError};
+
+/// Executable mappings are normally well below a megabyte. A hostile procfs
+/// replacement or a pathological process must not turn a page query into an
+/// unbounded allocation.
+const MAX_MAPS_BYTES: u64 = 8 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Mapping {
@@ -155,7 +161,7 @@ fn modules_from_maps(text: &str) -> Vec<ProcessModule> {
 
 pub(super) fn list_process_modules(pid: u32) -> Result<Vec<ProcessModule>> {
     let path = format!("/proc/{pid}/maps");
-    let maps = match std::fs::read_to_string(&path) {
+    let maps = match read_maps(&path) {
         Ok(maps) => maps,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             return Err(TmError::ProcessNotFound { pid });
@@ -167,7 +173,24 @@ pub(super) fn list_process_modules(pid: u32) -> Result<Vec<ProcessModule>> {
             ));
         }
     };
-    Ok(modules_from_maps(&maps))
+    Ok(modules_from_maps_bytes(&maps))
+}
+
+fn read_maps(path: &str) -> std::io::Result<Vec<u8>> {
+    let file = std::fs::File::open(path)?;
+    let mut bytes = Vec::with_capacity(64 * 1024);
+    file.take(MAX_MAPS_BYTES + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_MAPS_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("{path} exceeds the {MAX_MAPS_BYTES}-byte safety limit"),
+        ));
+    }
+    Ok(bytes)
+}
+
+fn modules_from_maps_bytes(bytes: &[u8]) -> Vec<ProcessModule> {
+    modules_from_maps(&String::from_utf8_lossy(bytes))
 }
 
 #[cfg(test)]
@@ -223,6 +246,15 @@ mod tests {
         assert!(parse_maps_line("1000-2000 rx 0 00:00 1 /a").is_none());
         assert!(parse_maps_line("1000-1000 r-xp 0 00:00 1 /a").is_none());
         assert!(parse_maps_line("2000-1000 r-xp 0 00:00 1 /a").is_none());
+    }
+
+    #[test]
+    fn non_utf8_mapping_paths_are_reported_lossily_without_losing_the_page() {
+        let maps = b"1000-2000 r-xp 00000000 08:01 42 /tmp/lib\xffname.so\n";
+        let modules = modules_from_maps_bytes(maps);
+        assert_eq!(modules.len(), 1);
+        assert!(modules[0].path.contains('\u{fffd}'));
+        assert_eq!(modules[0].name, "lib\u{fffd}name.so");
     }
 
     #[test]

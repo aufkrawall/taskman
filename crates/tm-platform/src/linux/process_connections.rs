@@ -3,7 +3,9 @@
 
 use crate::actions::{ConnectionProtocol, ProcessConnection, TcpState};
 use std::collections::HashSet;
+use std::io::{BufRead, BufReader};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::os::unix::fs::MetadataExt;
 use tm_core::error::{Result, TmError};
 
 const TABLES: [(&str, ConnectionProtocol); 4] = [
@@ -17,6 +19,27 @@ const TABLES: [(&str, ConnectionProtocol); 4] = [
 struct ProcNetSocket {
     inode: u64,
     connection: ProcessConnection,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct NetNamespace {
+    device: u64,
+    inode: u64,
+}
+
+fn net_namespace(pid: u32) -> Result<NetNamespace> {
+    let path = format!("/proc/{pid}/ns/net");
+    let metadata = std::fs::metadata(&path).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            TmError::ProcessNotFound { pid }
+        } else {
+            TmError::platform("read /proc/pid/ns/net", format!("{path}: {error}"))
+        }
+    })?;
+    Ok(NetNamespace {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+    })
 }
 
 fn socket_inode_link(link: &str) -> Option<u64> {
@@ -114,11 +137,18 @@ fn remote_of(state: TcpState, remote: SocketAddr) -> Option<SocketAddr> {
 /// Parse one `/proc/<pid>/net/{tcp,tcp6,udp,udp6}` table. Address words are
 /// stored in host byte order in the kernel's textual representation, which is
 /// little-endian on every Linux target this project ships.
-fn parse_net_table(text: &str, protocol: ConnectionProtocol) -> Vec<ProcNetSocket> {
+fn parse_net_table<R: BufRead>(
+    reader: R,
+    protocol: ConnectionProtocol,
+    inodes: Option<&HashSet<u64>>,
+) -> Vec<ProcNetSocket> {
     let ipv6 = matches!(protocol, ConnectionProtocol::Tcp6 | ConnectionProtocol::Udp6);
     let tcp = matches!(protocol, ConnectionProtocol::Tcp | ConnectionProtocol::Tcp6);
     let mut sockets = Vec::new();
-    for line in text.lines().skip(1) {
+    for line in reader.lines().skip(1) {
+        let Ok(line) = line else {
+            continue;
+        };
         let fields = line.split_ascii_whitespace().collect::<Vec<_>>();
         if fields.len() < 10 {
             continue;
@@ -132,6 +162,9 @@ fn parse_net_table(text: &str, protocol: ConnectionProtocol) -> Vec<ProcNetSocke
         if inode == 0 {
             continue;
         }
+        if inodes.is_some_and(|inodes| !inodes.contains(&inode)) {
+            continue;
+        }
         let state = if tcp {
             let Ok(raw) = u32::from_str_radix(fields[3], 16) else {
                 continue;
@@ -141,8 +174,23 @@ fn parse_net_table(text: &str, protocol: ConnectionProtocol) -> Vec<ProcNetSocke
             None
         };
         let remote = match state {
-            Some(state) => parse_proc_address(fields[2], ipv6)
-                .and_then(|(ip, port)| remote_of(state, SocketAddr::new(ip, port))),
+            Some(state) => {
+                let Some((ip, port)) = parse_proc_address(fields[2], ipv6) else {
+                    continue;
+                };
+                let remote = SocketAddr::new(ip, port);
+                let Some(remote) = remote_of(state, remote) else {
+                    // Listeners and placeholder peers are the only TCP rows
+                    // allowed to omit a peer. An established row with a
+                    // malformed address must not masquerade as a listener.
+                    if state == TcpState::Listen {
+                        None
+                    } else {
+                        continue;
+                    }
+                };
+                Some(remote)
+            }
             None => None,
         };
         sockets.push(ProcNetSocket {
@@ -168,16 +216,17 @@ fn connection_protocol_rank(protocol: ConnectionProtocol) -> u8 {
 }
 
 pub(super) fn list_process_connections(pid: u32) -> Result<Vec<ProcessConnection>> {
-    let inodes = process_socket_inodes(pid)?;
-    if inodes.is_empty() {
+    let namespace_before = net_namespace(pid)?;
+    let inodes_before = process_socket_inodes(pid)?;
+    if inodes_before.is_empty() {
         return Ok(Vec::new());
     }
 
-    let mut connections = Vec::new();
+    let mut sockets = Vec::new();
     let mut seen_inodes = HashSet::new();
     for (table_name, protocol) in TABLES {
         let path = format!("/proc/{pid}/net/{table_name}");
-        let table = match std::fs::read_to_string(&path) {
+        let table = match std::fs::File::open(&path) {
             Ok(table) => table,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
             Err(error) => {
@@ -187,12 +236,33 @@ pub(super) fn list_process_connections(pid: u32) -> Result<Vec<ProcessConnection
                 ));
             }
         };
-        for socket in parse_net_table(&table, protocol) {
-            if inodes.contains(&socket.inode) && seen_inodes.insert(socket.inode) {
-                connections.push(socket.connection);
+        for socket in parse_net_table(BufReader::new(table), protocol, Some(&inodes_before)) {
+            if seen_inodes.insert(socket.inode) {
+                sockets.push(socket);
             }
         }
     }
+    let namespace_after = net_namespace(pid)?;
+    let inodes_after = process_socket_inodes(pid)?;
+    if namespace_before != namespace_after {
+        return Err(TmError::platform(
+            "list process connections",
+            "the process moved to another network namespace during inspection",
+        ));
+    }
+    let stable: HashSet<u64> = inodes_before
+        .intersection(&inodes_after)
+        .copied()
+        .collect();
+    sockets.retain(|socket| {
+        // The inode is the kernel socket object identity while it is live.
+        // Retaining only sockets present before and after the table scan
+        // prevents a descriptor reused during the walk from inheriting a
+        // different endpoint.
+        stable.contains(&socket.inode)
+    });
+    let mut connections: Vec<ProcessConnection> =
+        sockets.into_iter().map(|socket| socket.connection).collect();
     connections.sort_by(|a, b| {
         connection_protocol_rank(a.protocol)
             .cmp(&connection_protocol_rank(b.protocol))
@@ -205,6 +275,7 @@ pub(super) fn list_process_connections(pid: u32) -> Result<Vec<ProcessConnection
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Cursor;
     use std::net::TcpListener;
 
     #[test]
@@ -213,7 +284,7 @@ mod tests {
   sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n\
    0: 0100007F:1F90 0200000A:01BB 01 00000000:00000000 00:00000000 00000000  1000        0 4242 1\n\
    1: 00000000:0016 00000000:0000 0A 00000000:00000000 00:00000000 00000000     0        0 4243 1\n";
-        let rows = parse_net_table(text, ConnectionProtocol::Tcp);
+        let rows = parse_net_table(Cursor::new(text), ConnectionProtocol::Tcp, None);
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].connection.local, "127.0.0.1:8080".parse().unwrap());
         assert_eq!(rows[0].connection.remote, Some("10.0.0.2:443".parse().unwrap()));
@@ -228,7 +299,7 @@ mod tests {
   sl  local_address                         remote_address                        st tx_queue rx_queue tr tm->when retrnsmt uid timeout inode\n\
    0: 00000000000000000000000001000000:1F90 00000000000000000000000001000000:0050 01 00000000:00000000 00:00000000 00000000 1000 0 99 1\n\
    1: 00000000000000000000000001000000:1F91 00000000000000000000000000000000:0000 01 00000000:00000000 00:00000000 00000000 1000 0 100 1\n";
-        let rows = parse_net_table(text, ConnectionProtocol::Tcp6);
+        let rows = parse_net_table(Cursor::new(text), ConnectionProtocol::Tcp6, None);
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].connection.local, "[::1]:8080".parse().unwrap());
         assert_eq!(rows[0].connection.remote, Some("[::1]:80".parse().unwrap()));
@@ -241,11 +312,40 @@ mod tests {
         let text = "\
   sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n\
    0: 00000000:0035 00000000:0000 07 00000000:00000000 00:00000000 00000000     0        0 777 2\n";
-        let rows = parse_net_table(text, ConnectionProtocol::Udp);
+        let rows = parse_net_table(Cursor::new(text), ConnectionProtocol::Udp, None);
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].connection.local, "0.0.0.0:53".parse().unwrap());
         assert_eq!(rows[0].connection.remote, None);
         assert_eq!(rows[0].connection.state, None);
+    }
+
+    #[test]
+    fn malformed_tcp_peer_is_omitted_instead_of_becoming_a_listener_shape() {
+        let text = "\
+  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n\
+   0: 0100007F:1F90 BADADDR:01BB 01 00000000:00000000 00:00000000 00000000  1000 0 4242 1\n";
+        assert!(parse_net_table(
+            Cursor::new(text),
+            ConnectionProtocol::Tcp,
+            None
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn table_scan_filters_unrelated_socket_inodes_before_allocating_rows() {
+        let text = "\
+  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n\
+   0: 0100007F:1F90 0200000A:01BB 01 00000000:00000000 00:00000000 00000000  1000 0 4242 1\n\
+   1: 0100007F:1F91 0200000A:01BB 01 00000000:00000000 00:00000000 00000000  1000 0 4243 1\n";
+        let wanted = HashSet::from([4242]);
+        let rows = parse_net_table(
+            BufReader::new(Cursor::new(text)),
+            ConnectionProtocol::Tcp,
+            Some(&wanted),
+        );
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].inode, 4242);
     }
 
     #[test]

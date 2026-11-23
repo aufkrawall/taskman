@@ -4,7 +4,7 @@
 
 ### New
 
-- **Linux process inspection:** Process Properties now lists loaded file mappings, per-thread scheduler and CPU evidence, and TCP/UDP endpoints from procfs on Linux. The module inventory is read-only; data that procfs cannot provide remains unavailable rather than being fabricated.
+- **Linux process inspection:** Process Properties now lists loaded file mappings, per-thread scheduler and CPU evidence, and TCP/UDP endpoints from procfs on Linux. PID/TID generation and network-namespace changes are rejected rather than mixing snapshots; socket reuse is filtered across before/after handle walks; malformed rows are omitted instead of rendered as listeners; and missing switch/cycle evidence remains unknown rather than becoming “Idle”. The module inventory is read-only, and data that procfs cannot provide remains unavailable rather than being fabricated.
 
 ### Fixed
 

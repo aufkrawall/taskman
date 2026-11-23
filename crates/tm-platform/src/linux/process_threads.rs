@@ -211,6 +211,17 @@ pub(super) fn list_process_threads(
         {
             continue;
         }
+        let Some(after_status) = read_task_stat(pid, tid)? else {
+            continue;
+        };
+        if after_status.tid != stat.tid
+            || after_status.start_ticks != stat.start_ticks
+        {
+            // The TID was reused between /stat and /status. Neither record can
+            // be safely combined with the other, so omit this now-ambiguous
+            // observation.
+            continue;
+        }
         let context_switches = status.and_then(TaskStatus::context_switches);
         let kernel_time_100ns = ticks_to_100ns(stat.kernel_ticks, clk_tck).ok_or_else(|| {
             TmError::platform(

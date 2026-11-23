@@ -84,8 +84,11 @@ pub struct ProcessExtra {
     pub wow64: Option<bool>,
 }
 
-/// One executable image mapped into a process. Module enumeration is an
-/// explicit, on-demand diagnostic query rather than part of the hot sample.
+/// One executable image mapping in a process. On Windows this is a loaded
+/// module image. On Linux it is an identity-merged span of executable mappings
+/// from `/proc/<pid>/maps`; a fragmented image can therefore appear as more
+/// than one span. Enumeration is an explicit, on-demand diagnostic query
+/// rather than part of the hot sample.
 ///
 /// There is deliberately no "protected" marking: which module to unload is
 /// the user's call. The confirmation dialog carries the crash warning, the
