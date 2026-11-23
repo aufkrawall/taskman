@@ -30,8 +30,12 @@
   directory is owner/mode validated; failed first writes leave no placeholder.
   Settings elevation is tri-state, so a failed Windows token query renders
   Unknown instead of claiming unelevated.
+- The final dependency audit upgraded `url` from 2.5.8 to 2.5.9 for
+  RUSTSEC-2026-0592; the remaining audit output is limited to allowed
+  unmaintained/yanked/unsound warnings.
 - No compile, test, formatter gate or release build was run in the review
-  passes. The integration branch remains pending its one final gate.
+  passes. Subsequent gate runs and their remaining corrections are recorded by
+  the final commit history.
 
 ## 2026-11-23 - Platform-aware GUI capabilities
 

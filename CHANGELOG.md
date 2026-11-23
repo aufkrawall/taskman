@@ -55,6 +55,10 @@
 - **A post-start event-loop failure is reported as such** — "event loop failed after startup" — instead of "failed to start GUI". The original error text is still included.
 - **The vendored-fork gate fails instead of silently skipping when PowerShell exists but cannot run**, and the probe has a 10 s timeout.
 
+### Security
+
+- **Patched `url` dependency:** the lockfile now uses `url` 2.5.9 instead of 2.5.8, addressing RUSTSEC-2026-0592 (stack overflow in `Url::origin()` for nested `blob:` URLs).
+
 ## 0.1.32 - 2026-11-21
 
 ### Improved
