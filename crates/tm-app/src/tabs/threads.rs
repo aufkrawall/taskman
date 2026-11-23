@@ -82,7 +82,7 @@ pub struct ThreadRow {
 
 struct Track {
     created_epoch_s: Option<i64>,
-    context_switches: u32,
+    context_switches: Option<u64>,
     cpu_100ns: u64,
     cycles: Option<u64>,
     sampled: Instant,
@@ -129,7 +129,10 @@ impl Tracker {
                     cycles_delta,
                 ) = match &previous {
                     Some(prev) => {
-                        let advanced = thread.context_switches != prev.context_switches
+                        let advanced = matches!(
+                            (thread.context_switches, prev.context_switches),
+                            (Some(now), Some(before)) if now != before
+                        )
                             || cpu_100ns != prev.cpu_100ns
                             || matches!(
                                 (thread.cycles, prev.cycles),
@@ -420,9 +423,12 @@ pub fn symbolize(address: u64, modules: &[ProcessModule]) -> String {
     )
 }
 
-/// Windows' symbolic thread priority: the thread's base priority relative to
-/// its process's base, with the saturated Idle/Time-critical levels.
-fn priority_label(base: i32, process_base: Option<i32>) -> String {
+/// Linux's scheduler policy is expressed directly as nice. Windows has a
+/// richer symbolic priority ladder, shown relative to the process base.
+fn priority_label(base: i32, process_base: Option<i32>, nice: Option<i32>) -> String {
+    if let Some(nice) = nice {
+        return format!("{} ({nice})", i18n::tr(K::ThreadPrioNice));
+    }
     let relative = process_base.and_then(|process| match base - process {
         -2 => Some(K::ThreadPrioLowest),
         -1 => Some(K::PrioBelowNormal),
@@ -453,11 +459,18 @@ fn state_label(thread: &ProcessThread) -> String {
         ThreadState::DeferredReady => K::ThreadStateDeferredReady,
         ThreadState::Waiting => {
             let waiting = i18n::tr(K::ThreadStateWaiting);
-            return match tm_platform::actions::wait_reason_name(thread.wait_reason) {
+            return match thread
+                .wait_reason
+                .and_then(tm_platform::actions::wait_reason_name)
+            {
                 Some(reason) => format!("{waiting} ({reason})"),
                 None => waiting.to_string(),
             };
         }
+        ThreadState::Sleeping => K::ThreadStateSleeping,
+        ThreadState::Stopped => K::ThreadStateStopped,
+        ThreadState::Idle => K::ThreadStateIdle,
+        ThreadState::Parked => K::ThreadStateParked,
         ThreadState::Other(raw) => return raw.to_string(),
     };
     i18n::tr(key).to_string()
@@ -566,7 +579,11 @@ fn view_for<'a>(
         .thread
         .start_address
         .map_or_else(|| "—".to_string(), |address| symbolize(address, modules));
-    let priority = priority_label(row.thread.base_priority, process_base_priority);
+    let priority = priority_label(
+        row.thread.base_priority,
+        process_base_priority,
+        row.thread.nice,
+    );
     let state = state_label(&row.thread);
     let activity = activity_label(row.activity);
     let cpu = row
@@ -875,12 +892,13 @@ mod tests {
             start_address: Some(0x1000),
             priority: 8,
             base_priority: 8,
-            context_switches: switches,
+            nice: None,
+            context_switches: Some(u64::from(switches)),
             kernel_time_100ns: cpu,
             user_time_100ns: 0,
             created_epoch_s: Some(100),
             state,
-            wait_reason: 6,
+            wait_reason: Some(6),
             cycles: Some(u64::from(switches) * 1000),
         }
     }
@@ -1110,16 +1128,20 @@ mod tests {
 
     #[test]
     fn priority_is_symbolic_relative_to_the_process() {
-        assert!(priority_label(8, Some(8)).contains("(8)"));
+        assert!(priority_label(8, Some(8), None).contains("(8)"));
         assert_eq!(
-            priority_label(10, Some(8)),
+            priority_label(10, Some(8), None),
             format!("{} (10)", i18n::tr(K::ThreadPrioHighest))
         );
         assert_eq!(
-            priority_label(15, Some(8)),
+            priority_label(15, Some(8), None),
             format!("{} (15)", i18n::tr(K::ThreadPrioTimeCritical))
         );
-        assert_eq!(priority_label(12, None), "12");
+        assert_eq!(priority_label(12, None, None), "12");
+        assert_eq!(
+            priority_label(0, Some(0), Some(0)),
+            format!("{} (0)", i18n::tr(K::ThreadPrioNice))
+        );
     }
 
     #[test]

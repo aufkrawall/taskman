@@ -1,6 +1,9 @@
 //! Linux backend: sysinfo + procfs/sysfs + systemd + XDG autostart.
 
 mod diskstats;
+mod process_connections;
+mod process_modules;
+mod process_threads;
 pub(crate) mod services;
 mod startup;
 
@@ -803,9 +806,9 @@ impl PlatformActions for LinuxActions {
             efficiency_mode: false,
             run_new_task: true,
             per_process_network: false,
-            process_modules: false,
-            process_threads: false,
-            process_connections: false,
+            process_modules: true,
+            process_threads: true,
+            process_connections: true,
             process_file_io: true,
             unload_module: false,
             start_with_windows: false,
@@ -969,6 +972,35 @@ impl PlatformActions for LinuxActions {
         cmd.spawn()
             .map(|_| ())
             .map_err(|e| tm_core::TmError::platform("spawn", e.to_string()))
+    }
+
+    fn list_process_modules(
+        &self,
+        pid: u32,
+        expected_start_epoch_s: Option<i64>,
+    ) -> Result<Vec<ProcessModule>> {
+        let before = process_start_for_read(pid, expected_start_epoch_s)?;
+        let modules = process_modules::list_process_modules(pid)?;
+        ensure_process_generation(pid, before)?;
+        Ok(modules)
+    }
+
+    fn list_process_threads(
+        &self,
+        pid: u32,
+        expected_start_epoch_s: Option<i64>,
+    ) -> Result<ProcessThreads> {
+        let before = process_start_for_read(pid, expected_start_epoch_s)?;
+        let threads = process_threads::list_process_threads(pid, Some(before))?;
+        ensure_process_generation(pid, before)?;
+        Ok(threads)
+    }
+
+    fn list_process_connections(&self, pid: u32) -> Result<Vec<ProcessConnection>> {
+        let before = process_start_for_read(pid, None)?;
+        let connections = process_connections::list_process_connections(pid)?;
+        ensure_process_generation(pid, before)?;
+        Ok(connections)
     }
 
     fn backend_name(&self) -> &'static str {
@@ -1242,6 +1274,24 @@ fn verify_process_identity(pid: u32, expected_start_ticks: Option<i64>) -> Resul
     Ok(())
 }
 
+/// Read the process generation for a read-only procfs inspection. A supplied
+/// sampled token must match exactly; it is a boot-relative start tick on
+/// Linux, despite the shared trait's historical parameter name.
+fn process_start_for_read(pid: u32, expected_start_ticks: Option<i64>) -> Result<i64> {
+    let before = linux_proc_start_ticks(pid).ok_or(tm_core::TmError::ProcessNotFound { pid })?;
+    if expected_start_ticks.is_some_and(|expected| expected != before) {
+        return Err(tm_core::TmError::ProcessNotFound { pid });
+    }
+    Ok(before)
+}
+
+fn ensure_process_generation(pid: u32, before: i64) -> Result<()> {
+    if linux_proc_start_ticks(pid) != Some(before) {
+        return Err(tm_core::TmError::ProcessNotFound { pid });
+    }
+    Ok(())
+}
+
 pub fn create_collector() -> LinuxCollector {
     LinuxCollector {
         sys: System::new_all(),
@@ -1262,6 +1312,15 @@ pub fn create_actions() -> LinuxActions {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn process_inspection_capabilities_match_the_read_only_procfs_backend() {
+        let capabilities = create_actions().capabilities();
+        assert!(capabilities.process_modules);
+        assert!(capabilities.process_threads);
+        assert!(capabilities.process_connections);
+        assert!(!capabilities.unload_module);
+    }
 
     #[test]
     fn every_settable_priority_reads_back_as_itself() {

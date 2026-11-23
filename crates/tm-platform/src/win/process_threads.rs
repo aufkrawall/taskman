@@ -209,12 +209,16 @@ fn parse_thread(buf: &[u8], base: usize, off: &ThreadOffsets) -> ParsedThread {
             start_address: (start != 0).then_some(start),
             priority: read_u32(buf, base + off.priority) as i32,
             base_priority: read_u32(buf, base + off.base_priority) as i32,
-            context_switches: read_u32(buf, base + off.context_switches),
+            nice: None,
+            context_switches: Some(u64::from(read_u32(
+                buf,
+                base + off.context_switches,
+            ))),
             kernel_time_100ns: u64::try_from(read_i64(buf, base + off.kernel_time)).unwrap_or(0),
             user_time_100ns: u64::try_from(read_i64(buf, base + off.user_time)).unwrap_or(0),
             created_epoch_s: super::cpu_load::filetime_to_unix_ticks(created_raw),
             state: ThreadState::from_raw(read_u32(buf, base + off.state)),
-            wait_reason: read_u32(buf, base + off.wait_reason),
+            wait_reason: Some(read_u32(buf, base + off.wait_reason)),
             cycles: None,
         },
         created_raw,
@@ -315,7 +319,7 @@ mod tests {
         assert_eq!(parsed.process_base_priority, 8);
         let tids: Vec<u32> = parsed.threads.iter().map(|t| t.thread.tid).collect();
         assert_eq!(tids, [7, 9]);
-        assert_eq!(parsed.threads[1].thread.context_switches, 90);
+        assert_eq!(parsed.threads[1].thread.context_switches, Some(90));
         assert_eq!(parsed.threads[0].thread.state, ThreadState::Waiting);
         assert_eq!(parsed.threads[0].thread.start_address, Some(0x7FF0_0000));
         assert_eq!(parsed.threads[0].created_raw, 0);

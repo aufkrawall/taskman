@@ -4392,12 +4392,13 @@ mod tests {
             start_address,
             priority: 8,
             base_priority: 8,
-            context_switches: 1,
+            nice: None,
+            context_switches: Some(1),
             kernel_time_100ns: 2,
             user_time_100ns: 3,
             created_epoch_s,
             state: ThreadState::Waiting,
-            wait_reason: 6,
+            wait_reason: Some(6),
             cycles,
         };
         let mut threads = ProcessThreads {

@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### New
+
+- **Linux process inspection:** Process Properties now lists loaded file mappings, per-thread scheduler and CPU evidence, and TCP/UDP endpoints from procfs on Linux. The module inventory is read-only; data that procfs cannot provide remains unavailable rather than being fabricated.
+
 ### Fixed
 
 - **A failed or skipped blit can no longer leave the window blank, stale or half-painted.** The Windows software renderer now presents through its own Win32 DIB surface: every `BitBlt` result is checked, only the rectangles that were actually blitted are validated, and a `WM_PAINT` update region is merged into the present set even when no egui tile changed. A failed resize, buffer access or present warns, marks the surface unpainted and retries in 50 ms instead of aborting (release builds abort on panic) or silently freezing the old pixels in place.
