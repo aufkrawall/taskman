@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### New
+
+- **Linux process inspection:** Process Properties now lists loaded file mappings, per-thread scheduler and CPU evidence, and TCP/UDP endpoints from procfs on Linux. The module inventory is read-only; data that procfs cannot provide remains unavailable rather than being fabricated.
+
 ### Fixed
 
 - **Linux X11 apps are classified from their real EWMH windows without guessing on Wayland.** Non-system processes that own a Normal or Iconic managed client in `_NET_CLIENT_LIST` or `_NET_CLIENT_LIST_STACKING` now become Apps, so minimizing a window or switching desktop no longer moves the app to Background. The collector distinguishes complete local-X11 coverage from partial/unavailable observations (native Wayland, malformed metadata, or a bounded query); only complete coverage can classify a missing window as a real negative. Withdrawn and override-redirect windows contribute no owner, and an unverifiable local PID is left unknown instead of being guessed.

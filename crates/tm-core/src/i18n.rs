@@ -205,8 +205,13 @@ keys! {
     ThreadStateStandby => ["Standby", "Standby"],
     ThreadStateTerminated => ["Beendet", "Terminated"],
     ThreadStateWaiting => ["Wartet", "Waiting"],
+    ThreadStateSleeping => ["Schläft", "Sleeping"],
+    ThreadStateStopped => ["Angehalten", "Stopped"],
+    ThreadStateIdle => ["Leerlauf", "Idle"],
+    ThreadStateParked => ["Geparkt", "Parked"],
     ThreadStateTransition => ["Übergang", "Transition"],
     ThreadStateDeferredReady => ["Verzögert bereit", "Deferred ready"],
+    ThreadPrioNice => ["Nice", "Nice"],
     ThreadPrioIdle => ["Leerlauf", "Idle"],
     ThreadPrioLowest => ["Niedrigste", "Lowest"],
     ThreadPrioHighest => ["Höchste", "Highest"],
@@ -246,8 +251,8 @@ keys! {
     ],
     HideIdle => ["Ruhende ausblenden", "Hide idle"],
     ThreadStartAddressTip => [
-        "Windows hat den Zugriff auf diesen Thread verweigert. TaskMan fragt den Core-Dienst, sofern verfügbar; geschützte Threads können weiterhin nicht lesbar sein",
-        "Windows denied access to this thread. TaskMan asks the core service when available; protected threads may remain unreadable"
+        "Startadresse oder Zyklen sind auf dieser Plattform nicht verfügbar. Linux-procfs stellt weder die Einstiegsroutine eines Threads noch seine CPU-Zyklen bereit; auf Windows kann der Zugriff auf geschützte Threads verweigert werden",
+        "The entry routine or CPU cycles are unavailable on this platform. Linux procfs exposes neither a thread entry routine nor per-thread CPU cycles; Windows can deny access to protected threads"
     ],
     ThreadCpuPercentTip => [
         "Anteil an allen logischen Prozessoren.\nAktuelle Messung: {}\nDurchschnitt seit Öffnen der Seite: {}",
@@ -377,6 +382,10 @@ keys! {
         "The connection tables only know the PID; the process identity is re-checked before every update"
     ],
     UnloadModule => ["Modul entladen", "Unload module"],
+    ModulesReadOnly => [
+        "Die Modulliste ist auf dieser Plattform schreibgeschützt",
+        "The module inventory is read-only on this platform"
+    ],
     UnloadModuleConfirm => [
         "\"{}\" wirklich aus \"{}\" entladen?",
         "Unload \"{}\" from \"{}\"?"

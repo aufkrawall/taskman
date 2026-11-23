@@ -133,24 +133,29 @@ items across Phases 2–6. The following concrete gaps remain:
   eaten by the popup's sizing pass, where no entry is enabled), and a request
   nothing consumed dies with its menu.
 
-The new Modules inspector is deliberately on-demand and Windows-only. Its
-unload command attempts ANY enumerated module — which module to unload is
-explicitly the user's call (product decision 2026-09-06; there is no
-"protected module" concept), gated only by the confirmation dialog and its
-crash warning. What remains is technical, not policy: same-architecture
-targets only (a 64-bit FreeLibrary address cannot be injected into a 32-bit
-process), process-level trust rules at the broker (critical/system/requesting-
-GUI targets refused), TaskMan refusing to act on itself, and the exact
-process identity + module base/path revalidation at action time. The unload repeats
-FreeLibrary until the module leaves or the bounded budget is spent, and the
-honest `ModuleUnloadOutcome` (still mapped, with how many references were
-dropped) is what the user sees; permanently pinned or re-loaded modules stay.
+The Modules inspector is deliberately on-demand. Linux provides a read-only
+inventory by merging contiguous executable file mappings from
+`/proc/<pid>/maps`; module unloading remains Windows-only. The Windows unload
+command attempts ANY enumerated module — which module to unload is explicitly
+the user's call (product decision 2026-09-06; there is no "protected module"
+concept), gated only by the confirmation dialog and its crash warning. What
+remains is technical, not policy: same-architecture targets only (a 64-bit
+FreeLibrary address cannot be injected into a 32-bit process), process-level
+trust rules at the broker (critical/system/requesting-GUI targets refused),
+TaskMan refusing to act on itself, and the exact process identity + module
+base/path revalidation at action time. The unload repeats FreeLibrary until
+the module leaves or the bounded budget is spent, and the honest
+`ModuleUnloadOutcome` (still mapped, with how many references were dropped) is
+what the user sees; permanently pinned or re-loaded modules stay.
 
 ## Process Properties list pages (2026-10-21)
 
-- Thread start addresses are `module+offset`, never symbol names: no PDB or
-  symbol-server lookup (privacy, latency), and nearest-export names would
-  mislabel the non-exported routines most threads start in.
+- Linux thread inspection comes from `/proc/<pid>/task`; procfs exposes no
+  thread entry routine or cumulative CPU cycles, so those fields remain
+  unavailable. Missing context-switch counters are also unknown, not zero.
+- Windows thread start addresses are `module+offset`, never symbol names: no
+  PDB or symbol-server lookup (privacy, latency), and nearest-export names
+  would mislabel the non-exported routines most threads start in.
 - Start address and cycles of another user's (service/SYSTEM) threads need a
   thread handle an unelevated GUI does not get. The exact-identity-bound
   `ProcessThreadDetails` request (introduced in v8) supplies them as

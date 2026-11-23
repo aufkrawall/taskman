@@ -146,6 +146,10 @@ pub enum ThreadState {
     Standby,
     Terminated,
     Waiting,
+    Sleeping,
+    Stopped,
+    Idle,
+    Parked,
     Transition,
     DeferredReady,
     Other(u32),
@@ -229,16 +233,20 @@ pub struct ProcessThread {
     pub start_address: Option<u64>,
     pub priority: i32,
     pub base_priority: i32,
+    /// Linux's raw nice value. `None` where the platform has no such notion.
+    pub nice: Option<i32>,
     /// Monotonic count of times the scheduler switched this thread onto a
-    /// processor. An unchanged count between two queries proves the thread
-    /// never ran in between — the evidence behind the "dormant" mark.
-    pub context_switches: u32,
+    /// processor, including both voluntary and involuntary switches on Linux.
+    /// An unchanged count between two queries proves the thread did not run in
+    /// between; `None` means the counter was unavailable, never zero.
+    pub context_switches: Option<u64>,
     pub kernel_time_100ns: u64,
     pub user_time_100ns: u64,
     pub created_epoch_s: Option<i64>,
     pub state: ThreadState,
-    /// Only meaningful while `state` is `Waiting`.
-    pub wait_reason: u32,
+    /// Only meaningful while `state` is `Waiting`. `None` when this platform
+    /// does not expose a Windows-compatible wait reason.
+    pub wait_reason: Option<u32>,
     /// Cumulative CPU cycles. `None` when the thread could not be opened
     /// (another user's or a protected process) — never a fabricated zero.
     pub cycles: Option<u64>,

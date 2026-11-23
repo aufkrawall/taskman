@@ -861,7 +861,9 @@ pub fn show(
                 can_unload && selected_module.is_some() && !state.unloading(),
                 egui::Button::new(i18n::tr(K::UnloadModule)),
             )
-            .on_disabled_hover_text(if selected_module.is_none() {
+            .on_disabled_hover_text(if !can_unload {
+                i18n::tr(K::ModulesReadOnly)
+            } else if selected_module.is_none() {
                 i18n::tr(K::SelectModuleFirst)
             } else {
                 i18n::tr(K::ModuleBusy)
@@ -874,7 +876,11 @@ pub fn show(
         }
     });
     ui.label(
-        egui::RichText::new(i18n::tr(K::UnloadModuleWarning))
+        egui::RichText::new(if can_unload {
+            i18n::tr(K::UnloadModuleWarning)
+        } else {
+            i18n::tr(K::ModulesReadOnly)
+        })
             .small()
             .color(pal.text_dim),
     );
@@ -1408,12 +1414,13 @@ mod tests {
                 start_address: start,
                 priority: 8,
                 base_priority: 8,
-                context_switches: 0,
+                nice: None,
+                context_switches: Some(0),
                 kernel_time_100ns: 0,
                 user_time_100ns: 0,
                 created_epoch_s: Some(1),
                 state: tm_platform::actions::ThreadState::Waiting,
-                wait_reason: 6,
+                wait_reason: Some(6),
                 cycles: None,
             },
             cpu_pct: None,
