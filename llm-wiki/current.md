@@ -634,6 +634,12 @@ rebase runbook.
   `/proc/<pid>/stat` ticks as the token and derives wall time separately.
   The `ProcessEntry::creation_identity()` accessor supplies the right token
   to selections, actions, and per-process history.
+- Linux tree termination walks `/proc` parent links together with those
+  creation ticks, rejects a child older than the process currently reached
+  (a recycled PPID), and delivers `SIGTERM` to descendants child-first and then
+  the selected root. Every signal is identity-checked at delivery and uses
+  `pidfd` when available; a target that exits mid-action is already done, and
+  no `SIGKILL` escalation is implied.
 - The Details process tree is no longer a mode. It IS the Name column's third
   sort state; clicking any other column leaves it and sorts purely by that
   column. `details_tree_view` migrated into `details_tree_hierarchical`.
@@ -835,14 +841,20 @@ rebase runbook.
   byte deltas, and current transfer rates. Inter-process I/O captures operations
   not involving physical disks (named pipes, ALPC, device controls/IOCTLs, and
   socket communication) directly from the kernel process table's `IO_COUNTERS`.
-  The open-files list (`win/process_file_io.rs`) snapshots the handle table,
-  duplicates each handle and reads every fact (type, path, size, position,
-  granted access) from that duplicate only: snapshot entries go stale as the
-  target closes handles and values get reused (measured: 51/1500 runs of the
-  module's parallel tests showed a write-only file as read/write while access
-  came from the snapshot). Position is queried with `NtQueryInformationFile
-  (FilePositionInformation)`, never `SetFilePointerEx`, which writes the
-  position back into the file object shared with the target.
+  The open-files list snapshots current handles and their path, size, position
+  and access separately from transfer totals. Windows
+  (`win/process_file_io.rs`) duplicates each handle and reads every fact from
+  that duplicate only: snapshot entries go stale as the target closes handles
+  and values get reused (measured: 51/1500 runs of the module's parallel tests
+  showed a write-only file as read/write while access came from the snapshot).
+  Position is queried with `NtQueryInformationFile(FilePositionInformation)`,
+  never `SetFilePointerEx`, which writes the position back into the file object
+  shared with the target. Linux (`linux/process_io.rs`) brackets the `/proc`
+  walk with the sampled start tick, groups regular files by path, stats deleted
+  files through their fd link, and excludes anonymous descriptors and
+  non-regular devices. It has no per-file trace, so every row's byte/op counts
+  stay `None`; `/proc/<pid>/io` fills only the explicit process-wide counter
+  fields and leaves the accounting state unavailable.
   Threads come from one
   `SystemExtendedProcessInformation` snapshot (no handle needed, so SYSTEM
   and service processes work unelevated); Windows 11 build 26300 ZEROES that
