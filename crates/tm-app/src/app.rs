@@ -2967,8 +2967,9 @@ impl TaskManApp {
     }
 
     /// Input/render diagnostics (`TASKMAN_INPUT_STATS=1`): logs `CursorMoved`
-    /// decisions, software-renderer pass/paint/present timings, tile-damage
-    /// skip ratio, AccessKit activation, and top repaint causes once per second.
+    /// and `MouseWheel` decisions, software-renderer pass/paint/present timings,
+    /// tile-damage skip ratio, AccessKit activation, and top repaint causes
+    /// once per second.
     fn update_input_stats(&mut self, ctx: &egui::Context) {
         for cause in ctx.repaint_causes() {
             *self
@@ -2983,6 +2984,7 @@ impl TaskManApp {
         }
         let secs = elapsed.as_secs_f64().max(0.001);
         let moves = egui_winit::pointer_move_stats_take();
+        let wheels = egui_winit::wheel_repaint_stats_take();
         let sw = eframe::software_frame_stats_take();
 
         let mut top: Vec<((&'static str, u32), u32)> = self.input_stats.causes.drain().collect();
@@ -3008,6 +3010,10 @@ impl TaskManApp {
             repaint_now = moves.repaint_now,
             trailing = moves.trailing_armed,
             active = moves.pointer_active_now,
+            wheel = wheels.wheel_events,
+            wheel_coalesced = wheels.coalesced_events,
+            wheel_immediate = wheels.immediate_repaints,
+            wheel_trailing = wheels.trailing_repaints,
             fps = format_args!("{:.1}", sw.frames as f64 / secs),
             skipped_damage = sw.skipped_damage,
             dirty_tiles = format_args!("{}/{}", sw.dirty_tiles, sw.total_tiles),
