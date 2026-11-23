@@ -42,7 +42,7 @@
 
 ### Improved
 
-- **Wheel scrolling no longer drives the UI faster than the display.** Wheel input is coalesced to one full repaint per display refresh, with the first event still immediate and one trailing repaint carrying the final accumulated delta. Line and pixel units, horizontal/vertical movement, modifiers, click order and touchpad phases are preserved. `TASKMAN_INPUT_STATS=1` now also reports wheel, coalesced, immediate and trailing counts.
+- **Wheel scrolling no longer drives the UI faster than the display.** Wheel input is coalesced to one full repaint per display refresh, with the first event still immediate and one trailing repaint carrying the final accumulated delta. Egui's wheel smoothing now follows the same minimum cadence instead of scheduling back-to-back frames, and short high-refresh delays are no longer collapsed to zero. Line and pixel units, horizontal/vertical movement, modifiers, click order and zero-delta touchpad lifecycle phases are preserved. `TASKMAN_INPUT_STATS=1` now also reports wheel, coalesced, immediate and trailing counts.
 - **A stored renderer preference is no longer silently rewritten.** Startup still coerces the value it actually uses on the current platform, but the user's explicit choice survives for a platform that supports it, and the coercion is logged once instead of being persisted as `cpu`.
 - **The restore acknowledgement repairs placement before answering.** A minimized window restored after a monitor unplug is re-fitted after it is unminimized, not only on the cloaked path.
 

@@ -128,9 +128,28 @@ impl ContextImpl {
 
     fn request_repaint_after(
         &mut self,
+        delay: Duration,
+        viewport_id: ViewportId,
+        cause: RepaintCause,
+    ) {
+        self.request_repaint_after_impl(delay, viewport_id, cause, true);
+    }
+
+    fn request_repaint_after_at_least(
+        &mut self,
+        delay: Duration,
+        viewport_id: ViewportId,
+        cause: RepaintCause,
+    ) {
+        self.request_repaint_after_impl(delay, viewport_id, cause, false);
+    }
+
+    fn request_repaint_after_impl(
+        &mut self,
         mut delay: Duration,
         viewport_id: ViewportId,
         cause: RepaintCause,
+        adjust_for_predicted_frame_time: bool,
     ) {
         let viewport = self.viewports.entry(viewport_id).or_default();
 
@@ -145,7 +164,10 @@ impl ContextImpl {
             // Hovering a tooltip is a good example of a case where we want to repaint after a delay.
         }
 
-        if let Ok(predicted_frame_time) = Duration::try_from_secs_f32(viewport.input.predicted_dt) {
+        if adjust_for_predicted_frame_time
+            && let Ok(predicted_frame_time) =
+                Duration::try_from_secs_f32(viewport.input.predicted_dt)
+        {
             // Make it less likely we over-shoot the target:
             delay = delay.saturating_sub(predicted_frame_time);
         }
@@ -534,7 +556,10 @@ impl ContextImpl {
         self.update_fonts_mut();
 
         if let Some(delay) = repaint_after {
-            self.request_repaint_after(delay, viewport_id, RepaintCause::new());
+            // Input-driven follow-up frames specify the minimum time until the
+            // next useful input sample. Subtracting the predicted frame time
+            // can collapse a high-refresh cadence all the way to zero.
+            self.request_repaint_after_at_least(delay, viewport_id, RepaintCause::new());
         }
     }
 
@@ -1947,6 +1972,21 @@ impl Context {
     pub fn request_repaint_after_for(&self, duration: Duration, id: ViewportId) {
         let cause = RepaintCause::new();
         self.write(|ctx| ctx.request_repaint_after(duration, id, cause));
+    }
+
+    /// Request that the backend does not wake solely because of this request
+    /// before the specified duration has elapsed.
+    ///
+    /// Unlike [`Self::request_repaint_after_for`], this does not bring the
+    /// deadline forward by the predicted frame time. Other events or repaint
+    /// requests may still wake the viewport sooner.
+    ///
+    /// This is intended for integrations that need a real minimum cadence,
+    /// such as coalescing high-frequency pointer or wheel input.
+    #[track_caller]
+    pub fn request_repaint_after_at_least_for(&self, duration: Duration, id: ViewportId) {
+        let cause = RepaintCause::new();
+        self.write(|ctx| ctx.request_repaint_after_at_least(duration, id, cause));
     }
 
     /// Was a repaint requested last pass for the current viewport?
@@ -4439,6 +4479,70 @@ fn warn_if_rect_changes_id(
 #[cfg(test)]
 mod test {
     use super::Context;
+
+    fn warmed_context() -> Context {
+        let ctx = Context::default();
+        for _ in 0..2 {
+            ctx.run_ui(crate::RawInput::default(), |_ui| {})
+                .drop_without_applying_deltas();
+        }
+        ctx
+    }
+
+    fn capture_repaint_delays(
+        ctx: &Context,
+    ) -> std::sync::Arc<std::sync::Mutex<Vec<std::time::Duration>>> {
+        let delays = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured = std::sync::Arc::clone(&delays);
+        ctx.set_request_repaint_callback(move |info| {
+            captured.lock().unwrap().push(info.delay);
+        });
+        delays
+    }
+
+    #[test]
+    fn request_repaint_after_at_least_preserves_a_short_delay() {
+        let ctx = warmed_context();
+        let delays = capture_repaint_delays(&ctx);
+        let delay = std::time::Duration::from_millis(10);
+        let output = ctx.run_ui(
+            crate::RawInput {
+                predicted_dt: 0.05,
+                ..Default::default()
+            },
+            |_ui| ctx.request_repaint_after_at_least_for(delay, crate::ViewportId::ROOT),
+        );
+        output.drop_without_applying_deltas();
+
+        assert_eq!(delays.lock().unwrap().as_slice(), [delay]);
+    }
+
+    #[test]
+    fn wheel_smoothing_keeps_the_predicted_refresh_delay_at_high_refresh_rates() {
+        let ctx = warmed_context();
+        let delays = capture_repaint_delays(&ctx);
+
+        let refresh = 1.0 / 240.0;
+        let output = ctx.run_ui(
+            crate::RawInput {
+                predicted_dt: refresh,
+                events: vec![crate::Event::MouseWheel {
+                    unit: crate::MouseWheelUnit::Line,
+                    delta: crate::vec2(0.0, 1.0),
+                    phase: crate::TouchPhase::Move,
+                    modifiers: crate::Modifiers::NONE,
+                }],
+                ..Default::default()
+            },
+            |_ui| {},
+        );
+        output.drop_without_applying_deltas();
+
+        assert_eq!(
+            delays.lock().unwrap().as_slice(),
+            [std::time::Duration::from_secs_f32(refresh)]
+        );
+    }
 
     #[test]
     fn test_single_pass() {

@@ -84,7 +84,7 @@ pub struct EventResponse {
 /// visuals only need to update at the display refresh rate, so moves that
 /// arrive faster than `min_interval` are coalesced: the first move repaints
 /// immediately, later moves within the window arm one trailing repaint (via
-/// `Context::request_repaint_after_for`) so the final pointer position is
+/// `Context::request_repaint_after_at_least_for`) so the final pointer position is
 /// always painted. Moves whose position in points did not change at all
 /// (sub-point jitter) are skipped entirely, and moves while a pointer button
 /// is down or egui is using the pointer (drags, text selection) always
@@ -575,7 +575,7 @@ fn plan_cursor_move_decision(
         }
         MoveRepaint::After(delay) => {
             stats.trailing_armed.fetch_add(1, Relaxed);
-            ctx.request_repaint_after_for(delay, viewport_id);
+            ctx.request_repaint_after_at_least_for(delay, viewport_id);
             false
         }
         MoveRepaint::Skip => {
@@ -604,7 +604,7 @@ fn plan_wheel_repaint_decision(
         WheelRepaint::After(delay) => {
             stats.coalesced_events.fetch_add(1, Relaxed);
             stats.trailing_repaints.fetch_add(1, Relaxed);
-            ctx.request_repaint_after_for(delay, viewport_id);
+            ctx.request_repaint_after_at_least_for(delay, viewport_id);
             false
         }
         WheelRepaint::Coalesced => {
@@ -620,6 +620,15 @@ fn mouse_scroll_delta_needs_repaint(delta: winit::event::MouseScrollDelta) -> bo
         winit::event::MouseScrollDelta::LineDelta(x, y) => x != 0.0 || y != 0.0,
         winit::event::MouseScrollDelta::PixelDelta(pos) => pos.x != 0.0 || pos.y != 0.0,
     }
+}
+
+fn mouse_wheel_event_needs_repaint(
+    delta: winit::event::MouseScrollDelta,
+    phase: winit::event::TouchPhase,
+) -> bool {
+    // Start/End/Cancel carry lifecycle state even when the delta is zero and
+    // must reach egui so a stale touchpad scroll state cannot survive idle.
+    phase != winit::event::TouchPhase::Moved || mouse_scroll_delta_needs_repaint(delta)
 }
 
 // ----------------------------------------------------------------------------
@@ -828,8 +837,18 @@ impl State {
         // trailing frame carries the final delta.
         self.flush_pending_wheel();
         let delivered_wheel = self.wheel_repaint_throttle.take_frame_marker();
+        let frame_now = web_time::Instant::now();
+        let predicted_dt =
+            if let Some(interval) = interval_cache_valid(self.cached_min_interval, frame_now) {
+                interval
+            } else {
+                let interval = input_repaint_min_interval(window);
+                self.cached_min_interval = Some((interval, frame_now));
+                interval
+            };
 
         self.egui_input.time = Some(self.start_time.elapsed().as_secs_f64());
+        self.egui_input.predicted_dt = predicted_dt.as_secs_f32();
 
         // On Windows, a minimized window will have 0 width and height.
         // See: https://github.com/rust-windowing/winit/issues/208
@@ -853,7 +872,7 @@ impl State {
 
         let input = self.egui_input.take();
         self.wheel_repaint_throttle
-            .note_frame(web_time::Instant::now(), delivered_wheel);
+            .note_frame(frame_now, delivered_wheel);
         input
     }
 
@@ -931,8 +950,7 @@ impl State {
                 // display refresh with one trailing frame for the final
                 // accumulated delta.
                 let pixels_per_point = pixels_per_point(&self.egui_ctx, window);
-                let (unit, delta) =
-                    mouse_wheel_unit_and_delta(*scroll_delta, pixels_per_point);
+                let (unit, delta) = mouse_wheel_unit_and_delta(*scroll_delta, pixels_per_point);
                 self.wheel_repaint_throttle.push(
                     &mut self.egui_input.events,
                     unit,
@@ -940,14 +958,10 @@ impl State {
                     to_egui_touch_phase(*phase),
                     self.modifiers,
                 );
-                let wants_repaint = mouse_scroll_delta_needs_repaint(*scroll_delta);
+                let wants_repaint = mouse_wheel_event_needs_repaint(*scroll_delta, *phase);
                 let now = web_time::Instant::now();
-                let repaint = self.plan_wheel_repaint(
-                    window,
-                    now,
-                    wants_repaint,
-                    &WHEEL_REPAINT_STATS,
-                );
+                let repaint =
+                    self.plan_wheel_repaint(window, now, wants_repaint, &WHEEL_REPAINT_STATS);
                 if repaint {
                     self.flush_pending_wheel();
                 }
@@ -1563,15 +1577,14 @@ impl State {
         wants_repaint: bool,
         stats: &AtomicWheelRepaintStats,
     ) -> bool {
-        let min_interval = if let Some(interval) =
-            interval_cache_valid(self.cached_min_interval, now)
-        {
-            interval
-        } else {
-            let interval = input_repaint_min_interval(window);
-            self.cached_min_interval = Some((interval, now));
-            interval
-        };
+        let min_interval =
+            if let Some(interval) = interval_cache_valid(self.cached_min_interval, now) {
+                interval
+            } else {
+                let interval = input_repaint_min_interval(window);
+                self.cached_min_interval = Some((interval, now));
+                interval
+            };
         plan_wheel_repaint_decision(
             &self.egui_ctx,
             self.viewport_id,
@@ -3080,6 +3093,43 @@ mod wheel_repaint_tests {
         )
     }
 
+    fn capture_repaint_delays(
+        ctx: &egui::Context,
+    ) -> std::sync::Arc<std::sync::Mutex<Vec<web_time::Duration>>> {
+        let delays = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured = std::sync::Arc::clone(&delays);
+        ctx.set_request_repaint_callback(move |info| {
+            captured.lock().unwrap().push(info.delay);
+        });
+        delays
+    }
+
+    #[test]
+    fn trailing_repaint_callback_keeps_the_full_remaining_cadence() {
+        let ctx = egui::Context::default();
+        let delays = capture_repaint_delays(&ctx);
+        let mut throttle = WheelRepaintThrottle::default();
+        let stats = AtomicWheelRepaintStats::default();
+        let t0 = web_time::Instant::now();
+
+        assert!(repaint(&ctx, &mut throttle, &stats, t0, true));
+        throttle.note_frame(t0, true);
+        assert!(delays.lock().unwrap().is_empty());
+
+        assert!(!repaint(&ctx, &mut throttle, &stats, at(t0, 4), true));
+        assert_eq!(
+            delays.lock().unwrap().as_slice(),
+            [web_time::Duration::from_millis(12)]
+        );
+
+        assert!(!repaint(&ctx, &mut throttle, &stats, at(t0, 8), true));
+        assert_eq!(
+            delays.lock().unwrap().as_slice(),
+            [web_time::Duration::from_millis(12)],
+            "a coalesced event must not arm another callback"
+        );
+    }
+
     #[test]
     fn wheel_burst_repaints_once_per_refresh_and_arms_one_trailing_repaint() {
         let ctx = egui::Context::default();
@@ -3121,23 +3171,11 @@ mod wheel_repaint_tests {
 
         for (ms, delta) in [(4, egui::vec2(3.0, 4.0)), (8, egui::vec2(5.0, 6.0))] {
             let (unit, delta) = line(delta);
-            throttle.push(
-                &mut events,
-                unit,
-                delta,
-                egui::TouchPhase::Move,
-                modifiers,
-            );
+            throttle.push(&mut events, unit, delta, egui::TouchPhase::Move, modifiers);
             assert!(!repaint(&ctx, &mut throttle, &stats, at(t0, ms), true));
         }
         let (unit, delta) = line(Vec2::ZERO);
-        throttle.push(
-            &mut events,
-            unit,
-            delta,
-            egui::TouchPhase::Move,
-            modifiers,
-        );
+        throttle.push(&mut events, unit, delta, egui::TouchPhase::Move, modifiers);
         assert!(!repaint(&ctx, &mut throttle, &stats, at(t0, 12), false));
 
         assert_eq!(events.len(), 1, "only the immediate delta was flushed");
@@ -3156,15 +3194,13 @@ mod wheel_repaint_tests {
 
     #[test]
     fn mixed_units_modifiers_and_axes_preserve_order() {
-        let line = mouse_wheel_unit_and_delta(
-            winit::event::MouseScrollDelta::LineDelta(2.0, -3.0),
-            2.0,
-        );
+        let line =
+            mouse_wheel_unit_and_delta(winit::event::MouseScrollDelta::LineDelta(2.0, -3.0), 2.0);
         assert_eq!(line, (egui::MouseWheelUnit::Line, egui::vec2(2.0, -3.0)));
         let pixel = mouse_wheel_unit_and_delta(
-            winit::event::MouseScrollDelta::PixelDelta(
-                winit::dpi::PhysicalPosition::new(20.0, -40.0),
-            ),
+            winit::event::MouseScrollDelta::PixelDelta(winit::dpi::PhysicalPosition::new(
+                20.0, -40.0,
+            )),
             2.0,
         );
         assert_eq!(
@@ -3290,6 +3326,67 @@ mod wheel_repaint_tests {
     }
 
     #[test]
+    fn zero_delta_lifecycle_phases_update_scroll_state_when_drained() {
+        let ctx = egui::Context::default();
+        let mut buffer = WheelEventBuffer::default();
+        let modifiers = egui::Modifiers::default();
+
+        let mut pass = |events: Vec<egui::Event>| {
+            ctx.run_ui(
+                egui::RawInput {
+                    events,
+                    ..Default::default()
+                },
+                |_ui| {},
+            )
+            .drop_without_applying_deltas();
+        };
+
+        let mut queued = Vec::new();
+        buffer.push(
+            &mut queued,
+            egui::MouseWheelUnit::Point,
+            Vec2::ZERO,
+            egui::TouchPhase::Start,
+            modifiers,
+        );
+        buffer.flush(&mut queued);
+        pass(queued);
+        assert!(ctx.input(|input| input.is_scrolling()));
+
+        let mut queued = Vec::new();
+        buffer.push(
+            &mut queued,
+            egui::MouseWheelUnit::Point,
+            Vec2::ZERO,
+            egui::TouchPhase::End,
+            modifiers,
+        );
+        buffer.flush(&mut queued);
+        pass(queued);
+        assert!(!ctx.input(|input| input.is_scrolling()));
+
+        let mut queued = Vec::new();
+        buffer.push(
+            &mut queued,
+            egui::MouseWheelUnit::Point,
+            Vec2::ZERO,
+            egui::TouchPhase::Start,
+            modifiers,
+        );
+        buffer.push(
+            &mut queued,
+            egui::MouseWheelUnit::Point,
+            Vec2::ZERO,
+            egui::TouchPhase::Cancel,
+            modifiers,
+        );
+        buffer.flush(&mut queued);
+        pass(queued);
+        assert!(!ctx.input(|input| input.is_scrolling()));
+    }
+
+    #[test]
     fn modifier_change_is_a_line_wheel_coalescing_boundary() {
         let mut buffer = WheelEventBuffer::default();
         let mut events = Vec::new();
@@ -3373,20 +3470,39 @@ mod wheel_repaint_tests {
             winit::event::MouseScrollDelta::LineDelta(0.0, 0.0)
         ));
         assert!(!mouse_scroll_delta_needs_repaint(
-            winit::event::MouseScrollDelta::PixelDelta(
-                winit::dpi::PhysicalPosition::new(0.0, 0.0)
-            )
+            winit::event::MouseScrollDelta::PixelDelta(winit::dpi::PhysicalPosition::new(0.0, 0.0))
         ));
         assert!(mouse_scroll_delta_needs_repaint(
-            winit::event::MouseScrollDelta::PixelDelta(
-                winit::dpi::PhysicalPosition::new(1.0, 0.0)
-            )
+            winit::event::MouseScrollDelta::PixelDelta(winit::dpi::PhysicalPosition::new(1.0, 0.0))
         ));
+        assert!(!mouse_wheel_event_needs_repaint(
+            winit::event::MouseScrollDelta::LineDelta(0.0, 0.0),
+            winit::event::TouchPhase::Moved,
+        ));
+        for phase in [
+            winit::event::TouchPhase::Started,
+            winit::event::TouchPhase::Ended,
+            winit::event::TouchPhase::Cancelled,
+        ] {
+            assert!(
+                mouse_wheel_event_needs_repaint(
+                    winit::event::MouseScrollDelta::LineDelta(0.0, 0.0),
+                    phase,
+                ),
+                "{phase:?} must be delivered even with a zero delta"
+            );
+        }
 
         let ctx = egui::Context::default();
         let mut throttle = WheelRepaintThrottle::default();
         let stats = AtomicWheelRepaintStats::default();
-        assert!(!repaint(&ctx, &mut throttle, &stats, web_time::Instant::now(), false));
+        assert!(!repaint(
+            &ctx,
+            &mut throttle,
+            &stats,
+            web_time::Instant::now(),
+            false
+        ));
         assert!(throttle.trailing_at.is_none());
 
         let taken = stats.take();

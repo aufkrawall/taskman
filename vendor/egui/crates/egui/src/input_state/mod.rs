@@ -362,6 +362,15 @@ impl Default for InputState {
     }
 }
 
+fn wheel_smoothing_repaint_delay(predicted_dt: f32) -> Duration {
+    let seconds = if predicted_dt.is_finite() && predicted_dt > 0.0 {
+        predicted_dt.clamp(0.001, 0.1)
+    } else {
+        1.0 / 60.0
+    };
+    Duration::from_secs_f32(seconds)
+}
+
 impl InputState {
     #[must_use]
     pub fn begin_pass(
@@ -656,13 +665,22 @@ impl InputState {
     /// cause a repaint.
     pub(crate) fn wants_repaint_after(&self) -> Option<Duration> {
         if self.pointer.wants_repaint()
-            || self.wheel.unprocessed_wheel_delta.abs().max_elem() > 0.2
-            || !self.events.is_empty()
+            || self
+                .events
+                .iter()
+                .any(|event| !matches!(event, Event::MouseWheel { .. }))
             || !self.raw.hovered_files.is_empty()
             || !self.raw.dropped_files.is_empty()
         {
             // Immediate repaint
             return Some(Duration::ZERO);
+        }
+
+        if self.wheel.unprocessed_wheel_delta.abs().max_elem() > 0.2 {
+            // Mouse-wheel smoothing is discrete follow-up input rather than an
+            // animation. Let the backend deliver it at the display cadence
+            // instead of asking for back-to-back frames.
+            return Some(wheel_smoothing_repaint_delay(self.predicted_dt));
         }
 
         if self.any_touches() && !self.pointer.is_decidedly_dragging() {
@@ -1755,6 +1773,78 @@ impl PointerState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn line_wheel() -> Event {
+        Event::MouseWheel {
+            unit: crate::MouseWheelUnit::Line,
+            delta: vec2(0.0, 1.0),
+            phase: crate::TouchPhase::Move,
+            modifiers: Modifiers::NONE,
+        }
+    }
+
+    #[test]
+    fn invalid_predicted_frame_time_uses_a_nonzero_fallback_delay() {
+        let fallback = Duration::from_secs_f32(1.0 / 60.0);
+        for predicted_dt in [0.0, -1.0, f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            assert_eq!(wheel_smoothing_repaint_delay(predicted_dt), fallback);
+        }
+    }
+
+    #[test]
+    fn wheel_only_input_requests_one_refresh_cadence() {
+        let predicted_dt = 1.0 / 240.0;
+        let state = InputState::default().begin_pass(
+            RawInput {
+                predicted_dt,
+                events: vec![line_wheel()],
+                ..Default::default()
+            },
+            false,
+            1.0,
+            InputOptions::default(),
+        );
+
+        assert_eq!(
+            state.wants_repaint_after(),
+            Some(Duration::from_secs_f32(predicted_dt))
+        );
+    }
+
+    #[test]
+    fn smooth_point_wheel_does_not_request_a_follow_up_frame() {
+        let state = InputState::default().begin_pass(
+            RawInput {
+                events: vec![Event::MouseWheel {
+                    unit: crate::MouseWheelUnit::Point,
+                    delta: vec2(1.0, 2.0),
+                    phase: crate::TouchPhase::Move,
+                    modifiers: Modifiers::NONE,
+                }],
+                ..Default::default()
+            },
+            false,
+            1.0,
+            InputOptions::default(),
+        );
+
+        assert_eq!(state.wants_repaint_after(), None);
+    }
+
+    #[test]
+    fn mixed_wheel_and_non_wheel_input_still_requests_immediate_repaint() {
+        let state = InputState::default().begin_pass(
+            RawInput {
+                events: vec![line_wheel(), Event::Text("x".to_owned())],
+                ..Default::default()
+            },
+            false,
+            1.0,
+            InputOptions::default(),
+        );
+
+        assert_eq!(state.wants_repaint_after(), Some(Duration::ZERO));
+    }
 
     #[test]
     fn window_focus_loss_releases_held_pointer_buttons_without_click() {
