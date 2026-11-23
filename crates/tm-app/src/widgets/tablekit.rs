@@ -1624,7 +1624,7 @@ pub fn caret(painter: egui::Painter, c: Pos2, ascending: bool, color: Color32) {
 }
 
 pub struct Aggregates {
-    pub cpu_pct: f32,
+    pub cpu_pct: Option<f32>,
     pub mem_pct: f32,
     /// Busiest disk's active time, or `None` while the platform's disk-time
     /// counters are not running. Both disk columns hang off this number, so
@@ -1661,7 +1661,10 @@ impl Aggregates {
             .reduce(f32::max)
             .map(|pct| pct.clamp(0.0, 100.0));
         Self {
-            cpu_pct: snap.cpu.utilization_pct,
+            cpu_pct: snap
+                .cpu
+                .utilization_pct_available
+                .then_some(snap.cpu.utilization_pct),
             mem_pct: snap.memory.used_pct(),
             disk_pct,
             net_pct,
@@ -1671,7 +1674,13 @@ impl Aggregates {
                 .processes
                 .iter()
                 .any(|p| p.gpu_util_pct.is_some())
-                .then(|| snap.gpus.iter().map(|g| g.util_pct).reduce(f32::max))
+                .then(|| {
+                    snap.gpus
+                        .iter()
+                        .filter(|g| g.util_pct_available)
+                        .map(|g| g.util_pct)
+                        .reduce(f32::max)
+                })
                 .flatten(),
         }
     }
@@ -1691,7 +1700,8 @@ impl Aggregates {
             .disk_pct
             .map_or_else(|| "\u{2014}".to_string(), format::format_pct_hdr);
         [
-            format::format_pct_hdr(self.cpu_pct),
+            self.cpu_pct
+                .map_or_else(|| "\u{2014}".to_string(), format::format_pct_hdr),
             format::format_pct_hdr(self.mem_pct),
             disk.clone(),
             self.net_pct
@@ -1951,6 +1961,19 @@ mod tests {
         );
     }
 
+    #[test]
+    fn the_cpu_total_distinguishes_a_measured_idle_from_no_sample() {
+        let mut snap = tm_core::model::Snapshot::default();
+        assert_eq!(Aggregates::from_snapshot(&snap).strings()[0], "\u{2014}");
+
+        snap.cpu.utilization_pct_available = true;
+        snap.cpu.utilization_pct = 0.0;
+        assert_eq!(
+            Aggregates::from_snapshot(&snap).strings()[0],
+            format::format_pct_hdr(0.0)
+        );
+    }
+
     /// The network total is the busiest adapter in its busiest direction.
     /// It summed receive + send across every adapter: a full-duplex link at
     /// 60 % each way read 100 %, and a virtual adapter on top of a physical
@@ -2019,6 +2042,7 @@ mod tests {
 
         snap.processes[0].gpu_util_pct = Some(12.0);
         snap.gpus[0].util_pct = 37.0;
+        snap.gpus[0].util_pct_available = true;
         assert_eq!(
             Aggregates::from_snapshot(&snap).strings()[5],
             format::format_pct_hdr(37.0)

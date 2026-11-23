@@ -1426,8 +1426,9 @@ impl Sampler {
             .max(1);
         let (utilization, per_core_pct) = match load.as_ref() {
             Some(l) => (l.global_pct.clamp(0.0, 100.0), l.per_core_pct.clone()),
-            None => (0.0, vec![0.0; logical]),
+            None => (0.0, Vec::new()),
         };
+        let cpu_available = load.is_some();
 
         // ---- memory ----------------------------------------------------------------
         let mem_total = self.sys.total_memory();
@@ -1928,6 +1929,7 @@ impl Sampler {
                 brand: cpu_brand,
                 vendor: cpu_vendor,
                 architecture: std::env::consts::ARCH.to_string(),
+                utilization_pct_available: cpu_available,
                 utilization_pct: utilization.clamp(0.0, 100.0),
                 per_core_pct,
                 per_core_kernel_pct: load

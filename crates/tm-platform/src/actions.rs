@@ -352,6 +352,8 @@ pub struct ProcessFileIo {
     pub offset: Option<u64>,
     /// Access rights of the currently open handles; both `false` once the
     /// file is closed.
+    #[serde(default)]
+    pub access_known: bool,
     pub is_read: bool,
     pub is_write: bool,
     pub open_handles: u32,

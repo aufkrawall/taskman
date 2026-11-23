@@ -51,6 +51,7 @@ pub struct TrackedFileIo {
     pub total_bytes: Option<u64>,
     pub offset: Option<u64>,
     pub file_size: Option<u64>,
+    pub access_known: bool,
     pub is_read: bool,
     pub is_write: bool,
     pub open_handles: u32,
@@ -210,12 +211,14 @@ impl State {
                     existing.is_read = file.is_read;
                     existing.is_write = file.is_write;
                     existing.offset = file.offset;
+                    existing.access_known = file.access_known;
                 } else {
                     // A denied/incomplete enumeration may omit or default
                     // individual handles. Only apply positive facts.
                     existing.open_handles = existing.open_handles.max(file.open_handles);
                     existing.is_read |= file.is_read;
                     existing.is_write |= file.is_write;
+                    existing.access_known |= file.access_known;
                     if let Some(offset) = file.offset {
                         existing.offset = Some(
                             existing
@@ -237,8 +240,14 @@ impl State {
                     (None, None) => None,
                 };
                 existing.total_bytes = measured_total(existing.read_bytes, existing.write_bytes);
-                if let Some(sz) = file.file_size {
-                    existing.file_size = Some(existing.file_size.map_or(sz, |prev| prev.max(sz)));
+                if handles_complete {
+                    existing.file_size = file.file_size;
+                } else if let Some(size) = file.file_size {
+                    existing.file_size = Some(
+                        existing
+                            .file_size
+                            .map_or(size, |previous| previous.max(size)),
+                    );
                 }
             } else {
                 let name = extract_file_name(&file.path);
@@ -252,6 +261,7 @@ impl State {
                     total_bytes,
                     offset: file.offset,
                     file_size: file.file_size,
+                    access_known: file.access_known,
                     is_read: file.is_read,
                     is_write: file.is_write,
                     open_handles: file.open_handles,
@@ -262,6 +272,7 @@ impl State {
             for file in &mut self.files {
                 if !seen.contains(&file.path) {
                     file.open_handles = 0;
+                    file.access_known = true;
                     file.is_read = false;
                     file.is_write = false;
                     file.offset = None;
@@ -277,18 +288,22 @@ impl State {
             // retaining. Keeping it would let temporary-file churn grow the
             // page without bound.
             self.files.retain(|file| file.open_handles > 0);
-        } else if self.files.len() > MAX_RETAINED_IO_ROWS {
-            let mut kept = Vec::with_capacity(MAX_RETAINED_IO_ROWS);
-            let mut closed = 0usize;
+        }
+        if self.files.len() > MAX_RETAINED_IO_ROWS {
+            let mut open = Vec::new();
+            let mut closed = Vec::new();
             for file in self.files.drain(..) {
-                if file.open_handles > 0 || closed < MAX_RETAINED_IO_ROWS {
-                    if file.open_handles == 0 {
-                        closed += 1;
-                    }
-                    kept.push(file);
+                if file.open_handles > 0 {
+                    open.push(file);
+                } else if per_file_measured {
+                    closed.push(file);
                 }
             }
-            self.files = kept;
+            open.truncate(MAX_RETAINED_IO_ROWS);
+            let remaining = MAX_RETAINED_IO_ROWS.saturating_sub(open.len());
+            closed.truncate(remaining);
+            open.extend(closed);
+            self.files = open;
         }
     }
 
@@ -765,6 +780,8 @@ pub fn show(
                 .is_none_or(|accounting| accounting.state != FileIoAccountingState::Measured);
         let msg = if unavailable {
             i18n::tr(K::PropIoFilesUnavailable)
+        } else if !state.file_filter.trim().is_empty() {
+            i18n::tr(K::NoMatches)
         } else {
             i18n::tr(K::PropIoNoFiles)
         };
@@ -941,7 +958,9 @@ pub fn show(
                 let hover_info = format!(
                     "{}\nAccess: {}{}\nPosition: {}\nSize: {}",
                     file.path,
-                    if file.is_read && file.is_write {
+                    if !file.access_known {
+                        "Unknown"
+                    } else if file.is_read && file.is_write {
                         "Read / Write"
                     } else if file.is_write {
                         "Write"
@@ -1230,6 +1249,7 @@ mod tests {
                 write_ops: None,
                 offset: Some(1000),
                 file_size: Some(5000),
+                access_known: true,
                 is_read: true,
                 is_write: false,
                 open_handles: 1,
@@ -1242,6 +1262,7 @@ mod tests {
                 write_ops: None,
                 offset: Some(500),
                 file_size: Some(500),
+                access_known: true,
                 is_read: false,
                 is_write: true,
                 open_handles: 1,
@@ -1269,6 +1290,7 @@ mod tests {
                 write_ops: None,
                 offset: Some(1500),
                 file_size: Some(1500),
+                access_known: true,
                 is_read: false,
                 is_write: true,
                 open_handles: 1,
@@ -1281,6 +1303,7 @@ mod tests {
                 write_ops: None,
                 offset: Some(200),
                 file_size: Some(200),
+                access_known: true,
                 is_read: true,
                 is_write: false,
                 open_handles: 1,
@@ -1327,6 +1350,7 @@ mod tests {
                     total_bytes: Some(5100),
                     offset: Some(5000),
                     file_size: Some(10000),
+                    access_known: true,
                     is_read: true,
                     is_write: false,
                     open_handles: 1,
@@ -1339,6 +1363,7 @@ mod tests {
                     total_bytes: Some(9100),
                     offset: Some(9000),
                     file_size: Some(9000),
+                    access_known: true,
                     is_read: false,
                     is_write: true,
                     open_handles: 1,
@@ -1351,6 +1376,7 @@ mod tests {
                     total_bytes: Some(4000),
                     offset: Some(2000),
                     file_size: Some(2000),
+                    access_known: true,
                     is_read: true,
                     is_write: true,
                     open_handles: 1,
@@ -1429,6 +1455,7 @@ mod tests {
             total_bytes: None,
             offset: Some(7),
             file_size: Some(10),
+            access_known: true,
             is_read: true,
             is_write: false,
             open_handles: 1,
@@ -1643,6 +1670,7 @@ mod tests {
                     total_bytes: Some(5100),
                     offset: Some(5000),
                     file_size: Some(10000),
+                    access_known: true,
                     is_read: true,
                     is_write: false,
                     open_handles: 1,
@@ -1655,6 +1683,7 @@ mod tests {
                     total_bytes: Some(9100),
                     offset: Some(9000),
                     file_size: Some(9000),
+                    access_known: true,
                     is_read: false,
                     is_write: true,
                     open_handles: 2,

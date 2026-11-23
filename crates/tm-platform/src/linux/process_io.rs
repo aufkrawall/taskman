@@ -42,6 +42,7 @@ struct HandleFact {
     path: String,
     file_size: Option<u64>,
     offset: Option<u64>,
+    access_known: bool,
     is_read: bool,
     is_write: bool,
 }
@@ -216,12 +217,14 @@ fn inspect_fd(
         *complete = false;
         return None;
     }
+    let access_known = fdinfo.access.is_some();
     let access = fdinfo.access.unwrap_or_default();
 
     Some(HandleFact {
         path,
         file_size: Some(metadata.len()),
         offset: fdinfo.offset,
+        access_known,
         is_read: access.is_read,
         is_write: access.is_write,
     })
@@ -285,6 +288,7 @@ fn merge_handle_fact(files: &mut HashMap<String, ProcessFileIo>, fact: HandleFac
         path,
         file_size,
         offset,
+        access_known,
         is_read,
         is_write,
     } = fact;
@@ -296,11 +300,13 @@ fn merge_handle_fact(files: &mut HashMap<String, ProcessFileIo>, fact: HandleFac
         write_ops: None,
         file_size,
         offset,
+        access_known: false,
         is_read: false,
         is_write: false,
         open_handles: 0,
     });
     file.open_handles = file.open_handles.saturating_add(1);
+    file.access_known |= access_known;
     file.is_read |= is_read;
     file.is_write |= is_write;
     if let Some(offset) = offset {

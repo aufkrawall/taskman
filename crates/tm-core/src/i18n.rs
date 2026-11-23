@@ -533,6 +533,14 @@ keys! {
         "{} Prozesse wirklich beenden? Nicht gespeicherte Daten dieser Prozesse gehen verloren.",
         "End {} processes? Unsaved data in these processes will be lost."
     ],
+    EndProcessTreeConfirm => [
+        "\"{}\" (PID {}) und alle untergeordneten Prozesse wirklich beenden? Nicht gespeicherte Daten gehen verloren.",
+        "End \"{}\" (PID {}) and all descendant processes? Unsaved data will be lost."
+    ],
+    EndProcessTreesConfirm => [
+        "{} Prozessbäume wirklich beenden? Nicht gespeicherte Daten dieser Prozesse gehen verloren.",
+        "End {} process trees? Unsaved data in these processes will be lost."
+    ],
     SelectedCount => ["{} ausgewählt", "{} selected"],
     ProcessesEndedToast => ["{} Prozesse beendet", "Ended {} processes"],
     BatchPartialFailure => [

@@ -5,6 +5,7 @@
 ### New
 
 - **Linux process inspection:** Process Properties now lists loaded file mappings, per-thread scheduler and CPU evidence, and TCP/UDP endpoints from procfs on Linux. PID/TID generation and network-namespace changes are rejected rather than mixing snapshots; socket reuse is filtered across before/after handle walks; malformed rows are omitted instead of rendered as listeners; Linux's `R` state is shown as runnable rather than proven execution; and missing switch/cycle evidence remains unknown rather than becoming "Idle". The module inventory is read-only, and data that procfs cannot provide remains unavailable rather than being fabricated.
+- **Linux telemetry and session parity:** Linux now computes aggregate and per-core CPU utilization plus kernel time from `/proc/stat` deltas (the counter-only first sample stays unavailable), reports adapter IPv4/IPv6 and sysfs driver/hardware descriptions, enriches every DRM adapter with available PCI identity, driver, VRAM/GTT and temperature data, and lists systemd login sessions through a validated `loginctl` path when available. Missing CPU/GPU utilization and GPU memory sources remain unavailable rather than idle or zero, history gaps stay aligned with their timestamps, no engine data is invented, and Wi-Fi SSID/signal plus session logoff/disconnect remain unavailable rather than guessed.
 
 ### Fixed
 

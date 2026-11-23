@@ -58,7 +58,10 @@ pub fn run(mock: bool) -> i32 {
         "ticks": handle.tick_count(),
         "sample_duration_ms": snap.sample_duration_ms,
         "cpu": {
-            "util_pct": snap.cpu.utilization_pct,
+            "util_pct": snap
+                .cpu
+                .utilization_pct_available
+                .then_some(snap.cpu.utilization_pct),
             "logical": snap.cpu.logical_count,
             "brand": snap.cpu.brand,
             // Measured current frequency; only the CPU_SPEED provider fills it.

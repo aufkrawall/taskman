@@ -19,6 +19,26 @@
   explicitly prohibited compiling or running tests, so the gate is unrun;
   static diff/secret checks only.
 
+## 2026-11-23 - Linux telemetry/session parity (static implementation)
+
+- Linux CPU utilization and kernel share now come from `/proc/stat` jiffy
+  deltas, not `sysinfo::Cpu::cpu_usage`; first samples and CPU-set changes are
+  unavailable, and per-core values use the same window.
+- Linux network metadata now adds preferred IPv4/IPv6 addresses and a sysfs
+  driver/PCI/USB description. Wi-Fi SSID and signal stay unknown because no
+  reliable, non-fragile source was added.
+- Every `/sys/class/drm/cardN` adapter is reported with available PCI identity,
+  driver name/version, VRAM/GTT and hwmon temperature. `gpu_busy_percent` is
+  adapter-wide, so it fills `GpuInfo::util_pct` and never fabricates engine
+  rows; `GpuInfo::util_pct_available` keeps missing utilization out of the 0 %
+  rendering path.
+- `loginctl` session enumeration is enabled only when systemd and the command
+  are present. Process-to-session mapping uses exact `session-N.scope` cgroup
+  membership; username fallback in the Users tab now requires one unambiguous
+  session. Session logoff/disconnect remains disabled.
+- Parser/delta and mapping tests were added, but this task's explicit no-build
+  constraint meant they, the format gate and the release build were not run.
+
 ## 2026-11-22 - Third-party review fixes (icons, identity, restore, diagnostics)
 
 - Fixed a release-abort in Linux icon decoding: 16-bit theme PNGs now decode

@@ -194,7 +194,7 @@ mod tests {
         let disk = disk_activity_series(&win, "C:");
         assert_eq!(disk, vec![None, Some(50.0), None]);
         let gpu = gpu_series(&win, "0", GpuField::Util);
-        assert_eq!(gpu, vec![0.0, 0.0, 0.0]);
+        assert!(gpu.iter().all(|value| value.is_nan()));
     }
 
     #[test]
@@ -217,6 +217,7 @@ mod tests {
         let mut busy = pt(500);
         busy.gpus = vec![crate::app::GpuHistoryPoint {
             id: 0,
+            util_pct_available: true,
             util_pct: 90.0,
             ..Default::default()
         }];
@@ -276,26 +277,28 @@ mod tests {
         p1.gpus = vec![
             crate::app::GpuHistoryPoint {
                 id: 0,
+                shared_mem_available: true,
                 dedicated_used_bytes: 1_000,
                 shared_used_bytes: 2_000,
                 ..Default::default()
             },
             crate::app::GpuHistoryPoint {
                 id: 1,
+                shared_mem_available: true,
                 dedicated_used_bytes: 5_000,
                 shared_used_bytes: 9_000,
                 ..Default::default()
             },
         ];
         let win = vec![pt(0), p1, pt(1000)];
-        assert_eq!(
-            gpu_series(&win, "0", GpuField::Shared),
-            vec![0.0, 2000.0, 0.0]
-        );
-        assert_eq!(
-            gpu_series(&win, "1", GpuField::Shared),
-            vec![0.0, 9000.0, 0.0]
-        );
+        let gpu0 = gpu_series(&win, "0", GpuField::Shared);
+        assert!(gpu0[0].is_nan());
+        assert_eq!(gpu0[1], 2000.0);
+        assert!(gpu0[2].is_nan());
+        let gpu1 = gpu_series(&win, "1", GpuField::Shared);
+        assert!(gpu1[0].is_nan());
+        assert_eq!(gpu1[1], 9000.0);
+        assert!(gpu1[2].is_nan());
     }
 
     #[test]
@@ -315,6 +318,7 @@ mod tests {
         let mut p1 = pt(500);
         p1.gpus = vec![crate::app::GpuHistoryPoint {
             id: 0,
+            util_pct_available: true,
             util_pct: 42.0,
             ..Default::default()
         }];
@@ -322,6 +326,7 @@ mod tests {
         let win = vec![pt(0), p1];
         let gpu = tm_core::model::GpuInfo {
             id: 0,
+            util_pct_available: true,
             util_pct: 42.0,
             engines: vec![
                 tm_core::model::GpuEngine {
@@ -350,8 +355,37 @@ mod tests {
     }
 
     #[test]
+    fn unavailable_gpu_utilization_is_not_rendered_as_idle_zero() {
+        let gpu = tm_core::model::GpuInfo {
+            id: 0,
+            util_pct_available: false,
+            util_pct: 0.0,
+            ..Default::default()
+        };
+        assert_eq!(gpu_util_text(&gpu), "\u{2014}");
+        assert_eq!(gpu_total_mem_value(&gpu), "\u{2014}");
+
+        let measured_idle = tm_core::model::GpuInfo {
+            util_pct_available: true,
+            ..gpu
+        };
+        assert_eq!(gpu_util_text(&measured_idle), format::format_pct_hdr(0.0));
+    }
+
+    #[test]
+    fn unavailable_cpu_utilization_is_not_rendered_as_idle_zero() {
+        let mut cpu = tm_core::model::CpuInfo::default();
+        assert_eq!(cpu_util_text(&cpu), "\u{2014}");
+
+        cpu.utilization_pct_available = true;
+        assert_eq!(cpu_util_text(&cpu), format::format_pct_hdr(0.0));
+    }
+
+    #[test]
     fn gpu_total_mem_omits_capacity_unless_both_capacities_are_known() {
         let known = tm_core::model::GpuInfo {
+            dedicated_mem_available: true,
+            shared_mem_available: true,
             dedicated_used_bytes: 2 * 1024 * 1024 * 1024,
             shared_used_bytes: 1024 * 1024 * 1024,
             mem_total_bytes: 12 * 1024 * 1024 * 1024,
@@ -367,7 +401,7 @@ mod tests {
             shared_total_bytes: 0,
             ..known
         };
-        assert!(!gpu_total_mem_value(&unknown_shared_cap).contains('/'));
+        assert_eq!(gpu_total_mem_value(&unknown_shared_cap), "\u{2014}");
     }
 
     #[test]
@@ -583,7 +617,13 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
                                 return disk_activity_series(win, &e.key);
                             }
                             let values = match e.kind {
-                                ResourceKind::Cpu => series(win, |h| h.cpu_total as f64),
+                                ResourceKind::Cpu => series(win, |h| {
+                                    if h.cpu_available {
+                                        h.cpu_total as f64
+                                    } else {
+                                        f64::NAN
+                                    }
+                                }),
                                 ResourceKind::Memory => {
                                     series(win, |h| pct_of(h.mem_used_bytes, h.mem_total_bytes))
                                 }
@@ -854,7 +894,7 @@ fn build_resource_list(app: &TaskManApp) -> Vec<ResourceEntry> {
         subtitle: String::new(),
         value_line: format!(
             "{}  {}",
-            format::format_pct_hdr(snap.cpu.utilization_pct),
+            cpu_util_text(&snap.cpu),
             format::format_freq_ghz(snap.cpu.freq_mhz)
         ),
     });
@@ -923,7 +963,7 @@ fn build_resource_list(app: &TaskManApp) -> Vec<ResourceEntry> {
             subtitle: g.name.clone(),
             value_line: format!(
                 "{}{}",
-                format::format_pct_hdr(g.util_pct),
+                gpu_util_text(g),
                 g.temperature_c
                     .map(|t| format!("  ({t:.0} °C)"))
                     .unwrap_or_default()
@@ -1105,6 +1145,16 @@ fn gpu_engine_names(
     snapshot: &[tm_core::model::GpuEngine],
     key: &str,
 ) -> Vec<String> {
+    let has_measurement = !snapshot.is_empty()
+        || win.iter().any(|point| {
+            point
+                .gpu_engines
+                .iter()
+                .any(|(id, ..)| id.to_string() == key)
+        });
+    if !has_measurement {
+        return Vec::new();
+    }
     let mut names: Vec<String> = vec![
         "3D".into(),
         "Copy".into(),
@@ -1167,13 +1217,36 @@ fn gpu_series(win: &[HistoryPoint], key: &str, field: GpuField) -> Vec<f64> {
             h.gpus
                 .iter()
                 .find(|point| point.id.to_string() == key)
-                .map_or(0.0, |point| match field {
-                    GpuField::Util => point.util_pct as f64,
-                    GpuField::Dedicated => point.dedicated_used_bytes as f64,
-                    GpuField::Shared => point.shared_used_bytes as f64,
+                .map_or(f64::NAN, |point| match field {
+                    GpuField::Util if point.util_pct_available => point.util_pct as f64,
+                    GpuField::Util => f64::NAN,
+                    GpuField::Dedicated if point.dedicated_mem_available => {
+                        point.dedicated_used_bytes as f64
+                    }
+                    GpuField::Dedicated => f64::NAN,
+                    GpuField::Shared if point.shared_mem_available => {
+                        point.shared_used_bytes as f64
+                    }
+                    GpuField::Shared => f64::NAN,
                 })
         })
         .collect()
+}
+
+fn gpu_util_text(gpu: &tm_core::model::GpuInfo) -> String {
+    if gpu.util_pct_available {
+        format::format_pct_hdr(gpu.util_pct)
+    } else {
+        "\u{2014}".to_string()
+    }
+}
+
+fn cpu_util_text(cpu: &tm_core::model::CpuInfo) -> String {
+    if cpu.utilization_pct_available {
+        format::format_pct_hdr(cpu.utilization_pct)
+    } else {
+        "\u{2014}".to_string()
+    }
 }
 
 /// Page title row: big name left, detail right.
@@ -1597,17 +1670,44 @@ fn cpu_page(app: &mut TaskManApp, ui: &mut egui::Ui, pal: &Palette) {
     let win = window(app);
     let ts = timestamps(win);
     let axis = TimeAxis::new(&ts, app.shared.settings.graph_seconds);
-    let total_series = series(win, |h| h.cpu_total as f64);
-    let kernel_series = series(win, |h| h.cpu_kernel as f64);
+    let total_series = series(win, |h| {
+        if h.cpu_available {
+            h.cpu_total as f64
+        } else {
+            f64::NAN
+        }
+    });
+    let kernel_series = series(win, |h| {
+        if h.cpu_available
+            && !h.per_core_kernel.is_empty()
+            && h.per_core_kernel.len() == h.per_core.len()
+        {
+            h.cpu_kernel as f64
+        } else {
+            f64::NAN
+        }
+    });
     let cores = snap.cpu.per_core_pct.len();
     let mut core_hist: Vec<Vec<f64>> = (0..cores).map(|_| Vec::with_capacity(win.len())).collect();
     let mut core_kern: Vec<Vec<f64>> = (0..cores).map(|_| Vec::with_capacity(win.len())).collect();
     for h in win {
-        for (dst, v) in core_hist.iter_mut().zip(h.per_core.iter()) {
-            dst.push(*v as f64);
+        if h.per_core.len() == cores {
+            for (dst, value) in core_hist.iter_mut().zip(&h.per_core) {
+                dst.push(*value as f64);
+            }
+        } else {
+            for dst in &mut core_hist {
+                dst.push(f64::NAN);
+            }
         }
-        for (dst, v) in core_kern.iter_mut().zip(h.per_core_kernel.iter()) {
-            dst.push(*v as f64);
+        if h.per_core_kernel.len() == cores {
+            for (dst, value) in core_kern.iter_mut().zip(&h.per_core_kernel) {
+                dst.push(*value as f64);
+            }
+        } else {
+            for dst in &mut core_kern {
+                dst.push(f64::NAN);
+            }
         }
     }
     let logical_mode = app.shared.settings.cpu_graph_mode == "logical";
@@ -1776,7 +1876,7 @@ fn cpu_page(app: &mut TaskManApp, ui: &mut egui::Ui, pal: &Palette) {
                         ui,
                         pal,
                         i18n::tr(K::StatUtilization),
-                        &format::format_pct_hdr(snap.cpu.utilization_pct),
+                        &cpu_util_text(&snap.cpu),
                         w,
                     );
                     big_stat(
@@ -1955,23 +2055,23 @@ fn gpu_graph_menu_contents(
         *chosen = Some("overall".to_string());
         ui.close();
     }
-    if menu::check(ui, i18n::tr(K::GpuAllEngines), current == "all").clicked() {
-        *chosen = Some("all".to_string());
-        ui.close();
-    }
     if !engines.is_empty() {
-        menu::separator(ui);
-    }
-    for engine in engines {
-        if menu::check(ui, &engine_label(engine), current == *engine).clicked() {
-            *chosen = Some(engine.clone());
+        if menu::check(ui, i18n::tr(K::GpuAllEngines), current == "all").clicked() {
+            *chosen = Some("all".to_string());
             ui.close();
         }
-    }
-    menu::separator(ui);
-    if menu::check(ui, i18n::tr(K::GpuMultiEngine), multi_engine).clicked() {
-        *toggled_multi = Some(!multi_engine);
-        ui.close();
+        menu::separator(ui);
+        for engine in engines {
+            if menu::check(ui, &engine_label(engine), current == *engine).clicked() {
+                *chosen = Some(engine.clone());
+                ui.close();
+            }
+        }
+        menu::separator(ui);
+        if menu::check(ui, i18n::tr(K::GpuMultiEngine), multi_engine).clicked() {
+            *toggled_multi = Some(!multi_engine);
+            ui.close();
+        }
     }
 }
 
@@ -2570,18 +2670,20 @@ fn gpu_engine_chart_spec(
     // An engine this adapter never reported falls back to the overall
     // (busiest-engine) view rather than drawing a flat zero the user cannot
     // tell from an idle engine.
-    let resolved_mode =
-        if requested == "overall" || requested == "all" || engines.iter().any(|e| e == requested) {
-            requested.to_string()
-        } else {
-            "overall".to_string()
-        };
+    let resolved_mode = if engines.is_empty() {
+        "overall".to_string()
+    } else if requested == "overall" || requested == "all" || engines.iter().any(|e| e == requested)
+    {
+        requested.to_string()
+    } else {
+        "overall".to_string()
+    };
 
     match resolved_mode.as_str() {
         "all" => GpuEngineChartSpec {
             resolved_mode,
             title: i18n::tr(K::GpuAllEngines).to_string(),
-            right_pct: format::format_pct_hdr(gpu.util_pct),
+            right_pct: gpu_util_text(gpu),
             series: engines
                 .iter()
                 .enumerate()
@@ -2600,7 +2702,7 @@ fn gpu_engine_chart_spec(
         "overall" => GpuEngineChartSpec {
             resolved_mode,
             title: i18n::tr(K::StatUtilization).to_string(),
-            right_pct: format::format_pct_hdr(gpu.util_pct),
+            right_pct: gpu_util_text(gpu),
             series: vec![MultiSeries::new(
                 i18n::tr(K::StatUtilization),
                 gpu_series(win, key, GpuField::Util),
@@ -2639,17 +2741,26 @@ fn gpu_memory_chart(
     window_text: &str,
     samples_bytes: Vec<f64>,
     capacity_bytes: u64,
+    available: bool,
     width: f32,
     height: f32,
     axis: TimeAxis,
 ) -> egui::Response {
-    let peak = samples_bytes.iter().copied().fold(0.0f64, f64::max) as u64;
+    let peak = samples_bytes
+        .iter()
+        .copied()
+        .filter(|value| value.is_finite() && *value > 0.0)
+        .fold(0.0f64, f64::max) as u64;
     let max_bytes = capacity_bytes.max(peak).max(1);
     caption(
         ui,
         pal,
         &i18n::trf(window_key, &[window_text]),
-        &format::format_bytes_loc(max_bytes),
+        &if available {
+            format::format_bytes_loc(max_bytes)
+        } else {
+            "\u{2014}".into()
+        },
     );
     // Mebibytes, matching `fmt_mib` — avoids mislabelling MiB values as GB.
     let mib: Vec<f64> = samples_bytes
@@ -2686,16 +2797,18 @@ fn gpu_mem_ratio_value(used_bytes: u64, total_bytes: u64) -> String {
 }
 
 fn gpu_total_mem_value(gpu: &tm_core::model::GpuInfo) -> String {
-    let used = gpu
-        .dedicated_used_bytes
-        .saturating_add(gpu.shared_used_bytes);
-    if gpu.mem_total_bytes > 0 && gpu.shared_total_bytes > 0 {
-        gpu_mem_ratio_value(
-            used,
-            gpu.mem_total_bytes.saturating_add(gpu.shared_total_bytes),
-        )
-    } else {
-        format::format_bytes_loc(used)
+    match (gpu.dedicated_mem_available, gpu.shared_mem_available) {
+        (true, true) if gpu.mem_total_bytes > 0 && gpu.shared_total_bytes > 0 => {
+            gpu_mem_ratio_value(
+                gpu.dedicated_used_bytes
+                    .saturating_add(gpu.shared_used_bytes),
+                gpu.mem_total_bytes.saturating_add(gpu.shared_total_bytes),
+            )
+        }
+        (true, true) => "\u{2014}".into(),
+        (true, false) => gpu_mem_ratio_value(gpu.dedicated_used_bytes, gpu.mem_total_bytes),
+        (false, true) => gpu_mem_ratio_value(gpu.shared_used_bytes, gpu.shared_total_bytes),
+        (false, false) => "\u{2014}".into(),
     }
 }
 
@@ -2714,7 +2827,7 @@ fn gpu_page(app: &mut TaskManApp, ui: &mut egui::Ui, pal: &Palette, entry: &Reso
     let width = content_width(ui);
     let window_text = window_label(app.shared.settings.graph_seconds);
     let engines = gpu_engine_names(win, &gpu.engines, &entry.key);
-    let multi_engine = app.shared.settings.gpu_multi_engine;
+    let multi_engine = app.shared.settings.gpu_multi_engine && !engines.is_empty();
 
     let mut engine_menus: Vec<(Option<usize>, egui::Response, egui::Response)> = Vec::new();
     let mut visible_engines: Vec<String> = Vec::new();
@@ -2801,6 +2914,7 @@ fn gpu_page(app: &mut TaskManApp, ui: &mut egui::Ui, pal: &Palette, entry: &Reso
         &window_text,
         gpu_series(win, &entry.key, GpuField::Dedicated),
         gpu.mem_total_bytes,
+        gpu.dedicated_mem_available,
         width,
         mem_chart_h,
         axis,
@@ -2814,6 +2928,7 @@ fn gpu_page(app: &mut TaskManApp, ui: &mut egui::Ui, pal: &Palette, entry: &Reso
         &window_text,
         gpu_series(win, &entry.key, GpuField::Shared),
         gpu.shared_total_bytes,
+        gpu.shared_mem_available,
         width,
         mem_chart_h,
         axis,
@@ -2831,7 +2946,7 @@ fn gpu_page(app: &mut TaskManApp, ui: &mut egui::Ui, pal: &Palette, entry: &Reso
                         ui,
                         pal,
                         i18n::tr(K::StatUtilization),
-                        &format::format_pct_hdr(gpu.util_pct),
+                        &gpu_util_text(gpu),
                         w,
                     );
                     big_stat(
@@ -2849,14 +2964,22 @@ fn gpu_page(app: &mut TaskManApp, ui: &mut egui::Ui, pal: &Palette, entry: &Reso
                         ui,
                         pal,
                         i18n::tr(K::PropGpuDedicated),
-                        &gpu_mem_ratio_value(gpu.dedicated_used_bytes, gpu.mem_total_bytes),
+                        &if gpu.dedicated_mem_available {
+                            gpu_mem_ratio_value(gpu.dedicated_used_bytes, gpu.mem_total_bytes)
+                        } else {
+                            "\u{2014}".into()
+                        },
                         w,
                     );
                     big_stat(
                         ui,
                         pal,
                         i18n::tr(K::PropGpuShared),
-                        &gpu_mem_ratio_value(gpu.shared_used_bytes, gpu.shared_total_bytes),
+                        &if gpu.shared_mem_available {
+                            gpu_mem_ratio_value(gpu.shared_used_bytes, gpu.shared_total_bytes)
+                        } else {
+                            "\u{2014}".into()
+                        },
                         w,
                     );
                     if let Some(t) = gpu.temperature_c {

@@ -47,6 +47,7 @@ pub fn snapshot(seed: u32) -> Snapshot {
             brand: "Mock CPU 8-Core".into(),
             vendor: "MockVendor".into(),
             architecture: "x86_64".into(),
+            utilization_pct_available: true,
             utilization_pct: busy,
             per_core_pct: (0..8)
                 .map(|i| {
@@ -133,7 +134,10 @@ pub fn snapshot(seed: u32) -> Snapshot {
             driver_date_epoch_s: Some(1_794_009_600),
             directx_version: "12 (FL 12.2)".into(),
             pci_location: Some((6, 0, 0)),
+            util_pct_available: true,
             util_pct: (s * 5.0) % 100.0,
+            dedicated_mem_available: true,
+            shared_mem_available: true,
             mem_used_bytes: 2 * 1024 * 1024 * 1024,
             mem_total_bytes: 8 * 1024 * 1024 * 1024,
             dedicated_used_bytes: 1024 * 1024 * 1024,

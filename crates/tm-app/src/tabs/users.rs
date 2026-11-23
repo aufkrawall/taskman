@@ -11,7 +11,7 @@ use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 use tm_core::i18n::{self, K};
-use tm_core::model::{DiskGroupLoad, GpuGroupLoad, UserSession};
+use tm_core::model::{DiskGroupLoad, GpuGroupLoad, ProcessEntry, UserSession};
 
 use crate::app::TaskManApp;
 use crate::icons::Icon;
@@ -61,16 +61,7 @@ pub(crate) fn first_search_match_session_id(app: &TaskManApp, q: &search::Query)
         );
     }
     for p in &snap.processes {
-        let sid = p.session_id.or_else(|| {
-            sessions
-                .iter()
-                .find(|s| {
-                    p.user
-                        .as_deref()
-                        .is_some_and(|u| u.eq_ignore_ascii_case(&s.user))
-                })
-                .map(|s| s.id)
-        });
+        let sid = process_session_id(&sessions, p);
         let Some(sid) = sid else { continue };
         let Some(a) = aggs.get_mut(&sid) else {
             continue;
@@ -210,6 +201,31 @@ fn accumulate(a: &mut Agg, p: &tm_core::model::ProcessEntry) {
             .exe_path
             .as_ref()
             .map(|x| x.to_string_lossy().into_owned());
+    }
+}
+
+/// Username is only a safe fallback on Windows, where account names are
+/// case-insensitive, and only when exactly one real session has that account.
+/// With two remote/local sessions for the same user,
+/// guessing the first would attribute CPU and I/O to the wrong session.
+fn unique_session_for_user(sessions: &[&UserSession], user: Option<&str>) -> Option<u32> {
+    let user = user?;
+    let mut matching = sessions
+        .iter()
+        .filter(|session| session.user.eq_ignore_ascii_case(user));
+    let session = matching.next()?;
+    matching.next().is_none().then_some(session.id)
+}
+
+fn process_session_id(sessions: &[&UserSession], process: &ProcessEntry) -> Option<u32> {
+    if cfg!(target_os = "windows") {
+        process
+            .session_id
+            .or_else(|| unique_session_for_user(sessions, process.user.as_deref()))
+    } else {
+        // Linux uses exact cgroup session scopes; username alone cannot prove
+        // that a daemon belongs to a user's graphical session.
+        process.session_id
     }
 }
 
@@ -408,16 +424,7 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
         );
     }
     for p in &snap.processes {
-        let sid = p.session_id.or_else(|| {
-            sessions
-                .iter()
-                .find(|s| {
-                    p.user
-                        .as_deref()
-                        .is_some_and(|u| u.eq_ignore_ascii_case(&s.user))
-                })
-                .map(|s| s.id)
-        });
+        let sid = process_session_id(&sessions, p);
         let Some(sid) = sid else { continue };
         let Some(a) = aggs.get_mut(&sid) else {
             continue;
@@ -1233,5 +1240,31 @@ mod tests {
             ),
             Ordering::Greater
         );
+    }
+
+    #[test]
+    fn username_fallback_requires_one_unambiguous_session() {
+        let alice = UserSession {
+            id: 1,
+            user: "alice".into(),
+            ..Default::default()
+        };
+        let alice_remote = UserSession {
+            id: 2,
+            user: "alice".into(),
+            ..Default::default()
+        };
+        let bob = UserSession {
+            id: 3,
+            user: "Bob".into(),
+            ..Default::default()
+        };
+
+        let unique = [&bob];
+        assert_eq!(unique_session_for_user(&unique, Some("Bob")), Some(3));
+        assert_eq!(unique_session_for_user(&unique, Some("bob")), Some(3));
+
+        let ambiguous = [&alice, &alice_remote, &bob];
+        assert_eq!(unique_session_for_user(&ambiguous, Some("alice")), None);
     }
 }

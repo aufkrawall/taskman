@@ -1997,89 +1997,104 @@ pub fn process_end_dialog(app: &mut TaskManApp, ctx: &egui::Context) {
         dialog_key_decision(keys, end_focused, true).map(|d| matches!(d, DialogDecision::Primary));
 
     let pal = crate::theme::palette_ctx(ctx);
-    egui::Window::new(i18n::tr(K::EndTask))
-        .modal(true)
-        .id(egui::Id::new("end-task-dialog"))
-        .open(&mut open)
-        .collapsible(false)
-        .resizable(false)
-        .fixed_size([420.0, dialog_height])
-        .anchor(Align2::CENTER_CENTER, [0.0, -40.0])
-        .show(ctx, |ui| {
-            ui.set_width(400.0);
-            match pending.targets.as_slice() {
-                [(identity, name)] => {
-                    ui.label(i18n::trf(
-                        K::EndProcessConfirm,
-                        &[name, &identity.pid.to_string()],
-                    ));
-                }
-                targets => {
-                    ui.label(i18n::trf(
-                        K::EndProcessesConfirm,
-                        &[&targets.len().to_string()],
-                    ));
-                    ui.add_space(8.0);
-                    let box_stroke = egui::Stroke::new(
-                        1.0,
-                        if ui.visuals().dark_mode {
-                            Color32::from_rgb(0x3e, 0x3e, 0x3e)
-                        } else {
-                            Color32::from_rgb(0xd8, 0xd8, 0xd8)
-                        },
-                    );
-                    let box_bg = if ui.visuals().dark_mode {
-                        Color32::from_rgb(0x1f, 0x1f, 0x1f)
+    egui::Window::new(if pending.tree {
+        i18n::tr(K::EndTree)
+    } else {
+        i18n::tr(K::EndTask)
+    })
+    .modal(true)
+    .id(egui::Id::new("end-task-dialog"))
+    .open(&mut open)
+    .collapsible(false)
+    .resizable(false)
+    .fixed_size([420.0, dialog_height])
+    .anchor(Align2::CENTER_CENTER, [0.0, -40.0])
+    .show(ctx, |ui| {
+        ui.set_width(400.0);
+        match pending.targets.as_slice() {
+            [(identity, name)] => {
+                ui.label(i18n::trf(
+                    if pending.tree {
+                        K::EndProcessTreeConfirm
                     } else {
-                        Color32::from_rgb(0xf5, 0xf5, 0xf5)
-                    };
-                    egui::Frame::NONE
-                        .fill(box_bg)
-                        .stroke(box_stroke)
-                        .corner_radius(CornerRadius::same(4))
-                        .inner_margin(egui::Margin::symmetric(10, 6))
-                        .show(ui, |ui| {
-                            egui::ScrollArea::vertical()
-                                .max_height(END_TASK_LIST_MAX_HEIGHT)
-                                .auto_shrink([false, true])
-                                .show(ui, |ui| {
-                                    ui.spacing_mut().item_spacing.y = 3.0;
-                                    for (identity, name) in targets {
-                                        ui.horizontal(|ui| {
-                                            ui.label(name);
-                                            ui.with_layout(
-                                                egui::Layout::right_to_left(egui::Align::Center),
-                                                |ui| {
-                                                    ui.label(
-                                                        egui::RichText::new(format!(
-                                                            "PID {}",
-                                                            identity.pid
-                                                        ))
-                                                        .color(pal.text_dim),
-                                                    );
-                                                },
-                                            );
-                                        });
-                                    }
-                                });
-                        });
-                }
+                        K::EndProcessConfirm
+                    },
+                    &[name, &identity.pid.to_string()],
+                ));
             }
-            ui.add_space(12.0);
+            targets => {
+                ui.label(i18n::trf(
+                    if pending.tree {
+                        K::EndProcessTreesConfirm
+                    } else {
+                        K::EndProcessesConfirm
+                    },
+                    &[&targets.len().to_string()],
+                ));
+                ui.add_space(8.0);
+                let box_stroke = egui::Stroke::new(
+                    1.0,
+                    if ui.visuals().dark_mode {
+                        Color32::from_rgb(0x3e, 0x3e, 0x3e)
+                    } else {
+                        Color32::from_rgb(0xd8, 0xd8, 0xd8)
+                    },
+                );
+                let box_bg = if ui.visuals().dark_mode {
+                    Color32::from_rgb(0x1f, 0x1f, 0x1f)
+                } else {
+                    Color32::from_rgb(0xf5, 0xf5, 0xf5)
+                };
+                egui::Frame::NONE
+                    .fill(box_bg)
+                    .stroke(box_stroke)
+                    .corner_radius(CornerRadius::same(4))
+                    .inner_margin(egui::Margin::symmetric(10, 6))
+                    .show(ui, |ui| {
+                        egui::ScrollArea::vertical()
+                            .max_height(END_TASK_LIST_MAX_HEIGHT)
+                            .auto_shrink([false, true])
+                            .show(ui, |ui| {
+                                ui.spacing_mut().item_spacing.y = 3.0;
+                                for (identity, name) in targets {
+                                    ui.horizontal(|ui| {
+                                        ui.label(name);
+                                        ui.with_layout(
+                                            egui::Layout::right_to_left(egui::Align::Center),
+                                            |ui| {
+                                                ui.label(
+                                                    egui::RichText::new(format!(
+                                                        "PID {}",
+                                                        identity.pid
+                                                    ))
+                                                    .color(pal.text_dim),
+                                                );
+                                            },
+                                        );
+                                    });
+                                }
+                            });
+                    });
+            }
+        }
+        ui.add_space(12.0);
 
-            match dialog_button_row(
-                ui,
-                ctx,
-                &pal,
-                i18n::tr(K::Cancel),
-                Some((i18n::tr(K::EndTask), true)),
-                &mut end_focused,
-            ) {
-                DialogButtonClick::Safe => decision = Some(false),
-                DialogButtonClick::Primary => decision = Some(true),
-                DialogButtonClick::None => {}
-            }
-        });
+        match dialog_button_row(
+            ui,
+            ctx,
+            &pal,
+            i18n::tr(K::Cancel),
+            Some((
+                i18n::tr(if pending.tree { K::EndTree } else { K::EndTask }),
+                true,
+            )),
+            &mut end_focused,
+        ) {
+            DialogButtonClick::Safe => decision = Some(false),
+            DialogButtonClick::Primary => decision = Some(true),
+            DialogButtonClick::None => {}
+        }
+    });
 
     ctx.data_mut(|d| d.insert_temp(focus_id, end_focused));
 

@@ -527,11 +527,9 @@ pub mod taskbar_monitor {
                 recv += n.recv_bps;
             }
             Self {
-                cpu_pct: snap
-                    .cpu
-                    .utilization_pct
-                    .is_finite()
-                    .then_some(snap.cpu.utilization_pct),
+                cpu_pct: (snap.cpu.utilization_pct_available
+                    && snap.cpu.utilization_pct.is_finite())
+                .then_some(snap.cpu.utilization_pct),
                 ram_pct,
                 net_sent_bps: (has_net && sent.is_finite()).then_some(sent),
                 net_recv_bps: (has_net && recv.is_finite()).then_some(recv),
@@ -580,6 +578,7 @@ pub mod taskbar_monitor {
         #[test]
         fn metrics_from_snapshot_excludes_loopback_and_handles_missing_ram() {
             let mut snap = Snapshot::default();
+            snap.cpu.utilization_pct_available = true;
             snap.cpu.utilization_pct = 24.5;
             snap.memory.total_bytes = 0;
             snap.networks.push(NetworkInfo {

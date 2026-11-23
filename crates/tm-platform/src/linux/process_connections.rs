@@ -146,7 +146,12 @@ fn parse_net_table<R: BufRead>(
     );
     let tcp = matches!(protocol, ConnectionProtocol::Tcp | ConnectionProtocol::Tcp6);
     let mut sockets = Vec::new();
-    for line in reader.lines().skip(1) {
+    let mut lines = reader.lines();
+    let Some(header) = lines.next() else {
+        return Ok(sockets);
+    };
+    header?;
+    for line in lines {
         let line = line?;
         let fields = line.split_ascii_whitespace().collect::<Vec<_>>();
         if fields.len() < 10 {
@@ -349,6 +354,23 @@ mod tests {
         .unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].inode, 4242);
+    }
+
+    #[test]
+    fn network_table_reader_errors_are_propagated_for_header_and_rows() {
+        let header_error = parse_net_table(
+            BufReader::new(Cursor::new(vec![0xff, b'\n'])),
+            ConnectionProtocol::Tcp,
+            None,
+        );
+        assert!(header_error.is_err());
+
+        let row_error = parse_net_table(
+            BufReader::new(Cursor::new(b"header\n\xff\n".to_vec())),
+            ConnectionProtocol::Tcp,
+            None,
+        );
+        assert!(row_error.is_err());
     }
 
     #[test]

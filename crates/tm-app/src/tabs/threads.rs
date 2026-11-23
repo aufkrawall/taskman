@@ -125,10 +125,10 @@ impl Tracker {
                     .saturating_add(thread.user_time_100ns);
                 // A TID names the same thread only while its creation time
                 // matches; a recycled TID starts a fresh history.
-                let previous = self
-                    .tracks
-                    .remove(&thread.tid)
-                    .filter(|track| track.created_epoch_s == thread.created_epoch_s);
+                let previous = self.tracks.remove(&thread.tid).filter(|track| {
+                    track.created_epoch_s.is_some()
+                        && track.created_epoch_s == thread.created_epoch_s
+                });
                 let running = thread.state == ThreadState::Running;
                 let (
                     first_seen,
@@ -173,6 +173,8 @@ impl Tracker {
                             (Some(now), Some(before)) => Some(now.saturating_sub(before)),
                             _ => None,
                         };
+                        let evidence_unavailable =
+                            !advanced && !switch_pair_available && !cycle_pair_available;
                         let mut last_active = prev.last_active;
                         let mut observing = prev.observing;
                         let mut idle_anchor = prev.idle_anchor;
@@ -205,7 +207,7 @@ impl Tracker {
                             cpu_pct,
                             avg_cpu_pct,
                             cycles_delta,
-                            !advanced && !switch_pair_available && !cycle_pair_available,
+                            evidence_unavailable,
                         )
                     }
                     None => (
@@ -1037,6 +1039,18 @@ mod tests {
         runnable.context_switches = Some(2);
         let rows = tracker.apply(vec![runnable], t0 + Duration::from_secs(2), 4);
         assert_eq!(rows[0].activity, Activity::Recent);
+    }
+
+    #[test]
+    fn unknown_thread_identity_starts_a_fresh_history() {
+        let mut tracker = Tracker::default();
+        let t0 = Instant::now();
+        tracker.apply(vec![thread(1, 5, 0, WAITING)], t0, 4);
+        let mut replaced = thread(1, 999, 0, WAITING);
+        replaced.created_epoch_s = None;
+        let rows = tracker.apply(vec![replaced], t0 + Duration::from_secs(1), 4);
+        assert_eq!(rows[0].cpu_pct, None);
+        assert!(matches!(rows[0].activity, Activity::Observing { .. }));
     }
 
     #[test]

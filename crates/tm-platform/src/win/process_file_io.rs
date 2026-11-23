@@ -299,7 +299,7 @@ fn enumerate_process_files(h_process: HANDLE) -> Result<FileEnumeration> {
 
     let mut map: HashMap<String, ProcessFileIo> = HashMap::new();
     let mut path_buf = vec![0u16; 1024];
-    let mut complete = count == header.number_of_handles as usize;
+    let mut complete = count == header.number_of_handles;
 
     for i in 0..count {
         let entry = unsafe { *entries_ptr.add(i) };
@@ -315,6 +315,9 @@ fn enumerate_process_files(h_process: HANDLE) -> Result<FileEnumeration> {
                 continue;
             }
         };
+        if !facts.complete {
+            complete = false;
+        }
         let (is_read, is_write) = access_flags(facts.granted_access);
 
         let file_entry = map
@@ -327,6 +330,7 @@ fn enumerate_process_files(h_process: HANDLE) -> Result<FileEnumeration> {
                 write_ops: None,
                 file_size: facts.file_size,
                 offset: facts.offset,
+                access_known: facts.granted_access.is_some(),
                 is_read: false,
                 is_write: false,
                 open_handles: 0,
@@ -363,6 +367,9 @@ struct HandleFacts {
     /// `None` when the object could not be queried; never taken from the
     /// handle snapshot, whose entry may describe a since-closed handle.
     granted_access: Option<u32>,
+    /// False when the handle identified a file but one of its optional facts
+    /// (type/size/position/access) could not be read.
+    complete: bool,
 }
 
 /// Read/write flags for a handle's granted access. Unknown access sets
@@ -434,12 +441,15 @@ fn inspect_duplicated_handle(dup: HANDLE, path_buf: &mut [u16]) -> Result<Option
         return Ok(None);
     }
     let file_size = std_ok.then(|| std_info.EndOfFile.max(0) as u64);
+    let offset = query_file_position(dup);
+    let granted_access = query_granted_access(dup);
 
     Ok(Some(HandleFacts {
         path,
-        offset: query_file_position(dup),
+        offset,
         file_size,
-        granted_access: query_granted_access(dup),
+        granted_access,
+        complete: std_ok && offset.is_some() && granted_access.is_some(),
     }))
 }
 

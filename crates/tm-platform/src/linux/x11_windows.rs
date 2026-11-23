@@ -63,14 +63,15 @@ pub(crate) enum WindowCoverage {
 
 #[derive(Debug, Clone)]
 pub(crate) struct WindowObservation {
-    pub owners: HashSet<u32>,
+    /// PID and its `/proc` boot-relative start ticks.
+    pub owners: HashMap<u32, i64>,
     pub coverage: WindowCoverage,
 }
 
 impl WindowObservation {
     fn unavailable() -> Self {
         Self {
-            owners: HashSet::new(),
+            owners: HashMap::new(),
             coverage: WindowCoverage::Unavailable,
         }
     }
@@ -79,11 +80,22 @@ impl WindowObservation {
 #[derive(Debug, Clone, Copy)]
 struct Atoms {
     root: Window,
+    multi_screen: bool,
     client_list: Option<Atom>,
     stacking: Option<Atom>,
     pid: Option<Atom>,
     state: Option<Atom>,
     client_machine: Option<Atom>,
+}
+
+impl Atoms {
+    fn needs_reintern(self) -> bool {
+        self.client_list.is_none()
+            || self.stacking.is_none()
+            || self.pid.is_none()
+            || self.state.is_none()
+            || self.client_machine.is_none()
+    }
 }
 
 enum PropertyReply {
@@ -114,7 +126,7 @@ struct QueryOutcome {
 /// unavailable instead of waiting on a blocking round trip.
 pub(crate) struct WindowObserver {
     requests: SyncSender<u64>,
-    responses: Receiver<(u64, WindowObservation)>,
+    responses: Receiver<(u64, Instant, WindowObservation)>,
     next_sequence: u64,
     outstanding: Option<(u64, Instant)>,
     latest: Option<(u64, Instant, WindowObservation)>,
@@ -130,7 +142,10 @@ impl WindowObserver {
                 let mut observer = BlockingObserver::default();
                 while let Ok(sequence) = request_rx.recv() {
                     let observation = observer.observe();
-                    if response_tx.send((sequence, observation)).is_err() {
+                    if response_tx
+                        .send((sequence, Instant::now(), observation))
+                        .is_err()
+                    {
                         break;
                     }
                 }
@@ -149,13 +164,15 @@ impl WindowObserver {
 
     pub(crate) fn observe(&mut self) -> WindowObservation {
         let now = Instant::now();
-        while let Ok((sequence, observation)) = self.responses.try_recv() {
+        let mut fresh_sequence = None;
+        while let Ok((sequence, observed_at, observation)) = self.responses.try_recv() {
             if self
                 .latest
                 .as_ref()
                 .is_none_or(|(latest_sequence, _, _)| sequence >= *latest_sequence)
             {
-                self.latest = Some((sequence, now, observation));
+                self.latest = Some((sequence, observed_at, observation));
+                fresh_sequence = Some(sequence);
             }
             if self
                 .outstanding
@@ -180,10 +197,19 @@ impl WindowObserver {
         }
 
         match &self.latest {
-            Some((_, observed_at, observation))
+            Some((sequence, observed_at, observation))
                 if now.saturating_duration_since(*observed_at) <= OBSERVATION_TTL =>
             {
-                observation.clone()
+                let mut observation = observation.clone();
+                if observation.coverage == WindowCoverage::Complete
+                    && fresh_sequence != Some(*sequence)
+                {
+                    // Negative evidence is valid only for the just-finished
+                    // observation. Cached Complete snapshots may be reused for
+                    // positive owners, but absence becomes unknown.
+                    observation.coverage = WindowCoverage::Partial;
+                }
+                observation
             }
             _ => WindowObservation::unavailable(),
         }
@@ -195,6 +221,7 @@ impl WindowObserver {
 struct BlockingObserver {
     connection: Option<RustConnection>,
     atoms: Option<Atoms>,
+    reintern_atoms: bool,
     retry_at: Option<Instant>,
     last_coverage: Option<WindowCoverage>,
 }
@@ -233,6 +260,30 @@ impl BlockingObserver {
                 }
             }
         }
+        if self.reintern_atoms
+            && let Some(connection) = self.connection.as_ref()
+        {
+            let root = self.atoms.map_or_else(
+                || connection.setup().roots.first().map(|screen| screen.root),
+                |atoms| Some(atoms.root),
+            );
+            match root
+                .ok_or(())
+                .and_then(|root| intern_atoms(connection, root))
+            {
+                Ok(atoms) => {
+                    self.atoms = Some(atoms);
+                    self.reintern_atoms = false;
+                }
+                Err(()) => {
+                    self.connection = None;
+                    self.atoms = None;
+                    self.retry_at = Some(now + RECONNECT_BACKOFF);
+                    self.record_coverage(WindowCoverage::Unavailable);
+                    return WindowObservation::unavailable();
+                }
+            }
+        }
 
         let Some(connection) = self.connection.as_ref() else {
             return WindowObservation::unavailable();
@@ -241,13 +292,12 @@ impl BlockingObserver {
             return WindowObservation::unavailable();
         };
         let mut outcome = query_window_owners(connection, atoms);
-        let atom_setup_incomplete =
-            atoms.pid.is_none() || (atoms.client_list.is_none() && atoms.stacking.is_none());
-        if outcome.connection_failed || atom_setup_incomplete {
+        if outcome.connection_failed {
             self.connection = None;
             self.atoms = None;
             self.retry_at = Some(now + RECONNECT_BACKOFF);
         } else {
+            self.reintern_atoms = atoms.needs_reintern();
             self.retry_at = None;
         }
         if !session_is_x11_only() && outcome.observation.coverage != WindowCoverage::Unavailable {
@@ -269,17 +319,20 @@ impl BlockingObserver {
 fn connect() -> Option<(RustConnection, Atoms)> {
     let (connection, screen) = x11rb::connect(None).ok()?;
     let root = connection.setup().roots.get(screen)?.root;
-    Some((
-        connection,
-        Atoms {
-            root,
-            client_list: intern_atom(&connection, b"_NET_CLIENT_LIST"),
-            stacking: intern_atom(&connection, b"_NET_CLIENT_LIST_STACKING"),
-            pid: intern_atom(&connection, b"_NET_WM_PID"),
-            state: intern_atom(&connection, b"WM_STATE"),
-            client_machine: intern_atom(&connection, b"WM_CLIENT_MACHINE"),
-        },
-    ))
+    let atoms = intern_atoms(&connection, root).ok()?;
+    Some((connection, atoms))
+}
+
+fn intern_atoms(connection: &RustConnection, root: Window) -> Result<Atoms, ()> {
+    Ok(Atoms {
+        root,
+        multi_screen: connection.setup().roots.len() > 1,
+        client_list: intern_atom(connection, b"_NET_CLIENT_LIST")?,
+        stacking: intern_atom(connection, b"_NET_CLIENT_LIST_STACKING")?,
+        pid: intern_atom(connection, b"_NET_WM_PID")?,
+        state: intern_atom(connection, b"WM_STATE")?,
+        client_machine: intern_atom(connection, b"WM_CLIENT_MACHINE")?,
+    })
 }
 
 struct ClientPids {
@@ -348,13 +401,17 @@ fn client_pid_for_window(window: Window, clients: &ClientPids) -> Option<u32> {
     clients.by_client.get(&client.resource_base).copied()
 }
 
+fn record_owner(owners: &mut HashMap<u32, i64>, pid: u32, coverage: &mut WindowCoverage) {
+    match super::linux_proc_start_ticks(pid) {
+        Some(start_ticks) => {
+            owners.insert(pid, start_ticks);
+        }
+        None => *coverage = WindowCoverage::Partial,
+    }
+}
+
 fn query_window_owners(connection: &RustConnection, atoms: Atoms) -> QueryOutcome {
-    let Some(pid_atom) = atoms.pid else {
-        return QueryOutcome {
-            observation: WindowObservation::unavailable(),
-            connection_failed: false,
-        };
-    };
+    let pid_atom = atoms.pid;
 
     let client_list = atoms.client_list.map_or(PropertyReply::Missing, |atom| {
         read_u32_property(
@@ -383,7 +440,11 @@ fn query_window_owners(connection: &RustConnection, atoms: Atoms) -> QueryOutcom
         };
     }
 
-    let mut coverage = WindowCoverage::Complete;
+    let mut coverage = if atoms.multi_screen {
+        WindowCoverage::Partial
+    } else {
+        WindowCoverage::Complete
+    };
     let mut list_available = false;
     let mut client_windows = Vec::new();
     let mut stacking_windows = Vec::new();
@@ -406,7 +467,7 @@ fn query_window_owners(connection: &RustConnection, atoms: Atoms) -> QueryOutcom
     if !list_available {
         return QueryOutcome {
             observation: WindowObservation {
-                owners: HashSet::new(),
+                owners: HashMap::new(),
                 coverage: WindowCoverage::Unavailable,
             },
             connection_failed: false,
@@ -428,7 +489,7 @@ fn query_window_owners(connection: &RustConnection, atoms: Atoms) -> QueryOutcom
         ClientPidQuery::ConnectionFailed => {
             return QueryOutcome {
                 observation: WindowObservation {
-                    owners: HashSet::new(),
+                    owners: HashMap::new(),
                     coverage: WindowCoverage::Unavailable,
                 },
                 connection_failed: true,
@@ -436,7 +497,7 @@ fn query_window_owners(connection: &RustConnection, atoms: Atoms) -> QueryOutcom
         }
     };
     let local_hostname = local_hostname();
-    let mut owners = HashSet::new();
+    let mut owners = HashMap::new();
     for window in windows {
         let attributes = match connection.get_window_attributes(window) {
             Ok(cookie) => match cookie.reply() {
@@ -499,11 +560,10 @@ fn query_window_owners(connection: &RustConnection, atoms: Atoms) -> QueryOutcom
 
         if let Some(client_pids) = &client_pids {
             if let Some(pid) = client_pid_for_window(window, client_pids) {
-                owners.insert(pid);
-            } else {
-                coverage = WindowCoverage::Partial;
+                record_owner(&mut owners, pid, &mut coverage);
+                continue;
             }
-            continue;
+            coverage = WindowCoverage::Partial;
         }
 
         let Some(machine_atom) = atoms.client_machine else {
@@ -533,6 +593,10 @@ fn query_window_owners(connection: &RustConnection, atoms: Atoms) -> QueryOutcom
             }
         }
 
+        let Some(pid_atom) = pid_atom else {
+            coverage = WindowCoverage::Partial;
+            continue;
+        };
         match read_u32_property(
             connection,
             window,
@@ -542,7 +606,7 @@ fn query_window_owners(connection: &RustConnection, atoms: Atoms) -> QueryOutcom
         ) {
             PropertyReply::Values(values) => match parse_window_pid(&values) {
                 Some(pid) => {
-                    owners.insert(pid);
+                    record_owner(&mut owners, pid, &mut coverage);
                 }
                 None => coverage = WindowCoverage::Partial,
             },
@@ -567,14 +631,14 @@ fn query_window_owners(connection: &RustConnection, atoms: Atoms) -> QueryOutcom
     }
 }
 
-fn intern_atom(connection: &RustConnection, name: &[u8]) -> Option<Atom> {
-    connection
-        .intern_atom(true, name)
-        .ok()?
-        .reply()
-        .ok()
-        .map(|reply| reply.atom)
-        .filter(|&atom| atom != x11rb::NONE)
+fn intern_atom(connection: &RustConnection, name: &[u8]) -> Result<Option<Atom>, ()> {
+    let cookie = connection.intern_atom(true, name).map_err(|_| ())?;
+    let reply = match cookie.reply() {
+        Ok(reply) => reply,
+        Err(ReplyError::X11Error(_)) => return Ok(None),
+        Err(ReplyError::ConnectionError(_)) => return Err(()),
+    };
+    Ok((reply.atom != x11rb::NONE).then_some(reply.atom))
 }
 
 fn read_u32_property(
@@ -676,14 +740,19 @@ fn window_eligibility(
         Some(WM_STATE_WITHDRAWN) => WindowEligibility::Ineligible,
         // ICCCM minimized and off-desktop clients are normally unmapped but
         // remain managed members of the client list.
-        Some(WM_STATE_NORMAL | WM_STATE_ICONIC) => WindowEligibility::Eligible,
-        Some(_) | None => match map_state {
-            MapState::VIEWABLE => WindowEligibility::Eligible,
-            // Without a usable WM_STATE, an unmapped managed client may be
-            // minimized or on another desktop. Treat that as unknown rather
-            // than proving it has no window.
-            MapState::UNMAPPED | MapState::UNVIEWABLE => WindowEligibility::Unknown,
-        },
+        Some(state) if state == WM_STATE_NORMAL || state == WM_STATE_ICONIC => {
+            WindowEligibility::Eligible
+        }
+        Some(_) | None => {
+            if map_state == MapState::VIEWABLE {
+                WindowEligibility::Eligible
+            } else {
+                // Without a usable WM_STATE, an unmapped managed client may
+                // be minimized or on another desktop. Treat that as unknown
+                // rather than proving it has no window.
+                WindowEligibility::Unknown
+            }
+        }
     }
 }
 
@@ -764,20 +833,10 @@ fn client_machine_matches(claimed: &str, local: Option<&str>) -> bool {
         return true;
     }
     let local_short = local.split('.').next().unwrap_or(local);
-    if local_short.eq_ignore_ascii_case(claimed) {
-        return true;
-    }
-    let claimed_lower = claimed.to_ascii_lowercase();
-    let local_lower = local.to_ascii_lowercase();
-    let local_short_lower = local_short.to_ascii_lowercase();
-    if local.contains('.') {
-        claimed_lower == local_lower || claimed_lower == local_short_lower
-    } else {
-        claimed_lower == local_lower
-            || claimed_lower
-                .strip_suffix(&format!(".{local_lower}"))
-                .is_some_and(|prefix| !prefix.is_empty())
-    }
+    // A short local hostname cannot authenticate an arbitrary FQDN claim:
+    // `host.example` and `evil.host` both otherwise look plausible. If the
+    // local name is an FQDN, the short form is still equivalent.
+    local.contains('.') && local_short.eq_ignore_ascii_case(claimed)
 }
 
 #[cfg(test)]
@@ -874,6 +933,7 @@ mod tests {
         assert!(client_machine_matches("HOST.example", Some("host.example")));
         assert!(client_machine_matches("host", Some("host.example")));
         assert!(!client_machine_matches("host.evil", Some("host")));
+        assert!(!client_machine_matches("evil.host", Some("host")));
         assert!(!client_machine_matches("container", Some("host")));
         assert!(!client_machine_matches("elsewhere", None));
     }
