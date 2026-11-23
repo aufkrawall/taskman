@@ -1,6 +1,6 @@
 # Known and Accepted Debt
 
-Last verified: 2026-10-26
+Last verified: 2026-11-23 (Linux privileged-action residuals)
 
 Primary sources:
 - `AGENTS.md`
@@ -365,6 +365,33 @@ remain follow-up rather than being simulated in headless tests:
   - macOS has no system thread-count source without Mach FFI, so its
     Performance page still shows 0 threads; Linux/macOS disk byte rates read
     0 B/s on the first sample (the model has no unknown rate).
+
+### 2026-11-23 Linux privileged-action residuals
+
+- **Linux Run no longer interprets shell syntax.** It tokenizes quotes and
+  escapes and launches the resulting argv directly, so pipes, redirects,
+  command substitution, globbing and `;` remain ordinary arguments. This is
+  deliberate: the same action must never become arbitrary text in the
+  privileged helper. A user who needs shell composition should run a shell
+  explicitly and remains responsible for that unprivileged launch.
+- **Linux Properties uses the containing directory.** `xdg-open` has no
+  standardized properties verb, so the action opens the parent directory
+  rather than opening the file with an unrelated default application. A
+  proper properties dialog needs a FileManager1 implementation or
+  file-manager-specific integration.
+- **Root GUI relaunch can still be refused by the desktop.** Desktop variables
+  are allowlisted, but Wayland/X11 access can still be refused by the
+  compositor or Polkit agent. The elevated GUI also inherits the root account's
+  home rather than the caller's per-user configuration directory.
+- **There is no TaskMan-specific Polkit policy.** The helper uses the desktop's
+  normal `pkexec` prompt. Deployment can add a narrowly scoped policy later,
+  but no installer or daemon is required for the current flow.
+- **The helper image is not hash-pinned.** With no installer or daemon there
+  is no protected same-binary copy to compare against. The helper protocol and
+  target checks narrow what an authorized run can do, but Polkit's authorization
+  prompt remains the only boundary for executing the current TaskMan image as
+  root. A packaged deployment should install a root-owned image and, optionally,
+  a TaskMan-specific Polkit action.
 
 ### 2026-11-22 reliability-review residuals
 

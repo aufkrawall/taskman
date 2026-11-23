@@ -10,6 +10,13 @@ pub mod actions;
 /// neutral on purpose so its tests run on every host.
 pub mod xdg_icons;
 
+/// Shell-free parsing for the Run dialog and the Linux Polkit helper.
+#[cfg(any(target_os = "linux", test))]
+mod command_line;
+/// Pure parsing and construction for Linux privileged helper requests.
+#[cfg(any(target_os = "linux", test))]
+mod linux_action_support;
+
 #[cfg(target_os = "windows")]
 pub mod win;
 

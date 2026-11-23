@@ -2379,7 +2379,11 @@ pub fn run_task_dialog(app: &mut TaskManApp, ctx: &egui::Context, _pal: &theme::
                 let spawned = std::thread::Builder::new()
                     .name("tm-run".into())
                     .spawn(move || {
-                        let result = actions.run_new_task_probe(&cmdline, elevated);
+                        // Linux deliberately leaves `run_new_task_probe`
+                        // non-launching. The Run dialog needs the actual
+                        // launch result (including a missing executable),
+                        // and this worker keeps that call off the UI thread.
+                        let result = actions.run_new_task(&cmdline, elevated);
                         let msg = match result {
                             Ok(()) => i18n::trf(K::StartedMsg, &[&cmdline]),
                             Err(error) => i18n::trf(K::ErrMsg, &[&error.to_string()]),

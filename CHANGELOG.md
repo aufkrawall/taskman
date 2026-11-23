@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+### New
+
+- **Linux privileged actions without an installer or daemon:** service start/stop/restart, process kill/suspend/resume, priority, and affinity now try the direct Linux operation first and request one-time desktop Polkit authorization through `pkexec` only when the kernel or service manager reports `EPERM`/`EACCES` or an equivalent authorization failure. The privileged half is a hidden same-executable helper with a strict typed action protocol, PID creation-identity checks, and no arbitrary shell command path; dismissed prompts, missing Polkit agents, and missing `pkexec` are reported explicitly.
+- **Linux desktop integration:** Open file location, Properties, and HTTP(S) links now use `xdg-open` without command interpolation; Run starts a parsed argv directly in its own process group and reports a missing executable instead of claiming a shell launch succeeded. `run_new_task_probe` remains non-launching on Linux, and general arbitrary elevated command launch is deliberately refused.
+
 ### Fixed
 
 - **A failed or skipped blit can no longer leave the window blank, stale or half-painted.** The Windows software renderer now presents through its own Win32 DIB surface: every `BitBlt` result is checked, only the rectangles that were actually blitted are validated, and a `WM_PAINT` update region is merged into the present set even when no egui tile changed. A failed resize, buffer access or present warns, marks the surface unpainted and retries in 50 ms instead of aborting (release builds abort on panic) or silently freezing the old pixels in place.

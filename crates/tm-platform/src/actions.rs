@@ -619,6 +619,8 @@ pub trait PlatformActions: Send + Sync {
         let _ = (command_line, elevate);
         Err(tm_core::TmError::Unsupported("run new task"))
     }
+    /// Report a launch outcome where the platform supports that probe.
+    /// Linux deliberately leaves this non-launching and unimplemented.
     fn run_new_task_probe(&self, command_line: &str, elevate: bool) -> Result<()> {
         let _ = (command_line, elevate);
         Err(tm_core::TmError::Unsupported("run new task"))

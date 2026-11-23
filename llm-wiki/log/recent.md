@@ -1,3 +1,21 @@
+## 2026-11-23 - Linux privileged actions and shell integration
+
+- Added direct-first Linux process/service actions with a hidden same-
+  executable `pkexec` helper. The helper protocol is typed and allowlisted,
+  carries PID creation identity, validates service names, refuses PID 1/self,
+  and never accepts arbitrary privileged shell text.
+- Added effective-uid detection, same-executable relaunch with original argv
+  preserved as separate arguments and allowlisted desktop environment
+  forwarding. General elevated Run-dialog execution is refused.
+- Replaced Linux `sh -c` launching with shell-free argv tokenization, process
+  groups and asynchronous reaping; added `xdg-open` file/location/link actions.
+  Linux `run_new_task_probe` remains non-launching and the Run dialog uses
+  `run_new_task` for a real spawn error.
+- Added parser, action-injection, environment-allowlist, PID-identity,
+  permission-classification and shell-path tests. Per the worker constraint,
+  no Cargo/Rust/Python build or test command was run; verification here is
+  static source and Git review only.
+
 ## 2026-11-22 - Third-party review fixes (icons, identity, restore, diagnostics)
 
 - Fixed a release-abort in Linux icon decoding: 16-bit theme PNGs now decode

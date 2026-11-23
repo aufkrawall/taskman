@@ -1,6 +1,6 @@
 # Repo Map (code map)
 
-Last cross-checked: 2026-10-26
+Last cross-checked: 2026-11-23 (Linux action modules)
 
 Primary sources:
 - workspace tree (verified against working tree)
@@ -179,6 +179,12 @@ platform boundary (`tm-core` ← `tm-platform` ← `tm-app` / `tm-service`), and
     `application-x-executable` / `application-default-icon` / `image-missing`
     chain, which is what a row without an icon of its own paints;
     platform-neutral so its tests run on the Windows host too).
+    Linux privileged execution adds `linux/polkit.rs` (direct-first escalation,
+    typed `pkexec` helper, clear authorization/tool errors),
+    `linux/launch.rs` (process-group launch, trusted `pkexec` path checks),
+    `linux/shell.rs` (`xdg-open` file/location/URL actions), plus the
+    platform-neutral `linux_action_support.rs` parser/security contract and
+    `command_line.rs` shell-free Run tokenizer.
     Linux/macOS backends exist and are
     built by default (`build.py`).
 - `crates/tm-app`
