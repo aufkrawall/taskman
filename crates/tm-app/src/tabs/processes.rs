@@ -3038,14 +3038,7 @@ mod tests {
             proc(2, None, "unknown", ProcCategory::Unknown),
             proc(3, None, "system", ProcCategory::System),
         ]);
-        let rows = build_display_rows(
-            &snap,
-            "",
-            0,
-            true,
-            &HashSet::new(),
-            &[false; 4],
-        );
+        let rows = build_display_rows(&snap, "", 0, true, &HashSet::new(), &[false; 4]);
         let headers: Vec<(u8, usize)> = rows
             .iter()
             .filter_map(|row| match row {

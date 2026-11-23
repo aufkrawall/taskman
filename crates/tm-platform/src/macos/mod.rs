@@ -103,7 +103,7 @@ impl SystemCollector for MacCollector {
             let category = classify::classify(classify::ClassifyInput {
                 pid: pid_u,
                 name: &name,
-                has_window: Some(false),
+                has_window: None,
                 critical: None,
                 windows_owned: None,
             });

@@ -84,9 +84,7 @@ fn parse_ipv4(hex: &str) -> Option<Ipv4Addr> {
     if hex.len() != 8 {
         return None;
     }
-    Some(Ipv4Addr::from(
-        u32::from_str_radix(hex, 16)?.to_le_bytes(),
-    ))
+    Some(Ipv4Addr::from(u32::from_str_radix(hex, 16)?.to_le_bytes()))
 }
 
 fn parse_ipv6(hex: &str) -> Option<Ipv6Addr> {
@@ -141,14 +139,15 @@ fn parse_net_table<R: BufRead>(
     reader: R,
     protocol: ConnectionProtocol,
     inodes: Option<&HashSet<u64>>,
-) -> Vec<ProcNetSocket> {
-    let ipv6 = matches!(protocol, ConnectionProtocol::Tcp6 | ConnectionProtocol::Udp6);
+) -> std::io::Result<Vec<ProcNetSocket>> {
+    let ipv6 = matches!(
+        protocol,
+        ConnectionProtocol::Tcp6 | ConnectionProtocol::Udp6
+    );
     let tcp = matches!(protocol, ConnectionProtocol::Tcp | ConnectionProtocol::Tcp6);
     let mut sockets = Vec::new();
     for line in reader.lines().skip(1) {
-        let Ok(line) = line else {
-            continue;
-        };
+        let line = line?;
         let fields = line.split_ascii_whitespace().collect::<Vec<_>>();
         if fields.len() < 10 {
             continue;
@@ -203,7 +202,7 @@ fn parse_net_table<R: BufRead>(
             },
         });
     }
-    sockets
+    Ok(sockets)
 }
 
 fn connection_protocol_rank(protocol: ConnectionProtocol) -> u8 {
@@ -236,7 +235,9 @@ pub(super) fn list_process_connections(pid: u32) -> Result<Vec<ProcessConnection
                 ));
             }
         };
-        for socket in parse_net_table(BufReader::new(table), protocol, Some(&inodes_before)) {
+        let table_rows = parse_net_table(BufReader::new(table), protocol, Some(&inodes_before))
+            .map_err(|error| TmError::platform("read /proc/pid/net", format!("{path}: {error}")))?;
+        for socket in table_rows {
             if seen_inodes.insert(socket.inode) {
                 sockets.push(socket);
             }
@@ -250,10 +251,7 @@ pub(super) fn list_process_connections(pid: u32) -> Result<Vec<ProcessConnection
             "the process moved to another network namespace during inspection",
         ));
     }
-    let stable: HashSet<u64> = inodes_before
-        .intersection(&inodes_after)
-        .copied()
-        .collect();
+    let stable: HashSet<u64> = inodes_before.intersection(&inodes_after).copied().collect();
     sockets.retain(|socket| {
         // The inode is the kernel socket object identity while it is live.
         // Retaining only sockets present before and after the table scan
@@ -261,8 +259,10 @@ pub(super) fn list_process_connections(pid: u32) -> Result<Vec<ProcessConnection
         // different endpoint.
         stable.contains(&socket.inode)
     });
-    let mut connections: Vec<ProcessConnection> =
-        sockets.into_iter().map(|socket| socket.connection).collect();
+    let mut connections: Vec<ProcessConnection> = sockets
+        .into_iter()
+        .map(|socket| socket.connection)
+        .collect();
     connections.sort_by(|a, b| {
         connection_protocol_rank(a.protocol)
             .cmp(&connection_protocol_rank(b.protocol))
@@ -284,10 +284,13 @@ mod tests {
   sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n\
    0: 0100007F:1F90 0200000A:01BB 01 00000000:00000000 00:00000000 00000000  1000        0 4242 1\n\
    1: 00000000:0016 00000000:0000 0A 00000000:00000000 00:00000000 00000000     0        0 4243 1\n";
-        let rows = parse_net_table(Cursor::new(text), ConnectionProtocol::Tcp, None);
+        let rows = parse_net_table(Cursor::new(text), ConnectionProtocol::Tcp, None).unwrap();
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].connection.local, "127.0.0.1:8080".parse().unwrap());
-        assert_eq!(rows[0].connection.remote, Some("10.0.0.2:443".parse().unwrap()));
+        assert_eq!(
+            rows[0].connection.remote,
+            Some("10.0.0.2:443".parse().unwrap())
+        );
         assert_eq!(rows[0].connection.state, Some(TcpState::Established));
         assert_eq!(rows[1].connection.state, Some(TcpState::Listen));
         assert_eq!(rows[1].connection.remote, None);
@@ -299,7 +302,7 @@ mod tests {
   sl  local_address                         remote_address                        st tx_queue rx_queue tr tm->when retrnsmt uid timeout inode\n\
    0: 00000000000000000000000001000000:1F90 00000000000000000000000001000000:0050 01 00000000:00000000 00:00000000 00000000 1000 0 99 1\n\
    1: 00000000000000000000000001000000:1F91 00000000000000000000000000000000:0000 01 00000000:00000000 00:00000000 00000000 1000 0 100 1\n";
-        let rows = parse_net_table(Cursor::new(text), ConnectionProtocol::Tcp6, None);
+        let rows = parse_net_table(Cursor::new(text), ConnectionProtocol::Tcp6, None).unwrap();
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].connection.local, "[::1]:8080".parse().unwrap());
         assert_eq!(rows[0].connection.remote, Some("[::1]:80".parse().unwrap()));
@@ -312,7 +315,7 @@ mod tests {
         let text = "\
   sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n\
    0: 00000000:0035 00000000:0000 07 00000000:00000000 00:00000000 00000000     0        0 777 2\n";
-        let rows = parse_net_table(Cursor::new(text), ConnectionProtocol::Udp, None);
+        let rows = parse_net_table(Cursor::new(text), ConnectionProtocol::Udp, None).unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].connection.local, "0.0.0.0:53".parse().unwrap());
         assert_eq!(rows[0].connection.remote, None);
@@ -324,12 +327,11 @@ mod tests {
         let text = "\
   sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n\
    0: 0100007F:1F90 BADADDR:01BB 01 00000000:00000000 00:00000000 00000000  1000 0 4242 1\n";
-        assert!(parse_net_table(
-            Cursor::new(text),
-            ConnectionProtocol::Tcp,
-            None
-        )
-        .is_empty());
+        assert!(
+            parse_net_table(Cursor::new(text), ConnectionProtocol::Tcp, None)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
@@ -343,7 +345,8 @@ mod tests {
             BufReader::new(Cursor::new(text)),
             ConnectionProtocol::Tcp,
             Some(&wanted),
-        );
+        )
+        .unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].inode, 4242);
     }

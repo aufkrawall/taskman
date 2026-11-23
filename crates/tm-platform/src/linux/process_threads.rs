@@ -93,7 +93,8 @@ fn parse_task_status(text: &str) -> TaskStatus {
 
 fn linux_thread_state(state: u8) -> ThreadState {
     match state {
-        b'R' => ThreadState::Running,
+        // Linux TASK_RUNNING covers both on-CPU and runnable-in-queue.
+        b'R' => ThreadState::Runnable,
         b'S' => ThreadState::Sleeping,
         b'D' | b'W' => ThreadState::Waiting,
         b'T' | b't' => ThreadState::Stopped,
@@ -139,8 +140,7 @@ fn read_task_status(pid: u32, tid: u32) -> Option<TaskStatus> {
 }
 
 fn check_root_identity(pid: u32, expected_start_ticks: Option<i64>, root: TaskStat) -> Result<()> {
-    if root.tid != pid
-        || expected_start_ticks.is_some_and(|expected| root.start_ticks != expected)
+    if root.tid != pid || expected_start_ticks.is_some_and(|expected| root.start_ticks != expected)
     {
         return Err(TmError::ProcessNotFound { pid });
     }
@@ -159,19 +159,13 @@ pub(super) fn list_process_threads(
         if error.kind() == std::io::ErrorKind::NotFound {
             TmError::ProcessNotFound { pid }
         } else {
-            TmError::platform(
-                "enumerate /proc/pid/task",
-                format!("{task_path}: {error}"),
-            )
+            TmError::platform("enumerate /proc/pid/task", format!("{task_path}: {error}"))
         }
     })?;
     let mut tids = Vec::new();
     for entry in entries {
         let entry = entry.map_err(|error| {
-            TmError::platform(
-                "enumerate /proc/pid/task",
-                format!("{task_path}: {error}"),
-            )
+            TmError::platform("enumerate /proc/pid/task", format!("{task_path}: {error}"))
         })?;
         if let Some(tid) = entry
             .file_name()
@@ -214,9 +208,7 @@ pub(super) fn list_process_threads(
         let Some(after_status) = read_task_stat(pid, tid)? else {
             continue;
         };
-        if after_status.tid != stat.tid
-            || after_status.start_ticks != stat.start_ticks
-        {
+        if after_status.tid != stat.tid || after_status.start_ticks != stat.start_ticks {
             // The TID was reused between /stat and /status. Neither record can
             // be safely combined with the other, so omit this now-ambiguous
             // observation.
@@ -247,9 +239,8 @@ pub(super) fn list_process_threads(
             context_switches,
             kernel_time_100ns,
             user_time_100ns,
-            created_epoch_s: btime_s.and_then(|btime| {
-                super::linux_start_timestamp(btime, stat.start_ticks, clk_tck)
-            }),
+            created_epoch_s: btime_s
+                .and_then(|btime| super::linux_start_timestamp(btime, stat.start_ticks, clk_tck)),
             state: linux_thread_state(stat.state),
             // Linux wait channels are names/addresses, not Windows
             // KWAIT_REASON identifiers.
@@ -288,7 +279,7 @@ mod tests {
 
     #[test]
     fn linux_thread_states_are_mapped_without_windows_names() {
-        assert_eq!(linux_thread_state(b'R'), ThreadState::Running);
+        assert_eq!(linux_thread_state(b'R'), ThreadState::Runnable);
         assert_eq!(linux_thread_state(b'S'), ThreadState::Sleeping);
         assert_eq!(linux_thread_state(b'D'), ThreadState::Waiting);
         assert_eq!(linux_thread_state(b'T'), ThreadState::Stopped);

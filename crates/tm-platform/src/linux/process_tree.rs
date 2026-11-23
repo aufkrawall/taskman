@@ -22,11 +22,7 @@ struct Descendant {
     parent_start_ticks: i64,
 }
 
-pub(super) fn kill_process(
-    pid: u32,
-    expected_start_ticks: Option<i64>,
-    tree: bool,
-) -> Result<()> {
+pub(super) fn kill_process(pid: u32, expected_start_ticks: Option<i64>, tree: bool) -> Result<()> {
     if !tree {
         return super::send_signal_checked(pid, expected_start_ticks, libc::SIGTERM);
     }
@@ -82,8 +78,18 @@ pub(super) fn kill_process(
         if child.link.pid == std::process::id() {
             continue;
         }
-        if !child_identity_is_current(child).unwrap_or(false) {
-            continue;
+        match child_identity_is_current(child) {
+            Ok(true) => {}
+            Ok(false) => continue,
+            Err(error) => {
+                tracing::debug!(
+                    child = child.link.pid,
+                    error = %error,
+                    "tree-kill child identity could not be revalidated"
+                );
+                child_error.get_or_insert(error);
+                continue;
+            }
         }
         match super::send_signal_checked(
             child.link.pid,
@@ -118,12 +124,7 @@ fn process_table() -> Result<HashMap<u32, TreeLink>> {
                 format!("could not enumerate /proc: {error}"),
             )
         })?;
-        let Some(pid) = entry
-            .file_name()
-            .to_string_lossy()
-            .parse::<u32>()
-            .ok()
-        else {
+        let Some(pid) = entry.file_name().to_string_lossy().parse::<u32>().ok() else {
             continue;
         };
         let link = match read_tree_link(pid) {
@@ -193,10 +194,7 @@ fn descendants(
     for link in table.values() {
         // PID 0 names itself as its parent; it must never become a child.
         if link.pid != link.parent_pid {
-            children_of
-                .entry(link.parent_pid)
-                .or_default()
-                .push(*link);
+            children_of.entry(link.parent_pid).or_default().push(*link);
         }
     }
     for children in children_of.values_mut() {
@@ -234,10 +232,8 @@ fn relationship_is_current(descendant: &Descendant) -> Result<bool> {
 }
 
 fn child_identity_is_current(descendant: &Descendant) -> Result<bool> {
-    Ok(
-        read_tree_link(descendant.link.pid)?
-            .is_some_and(|child| child.start_ticks == descendant.link.start_ticks),
-    )
+    Ok(read_tree_link(descendant.link.pid)?
+        .is_some_and(|child| child.start_ticks == descendant.link.start_ticks))
 }
 
 fn relationship_matches(parent: &TreeLink, child: &TreeLink, expected: &Descendant) -> bool {

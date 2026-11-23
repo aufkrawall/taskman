@@ -210,10 +210,7 @@ fn parse_thread(buf: &[u8], base: usize, off: &ThreadOffsets) -> ParsedThread {
             priority: read_u32(buf, base + off.priority) as i32,
             base_priority: read_u32(buf, base + off.base_priority) as i32,
             nice: None,
-            context_switches: Some(u64::from(read_u32(
-                buf,
-                base + off.context_switches,
-            ))),
+            context_switches: Some(u64::from(read_u32(buf, base + off.context_switches))),
             kernel_time_100ns: u64::try_from(read_i64(buf, base + off.kernel_time)).unwrap_or(0),
             user_time_100ns: u64::try_from(read_i64(buf, base + off.user_time)).unwrap_or(0),
             created_epoch_s: super::cpu_load::filetime_to_unix_ticks(created_raw),

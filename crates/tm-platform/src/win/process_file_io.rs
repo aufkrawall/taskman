@@ -201,7 +201,8 @@ pub fn list_process_file_io(
             unsafe {
                 let _ = CloseHandle(h_process);
             }
-            (result?, cr, cw, true)
+            let result = result?;
+            (result.files, cr, cw, result.complete)
         }
         Err(error) => {
             if is_access_denied_or_system(&error, pid) {
@@ -232,7 +233,12 @@ pub fn list_process_file_io(
     Ok(ProcessFileIoSnapshot { files, accounting })
 }
 
-fn enumerate_process_files(h_process: HANDLE) -> Result<Vec<ProcessFileIo>> {
+struct FileEnumeration {
+    files: Vec<ProcessFileIo>,
+    complete: bool,
+}
+
+fn enumerate_process_files(h_process: HANDLE) -> Result<FileEnumeration> {
     let mut buf = vec![0u8; 64 * 1024];
     loop {
         let mut written: u32 = 0;
@@ -274,7 +280,10 @@ fn enumerate_process_files(h_process: HANDLE) -> Result<Vec<ProcessFileIo>> {
     let header_size = std::mem::size_of::<ProcessHandleSnapshotInformation>();
     let entry_size = std::mem::size_of::<ProcessHandleTableEntryInfo>();
     if buf.len() < header_size {
-        return Ok(Vec::new());
+        return Ok(FileEnumeration {
+            files: Vec::new(),
+            complete: false,
+        });
     }
 
     let header = unsafe { &*buf.as_ptr().cast::<ProcessHandleSnapshotInformation>() };
@@ -290,16 +299,21 @@ fn enumerate_process_files(h_process: HANDLE) -> Result<Vec<ProcessFileIo>> {
 
     let mut map: HashMap<String, ProcessFileIo> = HashMap::new();
     let mut path_buf = vec![0u16; 1024];
+    let mut complete = count == header.number_of_handles as usize;
 
     for i in 0..count {
         let entry = unsafe { *entries_ptr.add(i) };
         if entry.handle_value == 0 {
             continue;
         }
-        let Some(facts) =
-            inspect_handle(h_process, current_proc, entry.handle_value, &mut path_buf)
-        else {
-            continue;
+        let facts = match inspect_handle(h_process, current_proc, entry.handle_value, &mut path_buf)
+        {
+            Ok(Some(facts)) => facts,
+            Ok(None) => continue,
+            Err(()) => {
+                complete = false;
+                continue;
+            }
         };
         let (is_read, is_write) = access_flags(facts.granted_access);
 
@@ -329,23 +343,15 @@ fn enumerate_process_files(h_process: HANDLE) -> Result<Vec<ProcessFileIo>> {
         }
     }
 
-    // Attribute observed handle positions based strictly on granted access rights.
-    // Never attribute file_size as written bytes, and never duplicate positions across both.
-    for file_entry in map.values_mut() {
-        if file_entry.is_read && !file_entry.is_write {
-            file_entry.read_bytes = file_entry.offset;
-            file_entry.write_bytes = Some(0);
-        } else if file_entry.is_write && !file_entry.is_read {
-            file_entry.read_bytes = Some(0);
-            file_entry.write_bytes = file_entry.offset;
-        } else {
-            // Read and write: cannot guess the split between read and write.
-            file_entry.read_bytes = None;
-            file_entry.write_bytes = None;
-        }
-    }
+    // A handle position is a seek offset, not transferred bytes. No per-file
+    // byte/operation source is available in this enumeration, so every row
+    // keeps those fields unavailable; the process-wide counters above remain
+    // separate facts.
 
-    Ok(map.into_values().collect())
+    Ok(FileEnumeration {
+        files: map.into_values().collect(),
+        complete,
+    })
 }
 
 /// What one open disk-file handle says about itself, all read from the same
@@ -378,7 +384,7 @@ fn inspect_handle(
     current_proc: HANDLE,
     handle_value: usize,
     path_buf: &mut [u16],
-) -> Option<HandleFacts> {
+) -> Result<Option<HandleFacts>, ()> {
     let mut dup = HANDLE::default();
     let ok = unsafe {
         DuplicateHandle(
@@ -392,7 +398,7 @@ fn inspect_handle(
         )
     };
     if ok.is_err() || dup.is_invalid() {
-        return None;
+        return Err(());
     }
     let facts = inspect_duplicated_handle(dup, path_buf);
     unsafe {
@@ -401,16 +407,16 @@ fn inspect_handle(
     facts
 }
 
-fn inspect_duplicated_handle(dup: HANDLE, path_buf: &mut [u16]) -> Option<HandleFacts> {
+fn inspect_duplicated_handle(dup: HANDLE, path_buf: &mut [u16]) -> Result<Option<HandleFacts>, ()> {
     // Only disk files; strictly avoid named pipes, sockets, or devices that could hang.
     if unsafe { GetFileType(dup) } != FILE_TYPE_DISK {
-        return None;
+        return Ok(None);
     }
 
     let path_flags = GETFINALPATHNAMEBYHANDLE_FLAGS(FILE_NAME_NORMALIZED.0 | VOLUME_NAME_DOS.0);
     let len = unsafe { GetFinalPathNameByHandleW(dup, path_buf, path_flags) } as usize;
     if len == 0 || len >= path_buf.len() {
-        return None;
+        return Err(());
     }
     let path = strip_verbatim(&String::from_utf16_lossy(&path_buf[..len]));
 
@@ -425,16 +431,16 @@ fn inspect_duplicated_handle(dup: HANDLE, path_buf: &mut [u16]) -> Option<Handle
     }
     .is_ok();
     if std_ok && std_info.Directory {
-        return None;
+        return Ok(None);
     }
     let file_size = std_ok.then(|| std_info.EndOfFile.max(0) as u64);
 
-    Some(HandleFacts {
+    Ok(Some(HandleFacts {
         path,
         offset: query_file_position(dup),
         file_size,
         granted_access: query_granted_access(dup),
-    })
+    }))
 }
 
 /// Current byte offset of the file object behind `handle`. Query only:
@@ -508,7 +514,7 @@ mod tests {
         assert!(found.is_some(), "opened temporary file must be discovered");
         let found = found.unwrap();
         assert!(found.is_write);
-        assert!(found.write_bytes.is_some_and(|w| w >= 4096));
+        assert_eq!(found.write_bytes, None);
         assert_eq!(found.file_size, Some(4096));
 
         drop(file);
@@ -526,7 +532,7 @@ mod tests {
         assert!(found2.is_some(), "read file must be discovered");
         let found2 = found2.unwrap();
         assert!(found2.is_read);
-        assert!(found2.read_bytes.is_some_and(|r| r >= 1024));
+        assert_eq!(found2.read_bytes, None);
 
         drop(read_file);
         let _ = std::fs::remove_file(&test_path);
@@ -552,6 +558,7 @@ mod tests {
             file.as_raw_handle() as usize,
             &mut path_buf,
         )
+        .expect("open disk file inspection")
         .expect("open disk file must be inspectable");
         assert!(facts.path.ends_with(&test_name));
         assert_eq!(access_flags(facts.granted_access), (false, true));
@@ -566,7 +573,8 @@ mod tests {
             file.as_raw_handle() as usize,
             &mut path_buf,
         )
-        .unwrap();
+        .expect("open disk file inspection")
+        .expect("open disk file must be inspectable");
         assert_eq!(facts.offset, Some(310));
 
         drop(file);
@@ -602,8 +610,8 @@ mod tests {
         let found = found.unwrap();
         assert!(found.is_write);
         assert_eq!(found.file_size, Some(8 * 1024 * 1024));
-        // Crucial invariant: 0 bytes were written, so write_bytes must be 0, NEVER 8 MB!
-        assert_eq!(found.write_bytes, Some(0));
+        // A seek position is never a transfer total.
+        assert_eq!(found.write_bytes, None);
 
         drop(file);
         let _ = std::fs::remove_file(&test_path);

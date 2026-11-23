@@ -17,7 +17,7 @@ use crate::actions::{
 };
 use tm_core::error::Result;
 
-const MAX_FDS: usize = 16_384;
+const MAX_FDS: usize = 4_096;
 const HANDLE_ENUMERATION_BUDGET: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -381,10 +381,7 @@ mod tests {
             })
         );
 
-        let path_only = parse_fdinfo(&format!(
-            "pos:\t7\nflags:\t{:o}\n",
-            libc::O_PATH
-        ));
+        let path_only = parse_fdinfo(&format!("pos:\t7\nflags:\t{:o}\n", libc::O_PATH));
         assert_eq!(
             path_only.access,
             Some(FdAccess {
@@ -476,8 +473,7 @@ mod tests {
             "character devices are not files that this view can size or attribute"
         );
         assert!(
-            reportable_file_target(std::path::Path::new("socket:[1]"), &deleted_metadata)
-                .is_none(),
+            reportable_file_target(std::path::Path::new("socket:[1]"), &deleted_metadata).is_none(),
             "anonymous descriptors have no filesystem path"
         );
     }

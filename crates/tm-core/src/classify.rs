@@ -1,5 +1,6 @@
-//! Process classification into the three Windows-Task-Manager-like groups:
-//! Apps / Background / System. Pure logic, unit-tested.
+//! Process classification into Windows-Task-Manager-like groups: Apps /
+//! Background / System, plus Unknown when window ownership is unavailable.
+//! Pure logic, unit-tested.
 //!
 //! The native rule is deliberately conservative (Raymond Chen, "How does
 //! Task Manager categorize processes as App, Background Process, or Windows

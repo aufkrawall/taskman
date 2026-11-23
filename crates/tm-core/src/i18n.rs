@@ -202,6 +202,7 @@ keys! {
     ThreadStateInitialized => ["Initialisiert", "Initialized"],
     ThreadStateReady => ["Bereit", "Ready"],
     ThreadStateRunning => ["Läuft", "Running"],
+    ThreadStateRunnable => ["Laufbereit", "Runnable"],
     ThreadStateStandby => ["Standby", "Standby"],
     ThreadStateTerminated => ["Beendet", "Terminated"],
     ThreadStateWaiting => ["Wartet", "Waiting"],
@@ -248,6 +249,15 @@ keys! {
     ThreadEvidencePartial => [
         "Startadresse oder Zyklen für {} von {} Threads nicht verfügbar",
         "Start address or cycles unavailable for {} of {} threads"
+    ],
+    ThreadActivityUnknown => ["Aktivität unbekannt", "Activity unknown"],
+    ThreadActivityUnknownTip => [
+        "Für diesen Thread fehlen Kontextwechsel- und Zykluszähler; ohne diese Evidenz wird er nicht als ruhend bezeichnet",
+        "This thread lacks context-switch and cycle evidence, so it is not reported as idle"
+    ],
+    ThreadActivityUnknownSummary => [
+        "Für {} von {} Threads fehlt Planungsevidenz",
+        "Scheduling evidence is unavailable for {} of {} threads"
     ],
     HideIdle => ["Ruhende ausblenden", "Hide idle"],
     ThreadStartAddressTip => [

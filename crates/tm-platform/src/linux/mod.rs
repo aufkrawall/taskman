@@ -4,8 +4,8 @@ mod diskstats;
 mod process_connections;
 mod process_io;
 mod process_modules;
-mod process_tree;
 mod process_threads;
+mod process_tree;
 pub(crate) mod services;
 mod startup;
 mod x11_windows;
@@ -126,15 +126,11 @@ impl SystemCollector for LinuxCollector {
                 .get(&pid_u)
                 .copied()
                 .filter(|&before| linux_proc_start_ticks(pid_u) == Some(before));
-            let has_window = if window_observation.owners.contains(&pid_u) {
-                Some(true)
-            } else if window_observation.coverage == x11_windows::WindowCoverage::Complete
-                && boot_start_ticks.is_some()
-            {
-                Some(false)
-            } else {
-                None
-            };
+            let has_window = window_evidence(
+                window_observation.owners.contains(&pid_u),
+                boot_start_ticks.is_some(),
+                window_observation.coverage,
+            );
             let category = classify::classify(classify::ClassifyInput {
                 pid: pid_u,
                 name: &name,
@@ -1164,22 +1160,55 @@ fn linux_proc_start_ticks(pid: u32) -> Option<i64> {
     parse_proc_stat_starttime(&stat)
 }
 
+fn read_proc_start_ticks(pid: u32) -> Result<i64> {
+    let path = format!("/proc/{pid}/stat");
+    let stat = match std::fs::read(&path) {
+        Ok(stat) => stat,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Err(tm_core::TmError::ProcessNotFound { pid });
+        }
+        Err(error) => {
+            return Err(tm_core::TmError::platform(
+                "read process identity",
+                format!("{path}: {error}"),
+            ));
+        }
+    };
+    parse_proc_stat_starttime(&stat).ok_or_else(|| {
+        tm_core::TmError::platform(
+            "read process identity",
+            format!("{path}: malformed process record"),
+        )
+    })
+}
+
 fn linux_clk_tck() -> Option<u64> {
     let raw = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
     u64::try_from(raw).ok().filter(|&hz| hz > 0)
 }
 
-pub(super) fn verify_process_identity(
-    pid: u32,
-    expected_start_ticks: Option<i64>,
-) -> Result<()> {
+fn window_evidence(
+    positive_owner: bool,
+    identity_known: bool,
+    coverage: x11_windows::WindowCoverage,
+) -> Option<bool> {
+    if positive_owner {
+        identity_known.then_some(true)
+    } else if coverage == x11_windows::WindowCoverage::Complete && identity_known {
+        Some(false)
+    } else {
+        None
+    }
+}
+
+pub(super) fn verify_process_identity(pid: u32, expected_start_ticks: Option<i64>) -> Result<()> {
     let expected = expected_start_ticks.ok_or_else(|| {
         tm_core::TmError::platform(
             "verify process identity",
             "process creation identity unavailable",
         )
     })?;
-    if linux_proc_start_ticks(pid) != Some(expected) {
+    if read_proc_start_ticks(pid)? != expected {
         return Err(tm_core::TmError::ProcessNotFound { pid });
     }
     Ok(())
@@ -1189,7 +1218,7 @@ pub(super) fn verify_process_identity(
 /// sampled token must match exactly; it is a boot-relative start tick on
 /// Linux, despite the shared trait's historical parameter name.
 fn process_start_for_read(pid: u32, expected_start_ticks: Option<i64>) -> Result<i64> {
-    let before = linux_proc_start_ticks(pid).ok_or(tm_core::TmError::ProcessNotFound { pid })?;
+    let before = read_proc_start_ticks(pid)?;
     if expected_start_ticks.is_some_and(|expected| expected != before) {
         return Err(tm_core::TmError::ProcessNotFound { pid });
     }
@@ -1197,7 +1226,7 @@ fn process_start_for_read(pid: u32, expected_start_ticks: Option<i64>) -> Result
 }
 
 fn ensure_process_generation(pid: u32, before: i64) -> Result<()> {
-    if linux_proc_start_ticks(pid) != Some(before) {
+    if read_proc_start_ticks(pid)? != before {
         return Err(tm_core::TmError::ProcessNotFound { pid });
     }
     Ok(())
@@ -1213,7 +1242,7 @@ pub fn create_collector() -> LinuxCollector {
         last_tick: None,
         first_tick_done: false,
         cache_kb: cache_totals_kb(&read_cache_indexes()),
-        window_observer: x11_windows::WindowObserver::default(),
+        window_observer: x11_windows::WindowObserver::new(),
     }
 }
 
@@ -1233,6 +1262,16 @@ mod tests {
         assert!(capabilities.process_connections);
         assert!(capabilities.end_process_tree);
         assert!(!capabilities.unload_module);
+    }
+
+    #[test]
+    fn x11_evidence_requires_identity_and_complete_coverage_for_negatives() {
+        use x11_windows::WindowCoverage::{Complete, Partial, Unavailable};
+        assert_eq!(window_evidence(true, true, Partial), Some(true));
+        assert_eq!(window_evidence(true, false, Complete), None);
+        assert_eq!(window_evidence(false, true, Complete), Some(false));
+        assert_eq!(window_evidence(false, true, Partial), None);
+        assert_eq!(window_evidence(false, true, Unavailable), None);
     }
 
     #[test]

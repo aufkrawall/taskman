@@ -9,14 +9,14 @@ use eframe::egui::{self, Color32, Pos2, Stroke, Vec2};
 use tm_core::format;
 use tm_core::i18n::{self, K};
 use tm_core::model::ProcessEntry;
-use tm_platform::actions::{
-    FileIoAccounting, FileIoAccountingState, ProcessFileIoSnapshot,
-};
+use tm_platform::actions::{FileIoAccounting, FileIoAccountingState, ProcessFileIoSnapshot};
 
 use crate::app::{ProcessIdentity, TaskManApp};
 use crate::tabs::inspector::{self, Poll};
 use crate::theme;
 use crate::widgets::chart::{self, MultiSeries, TimeAxis, ValueFmt};
+
+const MAX_RETAINED_IO_ROWS: usize = 4096;
 
 /// One historical sample of a process's I/O activity.
 #[derive(Clone, Copy, Debug)]
@@ -205,10 +205,25 @@ impl State {
             seen.insert(file.path.clone());
             if let Some(&index) = index_by_path.get(&file.path) {
                 let existing = &mut self.files[index];
-                existing.open_handles = file.open_handles;
-                existing.is_read = file.is_read;
-                existing.is_write = file.is_write;
-                existing.offset = file.offset;
+                if handles_complete {
+                    existing.open_handles = file.open_handles;
+                    existing.is_read = file.is_read;
+                    existing.is_write = file.is_write;
+                    existing.offset = file.offset;
+                } else {
+                    // A denied/incomplete enumeration may omit or default
+                    // individual handles. Only apply positive facts.
+                    existing.open_handles = existing.open_handles.max(file.open_handles);
+                    existing.is_read |= file.is_read;
+                    existing.is_write |= file.is_write;
+                    if let Some(offset) = file.offset {
+                        existing.offset = Some(
+                            existing
+                                .offset
+                                .map_or(offset, |current| current.max(offset)),
+                        );
+                    }
+                }
                 existing.read_bytes = match (existing.read_bytes, file.read_bytes) {
                     (Some(a), Some(b)) => Some(a.max(b)),
                     (Some(a), None) => Some(a),
@@ -253,6 +268,28 @@ impl State {
                 }
             }
         }
+        let per_file_measured = self
+            .accounting
+            .as_ref()
+            .is_some_and(|accounting| accounting.state == FileIoAccountingState::Measured);
+        if !per_file_measured {
+            // Without per-file counters, a closed row carries no history worth
+            // retaining. Keeping it would let temporary-file churn grow the
+            // page without bound.
+            self.files.retain(|file| file.open_handles > 0);
+        } else if self.files.len() > MAX_RETAINED_IO_ROWS {
+            let mut kept = Vec::with_capacity(MAX_RETAINED_IO_ROWS);
+            let mut closed = 0usize;
+            for file in self.files.drain(..) {
+                if file.open_handles > 0 || closed < MAX_RETAINED_IO_ROWS {
+                    if file.open_handles == 0 {
+                        closed += 1;
+                    }
+                    kept.push(file);
+                }
+            }
+            self.files = kept;
+        }
     }
 
     pub fn sorted_and_filtered_files(&self) -> Vec<&TrackedFileIo> {
@@ -272,34 +309,34 @@ impl State {
 
         let col = self.file_sort_column;
         let asc = self.file_sort_ascending;
-        result.sort_by(|a, b| {
-            match col {
-                FileSortColumn::Written => cmp_known_last(a.write_bytes, b.write_bytes, asc)
-                    .then_with(|| cmp_known_last(a.read_bytes, b.read_bytes, asc))
-                    .then_with(|| a.name.cmp(&b.name)),
-                FileSortColumn::Read => cmp_known_last(a.read_bytes, b.read_bytes, asc)
-                    .then_with(|| cmp_known_last(a.write_bytes, b.write_bytes, asc))
-                    .then_with(|| a.name.cmp(&b.name)),
-                FileSortColumn::Total => cmp_known_last(a.total_bytes, b.total_bytes, asc)
-                    .then_with(|| a.name.cmp(&b.name)),
-                FileSortColumn::Size => cmp_known_last(a.file_size, b.file_size, asc)
-                    .then_with(|| a.name.cmp(&b.name)),
-                FileSortColumn::Path => {
-                    let ord = a
-                        .path
-                        .to_lowercase()
-                        .cmp(&b.path.to_lowercase())
-                        .then_with(|| a.name.cmp(&b.name));
-                    if asc { ord } else { ord.reverse() }
-                }
-                FileSortColumn::File => {
-                    let ord = a
-                        .name
-                        .to_lowercase()
-                        .cmp(&b.name.to_lowercase())
-                        .then_with(|| a.path.cmp(&b.path));
-                    if asc { ord } else { ord.reverse() }
-                }
+        result.sort_by(|a, b| match col {
+            FileSortColumn::Written => cmp_known_last(a.write_bytes, b.write_bytes, asc)
+                .then_with(|| cmp_known_last(a.read_bytes, b.read_bytes, asc))
+                .then_with(|| a.name.cmp(&b.name)),
+            FileSortColumn::Read => cmp_known_last(a.read_bytes, b.read_bytes, asc)
+                .then_with(|| cmp_known_last(a.write_bytes, b.write_bytes, asc))
+                .then_with(|| a.name.cmp(&b.name)),
+            FileSortColumn::Total => {
+                cmp_known_last(a.total_bytes, b.total_bytes, asc).then_with(|| a.name.cmp(&b.name))
+            }
+            FileSortColumn::Size => {
+                cmp_known_last(a.file_size, b.file_size, asc).then_with(|| a.name.cmp(&b.name))
+            }
+            FileSortColumn::Path => {
+                let ord = a
+                    .path
+                    .to_lowercase()
+                    .cmp(&b.path.to_lowercase())
+                    .then_with(|| a.name.cmp(&b.name));
+                if asc { ord } else { ord.reverse() }
+            }
+            FileSortColumn::File => {
+                let ord = a
+                    .name
+                    .to_lowercase()
+                    .cmp(&b.name.to_lowercase())
+                    .then_with(|| a.path.cmp(&b.path));
+                if asc { ord } else { ord.reverse() }
             }
         });
         result
@@ -313,11 +350,7 @@ fn measured_total(read: Option<u64>, written: Option<u64>) -> Option<u64> {
     }
 }
 
-fn cmp_known_last<T: Ord>(
-    a: Option<T>,
-    b: Option<T>,
-    ascending: bool,
-) -> std::cmp::Ordering {
+fn cmp_known_last<T: Ord>(a: Option<T>, b: Option<T>, ascending: bool) -> std::cmp::Ordering {
     match (a, b) {
         (Some(a), Some(b)) if ascending => a.cmp(&b),
         (Some(a), Some(b)) => b.cmp(&a),
@@ -347,6 +380,14 @@ fn fmt_io_rate(v: f64) -> String {
 
 fn fmt_io_bytes(v: f64) -> String {
     format::format_bytes_loc(v.max(0.0) as u64)
+}
+
+fn fmt_optional_count(value: Option<u64>) -> String {
+    value.map_or_else(|| "\u{2014}".into(), format::format_thousands)
+}
+
+fn fmt_optional_bytes(value: Option<u64>) -> String {
+    value.map_or_else(|| "\u{2014}".into(), format::format_bytes_loc)
 }
 
 /// Paint one rolling I/O graph section matching the Performance page disk theming.
@@ -559,56 +600,17 @@ pub fn show(
             ui.add_space(4.0);
 
             // Columns layout for stats
-            let read_ops_str = process
-                .io_read_ops
-                .map(format::format_thousands)
-                .unwrap_or_else(|| "—".into());
+            let read_ops_str = fmt_optional_count(process.io_read_ops);
             let read_bytes_str = format::format_bytes_loc(process.disk_read_total);
-            let read_delta_str = process
-                .io_read_bytes_delta
-                .map(|d| {
-                    if d == 0 {
-                        "0".into()
-                    } else {
-                        format::format_bytes_loc(d)
-                    }
-                })
-                .unwrap_or_else(|| "â€”".into());
+            let read_delta_str = fmt_optional_bytes(process.io_read_bytes_delta);
 
-            let write_ops_str = process
-                .io_write_ops
-                .map(format::format_thousands)
-                .unwrap_or_else(|| "—".into());
+            let write_ops_str = fmt_optional_count(process.io_write_ops);
             let write_bytes_str = format::format_bytes_loc(process.disk_write_total);
-            let write_delta_str = process
-                .io_write_bytes_delta
-                .map(|d| {
-                    if d == 0 {
-                        "0".into()
-                    } else {
-                        format::format_bytes_loc(d)
-                    }
-                })
-                .unwrap_or_else(|| "â€”".into());
+            let write_delta_str = fmt_optional_bytes(process.io_write_bytes_delta);
 
-            let other_ops_str = process
-                .io_other_ops
-                .map(format::format_thousands)
-                .unwrap_or_else(|| "—".into());
-            let other_bytes_str = process
-                .io_other_total
-                .map(format::format_bytes_loc)
-                .unwrap_or_else(|| "—".into());
-            let other_delta_str = process
-                .io_other_bytes_delta
-                .map(|d| {
-                    if d == 0 {
-                        "0".into()
-                    } else {
-                        format::format_bytes_loc(d)
-                    }
-                })
-                .unwrap_or_else(|| "0".into());
+            let other_ops_str = fmt_optional_count(process.io_other_ops);
+            let other_bytes_str = fmt_optional_bytes(process.io_other_total);
+            let other_delta_str = fmt_optional_bytes(process.io_other_bytes_delta);
 
             let font = egui::FontId::proportional(13.0);
             let text_w = |s: &str| {
@@ -746,7 +748,7 @@ pub fn show(
         .accounting
         .as_ref()
         .is_some_and(|accounting| !accounting.handles_complete);
-    if handles_incomplete {
+    if handles_incomplete && !display_files.is_empty() {
         ui.add_space(6.0);
         ui.label(
             egui::RichText::new(i18n::tr(K::PropIoFilesUnavailable))
@@ -758,11 +760,9 @@ pub fn show(
         ui.add_space(6.0);
         let unavailable = handles_incomplete
             || state
-            .accounting
-            .as_ref()
-            .is_some_and(|accounting| {
-                accounting.state == FileIoAccountingState::Unavailable
-            });
+                .accounting
+                .as_ref()
+                .is_none_or(|accounting| accounting.state != FileIoAccountingState::Measured);
         let msg = if unavailable {
             i18n::tr(K::PropIoFilesUnavailable)
         } else {
@@ -1087,24 +1087,15 @@ pub fn show(
                     };
 
                 // Read bytes
-                let s = match file.read_bytes {
-                    Some(b) if b > 0 || file.is_read => format::format_bytes_loc(b),
-                    _ => "—".to_string(),
-                };
+                let s = fmt_optional_bytes(file.read_bytes);
                 show_num_cell(ui, egui::RichText::new(&s), &s, COL_READ_W);
 
                 // Written bytes
-                let s = match file.write_bytes {
-                    Some(b) if b > 0 || file.is_write => format::format_bytes_loc(b),
-                    _ => "—".to_string(),
-                };
+                let s = fmt_optional_bytes(file.write_bytes);
                 show_num_cell(ui, egui::RichText::new(&s), &s, COL_WRITE_W);
 
                 // Total bytes
-                let s = match file.total_bytes {
-                    Some(b) if b > 0 => format::format_bytes_loc(b),
-                    _ => "—".to_string(),
-                };
+                let s = fmt_optional_bytes(file.total_bytes);
                 show_num_cell(ui, egui::RichText::new(&s).strong(), &s, COL_TOTAL_W);
 
                 // File size
@@ -1421,6 +1412,10 @@ mod tests {
         assert_eq!(measured_total(Some(10), None), None);
         assert_eq!(measured_total(None, Some(20)), None);
         assert_eq!(measured_total(Some(10), Some(20)), Some(30));
+        assert_eq!(fmt_optional_bytes(None), "\u{2014}");
+        assert_eq!(fmt_optional_bytes(Some(0)), "0 B");
+        assert_eq!(fmt_optional_count(None), "\u{2014}");
+        assert_eq!(fmt_optional_count(Some(0)), "0");
     }
 
     #[test]
@@ -1506,8 +1501,7 @@ mod tests {
                     let win = visible_io_slice(samples, 60);
                     let stamps: Vec<u64> = win.iter().map(|s| s.t_ms).collect();
                     let axis = (!stamps.is_empty()).then(|| TimeAxis::new(&stamps, 60));
-                    let read_samples: Vec<Option<f64>> =
-                        win.iter().map(|s| s.read_bps).collect();
+                    let read_samples: Vec<Option<f64>> = win.iter().map(|s| s.read_bps).collect();
 
                     paint_io_graph_section(
                         ui,

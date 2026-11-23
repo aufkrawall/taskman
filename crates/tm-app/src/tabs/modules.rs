@@ -165,6 +165,7 @@ enum UnknownReason {
     Loading,
     Unavailable,
     StartsUnavailable,
+    ActivityUnavailable,
 }
 
 impl ModuleActivity {
@@ -188,6 +189,9 @@ impl ModuleActivity {
             Self::Unknown(UnknownReason::StartsUnavailable) => {
                 i18n::tr(K::ModuleActivityUnknown).to_string()
             }
+            Self::Unknown(UnknownReason::ActivityUnavailable) => {
+                crate::tabs::threads::activity_label(Activity::Unknown)
+            }
             Self::NoThreads => i18n::tr(K::ModuleNoOwnThreads).to_string(),
             Self::Observing => i18n::tr(K::ActivityObserving).to_string(),
             Self::Running => crate::tabs::threads::activity_label(Activity::Running),
@@ -206,6 +210,9 @@ impl ModuleActivity {
             }
             Self::Unknown(UnknownReason::StartsUnavailable) => {
                 i18n::tr(K::ModuleUnknownStartsTip).to_string()
+            }
+            Self::Unknown(UnknownReason::ActivityUnavailable) => {
+                i18n::tr(K::ThreadActivityUnknownTip).to_string()
             }
             Self::NoThreads => i18n::tr(K::ModuleNoThreadsTip).to_string(),
             Self::Observing => i18n::tr(K::ModuleObservingTip).to_string(),
@@ -263,6 +270,8 @@ fn module_activity(
         // A thread whose start is unknown might belong here and be running.
         if unknown_starts {
             ModuleActivity::Unknown(UnknownReason::StartsUnavailable)
+        } else if started.iter().any(|row| row.activity == Activity::Unknown) {
+            ModuleActivity::Unknown(UnknownReason::ActivityUnavailable)
         } else {
             let idle = started
                 .iter()
@@ -881,8 +890,8 @@ pub fn show(
         } else {
             i18n::tr(K::ModulesReadOnly)
         })
-            .small()
-            .color(pal.text_dim),
+        .small()
+        .color(pal.text_dim),
     );
     ui.label(
         egui::RichText::new(i18n::tr(K::OriginThreadActivityHelp))
@@ -1655,6 +1664,14 @@ mod tests {
             (
                 Some((0, true)),
                 ModuleActivity::Unknown(UnknownReason::StartsUnavailable)
+            )
+        );
+        let unknown_activity = [thread_row(2, Some(0x1100), Activity::Unknown)];
+        assert_eq!(
+            module_activity(&dll, ready(&unknown_activity)),
+            (
+                Some((1, false)),
+                ModuleActivity::Unknown(UnknownReason::ActivityUnavailable)
             )
         );
         assert_eq!(

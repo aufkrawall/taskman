@@ -679,6 +679,9 @@ pub struct ProcessEntry {
 
     pub exe_path: Option<PathBuf>,
     pub command_line: Option<String>,
+    /// Positive visible/managed-window evidence. `false` is NOT proof of a
+    /// windowless process on platforms/coverage modes where ownership is
+    /// unknown; `category` carries that distinction (`Unknown`).
     pub has_window: bool,
     /// Topmost process of an app subtree (Task Manager's "Apps" root rows).
     pub app_root: bool,

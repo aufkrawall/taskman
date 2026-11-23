@@ -147,6 +147,8 @@ pub enum ThreadState {
     Initialized,
     Ready,
     Running,
+    /// Runnable in the kernel queue, but not necessarily executing on a CPU.
+    Runnable,
     Standby,
     Terminated,
     Waiting,
@@ -256,7 +258,9 @@ pub struct ProcessThread {
     pub cycles: Option<u64>,
 }
 
-/// Every thread of one exact process, from one kernel snapshot.
+/// Every thread of one exact process. Platforms with atomic process/thread
+/// snapshots use that snapshot; procfs backends bracket individual records
+/// with the process/TID creation identity so recycled entries are omitted.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProcessThreads {
     /// The process's base priority, which the threads' symbolic priority

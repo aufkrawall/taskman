@@ -60,10 +60,15 @@ fn parse_maps_line(line: &str) -> Option<Mapping> {
     let mut cursor = 0;
     let range = next_field(line, &mut cursor)?;
     let perms = next_field(line, &mut cursor)?;
-    let _offset = next_field(line, &mut cursor)?;
+    let offset = next_field(line, &mut cursor)?;
     let device = next_field(line, &mut cursor)?;
     let inode = next_field(line, &mut cursor)?;
-    if perms.len() != 4 {
+    let (device_major, device_minor) = device.split_once(':')?;
+    if !valid_maps_permissions(perms)
+        || parse_hex_u64(offset).is_none()
+        || parse_hex_u64(device_major).is_none()
+        || parse_hex_u64(device_minor).is_none()
+    {
         return None;
     }
     while line
@@ -85,18 +90,51 @@ fn parse_maps_line(line: &str) -> Option<Mapping> {
         executable: perms.as_bytes().get(2) == Some(&b'x'),
         device: device.to_string(),
         inode: inode.parse().ok()?,
-        path: line[cursor..]
-            .trim_end_matches('\n')
-            .trim_end_matches('\r')
-            .to_string(),
+        path: decode_maps_path(line[cursor..].trim_end_matches('\n').trim_end_matches('\r')),
     })
+}
+
+/// Decode the octal escapes the kernel uses for whitespace, backslash, and
+/// non-printable bytes in `/proc/<pid>/maps` pathnames.
+fn decode_maps_path(raw: &str) -> String {
+    let bytes = raw.as_bytes();
+    let mut out = String::with_capacity(raw.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'\\' && index + 3 < bytes.len() {
+            let digits = &bytes[index + 1..index + 4];
+            if digits.iter().all(|digit| matches!(digit, b'0'..=b'7'))
+                && let Ok(value) = u8::from_str_radix(&raw[index + 1..index + 4], 8)
+            {
+                out.push(char::from(value));
+                index += 4;
+                continue;
+            }
+        }
+        let Some(ch) = raw[index..].chars().next() else {
+            break;
+        };
+        out.push(ch);
+        index += ch.len_utf8();
+    }
+    out
+}
+
+fn valid_maps_permissions(perms: &str) -> bool {
+    let bytes = perms.as_bytes();
+    bytes.len() == 4
+        && matches!(bytes[0], b'r' | b'-')
+        && matches!(bytes[1], b'w' | b'-')
+        && matches!(bytes[2], b'x' | b'-')
+        && matches!(bytes[3], b'p' | b's')
 }
 
 fn mapped_name(path: &str) -> String {
     let path = path.strip_suffix(" (deleted)").unwrap_or(path);
-    Path::new(path)
-        .file_name()
-        .map_or_else(|| path.to_string(), |name| name.to_string_lossy().into_owned())
+    Path::new(path).file_name().map_or_else(
+        || path.to_string(),
+        |name| name.to_string_lossy().into_owned(),
+    )
 }
 
 /// Group adjacent mappings of the same file into one executable module span.
@@ -221,14 +259,20 @@ mod tests {
 
     #[test]
     fn deleted_suffix_is_kept_in_the_path_but_not_in_the_name() {
-        let maps =
-            "1000-2000 r-xp 00000000 00:01 42 /tmp/plugin with spaces.so (deleted)\n";
+        let maps = "1000-2000 r-xp 00000000 00:01 42 /tmp/plugin with spaces.so (deleted)\n";
         let modules = modules_from_maps(maps);
         assert_eq!(modules.len(), 1);
         assert_eq!(modules[0].path, "/tmp/plugin with spaces.so (deleted)");
         assert_eq!(modules[0].name, "plugin with spaces.so");
         assert_eq!(modules[0].base_address, 0x1000);
         assert_eq!(modules[0].size_bytes, 0x1000);
+    }
+
+    #[test]
+    fn kernel_octal_path_escapes_are_decoded() {
+        let maps = "1000-2000 r-xp 00000000 00:01 42 /tmp/lib\\040with\\040space\\134x.so\n";
+        let modules = modules_from_maps(maps);
+        assert_eq!(modules[0].path, "/tmp/lib with space\\x.so");
     }
 
     #[test]
@@ -246,6 +290,10 @@ mod tests {
         assert!(parse_maps_line("1000-2000 rx 0 00:00 1 /a").is_none());
         assert!(parse_maps_line("1000-1000 r-xp 0 00:00 1 /a").is_none());
         assert!(parse_maps_line("2000-1000 r-xp 0 00:00 1 /a").is_none());
+        assert!(parse_maps_line("1000-2000 r-xx 0 00:00 1 /a").is_none());
+        assert!(parse_maps_line("1000-2000 r-xp nope 00:00 1 /a").is_none());
+        assert!(parse_maps_line("1000-2000 r-xp 0 bad 1 /a").is_none());
+        assert!(parse_maps_line("1000-2000 r-xp 0 00:00 1 /a").is_some());
     }
 
     #[test]

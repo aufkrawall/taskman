@@ -8,6 +8,9 @@
 //! count proves it never got a processor; the CPU-time and cycle checks cover a
 //! thread that kept one processor without ever being switched out. Ready and
 //! Standby are runnable states, not proof that a thread executed.
+//! Linux's `R` state is likewise only "runnable", not proof of current
+//! execution. When neither a context-switch pair nor a cycle pair is
+//! available, activity is reported as Unknown and never inferred as idle.
 //!
 //! Activity evidence is continuous only inside a bounded observation window.
 //! If counters advanced across a long sampling gap (Paused, another properties
@@ -93,6 +96,10 @@ struct Track {
     first_seen: Instant,
     first_cpu_100ns: u64,
     last_active: Option<Instant>,
+    /// Start of the current continuously observed interval with usable
+    /// scheduling evidence. Unknown samples reset it so their duration is not
+    /// reported as proven idle time.
+    idle_anchor: Instant,
     observing: Option<(Instant, ObservingReason)>,
 }
 
@@ -128,6 +135,7 @@ impl Tracker {
                     first_cpu_100ns,
                     mut last_active,
                     mut observing,
+                    mut idle_anchor,
                     cpu_pct,
                     avg_cpu_pct,
                     cycles_delta,
@@ -138,15 +146,12 @@ impl Tracker {
                             (thread.context_switches, prev.context_switches),
                             (Some(_), Some(_))
                         );
-                        let cycle_pair_available = matches!(
-                            (thread.cycles, prev.cycles),
-                            (Some(_), Some(_))
-                        );
+                        let cycle_pair_available =
+                            matches!((thread.cycles, prev.cycles), (Some(_), Some(_)));
                         let advanced = matches!(
                             (thread.context_switches, prev.context_switches),
                             (Some(now), Some(before)) if now != before
-                        )
-                            || cpu_100ns != prev.cpu_100ns
+                        ) || cpu_100ns != prev.cpu_100ns
                             || matches!(
                                 (thread.cycles, prev.cycles),
                                 (Some(now), Some(before)) if now != before
@@ -170,6 +175,7 @@ impl Tracker {
                         };
                         let mut last_active = prev.last_active;
                         let mut observing = prev.observing;
+                        let mut idle_anchor = prev.idle_anchor;
                         let sampling_gap =
                             taken.saturating_duration_since(prev.sampled) > DORMANT_AFTER;
                         let evidence_became_available = (thread.context_switches.is_some()
@@ -177,25 +183,29 @@ impl Tracker {
                             || (thread.cycles.is_some() && prev.cycles.is_none());
                         if advanced {
                             last_active = Some(taken);
+                            idle_anchor = taken;
                             if sampling_gap {
                                 observing = Some((taken, ObservingReason::AfterGap));
                             } else {
                                 observing = None;
                             }
                         } else if evidence_became_available {
+                            idle_anchor = taken;
                             observing = Some((taken, ObservingReason::AfterGap));
+                        }
+                        if evidence_unavailable {
+                            idle_anchor = taken;
                         }
                         (
                             prev.first_seen,
                             prev.first_cpu_100ns,
                             last_active,
                             observing,
+                            idle_anchor,
                             cpu_pct,
                             avg_cpu_pct,
                             cycles_delta,
-                            !advanced
-                                && !switch_pair_available
-                                && !cycle_pair_available,
+                            !advanced && !switch_pair_available && !cycle_pair_available,
                         )
                     }
                     None => (
@@ -203,6 +213,7 @@ impl Tracker {
                         cpu_100ns,
                         None,
                         Some((taken, ObservingReason::FirstObservation)),
+                        taken,
                         None,
                         None,
                         None,
@@ -211,9 +222,10 @@ impl Tracker {
                 };
                 if running {
                     last_active = Some(taken);
+                    idle_anchor = taken;
                     observing = None;
                 }
-                let idle = taken.saturating_duration_since(last_active.unwrap_or(first_seen));
+                let idle = taken.saturating_duration_since(idle_anchor);
                 let activity = if running {
                     Activity::Running
                 } else if evidence_unavailable {
@@ -253,6 +265,7 @@ impl Tracker {
                         first_seen,
                         first_cpu_100ns,
                         last_active,
+                        idle_anchor,
                         observing,
                     },
                 );
@@ -477,6 +490,7 @@ fn state_label(thread: &ProcessThread) -> String {
         ThreadState::Initialized => K::ThreadStateInitialized,
         ThreadState::Ready => K::ThreadStateReady,
         ThreadState::Running => K::ThreadStateRunning,
+        ThreadState::Runnable => K::ThreadStateRunnable,
         ThreadState::Standby => K::ThreadStateStandby,
         ThreadState::Terminated => K::ThreadStateTerminated,
         ThreadState::Transition => K::ThreadStateTransition,
@@ -517,7 +531,7 @@ pub fn activity_label(activity: Activity) -> String {
         Activity::Observing { elapsed, .. } => {
             i18n::trf(K::ActivityObservingFor, &[&elapsed.as_secs().to_string()])
         }
-        Activity::Unknown => i18n::tr(K::ThreadActivityUnavailable).to_string(),
+        Activity::Unknown => i18n::tr(K::ThreadActivityUnknown).to_string(),
         Activity::Idle { idle } => i18n::trf(K::ActivityIdleFor, &[&idle.as_secs().to_string()]),
     }
 }
@@ -540,7 +554,7 @@ fn activity_tip(activity: Activity) -> String {
             reason: ObservingReason::AfterGap,
             ..
         } => i18n::tr(K::ActivityObservingGapTip).to_string(),
-        Activity::Unknown => i18n::tr(K::ThreadActivityUnavailable).to_string(),
+        Activity::Unknown => i18n::tr(K::ThreadActivityUnknownTip).to_string(),
         Activity::Idle { idle } => i18n::trf(K::ThreadIdleTip, &[&idle.as_secs().to_string()]),
     }
 }
@@ -732,13 +746,13 @@ pub fn show(
             ui.separator();
             ui.label(
                 egui::RichText::new(i18n::trf(
-                    K::ThreadEvidencePartial,
+                    K::ThreadActivityUnknownSummary,
                     &[&unknown_activity.to_string(), &state.rows.len().to_string()],
                 ))
                 .small()
                 .color(pal.text_dim),
             )
-            .on_hover_text(i18n::tr(K::ThreadActivityUnavailable));
+            .on_hover_text(i18n::tr(K::ThreadActivityUnknownTip));
         }
         if let Some((text, stale)) = &sample_age {
             ui.separator();
@@ -1000,7 +1014,28 @@ mod tests {
         let t2 = t1 + Duration::from_secs(1);
         tracker.apply(vec![unknown.clone()], t2, 4);
         unknown.context_switches = Some(6);
-        let rows = tracker.apply(vec![unknown], t2 + Duration::from_secs(1), 4);
+        let t3 = t2 + Duration::from_secs(1);
+        let rows = tracker.apply(vec![unknown.clone()], t3, 4);
+        assert_eq!(rows[0].activity, Activity::Recent);
+        let rows = tracker.apply(vec![unknown], t3 + DORMANT_AFTER, 4);
+        assert_eq!(
+            rows[0].activity,
+            Activity::Idle {
+                idle: DORMANT_AFTER
+            }
+        );
+    }
+
+    #[test]
+    fn runnable_is_not_execution_evidence() {
+        let mut tracker = Tracker::default();
+        let t0 = Instant::now();
+        let mut runnable = thread(10, 1, 0, ThreadState::Runnable);
+        tracker.apply(vec![runnable.clone()], t0, 4);
+        let rows = tracker.apply(vec![runnable.clone()], t0 + Duration::from_secs(1), 4);
+        assert!(matches!(rows[0].activity, Activity::Observing { .. }));
+        runnable.context_switches = Some(2);
+        let rows = tracker.apply(vec![runnable], t0 + Duration::from_secs(2), 4);
         assert_eq!(rows[0].activity, Activity::Recent);
     }
 

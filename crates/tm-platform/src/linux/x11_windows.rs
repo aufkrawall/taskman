@@ -24,12 +24,15 @@
 //! engine on network I/O), caps the client list and per-window work, and
 //! reconnects on a connection-level failure.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::time::{Duration, Instant};
 use x11rb::connection::Connection as _;
-use x11rb::errors::ReplyError;
+use x11rb::errors::{ConnectionError, ReplyError};
+use x11rb::protocol::res::{self, ClientIdMask, ClientIdSpec, ConnectionExt as _};
 use x11rb::protocol::xproto::{Atom, AtomEnum, ConnectionExt as _, MapState, Window};
 use x11rb::rust_connection::RustConnection;
+use x11rb_protocol::parse_display::{ConnectAddress, parse_display};
 
 /// Bound root-property reads so a corrupt property cannot force an unbounded
 /// allocation. Truncated properties are treated as unavailable.
@@ -37,6 +40,8 @@ const MAX_PROPERTY_LONGS: u32 = 16_384;
 /// Bound the synchronous per-window work done once per sample.
 const MAX_CLIENT_WINDOWS: usize = 512;
 const RECONNECT_BACKOFF: Duration = Duration::from_secs(5);
+const OBSERVATION_TTL: Duration = Duration::from_secs(3);
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(3);
 
 const WM_STATE_WITHDRAWN: u32 = 0;
 const WM_STATE_NORMAL: u32 = 1;
@@ -102,29 +107,105 @@ struct QueryOutcome {
     connection_failed: bool,
 }
 
-/// Persistent X11 observer owned by the Linux collector.
+/// Non-blocking handle owned by the Linux collector.
+///
+/// All X11 I/O happens on one dedicated thread. If the server wedges, the
+/// engine thread keeps sampling and the cached observation expires to
+/// unavailable instead of waiting on a blocking round trip.
 pub(crate) struct WindowObserver {
+    requests: SyncSender<u64>,
+    responses: Receiver<(u64, WindowObservation)>,
+    next_sequence: u64,
+    outstanding: Option<(u64, Instant)>,
+    latest: Option<(u64, Instant, WindowObservation)>,
+}
+
+impl WindowObserver {
+    pub(crate) fn new() -> Self {
+        let (requests, request_rx) = mpsc::sync_channel(1);
+        let (response_tx, responses) = mpsc::channel();
+        let spawn = std::thread::Builder::new()
+            .name("tm-x11-windows".into())
+            .spawn(move || {
+                let mut observer = BlockingObserver::default();
+                while let Ok(sequence) = request_rx.recv() {
+                    let observation = observer.observe();
+                    if response_tx.send((sequence, observation)).is_err() {
+                        break;
+                    }
+                }
+            });
+        if let Err(error) = spawn {
+            tracing::warn!(%error, "failed to start Linux X11 window observer");
+        }
+        Self {
+            requests,
+            responses,
+            next_sequence: 0,
+            outstanding: None,
+            latest: None,
+        }
+    }
+
+    pub(crate) fn observe(&mut self) -> WindowObservation {
+        let now = Instant::now();
+        while let Ok((sequence, observation)) = self.responses.try_recv() {
+            if self
+                .latest
+                .as_ref()
+                .is_none_or(|(latest_sequence, _, _)| sequence >= *latest_sequence)
+            {
+                self.latest = Some((sequence, now, observation));
+            }
+            if self
+                .outstanding
+                .is_some_and(|(outstanding_sequence, _)| outstanding_sequence == sequence)
+            {
+                self.outstanding = None;
+            }
+        }
+
+        if self
+            .outstanding
+            .is_some_and(|(_, sent)| now.saturating_duration_since(sent) > REQUEST_TIMEOUT)
+        {
+            self.outstanding = None;
+        }
+        if self.outstanding.is_none() {
+            let sequence = self.next_sequence;
+            self.next_sequence = self.next_sequence.wrapping_add(1);
+            if self.requests.try_send(sequence).is_ok() {
+                self.outstanding = Some((sequence, now));
+            }
+        }
+
+        match &self.latest {
+            Some((_, observed_at, observation))
+                if now.saturating_duration_since(*observed_at) <= OBSERVATION_TTL =>
+            {
+                observation.clone()
+            }
+            _ => WindowObservation::unavailable(),
+        }
+    }
+}
+
+/// Blocking connection state. This type is confined to the observer thread.
+#[derive(Default)]
+struct BlockingObserver {
     connection: Option<RustConnection>,
     atoms: Option<Atoms>,
     retry_at: Option<Instant>,
     last_coverage: Option<WindowCoverage>,
 }
 
-impl Default for WindowObserver {
-    fn default() -> Self {
-        Self {
-            connection: None,
-            atoms: None,
-            retry_at: None,
-            last_coverage: None,
-        }
-    }
-}
-
-impl WindowObserver {
-    pub(crate) fn observe(&mut self) -> WindowObservation {
+impl BlockingObserver {
+    fn observe(&mut self) -> WindowObservation {
         let now = Instant::now();
-        let Some(display) = std::env::var("DISPLAY").ok().filter(|value| !value.is_empty()) else {
+        let Some(display) = std::env::var("DISPLAY")
+            .ok()
+            .filter(|value| !value.is_empty())
+        else {
             self.record_coverage(WindowCoverage::Unavailable);
             return WindowObservation::unavailable();
         };
@@ -160,14 +241,16 @@ impl WindowObserver {
             return WindowObservation::unavailable();
         };
         let mut outcome = query_window_owners(connection, atoms);
-        if outcome.connection_failed {
+        let atom_setup_incomplete =
+            atoms.pid.is_none() || (atoms.client_list.is_none() && atoms.stacking.is_none());
+        if outcome.connection_failed || atom_setup_incomplete {
             self.connection = None;
             self.atoms = None;
             self.retry_at = Some(now + RECONNECT_BACKOFF);
         } else {
             self.retry_at = None;
         }
-        if wayland_session() && outcome.observation.coverage != WindowCoverage::Unavailable {
+        if !session_is_x11_only() && outcome.observation.coverage != WindowCoverage::Unavailable {
             outcome.observation.coverage = WindowCoverage::Partial;
         }
         self.record_coverage(outcome.observation.coverage);
@@ -197,6 +280,72 @@ fn connect() -> Option<(RustConnection, Atoms)> {
             client_machine: intern_atom(&connection, b"WM_CLIENT_MACHINE"),
         },
     ))
+}
+
+struct ClientPids {
+    clients: Vec<res::Client>,
+    by_client: HashMap<u32, u32>,
+}
+
+enum ClientPidQuery {
+    Available(ClientPids),
+    Unsupported,
+    ConnectionFailed,
+}
+
+fn query_client_pids(connection: &RustConnection) -> ClientPidQuery {
+    let clients = match connection.res_query_clients() {
+        Ok(cookie) => match cookie.reply() {
+            Ok(reply) => reply.clients,
+            Err(ReplyError::ConnectionError(_)) => return ClientPidQuery::ConnectionFailed,
+            Err(ReplyError::X11Error(_)) => return ClientPidQuery::Unsupported,
+        },
+        Err(ConnectionError::UnsupportedExtension) => return ClientPidQuery::Unsupported,
+        Err(_) => return ClientPidQuery::ConnectionFailed,
+    };
+    if clients.is_empty() {
+        return ClientPidQuery::Available(ClientPids {
+            clients,
+            by_client: HashMap::new(),
+        });
+    }
+    let specs: Vec<ClientIdSpec> = clients
+        .iter()
+        .map(|client| ClientIdSpec {
+            client: client.resource_base,
+            mask: ClientIdMask::LOCAL_CLIENT_PID,
+        })
+        .collect();
+    let reply = match connection.res_query_client_ids(&specs) {
+        Ok(cookie) => match cookie.reply() {
+            Ok(reply) => reply,
+            Err(ReplyError::ConnectionError(_)) => return ClientPidQuery::ConnectionFailed,
+            Err(ReplyError::X11Error(_)) => return ClientPidQuery::Unsupported,
+        },
+        Err(ConnectionError::UnsupportedExtension) => return ClientPidQuery::Unsupported,
+        Err(_) => return ClientPidQuery::ConnectionFailed,
+    };
+    let by_client = reply
+        .ids
+        .into_iter()
+        .filter(|value| u32::from(value.spec.mask) & u32::from(ClientIdMask::LOCAL_CLIENT_PID) != 0)
+        .filter_map(|value| {
+            let res::ClientIdValue { spec, value } = value;
+            match value.as_slice() {
+                [pid] if *pid != 0 => Some((spec.client, *pid)),
+                _ => None,
+            }
+        })
+        .collect();
+    ClientPidQuery::Available(ClientPids { clients, by_client })
+}
+
+fn client_pid_for_window(window: Window, clients: &ClientPids) -> Option<u32> {
+    let client = clients
+        .clients
+        .iter()
+        .find(|client| (window & !client.resource_mask) == client.resource_base)?;
+    clients.by_client.get(&client.resource_base).copied()
 }
 
 fn query_window_owners(connection: &RustConnection, atoms: Atoms) -> QueryOutcome {
@@ -270,6 +419,22 @@ fn query_window_owners(connection: &RustConnection, atoms: Atoms) -> QueryOutcom
         coverage = WindowCoverage::Partial;
     }
 
+    let client_pids = match query_client_pids(connection) {
+        ClientPidQuery::Available(client_pids) => Some(client_pids),
+        ClientPidQuery::Unsupported => {
+            coverage = WindowCoverage::Partial;
+            None
+        }
+        ClientPidQuery::ConnectionFailed => {
+            return QueryOutcome {
+                observation: WindowObservation {
+                    owners: HashSet::new(),
+                    coverage: WindowCoverage::Unavailable,
+                },
+                connection_failed: true,
+            };
+        }
+    };
     let local_hostname = local_hostname();
     let mut owners = HashSet::new();
     for window in windows {
@@ -323,33 +488,48 @@ fn query_window_owners(connection: &RustConnection, atoms: Atoms) -> QueryOutcom
                 };
             }
         };
-        if !window_is_eligible(attributes.map_state, attributes.override_redirect, wm_state) {
+        match window_eligibility(attributes.map_state, attributes.override_redirect, wm_state) {
+            WindowEligibility::Eligible => {}
+            WindowEligibility::Ineligible => continue,
+            WindowEligibility::Unknown => {
+                coverage = WindowCoverage::Partial;
+                continue;
+            }
+        }
+
+        if let Some(client_pids) = &client_pids {
+            if let Some(pid) = client_pid_for_window(window, client_pids) {
+                owners.insert(pid);
+            } else {
+                coverage = WindowCoverage::Partial;
+            }
             continue;
         }
 
-        if let Some(machine_atom) = atoms.client_machine {
-            match read_text_property(connection, window, machine_atom, 1024) {
-                TextPropertyReply::Value(machine)
-                    if !client_machine_matches(&machine, local_hostname.as_deref()) =>
-                {
-                    // The raw PID may belong to a container or another host.
-                    // Positive attribution from this connection is not safe.
-                    coverage = WindowCoverage::Partial;
-                    continue;
-                }
-                TextPropertyReply::Invalid | TextPropertyReply::XError => {
-                    coverage = WindowCoverage::Partial;
-                }
-                TextPropertyReply::ConnectionFailed => {
-                    return QueryOutcome {
-                        observation: WindowObservation {
-                            owners,
-                            coverage: WindowCoverage::Unavailable,
-                        },
-                        connection_failed: true,
-                    };
-                }
-                TextPropertyReply::Value(_) | TextPropertyReply::Missing => {}
+        let Some(machine_atom) = atoms.client_machine else {
+            coverage = WindowCoverage::Partial;
+            continue;
+        };
+        match read_text_property(connection, window, machine_atom, 1024) {
+            TextPropertyReply::Value(machine)
+                if client_machine_matches(&machine, local_hostname.as_deref()) => {}
+            // Missing, malformed, or unverifiable machine identity means the
+            // raw PID may belong to another host or a PID namespace.
+            TextPropertyReply::Value(_)
+            | TextPropertyReply::Missing
+            | TextPropertyReply::Invalid
+            | TextPropertyReply::XError => {
+                coverage = WindowCoverage::Partial;
+                continue;
+            }
+            TextPropertyReply::ConnectionFailed => {
+                return QueryOutcome {
+                    observation: WindowObservation {
+                        owners,
+                        coverage: WindowCoverage::Unavailable,
+                    },
+                    connection_failed: true,
+                };
             }
         }
 
@@ -404,14 +584,8 @@ fn read_u32_property(
     expected_type: Option<Atom>,
     max_longs: u32,
 ) -> PropertyReply {
-    let cookie = match connection.get_property(
-        false,
-        window,
-        property,
-        AtomEnum::ANY,
-        0,
-        max_longs,
-    ) {
+    let cookie = match connection.get_property(false, window, property, AtomEnum::ANY, 0, max_longs)
+    {
         Ok(cookie) => cookie,
         Err(_) => return PropertyReply::ConnectionFailed,
     };
@@ -483,21 +657,33 @@ fn merge_window_lists(client_list: &[Window], stacking_list: &[Window]) -> Vec<W
     windows
 }
 
-fn window_is_eligible(
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WindowEligibility {
+    Eligible,
+    Ineligible,
+    Unknown,
+}
+
+fn window_eligibility(
     map_state: MapState,
     override_redirect: bool,
     wm_state: Option<u32>,
-) -> bool {
+) -> WindowEligibility {
     if override_redirect {
-        return false;
+        return WindowEligibility::Ineligible;
     }
     match wm_state {
-        Some(WM_STATE_WITHDRAWN) => false,
+        Some(WM_STATE_WITHDRAWN) => WindowEligibility::Ineligible,
         // ICCCM minimized and off-desktop clients are normally unmapped but
         // remain managed members of the client list.
-        Some(WM_STATE_NORMAL | WM_STATE_ICONIC) => true,
-        // Unknown non-withdrawn states fall back to the server map state.
-        Some(_) | None => map_state == MapState::VIEWABLE,
+        Some(WM_STATE_NORMAL | WM_STATE_ICONIC) => WindowEligibility::Eligible,
+        Some(_) | None => match map_state {
+            MapState::VIEWABLE => WindowEligibility::Eligible,
+            // Without a usable WM_STATE, an unmapped managed client may be
+            // minimized or on another desktop. Treat that as unknown rather
+            // than proving it has no window.
+            MapState::UNMAPPED | MapState::UNVIEWABLE => WindowEligibility::Unknown,
+        },
     }
 }
 
@@ -516,21 +702,45 @@ fn parse_window_pid(values: &[u32]) -> Option<u32> {
 }
 
 fn local_display(display: &str) -> bool {
-    let host = display
-        .rsplit_once(':')
-        .map_or(display, |(host, _display_number)| host);
-    host.is_empty()
-        || matches!(
-            host.to_ascii_lowercase().as_str(),
-            "unix" | "localhost" | "127.0.0.1" | "[::1]" | "::1"
-        )
+    let Ok(parsed) = parse_display(Some(display)) else {
+        return false;
+    };
+    let local_hostname = local_hostname();
+    for address in parsed.connect_instruction() {
+        match address {
+            ConnectAddress::Socket(_) => return true,
+            ConnectAddress::Hostname(host, _) => {
+                let host = host.to_ascii_lowercase();
+                if matches!(host.as_str(), "localhost" | "127.0.0.1" | "::1" | "[::1]") {
+                    return true;
+                }
+                if local_hostname.as_deref().is_some_and(|local| {
+                    host == local.to_ascii_lowercase()
+                        || local
+                            .split('.')
+                            .next()
+                            .is_some_and(|short| host == short.to_ascii_lowercase())
+                }) {
+                    return true;
+                }
+            }
+            _ => {}
+        }
+    }
+    false
 }
 
-fn wayland_session() -> bool {
-    std::env::var("XDG_SESSION_TYPE")
-        .ok()
-        .is_some_and(|kind| kind.eq_ignore_ascii_case("wayland"))
-        || std::env::var_os("WAYLAND_DISPLAY").is_some_and(|value| !value.is_empty())
+fn session_is_x11_only() -> bool {
+    let session = std::env::var("XDG_SESSION_TYPE").ok();
+    let wayland = std::env::var_os("WAYLAND_DISPLAY");
+    x11_only_session(
+        session.as_deref(),
+        wayland.as_deref().is_some_and(|value| !value.is_empty()),
+    )
+}
+
+fn x11_only_session(session: Option<&str>, wayland_display: bool) -> bool {
+    session.is_some_and(|kind| kind.eq_ignore_ascii_case("x11")) && !wayland_display
 }
 
 fn local_hostname() -> Option<String> {
@@ -538,20 +748,36 @@ fn local_hostname() -> Option<String> {
         .ok()
         .map(|hostname| hostname.trim().to_string())
         .filter(|hostname| !hostname.is_empty())
-        .or_else(|| std::env::var("HOSTNAME").ok().filter(|hostname| !hostname.is_empty()))
+        .or_else(|| {
+            std::env::var("HOSTNAME")
+                .ok()
+                .filter(|hostname| !hostname.is_empty())
+        })
 }
 
 fn client_machine_matches(claimed: &str, local: Option<&str>) -> bool {
     let claimed = claimed.trim();
     let Some(local) = local else {
-        return true;
+        return false;
     };
     if claimed.eq_ignore_ascii_case(local) {
         return true;
     }
-    let claimed_host = claimed.split('.').next().unwrap_or(claimed);
-    let local_host = local.split('.').next().unwrap_or(local);
-    !claimed_host.is_empty() && claimed_host.eq_ignore_ascii_case(local_host)
+    let local_short = local.split('.').next().unwrap_or(local);
+    if local_short.eq_ignore_ascii_case(claimed) {
+        return true;
+    }
+    let claimed_lower = claimed.to_ascii_lowercase();
+    let local_lower = local.to_ascii_lowercase();
+    let local_short_lower = local_short.to_ascii_lowercase();
+    if local.contains('.') {
+        claimed_lower == local_lower || claimed_lower == local_short_lower
+    } else {
+        claimed_lower == local_lower
+            || claimed_lower
+                .strip_suffix(&format!(".{local_lower}"))
+                .is_some_and(|prefix| !prefix.is_empty())
+    }
 }
 
 #[cfg(test)]
@@ -569,32 +795,43 @@ mod tests {
 
     #[test]
     fn normal_and_iconic_clients_are_eligible_even_when_unmapped() {
-        assert!(window_is_eligible(
-            MapState::UNMAPPED,
-            false,
-            Some(WM_STATE_NORMAL)
-        ));
-        assert!(window_is_eligible(
-            MapState::UNMAPPED,
-            false,
-            Some(WM_STATE_ICONIC)
-        ));
-        assert!(window_is_eligible(MapState::VIEWABLE, false, None));
-
-        assert!(!window_is_eligible(
-            MapState::VIEWABLE,
-            false,
-            Some(WM_STATE_WITHDRAWN)
-        ));
-        assert!(!window_is_eligible(MapState::UNMAPPED, false, None));
-        assert!(!window_is_eligible(MapState::UNVIEWABLE, false, None));
-        assert!(!window_is_eligible(MapState::VIEWABLE, true, None));
+        assert_eq!(
+            window_eligibility(MapState::UNMAPPED, false, Some(WM_STATE_NORMAL)),
+            WindowEligibility::Eligible
+        );
+        assert_eq!(
+            window_eligibility(MapState::UNMAPPED, false, Some(WM_STATE_ICONIC)),
+            WindowEligibility::Eligible
+        );
+        assert_eq!(
+            window_eligibility(MapState::VIEWABLE, false, None),
+            WindowEligibility::Eligible
+        );
+        assert_eq!(
+            window_eligibility(MapState::VIEWABLE, false, Some(WM_STATE_WITHDRAWN)),
+            WindowEligibility::Ineligible
+        );
+        assert_eq!(
+            window_eligibility(MapState::UNMAPPED, false, None),
+            WindowEligibility::Unknown
+        );
+        assert_eq!(
+            window_eligibility(MapState::UNVIEWABLE, false, None),
+            WindowEligibility::Unknown
+        );
+        assert_eq!(
+            window_eligibility(MapState::VIEWABLE, true, None),
+            WindowEligibility::Ineligible
+        );
     }
 
     #[test]
     fn wm_state_requires_the_full_two_cardinal_property() {
         assert_eq!(parse_wm_state(&[WM_STATE_NORMAL, 0]), Some(WM_STATE_NORMAL));
-        assert_eq!(parse_wm_state(&[WM_STATE_ICONIC, 42]), Some(WM_STATE_ICONIC));
+        assert_eq!(
+            parse_wm_state(&[WM_STATE_ICONIC, 42]),
+            Some(WM_STATE_ICONIC)
+        );
         assert_eq!(parse_wm_state(&[]), None);
         assert_eq!(parse_wm_state(&[WM_STATE_NORMAL]), None);
         assert_eq!(parse_wm_state(&[WM_STATE_NORMAL, 1, 2]), None);
@@ -609,20 +846,43 @@ mod tests {
     }
 
     #[test]
+    fn x_resource_client_base_maps_a_window_to_its_local_pid() {
+        let client_pids = ClientPids {
+            clients: vec![res::Client {
+                resource_base: 0x200000,
+                resource_mask: 0x1f_ffff,
+            }],
+            by_client: HashMap::from([(0x200000, 4242)]),
+        };
+        assert_eq!(client_pid_for_window(0x200123, &client_pids), Some(4242));
+        assert_eq!(client_pid_for_window(0x400123, &client_pids), None);
+    }
+
+    #[test]
     fn only_local_x11_displays_are_trusted() {
         assert!(local_display(":0"));
-        assert!(local_display("unix:0"));
+        assert!(local_display("unix/host:0"));
         assert!(local_display("localhost:10.0"));
         assert!(local_display("127.0.0.1:0"));
         assert!(local_display("[::1]:0"));
+        assert!(!local_display("stale:0"));
         assert!(!local_display("remote.example:0"));
     }
 
     #[test]
     fn client_machine_accepts_short_or_fqdn_local_names() {
+        assert!(client_machine_matches("HOST.example", Some("host.example")));
         assert!(client_machine_matches("host", Some("host.example")));
-        assert!(client_machine_matches("HOST.example", Some("host")));
+        assert!(!client_machine_matches("host.evil", Some("host")));
         assert!(!client_machine_matches("container", Some("host")));
-        assert!(client_machine_matches("elsewhere", None));
+        assert!(!client_machine_matches("elsewhere", None));
+    }
+
+    #[test]
+    fn complete_coverage_requires_positive_x11_session_evidence() {
+        assert!(x11_only_session(Some("x11"), false));
+        assert!(!x11_only_session(Some("wayland"), false));
+        assert!(!x11_only_session(None, false));
+        assert!(!x11_only_session(Some("x11"), true));
     }
 }
