@@ -1,5 +1,6 @@
 //! systemd services via `systemctl` (no dbus dependency; graceful fallback).
 
+use crate::actions::ServiceAction;
 use std::process::Command;
 use tm_core::error::{Result, TmError};
 use tm_core::model::{ServiceInfo, ServiceStatus};
@@ -89,27 +90,73 @@ fn map_status(active: &str, sub: &str) -> ServiceStatus {
     }
 }
 
-pub fn control_unit(unit: &str, action: super::super::actions::ServiceAction) -> Result<()> {
-    use super::super::actions::ServiceAction::*;
+pub(crate) fn control_unit_direct(unit: &str, action: ServiceAction) -> Result<()> {
+    use ServiceAction::*;
+    if let Err(error) = crate::linux_action_support::validate_service_unit(unit) {
+        return Err(TmError::platform("systemctl control service", error));
+    }
     let verb = match action {
         Start => "start",
         Stop => "stop",
         Restart => "restart",
     };
     let out = Command::new("systemctl")
+        .env("LC_ALL", "C")
+        .arg("--no-ask-password")
         .arg(verb)
         .arg(unit)
-        .status()
+        .output()
         .map_err(|e| TmError::platform("spawn systemctl", e.to_string()))?;
-    if out.success() {
+    if out.status.success() {
         tracing::info!(unit, verb, "systemd unit controlled");
         Ok(())
     } else {
-        Err(TmError::platform(
-            "systemctl",
-            format!("{verb} {unit} failed — need root?"),
-        ))
+        Err(control_failure(&out, verb, unit))
     }
+}
+
+fn control_failure(output: &std::process::Output, verb: &str, unit: &str) -> TmError {
+    let detail = first_line(&output.stderr)
+        .or_else(|| first_line(&output.stdout))
+        .unwrap_or_else(|| output.status.to_string());
+    let combined = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stderr),
+        String::from_utf8_lossy(&output.stdout)
+    );
+    if is_permission_failure(&combined) {
+        TmError::platform(
+            "systemctl control service",
+            format!("{verb} {unit} failed: {detail}; authentication is required"),
+        )
+    } else {
+        TmError::platform(
+            "systemctl control service",
+            format!("{verb} {unit} failed: {detail}"),
+        )
+    }
+}
+
+fn first_line(bytes: &[u8]) -> Option<String> {
+    bytes
+        .split(|byte| *byte == b'\n')
+        .map(|line| String::from_utf8_lossy(line).trim().to_string())
+        .find(|line| !line.is_empty())
+}
+
+fn is_permission_failure(detail: &str) -> bool {
+    let detail = detail.to_ascii_lowercase();
+    [
+        "access denied",
+        "permission denied",
+        "operation not permitted",
+        "interactive authentication required",
+        "authentication is required",
+        "not authorized",
+        "must be root",
+    ]
+    .iter()
+    .any(|needle| detail.contains(needle))
 }
 
 #[cfg(test)]
@@ -160,5 +207,27 @@ mod tests {
             err.to_string().contains("not been booted with systemd"),
             "{err}"
         );
+    }
+
+    #[test]
+    fn permission_failures_are_typed_for_the_polkit_fallback() {
+        let output = std::process::Output {
+            status: std::process::ExitStatus::from_raw(1 << 8),
+            stdout: Vec::new(),
+            stderr: b"Interactive authentication required.\n".to_vec(),
+        };
+        let error = control_failure(&output, "restart", "dbus.service");
+        assert!(super::super::polkit::is_permission_denied(&error));
+        assert!(error.to_string().contains("authentication is required"));
+        let later_line = std::process::Output {
+            status: std::process::ExitStatus::from_raw(1 << 8),
+            stdout: Vec::new(),
+            stderr: b"Failed to restart dbus.service.\nAccess denied\n".to_vec(),
+        };
+        let error = control_failure(&later_line, "restart", "dbus.service");
+        assert!(super::super::polkit::is_permission_denied(&error));
+        assert!(!is_permission_failure(
+            "Unit missing.service could not be found."
+        ));
     }
 }

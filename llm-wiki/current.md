@@ -1,6 +1,6 @@
 # Current State
 
-Last cross-checked: 2026-11-16
+Last cross-checked: 2026-11-23 (Linux privileged-action section)
 
 ## Summary
 
@@ -14,6 +14,8 @@ correctness, table interaction, Performance visuals, and advanced process
 diagnostics; remaining telemetry and accessibility work is itemized precisely
 in `known-debt.md`. Normal GUI startup remains unelevated; privileged controls
 can cross a protected, allowlisted service boundary after one explicit install.
+Linux instead uses an on-demand, typed `pkexec` helper and requires neither an
+installer nor a daemon.
 
 ## Row/total consistency (2026-10-21)
 
@@ -1360,6 +1362,26 @@ The window itself is now treated as a thing that can fail, not as a given:
   before releasing held buttons (no click), focus loss clears the held-button state, and
   the dump picker, the Run dialog's Browse and the shell verbs (`open file location`,
   `properties`, URLs) run on the action executor.
+
+## Linux privileged actions (2026-11-23, source-reviewed, not compiled here)
+
+- Linux service control and process kill/suspend/resume, priority and affinity
+  execute directly first. A clear `EPERM`/`EACCES` (or an equivalent systemctl
+  authorization failure) re-enters the same executable through `pkexec`; an
+  explicit denial is returned, not hidden by a second fallback.
+- The hidden `--linux-privileged-action=...` helper is handled before logging,
+  locale, settings and GUI startup. It accepts only typed service/process
+  fields, requires the sampled PID creation token before acting, validates
+  systemd unit names, refuses PID 1 and its own PID, and has no generic command
+  field or shell text.
+- The only privileged launch is the same-executable relaunch. Its argv entries
+  stay separate and only allowlisted desktop environment variables are
+  forwarded. General elevated Run-dialog execution is deliberately refused
+  rather than turning `pkexec` into a privileged shell runner.
+- Linux shell actions use direct `xdg-open` argv; Run parses argv without a
+  shell, creates a process group and reaps the child off the action lane.
+  `run_new_task_probe` remains non-launching on Linux; the Run dialog now calls
+  `run_new_task` so it can report a real spawn error.
 
 ## Routing
 

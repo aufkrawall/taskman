@@ -1,6 +1,6 @@
 # Repo Map (code map)
 
-Last cross-checked: 2026-10-26
+Last cross-checked: 2026-11-23 (Linux action modules)
 
 Primary sources:
 - workspace tree (verified against working tree)
@@ -182,11 +182,19 @@ platform boundary (`tm-core` ← `tm-platform` ← `tm-app` / `tm-service`), and
     chain, which is what a row without an icon of its own paints;
     platform-neutral so its tests run on the Windows host too).
     Linux/macOS backends exist and are built by default (`build.py`). The Linux
-    collector uses `linux/x11_windows.rs` for one EWMH connection per sample:
-    `_NET_CLIENT_LIST` and `_NET_CLIENT_LIST_STACKING` are merged, stale or
-    non-viewable windows are skipped, and `_NET_WM_PID` yields owner PIDs for
-    App classification. Native Wayland clients remain unobservable; XWayland
-    clients are the available X11 subset.
+    window observer uses a dedicated non-blocking `linux/x11_windows.rs`
+    thread: EWMH client lists are merged, X-Resource supplies local client
+    PIDs where available, machine-verified `_NET_WM_PID` is the fallback, and
+    only fresh complete observations may prove a process windowless. Native
+    Wayland clients remain unobservable; XWayland clients are the available
+    X11 subset.
+    Linux privileged execution adds `linux/polkit.rs` (direct-first escalation,
+    trusted `systemctl` execution through Polkit, and explicit fail-closed
+    portable-install behavior),
+    `linux/launch.rs` (process-group launch, trusted `pkexec` path checks),
+    `linux/shell.rs` (`xdg-open` file/location/URL actions), plus the
+    platform-neutral `linux_action_support.rs` parser/security contract and
+    `command_line.rs` shell-free Run tokenizer.
 - `crates/tm-app`
   - eframe GUI. `main.rs` (startup sequence: args → console only for CLI →
     early logging → hand a duplicate launch to the running instance → lazy

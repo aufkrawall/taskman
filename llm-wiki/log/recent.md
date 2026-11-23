@@ -62,6 +62,20 @@
 - Parser/delta and mapping tests were added, but this task's explicit no-build
   constraint meant they, the format gate and the release build were not run.
 
+## 2026-11-23 - Linux privileged actions and shell integration (review-corrected)
+
+- Linux service start/stop/restart keep the direct-first path and escalate only
+  after a real permission/authentication failure. Polkit now runs a trusted
+  `systemctl` executable, never the portable user-writable TaskMan image.
+- Privileged per-process mutations and elevated GUI relaunch fail closed in a
+  portable install because there is no protected helper image; direct
+  same-user actions still use pidfd/start-tick identity checks. The earlier
+  same-executable helper remains a root-only diagnostic path but is no longer
+  invoked through `pkexec`.
+- Linux Run remains shell-free with argv tokenization, process-group launch,
+  asynchronous reaping, and a non-launching probe. `xdg-open` remains the
+  non-shell file/location/link path.
+
 ## 2026-11-22 - Third-party review fixes (icons, identity, restore, diagnostics)
 
 - Fixed a release-abort in Linux icon decoding: 16-bit theme PNGs now decode

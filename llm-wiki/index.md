@@ -1,6 +1,6 @@
 # llm-wiki Index
 
-Last cross-checked: 2026-10-26 (thread/module evidence, protected rundown)
+Last cross-checked: 2026-11-23 (Linux privileged actions and current platform map)
 
 Primary sources:
 

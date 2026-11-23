@@ -480,12 +480,21 @@ impl PlatformActions for MacActions {
         cmd.stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
-        cmd.spawn()
+        let mut child = cmd
+            .spawn()
+            .map_err(|e| tm_core::TmError::platform("spawn", e.to_string()))?;
+        std::thread::Builder::new()
+            .name("tm-macos-run-reaper".into())
+            .spawn(move || {
+                let _ = child.wait();
+            })
             .map(|_| ())
-            .map_err(|e| tm_core::TmError::platform("spawn", e.to_string()))
+            .map_err(|e| tm_core::TmError::platform("spawn reaper", e.to_string()))
     }
-    fn run_new_task_probe(&self, command_line: &str, elevate: bool) -> Result<()> {
-        self.run_new_task(command_line, elevate)
+    fn run_new_task_probe(&self, _command_line: &str, _elevate: bool) -> Result<()> {
+        Err(tm_core::TmError::Unsupported(
+            "non-launching run probe on macOS",
+        ))
     }
     fn is_elevated(&self) -> bool {
         unsafe { libc::geteuid() == 0 }

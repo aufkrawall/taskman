@@ -3,7 +3,9 @@
 mod cpu_stat;
 mod diskstats;
 mod drm;
+mod launch;
 mod net_meta;
+pub mod polkit;
 mod process_connections;
 mod process_io;
 mod process_modules;
@@ -11,10 +13,12 @@ mod process_threads;
 mod process_tree;
 pub(crate) mod services;
 mod sessions;
+mod shell;
 mod startup;
 mod x11_windows;
 
 use crate::actions::*;
+use crate::linux_action_support::PrivilegedAction;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -478,8 +482,9 @@ fn leader_first(pid: u32, tids: impl IntoIterator<Item = u32>) -> Vec<u32> {
 
 /// Applies a per-thread call to every thread in `tids` (leader first). The
 /// leader's failure is the process's failure and leaves the other threads
-/// untouched; the rest are best effort, and a thread that exited between
-/// listing and the call (ESRCH) is not a miss.
+/// untouched. A thread that exited between listing and the call (ESRCH) is
+/// not a miss; any other failure is reported so a permission denial can
+/// trigger the privileged helper instead of being hidden.
 fn apply_to_threads(
     op: &'static str,
     tids: &[u32],
@@ -488,21 +493,40 @@ fn apply_to_threads(
     let Some((&leader, rest)) = tids.split_first() else {
         return Err(tm_core::TmError::platform(op, "no thread to update"));
     };
-    apply(leader).map_err(|e| tm_core::TmError::platform(op, e.to_string()))?;
-    let missed = rest
-        .iter()
-        .filter(|&&tid| apply(tid).is_err_and(|e| e.raw_os_error() != Some(libc::ESRCH)))
-        .count();
-    if missed > 0 {
+    apply(leader).map_err(|error| action_io_error(op, error))?;
+    let mut failed = 0usize;
+    let mut first_failure = None;
+    for &tid in rest {
+        match apply(tid) {
+            Ok(()) => {}
+            Err(error) if error.raw_os_error() == Some(libc::ESRCH) => {}
+            Err(error) => {
+                failed += 1;
+                first_failure.get_or_insert(error);
+            }
+        }
+    }
+    if let Some(error) = first_failure {
         tracing::warn!(
             pid = leader,
             op,
-            missed,
+            failed,
             threads = tids.len(),
             "process-wide change did not reach every thread"
         );
+        return Err(action_io_error(op, error));
     }
     Ok(())
+}
+
+fn action_io_error(context: &'static str, error: std::io::Error) -> tm_core::TmError {
+    if error.kind() == std::io::ErrorKind::PermissionDenied
+        || matches!(error.raw_os_error(), Some(libc::EPERM | libc::EACCES))
+    {
+        tm_core::TmError::platform(context, format!("permission denied: {error}"))
+    } else {
+        tm_core::TmError::platform(context, error.to_string())
+    }
 }
 
 fn cpu_topology() -> (usize, usize) {
@@ -737,7 +761,14 @@ impl PlatformActions for LinuxActions {
         services::list_systemd_units()
     }
     fn control_service(&self, name: &str, action: ServiceAction) -> Result<()> {
-        services::control_unit(name, action)
+        let direct = services::control_unit_direct(name, action);
+        polkit::direct_or_elevated(
+            direct,
+            PrivilegedAction::Service {
+                unit: name.to_string(),
+                action,
+            },
+        )
     }
     fn list_startup(&self) -> Result<Vec<StartupItem>> {
         Ok(startup::list_autostart())
@@ -775,7 +806,17 @@ impl PlatformActions for LinuxActions {
         expected_start_epoch_s: Option<i64>,
         tree: bool,
     ) -> Result<()> {
-        process_tree::kill_process(pid, expected_start_epoch_s, tree)
+        validate_mutation_target(pid)?;
+        let direct = process_tree::kill_process(pid, expected_start_epoch_s, tree);
+        match (expected_start_epoch_s, tree) {
+            (Some(start_ticks), false) => {
+                polkit::direct_or_elevated(direct, PrivilegedAction::Kill { pid, start_ticks })
+            }
+            // Portable builds cannot safely execute their user-writable image
+            // as root to reproduce the tree walk. Preserve the direct
+            // identity-checked result instead of killing only the root.
+            _ => direct,
+        }
     }
     fn suspend_process_checked(
         &self,
@@ -783,15 +824,22 @@ impl PlatformActions for LinuxActions {
         expected_start_epoch_s: Option<i64>,
         suspend: bool,
     ) -> Result<()> {
-        send_signal_checked(
-            pid,
-            expected_start_epoch_s,
-            if suspend {
-                libc::SIGSTOP
-            } else {
-                libc::SIGCONT
-            },
-        )
+        validate_mutation_target(pid)?;
+        let signal = if suspend {
+            libc::SIGSTOP
+        } else {
+            libc::SIGCONT
+        };
+        let direct = send_signal_checked(pid, expected_start_epoch_s, signal);
+        match (expected_start_epoch_s, suspend) {
+            (Some(start_ticks), true) => {
+                polkit::direct_or_elevated(direct, PrivilegedAction::Suspend { pid, start_ticks })
+            }
+            (Some(start_ticks), false) => {
+                polkit::direct_or_elevated(direct, PrivilegedAction::Resume { pid, start_ticks })
+            }
+            (None, _) => direct,
+        }
     }
     fn set_priority_checked(
         &self,
@@ -799,23 +847,19 @@ impl PlatformActions for LinuxActions {
         expected_start_epoch_s: Option<i64>,
         priority: PriorityClass,
     ) -> Result<()> {
-        verify_process_identity(pid, expected_start_epoch_s)?;
-        let Some(nice) = nice_for_priority(priority) else {
-            return Err(tm_core::TmError::platform(
-                "setpriority",
-                "an explicit priority class is required",
-            ));
-        };
-        let tids = process_tids(pid);
-        verify_process_identity(pid, expected_start_epoch_s)?;
-        apply_to_threads("setpriority", &tids, |tid| {
-            let rc = unsafe { libc::setpriority(libc::PRIO_PROCESS, tid, nice) };
-            if rc == 0 {
-                Ok(())
-            } else {
-                Err(std::io::Error::last_os_error())
-            }
-        })
+        validate_mutation_target(pid)?;
+        let direct = set_priority_direct(pid, expected_start_epoch_s, priority);
+        match expected_start_epoch_s {
+            Some(start_ticks) => polkit::direct_or_elevated(
+                direct,
+                PrivilegedAction::SetPriority {
+                    pid,
+                    start_ticks,
+                    priority,
+                },
+            ),
+            None => direct,
+        }
     }
     fn get_affinity_mask_checked(
         &self,
@@ -828,7 +872,10 @@ impl PlatformActions for LinuxActions {
             if libc::sched_getaffinity(pid as i32, std::mem::size_of::<libc::cpu_set_t>(), &mut set)
                 != 0
             {
-                return Err(tm_core::TmError::platform("sched_getaffinity", "failed"));
+                return Err(action_io_error(
+                    "sched_getaffinity",
+                    std::io::Error::last_os_error(),
+                ));
             }
             let mut mask = 0u64;
             for cpu in 0usize..64 {
@@ -848,74 +895,45 @@ impl PlatformActions for LinuxActions {
         expected_start_epoch_s: Option<i64>,
         mask: u64,
     ) -> Result<()> {
-        verify_process_identity(pid, expected_start_epoch_s)?;
-        let set = unsafe {
-            let mut set: libc::cpu_set_t = std::mem::zeroed();
-            libc::CPU_ZERO(&mut set);
-            for cpu in 0usize..64 {
-                if mask & (1u64 << cpu) != 0 {
-                    libc::CPU_SET(cpu, &mut set);
-                }
-            }
-            set
-        };
-        let tids = process_tids(pid);
-        verify_process_identity(pid, expected_start_epoch_s)?;
-        apply_to_threads("sched_setaffinity", &tids, |tid| {
-            let rc = unsafe {
-                libc::sched_setaffinity(
-                    tid as libc::pid_t,
-                    std::mem::size_of::<libc::cpu_set_t>(),
-                    &set,
-                )
-            };
-            if rc == 0 {
-                Ok(())
-            } else {
-                Err(std::io::Error::last_os_error())
-            }
-        })
+        validate_mutation_target(pid)?;
+        let direct = set_affinity_direct(pid, expected_start_epoch_s, mask);
+        match expected_start_epoch_s {
+            Some(start_ticks) => polkit::direct_or_elevated(
+                direct,
+                PrivilegedAction::SetAffinity {
+                    pid,
+                    start_ticks,
+                    mask,
+                },
+            ),
+            None => direct,
+        }
     }
 
     fn run_new_task(&self, command_line: &str, elevate: bool) -> Result<()> {
-        use std::process::{Command, Stdio};
-        if elevate {
-            return Err(tm_core::TmError::Unsupported(
-                "elevated arbitrary task launch",
-            ));
-        }
-        let argv = crate::command_line::split(command_line).map_err(|error| {
-            tm_core::TmError::platform("run new task", format!("invalid command line: {error}"))
-        })?;
-        let Some((program, arguments)) = argv.split_first() else {
-            return Err(tm_core::TmError::platform("run new task", "empty command"));
-        };
-        let mut cmd = Command::new(program);
-        cmd.args(arguments);
-        cmd.stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
-        let mut child = cmd
-            .spawn()
-            .map_err(|e| tm_core::TmError::platform("spawn", e.to_string()))?;
-        if let Err(error) = std::thread::Builder::new()
-            .name("tm-linux-run-reaper".into())
-            .spawn(move || {
-                let _ = child.wait();
-            })
-        {
-            // The program was launched successfully; failing the user action
-            // now would be false. A persistent GUI has nothing to reap while
-            // it runs, and the process exits normally on this rare path.
-            tracing::warn!(%error, "could not start the Run child reaper");
-        }
-        Ok(())
+        polkit::run_new_task(command_line, elevate)
     }
-    fn run_new_task_probe(&self, command_line: &str, elevate: bool) -> Result<()> {
-        self.run_new_task(command_line, elevate)
-    }
+
+    // Deliberately no `run_new_task_probe` override: that contract is
+    // non-launching on Linux. The Run dialog uses `run_new_task` above.
     fn is_elevated(&self) -> bool {
-        unsafe { libc::geteuid() == 0 }
+        polkit::is_elevated()
+    }
+
+    fn relaunch_elevated(&self) -> Result<()> {
+        polkit::relaunch_elevated()
+    }
+
+    fn open_file_location(&self, path: &str) -> Result<()> {
+        shell::open_file_location(path)
+    }
+
+    fn open_properties(&self, path: &str) -> Result<()> {
+        shell::open_properties(path)
+    }
+
+    fn open_url(&self, url: &str) -> Result<()> {
+        shell::open_url(url)
     }
 
     fn list_process_modules(
@@ -973,6 +991,60 @@ impl PlatformActions for LinuxActions {
     }
 }
 
+fn set_priority_direct(
+    pid: u32,
+    expected_start_epoch_s: Option<i64>,
+    priority: PriorityClass,
+) -> Result<()> {
+    verify_process_identity(pid, expected_start_epoch_s)?;
+    let Some(nice) = nice_for_priority(priority) else {
+        return Err(tm_core::TmError::platform(
+            "setpriority",
+            "an explicit priority class is required",
+        ));
+    };
+    let tids = process_tids(pid);
+    verify_process_identity(pid, expected_start_epoch_s)?;
+    apply_to_threads("setpriority", &tids, |tid| {
+        let rc = unsafe { libc::setpriority(libc::PRIO_PROCESS, tid, nice) };
+        if rc == 0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::last_os_error())
+        }
+    })
+}
+
+fn set_affinity_direct(pid: u32, expected_start_epoch_s: Option<i64>, mask: u64) -> Result<()> {
+    verify_process_identity(pid, expected_start_epoch_s)?;
+    let set = unsafe {
+        let mut set: libc::cpu_set_t = std::mem::zeroed();
+        libc::CPU_ZERO(&mut set);
+        for cpu in 0usize..64 {
+            if mask & (1u64 << cpu) != 0 {
+                libc::CPU_SET(cpu, &mut set);
+            }
+        }
+        set
+    };
+    let tids = process_tids(pid);
+    verify_process_identity(pid, expected_start_epoch_s)?;
+    apply_to_threads("sched_setaffinity", &tids, |tid| {
+        let rc = unsafe {
+            libc::sched_setaffinity(
+                tid as libc::pid_t,
+                std::mem::size_of::<libc::cpu_set_t>(),
+                &set,
+            )
+        };
+        if rc == 0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::last_os_error())
+        }
+    })
+}
+
 fn send_signal(pid: u32, sig: i32) -> Result<()> {
     let Ok(pid_t) = libc::pid_t::try_from(pid) else {
         return Err(tm_core::TmError::ProcessNotFound { pid });
@@ -980,14 +1052,24 @@ fn send_signal(pid: u32, sig: i32) -> Result<()> {
     let rc = unsafe { libc::kill(pid_t, sig) };
     if rc == 0 {
         Ok(())
-    } else if std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
-        Err(tm_core::TmError::ProcessNotFound { pid })
     } else {
-        Err(tm_core::TmError::platform(
-            "kill",
-            format!("signal {sig} failed"),
-        ))
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::ESRCH) {
+            Err(tm_core::TmError::ProcessNotFound { pid })
+        } else {
+            Err(action_io_error("kill", error))
+        }
     }
+}
+
+fn validate_mutation_target(pid: u32) -> Result<()> {
+    if pid <= 1 || pid == std::process::id() {
+        return Err(tm_core::TmError::platform(
+            "process mutation",
+            format!("pid {pid} is TaskMan itself or the init process"),
+        ));
+    }
+    Ok(())
 }
 
 pub(super) fn send_signal_checked(
@@ -1032,12 +1114,10 @@ pub(super) fn send_signal_checked(
         if rc == 0 {
             return Ok(());
         }
-        return match std::io::Error::last_os_error().raw_os_error() {
+        let error = std::io::Error::last_os_error();
+        return match error.raw_os_error() {
             Some(libc::ESRCH) => Err(tm_core::TmError::ProcessNotFound { pid }),
-            Some(libc::EPERM) => Err(tm_core::TmError::platform(
-                "pidfd_send_signal",
-                "insufficient privileges to signal process",
-            )),
+            Some(libc::EPERM | libc::EACCES) => Err(action_io_error("pidfd_send_signal", error)),
             _ => Err(tm_core::TmError::platform(
                 "pidfd_send_signal",
                 format!("signal {sig} failed"),
@@ -1049,7 +1129,7 @@ pub(super) fn send_signal_checked(
         Some(libc::ESRCH) => Err(tm_core::TmError::ProcessNotFound { pid }),
         // Old kernels (< 5.1) or restrictive seccomp profiles may block pidfd_open:
         // verify start time against /proc before falling back to kill(2).
-        Some(libc::ENOSYS | libc::EPERM) => {
+        Some(libc::ENOSYS | libc::EPERM | libc::EACCES) => {
             verify_process_identity(pid, Some(expected))?;
             send_signal(pid, sig)
         }
@@ -1183,6 +1263,11 @@ pub fn create_collector() -> LinuxCollector {
 
 pub fn create_actions() -> LinuxActions {
     LinuxActions
+}
+
+/// Whether this Linux process has effective uid 0.
+pub fn is_elevated() -> bool {
+    polkit::is_elevated()
 }
 
 #[cfg(test)]

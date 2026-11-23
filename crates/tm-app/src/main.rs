@@ -127,6 +127,15 @@ impl StartupTrace {
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
 
+    // Short-lived privileged helper for Linux service/process actions and
+    // the validated same-executable relaunch. Handle it before logging,
+    // locale, settings or any renderer initialization so pkexec never
+    // flashes the GUI.
+    #[cfg(target_os = "linux")]
+    if let Some(code) = tm_platform::linux::polkit::handle_helper(&args) {
+        std::process::exit(code);
+    }
+
     // Short-lived elevated helper for the HKLM IFEO integration. Handle this
     // before GUI/logging startup so a UAC helper never flashes the app window.
     #[cfg(target_os = "windows")]
