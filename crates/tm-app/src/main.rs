@@ -728,14 +728,14 @@ fn mode_for_renderer(renderer: eframe::Renderer) -> RenderMode {
 /// Sub-pixel atlas coverage is only safe when the active backend can blend each channel
 /// independently. The software painter can; WGPU can only after its device actually
 /// enabled dual-source blending; Glow and unsupported WGPU fail closed to grayscale.
-fn renderer_supports_subpixel(renderer: eframe::Renderer, wgpu_dual_source: bool) -> bool {
+fn renderer_supports_subpixel(_renderer: eframe::Renderer, _wgpu_dual_source: bool) -> bool {
     #[cfg(feature = "software")]
-    if matches!(renderer, eframe::Renderer::Software) {
+    if matches!(_renderer, eframe::Renderer::Software) {
         return true;
     }
     #[cfg(feature = "wgpu")]
-    if matches!(renderer, eframe::Renderer::Wgpu) {
-        return wgpu_dual_source;
+    if matches!(_renderer, eframe::Renderer::Wgpu) {
+        return _wgpu_dual_source;
     }
     false
 }

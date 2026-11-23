@@ -1,6 +1,6 @@
 //! Derived from eframe's `glow_integration.rs`.
 //!
-//! UPSTREAM_BASE: 05297424601afdf5966e5e01c8c63eef2696df54 (tag 0.36.1)
+//! `UPSTREAM_BASE`: 05297424601afdf5966e5e01c8c63eef2696df54 (tag 0.36.1)
 //!
 //! When rebasing the fork onto a new upstream tag, diff `glow_integration.rs` between
 //! `UPSTREAM_BASE` and the new tag and port anything relevant here by hand, then update
@@ -264,8 +264,10 @@ mod platform_surface {
         fn new(width: NonZeroU32, height: NonZeroU32) -> Result<Self, String> {
             let w_u32 = width.get();
             let h_u32 = height.get();
-            let w_i32 = i32::try_from(w_u32).map_err(|_| "width out of i32 range".to_owned())?;
-            let h_i32 = i32::try_from(h_u32).map_err(|_| "height out of i32 range".to_owned())?;
+            let w_i32 =
+                i32::try_from(w_u32).map_err(|_error| "width out of i32 range".to_owned())?;
+            let h_i32 =
+                i32::try_from(h_u32).map_err(|_error| "height out of i32 range".to_owned())?;
             let len = (w_u32 as usize)
                 .checked_mul(h_u32 as usize)
                 .filter(|&n| n > 0 && n <= MAX_BUFFER_PIXELS)
@@ -959,6 +961,7 @@ impl SoftwareWinitRunning<'_> {
         }
     }
 
+    #[expect(clippy::unnecessary_wraps)]
     fn run_ui_and_paint(&mut self, event_loop: &ActiveEventLoop) -> Result<EventResult> {
         profiling::function_scope!();
         profiling::finish_frame!();
@@ -1095,10 +1098,10 @@ impl SoftwareWinitRunning<'_> {
             || self.info.occluded == Some(true);
         let paintable = size.width > 0 && size.height > 0 && (!hidden || !self.has_presented_once);
 
+        if hidden {
+            self.presented_while_visible = false;
+        }
         if paintable {
-            if hidden {
-                self.presented_while_visible = false;
-            }
             // Sub-pixel mode *and* its blend parameters both come from the atlas's
             // options, so the way glyphs were rasterized and the way they are blended
             // cannot disagree.
@@ -1133,7 +1136,7 @@ impl SoftwareWinitRunning<'_> {
                 let mut state = self.surface.borrow_mut();
                 let os_dirty = if hidden { None } else { state.os_update_rect() };
                 if let Err(err) = state.resize(w, h) {
-                    log::warn!("software renderer resize({}x{}) failed: {err}", w, h);
+                    log::warn!("software renderer resize({w}x{h}) failed: {err}");
                     self.presented_while_visible = false;
                     self.integration
                         .egui_ctx

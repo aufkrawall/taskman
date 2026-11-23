@@ -231,7 +231,7 @@ fn bounded_validation_error(
         std::task::Poll::Ready(error) => return Ok(error),
         std::task::Poll::Pending => {}
     }
-    device.poll(wgpu::PollType::Poll).map_err(|_| ())?;
+    device.poll(wgpu::PollType::Poll).map_err(|_error| ())?;
     match error.as_mut().poll(&mut context) {
         std::task::Poll::Ready(error) => return Ok(error),
         std::task::Poll::Pending => {}
@@ -241,7 +241,7 @@ fn bounded_validation_error(
             submission_index: None,
             timeout: Some(std::time::Duration::from_millis(250)),
         })
-        .map_err(|_| ())?;
+        .map_err(|_error| ())?;
     match error.as_mut().poll(&mut context) {
         std::task::Poll::Ready(error) => Ok(error),
         std::task::Poll::Pending => Err(()),
@@ -266,6 +266,7 @@ fn font_subpixel_after(was: bool, delta: &epaint::ImageDelta) -> bool {
         .any(epaint::text::subpixel::is_lcd_texel)
 }
 
+#[expect(clippy::fn_params_excessive_bools)]
 fn use_lcd_pipeline(
     texture_id: epaint::TextureId,
     all_white_uv: bool,
@@ -445,6 +446,7 @@ impl Renderer {
     ///
     /// `output_color_format` should preferably be [`wgpu::TextureFormat::Rgba8Unorm`] or
     /// [`wgpu::TextureFormat::Bgra8Unorm`], i.e. in gamma-space.
+    #[expect(clippy::single_match_else)]
     pub fn new(
         device: &wgpu::Device,
         output_color_format: wgpu::TextureFormat,

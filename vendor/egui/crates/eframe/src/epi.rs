@@ -649,7 +649,7 @@ pub enum Renderer {
     /// TASKMAN-FORK: paint on the CPU with `egui_software`, present with `softbuffer`.
     ///
     /// No GPU, no driver, no shader compiler -- and the only backend that can do
-    /// sub-pixel (ClearType) text, which needs per-channel alpha blending.
+    /// sub-pixel (`ClearType`) text, which needs per-channel alpha blending.
     #[cfg(feature = "software")]
     Software,
 

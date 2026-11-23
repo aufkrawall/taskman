@@ -602,7 +602,8 @@ mod tests {
                 assert!(blit_quad(&mut target, full_clip(2, 2), &q, &atlas, blend));
                 buf[0]
             };
-            let channels = |pixel| ((pixel >> 16) & 0xff) + ((pixel >> 8) & 0xff) + (pixel & 0xff);
+            let channels =
+                |pixel| ((pixel >> 16) & 0xff_u32) + ((pixel >> 8) & 0xff_u32) + (pixel & 0xff_u32);
             assert!(
                 channels(render(0.5)) > channels(render(0.0)),
                 "LCD coverage {coverage:?} must receive the contrast boost"

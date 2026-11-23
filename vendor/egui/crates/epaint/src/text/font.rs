@@ -969,6 +969,7 @@ pub(super) fn is_cjk(c: char) -> bool {
     is_cjk_ideograph(c) || is_kana(c)
 }
 
+#[expect(clippy::items_after_test_module)]
 #[cfg(test)]
 mod tests {
     use super::lcd_texel;
@@ -976,19 +977,19 @@ mod tests {
     #[test]
     fn lcd_texels_use_zero_alpha_as_the_subpixel_tag() {
         let [r, g, b, a] = lcd_texel([255, 128, 0]).to_array();
-        assert_eq!((r, g, b, a), (255, 128, 0, 0));
+        assert_eq!([r, g, b, a], [255, 128, 0, 0]);
         assert!(crate::text::subpixel::is_lcd_texel(lcd_texel([
             255, 128, 0
         ])));
 
         let [r, g, b, a] = lcd_texel([128, 128, 128]).to_array();
-        assert_eq!((r, g, b, a), (128, 128, 128, 0));
+        assert_eq!([r, g, b, a], [128, 128, 128, 0]);
         assert!(crate::text::subpixel::is_lcd_texel(lcd_texel([
             128, 128, 128
         ])));
 
         let [r, g, b, a] = lcd_texel([255, 255, 255]).to_array();
-        assert_eq!((r, g, b, a), (255, 255, 255, 0));
+        assert_eq!([r, g, b, a], [255, 255, 255, 0]);
         assert!(crate::text::subpixel::is_lcd_texel(lcd_texel([
             255, 255, 255
         ])));

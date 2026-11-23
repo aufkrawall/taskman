@@ -5,7 +5,7 @@ use egui::{
 };
 
 /// A popup is painted on a separate layer. Scroll requests from that layer must
-/// not be consumed by a ScrollArea whose content closure happens to be building
+/// not be consumed by a `ScrollArea` whose content closure happens to be building
 /// the popup, or opening a row context menu moves the list underneath it.
 #[test]
 fn popup_scroll_target_does_not_escape_to_parent_scroll_area() {

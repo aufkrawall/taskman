@@ -109,7 +109,8 @@ fn is_unix_userspace_infrastructure(name_lower: &str) -> bool {
 }
 
 fn matches_core(name_lower: &str) -> bool {
-    is_unix_kernel_name(name_lower)
+    is_kernel_name(name_lower)
+        || is_unix_kernel_name(name_lower)
         || is_windows_core_image(name_lower)
         || is_unix_userspace_infrastructure(name_lower)
 }

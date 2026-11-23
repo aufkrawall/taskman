@@ -17,7 +17,9 @@ const TRUSTED_FC_MATCH_PATHS: &[&str] = &[
     "/run/current-system/sw/bin/fc-match",
     "/nix/var/nix/profiles/default/bin/fc-match",
 ];
+#[cfg(target_os = "linux")]
 const FC_MATCH_DEADLINE: std::time::Duration = std::time::Duration::from_millis(750);
+#[cfg(target_os = "linux")]
 const FC_MATCH_OUTPUT_LIMIT: usize = 64 * 1024;
 
 #[derive(Clone, Copy, Debug)]
@@ -269,8 +271,6 @@ fn capture_to_deadline<R: std::os::fd::AsRawFd>(
     deadline: std::time::Instant,
     output_limit: usize,
 ) -> Option<Vec<u8>> {
-    use std::os::fd::AsRawFd as _;
-
     let fd = reader.as_raw_fd();
     let mut output = Vec::new();
     loop {

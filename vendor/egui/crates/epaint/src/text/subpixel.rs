@@ -51,6 +51,7 @@
 /// premultiplied colour produces rainbow-tinted text, so the choice must be gated on the
 /// active renderer.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
 pub enum SubpixelMode {
     /// Grayscale coverage; every backend understands it.
     #[default]
@@ -97,6 +98,7 @@ impl SubpixelMode {
 /// Five taps span 5/3 of a pixel, so a stem's energy reaches at most one pixel either
 /// side. Longer filters suppress colour further but visibly blur; shorter ones fringe.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
 pub struct LcdFilter(pub [u16; 5]);
 
 impl LcdFilter {
