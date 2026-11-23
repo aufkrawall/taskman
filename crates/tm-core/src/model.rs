@@ -411,6 +411,9 @@ pub enum ProcCategory {
     App,
     Background,
     System,
+    /// Window ownership could not be observed, so the process cannot be
+    /// classified as an App or Background process without inventing evidence.
+    Unknown,
 }
 
 impl ProcCategory {
@@ -419,6 +422,7 @@ impl ProcCategory {
             ProcCategory::App => "Apps",
             ProcCategory::Background => "Background",
             ProcCategory::System => "System",
+            ProcCategory::Unknown => "Unknown",
         }
     }
 
@@ -428,6 +432,7 @@ impl ProcCategory {
             ProcCategory::App => 0,
             ProcCategory::Background => 1,
             ProcCategory::System => 2,
+            ProcCategory::Unknown => 3,
         }
     }
 }

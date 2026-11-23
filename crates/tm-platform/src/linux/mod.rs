@@ -29,6 +29,7 @@ pub struct LinuxCollector {
     /// L1/L2/L3 totals in KB; cache geometry is static, so the sysfs walk
     /// over every CPU runs once instead of every tick.
     cache_kb: [u64; 3],
+    window_observer: x11_windows::WindowObserver,
 }
 
 impl SystemCollector for LinuxCollector {
@@ -89,7 +90,7 @@ impl SystemCollector for LinuxCollector {
         // usable. Native Wayland clients have no portable equivalent, so a
         // Wayland session observes at most its XWayland clients; it never
         // invents owners for the remainder.
-        let window_owners = x11_windows::window_owner_pids();
+        let window_observation = self.window_observer.observe();
 
         let n_procs = self
             .sys
@@ -116,7 +117,19 @@ impl SystemCollector for LinuxCollector {
             let pid_u = pid.as_u32();
             let name = p.name().to_string_lossy().into_owned();
 
-            let has_window = window_owners.contains(&pid_u);
+            let boot_start_ticks = before_refresh
+                .get(&pid_u)
+                .copied()
+                .filter(|&before| linux_proc_start_ticks(pid_u) == Some(before));
+            let has_window = if window_observation.owners.contains(&pid_u) {
+                Some(true)
+            } else if window_observation.coverage == x11_windows::WindowCoverage::Complete
+                && boot_start_ticks.is_some()
+            {
+                Some(false)
+            } else {
+                None
+            };
             let category = classify::classify(classify::ClassifyInput {
                 pid: pid_u,
                 name: &name,
@@ -135,10 +148,7 @@ impl SystemCollector for LinuxCollector {
             entry.working_set_bytes = Some(p.memory());
             entry.commit_bytes = Some(p.virtual_memory());
             entry.peak_mem_bytes = proc_status_kb(pid_u, "VmHWM");
-            entry.boot_start_ticks = before_refresh
-                .get(&pid_u)
-                .copied()
-                .filter(|&before| linux_proc_start_ticks(pid_u) == Some(before));
+            entry.boot_start_ticks = boot_start_ticks;
             entry.start_epoch_s =
                 entry
                     .boot_start_ticks
@@ -151,7 +161,7 @@ impl SystemCollector for LinuxCollector {
             entry.disk_write_bps = du.written_bytes as f64 / interval_s;
             entry.disk_read_total = du.total_read_bytes;
             entry.disk_write_total = du.total_written_bytes;
-            entry.has_window = has_window;
+            entry.has_window = has_window == Some(true);
             entry.exe_path = p.exe().map(|e| e.to_path_buf());
             entry.user = p
                 .user_id()
@@ -1254,6 +1264,7 @@ pub fn create_collector() -> LinuxCollector {
         last_tick: None,
         first_tick_done: false,
         cache_kb: cache_totals_kb(&read_cache_indexes()),
+        window_observer: x11_windows::WindowObserver::default(),
     }
 }
 

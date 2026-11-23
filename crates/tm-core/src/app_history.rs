@@ -84,7 +84,8 @@ fn history_eligible(category: ProcCategory, windows: bool) -> bool {
     // Windows has a real visible-window App classification. The Unix
     // collectors cannot establish that boundary (in particular on Wayland),
     // so keep non-system process history useful instead of leaving it empty.
-    category == ProcCategory::App || (!windows && category == ProcCategory::Background)
+    category == ProcCategory::App
+        || (!windows && matches!(category, ProcCategory::Background | ProcCategory::Unknown))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -668,8 +669,10 @@ mod tests {
     fn unix_history_includes_background_processes_but_excludes_system_processes() {
         assert!(history_eligible(ProcCategory::Background, false));
         assert!(history_eligible(ProcCategory::App, false));
+        assert!(history_eligible(ProcCategory::Unknown, false));
         assert!(!history_eligible(ProcCategory::System, false));
         assert!(!history_eligible(ProcCategory::Background, true));
+        assert!(!history_eligible(ProcCategory::Unknown, true));
     }
 
     #[test]

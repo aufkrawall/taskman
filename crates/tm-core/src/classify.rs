@@ -96,7 +96,10 @@ pub fn is_core_os_image(name: &str) -> bool {
 pub struct ClassifyInput<'a> {
     pub pid: u32,
     pub name: &'a str,
-    pub has_window: bool,
+    /// Window ownership when the platform could observe it. `None` means the
+    /// platform cannot answer for this process; it must not become a negative
+    /// "no window" fact.
+    pub has_window: Option<bool>,
     /// Windows `IsProcessCritical`. `None` when it could not be queried;
     /// unknown must never be read as "critical".
     pub critical: Option<bool>,
@@ -123,11 +126,11 @@ pub fn classify(input: ClassifyInput<'_>) -> ProcCategory {
         return ProcCategory::System;
     }
 
-    if input.has_window {
-        return ProcCategory::App;
+    match input.has_window {
+        Some(true) => ProcCategory::App,
+        Some(false) => ProcCategory::Background,
+        None => ProcCategory::Unknown,
     }
-
-    ProcCategory::Background
 }
 
 #[cfg(test)]
@@ -144,7 +147,7 @@ mod tests {
         classify(ClassifyInput {
             pid,
             name,
-            has_window,
+            has_window: Some(has_window),
             critical,
             windows_owned,
         })
@@ -209,6 +212,20 @@ mod tests {
         assert_eq!(
             classify_win(3000, "vendor-protector.exe", false, None, Some(false)),
             ProcCategory::Background
+        );
+    }
+
+    #[test]
+    fn unknown_window_ownership_is_not_a_negative_window_fact() {
+        assert_eq!(
+            classify(ClassifyInput {
+                pid: 3000,
+                name: "app",
+                has_window: None,
+                critical: None,
+                windows_owned: None,
+            }),
+            ProcCategory::Unknown
         );
     }
 

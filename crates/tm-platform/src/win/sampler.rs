@@ -2492,7 +2492,7 @@ fn refine_categories_and_group_apps(processes: &mut [ProcessEntry]) {
         p.category = classify::classify(classify::ClassifyInput {
             pid: p.pid,
             name: &name,
-            has_window: p.has_window,
+            has_window: Some(p.has_window),
             critical: p.critical,
             windows_owned,
         });

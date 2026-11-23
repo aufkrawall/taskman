@@ -71,8 +71,8 @@ fn columns(value_order: &[usize]) -> Vec<TmColumn> {
 #[derive(Debug, Clone)]
 #[allow(clippy::large_enum_variant)]
 pub enum DisplayRow {
-    /// Group index (0=Apps 1=Background 2=Windows) + the native-style group
-    /// count, computed before flattening so expansion state cannot change it.
+    /// Group index (0=Apps 1=Background 2=System 3=Unknown) + the group count,
+    /// computed before flattening so expansion state cannot change it.
     GroupHeader(u8, usize),
     Process(RowData),
 }
@@ -133,8 +133,8 @@ pub struct State {
     pub expanded: HashSet<u32>,
     /// Expanded user rows (Benutzer tab reuses the same state).
     pub expanded_users: HashSet<u32>,
-    /// Collapsed group headers [Apps, Background, Windows].
-    pub group_collapsed: [bool; 3],
+    /// Collapsed group headers [Apps, Background, System, Unknown].
+    pub group_collapsed: [bool; 4],
     /// Process selected by keyboard type-navigation and waiting to be scrolled
     /// into the virtualized visible range.
     scroll_to_pid: Option<u32>,
@@ -957,6 +957,7 @@ fn group_header(
     let label = match gi {
         0 => i18n::tr(K::GroupApps),
         1 => i18n::tr(K::GroupBackground),
+        3 => i18n::tr(K::GroupUnknown),
         // The third group is Windows' OS infrastructure; calling it "Windows
         // processes" on Linux reads wrong, so use the neutral name there.
         _ if cfg!(target_os = "windows") => i18n::tr(K::GroupWindows),
@@ -975,7 +976,13 @@ fn group_header(
     crate::icons::draw_at(
         ui,
         caret_rect,
-        if app.processes_state.group_collapsed[gi as usize] {
+        if app
+            .processes_state
+            .group_collapsed
+            .get(gi as usize)
+            .copied()
+            .unwrap_or(false)
+        {
             Icon::ChevronRight
         } else {
             Icon::ChevronDown
@@ -1667,7 +1674,7 @@ fn build_display_rows(
     sort_col: usize,
     ascending: bool,
     expanded: &HashSet<u32>,
-    group_collapsed: &[bool; 3],
+    group_collapsed: &[bool],
 ) -> Vec<DisplayRow> {
     let q = search::Query::new(raw_search);
     // The sampler hands us sysinfo's hash-map order, which is not stable
@@ -1704,17 +1711,21 @@ fn build_display_rows(
     }
 
     let all_by_pid: HashMap<u32, &ProcessEntry> = all.iter().copied().map(|p| (p.pid, p)).collect();
-    for gi in 0..3u8 {
+    for gi in 0..4u8 {
         let cat = match gi {
             0 => ProcCategory::App,
             1 => ProcCategory::Background,
-            _ => ProcCategory::System,
+            2 => ProcCategory::System,
+            _ => ProcCategory::Unknown,
         };
         let members: Vec<&ProcessEntry> = all
             .iter()
             .copied()
             .filter(|p| grouping.category.get(&p.pid).copied().unwrap_or(p.category) == cat)
             .collect();
+        if cat == ProcCategory::Unknown && members.is_empty() {
+            continue;
+        }
         let children = display_children_map(&members, &grouping.category, &grouping.app_roots);
         let roots = tree_roots(&members, &children);
         // Native Task Manager's "Apps (N)" counts top-level app groups, while
@@ -1733,7 +1744,7 @@ fn build_display_rows(
         // list.
         if sort_col < FIXED_COLS {
             out.push(DisplayRow::GroupHeader(gi, total));
-            if group_collapsed[gi as usize] {
+            if group_collapsed.get(gi as usize).copied().unwrap_or(false) {
                 continue;
             }
         }
@@ -2116,6 +2127,8 @@ fn derive_display_groups(all: &[&ProcessEntry]) -> DisplayGroups {
                 p.pid,
                 if system {
                     ProcCategory::System
+                } else if p.category == ProcCategory::Unknown {
+                    ProcCategory::Unknown
                 } else {
                     ProcCategory::Background
                 },
@@ -3016,6 +3029,31 @@ mod tests {
             ),
             (Some(1), Some(1), Some(1))
         );
+    }
+
+    #[test]
+    fn unknown_window_ownership_has_its_own_group() {
+        let snap = snap_of(vec![
+            proc(1, None, "app", ProcCategory::App),
+            proc(2, None, "unknown", ProcCategory::Unknown),
+            proc(3, None, "system", ProcCategory::System),
+        ]);
+        let rows = build_display_rows(
+            &snap,
+            "",
+            0,
+            true,
+            &HashSet::new(),
+            &[false; 4],
+        );
+        let headers: Vec<(u8, usize)> = rows
+            .iter()
+            .filter_map(|row| match row {
+                DisplayRow::GroupHeader(group, count) => Some((*group, *count)),
+                DisplayRow::Process(_) => None,
+            })
+            .collect();
+        assert_eq!(headers, vec![(0, 1), (1, 0), (2, 1), (3, 1)]);
     }
 
     #[test]
