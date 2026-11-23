@@ -1,3 +1,26 @@
+## 2026-11-23 - Platform-aware GUI capabilities
+
+- Expanded `tm-platform` `Capabilities` for native Services/account surfaces,
+  elevated Run, start-with-system, elevation status, elevated relaunch, and
+  always-start-elevated policy. `end_process_tree` remains the single existing
+  process-tree capability used by both process tables.
+- Settings now gates start-with-system and the coherent elevation block on
+  those capabilities instead of a broad Windows `cfg`. Reset calls the
+  dedicated `clear_self_autostart` action when the backend advertises
+  start-with-system; the default implementation delegates to the same owned
+  registration path as the toggle. Windows-only taskbar monitor, core service,
+  and Task Manager replacement sections remain `cfg(target_os = "windows")`.
+- Services and Users use capability-backed native shell actions. Linux marks
+  those surfaces unavailable, so `services.msc` and `ms-settings:otherusers`
+  are not offered there.
+- Linux Run now uses shared shell-free argv tokenization and spawns the parsed
+  program directly. Its elevated Run capability is false and the backend
+  rejects elevated calls before spawning; macOS likewise marks elevated Run
+  unavailable and rejects it. Windows retains its ShellExecute/runas paths.
+- Added pure parser, capability, Settings visibility, and Run-dialog focus-order
+  tests. The task explicitly prohibited compiling or running tests, so the
+  test gate is unrun; verification is static source and Git review only.
+
 ## 2026-11-23 - Linux file-I/O honesty and process-tree parity
 
 - Split Linux procfs action handling into `linux/process_io.rs` and

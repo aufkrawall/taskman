@@ -367,23 +367,29 @@ impl PlatformActions for MacActions {
         Capabilities {
             services_list: true,
             services_control: true,
+            open_services_app: false,
             startup_toggle: false,
             end_process_tree: false,
             users_sessions: false,
             user_disconnect: false,
+            manage_user_accounts: false,
             end_process: true,
             suspend_resume: true,
             set_priority: true,
             set_affinity: false,
             efficiency_mode: false,
             run_new_task: true,
+            run_elevated: false,
             per_process_network: false,
             process_modules: false,
             process_threads: false,
             process_connections: false,
             process_file_io: false,
             unload_module: false,
-            start_with_windows: false,
+            start_with_system: false,
+            elevation_status: true,
+            relaunch_elevated: false,
+            start_elevated: false,
         }
     }
 
@@ -464,15 +470,25 @@ impl PlatformActions for MacActions {
 
     fn run_new_task(&self, command_line: &str, elevate: bool) -> Result<()> {
         use std::process::{Command, Stdio};
-        let mut cmd = Command::new(if elevate { "sudo" } else { "sh" });
         if elevate {
-            cmd.arg("sh");
+            return Err(tm_core::TmError::Unsupported(
+                "elevated arbitrary task launch",
+            ));
         }
+        let mut cmd = Command::new("sh");
         cmd.arg("-c").arg(command_line);
-        cmd.stdout(Stdio::null()).stderr(Stdio::null());
+        cmd.stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
         cmd.spawn()
             .map(|_| ())
             .map_err(|e| tm_core::TmError::platform("spawn", e.to_string()))
+    }
+    fn run_new_task_probe(&self, command_line: &str, elevate: bool) -> Result<()> {
+        self.run_new_task(command_line, elevate)
+    }
+    fn is_elevated(&self) -> bool {
+        unsafe { libc::geteuid() == 0 }
     }
 
     fn backend_name(&self) -> &'static str {
@@ -636,5 +652,23 @@ mod tests {
             tm_core::model::epoch_timestamp_to_unix_seconds(ts_a),
             1_700_000_000
         );
+    }
+
+    #[test]
+    fn capabilities_do_not_expose_windows_or_elevated_run_surfaces() {
+        let capabilities = create_actions().capabilities();
+        assert!(!capabilities.open_services_app);
+        assert!(!capabilities.manage_user_accounts);
+        assert!(!capabilities.start_with_system);
+        assert!(!capabilities.run_elevated);
+        assert!(!capabilities.relaunch_elevated);
+        assert!(!capabilities.start_elevated);
+        assert!(!capabilities.end_process_tree);
+    }
+
+    #[test]
+    fn elevated_run_never_reaches_the_sudo_path() {
+        let error = create_actions().run_new_task("true", true).unwrap_err();
+        assert!(matches!(error, tm_core::TmError::Unsupported(_)));
     }
 }

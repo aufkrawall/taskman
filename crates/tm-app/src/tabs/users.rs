@@ -293,6 +293,10 @@ fn heat_row(
 pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
     let pal = theme::palette(ui);
     let ctx = ui.ctx().clone();
+    if !app.actions.capabilities().users_sessions {
+        ui.centered_and_justified(|ui| ui.weak(i18n::tr(K::ModuleThreadsUnavailable)));
+        return;
+    }
 
     {
         let stale = {
@@ -371,14 +375,17 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
                     tm_platform::actions::UserSessionAction::Logoff,
                 );
             }
-            if crate::app_ui::cmd_button(
-                ui,
-                &pal,
-                Icon::Users,
-                i18n::tr(K::ManageUserAccounts),
-                true,
-            ) {
-                let _ = app.actions.run_new_task("ms-settings:otherusers", false);
+            if caps.manage_user_accounts
+                && crate::app_ui::cmd_button(
+                    ui,
+                    &pal,
+                    Icon::Users,
+                    i18n::tr(K::ManageUserAccounts),
+                    true,
+                )
+            {
+                let actions = app.actions.clone();
+                app.run_shell_action(ui.ctx(), move || actions.manage_user_accounts());
             }
         },
         |app, ui| {

@@ -115,6 +115,7 @@ fn ensure_fresh(app: &TaskManApp, ctx: &egui::Context) {
 pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
     let pal = theme::palette(ui);
     let frame_ctx = ui.ctx().clone();
+    let capabilities = app.actions.capabilities();
     ensure_fresh(app, &frame_ctx);
 
     if let Some(name) = tm_core::sync::lock(&app.svc_jump).take() {
@@ -134,6 +135,7 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
             })
             .map(|s| s.status)
     };
+    let can_control = app.actions.capabilities().services_control;
 
     crate::app_ui::tab_header(
         app,
@@ -148,7 +150,7 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
                 &pal,
                 Icon::Play,
                 i18n::tr(K::StartService),
-                stopped && !busy,
+                stopped && !busy && can_control,
             ) {
                 control(app, &frame_ctx, tm_platform::actions::ServiceAction::Start);
             }
@@ -157,7 +159,7 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
                 &pal,
                 Icon::StopSquare,
                 i18n::tr(K::StopService),
-                running && !busy,
+                running && !busy && can_control,
             ) {
                 control(app, &frame_ctx, tm_platform::actions::ServiceAction::Stop);
             }
@@ -166,7 +168,7 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
                 &pal,
                 Icon::Restart,
                 i18n::tr(K::RestartService),
-                running && !busy,
+                running && !busy && can_control,
             ) {
                 control(
                     app,
@@ -174,15 +176,18 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
                     tm_platform::actions::ServiceAction::Restart,
                 );
             }
-            crate::app_ui::vsep(ui, &pal);
-            if crate::app_ui::cmd_button(
-                ui,
-                &pal,
-                Icon::OpenExternal,
-                i18n::tr(K::OpenServicesApp),
-                true,
-            ) {
-                let _ = app.actions.run_new_task("services.msc", false);
+            if capabilities.open_services_app {
+                crate::app_ui::vsep(ui, &pal);
+                if crate::app_ui::cmd_button(
+                    ui,
+                    &pal,
+                    Icon::OpenExternal,
+                    i18n::tr(K::OpenServicesApp),
+                    true,
+                ) {
+                    let actions = app.actions.clone();
+                    app.run_shell_action(ui.ctx(), move || actions.open_services_app());
+                }
             }
         },
         |_app, ui| {
@@ -371,31 +376,45 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
                     let running = s.status == ServiceStatus::Running;
                     let stopped = s.status == ServiceStatus::Stopped;
                     let state_tip = |tip: K| {
-                        if busy {
+                        if !can_control {
+                            i18n::tr(K::ModuleThreadsUnavailable)
+                        } else if busy {
                             i18n::tr(K::ActionAlreadyRunning)
                         } else {
                             i18n::tr(tip)
                         }
                     };
-                    if menu::item_enabled(ui, i18n::tr(K::StartService), stopped && !busy)
-                        .on_disabled_hover_text(state_tip(K::ServiceNotRunning))
-                        .clicked()
+                    if menu::item_enabled(
+                        ui,
+                        i18n::tr(K::StartService),
+                        stopped && !busy && can_control,
+                    )
+                    .on_disabled_hover_text(state_tip(K::ServiceNotRunning))
+                    .clicked()
                     {
                         app.services_selected_name = Some(s.name.clone());
                         control(app, &mctx, tm_platform::actions::ServiceAction::Start);
                         ui.close();
                     }
-                    if menu::item_enabled(ui, i18n::tr(K::StopService), running && !busy)
-                        .on_disabled_hover_text(state_tip(K::ServiceRunning))
-                        .clicked()
+                    if menu::item_enabled(
+                        ui,
+                        i18n::tr(K::StopService),
+                        running && !busy && can_control,
+                    )
+                    .on_disabled_hover_text(state_tip(K::ServiceRunning))
+                    .clicked()
                     {
                         app.services_selected_name = Some(s.name.clone());
                         control(app, &mctx, tm_platform::actions::ServiceAction::Stop);
                         ui.close();
                     }
-                    if menu::item_enabled(ui, i18n::tr(K::RestartService), running && !busy)
-                        .on_disabled_hover_text(state_tip(K::ServiceRunning))
-                        .clicked()
+                    if menu::item_enabled(
+                        ui,
+                        i18n::tr(K::RestartService),
+                        running && !busy && can_control,
+                    )
+                    .on_disabled_hover_text(state_tip(K::ServiceRunning))
+                    .clicked()
                     {
                         app.services_selected_name = Some(s.name.clone());
                         control(app, &mctx, tm_platform::actions::ServiceAction::Restart);
@@ -416,8 +435,11 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
                         app.tab = crate::app::Tab::Details;
                         ui.close();
                     }
-                    if menu::item(ui, i18n::tr(K::OpenServicesApp)).clicked() {
-                        let _ = app.actions.run_new_task("services.msc", false);
+                    if capabilities.open_services_app
+                        && menu::item(ui, i18n::tr(K::OpenServicesApp)).clicked()
+                    {
+                        let actions = app.actions.clone();
+                        app.run_shell_action(&mctx, move || actions.open_services_app());
                         ui.close();
                     }
                     if menu::item(ui, i18n::tr(K::CopyName)).clicked() {

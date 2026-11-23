@@ -163,6 +163,7 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
     }
 
     let selected_id = app.selected_startup_id.clone();
+    let can_toggle = app.actions.capabilities().startup_toggle;
     crate::app_ui::tab_header(
         app,
         ui,
@@ -177,8 +178,13 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
             });
             let can_enable = sel.as_ref().is_some_and(|s| !s.enabled);
             let can_disable = sel.as_ref().is_some_and(|s| s.enabled);
-            if crate::app_ui::cmd_button(ui, &pal, Icon::Check, i18n::tr(K::EnableCmd), can_enable)
-            {
+            if crate::app_ui::cmd_button(
+                ui,
+                &pal,
+                Icon::Check,
+                i18n::tr(K::EnableCmd),
+                can_enable && can_toggle,
+            ) {
                 toggle_selected(app, true, ui.ctx());
             }
             if crate::app_ui::cmd_button(
@@ -186,7 +192,7 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
                 &pal,
                 Icon::SlashCircle,
                 i18n::tr(K::DisableCmd),
-                can_disable,
+                can_disable && can_toggle,
             ) {
                 toggle_selected(app, false, ui.ctx());
             }
@@ -433,7 +439,7 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
                     } else {
                         i18n::tr(K::EnableCmd)
                     };
-                    if menu::item(ui, label).clicked() {
+                    if menu::item_enabled(ui, label, can_toggle).clicked() {
                         let new_enabled = !item.enabled;
                         let id = item.id.clone();
                         let location = item.location.clone();

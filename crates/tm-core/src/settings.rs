@@ -284,7 +284,8 @@ pub struct Settings {
     pub details_tree_hierarchical: bool,
     /// Hide the main window instead of exiting when its close button is used.
     pub close_to_tray: bool,
-    /// Register this executable for per-user Windows logon startup.
+    /// Register this executable for per-user login startup. The config key
+    /// keeps its historical `start_with_windows` name for compatibility.
     pub start_with_windows: bool,
     /// Windows: start with administrator privileges. When this launch is
     /// unelevated, the process re-execs itself elevated (runas/UAC) before

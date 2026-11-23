@@ -1041,6 +1041,9 @@ impl PlatformActions for BrokeredActions {
             || self.local.control_service(name, action),
         )
     }
+    fn open_services_app(&self) -> Result<()> {
+        self.local.open_services_app()
+    }
 
     fn list_startup(&self) -> Result<Vec<tm_core::model::StartupItem>> {
         self.local.list_startup()
@@ -1059,6 +1062,9 @@ impl PlatformActions for BrokeredActions {
             BrokerRequest::ControlUserSession { session_id, action },
             || self.local.control_user_session(session_id, action),
         )
+    }
+    fn manage_user_accounts(&self) -> Result<()> {
+        self.local.manage_user_accounts()
     }
 
     fn kill_process(
@@ -1515,8 +1521,8 @@ impl PlatformActions for BrokeredActions {
         }
     }
 
-    fn set_start_with_windows(&self, enabled: bool, start_minimized: bool) -> Result<()> {
-        self.local.set_start_with_windows(enabled, start_minimized)
+    fn set_start_with_system(&self, enabled: bool, start_minimized: bool) -> Result<()> {
+        self.local.set_start_with_system(enabled, start_minimized)
     }
 
     fn core_service_state(&self) -> CoreServiceState {

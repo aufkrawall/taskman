@@ -703,7 +703,10 @@ keys! {
     RunDialogTitle => ["Neuen Task ausführen", "Create new task"],
     RunPrompt => ["Name des Programms, Ordners oder Dokuments:", "Type the name of a program, folder or document:"],
     RunHint => ["z. B. notepad", "e.g. notepad"],
-    RunElevated => ["Mit Administratorrechten ausführen", "Create this task with administrative privileges"],
+    RunElevated => [
+        "Mit erhöhten Rechten ausführen",
+        "Run with elevated privileges"
+    ],
     StartedToast => ["Gestartet:", "Started:"],
     LaunchFailed => ["Starten fehlgeschlagen", "Failed to launch"],
 
@@ -771,9 +774,9 @@ keys! {
         "Beim Schließen in den Infobereich minimieren",
         "Close to the notification area"
     ],
-    StartWithWindows => [
-        "Mit Windows im Infobereich starten",
-        "Start with Windows in the notification area"
+    StartWithSystem => [
+        "Bei der Systemanmeldung starten",
+        "Start at system login"
     ],
     SaveConfigAuto => [
         "Einstellungen automatisch in config.ini speichern",
@@ -786,19 +789,19 @@ keys! {
     ColumnsHeading => ["Spaltenbreiten zurücksetzen", "Column widths"],
     ResetColWidths => ["Standardbreiten", "Default widths"],
     ColWidthsResetToast => ["Spaltenbreiten zurückgesetzt", "Column widths reset"],
-    ElevatedHeading => ["Administratorrechte", "Administrator privileges"],
+    ElevatedHeading => ["Erhöhte Rechte", "Elevated privileges"],
     ElevatedRunning => [
-        "Mit Administratorrechten ausgeführt.",
-        "Running with administrator privileges."
+        "Mit erhöhten Rechten ausgeführt.",
+        "Running with elevated privileges."
     ],
     ElevatedNotRunning => [
-        "Ohne Administratorrechte ausgeführt; Aktionen für erhöhte Prozesse sind eingeschränkt.",
-        "Running without administrator privileges; actions on elevated processes are limited."
+        "Ohne erhöhte Rechte ausgeführt; Aktionen für geschützte Prozesse können eingeschränkt sein.",
+        "Running without elevated privileges; actions on protected processes may be limited."
     ],
-    RestartElevated => ["Als Administrator neu starten", "Restart as administrator"],
+    RestartElevated => ["Mit erhöhten Rechten neu starten", "Restart with elevated privileges"],
     StartElevated => [
-        "Immer mit Administratorrechten starten",
-        "Always start with administrator privileges"
+        "Immer mit erhöhten Rechten starten",
+        "Always start with elevated privileges"
     ],
     CoreServiceHeading => ["TaskMan-Core-Dienst", "TaskMan core service"],
     CheckingAdvancedState => ["Status wird geprüft…", "Checking status…"],
