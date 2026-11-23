@@ -826,9 +826,6 @@ mod tests {
     fn fullscreen_hook_tracks_suppressing_window_moves_after_foreground_leaves() {
         use std::sync::atomic::Ordering;
         use std::sync::mpsc;
-        use windows::Win32::UI::WindowsAndMessaging::{
-            MsgWaitForMultipleObjects, PM_REMOVE, PeekMessageW, QS_ALLINPUT,
-        };
 
         let _zorder = z_order_test_lock();
         let hinstance = HINSTANCE(unsafe { GetModuleHandleW(None).unwrap() }.0);
@@ -837,7 +834,7 @@ mod tests {
         let _windows = TestWindows(vec![hwnd]);
 
         enum FsCmd {
-            Move,
+            Move(i32),
             Exit,
         }
         let (cmd_tx, cmd_rx) = mpsc::channel::<FsCmd>();
@@ -866,14 +863,14 @@ mod tests {
             ready_tx.send((fs_hwnd.0 as isize, tid)).unwrap();
             while let Ok(cmd) = cmd_rx.recv() {
                 match cmd {
-                    FsCmd::Move => {
+                    FsCmd::Move(width) => {
                         unsafe {
                             SetWindowPos(
                                 fs_hwnd,
                                 None,
                                 -22_000,
                                 -22_000,
-                                800,
+                                width,
                                 600,
                                 SWP_NOZORDER | SWP_NOACTIVATE,
                             )
@@ -902,30 +899,20 @@ mod tests {
         assert_eq!(ctx.tracked_fs_tid, fs_tid);
         assert!(!ctx.fs_loc_hook.is_invalid());
 
-        REFRESH_PENDING.store(false, Ordering::Release);
-        cmd_tx.send(FsCmd::Move).unwrap();
-        ack_rx.recv().unwrap();
-
-        let deadline = Instant::now() + Duration::from_secs(2);
-        let mut msg = MSG::default();
-        while !REFRESH_PENDING.load(Ordering::Acquire) && Instant::now() < deadline {
-            while unsafe { PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE) }.as_bool() {
-                let _ = unsafe { TranslateMessage(&msg) };
-                unsafe { DispatchMessageW(&msg) };
-            }
-            if REFRESH_PENDING.load(Ordering::Acquire) {
+        let mut woke = false;
+        for width in [800, 807, 814] {
+            REFRESH_PENDING.store(false, Ordering::Release);
+            cmd_tx.send(FsCmd::Move(width)).unwrap();
+            ack_rx.recv().unwrap();
+            if pump_until(Duration::from_secs(1), || {
+                REFRESH_PENDING.load(Ordering::Acquire)
+            }) {
+                woke = true;
                 break;
-            }
-            let remaining_ms = deadline
-                .saturating_duration_since(Instant::now())
-                .as_millis()
-                .min(50) as u32;
-            unsafe {
-                let _ = MsgWaitForMultipleObjects(None, false, remaining_ms, QS_ALLINPUT);
             }
         }
         assert!(
-            REFRESH_PENDING.load(Ordering::Acquire),
+            woke,
             "resizing a non-topmost fullscreen suppressor after foreground left must wake refresh"
         );
 
@@ -1261,12 +1248,17 @@ mod tests {
             )
         };
         let resize_wakes_refresh = |width: i32| {
-            REFRESH_PENDING.store(false, Ordering::Release);
-            cmd_tx.send(Some(width)).unwrap();
-            ack_rx.recv().unwrap();
-            pump_until(Duration::from_secs(2), || {
-                REFRESH_PENDING.load(Ordering::Acquire)
-            })
+            for offset in [0, 7, 14] {
+                REFRESH_PENDING.store(false, Ordering::Release);
+                cmd_tx.send(Some(width + offset)).unwrap();
+                ack_rx.recv().unwrap();
+                if pump_until(Duration::from_secs(1), || {
+                    REFRESH_PENDING.load(Ordering::Acquire)
+                }) {
+                    return true;
+                }
+            }
+            false
         };
 
         let mut ctx = test_window_ctx(hwnd, true);

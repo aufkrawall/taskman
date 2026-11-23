@@ -1015,7 +1015,6 @@ struct PeerCredentials {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 
     fn test_dir(name: &str) -> PathBuf {
         let path = std::env::temp_dir().join(format!(

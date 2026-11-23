@@ -410,8 +410,6 @@ fn is_owned_entry(text: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::unix::fs::MetadataExt as _;
-    use std::os::unix::fs::PermissionsExt as _;
 
     fn test_config(name: &str) -> PathBuf {
         let path = std::env::temp_dir().join(format!(

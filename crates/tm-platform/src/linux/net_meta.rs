@@ -261,7 +261,10 @@ fe800000000000000000000000000001 02 40 20 80 eth0
 ";
         let parsed = parse_if_inet6(text);
         assert_eq!(parsed["eth0"].len(), 2);
-        assert_eq!(parsed["eth0"][0].address, "2001:db8::1".parse().unwrap());
+        assert_eq!(
+            parsed["eth0"][0].address,
+            "2001:db8::1".parse::<Ipv6Addr>().unwrap()
+        );
         assert_eq!(parsed["lo"][0].address, Ipv6Addr::LOCALHOST);
     }
 
