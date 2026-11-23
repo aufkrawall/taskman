@@ -1,3 +1,24 @@
+## 2026-11-23 - Linux file-I/O honesty and process-tree parity
+
+- Split Linux procfs action handling into `linux/process_io.rs` and
+  `linux/process_tree.rs`; `linux/mod.rs` keeps only module selection plus the
+  existing shared signal and identity helpers.
+- Removed fabricated per-file bytes from `/proc/<pid>/fdinfo` offsets. Linux
+  rows keep read/write byte and operation counts `None`; `/proc/<pid>/io`
+  supplies only the explicit process-wide counter fields while per-file
+  accounting remains `Unavailable`. The handle walk is start-tick-bracketed,
+  regular-file-only, uses the fd link for deleted-file size, and marks the
+  handle snapshot incomplete when facts cannot be read.
+- Linux `End process tree` now enumerates descendants from `/proc` PPID links
+  plus start ticks, rejects recycled-parent links, signals child-first with
+  `SIGTERM` through the existing pidfd/identity-checked helper, ignores
+  descendants that exit mid-action, and never escalates to `SIGKILL`.
+- Added static unit coverage for procfs I/O parsing, grouped handle shaping,
+  deleted/non-regular descriptor handling, `/proc/<pid>/stat` parsing,
+  descendant discovery, recycled PPIDs, and child-first order. The task
+  explicitly prohibited compiling or running tests, so the gate is unrun;
+  static diff/secret checks only.
+
 ## 2026-11-22 - Third-party review fixes (icons, identity, restore, diagnostics)
 
 - Fixed a release-abort in Linux icon decoding: 16-bit theme PNGs now decode

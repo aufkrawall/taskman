@@ -2521,6 +2521,7 @@ pub fn context_menu(app: &mut TaskManApp, ui: &mut egui::Ui, p: &ProcessEntry, h
     // selected them. The label says how many, so it is never a surprise.
     let batch = app.selection.len() > 1 && app.selection.contains_pid(p.pid);
     let selected_count = app.selection.len();
+    let can_end_tree = app.actions.capabilities().end_process_tree;
     let batch_label = move |base: &str| {
         if batch {
             format!("{base} ({selected_count})")
@@ -2544,8 +2545,7 @@ pub fn context_menu(app: &mut TaskManApp, ui: &mut egui::Ui, p: &ProcessEntry, h
         }
         ui.close();
     }
-    #[cfg(target_os = "windows")]
-    if menu::item(ui, &batch_label(i18n::tr(K::EndTree))).clicked() {
+    if can_end_tree && menu::item(ui, &batch_label(i18n::tr(K::EndTree))).clicked() {
         if batch {
             let targets = app.live_selection_targets();
             app.pending_process_end = Some(crate::app::PendingProcessEnd {

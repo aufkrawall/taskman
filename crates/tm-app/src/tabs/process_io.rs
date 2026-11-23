@@ -2,14 +2,16 @@
 //! write, and inter-process (IPC / Other) charts matching the Performance page
 //! theming, cumulative counters, interval deltas, and per-file read/written activity.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use eframe::egui::{self, Color32, Pos2, Stroke, Vec2};
 use tm_core::format;
 use tm_core::i18n::{self, K};
 use tm_core::model::ProcessEntry;
-use tm_platform::actions::{FileIoAccounting, ProcessFileIoSnapshot};
+use tm_platform::actions::{
+    FileIoAccounting, FileIoAccountingState, ProcessFileIoSnapshot,
+};
 
 use crate::app::{ProcessIdentity, TaskManApp};
 use crate::tabs::inspector::{self, Poll};
@@ -20,12 +22,12 @@ use crate::widgets::chart::{self, MultiSeries, TimeAxis, ValueFmt};
 #[derive(Clone, Copy, Debug)]
 pub struct IoSample {
     pub t_ms: u64,
-    pub read_bps: f64,
-    pub write_bps: f64,
-    pub other_bps: f64,
-    pub read_delta: u64,
-    pub write_delta: u64,
-    pub other_delta: u64,
+    pub read_bps: Option<f64>,
+    pub write_bps: Option<f64>,
+    pub other_bps: Option<f64>,
+    pub read_delta: Option<u64>,
+    pub write_delta: Option<u64>,
+    pub other_delta: Option<u64>,
 }
 
 /// Column to sort the file I/O list by.
@@ -121,12 +123,12 @@ impl State {
             {
                 let sample = IoSample {
                     t_ms: snapshot.timestamp_ms,
-                    read_bps: process.disk_read_bps,
-                    write_bps: process.disk_write_bps,
-                    other_bps: process.io_other_bps.unwrap_or(0.0),
-                    read_delta: process.io_read_bytes_delta.unwrap_or(0),
-                    write_delta: process.io_write_bytes_delta.unwrap_or(0),
-                    other_delta: process.io_other_bytes_delta.unwrap_or(0),
+                    read_bps: Some(process.disk_read_bps),
+                    write_bps: Some(process.disk_write_bps),
+                    other_bps: process.io_other_bps,
+                    read_delta: process.io_read_bytes_delta,
+                    write_delta: process.io_write_bytes_delta,
+                    other_delta: process.io_other_bytes_delta,
                 };
 
                 let cap = (app.shared.settings.graph_seconds as usize * 2).max(120);
@@ -190,15 +192,23 @@ impl State {
     }
 
     pub fn merge_files(&mut self, snapshot: ProcessFileIoSnapshot) {
+        let handles_complete = snapshot.accounting.handles_complete;
         self.accounting = Some(snapshot.accounting);
         let mut seen = HashSet::new();
+        let mut index_by_path: HashMap<String, usize> = self
+            .files
+            .iter()
+            .enumerate()
+            .map(|(index, file)| (file.path.clone(), index))
+            .collect();
         for file in snapshot.files {
             seen.insert(file.path.clone());
-            if let Some(existing) = self.files.iter_mut().find(|f| f.path == file.path) {
+            if let Some(&index) = index_by_path.get(&file.path) {
+                let existing = &mut self.files[index];
                 existing.open_handles = file.open_handles;
-                existing.is_read |= file.is_read;
-                existing.is_write |= file.is_write;
-                existing.offset = file.offset.or(existing.offset);
+                existing.is_read = file.is_read;
+                existing.is_write = file.is_write;
+                existing.offset = file.offset;
                 existing.read_bytes = match (existing.read_bytes, file.read_bytes) {
                     (Some(a), Some(b)) => Some(a.max(b)),
                     (Some(a), None) => Some(a),
@@ -211,23 +221,14 @@ impl State {
                     (None, Some(b)) => Some(b),
                     (None, None) => None,
                 };
-                existing.total_bytes = match (existing.read_bytes, existing.write_bytes) {
-                    (Some(r), Some(w)) => Some(r.saturating_add(w)),
-                    (Some(r), None) => Some(r),
-                    (None, Some(w)) => Some(w),
-                    (None, None) => existing.offset,
-                };
+                existing.total_bytes = measured_total(existing.read_bytes, existing.write_bytes);
                 if let Some(sz) = file.file_size {
                     existing.file_size = Some(existing.file_size.map_or(sz, |prev| prev.max(sz)));
                 }
             } else {
                 let name = extract_file_name(&file.path);
-                let total_bytes = match (file.read_bytes, file.write_bytes) {
-                    (Some(r), Some(w)) => Some(r.saturating_add(w)),
-                    (Some(r), None) => Some(r),
-                    (None, Some(w)) => Some(w),
-                    (None, None) => file.offset,
-                };
+                let total_bytes = measured_total(file.read_bytes, file.write_bytes);
+                index_by_path.insert(file.path.clone(), self.files.len());
                 self.files.push(TrackedFileIo {
                     path: file.path,
                     name,
@@ -242,9 +243,14 @@ impl State {
                 });
             }
         }
-        for file in &mut self.files {
-            if !seen.contains(&file.path) {
-                file.open_handles = 0;
+        if handles_complete {
+            for file in &mut self.files {
+                if !seen.contains(&file.path) {
+                    file.open_handles = 0;
+                    file.is_read = false;
+                    file.is_write = false;
+                    file.offset = None;
+                }
             }
         }
     }
@@ -267,43 +273,57 @@ impl State {
         let col = self.file_sort_column;
         let asc = self.file_sort_ascending;
         result.sort_by(|a, b| {
-            let ord = match col {
-                FileSortColumn::Written => a
-                    .write_bytes
-                    .unwrap_or(0)
-                    .cmp(&b.write_bytes.unwrap_or(0))
-                    .then_with(|| a.read_bytes.unwrap_or(0).cmp(&b.read_bytes.unwrap_or(0)))
+            match col {
+                FileSortColumn::Written => cmp_known_last(a.write_bytes, b.write_bytes, asc)
+                    .then_with(|| cmp_known_last(a.read_bytes, b.read_bytes, asc))
                     .then_with(|| a.name.cmp(&b.name)),
-                FileSortColumn::Read => a
-                    .read_bytes
-                    .unwrap_or(0)
-                    .cmp(&b.read_bytes.unwrap_or(0))
-                    .then_with(|| a.write_bytes.unwrap_or(0).cmp(&b.write_bytes.unwrap_or(0)))
+                FileSortColumn::Read => cmp_known_last(a.read_bytes, b.read_bytes, asc)
+                    .then_with(|| cmp_known_last(a.write_bytes, b.write_bytes, asc))
                     .then_with(|| a.name.cmp(&b.name)),
-                FileSortColumn::Total => a
-                    .total_bytes
-                    .unwrap_or(0)
-                    .cmp(&b.total_bytes.unwrap_or(0))
+                FileSortColumn::Total => cmp_known_last(a.total_bytes, b.total_bytes, asc)
                     .then_with(|| a.name.cmp(&b.name)),
-                FileSortColumn::Size => a
-                    .file_size
-                    .unwrap_or(0)
-                    .cmp(&b.file_size.unwrap_or(0))
+                FileSortColumn::Size => cmp_known_last(a.file_size, b.file_size, asc)
                     .then_with(|| a.name.cmp(&b.name)),
-                FileSortColumn::Path => a
-                    .path
-                    .to_lowercase()
-                    .cmp(&b.path.to_lowercase())
-                    .then_with(|| a.name.cmp(&b.name)),
-                FileSortColumn::File => a
-                    .name
-                    .to_lowercase()
-                    .cmp(&b.name.to_lowercase())
-                    .then_with(|| a.path.cmp(&b.path)),
-            };
-            if asc { ord } else { ord.reverse() }
+                FileSortColumn::Path => {
+                    let ord = a
+                        .path
+                        .to_lowercase()
+                        .cmp(&b.path.to_lowercase())
+                        .then_with(|| a.name.cmp(&b.name));
+                    if asc { ord } else { ord.reverse() }
+                }
+                FileSortColumn::File => {
+                    let ord = a
+                        .name
+                        .to_lowercase()
+                        .cmp(&b.name.to_lowercase())
+                        .then_with(|| a.path.cmp(&b.path));
+                    if asc { ord } else { ord.reverse() }
+                }
+            }
         });
         result
+    }
+}
+
+fn measured_total(read: Option<u64>, written: Option<u64>) -> Option<u64> {
+    match (read, written) {
+        (Some(read), Some(written)) => Some(read.saturating_add(written)),
+        _ => None,
+    }
+}
+
+fn cmp_known_last<T: Ord>(
+    a: Option<T>,
+    b: Option<T>,
+    ascending: bool,
+) -> std::cmp::Ordering {
+    match (a, b) {
+        (Some(a), Some(b)) if ascending => a.cmp(&b),
+        (Some(a), Some(b)) => b.cmp(&a),
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => std::cmp::Ordering::Equal,
     }
 }
 
@@ -335,26 +355,35 @@ fn paint_io_graph_section(
     ui: &mut egui::Ui,
     id: &'static str,
     title: &str,
-    current_val: f64,
-    samples: Vec<f64>,
+    current_val: Option<f64>,
+    samples: Vec<Option<f64>>,
     color: Color32,
     axis: Option<TimeAxis<'_>>,
     unit_is_rate: bool,
     pal: &theme::Palette,
 ) {
     let min_floor = if unit_is_rate { 4096.0 } else { 1024.0 };
-    let peak = format::nice_rate_max(samples.iter().copied().fold(0.0f64, f64::max)).max(min_floor);
+    let peak = format::nice_rate_max(
+        samples
+            .iter()
+            .flatten()
+            .copied()
+            .filter(|value| value.is_finite())
+            .fold(0.0f64, f64::max),
+    )
+    .max(min_floor);
 
-    let current_str = if current_val <= 0.0 {
-        if unit_is_rate {
-            "0 B/s".into()
-        } else {
-            "0 B".into()
+    let current_str = match current_val.filter(|value| value.is_finite()) {
+        None => "\u{2014}".into(),
+        Some(value) if value <= 0.0 => {
+            if unit_is_rate {
+                "0 B/s".into()
+            } else {
+                "0 B".into()
+            }
         }
-    } else if unit_is_rate {
-        format::format_rate(current_val)
-    } else {
-        format::format_bytes_loc(current_val as u64)
+        Some(value) if unit_is_rate => format::format_rate(value),
+        Some(value) => format::format_bytes_loc(value as u64),
     };
     let peak_str = if unit_is_rate {
         format::format_rate(peak)
@@ -388,7 +417,7 @@ fn paint_io_graph_section(
         // Chart widget matching performance page
         let chart_w = ui.available_width();
         let chart_h = 90.0;
-        let series = [MultiSeries::new(title, samples, color)];
+        let series = [MultiSeries::with_gaps(title, samples, color)];
         let fmt: ValueFmt = if unit_is_rate {
             fmt_io_rate
         } else {
@@ -426,17 +455,17 @@ pub fn show(
 
     // 1. Read graph (matching disk read theming)
     let read_current = if state.unit_is_rate {
-        process.disk_read_bps
+        Some(process.disk_read_bps)
     } else {
-        process.io_read_bytes_delta.unwrap_or(0) as f64
+        process.io_read_bytes_delta.map(|value| value as f64)
     };
-    let read_samples: Vec<f64> = win
+    let read_samples: Vec<Option<f64>> = win
         .iter()
         .map(|s| {
             if state.unit_is_rate {
                 s.read_bps
             } else {
-                s.read_delta as f64
+                s.read_delta.map(|value| value as f64)
             }
         })
         .collect();
@@ -455,17 +484,17 @@ pub fn show(
 
     // 2. Write graph (matching disk write theming)
     let write_current = if state.unit_is_rate {
-        process.disk_write_bps
+        Some(process.disk_write_bps)
     } else {
-        process.io_write_bytes_delta.unwrap_or(0) as f64
+        process.io_write_bytes_delta.map(|value| value as f64)
     };
-    let write_samples: Vec<f64> = win
+    let write_samples: Vec<Option<f64>> = win
         .iter()
         .map(|s| {
             if state.unit_is_rate {
                 s.write_bps
             } else {
-                s.write_delta as f64
+                s.write_delta.map(|value| value as f64)
             }
         })
         .collect();
@@ -485,17 +514,17 @@ pub fn show(
     // 3. Other / Inter-process (IPC) graph (optional via toggle)
     if state.show_other_graph {
         let other_current = if state.unit_is_rate {
-            process.io_other_bps.unwrap_or(0.0)
+            process.io_other_bps
         } else {
-            process.io_other_bytes_delta.unwrap_or(0) as f64
+            process.io_other_bytes_delta.map(|value| value as f64)
         };
-        let other_samples: Vec<f64> = win
+        let other_samples: Vec<Option<f64>> = win
             .iter()
             .map(|s| {
                 if state.unit_is_rate {
                     s.other_bps
                 } else {
-                    s.other_delta as f64
+                    s.other_delta.map(|value| value as f64)
                 }
             })
             .collect();
@@ -544,7 +573,7 @@ pub fn show(
                         format::format_bytes_loc(d)
                     }
                 })
-                .unwrap_or_else(|| "0".into());
+                .unwrap_or_else(|| "â€”".into());
 
             let write_ops_str = process
                 .io_write_ops
@@ -560,7 +589,7 @@ pub fn show(
                         format::format_bytes_loc(d)
                     }
                 })
-                .unwrap_or_else(|| "0".into());
+                .unwrap_or_else(|| "â€”".into());
 
             let other_ops_str = process
                 .io_other_ops
@@ -713,12 +742,27 @@ pub fn show(
     }
 
     let display_files = state.sorted_and_filtered_files();
+    let handles_incomplete = state
+        .accounting
+        .as_ref()
+        .is_some_and(|accounting| !accounting.handles_complete);
+    if handles_incomplete {
+        ui.add_space(6.0);
+        ui.label(
+            egui::RichText::new(i18n::tr(K::PropIoFilesUnavailable))
+                .small()
+                .color(pal.text_dim),
+        );
+    }
     if display_files.is_empty() {
         ui.add_space(6.0);
-        let unavailable = state
+        let unavailable = handles_incomplete
+            || state
             .accounting
             .as_ref()
-            .is_some_and(|a| !a.handles_complete);
+            .is_some_and(|accounting| {
+                accounting.state == FileIoAccountingState::Unavailable
+            });
         let msg = if unavailable {
             i18n::tr(K::PropIoFilesUnavailable)
         } else {
@@ -1162,12 +1206,12 @@ mod tests {
 
         state.history.push(IoSample {
             t_ms: 100,
-            read_bps: 1024.0,
-            write_bps: 512.0,
-            other_bps: 256.0,
-            read_delta: 1024,
-            write_delta: 512,
-            other_delta: 256,
+            read_bps: Some(1024.0),
+            write_bps: Some(512.0),
+            other_bps: Some(256.0),
+            read_delta: Some(1024),
+            write_delta: Some(512),
+            other_delta: Some(256),
         });
         assert_eq!(state.history.len(), 1);
 
@@ -1214,7 +1258,10 @@ mod tests {
         ];
         state.merge_files(ProcessFileIoSnapshot {
             files: batch1,
-            accounting: Default::default(),
+            accounting: FileIoAccounting {
+                handles_complete: true,
+                ..Default::default()
+            },
         });
         assert_eq!(state.files.len(), 2);
         assert_eq!(state.files[0].read_bytes, Some(1000));
@@ -1250,7 +1297,10 @@ mod tests {
         ];
         state.merge_files(ProcessFileIoSnapshot {
             files: batch2,
-            accounting: Default::default(),
+            accounting: FileIoAccounting {
+                handles_complete: true,
+                ..Default::default()
+            },
         });
         assert_eq!(state.files.len(), 3);
 
@@ -1366,16 +1416,65 @@ mod tests {
     }
 
     #[test]
+    fn unavailable_file_io_never_uses_offset_as_total() {
+        assert_eq!(measured_total(None, None), None);
+        assert_eq!(measured_total(Some(10), None), None);
+        assert_eq!(measured_total(None, Some(20)), None);
+        assert_eq!(measured_total(Some(10), Some(20)), Some(30));
+    }
+
+    #[test]
+    fn incomplete_snapshot_does_not_close_or_retype_unseen_handles() {
+        let mut state = State::default();
+        state.files.push(TrackedFileIo {
+            path: "/tmp/open".into(),
+            name: "open".into(),
+            read_bytes: None,
+            write_bytes: None,
+            total_bytes: None,
+            offset: Some(7),
+            file_size: Some(10),
+            is_read: true,
+            is_write: false,
+            open_handles: 1,
+        });
+        state.merge_files(ProcessFileIoSnapshot {
+            files: Vec::new(),
+            accounting: FileIoAccounting {
+                handles_complete: false,
+                ..Default::default()
+            },
+        });
+        let file = &state.files[0];
+        assert_eq!(file.open_handles, 1);
+        assert!(file.is_read);
+        assert_eq!(file.offset, Some(7));
+
+        state.merge_files(ProcessFileIoSnapshot {
+            files: Vec::new(),
+            accounting: FileIoAccounting {
+                handles_complete: true,
+                ..Default::default()
+            },
+        });
+        let file = &state.files[0];
+        assert_eq!(file.open_handles, 0);
+        assert!(!file.is_read);
+        assert!(!file.is_write);
+        assert_eq!(file.offset, None);
+    }
+
+    #[test]
     fn visible_io_slice_windowing() {
         let history: Vec<IoSample> = (0..100)
             .map(|i| IoSample {
                 t_ms: i * 1_000,
-                read_bps: 100.0,
-                write_bps: 50.0,
-                other_bps: 25.0,
-                read_delta: 100,
-                write_delta: 50,
-                other_delta: 25,
+                read_bps: Some(100.0),
+                write_bps: Some(50.0),
+                other_bps: Some(25.0),
+                read_delta: Some(100),
+                write_delta: Some(50),
+                other_delta: Some(25),
             })
             .collect();
 
@@ -1407,13 +1506,14 @@ mod tests {
                     let win = visible_io_slice(samples, 60);
                     let stamps: Vec<u64> = win.iter().map(|s| s.t_ms).collect();
                     let axis = (!stamps.is_empty()).then(|| TimeAxis::new(&stamps, 60));
-                    let read_samples: Vec<f64> = win.iter().map(|s| s.read_bps).collect();
+                    let read_samples: Vec<Option<f64>> =
+                        win.iter().map(|s| s.read_bps).collect();
 
                     paint_io_graph_section(
                         ui,
                         "test-io-read",
                         "Read",
-                        read_samples.last().copied().unwrap_or(0.0),
+                        read_samples.last().copied().flatten(),
                         read_samples,
                         pal.disk_graph,
                         axis,
@@ -1433,12 +1533,12 @@ mod tests {
         let mut samples: Vec<IoSample> = (0..40)
             .map(|i| IoSample {
                 t_ms: i * 1_000,
-                read_bps: (i as f64) * 1000.0,
-                write_bps: 0.0,
-                other_bps: 0.0,
-                read_delta: 0,
-                write_delta: 0,
-                other_delta: 0,
+                read_bps: Some((i as f64) * 1000.0),
+                write_bps: Some(0.0),
+                other_bps: Some(0.0),
+                read_delta: Some(0),
+                write_delta: Some(0),
+                other_delta: Some(0),
             })
             .collect();
 
@@ -1453,12 +1553,12 @@ mod tests {
         // Add new sample as graph updates while pointer stays still
         samples.push(IoSample {
             t_ms: 40_000,
-            read_bps: 99_999.0,
-            write_bps: 0.0,
-            other_bps: 0.0,
-            read_delta: 0,
-            write_delta: 0,
-            other_delta: 0,
+            read_bps: Some(99_999.0),
+            write_bps: Some(0.0),
+            other_bps: Some(0.0),
+            read_delta: Some(0),
+            write_delta: Some(0),
+            other_delta: Some(0),
         });
 
         // Frame with identical pointer position

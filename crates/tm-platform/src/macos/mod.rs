@@ -367,6 +367,7 @@ impl PlatformActions for MacActions {
             services_list: true,
             services_control: true,
             startup_toggle: false,
+            end_process_tree: false,
             users_sessions: false,
             user_disconnect: false,
             end_process: true,

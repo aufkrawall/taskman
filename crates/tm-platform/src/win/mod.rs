@@ -385,6 +385,7 @@ impl PlatformActions for WinActions {
             services_list: true,
             services_control: true,
             startup_toggle: true,
+            end_process_tree: true,
             users_sessions: true,
             user_disconnect: true,
             end_process: true,

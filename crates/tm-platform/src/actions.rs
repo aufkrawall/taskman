@@ -12,6 +12,7 @@ pub struct Capabilities {
     pub services_list: bool,
     pub services_control: bool,
     pub startup_toggle: bool,
+    pub end_process_tree: bool,
     pub users_sessions: bool,
     pub user_disconnect: bool,
     pub end_process: bool,
@@ -399,9 +400,11 @@ pub struct FileIoAccounting {
     /// Part of the totals dropped from `files` by a capacity limit.
     pub omitted_read_bytes: u64,
     pub omitted_write_bytes: u64,
-    /// Growth of the kernel's per-process read/write byte counters over the
-    /// same span, read at the same moments as the trace. `None` when the
-    /// counters could not be read.
+    /// Kernel per-process read/write byte counters. With
+    /// [`FileIoAccountingState::Measured`] these are growth over the same
+    /// trace span; on platforms without per-file accounting they may be the
+    /// explicitly identified process-lifetime totals (`since_ms == 0`).
+    /// `None` when the counters could not be read.
     pub counter_read_bytes: Option<u64>,
     pub counter_write_bytes: Option<u64>,
     /// Events the trace session reports as lost; counts are lower bounds when
