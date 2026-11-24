@@ -1557,10 +1557,11 @@ impl TmTable {
                 continue;
             }
             let cell = self.col_rect(from + k, row);
+            let text: &str = cell_data.text.as_ref();
             ui.painter_at(cell).text(
                 Pos2::new(cell.right() - 10.0, cell.center().y),
                 Align2::RIGHT_CENTER,
-                &*cell_data.text,
+                text,
                 FontId::proportional(FONT_ROW),
                 pal.text,
             );

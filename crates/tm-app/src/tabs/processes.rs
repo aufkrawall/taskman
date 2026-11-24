@@ -3215,10 +3215,7 @@ mod tests {
             })
             .collect();
         assert_eq!(selectable, expected, "the index must be the same sequence");
-        assert!(
-            !selectable.is_empty(),
-            "a populated model has selectable rows"
-        );
+        assert!(!selectable.is_empty(), "a populated model has selectable rows");
         for (position, &display) in selectable.iter().enumerate() {
             let addressed = selectable_row(&rows, &selectable, position).expect("in range");
             let DisplayRow::Process(row) = &rows[display] else {
