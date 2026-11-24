@@ -512,6 +512,15 @@ struct InputStatsRecorder {
     enabled: bool,
     window_start: std::time::Instant,
     causes: HashMap<(&'static str, u32), u32>,
+    /// Table model rebuilds (`(snapshot, sort, filter, view)` key changed).
+    /// The repaint path must NOT rebuild them: a scroll frame changes neither
+    /// the data nor the ordering, so the per-second count has to sit at the
+    /// sample cadence and never at the frame rate.
+    model_rebuilds: u32,
+    /// Rows whose icon the frame memo answered without touching the cache,
+    /// and the icon cache lookups the row loops actually made.
+    icon_memo_hits: u64,
+    icon_lookups: u64,
 }
 
 impl InputStatsRecorder {
@@ -523,6 +532,9 @@ impl InputStatsRecorder {
             enabled,
             window_start: std::time::Instant::now(),
             causes: HashMap::new(),
+            model_rebuilds: 0,
+            icon_memo_hits: 0,
+            icon_lookups: 0,
         }
     }
 }
@@ -2974,6 +2986,22 @@ impl TaskManApp {
             });
     }
 
+    /// Count one flattened-model rebuild for the `TASKMAN_INPUT_STATS=1`
+    /// summary. A page rebuilds its rows only when the data, the sort or the
+    /// filter changed — never on a scroll frame.
+    pub fn note_table_model_rebuild(&mut self) {
+        self.input_stats.model_rebuilds += 1;
+    }
+
+    /// Count one painted table's icon work for the `TASKMAN_INPUT_STATS=1`
+    /// summary: `memo_hits` rows reused an answer the frame memo already had,
+    /// `lookups` rows had to ask the icon cache. The two add up to the rows
+    /// painted, so the memo's effect is directly readable.
+    pub fn note_icon_work(&mut self, memo_hits: u64, lookups: u64) {
+        self.input_stats.icon_memo_hits += memo_hits;
+        self.input_stats.icon_lookups += lookups;
+    }
+
     /// Input/render diagnostics (`TASKMAN_INPUT_STATS=1`): logs `CursorMoved`
     /// and `MouseWheel` decisions, software-renderer pass/paint/present timings,
     /// tile-damage skip ratio, AccessKit activation, and top repaint causes
@@ -3031,11 +3059,17 @@ impl TaskManApp {
             paint_max_ms = format_args!("{:.2}", to_ms(sw.paint_ns_max)),
             present_avg_ms = format_args!("{:.2}", to_ms(sw.present_ns_sum) / painted_frames),
             present_max_ms = format_args!("{:.2}", to_ms(sw.present_ns_max)),
+            model_rebuilds = self.input_stats.model_rebuilds,
+            icon_lookups = self.input_stats.icon_lookups,
+            icon_memo_hits = self.input_stats.icon_memo_hits,
             accesskit = ctx.is_accesskit_enabled(),
             causes = %causes_summary.join(","),
             "input stats"
         );
         self.input_stats.window_start = std::time::Instant::now();
+        self.input_stats.model_rebuilds = 0;
+        self.input_stats.icon_memo_hits = 0;
+        self.input_stats.icon_lookups = 0;
     }
 }
 

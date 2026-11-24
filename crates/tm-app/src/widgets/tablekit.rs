@@ -681,6 +681,33 @@ pub fn norm(value: f64, max: f64) -> f32 {
     }
 }
 
+/// One frame's row-icon answers, keyed by the row's image path.
+///
+/// `None` is a legitimate key: rows without an image share the platform's
+/// default application icon, which is its own cache lookup.
+type IconMemo = std::collections::HashMap<Option<String>, Option<egui::TextureHandle>>;
+
+/// Answer `key` from `memo`, resolving it on the first ask.
+///
+/// Kept separate from [`TmTable::row_icon`] so the "exactly one resolution per
+/// distinct key" contract is testable without a platform or a texture.
+fn memoize<K, V>(
+    memo: &std::cell::RefCell<std::collections::HashMap<K, V>>,
+    key: K,
+    resolve: impl FnOnce() -> V,
+) -> V
+where
+    K: Eq + std::hash::Hash,
+    V: Clone,
+{
+    if let Some(cached) = memo.borrow().get(&key).cloned() {
+        return cached;
+    }
+    let value = resolve();
+    memo.borrow_mut().insert(key, value.clone());
+    value
+}
+
 pub struct TmTable {
     pub id: &'static str,
     pub cols: Vec<TmColumn>,
@@ -706,6 +733,17 @@ pub struct TmTable {
     /// Set when a drag is released on a new slot; the owning tab consumes it
     /// with [`TmTable::take_reorder`] and rewrites its own column order.
     pending_reorder: Option<(usize, usize)>,
+    /// Icon answers this table's rows already resolved THIS frame, keyed by
+    /// the row's image path (`None` = the platform's default application
+    /// icon). A table is built per frame, so the memo never outlives the
+    /// paint that filled it; see [`TmTable::row_icon`].
+    icon_memo: std::cell::RefCell<IconMemo>,
+    /// Icon answers this table's rows asked for THIS frame, and how many of
+    /// them the memo above did not have to resolve. Reported once per second
+    /// by `TASKMAN_INPUT_STATS=1`: the difference is the memo's effect on a
+    /// real machine, where a process list repeats one image across many rows.
+    icon_calls: std::cell::Cell<u64>,
+    icon_lookups: std::cell::Cell<u64>,
 }
 
 impl TmTable {
@@ -718,6 +756,9 @@ impl TmTable {
             reorderable: 0..0,
             pending_reorder: None,
             current_row: std::cell::Cell::new(None),
+            icon_memo: std::cell::RefCell::new(IconMemo::new()),
+            icon_calls: std::cell::Cell::new(0),
+            icon_lookups: std::cell::Cell::new(0),
             id,
             auto_widths: vec![None; cols.len()],
             cols,
@@ -1510,6 +1551,38 @@ impl TmTable {
         resp.clicked()
     }
 
+    /// Resolve one row's icon, asking [`crate::icon_cache::IconCache`] at most
+    /// once per distinct image per frame.
+    ///
+    /// The resolver is not free per call: it takes the context and two cache
+    /// locks, and a row with no usable image runs a SECOND full lookup for the
+    /// platform's default icon. A process list repeats one image across many
+    /// rows — a browser's helpers, every `svchost.exe`, every kernel thread —
+    /// so a per-row call re-answers the same question dozens of times per
+    /// frame. The answer cannot change inside one frame either: extraction is
+    /// asynchronous and only turns a pending image into a ready one BETWEEN
+    /// frames. The table is built per frame, so this memo dies with it.
+    pub fn row_icon(
+        &self,
+        ctx: &egui::Context,
+        icons: &crate::icon_cache::IconCache,
+        actions: &std::sync::Arc<dyn tm_platform::actions::PlatformActions>,
+        path: Option<&str>,
+    ) -> Option<egui::TextureHandle> {
+        self.icon_calls.set(self.icon_calls.get() + 1);
+        memoize(&self.icon_memo, path.map(str::to_owned), || {
+            self.icon_lookups.set(self.icon_lookups.get() + 1);
+            icons.icon_or_default(ctx, actions, path)
+        })
+    }
+
+    /// `(rows that reused an answer, icon cache lookups)` for this frame's
+    /// table. Feeds the `TASKMAN_INPUT_STATS=1` summary.
+    pub fn icon_memo_counts(&self) -> (u64, u64) {
+        let lookups = self.icon_lookups.get();
+        (self.icon_calls.get().saturating_sub(lookups), lookups)
+    }
+
     /// Paint a row's icon from `tex`.
     ///
     /// `tex` always comes from the platform's icon layer
@@ -1907,6 +1980,56 @@ mod tests {
             ],
             None,
         )
+    }
+
+    /// One row's icon must be resolved once per frame, however many rows show
+    /// the same image.
+    ///
+    /// Regression: the row loop called the icon cache for every visible row,
+    /// and a process list repeats one image across many of them (a browser's
+    /// helpers, every `svchost.exe`, every kernel thread). Each call takes the
+    /// context and two cache locks and a path-less row runs a second, full
+    /// lookup for the platform default icon — so the same answer was being
+    /// recomputed dozens of times per repaint, i.e. on every scroll frame.
+    #[test]
+    fn memoized_lookup_resolves_each_distinct_key_exactly_once() {
+        let memo: std::cell::RefCell<std::collections::HashMap<Option<String>, usize>> =
+            std::cell::RefCell::new(std::collections::HashMap::new());
+        let resolutions = std::cell::Cell::new(0usize);
+        let mut resolve = || {
+            resolutions.set(resolutions.get() + 1);
+            resolutions.get()
+        };
+
+        for _ in 0..5 {
+            assert_eq!(
+                memoize(&memo, Some("svchost.exe".to_string()), &mut resolve),
+                1
+            );
+        }
+        // A second distinct image, and the path-less rows, each resolve once.
+        for _ in 0..3 {
+            assert_eq!(
+                memoize(&memo, Some("/usr/bin/firefox".to_string()), &mut resolve),
+                2
+            );
+            assert_eq!(memoize(&memo, None, &mut resolve), 3);
+        }
+        assert_eq!(resolutions.get(), 3, "one resolution per distinct image");
+    }
+
+    /// The memo must not fuse two different images into one answer — a wrong
+    /// icon is a visible lie about which executable a row is.
+    #[test]
+    fn memoized_lookup_keeps_distinct_paths_apart() {
+        let memo: std::cell::RefCell<std::collections::HashMap<Option<String>, Option<u8>>> =
+            std::cell::RefCell::new(std::collections::HashMap::new());
+        assert_eq!(memoize(&memo, None, || Some(7)), Some(7));
+        assert_eq!(memoize(&memo, Some("a.exe".to_string()), || None), None);
+        assert_eq!(memoize(&memo, Some("b.exe".to_string()), || Some(9)), Some(9));
+        // A remembered "no icon for this image" is an answer too, never a miss.
+        assert_eq!(memoize(&memo, Some("a.exe".to_string()), || Some(1)), None);
+        assert_eq!(memo.borrow().len(), 3);
     }
 
     /// The disk headers must never invent a zero.

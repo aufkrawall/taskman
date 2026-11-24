@@ -370,6 +370,7 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
             key: key.clone(),
             rows: build_display_rows(&snap, &key.2, key.3, key.4, &expanded, &groups),
         });
+        app.note_table_model_rebuild();
     }
     let rows = match cache.as_ref() {
         Some(cache) => &cache.rows,
@@ -483,6 +484,8 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
             }
         },
     );
+    let (icon_memo_hits, icon_lookups) = table.icon_memo_counts();
+    app.note_icon_work(icon_memo_hits, icon_lookups);
     if let Some(col) = clicked {
         let logical = app.processes_state.logical_col(col);
         if app.processes_state.sort_col == logical {
@@ -1033,10 +1036,13 @@ fn row_ui(
         app.processes_state.toggle_expanded(row.pid);
     }
 
-    let tex = app
-        .shared
-        .icons
-        .icon_or_default(ui.ctx(), &app.actions, row.icon_path.as_deref());
+    // One lookup per distinct image per frame, not per row: see `row_icon`.
+    let tex = table.row_icon(
+        ui.ctx(),
+        &app.shared.icons,
+        &app.actions,
+        row.icon_path.as_deref(),
+    );
     table.icon_cell(
         ui,
         rect.translate(egui::vec2(row.depth as f32 * 22.0, 0.0)),
