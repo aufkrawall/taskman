@@ -16,6 +16,12 @@
   GPU-process memory. It isolates config/data, sanitizes inherited renderer controls, proves
   Tray readiness, verifies a visible main window does not appear in hidden mode, and keeps
   ETW-producing pages out of unattended runs.
+- Parent-side validation on the rebuilt D3D12 release measured the pre-fix installed binary
+  at 272.02 MB dedicated + 28.68 MB shared while hidden with the taskbar overlay. The new
+  release held 0 B dedicated + 0 B shared through five samples and six exact-child window
+  checks; visible mode peaked at 55.83 MB dedicated + 30.13 MB shared. A same-process
+  minimize/restore cycle dropped to 0/0 while iconic and returned to 55.83 MB dedicated with
+  no missing-texture warnings or log errors. The full host+Linux gate passed.
 
 ## 2026-11-23 - Wayland classification final review corrections
 

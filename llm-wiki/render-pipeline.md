@@ -319,6 +319,15 @@ suite. The full release gate and a user-visible visual review remain final check
 epaint has no color-glyph source, so hardware color-glyph coverage is not practical; the
 software and renderer-policy tests cover synthetic premultiplied color texels.
 
+**Validation after the 2026-11-24 WGPU-memory pass:** `python build.py --check` passed fmt,
+clippy, the workspace and fork tests, Linux target checks, host/Linux release builds, and
+packaging. On the D3D12 host, the isolated taskbar-overlay probe held 0 B dedicated/shared
+through five samples after the hidden main window was proven absent, visible mode peaked at
+55.83 MB dedicated + 30.13 MB shared, and a same-process minimize/restore returned to the
+visible footprint with no missing-texture warnings. Vulkan shares the lifecycle, allocator
+hint, and Wayland `SUSPENDED` path and compiled for Linux; no Vulkan hardware was available
+on this host.
+
 ## Still open
 
 - **Window-lifecycle recovery is tested, not seen.** The present/restore paths added for
