@@ -25,9 +25,31 @@ const FAILURE_CACHE_CAP: usize = 512;
 const UPLOAD_BUDGET: usize = 6;
 /// Retry window for icons whose extraction failed (e.g. file locked).
 const FAILURE_RETRY_TTL: std::time::Duration = std::time::Duration::from_secs(30);
+/// Backoff between failed icon-worker spawn attempts. Every visible row asks
+/// for its icon on every frame, so an unconditional retry meant a `spawn`
+/// syscall, a channel allocation and a `tracing::warn!` per row per frame while
+/// the OS kept refusing threads — exactly the hot-path noise this app bans.
+const SPAWN_RETRY_BACKOFF_MS: u64 = 30_000;
 /// Cache key for the platform's default application icon. No real path
 /// contains a NUL, so this can never collide with one.
 const DEFAULT_APP_ICON_KEY: &str = "\u{0}os-default-app-icon";
+
+/// Monotonic milliseconds since the first icon request (no wall-clock jumps).
+fn monotonic_ms() -> u64 {
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    START.get_or_init(std::time::Instant::now).elapsed().as_millis() as u64
+}
+
+/// Whether a worker spawn may be attempted at `now_ms`, given the deadline
+/// stored for the previous failure (`0` = never failed, so always due).
+fn spawn_attempt_due(deadline_ms: u64, now_ms: u64) -> bool {
+    now_ms >= deadline_ms
+}
+
+/// Deadline for the next spawn attempt after a failure at `now_ms`.
+fn spawn_retry_deadline(now_ms: u64) -> u64 {
+    now_ms.saturating_add(SPAWN_RETRY_BACKOFF_MS)
+}
 
 /// What the cache knows about one key right now.
 enum Lookup {
@@ -66,8 +88,14 @@ pub struct IconCache {
     inner: Arc<Mutex<Inner>>,
     tx: Arc<Mutex<Option<Arc<Sender<String>>>>>,
     results: Arc<Mutex<Vec<Decoded>>>,
+    /// Set by the worker when it publishes a result and cleared when
+    /// `drain_results` takes the queue, so a lookup on a row with nothing
+    /// pending costs one atomic load instead of three mutex acquisitions.
+    has_results: Arc<std::sync::atomic::AtomicBool>,
     /// Set when the worker thread has been started (lazy).
     worker_started: Arc<std::sync::atomic::AtomicBool>,
+    /// Monotonic deadline before which a failed worker spawn is not retried.
+    spawn_deadline_ms: Arc<std::sync::atomic::AtomicU64>,
     /// Bounded hand-off queue length.
     in_flight: Arc<std::sync::atomic::AtomicUsize>,
     /// `(egui pass number, textures uploaded in that pass)`. The budget is
@@ -161,25 +189,60 @@ impl IconCache {
         Lookup::Pending
     }
 
+    /// Hand `path` to the worker, or forget it again.
+    ///
+    /// `queued` is the dedup guard, so a request that never reached the worker
+    /// must not stay in it: every row asked for in that frame would then wait
+    /// for an answer nobody is working on and paint nothing for the rest of the
+    /// process's life (a transient thread-spawn failure, or a worker that died
+    /// between two frames).
     fn send_request(&self, path: &str) {
         let tx = sync::lock(&self.tx).clone();
-        if let Some(tx) = tx {
+        let sent = tx.is_some_and(|tx| {
             self.in_flight
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            if tx.send(path.to_string()).is_err() {
-                self.in_flight
-                    .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-                sync::lock(&self.inner).queued.remove(path);
-                // The worker thread is gone (panicked or the channel closed):
-                // allow ensure_worker to spawn a fresh one on the next get().
-                *sync::lock(&self.tx) = None;
-                self.worker_started
-                    .store(false, std::sync::atomic::Ordering::SeqCst);
+            if tx.send(path.to_string()).is_ok() {
+                return true;
             }
+            // The worker thread is gone (panicked or the channel closed). Every
+            // request it still owed an answer for died with it, so the whole
+            // outstanding set is released: a stale `queued` entry would never be
+            // asked for again, and a stale in-flight count would block every
+            // later request once it reached the cap.
+            *sync::lock(&self.tx) = None;
+            sync::lock(&self.inner).queued.clear();
+            self.in_flight
+                .store(0, std::sync::atomic::Ordering::Relaxed);
+            self.worker_started
+                .store(false, std::sync::atomic::Ordering::SeqCst);
+            false
+        });
+        if !sent {
+            // Also covers "no channel at all": the key must not stay in the
+            // dedup set, or its row never asks again.
+            sync::lock(&self.inner).queued.remove(path);
         }
     }
 
     fn ensure_worker(&self, actions: &Arc<dyn tm_platform::actions::PlatformActions>) {
+        // Fast path: once the worker runs, every row would otherwise pay an
+        // atomic read-modify-write and a clock read here.
+        if self
+            .worker_started
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            return;
+        }
+        let now = monotonic_ms();
+        if !spawn_attempt_due(
+            self.spawn_deadline_ms
+                .load(std::sync::atomic::Ordering::Relaxed),
+            now,
+        ) {
+            // A spawn failed recently: one attempt per backoff window, not one
+            // per queued row per frame.
+            return;
+        }
         if self
             .worker_started
             .swap(true, std::sync::atomic::Ordering::SeqCst)
@@ -188,13 +251,16 @@ impl IconCache {
         }
         let (tx, rx): (Sender<String>, Receiver<String>) = std::sync::mpsc::channel();
         let results = self.results.clone();
+        let has_results = self.has_results.clone();
         let actions = actions.clone();
         *sync::lock(&self.tx) = Some(Arc::new(tx));
         let spawned = std::thread::Builder::new()
             .name("tm-icons".into())
-            .spawn(move || icon_worker(rx, actions.clone(), results));
+            .spawn(move || icon_worker(rx, actions.clone(), results, has_results));
         if spawned.is_err() {
-            tracing::warn!("failed to spawn icon worker");
+            self.spawn_deadline_ms
+                .store(spawn_retry_deadline(now), std::sync::atomic::Ordering::Relaxed);
+            tracing::warn!("failed to spawn the icon worker; retrying after backoff");
             *sync::lock(&self.tx) = None;
             self.worker_started
                 .store(false, std::sync::atomic::Ordering::SeqCst);
@@ -206,6 +272,11 @@ impl IconCache {
     /// when a backlog remains) so fresh icons appear without waiting for an
     /// unrelated frame.
     fn drain_results(&self, ctx: &egui::Context) {
+        // Fast path: `lookup` calls this once per visible row, and a row would
+        // otherwise pay three mutex acquisitions with nothing to drain.
+        if !self.has_results.load(std::sync::atomic::Ordering::Relaxed) {
+            return;
+        }
         let pass = ctx.cumulative_pass_nr();
         let mut budget = sync::lock(&self.budget);
         if budget.0 == pass && budget.1 >= UPLOAD_BUDGET {
@@ -216,6 +287,10 @@ impl IconCache {
         if budget.0 != pass {
             *budget = (pass, 0);
         }
+        // Cleared before taking: a result published in between must be seen on
+        // the next pass, never lost. (Clearing after the take can swallow it.)
+        self.has_results
+            .store(false, std::sync::atomic::Ordering::Relaxed);
         let mut ready: Vec<Decoded> = {
             let mut r = sync::lock(&self.results);
             std::mem::take(&mut *r)
@@ -299,8 +374,13 @@ impl IconCache {
         }
         budget.1 += loaded;
         drop(budget);
-        self.in_flight
-            .fetch_sub(processed, std::sync::atomic::Ordering::Relaxed);
+        // Saturating: a dead worker resets the counter, and the results it had
+        // already published are drained after that reset.
+        let _ = self.in_flight.fetch_update(
+            std::sync::atomic::Ordering::Relaxed,
+            std::sync::atomic::Ordering::Relaxed,
+            |in_flight| Some(in_flight.saturating_sub(processed)),
+        );
         if loaded > 0 {
             // Freshly uploaded textures must be painted even when nothing is
             // left in the queue — otherwise the last batch waits for an
@@ -312,6 +392,10 @@ impl IconCache {
             let mut results = sync::lock(&self.results);
             leftover.append(&mut results);
             *results = leftover;
+            drop(results);
+            // Re-arm the fast path: these entries wait for the next pass.
+            self.has_results
+                .store(true, std::sync::atomic::Ordering::Relaxed);
             ctx.request_repaint();
         }
     }
@@ -332,6 +416,7 @@ fn icon_worker(
     rx: Receiver<String>,
     actions: Arc<dyn tm_platform::actions::PlatformActions>,
     results: Arc<Mutex<Vec<Decoded>>>,
+    has_results: Arc<std::sync::atomic::AtomicBool>,
 ) {
     while let Ok(path) = rx.recv() {
         // The default application icon is a platform property, not a file
@@ -342,6 +427,7 @@ fn icon_worker(
             actions.process_icon_rgba(&path)
         };
         sync::lock(&results).push(Decoded { path, icon });
+        has_results.store(true, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
@@ -384,6 +470,7 @@ pub fn usable_icon_path(path: &str) -> Option<&str> {
 mod tests {
     use super::*;
     use std::path::Path;
+    use std::sync::atomic::Ordering;
     use tm_platform::actions::PlatformActions;
 
     /// The written pixels of a 2x2 icon, so a test can tell which texture the
@@ -424,6 +511,18 @@ mod tests {
         fn default_app_icon_rgba(&self) -> Option<(u32, u32, Vec<u8>)> {
             self.default_icon.map(|c| (2, 2, c.repeat(4)))
         }
+    }
+
+    /// Publish a decoded result the way the worker does: the payload plus the
+    /// flag that makes `drain_results` look at the queue.
+    fn publish(cache: &IconCache, path: &str, icon: Option<(u32, u32, Vec<u8>)>) {
+        sync::lock(&cache.results).push(Decoded {
+            path: path.to_string(),
+            icon,
+        });
+        cache
+            .has_results
+            .store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Drive `icon_or_default` until the background worker's result is
@@ -578,10 +677,7 @@ mod tests {
         cache
             .in_flight
             .store(1, std::sync::atomic::Ordering::Relaxed);
-        sync::lock(&cache.results).push(Decoded {
-            path: path.to_string(),
-            icon: None,
-        });
+        publish(&cache, path, None);
         let actions: Arc<dyn PlatformActions> = Arc::new(IconActions::missing(path));
         assert!(matches!(
             cache.lookup(&ctx, &actions, path),
@@ -610,10 +706,11 @@ mod tests {
         let ctx = egui::Context::default();
         let cache = IconCache::default();
         for i in 0..(2 * UPLOAD_BUDGET) {
-            sync::lock(&cache.results).push(Decoded {
-                path: format!("/apps/{i}"),
-                icon: Some((1, 1, vec![255, 0, 0, 255])),
-            });
+            publish(
+                &cache,
+                &format!("/apps/{i}"),
+                Some((1, 1, vec![255, 0, 0, 255])),
+            );
         }
         // `lookup` calls this once per visible row; the budget must not reset
         // between those calls.
@@ -651,6 +748,109 @@ mod tests {
             Some(r"C:\x\a.exe".to_string())
         );
         assert_eq!(row_icon_key(None), None);
+    }
+
+    /// A request that never reached the worker must not stay in the dedup set:
+    /// the stuck key would never be asked for again, so that row kept an empty
+    /// icon cell for the rest of the process's life instead of retrying.
+    #[test]
+    fn unsent_request_is_not_left_queued() {
+        let cache = IconCache::default();
+        let path = r"C:\apps\never-sent.exe";
+        sync::lock(&cache.inner).queued.insert(path.to_string());
+        // No worker channel at all: the request cannot be delivered.
+        cache.send_request(path);
+        let inner = sync::lock(&cache.inner);
+        assert!(
+            !inner.queued.contains(path),
+            "the dead request must be forgotten"
+        );
+        assert_eq!(
+            cache.in_flight.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "a request that was never handed over is not in flight"
+        );
+    }
+
+    /// A worker that died between two frames strands every request it still
+    /// owed an answer for. The whole outstanding set is released: a stale
+    /// `queued` entry would never be asked for again, and a stale in-flight
+    /// count would block every later request once it reached the cap.
+    #[test]
+    fn dead_worker_releases_outstanding_requests() {
+        let cache = IconCache::default();
+        // A channel whose worker is already gone: `send` answers Err.
+        let (tx, rx) = std::sync::mpsc::channel::<String>();
+        drop(rx);
+        *sync::lock(&cache.tx) = Some(Arc::new(tx));
+        cache.worker_started.store(true, Ordering::SeqCst);
+        cache.in_flight.store(2, Ordering::Relaxed);
+        {
+            let mut inner = sync::lock(&cache.inner);
+            for key in ["/apps/a", "/apps/b", "/apps/c"] {
+                inner.queued.insert(key.to_string());
+            }
+        }
+        cache.send_request("/apps/c");
+        assert!(sync::lock(&cache.inner).queued.is_empty());
+        assert_eq!(cache.in_flight.load(Ordering::Relaxed), 0);
+        assert!(!cache.worker_started.load(Ordering::SeqCst));
+    }
+
+    /// The in-flight counter is decremented saturating: a worker that died and
+    /// released the counter must not have it wrapped back to `usize::MAX` by the
+    /// results it published before dying (that would block every later request).
+    #[test]
+    fn drain_results_does_not_wrap_the_in_flight_counter() {
+        let ctx = egui::Context::default();
+        let cache = IconCache::default();
+        cache.in_flight.store(1, Ordering::Relaxed);
+        for i in 0..3 {
+            publish(
+                &cache,
+                &format!("/apps/{i}"),
+                Some((1, 1, vec![255, 0, 0, 255])),
+            );
+        }
+        cache.drain_results(&ctx);
+        assert_eq!(cache.in_flight.load(Ordering::Relaxed), 0);
+        assert_eq!(cache.len(), 3, "every published icon is still uploaded");
+    }
+
+    /// The spawn backoff is what keeps a failing spawn from being retried for
+    /// every queued row on every frame (thread spawn, syscalls and a warning log
+    /// per row per frame). `0` means "never failed".
+    #[test]
+    fn spawn_backoff_skips_attempts_until_the_deadline_passes() {
+        let failed_at = 1_000;
+        let deadline = spawn_retry_deadline(failed_at);
+        assert_eq!(deadline, failed_at + SPAWN_RETRY_BACKOFF_MS);
+        assert!(!spawn_attempt_due(deadline, failed_at));
+        assert!(!spawn_attempt_due(deadline, deadline - 1));
+        assert!(spawn_attempt_due(deadline, deadline));
+        assert!(spawn_attempt_due(0, 0), "the first attempt is always due");
+        assert_eq!(
+            spawn_retry_deadline(u64::MAX),
+            u64::MAX,
+            "the deadline saturates instead of wrapping into the past"
+        );
+    }
+
+    /// The control case: a delivered request stays queued (so no duplicate is
+    /// sent) and counts as in flight until its result is uploaded.
+    #[test]
+    fn delivered_request_stays_queued_until_answered() {
+        let actions: Arc<dyn PlatformActions> = Arc::new(IconActions::all());
+        let cache = IconCache::default();
+        cache.ensure_worker(&actions);
+        let path = r"C:\apps\queued.exe";
+        sync::lock(&cache.inner).queued.insert(path.to_string());
+        cache.send_request(path);
+        assert!(sync::lock(&cache.inner).queued.contains(path));
+        assert_eq!(
+            cache.in_flight.load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
     }
 
     /// A blank path and a bare process name are not image paths. Asking the
