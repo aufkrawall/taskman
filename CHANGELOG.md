@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.1.33 - 2026-11-24
 
 ### New
 
@@ -16,6 +16,12 @@
 ### Improved
 
 - **D3D12/Vulkan resident memory:** WGPU now uses memory-oriented allocator blocks instead of performance-sized defaults, bounds the D3D12 descriptor heap, and reclaims oversized vertex/index buffers after sustained low use. The normal 2D UI keeps the ordinary and LCD text pipelines while lowering its resident GPU allocation floor.
+- **LCD atlas detection and startup:** full font-atlas replacements determine LCD state from their contents, while partial additions short-circuit once LCD is already known present. The WGPU `Locals` uniform is explicitly padded to 32 bytes, and both LCD fragment paths are parsed and validated with Naga in the normal `egui-wgpu` test suite. The hardware rendering suite is now explicitly ignored/manual and fails if its opt-in flag or a D3D12/Vulkan dual-source adapter is missing.
+- **Wheel scrolling no longer drives the UI faster than the display.** Wheel input is coalesced to one full repaint per display refresh, with the first event still immediate and one trailing repaint carrying the final accumulated delta. Egui's wheel smoothing now follows the same minimum cadence instead of scheduling back-to-back frames, and short high-refresh delays are no longer collapsed to zero. Line and pixel units, horizontal/vertical movement, modifiers, click order and zero-delta touchpad lifecycle phases are preserved. `TASKMAN_INPUT_STATS=1` now also reports wheel, coalesced, immediate and trailing counts.
+- **A stored renderer preference is no longer silently rewritten.** Startup still coerces the value it actually uses on the current platform, but the user's explicit choice survives for a platform that supports it, and the coercion is logged once instead of being persisted as `cpu`.
+- **The restore acknowledgement repairs placement before answering.** A minimized window restored after a monitor unplug is re-fitted after it is unminimized, not only on the cloaked path.
+
+- **Text rendering follows the monitor it is actually on.** The startup ClearType query uses the real window handle, a FLAT pixel geometry (rotated or non-RGB-stripe panels) disables sub-pixel rendering, and the theme refresh key now covers the whole text-rendering state, so a change of the display's parameters re-rasterizes the font atlas instead of reusing glyphs built for the previous monitor.
 
 ### Fixed
 
@@ -53,15 +59,6 @@
 - **The icon texture upload budget is enforced per frame, not per row.** A cold start with hundreds of ready icons no longer uploads all of them on the first visible frame.
 - **Interrupted atomic saves no longer leave temp files forever.** Stale `.<pid>-<seq>.*.tmp` files older than an hour are swept on the next save, while a recent temp (which may belong to a live concurrent save) is left alone.
 - **The Run dialog's Browse button recovers from a dead picker worker.** If the worker unwinds without publishing a result, the slot is marked cancelled instead of leaving Browse inert until the dialog is reopened.
-
-### Improved
-
-- **LCD atlas detection and startup:** full font-atlas replacements determine LCD state from their contents, while partial additions short-circuit once LCD is already known present. The WGPU `Locals` uniform is explicitly padded to 32 bytes, and both LCD fragment paths are parsed and validated with Naga in the normal `egui-wgpu` test suite. The hardware rendering suite is now explicitly ignored/manual and fails if its opt-in flag or a D3D12/Vulkan dual-source adapter is missing.
-- **Wheel scrolling no longer drives the UI faster than the display.** Wheel input is coalesced to one full repaint per display refresh, with the first event still immediate and one trailing repaint carrying the final accumulated delta. Egui's wheel smoothing now follows the same minimum cadence instead of scheduling back-to-back frames, and short high-refresh delays are no longer collapsed to zero. Line and pixel units, horizontal/vertical movement, modifiers, click order and zero-delta touchpad lifecycle phases are preserved. `TASKMAN_INPUT_STATS=1` now also reports wheel, coalesced, immediate and trailing counts.
-- **A stored renderer preference is no longer silently rewritten.** Startup still coerces the value it actually uses on the current platform, but the user's explicit choice survives for a platform that supports it, and the coercion is logged once instead of being persisted as `cpu`.
-- **The restore acknowledgement repairs placement before answering.** A minimized window restored after a monitor unplug is re-fitted after it is unminimized, not only on the cloaked path.
-
-- **Text rendering follows the monitor it is actually on.** The startup ClearType query uses the real window handle, a FLAT pixel geometry (rotated or non-RGB-stripe panels) disables sub-pixel rendering, and the theme refresh key now covers the whole text-rendering state, so a change of the display's parameters re-rasterizes the font atlas instead of reusing glyphs built for the previous monitor.
 
 ### Changed
 
