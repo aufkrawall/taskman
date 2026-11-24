@@ -512,6 +512,27 @@ struct InputStatsRecorder {
     enabled: bool,
     window_start: std::time::Instant,
     causes: HashMap<(&'static str, u32), u32>,
+    /// Table model rebuilds (`(snapshot, sort, filter, view)` key changed),
+    /// counted for the Processes and Details pages. The repaint path must NOT
+    /// rebuild them: a scroll frame changes neither the data nor the ordering,
+    /// so the per-second count has to sit at the sample cadence and never at
+    /// the frame rate. Saturating, because it is only reset while the probe is
+    /// enabled and must never wrap.
+    model_rebuilds: u32,
+    /// Rows whose icon the frame memo answered without touching the cache, and
+    /// the icon cache lookups the row loops actually made. Processes and
+    /// Details report them; App History, Startup and Users are the pages that
+    /// still resolve one icon per row uncached, so they are not part of these
+    /// two numbers. The remaining pages paint no row icon at all.
+    icon_memo_hits: u64,
+    icon_lookups: u64,
+    /// Clipped-text measurements spent only to answer "is this cell clipped?".
+    /// Details is the only page that reports them: Connections, Hosted
+    /// services, Modules, Services, Startup, Threads and Users still measure
+    /// every text cell through `text_cell`, into a table-local counter nothing
+    /// reads. App History measures nothing — it paints through `heat_cells` and
+    /// a raw `painter.text`.
+    text_measures: u64,
 }
 
 impl InputStatsRecorder {
@@ -523,6 +544,10 @@ impl InputStatsRecorder {
             enabled,
             window_start: std::time::Instant::now(),
             causes: HashMap::new(),
+            model_rebuilds: 0,
+            icon_memo_hits: 0,
+            icon_lookups: 0,
+            text_measures: 0,
         }
     }
 }
@@ -2974,6 +2999,32 @@ impl TaskManApp {
             });
     }
 
+    /// Count one flattened-model rebuild for the `TASKMAN_INPUT_STATS=1`
+    /// summary (Processes and Details are the pages that call this). A page
+    /// rebuilds its rows only when the data, the sort or the filter changed —
+    /// never on a scroll frame.
+    pub fn note_table_model_rebuild(&mut self) {
+        self.input_stats.model_rebuilds = self.input_stats.model_rebuilds.saturating_add(1);
+    }
+
+    /// Count one painted table's icon work for the `TASKMAN_INPUT_STATS=1`
+    /// summary: `memo_hits` rows reused an answer the frame memo already had,
+    /// `lookups` rows had to ask the icon cache. The two add up to the rows
+    /// painted, so the memo's effect is directly readable. Only Processes and
+    /// Details report here — the pages that still resolve one icon per row do
+    /// not, so this is their work, not the application's.
+    pub fn note_icon_work(&mut self, memo_hits: u64, lookups: u64) {
+        self.input_stats.icon_memo_hits += memo_hits;
+        self.input_stats.icon_lookups += lookups;
+    }
+
+    /// Count one painted table's clipped-text measurements for the
+    /// `TASKMAN_INPUT_STATS=1` summary: each one is a text layout spent on a
+    /// hover answer.
+    pub fn note_text_measures(&mut self, measures: u64) {
+        self.input_stats.text_measures += measures;
+    }
+
     /// Input/render diagnostics (`TASKMAN_INPUT_STATS=1`): logs `CursorMoved`
     /// and `MouseWheel` decisions, software-renderer pass/paint/present timings,
     /// tile-damage skip ratio, AccessKit activation, and top repaint causes
@@ -3031,11 +3082,19 @@ impl TaskManApp {
             paint_max_ms = format_args!("{:.2}", to_ms(sw.paint_ns_max)),
             present_avg_ms = format_args!("{:.2}", to_ms(sw.present_ns_sum) / painted_frames),
             present_max_ms = format_args!("{:.2}", to_ms(sw.present_ns_max)),
+            model_rebuilds = self.input_stats.model_rebuilds,
+            icon_lookups = self.input_stats.icon_lookups,
+            icon_memo_hits = self.input_stats.icon_memo_hits,
+            text_measures = self.input_stats.text_measures,
             accesskit = ctx.is_accesskit_enabled(),
             causes = %causes_summary.join(","),
             "input stats"
         );
         self.input_stats.window_start = std::time::Instant::now();
+        self.input_stats.model_rebuilds = 0;
+        self.input_stats.icon_memo_hits = 0;
+        self.input_stats.icon_lookups = 0;
+        self.input_stats.text_measures = 0;
     }
 }
 

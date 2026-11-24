@@ -277,7 +277,7 @@ fn heat_row(
 ) -> Option<&'static str> {
     let texts = value_columns::in_display_order(order, &roll.texts());
     let heat = value_columns::in_display_order(order, &heat_max.intensity(roll));
-    let cells: Vec<HeatCell> = heat
+    let cells: Vec<HeatCell<'_>> = heat
         .iter()
         .zip(texts)
         .map(|(t, text)| HeatCell::new(*t, text))

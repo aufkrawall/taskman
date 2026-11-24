@@ -1138,6 +1138,7 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
             key: key.clone(),
             rows: build_rows(&snap, &key.2, key.3, key.4, &app.details_state.collapsed),
         });
+        app.note_table_model_rebuild();
     }
     let rows = match cache.as_ref() {
         Some(cache) => &cache.rows,
@@ -1264,8 +1265,11 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
                         {
                             app.details_state.toggle_expanded(row.pid);
                         }
-                        let tex = app.shared.icons.icon_or_default(
+                        // One lookup per distinct image per frame, not per row
+                        // (see `TmTable::row_icon`).
+                        let tex = table.row_icon(
                             ui.ctx(),
+                            &app.shared.icons,
                             &app.actions,
                             row.icon_path.as_deref(),
                         );
@@ -1326,13 +1330,17 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
                             egui::FontId::proportional(tablekit::FONT_ROW),
                             pal.text,
                         );
-                    } else {
-                        if table.text_cell(ui, rect, pos, text, &pal, false)
-                            && pointer
-                                .is_some_and(|pointer| table.col_rect(pos, rect).contains(pointer))
-                        {
+                    } else if pointer
+                        .is_some_and(|pointer| table.col_rect(pos, rect).contains(pointer))
+                    {
+                        // The clipped-text answer is only consumed for the cell
+                        // under the pointer, so only that one is measured; the
+                        // rest are painted without a text layout each.
+                        if table.text_cell(ui, rect, pos, text, &pal, false) {
                             truncated_tip = Some(text.to_string());
                         }
+                    } else {
+                        table.text_cell_unmeasured(ui, rect, pos, text, &pal, false);
                     }
                 }
 
@@ -1399,6 +1407,9 @@ pub fn show(app: &mut TaskManApp, ui: &mut egui::Ui) {
             }
         },
     );
+    let (icon_memo_hits, icon_lookups) = table.icon_memo_counts();
+    app.note_icon_work(icon_memo_hits, icon_lookups);
+    app.note_text_measures(table.text_measure_count());
 
     let header_secondary = ui.ctx().input(|i| {
         i.pointer.button_clicked(egui::PointerButton::Secondary)
