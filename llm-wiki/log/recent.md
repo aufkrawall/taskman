@@ -1,3 +1,47 @@
+## 2026-11-24 - Linux CPU rendering, per-process CPU accounting and icons
+
+- Four fixes landed together, each written on its own branch off the v0.1.33 tree: the
+  Linux CPU renderer's damage path, per-process CPU accounting, icon resolution, and the
+  Processes/Details repaint caches. They sit under `## Unreleased` in `CHANGELOG.md`;
+  nothing was released with them.
+- Renderer: the softbuffer surface faked `age()` from a "presented once" bool, while
+  Wayland's two-`wl_shm`-buffer ring hands back a buffer that is 0 or 2 frames old — so
+  the 64×64 tracker repainted only the changed tiles into zeroed or two-frame-old memory
+  (black boxes, stale glyphs, left-over regions). `FrameBuffer::age()` is now
+  `softbuffer::Buffer::age()`, and a resize no longer paints incrementally into a
+  reallocated segment. The atlas generation now bumps when a patch rewrites a LIVE glyph
+  slot (epaint reuses slots on overflow) and still not when it fills empty space; the
+  damage frame key gained `bezier_tolerance`, `epsilon` and the remaining pixel-affecting
+  tessellation options; `Shape::Circle` hashes the atlas because a filled disc can be
+  prerasterized into it; `tools/check-fork.ps1` now lints and tests `eframe` with the
+  shipped software feature set.
+- CPU: `linux/process_cpu.rs` measures each process over the same `/proc/stat` window the
+  header uses, `CpuSample` gained `window_total_ticks`, and `ProcessEntry::cpu_pct` became
+  `Option<f32>`, so an unattributable share is a dash instead of a fabricated 0 % (or a
+  fabricated 100 % for every row when `/proc/stat` was unreadable). Users rollups fold
+  measured rows only; an unmeasured cell sorts below a measured zero. Windows keeps its
+  own accountant and now dashes the first tick / sub-120 ms window too.
+- Icons: full transitive theme chain from the configured theme or the spec `default`
+  theme, `ScaledDirectories=`/`@N` scale, `Size × Scale` ranking with a native-size
+  tie-break, `$HOME/.icons` plus per-data-dir `pixmaps`, correct
+  Exec/TryExec/wrapper/Flatpak `--command=` matching, a sorted `applications/` walk, and
+  an icon cache that releases a stranded `queued` key, backs off a failed worker spawn
+  for 30 s and checks one atomic before draining results.
+- Review loop: every branch was sent back at least once. The renderer branch for a frame
+  key that still missed `bezier_tolerance`/`epsilon`, a `Circle` arm that relied on the
+  atlas being keyed elsewhere, and a gate comment that overclaimed what it compiled; the
+  CPU branch for a `CellValues::default()` row that would have painted a measured-looking
+  0 B, for the sort rule, and for explaining the dash outside the CPU cell; the icon
+  branch for `ScaledDirectories`, the native-size tie-break and a `TryExec`-without-`Exec`
+  entry; the repaint branch for a scroll request the cached selectable index could not
+  resolve and a memo hit that still allocated.
+- Do not re-litigate: **Wayland full-paints on purpose.** Tile skipping behind a ring
+  needs a damage cache per buffer slot; a status flag on the surface cannot stand in for
+  the buffer's identity, and conflating the two is exactly what the corruption was.
+  **`TryExec` is only a fallback** because the spec means "is this program installed",
+  not "another name for the app" — using it eagerly would relabel every
+  `python3`/`java`/`flatpak` process with the first entry that mentions it.
+
 ## 2026-11-24 - Released v0.1.33; README covers the D3D12 VRR exclusion
 
 - Released v0.1.33 (`851af4d`, tag `v0.1.33`): Windows x86_64/arm64 zip and setup installers, Linux x86_64/arm64 glibc tarballs (zigbuild), each with a `.sha256`. The published Windows GUI and the published Linux x86_64 binary (real backend under WSL) both pass `--selfcheck`, both setup payloads verify, and `sha256sum -c` passes against the downloaded assets. `--check --audit --all-targets` was green on the tagged commit; the tag stays on the documented version-bump commit.
@@ -3322,8 +3366,8 @@ position and the failed attempt left bytes behind.
 image, so a browser with twenty renderers and one `crashpad_handler` rendered
 as twenty-one flat rows. `application_family` keeps the members that belong and
 leaves the rest where they are — which is why the group aggregate had to become
-the members' own values (`family_values`) rather than the subtree's: a
-descendant shown as its own row must not also be counted inside the group.
+the members' own values (`family_cells`, now returning `CellValues`) rather than the
+subtree's: a descendant shown as its own row must not also be counted inside the group.
 
 Two rules group now, and the difference in strength between them is the design:
 same image joins unconditionally (that is what keeps a 40 % renderer inside its

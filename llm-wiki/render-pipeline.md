@@ -1,6 +1,6 @@
 # Render Pipeline
 
-Last verified: 2026-11-24 (GPU LCD path, manual D3D12/Vulkan validation, and Linux fontconfig)
+Last verified: 2026-11-24 (GPU LCD path, manual D3D12/Vulkan validation, Linux fontconfig, and the Linux CPU-renderer damage/age contract)
 
 Primary sources:
 - `vendor/egui/TASKMAN-FORK.md` (what diverges from upstream egui, and why)
@@ -133,6 +133,32 @@ surface and presents with `BitBlt`, for four reasons that are all failure behavi
 Paint and present failures are **never fatal**: they warn, mark the surface unpainted and
 schedule a 50 ms retry. `EventResult::Wait` (not `RepaintNow`) is returned from inside
 `WM_PAINT`, because scheduling a repaint synchronously there recurses into the same paint.
+
+**A tile hash is only sound when every global input that changes pixels is in the key.**
+`damage::FrameKey` covers the target size, `pixels_per_point`, the clear colour, text and
+sub-pixel mode, gamma/contrast, `round_rects_to_pixels`, `round_text_to_pixels`,
+`round_line_segments_to_pixels`, `coarse_tessellation_culling`, `feathering`,
+`feathering_size_in_pixels`, `prerasterized_discs`, `bezier_tolerance`, `epsilon` and the
+font atlas size. The `debug_*` toggles are the deliberate exception: they change the shapes
+that get emitted, which the per-shape hash already covers. `Shape::Circle` is hashed
+together with the font atlas even though it names no texture, because a small filled circle
+can be tessellated through a prerasterized disc that lives in that atlas. A missing entry
+does not fail a test — it shows up as a stale region — so
+`global_render_state_changes_force_full_damage` changes one input at a time against a
+shape-free frame, where only the key can force the repaint.
+
+**An atlas patch that rewrites a live texel invalidates the tiles sampling it.** epaint
+reuses atlas slots when the atlas overflows (its cursor restarts inside the image and live
+glyph cells are overwritten), so a partial update that changes texels which already held
+content bumps the texture generation, while filling empty atlas space bumps nothing and a
+newly rasterized glyph therefore costs no repaint. The "was it empty" test is sound because
+an allocated cell is always written in full — both rasterizers loop over the whole
+width × height rect, zero coverage included — and a zero-sized glyph is never allocated.
+One case escapes it: right after an overflow restart a new cell of a different size can
+write content into a still-live cell's transparent texels. That cannot outlive the next
+pass, because overflow pins `fill_ratio()` at 1.0 and the full upload that follows does
+bump the generation — at worst one frame of stale glyphs, in the state epaint already
+warns about.
 
 **Resident WGPU state follows viewport visibility.** eframe creates a device and surface only
 for a visible viewport. When no viewport remains on screen, hidden logic ticks continue, but
@@ -356,7 +382,7 @@ on this host.
   - Uniform untextured triangle fast paths (opaque and translucent) with single-branch edge testing.
   - Text blitting with hoisted `linear_u16` LUTs, clamped row slices, and solid-glyph interior bypass.
   - Full-target memset clear path.
-  - 64×64 tile damage tracking (`egui_software::damage`, `Painter::paint_shapes_damaged`, the `age() == 1` present-in-damage path — `BitBlt` + `ValidateRect` per dirty rect on Windows, `softbuffer::Buffer::present_with_damage` elsewhere — and not restored from hidden), skipping unchanged frames completely and repainting/presenting only dirty tiles on partial updates.
+  - 64×64 tile damage tracking (`egui_software::damage`, `Painter::paint_shapes_damaged`, the `age() == 1` present-in-damage path — `BitBlt` + `ValidateRect` per dirty rect on Windows, `softbuffer::Buffer::present_with_damage` elsewhere — and not restored from hidden), skipping unchanged frames completely and repainting/presenting only dirty tiles on partial updates. The buffer's age is the SURFACE's to report: the tracker compares shapes, not pixels, so an incremental paint is sound only when the buffer it is handed really holds the previous frame. Windows answers with its DIB's presented flag; the softbuffer surface must answer with `softbuffer::Buffer::age()`. A local "we presented something" flag is not equivalent and was the Linux corruption: nothing in it changes when the backend hands back a *different* buffer. Softbuffer's Wayland backend keeps two `wl_shm` buffers and swaps them per present, so a leased buffer is 0 or 2 frames old and never 1 — Wayland therefore full-paints every frame, while X11 (one SHM segment per surface, age reset when it is reallocated) keeps the incremental path and a resize forces a full paint instead of painting into a reallocated segment. Restoring tile skipping behind a ring needs a damage cache per buffer slot; see `known-debt.md`.
   - Taskman process table caching by reference, avoiding per-frame vector cloning.
   - IconCache O(1) lazy expiration and direct unmultiplied upload.
   Remaining potential work: SIMD for span fills.

@@ -43,6 +43,17 @@ undisturbed. Windows integration tests may spawn short-lived helper processes.
 The service self-check is non-mutating: it does not write Program Files,
 ProgramData, registry, or SCM state.
 
+`--selfcheck`'s JSON summary carries per-source availability counters beside the
+entity counts, and they are the regression signal rather than decoration:
+`process_net_readings` and `process_disk_readings` for the two per-process traces
+(`0` with a running trace is a real answer — the ETW sessions need administrator
+rights), `process_cpu_readings` for rows that carried a measured CPU
+share, and `process_cpu_unknown` for the real (non-synthetic) processes showing
+the honest dash. `process_cpu_readings` at 0 while `cpu.util_pct` is non-null is the
+signature of an accountant that stopped reporting while the header stayed correct;
+`process_cpu_unknown` equal to the process count is the opposite failure, every row
+blanked.
+
 Three ignored ETW diagnostics validate real Windows payloads rather than only
 synthetic records: `disk_trace_attributes_real_requests_to_the_issuing_process`,
 `protected_process_modules_include_csrss_images`, and
@@ -96,7 +107,22 @@ normal GUI log.
   decisions (`moves_s`, `dup`, `same_target`, `stable_veto`, `coalesced`,
   `repaint_now`, `trailing`, `active`), software-renderer frame timings
   (`pass_avg/max_ms`, `paint_avg/max_ms`, `present_avg/max_ms`), tile-damage
-  skips/counts, AccessKit activation status, and top `ctx.repaint_causes()`.
+  skips/counts, AccessKit activation status, top `ctx.repaint_causes()`, and the
+  table repaint work below. The last three cover only the pages that report their
+  icon and text work (Processes, Details); App History, Startup and Users still
+  resolve one icon per row and are not part of those numbers.
+  - `model_rebuilds` — flattened-model rebuilds on Processes and Details. It
+    tracks the SAMPLING cadence, never the frame rate: a scroll frame changes
+    neither the data nor the ordering. A value that follows the refresh rate
+    instead is the regression this counter exists for.
+  - `icon_lookups` — icon-cache lookups the row loops actually made, roughly
+    the DISTINCT visible images per frame.
+  - `icon_memo_hits` — rows whose icon the per-frame memo answered without
+    touching the cache; `hits + lookups` is the rows painted.
+  - `text_measures` — clipped-text layouts spent only to answer "is this cell
+    clipped". Details is the only page that reports it, and it should sit at
+    ~0 unless the pointer is over the Details table; a number there is one text
+    layout per visible cell per repaint.
 
 ### Per-process GPU memory
 

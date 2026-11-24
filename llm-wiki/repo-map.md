@@ -1,6 +1,6 @@
 # Repo Map (code map)
 
-Last cross-checked: 2026-11-23 (Linux action, lifecycle, and evidence modules)
+Last cross-checked: 2026-11-24 (Linux per-process CPU accountant, icon theme chain, and the table repaint caches)
 
 Primary sources:
 - workspace tree (verified against working tree)
@@ -18,7 +18,9 @@ platform boundary (`tm-core` ← `tm-platform` ← `tm-app` / `tm-service`), and
     disks, networks incl. optional IP metadata (SSID/signal only behind the
     opt-in `wifi_details` setting), GPU incl.
     `AdapterLuid`, processes incl.
-    elevation/UAC/power-throttle fields), `engine.rs` (sampling engine:
+    elevation/UAC/power-throttle fields and `cpu_pct: Option<f32>` — `None`
+    means the backend could not attribute CPU time to that process in the
+    sample window, and it renders as "—", never as 0 %), `engine.rs` (sampling engine:
     lazy start via collector factory, event notifier, Refresh-while-paused),
     `settings.rs` (INI config + persisted Details tree view, per-table sort +
     per-image priority/affinity rules, tray/autostart options +
@@ -177,14 +179,43 @@ platform boundary (`tm-core` ← `tm-platform` ← `tm-app` / `tm-service`), and
     `\VarFileInfo\Translation` table with a UI-language preference — hardcoded
     English codepages silently blanked every binary shipping only a localized
     table). `xdg_icons.rs` (freedesktop icon-theme resolution used by the
-    Linux backend's `process_icon_rgba`: `.desktop` `Icon=` via XDG data dirs,
-    X11 XSettings or GTK config for the theme, then inheritance, hicolor,
-    and pixmaps. PNG decode is capped at
-    64 px; plus `default_app_icon_rgba`, the theme's
+    Linux backend's `process_icon_rgba`: an executable basename is matched
+    against `Exec=`, `TryExec=` or the desktop file's own id across the XDG
+    data dirs, walking `applications/` in sorted order because `read_dir` order
+    let the filesystem decide which app owns a shared executable name.
+    `TryExec=` is only a fallback — the spec means "is this program installed",
+    not "another name for the app" — so it counts only where the entry's
+    `Exec=` names a launcher (`env`/`sudo`/`setsid`/`nohup`/`nice` prefixes
+    skipped with their flags, `python3 app.py` never adopts `app.py`) or is
+    unusable, and a Flatpak launcher contributes its `--command=` instead of
+    `flatpak` itself. The `Icon=` value is then searched in the full transitive
+    theme chain: the configured theme (X11 XSettings, then GTK settings, then
+    Plasma `kdeglobals`) or the spec `default` theme, `Inherits` expanded
+    depth-first with a cycle guard, and `hicolor` last. `hicolor`-only discovery
+    was the bug: on a stock Arch box it holds no PNGs, so nearly every row
+    missed. Size directories come from `index.theme`'s `Directories=` plus
+    `ScaledDirectories=`, rank by `Size × Scale` (a missing `Scale=` derived
+    from an `@N` directory suffix) and prefer the directory native at the target
+    size over an upscaled tie; search roots are `$XDG_DATA_HOME/icons`,
+    `$XDG_DATA_DIRS/icons`, `$HOME/.icons` and every data dir's `pixmaps`. PNG
+    only — SVG/XPM candidates are skipped per size directory, so an SVG-only app
+    falls back to the generic glyph. PNG decode is capped at 64 px
+    (`EXPAND | STRIP_16`); plus `default_app_icon_rgba`, the theme's
     `application-x-executable` / `application-default-icon` / `image-missing`
     chain, which is what a row without an icon of its own paints;
     platform-neutral so its tests run on the Windows host too).
-    Linux/macOS backends exist and are built by default (`build.py`). The Linux
+    `linux/cpu_stat.rs` owns the machine `/proc/stat` window: aggregate and
+    per-core busy/kernel shares plus `window_total_ticks`, the CPU capacity
+    those two ticks covered. `linux/process_cpu.rs` is the per-process
+    accountant over that SAME window — `/proc/<pid>/stat` fields 14+15 against
+    `window_total_ticks`, a share of total machine capacity in [0, 100] (the
+    Windows contract), cumulative `cpu_time_s` since process start, a
+    boot-relative start-tick guard against PID reuse, skipped-reading
+    detection, regressing-counter rejection and a never-exceeds-machine clamp.
+    Anything unmeasurable is `None`, never 0 % — including the first window of
+    a process. One `/proc/<pid>/stat` read feeds both the identity bracket and
+    the accountant. Linux/macOS backends exist and are built by default
+    (`build.py`). The Linux
     window observer uses a dedicated non-blocking `linux/x11_windows.rs`
     thread: EWMH client lists are merged, X-Resource supplies local client
     PIDs where available, machine-verified `_NET_WM_PID` is the fallback, and
@@ -425,8 +456,21 @@ platform boundary (`tm-core` ← `tm-platform` ← `tm-app` / `tm-service`), and
 - `crates/tm-app/src/widgets/tablekit.rs` — the blue value band is OPAQUE and
   is painted after the row fill, so `row()` records its selection/hover color
   in `row_overlay` and `heat_cells` re-applies it; dropping that makes hover
-  stop dead at the first value column. Row height is per-table (`row_h`,
-  `ROW_H_DENSE`) and `scrolled_rows` must virtualize on it, never on `ROW_H`.
+  stop dead at the first value column. `HeatCell::text` is a `Cow`, so a page
+  whose model already formatted the cell passes the borrowed `&str` and a
+  repaint allocates nothing. `row_icon` answers a row's icon from a per-frame
+  memo keyed by the row's image path (a linear VECTOR, not a map: a table shows
+  tens of DISTINCT images per frame however many rows it has, and the hit path
+  must not build or copy a key): one cache lookup per distinct image per
+  repaint instead of one per visible row plus a second default-icon lookup for
+  every path-less row. The table is built per frame, which is what makes the
+  memo sound — extraction is asynchronous and only turns a pending image into
+  a ready one BETWEEN frames — and what stops a cached "no icon yet" from
+  outliving a frame. `text_cell_unmeasured` paints the identical cell without
+  the clipped-text layout, for callers that only consume the answer while the
+  pointer is inside that cell (Details); `icon_memo_counts` and
+  `text_measure_count` feed `TASKMAN_INPUT_STATS=1`. Row height is per-table
+  (`row_h`, `ROW_H_DENSE`) and `scrolled_rows` must virtualize on it, never on `ROW_H`.
   `scrolled_rows` also anchors the vertical offset to the identities of the
   previously visible rows (`ScrollAnchor` + `stable_key`) on model-rebuild
   frames, so insertions/removals around the viewport cannot shift the content.
@@ -494,10 +538,23 @@ platform boundary (`tm-core` ← `tm-platform` ← `tm-app` / `tm-service`), and
   Expandable application/family rows are virtual presentation parents: the
   virtual row owns the aggregate, while expansion reveals every concrete member
   (including the former head/root) as a child with only its own metrics. Flat
-  Background/Windows family aggregates use `family_values` — the MEMBERS' own
+  Background/Windows family aggregates use `family_cells` (returns
+  `CellValues`: `display` plus `known` per LOGICAL column) — the MEMBERS' own
   values, not the subtree's, because a
   foreign descendant left outside the group is rendered as its own row and must
-  not be counted twice. Do not collapse this back to a literal PPID tree. Raw `ProcessEntry.ppid` remains OS truth and is exposed by the
+  not be counted twice. Do not collapse this back to a literal PPID tree.
+  `State::cache` (`Cache`) now holds what the repaint path used to re-derive
+  every frame: the display rows and the selectable-row index (`selectable`,
+  display indices in display order, which selection movement, its Shift range
+  and the scroll request all walk). It is invalidated through `view_generation`
+  rather than through the `expanded`/`group_collapsed` sets — the index is only
+  correct for the expansion state that built it, so every mutation must bump
+  that generation (`toggle_expanded`, `toggle_group`, and Expand/Collapse all).
+  `RowData::cells` carries the per-row numeric cell TEXT, formatted with the
+  model by `normalize_heat`, which already finalizes the per-column heat; a
+  repaint paints it instead of re-formatting every visible cell. An unmeasured
+  cell is `None` in `CellValues::key`, so it ranks strictly below a measured
+  zero in both sort directions rather than tying with it. Raw `ProcessEntry.ppid` remains OS truth and is exposed by the
   persisted System Informer-style tree on the Details page, which is expanded
   by DEFAULT (`details::State.collapsed` tracks the exceptions) so newly
   appearing subtrees are never silently hidden. That tree has THREE sort
@@ -578,7 +635,11 @@ than portable CI.
 `vendor/egui/TASKMAN-FORK.md` is the divergence inventory and rebase runbook;
 `llm-wiki/render-pipeline.md` is the design. The fork has its own quality gate,
 `tools/check-fork.ps1`, because `cargo clippy --workspace` does not reach an excluded
-workspace.
+workspace; it also lints and unit-tests `eframe` with the shipped software feature
+set (`accesskit,default_fonts,software,wayland,x11`, never its defaults + `software`),
+which no workspace clippy or test run reached before. The script is host-only, so the
+Linux-only present surface still depends on `build.py`'s target cross-check to be
+compiled at all.
 
 `vendor/winit/` is a patch of winit 0.30.13: `TASKMAN_WINDOW_BAND` makes window
 creation use `CreateWindowInBand` so an always-on-top TaskMan window can be
