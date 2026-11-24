@@ -381,11 +381,22 @@ impl IconCache {
         drop(budget);
         // Saturating: a dead worker resets the counter, and the results it had
         // already published are drained after that reset.
-        let _ = self.in_flight.fetch_update(
-            std::sync::atomic::Ordering::Relaxed,
-            std::sync::atomic::Ordering::Relaxed,
-            |in_flight| Some(in_flight.saturating_sub(processed)),
-        );
+        // A compare-exchange loop rather than `fetch_update`: the latter is
+        // deprecated on current nightlies while the stable toolchain CI uses
+        // still ships it, so neither spelling is warning-free on both.
+        let mut current = self.in_flight.load(std::sync::atomic::Ordering::Relaxed);
+        loop {
+            let next = current.saturating_sub(processed);
+            match self.in_flight.compare_exchange_weak(
+                current,
+                next,
+                std::sync::atomic::Ordering::Relaxed,
+                std::sync::atomic::Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(actual) => current = actual,
+            }
+        }
         if loaded > 0 {
             // Freshly uploaded textures must be painted even when nothing is
             // left in the queue — otherwise the last batch waits for an

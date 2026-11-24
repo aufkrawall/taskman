@@ -4707,7 +4707,7 @@ mod tests {
     /// name comparison and the click looked like it did nothing.
     #[test]
     fn every_value_column_sorts_by_its_own_value() {
-        for li in 0..VALUE_COLS {
+        for (li, column) in VALUE_COLUMNS.iter().enumerate() {
             let mut low = ProcessEntry::new(1, "zzz-low.exe");
             let mut high = ProcessEntry::new(2, "aaa-high.exe");
             // Names are deliberately reversed: a column that falls back to
@@ -4723,7 +4723,7 @@ mod tests {
             assert_eq!(
                 rows[0].pid, high.pid,
                 "column {li} ({}) did not sort by its own value",
-                VALUE_COLUMNS[li].id
+                column.id
             );
         }
     }

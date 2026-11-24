@@ -2060,7 +2060,7 @@ mod tests {
         let memo: std::cell::RefCell<Vec<(Option<String>, usize)>> =
             std::cell::RefCell::new(Vec::new());
         let resolutions = std::cell::Cell::new(0usize);
-        let mut resolve = || {
+        let resolve = || {
             resolutions.set(resolutions.get() + 1);
             resolutions.get()
         };
@@ -2068,7 +2068,7 @@ mod tests {
         for _ in 0..5 {
             // A borrowed key every time: the hit path must not need an owned
             // one, which is what makes it allocation-free.
-            assert_eq!(memoize(&memo, Some("svchost.exe"), &mut resolve), 1);
+            assert_eq!(memoize(&memo, Some("svchost.exe"), resolve), 1);
         }
         assert_eq!(
             memo.borrow().len(),
@@ -2077,8 +2077,8 @@ mod tests {
         );
         // A second distinct image, and the path-less rows, each resolve once.
         for _ in 0..3 {
-            assert_eq!(memoize(&memo, Some("/usr/bin/firefox"), &mut resolve), 2);
-            assert_eq!(memoize(&memo, None, &mut resolve), 3);
+            assert_eq!(memoize(&memo, Some("/usr/bin/firefox"), resolve), 2);
+            assert_eq!(memoize(&memo, None, resolve), 3);
         }
         assert_eq!(resolutions.get(), 3, "one resolution per distinct image");
         assert_eq!(memo.borrow().len(), 3);
@@ -2113,7 +2113,7 @@ mod tests {
         let painted = |measured: bool| {
             let ctx = egui::Context::default();
             let table = table();
-            let out = ctx.run_ui(
+            let mut out = ctx.run_ui(
                 egui::RawInput {
                     screen_rect: Some(Rect::from_min_size(Pos2::ZERO, egui::vec2(900.0, 160.0))),
                     ..Default::default()
@@ -2136,6 +2136,7 @@ mod tests {
                     });
                 },
             );
+            out.textures_delta.clear();
             out.shapes
                 .iter()
                 .filter_map(|clipped| match &clipped.shape {
