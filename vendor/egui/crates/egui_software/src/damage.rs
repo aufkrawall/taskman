@@ -883,7 +883,7 @@ mod tests {
         mesh.texture_id = texture;
         let shapes = vec![ClippedShape {
             clip_rect: full_clip(),
-            shape: Shape::Mesh(mesh),
+            shape: Shape::Mesh(mesh.into()),
         }];
 
         let mut buf = vec![0u32; (W * H) as usize];
