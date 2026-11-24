@@ -20,7 +20,10 @@ use crate::widgets::tablekit::TmColumn;
 /// time, GPU.
 pub const VALUE_COLS: usize = 6;
 
-/// Index of the Network column inside `values` — one of the three whose value
+/// Index of the CPU column inside `values` — unknown for a row the backend
+/// could not attribute CPU time to in the sampled window.
+pub const CPU: usize = 0;
+/// Index of the Network column inside `values` — one of the columns whose value
 /// can be genuinely unknown per row.
 pub const NET: usize = 3;
 /// Index of the Disk active time column inside `values`; likewise optional.
@@ -196,7 +199,7 @@ pub fn in_display_order<T: Clone>(order: &[usize], logical: &[T; VALUE_COLS]) ->
 pub fn value_text(li: usize, value: f64, known: bool) -> String {
     match li {
         _ if !known => "\u{2014}".to_string(),
-        0 => format::format_pct_cell(value.min(100.0) as f32),
+        CPU => format::format_pct_cell(value.min(100.0) as f32),
         1 => format::format_mb(value as u64),
         2 => format::format_rate_mb(value),
         NET => format::format_process_net_rate(value),
@@ -206,7 +209,7 @@ pub fn value_text(li: usize, value: f64, known: bool) -> String {
 }
 
 /// Why a column can read "—", for the hover explanation. `None` where the
-/// column is always measurable and a dash would be a bug, not a limitation.
+/// column has no localized explanation yet.
 pub fn unavailable_tip(li: usize) -> Option<&'static str> {
     match li {
         NET => Some(i18n::tr(K::NetPerProcessUnavailable)),

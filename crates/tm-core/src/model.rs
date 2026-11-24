@@ -584,8 +584,12 @@ pub struct ProcessEntry {
     pub user_sid: Option<String>,
     pub session_id: Option<u32>,
 
-    /// CPU utilization normalized to whole-system capacity (TM-style, max 100).
-    pub cpu_pct: f32,
+    /// CPU utilization normalized to whole-system capacity (TM-style, max
+    /// 100), or `None` when the backend could not attribute CPU time to this
+    /// process for the sample window. A zero here would claim a measurement
+    /// nobody made.
+    #[serde(default)]
+    pub cpu_pct: Option<f32>,
     /// Resident memory attributed to the process (Private Working Set by default on Windows).
     pub mem_bytes: u64,
     /// Total working set (resident memory including shared pages) when available.
@@ -767,7 +771,7 @@ impl ProcessEntry {
             user: None,
             user_sid: None,
             session_id: None,
-            cpu_pct: 0.0,
+            cpu_pct: None,
             mem_bytes: 0,
             working_set_bytes: None,
             commit_bytes: None,

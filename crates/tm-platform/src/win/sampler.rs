@@ -1616,7 +1616,7 @@ impl Sampler {
             // Time-based share of total machine capacity + absolute CPU time,
             // both straight from the kernel's accumulators (cpu_load.rs).
             let pc = load.as_ref().and_then(|l| l.procs.get(&pid_u));
-            entry.cpu_pct = pc.map_or(0.0, |c| c.pct);
+            entry.cpu_pct = pc.map(|c| c.pct);
             let ws_total = self
                 .cpu_load
                 .working_set_of(pid_u, entry.start_epoch_s)
@@ -2395,7 +2395,7 @@ fn append_pseudo_rows(
         let mut e = ProcessEntry::new(PSEUDO_PID_INTERRUPTS, "System Interrupts");
         e.display = i18n::tr(K::SystemInterrupts).to_string();
         e.category = ProcCategory::System;
-        e.cpu_pct = h.pct.clamp(0.0, 100.0);
+        e.cpu_pct = Some(h.pct.clamp(0.0, 100.0));
         e.synthetic = true;
         e.description = Some(h.detail.clone());
         processes.push(e);
@@ -2412,7 +2412,7 @@ fn append_pseudo_rows(
             i18n::tr(K::TerminatedProcessesPlain).to_string()
         };
         e.category = ProcCategory::Background;
-        e.cpu_pct = h.pct.clamp(0.0, 100.0);
+        e.cpu_pct = Some(h.pct.clamp(0.0, 100.0));
         e.synthetic = true;
         e.description = Some(h.detail.clone());
         processes.push(e);
@@ -3143,10 +3143,10 @@ mod tests {
         let by_pid = |pid: u32| processes.iter().find(|p| p.pid == pid).unwrap();
         let i = by_pid(PSEUDO_PID_INTERRUPTS);
         assert_eq!(i.category, ProcCategory::System);
-        assert_eq!(i.cpu_pct, 2.0);
+        assert_eq!(i.cpu_pct, Some(2.0));
         let t = by_pid(PSEUDO_PID_TERMINATED);
         assert_eq!(t.category, ProcCategory::Background);
-        assert_eq!(t.cpu_pct, 40.0);
+        assert_eq!(t.cpu_pct, Some(40.0));
         assert!(t.display.contains('5'), "count in label: {}", t.display);
         assert_eq!(t.description.as_deref(), Some("rustc.exe ×5"));
     }

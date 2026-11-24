@@ -2143,7 +2143,10 @@ fn row_from_process(p: &ProcessEntry, depth: usize, children: bool) -> Row {
         power_throttled: p.power_throttled == Some(true),
         user: p.user.clone().unwrap_or_else(|| "—".into()),
         user_sid: p.user_sid.clone().unwrap_or_else(|| "—".into()),
-        cpu_s: format::format_cpu_detail(p.cpu_pct),
+        cpu_s: p
+            .cpu_pct
+            .map(format::format_cpu_detail)
+            .unwrap_or_else(|| "—".into()),
         mem_s: format::format_k(p.mem_bytes),
         net_s: option_rate(process_network_rate(p)),
         net_recv_s: option_rate(p.net_recv_bps),
@@ -4222,7 +4225,10 @@ fn process_properties_statistics(ui: &mut egui::Ui, process: &ProcessEntry) {
             property_row(
                 ui,
                 i18n::tr(K::ColCpu),
-                format::format_pct_cell(process.cpu_pct),
+                process
+                    .cpu_pct
+                    .map(format::format_pct_cell)
+                    .unwrap_or_else(|| "—".into()),
                 false,
             );
             property_row(
@@ -5640,8 +5646,8 @@ mod tests {
                     b.user_sid = Some("S-1-5-19".into());
                 }
                 ColumnId::Cpu => {
-                    a.cpu_pct = 5.0;
-                    b.cpu_pct = 50.0;
+                    a.cpu_pct = Some(5.0);
+                    b.cpu_pct = Some(50.0);
                 }
                 ColumnId::Memory => {
                     a.mem_bytes = 100;

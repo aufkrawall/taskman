@@ -45,7 +45,8 @@ use crate::app::TaskManApp;
 use crate::icons::Icon;
 use crate::search;
 use crate::tabs::value_columns::{
-    self, DISK_ACT as DISK_ACT_VALUE, FIXED_COLS, GPU as GPU_VALUE, NET as NET_VALUE, VALUE_COLS,
+    self, CPU as CPU_VALUE, DISK_ACT as DISK_ACT_VALUE, FIXED_COLS, GPU as GPU_VALUE,
+    NET as NET_VALUE, VALUE_COLS,
 };
 use crate::theme;
 use crate::widgets::menu;
@@ -102,6 +103,9 @@ pub struct RowData {
     /// before virtualization (audit P0.2): exactly 1.0 marks the column's
     /// top consumer.
     pub heat: [f32; VALUE_COLS],
+    /// False when this row's CPU share was not measured in the window; the
+    /// cell then reads "—". A zero would claim an idle process.
+    pub cpu_available: bool,
     pub net_available: bool,
     /// False while the per-process disk trace is not running. Rendered "—";
     /// a zero here would claim the process touched no disk.
@@ -1919,7 +1923,7 @@ fn joins_family(root: &ProcessEntry, kid: &ProcessEntry) -> bool {
     same_publisher
         && looks_like_helper_process(&kid.name)
         && !kid.has_window
-        && kid.cpu_pct < PROMOTE_CPU_PCT
+        && kid.cpu_pct.is_none_or(|pct| pct < PROMOTE_CPU_PCT)
         && !is_system_boundary(&root.name)
         && !is_system_boundary(&kid.name)
         && !is_launch_boundary(&root.name)
@@ -2079,6 +2083,7 @@ fn emit_flat_with_family_groups(
 
     for p in display {
         if let Some(fam) = family_heads.get(&p.pid) {
+            let cpu_available = fam.iter().any(|member| cpu_known(member));
             let net_available = fam
                 .iter()
                 .any(|member| member.net_recv_bps.is_some() || member.net_sent_bps.is_some());
@@ -2099,6 +2104,7 @@ fn emit_flat_with_family_groups(
                     .collect(),
                 values: repr.get(&p.pid).copied().unwrap_or([0.0; VALUE_COLS]),
                 heat: [0.0; VALUE_COLS],
+                cpu_available,
                 net_available,
                 disk_available,
                 gpu_available,
@@ -2421,7 +2427,7 @@ fn promote_busy_external_tasks<'a>(
             // instead, which makes them their own app root.
             !p.has_window
                 && p.app_group.is_none()
-                && p.cpu_pct >= PROMOTE_CPU_PCT
+                && p.cpu_pct.is_some_and(|pct| pct >= PROMOTE_CPU_PCT)
                 && category.get(&p.pid) == Some(&ProcCategory::App)
                 && !app_roots.contains(&p.pid)
                 && is_external_family_member(p, by_pid, &category)
@@ -2512,6 +2518,7 @@ fn value_text(row: &RowData, li: usize) -> String {
 /// pull the column's maximum either.
 fn value_known(d: &RowData, i: usize) -> bool {
     match i {
+        CPU_VALUE => d.cpu_available,
         NET_VALUE => d.net_available,
         DISK_ACT_VALUE => d.disk_available,
         GPU_VALUE => d.gpu_available,
@@ -2553,6 +2560,7 @@ fn make_flat_row(p: &ProcessEntry) -> DisplayRow {
         termination_targets: vec![process_identity(p)],
         values: own_values(p),
         heat: [0.0; VALUE_COLS],
+        cpu_available: cpu_known(p),
         net_available: p.net_recv_bps.is_some() || p.net_sent_bps.is_some(),
         disk_available: disk_known(p),
         gpu_available: gpu_known(p),
@@ -2567,7 +2575,7 @@ fn make_flat_row(p: &ProcessEntry) -> DisplayRow {
 /// The process's own resource values (no subtree aggregation).
 fn own_values(p: &ProcessEntry) -> [f64; VALUE_COLS] {
     [
-        p.cpu_pct as f64,
+        f64::from(p.cpu_pct.unwrap_or(0.0)),
         p.mem_bytes as f64,
         p.disk_read_bps + p.disk_write_bps,
         p.net_recv_bps.unwrap_or(0.0) + p.net_sent_bps.unwrap_or(0.0),
@@ -2576,6 +2584,11 @@ fn own_values(p: &ProcessEntry) -> [f64; VALUE_COLS] {
         f64::from(p.disk_active_pct.unwrap_or(0.0)),
         f64::from(p.gpu_util_pct.unwrap_or(0.0)),
     ]
+}
+
+/// Whether the per-process CPU accountant measured this process' share.
+fn cpu_known(p: &ProcessEntry) -> bool {
+    p.cpu_pct.is_some()
 }
 
 /// Whether the per-process disk trace produced a value for this process.
@@ -2601,6 +2614,7 @@ fn make_own_row(p: &ProcessEntry, depth: usize) -> DisplayRow {
         termination_targets: vec![process_identity(p)],
         values: own_values(p),
         heat: [0.0; VALUE_COLS],
+        cpu_available: cpu_known(p),
         net_available: p.net_recv_bps.is_some() || p.net_sent_bps.is_some(),
         disk_available: disk_known(p),
         gpu_available: gpu_known(p),
@@ -2758,6 +2772,7 @@ fn emit_tree<'a>(
             out.push(make_own_row(root, 0));
             continue;
         }
+        let cpu_available = members.iter().any(|member| cpu_known(member));
         let net_available = members
             .iter()
             .any(|member| member.net_recv_bps.is_some() || member.net_sent_bps.is_some());
@@ -2781,6 +2796,7 @@ fn emit_tree<'a>(
                 .collect(),
             values: shown[&root.pid],
             heat: [0.0; VALUE_COLS],
+            cpu_available,
             net_available,
             disk_available,
             gpu_available,
@@ -3098,7 +3114,7 @@ mod tests {
         p.ppid = ppid;
         p.category = cat;
         p.has_window = cat == ProcCategory::App && ppid.is_none();
-        p.cpu_pct = 1.0 * pid as f32;
+        p.cpu_pct = Some(1.0 * pid as f32);
         p.mem_bytes = 1000 * pid as u64;
         p
     }
@@ -3197,7 +3213,7 @@ mod tests {
             proc(4, None, "bg", ProcCategory::Background),
         ];
         for p in &mut snap_procs {
-            p.cpu_pct = 0.0;
+            p.cpu_pct = Some(0.0);
         }
         let snap = snap_of(snap_procs);
         let groups = [false; 3];
@@ -3229,7 +3245,7 @@ mod tests {
             proc(3, Some(2), "browser.exe", ProcCategory::App),
         ];
         for process in &mut processes {
-            process.cpu_pct = 0.0;
+            process.cpu_pct = Some(0.0);
             process.start_epoch_s = Some(1000 + i64::from(process.pid));
         }
         let snap = snap_of(processes);
@@ -3524,7 +3540,7 @@ mod tests {
         let mut shell = proc(11, Some(10), "powershell.exe", ProcCategory::App);
         // Real shells idle below the promotion threshold; keep the fixture
         // faithful to that so the shell stays folded into the terminal group.
-        shell.cpu_pct = 0.0;
+        shell.cpu_pct = Some(0.0);
         let mut notepad = proc(12, Some(11), "notepad.exe", ProcCategory::App);
         notepad.has_window = true;
         let rows = build_display_rows(
@@ -3574,7 +3590,7 @@ mod tests {
             proc(4, Some(3), "great", ProcCategory::App),
         ];
         for p in &mut snap_procs {
-            p.cpu_pct = 0.0;
+            p.cpu_pct = Some(0.0);
         }
         let snap = snap_of(snap_procs);
         let mut expanded = HashSet::new();
@@ -3625,7 +3641,7 @@ mod tests {
             proc(4, Some(3), "GGC", ProcCategory::App),
         ];
         for p in &mut snap_procs {
-            p.cpu_pct = 0.0;
+            p.cpu_pct = Some(0.0);
         }
         let snap = snap_of(snap_procs);
         let groups = [false; 3];
@@ -3654,10 +3670,10 @@ mod tests {
     fn app_group_aggregate_is_separate_from_the_real_root_values() {
         let mut root = proc(1, None, "app.exe", ProcCategory::App);
         root.has_window = true;
-        root.cpu_pct = 1.0;
+        root.cpu_pct = Some(1.0);
         root.mem_bytes = 100;
         let mut child = proc(2, Some(1), "app.exe", ProcCategory::App);
-        child.cpu_pct = 2.0;
+        child.cpu_pct = Some(2.0);
         child.mem_bytes = 200;
         // Snapshot order is arbitrary: a child may precede its parent.
         let snap = snap_of(vec![child, root]);
@@ -3929,13 +3945,13 @@ mod tests {
     #[test]
     fn heat_normalizes_per_column_across_the_whole_model() {
         let mut heavy = proc(10, None, "heavy.exe", ProcCategory::Background);
-        heavy.cpu_pct = 90.0;
+        heavy.cpu_pct = Some(90.0);
         heavy.mem_bytes = 800_000_000;
         let mut light = proc(11, None, "light.exe", ProcCategory::Background);
-        light.cpu_pct = 9.0;
+        light.cpu_pct = Some(9.0);
         light.mem_bytes = 400_000_000;
         let mut zero = proc(12, None, "zero.exe", ProcCategory::Background);
-        zero.cpu_pct = 0.0;
+        zero.cpu_pct = Some(0.0);
         zero.mem_bytes = 100;
 
         let groups = [false; 3];
@@ -4044,6 +4060,71 @@ mod tests {
             },
             "—"
         );
+    }
+
+    /// A CPU share nobody measured must read "—" in the CPU column, never
+    /// "0 %": Linux reports no share for the first window and for a process it
+    /// has seen only once, and a fabricated zero claims an idle process.
+    #[test]
+    fn missing_cpu_share_renders_unavailable_not_zero() {
+        let mut unmeasured = proc(9, None, "new.exe", ProcCategory::Background);
+        unmeasured.cpu_pct = None;
+        let d = single_row(snap_of(vec![unmeasured]));
+        assert!(!d.cpu_available);
+        assert_eq!(d.heat[CPU_VALUE], 0.0);
+        assert_eq!(value_text(&d, CPU_VALUE), "—");
+
+        // A measured zero IS a measurement and still prints as one.
+        let mut idle = proc(10, None, "idle.exe", ProcCategory::Background);
+        idle.cpu_pct = Some(0.0);
+        let d = single_row(snap_of(vec![idle]));
+        assert!(d.cpu_available, "a measured idle process is not unknown");
+        assert_eq!(value_text(&d, CPU_VALUE), format::format_pct_cell(0.0));
+    }
+
+    /// A group row is as measurable as the members that reported: one measured
+    /// member makes the (lower-bound) sum a real value, and a group nobody
+    /// measured stays unknown instead of totalling a fake zero.
+    #[test]
+    fn a_group_cpu_share_is_known_only_if_a_member_reported_one() {
+        let mut root = proc(1, None, "worker.exe", ProcCategory::Background);
+        root.cpu_pct = None;
+        let mut child = proc(2, Some(1), "worker.exe", ProcCategory::Background);
+        child.cpu_pct = Some(4.0);
+        let rows = build_display_rows(
+            &snap_of(vec![root, child]),
+            "",
+            0,
+            true,
+            &HashSet::new(),
+            &[false; 3],
+        );
+        let head = rows
+            .iter()
+            .find_map(|row| match row {
+                DisplayRow::Process(row) if row.pid == 1 => Some(row.clone()),
+                _ => None,
+            })
+            .expect("family head row");
+        assert!(head.cpu_available);
+        assert_eq!(head.values[CPU_VALUE], 4.0);
+
+        let mut lonely = proc(3, None, "quiet.exe", ProcCategory::Background);
+        lonely.cpu_pct = None;
+        let d = single_row(snap_of(vec![lonely]));
+        assert!(!d.cpu_available);
+        assert_eq!(value_text(&d, CPU_VALUE), "—");
+    }
+
+    /// The first row `build_display_rows` emits for a one-process snapshot.
+    fn single_row(snap: Snapshot) -> RowData {
+        build_display_rows(&snap, "", 0, true, &HashSet::new(), &[false; 3])
+            .into_iter()
+            .find_map(|row| match row {
+                DisplayRow::Process(row) => Some(row),
+                _ => None,
+            })
+            .expect("a process row")
     }
 
     /// The whole point of the Disk active time column: it must come from the
@@ -4197,8 +4278,8 @@ mod tests {
             high_values[li] = 9.0;
             subtree.insert(low.pid, low_values);
             subtree.insert(high.pid, high_values);
-            low.cpu_pct = 0.0;
-            high.cpu_pct = 0.0;
+            low.cpu_pct = Some(0.0);
+            high.cpu_pct = Some(0.0);
             let mut rows = vec![&low, &high];
             sort_entries(&mut rows, FIXED_COLS + li, false, &subtree);
             assert_eq!(
@@ -4346,9 +4427,9 @@ mod tests {
         // members all share the image collapses into one expandable row with
         // the family aggregate.
         let mut main = proc(1, Some(99), "Dropbox.exe", ProcCategory::Background);
-        main.cpu_pct = 1.0;
+        main.cpu_pct = Some(1.0);
         let mut sub1 = proc(2, Some(1), "Dropbox.exe", ProcCategory::Background);
-        sub1.cpu_pct = 2.0;
+        sub1.cpu_pct = Some(2.0);
         let sub2 = proc(3, Some(1), "Dropbox.exe", ProcCategory::Background);
         let sub3 = proc(4, Some(2), "Dropbox.exe", ProcCategory::Background);
         let groups = [false; 3];
@@ -4399,13 +4480,13 @@ mod tests {
     #[test]
     fn a_foreign_descendant_no_longer_breaks_up_the_family() {
         let mut main = proc(1, Some(99), "brave.exe", ProcCategory::Background);
-        main.cpu_pct = 1.0;
+        main.cpu_pct = Some(1.0);
         let mut renderer = proc(2, Some(1), "brave.exe", ProcCategory::Background);
-        renderer.cpu_pct = 2.0;
+        renderer.cpu_pct = Some(2.0);
         let mut renderer2 = proc(3, Some(1), "brave.exe", ProcCategory::Background);
-        renderer2.cpu_pct = 3.0;
+        renderer2.cpu_pct = Some(3.0);
         let mut crash = proc(4, Some(1), "crashpad_handler.exe", ProcCategory::Background);
-        crash.cpu_pct = 4.0;
+        crash.cpu_pct = Some(4.0);
 
         let rows = build_display_rows(
             &snap_of(vec![main, renderer, renderer2, crash]),
@@ -4432,11 +4513,11 @@ mod tests {
     #[test]
     fn repeat_runs_of_one_image_under_one_parent_group() {
         let mut runner = proc(1, Some(99), "taskrunner.exe", ProcCategory::Background);
-        runner.cpu_pct = 0.5;
+        runner.cpu_pct = Some(0.5);
         let mut kids: Vec<ProcessEntry> = (2..=4)
             .map(|pid| {
                 let mut k = proc(pid, Some(1), "node.exe", ProcCategory::Background);
-                k.cpu_pct = 1.0;
+                k.cpu_pct = Some(1.0);
                 k
             })
             .collect();
@@ -4481,7 +4562,7 @@ mod tests {
         let hosts: Vec<ProcessEntry> = (2..=5)
             .map(|pid| {
                 let mut host = proc(pid, Some(1), "svchost.exe", ProcCategory::System);
-                host.cpu_pct = 0.1;
+                host.cpu_pct = Some(0.1);
                 host.company = Some("Microsoft Corporation".into());
                 host.service_name = Some(format!("Service {pid}"));
                 host
@@ -4525,10 +4606,10 @@ mod tests {
     #[test]
     fn same_publisher_independent_program_does_not_fold_as_a_helper() {
         let mut parent = proc(1, Some(99), "vendor.exe", ProcCategory::Background);
-        parent.cpu_pct = 0.1;
+        parent.cpu_pct = Some(0.1);
         parent.company = Some("Example Vendor".into());
         let mut child = proc(2, Some(1), "game.exe", ProcCategory::Background);
-        child.cpu_pct = 0.1;
+        child.cpu_pct = Some(0.1);
         child.company = Some("Example Vendor".into());
 
         let rows = build_display_rows(
@@ -4608,10 +4689,10 @@ mod tests {
     fn an_idle_same_publisher_helper_joins_the_family_but_a_busy_one_does_not() {
         let publisher = || Some("Valve Corporation".to_string());
         let mut steam = proc(1, Some(99), "steam.exe", ProcCategory::Background);
-        steam.cpu_pct = 0.2;
+        steam.cpu_pct = Some(0.2);
         steam.company = publisher();
         let mut idle = proc(2, Some(1), "steamwebhelper.exe", ProcCategory::Background);
-        idle.cpu_pct = 0.1;
+        idle.cpu_pct = Some(0.1);
         idle.company = publisher();
 
         let rows = build_display_rows(
@@ -4627,7 +4708,7 @@ mod tests {
         assert_eq!(bg[0].name, "steam.exe [2]");
 
         let mut busy = idle;
-        busy.cpu_pct = 20.0;
+        busy.cpu_pct = Some(20.0);
         let rows = build_display_rows(
             &snap_of(vec![steam, busy]),
             "",
@@ -4645,10 +4726,10 @@ mod tests {
     #[test]
     fn a_different_publisher_never_folds_in() {
         let mut shell = proc(1, Some(99), "cmd.exe", ProcCategory::Background);
-        shell.cpu_pct = 0.1;
+        shell.cpu_pct = Some(0.1);
         shell.company = Some("Microsoft Corporation".into());
         let mut tool = proc(2, Some(1), "cargo.exe", ProcCategory::Background);
-        tool.cpu_pct = 0.1;
+        tool.cpu_pct = Some(0.1);
         tool.company = Some("The Rust Project".into());
 
         let rows = build_display_rows(
@@ -4691,10 +4772,10 @@ mod tests {
     fn a_group_row_keeps_the_image_name_and_the_count_apart() {
         let mut main = proc(1, Some(99), "Dropbox.exe", ProcCategory::Background);
         main.display = "Dropbox".into();
-        main.cpu_pct = 0.1;
+        main.cpu_pct = Some(0.1);
         let mut kid = proc(2, Some(1), "Dropbox.exe", ProcCategory::Background);
         kid.display = "Dropbox".into();
-        kid.cpu_pct = 0.1;
+        kid.cpu_pct = Some(0.1);
 
         let rows = build_display_rows(
             &snap_of(vec![main, kid]),
@@ -4730,11 +4811,11 @@ mod tests {
         // shell): the busy build tool must be its own row without needing to
         // expand anything — this was the "100% CPU not identifiable" bug.
         let mut shell = proc(1, Some(99), "cmd.exe", ProcCategory::Background);
-        shell.cpu_pct = 0.0;
+        shell.cpu_pct = Some(0.0);
         let mut build = proc(2, Some(1), "cargo.exe", ProcCategory::Background);
-        build.cpu_pct = 6.0;
+        build.cpu_pct = Some(6.0);
         let mut leaf = proc(3, Some(2), "rustc.exe", ProcCategory::Background);
-        leaf.cpu_pct = 0.0;
+        leaf.cpu_pct = Some(0.0);
         let groups = [false; 3];
         let rows = build_display_rows(
             &snap_of(vec![shell, build, leaf]),
@@ -4817,7 +4898,7 @@ mod tests {
         let mut helper = proc(2, Some(1), "steamwebhelper.exe", ProcCategory::App);
         helper.has_window = true;
         helper.company = Some("Valve Corporation".into());
-        helper.cpu_pct = 40.0;
+        helper.cpu_pct = Some(40.0);
         let groups = [false; 3];
         let rows = build_display_rows(
             &snap_of(vec![steam, helper]),
@@ -4840,9 +4921,9 @@ mod tests {
         let mut code = proc(1, None, "Code.exe", ProcCategory::App);
         code.has_window = true;
         let mut build = proc(2, Some(1), "cargo.exe", ProcCategory::App);
-        build.cpu_pct = 8.0;
+        build.cpu_pct = Some(8.0);
         let mut watcher = proc(3, Some(1), "watcher.exe", ProcCategory::App);
-        watcher.cpu_pct = 0.0;
+        watcher.cpu_pct = Some(0.0);
         let groups = [false; 3];
         let rows = build_display_rows(
             &snap_of(vec![code, build, watcher]),
@@ -4873,7 +4954,7 @@ mod tests {
         let mut brave = proc(1, None, "brave.exe", ProcCategory::App);
         brave.has_window = true;
         let mut renderer = proc(2, Some(1), "brave.exe", ProcCategory::App);
-        renderer.cpu_pct = 40.0;
+        renderer.cpu_pct = Some(40.0);
         let groups = [false; 3];
         let mut expanded = HashSet::new();
         expanded.insert(1u32);
@@ -4897,9 +4978,9 @@ mod tests {
         let mut code = proc(1, None, "Code.exe", ProcCategory::App);
         code.has_window = true;
         let mut cargo = proc(2, Some(1), "cargo.exe", ProcCategory::App);
-        cargo.cpu_pct = 8.0;
+        cargo.cpu_pct = Some(8.0);
         let mut rustc = proc(3, Some(2), "rustc.exe", ProcCategory::App);
-        rustc.cpu_pct = 0.0; // idle: must follow via wholesale descent
+        rustc.cpu_pct = Some(0.0); // idle: must follow via wholesale descent
         let groups = [false; 3];
         let mut expanded = HashSet::new();
         expanded.insert(2u32);
@@ -4938,12 +5019,12 @@ mod tests {
             ProcCategory::Background,
         );
         term.display = "Terminated processes (3)".into();
-        term.cpu_pct = 45.0;
+        term.cpu_pct = Some(45.0);
         term.description = Some("rustc.exe \u{d7}2, cargo.exe \u{d7}1".into());
         let mut irq = pseudo(u32::MAX, "System Interrupts", ProcCategory::System);
-        irq.cpu_pct = 3.0;
+        irq.cpu_pct = Some(3.0);
         let mut app = proc(2, None, "app.exe", ProcCategory::App);
-        app.cpu_pct = 5.0;
+        app.cpu_pct = Some(5.0);
         app.has_window = true;
 
         // Sorted by CPU descending (column 2): native TM flattens the group
@@ -5012,12 +5093,12 @@ mod tests {
         // alone would sort far lower.
         let mut head = proc(1, None, "fam.exe", ProcCategory::App);
         head.has_window = true;
-        head.cpu_pct = 0.0;
+        head.cpu_pct = Some(0.0);
         let mut worker = proc(2, Some(1), "fam.exe", ProcCategory::App);
-        worker.cpu_pct = 30.0;
+        worker.cpu_pct = Some(30.0);
         let mut other = proc(3, None, "other.exe", ProcCategory::App);
         other.has_window = true;
-        other.cpu_pct = 10.0;
+        other.cpu_pct = Some(10.0);
         let mut expanded = HashSet::new();
         expanded.insert(1u32);
         let rows = build_display_rows(
@@ -5084,7 +5165,7 @@ mod tests {
             ProcCategory::Background,
         );
         term.description = Some("rustc.exe \u{d7}2".into());
-        term.cpu_pct = 9.0;
+        term.cpu_pct = Some(9.0);
         // Name sort → grouped sections (rows_in_group needs headers).
         let rows = build_display_rows(
             &snap_of(vec![term]),
@@ -5125,7 +5206,7 @@ mod tests {
             let mut a = proc(2, Some(100), "worker.exe", ProcCategory::Background);
             let mut b = proc(3, Some(101), "worker.exe", ProcCategory::Background);
             for process in [&mut a, &mut b] {
-                process.cpu_pct = 0.0;
+                process.cpu_pct = Some(0.0);
                 process.mem_bytes = 0;
                 process.start_epoch_s = Some(1000);
             }

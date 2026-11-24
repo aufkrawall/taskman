@@ -117,7 +117,7 @@ impl SystemCollector for MacCollector {
             entry.category = category;
             // sysinfo returns percent of ONE core; normalize to share of
             // total machine capacity (TM-style, max 100).
-            entry.cpu_pct = (p.cpu_usage() / nb_cpus).clamp(0.0, 100.0);
+            entry.cpu_pct = Some((p.cpu_usage() / nb_cpus).clamp(0.0, 100.0));
             entry.mem_bytes = p.memory();
             entry.working_set_bytes = Some(p.memory());
             entry.commit_bytes = Some(p.virtual_memory());

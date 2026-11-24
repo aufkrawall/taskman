@@ -540,8 +540,9 @@ impl AppHistoryDb {
             let d_cpu = match (prev_cpu, p.cpu_time_s) {
                 _ if !same_process => 0.0,
                 (Some(before), Some(now)) => (now - before).max(0.0),
-                _ if p.cpu_pct > 0.0 => (p.cpu_pct as f64 / 100.0) * interval_s.max(0.0) * cores,
-                _ => 0.0,
+                _ => p.cpu_pct.map_or(0.0, |pct| {
+                    (f64::from(pct).max(0.0) / 100.0) * interval_s.max(0.0) * cores
+                }),
             };
             let d_net: u64 = match (prev_net, net_total) {
                 _ if !same_process => 0,
@@ -658,7 +659,7 @@ mod tests {
     fn first_sighting_with_a_positive_rate_still_contributes_nothing() {
         let mut db = AppHistoryDb::in_memory();
         let mut snap = snap_with(3, "app.exe", ProcCategory::App, 500.0, 1 << 20);
-        snap.processes[0].cpu_pct = 45.0;
+        snap.processes[0].cpu_pct = Some(45.0);
         snap.processes[0].net_recv_bps = Some(1000.0);
         db.observe(&snap, 5.0);
         assert_eq!(db.entries()["app.exe"].cpu_seconds, 0.0);
@@ -975,7 +976,7 @@ mod tests {
         let mut db = AppHistoryDb::in_memory();
         let mut p = ProcessEntry::new(10, "multicore.exe");
         p.category = ProcCategory::App;
-        p.cpu_pct = 25.0;
+        p.cpu_pct = Some(25.0);
         p.cpu_time_s = None;
 
         let mut snap = Snapshot {
